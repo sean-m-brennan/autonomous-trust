@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -102,12 +102,12 @@ create_conda_env() {
     fi
 
     info "Creating conda environment '$ENV_NAME' ..."
-    conda env create -n "$ENV_NAME" --file "$REPO_DIR/environment.yaml"
+    conda env create -n "$ENV_NAME" --file "$REPO_DIR/environment.yml"
 
     # Overlay development dependencies
-    if [ -f "$CFG_DIR/devel_environ.yaml" ]; then
+    if [ -f "$CFG_DIR/devel_environ.yml" ]; then
         info "Installing development dependencies ..."
-        conda env update -n "$ENV_NAME" --file "$CFG_DIR/devel_environ.yaml"
+        conda env update -n "$ENV_NAME" --file "$CFG_DIR/devel_environ.yml"
     fi
 
     # Platform-specific compiler packages
@@ -130,9 +130,9 @@ update_conda_env() {
     conda update -n base -c conda-forge conda
     activate_conda
     info "Updating conda environment '$ENV_NAME' ..."
-    conda env update -n "$ENV_NAME" --file "$REPO_DIR/environment.yaml" --prune
-    if [ -f "$CFG_DIR/devel_environ.yaml" ]; then
-        conda env update -n "$ENV_NAME" --file "$CFG_DIR/devel_environ.yaml"
+    conda env update -n "$ENV_NAME" --file "$REPO_DIR/environment.yml" --prune
+    if [ -f "$CFG_DIR/devel_environ.yml" ]; then
+        conda env update -n "$ENV_NAME" --file "$CFG_DIR/devel_environ.yml"
     fi
     info "Environment updated"
 }
@@ -372,7 +372,28 @@ check_docker() {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+usage() {
+    cat <<'EOF'
+Usage: setup-dev.sh [OPTIONS]
+
+Set up the autonomous-trust development environment: install miniforge
+(conda-forge only), create the conda environment, install the Rust toolchain
+and Frama-C inside it, and verify Docker.
+
+Options:
+  --update      Update the existing conda environment instead of full setup.
+  -h, --help    Show this help message and exit.
+EOF
+}
+
 main() {
+    case "${1:-}" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+    esac
+
     if [[ "${1:-}" == "--update" ]]; then
         update_conda_env
         exit 0

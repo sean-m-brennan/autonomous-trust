@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -31,12 +31,12 @@ GatewayMap = dict[str, GatewayUplink]
 
 
 class Ident(Configuration):
-    def __init__(self, position: Position, speed: float, kind: str, nickname: str):
+    def __init__(self, position: Position, speed: float, kind: str, petname: str):
         super().__init__(sim_data_pb2.Ident)
         self.position = position
         self.speed = speed
         self.kind = kind
-        self.nickname = nickname
+        self.petname = petname
 
 
 Map = dict[str, Ident]
@@ -104,6 +104,12 @@ class SimConfig(Configuration):
         self.space_mode: bool = kwargs.get('space_mode', False)
         self.comm_freq_hz: Optional[float] = kwargs.get('comm_freq_hz')
         self.sun_position: Optional[Position] = kwargs.get('sun_position')
+        # Finite comms-range cutoff in metres (ISSUES.md §6, opt-OUT: finite by
+        # default). None -> Simulator.DEFAULT_MAX_RANGE_M is applied; a positive
+        # value overrides it; <= 0 DISABLES the cutoff (restores the legacy
+        # all-pairs, effectively-infinite-range behaviour). Ignored in space
+        # mode, whose links are interplanetary. See Simulator.compute_step.
+        self.max_range_m: Optional[float] = kwargs.get('max_range_m')
 
     @classmethod
     def load(cls, data: str) -> 'SimConfig':

@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -284,7 +284,7 @@ static void rollback(const process_t *proc, update_state_t *state)
     {
         /* Config rollback: restore all backed-up configs */
         char cfg_dir[CFG_PATH_LEN];
-        if (get_cfg_dir(cfg_dir) == 0)
+        if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) == 0)
         {
             if (config_restore_all(cfg_dir, update_data_dir) != 0)
             {
@@ -327,7 +327,7 @@ static void rollback(const process_t *proc, update_state_t *state)
 static void run_health_check(const process_t *proc, update_state_t *state)
 {
     char cfg_dir[CFG_PATH_LEN];
-    if (get_cfg_dir(cfg_dir) != 0)
+    if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) != 0)
     {
         const char *root = getenv("AUTONOMOUS_TRUST_ROOT");
         if (root != NULL)
@@ -560,7 +560,7 @@ static bool handle_update_status(const process_t *proc, directory_t *queues, gen
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
     {
         log_info(proc->logger, "Update: status from %s (no payload)\n",
-                 nmsg->from_whom.fullname);
+                 nmsg->from_whom.nickname);
         return true;
     }
 
@@ -569,7 +569,7 @@ static bool handle_update_status(const process_t *proc, directory_t *queues, gen
     const char *detail = json_string_value(json_object_get(payload, "detail"));
 
     log_info(proc->logger, "Update: peer %s status=%s version=%s detail=%s\n",
-             nmsg->from_whom.fullname,
+             nmsg->from_whom.nickname,
              status  ? status  : "?",
              version ? version : "?",
              detail  ? detail  : "?");
@@ -588,7 +588,7 @@ int update_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t
 {
     /* Determine data directory */
     char data_dir[CFG_PATH_LEN];
-    if (get_data_dir(data_dir) != 0)
+    if (get_data_dir(data_dir, sizeof(data_dir)) != 0)
     {
         const char *root = getenv("AUTONOMOUS_TRUST_ROOT");
         if (root != NULL)

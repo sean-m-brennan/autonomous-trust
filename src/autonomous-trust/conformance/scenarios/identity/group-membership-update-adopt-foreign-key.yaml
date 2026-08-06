@@ -1,0 +1,64 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-membership-update-adopt-foreign-key
+byte_pinning: false
+description: |
+    Adopting a DIFFERENT, larger group that carries the shared PRIVATE key
+    must INSTALL that key — the receiver ends with the foreign group's uuid
+    AND its usable key, not the foreign uuid paired with the receiver's own
+    stale key.
+
+    Third member of the group_key_update family, alongside
+    group-membership-update-keeps-key (same-uuid public-only → keep our key)
+    and group-membership-update-refuse-foreign-public-only (different-uuid
+    public-only → refuse). This is the remaining adopt case: a different uuid
+    whose update carries the private key (the sender owns it, so group_to_json
+    emits public_only=false + the raw key).
+
+    This pins the cross-runtime parity that closed a latent C gap: Python's
+    `self.group = theirs` always installed theirs' encryptor, but C's
+    handle_group_update used to copy only uuid/address/address_map and KEEP its
+    own key — so C would adopt the foreign uuid while holding the wrong key
+    bytes (could not decrypt the group it had just joined). C now reconstructs
+    and installs theirs' encryptor on this path, mirroring group_from_json.
+
+    Observability trick: peer_a starts PUBLIC-ONLY (holds no private key), so
+    the install is directly observable — after adoption peer_a
+    group_owns_private_key flips to true ONLY if theirs' private key was
+    installed. The old keep-own-key behavior would leave it false. peer_b owns
+    the shared private key (default) and advertises a larger membership.
+
+    Topology: peer_a holds group G (uuid 0a..), PUBLIC-ONLY, size 1. peer_b
+    holds a DIFFERENT group H (uuid 0b..) WITH the private key, size 3.
+
+participants:
+  - id: peer_a
+    role: group_member
+  - id: peer_b
+    role: group_member
+
+fixtures:
+  groups:
+    peer_a:
+      uuid: "0a000000-0000-4000-8000-00000000000a"
+      size: 1
+      public_only: true
+    peer_b:
+      uuid: "0b000000-0000-4000-8000-00000000000b"
+      size: 3
+
+steps:
+  - id: 1
+    from: peer_b
+    to: peer_a
+    function: group_key_update
+    payload: {}
+    description: |
+        peer_b sends its DIFFERENT, private-key-bearing, size-3 group H. peer_a
+        (which held no key) adopts H wholesale and installs H's private key.
+
+expected_state:
+  peer_a:
+    group_owns_private_key: true
+    group_size: 3

@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -37,12 +37,24 @@ from __future__ import annotations
 import itertools
 import logging
 import os
+import queue
+import random
 from datetime import timedelta
 from typing import Callable, Optional
+from uuid import uuid4
 
-from autonomous_trust.core import ProcMeta
+from autonomous_trust.core import ProcMeta, CfgIds, to_yaml_string
 from autonomous_trust.core._python.automate import AutonomousTrust
+from autonomous_trust.core.capabilities import Capability
+from autonomous_trust.core.config import to_json_string
+from autonomous_trust.core.negotiation import (
+    Task, TaskParameters, NegotiationProtocol)
+from autonomous_trust.core.network import Message
+from autonomous_trust.core.reputation.protocol import ReputationProtocol
+from autonomous_trust.core.reputation.reputation import TransactionScore
+from autonomous_trust.core.system import queue_cadence
 from autonomous_trust.services.data.reading import Reading
+from autonomous_trust.services.data.server import DataProtocol
 from autonomous_trust.services.envdata import (
     AirQualityStreamProcess,
     CompromiseConfig,
@@ -61,6 +73,30 @@ from .disaster_response_data import build_generators_for_scenario
 
 
 logger = logging.getLogger(__name__)
+
+
+def _demo_task_period_sec() -> float:
+    """Period (sec) between the light inter-peer negotiation rounds that
+    keep honest-peer reputation alive (see
+    ``DisasterResponseDemoAT.autonomous_tasking``).
+
+    Slow by default: the bilateral reputation transactions only need to
+    trickle in to build and hold reputation, and each round is a cheap
+    compute task — far below the per-message cost of the continuous
+    sensor streams (see ``disaster_response_data._fast_stream_cadence_sec``).
+    Override per-deploy via ``AT_DEMO_TASK_PERIOD_SEC``; set <= 0 to fall
+    back to the default rather than disabling (disable by not running
+    --test, which is out of scope here).
+    """
+    default = 10.0
+    raw = os.environ.get("AT_DEMO_TASK_PERIOD_SEC")
+    if raw is None:
+        return default
+    try:
+        val = float(raw)
+    except ValueError:
+        return default
+    return val if val > 0 else default
 
 
 # ----------------------------------------------------------------------
@@ -125,6 +161,27 @@ def _source_for_peer(peer_name: str,
 # Role -> EnvDataProcess subclass map
 # ----------------------------------------------------------------------
 
+def _ts_keep(batch_id: str, denom: int) -> bool:
+    """Deterministic per-batch decimation for TS submission.
+
+    Both the sender (``_DemoProcessMixin.process``) and the coordinator
+    (``MultiAgencyCoordinator._maybe_submit_batch_scores``) call this with
+    the same batch_id and AT_TS_DECIMATION, so they always agree on which
+    batches produce a TransactionScore. That agreement is what preserves the
+    bilateral pairing Transaction.add / TransactionHistory.update requires
+    before a Transaction is appended to the chain — without it every
+    Transaction would stay at len==1 and never fold into the consensus EMA.
+
+    Kept byte-identical to examples/dod_mission/participant.py::_ts_keep and
+    examples/multi_agency/coordinator.py::_ts_keep (the C parity vectors in
+    src/c/test/data_source_test.c pin this exact selection)."""
+    if denom <= 1:
+        return True
+    # UUID4 is random; the first 8 hex chars are enough entropy for
+    # uniform mod-denom selection without a hash function.
+    return int(batch_id.replace('-', '')[:8], 16) % denom == 0
+
+
 class _DemoProcessMixin:
     """Mixin: lazily build a per-peer source on the first acquire() call.
 
@@ -143,10 +200,23 @@ class _DemoProcessMixin:
 
     Honors AT_PEER_NAME from the env so the source matches the scenario
     role assigned by the compose generator.
+
+    Bilateral scoring (Option C): each emitted reading is stamped with a
+    fresh ``metadata["task_id"]`` and, after broadcast, the peer submits its
+    own 0.9 "I delivered this batch" TransactionScore for that task_id
+    (decimated by _ts_keep). This pairs with the coordinator's verdict TS
+    (0.8 clean / 0.3 anomalous) on the SAME task_id, so the two Paxos commits
+    form a bilateral Transaction that folds the verdict into the subject
+    peer's consensus reputation. Without both halves the coordinator's
+    validation never reaches the scored peer. Mirrors
+    examples/dod_mission/participant.py::DoDDataProcess.
     """
 
     # Child classes inherit EnvDataProcess's self.active flag.
     active: bool
+    # Most-recent batch/task id stamped by acquire(); consumed by process().
+    _last_batch_id: Optional[str] = None
+    _logged_first_sender_ts = False
 
     def acquire(self):
         if not getattr(self, "_demo_source_wired", False):
@@ -160,7 +230,75 @@ class _DemoProcessMixin:
                     logger.exception(
                         "[%s] failed to wire demo source for %s",
                         type(self).__name__, peer_name)
-        return super().acquire()  # type: ignore[misc]
+        d = super().acquire()  # type: ignore[misc]
+        if d is None:
+            return None
+        # Stamp this reading so the coordinator groups it and submits its
+        # verdict TransactionScore against the same task_id; process() below
+        # submits the paired sender-side TS.
+        batch_id = str(uuid4())
+        meta = d.setdefault("metadata", {})
+        meta["task_id"] = batch_id
+        self._last_batch_id = batch_id
+        return d
+
+    def process(self, queues, signal):
+        """Broadcast loop mirroring DataProcess.process(), plus the paired
+        sender-side TransactionScore (see class docstring / _maybe_submit_
+        sender_ts). Kept in lockstep with DoDDataProcess.process; the only
+        addition over the base loop is the _maybe_submit_sender_ts call after
+        a batch is broadcast."""
+        while self.keep_running(signal):
+            self.process_messages(queues)  # type: ignore[attr-defined]
+            if self.active:
+                data = self.acquire()
+                if data is not None:
+                    for client_id in list(self.clients):  # type: ignore[attr-defined]
+                        proc_name, peer = self.clients[client_id]  # type: ignore[attr-defined]
+                        msg_obj = to_yaml_string(data)
+                        msg = Message(proc_name, DataProtocol.data,
+                                      msg_obj, peer)
+                        try:
+                            queues[CfgIds.network].put(
+                                msg, block=True, timeout=self.q_cadence)
+                        except queue.Full:
+                            self.logger.warning(
+                                "Queue full, dropping data message for %s",
+                                client_id)
+                    self._maybe_submit_sender_ts(queues)
+            self.sleep_until(self.cadence)  # type: ignore[attr-defined]
+
+    def _maybe_submit_sender_ts(self, queues):
+        """Submit the sender's 0.9 'I delivered this batch' TransactionScore
+        for the most recent batch, subject to the shared per-batch decimation
+        (_ts_keep with AT_TS_DECIMATION). Only fires when the coordinator has
+        actually subscribed (self.clients), so we score delivered batches and
+        stay in lockstep with the coordinator's verdict half. capability_name
+        matches the coordinator's 'multi.sensor-report' so the trust-ladder
+        weighting applies identically on both sides."""
+        batch_id = self._last_batch_id
+        self._last_batch_id = None
+        if batch_id is None or not self.clients:  # type: ignore[attr-defined]
+            return
+        denom = int(os.environ.get("AT_TS_DECIMATION", "30"))
+        if not _ts_keep(batch_id, denom):
+            return
+        ts = TransactionScore(task_id=batch_id, score=0.9,
+                              capability_name="multi.sensor-report")
+        try:
+            queues[CfgIds.reputation].put(
+                ts, block=True, timeout=self.q_cadence)
+            if not _DemoProcessMixin._logged_first_sender_ts:
+                self.logger.info(
+                    "Demo sender-side TransactionScore submitted (batch=%s, "
+                    "score=0.9, denom=%d) — pairs with coordinator verdict to "
+                    "form the bilateral tx that folds into consensus",
+                    batch_id, denom)
+                _DemoProcessMixin._logged_first_sender_ts = True
+        except queue.Full:
+            self.logger.warning(
+                "Reputation queue full; dropping sender TransactionScore "
+                "for batch %s", batch_id)
 
 
 class DisasterWeatherStreamProcess(_DemoProcessMixin, WeatherStreamProcess,
@@ -256,6 +394,10 @@ class DisasterResponseDemoAT(AutonomousTrust):
         self._demo_capabilities = [c.strip() for c in raw_caps.split(",")
                                    if c.strip()]
 
+        # Cadence for the light inter-peer negotiation that keeps
+        # honest-peer reputation alive (see autonomous_tasking).
+        self._demo_task_period = _demo_task_period_sec()
+
         # Always include the cross-validation service -- every peer in
         # the demo participates in peer-to-peer sanity checks.
         self._add_validation_worker()
@@ -338,20 +480,94 @@ class DisasterResponseDemoAT(AutonomousTrust):
 
         super().autonomous_ability(queues)
 
-    # --- tasking (minimal) -------------------------------------------
+    # --- tasking -----------------------------------------------------
+
+    # Real, cheap capabilities to exercise. The role *stream* caps are
+    # registered with a no-op announce function (_capability_announce)
+    # that returns no PID, so tasking them trips "Process failed to
+    # start"; restrict negotiation to the base compute caps, which have
+    # real executors (registered by super().autonomous_ability under
+    # --test).
+    _DEMO_TASK_CAPS = ("mult", "pow", "pi")
 
     def autonomous_tasking(self, queues):
-        """Streaming data and service discovery drive the demo.
+        """Drive light inter-peer negotiation so honest peers earn the
+        reputation the trust-network graph and Trust-Dynamics lines render.
 
-        We intentionally do NOT fire randomized negotiations like the
-        base class does in test mode -- the reputation / exclusion path
-        we're demonstrating comes from actual streaming behavior, not
-        synthetic tasks.
+        Edges/lines are fed by *bilateral* reputation transactions, which
+        form only when peers run tasks for one another: the requester
+        scores the returned TaskResult and the executor scores on
+        completion (see automate.py), both keyed to a shared task uuid.
+        Pure sensor streaming goes through DataRcvr and never touches that
+        path, so a stream-only cohort sits forever at PREREP_NEUTRAL (0.0)
+        and the graph stays edgeless -- which is exactly what "no edges,
+        no reputation lines at T+7min" was.
+
+        We therefore re-enable the base-class test-mode negotiation this
+        class previously opted out of, but throttled (AT_DEMO_TASK_PERIOD_SEC)
+        and restricted to cheap compute caps, so reputation builds and
+        holds without adding to the per-message load the continuous sensor
+        streams already carry. The validation-driven slash path (which
+        pushes a *rogue* peer's reputation down) layers on top of this
+        honest-peer baseline.
         """
-        # Tick clock so the base mechanics still run (reputation queries,
-        # peer monitoring, etc).
-        _ = self.tasking_tick(0)
+        # Prompt first-contact task + reputation sweep as new peers appear,
+        # so edges form without waiting a full period; then steady cadence.
+        if len(self.peers.all) > self.peer_count:
+            self.peer_count = len(self.peers.all)  # noqa
+            self._demo_random_task(queues)
+            self._query_peer_reputations(queues)
+        elif self.tasking_tick(0, self._demo_task_period):
+            self._demo_random_task(queues)
+            self._query_peer_reputations(queues)
         self._report_unhandled()
+
+    def _demo_random_task(self, queues) -> None:
+        """Dispatch one lightweight compute task to the cohort.
+
+        Mirrors ``AutonomousTrust._random_task`` but restricts the pick to
+        the real compute capabilities (mult/pow/pi). The negotiation
+        process selects an executor; its TaskResult flows back and both
+        ends submit a bilateral TransactionScore, which is what lifts
+        honest peers off PREREP_NEUTRAL and draws the trust edges.
+        """
+        registered = set(self.capabilities.to_list())
+        available = [n for n in self._DEMO_TASK_CAPS if n in registered]
+        if not available:
+            return
+        name = available[random.randint(0, len(available) - 1)]
+        if name == 'pi':
+            args = (random.randint(1000, 10000),)
+        elif name == 'pow':
+            args = (random.randint(2, 100), random.randint(2, 20))
+        else:  # mult
+            args = (random.randint(2, 1000000), random.randint(2, 1000000))
+        try:
+            task = Task(TaskParameters(Capability(name), args=args),
+                        self.identity)
+            msg = Message(CfgIds.negotiation, NegotiationProtocol.start, task)
+            queues[CfgIds.negotiation].put(
+                msg, block=True, timeout=queue_cadence)
+        except queue.Full:
+            self.logger.error(
+                "%s: demo task negotiation queue full", self.name)
+
+    def _query_peer_reputations(self, queues) -> None:
+        """Ask our own reputation process for its view of every known peer
+        (and ourself), populating latest_reputation for the local panels.
+        Mirrors the base test-mode sweep; reputation is *read* here, not
+        built (that is what _demo_random_task drives)."""
+        for peer in list(self.peers.all) + [self.identity]:
+            try:
+                query = Message(
+                    CfgIds.reputation, ReputationProtocol.rep_req,
+                    to_json_string((peer, self.proc_name)), self.identity,
+                    from_whom=self.identity)
+                queues[CfgIds.reputation].put(
+                    query, block=True, timeout=queue_cadence)
+            except queue.Full:
+                self.logger.error(
+                    "%s: reputation query queue full", self.name)
 
 
 # ----------------------------------------------------------------------
@@ -445,4 +661,8 @@ def _main(argv=None):
 
 
 if __name__ == '__main__':
+    # Default to forkserver: 'fork' (Linux default through 3.13) forks a
+    # multi-threaded process and can deadlock the child. Harmless on 3.14+.
+    import multiprocessing as _mp
+    _mp.set_start_method('forkserver', force=True)
     _main()

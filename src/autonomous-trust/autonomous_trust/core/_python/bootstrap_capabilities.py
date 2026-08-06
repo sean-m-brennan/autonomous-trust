@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #  Licensed under the Apache License, Version 2.0
 # ******************
 """AT-core bootstrap capabilities.
@@ -134,16 +134,42 @@ BOOTSTRAP_VERIFIERS: dict[str, Any] = {
 }
 
 
-def register_bootstrap_capabilities(capabilities) -> None:
+def register_bootstrap_capabilities(capabilities, ladder=None) -> None:
     """Register the three AT-core bootstrap capabilities on the given
     Capabilities mapping, each with required_tier=0 and
     transaction_weight=1 (the bootstrap-corpus signal: low-stakes,
     accumulates slowly, available to every admitted peer).
 
+    When a trust ladder is supplied — a
+    :class:`~autonomous_trust.core.trust_ladder.TrustLadder`, a path, or
+    (with ``ladder=None``) one discovered via ``AT_TRUST_LADDER`` — the
+    bootstrap caps take their ``required_tier`` / ``transaction_weight``
+    from it instead of the tier-0 / weight-1 defaults, and any additional
+    capabilities the ladder declares are registered metadata-only
+    (``function=None``). With no ladder configured this is exactly the
+    historical behavior: the three caps register at tier 0 / weight 1 and
+    nothing else.
+
     Idempotent — calling twice replaces with identical entries.
     """
+    from .trust_ladder import TrustLadder, load_trust_ladder
+    if not isinstance(ladder, TrustLadder):
+        ladder = load_trust_ladder(ladder)
     for name, function in BOOTSTRAP_FUNCTIONS.items():
+        meta = ladder.capabilities.get(name)
         capabilities.register_ability(
             name, function, arg_names=None, keywords=None,
-            required_tier=0, transaction_weight=1,
+            required_tier=meta.required_tier if meta else 0,
+            transaction_weight=meta.transaction_weight if meta else 1,
+        )
+    # Register any non-bootstrap capabilities the ladder declares as
+    # metadata-only — domain caps are handled remotely, so they carry no
+    # local server function.
+    for name, meta in ladder.capabilities.items():
+        if name in BOOTSTRAP_FUNCTIONS:
+            continue
+        capabilities.register_ability(
+            name, None,
+            required_tier=meta.required_tier,
+            transaction_weight=meta.transaction_weight,
         )

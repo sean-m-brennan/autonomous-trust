@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -119,7 +119,7 @@ def _await_peers():
     except ValueError:
         secs = 0
     if secs > 0:
-        print('Inspector: waiting %ds for peers to bind...' % secs, flush=True)
+        print(f'Inspector: waiting {secs}s for peers to bind...', flush=True)
         time.sleep(secs)
 
 

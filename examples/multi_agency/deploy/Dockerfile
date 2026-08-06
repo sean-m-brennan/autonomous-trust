@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.3
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #  Licensed under the Apache License, Version 2.0
 # ******************
 
@@ -20,9 +20,15 @@ ARG IMAGE_TAG
 FROM ${REGISTRY_URL}autonomous-trust-full-devel${IMAGE_TAG}
 
 USER root
-# plotly for dashboard charts (may already be in base image)
+# Dashboard deps. The coordinator now hosts demo.py (the full inspector
+# dashboard) in-thread, so the image needs the same Dash stack the
+# autonomous-trust-inspector image ships — notably dash-extensions
+# (demo.py: `from dash_extensions...`) and dash-bootstrap-components, plus
+# the map/graph deps. Missing dash-extensions makes coordinator.py fail at
+# import. (Some may already be in the base image; pip is idempotent.)
 SHELL ["conda", "run", "--live-stream", "-n", "autonomous_trust", "/bin/bash", "-c"]
-RUN pip install plotly pyyaml 2>/dev/null || true
+RUN pip install plotly pyyaml dash dash-extensions dash-bootstrap-components \
+        networkx numpy geopy utm 2>/dev/null || true
 USER user
 
 WORKDIR /app

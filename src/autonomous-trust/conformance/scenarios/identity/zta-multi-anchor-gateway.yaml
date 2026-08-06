@@ -1,0 +1,93 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: zta-multi-anchor-gateway
+byte_pinning: false
+description: |
+    Named trust anchors, and admission as ANY-OF across them (ISSUES §1.5).
+
+    The policy configures TWO anchors by name — "dod" and "operator" — pointing at
+    different CA bundles. The newcomer's credential chains to only one of them.
+    Admission is any-of, so one match is enough: the peer is admitted, and the
+    anchor it matched is what it earns authority for.
+
+    Nothing here makes the two CAs recognize each other. Cross-certification was
+    never the obstacle to coalition deployment and is not used: what is needed is
+    for THIS node to recognize both, which is a local list. That is also why the
+    holder-asserted binding exists — a foreign agency CA will not mint an AT uuid
+    into a SAN, so the CA-asserted route is unavailable exactly where coalitions
+    need it.
+
+    The anchor a peer proves is recorded as the OBSERVER's finding and is never
+    serialized: a peer able to state which anchors it satisfies would be
+    asserting the authority it is supposed to earn. Gateway federation is gated on
+    it (`_gateway_authorized`), which is enforceable against a peer that simply
+    declines to claim anything — unlike a rule of the form "a gateway must present
+    N credentials", which would rest on the peer's own claim.
+
+    What this pins is the admission half: that a named-anchor list resolves and
+    admits identically in both runtimes. The federation half is exercised by unit
+    tests on each side, since nothing on the wire carries a gateway role for a
+    scenario to drive.
+
+    Cross-impl: pinned on BOTH sides, ZTA-gated.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  zta_policy:
+    enabled: true
+    require_at_admission: true
+    binding_mode: "off"
+    verifier_type: x509
+    anchors:
+      - name: dod
+        ca_bundle_path: testdata/zta/ca-bundle.pem
+        operator: false
+      - name: operator
+        ca_bundle_path: testdata/zta/operator-ca-bundle.pem
+        operator: true
+  credentials:
+    newcomer: testdata/zta/certs/operator_leaf.der
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+    description: |
+        newcomer presents a credential chaining to the "operator" anchor only.
+        The "dod" anchor rejects it; any-of means one match suffices.
+  - id: 2
+    from: bg
+    to: broadcast
+    function: propose_peer
+    in_response_to: 1
+    description: bg proposes the candidate — the any-of observable.
+  - id: 3
+    from: bg
+    to: broadcast
+    function: peer_accepted
+    in_response_to: 1
+    description: After synchronous vote finalization the newcomer is stored.
+  - id: 4
+    from: bg
+    to: newcomer
+    function: access_granted
+    in_response_to: 1
+    description: bg sends its published identity to the newcomer.
+  - id: 5
+    from: bg
+    to: newcomer
+    function: full_history
+    in_response_to: 1
+    description: bg sends the group key + history DAG.
+
+expected_state:
+  bg:
+    operator_bound:
+      newcomer: true

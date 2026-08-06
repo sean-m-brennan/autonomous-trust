@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -113,3 +113,63 @@ def test_config_json_decoder_rejects_unknown_type():
     malicious = {"__type__": "os.system", "command": "echo pwned"}
     with pytest.raises(ValueError, match="not in allowed"):
         config_json_decoder(malicious)
+
+
+def test_cfg_file_write_is_atomic_on_failure(setup_teardown, simple_cfg, simple_repr):
+    """to_file must be atomic: a write that fails mid-serialize must leave the
+    previous complete file intact (never an empty/partial file) and leave no
+    leftover temp files. Guards the load_configs race that produced
+    'JSONDecodeError: Expecting value: line 1 column 1'."""
+    from unittest.mock import patch
+    file = os.path.join(TEST_DIR, 'test_cfg_atomic.cfg.json')
+    simple_cfg.to_file(file)  # establish a good prior version
+
+    # Force the serialization step to blow up partway through. to_file lives in
+    # the _python module (the native backend re-exports it), so patch there.
+    with patch('autonomous_trust.core._python.config.configuration.json.dump',
+               side_effect=RuntimeError('boom')):
+        with pytest.raises(RuntimeError, match='boom'):
+            simple_cfg.to_file(file)
+
+    # Prior file is untouched and still parses to the same object.
+    assert os.path.getsize(file) > 0
+    assert repr(Configuration.from_file(file)) == simple_repr
+    # No temp turds left behind in the directory.
+    leftovers = [f for f in os.listdir(TEST_DIR) if f.endswith('.tmp')]
+    assert leftovers == [], f'leftover temp files: {leftovers}'
+
+
+def test_cfg_file_concurrent_reads_never_see_empty(setup_teardown, simple_cfg):
+    """Stress the writer/reader race directly: repeated concurrent to_file /
+    from_file on the same path must never surface a partial (empty) read."""
+    import json
+    import threading
+    file = os.path.join(TEST_DIR, 'test_cfg_concurrent.cfg.json')
+    simple_cfg.to_file(file)
+
+    stop = threading.Event()
+    errors = []
+
+    def writer():
+        while not stop.is_set():
+            simple_cfg.to_file(file)
+
+    def reader():
+        while not stop.is_set():
+            try:
+                Configuration.from_file(file)
+            except json.JSONDecodeError as exc:
+                errors.append(str(exc))
+                return
+            except FileNotFoundError:
+                pass  # tolerated transient; the bug under test is empty content
+
+    threads = [threading.Thread(target=writer) for _ in range(2)] + \
+              [threading.Thread(target=reader) for _ in range(4)]
+    for t in threads:
+        t.start()
+    stop.wait(1.0)
+    stop.set()
+    for t in threads:
+        t.join()
+    assert not errors, f'partial reads observed: {errors[:3]}'

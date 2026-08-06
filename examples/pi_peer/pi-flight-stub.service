@@ -1,0 +1,75 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+# ******************
+#
+# Stretch Goal 3 (Path B): run a microdrone flight stub as a sidecar next to
+# the C ``at_demo`` node on a Pi, streaming ISR Readings into the node's
+# ``--ingest-readings`` AF_UNIX socket. Counterpart to the node unit
+# ``embedded/autonomous-trust.service``.
+#
+# This is a *template* unit — the instance name is the peer name:
+#
+#     # peer "microdrone-1" ingesting on /run/at/ingest/microdrone-1.sock
+#     systemctl start pi-flight-stub@microdrone-1.service
+#
+# %i (the unescaped instance string) is passed through as AT_PEER_NAME, and
+# the default socket path is derived from it. Override any knob via the
+# optional EnvironmentFile (AT_INGEST_SOCKET, AT_DEMO_T0_EPOCH, AT_SQUAD_SIZE,
+# AT_SWARM_SIZE, cadence, …). The stub is a pure client: it retries the connect
+# until the node's socket exists, so ordering with the node unit is advisory.
+#
+# Install (Pi-side):
+#   sudo install -m0644 pi-flight-stub.service \
+#       /etc/systemd/system/pi-flight-stub@.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pi-flight-stub@microdrone-1.service
+
+[Unit]
+Description=Autonomous Trust microdrone flight stub (%i)
+Documentation=https://github.com/TekFive/autonomous-trust
+# Best-effort ordering after the node; the stub reconnects regardless.
+After=network-online.target autonomous-trust.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Repo checkout deployed to the Pi. Override via the EnvironmentFile if the
+# checkout lives elsewhere.
+Environment=AT_PI_PEER_ROOT=/opt/autonomous-trust/examples/pi_peer
+Environment=AT_PEER_NAME=%i
+Environment=AT_INGEST_SOCKET=/run/at/ingest/%i.sock
+Environment=AT_FLIGHT_CADENCE=0.5
+EnvironmentFile=-/opt/autonomous-trust/etc/at/flight-stub.%i.env
+EnvironmentFile=-/opt/autonomous-trust/etc/at/flight-stub.env
+
+WorkingDirectory=${AT_PI_PEER_ROOT}
+ExecStart=/bin/sh -c 'exec python3 "${AT_PI_PEER_ROOT}/pi_peer_main.py" \
+    --socket "${AT_INGEST_SOCKET}" --cadence "${AT_FLIGHT_CADENCE}"'
+
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Hardening — the stub only needs to read its checkout and write to the
+# ingest socket directory.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/run/at
+
+[Install]
+WantedBy=multi-user.target

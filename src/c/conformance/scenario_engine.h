@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2026 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -83,7 +83,10 @@ typedef struct sce_run_ctx {
     int outbox_end[SCE_MAX_STEPS];
     char current_dispatcher[SCE_ID_LEN];
     int current_step_id;
-    char err[256];
+    /* Wide enough for the longest diagnostic _drive_assertion builds: the
+     * expected from->to:function triple plus a 256-byte list of what the
+     * parent step's outbox actually held. */
+    char err[512];
 } sce_run_ctx_t;
 
 /** Initialize internal bookkeeping (outbox indices, etc). Adapter should

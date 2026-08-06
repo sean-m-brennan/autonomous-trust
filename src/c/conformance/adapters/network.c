@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2026 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@
 #include "identity/group.h"
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
+#include "network/network.h"
 #include "network/net_message.h"
 
 #include "../negative_runner.h"
@@ -754,7 +755,7 @@ static int run_wv_signature(json_t *case_data, json_t *input, json_t *expected,
 
     uuid_t uuid;
     uuid_generate(uuid);
-    if (identity_create(&uuid, "10.0.0.1", "alice.scenario", "alice", "me",
+    if (identity_create(&uuid, "10.0.0.1", "alice.scenario", "alice",
                         &ident) != 0 || ident == NULL) {
         snprintf(err, err_len, "wv/signature: identity_create failed");
         goto cleanup;
@@ -950,7 +951,7 @@ static int _make_deterministic_identity(const char *pid, const char *addr,
     hash[8] = (hash[8] & 0x3F) | 0x80;
     memcpy(uuid, hash, 16);
 
-    int rc = identity_create(&uuid, addr, "x.scenario", pid, "me", out);
+    int rc = identity_create(&uuid, addr, "x.scenario", pid, out);
     if (rc != 0 || *out == NULL) return -1;
 
     /* Overwrite the randomly-generated keypairs with deterministic ones
@@ -2042,6 +2043,103 @@ cleanup:
     return rc;
 }
 
+/* Base-port resolution (scenario `port-resolution`).
+ *
+ * Walks fixtures.resolutions, driving AT_COMM_PORT and the configured value,
+ * and asserts each resolved (port, source) plus the derived group port. The
+ * point is cross-language agreement: Python's adapter runs the same table
+ * against system.resolve_comm_port(), so a change to either resolution order
+ * shows up here instead of at a peer that cannot be reached. */
+extern void net_port_resolve_reset(void);  /* test seam, not in network.h */
+
+static int run_port_resolution(const at_case_t *c, char *err, size_t err_len) {
+    json_t *fixtures = json_object_get(c->data, "fixtures");
+    json_t *table = fixtures != NULL
+        ? json_object_get(fixtures, "resolutions") : NULL;
+    if (!json_is_array(table) || json_array_size(table) == 0) {
+        snprintf(err, err_len, "scenario: fixtures.resolutions missing or empty");
+        return -1;
+    }
+
+    /* The default and the bounds are pinned in the scenario so a drift in
+     * either side's constants fails here rather than agreeing on a value
+     * neither side got from the other. */
+    json_t *j_default = json_object_get(fixtures, "default_port");
+    if (json_is_integer(j_default) &&
+        (int)json_integer_value(j_default) != COMM_PORT) {
+        snprintf(err, err_len,
+                 "default port: scenario says %d, C COMM_PORT is %d",
+                 (int)json_integer_value(j_default), COMM_PORT);
+        return -1;
+    }
+    json_t *j_min = json_object_get(fixtures, "port_min");
+    if (json_is_integer(j_min) &&
+        (int)json_integer_value(j_min) != COMM_PORT_MIN) {
+        snprintf(err, err_len, "port_min: scenario says %d, C says %d",
+                 (int)json_integer_value(j_min), COMM_PORT_MIN);
+        return -1;
+    }
+    json_t *j_max = json_object_get(fixtures, "port_max");
+    if (json_is_integer(j_max) &&
+        (int)json_integer_value(j_max) != COMM_PORT_MAX) {
+        snprintf(err, err_len, "port_max: scenario says %d, C says %d",
+                 (int)json_integer_value(j_max), COMM_PORT_MAX);
+        return -1;
+    }
+
+    /* Restore whatever the runner was invoked with, so one case cannot leak
+     * an override into the next. */
+    const char *saved = getenv("AT_COMM_PORT");
+    char saved_buf[32] = {0};
+    bool had_saved = (saved != NULL);
+    if (had_saved) snprintf(saved_buf, sizeof(saved_buf), "%s", saved);
+
+    int rc = 0;
+    size_t n = json_array_size(table);
+    for (size_t i = 0; i < n && rc == 0; i++) {
+        json_t *row = json_array_get(table, i);
+        const char *id = json_string_value(json_object_get(row, "id"));
+        if (id == NULL) id = "?";
+        int cfg_port = (int)json_integer_value(json_object_get(row, "cfg_port"));
+        json_t *j_env = json_object_get(row, "env");
+        const char *env = json_string_value(j_env);   /* NULL when YAML null */
+        int want_port = (int)json_integer_value(json_object_get(row, "expect_port"));
+        const char *want_src =
+            json_string_value(json_object_get(row, "expect_source"));
+        if (want_src == NULL) want_src = "";
+
+        if (env != NULL) setenv("AT_COMM_PORT", env, 1);
+        else unsetenv("AT_COMM_PORT");
+        net_port_resolve_reset();  /* the override is read once and cached */
+
+        net_port_source_t src = PORT_SRC_DEFAULT;
+        int got = net_port_resolve(cfg_port, &src, NULL);
+        const char *got_src = net_port_source_name(src);
+
+        if (got != want_port) {
+            snprintf(err, err_len,
+                     "%s: cfg_port=%d AT_COMM_PORT=%s -> port %d, want %d",
+                     id, cfg_port, env != NULL ? env : "(unset)", got, want_port);
+            rc = -1;
+        } else if (strcmp(got_src, want_src) != 0) {
+            snprintf(err, err_len,
+                     "%s: cfg_port=%d AT_COMM_PORT=%s -> source '%s', want '%s'",
+                     id, cfg_port, env != NULL ? env : "(unset)",
+                     got_src, want_src);
+            rc = -1;
+        } else if (got + 1 > COMM_PORT_MAX + 1) {
+            /* Derived group port must stay inside the 16-bit space. */
+            snprintf(err, err_len, "%s: group port %d out of range", id, got + 1);
+            rc = -1;
+        }
+    }
+
+    if (had_saved) setenv("AT_COMM_PORT", saved_buf, 1);
+    else unsetenv("AT_COMM_PORT");
+    net_port_resolve_reset();
+    return rc;
+}
+
 static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
     /* Network scenarios are protocol-specific; each adds a branch here
      * matching by case name. */
@@ -2071,6 +2169,9 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
     }
     if (strcmp(c->name, "group-key-rotation-decrypt-fails") == 0) {
         return run_group_key_rotation_decrypt_fails(c, err, err_len);
+    }
+    if (strcmp(c->name, "port-resolution") == 0) {
+        return run_port_resolution(c, err, err_len);
     }
     snprintf(err, err_len, "unknown network scenario: %s", c->name);
     return 1; /* skip */

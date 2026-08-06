@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@ import os
 import sys
 import json
 import base64
+import tempfile
+from contextlib import contextmanager
 from io import StringIO
 from datetime import datetime, timedelta
 from dateutil import parser
@@ -34,6 +36,43 @@ from ..util import ClassEnumMeta
 
 _ALLOWED_CONFIG_TYPES: set = set()
 _ALLOWED_ENUM_TYPES: set = set()
+
+
+@contextmanager
+def atomic_write(filepath, mode='w'):
+    """Write a file atomically: serialize into a temp file in the same
+    directory, then os.replace() it onto the target.
+
+    A plain open(filepath, 'w') truncates the file to empty *before* the new
+    contents are written, so a concurrent reader (e.g.
+    discover.load_configs -> Configuration.from_file -> json.load, often in
+    another process) can catch the empty/partial window and raise
+    "JSONDecodeError: Expecting value: line 1 column 1". os.replace is atomic
+    on POSIX, so readers always see either the previous complete file or the
+    new complete file. The temp name does not end in Configuration.file_ext,
+    so discover.load_configs' os.listdir filter ignores it even if it races
+    the rename.
+
+    Use as a drop-in for open(path, 'w') when writing config snapshots:
+
+        with atomic_write(path) as f:
+            json.dump(obj, f, ...)
+    """
+    directory = os.path.dirname(filepath) or '.'
+    fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(filepath) + '.',
+                               suffix='.tmp', dir=directory)
+    try:
+        with os.fdopen(fd, mode) as f:
+            yield f
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, filepath)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def register_config_type(cls):
@@ -75,6 +114,14 @@ class Configuration(object):
                      SerializeMode.PROTO: '.cfg.pb'}
     file_ext = _file_ext_map.get(mode, '.cfg.json')
     log_stdout = hex(sum([ord(x) for x in 'stdout']))
+    # Companion destination sentinel to log_stdout. Needed because
+    # `silent=True` suppresses the stdout log handler (it is what keeps the
+    # console clean), so `silent=True` + `logfile=log_stdout` asks for logs on a
+    # stream that is being suppressed -- AT resolves that by discarding them, and
+    # log_level goes inert. Callers that want no console chatter but DO want logs
+    # (the diag harness, any operator wanting a debug trace out of a quiet node)
+    # name this instead and get a stderr handler regardless of `silent`.
+    log_stderr = hex(sum([ord(x) for x in 'stderr']))
     _msg_class = None
 
     def __init__(self, msg_class=None):
@@ -157,7 +204,9 @@ class Configuration(object):
         return cls.from_string(data.decode('utf-8'))
 
     def to_file(self, filepath):
-        with open(filepath, 'w') as cfg:
+        # Atomic write (see atomic_write): a plain open(filepath, 'w') would
+        # expose an empty/partial file to a concurrent load_configs reader.
+        with atomic_write(filepath) as cfg:
             json.dump(self, cfg, cls=ConfigJSONEncoder, indent=2)
 
     def sync_from_message(self):

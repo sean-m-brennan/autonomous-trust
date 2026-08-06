@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -361,6 +361,14 @@ class DashControl(object):
     def run(self, host: str, port: int, **kwargs):
         kwargs['use_reloader'] = False  # *never* allow reloader (causes subtle bugs)
         import signal
-        signal.signal(signal.SIGINT, lambda s, f: self.halt())
+        import threading
+        # signal.signal() only works on the main thread of the main
+        # interpreter. When the server is hosted in a background thread (e.g.
+        # the multi-agency coordinator runs the dashboard in a daemon thread
+        # while AT owns the main loop), installing a SIGINT handler raises
+        # ValueError — and the owning main thread should handle signals
+        # anyway. Only grab SIGINT when we ARE the main thread.
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGINT, lambda s, f: self.halt())
         self.serve_websockets()
         self.app.run(host, port, **kwargs)

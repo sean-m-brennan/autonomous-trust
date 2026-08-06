@@ -10,7 +10,7 @@
  *   - borrowed references returned by getters (caller must NOT free)
  *   - malloc'd strings from json_dumps (caller must free)
  *
- * Copyright 2025 Sean M. Brennan and contributors
+ * Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  * SPDX-License-Identifier: Apache-2.0
  */
 

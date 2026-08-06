@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -84,8 +84,9 @@ class TestSlashScoringFloor:
     def test_consensus_reputation_unslashed_uses_baseline(self):
         rp = _make_rep_process()
         peer = uuid4()
-        # No slash, empty chain -> consensus baseline (0.5), NOT floored.
-        assert rp._consensus_reputation(peer) == pytest.approx(0.5)
+        # No slash, empty chain -> consensus baseline (PREREP_NEUTRAL, 0.2),
+        # NOT floored.
+        assert rp._consensus_reputation(peer) == pytest.approx(0.2)
 
     def test_compute_reputation_short_circuits_on_slash(self):
         rp = _make_rep_process()
@@ -119,22 +120,24 @@ class TestApplySlash:
         rp._apply_slash(att)  # same (target, epoch) -> no-op
         assert len(rp.pending_tiers) == n
 
-    def test_rehabilitate_lifts_hard_floor_but_score_stays_low(self):
+    def test_rehabilitate_lifts_to_neutral_and_readmits(self):
         rp = _make_rep_process()
         target = uuid4()
-        rp._apply_slash(_att(rp.identity.uuid, target, floor=0.1, epoch=1))
+        rp._apply_slash(_att(rp.identity.uuid, target, floor=0.0, epoch=1))
+        # Slashed below the 0.1 comm cut-off -> excluded.
+        assert rp._is_excluded(rp._consensus_reputation(target))
         rp._apply_slash(_att(rp.identity.uuid, target,
                              reason=SlashAttestation.REASON_REHABILITATE,
                              floor=0.0, epoch=2))
-        # The hard floor is released: the peer is no longer pinned in
-        # _slashed and CAN climb again.
+        # The hard floor is released: the peer is no longer pinned in _slashed.
         assert str(target) not in rp._slashed
-        # ...but rehabilitation is an UPHILL BATTLE. The score does NOT snap
-        # back to the 0.5 baseline — the slashed value persists in
-        # self.reputations as the cold-start prior (_consensus_baseline), so
-        # the peer must earn its standing back through new committed
-        # transactions rather than being handed neutrality for free.
-        assert rp._consensus_reputation(target) == pytest.approx(0.1)
+        # Rehabilitation LIFTS the score to neutral (PREREP_NEUTRAL, 0.2) --
+        # above the cut-off -- so the peer is re-admitted and then re-earns
+        # elevated trust from neutral. Recovery is explicit-only (this
+        # REASON_REHABILITATE lift); an excluded peer, being ignored, could
+        # never transact its way back on its own.
+        assert rp._consensus_reputation(target) == pytest.approx(0.2)
+        assert not rp._is_excluded(rp._consensus_reputation(target))
 
 
 # --- serialization ----------------------------------------------------------

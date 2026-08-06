@@ -5,8 +5,7 @@ _encryptor: !Cfg:autonomous_trust.core.identity.encrypt.Encryptor
     MmJiOTdmYTkwZmFkZWZkNTFjYWM3ZTljMTI4MmExMDFmNGM2MWZlZTM5MWJkOWY0NzA5OTI0NTZm
     MGJkNjM4Mg==
   public_only: false
-_fullname: t.p.payne@tekfive.com
-_nickname: SGMPayne
+_nickname: t.p.payne@tekfive.com
 _public_only: false
 _rank: 0
 _signature: !Cfg:autonomous_trust.core.identity.sign.Signature
@@ -16,4 +15,4 @@ _signature: !Cfg:autonomous_trust.core.identity.sign.Signature
   public_only: false
 _uuid: fc69acad-797a-4e63-be98-2f00ea26dffa
 address: 10.244.0.6
-petname: Pain
+petname: SGMPayne

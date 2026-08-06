@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -73,9 +73,23 @@ static int _trust_tier(double score)
 
 /* Forward declaration — definition follows _ensure_init/state struct.
  * Emits a local-IPC tier_update to the identity process queue iff the
- * peer's trust tier has changed since the last publication. Mirrors
- * Python's `_publish_tier_change` in repprocess.py:595-619. */
-static void _publish_tier_change(const uuid_t peer_uuid, double score);
+ * peer's trust tier has changed since the last publication, and an
+ * exclude/readmit control message to the network process iff the peer
+ * crossed the COMM_CUTOFF communication cut-off. Mirrors Python's
+ * `_publish_tier_change` in repprocess.py. Takes @p proc to resolve the
+ * peer's address (from proc->protocol.peers) for the exclusion message. */
+static void _publish_tier_change(const process_t *proc,
+                                 const uuid_t peer_uuid, double score);
+/* Resolve @p peer_uuid to an address and send a Network exclude/readmit
+ * control message to the network process. Mirrors Python
+ * ReputationProcess._publish_exclusion. */
+static void _publish_exclusion(const process_t *proc,
+                               const uuid_t peer_uuid, bool excluded);
+
+/* Slash "reason" that lifts (rather than floors) a target: releases the
+ * slash floor, restores the score to PREREP_NEUTRAL, and re-admits it.
+ * Recovery is explicit-only. Mirror: Python SlashAttestation.REASON_REHABILITATE. */
+#define REP_SLASH_REASON_REHABILITATE "rehabilitate"
 
 /****************************
  * Protocol-string definitions (declared `extern char[]` in
@@ -98,6 +112,9 @@ char REP_PROTO_REP_RESP[]    = "reputation response";
 char REP_PROTO_CONSENSUS_REP_REQ[] = "request consensus reputation";
 char REP_PROTO_LOCAL_QUERY[] = "local_rep_query";
 char REP_PROTO_LOCAL_RESP[]  = "local_rep_response";
+/* App -> AT (via the daemon main loop): re-emit the peer view on the
+ * app-facing carrier. See doc/architecture/app-peer-carrier.md. */
+char REP_PROTO_APP_ROSTER[]  = AT_APP_ROSTER_REQUEST;
 char REP_PROTO_SLASH_PROPOSE[] = "slash propose";
 char REP_PROTO_SLASH_SIGN[]    = "slash sign";
 char REP_PROTO_SLASH_FINAL[]   = "slash final";
@@ -117,6 +134,13 @@ static char ID_TIER_FUNC[] = "tier_update";
  * in-flight tasks whose capability.required_tier exceeds the new tier.
  */
 static char NEG_TIER_LOST_FUNC[] = "tier_lost";
+/* Local-IPC function fields for the reputation communication cut-off:
+ * reputation emits these to the network process, which excludes/readmits the
+ * carried address. Matched by value against net_proc's NET_FN_EXCLUDE /
+ * NET_FN_READMIT (network.h) — same cross-process string-match convention as
+ * ID_TIER_FUNC above. Value must match Python Network.exclude / readmit. */
+static char NET_EXCLUDE_FUNC[] = "exclude";
+static char NET_READMIT_FUNC[] = "readmit";
 
 /****************************
  * Process state (file-scope static, thread-safe via mutex)
@@ -178,6 +202,13 @@ static struct {
     char  task_weights_ring[2 * MAX_CHAIN_LEN][UUID_STRING_LEN + 1];
     int   task_weights_ring_head;
     int   task_weights_ring_len;
+    /* Per-task capability tier cache (task_uuid_str -> int), parallel to
+     * task_weights and evicted in lockstep with it (every task_tiers key is
+     * also a task_weights key; _record_task_weight_locked removes both at the
+     * same points, so no separate ring is needed). Feeds the per-tier
+     * consensus view (reputation_consensus_by_tier). Mirrors Python's
+     * self.task_tiers (deferred.md §2.3). */
+    map_t task_tiers;
     /* --- Slashing (fast-penalty path) ---
      * Mirrors Python ReputationProcess._slashed / _slash_sigs /
      * _slash_pending. A finalized slash floors the target's reputation
@@ -188,6 +219,14 @@ static struct {
     map_t slash_sigs;     /* "target:epoch" -> integer_data(signer count) */
     map_t slash_pending;  /* "target:epoch" -> integer_data(floor x1000) */
     int64_t slash_epoch;
+    /* Communication cut-off exclusion set: peers whose reputation fell below
+     * COMM_CUTOFF and were excluded at the network layer. Tracks the crossing
+     * so _publish_tier_change emits exclude/readmit only on an actual
+     * transition. Mirrors Python ReputationProcess._excluded. (C has no
+     * reputation persistence, so there is no snapshot to boot-reseed from —
+     * the Python two-sided persist filter + _seed_exclusions_from_snapshot
+     * have no C counterpart; see REPUTATION_THRESHOLDS_TODO.md.) */
+    map_t excluded;       /* peer_uuid_str -> integer_data(1) */
     /* --- Phase 2: quorum-signed Merkle checkpoints ---
      * Mirrors Python ReputationProcess._checkpoint / _checkpoint_sigs /
      * _checkpoint_pending. A member co-signs a proposed checkpoint only when
@@ -224,10 +263,12 @@ static void _ensure_init(void)
         map_init(&rep_state.task_weights);
         rep_state.task_weights_ring_head = 0;
         rep_state.task_weights_ring_len = 0;
+        map_init(&rep_state.task_tiers);
         map_init(&rep_state.slashed);
         map_init(&rep_state.slash_sigs);
         map_init(&rep_state.slash_pending);
         rep_state.slash_epoch = 0;
+        map_init(&rep_state.excluded);
         map_init(&rep_state.checkpoint_sigs);
         map_init(&rep_state.checkpoint_pending);
         rep_state.checkpoint_root[0] = '\0';
@@ -256,6 +297,21 @@ static int _resolve_tx_weight(const char *cap_name)
     return w > 0 ? w : 1;
 }
 
+/* Look up the required_tier for a capability by name (deferred.md §2.3).
+ * Mirrors Python's _resolve_tx_tier: empty name → 0, unknown cap → 0,
+ * otherwise the cap's required_tier (clamped to ≥0). Feeds the per-tier
+ * consensus view via the task_tiers cache. */
+static int _resolve_tx_tier(const char *cap_name)
+{
+    if (cap_name == NULL || cap_name[0] == '\0')
+        return 0;
+    capability_t *cap = find_capability(cap_name);
+    if (cap == NULL)
+        return 0;
+    int t = cap->required_tier;
+    return t > 0 ? t : 0;
+}
+
 /* Insert into rep_state.task_weights with FIFO eviction at the cap.
  * Caller must hold rep_state.lock. Refreshes order on re-insert so a
  * recent update isn't immediately evicted by an unrelated insert —
@@ -275,6 +331,7 @@ static void _record_task_weight_locked(char *task_uuid_str, int weight)
         && existing != NULL)
     {
         map_remove(&rep_state.task_weights, task_uuid_str);
+        map_remove(&rep_state.task_tiers, task_uuid_str);  /* lockstep (§2.3) */
         /* Best-effort ring compaction: walk and remove matching slot.
          * O(N) but N <= 2*MAX_CHAIN_LEN, and refresh hits are rare. */
         for (int i = 0; i < rep_state.task_weights_ring_len; i++)
@@ -314,6 +371,8 @@ static void _record_task_weight_locked(char *task_uuid_str, int weight)
         {
             map_remove(&rep_state.task_weights,
                        rep_state.task_weights_ring[evict_slot]);
+            map_remove(&rep_state.task_tiers,           /* lockstep (§2.3) */
+                       rep_state.task_weights_ring[evict_slot]);
             rep_state.task_weights_ring[evict_slot][0] = '\0';
         }
     }
@@ -328,16 +387,51 @@ static void _record_task_weight_locked(char *task_uuid_str, int weight)
     rep_state.task_weights_ring[rep_state.task_weights_ring_head][UUID_STRING_LEN] = '\0';
 }
 
-static void _publish_tier_change(const uuid_t peer_uuid, double score)
+/* Record a task's capability tier into rep_state.task_tiers (deferred.md
+ * §2.3). No own ring: every tier key is recorded together with its weight
+ * key, and _record_task_weight_locked removes both at the same eviction
+ * points, so the tier map stays bounded in lockstep with task_weights.
+ * Caller must hold rep_state.lock. */
+static void _record_task_tier_locked(char *task_uuid_str, int tier)
+{
+    if (task_uuid_str == NULL || task_uuid_str[0] == '\0') return;
+    data_t *t_dat = integer_data(tier > 0 ? tier : 0);
+    if (t_dat == NULL) return;
+    map_set(&rep_state.task_tiers, task_uuid_str, t_dat);
+}
+
+static void _publish_tier_change(const process_t *proc,
+                                 const uuid_t peer_uuid, double score)
 {
     int new_tier = _trust_tier(score);
     char uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(peer_uuid, uuid_str);
 
+    pthread_mutex_lock(&rep_state.lock);
+
+    /* Communication cut-off crossing. Checked BEFORE the tier dedup
+     * early-return because COMM_CUTOFF (0.1) lies WITHIN tier 0 ([0,0.5)):
+     * a 0.15 -> 0.05 move is a tier-0 -> tier-0 no-op for the tier logic
+     * yet must still exclude the peer. The exclusion set is the authority;
+     * the network process is notified only on an actual crossing. Mirrors
+     * Python repprocess._publish_tier_change. */
+    int exclusion_action = 0;  /* +1 exclude, -1 readmit, 0 unchanged */
+    bool now_excluded = (score < COMM_CUTOFF);
+    data_t *ex_dat = NULL;
+    bool was_excluded =
+        (map_get(&rep_state.excluded, uuid_str, &ex_dat) == 0);
+    (void)ex_dat;  /* membership only; value unused */
+    if (now_excluded && !was_excluded) {
+        map_set(&rep_state.excluded, uuid_str, integer_data(1));
+        exclusion_action = 1;
+    } else if (was_excluded && !now_excluded) {
+        map_remove(&rep_state.excluded, uuid_str);
+        exclusion_action = -1;
+    }
+
     /* Dedup: skip if the tier hasn't changed from the last publication
      * for this peer. Mirrors Python's `self.peer_tiers.get(key) == new_tier`
      * guard in repprocess.py. */
-    pthread_mutex_lock(&rep_state.lock);
     int prior = -1;
     data_t *prior_dat = NULL;
     if (map_get(&rep_state.peer_tiers, uuid_str, &prior_dat) == 0 &&
@@ -346,6 +440,10 @@ static void _publish_tier_change(const uuid_t peer_uuid, double score)
     }
     if (prior == new_tier) {
         pthread_mutex_unlock(&rep_state.lock);
+        /* Still enforce the cut-off crossing even when the tier is
+         * unchanged (the whole reason the cut-off check precedes this). */
+        if (exclusion_action != 0)
+            _publish_exclusion(proc, peer_uuid, exclusion_action > 0);
         return;
     }
     /* Capture demotion BEFORE we overwrite the cache so the
@@ -359,6 +457,12 @@ static void _publish_tier_change(const uuid_t peer_uuid, double score)
     if (tier_dat != NULL)
         map_set(&rep_state.peer_tiers, uuid_str, tier_dat);
     pthread_mutex_unlock(&rep_state.lock);
+
+    /* Enforce the cut-off crossing (network exclude/readmit) alongside the
+     * tier change. Done outside rep_state.lock because _publish_exclusion
+     * takes the peers read-lock and sends IPC. */
+    if (exclusion_action != 0)
+        _publish_exclusion(proc, peer_uuid, exclusion_action > 0);
 
     /* Build the tier_update payload — a 2-element JSON array
      * [uuid_str, tier_int] matching Python's
@@ -398,6 +502,128 @@ static void _publish_tier_change(const uuid_t peer_uuid, double score)
     json_decref(arr);
 }
 
+
+/****************************
+ * The app-facing reputation carrier (ethne D5/D18; see
+ * doc/architecture/app-peer-carrier.md).
+ *
+ * Deliberately NOT folded into _publish_tier_change: that function is gated
+ * on a tier CROSSING, and a consumer tracking earned reputation needs every
+ * change, not only the ones that step over one of four floors. It is also
+ * not folded into the tier_update IPC, because that message exists to tell
+ * the identity process a coarse tier and giving it the raw score would put a
+ * cached second copy of the score store where nothing needs one.
+ ****************************/
+
+/* @p rated is the load-bearing argument: an unrated peer reads as
+ * PREREP_NEUTRAL, which is also a score a peer can genuinely earn, so a
+ * consumer given only the number cannot tell "no information" from
+ * "rated 0.2". The score is zeroed when unrated so a consumer that ignores
+ * the flag cannot silently read a plausible-looking number. */
+static int _publish_reputation(const uuid_t peer_uuid, double score, bool rated)
+{
+    generic_msg_t msg = {0};
+    msg.type = PEER_REPUTATION;
+    msg.size = sizeof(peer_reputation_msg_t);
+    uuid_copy(msg.info.peer_reputation.peer_uuid, peer_uuid);
+    msg.info.peer_reputation.score = rated ? score : 0.0;
+    msg.info.peer_reputation.rated = rated;
+    return messaging_send(AT_MAIN_QUEUE, PEER_REPUTATION, &msg, false);
+}
+
+/* A score this process just committed is by construction rated. */
+static void _publish_reputation_change(const uuid_t peer_uuid, double score)
+{
+    _publish_reputation(peer_uuid, score, true);
+}
+
+int reputation_emit_all(const process_t *proc)
+{
+    if (proc == NULL || !rep_state.initialized)
+        return 0;
+    uuid_t uuids[DEFAULT_MAX_PEERS];
+    peers_read_lock(proc);
+    size_t n = proc->protocol.num_peers;
+    if (n > DEFAULT_MAX_PEERS)
+        n = DEFAULT_MAX_PEERS;
+    for (size_t i = 0; i < n; i++)
+        uuid_copy(uuids[i], proc->protocol.peers[i].uuid);
+    peers_read_unlock(proc);
+
+    int emitted = 0;
+    for (size_t i = 0; i < n; i++)
+    {
+        /* A peer with no rating is reported AS unrated rather than skipped:
+         * silence would leave a consumer unable to distinguish "we hold no
+         * rating" from "the message was lost". This pull is the only place
+         * rated=false can cross, since every change emission is rated. */
+        double score = 0.0;
+        pthread_mutex_lock(&rep_state.lock);
+        bool rated = (reputations_get(&rep_state.reputations, uuids[i], &score) == 0);
+        pthread_mutex_unlock(&rep_state.lock);
+        if (_publish_reputation(uuids[i], score, rated) == 0)
+            emitted++;
+    }
+    return emitted;
+}
+
+/* Handler: the app asked for the current peer view. */
+static bool handle_app_roster_request(const process_t *proc,
+                                      directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    (void)msg;
+    int n = reputation_emit_all(proc);
+    log_debug(proc->logger,
+              "Reputation: peer roster request -> %d reputation(s)\n", n);
+    return true;
+}
+
+/* Resolve @p peer_uuid to its address from the live peer roster and send a
+ * Network exclude/readmit control message to the network process. Local IPC
+ * only (no wire egress). No-op if the address is unknown (nothing to key the
+ * network-layer gate on). Mirrors Python ReputationProcess._publish_exclusion
+ * (address resolution + Message(CfgIds.network, Network.exclude/readmit, addr)). */
+static void _publish_exclusion(const process_t *proc,
+                               const uuid_t peer_uuid, bool excluded)
+{
+    if (proc == NULL)
+        return;
+    char address[ADDR_LEN + 1];
+    address[0] = '\0';
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+        if (uuid_compare(proc->protocol.peers[i].uuid, peer_uuid) == 0) {
+            snprintf(address, sizeof(address), "%s",
+                     proc->protocol.peers[i].address);
+            break;
+        }
+    }
+    peers_read_unlock(proc);
+    if (address[0] == '\0') {
+        char uuid_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(peer_uuid, uuid_str);
+        log_debug(proc->logger,
+                  "Reputation: exclusion %s for %s: no address, gate skipped\n",
+                  excluded ? "add" : "remove", uuid_str);
+        return;
+    }
+    generic_msg_t ipc = {0};
+    ipc.type = NET_MESSAGE;
+    strncpy(ipc.info.net_msg.process, "network", PROC_NAME_LEN);
+    ipc.info.net_msg.function = excluded ? NET_EXCLUDE_FUNC : NET_READMIT_FUNC;
+    ipc.info.net_msg.encrypt = false;  /* local IPC, no wire egress */
+    strncpy(ipc.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+    json_t *body = json_string(address);
+    if (body == NULL)
+        return;
+    net_msg_pack_json(&ipc.info.net_msg, body);
+    messaging_send("network", NET_MESSAGE, &ipc, false);
+    json_decref(body);
+    log_info(proc->logger, "Reputation: %s %s at the network layer\n",
+             excluded ? "excluded" : "readmitted", address);
+}
+
 /****************************
  * Handler: handle_request (ask permission) — Paxos Phase 1a
  * Validate peer, check id1 > last_id AND chain index matches → grant/nack/backdate
@@ -412,7 +638,7 @@ static void _publish_tier_change(const uuid_t peer_uuid, double score)
 static bool handle_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Reputation: permission request from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Reputation: permission request from %s\n", nmsg->from_whom.nickname);
 
     /* Unpack (id1, id2, peer_uuid) from JSON payload */
     json_t *payload = NULL;
@@ -435,7 +661,19 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
 
     int64_t id1 = json_integer_value(j_id1);
     int64_t id2 = json_integer_value(j_id2);
-    const char *peer_uuid_str = json_string_value(j_peer_uuid);
+    /* peer_uuid_str is a borrowed pointer into `payload`; copy it out before
+     * the json_decref below so the GRANT branch can echo it back without a
+     * use-after-free. Preserve NULL (non-string field) so the grant payload
+     * omits the key exactly as before rather than emitting an empty string. */
+    const char *peer_uuid_borrowed = json_string_value(j_peer_uuid);
+    char peer_uuid_buf[UUID_STRING_LEN + 1];
+    bool have_peer_uuid = peer_uuid_borrowed != NULL;
+    if (have_peer_uuid)
+    {
+        strncpy(peer_uuid_buf, peer_uuid_borrowed, UUID_STRING_LEN);
+        peer_uuid_buf[UUID_STRING_LEN] = '\0';
+    }
+    const char *peer_uuid_str = have_peer_uuid ? peer_uuid_buf : NULL;
 
     int64_t out_last_id = 0;
     int out_chain_len = 0;
@@ -538,7 +776,7 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
 static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Reputation: grant from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Reputation: grant from %s\n", nmsg->from_whom.nickname);
 
     /* Unpack (id1, id2, peer_uuid, last_id, chain_len) */
     json_t *payload = NULL;
@@ -666,7 +904,7 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
 static bool handle_nack(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Reputation: nack from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Reputation: nack from %s\n", nmsg->from_whom.nickname);
 
     /* Unpack (id1, id2) from payload for retry capability */
     json_t *payload = NULL;
@@ -748,7 +986,7 @@ static bool handle_nack(const process_t *proc, directory_t *queues, generic_msg_
 static bool handle_backdate(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_info(proc->logger, "Reputation: backdate notification from %s\n", nmsg->from_whom.fullname);
+    log_info(proc->logger, "Reputation: backdate notification from %s\n", nmsg->from_whom.nickname);
 
     /* Request chain update from this peer */
     generic_msg_t update_req = {0};
@@ -778,7 +1016,7 @@ static bool handle_backdate(const process_t *proc, directory_t *queues, generic_
 static bool handle_transaction(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Reputation: transaction from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Reputation: transaction from %s\n", nmsg->from_whom.nickname);
 
     /* Reject unverified Paxos proposals. Mirrors Python
      * repprocess.handle_transaction:390 — without this guard a peer
@@ -791,7 +1029,7 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
     {
         log_warn(proc->logger,
                     "Reputation: rejecting unverified Paxos proposal from %s\n",
-                    nmsg->from_whom.fullname);
+                    nmsg->from_whom.nickname);
         return true;
     }
 
@@ -818,8 +1056,32 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
     int64_t id2 = json_integer_value(j_id2);
     int64_t id1 = json_integer_value(j_id1);
     double score = json_real_value(j_score);
-    const char *peer_uuid_str = json_string_value(j_peer_uuid);
-    const char *task_uuid_str = json_string_value(json_object_get(payload, "task_uuid"));
+    /* peer_uuid / task_uuid are borrowed from `payload` but are echoed back
+     * into the ACCEPTED reply AFTER json_decref(payload) below; copy them out
+     * now to avoid a use-after-free. Preserve NULL so an absent field stays
+     * absent in the reply rather than becoming an empty string. cap_name is
+     * only consumed before the decref, so it can stay borrowed. */
+    const char *peer_uuid_borrowed = json_string_value(j_peer_uuid);
+    char peer_uuid_buf[UUID_STRING_LEN + 1];
+    bool have_peer_uuid = peer_uuid_borrowed != NULL;
+    if (have_peer_uuid)
+    {
+        strncpy(peer_uuid_buf, peer_uuid_borrowed, UUID_STRING_LEN);
+        peer_uuid_buf[UUID_STRING_LEN] = '\0';
+    }
+    const char *peer_uuid_str = have_peer_uuid ? peer_uuid_buf : NULL;
+
+    const char *task_uuid_borrowed =
+        json_string_value(json_object_get(payload, "task_uuid"));
+    char task_uuid_str_buf[UUID_STRING_LEN + 1];
+    bool have_task_uuid = task_uuid_borrowed != NULL;
+    if (have_task_uuid)
+    {
+        strncpy(task_uuid_str_buf, task_uuid_borrowed, UUID_STRING_LEN);
+        task_uuid_str_buf[UUID_STRING_LEN] = '\0';
+    }
+    const char *task_uuid_str = have_task_uuid ? task_uuid_str_buf : NULL;
+
     const char *cap_name = json_string_value(
         json_object_get(payload, "capability_name"));
 
@@ -845,6 +1107,7 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
         task_uuid_buf[UUID_STRING_LEN] = '\0';
         pthread_mutex_lock(&rep_state.lock);
         _record_task_weight_locked(task_uuid_buf, _resolve_tx_weight(cap_name));
+        _record_task_tier_locked(task_uuid_buf, _resolve_tx_tier(cap_name));
         pthread_mutex_unlock(&rep_state.lock);
     }
 
@@ -891,7 +1154,7 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
 static bool handle_accepted(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Reputation: tx accepted by %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Reputation: tx accepted by %s\n", nmsg->from_whom.nickname);
 
     /* Reject unverified Paxos acceptances. Mirrors Python
      * repprocess.handle_accepted:439 — a forged ACCEPTED can push
@@ -901,7 +1164,7 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
     {
         log_warn(proc->logger,
                     "Reputation: rejecting unverified Paxos acceptance from %s\n",
-                    nmsg->from_whom.fullname);
+                    nmsg->from_whom.nickname);
         return true;
     }
 
@@ -1147,7 +1410,7 @@ static bool handle_committed(const process_t *proc, directory_t *queues, generic
 static bool handle_outdated(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_info(proc->logger, "Reputation: update requested by %s\n", nmsg->from_whom.fullname);
+    log_info(proc->logger, "Reputation: update requested by %s\n", nmsg->from_whom.nickname);
 
     pthread_mutex_lock(&rep_state.lock);
 
@@ -1191,7 +1454,7 @@ static bool handle_outdated(const process_t *proc, directory_t *queues, generic_
 static bool handle_update(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_info(proc->logger, "Reputation: chain update from %s\n", nmsg->from_whom.fullname);
+    log_info(proc->logger, "Reputation: chain update from %s\n", nmsg->from_whom.nickname);
 
     /* Unpack chain JSON from payload */
     json_t *chain_json = NULL;
@@ -1314,7 +1577,7 @@ static bool handle_consensus_rep_request(const process_t *proc, directory_t *que
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Reputation: consensus rep request from %s\n",
-              nmsg->from_whom.fullname);
+              nmsg->from_whom.nickname);
     probes_counter("rep.consensus", "enter", NULL);
 
     json_t *payload = NULL;
@@ -1402,7 +1665,7 @@ static bool handle_consensus_rep_request(const process_t *proc, directory_t *que
 static bool handle_rep_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Reputation: rep request from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Reputation: rep request from %s\n", nmsg->from_whom.nickname);
     /* Mirrors Python's `_probes.counter('rep.compute', 'enter')` at
      * repprocess.py:429; the rep.compute layer correlates handle_req
      * → compute → forward across the reputation pipeline. */
@@ -1487,7 +1750,8 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
      * already holds the send context; Python uses a queue because its
      * _compute_reputation runs in a spawned thread without queue access. */
     if (have_uuid) {
-        _publish_tier_change(peer_uuid, score);
+        _publish_tier_change(proc, peer_uuid, score);
+        _publish_reputation_change(peer_uuid, score);
         probes_counter("rep.compute", "queued", NULL);
     }
 
@@ -1531,7 +1795,7 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
 static bool handle_rep_response(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Reputation: rep response from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Reputation: rep response from %s\n", nmsg->from_whom.nickname);
 
     /* Unpack and store in requested_reps array */
     json_t *payload = NULL;
@@ -1637,12 +1901,14 @@ static bool handle_local_rep_query(const process_t *proc, directory_t *queues, g
   requires rep_state.paxos.initialized == \true;
 */
 void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
-                          const uuid_t peer_uuid, double score)
+                          const uuid_t peer_uuid, double score,
+                          const char *capability_name)
 {
     char task_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(task_uuid, task_str);
-    log_info(proc->logger, "Reputation: forwarding transaction for task %s, score %.2f\n",
-             task_str, score);
+    log_info(proc->logger, "Reputation: forwarding transaction for task %s, score %.2f (cap %s)\n",
+             task_str, score,
+             (capability_name && capability_name[0]) ? capability_name : "-");
 
     pthread_mutex_lock(&rep_state.lock);
 
@@ -1652,9 +1918,22 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
     {
         uuid_copy(tx->task_uuid, task_uuid);
         tx->score = score;
+        /* Carry the capability name so _pure_reputation weights this tx by
+         * its tier (mirrors Python TransactionScore.capability_name). */
+        if (capability_name != NULL)
+            strncpy(tx->capability_name, capability_name, CAP_NAMELEN);
+        else
+            tx->capability_name[0] = '\0';
+        tx->capability_name[CAP_NAMELEN] = '\0';
         data_t *tx_dat = object_ptr_data(tx, sizeof(tx_score_t));
         map_set(&rep_state.my_requests, task_str, tx_dat);
     }
+
+    /* Cache the weight for this task so _pure_reputation can aggregate it
+     * (mirrors Python _start_paxos → _record_task_weight). Done under the
+     * same lock as the my_requests insert. */
+    _record_task_weight_locked(task_str, _resolve_tx_weight(capability_name));
+    _record_task_tier_locked(task_str, _resolve_tx_tier(capability_name));
 
     pthread_mutex_unlock(&rep_state.lock);
 
@@ -1777,7 +2056,7 @@ static bool handle_slash_propose(const process_t *proc, directory_t *queues, gen
     {
         log_warn(proc->logger,
                  "Reputation: rejecting unverified slash_propose from %s\n",
-                 nmsg->from_whom.fullname);
+                 nmsg->from_whom.nickname);
         return true;
     }
     json_t *payload = NULL;
@@ -1918,7 +2197,7 @@ static bool handle_slash_final(const process_t *proc, directory_t *queues, gener
     {
         log_warn(proc->logger,
                  "Reputation: rejecting unverified slash_final from %s\n",
-                 nmsg->from_whom.fullname);
+                 nmsg->from_whom.nickname);
         return true;
     }
     json_t *payload = NULL;
@@ -1928,6 +2207,8 @@ static bool handle_slash_final(const process_t *proc, directory_t *queues, gener
         json_string_value(json_object_get(payload, "target_uuid"));
     double floor = json_real_value(json_object_get(payload, "floor_score"));
     int64_t epoch = json_integer_value(json_object_get(payload, "epoch"));
+    const char *reason =
+        json_string_value(json_object_get(payload, "reason"));
     if (target_str == NULL)
     {
         json_decref(payload);
@@ -1948,9 +2229,37 @@ static bool handle_slash_final(const process_t *proc, directory_t *queues, gener
         json_decref(payload);
         return true;
     }
+    /* Rehabilitation (explicit-only recovery): release the slash floor and
+     * LIFT the score to PREREP_NEUTRAL (above the comm cut-off) so the peer
+     * is re-admitted and must re-earn elevated trust from neutral. Mirrors
+     * Python _apply_slash's REASON_REHABILITATE branch. (Python also clears
+     * _consensus_ema/_consensus_last/_consensus_folded_idx so the lift is
+     * visible past the slash-override; the C twin keeps no such running-EMA
+     * latch — the score store is authoritative — so there is nothing to
+     * clear here.) The tier recompute below drives the readmit through
+     * _publish_tier_change (score above the cut-off -> exclusion_action -1). */
+    if (reason != NULL && strcmp(reason, REP_SLASH_REASON_REHABILITATE) == 0)
+    {
+        pthread_mutex_lock(&rep_state.lock);
+        map_remove(&rep_state.slashed, (map_key_t)target_str);
+        reputations_update(&rep_state.reputations, target_uuid, PREREP_NEUTRAL);
+        pthread_mutex_unlock(&rep_state.lock);
+        _publish_tier_change(proc, target_uuid, PREREP_NEUTRAL);
+        _publish_reputation_change(target_uuid, PREREP_NEUTRAL);
+        log_info(proc->logger,
+                 "Reputation: slash lifted (rehabilitate) target=%s -> %.2f\n",
+                 target_str, PREREP_NEUTRAL);
+        json_decref(payload);
+        return true;
+    }
     pthread_mutex_lock(&rep_state.lock);
     _apply_slash_locked(target_str, target_uuid, floor, epoch);
     pthread_mutex_unlock(&rep_state.lock);
+    /* Drive the tier/exclusion publication so a sub-cut-off floor excludes
+     * the peer at the network layer immediately (mirrors Python's
+     * pending_tiers -> _compute_reputation -> _publish_tier_change flow). */
+    _publish_tier_change(proc, target_uuid, floor);
+    _publish_reputation_change(target_uuid, floor);
     log_info(proc->logger, "Reputation: slash applied target=%s floor=%.2f\n",
              target_str, floor);
     json_decref(payload);
@@ -1977,7 +2286,7 @@ static bool handle_checkpoint_propose(const process_t *proc, directory_t *queues
     {
         log_warn(proc->logger,
                  "Reputation: rejecting unverified checkpoint_propose from %s\n",
-                 nmsg->from_whom.fullname);
+                 nmsg->from_whom.nickname);
         return true;
     }
     json_t *payload = NULL;
@@ -2121,7 +2430,7 @@ static bool handle_checkpoint_final(const process_t *proc, directory_t *queues, 
     {
         log_warn(proc->logger,
                  "Reputation: rejecting unverified checkpoint_final from %s\n",
-                 nmsg->from_whom.fullname);
+                 nmsg->from_whom.nickname);
         return true;
     }
     json_t *payload = NULL;
@@ -2163,6 +2472,7 @@ int reputation_register_handlers(process_t *proc)
     process_register_handler(proc, REP_PROTO_CONSENSUS_REP_REQ,
                              (handler_ptr_t)handle_consensus_rep_request);
     process_register_handler(proc, REP_PROTO_LOCAL_QUERY, (handler_ptr_t)handle_local_rep_query);
+    process_register_handler(proc, REP_PROTO_APP_ROSTER, (handler_ptr_t)handle_app_roster_request);
     process_register_handler(proc, REP_PROTO_SLASH_PROPOSE, (handler_ptr_t)handle_slash_propose);
     process_register_handler(proc, REP_PROTO_SLASH_SIGN,    (handler_ptr_t)handle_slash_sign);
     process_register_handler(proc, REP_PROTO_SLASH_FINAL,   (handler_ptr_t)handle_slash_final);
@@ -2217,6 +2527,8 @@ void reputation_reset_state(int num_peers)
     rep_state.task_weights_ring_head = 0;
     rep_state.task_weights_ring_len = 0;
     memset(rep_state.task_weights_ring, 0, sizeof(rep_state.task_weights_ring));
+    map_free(&rep_state.task_tiers);   /* lockstep with task_weights (§2.3) */
+    map_init(&rep_state.task_tiers);
     map_free(&rep_state.slashed);
     map_init(&rep_state.slashed);
     map_free(&rep_state.slash_sigs);
@@ -2224,6 +2536,8 @@ void reputation_reset_state(int num_peers)
     map_free(&rep_state.slash_pending);
     map_init(&rep_state.slash_pending);
     rep_state.slash_epoch = 0;
+    map_free(&rep_state.excluded);
+    map_init(&rep_state.excluded);
     map_free(&rep_state.checkpoint_sigs);
     map_init(&rep_state.checkpoint_sigs);
     map_free(&rep_state.checkpoint_pending);
@@ -2441,6 +2755,64 @@ int reputation_get_peer_reputation(const uuid_t peer_uuid, double *out)
 /* Frama-C: skipped — [solver-timeout] state-cascade through paxos_init +
  * process_register_handler stubs prevents WP from discharging
  * valid_rw(proc) and valid_rd(signal) at downstream call sites */
+/* Resolve this node's own identity UUID from the loaded "identity" config.
+ * Same access path net_proc.c:1495 and zta_process.c:750 use — proc->configs
+ * carries the identity config for every process, so the long-standing
+ * "process doesn't carry self identity" comments above are obsolete. Returns
+ * true and fills out_uuid on success; false if identity isn't resolvable yet. */
+static bool _resolve_self_uuid(const process_t *proc, uuid_t out_uuid)
+{
+    if (proc == NULL || proc->configs == NULL)
+        return false;
+    data_t *id_dat = NULL;
+    char id_key[] = "identity";
+    if (map_get(proc->configs, id_key, &id_dat) != 0 || id_dat == NULL)
+        return false;
+    config_t *id_cfg = NULL;
+    if (data_object_ptr(id_dat, (void **)&id_cfg) != 0 || id_cfg == NULL
+        || id_cfg->data_struct == NULL)
+        return false;
+    const identity_t *self = (const identity_t *)id_cfg->data_struct;
+    uuid_copy(out_uuid, self->uuid);
+    return true;
+}
+
+/* Handle a locally-submitted TransactionScore. Another process on this node
+ * (e.g. the data-source's producer-side dod.sensor-report score) posts a
+ * TRANSACTION_SCORE generic message to our queue; we are the proposer, so we
+ * start a Paxos round under our own identity. Mirrors Python automate.py
+ * putting a TransactionScore on the reputation queue → repprocess._start_paxos.
+ *
+ * The generic run_message_handlers cannot dispatch this — it only routes
+ * net_msg payloads by function name — which is why such messages were silently
+ * dropped before (and _forward_transaction was dead code).
+ *
+ * Only real (non-zero task_uuid) scores are forwarded. A zero task_uuid is the
+ * legacy ZTA/config "system score" sentinel (zta_process.c:124) whose bilateral
+ * semantics are out of scope here; it stays a no-op, unchanged from before. */
+static void _handle_local_tx_score(const process_t *proc,
+                                   const generic_msg_t *msg,
+                                   const uuid_t self_uuid, bool have_self)
+{
+    const tx_score_msg_t *ts = &msg->info.tx_score;
+    uuid_t zero;
+    uuid_clear(zero);
+    if (uuid_compare(ts->task_uuid, zero) == 0)
+    {
+        log_debug(proc->logger,
+                  "Reputation: ignoring system TRANSACTION_SCORE (zero task)\n");
+        return;
+    }
+    if (!have_self)
+    {
+        log_warn(proc->logger,
+                 "Reputation: dropping local score — self identity unavailable\n");
+        return;
+    }
+    _forward_transaction(proc, ts->task_uuid, self_uuid, ts->score,
+                         ts->capability_name);
+}
+
 int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     _ensure_init();
@@ -2452,6 +2824,48 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
 
     reputation_register_handlers(proc);
     proc->protocol.phase = 1;
-    return process_run(proc, queues, signal, logger);
+
+    /* Custom loop (mirrors data_source_run): intercept locally-submitted
+     * TRANSACTION_SCORE messages and start a Paxos round for them; everything
+     * else flows through the registered net_msg handlers exactly as
+     * process_loop would. Without this, a node could only participate in
+     * transactions other peers initiate, never propose its own. */
+    process_ctx_t ctx = {0};
+    int err = process_setup(proc, signal, logger, &ctx);
+    if (err != 0)
+        return err;
+
+    uuid_t self_uuid;
+    bool have_self = _resolve_self_uuid(proc, self_uuid);
+
+    while (keep_running(proc, &ctx.sig_q, logger))
+    {
+        sleep_until(proc, cadence);
+
+        generic_msg_t buf = {0};
+        int rerr = messaging_recv(&buf);
+        if (rerr == -1 || rerr == ENOMSG)
+            continue;
+
+        if (buf.type == TRANSACTION_SCORE)
+        {
+            /* Self identity may not have been loaded at startup; resolve
+             * lazily on first use so an early submission isn't lost. */
+            if (!have_self)
+                have_self = _resolve_self_uuid(proc, self_uuid);
+            _handle_local_tx_score(proc, &buf, self_uuid, have_self);
+        }
+        else
+        {
+            run_message_handlers(proc, queues, buf.type, &buf);
+        }
+    }
+
+    array_free(queues);
+    if (ctx.fd1 > 0)
+        close(ctx.fd1);
+    if (ctx.fd2 > 0)
+        close(ctx.fd2);
+    return 0;
 }
 DECLARE_PROCESS(reputation, rep_proc, reputation_run);

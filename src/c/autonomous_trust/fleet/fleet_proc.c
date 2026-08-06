@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -89,7 +89,7 @@ static bool handle_update_accepted(const process_t *proc, directory_t *queues, g
 static bool handle_update_proposal(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Fleet: update proposal from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Fleet: update proposal from %s\n", nmsg->from_whom.nickname);
 
     /* Unpack proposal JSON from payload */
     json_t *payload = NULL;
@@ -183,7 +183,7 @@ static bool handle_update_proposal(const process_t *proc, directory_t *queues, g
 static bool handle_vote_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Fleet: vote request from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Fleet: vote request from %s\n", nmsg->from_whom.nickname);
 
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
@@ -288,7 +288,7 @@ static bool handle_vote_request(const process_t *proc, directory_t *queues, gene
 static bool handle_vote_grant(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Fleet: vote grant from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Fleet: vote grant from %s\n", nmsg->from_whom.nickname);
 
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
@@ -409,7 +409,7 @@ static bool handle_vote_grant(const process_t *proc, directory_t *queues, generi
 static bool handle_vote_nack(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Fleet: vote nack from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Fleet: vote nack from %s\n", nmsg->from_whom.nickname);
 
     json_t *payload = NULL;
     int64_t id1 = 0, id2 = 0;
@@ -444,7 +444,7 @@ static bool handle_vote_nack(const process_t *proc, directory_t *queues, generic
 static bool handle_update_accepted(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Fleet: update accepted from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Fleet: update accepted from %s\n", nmsg->from_whom.nickname);
 
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
@@ -497,7 +497,7 @@ static bool handle_update_accepted(const process_t *proc, directory_t *queues, g
     generic_msg_t notify = {0};
     notify.type = UPDATE_ACCEPTED;
     uuid_parse(prop_uuid_str, notify.info.update_accepted.proposal_uuid);
-    messaging_send("AutonomousTrust", UPDATE_ACCEPTED, &notify, false);
+    messaging_send(AT_MAIN_QUEUE, UPDATE_ACCEPTED, &notify, false);
 
     /* If we already have the artifact (proposer), mark complete.
      * Otherwise, request the artifact from the sender (proposer). */

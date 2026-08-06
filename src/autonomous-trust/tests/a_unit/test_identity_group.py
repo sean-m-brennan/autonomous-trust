@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -121,3 +121,91 @@ class TestGroup:
             g = Group.initialize({'p1': '10.0.0.1'}, 'init_test')
         assert g.nickname == 'init_test'
         assert g._public_only is False
+
+    def test_canonical_roundtrip_owned(self):
+        # DRY canonical group wire form (group-key sync): a group we own
+        # serializes the RAW private key so a peer can decrypt group traffic;
+        # round-trip must reproduce the same keypair. Schema must match C's
+        # group_to_json (flat address_map, encryptor.{hex_seed,public_only}).
+        g = Group(uuid4(), {'p1': '10.0.0.1'}, 'g1',
+                  Encryptor.generate(), _public_only=False)
+        can = g.to_canonical()
+        assert can['typename'] == 'group'
+        assert can['encryptor']['public_only'] is False
+        assert len(can['encryptor']['hex_seed']) == 64  # raw 32-byte priv key
+        assert can['address_map'] == {'p1': '10.0.0.1'}  # flat dict, not verbose
+        g2 = Group.from_canonical(can)
+        assert g2.encryptor.publish() == g.encryptor.publish()
+        assert g2.encryptor.serialize() == g.encryptor.serialize()
+        assert str(g2.uuid) == str(g.uuid)
+
+    def test_proto_roundtrip_address_map_created(self):
+        # ISSUES.md §1.4: the protobuf Group carries the FULL address_map (not
+        # just a single `address`) and the §3.1-b `created` age, matching the
+        # canonical JSON form. Exercises to_wire_bytes/from_wire_bytes (the
+        # binary-proto path -> sync_to_message/sync_from_message).
+        from autonomous_trust.core.protobuf.identity import identity_pb2
+        fields = [f.name for f in identity_pb2.Group.DESCRIPTOR.fields]
+        if 'address_map' not in fields or 'created' not in fields:
+            pytest.skip('identity_pb2 not regenerated for §1.4 '
+                        '(run scripts/build-py.sh proto-only)')
+        g = Group(uuid4(), {'u1': '10.0.0.1', 'u2': '10.0.0.2'}, 'squad',
+                  Encryptor.generate(), _public_only=False, _created=1700000000.5)
+        g2 = Group.from_wire_bytes(g.to_wire_bytes())
+        assert dict(g2._address_map) == {'u1': '10.0.0.1', 'u2': '10.0.0.2'}
+        assert g2.created == 1700000000.5
+        assert str(g2.uuid) == str(g.uuid)
+
+    def test_proto_legacy_address_only(self):
+        # Back-compat: a proto Group from an older peer that set only the single
+        # `address` (no address_map) reconstructs a one-entry map keyed by uuid.
+        from autonomous_trust.core.protobuf.identity import identity_pb2
+        if 'address_map' not in [f.name for f in identity_pb2.Group.DESCRIPTOR.fields]:
+            pytest.skip('identity_pb2 not regenerated for §1.4')
+        msg = identity_pb2.Group()
+        msg.uuid = b'grp-legacy'
+        msg.address = '10.9.9.9'
+        enc = Encryptor.generate()
+        enc.sync_to_message()
+        msg.encryptor.CopyFrom(enc.message)
+        g = Group.from_wire_bytes(msg.SerializeToString())
+        assert dict(g._address_map) == {'grp-legacy': '10.9.9.9'}
+
+    def test_canonical_public_only(self):
+        # A published (public-only) group emits the public key + public_only=true
+        # and reconstructs with no private key.
+        g = Group(uuid4(), {}, 'g1', Encryptor.generate(), _public_only=False)
+        can = g.publish().to_canonical()
+        assert can['encryptor']['public_only'] is True
+        g2 = Group.from_canonical(can)
+        assert g2._public_only is True
+        assert g2.encryptor.private is None
+        assert g2.encryptor.publish() == g.encryptor.publish()
+
+    def test_owns_private_key(self):
+        # owns_private_key gates whether we can decrypt group traffic; it must
+        # track both the _public_only flag and the actual private key presence.
+        owned = Group(uuid4(), {}, 'g', Encryptor.generate(), _public_only=False)
+        assert owned.owns_private_key is True
+        pub = owned.publish()
+        assert pub.owns_private_key is False
+        # A round-tripped public-only group (the protobuf/wire shape) too.
+        from_wire = Group.from_canonical(pub.to_canonical())
+        assert from_wire.owns_private_key is False
+
+    def test_adopt_membership_keeps_key(self):
+        # adopt_membership grafts another group's uuid + larger address map onto
+        # us while KEEPING our private encryptor (mirrors C handle_group_update).
+        mine = Group(uuid4(), {'me': '10.0.0.1'}, 'mine',
+                     Encryptor.generate(), _public_only=False)
+        key_before = mine.encryptor.serialize()
+        other = Group(uuid4(), {'me': '10.0.0.1', 'lt': '10.0.0.2',
+                                'sgt': '10.0.0.3'}, 'mesh',
+                      Encryptor.generate(), _public_only=True)
+        mine.adopt_membership(other)
+        assert mine.uuid == str(other.uuid)
+        assert mine.nickname == 'mesh'
+        assert set(mine.addresses) == {'10.0.0.1', '10.0.0.2', '10.0.0.3'}
+        # Our private key is untouched.
+        assert mine.owns_private_key
+        assert mine.encryptor.serialize() == key_before

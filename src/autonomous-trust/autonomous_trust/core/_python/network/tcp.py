@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -16,10 +16,13 @@
 
 import socket
 import struct
+import threading
+import time
 
 from .netprocess import NetworkProtocol, TransmissionError
-from .udp import UDPNetworkProcess
+from .udp import UDPNetworkProcess, bind_source_address
 from .. import _probes
+from .. import system
 
 
 class PeerDisconnect(TransmissionError):
@@ -28,6 +31,16 @@ class PeerDisconnect(TransmissionError):
     when peers cycle accept/connect), surfaced as a distinct exception
     type so the listener can log it at debug rather than error."""
     pass
+
+
+class _PooledConn:
+    """One reusable outbound socket plus the wall-clock time it was last
+    used, so the idle reaper can age it out."""
+    __slots__ = ('sock', 'last_used')
+
+    def __init__(self, sock, last_used):
+        self.sock = sock
+        self.last_used = last_used
 
 
 class TCPNetworkProcess(UDPNetworkProcess):
@@ -79,6 +92,26 @@ class TCPNetworkProcess(UDPNetworkProcess):
 
         self._init_mcast(use_mcast)
 
+        # Persistent-connection state. When pooling is off (the default),
+        # none of this is touched and the transport behaves exactly as the
+        # historical connect/send/close-per-message path.
+        #
+        # Everything here must survive the multiprocessing spawn pickle:
+        # empty dict/set and None are fine, but a threading.Lock is not, so
+        # the locks are created later in _init_transport() (which runs in
+        # the worker subprocess). This mirrors the lazy _ping_at_pool.
+        self._pool_enabled = system.net_persistent_conn
+        self._conn_idle_ttl = system.net_conn_idle_ttl
+        self._max_live_conns = system.net_max_live_conns
+        self._conn_pool = {}          # (host, port) -> _PooledConn
+        self._pool_lock = None        # created in _init_transport
+        self._reader_threads = set()  # live inbound reader threads
+        self._reader_lock = None      # created in _init_transport
+        self._last_reap = 0.0
+        # Sweep for idle connections at most this often (well under the TTL,
+        # so a stale connection is closed within ~TTL + one sweep interval).
+        self._reap_interval = max(1.0, self._conn_idle_ttl / 6.0)
+
     # Generous explicit timeout for outbound TCP. Was inheriting the
     # 100ms global default, which under bursty cross-container load
     # connect()-failed thousands of times per peer per minute. We swap
@@ -87,7 +120,76 @@ class TCPNetworkProcess(UDPNetworkProcess):
     # socket in non-blocking mode (BlockingIOError on first I/O).
     send_timeout = 5.0
 
+    def _channel(self, port):
+        return 'peer' if port == self.port else 'group'
+
+    def _write_frame(self, sock, msg):
+        """Write one length-prefixed frame. ``msg`` is bytes. Raises
+        socket.error on a broken connection so the caller can decide
+        whether to reconnect (pooled) or give up (solo)."""
+        sent = sock.send(struct.pack('!I', len(msg)))
+        if sent == 0:
+            raise TransmissionError("Socket connection broken (no bytes sent)")
+        total_sent = 0
+        while total_sent < len(msg):
+            sent = sock.send(msg[total_sent:])
+            if sent == 0:
+                raise TransmissionError("Socket connection broken (no bytes sent)")
+            total_sent += sent
+        self.logger.debug('Sent %s bytes' % total_sent)
+
+    def _open_conn(self, host, port):
+        """Open one outbound TCP connection with the send timeout, enabling
+        TCP keepalive so a dead peer is eventually detected. Raises
+        TransmissionError on connect failure."""
+        old_default = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(self.send_timeout)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        finally:
+            socket.setdefaulttimeout(old_default)
+        # stream=True: IP_BIND_ADDRESS_NO_PORT, so pinning the source ADDRESS
+        # does not also reserve a port ahead of connect() (see
+        # bind_source_address) -- this path is pooled, but the solo path below
+        # opens one connection per message and would exhaust the range.
+        bind_source_address(sock, getattr(self, 'my_address', None),
+                            getattr(self, 'logger', None), stream=True)
+        try:
+            sock.connect((host, port))
+        except socket.error as err:
+            _probes.counter('net.tcp.send', 'connect_failed', err.__class__.__name__)
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise TransmissionError('Connect - ' + str(err))
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            # Idle/interval/count where the platform exposes them (Linux).
+            for opt_name, opt_val in (('TCP_KEEPIDLE', 30),
+                                      ('TCP_KEEPINTVL', 10),
+                                      ('TCP_KEEPCNT', 3)):
+                opt = getattr(socket, opt_name, None)
+                if opt is not None:
+                    sock.setsockopt(socket.IPPROTO_TCP, opt, opt_val)
+        except OSError:
+            pass  # keepalive tuning is best-effort
+        return sock
+
     def _send_tcp(self, msg, host, port):
+        if not isinstance(msg, bytes):
+            msg = msg.encode(self.enc)
+        # getattr default so a spec-mock (unit tests) without the instance
+        # attribute takes the solo path.
+        if getattr(self, '_pool_enabled', False):
+            self._send_tcp_pooled(msg, host, port)
+            return
+        # Solo path: per-message connect/send/close (msg already bytes).
+        # The default when pooling is off, and the behaviour the pooled path
+        # degrades to against a peer that accepts one message per connection.
+        # Kept inline and byte-for-byte as the historical implementation --
+        # it is the battle-tested default, and the unit tests drive this body
+        # directly on a spec-mock, so delegating to a helper would no-op it.
         old_default = socket.getdefaulttimeout()
         socket.setdefaulttimeout(self.send_timeout)
         try:
@@ -95,13 +197,22 @@ class TCPNetworkProcess(UDPNetworkProcess):
         finally:
             socket.setdefaulttimeout(old_default)
         with sock:
-            if not isinstance(msg, bytes):
-                msg = msg.encode(self.enc)
+            # Module-level call, not a method: the unit tests drive this body on
+            # a spec-mock, and the helper's isinstance(str) guard makes a Mock
+            # my_address a no-op rather than a crash.
+            bind_source_address(sock, getattr(self, 'my_address', None),
+                                getattr(self, 'logger', None), stream=True)
             self.logger.debug('Solo connect to %s:%s' % (host, port))
             try:
                 sock.connect((host, port))
             except socket.error as err:
+                _probes.counter('net.tcp.send', 'connect_failed',
+                                err.__class__.__name__)
                 raise TransmissionError('Connect - ' + str(err))
+            # Churn metric: one TCP connection per message, so this
+            # counter's RATE is handshakes/sec/node.
+            _probes.counter('net.tcp.send', 'connect',
+                            'peer' if port == self.port else 'group')
             try:
                 sent = sock.send(struct.pack('!I', len(msg)))
             except socket.error as err:
@@ -116,9 +227,123 @@ class TCPNetworkProcess(UDPNetworkProcess):
                     raise TransmissionError(str(err))
                 if sent == 0:
                     raise TransmissionError("Socket connection broken (no bytes sent)")
-                self.logger.debug('sending ...')
-                total_sent = total_sent + sent
+                total_sent += sent
             self.logger.debug('Sent %s bytes' % total_sent)
+
+    # --- Connection pool (send side) -----------------------------------
+
+    def _ensure_pool(self):
+        # Idempotent; _init_transport creates the locks in the worker
+        # before any thread runs, so this only actually constructs them
+        # when _send_tcp is exercised directly (e.g. in unit tests).
+        if self._pool_lock is None:
+            self._pool_lock = threading.Lock()
+        if self._reader_lock is None:
+            self._reader_lock = threading.Lock()
+
+    def _get_pooled(self, key, channel):
+        """Return (sock, reused). Reuses the pooled socket for ``key`` if
+        present, else connects a new one (evicting the oldest first if the
+        cap is reached). Runs under the pool lock; sends come from the net
+        main loop, so contention is only the group/ping paths."""
+        with self._pool_lock:
+            pc = self._conn_pool.get(key)
+            if pc is not None:
+                return pc.sock, True
+            if len(self._conn_pool) >= self._max_live_conns:
+                self._evict_oldest_locked()
+            sock = self._open_conn(key[0], key[1])  # may raise TransmissionError
+            self._conn_pool[key] = _PooledConn(sock, time.time())
+            return sock, False
+
+    def _evict(self, key, sock):
+        with self._pool_lock:
+            pc = self._conn_pool.get(key)
+            if pc is not None and pc.sock is sock:
+                del self._conn_pool[key]
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def _evict_oldest_locked(self):
+        # Caller holds the pool lock.
+        if not self._conn_pool:
+            return
+        oldest = min(self._conn_pool, key=lambda k: self._conn_pool[k].last_used)
+        pc = self._conn_pool.pop(oldest)
+        _probes.counter('net.tcp.pool', 'evict_cap')
+        try:
+            pc.sock.close()
+        except OSError:
+            pass
+
+    def _send_tcp_pooled(self, msg, host, port):
+        self._ensure_pool()
+        key = (host, port)
+        channel = self._channel(port)
+        # Attempt 0 reuses (or connects); on a broken socket, evict and try
+        # exactly once more with a fresh connection. A second failure raises,
+        # matching the solo path the caller already handles.
+        for attempt in (0, 1):
+            sock, reused = self._get_pooled(key, channel)
+            try:
+                self._write_frame(sock, msg)
+            except socket.error as err:
+                self._evict(key, sock)
+                if attempt == 0:
+                    _probes.counter('net.tcp.send', 'reconnect', channel)
+                    continue
+                raise TransmissionError('Send - ' + str(err))
+            with self._pool_lock:
+                pc = self._conn_pool.get(key)
+                if pc is not None and pc.sock is sock:
+                    pc.last_used = time.time()
+            _probes.counter('net.tcp.send', 'reuse' if reused else 'connect', channel)
+            return
+
+    # --- Transport lifecycle hooks -------------------------------------
+
+    def _init_transport(self):
+        # Create the locks in the worker subprocess (they can't be pickled
+        # across the spawn handoff). Single-threaded here, before any
+        # receiver/reader thread starts.
+        self._pool_lock = threading.Lock()
+        self._reader_lock = threading.Lock()
+
+    def reap_idle_conns(self):
+        if not self._pool_enabled or self._pool_lock is None:
+            return
+        now = time.time()
+        if now - self._last_reap < self._reap_interval:
+            return
+        self._last_reap = now
+        dead = []
+        with self._pool_lock:
+            for key in list(self._conn_pool):
+                pc = self._conn_pool[key]
+                if now - pc.last_used > self._conn_idle_ttl:
+                    dead.append(pc.sock)
+                    del self._conn_pool[key]
+        for sock in dead:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        if dead:
+            _probes.counter('net.tcp.pool', 'evict_idle', n=len(dead))
+
+    def close_connections(self):
+        if self._pool_lock is None:
+            return
+        with self._pool_lock:
+            socks = [pc.sock for pc in self._conn_pool.values()]
+            self._conn_pool.clear()
+        for sock in socks:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     def send_peer(self, msg, host):
         self._send_tcp(msg, host, self.port)
@@ -205,3 +430,112 @@ class TCPNetworkProcess(UDPNetworkProcess):
             return None, addr, port  # blacklisted
         _probes.counter('net.tcp.group', 'accepted')
         return self._recv(clientsock), addr, port
+
+    # --- Persistent readers (receive side) -----------------------------
+    # When pooling is on, a sender keeps its connection open and sends many
+    # frames back-to-back, so the receiver can't go back to accept after one
+    # read. Instead the acceptor hands each accepted socket to a reader
+    # thread that loops _recv until the peer disconnects, errors, or goes
+    # idle. Accept-time gates (own-address / blacklist) match recv_peer /
+    # recv_group; downstream attribution is unchanged because readers feed
+    # the same deque with the same (raw, from_addr) tuples.
+
+    @staticmethod
+    def _close_quiet(sock):
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def start_receivers(self, queues):
+        if self._pool_enabled:
+            threading.Thread(target=self.peer_acceptor,
+                             args=(self.peer_messages,), daemon=True).start()
+            threading.Thread(target=self.group_acceptor,
+                             args=(self.group_messages,), daemon=True).start()
+        else:
+            super().start_receivers(queues)
+
+    def peer_acceptor(self, msg_queue):
+        self._accept_loop(self.recv_ptp_sock, msg_queue, 'peer')
+
+    def group_acceptor(self, msg_queue):
+        self._accept_loop(self.recv_grp_sock, msg_queue, 'group')
+
+    def _accept_loop(self, listen_sock, msg_queue, channel):
+        layer = 'net.tcp.' + channel
+        while not self.stop:
+            try:
+                (clientsock, (addr, port)) = listen_sock.accept()
+            except (TimeoutError, socket.timeout):
+                continue
+            except BlockingIOError:
+                time.sleep(self.socket_timeout)
+                continue
+            except OSError as err:
+                _probes.counter(layer, 'accept_error', err.__class__.__name__)
+                continue
+            if addr == self.my_address:
+                _probes.counter(layer, 'drop', 'own_address')
+                self._close_quiet(clientsock)
+                continue
+            if self.reject_message(addr):
+                _probes.counter(layer, 'drop', 'blacklisted')
+                self._close_quiet(clientsock)
+                continue
+            with self._reader_lock:
+                at_cap = len(self._reader_threads) >= self._max_live_conns
+            if at_cap:
+                _probes.counter(layer, 'drop', 'max_conns')
+                self._close_quiet(clientsock)
+                continue
+            _probes.counter(layer, 'accepted')
+            reader = threading.Thread(
+                target=self._reader,
+                args=(clientsock, addr, msg_queue, channel), daemon=True)
+            with self._reader_lock:
+                self._reader_threads.add(reader)
+            reader.start()
+
+    def _reader(self, clientsock, addr, msg_queue, channel):
+        _probes.counter('net.tcp.reader', 'open', channel)
+        reason = 'eof'
+        last = time.time()
+        try:
+            while not self.stop:
+                try:
+                    raw = self._recv(clientsock)
+                except PeerDisconnect:
+                    reason = 'disconnect'
+                    break
+                except (TimeoutError, socket.timeout):
+                    # Idle between frames. _recv times out on the first recv
+                    # (before any prefix byte), so no partial frame is lost.
+                    if time.time() - last > self._conn_idle_ttl:
+                        reason = 'idle'
+                        break
+                    continue
+                except BlockingIOError:
+                    time.sleep(self.socket_timeout)
+                    continue
+                except TransmissionError:
+                    reason = 'error'
+                    self.track_recv_error()
+                    break
+                except OSError:
+                    reason = 'error'
+                    break
+                # Deliver + stats, mirroring _encr_recv's success branch so
+                # downstream dispatch and rate tracking are unchanged.
+                msg_queue.append((raw, addr))
+                who = self.peers.find_by_address(addr)
+                if who is not None:
+                    self.track_recv_stats(who.uuid, len(raw))
+                else:
+                    self.track_recv_stats(self.unknown_peer, len(raw))
+                last = time.time()
+        finally:
+            self._close_quiet(clientsock)
+            with self._reader_lock:
+                self._reader_threads.discard(threading.current_thread())
+            _probes.counter('net.tcp.reader', 'close', reason)

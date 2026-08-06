@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2026 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -121,9 +121,9 @@ static int _make_identity(const char *id, size_t idx, identity_t **out)
     _uuid5("neg:", id, uuid);
     char addr[ADDR_LEN + 1] = {0};
     snprintf(addr, sizeof(addr), "10.0.50.%zu", idx + 1);
-    char fullname[NAME_LEN + 1] = {0};
-    snprintf(fullname, sizeof(fullname), "%s.neg", id);
-    return identity_create(&uuid, addr, fullname, id, "me", out);
+    char nickname[NAME_LEN + 1] = {0};
+    snprintf(nickname, sizeof(nickname), "%s.neg", id);
+    return identity_create(&uuid, addr, nickname, id, out);
 }
 
 static np_impl_t *_build_participant_impl(const char *id, size_t idx)

@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -117,6 +117,8 @@ ffi.cdef("""
 
     /* ---- structures/array.h ---- */
     typedef struct array_s array_t;
+    typedef array_t directory_t;   /* processes.h: typedef array_t directory_t */
+    typedef ... pthread_mutex_t;    /* opaque; only ever passed as a pointer */
 
     int    array_init(array_t *a);
     int    array_create(array_t **a_ptr);
@@ -203,8 +205,14 @@ ffi.cdef("""
     extern config_t configuration_table[];
     extern size_t configuration_table_size;
 
-    int  get_cfg_dir(char path[]);
-    int  get_data_dir(char path[]);
+    /* Both gained an explicit `destlen` on 2026-08-04 (ISSUES.md §2.1.1: they
+       used to hardcode 255 as path_join's bound while taking an unsized
+       `char path[]`, which overflowed a 108-byte caller). Keep the arity in step
+       with the C header — `ffi.dlopen` is ABI mode, so CFFI validates nothing
+       and a stale arity means the C side reads `destlen` off a garbage register
+       and writes that far. `scripts/audit-ffi-drift.py` catches this one. */
+    int  get_cfg_dir(char path[], size_t destlen);
+    int  get_data_dir(char path[], size_t destlen);
     int  read_config_file(const char *filename, void *data_struct);
     int  write_config_file(const config_t *cfg_obj, const void *data_struct,
                            const char *filename);
@@ -231,9 +239,42 @@ ffi.cdef("""
         bool alloc; size_t refs;  /* smrt_ptr_t */
         unsigned char uuid[16];
         char address[33];
-        char fullname[129];
+        char nickname[129];   /* NAME_LEN+1; Zooko ONLINE name (was fullname) */
+        char petname[129];    /* NAME_LEN+1; local-only Zooko name -- never */
+                              /* serialized (see identity.c sync_out/sync_in). */
         signature_t signature;
         encryptor_t encryptor;
+        /* Operator-attended signal (identity.h:83-84). Kept OUTSIDE the AT_ZTA
+           guard in C, so these fields are always present regardless of build
+           flags and must appear here in the same position (between encryptor
+           and the ZTA fields) or the struct layout — and every trailing field
+           offset — is wrong. */
+        bool operator_bound;
+        double operator_attested_at;
+        /* Operator KEY binding (identity.h:130-132), the operator-key slice's
+           three fields. Also outside the AT_ZTA guard in C, for the same reason.
+           `crypto_sign_PUBLICKEYBYTES` is 32; spelled literally because the cdef
+           has no libsodium macros.
+
+           These were MISSING here until 2026-08-04, and the comment above
+           already said what that costs: the struct was 48 bytes short and every
+           ZTA offset below it was wrong. `PublicIdentity.from_proto_bytes` does
+           `ffi.new('public_identity_t *')` and hands that to `proto_to_peer`,
+           which writes the full C-sized struct into the undersized CFFI
+           allocation — a heap overflow that surfaced later as
+           `free(): invalid pointer` and aborted pytest. Struct drift is invisible
+           to `scripts/audit-ffi-drift.py`, which compares function ARG COUNTS
+           only. */
+        uint8_t operator_pubkey[32];
+        uint8_t *operator_key_binding;
+        size_t operator_key_binding_len;
+        /* ZTA credential binding (identity.h, #ifdef AT_ZTA_ENABLED). The
+           native lib is built AT_ZTA=ON (build-native.sh -DAT_ZTA=ON), so these
+           are part of the ABI layout and must be present here to match. */
+        uint8_t zta_credential_hash[32];
+        char zta_issuer[64];
+        uint8_t *zta_credential;
+        size_t zta_credential_len;
     } public_identity_t;
 
     typedef struct identity_s identity_t;  /* opaque - contains private keys */
@@ -243,12 +284,10 @@ ffi.cdef("""
         unsigned long long len;
     } msg_str_t;
 
-    int  identity_create(unsigned char *uuid, char *address, char *fullname,
-                         char *nickname, char *petname,
-                         identity_t **ident);
-    int  identity_init(unsigned char *uuid, char *address, char *fullname,
-                       char *nickname, char *petname,
-                       identity_t *identity);
+    int  identity_create(unsigned char *uuid, char *address, char *nickname,
+                         char *petname, identity_t **ident);
+    int  identity_init(unsigned char *uuid, char *address, char *nickname,
+                       char *petname, identity_t *identity);
     int  identity_publish(const identity_t *ident, public_identity_t **pub_copy);
     int  identity_sign(const identity_t *ident, const msg_str_t *in,
                        msg_str_t *out);
@@ -292,38 +331,56 @@ ffi.cdef("""
         } target;
     } net_recipient_t;
 
+    /* Field order is the ABI. `trace_id` and `from_rank` sit MID-STRUCT, so
+       omitting them (as this did until 2026-08-04) did not merely truncate the
+       struct — it put `to_whom`, `from_whom` and `encrypt` at wrong offsets, so
+       every one of them was read from the wrong bytes. Total was 1792 against
+       C's 1896, and `ffi.new('net_wire_msg_t *')` in _native/network/message.py
+       handed C a buffer 104 bytes short. Verified by measurement against the
+       header: cdef sizeof == C sizeof == 1896. */
     typedef struct {
         char process[65];        /* PROC_NAME_LEN(64) + 1 */
         char *function;
         uint8_t *data;
         size_t data_len;
+        char trace_id[33];       /* NET_TRACE_ID_LEN(32) + 1 */
         net_recipient_t to_whom;
         public_identity_t from_whom;
+        int from_rank;
         bool encrypt;
+        uint8_t signature[64];   /* crypto_sign_BYTES */
+        bool has_signature;
+        bool verified;
     } net_wire_msg_t;
 
     int  net_message_to_wire(const net_wire_msg_t *msg,
+                             const identity_t *signer,
                              uint8_t **wire_out, size_t *wire_len);
     int  net_message_from_wire(const uint8_t *data, size_t len,
                                const public_identity_t *peer,
                                net_wire_msg_t *msg_out);
     void net_wire_msg_free(net_wire_msg_t *msg);
 
-    /* ---- network/ping.h ---- */
-    typedef struct {
-        char host[17];           /* IPV4_ADDR_LEN(16) + 1 */
-        double rtt_ms[4];       /* PING_COUNT */
-        double min_rtt;
-        double max_rtt;
-        double avg_rtt;
-        double loss;
-        int sent;
-        int received;
-    } ping_stats_t;
+    /* ---- network/network.h ---- */
+    /* Base-port resolution: config -> AT_COMM_PORT -> COMM_PORT. Declared so
+       the Python side can assert it agrees with C for a given base instead of
+       hand-copying the constants (which is how the old port table drifted). */
+    typedef enum { PORT_SRC_CONFIG, PORT_SRC_ENV, PORT_SRC_DEFAULT } net_port_source_t;
+    int net_port_resolve(int cfg_port, net_port_source_t *src, void *logger);
+    const char *net_port_source_name(net_port_source_t src);
+    void net_port_resolve_reset(void);
 
-    int  ping(const char *host, ping_stats_t *stats);
-    int  ping_server_start(void);
-    int  ping_server_stop(void);
+    /* ping.h is deliberately absent: C does not implement ping. There was a
+       ping_stats_t + ping()/ping_server_start()/ping_server_stop() block here,
+       bound by _ping_native.py. Both are gone -- Python's ping is the only
+       implementation, and the C network process answers the `ping` selector
+       with {"error": "unsupported"}. Do NOT re-add these declarations without
+       the C functions. `ffi.dlopen` resolves symbols LAZILY, per attribute
+       (measured): a stale declaration does NOT fail at import -- it raises
+       AttributeError the first time something touches `lib.<name>`, so the
+       breakage surfaces wherever that call site is, possibly long after the
+       mismatch was introduced. Delete declarations together with the functions
+       they describe rather than leaving harmless-looking prototypes. */
 
     /* ---- processes/capabilities.h ---- */
     /* thread_args_t and capability_t contain embedded opaque structs
@@ -422,9 +479,21 @@ ffi.cdef("""
 
     typedef int (*handler_ptr_t)(process_t *, array_t *, char *, logger_t *);
 
+    /* The four trailing collaborators became a `proc_context_t` in the
+       2026-07-01 refactor (ISSUES.md §2.1, autonomous_trust.c:283); this cdef
+       kept the old 8-arg form until 2026-08-04. Nothing calls it from Python,
+       so it was LATENT rather than a live segfault — `audit-ffi-drift.py`
+       classifies it exactly that way. */
+    typedef struct {
+        map_t *procs;
+        pthread_mutex_t *procs_lock;
+        directory_t *queues;
+        logger_t *logger;
+    } proc_context_t;
+
     int  start_process(char *pname, handler_ptr_t runner,
                        map_t *configs, tracker_t *tracker,
-                       map_t *procs, array_t *queues, logger_t *logger);
+                       proc_context_t *ctx);
     void process_free(process_t *proc);
 
     /* ---- negotiation/task.h ---- */
@@ -499,7 +568,8 @@ ffi.cdef("""
     double reputation_compute(const tx_history_t *hist,
                               const reputations_t *reps,
                               const unsigned char *self_uuid,
-                              const unsigned char *peer_uuid);
+                              const unsigned char *peer_uuid,
+                              const map_t *task_weights);
 
     /* ---- autonomous_trust.h ---- */
     int run_autonomous_trust(char *q_in, char *q_out,
@@ -554,7 +624,9 @@ def _find_library() -> str:
 
 def _preload_deps():
     """Pre-load shared library dependencies so dlopen() can resolve symbols."""
-    dep_names = ['sodium', 'jansson', 'protobuf-c', 'protobuf', 'uuid']
+    # crypto/ssl are needed because the lib is built AT_ZTA=ON (OpenSSL). They
+    # usually resolve via RPATH/LD_LIBRARY_PATH; preloading is belt-and-braces.
+    dep_names = ['sodium', 'jansson', 'protobuf-c', 'protobuf', 'uuid', 'crypto', 'ssl']
     for name in dep_names:
         path = ctypes.util.find_library(name)
         if path:

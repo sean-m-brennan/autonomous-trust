@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2024 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -28,12 +28,16 @@
  * + function are the bare minimum; `arguments` defaults to a zero-
  * initialized map_t (callers populate it at runtime if they have
  * type metadata). */
-#define DECLARE_CAPABILITY(cap_name, func) \
-    {                                      \
-        .name = QUOTE(cap_name),           \
-        .local = true,                     \
-        .function = func,                  \
-        .arguments = {0},                  \
+/* NB: the second parameter is `cap_func`, NOT `func` — preprocess.py
+ * substitutes macro args by plain substring replace, and `func` is a
+ * substring of the `.function` field name (it would corrupt it to
+ * `.NULLtion`). Mirrors how process_table_priv.h.in names its first
+ * param `type_name` (not `type`) to avoid clobbering `.type`. */
+#define DECLARE_CAPABILITY(cap_name, cap_func) \
+    {                                          \
+        .name = QUOTE(cap_name),               \
+        .local = true,                         \
+        .function = cap_func,                  \
     },
 
 

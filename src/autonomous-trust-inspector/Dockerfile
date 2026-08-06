@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.3
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -47,6 +47,7 @@ RUN pip install --no-cache-dir \
         "quart>=0.19.5" \
         "websockets" \
         "networkx>=3.0" \
+        "numpy>=1.24" \
         "libsass>=0.22.0" \
         "aenum>=3.1.15" \
         "geopy>=2.4.0" \

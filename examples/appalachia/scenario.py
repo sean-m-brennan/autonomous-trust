@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -158,7 +158,7 @@ def create_appalachian_config(
         peers.append(PeerInfo(
             uuid=node_uuid,
             kind='hilltop_relay',
-            nickname=name,
+            petname=name,
             ip4_addr=ip_addr,
             initial_position=position,
             signal=hilltop_signal,
@@ -183,7 +183,7 @@ def create_appalachian_config(
             peers.append(PeerInfo(
                 uuid=node_uuid,
                 kind='valley_relay',
-                nickname=name,
+                petname=name,
                 ip4_addr=ip_addr,
                 initial_position=position,
                 signal=valley_signal,

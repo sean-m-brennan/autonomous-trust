@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -13,6 +13,8 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
+import json
+
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -147,6 +149,34 @@ def test_message_parse_sender_not_identity():
         Message.parse('proc|func|data', 'not_identity')
 
 
+def test_envelope_carries_from_rank():
+    """The sender's topology rank rides the envelope 'from_rank' and is
+    reconstructed onto from_whom when the peer is not yet known — the live
+    source that feeds rank-based child-gateway discovery (parity with C
+    net_message.c). See gateway-reputation-tree.md."""
+    sender = _real_identity('ranked')
+    sender._rank = 5
+    # Parse with a non-Identity sender so from_whom is rebuilt from the wire
+    # (the request_access-from-unknown-peer path), not taken from `sender`.
+    parsed = Message.parse(bytes(Message('identity', 'request_access', '{}',
+                                         from_whom=sender, encrypt=False)),
+                           None, validate=False)
+    assert isinstance(parsed.from_whom, Identity)
+    assert getattr(parsed.from_whom, '_rank', 0) == 5
+
+
+def test_envelope_from_rank_absent_defaults_zero():
+    """A wire form without 'from_rank' (older peer) reconstructs rank 0."""
+    from autonomous_trust.core.network.message import _identity_from_wire
+    sender = _real_identity('legacy')
+    wire = json.loads(bytes(Message('identity', 'request_access', '{}',
+                                    from_whom=sender, encrypt=False)))
+    wire.pop('from_rank', None)
+    rebuilt = _identity_from_wire(wire)
+    assert rebuilt is not None
+    assert getattr(rebuilt, '_rank', 0) == 0
+
+
 def _real_identity(pid):
     """Build a real Identity (signing capable) for sig-verify tests."""
     import hashlib
@@ -157,12 +187,12 @@ def _real_identity(pid):
     ns = UUID('00000000-0000-0000-0000-000000000aaa')
     return Identity(
         uuid5(ns, f'test:{pid}'),
-        '10.0.0.1', f'{pid}.test', pid,
+        '10.0.0.1', f'{pid}.test',
         Signature(hashlib.sha256(b'test:sig:' + pid.encode()).hexdigest().encode('ascii'),
                   public_only=False),
         Encryptor(hashlib.sha256(b'test:enc:' + pid.encode()).hexdigest().encode('ascii'),
                   public_only=False),
-        'me', False, 0, AgreementImpl.POA.value,
+        pid, False, 0, AgreementImpl.POA.value,
     )
 
 

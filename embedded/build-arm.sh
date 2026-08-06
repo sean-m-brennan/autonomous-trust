@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -122,7 +122,15 @@ extract_artifacts() {
     rm -rf "$staging"
     mkdir -p "$staging/opt/autonomous-trust/bin" "$staging/opt/autonomous-trust/lib"
 
-    docker cp "$container_name:/opt/autonomous-trust/bin/at_demo" "$staging/opt/autonomous-trust/bin/"
+    # The two Dockerfiles install at_demo to different paths: Dockerfile-c ->
+    # /opt/autonomous-trust/bin, Dockerfile-c-static -> /usr/local/bin. Copy
+    # from whichever this build used, but stage it under the same layout so the
+    # tarball is uniform across dynamic/static.
+    local bin_src="/opt/autonomous-trust/bin/at_demo"
+    if $STATIC; then
+        bin_src="/usr/local/bin/at_demo"
+    fi
+    docker cp "$container_name:$bin_src" "$staging/opt/autonomous-trust/bin/"
     if ! $STATIC; then
         docker cp "$container_name:/opt/autonomous-trust/lib/libautonomous_trust.so" "$staging/opt/autonomous-trust/lib/"
     fi
@@ -133,7 +141,7 @@ extract_artifacts() {
     rm -rf "$staging"
 
     info "Created $tarball"
-    echo "  $(file "$staging/../$(basename "$tarball")" 2>/dev/null || echo "$tarball")"
+    echo "  $(file "$tarball" 2>/dev/null || echo "$tarball")"
 }
 
 for platform in "${PLATFORMS[@]}"; do

@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -78,6 +78,10 @@ class DetectionSummary:
     crop_b64: str = ""                       # base64 JPEG; empty = no contact
     crop_size_px: tuple[int, int] = (0, 0)   # (width, height) of the crop
     bbox_in_crop_px: tuple[int, int, int, int] = (0, 0, 0, 0)
+    # Oriented box: 4 [x,y] corners in crop-local px. When present the drawer
+    # draws this rotated polygon instead of the axis-aligned bbox rect. Empty
+    # for overlay/no-OBB detections (falls back to the rect).
+    obb_in_crop_px: tuple = ()
     label: str = ""
     world_uid: str = ""
     confidence: float = 0.0
@@ -450,6 +454,18 @@ def _detection_image_svg(d: "DetectionSummary",
                      'font-family="monospace" font-size="14" '
                      'font-weight="bold" text-anchor="middle">STALE</text>'
                      if dimmed else '')
+    # Prefer the oriented box (rotated <polygon>) when the detection carries
+    # one; otherwise fall back to the axis-aligned bbox <rect>. Both use the
+    # same dashed-red style in the crop's pixel userspace.
+    obb = d.obb_in_crop_px or ()
+    if len(obb) >= 3:
+        pts = " ".join(f"{int(p[0])},{int(p[1])}" for p in obb)
+        box_shape = (f'<polygon points="{pts}" fill="none" stroke="#ef4444" '
+                     f'stroke-width="2" stroke-dasharray="6,3"/>')
+    else:
+        box_shape = (f'<rect x="{bx1}" y="{by1}" width="{bx2 - bx1}" '
+                     f'height="{by2 - by1}" fill="none" stroke="#ef4444" '
+                     f'stroke-width="2" stroke-dasharray="6,3"/>')
     return (
         f'<svg viewBox="0 0 {cw} {ch}" '
         f'preserveAspectRatio="xMidYMid meet" '
@@ -459,9 +475,7 @@ def _detection_image_svg(d: "DetectionSummary",
         f'<image href="data:image/jpeg;base64,{d.crop_b64}" '
         f'x="0" y="0" width="{cw}" height="{ch}" '
         f'opacity="{opacity}"/>'
-        f'<rect x="{bx1}" y="{by1}" width="{bx2 - bx1}" '
-        f'height="{by2 - by1}" fill="none" stroke="#ef4444" '
-        f'stroke-width="2" stroke-dasharray="6,3"/>'
+        f'{box_shape}'
         f'{overlay_label}'
         f'</svg>'
     )
@@ -493,11 +507,20 @@ def detection_figure(summary: "DetectionSummary") -> Any:
     fig.add_trace(go.Image(z=list(img.getdata()), dx=1, dy=1)
                   if False else go.Image(source=(
                       f"data:image/jpeg;base64,{summary.crop_b64}")))
-    bx1, by1, bx2, by2 = summary.bbox_in_crop_px
-    fig.add_shape(
-        type="rect", x0=bx1, y0=by1, x1=bx2, y1=by2,
-        line=dict(color="#ef4444", width=2, dash="dash"),
-    )
+    obb = summary.obb_in_crop_px or ()
+    if len(obb) >= 3:
+        # Closed rotated polygon via an SVG path.
+        path = "M " + " L ".join(f"{int(p[0])},{int(p[1])}" for p in obb) + " Z"
+        fig.add_shape(
+            type="path", path=path,
+            line=dict(color="#ef4444", width=2, dash="dash"),
+        )
+    else:
+        bx1, by1, bx2, by2 = summary.bbox_in_crop_px
+        fig.add_shape(
+            type="rect", x0=bx1, y0=by1, x1=bx2, y1=by2,
+            line=dict(color="#ef4444", width=2, dash="dash"),
+        )
     annotation = (
         f"{summary.label or '(unlabelled)'} "
         f"({summary.confidence:.2f}) — {int(summary.age_sec)}s ago"

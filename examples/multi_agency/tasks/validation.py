@@ -1,3 +1,19 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+# ******************
+
 """
 Cross-source validation task for the multi-agency disaster response demo.
 
@@ -56,8 +72,22 @@ class ValidationResult:
 class CrossSourceValidator:
     """Validates readings from multiple sources of the same data type.
 
-    Compares each source against the median of all other sources.
-    If a source deviates beyond `threshold`, it is flagged as anomalous.
+    Consensus is the median of ALL current sources (including the reading
+    under test); a reading is flagged when it deviates from that consensus
+    beyond ``threshold``.
+
+    Using the median of *all* sources — rather than the median of the
+    *others* — is what makes a single liar identifiable without smearing
+    the blame onto the honest majority. With "median of others" and only
+    two other sources, the consensus is their *average*, which a lone
+    outlier drags halfway toward itself: every honest source then reads as
+    deviating by ~half the gap and the validator flags the whole bucket
+    (the MQ-800 false-positive that also condemned both honest RQ-86s when
+    the swarm had moved out of range, leaving just the recon pair + the
+    rogue). The median of all sources is robust to a *minority* of liars:
+    with 2 honest + 1 rogue it equals the honest cluster, so only the rogue
+    deviates. ``min_sources`` (default 3) keeps the two-source case — where
+    no median can distinguish liar from honest — from validating at all.
 
     Args:
         data_type:       Which reading type to validate (e.g. "temperature")
@@ -116,20 +146,16 @@ class CrossSourceValidator:
         if len(active_sources) < self.min_sources:
             return None
 
-        # Compute consensus (median of other sources)
-        values = {peer: r.value for peer, r in active_sources.items()}
-        other_values = sorted(
-            v for p, v in values.items() if p != reading.peer_name
-        )
-        if not other_values:
-            return None
-
-        # Median
-        mid = len(other_values) // 2
-        if len(other_values) % 2 == 0:
-            consensus = (other_values[mid - 1] + other_values[mid]) / 2
+        # Consensus = median of ALL current sources (including this reading).
+        # The median is robust to a minority of liars, so the honest cluster
+        # sets the consensus and only a true outlier deviates from it — see
+        # the class docstring for why "median of others" was wrong here.
+        all_values = sorted(r.value for r in active_sources.values())
+        mid = len(all_values) // 2
+        if len(all_values) % 2 == 0:
+            consensus = (all_values[mid - 1] + all_values[mid]) / 2
         else:
-            consensus = other_values[mid]
+            consensus = all_values[mid]
 
         deviation = abs(reading.value - consensus)
         is_anomalous = deviation > self.threshold

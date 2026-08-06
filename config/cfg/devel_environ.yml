@@ -1,0 +1,84 @@
+name: autonomous_trust
+channels:
+  - conda-forge
+dependencies:
+  - python==3.13.*
+
+  # core (autonomous-trust): the shared build / test / C-toolchain / formal-
+  # verification / docs tooling. The other packages (services, simulator,
+  # evaluation, operator, behavior) develop against this same toolchain and add
+  # no dev deps of their own; only inspector adds web-specific tooling (below).
+
+  # packaging / build
+  - poetry
+  - maturin            # builds the Rust extension under src/autonomous-trust/rust
+  - types-protobuf>=6.32.1
+  - go
+  - napkin
+
+  # lint / test
+  - pylint
+  # >=4.58: earlier 4.x (4.56 shipped in the test image) rolls back a failed
+  # package-env registration without clearing the config, then reports the
+  # bogus "duplicate configuration definition for .pkg" instead of the real
+  # failure -- and which of the two it reports depends on dict hash order.
+  - tox>=4.58
+  - pytest
+  - pytest-asyncio
+  - pytest-cov
+  - docker-py          # container-backed integration / conformance tests
+  - testcontainers
+  - jsonschema         # conformance corpus schema validation
+  - ruamel.yaml
+  - gitpython>=3.1.35
+  - pexpect
+
+  # misc build helpers / docs
+  - rsync
+  - curl
+  - libffi
+  - pandoc
+  # Uncomment and remove pip entries once conda-pypi is mainstream
+  #- conda-pypi::mermaid-cli    # core: docs diagram rendering
+  #- conda-pypi::jcs            # core: JSON canonicalization (conformance / identity)
+
+  # C / C++ toolchain + coverage (the C library build)
+  - git
+  - clang
+  - clangxx
+  # libstdc++ for clang++. The bare `clangxx` package ships no C++ stdlib, and
+  # the --sysroot only covers C headers, so the protobuf C++ TU
+  # (protobuf_shutdown.cpp) fails with "'climits' not found". gxx_linux-64
+  # installs the full conda GCC toolchain (headers + libstdc++) at the canonical
+  # location clang++ auto-detects. CXX stays forced to clang++ (ci-local /
+  # conformance.yml export it), so this only supplies the libstdc++ clang++
+  # links against -- it does NOT switch the compiler to g++.
+  - gxx_linux-64
+  - lld
+  - lcov
+  - llvmdev
+
+  # formal verification (Frama-C via OCaml/opam) + autotools C build
+  - opam
+  - autoconf
+  - automake
+  - libtool
+  - pkg-config
+  - gmp
+  - pcre2
+  - sqlite
+  - libexpat
+
+  # inspector (autonomous-trust-inspector): web dashboard e2e + async test tooling.
+  - pytest-aiohttp
+  - nodejs
+  - beautifulsoup4
+  - playwright
+  - pyee
+
+  - pip
+  - pip:
+      - mermaid-cli
+      - jcs  # conformance: JSON Canonicalization Scheme, used by
+             # harness/common/canonical.py to compare and regenerate the
+             # byte-pinned wire vectors. No conda-forge package (checked).

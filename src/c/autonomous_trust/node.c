@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -27,7 +27,9 @@
 #include <sys/wait.h>
 
 #include "node.h"
+#include "node_priv.h"
 #include "config/generate.h"
+#include "utilities/clock.h"
 #include "utilities/sighandler.h"
 #include "utilities/util.h"
 #include "processes/processes.h"   /* cadence */
@@ -40,8 +42,14 @@ extern int run_autonomous_trust(char *q_in, char *q_out,
 
 int at_node_init(at_node_t *node, const at_node_config_t *cfg)
 {
+    /* Copy BEFORE the memset, and read only the copy afterwards: `cfg` may
+     * legitimately alias `&node->config` — the flat wrapper in app_node.c
+     * hands over the config it just filled in — and the memset would
+     * otherwise zero the very struct being read. That failed silently: every
+     * field fell back to a default or zero and init still returned 0. */
+    const at_node_config_t requested = *cfg;
     memset(node, 0, sizeof(*node));
-    node->config = *cfg;
+    node->config = requested;
 
     /* Defaults */
     if (!node->config.app_name)
@@ -52,13 +60,22 @@ int at_node_init(at_node_t *node, const at_node_config_t *cfg)
         node->config.q_in = "at_to_extern";
 
     /* Logger */
-    logger_init(&node->log, cfg->log_level, (char *)cfg->log_file);
+    logger_init(&node->log, node->config.log_level,
+                (char *)node->config.log_file);
+
+    /* Clock gate, before anything that timestamps or votes. AT carries no NTP
+     * client: a stock daemon on the HOST disciplines the clock and this only
+     * reads what it achieved. Enforcing inside AT container images (they set
+     * AT_REQUIRE_SYNCED_CLOCK=1), advisory elsewhere so a developer machine
+     * still runs. */
+    if (at_clock_require_synced(&node->log, 0) != 0)
+        return -1;
 
     /* Ensure required directories exist */
     char cfg_dir[CFG_PATH_LEN + 1];
     char data_dir[CFG_PATH_LEN + 1];
-    get_cfg_dir(cfg_dir);
-    get_data_dir(data_dir);
+    get_cfg_dir(cfg_dir, sizeof(cfg_dir));
+    get_data_dir(data_dir, sizeof(data_dir));
 
     if (makedirs(cfg_dir, 0755) != 0)
     {
@@ -74,7 +91,7 @@ int at_node_init(at_node_t *node, const at_node_config_t *cfg)
     }
 
     /* Optional config generation */
-    if (cfg->generate_config)
+    if (node->config.generate_config)
     {
         log_info(&node->log, "Generating configs in %s\n", cfg_dir);
         /* seed_str=NULL → random_config falls back to AT_PEER_SEED env. */
@@ -89,6 +106,34 @@ int at_node_init(at_node_t *node, const at_node_config_t *cfg)
         log_info(&node->log, "Configs generated successfully\n");
     }
 
+    return 0;
+}
+
+int at_node_bind_inbound(at_node_t *node)
+{
+    /* Set up IPC. The queue we BIND has to be the one the daemon sends to,
+     * which is `q_in` (AT -> app) — binding `app_name` instead left the
+     * daemon's outbound datagrams addressed to a socket path nobody had
+     * bound, so nothing an app was meant to receive ever arrived. Falls back
+     * to app_name for a caller that sets no q_in and only ever sends. */
+    const char *inbound = (node->config.q_in != NULL
+                           && node->config.q_in[0] != '\0')
+                              ? node->config.q_in : node->config.app_name;
+    if (messaging_init(inbound, &node->app_queue) != 0)
+    {
+        log_exception(&node->log);
+        log_error(&node->log,
+                  "Could not bind inbound queue '%s'; this app could never "
+                  "receive from the daemon\n", inbound);
+        /* messaging_init may have opened the socket before failing to bind it.
+         * Closed here, not by messaging_qclose, which also unlinks the path —
+         * on this path the name may well belong to whoever we lost the race to. */
+        if (node->app_queue.fd >= 0)
+            close(node->app_queue.fd);
+        node->app_queue.fd = -1;
+        return -1;
+    }
+    messaging_assign(&node->app_queue);
     return 0;
 }
 
@@ -111,10 +156,17 @@ int at_node_start(at_node_t *node)
 
     init_sig_handling(NULL);
 
-    /* Set up IPC so the host app can send messages to AT sub-processes */
-    if (messaging_init(node->config.app_name, &node->app_queue) != 0)
-        log_exception(&node->log);
-    messaging_assign(&node->app_queue);
+    /* A bind failure is fatal, not a warning. An app whose inbound queue did not
+     * bind can never receive anything the daemon sends — the same silent failure
+     * as binding the wrong name (doc/architecture/app-peer-carrier.md, break #4),
+     * and indistinguishable from a quiet network. Reap the daemon we just forked
+     * rather than orphan it. */
+    if (at_node_bind_inbound(node) != 0)
+    {
+        log_error(&node->log, "Refusing to start %s\n", node->config.app_name);
+        at_node_shutdown(node);
+        return -1;
+    }
 
     log_info(&node->log, "%s running (AT daemon at PID %d)\n",
              node->config.app_name, node->daemon_pid);
@@ -172,8 +224,52 @@ void at_node_shutdown(at_node_t *node)
         log_info(&node->log, "Sending SIGINT to AT daemon (PID %d)\n",
                  node->daemon_pid);
         kill(node->daemon_pid, SIGINT);
-        int status;
-        waitpid(node->daemon_pid, &status, 0);
+
+        /* `waitpid` here CANNOT reap this daemon and never could: `daemonize`
+         * double-forks (`FORK` defaults to 2, daemonize.c), so `daemon_pid` names
+         * a grandchild that init has already adopted. waitpid returns -1/ECHILD
+         * immediately, which is why it went unnoticed — the call looked like it
+         * was doing the waiting and was doing nothing at all. Kept because a
+         * single-fork build (`-DFORK=1`) DOES make the daemon our child, and then
+         * this both reaps it and is the whole wait.
+         *
+         * Measured 2026-08-04: the daemon needs about 5.3 s to shut down, because
+         * it gives its own subsystem processes a grace period before SIGKILL. So
+         * without a wait, `at_node_shutdown` returned while the daemon was still
+         * running and still holding its sockets — and a host that stopped a node
+         * and immediately started another raced the corpse for the socket path.
+         * "Reap rather than orphan" was the intent at the call site in
+         * `at_node_start`; this makes it true. */
+        int status = 0;
+        (void)waitpid(node->daemon_pid, &status, 0);
+
+        /* Poll for actual exit, since ECHILD leaves us no event to block on. */
+        const int step_ms = 50;
+        int waited_ms = 0;
+        while (waited_ms < AT_DAEMON_EXIT_TIMEOUT_MS)
+        {
+            if (kill(node->daemon_pid, 0) == -1 && errno == ESRCH)
+                break;
+            usleep(step_ms * 1000);
+            waited_ms += step_ms;
+        }
+        if (kill(node->daemon_pid, 0) == 0)
+        {
+            /* Named, not papered over. Escalating to SIGKILL is deliberately NOT
+             * done here: the daemon may be mid-write to the identity or peer
+             * stores, and a corrupted store is worse than a lingering process.
+             * A caller that must have the pid back has it from
+             * `at_node_daemon_pid` and can make that choice itself. */
+            log_error(&node->log,
+                      "AT daemon (PID %d) has not exited %d ms after SIGINT; "
+                      "leaving it rather than risking SIGKILL mid-write\n",
+                      node->daemon_pid, AT_DAEMON_EXIT_TIMEOUT_MS);
+        }
+        else
+        {
+            log_info(&node->log, "AT daemon (PID %d) exited after %d ms\n",
+                     node->daemon_pid, waited_ms);
+        }
         node->daemon_alive = false;
     }
     log_info(&node->log, "%s exiting\n", node->config.app_name);

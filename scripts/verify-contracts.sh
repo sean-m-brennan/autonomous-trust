@@ -1,6 +1,6 @@
 #!/bin/bash
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -170,6 +170,22 @@ if [[ -n "$module" ]]; then
         echo "Valid modules: $(printf '%s, ' "${VALID_MODULES[@]}" | sed 's/, $//')"
         exit 1
     fi
+fi
+
+####################
+# Require the conda env
+####################
+# Frama-C is invoked below with `-I $CONDA_PREFIX/include` for the OpenSSL +
+# toolchain headers the project's `autonomous_trust` env supplies. Under
+# `set -u` an inactive env leaves $CONDA_PREFIX unbound and the script would
+# die with a cryptic "CONDA_PREFIX: unbound variable"; gate up-front instead,
+# matching scripts/build-native.sh. Deferred past --help/module validation so
+# usage still works without the env active.
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-autonomous_trust}"
+if [[ "${CONDA_DEFAULT_ENV:-}" != "$CONDA_ENV_NAME" ]]; then
+    echo "ERROR: conda environment '$CONDA_ENV_NAME' is not active." >&2
+    echo "  Run: conda activate $CONDA_ENV_NAME" >&2
+    exit 1
 fi
 
 ####################
@@ -698,8 +714,10 @@ for src in "${files[@]}"; do
             skip_fns="config_run,handle_config_accepted,handle_config_artifact_ready,send_to_peer" ;;
         artifact_proc_helpers.c)
             # [solver-timeout] artifact_download_state_init: struct init
-            # with memset/logging preconditions
-            skip_fns="artifact_download_state_init" ;;
+            # with memset/logging preconditions. artifact_encode_chunk /
+            # artifact_decode_chunk: base64 stub reasoning (weak encoded_len
+            # postcondition) is not WP-dischargeable.
+            skip_fns="artifact_download_state_init,artifact_encode_chunk,artifact_decode_chunk" ;;
         artifact_proc.c)
             # artifact_run: [solver-timeout] state-cascade through
             # getenv/path_join/artifact_store_init prevents discharging

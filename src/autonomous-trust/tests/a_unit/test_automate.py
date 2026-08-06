@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -17,8 +17,11 @@
 import os
 import queue
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import uuid4
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from autonomous_trust.core.config import Configuration
 from autonomous_trust.core.config.generate import generate_identity
@@ -70,6 +73,41 @@ class TestAutonomousTrustInit:
         at = AutonomousTrust(multiproc=False, silent=False, logfile=Configuration.log_stdout)
         at.print('hello')
         assert 'hello' in capsys.readouterr().out
+
+    def test_silent_stdout_discards_logs(self, setup_teardown):
+        """silent=True + logfile=log_stdout asks for a quiet console AND for logs
+        ON the console, and AT resolves that by discarding: the ONLY handler is a
+        NullHandler, so log_level is inert. Deliberate (most cases in this file
+        depend on the quiet), but it is the trap that made a working discovery
+        look silent in the diag harness, so pin it."""
+        import logging
+        at = AutonomousTrust(multiproc=False, silent=True,
+                             log_level=logging.DEBUG,
+                             logfile=Configuration.log_stdout)
+        assert all(isinstance(h, logging.NullHandler)
+                   for h in at._logger.handlers), \
+            'expected the discard path, got %r' % at._logger.handlers
+
+    def test_silent_stderr_still_logs(self, setup_teardown, capsys):
+        """The companion sentinel: a caller wanting no console chatter but a real
+        debug trace names log_stderr and gets one, REGARDLESS of silent. Without
+        this there is no way to ask -- which is why the harness's log_level was
+        inert. `silent` still governs print() chatter."""
+        import logging
+        at = AutonomousTrust(multiproc=False, silent=True,
+                             log_level=logging.DEBUG,
+                             logfile=Configuration.log_stderr)
+        streams = [h for h in at._logger.handlers
+                   if isinstance(h, logging.StreamHandler)
+                   and not isinstance(h, logging.NullHandler)]
+        assert streams, 'log_stderr attached no real handler'
+        assert all(h.level == logging.DEBUG for h in streams)
+        at.logger.debug('discovery-trace-marker')
+        captured = capsys.readouterr()
+        assert 'discovery-trace-marker' in captured.err
+        # silent still suppresses console chatter, and logs must not leak to stdout
+        at.print('chatter')
+        assert 'chatter' not in capsys.readouterr().out
 
     def test_queue_type(self, setup_teardown):
         at = AutonomousTrust(multiproc=False, logfile=Configuration.log_stdout)
@@ -277,6 +315,126 @@ class TestHandleMessages:
         assert len(at.unhandled_messages) == 1
 
 
+class TestHandleResults:
+    """The completed-task path is the principled TS producer: it should tag
+    the TransactionScore with the executed capability's name so the reputation
+    process applies that capability's transaction_weight (deferred.md §1.2)."""
+
+    def _make_at(self):
+        at = AutonomousTrust(multiproc=False, testing=True, silent=True,
+                             logfile=Configuration.log_stdout)
+        at.proc_name = CfgIds.main
+        return at
+
+    def test_completed_task_ts_carries_capability_name(self, setup_teardown):
+        at = self._make_at()
+        at.capabilities.register_ability('weighted_cap', lambda x: x,
+                                         transaction_weight=4)
+        task = Task(TaskParameters(Capability('weighted_cap')), 'req')
+        key = str(task.uuid)
+        at.active_tasks[key] = task
+        mock_result = MagicMock()
+        mock_result.ready.return_value = True
+        mock_result.get.return_value = 42
+        q_neg, q_rep = queue.Queue(), queue.Queue()
+        at._handle_results({CfgIds.negotiation: q_neg,
+                            CfgIds.reputation: q_rep},
+                           {key: mock_result})
+        tr = q_neg.get_nowait()
+        assert isinstance(tr, TaskResult)
+        ts = q_rep.get_nowait()
+        assert isinstance(ts, TransactionScore)
+        assert ts.task_id == tr.uuid
+        assert ts.capability_name == 'weighted_cap'
+
+    def test_completed_task_without_capability_is_unweighted(self,
+                                                             setup_teardown):
+        # Defensive: a task whose capability can't be resolved must fall back
+        # to capability_name=None (weight 1), the historical behavior.
+        at = self._make_at()
+        task = MagicMock()
+        task.uuid = uuid4()
+        task.capability = None
+        key = str(task.uuid)
+        at.active_tasks[key] = task
+        mock_result = MagicMock()
+        mock_result.ready.return_value = True
+        mock_result.get.return_value = 1
+        q_rep = queue.Queue()
+        at._handle_results({CfgIds.negotiation: queue.Queue(),
+                            CfgIds.reputation: q_rep},
+                           {key: mock_result})
+        ts = q_rep.get_nowait()
+        assert ts.capability_name is None
+
+
+class TestTaskResultScoring:
+    """Requestor-side scoring of a returned TaskResult treats verify_proof()
+    as tri-state: True -> 0.8, False -> 0.3 (genuine tamper), None -> split by
+    whether ZKP is available process-wide (unavailable => score on successful
+    completion; available-but-missing => suspicious defection).
+
+    Regression guard for the ZKP-absent 0.3 flood: with the extension unshipped
+    verify_proof() returns None for every result, and the old
+    `0.8 if zkp_valid else 0.3` scored all of them 0.3, cratering honest
+    reputation.
+    """
+
+    def _make_at(self):
+        at = AutonomousTrust(multiproc=False, testing=True, silent=True,
+                             logfile=Configuration.log_stdout)
+        at.proc_name = CfgIds.main
+        return at
+
+    def _score_for(self, monkeypatch, verify_result, zkp_available,
+                   result=42):
+        at = self._make_at()
+        # A TaskResult is not a protocol Message; production falls straight
+        # through run_message_handlers to the isinstance branch. Force that
+        # here so the test doesn't depend on protocol-handler wiring.
+        monkeypatch.setattr(at, "run_message_handlers", lambda q, m: False)
+        monkeypatch.setattr(
+            "autonomous_trust.core._python.automate.ZKP_AVAILABLE",
+            zkp_available)
+        at.capabilities.register_ability("cap", lambda x: x)
+        task = Task(TaskParameters(Capability("cap")), "req")
+        tr = TaskResult(task=task, result=result)
+        monkeypatch.setattr(tr, "verify_proof", lambda: verify_result)
+        q_main, q_rep, q_neg = queue.Queue(), queue.Queue(), queue.Queue()
+        q_main.put(tr)
+        queues = {CfgIds.main: q_main,
+                  CfgIds.reputation: q_rep,
+                  CfgIds.negotiation: q_neg}
+        at._handle_messages(queues, MagicMock(), {})
+        ts = q_rep.get_nowait()
+        assert isinstance(ts, TransactionScore)
+        assert ts.task_id == tr.uuid
+        return ts.score
+
+    def test_valid_proof_scores_high(self, setup_teardown, monkeypatch):
+        assert self._score_for(monkeypatch, True, zkp_available=True) == 0.8
+
+    def test_invalid_proof_scores_defection(self, setup_teardown, monkeypatch):
+        assert self._score_for(monkeypatch, False, zkp_available=True) == 0.3
+
+    def test_indeterminate_without_zkp_scores_on_completion(
+            self, setup_teardown, monkeypatch):
+        # ZKP unavailable: a completed result is not the peer's fault for
+        # lacking a proof -> credit completion, do NOT score as defection.
+        assert self._score_for(monkeypatch, None, zkp_available=False) == 0.8
+
+    def test_indeterminate_without_zkp_failed_result_scores_low(
+            self, setup_teardown, monkeypatch):
+        # No proof AND no result -> the task did not successfully complete.
+        assert self._score_for(
+            monkeypatch, None, zkp_available=False, result=None) == 0.3
+
+    def test_indeterminate_with_zkp_is_suspicious(
+            self, setup_teardown, monkeypatch):
+        # ZKP available but no proof attached -> suspicious -> defection.
+        assert self._score_for(monkeypatch, None, zkp_available=True) == 0.3
+
+
 class TestMonitorProcesses:
     def test_ready_success(self, setup_teardown):
         at = AutonomousTrust(multiproc=False, silent=True, logfile=Configuration.log_stdout)
@@ -434,6 +592,52 @@ class TestRepResponsePeer:
         q_main.put(msg)
         queues = {CfgIds.main: q_main}
         at._handle_messages(queues, MagicMock(), {})
+
+    def test_remote_observer_response_excluded_from_own_view(self, setup_teardown):
+        # A transitive peer-pair rep_resp from a REMOTE observer (from_whom !=
+        # us) is that observer's bilateral CTFT reading -- cold-start 0.0 for a
+        # no-shared-history pair. It must land ONLY in latest_reputation_pairs
+        # (the Trust Network graph), NOT in latest_reputation (this node's own
+        # view -> reputations table + Trust Dynamics timeline); writing it there
+        # dragged the majority of nodes to 0.00.
+        at = AutonomousTrust(multiproc=False, testing=True, silent=True,
+                             logfile=Configuration.log_stdout)
+        at.identity = MagicMock()
+        at.identity.uuid = uuid4()
+        at.peers = MagicMock()
+        at.peers.find_by_uuid = MagicMock(return_value=None)
+        observer = MagicMock()
+        observer.uuid = uuid4()          # a remote observer, != us
+        subject = uuid4()
+        rep = MagicMock()
+        rep.peer_id = subject
+        rep.score = 0.0                  # CTFT cold-start for no shared history
+        msg = Message(CfgIds.main, ReputationProtocol.rep_resp, rep,
+                      from_whom=observer)
+        q_main = queue.Queue()
+        q_main.put(msg)
+        at._handle_messages({CfgIds.main: q_main}, MagicMock(), {})
+        assert str(subject) not in at.latest_reputation          # own view clean
+        assert (str(observer.uuid), str(subject)) in at.latest_reputation_pairs
+
+    def test_own_view_response_populates_latest_reputation(self, setup_teardown):
+        # Our own computation (from_whom == us) IS our view -> latest_reputation.
+        at = AutonomousTrust(multiproc=False, testing=True, silent=True,
+                             logfile=Configuration.log_stdout)
+        at.identity = MagicMock()
+        at.identity.uuid = uuid4()
+        at.peers = MagicMock()
+        at.peers.find_by_uuid = MagicMock(return_value=None)
+        subject = uuid4()
+        rep = MagicMock()
+        rep.peer_id = subject
+        rep.score = 0.72
+        msg = Message(CfgIds.main, ReputationProtocol.rep_resp, rep,
+                      from_whom=at.identity)
+        q_main = queue.Queue()
+        q_main.put(msg)
+        at._handle_messages({CfgIds.main: q_main}, MagicMock(), {})
+        assert str(subject) in at.latest_reputation
 
 
 class TestTaskCapabilityNotFound:
@@ -652,3 +856,95 @@ class TestConfigureErrorPaths:
             # No processes should be in result when start=False
             from autonomous_trust.core.processes import Process
             assert Process.key not in result or result[Process.key] == []
+
+
+class _FakeConn:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeProxy:
+    """Mimics a manager Queue proxy: carries a thread-local ``_tls.connection``
+    and can be told to raise a transport error once (as a dropped manager
+    connection would) before behaving like a normal queue."""
+
+    def __init__(self, items=None, raise_exc=None):
+        self._tls = SimpleNamespace(connection=_FakeConn())
+        self._items = list(items or [])
+        self._raise_exc = raise_exc
+
+    def get_nowait(self):
+        if self._raise_exc is not None:
+            exc, self._raise_exc = self._raise_exc, None
+            raise exc
+        if not self._items:
+            raise queue.Empty
+        return self._items.pop(0)
+
+    def get(self, block=True, timeout=None):
+        return self.get_nowait()
+
+
+class TestMqGet:
+    """_mq_get returns the main loop to a receptive state on a dropped
+    manager-proxied connection instead of spinning on it (see automate
+    _mq_get / _reset_proxy_connection / _manager_alive)."""
+
+    def _make_at(self):
+        at = AutonomousTrust(multiproc=False, testing=True, silent=True,
+                             logfile=Configuration.log_stdout)
+        at.proc_name = CfgIds.main
+        return at
+
+    def test_passthrough_item(self, setup_teardown):
+        at = self._make_at()
+        p = _FakeProxy(items=[('INFO', 'sub', 'hi')])
+        assert at._mq_get(p) == ('INFO', 'sub', 'hi')
+
+    def test_empty_passthrough(self, setup_teardown):
+        at = self._make_at()
+        with pytest.raises(queue.Empty):
+            at._mq_get(_FakeProxy(items=[]))
+
+    def test_broken_pipe_becomes_empty_and_resets_connection(self, setup_teardown):
+        at = self._make_at()
+        p = _FakeProxy(raise_exc=BrokenPipeError())
+        conn = p._tls.connection
+        with pytest.raises(queue.Empty):
+            at._mq_get(p)
+        # the wedged connection was closed and dropped so the next call
+        # reconnects (returns to a receptive state)
+        assert conn.closed is True
+        assert not hasattr(p._tls, 'connection')
+
+    def test_reconnects_after_drop(self, setup_teardown):
+        at = self._make_at()
+        # first call raises (drop -> Empty), a queued item is read on retry
+        p = _FakeProxy(items=[('INFO', 'sub', 'later')],
+                       raise_exc=EOFError())
+        with pytest.raises(queue.Empty):
+            at._mq_get(p)
+        assert at._mq_get(p) == ('INFO', 'sub', 'later')
+
+    def test_blocking_get_survives_drop(self, setup_teardown):
+        at = self._make_at()
+        p = _FakeProxy(raise_exc=ConnectionResetError())
+        with pytest.raises(queue.Empty):
+            at._mq_get(p, block=True, timeout=0.01)
+
+    def test_manager_alive_threading_mode(self, setup_teardown):
+        # multiproc=False -> no manager server; drops are treated recoverable
+        assert self._make_at()._manager_alive() is True
+
+    def test_manager_alive_reflects_dead_process(self, setup_teardown):
+        at = self._make_at()
+        at._manager = SimpleNamespace(
+            _process=SimpleNamespace(is_alive=lambda: False))
+        assert at._manager_alive() is False
+
+    def test_reset_proxy_connection_noop_on_plain_queue(self, setup_teardown):
+        # a plain queue.Queue has no _tls; reset must be a safe no-op
+        self._make_at()._reset_proxy_connection(queue.Queue())

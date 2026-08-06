@@ -1,3 +1,19 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+# ******************
+
 """
 Base scenario engine for AutonomousTrust demonstration examples.
 
@@ -21,7 +37,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from typing import Any, Callable, Optional
 
@@ -263,7 +279,7 @@ class Scenario(ABC):
     def _emit(self, event: ScenarioEvent):
         """Dispatch an event to all listeners and record it."""
         record = event.to_dict()
-        record["wall_time"] = datetime.utcnow().isoformat()
+        record["wall_time"] = datetime.now(timezone.utc).isoformat()
         self._event_log.append(record)
 
         for listener in self._listeners:
@@ -379,7 +395,7 @@ class Scenario(ABC):
             realtime_factor: Speed multiplier (1.0 = real time, 10.0 = 10x)
             tick_callback:   Called each tick with (scenario, elapsed_timedelta)
         """
-        self._start_time = datetime.utcnow()
+        self._start_time = datetime.now(timezone.utc)
         self._running = True
         self._current_phase_idx = 0
 
@@ -396,7 +412,7 @@ class Scenario(ABC):
         total_seconds = self.duration.total_seconds()
 
         while self._running:
-            wall_elapsed = (datetime.utcnow() - self._start_time).total_seconds()
+            wall_elapsed = (datetime.now(timezone.utc) - self._start_time).total_seconds()
             scenario_elapsed = wall_elapsed * realtime_factor
             elapsed_td = timedelta(seconds=scenario_elapsed)
 

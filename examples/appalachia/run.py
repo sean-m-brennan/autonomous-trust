@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -172,4 +172,8 @@ def main():
 
 
 if __name__ == '__main__':
+    # Default to forkserver: 'fork' (Linux default through 3.13) forks a
+    # multi-threaded process and can deadlock the child. Harmless on 3.14+.
+    import multiprocessing as _mp
+    _mp.set_start_method('forkserver', force=True)
     main()

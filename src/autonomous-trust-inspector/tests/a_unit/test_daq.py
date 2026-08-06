@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -21,6 +21,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from autonomous_trust.core import CfgIds
+from autonomous_trust.core.network import Message
+from autonomous_trust.core.reputation import ReputationProtocol
+
 from autonomous_trust.inspector.peer.daq import (
     PeerDataAcq, CohortInterface, Cohort, CohortProtocol, CohortTracker,
     NullPeerData,
@@ -39,8 +43,8 @@ class TestNullPeerData:
 class TestPeerDataAcq:
     def _make_peer(self):
         ident = MagicMock()
-        ident.fullname = 'Test Peer'
-        ident.nickname = 'TP'
+        ident.nickname = 'Test Peer'
+        ident.petname = 'TP'
         metadata = MagicMock()
         metadata.time = datetime.now()
         metadata.position = MagicMock()
@@ -95,6 +99,17 @@ class TestPeerDataAcq:
 
     def test_max_history(self):
         assert PeerDataAcq.max_history == 20
+
+    def test_reputation_of_unknown_is_none(self):
+        p = self._make_peer()
+        assert p.reputation_of('nobody') is None
+
+    def test_record_and_read_reputation_of(self):
+        p = self._make_peer()
+        p.record_reputation_of('other-1', 0.4)
+        p.record_reputation_of('other-1', 0.7)
+        assert p.reputation_of('other-1') == 0.7               # latest wins
+        assert p.reputation_by_other['other-1'].maxlen == PeerDataAcq.max_history
 
     def test_reputation_history_deque(self):
         p = self._make_peer()
@@ -311,3 +326,81 @@ class TestCohortTracker:
         msg.function = 'wrong'
         result = tracker.handle_stats(None, msg)
         assert result is False
+
+    def test_handle_stats_new_peer_uuid(self):
+        # Regression: a stat for a not-yet-seen other must create its per-other
+        # deque rather than raising KeyError on the plain network_history dict.
+        tracker = MagicMock(spec=CohortTracker)
+        tracker.handle_stats = CohortTracker.handle_stats.__get__(tracker)
+        peer_mock = MagicMock()
+        peer_mock.network_history = {}                 # 'peer-2' not yet present
+        peer_mock.total_network_history = deque()
+        tracker.cohort = MagicMock()
+        tracker.cohort.peers = {'peer-1': peer_mock}
+        msg = MagicMock()
+        msg.function = CohortProtocol.stats
+        msg.from_whom.uuid = 'peer-1'
+        with patch('autonomous_trust.inspector.peer.daq.from_json_string',
+                   return_value={'peer-2': [1, 2, 3]}):
+            result = tracker.handle_stats(None, msg)
+        assert result is True
+        assert 'peer-2' in peer_mock.network_history
+        assert list(peer_mock.network_history['peer-2']) == [[1, 2, 3]]
+
+    def test_handle_reputation_appends_history(self):
+        # A reputation response must land in reputation_history (what the
+        # peer_status renderers read), not a dead ad-hoc attribute.
+        tracker = MagicMock(spec=CohortTracker)
+        tracker.handle_reputation = CohortTracker.handle_reputation.__get__(tracker)
+        peer_mock = MagicMock()
+        peer_mock.reputation_history = deque(maxlen=PeerDataAcq.max_history)
+        tracker.cohort = MagicMock()
+        tracker.cohort.peers = {'peer-1': peer_mock}
+        rep = MagicMock()
+        rep.peer_id = 'peer-1'
+        rep.score = 0.85
+        msg = Message(CfgIds.reputation, ReputationProtocol.rep_resp, rep)
+        assert tracker.handle_reputation(msg) is True
+        assert list(peer_mock.reputation_history) == [0.85]
+
+    def test_handle_reputation_unknown_peer(self):
+        # Consumed (returns True) but nothing recorded for an unknown peer.
+        tracker = MagicMock(spec=CohortTracker)
+        tracker.handle_reputation = CohortTracker.handle_reputation.__get__(tracker)
+        tracker.cohort = MagicMock()
+        tracker.cohort.peers = {}
+        rep = MagicMock()
+        rep.peer_id = 'nobody'
+        rep.score = 0.5
+        msg = Message(CfgIds.reputation, ReputationProtocol.rep_resp, rep)
+        assert tracker.handle_reputation(msg) is True
+
+    def test_handle_reputation_non_reputation_message(self):
+        # A non-reputation object (e.g. a Peers listing) is not consumed here.
+        tracker = MagicMock(spec=CohortTracker)
+        tracker.handle_reputation = CohortTracker.handle_reputation.__get__(tracker)
+        assert tracker.handle_reputation(object()) is False
+
+    def test_handle_reputation_records_transitive_view(self):
+        # A rep_resp routed back FROM observer 'peer-1' ABOUT subject 'peer-2'
+        # is peer-1's per-other view of peer-2 (§4.2:159); peer-2 still gets the
+        # direct aggregate append.
+        def _pda(uuid):
+            return PeerDataAcq(uuid, 0, MagicMock(), MagicMock(), MagicMock(),
+                               Queue(), Queue())
+        observer = _pda('peer-1')
+        subject = _pda('peer-2')
+        tracker = MagicMock(spec=CohortTracker)
+        tracker.handle_reputation = CohortTracker.handle_reputation.__get__(tracker)
+        tracker.cohort = MagicMock()
+        tracker.cohort.peers = {'peer-1': observer, 'peer-2': subject}
+        rep = MagicMock()
+        rep.peer_id = 'peer-2'
+        rep.score = 0.6
+        msg = Message(CfgIds.reputation, ReputationProtocol.rep_resp, rep)
+        msg.from_whom = MagicMock()
+        msg.from_whom.uuid = 'peer-1'
+        assert tracker.handle_reputation(msg) is True
+        assert list(subject.reputation_history) == [0.6]     # direct aggregate
+        assert observer.reputation_of('peer-2') == 0.6        # transitive/per-other
+        assert list(observer.reputation_history) == []        # observer's own untouched

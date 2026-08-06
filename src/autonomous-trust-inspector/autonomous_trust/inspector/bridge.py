@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -48,10 +48,13 @@ from autonomous_trust.core.identity.peers import Peers
 from autonomous_trust.core.network import Network, Message
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
 from autonomous_trust.core.system import queue_cadence
+
 from autonomous_trust.core._python import _probes
 from autonomous_trust.services.data.server import DataProtocol
 
 from .inspector import Inspector
+from .latency import summarize
+from .transitive_trust import PEER_PAIR_QUERY_SEC
 
 
 logger = logging.getLogger(__name__)
@@ -63,7 +66,13 @@ logger = logging.getLogger(__name__)
 #         public signing key (hex, 16 chars). Either string may be
 #         empty if the peer's Identity object is missing those fields.
 #   ("reputation", name:str, score:float, wall_t:float)
-#   ("ping",       name:str, rtt_ms:float, wall_t:float)
+#   ("ping_at",    name:str, rtt_ms:float, loss_pct:float, count:int,
+#                  wall_t:float)
+#       — a PingAT round: an AT peer answered on AT's ports via a
+#         cooperating responder. Distinct from ICMP reachability, and
+#         non-load-bearing: a missed reply costs a sample, nothing more.
+#         rtt_ms is the round's average; loss_pct and count come along
+#         because an average alone hides a peer answering 1 in 5.
 #   ("rep_pair",   observer:str, subject:str, score:float, wall_t:float)
 #       — bilateral observation: observer's view of subject.
 #   ("reading",    peer:str, reading_dict:dict, wall_t:float)
@@ -71,10 +80,10 @@ logger = logging.getLogger(__name__)
 #   ("peer_gone",  name:str)   # future
 BRIDGE_QUEUE_MAX = 1024
 
-# Send a peer-to-peer reputation-query round every PEER_PAIR_QUERY_SEC.
-# O(N²) round-trips per round, but typical N is small (~10 peers) and
-# the network can absorb 100 messages/min easily.
-PEER_PAIR_QUERY_SEC = 60.0
+# PEER_PAIR_QUERY_SEC (the peer-to-peer query cadence) and the query round
+# itself now live in transitive_trust.TransitiveTrustMixin, shared with the
+# stock Inspector. O(N²) round-trips per round, but typical N is small
+# (~10 peers) and the network can absorb 100 messages/min easily.
 
 # Minimum score delta that triggers a `reputation` / `rep_pair` push to
 # the bridge queue. The bridge polls latest_reputation every ~5s; with
@@ -86,16 +95,26 @@ REPUTATION_PUSH_DELTA = 0.01
 
 
 def _peer_name(identity_obj) -> str:
-    """Best-effort identity -> display name.
+    """Best-effort identity -> bare roster display name.
 
-    AT Identity has .nickname, .fullname, .uuid. Prefer nickname so
-    bridge events carry the scenario's short label (e.g. 'noaa-1') when
-    AT_PEER_NAME propagation is wired. Falls back to str() if none set.
+    AT Identity has .nickname (online), .petname (local), .uuid. Prefer the
+    online nickname, then petname, then str(). The online nickname is
+    domain-qualified (e.g. 'noaa-1@tekfive.com'); strip the '@domain' so the
+    emitted name is the deployment-set AT_PEER_NAME ('noaa-1') — which is the
+    key the scenario roster (scenario.peers) and therefore every dashboard
+    panel is keyed on. Mirrors examples/*/coordinator.py:_roster_name_of.
+
+    Without the strip, the Trust Network graph — whose nodes are built from
+    scenario.peers — drops every edge (TrustNetworkGraph.set_trust ignores a
+    pair whose endpoints aren't existing nodes), and per-peer reputation
+    lookups (_latest_real_rep / _real_peer_status) never match, so the whole
+    dashboard sits empty while the raw '@domain' names still show in the log.
     """
-    for attr in ("nickname", "fullname"):
+    for attr in ("nickname", "petname"):
         v = getattr(identity_obj, attr, None)
         if v:
-            return str(v)
+            local = str(v).split('@', 1)[0].strip()
+            return local or str(v)
     return str(identity_obj)
 
 
@@ -260,25 +279,57 @@ class BridgeDataRcvr(Process, metaclass=ProcMeta,
                 #     which reads main proc's view of peer_capabilities.
                 # main proc's view lags behind idproc's because main is
                 # heavily backlogged (102k rep_resp messages, processed
-                # one-per-500ms), so its forwards routinely carry a
-                # smaller set of caps than idproc has. Naively replacing
-                # `self.protocol.peer_capabilities = message` lets a
-                # stale 8-key forward downgrade a freshly arrived 9-key
-                # direct fan-put — manifested as EPA's airquality_stream
-                # being seen by idproc but never reaching bridge-rcvr.
-                # Accept only updates that strictly grow (or replace
-                # nothing): if incoming has fewer keys than what we
-                # already hold, drop it.
+                # one-per-500ms). The two are DIFFERENT PARTIAL VIEWS of
+                # the same {cap_name: [peer_ids]} map: each can carry keys
+                # the other lacks. An earlier size-monotonic guard
+                # (accept only if inc_n >= cur_n) tried to protect EPA's
+                # airquality_stream but did the opposite — it rejected the
+                # airquality-bearing view whenever that view had fewer
+                # *total* keys, so airquality never reached bridge-rcvr.
+                # Reconcile by UNION instead: merge incoming per-cap peer
+                # sets into what we hold so no key is ever lost to a
+                # smaller update. (Trade-off: caps are never removed here;
+                # stale peers are harmless because the subscribe loop
+                # re-checks the peer roster via find_by_uuid.)
                 cur = self.protocol.peer_capabilities
                 cur_n = len(cur) if cur is not None else 0
                 inc_n = len(message)
-                if inc_n >= cur_n:
+                # Diagnostic: which incoming keys are NEW vs what we hold,
+                # and whether this update carries airquality_stream. Lets
+                # us distinguish "arrived-and-merged" from "never arrives".
+                cur_keys = set(cur) if cur is not None else set()
+                new_keys = set(message) - cur_keys
+                _probes.counter('bridge.rcvr', 'caps_incoming_new',
+                                ','.join(sorted(new_keys)) or '(none)')
+                _probes.counter('bridge.rcvr', 'caps_has_airq',
+                                '1' if 'airquality_stream' in set(message)
+                                else '0')
+                if cur is None or cur_n == 0:
                     self.protocol.peer_capabilities = message
                     _probes.counter('bridge.rcvr', 'caps_accept',
                                     f'{cur_n}->{inc_n}')
                 else:
-                    _probes.counter('bridge.rcvr', 'caps_reject_shrink',
-                                    f'{cur_n}->{inc_n}')
+                    merged = dict(cur._listing)
+                    for cap in message:
+                        existing = merged.get(cap)
+                        if existing is None:
+                            merged[cap] = list(message[cap])
+                            continue
+                        seen = {str(p) for p in existing}
+                        combined = list(existing)
+                        for pid in message[cap]:
+                            if str(pid) not in seen:
+                                combined.append(pid)
+                                seen.add(str(pid))
+                        merged[cap] = combined
+                    new_caps = PeerCapabilities(_listing=merged)
+                    # Preserve runtime-only descriptors from both views.
+                    new_caps.descriptors = {
+                        **getattr(cur, 'descriptors', {}),
+                        **getattr(message, 'descriptors', {})}
+                    self.protocol.peer_capabilities = new_caps
+                    _probes.counter('bridge.rcvr', 'caps_merge',
+                                    f'{cur_n}->{len(new_caps)}')
                 continue
             if isinstance(message, Peers):
                 self.protocol.peers = message
@@ -378,7 +429,7 @@ class InspectorBridge(Inspector):
                     # top-level queue) via Protocol.__init__.
                     # netproc dispatches ping() into a thread pool, so
                     # this no longer blocks the main loop.
-                    ping = Message(CfgIds.network, Network.ping, 5,
+                    ping = Message(CfgIds.network, Network.ping_at, 5,
                                    peer, return_to=self.proc_name)
                     queues[CfgIds.network].put(
                         ping, block=True, timeout=queue_cadence)
@@ -401,30 +452,14 @@ class InspectorBridge(Inspector):
         # forward_reputation can route the rep_resp back over the
         # network (else requestor=None and the response stays local).
         if self.tasking_tick(3, PEER_PAIR_QUERY_SEC):
+            # Peer-to-peer reputation queries (shared TransitiveTrustMixin):
+            # ask each observer for its view of every other subject, routed
+            # over the network; responses are captured into
+            # latest_reputation_pairs by automate.py.
             _probes.counter('bridge.task', 'tick3_fired')
-            peers = list(self.peers.all)
-            _probes.counter('bridge.task', 'tick3_peers', str(len(peers)))
-            for observer in peers:
-                for subject in peers:
-                    if str(observer.uuid) == str(subject.uuid):
-                        continue
-                    try:
-                        query = Message(
-                            CfgIds.reputation,
-                            ReputationProtocol.rep_req,
-                            to_json_string((subject, self.proc_name)),
-                            observer,  # routed over the network
-                            from_whom=self.identity,
-                        )
-                        _probes.counter('bridge.task', 'tick3_msg_built')
-                        queues[CfgIds.network].put(
-                            query, block=True, timeout=queue_cadence)
-                        _probes.counter('bridge.task', 'tick3_msg_queued')
-                    except Exception:
-                        _probes.counter('bridge.task', 'tick3_exc')
-                        logger.exception(
-                            "[bridge] failed peer-pair rep_req %r->%r",
-                            observer, subject)
+            _probes.counter('bridge.task', 'tick3_peers', str(len(self.peers.all)))
+            sent = self.query_peer_pairs(queues, logger=logger)
+            _probes.counter('bridge.task', 'tick3_msg_queued', str(sent))
 
         if self.tasking_tick(2, 5.0):  # ~5s
             now = time.time()
@@ -458,18 +493,24 @@ class InspectorBridge(Inspector):
 
             for message in list(self.unhandled_messages):
                 # unhandled_messages is a mixed bag — skip anything
-                # that isn't a Network.ping Message.
-                if getattr(message, "function", None) != Network.ping:
+                # that isn't a Network.ping_at Message.
+                if getattr(message, "function", None) != Network.ping_at:
                     continue
                 self.unhandled_messages.remove(message)
-                try:
-                    rtt = float(message.obj)
-                except (TypeError, ValueError):
+                # message.obj is a PingATStats, not a number: float(obj) raised
+                # TypeError, which this loop caught and skipped, so the latency
+                # panel never received a sample. Loss and count ride along
+                # because latency alone hides a peer answering one ping in five.
+                sample = summarize(message.obj)
+                if sample is None:
                     continue
-                target = _peer_name(getattr(message, "to_whom", None)
-                                    or getattr(message, "from_whom", None)
-                                    or "?")
-                self._push(("ping", target, rtt, time.time()))
+                peer = getattr(message, "from_whom", None) \
+                    or getattr(message, "to_whom", None)
+                if isinstance(peer, (list, tuple)):
+                    peer = peer[0] if peer else None
+                target = _peer_name(peer if peer is not None else "?")
+                self._push(("ping_at", target, sample.rtt_ms, sample.loss_pct,
+                            sample.count, time.time()))
 
     def _push(self, event):
         try:

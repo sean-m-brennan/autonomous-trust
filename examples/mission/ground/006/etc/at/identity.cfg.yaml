@@ -5,8 +5,7 @@ _encryptor: !Cfg:autonomous_trust.core.identity.encrypt.Encryptor
     MTRkMjUzOWJmZjgwNGE5NWM3NmZkM2M3YTQ4NzYzNmI1MDc1NjA2YTk5YmMxNWQ4MDllYjg5MGU4
     YTA3YmQ3Nw==
   public_only: false
-_fullname: m.j.novosel@tekfive.com
-_nickname: CWONovosel
+_nickname: m.j.novosel@tekfive.com
 _public_only: false
 _rank: 0
 _signature: !Cfg:autonomous_trust.core.identity.sign.Signature
@@ -16,4 +15,4 @@ _signature: !Cfg:autonomous_trust.core.identity.sign.Signature
   public_only: false
 _uuid: 9ce3e8ef-2767-4063-b8e8-e00efe24cc20
 address: 10.244.0.7
-petname: Nova
+petname: CWONovosel

@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2026 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #  Licensed under the Apache License, Version 2.0
 # ******************
 """Offline detection catalogue builder for the DoD demo.
@@ -19,7 +19,7 @@ Output::
 Both are gitignored; regenerate after ``tools/naip_fetch.py``.
 
 Dependencies (provided by the ``autonomous_trust`` conda env --
-see environment.yaml; ``conda activate autonomous_trust``)::
+see environment.yml; ``conda activate autonomous_trust``)::
 
     ultralytics Pillow numpy pyproj
 
@@ -146,10 +146,20 @@ def _ensure_weights(weights_path: Path, *, quiet: bool) -> Path:
         ) from e
     if not quiet:
         print(f"[detection_prep] fetching {weights_path.name} via ultralytics ...")
-    # Setting YOLO_CONFIG_DIR keeps state local to our cache.
+    # Setting YOLO_CONFIG_DIR keeps ultralytics' settings/state local to our cache.
     os.environ.setdefault("YOLO_CONFIG_DIR", str(weights_path.parent))
-    # Letting YOLO() resolve the bare name triggers its download path.
-    model = YOLO(weights_path.name)
+    # ultralytics resolves a bare weight name relative to the *current working
+    # directory* and downloads there. Run the download from inside the cache
+    # dir so the .pt lands in weights_path.parent instead of scattering into
+    # whatever cwd the tool was launched from (e.g. the repo root).
+    prev_cwd = Path.cwd()
+    try:
+        os.chdir(weights_path.parent)
+        model = YOLO(weights_path.name)
+    finally:
+        os.chdir(prev_cwd)
+    # Fallback: if ultralytics still resolved the checkpoint elsewhere, copy it
+    # into the canonical cache path.
     src = Path(model.ckpt_path) if hasattr(model, "ckpt_path") else None
     if src and src.exists() and src.resolve() != weights_path.resolve():
         weights_path.write_bytes(src.read_bytes())
@@ -202,6 +212,29 @@ def _nms(detections: list[dict], iou_threshold: float) -> list[dict]:
     return kept
 
 
+def _stitch_obb_corners(corners_batch, confs, clses,
+                        x_off: int, y_off: int, names: dict) -> list[dict]:
+    """Convert one tile's OBB result rows into panorama-space raw detections.
+
+    ``corners_batch`` is an (N, 4, 2) array of tile-local corner coordinates
+    (ultralytics ``result.obb.xyxyxyxy``); ``confs``/``clses`` are the parallel
+    (N,) confidence / class-index arrays. Each box is shifted by the tile's
+    top-left offset so corners land in panorama pixel space, then reduced to an
+    AABB for cross-tile NMS. Pulled out of :func:`_run_yolo_obb` so the
+    offset/stitching arithmetic is unit-testable without torch or a real
+    model."""
+    out: list[dict] = []
+    for corners, conf, cls in zip(corners_batch, confs, clses):
+        corners = [(float(cx + x_off), float(cy + y_off)) for cx, cy in corners]
+        out.append({
+            "class": str(names.get(int(cls), str(int(cls)))),
+            "confidence": float(conf),
+            "aabb": _obb_to_aabb(corners),
+            "obb": corners,
+        })
+    return out
+
+
 def _run_yolo_obb(panorama_path: Path, weights_path: Path,
                   conf_threshold: float, tile_size: int, tile_overlap: int,
                   iou_threshold: float, *, quiet: bool) -> list[dict]:
@@ -232,15 +265,8 @@ def _run_yolo_obb(panorama_path: Path, weights_path: Path,
         corners_batch = result.obb.xyxyxyxy.cpu().numpy()
         confs = result.obb.conf.cpu().numpy()
         clses = result.obb.cls.cpu().numpy().astype(int)
-        for corners, conf, cls in zip(corners_batch, confs, clses):
-            corners = [(float(cx + x1), float(cy + y1)) for cx, cy in corners]
-            aabb = _obb_to_aabb(corners)
-            raw.append({
-                "class": str(names.get(int(cls), str(int(cls)))),
-                "confidence": float(conf),
-                "aabb": aabb,
-                "obb": corners,
-            })
+        raw.extend(_stitch_obb_corners(corners_batch, confs, clses,
+                                       x1, y1, names))
         if not quiet and (i % 4 == 0 or i == len(tiles)):
             print(f"[detection_prep]   tile {i}/{len(tiles)}: "
                   f"running total {len(raw)}")

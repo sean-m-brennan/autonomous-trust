@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -54,12 +54,12 @@ def hilltop_pair():
     sutton_pos = GeoPosition(38.66, -80.71, 670).convert(UTMPosition)
     burnsville_pos = GeoPosition(38.85, -80.66, 730).convert(UTMPosition)
     sutton = PeerConnection(
-        uuid='sutton-001', kind='hilltop_relay', nickname='sutton_hilltop',
+        uuid='sutton-001', kind='hilltop_relay', petname='sutton_hilltop',
         ip4_addr='10.38.80.1', position=sutton_pos, signal=30.0,
         antenna=Antenna.YAGI, iface=NetInterface.MEDIUM,
     )
     burnsville = PeerConnection(
-        uuid='burnsville-001', kind='hilltop_relay', nickname='burnsville_hilltop',
+        uuid='burnsville-001', kind='hilltop_relay', petname='burnsville_hilltop',
         ip4_addr='10.38.80.2', position=burnsville_pos, signal=30.0,
         antenna=Antenna.YAGI, iface=NetInterface.MEDIUM,
     )
@@ -76,12 +76,12 @@ def valley_pair():
     pos_a = GeoPosition(38.655, -80.710, 290).convert(UTMPosition)
     pos_b = GeoPosition(38.670, -80.770, 270).convert(UTMPosition)
     peer_a = PeerConnection(
-        uuid='valley-001', kind='valley_relay', nickname='sutton_valley',
+        uuid='valley-001', kind='valley_relay', petname='sutton_valley',
         ip4_addr='10.38.80.10', position=pos_a, signal=20.0,
         antenna=Antenna.DIPOLE, iface=NetInterface.SMALL,
     )
     peer_b = PeerConnection(
-        uuid='valley-002', kind='valley_relay', nickname='gassaway_valley',
+        uuid='valley-002', kind='valley_relay', petname='gassaway_valley',
         ip4_addr='10.38.80.11', position=pos_b, signal=20.0,
         antenna=Antenna.DIPOLE, iface=NetInterface.SMALL,
     )
@@ -94,12 +94,12 @@ def hilltop_pair_original():
     sutton_pos = GeoPosition(38.66, -80.71, 670).convert(UTMPosition)
     burnsville_pos = GeoPosition(38.85, -80.66, 730).convert(UTMPosition)
     sutton = PeerConnection(
-        uuid='sutton-001', kind='hilltop_relay', nickname='sutton_hilltop',
+        uuid='sutton-001', kind='hilltop_relay', petname='sutton_hilltop',
         ip4_addr='10.38.80.1', position=sutton_pos, signal=-200.,
         antenna=Antenna.YAGI, iface=NetInterface.MEDIUM,
     )
     burnsville = PeerConnection(
-        uuid='burnsville-001', kind='hilltop_relay', nickname='burnsville_hilltop',
+        uuid='burnsville-001', kind='hilltop_relay', petname='burnsville_hilltop',
         ip4_addr='10.38.80.2', position=burnsville_pos, signal=-200.,
         antenna=Antenna.YAGI, iface=NetInterface.MEDIUM,
     )

@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -84,7 +84,7 @@ class TestReputationParity:
         assert abs(score - 0.9) < 0.001
 
     def test_reputation_compute_default(self):
-        """Default reputation for unknown peer is 0.5 (neutral)."""
+        """Default reputation for unknown peer is PREREP_NEUTRAL (0.2, neutral)."""
         from autonomous_trust.core._native.reputation import (
             NativeTransactionHistory as TransactionHistory,
             NativeReputations as Reputations,
@@ -98,8 +98,8 @@ class TestReputationParity:
         peer_id = uuid.uuid4()
 
         score = reputation_compute(hist, reps, self_id, peer_id)
-        # No history → contrite TFT → 0.49
-        assert abs(score - 0.49) < 0.01
+        # No history → contrite TFT cold-start prior → PREREP_NEUTRAL 0.2
+        assert abs(score - 0.2) < 0.01
 
     def test_reputation_compute_with_history(self):
         """Reputation after recording transactions."""

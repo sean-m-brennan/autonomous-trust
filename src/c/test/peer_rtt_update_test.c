@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -47,8 +47,8 @@ static void proc_init_with_peers(process_t *proc,
     pthread_rwlock_init(&proc->protocol.peers_rwlock, NULL);
     for (size_t i = 0; i < n && i < DEFAULT_MAX_PEERS; i++) {
         memcpy(proc->protocol.peers[i].uuid, uuids[i], 16);
-        snprintf(proc->protocol.peers[i].fullname,
-                 sizeof(proc->protocol.peers[i].fullname),
+        snprintf(proc->protocol.peers[i].nickname,
+                 sizeof(proc->protocol.peers[i].nickname),
                  "peer-%zu", i);
         proc->protocol.peer_rtt_ms[i] = 0;
     }

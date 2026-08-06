@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2026 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #  Licensed under the Apache License, Version 2.0
 # ******************
 """Sparse Detection event source for the DoD demo.
@@ -49,7 +49,7 @@ import math
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 from autonomous_trust.services.data import Reading
 
@@ -63,6 +63,94 @@ DEFAULT_CATALOGUE_PATH = Path(
 DEFAULT_TIME_FLOOR_SEC = 5.0
 DEFAULT_SUPPRESSION_SEC = 30.0
 DEFAULT_DRIFT_THRESHOLD_M = 25.0
+
+# --- Link-degradation model (STRETCH_GOAL_2_DETECTION_PLAN.md §5.5) ------
+#
+# A single per-peer link_quality knob ∈ [0,1] maps to one of four tiers.
+# `_degradation_tier(q)` returns (tier_name, reading_quality, downsample_to,
+# blur_sigma, drop_one_in). The tier governs both how the crop is rendered
+# (downsample/blur) and whether the emission fires at all (drop / link-lost).
+DEGRADE_PASS = "pass"            # q >= 0.8: full-res crop, quality 0.95
+DEGRADE_DOWNSAMPLE = "downsample"  # 0.5 <= q < 0.8: crop -> 64x48, quality 0.7
+DEGRADE_DROP = "degraded"        # 0.2 <= q < 0.5: 1-in-3 dropped + blur, q 0.4
+DEGRADE_LOST = "lost"            # q < 0.2: emission suppressed, heartbeat only
+
+_DOWNSAMPLE_SIZE = (64, 48)
+_DEGRADE_BLUR_SIGMA = 10.0
+_DEGRADE_DROP_ONE_IN = 3
+
+
+def _degradation_tier(q: float):
+    """Map a link_quality value to (tier, reading_quality). See §5.5."""
+    if q >= 0.8:
+        return DEGRADE_PASS, 0.95
+    if q >= 0.5:
+        return DEGRADE_DOWNSAMPLE, 0.7
+    if q >= 0.2:
+        return DEGRADE_DROP, 0.4
+    return DEGRADE_LOST, 0.1
+
+
+def _transform_crop_b64(crop_b64: str, *, resize_to=None, blur_sigma=0.0):
+    """Apply a downsample and/or Gaussian blur to a base64 JPEG crop.
+
+    Returns ``(new_b64, (w, h))``. PIL-optional: if Pillow is unavailable or
+    the input is empty, returns the input unchanged (with size best-effort
+    derived only when PIL is present), so the runtime degrades gracefully
+    without a hard image-processing dependency. The size in the returned
+    tuple always reflects the ACTUAL bytes (no lying about resize when PIL
+    is missing)."""
+    if not crop_b64:
+        return crop_b64, (0, 0)
+    try:
+        import io as _io
+
+        from PIL import Image, ImageFilter
+    except Exception:  # noqa: BLE001 — PIL not strictly required at runtime
+        return crop_b64, (0, 0)
+    try:
+        raw = base64.b64decode(crop_b64)
+        img = Image.open(_io.BytesIO(raw)).convert("RGB")
+        if resize_to is not None:
+            img = img.resize(resize_to, Image.BILINEAR)
+        if blur_sigma and blur_sigma > 0:
+            img = img.filter(ImageFilter.GaussianBlur(radius=blur_sigma))
+        buf = _io.BytesIO()
+        img.save(buf, format="JPEG", quality=70)
+        out = base64.b64encode(buf.getvalue()).decode("ascii")
+        return out, img.size
+    except Exception:  # noqa: BLE001
+        return crop_b64, (0, 0)
+
+
+def _obb_in_crop(obb_panorama_px, bbox_panorama_px,
+                 crop_size_px, margin_frac: float = 0.20):
+    """Map oriented-box corners from panorama px into crop-local px.
+
+    The crop is the object's AABB expanded by ``margin_frac`` on each side
+    (matching ``tools/detection_prep.py``'s bake-out) and resized to
+    ``crop_size_px``; the same affine maps each OBB corner. Returns a list of
+    ``[x, y]`` integer pairs (one per corner), or ``[]`` when the inputs are
+    unusable (no OBB / zero-size crop). For an axis-aligned overlay object the
+    OBB corners equal the AABB corners, so the rendered polygon degenerates to
+    the bbox rectangle — correct, just not rotated."""
+    cw, ch = crop_size_px
+    if not obb_panorama_px or cw <= 0 or ch <= 0:
+        return []
+    x0, y0, x1, y1 = bbox_panorama_px
+    w = max(x1 - x0, 1)
+    h = max(y1 - y0, 1)
+    crop_left = x0 - margin_frac * w
+    crop_top = y0 - margin_frac * h
+    crop_w = w * (1 + 2 * margin_frac)
+    crop_h = h * (1 + 2 * margin_frac)
+    pts = []
+    for corner in obb_panorama_px:
+        px, py = corner[0], corner[1]
+        cx = (px - crop_left) / crop_w * cw
+        cy = (py - crop_top) / crop_h * ch
+        pts.append([int(round(cx)), int(round(cy))])
+    return pts
 
 # Squad insertion landmark (GROUND_START in examples/dod_mission/scenario.py).
 # Position readings are reported as metres east/north of this point so they
@@ -99,20 +187,29 @@ class RoleFOV:
 
 # Per-peer view-centre override (lat, lon), used when a peer's roster
 # position is outside the AO panorama. MQ-800's roster ingress is
-# 3.4 km east of the AO; for v1 we pin its detection vantage ~500 m
-# east of compound-alpha so its 600 m oblique FOV catches the target
-# and the decoy. Microdrones / RQ-86s use their roster positions
-# (no override entry).
+# 3.4 km east of the AO; we pin its detection vantage east of and
+# between compound-alpha (target) and compound-bravo (decoy) so its
+# west-facing (bearing 270deg) 600 m x 600 m FOV catches both: the decoy
+# sits ~196 m forward and the target ~541 m forward, each ~158 m off the
+# centreline (well inside the 300 m half-width). Microdrones / RQ-86s use
+# their roster positions (no override entry). Keep in sync with the
+# compound-alpha/bravo positions in assets/detections/overlay.json.
 DETECTION_VIEW_CENTER_OVERRIDE: dict[str, tuple[float, float]] = {
-    "mq800": (34.724448, -86.634330),
+    "mq800": (34.724940, -86.632000),
 }
 
 
 ROLE_FOV: dict[str, RoleFOV] = {
-    # Microdrones: low + close, narrow-ish trapezoid approximated as a
-    # forward rectangle (350 m fwd, 350 m wide). Plan section 5.2.
-    "microdrone": RoleFOV(forward_m=350.0, back_m=0.0,
-                          half_width_m=175.0, alt_m=200.0),
+    # Microdrones: low overhead observers. Modeled as a small NADIR footprint
+    # centered on the drone (a 500 m box: 250 m each way), like a scaled-down
+    # RQ-86 — NOT a forward-only rectangle. With live motion the swarm loiters
+    # *over* the objective during the hold; a forward-only FOV (back_m=0, fixed
+    # north bearing) left the target behind the drones once they arrived, so
+    # detection only flickered for a few seconds on final approach and then
+    # vanished. A centered footprint keeps the compound in view throughout the
+    # T+3:00–T+7:00 hold and is bearing-independent (no overshoot fragility).
+    "microdrone": RoleFOV(forward_m=250.0, back_m=250.0,
+                          half_width_m=250.0, alt_m=200.0),
     # RQ-86: high + nadir; FOV covers a 10 km square centred on the peer.
     "recon-drone": RoleFOV(forward_m=5000.0, back_m=5000.0,
                            half_width_m=5000.0, alt_m=5000.0),
@@ -165,6 +262,7 @@ class CatalogueObject:
     crop_b64: str                      # base64 of crop bytes (may be "")
     crop_size_px: tuple[int, int]      # (w, h) of the crop, post-thumbnail
     bbox_panorama_px: tuple[int, int, int, int]
+    obb_panorama_px: tuple              # 4 [x,y] corners (oriented box); may be ()
     center_utm: tuple[float, float]    # (E, N)
     center_squad_xy: tuple[float, float]  # (x, y) relative to GROUND_START
     center_latlon: tuple[float, float]  # (lat, lon) for map markers
@@ -233,6 +331,8 @@ def load_catalogue(path: Path,
             crop_b64=crop_b64,
             crop_size_px=crop_size,
             bbox_panorama_px=tuple(entry["bbox_panorama_px"]),
+            obb_panorama_px=tuple(tuple(pt) for pt in
+                                  entry.get("obb_panorama_px", []) or []),
             center_utm=(ce, cn),
             center_squad_xy=(cx, cy),
             center_latlon=(float(entry.get("center_lat", 0.0)),
@@ -317,7 +417,9 @@ class DetectionSource:
                  time_floor_sec: float = DEFAULT_TIME_FLOOR_SEC,
                  suppression_sec: float = DEFAULT_SUPPRESSION_SEC,
                  drift_threshold_m: float = DEFAULT_DRIFT_THRESHOLD_M,
-                 seed: Optional[int] = None):
+                 seed: Optional[int] = None,
+                 active_after_sec: float = 0.0,
+                 pose_provider: Optional[Callable[[], Optional[tuple]]] = None):
         if role not in ROLE_FOV and fov is None:
             raise ValueError(
                 f"Unknown role {role!r}; pass fov= explicitly or use one "
@@ -330,17 +432,64 @@ class DetectionSource:
         self.bearing_deg = (bearing_deg if bearing_deg is not None
                             else ROLE_DEFAULT_BEARING_DEG.get(role, 0.0))
         self.link_quality = link_quality
+        # Link-degradation tier (§5.5): governs reading quality, crop
+        # downsample/blur, and the drop / link-lost behavior below.
+        self.degrade_tier, self._reading_quality = _degradation_tier(link_quality)
+        self._drop_counter = 0
+        self._crop_cache: dict[str, tuple[str, tuple[int, int]]] = {}
         self.time_floor_sec = time_floor_sec
         self.suppression_sec = suppression_sec
         self.drift_threshold_m = drift_threshold_m
+        # Arrival gate: emit nothing (not even a heartbeat) before this
+        # scenario-second. A late-joining emitter like the MQ-800 (join_phase
+        # 4, T+4:00) isn't on the network yet, so its detections must not
+        # appear — or be cross-validated — before it arrives. Pre-established
+        # emitters (microdrones, RQ-86s) pass 0.0 and are unaffected.
+        self.active_after_sec = active_after_sec
         self._view_center_latlon = view_center_latlon
         self._view_utm = _wgs84_to_utm(*view_center_latlon)
-        # Pre-compute the in-view subset; for the stationary-peer v1
-        # this never changes.
+        # Optional live-pose source for simulator-driven motion: a callable
+        # returning (lat, lon[, bearing_deg]) or None. Consulted at the top of
+        # tick(); when absent the source uses its construction-time pose (the
+        # stationary-peer v1). Lets a moving microdrone bring the target
+        # compound into its 350 m forward FOV as it advances north.
+        self._pose_provider = pose_provider
+        # Pre-compute the in-view subset; recomputed by update_pose() when the
+        # peer moves.
         self._visible = _visible_objects(catalogue, self._view_utm,
                                          self.bearing_deg, self.fov)
         self._emit_state: dict[str, _EmitState] = {}
         self._last_tick_sec: float = -math.inf
+
+    # --- pose / motion -------------------------------------------------
+
+    def set_pose_provider(self,
+                          provider: Optional[Callable[[], Optional[tuple]]]):
+        """Install (or clear) the live-pose callable consulted each tick."""
+        self._pose_provider = provider
+
+    def update_pose(self, view_center_latlon: Optional[tuple] = None,
+                    bearing_deg: Optional[float] = None) -> bool:
+        """Move/aim the sensor and recompute the in-view catalogue subset.
+
+        Returns True iff the pose actually changed (the FOV recompute is
+        skipped when it didn't, so calling this every tick is cheap). The
+        per-object reported positions come from the catalogue and are
+        unaffected by peer motion — moving the peer changes *which* objects
+        are visible, not where it claims they are."""
+        changed = False
+        if (view_center_latlon is not None
+                and tuple(view_center_latlon) != tuple(self._view_center_latlon)):
+            self._view_center_latlon = tuple(view_center_latlon)
+            self._view_utm = _wgs84_to_utm(*self._view_center_latlon)
+            changed = True
+        if bearing_deg is not None and float(bearing_deg) != self.bearing_deg:
+            self.bearing_deg = float(bearing_deg)
+            changed = True
+        if changed:
+            self._visible = _visible_objects(self.catalogue, self._view_utm,
+                                             self.bearing_deg, self.fov)
+        return changed
 
     # --- public introspection ------------------------------------------
 
@@ -354,10 +503,33 @@ class DetectionSource:
     # --- emit ----------------------------------------------------------
 
     def tick(self, t: timedelta) -> list[Reading]:
+        # Arrival gate: the peer isn't on the network before this scenario
+        # second (e.g. the MQ-800 at T+4:00), so emit nothing at all — no
+        # detection, no position reading, no heartbeat.
+        if t.total_seconds() < self.active_after_sec:
+            return []
+        # Refresh pose from the live source (simulator-driven motion) before
+        # gating/visibility. Pose tracking is independent of the emission
+        # cadence, and update_pose() is a no-op when the pose is unchanged.
+        if self._pose_provider is not None:
+            try:
+                pose = self._pose_provider()
+            except Exception:  # noqa: BLE001 — a flaky pose source must not
+                pose = None    # crash the sensor loop; keep the last pose
+            if pose:
+                lat, lon = pose[0], pose[1]
+                bearing = pose[2] if len(pose) > 2 else None
+                self.update_pose((lat, lon), bearing)
         t_sec = t.total_seconds()
         if t_sec - self._last_tick_sec < self.time_floor_sec:
             return []
         self._last_tick_sec = t_sec
+
+        # Link lost (§5.5, q < 0.2): suppress all detection emissions; the
+        # inspector shows "link lost" off the heartbeat. Recovery is instant
+        # when link_quality climbs (a new source is built per reconnection).
+        if self.degrade_tier == DEGRADE_LOST:
+            return [self._heartbeat(t, link_lost=True)]
 
         readings: list[Reading] = []
         for obj in self._visible:
@@ -395,11 +567,21 @@ class DetectionSource:
         if prev is not None and not drifted:
             if t_sec - prev.last_t_sec < self.suppression_sec:
                 return []
+        # Degraded-link drop (§5.5, 0.2 <= q < 0.5): drop 1-in-3 contacts.
+        # The counter advances only for emissions that clear suppression, so
+        # the drop rate is over real contacts (not idle ticks); a dropped
+        # contact does NOT update _emit_state, so it retries next tick.
+        if self.degrade_tier == DEGRADE_DROP:
+            self._drop_counter += 1
+            if self._drop_counter % _DEGRADE_DROP_ONE_IN == 0:
+                return []
         self._emit_state[world_uid] = _EmitState(t_sec, rx, ry)
+        # Apply the link tier's crop transform (downsample/blur), then derive
+        # bbox-in-crop from the (possibly resized) crop frame.
+        crop_b64, (cw, ch) = self._degrade_crop(reported_obj)
         # bbox-in-crop is the full crop frame minus the 20% margin used
         # by detection_prep.py; we report the inner rectangle so the
         # inspector can overlay it directly on the rendered crop.
-        cw, ch = reported_obj.crop_size_px
         if cw > 0 and ch > 0:
             mx = int(round(cw * 0.20 / (1 + 2 * 0.20)))
             my = int(round(ch * 0.20 / (1 + 2 * 0.20)))
@@ -407,6 +589,10 @@ class DetectionSource:
                             max(ch - my, my + 1)]
         else:
             bbox_in_crop = [0, 0, 0, 0]
+        # Oriented box in crop-local coords (rotated rectangle the inspector
+        # draws over the crop); falls back to [] when no OBB is available.
+        obb_in_crop = _obb_in_crop(reported_obj.obb_panorama_px,
+                                   reported_obj.bbox_panorama_px, (cw, ch))
         return [
             Reading(
                 timestamp=t,
@@ -414,20 +600,23 @@ class DetectionSource:
                 data_type="detection",
                 value=reported_obj.confidence,
                 unit="conf",
-                quality=self.link_quality,
+                quality=self._reading_quality,
                 metadata={
                     "world_uid": world_uid,
                     "class": reported_obj.cls,
                     "label": reported_obj.label,
                     "crop_id": reported_obj.crop,
-                    "crop_b64": reported_obj.crop_b64,
-                    "crop_size_px": list(reported_obj.crop_size_px),
+                    "crop_b64": crop_b64,
+                    "crop_size_px": [cw, ch],
                     "bbox_in_crop_px": bbox_in_crop,
+                    "obb_in_crop_px": obb_in_crop,
                     "bbox_panorama_px": list(reported_obj.bbox_panorama_px),
                     "target_latlon": list(reported_obj.center_latlon),
                     "view_center_latlon": list(self._view_center_latlon),
                     "view_bearing_deg": self.bearing_deg,
                     "view_alt_m": self.fov.alt_m,
+                    "link_quality": self.link_quality,
+                    "degradation": self.degrade_tier,
                 },
             ),
             Reading(
@@ -436,7 +625,7 @@ class DetectionSource:
                 data_type="target_position_x",
                 value=rx,
                 unit="m",
-                quality=self.link_quality,
+                quality=self._reading_quality,
                 metadata={"world_uid": world_uid},
             ),
             Reading(
@@ -445,22 +634,46 @@ class DetectionSource:
                 data_type="target_position_y",
                 value=ry,
                 unit="m",
-                quality=self.link_quality,
+                quality=self._reading_quality,
                 metadata={"world_uid": world_uid},
             ),
         ]
 
-    def _heartbeat(self, t: timedelta) -> Reading:
+    def _degrade_crop(self, obj: CatalogueObject
+                      ) -> tuple[str, tuple[int, int]]:
+        """Return the (possibly downsampled/blurred) crop for this tier.
+        Cached per crop id since the tier is fixed for the source's life."""
+        key = obj.crop or id(obj)
+        cached = self._crop_cache.get(key)
+        if cached is not None:
+            return cached
+        if self.degrade_tier == DEGRADE_DOWNSAMPLE:
+            result = _transform_crop_b64(obj.crop_b64, resize_to=_DOWNSAMPLE_SIZE)
+        elif self.degrade_tier == DEGRADE_DROP:
+            result = _transform_crop_b64(obj.crop_b64, blur_sigma=_DEGRADE_BLUR_SIGMA)
+        else:
+            result = (obj.crop_b64, obj.crop_size_px)
+        # If the transform couldn't run (no PIL / empty crop), fall back to
+        # the original crop + its known size rather than a zeroed size.
+        if not result[0] or result[1] == (0, 0):
+            result = (obj.crop_b64, obj.crop_size_px)
+        self._crop_cache[key] = result
+        return result
+
+    def _heartbeat(self, t: timedelta, link_lost: bool = False) -> Reading:
         return Reading(
             timestamp=t,
             peer_name=self.peer_name,
             data_type="detection_heartbeat",
             value=0.0,
             unit="",
-            quality=self.link_quality,
+            quality=self._reading_quality,
             metadata={"role": self.role,
                       "in_view_count": 0,
-                      "view_center_latlon": list(self._view_center_latlon)},
+                      "view_center_latlon": list(self._view_center_latlon),
+                      "link_quality": self.link_quality,
+                      "degradation": self.degrade_tier,
+                      "link_lost": link_lost},
         )
 
 
@@ -475,7 +688,10 @@ def build_detection_source(peer_name: str, role: str,
                                tuple[float, float]] = None,
                            bearing_deg: Optional[float] = None,
                            link_quality: float = 0.95,
-                           seed: Optional[int] = None
+                           seed: Optional[int] = None,
+                           active_after_sec: float = 0.0,
+                           pose_provider: Optional[
+                               Callable[[], Optional[tuple]]] = None
                            ) -> Optional[DetectionSource]:
     """Convenience factory used by participant.py.
 
@@ -506,4 +722,6 @@ def build_detection_source(peer_name: str, role: str,
         bearing_deg=bearing_deg,
         link_quality=link_quality,
         seed=seed,
+        active_after_sec=active_after_sec,
+        pose_provider=pose_provider,
     )

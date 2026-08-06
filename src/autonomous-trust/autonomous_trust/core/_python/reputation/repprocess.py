@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ from queue import Empty, Full
 from uuid import UUID
 from dataclasses import dataclass
 
-from ..network import Message
+from ..network import Message, Network
 from ..processes import Process, ProcMeta
 from ..config import Configuration, from_json_string, to_json_string
 from ..identity.protocol import IdentityProtocol
@@ -31,14 +31,33 @@ from .protocol import ReputationProtocol
 from .reputation import (TransactionHistory, Reputation, Reputations,
                          TransactionScore, SlashAttestation, SignedSlash,
                          Checkpoint, SignedCheckpoint)
-from ..system import CfgIds, now, encoding
+from ..system import CfgIds, now, encoding, proc_idle_floor
 from .. import _probes
+
+
+def _env_float(name, default):
+    """Read a reputation threshold from the environment, falling back to
+    ``default``. Lets an operator re-adjust the trust thresholds (neutral,
+    communication cut-off, decay asymptote, persist gate) without a code
+    change -- e.g. for a demo or a differently-tuned deployment. A missing
+    or unparseable value uses the default (logged nowhere -- this runs at
+    import). The C twin mirrors these via getenv with identical names and
+    defaults so Python<->C stay byte-comparable under the SAME environment.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == '':
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
 
 
 # Reputation save gate: only peers strictly above this threshold survive
 # a process restart. Self is always persisted regardless. See
 # doc/architecture/persistent-cohort.md for the rationale.
-REPUTATION_PERSIST_THRESHOLD = 0.5
+# Override: AT_REP_PERSIST_THRESHOLD.
+REPUTATION_PERSIST_THRESHOLD = _env_float('AT_REP_PERSIST_THRESHOLD', 0.5)
 
 
 @dataclass
@@ -80,12 +99,79 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     COOP_ENTER = 0.55
     COOP_EXIT = 0.45
 
+    # Pre-reputation cold-start (CTFT no-bilateral-history-with-us branch).
+    # PREREP_NEUTRAL is the "no information" starting reputation on the
+    # [0, 1] scale: a peer we know nothing about starts at NEUTRAL (0.2) — a
+    # small leeway above the COMM_CUTOFF (0.1) communication cut-off so a
+    # newcomer can make a minor mistake without being silenced — and must EARN
+    # its way up toward 1.0, rather than being handed a near-threshold ~0.5
+    # for free (which let unknown/newcomer peers read as almost-trusted and
+    # made the trust graph a flat all-to-all mesh). A catastrophically-failed
+    # peer is driven down to the slash floor (0.0), below the cut-off. The
+    # transaction-memory prior (_prereputation_prior) shrinks a peer's observed
+    # third-party standing toward this value by a pseudo-count of
+    # PREREP_SHRINKAGE_K, so a truly-unknown peer (zero observations) reads
+    # exactly PREREP_NEUTRAL while a peer others have already scored gets an
+    # informed, conservatively-shrunk prior. This is the STARTING point only --
+    # the CTFT bilateral pivots (min(0.49, .)/max(0.51, .) around the 0.5
+    # per-transaction cooperate threshold) are the earned near-threshold
+    # outputs and are deliberately unchanged (the per-tx task-score scale is
+    # unchanged; only the aggregate-reputation thresholds move). Mirror:
+    # reputation.c PREREP_NEUTRAL. Disable the heuristic via
+    # AT_PREREP_HEURISTIC=0; re-adjust the neutral value via AT_REP_NEUTRAL.
+    PREREP_NEUTRAL = _env_float('AT_REP_NEUTRAL', 0.2)
+    PREREP_SHRINKAGE_K = 3.0
+
+    # Communication cut-off (participation floor on the [0, 1] scale). A peer
+    # whose aggregate reputation falls BELOW COMM_CUTOFF is EXCLUDED: gateways
+    # stop forwarding to/for it and LAN/one-hop nodes ignore its messages
+    # (enforced at the network process via the exclusion feed in
+    # _publish_tier_change). The cut-off sits just above the slash floor (0.0),
+    # so a slashed peer lands below it. Because an excluded peer can no longer
+    # transact, it cannot earn its way back — exclusion is STICKY and recovery
+    # is ONLY via a REASON_REHABILITATE slash-lift (operator/quorum), which
+    # restores the score to PREREP_NEUTRAL and re-admits it. The excluded state
+    # is persisted across restart (two-sided persist filter) so a restart
+    # cannot silently rehabilitate. Mirror: reputation.c COMM_CUTOFF.
+    # Re-adjust via AT_REP_COMM_CUTOFF.
+    COMM_CUTOFF = _env_float('AT_REP_COMM_CUTOFF', 0.1)
+
     # EMA half-life (in committed bilateral txs) for the dashboard
     # consensus-reputation channel.  Smaller → faster crash on a peer
     # that starts producing bad scores, slower rebuild for the rest.
     # 20 txs gives α ≈ 0.034 — a hacked peer falls visibly within
     # a few seconds of demo time while honest peers recover gradually.
     CONSENSUS_EMA_HALF_LIFE = 20
+
+    # --- Idle reputation decay (warm-start staleness) -----------------
+    # A peer's earned operational reputation is a *memory* of past
+    # AT-bounded interaction. Memory should fade: the longer since we
+    # last transacted with a peer, the closer its operational reputation
+    # relaxes toward "almost-but-not-quite neutral" — never all the way
+    # to neutral (0.20), so a long-known asset stays faintly preferred over
+    # a true stranger, but its elevated trust tier lapses and must be re-earned
+    # on contact. The gap a peer spends out of contact between our
+    # shutdown and the next start-up counts as idle time (seeded from the
+    # persisted snapshot's mtime in _seed_idle_from_snapshot), which is
+    # exactly what makes a warm-started cohort safe: re-loaded trust is
+    # stale trust, and stale trust decays.
+    #
+    # ASYMMETRIC by design: decay only erodes reputation *above* the
+    # asymptote, pulling it down. Scores at or below the asymptote are
+    # left untouched — mere absence never rehabilitates a distrusted or
+    # corrupt node (this preserves the sticky-low-reputation intent
+    # documented at self._consensus_last). Slashed peers and self are
+    # never decayed.
+    #
+    # Tunable. ONSET is a grace period before any decay starts (brief
+    # out-of-range gaps cost nothing); HALF_LIFE sets how fast the gap
+    # above the asymptote then halves; SWEEP_INTERVAL throttles the live
+    # sweep. Defaults assume wall-clock seconds.
+    # just above neutral (0.20), above COMM_CUTOFF. Override: AT_REP_DECAY_ASYMPTOTE.
+    REPUTATION_DECAY_ASYMPTOTE = _env_float('AT_REP_DECAY_ASYMPTOTE', 0.21)
+    REPUTATION_DECAY_ONSET = 3600.0         # s idle before decay begins
+    REPUTATION_DECAY_HALF_LIFE = 86400.0    # s for the above-asymptote gap to halve
+    REPUTATION_DECAY_SWEEP_INTERVAL = 60.0  # min s between live sweeps
 
     # Cap on the dedup set for committed paxos rounds (see
     # `self.committed_paxos_rounds` below). FIFO eviction, paired
@@ -176,15 +262,52 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self.reputations = (loaded_reps
                             if isinstance(loaded_reps, Reputations)
                             else Reputations())
+        # Idle-decay bookkeeping. _last_interaction maps peer-uuid-str ->
+        # epoch seconds of our most recent committed transaction with that
+        # peer; the staleness sweep relaxes idle peers toward almost-
+        # neutral (see the REPUTATION_DECAY_* constants). _seed_idle_from_
+        # snapshot below back-dates the warm-started cohort to the persisted
+        # snapshot's mtime and applies the offline-gap decay at start-up.
+        self._last_interaction: dict[str, float] = {}
+        self._last_decay_sweep = 0.0
+        # Debug instrument (AT_REP_DUMP_SEC): throttle clock for the
+        # per-node reputation-view dump emitted from process(). See
+        # _dump_reputation_trace. 0 == last dump not yet taken.
+        self._last_rep_dump = 0.0
+        self._seed_idle_from_snapshot()
+        # Communication-cut-off exclusion set (peer-uuid-str). A peer whose
+        # aggregate reputation is below COMM_CUTOFF is excluded from the
+        # network: gateways stop forwarding to/for it and LAN/one-hop nodes
+        # ignore its messages. The set is maintained by _publish_tier_change
+        # as scores cross the cut-off and fed to the network process, and is
+        # seeded here at boot from the persisted (warm-started) snapshot so a
+        # peer excluded before shutdown stays excluded across restart --
+        # recovery is explicit-only (REASON_REHABILITATE).
+        self._excluded: set[str] = set()
+        self._seed_exclusions_from_snapshot()
+        # One-shot guard: the boot-seeded exclusion set (above) is pushed
+        # to the network process on the first process() iteration, once
+        # IPC queues exist (they don't at __init__ time).
+        self._exclusions_synced = False
         # Sticky consensus memory: peer-uuid-str -> last real (chain-derived)
         # consensus score. The tx chain is a bounded window, so an idle
         # peer's transactions evict within ~one window of sustained
-        # activity; without this its consensus would snap back to 0.5 the
-        # moment its last tx ages out. Stickiness holds the last computed
+        # activity; without this its consensus would snap back to neutral
+        # (0.2) the moment its last tx ages out. Stickiness holds the last computed
         # value until NEW transactions update it — so a peer that stops
         # interacting (out of range) keeps its earned reputation (incl. a
         # low one for a corrupt node) instead of decaying to neutral.
         self._consensus_last: dict[str, float] = {}
+        # Persistent per-peer running consensus EMA over the PRIMARY chain
+        # (peer-uuid-str -> ema), folded once per committed bilateral tx and
+        # tracked by the highest chain index already folded
+        # (_consensus_folded_idx). Unlike the from-scratch recompute in
+        # _consensus_reputation, this retains history that has since evicted
+        # from the bounded window, so a sliding window can no longer reshape a
+        # peer's score — which is what produced the synchronized dashboard
+        # "Trust Dynamics" sawtooth. See _running_consensus.
+        self._consensus_ema: dict[str, float] = {}
+        self._consensus_folded_idx: dict[str, int] = {}
         self.requested_reps = []
         self.updates = {}
         self.num_updates = 3
@@ -201,6 +324,16 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # only saw the committed broadcast). Bounded by tying eviction to
         # the TransactionHistory chain (see _evict_task_weight below).
         self.task_weights: dict[str, int] = {}
+        # Per-task capability tier, populated alongside task_weights from the
+        # TS capability_name. Feeds the per-tier consensus view
+        # (_consensus_reputation_by_tier, trust-tiers §12 / deferred.md §2.3).
+        # Same FIFO bound as task_weights. Default tier 0 when the capability
+        # is unknown locally.
+        self.task_tiers: dict[str, int] = {}
+        # Last computed {tier: score} per peer (str uuid -> dict), refreshed by
+        # _consensus_reputation_by_tier so a dashboard / query can read the
+        # per-tier breakdown without recomputing.
+        self._per_tier_last: dict[str, dict[int, float]] = {}
         # (peer_uuid, score) pairs produced by _compute_reputation in
         # spawned threads, drained by the main `process` loop where
         # `queues` is in scope. Same pattern as `requested_reps`.
@@ -228,9 +361,14 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # Applied floors: target-uuid-str -> (floor_score, epoch). Consulted
         # at the TOP of _consensus_reputation / _compute_reputation so a
         # slashed peer reads its floor regardless of chain/EMA/baseline.
-        # Volatile (not persisted): a process restart clears slashes, which
-        # matches the persist model (a slashed peer is simply below
-        # REPUTATION_PERSIST_THRESHOLD and isn't carried over).
+        # The _slashed floor dict itself is volatile (a restart clears it),
+        # BUT the floored score it writes into self.reputations is below
+        # COMM_CUTOFF and so IS carried across a restart by the two-sided
+        # persist filter (see _persist_reputations): the peer comes back up
+        # excluded and is re-seeded into _excluded at boot, staying cut off
+        # until explicit REASON_REHABILITATE. Only the fast-penalty CTFT
+        # short-circuit (forcing re-earn from the punished regime) is lost on
+        # restart; the exclusion itself survives.
         self._slashed: dict[str, tuple] = {}
         # Proposer-side co-signature accumulation: slash-key -> set of
         # voter-uuid-str. Seeded with the slasher itself on initiation.
@@ -519,6 +657,32 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         while len(self.task_weights) > self._TASK_WEIGHTS_CAP:
             self.task_weights.pop(next(iter(self.task_weights)))
 
+    def _resolve_tx_tier(self, score: TransactionScore) -> int:
+        """Map a TS's capability_name to the capability's required_tier, with
+        a graceful default of 0 (mirrors _resolve_tx_weight). Peers that don't
+        have the capability registered locally treat the tier as 0. Used to
+        bucket transactions for the per-tier consensus view."""
+        cap_name = getattr(score, 'capability_name', None)
+        if not cap_name:
+            return 0
+        try:
+            cap = self.protocol.capabilities[cap_name]
+        except (KeyError, AttributeError, TypeError):
+            return 0
+        t = getattr(cap, 'required_tier', 0) or 0
+        return max(0, int(t))
+
+    def _record_task_tier(self, task_id, tier: int) -> None:
+        """Insert into self.task_tiers with the same FIFO eviction as
+        task_weights (kept in lockstep so a task's weight and tier evict
+        together)."""
+        key = str(task_id)
+        if key in self.task_tiers:
+            del self.task_tiers[key]
+        self.task_tiers[key] = int(tier)
+        while len(self.task_tiers) > self._TASK_WEIGHTS_CAP:
+            self.task_tiers.pop(next(iter(self.task_tiers)))
+
     def _start_paxos(self, queues, score: TransactionScore, group_uuid=None):
         id1 = int(now().timestamp() * 1000)
         id2 = len(self.history) + 1
@@ -539,8 +703,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         queues[CfgIds.network].put(pax_msg, block=True, timeout=self.q_cadence)
         self.proposals[idx] = score
         # Cache the weight for this task so _pure_reputation can later
-        # aggregate it correctly (Slice 3 / trust-tiers.md §5).
+        # aggregate it correctly (Slice 3 / trust-tiers.md §5), and the tier
+        # so the per-tier consensus view can bucket it (§2.3).
         self._record_task_weight(score.task_id, self._resolve_tx_weight(score))
+        self._record_task_tier(score.task_id, self._resolve_tx_tier(score))
         self.logger.debug('Start a Paxos round')
 
     def handle_transaction(self, queues, message):
@@ -561,6 +727,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             # capability locally fall back to weight 1.
             if hasattr(score, 'task_id'):
                 self._record_task_weight(score.task_id, self._resolve_tx_weight(score))
+                self._record_task_tier(score.task_id, self._resolve_tx_tier(score))
             msg = Message(self.name, ReputationProtocol.accepted,
                           to_json_string((id1, id2, peer_id)),
                           message.from_whom, from_whom=self.identity)
@@ -631,6 +798,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # — primary for leaf nodes, a child chain on a gateway.
                 self._chain_for_group(round_group_uuid).update(
                     score.task_id, peer_id, score.score)
+                # Fold-on-commit: keep the dashboard running consensus EMA
+                # current the moment a tx completes (primary chain only).
+                self._fold_committed_tx(
+                    score.task_id, self._chain_for_group(round_group_uuid))
+                self._note_interaction(peer_id)
                 # Bumped to info to make demo debugging tractable —
                 # without a commit log, "no movement on reputations"
                 # is indistinguishable from "no paxos commits".
@@ -697,6 +869,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 return True
             chain = self._chain_for_group(group_uuid)
             chain.update(task_id, peer_id, float(score))
+            # Fold-on-commit: advance the dashboard running consensus EMA as
+            # soon as this tx completes (primary chain only; idempotent).
+            self._fold_committed_tx(task_id, chain)
+            self._note_interaction(peer_id)
             self.logger.info(
                 'Recorded committed tx from %s: task=%s score=%.2f '
                 'group=%s (chain now %d txs, %d task_maps)',
@@ -803,17 +979,41 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         target = str(attestation.target_uuid)
         if attestation.reason == SlashAttestation.REASON_REHABILITATE:
             self._slashed.pop(target, None)
-            # Drop sticky floor so the score recomputes from chain/EMA.
+            # Drop the sticky floor AND the running-EMA latch so the score
+            # recomputes from the lifted value rather than the floored one.
+            # The slash-override in _consensus_reputation pins BOTH
+            # _consensus_last and _consensus_ema to the floor; clearing only
+            # the former would leave _running_consensus returning the stale
+            # floored EMA and the lift below would be invisible.
             self._consensus_last.pop(target, None)
+            self._consensus_ema.pop(target, None)
+            self._consensus_folded_idx.pop(target, None)
+            # Lift the score to neutral (PREREP_NEUTRAL, above the comm
+            # cut-off) so the peer is re-admitted to the network and then
+            # must re-earn elevated trust from neutral -- rather than
+            # snapping back to a stale pre-failure value or being left below
+            # the cut-off (still excluded) by a rehab attestation whose
+            # floor_score is the punitive floor. The tier recompute below
+            # (score above the cut-off) drives the readmit through
+            # _publish_tier_change.
+            pending_score = self.PREREP_NEUTRAL
+            try:
+                self.reputations.update(attestation.target_uuid, pending_score)
+            except Exception:
+                self.logger.debug('apply_slash: reputations.update (rehab) '
+                                  'failed', exc_info=True)
         else:
             floor = float(attestation.floor_score)
+            pending_score = floor
             self._slashed[target] = (floor, int(attestation.epoch))
             # Reflect the floor in the canonical reputation store too, so
             # the verdict is observable to persistence, tier publication,
             # and any reader of self.reputations (e.g. the conformance
             # `reputation_of` assertion) — not only lazily at scoring time.
-            # A floored peer is below REPUTATION_PERSIST_THRESHOLD so it is
-            # not carried across a restart, matching the volatile intent.
+            # A floored peer is below COMM_CUTOFF, so the two-sided persist
+            # filter DOES carry it across a restart (it stays excluded until
+            # explicit rehabilitation); the volatile _slashed floor itself is
+            # not persisted, but the sub-cut-off score is.
             try:
                 self.reputations.update(attestation.target_uuid, floor)
             except Exception:
@@ -823,15 +1023,15 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         while len(self._slashed_seen) > self.COMMITTED_ROUNDS_CAP:
             self._slashed_seen.popitem(last=False)
         # Queue a tier recompute (drained in process()): _compute_reputation
-        # now short-circuits on the floor and publishes tier 0 / tier_lost.
-        self.pending_tiers.append(
-            (attestation.target_uuid, float(attestation.floor_score)))
+        # short-circuits on a floor and publishes tier 0 / tier_lost; a rehab
+        # lift republishes the restored (neutral) tier and readmits.
+        self.pending_tiers.append((attestation.target_uuid, pending_score))
         self.logger.info(
-            'Slash %s: target=%s reason=%s floor=%.2f epoch=%d',
+            'Slash %s: target=%s reason=%s score=%.2f epoch=%d',
             'lifted' if attestation.reason
             == SlashAttestation.REASON_REHABILITATE else 'applied',
             target[:8], attestation.reason,
-            float(attestation.floor_score), int(attestation.epoch))
+            pending_score, int(attestation.epoch))
 
     def forward_slash(self, queues, message):
         """Entry point for a locally-originated slash: a detector (e.g. the
@@ -1200,12 +1400,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     def _pure_reputation(self, peer):
         # Counterparty's-score weighted by counterparty's-reputation
         # AND by the originating capability's transaction_weight
-        # (doc/architecture/trust-tiers.md §5). Default 0.5 on
-        # no-history OR no-valid-tx (returning 0.0 would route the
-        # peer back into CTFT mode on the next compute, the very
-        # condition we supposedly graduated from). Counterparties
-        # absent from self.reputations use a 0.5 fallback rather
-        # than being silently skipped (skipping made the result
+        # (doc/architecture/trust-tiers.md §5). Default PREREP_NEUTRAL
+        # (0.2) on no-history OR no-valid-tx (returning a lower value
+        # would route the peer back into CTFT mode on the next compute,
+        # the very condition we supposedly graduated from). Counterparties
+        # absent from self.reputations use the PREREP_NEUTRAL fallback
+        # rather than being silently skipped (skipping made the result
         # sensitive to whether the local reputations dict had caught
         # up to the history chain).
         # `peer` may be a Peer object (production sender path), a
@@ -1216,7 +1416,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         try:
             txs = list(self.history.by_peer(peer_uuid))
         except KeyError:
-            return 0.5
+            return self.PREREP_NEUTRAL
         total = 0.0
         total_weight = 0
         for tx in txs:
@@ -1231,12 +1431,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             else:
                 continue
             cp_rep = self.reputations[counterparty_id] \
-                if counterparty_id in self.reputations else 0.5
+                if counterparty_id in self.reputations else self.PREREP_NEUTRAL
             w = self.task_weights.get(str(tx.task_id), 1)
             total += counterparty_score * cp_rep * w
             total_weight += w
         if total_weight == 0:
-            return 0.5
+            return self.PREREP_NEUTRAL
         return total / total_weight
 
     def _contrite_tit_for_tat(self, peer):
@@ -1262,8 +1462,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     my_scores.append(tx.p1_score)
         except KeyError:
             self.logger.debug('No transaction history for peer %s' % peer_uuid)
-        if len(peer_scores) < 1 or len(my_scores) < 1:  # not enough info
-            return 0.49
+        if len(peer_scores) < 1 or len(my_scores) < 1:  # no bilateral w/ us
+            # Cold-start: before any bilateral history WITH us exists, fall
+            # back to a transaction-memory prior rather than a flat neutral.
+            return self._prereputation_prior(peer_uuid)
         peer_standing = sum(peer_scores) / len(peer_scores)
         my_standing = sum(my_scores) / len(my_scores)
         if peer_scores[-1] < 0.5 and my_standing < 0.5:  # peer defected, but my standing sucks
@@ -1274,7 +1476,70 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             rep_score = max(0.51, peer_standing)
         return rep_score
 
-    # TODO can we use the transaction memory to do better than CTFT before reputation kicks in?
+    def _prereputation_prior(self, peer_uuid):
+        """Transaction-memory prior for the CTFT cold-start window.
+
+        Before any *bilateral* history with us exists, a flat PREREP_NEUTRAL
+        throws away what the chain already knows about the peer: the scores third
+        parties have assigned it. Mine those (the counterparty-submitted
+        score on each committed transaction the peer took part in — the same
+        "assessment OF the peer" axis _pure_reputation uses), weight each by
+        the counterparty's reputation and the task weight, and shrink the
+        result toward PREREP_NEUTRAL by a pseudo-count of PREREP_SHRINKAGE_K.
+
+        With zero usable observations this returns PREREP_NEUTRAL exactly, so
+        a genuinely-unknown peer behaves exactly as before; a peer others
+        have already transacted with gets an informed, conservatively-shrunk
+        prior instead. Pure function of the chain + local reputations, so it
+        stays deterministic across nodes with the same state.
+
+        Mirror: reputation.c reputation_prereputation_prior.
+        Kill switch: AT_PREREP_HEURISTIC=0 restores the flat default."""
+        neutral = self.PREREP_NEUTRAL
+        if os.environ.get('AT_PREREP_HEURISTIC') == '0':
+            return neutral
+        try:
+            txs = list(self.history.by_peer(peer_uuid))
+        except (KeyError, AttributeError):
+            return neutral
+        self_uuid = getattr(self.identity, 'uuid', None)
+        total = 0.0
+        total_weight = 0.0
+        count = 0
+        seen = set()  # by_peer can list a tx twice (mapped under p1 and p2);
+        #               one transaction is one observation for the prior.
+        for tx in txs:
+            if tx.task_id in seen:
+                continue
+            if tx.p1_id == peer_uuid and tx.p2_id is not None:
+                about_peer, counterparty_id = tx.p2_score, tx.p2_id
+            elif tx.p2_id == peer_uuid and tx.p1_id is not None:
+                about_peer, counterparty_id = tx.p1_score, tx.p1_id
+            else:
+                continue
+            if about_peer is None or counterparty_id == self_uuid:
+                continue
+            seen.add(tx.task_id)
+            # Weight each third-party observation by the counterparty's
+            # reputation (an assessment from a trusted peer counts for more).
+            # Unlike _pure_reputation we deliberately omit the capability
+            # task-weight here: during cold-start the task-weight cache is
+            # sparse, and keeping the prior a pure function of (chain, reps)
+            # makes the C mirror a straight port of CTFT's inputs.
+            cp_rep = self.reputations[counterparty_id] \
+                if counterparty_id in self.reputations else self.PREREP_NEUTRAL
+            if cp_rep <= 0:
+                continue
+            total += about_peer * cp_rep
+            total_weight += cp_rep
+            count += 1
+        if count < 1 or total_weight <= 0:
+            return neutral
+        observed = total / total_weight
+        n = float(count)
+        k = self.PREREP_SHRINKAGE_K
+        prior = (n * observed + k * neutral) / (n + k)
+        return min(1.0, max(0.0, prior))
 
     @classmethod
     def _trust_tier(cls, score: float) -> int:
@@ -1288,19 +1553,144 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 return tier
         return 0
 
-    def _persist_reputations(self):
-        """Write the reputation snapshot to disk, filtered by threshold.
+    @classmethod
+    def _is_excluded(cls, score) -> bool:
+        """True if `score` is below the communication cut-off, i.e. the
+        peer is excluded from the network (gateways stop forwarding
+        to/for it, LAN/one-hop nodes ignore it). Recovery is
+        explicit-only (REASON_REHABILITATE)."""
+        return score is not None and score < cls.COMM_CUTOFF
 
-        Only peers with score strictly above REPUTATION_PERSIST_THRESHOLD
-        are persisted; self is always included regardless. The on-disk
-        file is therefore the authoritative "trusted cohort" snapshot
-        used by the warm-start path in IdentityProcess.choose_group()
-        and by the dod-mission seed generator at
-        tools/seed_dod_cohort.py.
+    def _note_interaction(self, peer_uuid):
+        """Stamp 'we just transacted with peer_uuid' — resets its idle
+        clock so the staleness sweep (_decay_reputations) leaves an
+        actively-interacting peer alone. Self is ignored."""
+        key = str(peer_uuid)
+        if key == str(self.identity.uuid):
+            return
+        self._last_interaction[key] = now().timestamp()
+
+    @classmethod
+    def _decayed_score(cls, score, idle_seconds):
+        """Relax an operational reputation toward almost-neutral as a
+        function of idle time. ASYMMETRIC: a score at or below the
+        asymptote is returned unchanged (absence never rehabilitates a
+        distrusted node); a score above it decays exponentially toward
+        the asymptote after the onset grace period, never overshooting
+        below it. See the REPUTATION_DECAY_* constants."""
+        if score is None or score <= cls.REPUTATION_DECAY_ASYMPTOTE:
+            return score
+        if idle_seconds <= cls.REPUTATION_DECAY_ONSET:
+            return score
+        elapsed = idle_seconds - cls.REPUTATION_DECAY_ONSET
+        factor = 0.5 ** (elapsed / cls.REPUTATION_DECAY_HALF_LIFE)
+        decayed = cls.REPUTATION_DECAY_ASYMPTOTE + \
+            (score - cls.REPUTATION_DECAY_ASYMPTOTE) * factor
+        return max(cls.REPUTATION_DECAY_ASYMPTOTE, decayed)
+
+    def _seed_idle_from_snapshot(self):
+        """At start-up, treat the persisted reputation snapshot's mtime as
+        the moment of our last AT-bounded activity: seed every warm-started
+        peer's idle clock to it and apply the offline-gap decay up front, so
+        a long-dormant cohort comes up with faded (not stale-inflated)
+        trust. No-op on a cold start (no snapshot on disk). No queues are
+        available this early, so tier changes are not published here — the
+        first live sweep / rep_req republishes from the decayed value."""
+        try:
+            path = os.path.join(Configuration.get_cfg_dir(),
+                                CfgIds.reputation + Configuration.file_ext)
+            mtime = os.path.getmtime(path)
+        except (OSError, IOError):
+            return
+        present = now().timestamp()
+        idle = max(0.0, present - mtime)
+        self_uuid = str(self.identity.uuid)
+        for u in list(self.reputations.current.keys()):
+            if str(u) == self_uuid:
+                continue
+            self._last_interaction[str(u)] = mtime
+            score = self.reputations.current.get(u)
+            decayed = self._decayed_score(score, idle)
+            if decayed is not None:
+                self.reputations.current[u] = decayed
+
+    def _seed_exclusions_from_snapshot(self):
+        """Re-establish the exclusion set at start-up from the persisted
+        (warm-started) reputation snapshot: any peer whose score is below
+        COMM_CUTOFF was excluded before shutdown and must stay excluded,
+        because recovery is explicit-only (REASON_REHABILITATE) and an
+        excluded peer -- being ignored -- can never transact its way back.
+        Called after _seed_idle_from_snapshot so it reads post-offline-gap
+        scores; decay never lifts a sub-asymptote score, so an excluded peer
+        cannot idle its way above the cut-off. No queues exist this early, so
+        the network process is not notified here -- the exclusion set is read
+        by the first outbound/inbound gate and republished on the first live
+        tier change."""
+        self_uuid = str(self.identity.uuid)
+        for u, score in self.reputations.current.items():
+            if str(u) == self_uuid:
+                continue
+            if self._is_excluded(score):
+                self._excluded.add(str(u))
+
+    def _decay_reputations(self, queues, present):
+        """Periodic staleness sweep: pull idle peers' operational
+        reputation toward almost-neutral. Throttled to one pass per
+        REPUTATION_DECAY_SWEEP_INTERVAL. Skips self and slashed peers
+        (their floor is authoritative). Republishes the trust tier on a
+        floor crossing and persists if anything moved. The dashboard
+        consensus channel (_consensus_last) is decayed in lock-step so the
+        two views agree. See doc/architecture/persistent-cohort.md."""
+        if present - self._last_decay_sweep < self.REPUTATION_DECAY_SWEEP_INTERVAL:
+            return
+        self._last_decay_sweep = present
+        self_uuid = str(self.identity.uuid)
+        changed = False
+        for u in list(self.reputations.current.keys()):
+            key = str(u)
+            if key == self_uuid or key in self._slashed:
+                continue
+            score = self.reputations.current.get(u)
+            if score is None or score <= self.REPUTATION_DECAY_ASYMPTOTE:
+                continue
+            idle = max(0.0, present - self._last_interaction.get(key, present))
+            decayed = self._decayed_score(score, idle)
+            if decayed is None or abs(decayed - score) <= 1e-9:
+                continue
+            self.reputations.current[u] = decayed
+            prior = self._consensus_last.get(key)
+            if prior is not None and prior > self.REPUTATION_DECAY_ASYMPTOTE:
+                self._consensus_last[key] = self._decayed_score(prior, idle)
+            self._publish_tier_change(queues, u, decayed)
+            changed = True
+        if changed:
+            try:
+                self._persist_reputations()
+            except (OSError, IOError) as e:
+                self.logger.warning(
+                    'Could not persist reputations after decay: %s' % e)
+
+    def _persist_reputations(self):
+        """Write the reputation snapshot to disk, filtered two-sided.
+
+        Persisted cohorts: (1) self, always; (2) the TRUSTED cohort --
+        peers with score strictly above REPUTATION_PERSIST_THRESHOLD (the
+        authoritative warm-start snapshot used by IdentityProcess.
+        choose_group() and the dod-mission seed generator at
+        tools/seed_dod_cohort.py); and (3) the EXCLUDED cohort -- peers
+        below COMM_CUTOFF. The excluded cohort must be carried across a
+        restart so a peer that was cut off before shutdown comes back up
+        still excluded; otherwise a restart would silently rehabilitate it
+        (recovery is meant to be explicit-only, via REASON_REHABILITATE).
+        The mid-band (cut-off .. persist-threshold) is not persisted -- an
+        ordinary peer warm-starts from cold rather than carrying a stale
+        middling score.
         """
         keep_uuids = {self.identity.uuid}
         for u, score in self.reputations.current.items():
-            if score is not None and score > REPUTATION_PERSIST_THRESHOLD:
+            if score is None:
+                continue
+            if score > REPUTATION_PERSIST_THRESHOLD or self._is_excluded(score):
                 keep_uuids.add(u)
         snapshot = self.reputations.filtered_for_persist(keep_uuids)
         snapshot.to_file(os.path.join(Configuration.get_cfg_dir(),
@@ -1317,8 +1707,22 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         be cancelled. See doc/architecture/trust-tiers.md §7.2.
         """
         try:
-            new_tier = self._trust_tier(score)
             key = str(peer_uuid)
+            # Communication cut-off crossing. This is checked BEFORE the
+            # tier early-return because the cut-off (0.1) lies WITHIN tier 0
+            # (which spans [0, 0.5)): a 0.15 -> 0.05 crossing is a
+            # tier-0 -> tier-0 no-op for the tier logic, yet it must
+            # exclude the peer. Exclusion state is the authority; the
+            # network process is notified only on an actual crossing.
+            now_excluded = self._is_excluded(score)
+            was_excluded = key in self._excluded
+            if now_excluded and not was_excluded:
+                self._excluded.add(key)
+                self._publish_exclusion(queues, peer_uuid, True)
+            elif was_excluded and not now_excluded:
+                self._excluded.discard(key)
+                self._publish_exclusion(queues, peer_uuid, False)
+            new_tier = self._trust_tier(score)
             old_tier = self.peer_tiers.get(key)
             if old_tier == new_tier:
                 return
@@ -1351,6 +1755,43 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         except Exception as err:
             self.logger.warning('_publish_tier_change failed: %s' % err)
 
+    def _publish_exclusion(self, queues, peer_uuid, excluded):
+        """Tell the network process to exclude (or readmit) a peer whose
+        reputation has crossed the communication cut-off. Resolves the
+        peer's address from the live roster and sends a local-IPC
+        Network.exclude / Network.readmit control message; the network
+        process then drops the peer's inbound frames and filters it out
+        of outbound targets. No-op if the address is unknown (nothing to
+        key the network-layer gate on)."""
+        try:
+            # Peer uuids are strings in this codebase, but callers may hand
+            # us a UUID (pending_tiers) or a Peer/Identity object; resolve
+            # tolerantly across all three, matching self.reputations keying.
+            peer = None
+            if isinstance(peer_uuid, (str, UUID)):
+                peer = (self.peers.find_by_uuid(peer_uuid)
+                        or self.peers.find_by_uuid(str(peer_uuid)))
+            else:
+                peer = peer_uuid  # already a Peer/Identity
+            address = getattr(peer, 'address', None)
+            if not address:
+                self.logger.debug(
+                    'Exclusion %s for %s: no address, network gate skipped',
+                    'add' if excluded else 'remove', str(peer_uuid)[:8])
+                return
+            func = Network.exclude if excluded else Network.readmit
+            msg = Message(CfgIds.network, func, address,
+                          to_whom=None, from_whom=self.identity)
+            queues[CfgIds.network].put(
+                msg, block=True, timeout=self.q_cadence)
+            self.logger.info('Reputation %s %s (%s) at the network layer',
+                             'excluded' if excluded else 'readmitted',
+                             str(peer_uuid)[:8], address)
+        except Full:
+            self.logger.error('_publish_exclusion: network queue full')
+        except Exception as err:
+            self.logger.warning('_publish_exclusion failed: %s' % err)
+
     def _compute_reputation(self, peer, req_proc, requestor):
         _probes.counter('rep.compute', 'enter')
         try:
@@ -1379,7 +1820,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     (Reputation(peer_uuid, rep_score), req_proc, requestor))
                 _probes.counter('rep.compute', 'slashed')
                 return
-            previous = 0.0
+            previous = self.PREREP_NEUTRAL
             if peer_uuid in self.reputations:
                 previous = self.reputations[peer_uuid]
             in_coop = self._coop_mode.get(peer_uuid, False)
@@ -1434,11 +1875,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         Priority: (1) the last real consensus value computed for this
         peer (stickiness — so an idle peer whose txs have evicted from
         the bounded chain keeps its earned score instead of resetting to
-        0.5), (2) the locally-known reputation (a warm-start seeded prior
-        from reputation.cfg.json, or a prior local compute), (3) the
-        neutral 0.5. Used only when the consensus chain has nothing for
-        the peer — once real bilateral txs exist, the EMA in
-        _consensus_reputation dominates and refreshes the sticky value.
+        neutral), (2) the locally-known reputation (a warm-start seeded
+        prior from reputation.cfg.json, or a prior local compute), (3) the
+        neutral PREREP_NEUTRAL (0.2). Used only when the consensus chain
+        has nothing for the peer — once real bilateral txs exist, the EMA
+        in _consensus_reputation dominates and refreshes the sticky value.
         Tolerates the str/UUID key ambiguity in self.reputations.current."""
         last = self._consensus_last.get(str(peer_uuid))
         if last is not None:
@@ -1446,7 +1887,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         try:
             cur = self.reputations.current
         except AttributeError:
-            return 0.5
+            return self.PREREP_NEUTRAL
         for k in (peer_uuid, str(peer_uuid)):
             if k in cur and cur[k] is not None:
                 return float(cur[k])
@@ -1456,7 +1897,122 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 return float(cur[u])
         except (ValueError, TypeError, AttributeError):
             pass
-        return 0.5
+        return self.PREREP_NEUTRAL
+
+    def _fold_tx_for_peer(self, peer_uuid, tx, alpha):
+        """Fold one completed tx's counterparty-side score into ``peer_uuid``'s
+        persistent running consensus EMA, exactly once (guarded by chain
+        index). No-op for an incomplete/one-sided tx (index None), a peer not
+        party to it, a missing counterparty score, an already-folded tx, or a
+        slashed peer (its floor is authoritative — folding would drift the
+        stored value the slash override masks, breaking resume-from-floor).
+        Updates ``_consensus_ema``/``_consensus_folded_idx`` and keeps
+        ``_consensus_last`` in step (read by the baseline path + idle decay)."""
+        if tx is None or tx.index is None:
+            return
+        key = str(peer_uuid)
+        if key in self._slashed:
+            return
+        if tx.index <= self._consensus_folded_idx.get(key, -1):
+            return
+        if tx.p1_id == peer_uuid:
+            cp_score = tx.p2_score
+        elif tx.p2_id == peer_uuid:
+            cp_score = tx.p1_score
+        else:
+            return
+        if cp_score is None:
+            return
+        ema = self._consensus_ema.get(key)
+        # transaction_weight applied as w single-step folds (see
+        # _consensus_reputation for why this preserves the [0,1] range).
+        w = self.task_weights.get(str(tx.task_id), 1)
+        for _ in range(max(1, int(w))):
+            if ema is None:
+                ema = float(cp_score)
+            else:
+                ema = alpha * float(cp_score) + (1.0 - alpha) * ema
+        self._consensus_ema[key] = ema
+        self._consensus_folded_idx[key] = tx.index
+        self._consensus_last[key] = ema
+        # Determination instrumentation (AT_REP_TRACE): record every fold so
+        # we can tell a peer whose consensus EMA is actually MOVING (real
+        # bilateral txs folding in) from one stuck at baseline (never folds).
+        # Off unless the env flag is set; logging only, no behaviour change.
+        if os.environ.get('AT_REP_TRACE'):
+            self.logger.info(
+                'REPTRACE fold peer=%s cp_score=%.3f -> ema=%.4f idx=%d w=%d',
+                key[:8], float(cp_score), ema, tx.index, max(1, int(w)))
+
+    def _fold_committed_tx(self, task_id, chain):
+        """Fold-on-commit hook: when a tx completes on the PRIMARY chain, fold
+        it into BOTH counterparties' running consensus EMAs immediately, so the
+        dashboard value is retained independently of when consensus is next
+        queried. Idempotent (index-guarded), so it is safe to call after every
+        chain.update — a still-incomplete tx (index None) folds nothing.
+        Child-chain (gateway) commits are ignored here: those peers score via
+        the pure from-scratch recompute in _consensus_reputation."""
+        if chain is not self.history:
+            return
+        tx = chain._task_mapping.get(task_id)
+        if tx is None or tx.index is None:
+            return
+        alpha = 1.0 - 0.5 ** (1.0 / float(self.CONSENSUS_EMA_HALF_LIFE))
+        self._fold_tx_for_peer(tx.p1_id, tx, alpha)
+        self._fold_tx_for_peer(tx.p2_id, tx, alpha)
+
+    def _running_consensus(self, peer_uuid):
+        """Persistent per-peer running consensus EMA over the PRIMARY chain.
+
+        The value is built by folding each committed bilateral tx exactly once
+        (``_fold_tx_for_peer``, tracked by chain index). Folding happens
+        eagerly ON COMMIT (``_fold_committed_tx`` from the accept/commit
+        handlers), so already-folded transactions stay reflected in the stored
+        value even after they evict from the bounded window — the score changes
+        ONLY when new transactions commit and never wobbles as the shared
+        window slides. That is the fix for the synchronized "Trust Dynamics"
+        sawtooth (the old from-scratch recompute, still used for gateway child
+        chains in _consensus_reputation, re-derived the EMA over whatever subset
+        of a peer's txs was resident, so every line rose/fell on the global
+        eviction beat).
+
+        This method just RETURNS the stored value; the resident-tx scan below
+        is an idempotent safety net that folds any resident tx a commit handler
+        missed (e.g. a catchup/replay path that appended without folding),
+        while it is still resident.
+
+        Equivalence: for a chain that has not yet evicted, the folded set/order/
+        seed match the from-scratch recompute exactly, so the conformance/parity
+        corpora (small, non-evicting) are unaffected. Determinism note: after
+        eviction the value depends on which txs THIS node folded — a deliberate
+        trade for a stable timeline. Slash override and cold-start baseline are
+        handled by the caller / _consensus_baseline. C twin keeps the
+        from-scratch form for now (parity follow-up)."""
+        key = str(peer_uuid)
+        alpha = 1.0 - 0.5 ** (1.0 / float(self.CONSENSUS_EMA_HALF_LIFE))
+        try:
+            txs = list(self.history.by_peer(peer_uuid))
+        except KeyError:
+            txs = []
+        # Ascending chain-index order == commit order; already-folded txs are
+        # skipped by the index guard, so this is a no-op on the normal path.
+        for tx in sorted(txs, key=lambda t: (t.index if t.index is not None else 0)):
+            self._fold_tx_for_peer(peer_uuid, tx, alpha)
+        if key in self._consensus_ema:
+            return self._consensus_ema[key]
+        # No committed bilateral history folded yet -> cold-start baseline
+        # (sticky last / seeded prior / neutral), same as the recompute.
+        base = self._consensus_baseline(peer_uuid)
+        # Determination instrumentation (AT_REP_TRACE): a peer that keeps
+        # landing here has NO folded bilateral txs — its dashboard score is
+        # pure baseline, never its earned performance. Distinguishes the
+        # "validator verdict never reaches the subject" hypothesis from a
+        # mean-dilution effect. Logging only.
+        if os.environ.get('AT_REP_TRACE'):
+            self.logger.info(
+                'REPTRACE baseline peer=%s (0 folded bilateral txs) -> %.4f',
+                key[:8], base)
+        return base
 
     def _consensus_reputation(self, peer_uuid, chain=None):
         """Deterministic reputation score over a consensus tx chain.
@@ -1474,9 +2030,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
         Cold-start exception: when the chain has NO committed bilateral
         history for the peer, falls back to ``_consensus_baseline``
-        (the locally-known/seeded prior) instead of a flat 0.5, so a
+        (the locally-known/seeded prior) instead of a flat neutral, so a
         warm-started cohort reads its primed rep on the dashboard
-        rather than a uniform 0.5. This is the only point where the
+        rather than a uniform neutral (0.2). This is the only point where the
         score depends on per-node state, and only until the first real
         tx lands — after that the EMA dominates and nodes reconverge.
         Intended for the inspector dashboard;
@@ -1496,8 +2052,18 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         if slashed is not None:
             floor = float(slashed[0])
             self._consensus_last[str(peer_uuid)] = floor
+            # Keep the running EMA in step so a later rehabilitation resumes
+            # from the floor rather than a stale pre-slash value.
+            self._consensus_ema[str(peer_uuid)] = floor
             return floor
-        history = self.history if chain is None else chain
+        # Primary chain (the dashboard/timeline path): a persistent per-peer
+        # running EMA that folds each committed tx exactly once, so evicting
+        # old txs can't reshape the score (no sawtooth). Gateway child-chain
+        # scoring (chain is not None) keeps the pure from-scratch recompute
+        # below, which the rep-tree/conformance path depends on.
+        if chain is None:
+            return self._running_consensus(peer_uuid)
+        history = chain
         try:
             txs = list(history.by_peer(peer_uuid))
         except KeyError:
@@ -1539,6 +2105,63 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # txs from the bounded chain window.
         self._consensus_last[str(peer_uuid)] = ema
         return ema
+
+    def _consensus_reputation_by_tier(self, peer_uuid, chain=None):
+        """Per-tier consensus reputation (trust-tiers §12 / deferred.md §2.3).
+
+        Instead of collapsing every transaction into a single EMA, partition
+        the peer's committed bilateral transactions by the **tier of the
+        capability** that produced each one (``self.task_tiers``, populated
+        alongside ``task_weights`` from the TS ``capability_name``) and fold
+        each partition into its own weighted EMA. Returns ``{tier: score}``
+        for every tier with at least one observation — e.g. ``{1: 0.92,
+        3: 0.41}`` ("trusted at tier 1, untrusted at tier 3") — instead of one
+        number.
+
+        Additive: the collapsed ``_consensus_reputation`` is untouched and
+        remains the system's single-number score. Same EMA/weighting as the
+        collapsed view, applied within each tier bucket; deduped by task
+        (``by_peer`` can list a tx twice). Pure function of the chain +
+        ``task_tiers``/``task_weights`` caches, mirroring the collapsed view's
+        dependence on ``task_weights``.
+
+        Mirror: reputation.c ``reputation_consensus_by_tier``."""
+        history = self.history if chain is None else chain
+        try:
+            txs = list(history.by_peer(peer_uuid))
+        except KeyError:
+            return {}
+        alpha = 1.0 - 0.5 ** (1.0 / float(self.CONSENSUS_EMA_HALF_LIFE))
+        ordered = sorted(
+            txs, key=lambda t: (t.index if t.index is not None else 0))
+        ema_by_tier: dict[int, float] = {}
+        seen = set()
+        for tx in ordered:
+            if tx.p1_id is None or tx.p2_id is None:
+                continue
+            if tx.task_id in seen:
+                continue
+            if tx.p1_id == peer_uuid:
+                cp_score = tx.p2_score
+            elif tx.p2_id == peer_uuid:
+                cp_score = tx.p1_score
+            else:
+                continue
+            if cp_score is None:
+                continue
+            seen.add(tx.task_id)
+            tier = self.task_tiers.get(str(tx.task_id), 0)
+            w = self.task_weights.get(str(tx.task_id), 1)
+            ema = ema_by_tier.get(tier)
+            for _ in range(max(1, int(w))):
+                if ema is None:
+                    ema = float(cp_score)
+                else:
+                    ema = alpha * float(cp_score) + (1.0 - alpha) * ema
+            ema_by_tier[tier] = ema
+        if ema_by_tier:
+            self._per_tier_last[str(peer_uuid)] = dict(ema_by_tier)
+        return ema_by_tier
 
     def _subtree_roster(self, gateway_uuid):
         """Reputation roster for a node and everything below it in the
@@ -1725,6 +2348,99 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             except Full:
                 self.logger.error('forward_reputation: %s queue full' % req_proc)
 
+    def _dump_reputation_trace(self, present):
+        """Debug instrument: emit THIS node's own reputation view of every
+        peer it knows, as a single parseable JSON log line, so a host-side
+        harvester (examples/multi_agency/log_harvest.py) can reconstruct the
+        full observer->subject bilateral matrix by union-ing every node's
+        self-report — WITHOUT relaying scores peer-to-peer over the mesh.
+
+        Opt-in and throttled via ``AT_REP_DUMP_SEC`` (float seconds; unset or
+        <= 0 disables). Emits at INFO so it reaches container stdout/stderr
+        (``docker logs`` / ``kubectl logs``). Python reputation backend only —
+        a native-C run won't emit these (same limitation as AT_REP_TRACE).
+
+        Line shape (one complete record per line)::
+
+            AT_REPDUMP {"t":<sec>,"self":"<uuid>","view":[
+                {"s":"<subj_uuid>","nick":"<subj_nick>","con":<own-view score>,
+                 "rep":<aggregate rep or null>,"n":<n_tx>,"coop":<n>,"def":<n>,
+                 "tier":<int>,"exc":<bool>}, ... ]}
+
+        ``con`` is this node's OWN computed consensus of the subject (the
+        Trust-Dynamics value); ``n``/``coop``/``def`` are the raw CTFT inputs
+        (committed bilateral txs involving the subject, split at the 0.5
+        cooperate threshold) that produced it.
+        """
+        interval = _env_float('AT_REP_DUMP_SEC', 0.0)
+        if interval <= 0:
+            return
+        if self._last_rep_dump and present - self._last_rep_dump < interval:
+            return
+        self._last_rep_dump = present
+        try:
+            me = str(self.identity.uuid)
+            # Subjects = the known cohort plus anyone we hold a reputation or
+            # tx history for (a peer that has since left the group still has
+            # an earned score worth revealing).
+            subjects: dict[str, UUID] = {}
+            try:
+                for p in self.peers.all:
+                    subjects[str(p.uuid)] = p.uuid
+            except Exception:
+                pass
+            for uid in list(self.reputations.current.keys()):
+                subjects.setdefault(str(uid), uid)
+            view = []
+            for key, subj in subjects.items():
+                if key == me:
+                    continue
+                try:
+                    con = float(self._running_consensus(subj))
+                except Exception:
+                    con = None
+                rep = float(self.reputations[subj]) \
+                    if subj in self.reputations else None
+                n = coop = defect = 0
+                try:
+                    for tx in self.history.by_peer(subj):
+                        if tx.p1_id == subj:
+                            s = tx.p1_score
+                        elif tx.p2_id == subj:
+                            s = tx.p2_score
+                        else:
+                            continue
+                        if s is None:
+                            continue
+                        n += 1
+                        if s >= 0.5:
+                            coop += 1
+                        else:
+                            defect += 1
+                except Exception:
+                    # by_peer raises KeyError for a peer with no committed
+                    # bilateral txs yet — leave the tallies at zero.
+                    pass
+                nick = None
+                try:
+                    peer = self.peers.find_by_uuid(subj)
+                    nick = getattr(peer, 'nickname', None) if peer else None
+                except Exception:
+                    nick = None
+                view.append({
+                    's': key,
+                    'nick': nick,
+                    'con': None if con is None else round(con, 4),
+                    'rep': None if rep is None else round(rep, 4),
+                    'n': n, 'coop': coop, 'def': defect,
+                    'tier': int(self.peer_tiers.get(key, 0)),
+                    'exc': key in self._excluded,
+                })
+            rec = {'t': round(present, 3), 'self': me, 'view': view}
+            self.logger.info('AT_REPDUMP %s' % to_json_string(rec))
+        except Exception as err:
+            self.logger.error('reputation dump failed: %s' % err)
+
     def process(self, queues, signal):
         # Drain budget per iter. Each handle_reputation_request spawns
         # a short-lived thread, so processing many per iter is cheap
@@ -1734,6 +2450,14 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         DRAIN_BUDGET = 64
         while self.keep_running(signal):
             try:
+                # Push boot-seeded exclusions (warm-started peers below the
+                # cut-off) to the network process now that queues exist, so
+                # a peer excluded before shutdown is re-gated at the network
+                # layer on restart -- recovery is explicit-only.
+                if not self._exclusions_synced:
+                    for key in list(self._excluded):
+                        self._publish_exclusion(queues, key, True)
+                    self._exclusions_synced = True
                 drained = 0
                 # First iteration blocks briefly so we don't hot-spin
                 # when the queue is empty; subsequent iterations are
@@ -1772,6 +2496,13 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     self._publish_tier_change(queues, peer_uuid, rep_score)
 
                 present = now().timestamp()
+                # Staleness sweep: relax idle peers' operational
+                # reputation toward almost-neutral (warm-start memory
+                # fades). Throttled internally to SWEEP_INTERVAL.
+                self._decay_reputations(queues, present)
+                # Debug instrument: emit this node's own reputation view for
+                # a host-side log harvester (opt-in, throttled internally).
+                self._dump_reputation_trace(present)
                 for req in list(self.requests):
                     if present - req[0] > self.expiration:
                         self.requests.remove(req)
@@ -1781,10 +2512,14 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 for rnd in list(self.round_group):
                     if present - rnd[0] > self.expiration:
                         del self.round_group[rnd]
-                # No sleep_until here: removing the 0.5 s cadence
-                # throttle was the whole point. Pacing is already
-                # provided by queue.get's q_cadence-second blocking
-                # timeout when no work is pending.
+                # Guarantee a CPU-yield floor. queue.get's q_cadence timeout
+                # only sleeps when the queue is idle for a full window; under
+                # continuous traffic there is no idle window and this loop
+                # would spin at 100%. sleep_until(proc_idle_floor) yields the
+                # rest of a ~10ms window when the iteration wasn't saturated,
+                # without the old sleep_until(cadence)=0.5s throughput cap.
+                # (AT_PROC_IDLE_FLOOR_SEC=0 restores the un-throttled loop.)
+                self.sleep_until(proc_idle_floor)
             except Exception as err:
                 self.logger.error(err)
                 self.logger.error(traceback.format_exc())

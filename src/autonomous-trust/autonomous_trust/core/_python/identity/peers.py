@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -104,12 +104,38 @@ class Peers(Configuration):
     def add(self, who, level=None):
         if level is None:
             level = self.mid_level
+        index = self._index_by(who)
+        # A peer that rejoins under a new identity keeps its nickname but
+        # gets a new uuid (and usually a new address). hierarchy/valuation
+        # are keyed by nickname, so `who` replaces the prior holder there;
+        # but self.all and self.listing are keyed by object/address and
+        # would otherwise retain the stale entry — leaving two peers with
+        # the same nickname in self.all. Downstream that doubles per-peer
+        # work (e.g. reputation queries) and, because the stale uuid scores
+        # the cold-start neutral baseline while the live one carries the
+        # real score, drew a sawtooth on the dashboard's trust timeline.
+        # Evict the prior holder of this nickname (a genuinely new object)
+        # from every structure first, so there is exactly one peer per
+        # nickname. Re-adding the SAME object is left to the idempotent
+        # guards below.
+        prior = self.find_by_index(index)
+        if prior is not None and prior is not who:
+            try:
+                self.all.remove(prior)
+            except ValueError:
+                pass
+            self.listing.pop(getattr(prior, 'address', None), None)
+            self.delete(prior)  # clears the nickname slot in hierarchy/valuation
+            _probes.emit('peer.set', 'replaced',
+                         peer_nick=index,
+                         old_uuid=str(getattr(prior, 'uuid', None)),
+                         new_uuid=str(getattr(who, 'uuid', None)))
+            _probes.counter('peer.set', 'replaced')
         was_new = who.address not in self.listing
         if who.address not in self.listing:
             self.listing[who.address] = who
         if who not in self.all:
             self.all.append(who)
-        index = self._index_by(who)
         self.hierarchy[level][index] = who
         self.valuation[-1][index] = who
         if was_new:
@@ -120,11 +146,18 @@ class Peers(Configuration):
             _probes.counter('peer.set', 'added')
 
     def delete(self, who):
+        # hierarchy and valuation are independent structures; a peer can be
+        # present in one but not the other (e.g. a wire-reconstructed Peers,
+        # whose __init__ rebuilds all/listing from `hierarchy` but does not
+        # backfill `valuation`). Guard each removal on its own lookup — gating
+        # both on `idx is not None` indexed self.valuation[None] and crashed
+        # the add()->delete(prior) resync path with a TypeError.
         index = self._index_by(who)
         idx = self._find(index)
         v_idx = self._find_v(index)
         if idx is not None:
             del self.hierarchy[idx][index]
+        if v_idx is not None:
             del self.valuation[v_idx][index]
 
     def move(self, who, level):

@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -126,7 +126,7 @@ static int send_to_peer(const process_t *proc, const char *function,
 static bool handle_artifact_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Artifact: request from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Artifact: request from %s\n", nmsg->from_whom.nickname);
 
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
@@ -196,7 +196,7 @@ static bool handle_artifact_request(const process_t *proc, directory_t *queues, 
 static bool handle_artifact_manifest(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Artifact: manifest from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Artifact: manifest from %s\n", nmsg->from_whom.nickname);
 
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
@@ -369,9 +369,18 @@ static bool handle_chunk_request(const process_t *proc, directory_t *queues, gen
     uint8_t chunk_hash[UPDATE_HASH_LEN];
     crypto_generichash_blake2b(chunk_hash, UPDATE_HASH_LEN, chunk_buf, chunk_len, NULL, 0);
 
-    /* Hex-encode chunk data and chunk_hash */
-    char data_hex[ARTIFACT_CHUNK_SIZE * 2 + 1];
-    sodium_bin2hex(data_hex, sizeof(data_hex), chunk_buf, chunk_len);
+    /* Base64-encode the chunk payload (§7: ~1.33x expansion vs hex's 2x on the
+     * wire). The per-chunk hash stays hex — it is small (32 B, so the 2x cost is
+     * negligible) and hex is the conventional digest representation used
+     * elsewhere in this protocol. Standard variant: the string lives inside a
+     * JSON body, so '+'/'/'/'=' are safe and no URL-safe alphabet is needed. */
+    char data_b64[sodium_base64_ENCODED_LEN(ARTIFACT_CHUNK_SIZE,
+                                            sodium_base64_VARIANT_ORIGINAL)];
+    if (artifact_encode_chunk(chunk_buf, chunk_len, data_b64, sizeof(data_b64)) != 0)
+    {
+        log_error(proc->logger, "Artifact: failed to base64-encode chunk %d\n", chunk_index);
+        return false;
+    }
 
     char chunk_hash_hex[UPDATE_HASH_LEN * 2 + 1];
     sodium_bin2hex(chunk_hash_hex, sizeof(chunk_hash_hex), chunk_hash, UPDATE_HASH_LEN);
@@ -385,7 +394,7 @@ static bool handle_chunk_request(const process_t *proc, directory_t *queues, gen
     }
     json_object_set_new(resp, "hash", json_string(hash_hex));
     json_object_set_new(resp, "chunk_index", json_integer(chunk_index));
-    json_object_set_new(resp, "data", json_string(data_hex));
+    json_object_set_new(resp, "data", json_string(data_b64));
     json_object_set_new(resp, "chunk_hash", json_string(chunk_hash_hex));
     json_object_set_new(resp, "data_len", json_integer((json_int_t)chunk_len));
 
@@ -432,7 +441,7 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
 
     const char *hash_raw = json_string_value(j_hash);
     int chunk_index = (int)json_integer_value(j_chunk_index);
-    const char *data_hex = json_string_value(j_data);
+    const char *data_b64 = json_string_value(j_data);
     const char *chunk_hash_hex_raw = json_string_value(j_chunk_hash);
     size_t data_len = (size_t)json_integer_value(j_data_len);
 
@@ -441,15 +450,17 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
     strncpy(hash_hex, hash_raw ? hash_raw : "", sizeof(hash_hex) - 1);
     hash_hex[sizeof(hash_hex) - 1] = '\0';
 
-    /* Decode hex data (before freeing payload since data_hex points into it) */
+    /* Decode + length-validate the base64 chunk payload (before freeing payload
+     * since data_b64 points into it). The decode is bounded by sizeof(data_buf)
+     * and rejects a data_len that disagrees with the decoded length, so bin_len
+     * is authoritative for every downstream read. */
     uint8_t data_buf[ARTIFACT_CHUNK_SIZE];
     size_t bin_len = 0;
-    if (!data_hex || sodium_hex2bin(data_buf, sizeof(data_buf),
-                       data_hex, strlen(data_hex),
-                       NULL, &bin_len, NULL) != 0)
+    if (!data_b64 || artifact_decode_chunk(data_b64, data_len, data_buf,
+                                           sizeof(data_buf), &bin_len) != 0)
     {
         json_decref(payload);
-        log_error(proc->logger, "Artifact: failed to decode chunk data hex\n");
+        log_error(proc->logger, "Artifact: failed to decode/validate chunk data\n");
         return false;
     }
 
@@ -468,14 +479,14 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
     json_decref(payload);
 
     /* Verify per-chunk hash */
-    if (artifact_verify_chunk_hash(data_buf, data_len, chunk_hash) != 0)
+    if (artifact_verify_chunk_hash(data_buf, bin_len, chunk_hash) != 0)
     {
         log_error(proc->logger, "Artifact: chunk %d hash mismatch for %s\n", chunk_index, hash_hex);
         return false;
     }
 
     /* Save chunk to store */
-    if (artifact_store_save_chunk(hash_hex, chunk_index, data_buf, data_len) != 0)
+    if (artifact_store_save_chunk(hash_hex, chunk_index, data_buf, bin_len) != 0)
     {
         log_error(proc->logger, "Artifact: failed to save chunk %d for %s\n", chunk_index, hash_hex);
         return false;
@@ -619,7 +630,7 @@ static bool handle_artifact_complete(const process_t *proc, directory_t *queues,
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
     {
-        log_info(proc->logger, "Artifact: complete notification from %s\n", nmsg->from_whom.fullname);
+        log_info(proc->logger, "Artifact: complete notification from %s\n", nmsg->from_whom.nickname);
         return true;
     }
 
@@ -627,7 +638,7 @@ static bool handle_artifact_complete(const process_t *proc, directory_t *queues,
     const char *hash_hex = j_hash ? json_string_value(j_hash) : "unknown";
 
     log_info(proc->logger, "Artifact: peer %s completed download of %s\n",
-             nmsg->from_whom.fullname, hash_hex);
+             nmsg->from_whom.nickname, hash_hex);
 
     json_decref(payload);
     return true;

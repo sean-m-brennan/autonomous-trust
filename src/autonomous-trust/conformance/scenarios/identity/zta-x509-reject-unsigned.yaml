@@ -1,0 +1,51 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: zta-x509-reject-unsigned
+byte_pinning: false
+description: |
+    ZTA X.509 admission — the "unsigned" forgery. The newcomer announces with NO
+    credential at all (absent from fixtures.credentials). With the ZTA policy
+    requiring a credential at admission, verify_credential returns REJECTED ("no
+    credential data"), so the welcoming committee drops the candidate before the
+    propose — propose_emitted == 0. The forged peer never enters the trust graph.
+
+    Cross-impl: pinned on BOTH sides. The C conformance adapter wires the ZTA
+    policy + credentials (_apply_zta_fixtures) when built with -DAT_ZTA=ON;
+    scripts/test-conformance.sh enables that automatically when OpenSSL is
+    present (build-zta/). Without OpenSSL the C side skips this scenario, which
+    is still non-asymmetric (diff_results.py treats a one-side skip as a match).
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  zta_policy:
+    enabled: true
+    require_at_admission: true
+    # These fixtures PREDATE the credential->identity binding (ISSUES §1.5) and
+    # provision none, so `off` keeps each pin testing what it claims: this case is
+    # about the chain / operator classification, not about bindings. Without it a
+    # reject-* pin would pass for the wrong reason (unbound, not bad chain) and the
+    # admit pins would fail outright. Binding behavior is pinned separately by the
+    # zta-binding-* scenarios.
+    binding_mode: "off"
+    verifier_type: x509
+    ca_bundle_path: testdata/zta/ca-bundle.pem
+  # No `credentials` entry for newcomer: it announces unsigned.
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+    description: |
+        newcomer announces with no ZTA credential. bg rejects at admission; no
+        propose is emitted.
+
+expected_state:
+  bg:
+    propose_emitted: 0

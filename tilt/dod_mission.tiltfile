@@ -22,6 +22,12 @@
 # or examples/dod_mission/ trigger image rebuild and rolling-update of
 # affected Deployments.
 
+# restart_process ext: wraps an image's entrypoint so a live_update sync can
+# restart the process in-place (the Dash app runs with use_reloader=False, so
+# a synced .py won't take effect without a restart). Fetched from Tilt's
+# extension registry on first `tilt up` (needs network once; cached after).
+load('ext://restart_process', 'docker_build_with_restart')
+
 namespace = os.getenv("_TILT_NAMESPACE", "dod-demo")
 log_level = os.getenv("_TILT_LOG_LEVEL", "info")
 # DoD-specific scaling knobs (no multi-agency equivalent).
@@ -36,11 +42,52 @@ compromise_mode = os.getenv("_TILT_COMPROMISE_MODE", "abrupt")
 # step entirely so peers cold-bootstrap (useful for testing the
 # handshake/Sybil-rejection flow without warm-start).
 preseed = os.getenv("AT_PRESEED", "1")
+# Embedded-C microdrones (Stretch Goal 3, Path B). SPEC threaded from
+# run-demo.sh (--c-microdrones) via _TILT_C_MICRODRONES: "" => all-Python
+# (back-compat); "all"/integer-N/comma-list otherwise. When set, the named
+# microdrones are emitted as C at_demo + flight-stub Pods (generate_k8s),
+# seeded with C-format identities (seed_dod_cohort), and the autonomous-trust-c
+# image is built below. The SPEC must be identical on the seed + manifest sides
+# (generate_compose.parse_c_microdrones resolves both), so they share one knob.
+c_microdrones = os.getenv("_TILT_C_MICRODRONES", "")
 
 # Run against whatever k8s context the user has selected. minikube,
 # kind, k3d, etc. all work — the manifests are NodePort-based with no
 # cluster-specific networking assumptions beyond a flat pod network.
 allow_k8s_contexts(k8s_context())
+
+# --- Image delivery via minikube's built-in registry ----------------------
+# Opt-in (set _TILT_REGISTRY=1) delivery through `minikube addons enable
+# registry`. On the docker driver (Linux) that registry is reachable from
+# BOTH the host and the nodes at $(minikube ip):5000 (registry-proxy
+# DaemonSet hostPort), so a single ref both pushes (from the host) and pulls
+# (by the kubelet). Benefits: images push once and pull by-layer, the same
+# refs resolve for the `run-demo.sh --k8s` (kubectl) path, and images survive
+# `minikube stop/start` -- so the Tilt and kubectl paths stop invalidating
+# each other's caches.
+#
+# It is OPT-IN because (a) with the live_update blocks below, ordinary Python
+# edits hot-sync into the running pods and never rebuild/push, so the registry
+# only helps the rarer dep/Dockerfile/C rebuilds and the kubectl path; and
+# (b) on the docker driver Tilt otherwise builds straight into minikube's
+# daemon (no push), which is fine as a default. Leaving it off keeps the
+# current, known-good behavior untouched.
+#
+# Host prereqs (run ONCE before `_TILT_REGISTRY=1 tilt up`):
+#   minikube addons enable registry
+#   # let the host docker daemon push over plain HTTP to the node subnet;
+#   # add to /etc/docker/daemon.json (CIDR tolerates minikube IP changes):
+#   #   {"insecure-registries": ["192.168.49.0/24"]}
+#   sudo systemctl restart docker
+#   # recreate the cluster so its runtime also trusts the insecure registry:
+#   minikube start --insecure-registry "192.168.49.0/24"
+if os.getenv("_TILT_REGISTRY", "") == "1" and "minikube" in k8s_context():
+    _mk_ip = str(local("minikube ip", quiet=True, echo_off=True)).strip()
+    if _mk_ip:
+        # Tilt rewrites both the image tags AND the BASE_IMAGE build_arg refs
+        # (they name known docker_build images), so the FROM-chain still
+        # resolves to registry-qualified parents.
+        default_registry(_mk_ip + ":5000")
 
 repo_root = ".."
 deploy_dir = repo_root + "/examples/dod_mission/deploy"
@@ -84,6 +131,11 @@ _k8s_gen_args = [
 ]
 if preseed == "1":
     _k8s_gen_args.append("--seed-root " + seed_root)
+if c_microdrones != "":
+    # C node Pods + the C image ref the manifests should carry (Tilt rewrites
+    # the :dev tag to its own build below). Kept in lockstep with the seed SPEC.
+    _k8s_gen_args.append("--c-microdrones " + c_microdrones)
+    _k8s_gen_args.append("--c-image autonomous-trust-c")
 _k8s_gen_cmd = " ".join(_k8s_gen_args)
 
 # Seed generator runs before manifest generation so the per-peer CMs
@@ -92,7 +144,7 @@ _k8s_gen_cmd = " ".join(_k8s_gen_args)
 # identities so the keys agreed between peers stay valid). Pass --force
 # at the env-var level (AT_PRESEED_FORCE=1) to regenerate identities.
 _seed_force = "--force" if os.getenv("AT_PRESEED_FORCE") == "1" else ""
-_seed_cmd = " ".join([
+_seed_args = [
     "PYTHONPATH=" + _at_src,
     "python3 -m tools.seed_dod_cohort",
     "--out " + seed_root,
@@ -100,7 +152,12 @@ _seed_cmd = " ".join([
     "--sensor-count " + sensor_count,
     "--hacked-sensors " + hacked_sensors,
     _seed_force,
-]).strip()
+]
+if c_microdrones != "":
+    # Same SPEC as the manifest side: a peer seeded C-format MUST be emitted as
+    # a C Pod (and vice-versa), else it can't load its own identity.
+    _seed_args.append("--c-microdrones " + c_microdrones)
+_seed_cmd = " ".join(_seed_args).strip()
 if preseed != "1":
     _seed_cmd = "echo 'AT_PRESEED=0: skipping cohort seed'"
 # Simulator scenario is JSON (despite the .yaml extension) and gets
@@ -130,6 +187,8 @@ local_resource(
     cmd=_gen_cmd,
     deps=[
         repo_root + "/examples/dod_mission/deploy/generate_k8s.py",
+        # generate_k8s imports parse_c_microdrones from here; seed uses its twin.
+        repo_root + "/examples/dod_mission/deploy/generate_compose.py",
         repo_root + "/examples/dod_mission/simulator/generate_scenario.py",
         repo_root + "/examples/dod_mission/scenario.py",
         repo_root + "/tools/seed_dod_cohort.py",
@@ -171,15 +230,61 @@ build_args["GIT_VERSION"] = git_version
 #                               — lean, no Dash, no .inspector)
 #
 # Tilt's docker_build manages each image: content-hash caching, FROM
-# chain resolution (preflight in run-demo.sh seeds the daemon with the
-# canonical :dev tags so the Dockerfile defaults resolve), and image-
-# ref rewriting in k8s_yaml() so Deployments auto-roll when their
-# image rebuilds.
+# chain resolution, and image-ref rewriting in k8s_yaml() so Deployments
+# auto-roll when their image rebuilds.
+#
+# The derived images use `FROM ${BASE_IMAGE}` with a `:dev` default, which
+# defeats Tilt's *static* FROM-chain detection (it can't see through the ARG).
+# Passing BASE_IMAGE as a build_arg whose value is the parent's docker_build
+# ref lets Tilt resolve the chain itself (autonomous-trust -> -inspector ->
+# at-dod-mission-demo, and autonomous-trust -> at-dod-mission-peer) and inject
+# each freshly-built parent. This is what lets run-demo.sh SKIP the pre-seed
+# for the tilt path (see ensure_demo_images / the tilt dispatch); the
+# compose/k8s paths still pre-build since there's no Tilt to drive the chain.
 #
 # An earlier revision wrapped each build in a local_resource for
 # per-image build rows in the Tilt UI, but that broke auto-rollout
 # (Tilt couldn't see the image change) and the multi-agency pattern
 # turned out smoother in practice.
+
+# Per-image build_args: shared args + the parent image ref so `FROM
+# ${BASE_IMAGE}` resolves to a Tilt-managed image. Copy (don't mutate the
+# shared dict). Root images (autonomous-trust, autonomous-trust-c) omit it.
+def _with_base(parent):
+    d = dict(build_args)
+    d["BASE_IMAGE"] = parent
+    return d
+
+# --- live_update sync sets ------------------------------------------------
+# Sync host Python source straight into the running containers instead of
+# rebuilding the FROM-chain on every edit. Container paths mirror the COPY
+# targets in the two Dockerfiles (inspector: /opt/at-*, /app/...core;
+# demo overlay: /app/examples/*). A changed .py that matches a sync makes
+# Tilt live_update that image INSTEAD of rebuilding it -- which is what
+# breaks the base->inspector->demo rebuild cascade for code edits. Non-code
+# changes (Dockerfile, deps, the C library) aren't synced, so they still
+# fall back to a normal image rebuild.
+_inspector_syncs = [
+    sync(repo_root + "/src/autonomous-trust/autonomous_trust/core",
+         "/app/autonomous_trust/core"),
+    sync(repo_root + "/src/autonomous-trust-inspector/autonomous_trust",
+         "/opt/at-inspector/autonomous_trust"),
+    sync(repo_root + "/src/autonomous-trust-evaluation/autonomous_trust",
+         "/opt/at-evaluation/autonomous_trust"),
+    sync(repo_root + "/src/autonomous-trust-services/autonomous_trust",
+         "/opt/at-services/autonomous_trust"),
+    sync(repo_root + "/src/autonomous-trust-simulator/autonomous_trust",
+         "/opt/at-simulator/autonomous_trust"),
+]
+# The coordinator/simulator pod runs the demo image (FROM inspector), so it
+# needs the inherited inspector/core trees kept fresh AND the demo-side
+# examples/ overlays. Syncing the inspector trees here too means an inspector
+# edit hot-syncs into the coordinator rather than cascading a demo rebuild.
+_demo_syncs = _inspector_syncs + [
+    sync(repo_root + "/examples/multi_agency", "/app/examples/multi_agency"),
+    sync(repo_root + "/examples/dod_mission",  "/app/examples/dod_mission"),
+    sync(repo_root + "/examples/pi_peer",      "/app/examples/pi_peer"),
+]
 
 docker_build(
     "autonomous-trust",
@@ -194,15 +299,30 @@ docker_build(
     repo_root,
     dockerfile=repo_root + "/src/autonomous-trust-inspector/Dockerfile",
     network="host",
-    build_args=build_args,
+    build_args=_with_base("autonomous-trust"),
+    # This image doesn't COPY the DoD/pi examples, but the context is the
+    # whole repo, so without this an edit under them would still rebuild it
+    # (and cascade into the demo). Exclude them from its rebuild trigger.
+    ignore=["examples/dod_mission", "examples/pi_peer"],
+    # Hot-sync the AT package source; edits live_update instead of rebuilding
+    # the inspector layer (and thus avoid cascading a demo rebuild). Applies
+    # to containers built FROM this image too (the coordinator/simulator).
+    live_update=_inspector_syncs,
 )
 
-docker_build(
+# Coordinator/simulator pod. docker_build_with_restart wraps the entrypoint
+# so a live_update sync restarts the process (the Dash app runs with
+# use_reloader=False, so a synced .py won't take effect otherwise). The
+# entrypoint mirrors the image's own ENTRYPOINT -- AUTONOMOUS_TRUST_EXE (set
+# per-pod in the manifests) still selects coordinator vs. simulator.
+docker_build_with_restart(
     "at-dod-mission-demo",
     repo_root,
     dockerfile=repo_root + "/examples/dod_mission/deploy/Dockerfile",
+    entrypoint=["/bin/entrypoint.sh"],
+    live_update=_demo_syncs,
     network="host",
-    build_args=build_args,
+    build_args=_with_base("autonomous-trust-inspector"),
 )
 
 docker_build(
@@ -210,8 +330,22 @@ docker_build(
     repo_root,
     dockerfile=repo_root + "/examples/dod_mission/deploy/Dockerfile-peer",
     network="host",
-    build_args=build_args,
+    build_args=_with_base("autonomous-trust"),
 )
+
+# Embedded C at_demo image — only built when --c-microdrones names at least one
+# microdrone. Standalone build (Dockerfile-c is FROM debian, not BASE_IMAGE),
+# so it needs network for apt, hence network="host" like the chain above. Tilt
+# rewrites the autonomous-trust-c:dev ref in the C-microdrone Pods to this
+# build and gates those pods on it. The Python-only default never builds it.
+if c_microdrones != "":
+    docker_build(
+        "autonomous-trust-c",
+        repo_root,
+        dockerfile=repo_root + "/src/autonomous-trust/Dockerfile-c",
+        network="host",
+        build_args=build_args,
+    )
 
 # --- K8s manifests --------------------------------------------------------
 # Order matters for first-time apply: namespace before the rest. Tilt
@@ -261,6 +395,30 @@ watch_file(repo_root + "/src/autonomous-trust-inspector/autonomous_trust")
 watch_file(repo_root + "/src/autonomous-trust-simulator/autonomous_trust")
 watch_file(repo_root + "/examples/dod_mission")
 
-# Don't fight ourselves over the generated tree: the local_resource
-# above is the only thing that should write under k8s_dir.
-watch_settings(ignore=[k8s_dir, repo_root + "/examples/dod_mission/simulator/scenario.yaml"])
+# --- Only rebuild on git-tracked changes ----------------------------------
+# The docker_build contexts (repo_root) and the watch_file() trees above
+# otherwise watch the WHOLE repo, so untracked cruft
+# (src/autonomous-trust-inspector/.rustup, __pycache__, .venv, .demo-state,
+# doc/research PDFs, ...) triggers spurious image rebuilds. Instead of
+# hand-maintaining an exhaustive ignore list, let git enumerate it:
+#   `ls-files --others`  -> every untracked path (NO --exclude-standard, so
+#                           gitignored paths are included too)
+#   `--directory`        -> collapse a fully-untracked dir to one entry
+# Paths are git-root-relative (== repo_root), so prefix repo_root to make
+# them Tiltfile-relative. watch_settings(ignore=) is a GLOBAL ignore that
+# covers the docker_build contexts and the watch_file() trees alike.
+# NB: this is snapshotted at Tiltfile eval — a brand-new file only starts
+# triggering rebuilds after `git add` + a Tiltfile reload.
+_untracked = str(local(
+    "git -C " + repo_root + " ls-files --others --directory",
+    quiet=True, echo_off=True,
+)).split("\n")
+_git_ignore = [repo_root + "/" + p for p in _untracked if p]
+
+# Also don't fight ourselves over the generated tree: the local_resource
+# above is the only thing that should write under k8s_dir, and the
+# scenario.yaml (tracked) is regenerated on every eval.
+watch_settings(ignore=[
+    k8s_dir,
+    repo_root + "/examples/dod_mission/simulator/scenario.yaml",
+] + _git_ignore)

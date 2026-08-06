@@ -1,6 +1,6 @@
 #!/bin/bash
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -21,6 +21,21 @@
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$here" || exit 1
 
+usage() {
+  cat <<'EOF'
+Usage: test-packages.sh [OPTIONS] [pytest args...]
+
+Build the C library, then run the Python test suites for each autonomous-trust
+package. Extra arguments are forwarded to pytest (the flags consumed here are
+stripped before forwarding).
+
+Options:
+  -q, --quick     Skip the two-node integration test.
+  -v, --verbose   Verbose build and test output.
+  -h, --help      Show this help message and exit.
+EOF
+}
+
 status=0
 quick=false
 verbose=false
@@ -28,8 +43,20 @@ for arg in "$@"; do
     case "$arg" in
         --quick|-q) quick=true ;;
         --verbose|-v) verbose=true ;;
+        --help|-h) usage; exit 0 ;;
     esac
 done
+
+# The suites below run via the bare `python -m pytest`, which expects the
+# project's `autonomous_trust` conda env to be active so the interpreter
+# carries the AT deps. Match the gating convention in scripts/build-py.sh;
+# deferred past --help so usage still works without the env active.
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-autonomous_trust}"
+if [[ "${CONDA_DEFAULT_ENV:-}" != "$CONDA_ENV_NAME" ]]; then
+    echo "ERROR: conda environment '$CONDA_ENV_NAME' is not active." >&2
+    echo "  Run: conda activate $CONDA_ENV_NAME" >&2
+    exit 1
+fi
 
 echo "========== Building the C library =========="
 if $verbose; then
@@ -38,7 +65,7 @@ else
   scripts/build.sh --c >/dev/null || exit 1
 fi
 
-for pkg in autonomous-trust autonomous-trust-services autonomous-trust-inspector autonomous-trust-simulator; do
+for pkg in autonomous-trust autonomous-trust-services autonomous-trust-inspector autonomous-trust-simulator autonomous-trust-behaviour; do
     pkg_dir="$here/src/$pkg"
     if [ -d "$pkg_dir/tests" ]; then
         echo "========== Testing $pkg =========="
@@ -56,12 +83,15 @@ for pkg in autonomous-trust autonomous-trust-services autonomous-trust-inspector
         if $quick; then
           quick_flags="--ignore=tests/b_integration/test_two_node.py"
         fi
-        # Strip -q/--quick from passthrough args
+        # Forward extra args to pytest, but strip the flags this script
+        # consumes itself -- otherwise pytest sees e.g. --quick and errors with
+        # "unrecognized arguments".
         pass_args=()
         for arg in "$@"; do
-          if $quick; then
-            pass_args+=("$arg")
-          fi
+          case "$arg" in
+            --quick|-q|--verbose|-v) ;;  # consumed above; don't forward
+            *) pass_args+=("$arg") ;;
+          esac
         done
         if [[ "$pkg" = "autonomous-trust" ]]; then
           # Test both backends

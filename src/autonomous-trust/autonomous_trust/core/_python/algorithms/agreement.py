@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -71,6 +71,15 @@ class AgreementVoter(ABC):
         # from topological rank. Read by AgreementByTrust; PoA voters
         # leave it at 0. See doc/architecture/trust-tiers.md §1.
         self._tier = _tier
+        # Operational (dynamic) topology-rank adjustment layered on the
+        # static, signed ``_rank``. Driven by one-hop reachability
+        # observations (``observe_reachability``) so a peer that loses its
+        # gateway / falls off the one-hop mesh drops out of the authority
+        # cutoff *without* an identity re-issue. 0 ⇒ no adjustment, so
+        # ``effective_rank`` equals the signed ``_rank`` — which keeps the
+        # static-config path (and every rank-pinned conformance fixture)
+        # behaving exactly as before. See deferred.md §2.2.
+        self._rank_adjustment = 0
 
     @property
     def uuid(self):
@@ -78,7 +87,44 @@ class AgreementVoter(ABC):
 
     @property
     def rank(self):
+        # The static, signed baseline — serialized on the identity and used
+        # as the partition-recovery seed. Operational decisions key off
+        # ``effective_rank`` instead.
         return self._rank
+
+    @property
+    def effective_rank(self):
+        """Operational rank = signed rank + dynamic adjustment, floored at 0.
+
+        Authority voting and partition-leader selection read this rather
+        than the raw signed rank, so topology changes (gateway loss, a peer
+        dropping off the one-hop mesh) take effect immediately without
+        re-issuing the peer's signed identity."""
+        eff = self._rank + self._rank_adjustment
+        return eff if eff > 0 else 0
+
+    def set_rank_adjustment(self, delta):
+        """Set the operational rank delta directly (e.g. a graded
+        downgrade). ``reset_rank_adjustment``/``observe_reachability`` are
+        the usual entry points."""
+        self._rank_adjustment = int(delta)
+
+    def reset_rank_adjustment(self):
+        self._rank_adjustment = 0
+
+    def observe_reachability(self, reachable):
+        """Fold a one-hop reachability observation into the operational
+        rank. Unreachable (e.g. gateway loss) fully demotes the peer to
+        effective rank 0; reachable restores the signed rank. Returns True
+        if the effective rank changed.
+
+        This is the dynamic *source*: a transport/peer-liveness layer calls
+        it on reachability transitions. Mirror: the C side drives the same
+        adjustment from ``PEER_RTT_UPDATE`` / ``peer_rtt_ms`` (processes.h).
+        """
+        before = self.effective_rank
+        self._rank_adjustment = 0 if reachable else -self._rank
+        return self.effective_rank != before
 
     @property
     def tier(self):

@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2026 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #  Licensed under the Apache License, Version 2.0
 # ******************
 """End-to-end integration test for Stretch Goal 2 (sparse detections).
@@ -70,7 +70,7 @@ def _build_catalogue():
         objs.append(det.CatalogueObject(
             world_uid=uid, cls="target-building", confidence=1.0,
             crop=crop, crop_b64="", crop_size_px=(128, 96),
-            bbox_panorama_px=(0, 0, 40, 40),
+            bbox_panorama_px=(0, 0, 40, 40), obb_panorama_px=(),
             center_utm=(e, n), center_squad_xy=(cx, cy),
             center_latlon=ll,
             label=uid,
@@ -171,11 +171,13 @@ def test_full_pipeline_catches_mq800_lie(pipeline):
     cache: dict = {}
     log: dict = {}
 
-    # T+10: prime the validator with honest baselines on alpha.
-    _drive(rq1, 10.0, validator, cache, log)
-    _drive(rq2, 10.0, validator, cache, log)
-    # MQ-800 reports alpha at bravo's coords -> validator catches.
-    flagged = _drive(mq, 10.0, validator, cache, log)
+    # Past the compromise activation (T+4:15) so the MQ-800's decoy swap is
+    # live; all three share one validator window. Prime honest baselines on
+    # alpha, then the MQ-800 reports alpha at bravo's coords -> validator
+    # catches it inside the alpha bucket.
+    _drive(rq1, 260.0, validator, cache, log)
+    _drive(rq2, 260.0, validator, cache, log)
+    flagged = _drive(mq, 260.0, validator, cache, log)
 
     alpha_results = [r for r in flagged
                      if r.peer_name == "mq800" and r.is_anomalous]

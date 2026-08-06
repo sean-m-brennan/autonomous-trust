@@ -1,0 +1,128 @@
+schema_version: '1'
+kind: scenario
+protocol: identity
+name: peer-caps-descriptor-exchange
+byte_pinning: false
+description: "Exercises the capability-DESCRIPTOR form of `peer_caps_response`\n(PIV_MFA_OPERATOR_ACCESS_PLAN.md §3.5). Where peer-caps-exchange sends a\nbare JSON array of capability names, this sends an array of descriptor\nobjects {name, required_tier, description, kind, arg_schema} so a peer's\ncapabilities are self-describing for the operator console's resource\ndirectory.\n\nbg sends a descriptor-form caps_response to newcomer.\n  - Python: handle_caps_response tolerantly parses each item as a name\n    (str) OR a descriptor object (dict). Names register in\n    peer_capabilities; descriptors are size-bounded (sanitize_descriptor)\n    and stored in peer_capabilities.descriptors[name].\n  - C: handle_caps_response must parse the same object/string-tolerant\n    form, register the names, and store the bounded descriptor in its\n    peer_caps map's per-cap descriptor slot.\n\nBackward compatibility: the legacy name-only form is still covered by\npeer-caps-exchange. A receiver MUST accept both; an item that is a bare\nstring carries only the name (no descriptor).\n\nSize bounds (untrusted input): description <= 256 chars, kind <= 32,\narg_schema <= 32 entries (key <= 64, value <= 64). Receivers truncate/drop\noversized fields rather than rejecting the descriptor. The oversize_strings\nand oversize_schema caps below deliberately exceed every bound and assert\nthe exact truncated result, so Python and C MUST clamp identically or the\ncross-language diff goes asymmetric (this is what pins the bounds in\nlockstep -- previously only a code comment kept them aligned).\n"
+participants:
+- id: bg
+  role: border_guard
+- id: newcomer
+  role: new_node
+fixtures:
+  capabilities:
+    bg:
+    - sensor_validation
+    - airquality_stream
+    - oversize_strings
+    - oversize_schema
+steps:
+- id: 1
+  from: bg
+  to: newcomer
+  function: peer_caps_response
+  payload:
+    descriptors:
+    - name: sensor_validation
+      required_tier: 0
+    - name: airquality_stream
+      required_tier: 1
+      description: live air-quality telemetry
+      kind: data_stream
+      arg_schema:
+        rate_hz: int
+    - name: oversize_strings
+      required_tier: 2
+      description: DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD
+      kind: KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK
+      arg_schema:
+        kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk: 'vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv'
+    - name: oversize_schema
+      required_tier: 0
+      arg_schema:
+        a00: 'y'
+        a01: 'y'
+        a02: 'y'
+        a03: 'y'
+        a04: 'y'
+        a05: 'y'
+        a06: 'y'
+        a07: 'y'
+        a08: 'y'
+        a09: 'y'
+        a10: 'y'
+        a11: 'y'
+        a12: 'y'
+        a13: 'y'
+        a14: 'y'
+        a15: 'y'
+        a16: 'y'
+        a17: 'y'
+        a18: 'y'
+        a19: 'y'
+        a20: 'y'
+        a21: 'y'
+        a22: 'y'
+        a23: 'y'
+        a24: 'y'
+        a25: 'y'
+        a26: 'y'
+        a27: 'y'
+        a28: 'y'
+        a29: 'y'
+        a30: 'y'
+        a31: 'y'
+        a32: 'y'
+        a33: 'y'
+  description: "bg's descriptor-form caps_response delivered to newcomer.\nhandle_caps_response registers all caps under bg's uuid AND records\neach (size-bounded) descriptor in newcomer's peer_capabilities.\n"
+expected_state:
+  newcomer:
+    peer_caps_count: 4
+    peer_caps_descriptor:
+      sensor_validation:
+        required_tier: 0
+      airquality_stream:
+        required_tier: 1
+        description: live air-quality telemetry
+        kind: data_stream
+      oversize_strings:
+        required_tier: 2
+        description: 'DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD'
+        kind: 'KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK'
+        arg_schema:
+          kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk: 'vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv'
+      oversize_schema:
+        required_tier: 0
+        arg_schema:
+          a00: 'y'
+          a01: 'y'
+          a02: 'y'
+          a03: 'y'
+          a04: 'y'
+          a05: 'y'
+          a06: 'y'
+          a07: 'y'
+          a08: 'y'
+          a09: 'y'
+          a10: 'y'
+          a11: 'y'
+          a12: 'y'
+          a13: 'y'
+          a14: 'y'
+          a15: 'y'
+          a16: 'y'
+          a17: 'y'
+          a18: 'y'
+          a19: 'y'
+          a20: 'y'
+          a21: 'y'
+          a22: 'y'
+          a23: 'y'
+          a24: 'y'
+          a25: 'y'
+          a26: 'y'
+          a27: 'y'
+          a28: 'y'
+          a29: 'y'
+          a30: 'y'
+          a31: 'y'

@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -43,9 +43,9 @@ def clamp(n, min_n, max_n):
 
 
 class MockIdentity(object):
-    def __init__(self, nickname, fullname):
-        self.nickname = nickname
-        self.fullname = fullname
+    def __init__(self, nickname, petname):
+        self.nickname = nickname  # Zooko online name
+        self.petname = petname    # Zooko local display name
 
 
 class SimCohort(CohortInterface):

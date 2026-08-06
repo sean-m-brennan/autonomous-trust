@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2024 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -104,6 +104,13 @@ int logger_init_time_res(logger_t *logger, log_level_t max_level, const char *lo
         if (logger->file == NULL)
             return SYS_EXCEPTION();
         logger->term = false;
+        /* Line-buffer the log file so each newline-terminated record reaches
+         * disk promptly. A file stream is fully buffered by default, which in
+         * a long-lived daemon strands log lines in the ~4 KiB stdio buffer
+         * until it fills or the process exits — they'd never show up live.
+         * (stderr, the foreground sink, is unbuffered already.) Must precede
+         * any write to the stream. */
+        setvbuf(logger->file, NULL, _IOLBF, 0);
     }
     return 0;
 }
@@ -116,6 +123,25 @@ int logger_init_time_res(logger_t *logger, log_level_t max_level, const char *lo
 inline int logger_init(logger_t *logger, log_level_t max_level, const char *log_file)
 {
     return logger_init_time_res(logger, max_level, log_file, MILLISECONDS);
+}
+
+/* Frama-C: skipped — [syscall] freopen. */
+int logger_reopen(logger_t *logger)
+{
+    if (logger == NULL || logger->file_name[0] == '\0')
+        return 0;  /* stderr/terminal logger — fds 0/1/2 survive daemonize */
+    /* freopen reuses the existing FILE* object, so handlers holding
+     * logger->file keep a valid pointer. It flushes+closes the old (now
+     * already-closed) descriptor — that close failure is ignored per POSIX —
+     * then opens file_name fresh in append mode on a live fd. */
+    FILE *reopened = freopen(logger->file_name, "a", logger->file);
+    if (reopened == NULL)
+        return SYS_EXCEPTION();
+    logger->file = reopened;
+    /* freopen resets buffering to the default (full) — restore line buffering
+     * so the child's records flush per line, matching logger_init. */
+    setvbuf(logger->file, NULL, _IOLBF, 0);
+    return 0;
 }
 
 /* Frama-C: skipped —

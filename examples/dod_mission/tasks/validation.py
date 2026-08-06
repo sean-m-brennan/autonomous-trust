@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #  Licensed under the Apache License, Version 2.0
 # ******************
 """Cross-source validators for the DoD scenario.
@@ -41,16 +41,15 @@ from examples.multi_agency.tasks.validation import CrossSourceValidator
 POSITION_VALIDATOR_X = CrossSourceValidator(
     data_type="target_position_x",
     threshold=50.0,          # meters from consensus
-    # 3, not 2: with only 2 active sources the "median of others" is a
-    # single value, so any natural spread between two honest overhead
-    # platforms (orbit parallax, path jitter) trips the validator and
-    # the two RQ-86s flag each other before the squad/microdrones are
-    # producing position readings — the "anomalous way too early" false
-    # positive. Requiring ≥3 means each reading is judged against the
-    # median of ≥2 others (robust to one outlier); the validator just
-    # returns None until that many independent sources exist. The
-    # MQ-800 joins at phase 4 when the full roster is reporting, so its
-    # detection is unaffected.
+    # 3, not 2: consensus is the median of ALL current sources (see
+    # CrossSourceValidator). With only 2 sources that median is their
+    # average, which can't distinguish a liar from an honest peer — and a
+    # natural spread between two honest overhead platforms (orbit parallax,
+    # path jitter) would read as a mutual anomaly. Requiring ≥3 sources
+    # gives a real median that the honest majority sets, so a lone rogue
+    # (the MQ-800, ~424 m off) is the only reading that deviates while the
+    # honest RQ-86s stay clean — even in the late window where the swarm
+    # has exfiltrated and only the recon pair + the rogue remain.
     min_sources=3,
     window_sec=10.0,
 )

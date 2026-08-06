@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -46,6 +46,47 @@ def _sig_to_hex_str(sig):
     if isinstance(sig, str):
         return sig
     return HexEncoder.encode(bytes(sig)).decode('ascii')
+
+
+def _identity_from_wire(wire):
+    """Reconstruct a public ``Identity`` from the envelope ``from_*`` wire
+    fields, or return ``None`` when no sender identity is present.
+
+    The ``from_uuid`` / ``from_name`` / ``from_address`` / ``from_sig_hex`` /
+    ``from_enc_hex`` envelope fields are the single canonical, cross-runtime
+    representation of a message sender's identity (C ``net_message.c`` and
+    Python ``Message.__bytes__`` emit the same five keys; pinned by the
+    message-envelope conformance vectors). This is how a peer whose identity
+    we do NOT yet know — the ``request_access`` discovery broadcast from a
+    brand-new node, including a C ``at_demo`` peer — is admitted: identity
+    travels in the envelope, NOT the payload (the payload carries only
+    ``[package_hash, capabilities]``). The hex fields are the hex-encoded
+    public keys, exactly what ``Signature``/``Encryptor`` accept with
+    ``public_only=True``. The online nickname rides the envelope ``from_name``
+    slot (may be empty); the local petname is never on the wire and is left
+    empty. Equality/lookup for a new peer keys on uuid + public keys, which are
+    all present."""
+    from ..identity import Identity, Signature, Encryptor
+    from_uuid = wire.get('from_uuid') or ''
+    from_sig = wire.get('from_sig_hex') or ''
+    from_enc = wire.get('from_enc_hex') or ''
+    if not from_uuid or not from_sig or not from_enc:
+        return None
+    try:
+        sig = Signature(from_sig.encode('ascii'), public_only=True)
+        enc = Encryptor(from_enc.encode('ascii'), public_only=True)
+        # Topology rank rides the envelope "from_rank" (parity with C); a peer
+        # reconstructed here carries it so _member_rank sees a live value for
+        # rank-based child-gateway discovery. Absent (older peer) -> 0.
+        try:
+            from_rank = int(wire.get('from_rank', 0) or 0)
+        except (TypeError, ValueError):
+            from_rank = 0
+        return Identity(from_uuid, wire.get('from_address', '') or '',
+                        wire.get('from_name', '') or '', sig, enc,
+                        _rank=from_rank)
+    except (ValueError, TypeError, RuntimeError):
+        return None
 
 
 class Message(object):
@@ -123,7 +164,9 @@ class Message(object):
         # HexEncoder.encode again on self.signature or it will double-encode.
         if from_whom is not None and isinstance(from_whom, Identity):
             try:
-                signed = from_whom.sign(self._content_str())
+                signed = from_whom.sign(
+                    self._signable_content(self.process, self.function,
+                                           self._obj_b64()))
                 self.signature = signed.signature  # ASCII-hex (128 bytes)
                 self.verified = True  # we just signed it ourselves
             except (RuntimeError, AttributeError):
@@ -136,12 +179,35 @@ class Message(object):
                      trace_id=self.trace_id, process=self.process,
                      function=self.function, has_from=self.from_whom is not None)
 
-    def _content_str(self):
-        """The signable content: process|function|obj_str"""
-        obj_str = str(self.obj)
+    def _obj_str(self):
+        """The raw body as a string (Configuration uses its canonical form)."""
         if isinstance(self.obj, Configuration):
-            obj_str = self.obj.to_string()
-        return '|'.join([self.process, self.function, obj_str])
+            return self.obj.to_string()
+        return str(self.obj)
+
+    def _obj_b64(self):
+        """The body as the wire base64 string (the exact `data` field)."""
+        return b64encode(self._obj_str().encode(Network.encoding)).decode('ascii')
+
+    def _content_str(self):
+        """The legacy pipe-format content: process|function|raw_body.
+
+        This is the human/legacy serialization used by ``__str__`` and the
+        pipe-format ``parse`` fallback. It is NOT the signature pre-image — see
+        ``_signable_content`` (which signs over the *base64* body to match the
+        C / _native runtimes)."""
+        return '|'.join([self.process, self.function, self._obj_str()])
+
+    @staticmethod
+    def _signable_content(process, function, data_b64):
+        """Canonical signature pre-image shared with the C / _native runtimes:
+        ``<process>|<function>|<base64(data)>`` (net_message.c). Signing over
+        the *base64* body (not the raw body) is what lets a C ``at_demo`` peer's
+        signature verify here; the two coincide only for an empty payload
+        (base64('') == ''), so the old raw-body form silently passed
+        request_access but rejected every non-empty C-signed message as
+        "forged or corrupt"."""
+        return '|'.join([process, function, data_b64])
 
     def __str__(self):
         content = self._content_str()
@@ -152,10 +218,7 @@ class Message(object):
     def __bytes__(self):
         from ..identity import Identity
 
-        obj_str = str(self.obj)
-        if isinstance(self.obj, Configuration):
-            obj_str = self.obj.to_string()
-        data_b64 = b64encode(obj_str.encode(Network.encoding)).decode('ascii')
+        data_b64 = self._obj_b64()
 
         wire = {
             'process': self.process,
@@ -168,20 +231,33 @@ class Message(object):
             'from_address': '',
             'from_sig_hex': '',
             'from_enc_hex': '',
+            # Sender topology rank on the envelope (mirrors C net_message.c's
+            # "from_rank"). Kept in lockstep with C so the wire form stays
+            # symmetric; a receiver reads it back onto the peer for rank-based
+            # child-gateway discovery. 0 when no sender / unknown.
+            'from_rank': 0,
         }
 
         if self.from_whom is not None and isinstance(self.from_whom, Identity):
             wire['from_uuid'] = str(self.from_whom.uuid)
-            wire['from_name'] = getattr(self.from_whom, 'fullname', '')
+            wire['from_name'] = getattr(self.from_whom, 'nickname', '')
             wire['from_address'] = getattr(self.from_whom, 'address', '')
+            wire['from_rank'] = int(getattr(self.from_whom, '_rank', 0) or 0)
+            # publish() already returns the HEX-encoded public key (bytes), e.g.
+            # b'45cf..' (64 ASCII hex chars). Just decode to str — do NOT hex
+            # encode it again: a second HexEncoder.encode() yields 128 chars,
+            # which C's public_{encryptor,signature}_init reject (they require
+            # exactly 64) and which Message.reconstruct_sender's own
+            # PublicKey/VerifyKey(..., HexEncoder) parse also fails. Both the
+            # parser and C expect the bare 64-char hex pubkey.
             try:
                 sig_pub = self.from_whom.signature.publish()
-                wire['from_sig_hex'] = HexEncoder.encode(sig_pub).decode('ascii') if sig_pub else ''
+                wire['from_sig_hex'] = sig_pub.decode('ascii') if sig_pub else ''
             except (AttributeError, TypeError):
                 pass
             try:
                 enc_pub = self.from_whom.encryptor.publish()
-                wire['from_enc_hex'] = HexEncoder.encode(enc_pub).decode('ascii') if enc_pub else ''
+                wire['from_enc_hex'] = enc_pub.decode('ascii') if enc_pub else ''
             except (AttributeError, TypeError):
                 pass
 
@@ -232,7 +308,28 @@ class Message(object):
                 # field) → trace_id falls back to a fresh UUID, breaking
                 # the chain at that hop but not the message.
                 wire_trace = wire.get('trace_id') or None
-                msg = Message(process, function, obj_str, from_whom=sender,
+                # Resolve the sender. When the network layer couldn't map
+                # the source address to a known peer (sender is None) — the
+                # request_access discovery broadcast from a brand-new node,
+                # C or Python — reconstruct the sender identity from the
+                # canonical envelope from_* fields. This is what lets a C
+                # at_demo peer (which puts its identity ONLY in from_*, not
+                # the payload) be admitted, and is the receive-side half of
+                # the DRY request_access contract (identity in from_*,
+                # payload = [package_hash, capabilities]).
+                # On the broadcast/multicast channel the network layer passes
+                # the source ADDRESS string as `sender` (netprocess.py:759,
+                # validate=False), and on an unmatched p2p address it passes
+                # None — in both cases the peer identity is not yet known. When
+                # the envelope carries from_* (every request_access does, C and
+                # Python alike), reconstruct the real sender Identity from it so
+                # handlers receive an Identity rather than a bare address/None.
+                eff_sender = sender
+                if not isinstance(eff_sender, Identity):
+                    reconstructed = _identity_from_wire(wire)
+                    if reconstructed is not None:
+                        eff_sender = reconstructed
+                msg = Message(process, function, obj_str, from_whom=eff_sender,
                               encrypt=wire.get('encrypt', False),
                               trace_id=wire_trace)
                 msg.verified = False
@@ -245,16 +342,22 @@ class Message(object):
                 # the wire hex once ourselves and hand the 64-byte
                 # signature straight to VerifyKey.verify with no encoder.
                 sig_hex = wire.get('signature')
-                if sig_hex and sender is not None and isinstance(sender, Identity):
+                if sig_hex and eff_sender is not None and isinstance(eff_sender, Identity):
                     try:
                         sig_raw = HexEncoder.decode(sig_hex.encode('ascii'))
-                        content = '|'.join([process, function, obj_str])
-                        sender.signature.public.verify(
+                        # Verify over the base64 body (the exact wire `data`
+                        # string), matching the sender's _signable_content and
+                        # the C/_native canonical. Verifying over the decoded
+                        # obj_str was the bug: it rejected every non-empty
+                        # C-signed message ("forged or corrupt").
+                        content = Message._signable_content(
+                            process, function, data_b64)
+                        eff_sender.signature.public.verify(
                             content.encode(Network.encoding), sig_raw,
                         )
                         msg.verified = True
                     except (BadSignatureError, Exception) as e:
-                        logger.warning(f"Message signature verification failed from {sender}: {e}")
+                        logger.warning(f"Message signature verification failed from {eff_sender}: {e}")
                         msg.verified = False
                 return msg
         except (json.JSONDecodeError, ValueError, KeyError):
@@ -280,9 +383,13 @@ class Message(object):
 
         if sig_hex and sender is not None and isinstance(sender, Identity):
             try:
-                # Same direct-verify path as the JSON branch above.
+                # Same direct-verify path as the JSON branch above. Sign/verify
+                # over the base64 body (the canonical pre-image), not the raw
+                # pipe-field obj_str.
                 sig_raw = HexEncoder.decode(sig_hex.encode('ascii'))
-                content = '|'.join([process, function, obj_str])
+                content = Message._signable_content(
+                    process, function,
+                    b64encode(obj_str.encode(Network.encoding)).decode('ascii'))
                 sender.signature.public.verify(
                     content.encode(Network.encoding), sig_raw,
                 )

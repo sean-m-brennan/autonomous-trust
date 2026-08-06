@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2024 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -37,6 +37,11 @@
 #include "utilities/util.h"
 
 const char *sig_quit = "quit";
+
+/* See processes.h — extra daemonize() flags applied to every subsystem child.
+ * Set by run_autonomous_trust() to NO_STDERR_REDIRECT in foreground mode so
+ * subsystem logs survive past daemonize(). */
+int process_child_extra_flags = 0;
 
 const long cadence = 500000L; // microseconds
 
@@ -90,8 +95,12 @@ int process_init(process_t *proc, char *name, handler_ptr_t runner, map_t *confi
 
 /* Frama-C: skipped — [solver-timeout] process lifecycle preconditions */
 int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs, tracker_t *tracker,
-                   map_t *procs, pthread_mutex_t *procs_lock, directory_t *queues, logger_t *logger)
+                   proc_context_t *ctx)
 {
+    map_t *procs = ctx->procs;
+    pthread_mutex_t *procs_lock = ctx->procs_lock;
+    directory_t *queues = ctx->queues;
+    logger_t *logger = ctx->logger;
     process_t *proc;
     if (orig > 0)
     {
@@ -148,14 +157,14 @@ int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs
 }
 
 int start_process(char *pname, handler_ptr_t runner, map_t *configs, tracker_t *tracker,
-                  map_t *procs, pthread_mutex_t *procs_lock, directory_t *queues, logger_t *logger)
+                  proc_context_t *ctx)
 {
-    return _process_start(-1, pname, runner, configs, tracker, procs, procs_lock, queues, logger);
+    return _process_start(-1, pname, runner, configs, tracker, ctx);
 }
 
-int restart_process(pid_t orig, char *pname, map_t *procs, pthread_mutex_t *procs_lock, directory_t *queues, logger_t *logger)
+int restart_process(pid_t orig, char *pname, proc_context_t *ctx)
 {
-    return _process_start(orig, pname, NULL, NULL, NULL, procs, procs_lock, queues, logger);
+    return _process_start(orig, pname, NULL, NULL, NULL, ctx);
 }
 
 /*@
@@ -236,7 +245,7 @@ int process_apply_handler_config(const process_t *proc)
      * from a sibling JSON file written by hand. Path mirrors the
      * config dir convention: `<cfg_dir>/<proc_name>.handlers.json`. */
     char cfg_dir[CFG_PATH_LEN + 1];
-    if (get_cfg_dir(cfg_dir) < 0)
+    if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) < 0)
         return 0;
     char path[CFG_PATH_LEN + 1];
     if (path_join(path, sizeof(path), cfg_dir, proc->name) < 0)
@@ -397,13 +406,25 @@ int process_setup(process_t *proc, queue_id_t signal, logger_t *logger,
                   process_ctx_t *ctx)
 {
     char data_path[MAX_FILENAME + 1];
-    get_data_dir(data_path);
+    get_data_dir(data_path, sizeof(data_path));
 
     ctx->fd1 = 0;
     ctx->fd2 = 0;
+    /* In foreground mode the daemon keeps stderr; propagate that to children so
+     * their post-daemonize log output isn't redirected to /dev/null. */
+    proc->flags |= process_child_extra_flags;
     int err = daemonize(data_path, proc->flags, &ctx->fd1, &ctx->fd2);
     if (err != 0)
         return err;
+
+    /* Child only (daemonize returned 0). When the close-all-fds sweep ran
+     * (NO_CLOSE_FILES unset, the default for everything but net_proc), it
+     * closed the descriptor under a file-backed logger — re-open it so this
+     * child's log output keeps reaching the log file in daemon mode. No-op for
+     * a stderr/terminal logger (file_name empty). net_proc sets NO_CLOSE_FILES
+     * to keep its sockets, which also preserves its log fd, so skip it there. */
+    if (!(proc->flags & NO_CLOSE_FILES))
+        logger_reopen(logger);
 
     pid_t pid = getpid();
     log_debug(logger, "Child pid %d\n", pid);

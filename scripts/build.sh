@@ -1,6 +1,6 @@
 #!/bin/bash
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -22,6 +22,35 @@ here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$here" || exit 1
 
 set -e
+
+usage() {
+  cat <<'EOF'
+Usage: build.sh [WHAT] [extra args...] [-h|--help]
+
+Top-level build dispatcher. WHAT selects which components to build; any extra
+arguments are forwarded to the underlying build scripts.
+
+WHAT (substring-matched; default: "py c zkp docker"):
+  py             Build the Python distributions (build-py.sh).
+  zkp | zero     Build the ZKP Rust extension (build-zkp.sh).
+  c | native     Build the native C library (build-native.sh).
+  docker         Build the Docker images (build-docker.sh all).
+
+Examples:
+  build.sh                 # build everything
+  build.sh c               # build only the native C library
+  build.sh "py c"          # build Python + native
+  build.sh py proto-only   # forward 'proto-only' to build-py.sh
+
+Options:
+  -h, --help    Show this help message and exit.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
 WHAT="$1"
 if [ -n "$WHAT" ]; then
   shift

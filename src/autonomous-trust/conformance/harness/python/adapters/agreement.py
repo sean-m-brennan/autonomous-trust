@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2026 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -220,10 +220,10 @@ class AgreementAdapter:
             sig_seed = _stretch(pid, b'sig')
             enc_seed = _stretch(pid, b'enc')
             identities[pid] = Identity(
-                uuid, f'10.0.42.{idx + 1}', f'{pid}.agree', pid,
+                uuid, f'10.0.42.{idx + 1}', f'{pid}.agree',
                 Signature(sig_seed, public_only=False),
                 Encryptor(enc_seed, public_only=False),
-                'me', False, rank, 'authority', _tier=tier,
+                pid, False, rank, 'authority', _tier=tier,
             )
 
         if myself_id not in identities:
@@ -382,10 +382,10 @@ class AgreementAdapter:
             sig_seed = _stretch(pid, b'sig')
             enc_seed = _stretch(pid, b'enc')
             identity = Identity(
-                uuid, f'10.0.42.{idx + 1}', f'{pid}.agree', pid,
+                uuid, f'10.0.42.{idx + 1}', f'{pid}.agree',
                 Signature(sig_seed, public_only=False),
                 Encryptor(enc_seed, public_only=False),
-                'me', False, rank, 'authority',
+                pid, False, rank, 'authority',
             )
             identities[pid] = identity
         return identities

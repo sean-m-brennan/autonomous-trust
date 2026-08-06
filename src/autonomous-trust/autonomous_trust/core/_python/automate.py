@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ import signal
 import sys
 import time
 import logging
+import uuid as _uuid
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler, SysLogHandler
 import traceback
@@ -45,6 +46,7 @@ from .config import Configuration, to_json_string, from_json_string, ConfigMap
 from .config.discover import get_cfg_type, load_configs
 from .processes import Process, LogLevel, ProcessTracker
 from .identity import Peers
+from .identity.protocol import IdentityProtocol
 from .bootstrap_capabilities import (
     register_bootstrap_capabilities,
     BOOTSTRAP_CAPABILITY_NAMES,
@@ -53,9 +55,10 @@ from .capabilities import Capabilities, Capability, PeerCapabilities
 from .system import CfgIds, PackageHash, queue_cadence, max_concurrency, now, preferred_proto_ver, QueueType
 from .protocol import Protocol
 from .negotiation import Task, TaskParameters, TaskStatus, Status, TaskResult, NegotiationProtocol
-from .network import Message
+from .network import Message, require_synced_clock
 from .reputation import TransactionScore, ReputationProtocol
 from .queue_pool import QueuePool
+from .._zkp import ZKP_AVAILABLE
 from . import _probes
 
 PoolType = Union[ProcessPool, ThreadPool]
@@ -89,6 +92,13 @@ class AutonomousTrust(Protocol):
     external_control = 'extern_out'
     external_feedback = 'extern_in'
 
+    # Transport errors raised by a manager-proxied queue when its connection
+    # drops (peer/subprocess churn) or the manager server dies — distinct from
+    # queue.Empty / queue.Full. BrokenPipeError and ConnectionError are OSError
+    # subclasses; EOFError is not, so both are listed.
+    _MGR_CONN_ERRORS = (EOFError, OSError)
+    _IPC_DROP_LOG_INTERVAL = 30.0  # min seconds between IPC-drop log lines
+
     # default to production values
     def __init__(self, multiproc: bool = True, log_level: int = LogLevel.WARNING,
                  logfile: str = None, log_classes: list[str] = None, syslog: bool = False,
@@ -108,9 +118,14 @@ class AutonomousTrust(Protocol):
             if context == Ctx.FORKSERVER:
                 ctx.set_forkserver_preload(['autonomous_trust.core'])
             manager = ctx.Manager()
+            # Keep the manager referenced (not just via its queue proxies) so
+            # the main loop can check whether its server process is still alive
+            # when a proxy connection drops — see _mq_get / _manager_alive.
+            self._manager = manager
             self._queue_type = manager.Queue  # noqa
         else:
             # Threading
+            self._manager = None  # no manager server in threading mode
             self._pool_type = ThreadPool
             self._queue_type = queue.Queue
         self.queue_pool: QueuePool = QueuePool(self._queue_type)
@@ -130,10 +145,23 @@ class AutonomousTrust(Protocol):
         handlers = []
         if not silent:
             handlers.append(logging.StreamHandler(sys.stdout))
-        if logfile != Configuration.log_stdout:
+        if logfile == Configuration.log_stderr:
+            # Explicit stderr destination, honored REGARDLESS of `silent`.
+            # `silent` governs user-facing console chatter (see self.print);
+            # naming a destination governs where logs go. Keeping the two
+            # separate is the point of this sentinel -- without it, a caller
+            # that wants a quiet console and a debug trace has no way to ask.
+            handlers.append(logging.StreamHandler(sys.stderr))
+        elif logfile != Configuration.log_stdout:
             os.makedirs(os.path.dirname(logfile), exist_ok=True)
             handlers.append(TimedRotatingFileHandler(logfile, when="midnight", interval=1, backupCount=5))
         if not handlers:
+            # Reachable only via silent=True + logfile=log_stdout, i.e. "keep the
+            # console quiet" AND "log to the console" -- a contradiction, resolved
+            # by discarding. NOTE: log_level is INERT in this mode; no level makes
+            # anything appear. Pass logfile=Configuration.log_stderr (or a real
+            # file) if you want the logs. Many tests/a_unit/test_automate.py cases
+            # rely on this staying quiet, so the discard is deliberate, not a bug.
             handlers.append(logging.NullHandler())
         for handler in handlers:
             handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d - %(levelname)s %(message)s',
@@ -156,6 +184,9 @@ class AutonomousTrust(Protocol):
         if not os.environ.get('AT_BOOTSTRAP_DISABLED'):
             register_bootstrap_capabilities(self.capabilities)
         self._output: QueueType = self.queue_type()  # subsystem logging
+        # Rate-limit for IPC-drop warnings so a churn-induced connection reset
+        # reconnects quietly instead of logging a traceback every tick.
+        self._last_ipc_drop_log: float = 0.0
         self._subsystems: ProcessTracker = ProcessTracker()
         self._additional_workers: list[tuple[type[Process], list[str], dict[str, Any]]] = []
         # Register the BootstrapWorker alongside the bootstrap caps. It
@@ -182,6 +213,35 @@ class AutonomousTrust(Protocol):
         # info; consumers that want a peer-to-peer matrix (the multi-agency
         # demo's trust graph, for one) read from the pair dict.
         self.latest_reputation_pairs: dict[tuple[str, str], Any] = {}
+        # Subtree member-roster enumeration (requestor-side BFS). The app
+        # calls request_subtree_roster(queues, gateway) to start a walk of a
+        # gateway's cohort tree; each roster_resp is merged here and, for any
+        # newly-named child gateway we can route to, a follow-up roster_req is
+        # sent — unrolling the recursion across message ticks WITHOUT blocking
+        # a handler. `subtree_roster` maps member-uuid -> member dict; the walk
+        # is complete once `_roster_pending` drains. A child gateway we cannot
+        # resolve to a peer (or that never answers) leaves the roster marked
+        # incomplete; a gateway that opted out (AT_ROSTER_PRIVATE) is recorded
+        # in `subtree_roster_private` as an intentional boundary, NOT a failure.
+        # See doc/architecture/gateway-reputation-tree.md.
+        self.subtree_roster: dict[str, Any] = {}
+        self.subtree_roster_complete: bool = True
+        self.subtree_roster_private: list[str] = []
+        self._roster_visited: set[str] = set()
+        self._roster_pending: set[str] = set()
+        # Operator-attended pull (ethne D8, attended-now half). The live
+        # OperatorSession is created by the console app; the main loop runs in
+        # a daemon thread of that same process (see the operator bridge), so
+        # this is the one place in the node that can actually read it. The
+        # identity subprocess asks us for the current state per pull —
+        # see _answer_operator_state / operator-attended.md.
+        self._operator_session = None
+        # Consumer side: peer-uuid -> epoch we asked at, for pulls handed to the
+        # identity process and not yet reported back. Verified answers land on
+        # `peer_attestations` (peer-uuid -> attested epoch, 0 = not attended);
+        # that dict is what ethne's guardian edge reads.
+        self._attest_sent: dict[str, float] = {}
+        self.peer_attestations: dict[str, float] = {}
         self.unhandled_messages: list[Message] = []
         self.peer_count = 0
 
@@ -271,6 +331,213 @@ class AutonomousTrust(Protocol):
     def cleanup(self):
         pass
 
+    # --- Subtree member-roster enumeration (requestor-side BFS) --------------
+
+    def _resolve_gateway(self, gateway_uuid):
+        """Resolve a gateway node uuid to an addressable Identity via the
+        requestor's own peer view (mirrors how reputation resolves peers).
+        Returns the Identity, or None if this node cannot route to it — in
+        which case the enumeration is marked incomplete rather than hanging."""
+        key = str(gateway_uuid)
+        if self.identity is not None and key == str(self.identity.uuid):
+            return self.identity
+        try:
+            return self.peers.find_by_uuid(gateway_uuid)
+        except Exception:
+            return None
+
+    def _send_roster_req(self, queues, gateway):
+        """Send a roster_req to one gateway Identity and mark it pending.
+        The gateway's identity process answers via handle_roster_request.
+
+        The payload names the process the answer must come back to. Inbound
+        messages are routed by ``Message.process`` alone (see
+        netprocess._msg_to_queue), and the aggregation this answer feeds lives
+        here in the main loop, not in the identity process — so without naming
+        it the reply lands in the wrong process and the walk never completes.
+        Same convention as rep_req's ``requesting_process``."""
+        try:
+            req = Message(CfgIds.identity, IdentityProtocol.roster_req,
+                          to_json_string({'requestor': str(self.identity.uuid),
+                                          'requesting_process': self.proc_name}),
+                          to_whom=gateway, from_whom=self.identity)
+            queues[CfgIds.network].put(req, block=True, timeout=queue_cadence)
+            self._roster_pending.add(str(gateway.uuid))
+            return True
+        except queue.Full:
+            self.logger.error('_send_roster_req: network queue full')
+            self.subtree_roster_complete = False
+            return False
+
+    def request_subtree_roster(self, queues, gateway):
+        """Begin enumerating a gateway's cohort tree (any depth).
+
+        Resets the accumulator and sends the first roster_req to ``gateway``
+        (an Identity, or a node-uuid resolvable via this node's peer view).
+        Subsequent levels are pursued automatically as each roster_resp
+        arrives (see the roster_resp branch in autonomous_loop). Read the
+        result off ``subtree_roster`` / ``subtree_roster_complete`` /
+        ``subtree_roster_private`` once the walk settles."""
+        self.subtree_roster = {}
+        self.subtree_roster_complete = True
+        self.subtree_roster_private = []
+        self._roster_visited = set()
+        self._roster_pending = set()
+        if not isinstance(gateway, str) and gateway is not None:
+            target = gateway
+        else:
+            target = self._resolve_gateway(gateway)
+        if target is None:
+            self.subtree_roster_complete = False
+            return
+        self._roster_visited.add(str(target.uuid))
+        self._send_roster_req(queues, target)
+
+    def _consume_roster_resp(self, queues, message):
+        """Merge one roster_resp and pursue any newly-named child gateways —
+        the per-tick unroll of the requestor-side breadth-first walk."""
+        responder = getattr(message, 'from_whom', None)
+        responder_uuid = getattr(responder, 'uuid', None)
+        if responder_uuid is not None:
+            self._roster_pending.discard(str(responder_uuid))
+        payload = message.obj
+        if isinstance(payload, str):
+            payload = from_json_string(payload)
+        if not isinstance(payload, dict):
+            self.subtree_roster_complete = False
+            return
+        if payload.get('private'):
+            # Intentional opaque boundary — do not recurse, not a failure.
+            if responder_uuid is not None:
+                uid = str(responder_uuid)
+                if uid not in self.subtree_roster_private:
+                    self.subtree_roster_private.append(uid)
+            return
+        for member in payload.get('members') or []:
+            if isinstance(member, dict):
+                key = str(member.get('uuid'))
+                if key and key not in self.subtree_roster:
+                    self.subtree_roster[key] = member
+        for child_uuid in payload.get('child_gateways') or []:
+            key = str(child_uuid)
+            if key in self._roster_visited:
+                continue
+            self._roster_visited.add(key)
+            target = self._resolve_gateway(key)
+            if target is None:
+                # Cannot route to this gateway — partial, not a hang.
+                self.subtree_roster_complete = False
+                continue
+            self._send_roster_req(queues, target)
+
+    # --- Operator-attended pull (ethne D8 guardian edge) ---------------------
+
+    def set_operator_session(self, session):
+        """Attach the live :class:`OperatorSession` so this node can answer
+        attended-now pulls.
+
+        Called by the console bridge right after it builds the node, because
+        the bridge runs ``run_forever`` in a daemon thread of the app process —
+        the main loop and the session share an address space. IdentityProcess
+        does NOT: it runs in its own subprocess, which is exactly why the
+        attended-now signal was always 0 before this. It asks us per pull
+        (operator_state_query) rather than caching a mirror that could go
+        stale. See doc/architecture/operator-attended.md."""
+        self._operator_session = session
+
+    def _operator_attended(self):
+        """Current attended state as ``(attended, epoch, have_session)``.
+
+        Attended is decided by :func:`operator.session.is_attended` — the one
+        definition, shared with IdentityProcess so the two processes cannot
+        drift apart. No session (a drone, or a node with no console attached) is
+        honestly reported as have_session=False, which the puller reads as
+        not-attended rather than as an error."""
+        session = self._operator_session
+        if session is None:
+            return False, 0.0, False
+        try:
+            from .operator.session import is_attended  # operator pkg is optional
+            return bool(is_attended(session)), time.time(), True
+        except Exception:
+            # Never let a session read break the loop; unknown reads as absent.
+            self.logger.debug('operator session poll failed', exc_info=True)
+            return False, 0.0, False
+
+    def _answer_operator_state(self, queues, message):
+        """Answer the identity subprocess's operator_state_query. Local-only
+        IPC — this never touches the network queue."""
+        attended, epoch, have_session = self._operator_attended()
+        payload = {'attended': attended, 'epoch': epoch,
+                   'have_session': have_session}
+        try:
+            reply = Message(CfgIds.identity,
+                            IdentityProtocol.operator_state_resp,
+                            to_json_string(payload),
+                            from_whom=self.identity)
+            queues[CfgIds.identity].put(reply, block=True,
+                                        timeout=queue_cadence)
+        except queue.Full:
+            # The identity process ages the pull out and answers "cannot
+            # confirm" — a dropped answer degrades to not-attended, never hangs.
+            self.logger.error('_answer_operator_state: identity queue full')
+        except Exception as err:
+            self.logger.error('_answer_operator_state: %s' % err)
+
+    def request_peer_attestation(self, queues, peer):
+        """Ask for a freshly-stamped operator attestation from one peer.
+
+        Consumer-pull by design: nothing is announced on a cadence, so an idle
+        network carries no attestation traffic. ``peer`` is an Identity or a node
+        uuid. Read the answer off ``peer_attestations[peer_uuid]`` once it
+        arrives — an epoch (a human was at that node's console when it answered)
+        or 0.0 for not-attended. Returns True if the request was handed off.
+
+        The pull itself belongs to IdentityProcess, which holds the operator
+        trust anchor: an attestation is worthless until the credential in it has
+        been re-verified, so the process that can verify is the process that
+        asks. This is the local hand-off."""
+        target = str(getattr(peer, 'uuid', peer))
+        try:
+            req = Message(CfgIds.identity, IdentityProtocol.attest_trigger,
+                          to_json_string({'target': target}),
+                          from_whom=self.identity)
+            queues[CfgIds.identity].put(req, block=True, timeout=queue_cadence)
+        except queue.Full:
+            self.logger.error('request_peer_attestation: identity queue full')
+            return False
+        self._attest_sent[target] = time.time()
+        return True
+
+    def _consume_attest_resp(self, queues, message):
+        """Record a peer's verified attended-now stamp for consumers to read.
+
+        The identity process has already matched the nonce it minted and
+        re-verified the operator credential; what reaches here is a verdict, so
+        this only files it. An unsolicited report is still dropped: nothing
+        should be able to inject an attendance claim for a peer we never asked
+        about."""
+        payload = message.obj
+        if isinstance(payload, str):
+            payload = from_json_string(payload)
+        if not isinstance(payload, dict):
+            return
+        peer_uuid = payload.get('peer')
+        if not peer_uuid:
+            return
+        peer_uuid = str(peer_uuid)
+        if peer_uuid not in self._attest_sent:
+            _probes.counter('proc.automate', 'attest_unsolicited')
+            self.logger.warning('_consume_attest_resp: unsolicited report for %s'
+                                % peer_uuid)
+            return
+        del self._attest_sent[peer_uuid]
+        attested = payload.get('operator_attested_at') or 0.0
+        try:
+            self.peer_attestations[peer_uuid] = float(attested)
+        except (TypeError, ValueError):
+            self.peer_attestations[peer_uuid] = 0.0
+
     def autonomous_loop(self, results: dict[str, AsyncResult], queues: dict[str, QueueType],
                         signals: dict[str, QueueType]) -> None:
         """
@@ -307,13 +574,19 @@ class AutonomousTrust(Protocol):
         :return: None
         """
         os.makedirs(Configuration.get_data_dir(), exist_ok=True)
+        # Clock gate, before anything timestamps or votes. AT carries no NTP
+        # client of its own: a stock daemon on the HOST disciplines the clock
+        # and this reads only what it achieved. Enforcing inside AT container
+        # images (they set AT_REQUIRE_SYNCED_CLOCK=1), advisory elsewhere so a
+        # developer machine still runs. Mirrors the C gate in at_node_init.
+        require_synced_clock(self.logger)
         configs = self._configure()
         procs: list[Process] = configs[Process.key]
         if self._log_level <= LogLevel.WARNING:
             self._banner()
         self.logger.info(self.name + ':  Package signature %s' % configs[PackageHash.key])
         self.logger.info(self.name + ":  Configuring '%s' at %s for %s" %
-                         (self.identity.fullname, self.identity.address, '(unknown domain)'))
+                         (self.identity.nickname, self.identity.address, '(unknown domain)'))
         self.logger.info(self.name + ':  Signature: %s' % self.identity.signature.publish())
         self.logger.info(self.name + ':  Public key: %s' % self.identity.encryptor.publish())
 
@@ -441,6 +714,63 @@ class AutonomousTrust(Protocol):
                 configs[Process.key].append(worker_cls(configs, self._subsystems, self._output, deps, **kwargs))
         return configs
 
+    @staticmethod
+    def _reset_proxy_connection(proxy) -> None:
+        """Drop a manager proxy's wedged thread-local connection so the next
+        call on it opens a fresh one. Recovers a proxy whose remote end was
+        closed (e.g. when a peer/subprocess churns) without tearing down the
+        loop. No-op for plain threading-mode queues (no ``_tls``)."""
+        tls = getattr(proxy, '_tls', None)
+        if tls is None:
+            return
+        conn = getattr(tls, 'connection', None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+            try:
+                del tls.connection
+            except AttributeError:
+                pass
+
+    def _manager_alive(self) -> bool:
+        """Whether the multiprocessing manager server process is still up.
+        True in threading mode (no manager) so callers treat drops as
+        recoverable there."""
+        mgr = getattr(self, '_manager', None)
+        proc = getattr(mgr, '_process', None) if mgr is not None else None
+        return proc is None or proc.is_alive()
+
+    def _mq_get(self, proxy, block: bool = False, timeout: float = None):
+        """``queue.get`` on a manager-proxied queue that survives a dropped
+        connection. On a transport error it resets the proxy (so the next
+        tick reconnects) and reports the queue as empty — returning the main
+        loop to a receptive state instead of spinning on a dead connection.
+        Whether the manager server itself is still alive is surfaced at most
+        once per _IPC_DROP_LOG_INTERVAL rather than as a per-tick traceback."""
+        try:
+            if block:
+                return proxy.get(block=True, timeout=timeout)
+            return proxy.get_nowait()
+        except queue.Empty:
+            raise
+        except self._MGR_CONN_ERRORS as ex:
+            self._reset_proxy_connection(proxy)
+            alive = self._manager_alive()
+            now = time.monotonic()
+            if now - self._last_ipc_drop_log >= self._IPC_DROP_LOG_INTERVAL:
+                self._last_ipc_drop_log = now
+                if alive:
+                    self.logger.warning(
+                        '%s: IPC queue connection dropped (%s); reconnecting'
+                        % (self.name, type(ex).__name__))
+                else:
+                    self.logger.error(
+                        '%s: manager server process is down; IPC lost, '
+                        'awaiting restart' % self.name)
+            raise queue.Empty from ex
+
     def _monitor_processes(self, proc_results: dict[str, AsyncResult], show_output: bool = True):
         """
         Should be included in any main-loop override function
@@ -465,10 +795,12 @@ class AutonomousTrust(Protocol):
                     self._stopped_procs.append(name)
 
         if show_output:
-            # drain subprocess outputs, if any
+            # drain subprocess outputs, if any. _mq_get treats a dropped
+            # manager connection as empty (after resetting it to reconnect
+            # next tick), so a peer/subprocess churn no longer spins here.
             while True:
                 try:
-                    level, name, msg = self._output.get_nowait()
+                    level, name, msg = self._mq_get(self._output)
                     self.logger.log(level, '%s: %s' % (name, msg))
                 except queue.Empty:
                     break
@@ -484,7 +816,7 @@ class AutonomousTrust(Protocol):
     def _handle_messages(self, queues: dict[str, QueueType], pool: PoolType, results: dict[str, AsyncResult]):
         if self.external_control in queues:
             try:
-                cmd = queues[self.external_control].get_nowait()
+                cmd = self._mq_get(queues[self.external_control])
                 if isinstance(cmd, Task):
                     message = Message(CfgIds.negotiation, NegotiationProtocol.start, cmd)
                     queues[CfgIds.negotiation].put(message, block=True, timeout=queue_cadence)
@@ -498,7 +830,7 @@ class AutonomousTrust(Protocol):
 
         message = None
         try:
-            message = queues[self.proc_name].get(block=True, timeout=queue_cadence)
+            message = self._mq_get(queues[self.proc_name], block=True, timeout=queue_cadence)
         except queue.Empty:
             pass
 
@@ -515,10 +847,37 @@ class AutonomousTrust(Protocol):
                 elif isinstance(message, TaskResult):
                     task = message
                     self.logger.debug(self.name + ': Task result recvd: %s' % task.result)
+                    # Requestor-side score for a returned TaskResult. verify_proof()
+                    # is tri-state: True (proof verified), False (proof present but
+                    # INVALID -> genuine tamper signal), or None (indeterminate: no
+                    # proof attached, or ZKP unavailable in this process).
+                    #
+                    # None must NOT be scored as a defection. Split by cause:
+                    #   * ZKP unavailable process-wide -> proofs cannot attest
+                    #     anything, so score on the fact the task completed with a
+                    #     result; missing infrastructure is not the peer's fault.
+                    #   * ZKP available but proof absent -> suspicious; score as a
+                    #     defection, like an invalid proof.
+                    # Previously `0.8 if zkp_valid else 0.3` collapsed None into the
+                    # defection bucket, so with the ZKP extension unshipped every
+                    # requestor scored 0.3 and honest reputation cratered.
                     zkp_valid = task.verify_proof()
-                    if zkp_valid is False:
-                        self.logger.warning(self.name + ': ZKP verification FAILED for task %s' % task.uuid)
-                    score = 0.8 if zkp_valid else 0.3
+                    if zkp_valid is True:
+                        score = 0.8
+                    elif zkp_valid is False:
+                        self.logger.warning(
+                            self.name + ': ZKP verification FAILED for task %s'
+                            % task.uuid)
+                        score = 0.3
+                    elif ZKP_AVAILABLE:
+                        # Proof missing despite ZKP being available -> suspicious.
+                        self.logger.warning(
+                            self.name + ': task %s result carried no ZKP proof '
+                            'despite ZKP being available' % task.uuid)
+                        score = 0.3
+                    else:
+                        # ZKP unavailable: score on successful completion.
+                        score = 0.8 if task.result is not None else 0.3
                     tx = TransactionScore(task.uuid, score)
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
                     if self.external_feedback in queues:
@@ -561,11 +920,40 @@ class AutonomousTrust(Protocol):
                             peer = self.peers.find_by_uuid(rep.peer_id)
                             if peer:
                                 self.print("%s's current reputation score:\033[32m %s\033[00m" % (peer.nickname, rep.score))
-                        self.latest_reputation[str(rep.peer_id)] = rep
+                        # latest_reputation is THIS node's OWN view of each
+                        # peer (fed to the reputations panel + Trust Dynamics
+                        # timeline; see the "My/X's current reputation score"
+                        # prints above). Only our own computation belongs here:
+                        # a transitive peer-pair rep_req answered by a REMOTE
+                        # observer (from_whom != us) is that observer's bilateral
+                        # CTFT reading — cold-start PREREP_NEUTRAL (0.0) for a
+                        # pair with no shared history, e.g. a consumer-only peer
+                        # nobody transacts with. Writing those here overwrote the
+                        # consensus value and dragged the timeline to 0; they are
+                        # captured below for the Trust Network graph only.
+                        own_view = (observer_uuid is None
+                                    or str(observer_uuid) == str(self.identity.uuid))
+                        if own_view:
+                            self.latest_reputation[str(rep.peer_id)] = rep
                         # Bilateral capture: track WHO computed this score.
                         if observer_uuid is not None:
                             key = (str(observer_uuid), str(rep.peer_id))
                             self.latest_reputation_pairs[key] = rep
+                elif isinstance(message, Message) and message.function == IdentityProtocol.roster_resp:
+                    # One level of the requestor-side subtree-roster walk:
+                    # merge this gateway's members and fan out roster_req to
+                    # any child gateways it named (see _consume_roster_resp).
+                    self._consume_roster_resp(queues, message)
+                elif (isinstance(message, Message)
+                      and message.function == IdentityProtocol.operator_state_req):
+                    # Local-only IPC: the identity subprocess cannot see the
+                    # console's OperatorSession, but this loop shares its
+                    # address space. Answer with the current attended state.
+                    self._answer_operator_state(queues, message)
+                elif (isinstance(message, Message)
+                      and message.function == IdentityProtocol.attest_resp):
+                    # A peer answered one of our attended-now pulls.
+                    self._consume_attest_resp(queues, message)
                 else:
                     self.unhandled_messages.append(message)
         return True
@@ -585,16 +973,38 @@ class AutonomousTrust(Protocol):
         for key in list(results.keys()):
             if results[key].ready():
                 if key in list(self.process_names):
+                    # A long-running process is not supposed to return at all,
+                    # so this stays an error -- but report it ONCE. The entry
+                    # remains ready() forever, so continuing without dropping
+                    # it re-logged the same line on every main-loop pass
+                    # (Process.cadence, 2 Hz) for the rest of the run.
+                    # _monitor_processes runs earlier in the same iteration, so
+                    # any exception traceback is already on the record; a clean
+                    # return leaves no traceback and only this line.
                     self.logger.error('unexpected termination of process %s' % key)
+                    if key not in self._stopped_procs:
+                        self._stopped_procs.append(key)
+                    del results[key]
                     continue
                 try:
                     self.logger.debug(self.name + ': %s Task' % key)
                     result = results[key].get()
                     self.logger.debug(self.name + ': %s Task completed %s' % (key, result))
-                    tr = TaskResult(self.active_tasks[str(key)], result)
+                    orig_task = self.active_tasks[str(key)]
+                    tr = TaskResult(orig_task, result)
                     tr.generate_proof()
                     queues[CfgIds.negotiation].put(tr, block=True, timeout=queue_cadence)
-                    tx = TransactionScore(tr.uuid, 0.9)
+                    # Tag the TS with the capability that produced it so the
+                    # reputation process's _resolve_tx_weight applies the
+                    # capability's configured transaction_weight. The executor
+                    # holds the original Task (active_tasks), so the name comes
+                    # "for free" off the negotiation-driven path — this is the
+                    # principled producer the DoD coordinator stop-gap hand-tags
+                    # by hand (see doc/NV059/work/deferred.md §1.2). A None name
+                    # falls back to weight 1, the prior behavior.
+                    cap_name = getattr(
+                        getattr(orig_task, 'capability', None), 'name', None)
+                    tx = TransactionScore(tr.uuid, 0.9, capability_name=cap_name)
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
                 except KeyboardInterrupt:
                     pass

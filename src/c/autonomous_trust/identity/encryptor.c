@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2024 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -48,16 +48,59 @@ int encryptor_init(encryptor_t *encr, const unsigned char *hex_seed, size_t hex_
     return 0;
 }
 
-/* Frama-C: skipped — [solver-timeout] libsodium stub preconditions */
-unsigned char *encryptor_publish(const encryptor_t *encr)
+/* Init an encryptor from a RAW box private key (the Curve25519 secret
+ * scalar), NOT a libsodium seed. This is the cross-runtime canonical form:
+ * Python's Encryptor serializes `self.private.encode()` (the raw 32-byte
+ * private key), and `crypto_scalarmult_base(pk, sk)` reproduces the same
+ * public key PyNaCl derives from those bytes (verified). Distinct from
+ * encryptor_init(), which hashes a seed via crypto_box_seed_keypair and is
+ * used for seed-based identity provisioning. Used for group-key transport. */
+int encryptor_init_from_private(encryptor_t *encr, const unsigned char *hex_priv, size_t hex_len)
 {
-    unsigned char *hex = malloc(crypto_box_PUBLICKEYBYTES * 2);
+    if (encr == NULL || hex_priv == NULL
+        || hex_len != crypto_box_SECRETKEYBYTES * 2)
+        return -1;
+    if (unhexlify(hex_priv, hex_len, (unsigned char *)encr->private) != 0)
+        return -1;
+    if (crypto_scalarmult_base((unsigned char *)encr->public,
+                               (const unsigned char *)encr->private) != 0)
+        return -1;
+    hexlify(encr->public, crypto_box_PUBLICKEYBYTES, (unsigned char *)encr->public_hex);
+    return 0;
+}
+
+/* Serialize the RAW box private key as hex (64 chars + NUL). Mirrors
+ * Python Encryptor.serialize(). Caller frees. Returns NULL if the
+ * encryptor holds no private key (all-zero) — callers must publish the
+ * public key instead in that case. */
+unsigned char *encryptor_serialize_private(const encryptor_t *encr)
+{
+    if (encr == NULL || sodium_is_zero(encr->private, crypto_box_SECRETKEYBYTES))
+        return NULL;
+    unsigned char *hex = malloc(crypto_box_SECRETKEYBYTES * 2 + 1);
     if (hex == NULL)
     {
         EXCEPTION(ENOMEM);
         return NULL;
     }
-    memcpy(hex, encr->public_hex, crypto_box_PUBLICKEYBYTES * 2);
+    hexlify(encr->private, crypto_box_SECRETKEYBYTES, hex);
+    return hex;
+}
+
+/* Frama-C: skipped — [solver-timeout] libsodium stub preconditions */
+unsigned char *encryptor_publish(const encryptor_t *encr)
+{
+    /* public_hex is NUL-terminated ([... * 2 + 1]); copy the terminator too
+     * so callers treating the result as a C string (json_string in
+     * public_identity_to_json) read exactly the 64 hex chars instead of
+     * over-running into the heap. Length-passing callers are unaffected. */
+    unsigned char *hex = malloc(crypto_box_PUBLICKEYBYTES * 2 + 1);
+    if (hex == NULL)
+    {
+        EXCEPTION(ENOMEM);
+        return NULL;
+    }
+    memcpy(hex, encr->public_hex, crypto_box_PUBLICKEYBYTES * 2 + 1);
     return hex;
 }
 

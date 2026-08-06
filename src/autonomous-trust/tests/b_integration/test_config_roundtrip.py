@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -32,7 +32,7 @@ from .. import TEST_DIR
 
 def _random_identity():
     seed = secrets.token_hex(32)
-    return Identity(uuid4(), '127.0.0.1', 'full name', 'nick', Signature(seed), None)
+    return Identity(uuid4(), '127.0.0.1', 'full name', Signature(seed), None, 'nick')
 
 
 class TestConfigRoundtrip:
@@ -45,8 +45,8 @@ class TestConfigRoundtrip:
 
     def test_peers_yaml_roundtrip(self, setup_teardown):
         peers = Peers()
-        p1 = Identity(uuid4(), '10.0.0.1', 'peer1', 'p1', Signature.generate(), Encryptor.generate())
-        p2 = Identity(uuid4(), '10.0.0.2', 'peer2', 'p2', Signature.generate(), Encryptor.generate())
+        p1 = Identity(uuid4(), '10.0.0.1', 'peer1', Signature.generate(), Encryptor.generate(), 'p1')
+        p2 = Identity(uuid4(), '10.0.0.2', 'peer2', Signature.generate(), Encryptor.generate(), 'p2')
         peers.add(p1)
         peers.add(p2)
         filepath = os.path.join(TEST_DIR, 'rt_peers')

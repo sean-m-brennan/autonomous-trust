@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2026 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -185,10 +185,10 @@ def _to_captured(msg: Any, emitter_id: str) -> CapturedMessage:
 def _resolve_to_id(msg: Message) -> str:
     to = msg.to_whom
     if isinstance(to, Identity):
-        return getattr(to, 'nickname', '') or str(to.uuid)
+        return getattr(to, 'petname', '') or str(to.uuid)
     if isinstance(to, list) and to:
         first = to[0]
-        return getattr(first, 'nickname', '') or str(getattr(first, 'uuid', first))
+        return getattr(first, 'petname', '') or str(getattr(first, 'uuid', first))
     return 'broadcast'
 
 
@@ -262,10 +262,10 @@ class NegotiationAdapter:
             enc = hashlib.sha256(b'neg:enc:' + pid.encode()).hexdigest().encode('ascii')
             identity = Identity(
                 uuid5(_NS, f'neg:{pid}'), f'10.0.50.{idx + 1}',
-                f'{pid}.neg', pid,
+                f'{pid}.neg',
                 Signature(sig, public_only=False),
                 Encryptor(enc, public_only=False),
-                'me', False, 0, 'authority',
+                pid, False, 0, 'authority',
             )
             identities[pid] = identity
 

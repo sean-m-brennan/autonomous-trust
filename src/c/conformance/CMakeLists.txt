@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2026 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -38,6 +38,7 @@ set(AT_CONFORMANCE_SOURCES
     adapters/agreement.c
     adapters/negotiation.c
     adapters/reputation.c
+    adapters/bootstrap.c
 )
 
 # The corpus YAML lives next to src/c/, under src/autonomous-trust/conformance/.

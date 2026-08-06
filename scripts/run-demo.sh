@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -37,9 +37,11 @@
 #                 those.
 #   --k8s         Minikube + kubectl apply (one-shot). Multi-agency
 #                 and dod-mission.
-#   --playback FILE  Inspector-only replay (multi-agency only).
-#   --record FILE    Inspector-only scripted run, captures events
-#                    (multi-agency only).
+#   --playback FILE  Canned-playback replay, no AT runtime (multi-agency
+#                    only). A live multi-agency run is now hosted by the
+#                    coordinator (an AT mesh node); capture a recording by
+#                    running the coordinator with --record inside the stack.
+#                    For dod-mission, record a *live* run with --record-to FILE.
 #   --teardown    Stop a previous run + clean up, exit.
 #
 # Examples:
@@ -50,6 +52,7 @@
 #   scripts/run-demo.sh --variant=multi-agency --compose
 #   scripts/run-demo.sh --variant=multi-agency --playback recording.json
 #   scripts/run-demo.sh --variant=dod-mission --swarm-size=8
+#   scripts/run-demo.sh --variant=dod-mission --compose --record-to demo.json
 #   scripts/run-demo.sh --variant=multi-agency --teardown
 
 set -euo pipefail
@@ -88,7 +91,11 @@ REGISTRY="${REGISTRY:-}"
 IMAGE_TAG="${IMAGE_TAG:-:dev}"
 IMAGE_NAME="${IMAGE_NAME:-autonomous-trust}"
 PLAYBACK_FILE=""                     # multi-agency only
-RECORD_FILE=""                       # multi-agency only
+RECORD_FILE=""                       # multi-agency only (inspector-only mode)
+RECORD_TO=""                         # dod-mission: record a live run to a file
+PORT_EXPLICIT=0                      # 1 once the user passes --port
+HARVEST_RUNTIME="docker"             # log-harvest: docker | k8s
+HARVEST_CONTAINERS=""                # log-harvest: comma-list override (default: scenario peers)
 
 # DoD scenario knobs (only honored when --variant=dod-mission).
 SQUAD_SIZE=4
@@ -96,6 +103,11 @@ SWARM_SIZE=4
 SENSOR_COUNT=3
 HACKED_SENSORS=2
 COMPROMISE_MODE="abrupt"
+# Which microdrones run the embedded C at_demo node (dod-mission + --compose
+# only). "" = none (all-Python, the default); "all" = every microdrone-*; or a
+# comma-list of peer names. Threaded identically to seed_dod_cohort.py and
+# generate_compose.py so the seeded identity format matches the runtime.
+C_MICRODRONES="${AT_C_MICRODRONES:-}"
 
 # Probes shared volume defaults to ON for multi-agency compose.
 export AT_PROBES="${AT_PROBES:-1}"
@@ -111,6 +123,56 @@ log()   { echo -e "${CYAN}[$VARIANT]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[$VARIANT]${NC} $*"; }
 err()   { echo -e "${RED}[$VARIANT]${NC} $*" >&2; }
 event() { echo -e "${GREEN}[T+${1}]${NC} $2"; }
+
+# Ensure a git submodule is checked out. Dockerfile-native COPYs the working
+# tree rather than cloning, so an uninitialized submodule surfaces as a CMake
+# "Cannot find source file" error deep in the build. `git submodule status`
+# prefixes an uninitialized entry with '-'; the optional sentinel guards the
+# edge case where the dir exists but is empty (git thinks it's fine but the
+# expected source is absent).
+#   $1 = submodule path (relative to repo root)
+#   $2 = (optional) sentinel file, relative to repo root, that must exist
+#        after checkout
+ensure_submodule() {
+    local sm_path="$1" sentinel="${2:-}"
+    command -v git &>/dev/null \
+        || { err "git not found; cannot init submodule $sm_path"; return 1; }
+    local st
+    st=$(git -C "$here" submodule status -- "$sm_path" 2>/dev/null)
+    if [[ -z "$st" || "$st" == -* ]] \
+        || { [[ -n "$sentinel" && ! -f "$here/$sentinel" ]]; }; then
+        warn "Submodule $sm_path not checked out — initializing ..."
+        git -C "$here" submodule update --init "$sm_path" \
+            || { err "failed to init submodule $sm_path (network access to its host?)"; return 1; }
+        if [[ -n "$sentinel" && ! -f "$here/$sentinel" ]]; then
+            err "submodule $sm_path init reported success but $sentinel is still missing"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# Force-reseed cleanup. The demo containers run as root and create var/at/ (and
+# the C nodes' etc/at network/subsystems configs) as root, so the Python seeder
+# — running as the host user — cannot unlink that runtime state. It then
+# survives a --reseed wipe, leaving stale identity/group/reputation state that
+# mismatches the freshly-seeded etc/at (peers fail to re-form the cohort). Wipe
+# the whole state dir as root via a throwaway container so the seed starts
+# clean. Best-effort: if docker can't do it, the seeder's own partial wipe still
+# runs (it skips, rather than crashes on, the undeletable files).
+reseed_wipe_state() {
+    local state_dir="$1"
+    [[ -d "$state_dir" ]] || return 0
+    log "Reseed: wiping persistent state as root via docker ($state_dir) ..."
+    # sh -c so the glob expands INSIDE the container; `docker run ... rm /s/*`
+    # would let the host shell expand /s/* (a nonexistent host path) and pass it
+    # literally to rm, which -f-ignores it (a silent no-op). Include dotfiles;
+    # `|| true` so an already-empty dir isn't a failure.
+    docker run --rm -v "$state_dir:/s" alpine \
+        sh -c 'rm -rf /s/* /s/.[!.]* 2>/dev/null || true' \
+        || warn "Reseed root-wipe via docker failed; seeder falls back to a" \
+                "partial wipe (root-owned var/at may persist)."
+}
 
 # --- Usage ----------------------------------------------------------------
 
@@ -131,21 +193,37 @@ Backends (pick one, defaults to --tilt; not all valid for every variant):
   --tilt                 Tilt-managed (live rebuild on save)
   --compose              docker compose (one-shot)
   --k8s                  Minikube + kubectl (multi-agency + dod-mission)
-  --playback FILE        Inspector-only replay (multi-agency only)
-  --record FILE          Inspector-only scripted run (multi-agency only)
+  --playback FILE        Canned-playback replay, no AT runtime (multi-agency only)
+  --log-harvest          Reputation log-harvest debug lens (multi-agency only).
+                         Tails a RUNNING mesh's logs (nodes started with
+                         AT_REP_DUMP_SEC set) as a background subprocess and
+                         serves the reconstructed observer->subject matrix.
+                         Bring the mesh up with dumps enabled first, e.g.:
+                           AT_REP_DUMP_SEC=2 $0 --variant=multi-agency --compose
+  --triage               One-shot: print a per-subject exclusion triage table
+                         from the running mesh's logs (real AT exclusion vs
+                         cold-start baseline vs earned decline) and exit.
+                         Multi-agency only; honors --runtime/--namespace/--containers.
   --teardown             Stop a previous run, exit
   --clean                Remove generated artifacts, exit
 
 Common options:
   --namespace NS         K8s namespace (multi-agency/dod-mission only)
-  --port PORT            Inspector port (default: $INSPECTOR_PORT)
+  --port PORT            Inspector port (default: $INSPECTOR_PORT; log-harvest
+                         defaults to 8060 to avoid the coordinator's 8050)
+  --runtime R            log-harvest log source: docker | k8s (default: docker)
+  --containers LIST      log-harvest: comma-list of container/pod names to tail
+                         (default: the scenario's peer names)
   --log-level LEVEL      info | debug | warning (default: $LOG_LEVEL)
   --registry PREFIX      Image registry (include trailing /)
   --image-tag TAG        Image tag, include leading : (default: $IMAGE_TAG)
   --deploy-dir DIR       Output dir for generated files
   --no-browser           Don't auto-open the dashboard
   --skip-build           Don't (re)build images
-  --rebuild              Force rebuild of overlay images
+  --rebuild              Force rebuild of the whole image chain (base,
+                         inspector, and overlays) so edited source
+                         propagates. Layer-cached, so unchanged layers
+                         are near-free; only changed COPYs rebuild.
   --reseed               Force-regenerate the persistent-cohort seed
                          (fresh identities + gateway child groups);
                          same as AT_PRESEED_FORCE=1
@@ -164,9 +242,25 @@ dod-mission options:
   --sensor-count N       Sensors (default: $SENSOR_COUNT)
   --hacked-sensors N     Hacked sensors (default: $HACKED_SENSORS)
   --compromise-mode M    abrupt|gradual (default: $COMPROMISE_MODE)
+  --c-microdrones[=SPEC] Run microdrones as embedded C at_demo nodes instead of
+                         Python (requires --compose). SPEC is 'all' (default
+                         when given bare), a bare integer N for the first N
+                         microdrones (N < total => a MIXED Python+C swarm, e.g.
+                         --c-microdrones=2), or a comma-list of peer names
+                         (e.g. microdrone-1,microdrone-2). (Note: '1' means the
+                         first one, not all — use 'all'.) Builds the
+                         autonomous-trust-c image (Dockerfile-c, needs network
+                         for apt) and seeds those peers with C-format identities
+                         so they cold-join the Python mesh for the group key.
+  --record-to FILE       Record this live run for canned playback. The
+                         coordinator flushes FILE on graceful shutdown
+                         (compose: ./recording/FILE beside the compose file;
+                         k8s: on the node). Play back with
+                         'python -m examples.dod_mission --playback FILE'.
 
 Environment overrides: VARIANT, NAMESPACE, INSPECTOR_PORT, DEPLOY_DIR,
-                       REGISTRY, IMAGE_TAG, LOG_LEVEL, TILT_LOG
+                       REGISTRY, IMAGE_TAG, LOG_LEVEL, TILT_LOG,
+                       AT_RECORD, AT_RECORD_HOST_DIR, AT_RECORD_NODE_PATH
 EOF
     exit "${1:-0}"
 }
@@ -185,11 +279,19 @@ while [[ $# -gt 0 ]]; do
         --teardown)              BACKEND_MODE="teardown";    shift;;
         --clean)                 BACKEND_MODE="clean";       shift;;
         --playback)              BACKEND_MODE="playback"; PLAYBACK_FILE="$2"; shift 2;;
+        --log-harvest)           BACKEND_MODE="log-harvest"; shift;;
+        --triage)                BACKEND_MODE="triage";      shift;;
+        --runtime=*)             HARVEST_RUNTIME="${1#*=}";  shift;;
+        --runtime)               HARVEST_RUNTIME="$2";       shift 2;;
+        --containers=*)          HARVEST_CONTAINERS="${1#*=}"; shift;;
+        --containers)            HARVEST_CONTAINERS="$2";    shift 2;;
         --record)                BACKEND_MODE="record";   RECORD_FILE="$2";   shift 2;;
+        --record-to=*)           RECORD_TO="${1#*=}";        shift;;
+        --record-to)             RECORD_TO="$2";             shift 2;;
         --namespace=*)           NAMESPACE="${1#*=}";        shift;;
         --namespace)             NAMESPACE="$2";             shift 2;;
-        --port=*)                INSPECTOR_PORT="${1#*=}";   shift;;
-        --port)                  INSPECTOR_PORT="$2";        shift 2;;
+        --port=*)                INSPECTOR_PORT="${1#*=}"; PORT_EXPLICIT=1; shift;;
+        --port)                  INSPECTOR_PORT="$2"; PORT_EXPLICIT=1; shift 2;;
         --log-level=*)           LOG_LEVEL="${1#*=}";        shift;;
         --log-level)             LOG_LEVEL="$2";             shift 2;;
         --registry=*)            REGISTRY="${1#*=}";         shift;;
@@ -215,6 +317,8 @@ while [[ $# -gt 0 ]]; do
         --hacked-sensors)        HACKED_SENSORS="$2";        shift 2;;
         --compromise-mode=*)     COMPROMISE_MODE="${1#*=}";  shift;;
         --compromise-mode)       COMPROMISE_MODE="$2";       shift 2;;
+        --c-microdrones=*)       C_MICRODRONES="${1#*=}";    shift;;
+        --c-microdrones)         C_MICRODRONES="all";        shift;;
         -v)                      LOG_LEVEL="info";           shift;;
         -vv)                     LOG_LEVEL="debug";          shift;;
         -vvv)                    LOG_LEVEL="verbose";        shift;;
@@ -267,7 +371,7 @@ esac
 # encode as variant-suffixed plain vars.
 ALLOWED_python="tilt teardown clean"
 ALLOWED_c="tilt teardown clean"
-ALLOWED_multi_agency="tilt compose k8s playback record teardown clean"
+ALLOWED_multi_agency="tilt compose k8s playback log-harvest triage teardown clean"
 ALLOWED_dod_mission="tilt compose k8s teardown clean"
 
 _variant_slug=${VARIANT//-/_}
@@ -276,7 +380,44 @@ _allowed="${!_allowed_var}"
 if [[ ! " $_allowed " == *" $BACKEND_MODE "* ]]; then
     err "Backend mode '$BACKEND_MODE' is not valid for variant '$VARIANT'."
     err "    Allowed for $VARIANT: $_allowed"
+    if [[ "$BACKEND_MODE" == "record" && "$VARIANT" == "dod-mission" ]]; then
+        err "    To record a dod-mission live run, use: --record-to FILE"
+    fi
     exit 1
+fi
+
+# Normalize the C-microdrone knob ("0"/"none"/"false" -> off) and gate it: the
+# embedded C at_demo path exists in the dod-mission compose AND k8s generators
+# (generate_compose.py / generate_k8s.py), the latter driving the tilt backend.
+case "$C_MICRODRONES" in 0|none|false|off) C_MICRODRONES="";; esac
+if [[ -n "$C_MICRODRONES" ]]; then
+    if [[ "$VARIANT" != "dod-mission" ]]; then
+        err "--c-microdrones is only supported with --variant=dod-mission."
+        exit 1
+    fi
+    case "$BACKEND_MODE" in
+        compose|tilt|k8s) : ;;  # all three generators emit C at_demo nodes
+        *)
+            err "--c-microdrones requires the --compose, --tilt, or --k8s"
+            err "    backend (got --$BACKEND_MODE)."
+            exit 1 ;;
+    esac
+fi
+
+# dod-mission: --record-to FILE records the live run. The compose/k8s/tilt
+# paths all generate via generate_compose/_k8s, which read AT_RECORD, so just
+# export it; the coordinator then gets `--record` + a host-backed recording
+# volume and flushes the canned-playback log on graceful shutdown.
+if [[ -n "$RECORD_TO" ]]; then
+    if [[ "$VARIANT" != "dod-mission" ]]; then
+        err "--record-to is only supported for --variant=dod-mission"
+        err "    (multi-agency records via its inspector-only --record FILE mode)"
+        exit 1
+    fi
+    export AT_RECORD="$RECORD_TO"
+    log "Recording this run -> coordinator writes $(basename "$RECORD_TO") on"
+    log "    graceful shutdown (compose: ./recording/ beside the compose file;"
+    log "    k8s: ${AT_RECORD_NODE_PATH:-/data/dod-mission-recording}/ on the node)."
 fi
 
 # --- Clean fast path ------------------------------------------------------
@@ -434,6 +575,26 @@ cleanup_inspector_procs() {
     pkill -f "examples\\.multi_agency" 2>/dev/null || true
 }
 
+# Force-reap the demo namespace's pods on Ctrl-C/teardown WITHOUT the heavy
+# `minikube delete` that the --teardown path runs. `tilt down` deletes the
+# Deployments, but pod termination is async and graceful: an AT node is slow
+# to exit on SIGTERM (it tears down a multiprocessing pool of subprocesses),
+# so the pod sits in Terminating with its whole python process tree still
+# alive — visible host-side, "multiple per node". A grace-period-0 force
+# delete SIGKILLs the pod sandboxes immediately so those trees die now,
+# while minikube + the cached layer images are left intact for a fast next
+# round. Best-effort and non-blocking (--wait=false) so the exit trap never
+# hangs.
+reap_namespace_fast() {
+    [[ "$VARIANT" == "multi-agency" || "$VARIANT" == "dod-mission" ]] || return 0
+    [[ -n "$NAMESPACE" ]] || return 0
+    command -v kubectl &>/dev/null || return 0
+    kubectl delete pods --all -n "$NAMESPACE" \
+        --force --grace-period=0 --wait=false 2>/dev/null || true
+    kubectl delete namespace "$NAMESPACE" \
+        --ignore-not-found=true --wait=false 2>/dev/null || true
+}
+
 ensure_minikube_running() {
     if ! command -v minikube &>/dev/null; then
         err "minikube not installed; see https://minikube.sigs.k8s.io/docs/start/"
@@ -470,6 +631,109 @@ git_version=$(git describe HEAD 2>/dev/null || echo unknown)
 git_version="${git_version#v}"
 build_args+=("--build-arg" "GIT_VERSION=$git_version")
 
+# --- Stale-image schema-skew preflight -----------------------------------
+# Catches the dod-mission "all forming…/peers.all=0" trap: tools/seed_dod_
+# cohort.py runs from the host tree and serializes Identity with whatever
+# fields the host identity.py declares (e.g. the ZTA zta_credential/zta_issuer/
+# zta_credential_hash added in f6250c8). If the baked base image's
+# Identity.__init__ predates those kwargs, every seeded peer TypeErrors at boot
+# -> peers.all=0 -> reputations stuck "forming…". Returns 0 (stale) only when
+# the image clearly exists AND is missing a kwarg the host source has; any
+# uncertainty (no image, can't parse, can't introspect) returns 1 so the normal
+# build path is never blocked.
+base_image_identity_stale() {
+    local base_ref="$1"
+    docker image inspect "$base_ref" &>/dev/null || return 1
+
+    local id_src="$here/src/autonomous-trust/autonomous_trust/core/_python/identity/identity.py"
+    [[ -r "$id_src" ]] || return 1
+
+    # Host kwarg set, via ast (no package import needed).
+    local host_args
+    host_args=$(python3 - "$id_src" <<'PY' 2>/dev/null
+import ast, sys
+mod = ast.parse(open(sys.argv[1]).read())
+for cls in ast.walk(mod):
+    if isinstance(cls, ast.ClassDef) and cls.name == "Identity":
+        for fn in cls.body:
+            if isinstance(fn, ast.FunctionDef) and fn.name == "__init__":
+                a = fn.args
+                names = [x.arg for x in a.args if x.arg != "self"] + [x.arg for x in a.kwonlyargs]
+                print(" ".join(sorted(names)))
+PY
+)
+    [[ -n "$host_args" ]] || return 1
+
+    # Baked kwarg set, introspected from the image (entrypoint bypassed).
+    local img_args
+    img_args=$(docker run --rm --entrypoint python3 "$base_ref" -c \
+        'import inspect; from autonomous_trust.core._python.identity.identity import Identity as I; p=inspect.signature(I.__init__).parameters; print(" ".join(sorted(x for x in p if x!="self")))' \
+        2>/dev/null)
+    [[ -n "$img_args" ]] || return 1
+
+    local a
+    for a in $host_args; do
+        case " $img_args " in
+            *" $a "*) ;;
+            *) return 0 ;;   # image missing a host kwarg -> stale
+        esac
+    done
+    return 1
+}
+
+# --- Inspector capability-merge freshness guard --------------------------
+# The inspector's bridge.py capability propagation was fixed to a per-cap
+# UNION merge, replacing a size-monotonic guard that silently dropped a
+# late-arriving capability delivered in a smaller partial view (the bug where
+# airquality_stream never subscribed). A *cached* inspector image built before
+# that fix redeploys the old code and reproduces the bug -- while looking like
+# a clean run, so a stale image can quietly invalidate a whole demo / probe
+# capture. This introspects the image that is about to deploy and confirms
+# bridge.py carries the fix (the 'caps_merge' probe counter, emitted only by
+# the merge path; the source is COPY'd into the image, so inspect.getsource
+# sees it).
+#
+# Conservative like base_image_identity_stale(): it blocks ONLY on a definitive
+# miss (image exists AND bridge.py lacks the marker). No image, no importable
+# source, or any introspection/docker error -> pass, so a launch is never
+# blocked on a false negative. Bypass entirely with AT_SKIP_INSPECTOR_GUARD=1.
+guard_inspector_image() {
+    local ref="$1"
+    [[ "${AT_SKIP_INSPECTOR_GUARD:-0}" == "1" ]] && return 0
+    docker image inspect "$ref" &>/dev/null || return 0   # nothing to check yet
+    local rc=0
+    docker run --rm -i --entrypoint python3 "$ref" - >/dev/null 2>&1 <<'PY' || rc=$?
+import sys
+try:
+    import inspect
+    import autonomous_trust.inspector.bridge as m
+    src = inspect.getsource(m)
+except Exception:
+    sys.exit(2)                       # uncertain: can't introspect -> don't block
+sys.exit(0 if "caps_merge" in src else 1)
+PY
+    case "$rc" in
+        0) return 0 ;;                # fix present -> good
+        1)                            # definitively stale -> block
+            err "Inspector image '$ref' is STALE: its bridge.py predates the"
+            err "    capability-merge fix (no 'caps_merge' path), so a late-arriving"
+            err "    capability such as airquality_stream can be silently dropped."
+            err "    This image would deploy old code and quietly invalidate the run."
+            if (( REBUILD == 1 )); then
+                err "    --rebuild was requested yet the image is still stale -> Docker"
+                err "    served a cached COPY layer. Force a clean rebuild, e.g.:"
+                err "        docker rmi '$ref' && $0 --variant=$VARIANT ... --rebuild"
+            else
+                err "    Rebuild so the working-tree bridge.py propagates:"
+                err "        $0 --variant=$VARIANT ... --rebuild"
+            fi
+            err "    (Set AT_SKIP_INSPECTOR_GUARD=1 to bypass this check intentionally.)"
+            exit 1
+            ;;
+        *) return 0 ;;                # rc 2 (uncertain) or docker error -> don't block
+    esac
+}
+
 # --- Image build chains (per variant) ------------------------------------
 # Builds anything missing in the *active* docker daemon (host or
 # cluster, depending on whether use_cluster_docker_env() was called
@@ -486,23 +750,29 @@ ensure_demo_images() {
             full_ref="${REGISTRY}autonomous-trust${IMAGE_TAG}"
             peer_ref="${REGISTRY}autonomous-trust-disaster${IMAGE_TAG}"
             inspector_ref="${REGISTRY}autonomous-trust-inspector${IMAGE_TAG}"
-            if ! docker image inspect "$full_ref" &>/dev/null; then
+            # --rebuild reaches the whole chain so source edits propagate;
+            # without --no-cache, unchanged layers stay cached (see the
+            # dod-mission branch below for the rationale).
+            if (( REBUILD == 1 )) || ! docker image inspect "$full_ref" &>/dev/null; then
                 log "Image $full_ref not found — building ..."
                 docker build "${build_args[@]}" -t "$full_ref" \
                     -f "$here/src/autonomous-trust/Dockerfile-native" "$here"
             fi
-            if ! docker image inspect "$peer_ref" &>/dev/null; then
+            if (( REBUILD == 1 )) || ! docker image inspect "$peer_ref" &>/dev/null; then
                 log "Image $peer_ref not found — building ..."
                 docker build --build-arg "BASE_IMAGE=$full_ref" \
                     "${build_args[@]}" -t "$peer_ref" \
                     -f "$here/src/autonomous-trust-evaluation/Dockerfile" "$here"
             fi
-            if ! docker image inspect "$inspector_ref" &>/dev/null; then
+            if (( REBUILD == 1 )) || ! docker image inspect "$inspector_ref" &>/dev/null; then
                 log "Image $inspector_ref not found — building ..."
                 docker build --build-arg "BASE_IMAGE=$full_ref" \
                     "${build_args[@]}" -t "$inspector_ref" \
                     -f "$here/src/autonomous-trust-inspector/Dockerfile" "$here"
             fi
+            # Whether just built or served from cache, the image that will
+            # deploy must carry the bridge.py capability-merge fix.
+            guard_inspector_image "$inspector_ref"
             ;;
         dod-mission)
             local base_ref inspector_ref demo_ref peer_ref
@@ -510,17 +780,43 @@ ensure_demo_images() {
             inspector_ref="${REGISTRY}autonomous-trust-inspector${IMAGE_TAG}"
             demo_ref="${REGISTRY}at-dod-mission-demo${IMAGE_TAG}"
             peer_ref="${REGISTRY}at-dod-mission-peer${IMAGE_TAG}"
-            if ! docker image inspect "$base_ref" &>/dev/null; then
+            # Preflight: a base image whose baked Identity predates the host
+            # source is the "all forming…/peers.all=0" trap (seeded peers
+            # TypeError at boot). Detect it and force a --no-cache base rebuild
+            # so the new identity.py is guaranteed to bake (a plain --rebuild
+            # omits --no-cache and can be served a stale COPY layer). REBUILD=1
+            # then cascades to the inspector/overlay images off the fresh base.
+            local base_cache_flag=()
+            if base_image_identity_stale "$base_ref"; then
+                log "WARNING: base image '$base_ref' Identity schema is OLDER than host source."
+                log "         Seeded peers would TypeError at boot -> reputations stuck 'forming…'."
+                log "         Forcing a --no-cache rebuild of the image chain."
+                REBUILD=1
+                base_cache_flag=(--no-cache)
+            fi
+            # --rebuild must reach the base + inspector images, not just the
+            # thin overlays below: the inspector image COPYs the frequently
+            # edited Python source (core, inspector, evaluation, services,
+            # simulator). Rebuilding only the dod overlay picks up new
+            # examples/ code that imports new library symbols while the
+            # inspector package underneath stays stale -> ImportError (e.g.
+            # narration_script.py importing NarrationAnchor before the
+            # inspector image carries it). These builds don't pass
+            # --no-cache, so when the source is unchanged Docker hits the
+            # layer cache and the forced rebuild is nearly free.
+            if (( REBUILD == 1 )) || ! docker image inspect "$base_ref" &>/dev/null; then
                 log "Building base image: $base_ref ..."
-                docker build --network host "${build_args[@]}" -t "$base_ref" \
+                docker build --network host "${base_cache_flag[@]}" "${build_args[@]}" -t "$base_ref" \
                     -f "$here/src/autonomous-trust/Dockerfile-native" "$here"
             fi
-            if ! docker image inspect "$inspector_ref" &>/dev/null; then
+            if (( REBUILD == 1 )) || ! docker image inspect "$inspector_ref" &>/dev/null; then
                 log "Building inspector image: $inspector_ref ..."
                 docker build --network host --build-arg "BASE_IMAGE=$base_ref" \
                     "${build_args[@]}" -t "$inspector_ref" \
                     -f "$here/src/autonomous-trust-inspector/Dockerfile" "$here"
             fi
+            # Same shared inspector image -> same stale-code risk; guard it.
+            guard_inspector_image "$inspector_ref"
             # The two dod overlays are thin COPY layers; --rebuild forces
             # them to pick up edits under examples/dod_mission/ that
             # Docker's content-addressed cache might otherwise miss.
@@ -535,6 +831,18 @@ ensure_demo_images() {
                 docker build --network host --build-arg "BASE_IMAGE=$base_ref" \
                     "${build_args[@]}" -t "$peer_ref" \
                     -f "$here/examples/dod_mission/deploy/Dockerfile-peer" "$here"
+            fi
+            # Embedded C at_demo image for --c-microdrones. Standalone build
+            # (Dockerfile-c is FROM debian, no BASE_IMAGE); needs network for
+            # apt, hence --network host. AT_C_IMAGE feeds generate_compose.py.
+            if [[ -n "$C_MICRODRONES" ]]; then
+                local c_ref="${REGISTRY}autonomous-trust-c${IMAGE_TAG}"
+                export AT_C_IMAGE="$c_ref"
+                if (( REBUILD == 1 )) || ! docker image inspect "$c_ref" &>/dev/null; then
+                    log "Building embedded C at_demo image: $c_ref ..."
+                    docker build --network host "${build_args[@]}" -t "$c_ref" \
+                        -f "$here/src/autonomous-trust/Dockerfile-c" "$here"
+                fi
             fi
             ;;
     esac
@@ -591,16 +899,32 @@ PY
                     >/dev/null \
                     || warn "simulator scenario generation failed (non-fatal)"
 
+                # --c-microdrones: render those microdrones as C at_demo nodes
+                # (+ flight-stub sidecar), pinned to the locally-built C image.
+                # Empty -> no C args, fully Python (back-compat default).
+                compose_c_args=()
+                if [[ -n "$C_MICRODRONES" ]]; then
+                    compose_c_args+=(--c-microdrones "$C_MICRODRONES"
+                                     --c-image "${AT_C_IMAGE:-${REGISTRY}autonomous-trust-c${IMAGE_TAG}}")
+                fi
+
                 log "Regenerating docker-compose.yml..."
                 # Module form (mirrors generate_k8s below). PYTHONPATH
                 # is exported at the top of this script, so `examples`
                 # resolves.
+                # Pin the image to the locally-built tag (e.g. :dev). Without
+                # this the compose defaults to the untagged DEMO_IMAGE, which
+                # Docker reads as :latest and then tries to PULL — failing with
+                # "pull access denied" since only the :dev tag exists locally.
+                # Mirrors the --image-tag the k8s generator already gets below.
                 python3 -m examples.dod_mission.deploy.generate_compose \
                     "$COMPOSE_FILE" \
+                    --image "${REGISTRY}at-dod-mission-demo${IMAGE_TAG}" \
                     --squad-size "$SQUAD_SIZE" \
                     --swarm-size "$SWARM_SIZE" \
                     --sensor-count "$SENSOR_COUNT" \
                     --hacked-sensors "$HACKED_SENSORS" \
+                    "${compose_c_args[@]+"${compose_c_args[@]}"}" \
                     || { err "compose generation failed"; exit 1; }
 
                 if [[ "${AT_PRESEED:-1}" == "1" ]]; then
@@ -615,14 +939,30 @@ PY
                     log "Seeding persistent-cohort dirs under .demo-state/dod-mission/ ..."
                     seed_force=""
                     [[ "${AT_PRESEED_FORCE:-0}" == "1" ]] && seed_force="--force"
+                    # On --reseed, clear root-owned container state first (see
+                    # reseed_wipe_state) so the fresh seed isn't shadowed by it.
+                    [[ -n "$seed_force" ]] && reseed_wipe_state "$here/.demo-state/dod-mission"
+                    # Seed C-format identities for the C microdrones so the SPEC
+                    # matches generate_compose.py exactly (a peer running the C
+                    # node must be seeded C, and vice-versa). No spaces in SPEC.
+                    seed_c_arg=""
+                    [[ -n "$C_MICRODRONES" ]] && seed_c_arg="--c-microdrones $C_MICRODRONES"
                     python3 -m tools.seed_dod_cohort \
                         --out .demo-state/dod-mission \
                         --squad-size "$SQUAD_SIZE" \
                         --swarm-size "$SWARM_SIZE" \
                         --sensor-count "$SENSOR_COUNT" \
                         --hacked-sensors "$HACKED_SENSORS" \
-                        $seed_force \
+                        $seed_force $seed_c_arg \
                         || { err "cohort seed failed"; exit 1; }
+                    if [[ "${AT_ZTA_PROVISION:-1}" == "1" ]]; then
+                        log "Provisioning ZTA mission CA + per-peer credentials ..."
+                        AT_SQUAD_SIZE="$SQUAD_SIZE" AT_SWARM_SIZE="$SWARM_SIZE" \
+                        AT_SENSOR_COUNT="$SENSOR_COUNT" AT_HACKED_SENSORS="$HACKED_SENSORS" \
+                        python3 -m tools.provision_zta_certs \
+                            --out-root .demo-state/dod-mission \
+                            || warn "ZTA provisioning failed (non-fatal; peers cold-bootstrap without ZTA)"
+                    fi
                 else
                     log "AT_PRESEED=0: skipping cohort seed (peers will cold-bootstrap)"
                 fi
@@ -649,18 +989,35 @@ PY
                     log "Seeding persistent-cohort dirs under .demo-state/dod-mission/ ..."
                     seed_force=""
                     [[ "${AT_PRESEED_FORCE:-0}" == "1" ]] && seed_force="--force"
+                    # On --reseed, clear root-owned container state first (see
+                    # reseed_wipe_state) so the fresh seed isn't shadowed by it.
+                    [[ -n "$seed_force" ]] && reseed_wipe_state "$here/.demo-state/dod-mission"
+                    # Seed C-format identities for the C microdrones so the SPEC
+                    # matches generate_k8s.py exactly (C Pod <-> C identity).
+                    seed_c_arg=""
+                    [[ -n "$C_MICRODRONES" ]] && seed_c_arg="--c-microdrones $C_MICRODRONES"
                     python3 -m tools.seed_dod_cohort \
                         --out .demo-state/dod-mission \
                         --squad-size "$SQUAD_SIZE" \
                         --swarm-size "$SWARM_SIZE" \
                         --sensor-count "$SENSOR_COUNT" \
                         --hacked-sensors "$HACKED_SENSORS" \
-                        $seed_force \
+                        $seed_force $seed_c_arg \
                         || { err "cohort seed failed"; exit 1; }
+                    if [[ "${AT_ZTA_PROVISION:-1}" == "1" ]]; then
+                        log "Provisioning ZTA mission CA + per-peer credentials ..."
+                        AT_SQUAD_SIZE="$SQUAD_SIZE" AT_SWARM_SIZE="$SWARM_SIZE" \
+                        AT_SENSOR_COUNT="$SENSOR_COUNT" AT_HACKED_SENSORS="$HACKED_SENSORS" \
+                        python3 -m tools.provision_zta_certs \
+                            --out-root .demo-state/dod-mission \
+                            || warn "ZTA provisioning failed (non-fatal; peers cold-bootstrap without ZTA)"
+                    fi
                     seed_root_arg="--seed-root .demo-state/dod-mission"
                 else
                     log "AT_PRESEED=0: skipping cohort seed (peers will cold-bootstrap)"
                 fi
+                k8s_c_arg=""
+                [[ -n "$C_MICRODRONES" ]] && k8s_c_arg="--c-microdrones $C_MICRODRONES"
                 log "Generating kubernetes manifests under $K8S_DIR ..."
                 python3 -m examples.dod_mission.deploy.generate_k8s \
                     --out "$K8S_DIR" \
@@ -673,7 +1030,7 @@ PY
                     --swarm-size "$SWARM_SIZE" \
                     --sensor-count "$SENSOR_COUNT" \
                     --hacked-sensors "$HACKED_SENSORS" \
-                    $seed_root_arg \
+                    $seed_root_arg $k8s_c_arg \
                     || { err "k8s manifest generation failed"; exit 1; }
             fi
             ;;
@@ -696,6 +1053,10 @@ prepare_tilt_env() {
             export _TILT_SENSOR_COUNT="$SENSOR_COUNT"
             export _TILT_HACKED_SENSORS="$HACKED_SENSORS"
             export _TILT_COMPROMISE_MODE="$COMPROMISE_MODE"
+            # Embedded-C microdrones: the tiltfile reads this, builds the
+            # autonomous-trust-c image, and threads the SPEC to generate_k8s +
+            # seed_dod_cohort. Empty => all-Python (back-compat).
+            export _TILT_C_MICRODRONES="$C_MICRODRONES"
             ;;
     esac
 }
@@ -714,10 +1075,43 @@ tilt_args() {
     printf '%s\n' "${args[@]}"
 }
 
+# --- Conda env gate -------------------------------------------------------
+# Every backend below shells out to the host `python3` (manifest generation,
+# cohort seeding, ZTA provisioning, the multi-agency playback/record nodes),
+# all of which expect the project's `autonomous_trust` conda env to be active
+# so the interpreter carries the AT deps. Matches the gating convention in
+# scripts/build-py.sh and scripts/scale-test-dod-mission.sh. --help and --clean
+# have already short-circuited above; --teardown only drives tilt/kubectl/
+# minikube and needs no AT python, so it is exempt.
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-autonomous_trust}"
+if [[ "$BACKEND_MODE" != "teardown" && "${CONDA_DEFAULT_ENV:-}" != "$CONDA_ENV_NAME" ]]; then
+    err "conda environment '$CONDA_ENV_NAME' is not active."
+    err "    Run: conda activate $CONDA_ENV_NAME"
+    exit 1
+fi
+
 # --- Tool preflight -------------------------------------------------------
 
 command -v docker  &>/dev/null || { err "docker not found"; exit 1; }
 command -v python3 &>/dev/null || { err "python3 not found"; exit 1; }
+
+# Ryu (d2s, JCS number formatting) is always linked into the native C library,
+# so its submodule must be present for every build path.
+ensure_submodule src/c/third_party/ryu src/c/third_party/ryu/ryu/d2s.c || exit 1
+
+# DTN transport submodules are only needed when the C build opts in
+# (AT_NET_DTN=ON with an ion/ud3tn backend — both OFF by default, so neither
+# run-demo.sh nor Dockerfile-native needs them). Fetch on request only; ION-DTN
+# in particular is a large clone. Set DEMO_INIT_DTN to ion, ud3tn, or all.
+case "${DEMO_INIT_DTN:-}" in
+    ion)        ensure_submodule src/c/third_party/ION-DTN || exit 1 ;;
+    ud3tn)      ensure_submodule src/c/third_party/ud3tn   || exit 1 ;;
+    all|1|true) ensure_submodule src/c/third_party/ION-DTN || exit 1
+                ensure_submodule src/c/third_party/ud3tn   || exit 1 ;;
+    ''|off|false|0|no) ;;
+    *) warn "Unrecognized DEMO_INIT_DTN='${DEMO_INIT_DTN}' (use ion|ud3tn|all); skipping DTN submodules" ;;
+esac
+
 if [[ "$BACKEND_MODE" == "tilt" ]]; then
     command -v tilt    &>/dev/null \
         || { err "tilt not found; install from https://docs.tilt.dev/"; exit 1; }
@@ -768,26 +1162,115 @@ if [[ "$BACKEND_MODE" == "teardown" ]]; then
     exit 0
 fi
 
-# --- Playback / record fast paths (multi-agency only) --------------------
+# --- Playback fast path (multi-agency only) ------------------------------
+# Canned-playback replays a recorded JSON with no AT runtime (host-side
+# demo.py). Recording is no longer a standalone host-side mode: a live run is
+# now hosted by the coordinator (an AT mesh node), so capture a recording by
+# running the coordinator with --record inside the deployed stack (future:
+# a --record-to flag mirroring dod-mission's).
 
 if [[ "$BACKEND_MODE" == "playback" ]]; then
     [[ -f "$PLAYBACK_FILE" ]] || { err "Playback file not found: $PLAYBACK_FILE"; exit 1; }
-    log "Inspector-only playback mode."
+    log "Canned-playback mode (no AT runtime)."
     export AT_DEMO_PLAYBACK_FILE="$PLAYBACK_FILE"
     exec python3 -m examples.multi_agency \
         --playback "$PLAYBACK_FILE" \
         --port "$INSPECTOR_PORT"
 fi
 
-if [[ "$BACKEND_MODE" == "record" ]]; then
-    [[ -n "$RECORD_FILE" ]] || { err "Missing --record FILE argument"; exit 1; }
-    mkdir -p "$(dirname -- "$RECORD_FILE")"
-    log "Inspector-only recording mode."
-    log "    Output: $RECORD_FILE (written on Ctrl-C)"
-    exec python3 -m examples.multi_agency \
-        --record "$RECORD_FILE" \
-        --port "$INSPECTOR_PORT" \
-        --log-level "$LOG_LEVEL"
+# --- Log-harvest fast path (multi-agency only) ---------------------------
+# Reputation debug lens: reconstruct the observer->subject matrix by tailing
+# a RUNNING mesh's container/pod logs (nodes must have been started with
+# AT_REP_DUMP_SEC set — the compose/k8s generators forward it host->container
+# when it's set on the host). The harvester (python -m examples.multi_agency
+# --log-harvest) is launched as a MANAGED BACKGROUND SUBPROCESS — not exec'd —
+# so this script keeps its EXIT/INT/TERM traps and reaps the subprocess (and
+# any stale host-side leftovers) on the way out. It does NOT bring the mesh
+# up or down; that stays with --compose / --k8s / --tilt.
+
+if [[ "$BACKEND_MODE" == "log-harvest" ]]; then
+    # Default the lens dashboard to 8060 so it doesn't collide with the
+    # coordinator's own dashboard on 8050 unless --port was given.
+    (( PORT_EXPLICIT == 1 )) || INSPECTOR_PORT=8060
+
+    case "$HARVEST_RUNTIME" in
+        docker) ;;  # docker already preflighted above
+        k8s)
+            command -v kubectl &>/dev/null \
+                || { err "kubectl not found (needed for --runtime k8s)"; exit 1; } ;;
+        *)  err "Unknown --runtime '$HARVEST_RUNTIME' (use docker | k8s)"; exit 1 ;;
+    esac
+
+    # The python entrypoint's --log-level choices don't include 'verbose'.
+    hlevel="$LOG_LEVEL"; [[ "$hlevel" == "verbose" ]] && hlevel="debug"
+
+    harvest_args=(-m examples.multi_agency --log-harvest
+                  --runtime "$HARVEST_RUNTIME"
+                  --port "$INSPECTOR_PORT"
+                  --log-level "$hlevel")
+    [[ "$HARVEST_RUNTIME" == "k8s" && -n "$NAMESPACE" ]] \
+        && harvest_args+=(--namespace "$NAMESPACE")
+    [[ -n "$HARVEST_CONTAINERS" ]] && harvest_args+=(--containers "$HARVEST_CONTAINERS")
+
+    log "Reputation log-harvest lens ($HARVEST_RUNTIME; host-side, no AT runtime)."
+    log "    Mesh must be running with AT_REP_DUMP_SEC set, e.g.:"
+    log "      AT_REP_DUMP_SEC=2 $0 --variant=multi-agency --compose"
+    log "    If nothing renders, confirm the nodes are emitting AT_REPDUMP lines:"
+    if [[ "$HARVEST_RUNTIME" == "k8s" ]]; then
+        log "      kubectl logs -n ${NAMESPACE:-<ns>} <pod> | grep AT_REPDUMP"
+    else
+        log "      docker logs noaa-sensor-1 | grep AT_REPDUMP"
+    fi
+
+    cleanup_inspector_procs   # clear any stale harvester on the port
+    log "Launching harvester subprocess: python3 ${harvest_args[*]}"
+    python3 "${harvest_args[@]}" &
+    HARVEST_PID=$!
+
+    # Managed subprocess: EXIT reaps it; INT/TERM just exit so the signal
+    # propagates and the EXIT trap runs the cleanup once.
+    trap 'kill "$HARVEST_PID" 2>/dev/null || true; \
+          wait "$HARVEST_PID" 2>/dev/null || true; \
+          cleanup_inspector_procs' EXIT
+    trap 'echo; log "Stopping harvester..."; exit 130' INT
+    trap 'echo; log "Stopping harvester..."; exit 143' TERM
+
+    harvest_url="http://localhost:$INSPECTOR_PORT/"
+    log "Waiting for harvest dashboard at $harvest_url ..."
+    if wait_for_http "$harvest_url" 120 "harvest dashboard" "$INSPECTOR_PORT"; then
+        open_browser "$harvest_url"
+    else
+        warn "Harvest dashboard did not respond within 120s."
+        warn "    Check the subprocess above imported cleanly (dash/plotly present)."
+    fi
+
+    echo ""
+    log "--- Harvesting (subprocess PID $HARVEST_PID). Ctrl-C to stop. ---"
+    # Hold the foreground on the subprocess; if it dies on its own, fall
+    # through so the EXIT trap cleans up.
+    wait "$HARVEST_PID"
+    exit 0
+fi
+
+# --- Triage fast path (multi-agency only) --------------------------------
+# One-shot read of a RUNNING mesh's logs -> per-subject exclusion triage
+# table, then exit. No dashboard, no background process (exec is fine —
+# it reads and returns). Same runtime/selection knobs as --log-harvest.
+
+if [[ "$BACKEND_MODE" == "triage" ]]; then
+    case "$HARVEST_RUNTIME" in
+        docker) ;;
+        k8s)
+            command -v kubectl &>/dev/null \
+                || { err "kubectl not found (needed for --runtime k8s)"; exit 1; } ;;
+        *)  err "Unknown --runtime '$HARVEST_RUNTIME' (use docker | k8s)"; exit 1 ;;
+    esac
+    triage_args=(-m examples.multi_agency --triage --runtime "$HARVEST_RUNTIME")
+    [[ "$HARVEST_RUNTIME" == "k8s" && -n "$NAMESPACE" ]] \
+        && triage_args+=(--namespace "$NAMESPACE")
+    [[ -n "$HARVEST_CONTAINERS" ]] && triage_args+=(--containers "$HARVEST_CONTAINERS")
+    log "One-shot reputation exclusion triage ($HARVEST_RUNTIME) ..."
+    exec python3 "${triage_args[@]}"
 fi
 
 # --- Manifest generation (compose/k8s only) ------------------------------
@@ -808,16 +1291,23 @@ case "$BACKEND_MODE" in
         if [[ "$VARIANT" == "multi-agency" || "$VARIANT" == "dod-mission" ]]; then
             ensure_minikube_running
             if (( NO_BUILD == 0 )); then
-                # Both k8s scenario variants now use Tilt's native
-                # docker_build, which caches by input-content hash and
-                # doesn't notice when the user `docker rmi`s the image
-                # out from under it. Preflight against the cluster's
-                # daemon so a `rmi + relaunch` always produces a fresh
-                # build, and seed the chain so the Dockerfile FROM
-                # references resolve to local :dev tags.
-                log "Preflight image check ..."
+                # Switch to the cluster's daemon so Tilt's docker_build lands
+                # where the pods pull from.
                 use_cluster_docker_env
-                ensure_demo_images
+                # Both scenario tiltfiles now wire BASE_IMAGE per image, so
+                # Tilt owns the whole FROM chain (base -> inspector -> demo/peer,
+                # base -> disaster/inspector) and rebuilds on content change.
+                # Pre-seeding here just built every image a second time (Tilt
+                # rebuilds them all on `up`), so it's skipped — matching the
+                # python/c variants which never pre-build.
+                #
+                # NOTE (trade-off): this drops the old preflight's two side
+                # effects — (1) forcing a fresh build after a `docker rmi`
+                # (Tilt's content-hash cache doesn't notice a daemon-side rmi),
+                # and (2) the dod-mission base_image_identity_stale guard.
+                # Tilt's content-hash caching rebuilds when the copied source
+                # changes, so a normal edit is covered; a manual `rmi`
+                # mid-session may need `tilt trigger` / `--rebuild`.
             fi
         fi
 
@@ -842,6 +1332,7 @@ case "$BACKEND_MODE" in
               kill $TILT_PID 2>/dev/null || true; \
               wait $TILT_PID 2>/dev/null || true; \
               tilt down -- $_ta_down &>>"$TILT_LOG" || true; \
+              reap_namespace_fast; \
               cleanup_inspector_procs' EXIT
         trap 'echo; log "Stopping Tilt..."; exit 130' INT
         trap 'echo; log "Stopping Tilt..."; exit 143' TERM
@@ -864,6 +1355,11 @@ case "$BACKEND_MODE" in
             log "Waiting for tilt to build images + roll out coordinator ..."
             log "    (this can take 5-15min on a cold cluster; tail -f $TILT_LOG)"
             wait_for_deployment "$NAMESPACE" "dod-coordinator" 1500 \
+                || warn "Coordinator deployment did not become Available."
+        elif [[ "$VARIANT" == "multi-agency" ]]; then
+            log "Waiting for tilt to build images + roll out coordinator ..."
+            log "    (this can take 5-15min on a cold cluster; tail -f $TILT_LOG)"
+            wait_for_deployment "$NAMESPACE" "multi-agency-coordinator" 1500 \
                 || warn "Coordinator deployment did not become Available."
         fi
 
@@ -938,7 +1434,7 @@ case "$BACKEND_MODE" in
         else
             warn "Inspector did not respond within 180s; opening anyway."
             case "$VARIANT" in
-                multi-agency) warn "  docker logs multi-agency-inspector";;
+                multi-agency) warn "  docker logs multi-agency-coordinator";;
                 dod-mission)  warn "  docker compose -f $COMPOSE_FILE logs -f coordinator";;
             esac
             open_browser "http://localhost:$INSPECTOR_PORT/"
@@ -948,7 +1444,7 @@ case "$BACKEND_MODE" in
         log "--- Running. Ctrl-C to stop ---"
         case "$VARIANT" in
             multi-agency)
-                log "Inspector logs: docker logs -f multi-agency-inspector"
+                log "Coordinator logs: docker logs -f multi-agency-coordinator"
                 trap '(cd "$DEPLOY_DIR" && docker compose down) || true; \
                       cleanup_inspector_procs' EXIT
                 ;;
@@ -986,8 +1482,8 @@ case "$BACKEND_MODE" in
         # name and the NodePort service name; both are captured here.
         case "$VARIANT" in
             multi-agency)
-                inspector_deploy="multi-agency-inspector"
-                inspector_svc="multi-agency-inspector"
+                inspector_deploy="multi-agency-coordinator"
+                inspector_svc="multi-agency-coordinator"
                 ;;
             dod-mission)
                 inspector_deploy="dod-coordinator"

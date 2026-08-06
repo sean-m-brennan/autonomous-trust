@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #  Licensed under the Apache License, Version 2.0
 # ******************
 """DoD mission demo participant node.
@@ -364,20 +364,78 @@ class DoDMissionParticipant(AutonomousTrust):
         # with no role-specific data source (soldier, command-node,
         # fighter-jet) still get a DataProcess so the service is
         # available, but with no bundle attached it just no-ops.
+        # Shared epoch for cross-peer timestamp alignment in the
+        # sensor-comparison charts.  See DoDDataProcess docstring. Computed
+        # before _build_generators so the detection pose-provider closure
+        # (_detection_pose_provider) can replay this peer's scenario path on
+        # the same clock the emitted readings are stamped against.
+        self._t0_epoch = float(os.environ.get("AT_DEMO_T0_EPOCH")
+                               or time.time())
+
         self.generators = self._build_generators()
 
-        # Shared epoch for cross-peer timestamp alignment in the
-        # sensor-comparison charts.  See DoDDataProcess docstring.
-        t0_epoch = float(os.environ.get("AT_DEMO_T0_EPOCH") or time.time())
         self.add_worker(DoDDataProcess,
                         generators=self.generators,
-                        t0_epoch=t0_epoch)
+                        t0_epoch=self._t0_epoch)
 
         logger.info("Participant %s initialized: role=%s, generators=%s, "
                     "compromised=%s, forgery_mode=%s",
                     peer_name, self.role.kind,
                     type(self.generators).__name__ if self.generators else "none",
                     compromised, forgery_mode)
+
+    def _detection_pose_provider(self, kind, roster_latlon):
+        """Return a callable ``() -> (lat, lon) | None`` yielding this peer's
+        live pose each tick, or ``None`` to keep the stationary roster pose.
+
+        Resolution order:
+
+        1. An explicit ``self._pose_provider`` (e.g. a real simulator feed set
+           on the instance) always wins.
+        2. **Microdrones** get live motion *on by default*: a closure that
+           replays this peer's own deterministic scenario path locally — no
+           simulator dependency — so its ~350 m forward FOV sweeps onto the
+           target compound as it advances from the insertion LZ to the
+           objective (T+1:00..T+7:00). The pose is read from this
+           participant's own ``scenario`` instance (built from the same roster
+           knobs the coordinator uses), driven by ``self._t0_epoch`` — the
+           shared demo clock the emitted readings are also stamped against, so
+           visibility timing lines up with the rest of the timeline. Opt out
+           with ``AT_DETECTION_LIVE_MOTION=0`` to restore the stationary v1.
+        3. Every other role keeps the stationary roster pose (``None``); the
+           RQ-86s orbit overhead (bearing-irrelevant) and the MQ-800 uses its
+           DETECTION_VIEW_CENTER_OVERRIDE.
+        """
+        explicit = getattr(self, "_pose_provider", None)
+        if explicit is not None:
+            return explicit
+        if kind != "microdrone":
+            return None
+        if os.environ.get("AT_DETECTION_LIVE_MOTION", "1") == "0":
+            return None
+
+        scenario = self.scenario
+        peer_name = self.peer_name
+        epoch = self._t0_epoch
+
+        def _pose():
+            # Replay the scenario movement model to this peer's live position.
+            # _update_positions is pure movement (no phase-event side effects),
+            # mutating scenario.peers[*].position in place; we read our own.
+            try:
+                t = timedelta(seconds=time.time() - epoch)
+                scenario._update_positions(t)
+                role = scenario.peers.get(peer_name)
+                pos = getattr(role, "position", None)
+                if pos is None:
+                    return None
+                return (pos.lat, pos.lon)
+            except Exception:  # a flaky pose source must not crash the sensor
+                logger.debug("detection pose provider failed for %s",
+                             peer_name, exc_info=True)
+                return None
+
+        return _pose
 
     def _maybe_add_detection(self, bundle, kind, roster_latlon):
         """Attach a DetectionSource alongside a drone-role bundle.
@@ -391,11 +449,23 @@ class DoDMissionParticipant(AutonomousTrust):
         compound-alpha's bucket.
         """
         view_override = DETECTION_VIEW_CENTER_OVERRIDE.get(self.peer_name)
+        # Arrival gate: a late joiner (the MQ-800 at join_phase 4 / T+4:00)
+        # must not emit — or be cross-validated — before it is on the network.
+        # Derive the threshold from the peer's join-phase start, mirroring
+        # scenario.peer_arrived; pre-established emitters (join_phase 0) get
+        # 0.0 and are unaffected.
+        arrival_sec = 0.0
+        jp = getattr(self.role, "join_phase", 0)
+        phases = getattr(self.scenario, "_phases", None)
+        if jp and phases and 0 <= jp < len(phases):
+            arrival_sec = phases[jp].start.total_seconds()
         ds = build_detection_source(
             peer_name=self.peer_name,
             role=kind,
             roster_latlon=roster_latlon,
             view_center_override_latlon=view_override,
+            active_after_sec=arrival_sec,
+            pose_provider=self._detection_pose_provider(kind, roster_latlon),
         )
         if ds is None:
             return bundle
@@ -520,6 +590,83 @@ class DoDMissionParticipant(AutonomousTrust):
         pass
 
 
+def _attach_zta_credential(cfg_dir: str) -> None:
+    """Bind a provisioned ZTA credential to this peer's identity.
+
+    ``tools/provision_zta_certs.py`` writes ``zta_credential.der`` into each
+    peer's config dir — a mission-CA-signed cert for legitimate peers, or a
+    rogue/absent credential for the hacked leave-behind sensors. Loading it
+    onto the identity here means the peer's announce carries it, so the
+    welcoming committee's ZTA gate (idprocess.welcoming_committee) verifies it
+    at admission against the receiver's ``zta_policy`` — rejecting the forged
+    sensors at the identity layer instead of merely flooring them on the
+    dashboard. No-op when no credential file is present (ZTA-disabled runs).
+
+    Also signs the credential->identity **binding** when the provisioned private key
+    is present (``zta_credential.key.pem``). That has to happen here rather than at
+    provisioning time: the signed pre-image names this node's uuid and signing key,
+    which do not exist until the identity is first minted. Under
+    ``binding_mode: require`` a credential with no binding is refused, so a forged
+    credential — provisioned deliberately without a key — cannot be presented at all.
+    """
+    cred_file = Path(cfg_dir) / "zta_credential.der"
+    if not cred_file.is_file():
+        return
+    from autonomous_trust.core.identity import Identity  # local: heavy import
+    id_file = Path(cfg_dir) / ("identity" + Identity.file_ext)
+    if not id_file.is_file():
+        return
+    try:
+        ident = Identity.from_file(str(id_file))
+        ident.zta_credential = cred_file.read_bytes()
+        ident.zta_credential_binding = _sign_zta_binding(
+            cfg_dir, ident, ident.zta_credential)
+        # The primary also travels in the repeated field, which is the only place a
+        # binding fits on the wire (identity.proto field 16).
+        ident.zta_credentials = [{'der': ident.zta_credential,
+                                  'binding': ident.zta_credential_binding,
+                                  'issuer': ident.zta_issuer}]
+        ident.to_file(str(id_file))
+        logger.info("Attached ZTA credential (%d bytes, binding %s) to identity in %s",
+                    len(ident.zta_credential),
+                    "signed" if ident.zta_credential_binding else "ABSENT",
+                    cfg_dir)
+    except Exception:
+        logger.warning("Failed to attach ZTA credential from %s", cred_file,
+                       exc_info=True)
+
+
+def _sign_zta_binding(cfg_dir: str, ident, cred: bytes) -> bytes:
+    """Sign this node's credential->identity binding, or return b'' if it cannot.
+
+    Returns empty (never raises) when no private key was provisioned — the forged
+    leave-behind sensors, and any peer whose credential lives on a smartcard. That is
+    a legitimate state to be in, and the admission gate decides what it costs.
+    """
+    key_file = Path(cfg_dir) / "zta_credential.key.pem"
+    if not key_file.is_file() or not cred:
+        return b""
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+        from autonomous_trust.core.identity.zta_binding import zta_binding_preimage
+        key = serialization.load_pem_private_key(key_file.read_bytes(),
+                                                 password=None)
+        pre = zta_binding_preimage(ident, cred)
+        if isinstance(key, ec.EllipticCurvePrivateKey):
+            return key.sign(pre, ec.ECDSA(hashes.SHA256()))
+        if isinstance(key, rsa.RSAPrivateKey):
+            # PKCS#1 v1.5 + SHA-256, matching what PivVerifier._verify_signature
+            # accepts on the far side; a mismatch here verifies nowhere.
+            return key.sign(pre, padding.PKCS1v15(), hashes.SHA256())
+        logger.warning("Unsupported ZTA credential key type %s; no binding signed",
+                       type(key).__name__)
+        return b""
+    except Exception:
+        logger.warning("Failed to sign ZTA binding from %s", key_file, exc_info=True)
+        return b""
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -565,6 +712,7 @@ def main():
     os.makedirs(dat_dir, exist_ok=True)
 
     generate_identity(cfg_dir, preserve=True, defaults=True)
+    _attach_zta_credential(cfg_dir)
 
     # Build the scenario from the same env-var knobs the coordinator uses,
     # so all peers agree on the peer roster (squad_size, swarm_size, ...).
@@ -609,4 +757,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # Default to forkserver: 'fork' (Linux default through 3.13) forks a
+    # multi-threaded process and can deadlock the child. Harmless on 3.14+.
+    import multiprocessing as _mp
+    _mp.set_start_method('forkserver', force=True)
     main()

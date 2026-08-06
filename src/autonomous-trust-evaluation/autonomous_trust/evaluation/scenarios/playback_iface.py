@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -314,10 +314,15 @@ class PlaybackInterface(ScenarioInterface):
                 desc = (f"[live] {observer} ↔ {subject} trust "
                         f"= {score:.2f}")
                 name = subject
-            elif tag == "ping" and len(ev) >= 3:
+            elif tag == "ping_at" and len(ev) >= 3:
+                # ("ping_at", name, rtt_ms, loss_pct, count, wall_t) — loss is
+                # worth annotating: an average rtt alone reads the same whether
+                # a peer answered every ping or one in five.
                 name = str(ev[1])
                 rtt = float(ev[2])
                 desc = f"[live] {name} rtt = {rtt:.0f}ms"
+                if len(ev) >= 4 and float(ev[3]) > 0.0:
+                    desc += f", loss = {float(ev[3]):.0f}%"
             elif tag == "reading":
                 # Streams fire ~1 Hz per peer per data_type — would
                 # drown the timeline event log. Handlers above already

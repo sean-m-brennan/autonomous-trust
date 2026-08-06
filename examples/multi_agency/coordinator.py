@@ -1,3 +1,19 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+# ******************
+
 """
 Multi-agency demo coordinator / inspector node.
 
@@ -27,8 +43,32 @@ from autonomous_trust.core.network import Message
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
 from autonomous_trust.core.reputation.reputation import TransactionScore
 from autonomous_trust.core.system import queue_cadence, now
+from autonomous_trust.inspector.transitive_trust import (
+    TransitiveTrustMixin, PEER_PAIR_QUERY_SEC)
 from autonomous_trust.evaluation.scenarios.recording import EventRecorder
 from autonomous_trust.services.data import Reading
+
+# Push-delta for reputation/pair tuple emission — mirrors the bridge's
+# REPUTATION_PUSH_DELTA so the coordinator-hosted UI sees the same debounced
+# stream the standalone bridge produced.
+REPUTATION_PUSH_DELTA = 0.05
+
+
+def _roster_name_of(peer):
+    """Bare roster name for a peer == the local-part of its ONLINE nickname.
+
+    The online nickname (e.g. ``noaa-1@tekfive.com``) is the only globally-
+    consistent, wire-carried name; the local petname is deliberately arbitrary
+    (a random suffix is minted on receipt -- see identity.derive_local_petname)
+    and must NOT be used to match a peer to its scenario role. Strip the
+    ``@domain`` to recover the deployment-set AT_PEER_NAME (``noaa-1``). Accepts
+    a raw ``Identity`` (``.nickname``) or a peer wrapper exposing ``.identity``,
+    and tolerates a nickname with no ``@``."""
+    ident = getattr(peer, "identity", None) or peer
+    nn = (getattr(ident, "nickname", None)
+          or getattr(peer, "nickname", None) or "")
+    return str(nn).split('@', 1)[0].strip()
+
 
 try:
     from autonomous_trust.inspector.peer.daq import Cohort, CohortTracker
@@ -137,7 +177,7 @@ try:
                             msg, block=True, timeout=self.q_cadence)
                         self.logger.info(
                             "DiagDataRcvr: subscribed to %s",
-                            getattr(ident, "nickname", ident))
+                            _roster_name_of(ident) or ident)
                 try:
                     message = queues[self.name].get(
                         block=True, timeout=self.q_cadence)
@@ -191,10 +231,12 @@ except ImportError as _exc:
 # Dashboard imports — PYTHONPATH=/app:... in the demo image (see
 # deploy/Dockerfile), so the package-qualified imports work directly.
 from examples.multi_agency.scenario import DisasterResponseScenario  # noqa: E402
-from examples.multi_agency.dashboard.multi_agency_app import (  # noqa: E402
-    build_dashboard,
-)
-from examples.multi_agency.dashboard import live_server  # noqa: E402
+# NOTE: the coordinator now HOSTS the full demo.py dashboard in-process
+# (feeding it the same bridge-tuple stream the standalone inspector's bridge
+# subprocess used to produce), rather than the older, simpler live_server
+# dashboard. MultiAgencyDemo + PlaybackInterface are imported LAZILY inside
+# init_tasking so merely importing this module (e.g. from a unit test) does
+# not drag in the whole Dash / dash_components stack.
 from examples.multi_agency.tasks.validation import (  # noqa: E402
     ALL_VALIDATORS,
 )
@@ -273,7 +315,7 @@ def _reading_from_dict(d: dict) -> Reading:
     )
 
 
-class MultiAgencyCoordinator(AutonomousTrust):
+class MultiAgencyCoordinator(TransitiveTrustMixin, AutonomousTrust):
     """Coordinator node for the multi-agency disaster response demo.
 
     Extends AutonomousTrust with:
@@ -298,11 +340,6 @@ class MultiAgencyCoordinator(AutonomousTrust):
         self._reputation_cache: dict[str, float] = {}
         self._anomaly_log: list[dict] = []
         self._tick_count = 0
-        self._latest_state: dict = {
-            "reputations": {},
-            "tiers": {},
-            "tick": 0, "phase": None,
-        }
         # nickname -> tier int (so _render_reputations can show both)
         self._tier_cache: dict[str, int] = {}
         # Prior cycle's tier_cache snapshot — used to detect demotions
@@ -331,7 +368,20 @@ class MultiAgencyCoordinator(AutonomousTrust):
         # peer could subscribe to the same drain and re-run them.
         self.validators = list(ALL_VALIDATORS)
 
-        self._panels = build_dashboard(scenario)
+        # --- Hosted dashboard plumbing -------------------------------------
+        # The coordinator now hosts demo.py's MultiAgencyDemo in a daemon
+        # thread. It feeds that UI the exact 4 bridge-tuple shapes the
+        # standalone inspector's bridge subprocess used to emit, pushed into
+        # this in-process queue (drained by the demo's PlaybackInterface each
+        # Dash tick). No separate AT observer node — the coordinator IS the
+        # mesh participant, and the UI reads its in-process state.
+        self._ui_queue: queue.Queue = queue.Queue(maxsize=100000)
+        self._demo: MultiAgencyDemo | None = None
+        # Push-delta gating state (mirrors bridge.py): only emit a
+        # reputation/pair tuple when the value moved by >= REPUTATION_PUSH_DELTA.
+        self._seen_peers: set[str] = set()
+        self._last_rep: dict[str, float] = {}
+        self._last_pair: dict[tuple[str, str], float] = {}
 
         super().__init__(silent=True, **kwargs)
 
@@ -372,41 +422,73 @@ class MultiAgencyCoordinator(AutonomousTrust):
         # construction time. Default-OK when no provider attached
         # (playback mode without a live coord) so existing recordings
         # replay unmodified.
-        scenario._tier_view_provider = lambda: dict(self._tier_cache)
+        # The rank-gate now runs in the hosted demo's engine thread (it drives
+        # scenario.advance_to), while _tier_cache is mutated in the
+        # coordinator's AT thread. Expose an atomically-rebound snapshot rather
+        # than the live dict so the gate never iterates a dict mid-mutation.
+        self._tier_snapshot: dict[str, int] = {}
+        scenario._tier_view_provider = lambda: self._tier_snapshot
         self._install_negotiation_gate(scenario)
 
     # -- AT lifecycle ---------------------------------------------------
 
     def init_tasking(self, queues):
-        """Called once before the main loop starts."""
+        """Called once before the main loop starts.
+
+        Spin up demo.py's full Dash dashboard in a daemon thread. It is
+        driven by a PlaybackInterface in LIVE mode whose ``bridge_queue`` is
+        this coordinator's in-process ``_ui_queue`` — so the tuples the
+        coordinator pushes (peer_seen/reputation/rep_pair/reading) drive the
+        same UI-derived state the standalone bridge subprocess used to feed.
+        The demo's PlaybackEngine owns the scenario clock (it shares this
+        coordinator's ``scenario`` instance and advances it), so the
+        coordinator no longer advances the clock itself — it only reads
+        ``scenario.current_phase`` (via the rank-gate's tier view). The thread
+        is a daemon; it dies with the process, so cleanup() need not join it.
+        """
         logger.info("Multi-agency coordinator starting (compromise_mode=%s, %d peers)",
                     self._compromise_mode, len(self.scenario.peers))
         if self._record_path:
             logger.info("Recording events to %s", self._record_path)
-        live_server.start_in_thread(
-            name="examples.multi_agency.coordinator",
-            title=self.scenario.name,
-            panels=self._panels,
-            chart_keys=["temperature_chart", "wind_chart"],
-            state_provider=lambda: self._latest_state,
-            port=self._dashboard_port,
+        # Lazy import: keeps the Dash / dash_components stack off the module
+        # import path (unit tests import this coordinator without a display).
+        from examples.multi_agency.demo import MultiAgencyDemo
+        from autonomous_trust.evaluation.scenarios.playback_iface import (
+            PlaybackInterface,
         )
+        # record_file=None on the hosted demo: canned-playback recording is
+        # the coordinator's own EventRecorder job (see _on_scenario_event /
+        # _feed_timeline / submit_reading_for_validation), not the demo's.
+        iface = PlaybackInterface(self.scenario, bridge_queue=self._ui_queue)
+        self._demo = MultiAgencyDemo(iface, port=self._dashboard_port)
+        threading.Thread(
+            target=self._demo.run,
+            name="multi-agency-dashboard",
+            daemon=True,
+        ).start()
         logger.info("Dashboard serving on :%d", self._dashboard_port)
 
     def autonomous_tasking(self, queues):
-        """Called each tick — drains readings, fires validators,
-        submits TSs, queries reputations, advances scenario clock.
+        """Called each tick — drains readings, fires validators, submits TSs,
+        queries reputations, and emits the UI tuple stream. The scenario clock
+        is advanced by the hosted demo's PlaybackEngine, not here.
         """
         self._tick_count += 1
+        self._task_queues = queues
         self._drain_peer_readings(queues)
         # Query reputation every ~30s (60 ticks at the 500ms cadence
-        # multi-agency assumes).
+        # multi-agency assumes), then emit the per-subject consensus tuples.
         if self._tick_count % 60 == 0:
             self._query_reputations(queues)
-        # Advance scenario clock + push dashboard update every 10 ticks.
-        if self._tick_count % 10 == 0:
-            self._advance_scenario_clock()
-            self._push_dashboard_update()
+        # Peer-of-peer (transitive) trust: ask each observer for its view of
+        # every other subject (TransitiveTrustMixin). Replies land in
+        # self.latest_reputation_pairs (automate.py); _emit_rep_pairs turns
+        # them into the demo's rep_pair stream (Trust Network edges + the
+        # consensus-sourced Trust-Dynamics timeline). O(N^2), so kept on its
+        # own ~60s cadence, off the 60-tick direct-query cadence.
+        if self._tick_count % max(1, int(PEER_PAIR_QUERY_SEC / 0.5)) == 0:
+            self.query_peer_pairs(queues, logger=logger)
+        self._emit_rep_pairs()
 
     def cleanup(self):
         """Flush the event log on shutdown."""
@@ -454,30 +536,74 @@ class MultiAgencyCoordinator(AutonomousTrust):
             "Negotiation phase not found in scenario; rank-gate not installed")
 
     def _on_scenario_event(self, event):
-        """Forward scenario events to the event log + playback record."""
-        try:
-            self._panels["event_log"].add_from_scenario_event(event)
-        except Exception:
-            logger.exception("Failed to forward scenario event to dashboard")
+        """Record scenario events for canned playback.
+
+        Display is the hosted demo's job (its own PlaybackInterface
+        subscribes to the shared scenario's events and drains the event-log
+        tail). The coordinator only persists them into the recording sidecar
+        so a captured run replays with the full scripted timeline.
+        """
         if self._event_recorder is not None:
             self._event_recorder.record(event)
 
-    def _advance_scenario_clock(self) -> None:
-        """Tick the scenario forward to (now - tasking_start).
+    # NOTE: the scenario clock is advanced by the hosted demo's PlaybackEngine
+    # (LIVE mode calls scenario.advance_to each Dash tick on the shared
+    # scenario instance). The coordinator therefore no longer advances it; the
+    # Negotiation rank-gate still fires because it reads the live tier view
+    # (_tier_view_provider) the coordinator keeps updating in _query_reputations.
 
-        Mirror of DoD's _advance_scenario_clock — without this the
-        scenario never leaves Formation in live mode and the dashboard
-        phase indicator + the Negotiation rank-gate are never
-        consulted.
+    def _emit_ui(self, tup: tuple) -> None:
+        """Push one bridge-shaped tuple to the hosted demo's UI queue.
+
+        Best-effort: drop silently if the queue is somehow full so the AT
+        tasking loop never blocks on the UI. Matches the standalone bridge's
+        fire-and-forget _push semantics.
         """
         try:
-            t = now() - self.tasking_start
-        except Exception:
+            self._ui_queue.put_nowait(tup)
+        except queue.Full:
+            pass
+
+    def _feed_event_log(self, record: dict) -> None:
+        """Surface a coordinator-produced record (validator anomaly, tier
+        loss) in the hosted demo's Event Log. Scripted scenario events reach
+        the log via the demo's own scenario subscription; these are the
+        emergent, coordinator-only records that would otherwise be invisible.
+        Best-effort and None-safe (demo may not be up yet at the first tick).
+        """
+        demo = self._demo
+        if demo is None:
             return
         try:
-            self.scenario.advance_to(t)
+            demo._event_log_panel.add_from_event_record(record)  # noqa: SLF001
         except Exception:
-            logger.exception("scenario.advance_to(%s) failed", t)
+            logger.exception("Failed to feed event-log record to demo")
+
+    def _emit_rep_pairs(self) -> None:
+        """Emit rep_pair tuples for any bilateral (observer→subject) score
+        that moved since last emit. Mirrors bridge.py's rep_pair path so the
+        demo's Trust Network graph + consensus timeline are fed identically.
+        """
+        pairs = getattr(self, "latest_reputation_pairs", None)
+        if not pairs:
+            return
+        peers_by_uuid = {str(p.uuid): p for p in self.peers.all} \
+            if self.peers is not None else {}
+        for (obs_uuid, sub_uuid), rep in list(pairs.items()):
+            try:
+                score = float(getattr(rep, "score", rep))
+            except (TypeError, ValueError):
+                continue
+            key = (str(obs_uuid), str(sub_uuid))
+            prev = self._last_pair.get(key)
+            if prev is not None and abs(prev - score) < REPUTATION_PUSH_DELTA:
+                continue
+            self._last_pair[key] = score
+            obs = peers_by_uuid.get(str(obs_uuid))
+            sub = peers_by_uuid.get(str(sub_uuid))
+            obs_name = _roster_name_of(obs) or str(obs_uuid)[:8]
+            sub_name = _roster_name_of(sub) or str(sub_uuid)[:8]
+            self._emit_ui(("rep_pair", obs_name, sub_name, score))
 
     def _drain_peer_readings(self, queues=None):
         """Drain payloads from the shared reading_drain queue,
@@ -498,8 +624,28 @@ class MultiAgencyCoordinator(AutonomousTrust):
                 "_drain_peer_readings: cohort first populated with "
                 "%d peer(s): %s",
                 len(self._cohort.peers),
-                sorted(p.nickname for p in self._cohort.peers.values()))
+                sorted(_roster_name_of(p)
+                       for p in self._cohort.peers.values()))
             MultiAgencyCoordinator._logged_first_peers = True
+
+        # Emit peer_seen for any newly-observed peer so the demo's Peer Detail
+        # panel gets its identity (uuid + key fingerprint + join time), the
+        # same first-sighting tuple the bridge produced.
+        try:
+            for p in (self.peers.all if self.peers is not None else []):
+                name = _roster_name_of(p) or str(p.uuid)[:8]
+                if name in self._seen_peers:
+                    continue
+                self._seen_peers.add(name)
+                fingerprint = ""
+                for attr in ("fingerprint", "key_fingerprint"):
+                    val = getattr(p, attr, None)
+                    if val:
+                        fingerprint = str(val)
+                        break
+                self._emit_ui(("peer_seen", name, str(p.uuid), fingerprint))
+        except Exception:
+            logger.exception("peer_seen emission failed")
 
         if getattr(self, '_reading_drain', None) is None:
             return
@@ -520,9 +666,7 @@ class MultiAgencyCoordinator(AutonomousTrust):
             except (TypeError, ValueError):
                 continue
             peer = peers_by_uuid.get(uuid_str)
-            peer_name = (getattr(peer, 'nickname', None)
-                         or getattr(peer, 'fullname', None)
-                         or uuid_str[:8])
+            peer_name = _roster_name_of(peer) or uuid_str[:8]
             if not MultiAgencyCoordinator._logged_first_reading:
                 logger.info(
                     "_drain_peer_readings: first reading payload from "
@@ -554,12 +698,14 @@ class MultiAgencyCoordinator(AutonomousTrust):
         per-batch anomaly state so we can submit a TransactionScore
         for the batch as a whole once it has settled.
         """
-        # Fan to both sensor charts; each ignores mismatched data_types.
-        for chart_key in ("temperature_chart", "wind_chart"):
-            try:
-                self._panels[chart_key].add_reading(reading)
-            except Exception:
-                logger.exception("Failed to forward reading to %s", chart_key)
+        # Emit the reading to the hosted demo's UI (streams panel + sensor
+        # charts + per-peer stream counts all derive from this tuple), the
+        # same ("reading", name, dict) shape the bridge produced.
+        try:
+            self._emit_ui(("reading", reading.peer_name, reading.to_dict()))
+        except Exception:
+            logger.exception("Failed to emit reading tuple for %s",
+                             reading.peer_name)
         # Snapshot the reading for canned playback (decimated per
         # (peer, data_type) by AT_RECORDING_READING_STRIDE).
         if self._event_recorder is not None:
@@ -633,7 +779,7 @@ class MultiAgencyCoordinator(AutonomousTrust):
                     reading.value, result.consensus,
                     result.deviation, result.threshold,
                 )
-                live_server.feed_event(self._panels, record)
+                self._feed_event_log(record)
 
         if batch_id is not None and anomalous_this_reading:
             self._batch_state[batch_id]["anomalous"] = True
@@ -718,15 +864,24 @@ class MultiAgencyCoordinator(AutonomousTrust):
             if score is None:
                 continue
             peer = peers_by_uuid.get(str(peer_id_str))
-            name = getattr(peer, "nickname", None) or str(peer_id_str)
+            name = _roster_name_of(peer) or str(peer_id_str)
             self._reputation_cache[name] = float(score)
             self._feed_timeline(name, float(score))
+            # Emit the per-subject consensus score to the demo UI (push-delta
+            # gated, like the bridge). rep_pair also feeds the timeline, but
+            # this keeps a peer visible/"active" even before any pair lands.
+            prev = self._last_rep.get(name)
+            if prev is None or abs(prev - float(score)) >= REPUTATION_PUSH_DELTA:
+                self._last_rep[name] = float(score)
+                self._emit_ui(("reputation", name, float(score)))
             new_tier = int(getattr(peer, "_tier", 0))
             prev_tier = self._prev_tier_cache.get(name)
             self._tier_cache[name] = new_tier
             if prev_tier is not None and new_tier < prev_tier:
                 self._emit_tier_lost(name, prev_tier, new_tier)
             self._prev_tier_cache[name] = new_tier
+        # Publish an immutable snapshot for the cross-thread rank-gate read.
+        self._tier_snapshot = dict(self._tier_cache)
 
     def _emit_tier_lost(self, peer_name: str, prev_tier: int,
                         new_tier: int) -> None:
@@ -752,20 +907,21 @@ class MultiAgencyCoordinator(AutonomousTrust):
         self._anomaly_log.append(record)
         if self._event_recorder is not None:
             self._event_recorder.record(record)
-        try:
-            live_server.feed_event(self._panels, record)
-        except Exception:
-            logger.exception("Failed to feed tier_lost to event log")
+        self._feed_event_log(record)
         logger.warning(
             "TIER_LOST: %s tier %d -> %d", peer_name, prev_tier, new_tier)
 
     def _feed_timeline(self, peer_name: str, score: float) -> None:
+        """Record a reputation sample into the canned-playback sidecar.
+
+        Live display of the same score reaches the demo via the
+        ("reputation", ...) / ("rep_pair", ...) tuple stream; this method now
+        only persists the sample for recordings.
+        """
         try:
             t = (now() - self.tasking_start).total_seconds()
         except Exception:
             t = self._tick_count * 0.5
-        live_server.feed_timeline_sample(
-            self._panels, t_seconds=t, peer_name=peer_name, score=score)
         if self._event_recorder is not None:
             self._event_recorder.record_snapshot({
                 "t": t,
@@ -773,24 +929,6 @@ class MultiAgencyCoordinator(AutonomousTrust):
                 "peer": peer_name,
                 "score": float(score),
             })
-
-    def _push_dashboard_update(self):
-        try:
-            t_seconds = (now() - self.tasking_start).total_seconds()
-        except Exception:
-            t_seconds = self._tick_count * 0.5
-        self._latest_state = {
-            "reputations": dict(self._reputation_cache),
-            "tiers": dict(self._tier_cache),
-            "tick": self._tick_count,
-            "t_seconds": t_seconds,
-            "phase": (self.scenario.current_phase.name
-                      if self.scenario.current_phase else None),
-        }
-        try:
-            self.data_queue.put_nowait(("state", self._latest_state))
-        except queue.Full:
-            pass
 
 
 def main():
@@ -810,6 +948,7 @@ def main():
     record_path = None
     compromise_mode = "abrupt"
     log_level = LogLevel.DEBUG
+    dashboard_port = int(os.environ.get("AT_DASHBOARD_PORT", "8050"))
 
     for i, arg in enumerate(sys.argv):
         if arg == "--log-level" and i + 1 < len(sys.argv):
@@ -818,6 +957,8 @@ def main():
             record_path = sys.argv[i + 1]
         elif arg == "--compromise-mode" and i + 1 < len(sys.argv):
             compromise_mode = sys.argv[i + 1]
+        elif arg == "--port" and i + 1 < len(sys.argv):
+            dashboard_port = int(sys.argv[i + 1])
 
     # AT derives etc/at + var/at from AUTONOMOUS_TRUST_ROOT.  generate_identity
     # requires cfg_dir as a positional arg (see mission/coordinator.py).
@@ -840,16 +981,37 @@ def main():
         print("Setup complete for coordinator")
         return
 
+    # Honor STARTUP_DELAY here: the deployment launches the coordinator with
+    # an explicit `python3 -m ...` command (not the native entrypoint.sh that
+    # normally implements the delay), and the coordinator joins an
+    # already-bootstrapping mesh — its request_access multicast otherwise
+    # races the peers' socket bind(). Mirrors the inspector's old _await_peers.
+    _delay = os.environ.get("STARTUP_DELAY") or os.environ.get("AT_STARTUP_DELAY")
+    try:
+        _secs = int(_delay) if _delay else 0
+    except ValueError:
+        _secs = 0
+    if _secs > 0:
+        logger.info("multi-agency coordinator: waiting %ds for peers to bind",
+                    _secs)
+        import time as _time
+        _time.sleep(_secs)
+
     logger.info("Starting multi-agency coordinator")
     scenario = DisasterResponseScenario()
     coordinator = MultiAgencyCoordinator(
         scenario=scenario,
         record_path=record_path,
         compromise_mode=compromise_mode,
+        dashboard_port=dashboard_port,
         log_level=log_level,
     )
     coordinator.run_forever()
 
 
 if __name__ == "__main__":
+    # Default to forkserver: 'fork' (Linux default through 3.13) forks a
+    # multi-threaded process and can deadlock the child. Harmless on 3.14+.
+    import multiprocessing as _mp
+    _mp.set_start_method('forkserver', force=True)
     main()

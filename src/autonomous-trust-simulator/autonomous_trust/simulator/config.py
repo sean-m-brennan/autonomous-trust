@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ import sys
 from datetime import datetime, timedelta
 import os
 
-from autonomous_trust.services.data.server import DataConfig
 from autonomous_trust.services.peer.position import GeoPosition, UTMPosition
 from autonomous_trust.core.config import Configuration
 from autonomous_trust.core.identity import Identity
@@ -33,10 +32,9 @@ base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 
 class MetaIdentity(object):
-    def __init__(self, ident, meta, data):
+    def __init__(self, ident, meta):
         self.ident = ident
         self.meta = meta
-        self.data = data
 
     @classmethod
     def from_directory(cls, path: str) -> 'MetaIdentity':
@@ -45,22 +43,12 @@ class MetaIdentity(object):
         if ident._uuid != meta.uuid:  # noqa
             raise RuntimeError('Identity and Metadata configs are inconsistent for %s (%s vs %s)' %
                                (path, ident._uuid, meta.uuid))  # noqa
-        data = None
-        data_cfg = os.path.join(path, 'data-source' + Configuration.file_ext)
-        if os.path.exists(data_cfg):
-            data = DataConfig.from_file(data_cfg)
-            # Open: the consistency check below is commented out
-            # because `data.channels` and `meta.data_meta` carry
-            # duplicate-but-shaped-differently info. Resolution path
-            # is one of: (a) drop the DataSrc files and let
-            # Metadata.data_meta be the single source of truth, or
-            # (b) keep DataSrc and remove the redundant field from
-            # Metadata. Until we pick, the check stays disabled so
-            # legitimate configs don't trip it.
-            #if data.channels != meta.data_meta:
-            #   raise RuntimeError('DataSource and Metadata configs are inconsistent for %s (%s vs %s)' %
-            #                      (path, data.channels, meta.data_channels))
-        return cls(ident, meta, data)
+        # Channel info comes solely from Metadata.data_meta (decided
+        # 2026-07-01: Metadata is the single source of truth). The former
+        # per-peer `data-source` DataConfig file duplicated this in a
+        # different shape and was only ever used for a disabled consistency
+        # check, so it is no longer loaded here.
+        return cls(ident, meta)
 
     @property
     def uuid(self):
@@ -71,8 +59,10 @@ class MetaIdentity(object):
         return self.meta.peer_kind
 
     @property
-    def nickname(self):
-        return self.ident.nickname
+    def petname(self):
+        # Simulator-local display name; sourced from the core identity's
+        # local petname (the short/bare human label).
+        return self.ident.petname
 
     @property
     def address(self):
@@ -145,7 +135,7 @@ def create_config(path: str = None, output_file: str = None, duration: timedelta
             path_data2 = PathData(one_third, two_thirds, shape2, Variability.GAUSSIAN, 2.0, Variability.UNIFORM)
             path_data3 = PathData(two_thirds, end, shape3, Variability.GAUSSIAN, 2.0, Variability.UNIFORM)
             path_data = [path_data1, path_data2, path_data3]
-            peers.append(PeerInfo(meta_id.uuid, meta_id.kind, meta_id.nickname, meta_id.address, shape1.start, grd_sig,
+            peers.append(PeerInfo(meta_id.uuid, meta_id.kind, meta_id.petname, meta_id.address, shape1.start, grd_sig,
                                   Antenna.DIPOLE, NetInterface.SMALL, start, end, path_data, data_streams))
 
         elif meta_id.kind == 'soldier':
@@ -156,13 +146,13 @@ def create_config(path: str = None, output_file: str = None, duration: timedelta
             path_data2 = PathData(one_third, two_thirds, shape2, Variability.GAUSSIAN, 0, Variability.UNIFORM)
             path_data3 = PathData(two_thirds, end, shape3, Variability.GAUSSIAN, 1.6, Variability.UNIFORM)
             path_data = [path_data1, path_data2, path_data3]
-            peers.append(PeerInfo(meta_id.uuid, meta_id.kind, meta_id.nickname, meta_id.address, shape1.start, grd_sig,
+            peers.append(PeerInfo(meta_id.uuid, meta_id.kind, meta_id.petname, meta_id.address, shape1.start, grd_sig,
                                   Antenna.DIPOLE, NetInterface.SMALL, start, end, path_data, data_streams))
 
         elif meta_id.kind == 'recon':
             shape = EllipseData(uah_alt, *recon_info[recon_num], 3)
             path_data = PathData(start, end, shape, Variability.GAUSSIAN, 90.2, Variability.UNIFORM)
-            peers.append(PeerInfo(meta_id.uuid, meta_id.kind, meta_id.nickname, meta_id.address, path_data.shape.start,
+            peers.append(PeerInfo(meta_id.uuid, meta_id.kind, meta_id.petname, meta_id.address, path_data.shape.start,
                                   aer_sig, Antenna.PARABOLIC, NetInterface.LARGE, start, end, [path_data],
                                   data_streams))
             recon_num += 1
@@ -170,7 +160,7 @@ def create_config(path: str = None, output_file: str = None, duration: timedelta
         elif meta_id.kind == 'jet':
             shape = EllipseData(uah_alt2,  *jet_info, 1)
             path_data = PathData(last_minute, end, shape, Variability.GAUSSIAN, 203.4, Variability.UNIFORM)
-            peers.append(PeerInfo(meta_id.uuid, meta_id.kind, meta_id.nickname, meta_id.address, path_data.shape.start,
+            peers.append(PeerInfo(meta_id.uuid, meta_id.kind, meta_id.petname, meta_id.address, path_data.shape.start,
                                   aer_sig, Antenna.YAGI, NetInterface.LARGE, last_minute, end, [path_data],
                                   data_streams))
 

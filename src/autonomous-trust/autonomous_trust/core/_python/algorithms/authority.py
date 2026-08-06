@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -29,19 +29,24 @@ class AgreementByAuthority(AgreementProtocol, ABC):
 
     @property
     def threshold_rank(self):
-        """Derive threshold from voter ranks: top 1/3 of peers by rank qualify."""
+        """Derive threshold from voter ranks: top 1/3 of peers by rank qualify.
+
+        Reads each voter's ``effective_rank`` (signed rank adjusted by live
+        one-hop reachability) so an unreachable peer no longer counts toward
+        — or clears — the authority cutoff. With no reachability adjustment
+        in play, ``effective_rank == rank`` and this is unchanged."""
         if self._explicit_threshold is not None:
             return self._explicit_threshold
         if not self.voters:
             return 0
-        ranks = sorted([v.rank for v in self.voters], reverse=True)
+        ranks = sorted([v.effective_rank for v in self.voters], reverse=True)
         cutoff_idx = max(1, len(ranks) // 3) - 1
         return ranks[cutoff_idx]
 
     def _count_vote(self, blob, proof, voter):
-        if voter.rank >= self.threshold_rank:
-            return voter.rank, proof.approval
-        return voter.rank, False
+        if voter.effective_rank >= self.threshold_rank:
+            return voter.effective_rank, proof.approval
+        return voter.effective_rank, False
 
     def _accumulate_votes(self, votes):
         # POA semantics: the highest-ranked voter's verdict decides. If the
@@ -53,5 +58,5 @@ class AgreementByAuthority(AgreementProtocol, ABC):
         # agreement/poa-leader-abstains conformance scenario.
         if not self.voters:
             return False
-        leader = max(voter.rank for voter in self.voters)
+        leader = max(voter.effective_rank for voter in self.voters)
         return dict(votes).get(leader, False)

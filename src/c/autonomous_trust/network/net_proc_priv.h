@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2024 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -114,6 +114,17 @@ void net_proc_test_reset_deferred(void);
 bool net_proc_test_deferred_matches_peer(size_t idx,
                                          const public_identity_t *new_peer);
 
+/** @brief Defer a (non-envelope) message — populate the queue without a
+ *         live socket. */
+void net_proc_test_defer(const uint8_t *data, size_t len, const char *from_addr);
+
+/** @brief Backdate every queued entry by @p secs, so a test can simulate
+ *         time passing and trigger age-out without sleeping. */
+void net_proc_test_backdate_deferred(int64_t secs);
+
+/** @brief Run the age-out sweep now; returns the number of surviving entries. */
+size_t net_proc_test_sweep_stale(void);
+
 /* ---- Test-only: route_to_process capture ----
  * Tests for AT_DISCOVERY_CROSS_CLUSTER observe whether a forwarded
  * broadcast preserved the wire payload's self-reported from_whom.address
@@ -127,5 +138,17 @@ void net_proc_test_reset_last_routed_from_addr(void);
  *         @p out (NUL-terminated, truncated to @p outlen). Empty string
  *         if no call has happened since the last reset. */
 void net_proc_test_get_last_routed_from_addr(char *out, size_t outlen);
+
+/* ---- ping_at refusal (divergence: C implements no PingAT) ----
+ * The outbound drain answers the `ping_at` selector with an explicit refusal
+ * instead of performing one. Exposed here (not in network.h) so a test can
+ * assert the reply's selector and body without standing up a whole network
+ * process; it is not public API. */
+
+/** @brief Post `{"error":"unsupported", ...}` on the NET_FN_PING_AT selector to
+ *         @p return_to. Local IPC only — never a wire message.
+ *  @return 0 when the refusal was posted, non-zero on alloc/send failure. */
+int refuse_ping_at_unsupported(const char *target_addr, const char *return_to,
+                            logger_t *logger);
 
 #endif  // NET_PROC_PRIV_H

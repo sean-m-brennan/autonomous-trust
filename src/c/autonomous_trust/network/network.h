@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2024 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -24,11 +24,20 @@
 #include <stdint.h>
 #include <jansson.h>
 #include "utilities/allocation.h"
+#include "utilities/logger.h"
 
+/* Compile-time DEFAULT base port, not a fixed one. The port a node actually
+ * uses is resolved by net_port_resolve() below; the transports derive the
+ * encrypted-group port as base + 1. Two nodes co-locate on one host by taking
+ * different bases (or the same base on different addresses). Mirrors Python
+ * system.py comm_port. */
 #define COMM_PORT 27787
-#define PING_RCV_PORT (COMM_PORT + 2)
-#define PING_SND_PORT (PING_RCV_PORT + 1)
-#define NTP_PORT (COMM_PORT + 4)
+
+/* Lowest/highest base a node may be given. The upper bound leaves room for
+ * the derived group port (base + 1) inside the 16-bit port space, and the
+ * lower bound keeps a node off the privileged range it cannot bind unprivileged. */
+#define COMM_PORT_MIN 1024
+#define COMM_PORT_MAX 65534
 
 #define IPV4_ADDR_LEN 16
 #define CIDR4_LEN (IPV4_ADDR_LEN + 3)
@@ -37,11 +46,11 @@
 #define MAC_ADDR_LEN 17
 
 /* Per-peer duplicate-broadcast threshold before demotion. Mirrors
- * Python NetworkProcess.annoy_limit (netprocess.py:90). The pest-
- * tracking map itself isn't yet wired into the C receive path —
- * defining the constant here so it's discoverable at the matching
- * call sites and so a future implementer has one knob to tune.
- * See divergence.md M13. */
+ * Python NetworkProcess.annoy_limit (netprocess.py:90). The pest-tracking
+ * map IS wired into the C receive path — net_proc.c:287 compares against
+ * this constant to set over_limit. Note the tunability divergence: Python
+ * exposes annoy_limit as an overridable class attribute, C has only this
+ * macro (see ISSUES.md, tunable-on-one-side entry). */
 #define NET_ANNOY_LIMIT 5
 
 /**
@@ -58,13 +67,22 @@ typedef enum {
 } network_protocol_t;
 
 /* Wire-protocol function selectors handled by the network process
- * outbound queue (mirrors Python Network.{stats_req,stats_resp,ping}
+ * outbound queue (mirrors Python Network.{stats_req,stats_resp,ping_at}
  * in network.py:33-35). Defined via `extern char[]` so callers compare
  * against the same bytes the wire serializer emits — see
  * project_proto_string_arrays. */
 extern char NET_FN_STATS_REQ[];
 extern char NET_FN_STATS_RESP[];
-extern char NET_FN_PING[];
+/* PingAT: confirmation that an AT peer is present and answering on AT's own
+ * UDP ports via a cooperating responder — NOT ICMP reachability. C implements
+ * no PingAT. The selector is retained so the outbound drain recognizes the
+ * request and answers {"error": "unsupported"} rather than dropping it and
+ * leaving a requester to time out. Python is the only implementation. */
+extern char NET_FN_PING_AT[];
+/* Reputation communication cut-off control (local IPC only; mirrors Python
+ * Network.exclude / Network.readmit in network.py). */
+extern char NET_FN_EXCLUDE[];
+extern char NET_FN_READMIT[];
 
 /* Python's INBOUND_BUDGET=32 per-channel drain cap (netprocess.py:581).
  * C's receive path is thread-per-channel, so OS scheduling provides the
@@ -94,18 +112,91 @@ typedef struct
     char mcast6_addr[IPV6_ADDR_LEN + 1];
 } network_config_t;
 
+/** Which layer supplied the base port a node is running on. */
+typedef enum {
+    PORT_SRC_CONFIG  = 0,  /**< network_config_t.port was non-zero. */
+    PORT_SRC_ENV     = 1,  /**< AT_COMM_PORT supplied it. */
+    PORT_SRC_DEFAULT = 2,  /**< Nothing did; COMM_PORT. */
+} net_port_source_t;
+
+/**
+ * @brief Resolve the base port a node communicates on.
+ *
+ * Resolution order: a non-zero @p cfg_port (the provisioned config always
+ * wins) → the AT_COMM_PORT environment variable (operator override, applied
+ * only where the config is silent) → COMM_PORT. The environment value is read
+ * once and cached, matching the other AT_* overrides in this tree
+ * (generate.c AT_TRANSPORT, net_proc.c AT_MYSTERY_MAX_AGE_SEC,
+ * configuration.c AT_SERIALIZE_MODE).
+ *
+ * An AT_COMM_PORT that is unparseable or outside [COMM_PORT_MIN,
+ * COMM_PORT_MAX] is refused with a warning and the default kept — never a
+ * silent 0. The result is always a bindable base, and base + 1 (the derived
+ * encrypted-group port) is always in range.
+ *
+ * @param cfg_port  network_config_t.port, or 0/negative when unset.
+ * @param src       Optional out-param: which layer supplied the result.
+ * @param logger    Optional; used to report a refused AT_COMM_PORT.
+ * @return the resolved base port, in [COMM_PORT_MIN, COMM_PORT_MAX].
+ */
+/*@
+  requires src == \null || \valid(src);
+  ensures \result >= COMM_PORT_MIN && \result <= COMM_PORT_MAX;
+  ensures cfg_port >= COMM_PORT_MIN && cfg_port <= COMM_PORT_MAX
+          ==> \result == cfg_port;
+*/
+int net_port_resolve(int cfg_port, net_port_source_t *src, logger_t *logger);
+
+/**
+ * @brief Human-readable name of a port source, for logs.
+ */
+/*@
+  assigns \nothing;
+  ensures \result != \null;
+*/
+const char *net_port_source_name(net_port_source_t src);
+
+/**
+ * @brief Split a CIDR string into its address and prefix-length parts.
+ *
+ * The output lengths are EXPLICIT because callers legitimately differ: the IPv4
+ * helpers pass @c char[IPV4_ADDR_LEN] (16) while the IPv6 helper and both socket
+ * transports pass @c char[IPV6_ADDR_LEN] (46). This used to be a hard-coded
+ * @c snprintf(addr, IPV4_ADDR_LEN, ...) plus @c snprintf(mask, 3, ...), which
+ * silently truncated every IPv6 input -- measured: a 38-char address became 15
+ * chars and a "/128" prefix became "12", and because the prefix 12 passes the
+ * family sanity check, @ref cidr6_to_ip6_binary returned SUCCESS with the wrong
+ * mask. Widening the hard-coded length was not an option: it would have
+ * overflowed the 16-byte callers.
+ *
+ * Truncation is an ERROR (@ref ENET_ADDR_TOO_LONG), not a silent shortening. A
+ * truncated address or prefix is not a usable approximation of anything.
+ *
+ * @param[in]  cidr      "address" or "address/prefix"; not modified.
+ * @param[out] addr      Receives the address part, always NUL-terminated.
+ * @param[in]  addr_len  sizeof the @p addr buffer; must be non-zero.
+ * @param[out] mask      Receives the prefix digits, or untouched when @p cidr
+ *                       carries no '/' (a missing prefix is acceptable). May be
+ *                       NULL to discard.
+ * @param[in]  mask_len  sizeof the @p mask buffer; ignored when @p mask is NULL.
+ *                       Must be >= 4 to represent an IPv6 "128".
+ * @return 0 on success, non-zero on a NULL/empty input, a zero-length buffer, or
+ *         truncation of either field.
+ */
 /*@
   requires cidr != \null && \valid_read(cidr);
-  requires addr != \null && \valid(addr + (0 .. IPV4_ADDR_LEN - 1));
-  requires mask == \null || \valid(mask + (0 .. 2));
-  assigns addr[0 .. IPV4_ADDR_LEN - 1];
+  requires addr != \null && \valid(addr + (0 .. addr_len - 1));
+  requires addr_len > 0;
+  requires mask == \null || \valid(mask + (0 .. mask_len - 1));
+  assigns addr[0 .. addr_len - 1];
   behavior success:
     ensures \result == 0;
   behavior failure:
     ensures \result != 0;
   disjoint behaviors;
 */
-int cidr_split(char * cidr, char *addr, char *mask);
+int cidr_split(char *cidr, char *addr, size_t addr_len,
+               char *mask, size_t mask_len);
 
 /*@
   requires cidr != \null && \valid_read(cidr);
@@ -182,6 +273,8 @@ int network_from_json(const json_t *obj, void *data_struct);
 
 #define ENET_INVALID_MASK 220
 DECLARE_ERROR(ENET_INVALID_MASK, "CIDR prefix length exceeds maximum for address family");
+#define ENET_ADDR_TOO_LONG 221
+DECLARE_ERROR(ENET_ADDR_TOO_LONG, "CIDR address or prefix does not fit the caller's buffer");
 
 
 /** @} */ /* end of internal_network */

@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ import re
 import ipaddress
 import psutil
 import socket
+import shutil
 import subprocess
 
 from ..config import InitializableConfig
@@ -30,9 +31,16 @@ class Network(InitializableConfig):
     broadcast = 'anyone'
     multicast_v4_address = '239.0.0.65'  # must be setup in OS
     multicast_v6_address = 'ff00::41e9:dddc:e4c7:e7e7'
-    ping = 'ping'
+    ping_at = 'ping_at'
     stats_req = 'stats_req'
     stats_resp = 'stats_resp'
+    # Reputation communication cut-off control (local IPC, reputation ->
+    # network). A peer whose reputation falls below the cut-off is
+    # EXCLUDED: the network process ignores its inbound frames and does
+    # not forward to/for it. `readmit` reverses it (explicit
+    # rehabilitation only). Payload is the peer's address string.
+    exclude = 'exclude'
+    readmit = 'readmit'
     # Parser-level wire-bytes size cap. Matches the C transport's
     # NET_MSG_MAX_DATA (net_message.h:31). Enforced at envelope-parse
     # time as defense-in-depth: the TCP transport already caps inbound
@@ -58,7 +66,17 @@ class Network(InitializableConfig):
 
     @classmethod
     def _get_default_device(cls):
-        route = subprocess.check_output(['/sbin/ip', 'route']).decode().split('\n')[0]
+        # Prefer the canonical /sbin (or /usr/sbin) ip; fall back to any `ip`
+        # on PATH. If iproute2 isn't present at all (e.g. a minimal CI/build
+        # container), return '' so get_addresses falls back to its 'eth0'
+        # default instead of crashing with FileNotFoundError.
+        ip_bin = shutil.which('ip', path='/sbin:/usr/sbin') or shutil.which('ip')
+        if ip_bin is None:
+            return ''
+        try:
+            route = subprocess.check_output([ip_bin, 'route']).decode().split('\n')[0]
+        except (OSError, subprocess.CalledProcessError):
+            return ''
         if 'default' in route:
             return route.split()[4]
         return route.split()[2]

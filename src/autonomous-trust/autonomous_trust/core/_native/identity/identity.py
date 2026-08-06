@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -25,7 +25,14 @@ from .sign import NativeSignature
 from .encrypt import NativeEncryptor
 
 # Re-export Python Identity for full API compatibility
-from ..._python.identity.identity import Identity  # noqa: F401
+from ..._python.identity.identity import (  # noqa: F401
+    Identity,
+    # Backend-agnostic canonical helpers (operate on the public Identity
+    # interface); re-exported so `core.identity.identity` resolves them on the
+    # native backend too.
+    public_identity_to_canonical,
+    public_identity_from_canonical,
+)
 
 # libsodium constants
 _CRYPTO_SIGN_BYTES = 64
@@ -52,8 +59,8 @@ class PublicIdentity:
         return ffi.string(self._ptr.address).decode('ascii')
 
     @property
-    def fullname(self) -> str:
-        return ffi.string(self._ptr.fullname).decode('utf-8')
+    def nickname(self) -> str:
+        return ffi.string(self._ptr.nickname).decode('utf-8')
 
     @property
     def signature(self) -> NativeSignature:
@@ -85,7 +92,7 @@ class PublicIdentity:
         return cls(_ptr=ptr, _owned=False)
 
     def __repr__(self):
-        return f'PublicIdentity(fullname={self.fullname!r}, address={self.address!r})'
+        return f'PublicIdentity(nickname={self.nickname!r}, address={self.address!r})'
 
     def __del__(self):
         if self._owned and self._ptr is not None:
@@ -100,37 +107,35 @@ class NativeIdentity:
 
     __slots__ = ('_ptr',)
 
-    def __init__(self, fullname: str, address: str = '',
+    def __init__(self, nickname: str, address: str = '',
                  uuid_val: _uuid.UUID | None = None,
-                 nickname: str = '', petname: str = ''):
+                 petname: str = ''):
         """Create a new identity with generated keypairs.
 
         Args:
-            fullname: Display name for this identity.
+            nickname: Zooko ONLINE name for this identity (was ``fullname``);
+                      the only name carried on the wire.
             address:  Network address string (up to 32 chars).
             uuid_val: Optional UUID; generated if not provided.
-            nickname: Optional short alias (NAME_LEN cap).
-            petname:  Optional private/local alias (NAME_LEN cap).
+            petname:  Optional local-only Zooko name (NAME_LEN cap).
 
-        nickname/petname default to "" because the C side accepts NULL
-        (identity_init at identity.c:57-58 substitutes the empty
-        string), but CFFI doesn't let us pass NULL for a `char *`
-        without an extra cast — empty strings are simpler and match
-        the C default.
+        petname defaults to "" because the C side accepts NULL
+        (identity_init substitutes the empty string), but CFFI doesn't
+        let us pass NULL for a `char *` without an extra cast — empty
+        strings are simpler and match the C default.
         """
         if uuid_val is None:
             uuid_val = _uuid.uuid4()
 
         uuid_bytes = ffi.new('unsigned char[16]', uuid_val.bytes)
         addr_bytes = ffi.new('char[]', address.encode('utf-8'))
-        name_bytes = ffi.new('char[]', fullname.encode('utf-8'))
-        nick_bytes = ffi.new('char[]', nickname.encode('utf-8'))
+        name_bytes = ffi.new('char[]', nickname.encode('utf-8'))
         pet_bytes  = ffi.new('char[]', petname.encode('utf-8'))
 
         ident_ptr = ffi.new('identity_t **')
         ident_ptr[0] = ffi.cast('identity_t *', 0x1)  # non-NULL workaround
         rc = lib.identity_create(uuid_bytes, addr_bytes, name_bytes,
-                                 nick_bytes, pet_bytes, ident_ptr)
+                                 pet_bytes, ident_ptr)
         if rc != 0:
             raise RuntimeError(f"identity_create failed with rc={rc}")
         self._ptr = ident_ptr[0]

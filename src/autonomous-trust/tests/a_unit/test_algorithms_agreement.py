@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -78,6 +78,77 @@ class TestAgreementVoter:
         voter = ConcreteVoter(uid, 5)
         assert voter.uuid == uid
         assert voter.rank == 5
+
+
+class TestAgreementVoterEffectiveRank:
+    """Dynamic topology-rank source (deferred.md §2.2): operational rank =
+    signed rank + one-hop-reachability adjustment, floored at 0."""
+
+    def test_effective_rank_defaults_to_signed(self):
+        v = ConcreteVoter(uuid4(), 5)
+        assert v.effective_rank == 5 and v.rank == 5
+
+    def test_observe_unreachable_demotes_to_zero(self):
+        v = ConcreteVoter(uuid4(), 5)
+        assert v.observe_reachability(False) is True
+        assert v.effective_rank == 0
+        assert v.rank == 5  # signed baseline untouched
+
+    def test_observe_reachable_restores(self):
+        v = ConcreteVoter(uuid4(), 5)
+        v.observe_reachability(False)
+        assert v.observe_reachability(True) is True
+        assert v.effective_rank == 5
+
+    def test_observe_idempotent_returns_false(self):
+        v = ConcreteVoter(uuid4(), 5)
+        assert v.observe_reachability(True) is False  # already reachable
+
+    def test_set_and_reset_adjustment_floors_at_zero(self):
+        v = ConcreteVoter(uuid4(), 5)
+        v.set_rank_adjustment(-2)
+        assert v.effective_rank == 3
+        v.set_rank_adjustment(-100)
+        assert v.effective_rank == 0  # floored, never negative
+        v.reset_rank_adjustment()
+        assert v.effective_rank == 5
+
+
+class TestAuthorityEffectiveRank:
+    """Authority voting keys off effective_rank, so a peer that loses one-hop
+    reachability drops out of the cutoff / leadership (deferred.md §2.2)."""
+
+    def _build(self, ranks):
+        from autonomous_trust.core.algorithms.authority import AgreementByAuthority
+
+        class _Probe(AgreementByAuthority):
+            def _pre_verify(self, blob, proof, sig):
+                return True
+
+        voters = [ConcreteVoter(uuid4(), r) for r in ranks]
+        return _Probe(voters[0], voters[1:], threshold_rank=None), voters
+
+    def test_threshold_uses_effective_rank(self):
+        proto, voters = self._build([6, 0, 0])
+        assert proto.threshold_rank == 6           # derived from [6,0,0]
+        voters[0].observe_reachability(False)       # gateway loss on the top
+        assert proto.threshold_rank == 0            # now [0,0,0]
+
+    def test_leader_changes_when_demoted(self):
+        proto, voters = self._build([6, 3, 0])
+        assert max(v.effective_rank for v in proto.voters) == 6
+        voters[0].observe_reachability(False)
+        assert max(v.effective_rank for v in proto.voters) == 3
+
+    def test_count_vote_returns_effective_rank_key(self):
+        proto, voters = self._build([6, 0])
+        voters[0].observe_reachability(False)       # demote the leader to 0
+        proof = MagicMock()
+        proof.approval = True
+        rank_key, approval = proto._count_vote(None, proof, voters[0])
+        # key is the effective rank (0), so the demoted peer can no longer be
+        # the leader in _accumulate_votes.
+        assert rank_key == 0
 
 
 class TestVoterTracker:

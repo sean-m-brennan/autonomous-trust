@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -29,19 +29,19 @@ DEFINE_TEST(test_cidr_split)
     char addr[IPV4_ADDR_LEN] = {0};
     char mask[4] = {0};
 
-    ck_assert_ret_ok(cidr_split(cidr, addr, mask));
+    ck_assert_ret_ok(cidr_split(cidr, addr, sizeof(addr), mask, sizeof(mask)));
     ck_assert_str_eq(addr, "192.168.1.0");
     ck_assert_str_eq(mask, "24");
 
     /* Split without mask output */
     char cidr2[] = "10.0.0.1/8";
     char addr2[IPV4_ADDR_LEN] = {0};
-    ck_assert_ret_ok(cidr_split(cidr2, addr2, NULL));
+    ck_assert_ret_ok(cidr_split(cidr2, addr2, sizeof(addr2), NULL, 0));
     ck_assert_str_eq(addr2, "10.0.0.1");
 
     /* NULL addr should fail */
     char cidr3[] = "10.0.0.1/8";
-    ck_assert_ret_nonzero(cidr_split(cidr3, NULL, NULL));
+    ck_assert_ret_nonzero(cidr_split(cidr3, NULL, 0, NULL, 0));
 }
 END_TEST_DEFINITION()
 
@@ -142,7 +142,7 @@ DEFINE_TEST(test_cidr_split_no_mask)
     char addr[IPV4_ADDR_LEN] = {0};
     char mask[4] = {0};
 
-    ck_assert_ret_ok(cidr_split(cidr, addr, mask));
+    ck_assert_ret_ok(cidr_split(cidr, addr, sizeof(addr), mask, sizeof(mask)));
     ck_assert_str_eq(addr, "10.0.0.1");
     /* mask should remain empty when no slash present */
 }

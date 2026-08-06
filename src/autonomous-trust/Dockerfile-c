@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.3
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -46,12 +46,17 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Copy C source and protobuf definitions
-# CMake expects protobuf as a sibling: ${CMAKE_CURRENT_SOURCE_DIR}/../protobuf
-COPY src/c /build/c-src
-COPY src/protobuf /build/protobuf
+# Copy the examples project plus the library and protobuf sources it depends on.
+# at_demo is built by examples/CMakeLists.txt, NOT by src/c (which only builds
+# the library). The examples build add_subdirectory()s the library via the
+# sibling path ../src/c, and the library in turn finds protobuf via ../protobuf.
+# Preserve that sibling layout under /build so both relative paths resolve:
+#   /build/examples  ->  ../src/c == /build/src/c  ->  ../protobuf == /build/src/protobuf
+COPY examples /build/examples
+COPY src/c /build/src/c
+COPY src/protobuf /build/src/protobuf
 
-RUN rm -rf /build/c-src/build && mkdir -p /build/c-src/build && cd /build/c-src/build && \
+RUN rm -rf /build/examples/build && mkdir -p /build/examples/build && cd /build/examples/build && \
     CC=clang CXX=clang++ cmake .. -DCMAKE_BUILD_TYPE=Release -DREVISION="$GIT_VERSION" -DCMAKE_C_FLAGS="-Wno-unknown-warning-option" -DCMAKE_CXX_FLAGS="-Wno-unknown-warning-option" && \
     make -j$(nproc) && \
     make install DESTDIR=/build/install
@@ -86,6 +91,18 @@ RUN chmod +x /bin/entrypoint-c.sh
 
 # Pre-create data dirs writable by any UID (supports user: in compose)
 RUN mkdir -p /etc/at /var/at && chmod 777 /etc/at /var/at
+
+# --- Clock discipline (required) -------------------------------------------
+# AT carries no NTP client of its own. This node refuses to start on a clock
+# no daemon is steering: the in-process gate reads ntp_adjtime(modes=0), which
+# is honest inside a container because CLOCK_REALTIME is shared with the host
+# (a time namespace can offset only CLOCK_MONOTONIC and CLOCK_BOOTTIME).
+#
+# THE HOST MUST RUN A STOCK NTP DAEMON -- chrony, ntpd or systemd-timesyncd.
+# A container cannot discipline CLOCK_REALTIME itself: clock_settime() returns
+# EPERM without CAP_SYS_TIME, and granting it would only let the container
+# fight its host. So there is deliberately no chronyd in this image.
+ENV AT_REQUIRE_SYNCED_CLOCK=1
 
 ENV AUTONOMOUS_TRUST_ROOT="/"
 ENV ROUTER="172.17.0.1"

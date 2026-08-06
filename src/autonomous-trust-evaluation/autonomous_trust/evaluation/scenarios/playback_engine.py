@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -125,7 +125,23 @@ class PlaybackEngine:
         # sensor readings, etc.). Time-sorted; tick() pops as
         # scenario_time advances past each entry's `t`.
         self._deferred_snapshots: list[dict] = []
+        # Playback transport extent. A recorded session routinely runs PAST
+        # the scenario's nominal `duration` (the live coordinator doesn't hard
+        # -stop at it), so clamping playback to scenario.duration would freeze
+        # the demo partway through — most of the recording (events, the rogue
+        # collapse, the strike/exfil) would never replay. load_recorded sets
+        # this to cover the last recorded event/snapshot so the full session
+        # plays. None in live mode => fall back to scenario.duration.
+        self._playback_duration: Optional[timedelta] = None
         self._wire_scenario_listener()
+
+    @property
+    def _effective_duration(self) -> timedelta:
+        """Transport length: the recording's true extent in playback, else
+        the scenario's nominal duration."""
+        if self._playback_duration is not None:
+            return self._playback_duration
+        return self._scenario.duration
 
     # --- wiring ------------------------------------------------------
 
@@ -202,7 +218,7 @@ class PlaybackEngine:
         """Jump to an absolute scenario time."""
         if t_seconds < 0:
             t_seconds = 0.0
-        duration = self._scenario.duration.total_seconds()
+        duration = self._effective_duration.total_seconds()
         if t_seconds > duration:
             t_seconds = duration
         self._scenario_time = timedelta(seconds=t_seconds)
@@ -251,10 +267,18 @@ class PlaybackEngine:
 
         dt_scenario = dt_wall * self._speed
         new_t = self._scenario_time + timedelta(seconds=dt_scenario)
-        duration = self._scenario.duration
-        if new_t >= duration:
-            new_t = duration
-            self._playing = False
+        # Only PLAYBACK mode has a finite transport: a recording ends at its
+        # last event/snapshot, so clamp the clock there and stop. LIVE mode
+        # free-runs -- the AT mesh keeps producing observations past the
+        # scenario's nominal duration and the live coordinator never
+        # hard-stops, so freezing at duration would just stall the demo
+        # mid-run (the scripted timeline is exhausted by the last phase, but
+        # the network keeps evolving).
+        if self._mode == PlaybackMode.PLAYBACK:
+            duration = self._effective_duration
+            if new_t >= duration:
+                new_t = duration
+                self._playing = False
 
         self._scenario_time = new_t
         if self._mode == PlaybackMode.PLAYBACK:
@@ -297,7 +321,7 @@ class PlaybackEngine:
             playing=self._playing,
             speed=self._speed,
             scenario_time=self._scenario_time.total_seconds(),
-            scenario_duration=self._scenario.duration.total_seconds(),
+            scenario_duration=self._effective_duration.total_seconds(),
             current_phase_idx=phase_idx,
             current_phase_name=phase.name if phase else "",
             mode=self._mode,
@@ -361,6 +385,23 @@ class PlaybackEngine:
             snap_buf.append(rec)
         snap_buf.sort(key=lambda r: r.get("t", 0.0))
         self._deferred_snapshots = snap_buf
+
+        # Stretch the transport to cover the full recording. A live session
+        # commonly runs past the scenario's nominal duration, so without this
+        # tick() would clamp at scenario.duration and freeze playback partway
+        # through (the bulk of events/snapshots never replaying). Take the
+        # latest recorded timestamp across both streams, floored at the
+        # nominal duration so a short recording still gets the authored length.
+        last_event = (buf[-1].timestamp.total_seconds() if buf else 0.0)
+        last_snap = (snap_buf[-1].get("t", 0.0) if snap_buf else 0.0)
+        recorded_extent = max(last_event, last_snap)
+        nominal = self._scenario.duration.total_seconds()
+        self._playback_duration = timedelta(
+            seconds=max(recorded_extent, nominal))
+        logger.info("playback extent: %.0fs (recording) vs %.0fs (nominal) "
+                    "-> transport runs to %.0fs",
+                    recorded_extent, nominal,
+                    self._playback_duration.total_seconds())
 
     # --- helpers -----------------------------------------------------
 

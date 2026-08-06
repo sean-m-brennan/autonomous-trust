@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -57,9 +57,12 @@ typedef struct {
     log_level_t   log_level;
     const char   *log_file;        /* NULL = stderr */
     bool          generate_config; /* run random_config() before launch */
-    const char   *app_name;        /* IPC queue name, e.g. "at_demo"   */
+    const char   *app_name;        /* logging identity, e.g. "at_demo"  */
     const char   *q_out;           /* queue: app -> AT daemon           */
-    const char   *q_in;            /* queue: AT daemon -> app           */
+    /* queue: AT daemon -> app. at_node_start BINDS this, so it is the name
+     * the app receives on (at_node_tick's messaging_recv). Must differ from
+     * q_out — the two directions are separate sockets. */
+    const char   *q_in;
     void         *capabilities;    /* passed to run_autonomous_trust    */
     size_t        cap_len;
     size_t        max_iterations;  /* 0 = unlimited (run until signal)  */
@@ -96,6 +99,11 @@ typedef int (*at_node_tick_fn)(at_node_t *node, void *user_data);
  * Initialise the node: create logger, ensure cfg/data directories exist,
  * optionally run config generation.
  * Returns 0 on success.
+ *
+ * @p cfg may alias `&node->config`; it is copied before the node is cleared.
+ * The config stores the caller's string pointers rather than copying them, so
+ * they must outlive the node (`at_node_shutdown` logs `app_name`). A caller
+ * that cannot promise that should own copies — see app_node.h, which does.
  */
 /*@
   requires \valid(node);
@@ -112,6 +120,10 @@ int at_node_init(at_node_t *node, const at_node_config_t *cfg);
 /**
  * Launch the AT daemon, install signal handlers, set up IPC.
  * Returns 0 on success (daemon PID stored internally).
+ *
+ * Binding the inbound queue (`q_in`, falling back to `app_name`) is part of
+ * success: if it fails, the daemon is stopped again and this returns non-zero,
+ * because an app that cannot receive is not started, however live the daemon.
  */
 /*@
   requires \valid(node);
@@ -139,8 +151,26 @@ int at_node_start(at_node_t *node);
 */
 int at_node_run(at_node_t *node, at_node_tick_fn tick, void *user_data);
 
+/** How long @ref at_node_shutdown waits for the daemon to actually exit.
+ *
+ *  Generous on purpose: the daemon gives its own subsystem processes a grace
+ *  period before SIGKILL, and a full shutdown was measured at about 5.3 s. A
+ *  bound tighter than that would turn an ordinary stop into a reported failure.
+ */
+#define AT_DAEMON_EXIT_TIMEOUT_MS 15000
+
 /**
- * Graceful shutdown: SIGINT the daemon, wait for it, log exit.
+ * Graceful shutdown: SIGINT the daemon, wait for it to exit, log it.
+ *
+ * Returns once the daemon is gone, or after @ref AT_DAEMON_EXIT_TIMEOUT_MS with
+ * an error logged naming the pid. It does **not** escalate to SIGKILL: the
+ * daemon may be mid-write to a store.
+ *
+ * The wait is a poll, not a `waitpid`, and that is forced rather than chosen —
+ * `daemonize` double-forks, so the daemon is init's child and not ours. Before
+ * 2026-08-04 this called `waitpid` alone, which returned ECHILD at once, so
+ * "wait for it" was not happening and a stop returned with the daemon still
+ * live and still holding its sockets.
  */
 /*@
   requires \valid(node);

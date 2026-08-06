@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -423,15 +423,26 @@ def _stub_proc(self_uuid, reputations=None):
     # (doc/architecture/trust-tiers.md §5). Default per-task weight 1
     # mirrors the production fallback when the cache is empty.
     stub.task_weights = {}
+    # _contrite_tit_for_tat now defers its cold-start (no-bilateral-history)
+    # branch to _prereputation_prior; bind the real method so the stub
+    # exercises the production algorithm rather than a fake.
+    stub._prereputation_prior = lambda pid: \
+        ReputationProcess._prereputation_prior(stub, pid)
+    stub.PREREP_NEUTRAL = ReputationProcess.PREREP_NEUTRAL
+    stub.PREREP_SHRINKAGE_K = ReputationProcess.PREREP_SHRINKAGE_K
     return stub
 
 
 class TestContriteTitForTat:
-    def test_empty_history_returns_0_49(self):
+    def test_empty_history_returns_neutral(self):
+        # No bilateral history AND nothing on the chain → cold-start prior
+        # returns PREREP_NEUTRAL (0.2): an unknown peer starts at neutral
+        # (a small leeway above the 0.1 comm cut-off) and must earn its
+        # way up.
         self_id, peer_id = uuid4(), uuid4()
         stub = _stub_proc(self_id)
         peer = SimpleNamespace(uuid=peer_id)
-        assert ReputationProcess._contrite_tit_for_tat(stub, peer) == 0.49
+        assert ReputationProcess._contrite_tit_for_tat(stub, peer) == 0.2
 
     def test_cooperative_self_p1(self):
         """Self enters as p1, peer as p2, both cooperate. Falls into
@@ -490,30 +501,82 @@ class TestContriteTitForTat:
         # peer_last < 0.5, my_standing < 0.5 → max(0.51, 0.35) = 0.51.
         assert score == pytest.approx(0.51, abs=0.001)
 
-    def test_third_party_transactions_ignored(self):
-        """Transactions involving peer but not self should not enter
-        the bilateral computation."""
+    def test_third_party_transactions_inform_prior(self):
+        """Third-party transactions (peer ↔ other, no self involvement) do
+        not enter the *bilateral* CTFT computation, but with no bilateral
+        history WITH us they now feed the cold-start prior
+        (_prereputation_prior) instead of a flat neutral (deferred.md §2.4)."""
         self_id, peer_id, other = uuid4(), uuid4(), uuid4()
         stub = _stub_proc(self_id)
-        # peer ↔ other (no self involvement) — must be ignored.
         t = uuid4()
-        stub.history.update(t, peer_id, 0.1)
-        stub.history.update(t, other, 0.1)
+        stub.history.update(t, peer_id, 0.1)   # peer → p1
+        stub.history.update(t, other, 0.1)     # other → p2 (scores the peer)
         score = ReputationProcess._contrite_tit_for_tat(
             stub, SimpleNamespace(uuid=peer_id))
-        # No bilateral self↔peer history → no-history default 0.49.
-        assert score == 0.49
+        # observed standing = other's score about peer = 0.1 (cp_rep cancels
+        # in the weighted mean of a single observation), shrunk toward
+        # neutral 0.2: (1*0.1 + 3*0.2) / (1+3) = 0.175.
+        assert score == pytest.approx(0.175, abs=0.001)
+
+
+class TestPrereputationPrior:
+    """The CTFT cold-start prior (deferred.md §2.4). Mirror in C:
+    reputation_prereputation_prior / src/c/test reputation tests."""
+
+    def test_no_observations_returns_neutral(self):
+        self_id, peer_id = uuid4(), uuid4()
+        stub = _stub_proc(self_id)
+        assert ReputationProcess._prereputation_prior(stub, peer_id) \
+            == pytest.approx(0.2, abs=1e-9)
+
+    def test_self_counterparty_excluded(self):
+        # A one-sided tx where WE are the counterparty must not seed the
+        # prior (that is the bilateral path's job, not the cold-start prior).
+        self_id, peer_id = uuid4(), uuid4()
+        stub = _stub_proc(self_id)
+        t = uuid4()
+        stub.history.update(t, peer_id, 0.9)   # peer → p1
+        stub.history.update(t, self_id, 0.2)   # self → p2 (we score peer)
+        # self is excluded → no third-party observation → neutral.
+        assert ReputationProcess._prereputation_prior(stub, peer_id) \
+            == pytest.approx(0.2, abs=1e-9)
+
+    def test_shrinks_toward_neutral_with_sample_size(self):
+        # More consistent third-party evidence pulls the prior further from
+        # neutral toward the observed mean.
+        self_id, peer_id = uuid4(), uuid4()
+        reps = Reputations()
+        stub = _stub_proc(self_id, reputations=reps)
+        others = [uuid4() for _ in range(4)]
+        for i, o in enumerate(others):
+            t = uuid4()
+            stub.history.update(t, peer_id, 0.9)  # peer → p1
+            stub.history.update(t, o, 0.9)        # other scores peer 0.9
+        prior = ReputationProcess._prereputation_prior(stub, peer_id)
+        # observed=0.9, n=4, k=3, neutral=0.2 → (4*0.9 + 3*0.2)/7 = 0.6.
+        assert prior == pytest.approx((4 * 0.9 + 3 * 0.2) / 7, abs=0.001)
+        assert 0.2 < prior < 0.9
+
+    def test_kill_switch_restores_flat_neutral(self, monkeypatch):
+        monkeypatch.setenv('AT_PREREP_HEURISTIC', '0')
+        self_id, peer_id, other = uuid4(), uuid4(), uuid4()
+        stub = _stub_proc(self_id)
+        t = uuid4()
+        stub.history.update(t, peer_id, 0.9)
+        stub.history.update(t, other, 0.9)
+        assert ReputationProcess._prereputation_prior(stub, peer_id) == 0.2
 
 
 class TestPureReputation:
-    def test_empty_history_returns_0_5(self):
-        """Default 0.5 (mirrors reputation.c:419-420 / :454-455).
-        Returning 0.0 would route the peer right back into CTFT mode."""
+    def test_empty_history_returns_neutral(self):
+        """Default PREREP_NEUTRAL (0.2) on no history (mirrors C).
+        Returning a lower value would route the peer right back into
+        CTFT mode."""
         self_id, peer_id = uuid4(), uuid4()
         stub = _stub_proc(self_id)
         score = ReputationProcess._pure_reputation(
             stub, SimpleNamespace(uuid=peer_id))
-        assert score == 0.5
+        assert score == 0.2
 
     def test_weighted_average(self):
         """Counterparty score weighted by counterparty reputation."""
@@ -529,9 +592,10 @@ class TestPureReputation:
         # counterparty_score = 0.7, cp_rep = 0.8 → 0.56.
         assert score == pytest.approx(0.56, abs=0.001)
 
-    def test_unknown_counterparty_uses_default_0_5(self):
+    def test_unknown_counterparty_uses_default_neutral(self):
         """Counterparty missing from self.reputations falls back to
-        0.5 (mirrors C); does not silently skip the transaction."""
+        PREREP_NEUTRAL (0.2, mirrors C); does not silently skip the
+        transaction."""
         self_id, peer_id = uuid4(), uuid4()
         stub = _stub_proc(self_id)  # empty reputations dict
         t = uuid4()
@@ -539,8 +603,8 @@ class TestPureReputation:
         stub.history.update(t, self_id, 0.6)
         score = ReputationProcess._pure_reputation(
             stub, SimpleNamespace(uuid=peer_id))
-        # counterparty_score = 0.6, cp_rep = 0.5 → 0.3.
-        assert score == pytest.approx(0.3, abs=0.001)
+        # counterparty_score = 0.6, cp_rep = 0.2 → 0.12.
+        assert score == pytest.approx(0.12, abs=0.001)
 
 
 class TestProposerHistoryBilateral:
@@ -598,6 +662,8 @@ class TestProposerHistoryBilateral:
         # group_uuid, so _chain_for_group(None) resolves to the primary
         # chain — which for this leaf stub is just `history`.
         stub._chain_for_group = lambda g: history
+        stub._note_interaction = lambda *a, **k: None
+        stub._fold_committed_tx = lambda *a, **k: None
         stub.identity = SimpleNamespace(uuid=self_id)
         stub.logger = SimpleNamespace(
             warning=lambda *a, **k: None, debug=lambda *a, **k: None,
@@ -653,6 +719,8 @@ class TestProposerHistoryBilateral:
             history=history,
             # Legacy 3-tuple commit -> group_uuid None -> primary chain.
             _chain_for_group=lambda g: history,
+            _note_interaction=lambda *a, **k: None,
+            _fold_committed_tx=lambda *a, **k: None,
             identity=SimpleNamespace(uuid=self_id),
             logger=SimpleNamespace(
                 warning=lambda *a, **k: None, debug=lambda *a, **k: None,
@@ -693,3 +761,94 @@ class TestProposerHistoryBilateral:
         assert start_paxos_calls[0][1] is ts
         # …but history is still empty.
         assert len(history) == 0
+
+
+class TestConsensusByTier:
+    """Per-tier consensus aggregation (trust-tiers §12 / deferred.md §2.3).
+    Mirror in C: reputation_consensus_by_tier (src/c/test reputation tests)."""
+
+    def _stub(self):
+        stub = SimpleNamespace()
+        stub.history = TransactionHistory()
+        stub.task_weights = {}
+        stub.task_tiers = {}
+        stub._per_tier_last = {}
+        stub.CONSENSUS_EMA_HALF_LIFE = ReputationProcess.CONSENSUS_EMA_HALF_LIFE
+        return stub
+
+    def test_empty_history_returns_empty(self):
+        stub = self._stub()
+        assert ReputationProcess._consensus_reputation_by_tier(
+            stub, uuid4()) == {}
+
+    def test_partitions_score_by_capability_tier(self):
+        stub = self._stub()
+        peer, o1, o3 = uuid4(), uuid4(), uuid4()
+        t1, t3 = uuid4(), uuid4()
+        # tier-1 interaction: counterparty (o1) scores the peer 0.9.
+        stub.history.update(t1, peer, 0.5)   # peer side (p1)
+        stub.history.update(t1, o1, 0.9)     # counterparty scores peer (p2)
+        stub.task_tiers[str(t1)] = 1
+        # tier-3 interaction: counterparty (o3) scores the peer 0.4.
+        stub.history.update(t3, peer, 0.5)
+        stub.history.update(t3, o3, 0.4)
+        stub.task_tiers[str(t3)] = 3
+        result = ReputationProcess._consensus_reputation_by_tier(stub, peer)
+        # "trusted at tier 1 (0.92-ish), untrusted at tier 3 (0.41-ish)".
+        assert set(result) == {1, 3}
+        assert result[1] == pytest.approx(0.9, abs=1e-6)
+        assert result[3] == pytest.approx(0.4, abs=1e-6)
+        # cached for later query
+        assert stub._per_tier_last[str(peer)] == result
+
+    def test_same_tier_folds_into_one_ema(self):
+        stub = self._stub()
+        peer, o1, o2 = uuid4(), uuid4(), uuid4()
+        ta, tb = uuid4(), uuid4()
+        for task, other, sc in ((ta, o1, 1.0), (tb, o2, 0.0)):
+            stub.history.update(task, peer, 0.5)
+            stub.history.update(task, other, sc)
+            stub.task_tiers[str(task)] = 2
+        result = ReputationProcess._consensus_reputation_by_tier(stub, peer)
+        assert set(result) == {2}
+        # one EMA over [1.0, 0.0]: starts at 1.0, then folds 0.0 → strictly
+        # between 0 and 1, below the first sample.
+        assert 0.0 < result[2] < 1.0
+
+    def test_unmapped_task_defaults_to_tier_zero(self):
+        stub = self._stub()
+        peer, other = uuid4(), uuid4()
+        t = uuid4()
+        stub.history.update(t, peer, 0.5)
+        stub.history.update(t, other, 0.8)
+        # no task_tiers entry → bucket 0
+        result = ReputationProcess._consensus_reputation_by_tier(stub, peer)
+        assert set(result) == {0}
+        assert result[0] == pytest.approx(0.8, abs=1e-6)
+
+
+class TestResolveTxTier:
+    """_resolve_tx_tier maps capability_name → required_tier (deferred.md §2.3)."""
+
+    def test_resolves_registered_tier(self):
+        from autonomous_trust.core.capabilities import Capabilities
+        caps = Capabilities()
+        caps.register_ability('cap.high', None, required_tier=3,
+                              transaction_weight=8)
+        stub = SimpleNamespace(protocol=SimpleNamespace(capabilities=caps))
+        ts = TransactionScore(task_id=uuid4(), score=0.9,
+                              capability_name='cap.high')
+        assert ReputationProcess._resolve_tx_tier(stub, ts) == 3
+
+    def test_unknown_capability_defaults_zero(self):
+        from autonomous_trust.core.capabilities import Capabilities
+        stub = SimpleNamespace(
+            protocol=SimpleNamespace(capabilities=Capabilities()))
+        ts = TransactionScore(task_id=uuid4(), score=0.9,
+                              capability_name='cap.missing')
+        assert ReputationProcess._resolve_tx_tier(stub, ts) == 0
+
+    def test_no_capability_name_defaults_zero(self):
+        stub = SimpleNamespace(protocol=SimpleNamespace(capabilities=None))
+        ts = TransactionScore(task_id=uuid4(), score=0.9)
+        assert ReputationProcess._resolve_tx_tier(stub, ts) == 0

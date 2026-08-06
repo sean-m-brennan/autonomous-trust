@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -27,7 +27,10 @@ from ..system import max_concurrency, now
 from ..config import Configuration
 
 
-# TODO NTP synchronization using ntplib and tied to reputation
+# TODO tie clock quality to reputation. AT no longer implements NTP: a stock
+# daemon disciplines the host clock and network/clock.py reads what it achieved
+# (NtpTimeSource.trustworthy). A peer whose clock nothing is steering is the
+# reputation-relevant signal, not a sync AT performs itself.
 
 class Status(Enum):
     running = 'running'

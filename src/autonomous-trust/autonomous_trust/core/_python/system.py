@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -47,15 +47,135 @@ class CfgIds(object, metaclass=ClassEnumMeta):
 tcp_communications = pkg + '.network.TCPNetworkProcess'
 udp_communications = pkg + '.network.UDPNetworkProcess'
 communications = os.environ.get('AT_TRANSPORT', udp_communications)
-comm_port = 27787
-ping_rcv_port = comm_port + 2
-ping_snd_port = ping_rcv_port + 1
+
+# Compile-time DEFAULT base port, not a fixed one. Mirrors C's COMM_PORT
+# (network/network.h). The bounds leave room for the derived group port
+# (base + 1) inside the 16-bit space and keep a node off the privileged range.
+default_comm_port = 27787
+comm_port_min = 1024
+comm_port_max = 65534
+
+
+class PortSource(object, metaclass=ClassEnumMeta):
+    """Which layer supplied the base port. Mirrors C's net_port_source_t."""
+    config = 'config'
+    env = 'AT_COMM_PORT'
+    default = 'default'
+
+
+def resolve_comm_port(cfg_port: int = 0, logger: logging.Logger = None) -> tuple[int, str]:
+    """Resolve the base port a node communicates on, with its source.
+
+    Resolution order, identical to C's ``net_port_resolve``: a usable
+    ``cfg_port`` (the provisioned config always wins) -> ``AT_COMM_PORT``
+    (operator override, applied only where the config is silent) ->
+    ``default_comm_port``.
+
+    An ``AT_COMM_PORT`` that is unparseable or out of range is refused with a
+    warning and the default kept -- never a silent 0, which would ask the
+    kernel for an ephemeral port and put the node where no peer is looking.
+    """
+    def _warn(msg):
+        if logger is not None:
+            logger.warning(msg)
+
+    if cfg_port and comm_port_min <= cfg_port <= comm_port_max:
+        raw = os.environ.get('AT_COMM_PORT')
+        if raw and logger is not None:
+            # Say so rather than letting an operator believe the override took.
+            logger.info('config port %d overrides AT_COMM_PORT=%s' % (cfg_port, raw))
+        return cfg_port, PortSource.config
+    if cfg_port:
+        _warn('refusing configured port %r (want an integer in [%d, %d]); falling back'
+              % (cfg_port, comm_port_min, comm_port_max))
+
+    raw = os.environ.get('AT_COMM_PORT')
+    if raw:
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            val = None
+        if val is None or not (comm_port_min <= val <= comm_port_max):
+            _warn("refusing AT_COMM_PORT=%r (want an integer in [%d, %d]); using default %d"
+                  % (raw, comm_port_min, comm_port_max, default_comm_port))
+        else:
+            return val, PortSource.env
+    return default_comm_port, PortSource.default
+
+
+# Module-level defaults layer. A lot imports these names, so they stay -- but
+# they are the resolved-at-import view (config is not visible here), not the
+# truth for a node that carries a configured port. Use resolve_comm_port() when
+# a config is in hand. The derived ports follow the base, so an AT_COMM_PORT
+# override separates two co-located nodes on every socket, not just the peer one.
+comm_port = resolve_comm_port()[0]
+ping_at_rcv_port = comm_port + 2
+ping_at_snd_port = ping_at_rcv_port + 1
 ntp_port = comm_port + 4
 preferred_proto_ver = 4
-net_cadence = 0.0001
+# Network subsystem poll cadence. Was 0.0001 (100us), which made the net
+# process + its receiver threads effectively busy-wait (sleep_until no-ops
+# whenever a loop iteration exceeds the cadence), pegging a core per node —
+# pathological when the whole cohort is co-located on one host. 5ms trades
+# sub-millisecond network latency (irrelevant for this demo) for far lower
+# idle CPU. See ISSUES.md (net CPU / connection churn).
+net_cadence = 0.005
 encoding = 'utf-8'
 cadence = 0.5
 queue_cadence = 0.01
+
+
+def _env_bool(name: str) -> bool:
+    return os.environ.get(name, '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _env_num(name: str, default, cast):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return cast(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+# Persistent / pooled TCP connections. The TCP transport normally opens one
+# connection per message (connect/send/close); with pooling on it reuses one
+# connection per (peer, channel) for many messages, so steady-state handshakes
+# drop from ~1/message to ~1/peer/idle-period. Framing is unchanged, so a
+# pooling node still interoperates with a per-message peer (Python or C).
+# Default OFF; opt in with AT_NET_POOL=1. See
+# doc/architecture/network-connection-pooling.md.
+net_persistent_conn = _env_bool('AT_NET_POOL')
+# Close a pooled/accepted connection after this many idle seconds, to bound fds.
+net_conn_idle_ttl = _env_num('AT_NET_CONN_IDLE_TTL', 30.0, float)
+# Cap on simultaneous live connections per direction (outbound pool / inbound
+# reader threads), so a hostile peer can't exhaust fds by holding many open.
+net_max_live_conns = _env_num('AT_NET_MAX_CONNS', 64, int)
+
+
+def _proc_idle_floor() -> float:
+    """Minimum wall-clock period (sec) for the reputation/negotiation main
+    loops. Those loops pace only via queue.get's blocking q_cadence timeout,
+    which sleeps ONLY when the queue is empty for a full window; under
+    continuous traffic (e.g. the multi-agency demo) there is never an idle
+    window, so the loop spins at 100% CPU. A small trailing sleep_until(floor)
+    guarantees the loop yields the CPU whenever it is not genuinely saturated,
+    without the old sleep_until(cadence)=0.5s throughput cap (~2 msg/s).
+
+    Tunable via AT_PROC_IDLE_FLOOR_SEC; set 0 to restore the un-throttled loop.
+    """
+    raw = os.environ.get('AT_PROC_IDLE_FLOOR_SEC')
+    if raw is None:
+        return 0.01
+    try:
+        val = float(raw)
+    except ValueError:
+        return 0.01
+    return val if val >= 0 else 0.01
+
+
+proc_idle_floor = _proc_idle_floor()
 agreement_impl = AgreementImpl.POA.value
 dev_root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 core_system = {CfgIds.network: communications,
@@ -71,9 +191,21 @@ QueueType = Union[queue.Queue, multiprocessing.Queue]
 
 
 def now():
-    """Return current time adjusted by NTP offset (if available)."""
-    from .network.ntp import get_offset
-    return datetime.now(UTC) + get_offset()
+    """Return the current time from the host clock.
+
+    The host clock is disciplined by a stock NTP daemon (chrony / ntpd /
+    systemd-timesyncd); AT does not maintain a time correction of its own. It
+    used to: a userspace offset was applied HERE and nowhere else, so AT's notion
+    of time diverged from its own host's, with no clock discipline (one raw
+    sample per poll, no filter, dispersion check, step/slew policy or sanity
+    bound) and no authentication. Time discipline is a solved problem that belongs
+    to the daemon that owns the kernel clock.
+
+    ``network.clock`` reads how well that discipline is going, and a node can
+    refuse to start on a clock nothing is steering -- see
+    ``clock.require_synced_clock``.
+    """
+    return datetime.now(UTC)
 
 
 class PackageHash(object):

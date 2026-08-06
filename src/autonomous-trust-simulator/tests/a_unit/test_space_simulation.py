@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -97,7 +97,7 @@ class TestSpaceModeComputeStep:
 
         peers = [
             PeerInfo(
-                uuid='habitat-a', kind='habitat', nickname='alpha',
+                uuid='habitat-a', kind='habitat', petname='alpha',
                 ip4_addr='10.0.0.1', initial_position=a_pos,
                 signal=40.0, antenna=Antenna.LASER,
                 iface=NetInterface.LASER_COMMS,
@@ -105,7 +105,7 @@ class TestSpaceModeComputeStep:
                 path_list=[a_path], data_streams=[],
             ),
             PeerInfo(
-                uuid='habitat-b', kind='habitat', nickname='beta',
+                uuid='habitat-b', kind='habitat', petname='beta',
                 ip4_addr='10.0.0.2', initial_position=b_pos,
                 signal=40.0, antenna=Antenna.HIGH_GAIN_PARABOLIC,
                 iface=NetInterface.DEEP_SPACE,

@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -215,6 +215,13 @@ class RedTeamHarness:
         if rep_a is not None:
             if rep_a > 0.15:
                 return 'FAIL'
+
+        # Attack-specific hard invariants. The Sybil scenario reports an
+        # explicit distinct-identity bound; an admitted Sybil is a failure
+        # regardless of convergence/reputation deltas.
+        specific = attack_metrics.get('attack_specific') or {}
+        if specific.get('identity_count_bounded') is False:
+            return 'FAIL'
 
         return 'PASS'
 

@@ -1,0 +1,95 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: operator-bound-verified
+byte_pinning: false
+description: |
+    Operator-attended signal — happy path (ethne guardian edge, D8/Q9). The
+    newcomer announces with an OPERATOR credential (operator_leaf.der) that
+    chains to BOTH the mission CA bundle (so it is admitted as a peer) AND the
+    distinct operator CA (operator-ca-bundle.pem). The border guard runs the
+    full admission cascade (propose -> peer_accepted -> access_granted ->
+    full_history, driven synchronously) and, in _zta_admit, classifies the
+    credential as operator-class against the operator anchor — so the stored
+    peer's operator_bound is true.
+
+    The determination is non-forgeable: it comes from verifying the credential
+    against the distinct operator anchor, never from the advertised bool. Peers
+    that present an ordinary device/drone credential (see
+    operator-bound-lying-rejected) end up operator_bound = false.
+
+    Cross-impl: pinned on BOTH sides. The C conformance adapter wires the ZTA
+    policy (incl. operator_ca_bundle_path) + credentials (_apply_zta_fixtures)
+    when built with -DAT_ZTA=ON; scripts/test-conformance.sh enables that when
+    OpenSSL is present (build-zta/). Without OpenSSL the C side skips this
+    scenario, still non-asymmetric (diff_results.py treats a one-side skip as a
+    match). Fixtures operator_leaf.der + operator-ca-bundle.pem are minted by
+    testdata/zta/gen-operator-ca.sh (a distinct operator CA + leaf). Here the
+    border guard trusts the operator CA as both its peer anchor and its operator
+    anchor — the operator leaf admits and is classified operator-attended; the
+    distinct-anchor property (a peer cred that admits but is NOT operator-class)
+    is pinned by operator-bound-lying-rejected.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  zta_policy:
+    enabled: true
+    require_at_admission: true
+    # These fixtures PREDATE the credential->identity binding (ISSUES §1.5) and
+    # provision none, so `off` keeps each pin testing what it claims: this case is
+    # about the chain / operator classification, not about bindings. Without it a
+    # reject-* pin would pass for the wrong reason (unbound, not bad chain) and the
+    # admit pins would fail outright. Binding behavior is pinned separately by the
+    # zta-binding-* scenarios.
+    binding_mode: "off"
+    verifier_type: x509
+    ca_bundle_path: testdata/zta/operator-ca-bundle.pem
+    operator_ca_bundle_path: testdata/zta/operator-ca-bundle.pem
+  credentials:
+    newcomer: testdata/zta/certs/operator_leaf.der
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+    description: |
+        newcomer announces with an operator credential. bg's welcoming_committee
+        verifies the chain (peer anchor), then classifies it operator-class
+        against the operator anchor and marks the peer operator-attended.
+  - id: 2
+    from: bg
+    to: broadcast
+    function: propose_peer
+    in_response_to: 1
+    description: bg proposes the candidate to the group.
+  - id: 3
+    from: bg
+    to: broadcast
+    function: peer_accepted
+    in_response_to: 1
+    description: |
+        After synchronous vote finalization, _peer_accepted stores the newcomer
+        (carrying the verified operator_bound) and broadcasts the confirm.
+  - id: 4
+    from: bg
+    to: newcomer
+    function: access_granted
+    in_response_to: 1
+    description: bg sends its published identity to the newcomer.
+  - id: 5
+    from: bg
+    to: newcomer
+    function: full_history
+    in_response_to: 1
+    description: bg sends the group key + history DAG.
+
+expected_state:
+  bg:
+    operator_bound:
+      newcomer: true

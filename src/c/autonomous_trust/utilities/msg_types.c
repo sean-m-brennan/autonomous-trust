@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2024 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -66,6 +66,10 @@ size_t message_size(message_type_t type)
         return sizeof(update_accepted_msg_t);
     case PEER_RTT_UPDATE:
         return sizeof(peer_rtt_update_msg_t);
+    case PEER_OBSERVED:
+        return sizeof(peer_observed_msg_t);
+    case PEER_REPUTATION:
+        return sizeof(peer_reputation_msg_t);
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:
     case ZTA_VERIFICATION_RESULT:
@@ -111,6 +115,10 @@ char *message_type_to_string(message_type_t type)
         return (char*)"UPDATE_ACCEPTED";
     case PEER_RTT_UPDATE:
         return (char*)"PEER_RTT_UPDATE";
+    case PEER_OBSERVED:
+        return (char*)"PEER_OBSERVED";
+    case PEER_REPUTATION:
+        return (char*)"PEER_REPUTATION";
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:
         return (char*)"ZTA_REVOCATION_ALERT";
@@ -160,6 +168,10 @@ message_type_t string_to_message_type(const char *str)
         return UPDATE_ACCEPTED;
     if (strcmp(str, "PEER_RTT_UPDATE") == 0)
         return PEER_RTT_UPDATE;
+    if (strcmp(str, "PEER_OBSERVED") == 0)
+        return PEER_OBSERVED;
+    if (strcmp(str, "PEER_REPUTATION") == 0)
+        return PEER_REPUTATION;
     return -1;  // No matching message type found (all valid types are > 0)
 }
 
@@ -176,7 +188,13 @@ int signal_to_proto(const signal_t *msg, void **data_ptr, size_t *data_len_ptr)
 /* Frama-C: skipped — [solver-timeout] JSON + protobuf preconditions */
 int net_msg_pack_json(net_msg_t *msg, json_t *json)
 {
-    char *str = json_dumps(json, JSON_COMPACT);
+    /* JSON_ENCODE_ANY: permit a scalar root (e.g. a bare string), not just
+     * object/array. The partition_signal IPC carries the from_addr as a
+     * bare JSON string (doc/architecture/partition-recovery.md §5.1);
+     * without this flag json_dumps returns NULL for it and the signal is
+     * silently dropped (the probe is never emitted). Object/array payloads
+     * encode identically. */
+    char *str = json_dumps(json, JSON_COMPACT | JSON_ENCODE_ANY);
     if (str == NULL)
         return -1;
     size_t slen = strlen(str);
@@ -197,7 +215,10 @@ int net_msg_unpack_json(const net_msg_t *msg, json_t **json)
     if (msg->obj == NULL || msg->len == 0)
         return -1;
     json_error_t error;
-    *json = json_loads((const char *)msg->obj, 0, &error);
+    /* JSON_DECODE_ANY mirrors the JSON_ENCODE_ANY in net_msg_pack_json so a
+     * scalar-root payload (the partition_signal from_addr) round-trips.
+     * Object/array payloads decode identically. */
+    *json = json_loads((const char *)msg->obj, JSON_DECODE_ANY, &error);
     if (*json == NULL)
         return -1;
     return 0;
@@ -218,7 +239,7 @@ int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr
     char uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(msg->from_whom.uuid, uuid_str);
     json_object_set_new(root, "from_uuid", json_string(uuid_str));
-    json_object_set_new(root, "from_name", json_string(msg->from_whom.fullname));
+    json_object_set_new(root, "from_name", json_string(msg->from_whom.nickname));
     json_object_set_new(root, "from_address", json_string(msg->from_whom.address));
     json_object_set_new(root, "from_sig_hex",
                         json_string((const char *)msg->from_whom.signature.public_hex));
@@ -227,7 +248,7 @@ int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr
 
     uuid_unparse_lower(msg->to_whom.uuid, uuid_str);
     json_object_set_new(root, "to_uuid", json_string(uuid_str));
-    json_object_set_new(root, "to_name", json_string(msg->to_whom.fullname));
+    json_object_set_new(root, "to_name", json_string(msg->to_whom.nickname));
     json_object_set_new(root, "to_address", json_string(msg->to_whom.address));
     json_object_set_new(root, "to_sig_hex",
                         json_string((const char *)msg->to_whom.signature.public_hex));
@@ -374,6 +395,22 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         memcpy(subdata, &msg->info.peer_rtt_update, subdata_len);
         break;
     }
+    case PEER_OBSERVED:
+    {
+        subdata_len = sizeof(peer_observed_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.peer_observed, subdata_len);
+        break;
+    }
+    case PEER_REPUTATION:
+    {
+        subdata_len = sizeof(peer_reputation_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.peer_reputation, subdata_len);
+        break;
+    }
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:
     case ZTA_VERIFICATION_RESULT:
@@ -409,7 +446,10 @@ int proto_to_signal(uint8_t *data, size_t len, signal_t *sig)
      * NOT guaranteed NUL-terminated (it is a raw protobuf value), so stay
      * inside `len` throughout. */
     const char *s = (const char *)data;
-    size_t dash = 0;
+    /* A negative sig (signal_to_proto writes "%d-%s", so sig -1 yields
+     * "-1-test") puts a sign in s[0]. That leading sign is part of the
+     * integer, not the separator, so start the scan past it. */
+    size_t dash = (s[0] == '-' || s[0] == '+') ? 1 : 0;
     while (dash < len && s[dash] != '-')
         dash++;
     if (dash == 0 || dash >= len)
@@ -487,7 +527,7 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
         uuid_parse(from_uuid, net_msg->from_whom.uuid);
     const char *from_name = json_string_value(json_object_get(root, "from_name"));
     if (from_name)
-        strncpy(net_msg->from_whom.fullname, from_name, NAME_LEN);
+        strncpy(net_msg->from_whom.nickname, from_name, NAME_LEN);
     const char *from_addr = json_string_value(json_object_get(root, "from_address"));
     if (from_addr)
         strncpy(net_msg->from_whom.address, from_addr, ADDR_LEN);
@@ -505,7 +545,7 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
         uuid_parse(to_uuid, net_msg->to_whom.uuid);
     const char *to_name = json_string_value(json_object_get(root, "to_name"));
     if (to_name)
-        strncpy(net_msg->to_whom.fullname, to_name, NAME_LEN);
+        strncpy(net_msg->to_whom.nickname, to_name, NAME_LEN);
     const char *to_addr = json_string_value(json_object_get(root, "to_address"));
     if (to_addr)
         strncpy(net_msg->to_whom.address, to_addr, ADDR_LEN);
@@ -578,6 +618,12 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
         return 0;
     case PEER_RTT_UPDATE:
         memcpy(&msg->info.peer_rtt_update, pb_msg->value.data, sizeof(peer_rtt_update_msg_t));
+        return 0;
+    case PEER_OBSERVED:
+        memcpy(&msg->info.peer_observed, pb_msg->value.data, sizeof(peer_observed_msg_t));
+        return 0;
+    case PEER_REPUTATION:
+        memcpy(&msg->info.peer_reputation, pb_msg->value.data, sizeof(peer_reputation_msg_t));
         return 0;
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:

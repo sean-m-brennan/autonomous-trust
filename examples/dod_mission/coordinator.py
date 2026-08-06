@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #  Licensed under the Apache License, Version 2.0
 # ******************
 """DoD mission demo coordinator / inspector node.
@@ -50,7 +50,59 @@ from autonomous_trust.core.config.generate import (
     generate_identity, generate_worker_config,
 )
 from autonomous_trust.core.system import now, queue_cadence
+from autonomous_trust.inspector.transitive_trust import (
+    TransitiveTrustMixin, PEER_PAIR_QUERY_SEC)
 from autonomous_trust.evaluation.scenarios.recording import EventRecorder
+
+def _roster_name_of(peer):
+    """Bare roster name for a peer == the local-part of its ONLINE nickname.
+
+    The online nickname (e.g. ``mq800@tekfive.com``) is the only globally-
+    consistent, wire-carried name; the local petname is deliberately arbitrary
+    (a random suffix is minted on receipt -- see
+    identity.derive_local_petname) and must NOT be used to match a peer to its
+    scenario roster role. We strip the ``@domain`` to recover the deployment-set
+    AT_PEER_NAME (``mq800``) the scenario keys on.
+
+    Accepts either a raw ``Identity`` (``.nickname``) or a peer wrapper that
+    exposes ``.identity`` (the inspector's ``PeerDataAcq``), and tolerates a
+    nickname with no ``@`` (returned as-is)."""
+    ident = getattr(peer, "identity", None) or peer
+    nn = (getattr(ident, "nickname", None)
+          or getattr(peer, "nickname", None) or "")
+    return str(nn).split('@', 1)[0].strip()
+
+
+def _peer_permits_neighbor(name: str, agency: str,
+                           other: str, other_agency: str) -> bool:
+    """Trust-graph isolation policy for one endpoint of an edge (mirrors the
+    real command structure):
+
+    * **microdrones** are ODA-internal assets (flown by the squad), so they
+      only trust-link WITHIN the ODA — to soldiers and to each other.
+    * the **command** node coordinates only with the RQ-86 gateways and the
+      ODA, so it only links to ``rq86-*`` or ODA peers.
+
+    Everyone else is unrestricted (returns True). Pure — keyed on the same
+    name prefixes the warm-start cohort uses (see reputation_warmstart)."""
+    if name.startswith("microdrone-"):
+        return other_agency == "ODA"
+    if name == "command":
+        return other.startswith("rq86-") or other_agency == "ODA"
+    return True
+
+
+def _trust_edge_allowed(a: str, agency_a: str, b: str, agency_b: str) -> bool:
+    """True if a bilateral trust edge between ``a`` and ``b`` may be drawn.
+
+    Admitted iff BOTH endpoints permit the other (intersection of the two
+    isolation policies). So e.g. command<->microdrone is DROPPED: command
+    permits the ODA, but the microdrone permits only ODA members and the
+    command node is not one — command reaches the ODA via the squad, not each
+    drone. Pure."""
+    return (_peer_permits_neighbor(a, agency_a, b, agency_b)
+            and _peer_permits_neighbor(b, agency_b, a, agency_a))
+
 
 try:
     from autonomous_trust.inspector.peer.daq import Cohort, CohortTracker
@@ -123,6 +175,28 @@ try:
             # kwargs['cohort'] access still succeeds and we don't leak
             # the extra kwarg into the Protocol base class.
             self.reading_drain = kwargs.pop('reading_drain', None)
+            # Nicknames of peers known to produce data — the roster-driven
+            # subscribe fallback for late joiners whose data-cap advert was
+            # lost (see _patched_process). Empty set => fallback is a no-op.
+            self.data_producers = set(kwargs.pop('data_producers', None) or ())
+            # uuid strings of peers we have ACTUALLY received a reading from.
+            # The roster subscribe is fire-and-forget on the producer side
+            # (server.handle_requests registers a client only if the request
+            # lands), so a single lost/early request strands a producer at
+            # clients=0 forever. We retry the subscribe until a reading shows
+            # up here, so a late joiner (mq800) whose first request was dropped
+            # — or arrived before its group-join settled — still gets serviced.
+            self._received_data_uuids: set = set()
+            # Re-subscribe throttle: attempt every Nth process() iteration
+            # (the first attempt is on iteration 0, see _patched_process) so a
+            # lost/early request is retried within ~N * q_cadence seconds until
+            # data flows. Kept small so a late joiner whose advert was lost
+            # (mq800) appears within a few seconds, not ~10s; raise to ease
+            # network load if a deployment has many silent producers.
+            self._resub_period = max(1, int(
+                os.environ.get("AT_DATA_RESUBSCRIBE_TICKS", "6")))
+            self._resub_tick = 0
+            self._resub_logged: set = set()
             super().__init__(configurations, subsystems, log_queue,
                              dependencies, **kwargs)
 
@@ -137,6 +211,10 @@ try:
                 self.logger.exception(
                     "DiagDataRcvr.handle_data: failed to decode payload")
                 return True
+            # Mark this producer as live so the roster-subscribe retry
+            # (see _patched_process) stops re-requesting its stream.
+            if uuid_str is not None:
+                self._received_data_uuids.add(uuid_str)
             if self.reading_drain is None:
                 # Fallback: keep the legacy per-peer cohort path so
                 # we don't silently lose data if reading_drain wasn't
@@ -180,7 +258,57 @@ try:
                             msg, block=True, timeout=self.q_cadence)
                         self.logger.info(
                             "DiagDataRcvr: subscribed to %s",
-                            getattr(ident, "nickname", ident))
+                            _roster_name_of(ident) or ident)
+
+                # Fallback: subscribe to admitted data-PRODUCING roster peers
+                # whose data-capability advertisement never reached us. A late
+                # joiner (the MQ-800 at T+4:00) can drop that advert under UDP
+                # loss; the cap path above then never lists it, so its readings
+                # never arrive and it is never detected — which also strands the
+                # anomaly-gated jet. The peer's DataProcess runs regardless and
+                # answers a direct request, so subscribing by roster recovers
+                # the stream.
+                #
+                # The subscribe is fire-and-forget: the producer registers us
+                # as a client only if the request actually lands
+                # (server.handle_requests), and there is no ack. A single
+                # request lost to UDP — or sent before the late joiner's
+                # group-join settled — therefore leaves it at clients=0 forever
+                # (observed: mq800 emits "active=True, clients=0", its readings
+                # never arrive, no anomaly, jet never launches). So we RETRY on
+                # a throttle, keyed on whether a reading has actually arrived
+                # (_received_data_uuids, set in handle_data), not on whether we
+                # once sent a request — until the stream is live.
+                #
+                # Fire on the FIRST pass (tick 0 % period == 0) and then every
+                # _resub_period passes — incrementing AFTER the check. The
+                # increment used to run first, so the first attempt waited a
+                # whole period (~10s): mq800, whose advert is lost and which
+                # thus depends entirely on this path, appeared ~10s late while
+                # cap-advertised producers (rq86) showed immediately. Firing
+                # immediately closes that mq800-specific lag.
+                if (self.data_producers
+                        and self._resub_tick % self._resub_period == 0):
+                    for p in self._pending_roster_subscriptions(
+                            self.protocol.peers.all,
+                            self._received_data_uuids,
+                            self.data_producers):
+                        msg = _DQ_Message(
+                            _DQ_DataProcess.name,
+                            _DQ_DataProtocol.request,
+                            self.name, p)
+                        queues[_DQ_CfgIds.network].put(
+                            msg, block=True, timeout=self.q_cadence)
+                        # Log the first attempt per peer at INFO; later retries
+                        # at DEBUG so a never-reachable producer can't flood.
+                        uid = str(getattr(p, "uuid", ""))
+                        log = (self.logger.info if uid not in self._resub_logged
+                               else self.logger.debug)
+                        self._resub_logged.add(uid)
+                        log("DiagDataRcvr: roster-subscribed to %s "
+                            "(no readings yet — retrying until live)",
+                            _roster_name_of(p) or p)
+                self._resub_tick += 1
 
                 # Drain inbound messages (the data payloads).
                 try:
@@ -198,6 +326,36 @@ try:
                         self.logger.error(
                             "Unhandled message of type %s",
                             type(message).__name__)
+
+        @staticmethod
+        def _pending_roster_subscriptions(peers_all, already, data_producers):
+            """Roster peers that produce data but aren't satisfied yet.
+
+            Pure decision half of the late-joiner fallback (see
+            _patched_process): given the admitted roster, the set of peers
+            already satisfied, and the set of data-producer roster names,
+            return the peers to (re)subscribe to now. ``already`` may hold
+            Identity objects (the cap path's servicers) OR bare uuid strings
+            (the retry path's _received_data_uuids) — both reduce to a uuid
+            string. Dedups by uuid string so a peer already serviced / already
+            delivering data is skipped, and the same peer isn't returned twice
+            within one pass.
+            """
+            subscribed = {str(getattr(s, "uuid", s)) for s in already}
+            pending = []
+            for p in peers_all:
+                # Match on the ONLINE nickname's local-part, NOT the petname:
+                # the petname is local-only and arbitrary on the receiver side
+                # (random suffix), so it never equals a roster name like
+                # "mq800". See _roster_name_of / identity.derive_local_petname.
+                if _roster_name_of(p) not in data_producers:
+                    continue
+                uid = str(getattr(p, "uuid", ""))
+                if not uid or uid in subscribed:
+                    continue
+                subscribed.add(uid)
+                pending.append(p)
+            return pending
 
         def _resolve_identity(self, ref):
             """Accept Identity, UUID, or uuid-string; return Identity
@@ -262,6 +420,11 @@ from scenario import DoDMissionScenario  # noqa: E402
 from dashboard.dod_app import build_dashboard  # noqa: E402
 from dashboard import live_server  # noqa: E402
 from dashboard.narration_script import DOD_NARRATION  # noqa: E402
+from reputation_warmstart import (  # noqa: E402
+    is_warm_start_member, is_pre_trusted, reconcile_rep_score,
+    reconcile_rep_score_sticky, warm_start_edge_score,
+    SEED_REPUTATION, SEED_TIER,
+)
 sys.path.insert(0, str(_HERE / "tasks"))
 from validation import (  # noqa: E402
     POSITION_VALIDATOR_X, POSITION_VALIDATOR_Y, ELECTRONIC_NOISE_VALIDATOR,
@@ -269,6 +432,16 @@ from validation import (  # noqa: E402
 )
 
 logger = logging.getLogger(__name__)
+
+
+# The consensus reputation baseline for a peer with no committed bilateral
+# history is exactly the neutral 0.5 (see repprocess._consensus_baseline,
+# final fallback). A real EMA over the demo's transaction scores (0.3 for an
+# anomalous batch, 0.8 for a clean one) never lands exactly on 0.5, and a
+# slash floors to 0.1 — so an exact-0.5 reading is the "no information yet"
+# cold-start placeholder, not an earned score. The neutral test + the
+# warm-start substitution that uses it now live in reputation_warmstart
+# (is_neutral_rep / reconcile_rep_score), shared with tools/seed_dod_cohort.py.
 
 
 def _ts_keep(batch_id: str, denom: int) -> bool:
@@ -301,7 +474,7 @@ def _reading_from_dict(d: dict) -> Reading:
     )
 
 
-class DoDMissionCoordinator(AutonomousTrust):
+class DoDMissionCoordinator(TransitiveTrustMixin, AutonomousTrust):
     """Coordinator node for the DoD squad infiltration demo.
 
     Extends AutonomousTrust with:
@@ -323,6 +496,47 @@ class DoDMissionCoordinator(AutonomousTrust):
         self._compromise_mode = compromise_mode
         self._dashboard_port = dashboard_port
         self._reputation_cache: dict[str, float] = {}
+        # Dashboard warm-start: replace a pre-trusted peer's cold-start 0.5
+        # with its seeded prior when it has no *earned* consensus to show.
+        # Two cases qualify:
+        #   * join_phase > 0   — joins too late to build history (the
+        #                        fighter-jet's ~15 s strike window).
+        #   * kind == soldier  — consumer-only (participant.py: squad members
+        #                        run no data generator), so they never appear
+        #                        as a counterparty in scored bilateral
+        #                        transactions and their consensus stays at the
+        #                        neutral baseline forever. Their trust is
+        #                        pre-established (seeded), exactly as the
+        #                        narration states ("pre-established trust with
+        #                        their microdrones…"), so the dashboard should
+        #                        show that seeded prior, not 0.5.
+        #   * kind == microdrone — seeded in the persistent cohort (~0.7); their
+        #                        earned build-up does not reliably surface via
+        #                        the coordinator's consensus query (data-light /
+        #                        group-churn-prone, more so since C-node interop
+        #                        widened the field cohort), so they read
+        #                        "forming…" indefinitely without warm-start. A
+        #                        real rising score still overrides the prior the
+        #                        moment one lands (reconcile_rep_score), so the
+        #                        trust-dynamics build-up is unaffected when it
+        #                        does surface. See reputation_warmstart
+        #                        .is_warm_start_member (the authoritative set).
+        # Keyed by roster name (== the local-part of the AT identity's online
+        # nickname; see _roster_name_of). _reputations_view / _tiers_view apply
+        # the same prior for a warm-start asset that never surfaces a score.
+        self._warm_start_peers: set[str] = {
+            p.name for p in scenario.peers.values()
+            if is_warm_start_member(
+                p.name, getattr(p, "join_phase", 0), p.kind)
+        }
+        # The coordinator's OWN AT node (nickname "coordinator") is the
+        # observer, not a scenario peer, so the comprehension above never sees
+        # it — yet is_warm_start_member treats it as infrastructure that should
+        # read trusted from t=0. Add it explicitly so it surfaces its seeded
+        # prior (0.70 / T2) instead of the cold-start 0.50 it would otherwise
+        # show in its own dashboard. ("command" is a real scenario peer and is
+        # already covered by the comprehension.)
+        self._warm_start_peers.add("coordinator")
         self._anomaly_log: list[dict] = []
         self._tick_count = 0
         self._latest_state: dict = {
@@ -392,6 +606,12 @@ class DoDMissionCoordinator(AutonomousTrust):
         # repprocess.SlashAttestation / reputation-vs-blockchain-analysis.md.
         self._anomaly_streak: dict[str, int] = {}
         self._slashed_peers: set = set()
+        # Peers the scenario has excluded (PEER_EXCLUDE). A forged-identity
+        # sensor is rejected at the ZTA identity layer, so it never forms a
+        # consensus chain and the exclusion slash can't resolve its uuid;
+        # tracking the exclusion here lets _reputations_view floor its
+        # displayed score deterministically (see that method).
+        self._excluded_peers: set = set()
         # Live queues handle, set each tick by autonomous_tasking; used by
         # _on_scenario_event (which has no queues param of its own).
         self._task_queues = None
@@ -456,8 +676,21 @@ class DoDMissionCoordinator(AutonomousTrust):
         # required by DataRcvr.__init__ (and useful for peer-metadata
         # bookkeeping); pass it alongside.
         if HAS_DATA and HAS_INSPECTOR:
+            # Roster of peers that PRODUCE data (have generator bundles in
+            # participant._build_generators). The data sink subscribes to
+            # these directly as a fallback when their `data` capability
+            # advertisement never reaches it — a late joiner like the MQ-800
+            # (T+4:00) can drop that advert, and then the cap-driven subscribe
+            # path never lists it, so its readings never arrive and it is
+            # never detected. See DiagDataRcvr._patched_process.
+            _DATA_PRODUCER_KINDS = {
+                "microdrone", "recon-drone", "armed-drone", "ground-sensor"}
+            data_producers = {
+                name for name, role in scenario.peers.items()
+                if getattr(role, "kind", None) in _DATA_PRODUCER_KINDS}
             self.add_worker(DiagDataRcvr, cohort=self._cohort,
-                            reading_drain=self._reading_drain)
+                            reading_drain=self._reading_drain,
+                            data_producers=data_producers)
 
         # Subscribe to the scenario's event stream so we can record
         # PhaseEvents (PEER_JOIN, COMPROMISE_START, PEER_EXCLUDE) to
@@ -487,7 +720,7 @@ class DoDMissionCoordinator(AutonomousTrust):
             name=__name__,
             title=self.scenario.name,
             panels=self._panels,
-            chart_keys=["target_x_chart", "noise_chart"],
+            chart_keys=["target_x_chart", "noise_chart", "trust_network"],
             state_provider=lambda: self._latest_state,
             port=self._dashboard_port,
             narration_script=DOD_NARRATION,
@@ -495,6 +728,9 @@ class DoDMissionCoordinator(AutonomousTrust):
             # the start; it can still be toggled off via Presentation Mode.
             presentation_default=True,
             peer_names=sorted(self.scenario.peers.keys()),
+            # Open the Peer Detail drawer on the rq86-1 gateway by default
+            # (falls back to empty if that peer isn't in the cohort).
+            default_peer="rq86-1",
         )
         logger.info("Dashboard serving on :%d", self._dashboard_port)
 
@@ -509,10 +745,30 @@ class DoDMissionCoordinator(AutonomousTrust):
         # data_stream queues (a small, fixed-size multiproc Queue
         # allocated from the QueuePool).
         self._drain_peer_readings(queues)
-        # Query reputation every ~30s (60 ticks at the 500ms cadence
-        # multi-agency assumes; tune later from real runs).
-        if self._tick_count % 60 == 0:
+        # Query reputation every ~10s (20 ticks at the 500ms cadence) so an
+        # earned consensus score surfaces on the dashboard promptly instead of
+        # lagging up to a full ~30s behind the tx that produced it. The cohort
+        # is small, so the extra consensus_rep_req fan-out is cheap; pre-trusted
+        # assets already read their warm-start prior immediately
+        # (_reputations_view), so this mainly accelerates the visible climb of
+        # the cold-bootstrap field peers (sensors / rq86 / mq800).
+        if self._tick_count % 20 == 0:
             self._query_reputations(queues)
+        # Peer-of-peer (transitive) trust: ask each observer for its view of
+        # every other subject over the network (TransitiveTrustMixin). Replies
+        # land in self.latest_reputation_pairs (automate.py); _build_trust_matrix
+        # turns them into the dashboard's Trust Network edges. Cadence ~= 60s
+        # (PEER_PAIR_QUERY_SEC) at the 500ms tick, kept off the 20-tick direct
+        # cadence since it is O(N^2).
+        if self._tick_count % int(PEER_PAIR_QUERY_SEC / 0.5) == 0:
+            self.query_peer_pairs(queues, logger=logger)
+        # Flush the recording on its own (slower) cadence so a hard kill (or a
+        # missed graceful-shutdown window — e.g. k8s teardown wiping the node)
+        # can't discard the whole run; it's a durability backstop, not a display
+        # path, so it need not track the query cadence. cleanup() still does a
+        # final flush. No-op when recording is disabled.
+        if self._tick_count % 60 == 0:
+            self._flush_recording()
         # Advance the scenario clock so phases progress past Setup in
         # live mode. The Approach-phase gate (Phase 6 #2) consults the
         # live tier view attached above; until ≥90% of peers reach
@@ -547,6 +803,7 @@ class DoDMissionCoordinator(AutonomousTrust):
     _logged_first_rep_drain = False
     _logged_first_batch_seen = False
     _logged_missing_task_id = False
+    _logged_jet_gate = False
 
     def _drain_peer_readings(self, queues=None):
         """Drain payloads that DiagDataRcvr has put onto the shared
@@ -584,7 +841,10 @@ class DoDMissionCoordinator(AutonomousTrust):
                 "_drain_peer_readings: cohort first populated with "
                 "%d peer(s): %s",
                 len(self._cohort.peers),
-                sorted(p.nickname for p in self._cohort.peers.values()))
+                # Log the bare roster names (online-nickname local-part), not
+                # the arbitrary local petnames -- see _roster_name_of.
+                sorted(_roster_name_of(p)
+                       for p in self._cohort.peers.values()))
             DoDMissionCoordinator._logged_first_peers = True
         if (not DoDMissionCoordinator._logged_first_drain
                 and self._tick_count % 20 == 0):
@@ -617,9 +877,9 @@ class DoDMissionCoordinator(AutonomousTrust):
                     item)
                 continue
             peer = peers_by_uuid.get(uuid_str)
-            peer_name = (getattr(peer, 'nickname', None)
-                         or getattr(peer, 'fullname', None)
-                         or uuid_str[:8])
+            # Bare roster name for log lines (online-nickname local-part); the
+            # data path itself keys off the reading payload's peer_name.
+            peer_name = _roster_name_of(peer) or uuid_str[:8]
             if not DoDMissionCoordinator._logged_first_reading:
                 logger.info(
                     "_drain_peer_readings: first reading payload from "
@@ -646,17 +906,31 @@ class DoDMissionCoordinator(AutonomousTrust):
                         "Validator/chart dispatch failed for %s",
                         peer_name)
 
+    def _flush_recording(self, *, final: bool = False) -> None:
+        """Persist the recording captured so far.
+
+        Called periodically from autonomous_tasking (so an ungraceful exit
+        can't lose the run) and once more on shutdown. Safe to call when
+        recording is disabled (no-op) and to call repeatedly — ``save()``
+        rewrites the file each time."""
+        if self._event_recorder is None or not self._record_path:
+            return
+        try:
+            self._event_recorder.save(
+                self._record_path, scenario=self.scenario)
+            n = len(self._event_recorder.events)
+            if final:
+                logger.info("Recorded %d events to %s",
+                            n, self._record_path)
+            else:
+                logger.debug("Flushed %d events to %s (periodic)",
+                             n, self._record_path)
+        except Exception:
+            logger.exception("Failed to save recording")
+
     def cleanup(self):
         """Flush the event log to disk on shutdown."""
-        if self._event_recorder is not None and self._record_path:
-            try:
-                self._event_recorder.save(
-                    self._record_path, scenario=self.scenario)
-                logger.info("Recorded %d events to %s",
-                            len(self._event_recorder.events),
-                            self._record_path)
-            except Exception:
-                logger.exception("Failed to save recording")
+        self._flush_recording(final=True)
         logger.info("DoD mission coordinator shutting down")
 
     # -- internal -------------------------------------------------------
@@ -679,16 +953,24 @@ class DoDMissionCoordinator(AutonomousTrust):
                 == "PEER_EXCLUDE"):
             peer_name = getattr(event, "peer_name", None)
             if peer_name:
+                # Track the exclusion unconditionally so the dashboard can
+                # floor the score even when the slash below is a no-op (a
+                # forged-identity peer never joins, so its uuid won't resolve).
+                self._excluded_peers.add(peer_name)
                 self._submit_slash(
                     self._task_queues, peer_name,
                     reason=SlashAttestation.REASON_PEER_EXCLUDE,
                     floor=0.0)
 
     def _peer_uuid(self, peer_name):
-        """Resolve a roster nickname to its peer UUID (or None)."""
+        """Resolve a bare roster name to its peer UUID.
+
+        Matches on the ONLINE nickname's local-part (the wire-carried, globally
+        consistent name), NOT the local petname -- the petname is arbitrary on
+        the receiver (random suffix) and never equals a roster name."""
         try:
             for p in self.peers.all:
-                if getattr(p, "nickname", None) == peer_name:
+                if _roster_name_of(p) == peer_name:
                     return p.uuid
         except Exception:
             logger.debug("peer-uuid lookup failed for %s", peer_name,
@@ -765,26 +1047,87 @@ class DoDMissionCoordinator(AutonomousTrust):
             # process is actually delivering scores and what they look
             # like.  Without this, "still 0.49" gives no information
             # about which side of the pipeline is stalled.
+            # Diagnostic for the worker->main peer-propagation gap
+            # (dod-coordinator-partition-nonconvergence.md, layer 3): the
+            # IdentityProcess worker admits the mesh but `self.peers` (main
+            # proc) stays tiny. group_addrs tells us whether Group broadcasts
+            # reach main even when Peers broadcasts don't — if group_addrs is
+            # large while peers.all stays ~1, the gap is specifically the
+            # Peers fan-out / run_message_handlers application, not the queue.
+            try:
+                group_addrs = len(list(self.group.addresses)) \
+                    if getattr(self, "group", None) is not None else 0
+            except Exception:
+                group_addrs = -1
             logger.info(
-                "_query_reputations: tick=%d peers.all=%d "
+                "_query_reputations: tick=%d peers.all=%d group_addrs=%d "
                 "latest_reputation=%d history items, last5=%r",
-                self._tick_count, len(self.peers.all),
+                self._tick_count, len(self.peers.all), group_addrs,
                 len(self.latest_reputation),
                 [(str(k)[:8], round(getattr(v, "score", -1), 3))
                  for k, v in list(self.latest_reputation.items())[-5:]])
             DoDMissionCoordinator._logged_first_rep_drain = True
+        # Reconcile entries that resolve to the same display name before
+        # touching the cache/timeline. A peer that re-keys or rejoins (see
+        # the late-joiner handling) can leave a stale/forming uuid in
+        # latest_reputation alongside its live one; the forming uuid scores
+        # the neutral consensus baseline (0.5) while the live uuid carries
+        # the real EMA. The old code fed BOTH to the timeline each cycle, so
+        # a single peer's line drew two points per tick — its real score and
+        # 0.5 — i.e. a sawtooth (and the reputations table flipped to
+        # whichever uuid was iterated last). Collect candidate (score, tier)
+        # per name, then keep ONE representative, preferring a real
+        # (non-neutral) score over the 0.5 placeholder so a known reputation
+        # never jumps to 0.5.
+        candidates: dict[str, list[tuple[float, int]]] = {}
         for peer_id_str, rep in list(self.latest_reputation.items()):
             score = getattr(rep, "score", None)
             if score is None:
                 continue
             peer = peers_by_uuid.get(str(peer_id_str))
-            name = getattr(peer, "nickname", None) or str(peer_id_str)
-            self._reputation_cache[name] = float(score)
-            self._feed_timeline(name, float(score))
+            if peer is None:
+                # A uuid no longer in peers.all — a peer that left, or the
+                # stale identity of one that re-keyed (now deduped out by
+                # Peers.add). Its entry lingers in latest_reputation with a
+                # frozen value; skip it so it doesn't draw an orphan line.
+                continue
+            # Bare roster name from the ONLINE nickname's local-part (keys the
+            # panel + maps to the scenario role). NOT the petname: that is
+            # local-only and arbitrary on the receiver (random suffix), so it
+            # never equals a roster name like "mq800". See _roster_name_of.
+            name = _roster_name_of(peer)
+            # Skip a peer that surfaced before its nickname resolved (e.g. a
+            # half-admitted identity mid-handshake): an empty name renders as a
+            # spurious blank-labelled row (T0 / 0.50) at the top of the panel.
+            # It re-appears under its real name once the nickname lands.
+            if not name or not str(name).strip():
+                continue
+            tier = int(getattr(peer, "_tier", 0))
+            candidates.setdefault(name, []).append((float(score), tier))
+
+        for name, vals in candidates.items():
+            # Prefer a real (non-neutral) score; for a warm-start peer with
+            # only the neutral cold-start placeholder (e.g. the fighter-jet,
+            # present too briefly to build consensus) substitute its seeded
+            # prior so a pre-trusted asset never reads untrusted while up.
+            # Otherwise fall back to neutral (a genuinely cold/forming peer).
+            # Cross-cycle stickiness (the name-keyed twin of the per-peer
+            # running consensus EMA): when NO reading this cycle carries real
+            # earned evidence — every candidate is the neutral cold-start
+            # baseline — a peer that has already earned a score must NOT regress
+            # to that placeholder. This happens when a peer's live identity uuid
+            # briefly drops out of peers.all (churn) or a re-keyed/"forming"
+            # uuid surfaces alone, leaving only the 0.5 baseline for the name
+            # for a cycle or two; feeding it drew a per-peer sawtooth tooth
+            # (drop to baseline, then re-climb). A REAL drop — a lower EMA or a
+            # slash floor — is non-neutral, so it is NOT masked and still shows.
+            score, new_tier = reconcile_rep_score_sticky(
+                vals, name in self._warm_start_peers,
+                self._reputation_cache.get(name), self._tier_cache.get(name))
+            self._reputation_cache[name] = score
+            self._feed_timeline(name, score)
             # Stash the peer's trust tier alongside the score so the
-            # dashboard reputations panel can show both. tier defaults
-            # to 0 if the peer object isn't fully resolved yet.
-            new_tier = int(getattr(peer, "_tier", 0))
+            # dashboard reputations panel can show both.
             prev_tier = self._prev_tier_cache.get(name)
             self._tier_cache[name] = new_tier
             if prev_tier is not None and new_tier < prev_tier:
@@ -843,14 +1186,22 @@ class DoDMissionCoordinator(AutonomousTrust):
                 "type": "REPUTATION_SAMPLE",
                 "peer": peer_name,
                 "score": float(score),
+                # Carry the access tier alongside the score so canned
+                # playback can colour the Reputations ladder + drive the
+                # peer-detail status the same way the live dashboard does
+                # (it has no _tier_cache to reach into). Defaults to 0
+                # when the peer hasn't been tiered yet.
+                "tier": int(self._tier_cache.get(peer_name, 0)),
             })
 
-    def _cache_detection_reading(self, reading) -> None:
+    def _cache_detection_reading(self, reading) -> dict:
         """Stash a detection-typed Reading in per-(peer, uid) caches.
 
         Stores a flat dict (rather than DetectionSummary) so the entry
         survives the data_queue pickle hop into the live_server callback
         process without needing the inspector import on the wire path.
+        Returns the cached entry so callers (the recorder path) can
+        persist it into the playback sidecar.
         """
         md = reading.metadata or {}
         world_uid = str(md.get("world_uid", ""))
@@ -863,6 +1214,8 @@ class DoDMissionCoordinator(AutonomousTrust):
             "crop_size_px": tuple(md.get("crop_size_px") or (0, 0)),
             "bbox_in_crop_px": tuple(md.get("bbox_in_crop_px")
                                      or (0, 0, 0, 0)),
+            "obb_in_crop_px": [list(p) for p in (md.get("obb_in_crop_px")
+                                                 or [])],
             "target_latlon": tuple(md.get("target_latlon") or (0.0, 0.0)),
             "t_seconds": reading.timestamp.total_seconds(),
         }
@@ -872,6 +1225,7 @@ class DoDMissionCoordinator(AutonomousTrust):
             log = deque(maxlen=DETECTION_LOG_CAPACITY)
             self._detection_log_per_peer[reading.peer_name] = log
         log.append(entry)
+        return entry
 
     # Priority list for `_pick_primary_detection_per_peer`. World UIDs
     # that appear earlier "win" the per-peer slot, even if a later
@@ -901,7 +1255,7 @@ class DoDMissionCoordinator(AutonomousTrust):
                 out[peer] = dict(max(entries, key=lambda e: e["t_seconds"]))
         return out
 
-    def _reputations_view(self) -> dict:
+    def _reputations_view(self, t_seconds: float = 0.0) -> dict:
         """Reputations for the dashboard, completed with pre-established peers.
 
         Every pre-established peer (join_phase 0) should be forming a
@@ -915,13 +1269,158 @@ class DoDMissionCoordinator(AutonomousTrust):
         reps: dict = dict(self._reputation_cache)
         try:
             for role in self.scenario.peers.values():
-                if (getattr(role, "join_phase", 0) == 0
-                        and role.name not in reps):
-                    reps[role.name] = None
+                if role.name in reps:
+                    continue
+                # Only surface a peer's row once it has actually arrived on the
+                # map/narrative (peer_reputation_visible) — a pre-established
+                # asset is visible from t=0, a late joiner (MQ-800 T+4:00, jet
+                # at its dynamic launch) only when it checks in. Showing a late
+                # joiner's row before then read as confusing ("why is the rogue
+                # already listed?"); showing it only after it earns consensus
+                # lagged the map/narrative. This tracks arrival instead.
+                if not self.scenario.peer_reputation_visible(
+                        role.name, t_seconds):
+                    continue
+                # A WARM-START asset (microdrone/soldier/jet/command) reads its
+                # seeded prior, NOT "forming…": the warm-start in
+                # _query_reputations only fires once a peer surfaces in
+                # latest_reputation, which is unreliable for these data-light /
+                # churn-prone peers (see reputation_warmstart). A real
+                # (non-neutral) score still overrides it the moment one lands.
+                # A non-warm-start peer (e.g. the rogue MQ-800) reads "forming…"
+                # (None) until it earns its real — and soon-slashed — score.
+                reps[role.name] = (SEED_REPUTATION
+                                   if role.name in self._warm_start_peers
+                                   else None)
         except Exception:
             logger.debug("reputations-view roster merge failed",
                          exc_info=True)
+        # Deterministic untrusted-floor, mirroring the trust verdict:
+        #   ZTA invalid (forged identity) -> 0.0 (untrusted the moment known)
+        #   excluded but ZTA-valid        -> slash floor (sub-0.5, untrusted)
+        #
+        # PRIMARY MECHANISM (2026-06-03): forged-identity sensors are now
+        # rejected at the IDENTITY LAYER by the ZTA admission gate
+        # (idprocess.welcoming_committee + identity/zta/; provisioned by
+        # tools/provision_zta_certs.py). A rejected peer never joins, never
+        # gets scored, and so never appears in self._reputation_cache — the
+        # `forged_identity` floor below no longer fires in a ZTA-enabled run.
+        # It is retained as a DASHBOARD FALLBACK for ZTA-disabled runs (no
+        # zta_policy / no mission CA): there the hacked sensor would otherwise
+        # sit at the cold-start 0.5 baseline, so we still floor it to 0.0 as
+        # soon as it surfaces a reputation or is excluded (independent of the
+        # scripted PEER_EXCLUDE, which can lag if the bootstrap gate holds the
+        # clock at Setup). Floors only peers already present (or excluded) so
+        # we never conjure an absent peer; min() so we never raise a peer
+        # already lower. Clean sensors untouched. See zta-python-parity.md.
+        # TODO(follow-up): surface the actual ZTA rejection as a dashboard
+        # event (cross-process plumbing from the worker idprocess), then this
+        # fallback can be dropped entirely.
+        for role in self.scenario.peers.values():
+            name = role.name
+            zta_invalid = bool((getattr(role, "metadata", None) or {})
+                               .get("forged_identity"))
+            excluded = name in self._excluded_peers
+            if zta_invalid and (name in reps or excluded):
+                floor = 0.0
+            elif excluded:
+                floor = self._slash_floor
+            else:
+                continue
+            existing = reps.get(name)
+            reps[name] = (min(existing, floor)
+                          if isinstance(existing, (int, float)) else floor)
         return reps
+
+    def _tiers_view(self, t_seconds: float = 0.0) -> dict:
+        """Trust tiers for the dashboard, completed in lockstep with
+        _reputations_view: a pre-established warm-start asset that has no
+        earned tier yet reads its seeded tier (SEED_TIER) rather than T0, so
+        the reputations panel shows a consistent (score, tier) pair instead of
+        "0.70 / T0". A peer with a real cached tier keeps it (set together with
+        its real score in _query_reputations), so an earned tier still wins.
+        """
+        tiers = dict(self._tier_cache)
+        for role in self.scenario.peers.values():
+            if (role.name not in tiers
+                    and role.name in self._warm_start_peers
+                    and self.scenario.peer_reputation_visible(
+                        role.name, t_seconds)):
+                tiers[role.name] = SEED_TIER
+        return tiers
+
+    def _build_trust_matrix(self, t_seconds: float = 0.0):
+        """Undirected bilateral trust edges for the dashboard Trust Network.
+
+        Built from ``self.latest_reputation_pairs`` (populated by the peer-pair
+        query round): each ``(observer_uuid, subject_uuid) -> rep`` is resolved
+        to roster names and the two directional views of a pair are min-combined
+        (skepticism-wins). Returns ``list[(observer, subject, score)]`` — the
+        shape ``build_graph_from_scenario(trust_matrix=...)`` consumes.
+
+        Warm-start applies at two points:
+
+        * *Substitution* — a directional reading whose SUBJECT is a pre-trusted
+          asset with no earned bilateral history yet is a cold-start neutral
+          (0.5 in pure mode, PREREP_NEUTRAL 0.0 in tit-for-tat), the same reason
+          its Reputations-panel score is warm-started (reconcile_rep_score).
+          ``warm_start_edge_score`` surfaces the seeded prior so it draws an edge
+          instead of dropping off the graph. A real reading — including earned
+          skepticism — is left as-is, so the skepticism-wins min-combine still
+          lets genuine low trust override the prior.
+
+        * *Pre-established mesh* — the seeded cohort (``is_pre_trusted``:
+          squad-/microdrone-/jet-) mutually trusts at SEED_REPUTATION from t=0
+          (tools/seed_dod_cohort writes it into each member's
+          reputation.cfg.json). That trust EXISTS before any query, so it must
+          show IMMEDIATELY — not wait for the first O(N^2) peer-pair round
+          (~tick 120) to route and return, which left the graph edgeless for the
+          first ~1–2 min. It is drawn from the scenario ROSTER and gated by
+          ``peer_reputation_visible`` (the same arrival gate _reputations_view
+          uses, so the Trust Network and Reputations panels agree on when a
+          cohort member appears — the jet stays off the graph until its launch).
+          ``setdefault`` makes it a FALLBACK: a real earned reading (or a
+          cold-start one already substituted above) always wins over the seed.
+        """
+        warm = self._warm_start_peers
+        combined: dict[tuple[str, str], float] = {}
+        pairs = getattr(self, "latest_reputation_pairs", None)
+        if pairs:
+            name_of = {str(p.uuid): (_roster_name_of(p) or str(p.uuid))
+                       for p in self.peers.all}
+            for (obs_uuid, subj_uuid), rep in list(pairs.items()):
+                obs = name_of.get(str(obs_uuid))
+                subj = name_of.get(str(subj_uuid))
+                if not obs or not subj or obs == subj:
+                    continue
+                try:
+                    score = float(getattr(rep, "score", rep))
+                except (TypeError, ValueError):
+                    continue
+                score = warm_start_edge_score(score, subj in warm)
+                key = tuple(sorted((obs, subj)))
+                combined[key] = (min(combined[key], score)
+                                 if key in combined else score)
+        try:
+            cohort = sorted(
+                r.name for r in self.scenario.peers.values()
+                if is_pre_trusted(r.name)
+                and self.scenario.peer_reputation_visible(r.name, t_seconds))
+        except Exception:
+            logger.debug("trust-matrix warm-start mesh failed", exc_info=True)
+            cohort = []
+        for i, a in enumerate(cohort):
+            for b in cohort[i + 1:]:
+                combined.setdefault(tuple(sorted((a, b))), SEED_REPUTATION)
+        # Isolation policy: some assets are group-restricted (microdrones ->
+        # ODA-only; command -> rq86-*/ODA-only), so drop any edge the topology
+        # forbids -- whether it came from the seeded mesh or a real peer-pair
+        # reading. Applied last so it governs both sources uniformly.
+        agency_of = {r.name: getattr(r, "agency", "")
+                     for r in self.scenario.peers.values()}
+        return [(a, b, s) for (a, b), s in combined.items()
+                if _trust_edge_allowed(a, agency_of.get(a, ""),
+                                       b, agency_of.get(b, ""))]
 
     def _push_dashboard_update(self):
         # Scenario seconds since tasking_start — falls back to tick-derived
@@ -931,8 +1430,22 @@ class DoDMissionCoordinator(AutonomousTrust):
         except Exception:
             t_seconds = self._tick_count * 0.5
         self._latest_state = {
-            "reputations": self._reputations_view(),
-            "tiers": dict(self._tier_cache),
+            "reputations": self._reputations_view(t_seconds),
+            "tiers": self._tiers_view(t_seconds),
+            # Peer-of-peer trust edges for the Trust Network panel (Stage 5).
+            "trust_matrix": self._build_trust_matrix(t_seconds),
+            # Live narration gates for beats whose real moment floats. The jet
+            # strike is gated on the jet actually reaching the objective (its
+            # launch is gated on the MQ-800 collapse, so the strike time floats
+            # later than the authored t_start). See narration_script / the
+            # NarrationOverlay.advance_to gates arg.
+            "narration_gates": {
+                "jet_over_target": self.scenario.jet_over_objective(t_seconds),
+            },
+            # True (drifting) ISR target lat/lon so the map's microdrone FOV
+            # wedges point where the target actually IS, not the static squad
+            # hold (GROUND_MID) the drones loiter on. See target_position_map.
+            "target_latlon": self.scenario.true_target_latlon(t_seconds),
             "tick": self._tick_count,
             "t_seconds": t_seconds,
             "phase": (self.scenario.current_phase.name
@@ -965,16 +1478,30 @@ class DoDMissionCoordinator(AutonomousTrust):
                 if p.kind in ("soldier", "microdrone",
                               "recon-drone", "armed-drone",
                               "fighter-jet", "ground-sensor")
+                # Don't draw a late joiner (MQ-800 @ T+4:00, sensors @ T+2:00)
+                # before it actually arrives — else it sits at its roster
+                # position from t=0 and reads as "already here". peer_active
+                # also drops the two ECM microdrone casualties before exfil.
+                and self.scenario.peer_active(p.name, t_seconds)
             },
-            "detection_per_peer": self._pick_primary_detection_per_peer(),
+            # Detection markers follow the same active-peer gate so a lost
+            # microdrone's last detection doesn't linger on the map after it
+            # has dropped off.
+            "detection_per_peer": {
+                peer: entry
+                for peer, entry in self._pick_primary_detection_per_peer().items()
+                if self.scenario.peer_active(peer, t_seconds)
+            },
             "detection_per_target": {
                 f"{peer}|{uid}": dict(entry)
                 for (peer, uid), entry
                 in self._detection_per_target.items()
+                if self.scenario.peer_active(peer, t_seconds)
             },
             "detection_log_per_peer": {
                 k: [dict(entry) for entry in log]
                 for k, log in self._detection_log_per_peer.items()
+                if self.scenario.peer_active(k, t_seconds)
             },
         }
         try:
@@ -994,7 +1521,20 @@ class DoDMissionCoordinator(AutonomousTrust):
         # the chart fan-out + validator loop (the parallel
         # target_position_x/y readings are what the validators score).
         if reading.data_type == "detection":
-            self._cache_detection_reading(reading)
+            entry = self._cache_detection_reading(reading)
+            # Persist the detection (crop + bbox + label + UID) into the
+            # playback sidecar so the canned-playback peer-detail drawer
+            # can rebuild detection_per_peer / detection_log_per_peer —
+            # there is no live AT mesh in playback to re-emit these, and
+            # the crop imagery isn't otherwise reconstructable. Detection
+            # emissions are sparse (time-floor + per-UID suppression in
+            # generators/detection.py), so recording every one is cheap.
+            if self._event_recorder is not None and entry is not None:
+                snap = dict(entry)
+                snap["t"] = reading.timestamp.total_seconds()
+                snap["type"] = "DETECTION"
+                snap["peer"] = reading.peer_name
+                self._event_recorder.record_snapshot(snap)
             return
         if reading.data_type == "detection_heartbeat":
             # No visible state to update — the cache stays as-is so
@@ -1064,7 +1604,20 @@ class DoDMissionCoordinator(AutonomousTrust):
                 continue
             if result.is_anomalous:
                 anomalous_this_reading = True
-                t_sec = result.timestamp.total_seconds()
+                # Anomaly time on the coordinator SCENARIO clock
+                # (now - tasking_start) — the same clock that drives the jet
+                # position, phase events, and _jet_launch_time. NOT
+                # result.timestamp: that is reading.timestamp, stamped on the
+                # producer's AT_DEMO_T0_EPOCH (launcher) clock, which precedes
+                # tasking_start by the coordinator's boot/bootstrap offset. Using
+                # it armed gate_jet_on_anomaly that many seconds late, sliding the
+                # jet strike late live AND in playback (the recorded marker's "t"
+                # below re-arms the gate). Falls back to the tick-derived estimate
+                # until tasking_start is set, mirroring _push_dashboard_update.
+                try:
+                    t_sec = (now() - self.tasking_start).total_seconds()
+                except Exception:
+                    t_sec = self._tick_count * 0.5
                 # Type is "COMPROMISE_DETECT" (a PhaseEvent enum name) so the
                 # record survives PlaybackEngine.load_recorded's PhaseEvent
                 # filter and replays in the event log; data.source pins it
@@ -1087,6 +1640,26 @@ class DoDMissionCoordinator(AutonomousTrust):
                 self._anomaly_log.append(record)
                 if self._event_recorder is not None:
                     self._event_recorder.record(record)
+                # Release the gated fighter-jet strike once the rogue is
+                # actually exposed. The validator detection is the reliable
+                # signal in both live and playback (it fires whenever the
+                # rogue's data diverges and is recorded as a src="validator"
+                # COMPROMISE_DETECT); a slash may never resolve the rogue's
+                # uuid, so it is NOT a dependable gate. First (rogue) hit wins;
+                # non-rogue peers are ignored inside gate_jet_on_anomaly.
+                try:
+                    self.scenario.gate_jet_on_anomaly(result.peer_name, t_sec)
+                    if (not DoDMissionCoordinator._logged_jet_gate
+                            and getattr(self.scenario,
+                                        "_jet_anomaly_sec", None) is not None):
+                        logger.warning(
+                            "JET GATE armed by %s anomaly at t=%.1fs — "
+                            "jet will launch shortly",
+                            result.peer_name, self.scenario._jet_anomaly_sec)
+                        DoDMissionCoordinator._logged_jet_gate = True
+                except Exception:
+                    logger.exception("Failed to gate jet on anomaly for %s",
+                                     result.peer_name)
                 logger.warning(
                     "ANOMALY: %s reported %s=%.2f, consensus=%.2f (dev %.1f > %.1f)",
                     result.peer_name, result.data_type,
@@ -1273,4 +1846,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # Default to forkserver: 'fork' (Linux default through 3.13) forks a
+    # multi-threaded process and can deadlock the child. Harmless on 3.14+.
+    import multiprocessing as _mp
+    _mp.set_start_method('forkserver', force=True)
     main()

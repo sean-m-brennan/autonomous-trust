@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2024 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -47,6 +47,8 @@ typedef enum {
     UPDATE_VOTE,             /**< Vote on an update proposal. */
     UPDATE_ACCEPTED,         /**< Announcement that an update was accepted. */
     PEER_RTT_UPDATE,         /**< Net-proc → sibling processes: peer RTT telemetry. Local IPC only — not part of identity.proto / public_identity_t network serialization. */
+    PEER_OBSERVED,           /**< Identity → app: one observed peer (@ref peer_observed_msg_t). Local IPC only. */
+    PEER_REPUTATION,         /**< Reputation → app: one peer's earned score (@ref peer_reputation_msg_t). Local IPC only. */
 #ifdef AT_ZTA_ENABLED
     ZTA_REVOCATION_ALERT,    /**< Peer credential revocation notice. */
     ZTA_VERIFICATION_RESULT  /**< Outcome of a deferred ZTA verification. */
@@ -71,6 +73,13 @@ typedef struct
     size_t len;
     public_identity_t to_whom;
     public_identity_t from_whom;
+    /* Sender topology rank carried on the envelope (mirrors Python's
+     * from_whom._rank riding the wire). public_identity_t drops rank, so the
+     * envelope carries it alongside; net_proc route_to_process copies it in
+     * from the wire, and the identity process captures it into peer_ranks at
+     * admission for rank-based child-gateway discovery. Default 0 (unknown).
+     * See doc/architecture/gateway-reputation-tree.md. */
+    int from_rank;
     bool encrypt;
     char return_to[PROC_NAME_LEN+1];
     /* 32-char hex (UUID4 without dashes) + NUL — must match
@@ -120,6 +129,12 @@ typedef struct {
     uuid_t task_uuid;
     uuid_t peer_uuid;
     double score;
+    /* Name of the Capability that produced this score, so the reputation
+     * process can resolve its transaction_weight (mirrors Python
+     * TransactionScore.capability_name). Empty string == unknown/legacy →
+     * weight 1. Carried verbatim by the whole-struct memcpy in
+     * msg_types.c (TRANSACTION_SCORE ser/de), so no field-wise packing. */
+    char capability_name[CAP_NAMELEN + 1];
 } tx_score_msg_t;
 
 typedef struct {
@@ -147,6 +162,77 @@ typedef struct {
     uuid_t  peer_uuid;
     int32_t rtt_ms;
 } peer_rtt_update_msg_t;
+
+/**
+ * @brief AT → app: one peer as this node currently observes it.
+ *
+ * Half of the app-facing peer carrier; @ref peer_reputation_msg_t is the
+ * other half. The split follows process ownership rather than the consumer's
+ * convenience: the identity process holds the peer table, the ranks and the
+ * operator signals, while earned reputation lives in the reputation process.
+ * Neither reaches into the other; the consumer joins the two on @c peer_uuid.
+ *
+ * Local IPC only — not part of identity.proto or `public_identity_t` network
+ * serialization (same standing as @ref peer_rtt_update_msg_t).
+ *
+ * See doc/architecture/app-peer-carrier.md.
+ */
+typedef struct {
+    uuid_t   peer_uuid;
+    /** ed25519 signing public key (`public_identity_t.signature.public`).
+     *  Identity for a consumer: it is what a `did:key` embeds, so no
+     *  registry is needed to name this peer outside AT. */
+    uint8_t  signing_pubkey[crypto_sign_PUBLICKEYBYTES];
+    /** Topology rank (one-hop reachability via gateways), from the identity
+     *  process's `peer_ranks` seam; 0 = unknown. NOT a trust tier. */
+    int32_t  rank;
+    /** Durable: this node has a human guardian, and OUR receiver verified
+     *  their credential against the distinct operator anchor. Never the
+     *  peer's own claim. */
+    bool     operator_bound;
+    /** Live: epoch seconds of the last verified operator session, 0 = nobody
+     *  attending (or could not confirm — for a guardian edge those are the
+     *  same operational answer). Meaningless without a clock to compare
+     *  against, so it is carried raw and graded by the consumer, never
+     *  reduced to a bool here. Read together with @c operator_bound and
+     *  never for it: a bound node with nobody at the keyboard for a week is
+     *  a normal state, not an error.
+     *  See doc/architecture/operator-attended.md. */
+    double   operator_attested_at;
+    /** WHICH human, when the peer opted in: the guardian's ed25519 public
+     *  key, all-zero for "not advertised". Non-zero only when OUR receiver
+     *  verified a binding signed by that operator's credential and naming
+     *  this peer — the stored key IS the verification, so there is no second
+     *  flag here to disagree with it.
+     *
+     *  All-zero is the ordinary case and says nothing bad about the peer:
+     *  naming a guardian is opt-in, and one key per operator links that
+     *  human's nodes to each other, which is a real cost AT does not impose.
+     *  Zeroed whenever @c operator_bound is false, for the same reason the
+     *  stamp is. */
+    uint8_t  operator_pubkey[crypto_sign_PUBLICKEYBYTES];
+} peer_observed_msg_t;
+
+/**
+ * @brief AT → app: one peer's earned reputation.
+ *
+ * @c rated is the load-bearing field. AT's scale is anchored by fixed
+ * constants (PREREP_NEUTRAL, COMM_CUTOFF, the tier floors) rather than
+ * normalized across the peer population, so @c score crosses as-is — but a
+ * peer AT has never scored reads as exactly PREREP_NEUTRAL, which is also a
+ * score a peer can genuinely earn. Collapsing those two would let a consumer
+ * treat "no information" as a real, mid-range rating. @c rated separates
+ * them: false means @c score carries no information and must not be read.
+ *
+ * Local IPC only.
+ */
+typedef struct {
+    uuid_t peer_uuid;
+    /** AT's absolute [0.0, 1.0] score. Meaningless unless @c rated. */
+    double score;
+    /** True iff AT holds an actual rating for this peer. */
+    bool   rated;
+} peer_reputation_msg_t;
 
 #define SIGNAL_LEN 32
 
@@ -190,6 +276,8 @@ typedef struct
         update_vote_msg_t update_vote;
         update_accepted_msg_t update_accepted;
         peer_rtt_update_msg_t peer_rtt_update;
+        peer_observed_msg_t peer_observed;
+        peer_reputation_msg_t peer_reputation;
 #ifdef AT_ZTA_ENABLED
         zta_event_msg_t zta_event;
 #endif

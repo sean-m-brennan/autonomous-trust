@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -31,13 +31,22 @@ class Group(InitializableConfig):
     """
     _msg_class = identity_pb2.Group
 
-    def __init__(self, _uuid, _address_map, _nickname, _encryptor, _public_only=True):
+    def __init__(self, _uuid, _address_map, _nickname, _encryptor, _public_only=True,
+                 _created=0.0):
         super().__init__(identity_pb2.Group)
         self._uuid = str(_uuid)
         self._address_map = _address_map
         self._nickname = _nickname
         self._encryptor = _encryptor  # group-shared key
         self._public_only = _public_only
+        # Group age (ISSUES.md §3.1-b): a comparable creation epoch (seconds).
+        # Used only as the group-merge tiebreaker on a MEMBERSHIP-SIZE TIE — the
+        # OLDER (smaller `created`) group wins, so the more-established group
+        # absorbs the younger one. 0.0 = "unknown age" (the default for
+        # wire/test-constructed groups), in which case the merge falls back to
+        # the historical uuid tiebreaker so behavior is unchanged. Only groups
+        # minted via `initialize` carry a real age. Local/merge signal only.
+        self._created = float(_created) if _created else 0.0
 
     def __eq__(self, other):
         if not isinstance(other, self.__class__):
@@ -47,6 +56,11 @@ class Group(InitializableConfig):
     @property
     def uuid(self):
         return self._uuid
+
+    @property
+    def created(self):
+        """Comparable creation epoch (seconds); 0.0 if unknown. See §3.1-b."""
+        return getattr(self, '_created', 0.0)
 
     @property
     def nickname(self):
@@ -65,6 +79,37 @@ class Group(InitializableConfig):
     @property
     def encryptor(self):
         return self._encryptor
+
+    @property
+    def owns_private_key(self):
+        """True iff this Group holds the shared *private* box key (and can
+        therefore decrypt group traffic). Mirrors the ``owns_private``
+        predicate in :meth:`to_canonical` and the :meth:`encrypt` guard. A
+        public-only group — e.g. one reconstructed from a protobuf round-trip
+        (``sync_from_message`` forces ``_public_only=True``) or handed to us on
+        the wire with ``public_only`` set — returns False."""
+        return (not self._public_only) and self.encryptor.private is not None
+
+    def adopt_membership(self, other):
+        """Adopt *other*'s group identity (uuid) and membership (address map)
+        while KEEPING our own private encryptor. Used by ``handle_group_update``
+        when a group_key_update carries a larger membership but only the public
+        key: adopting *other* wholesale would drop our shared private key and
+        break group decrypt. ``group_key_update`` is membership-only (the key is
+        not rotated — see idprocess.py:1042), so retaining our encryptor is
+        correct, and it mirrors C's ``handle_group_update`` which copies only
+        uuid/address/address_map and keeps its own encryptor
+        (id_proc.c:2113-2134). See [[dod-microdrone-targets-live-vs-playback]]."""
+        self._uuid = str(other.uuid)
+        self._address_map = (dict(other._address_map)
+                             if isinstance(other._address_map, dict)
+                             else {a: a for a in other.addresses})
+        if other.nickname:
+            self._nickname = other.nickname
+        # Inherit the adopted group's age (§3.1-b) so subsequent merges compare
+        # against the established group's creation epoch, not ours.
+        if other.created:
+            self._created = other.created
 
     def encrypt(self, msg, whom, nonce=None):
         """
@@ -98,20 +143,27 @@ class Group(InitializableConfig):
 
     def sync_to_message(self):
         self.message.uuid = str(self._uuid).encode('utf-8')
-        # Proto has a single address string; take first value from map or empty
-        if self._address_map:
-            if isinstance(self._address_map, dict):
-                self.message.address = next(iter(self._address_map.values()), '')
-            else:
-                self.message.address = next(iter(self._address_map), '')
-        else:
-            self.message.address = ''
+        addr_map = dict(self._address_map) if isinstance(self._address_map, dict) \
+            else {a: a for a in (self._address_map or [])}
+        # Full UUID->address map (§1.4).
+        self.message.address_map.clear()
+        for uuid, addr in addr_map.items():
+            self.message.address_map[str(uuid)] = str(addr)
+        # Legacy single address = first value, for older peers that only read it.
+        self.message.address = next(iter(addr_map.values()), '')
+        self.message.created = float(self.created)  # §3.1-b group age
         self._encryptor.sync_to_message()
         self.message.encryptor.CopyFrom(self._encryptor.message)
 
     def sync_from_message(self):
         self._uuid = self.message.uuid.decode('utf-8')
-        self._address_map = {}
+        # Prefer the full map (§1.4); fall back to the legacy single `address`
+        # from an older peer (keyed by the group uuid, the best we can do
+        # without the original key).
+        self._address_map = dict(self.message.address_map)
+        if not self._address_map and self.message.address:
+            self._address_map = {self._uuid: self.message.address}
+        self._created = float(self.message.created) if self.message.created else 0.0
         self._nickname = ''
         self._public_only = True
         # Reconstruct nested Encryptor
@@ -120,10 +172,59 @@ class Group(InitializableConfig):
         self._encryptor.message.CopyFrom(self.message.encryptor)
         self._encryptor.sync_from_message()
 
+    def to_canonical(self):
+        """Flat, cross-runtime ("DRY canonical") group wire form, byte-shape
+        identical to C's ``group_to_json`` (identity/group.c). Used for the
+        ID_HISTORY group-key delivery so a C peer can parse it (Python's
+        default ConfigJSONEncoder form, with ``__type__``/``_uuid`` and a
+        base64-wrapped hex_seed, is unparseable by C). When we own the shared
+        private key, ``hex_seed`` is the RAW 32-byte box private key (so the
+        peer can decrypt group traffic); otherwise the public key, with
+        ``public_only`` disambiguating on read. See [[project_group_key_sync]]."""
+        addr_map = dict(self._address_map) if isinstance(self._address_map, dict) \
+            else {}
+        owns_private = (not self._public_only) and self.encryptor.private is not None
+        seed = self.encryptor.serialize() if owns_private else self.encryptor.publish()
+        if isinstance(seed, bytes):
+            seed = seed.decode('ascii')
+        return {
+            'typename': 'group',
+            'uuid': str(self._uuid),
+            'address': next(iter(addr_map.values()), ''),
+            'nickname': self._nickname or '',
+            'address_map': addr_map,
+            'encryptor': {'hex_seed': seed, 'public_only': not owns_private},
+            # Group age (§3.1-b) for the merge size-tie tiebreaker. Omitted-on-
+            # read defaults to 0.0 (unknown → uuid tiebreak), so a peer on an
+            # older build that doesn't send it stays compatible.
+            'created': self.created,
+        }
+
+    @staticmethod
+    def from_canonical(d):
+        """Inverse of :meth:`to_canonical`; reconstruct a Group from the flat
+        cross-runtime form (also what C emits). Tolerates a missing
+        ``public_only`` (defaults to public-only, matching C)."""
+        encr = d.get('encryptor', {}) or {}
+        seed = encr.get('hex_seed', '')
+        if isinstance(seed, str):
+            seed = seed.encode('ascii')
+        public_only = bool(encr.get('public_only', True))
+        return Group(d.get('uuid'), dict(d.get('address_map', {}) or {}),
+                     d.get('nickname', ''),
+                     Encryptor(seed, public_only=public_only), public_only,
+                     _created=d.get('created', 0.0) or 0.0)
+
     @staticmethod
     def initialize(address_map, our_nickname):
         time.sleep(random.random())  # reduce chance of collision
-        return Group(uuid_mod.uuid4(), address_map, our_nickname, Encryptor.generate(), False)
+        # Stamp a real creation epoch (§3.1-b) so a group minted here carries a
+        # comparable age for the merge tiebreaker. now() is the NTP-adjusted
+        # clock (autonomous_trust.core.system.now).
+        from ..system import now
+        created = now().timestamp()
+        return Group(uuid_mod.uuid4(), address_map, our_nickname,
+                     Encryptor.generate(), False, _created=created)
 
 
 class ChildGroupSet(object):

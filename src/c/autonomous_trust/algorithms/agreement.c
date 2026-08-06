@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -172,10 +172,30 @@ static int _int_desc_cmp(const void *a, const void *b)
     return (ia < ib) ? 1 : (ia > ib) ? -1 : 0;
 }
 
+/* Operational rank = signed rank + dynamic adjustment, floored at 0
+ * (deferred.md §2.2). Mirror of Python AgreementVoter.effective_rank. */
+int agreement_voter_effective_rank(const agreement_voter_t *voter)
+{
+    int eff = voter->rank + voter->rank_adjustment;
+    return (eff > 0) ? eff : 0;
+}
+
+/* Fold a one-hop reachability observation into the operational rank:
+ * unreachable fully demotes to effective rank 0; reachable restores the
+ * signed rank. Returns true if the effective rank changed. Mirror of
+ * Python AgreementVoter.observe_reachability — the live source on this side
+ * is PEER_RTT_UPDATE / peer_rtt_ms (processes.h). */
+bool agreement_voter_observe_reachability(agreement_voter_t *voter, bool reachable)
+{
+    int before = agreement_voter_effective_rank(voter);
+    voter->rank_adjustment = reachable ? 0 : -voter->rank;
+    return agreement_voter_effective_rank(voter) != before;
+}
+
 /* Derive the effective threshold rank. If an explicit non-negative
  * threshold was supplied at create-time, use it verbatim; otherwise
  * compute the top-1/3 cutoff over the current voter set. Mirrors
- * Python's authority.py:31-39 — sort ranks descending, take
+ * Python's authority.py:31-39 — sort effective ranks descending, take
  * ranks[max(1, len//3) - 1]. Empty voter set degrades to 0. */
 static int _authority_effective_threshold(const agreement_protocol_t *proto)
 {
@@ -190,7 +210,7 @@ static int _authority_effective_threshold(const agreement_protocol_t *proto)
     if (ranks == NULL)
         return 0;
     for (int i = 0; i < n; i++)
-        ranks[i] = proto->voters[i].rank;
+        ranks[i] = agreement_voter_effective_rank(&proto->voters[i]);
     qsort(ranks, (size_t)n, sizeof(int), _int_desc_cmp);
     int cutoff_idx = (n / 3 > 1) ? (n / 3) : 1;
     int result = ranks[cutoff_idx - 1];
@@ -203,8 +223,9 @@ static void _authority_count_vote(agreement_protocol_t *proto, merkle_blob_t *bl
                                   int *rank_out, bool *approval_out)
 {
     (void)blob;
-    *rank_out = voter->rank;
-    if (voter->rank >= _authority_effective_threshold(proto))
+    int eff = agreement_voter_effective_rank(voter);
+    *rank_out = eff;
+    if (eff >= _authority_effective_threshold(proto))
         *approval_out = proof->approval;
     else
         *approval_out = false;
@@ -223,8 +244,9 @@ static bool _authority_accumulate(agreement_protocol_t *proto, int *ranks, bool 
     int leader_rank = -1;
     for (int i = 0; i < proto->voter_count; i++)
     {
-        if (proto->voters[i].rank > leader_rank)
-            leader_rank = proto->voters[i].rank;
+        int eff = agreement_voter_effective_rank(&proto->voters[i]);
+        if (eff > leader_rank)
+            leader_rank = eff;
     }
     for (int i = 0; i < count; i++)
     {

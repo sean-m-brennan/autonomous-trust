@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -44,12 +44,12 @@ static int _identity_obj_designation(const merkle_blob_t *blob, uint8_t **out, s
     char uuid_str[37];
     uuid_unparse_lower(obj->identity->uuid, uuid_str);
 
-    /* originator + uuid + fullname + public_key.  Use strnlen throughout
+    /* originator + uuid + nickname + public_key.  Use strnlen throughout
      * so a wire-sourced identity that lacks a NUL terminator cannot walk
      * past the field and read adjacent memory. */
     size_t orig_len = strnlen(obj->originator_uuid, MERKLE_UUID_LEN);
     size_t uuid_len = strnlen(uuid_str, sizeof(uuid_str));
-    size_t name_len = strnlen(obj->identity->fullname, NAME_LEN + 1);
+    size_t name_len = strnlen(obj->identity->nickname, NAME_LEN + 1);
     if (orig_len >= MERKLE_UUID_LEN || uuid_len >= sizeof(uuid_str) ||
         name_len > NAME_LEN)
         return EINVAL;
@@ -65,7 +65,7 @@ static int _identity_obj_designation(const merkle_blob_t *blob, uint8_t **out, s
     offset += orig_len;
     memcpy(buf + offset, uuid_str, uuid_len);
     offset += uuid_len;
-    memcpy(buf + offset, obj->identity->fullname, name_len);
+    memcpy(buf + offset, obj->identity->nickname, name_len);
     offset += name_len;
     memcpy(buf + offset, obj->identity->signature.public, key_len);
 
@@ -705,18 +705,18 @@ bool identity_history_verify_object(identity_history_t *history,
         return false;
 
     /* Shape check: blob must carry a non-null identity with at least
-     * uuid + fullname + signature populated. Mirrors Python's
+     * uuid + nickname + signature populated. Mirrors Python's
      * IdentityObj.validate() (history.py:55-69). The C identity_obj_t
-     * stores `identity` as a pointer; null or zero-fullname rejects. */
+     * stores `identity` as a pointer; null or zero-nickname rejects. */
     const identity_obj_t *idobj = (const identity_obj_t *)blob;
     if (idobj->identity == NULL) {
         if (history->logger != NULL)
             log_debug(history->logger, "verify_object: no identity\n");
         return false;
     }
-    if (idobj->identity->fullname[0] == '\0') {
+    if (idobj->identity->nickname[0] == '\0') {
         if (history->logger != NULL)
-            log_debug(history->logger, "verify_object: identity has no fullname\n");
+            log_debug(history->logger, "verify_object: identity has no nickname\n");
         return false;
     }
     /* Signature key presence: the ed25519 public key is a fixed-size
@@ -775,6 +775,28 @@ bool identity_history_verify_object(identity_history_t *history,
                 log_warn(history->logger,
                          "verify_object: signature verification failed\n");
             return false;
+        }
+    }
+
+    /* Divergence detection (ISSUES.md §3.2): the proof commits the voter to a
+     * specific view of the candidate via its digest. Recompute the blob's hash
+     * — with the proof's nonce, so PoW's mined digest also matches — and reject
+     * a proof whose digest disagrees: that voter is voting on a conflicting
+     * history view of this blob. get_hash is byte-identical Python<->C (pinned
+     * by pow-cross-language-byte-pin), so this is interop-safe. Enforced only
+     * when a digest is present (empty-digest proofs fall through, matching
+     * prior behavior). Mirrors Python IdentityHistory.verify_object. */
+    if (proof != NULL && proof->digest != NULL && proof->digest_len > 0 &&
+        blob->get_hash != NULL) {
+        uint8_t computed[MERKLE_DIGEST_LEN];
+        if (blob->get_hash(blob, proof->nonce, proof->nonce_len, computed) == 0) {
+            if (proof->digest_len != MERKLE_DIGEST_LEN ||
+                memcmp(proof->digest, computed, MERKLE_DIGEST_LEN) != 0) {
+                if (history->logger != NULL)
+                    log_warn(history->logger, "verify_object: divergent history "
+                             "view — proof digest mismatch\n");
+                return false;
+            }
         }
     }
     return true;

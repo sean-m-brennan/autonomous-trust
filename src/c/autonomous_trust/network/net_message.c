@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -157,12 +157,17 @@ int net_message_to_wire(const net_wire_msg_t *msg, const identity_t *signer,
         uuid_unparse_lower(msg->from_whom.uuid, uuid_str);
     }
     json_object_set_new(root, "from_uuid", json_string(uuid_str));
-    json_object_set_new(root, "from_name", json_string(msg->from_whom.fullname));
+    json_object_set_new(root, "from_name", json_string(msg->from_whom.nickname));
     json_object_set_new(root, "from_address", json_string(msg->from_whom.address));
     json_object_set_new(root, "from_sig_hex",
                         json_string((const char *)msg->from_whom.signature.public_hex));
     json_object_set_new(root, "from_enc_hex",
                         json_string((const char *)msg->from_whom.encryptor.public_hex));
+    /* Sender topology rank (mirrors Python Message.__bytes__'s from_rank).
+     * Outside the signed pre-image (process|function|data) and the ciphertext,
+     * so it neither breaks signatures nor encryption. A receiver captures it
+     * into peer_ranks for rank-based child-gateway discovery. */
+    json_object_set_new(root, "from_rank", json_integer(msg->from_rank));
 
     char *json_str = json_dumps(root, JSON_COMPACT);
     json_decref(root);
@@ -267,7 +272,7 @@ int net_message_from_wire(const uint8_t *data, size_t len,
         if (from_uuid != NULL)
             uuid_parse(from_uuid, msg_out->from_whom.uuid);
         if (from_name != NULL)
-            strncpy(msg_out->from_whom.fullname, from_name, NAME_LEN);
+            strncpy(msg_out->from_whom.nickname, from_name, NAME_LEN);
         if (from_addr != NULL)
             strncpy(msg_out->from_whom.address, from_addr, ADDR_LEN);
         const char *from_sig = json_string_value(json_object_get(root, "from_sig_hex"));
@@ -279,6 +284,10 @@ int net_message_from_wire(const uint8_t *data, size_t len,
             (void)public_encryptor_init(&msg_out->from_whom.encryptor,
                                         (const unsigned char *)from_enc, strlen(from_enc));
     }
+    /* Sender topology rank (default 0 when the field is absent — older peers
+     * or unsigned/anonymous senders). Read regardless of the transport-`peer`
+     * branch: rank is the sender's claim on the envelope, not a transport fact. */
+    msg_out->from_rank = (int)json_integer_value(json_object_get(root, "from_rank"));
 
     /* extract and verify signature if present */
     msg_out->has_signature = false;

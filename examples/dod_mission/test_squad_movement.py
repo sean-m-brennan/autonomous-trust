@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2026 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #  Licensed under the Apache License, Version 2.0
 # ******************
 """Tests for the DoD demo squad infil/exfil movement model.
@@ -83,6 +83,28 @@ def test_exfiltrates_to_separate_extraction():
     assert _horiz_m(cap, _Pt(*GROUND_EXFIL)) < 5.0
     # Exfil point is genuinely distinct from the insertion LZ.
     assert _horiz_m(_Pt(*GROUND_EXFIL), _Pt(*GROUND_START)) > 500.0
+
+
+def test_two_microdrones_drop_off_before_exfil():
+    sc = _scenario()  # swarm_size=4
+    names = [f"microdrone-{i}" for i in range(1, 5)]
+    # Before the ECM losses, the whole swarm is active.
+    assert all(sc.peer_active(n, 300.0) for n in names)
+    # Staggered losses: microdrone-4 at T+5:20, microdrone-3 at T+5:40.
+    assert not sc.peer_active("microdrone-4", 330.0)
+    assert sc.peer_active("microdrone-3", 330.0)
+    assert not sc.peer_active("microdrone-3", 345.0)
+    # Exactly two survive into the exfil beat (T+7:00).
+    survivors = [n for n in names if sc.peer_active(n, 450.0)]
+    assert survivors == ["microdrone-1", "microdrone-2"]
+
+
+def test_small_swarm_takes_no_casualties():
+    # Scale-test safety: a swarm too small to spare two loses nobody.
+    sc = DoDMissionScenario(squad_size=2, swarm_size=2, include_mq800=False,
+                            include_jet=False, include_command=False)
+    assert sc.peer_active("microdrone-1", 450.0)
+    assert sc.peer_active("microdrone-2", 450.0)
 
 
 @pytest.mark.parametrize("minutes", [0.0, 2.0, 5.0, 7.5, 8.0])

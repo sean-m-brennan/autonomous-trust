@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2026 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -156,14 +156,25 @@ static int _drive_assertion(sce_run_ctx_t *ctx, json_t *step, int in_resp) {
         for (int i = ctx->outbox_start[in_resp];
              i < ctx->outbox_end[in_resp] && off < sizeof(captured) - 32; i++) {
             const sce_captured_t *cm = &ctx->captured[i];
-            off += snprintf(captured + off, sizeof(captured) - off,
-                            "%s%s->%s:%s",
-                            off == 0 ? "" : ", ",
-                            cm->from, cm->to, cm->function);
+            int n = snprintf(captured + off, sizeof(captured) - off,
+                             "%s%s->%s:%s",
+                             off == 0 ? "" : ", ",
+                             cm->from, cm->to, cm->function);
+            if (n < 0) break;
+            /* snprintf returns the would-be length, so clamp rather than let
+             * off run past the buffer and underflow the next size argument. */
+            if ((size_t)n >= sizeof(captured) - off) {
+                off = sizeof(captured) - 1;
+                break;
+            }
+            off += (size_t)n;
         }
+        /* Precisions bound each interpolation to its field width (ids are
+         * SCE_ID_LEN, functions SCE_FN_LEN, the list is `captured` above) so
+         * the whole message provably fits in ctx->err. */
         snprintf(ctx->err, sizeof(ctx->err),
-                 "step %d: expected %s->%s:%s in response to step %d; "
-                 "outbox of step %d held [%s]",
+                 "step %d: expected %.31s->%.31s:%.63s in response to step %d; "
+                 "outbox of step %d held [%.255s]",
                  sid, from, to, function, in_resp, in_resp,
                  captured[0] ? captured : "(empty)");
         return -1;

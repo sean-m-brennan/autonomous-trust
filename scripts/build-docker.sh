@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -246,23 +246,36 @@ run_builder() {
         # Also wipe the recipe's poetry output (./dist) so re-runs don't
         # confuse already-extracted wheels with newly-built ones.
         rm -rf "$src_pkg/dist"
-        # Temporarily move heavy/problematic subtrees OUTSIDE the source
-        # dir entirely. node_modules has tens of thousands of files plus
-        # broken symlinks that crash `cp -a` during conda-build's
-        # _copy_top_level_recipe step. Stash must be outside the bind-
-        # mounted source — a sibling location inside the same dir still
-        # gets walked by conda-build's recipe-copy. Production runtime
-        # needs only the built wheel; node_modules is dev-time only.
-        local stash="/tmp/at-builder-stash-$$-${sp//\//_}"
-        local stashed=0
-        if [[ -d "$src_pkg/reactjs/node_modules" ]]; then
-            mv "$src_pkg/reactjs/node_modules" "$stash"
-            stashed=1
-            # Restore on any exit path (success/failure/Ctrl-C) so a stray
-            # build crash doesn't leave the user with a missing
-            # node_modules dir.
+        # Temporarily move heavy/problematic dev-only subtrees OUTSIDE the
+        # source dir entirely. conda-build's recipe-copy (source: path: ./)
+        # walks the whole tree:
+        #   - reactjs/node_modules: tens of thousands of files plus broken
+        #     symlinks that crash `cp -a` during _copy_top_level_recipe.
+        #   - .tox / .venv: virtualenvs whose `bin/python` symlinks point at
+        #     host paths absent in the container, so the copy emits "broken
+        #     symlink - ignoring copy" warnings for each.
+        #   - .rustup: the Rust toolchain dir (large; internal symlinks).
+        # A sibling location inside the dir still gets walked, so the stash
+        # must be OUTSIDE the bind-mounted source. Production runtime needs
+        # only the built wheel; all are dev-time only. Restore on any exit
+        # path (success/failure/Ctrl-C) so a build crash doesn't lose them.
+        local -a _stash_rel=("reactjs/node_modules" ".tox" ".venv" ".rustup")
+        local -a _stash_from=() _stash_to=()
+        local _rel _sp_dest
+        for _rel in "${_stash_rel[@]}"; do
+            [[ -e "$src_pkg/$_rel" ]] || continue
+            _sp_dest="/tmp/at-builder-stash-$$-${sp//\//_}-${_rel//\//_}"
+            mv "$src_pkg/$_rel" "$_sp_dest"
+            _stash_from+=("$_sp_dest")
+            _stash_to+=("$src_pkg/$_rel")
+        done
+        if (( ${#_stash_from[@]} )); then
+            local _restore="" _i
+            for _i in "${!_stash_from[@]}"; do
+                _restore+="[[ -e '${_stash_from[$_i]}' && ! -e '${_stash_to[$_i]}' ]] && mkdir -p \"\$(dirname '${_stash_to[$_i]}')\" && mv '${_stash_from[$_i]}' '${_stash_to[$_i]}'; "
+            done
             # shellcheck disable=SC2064
-            trap "[[ -d '$stash' && ! -e '$src_pkg/reactjs/node_modules' ]] && mv '$stash' '$src_pkg/reactjs/node_modules'" EXIT INT TERM
+            trap "$_restore" EXIT INT TERM
         fi
         info "running package-builder for $sp ..."
         docker run --rm -u "$(id -u):$(id -g)" \
@@ -272,8 +285,13 @@ run_builder() {
             -v "$conda_repo:/build/dist" \
             -w /build/src \
             package-builder
-        if (( stashed )); then
-            mv "$stash" "$src_pkg/reactjs/node_modules"
+        if (( ${#_stash_from[@]} )); then
+            local _j
+            for _j in "${!_stash_from[@]}"; do
+                [[ -e "${_stash_from[$_j]}" && ! -e "${_stash_to[$_j]}" ]] && \
+                    mkdir -p "$(dirname "${_stash_to[$_j]}")" && \
+                    mv "${_stash_from[$_j]}" "${_stash_to[$_j]}"
+            done
             trap - EXIT INT TERM
         fi
         # Surface what got produced; if zero matching artifacts landed,
@@ -311,7 +329,7 @@ build_full() {
     docker build "${args[@]}" \
         -t "${IMAGE_NAME}-full" \
         -f "$SRC_DIR/Dockerfile" \
-        "$SRC_DIR"
+        "$REPO_DIR"
     push_to_registry "${IMAGE_NAME}-full" 2>/dev/null || true
 }
 

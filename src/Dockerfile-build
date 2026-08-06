@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -51,7 +51,11 @@ RUN apt update -y && apt install -y curl build-essential && apt clean
 
 RUN conda update -y -n base conda
 RUN conda config --add channels conda-forge
-RUN conda install -y -n base python=3.13 conda-build conda-verify pip python-build maturin mercurial
+# NB: builder-base Python only — the built packages' Python is set by meta.yaml,
+# independent of this pin. conda-verify dropped (deprecated; its recipe checks
+# are folded into modern conda-build) which lifts the python <3.12 cap; pinned
+# at 3.12 (mercurial has no cp313 build on conda-forge — it jumps cp312 -> cp314).
+RUN conda install -y -n base python=3.12 conda-build pip python-build maturin mercurial
 
 WORKDIR /build/src
 ENV TEMPDIR=/build

@@ -5,6 +5,33 @@
 {% set name = project.get('name') %}
 {% set version = project.get('version') %}
 
+{# ------------------------------------------------------------------------
+   The conda `run:` deps below are DERIVED from pyproject's
+   tool.poetry.dependencies table (NB: a line ending in a bracket is
+   parsed as a conda-build selector, so that name is left unbracketed),
+   so pyproject.toml is the single source of truth (no more meta.yaml drift).
+   Two small hand-maintained tables bridge PyPI -> conda-forge:
+   ------------------------------------------------------------------------ #}
+{% set poetry_deps = toml.get('tool', {}).get('poetry', {}).get('dependencies', {}) %}
+{# (1) deps whose conda-forge name differs from the PyPI/pyproject name.
+   AT subpackages are underscored on conda; a few deps are renamed upstream. #}
+{% set CONDA_NAME = {
+     'autonomous-trust': 'autonomous_trust',
+     'autonomous-trust-services': 'autonomous_trust_services',
+     'autonomous-trust-inspector': 'autonomous_trust_inspector',
+     'opencv-python': 'py-opencv',
+     'kaleido': 'python-kaleido',
+     'PyNaCl': 'pynacl',
+   } %}
+{# (2) deps NOT on conda-forge -> installed from the environment.yml pip
+   section, so they must be omitted from conda run: requirements. #}
+{% set PIP_ONLY = ['mediapipe', 'dash-iconify'] %}
+{# NB: the poetry version spec is emitted verbatim, so deps MUST use
+   conda-compatible operators (>=, <, ==, comma ranges). Poetry caret/tilde
+   (^, ~) and bare versions are NOT translated — use explicit operators here.
+   (The core `autonomous-trust` recipe keeps a hand-written run: precisely
+   because its deps use carets.) #}
+
 package:
   name: {{ name|lower }}
   version: {{ version }}
@@ -28,12 +55,8 @@ requirements:
     - poetry
   run:
     - python>=3.13
-    - autonomous-trust
-    - numpy>=1.25.2
-    - py-opencv>=4.8.0
-    - imutils>=0.5.4
-    - msgpack-numpy>=0.4.7
-    - psutil>=5.9.5
-    - geopy>=2.4.0
-    - utm>=0.7.0
-#    - mediapipe>=0.10.5  # pip only
+    {%- for dep_name, dep_spec in poetry_deps.items() %}
+    {%- if dep_name != 'python' and dep_name not in PIP_ONLY %}
+    - {{ CONDA_NAME.get(dep_name, dep_name) }}{{ dep_spec }}
+    {%- endif %}
+    {%- endfor %}

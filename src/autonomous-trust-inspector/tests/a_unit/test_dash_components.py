@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -46,8 +46,8 @@ def _make_ctl(**kwargs):
 
 def _make_peer(uuid='uuid-1', index=0):
     ident = MagicMock()
-    ident.fullname = 'Test Peer'
-    ident.nickname = 'TP'
+    ident.nickname = 'Test Peer'
+    ident.petname = 'TP'
     metadata = MagicMock()
     metadata.time = datetime.now()
     metadata.position = MagicMock()

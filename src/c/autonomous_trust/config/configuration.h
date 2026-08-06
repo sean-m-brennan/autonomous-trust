@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2024 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -72,30 +72,60 @@ at_serialize_mode_t at_serialize_mode_current(void);
 const char *at_serialize_mode_file_ext(at_serialize_mode_t mode);
 
 /**
- * @brief Get the config directory
+ * @brief The configuration/data root — `$AUTONOMOUS_TRUST_ROOT`, or "" if unset.
  *
- * @param path char[CFG_PATH_LEN]
- * @return int
+ * Declared here because it had external linkage and no declaration anywhere, so a
+ * caller outside this translation unit got an implicit-declaration error or, in a
+ * laxer dialect, a wrong return type. Every path in the tree hangs off this.
+ *
+ * @return The root, never NULL. Not owned by the caller.
  */
 /*@
-  requires \valid(path + (0 .. CFG_PATH_LEN - 1));
-  assigns path[0 .. CFG_PATH_LEN - 1];
-  ensures \result >= 0 || \result < 0;
+  assigns \nothing;
+  ensures \result != \null;
 */
-int get_cfg_dir(char path[]);
+const char *rootDir(void);
 
 /**
- * @brief Get the data directory
+ * @brief Get the config directory.
  *
- * @param path char[CFG_PATH_LEN]
- * @return int
+ * @param[out] path     Destination buffer.
+ * @param destlen       Size of @p path in bytes. **Pass `sizeof` the buffer.**
+ * @return The path length on success, negative if it does not fit.
+ *
+ * @note @p destlen is a parameter and not a constant because it was a constant,
+ *       and the constant was wrong. Both of these hardcoded 255 while taking an
+ *       unsized `char path[]` — which the compiler cannot check — so `path_join`'s
+ *       own correct bounds check ran against a number up to 147 bytes too large.
+ *       `unix_addr` passes a 108-byte `sun_path`-sized buffer, and a long
+ *       `AUTONOMOUS_TRUST_ROOT` therefore smashed the caller's stack. See
+ *       ISSUES.md §2.1.1. The ACSL below said `CFG_PATH_LEN` too, so the contract
+ *       was contradicted by a caller and nothing noticed.
  */
 /*@
-  requires \valid(path + (0 .. CFG_PATH_LEN - 1));
-  assigns path[0 .. CFG_PATH_LEN - 1];
+  requires destlen > 0;
+  requires \valid(path + (0 .. destlen - 1));
+  assigns path[0 .. destlen - 1];
   ensures \result >= 0 || \result < 0;
 */
-int get_data_dir(char path[]);
+int get_cfg_dir(char *path, size_t destlen);
+
+/**
+ * @brief Get the data directory.
+ *
+ * @param[out] path     Destination buffer.
+ * @param destlen       Size of @p path in bytes. **Pass `sizeof` the buffer.**
+ * @return The path length on success, negative if it does not fit.
+ *
+ * @see get_cfg_dir for why @p destlen is a parameter.
+ */
+/*@
+  requires destlen > 0;
+  requires \valid(path + (0 .. destlen - 1));
+  assigns path[0 .. destlen - 1];
+  ensures \result >= 0 || \result < 0;
+*/
+int get_data_dir(char *path, size_t destlen);
 
 /**
  * @brief Registration entry for a named configuration section.

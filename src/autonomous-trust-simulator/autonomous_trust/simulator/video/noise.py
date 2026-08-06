@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -33,27 +33,24 @@ def add_noise(noise, image, shape=None):
         image = np.zeros(shape, np.uint8)
 
     if noise == Noise.GAUSSIAN:
-        row, col, ch = image.shape
+        # image.shape[:2] tolerates both grayscale (H, W) and
+        # multi-channel (H, W, C) frames; the same Gaussian field is
+        # added to every channel.
+        row, col = image.shape[:2]
         mean = random.randint(0, 200)
         var = random.randint(100, 400)
         sigma = var ** 0.5
         gauss = np.random.normal(mean, sigma, (row, col))
-        noisy = np.zeros(image.shape, np.float32)
+        noisy = image.astype(np.float32)
 
-        if len(image.shape) == 2:
-            noisy = image + gauss
+        if image.ndim == 2:
+            noisy = noisy + gauss
         else:
-            noisy[:, :, 0] = image[:, :, 0] + gauss
-            noisy[:, :, 1] = image[:, :, 1] + gauss
-            noisy[:, :, 2] = image[:, :, 2] + gauss
+            for c in range(image.shape[2]):
+                noisy[:, :, c] = image[:, :, c] + gauss
         cv2.normalize(noisy, noisy, 0, 255, cv2.NORM_MINMAX, dtype=-1)
         noisy = noisy.astype(np.uint8)
         return noisy
-    # Open: only GAUSSIAN (above) and SALT_PEPPER are known-working
-    # today; the POISSON / SPECKLE / others below were either never
-    # finished or regressed without notice. Validate each branch
-    # against a reference image set and either fix or remove the
-    # broken modes.
     elif noise == Noise.SALT_PEPPER:
         s_vs_p = 0.5
         amount = 0.004
@@ -71,15 +68,19 @@ def add_noise(noise, image, shape=None):
         out[coords] = 0
         return out
     elif noise == Noise.POISSON:
-        vals = len(np.unique(image))
-        vals = 2 ** np.ceil(np.log2(vals))
-        noisy = np.random.poisson(image * vals) / float(vals)
-        return noisy
+        # Shot noise: sample each pixel from a Poisson distribution with
+        # lambda = pixel intensity. Guard against an all-zero image (the
+        # only-noise path) where every sample would collapse to zero.
+        lam = np.clip(image.astype(np.float32), 1e-6, None)
+        noisy = np.random.poisson(lam).astype(np.float32)
+        cv2.normalize(noisy, noisy, 0, 255, cv2.NORM_MINMAX, dtype=-1)
+        return noisy.astype(np.uint8)
     elif noise == Noise.SPECKLE:
-        row, col, ch = image.shape
-        gauss = np.random.randn(row, col, ch)
-        gauss = gauss.reshape((row, col, ch))
-        noisy = image + image * gauss
-        return noisy
+        # Multiplicative Gaussian noise; np.random.randn matches the
+        # image shape (works for both grayscale and multi-channel).
+        gauss = np.random.randn(*image.shape).astype(np.float32)
+        noisy = image.astype(np.float32) * (1.0 + gauss)
+        cv2.normalize(noisy, noisy, 0, 255, cv2.NORM_MINMAX, dtype=-1)
+        return noisy.astype(np.uint8)
     else:
         return image

@@ -1,0 +1,53 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: zta-ddil-defer
+byte_pinning: false
+description: |
+    ZTA DDIL fallback. The verification backend is unreachable — modeled with
+    verifier_type "oidc", whose stub verifier returns UNAVAILABLE on both
+    implementations. With allow_ddil_fallback true, the welcoming committee does
+    NOT drop the newcomer: it admits it (proposes it) under a reputation cap,
+    preserving network formation in disconnected environments. So
+    propose_emitted == 1, exercising the DEFERRED/UNAVAILABLE branch of the gate
+    distinct from the VERIFIED happy path. See zta-integration.md §11 (step 4).
+
+    Cross-impl: pinned on BOTH sides. The C conformance adapter wires the ZTA
+    policy + credentials (_apply_zta_fixtures) when built with -DAT_ZTA=ON;
+    scripts/test-conformance.sh enables that automatically when OpenSSL is
+    present (build-zta/). Without OpenSSL the C side skips this scenario, which
+    is still non-asymmetric (diff_results.py treats a one-side skip as a match).
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  zta_policy:
+    enabled: true
+    require_at_admission: true
+    # These fixtures PREDATE the credential->identity binding (ISSUES §1.5) and
+    # provision none, so `off` keeps each pin testing what it claims: this case is
+    # about the chain / operator classification, not about bindings. Without it a
+    # reject-* pin would pass for the wrong reason (unbound, not bad chain) and the
+    # admit pins would fail outright. Binding behavior is pinned separately by the
+    # zta-binding-* scenarios.
+    binding_mode: "off"
+    verifier_type: oidc
+    allow_ddil_fallback: true
+    ddil_fallback_reputation_cap: 0.5
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+    description: |
+        newcomer announces while ZTA infra is unreachable (oidc stub ->
+        UNAVAILABLE). bg admits under DDIL fallback and proposes the candidate.
+
+expected_state:
+  bg:
+    propose_emitted: 1

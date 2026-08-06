@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ******************
-#  Copyright 2026 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -61,15 +61,11 @@ AT_SRC_PATHS="$here/src/autonomous-trust:$here/src/autonomous-trust-evaluation:$
 export PYTHONPATH="${AT_SRC_PATHS}:${here}${PYTHONPATH:+:$PYTHONPATH}"
 
 # Project is conda-based; the canonical interpreter lives in the
-# `autonomous_trust` env (see environment.yaml + scripts/setup-dev.sh).
+# `autonomous_trust` env (see environment.yml + scripts/setup-dev.sh).
 # Match the gating convention used by scripts/build-py.sh: refuse to
-# run when that env isn't active.
+# run when that env isn't active. The actual check is deferred until after
+# argument parsing so that --help works without the env active.
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-autonomous_trust}"
-if [[ "${CONDA_DEFAULT_ENV:-}" != "$CONDA_ENV_NAME" ]]; then
-    echo "ERROR: conda environment '$CONDA_ENV_NAME' is not active." >&2
-    echo "  Run: conda activate $CONDA_ENV_NAME" >&2
-    exit 1
-fi
 # Use the env's python — once activated, plain `python` resolves
 # through $CONDA_PREFIX/bin first. Override with AT_PYTHON for
 # debugging only.
@@ -198,6 +194,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Enforce the conda-env gate now that --help has had a chance to short-circuit.
+if [[ "${CONDA_DEFAULT_ENV:-}" != "$CONDA_ENV_NAME" ]]; then
+    echo "ERROR: conda environment '$CONDA_ENV_NAME' is not active." >&2
+    echo "  Run: conda activate $CONDA_ENV_NAME" >&2
+    exit 1
+fi
+
 if [[ -z "$SCALES_RAW" ]]; then
     SCALES_RAW="16-peer:4,4,3,2 25-peer:4,16,3,2 100-peer:4,88,3,2"
 fi
@@ -212,7 +215,7 @@ fi
 log "Using python: $AT_PYTHON"
 
 # The compose + scenario generators import a handful of conda-installed
-# deps (pyyaml at minimum; environment.yaml is the canonical source).
+# deps (pyyaml at minimum; environment.yml is the canonical source).
 # Probe up front so the error message points the user at the fix
 # instead of producing a traceback per scale point.
 ensure_py_deps() {
@@ -257,7 +260,7 @@ ensure_py_deps() {
     err "Missing python deps in $CONDA_ENV_NAME env: ${missing[*]}"
     err "    Re-run with --install-deps, OR install them manually:"
     err "    mamba install -n $CONDA_ENV_NAME -c conda-forge ${pkgs[*]}"
-    err "    (or: conda env update -n $CONDA_ENV_NAME --file environment.yaml)"
+    err "    (or: conda env update -n $CONDA_ENV_NAME --file environment.yml)"
     exit 1
 }
 ensure_py_deps

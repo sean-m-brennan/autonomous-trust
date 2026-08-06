@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.3
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -68,6 +68,18 @@ RUN --mount=source=dist/conda-repo,target=/app/dist \
     conda clean -afy
 
 ENV AUTONOMOUS_TRUST_ROOT="/app/config"
+
+# --- Clock discipline (required) -------------------------------------------
+# AT carries no NTP client of its own. This node refuses to start on a clock
+# no daemon is steering: the in-process gate reads ntp_adjtime(modes=0), which
+# is honest inside a container because CLOCK_REALTIME is shared with the host
+# (a time namespace can offset only CLOCK_MONOTONIC and CLOCK_BOOTTIME).
+#
+# THE HOST MUST RUN A STOCK NTP DAEMON -- chrony, ntpd or systemd-timesyncd.
+# A container cannot discipline CLOCK_REALTIME itself: clock_settime() returns
+# EPERM without CAP_SYS_TIME, and granting it would only let the container
+# fight its host. So there is deliberately no chronyd in this image.
+ENV AT_REQUIRE_SYNCED_CLOCK=1
 
 COPY autonomous-trust/entrypoint.sh /bin/entrypoint.sh
 ENV ROUTER="172.17.0.1"

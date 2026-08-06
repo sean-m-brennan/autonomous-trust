@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2024 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -132,6 +132,15 @@ int public_encryptor_init(encryptor_t *encr, const unsigned char *hex_seed, size
   ensures \result == 0 || \result == -1;
 */
 int encryptor_init(encryptor_t *encr, const unsigned char *hex_seed, size_t hex_len);
+
+/** Init from a RAW box private key hex (64 chars), reproducing the public
+ *  key via crypto_scalarmult_base. Cross-runtime canonical for group-key
+ *  transport (matches Python Encryptor(self.private.encode())). */
+int encryptor_init_from_private(encryptor_t *encr, const unsigned char *hex_priv, size_t hex_len);
+
+/** Serialize the RAW box private key as hex (64 chars + NUL); caller frees.
+ *  NULL if the encryptor holds no private key. Mirrors Python serialize(). */
+unsigned char *encryptor_serialize_private(const encryptor_t *encr);
 
 /*@
   requires \valid(encr);

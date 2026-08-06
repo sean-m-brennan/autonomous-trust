@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -67,6 +67,33 @@ class TestPeers:
         p.add(peer)  # should not duplicate
         assert p.all.count(peer) == 1
 
+    def test_add_rejoin_same_nickname_dedups(self):
+        # A peer rejoining under a new uuid/address keeps its nickname. The
+        # stale identity must NOT linger in self.all / self.listing — there
+        # must be exactly one peer per nickname, and it must be the new one.
+        p = Peers()
+        old = _mock_peer(nickname='mq800', address='10.0.0.1', uuid=uuid4())
+        new = _mock_peer(nickname='mq800', address='10.0.0.2', uuid=uuid4())
+        p.add(old)
+        p.add(new)
+        assert p.all == [new]
+        assert old not in p.all
+        assert old.address not in p.listing
+        assert new.address in p.listing
+        assert p.find_by_index('mq800') is new
+        assert p.find_by_uuid(new.uuid) is new
+        assert p.find_by_uuid(old.uuid) is None
+
+    def test_add_distinct_nicknames_coexist(self):
+        # Dedup is per-nickname only: different nicknames are unaffected.
+        p = Peers()
+        a = _mock_peer(nickname='a', address='10.0.0.1', uuid=uuid4())
+        b = _mock_peer(nickname='b', address='10.0.0.2', uuid=uuid4())
+        p.add(a)
+        p.add(b)
+        assert a in p.all and b in p.all
+        assert len(p.all) == 2
+
     def test_find_by_uuid(self):
         p = Peers()
         uid = uuid4()
@@ -119,6 +146,35 @@ class TestPeers:
         p = Peers()
         peer = _mock_peer()
         p.delete(peer)  # should not crash
+
+    def test_delete_when_in_hierarchy_but_not_valuation(self):
+        # A wire-reconstructed Peers populates all/listing/hierarchy from the
+        # `hierarchy` arg but leaves `valuation` empty. delete() must guard the
+        # valuation removal independently of the hierarchy one, or it indexes
+        # valuation[None] (TypeError: list indices ... not NoneType) on the
+        # add()->delete(prior) resync path (handle_identity_response).
+        peer = _mock_peer(nickname='node-x', address='10.0.0.5')
+        hier = [dict({}) for _ in range(Peers.LEVELS)]
+        hier[Peers.LEVELS // 2]['node-x'] = peer
+        p = Peers(hierarchy=hier)        # valuation left empty
+        assert p.find_by_index('node-x') is peer
+        assert not any('node-x' in v for v in p.valuation)
+        p.delete(peer)                   # must not raise
+        assert 'node-x' not in p.hierarchy[p.mid_level]
+
+    def test_add_same_nickname_on_wire_reconstructed_peers(self):
+        # The exact crash path: a Peers rebuilt from the wire (hierarchy only),
+        # then a new identity for the same nickname arrives and add() evicts
+        # the prior holder via delete(). Regression for the two-node protocol
+        # IdentityProcess.handle_identity_response TypeError.
+        old = _mock_peer(nickname='node-x', address='10.0.0.5')
+        hier = [dict({}) for _ in range(Peers.LEVELS)]
+        hier[Peers.LEVELS // 2]['node-x'] = old
+        p = Peers(hierarchy=hier)
+        new = _mock_peer(nickname='node-x', address='10.0.0.6')
+        p.add(new)                       # must not raise
+        assert len(p.all) == 1
+        assert p.find_by_index('node-x') is new
 
     def test_find_top_n_all(self):
         p = Peers()

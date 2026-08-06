@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -109,9 +109,8 @@ DEFINE_TEST(test_sign_verify_roundtrip_with_canonical_input)
     char addr[] = "10.0.0.3";
     char name[] = "coord";
     char nick[] = "coord";
-    char pet[] = "";
     identity_t *ident = NULL;
-    ck_assert_ret_ok(identity_create(&uuid, addr, name, nick, pet, &ident));
+    ck_assert_ret_ok(identity_create(&uuid, addr, name, nick, &ident));
 
     char group_uuid_str[] = "a169fd78-b0f8-4f1d-acfe-2d74b59cf2c7";
     int group_size = 1;

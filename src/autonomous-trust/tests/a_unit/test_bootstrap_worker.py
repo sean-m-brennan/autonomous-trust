@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -34,18 +34,26 @@ from autonomous_trust.core.bootstrap_worker import BootstrapWorker
 from autonomous_trust.core.bootstrap_capabilities import (
     BOOTSTRAP_CAPABILITY_NAMES, register_bootstrap_capabilities,
 )
-from autonomous_trust.core.capabilities import Capabilities
+from autonomous_trust.core.capabilities import Capabilities, PeerCapabilities
 from autonomous_trust.core.negotiation import NegotiationProtocol, Task
 from autonomous_trust.core.network import Message
 from autonomous_trust.core.system import CfgIds
 
 
-def _make_worker(env_overrides=None, peer_count=3, register_caps=True):
+def _make_worker(env_overrides=None, peer_count=3, register_caps=True,
+                 caps_config=None):
     """Build a BootstrapWorker with the minimum-viable configs.
     `register_caps=False` simulates AT_BOOTSTRAP_DISABLED at the cap-
     registration boundary (the worker should still init cleanly and
-    just emit zero pairs)."""
-    env_overrides = env_overrides or {}
+    just emit zero pairs).
+
+    The worker owns its own bootstrap Capabilities (it does NOT read
+    configs[CfgIds.capabilities], which in the live runtime is the
+    PeerCapabilities map), so the disable path is driven by the env var
+    the worker actually honors, not by withholding an injected object."""
+    env_overrides = dict(env_overrides or {})
+    if not register_caps:
+        env_overrides.setdefault('AT_BOOTSTRAP_DISABLED', '1')
     # Hold a token outside the patch so the test isolates env state.
     saved = {k: os.environ.get(k) for k in env_overrides}
     for k, v in env_overrides.items():
@@ -68,10 +76,14 @@ def _make_worker(env_overrides=None, peer_count=3, register_caps=True):
             peer_objs.append(p)
         peers.all = peer_objs
 
+        # caps_config lets a test pin what sits at CfgIds.capabilities to
+        # reproduce the live runtime, where that key is a PeerCapabilities
+        # (Automate._configure default) rather than a Capabilities. The
+        # worker must not depend on this object.
         configurations = {
             CfgIds.identity: identity,
             CfgIds.peers: peers,
-            CfgIds.capabilities: caps,
+            CfgIds.capabilities: caps if caps_config is None else caps_config,
             'processes': [],
         }
         log_q = queue.Queue()
@@ -147,6 +159,24 @@ class TestTryIssuePair:
         # The cap on the Task must be one of the three bootstrap caps.
         assert msg.obj.capability.name in BOOTSTRAP_CAPABILITY_NAMES
 
+    def test_issues_with_live_peercapabilities_config(self, setup_teardown):
+        # Regression: in the live runtime configs[CfgIds.capabilities] is a
+        # PeerCapabilities (Automate._configure default), NOT a Capabilities.
+        # The worker previously read that key into self.capabilities and
+        # called .to_list() on it -> AttributeError every _tick -> no pairs
+        # issued -> peers never admitted -> reputations frozen at 0.5. The
+        # worker must own its own bootstrap Capabilities and issue normally
+        # regardless of what sits at that config key.
+        worker, _ = _make_worker(env_overrides={'AT_BOOTSTRAP_SEED': '1'},
+                                  caps_config=PeerCapabilities())
+        assert isinstance(worker.capabilities, Capabilities)
+        assert sorted(worker.capabilities.to_list()) == sorted(BOOTSTRAP_CAPABILITY_NAMES)
+        queues = {CfgIds.negotiation: queue.Queue()}
+        assert worker._try_issue_pair(queues) is True
+        msg = queues[CfgIds.negotiation].get_nowait()
+        assert isinstance(msg.obj, Task)
+        assert msg.obj.capability.name in BOOTSTRAP_CAPABILITY_NAMES
+
     def test_args_per_cap_shape(self, setup_teardown):
         # Each cap takes a specific kwarg shape; the function-args
         # builder is the contract with bootstrap_capabilities.py.
@@ -209,12 +239,15 @@ class TestTickWindow:
     def test_stops_after_window_closes(self, setup_teardown):
         worker, _ = _make_worker(env_overrides={
             'AT_BOOTSTRAP_PAIRS': '999',           # cap not the limit
-            'AT_BOOTSTRAP_DURATION_SEC': '0.0001',
+            'AT_BOOTSTRAP_DURATION_SEC': '999',    # window open for the 1st tick
         })
         queues = {CfgIds.negotiation: queue.Queue()}
         worker._tick(queues)  # opens window + issues 1 pair
-        # Force window-elapsed clock past duration; the next tick
-        # should be a no-op despite peers + pairs_remaining. Use
+        # Force the window closed by backdating its start well past the
+        # duration; the next ticks must be no-ops despite peers +
+        # pairs_remaining. (Backdating is the deterministic way to close the
+        # window — a tiny DURATION_SEC instead races the first tick's own
+        # open->issue, since two now() calls + a log straddle it.) Use a
         # tz-aware datetime since system.now() returns one.
         worker._window_start = datetime(2020, 1, 1, tzinfo=timezone.utc)
         for _ in range(5):

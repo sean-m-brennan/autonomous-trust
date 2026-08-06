@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -31,26 +31,103 @@ class LiveData(object, metaclass=ClassEnumMeta):
 
     @classmethod
     def run_data_handlers(cls, graph, which, data):
-        # Feature not yet implemented: all four LiveData branches
-        # below are stubs. Each should read `data` into `graph.G`
-        # (peers as nodes, reputation/latencies as edge attributes,
-        # commands as event annotations). Until then the live-graph
-        # view shows the static initial topology only.
+        """Fold one live-data event into the networkx graph ``graph`` (the
+        ``.G`` of a NetworkGraph).
+
+        Peers are keyed into the graph by uuid via a ``graph.graph['uuid_nodes']``
+        map (uuid -> node key). Nodes carry a ``reputation`` attribute (this
+        observer's direct trust of the peer); **transitive** (peer-of-peer)
+        trust is stored per-observer on the connecting edge's ``trust`` dict so
+        an asymmetric A->B vs B->A view is preserved on the undirected edge.
+
+        Data shapes by label:
+          - ``peers``:      dict/iterable of peer uuids -> ensure a node per uuid
+          - ``reputation``: a rep object with ``.peer_id``/``.score`` (direct
+                            trust -> node attr), or an
+                            ``(observer_uuid, subject_uuid, score)`` triple
+                            (transitive trust -> edge attr)
+          - ``latencies``:  ``(peer_uuid, rtt)`` -> node ``latency`` attr
+          - ``commands``:   ``(peer_uuid, text)`` -> node ``command`` annotation
+
+        A ``None`` graph or unrecognized/malformed ``data`` is a safe no-op so a
+        partially-wired producer can never crash the render loop.
+        """
+        if graph is None:
+            return
         if which == cls.peers:
-            pass
+            cls._ensure_peer_nodes(graph, data)
         elif which == cls.reputation:
-            pass
+            cls._apply_reputation(graph, data)
         elif which == cls.latencies:
-            pass
+            cls._apply_latency(graph, data)
         elif which == cls.commands:
-            pass
+            cls._apply_command(graph, data)
+
+    @staticmethod
+    def _peer_node(graph, uuid):
+        """Return the graph node key for ``uuid``, creating the node (keyed by
+        the uuid string itself) on first sight."""
+        mapping = graph.graph.setdefault('uuid_nodes', {})
+        node = mapping.get(uuid)
+        if node is None:
+            node = uuid
+            mapping[uuid] = node
+            if not graph.has_node(node):
+                graph.add_node(node, name=uuid, id=uuid, group=None, reputation=None)
+        return node
+
+    @classmethod
+    def _ensure_peer_nodes(cls, graph, data):
+        if not data:
+            return
+        uuids = data.keys() if isinstance(data, dict) else data
+        try:
+            for uuid in uuids:
+                cls._peer_node(graph, uuid)
+        except TypeError:
+            pass  # data not iterable — ignore malformed payload
+
+    @classmethod
+    def _apply_reputation(cls, graph, data):
+        # Transitive (observer, subject, score) triple -> per-observer edge trust.
+        if isinstance(data, (tuple, list)) and len(data) == 3:
+            observer, subject, score = data
+            o = cls._peer_node(graph, observer)
+            s = cls._peer_node(graph, subject)
+            graph.add_edge(o, s)
+            trust = graph.edges[o, s].setdefault('trust', {})
+            trust[observer] = score
+            # Scalar summary for rendering/diffing (dicts aren't hashable and
+            # can't be styled directly): worst-case of the directional views.
+            graph.edges[o, s]['trust_level'] = min(trust.values())
+            return
+        # Direct: a rep object with .peer_id / .score -> node reputation attr.
+        peer_id = getattr(data, 'peer_id', None)
+        if peer_id is not None:
+            node = cls._peer_node(graph, peer_id)
+            graph.nodes[node]['reputation'] = getattr(data, 'score', None)
+
+    @classmethod
+    def _apply_latency(cls, graph, data):
+        if isinstance(data, (tuple, list)) and len(data) == 2:
+            uuid, rtt = data
+            graph.nodes[cls._peer_node(graph, uuid)]['latency'] = rtt
+
+    @classmethod
+    def _apply_command(cls, graph, data):
+        if isinstance(data, (tuple, list)) and len(data) == 2:
+            uuid, text = data
+            graph.nodes[cls._peer_node(graph, uuid)]['command'] = text
 
 
 class LiveNetwork(ng.NetworkGraph):
     cadence_ms = 1000
 
     def __init__(self, _, **kwargs):
-        self.node_data = list(self.node_data) + ['persist']
+        # Track reputation (node) + trust_level (edge) in the diff keys so a
+        # change in transitive trust triggers an update emit to the client.
+        self.node_data = list(self.node_data) + ['persist', 'reputation']
+        self.link_data = list(self.link_data) + ['trust_level']
         self.iteration = 0
         self._stopped = False
         groups = ['a', '', ' ', 'trouble']

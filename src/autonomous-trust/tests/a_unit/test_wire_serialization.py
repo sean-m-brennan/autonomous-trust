@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2024 TekFive, Inc. and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -64,8 +64,8 @@ class TestIdentityWire:
         sig = Signature.generate()
         enc = Encryptor.generate()
         uid = uuid4()
-        return Identity(uid, '127.0.0.1', 'Test User', 'tester', sig, enc,
-                        'pet', False, 0)
+        return Identity(uid, '127.0.0.1', 'Test User', sig, enc,
+                        'tester', False, 0)
 
     def test_round_trip(self, wire_format):
         ident = self._make_identity()
@@ -73,12 +73,16 @@ class TestIdentityWire:
         restored = Identity.from_string(data)
         assert str(restored.uuid) == str(ident.uuid)
         assert restored.address == ident.address
-        assert restored.fullname == ident.fullname
+        assert restored.nickname == ident.nickname
         assert restored.signature.publish() == ident.signature.publish()
         assert restored.encryptor.publish() == ident.encryptor.publish()
-        # Fields lost on wire
-        assert restored._nickname == ''
-        assert restored.petname == ''
+        # petname is local-only and NOT carried on the wire: the original
+        # ('tester') is dropped and the receiver mints its own from the online
+        # nickname's local-part plus a random suffix (Identity.derive_local_
+        # petname), so it is non-empty, deliberately != the sender's petname,
+        # and never a globalized name.
+        assert restored.petname != ident.petname
+        assert restored.petname.startswith('Test User-')
         assert restored._public_only is True
 
 
@@ -92,9 +96,10 @@ class TestGroupWire:
         restored = Group.from_string(data)
         assert str(restored.uuid) == str(grp.uuid)
         assert restored.encryptor.publish() == enc.publish()
-        # Proto format stores only a single address, not the full map;
-        # address_map is lossy on the wire
-        assert restored._address_map == {}
+        # §1.4: the full address_map now round-trips on the wire — the proto
+        # gained a `map<string,string> address_map` field (and JSON carries it),
+        # so it is no longer lossy.
+        assert restored._address_map == addr_map
 
 
 class TestAgreementProofWire:
@@ -168,12 +173,12 @@ class TestIdentityObjWire:
         sig = Signature.generate()
         enc = Encryptor.generate()
         uid = uuid4()
-        ident = Identity(uid, '127.0.0.1', 'Test User', 'tester', sig, enc, 'pet', False, 0)
+        ident = Identity(uid, '127.0.0.1', 'Test User', sig, enc, 'tester', False, 0)
         originator = uuid4()
         obj = IdentityObj(ident, originator)
         data = obj.to_string()
         restored = IdentityObj.from_string(data)
         assert restored.originator == originator
         assert str(restored.identity.uuid) == str(uid)
-        assert restored.identity.fullname == 'Test User'
+        assert restored.identity.nickname == 'Test User'
         assert restored.identity.signature.publish() == sig.publish()

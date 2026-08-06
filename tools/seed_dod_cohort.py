@@ -1,13 +1,33 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+# ******************
+
 """Seed per-peer persistent state for the high-trust dod-mission cohort.
 
 Generates ``./.demo-state/dod-mission/<peer>/etc/at/{identity,group,
-peers,reputation,peer-capabilities}.cfg.json`` for every squad-* /
-microdrone-* / jet-* peer in the scenario. The state encodes mutual
+peers,reputation,peer-capabilities}.cfg.json`` for every pre-trusted peer
+in the scenario (squad-* / microdrone-* / jet-* — see PRE_TRUSTED_PREFIXES
+in examples/dod_mission/reputation_warmstart.py). The state encodes mutual
 recognition + reputation = 0.7 so the cohort starts trusting each other
-from t=0; everyone else (rq-86 recon, mq-800 armed, ground sensors,
-command-node) cold-bootstraps normally so the existing demo beats
-(Sybil rejection on hacked sensors, MQ-800 contradiction detection)
-stay intact.
+from t=0. The jet is included because its strike window is too brief to
+build consensus. Everyone else (rq-86 recon, mq-800 armed, ground sensors,
+command-node) cold-bootstraps normally so the existing demo beats (Sybil
+rejection on hacked sensors, MQ-800 contradiction detection) stay intact.
+
+(``command`` was briefly seeded too, but that made it a mutual-trust field
+member and churned the gateway-reputation tree — reverted; it cold-boots.)
 
 Output layout::
 
@@ -42,6 +62,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -64,17 +85,23 @@ from autonomous_trust.core._python.capabilities import PeerCapabilities  # noqa:
 from autonomous_trust.core._python.system import CfgIds  # noqa: E402
 
 
-# Seed reputation per peer — clearly above the rep-persist threshold
-# (0.5) but well under 1.0 so the trust tier sits in the "trusted but
-# earned" band (TIER_FLOORS in repprocess.py:57-62 maps 0.65..0.80 to
-# tier 2 = "affirmed", which is what we want).
-SEED_REPUTATION = 0.7
-
-# Trust tier (0..4) we bake into each peer's *view* of every other
-# seeded peer. tier 2 ("affirmed") matches SEED_REPUTATION=0.7 per
-# TIER_FLOORS in repprocess.py. The runtime tier-update path will
-# update this after the first reputation cycle if scoring drifts.
-SEED_TIER = 2
+# Seed reputation / tier / pre-trusted set: single source of truth shared
+# with the coordinator's dashboard warm-start (see the module docstring).
+# 0.7 sits above the 0.5 rep-persist threshold but under 1.0 -> tier 2
+# ("affirmed") per TIER_FLOORS in repprocess.py:57-62.
+from examples.dod_mission.reputation_warmstart import (  # noqa: E402
+    SEED_REPUTATION, SEED_TIER, PRE_TRUSTED_PREFIXES,
+)
+# Compose IP scheme — single source of truth so a pre-seeded C node's stored
+# address matches the IP the compose generator assigns it (the C node preserves
+# its seeded identity and does not re-discover the interface; the announce
+# envelope's from_address derives from this).
+from examples.dod_mission.deploy.generate_compose import (  # noqa: E402
+    SUBNET_BASE, BASE_PEER_OCTET,
+)
+from tools.c_identity import (  # noqa: E402
+    make_c_node_identity, public_identity_from_c_json,
+)
 
 # Capability list each seeded peer advertises in its peer-capabilities
 # snapshot. Matches the canonical bootstrap set every AT peer registers
@@ -90,8 +117,6 @@ SEEDED_PEER_CAPABILITIES: list[str] = [
 
 GROUP_NICKNAME = "odazone"
 
-PRE_TRUSTED_PREFIXES = ("squad-", "microdrone-", "jet-")
-
 # Gateways (rank > 1 "peer leaders") bridge the command cohort above them
 # to the field cohort below. For seed-assisted dual membership they are
 # given the field group as a CHILD group (group_child_*.cfg.json) and are
@@ -105,13 +130,44 @@ GATEWAY_PREFIXES = ("rq86-",)
 
 
 def is_seeded(peer_name: str) -> bool:
-    """Strictly the spec's pre-trusted set: squad-*, microdrone-*, jet-*."""
+    """The pre-trusted set: squad-*, microdrone-*, jet-*."""
     return peer_name.startswith(PRE_TRUSTED_PREFIXES)
 
 
 def is_gateway(peer_name: str) -> bool:
     """Gateways that get the field cohort as a seeded child group."""
     return peer_name.startswith(GATEWAY_PREFIXES)
+
+
+def _compose_ip(scenario: DoDMissionScenario, peer_name: str) -> str:
+    """The IP generate_compose.py assigns this peer (same enumerate order)."""
+    idx = list(scenario.peers).index(peer_name)
+    return f"{SUBNET_BASE}.{BASE_PEER_OCTET + idx}"
+
+
+def _read_or_init_c_identity(ident_file: Path, peer_name: str, address: str,
+                             force: bool) -> tuple[dict, Identity]:
+    """C-node analog of _read_or_init_identity: emit a seed-based C-format
+    identity (so the C ``at_demo`` node loads it via its preserve path) and the
+    matching public-only cohort view. Idempotent: a re-run without ``--force``
+    reuses the stored seeds so the C node keeps its UUID/pubkeys.
+    """
+    if ident_file.exists() and not force:
+        with ident_file.open("r") as f:
+            c_json = json.load(f)  # plain C JSON, NOT ConfigJSONEncoder
+        if isinstance(c_json, dict) and "hex_seed" in c_json.get("signature", {}):
+            return c_json, public_identity_from_c_json(c_json)
+        # Format mismatch: a Python-format identity (ConfigJSONEncoder output,
+        # ``__type__``/``signature`` as a nested Configuration) sits on disk but
+        # this run treats the peer as a C node — i.e. ``--c-microdrones`` gained
+        # this peer since the prior seed. The Python schema can't be loaded by
+        # the C runtime, so regenerate a fresh C-format seed rather than KeyError
+        # on the missing ``hex_seed``. Fresh keys are fine: the cohort views are
+        # all rebuilt in this same seed run, so every peer still agrees.
+        print(f"  warning: {peer_name} has a Python-format identity on disk but "
+              f"is being seeded as a C node; regenerating a fresh C identity "
+              f"(drop --c-microdrones to keep it Python, or --force to silence).")
+    return make_c_node_identity(peer_name, address)
 
 
 def _read_or_init_identity(ident_file: Path, peer_name: str,
@@ -124,7 +180,22 @@ def _read_or_init_identity(ident_file: Path, peer_name: str,
     """
     if ident_file.exists() and not force:
         with ident_file.open("r") as f:
-            return json.load(f, object_hook=config_json_decoder)
+            loaded = json.load(f, object_hook=config_json_decoder)
+        if isinstance(loaded, Identity):
+            return loaded
+        # Format mismatch: the file is a C-runtime identity (flat jansson
+        # schema, no ``__type__``), so the Python decoder handed back a plain
+        # dict. This run is seeding the peer as Python but a prior run seeded it
+        # as a C ``at_demo`` node (the ``--c-microdrones`` SPEC was dropped or
+        # changed). A C seed carries only public material in the wrong schema
+        # and can't be loaded as a Python identity, so regenerate a fresh Python
+        # keypair instead of letting the dict crash _peer_view_of() downstream.
+        # Fresh keys are fine: the whole cohort's views are rebuilt in this same
+        # seed run, so every peer still recognises every other.
+        print(f"  warning: {peer_name} has a C-format identity on disk but is "
+              f"being seeded as a Python peer; regenerating a fresh Python "
+              f"identity (pass --c-microdrones to keep it a C node, or --force "
+              f"to silence).")
     return Identity.initialize(
         my_name=f"{peer_name}@dod-demo",
         my_nickname=peer_name,
@@ -152,9 +223,16 @@ def _peer_view_of(ident: Identity) -> Identity:
 
 
 def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
-                force: bool = False) -> list[str]:
+                force: bool = False,
+                c_nodes: frozenset[str] = frozenset()) -> list[str]:
     """Write seeded state under ``out_root``. Returns the list of seeded
     peer names (squad-*/microdrone-*/jet-*).
+
+    ``c_nodes`` names peers that run the C ``at_demo`` binary instead of the
+    Python participant. They get a seed-based **C-format** ``identity.cfg.json``
+    (no Python-format group/peers/reputation in their own dir — they cold-join
+    for the group key via the live handshake) while still being registered, at
+    seed tier, in every *other* peer's view so the cohort recognises them at t=0.
     """
     seeded = [name for name in scenario.peers.keys() if is_seeded(name)]
     if not seeded:
@@ -162,7 +240,29 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
     gateways = [name for name in scenario.peers.keys() if is_gateway(name)]
 
     if force and out_root.exists():
-        shutil.rmtree(out_root)
+        # Best-effort wipe. We OWN and must refresh the seeded identities under
+        # each peer's etc/at; the sibling var/at is *runtime* state the live
+        # node/container writes — and when peers ran in Docker as root, those
+        # files come back owned by uid 0 (and on a virtiofs-backed checkout not
+        # even host sudo can unlink them). A plain rmtree() aborts the whole
+        # reseed on the first such file. Skip what we can't remove (the node
+        # overwrites/append its own var/at on boot) and keep going; the ETC/AT
+        # identities we do own get cleared here and regenerated below.
+        undeletable = []
+
+        def _keep_going(func, path, exc):  # onexc(3.12+)/onerror(<3.12) callback
+            undeletable.append(path)
+
+        try:
+            shutil.rmtree(out_root, onexc=_keep_going)        # Python >= 3.12
+        except TypeError:
+            shutil.rmtree(out_root, onerror=_keep_going)      # Python < 3.12
+        if undeletable:
+            print(f"  warning: {len(undeletable)} container-owned runtime "
+                  f"file(s) under {out_root} could not be removed "
+                  f"(e.g. {undeletable[0]}); seeded identities are still "
+                  f"regenerated. To fully reset, delete the dir as the owner "
+                  f"(e.g. a root `docker run --rm -v ...:/s alpine rm -rf /s`).")
     out_root.mkdir(parents=True, exist_ok=True)
 
     # Phase 1: per-peer identities (load existing on re-run unless --force).
@@ -173,8 +273,17 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
     identities: dict[str, Identity] = {}
     for peer in seeded + gateways:
         ident_file = out_root / peer / "etc" / "at" / "identity.cfg.json"
-        identities[peer] = _read_or_init_identity(ident_file, peer, force)
-        _save_json(ident_file, identities[peer])
+        if peer in c_nodes:
+            # C node: write the C-runtime schema verbatim (json.dump, not
+            # ConfigJSONEncoder); register the public-only view for the cohort.
+            c_json, identities[peer] = _read_or_init_c_identity(
+                ident_file, peer, _compose_ip(scenario, peer), force)
+            ident_file.parent.mkdir(parents=True, exist_ok=True)
+            with ident_file.open("w") as f:
+                json.dump(c_json, f, indent=2)
+        else:
+            identities[peer] = _read_or_init_identity(ident_file, peer, force)
+            _save_json(ident_file, identities[peer])
 
     # Phase 2: shared field Group. Its address map spans the seeded field
     # members AND the gateways, so field members unicast field-group
@@ -206,6 +315,13 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
     # the gateways (so it recognises and unicasts to them).
     field_and_gw = seeded + gateways
     for peer in seeded:
+        if peer in c_nodes:
+            # C node loads only its C-format identity; it cold-joins for the
+            # group key + peer set via the live admission handshake (the cohort
+            # already trusts its seeded pubkey). Writing Python-format group/
+            # peers/reputation into its dir would just be unparsed noise to the
+            # C loader, so skip — it stays in *other* peers' views via `seeded`.
+            continue
         peer_cfg_dir = out_root / peer / "etc" / "at"
 
         # Group: shared content, one file per peer (each container
@@ -270,6 +386,38 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
     return seeded
 
 
+def _microdrones_sorted(scenario):
+    """microdrone-* peer names ordered by numeric suffix (microdrone-2 <
+    microdrone-10) so a "first N" SPEC selects a stable, obvious prefix."""
+    return sorted((n for n in scenario.peers if n.startswith("microdrone-")),
+                  key=lambda n: int(n.rsplit("-", 1)[-1]))
+
+
+def _resolve_c_microdrones(scenario, raw):
+    """Resolve which microdrones run the C at_demo node from a SPEC string.
+    Kept in LOCKSTEP with generate_compose.parse_c_microdrones so seeding and
+    compose agree on the exact set (a mismatch cross-wires a peer's identity
+    format). Grammar:
+
+      * unset/""/"0"/"none"/"false"  -> none
+      * "all"/"true"                 -> every microdrone-*
+      * a bare integer N             -> the first N microdrones (by numeric
+                                        suffix); N < total -> mixed Python+C.
+                                        "1" means "first 1", not "all".
+      * comma-separated peer names   -> exactly those peers
+    """
+    if raw is None:
+        raw = os.environ.get("AT_C_MICRODRONES", "")
+    raw = raw.strip()
+    if raw in ("", "0", "none", "false"):
+        return frozenset()
+    if raw in ("all", "true"):
+        return frozenset(_microdrones_sorted(scenario))
+    if raw.isdigit():
+        return frozenset(_microdrones_sorted(scenario)[:int(raw)])
+    return frozenset(n.strip() for n in raw.split(",") if n.strip())
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--out", type=Path,
@@ -287,6 +435,17 @@ def main(argv=None) -> int:
     p.add_argument("--no-mq800", action="store_true")
     p.add_argument("--no-jet", action="store_true")
     p.add_argument("--no-command", action="store_true")
+    p.add_argument("--c-microdrones", metavar="SPEC", nargs="?",
+                   const="all", default=None,
+                   help="Seed microdrone-* peers as C at_demo nodes (C-format "
+                        "identity; they cold-join for the group key). SPEC is "
+                        "'all' (the default when the flag is given bare), a bare "
+                        "integer N for the first N microdrones (N < total -> a "
+                        "mixed Python+C swarm), a comma-separated list of peer "
+                        "names, or unset. MUST match the SPEC passed to "
+                        "generate_compose.py --c-microdrones, else a peer gets a "
+                        "C-format identity but runs as Python (or vice-versa) "
+                        "and fails to load its own identity.")
     args = p.parse_args(argv)
 
     scenario = DoDMissionScenario(
@@ -298,12 +457,15 @@ def main(argv=None) -> int:
         include_jet=not args.no_jet,
         include_command=not args.no_command,
     )
-    seeded = seed_cohort(args.out, scenario, force=args.force)
+    c_nodes = _resolve_c_microdrones(scenario, args.c_microdrones)
+    seeded = seed_cohort(args.out, scenario, force=args.force, c_nodes=c_nodes)
     n_skipped = len(scenario.peers) - len(seeded)
     print(f"Seeded {len(seeded)} peers under {args.out} "
           f"({n_skipped} peers left to cold-bootstrap)")
     if seeded:
         print("  Trusted cohort: " + ", ".join(sorted(seeded)))
+    if c_nodes:
+        print("  C at_demo nodes: " + ", ".join(sorted(c_nodes)))
     return 0
 
 

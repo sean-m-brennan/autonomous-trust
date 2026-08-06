@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #  Licensed under the Apache License, Version 2.0
 # ******************
 """MQ-800 contradictory ISR compromise.
@@ -29,8 +29,14 @@ Two refinement notes:
      pass a negative offset for that generator so the divergence is
      "MQ-800 says 30 dB when everyone else says 55 dB."
 
-Offsets are chosen large enough to trip the validator thresholds:
-  POSITION_VALIDATOR_*:  threshold = 50 m → use offset 80 m
+Offsets are chosen FAR beyond the validator thresholds, so the divergence
+reads unambiguously as a deliberate lie rather than sensor/statistical
+noise (an 80 m offset against a 50 m threshold was only 1.6x over — easy
+for an audience to wave off as GPS jitter):
+  POSITION_VALIDATOR_*:  threshold = 50 m → use offset 300 m (per axis;
+                         ~424 m NE, same heading as the compound-bravo
+                         decoy so the two erroneous reports don't straddle
+                         the true target)
   ELECTRONIC_NOISE:      threshold = 15 dB → use offset -25 dB
 """
 
@@ -63,8 +69,10 @@ from detection import (  # noqa: E402
 # scenario.py (phase "Rogue").
 DEFAULT_ACTIVATE_AT = timedelta(minutes=4, seconds=15)
 
-# Offsets — sized to trip the validators in ../tasks/validation.py.
-DEFAULT_POSITION_OFFSET_M = 80.0
+# Offsets — sized FAR past the validators in ../tasks/validation.py so the
+# erroneous target is visibly, decisively off (not a near-threshold blip
+# that could pass for a statistical anomaly). 300 m per axis ≈ 424 m NE.
+DEFAULT_POSITION_OFFSET_M = 300.0
 DEFAULT_NOISE_OFFSET_DB = -25.0
 
 
@@ -148,16 +156,33 @@ class CompromisedDetectionSource(DetectionSource):
     """
 
     def __init__(self, *args, true_uid: str = DEFAULT_TRUE_UID,
-                 decoy_uid: str = DEFAULT_DECOY_UID, **kwargs):
+                 decoy_uid: str = DEFAULT_DECOY_UID,
+                 activate_at: timedelta = DEFAULT_ACTIVATE_AT, **kwargs):
         super().__init__(*args, **kwargs)
         self._true_uid = true_uid
         self._decoy_obj: Optional[CatalogueObject] = next(
             (o for o in self.catalogue if o.world_uid == decoy_uid), None
         )
+        # The decoy swap only begins at ``activate_at`` (the COMPROMISE_START
+        # beat, T+4:15) — the same instant the contradictory ISR position
+        # generators start diverging. Before then the MQ-800 reports the
+        # honest target (clusters with the RQ-86s); after, it designates the
+        # decoy and reads as the outlier the cross-validator catches. The red
+        # "caught" ring follows ~15 s later when reputation drops (the
+        # coordinator's mark_anomalous on the validator hit). Gating on START
+        # (not DETECT) keeps both the detection and ISR paths agreeing, so the
+        # map marker never flickers between honest and offset.
+        self._activate_at_sec = activate_at.total_seconds()
+        self._now_sec = float("-inf")
+
+    def tick(self, t: timedelta):
+        self._now_sec = t.total_seconds()
+        return super().tick(t)
 
     def _resolve_emission(self, obj: CatalogueObject):
         if (self._decoy_obj is not None
-                and obj.world_uid == self._true_uid):
+                and obj.world_uid == self._true_uid
+                and self._now_sec >= self._activate_at_sec):
             return self._decoy_obj, self._true_uid
         return super()._resolve_emission(obj)
 
@@ -167,6 +192,7 @@ def wrap_detection_source_with_compromise(
     mode: str = "abrupt",
     true_uid: str = DEFAULT_TRUE_UID,
     decoy_uid: str = DEFAULT_DECOY_UID,
+    activate_at: timedelta = DEFAULT_ACTIVATE_AT,
 ) -> CompromisedDetectionSource:
     """Build a CompromisedDetectionSource that mirrors an honest one.
 
@@ -189,8 +215,12 @@ def wrap_detection_source_with_compromise(
         time_floor_sec=honest.time_floor_sec,
         suppression_sec=honest.suppression_sec,
         drift_threshold_m=honest.drift_threshold_m,
+        # Carry the honest source's arrival gate (e.g. the MQ-800's T+4:00)
+        # so wrapping for compromise doesn't reopen the pre-arrival window.
+        active_after_sec=honest.active_after_sec,
         true_uid=true_uid,
         decoy_uid=decoy_uid,
+        activate_at=activate_at,
     )
 
 

@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2024 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -79,18 +79,80 @@ void messaging_set_max_size(size_t size)
     ensures \result == -1;
   disjoint behaviors;
 */
+/* The socket path is built here and nowhere else. Two constructors of it is how
+ * ISSUES.md §2.1.1 happened: `get_data_dir` was told this buffer held 255 bytes
+ * when it holds 108, so a long AUTONOMOUS_TRUST_ROOT wrote past the end of the
+ * caller's stack frame. Both bounds are now this function's own, and a root that
+ * does not fit is REFUSED — a truncated socket path is a different socket, which
+ * is the same rule `at_app_node_build_config` applies to a queue name. */
 int unix_addr(const char *key, struct sockaddr_un *addr)
 {
+    if (key == NULL || addr == NULL)
+        return EXCEPTION(EINVAL);
+
     char path[SOCK_PATH_LEN] = {0};
-    if (get_data_dir(path) < 0)
-        return SYS_EXCEPTION();
-    path[strlen(path)] = '/';
-    strncat(path, key, SOCK_PATH_LEN - strlen(path) - 1);
+    int dir_len = get_data_dir(path, sizeof(path));
+    if (dir_len < 0)
+    {
+        /* path_join refused: the data directory alone does not fit in a
+         * sun_path. Name the cause, because the fix is the configuration and
+         * nothing downstream can infer that from a bind failure. */
+        log_error(NULL,
+                  "AUTONOMOUS_TRUST_ROOT is too long: the data directory under \"%s\" "
+                  "does not fit in a unix socket path (%d bytes). Use a shorter root.\n",
+                  rootDir(), SOCK_PATH_LEN);
+        return EXCEPTION(ENAMETOOLONG);
+    }
+
+    /* `path[strlen(path)] = '/'` used to go here, overwriting the NUL without
+     * replacing it — after which strncat's own strlen ran off the end of the
+     * buffer. Join with the bound instead, and refuse if the key does not fit:
+     * at 99 bytes of root the old code silently dropped the queue name
+     * ENTIRELY and left the caller binding a directory. */
+    size_t used = (size_t)dir_len;
+    size_t need = used + 1 + strlen(key) + 1;
+    if (need > sizeof(path))
+    {
+        log_error(NULL,
+                  "socket path for queue \"%s\" needs %zu bytes and a unix socket path "
+                  "holds %d; AUTONOMOUS_TRUST_ROOT is too long for this queue name.\n",
+                  key, need, SOCK_PATH_LEN);
+        return EXCEPTION(ENAMETOOLONG);
+    }
+    path[used] = '/';
+    memcpy(path + used + 1, key, strlen(key) + 1);
 
     addr->sun_family = AF_UNIX;
-    strncpy(addr->sun_path, path, sizeof(addr->sun_path) - 1);
-    addr->sun_path[sizeof(addr->sun_path) - 1] = '\0';
+    /* Fits by construction now; the copy stays bounded so this cannot become the
+     * next place the invariant is assumed rather than enforced. */
+    memcpy(addr->sun_path, path, strlen(path) + 1);
     return 0;
+}
+
+/*@
+  requires key != \null && \valid_read(key);
+  assigns \nothing;
+*/
+bool messaging_bound(const char *key)
+{
+    if (key == NULL || key[0] == '\0')
+        return false;
+
+    struct sockaddr_un addr = {0};
+    if (unix_addr(key, &addr) != 0)
+        return false;
+
+    /* A `stat` of the path would be wrong, and the difference matters: a daemon
+     * that died leaves its socket FILE behind, and a file check would call that
+     * ready. `connect` on a SOCK_DGRAM unix socket succeeds only if something is
+     * bound at the other end, and gives ECONNREFUSED for a stale file. It sends
+     * nothing, so probing has no effect on whoever is listening. */
+    int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (fd < 0)
+        return false;
+    bool bound = connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0;
+    close(fd);
+    return bound;
 }
 
 /*@
@@ -115,7 +177,21 @@ int messaging_init(const char *id, queue_t *queue)
 
     struct sockaddr_un local;
     if (unix_addr(id, &local) != 0)
-        return SYS_EXCEPTION();
+    {
+        /* Propagate, do NOT re-raise. `unix_addr` has already recorded exactly
+         * why (ENAMETOOLONG for a root that cannot fit, EINVAL for a bad
+         * argument), and `SYS_EXCEPTION()` here would overwrite that with
+         * whatever `errno` happened to hold — `_set_exception` does not touch
+         * errno, so the reason was replaced by an unrelated stale value. A
+         * caller cannot act on "too long" it never gets told.
+         *
+         * The `close` is the other half: this path became reachable when
+         * `unix_addr` started refusing instead of overflowing, and without it a
+         * caller that retries leaks a descriptor per attempt. */
+        close(queue->fd);
+        queue->fd = -1;
+        return -1;
+    }
 
     if (unlink(local.sun_path) != 0)
     {

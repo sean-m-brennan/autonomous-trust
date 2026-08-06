@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -175,7 +175,7 @@ def create_asteroid_belt_config(
         peers.append(PeerInfo(
             uuid=node_uuid,
             kind='habitat',
-            nickname=name,
+            petname=name,
             ip4_addr=ip_addr,
             initial_position=orbit_start,
             signal=hab['signal_dbm'],

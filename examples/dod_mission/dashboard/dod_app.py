@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #  Licensed under the Apache License, Version 2.0
 # ******************
 """DoD-mission dashboard component bundle.
@@ -105,11 +105,11 @@ def build_dashboard(scenario: DoDMissionScenario) -> dict:
 
     colors = build_peer_colors(scenario)
 
-    # Trust dynamics: same threshold (0.5) as multi-agency.  Phase markers
-    # come from scenario.phases — 8 of them for DoD.
+    # Trust dynamics: communication cut-off (0.1) as multi-agency.  Phase
+    # markers come from scenario.phases — 8 of them for DoD.
     timeline = TrustTimeline(
         peer_colors=colors,
-        threshold=0.5,
+        threshold=0.1,
         title="Trust Dynamics — DoD Squad Infiltration",
     )
     for phase in scenario.phases:
@@ -129,7 +129,13 @@ def build_dashboard(scenario: DoDMissionScenario) -> dict:
     # on data_type=target_position_x.
     from .target_position_map import TargetPositionMapPanel
     target_x_chart = TargetPositionMapPanel(
+        # Start from the full scenario color map so EVERY peer that reports a
+        # target (microdrones included) gets its own colour + legend entry —
+        # previously only rq86/mq800 were listed, so a microdrone's reported
+        # target rendered grey (#888): near-invisible on the dark map and
+        # unlabelled. Keep the curated overhead-ISR golds/amber as overrides.
         peer_colors={
+            **colors,
             "rq86-1": RQ86_GOLD,
             "rq86-2": "#E6C656",   # lighter gold to differentiate from rq86-1
             "mq800":  MQ800_AMBER,
@@ -156,10 +162,18 @@ def build_dashboard(scenario: DoDMissionScenario) -> dict:
     streams = DataStreamsPanel(peer_colors=colors)
     detail = PeerDetailPanel()
 
+    # Trust Network (transitive-trust Stage 5): peer-of-peer bilateral trust,
+    # fed by the coordinator's live trust_matrix.
+    from .trust_network_panel import TrustNetworkPanel
+    # Pass the per-peer role colors so trust-network nodes render in their role
+    # color (squad green, microdrone cyan, ...) instead of a fallback grey.
+    trust_network = TrustNetworkPanel(scenario, peer_colors=colors)
+
     return {
         "trust_timeline": timeline,
         "target_x_chart": target_x_chart,
         "noise_chart": noise_chart,
+        "trust_network": trust_network,
         "event_log": event_log,
         "data_streams": streams,
         "peer_detail": detail,

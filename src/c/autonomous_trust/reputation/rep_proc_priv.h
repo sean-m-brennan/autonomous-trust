@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -159,6 +159,14 @@ void reputation_install_coop_mode(const uuid_t peer_uuid, bool in_coop);
  *  expected_state assertions. Returns 0 on success (writing to @p out),
  *  -1 if uninitialized or @p peer_uuid is absent. */
 int reputation_get_peer_reputation(const uuid_t peer_uuid, double *out);
+
+/** Re-emit every peer's reputation on the app-facing carrier (PEER_REPUTATION
+ *  via AT_MAIN_QUEUE) — the reputation half of the app's roster pull. Peers
+ *  AT holds no rating for are emitted with rated=false rather than skipped;
+ *  this is the ONLY path on which rated=false can cross, since every
+ *  change-driven emission is by construction rated.
+ *  Returns the number emitted. See doc/architecture/app-peer-carrier.md. */
+int reputation_emit_all(const process_t *proc);
 
 #define EREP_PAXOS 253
 DECLARE_ERROR(EREP_PAXOS, "Paxos consensus error");

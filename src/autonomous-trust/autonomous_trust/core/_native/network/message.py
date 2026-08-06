@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -21,8 +21,11 @@ import enum
 from .._ffi import ffi, lib
 from ..identity import PublicIdentity
 
-# Re-export Python Message for full API compatibility
-from ..._python.network.message import Message  # noqa: F401
+# Re-export Python Message for full API compatibility. _identity_from_wire is
+# re-exported too: the native backend parses envelopes through this same
+# Python Message (which calls _identity_from_wire internally), so exposing it
+# here keeps `core.network.message` import-compatible across both backends.
+from ..._python.network.message import Message, _identity_from_wire  # noqa: F401
 
 
 class RecipientType(enum.IntEnum):
@@ -92,7 +95,10 @@ class NetWireMessage:
         """Serialize to wire format bytes."""
         wire_out = ffi.new('uint8_t **')
         wire_len = ffi.new('size_t *')
-        rc = lib.net_message_to_wire(self._ptr, wire_out, wire_len)
+        # 2nd arg is `const identity_t *signer`; NULL = serialize without
+        # signing (matches the C NULL-signer path). Omitting it left the C
+        # function reading a garbage pointer for the wire-out slot.
+        rc = lib.net_message_to_wire(self._ptr, ffi.NULL, wire_out, wire_len)
         if rc != 0:
             raise RuntimeError(f"net_message_to_wire failed with rc={rc}")
         result = bytes(ffi.buffer(wire_out[0], wire_len[0]))

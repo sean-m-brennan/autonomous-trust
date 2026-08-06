@@ -1,5 +1,5 @@
 /* ******************
- *  Copyright 2026 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -160,9 +160,40 @@ static int es6_from_ryu(buf_t *b, const char *ryu, size_t n_in)
         if (saw_point) ++frac_digits;
     }
 
+    /* Parse the exponent WITHIN n_in.  `ryu` is a counted buffer, not a C
+     * string: d2s_buffered_n writes the digits and returns the length but does
+     * NOT terminate (d2s_buffered is the variant that appends the NUL).  Calling
+     * strtol here read past the written bytes into uninitialized stack, picking
+     * up whatever leftover digits happened to follow — which is ISSUES §2.1.2:
+     * 12345.678 canonicalized as 1.2345678e+46 in ~3% of runs, mantissa always
+     * right and only the exponent varying, because the real leading digit was
+     * being concatenated with garbage.
+     *
+     * That matters far beyond a flaky test: JCS canonicalization is what wire
+     * bytes are signed over, so a node doing this signs a byte string its
+     * verifier will not reproduce.
+     *
+     * Parsed by hand rather than copying into a NUL-terminated scratch buffer,
+     * so the bound is visible at the point of use and this function stays
+     * correct for ANY counted input, not just one whose caller remembered to
+     * terminate it. */
     int ryu_exp = 0;
     if (epos != NULL) {
-        ryu_exp = (int)strtol(epos + 1, NULL, 10);
+        size_t ei = (size_t)(epos - ryu) + 1;
+        int esign = 1;
+        if (ei < n_in && (ryu[ei] == '+' || ryu[ei] == '-')) {
+            if (ryu[ei] == '-') esign = -1;
+            ++ei;
+        }
+        int mag = 0;
+        for (; ei < n_in && ryu[ei] >= '0' && ryu[ei] <= '9'; ++ei) {
+            /* A double's decimal exponent fits well inside 3 digits (|exp| <=
+             * 324); anything longer is not a Ryu output and refusing beats
+             * overflowing. */
+            if (mag > 99999) return -1;
+            mag = mag * 10 + (ryu[ei] - '0');
+        }
+        ryu_exp = esign * mag;
     }
 
     /* n in ES6 spec terms: position one past the leading digit, i.e. the
@@ -221,6 +252,21 @@ static int es6_from_ryu(buf_t *b, const char *ryu, size_t n_in)
     return buf_append(b, out, oi);
 }
 
+int jcs_es6_from_ryu_for_test(const char *ryu, size_t n_in,
+                              char *out, size_t out_cap)
+{
+    buf_t b;
+    memset(&b, 0, sizeof(b));
+    int rc = es6_from_ryu(&b, ryu, n_in);
+    int n = -1;
+    if (rc == 0 && b.len <= out_cap) {
+        memcpy(out, b.buf, b.len);
+        n = (int)b.len;
+    }
+    free(b.buf);
+    return n;
+}
+
 static int emit_number(buf_t *b, double v)
 {
     if (isnan(v) || isinf(v)) {
@@ -247,7 +293,12 @@ static int emit_number(buf_t *b, double v)
         }
     }
 
-    /* Non-integer: get Ryu's shortest, then reshape to ES6. */
+    /* Non-integer: get Ryu's shortest, then reshape to ES6.
+     *
+     * NOTE: d2s_buffered_n returns a COUNTED buffer and does NOT terminate it
+     * (d2s_buffered is the variant that appends the NUL). Everything downstream
+     * must respect `n` — treating ryu_buf as a C string reads uninitialized
+     * stack, which is exactly what ISSUES §2.1.2 was. */
     char ryu_buf[32];
     int n = d2s_buffered_n(v, ryu_buf);
     if (n <= 0 || (size_t)n >= sizeof(ryu_buf)) return -1;

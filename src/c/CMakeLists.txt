@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2024 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -82,26 +82,30 @@ if(AT_CC_VALIDATE_OUTPUT)
     set(CMAKE_CXX_COMPILER_LAUNCHER ${_at_cc_launcher})
     message("-- AT_CC_VALIDATE_OUTPUT enabled (build FS: ${_at_build_fs_type}); using ${_at_cc_launcher}")
 
-    # Same virtiofs page-cache hazard, different victim: when ar/ranlib writes
-    # libautonomous_trust.a through virtiofs, the on-disk file is occasionally
-    # truncated at a page boundary (observed exactly 65536 bytes, leaving 5 of
-    # 81 expected members). Downstream links then fail with undefined refs on
-    # symbols whose .o was never persisted. Wrap ar+ranlib with a validate-
-    # and-retry launcher analogous to cc-validate-output. Tied to the same
-    # AT_CC_VALIDATE_OUTPUT switch since the trigger is identical (virtiofs).
+    # Same virtiofs page-cache hazard, different victim: writing
+    # libautonomous_trust.a through virtiofs can truncate the on-disk file at a
+    # page boundary (observed 65536-73728 bytes, leaving ~5 of 91 members).
+    # Downstream links then fail with "file too short" / undefined refs on
+    # symbols whose member was never persisted. Empirically the culprit is the
+    # separate `ranlib` FINISH step: its in-place symbol-table rewrite is what
+    # truncates (a plain `ar qc` CREATE survives). So we (a) build the symbol
+    # index inline with `ar qcs` in the CREATE step — a single write that
+    # survives — and (b) drop the standalone ranlib FINISH entirely (a no-op),
+    # since the index is already present. The CREATE is still wrapped by
+    # ar-validate-output, whose member-count check catches any residual ar
+    # truncation and retries. Tied to the same AT_CC_VALIDATE_OUTPUT switch
+    # since the trigger is identical (virtiofs).
     set(_at_ar_launcher ${CMAKE_CURRENT_SOURCE_DIR}/cmake/ar-validate-output)
     if(NOT EXISTS ${_at_ar_launcher})
         message(FATAL_ERROR "AT_CC_VALIDATE_OUTPUT=ON but ${_at_ar_launcher} is missing")
     endif()
     set(CMAKE_C_ARCHIVE_CREATE
-        "${_at_ar_launcher} ar <CMAKE_AR> qc <TARGET> <LINK_FLAGS> <OBJECTS>")
-    set(CMAKE_C_ARCHIVE_FINISH
-        "${_at_ar_launcher} ranlib <CMAKE_RANLIB> <TARGET>")
+        "${_at_ar_launcher} ar <CMAKE_AR> qcs <TARGET> <LINK_FLAGS> <OBJECTS>")
+    set(CMAKE_C_ARCHIVE_FINISH "true <TARGET>")
     set(CMAKE_CXX_ARCHIVE_CREATE
-        "${_at_ar_launcher} ar <CMAKE_AR> qc <TARGET> <LINK_FLAGS> <OBJECTS>")
-    set(CMAKE_CXX_ARCHIVE_FINISH
-        "${_at_ar_launcher} ranlib <CMAKE_RANLIB> <TARGET>")
-    message("-- AT_CC_VALIDATE_OUTPUT: wrapping ar/ranlib via ${_at_ar_launcher}")
+        "${_at_ar_launcher} ar <CMAKE_AR> qcs <TARGET> <LINK_FLAGS> <OBJECTS>")
+    set(CMAKE_CXX_ARCHIVE_FINISH "true <TARGET>")
+    message("-- AT_CC_VALIDATE_OUTPUT: ar qcs (inline index) + no-op finish via ${_at_ar_launcher}")
 endif()
 
 set(warning_as_error -Werror)
@@ -123,6 +127,10 @@ if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
 endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
     list(APPEND useful_warnings -Wno-microsoft-anon-tag -Wno-deprecated-non-prototype -Wno-unused-but-set-variable -Wno-unknown-pragmas -Wno-cast-align -Wno-cast-function-type-mismatch)
+    # conda's default CFLAGS are GCC-tuned (e.g. -fno-merge-constants) and leak
+    # into CMAKE_C_FLAGS; clang ignores them but, under -Werror, the resulting
+    # -Wignored-optimization-argument would otherwise fail the build.
+    list(APPEND useful_warnings -Wno-ignored-optimization-argument)
 endif()
 set(useful_flags
     #-fanalyzer
@@ -299,8 +307,25 @@ if(NOT DEFINED PROTOBUF_INCLUDE_DIR OR "${PROTOBUF_INCLUDE_DIR}" STREQUAL "")
 endif()
 
 # protobuf-c
-find_path(LIBPROTOBUF_C_INCLUDE_DIR protobuf-c.h PATH_SUFFIXES protobuf-c HINTS ${CONDA_ROOT})
-find_library(LIBPROTOBUF_C_LIBRARY NAMES protobuf-c HINTS ${CONDA_ROOT})
+# Mirror the protobuf block above: inside a conda env, resolve protobuf-c
+# strictly from the env (NO_DEFAULT_PATH) so we don't latch onto a system
+# libprotobuf-c.so whose dev symlink may be absent on the host (which leaves
+# a dangling DEPENDS path -> "No rule to make target .../libprotobuf-c.so").
+set(_at_pbc_resolved FALSE)
+if(DEFINED ENV{CONDA_PREFIX})
+    find_path(_at_pbc_inc protobuf-c.h PATH_SUFFIXES protobuf-c
+              HINTS ${CONDA_ROOT} NO_DEFAULT_PATH)
+    find_library(_at_pbc_lib NAMES protobuf-c HINTS ${CONDA_ROOT} NO_DEFAULT_PATH)
+    if(_at_pbc_inc AND _at_pbc_lib)
+        set(LIBPROTOBUF_C_INCLUDE_DIR ${_at_pbc_inc} CACHE PATH "" FORCE)
+        set(LIBPROTOBUF_C_LIBRARY ${_at_pbc_lib} CACHE FILEPATH "" FORCE)
+        set(_at_pbc_resolved TRUE)
+    endif()
+endif()
+if(NOT _at_pbc_resolved)
+    find_path(LIBPROTOBUF_C_INCLUDE_DIR protobuf-c.h PATH_SUFFIXES protobuf-c)
+    find_library(LIBPROTOBUF_C_LIBRARY NAMES protobuf-c)
+endif()
 include_directories(${LIBPROTOBUF_C_INCLUDE_DIR})
 #find_program(PROTOC_C_EXE protoc-c HINTS ${CONDA_ROOT})
 if(LIBPROTOBUF_C_LIBRARY)
@@ -317,6 +342,16 @@ if(LIBCHECK_LIBRARY)
     message("-- Found libcheck at ${LIBCHECK_LIBRARY}")
 else()
     message(WARNING "Testing dependency libcheck not found. Tests will not be built.")
+endif()
+# subunit is only required when libcheck is STATICALLY linked (its TAP output
+# backend); a shared libcheck.so resolves it internally. Link it only if present
+# so builds against a conda/shared libcheck (no separate subunit pkg) don't fail
+# with "cannot find -lsubunit".
+find_library(LIBSUBUNIT_LIBRARY NAMES subunit libsubunit.so libsubunit.a HINTS ${CONDA_ROOT})
+if(NOT LIBSUBUNIT_LIBRARY)
+    # find_library yields <VAR>-NOTFOUND when missing; blank it so it drops out
+    # of target_link_libraries cleanly rather than becoming a bogus link item.
+    set(LIBSUBUNIT_LIBRARY "")
 endif()
 
 # OpenSSL (required only when AT_ZTA is ON)
@@ -393,6 +428,14 @@ set(table_headers_in
 
 set(libsrc
     autonomous_trust/autonomous_trust.c
+    autonomous_trust/app_events.c
+    # The daemon's side of the app-facing wire, in flat form, so a foreign
+    # consumer's tests can play daemon. Nothing in AT calls it; it is here for
+    # the same reason messaging_set_test_hook is in message.h.
+    autonomous_trust/app_events_test_support.c
+    # The flat counterpart to node.h, for a consumer in another language:
+    # at_node_t embeds logger_t and queue_t by value and cannot be mirrored.
+    autonomous_trust/app_node.c
     autonomous_trust/node.c
     autonomous_trust/algorithms/agreement.c
     autonomous_trust/algorithms/paxos.c
@@ -413,8 +456,6 @@ set(libsrc
     autonomous_trust/reputation/reputation.c
     autonomous_trust/reputation/rep_proc.c
     autonomous_trust/config/generate.c
-    autonomous_trust/network/ping.c
-    autonomous_trust/network/ntp.c
     autonomous_trust/network/net_message.c
     autonomous_trust/network/net_proc.c
     autonomous_trust/network/net_transport_ip.c
@@ -423,6 +464,8 @@ set(libsrc
     autonomous_trust/network/net_transport_hybrid.c
     autonomous_trust/network/net_transport_registry.c
     autonomous_trust/network/network.c
+    autonomous_trust/bootstrap/bootstrap_capabilities.c
+    autonomous_trust/bootstrap/bootstrap_worker.c
     autonomous_trust/processes/capabilities.c
     autonomous_trust/processes/daemonize.c
     autonomous_trust/processes/process_tracker.c
@@ -437,6 +480,7 @@ set(libsrc
     autonomous_trust/utilities/allocation.c
     autonomous_trust/utilities/at_jansson.c
     autonomous_trust/utilities/b64.c
+    autonomous_trust/utilities/clock.c
     autonomous_trust/utilities/err_str.c
     autonomous_trust/utilities/exception.c
     autonomous_trust/utilities/logger.c
@@ -452,6 +496,7 @@ set(libsrc
     autonomous_trust/fleet/update_proposal.c
     autonomous_trust/fleet/fleet_helpers.c
     autonomous_trust/fleet/fleet_ops.c
+    autonomous_trust/data_source/data_source_proc.c
     autonomous_trust/fleet/fleet_proc.c
     autonomous_trust/fleet/artifact_store.c
     autonomous_trust/fleet/artifact_proc_helpers.c
@@ -472,6 +517,7 @@ if(AT_ZTA)
         autonomous_trust/zta/zta_policy.c
         autonomous_trust/zta/zta_audit.c
         autonomous_trust/zta/zta_process.c
+        autonomous_trust/zta/zta_binding.c
     )
 endif()
 
@@ -622,6 +668,14 @@ endif()
 
 set(libhdr
     autonomous_trust.h
+    # The app-facing surface. These are the headers a consumer in another
+    # language compiles against, so an installed library that omits them is
+    # unusable from outside C — app_events.h was reachable only through the
+    # source tree until now.
+    autonomous_trust/app_events.h
+    autonomous_trust/app_events_test_support.h
+    autonomous_trust/app_node.h
+    autonomous_trust/node.h
     autonomous_trust/algorithms/agreement.h
     autonomous_trust/algorithms/algorithms.h
     autonomous_trust/algorithms/paxos.h
@@ -640,6 +694,7 @@ set(libhdr
     autonomous_trust/structures/datetime.h
     autonomous_trust/structures/map.h
     autonomous_trust/structures/merkle.h
+    autonomous_trust/utilities/clock.h
     autonomous_trust/utilities/exception.h
     autonomous_trust/utilities/logger.h
     autonomous_trust/utilities/message.h
@@ -649,8 +704,6 @@ set(libhdr
     autonomous_trust/negotiation/negotiation.h
     autonomous_trust/reputation/reputation.h
     autonomous_trust/config/generate.h
-    autonomous_trust/network/ping.h
-    autonomous_trust/network/ntp.h
     autonomous_trust/fleet/update_proposal.h
     autonomous_trust/fleet/fleet_proc.h
     autonomous_trust/fleet/artifact_store.h
@@ -683,8 +736,24 @@ if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust/version.h)
     else()
         find_package(Git)
         if (GIT_FOUND AND EXISTS "${top_src_dir}/.git")
-            execute_process(COMMAND ${GIT_EXECUTABLE} describe HEAD OUTPUT_VARIABLE TAG OUTPUT_STRIP_TRAILING_WHITESPACE)
-            string(REGEX REPLACE "^v" "" VERSION ${TAG})
+            # `git describe` needs a reachable tag; a shallow/tagless checkout
+            # (e.g. actions/checkout, which fetches no tags by default) makes it
+            # fail with "No names found". Tolerate that: fall back to a short
+            # commit hash, then "unknown", and always quote "${TAG}" so the
+            # string(REGEX ...) below keeps its input argument when TAG is empty.
+            execute_process(COMMAND ${GIT_EXECUTABLE} describe HEAD
+                            OUTPUT_VARIABLE TAG OUTPUT_STRIP_TRAILING_WHITESPACE
+                            ERROR_QUIET RESULT_VARIABLE _git_describe_rc)
+            if(NOT _git_describe_rc EQUAL 0 OR TAG STREQUAL "")
+                execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+                                OUTPUT_VARIABLE TAG OUTPUT_STRIP_TRAILING_WHITESPACE
+                                ERROR_QUIET RESULT_VARIABLE _git_rev_rc)
+                if(NOT _git_rev_rc EQUAL 0 OR TAG STREQUAL "")
+                    set(TAG "unknown")
+                endif()
+                message("-- git describe unavailable (no reachable tag); version = ${TAG}")
+            endif()
+            string(REGEX REPLACE "^v" "" VERSION "${TAG}")
             set(REVISION ${VERSION} CACHE STRING "git tag" FORCE)
         else()
             message(WARNING "Git not found, cannot set version info")
@@ -724,7 +793,9 @@ function(preprocess _file_in)
         OUTPUT ${_header_file}
         COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/preprocess.py ${_fullpath} ${_header_file} ${_src_dir}/ autonomous_trust ${_exclude_args}
         COMMENT "Preprocessing table header from ${_file_in}"
-        DEPENDS ${_fullpath}
+        # Depend on the generator too: a change to preprocess.py (e.g. which
+        # directories it scans) must re-run generation, or stale tables linger.
+        DEPENDS ${_fullpath} ${CMAKE_CURRENT_SOURCE_DIR}/preprocess.py
     )
     set(table_hdrs ${table_hdrs} ${_header_file} PARENT_SCOPE)
 endfunction()
@@ -903,6 +974,14 @@ add_executable(agreement_test test/agreement_test.c)
 set_source_files_properties(test/agreement_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(agreement_test PRIVATE ${AT_TEST_LIBS})
 
+add_executable(bootstrap_capabilities_test test/bootstrap_capabilities_test.c)
+set_source_files_properties(test/bootstrap_capabilities_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(bootstrap_capabilities_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(bootstrap_worker_test test/bootstrap_worker_test.c)
+set_source_files_properties(test/bootstrap_worker_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(bootstrap_worker_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(net_message_test test/net_message_test.c)
 set_source_files_properties(test/net_message_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(net_message_test PRIVATE ${AT_TEST_LIBS})
@@ -943,9 +1022,33 @@ add_executable(partition_recovery_test test/partition_recovery_test.c)
 set_source_files_properties(test/partition_recovery_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(partition_recovery_test PRIVATE ${AT_TEST_LIBS})
 
+add_executable(late_joiner_caps_resync_test test/late_joiner_caps_resync_test.c)
+set_source_files_properties(test/late_joiner_caps_resync_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(late_joiner_caps_resync_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(identity_resync_test test/identity_resync_test.c)
+set_source_files_properties(test/identity_resync_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(identity_resync_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(subtree_roster_test test/subtree_roster_test.c)
+set_source_files_properties(test/subtree_roster_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(subtree_roster_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(operator_attestation_test test/operator_attestation_test.c)
+set_source_files_properties(test/operator_attestation_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(operator_attestation_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(data_test test/data_test.c)
 set_source_files_properties(test/data_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(data_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(data_source_test test/data_source_test.c)
+set_source_files_properties(test/data_source_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(data_source_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(net_proc_ageout_test test/net_proc_ageout_test.c)
+set_source_files_properties(test/net_proc_ageout_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_proc_ageout_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(datetime_test test/datetime_test.c)
 set_source_files_properties(test/datetime_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -954,6 +1057,10 @@ target_link_libraries(datetime_test PRIVATE ${AT_TEST_LIBS})
 add_executable(b64_test test/b64_test.c)
 set_source_files_properties(test/b64_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(b64_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(clock_test test/clock_test.c)
+set_source_files_properties(test/clock_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(clock_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(group_test test/group_test.c)
 set_source_files_properties(test/group_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1001,7 +1108,7 @@ target_link_libraries(jcs_test PRIVATE
     at_ryu
     ${LIBJANSSON_LIBRARY}
     ${LIBCHECK_LIBRARY}
-    subunit
+    ${LIBSUBUNIT_LIBRARY}  # empty (and skipped) unless a subunit lib was found
     m
     pthread
     rt
@@ -1019,6 +1126,8 @@ add_test(NAME rb_test COMMAND $<TARGET_FILE:rb_test>)
 add_test(NAME merkle_test COMMAND $<TARGET_FILE:merkle_test>)
 add_test(NAME dag_test COMMAND $<TARGET_FILE:dag_test>)
 add_test(NAME agreement_test COMMAND $<TARGET_FILE:agreement_test>)
+add_test(NAME bootstrap_capabilities_test COMMAND $<TARGET_FILE:bootstrap_capabilities_test>)
+add_test(NAME bootstrap_worker_test COMMAND $<TARGET_FILE:bootstrap_worker_test>)
 add_test(NAME net_message_test COMMAND $<TARGET_FILE:net_message_test>)
 add_test(NAME socket_helpers_test COMMAND $<TARGET_FILE:socket_helpers_test>)
 add_test(NAME at_jansson_test COMMAND $<TARGET_FILE:at_jansson_test>)
@@ -1029,9 +1138,16 @@ add_test(NAME queue_pool_test COMMAND $<TARGET_FILE:queue_pool_test>)
 add_test(NAME network_test COMMAND $<TARGET_FILE:network_test>)
 add_test(NAME identity_test COMMAND $<TARGET_FILE:identity_test>)
 add_test(NAME partition_recovery_test COMMAND $<TARGET_FILE:partition_recovery_test>)
+add_test(NAME late_joiner_caps_resync_test COMMAND $<TARGET_FILE:late_joiner_caps_resync_test>)
+add_test(NAME identity_resync_test COMMAND $<TARGET_FILE:identity_resync_test>)
+add_test(NAME subtree_roster_test COMMAND $<TARGET_FILE:subtree_roster_test>)
+add_test(NAME operator_attestation_test COMMAND $<TARGET_FILE:operator_attestation_test>)
 add_test(NAME data_test COMMAND $<TARGET_FILE:data_test>)
+add_test(NAME data_source_test COMMAND $<TARGET_FILE:data_source_test>)
+add_test(NAME net_proc_ageout_test COMMAND $<TARGET_FILE:net_proc_ageout_test>)
 add_test(NAME datetime_test COMMAND $<TARGET_FILE:datetime_test>)
 add_test(NAME b64_test COMMAND $<TARGET_FILE:b64_test>)
+add_test(NAME clock_test COMMAND $<TARGET_FILE:clock_test>)
 add_test(NAME group_test COMMAND $<TARGET_FILE:group_test>)
 add_test(NAME data_json_test COMMAND $<TARGET_FILE:data_json_test>)
 add_test(NAME datetime2_test COMMAND $<TARGET_FILE:datetime2_test>)
@@ -1050,6 +1166,22 @@ add_executable(network2_test test/network2_test.c)
 set_source_files_properties(test/network2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(network2_test PRIVATE ${AT_TEST_LIBS})
 
+add_executable(net_port_test test/net_port_test.c)
+set_source_files_properties(test/net_port_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_port_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(cidr_split_test test/cidr_split_test.c)
+set_source_files_properties(test/cidr_split_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(cidr_split_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(unencrypted_verbs_test test/unencrypted_verbs_test.c)
+set_source_files_properties(test/unencrypted_verbs_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(unencrypted_verbs_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(net_source_bind_test test/net_source_bind_test.c)
+set_source_files_properties(test/net_source_bind_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_source_bind_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(proc_tracker2_test test/proc_tracker2_test.c)
 set_source_files_properties(test/proc_tracker2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(proc_tracker2_test PRIVATE ${AT_TEST_LIBS})
@@ -1064,6 +1196,10 @@ target_link_libraries(capabilities_test PRIVATE ${AT_TEST_LIBS})
 
 add_test(NAME msg_types_test COMMAND $<TARGET_FILE:msg_types_test>)
 add_test(NAME network2_test COMMAND $<TARGET_FILE:network2_test>)
+add_test(NAME net_port_test COMMAND $<TARGET_FILE:net_port_test>)
+add_test(NAME cidr_split_test COMMAND $<TARGET_FILE:cidr_split_test>)
+add_test(NAME unencrypted_verbs_test COMMAND $<TARGET_FILE:unencrypted_verbs_test>)
+add_test(NAME net_source_bind_test COMMAND $<TARGET_FILE:net_source_bind_test>)
 add_test(NAME proc_tracker2_test COMMAND $<TARGET_FILE:proc_tracker2_test>)
 add_test(NAME processes_test COMMAND $<TARGET_FILE:processes_test>)
 add_test(NAME capabilities_test COMMAND $<TARGET_FILE:capabilities_test>)
@@ -1316,6 +1452,30 @@ add_executable(peer_rtt_update_test test/peer_rtt_update_test.c)
 set_source_files_properties(test/peer_rtt_update_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(peer_rtt_update_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME peer_rtt_update_test COMMAND $<TARGET_FILE:peer_rtt_update_test>)
+
+add_executable(app_events_test test/app_events_test.c)
+set_source_files_properties(test/app_events_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(app_events_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME app_events_test COMMAND $<TARGET_FILE:app_events_test>)
+
+# The flat lifecycle ABI (app_node.h) and the non-forking half of
+# at_node_start. Creates and binds under its own AUTONOMOUS_TRUST_ROOT.
+# The opt-in operator key: the cross-language pre-image pin, and (with ZTA) the
+# signature check. Mints its own PKI at run time like zta_ocsp_test.
+add_executable(operator_binding_test test/operator_binding_test.c)
+set_source_files_properties(test/operator_binding_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(operator_binding_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME operator_binding_test COMMAND $<TARGET_FILE:operator_binding_test>)
+
+add_executable(zta_binding_test test/zta_binding_test.c)
+set_source_files_properties(test/zta_binding_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(zta_binding_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME zta_binding_test COMMAND $<TARGET_FILE:zta_binding_test>)
+
+add_executable(app_node_test test/app_node_test.c)
+set_source_files_properties(test/app_node_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(app_node_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME app_node_test COMMAND $<TARGET_FILE:app_node_test>)
 
 # Envelope codec unit tests — gated by AT_NET_ENVELOPE since the codec TU
 # itself is only compiled when that option is ON.

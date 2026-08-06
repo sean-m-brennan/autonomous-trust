@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -107,7 +107,7 @@ static uint8_t *build_inner_wire(const uuid_t announcer_uuid,
     wmsg.data_len = 0;
     wmsg.to_whom.type = RECIPIENT_BROADCAST;
     memcpy(wmsg.from_whom.uuid, announcer_uuid, 16);
-    snprintf(wmsg.from_whom.fullname, sizeof(wmsg.from_whom.fullname), "remote-peer");
+    snprintf(wmsg.from_whom.nickname, sizeof(wmsg.from_whom.nickname), "remote-peer");
     snprintf(wmsg.from_whom.address, sizeof(wmsg.from_whom.address),
              "%s", self_reported_addr);
     wmsg.encrypt = false;

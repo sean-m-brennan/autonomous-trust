@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -292,6 +292,105 @@ def test_track_recv_error_handles_missing_unknown_peer():
     stat_before = nproc.statistics[nproc.unknown_peer]
     nproc.track_recv_error()
     assert nproc.statistics[nproc.unknown_peer] is stat_before
+
+
+# ---------------------------------------------------------------------------
+# net_stats must (a) not raise "dictionary changed size during iteration" when
+# the sender/receiver threads add peers mid-read, (b) compute a bytes/second
+# rate (the timedelta needs .total_seconds(); int/timedelta is a TypeError), and
+# (c) skip entries without a spannable interval. Surfaced 2026-06-26 by the
+# two-node integration test ([node_b] UDPNetworkProcess: dictionary changed
+# size during iteration).
+# ---------------------------------------------------------------------------
+
+def test_net_stats_rate_is_bytes_per_second_and_shape():
+    from collections import deque
+    from datetime import datetime, timedelta
+    from autonomous_trust.core.network.netprocess import NetworkProcess, NetStat
+
+    nproc = NetworkProcess.__new__(NetworkProcess)
+    nproc.statistics = {}
+    stat = NetStat()
+    t0 = datetime(2026, 6, 26, 12, 0, 0)
+    stat.times = deque([t0, t0 + timedelta(seconds=2)])  # 2 s span
+    stat.send = deque([100, 100])
+    stat.recv = deque([50, 50])
+    stat.send_total, stat.recv_total = 200, 100
+    stat.err_out, stat.err_in = 1, 2
+    nproc.statistics['peer-1'] = stat
+
+    stats = nproc.net_stats                       # must not raise TypeError
+    up, down, send_total, recv_total, err_out, err_in = stats['peer-1']
+    assert up == 100.0 and down == 50.0           # bytes / 2 s
+    assert (send_total, recv_total, err_out, err_in) == (200, 100, 1, 2)
+
+
+def test_net_stats_skips_insufficient_or_zero_span_entries():
+    from collections import deque
+    from datetime import datetime
+    from autonomous_trust.core.network.netprocess import NetworkProcess, NetStat
+
+    nproc = NetworkProcess.__new__(NetworkProcess)
+    nproc.statistics = {}
+    one = NetStat()
+    one.sent(10)                                  # single sample -> no interval
+    nproc.statistics['one-sample'] = one
+    same = NetStat()
+    t = datetime(2026, 6, 26, 12, 0, 0)
+    same.times = deque([t, t])                    # zero-span -> no rate
+    same.send, same.recv = deque([1, 1]), deque([1, 1])
+    nproc.statistics['zero-span'] = same
+
+    stats = nproc.net_stats                        # no IndexError / ZeroDivision
+    assert 'one-sample' not in stats and 'zero-span' not in stats
+
+
+def test_net_stats_safe_when_peer_added_mid_iteration():
+    # Deterministically reproduce the reported failure: a peer is added to
+    # statistics WHILE net_stats iterates it (as the sender/receiver threads
+    # do). The injecting entry's .times access inserts a new key; with the old
+    # `for uuid in self.statistics` this raised "dictionary changed size during
+    # iteration", with the key snapshot it does not.
+    from collections import deque
+    from datetime import datetime, timedelta
+    from autonomous_trust.core.network.netprocess import NetworkProcess, NetStat
+
+    t0 = datetime(2026, 6, 26, 12, 0, 0)
+
+    def _stat(send_total):
+        s = NetStat()
+        s.times = deque([t0, t0 + timedelta(seconds=1)])
+        s.send = deque([send_total // 2, send_total // 2])
+        s.recv = deque([0, 0])
+        s.send_total = send_total
+        return s
+
+    class _InjectingStat:
+        """Duck-typed NetStat whose .times read inserts a late peer."""
+        def __init__(self, target):
+            self._target = target
+            self._fired = False
+            self.send = deque([5, 5])
+            self.recv = deque([0, 0])
+            self.send_total, self.recv_total, self.err_out, self.err_in = 10, 0, 0, 0
+
+        @property
+        def times(self):
+            if not self._fired:
+                self._fired = True
+                self._target['late-peer'] = _stat(99)   # mutate mid-iteration
+            return deque([t0, t0 + timedelta(seconds=1)])
+
+    nproc = NetworkProcess.__new__(NetworkProcess)
+    nproc.statistics = {}
+    nproc.statistics['inject'] = _InjectingStat(nproc.statistics)
+    nproc.statistics['other'] = _stat(20)
+
+    stats = nproc.net_stats          # must not raise
+    # the two peers present at snapshot time are reported; the late insert is
+    # simply picked up on the next call rather than crashing this one.
+    assert 'inject' in stats and 'other' in stats
+    assert nproc.net_stats.get('late-peer') is not None
 
 
 # ---------------------------------------------------------------------------

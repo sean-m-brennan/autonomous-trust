@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -14,7 +14,6 @@
 #   limitations under the License.
 # ******************
 
-import multiprocessing
 import os
 import time
 from queue import Empty, Full
@@ -111,8 +110,8 @@ class Commander(object):
         self.req = Requestor(**kwargs)
 
     def run_forever(self):
-        req = multiprocessing.Process(target=self.req.run_forever,
-                                      args=(self.req_in_queue, self.req_out_queue))
+        req = self.ctx.Process(target=self.req.run_forever,
+                               args=(self.req_in_queue, self.req_out_queue))
         req.start()
         time.sleep(0.5)
         while True:
@@ -138,5 +137,9 @@ class Commander(object):
 
 
 if __name__ == '__main__':
+    # Default to forkserver: 'fork' (Linux default through 3.13) forks a
+    # multi-threaded process and can deadlock the child. Harmless on 3.14+.
+    import multiprocessing as _mp
+    _mp.set_start_method('forkserver', force=True)
     random_config(os.path.join(os.path.dirname(__file__)))
     Commander(log_level=LogLevel.DEBUG).run_forever()

@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import logging
 import os
 import sys
 from datetime import UTC, datetime
@@ -45,12 +46,77 @@ class MetadataProtocol(Protocol):
 
 class TimeSource(object):
     def acquire(self) -> datetime:
-        # Open: tap into custom NTP. Currently returns local
-        # wall-clock UTC; for distributed-trust scenarios a
-        # peer-shared time source (or the C-side native RFC 5905
-        # client at network/ntp.c) would let participants agree on
-        # event ordering across drift.
-        return datetime.now(UTC)
+        """Return the current time from the host clock.
+
+        Delegates to the core time authority
+        (``autonomous_trust.core.system.now``), which reads the host clock as
+        disciplined by a stock NTP daemon (chrony / ntpd / systemd-timesyncd).
+        Participants order events on a common clock because the daemon steers the
+        kernel, not because AT applies a correction of its own -- it used to, and
+        that offset was visible only to AT code, leaving AT and its own host
+        disagreeing about the time. See ``NtpTimeSource`` for a source that also
+        reports how trustworthy that discipline currently is.
+        """
+        try:
+            from autonomous_trust.core.system import now
+            return now()
+        except ImportError:  # core time authority unavailable — local fallback
+            return datetime.now(UTC)
+
+
+class NtpTimeSource(TimeSource):
+    """Time source that also reports the quality of the host's NTP discipline.
+
+    AT does not implement NTP. This source reads what the stock daemon has
+    achieved -- via ``ntp_adjtime`` (unprivileged, no socket or network, and
+    honest inside a container because CLOCK_REALTIME is shared with the host),
+    plus chronyc detail when that happens to be reachable. ``acquire`` returns
+    the host clock exactly as the base class does; the value added here is
+    ``quality`` / ``trustworthy``, so a consumer can decline to order events on a
+    clock nothing is steering rather than silently trusting it.
+
+    Register it as a metadata class to get clock-quality reporting alongside the
+    timestamp. The legacy ``server`` / ``interval`` kwargs are accepted so
+    existing ``time_src_kwargs`` payloads keep loading, but they no longer mean
+    anything: choosing servers and poll intervals is the daemon's configuration,
+    not AT's. Passing them warns once.
+    """
+
+    _legacy_warned: bool = False
+
+    def __init__(self, server: str = None, interval: float = None,
+                 max_error_sec: float = 1.0):
+        self.max_error_sec = float(max_error_sec)
+        # Kept only so an old config does not fail to load.
+        self.server = server
+        self.interval = interval
+        if (server is not None or interval is not None) and not NtpTimeSource._legacy_warned:
+            NtpTimeSource._legacy_warned = True
+            logging.getLogger(__name__).warning(
+                'NtpTimeSource: server/interval are ignored — AT no longer runs its '
+                'own NTP client. Configure the stock daemon (chrony/ntpd/timesyncd) '
+                'on the host instead; this source only reports its state.')
+
+    @property
+    def quality(self):
+        """The host clock's discipline state, or None if core is unavailable."""
+        try:
+            from autonomous_trust.core.network.clock import clock_state
+        except ImportError:
+            return None
+        return clock_state()
+
+    @property
+    def trustworthy(self) -> bool:
+        """True iff a daemon is steering this clock and its error is bounded.
+
+        False is a real answer, not an error: it means timestamps from this host
+        should not be used to order events against other peers'.
+        """
+        state = self.quality
+        if state is None:
+            return False
+        return state.synced and state.max_error.total_seconds() <= self.max_error_sec
 
 
 class PositionSource(object):
@@ -60,6 +126,7 @@ class PositionSource(object):
 
 _ALLOWED_METADATA_CLASSES = {
     'autonomous_trust.services.peer.metadata.TimeSource',
+    'autonomous_trust.services.peer.metadata.NtpTimeSource',
     'autonomous_trust.services.peer.metadata.PositionSource',
     'autonomous_trust.services.peer.position.Position',
     'autonomous_trust.services.peer.position.GeoPosition',
@@ -69,7 +136,8 @@ _ALLOWED_METADATA_CLASSES = {
 
 class Metadata(InitializableConfig):
     def __init__(self, uuid: str, peer_kind: str, data_meta: dict[str, int],
-                 position_src_class: type, time_src_class: type = None):
+                 position_src_class: type, time_src_class: type = None,
+                 position_src_kwargs: dict = None, time_src_kwargs: dict = None):
         self.uuid = uuid
         self.peer_kind = peer_kind
         self.data_meta = data_meta
@@ -78,19 +146,22 @@ class Metadata(InitializableConfig):
             self.time_src_class = self.class_to_name(TimeSource)
         else:
             self.time_src_class = self.class_to_name(time_src_class)
+        # Constructor params for the source classes. These serialize with the
+        # rest of the config (plain dicts of scalars) and are passed through by
+        # the source properties, so a registered source may be parameterized
+        # (e.g. a GPS device path / GeoPosition origin for the position source,
+        # or an NTP server/interval for NtpTimeSource) instead of being limited
+        # to a no-arg __init__.
+        self.position_src_kwargs = dict(position_src_kwargs) if position_src_kwargs else {}
+        self.time_src_kwargs = dict(time_src_kwargs) if time_src_kwargs else {}
 
     @property
     def position_source(self):
-        # Open: position-source constructor params. Today every
-        # registered class must accept no-arg __init__. If position
-        # sources need configuration (e.g. GPS device path,
-        # GeoPosition origin reference), Metadata would need to carry
-        # an additional kwargs payload and pass it through here.
-        return self.name_to_class(self.position_src_class)()
+        return self.name_to_class(self.position_src_class)(**(self.position_src_kwargs or {}))
 
     @property
     def time_source(self):
-        return self.name_to_class(self.time_src_class)()
+        return self.name_to_class(self.time_src_class)(**(self.time_src_kwargs or {}))
 
     @classmethod
     def register_metadata_class(cls, klass):
@@ -117,9 +188,11 @@ class Metadata(InitializableConfig):
 
     @classmethod
     def initialize(cls, peer_kind: str, data_meta: dict[str, int],
-                   position_source: type, time_source: type = None):
+                   position_source: type, time_source: type = None,
+                   position_src_kwargs: dict = None, time_src_kwargs: dict = None):
         uuid = cls.get_assoc_ident().uuid
-        return Metadata(uuid, peer_kind, data_meta, position_source, time_source)
+        return Metadata(uuid, peer_kind, data_meta, position_source, time_source,
+                        position_src_kwargs, time_src_kwargs)
 
 
 class MetadataSource(Process, metaclass=ProcMeta,

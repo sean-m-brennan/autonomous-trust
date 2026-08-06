@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -96,13 +96,18 @@ class TestGetAddresses:
 
 
 class TestGetDefaultDevice:
+    # _get_default_device() short-circuits to '' when the `ip` binary is absent
+    # (e.g. a minimal CI container without iproute2). Patch shutil.which so the
+    # parse logic is exercised regardless of what's installed on the host.
+    @patch('autonomous_trust.core.network.network.shutil.which', return_value='/sbin/ip')
     @patch('autonomous_trust.core.network.network.subprocess.check_output')
-    def test_default_route(self, mock_output):
+    def test_default_route(self, mock_output, _mock_which):
         mock_output.return_value = b'default via 192.168.1.1 dev eth0 proto dhcp\n'
         assert Network._get_default_device() == 'eth0'
 
+    @patch('autonomous_trust.core.network.network.shutil.which', return_value='/sbin/ip')
     @patch('autonomous_trust.core.network.network.subprocess.check_output')
-    def test_no_default(self, mock_output):
+    def test_no_default(self, mock_output, _mock_which):
         mock_output.return_value = b'192.168.1.0/24 dev eth0 proto kernel\n'
         assert Network._get_default_device() == 'eth0'
 

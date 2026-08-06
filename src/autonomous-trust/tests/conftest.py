@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -58,8 +58,19 @@ def setup(local_net=False):
 
 
 def teardown():
-    if not PRESERVE_FILES and os.path.isdir(TEST_DIR):
-        shutil.rmtree(TEST_DIR)
+    if PRESERVE_FILES or not os.path.isdir(TEST_DIR):
+        return
+    # A child process may still be flushing config files into TEST_DIR as the
+    # session winds down, so a plain rmtree can race those writes and fail with
+    # "OSError: Directory not empty". Retry briefly to let stragglers finish,
+    # then fall back to best-effort removal so cleanup never fails the suite.
+    for _ in range(10):
+        try:
+            shutil.rmtree(TEST_DIR)
+            return
+        except OSError:
+            time.sleep(0.1)
+    shutil.rmtree(TEST_DIR, ignore_errors=True)
 
 
 @pytest.fixture(scope="session")

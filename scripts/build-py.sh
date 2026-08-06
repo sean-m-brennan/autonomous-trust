@@ -1,6 +1,6 @@
 #!/bin/bash
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -20,6 +20,29 @@
 # Run everything relative to the repo root
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$here" || exit 1
+
+usage() {
+  cat <<'EOF'
+Usage: build-py.sh [proto-only] [-h|--help]
+
+Build the Python source distributions for live use. Regenerates the Protobuf
+interfaces, then builds and extracts sdists for the autonomous-trust packages
+into ./dist.
+
+Requires the 'autonomous_trust' conda environment to be active (run
+'conda activate autonomous_trust').
+
+Arguments:
+  proto-only    Only regenerate Protobuf interfaces; skip building sdists.
+
+Options:
+  -h, --help    Show this help message and exit.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
 
 if [[ "${CONDA_DEFAULT_ENV:-}" != "autonomous_trust" ]]; then
   echo "ERROR: conda environment 'autonomous_trust' is not active." >&2

@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -30,6 +30,8 @@
 #include <openssl/ocsp.h>
 #include <openssl/bio.h>
 #include <openssl/ssl.h>
+#include <openssl/pkcs7.h>
+#include <openssl/objects.h>
 
 #include "x509_verifier.h"
 
@@ -51,9 +53,21 @@ typedef struct {
     bool valid;
 } cert_cache_entry_t;
 
+/* Max number of intermediate CA certificates between the leaf and the trust
+ * anchor (root). MUST stay in lockstep with Python `_MAX_CHAIN_DEPTH`
+ * (identity/zta/zta_verifier.py). OpenSSL's X509_VERIFY_PARAM_set_depth bounds
+ * exactly this quantity. Pinned by conformance zta-x509-reject-chain-depth. */
+#define AT_X509_MAX_CHAIN_DEPTH 8
+
 typedef struct {
     x509_verifier_config_t cfg;
     X509_STORE *ca_store;
+    /* Non-self-signed certs from the bundle, kept as UNTRUSTED intermediates and
+     * handed to X509_STORE_CTX_init at verify time. Only self-signed certs go
+     * into ca_store as trusted anchors -- otherwise OpenSSL would treat a bundled
+     * intermediate as a root and short-circuit the chain to depth 0, defeating
+     * the depth bound (matches Python: only a self-signed root terminates). */
+    STACK_OF(X509) *untrusted;
     cert_cache_entry_t cert_cache[CERT_CACHE_SIZE];
     int cert_cache_count;
     bool ocsp_reachable;                /* Last-known OCSP reachability */
@@ -82,6 +96,90 @@ static X509 *parse_cert(const uint8_t *data, size_t len)
     cert = PEM_read_bio_X509(bio, NULL, NULL, NULL);
     BIO_free(bio);
     return cert;
+}
+
+/* Frama-C: skipped — [syscall] OpenSSL EVP signature verification */
+bool x509_verify_data_signature(const uint8_t *cert_der, size_t cert_len,
+                                const uint8_t *data, size_t data_len,
+                                const uint8_t *sig, size_t sig_len)
+{
+    if (cert_der == NULL || cert_len == 0 || data == NULL || data_len == 0
+        || sig == NULL || sig_len == 0)
+        return false;
+
+    X509 *cert = parse_cert(cert_der, cert_len);
+    if (cert == NULL)
+        return false;
+
+    bool ok = false;
+    EVP_PKEY *pub = X509_get_pubkey(cert);
+    EVP_MD_CTX *ctx = NULL;
+    if (pub == NULL)
+        goto out;
+
+    /* Only the two key types a PIV/CAC actually carries, and the same pairings
+     * Python's verifier uses: RSA => PKCS#1 v1.5, EC => ECDSA, SHA-256 either
+     * way. Anything else is refused rather than guessed at — a signature scheme
+     * inferred wrongly fails closed here, but silently accepting an unexpected
+     * key type is how a verifier ends up verifying nothing. */
+    int kind = EVP_PKEY_base_id(pub);
+    if (kind != EVP_PKEY_RSA && kind != EVP_PKEY_EC)
+        goto out;
+
+    ctx = EVP_MD_CTX_new();
+    if (ctx == NULL)
+        goto out;
+    if (EVP_DigestVerifyInit(ctx, NULL, EVP_sha256(), NULL, pub) != 1)
+        goto out;
+    /* One-shot: the pre-image is ~100 bytes, so there is nothing to stream. */
+    ok = EVP_DigestVerify(ctx, sig, sig_len, data, data_len) == 1;
+
+out:
+    if (ctx != NULL)
+        EVP_MD_CTX_free(ctx);
+    if (pub != NULL)
+        EVP_PKEY_free(pub);
+    X509_free(cert);
+    return ok;
+}
+
+/* Frama-C: skipped — [syscall] OpenSSL SAN extension parsing */
+bool x509_cert_has_uri_san(const uint8_t *cert_der, size_t cert_len,
+                           const char *uri)
+{
+    if (cert_der == NULL || cert_len == 0 || uri == NULL || uri[0] == '\0')
+        return false;
+    X509 *cert = parse_cert(cert_der, cert_len);
+    if (cert == NULL)
+        return false;
+
+    bool found = false;
+    GENERAL_NAMES *names = X509_get_ext_d2i(cert, NID_subject_alt_name,
+                                            NULL, NULL);
+    if (names != NULL) {
+        int n = sk_GENERAL_NAME_num(names);
+        for (int i = 0; i < n && !found; i++) {
+            const GENERAL_NAME *gn = sk_GENERAL_NAME_value(names, i);
+            if (gn == NULL || gn->type != GEN_URI)
+                continue;
+            const unsigned char *val = ASN1_STRING_get0_data(
+                gn->d.uniformResourceIdentifier);
+            int val_len = ASN1_STRING_length(gn->d.uniformResourceIdentifier);
+            if (val == NULL || val_len <= 0)
+                continue;
+            /* Length-checked rather than strcasecmp: an ASN1_STRING is not
+             * required to be NUL-terminated, and one containing an embedded NUL
+             * would otherwise compare equal on its prefix — the classic way a
+             * SAN check is defeated. */
+            if ((size_t)val_len != strlen(uri))
+                continue;
+            if (strncasecmp((const char *)val, uri, (size_t)val_len) == 0)
+                found = true;
+        }
+        GENERAL_NAMES_free(names);
+    }
+    X509_free(cert);
+    return found;
 }
 
 /**
@@ -407,7 +505,7 @@ static int x509_verify_credential(zta_verifier_t *self,
         return EZTA_INTERNAL;
     }
 
-    if (X509_STORE_CTX_init(ctx, impl->ca_store, cert, NULL) != 1) {
+    if (X509_STORE_CTX_init(ctx, impl->ca_store, cert, impl->untrusted) != 1) {
         X509_STORE_CTX_free(ctx);
         X509_free(cert);
         zta_result_set(result, ZTA_UNAVAILABLE, "failed to init verification context");
@@ -432,6 +530,44 @@ static int x509_verify_credential(zta_verifier_t *self,
     return 0;
 }
 
+/**
+ * @brief Load a CRL as PEM **or DER** (agency CRLs are normally DER).
+ *
+ * Only PEM was accepted before, so a DER CRL parsed as nothing and the caller
+ * silently proceeded as though no CRL were configured -- revocation checking
+ * looked wired up while doing nothing. Python parity: `X509Verifier._load_crl`.
+ *
+ * @param path      CRL file path.
+ * @param readable  Out: whether the file could be opened at all.
+ * @return the CRL (caller frees), or NULL.
+ */
+static X509_CRL *_load_crl_file(const char *path, bool *readable)
+{
+    *readable = false;
+    BIO *bio = BIO_new_file(path, "r");
+    if (bio == NULL) {
+        ERR_clear_error();
+        return NULL;
+    }
+    *readable = true;
+    X509_CRL *crl = PEM_read_bio_X509_CRL(bio, NULL, NULL, NULL);
+    BIO_free(bio);
+    if (crl != NULL)
+        return crl;
+
+    ERR_clear_error();
+    bio = BIO_new_file(path, "rb");  /* reopen; see _bundle_load_pkcs7 */
+    if (bio == NULL) {
+        ERR_clear_error();
+        return NULL;
+    }
+    crl = d2i_X509_CRL_bio(bio, NULL);
+    BIO_free(bio);
+    if (crl == NULL)
+        ERR_clear_error();
+    return crl;
+}
+
 /* Frama-C: skipped — [solver-timeout] OpenSSL + OCSP preconditions */
 static int x509_check_revocation(zta_verifier_t *self,
                                  const uint8_t *cred_hash,
@@ -442,25 +578,56 @@ static int x509_check_revocation(zta_verifier_t *self,
 
     /* CRL-based revocation check */
     if (impl->cfg.crl_path[0] != '\0') {
-        FILE *fp = fopen(impl->cfg.crl_path, "r");
-        if (fp) {
-            X509_CRL *crl = PEM_read_X509_CRL(fp, NULL, NULL, NULL);
-            fclose(fp);
-            if (crl) {
-                /*
-                 * Full CRL checking requires matching serial numbers.
-                 * For now, having a loadable CRL means the infrastructure
-                 * is reachable. Detailed serial matching is done during
-                 * verify_credential via X509_STORE flags.
-                 */
-                X509_STORE_set_flags(impl->ca_store, X509_V_FLAG_CRL_CHECK);
-                X509_STORE_add_crl(impl->ca_store, crl);
-                X509_CRL_free(crl);
-                zta_result_set(result, ZTA_VERIFIED, "CRL loaded; not revoked");
-                memcpy(result->credential_hash, cred_hash, ZTA_HASH_LEN);
-                return 0;
-            }
+        bool readable = false;
+        X509_CRL *crl = _load_crl_file(impl->cfg.crl_path, &readable);
+        if (crl == NULL) {
+            /* A configured-but-unusable CRL must NOT fall through to the OCSP /
+             * "no revocation method configured" tail: that is indistinguishable
+             * from having no CRL at all, and is exactly how a DER CRL used to
+             * disappear. UNAVAILABLE, never VERIFIED -- a check that cannot run
+             * must not read as "not revoked". */
+            /* The path is bounded (%.190s) so a long path cannot crowd the
+             * explanation out of the fixed reason buffer. */
+            char reason[ZTA_REASON_LEN];
+            if (readable)
+                snprintf(reason, sizeof(reason),
+                         "CRL %.190s could not be parsed (expected PEM or DER X.509 CRL)",
+                         impl->cfg.crl_path);
+            else
+                snprintf(reason, sizeof(reason), "CRL %.190s could not be read",
+                         impl->cfg.crl_path);
+            zta_result_set(result, ZTA_UNAVAILABLE, reason);
+            memcpy(result->credential_hash, cred_hash, ZTA_HASH_LEN);
+            return 0;
         }
+        /*
+         * Match the previously-verified cert's serial against the CRL,
+         * mirroring Python X509Verifier.check_revocation
+         * (crl.get_revoked_certificate_by_serial_number). The cert was
+         * cached by verify_credential keyed on cred_hash; without it we
+         * cannot match a serial, so fall through to "not revoked"
+         * (matching Python, whose cache miss likewise yields a non-
+         * revoked verdict). This explicit serial match — rather than the
+         * old "CRL loaded => reachable" stub — is what lets the admission
+         * gate reject a revoked-but-chain-valid cert; pinned cross-impl
+         * by conformance zta-x509-reject-revoked-credential.
+         */
+        X509 *cert = _cache_lookup(impl, cred_hash);
+        bool revoked = false;
+        if (cert != NULL) {
+            X509_REVOKED *rev = NULL;
+            if (X509_CRL_get0_by_cert(crl, &rev, cert) == 1)
+                revoked = true;
+            X509_free(cert);
+        }
+        X509_CRL_free(crl);
+        if (revoked) {
+            zta_result_set(result, ZTA_REVOKED, "certificate revoked (CRL)");
+        } else {
+            zta_result_set(result, ZTA_VERIFIED, "CRL loaded; not revoked");
+        }
+        memcpy(result->credential_hash, cred_hash, ZTA_HASH_LEN);
+        return 0;
     }
 
     /* OCSP-based revocation check */
@@ -660,11 +827,141 @@ static void x509_destroy(zta_verifier_t *self)
             if (impl->cert_cache[i].valid && impl->cert_cache[i].der)
                 OPENSSL_free(impl->cert_cache[i].der);
         }
+        if (impl->untrusted)
+            sk_X509_pop_free(impl->untrusted, X509_free);
         if (impl->ca_store)
             X509_STORE_free(impl->ca_store);
         free(impl);
     }
     free(self);
+}
+
+/* ---------- CA bundle loading ---------- */
+
+/**
+ * @brief File a bundle certificate as a trusted anchor or an intermediate.
+ *
+ * Self-signed goes into the store as a trust anchor; everything else onto the
+ * untrusted stack, so X509_STORE_set_depth actually bounds intermediates (see
+ * the constructor's comment). Consumes the caller's reference to @p c.
+ */
+static void _bundle_add_cert(X509_STORE *store, STACK_OF(X509) **untrusted,
+                             X509 *c)
+{
+    if (X509_NAME_cmp(X509_get_subject_name(c), X509_get_issuer_name(c)) == 0) {
+        X509_STORE_add_cert(store, c);  /* ups its own ref */
+        X509_free(c);
+    } else {
+        if (*untrusted == NULL)
+            *untrusted = sk_X509_new_null();
+        if (*untrusted != NULL)
+            sk_X509_push(*untrusted, c); /* stack takes our ref */
+        else
+            X509_free(c);
+    }
+}
+
+/**
+ * @brief Load the certificates from a PKCS#7 bundle (.p7b/.p7c), DER or PEM.
+ *
+ * PKCS#7 is the format agency PKI (incl. DoD) ships chains in; without this the
+ * bundle had to be converted with `openssl pkcs7 -print_certs` out of band, and
+ * an unconverted .p7b failed as a corrupt bundle. Python parity:
+ * `X509Verifier._load_bundle_certs`.
+ *
+ * @return number of certificates filed into the store/untrusted stack.
+ */
+static int _bundle_load_pkcs7(X509_STORE *store, STACK_OF(X509) **untrusted,
+                              const char *path)
+{
+    PKCS7 *p7 = NULL;
+    BIO *bio = BIO_new_file(path, "rb");
+    if (bio != NULL) {
+        p7 = d2i_PKCS7_bio(bio, NULL);
+        BIO_free(bio);
+    }
+    if (p7 == NULL) {
+        /* Not DER; a PEM-wrapped ("-----BEGIN PKCS7-----") container is also
+         * issued in practice. Reopen rather than BIO_reset: file-BIO reset
+         * semantics differ from the usual 1-on-success convention. */
+        ERR_clear_error();
+        bio = BIO_new_file(path, "r");
+        if (bio != NULL) {
+            p7 = PEM_read_bio_PKCS7(bio, NULL, NULL, NULL);
+            BIO_free(bio);
+        }
+    }
+    if (p7 == NULL) {
+        ERR_clear_error();
+        return 0;
+    }
+
+    STACK_OF(X509) *certs = NULL;
+    int type = OBJ_obj2nid(p7->type);
+    if (type == NID_pkcs7_signed && p7->d.sign != NULL)
+        certs = p7->d.sign->cert;
+    else if (type == NID_pkcs7_signedAndEnveloped &&
+             p7->d.signed_and_enveloped != NULL)
+        certs = p7->d.signed_and_enveloped->cert;
+
+    int added = 0;
+    int count = (certs != NULL) ? sk_X509_num(certs) : 0;
+    for (int i = 0; i < count; i++) {
+        X509 *c = sk_X509_value(certs, i);
+        if (c == NULL)
+            continue;
+        /* The stack belongs to p7; take our own ref before handing it on. */
+        if (X509_up_ref(c) != 1)
+            continue;
+        _bundle_add_cert(store, untrusted, c);
+        added++;
+    }
+    PKCS7_free(p7);
+    return added;
+}
+
+/* Never prompt for a passphrase while probing a file's kind. */
+static int _no_password_cb(char *buf, int size, int rwflag, void *u)
+{
+    (void)buf; (void)size; (void)rwflag; (void)u;
+    return 0;
+}
+
+/**
+ * @brief Whether the bundle path holds an identifiable non-certificate object.
+ *
+ * A CRL, CSR, or private key handed to ca_bundle_path is a configuration mix-up,
+ * worth EX509_CAKIND rather than the generic "failed to load" -- the same
+ * distinction Python draws in `_classify_bundle`. Best-effort: an encrypted key
+ * is not identified (we never prompt), and simply falls back to EX509_CALOAD.
+ */
+static bool _bundle_wrong_kind(const char *path)
+{
+    bool wrong = false;
+    BIO *bio;
+
+    if ((bio = BIO_new_file(path, "r")) != NULL) {
+        X509_CRL *crl = PEM_read_bio_X509_CRL(bio, NULL, NULL, NULL);
+        BIO_free(bio);
+        if (crl != NULL) { X509_CRL_free(crl); wrong = true; }
+    }
+    if (!wrong && (bio = BIO_new_file(path, "rb")) != NULL) {
+        X509_CRL *crl = d2i_X509_CRL_bio(bio, NULL);
+        BIO_free(bio);
+        if (crl != NULL) { X509_CRL_free(crl); wrong = true; }
+    }
+    if (!wrong && (bio = BIO_new_file(path, "r")) != NULL) {
+        X509_REQ *req = PEM_read_bio_X509_REQ(bio, NULL, NULL, NULL);
+        BIO_free(bio);
+        if (req != NULL) { X509_REQ_free(req); wrong = true; }
+    }
+    if (!wrong && (bio = BIO_new_file(path, "r")) != NULL) {
+        EVP_PKEY *key = PEM_read_bio_PrivateKey(bio, NULL, _no_password_cb, NULL);
+        BIO_free(bio);
+        if (key != NULL) { EVP_PKEY_free(key); wrong = true; }
+    }
+    ERR_clear_error();  /* probing failures are expected; don't leak them */
+    return wrong;
 }
 
 /* ---------- constructor ---------- */
@@ -681,10 +978,80 @@ int x509_verifier_create(const x509_verifier_config_t *cfg,
     if (!store)
         return EX509_CALOAD;
 
+    /* Bound the chain depth (max intermediate CAs) so a pathologically deep
+     * chain is rejected -- C parity with Python _MAX_CHAIN_DEPTH. */
+    X509_STORE_set_depth(store, AT_X509_MAX_CHAIN_DEPTH);
+
+    STACK_OF(X509) *untrusted = NULL;
     if (cfg->ca_bundle_path[0] != '\0') {
-        if (X509_STORE_load_locations(store, cfg->ca_bundle_path, NULL) != 1) {
-            X509_STORE_free(store);
-            return EX509_CALOAD;
+        /* Load the bundle cert-by-cert, classifying self-signed certs as trusted
+         * roots (into the store) and the rest as UNTRUSTED intermediates. If we
+         * instead trusted every bundled cert (X509_STORE_load_locations), OpenSSL
+         * would treat a bundled intermediate as a valid anchor and the chain
+         * would verify at depth 0, making set_depth a no-op. Falls back to the
+         * bulk load for a directory / non-PEM path (no intermediates to bound).*/
+        BIO *bio = BIO_new_file(cfg->ca_bundle_path, "r");
+        int loaded = 0;
+        if (bio != NULL) {
+            X509 *c = NULL;
+            while ((c = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL) {
+                loaded++;
+                _bundle_add_cert(store, &untrusted, c);
+            }
+            BIO_free(bio);
+            ERR_clear_error();  /* the loop always ends on a read failure */
+        }
+        if (loaded == 0) {
+            /* A single DER certificate: the bulk loader below is PEM-only, so
+             * without this a DER bundle failed (Python accepts one). */
+            BIO *dbio = BIO_new_file(cfg->ca_bundle_path, "rb");
+            if (dbio != NULL) {
+                X509 *dc = d2i_X509_bio(dbio, NULL);
+                BIO_free(dbio);
+                if (dc != NULL) {
+                    _bundle_add_cert(store, &untrusted, dc);
+                    loaded = 1;
+                } else {
+                    ERR_clear_error();
+                }
+            }
+        }
+        if (loaded == 0) {
+            /* PKCS#7 (.p7b) before the bulk loader, which does not understand it */
+            loaded = _bundle_load_pkcs7(store, &untrusted, cfg->ca_bundle_path);
+        }
+        if (loaded == 0) {
+            /* directory bundle: fall back to the bulk loader */
+            bool bulk_ok =
+                X509_STORE_load_locations(store, cfg->ca_bundle_path, NULL) == 1;
+            if (bulk_ok) {
+                /* load_locations reports success even when the file yielded no
+                 * *certificates*, leaving a trust store in which nothing can ever
+                 * verify -- the same silent-empty-store trap Python's
+                 * bundle_error closes. Count certs specifically: it loads a PEM
+                 * file's CRLs as well, so a CRL handed to this slot otherwise
+                 * looks like a successful load with zero anchors. */
+                STACK_OF(X509_OBJECT) *objs = X509_STORE_get0_objects(store);
+                int n_certs = 0;
+                for (int i = 0; objs != NULL && i < sk_X509_OBJECT_num(objs); i++) {
+                    X509_OBJECT *o = sk_X509_OBJECT_value(objs, i);
+                    if (o != NULL && X509_OBJECT_get_type(o) == X509_LU_X509)
+                        n_certs++;
+                }
+                if (n_certs == 0)
+                    bulk_ok = false;
+            }
+            if (!bulk_ok) {
+                /* Distinguish a wrong-kind file from an unreadable one, so a CRL
+                 * or key in this slot is diagnosable (Python parity: the reject
+                 * reason names it). */
+                int err = _bundle_wrong_kind(cfg->ca_bundle_path)
+                          ? EX509_CAKIND : EX509_CALOAD;
+                ERR_clear_error();
+                if (untrusted != NULL) sk_X509_pop_free(untrusted, X509_free);
+                X509_STORE_free(store);
+                return err;
+            }
         }
     } else {
         /* Use system default CA paths */
@@ -696,14 +1063,17 @@ int x509_verifier_create(const x509_verifier_config_t *cfg,
 
     x509_impl_t *impl = calloc(1, sizeof(x509_impl_t));
     if (!impl) {
+        if (untrusted != NULL) sk_X509_pop_free(untrusted, X509_free);
         X509_STORE_free(store);
         return EZTA_INTERNAL;
     }
     memcpy(&impl->cfg, cfg, sizeof(x509_verifier_config_t));
     impl->ca_store = store;
+    impl->untrusted = untrusted;
 
     zta_verifier_t *v = calloc(1, sizeof(zta_verifier_t));
     if (!v) {
+        if (untrusted != NULL) sk_X509_pop_free(untrusted, X509_free);
         X509_STORE_free(store);
         free(impl);
         return EZTA_INTERNAL;

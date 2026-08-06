@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -211,15 +211,19 @@ DEFINE_TEST(test_x509_crl_revocation)
 
     zta_result_t result;
     ck_assert_ret_ok(v->verify_credential(v, cert_data, cert_len, &result));
-    /* Note: CRL check happens at store level; may be VERIFIED or REJECTED
-     * depending on when CRL is loaded. The CRL revocation is exercised
-     * via check_revocation which adds the CRL to the store. */
+    /* drone_alpha is chain-valid and unexpired, so verify_credential (which
+     * walks chain + expiry only) VERIFIES it and caches the cert keyed on its
+     * credential_hash. */
+    ck_assert_int_eq(result.status, ZTA_VERIFIED);
 
-    /* check_revocation should load the CRL */
+    /* check_revocation now matches the cached cert's serial against the CRL
+     * (drone_alpha IS revoked in intermediate-revoked.crl.pem), mirroring
+     * Python X509Verifier.check_revocation. This is what lets the admission
+     * gate drop a revoked-but-chain-valid cert (see id_proc.c welcoming
+     * committee + conformance zta-x509-reject-revoked-credential). */
     zta_result_t revoke_result;
     ck_assert_ret_ok(v->check_revocation(v, result.credential_hash, &revoke_result));
-    /* CRL loaded means infrastructure is reachable */
-    ck_assert_int_eq(revoke_result.status, ZTA_VERIFIED);
+    ck_assert_int_eq(revoke_result.status, ZTA_REVOKED);
 
     /* is_available should be true when CRL is configured and loadable */
     ck_assert(v->is_available(v) == true);

@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2026 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -343,8 +343,8 @@ def _make_signer_identity(pid: str):
         b'at-conformance:neg:enc:' + pid.encode('utf-8'),
     ).hexdigest().encode('ascii')
     return Identity(
-        uuid, '10.0.90.1', f'{pid}.neg', pid,
+        uuid, '10.0.90.1', f'{pid}.neg',
         Signature(sig_seed, public_only=False),
         Encryptor(enc_seed, public_only=False),
-        'me', False, 0, AgreementImpl.POA.value,
+        pid, False, 0, AgreementImpl.POA.value,
     )

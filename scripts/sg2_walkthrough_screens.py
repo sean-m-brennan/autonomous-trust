@@ -1,3 +1,19 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+# ******************
+
 """Regenerate the SG2 walkthrough's _generated/sg2/ artefacts.
 
 Re-run from the repo root, with the ``autonomous_trust`` conda env active,
@@ -5,10 +21,10 @@ after `tools/naip_fetch.py` and `tools/detection_prep.py` have written
 their outputs (the conda env supplies ultralytics/Pillow/pyproj/numpy):
 
     conda activate autonomous_trust
-    PYTHONPATH=src/autonomous-trust:src/autonomous-trust-services:\
-src/autonomous-trust-inspector:src/autonomous-trust-evaluation:\
-src/autonomous-trust-simulator \
-        python -m scripts.sg2_walkthrough_screens
+    python3 scripts/sg2_walkthrough_screens.py
+
+The script bootstraps the autonomous_trust namespace-package src roots onto
+``sys.path`` itself (see below), so no ``PYTHONPATH=`` prefix is needed.
 
 Produces:
 * doc/architecture/_generated/sg2/catalogue_overlay.jpg
@@ -24,7 +40,22 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / "examples" / "dod_mission"))
+# Self-contained path bootstrap so the script runs with a bare
+# `python3 scripts/sg2_walkthrough_screens.py` (no PYTHONPATH= prefix). Adds
+# the dod_mission example dir plus the autonomous_trust namespace-package src
+# roots; harmless when autonomous_trust is already pip-installed in the env.
+_SRC = REPO_ROOT / "src"
+for _p in (
+    REPO_ROOT / "examples" / "dod_mission",
+    _SRC / "autonomous-trust",
+    _SRC / "autonomous-trust-services",
+    _SRC / "autonomous-trust-inspector",
+    _SRC / "autonomous-trust-evaluation",
+    _SRC / "autonomous-trust-simulator",
+):
+    _ps = str(_p)
+    if _p.is_dir() and _ps not in sys.path:
+        sys.path.insert(0, _ps)
 
 OUT_DIR = REPO_ROOT / "doc" / "architecture" / "_generated" / "sg2"
 ASSETS = REPO_ROOT / "examples" / "dod_mission" / "assets"
@@ -151,6 +182,28 @@ def _srcdoc(html: str) -> str:
     return html.replace("&", "&amp;").replace('"', "&quot;")
 
 
+def _maybe_write_png(fig, html_target: Path) -> None:
+    """Best-effort static PNG export beside the HTML (needs Kaleido).
+
+    The interactive HTML stays the source of truth; the PNG is for slide
+    decks / docs that can't embed a live Plotly figure. Silently degrades to
+    a one-line hint when Kaleido isn't installed, so the walkthrough still
+    regenerates without it."""
+    try:
+        import kaleido  # noqa: F401
+    except Exception:  # noqa: BLE001 — optional dependency
+        print(f"  (skipping PNG for {html_target.name}: "
+              f"pip install --upgrade kaleido to enable static export)")
+        return
+    png = html_target.with_suffix(".png")
+    try:
+        fig.write_image(str(png), width=900, height=700, scale=2)
+        print(f"wrote {png.relative_to(REPO_ROOT)} "
+              f"({png.stat().st_size:,} bytes)")
+    except Exception as e:  # noqa: BLE001
+        print(f"  (PNG export failed for {html_target.name}: {e})")
+
+
 def _agency_map_sightlines() -> None:
     from autonomous_trust.inspector.dashboard.disaster_response_map import (
         AgencyMap, MapPeer,
@@ -183,9 +236,22 @@ def _agency_map_sightlines() -> None:
     target = OUT_DIR / "agency_map_sightlines.html"
     fig.write_html(str(target), include_plotlyjs="cdn", full_html=True)
     print(f"wrote {target.relative_to(REPO_ROOT)} ({target.stat().st_size:,} bytes)")
+    _maybe_write_png(fig, target)
 
 
 def main() -> None:
+    import argparse
+
+    argparse.ArgumentParser(
+        description=(
+            "Regenerate the SG2 walkthrough's _generated/sg2/ artefacts "
+            "(catalogue_overlay.jpg, drawer_ab.html, agency_map_sightlines.html). "
+            "Run from the repo root with the 'autonomous_trust' conda env active, "
+            "after tools/naip_fetch.py and tools/detection_prep.py have produced "
+            "their outputs."
+        ),
+    ).parse_args()
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     if not PANORAMA.exists():
         raise SystemExit(f"missing {PANORAMA}; run tools/naip_fetch.py first")

@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 # ******************
 
 import concurrent.futures
+import errno
 import socket
 import threading
 import time
@@ -28,14 +29,14 @@ import nacl
 
 from ..protocol import Protocol
 from ..identity import Identity
-from ..identity.protocol import IdentityProtocol
+from ..identity.protocol import IdentityProtocol, UNENCRYPTED_VERBS
 from ..processes import Process, ProcMeta
 from .. import _probes
 from ..identity import Group
-from ..system import CfgIds, comm_port, net_cadence
+from ..system import CfgIds, PortSource, comm_port, net_cadence, resolve_comm_port
 from .network import Network
 from .message import Message
-from .ping import PingServer, ping
+from .ping_at import PingATServer, ping_at
 
 
 class NetworkProtocol(Enum):
@@ -97,12 +98,20 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     def __init__(self, configurations, subsystems, log_q, acceptance_func=None, **kwargs):
         super().__init__(configurations, subsystems, log_q, **kwargs)
         self.net_cfg = configurations[CfgIds.network]
-        port = self.net_cfg.port
-        self.port = port
-        if port is None:
+        # One resolution, same order as C's net_port_resolve: a usable config
+        # port wins, else AT_COMM_PORT, else the compile-time default. Going
+        # through the resolver (rather than `port or default_port`) is what
+        # range-checks a bad configured value and logs which layer supplied the
+        # result, so an operator can tell an ignored override from an applied one.
+        self.port, self.port_source = resolve_comm_port(self.net_cfg.port or 0, self.logger)
+        if self.port_source == PortSource.default:
+            # The metaclass default is the same defaults layer; keep honoring an
+            # explicit subclass override of `port=` in that case only.
             self.port = self.default_port  # noqa
+        self.logger.info('network base port %d from %s (group %d)'
+                         % (self.port, self.port_source, self.port + 1))
         self.diplomat = True
-        self.ping = None
+        self.ping_at_server = None
         self.myself = configurations[CfgIds.identity]
         self.peer_messages = deque()
         self.encrypted_messages = deque()
@@ -111,6 +120,12 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self.acceptance = acceptance_func
         self.pests = {}
         self.protocol = Protocol(self.name, self.logger, configurations)
+        # Reputation cut-off enforcement: ReputationProcess feeds
+        # exclude/readmit control messages here as peers cross the
+        # communication cut-off. See handle_exclude / handle_readmit and
+        # the inbound-drop / outbound-forward gates below.
+        self.protocol.register_handler(Network.exclude, self.handle_exclude)
+        self.protocol.register_handler(Network.readmit, self.handle_readmit)
         self.stop = False
         self.statistics = {}
         self._rejected_addresses: set[str] = set()
@@ -123,8 +138,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self._partition_signal_lru: dict[str, datetime] = {}
         # Lazily created in process(). ThreadPoolExecutor can't be
         # pickled, so creating it here would break the multiprocessing
-        # spawn handoff. See `_ensure_ping_pool`.
-        self._ping_pool: concurrent.futures.ThreadPoolExecutor | None = None
+        # spawn handoff. See `_ensure_ping_at_pool`.
+        self._ping_at_pool: concurrent.futures.ThreadPoolExecutor | None = None
 
     @property
     def my_ip(self):
@@ -164,7 +179,13 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         grp = self.group
         if grp is not None and from_addr in grp.addresses:
             return grp
-        for child in self.child_groups.values():
+        # Snapshot the child-group values before iterating: child_groups
+        # (self.protocol.child_groups) is mutated by the message-handling
+        # thread as groups form/merge while this runs on the receive path, so
+        # iterating it live raised "dictionary changed size during iteration"
+        # (same class of bug as net_stats above). We only read each child's
+        # addresses, so a values snapshot is sufficient.
+        for child in list(self.child_groups.values()):
             try:
                 if from_addr in child.addresses:
                     return child
@@ -198,11 +219,26 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     @property
     def net_stats(self):
         cumulative = {}
-        for uuid in self.statistics:
-            elapsed = self.statistics[uuid].times[-1] - self.statistics[uuid].times[0]
-            up, down = sum(self.statistics[uuid].send) / elapsed, sum(self.statistics[uuid].recv) / elapsed
-            cumulative[uuid] = (up, down, self.statistics[uuid].send_total, self.statistics[uuid].recv_total,
-                                self.statistics[uuid].err_out, self.statistics[uuid].err_in)
+        # Snapshot the keys: track_send/recv_* run in the sender/receiver
+        # threads and add new peers to self.statistics, so iterating it live
+        # raised "dictionary changed size during iteration". Keys are only ever
+        # added (never deleted), so a key snapshot is sufficient. Likewise
+        # snapshot each NetStat's deques before summing -- a deque mutated by a
+        # concurrent send/rcvd mid-iteration raises in the same way.
+        for uuid in list(self.statistics):
+            stat = self.statistics.get(uuid)
+            if stat is None:
+                continue
+            times = list(stat.times)
+            if len(times) < 2:
+                continue  # need two samples to span an interval
+            elapsed = (times[-1] - times[0]).total_seconds()
+            if elapsed <= 0:
+                continue  # same-instant samples -> no meaningful rate
+            up = sum(list(stat.send)) / elapsed
+            down = sum(list(stat.recv)) / elapsed
+            cumulative[uuid] = (up, down, stat.send_total, stat.recv_total,
+                                stat.err_out, stat.err_in)
         return cumulative
 
     def send_peer(self, msg, whom):
@@ -223,12 +259,55 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     def recv_any(self):
         raise NotImplementedError
 
+    # --- Transport lifecycle hooks -------------------------------------
+    # No-ops here; a transport that keeps long-lived connections (the TCP
+    # pool) overrides them. They run in the worker subprocess from
+    # process(), which matters because threading primitives can't survive
+    # the multiprocessing spawn pickle (see _ensure_ping_at_pool).
+
+    def _init_transport(self):
+        """Per-worker transport setup that can't be pickled across the
+        spawn handoff (e.g. locks). Called once before receiver threads
+        start."""
+        pass
+
+    def start_receivers(self, queues):
+        """Start the point-to-point and group receive threads. The default
+        is one accept-read-one thread per channel; a transport with
+        persistent readers overrides this."""
+        threading.Thread(target=self.peer_receiver, daemon=True).start()
+        threading.Thread(target=self.group_receiver, daemon=True).start()
+
+    def reap_idle_conns(self):
+        """Close connections idle past their TTL. Called each main-loop
+        iteration; rate-limits itself internally."""
+        pass
+
+    def close_connections(self):
+        """Close any live transport connections at shutdown."""
+        pass
+
+    def close_listeners(self):
+        """Close the bound receive sockets (peer, group, broadcast/multicast)
+        so their ports are released deterministically at shutdown rather than
+        whenever the process object is garbage-collected. Safe to call more
+        than once; a missing or already-closed socket is ignored."""
+        for name in ('recv_ptp_sock', 'recv_grp_sock', 'recv_cast_sock'):
+            sock = getattr(self, name, None)
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
     def accept_peer_message(self, address):
         """
         Accept/reject messages based on sender's address
         :param address: Incoming sender
         :return: bool
         """
+        if self.reject_message(address):
+            return False
         if self.acceptance is not None:
             return self.acceptance(address)
         if self.peers.find_by_address(address) is None:
@@ -245,13 +324,47 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             return False
         return self.accept_peer_message(address)
 
+    @staticmethod
+    def _norm_addr(address):
+        """Canonicalize an address to the form used as the peer-listing
+        key (strip any '/suffix'), matching Peers.find_by_address so an
+        exclusion keyed on a peer's stored address matches the raw
+        from_addr seen at recv."""
+        if address is None:
+            return None
+        address = str(address)
+        if '/' in address:
+            address = address.split('/')[0]
+        return address
+
     def reject_message(self, address):
-        """Check if an address has been blacklisted."""
-        return address in self._rejected_addresses
+        """Check if an address is excluded (reputation cut-off) or
+        otherwise blacklisted."""
+        return self._norm_addr(address) in self._rejected_addresses
 
     def blacklist_address(self, address):
         """Add an address to the rejection list."""
-        self._rejected_addresses.add(address)
+        self._rejected_addresses.add(self._norm_addr(address))
+
+    def handle_exclude(self, queues, message):
+        """Exclude a peer's address (reputation cut-off): its inbound
+        frames are dropped and it is filtered out of outbound targets.
+        Fed by ReputationProcess._publish_exclusion. Local IPC only."""
+        addr = self._norm_addr(getattr(message, 'obj', None))
+        if addr:
+            self._rejected_addresses.add(addr)
+            _probes.counter('net.exclude', 'add')
+            self.logger.info('Reputation cut-off: excluding %s' % addr)
+        return True
+
+    def handle_readmit(self, queues, message):
+        """Reverse an exclusion (explicit rehabilitation). Local IPC."""
+        addr = self._norm_addr(getattr(message, 'obj', None))
+        if addr:
+            self._rejected_addresses.discard(addr)
+            _probes.counter('net.exclude', 'remove')
+            self.logger.info('Reputation readmit: %s' % addr)
+        return True
 
     _PARTITION_SIGNAL_COOLDOWN = 5.0  # seconds, per from_addr
 
@@ -291,27 +404,34 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         except Full:
             _probes.counter('net.group', 'partition_signal_drop', 'queue_full')
 
-    def _ensure_ping_pool(self):
+    def _ensure_ping_at_pool(self):
         """Lazily instantiate the ping thread pool inside the subprocess.
         Created on demand so it doesn't try to ride through a pickle
-        handoff. Outbound pings dispatch here so the synchronous ping()
+        handoff. Outbound pings dispatch here so the synchronous ping_at()
         function (which sleeps 1 s per packet × count) doesn't block the
         main process loop.
         """
-        if self._ping_pool is None:
-            self._ping_pool = concurrent.futures.ThreadPoolExecutor(
+        if self._ping_at_pool is None:
+            self._ping_at_pool = concurrent.futures.ThreadPoolExecutor(
                 max_workers=16, thread_name_prefix='netproc-ping')
-        return self._ping_pool
+        return self._ping_at_pool
 
-    def _do_ping_async(self, address, count, return_queue):
-        """Run ping() in a worker thread and post stats back to the
+    def _do_ping_at_async(self, address, count, return_queue, peer=None):
+        """Run ping_at() in a worker thread and post stats back to the
         original requester's return queue. Errors are logged but not
         raised — a failed ping is just a missed RTT sample, not a
         process-fatal event.
+
+        The reply carries the pinged peer as `from_whom` so the requester can
+        attribute the sample. Without it the reply named nobody: PingATStats
+        only knows the address it dialed, and every consumer keys peers by
+        Identity UUID, so a sample either landed on a node named for an IP or
+        on no node at all.
         """
         try:
-            stats = ping(address, count=count)  # noqa
-            msg = Message(self.name, Network.ping, stats)  # noqa
+            stats = ping_at(address, count=count)  # noqa
+            msg = Message(self.name, Network.ping_at, stats,  # noqa
+                          from_whom=peer)
             return_queue.put(msg, block=True, timeout=self.q_cadence)
         except TransmissionError as err:
             self.logger.error('Ping (async): %s' % err)
@@ -354,6 +474,15 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 time.sleep(self.socket_timeout)
                 continue
             except Exception as err:
+                if isinstance(err, OSError) and err.errno == errno.EBADF and self.stop:
+                    # Teardown race, not a fault: shutdown sets self.stop and
+                    # only then calls close_listeners(), so a thread already
+                    # past its stop check and inside recv_* takes EBADF exactly
+                    # once before the loop exits. Logging it at error made every
+                    # clean shutdown look like a failure.
+                    _probes.counter(layer, 'recv_error', 'closed_at_stop')
+                    self.logger.debug('Network: listener closed at shutdown')
+                    continue
                 # Belt-and-suspenders: a single malformed frame should
                 # not kill the listener thread for the rest of the run.
                 # (Used to lose every subsequent inbound after the first
@@ -415,6 +544,11 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 time.sleep(self.socket_timeout)
                 continue
             except Exception as err:
+                if isinstance(err, OSError) and err.errno == errno.EBADF and self.stop:
+                    # Same teardown race as _encr_recv; see the note there.
+                    _probes.counter('net.recv.any', 'recv_error', 'closed_at_stop')
+                    self.logger.debug('Network: listener closed at shutdown')
+                    continue
                 # Mirror _encr_recv: never let a malformed inbound kill
                 # the listener thread for the rest of the run.
                 _probes.counter('net.recv.any', 'recv_error', err.__class__.__name__)
@@ -460,6 +594,43 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                         remaining.append((raw_msg, from_addr))
             self.encrypted_messages.extend(remaining)
             time.sleep(self.cadence + self.q_cadence)  # curiously, does not sleep if exactly cadence
+
+    def _accept_unencrypted(self, raw_msg, from_whom, queues):
+        """Deliver a plaintext frame from a KNOWN peer, but only an allowlisted
+        verb that declares itself unencrypted.
+
+        Three conditions, all required: the bytes parse as an envelope, the
+        envelope's own `encrypt` flag is false, and the verb is in
+        UNENCRYPTED_VERBS. A frame that merely fails to decrypt is NOT accepted
+        -- corrupt ciphertext, a stale group key, or a forged frame all land in
+        the caller's drop path as before.
+
+        Returns True only if the frame was handed on. Parsing happens twice (here
+        to inspect, then inside _msg_to_queue to deliver); this is an error-path
+        branch, and the alternative is duplicating the dispatch logic.
+        """
+        try:
+            probe = Message.parse(raw_msg, from_whom, validate=False)
+        except Exception:
+            # Not a parseable envelope -- almost certainly real ciphertext.
+            _probes.counter('net.ptp', 'unencrypted_refused', 'unparseable')
+            return False
+        if getattr(probe, 'encrypt', True):
+            # Claims to be encrypted but would not decrypt. Genuinely broken or
+            # hostile; do not accept the plaintext reading of it.
+            _probes.counter('net.ptp', 'unencrypted_refused', 'claims_encrypted')
+            return False
+        verb = getattr(probe, 'function', None)
+        if verb not in UNENCRYPTED_VERBS:
+            _probes.counter('net.ptp', 'unencrypted_refused', str(verb))
+            self.logger.warning(
+                'Refusing plaintext %s from known peer %s: not an unencrypted '
+                'verb' % (verb, getattr(from_whom, 'nickname', from_whom)))
+            return False
+        self._msg_to_queue(raw_msg, from_whom, queues, 'point-to-point',
+                           validate=False)
+        _probes.counter('net.ptp', 'unencrypted_accepted', str(verb))
+        return True
 
     def _msg_to_queue(self, msg, from_whom, queues, rcvd_by, validate=True):
         try:
@@ -522,19 +693,20 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 _sock.settimeout(self.socket_timeout)
             except (OSError, AttributeError):
                 pass
-        threading.Thread(target=self.peer_receiver, daemon=True).start()
-        threading.Thread(target=self.group_receiver, daemon=True).start()
+        self._init_transport()
+        self.start_receivers(queues)
         threading.Thread(target=self.unknown_receiver, daemon=True).start()
         threading.Thread(target=self.mystery_handler, args=(queues,), daemon=True).start()
         while self.keep_running(signal):
             try:
+                self.reap_idle_conns()
                 if self.diplomat:
-                    if self.ping is None:
-                        self.ping = PingServer(self.net_cfg.ip4, self.logger)
-                        self.ping.start()
-                elif self.ping is not None:
-                    self.ping.stop()
-                    self.ping = None
+                    if self.ping_at_server is None:
+                        self.ping_at_server = PingATServer(self.net_cfg.ip4, self.logger)
+                        self.ping_at_server.start()
+                elif self.ping_at_server is not None:
+                    self.ping_at_server.stop()
+                    self.ping_at_server = None
                 try:
                     message = queues[self.name].get(block=True, timeout=self.q_cadence)  # noqa
                     _probes.counter('net.dequeue', 'got')
@@ -570,7 +742,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                             if message.function == Network.stats_req:
                                 msg = Message(CfgIds.network, Network.stats_resp, self.net_stats)
                                 queues[message.process].put(msg, block=True, timeout=self.q_cadence)
-                            elif message.function == Network.ping:
+                            elif message.function == Network.ping_at:
                                 # Message.__init__ wraps a single Identity
                                 # to_whom in a list; pull the head out
                                 # before dereferencing .address.
@@ -586,15 +758,15 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                         '(expected a queue key); skipping' %
                                         message.return_to)
                                 else:
-                                    # Dispatch to a worker thread; ping()
+                                    # Dispatch to a worker thread; ping_at()
                                     # is synchronous and sleeps 1 s per
                                     # packet (count=5 → ≥5 s). Running it
                                     # inline blocks the netproc main loop
                                     # and starves all other outbound.
-                                    self._ensure_ping_pool().submit(
-                                        self._do_ping_async,
+                                    self._ensure_ping_at_pool().submit(
+                                        self._do_ping_at_async,
                                         target.address, message.obj,
-                                        queues[message.return_to])
+                                        queues[message.return_to], target)
                             elif message.to_whom == Network.broadcast:
                                 msg = bytes(message)
                                 try:
@@ -625,6 +797,12 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                 for addr in message.to_whom.addresses:
                                     if addr == self.myself.address:
                                         continue
+                                    # Reputation cut-off: do not forward
+                                    # to/for an excluded member (a gateway
+                                    # thus stops relaying toward it).
+                                    if self.reject_message(addr):
+                                        _probes.counter('net.group', 'skip', 'excluded_target')
+                                        continue
                                     try:
                                         self.send_group(msg, addr)
                                         self.track_send_stats(self.unknown_peer, len(msg))
@@ -636,6 +814,11 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                     address = who.address
                                     if '/' in address:
                                         address = address.split('/')[0]
+                                    # Reputation cut-off: skip an excluded
+                                    # recipient.
+                                    if self.reject_message(address):
+                                        _probes.counter('net.ptp', 'skip', 'excluded_target')
+                                        continue
                                     if message.encrypt:
                                         msg = self.myself.encrypt(bytes(message), who)
                                     else:
@@ -672,16 +855,36 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     except IndexError:
                         break
                     drained_ptp += 1
-                    peers = self.configs[CfgIds.peers]
+                    # Reputation cut-off: an excluded sender is ignored --
+                    # drop its frame before any decrypt/delivery.
+                    if self.reject_message(from_addr):
+                        _probes.counter('net.ptp', 'drop', 'excluded')
+                        continue
+                    # Use the LIVE roster (self.peers), not the original bootstrap
+                    # Peers object in self.configs[CfgIds.peers] (only the welcomer's
+                    # address). Every other attribution site uses self.peers; using
+                    # the stale config here missed ~100% of inbound ptp msgs, which
+                    # then churned through mystery_handler + retries (CPU + drops).
+                    peers = self.peers
                     from_whom = peers.find_by_address(from_addr)
                     if from_whom is not None:
                         try:
                             decrypt_msg = self.myself.decrypt(raw_msg, from_whom)
                             self._msg_to_queue(decrypt_msg, from_whom, queues, 'point-to-point')
                         except Exception:
-                            _probes.counter('net.ptp', 'drop', 'decrypt_failed_known_peer')
-                            self.logger.error('Decryption failed for known peer %s, rejecting message' %
-                                              from_whom.nickname)
+                            # Decrypt failed. Some protocol verbs are sent in
+                            # PLAINTEXT by design (encrypt=False), and once a
+                            # peer is in the listing this is the branch its
+                            # frames take -- so those verbs were dropped here,
+                            # which is what cost 3-peer convergence. Accept a
+                            # plaintext parse only for an allowlisted verb; a
+                            # known peer must not be able to downgrade anything
+                            # else. See identity.protocol.UNENCRYPTED_VERBS.
+                            if not self._accept_unencrypted(raw_msg, from_whom,
+                                                            queues):
+                                _probes.counter('net.ptp', 'drop', 'decrypt_failed_known_peer')
+                                self.logger.error('Decryption failed for known peer %s, rejecting message' %
+                                                  from_whom.nickname)
                     else:
                         # Unknown sender — bootstrap (empty peers) or a
                         # late joiner welcoming us. Try unencrypted parse;
@@ -689,6 +892,29 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                         # are encrypt=False. If bytes don't decode, it's
                         # an encrypted message from a peer we don't know
                         # yet — defer to mystery_handler.
+                        #
+                        # CHURN DIAGNOSTIC: attribution misses on ~every
+                        # inbound (deferred_encrypted == accepted). Is it a
+                        # format mismatch (from_addr shape != listing keys)
+                        # or a timing race (address registered a beat later)?
+                        # Categorize cheaply always, and capture a bounded
+                        # sample of from_addr vs listing keys to compare shapes.
+                        # See ISSUES.md (connection churn / attribution miss).
+                        _listing = getattr(self.peers, 'listing', None) or {}
+                        _probes.counter('net.ptp', 'attrib_miss',
+                                        'listing_empty' if not _listing
+                                        else 'addr_not_in_listing')
+                        _dn = getattr(self, '_attrib_miss_diag_n', 0)
+                        if _dn < 25:
+                            self._attrib_miss_diag_n = _dn + 1
+                            try:
+                                _keys = sorted(str(k) for k in _listing)[:8]
+                            except Exception:
+                                _keys = ['<unavailable>']
+                            _probes.emit('net.ptp', 'attrib_miss_sample',
+                                         from_addr=repr(from_addr),
+                                         listing_size=len(_listing),
+                                         listing_keys=_keys)
                         try:
                             self._msg_to_queue(raw_msg, from_addr, queues, 'point-to-point', validate=False)
                             _probes.counter('net.ptp', 'unknown_sender', 'parsed_unencrypted')
@@ -708,6 +934,12 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     except IndexError:
                         break
                     drained_grp += 1
+                    # Reputation cut-off: drop an excluded sender's group
+                    # frame before decrypt/delivery (a gateway thus does
+                    # not relay it onward either).
+                    if self.reject_message(from_addr):
+                        _probes.counter('net.group', 'drop', 'excluded')
+                        continue
                     # Resolve which group this sender belongs to. For a
                     # leaf node this is always the primary group (or
                     # None), so the path is identical to before. A
@@ -756,6 +988,11 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     except IndexError:
                         break
                     drained_unk += 1
+                    # Reputation cut-off: ignore an excluded peer even on
+                    # the stranger/multicast channel.
+                    if self.reject_message(from_addr):
+                        _probes.counter('net.multicast', 'drop', 'excluded')
+                        continue
                     self._msg_to_queue(raw_msg, from_addr, queues, 'multicast', validate=False)
                 total_inbound += drained_unk
 
@@ -765,3 +1002,5 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 self.logger.error(traceback.format_exc())
 
         self.stop = True
+        self.close_connections()
+        self.close_listeners()

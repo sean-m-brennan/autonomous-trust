@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -12,28 +12,36 @@
 
 Wires a Dash app to a PlaybackEngine driving DisasterResponseScenario.
 
-Stage 1: topbar clock / phase / status.
-Stage 2a: playback controls (play/pause, speed, phase jumps, progress,
-          reset, spacebar shortcut), event log, narration overlay.
-Stage 2b: agency map, trust timeline, peer detail drawer.
-Stage 2c: trust network graph, data streams panel, sensor comparison
-          chart embedded in the peer-detail drawer.
-Stage 3 (live bridge): peer_seen, reputation, rep_pair, and reading
-          observations from real AT peers are drained from
-          `bridge_queue` each tick into the scenario event log,
-          trust matrix, reputation samples, and streams panel.
+Layout: topbar clock / phase / status; playback controls (play/pause,
+speed, phase jumps, progress, reset, spacebar); event log; narration
+overlay; agency map; trust timeline; trust network graph; data streams
+panel; and a peer-detail drawer with an embedded sensor-comparison chart.
+
+REAL DATA ONLY. These demos are instruments for debugging the AT
+algorithms, so the dashboard never synthesizes interactions. Every
+reputation value, trust-graph edge, sensor reading, and node status is
+sourced from live InspectorBridge observations of the real mesh
+(peer_seen / reputation / rep_pair / reading events drained from
+`bridge_queue` each tick). The scenario supplies only the phase/time
+axis and the ground-truth compromise INJECTION (a peer that really
+falsifies data). A peer the mesh has produced no reputation for renders
+as "forming" (faint, unconnected) — the honest empty state — so a
+cold-start that fails to join, reputation that won't propagate or
+stabilize, or a detection that never fires is visible, not painted over.
+Warm-start is legitimate only as state a node loads from its config at
+boot; everything after boot is the mesh's real behavior.
 
 Two modes:
-    live        real wall clock; scripted scenario.advance_to events
-                augmented by live bridge observations.
-    playback    recorded JSON event log buffered + replayed over time
-                via PlaybackEngine.load_recorded.
+    live        real wall clock; scenario phases advance on schedule,
+                all peer state comes from live bridge observations.
+    playback    a recorded JSON event log (a captured REAL run) buffered
+                + replayed over time via PlaybackEngine.load_recorded.
 """
 
 from __future__ import annotations
 
 import logging
-import math
+import os
 from datetime import timedelta
 from typing import Optional
 
@@ -44,7 +52,6 @@ from autonomous_trust.evaluation.scenarios.disaster_response_narration import (
 from autonomous_trust.evaluation.scenarios.playback_engine import ALLOWED_SPEEDS
 from autonomous_trust.evaluation.scenarios.playback_iface import PlaybackInterface
 from autonomous_trust.evaluation.scenarios.recording import KeyStatTracker
-from autonomous_trust.evaluation.scenarios.scenario import PeerState
 
 from dash import callback_context as ctx
 from dash_extensions import Keyboard
@@ -83,7 +90,19 @@ from collections import deque
 
 
 _TICK_INTERVAL_ID = "demo-tick"
-_TICK_MS = 500
+# Main dashboard cadence. 1 Hz (was 500ms / 2 Hz) — matches the DoD live
+# dashboard (live_server.py) and halves per-second callback + figure work.
+# Override with AT_DASH_TICK_MS.
+_TICK_MS = int(os.environ.get("AT_DASH_TICK_MS", "1000"))
+
+# The Tactical Map is the heaviest figure (per-peer geo traces rebuilt from
+# scratch each render). Refresh it on its OWN Interval + callback, decoupled
+# from the main data tick, so it isn't rebuilt in lockstep with the 14 other
+# outputs and can be independently throttled. Defaults to the main tick;
+# override with AT_DASH_MAP_TICK_MS (e.g. 2000 to halve map churn). Mirrors
+# live_server.py's _MAP_TICK_MS.
+_MAP_TICK_INTERVAL_ID = "demo-map-tick"
+_MAP_TICK_MS = int(os.environ.get("AT_DASH_MAP_TICK_MS", str(_TICK_MS)))
 
 # Playback-control element IDs (local to this module).
 _PB_PLAYPAUSE = "demo-pb-playpause"
@@ -99,12 +118,22 @@ _MAP_GRAPH = "demo-map-graph"
 _TIMELINE_GRAPH = "demo-timeline-graph"
 _DETAIL_IFRAME = "demo-detail-iframe"
 _SELECTED_PEER = "demo-selected-peer"   # dcc.Store payload key = "name"
-_TICK_SAMPLE_SEC = 2.0  # how often the timeline samples reputation
 
-# Stage-2c element IDs.
+# Display thresholds for deriving node status from REAL mesh reputation
+# (no scripted peer_states). 0.5 mirrors AT's REPUTATION_PERSIST_THRESHOLD /
+# tier-1 floor (repprocess.py): a peer whose earned reputation is at/below it
+# has no surviving trust standing, so the dashboard shows it excluded. Kept as
+# a local constant rather than importing the _python internal because the AT
+# backend may be native.
+_EXCLUSION_THRESHOLD = 0.5
+# Opacity for a "forming" peer — one the mesh has produced NO consensus
+# reputation for yet. Rendered faint (present but not integrated) instead of
+# hidden or fabricated, so a peer that never earns trust stays visibly absent.
+_FORMING_OPACITY = 0.35
+
+# Trust-graph / streams element IDs.
 _GRAPH_GRAPH = "demo-trust-graph"
 _STREAMS_PANEL = "demo-streams-panel"
-_STREAMS_TICK_SEC = 1.0  # synthesize one reading per stream at 1 Hz
 
 # 3h sensor-comparison chart, embedded inside panel_detail. The chart
 # lives in a sibling html.Details (Sensor Readings) below the iframe so
@@ -114,7 +143,8 @@ _SENSOR_GRAPH = "demo-sensor-graph"
 _SENSOR_DETAILS = "demo-sensor-details"
 _SENSOR_HISTORY_MAX = 240  # ~4 minutes at 1 Hz; covers the 120s display window
 # kind -> (primary stream data_type, unit) for the comparison chart.
-# Keys match disaster_response peer roles; data types match _STREAM_SPECS.
+# Keys match disaster_response peer roles; data types match the real
+# Reading.data_type values the bridge delivers.
 _KIND_PRIMARY_DTYPE: dict[str, tuple[str, str]] = {
     "weather-sensor":      ("temperature", "C"),
     "seismic-monitor":     ("magnitude",   "Mw"),
@@ -157,19 +187,27 @@ class MultiAgencyDemo:
 
         # Per-peer reputation history, appended each tick; drives the
         # trust-timeline panel. Live bridge events update _rep_samples
-        # via _on_bridge_event; peers that have received at least one
-        # live observation are tracked in _live_rep_peers so
-        # _sample_reputation skips them and falls back to peer_state
-        # synthesis only for peers we haven't yet observed.
+        # via _on_bridge_event; a peer appears here only once the bridge
+        # observes a real consensus reputation for it. Peers absent from
+        # _live_rep_peers are "forming" — no synthetic fallback fills them.
         self._rep_samples: dict[str, list[ReputationSample]] = {}
-        self._last_sample_t: float = -_TICK_SAMPLE_SEC
         self._live_rep_peers: set[str] = set()
+        # Authoritative per-peer (excluded, forming) status from the
+        # log-harvest lens ("rep_status" bridge tuple). Derived from real
+        # _excluded membership + committed-tx counts, not a score
+        # threshold — so a cold-start peer at the 0.2 baseline shows as
+        # forming, not excluded. Empty in coordinator-hosted-live /
+        # playback modes, where _real_peer_status falls back to the score.
+        self._live_status: dict[str, tuple[bool, bool]] = {}
         # Bilateral observation matrix. Keys are canonical (a, b)
         # tuples (sorted) so a's view of b and b's view of a collapse
         # into one undirected edge weight. Value is the latest
         # pair-blended trust (currently min — skepticism wins).
         self._live_trust_matrix: dict[tuple[str, str], float] = {}
         self._live_trust_seen_dir: dict[tuple[str, str], float] = {}
+        # Determination instrumentation (AT_REP_TRACE): throttle counter for
+        # the per-subject observer-distribution dump in _trace_consensus_dist.
+        self._rep_trace_tick = 0
 
         self._peer_detail_panel = PeerDetailPanel()
         # Last peer rendered into the detail iframe. The iframe
@@ -180,23 +218,30 @@ class MultiAgencyDemo:
         # peer name and from None, so the very first tick always
         # renders the empty placeholder.
         self._peer_detail_last_peer: object = "<unset>"
+        # Figure dirty-check signatures. Each Plotly figure is rebuilt only
+        # when its underlying data actually changed since the last render;
+        # otherwise the callback returns no_update and Dash skips the redraw.
+        # Sentinel object() differs from any real signature so the first
+        # render of each always fires. Reset by _on_reset.
+        self._last_map_sig: object = object()
+        self._last_timeline_sig: object = object()
+        self._last_graph_sig: object = object()
         self._event_log_panel = EventLogPanel(capacity=200)
         self._streams_panel = DataStreamsPanel(
             peer_colors=_agency_palette(iface.scenario))
 
-        # Per-(data_type, peer) ring of recent Reading samples,
-        # populated from both synth (_update_streams) and live (bridge).
-        # Drives the SensorComparisonChart embedded in the peer-detail
-        # drawer when a sensor peer is selected.
+        # Per-(data_type, peer) ring of recent Reading samples, populated
+        # only from live bridge `reading` events. Drives the
+        # SensorComparisonChart embedded in the peer-detail drawer when a
+        # sensor peer is selected.
         self._sensor_history: dict[str, dict[str, deque]] = {}
-        self._last_streams_t: float = -_STREAMS_TICK_SEC
         # Track which peers have been marked inactive in the streams
         # panel so we only mark once (mark_inactive is idempotent, but
         # avoiding the scan each tick is cheap).
         self._streams_inactive: set[str] = set()
         # Peers whose readings have arrived from real EnvData* services
-        # via the bridge. _update_streams falls back to synthesis only
-        # for peers we haven't yet observed.
+        # via the bridge. A peer absent here has produced no readings the
+        # inspector has seen — it simply has no stream (nothing synthesized).
         self._live_stream_peers: set[str] = set()
 
         # Identity facts captured from the bridge's first peer_seen
@@ -331,6 +376,11 @@ class MultiAgencyDemo:
         return html.Div(children=[
             dcc.Interval(id=_TICK_INTERVAL_ID,
                          interval=_TICK_MS, n_intervals=0),
+            # Tactical Map refresh runs on its own Interval (see _MAP_TICK_MS
+            # and _refresh_map) so the heaviest figure isn't rebuilt inside
+            # the main data tick.
+            dcc.Interval(id=_MAP_TICK_INTERVAL_ID,
+                         interval=_MAP_TICK_MS, n_intervals=0),
             dcc.Store(id=_SELECTED_PEER, data={"name": None}),
             # Document-level keyboard listener for the spacebar
             # play/pause shortcut. captureKeys filters at the JS layer
@@ -420,7 +470,6 @@ class MultiAgencyDemo:
             Output(_PB_PLAYPAUSE, "children"),
             Output(_PB_TIME_LABEL, "children"),
             Output(_PB_PROGRESS_FILL, "style"),
-            Output(_MAP_GRAPH, "figure"),
             Output(_TIMELINE_GRAPH, "figure"),
             Output(_DETAIL_IFRAME, "srcDoc"),
             Output(_GRAPH_GRAPH, "figure"),
@@ -433,7 +482,14 @@ class MultiAgencyDemo:
         def _on_tick(_n, selected):
             iface.tick()
             tel = iface.telemetry()
-            states = scenario.peer_states
+
+            # Determination instrumentation (AT_REP_TRACE): every ~15 ticks,
+            # dump the per-subject observer distribution feeding the Trust
+            # Dynamics line. Settles WHY honest peers trend down — see
+            # _trace_consensus_dist. No-op unless AT_REP_TRACE is set.
+            demo._rep_trace_tick += 1
+            if demo._rep_trace_tick % 15 == 0:
+                demo._trace_consensus_dist(tel.scenario_time)
 
             clock = format_clock(tel.scenario_time)
             phase_str = format_phase(tel.current_phase_idx,
@@ -454,30 +510,27 @@ class MultiAgencyDemo:
                                100.0 * tel.scenario_time / duration))
             progress_style = {"width": f"{pct:.1f}%"}
 
-            # Stage-2b panels.
-            compromised = {n for n, s in states.items()
-                           if s in (PeerState.COMPROMISED,
-                                    PeerState.DETECTED)}
-            excluded = {n for n, s in states.items()
-                        if s == PeerState.EXCLUDED}
-            # Late joiners (join_phase>0) default to opacity 0 in the
-            # builders; we flip them to visible once they've transitioned
-            # out of PENDING.
-            peer_opacity = {n: 1.0 for n, s in states.items()
-                            if s != PeerState.PENDING}
-            map_fig = build_map_from_scenario(
-                scenario,
-                compromised=compromised,
-                excluded=excluded,
-                peer_opacity=peer_opacity,
-            )
-            # uirevision preserves pan/zoom across frames; the figure's
-            # own autosize=True handles container fit via dcc.Graph.
-            map_fig.update_layout(uirevision="demo-map")
+            # Node status derived from REAL mesh reputation, not scripted
+            # peer_states (see _real_peer_status): compromised = ground-truth
+            # injection marker; excluded = earned reputation actually collapsed;
+            # forming (faint) = mesh has produced no reputation for the peer yet.
+            # (The Tactical Map consumes the same status on its own Interval —
+            # see _refresh_map.)
+            compromised, excluded, peer_opacity = demo._real_peer_status()
 
-            demo._sample_reputation(tel.scenario_time)
-            timeline_fig = demo._build_timeline_figure()
-            timeline_fig.update_layout(uirevision="demo-timeline")
+            # Trust timeline — rebuild only when a new reputation sample has
+            # landed. _rep_samples lists are append-only, so a change in the
+            # per-peer sample counts is a sufficient dirty signal (phase
+            # markers are static). Unchanged → skip the redraw.
+            timeline_sig = tuple(sorted(
+                (name, len(samples))
+                for name, samples in demo._rep_samples.items()))
+            if timeline_sig != demo._last_timeline_sig:
+                demo._last_timeline_sig = timeline_sig
+                timeline_fig = demo._build_timeline_figure()
+                timeline_fig.update_layout(uirevision="demo-timeline")
+            else:
+                timeline_fig = no_update
 
             peer_name = (selected or {}).get("name") if selected else None
             # Only rebuild the peer-detail iframe when the selection
@@ -495,30 +548,68 @@ class MultiAgencyDemo:
                 detail_html = no_update
             sensor_fig, sensor_style = demo._build_sensor_chart(peer_name)
 
-            # Stage-2c: trust graph + data streams.
-            # Stage 3b.3: live observations cap (and thus discount) any
-            # edge touching a peer the bridge has scored — see
-            # _build_trust_matrix.
-            trust_matrix = demo._build_trust_matrix(scenario, states)
-            stream_counts = _synth_stream_counts(scenario, states)
-            graph_fig = build_graph_from_scenario(
-                scenario,
-                trust_matrix=trust_matrix,
-                stream_counts=stream_counts,
-                compromised=compromised,
-                excluded=excluded,
-                peer_opacity=peer_opacity,
+            # Trust graph + data streams — both driven only by real bridge
+            # observations. Unobserved pairs have no edge and unobserved peers
+            # no stream count, so a forming peer floats unconnected. Rebuild
+            # the graph only when its inputs (edges, stream counts, or node
+            # status) changed since the last render.
+            trust_matrix = demo._build_trust_matrix()
+            stream_counts = demo._real_stream_counts()
+            graph_sig = (
+                tuple(sorted(trust_matrix)),
+                tuple(sorted(stream_counts.items())),
+                frozenset(compromised), frozenset(excluded),
+                tuple(sorted(peer_opacity.items())),
             )
-            graph_fig.update_layout(uirevision="demo-graph")
-            demo._update_streams(tel.scenario_time, states)
+            if graph_sig != demo._last_graph_sig:
+                demo._last_graph_sig = graph_sig
+                graph_fig = build_graph_from_scenario(
+                    scenario,
+                    trust_matrix=trust_matrix,
+                    stream_counts=stream_counts,
+                    compromised=compromised,
+                    excluded=excluded,
+                    peer_opacity=peer_opacity,
+                )
+                graph_fig.update_layout(uirevision="demo-graph")
+            else:
+                graph_fig = no_update
+            demo._update_streams(excluded)
             streams_children = demo._streams_panel.to_dash_children()
 
             return (clock, phase_str, keystats_children,
                     log_children, nchildren, nstyle,
                     play_icon, time_label, progress_style,
-                    map_fig, timeline_fig, detail_html,
+                    timeline_fig, detail_html,
                     graph_fig, streams_children,
                     sensor_fig, sensor_style)
+
+        @self._dash.callback(
+            Output(_MAP_GRAPH, "figure"),
+            Input(_MAP_TICK_INTERVAL_ID, "n_intervals"),
+        )
+        def _refresh_map(_n):
+            # Tactical Map, decoupled from the main data tick. Read-only: the
+            # scenario clock is advanced solely by _on_tick's iface.tick(), so
+            # this consumes the peer status produced by the most recent data
+            # tick. Rebuild only when node status changed (position is static,
+            # so compromised/excluded/opacity fully determine the figure).
+            compromised, excluded, peer_opacity = demo._real_peer_status()
+            map_sig = (frozenset(compromised), frozenset(excluded),
+                       tuple(sorted(peer_opacity.items())))
+            if map_sig == demo._last_map_sig:
+                return no_update
+            demo._last_map_sig = map_sig
+            map_fig = build_map_from_scenario(
+                scenario,
+                compromised=compromised,
+                excluded=excluded,
+                peer_opacity=peer_opacity,
+            )
+            # uirevision preserves pan/zoom across frames; the figure's
+            # own autosize=True handles container fit via dcc.Graph.
+            map_fig.update_layout(uirevision="demo-map")
+            return map_fig
 
         @self._dash.callback(
             Output(_SELECTED_PEER, "data"),
@@ -610,27 +701,113 @@ class MultiAgencyDemo:
 
     # --- Stage 2b data derivation ---------------------------------------
 
-    def _sample_reputation(self, scenario_time: float):
-        """Append a reputation sample for each peer based on current
-        peer_state. Called every tick but only records a new data point
-        every _TICK_SAMPLE_SEC seconds (keeps the timeline lean).
+    def _trace_consensus_dist(self, scenario_time: float) -> None:
+        """Determination instrumentation (AT_REP_TRACE): log, per subject, the
+        distribution of the per-observer consensus scores that ``_pair_consensus``
+        averages into each Trust Dynamics line.
 
-        Peers that have received at least one live reputation observation
-        from the bridge are skipped — _on_bridge_event writes their
-        samples directly. The synthesis path remains for peers we haven't seen
-        yet (late joiners, peers behind a partition)."""
-        if scenario_time - self._last_sample_t < _TICK_SAMPLE_SEC:
+        Reads the interpretation directly off the numbers over successive dumps:
+
+        * ``n_obs`` climbing while ``mean`` falls, ``max`` staying high, and
+          ``at_baseline`` climbing  -> DILUTION: late observers with no
+          committed bilateral history with the subject keep entering the mean
+          at the 0.5 baseline and drag every honest line down.
+        * scores clustered at ~0.5 that never rise (``at_baseline`` ~= n_obs)
+          -> STUCK BASELINE: no observer ever folds a real tx for the subject
+          (e.g. the validator verdict never reaches it) — the subject-field bug.
+        * individual scores starting high then declining -> genuine EMA decay.
+
+        Logging only; no-op unless AT_REP_TRACE is set."""
+        if not os.environ.get("AT_REP_TRACE"):
             return
-        self._last_sample_t = scenario_time
-        for name, state in self._iface.scenario.peer_states.items():
-            if name in self._live_rep_peers:
+        by_subject: dict[str, list[float]] = {}
+        for (obs, subj), s in self._live_trust_seen_dir.items():
+            if obs == subj:
                 continue
-            self._rep_samples.setdefault(name, []).append(
-                ReputationSample(
-                    t=scenario_time,
-                    peer_name=name,
-                    score=_peer_state_to_score(state),
-                ))
+            by_subject.setdefault(subj, []).append(s)
+        if not by_subject:
+            logger.info("REPTRACE t=%.0fs: no observed pairs yet", scenario_time)
+            return
+        for subj in sorted(by_subject):
+            scores = sorted(by_subject[subj])
+            n = len(scores)
+            mean = sum(scores) / n
+            at_baseline = sum(1 for x in scores if abs(x - 0.5) < 1e-3)
+            logger.info(
+                "REPTRACE t=%.0fs subject=%s n_obs=%d mean=%.4f min=%.3f "
+                "max=%.3f at_baseline=%d scores=[%s]",
+                scenario_time, subj, n, mean, scores[0], scores[-1],
+                at_baseline, ",".join(f"{x:.2f}" for x in scores))
+
+    def _latest_real_rep(self, name: str) -> Optional[float]:
+        """Latest bridge-observed reputation for a peer, or None if the mesh
+        has produced no consensus reputation for it yet ("forming"). Timeline
+        samples are written only by _on_bridge_event, so _rep_samples holds
+        real observations exclusively — there is no synthetic fallback."""
+        if name in self._live_rep_peers:
+            samples = self._rep_samples.get(name)
+            if samples:
+                return samples[-1].score
+        return None
+
+    def _real_peer_status(self):
+        """Derive display status purely from real mesh signals — never from
+        scripted peer_states. Returns (compromised, excluded, peer_opacity).
+
+        * compromised: ground-truth INJECTED-compromise peers (scenario role
+          metadata). This labels our own injection (the peer really falsifies
+          data); it is NOT a synthetic mesh signal. Whether the mesh actually
+          catches it is judged by whether its real reputation collapses below
+          _EXCLUSION_THRESHOLD (→ also excluded) — so a detection failure shows
+          as a compromised node that never goes excluded.
+        * excluded: peers whose earned reputation has fallen to/below the AT
+          persist threshold — a real outcome, not a scripted time.
+        * peer_opacity: observed peers full; peers with no earned reputation
+          yet render faint ("forming"), so a silent/absent peer stays visible
+          as un-integrated instead of being hidden or faked."""
+        scenario = self._iface.scenario
+        compromised = {n for n, r in scenario.peers.items()
+                       if (r.metadata or {}).get("compromised")}
+        excluded: set[str] = set()
+        peer_opacity: dict[str, float] = {}
+        for name in scenario.peers:
+            # Authoritative status (log-harvest lens) wins when present: it
+            # distinguishes real AT exclusion (_excluded membership) from the
+            # 0.2 cold-start baseline, which the score-threshold fallback
+            # below cannot. See _on_bridge_event 'rep_status'.
+            status = self._live_status.get(name)
+            if status is not None:
+                is_excluded, is_forming = status
+                if is_forming:
+                    peer_opacity[name] = _FORMING_OPACITY
+                else:
+                    peer_opacity[name] = 1.0
+                    if is_excluded:
+                        excluded.add(name)
+                continue
+            # Fallback (coordinator-hosted live / playback): infer from the
+            # consensus score. _EXCLUSION_THRESHOLD (0.5) is a DISPLAY gate,
+            # not AT's real COMM_CUTOFF (0.1), so a cold peer at the 0.2
+            # baseline can show excluded here — exactly what the lens fixes.
+            rep = self._latest_real_rep(name)
+            if rep is None:
+                peer_opacity[name] = _FORMING_OPACITY
+            else:
+                peer_opacity[name] = 1.0
+                if rep <= _EXCLUSION_THRESHOLD:
+                    excluded.add(name)
+        return compromised, excluded, peer_opacity
+
+    def _real_stream_counts(self) -> dict[str, int]:
+        """Per-peer count of DISTINCT data types the bridge has actually
+        received a reading for — real observed streams, not advertised
+        capabilities. A peer with no real readings is absent (count 0)."""
+        counts: dict[str, int] = {}
+        for _dtype, per_peer in self._sensor_history.items():
+            for name, ring in per_peer.items():
+                if ring:
+                    counts[name] = counts.get(name, 0) + 1
+        return counts
 
     def _build_timeline_figure(self):
         peer_colors = _agency_palette(self._iface.scenario)
@@ -642,91 +819,81 @@ class MultiAgencyDemo:
             tl.add_phase_marker(phase.start.total_seconds(), phase.name)
         return tl.figure(height=None)  # let Dash size it to the panel
 
-    def _build_trust_matrix(self, scenario,
-                            states) -> list[tuple[str, str, float]]:
-        """Build the pairwise trust matrix for the network graph.
+    def _build_trust_matrix(self) -> list[tuple[str, str, float]]:
+        """Pairwise trust edges for the network graph — REAL bilateral
+        observations only.
 
-        Three layers, in priority order:
+        Each edge is a peer's view of another gathered via remote rep_req
+        (`_on_bridge_event` 'rep_pair'): when both directions have arrived
+        the weight is min(observer→subject, subject→observer)
+        (skepticism-wins); a single direction stands alone until its
+        counterpart lands.
 
-        1. **Bilateral live (`_live_trust_matrix`)** — Stage 3b.3(a).
-           Each peer's view of every other peer, gathered via remote
-           rep_req. The edge weight is min(observer→subject,
-           subject→observer) when both directions have arrived
-           (skepticism-wins between the two directional views).
-        2. **Inspector-observation cap (`_live_rep_peers`)** —
-           Stage 3b.3(b). For pairs without bilateral data yet, edges
-           are still capped at the latest single-direction observation
-           the inspector has of either endpoint. This keeps the
-           inspector's view visible until the bilateral round-trip
-           lands.
-        3. **Synth fallback (`_synth_trust_matrix`)** — Stage 2c.
-           peer_state-derived; remains the baseline for pairs the
-           bridge has not seen yet.
-        """
-        synth = _synth_trust_matrix(scenario, states)
-        # Index synth so we can replace specific edges.
-        synth_idx: dict[tuple[str, str], float] = {
-            tuple(sorted((a, b))): score for a, b, score in synth
-        }
-        # Layer 1: bilateral live overrides synth — and is included
-        # even when synth has no corresponding edge. This is the path
-        # that surfaces real AT-mesh observations on the trust graph
-        # before the scripted scenario has transitioned peers out of
-        # PENDING (e.g. live mode early in the run, or paused before
-        # play).
-        for key, score in self._live_trust_matrix.items():
-            synth_idx[key] = score
-        # Layer 2: cap remaining synth edges by single-direction
-        # observation. Skip edges already replaced in layer 1.
-        if self._live_rep_peers:
-            latest: dict[str, float] = {}
-            for name in self._live_rep_peers:
-                samples = self._rep_samples.get(name)
-                if samples:
-                    latest[name] = samples[-1].score
-            for key in list(synth_idx):
-                if key in self._live_trust_matrix:
-                    continue
-                a, b = key
-                weight = synth_idx[key]
-                if a in latest:
-                    weight = min(weight, latest[a])
-                if b in latest:
-                    weight = min(weight, latest[b])
-                synth_idx[key] = weight
-        return [(a, b, w) for (a, b), w in synth_idx.items()]
+        There is NO synthetic fallback. A pair the mesh has not scored has
+        no edge, so an un-observed / forming peer floats unconnected — that
+        absence is the signal, not a fabricated high-trust edge."""
+        return [(a, b, w) for (a, b), w in self._live_trust_matrix.items()]
+
+    def _pair_consensus(self, subject: str) -> Optional[float]:
+        """Consensus reputation of ``subject`` across the mesh = mean of every
+        observer's current directional score of it (the rep_pair stream cached
+        in ``_live_trust_seen_dir``). Self-observations are excluded. Returns
+        None when no observer has scored ``subject`` yet.
+
+        This is the Trust-Dynamics feed. The single ``reputation`` events that
+        used to fill the timeline are the bridge's OWN direct view, which a
+        passive inspector never computes (it runs no transactions; its rep
+        queries are answered by REMOTE observers and captured as pairs, not
+        own-view — see automate.py's own_view split). So the timeline reads
+        the same bilateral stream the Trust Network graph does, aggregated per
+        subject, instead of an empty own-view buffer."""
+        scores = [s for (obs, subj), s in self._live_trust_seen_dir.items()
+                  if subj == subject and obs != subject]
+        if not scores:
+            return None
+        return sum(scores) / len(scores)
 
     def _build_peer_detail_html(self, peer_name: Optional[str]) -> str:
         if peer_name is None or peer_name not in self._iface.scenario.peers:
             return self._peer_detail_panel.to_html(None)
         role = self._iface.scenario.peers[peer_name]
-        state = self._iface.scenario.peer_states.get(peer_name, PeerState.PENDING)
         pos = role.position
         lat = (getattr(pos, "lat", None)
                or getattr(pos, "x", 0.0) or 0.0)
         lon = (getattr(pos, "lon", None)
                or getattr(pos, "y", 0.0) or 0.0)
-        latest = None
-        if peer_name in self._rep_samples and self._rep_samples[peer_name]:
-            latest = self._rep_samples[peer_name][-1].score
+        # Real mesh state only. latest is None until the bridge observes a
+        # consensus reputation for this peer → "forming…".
+        latest = self._latest_real_rep(peer_name)
+        # Prefer the lens's authoritative status so the drawer agrees with
+        # the graph (see _real_peer_status); fall back to the score gate.
+        status_auth = self._live_status.get(peer_name)
+        if status_auth is not None:
+            excluded, forming = status_auth[0], status_auth[1]
+        else:
+            forming = latest is None
+            excluded = (not forming) and latest <= _EXCLUSION_THRESHOLD
+        status = ("onboarding" if forming
+                  else "excluded" if excluded
+                  else "active")
         uuid_str, fingerprint, joined_at = self._peer_identity.get(
             peer_name, ("", "", 0.0))
         detail = PeerDetailState(
             name=peer_name,
             agency=role.agency,
             kind=role.kind,
-            status=_peer_state_to_status(state),
+            status=status,
             lat=float(lat),
             lon=float(lon),
             identity=IdentityInfo(
                 uuid=uuid_str,
-                zta_valid=(state != PeerState.EXCLUDED),
+                zta_valid=not excluded,
                 joined_at=joined_at,
                 key_fingerprint=fingerprint,
             ),
             reputation=ReputationSnapshot(
-                current_score=latest if latest is not None
-                else _peer_state_to_score(state),
+                current_score=latest if latest is not None else 0.0,
+                forming=forming,
             ),
             capabilities=list(role.capabilities or []),
             producing=self._build_producing_streams(peer_name),
@@ -737,10 +904,9 @@ class MultiAgencyDemo:
         """Build StreamSummary objects for the selected peer.
 
         Reads the per-(data_type, peer) ring buffers in _sensor_history
-        — populated from both bridge `reading` events and synth
-        readings — and produces one StreamSummary per data_type the
-        peer has emitted. Pull-style: only the selected peer's data
-        is processed.
+        — populated only from real bridge `reading` events — and produces
+        one StreamSummary per data_type the peer has actually emitted.
+        Pull-style: only the selected peer's data is processed.
         """
         out = []
         for dtype, per_peer in self._sensor_history.items():
@@ -841,9 +1007,37 @@ class MultiAgencyDemo:
                 self._live_trust_matrix[key] = score
             else:
                 self._live_trust_matrix[key] = min(score, opposite)
+            # Trust Dynamics feed: append the subject's updated mesh-consensus
+            # reputation to the timeline buffer (see _pair_consensus). Skip a
+            # no-op repeat so the line only gains a point when consensus moves.
+            consensus = self._pair_consensus(subject)
+            if consensus is not None:
+                prev = self._rep_samples.get(subject)
+                if not prev or prev[-1].score != consensus:
+                    self._rep_samples.setdefault(subject, []).append(
+                        ReputationSample(
+                            t=scenario_time,
+                            peer_name=subject,
+                            score=consensus,
+                        ))
+                    self._maybe_record_snapshot({
+                        "t": scenario_time,
+                        "type": "REPUTATION_SAMPLE",
+                        "peer": subject,
+                        "score": consensus,
+                    })
+                self._live_rep_peers.add(subject)
+        elif tag == "rep_status" and len(ev) >= 4:
+            # Authoritative per-subject status from the log-harvest lens:
+            # (excluded, forming) computed from real _excluded membership +
+            # committed-tx counts, not inferred from a score threshold. Lets
+            # _real_peer_status stop mislabeling cold-start baseline peers as
+            # excluded. See log_harvest.RepMatrix._status_updates.
+            name = str(ev[1])
+            self._live_status[name] = (bool(ev[2]), bool(ev[3]))
         elif tag == "reading" and len(ev) >= 3:
-            # envdata reading: forward to the streams panel and mark
-            # the peer as live so _update_streams stops synthesizing.
+            # envdata reading: forward to the streams panel and mark the
+            # peer as a live stream source (it has produced a real reading).
             name = str(ev[1])
             rd = ev[2] if isinstance(ev[2], dict) else {}
             reading = _reading_from_dict(name, rd)
@@ -878,9 +1072,9 @@ class MultiAgencyDemo:
             epa_peer=self._keystat_tracker._epa)                  # noqa: SLF001
         self._event_log_panel.clear()
         self._rep_samples.clear()
-        self._last_sample_t = -_TICK_SAMPLE_SEC
         self._sensor_history.clear()
         self._live_rep_peers.clear()
+        self._live_status.clear()
         self._live_trust_matrix.clear()
         self._live_trust_seen_dir.clear()
         self._live_stream_peers.clear()
@@ -891,11 +1085,15 @@ class MultiAgencyDemo:
         self._streams_panel = DataStreamsPanel(
             peer_colors=_agency_palette(self._iface.scenario))
         self._streams_inactive.clear()
-        self._last_streams_t = -_STREAMS_TICK_SEC
         self._narration.advance_to(0.0)
         # Force a re-render of the peer detail iframe on the next tick
         # so the user sees the post-reset state if a peer was selected.
         self._peer_detail_last_peer = "<unset>"
+        # Invalidate the figure dirty-check signatures so the map, timeline,
+        # and trust graph all rebuild from the cleared state on the next tick.
+        self._last_map_sig = object()
+        self._last_timeline_sig = object()
+        self._last_graph_sig = object()
 
     def _maybe_record_snapshot(self, snapshot: dict) -> None:
         """Push a snapshot to the interface's recorder if one is
@@ -1039,10 +1237,11 @@ class MultiAgencyDemo:
         return (fig, visible_style)
 
     def _maybe_observe_epa_onboard(self, scenario_time: float) -> None:
-        """Forward the most recent EPA reputation reading (live or synth)
-        into KeyStatTracker.observe_reputation so it can fix the
-        epa_onboard_sec timestamp the first time the score crosses
-        the threshold. KeyStatTracker is idempotent past the first
+        """Forward the most recent real EPA reputation observation into
+        KeyStatTracker.observe_reputation so it can fix the epa_onboard_sec
+        timestamp the first time the score crosses the threshold. No-op
+        until the mesh actually produces reputation for EPA (no synthetic
+        sample forces this). KeyStatTracker is idempotent past the first
         crossing, so this is cheap to call every tick."""
         epa = self._keystat_tracker._epa  # noqa: SLF001
         samples = self._rep_samples.get(epa)
@@ -1052,36 +1251,16 @@ class MultiAgencyDemo:
         self._keystat_tracker.observe_reputation(
             peer=epa, score=float(latest.score), t_seconds=scenario_time)
 
-    def _update_streams(self, scenario_time: float,
-                        peer_states: dict) -> None:
-        """Push synthetic readings into the streams panel at 1 Hz, and
-        mark excluded peers' streams as inactive as soon as they flip."""
-        # Mark newly-excluded peers. Idempotent in the panel, but we
-        # guard with a local set so we skip work once handled.
-        for name, state in peer_states.items():
-            if (state == PeerState.EXCLUDED
-                    and name not in self._streams_inactive):
+    def _update_streams(self, excluded) -> None:
+        """Mark excluded peers' streams inactive on the data-streams panel.
+
+        Real readings are fed into the panel directly by _on_bridge_event
+        ('reading'); nothing is synthesized here. ``excluded`` is the real,
+        reputation-derived exclusion set from _real_peer_status."""
+        for name in excluded:
+            if name not in self._streams_inactive:
                 self._streams_panel.mark_inactive(name)
                 self._streams_inactive.add(name)
-
-        if scenario_time - self._last_streams_t < _STREAMS_TICK_SEC:
-            return
-        self._last_streams_t = scenario_time
-        ts = timedelta(seconds=scenario_time)
-        for name, role in self._iface.scenario.peers.items():
-            state = peer_states.get(name, PeerState.PENDING)
-            if state in (PeerState.PENDING, PeerState.EXCLUDED):
-                continue
-            # Stage 3b.4: when the bridge has delivered any real reading
-            # from this peer, stop overlaying synthesized data on top of
-            # it. This mirrors how _live_rep_peers gates _sample_reputation.
-            if name in self._live_stream_peers:
-                continue
-            quality = _peer_state_to_quality(state)
-            for reading in _readings_for_role(name, role, ts, quality,
-                                              scenario_time):
-                self._streams_panel.update(reading)
-                self._record_reading(reading)
 
     # --- run ------------------------------------------------------------
 
@@ -1174,32 +1353,6 @@ def _detection_time(scenario, peer_name: str) -> Optional[float]:
     return None
 
 
-def _peer_state_to_score(state: PeerState) -> float:
-    """Synthesize a 0-1 reputation from a scenario PeerState. Replace
-    with live AT reputation data in Stage 3."""
-    if state == PeerState.PENDING:
-        return 0.0
-    if state == PeerState.ACTIVE:
-        return 1.0
-    if state == PeerState.COMPROMISED:
-        return 0.55   # noisy but not yet detected
-    if state == PeerState.DETECTED:
-        return 0.25   # below exclusion threshold (0.5)
-    if state == PeerState.EXCLUDED:
-        return 0.0
-    return 0.5
-
-
-def _peer_state_to_status(state: PeerState) -> str:
-    if state == PeerState.PENDING:
-        return "onboarding"
-    if state in (PeerState.COMPROMISED, PeerState.DETECTED):
-        return "compromised"
-    if state == PeerState.EXCLUDED:
-        return "excluded"
-    return "active"
-
-
 _AGENCY_COLORS = {
     "NOAA": "#1f77b4",
     "USGS": "#8c564b",
@@ -1228,72 +1381,7 @@ def _peer_name_from_click(click_data) -> Optional[str]:
     return pts[0].get("text") or None
 
 
-# --- Stage 2c helpers --------------------------------------------------
-
-def _peer_state_to_quality(state: PeerState) -> float:
-    if state == PeerState.ACTIVE:
-        return 0.96
-    if state == PeerState.COMPROMISED:
-        return 0.60   # before detection: drift visible in quality only
-    if state == PeerState.DETECTED:
-        return 0.30
-    return 1.0        # PENDING/EXCLUDED caller filters before reaching here
-
-
-def _synth_trust_matrix(scenario, states) -> list[tuple[str, str, float]]:
-    """Synthesize pairwise trust scores from peer_states. Stage 3 replaces
-    this with real bilateral reputation from the AT reputation protocol."""
-    names = list(scenario.peers.keys())
-    matrix: list[tuple[str, str, float]] = []
-    for i, a in enumerate(names):
-        sa = states.get(a, PeerState.PENDING)
-        if sa == PeerState.PENDING:
-            continue
-        for b in names[i + 1:]:
-            sb = states.get(b, PeerState.PENDING)
-            if sb == PeerState.PENDING:
-                continue
-            # Either side excluded -> very low.
-            if PeerState.EXCLUDED in (sa, sb):
-                matrix.append((a, b, 0.05))
-                continue
-            # Either side detected -> low.
-            if PeerState.DETECTED in (sa, sb):
-                matrix.append((a, b, 0.25))
-                continue
-            # Either side compromised (but not yet detected): mid.
-            if PeerState.COMPROMISED in (sa, sb):
-                matrix.append((a, b, 0.55))
-                continue
-            # Both active: strong trust.
-            matrix.append((a, b, 0.9))
-    return matrix
-
-
-def _synth_stream_counts(scenario, states) -> dict[str, int]:
-    """Each active peer counts one stream per streaming capability it has."""
-    stream_caps = {"weather_stream", "seismic_stream",
-                   "airquality_stream", "situation_report", "data_fusion"}
-    counts: dict[str, int] = {}
-    for name, role in scenario.peers.items():
-        state = states.get(name, PeerState.PENDING)
-        if state in (PeerState.PENDING, PeerState.EXCLUDED):
-            counts[name] = 0
-            continue
-        caps = list(role.capabilities or [])
-        counts[name] = sum(1 for c in caps if c in stream_caps)
-    return counts
-
-
-# Per-capability reading spec: (data_type, unit, base_value, amplitude)
-_STREAM_SPECS: dict[str, tuple[str, str, float, float]] = {
-    "weather_stream":     ("temperature", "C",        15.0, 4.0),
-    "seismic_stream":     ("magnitude",   "Mw",        2.0, 0.6),
-    "airquality_stream":  ("pm25",        "ug/m3",    30.0, 10.0),
-    "situation_report":   ("incidents",   "count",     4.0, 2.0),
-    "data_fusion":        ("fused_conf",  "score",     0.85, 0.05),
-}
-
+# --- bridge reading rehydration ---------------------------------------
 
 def _reading_from_dict(peer_name: str, d: dict) -> Optional[Reading]:
     """Inverse of Reading.to_dict() — used by the Stage 3b.4 bridge path
@@ -1324,28 +1412,3 @@ def _reading_from_dict(peer_name: str, d: dict) -> Optional[Reading]:
         quality=quality,
         metadata=dict(d.get("metadata") or {}),
     )
-
-
-def _readings_for_role(name: str, role, ts: timedelta,
-                       quality: float, t_sec: float) -> list[Reading]:
-    """Build one synthetic Reading per streaming capability of this peer.
-
-    Values oscillate around a base with a per-peer phase offset so the
-    panel isn't visibly in lockstep. Compromised peers get degraded
-    quality (already applied by caller) and a bigger drift component."""
-    out: list[Reading] = []
-    phase = hash(name) % 360  # stable offset per peer
-    drift = 0.0 if quality > 0.8 else 1.5 * (1.0 - quality)
-    for cap in (role.capabilities or []):
-        spec = _STREAM_SPECS.get(cap)
-        if spec is None:
-            continue
-        dtype, unit, base, amp = spec
-        value = base + amp * math.sin(
-            (t_sec + phase) * 2 * math.pi / 60.0) + drift
-        out.append(Reading(
-            timestamp=ts, peer_name=name,
-            data_type=dtype, value=value, unit=unit,
-            quality=quality,
-        ))
-    return out

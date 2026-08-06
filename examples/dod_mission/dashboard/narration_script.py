@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #  Licensed under the Apache License, Version 2.0
 # ******************
 """Narration script for the DoD squad infiltration demo.
@@ -18,8 +18,19 @@ Severity / style is consumed by inspector.dashboard.narration:
   "success"  successful autonomous action
 """
 
-from autonomous_trust.inspector.dashboard.narration import NarrationBlock
+from autonomous_trust.inspector.dashboard.narration import (
+    NarrationBlock, NarrationAnchor,
+)
 
+
+# The trust/threat beats below carry ``anchor`` cues so that, during canned
+# playback, examples.dod_mission.__main__ re-times them to when the events
+# *actually* happened in the recording (reputation crossing 0.7, the MQ-800
+# being detected and collapsing, the jet checking in) instead of the
+# idealised ``t_start`` schedule. The ``t_start`` values remain the live-mode
+# fallback (and the fallback if a cue never fires in a given recording).
+# The "cohort_above" cohort (the pre-established peers) is injected at
+# runtime from the scenario roster — see __main__.
 
 DOD_NARRATION: list[NarrationBlock] = [
     # ----- Phase 0: Setup (T+0:00 - T+1:00) ----------------------------
@@ -27,7 +38,7 @@ DOD_NARRATION: list[NarrationBlock] = [
         t_start=0,
         t_end=15,
         text="A 12-man squad inserts behind enemy lines on a mobile-target "
-             "mission.  They are three klicks out.",
+             "mission.  They are two kilometers out.",
         subtext="The squad has pre-established trust with their microdrones, "
              "two RQ-86 recon drones overhead, and a remote command node.  "
              "Pre-mission identity chains are loaded.  Nothing else is "
@@ -67,6 +78,9 @@ DOD_NARRATION: list[NarrationBlock] = [
              "have leveled.  The network has autonomously decided these "
              "peers are trustworthy.",
         style="success",
+        # Fires when the LAST pre-established peer first crosses 0.7.
+        anchor=NarrationAnchor(kind="cohort_above", op="above",
+                               threshold=0.7),
     ),
 
     # ----- Phase 2: Contact (T+2:00 - T+3:00) --------------------------
@@ -116,6 +130,8 @@ DOD_NARRATION: list[NarrationBlock] = [
              "just not on this squad's roster.  Watch what the network does "
              "in the next 30 seconds.",
         style="info",
+        # Fires when the MQ-800 first appears in the trust timeline.
+        anchor=NarrationAnchor(kind="peer_sample", peer="mq800", op="first"),
     ),
     NarrationBlock(
         t_start=255,
@@ -124,11 +140,15 @@ DOD_NARRATION: list[NarrationBlock] = [
              "everyone else's.",
         subtext="The cross-source position validator is running on the "
              "fusion node.  RQ-86-1, RQ-86-2, and the microdrones agree "
-             "within a few metres; the MQ-800 designates a different "
-             "building several hundred metres away.  On the Target "
-             "Position map its marker visibly splits from the cluster in "
-             "real time.",
+             "within a few meters; the MQ-800 designates a different "
+             "building the better part of a kilometer away — far beyond "
+             "any plausible sensor error, so it cannot be written off as a "
+             "statistical anomaly.  On the Target Position map its marker "
+             "visibly splits from the cluster in real time.",
         style="alert",
+        # Fires on the first cross-source position anomaly against the MQ-800.
+        anchor=NarrationAnchor(kind="event", event_type="COMPROMISE_DETECT",
+                               peer="mq800"),
     ),
     NarrationBlock(
         t_start=270,
@@ -140,6 +160,9 @@ DOD_NARRATION: list[NarrationBlock] = [
              "processors, the RQ-86s, and the microdrones converged "
              "independently.",
         style="alert",
+        # Fires when the MQ-800's reputation first drops below the 0.5 line.
+        anchor=NarrationAnchor(kind="peer_sample", peer="mq800", op="below",
+                               threshold=0.5),
     ),
     NarrationBlock(
         t_start=285,
@@ -151,6 +174,9 @@ DOD_NARRATION: list[NarrationBlock] = [
              "\"Network excluded MQ-800 (autonomous).\"  This was not a "
              "human decision.",
         style="alert",
+        # Fires when the MQ-800 hits the untrusted floor (excluded).
+        anchor=NarrationAnchor(kind="peer_sample", peer="mq800", op="below",
+                               threshold=0.2),
     ),
 
     # ----- Phase 5: ECM (T+5:00 - T+6:00) ------------------------------
@@ -170,15 +196,22 @@ DOD_NARRATION: list[NarrationBlock] = [
     # ----- Phase 6: Strike (T+6:00 - T+7:00) ---------------------------
     NarrationBlock(
         t_start=360,
-        t_end=380,
-        text="Command scrambled a fighter jet the moment the MQ-800 went "
-             "rogue.  It arrives now, announces itself, and the cohort "
-             "validates it.",
+        # No fixed t_end: hold this "jet arrives / validating" beat until the
+        # strike-confirmed block below opens its gate (the jet actually
+        # reaching the objective). Otherwise, because the strike beat is gated
+        # and the jet's pass floats later than its authored time, the overlay
+        # would go blank between this beat ending and the gate firing.
+        t_end=None,
+        text="A fighter jet was already on patrol nearby.  The moment the "
+             "MQ-800 was exposed as rogue, Command vectored it in.  It "
+             "arrives now, announces itself, and the cohort validates it.",
         subtext="The jet presents a fresh identity chained to Command's "
              "root.  Squad processors verify it against the pre-mission "
              "trust anchor and admit it to the cohort.  Elapsed time, "
              "identity to operational trust: under one second.",
         style="success",
+        # Fires when the fighter jet checks in (first appears in the timeline).
+        anchor=NarrationAnchor(kind="peer_sample", peer="jet-1", op="first"),
     ),
     NarrationBlock(
         t_start=380,
@@ -189,6 +222,11 @@ DOD_NARRATION: list[NarrationBlock] = [
              "six seconds of the jet's ingress — orders of magnitude faster "
              "than any human-mediated trust process.",
         style="success",
+        # Held until the jet is actually over the objective. The launch is
+        # gated on the MQ-800 collapse so the strike time floats; t_start is
+        # only the earliest it may show (coordinator publishes the gate; see
+        # scenario.jet_over_objective / coordinator._push_dashboard_update).
+        gate="jet_over_target",
     ),
 
     # ----- Phase 7: Exfil (T+7:00 - T+8:00) ----------------------------

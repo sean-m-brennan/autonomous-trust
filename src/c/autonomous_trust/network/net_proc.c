@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2024 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -44,7 +44,6 @@
 #include "network/net_message.h"
 #include "network/net_transport.h"
 #include "network/net_proc_priv.h"
-#include "network/ping.h"
 #ifdef AT_NET_ENVELOPE
 #include "network/net_envelope.h"
 #endif
@@ -145,9 +144,105 @@ DEFINE_ERROR(ENET_RECV, "Network receive failed");
 /* Protocol-string definitions (declared `extern char[]` in network.h). */
 char NET_FN_STATS_REQ[]  = "stats_req";
 char NET_FN_STATS_RESP[] = "stats_resp";
-char NET_FN_PING[]       = "ping";
+char NET_FN_PING_AT[]    = "ping_at";
+/* Reputation communication cut-off control (local IPC from rep_proc's
+ * _publish_exclusion). Mirror: Python Network.exclude / Network.readmit. */
+char NET_FN_EXCLUDE[]    = "exclude";
+char NET_FN_READMIT[]    = "readmit";
 
 static const int RECV_POLL_TIMEOUT_MS = 100;
+
+/****************************
+ * Base port resolution
+ ****************************/
+
+/* AT_COMM_PORT, read once and cached — same habit as the other AT_* overrides
+ * (generate.c AT_TRANSPORT, AT_MYSTERY_MAX_AGE_SEC below, configuration.c
+ * AT_SERIALIZE_MODE). 0 means "no usable override"; a value that is present but
+ * unparseable or out of range is refused once, loudly, and the default kept —
+ * never a silent 0, which would ask the kernel for an ephemeral port and put
+ * the node somewhere no peer is looking. */
+static int  env_comm_port       = 0;
+static bool env_comm_port_read  = false;
+static bool env_comm_port_bad   = false;
+static char env_comm_port_raw[32] = {0};
+
+static int comm_port_from_env(logger_t *logger)
+{
+    if (!env_comm_port_read) {
+        env_comm_port_read = true;
+        const char *raw = getenv("AT_COMM_PORT");
+        if (raw != NULL && raw[0] != '\0') {
+            snprintf(env_comm_port_raw, sizeof(env_comm_port_raw), "%s", raw);
+            char *end = NULL;
+            errno = 0;
+            long val = strtol(raw, &end, 10);
+            if (errno != 0 || end == raw || (end != NULL && *end != '\0') ||
+                val < COMM_PORT_MIN || val > COMM_PORT_MAX) {
+                env_comm_port_bad = true;
+            } else {
+                env_comm_port = (int)val;
+            }
+        }
+    }
+    if (env_comm_port_bad) {
+        /* Report every time it is consulted with a logger: the resolver may be
+         * called before the logger exists, and a refused override must not be
+         * the one thing that goes unlogged. */
+        log_warn(logger,
+                 "Network: refusing AT_COMM_PORT='%s' (want an integer in "
+                 "[%d, %d]); using default %d\n",
+                 env_comm_port_raw, COMM_PORT_MIN, COMM_PORT_MAX, COMM_PORT);
+    }
+    return env_comm_port;
+}
+
+const char *net_port_source_name(net_port_source_t src)
+{
+    switch (src) {
+        case PORT_SRC_CONFIG: return "config";
+        case PORT_SRC_ENV:    return "AT_COMM_PORT";
+        case PORT_SRC_DEFAULT:
+        default:              return "default";
+    }
+}
+
+int net_port_resolve(int cfg_port, net_port_source_t *src, logger_t *logger)
+{
+    if (cfg_port >= COMM_PORT_MIN && cfg_port <= COMM_PORT_MAX) {
+        /* The provisioned config wins. Say so when an override was also given,
+         * rather than letting the operator believe AT_COMM_PORT took effect. */
+        if (comm_port_from_env(logger) != 0 && env_comm_port != cfg_port)
+            log_info(logger,
+                     "Network: config port %d overrides AT_COMM_PORT=%d\n",
+                     cfg_port, env_comm_port);
+        if (src != NULL) *src = PORT_SRC_CONFIG;
+        return cfg_port;
+    }
+    if (cfg_port != 0)
+        log_warn(logger,
+                 "Network: refusing configured port %d (want an integer in "
+                 "[%d, %d]); falling back\n",
+                 cfg_port, COMM_PORT_MIN, COMM_PORT_MAX);
+
+    int from_env = comm_port_from_env(logger);
+    if (from_env != 0) {
+        if (src != NULL) *src = PORT_SRC_ENV;
+        return from_env;
+    }
+    if (src != NULL) *src = PORT_SRC_DEFAULT;
+    return COMM_PORT;
+}
+
+/* Test seam: forget the cached AT_COMM_PORT so a test can exercise more than
+ * one value in one process. Not declared in network.h — tests declare it. */
+void net_port_resolve_reset(void)
+{
+    env_comm_port      = 0;
+    env_comm_port_read = false;
+    env_comm_port_bad  = false;
+    env_comm_port_raw[0] = '\0';
+}
 
 /****************************
  * Blacklist / rejected addresses
@@ -158,12 +253,30 @@ static char rejected_addresses[MAX_REJECTED][ADDR_LEN + 1];
 static size_t rejected_count = 0;
 static pthread_mutex_t rejected_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Canonicalize an address to the peer-listing key form (strip any
+ * '/suffix', e.g. a CIDR mask), so an exclusion keyed on a peer's stored
+ * address matches the raw from_addr seen at recv. Mirrors Python
+ * NetworkProcess._norm_addr. @p out must hold ADDR_LEN + 1 bytes. */
+static void _norm_addr(const char *address, char *out, size_t outlen)
+{
+    if (address == NULL || out == NULL || outlen == 0) {
+        if (out != NULL && outlen > 0) out[0] = '\0';
+        return;
+    }
+    size_t i = 0;
+    for (; address[i] != '\0' && address[i] != '/' && i < outlen - 1; i++)
+        out[i] = address[i];
+    out[i] = '\0';
+}
+
 static bool reject_message(const char *address)
 {
+    char norm[ADDR_LEN + 1];
+    _norm_addr(address, norm, sizeof(norm));
     bool found = false;
     pthread_mutex_lock(&rejected_lock);
     for (size_t i = 0; i < rejected_count; i++) {
-        if (strcmp(rejected_addresses[i], address) == 0) {
+        if (strcmp(rejected_addresses[i], norm) == 0) {
             found = true;
             break;
         }
@@ -172,20 +285,44 @@ static bool reject_message(const char *address)
     return found;
 }
 
-__attribute__((unused))
 static void blacklist_address(const char *address)
 {
+    char norm[ADDR_LEN + 1];
+    _norm_addr(address, norm, sizeof(norm));
     pthread_mutex_lock(&rejected_lock);
     for (size_t i = 0; i < rejected_count; i++) {
-        if (strcmp(rejected_addresses[i], address) == 0) {
+        if (strcmp(rejected_addresses[i], norm) == 0) {
             pthread_mutex_unlock(&rejected_lock);
             return;
         }
     }
     if (rejected_count < MAX_REJECTED) {
         snprintf(rejected_addresses[rejected_count], sizeof(rejected_addresses[0]),
-                 "%s", address);
+                 "%s", norm);
         rejected_count++;
+    }
+    pthread_mutex_unlock(&rejected_lock);
+}
+
+/* Reverse a blacklist/exclusion (explicit rehabilitation / readmit).
+ * Removes @p address (normalized) from the rejection list, compacting the
+ * fixed array. Mirrors Python NetworkProcess.handle_readmit's discard. */
+static void remove_rejected_address(const char *address)
+{
+    char norm[ADDR_LEN + 1];
+    _norm_addr(address, norm, sizeof(norm));
+    pthread_mutex_lock(&rejected_lock);
+    for (size_t i = 0; i < rejected_count; i++) {
+        if (strcmp(rejected_addresses[i], norm) == 0) {
+            /* memmove, not snprintf: source and destination are slots of the
+             * same array, which violates snprintf's restrict contract. */
+            if (i + 1 < rejected_count)
+                memmove(rejected_addresses[i], rejected_addresses[i + 1],
+                        (rejected_count - i - 1) * sizeof(rejected_addresses[0]));
+            rejected_count--;
+            rejected_addresses[rejected_count][0] = '\0';
+            break;
+        }
     }
     pthread_mutex_unlock(&rejected_lock);
 }
@@ -278,12 +415,67 @@ typedef struct {
     char from_addr[ADDR_LEN + 1];
     uuid_t src_uuid;        /* Original sender's UUID (envelope mode). */
     bool   has_src_uuid;    /* True iff src_uuid is meaningful. */
+    int64_t deferred_at_s;  /* CLOCK_MONOTONIC seconds when deferred (age-out). */
     uint8_t data[];         /* Flexible: allocated with `len` bytes. */
 } deferred_msg_t;
 
 static deferred_msg_t *deferred_messages[MAX_DEFERRED];   /* owning ptrs, NULL when slot free */
 static size_t deferred_count = 0;
 static pthread_mutex_t deferred_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Age-out: a deferred entry whose sender never becomes a known peer is
+ * reclaimed after this many seconds. Mirrors Python netprocess.py's
+ * mystery_max_retries (60 retries × ~0.5s ≈ 30s) — but the C retry is
+ * event-driven (on peer admission), not a polling thread, so we bound the
+ * lifetime by wall-time instead of retry count. Without this, a burst of
+ * un-resolvable encrypted frames permanently occupies the bounded queue and
+ * starves legitimate deferrals. Overridable via AT_MYSTERY_MAX_AGE_SEC. */
+#define DEFERRED_MAX_AGE_SEC_DEFAULT 30
+static int64_t _deferred_max_age_s(void)
+{
+    const char *e = getenv("AT_MYSTERY_MAX_AGE_SEC");
+    if (e != NULL && e[0] != '\0') {
+        long v = atol(e);
+        if (v > 0)
+            return (int64_t)v;
+    }
+    return DEFERRED_MAX_AGE_SEC_DEFAULT;
+}
+
+static int64_t _deferred_now_s(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    return (int64_t)ts.tv_sec;
+}
+
+/* Free + compact out entries older than the age-out window, preserving
+ * insertion order (so slot 0 remains the oldest survivor). Caller MUST hold
+ * deferred_lock. Emits a net.mystery/aged_out counter per reclaimed entry,
+ * mirroring Python's _probes.counter('net.mystery', 'drop', 'max_retries'). */
+static void _deferred_sweep_stale_locked(int64_t now_s)
+{
+    int64_t max_age = _deferred_max_age_s();
+    size_t remaining = 0;
+    for (size_t i = 0; i < deferred_count; i++) {
+        deferred_msg_t *dm = deferred_messages[i];
+        if (dm == NULL)
+            continue;
+        if (now_s - dm->deferred_at_s >= max_age) {
+            probes_counter("net.mystery", "aged_out", "max_age");
+            free(dm);
+            deferred_messages[i] = NULL;
+        } else {
+            if (remaining != i) {
+                deferred_messages[remaining] = dm;
+                deferred_messages[i] = NULL;
+            }
+            remaining++;
+        }
+    }
+    deferred_count = remaining;
+}
 
 /* @p src_uuid is optional — pass NULL in non-envelope mode. When non-NULL,
  * the entry will be matched against a newly-admitted peer's UUID (the
@@ -314,14 +506,26 @@ static void defer_message(const uint8_t *data, size_t len,
         memset(dm->src_uuid, 0, 16);
         dm->has_src_uuid = false;
     }
+    int64_t now_s = _deferred_now_s();
+    dm->deferred_at_s = now_s;
     pthread_mutex_lock(&deferred_lock);
-    if (deferred_count < MAX_DEFERRED) {
-        deferred_messages[deferred_count++] = dm;
-        dm = NULL;  /* ownership transferred to the queue */
+    /* Reclaim aged-out entries first so a self-cleaning queue makes room
+     * without a polling thread. */
+    _deferred_sweep_stale_locked(now_s);
+    if (deferred_count >= MAX_DEFERRED) {
+        /* Still full of fresh (un-aged) entries: FIFO-evict the oldest (slot 0,
+         * insertion order preserved) so this fresh — possibly legitimate —
+         * deferral isn't starved by older, likely-unresolvable traffic. The
+         * prior design dropped the NEW message here, which is what let a burst
+         * starve later legitimate deferrals. */
+        probes_counter("net.mystery", "evicted", "overflow");
+        free(deferred_messages[0]);
+        memmove(&deferred_messages[0], &deferred_messages[1],
+                (MAX_DEFERRED - 1) * sizeof(deferred_messages[0]));
+        deferred_count = MAX_DEFERRED - 1;
     }
+    deferred_messages[deferred_count++] = dm;  /* ownership transferred */
     pthread_mutex_unlock(&deferred_lock);
-    /* If we hit the queue cap, dm is still owned by us — free it. */
-    free(dm);
 }
 
 /* Match predicate: a deferred entry matches a newly-admitted peer iff
@@ -367,6 +571,35 @@ bool net_proc_test_deferred_matches_peer(size_t idx,
         m = deferred_matches_peer(deferred_messages[idx], new_peer);
     pthread_mutex_unlock(&deferred_lock);
     return m;
+}
+
+/* Defer a message (non-envelope) — lets tests populate the queue without a
+ * live socket. Wraps the static defer_message. */
+void net_proc_test_defer(const uint8_t *data, size_t len, const char *from_addr)
+{
+    defer_message(data, len, from_addr, NULL);
+}
+
+/* Backdate every queued entry by @p secs so a test can simulate the passage of
+ * time without sleeping, then exercise the age-out sweep. */
+void net_proc_test_backdate_deferred(int64_t secs)
+{
+    pthread_mutex_lock(&deferred_lock);
+    for (size_t i = 0; i < deferred_count; i++)
+        if (deferred_messages[i] != NULL)
+            deferred_messages[i]->deferred_at_s -= secs;
+    pthread_mutex_unlock(&deferred_lock);
+}
+
+/* Run the age-out sweep at the current time and return how many entries
+ * survive. */
+size_t net_proc_test_sweep_stale(void)
+{
+    pthread_mutex_lock(&deferred_lock);
+    _deferred_sweep_stale_locked(_deferred_now_s());
+    size_t n = deferred_count;
+    pthread_mutex_unlock(&deferred_lock);
+    return n;
 }
 
 /* Capture of the most recent from_whom.address handed to route_to_process,
@@ -517,7 +750,7 @@ static int decrypt_message(const identity_t *myself, const public_identity_t *pe
  ****************************/
 
 /* Frama-C: skipped — [alloc-pattern] route_to_process: at_memcpy + strdup + messaging_send. */
-/* stats_req / ping interception (divergence.md H7, H8) does NOT live here —
+/* stats_req / ping_at interception (divergence.md H7, H8) does NOT live here —
  * it lives in the outbound queue drain at the end of net_process_run(),
  * mirroring Python netprocess.py:501-528 which intercepts on the OUTBOUND
  * path (after the local process puts the request into the network process's
@@ -547,6 +780,7 @@ static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
     gmsg.info.net_msg.obj = wmsg->data;
     gmsg.info.net_msg.len = wmsg->data_len;
     memcpy(&gmsg.info.net_msg.from_whom, &wmsg->from_whom, sizeof(public_identity_t));
+    gmsg.info.net_msg.from_rank = wmsg->from_rank;
     gmsg.info.net_msg.encrypt = wmsg->encrypt;
     /* Carry trace_id across the IPC hop so probes_trace_msg in the
      * downstream process stays correlated with the wire side. */
@@ -566,7 +800,7 @@ static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
         return ret;
     }
     log_debug(logger, "Routed %s.%s from %s\n", wmsg->process, wmsg->function,
-              wmsg->from_whom.fullname);
+              wmsg->from_whom.nickname);
     if (gmsg.info.net_msg.function != NULL) free(gmsg.info.net_msg.function);
     return 0;
 }
@@ -749,12 +983,12 @@ static int net_encrypt_and_send(const identity_t *myself, const net_wire_msg_t *
                                 int port, logger_t *logger);
 
 /****************************
- * stats_req / ping outbound interception (divergence.md H7, H8)
+ * stats_req / ping_at outbound interception (divergence.md H7, H8)
  *
  * Mirrors Python netprocess.py:501-528. The local outbound drain
  * checks `process==network` plus a function selector and either
  * (H7) synthesizes a stats_resp pointed back at from_whom, or
- * (H8) dispatches a worker thread that runs the blocking ping()
+ * (H8) answers the ping_at selector (C implements no PingAT; it once
  * RFC5905-style synchronous loop and posts a stats Message back
  * into the requester's queue via return_to.
  ****************************/
@@ -784,81 +1018,45 @@ static uint8_t *peer_stats_to_json_bytes(size_t *out_len)
     return (uint8_t *)s;
 }
 
-/* Worker arguments for the async ping dispatch. Owned by the worker;
- * the worker frees this after posting the result (or on error). */
-typedef struct {
-    char     target_addr[ADDR_LEN + 1];
-    int      count;
-    char     return_to[PROC_NAME_LEN + 1];
-    logger_t *logger;
-} ping_worker_args_t;
-
-static void *ping_worker_thread(void *arg)
+/* Answer a `ping_at` request with an explicit refusal.
+ *
+ * PingAT confirms an AT peer is present and answering on AT's own UDP ports via
+ * a cooperating responder; it is NOT ICMP reachability. C implements no PingAT
+ * responder or client, so the selector is intercepted here only so a
+ * requester gets an answer. The reply carries the SAME function selector the
+ * requester is waiting on, with an error body, so it fails fast instead of
+ * waiting out its own timeout; a distinct "unsupported" selector would be
+ * ignored by a requester blocked on `ping_at`. This is a local IPC reply into
+ * return_to (as the removed ping worker did), never a wire message.
+ *
+ * Returns 0 when the refusal was posted, non-zero on allocation/send failure
+ * (caller logs). Python performs the PingAT instead (netprocess.py) and
+ * is the only implementation — see ISSUES.md. */
+int refuse_ping_at_unsupported(const char *target_addr,
+                            const char *return_to, logger_t *logger)
 {
-    ping_worker_args_t *args = (ping_worker_args_t *)arg;
-    ping_stats_t stats = {0};
-    int rc = ping(args->target_addr, args->count, &stats);
-    if (rc != 0) {
-        log_warn(args->logger, "Ping (async) to %s failed (rc=%d)\n",
-                 args->target_addr, rc);
-        free(args);
-        return NULL;
-    }
-    /* Serialize the ping_stats_t as JSON. Mirror Python's ping result
-     * shape loosely — sender treats obj as opaque bytes here. */
     json_t *jr = json_object();
-    if (jr == NULL) { free(args); return NULL; }
-    json_object_set_new(jr, "host", json_string(stats.host));
-    json_object_set_new(jr, "sent", json_integer(stats.sent));
-    json_object_set_new(jr, "received", json_integer(stats.received));
-    json_object_set_new(jr, "min_rtt", json_real(stats.min_rtt));
-    json_object_set_new(jr, "max_rtt", json_real(stats.max_rtt));
-    json_object_set_new(jr, "avg_rtt", json_real(stats.avg_rtt));
-    json_object_set_new(jr, "loss", json_real(stats.loss));
+    if (jr == NULL) return SYS_EXCEPTION();
+    json_object_set_new(jr, "error", json_string("unsupported"));
+    json_object_set_new(jr, "function", json_string(NET_FN_PING_AT));
+    json_object_set_new(jr, "host", json_string(target_addr != NULL ? target_addr : ""));
     char *body = json_dumps(jr, JSON_COMPACT);
     json_decref(jr);
-    if (body == NULL) { free(args); return NULL; }
-    size_t body_len = strlen(body);
+    if (body == NULL) return SYS_EXCEPTION();
 
     generic_msg_t gmsg = {0};
     gmsg.type = NET_MESSAGE;
     snprintf(gmsg.info.net_msg.process, sizeof(gmsg.info.net_msg.process), "network");
-    gmsg.info.net_msg.function = strdup(NET_FN_PING);
+    gmsg.info.net_msg.function = strdup(NET_FN_PING_AT);
     gmsg.info.net_msg.obj = (uint8_t *)body;
-    gmsg.info.net_msg.len = body_len;
+    gmsg.info.net_msg.len = strlen(body);
     gmsg.info.net_msg.encrypt = false;
-    if (messaging_send(args->return_to, NET_MESSAGE, &gmsg, false) != 0) {
-        log_warn(args->logger, "Ping (async): failed to post result to '%s'\n",
-                 args->return_to);
-    }
+    int rc = messaging_send(return_to, NET_MESSAGE, &gmsg, false);
+    if (rc != 0)
+        log_warn(logger, "Network: failed to post ping_at refusal to '%s'\n", return_to);
     if (gmsg.info.net_msg.function != NULL) free(gmsg.info.net_msg.function);
     free(body);
-    free(args);
-    return NULL;
-}
-
-/* Dispatch a detached worker. Returns 0 on dispatch, non-zero if the
- * thread couldn't be started (caller logs). */
-static int dispatch_ping_async(const char *target_addr, int count,
-                               const char *return_to, logger_t *logger)
-{
-    ping_worker_args_t *args = calloc(1, sizeof(*args));
-    if (args == NULL) return SYS_EXCEPTION();
-    snprintf(args->target_addr, sizeof(args->target_addr), "%s", target_addr);
-    args->count = count > 0 ? count : PING_COUNT;
-    snprintf(args->return_to, sizeof(args->return_to), "%s", return_to);
-    args->logger = logger;
-    pthread_t tid;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    int rc = pthread_create(&tid, &attr, ping_worker_thread, args);
-    pthread_attr_destroy(&attr);
-    if (rc != 0) {
-        free(args);
-        return rc;
-    }
-    return 0;
+    return rc;
 }
 
 /* Handle a stats_req intercepted on the outbound drain. Sends a
@@ -1053,14 +1251,60 @@ static int net_encrypt_and_send(const identity_t *myself, const net_wire_msg_t *
  * site) but no C code path consumes it.
  ****************************/
 
-/* Return the local address string for comparing to the packet sender. */
-static void my_address(const network_config_t *net_cfg, bool ipv6, char *out)
+/* Return the local address string for comparing to the packet sender.
+ * `out_len` is explicit and callers pass IPV6_ADDR_LEN buffers: ADDR_LEN (32) is
+ * too small for a full IPv6 literal (up to 45 chars), and the result feeds a
+ * self-filter -- `strcmp(from_addr, my_addr) == 0` -- so a truncated value would
+ * silently stop a node recognising its own traffic. cidr_split now clears `out`
+ * and reports ENET_ADDR_TOO_LONG rather than truncating, which turns that into a
+ * non-match instead of a wrong match. */
+static void my_address(const network_config_t *net_cfg, bool ipv6, char *out,
+                       size_t out_len)
 {
     out[0] = '\0';
     if (ipv6)
-        cidr_split((char *)net_cfg->ip6_cidr, out, NULL);
+        cidr_split((char *)net_cfg->ip6_cidr, out, out_len, NULL, 0);
     else
-        cidr_split((char *)net_cfg->ip4_cidr, out, NULL);
+        cidr_split((char *)net_cfg->ip4_cidr, out, out_len, NULL, 0);
+}
+
+/* Deliver a PLAINTEXT frame from a peer we already know, but only an
+ * allowlisted verb that declares itself unencrypted.
+ *
+ * Three conditions, all required: the bytes parse as a wire message, the
+ * envelope's own encrypt flag is false, and the verb is one this protocol sends
+ * in plaintext (identity_verb_is_unencrypted). A frame that merely failed to
+ * decrypt is NOT accepted -- corrupt ciphertext, a stale group key or a forged
+ * frame all fall through to the caller's existing log + annoy path.
+ *
+ * Parses with a NULL peer, i.e. without signature verification, mirroring
+ * Python's validate=False on the same path. Only the ADDRESS is stamped onto
+ * from_whom, exactly as the unknown-sender branch below does: public_identity_t
+ * carries heap members (operator_key_binding, zta_credential) that
+ * net_wire_msg_free does not release, so copying a whole peer struct over
+ * from_whom would leak them and alias the peer's own pointers.
+ *
+ * Frama-C: skipped — [serialization] net_message_from_wire + at_logging.
+ */
+static bool try_unencrypted_from_known_peer(net_thread_ctx_t *ctx,
+                                           const uint8_t *buf, size_t len,
+                                           const char *from_addr)
+{
+    net_wire_msg_t wmsg;
+    if (net_message_from_wire(buf, len, NULL, &wmsg) != 0)
+        return false;
+    if (wmsg.encrypt || !identity_verb_is_unencrypted(wmsg.function)) {
+        if (!wmsg.encrypt && wmsg.function != NULL)
+            log_warn(ctx->logger, "Refusing plaintext %s from known peer %s: "
+                     "not an unencrypted verb\n", wmsg.function, from_addr);
+        net_wire_msg_free(&wmsg);
+        return false;
+    }
+    snprintf(wmsg.from_whom.address, sizeof(wmsg.from_whom.address),
+             "%s", from_addr);
+    route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
+    net_wire_msg_free(&wmsg);
+    return true;
 }
 
 /* Frama-C: skipped —
@@ -1115,6 +1359,11 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
             }
             free(plain);
             net_wire_msg_free(&wmsg);
+        } else if (try_unencrypted_from_known_peer(ctx, inner_buf, inner_len,
+                                                   from_addr)) {
+            /* A verb this protocol sends in plaintext by design. Delivered, and
+             * deliberately NOT annoy-tracked: penalising it would have driven a
+             * well-behaved peer toward blacklist for following the protocol. */
         } else {
             log_error(ctx->logger, "Network: decrypt failed (%d) from peer %s\n",
                       dec, from_addr);
@@ -1166,8 +1415,8 @@ static void *peer_receiver_thread(void *arg)
             continue;
         }
 
-        char my_addr[ADDR_LEN + 1] = {0};
-        my_address(ctx->net_cfg, false, my_addr);
+        char my_addr[IPV6_ADDR_LEN] = {0};
+        my_address(ctx->net_cfg, false, my_addr, sizeof(my_addr));
         if (strcmp(from_addr, my_addr) == 0 || reject_message(from_addr)) {
             free(buf);
             continue;
@@ -1282,8 +1531,8 @@ static void *broadcast_receiver_thread(void *arg)
             continue;
         }
 
-        char my_addr[ADDR_LEN + 1] = {0};
-        my_address(ctx->net_cfg, false, my_addr);
+        char my_addr[IPV6_ADDR_LEN] = {0};
+        my_address(ctx->net_cfg, false, my_addr, sizeof(my_addr));
         if (strcmp(from_addr, my_addr) == 0 || reject_message(from_addr)) {
             free(buf);
             continue;
@@ -1314,8 +1563,8 @@ static void *group_receiver_thread(void *arg)
             continue;
         }
 
-        char my_addr[ADDR_LEN + 1] = {0};
-        my_address(ctx->net_cfg, false, my_addr);
+        char my_addr[IPV6_ADDR_LEN] = {0};
+        my_address(ctx->net_cfg, false, my_addr, sizeof(my_addr));
         if (strcmp(from_addr, my_addr) == 0 || reject_message(from_addr)) {
             free(buf);
             continue;
@@ -1485,7 +1734,10 @@ static int network_run(const net_transport_t *transport,
                        queue_id_t signal, logger_t *logger)
 {
     network_config_t *net_cfg = (network_config_t *)proc->conf.data_struct;
-    int port_num = net_cfg->port ? net_cfg->port : COMM_PORT;
+    net_port_source_t port_src = PORT_SRC_DEFAULT;
+    int port_num = net_port_resolve(net_cfg->port, &port_src, logger);
+    log_info(logger, "Network: base port %d from %s (group %d)\n",
+             port_num, net_port_source_name(port_src), port_num + 1);
 
     /* Extract identity before opening the transport — non-IP transports
      * (DTN) derive their local endpoint name from myself->uuid and need
@@ -1592,18 +1844,62 @@ static int network_run(const net_transport_t *transport,
                                               port_num, logger);
                     continue;
                 }
-                if (strcmp(nmsg->function, NET_FN_PING) == 0) {
-                    int count = PING_COUNT;
-                    if (nmsg->obj != NULL && nmsg->len == sizeof(int))
-                        count = *(const int *)nmsg->obj;
+                if (strcmp(nmsg->function, NET_FN_PING_AT) == 0) {
                     const char *ret_q = nmsg->return_to[0] != '\0'
                                          ? nmsg->return_to : "network";
-                    if (dispatch_ping_async(nmsg->to_whom.address, count,
-                                            ret_q, logger) != 0)
-                        log_warn(logger, "Network: ping dispatch failed for %s\n",
-                                 nmsg->to_whom.address);
+                    log_warn(logger,
+                             "Network: ping_at is unsupported in C, refusing "
+                             "request for %s (requester '%s')\n",
+                             nmsg->to_whom.address, ret_q);
+                    refuse_ping_at_unsupported(nmsg->to_whom.address, ret_q, logger);
                     continue;
                 }
+                /* Reputation communication cut-off enforcement. rep_proc's
+                 * _publish_exclusion feeds an exclude/readmit control message
+                 * carrying the peer's address (JSON string). An excluded
+                 * address's inbound frames are dropped (reject_message gate in
+                 * the ptp/group/any recv loops) and it is skipped as an
+                 * outbound target. Mirrors Python netprocess handle_exclude /
+                 * handle_readmit. Never leaves on the wire. */
+                if (strcmp(nmsg->function, NET_FN_EXCLUDE) == 0 ||
+                    strcmp(nmsg->function, NET_FN_READMIT) == 0) {
+                    json_t *body = NULL;
+                    char addr[ADDR_LEN + 1];
+                    addr[0] = '\0';
+                    if (net_msg_unpack_json(nmsg, &body) == 0 && body != NULL) {
+                        const char *a = json_string_value(body);
+                        if (a != NULL)
+                            snprintf(addr, sizeof(addr), "%s", a);
+                        json_decref(body);
+                    }
+                    if (addr[0] != '\0') {
+                        if (strcmp(nmsg->function, NET_FN_EXCLUDE) == 0) {
+                            blacklist_address(addr);
+                            log_info(logger,
+                                     "Network: reputation cut-off, excluding %s\n",
+                                     addr);
+                        } else {
+                            remove_rejected_address(addr);
+                            log_info(logger,
+                                     "Network: reputation readmit %s\n", addr);
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            /* Outbound-skip gate (reputation cut-off): never forward a
+             * targeted (unicast) message to an excluded peer. Broadcasts
+             * (empty to_whom) are unaffected — a receiver-side inbound-drop
+             * gate handles those. Mirrors Python netprocess's outbound-skip
+             * in the group-send / pseudo-multicast loops. */
+            if (nmsg->to_whom.address[0] != '\0' &&
+                reject_message(nmsg->to_whom.address)) {
+                log_debug(logger,
+                          "Network: outbound skip to excluded %s (%s.%s)\n",
+                          nmsg->to_whom.address, nmsg->process,
+                          nmsg->function ? nmsg->function : "?");
+                continue;
             }
 
             net_wire_msg_t wmsg = {0};
@@ -1622,6 +1918,13 @@ static int network_run(const net_transport_t *transport,
                 memcpy(&wmsg.from_whom, my_public, sizeof(public_identity_t));
             else
                 memcpy(&wmsg.from_whom, &nmsg->from_whom, sizeof(public_identity_t));
+            /* Carry our topology rank on the envelope (public_identity_t drops
+             * rank; `myself` is the full identity_t). from_whom is stamped self
+             * above, so the rank is self's — mirrors Python from_whom._rank on
+             * the wire. Fall back to whatever the sibling process set when we
+             * are relaying a non-self from_whom. */
+            wmsg.from_rank = (my_public != NULL && myself != NULL)
+                             ? myself->rank : nmsg->from_rank;
 
             bool is_broadcast = (nmsg->to_whom.address[0] == '\0');
             if (is_broadcast) {
@@ -1665,7 +1968,7 @@ static int network_run(const net_transport_t *transport,
             peers_write_lock(proc);
             bool appended = false;
             int snapshot_rtt = 0;  /* captured under lock for rtt fan-out */
-            if (new_peer->fullname[0] != '\0' &&
+            if (new_peer->nickname[0] != '\0' &&
                 proc->protocol.num_peers < MAX_PEERS) {
                 bool found = false;
                 for (size_t i = 0; i < proc->protocol.num_peers; i++) {
@@ -1698,7 +2001,7 @@ static int network_run(const net_transport_t *transport,
 
             if (appended) {
                 log_info(logger, "Network: added peer %s (%s)\n",
-                         new_peer->fullname, new_peer->address);
+                         new_peer->nickname, new_peer->address);
 
                 /* Push the freshly-computed rtt to sibling processes so their
                  * peer_rtt_ms[] arrays track net_proc's view. Local IPC only.
@@ -1716,6 +2019,9 @@ static int network_run(const net_transport_t *transport,
                  * decrypt-failure we keep it and compact via pointer
                  * move (no payload copy). */
                 pthread_mutex_lock(&deferred_lock);
+                /* Reclaim aged-out entries before the match pass so stale,
+                 * never-resolved mysteries don't linger across admissions. */
+                _deferred_sweep_stale_locked(_deferred_now_s());
                 size_t remaining = 0;
                 for (size_t di = 0; di < deferred_count; di++) {
                     deferred_msg_t *dm = deferred_messages[di];

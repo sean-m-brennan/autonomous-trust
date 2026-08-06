@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -54,6 +54,10 @@ ALL_PEERS = [NODE_A_IP, NODE_B_IP]
 CAST_PORT_OFFSET = 5  # avoids conflict with peer(+0), group(+1), ping(+2,+3), ntp(+4)
 RUNTIME = 90  # seconds
 STAGGER = 15  # seconds between node starts (lets Node A establish group first)
+
+# Match the framework's start method (AutonomousTrust defaults to forkserver):
+# the default 'fork' on Linux forks a multi-threaded process and risks deadlocks.
+MP_CTX = multiprocessing.get_context('forkserver')
 
 STAGES = [
     (1, 'Startup',        r'Ready\.'),
@@ -218,7 +222,7 @@ def test_two_node_protocol_stages(two_node_setup):
     # then start Node B after STAGGER seconds to avoid
     # group-key cross-adoption race.
     node_a = nodes['node_a']
-    proc_a = multiprocessing.Process(
+    proc_a = MP_CTX.Process(
         target=_run_node,
         args=(node_a['cfg_dir'], node_a['ip'], ALL_PEERS, RUNTIME, node_a['log_file']),
         daemon=True,
@@ -228,7 +232,7 @@ def test_two_node_protocol_stages(two_node_setup):
     time.sleep(STAGGER)
 
     node_b = nodes['node_b']
-    proc_b = multiprocessing.Process(
+    proc_b = MP_CTX.Process(
         target=_run_node,
         args=(node_b['cfg_dir'], node_b['ip'], ALL_PEERS, RUNTIME - STAGGER, node_b['log_file']),
         daemon=True,

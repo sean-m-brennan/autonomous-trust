@@ -4,7 +4,13 @@
 
 The network layer handles all wire communication between nodes. It provides three logical channels with different security properties, runs receiver threads for concurrent I/O, and routes messages between the network and internal process queues.
 
-## Communication Channels
+> This describes the Python `NetworkProcess`. The C implementation
+> (`src/c/autonomous_trust/network/`) implements the **same wire protocol**, and
+> C and Python nodes interoperate on the same network: provided both sides use
+> the DRY canonical JSON wire form for identity/group payloads (see
+> [Native / FFI Dual Implementation](native-ffi-dual-implementation.md) §6).
+
+## Communication channels
 
 | Channel | Transport | Encryption | Use Case |
 |---------|-----------|------------|----------|
@@ -12,19 +18,58 @@ The network layer handles all wire communication between nodes. It provides thre
 | **Encrypted group** | UDP to each group member (port N+1) | NaCl SecretBox (shared group key) | Proposals, votes, confirmations, history diffs, Paxos consensus |
 | **Encrypted peer-to-peer** | UDP (or TCP) to individual peer (port N) | NaCl Box (sender private + recipient public) | History transfer, task negotiation, reputation messages |
 
-## Socket Layout
+## Socket layout
 
 The `UDPNetworkProcess` binds three UDP sockets:
 
 | Socket | Address | Port | Purpose |
 |--------|---------|------|---------|
-| `recv_ptp_sock` | Node IP | N (default 27787) | Peer-to-peer receive |
+| `recv_ptp_sock` | Node IP | N | Peer-to-peer receive |
 | `recv_grp_sock` | Node IP | N+1 | Group receive |
 | `recv_cast_sock` | Broadcast/multicast addr | N | Open broadcast receive |
 
-The `TCPNetworkProcess` extends this by replacing peer and group UDP with TCP (using `listen`/`accept`), while keeping UDP for broadcast/multicast. TCP uses `[length]\|[data]` framing for reliable delivery.
+### Where N comes from
 
-## Wire Message Format
+N is resolved once per node, from three layers in order:
+
+1. the provisioned config's `port` (a config always wins),
+2. the `AT_COMM_PORT` environment variable (operator override, applied only
+   where the config is silent),
+3. the compile-time default, 27787.
+
+C: `net_port_resolve()` (`network/network.h`), logged at startup with the layer
+that supplied it. Python: `system.resolve_comm_port()`. Both refuse a value that
+is unparseable or outside [1024, 65534], keeping the default rather than
+yielding 0, which would take an ephemeral port and leave the node where no peer
+looks. The upper bound leaves room for the derived N+1. The two implementations
+are held to the same table by the `network/port-resolution` conformance case.
+
+The config generator records `port` only when the operator asked for one, so a
+provisioned root does not pin every node to one port.
+
+**Two nodes on one host** therefore need only different `AT_COMM_PORT` values,
+or different addresses. Same base *and* same address is a silent failure, not a
+loud one: `SO_REUSEADDR` is set on every bind, so both succeed and the last
+binder receives everything (see `ISSUES.md`).
+
+Python derives two further ports from the same base: `ping_at_rcv` = N+2 and
+`ping_at_snd` = N+3. C has no counterpart: it implements neither.
+
+**PingAT is not ICMP.** It asks whether an *AT peer* is present and answering on
+AT's own ports via a cooperating responder (`PingATServer`); `ping(8)` asks
+whether a *host* is reachable. A host can answer ICMP with no AT process running
+at all, and an AT node can be present while ICMP is filtered, so the two answer
+different questions. The name says which one this is. PingAT is
+non-load-bearing: a missed reply costs a latency sample and changes no AT
+behaviour.
+
+There is no NTP port. AT carries no NTP implementation on either side; a stock
+daemon on the host disciplines the clock and AT only reads what it achieved
+(see [Node Lifecycle](node-lifecycle.md#clock-discipline)).
+
+The `TCPNetworkProcess` extends this by replacing peer and group UDP with TCP (using `listen`/`accept`), while keeping UDP for broadcast/multicast. TCP uses `[length]\|[data]` framing for reliable delivery. By default it opens one connection per message; it can optionally reuse one connection per peer for many messages, described in [TCP Connection Pooling](network-connection-pooling.md).
+
+## Wire message format
 
 Messages are serialized as pipe-delimited strings:
 
@@ -38,7 +83,7 @@ process|function|data
 
 For encrypted channels, the entire serialized string is encrypted before transmission.
 
-## Receiver Threads
+## Receiver threads
 
 `NetworkProcess.process()` starts four daemon threads:
 
@@ -47,11 +92,11 @@ For encrypted channels, the entire serialized string is encrypted before transmi
 | **peer_receiver** | `peer_receiver()` | Peer socket | Appends `(raw_msg, from_addr)` to `peer_messages` |
 | **group_receiver** | `group_receiver()` | Group socket | Appends to `group_messages` |
 | **unknown_receiver** | `unknown_receiver()` | Broadcast socket | Appends to `unknown_messages` |
-| **mystery_handler** | `mystery_handler()` | -- | Retries encrypted messages from unknown peers |
+| **mystery_handler** | `mystery_handler()` |, | Retries encrypted messages from unknown peers |
 
 The mystery handler exists because during bootstrapping, encrypted messages may arrive before the sender's identity is known. It holds these messages and retries decryption periodically (up to 30 seconds) as peers are discovered.
 
-## Send-Side Message Routing
+## Send-side message routing
 
 When a process places a `Message` on the network queue, `NetworkProcess` routes it based on `message.to_whom`:
 
@@ -59,7 +104,7 @@ When a process places a `Message` on the network queue, `NetworkProcess` routes 
 flowchart TD
     Start["Message from<br/>process queue"] --> Special{"Special<br/>message?"}
     Special -- "stats_req" --> Stats["Return net stats<br/>to sender"]
-    Special -- "ping" --> Ping["ICMP ping<br/>target host"]
+    Special -- "ping_at" --> Ping["Python: ping the AT peer<br/>C: reply {error: unsupported}"]
     Special -- "no" --> Broadcast{"to_whom ==<br/>broadcast?"}
     Broadcast -- "yes" --> SendAny["send_any()<br/>UDP broadcast/multicast<br/>unencrypted"]
     Broadcast -- "no" --> GroupCheck{"to_whom is<br/>Group?"}
@@ -76,7 +121,7 @@ flowchart TD
     PeerPlain --> SendPeer
 ```
 
-## Receive-Side Message Processing
+## Receive-side message processing
 
 The main loop processes one message from each receive queue per tick:
 
@@ -111,7 +156,7 @@ flowchart TD
     end
 ```
 
-## Queue Dispatch
+## Queue dispatch
 
 After decryption, `_msg_to_queue()` parses the wire format and routes the resulting `Message` to the correct process queue:
 
@@ -121,7 +166,7 @@ After decryption, `_msg_to_queue()` parses the wire format and routes the result
 
 If the process name is not recognized, the message is logged and dropped.
 
-## Pest Tracking
+## Pest tracking
 
 Peers that send invalid encrypted messages (returning `None` from decryption but with a known address) are tracked in a `pests` dict. After exceeding `annoy_limit` (5) failed messages, the peer is demoted in the hierarchy.
 

@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2024 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -51,13 +51,17 @@ int signature_init(signature_t *sig, const unsigned char *hex_seed, size_t hex_l
 /* Frama-C: skipped — [solver-timeout] libsodium stub preconditions */
 unsigned char *signature_publish(const signature_t *sig)
 {
-    unsigned char *hex = malloc(crypto_sign_PUBLICKEYBYTES * 2);
+    /* public_hex is NUL-terminated ([... * 2 + 1]); copy the terminator too
+     * so callers that treat the result as a C string (json_string in
+     * public_identity_to_json) read exactly the 64 hex chars rather than
+     * over-running into the heap. Length-passing callers are unaffected. */
+    unsigned char *hex = malloc(crypto_sign_PUBLICKEYBYTES * 2 + 1);
     if (hex == NULL)
     {
         EXCEPTION(ENOMEM);
         return NULL;
     }
-    memcpy(hex, sig->public_hex, crypto_sign_PUBLICKEYBYTES * 2);
+    memcpy(hex, sig->public_hex, crypto_sign_PUBLICKEYBYTES * 2 + 1);
     return hex;
 }
 

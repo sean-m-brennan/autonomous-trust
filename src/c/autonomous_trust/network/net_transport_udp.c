@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -37,6 +37,7 @@
 #include "net_transport_priv.h"
 #include "utilities/exception.h"
 #include "utilities/socket_helpers.h"
+#include "utilities/util.h"
 #include "network/network.h"
 
 /* Whether to use mcast for the bcast channel vs. IPv4 broadcast. Matches
@@ -119,11 +120,16 @@ static int udp_open_common(net_transport_ctx_t **out_ctx,
 
     char addr_buf[IPV6_ADDR_LEN] = {0};
     if (ipv6) {
-        cidr_split((char *)params->net_cfg->ip6_cidr, addr_buf, NULL);
+        cidr_split((char *)params->net_cfg->ip6_cidr, addr_buf,
+                   sizeof(addr_buf), NULL, 0);
     } else {
-        cidr_split((char *)params->net_cfg->ip4_cidr, addr_buf, NULL);
+        cidr_split((char *)params->net_cfg->ip4_cidr, addr_buf,
+                   sizeof(addr_buf), NULL, 0);
     }
     const char *address = (addr_buf[0] != '\0') ? addr_buf : NULL;
+    /* Cache for the send paths, so a frame's source address is the one we are
+     * listening on and peers can attribute it. */
+    at_strlcpy(ctx->local_addr, addr_buf, sizeof(ctx->local_addr));
 
     int port = params->port_base;
     int grp_port = port + 1;
@@ -196,6 +202,10 @@ static int udp_send_unicast(net_transport_ctx_t *ctx,
         return SYS_EXCEPTION();
     int one = 1;
     setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
+    /* Transmit FROM the address peers know us by, else they cannot attribute
+     * the frame. Non-fatal: send anyway if it could not be pinned. */
+    (void)net_transport_ip_bind_source(sock, ctx->local_addr, ctx->cfg.domain,
+                                       false, ctx->logger);
     int ret = udp_send(sock, wire, wire_len, target, port, ctx->ipv6, ctx->logger);
     close(sock);
     return ret;
@@ -235,6 +245,11 @@ static int udp_send_broadcast(net_transport_ctx_t *ctx, net_channel_t channel,
         return SYS_EXCEPTION();
     int one = 1;
     setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
+    /* Also what makes our own broadcast recognisable as ours: the receive path
+     * discards a frame whose source matches this node, and we receive our own
+     * broadcast on the cast socket. */
+    (void)net_transport_ip_bind_source(sock, ctx->local_addr, ctx->cfg.domain,
+                                       false, ctx->logger);
     int ret = udp_send(sock, wire, wire_len, target, port, ctx->ipv6, ctx->logger);
     close(sock);
     return ret;

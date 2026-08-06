@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -180,18 +180,22 @@ class TestCompromiseDetection:
         )
 
     def test_pressure_flatlines_after_onset(self):
-        # Pressure random-walks normally; the rogue freezes at onset.
+        # Pressure random-walks normally; the rogue freezes at onset (240s).
         roster = self.roster
-        rogue_vals: list[float] = []
+        # Window by simulated time, not by list index: the emission cadence
+        # (AT_STREAM_CADENCE_SEC, default 3s) means far fewer than one reading
+        # per tick, so index-based slicing put the whole run in the pre-onset
+        # bucket and left post empty. Onset is 240s; keep a buffer around it.
+        rogue_vals: list[tuple[int, float]] = []  # (ts, value)
         for ts in range(0, 400):
             t = timedelta(seconds=ts)
             for g in roster['noaa-3']:
                 r = g.tick(t)
                 if r and r.data_type == TYPE_PRESSURE:
-                    rogue_vals.append(r.value)
+                    rogue_vals.append((ts, r.value))
 
-        pre = [v for i, v in enumerate(rogue_vals) if i < 200]
-        post = [v for i, v in enumerate(rogue_vals) if i >= 240]
+        pre = [v for ts, v in rogue_vals if ts < 200]
+        post = [v for ts, v in rogue_vals if ts >= 240]
         assert pre and post
         # Post-onset stddev should be effectively zero (flatline).
         assert statistics.pstdev(post) < 0.005, (
@@ -289,18 +293,21 @@ class TestComposeAndK8sGeneration:
             generate_k8s_manifests,
         )
         files = generate_k8s_manifests(DisasterResponseScenario())
-        # Per-agency + scenario config + namespace + inspector
+        # Per-agency + scenario config + namespace + coordinator
         expected = {"noaa.yaml", "usgs.yaml", "fema.yaml", "epa.yaml",
                     "scenario-config.yaml", "namespace.yaml",
-                    "inspector.yaml"}
+                    "coordinator.yaml"}
         assert set(files.keys()) == expected
         assert "disaster-response-scenario" in files["scenario-config.yaml"]
-        # Inspector manifest must carry both Deployment and NodePort Service.
-        ins = files["inspector.yaml"]
+        # Coordinator manifest must carry both Deployment and NodePort Service.
+        ins = files["coordinator.yaml"]
         assert "kind: Deployment" in ins
         assert "kind: Service" in ins
         assert "type: NodePort" in ins
-        assert "name: multi-agency-inspector" in ins
+        assert "name: multi-agency-coordinator" in ins
+        # It hosts the dashboard via the coordinator module, not the
+        # standalone `-m examples.multi_agency` inspector.
+        assert "examples.multi_agency.coordinator" in ins
 
     def test_compose_scenario_export_is_json(self):
         # The compose generator writes a scenario.json the dashboard reads;
@@ -336,8 +343,11 @@ class TestPlaybackEngine:
         assert "COMPROMISE_START" in seen
 
     def test_record_and_replay_roundtrip(self):
+        from unittest import mock
+
+        from autonomous_trust.evaluation.scenarios import playback_engine as pe_mod
         from autonomous_trust.evaluation.scenarios.playback_engine import (
-            PlaybackEngine,
+            PlaybackEngine, PlaybackMode,
         )
         from autonomous_trust.evaluation.scenarios.recording import (
             EventRecorder,
@@ -354,12 +364,26 @@ class TestPlaybackEngine:
             path = fh.name
         try:
             rec.save(path, scenario=s)
-            # Fresh scenario + engine, replay into it
+            # Replay the *recording* into a fresh scenario. In PLAYBACK mode
+            # load_recorded buffers the events and tick() drains them as
+            # scenario time advances -- the scripted timeline is suppressed, so
+            # whatever lands in `replayed` came from the recorded stream, not a
+            # re-run of s2. tick() is wall-clock driven, so we control the
+            # engine's monotonic clock to advance deterministically past the
+            # recording's extent in a single tick.
             s2 = DisasterResponseScenario()
-            engine2 = PlaybackEngine(s2)
+            engine2 = PlaybackEngine(s2, mode=PlaybackMode.PLAYBACK)
             replayed: list[str] = []
             engine2.on_event(lambda ev, t: replayed.append(ev.event_type.name))
             engine2.load_recorded(path)
+
+            clock = {"t": 1000.0}
+            with mock.patch.object(pe_mod.time, "monotonic",
+                                   lambda: clock["t"]):
+                engine2.play()             # anchors _last_wall at 1000
+                clock["t"] += 100_000.0    # jump past the recording's extent
+                engine2.tick()             # drains all deferred events
+
             assert replayed
             assert "COMPROMISE_START" in replayed
             assert "PEER_EXCLUDE" in replayed

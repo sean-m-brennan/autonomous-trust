@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -359,8 +359,12 @@ static void _broadcast_verification(process_t *proc, const uuid_t peer_uuid,
     memcpy(msg.info.zta_event.voucher_uuid, zta_state.self_uuid, sizeof(uuid_t));
     memcpy(msg.info.zta_event.credential_hash, result->credential_hash, ZTA_HASH_LEN);
     msg.info.zta_event.status = (int)result->status;
+    /* reason[ZTA_REASON_LEN=256] -> the narrower wire field; bound the
+     * conversion width to the destination so the (intentional) truncation is
+     * explicit and -Wformat-truncation is satisfied. */
     snprintf(msg.info.zta_event.reason, sizeof(msg.info.zta_event.reason),
-             "%s", result->reason);
+             "%.*s", (int)(sizeof(msg.info.zta_event.reason) - 1),
+             result->reason);
 
     messaging_send("network", NET_MESSAGE, &msg, false);
 
@@ -729,14 +733,19 @@ static bool _handle_rep_response(const process_t *proc, directory_t *queues,
 int zta_process_run(process_t *proc, directory_t *queues,
                     queue_id_t signal, logger_t *logger)
 {
-    /* Look up ZTA policy from configs */
+    /* Look up ZTA policy from configs. Values are object_ptr_data(config_t)
+     * (load_all_configs), so unwrap data_t -> config_t -> data_struct rather
+     * than casting the data_t wrapper directly to the policy struct. */
     data_t *policy_data = NULL;
+    config_t *policy_cfg = NULL;
     char zta_key[] = "zta_policy";
-    if (map_get(proc->configs, zta_key, &policy_data) != 0 || !policy_data) {
+    if (map_get(proc->configs, zta_key, &policy_data) != 0 || !policy_data
+        || data_object_ptr(policy_data, (void **)&policy_cfg) != 0
+        || policy_cfg == NULL || policy_cfg->data_struct == NULL) {
         log_info(logger, "ZTA: no policy configured, process exiting\n");
         return 0;
     }
-    zta_state.policy = (zta_policy_t *)policy_data;
+    zta_state.policy = (zta_policy_t *)policy_cfg->data_struct;
 
     /* Resolve our own identity UUID for signing broadcast messages */
     {
@@ -771,7 +780,7 @@ int zta_process_run(process_t *proc, directory_t *queues,
 
     /* Init audit log */
     char data_dir[CFG_PATH_LEN];
-    get_data_dir(data_dir);
+    get_data_dir(data_dir, sizeof(data_dir));
     char audit_path[CFG_PATH_LEN + 32];
     snprintf(audit_path, sizeof(audit_path), "%s/zta_audit.jsonl", data_dir);
     if (zta_audit_init(&zta_state.audit, audit_path) != 0) {

@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -494,7 +494,7 @@ static bool handle_start_task(const process_t *proc, directory_t *queues, generi
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_info(proc->logger, "Negotiation: start task from %s\n", nmsg->from_whom.fullname);
+    log_info(proc->logger, "Negotiation: start task from %s\n", nmsg->from_whom.nickname);
 
     pthread_mutex_lock(&neg_state.lock);
 
@@ -604,7 +604,7 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_info(proc->logger, "Negotiation: invitation from %s\n", nmsg->from_whom.fullname);
+    log_info(proc->logger, "Negotiation: invitation from %s\n", nmsg->from_whom.nickname);
 
     /* Deserialize task from payload */
     json_t *j = NULL;
@@ -819,7 +819,7 @@ static bool handle_haggle(const process_t *proc, directory_t *queues, generic_ms
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Negotiation: haggle response from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Negotiation: haggle response from %s\n", nmsg->from_whom.nickname);
 
     /* Deserialize counter-offer task from payload */
     json_t *j = NULL;
@@ -962,7 +962,7 @@ static bool handle_refuse(const process_t *proc, directory_t *queues, generic_ms
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_info(proc->logger, "Negotiation: refused by %s\n", nmsg->from_whom.fullname);
+    log_info(proc->logger, "Negotiation: refused by %s\n", nmsg->from_whom.nickname);
 
     pthread_mutex_lock(&neg_state.lock);
 
@@ -1022,7 +1022,7 @@ static bool handle_accept(const process_t *proc, directory_t *queues, generic_ms
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_info(proc->logger, "Negotiation: accepted by %s\n", nmsg->from_whom.fullname);
+    log_info(proc->logger, "Negotiation: accepted by %s\n", nmsg->from_whom.nickname);
 
     pthread_mutex_lock(&neg_state.lock);
 
@@ -1102,7 +1102,7 @@ static bool handle_stat_req(const process_t *proc, directory_t *queues, generic_
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Negotiation: status request from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Negotiation: status request from %s\n", nmsg->from_whom.nickname);
 
     /* Extract task UUID from payload */
     json_t *j = NULL;
@@ -1171,7 +1171,7 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_debug(proc->logger, "Negotiation: status response from %s\n", nmsg->from_whom.fullname);
+    log_debug(proc->logger, "Negotiation: status response from %s\n", nmsg->from_whom.nickname);
 
     pthread_mutex_lock(&neg_state.lock);
 
@@ -1212,7 +1212,7 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
                     log_error(proc->logger,
                               "Negotiation: clock synchronization error "
                               "with %s (task %s still pending)\n",
-                              nmsg->from_whom.fullname, task_uuid_str);
+                              nmsg->from_whom.nickname, task_uuid_str);
 
                 /* Confirmation-prereq guard (C11) — only extend timeout
                  * for peers that have ack'd this task. Mirrors Python's
@@ -1263,7 +1263,7 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
                               "Negotiation: task %s active (status=%d), "
                               "extending timeout by %lds (peer %s)\n",
                               task_uuid_str, (int)status, extend,
-                              nmsg->from_whom.fullname);
+                              nmsg->from_whom.nickname);
 
                     /* Drop the matching task uuid from status_pending —
                      * Python does `self.status_pending.remove(task)` so
@@ -1288,7 +1288,7 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
                     log_debug(proc->logger,
                               "Negotiation: stat_resp from unconfirmed peer "
                               "%s for task %s — not extending timeout\n",
-                              nmsg->from_whom.fullname, task_uuid_str);
+                              nmsg->from_whom.nickname, task_uuid_str);
                 }
                 break;
             }
@@ -1358,7 +1358,7 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
-    log_info(proc->logger, "Negotiation: results from %s\n", nmsg->from_whom.fullname);
+    log_info(proc->logger, "Negotiation: results from %s\n", nmsg->from_whom.nickname);
 
     pthread_mutex_lock(&neg_state.lock);
 
@@ -1423,7 +1423,7 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
                     result_msg.info.task_result.result_data = (uint8_t *)result_data;
                     result_msg.info.task_result.result_len  = result_len;
 
-                    messaging_send("main", TASK_RESULT, &result_msg, false);
+                    messaging_send(AT_MAIN_QUEUE, TASK_RESULT, &result_msg, false);
 
                     /* Clean up tracker entry */
                     map_remove(&neg_state.my_tasks, task_uuid_str);
@@ -1634,7 +1634,7 @@ static bool handle_tier_lost(const process_t *proc, directory_t *queues, generic
                           orig_task->requestor_uuid);
                 cancel_msg.info.task_result.result_data = NULL;
                 cancel_msg.info.task_result.result_len  = 0;
-                messaging_send("main", TASK_RESULT, &cancel_msg, false);
+                messaging_send(AT_MAIN_QUEUE, TASK_RESULT, &cancel_msg, false);
 
                 map_remove(mt, task_uuid_str);
                 task_tracker_free(tracker);

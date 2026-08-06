@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -129,5 +129,8 @@ def reputation_compute(history: TransactionHistory, reputations: Reputations,
     """
     self_buf = ffi.new('unsigned char[16]', self_uuid.bytes)
     peer_buf = ffi.new('unsigned char[16]', peer_uuid.bytes)
+    # 5th arg is task_weights (const map_t *); NULL = unweighted aggregator.
+    # Omitting it left the C function reading a garbage pointer and segfaulting
+    # on the pure-reputation branch (trusted peer). Mirror the no-weights call.
     return lib.reputation_compute(history._ptr, reputations._ptr,
-                                  self_buf, peer_buf)
+                                  self_buf, peer_buf, ffi.NULL)

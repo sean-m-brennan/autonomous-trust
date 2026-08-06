@@ -1,3 +1,19 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+# ******************
+
 """Live Dash server for the DoD mission coordinator.
 
 Spawns a minimal Dash app on port 8050 in a daemon thread so the
@@ -17,6 +33,8 @@ render empty traces with their axes + threshold lines.
 from __future__ import annotations
 
 import logging
+import os
+import queue
 import threading
 from typing import Any, Callable, Optional
 
@@ -34,8 +52,41 @@ from autonomous_trust.inspector.dashboard.narration import (
     NarrationBlock, NarrationOverlay, STYLE_COLORS,
 )
 
+# Pure pause/auto-pause state machine, kept in a Dash-free sibling module so
+# the logic is unit-testable without standing up a server.
+try:
+    from .pause_control import apply_pause_click, auto_pause
+except ImportError:  # imported as a top-level module rather than a package
+    from pause_control import apply_pause_click, auto_pause
+
 
 _TICK_MS = 1000
+
+# The Tactical Map is refreshed by its OWN Interval + callback, decoupled from
+# the main _refresh tick that drives every other panel. This stops the map and
+# the rest of the dashboard from forcing each other to re-serialize + redraw on
+# the same heartbeat (the source of the "choppy" feel), and lets the heavier 3D
+# isometric view tick more slowly when desired. Defaults to the main cadence;
+# raise AT_DASH_MAP_TICK_MS (e.g. 2000) to ease load during the iso view.
+_MAP_TICK_MS = int(os.environ.get("AT_DASH_MAP_TICK_MS", str(_TICK_MS)))
+
+# Fixed Tactical-Map width (px). The map panel renders at this width in both 2D
+# and iso modes; the trust/noise charts pin to it (see _refresh). Mirrors the
+# "900px" left column in the layout grid.
+_MAP_W = 900
+
+# Bound the dashboard's HTTP worker threads. Werkzeug's dev server (what
+# Dash's app.run uses) spawns one *unbounded* thread per request; the
+# dashboard polls every tick (status bar, every chart, the reputations
+# table, plus the peer-detail iframe reloading its srcDoc), and it runs in
+# the same process as the AutonomousTrust core (already thread/process
+# heavy). Under sustained polling those request threads pile up faster than
+# they retire and the process hits its thread limit:
+#   RuntimeError: can't start new thread
+# A fixed pool caps concurrency — its queue absorbs bursts instead of
+# minting a thread per request. The dashboard is low-concurrency (a handful
+# of viewers), so a small pool is ample. Override via AT_DASH_HTTP_THREADS.
+_SERVER_THREADS = int(os.environ.get("AT_DASH_HTTP_THREADS", "8"))
 
 
 def _narration_div(block: Optional[NarrationBlock]) -> Any:
@@ -220,6 +271,9 @@ def make_app(name: str, title: str,
              narration_script: Optional[list[NarrationBlock]] = None,
              presentation_default: bool = True,
              peer_names: Optional[list[str]] = None,
+             default_peer: Optional[str] = None,
+             start_paused: bool = False,
+             auto_pause_before_narration: bool = False,
              ) -> dash.Dash:
     """Construct the Dash app.
 
@@ -239,6 +293,17 @@ def make_app(name: str, title: str,
     "Presentation" + "Fullscreen" toggle pair in the status bar.  The
     state provider should include a ``t_seconds`` key (scenario seconds,
     float) so narration can advance with the demo clock.
+
+    Pause control (presentations): a "Pause/Resume" button lets the
+    operator freeze the demo at any time.  Freezing means ``_refresh``
+    stops calling ``state_provider`` — for canned playback that halts the
+    recording clock (``PlaybackInterface.tick`` is no longer invoked) and
+    holds every panel as-is.  ``auto_pause_before_narration`` (opt-in;
+    OFF by default so the live coordinator dashboard runs freely) makes the
+    demo freeze itself the moment the clock first reaches the earliest
+    narration block, so the operator can finish bringing the dashboard up and
+    then click Resume to start the narrative on cue — intended for canned
+    playback, where ``__main__`` enables it.  ``start_paused`` opens frozen.
     """
     timeline: TrustTimeline = panels["trust_timeline"]
     # Chart-shaped panels — see make_app docstring for the duck-typed
@@ -249,6 +314,18 @@ def make_app(name: str, title: str,
 
     overlay = (NarrationOverlay(narration_script)
                if narration_script else None)
+
+    # Auto-pause cue: the earliest narration block's start time. When set,
+    # the demo freezes itself the first time the clock reaches it (so the
+    # operator hits Resume to launch the narrative). None disables it.
+    narration_start_t: Optional[float] = (
+        min((b.t_start for b in narration_script), default=None)
+        if (narration_script and auto_pause_before_narration) else None)
+    # Latest state snapshot, refreshed only while running. The peer-detail
+    # drawer reads this instead of calling state_provider() itself, so the
+    # recording clock advances exactly once per tick and a frozen demo stays
+    # frozen even with a drawer open.
+    _latest_state: dict[str, Any] = {}
 
     app = dash.Dash(name, title=title, update_title=None)
 
@@ -261,6 +338,16 @@ def make_app(name: str, title: str,
         # fullscreen toggle has somewhere to keep its state.
         dcc.Store(id="presentation-mode",
                   data={"on": bool(presentation_default)}),
+        # Pause state for the demo clock. "paused" freezes _refresh;
+        # "auto_done" latches once auto-pause-before-narration has fired (or
+        # the operator has taken manual control) so it never re-fires.
+        dcc.Store(id="playback-paused",
+                  data={"paused": bool(start_paused),
+                        "auto_done": bool(start_paused)}),
+        # Tactical-Map view mode: "2d" (default MapLibre top-down) or "iso"
+        # (3D orthographic terrain). The map callback threads this into the
+        # panel's set_view_mode each tick.
+        dcc.Store(id="tactical-view-mode", data={"mode": "2d"}),
         html.Div(
             id="control-bar",
             style={"display": "flex" if narration_script else "none",
@@ -289,6 +376,30 @@ def make_app(name: str, title: str,
                                    "border": "1px solid #334155",
                                    "borderRadius": "4px",
                                    "cursor": "pointer"}),
+                # Pause/Resume freezes the demo clock (see _refresh). Label
+                # reflects the action the click performs.
+                html.Button("▶ Resume" if start_paused else "⏸ Pause",
+                            id="pause-toggle",
+                            n_clicks=0,
+                            style={"padding": "4px 12px",
+                                   "background": "#1E293B",
+                                   "color": "#E2E8F0",
+                                   "border": "1px solid #334155",
+                                   "borderRadius": "4px",
+                                   "cursor": "pointer",
+                                   "minWidth": "92px"}),
+                # Tactical-Map view toggle: top-down 2D <-> 3D isometric
+                # terrain. Label reflects the view the click switches TO.
+                html.Button("◢ Isometric View",
+                            id="view-toggle",
+                            n_clicks=0,
+                            style={"padding": "4px 12px",
+                                   "background": "#1E293B",
+                                   "color": "#E2E8F0",
+                                   "border": "1px solid #334155",
+                                   "borderRadius": "4px",
+                                   "cursor": "pointer",
+                                   "minWidth": "128px"}),
                 html.Span(id="presentation-status",
                           style={"color": "#94A3B8",
                                  "fontSize": "11px",
@@ -311,8 +422,39 @@ def make_app(name: str, title: str,
             # Left column: the square Target-position map + its HTML legend,
             # with the reputations table and event log beneath it.
             html.Div(children=[
-                *([dcc.Graph(id=chart_graph_ids[0],
-                             config={"displayModeBar": False}),
+                *([html.Div(
+                       # Relative wrapper so the cursor lat/lon readout can
+                       # be absolutely positioned over the bottom-left of
+                       # the map. The readout is driven entirely client-side
+                       # (see the map-coord clientside callback below) by the
+                       # underlying MapLibre map's mousemove; it freezes
+                       # (dims) on mouseout.
+                       style={"position": "relative"},
+                       children=[
+                           dcc.Graph(id=chart_graph_ids[0],
+                                     config={"displayModeBar": False}),
+                           html.Div(
+                               id="map-coord-readout",
+                               children="lat —   lon —",
+                               style={
+                                   "position": "absolute",
+                                   "left": "12px",
+                                   "bottom": "12px",
+                                   "zIndex": 1000,
+                                   "padding": "3px 8px",
+                                   "background": "rgba(11,18,32,0.78)",
+                                   "border": "1px solid #334155",
+                                   "borderRadius": "4px",
+                                   "color": "#E2E8F0",
+                                   "font": "12px/1.2 ui-monospace, "
+                                           "SFMono-Regular, Menlo, monospace",
+                                   "whiteSpace": "nowrap",
+                                   # Selectable so the frozen value can be
+                                   # copied; moving onto the chip leaves the
+                                   # map canvas, which freezes the readout.
+                                   "userSelect": "text",
+                               }),
+                       ]),
                    # External legend for the map panel — a sibling div so
                    # CSS controls its horizontal layout (see
                    # _render_map_legend / TargetPositionMapPanel.legend_groups).
@@ -335,9 +477,13 @@ def make_app(name: str, title: str,
             html.Div(children=[
                 dcc.Graph(id="timeline-graph",
                           config={"displayModeBar": False}),
+                # Each chart may expose its own dcc.Graph ``config`` (the Trust
+                # Network opts into a pan/zoom modebar); default is a bare graph
+                # with no modebar, as before.
                 *[dcc.Graph(id=gid,
-                            config={"displayModeBar": False})
-                  for gid in chart_graph_ids[1:]],
+                            config=(getattr(chart, "graph_config", None)
+                                    or {"displayModeBar": False}))
+                  for gid, chart in zip(chart_graph_ids[1:], charts[1:])],
                 # Stretch Goal 2 / Phase 4: peer-detail drawer slot.
                 # Rendered as a self-contained HTML document inside an
                 # Iframe so the drawer's <details>/<svg>/<style>
@@ -348,12 +494,21 @@ def make_app(name: str, title: str,
                     id="peer-selector",
                     options=[{"label": p, "value": p}
                              for p in (peer_names or [])],
+                    # Default the drawer to a specific peer (e.g. the rq86-1
+                    # gateway) when caller asks AND it's a known peer; else
+                    # leave empty with the placeholder.
+                    value=(default_peer
+                           if default_peer and default_peer in (peer_names or [])
+                           else None),
                     placeholder=("(select a peer)" if peer_names
                                  else "(no peers known)"),
                     clearable=True,
                     style={"marginBottom": "8px", "color": "#0F172A"},
                 ),
-                dcc.Store(id="selected-peer-name", data=None),
+                dcc.Store(id="selected-peer-name",
+                          data=(default_peer
+                                if default_peer and default_peer in (peer_names or [])
+                                else None)),
                 html.Iframe(
                     id="peer-detail",
                     srcDoc="",
@@ -366,7 +521,19 @@ def make_app(name: str, title: str,
         ]),
         html.Div(id="narration-overlay",
                  style={"visibility": presentation_visible_initially}),
+        # Dummy sink for the map cursor-readout clientside callback (the
+        # callback only installs DOM listeners; it never feeds Dash state).
+        dcc.Store(id="map-coord-hook"),
+        # True while the operator is dragging the map (rotate/zoom). A
+        # clientside listener sets it on mousedown/wheel and clears it on
+        # release; _refresh_map skips routine re-renders while it's true so the
+        # interaction stays smooth. Dummy sink for that listener-installer.
+        dcc.Store(id="map-interacting", data={"dragging": False}),
+        dcc.Store(id="map-drag-hook"),
         dcc.Interval(id="tick", interval=_TICK_MS, n_intervals=0),
+        # Dedicated cadence for the Tactical Map, decoupled from the main tick
+        # so the map and the other panels don't force mutual redraws.
+        dcc.Interval(id="map-tick", interval=_MAP_TICK_MS, n_intervals=0),
     ]
     app.layout = html.Div(
         style={"backgroundColor": "#0F172A",
@@ -378,27 +545,68 @@ def make_app(name: str, title: str,
     )
 
     chart_outputs = [Output(gid, "figure") for gid in chart_graph_ids]
+    # The Tactical Map (chart-0) is driven by its own callback/Interval (see
+    # _refresh_map below); _refresh owns every OTHER chart.
+    _non_map_chart_outputs = chart_outputs[1:]
+
+    # Count of data-panel outputs preceding the pause store/button, used to
+    # size the "freeze" return (everything held with dash.no_update). One fewer
+    # than charts because the map output now lives in its own callback.
+    _n_data_outputs = 6 + len(charts)
 
     @app.callback(
         Output("status-bar", "children"),
         Output("timeline-graph", "figure"),
-        *chart_outputs,
+        *_non_map_chart_outputs,
         Output("map-legend", "children"),
         Output("reputations", "children"),
         Output("event-log", "children"),
         Output("narration-overlay", "children"),
         Output("narration-overlay", "style"),
+        Output("playback-paused", "data"),
+        Output("pause-toggle", "children"),
         Input("tick", "n_intervals"),
+        Input("pause-toggle", "n_clicks"),
         State("presentation-mode", "data"),
+        State("playback-paused", "data"),
     )
-    def _refresh(_n, presentation_data):
+    def _refresh(_n, _pause_clicks, presentation_data, paused_data):
+        paused_data = dict(paused_data or {})
+        is_paused = bool(paused_data.get("paused"))
+        auto_done = bool(paused_data.get("auto_done"))
+
+        # A click on the Pause/Resume button toggles the frozen state.
+        clicked = dash.callback_context.triggered_id == "pause-toggle"
+        is_paused, auto_done = apply_pause_click(clicked, is_paused, auto_done)
+
+        # Frozen: don't call state_provider() (which would advance the
+        # recording clock) and hold every data panel as-is. Only the pause
+        # store + button label change. _latest_state being non-empty means we
+        # have already rendered at least one frame to freeze on.
+        if is_paused and _latest_state:
+            return (*([dash.no_update] * _n_data_outputs),
+                    {"paused": True, "auto_done": auto_done}, "▶ Resume")
+
+        # ---- running: advance the clock exactly once ----
         state = state_provider() or {}
+        _latest_state.clear()
+        _latest_state.update(state)
         # Feed live squad/microdrone positions to any panel that renders
-        # them (the TargetPositionMapPanel) before its figure is built.
+        # them (the TargetPositionMapPanel) before its figure is built. Pass
+        # the scenario clock too so the panel's FOV scan / exfil mode tracks
+        # demo time rather than wall-clock frames.
         platforms = state.get("platforms") or {}
+        plat_t = float(state.get("t_seconds", 0.0))
+        target_latlon = state.get("target_latlon")
         for chart in charts:
             if hasattr(chart, "set_platforms"):
-                chart.set_platforms(platforms)
+                chart.set_platforms(platforms, plat_t, target_latlon)
+        # Feed peer-of-peer trust edges to the Trust Network panel (Stage 5).
+        for chart in charts:
+            if hasattr(chart, "set_trust_matrix"):
+                chart.set_trust_matrix(state.get("trust_matrix"),
+                                       state.get("compromised"),
+                                       state.get("excluded"))
         # External HTML legend for the map panel (first chart exposing
         # legend_groups). Rebuilt each tick so it tracks the live markers.
         map_legend: Any = []
@@ -406,27 +614,42 @@ def make_app(name: str, title: str,
             if hasattr(chart, "legend_groups"):
                 map_legend = _render_map_legend(chart.legend_groups())
                 break
+
+        t_seconds = float(state.get("t_seconds", 0.0))
+        # Auto-pause right before the narrative: the first time the clock
+        # reaches the earliest narration block, freeze.
+        is_paused, auto_done = auto_pause(
+            is_paused, auto_done, t_seconds, narration_start_t)
+        # When this running frame is the one we freeze on (auto-pause just
+        # fired, or we opened with start_paused), hold the narration hidden so
+        # Resume reveals the first block on cue.
+        suppress_narration = is_paused
+
         narration_children: Any = html.Div()
         overlay_style = {"visibility": "hidden"}
-        if overlay is not None:
-            t_seconds = float(state.get("t_seconds", 0.0))
-            overlay.advance_to(t_seconds)
+        if overlay is not None and not suppress_narration:
+            # Live gates for beats whose real moment floats (e.g. the jet
+            # strike, gated on the jet actually reaching the objective). The
+            # coordinator publishes them in state; absent => no gating.
+            overlay.advance_to(t_seconds, gates=state.get("narration_gates"))
             presentation_on = bool((presentation_data or {}).get("on"))
             if presentation_on:
                 narration_children = _narration_div(overlay.current_block)
                 overlay_style = {"visibility": "visible"}
-        # Pin the trust-dynamics and noise-floor charts to the map's
-        # fixed width. charts[0] is the map; its width is authoritative.
+        # Pin the trust-dynamics and noise-floor charts to the map's fixed
+        # width (_MAP_W). The map itself is built in _refresh_map now, so we
+        # use the constant rather than reading the map figure's width.
         # We override via update_layout (not the figure(width=...) arg)
         # because the sensor chart's empty-data path returns before it
         # applies the width, which would otherwise autosize to fill the
         # wider right column and not line up with the map.
-        chart_figs = [chart.figure() for chart in charts]
-        map_w = chart_figs[0].layout.width or 900
+        chart_figs = [chart.figure() for chart in charts[1:]]  # non-map charts
+        map_w = _MAP_W
         timeline_fig = timeline.figure()
         timeline_fig.update_layout(width=map_w)
-        for cf in chart_figs[1:]:
+        for cf in chart_figs:
             cf.update_layout(width=map_w)
+        pause_label = "▶ Resume" if is_paused else "⏸ Pause"
         return (
             _render_status_bar(title, state),
             timeline_fig,
@@ -436,18 +659,97 @@ def make_app(name: str, title: str,
             event_log.to_dash_children(),
             narration_children,
             overlay_style,
+            {"paused": is_paused, "auto_done": auto_done},
+            pause_label,
         )
+
+    # ---- Tactical Map: own callback + Interval, decoupled from _refresh ----
+    # Rendering the map separately means a map redraw no longer forces every
+    # other panel to re-serialize/redraw (and vice versa), and the heavier 3D
+    # iso view can tick at its own (slower) cadence. The map panel's live
+    # platform data is still fed by _refresh's set_platforms loop above — this
+    # callback only renders whatever the shared panel object currently holds,
+    # so it must NOT call state_provider() (that would double-advance the clock).
+    if chart_graph_ids:
+        _map_panel = charts[0]
+
+        @app.callback(
+            Output(chart_graph_ids[0], "figure"),
+            Input("map-tick", "n_intervals"),
+            Input("tactical-view-mode", "data"),
+            State("playback-paused", "data"),
+            State("map-interacting", "data"),
+            State(chart_graph_ids[0], "relayoutData"),
+        )
+        def _refresh_map(_n, view_data, paused_data, interacting, relayout):
+            triggered = dash.callback_context.triggered_id
+            # Persist the operator's 3D rotate/zoom across ticks: a scene orbit
+            # emits the live camera in relayoutData under "scene.camera". Hand
+            # it to the panel so every subsequent iso render re-emits THAT
+            # camera rather than snapping back to the default eye. (uirevision
+            # alone did not hold the view between live/playback updates.)
+            # Captured even mid-drag, before the no_update short-circuit below,
+            # so the latest orientation is already stored when ticks resume.
+            if hasattr(_map_panel, "set_iso_camera"):
+                cam = (relayout or {}).get("scene.camera")
+                if cam:
+                    _map_panel.set_iso_camera(cam)
+            # While the operator is dragging to rotate/zoom, skip routine tick
+            # re-renders — a full Plotly.react each cadence would stutter the
+            # drag. A view-mode switch still re-renders (so the toggle works
+            # even mid-drag). Resumes on the next tick after release.
+            if (interacting or {}).get("dragging") and triggered == "map-tick":
+                return dash.no_update
+            paused = bool((paused_data or {}).get("paused"))
+            # While frozen, skip routine ticks (data unchanged; the captured
+            # camera + uirevision hold the view) but DO honor an explicit
+            # view-mode switch so the operator can flip 2D<->iso on a paused
+            # frame.
+            if paused and triggered == "map-tick" and _latest_state:
+                return dash.no_update
+            mode = (view_data or {}).get("mode", "2d")
+            if hasattr(_map_panel, "set_view_mode"):
+                _map_panel.set_view_mode(mode)
+            return _map_panel.figure(width=_MAP_W)
+
+        @app.callback(
+            Output("tactical-view-mode", "data"),
+            Output("view-toggle", "children"),
+            Input("view-toggle", "n_clicks"),
+            State("tactical-view-mode", "data"),
+            prevent_initial_call=True,
+        )
+        def _toggle_view(_n, current):
+            iso = (current or {}).get("mode") != "iso"
+            # Button label reflects the view the NEXT click switches to.
+            label = "▦ Top-down View" if iso else "◢ Isometric View"
+            return {"mode": "iso" if iso else "2d"}, label
 
     # Stretch Goal 2 / Phase 4: peer-detail drawer.
     # Dropdown change -> Store; Store + tick -> re-render the
     # iframe srcDoc from the cached detection + reputation state.
+    # Two ways to pick the drawer peer: the dropdown, or clicking the peer's
+    # marker on the map (charts[0]). Both feed the one selected-peer-name
+    # Store via a single callback (Dash forbids duplicate Outputs); the
+    # trigger source disambiguates. The map markers carry the bare peer name
+    # in customdata (see TargetPositionMapPanel.figure).
+    _map_graph_id = chart_graph_ids[0] if chart_graph_ids else None
+    _select_inputs = [Input("peer-selector", "value")]
+    if _map_graph_id:
+        _select_inputs.append(Input(_map_graph_id, "clickData"))
+
     @app.callback(
         Output("selected-peer-name", "data"),
-        Input("peer-selector", "value"),
+        *_select_inputs,
         prevent_initial_call=True,
     )
-    def _sync_selected(value):
-        return value or None
+    def _sync_selected(selector_value, click_data=None):
+        if _map_graph_id and dash.callback_context.triggered_id == _map_graph_id:
+            peer = _peer_from_map_click(click_data)
+            # Ignore clicks on non-peer geometry (trails/sightlines without
+            # customdata) rather than clearing the current selection.
+            return peer if peer else dash.no_update
+        return selector_value or None
 
     @app.callback(
         Output("peer-detail", "srcDoc"),
@@ -457,8 +759,10 @@ def make_app(name: str, title: str,
     def _render_drawer(_n, selected_peer):
         if not selected_peer:
             return _DRAWER_PLACEHOLDER
-        state = state_provider() or {}
-        return _render_peer_drawer(state, selected_peer)
+        # Read the snapshot _refresh cached this tick rather than calling
+        # state_provider() again — that would advance the recording clock a
+        # second time per tick and would defeat a paused demo.
+        return _render_peer_drawer(_latest_state, selected_peer)
 
     if narration_script:
         @app.callback(
@@ -494,6 +798,110 @@ def make_app(name: str, title: str,
             Input("fullscreen-toggle", "n_clicks"),
         )
 
+    # Cursor lat/lon readout over the bottom-left of the Target-position
+    # map.  Plotly's go.Scattermap renders on a MapLibre GL map.  Two
+    # gotchas this callback handles:
+    #   1. dcc.Graph(id="chart-0") renders an OUTER <div id="chart-0">; the
+    #      Plotly graph div (carrying _fullLayout + the map instance) is the
+    #      ".js-plotly-plot" descendant, not the element with the id.
+    #   2. The map subplot is keyed "map" for go.Scattermap (MapLibre) but
+    #      "mapbox" for the legacy go.Scattermapbox; the live MapLibre/Mapbox
+    #      instance hangs off <subplot>._subplot.map, created asynchronously
+    #      after the figure draws.
+    # So we drive this off the tick Interval and retry until the map exists,
+    # attaching the listeners exactly once (guarded by a window flag).  The
+    # listeners write straight to the readout DOM node; the callback's Store
+    # output is an unused sink — Dash state never carries the coordinates.
+    map_graph_id = chart_graph_ids[0] if chart_graph_ids else "chart-0"
+    app.clientside_callback(
+        """
+        function(n_intervals) {
+            var NO = window.dash_clientside.no_update;
+            if (window.__mapCoordHooked) { return NO; }
+            var outer = document.getElementById('__GRAPH_ID__');
+            if (!outer) { return NO; }
+            var gd = outer.classList && outer.classList.contains('js-plotly-plot')
+                     ? outer : outer.querySelector('.js-plotly-plot');
+            var readout = document.getElementById('map-coord-readout');
+            if (!gd || !gd._fullLayout || !readout) { return NO; }  // not drawn yet
+            var fl = gd._fullLayout;
+            // Locate the live MapLibre/Mapbox map.  Try the known subplot keys
+            // first, then fall back to scanning every subplot container for one
+            // whose ._subplot.map quacks like a maplibre map (on + unproject).
+            function isMap(m) {
+                return m && typeof m.on === 'function' &&
+                       typeof m.unproject === 'function';
+            }
+            var map = (fl.map && fl.map._subplot && fl.map._subplot.map) ||
+                      (fl.mapbox && fl.mapbox._subplot && fl.mapbox._subplot.map);
+            if (!isMap(map)) {
+                map = null;
+                for (var k in fl) {
+                    var s = fl[k];
+                    if (s && s._subplot && isMap(s._subplot.map)) {
+                        map = s._subplot.map; break;
+                    }
+                }
+            }
+            if (!isMap(map)) { return NO; }  // not ready yet; retry next tick
+            function fmt(v) { return (v >= 0 ? '+' : '') + v.toFixed(5); }
+            map.on('mousemove', function(e) {
+                readout.style.opacity = '1';
+                readout.textContent =
+                    'lat ' + fmt(e.lngLat.lat) + '   lon ' + fmt(e.lngLat.lng);
+            });
+            // Freeze on exit: keep the last value, dim it to flag it's stale.
+            map.on('mouseout', function() { readout.style.opacity = '0.55'; });
+            window.__mapCoordHooked = true;
+            return NO;
+        }
+        """.replace("__GRAPH_ID__", map_graph_id),
+        Output("map-coord-hook", "data"),
+        Input("tick", "n_intervals"),
+    )
+
+    # Drag-to-interact detector: pause the map's tick re-renders while the
+    # operator is rotating/zooming so the interaction stays smooth (esp. the
+    # 3D iso scene). Installs DOM listeners once (retrying off the tick until
+    # the Plotly graph div exists) that flip the `map-interacting` Store via
+    # dash_clientside.set_props. mousedown/touchstart begin a drag; release on
+    # `document` ends it; a wheel zoom holds the flag for a short debounce so
+    # continuous scrolling keeps updates paused until it settles.
+    app.clientside_callback(
+        """
+        function(n_intervals) {
+            var NO = window.dash_clientside.no_update;
+            if (window.__mapDragHooked) { return NO; }
+            var outer = document.getElementById('__GRAPH_ID__');
+            if (!outer) { return NO; }
+            var gd = outer.classList && outer.classList.contains('js-plotly-plot')
+                     ? outer : outer.querySelector('.js-plotly-plot');
+            if (!gd) { return NO; }  // graph not drawn yet; retry next tick
+            function setDrag(v) {
+                try {
+                    window.dash_clientside.set_props(
+                        'map-interacting', {data: {dragging: v}});
+                } catch (e) { /* older dash without set_props: no-op */ }
+            }
+            gd.addEventListener('mousedown', function() { setDrag(true); });
+            gd.addEventListener('touchstart', function() { setDrag(true); },
+                                {passive: true});
+            document.addEventListener('mouseup', function() { setDrag(false); });
+            document.addEventListener('touchend', function() { setDrag(false); });
+            var wheelTimer = null;
+            gd.addEventListener('wheel', function() {
+                setDrag(true);
+                if (wheelTimer) { clearTimeout(wheelTimer); }
+                wheelTimer = setTimeout(function() { setDrag(false); }, 500);
+            }, {passive: true});
+            window.__mapDragHooked = true;
+            return NO;
+        }
+        """.replace("__GRAPH_ID__", map_graph_id),
+        Output("map-drag-hook", "data"),
+        Input("map-tick", "n_intervals"),
+    )
+
     return app
 
 
@@ -505,18 +913,19 @@ def start_in_thread(name: str, title: str,
                     narration_script: Optional[list[NarrationBlock]] = None,
                     presentation_default: bool = True,
                     peer_names: Optional[list[str]] = None,
+                    default_peer: Optional[str] = None,
                     ) -> threading.Thread:
     """Start the Dash app in a daemon thread and return the thread."""
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
     app = make_app(name, title, panels, chart_keys, state_provider,
                    narration_script=narration_script,
                    presentation_default=presentation_default,
-                   peer_names=peer_names)
+                   peer_names=peer_names,
+                   default_peer=default_peer)
 
     def _run():
         try:
-            app.run(host=host, port=port,
-                    debug=False, use_reloader=False)
+            _serve_bounded(app, host, port)
         except Exception:
             logging.getLogger(__name__).exception(
                 "Dashboard server crashed")
@@ -525,6 +934,100 @@ def start_in_thread(name: str, title: str,
                          name="dod-dashboard")
     t.start()
     return t
+
+
+def _serve_bounded(app: "dash.Dash", host: str, port: int) -> None:
+    """Serve the Dash WSGI app with a fixed pool of daemon worker threads.
+
+    Two properties this guarantees, both learned the hard way:
+
+    * Bounded: werkzeug's dev server spawns one *unbounded* thread per
+      request; under the dashboard's per-tick polling that exhausts the
+      process thread limit (``can't start new thread``). A fixed worker
+      count caps concurrency; the listen queue absorbs bursts.
+    * Non-blocking shutdown: the workers are plain ``daemon`` threads, NOT a
+      concurrent.futures pool. ThreadPoolExecutor installs a global atexit
+      hook that joins its workers with no timeout at interpreter shutdown —
+      which, when the coordinator catches SIGTERM (Tilt/k8s teardown) and
+      returns from its main loop, can stall the process at exit with the
+      dashboard threads still alive. Daemon threads are simply killed when
+      the interpreter exits, so they can never keep the process running.
+
+    Falls back to Dash's app.run if werkzeug's serving internals aren't
+    shaped as expected on this version, so the dashboard still comes up.
+    """
+    log = logging.getLogger(__name__)
+    try:
+        from werkzeug.serving import make_server, WSGIRequestHandler
+
+        # Disable HTTP/1.1 keep-alive. With keep-alive a persistent
+        # connection holds its handler for the connection's whole lifetime,
+        # so a few idle browser connections (browsers open ~6/host, plus the
+        # peer-detail iframe) would tie up every worker and stall the pool.
+        # HTTP/1.0 closes after each response, so a pooled worker handles one
+        # short request and returns — making the bound depend only on
+        # concurrent in-flight requests, not on how many tabs are open. The
+        # read timeout reaps a connection whose client vanished mid-request
+        # so a worker can't be parked forever.
+        class _Handler(WSGIRequestHandler):
+            protocol_version = "HTTP/1.0"
+            timeout = 30
+
+        # threaded=False: a plain single-threaded BaseWSGIServer whose
+        # synchronous process_request we replace with pool dispatch below.
+        # (We do our own bounded threading, so we want none of werkzeug's
+        # ThreadingMixIn per-request thread spawning.)
+        srv = make_server(host, port, app.server, threaded=False,
+                          request_handler=_Handler)
+
+        # Hand-rolled bounded pool of daemon workers (see docstring for why
+        # not ThreadPoolExecutor). The work queue is bounded so a flood of
+        # connections can't grow it without limit; an over-capacity request
+        # is closed rather than queued forever.
+        work: "queue.Queue" = queue.Queue(maxsize=_SERVER_THREADS * 16)
+
+        def _worker():
+            while True:
+                request, client_address = work.get()
+                try:
+                    srv.finish_request(request, client_address)
+                except Exception:
+                    try:
+                        srv.handle_error(request, client_address)
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        srv.shutdown_request(request)
+                    except Exception:
+                        pass
+
+        for i in range(_SERVER_THREADS):
+            threading.Thread(target=_worker, daemon=True,
+                             name="dod-dash-wsgi-%d" % i).start()
+
+        def _process_request(request, client_address):
+            try:
+                work.put((request, client_address), timeout=5)
+            except queue.Full:
+                # Saturated: drop the connection so the client retries
+                # rather than letting the queue (and latency) grow unbounded.
+                try:
+                    srv.shutdown_request(request)
+                except Exception:
+                    pass
+
+        # Replace the server's synchronous process_request with pool dispatch
+        # so each accepted request runs on a bounded daemon worker, not inline.
+        srv.process_request = _process_request
+        log.info("Dashboard serving on %s:%d with %d HTTP worker threads",
+                 host, port, _SERVER_THREADS)
+        srv.serve_forever()
+    except Exception:
+        log.exception(
+            "Bounded dashboard server setup failed; "
+            "falling back to app.run (unbounded threads)")
+        app.run(host=host, port=port, debug=False, use_reloader=False)
 
 
 def feed_timeline_sample(panels: dict[str, Any],
@@ -546,6 +1049,22 @@ def feed_event(panels: dict[str, Any], record: dict) -> None:
 # coordinator.py `_push_dashboard_update`) into the inspector
 # components. A dashboard callback wires them by reading
 # state["detection_per_peer"] each tick.
+
+def _peer_from_map_click(click_data) -> Optional[str]:
+    """Resolve a Plotly map ``clickData`` payload to a peer name.
+
+    Peer markers (TargetPositionMapPanel) carry the bare peer name in
+    ``customdata``; non-peer geometry (trails, sightlines) carries none.
+    Returns ``None`` when the click can't be resolved to a peer, so the
+    caller can leave the current selection untouched."""
+    try:
+        cd = (click_data or {})["points"][0].get("customdata")
+    except (KeyError, IndexError, TypeError):
+        return None
+    if isinstance(cd, (list, tuple)):
+        return cd[0] if cd else None
+    return cd
+
 
 def detection_summary_for(state: dict[str, Any],
                           peer_name: str):
@@ -569,6 +1088,8 @@ def detection_summary_for(state: dict[str, Any],
         crop_size_px=tuple(bucket.get("crop_size_px") or (0, 0)),
         bbox_in_crop_px=tuple(bucket.get("bbox_in_crop_px")
                               or (0, 0, 0, 0)),
+        obb_in_crop_px=tuple(tuple(p) for p in
+                             (bucket.get("obb_in_crop_px") or [])),
         label=bucket.get("label", ""),
         world_uid=bucket.get("world_uid", ""),
         confidence=float(bucket.get("confidence", 0.0)),
@@ -594,6 +1115,8 @@ def detection_log_for(state: dict[str, Any], peer_name: str) -> list:
             crop_size_px=tuple(bucket.get("crop_size_px") or (0, 0)),
             bbox_in_crop_px=tuple(bucket.get("bbox_in_crop_px")
                                   or (0, 0, 0, 0)),
+            obb_in_crop_px=tuple(tuple(p) for p in
+                                 (bucket.get("obb_in_crop_px") or [])),
             label=bucket.get("label", ""),
             world_uid=bucket.get("world_uid", ""),
             confidence=float(bucket.get("confidence", 0.0)),

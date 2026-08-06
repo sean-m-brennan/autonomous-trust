@@ -2,7 +2,7 @@
 
 # Zero Trust Architecture Integration
 
-## 1. Why Certificate Management Is Not Enough
+## 1. Why certificate management is not enough
 
 Certificate-based trust is the foundation of Zero Trust Architecture (ZTA). NIST SP 800-207 defines ZTA around a Policy Decision Point (PDP) that verifies identity via certificates for every access request [1]. This creates a dependency chain:
 
@@ -10,7 +10,7 @@ Certificate-based trust is the foundation of Zero Trust Architecture (ZTA). NIST
 Trust -> PDP decision -> Identity verification -> Certificate validation -> CA/OCSP/CRL availability
 ```
 
-Break any link -- the CA is unreachable, the OCSP responder is down, the CRL is stale -- and trust collapses. SP 800-207 acknowledges this: "If the PE and PA are not available, no new connection requests can be approved" (SS7.3) [1]. The standard offers redundancy as the only mitigation, but redundancy still requires connectivity to at least one instance.
+Break any link (the CA is unreachable, the OCSP responder is down, the CRL is stale) and trust collapses. SP 800-207 acknowledges this in S5.2 (Denial-of-Service or Network Disruption): "Enterprise resources cannot connect to each other without the PA's permission," and an attacker who "disrupts or denies access to the PEP(s) or PE/PA ... can adversely impact enterprise operations" [1]. The standard offers replication/cyber-resiliency as the mitigation, but that still requires connectivity to at least one instance.
 
 This is not an implementation bug. It is structural:
 
@@ -21,7 +21,7 @@ This is not an implementation bug. It is structural:
 
 In connected enterprise environments, certificate management is already painful: 77% of organizations experienced certificate-related outages in a 24-month period, with an average cost of $11.1 million per organization per year [2][3]. High-profile failures (Equifax 2017, Ericsson/O2 2018, Let's Encrypt root expiry 2021) occur with full connectivity to certificate infrastructure [4][5][6].
 
-### Where It Breaks Entirely
+### Where it breaks entirely
 
 **Tactical/DDIL environments.** The DoD CRL can exceed 50 MB; tactical SATCOM links at 9.6-256 kbps cannot reliably download it [7]. Tactical edge systems frequently lose connectivity to OCSP responders and must choose between fail-open (insecure) and fail-closed (mission denial) [8].
 
@@ -33,7 +33,7 @@ The trend is worsening: the CA/Browser Forum has proposed 47-day certificate lif
 
 ---
 
-## 2. The Layered Architecture: ZTA + AT
+## 2. The layered architecture: ZTA + AT
 
 ZTA and AT are complementary layers, not alternatives. ZTA opens the door; AT decides what happens inside the room.
 
@@ -42,24 +42,24 @@ ZTA and AT are complementary layers, not alternatives. ZTA opens the door; AT de
 | **Evaluates** | Credentials, device posture, context | Behavior over time |
 | **Trust model** | Binary (allow/deny) | Continuous gradient (0.0-1.0) |
 | **Adapts** | When policies are updated by humans | Continuously, autonomously |
-| **Fails when** | PDP is unreachable or wrong | Never fully -- degrades gracefully |
+| **Fails when** | PDP is unreachable or wrong | Never fully, degrades gracefully |
 | **Scales via** | More policy rules | More peer observations |
 
-A peer needs valid ZTA credentials to reach an AT agent (satisfying the mandate), but once connected, AT takes over. The certificate is no longer the operative trust boundary -- behavioral reputation is. A ZTA-authenticated peer enters the network at neutral reputation (0.5) and must earn higher trust through demonstrated behavior. Authentication is not trust.
+A peer needs valid ZTA credentials to reach an AT agent (satisfying the mandate), but once connected, AT takes over. The certificate is no longer the operative trust boundary: behavioral reputation is. A ZTA-authenticated peer enters the network at neutral reputation (0.5) and must earn higher trust through demonstrated behavior. Authentication is not trust.
 
-### Failure Mode Transformation
+### Failure mode transformation
 
 | Certificate Failure | ZTA-Only Impact | ZTA + AT Impact |
 |---|---|---|
 | **Expired cert** | Service outage | Brief re-authentication; AT reputation persists across the renewal |
-| **Compromised cert** | Full access until revocation propagates | Attacker has neutral reputation (new identity) or divergent behavior (existing identity) -- AT detects it |
+| **Compromised cert** | Full access until revocation propagates | Attacker has neutral reputation (new identity) or divergent behavior (existing identity), AT detects it |
 | **CA compromise** | Catastrophic trust collapse across all relying parties | AT trust is independent of CA; network continues on behavioral trust |
 | **OCSP/CRL unreachable** | Fail-open (insecure) or fail-closed (outage) | AT trust evaluation continues unimpaired |
-| **PDP unavailable** | No new connections approved (SP 800-207 SS7.3) | AT peers continue operating on behavioral trust |
+| **PDP unavailable** | Enterprise operations impacted; PA's permission required to connect (SP 800-207 S5.2) | AT peers continue operating on behavioral trust |
 | **Cross-cert lapse** | Inter-agency authentication fails | AT trust between peers persists; re-established when connectivity returns |
 | **Stale cached revocation** | False sense of security | AT behavioral scoring detects changed behavior regardless of credential state |
 
-### AT-Informed Certificate Management
+### AT-informed certificate management
 
 AT's reputation signal can inform automated certificate lifecycle decisions:
 
@@ -70,9 +70,9 @@ AT's reputation signal can inform automated certificate lifecycle decisions:
 
 ---
 
-## 3. Design Principles
+## 3. Design principles
 
-1. **ZTA remains mandatory when available.** AT does not override or bypass ZTA -- it extends it.
+1. **ZTA remains mandatory when available.** AT does not override or bypass ZTA: it extends it.
 2. **AT provides continuity when ZTA fails.** The value proposition is graceful degradation, not ZTA replacement.
 3. **Credential state informs reputation, not the reverse.** ZTA revocation penalizes AT reputation. AT reputation can inform cert lifecycle decisions. Neither layer unilaterally controls the other.
 4. **Configuration, not hardcoding.** Different deployments (enterprise, tactical, space) have different ZTA availability profiles. The integration must be tunable.
@@ -80,7 +80,7 @@ AT's reputation signal can inform automated certificate lifecycle decisions:
 
 ---
 
-## 4. Architecture Overview
+## 4. Architecture overview
 
 The ZTA subsystem is compiled conditionally via `AT_ZTA=ON` in CMake, which defines `AT_ZTA_ENABLED` globally. When compiled in, it can be enabled or disabled at runtime via `zta_policy.cfg.json`. When disabled at runtime, all ZTA code paths are no-ops.
 
@@ -104,17 +104,17 @@ The ZTA subsystem is compiled conditionally via `AT_ZTA=ON` in CMake, which defi
 +------------------+
 ```
 
-### Key Design Decisions
+### Key design decisions
 
 1. **Master switch**: ZTA can be compiled in but disabled at runtime. This allows a single binary to serve both ZTA-mandated and non-ZTA deployments.
 2. **Pluggable backends**: The verifier interface (`zta_verifier_t`) is a vtable with function pointers. New credential types (SAML, JWT, etc.) can be added without modifying core code.
-3. **Reputation integration**: ZTA verification results feed into the reputation system as one signal among many -- not a binary kill switch. A revocation applies a configurable reputation penalty; it does not forcibly disconnect the peer.
+3. **Reputation integration**: ZTA verification results feed into the reputation system as one signal among many, not a binary kill switch. A revocation applies a configurable reputation penalty; it does not forcibly disconnect the peer.
 4. **DDIL fallback**: When verification infrastructure is unreachable, peers can still be admitted with a reputation cap, preserving network formation in disconnected environments.
 5. **Audit trail**: Every verification attempt, deferral, and resolution is logged to a JSONL file for compliance review.
 
 ---
 
-## 5. Pluggable Verifier Interface
+## 5. Pluggable verifier interface
 
 The `zta_verifier_t` struct (`src/c/autonomous_trust/zta/zta_verifier.h`) defines a vtable with five operations:
 
@@ -128,7 +128,7 @@ The `zta_verifier_t` struct (`src/c/autonomous_trust/zta/zta_verifier.h`) define
 
 Any function pointer may be NULL; a NULL pointer is treated as returning `ZTA_UNAVAILABLE`.
 
-### Verification Status
+### Verification status
 
 | Status | Meaning |
 |--------|---------|
@@ -139,7 +139,7 @@ Any function pointer may be NULL; a NULL pointer is treated as returning `ZTA_UN
 | `ZTA_REVOKED` | Credential has been revoked |
 | `ZTA_UNAVAILABLE` | Verifier cannot perform this operation |
 
-### Backend Implementations
+### Backend implementations
 
 **X.509 verifier** (`x509_verifier.h`): OpenSSL-based certificate verification against a CA bundle (PEM). Supports optional OCSP responder and CRL file for revocation checking. Configurable connection timeout (default 2000ms).
 
@@ -149,7 +149,7 @@ Any function pointer may be NULL; a NULL pointer is treated as returning `ZTA_UN
 
 ---
 
-## 6. Identity Binding
+## 6. Identity binding
 
 When ZTA is enabled, the `public_identity_t` struct (`identity.h`) carries additional fields:
 
@@ -162,11 +162,11 @@ When ZTA is enabled, the `public_identity_t` struct (`identity.h`) carries addit
 
 These fields are serialized in the identity protobuf (`identity.proto` fields 6-8) and exchanged during peer discovery. The credential hash provides a stable binding between the AT identity (UUID + Ed25519 key) and the ZTA credential that was valid at admission time.
 
-Credential rotation updates the binding; AT reputation is unaffected by routine rotation. This is by design -- the behavioral trust history persists across credential renewals.
+Credential rotation updates the binding; AT reputation is unaffected by routine rotation. This is by design: the behavioral trust history persists across credential renewals.
 
 ---
 
-## 7. Policy Configuration
+## 7. Policy configuration
 
 The `zta_policy_t` struct (`zta_policy.h`) is loaded from `zta_policy.cfg.json`:
 
@@ -188,7 +188,7 @@ The `zta_policy_t` struct (`zta_policy.h`) is loaded from `zta_policy.cfg.json`:
 }
 ```
 
-### Field Reference
+### Field reference
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -206,7 +206,7 @@ The `zta_policy_t` struct (`zta_policy.h`) is loaded from `zta_policy.cfg.json`:
 | `ocsp_url` | string | | OCSP responder URL. Empty string disables OCSP. |
 | `crl_path` | string | | CRL file path. Empty string disables CRL checking. |
 
-### Environment-Specific Tuning
+### Environment-specific tuning
 
 **Enterprise** (full connectivity): Short `reverify_interval_sec` (300-900), high `revocation_reputation_penalty` (0.9-1.0), `allow_ddil_fallback` false.
 
@@ -214,24 +214,24 @@ The `zta_policy_t` struct (`zta_policy.h`) is loaded from `zta_policy.cfg.json`:
 
 **Space/DTN**: Long `reverify_interval_sec` (7200+), `allow_ddil_fallback` true, `ddil_fallback_reputation_cap` 0.5. Rely primarily on AT behavioral trust. AT complements BPSec (RFC 9172) by adding the behavioral layer that BPSec explicitly defers: BPSec answers "is this bundle authentic?" AT answers "should we trust this relay?" A relay with valid BPSec credentials but degrading forwarding reliability loses AT reputation and is routed around.
 
-**Multi-agency**: AT's bilateral negotiation protocol handles cross-organizational trust without requiring PKI interoperability or cross-certification. New participants enter at neutral reputation regardless of ZTA authentication status and earn trust through demonstrated behavior. When cross-cert trust paths break, AT trust between peers persists -- authentication can be re-established when connectivity returns without losing behavioral trust history.
+**Multi-agency**: AT's bilateral negotiation protocol handles cross-organizational trust without requiring PKI interoperability or cross-certification. New participants enter at neutral reputation regardless of ZTA authentication status and earn trust through demonstrated behavior. When cross-cert trust paths break, AT trust between peers persists: authentication can be re-established when connectivity returns without losing behavioral trust history.
 
 ---
 
-## 8. Delegated Verification (Distributed PDP)
+## 8. Delegated verification (distributed PDP)
 
 In prolonged DDIL scenarios, no peer in the group may be able to reach ZTA infrastructure (OCSP, CRL endpoints). Without mitigation, every DDIL-admitted peer stays capped at `ddil_fallback_reputation_cap` indefinitely, preventing the network from reaching full trust depth.
 
-Delegated verification solves this by turning the AT group itself into a distributed Policy Decision Point. When any peer in the group successfully verifies a credential against ZTA infrastructure, it broadcasts the result via `ZTA_PROTO_VERIFICATION`. Peers that could not verify independently accept the delegated result -- but only from peers they trust.
+Delegated verification solves this by turning the AT group itself into a distributed Policy Decision Point. When any peer in the group successfully verifies a credential against ZTA infrastructure, it broadcasts the result via `ZTA_PROTO_VERIFICATION`. Peers that could not verify independently accept the delegated result, but only from peers they trust.
 
-### How It Works
+### How it works
 
 1. Peer A admits Peer B in DDIL mode (reputation capped at 0.5).
 2. Peer C has OCSP connectivity and verifies B's credential during periodic re-verification. C broadcasts a `ZTA_VERIFICATION_RESULT` message identifying B as verified, signed with C's identity.
 3. Peer A receives C's verification. If the vouch is from an admitted group member (guaranteed by the encrypted channel), A records it.
 4. When the number of distinct vouching peers reaches `delegated_verification_quorum`, A lifts B's DDIL reputation cap. B can now earn reputation above 0.5.
 
-### Trust Gating
+### Trust gating
 
 Delegated verification is not blind trust in relay. The `delegated_verification_min_reputation` threshold (default 0.7) controls the minimum reputation a vouching peer must have for its verification to be accepted. The ZTA process queries the local reputation process via IPC (`local_rep_query`/`local_rep_response`) and caches scores with a 10-minute TTL. Vouches that arrive before the voucher's reputation is cached are held in a pending queue and evaluated when the reputation response arrives. This prevents:
 
@@ -240,7 +240,7 @@ Delegated verification is not blind trust in relay. The `delegated_verification_
 
 The `delegated_verification_quorum` (default 1) can be raised for higher-assurance environments. With quorum 3, three independent peers must each verify the credential before the cap lifts. This provides Byzantine fault tolerance: a single compromised verifier cannot unilaterally lift caps.
 
-### Audit Trail
+### Audit trail
 
 Every delegated vouch is recorded in the audit log:
 
@@ -265,7 +265,7 @@ This provides a complete chain: "Peer B was admitted at T with deferred verifica
 
 ---
 
-## 9. ZTA Process
+## 9. ZTA process
 
 The `zta_process_run` function (`zta_process.h`) implements a background process that:
 
@@ -277,7 +277,7 @@ The `zta_process_run` function (`zta_process.h`) implements a background process
 
 When ZTA is disabled at runtime, the process exits immediately.
 
-### Protocol Messages
+### Protocol messages
 
 ZTA peers exchange three message types via the network layer:
 
@@ -291,7 +291,7 @@ These use the existing `net_msg_t` transport with the function field set to the 
 
 ---
 
-## 10. Audit Logging
+## 10. Audit logging
 
 The `zta_audit_log_t` (`zta_audit.h`) provides a thread-safe, append-only audit log in JSONL format (one JSON object per line). The default log path is `/var/at/zta_audit.jsonl`.
 
@@ -310,22 +310,30 @@ This audit trail supports compliance review: "we could not verify peer X at time
 
 ---
 
-## 11. Integration with Admission Protocol
+## 11. Integration with admission protocol
 
 The ZTA check occurs during Phase 3 (Border Guard Mode) of the [identity protocol](identity-protocol.md). When a new peer announces, the border guard:
 
-1. Validates the AT identity (UUID, keys, package hash) -- unchanged.
+1. Validates the AT identity (UUID, keys, package hash): unchanged.
 2. If `require_at_admission` is true, verifies the peer's ZTA credential via the configured verifier.
-3. If verification returns `ZTA_VERIFIED`, the peer is proposed for group voting with no reputation cap (starts at 0.5 neutral, can earn higher).
+3. If verification returns `ZTA_VERIFIED`, the gate then **checks revocation** (`check_revocation` on the verified credential's hash). `verify_credential` walks only the chain + expiry, so a chain-valid but revoked certificate would otherwise admit; the explicit revocation check closes that gap. Only an affirmative `ZTA_REVOKED` blocks: `ZTA_UNAVAILABLE` (the default when no CRL/OCSP source is configured) does **not**, so deployments without a revocation source are unaffected. A surviving credential is proposed for group voting with no reputation cap (starts at 0.5 neutral, can earn higher).
 4. If verification returns `ZTA_DEFERRED` and `allow_ddil_fallback` is true, the peer is admitted with a reputation cap of `ddil_fallback_reputation_cap`. The deferral is recorded in the audit log.
-5. If verification returns `ZTA_REJECTED`, `ZTA_EXPIRED`, or `ZTA_REVOKED`, the peer is not proposed.
+5. If verification returns `ZTA_REJECTED` or `ZTA_EXPIRED` (or the revocation check in step 3 returns `ZTA_REVOKED`), the peer is not proposed.
 6. If `require_at_admission` is false, the ZTA check is skipped entirely.
+
+Both implementations match here: Python `idprocess._zta_admit` and C `welcoming_committee` (`id_proc.c`) both run the revocation check after a `VERIFIED` chain result, and the CRL serial match itself is at parity (`X509Verifier.check_revocation` ↔ `x509_check_revocation`). Pinned cross-language by conformance `zta-x509-reject-revoked-credential`. The human-operator analogue of this gate is described in [Operator Access](operator-access.md).
 
 ---
 
-## 12. Compliance Alignment
+## 12. Compliance alignment
 
 Implementing AT with ZTA does not conflict with ZTA mandates. It extends them.
+
+> The full per-tenet / per-pillar **traceability matrix** (SP 800-207, DoD ZT RA
+> v2.0, SP 800-160 Vol. 2, CSF 2.0, CISA ZTMM, OMB M-22-09, DoD ZT Strategy →
+> AT mechanism, with I/IP/P/D status and gap→Option mapping) is the SOW Task 1.4
+> deliverable at `doc/NV059/work/NIST_DOD_ZT_TRACEABILITY.md`. The summary below
+> is the high-level alignment; that document is authoritative.
 
 | Standard/Framework | Requirement | AT Alignment |
 |---|---|---|
@@ -336,7 +344,7 @@ Implementing AT with ZTA does not conflict with ZTA mandates. It extends them.
 | CISA ZT Maturity Model | Progressive trust evaluation | AT's trust gradient (0.0-1.0) is progressive by design |
 | OMB M-22-09 | Agency-level ZTA implementation | AT extends ZTA without conflicting with it |
 
-Every ZTA requirement -- identity verification, least privilege, session management, micro-segmentation -- remains in place. AT adds a capability ZTA's architecture cannot provide: continuous, autonomous, behavioral trust evaluation that operates without human policy authoring and without centralized infrastructure.
+Every ZTA requirement (identity verification, least privilege, session management, micro-segmentation) remains in place. AT adds a capability ZTA's architecture cannot provide: continuous, autonomous, behavioral trust evaluation that operates without human policy authoring and without centralized infrastructure.
 
 ---
 
@@ -351,7 +359,7 @@ make -j$(nproc)
 
 `AT_ZTA=ON` adds OpenSSL as a dependency and compiles the `src/c/autonomous_trust/zta/` sources. It also defines `AT_ZTA_ENABLED` globally, which extends `public_identity_t` and `generic_msg_t` with ZTA fields. All translation units must see the same definition to avoid struct size mismatches.
 
-### Running Tests
+### Running tests
 
 ```bash
 # All tests including ZTA
@@ -362,30 +370,30 @@ ctest -R "zta_" --output-on-failure
 ```
 
 The ZTA-specific tests are:
-- `zta_verifier_test` -- verifier interface and null/X.509 backends
-- `zta_policy_test` -- policy serialization and verifier creation
-- `zta_audit_test` -- audit log init, record, defer, resolve
+- `zta_verifier_test` (verifier interface and null/X.509 backends
+- `zta_policy_test`) policy serialization and verifier creation
+- `zta_audit_test`, audit log init, record, defer, resolve
 
-### Source Files
+### Source files
 
 Modified:
-- `src/protobuf/.../identity/identity.proto` -- ZTA binding fields (6-8)
-- `src/c/autonomous_trust/identity/identity.h` / `identity.c` -- extended `public_identity_t`, serialization
-- `src/c/autonomous_trust/identity/id_proc.c` -- ZTA check during admission
-- `src/c/autonomous_trust/utilities/msg_types.h` / `msg_types.c` -- `ZTA_REVOCATION_ALERT` and `ZTA_VERIFICATION_RESULT` message types
-- `src/c/CMakeLists.txt` -- `AT_ZTA` option, conditional compilation, ZTA test targets
+- `src/protobuf/.../identity/identity.proto` (ZTA binding fields (6-8)
+- `src/c/autonomous_trust/identity/identity.h` / `identity.c`) extended `public_identity_t`, serialization
+- `src/c/autonomous_trust/identity/id_proc.c` (ZTA check during admission
+- `src/c/autonomous_trust/utilities/msg_types.h` / `msg_types.c`) `ZTA_REVOCATION_ALERT` and `ZTA_VERIFICATION_RESULT` message types
+- `src/c/CMakeLists.txt`, `AT_ZTA` option, conditional compilation, ZTA test targets
 
 New:
-- `src/c/autonomous_trust/zta/zta_verifier.h` / `.c` -- pluggable verifier interface and null backend
-- `src/c/autonomous_trust/zta/x509_verifier.h` / `.c` -- OpenSSL X.509 backend
-- `src/c/autonomous_trust/zta/oidc_verifier.h` / `.c` -- OIDC stub backend
-- `src/c/autonomous_trust/zta/zta_policy.h` / `.c` -- policy configuration and JSON serialization
-- `src/c/autonomous_trust/zta/zta_process.h` / `.c` -- background re-verification process
-- `src/c/autonomous_trust/zta/zta_audit.h` / `.c` -- compliance audit log
-- `src/c/autonomous_trust/zta/zta_protocol.h` -- protocol message constants
-- `src/c/test/zta_verifier_test.c`, `zta_policy_test.c`, `zta_audit_test.c` -- unit tests
-- `config/cfg/zta_policy.cfg.json` -- default policy configuration
-- `examples/zta/` -- 4-peer Docker Compose demo with mock OCSP
+- `src/c/autonomous_trust/zta/zta_verifier.h` / `.c` (pluggable verifier interface and null backend
+- `src/c/autonomous_trust/zta/x509_verifier.h` / `.c`) OpenSSL X.509 backend
+- `src/c/autonomous_trust/zta/oidc_verifier.h` / `.c` (OIDC stub backend
+- `src/c/autonomous_trust/zta/zta_policy.h` / `.c`) policy configuration and JSON serialization
+- `src/c/autonomous_trust/zta/zta_process.h` / `.c` (background re-verification process
+- `src/c/autonomous_trust/zta/zta_audit.h` / `.c`) compliance audit log
+- `src/c/autonomous_trust/zta/zta_protocol.h` (protocol message constants
+- `src/c/test/zta_verifier_test.c`, `zta_policy_test.c`, `zta_audit_test.c`) unit tests
+- `config/cfg/zta_policy.cfg.json` (default policy configuration
+- `examples/zta/`) 4-peer Docker Compose demo with mock OCSP
 
 ---
 
@@ -407,11 +415,19 @@ The demo creates:
 
 ---
 
-## 15. Open Questions
+## 15. Open design questions
 
 1. **Retroactive reputation adjustment.** When a peer operates for an extended period without ZTA verification and then verification fails, how far back should reputation be unwound? The current implementation applies a single penalty at detection time; historical unwinding is not yet implemented.
-2. **Multi-operator ZTA.** In coalition/multi-agency scenarios (LunaNet, joint ops), peers may have certs from different CAs. The verifier interface supports this in principle (multiple CA bundles), but cross-certification verification and CA trust negotiation are not yet implemented.
-3. **Python implementation.** The current ZTA integration is C-only. The Python identity process (`idprocess.py`) does not yet perform ZTA checks.
+2. **Multi-operator ZTA — answered 2026-08-06, both runtimes.** In coalition/multi-agency scenarios (LunaNet, joint ops), peers may have certs from different CAs. The ZTA policy now names trust anchors explicitly and an identity carries a repeated `ZtaCredential{der, binding, issuer}` (proto field 16), so admission is *any-of* across configured anchors and each verified credential earns authority for its own anchor (`zta_anchors` — the observer's finding, never serialized). Group federation then requires a *proved* shared anchor rather than a declared gateway role — gatewayhood is emergent in AT, so a declared rule would rest on the peer's own claim and an attacker would simply decline to claim.
+
+   What the question above got wrong is the assumption that this needs cross-certification or CA trust negotiation. It needs neither: nothing has to make two CAs recognize each other, only make *this node* recognize both, and a holder-asserted binding (§1.5) lets a foreign CA's credential bind to an AT identity without that CA knowing AT exists. Coalition deployment is in fact what forces the holder-asserted route — a foreign CA will not put an AT uuid in a SAN, so the CA-asserted route is unavailable exactly where coalitions need it.
+
+Item 1 remains a design direction rather than scoped work, recorded in
+[`ISSUES.md`](../../ISSUES.md) §10.5. Item 2 is closed in both runtimes (§1.5).
+
+The integration is not C-only: the Python identity process (`idprocess.py`) performs ZTA checks at admission time (`_zta_admit`, gated in `welcoming_committee`), with X.509 verification, DDIL reputation capping, and wire-level credential carriage at parity with C. See [ZTA Python Parity](zta-python-parity.md) for that implementation and for the features that are C-only (background re-verification process, audit log, delegated verification).
+
+**As of 2026-08-06 the credential→identity *binding* gate, named trust anchors, multi-credential admission, and derived gateway authority exist in BOTH runtimes** (ISSUES §1.5), pinned by 168/168 conformance cases with 0 asymmetric. `binding_mode: require` is therefore a fleet-wide guarantee rather than a per-runtime one: a C `welcoming_committee` and a Python one refuse the same credentials. The C side is a mirror, not a reimplementation — `zta/zta_binding.{h,c}`, `identity.c::zta_binding_preimage`, `zta_policy_t.anchors`/`binding_mode`/`san_uri_template`, a repeated-credential list on `public_identity_t` (proto field 16), `id_proc.c::_zta_admit`, and `_gateway_authorized`.
 
 ---
 

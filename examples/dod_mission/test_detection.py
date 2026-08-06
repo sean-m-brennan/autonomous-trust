@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2026 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #  Licensed under the Apache License, Version 2.0
 # ******************
 """Tests for the SG2 Phase 2 sparse-detection pipeline.
@@ -48,6 +48,7 @@ def _make_catalogue(*objects: tuple[str, float, float, str]) -> list:
             crop=f"crops/{uid}.jpg", crop_b64="",
             crop_size_px=(128, 96),
             bbox_panorama_px=(0, 0, 10, 10),
+            obb_panorama_px=(),
             center_utm=(e, n), center_squad_xy=(cx, cy),
             center_latlon=(lat, lon),
             label=uid, extra={"scenario_role": role},
@@ -81,12 +82,13 @@ def test_rq86_sees_entire_ao(catalogue):
                                      "squad-marker"}
 
 
-def test_microdrone_fov_limited_to_350m_forward(catalogue):
+def test_microdrone_fov_centered_footprint(catalogue):
     src = det.DetectionSource("microdrone-1", "microdrone",
                               catalogue=catalogue,
                               view_center_latlon=SQUAD_LL)
-    # Squad faces north (default); compound at ~2km north is way out
-    # of the 350m fwd rectangle, only squad-marker (right under) shows
+    # Microdrone has a small nadir footprint centered on itself; at the LZ
+    # only squad-marker (right under) shows. The compound ~2km north is far
+    # outside the footprint until the drone moves over it (see the pose tests).
     assert "squad-marker" in src.visible_uids
     assert "compound-alpha" not in src.visible_uids
 
@@ -158,7 +160,8 @@ def test_compromise_swaps_position_and_crop_keeps_uid(catalogue):
                                  catalogue=catalogue,
                                  view_center_latlon=(34.724448, -86.634330))
     comp = ci.wrap_detection_source_with_compromise(honest)
-    out = comp.tick(timedelta(seconds=10))
+    # Tick past the compromise activation (T+4:15) so the decoy swap is live.
+    out = comp.tick(timedelta(seconds=260))
     by_uid = {}
     for r in out:
         if r.data_type == "detection":
@@ -187,6 +190,48 @@ def test_compromise_falls_back_when_decoy_missing():
     out = comp.tick(timedelta(seconds=10))
     alpha = next(r for r in out if r.data_type == "detection")
     assert alpha.metadata["crop_id"] == "crops/compound-alpha.jpg"
+
+
+def test_compromise_honest_until_activation_then_decoy(catalogue):
+    # Anomaly-reveal gate: the MQ-800 reports the honest target until the
+    # compromise activates (T+4:15), then designates the decoy. Before:
+    # compound-alpha carries its OWN crop (clusters with the RQ-86s). After:
+    # it keeps the alpha UID but carries bravo's crop — the "wrong building".
+    honest = det.DetectionSource("mq800", "armed-drone", catalogue=catalogue,
+                                 view_center_latlon=(34.724448, -86.634330))
+    comp = ci.wrap_detection_source_with_compromise(honest)
+
+    early = {r.metadata["world_uid"]: r
+             for r in comp.tick(timedelta(seconds=100))
+             if r.data_type == "detection"}
+    assert early["compound-alpha"].metadata["crop_id"] == \
+        "crops/compound-alpha.jpg"
+
+    late = {r.metadata["world_uid"]: r
+            for r in comp.tick(timedelta(seconds=260))
+            if r.data_type == "detection"}
+    assert late["compound-alpha"].metadata["crop_id"] == \
+        "crops/compound-bravo.jpg"
+
+
+def test_arrival_gate_suppresses_emission_before_join(catalogue):
+    # Arrival gate: a late joiner emits nothing at all before its join time.
+    src = det.DetectionSource("mq800", "armed-drone", catalogue=catalogue,
+                              view_center_latlon=GROUND_MID_LL,
+                              active_after_sec=240.0)
+    assert src.tick(timedelta(seconds=100)) == []     # not arrived yet
+    assert src.tick(timedelta(seconds=250)) != []      # arrived → emits
+
+
+def test_wrap_preserves_arrival_gate(catalogue):
+    # Wrapping an honest source for compromise must not reopen the
+    # pre-arrival window.
+    honest = det.DetectionSource("mq800", "armed-drone", catalogue=catalogue,
+                                 view_center_latlon=GROUND_MID_LL,
+                                 active_after_sec=240.0)
+    comp = ci.wrap_detection_source_with_compromise(honest)
+    assert comp.active_after_sec == 240.0
+    assert comp.tick(timedelta(seconds=100)) == []
 
 
 # --- Validator integration --------------------------------------------
@@ -225,6 +270,33 @@ def test_validator_catches_mq800_alpha_lie():
     assert lie is not None
     assert lie.is_anomalous
     assert lie.deviation > 50.0
+
+
+def test_three_source_one_liar_does_not_flag_honest_sources():
+    """Regression: the degenerate 3-source window (two honest recon + the
+    lone rogue) must flag ONLY the rogue, never the honest pair.
+
+    This is the live false-positive that condemned both RQ-86s: once the
+    swarm exfiltrates, only rq86-1, rq86-2, and the MQ-800 remain on the
+    primary target track. Under the old "median of others" consensus, each
+    honest RQ-86 was judged against the average of {other RQ-86, MQ-800},
+    dragged ~half the gap toward the lie, so all three tripped the 50 m
+    threshold. With the median of ALL sources the honest cluster sets the
+    consensus and only the rogue deviates."""
+    v = CrossSourceValidator(data_type="target_position_x",
+                             threshold=50.0, min_sources=3, window_sec=10.0)
+    # Mirrors the real values around the recorded detection (~t+7:20).
+    v.submit(_detection_position_x("rq86-1", -213.6, "compound-alpha", 0))
+    v.submit(_detection_position_x("rq86-2", -212.5, "compound-alpha", 1))
+    rogue = v.submit(_detection_position_x("mq800", 85.9,
+                                           "compound-alpha", 2))
+    assert rogue is not None and rogue.is_anomalous
+    # Re-submit the honest pair now that all three sources are active; they
+    # must read clean against the median-of-all consensus.
+    h1 = v.submit(_detection_position_x("rq86-1", -213.6, "compound-alpha", 3))
+    h2 = v.submit(_detection_position_x("rq86-2", -212.5, "compound-alpha", 4))
+    assert h1 is not None and not h1.is_anomalous, h1.deviation
+    assert h2 is not None and not h2.is_anomalous, h2.deviation
 
 
 def test_load_catalogue_inlines_real_crops(tmp_path):
@@ -448,6 +520,28 @@ def test_drawer_renders_detection_section():
     assert "no contacts" in html_empty
 
 
+def test_drawer_renders_obb_polygon_when_present():
+    """When the detection carries an oriented box, the drawer draws a
+    rotated <polygon> (not the axis-aligned <rect>)."""
+    from autonomous_trust.inspector.dashboard.peer_detail import (
+        DetectionSummary, PeerDetailPanel, PeerDetailState,
+    )
+    d = DetectionSummary(
+        crop_b64="dGVzdA==", crop_size_px=(128, 96),
+        bbox_in_crop_px=(21, 16, 107, 80),
+        obb_in_crop_px=((30, 16), (107, 30), (98, 80), (21, 66)),
+        label="compound-alpha", world_uid="compound-alpha",
+        confidence=0.87, age_sec=4.5,
+    )
+    html = PeerDetailPanel().to_html(PeerDetailState(
+        name="rq86-1", agency="Air-Support", kind="recon-drone",
+        detection=d))
+    assert "<polygon points=" in html
+    assert "30,16" in html and "107,30" in html
+    # OBB takes precedence over the axis-aligned rect.
+    assert '<rect x="21"' not in html
+
+
 def test_peer_detail_forming_reputation_matches_list():
     """A peer with no consensus reputation yet renders 'forming…' (the
     same wording the Reputations list shows for a None score), not a
@@ -479,7 +573,10 @@ def test_validator_backward_compat_for_metadata_less_reading():
     v.submit(Reading(td(seconds=0), "noaa-1", "temperature", 20.0, "C"))
     v.submit(Reading(td(seconds=1), "noaa-2", "temperature", 21.0, "C"))
     res = v.submit(Reading(td(seconds=2), "noaa-3", "temperature", 30.0, "C"))
-    assert res.is_anomalous and abs(res.deviation - 9.5) < 0.01
+    # metadata-less readings still bucket together and validate. Consensus is
+    # the median of ALL sources {20, 21, 30} = 21, so the 30 C outlier
+    # deviates by 9.0 (was 9.5 under the old median-of-others). Still anomalous.
+    assert res.is_anomalous and abs(res.deviation - 9.0) < 0.01
 
 
 class _FakeBundleForPickle:
@@ -515,3 +612,309 @@ def test_detection_augmented_bundle_survives_pickle():
     assert back.electronic_noise == 0.05
     # tick() composes both producers — proves the wrapper isn't broken.
     assert back.tick(7) == [("x", 7)]
+
+
+# --- Link-degradation model (§5.5) ------------------------------------
+
+def _count_by_type(readings, data_type):
+    return sum(1 for r in readings if r.data_type == data_type)
+
+
+def test_degradation_tier_mapping():
+    # Boundary checks against §5.5's four tiers.
+    assert det._degradation_tier(0.95) == (det.DEGRADE_PASS, 0.95)
+    assert det._degradation_tier(0.80) == (det.DEGRADE_PASS, 0.95)
+    assert det._degradation_tier(0.79) == (det.DEGRADE_DOWNSAMPLE, 0.7)
+    assert det._degradation_tier(0.50) == (det.DEGRADE_DOWNSAMPLE, 0.7)
+    assert det._degradation_tier(0.49) == (det.DEGRADE_DROP, 0.4)
+    assert det._degradation_tier(0.20) == (det.DEGRADE_DROP, 0.4)
+    assert det._degradation_tier(0.19) == (det.DEGRADE_LOST, 0.1)
+    assert det._degradation_tier(0.0) == (det.DEGRADE_LOST, 0.1)
+
+
+def test_pass_through_full_quality(catalogue):
+    src = det.DetectionSource("rq86-1", "recon-drone", catalogue=catalogue,
+                              view_center_latlon=GROUND_MID_LL,
+                              link_quality=0.95)
+    assert src.degrade_tier == det.DEGRADE_PASS
+    readings = src.tick(timedelta(seconds=10))
+    dets = [r for r in readings if r.data_type == "detection"]
+    assert dets and all(abs(r.quality - 0.95) < 1e-9 for r in dets)
+
+
+def test_link_lost_suppresses_detections(catalogue):
+    src = det.DetectionSource("rq86-1", "recon-drone", catalogue=catalogue,
+                              view_center_latlon=GROUND_MID_LL,
+                              link_quality=0.1)
+    assert src.degrade_tier == det.DEGRADE_LOST
+    readings = src.tick(timedelta(seconds=10))
+    # Only a heartbeat fires, flagged link_lost; no detection events.
+    assert _count_by_type(readings, "detection") == 0
+    hbs = [r for r in readings if r.data_type == "detection_heartbeat"]
+    assert len(hbs) == 1
+    assert hbs[0].metadata["link_lost"] is True
+    assert hbs[0].metadata["degradation"] == det.DEGRADE_LOST
+
+
+def test_reading_quality_reflects_downsample_tier(catalogue):
+    src = det.DetectionSource("rq86-1", "recon-drone", catalogue=catalogue,
+                              view_center_latlon=GROUND_MID_LL,
+                              link_quality=0.6)
+    assert src.degrade_tier == det.DEGRADE_DOWNSAMPLE
+    readings = src.tick(timedelta(seconds=10))
+    dets = [r for r in readings if r.data_type == "detection"]
+    assert dets and all(abs(r.quality - 0.7) < 1e-9 for r in dets)
+    assert all(r.metadata["degradation"] == det.DEGRADE_DOWNSAMPLE
+               for r in dets)
+    assert all(abs(r.metadata["link_quality"] - 0.6) < 1e-9 for r in dets)
+
+
+def test_degraded_link_drops_one_in_three(catalogue):
+    # rq86 sees all three catalogue objects; the per-contact drop counter
+    # advances 1,2,3 within the tick and drops the third (counter % 3 == 0).
+    src = det.DetectionSource("rq86-1", "recon-drone", catalogue=catalogue,
+                              view_center_latlon=GROUND_MID_LL,
+                              link_quality=0.3)
+    assert src.degrade_tier == det.DEGRADE_DROP
+    readings = src.tick(timedelta(seconds=10))
+    # 3 visible, 1 dropped → 2 detection events, each quality 0.4.
+    assert _count_by_type(readings, "detection") == 2
+    dets = [r for r in readings if r.data_type == "detection"]
+    assert all(abs(r.quality - 0.4) < 1e-9 for r in dets)
+
+
+def _real_crop_b64(w=128, h=96):
+    """A real JPEG crop encoded as base64, for transform tests."""
+    PIL = pytest.importorskip("PIL")
+    from PIL import Image
+    import base64 as _b64
+    import io as _io
+    img = Image.new("RGB", (w, h), (120, 160, 90))
+    buf = _io.BytesIO()
+    img.save(buf, format="JPEG")
+    return _b64.b64encode(buf.getvalue()).decode("ascii"), (w, h)
+
+
+def test_downsample_resizes_crop_bytes():
+    pytest.importorskip("PIL")
+    crop_b64, size = _real_crop_b64()
+    obj = det.CatalogueObject(
+        world_uid="compound-alpha", cls="building", confidence=0.9,
+        crop="crops/alpha.jpg", crop_b64=crop_b64, crop_size_px=size,
+        bbox_panorama_px=(0, 0, 10, 10), obb_panorama_px=(),
+        center_utm=det._wgs84_to_utm(*GROUND_MID_LL),
+        center_squad_xy=det._utm_to_squad_xy(*det._wgs84_to_utm(*GROUND_MID_LL)),
+        center_latlon=GROUND_MID_LL, label="alpha", extra={})
+    src = det.DetectionSource("rq86-1", "recon-drone", catalogue=[obj],
+                              view_center_latlon=GROUND_MID_LL,
+                              link_quality=0.6)
+    dets = [r for r in src.tick(timedelta(seconds=10))
+            if r.data_type == "detection"]
+    assert len(dets) == 1
+    assert dets[0].metadata["crop_size_px"] == [64, 48]
+    assert dets[0].metadata["crop_b64"] != crop_b64  # actually transformed
+
+
+# --- OBB (oriented box) in crop coords --------------------------------
+
+def test_obb_in_crop_transform():
+    # Axis-aligned OBB corners with a 1:1 crop scale map to the inner rect
+    # left after the 20% bake-out margin.
+    obb = ((100, 100), (200, 100), (200, 200), (100, 200))
+    pts = det._obb_in_crop(obb, (100, 100, 200, 200), (140, 140))
+    assert pts == [[20, 20], [120, 20], [120, 120], [20, 120]]
+    # Unusable inputs degrade to [].
+    assert det._obb_in_crop((), (0, 0, 10, 10), (128, 96)) == []
+    assert det._obb_in_crop(obb, (100, 100, 200, 200), (0, 0)) == []
+
+
+def test_emit_includes_obb_in_crop():
+    obj = det.CatalogueObject(
+        world_uid="compound-alpha", cls="building", confidence=0.9,
+        crop="crops/a.jpg", crop_b64="", crop_size_px=(128, 96),
+        bbox_panorama_px=(100, 100, 200, 200),
+        obb_panorama_px=((110, 100), (200, 110), (190, 200), (100, 190)),
+        center_utm=det._wgs84_to_utm(*GROUND_MID_LL),
+        center_squad_xy=det._utm_to_squad_xy(*det._wgs84_to_utm(*GROUND_MID_LL)),
+        center_latlon=GROUND_MID_LL, label="alpha", extra={})
+    src = det.DetectionSource("rq86-1", "recon-drone", catalogue=[obj],
+                              view_center_latlon=GROUND_MID_LL,
+                              link_quality=0.95)
+    dets = [r for r in src.tick(timedelta(seconds=10))
+            if r.data_type == "detection"]
+    assert len(dets) == 1
+    obb_pts = dets[0].metadata["obb_in_crop_px"]
+    assert len(obb_pts) == 4 and all(len(p) == 2 for p in obb_pts)
+    # Rotated box is NOT an axis-aligned rectangle (corners differ in both x,y).
+    xs = {p[0] for p in obb_pts}
+    ys = {p[1] for p in obb_pts}
+    assert len(xs) > 2 and len(ys) > 2
+
+
+# --- Map click-to-select (dropdown alternative) -----------------------
+
+def test_map_peer_markers_carry_customdata():
+    """TargetPositionMapPanel tags each peer marker with customdata=[name]
+    so a map click can resolve to a drawer selection."""
+    pytest.importorskip("plotly")
+    sys.path.insert(0, str(_DOD / "dashboard"))
+    import target_position_map as tpm
+
+    panel = tpm.TargetPositionMapPanel({"rq86-1": "#1FB8CD"})
+    for dt, val in (("target_position_x", 120.0), ("target_position_y", 340.0)):
+        panel.add_reading(Reading(
+            timestamp=timedelta(seconds=10), peer_name="rq86-1",
+            data_type=dt, value=val, unit="m", quality=0.95,
+            metadata={"world_uid": "compound-alpha"}))
+    # A reported-target marker only renders while its reporter is a currently-
+    # active platform (set_platforms), so register rq86-1 as one before drawing.
+    panel.set_platforms({"rq86-1": {"lat": 34.724, "lon": -86.640, "alt": 5000.0,
+                                    "kind": "recon-drone", "color": "#1FB8CD"}})
+    fig = panel.figure()
+    customs = []
+    for tr in fig.data:
+        cd = getattr(tr, "customdata", None)
+        if cd is not None:
+            customs.extend(list(cd))
+    assert "rq86-1" in customs
+
+
+def test_peer_from_map_click_resolves_customdata():
+    """live_server._peer_from_map_click pulls the peer name out of a marker
+    click and returns None for non-peer geometry."""
+    pytest.importorskip("dash")
+    pytest.importorskip("dash_extensions")
+    sys.path.insert(0, str(_DOD / "dashboard"))
+    import live_server as ls
+
+    # Peer marker click → peer name.
+    click = {"points": [{"customdata": ["mq800"], "lat": 34.7, "lon": -86.6}]}
+    assert ls._peer_from_map_click(click) == "mq800"
+    # Scalar customdata also accepted.
+    assert ls._peer_from_map_click(
+        {"points": [{"customdata": "rq86-1"}]}) == "rq86-1"
+    # Non-peer geometry / empty / malformed → None (selection untouched).
+    assert ls._peer_from_map_click({"points": [{"lat": 1.0}]}) is None
+    assert ls._peer_from_map_click({"points": []}) is None
+    assert ls._peer_from_map_click(None) is None
+
+
+# --- Simulator-driven peer motion (pose provider) ----------------------
+
+def test_update_pose_recomputes_visibility(catalogue):
+    # A microdrone parked at the squad start can't see the compound 2km N.
+    src = det.DetectionSource("microdrone-1", "microdrone",
+                              catalogue=catalogue, view_center_latlon=SQUAD_LL)
+    assert "compound-alpha" not in src.visible_uids
+    # Advance it north to the objective — the compound enters its FOV.
+    changed = src.update_pose(GROUND_MID_LL)
+    assert changed is True
+    assert "compound-alpha" in src.visible_uids
+    # Re-applying the same pose is a no-op (no needless FOV recompute).
+    assert src.update_pose(GROUND_MID_LL) is False
+
+
+def test_pose_provider_drives_motion_in_tick(catalogue):
+    # The pose provider feeds the live position each tick; once it places the
+    # microdrone over the objective, it detects the compound.
+    pose = {"ll": SQUAD_LL}
+    src = det.DetectionSource(
+        "microdrone-1", "microdrone", catalogue=catalogue,
+        view_center_latlon=SQUAD_LL,
+        pose_provider=lambda: (pose["ll"][0], pose["ll"][1]))
+    # Still at the squad start: no compound detection.
+    early = src.tick(timedelta(seconds=10))
+    early_uids = {r.metadata.get("world_uid") for r in early
+                  if r.data_type == "detection"}
+    assert "compound-alpha" not in early_uids
+    # Drone advances to the objective; next tick (past the time floor) sees it.
+    pose["ll"] = GROUND_MID_LL
+    late = src.tick(timedelta(seconds=20))
+    late_uids = {r.metadata.get("world_uid") for r in late
+                 if r.data_type == "detection"}
+    assert "compound-alpha" in late_uids
+
+
+def test_pose_provider_failure_keeps_last_pose(catalogue):
+    # A flaky pose source must not crash the sensor loop.
+    def _boom():
+        raise RuntimeError("sim feed dropped")
+    src = det.DetectionSource("rq86-1", "recon-drone", catalogue=catalogue,
+                              view_center_latlon=GROUND_MID_LL,
+                              pose_provider=_boom)
+    out = src.tick(timedelta(seconds=10))  # must not raise
+    assert any(r.data_type == "detection" for r in out)
+
+
+def _haversine_m(ll_a, ll_b):
+    import math
+    (la1, lo1), (la2, lo2) = ll_a, ll_b
+    la1, la2 = math.radians(la1), math.radians(la2)
+    dla, dlo = la2 - la1, math.radians(lo2 - lo1)
+    h = (math.sin(dla / 2) ** 2
+         + math.cos(la1) * math.cos(la2) * math.sin(dlo / 2) ** 2)
+    return 2 * 6371000.0 * math.asin(math.sqrt(h))
+
+
+def _pose_stub(peer_name="microdrone-1"):
+    """Minimal stand-in for a DoDMissionParticipant carrying just the
+    attributes _detection_pose_provider reads, so we can exercise the wiring
+    without the participant's full identity/worker startup."""
+    from scenario import DoDMissionScenario
+
+    class _Stub:
+        pass
+    stub = _Stub()
+    stub.scenario = DoDMissionScenario()
+    stub.peer_name = peer_name
+    stub._t0_epoch = 0.0
+    return stub
+
+
+def test_microdrone_live_motion_wired_on_by_default():
+    # The participant wires live microdrone motion on by default: the pose
+    # provider replays this peer's scenario path, carrying it from the
+    # insertion LZ (~km from the objective) to the objective hold (~tens of m)
+    # as scenario time advances.
+    import time as _time
+    sys.path.insert(0, str(_DOD))
+    from participant import DoDMissionParticipant
+    from scenario import GROUND_MID  # the squad's actual objective (lat,lon,alt)
+
+    objective_ll = (GROUND_MID[0], GROUND_MID[1])
+    stub = _pose_stub()
+
+    def _pose_at(scenario_secs):
+        # The closure captures _t0_epoch; epoch = now - t lands the replay at t.
+        stub._t0_epoch = _time.time() - scenario_secs
+        prov = DoDMissionParticipant._detection_pose_provider(
+            stub, "microdrone", SQUAD_LL)
+        assert prov is not None
+        return prov()
+
+    lz = _pose_at(0.0)
+    hold = _pose_at(210.0)
+    assert lz is not None and hold is not None
+    assert _haversine_m(lz, objective_ll) > 1000     # still at the LZ
+    assert _haversine_m(hold, objective_ll) < 100     # converged on objective
+
+
+def test_pose_provider_scoping_and_optout(monkeypatch):
+    # Non-microdrone roles keep the stationary roster pose; an explicit
+    # instance provider wins; AT_DETECTION_LIVE_MOTION=0 opts out.
+    sys.path.insert(0, str(_DOD))
+    from participant import DoDMissionParticipant
+
+    stub = _pose_stub()
+    assert DoDMissionParticipant._detection_pose_provider(
+        stub, "recon-drone", GROUND_MID_LL) is None
+
+    sentinel = lambda: (1.0, 2.0)  # noqa: E731
+    stub._pose_provider = sentinel
+    assert DoDMissionParticipant._detection_pose_provider(
+        stub, "microdrone", SQUAD_LL) is sentinel
+
+    stub2 = _pose_stub()
+    monkeypatch.setenv("AT_DETECTION_LIVE_MOTION", "0")
+    assert DoDMissionParticipant._detection_pose_provider(
+        stub2, "microdrone", SQUAD_LL) is None

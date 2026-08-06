@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -71,6 +71,52 @@ DEFINE_TEST(test_group_json_roundtrip)
 }
 END_TEST_DEFINITION()
 
+/* Group-key sync (SG3): group_to_json must serialize the RAW private key
+ * (when owned) so group_from_json reconstructs the SAME keypair — a peer
+ * receiving full_history can then decrypt group traffic. The prior code
+ * wrote the PUBLIC key but read it back as a seed, so the keypair never
+ * round-tripped. Also pins the cross-runtime canonical: hex_seed is the
+ * raw private key + public_only=false. */
+DEFINE_TEST(test_group_json_roundtrip_preserves_keypair)
+{
+    ck_assert(sodium_init() >= 0);
+
+    uuid_t uuid;
+    uuid_generate(uuid);
+    char addr[] = "10.0.0.7";
+
+    group_t *grp = NULL;
+    ck_assert_ret_ok(group_create(&uuid, addr, &grp));
+    /* group_create generates a keypair, so we own the private key */
+    ck_assert_int_eq(sodium_is_zero(grp->encryptor.private,
+                                    crypto_box_SECRETKEYBYTES), 0);
+
+    json_t *obj = NULL;
+    ck_assert_ret_ok(group_to_json(grp, &obj));
+
+    /* Canonical: hex_seed is 64 chars (raw 32-byte private key) + public_only=false */
+    json_t *encr = json_object_get(obj, "encryptor");
+    const char *hex = json_string_value(json_object_get(encr, "hex_seed"));
+    ck_assert_ptr_nonnull(hex);
+    ck_assert_uint_eq(strlen(hex), (size_t)(crypto_box_SECRETKEYBYTES * 2));
+    json_t *po = json_object_get(encr, "public_only");
+    ck_assert_ptr_nonnull(po);
+    ck_assert(!json_boolean_value(po));
+
+    /* Round-trip: the reconstructed keypair must match byte-for-byte */
+    group_t grp2;
+    memset(&grp2, 0, sizeof(grp2));
+    ck_assert_ret_ok(group_from_json(obj, &grp2));
+    ck_assert_int_eq(memcmp(grp->encryptor.private, grp2.encryptor.private,
+                            crypto_box_SECRETKEYBYTES), 0);
+    ck_assert_int_eq(memcmp(grp->encryptor.public, grp2.encryptor.public,
+                            crypto_box_PUBLICKEYBYTES), 0);
+
+    json_decref(obj);
+    group_free(grp);
+}
+END_TEST_DEFINITION()
+
 DEFINE_TEST(test_group_free_null)
 {
     /* group_free(NULL) should not crash */
@@ -114,6 +160,7 @@ DEFINE_TEST(test_group_init_nul_terminates_long_address)
 }
 END_TEST_DEFINITION()
 
-RUN_TESTS(Group2, test_group_json_roundtrip, test_group_free_null,
+RUN_TESTS(Group2, test_group_json_roundtrip,
+          test_group_json_roundtrip_preserves_keypair, test_group_free_null,
           test_group_publish_null,
           test_group_init_nul_terminates_long_address)

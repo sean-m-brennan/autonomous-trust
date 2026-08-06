@@ -1,3 +1,19 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+# ******************
+
 """Tests for the persistent-cohort feature.
 
 Covers:
@@ -44,10 +60,10 @@ def _mk_identity(name: str, tier: int = 0) -> Identity:
     ident = Identity(
         _uuid=uuid4(),
         address=name,
-        _fullname=f"{name}@test",
-        _nickname=name,
+        _nickname=f"{name}@test",  # Zooko online name (decorated)
         _signature=Signature.generate(),
         _encryptor=Encryptor.generate(),
+        petname=name,              # Zooko local name (bare roster label)
     )
     ident._tier = tier  # noqa: SLF001
     return ident
@@ -98,7 +114,7 @@ def test_peers_filtered_for_persist_keeps_only_listed_uuids():
         peers.add(ident)
     keep = {alice.uuid, bob.uuid}
     filtered = peers.filtered_for_persist(keep)
-    assert {p.nickname for p in filtered.all} == {"alice", "bob"}
+    assert {p.petname for p in filtered.all} == {"alice", "bob"}
     # Hierarchy + valuation both filtered
     assert all("carol" not in level for level in filtered.hierarchy)
     assert all("carol" not in tier for tier in filtered.valuation)
@@ -183,7 +199,7 @@ def test_seed_cohort_mutual_recognition(tmp_path, scenario_factory):
         peers_file = tmp_path / peer / "etc" / "at" / "peers.cfg.json"
         with peers_file.open() as f:
             peers = json.load(f, object_hook=config_json_decoder)
-        names = {p.nickname for p in peers.all}
+        names = {p.petname for p in peers.all}  # bare roster label (Zooko local)
         for other in seeded:
             if other == peer:
                 assert other not in names, "self should not be in peers"

@@ -1,0 +1,82 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: zta-binding-admit-bound
+byte_pinning: false
+description: |
+    The credential->identity binding, happy path, and the case that makes
+    `binding_mode: require` usable at all (ISSUES §1.5).
+
+    The newcomer presents a chain-valid credential AND a holder-asserted binding
+    — a signature by that credential's own private key over
+
+        "at-zta-binding-v1" || uuid || node signing key || sha256(credential)
+
+    Because the node is named inside the signed bytes, this answers the question
+    the chain cannot: not "is this certificate genuine" but "may THIS node
+    present it". The border guard verifies it and admits.
+
+    The binding is signed AT SCENARIO TIME by both adapters from
+    testdata/zta/certs/operator_leaf.key rather than pinned as a recorded blob,
+    for the same reason the operator-key cases are: it holds the two
+    implementations to the same pre-image and the same signature scheme instead
+    of to one implementation's saved output. RSA PKCS#1 v1.5 over SHA-256 is
+    deterministic, so they agree byte for byte or this fails.
+
+    It also pins the wire path: fields 6-8 have nowhere to carry a binding, so
+    the credential travels in the repeated `zta_credentials` (field 16) — which
+    is why that field exists.
+
+    Cross-impl: pinned on BOTH sides, ZTA-gated; without OpenSSL the C side skips
+    and diff_results.py treats a one-side skip as a match.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  zta_policy:
+    enabled: true
+    require_at_admission: true
+    binding_mode: require
+    verifier_type: x509
+    ca_bundle_path: testdata/zta/operator-ca-bundle.pem
+  credentials:
+    newcomer: testdata/zta/certs/operator_leaf.der
+  zta_bindings:
+    newcomer: valid
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+    description: newcomer announces a chain-valid, BOUND credential.
+  - id: 2
+    from: bg
+    to: broadcast
+    function: propose_peer
+    in_response_to: 1
+    description: |
+        The binding verifies, so the credential is usable and bg proposes the
+        candidate. This is the observable — propose_emitted=1.
+  - id: 3
+    from: bg
+    to: broadcast
+    function: peer_accepted
+    in_response_to: 1
+    description: After synchronous vote finalization the newcomer is stored.
+  - id: 4
+    from: bg
+    to: newcomer
+    function: access_granted
+    in_response_to: 1
+    description: bg sends its published identity to the newcomer.
+  - id: 5
+    from: bg
+    to: newcomer
+    function: full_history
+    in_response_to: 1
+    description: bg sends the group key + history DAG.

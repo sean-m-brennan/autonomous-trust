@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2024 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -28,6 +28,33 @@
 #include "msg_types.h"
 
 #define MSG_KEY_LEN PROC_NAME_LEN
+
+/**
+ * @brief IPC queue name of the daemon's own main loop.
+ *
+ * The loop binds this (@ref run_autonomous_trust) and sibling processes send
+ * to it — anything app-bound has to pass through the loop, which owns the
+ * app's queue name. One spelling, in one place, because a second spelling is
+ * exactly what silently swallowed negotiation's task results: they were sent
+ * to `"main"`, a name nothing ever binds.
+ */
+#define AT_MAIN_QUEUE "AutonomousTrust"
+
+/**
+ * @brief App → AT local-only verb: re-emit the current peer view.
+ *
+ * Carried as a @ref NET_MESSAGE `function` rather than as its own message
+ * type, following the established local-only-verb pattern (`tier_update`,
+ * `attest_trigger`, `local_rep_query`): typed messages dispatch through a
+ * single shared switch that cannot reach process-specific code, whereas a
+ * function string dispatches to whichever process registered it.
+ *
+ * This is the ONLY verb the daemon accepts from an app, and it is forwarded
+ * to a fixed pair of processes — an app must not be able to inject arbitrary
+ * internal verbs at an arbitrary process.
+ */
+#define AT_APP_ROSTER_REQUEST "app_roster_request"
+
 #define DEFAULT_MAX_MSG_SIZE 1024
 /* MAX_MSG_SIZE is configurable at runtime via messaging_set_max_size() */
 #define MAX_MSG_SIZE (messaging_max_size())
@@ -69,6 +96,29 @@ typedef struct
   disjoint behaviors;
 */
 int messaging_init(const char *id, queue_t *queue);
+
+/**
+ * @brief Is a queue with this key actually bound — i.e. is somebody listening?
+ *
+ * The readiness question a host needs and could not previously ask. A forked
+ * daemon exists long before its message loop binds anything: measured, about
+ * **170-210 ms** separate `at_app_node_start` returning from the daemon's inbound
+ * queue appearing, and for that whole window the process is alive and nothing
+ * sent to it arrives. `at_app_node_alive` truthfully reports a running process
+ * and says nothing about reachability; this answers the other half.
+ *
+ * Probes with `connect` on a throwaway datagram socket rather than checking that
+ * the socket file exists, because a daemon that died leaves the file behind and a
+ * file check would call that ready. Sends nothing; has no effect on a listener.
+ *
+ * @param key Queue name.
+ * @return true if a socket is bound at that key's path.
+ */
+/*@
+  requires key != \null && \valid_read(key);
+  assigns \nothing;
+*/
+bool messaging_bound(const char *key);
 
 /**
  * @brief Identify the queue that belong to this process.

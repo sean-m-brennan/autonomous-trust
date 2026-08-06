@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #  Licensed under the Apache License, Version 2.0
 # ******************
 #
@@ -62,9 +62,28 @@ function(add_at_example target source)
         -Wl,--whole-archive autonomous_trust_static -Wl,--no-whole-archive
         ${DEPENDENCIES}
     )
-    target_compile_options(${target} PRIVATE -Wall)
+    # -fms-extensions is REQUIRED, not cosmetic: the library headers embed
+    # smrt_ptr_t (and struct tm / thread_args_t / public_identity_t) as
+    # anonymous typedef'd members. Without this flag GCC silently drops those
+    # members ("declaration does not declare anything"), giving the example a
+    # struct layout that disagrees with the library it links against. The
+    # library itself is built with -fms-extensions (src/c/CMakeLists.txt:136).
+    target_compile_options(${target} PRIVATE -Wall -fms-extensions)
+    # clang still emits -Wmicrosoft-anon-tag for those deliberate anonymous
+    # typedef'd members even with -fms-extensions; the library build suppresses
+    # the same spurious warning (src/c/CMakeLists.txt:125).
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+        target_compile_options(${target} PRIVATE -Wno-microsoft-anon-tag)
+    endif()
     install(TARGETS ${target} RUNTIME DESTINATION bin)
 endfunction()
+
+# ----- Minimal host app (src/c/example.c) -----
+# Built here because nothing built it before: it is the reference an integrator
+# copies, and an uncompiled reference is one nothing checks. It shipped with
+# app_name != q_in, so the daemon's messages went to a socket the app had not
+# bound and the tick callback could never have received anything.
+add_at_example(at_example ../src/c/example.c)
 
 # ----- Demo app (fleet update, containerized) -----
 add_at_example(at_demo demo/src/at_demo.c)

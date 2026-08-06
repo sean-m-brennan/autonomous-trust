@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -14,13 +14,17 @@
 #   limitations under the License.
 # ******************
 
+import base64
+import hashlib
 import hmac
 import os
 import sys
 import time
+import uuid
 from datetime import datetime
 from queue import Empty, Full
 import threading
+from types import SimpleNamespace
 from typing import Optional, Union
 
 from nacl.encoding import HexEncoder
@@ -28,6 +32,9 @@ from nacl.exceptions import BadSignatureError
 from nacl.signing import SignedMessage
 
 from . import Peers
+from .identity import Identity, public_identity_to_canonical, public_identity_from_canonical
+from .operator_binding import (OPERATOR_BINDING_MAX, OPERATOR_PUBKEY_LEN,
+                               verify_operator_binding)
 from .group import Group, ChildGroupSet
 from .history.history import IdentityHistory
 from ..algorithms.agreement import AgreementProof
@@ -35,14 +42,17 @@ from ..algorithms.impl import AgreementImpl
 from ..capabilities import PeerCapabilities
 import json
 from ..config import Configuration, to_json_string, from_json_string, names
-from ..config.configuration import ConfigJSONEncoder
+from ..config.configuration import ConfigJSONEncoder, atomic_write
 from ..processes import Process, ProcMeta
 from ..network import Message, Network
 from .history import IdentityByWork, IdentityByStake, IdentityByAuthority
 from .history import IdentityObj
 from .protocol import IdentityProtocol
+from .zta import (ZtaPolicy, ZtaStatus, ZTA_CRED_MAX, BINDING_MODE_PREFER,
+                  BINDING_MODE_REQUIRE)
+from .zta_binding import identity_is_bound
 from ..structures.dag import LinkedStep
-from ..system import CfgIds, encoding, PackageHash, now
+from ..system import CfgIds, encoding, PackageHash, now, _env_bool
 from .. import _probes
 
 
@@ -58,6 +68,73 @@ GroupTree = tuple[Group, list[LinkedStep]]
 # REPUTATION_PERSIST_THRESHOLD (rep > 0.5) via TIER_FLOORS: tier 1 floor
 # is 0.50, so any peer that's been scored above 0.5 has _tier >= 1.
 PERSIST_TIER_FLOOR = 1
+
+
+# Fan-out / cycle backstop for the recursive subtree-roster aggregation. Far
+# above any real cohort tree; bounds a malformed or looping topology so the
+# query returns a partial result rather than hanging.
+SUBTREE_ROSTER_MAX_NODES = 4096
+
+
+def aggregate_subtree_roster(top_gateway_uuid, fetch, max_nodes=SUBTREE_ROSTER_MAX_NODES):
+    """Breadth-first flatten of a gateway's subtree into a deduped, sorted
+    member roster — the requestor side of the recursive enumeration.
+
+    ``fetch(gateway_uuid) -> {'members': [...], 'child_gateways': [uuid_str],
+    'private': bool}`` is the per-gateway query: a network round-trip
+    (roster_req / roster_resp) in production, an injected stub in tests. Each
+    visited gateway contributes its local members and names the child gateways
+    to recurse into; this walks the tree, dedups members by uuid, and sorts by
+    uuid so the result is canonical across implementations.
+
+    A gateway that has opted out of disclosure (AT_ROSTER_PRIVATE) replies
+    with ``private: True`` and no members/children: it is recorded as an
+    intentional, opaque boundary, NOT as a failure — the enumeration simply
+    does not see behind it. A private TOP gateway therefore yields an empty
+    roster that is nonetheless ``complete`` (the network chose not to be
+    mapped), which the caller distinguishes from an unreachable node via the
+    boundary list.
+
+    Cycle- and fan-out-guarded. Returns ``(members, complete,
+    private_boundaries)`` where ``complete`` is False only if a fetch
+    failed/returned nothing or the node cap tripped (unreachability, NOT
+    privacy), and ``private_boundaries`` lists the gateway uuids that opted
+    out. A partial roster is returned rather than hanging or raising."""
+    by_uuid: dict[str, dict] = {}
+    private_boundaries: list[str] = []
+    complete = True
+    queued = [str(top_gateway_uuid)]
+    visited: set[str] = set()
+    while queued:
+        if len(visited) >= max_nodes:
+            complete = False
+            break
+        gateway = queued.pop(0)
+        if gateway in visited:
+            continue
+        visited.add(gateway)
+        try:
+            resp = fetch(gateway)
+        except Exception:
+            complete = False
+            continue
+        if not resp:
+            complete = False
+            continue
+        if resp.get('private'):
+            # Intentional opaque boundary — succeeded, but discloses nothing.
+            private_boundaries.append(gateway)
+            continue
+        for member in resp.get('members') or []:
+            key = str(member.get('uuid')) if isinstance(member, dict) else None
+            if key and key not in by_uuid:
+                by_uuid[key] = member
+        for child in resp.get('child_gateways') or []:
+            child = str(child)
+            if child not in visited and child not in queued:
+                queued.append(child)
+    members = [by_uuid[k] for k in sorted(by_uuid)]
+    return members, complete, private_boundaries
 
 
 class IdentityProcess(Process, metaclass=ProcMeta,
@@ -119,12 +196,65 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             raise RuntimeError('Invalid identity history implementation: %s' % impl)
         self.messages: list[Message] = []
         self.border_guard_mode = True
+        # Two-phase admission (ISSUES.md §3.1-a). A member receiving a
+        # `confirm` broadcast holds the peer PROVISIONAL — known in
+        # self.peers/history for reputation/routing, but the group key is NOT
+        # propagated to it (no group.add_address + _update_group) — until
+        # `_admission_quorum` DISTINCT border-guards have independently
+        # confirmed the admission, at which point it is promoted to CONFIRMED.
+        # The default quorum of 1 promotes on the first confirm, reproducing
+        # the historical single-welcomer behavior exactly (no regression); a
+        # deployment sets it higher for corroborated key handover. Local policy
+        # only — no wire field. `_provisional_confirmations` maps a peer uuid
+        # (str) to the set of confirmer uuids (str) seen so far.
+        self._admission_quorum = 1
+        self._provisional_confirmations: dict[str, set] = {}
         # 3-tuple: (group, history-steps, peer-identities). The peer
         # list rides along to seed self.peers with welcomer-known peers
         # whose admission confirm broadcasts predated our join. Older
         # sender versions send a 2-tuple; choose_group() tolerates both.
         self.histories: list[tuple] = []
         self.package_hash = self.configs[PackageHash.key]
+        # ZTA admission gate (parity with the C handle_welcoming_committee
+        # block, id_proc.c:777-821). Lazily built on first announce; the
+        # default policy is disabled so non-ZTA deployments are unaffected.
+        # See doc/architecture/zta-python-parity.md and zta-integration.md §11.
+        self._zta_policy_cache: Optional[ZtaPolicy] = None
+        self._zta_verifier_cache = None
+        self._zta_operator_verifier_cache = None  # operator-anchor verifier (D8/Q9)
+        # Per-anchor verifiers for the multi-credential admission path, one per
+        # named trust anchor. Separate cache from _zta_verifier_cache because the
+        # two answer different questions: that one is "the" verifier, this is the
+        # set a credential may chain to.
+        self._zta_anchor_cache = None
+        # Anchor names our OWN credentials verify against, for the gateway-authority
+        # check. Distinct from the peer-side zta_anchors: we never admit ourselves,
+        # so nothing else computes this.
+        self._own_anchor_cache = None
+        self._zta_capped: set = set()  # uuids admitted via DDIL fallback (rep-capped)
+        self._operator_verified: set = set()  # uuids whose operator credential verified
+        self._operator_session = None  # live OperatorSession, attached in P-L3
+        # Attended-now pulls awaiting the main loop's session answer:
+        # nonce -> (requestor Identity, req_proc, deadline). This process runs
+        # in its own subprocess and cannot see the console's OperatorSession, so
+        # each pull costs one local round trip to the main loop (which shares
+        # the console's address space). Nothing is cached, so nothing goes
+        # stale; a pull the main loop never answers ages out and is answered
+        # honestly as not-attended. See doc/architecture/operator-attended.md.
+        self._attest_pending: dict[str, tuple] = {}
+        # Pulls we SENT and have not yet resolved: nonce -> (peer_uuid,
+        # deadline). Keyed by nonce because the nonce is the only thing that
+        # makes a returned stamp attributable to a request we actually made.
+        self._attest_sent: dict[str, tuple] = {}
+        # Peers ReputationProcess has actually published a trust tier for, as
+        # uuid strings. `peer._tier` alone cannot answer this: it is a
+        # CONSTRUCTOR DEFAULT of 0 (identity.py:63) and the wire form does not
+        # carry it, so "nobody has scored this peer yet" and "this peer was
+        # scored down into tier 0" are the same value. The persistent-cohort
+        # save gate needs to tell those apart -- see
+        # _trusted_uuids_for_persist. A set of strings, so it survives the
+        # Process pickle across fork.
+        self._tier_published: set[str] = set()
         self.choosing = False
         # P1 group-merge tracking: set when choose_group falls through to
         # self-bootstrap (mesh didn't answer in init_timeout). A late
@@ -144,6 +274,28 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # multi-group path inert and behaviour identical to today.
         self.child_groups: dict[str, Group] = {}
         self.parent_gateway: Optional[str] = None
+        # Subtree member-roster recursion targets: child-group-uuid-str ->
+        # child-gateway-node-uuid-str. The values are the gateways a full
+        # subtree-roster query recurses into (see handle_roster_request /
+        # aggregate_subtree_roster). Empty on a leaf or a gateway with no
+        # deeper gateways, in which case a roster query is purely local and
+        # behaviour is identical to today. Seeded (group_child_*.cfg.json may
+        # name a gateway) or supplied by a test/adapter fixture.
+        self.child_gateways: dict[str, str] = {}
+        # Roster-privacy opt-out (AT config option AT_ROSTER_PRIVATE). When
+        # set, this node refuses to disclose its subtree to a roster query:
+        # handle_roster_request replies with a `private` marker carrying no
+        # members and no child gateways, so the enumeration stops at this
+        # node as an intentional, opaque boundary (distinct from an
+        # unreachable/timed-out node). Applies uniformly to every requestor,
+        # including the node's own app-issued enumeration — so a private
+        # TOP gateway yields an empty roster, which is how a fully private
+        # network/subtree opts out of being mapped at all. Enforced at the
+        # DISCLOSURE boundary only; enumerate_local_members stays pure (a
+        # node always knows its own members locally). Per-node granularity
+        # (one node = one process); C reads the same env var for parity.
+        # See doc/architecture/gateway-reputation-tree.md.
+        self.roster_private: bool = _env_bool('AT_ROSTER_PRIVATE')
         # Partition-recovery state — see doc/architecture/partition-recovery.md.
         # All three maps are pure local memory; no wire egress, no
         # configuration import.  They get reset when _merge_to_mesh adopts
@@ -156,6 +308,12 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self._partition_probe_cooldown: dict[str, datetime] = {}
         self._partition_response_cooldown: dict[str, datetime] = {}
         self._partition_recovery_in_progress: Optional[tuple[str, datetime]] = None
+        # Late-joiner capability-loss backstop (see feedback_late_joiner_caps):
+        # the confirm-time directed caps_query is a one-shot; if it OR its
+        # response is lost in UDP, a peer stays in self.peers but invisible to
+        # cap-driven discovery. This timestamp paces a periodic re-query sweep
+        # over cap-less peers. Set on first process() iteration (post-fork).
+        self._last_caps_resync: Optional[datetime] = None
         self.protocol.register_handler(IdentityProtocol.announce, self.welcoming_committee)
         self.protocol.register_handler(IdentityProtocol.accept, self.handle_acceptance)
         self.protocol.register_handler(IdentityProtocol.history, self.receive_history)
@@ -166,6 +324,14 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.update, self.handle_group_update)
         self.protocol.register_handler(IdentityProtocol.caps_query, self.handle_caps_query)
         self.protocol.register_handler(IdentityProtocol.caps_response, self.handle_caps_response)
+        self.protocol.register_handler(IdentityProtocol.id_query, self.handle_identity_query)
+        self.protocol.register_handler(IdentityProtocol.id_response, self.handle_identity_response)
+        self.protocol.register_handler(IdentityProtocol.roster_req, self.handle_roster_request)
+        self.protocol.register_handler(IdentityProtocol.attest_req, self.handle_attest_request)
+        self.protocol.register_handler(IdentityProtocol.attest_resp, self.handle_attest_response)
+        self.protocol.register_handler(IdentityProtocol.attest_trigger, self.handle_attest_trigger)
+        self.protocol.register_handler(IdentityProtocol.operator_state_resp,
+                                       self.handle_operator_state_response)
         self.protocol.register_handler(IdentityProtocol.tier_update, self.handle_tier_update)
         self.protocol.register_handler(IdentityProtocol.partition_signal, self.handle_partition_signal)
         self.protocol.register_handler(IdentityProtocol.partition_probe, self.handle_partition_probe)
@@ -179,18 +345,38 @@ class IdentityProcess(Process, metaclass=ProcMeta,
     def _trusted_uuids_for_persist(self):
         """Return uuids that should survive the persistent-cohort filter.
 
-        Self is always included. A peer survives iff its `_tier` attr
-        (populated by handle_tier_update from ReputationProcess) is at
-        or above PERSIST_TIER_FLOOR — i.e. rep > REPUTATION_PERSIST_THRESHOLD
-        per repprocess.TIER_FLOORS.
+        Self is always included. A peer survives unless it has been ASSESSED
+        and found wanting: it is dropped only when ReputationProcess has
+        actually published a tier for it (`self._tier_published`) and that tier
+        is below PERSIST_TIER_FLOOR — i.e. rep < REPUTATION_PERSIST_THRESHOLD
+        per repprocess.TIER_FLOORS. A peer nobody has scored yet is kept.
+
+        The gate used to read `_tier >= PERSIST_TIER_FLOOR` directly, which
+        looks equivalent and is not, because `_tier` is a constructor default
+        of 0 (identity.py:63) that the wire form never carries: an unscored
+        peer is indistinguishable from a demoted one. Measured consequence --
+        ReputationProcess only computes a score when something ASKS, and on a
+        quiet mesh nothing does (0 `rep.*` probe events across a 40 s two-peer
+        run), so no tier was ever published, every admitted peer sat at the
+        default 0, and the saved roster was EMPTY. Not "empty until the peer
+        earns trust" but empty permanently, which also means a node forgot
+        every legitimate group member across a restart. Admission is what makes
+        a peer a member; reputation only takes that away.
+
+        Note the neutral prior persists either way: `_trust_tier` uses
+        `score >= 0.50` (repprocess.py:1549-1554), so a peer scored at exactly
+        REPUTATION_PERSIST_THRESHOLD lands in tier 1 and is kept.
         """
         kept = {self.identity.uuid}
         for peer in self.peers.all:
-            tier = getattr(peer, '_tier', 0) or 0
-            if tier >= PERSIST_TIER_FLOOR:
-                puuid = getattr(peer, 'uuid', None)
-                if puuid is not None:
-                    kept.add(puuid)
+            puuid = getattr(peer, 'uuid', None)
+            if puuid is None:
+                continue
+            if str(puuid) in self._tier_published:
+                tier = getattr(peer, '_tier', 0) or 0
+                if tier < PERSIST_TIER_FLOOR:
+                    continue  # assessed, and below the floor
+            kept.add(puuid)
         return kept
 
     def _remember_activity(self, queues, name: str, obj: Union[Peers, PeerCapabilities, GroupHistory]):
@@ -220,7 +406,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self.update(obj, queues)
                 else:
                     self.configs[name] = obj[0]
-                    with open(filename, 'w') as cfg:
+                    # Atomic write: load_configs may read this snapshot
+                    # concurrently; a raw open(...,'w') exposes an empty window.
+                    with atomic_write(filename) as cfg:
                         if isinstance(obj[0], Group):
                             json.dump((obj[0], obj[1].to_dict()), cfg, cls=ConfigJSONEncoder, indent=2)
                         else:
@@ -330,10 +518,554 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         except Exception as err:
             self.logger.warning('_load_child_groups failed: %s' % err)
 
+    # --- Subtree member-roster enumeration -----------------------------------
+
+    def enumerate_local_members(self):
+        """The member identities this node holds directly: itself, its primary
+        group, and every child group it gateways (from each group's address
+        map). Returns a list of ``{'uuid', 'nickname', 'address'}`` dicts,
+        deduped by uuid and sorted by uuid. Pure and local — no network, no
+        reputation. A leaf node returns itself plus its primary-group members;
+        a gateway additionally includes each child group's members. This is the
+        per-node contribution the recursive aggregation composes across the
+        cohort tree. See doc/architecture/gateway-reputation-tree.md."""
+        by_uuid: dict[str, dict] = {}
+
+        def add(uuid, address=None, nickname=None):
+            key = str(uuid)
+            if not key:
+                return
+            entry = by_uuid.get(key)
+            if entry is None:
+                by_uuid[key] = {'uuid': key, 'nickname': nickname, 'address': address}
+                return
+            if nickname and not entry.get('nickname'):
+                entry['nickname'] = nickname
+            if address and not entry.get('address'):
+                entry['address'] = address
+
+        if self.identity is not None:
+            add(self.identity.uuid, getattr(self.identity, 'address', None),
+                getattr(self.identity, 'nickname', None))
+        groups = [self.group] + list(self.child_groups.values())
+        for grp in groups:
+            if grp is None:
+                continue
+            amap = getattr(grp, '_address_map', None) or {}
+            try:
+                items = list(amap.items())
+            except AttributeError:
+                items = []
+            for uuid, address in items:
+                nick = None
+                try:
+                    ident = self.peers.find_by_uuid(uuid) if self.peers else None
+                    nick = getattr(ident, 'nickname', None) if ident else None
+                except Exception:
+                    nick = None
+                add(uuid, address, nick)
+        return [by_uuid[k] for k in sorted(by_uuid)]
+
+    def _member_rank(self, uuid):
+        """A peer's rank for child-gateway discovery: operational
+        ``effective_rank`` if present, else the static ``_rank``, else 0
+        (unknown). Mirrors the welcomer-selection rank read (idprocess ~2082)."""
+        try:
+            peer = self.peers.find_by_uuid(uuid) if self.peers else None
+        except Exception:
+            peer = None
+        if peer is None:
+            return 0
+        r = getattr(peer, 'effective_rank', None)
+        if r is None:
+            r = getattr(peer, '_rank', 0)
+        return r or 0
+
+    def _own_zta_anchors(self) -> set:
+        """Anchor names OUR OWN credentials verify against. Computed locally, once.
+
+        Not read from ``self.identity.zta_anchors``: that field is what a *peer*
+        proved to us at admission, and we never admit ourselves. This walks our own
+        credentials through the same anchor verifiers instead.
+        """
+        if self._own_anchor_cache is None:
+            own = set()
+            identity = getattr(self, 'identity', None)
+            if identity is not None:
+                anchors = self._zta_anchor_verifiers()
+                for cred, _binding, _issuer in self._zta_credentials(identity):
+                    matched, _is_op, _fail, _defer = self._zta_match_anchors(cred, anchors)
+                    own.update(name for name, _v, _r in matched)
+            self._own_anchor_cache = own
+        return self._own_anchor_cache
+
+    def _gateway_authorized(self, peer_uuid) -> bool:
+        """Whether this node may federate through ``peer_uuid``.
+
+        The candidate must have PROVED, at admission, an anchor we also hold. That is
+        the derived-authority rule: crossing an agency boundary requires a credential
+        from an agency both sides recognize, and since nothing on the wire declares
+        gatewayhood, deriving the permission from verified credentials is the only
+        form of it a peer cannot simply assert. A candidate we never admitted has no
+        proved anchors and is refused — which is the point, not a side effect.
+
+        Inert (True) when the policy is not enforcing at admission, or when we hold no
+        anchors ourselves: with nothing to compare against, refusing every candidate
+        would break federation for every non-ZTA deployment rather than protecting
+        anything. Also inert on an object with no ZTA machinery wired at all, matching
+        how the rest of this gate stays usable on a lightweight stand-in.
+        """
+        try:
+            policy = self._zta_policy()
+        except AttributeError:
+            return True
+        if not (policy.enabled and policy.require_at_admission):
+            return True
+        own = self._own_zta_anchors()
+        if not own:
+            return True
+        peers = getattr(self, 'peers', None)
+        peer = peers.find_by_uuid(peer_uuid) if peers is not None else None
+        proved = set(getattr(peer, 'zta_anchors', None) or []) if peer is not None else set()
+        if proved & own:
+            return True
+        _probes.counter('id.gateway', 'federation_refused',
+                        'no_shared_anchor' if proved else 'no_proved_anchor')
+        self.logger.warning(
+            'Gateway: refusing to federate through %s: proved anchors %s share none '
+            'with ours %s', peer_uuid, sorted(proved) or '[]', sorted(own))
+        return False
+
+    def _discover_child_gateway(self, group, self_uuid):
+        """The recursion target for one child group = its highest-rank member
+        (excluding self), ties broken by the lexicographically greater uuid so
+        the choice is deterministic and identical in C. Returns a uuid string
+        or None (empty group / self only).
+
+        Candidates that cannot prove gateway authority for a boundary we share are
+        passed over rather than returned (see :meth:`_gateway_authorized`), so a peer
+        holding only a foreign agency's credential is never federated through — the
+        next-highest-rank eligible member is chosen instead.
+        """
+        amap = getattr(group, '_address_map', None) or {}
+        best, best_key = None, None
+        for uuid in amap:
+            u = str(uuid)
+            if self_uuid is not None and u == self_uuid:
+                continue
+            if not self._gateway_authorized(u):
+                continue
+            key = (self._member_rank(u), u)
+            if best_key is None or key > best_key:
+                best, best_key = u, key
+        return best
+
+    def _child_gateway_uuids(self):
+        """Node uuids of the child gateways a full-subtree roster recurses into
+        — one per gatewayed child group, **discovered by rank** (the highest-rank
+        member of the group, excluding self; see :meth:`_discover_child_gateway`).
+        An explicit ``self.child_gateways[cg]`` entry overrides discovery (tests /
+        pinned topologies). Deduped, order-stable. Empty when this node gateways
+        no deeper gateways — a roster query is then purely local. See
+        doc/architecture/gateway-reputation-tree.md."""
+        self_uuid = str(self.identity.uuid) if self.identity is not None else None
+        out = []
+        for cg_uuid, group in self.child_groups.items():
+            explicit = self.child_gateways.get(cg_uuid)
+            gw = str(explicit) if explicit else self._discover_child_gateway(group, self_uuid)
+            if gw and gw not in out:
+                out.append(gw)
+        return out
+
+    def _roster_response(self):
+        """This node's roster-query answer as a plain dict: ``{'members',
+        'child_gateways', 'private'}``. A node that opted out
+        (``self.roster_private``, AT config ``AT_ROSTER_PRIVATE``) discloses
+        nothing. Shared by :meth:`handle_roster_request` (the wire path) and
+        the requestor-side aggregation's fetch (tests / conformance), so both
+        see byte-identical content. See gateway-reputation-tree.md."""
+        if self.roster_private:
+            return {'members': [], 'child_gateways': [], 'private': True}
+        return {'members': self.enumerate_local_members(),
+                'child_gateways': self._child_gateway_uuids(),
+                'private': False}
+
+    def handle_roster_request(self, queues, message):
+        """Answer a subtree-roster query with this node's LOCAL members and the
+        child gateways to recurse into. The requestor performs the breadth-first
+        aggregation across the tree (see :func:`aggregate_subtree_roster`), so
+        this handler never blocks awaiting child responses — matching the async,
+        no-blocking-handler model of the rest of the protocol.
+
+        A node that has opted out of disclosure (``self.roster_private``,
+        AT config option ``AT_ROSTER_PRIVATE``) replies with a ``private``
+        marker carrying NO members and NO child gateways: the enumeration
+        stops here as an intentional, opaque boundary. The requestor
+        records the boundary (see :func:`aggregate_subtree_roster`) rather
+        than treating it as an unreachable/incomplete node.
+
+        The reply is addressed to the process the requestor named in
+        ``requesting_process`` (rep_req's convention), defaulting to the main
+        loop. That default is the answer's real home: inbound messages route by
+        ``Message.process`` alone, and the breadth-first aggregation that
+        consumes a roster_resp lives in the main loop
+        (AutonomousTrust._consume_roster_resp), not in this process. Replying
+        to our own process name would deliver every answer to the requestor's
+        identity process, which has no handler for it — the walk would then
+        never complete on a real multiprocess node while still looking correct
+        in a single-process test."""
+        if message.function != IdentityProtocol.roster_req:
+            return False
+        try:
+            requestor = message.from_whom
+            payload = message.obj
+            if isinstance(payload, str) and payload:
+                try:
+                    payload = from_json_string(payload)
+                except Exception:
+                    payload = {}
+            req_proc = (payload.get('requesting_process')
+                        if isinstance(payload, dict) else None) or CfgIds.main
+            out = to_json_string(self._roster_response())
+            reply = Message(req_proc, IdentityProtocol.roster_resp, out,
+                            to_whom=requestor if requestor is not None
+                            else Network.broadcast,
+                            from_whom=self.identity, encrypt=False)
+            queues[CfgIds.network].put(reply, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('handle_roster_request: Network queue full')
+        except Exception as err:
+            self.report_exception(err, 'handle_roster_request')
+        return True
+
+    # --- Operator-attended pull, responder side (ethne D8/Q9) ----------------
+
+    #: how long a pull waits for the main loop's session answer before it is
+    #: answered honestly as not-attended. Short: the round trip is two local
+    #: queue hops, and a puller waiting on attendance wants a prompt "no" far
+    #: more than a slow "yes".
+    _ATTEST_ROUND_TRIP_SEC = 2.0
+
+    def handle_attest_request(self, queues, message):
+        """Take in an attended-now pull and start the local session round trip.
+
+        Cannot answer inline: the live OperatorSession belongs to the console
+        app's address space, which the node's MAIN LOOP shares but this
+        subprocess does not. So record the pull and ask the main loop
+        (operator_state_query); handle_operator_state_response finishes it.
+        Returns without blocking, matching handle_roster_request's contract —
+        no handler in this protocol may wait on another process.
+
+        Where an in-process session HAS been attached (tests, single-process
+        embeds) the answer still goes through the same path, so both
+        deployments exercise one code path."""
+        if message.function != IdentityProtocol.attest_req:
+            return False
+        try:
+            payload = message.obj
+            if isinstance(payload, str):
+                payload = from_json_string(payload)
+            if not isinstance(payload, dict):
+                payload = {}
+            nonce = payload.get('nonce')
+            if not nonce:
+                # Unnonced pulls are refused, not answered: an attestation with
+                # nothing binding it to a request is replayable forever, which
+                # is precisely what attended-NOW must not permit.
+                self.logger.warning('handle_attest_request: missing nonce')
+                return True
+            deadline = self._now_epoch() + self._ATTEST_ROUND_TRIP_SEC
+            self._attest_pending[str(nonce)] = (message.from_whom, deadline)
+            query = Message(CfgIds.main, IdentityProtocol.operator_state_req,
+                            '', from_whom=self.identity)
+            queues[CfgIds.main].put(query, block=True, timeout=self.q_cadence)
+        except Full:
+            # The main loop is backlogged; the pull ages out on the next tick
+            # and gets answered as not-attended rather than left hanging.
+            self.logger.error('handle_attest_request: main queue full')
+        except Exception as err:
+            self.report_exception(err, 'handle_attest_request')
+        return True
+
+    def _attest_payload(self, nonce, attested_at):
+        """The attestation to return for one pull: the same shape the admission
+        path carries (so the receiver can re-verify the real operator
+        credential), with attended-now overridden by what the session just said
+        and the requestor's nonce echoed back to bind it to this request."""
+        payload = dict(self._operator_attestation())
+        payload['nonce'] = str(nonce)
+        if attested_at:
+            payload['operator_attested_at'] = float(attested_at)
+        else:
+            # Explicit 0 rather than an omitted key: "asked, and no human is
+            # attending" is a real answer and must not read as "didn't say".
+            payload['operator_attested_at'] = 0.0
+        return payload
+
+    def _answer_attest_pull(self, queues, nonce, requestor, attested_at):
+        """Send one attest_resp back to the puller.
+
+        Addressed to the puller's IDENTITY process (self.name, as
+        handle_roster_request does), because that is the only process holding
+        the operator trust anchor the answer has to be checked against — an
+        unverified attestation is not evidence of anything."""
+        try:
+            reply = Message(self.name, IdentityProtocol.attest_resp,
+                            to_json_string(self._attest_payload(nonce,
+                                                                attested_at)),
+                            to_whom=requestor if requestor is not None
+                            else Network.broadcast,
+                            from_whom=self.identity, encrypt=False)
+            queues[CfgIds.network].put(reply, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('_answer_attest_pull: Network queue full')
+        except Exception as err:
+            self.report_exception(err, '_answer_attest_pull')
+
+    def handle_operator_state_response(self, queues, message):
+        """The main loop reported the console session state — answer every pull
+        waiting on it.
+
+        One answer serves all pulls in flight: they all asked the same question
+        of the same session at effectively the same instant. `have_session`
+        False (a drone, or no console attached) is a legitimate answer meaning
+        not-attended, not an error."""
+        if message.function != IdentityProtocol.operator_state_resp:
+            return False
+        try:
+            payload = message.obj
+            if isinstance(payload, str):
+                payload = from_json_string(payload)
+            if not isinstance(payload, dict):
+                payload = {}
+            attended = bool(payload.get('attended'))
+            epoch = float(payload.get('epoch') or 0.0) if attended else 0.0
+            pending, self._attest_pending = self._attest_pending, {}
+            for nonce, (requestor, _deadline) in pending.items():
+                self._answer_attest_pull(queues, nonce, requestor, epoch)
+        except Exception as err:
+            self.report_exception(err, 'handle_operator_state_response')
+        return True
+
+    def _expire_attest_pending(self, queues):
+        """Answer pulls the main loop never got to, as not-attended.
+
+        The roster convention applied to attendance: report a bounded, honest
+        partial rather than hang. Silence is what a puller cannot act on — a
+        node whose console never answers is, for the purpose of the guardian
+        edge, unattended."""
+        if not self._attest_pending:
+            return
+        tick = self._now_epoch()
+        expired = [nonce for nonce, (_r, deadline)
+                   in self._attest_pending.items() if deadline <= tick]
+        for nonce in expired:
+            requestor, _deadline = self._attest_pending.pop(nonce)
+            self.logger.debug('attest pull %s timed out; answering unattended'
+                              % nonce)
+            self._answer_attest_pull(queues, nonce, requestor, 0.0)
+
+    # --- Operator-attended pull, requestor side (ethne D8/Q9) ----------------
+
+    #: how long a pull we SENT stays open before the consumer is told
+    #: not-attended. Generous next to the responder's own round trip: this
+    #: spans the network. An unreachable node is unattended for the guardian
+    #: edge's purposes, so silence still resolves to an answer.
+    _ATTEST_REPLY_WAIT_SEC = 10.0
+
+    #: how far a peer's claimed stamp may sit from our clock and still be
+    #: believed. The nonce already stops replay of an old attestation; this
+    #: catches a peer asserting attendance at an implausible time (a
+    #: far-future stamp meant to stay "fresh", or an ancient one).
+    _ATTEST_WINDOW_SEC = 120.0
+
+    def handle_attest_trigger(self, queues, message):
+        """A consumer asked us to pull one peer's attended-now state.
+
+        The pull lives here rather than in the main loop because the answer is
+        only worth having once the operator credential inside it has been
+        re-verified against the operator trust anchor — and this process owns
+        that anchor (see _is_operator_credential, shared with admission).
+
+        Local-only verb: never leaves this node. Mints the nonce that binds
+        the peer's answer to this request."""
+        if message.function != IdentityProtocol.attest_trigger:
+            return False
+        try:
+            payload = message.obj
+            if isinstance(payload, str):
+                payload = from_json_string(payload)
+            if not isinstance(payload, dict):
+                payload = {}
+            target_uuid = payload.get('target')
+            if not target_uuid:
+                return True
+            target = None
+            try:
+                target = self.peers.find_by_uuid(str(target_uuid)) if self.peers else None
+            except Exception:
+                target = None
+            if target is None:
+                # Unroutable peer: answer the consumer now rather than let it
+                # wait on a pull that can never be sent.
+                self._report_attestation(queues, str(target_uuid), 0.0, False)
+                return True
+            nonce = uuid.uuid4().hex
+            req = Message(self.name, IdentityProtocol.attest_req,
+                          to_json_string({'nonce': nonce}),
+                          to_whom=target, from_whom=self.identity,
+                          encrypt=False)
+            queues[CfgIds.network].put(req, block=True, timeout=self.q_cadence)
+            self._attest_sent[nonce] = (
+                str(target.uuid),
+                self._now_epoch() + self._ATTEST_REPLY_WAIT_SEC)
+        except Full:
+            self.logger.error('handle_attest_trigger: Network queue full')
+        except Exception as err:
+            self.report_exception(err, 'handle_attest_trigger')
+        return True
+
+    def _report_attestation(self, queues, peer_uuid, attested_at, verified):
+        """Hand a finished pull back to the main loop for consumers to read
+        (AutonomousTrust.peer_attestations, which is what ethne's guardian
+        edge reads). Local-only; carries the VERIFIED verdict, never the
+        peer's assertion."""
+        try:
+            out = Message(CfgIds.main, IdentityProtocol.attest_resp,
+                          to_json_string({'peer': str(peer_uuid),
+                                          'operator_attested_at': float(attested_at or 0.0),
+                                          'operator_verified': bool(verified)}),
+                          from_whom=self.identity)
+            queues[CfgIds.main].put(out, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('_report_attestation: main queue full')
+        except Exception as err:
+            self.report_exception(err, '_report_attestation')
+
+    def handle_attest_response(self, queues, message):
+        """Verify one peer's attended-now answer and record it.
+
+        Nothing the peer asserts is taken at face value. Three independent
+        checks must pass before a stamp counts:
+
+        1. the nonce must be one WE minted and have not yet retired — this is
+           what makes the signal attended-*now* instead of a recording that
+           can be replayed indefinitely;
+        2. the operator credential in the payload must chain-verify against the
+           distinct operator anchor, with its hash recomputed from the actual
+           bytes (:meth:`_is_operator_credential`, the same gate admission
+           uses) — a node cannot talk its way into operator class;
+        3. the stamp must fall inside a bounded window around our clock.
+
+        A failure of any check records not-attended rather than raising: the
+        guardian edge needs a decision, and "unverified" and "unattended" are
+        the same answer to it."""
+        if message.function != IdentityProtocol.attest_resp:
+            return False
+        try:
+            payload = message.obj
+            if isinstance(payload, str):
+                payload = from_json_string(payload)
+            if not isinstance(payload, dict):
+                payload = {}
+            nonce = payload.get('nonce')
+            sent = self._attest_sent.pop(str(nonce), None) if nonce else None
+            if sent is None:
+                # Unsolicited, replayed, or an answer to a pull already retired.
+                self.logger.warning('handle_attest_response: unknown nonce %r'
+                                    % nonce)
+                return True
+            peer_uuid, _deadline = sent
+            responder_uuid = str(getattr(message.from_whom, 'uuid', '') or '')
+            if responder_uuid and responder_uuid != peer_uuid:
+                # Right nonce, wrong node — someone else answering for the
+                # peer we asked.
+                self.logger.warning('handle_attest_response: nonce %s answered '
+                                    'by %s, expected %s'
+                                    % (nonce, responder_uuid, peer_uuid))
+                self._report_attestation(queues, peer_uuid, 0.0, False)
+                return True
+            claimed = 0.0
+            try:
+                claimed = float(payload.get('operator_attested_at') or 0.0)
+            except (TypeError, ValueError):
+                claimed = 0.0
+            # Re-verify the credential against the operator anchor. Decode the
+            # attestation onto a scratch identity so the existing gate sees the
+            # same shape it sees at admission.
+            scratch = SimpleNamespace(zta_issuer='', zta_credential=b'',
+                                      zta_credential_hash=b'',
+                                      operator_bound=False,
+                                      operator_attested_at=0.0)
+            self._apply_operator_attestation(scratch, payload)
+            cred = getattr(scratch, 'zta_credential', b'') or b''
+            verified = self._is_operator_credential(scratch, cred)
+            tick = self._now_epoch()
+            in_window = bool(claimed) and abs(tick - claimed) <= self._ATTEST_WINDOW_SEC
+            if claimed and not in_window:
+                self.logger.warning('handle_attest_response: stamp %r outside '
+                                    'acceptance window (now %r)' % (claimed, tick))
+            attested = claimed if (verified and in_window) else 0.0
+            self._store_peer_attestation(peer_uuid, attested, verified)
+            self._report_attestation(queues, peer_uuid, attested, verified)
+        except Exception as err:
+            self.report_exception(err, 'handle_attest_response')
+        return True
+
+    def _store_peer_attestation(self, peer_uuid, attested_at, verified):
+        """Write the verified result onto our stored peer identity, so a
+        consumer reading the local peer mirror sees a live value instead of
+        the stamp captured once at admission (the gap this closes)."""
+        try:
+            peer = self.peers.find_by_uuid(str(peer_uuid)) if self.peers else None
+        except Exception:
+            peer = None
+        if peer is None:
+            return
+        try:
+            peer.operator_attested_at = float(attested_at or 0.0)
+        except Exception:
+            pass
+        if verified:
+            # Durable half: a peer that just proved an operator credential IS
+            # operator-bound, even if nobody is at the console right now.
+            self._mark_operator_bound(peer, True)
+
+    def _expire_attest_sent(self, queues):
+        """Resolve pulls the peer never answered as not-attended, so a
+        consumer is never left waiting on a node that has gone quiet."""
+        if not self._attest_sent:
+            return
+        tick = self._now_epoch()
+        expired = [nonce for nonce, (_u, deadline)
+                   in self._attest_sent.items() if deadline <= tick]
+        for nonce in expired:
+            peer_uuid, _deadline = self._attest_sent.pop(nonce)
+            self.logger.debug('attest pull to %s unanswered; reporting '
+                              'unattended' % peer_uuid)
+            self._report_attestation(queues, peer_uuid, 0.0, False)
+
     def _record_peers(self, queues):
         self.logger.debug('Add peers')
         self._remember_activity(queues, CfgIds.peers, self.peers)
         self._remember_activity(queues, CfgIds.capabilities, self.peer_capabilities)
+        # Reliable re-put of self.peers to the main proc. _remember_activity's
+        # update() fan-put uses the q_cadence (10 ms) timeout, which silently
+        # DROPS under main-proc queue contention — e.g. the dod_mission
+        # coordinator, whose main loop is processing thousands of rep_resp
+        # messages, so the Peers broadcast never lands and self.peers stays
+        # stale (peers.all=1 while group.addresses grows). handle_caps_response
+        # already does exactly this for peer_capabilities (see ~line 1336, the
+        # same drop); self.peers had no equivalent. 1 s timeout rides through
+        # bursty contention; bounded, so it can't deadlock. Without this the
+        # coordinator can never name consensus reputations -> dashboard stuck
+        # "forming…". See dod-coordinator-partition-nonconvergence.md (layer 3).
+        if CfgIds.main in queues:
+            try:
+                queues[CfgIds.main].put(self.peers, block=True, timeout=1.0)
+                _probes.counter('peer.set', 'peers_explicit_main_put')
+            except Full:
+                _probes.counter('peer.set', 'peers_explicit_main_full')
 
     def acquire_capabilities(self, queues):
         start = now()
@@ -350,14 +1082,159 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         with self.lock:
             self.phase = 1
 
+    def set_operator_session(self, session):
+        """Attach a live OperatorSession so (re)announces can stamp attended-now
+        (ethne D8/Q9). In-process seam: usable when the session and the identity
+        process share an address space (tests, single-process embeds).
+
+        The multiprocess node runs this process in its own subprocess where the
+        console's session object is not reachable. That case is served the other
+        way round: an inbound attest_req triggers a local round trip to the main
+        loop, which DOES share the console's address space (see
+        handle_attest_request / AutonomousTrust.set_operator_session). The
+        DURABLE operator_bound signal crosses the boundary on its own, via the
+        persisted identity."""
+        self._operator_session = session
+
+    def _refresh_operator_attestation(self):
+        """Re-stamp self.identity.operator_attested_at from the live operator
+        session state just before a (re)announce (ethne D8/Q9 attended-now).
+
+        No-op unless an OperatorSession has been attached (set_operator_session).
+        When one is present and attended the node stamps the current epoch time;
+        otherwise it clears the stamp to 0 so a locked/absent session reads as
+        not-attended. operator_bound (durable) is set once at operator activation
+        (operator/activate.bind_piv_credential) and is not touched here."""
+        session = getattr(self, '_operator_session', None)
+        if session is None:
+            return
+        try:
+            from ..operator.session import is_attended  # operator pkg is optional
+            fresh = is_attended(session)
+            self.identity.operator_attested_at = self._now_epoch() if fresh else 0.0
+        except Exception:  # never let attestation refresh break an announce
+            self.logger.debug('operator attestation refresh skipped', exc_info=True)
+
+    def _now_epoch(self):
+        """Wall-clock epoch seconds; a seam so P-L3 unit tests can inject a
+        deterministic clock."""
+        return time.time()
+
+    def _operator_attestation(self):
+        """Build the operator-attended attestation carried in the signed
+        request_access DATA payload (ethne guardian edge, D8/Q9). It reuses
+        the node's own ZTA binding so the welcoming committee can verify the
+        operator credential and confirm the claim (see welcoming_committee /
+        _zta_admit). Emitted as a dict of only the non-default fields so a node
+        with no operator binding contributes an empty dict (backward-compatible
+        with the 2-element payload). Bytes are base64 (standard, no newline),
+        matching public_identity_to_canonical and the C payload encoder.
+
+        NOTE: this reads self.identity's CURRENT fields. operator_attested_at
+        freshness is (re)stamped by _refresh_operator_attestation (P-L3) before
+        this is called; here in P-L1 it reflects whatever activation set."""
+        me = self.identity
+        att = {}
+        if getattr(me, 'operator_bound', False):
+            att['operator_bound'] = True
+        attested = float(getattr(me, 'operator_attested_at', 0.0) or 0.0)
+        if attested:
+            att['operator_attested_at'] = attested
+        issuer = getattr(me, 'zta_issuer', '') or ''
+        if issuer:
+            att['zta_issuer'] = issuer
+        cred_hash = getattr(me, 'zta_credential_hash', b'') or b''
+        if cred_hash:
+            att['zta_credential_hash'] = base64.b64encode(bytes(cred_hash)).decode('ascii')
+        cred = getattr(me, 'zta_credential', b'') or b''
+        if cred:
+            att['zta_credential'] = base64.b64encode(bytes(cred)).decode('ascii')
+        # The OPT-IN guardian identity (identity.proto 14-15). Both halves or
+        # neither — a key with no binding is unverifiable and a binding with no key
+        # names nobody — and nothing at all when this node declined, which keeps a
+        # declining node's payload byte-identical to one built before these fields
+        # existed. Mirror of the C _operator_attestation_json.
+        op_key = getattr(me, 'operator_pubkey', b'') or b''
+        op_binding = getattr(me, 'operator_key_binding', b'') or b''
+        if op_key and op_binding:
+            att['operator_pubkey'] = base64.b64encode(bytes(op_key)).decode('ascii')
+            att['operator_key_binding'] = base64.b64encode(
+                bytes(op_binding)).decode('ascii')
+        return att
+
+    @staticmethod
+    def _apply_operator_attestation(new_id, att):
+        """Decode the request_access attestation dict onto a newly-announced
+        peer identity (inverse of _operator_attestation). Copies the ZTA
+        binding (so _zta_admit can verify a wire-delivered credential) and the
+        advertised operator claim. The advertised operator_bound is NOT trusted
+        here — _zta_admit overwrites it with the verified result (P-L2).
+        Tolerant of missing/malformed keys (defaults false/0/empty)."""
+        if not isinstance(att, dict):
+            return
+        try:
+            issuer = att.get('zta_issuer', '') or ''
+            if issuer:
+                new_id.zta_issuer = issuer
+            cred_hash_b64 = att.get('zta_credential_hash', '') or ''
+            if cred_hash_b64:
+                new_id.zta_credential_hash = base64.b64decode(cred_hash_b64)
+            cred_b64 = att.get('zta_credential', '') or ''
+            if cred_b64:
+                new_id.zta_credential = base64.b64decode(cred_b64)
+            new_id.operator_bound = bool(att.get('operator_bound', False))
+            new_id.operator_attested_at = float(att.get('operator_attested_at', 0.0) or 0.0)
+            # The guardian CLAIM (mirror of the C _apply_operator_attestation_json).
+            # A wrong-length key is dropped whole — a truncated ed25519 key is a
+            # different key — and an oversized binding refused. _zta_admit
+            # neutralizes the key and re-earns it from the binding; nothing here is
+            # verified.
+            key_b64 = att.get('operator_pubkey', '') or ''
+            binding_b64 = att.get('operator_key_binding', '') or ''
+            if key_b64:
+                key = base64.b64decode(key_b64)
+                if len(key) == OPERATOR_PUBKEY_LEN:
+                    new_id.operator_pubkey = key
+            if binding_b64:
+                binding = base64.b64decode(binding_b64)
+                if 0 < len(binding) <= OPERATOR_BINDING_MAX:
+                    new_id.operator_key_binding = binding
+        except (ValueError, TypeError):
+            # A malformed attestation is treated as absent; identity/keys still
+            # stand on their own and normal admission proceeds.
+            pass
+
     def _broadcast_request_access(self, queues):
         """Build and broadcast the `request_access` envelope on the open
         channel. Factored out of announce_identity so the group-merge
         path (see _merge_to_mesh) can re-broadcast without a phase change.
         Quiet on Full — caller logs."""
-        msg_str = to_json_string((self.identity.publish(), self.package_hash, self.capabilities.to_list()))
+        # DRY request_access wire contract (cross-runtime canonical): the
+        # requester identity travels in the envelope from_* fields (set via
+        # from_whom below — the single representation C and Python both
+        # emit/parse, pinned by the message-envelope conformance vectors),
+        # NOT in the payload. The payload carries only the request-specific
+        # extras [package_hash, capabilities]. This is what lets a C at_demo
+        # node (whose net_proc stamps identity into from_* on every outbound
+        # and leaves request-payload identity absent) be admitted by a Python
+        # welcoming committee, and vice-versa. See welcoming_committee and
+        # message._identity_from_wire.
+        #
+        # The operator-attended attestation (ethne D8/Q9) rides as an OPTIONAL
+        # 3rd payload element. It carries the node's ZTA operator binding
+        # (credential + hash + issuer) which — unlike identity in from_* — is
+        # NOT on the envelope, so this payload is also what finally delivers a
+        # verifiable credential to the welcoming committee. Because it is in the
+        # signed DATA payload (process|function|base64(data)), it is
+        # tamper-evident under the existing message signature with no change to
+        # the signing formula and no envelope/wire-vector change. Old peers emit
+        # a 2-element payload; welcoming_committee tolerates both arities.
+        self._refresh_operator_attestation()
+        msg_str = to_json_string((self.package_hash, self.capabilities.to_list(),
+                                  self._operator_attestation()))
         message = Message(self.name, IdentityProtocol.announce,
-                          msg_str, to_whom=Network.broadcast, encrypt=False)
+                          msg_str, to_whom=Network.broadcast,
+                          from_whom=self.identity, encrypt=False)
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
 
     def announce_identity(self, queues):
@@ -420,11 +1297,21 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 else:
                     group, steps = hist_tpl[0], hist_tpl[1]
                     peer_idents = None
+                # Group rides the wire as the DRY canonical flat dict (shared
+                # byte-shape with C's group_to_json); reconstruct it. Tolerate
+                # a legacy Group object (in-process / pre-canonical path).
+                if isinstance(group, dict):
+                    group = Group.from_canonical(group)
                 # Merge peer identities from every history that arrived
                 # — even ones we won't pick for our group/DAG — so the
                 # peer set is the union of what all welcomers saw.
                 if peer_idents:
                     for ident in peer_idents:
+                        # Slot-2 peers ride as DRY canonical public-identity
+                        # dicts (shared with C); reconstruct, tolerating a
+                        # legacy Identity object.
+                        if isinstance(ident, dict):
+                            ident = public_identity_from_canonical(ident)
                         uuid = getattr(ident, 'uuid', None)
                         if uuid is not None:
                             unioned_peers.setdefault(str(uuid), ident)
@@ -536,8 +1423,17 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 else:
                     group, steps = hist_tpl[0], hist_tpl[1]
                     peer_idents = None
+                # Group rides the wire as the DRY canonical flat dict (see
+                # _merge_to_mesh); reconstruct it, tolerating a legacy object.
+                if isinstance(group, dict):
+                    group = Group.from_canonical(group)
                 if peer_idents:
                     for ident in peer_idents:
+                        # Slot-2 peers ride as DRY canonical public-identity
+                        # dicts (shared with C); reconstruct, tolerating a
+                        # legacy Identity object.
+                        if isinstance(ident, dict):
+                            ident = public_identity_from_canonical(ident)
                         uuid = getattr(ident, 'uuid', None)
                         if uuid is not None:
                             unioned_peers.setdefault(str(uuid), ident)
@@ -631,12 +1527,27 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.logger.debug('Process accepted peer: %s (%s)' % (blob.identity.nickname, amnesia))
 
         # inform existing group members about the new peer;  to self.handle_confirm_peer()
-        message = Message(self.name, IdentityProtocol.confirm, blob, to_whom=self.group)
+        # New-peer identity rides as the DRY canonical public-identity payload
+        # (shared byte-shape with C public_identity_to_json) so a C member can
+        # parse it — the new peer is a third party, so it can't use from_*.
+        # from_whom carries the CONFIRMER (us) so a member can count distinct
+        # confirmers for the two-phase admission quorum (§3.1-a). The new-peer
+        # identity is the payload; the confirmer rides the envelope (idiomatic,
+        # mirrors `accept`). Harmless at the default quorum of 1.
+        msg_str = to_json_string(public_identity_to_canonical(blob.identity))
+        message = Message(self.name, IdentityProtocol.confirm, msg_str, to_whom=self.group,
+                          from_whom=self.identity)
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
 
-        # send my identity in the open to enable encryption;  to self.handle_acceptance()
-        msg_str = to_json_string((self.identity.publish(), self.package_hash, self.capabilities.to_list()))
-        message = Message(self.name, IdentityProtocol.accept, msg_str, to_whom=blob.identity, encrypt=False)
+        # send my identity in the open to enable encryption — the new peer needs
+        # my enc pubkey to decrypt the box-encrypted full_history that follows.
+        # DRY canonical (mirrors request_access): identity travels in the
+        # envelope from_* (from_whom), payload is [package_hash, capabilities],
+        # so a C peer reads the granter identity where C always stamps it.
+        # to self.handle_acceptance()
+        msg_str = to_json_string((self.package_hash, self.capabilities.to_list()))
+        message = Message(self.name, IdentityProtocol.accept, msg_str, to_whom=blob.identity,
+                          from_whom=self.identity, encrypt=False)
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
 
         # send group key + history + my peer set so the new peer can
@@ -644,8 +1555,17 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # peers I already admitted (otherwise it never receives confirm
         # broadcasts for those peers — see project_inspector_peer_set_gap).
         # Peer identities are stripped of private keys via publish().
-        peers_payload = [p.publish() for p in self.peers.all]
-        msg_str = to_json_string((self.group, self._history.recite(),
+        # Peer bundle (slot 2) rides as DRY canonical public-identity dicts
+        # (shared byte-shape with C public_identity_to_json) so the joining
+        # peer — including a C node — can parse the existing roster. (Was
+        # p.publish(), the ConfigJSONEncoder form C cannot read.)
+        peers_payload = [public_identity_to_canonical(p) for p in self.peers.all]
+        # Group slot travels as the DRY canonical flat dict (shared byte-shape
+        # with C's group_to_json) so a C peer can parse it and recover the
+        # shared private key; Python peers reconstruct via Group.from_canonical
+        # in receive_history/_merge_to_mesh/choose_group. See
+        # [[project_group_key_sync]].
+        msg_str = to_json_string((self.group.to_canonical(), self._history.recite(),
                                   peers_payload))
         message = Message(self.name, IdentityProtocol.history, msg_str, to_whom=blob.identity)
         self.logger.debug('Send full history (+%d peer identities)' %
@@ -661,6 +1581,444 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                          source='peer_accepted')
             self._add_peer(queues, blob.identity, amnesia)
 
+    def _zta_policy(self) -> ZtaPolicy:
+        """Resolve the ZTA policy once (configs['zta_policy'] or the on-disk
+        zta_policy.cfg.json, else a disabled default). Cached for the process."""
+        if self._zta_policy_cache is None:
+            cfg = self.configs.get(ZtaPolicy.CONFIG_KEY) if hasattr(self.configs, 'get') else None
+            if isinstance(cfg, ZtaPolicy):
+                self._zta_policy_cache = cfg
+            else:
+                try:
+                    self._zta_policy_cache = ZtaPolicy.load()
+                except Exception:
+                    self._zta_policy_cache = ZtaPolicy.defaults()
+        return self._zta_policy_cache
+
+    def _zta_verifier(self):
+        """Build the configured verifier once (cached)."""
+        if self._zta_verifier_cache is None:
+            self._zta_verifier_cache = self._zta_policy().create_verifier()
+        return self._zta_verifier_cache
+
+    def _zta_operator_verifier(self):
+        """Build the OPERATOR-anchor verifier once (cached); None when no
+        operator CA bundle is configured (ethne D8/Q9). Sentinel False marks
+        "already tried, none configured" so we don't rebuild every admission."""
+        if self._zta_operator_verifier_cache is None:
+            self._zta_operator_verifier_cache = \
+                self._zta_policy().create_operator_verifier() or False
+        return self._zta_operator_verifier_cache or None
+
+    def _verify_operator_key(self, new_id, cred, claimed_key):
+        """Credit a peer's OPT-IN guardian identity, if it advertised one and the
+        binding holds.
+
+        Called only once the credential is known to be operator-class: a binding
+        signed by a credential with no standing to name a guardian names nobody.
+
+        Three outcomes, and the middle one is the design:
+          - no claim  -> silent. The default, and it must stay costless.
+          - claim + binding verifies -> the key is written onto the peer, so from
+            here on a stored peer with a key is one we verified.
+          - claim + binding fails -> the key stays empty and we say so.
+            operator_bound is NOT demoted: it was earned independently above, and a
+            stale binding after node key rotation is an honest cause of this.
+            Losing a guardian edge is the failure mode; losing admission is not.
+
+        Mirror of the C _verify_operator_key (id_proc.c).
+        """
+        nick = getattr(new_id, 'nickname', '?')
+        binding = getattr(new_id, 'operator_key_binding', b'') or b''
+        if not claimed_key and not binding:
+            return                              # declined; the normal case
+        if not claimed_key or not binding:
+            # Half a claim is not a claim. Worth a word either way: both halves are
+            # written by one code path, so one without the other means something
+            # upstream is broken, not that a peer declined.
+            self.logger.warning(
+                'ZTA: %s advertised half an operator-key binding (key %s, '
+                'binding %s); no guardian recorded', nick,
+                'present' if claimed_key else 'absent',
+                'present' if binding else 'absent')
+            return
+        if verify_operator_binding(new_id, cred, claimed_key, binding):
+            new_id.operator_pubkey = claimed_key
+            self.logger.debug('ZTA: %s guardian key bound and verified', nick)
+            _probes.emit('id.welcome', 'operator_key_bound', peer_nick=str(nick))
+        else:
+            self.logger.warning(
+                'ZTA: %s advertised an operator key whose binding does not verify '
+                'against its operator credential; no guardian recorded '
+                '(operator_bound stands on its own)', nick)
+            _probes.emit('id.welcome', 'operator_key_refused', peer_nick=str(nick))
+            _probes.counter('id.welcome', 'operator_key_refused')
+
+    @staticmethod
+    def _mark_operator_bound(new_id, value):
+        """Set the AUTHORITATIVE operator_bound on a peer identity (defensive:
+        test stand-ins may lack the attribute)."""
+        try:
+            new_id.operator_bound = bool(value)
+        except Exception:
+            pass
+
+    def _is_operator_credential(self, new_id, cred) -> bool:
+        """True iff ``cred`` is an operator (human-attended) credential — i.e.
+        it chain-verifies against the distinct operator trust anchor (D8/Q9).
+
+        Non-forgeable: the decision comes from verifying the actual credential
+        against the operator anchor, never from the peer-advertised
+        operator_bound / zta_issuer. Fail-safe: no credential, an advertised
+        hash that does not match the actual bytes, no operator anchor
+        configured, or a non-VERIFIED operator-chain result all yield False."""
+        if not cred:
+            return False
+        advertised = getattr(new_id, 'zta_credential_hash', b'') or b''
+        if advertised and hashlib.sha256(cred).digest() != bytes(advertised):
+            # The node's advertised hash disagrees with the credential it sent —
+            # do not treat as operator-class (a claim/credential mismatch).
+            return False
+        op_verifier = self._zta_operator_verifier()
+        if op_verifier is None:
+            return False
+        return op_verifier.verify_credential(cred).status is ZtaStatus.VERIFIED
+
+    def _zta_credential_replayed(self, new_id, cred) -> bool:
+        """True if this exact credential is already bound to a DIFFERENT network
+        identity — a harvested/replayed credential (closes ISSUES §1.5).
+
+        The chain-only verifier accepts a chain-valid certificate regardless of
+        WHO presents it, so a credential lifted from one peer's (clear-text)
+        announce could be re-announced under a different uuid/signing key and
+        still pass. Here we enforce a credential↔identity uniqueness invariant: a
+        credential is a one-per-identity binding. "Previously seen" = present in
+        this node's peer roster (or our own identity); since rosters are built
+        from announces propagated across the mesh, this is the "seen by other
+        nodes" check. It is first-use-wins (TOFU): the first identity to bind a
+        credential keeps it, and a later, different identity presenting the same
+        credential is treated as a replay/clone and refused.
+
+        Fingerprints are recomputed from the actual credential bytes, never the
+        peer-advertised ``zta_credential_hash`` (which the announcer controls).
+        Defensive about missing ``peers``/``identity`` so the gate works when
+        invoked on a lightweight stand-in (no roster → no prior binding).
+        """
+        if not cred:
+            return False
+        fp = hashlib.sha256(cred).digest()
+        new_uuid = getattr(new_id, 'uuid', None)
+        # Our own credential must not be worn by anyone else.
+        own_id = getattr(self, 'identity', None)
+        if own_id is not None:
+            own = getattr(own_id, 'zta_credential', b'') or b''
+            if (own and getattr(own_id, 'uuid', None) != new_uuid
+                    and hashlib.sha256(own).digest() == fp):
+                return True
+        peers = getattr(self, 'peers', None)
+        roster = list(getattr(peers, 'all', []) or []) if peers is not None else []
+        for peer in roster:
+            if getattr(peer, 'uuid', None) == new_uuid:
+                continue  # same identity re-announcing its own credential: fine
+            pc = getattr(peer, 'zta_credential', b'') or b''
+            if pc and hashlib.sha256(pc).digest() == fp:
+                return True
+        return False
+
+    def _zta_anchor_verifiers(self):
+        """``[(name, verifier, is_operator)]``, one per configured trust anchor,
+        built once per process.
+
+        The single seam for substituting verifiers in the admission path -- inject
+        into ``_zta_anchor_cache`` to force a particular outcome (a verifier that
+        reports UNAVAILABLE, say, to exercise the DDIL fallback).
+        """
+        if self._zta_anchor_cache is None:
+            self._zta_anchor_cache = self._zta_policy().create_anchor_verifiers()
+        return self._zta_anchor_cache
+
+    def _zta_credentials(self, new_id):
+        """The peer's credentials as ``[(der, binding, issuer)]``, primary first.
+
+        A node carries ONE credential; several arise only at a network gateway
+        bridging agencies, which must hold one per agency it bridges. The primary
+        lives in the singular wire fields (kept so a pre-multi-credential peer
+        interoperates unchanged) and the full set in the repeated one, so the
+        primary normally appears twice -- deduplicated here by fingerprint over the
+        actual bytes, keeping the first occurrence but preferring whichever copy
+        carries a binding, since the singular fields have nowhere to put one.
+        """
+        out, seen = [], {}
+
+        def _add(der, binding, issuer):
+            if not der:
+                return
+            der, binding = bytes(der), bytes(binding or b'')
+            fp = hashlib.sha256(der).digest()
+            if fp in seen:
+                idx = seen[fp]
+                if binding and not out[idx][1]:
+                    out[idx] = (der, binding, out[idx][2] or issuer)
+                return
+            seen[fp] = len(out)
+            out.append((der, binding, issuer or ''))
+
+        try:
+            _add(getattr(new_id, 'zta_credential', b'') or b'',
+                 getattr(new_id, 'zta_credential_binding', b'') or b'',
+                 getattr(new_id, 'zta_issuer', '') or '')
+        except AttributeError:
+            pass  # peer from an older/non-ZTA build carries no fields
+        for entry in (getattr(new_id, 'zta_credentials', None) or []):
+            if isinstance(entry, dict):
+                _add(entry.get('der') or entry.get('credential') or b'',
+                     entry.get('binding') or b'', entry.get('issuer') or '')
+            else:  # a protobuf ZtaCredential (or any duck-typed stand-in)
+                _add(getattr(entry, 'der', b'') or getattr(entry, 'credential', b''),
+                     getattr(entry, 'binding', b''), getattr(entry, 'issuer', ''))
+        return out
+
+    def _zta_match_anchors(self, cred, anchors):
+        """``(matched, is_operator, last_failure)`` for one credential.
+
+        Every anchor is tried, deliberately not stopping at the first match: a
+        credential may legitimately chain to more than one (the legacy config
+        synthesizes a peer and an operator anchor that are frequently the same CA),
+        and both the operator classification and gateway authority depend on knowing
+        the full set rather than whichever happened to be checked first.
+
+        ``last_failure`` carries a non-VERIFIED result so the caller can report a
+        representative reason -- the observable the zta-x509-reject-* scenarios pin.
+        """
+        matched, is_operator, last_failure, deferred = [], False, None, None
+        for name, verifier, anchor_is_operator in anchors:
+            result = verifier.verify_credential(cred)
+            if result.status is ZtaStatus.VERIFIED:
+                matched.append((name, verifier, result))
+                is_operator = is_operator or anchor_is_operator
+            elif result.status in (ZtaStatus.REJECTED, ZtaStatus.EXPIRED,
+                                   ZtaStatus.REVOKED):
+                last_failure = result
+            else:  # DEFERRED / UNAVAILABLE — the verifier could not answer
+                deferred = result
+        return matched, is_operator, (last_failure or deferred), deferred
+
+    def _zta_admit(self, new_id) -> str:
+        """ZTA admission decision for a newly-announced peer.
+
+        Mirrors zta-integration.md §11 / the C gate: returns 'admit' (proceed,
+        no cap), 'admit_capped' (DDIL fallback, reputation-capped), or 'reject'
+        (do not propose). A no-op ('admit') when the policy is disabled or does
+        not require verification at admission.
+
+        **Admission is any-of** (ISSUES §1.5): at least one credential must verify
+        against some configured anchor AND be bound to this identity. Each verified
+        credential records authority for its anchor on the peer
+        (``zta_anchors``), and that -- not a self-declared role -- is what lets a
+        node act as a gateway across an agency boundary. Gateway-ness is emergent
+        from group membership and nothing on the wire declares it, so a rule of the
+        form "a gateway must present N credentials" would rest on a peer's own claim
+        and buy nothing; deriving authority from credentials instead is enforceable
+        against a peer that simply declines to claim anything.
+
+        **Failure is graded, because forgery and ignorance are different.** A
+        binding that is present and does not verify, a credential already bound to
+        another identity, an oversized blob, or an affirmatively revoked credential
+        all reject the identity -- each is evidence someone is lying. A credential
+        that is merely expired or chains to no anchor we hold is skipped: it says
+        nothing about the peer's honesty, only about our ability to evaluate it. For
+        the single-credential node this collapses to the previous behavior (nothing
+        usable left => reject), which is why the zta-x509-reject-* pins still hold.
+
+        Also sets the AUTHORITATIVE operator_bound (ethne D8/Q9): the advertised
+        claim is neutralized to False on entry and set True only when a credential
+        verifies against an operator-flagged trust anchor. So a disabled policy, an
+        unverified peer, or a lying node (advertising operator_bound with a
+        non-operator credential) all end up operator_bound=False.
+        """
+        # Never trust the peer-advertised operator_bound: start False and earn
+        # True only via operator-anchor verification below.
+        self._mark_operator_bound(new_id, False)
+        # Same rule for the OPT-IN guardian identity, with one wrinkle: the claimed
+        # key is part of the pre-image the operator signed, so the gate needs it —
+        # it moves aside and the peer's own copy is cleared. A stored peer with a
+        # key is therefore one whose binding we verified, and a policy that never
+        # verifies leaves every peer keyless (the fail-safe operator_bound takes).
+        claimed_key = getattr(new_id, 'operator_pubkey', b'') or b''
+        new_id.operator_pubkey = b''
+        policy = self._zta_policy()
+        if not (policy.enabled and policy.require_at_admission):
+            return 'admit'
+        nick = getattr(new_id, 'nickname', '?')
+
+        def _reject(reason, status=ZtaStatus.REJECTED, level='warning'):
+            getattr(self.logger, level)('ZTA: rejecting %s at admission: %s',
+                                        nick, reason)
+            _probes.emit('id.welcome', 'zta_rejected', peer_nick=str(nick),
+                         zta_status=status.value, reason=reason)
+            _probes.counter('id.welcome', 'zta_rejected')
+            return 'reject'
+
+        creds = self._zta_credentials(new_id)
+        if not creds:
+            # A peer presenting NOTHING still has to be evaluated, not silently
+            # skipped: the verifiers are what distinguish "we cannot reach the PKI"
+            # (DDIL, admit capped) from "we can, and there is no credential"
+            # (reject). Iterating an empty list would answer neither, so the empty
+            # credential goes through the same path every other one does and the
+            # verifier says which it is -- x509 reports REJECTED "no credential
+            # data", the OIDC stub reports UNAVAILABLE. That is what the
+            # zta-ddil-defer and zta-x509-reject-unsigned pins turn on.
+            creds = [(b'', b'', '')]
+        # Size guard BEFORE handing any blob to a verifier: an oversized
+        # credential is almost certainly hostile/corrupt and would let a remote
+        # cause an OOM / parse-time DoS. Mirrors C `ZTA_CRED_MAX` (identity.h);
+        # the C twin enforces the same cap at this admission gate (id_proc.c)
+        # AND at protobuf deserialization (identity.c). Keep the bound in
+        # lockstep -- pinned by conformance zta-x509-reject-oversized-credential.
+        for cred, _binding, _issuer in creds:
+            if len(cred) > ZTA_CRED_MAX:
+                return _reject('credential too large (%d > %d)'
+                               % (len(cred), ZTA_CRED_MAX))
+        # Credential↔identity uniqueness: a chain-valid credential harvested from
+        # another peer's announce and re-presented under a different identity is a
+        # replay/clone. Rejected before chain verification -- the cert may verify
+        # fine; the point is that it is already bound elsewhere. This is the
+        # roster-based, first-use-wins check, which the binding below supersedes for
+        # any credential that carries one; it stays because it is the only defence
+        # left for an unbound credential under `binding_mode: prefer`/`off`.
+        for cred, _binding, _issuer in creds:
+            if self._zta_credential_replayed(new_id, cred):
+                return _reject('credential bound to a different identity (replay)')
+        anchors = self._zta_anchor_verifiers()
+        mode = policy.binding_mode
+        san_template = getattr(policy, 'san_uri_template', '') or ''
+        usable = []          # [(anchor_name, cred, is_operator, bound)]
+        earned = []          # anchor names this peer proved authority for
+        last_failure = None  # a representative non-VERIFIED result, for the reason
+        deferred = None      # a verifier that could not answer -> DDIL
+        for cred, binding, _issuer in creds:
+            matched, is_operator, failure, defer = self._zta_match_anchors(cred, anchors)
+            last_failure = failure or last_failure
+            deferred = defer or deferred
+            if not matched:
+                continue  # chains to no anchor we hold: ignorance, not forgery
+            # A chain-valid certificate may nonetheless have been revoked.
+            # verify_credential does NOT consult the CRL/OCSP source (it mirrors
+            # C x509_verify_credential, which only walks the chain + expiry), so
+            # the admission gate must explicitly check revocation before
+            # admitting. Only an affirmative REVOKED blocks: UNAVAILABLE — the
+            # default when no crl_path/ocsp_url is configured — keeps the peer
+            # admitted, so deployments without a revocation source see no change
+            # in behavior. Mirrors the C welcoming_committee revocation gate;
+            # pinned by conformance zta-x509-reject-revoked-credential.
+            revoked = None
+            for _name, verifier, result in matched:
+                rev = verifier.check_revocation(result.credential_hash)
+                if rev.status is ZtaStatus.REVOKED:
+                    revoked = rev
+                    break
+            if revoked is not None:
+                return _reject(revoked.reason or 'credential revoked',
+                               status=ZtaStatus.REVOKED)
+            # The credential is genuine. Is THIS node entitled to present it?
+            # claimed_key/operator_key_binding are passed explicitly because the
+            # advertised operator_pubkey was moved aside above: an opted-in node's
+            # operator-key binding is itself a signature by this credential's key over
+            # bytes naming this node, so it already proves entitlement.
+            bound = identity_is_bound(
+                new_id, cred, binding, san_template,
+                operator_pubkey=claimed_key,
+                operator_key_binding=getattr(new_id, 'operator_key_binding', b''))
+            if binding and not bound:
+                # A binding was offered and does not verify. Unlike absence, that is
+                # affirmative evidence of forgery -- somebody tried and failed to
+                # prove entitlement -- so it condemns the whole identity rather than
+                # just costing this one credential.
+                return _reject('credential binding does not verify for this identity')
+            if not bound and mode == BINDING_MODE_REQUIRE:
+                # Unbound is a provisioning state, not a lie. The credential is
+                # unusable, so it earns no authority; if nothing else survives the
+                # peer is refused below, which for a single-credential node is
+                # exactly the old reject.
+                self.logger.warning(
+                    'ZTA: %s presented an unbound credential and binding_mode is '
+                    '%s; credential unusable', nick, mode)
+                _probes.counter('id.welcome', 'zta_unbound_refused')
+                continue
+            usable.append((matched[0][0], cred, is_operator, bound))
+            earned.extend(name for name, _v, _r in matched)
+        if usable:
+            # Record which anchors this peer actually proved. Gateway function
+            # across an agency boundary is gated on this, NOT on a declared role.
+            try:
+                new_id.zta_anchors = sorted(set(earned))
+            except Exception:
+                pass
+            for _anchor, cred, anchor_is_operator, _bound in usable:
+                # Operator-class (D8/Q9) by either route, because a deployment may
+                # express the operator anchor either way: as an anchor carrying
+                # `operator: true`, or as the separate operator_ca_bundle_path that
+                # _is_operator_credential consults. Both derive the answer from
+                # verifying the actual credential against an operator trust anchor,
+                # never from the peer-advertised operator_bound/zta_issuer.
+                # _is_operator_credential additionally refuses when the peer's
+                # advertised hash disagrees with the bytes it sent; the anchor-flag
+                # route does not need that guard, since the chain it walked is the
+                # non-forgeable signal and the advertised hash adds nothing to it.
+                if not (anchor_is_operator
+                        or self._is_operator_credential(new_id, cred)):
+                    continue
+                self._mark_operator_bound(new_id, True)
+                try:
+                    self._operator_verified.add(new_id.uuid)
+                except Exception:
+                    pass
+                self.logger.debug('ZTA: %s is operator-attended (human guardian)', nick)
+                self._verify_operator_key(new_id, cred, claimed_key)
+                break
+            if (mode == BINDING_MODE_PREFER
+                    and any(not bound for _a, _c, _o, bound in usable)):
+                # `prefer` only: admitted on an unbound credential, so the
+                # roster-based TOFU check is all that stood between us and a
+                # harvested cert -- cap it like any other deferred verification.
+                # `off` deliberately does NOT cap: absence of a binding carries no
+                # penalty there, which is what makes it the no-change-in-behavior
+                # setting for a deployment that has not provisioned bindings yet.
+                self.logger.info('ZTA: %s admitted on an unbound credential '
+                                 '(binding_mode %s); reputation cap %.2f',
+                                 nick, mode, policy.ddil_fallback_reputation_cap)
+                _probes.counter('id.welcome', 'zta_unbound_capped')
+                try:
+                    self._zta_capped.add(new_id.uuid)
+                except Exception:
+                    pass
+                return 'admit_capped'
+            return 'admit'
+        # Nothing usable. A verifier that could not answer is a DDIL condition and
+        # gets the fallback; an answer we did not like is a rejection.
+        if deferred is not None and last_failure is deferred:
+            if policy.allow_ddil_fallback:
+                self.logger.info('ZTA: verification deferred for %s (%s); admitting '
+                                 'with reputation cap %.2f', nick,
+                                 deferred.status.value,
+                                 policy.ddil_fallback_reputation_cap)
+                _probes.emit('id.welcome', 'zta_deferred', peer_nick=str(nick),
+                             zta_status=deferred.status.value, reason=deferred.reason)
+                _probes.counter('id.welcome', 'zta_deferred')
+                try:
+                    self._zta_capped.add(new_id.uuid)
+                except Exception:
+                    pass
+                return 'admit_capped'
+            self.logger.warning('ZTA: verification unavailable for %s (%s) and DDIL '
+                                'fallback disabled; rejecting', nick,
+                                deferred.status.value)
+            return _reject(deferred.reason, status=deferred.status)
+        if last_failure is not None:
+            return _reject(last_failure.reason, status=last_failure.status)
+        return _reject('no verifiable credential presented')
+
     def welcoming_committee(self, queues, message):
         """
         Handle incoming newbies. Every peer in phase 3 caches the
@@ -672,13 +2030,45 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.announce:
             try:
-                new_id, ph, caps = from_json_string(message.obj)  # from self.announce_identity()
+                # DRY request_access contract: requester identity comes from
+                # the envelope (Message.parse reconstructs from_whom from the
+                # canonical from_* fields for an as-yet-unknown peer); the
+                # payload carries only [package_hash, capabilities]. See
+                # _broadcast_request_access and message._identity_from_wire.
+                new_id = message.from_whom
+                if not isinstance(new_id, Identity):
+                    self.logger.warning('request_access with no sender identity; ignoring')
+                    return True
+                # [package_hash, capabilities, (optional) operator attestation].
+                # Arity-tolerant: an old peer sends a 2-element payload → no
+                # attestation. The attestation's ZTA binding (credential/hash/
+                # issuer) is NOT on the envelope, so copy it onto new_id here
+                # BEFORE _zta_admit — this is the wire delivery of the
+                # verifiable credential (see _operator_attestation). The
+                # advertised operator_bound is copied only as a claim; _zta_admit
+                # overwrites it with the verified truth (P-L2).
+                parts = from_json_string(message.obj)
+                ph, caps = parts[0], parts[1]
+                attestation = parts[2] if len(parts) > 2 and isinstance(parts[2], dict) else {}
+                if attestation:
+                    self._apply_operator_attestation(new_id, attestation)
                 if new_id == self.identity:
                     self.logger.debug('Should not have received my own announcement')
                     return
-                if not hmac.compare_digest(str(ph), str(self.package_hash)):
+                # Counterfeit check: a peer advertising a DIFFERENT non-empty
+                # package hash is running tampered software → reject. An EMPTY
+                # advertised hash means the peer doesn't compute one (e.g. a C
+                # at_demo node, which has no package-hash concept) — treat as
+                # "unknown", skip the check, and admit on identity/keys alone.
+                # This is the heterogeneous-fleet allowance that lets a C node
+                # join a Python welcoming committee; a same-runtime counterfeit
+                # still advertises its (mismatched) hash and is caught.
+                if str(ph) and not hmac.compare_digest(str(ph), str(self.package_hash)):
                     self.logger.error("Newbie is running a counterfeit; Ignore")
                     return True
+                if not str(ph):
+                    self.logger.debug("Peer advertised no package hash (heterogeneous "
+                                      "runtime, e.g. C node); skipping counterfeit check")
                 id_obj = IdentityObj(new_id, new_id.uuid)
                 existing = self.peers.find_by_uuid(new_id.uuid)
                 if new_id == existing:  # don't care if it's a different address
@@ -717,6 +2107,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 if not id_obj.validate():
                     self.logger.warning('Invalid identity object from %s' % new_id.nickname)
                     return True
+                # ZTA credential check at admission (parity with the C gate in
+                # handle_welcoming_committee). A forged/unsigned/expired/
+                # untrusted-issuer credential is rejected here, before the peer
+                # is cached or proposed for the welcoming-committee vote — the
+                # peer never enters the trust graph. No-op when the zta_policy
+                # is disabled. See doc/architecture/zta-python-parity.md.
+                zta_decision = self._zta_admit(new_id)
+                if zta_decision == 'reject':
+                    return True
                 # Cache the announcement on every peer (regardless of
                 # border_guard_mode). Without this, non-welcomers later
                 # silent-drop the peer_accepted broadcast in
@@ -736,7 +2135,14 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         return False
 
     def _update_group(self, queues, group, level):
-        grp_msg = group.to_string()  # to self.handle_group_update()
+        # DRY canonical flat wire form (shared byte-shape with C's
+        # group_to_json) so a C co-member can parse the group_key_update —
+        # Python's default ConfigJSONEncoder group is unparseable by C, which
+        # left cross-runtime membership updates silently dropped. Mirrors the
+        # full_history group delivery in _peer_accepted. The group key itself
+        # is not rotated here (membership-only; key handover is a deferred
+        # design — see idprocess.py:1042 / [[project_group_key_sync]]).
+        grp_msg = to_json_string(group.to_canonical())  # to self.handle_group_update()
         for to_peer in list(self.peers.hierarchy[level].values()):
             message = Message(self.name, IdentityProtocol.update, grp_msg, to_whom=to_peer)
             queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
@@ -838,7 +2244,33 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self.logger.debug(
                 'Announced self to %d bundled peers' % sent)
 
-    def _add_peer(self, queues, identity, amnesia=False):
+    def _confirm_group_membership(self, queues, identity, level=None):
+        """Propagate group membership + key to a CONFIRMED peer (§3.1-a).
+
+        Adds the peer's address to our group and re-publishes the group —
+        which carries the shared private key (Group.to_canonical) — to the
+        mid-level hierarchy. Split out of _add_peer so a PROVISIONAL member
+        can be tracked (known in self.peers/history) without the group key
+        ever leaving this node until the admission quorum is met. Only reached
+        for confirmed peers; see handle_confirm_peer for the state machine."""
+        if self.group is None:
+            return
+        if level is None:
+            level = self.peers.mid_level
+        self.group.add_address(identity.uuid, identity.address)
+        self._record_group(queues)
+        # DEFERRED DESIGN: adopting the new peer's group key when
+        # they come from an older/larger group (group-merge
+        # protocol). Today we always retain our own group identity
+        # and add the joiner's address to it. Inverting this would
+        # require: (a) a comparable size/age signal on Group, (b)
+        # a peer-key handover handshake, (c) C-side parity. Tracked
+        # alongside the broader group-merge discussion in
+        # divergence.md context (see also the M2 / late-history
+        # paths that already merge histories without merging keys).
+        self._update_group(queues, self.group, level)
+
+    def _add_peer(self, queues, identity, amnesia=False, confirmed=True):
         # The `amnesia` parameter is currently a structural placeholder.
         # All callers either pass the default (`False`) or are guarded
         # by `if not amnesia` above. The actual amnesia recovery flow
@@ -849,29 +2281,17 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # late-joiner-caps four-layer defense pattern for context.
         # The parameter is retained so future per-callsite recovery
         # policy can plug in here without changing the signature.
+        #
+        # `confirmed` (§3.1-a two-phase admission): when False, the peer is
+        # recorded in history/peers/caps but the group key is NOT propagated
+        # (the group-address add + _update_group are withheld) — the
+        # PROVISIONAL state. handle_confirm_peer promotes to confirmed once
+        # the admission quorum of distinct confirmers is met. The welcomer
+        # (post-finalize) and single-confirm default (quorum 1) pass True, so
+        # existing behavior is unchanged.
         level = self.peers.mid_level
-        if self.group is not None:
-            # DEFERRED DESIGN: delaying group-update vs. exposing group
-            # key. Current behavior adds the new peer's address and
-            # publishes the group BEFORE the peer is fully validated by
-            # the welcoming-committee vote. This trades a brief window
-            # of premature group-key visibility for simpler ordering —
-            # if the peer is later rejected, group_remove cleans up.
-            # Tightening this requires a multi-phase admission protocol
-            # (provisional vs. confirmed group membership) that both
-            # the Python and C implementations would need to agree on.
-            self.group.add_address(identity.uuid, identity.address)
-            self._record_group(queues)
-            # DEFERRED DESIGN: adopting the new peer's group key when
-            # they come from an older/larger group (group-merge
-            # protocol). Today we always retain our own group identity
-            # and add the joiner's address to it. Inverting this would
-            # require: (a) a comparable size/age signal on Group, (b)
-            # a peer-key handover handshake, (c) C-side parity. Tracked
-            # alongside the broader group-merge discussion in
-            # divergence.md context (see also the M2 / late-history
-            # paths that already merge histories without merging keys).
-            self._update_group(queues, self.group, level)
+        if confirmed:
+            self._confirm_group_membership(queues, identity, level)
         self._history.insert_peer(identity, level)
         with self.lock:
             has_potential = identity.uuid in self.peer_potentials
@@ -898,7 +2318,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             for peer in self.peers.all:
                 if blob.identity.uuid == peer.uuid or \
                         blob.identity.signature == peer.signature or \
-                        blob.identity.encryptor == peer.signature:
+                        blob.identity.encryptor == peer.encryptor:
                     self.logger.warning('New identity (%s) using peer id (%s)' % (blob.identity.nickname, peer.nickname))
                     return None
             proof: AgreementProof = self._history.prove(blob)
@@ -925,22 +2345,20 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.propose:
             self.logger.debug('Received peer proposal')
-            # DEFERRED DESIGN: should non-border-guards vote on
-            # proposals? `welcoming_committee` only emits `propose`
-            # when `self.border_guard_mode` is True (line ~587), but
-            # any peer in phase 3 that receives the broadcast
-            # currently votes. Two viable policies:
-            #   A. Current: everyone in phase 3 votes — wider quorum,
-            #      but a non-border-guard's view of the candidate is
-            #      necessarily shallower (no welcoming-committee
-            #      validation context).
-            #   B. Border-guards-only: gate this branch on
-            #      `if self.border_guard_mode:` to mirror the emit
-            #      side. Tighter security model, smaller quorum.
-            # Policy B requires C-side parity — the C implementation
-            # has no `border_guard_mode` concept yet (greppable: no
-            # matches in src/c/autonomous_trust/identity/). Land
-            # cross-impl before changing the Python behavior.
+            # Policy B — border-guards-only voting (ISSUES.md §3.1-c).
+            # `welcoming_committee` only *emits* a proposal when this peer is a
+            # border guard; the vote side now mirrors that: only border guards
+            # vote on a received proposal. A non-border-guard has no
+            # welcoming-committee validation context for the candidate, so its
+            # vote would carry the same weight on a shallower view — Policy B is
+            # the tighter security model. border_guard_mode defaults True (every
+            # peer is a guard) so this is a no-op unless a deployment designates
+            # non-guards; the C `handle_vote_on_peer` mirrors this gate. The
+            # message is still consumed (returns True) — a non-guard simply
+            # abstains rather than leaving it unhandled.
+            if not self.border_guard_mode:
+                self.logger.debug('Not a border guard; abstaining from vote')
+                return True
             blob = message.obj  # from self.welcoming_committee()
             if isinstance(blob, str):
                 blob = Configuration.from_string(blob)
@@ -983,8 +2401,22 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.accept:
             self.logger.debug('Received peer acceptance')
-            ident, pkh, caps = from_json_string(message.obj)  # from self._peer_accepted()
-            if not hmac.compare_digest(str(pkh), str(self.package_hash)):
+            # DRY accept contract (mirrors request_access): granter identity
+            # comes from the envelope (from_whom, reconstructed from the
+            # canonical from_* fields); payload is [package_hash, capabilities].
+            ident = message.from_whom
+            if not isinstance(ident, Identity):
+                self.logger.warning('access_granted with no sender identity; ignoring')
+                return True
+            payload = from_json_string(message.obj) if message.obj else None
+            if payload and len(payload) >= 2:
+                pkh, caps = payload[0], payload[1]
+            else:
+                pkh, caps = '', []  # C granter sends an empty payload
+            # Counterfeit check: skip when the granter advertises an empty
+            # package hash (heterogeneous runtime, e.g. a C node) — same
+            # allowance as the request_access welcoming committee.
+            if str(pkh) and not hmac.compare_digest(str(pkh), str(self.package_hash)):
                 self.logger.error("Counterfeit 'peer'")
                 return True
             with self.lock:
@@ -1008,14 +2440,25 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.confirm:
             self.logger.debug('Received peer confirmation')
+            # DRY canonical confirm contract: the new-peer identity rides as a
+            # flat public-identity dict (shared byte-shape with C
+            # public_identity_to_json). Tolerate a legacy Configuration/
+            # IdentityObj blob (in-process / pre-canonical path).
             blob = message.obj
             if isinstance(blob, str):
-                blob = Configuration.from_string(blob)
-            if hasattr(blob, 'validate') and not blob.validate():
+                blob = from_json_string(blob)
+            if isinstance(blob, dict):
+                peer = public_identity_from_canonical(blob)
+            else:
+                if hasattr(blob, 'validate') and not blob.validate():
+                    _probes.counter('peer.set', 'silent_drop', 'invalid_blob')
+                    self.logger.warning('Invalid peer confirmation blob')
+                    return True
+                peer = blob.identity if hasattr(blob, 'identity') else blob
+            if peer is None or not hasattr(peer, 'uuid'):
                 _probes.counter('peer.set', 'silent_drop', 'invalid_blob')
                 self.logger.warning('Invalid peer confirmation blob')
                 return True
-            peer = blob.identity if hasattr(blob, 'identity') else blob
             # Note: peer_potentials membership was previously a hard gate here.
             # It was redundant — blob.validate() already checked authenticity,
             # the confirm broadcast comes from a trusted group member, and the
@@ -1038,11 +2481,45 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 # but missing from peer_capabilities, so DataRcvr never
                 # subscribes to their streams.
                 self._send_caps_query(queues, peer)
+            # Two-phase admission (§3.1-a). Count DISTINCT confirmers for this
+            # peer; propagate the group key only once the quorum is met.
+            #   - quorum 1 (default): first confirm promotes immediately —
+            #     identical to the historical single-welcomer behavior.
+            #   - quorum >1: hold PROVISIONAL (peer known, key withheld) until
+            #     that many distinct border-guards have independently
+            #     confirmed, then CONFIRM (propagate the group key).
+            peer_key = str(peer.uuid)
+            confirmer = message.from_whom
+            confirmer_uuid = str(confirmer.uuid) if isinstance(confirmer, Identity) else None
+            with self.lock:
+                confirmers = self._provisional_confirmations.setdefault(peer_key, set())
+                # No confirmer identity on the envelope (e.g. quorum 1, or a
+                # sender that didn't stamp from_whom): treat this confirm as a
+                # distinct anonymous corroboration so single-confirm admission
+                # still promotes.
+                confirmers.add(confirmer_uuid if confirmer_uuid is not None
+                               else '<anon:%d>' % len(confirmers))
+                reached = len(confirmers) >= max(1, self._admission_quorum)
+            first_add = self.peers.find_by_uuid(peer.uuid) is None
             _probes.emit('peer.set', 'add_request',
                          peer_uuid=str(peer.uuid),
                          peer_addr=getattr(peer, 'address', None),
                          source='handle_confirm_peer')
-            self._add_peer(queues, peer)
+            if first_add:
+                # Record the peer (history/peers/caps); propagate the group
+                # key only if the quorum is already satisfied.
+                self._add_peer(queues, peer, confirmed=reached)
+            elif reached:
+                # Already provisionally known; the quorum is now met —
+                # propagate the group key (promotion).
+                self._confirm_group_membership(queues, peer)
+            if reached:
+                with self.lock:
+                    self._provisional_confirmations.pop(peer_key, None)
+            else:
+                self.logger.debug(
+                    'Peer %s provisional: %d/%d confirms' %
+                    (peer.nickname, len(confirmers), max(1, self._admission_quorum)))
             return True
         return False
 
@@ -1065,6 +2542,38 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             _probes.counter('peer.set', 'caps_query_q_full')
             self.logger.error('_send_caps_query: Network queue full')
 
+    def _capability_descriptor(self, name: str) -> dict:
+        """Build the JSON descriptor for one capability for caps_response.
+
+        Always carries ``name``; adds required_tier/description/kind/arg_schema
+        when this node's `Capabilities` registry knows them (operator-console
+        directory metadata, PIV_MFA_OPERATOR_ACCESS_PLAN.md §3.5). Receivers are
+        tolerant of both this object form and a legacy bare name string.
+        """
+        from ..capabilities import sanitize_descriptor
+        desc = {'name': name}
+        cap = None
+        if self.capabilities is not None:
+            try:
+                cap = self.capabilities[name]
+            except KeyError:
+                cap = None
+        if cap is not None:
+            raw = {'required_tier': int(getattr(cap, 'required_tier', 0) or 0),
+                   'description': getattr(cap, 'description', '') or '',
+                   'kind': getattr(cap, 'kind', '') or ''}
+            schema = getattr(cap, 'arg_schema', None)
+            if not schema:
+                arg_names = getattr(cap, 'arg_names', None)
+                if arg_names:
+                    schema = {a: 'any' for a in arg_names}
+            if schema:
+                raw['arg_schema'] = schema
+            # Clamp to the same bounds the receiver enforces, so we never emit
+            # an oversized descriptor (defensive symmetry).
+            desc.update(sanitize_descriptor(raw))
+        return desc
+
     def handle_caps_query(self, queues, message):
         """Respond to a peer's caps_query with our own capability list."""
         if message.function != IdentityProtocol.caps_query:
@@ -1081,7 +2590,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             _probes.emit('peer.set', 'caps_query_responding',
                          caps_count=len(caps_list),
                          caps=','.join(sorted(caps_list)) if caps_list else '')
-            payload = to_json_string(caps_list)
+            # Carry per-capability descriptors (name + optional required_tier/
+            # description/kind/arg_schema). Receivers are tolerant of both this
+            # object form and a legacy bare-name string.
+            payload = to_json_string(
+                [self._capability_descriptor(n) for n in caps_list])
             sender = getattr(message, 'from_whom', None)
             if sender is None:
                 _probes.counter('peer.set', 'caps_query_no_sender')
@@ -1115,14 +2628,34 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             _probes.counter('peer.set', 'caps_response_no_sender')
             return True
         try:
-            caps_list = from_json_string(message.obj)
-            if not isinstance(caps_list, list) or not caps_list:
+            items = from_json_string(message.obj)
+            if not isinstance(items, list) or not items:
+                _probes.counter('peer.set', 'caps_response_bad_shape')
+                return True
+            # Tolerant parse: each item is either a legacy bare capability
+            # name (str) or a descriptor object {name, required_tier,
+            # description, kind, arg_schema}. Descriptors are untrusted and
+            # size-bounded by PeerCapabilities.register_descriptor.
+            caps_list = []
+            parsed_descriptors = {}
+            for item in items:
+                if isinstance(item, str):
+                    caps_list.append(item)
+                elif isinstance(item, dict) and isinstance(item.get('name'), str):
+                    nm = item['name']
+                    caps_list.append(nm)
+                    parsed_descriptors[nm] = {k: v for k, v in item.items()
+                                              if k != 'name'}
+                # else: malformed item, skip
+            if not caps_list:
                 _probes.counter('peer.set', 'caps_response_bad_shape')
                 return True
             # Compute the set of caps this peer is missing from.
             # Snapshot under lock; emit diagnostics OUTSIDE the lock to
             # avoid contention with the identity proc's fan-put path.
             with self.lock:
+                for nm, desc in parsed_descriptors.items():
+                    self.peer_capabilities.register_descriptor(nm, desc)
                 missing = [
                     c for c in caps_list
                     if sender.uuid not in self.peer_capabilities.get(c, [])
@@ -1163,6 +2696,178 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         except Exception as err:
             _probes.counter('peer.set', 'caps_response_exc')
             self.report_exception(err, 'handle_caps_response')
+        return True
+
+    # How often the cap-resync sweep runs, and the max queries it emits per
+    # sweep (so a large degraded group can't burst the network queue). The
+    # interval is long relative to the q_cadence loop so steady-state cost is
+    # negligible; a converged group emits zero queries (every peer has caps).
+    _CAPS_RESYNC_INTERVAL_SEC = 20.0
+    _CAPS_RESYNC_MAX_PER_SWEEP = 16
+
+    def _periodic_caps_resync(self, queues):
+        """Periodic backstop for the late-joiner UDP-loss case.
+
+        The confirm-time directed ``caps_query`` (``handle_confirm_peer``)
+        recovers a peer whose ``announce`` was lost — but it is a one-shot.
+        If that query or its ``caps_response`` is also dropped (UDP across
+        the docker bridge), the peer stays in ``self.peers`` yet absent from
+        ``peer_capabilities``, so cap-driven discovery (DataRcvr's stream
+        subscription, negotiation participant lookup) never sees it. This
+        sweep re-sends ``caps_query`` to every admitted peer that has NO
+        capabilities registered, every ``_CAPS_RESYNC_INTERVAL_SEC``, until
+        the caps arrive.
+
+        Self-limiting: a peer with any registered cap is skipped, so a
+        converged group emits nothing. Idempotent: ``handle_caps_response``
+        already per-cap-dedups, so a redundant re-query is harmless. Reuses
+        the existing reliable directed query/response — no new wire message,
+        so Python/C wire parity is unaffected.
+        """
+        if self.phase != 3 or self.group is None or self.choosing:
+            return
+        try:
+            with self.lock:
+                if self.peers is None:
+                    return
+                # uuids that already have at least one cap registered
+                known = set()
+                for _cap, uuids in self.peer_capabilities.items():
+                    known.update(str(u) for u in uuids)
+                self_uuid = str(self.identity.uuid)
+                capless = [
+                    peer for peer in self.peers.all
+                    if str(peer.uuid) != self_uuid
+                    and str(peer.uuid) not in known
+                ]
+            if not capless:
+                return
+            sent = 0
+            for peer in capless:
+                if sent >= self._CAPS_RESYNC_MAX_PER_SWEEP:
+                    _probes.counter('peer.set', 'caps_resync_truncated',
+                                    str(len(capless) - sent))
+                    break
+                self._send_caps_query(queues, peer)
+                sent += 1
+            _probes.counter('peer.set', 'caps_resync_query', str(sent))
+            self.logger.debug(
+                'Caps resync: re-queried %d cap-less peer(s)' % sent)
+        except Exception as err:
+            _probes.counter('peer.set', 'caps_resync_exc')
+            self.report_exception(err, '_periodic_caps_resync')
+
+    # --- Identity backfill for cold/late joiners ---------------------------
+    # group.addresses can list members whose full Identity never reached us:
+    # the merge/partition path adopts the group (addresses grow) but
+    # _populate_peers_from_history only adds the identities a welcomer bundled,
+    # so self.peers stays sparse. Without the Identity (nickname) we can't name
+    # those peers, so consensus reputations stay unattributed and the
+    # dod_mission dashboard shows everyone "forming…". This sweep asks the
+    # group for the identities we lack; matching members reply with their
+    # published identity, which we add to self.peers (and _record_peers then
+    # reliably reaches the main proc via the explicit-put fix above).
+    # Self-limiting: a node that already holds an identity per group member
+    # emits nothing. Shares the caps-resync cadence (driven from the loop).
+    def _periodic_identity_resync(self, queues):
+        if self.phase != 3 or self.group is None or self.choosing:
+            return
+        try:
+            group_size = len(list(self.group.addresses))
+            have = {str(p.uuid) for p in self.peers.all}
+            have.add(str(self.identity.uuid))
+            # We have an Identity for (at least) every group member -> nothing
+            # to do. uuid-count vs address-count is 1:1 per member; an
+            # occasional over-query is harmless (responders skip via `have`).
+            if len(have) >= group_size:
+                return
+            payload = to_json_string({'group_uuid': str(self.group.uuid),
+                                      'have': sorted(have)})
+            query = Message(self.name, IdentityProtocol.id_query, payload,
+                            to_whom=Network.broadcast, encrypt=False)
+            queues[CfgIds.network].put(query, block=True, timeout=self.q_cadence)
+            _probes.counter('peer.set', 'identity_resync_query',
+                            str(group_size - len(have)))
+            self.logger.debug(
+                'Identity resync: querying group for %d missing member '
+                'identity/ies' % (group_size - len(have)))
+        except Full:
+            _probes.counter('peer.set', 'identity_resync_q_full')
+            self.logger.error('_periodic_identity_resync: Network queue full')
+        except Exception as err:
+            _probes.counter('peer.set', 'identity_resync_exc')
+            self.report_exception(err, '_periodic_identity_resync')
+
+    def handle_identity_query(self, queues, message):
+        """A same-group peer that holds our address but not our Identity asks
+        for it (payload: our group uuid + the uuids it already has). If we're
+        in that group and not in its have-list, reply with our published
+        identity so it can populate self.peers."""
+        if message.function != IdentityProtocol.id_query:
+            return False
+        try:
+            payload = from_json_string(message.obj) \
+                if isinstance(message.obj, (str, bytes)) else message.obj
+            if not isinstance(payload, dict) or self.group is None:
+                return True
+            if str(payload.get('group_uuid')) != str(self.group.uuid):
+                return True  # different group — not our concern
+            have = {str(x) for x in (payload.get('have') or [])}
+            if str(self.identity.uuid) in have:
+                return True  # asker already has us
+            out = to_json_string({'from_identity': self.identity.publish(),
+                                  'from_address': self.identity.address})
+            reply = Message(self.name, IdentityProtocol.id_response, out,
+                            to_whom=Network.broadcast, encrypt=False)
+            queues[CfgIds.network].put(reply, block=True, timeout=self.q_cadence)
+            _probes.counter('peer.set', 'identity_response_sent')
+        except Full:
+            _probes.counter('peer.set', 'identity_response_q_full')
+            self.logger.error('handle_identity_query: Network queue full')
+        except Exception as err:
+            _probes.counter('peer.set', 'identity_query_exc')
+            self.report_exception(err, 'handle_identity_query')
+        return True
+
+    def handle_identity_response(self, queues, message):
+        """Receive a group member's published identity (reply to our
+        id_query) and add it to self.peers. Gated to peers whose advertised
+        address is actually in our group's address map, so a stray
+        broadcaster can't inject itself into our peer set."""
+        if message.function != IdentityProtocol.id_response:
+            return False
+        try:
+            payload = from_json_string(message.obj) \
+                if isinstance(message.obj, (str, bytes)) else message.obj
+            if not isinstance(payload, dict) or self.group is None:
+                return True
+            ident = self._as_identity(payload.get('from_identity'))
+            if ident is None or getattr(ident, 'uuid', None) is None:
+                _probes.counter('peer.set', 'identity_response_no_identity')
+                return True
+            addr = (getattr(ident, 'address', None)
+                    or payload.get('from_address'))
+            if addr is None or addr not in list(self.group.addresses):
+                # Only backfill identities for actual group members.
+                _probes.counter('peer.set', 'identity_response_not_in_group')
+                return True
+            if str(ident.uuid) == str(self.identity.uuid):
+                return True
+            with self.lock:
+                already = self.peers.find_by_uuid(ident.uuid) is not None
+                if not already:
+                    self.peers.add(ident)
+            if not already:
+                self._record_peers(queues)
+                _probes.counter('peer.set', 'identity_response_added')
+                self.logger.debug(
+                    'Identity resync: backfilled identity for group member '
+                    '%s' % getattr(ident, 'nickname', str(ident.uuid)))
+            else:
+                _probes.counter('peer.set', 'identity_response_redundant')
+        except Exception as err:
+            _probes.counter('peer.set', 'identity_response_exc')
+            self.report_exception(err, 'handle_identity_response')
         return True
 
     def handle_history_diff(self, queues, message):
@@ -1226,6 +2931,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 # Tier update arrived before we have the peer's identity.
                 # Drop quietly — the next reputation cycle will retry.
                 return True
+            # Record that this peer HAS been scored, whether or not the value
+            # moved. A published tier of 0 is real information (the peer was
+            # assessed and landed there); it is not the same as never having
+            # been assessed, and only this set can tell the two apart.
+            self._tier_published.add(peer_uuid_str)
             old = getattr(target, '_tier', 0)
             if old != new_tier:
                 target._tier = new_tier
@@ -1243,6 +2953,25 @@ class IdentityProcess(Process, metaclass=ProcMeta,
     _PARTITION_PROBE_COOLDOWN_SEC = 10.0   # per from_addr (§5.2)
     _PARTITION_RESPONSE_COOLDOWN_SEC = 30.0  # per probe-sender uuid (§5.3)
     _PARTITION_RECOVERY_TIMEOUT_SEC = 15.0  # in-progress lockout (§5.4)
+
+    @staticmethod
+    def _as_identity(obj):
+        """Normalize a payload's ``from_identity`` to an Identity (or None).
+
+        A Python sender's identity round-trips through ``from_json_string``
+        back into an Identity (its publish() form carries ``__type__``), but a
+        C / cross-runtime sender serializes it as the flat *canonical* form
+        (no ``__type__``), so ``from_json_string`` leaves it a plain dict.
+        Reconstruct that via ``public_identity_from_canonical`` so the
+        signature/uuid checks downstream work for both. Without this a
+        C-originated partition_probe/response crashes the handler
+        (``'dict' object has no attribute 'signature'``) and an id_response is
+        silently dropped, stranding cross-runtime group merges."""
+        if isinstance(obj, dict):
+            return public_identity_from_canonical(obj)
+        if getattr(obj, 'uuid', None) is not None:
+            return obj
+        return None
 
     @staticmethod
     def _partition_probe_canonical(group_uuid, group_size):
@@ -1277,11 +3006,17 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         group is size-1 — the dod_mission coordinator case.
         """
         candidates = []
-        our_rank = getattr(self.identity, '_rank', 0)
+        # Use operational (effective) rank so a peer that has dropped off the
+        # one-hop mesh isn't picked as welcomer; falls back to the static
+        # rank when no reachability adjustment is in play (deferred.md §2.2).
+        our_rank = getattr(self.identity, 'effective_rank',
+                           getattr(self.identity, '_rank', 0))
         for peer in self.peers.all:
             if str(getattr(peer, 'uuid', '')) == str(self.identity.uuid):
                 continue
-            if getattr(peer, '_rank', 0) < our_rank:
+            peer_rank = getattr(peer, 'effective_rank',
+                                getattr(peer, '_rank', 0))
+            if peer_rank < our_rank:
                 continue
             candidates.append(peer)
         if not candidates:
@@ -1367,7 +3102,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             if not isinstance(payload, dict):
                 _probes.counter('peer.set', 'partition_probe_bad_payload')
                 return True
-            sender_id = payload.get('from_identity')
+            sender_id = self._as_identity(payload.get('from_identity'))
             group_uuid = payload.get('my_group_uuid')
             group_size = payload.get('my_group_size')
             sig_hex = payload.get('signature')
@@ -1375,9 +3110,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     or group_size is None or sig_hex is None):
                 _probes.counter('peer.set', 'partition_probe_missing_fields')
                 return True
-            # sender_id arrived deserialized as an Identity (Configuration
-            # auto-deserialization in Message.__init__). Verify signature
-            # using the raw-bytes path that message.py:228-243 documents
+            # sender_id normalized to an Identity by _as_identity (a Python
+            # sender round-trips to Identity; a C sender's flat canonical
+            # dict is rebuilt). Verify signature using the raw-bytes path
+            # that message.py:228-243 documents
             # — Identity.verify's two-arg form double-encodes under nacl.
             try:
                 sig_raw = HexEncoder.decode(sig_hex.encode('ascii'))
@@ -1388,6 +3124,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 _probes.counter('peer.set', 'partition_probe_bad_sig')
                 return True
             sender_uuid = str(sender_id.uuid)
+            our_group_uuid = str(self.group.uuid)
+            our_group_size = len(list(self.group.addresses))
             # If the sender is already in our group, this is the
             # graceful no-op case (their local view is stale); send a
             # normal group_key_update and bail.
@@ -1399,6 +3137,35 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 # don't respond with a partition_response.
                 _probes.counter('peer.set', 'partition_probe_known_peer')
                 return True
+            # Symmetric adoption: the probe already advertises the prober's
+            # group size, so decide adoption HERE too — not only in
+            # handle_partition_response. Without this, a node that never
+            # receives a foreign GROUP-channel message — e.g. the
+            # dod_mission coordinator, which sits in no other group's
+            # address map — only ever RESPONDS to probes (its
+            # ``sender_group is None`` trigger in netprocess never fires)
+            # and can never initiate a merge into a larger group, leaving a
+            # size-1/2 group wedged on the losing side of every comparison
+            # (partition-recovery.md §1's size-1-coordinator case). Same
+            # decision as handle_partition_response (strictly larger, or
+            # equal size with smaller uuid), guarded by the in-flight lock
+            # so we neither double-initiate nor ping-pong with the
+            # symmetric peer (exactly one side's adopt test is True).
+            if not self._partition_recovery_active():
+                their_size = int(group_size)
+                if (their_size > our_group_size
+                        or (their_size == our_group_size
+                            and str(group_uuid) < our_group_uuid)):
+                    self._partition_recovery_in_progress = (
+                        str(group_uuid), now())
+                    self._broadcast_request_access(queues)
+                    _probes.counter('peer.set', 'partition_recovery_initiated')
+                    self.logger.info(
+                        'Partition recovery (from probe): adopting group %s '
+                        '(size=%d vs our %d), sent request_access '
+                        '(probe from %s@%s)' %
+                        (group_uuid, their_size, our_group_size,
+                         sender_uuid, payload.get('from_address')))
             cutoff = now()
             last = self._partition_response_cooldown.get(sender_uuid)
             if (last is not None
@@ -1407,8 +3174,6 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 return True
             self._partition_response_cooldown[sender_uuid] = cutoff
             # Build the response.
-            our_group_uuid = str(self.group.uuid)
-            our_group_size = len(list(self.group.addresses))
             leader = self._select_partition_leader()
             resp_sig_bytes = self._partition_response_canonical(
                 our_group_uuid, our_group_size, sender_uuid)
@@ -1456,7 +3221,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 message.obj, (str, bytes)) else message.obj
             if not isinstance(payload, dict):
                 return True
-            sender_id = payload.get('from_identity')
+            sender_id = self._as_identity(payload.get('from_identity'))
             in_response_to = payload.get('in_response_to')
             their_group_uuid = payload.get('my_group_uuid')
             their_group_size = payload.get('my_group_size')
@@ -1531,7 +3296,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             if isinstance(group, str):
                 if not group:
                     return True  # empty payload — no-op
-                group = Configuration.from_string(group)
+                # The group rides as the DRY canonical flat dict (shared
+                # byte-shape with C's group_to_json) so a C co-member's
+                # group_key_update parses; tolerate a legacy ConfigJSONEncoder
+                # Group object (same-runtime / pre-canonical senders, which
+                # from_json_string reconstructs directly via __type__). Mirrors
+                # the full_history reconstruction. See [[project_group_key_sync]].
+                decoded = from_json_string(group)
+                group = (Group.from_canonical(decoded)
+                         if isinstance(decoded, dict) else decoded)
             mine, theirs = self.group, group
             if mine is None or theirs is None:
                 return True
@@ -1552,10 +3325,42 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 elif len(theirs.addresses) < len(mine.addresses):
                     adopt = False
                 else:
-                    adopt = str(theirs.uuid) < str(mine.uuid)
+                    # Size tie (ISSUES.md §3.1-b): the OLDER group wins — the
+                    # more-established group absorbs the younger one — so we
+                    # adopt theirs iff it is older. Only when both carry a known
+                    # age (created > 0) that differs; otherwise fall back to the
+                    # deterministic uuid tiebreaker (historical behavior, which
+                    # prevents the equal-size group_key_update flood). "Adopt
+                    # the older/larger group": larger is primary above, older
+                    # breaks the tie here.
+                    if theirs.created and mine.created and theirs.created != mine.created:
+                        adopt = theirs.created < mine.created
+                    else:
+                        adopt = str(theirs.uuid) < str(mine.uuid)
             if adopt:
-                self.logger.debug('Replace %s group with %s group' % (mine.nickname, theirs.nickname))
-                self.group = theirs
+                if theirs.owns_private_key or not mine.owns_private_key:
+                    # Normal adopt: `theirs` carries the shared private key, or
+                    # we hold no key to lose — take it wholesale.
+                    self.logger.debug('Replace %s group with %s group' % (mine.nickname, theirs.nickname))
+                    self.group = theirs
+                elif mine.uuid == theirs.uuid:
+                    # `theirs` is PUBLIC-ONLY but has a larger membership for OUR
+                    # group. Adopt the membership but KEEP our private encryptor:
+                    # group_key_update is membership-only (the key is not rotated,
+                    # idprocess.py:1042). Wholesale replacement here would drop the
+                    # shared private key and break group decrypt — the Py<->C
+                    # divergence that left cold-joining C nodes keyless (right
+                    # uuid, wrong key bytes). C's handle_group_update already
+                    # keeps its encryptor. See [[dod-microdrone-targets-live-vs-playback]].
+                    self.logger.debug('Adopt %s membership; keep our group key' % theirs.nickname)
+                    self.group.adopt_membership(theirs)
+                else:
+                    # `theirs` is a DIFFERENT, public-only group. Adopting it would
+                    # abandon our key-bearing group for one we cannot decrypt;
+                    # refuse and wait for a private-bearing full_history / update
+                    # to converge. (Quiet no-op — don't echo, that's the flood.)
+                    self.logger.debug('Refuse public-only group %s over our keyed group' % theirs.nickname)
+                    return True
                 self._record_group(queues)
                 # Partition recovery completes here whenever the adopted
                 # group matches an in-flight recovery, OR opportunistically
@@ -1606,6 +3411,28 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self.logger.debug('Phase %s' % self.phase)
                     phase = self.phase
                 self.vote_response(queues)
+
+                # Periodic late-joiner cap-loss backstop. Interval-gated so
+                # the fast drain loop doesn't run it every iteration; a
+                # converged group emits no queries. See
+                # _periodic_caps_resync / feedback_late_joiner_caps.
+                tick = now()
+                if (self._last_caps_resync is None
+                        or (tick - self._last_caps_resync).total_seconds()
+                        >= self._CAPS_RESYNC_INTERVAL_SEC):
+                    self._last_caps_resync = tick
+                    self._periodic_caps_resync(queues)
+                    # Same cadence: backfill identities for group members we
+                    # hold an address for but no Identity (cold/late joiner;
+                    # see _periodic_identity_resync + layer 3 memory).
+                    self._periodic_identity_resync(queues)
+
+                # Every iteration, not interval-gated: an attended-now pull
+                # must not outlive its deadline, in either direction — a pull
+                # we owe an answer to, or one we are waiting on. Cheap — both
+                # are no-ops unless a pull is in flight.
+                self._expire_attest_pending(queues)
+                self._expire_attest_sent(queues)
 
                 untouched = []
                 while len(self.messages) > 0:

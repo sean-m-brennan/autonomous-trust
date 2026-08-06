@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -23,10 +23,14 @@ from autonomous_trust.core.algorithms.stake import AgreementByStake
 from autonomous_trust.core.algorithms.work import AgreementByWork
 
 
-def _mock_voter(rank=1, uid=None):
+def _mock_voter(rank=1, uid=None, effective_rank=None):
     v = MagicMock(spec=AgreementVoter)
     v.uuid = uid or uuid4()
     v.rank = rank
+    # Authority voting keys off effective_rank (deferred.md §2.2); with no
+    # reachability adjustment it equals the signed rank. Set it explicitly so
+    # the spec'd mock returns an int, not an unconfigured MagicMock.
+    v.effective_rank = rank if effective_rank is None else effective_rank
     return v
 
 

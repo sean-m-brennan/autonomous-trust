@@ -1,0 +1,88 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: operator-key-bound-to-another-identity-rejected
+byte_pinning: false
+description: |
+    NEGATIVE CONTROL: a binding that is cryptographically perfect and still
+    refused, because it names a different node.
+
+    This is ISSUES.md §1.5 made concrete — a chain-valid credential harvested
+    from another peer's clear-text announce and re-presented under a new
+    identity. The signature verifies against the operator credential; the
+    operator really did sign it; the operator key is a real one. It simply was
+    not bound to THIS node. Without the uuid and signing key inside the signed
+    pre-image, the harvested pair would transfer freely and one operator could
+    be claimed as guardian by every node that overheard them.
+
+    The binding closes that hole for opted-in operator nodes specifically.
+    Ordinary device credentials and opted-out nodes are exactly as exposed as
+    before, and §1.5 stays open.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  zta_policy:
+    enabled: true
+    require_at_admission: true
+    # These fixtures PREDATE the credential->identity binding (ISSUES §1.5) and
+    # provision none, so `off` keeps each pin testing what it claims: this case is
+    # about the chain / operator classification, not about bindings. Without it a
+    # reject-* pin would pass for the wrong reason (unbound, not bad chain) and the
+    # admit pins would fail outright. Binding behavior is pinned separately by the
+    # zta-binding-* scenarios.
+    binding_mode: "off"
+    verifier_type: x509
+    ca_bundle_path: testdata/zta/operator-ca-bundle.pem
+    operator_ca_bundle_path: testdata/zta/operator-ca-bundle.pem
+  credentials:
+    newcomer: testdata/zta/certs/operator_leaf.der
+  operator_bindings:
+    newcomer: other-identity
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+    description: |
+        newcomer announces with an operator credential AND an advertised
+        guardian key. bg's welcoming_committee verifies the chain, classifies
+        the credential operator-class, then checks the binding.
+  - id: 2
+    from: bg
+    to: broadcast
+    function: propose_peer
+    in_response_to: 1
+    description: bg proposes the candidate to the group.
+  - id: 3
+    from: bg
+    to: broadcast
+    function: peer_accepted
+    in_response_to: 1
+    description: |
+        After synchronous vote finalization, _peer_accepted stores the newcomer
+        with whatever the gate concluded about its guardian.
+  - id: 4
+    from: bg
+    to: newcomer
+    function: access_granted
+    in_response_to: 1
+    description: bg sends its published identity to the newcomer.
+  - id: 5
+    from: bg
+    to: newcomer
+    function: full_history
+    in_response_to: 1
+    description: bg sends the group key + history DAG.
+
+expected_state:
+  bg:
+    operator_bound:
+      newcomer: true
+    operator_guardian:
+      newcomer: false

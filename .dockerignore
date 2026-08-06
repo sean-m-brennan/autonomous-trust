@@ -1,6 +1,10 @@
 **/__pycache__/
 **/*.pyc
 **/*.pyo
+**/.tox/
 .git/
 .tilt/
 *.egg-info/
+# node_modules is reinstalled inside the inspector Dockerfile's builder stage;
+# keep the ~200MB host tree out of the build context.
+**/node_modules/

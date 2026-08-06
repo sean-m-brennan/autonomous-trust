@@ -1,6 +1,6 @@
 #!/bin/bash
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -57,18 +57,19 @@ fi
 cd $this_dir/async_update
 protoc -I=. --python_out=./ ./bin_data.proto
 
-cd $package_dir/dash_components/assets
-if $devel; then
-  ln -sf ../../../../reactjs/async_update/async_update.dev.js
-  ln -sf ../../../../reactjs/async_update/async_update.dev.js.map
-  #cp ../../../../reactjs/async_update/async_update.dev.js ./
-  #cp ../../../../reactjs/async_update/async_update.dev.js.map ./
-else
-  ln -sf ../../../../reactjs/async_update/async_update.min.js
-  ln -sf ../../../../reactjs/async_update/async_update.min.js.map
-  #cp ../../../../reactjs/async_update/async_update.min.js ./
-  #cp ../../../../reactjs/async_update/async_update.min.js.map ./
-fi
-cd ..
-ln -sf ../../../reactjs/async_update
+# Expose the built async_update Dash component package where the inspector
+# imports it (dash_components/async_update; see core.py "from .async_update
+# import bin_data_pb2"). The package's __init__.py serves its own JS bundle via
+# _js_dist, so the JS does NOT need to live under the Dash assets_folder -- the
+# whole package directory is what must be reachable.
+#   -n: do not dereference an existing async_update symlink, otherwise the new
+#       link would be created *inside* the previous target (nesting it). This is
+#       what silently corrupted earlier runs.
+cd "$package_dir/dash_components"
+ln -sfn ../../../reactjs/async_update async_update
+
+# core.py points Dash at dash_components/assets for app-level static assets
+# (CSS/images). It is gitignored and may be empty, but must exist so Dash's
+# assets_folder resolves cleanly.
+mkdir -p "$package_dir/dash_components/assets"
 #cp -r ../../../reactjs/async_update ./

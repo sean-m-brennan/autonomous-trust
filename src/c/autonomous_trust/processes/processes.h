@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2024 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -62,6 +62,56 @@ struct process_s
         map_t *peer_capabilities;
         int phase;
         array_t *unhandled_messages;
+        /* Border-guard flag (identity process only; ISSUES.md §3.1-c).
+         * Mirrors Python IdentityProcess.border_guard_mode. When true (the
+         * default, set in identity_register_handlers) this peer welcomes
+         * newcomers AND votes on received proposals; when false it abstains
+         * from voting (Policy B — border-guards-only). Non-identity
+         * processes never read it. */
+        bool border_guard_mode;
+        /* Two-phase admission quorum (identity process only; ISSUES.md
+         * §3.1-a). Mirrors Python IdentityProcess._admission_quorum. A member
+         * withholds the group key from a peer until this many DISTINCT
+         * border-guards have confirmed the admission. Default 1 (set in
+         * identity_register_handlers) = promote on first confirm = historical
+         * behavior. Non-identity processes never read it. */
+        int admission_quorum;
+        /* Subtree member-roster enumeration (identity process only). Mirrors
+         * Python IdentityProcess.child_groups / child_gateways / roster_private.
+         * child_groups: child-group-uuid string -> group_t* (a cohort this node
+         * gateways, beyond its primary `group`). child_gateways: child-group-uuid
+         * string -> child-gateway node-uuid string — an EXPLICIT override of the
+         * deeper gateway a full subtree roster recurses into (tests / pinned
+         * topologies). When absent, the child gateway is DISCOVERED by rank: the
+         * highest-rank member of the child group (excluding self), ties broken by
+         * the lexicographically greater uuid — identical to Python. Both NULL/empty
+         * on a leaf, in which case a roster query is purely local and behaviour is
+         * identical to today. peer_ranks: peer-uuid string -> rank int, the seam
+         * that feeds rank-based discovery (default 0/unknown). C peers are stored
+         * as public_identity_t, which drops rank (rank travels only on the full
+         * identity_t via history), so discovery reads this map rather than the
+         * peer table; populate it via identity_set_peer_rank. roster_private:
+         * opt-out (AT config AT_ROSTER_PRIVATE) — when true this node refuses to
+         * disclose its subtree, replying with a `private` marker. Non-identity
+         * processes never read these. See gateway-reputation-tree.md. */
+        map_t *child_groups;
+        map_t *child_gateways;
+        map_t *peer_ranks;
+        bool roster_private;
+        /* Operator-attended pull (identity process only; ethne D8/Q9).
+         * Python answers a pull by asking the main loop, which shares an
+         * address space with the console's live OperatorSession. C has no
+         * OperatorSession and no console app (no PIV/MFA in C), so it answers
+         * from these fields instead: the state SOURCE differs by language, the
+         * verb shape and the answer do not. Drive them with
+         * identity_set_operator_attended; attest_clock is an injectable clock
+         * (0 = wall clock) so conformance can pin a deterministic stamp.
+         * The outstanding-pull table lives in id_state (module state, like the
+         * other identity-only maps). Non-identity processes never read these.
+         * See doc/architecture/operator-attended.md. */
+        bool operator_attended;
+        double operator_attested_at;
+        double attest_clock;
     } protocol;
 };
 
@@ -119,6 +169,18 @@ extern const char *sig_quit;
 #define NO_STDOUT_REDIRECT 0x08
 #define NO_STDERR_REDIRECT 0x10
 
+/* Extra daemonize() flags OR'd into every subsystem process's own flags by
+ * process_setup(). The daemon sets this to NO_STDERR_REDIRECT when running in
+ * the foreground (log_file == NULL) so child processes keep stderr connected to
+ * the controlling terminal / container stream instead of having it redirected
+ * to /dev/null. Without it, everything a subsystem logs *after* it daemonizes
+ * (i.e. all of its message-handler output) is silently discarded — invisible to
+ * `docker logs`, journald, or a terminal. Default 0 preserves classic detached
+ * daemon behavior (subsystem stderr -> /dev/null). */
+#ifndef PROCESSES_IMPL
+extern int process_child_extra_flags;
+#endif
+
 /**
  * @brief Initialize a process (config, etc)
  *
@@ -147,10 +209,25 @@ extern const char *sig_quit;
 */
 int process_init(process_t *proc, char *name, handler_ptr_t runner, map_t *configurations, tracker_t *subsystems, logger_t *logger, array_t *dependencies);
 
-int start_process(char *pname, handler_ptr_t runner, map_t *configs, tracker_t *tracker,
-                  map_t *procs, pthread_mutex_t *procs_lock, directory_t *queues, logger_t *logger);
+/**
+ * @brief Process-management context shared by (re)start_process.
+ *
+ * Bundles the live pid->process registry, its lock, the queue directory,
+ * and the logger so these four collaborators travel together instead of as
+ * loose positional parameters.
+ */
+typedef struct
+{
+    map_t *procs;
+    pthread_mutex_t *procs_lock;
+    directory_t *queues;
+    logger_t *logger;
+} proc_context_t;
 
-int restart_process(pid_t orig, char *pname, map_t *procs, pthread_mutex_t *procs_lock, directory_t *queues, logger_t *logger);
+int start_process(char *pname, handler_ptr_t runner, map_t *configs, tracker_t *tracker,
+                  proc_context_t *ctx);
+
+int restart_process(pid_t orig, char *pname, proc_context_t *ctx);
 
 
 /**

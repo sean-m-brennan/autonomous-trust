@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2024 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -18,6 +18,17 @@
 
 void *smrt_create(size_t size)
 {
+    /* Every smrt allocation carries a smrt_ptr_t header at offset 0 (the
+     * `sptr->alloc`/`sptr->refs` writes below). Callers that use smrt_create
+     * as a plain buffer allocator (e.g. smrt_create(strlen(s) + 1) for a
+     * string, or net_msg_pack_json for a short JSON payload) can request
+     * fewer than sizeof(smrt_ptr_t) bytes; the header write would then run
+     * past the allocation. Enforce the documented `requires size >=
+     * sizeof(smrt_ptr_t)` precondition with a floor so the header always
+     * fits. Over-allocating a few bytes is harmless — callers track their
+     * own logical length separately. */
+    if (size < sizeof(smrt_ptr_t))
+        size = sizeof(smrt_ptr_t);
     void *ptr = calloc(1, size);
     if (ptr == NULL)
         return ptr;

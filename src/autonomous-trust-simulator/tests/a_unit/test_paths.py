@@ -1,5 +1,5 @@
 # ******************
-#  Copyright 2025 Sean M. Brennan and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -155,8 +155,14 @@ def test_line_path(line_cfg, locations, times):
 
 def test_bezier_path(bezier_cfg, locations, times):
     def confirm(step, prev, pos):
-        if step != 11:  # 11 is on cusp
-            assert prev.easting > pos.easting
+        # Easting decreases monotonically the whole way (>=42 m/step), far above
+        # the path's GAUSSIAN position jitter (N(0,1) per axis, per point), so
+        # assert it at every step. Northing reverses at the symmetric cusp
+        # (steps 10-11), where the true inter-step delta (~3 m) is within the
+        # jitter band -- a strict northing ordering there is not physically
+        # meaningful and would flake -- so only assert northing away from it.
+        assert prev.easting > pos.easting
+        if step not in (10, 11):
             assert prev.northing < pos.northing
 
     start, end = locations

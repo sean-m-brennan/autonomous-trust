@@ -1,5 +1,5 @@
 /********************
- *  Copyright 2025 Sean M. Brennan and contributors
+ *  Copyright 2024 TekFive, Inc., Sean M. Brennan, and contributors
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -127,8 +127,13 @@ int tracker_to_json(const void *data_struct, json_t **obj_ptr)
     if (err != 0)
         return EXCEPTION(EJSN_OBJ_SET);
     
-    // TODO: Refactor to use map_to_json() once it supports simple key-value
-    // JSON encoding (current map_to_json serializes internal structure)
+    /* Intentional (not a TODO): emit "subsystems" as a FLAT array of
+     * {type: impl} objects that mirrors the Python ProcessTracker wire
+     * format, so a Python peer can parse it and vice versa. map_to_json()
+     * is deliberately NOT used here because it serializes the map's verbose
+     * internal structure (length/capacity/hashkey/bucket slots) for
+     * full-fidelity round-tripping, which is a different, incompatible
+     * format. Same convention as group.c's address_map encoding. */
     json_t *array_obj = json_array();
     if (array_obj == NULL) {
         json_decref(top_obj);
@@ -230,12 +235,19 @@ int tracker_from_file(const char *filename, logger_t *logger, tracker_t **tracke
 /* Frama-C: skipped —
  * [syscall] tracker_config: at_snprintf + ensures + assigns (filesystem path formatting).
  */
-int tracker_config(char config_file[])
+int tracker_config(char *config_file, size_t destlen)
 {
-    get_cfg_dir(config_file);
+    /* Both bounds come from the caller now. This function had the same shape as
+     * the defect in ISSUES.md §2.1.1 — an unsized `char config_file[]` parameter
+     * with `CFG_PATH_LEN` hardcoded as its length — and was safe only because its
+     * one caller happened to pass a buffer that big. */
+    if (config_file == NULL || destlen == 0)
+        return -1;
+    if (get_cfg_dir(config_file, destlen) < 0)
+        return -1;
     size_t len = strlen(config_file);
-    int n = snprintf(config_file + len, CFG_PATH_LEN - len, "/%s", default_tracker_filename);
-    if (n < 0 || (size_t)n >= CFG_PATH_LEN - len)
+    int n = snprintf(config_file + len, destlen - len, "/%s", default_tracker_filename);
+    if (n < 0 || (size_t)n >= destlen - len)
         return -1;
     return (int)(len + 1);
 }
