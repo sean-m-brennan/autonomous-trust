@@ -1467,6 +1467,11 @@ set_source_files_properties(test/operator_binding_test.c PROPERTIES COMPILE_FLAG
 target_link_libraries(operator_binding_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME operator_binding_test COMMAND $<TARGET_FILE:operator_binding_test>)
 
+add_executable(process_child_exit_test test/process_child_exit_test.c)
+set_source_files_properties(test/process_child_exit_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(process_child_exit_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME process_child_exit_test COMMAND $<TARGET_FILE:process_child_exit_test>)
+
 add_executable(zta_binding_test test/zta_binding_test.c)
 set_source_files_properties(test/zta_binding_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(zta_binding_test PRIVATE ${AT_TEST_LIBS})
