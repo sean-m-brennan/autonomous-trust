@@ -1251,14 +1251,60 @@ static int net_encrypt_and_send(const identity_t *myself, const net_wire_msg_t *
  * site) but no C code path consumes it.
  ****************************/
 
-/* Return the local address string for comparing to the packet sender. */
-static void my_address(const network_config_t *net_cfg, bool ipv6, char *out)
+/* Return the local address string for comparing to the packet sender.
+ * `out_len` is explicit and callers pass IPV6_ADDR_LEN buffers: ADDR_LEN (32) is
+ * too small for a full IPv6 literal (up to 45 chars), and the result feeds a
+ * self-filter -- `strcmp(from_addr, my_addr) == 0` -- so a truncated value would
+ * silently stop a node recognising its own traffic. cidr_split now clears `out`
+ * and reports ENET_ADDR_TOO_LONG rather than truncating, which turns that into a
+ * non-match instead of a wrong match. */
+static void my_address(const network_config_t *net_cfg, bool ipv6, char *out,
+                       size_t out_len)
 {
     out[0] = '\0';
     if (ipv6)
-        cidr_split((char *)net_cfg->ip6_cidr, out, NULL);
+        cidr_split((char *)net_cfg->ip6_cidr, out, out_len, NULL, 0);
     else
-        cidr_split((char *)net_cfg->ip4_cidr, out, NULL);
+        cidr_split((char *)net_cfg->ip4_cidr, out, out_len, NULL, 0);
+}
+
+/* Deliver a PLAINTEXT frame from a peer we already know, but only an
+ * allowlisted verb that declares itself unencrypted.
+ *
+ * Three conditions, all required: the bytes parse as a wire message, the
+ * envelope's own encrypt flag is false, and the verb is one this protocol sends
+ * in plaintext (identity_verb_is_unencrypted). A frame that merely failed to
+ * decrypt is NOT accepted -- corrupt ciphertext, a stale group key or a forged
+ * frame all fall through to the caller's existing log + annoy path.
+ *
+ * Parses with a NULL peer, i.e. without signature verification, mirroring
+ * Python's validate=False on the same path. Only the ADDRESS is stamped onto
+ * from_whom, exactly as the unknown-sender branch below does: public_identity_t
+ * carries heap members (operator_key_binding, zta_credential) that
+ * net_wire_msg_free does not release, so copying a whole peer struct over
+ * from_whom would leak them and alias the peer's own pointers.
+ *
+ * Frama-C: skipped — [serialization] net_message_from_wire + at_logging.
+ */
+static bool try_unencrypted_from_known_peer(net_thread_ctx_t *ctx,
+                                           const uint8_t *buf, size_t len,
+                                           const char *from_addr)
+{
+    net_wire_msg_t wmsg;
+    if (net_message_from_wire(buf, len, NULL, &wmsg) != 0)
+        return false;
+    if (wmsg.encrypt || !identity_verb_is_unencrypted(wmsg.function)) {
+        if (!wmsg.encrypt && wmsg.function != NULL)
+            log_warn(ctx->logger, "Refusing plaintext %s from known peer %s: "
+                     "not an unencrypted verb\n", wmsg.function, from_addr);
+        net_wire_msg_free(&wmsg);
+        return false;
+    }
+    snprintf(wmsg.from_whom.address, sizeof(wmsg.from_whom.address),
+             "%s", from_addr);
+    route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
+    net_wire_msg_free(&wmsg);
+    return true;
 }
 
 /* Frama-C: skipped —
@@ -1313,6 +1359,11 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
             }
             free(plain);
             net_wire_msg_free(&wmsg);
+        } else if (try_unencrypted_from_known_peer(ctx, inner_buf, inner_len,
+                                                   from_addr)) {
+            /* A verb this protocol sends in plaintext by design. Delivered, and
+             * deliberately NOT annoy-tracked: penalising it would have driven a
+             * well-behaved peer toward blacklist for following the protocol. */
         } else {
             log_error(ctx->logger, "Network: decrypt failed (%d) from peer %s\n",
                       dec, from_addr);
@@ -1364,8 +1415,8 @@ static void *peer_receiver_thread(void *arg)
             continue;
         }
 
-        char my_addr[ADDR_LEN + 1] = {0};
-        my_address(ctx->net_cfg, false, my_addr);
+        char my_addr[IPV6_ADDR_LEN] = {0};
+        my_address(ctx->net_cfg, false, my_addr, sizeof(my_addr));
         if (strcmp(from_addr, my_addr) == 0 || reject_message(from_addr)) {
             free(buf);
             continue;
@@ -1480,8 +1531,8 @@ static void *broadcast_receiver_thread(void *arg)
             continue;
         }
 
-        char my_addr[ADDR_LEN + 1] = {0};
-        my_address(ctx->net_cfg, false, my_addr);
+        char my_addr[IPV6_ADDR_LEN] = {0};
+        my_address(ctx->net_cfg, false, my_addr, sizeof(my_addr));
         if (strcmp(from_addr, my_addr) == 0 || reject_message(from_addr)) {
             free(buf);
             continue;
@@ -1512,8 +1563,8 @@ static void *group_receiver_thread(void *arg)
             continue;
         }
 
-        char my_addr[ADDR_LEN + 1] = {0};
-        my_address(ctx->net_cfg, false, my_addr);
+        char my_addr[IPV6_ADDR_LEN] = {0};
+        my_address(ctx->net_cfg, false, my_addr, sizeof(my_addr));
         if (strcmp(from_addr, my_addr) == 0 || reject_message(from_addr)) {
             free(buf);
             continue;
