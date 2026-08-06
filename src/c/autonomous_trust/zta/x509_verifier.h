@@ -101,6 +101,38 @@ bool x509_verify_data_signature(const uint8_t *cert_der, size_t cert_len,
                                 const uint8_t *data, size_t data_len,
                                 const uint8_t *sig, size_t sig_len);
 
+/**
+ * @brief Whether the certificate carries @p uri as a URI Subject Alternative Name.
+ *
+ * The CA-asserted half of the credential->identity binding (ISSUES §1.5): where AT
+ * controls issuance it can have the issuer name the node in the certificate itself
+ * (`at://<uuid>`, SPIFFE/IDevID style), and then the presenter has nothing to
+ * assert and carries no binding blob. Unavailable, by construction, wherever AT
+ * does NOT control issuance — a foreign agency CA will not mint an AT uuid into a
+ * SAN — which is exactly why the holder-asserted signature exists alongside it.
+ *
+ * Comparison is case-insensitive (uuids are canonically lower-case hex, but a CA
+ * that upper-cased one has not issued a different certificate) and
+ * length-checked, so an embedded NUL cannot make a shorter SAN compare equal.
+ *
+ * Needs no CA store: this answers only "does this certificate name that URI",
+ * not whether the certificate is trustworthy.
+ *
+ * @param[in] cert_der  Certificate, DER (or PEM — same parser as the chain path).
+ * @param[in] cert_len  Length of @p cert_der.
+ * @param[in] uri       Fully rendered URI to match (e.g. "at://<uuid>").
+ * @return true only on a match. False on any bad argument, unparseable
+ *         certificate, or absent SAN extension — a certificate that cannot be
+ *         read names nobody.
+ */
+/*@
+  requires cert_der == \null || \valid_read(cert_der + (0 .. cert_len - 1));
+  requires uri == \null || \valid_read(uri);
+  assigns \nothing;
+*/
+bool x509_cert_has_uri_san(const uint8_t *cert_der, size_t cert_len,
+                           const char *uri);
+
 /* Error codes */
 #define EX509_CALOAD  290
 DECLARE_ERROR(EX509_CALOAD, "Failed to load CA bundle");

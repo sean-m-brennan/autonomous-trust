@@ -1,0 +1,55 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: zta-binding-reject-unbound
+byte_pinning: false
+description: |
+    The flag day, pinned. Under `binding_mode: require` a chain-valid credential
+    with NO binding is unusable, so the peer is refused — and this is the same
+    credential and the same anchor that zta-binding-admit-bound admits, with the
+    binding as the only difference.
+
+    That difference is the whole of ISSUES §1.5. Without a binding the gate has
+    no way to distinguish holder from thief and falls back on first-use-wins;
+    TOFU is not a weakness of ZTA but what is left over when the
+    credential->identity binding is inferred rather than asserted.
+
+    Unbound is a PROVISIONING STATE, not a lie, and the implementation grades it
+    that way: the credential is skipped rather than the identity condemned. For a
+    single-credential node like this one the two outcomes coincide (nothing else
+    survives, so the peer is refused), which is exactly why the pre-existing
+    zta-x509-reject-* pins still hold unchanged. Contrast
+    zta-binding-reject-forged, where a binding is offered and fails — affirmative
+    evidence of forgery, which condemns the identity outright even if other
+    credentials would otherwise have carried it.
+
+    Cross-impl: pinned on BOTH sides, ZTA-gated.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  zta_policy:
+    enabled: true
+    require_at_admission: true
+    binding_mode: require
+    verifier_type: x509
+    ca_bundle_path: testdata/zta/operator-ca-bundle.pem
+  credentials:
+    newcomer: testdata/zta/certs/operator_leaf.der
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+    description: |
+        newcomer announces a chain-valid credential with no binding. bg's
+        welcoming_committee finds nothing usable and does NOT propose.
+
+expected_state:
+  bg:
+    propose_emitted: 0

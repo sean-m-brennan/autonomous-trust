@@ -228,6 +228,125 @@ int operator_binding_preimage(const public_identity_t *ident,
     return 0;
 }
 
+int zta_binding_preimage(const public_identity_t *ident,
+                         const uint8_t *cred, size_t cred_len,
+                         uint8_t out[ZTA_BINDING_PREIMAGE_LEN])
+{
+    if (ident == NULL || cred == NULL || cred_len == 0 || out == NULL)
+        return EINVAL;
+    uint8_t *p = out;
+    memcpy(p, ZTA_BINDING_TAG, ZTA_BINDING_TAG_LEN);
+    p += ZTA_BINDING_TAG_LEN;
+    memcpy(p, ident->uuid, UUID_LEN);
+    p += UUID_LEN;
+    memcpy(p, ident->signature.public, crypto_sign_PUBLICKEYBYTES);
+    p += crypto_sign_PUBLICKEYBYTES;
+    /* Over the bytes we were handed, never the advertised hash. */
+    crypto_hash_sha256(p, cred, cred_len);
+    return 0;
+}
+
+#ifdef AT_ZTA_ENABLED
+void public_identity_zta_credentials_clear(public_identity_t *ident)
+{
+    if (ident == NULL)
+        return;
+    for (size_t i = 0; i < ZTA_MAX_CREDENTIALS; i++) {
+        free(ident->zta_credentials[i].der);
+        free(ident->zta_credentials[i].binding);
+    }
+    memset(ident->zta_credentials, 0, sizeof(ident->zta_credentials));
+    ident->num_zta_credentials = 0;
+}
+
+int public_identity_add_zta_credential(public_identity_t *ident,
+                                       const uint8_t *der, size_t der_len,
+                                       const uint8_t *binding, size_t binding_len,
+                                       const char *issuer)
+{
+    if (ident == NULL || der == NULL || der_len == 0 || der_len > ZTA_CRED_MAX)
+        return EINVAL;
+    if (binding_len > ZTA_BINDING_MAX) {
+        /* Refuse the oversized binding, keep the credential: the two are
+           separately sourced, and dropping a good credential because someone
+           padded its signature would turn a bounds check into a denial of
+           service against the honest case. */
+        binding = NULL;
+        binding_len = 0;
+    }
+    uint8_t fp[crypto_hash_sha256_BYTES];
+    crypto_hash_sha256(fp, der, der_len);
+    for (size_t i = 0; i < ident->num_zta_credentials; i++) {
+        zta_credential_t *e = &ident->zta_credentials[i];
+        if (e->der == NULL || e->der_len != der_len)
+            continue;
+        uint8_t efp[crypto_hash_sha256_BYTES];
+        crypto_hash_sha256(efp, e->der, e->der_len);
+        if (memcmp(fp, efp, sizeof(fp)) != 0)
+            continue;
+        /* Same credential. Adopt a binding if this copy has one and the stored
+           copy does not — the singular wire fields cannot carry one. */
+        if (binding != NULL && binding_len > 0
+            && (e->binding == NULL || e->binding_len == 0)) {
+            uint8_t *b = malloc(binding_len);
+            if (b != NULL) {
+                memcpy(b, binding, binding_len);
+                e->binding = b;
+                e->binding_len = binding_len;
+            }
+        }
+        if (e->issuer[0] == '\0' && issuer != NULL && issuer[0] != '\0')
+            at_strlcpy(e->issuer, issuer, sizeof(e->issuer));
+        return 0;
+    }
+    if (ident->num_zta_credentials >= ZTA_MAX_CREDENTIALS)
+        return ENOSPC;
+    zta_credential_t *slot = &ident->zta_credentials[ident->num_zta_credentials];
+    memset(slot, 0, sizeof(*slot));
+    slot->der = malloc(der_len);
+    if (slot->der == NULL)
+        return ENOMEM;
+    memcpy(slot->der, der, der_len);
+    slot->der_len = der_len;
+    if (binding != NULL && binding_len > 0) {
+        slot->binding = malloc(binding_len);
+        if (slot->binding != NULL) {
+            memcpy(slot->binding, binding, binding_len);
+            slot->binding_len = binding_len;
+        }
+    }
+    if (issuer != NULL)
+        at_strlcpy(slot->issuer, issuer, sizeof(slot->issuer));
+    ident->num_zta_credentials++;
+    return 0;
+}
+
+void public_identity_add_zta_anchor(public_identity_t *ident, const char *name)
+{
+    if (ident == NULL || name == NULL || name[0] == '\0')
+        return;
+    for (size_t i = 0; i < ident->num_zta_anchors; i++)
+        if (strcmp(ident->zta_anchors[i], name) == 0)
+            return;
+    if (ident->num_zta_anchors >= ZTA_MAX_ANCHORS)
+        return;
+    at_strlcpy(ident->zta_anchors[ident->num_zta_anchors], name,
+               ZTA_ANCHOR_NAME_LEN);
+    ident->num_zta_anchors++;
+}
+
+bool public_identity_has_zta_anchor(const public_identity_t *ident,
+                                    const char *name)
+{
+    if (ident == NULL || name == NULL || name[0] == '\0')
+        return false;
+    for (size_t i = 0; i < ident->num_zta_anchors; i++)
+        if (strcmp(ident->zta_anchors[i], name) == 0)
+            return true;
+    return false;
+}
+#endif /* AT_ZTA_ENABLED */
+
 int identity_sign(const identity_t *ident, const msg_str_t *in, msg_str_t *out)
 {
     return crypto_sign(out->msg, &out->len, in->msg, in->len, ident->signature.private);
@@ -600,6 +719,41 @@ int public_identity_sync_out(public_identity_t *identity, AutonomousTrust__Core_
         proto->zta_credential.data = identity->zta_credential;
         proto->zta_credential.len = identity->zta_credential_len;
     }
+    /* The full credential set (field 16). Unlike every other field here this one
+       ALLOCATES — protobuf-c models a repeated message as an array of pointers,
+       so there is nothing on the identity to borrow. public_identity_proto_free
+       releases it, which is why that function already exists. The credential
+       BYTES are still borrowed; only the little wrappers are ours. */
+    if (identity->num_zta_credentials > 0) {
+        size_t n = identity->num_zta_credentials;
+        proto->zta_credentials = calloc(n, sizeof(*proto->zta_credentials));
+        if (proto->zta_credentials != NULL) {
+            size_t emitted = 0;
+            for (size_t i = 0; i < n; i++) {
+                const zta_credential_t *c = &identity->zta_credentials[i];
+                if (c->der == NULL || c->der_len == 0)
+                    continue;
+                AutonomousTrust__Core__Protobuf__Identity__ZtaCredential *pc =
+                    malloc(sizeof(*pc));
+                if (pc == NULL)
+                    break;
+                autonomous_trust__core__protobuf__identity__zta_credential__init(pc);
+                pc->der.data = c->der;
+                pc->der.len = c->der_len;
+                if (c->binding != NULL && c->binding_len > 0) {
+                    pc->binding.data = c->binding;
+                    pc->binding.len = c->binding_len;
+                }
+                pc->issuer = (char *)c->issuer;
+                proto->zta_credentials[emitted++] = pc;
+            }
+            proto->n_zta_credentials = emitted;
+            if (emitted == 0) {
+                free(proto->zta_credentials);
+                proto->zta_credentials = NULL;
+            }
+        }
+    }
 #endif
 
     return 0;
@@ -675,6 +829,45 @@ int public_identity_sync_in(AutonomousTrust__Core__Protobuf__Identity__Identity 
             identity->zta_credential_len = proto->zta_credential.len;
         }
     }
+
+    /* The credential LIST (field 16). Seeded with the primary first so a peer
+       predating field 16 still yields a one-entry list and the admission gate has
+       a single shape to iterate — and so the primary keeps its slot when the
+       repeated field also carries it. add_zta_credential dedups by fingerprint
+       and adopts the field-16 copy's binding onto the primary, which matters
+       because fields 6-8 have nowhere to carry one.
+
+       Note the asymmetry with the singular field above: an oversized entry HERE
+       is skipped rather than failing the whole deserialization. One bad element
+       in a list should not discard the peer's good credentials; an oversized
+       singular credential is the peer's only one, so there is nothing to salvage.
+
+       ZEROED, NOT FREED, deliberately: the lines above drop `zta_credential` by
+       assigning NULL rather than freeing it, so this function's standing contract
+       is that the target identity is fresh. Freeing here would honor a contract
+       that does not exist and would free garbage on an uninitialized struct. A
+       caller REUSING an identity must call public_identity_zta_credentials_clear
+       first — the same obligation it already has for the singular field. */
+    memset(identity->zta_credentials, 0, sizeof(identity->zta_credentials));
+    identity->num_zta_credentials = 0;
+    if (identity->zta_credential != NULL && identity->zta_credential_len > 0)
+        public_identity_add_zta_credential(identity, identity->zta_credential,
+                                           identity->zta_credential_len,
+                                           NULL, 0, identity->zta_issuer);
+    for (size_t i = 0; i < proto->n_zta_credentials; i++) {
+        const AutonomousTrust__Core__Protobuf__Identity__ZtaCredential *pc =
+            proto->zta_credentials[i];
+        if (pc == NULL || pc->der.data == NULL || pc->der.len == 0
+            || pc->der.len > ZTA_CRED_MAX)
+            continue;
+        public_identity_add_zta_credential(identity, pc->der.data, pc->der.len,
+                                           pc->binding.data, pc->binding.len,
+                                           pc->issuer);
+    }
+    /* Anchors are OUR finding about this peer, never theirs about themselves:
+       a fresh deserialization has proved nothing yet. */
+    memset(identity->zta_anchors, 0, sizeof(identity->zta_anchors));
+    identity->num_zta_anchors = 0;
 #endif
 
     return 0;
@@ -684,6 +877,15 @@ void public_identity_proto_free(AutonomousTrust__Core__Protobuf__Identity__Ident
 {
     free(proto->signature);
     free(proto->encryptor);
+#ifdef AT_ZTA_ENABLED
+    /* Only the wrappers sync_out allocated; their `der`/`binding` point into the
+       identity and are not ours to free. */
+    for (size_t i = 0; i < proto->n_zta_credentials; i++)
+        free(proto->zta_credentials[i]);
+    free(proto->zta_credentials);
+    proto->zta_credentials = NULL;
+    proto->n_zta_credentials = 0;
+#endif
 }
 
 int peer_to_proto(public_identity_t *msg, void **data_ptr, size_t *data_len_ptr)

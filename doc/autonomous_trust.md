@@ -9,6 +9,7 @@
 - [Concept](concept.md): adversarial assumption, inverted access model, M2M focus, familiar analogies
 - [API](api.md): flat namespace, protocol/session config, state tracking, consensus, communication modes
 - [Security Model](security.md): security properties, malicious code containment, known vulnerability classes
+- [Verification Oracle](verification_oracle.md): scoring peers without an authored domain, claim classes, non-sensory work, certificates and replication
 - [Supply Chain Security](supply_chain.md): vulnerability surface, task restriction, supplier reputation tracking
 
 ## Architecture

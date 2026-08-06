@@ -1,0 +1,56 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: zta-binding-reject-other-identity
+byte_pinning: false
+description: |
+    The harvested credential — the attack ISSUES §1.5 is about, and the reason
+    the pre-image names the node at all.
+
+    The binding here is CORRECT in every respect except one: it is signed by the
+    genuine credential's own private key, with the right tag and the right
+    fingerprint, over a pre-image naming a DIFFERENT node. That is precisely what
+    an attacker obtains by lifting a `(credential, binding)` pair from a peer's
+    clear-text announce and re-presenting it under its own uuid. The chain still
+    verifies; the binding does not, because it names somebody else.
+
+    A verifier that checked only "was this signed by the credential's key" would
+    accept it. The pin exists to make sure neither implementation drifts into
+    that.
+
+    Twin of operator-key-bound-to-another-identity-rejected, one layer down: that
+    one harvests a guardian claim, this one harvests entitlement to the
+    credential itself.
+
+    Cross-impl: pinned on BOTH sides, ZTA-gated.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  zta_policy:
+    enabled: true
+    require_at_admission: true
+    binding_mode: require
+    verifier_type: x509
+    ca_bundle_path: testdata/zta/operator-ca-bundle.pem
+  credentials:
+    newcomer: testdata/zta/certs/operator_leaf.der
+  zta_bindings:
+    newcomer: other-identity
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+    description: |
+        newcomer announces a credential bound to a different node. bg refuses
+        the identity and does NOT propose.
+
+expected_state:
+  bg:
+    propose_emitted: 0

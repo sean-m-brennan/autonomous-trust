@@ -15,6 +15,7 @@
 # ******************
 
 import base64
+import hashlib
 import secrets
 import time
 import uuid as uuid_mod
@@ -28,7 +29,18 @@ from ..algorithms.agreement import AgreementVoter
 from .sign import Signature
 from .encrypt import Encryptor
 from .operator_binding import OPERATOR_BINDING_MAX, OPERATOR_PUBKEY_LEN
+from .zta_binding import ZTA_BINDING_MAX
+
 from autonomous_trust.core.protobuf.identity import identity_pb2
+
+#: Whether the generated protobuf module carries `Identity.zta_credentials`
+#: (field 16, the multi-credential set). Regenerating the pb2 happens on the
+#: toolchain host, so source can be newer than the generated module for a window;
+#: without this the sync paths would raise on every identity. Remove the guard once
+#: no deployed pb2 predates field 16.
+_HAS_ZTA_CREDENTIALS = ('zta_credentials'
+                        in identity_pb2.Identity.DESCRIPTOR.fields_by_name)
+
 
 def derive_local_petname(nickname):
     """Mint a LOCAL, arbitrary Zooko petname for a *received* identity.
@@ -63,7 +75,8 @@ class Identity(InitializableConfig, AgreementVoter):
                  _public_only=True, _rank=0, _block_impl=agreement_impl, _tier=0,
                  zta_credential=b'', zta_issuer='', zta_credential_hash=b'',
                  operator_bound=False, operator_attested_at=0.0,
-                 operator_pubkey=b'', operator_key_binding=b''):
+                 operator_pubkey=b'', operator_key_binding=b'',
+                 zta_credential_binding=b'', zta_credentials=None):
         Configuration.__init__(self, identity_pb2.Identity)
         AgreementVoter.__init__(self, str(_uuid), _rank, _tier=_tier)
         self.address = address  # corresponds to one address in Network config
@@ -87,6 +100,27 @@ class Identity(InitializableConfig, AgreementVoter):
         self.zta_credential = zta_credential or b''
         self.zta_issuer = zta_issuer or ''
         self.zta_credential_hash = zta_credential_hash or b''
+        # Proof that THIS node may present the primary credential above: a signature
+        # by the credential's own private key over bytes naming this node (see
+        # identity/zta_binding.py). Empty is legitimate -- a certificate whose SAN
+        # names the node is bound by its issuer instead. Fields 6-8 have nowhere to
+        # carry this, so on the wire it travels inside zta_credentials (field 16).
+        self.zta_credential_binding = zta_credential_binding or b''
+        # The full credential set as [{'der', 'binding', 'issuer'}], including the
+        # primary. ONE entry for an ordinary node; several only at a network gateway
+        # bridging agencies, which must hold one per agency it bridges. Each verified
+        # credential earns authority for its anchor at admission (Identity.zta_anchors,
+        # written by idprocess._zta_admit) and that -- not any declared role -- is what
+        # permits gateway function across an agency boundary.
+        self.zta_credentials = [dict(c) for c in zta_credentials] if zta_credentials else []
+        # Anchors this peer PROVED at admission, written by idprocess._zta_admit.
+        # Local and derived, never advertised: a peer stating which anchors it holds
+        # would be a claim, and the entire point of deriving authority is that this is
+        # not one. Excluded from to_dict (below) so it cannot ride the JSON identity
+        # payloads out and back in -- if it round-tripped, a peer could assert gateway
+        # authority for an agency whose credential it never presented. Deliberately
+        # NOT an __init__ kwarg for the same reason.
+        self.zta_anchors: list = []
         # Operator-attended signal (identity.proto fields 12-13; parity with C
         # public_identity_t). operator_bound is the durable "node has a human
         # guardian" flag — advertised by the node but authoritative only after
@@ -138,8 +172,16 @@ class Identity(InitializableConfig, AgreementVoter):
         # so the serialized key-set is unchanged (config_json_decoder rebuilds
         # via cls(**kwargs), so a stray key would also break the round-trip).
         # Each node re-derives the adjustment from its own observations.
+        #
+        # `zta_anchors` is dropped for exactly the same reason: it records the trust
+        # anchors a peer PROVED to us at admission, so it is the observer's finding
+        # and not the subject's claim. If it round-tripped, a peer could simply state
+        # gateway authority for an agency whose credential it never presented --
+        # which is the whole thing deriving authority from credentials is meant to
+        # prevent. It is deliberately not an __init__ kwarg either.
         d = super().to_dict()
         d.pop('_rank_adjustment', None)
+        d.pop('zta_anchors', None)
         return d
 
     def __eq__(self, other):
@@ -245,7 +287,9 @@ class Identity(InitializableConfig, AgreementVoter):
                         operator_bound=self.operator_bound,
                         operator_attested_at=self.operator_attested_at,
                         operator_pubkey=self.operator_pubkey,
-                        operator_key_binding=self.operator_key_binding)
+                        operator_key_binding=self.operator_key_binding,
+                        zta_credential_binding=self.zta_credential_binding,
+                        zta_credentials=self.zta_credentials)
 
     def sync_to_message(self):
         self.message.uuid = str(self.uuid).encode('utf-8')
@@ -288,6 +332,44 @@ class Identity(InitializableConfig, AgreementVoter):
             # because their rotation path always writes a new value.)
             self.message.ClearField('operator_pubkey')
             self.message.ClearField('operator_key_binding')
+        # The full credential set (proto field 16), primary first. The primary is
+        # emitted here as well as in fields 6-8 -- redundant by design, because those
+        # fields cannot carry a binding and a peer predating this field still needs
+        # them. The receiver deduplicates by fingerprint (idprocess._zta_credentials).
+        # Cleared first for the same reason as the operator fields: `self.message` is
+        # reused, so a node whose credential set SHRANK would otherwise keep
+        # advertising the credential it dropped.
+        if _HAS_ZTA_CREDENTIALS:
+            self.message.ClearField('zta_credentials')
+            for der, binding, issuer in self._zta_credential_tuples():
+                entry = self.message.zta_credentials.add()
+                entry.der = der
+                if binding:
+                    entry.binding = binding
+                if issuer:
+                    entry.issuer = issuer
+
+    def _zta_credential_tuples(self):
+        """``[(der, binding, issuer)]`` for the wire, primary first, deduplicated by
+        fingerprint over the actual bytes so listing the primary in
+        ``zta_credentials`` too does not emit it twice."""
+        out, seen = [], set()
+
+        def _add(der, binding, issuer):
+            der = bytes(der or b'')
+            if not der:
+                return
+            fp = hashlib.sha256(der).digest()
+            if fp in seen:
+                return
+            seen.add(fp)
+            out.append((der, bytes(binding or b''), issuer or ''))
+
+        _add(self.zta_credential, self.zta_credential_binding, self.zta_issuer)
+        for cred in self.zta_credentials:
+            _add(cred.get('der') or cred.get('credential'),
+                 cred.get('binding'), cred.get('issuer'))
+        return out
 
     def sync_from_message(self):
         self._uuid = self.message.uuid.decode('utf-8')
@@ -322,6 +404,38 @@ class Identity(InitializableConfig, AgreementVoter):
         binding = bytes(self.message.operator_key_binding)
         self.operator_key_binding = (
             binding if 0 < len(binding) <= OPERATOR_BINDING_MAX else b'')
+        # The full credential set (proto field 16). Nothing is verified here --
+        # _zta_admit walks the chains, checks each binding, and decides. An
+        # oversized binding is dropped now, on the same reasoning as the operator
+        # one above: it can only be corrupt or hostile, and carrying it forward
+        # would just hand a bigger blob to the verifier.
+        self.zta_credentials = []
+        if _HAS_ZTA_CREDENTIALS:
+            for entry in self.message.zta_credentials:
+                der = bytes(entry.der)
+                if not der:
+                    continue
+                cred_binding = bytes(entry.binding)
+                if len(cred_binding) > ZTA_BINDING_MAX:
+                    cred_binding = b''
+                self.zta_credentials.append({'der': der, 'binding': cred_binding,
+                                             'issuer': entry.issuer})
+        # Recover the PRIMARY's binding: fields 6-8 cannot carry one, so it arrives
+        # in the matching field-16 entry. Also promote the first entry to primary for
+        # a peer that sent only field 16 (nothing does today, but reading the wire
+        # form that way costs nothing and means the two can never disagree).
+        self.zta_credential_binding = b''
+        primary_fp = (hashlib.sha256(self.zta_credential).digest()
+                      if self.zta_credential else None)
+        for cred in self.zta_credentials:
+            if primary_fp is None:
+                self.zta_credential = cred['der']
+                self.zta_credential_binding = cred['binding']
+                self.zta_issuer = self.zta_issuer or cred['issuer']
+                break
+            if hashlib.sha256(cred['der']).digest() == primary_fp:
+                self.zta_credential_binding = cred['binding']
+                break
 
     @staticmethod
     def initialize(my_name, my_nickname, my_address):

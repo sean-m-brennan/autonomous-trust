@@ -45,6 +45,7 @@
 #include "zta/zta_verifier.h"
 #include "zta/zta_audit.h"
 #include "zta/x509_verifier.h"   /* x509_verify_data_signature, for the binding */
+#include "zta/zta_binding.h"     /* the credential->identity binding (ISSUES §1.5) */
 #endif
 
 /* Operator-attended signal helpers (ethne D8/Q9); defined below _build_announcement
@@ -57,8 +58,16 @@ static bool _is_operator_credential(const zta_policy_t *policy,
                                     const uint8_t *advertised_hash);
 static void _verify_operator_key(const process_t *proc,
                                  public_identity_t *pub,
+                                 const uint8_t *cred, size_t cred_len,
                                  const uint8_t claimed_key[crypto_sign_PUBLICKEYBYTES]);
+typedef enum { ZTA_GATE_ADMIT, ZTA_GATE_ADMIT_CAPPED, ZTA_GATE_REJECT } zta_gate_t;
+static zta_gate_t _zta_admit(const process_t *proc, const zta_policy_t *policy,
+                             public_identity_t *pub,
+                             const uint8_t claimed_key[crypto_sign_PUBLICKEYBYTES]);
 #endif
+/* Defined with the partition-recovery helpers far below, but the ZTA gate needs
+ * it to reach this node's own identity for the replay check. */
+static const identity_t *_partition_self_identity(const process_t *proc);
 
 DEFINE_ERROR(EID_NOQ, "Required process queue missing");
 
@@ -1022,109 +1031,16 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
             && zta_cfg != NULL && zta_cfg->data_struct != NULL)
             zta_policy = (zta_policy_t *)zta_cfg->data_struct;
 
-        if (zta_policy && zta_policy->enabled && zta_policy->require_at_admission) {
-            zta_verifier_t *verifier = NULL;
-            int zrc = zta_policy_create_verifier(zta_policy, &verifier);
-            if (zrc == 0 && verifier) {
-                zta_result_t zta_result;
-                /* Size guard BEFORE verify: an oversized credential is almost
-                 * certainly hostile/corrupt and would let a remote cause an OOM
-                 * / parse-time DoS. public_identity_sync_in already rejects this
-                 * at protobuf deserialization (identity.c:ZTA_CRED_MAX), but the
-                 * conformance harness attaches a live from_whom (no wire round-
-                 * trip), so the bound is enforced here at the admission gate too,
-                 * mirroring Python idprocess._zta_admit. Pinned by conformance
-                 * zta-x509-reject-oversized-credential. Keep ZTA_CRED_MAX in
-                 * lockstep with Python (identity/zta/zta_verifier.py). */
-                if (nmsg->from_whom.zta_credential_len > ZTA_CRED_MAX) {
-                    log_warn(proc->logger,
-                             "Identity: ZTA credential too large for %s "
-                             "(%zu > %u)\n", nmsg->from_whom.nickname,
-                             nmsg->from_whom.zta_credential_len,
-                             (unsigned)ZTA_CRED_MAX);
-                    verifier->destroy(verifier);
-                    return true; /* reject */
-                }
-                verifier->verify_credential(
-                    verifier,
-                    nmsg->from_whom.zta_credential,
-                    nmsg->from_whom.zta_credential_len,
-                    &zta_result);
-
-                if (zta_result.status == ZTA_REJECTED || zta_result.status == ZTA_EXPIRED) {
-                    log_warn(proc->logger,
-                             "Identity: ZTA credential %s for %s: %s\n",
-                             zta_status_str(zta_result.status),
-                             nmsg->from_whom.nickname, zta_result.reason);
-                    verifier->destroy(verifier);
-                    return true; /* reject */
-                }
-                if (zta_result.status == ZTA_VERIFIED && verifier->check_revocation) {
-                    /* A chain-valid certificate may nonetheless have been
-                     * revoked. verify_credential only walks the chain + expiry
-                     * (x509_verify_credential), so the admission gate must check
-                     * revocation explicitly before admitting. Only an
-                     * affirmative ZTA_REVOKED blocks: ZTA_UNAVAILABLE — the
-                     * default when no CRL/OCSP source is configured — keeps the
-                     * peer admitted, so deployments without a revocation source
-                     * are unchanged. Mirrors Python idprocess._zta_admit; pinned
-                     * by conformance zta-x509-reject-revoked-credential. */
-                    zta_result_t rev_result;
-                    verifier->check_revocation(verifier,
-                                               zta_result.credential_hash,
-                                               &rev_result);
-                    if (rev_result.status == ZTA_REVOKED) {
-                        log_warn(proc->logger,
-                                 "Identity: ZTA credential %s for %s: %s\n",
-                                 zta_status_str(rev_result.status),
-                                 nmsg->from_whom.nickname, rev_result.reason);
-                        verifier->destroy(verifier);
-                        return true; /* reject */
-                    }
-                }
-                if (zta_result.status == ZTA_VERIFIED) {
-                    /* Peer credential verified against the mission anchor. Now
-                     * classify operator-class against the DISTINCT operator
-                     * anchor (ethne D8/Q9): only a credential that also
-                     * chain-verifies there marks a human guardian. Overwrites
-                     * the (neutralized) operator_bound with the verified truth,
-                     * so a lying node's advertised claim never survives. */
-                    if (_is_operator_credential(zta_policy,
-                                                nmsg->from_whom.zta_credential,
-                                                nmsg->from_whom.zta_credential_len,
-                                                nmsg->from_whom.zta_credential_hash)) {
-                        nmsg->from_whom.operator_bound = true;
-                        log_info(proc->logger,
-                                 "Identity: %s is operator-attended (human guardian)\n",
-                                 nmsg->from_whom.nickname);
-                        /* WHICH human, if the peer opted in: credit the claimed
-                         * guardian key only when the operator's own credential
-                         * signed a binding naming THIS node (uuid + signing key),
-                         * so a (key, binding) pair lifted from another peer's
-                         * announce buys nothing. Absent is the normal case and
-                         * silent; present-but-invalid is a forgery attempt and
-                         * says so, but does NOT demote operator_bound — that is
-                         * independently earned above, and node key rotation
-                         * legitimately stales a binding. Losing a guardian edge
-                         * is the failure mode; losing admission is not. */
-                        _verify_operator_key(proc, &nmsg->from_whom,
-                                             claimed_operator_key);
-                    }
-                }
-                if (zta_result.status == ZTA_UNAVAILABLE || zta_result.status == ZTA_DEFERRED) {
-                    if (!zta_policy->allow_ddil_fallback) {
-                        log_warn(proc->logger,
-                                 "Identity: ZTA unavailable, DDIL fallback disabled; rejecting %s\n",
-                                 nmsg->from_whom.nickname);
-                        verifier->destroy(verifier);
-                        return true; /* reject */
-                    }
-                    log_info(proc->logger,
-                             "Identity: ZTA verification deferred (DDIL) for %s\n",
-                             nmsg->from_whom.nickname);
-                }
-                verifier->destroy(verifier);
-            }
+        if (zta_policy != NULL) {
+            /* The whole decision — any-of across anchors, graded failure, the
+               credential->identity binding, replay, operator classification —
+               lives in _zta_admit, mirroring Python's _zta_admit one-for-one.
+               A capped admission is logged there; C has no reputation-cap set to
+               add the peer to (Python's _zta_capped), so the two runtimes differ
+               in bookkeeping, not in who gets admitted. */
+            if (_zta_admit(proc, zta_policy, &nmsg->from_whom,
+                           claimed_operator_key) == ZTA_GATE_REJECT)
+                return true; /* reject */
         }
     }
 #endif
@@ -3204,6 +3120,47 @@ static json_t *_operator_attestation_json(const public_identity_t *pub)
             free(cb64);
         }
     }
+    /* The full credential set, mirroring proto field 16. It rides HERE and not on
+       the envelope for the same reason the singular credential does: C's announce
+       carries the identity in the canonical from_* fields, which have no room for
+       a credential, so the attestation payload is the wire delivery. Emitted only
+       when there is more than the primary, or when the primary carries a binding
+       the singular fields cannot express — otherwise a single-credential node's
+       payload stays byte-identical to one built before field 16 existed. */
+    bool need_list = pub->num_zta_credentials > 1;
+    for (size_t i = 0; i < pub->num_zta_credentials && !need_list; i++)
+        if (pub->zta_credentials[i].binding != NULL
+            && pub->zta_credentials[i].binding_len > 0)
+            need_list = true;
+    if (need_list) {
+        json_t *arr = json_array();
+        for (size_t i = 0; i < pub->num_zta_credentials; i++) {
+            const zta_credential_t *c = &pub->zta_credentials[i];
+            if (c->der == NULL || c->der_len == 0)
+                continue;
+            json_t *entry = json_object();
+            size_t dlen = b64_encoded_len(c->der_len);
+            char *db64 = malloc(dlen);
+            if (db64 != NULL) {
+                base64_encode(c->der, c->der_len, db64, dlen);
+                json_object_set_new(entry, "der", json_string(db64));
+                free(db64);
+            }
+            if (c->binding != NULL && c->binding_len > 0) {
+                size_t blen2 = b64_encoded_len(c->binding_len);
+                char *bb2 = malloc(blen2);
+                if (bb2 != NULL) {
+                    base64_encode(c->binding, c->binding_len, bb2, blen2);
+                    json_object_set_new(entry, "binding", json_string(bb2));
+                    free(bb2);
+                }
+            }
+            if (c->issuer[0] != '\0')
+                json_object_set_new(entry, "issuer", json_string(c->issuer));
+            json_array_append_new(arr, entry);
+        }
+        json_object_set_new(att, "zta_credentials", arr);
+    }
 #endif
     return att;
 }
@@ -3271,6 +3228,57 @@ static void _apply_operator_attestation_json(const json_t *att, public_identity_
             }
         }
     }
+    /* Rebuild the credential list from what just arrived, primary first so a
+       sender predating field 16 still yields a one-entry list. Cleared rather
+       than appended to: this function OVERWRITES the peer's advertised
+       credentials from a fresh announce, so carrying over a previous
+       announce's set would let a peer accumulate credentials it no longer
+       presents — and, worse, keep one it has since had revoked. */
+    public_identity_zta_credentials_clear(pub);
+    if (pub->zta_credential != NULL && pub->zta_credential_len > 0)
+        public_identity_add_zta_credential(pub, pub->zta_credential,
+                                           pub->zta_credential_len, NULL, 0,
+                                           pub->zta_issuer);
+    json_t *carr = json_object_get(att, "zta_credentials");
+    if (json_is_array(carr)) {
+        size_t ci;
+        json_t *entry;
+        json_array_foreach(carr, ci, entry) {
+            if (!json_is_object(entry))
+                continue;
+            const char *db64 = json_string_value(json_object_get(entry, "der"));
+            if (db64 == NULL)
+                continue;
+            size_t dlen = b64_decoded_len_s(strlen(db64), db64);
+            if (dlen == 0 || dlen > ZTA_CRED_MAX)
+                continue;
+            uint8_t *der = malloc(dlen);
+            if (der == NULL)
+                continue;
+            base64_decode(db64, strlen(db64), der, dlen);
+            uint8_t *bind = NULL;
+            size_t blen3 = 0;
+            const char *bb3 = json_string_value(json_object_get(entry, "binding"));
+            if (bb3 != NULL) {
+                size_t want = b64_decoded_len_s(strlen(bb3), bb3);
+                if (want > 0 && want <= ZTA_BINDING_MAX) {
+                    bind = malloc(want);
+                    if (bind != NULL) {
+                        base64_decode(bb3, strlen(bb3), bind, want);
+                        blen3 = want;
+                    }
+                }
+            }
+            public_identity_add_zta_credential(
+                pub, der, dlen, bind, blen3,
+                json_string_value(json_object_get(entry, "issuer")));
+            free(der);
+            free(bind);
+        }
+    }
+    /* Anchors are our finding, not the peer's claim: nothing is proved yet. */
+    memset(pub->zta_anchors, 0, sizeof(pub->zta_anchors));
+    pub->num_zta_anchors = 0;
 #endif
 }
 
@@ -3305,6 +3313,62 @@ static bool _is_operator_credential(const zta_policy_t *policy,
     return ok;
 }
 
+/* True if this exact credential is already bound to a DIFFERENT network identity
+ * — a harvested/replayed credential (ISSUES §1.5). C twin of Python
+ * IdentityProcess._zta_credential_replayed.
+ *
+ * The chain-only verifier accepts a chain-valid certificate regardless of WHO
+ * presents it, so one lifted from a peer's clear-text announce could be
+ * re-announced under a different uuid and still pass. This enforces a
+ * credential<->identity uniqueness invariant: first-use-wins, where "previously
+ * seen" means present in our peer roster (rosters propagate, so this is the
+ * "seen by other nodes" check) or on our own identity.
+ *
+ * Superseded by the binding for any credential that carries one; it stays
+ * because it is the only defence left for an UNBOUND credential under
+ * binding_mode prefer/off.
+ *
+ * Fingerprints are recomputed from the actual bytes, never the announcer-
+ * controlled zta_credential_hash. Caller must NOT hold the peers lock. */
+static bool _zta_credential_replayed(const process_t *proc,
+                                     const public_identity_t *pub,
+                                     const uint8_t *cred, size_t cred_len)
+{
+    if (proc == NULL || pub == NULL || cred == NULL || cred_len == 0)
+        return false;
+    uint8_t fp[crypto_hash_sha256_BYTES];
+    crypto_hash_sha256(fp, cred, cred_len);
+
+    const identity_t *self = _partition_self_identity(proc);
+    if (self != NULL && uuid_compare(self->uuid, (unsigned char *)pub->uuid) != 0
+        && self->zta_credential != NULL && self->zta_credential_len > 0) {
+        uint8_t own[crypto_hash_sha256_BYTES];
+        crypto_hash_sha256(own, self->zta_credential, self->zta_credential_len);
+        if (memcmp(fp, own, sizeof(fp)) == 0)
+            return true;  /* our own credential, worn by somebody else */
+    }
+
+    bool found = false;
+    peers_read_lock((process_t *)proc);
+    for (size_t i = 0; i < proc->protocol.num_peers && !found; i++) {
+        const public_identity_t *peer = &proc->protocol.peers[i];
+        if (uuid_compare((unsigned char *)peer->uuid,
+                         (unsigned char *)pub->uuid) == 0)
+            continue;  /* same identity re-announcing its own credential: fine */
+        for (size_t j = 0; j < peer->num_zta_credentials && !found; j++) {
+            const zta_credential_t *c = &peer->zta_credentials[j];
+            if (c->der == NULL || c->der_len == 0)
+                continue;
+            uint8_t pfp[crypto_hash_sha256_BYTES];
+            crypto_hash_sha256(pfp, c->der, c->der_len);
+            if (memcmp(fp, pfp, sizeof(fp)) == 0)
+                found = true;
+        }
+    }
+    peers_read_unlock((process_t *)proc);
+    return found;
+}
+
 /* Credit a peer's OPT-IN guardian identity, if it advertised one and the binding
  * holds. Called only after the peer's credential has been classified
  * operator-class, because a binding signed by a credential with no standing to
@@ -3319,6 +3383,7 @@ static bool _is_operator_credential(const zta_policy_t *policy,
  *     key rotation is an honest cause of this. */
 static void _verify_operator_key(const process_t *proc,
                                  public_identity_t *pub,
+                                 const uint8_t *cred, size_t cred_len,
                                  const uint8_t claimed_key[crypto_sign_PUBLICKEYBYTES])
 {
     if (pub == NULL || claimed_key == NULL)
@@ -3344,7 +3409,9 @@ static void _verify_operator_key(const process_t *proc,
     uint8_t preimage[OPERATOR_BINDING_PREIMAGE_LEN];
     if (operator_binding_preimage(pub, claimed_key, preimage) != 0)
         return;
-    if (x509_verify_data_signature(pub->zta_credential, pub->zta_credential_len,
+    /* Against the credential that actually verified operator-class, which with
+       several credentials in play need not be the primary in fields 6-8. */
+    if (x509_verify_data_signature(cred, cred_len,
                                    preimage, sizeof(preimage),
                                    pub->operator_key_binding,
                                    pub->operator_key_binding_len)) {
@@ -3357,6 +3424,301 @@ static void _verify_operator_key(const process_t *proc,
                  "verify against its operator credential; no guardian recorded "
                  "(operator_bound stands on its own)\n", pub->nickname);
     }
+}
+
+/* The ZTA admission decision. C twin of Python IdentityProcess._zta_admit.
+ *
+ * ADMISSION IS ANY-OF (ISSUES §1.5): at least one credential must chain to some
+ * configured anchor AND be bound to this identity. Each verified credential
+ * records authority for its anchor on the peer (zta_anchors), and that — not a
+ * self-declared role — is what lets a node gateway across an agency boundary.
+ * Gatewayhood is emergent from group membership and nothing on the wire declares
+ * it, so "a gateway must present N credentials" would rest on the peer's own
+ * claim and buy nothing; an attacker just declines to claim.
+ *
+ * FAILURE IS GRADED, because forgery and ignorance are different things. A
+ * binding that is present and fails, a credential already bound elsewhere, an
+ * oversized blob, or an affirmative revocation all reject the identity — each is
+ * evidence someone is lying. A credential merely expired, or chaining to no
+ * anchor we hold, is SKIPPED: that says nothing about the peer's honesty, only
+ * about our ability to evaluate it. For a single-credential node this collapses
+ * to the previous behavior (nothing usable left => reject), which is why the
+ * zta-x509-reject-* conformance pins still hold unchanged.
+ *
+ * Caller must already have neutralized pub->operator_bound and moved the claimed
+ * guardian key aside; this function sets the authoritative operator_bound. */
+static zta_gate_t _zta_admit(const process_t *proc, const zta_policy_t *policy,
+                             public_identity_t *pub,
+                             const uint8_t claimed_key[crypto_sign_PUBLICKEYBYTES])
+{
+    if (policy == NULL || pub == NULL)
+        return ZTA_GATE_ADMIT;
+    if (!policy->enabled || !policy->require_at_admission)
+        return ZTA_GATE_ADMIT;
+    const char *nick = pub->nickname;
+
+    /* Working set. Normally the list, which sync_in/_apply_operator_attestation
+       seed with the primary; the fallback covers a caller that set only the
+       singular field (the conformance adapter attaches a live from_whom that way,
+       and so does any pre-list code path). */
+    zta_credential_t fallback;
+    const zta_credential_t *creds = pub->zta_credentials;
+    size_t n_creds = pub->num_zta_credentials;
+    if (n_creds == 0) {
+        memset(&fallback, 0, sizeof(fallback));
+        if (pub->zta_credential != NULL && pub->zta_credential_len > 0) {
+            fallback.der = pub->zta_credential;
+            fallback.der_len = pub->zta_credential_len;
+            at_strlcpy(fallback.issuer, pub->zta_issuer, sizeof(fallback.issuer));
+        }
+        /* Even when that leaves an EMPTY entry. A peer presenting nothing still
+           has to be evaluated, not silently skipped: the verifiers are what
+           distinguish "we cannot reach the PKI" (DDIL, admit capped) from "we can,
+           and there is no credential" (reject). x509 reports REJECTED "no
+           credential data"; the OIDC stub reports UNAVAILABLE. That is what the
+           zta-ddil-defer and zta-x509-reject-unsigned pins turn on. */
+        creds = &fallback;
+        n_creds = 1;
+    }
+
+    /* Size guard BEFORE handing any blob to a verifier: an oversized credential
+       is almost certainly hostile/corrupt and would let a remote cause an OOM or
+       parse-time DoS. Enforced here as well as at deserialization because the
+       conformance harness attaches a live from_whom with no wire round trip.
+       Keep ZTA_CRED_MAX in lockstep with Python. */
+    for (size_t i = 0; i < n_creds; i++) {
+        if (creds[i].der_len > ZTA_CRED_MAX) {
+            log_warn(proc->logger,
+                     "Identity: ZTA credential too large for %s (%zu > %u)\n",
+                     nick, creds[i].der_len, (unsigned)ZTA_CRED_MAX);
+            return ZTA_GATE_REJECT;
+        }
+    }
+    /* Credential<->identity uniqueness, before chain verification: the cert may
+       verify fine; the point is that it is already bound elsewhere. */
+    for (size_t i = 0; i < n_creds; i++) {
+        if (_zta_credential_replayed(proc, pub, creds[i].der, creds[i].der_len)) {
+            log_warn(proc->logger,
+                     "Identity: ZTA rejecting %s: credential bound to a different "
+                     "identity (replay)\n", nick);
+            return ZTA_GATE_REJECT;
+        }
+    }
+
+    /* One chain-walking verifier per resolved anchor. Mirrors Python
+       ZtaPolicy.create_anchor_verifiers, including both of its escape hatches:
+       an anchor IS a CA bundle, so for any non-x509 verifier_type (oidc, mfa)
+       there is nothing to enumerate and the single configured verifier stands in
+       under the name "default"; and an x509 policy with no bundle anywhere gets
+       the same treatment, because a verifier over an empty bundle reports
+       UNAVAILABLE, which is what drives the DDIL defer path. Resolving to zero
+       anchors there would silently turn a defer into a flat rejection. */
+    zta_anchor_t anchors[ZTA_POLICY_MAX_ANCHORS];
+    zta_verifier_t *verifiers[ZTA_POLICY_MAX_ANCHORS] = {0};
+    size_t n_anchors = 0;
+    if (strcmp(policy->verifier_type, "x509") == 0)
+        n_anchors = zta_policy_resolved_anchors(policy, anchors,
+                                                ZTA_POLICY_MAX_ANCHORS);
+    if (n_anchors == 0) {
+        memset(&anchors[0], 0, sizeof(anchors[0]));
+        at_strlcpy(anchors[0].name, "default", ZTA_ANCHOR_NAME_MAX);
+        anchors[0].is_operator = false;
+        n_anchors = 1;
+        zta_policy_create_verifier(policy, &verifiers[0]);
+    } else {
+        for (size_t a = 0; a < n_anchors; a++)
+            zta_policy_create_anchor_verifier(policy, &anchors[a], &verifiers[a]);
+    }
+
+    const char *san = policy->san_uri_template;
+    zta_gate_t decision;
+    bool any_usable = false;
+    bool any_unbound_usable = false;
+    bool have_failure = false, have_deferred = false;
+    zta_status_t failure_status = ZTA_REJECTED;
+    char failure_reason[ZTA_REASON_LEN] = {0};
+    zta_status_t deferred_status = ZTA_UNAVAILABLE;
+    char deferred_reason[ZTA_REASON_LEN] = {0};
+    /* Deferred outcomes are tracked separately from real failures so the
+       nothing-usable branch can tell "we could not evaluate" (DDIL, fallback
+       applies) from "we evaluated and did not like it" (reject). */
+
+    for (size_t i = 0; i < n_creds; i++) {
+        const uint8_t *cred = creds[i].der;
+        size_t cred_len = creds[i].der_len;
+        /* NOT skipped when empty — see the working-set note above: the verifiers
+           are what tell DDIL apart from an absent credential. */
+
+        bool matched = false, is_operator = false, revoked = false;
+        size_t first_match = 0;
+        uint8_t match_hash[ZTA_HASH_LEN] = {0};
+        for (size_t a = 0; a < n_anchors; a++) {
+            if (verifiers[a] == NULL || verifiers[a]->verify_credential == NULL)
+                continue;
+            zta_result_t r;
+            memset(&r, 0, sizeof(r));
+            verifiers[a]->verify_credential(verifiers[a], cred, cred_len, &r);
+            if (r.status == ZTA_VERIFIED) {
+                /* Every anchor is tried, deliberately not stopping at the first
+                   match: a credential may legitimately chain to more than one
+                   (the synthesized legacy pair is frequently the same CA), and
+                   both operator classification and gateway authority depend on
+                   the full set rather than whichever was checked first. */
+                if (!matched) { first_match = a; memcpy(match_hash, r.credential_hash,
+                                                        sizeof(match_hash)); }
+                matched = true;
+                is_operator = is_operator || anchors[a].is_operator;
+                if (!revoked && verifiers[a]->check_revocation != NULL) {
+                    /* A chain-valid certificate may nonetheless have been
+                       revoked; verify_credential walks only chain + expiry. Only
+                       an affirmative ZTA_REVOKED blocks — ZTA_UNAVAILABLE (the
+                       default with no CRL/OCSP source) keeps the peer admitted,
+                       so deployments without one are unchanged. */
+                    zta_result_t rev;
+                    memset(&rev, 0, sizeof(rev));
+                    verifiers[a]->check_revocation(verifiers[a],
+                                                   r.credential_hash, &rev);
+                    if (rev.status == ZTA_REVOKED) {
+                        revoked = true;
+                        at_strlcpy(failure_reason, rev.reason[0] ? rev.reason
+                                   : "credential revoked", ZTA_REASON_LEN);
+                    }
+                }
+            } else if (r.status == ZTA_REJECTED || r.status == ZTA_EXPIRED
+                       || r.status == ZTA_REVOKED) {
+                have_failure = true;
+                failure_status = r.status;
+                at_strlcpy(failure_reason, r.reason, ZTA_REASON_LEN);
+            } else {  /* DEFERRED / UNAVAILABLE — the verifier could not answer */
+                have_deferred = true;
+                deferred_status = r.status;
+                at_strlcpy(deferred_reason, r.reason, ZTA_REASON_LEN);
+            }
+        }
+        if (revoked) {
+            log_warn(proc->logger, "Identity: ZTA rejecting %s: %s\n",
+                     nick, failure_reason);
+            decision = ZTA_GATE_REJECT;
+            goto done;
+        }
+        if (!matched)
+            continue;  /* chains to no anchor we hold: ignorance, not forgery */
+
+        /* The credential is genuine. Is THIS node entitled to present it? */
+        bool bound = zta_identity_is_bound(pub, cred, cred_len,
+                                           creds[i].binding, creds[i].binding_len,
+                                           san, claimed_key,
+                                           pub->operator_key_binding,
+                                           pub->operator_key_binding_len);
+        if (creds[i].binding != NULL && creds[i].binding_len > 0 && !bound) {
+            /* A binding was offered and does not verify. Unlike absence, that is
+               affirmative evidence of forgery — somebody tried and failed to
+               prove entitlement — so it condemns the whole identity rather than
+               costing just this one credential. */
+            log_warn(proc->logger,
+                     "Identity: ZTA rejecting %s: credential binding does not "
+                     "verify for this identity\n", nick);
+            decision = ZTA_GATE_REJECT;
+            goto done;
+        }
+        if (!bound && policy->binding_mode == ZTA_BINDING_MODE_REQUIRE) {
+            /* Unbound is a provisioning state, not a lie. The credential earns no
+               authority; if nothing else survives the peer is refused below,
+               which for a single-credential node is exactly the old reject. */
+            log_warn(proc->logger,
+                     "Identity: %s presented an unbound ZTA credential and "
+                     "binding_mode is require; credential unusable\n", nick);
+            continue;
+        }
+
+        any_usable = true;
+        if (!bound)
+            any_unbound_usable = true;
+        for (size_t a = 0; a < n_anchors; a++) {
+            if (verifiers[a] == NULL)
+                continue;
+            /* Re-derive rather than cache a per-anchor verdict array: n_anchors
+               is <= 8 and the verifier caches parsed certs, so this is cheap and
+               keeps the match loop above from needing a parallel result buffer. */
+            zta_result_t r;
+            memset(&r, 0, sizeof(r));
+            if (verifiers[a]->verify_credential(verifiers[a], cred, cred_len, &r) == 0
+                && r.status == ZTA_VERIFIED)
+                public_identity_add_zta_anchor(pub, anchors[a].name);
+        }
+        if (!pub->operator_bound) {
+            /* Operator-class (ethne D8/Q9) by EITHER route, because a deployment
+               may express the operator anchor either way: as an anchor carrying
+               `operator: true`, or as the separate operator_ca_bundle_path that
+               _is_operator_credential consults. Both derive the answer from
+               verifying the actual credential against an operator trust anchor,
+               never from the peer-advertised operator_bound/zta_issuer. */
+            if (is_operator
+                || _is_operator_credential(policy, cred, cred_len,
+                                           pub->zta_credential_hash)) {
+                pub->operator_bound = true;
+                log_info(proc->logger,
+                         "Identity: %s is operator-attended (human guardian)\n",
+                         nick);
+                _verify_operator_key(proc, pub, cred, cred_len, claimed_key);
+            }
+        }
+        (void)first_match;
+        (void)match_hash;
+    }
+
+    if (any_usable) {
+        if (policy->binding_mode == ZTA_BINDING_MODE_PREFER && any_unbound_usable) {
+            /* `prefer` only: admitted on an unbound credential, so the
+               roster-based TOFU check is all that stood between us and a
+               harvested cert — cap it like any other deferred verification.
+               `off` deliberately does NOT cap: absence of a binding carries no
+               penalty there, which is what makes it the no-change setting for a
+               deployment that has not provisioned bindings yet. */
+            log_info(proc->logger,
+                     "Identity: %s admitted on an unbound ZTA credential "
+                     "(binding_mode prefer); reputation cap %.2f\n",
+                     nick, policy->ddil_fallback_reputation_cap);
+            decision = ZTA_GATE_ADMIT_CAPPED;
+            goto done;
+        }
+        decision = ZTA_GATE_ADMIT;
+        goto done;
+    }
+
+    /* Nothing usable. A verifier that could not answer is a DDIL condition and
+       gets the fallback; an answer we did not like is a rejection. */
+    if (have_deferred && !have_failure) {
+        if (policy->allow_ddil_fallback) {
+            log_info(proc->logger,
+                     "Identity: ZTA verification deferred (DDIL) for %s (%s); "
+                     "admitting with reputation cap %.2f\n",
+                     nick, zta_status_str(deferred_status),
+                     policy->ddil_fallback_reputation_cap);
+            decision = ZTA_GATE_ADMIT_CAPPED;
+            goto done;
+        }
+        log_warn(proc->logger,
+                 "Identity: ZTA unavailable for %s (%s) and DDIL fallback "
+                 "disabled; rejecting: %s\n", nick,
+                 zta_status_str(deferred_status), deferred_reason);
+        decision = ZTA_GATE_REJECT;
+        goto done;
+    }
+    if (have_failure)
+        log_warn(proc->logger, "Identity: ZTA credential %s for %s: %s\n",
+                 zta_status_str(failure_status), nick, failure_reason);
+    else
+        log_warn(proc->logger,
+                 "Identity: ZTA rejecting %s: no verifiable credential presented\n",
+                 nick);
+    decision = ZTA_GATE_REJECT;
+
+done:
+    for (size_t a = 0; a < n_anchors; a++)
+        if (verifiers[a] != NULL)
+            verifiers[a]->destroy(verifiers[a]);
+    return decision;
 }
 #endif
 
@@ -4522,11 +4884,144 @@ static int _roster_member_rank(const process_t *proc, const char *uuid)
     return 0;
 }
 
+#ifdef AT_ZTA_ENABLED
+/* The anchor names OUR OWN credentials verify against. Mirrors Python
+ * IdentityProcess._own_zta_anchors.
+ *
+ * Computed locally rather than read from our identity's zta_anchors, because
+ * that field is what a PEER proved to us at admission and we never admit
+ * ourselves. This walks our own credentials through the same anchor verifiers.
+ *
+ * Cached, because the alternative is re-reading every CA bundle off disk on each
+ * roster query and the identity loop is single-threaded (see the other
+ * handler-side reads in this file).
+ *
+ * KEYED ON THE IDENTITY, not a bare `computed` flag: the conformance runner hosts
+ * every participant in ONE process, so a process-wide cache would answer for
+ * whichever node asked first and silently hand its anchors to the others. A
+ * production node has exactly one identity and hits the cache every time. */
+static size_t _own_zta_anchors(const process_t *proc, const zta_policy_t *policy,
+                               char out[][ZTA_ANCHOR_NAME_LEN], size_t max)
+{
+    static char cache[ZTA_MAX_ANCHORS][ZTA_ANCHOR_NAME_LEN];
+    static size_t cache_n = 0;
+    static const identity_t *cached_for = NULL;
+    const identity_t *self_key = _partition_self_identity(proc);
+    if (self_key == NULL || cached_for != self_key) {
+        cached_for = self_key;
+        cache_n = 0;
+        const identity_t *self = self_key;
+        if (self != NULL && policy != NULL) {
+            zta_anchor_t anchors[ZTA_POLICY_MAX_ANCHORS];
+            size_t n_anchors = zta_policy_resolved_anchors(policy, anchors,
+                                                           ZTA_POLICY_MAX_ANCHORS);
+            /* Our own credential list, with the singular field as the fallback —
+               the same working set the admission gate builds for a peer. */
+            for (size_t a = 0; a < n_anchors && cache_n < ZTA_MAX_ANCHORS; a++) {
+                zta_verifier_t *v = NULL;
+                if (zta_policy_create_anchor_verifier(policy, &anchors[a], &v) != 0
+                    || v == NULL)
+                    continue;
+                bool hit = false;
+                size_t n = self->num_zta_credentials;
+                for (size_t i = 0; i < n && !hit; i++) {
+                    const zta_credential_t *c = &self->zta_credentials[i];
+                    if (c->der == NULL || c->der_len == 0)
+                        continue;
+                    zta_result_t r;
+                    memset(&r, 0, sizeof(r));
+                    v->verify_credential(v, c->der, c->der_len, &r);
+                    hit = (r.status == ZTA_VERIFIED);
+                }
+                if (!hit && n == 0 && self->zta_credential != NULL
+                    && self->zta_credential_len > 0) {
+                    zta_result_t r;
+                    memset(&r, 0, sizeof(r));
+                    v->verify_credential(v, self->zta_credential,
+                                         self->zta_credential_len, &r);
+                    hit = (r.status == ZTA_VERIFIED);
+                }
+                v->destroy(v);
+                if (hit)
+                    at_strlcpy(cache[cache_n++], anchors[a].name,
+                               ZTA_ANCHOR_NAME_LEN);
+            }
+        }
+    }
+    size_t n_out = cache_n < max ? cache_n : max;
+    for (size_t i = 0; i < n_out; i++)
+        at_strlcpy(out[i], cache[i], ZTA_ANCHOR_NAME_LEN);
+    return n_out;
+}
+
+/* Whether this node may federate through @p uuid. Mirrors Python
+ * IdentityProcess._gateway_authorized.
+ *
+ * The candidate must have PROVED, at admission, an anchor we also hold. That is
+ * the derived-authority rule: crossing an agency boundary requires a credential
+ * from an agency both sides recognize, and since nothing on the wire declares
+ * gatewayhood, deriving the permission from verified credentials is the only form
+ * of it a peer cannot simply assert. A candidate we never admitted has no proved
+ * anchors and is refused — which is the point, not a side effect.
+ *
+ * Inert (true) when the policy is not enforcing at admission, or when we hold no
+ * anchors ourselves: with nothing to compare against, refusing every candidate
+ * would break federation for every non-ZTA deployment rather than protect
+ * anything. */
+static bool _gateway_authorized(const process_t *proc, const char *uuid)
+{
+    if (proc == NULL || uuid == NULL || uuid[0] == '\0')
+        return true;
+    data_t *zta_dat = NULL;
+    config_t *zta_cfg = NULL;
+    const zta_policy_t *policy = NULL;
+    char zta_key[] = "zta_policy";
+    if (proc->configs != NULL
+        && map_get(proc->configs, zta_key, &zta_dat) == 0 && zta_dat != NULL
+        && data_object_ptr(zta_dat, (void **)&zta_cfg) == 0
+        && zta_cfg != NULL && zta_cfg->data_struct != NULL)
+        policy = (const zta_policy_t *)zta_cfg->data_struct;
+    if (policy == NULL || !policy->enabled || !policy->require_at_admission)
+        return true;
+
+    char own[ZTA_MAX_ANCHORS][ZTA_ANCHOR_NAME_LEN];
+    size_t n_own = _own_zta_anchors(proc, policy, own, ZTA_MAX_ANCHORS);
+    if (n_own == 0)
+        return true;
+
+    bool ok = false, seen = false;
+    peers_read_lock((process_t *)proc);
+    for (size_t i = 0; i < proc->protocol.num_peers && !ok; i++) {
+        const public_identity_t *peer = &proc->protocol.peers[i];
+        char pu[UUID_STRING_LEN + 1];
+        uuid_unparse_lower((const unsigned char *)peer->uuid, pu);
+        if (strcmp(pu, uuid) != 0)
+            continue;
+        seen = true;
+        for (size_t j = 0; j < peer->num_zta_anchors && !ok; j++)
+            for (size_t k = 0; k < n_own; k++)
+                if (strcmp(peer->zta_anchors[j], own[k]) == 0) { ok = true; break; }
+    }
+    peers_read_unlock((process_t *)proc);
+    if (!ok)
+        log_warn(proc->logger,
+                 "Identity: gateway: refusing to federate through %s (%s)\n",
+                 uuid, seen ? "shares no proved anchor with ours"
+                            : "no proved anchors — never admitted here");
+    return ok;
+}
+#endif /* AT_ZTA_ENABLED */
+
 /* Discover the recursion target for one child group = its highest-rank member
  * (excluding self), ties broken by the lexicographically greater uuid so the
  * choice is deterministic and identical in Python. Writes the winning uuid
  * into @p out (UUID_STRING_LEN+1) and returns true, or returns false for an
- * empty / self-only group. Mirrors Python's _discover_child_gateway. */
+ * empty / self-only group. Mirrors Python's _discover_child_gateway.
+ *
+ * Candidates that cannot prove gateway authority for a boundary we share are
+ * passed over rather than returned (see _gateway_authorized), so a peer holding
+ * only a foreign agency's credential is never federated through — the
+ * next-highest-rank eligible member is chosen instead. */
 static bool _roster_discover_child_gateway(const process_t *proc,
                                            group_t *group, const char *self_uuid,
                                            char *out)
@@ -4542,6 +5037,9 @@ static bool _roster_discover_child_gateway(const process_t *proc,
         const char *u = (const char *)key;
         if (u == NULL || u[0] == '\0') continue;
         if (self_uuid != NULL && strcmp(u, self_uuid) == 0) continue;
+#ifdef AT_ZTA_ENABLED
+        if (!_gateway_authorized(proc, u)) continue;
+#endif
         int rank = _roster_member_rank(proc, u);
         /* key = (rank, uuid); greater wins (uuid tiebreak = strcmp > 0). */
         if (!have || rank > best_rank

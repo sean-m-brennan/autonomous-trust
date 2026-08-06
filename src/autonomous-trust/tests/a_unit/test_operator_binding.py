@@ -54,7 +54,7 @@ from autonomous_trust.core._python.identity.idprocess import IdentityProcess  # 
 from autonomous_trust.core._python.identity.operator_binding import (  # noqa: E402
     OPERATOR_BINDING_PREIMAGE_LEN, OPERATOR_BINDING_TAG, OPERATOR_PUBKEY_LEN,
     node_signing_pubkey, operator_binding_preimage, verify_operator_binding)
-from autonomous_trust.core.identity.zta import ZtaPolicy  # noqa: E402
+from autonomous_trust.core.identity.zta import ZtaPolicy, BINDING_MODE_OFF  # noqa: E402
 from autonomous_trust.core.identity.zta.piv.pkcs11 import SoftwareToken  # noqa: E402
 
 
@@ -83,15 +83,26 @@ class _Gate:
     _is_operator_credential = IdentityProcess._is_operator_credential
     _mark_operator_bound = staticmethod(IdentityProcess._mark_operator_bound)
     _verify_operator_key = IdentityProcess._verify_operator_key
+    _zta_credentials = IdentityProcess._zta_credentials
+    _zta_match_anchors = IdentityProcess._zta_match_anchors
+    _zta_anchor_verifiers = IdentityProcess._zta_anchor_verifiers
 
     def __init__(self, bundle_path: str, operator_bundle_path: str):
+        # `binding_mode: off`: these fixtures carry an operator-KEY binding (which
+        # human) and no credential->identity binding (who may present the cert), and
+        # the operator key is the thing under test here. Whether a valid
+        # operator-key binding should itself count as a credential binding -- it is
+        # a signature by the credential's own key over bytes naming the node, so
+        # arguably yes -- is an open question, not something to assume here.
         self.configs = {ZtaPolicy.CONFIG_KEY: ZtaPolicy(
             enabled=True, require_at_admission=True, verifier_type='x509',
+            binding_mode=BINDING_MODE_OFF,
             ca_bundle_path=bundle_path,
             operator_ca_bundle_path=operator_bundle_path)}
         self._zta_policy_cache = None
         self._zta_verifier_cache = None
         self._zta_operator_verifier_cache = None
+        self._zta_anchor_cache = None
         self._zta_capped = set()
         self._operator_verified = set()
         self.logger = logging.getLogger('test.operator_binding')

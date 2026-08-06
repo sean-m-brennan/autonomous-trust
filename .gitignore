@@ -125,7 +125,7 @@ deploy
 
 /.tmp-sim*/
 /doc/AutonomousTrust.pdf
-/doc/whitepaper/HighTrust.pdf
+/doc/whitepaper/*.pdf
 /doc/tekfive/pitch/*.pdf
 /doc/tekfive/whitepaper/bibtex2bibjson/
 /docs/
@@ -189,3 +189,4 @@ embedded/signing.pub
 
 /doc/tekfive/NV059
 /doc/tekfive/*.pdf
+/doc/tekfive/*.html
