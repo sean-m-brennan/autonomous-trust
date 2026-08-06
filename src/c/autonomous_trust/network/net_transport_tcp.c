@@ -44,6 +44,7 @@
 #include "net_transport_priv.h"
 #include "utilities/exception.h"
 #include "utilities/socket_helpers.h"
+#include "utilities/util.h"
 #include "network/net_message.h"
 
 /* ---------- Low-level send/recv helpers ---------- */
@@ -69,11 +70,19 @@ static int send_all(int sock, const void *buf, size_t len)
  * accept/read/close sequence.
  */
 static int tcp_send_to(const uint8_t *msg, size_t msg_len,
-                       const char *host, int port, bool ipv6, logger_t *logger)
+                       const char *host, int port, bool ipv6,
+                       const char *src_addr, logger_t *logger)
 {
     int sock = socket(ipv6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
     if (sock == -1)
         return SYS_EXCEPTION();
+
+    /* Connect FROM the address peers know us by, else they cannot attribute the
+     * frame. stream=true so IP_BIND_ADDRESS_NO_PORT defers port selection to
+     * connect() -- this path opens one connection per message, and reserving a
+     * port per send would exhaust the ephemeral range. Non-fatal. */
+    (void)net_transport_ip_bind_source(sock, src_addr,
+                                       ipv6 ? AF_INET6 : AF_INET, true, logger);
 
     int err;
     if (ipv6) {
@@ -236,11 +245,16 @@ static int tcp_open_common(net_transport_ctx_t **out_ctx,
 
     char addr_buf[IPV6_ADDR_LEN] = {0};
     if (ipv6) {
-        cidr_split((char *)params->net_cfg->ip6_cidr, addr_buf, NULL);
+        cidr_split((char *)params->net_cfg->ip6_cidr, addr_buf,
+                   sizeof(addr_buf), NULL, 0);
     } else {
-        cidr_split((char *)params->net_cfg->ip4_cidr, addr_buf, NULL);
+        cidr_split((char *)params->net_cfg->ip4_cidr, addr_buf,
+                   sizeof(addr_buf), NULL, 0);
     }
     const char *address = (addr_buf[0] != '\0') ? addr_buf : NULL;
+    /* Cache for tcp_send_to, so an outbound connection's source address is the
+     * one we accept on and peers can attribute it. */
+    at_strlcpy(ctx->local_addr, addr_buf, sizeof(ctx->local_addr));
 
     int port = params->port_base;
     int grp_port = port + 1;
@@ -280,7 +294,8 @@ static int tcp_send_unicast(net_transport_ctx_t *ctx,
                             const uint8_t *wire, size_t wire_len,
                             const char *target, int port)
 {
-    return tcp_send_to(wire, wire_len, target, port, ctx->ipv6, ctx->logger);
+    return tcp_send_to(wire, wire_len, target, port, ctx->ipv6,
+                       ctx->local_addr, ctx->logger);
 }
 
 static int tcp_send_broadcast(net_transport_ctx_t *ctx, net_channel_t channel,

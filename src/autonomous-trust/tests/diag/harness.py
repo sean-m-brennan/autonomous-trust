@@ -142,8 +142,14 @@ def _peer_main(peer_idx: int, addr: str, cfg_dir: str,
                     pass
 
     try:
+        # log_stderr, NOT log_stdout: `silent=True` (which keeps each peer's
+        # banner/print chatter off the console) also suppresses the stdout log
+        # handler, so with log_stdout every peer's logger fell through to a
+        # NullHandler and the harness's `log_level` was inert -- a debug run
+        # emitted zero bytes, which is why a working discovery looked silent.
+        # stderr keeps the chatter suppressed while the logs actually land.
         _BoundedTrust(multiproc=True, log_level=log_level,
-                      logfile=Configuration.log_stdout,
+                      logfile=Configuration.log_stderr,
                       testing=True, silent=True).run_forever()
     except Exception as err:  # pragma: no cover — diagnostic only
         try:

@@ -235,6 +235,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # deadline). Keyed by nonce because the nonce is the only thing that
         # makes a returned stamp attributable to a request we actually made.
         self._attest_sent: dict[str, tuple] = {}
+        # Peers ReputationProcess has actually published a trust tier for, as
+        # uuid strings. `peer._tier` alone cannot answer this: it is a
+        # CONSTRUCTOR DEFAULT of 0 (identity.py:63) and the wire form does not
+        # carry it, so "nobody has scored this peer yet" and "this peer was
+        # scored down into tier 0" are the same value. The persistent-cohort
+        # save gate needs to tell those apart -- see
+        # _trusted_uuids_for_persist. A set of strings, so it survives the
+        # Process pickle across fork.
+        self._tier_published: set[str] = set()
         self.choosing = False
         # P1 group-merge tracking: set when choose_group falls through to
         # self-bootstrap (mesh didn't answer in init_timeout). A late
@@ -325,18 +334,38 @@ class IdentityProcess(Process, metaclass=ProcMeta,
     def _trusted_uuids_for_persist(self):
         """Return uuids that should survive the persistent-cohort filter.
 
-        Self is always included. A peer survives iff its `_tier` attr
-        (populated by handle_tier_update from ReputationProcess) is at
-        or above PERSIST_TIER_FLOOR — i.e. rep > REPUTATION_PERSIST_THRESHOLD
-        per repprocess.TIER_FLOORS.
+        Self is always included. A peer survives unless it has been ASSESSED
+        and found wanting: it is dropped only when ReputationProcess has
+        actually published a tier for it (`self._tier_published`) and that tier
+        is below PERSIST_TIER_FLOOR — i.e. rep < REPUTATION_PERSIST_THRESHOLD
+        per repprocess.TIER_FLOORS. A peer nobody has scored yet is kept.
+
+        The gate used to read `_tier >= PERSIST_TIER_FLOOR` directly, which
+        looks equivalent and is not, because `_tier` is a constructor default
+        of 0 (identity.py:63) that the wire form never carries: an unscored
+        peer is indistinguishable from a demoted one. Measured consequence --
+        ReputationProcess only computes a score when something ASKS, and on a
+        quiet mesh nothing does (0 `rep.*` probe events across a 40 s two-peer
+        run), so no tier was ever published, every admitted peer sat at the
+        default 0, and the saved roster was EMPTY. Not "empty until the peer
+        earns trust" but empty permanently, which also means a node forgot
+        every legitimate group member across a restart. Admission is what makes
+        a peer a member; reputation only takes that away.
+
+        Note the neutral prior persists either way: `_trust_tier` uses
+        `score >= 0.50` (repprocess.py:1549-1554), so a peer scored at exactly
+        REPUTATION_PERSIST_THRESHOLD lands in tier 1 and is kept.
         """
         kept = {self.identity.uuid}
         for peer in self.peers.all:
-            tier = getattr(peer, '_tier', 0) or 0
-            if tier >= PERSIST_TIER_FLOOR:
-                puuid = getattr(peer, 'uuid', None)
-                if puuid is not None:
-                    kept.add(puuid)
+            puuid = getattr(peer, 'uuid', None)
+            if puuid is None:
+                continue
+            if str(puuid) in self._tier_published:
+                tier = getattr(peer, '_tier', 0) or 0
+                if tier < PERSIST_TIER_FLOOR:
+                    continue  # assessed, and below the floor
+            kept.add(puuid)
         return kept
 
     def _remember_activity(self, queues, name: str, obj: Union[Peers, PeerCapabilities, GroupHistory]):
@@ -2656,6 +2685,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 # Tier update arrived before we have the peer's identity.
                 # Drop quietly — the next reputation cycle will retry.
                 return True
+            # Record that this peer HAS been scored, whether or not the value
+            # moved. A published tier of 0 is real information (the peer was
+            # assessed and landed there); it is not the same as never having
+            # been assessed, and only this set can tell the two apart.
+            self._tier_published.add(peer_uuid_str)
             old = getattr(target, '_tier', 0)
             if old != new_tier:
                 target._tier = new_tier

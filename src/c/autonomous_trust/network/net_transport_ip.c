@@ -21,6 +21,7 @@
 
 #define _XOPEN_SOURCE 700
 #define _DEFAULT_SOURCE
+#include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -30,6 +31,59 @@
 
 #include "net_transport_priv.h"
 #include "utilities/exception.h"
+
+/* Frama-C: skipped — [syscall] inet_pton + bind/setsockopt stubs. */
+int net_transport_ip_bind_source(int sock, const char *address, int domain,
+                                 bool stream, logger_t *logger)
+{
+    /* Nothing to pin: no address, or a wildcard, which is what an unbound
+     * socket already does. Not an error. */
+    if (address == NULL || address[0] == '\0' ||
+        strcmp(address, "0.0.0.0") == 0 || strcmp(address, "::") == 0)
+        return -1;
+
+    if (stream) {
+#ifdef IP_BIND_ADDRESS_NO_PORT
+        int one = 1;
+        /* Best effort: correctness does not depend on it, only port headroom. */
+        (void)setsockopt(sock, IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT,
+                         &one, sizeof(one));
+#endif
+    }
+
+    /* inet_pton rather than getaddrinfo: this runs on every send, and the
+     * address is already a numeric literal derived from the config. NOTE: no
+     * SO_REUSEADDR here, deliberately -- see the header comment. Port 0 lets
+     * the kernel autobind. */
+    int err;
+    if (domain == AF_INET6) {
+        struct sockaddr_in6 src = {0};
+        src.sin6_family = AF_INET6;
+        src.sin6_port = 0;
+        if (inet_pton(AF_INET6, address, &src.sin6_addr) != 1)
+            return -1;
+        err = bind(sock, (struct sockaddr *)&src, sizeof(src));
+    } else {
+        struct sockaddr_in src = {0};
+        src.sin_family = AF_INET;
+        src.sin_port = 0;
+        if (inet_pton(AF_INET, address, &src.sin_addr) != 1)
+            return -1;
+        err = bind(sock, (struct sockaddr *)&src, sizeof(src));
+    }
+    if (err != 0) {
+        /* Warn once per process, not once per send. */
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            log_warn(logger, "Could not bind source address %s (%s); sending "
+                     "unbound, so peers may fail to attribute these messages\n",
+                     address, strerror(errno));
+        }
+        return -1;
+    }
+    return 0;
+}
 
 /* Frama-C: skipped —
  * [syscall] net_transport_ip_bind: getaddrinfo loop + bind/setsockopt + 6x set_exception

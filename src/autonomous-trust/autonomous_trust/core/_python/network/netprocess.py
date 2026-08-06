@@ -15,6 +15,7 @@
 # ******************
 
 import concurrent.futures
+import errno
 import socket
 import threading
 import time
@@ -28,7 +29,7 @@ import nacl
 
 from ..protocol import Protocol
 from ..identity import Identity
-from ..identity.protocol import IdentityProtocol
+from ..identity.protocol import IdentityProtocol, UNENCRYPTED_VERBS
 from ..processes import Process, ProcMeta
 from .. import _probes
 from ..identity import Group
@@ -473,6 +474,15 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 time.sleep(self.socket_timeout)
                 continue
             except Exception as err:
+                if isinstance(err, OSError) and err.errno == errno.EBADF and self.stop:
+                    # Teardown race, not a fault: shutdown sets self.stop and
+                    # only then calls close_listeners(), so a thread already
+                    # past its stop check and inside recv_* takes EBADF exactly
+                    # once before the loop exits. Logging it at error made every
+                    # clean shutdown look like a failure.
+                    _probes.counter(layer, 'recv_error', 'closed_at_stop')
+                    self.logger.debug('Network: listener closed at shutdown')
+                    continue
                 # Belt-and-suspenders: a single malformed frame should
                 # not kill the listener thread for the rest of the run.
                 # (Used to lose every subsequent inbound after the first
@@ -534,6 +544,11 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 time.sleep(self.socket_timeout)
                 continue
             except Exception as err:
+                if isinstance(err, OSError) and err.errno == errno.EBADF and self.stop:
+                    # Same teardown race as _encr_recv; see the note there.
+                    _probes.counter('net.recv.any', 'recv_error', 'closed_at_stop')
+                    self.logger.debug('Network: listener closed at shutdown')
+                    continue
                 # Mirror _encr_recv: never let a malformed inbound kill
                 # the listener thread for the rest of the run.
                 _probes.counter('net.recv.any', 'recv_error', err.__class__.__name__)
@@ -579,6 +594,43 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                         remaining.append((raw_msg, from_addr))
             self.encrypted_messages.extend(remaining)
             time.sleep(self.cadence + self.q_cadence)  # curiously, does not sleep if exactly cadence
+
+    def _accept_unencrypted(self, raw_msg, from_whom, queues):
+        """Deliver a plaintext frame from a KNOWN peer, but only an allowlisted
+        verb that declares itself unencrypted.
+
+        Three conditions, all required: the bytes parse as an envelope, the
+        envelope's own `encrypt` flag is false, and the verb is in
+        UNENCRYPTED_VERBS. A frame that merely fails to decrypt is NOT accepted
+        -- corrupt ciphertext, a stale group key, or a forged frame all land in
+        the caller's drop path as before.
+
+        Returns True only if the frame was handed on. Parsing happens twice (here
+        to inspect, then inside _msg_to_queue to deliver); this is an error-path
+        branch, and the alternative is duplicating the dispatch logic.
+        """
+        try:
+            probe = Message.parse(raw_msg, from_whom, validate=False)
+        except Exception:
+            # Not a parseable envelope -- almost certainly real ciphertext.
+            _probes.counter('net.ptp', 'unencrypted_refused', 'unparseable')
+            return False
+        if getattr(probe, 'encrypt', True):
+            # Claims to be encrypted but would not decrypt. Genuinely broken or
+            # hostile; do not accept the plaintext reading of it.
+            _probes.counter('net.ptp', 'unencrypted_refused', 'claims_encrypted')
+            return False
+        verb = getattr(probe, 'function', None)
+        if verb not in UNENCRYPTED_VERBS:
+            _probes.counter('net.ptp', 'unencrypted_refused', str(verb))
+            self.logger.warning(
+                'Refusing plaintext %s from known peer %s: not an unencrypted '
+                'verb' % (verb, getattr(from_whom, 'nickname', from_whom)))
+            return False
+        self._msg_to_queue(raw_msg, from_whom, queues, 'point-to-point',
+                           validate=False)
+        _probes.counter('net.ptp', 'unencrypted_accepted', str(verb))
+        return True
 
     def _msg_to_queue(self, msg, from_whom, queues, rcvd_by, validate=True):
         try:
@@ -820,9 +872,19 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                             decrypt_msg = self.myself.decrypt(raw_msg, from_whom)
                             self._msg_to_queue(decrypt_msg, from_whom, queues, 'point-to-point')
                         except Exception:
-                            _probes.counter('net.ptp', 'drop', 'decrypt_failed_known_peer')
-                            self.logger.error('Decryption failed for known peer %s, rejecting message' %
-                                              from_whom.nickname)
+                            # Decrypt failed. Some protocol verbs are sent in
+                            # PLAINTEXT by design (encrypt=False), and once a
+                            # peer is in the listing this is the branch its
+                            # frames take -- so those verbs were dropped here,
+                            # which is what cost 3-peer convergence. Accept a
+                            # plaintext parse only for an allowlisted verb; a
+                            # known peer must not be able to downgrade anything
+                            # else. See identity.protocol.UNENCRYPTED_VERBS.
+                            if not self._accept_unencrypted(raw_msg, from_whom,
+                                                            queues):
+                                _probes.counter('net.ptp', 'drop', 'decrypt_failed_known_peer')
+                                self.logger.error('Decryption failed for known peer %s, rejecting message' %
+                                                  from_whom.nickname)
                     else:
                         # Unknown sender — bootstrap (empty peers) or a
                         # late joiner welcoming us. Try unencrypted parse;

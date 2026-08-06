@@ -18,6 +18,73 @@ import socket
 import struct
 
 from .netprocess import NetworkProcess, NetworkProtocol, TransmissionError
+from .. import _probes
+
+# Warn at most once per process that a source bind failed, so a
+# misconfigured address does not log on every single send.
+_bind_warned = False
+
+
+def bind_source_address(sock, address, logger=None, stream=False):
+    """Pin `sock`'s SOURCE address to `address` before it sends or connects.
+
+    AT's receive sockets bind the node's configured address, but the send
+    sockets historically did not, so the kernel chose the source from the route
+    to the destination. Any node with more than one candidate source address
+    (loopback aliases, multi-homed hosts, containers on several networks) then
+    transmitted from an address its peers do not have in their listing:
+    `_recv_udp` hands `recvfrom()`'s source addr to
+    `netprocess.peers.find_by_address()`, so every encrypted frame missed
+    attribution and aged out through mystery_handler, and `_recv_udp`'s
+    `addr == self.my_address` self-filter stopped recognising the node's own
+    broadcasts. Binding the source makes the address a node transmits FROM equal
+    the address it is known BY.
+
+    Port collisions: always bind port 0 and NEVER set SO_REUSEADDR here. The
+    recv sockets hold (my_address, comm_port) WITH SO_REUSEADDR, and UDP lets two
+    sockets share addr:port only when BOTH set it -- so omitting it is what makes
+    the kernel's autobind unable to hand out the port this node is listening on,
+    even when AT_COMM_PORT is configured inside the ephemeral range. Verified:
+    an explicit same-port bind is refused without the option and succeeds with
+    it, and 4000 concurrent autobinds never landed on the held port.
+
+    For TCP, `stream=True` sets IP_BIND_ADDRESS_NO_PORT so the kernel defers port
+    selection to connect() and keeps 4-tuple uniqueness. Without it, binding
+    before connect reserves a port against the local address alone, which
+    exhausts the ephemeral range much sooner under the per-message
+    connect/send/close path that is still the default.
+
+    Returns True if the source was pinned. A bind failure is NOT fatal -- the
+    send proceeds unbound (losing attribution, as before) and warns once, rather
+    than taking the node off the air over a bad address.
+    """
+    global _bind_warned
+    # Guard on `str` rather than truthiness: this is called with
+    # getattr(self, 'my_address', None), and the unit tests drive the send
+    # bodies on spec-mocks whose attributes are Mock objects, not addresses.
+    if not isinstance(address, str) or address in ('', '0.0.0.0', '::'):
+        _probes.counter('net.bind_source', 'skipped', 'wildcard_or_unset')
+        return False
+    if stream:
+        opt = getattr(socket, 'IP_BIND_ADDRESS_NO_PORT', None)
+        if opt is not None:
+            try:
+                sock.setsockopt(socket.IPPROTO_IP, opt, 1)
+            except OSError:
+                pass  # best-effort; correctness does not depend on it
+    try:
+        sock.bind((address, 0))
+        _probes.counter('net.bind_source', 'bound')
+        return True
+    except OSError as err:
+        _probes.counter('net.bind_source', 'failed', err.__class__.__name__)
+        if not _bind_warned:
+            _bind_warned = True
+            if logger is not None:
+                logger.warning(
+                    'Could not bind source address %s (%s); sending unbound, so '
+                    'peers may fail to attribute these messages' % (address, err))
+        return False
 
 
 class UDPNetworkProcess(NetworkProcess):
@@ -102,6 +169,10 @@ class UDPNetworkProcess(NetworkProcess):
 
     def _send_udp(self, msg, host, port):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+            # Transmit FROM the address peers know us by, or they cannot
+            # attribute the frame (see bind_source_address).
+            bind_source_address(sock, getattr(self, 'my_address', None),
+                                getattr(self, 'logger', None))
             if not isinstance(msg, bytes):
                 msg = msg.encode(self.enc)
             sent = sock.sendto(msg, (host, port))
@@ -119,6 +190,11 @@ class UDPNetworkProcess(NetworkProcess):
 
     def send_any(self, msg):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+            # Also the fix for the self-filter: _recv_udp drops our own
+            # broadcast only when its source matches my_address, and this node
+            # receives its own send_any on the cast socket.
+            bind_source_address(sock, getattr(self, 'my_address', None),
+                                getattr(self, 'logger', None))
             if not isinstance(msg, bytes):
                 msg = msg.encode(self.enc)
             sock.setsockopt(*self.sock_options)

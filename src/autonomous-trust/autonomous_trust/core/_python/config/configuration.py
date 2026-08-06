@@ -114,6 +114,14 @@ class Configuration(object):
                      SerializeMode.PROTO: '.cfg.pb'}
     file_ext = _file_ext_map.get(mode, '.cfg.json')
     log_stdout = hex(sum([ord(x) for x in 'stdout']))
+    # Companion destination sentinel to log_stdout. Needed because
+    # `silent=True` suppresses the stdout log handler (it is what keeps the
+    # console clean), so `silent=True` + `logfile=log_stdout` asks for logs on a
+    # stream that is being suppressed -- AT resolves that by discarding them, and
+    # log_level goes inert. Callers that want no console chatter but DO want logs
+    # (the diag harness, any operator wanting a debug trace out of a quiet node)
+    # name this instead and get a stderr handler regardless of `silent`.
+    log_stderr = hex(sum([ord(x) for x in 'stderr']))
     _msg_class = None
 
     def __init__(self, msg_class=None):

@@ -148,20 +148,30 @@ class TestProbe:
                 raise RuntimeError('finalize blew up')
         assert probe_token('/m.so', lib_loader=_loader(_BadUnload())).present
 
-    def test_token_present_is_boolean_form(self):
-        # `token_present` takes no `lib_loader`, so this one call cannot use the
-        # fake and really does reach PyKCS11, which really does try to dlopen
-        # '/m.so' and prints its own diagnostic to stderr:
+    def test_token_present_is_boolean_form(self, monkeypatch):
+        # `token_present` takes no `lib_loader`, so it always goes through the
+        # real `_load_pkcs11_lib`; stub that instead. Unstubbed, this call did a
+        # genuine dlopen('/m.so'), and *which* branch it took depended on the
+        # environment: a real load failure where PyKCS11 is installed, the
+        # ImportError branch where it is not. Same assertion either way, so the
+        # test silently covered whichever path the machine happened to have --
+        # and on the way through, PyKCS11's own loader wrote to C-level stderr:
         #   src/dyn_unix.c:34:SYS_dyn_LoadLibrary() /m.so: cannot open shared
         #   object file
-        # That line is expected third-party output, not a failure -- it is only
-        # *visible* because scripts/test-packages.sh runs pytest with `-s`, which
-        # disables capture. What matters is that an unloadable module is reported
-        # as "no token", never raised.
+        # (visible because scripts/test-packages.sh runs pytest with `-s`, and
+        # appearing *after* the summary because a C FILE* buffer only flushes at
+        # process exit). The stub pins the branch this test is actually about:
+        # an unloadable module is reported as "no token", never raised.
         #
         # Asserted as `is False` rather than the previous `in (True, False)`,
         # which was a tautology: it held for any bool, so it would have passed
         # just as well had the swallow-and-report behaviour been broken.
+        def unloadable(module_path):
+            raise PivTokenError('failed to load PKCS#11 module %s: '
+                                'CKR_GENERAL_ERROR' % module_path)
+        monkeypatch.setattr(
+            'autonomous_trust.core.identity.zta.piv.pkcs11._load_pkcs11_lib',
+            unloadable)
         assert token_present('/m.so') is False
         assert probe_token('/m.so', lib_loader=_loader(_FakeLib(()))).present is False
 

@@ -20,7 +20,7 @@ import threading
 import time
 
 from .netprocess import NetworkProtocol, TransmissionError
-from .udp import UDPNetworkProcess
+from .udp import UDPNetworkProcess, bind_source_address
 from .. import _probes
 from .. import system
 
@@ -148,6 +148,12 @@ class TCPNetworkProcess(UDPNetworkProcess):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         finally:
             socket.setdefaulttimeout(old_default)
+        # stream=True: IP_BIND_ADDRESS_NO_PORT, so pinning the source ADDRESS
+        # does not also reserve a port ahead of connect() (see
+        # bind_source_address) -- this path is pooled, but the solo path below
+        # opens one connection per message and would exhaust the range.
+        bind_source_address(sock, getattr(self, 'my_address', None),
+                            getattr(self, 'logger', None), stream=True)
         try:
             sock.connect((host, port))
         except socket.error as err:
@@ -191,6 +197,11 @@ class TCPNetworkProcess(UDPNetworkProcess):
         finally:
             socket.setdefaulttimeout(old_default)
         with sock:
+            # Module-level call, not a method: the unit tests drive this body on
+            # a spec-mock, and the helper's isinstance(str) guard makes a Mock
+            # my_address a no-op rather than a crash.
+            bind_source_address(sock, getattr(self, 'my_address', None),
+                                getattr(self, 'logger', None), stream=True)
             self.logger.debug('Solo connect to %s:%s' % (host, port))
             try:
                 sock.connect((host, port))

@@ -74,6 +74,41 @@ class TestAutonomousTrustInit:
         at.print('hello')
         assert 'hello' in capsys.readouterr().out
 
+    def test_silent_stdout_discards_logs(self, setup_teardown):
+        """silent=True + logfile=log_stdout asks for a quiet console AND for logs
+        ON the console, and AT resolves that by discarding: the ONLY handler is a
+        NullHandler, so log_level is inert. Deliberate (most cases in this file
+        depend on the quiet), but it is the trap that made a working discovery
+        look silent in the diag harness, so pin it."""
+        import logging
+        at = AutonomousTrust(multiproc=False, silent=True,
+                             log_level=logging.DEBUG,
+                             logfile=Configuration.log_stdout)
+        assert all(isinstance(h, logging.NullHandler)
+                   for h in at._logger.handlers), \
+            'expected the discard path, got %r' % at._logger.handlers
+
+    def test_silent_stderr_still_logs(self, setup_teardown, capsys):
+        """The companion sentinel: a caller wanting no console chatter but a real
+        debug trace names log_stderr and gets one, REGARDLESS of silent. Without
+        this there is no way to ask -- which is why the harness's log_level was
+        inert. `silent` still governs print() chatter."""
+        import logging
+        at = AutonomousTrust(multiproc=False, silent=True,
+                             log_level=logging.DEBUG,
+                             logfile=Configuration.log_stderr)
+        streams = [h for h in at._logger.handlers
+                   if isinstance(h, logging.StreamHandler)
+                   and not isinstance(h, logging.NullHandler)]
+        assert streams, 'log_stderr attached no real handler'
+        assert all(h.level == logging.DEBUG for h in streams)
+        at.logger.debug('discovery-trace-marker')
+        captured = capsys.readouterr()
+        assert 'discovery-trace-marker' in captured.err
+        # silent still suppresses console chatter, and logs must not leak to stdout
+        at.print('chatter')
+        assert 'chatter' not in capsys.readouterr().out
+
     def test_queue_type(self, setup_teardown):
         at = AutonomousTrust(multiproc=False, logfile=Configuration.log_stdout)
         assert at.queue_type is queue.Queue
