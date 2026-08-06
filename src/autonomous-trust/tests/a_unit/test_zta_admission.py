@@ -27,7 +27,7 @@ import pytest
 
 from autonomous_trust.core.identity.idprocess import IdentityProcess
 from autonomous_trust.core.identity.zta import (
-    ZtaPolicy, ZtaResult, ZtaStatus, Verifier)
+    ZtaPolicy, ZtaResult, ZtaStatus, Verifier, BINDING_MODE_OFF)
 
 pytest.importorskip("cryptography")
 
@@ -60,12 +60,18 @@ class _GateProc:
     _mark_operator_bound = staticmethod(IdentityProcess._mark_operator_bound)
     _zta_admit = IdentityProcess._zta_admit
     _zta_credential_replayed = IdentityProcess._zta_credential_replayed
+    # Multi-credential admission (ISSUES §1.5): the credential list, the per-anchor
+    # chain walk, and the anchor-verifier seam _zta_admit now goes through.
+    _zta_credentials = IdentityProcess._zta_credentials
+    _zta_match_anchors = IdentityProcess._zta_match_anchors
+    _zta_anchor_verifiers = IdentityProcess._zta_anchor_verifiers
 
     def __init__(self, policy: ZtaPolicy, peers=None, identity=None):
         self.configs = {ZtaPolicy.CONFIG_KEY: policy}
         self._zta_policy_cache = None
         self._zta_verifier_cache = None
         self._zta_operator_verifier_cache = None
+        self._zta_anchor_cache = None
         self._operator_verified = set()
         self._zta_capped = set()
         self.logger = logging.getLogger('test.zta')
@@ -96,7 +102,14 @@ class TestZtaAdmissionDisabled:
 
 @requires_ca
 class TestZtaAdmissionX509:
+    """Chain validity only. These fixtures predate the credential->identity binding
+    and provision none, so they run `binding_mode: off` -- otherwise every one of
+    them would reject for the unrelated reason that nothing is bound, and stop
+    testing the chain walk. Binding enforcement has its own tests below and in
+    test_zta_binding.py."""
+
     def _proc(self, **kw):
+        kw.setdefault('binding_mode', BINDING_MODE_OFF)
         return _GateProc(ZtaPolicy(enabled=True, require_at_admission=True,
                                    verifier_type='x509', ca_bundle_path=_BUNDLE, **kw))
 
@@ -119,9 +132,12 @@ class TestZtaAdmissionX509:
 class TestZtaAdmissionRevocation:
     """§7.1 caveat 2: a chain-valid but CRL-revoked cert must be rejected at
     admission. drone_alpha is the cert revoked in intermediate-revoked.crl.pem;
-    it is otherwise valid (admitted above when no CRL is configured)."""
+    it is otherwise valid (admitted above when no CRL is configured).
+
+    `binding_mode: off` for the same reason as TestZtaAdmissionX509."""
 
     def _proc(self, **kw):
+        kw.setdefault('binding_mode', BINDING_MODE_OFF)
         return _GateProc(ZtaPolicy(enabled=True, require_at_admission=True,
                                    verifier_type='x509', ca_bundle_path=_BUNDLE, **kw))
 
@@ -154,8 +170,13 @@ class TestZtaCredentialReplay:
     identity."""
 
     def _proc(self, peers=None, identity=None):
+        # `binding_mode: off` deliberately: this class pins the ROSTER-based
+        # first-use-wins check, which is what an unbound credential still relies on.
+        # A bound credential does not need it (the signature names the node), so
+        # running these under `require` would test the binding instead.
         return _GateProc(ZtaPolicy(enabled=True, require_at_admission=True,
-                                   verifier_type='x509', ca_bundle_path=_BUNDLE),
+                                   verifier_type='x509', ca_bundle_path=_BUNDLE,
+                                   binding_mode=BINDING_MODE_OFF),
                          peers=peers, identity=identity)
 
     def test_same_credential_different_identity_rejected(self):
@@ -196,9 +217,12 @@ class TestZtaDdilFallback:
     def _proc(self, allow_fallback):
         proc = _GateProc(ZtaPolicy(enabled=True, require_at_admission=True,
                                    verifier_type='x509', ca_bundle_path=_BUNDLE,
+                                   binding_mode=BINDING_MODE_OFF,
                                    allow_ddil_fallback=allow_fallback,
                                    ddil_fallback_reputation_cap=0.5))
-        proc._zta_verifier_cache = _UnavailableVerifier()  # force UNAVAILABLE
+        # Injected at the anchor-verifier seam, which is what the multi-credential
+        # gate walks; _zta_verifier_cache is no longer on that path.
+        proc._zta_anchor_cache = [('default', _UnavailableVerifier(), False)]
         return proc
 
     def test_deferred_admitted_capped_when_fallback_on(self):

@@ -116,6 +116,12 @@ no Python ZTA *process* yet, see §6).
 
 ## 3. Identity binding / wire parity
 
+> **Naming collision, worth reading before §3.** "Identity binding" in this section
+> means *wire carriage* — the credential riding the announce/propose/confirm payloads.
+> It is **not** the credential→identity **binding gate** added 2026-08-06 (ISSUES §1.5,
+> `identity/zta_binding.py` / `zta/zta_binding.c`), which proves the announcing node is
+> entitled to present the credential. See §8.
+
 C serializes the ZTA fields into `identity.proto` fields 6-8 (`identity.c:349-398`); Python
 `Identity` previously ignored them. Phase 2 adds `zta_credential` / `zta_issuer` /
 `zta_credential_hash` to `Identity.__init__`, `publish()`, `sync_to_message()`, and
@@ -163,5 +169,70 @@ both sides: `zta-x509-admit-valid`, `zta-x509-reject-unsigned`,
 load the `zta_policy` + CA bundle and attach a per-participant credential (reusing the test
 CA certs); the adapters assert an `admitted` / `zta_status` observable. Schema stays `"1"`.
 The C conformance runner must be built with `-DAT_ZTA=ON` for these to run on the C side.
+
+## 8. The credential→identity binding (2026-08-06) — both runtimes
+
+Everything above describes Python catching up to C. This section is work that landed in
+**both**, on the same day, and it is the substance of ISSUES §1.5. `binding_mode:
+require` IS a fleet-wide guarantee: a C `welcoming_committee` and a Python one make the
+same admission decision, pinned by 168/168 conformance cases with 0 asymmetric.
+
+Python in `identity/zta_binding.py` + `idprocess.py`; C in `zta/zta_binding.{h,c}`,
+`identity.c`, `zta/zta_policy.{h,c}` and `identity/id_proc.c::_zta_admit`:
+
+- **The binding gate.** A chain-valid credential must additionally be *bound* to the
+  announcing identity, by any one of three mechanisms — holder-asserted (the
+  credential's key signs a pre-image naming the node's uuid and signing key),
+  CA-asserted (a URI SAN naming the node), or an existing operator-key binding, which
+  is already such a signature. `binding_mode` (`require` default / `prefer` / `off`)
+  governs enforcement; an unrecognized value falls back to `require`, so a typo
+  tightens the gate rather than opening it.
+- **Named trust anchors.** `ZtaPolicy.anchors` = `{name, ca_bundle_path, operator}`.
+  A config with no `anchors` key resolves to exactly the two anchors it always had, so
+  this is not a config flag day even though `binding_mode` is a credential one.
+- **Multiple credentials per identity.** Repeated `ZtaCredential{der, binding, issuer}`
+  at `identity.proto` **field 16**; fields 6-8 remain the primary, so a peer predating
+  field 16 — including every current C node — interoperates unchanged. Admission is
+  *any-of*, and failure is **graded**: a binding present-and-failing, a credential
+  already bound to another identity, an oversized blob, or an affirmative revocation
+  reject the identity, while merely-expired or unknown-anchor credentials are skipped.
+  For a single-credential node this collapses to the previous behavior, which is why
+  the `zta-x509-reject-*` pins still hold unchanged.
+- **Derived gateway authority.** Each verified credential earns authority for its
+  anchor (`Identity.zta_anchors`, excluded from `to_dict` — it is the observer's
+  finding, not a peer's claim), and `_gateway_authorized` refuses to federate through
+  a candidate that has not proved an anchor this node also holds.
+
+### 8.1 Two seams that only appear once both sides exist
+
+Recorded because neither is discoverable from one runtime alone, and both fail quietly.
+
+- **The SAN template keeps Python's `{uuid}` spelling, and C substitutes it
+  textually** (`zta_render_san_uri`) rather than treating it as a printf format. ONE
+  `zta_policy.cfg.json` is read by both runtimes, so a C-only `%s` would render
+  `at://{uuid}` literally against a Python-written config and match nothing — a binding
+  check that never fires, which is worse than one that errors. This was a real bug
+  during implementation, caught by the C unit test, not by inspection.
+- **`_own_zta_anchors` caches keyed on the identity**, not behind a bare "computed"
+  flag. The conformance runner hosts every participant in one process, so a
+  process-wide cache would answer for whichever node asked first and hand its anchors
+  to the others. A production node has one identity and hits the cache every time.
+
+### 8.2 Conformance
+
+Seven scenarios: `zta-binding-{admit-bound,reject-unbound,reject-forged,
+reject-other-identity,prefer-admits-unbound}`,
+`zta-credential-replay-different-identity`, `zta-multi-anchor-gateway`. Bindings are
+**signed at scenario time** by both adapters (fixture key `zta_bindings`, variants
+`valid` / `forged` / `other-identity`) rather than pinned as recorded blobs — pinning
+one signature would let the two implementations agree on a byte string while
+disagreeing about what is signed. A mint that cannot load its key is **fatal, not
+skipped**: an unbound participant is exactly the expected outcome of the reject cases,
+so a skipped mint would make them pass vacuously.
+
+The 14 pre-existing `zta-x509-*` / `operator-*` fixtures now carry an explicit
+`binding_mode: off`. They predate bindings and provision none, so under the new
+`require` default they broke — 7 cases, failing identically on both sides. `off` also
+keeps each of those pins testing what it claims (a bad chain, not an absent binding).
 
 [ZTA Integration >](zta-integration.md)

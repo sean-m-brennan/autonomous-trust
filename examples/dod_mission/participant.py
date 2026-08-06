@@ -601,6 +601,13 @@ def _attach_zta_credential(cfg_dir: str) -> None:
     at admission against the receiver's ``zta_policy`` — rejecting the forged
     sensors at the identity layer instead of merely flooring them on the
     dashboard. No-op when no credential file is present (ZTA-disabled runs).
+
+    Also signs the credential->identity **binding** when the provisioned private key
+    is present (``zta_credential.key.pem``). That has to happen here rather than at
+    provisioning time: the signed pre-image names this node's uuid and signing key,
+    which do not exist until the identity is first minted. Under
+    ``binding_mode: require`` a credential with no binding is refused, so a forged
+    credential — provisioned deliberately without a key — cannot be presented at all.
     """
     cred_file = Path(cfg_dir) / "zta_credential.der"
     if not cred_file.is_file():
@@ -612,12 +619,52 @@ def _attach_zta_credential(cfg_dir: str) -> None:
     try:
         ident = Identity.from_file(str(id_file))
         ident.zta_credential = cred_file.read_bytes()
+        ident.zta_credential_binding = _sign_zta_binding(
+            cfg_dir, ident, ident.zta_credential)
+        # The primary also travels in the repeated field, which is the only place a
+        # binding fits on the wire (identity.proto field 16).
+        ident.zta_credentials = [{'der': ident.zta_credential,
+                                  'binding': ident.zta_credential_binding,
+                                  'issuer': ident.zta_issuer}]
         ident.to_file(str(id_file))
-        logger.info("Attached ZTA credential (%d bytes) to identity in %s",
-                    len(ident.zta_credential), cfg_dir)
+        logger.info("Attached ZTA credential (%d bytes, binding %s) to identity in %s",
+                    len(ident.zta_credential),
+                    "signed" if ident.zta_credential_binding else "ABSENT",
+                    cfg_dir)
     except Exception:
         logger.warning("Failed to attach ZTA credential from %s", cred_file,
                        exc_info=True)
+
+
+def _sign_zta_binding(cfg_dir: str, ident, cred: bytes) -> bytes:
+    """Sign this node's credential->identity binding, or return b'' if it cannot.
+
+    Returns empty (never raises) when no private key was provisioned — the forged
+    leave-behind sensors, and any peer whose credential lives on a smartcard. That is
+    a legitimate state to be in, and the admission gate decides what it costs.
+    """
+    key_file = Path(cfg_dir) / "zta_credential.key.pem"
+    if not key_file.is_file() or not cred:
+        return b""
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+        from autonomous_trust.core.identity.zta_binding import zta_binding_preimage
+        key = serialization.load_pem_private_key(key_file.read_bytes(),
+                                                 password=None)
+        pre = zta_binding_preimage(ident, cred)
+        if isinstance(key, ec.EllipticCurvePrivateKey):
+            return key.sign(pre, ec.ECDSA(hashes.SHA256()))
+        if isinstance(key, rsa.RSAPrivateKey):
+            # PKCS#1 v1.5 + SHA-256, matching what PivVerifier._verify_signature
+            # accepts on the far side; a mismatch here verifies nowhere.
+            return key.sign(pre, padding.PKCS1v15(), hashes.SHA256())
+        logger.warning("Unsupported ZTA credential key type %s; no binding signed",
+                       type(key).__name__)
+        return b""
+    except Exception:
+        logger.warning("Failed to sign ZTA binding from %s", key_file, exc_info=True)
+        return b""
 
 
 def _env_flag(name: str, default: bool = False) -> bool:

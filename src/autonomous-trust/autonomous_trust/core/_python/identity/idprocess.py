@@ -48,7 +48,9 @@ from ..network import Message, Network
 from .history import IdentityByWork, IdentityByStake, IdentityByAuthority
 from .history import IdentityObj
 from .protocol import IdentityProtocol
-from .zta import ZtaPolicy, ZtaStatus, ZTA_CRED_MAX
+from .zta import (ZtaPolicy, ZtaStatus, ZTA_CRED_MAX, BINDING_MODE_PREFER,
+                  BINDING_MODE_REQUIRE)
+from .zta_binding import identity_is_bound
 from ..structures.dag import LinkedStep
 from ..system import CfgIds, encoding, PackageHash, now, _env_bool
 from .. import _probes
@@ -220,6 +222,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self._zta_policy_cache: Optional[ZtaPolicy] = None
         self._zta_verifier_cache = None
         self._zta_operator_verifier_cache = None  # operator-anchor verifier (D8/Q9)
+        # Per-anchor verifiers for the multi-credential admission path, one per
+        # named trust anchor. Separate cache from _zta_verifier_cache because the
+        # two answer different questions: that one is "the" verifier, this is the
+        # set a credential may chain to.
+        self._zta_anchor_cache = None
+        # Anchor names our OWN credentials verify against, for the gateway-authority
+        # check. Distinct from the peer-side zta_anchors: we never admit ourselves,
+        # so nothing else computes this.
+        self._own_anchor_cache = None
         self._zta_capped: set = set()  # uuids admitted via DDIL fallback (rep-capped)
         self._operator_verified: set = set()  # uuids whose operator credential verified
         self._operator_session = None  # live OperatorSession, attached in P-L3
@@ -570,16 +581,79 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             r = getattr(peer, '_rank', 0)
         return r or 0
 
+    def _own_zta_anchors(self) -> set:
+        """Anchor names OUR OWN credentials verify against. Computed locally, once.
+
+        Not read from ``self.identity.zta_anchors``: that field is what a *peer*
+        proved to us at admission, and we never admit ourselves. This walks our own
+        credentials through the same anchor verifiers instead.
+        """
+        if self._own_anchor_cache is None:
+            own = set()
+            identity = getattr(self, 'identity', None)
+            if identity is not None:
+                anchors = self._zta_anchor_verifiers()
+                for cred, _binding, _issuer in self._zta_credentials(identity):
+                    matched, _is_op, _fail, _defer = self._zta_match_anchors(cred, anchors)
+                    own.update(name for name, _v, _r in matched)
+            self._own_anchor_cache = own
+        return self._own_anchor_cache
+
+    def _gateway_authorized(self, peer_uuid) -> bool:
+        """Whether this node may federate through ``peer_uuid``.
+
+        The candidate must have PROVED, at admission, an anchor we also hold. That is
+        the derived-authority rule: crossing an agency boundary requires a credential
+        from an agency both sides recognize, and since nothing on the wire declares
+        gatewayhood, deriving the permission from verified credentials is the only
+        form of it a peer cannot simply assert. A candidate we never admitted has no
+        proved anchors and is refused — which is the point, not a side effect.
+
+        Inert (True) when the policy is not enforcing at admission, or when we hold no
+        anchors ourselves: with nothing to compare against, refusing every candidate
+        would break federation for every non-ZTA deployment rather than protecting
+        anything. Also inert on an object with no ZTA machinery wired at all, matching
+        how the rest of this gate stays usable on a lightweight stand-in.
+        """
+        try:
+            policy = self._zta_policy()
+        except AttributeError:
+            return True
+        if not (policy.enabled and policy.require_at_admission):
+            return True
+        own = self._own_zta_anchors()
+        if not own:
+            return True
+        peers = getattr(self, 'peers', None)
+        peer = peers.find_by_uuid(peer_uuid) if peers is not None else None
+        proved = set(getattr(peer, 'zta_anchors', None) or []) if peer is not None else set()
+        if proved & own:
+            return True
+        _probes.counter('id.gateway', 'federation_refused',
+                        'no_shared_anchor' if proved else 'no_proved_anchor')
+        self.logger.warning(
+            'Gateway: refusing to federate through %s: proved anchors %s share none '
+            'with ours %s', peer_uuid, sorted(proved) or '[]', sorted(own))
+        return False
+
     def _discover_child_gateway(self, group, self_uuid):
         """The recursion target for one child group = its highest-rank member
         (excluding self), ties broken by the lexicographically greater uuid so
         the choice is deterministic and identical in C. Returns a uuid string
-        or None (empty group / self only)."""
+        or None (empty group / self only).
+
+        Candidates that cannot prove gateway authority for a boundary we share are
+        passed over rather than returned (see :meth:`_gateway_authorized`), so a peer
+        holding only a foreign agency's credential is never federated through — the
+        next-highest-rank eligible member is chosen instead.
+        """
         amap = getattr(group, '_address_map', None) or {}
         best, best_key = None, None
         for uuid in amap:
             u = str(uuid)
             if self_uuid is not None and u == self_uuid:
+                continue
+            if not self._gateway_authorized(u):
                 continue
             key = (self._member_rank(u), u)
             if best_key is None or key > best_key:
@@ -1651,6 +1725,84 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 return True
         return False
 
+    def _zta_anchor_verifiers(self):
+        """``[(name, verifier, is_operator)]``, one per configured trust anchor,
+        built once per process.
+
+        The single seam for substituting verifiers in the admission path -- inject
+        into ``_zta_anchor_cache`` to force a particular outcome (a verifier that
+        reports UNAVAILABLE, say, to exercise the DDIL fallback).
+        """
+        if self._zta_anchor_cache is None:
+            self._zta_anchor_cache = self._zta_policy().create_anchor_verifiers()
+        return self._zta_anchor_cache
+
+    def _zta_credentials(self, new_id):
+        """The peer's credentials as ``[(der, binding, issuer)]``, primary first.
+
+        A node carries ONE credential; several arise only at a network gateway
+        bridging agencies, which must hold one per agency it bridges. The primary
+        lives in the singular wire fields (kept so a pre-multi-credential peer
+        interoperates unchanged) and the full set in the repeated one, so the
+        primary normally appears twice -- deduplicated here by fingerprint over the
+        actual bytes, keeping the first occurrence but preferring whichever copy
+        carries a binding, since the singular fields have nowhere to put one.
+        """
+        out, seen = [], {}
+
+        def _add(der, binding, issuer):
+            if not der:
+                return
+            der, binding = bytes(der), bytes(binding or b'')
+            fp = hashlib.sha256(der).digest()
+            if fp in seen:
+                idx = seen[fp]
+                if binding and not out[idx][1]:
+                    out[idx] = (der, binding, out[idx][2] or issuer)
+                return
+            seen[fp] = len(out)
+            out.append((der, binding, issuer or ''))
+
+        try:
+            _add(getattr(new_id, 'zta_credential', b'') or b'',
+                 getattr(new_id, 'zta_credential_binding', b'') or b'',
+                 getattr(new_id, 'zta_issuer', '') or '')
+        except AttributeError:
+            pass  # peer from an older/non-ZTA build carries no fields
+        for entry in (getattr(new_id, 'zta_credentials', None) or []):
+            if isinstance(entry, dict):
+                _add(entry.get('der') or entry.get('credential') or b'',
+                     entry.get('binding') or b'', entry.get('issuer') or '')
+            else:  # a protobuf ZtaCredential (or any duck-typed stand-in)
+                _add(getattr(entry, 'der', b'') or getattr(entry, 'credential', b''),
+                     getattr(entry, 'binding', b''), getattr(entry, 'issuer', ''))
+        return out
+
+    def _zta_match_anchors(self, cred, anchors):
+        """``(matched, is_operator, last_failure)`` for one credential.
+
+        Every anchor is tried, deliberately not stopping at the first match: a
+        credential may legitimately chain to more than one (the legacy config
+        synthesizes a peer and an operator anchor that are frequently the same CA),
+        and both the operator classification and gateway authority depend on knowing
+        the full set rather than whichever happened to be checked first.
+
+        ``last_failure`` carries a non-VERIFIED result so the caller can report a
+        representative reason -- the observable the zta-x509-reject-* scenarios pin.
+        """
+        matched, is_operator, last_failure, deferred = [], False, None, None
+        for name, verifier, anchor_is_operator in anchors:
+            result = verifier.verify_credential(cred)
+            if result.status is ZtaStatus.VERIFIED:
+                matched.append((name, verifier, result))
+                is_operator = is_operator or anchor_is_operator
+            elif result.status in (ZtaStatus.REJECTED, ZtaStatus.EXPIRED,
+                                   ZtaStatus.REVOKED):
+                last_failure = result
+            else:  # DEFERRED / UNAVAILABLE — the verifier could not answer
+                deferred = result
+        return matched, is_operator, (last_failure or deferred), deferred
+
     def _zta_admit(self, new_id) -> str:
         """ZTA admission decision for a newly-announced peer.
 
@@ -1659,12 +1811,30 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         (do not propose). A no-op ('admit') when the policy is disabled or does
         not require verification at admission.
 
+        **Admission is any-of** (ISSUES §1.5): at least one credential must verify
+        against some configured anchor AND be bound to this identity. Each verified
+        credential records authority for its anchor on the peer
+        (``zta_anchors``), and that -- not a self-declared role -- is what lets a
+        node act as a gateway across an agency boundary. Gateway-ness is emergent
+        from group membership and nothing on the wire declares it, so a rule of the
+        form "a gateway must present N credentials" would rest on a peer's own claim
+        and buy nothing; deriving authority from credentials instead is enforceable
+        against a peer that simply declines to claim anything.
+
+        **Failure is graded, because forgery and ignorance are different.** A
+        binding that is present and does not verify, a credential already bound to
+        another identity, an oversized blob, or an affirmatively revoked credential
+        all reject the identity -- each is evidence someone is lying. A credential
+        that is merely expired or chains to no anchor we hold is skipped: it says
+        nothing about the peer's honesty, only about our ability to evaluate it. For
+        the single-credential node this collapses to the previous behavior (nothing
+        usable left => reject), which is why the zta-x509-reject-* pins still hold.
+
         Also sets the AUTHORITATIVE operator_bound (ethne D8/Q9): the advertised
-        claim is neutralized to False on entry and set True only when the
-        credential verifies against the distinct operator trust anchor (see
-        _is_operator_credential). So a disabled policy, an unverified peer, or a
-        lying node (advertising operator_bound with a non-operator credential)
-        all end up operator_bound=False.
+        claim is neutralized to False on entry and set True only when a credential
+        verifies against an operator-flagged trust anchor. So a disabled policy, an
+        unverified peer, or a lying node (advertising operator_bound with a
+        non-operator credential) all end up operator_bound=False.
         """
         # Never trust the peer-advertised operator_bound: start False and earn
         # True only via operator-anchor verification below.
@@ -1680,43 +1850,59 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if not (policy.enabled and policy.require_at_admission):
             return 'admit'
         nick = getattr(new_id, 'nickname', '?')
-        try:
-            cred = new_id.zta_credential or None
-        except AttributeError:
-            cred = None  # peer from an older/non-ZTA build carries no field
-        # Size guard BEFORE handing the blob to the verifier: an oversized
+
+        def _reject(reason, status=ZtaStatus.REJECTED, level='warning'):
+            getattr(self.logger, level)('ZTA: rejecting %s at admission: %s',
+                                        nick, reason)
+            _probes.emit('id.welcome', 'zta_rejected', peer_nick=str(nick),
+                         zta_status=status.value, reason=reason)
+            _probes.counter('id.welcome', 'zta_rejected')
+            return 'reject'
+
+        creds = self._zta_credentials(new_id)
+        if not creds:
+            # A peer presenting NOTHING still has to be evaluated, not silently
+            # skipped: the verifiers are what distinguish "we cannot reach the PKI"
+            # (DDIL, admit capped) from "we can, and there is no credential"
+            # (reject). Iterating an empty list would answer neither, so the empty
+            # credential goes through the same path every other one does and the
+            # verifier says which it is -- x509 reports REJECTED "no credential
+            # data", the OIDC stub reports UNAVAILABLE. That is what the
+            # zta-ddil-defer and zta-x509-reject-unsigned pins turn on.
+            creds = [(b'', b'', '')]
+        # Size guard BEFORE handing any blob to a verifier: an oversized
         # credential is almost certainly hostile/corrupt and would let a remote
         # cause an OOM / parse-time DoS. Mirrors C `ZTA_CRED_MAX` (identity.h);
         # the C twin enforces the same cap at this admission gate (id_proc.c)
         # AND at protobuf deserialization (identity.c). Keep the bound in
         # lockstep -- pinned by conformance zta-x509-reject-oversized-credential.
-        if cred is not None and len(cred) > ZTA_CRED_MAX:
-            self.logger.warning('ZTA: rejecting %s at admission: credential too '
-                                'large (%d > %d)', nick, len(cred), ZTA_CRED_MAX)
-            _probes.emit('id.welcome', 'zta_rejected', peer_nick=str(nick),
-                         zta_status=ZtaStatus.REJECTED.value,
-                         reason='credential too large')
-            _probes.counter('id.welcome', 'zta_rejected')
-            return 'reject'
-        # Credential↔identity uniqueness (ISSUES §1.5 replay mitigation): a
-        # chain-valid credential harvested from another peer's announce and
-        # re-presented under a different identity is a replay/clone. Reject it
-        # before chain verification — the cert may verify fine; the point is it
-        # is already bound elsewhere. C parity (handle_welcoming_committee) is a
-        # tracked follow-up; the deeper fix (binding the cert to the identity via
-        # SAN/challenge-response) remains open in ISSUES §1.5.
-        if cred is not None and self._zta_credential_replayed(new_id, cred):
-            self.logger.warning('ZTA: rejecting %s at admission: credential '
-                                'already bound to a different identity (replay)',
-                                nick)
-            _probes.emit('id.welcome', 'zta_rejected', peer_nick=str(nick),
-                         zta_status=ZtaStatus.REJECTED.value,
-                         reason='credential bound to a different identity (replay)')
-            _probes.counter('id.welcome', 'zta_rejected')
-            return 'reject'
-        result = self._zta_verifier().verify_credential(cred)
-        status = result.status
-        if status is ZtaStatus.VERIFIED:
+        for cred, _binding, _issuer in creds:
+            if len(cred) > ZTA_CRED_MAX:
+                return _reject('credential too large (%d > %d)'
+                               % (len(cred), ZTA_CRED_MAX))
+        # Credential↔identity uniqueness: a chain-valid credential harvested from
+        # another peer's announce and re-presented under a different identity is a
+        # replay/clone. Rejected before chain verification -- the cert may verify
+        # fine; the point is that it is already bound elsewhere. This is the
+        # roster-based, first-use-wins check, which the binding below supersedes for
+        # any credential that carries one; it stays because it is the only defence
+        # left for an unbound credential under `binding_mode: prefer`/`off`.
+        for cred, _binding, _issuer in creds:
+            if self._zta_credential_replayed(new_id, cred):
+                return _reject('credential bound to a different identity (replay)')
+        anchors = self._zta_anchor_verifiers()
+        mode = policy.binding_mode
+        san_template = getattr(policy, 'san_uri_template', '') or ''
+        usable = []          # [(anchor_name, cred, is_operator, bound)]
+        earned = []          # anchor names this peer proved authority for
+        last_failure = None  # a representative non-VERIFIED result, for the reason
+        deferred = None      # a verifier that could not answer -> DDIL
+        for cred, binding, _issuer in creds:
+            matched, is_operator, failure, defer = self._zta_match_anchors(cred, anchors)
+            last_failure = failure or last_failure
+            deferred = defer or deferred
+            if not matched:
+                continue  # chains to no anchor we hold: ignorance, not forgery
             # A chain-valid certificate may nonetheless have been revoked.
             # verify_credential does NOT consult the CRL/OCSP source (it mirrors
             # C x509_verify_credential, which only walks the chain + expiry), so
@@ -1726,18 +1912,63 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             # admitted, so deployments without a revocation source see no change
             # in behavior. Mirrors the C welcoming_committee revocation gate;
             # pinned by conformance zta-x509-reject-revoked-credential.
-            rev = self._zta_verifier().check_revocation(result.credential_hash)
-            if rev.status is ZtaStatus.REVOKED:
-                self.logger.warning('ZTA: rejecting %s at admission: %s (%s)',
-                                    nick, rev.status.value, rev.reason)
-                _probes.emit('id.welcome', 'zta_rejected', peer_nick=str(nick),
-                             zta_status=rev.status.value, reason=rev.reason)
-                _probes.counter('id.welcome', 'zta_rejected')
-                return 'reject'
-            # Peer credential verified against the mission anchor. Now classify
-            # operator-class against the DISTINCT operator anchor (D8/Q9): only
-            # a credential that also chain-verifies there marks a human guardian.
-            if self._is_operator_credential(new_id, cred):
+            revoked = None
+            for _name, verifier, result in matched:
+                rev = verifier.check_revocation(result.credential_hash)
+                if rev.status is ZtaStatus.REVOKED:
+                    revoked = rev
+                    break
+            if revoked is not None:
+                return _reject(revoked.reason or 'credential revoked',
+                               status=ZtaStatus.REVOKED)
+            # The credential is genuine. Is THIS node entitled to present it?
+            # claimed_key/operator_key_binding are passed explicitly because the
+            # advertised operator_pubkey was moved aside above: an opted-in node's
+            # operator-key binding is itself a signature by this credential's key over
+            # bytes naming this node, so it already proves entitlement.
+            bound = identity_is_bound(
+                new_id, cred, binding, san_template,
+                operator_pubkey=claimed_key,
+                operator_key_binding=getattr(new_id, 'operator_key_binding', b''))
+            if binding and not bound:
+                # A binding was offered and does not verify. Unlike absence, that is
+                # affirmative evidence of forgery -- somebody tried and failed to
+                # prove entitlement -- so it condemns the whole identity rather than
+                # just costing this one credential.
+                return _reject('credential binding does not verify for this identity')
+            if not bound and mode == BINDING_MODE_REQUIRE:
+                # Unbound is a provisioning state, not a lie. The credential is
+                # unusable, so it earns no authority; if nothing else survives the
+                # peer is refused below, which for a single-credential node is
+                # exactly the old reject.
+                self.logger.warning(
+                    'ZTA: %s presented an unbound credential and binding_mode is '
+                    '%s; credential unusable', nick, mode)
+                _probes.counter('id.welcome', 'zta_unbound_refused')
+                continue
+            usable.append((matched[0][0], cred, is_operator, bound))
+            earned.extend(name for name, _v, _r in matched)
+        if usable:
+            # Record which anchors this peer actually proved. Gateway function
+            # across an agency boundary is gated on this, NOT on a declared role.
+            try:
+                new_id.zta_anchors = sorted(set(earned))
+            except Exception:
+                pass
+            for _anchor, cred, anchor_is_operator, _bound in usable:
+                # Operator-class (D8/Q9) by either route, because a deployment may
+                # express the operator anchor either way: as an anchor carrying
+                # `operator: true`, or as the separate operator_ca_bundle_path that
+                # _is_operator_credential consults. Both derive the answer from
+                # verifying the actual credential against an operator trust anchor,
+                # never from the peer-advertised operator_bound/zta_issuer.
+                # _is_operator_credential additionally refuses when the peer's
+                # advertised hash disagrees with the bytes it sent; the anchor-flag
+                # route does not need that guard, since the chain it walked is the
+                # non-forgeable signal and the advertised hash adds nothing to it.
+                if not (anchor_is_operator
+                        or self._is_operator_credential(new_id, cred)):
+                    continue
                 self._mark_operator_bound(new_id, True)
                 try:
                     self._operator_verified.add(new_id.uuid)
@@ -1745,33 +1976,48 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     pass
                 self.logger.debug('ZTA: %s is operator-attended (human guardian)', nick)
                 self._verify_operator_key(new_id, cred, claimed_key)
+                break
+            if (mode == BINDING_MODE_PREFER
+                    and any(not bound for _a, _c, _o, bound in usable)):
+                # `prefer` only: admitted on an unbound credential, so the
+                # roster-based TOFU check is all that stood between us and a
+                # harvested cert -- cap it like any other deferred verification.
+                # `off` deliberately does NOT cap: absence of a binding carries no
+                # penalty there, which is what makes it the no-change-in-behavior
+                # setting for a deployment that has not provisioned bindings yet.
+                self.logger.info('ZTA: %s admitted on an unbound credential '
+                                 '(binding_mode %s); reputation cap %.2f',
+                                 nick, mode, policy.ddil_fallback_reputation_cap)
+                _probes.counter('id.welcome', 'zta_unbound_capped')
+                try:
+                    self._zta_capped.add(new_id.uuid)
+                except Exception:
+                    pass
+                return 'admit_capped'
             return 'admit'
-        if status in (ZtaStatus.REJECTED, ZtaStatus.EXPIRED, ZtaStatus.REVOKED):
-            self.logger.warning('ZTA: rejecting %s at admission: %s (%s)',
-                                 nick, status.value, result.reason)
-            _probes.emit('id.welcome', 'zta_rejected', peer_nick=str(nick),
-                         zta_status=status.value, reason=result.reason)
-            _probes.counter('id.welcome', 'zta_rejected')
-            return 'reject'
-        # DEFERRED / UNAVAILABLE -> DDIL handling
-        if policy.allow_ddil_fallback:
-            self.logger.info('ZTA: verification deferred for %s (%s); admitting '
-                             'with reputation cap %.2f', nick, status.value,
-                             policy.ddil_fallback_reputation_cap)
-            _probes.emit('id.welcome', 'zta_deferred', peer_nick=str(nick),
-                         zta_status=status.value, reason=result.reason)
-            _probes.counter('id.welcome', 'zta_deferred')
-            try:
-                self._zta_capped.add(new_id.uuid)
-            except Exception:
-                pass
-            return 'admit_capped'
-        self.logger.warning('ZTA: verification unavailable for %s (%s) and DDIL '
-                            'fallback disabled; rejecting', nick, status.value)
-        _probes.emit('id.welcome', 'zta_rejected', peer_nick=str(nick),
-                     zta_status=status.value, reason=result.reason)
-        _probes.counter('id.welcome', 'zta_rejected')
-        return 'reject'
+        # Nothing usable. A verifier that could not answer is a DDIL condition and
+        # gets the fallback; an answer we did not like is a rejection.
+        if deferred is not None and last_failure is deferred:
+            if policy.allow_ddil_fallback:
+                self.logger.info('ZTA: verification deferred for %s (%s); admitting '
+                                 'with reputation cap %.2f', nick,
+                                 deferred.status.value,
+                                 policy.ddil_fallback_reputation_cap)
+                _probes.emit('id.welcome', 'zta_deferred', peer_nick=str(nick),
+                             zta_status=deferred.status.value, reason=deferred.reason)
+                _probes.counter('id.welcome', 'zta_deferred')
+                try:
+                    self._zta_capped.add(new_id.uuid)
+                except Exception:
+                    pass
+                return 'admit_capped'
+            self.logger.warning('ZTA: verification unavailable for %s (%s) and DDIL '
+                                'fallback disabled; rejecting', nick,
+                                deferred.status.value)
+            return _reject(deferred.reason, status=deferred.status)
+        if last_failure is not None:
+            return _reject(last_failure.reason, status=last_failure.status)
+        return _reject('no verifiable credential presented')
 
     def welcoming_committee(self, queues, message):
         """

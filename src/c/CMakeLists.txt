@@ -517,6 +517,7 @@ if(AT_ZTA)
         autonomous_trust/zta/zta_policy.c
         autonomous_trust/zta/zta_audit.c
         autonomous_trust/zta/zta_process.c
+        autonomous_trust/zta/zta_binding.c
     )
 endif()
 
@@ -1465,6 +1466,11 @@ add_executable(operator_binding_test test/operator_binding_test.c)
 set_source_files_properties(test/operator_binding_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(operator_binding_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME operator_binding_test COMMAND $<TARGET_FILE:operator_binding_test>)
+
+add_executable(zta_binding_test test/zta_binding_test.c)
+set_source_files_properties(test/zta_binding_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(zta_binding_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME zta_binding_test COMMAND $<TARGET_FILE:zta_binding_test>)
 
 add_executable(app_node_test test/app_node_test.c)
 set_source_files_properties(test/app_node_test.c PROPERTIES COMPILE_FLAGS "-Wall")
