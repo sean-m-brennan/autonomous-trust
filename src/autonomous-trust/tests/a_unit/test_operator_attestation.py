@@ -39,7 +39,8 @@ from autonomous_trust.core.identity.identity import (
 from autonomous_trust.core.identity.idprocess import IdentityProcess
 from autonomous_trust.core.identity.sign import Signature
 from autonomous_trust.core.identity.encrypt import Encryptor
-from autonomous_trust.core.identity.zta import ZtaPolicy, ZtaResult, ZtaStatus, Verifier
+from autonomous_trust.core.identity.zta import (ZtaPolicy, ZtaResult, ZtaStatus,
+                                                Verifier, BINDING_MODE_OFF)
 from autonomous_trust.core.protobuf.identity import identity_pb2
 
 CRED = b'FAKE-OPERATOR-DER-CERT'
@@ -197,16 +198,27 @@ class _OpGateProc:
     # The opt-in guardian-key check runs inside the operator-class branch of the
     # gate, so the stub needs it for any operator-credential case to reach the end.
     _verify_operator_key = IdentityProcess._verify_operator_key
+    _zta_credentials = IdentityProcess._zta_credentials
+    _zta_match_anchors = IdentityProcess._zta_match_anchors
+    _zta_anchor_verifiers = IdentityProcess._zta_anchor_verifiers
 
     def __init__(self, peer_status=ZtaStatus.VERIFIED, operator_anchor=True,
                  operator_status=ZtaStatus.VERIFIED):
-        self.configs = {ZtaPolicy.CONFIG_KEY: ZtaPolicy(enabled=True,
-                                                        require_at_admission=True)}
+        # `binding_mode: off`: these fixtures carry no credential->identity binding,
+        # and operator_bound classification is what is under test.
+        self.configs = {ZtaPolicy.CONFIG_KEY: ZtaPolicy(
+            enabled=True, require_at_admission=True,
+            binding_mode=BINDING_MODE_OFF)}
         self._zta_policy_cache = None
         # Pre-seed caches so create_verifier (needs cryptography) is never called.
         self._zta_verifier_cache = _StubVerifier(peer_status)
         self._zta_operator_verifier_cache = (_StubVerifier(operator_status)
                                              if operator_anchor else False)
+        # The gate walks the anchor list, so the peer stub must be seeded there.
+        # Named 'peer' with operator=False on purpose: operator-class must be earned
+        # through the DISTINCT operator verifier above, which is what these tests
+        # exercise.
+        self._zta_anchor_cache = [('peer', self._zta_verifier_cache, False)]
         self._zta_capped = set()
         self._operator_verified = set()
         self.logger = logging.getLogger('test.operator')

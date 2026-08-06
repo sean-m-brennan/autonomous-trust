@@ -29,6 +29,13 @@ fixtures:
   zta_policy:
     enabled: true
     require_at_admission: true
+    # These fixtures PREDATE the credential->identity binding (ISSUES §1.5) and
+    # provision none, so `off` keeps each pin testing what it claims: this case is
+    # about the chain / operator classification, not about bindings. Without it a
+    # reject-* pin would pass for the wrong reason (unbound, not bad chain) and the
+    # admit pins would fail outright. Binding behavior is pinned separately by the
+    # zta-binding-* scenarios.
+    binding_mode: "off"
     verifier_type: x509
     ca_bundle_path: testdata/zta/operator-ca-bundle.pem
     operator_ca_bundle_path: testdata/zta/operator-ca-bundle.pem

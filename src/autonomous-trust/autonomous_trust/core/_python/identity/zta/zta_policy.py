@@ -29,6 +29,16 @@ from ...config.configuration import Configuration
 from .zta_verifier import Verifier, NullVerifier, OidcVerifier, X509Verifier
 from .mfa import MfaChain, CombinePolicy
 
+#: How hard the admission gate insists on a credential->identity binding
+#: (`identity/zta_binding.py`). ``require`` is the default because without a binding
+#: the gate falls back on first-use-wins, and TOFU is the whole of ISSUES §1.5. The
+#: cost is a flag day: a credential provisioned before bindings existed is refused
+#: until re-provisioned, so a fleet mid-migration wants ``prefer`` for one hop.
+BINDING_MODE_REQUIRE = 'require'   # unbound credential -> reject
+BINDING_MODE_PREFER = 'prefer'     # unbound -> admit, DDIL-capped, TOFU check stands
+BINDING_MODE_OFF = 'off'           # verify a binding if offered, never require one
+BINDING_MODES = (BINDING_MODE_REQUIRE, BINDING_MODE_PREFER, BINDING_MODE_OFF)
+
 
 class ZtaPolicy(Configuration):
     """Runtime ZTA verification policy.
@@ -57,7 +67,10 @@ class ZtaPolicy(Configuration):
                  factors: Optional[List[dict]] = None,
                  operator_allow_ddil_relay: bool = True,
                  operator_privileged_requires_full_verify: bool = True,
-                 operator_ca_bundle_path: str = ''):
+                 operator_ca_bundle_path: str = '',
+                 anchors: Optional[List[dict]] = None,
+                 binding_mode: str = BINDING_MODE_REQUIRE,
+                 san_uri_template: str = 'at://{uuid}'):
         super().__init__()
         self.enabled = enabled
         self.require_at_admission = require_at_admission
@@ -95,6 +108,24 @@ class ZtaPolicy(Configuration):
         # bundle path in the C zta_policy. Additive/optional key so the C parser
         # (and older configs) ignore it safely.
         self.operator_ca_bundle_path = operator_ca_bundle_path
+        # Named trust anchors, one per agency. Multiple credentials arise only at a
+        # network gateway bridging agencies; an ordinary node carries one. Each
+        # entry: {"name": str, "ca_bundle_path": str, "operator": bool}. A list of
+        # plain dicts rather than a class, following `factors` above, so JSON
+        # round-trips without a decoder hook.
+        #
+        # Empty is the common case and NOT a degenerate one: `resolved_anchors`
+        # synthesizes the pair from ca_bundle_path / operator_ca_bundle_path, so
+        # every pre-existing config keeps working untouched.
+        self.anchors = [dict(a) for a in anchors] if anchors else []
+        # An unrecognized mode would silently become the most permissive thing,
+        # which is the wrong direction to fail: fall back to the strictest.
+        mode = (binding_mode or '').lower()
+        self.binding_mode = mode if mode in BINDING_MODES else BINDING_MODE_REQUIRE
+        # URI SAN template naming the node, for the CA-asserted binding. Empty
+        # disables the SAN path, leaving holder-asserted signatures as the only
+        # accepted proof.
+        self.san_uri_template = san_uri_template
 
     @classmethod
     def defaults(cls) -> 'ZtaPolicy':
@@ -141,6 +172,70 @@ class ZtaPolicy(Configuration):
         if not self.enabled or not self.operator_ca_bundle_path:
             return None
         return X509Verifier(self.operator_ca_bundle_path, self.ocsp_url, self.crl_path)
+
+    def resolved_anchors(self) -> List[dict]:
+        """The trust anchors to evaluate a peer's credentials against, normalized to
+        ``{"name", "ca_bundle_path", "operator"}``.
+
+        When ``anchors`` is empty this synthesizes the historical pair — the peer
+        anchor from ``ca_bundle_path`` and, if configured, the distinct operator
+        anchor from ``operator_ca_bundle_path``. That is what makes the multi-anchor
+        work additive: an existing single-CA deployment resolves to exactly the two
+        anchors it already had, in the same roles.
+
+        Anchors with no bundle path are dropped; an anchor that trusts nothing can
+        verify nothing, and keeping it would only produce confusing per-anchor
+        failures. Names are deduplicated by first occurrence so a config that
+        repeats one cannot make a credential count twice toward gateway authority.
+        """
+        raw = self.anchors
+        if not raw:
+            raw = []
+            if self.ca_bundle_path:
+                raw.append({'name': 'peer', 'ca_bundle_path': self.ca_bundle_path,
+                            'operator': False})
+            if self.operator_ca_bundle_path:
+                raw.append({'name': 'operator',
+                            'ca_bundle_path': self.operator_ca_bundle_path,
+                            'operator': True})
+        out, seen = [], set()
+        for idx, anchor in enumerate(raw):
+            path = (anchor.get('ca_bundle_path') or '').strip()
+            if not path:
+                continue
+            name = str(anchor.get('name') or 'anchor%d' % idx)
+            if name in seen:
+                continue
+            seen.add(name)
+            out.append({'name': name, 'ca_bundle_path': path,
+                        'operator': bool(anchor.get('operator', False))})
+        return out
+
+    def create_anchor_verifiers(self) -> List[tuple]:
+        """``[(name, verifier, is_operator), ...]`` — one chain-walking verifier per
+        resolved anchor, for the multi-credential admission path.
+
+        Anchors are an X.509 notion: an anchor *is* a CA bundle. For any other
+        ``verifier_type`` (``mfa``, ``oidc``) there is nothing to enumerate, so this
+        yields the single configured verifier under the name ``default`` and the
+        caller's logic is unchanged. Disabled policy yields nothing at all — the
+        admission gate short-circuits before reaching here.
+        """
+        if not self.enabled:
+            return []
+        if (self.verifier_type or '').lower() != 'x509':
+            return [('default', self.create_verifier(), False)]
+        resolved = self.resolved_anchors()
+        if not resolved:
+            # Enabled, x509, and no bundle anywhere. Not a no-op: the single
+            # verifier over an empty bundle reports UNAVAILABLE, which is what
+            # drives the DDIL defer path. Returning [] here would silently turn
+            # that into a flat rejection.
+            return [('default', self.create_verifier(), False)]
+        return [(a['name'],
+                 X509Verifier(a['ca_bundle_path'], self.ocsp_url, self.crl_path),
+                 a['operator'])
+                for a in resolved]
 
     def _create_mfa_chain(self) -> MfaChain:
         """Build an `MfaChain` from ``self.factors`` (AND-combined).

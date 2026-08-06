@@ -1,0 +1,48 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: zta-binding-reject-forged
+byte_pinning: false
+description: |
+    A binding is offered and does not verify: it is signed by an unrelated key
+    (testdata/zta/certs/impostor_leaf.key) rather than by the credential the peer
+    presents.
+
+    Unlike absence, that is affirmative evidence of forgery — somebody tried to
+    prove entitlement and failed — so it condemns the whole IDENTITY rather than
+    merely costing this one credential. The gate rejects without considering
+    anything else the peer might be carrying, which is the graded-failure rule
+    the implementations must agree on.
+
+    Cross-impl: pinned on BOTH sides, ZTA-gated.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  zta_policy:
+    enabled: true
+    require_at_admission: true
+    binding_mode: require
+    verifier_type: x509
+    ca_bundle_path: testdata/zta/operator-ca-bundle.pem
+  credentials:
+    newcomer: testdata/zta/certs/operator_leaf.der
+  zta_bindings:
+    newcomer: forged
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+    description: |
+        newcomer announces a chain-valid credential with a binding signed by the
+        wrong key. bg refuses the identity and does NOT propose.
+
+expected_state:
+  bg:
+    propose_emitted: 0
