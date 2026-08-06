@@ -53,6 +53,12 @@ struct net_transport_ctx_s {
     const network_config_t *net_cfg;
     logger_t *logger;
     bool ipv6;
+    /** This node's own address, exactly as derived for the recv binds in
+     *  udp_open_common / tcp_open_common. Cached at open so the send paths pin
+     *  the SAME string they listen on, and so cidr_split's strdup stays off the
+     *  per-send hot path. Empty when the address could not be derived, in which
+     *  case the send paths transmit unbound (the historical behavior). */
+    char local_addr[IPV6_ADDR_LEN];
 };
 
 /** Shared bind helper used by both UDP and TCP transports — opens a socket,
@@ -60,6 +66,31 @@ struct net_transport_ctx_s {
 int net_transport_ip_bind(const socket_cfg_t *cfg, const char *address,
                           int port, bool listen_sock, int *out_fd,
                           logger_t *logger);
+
+/** Pin an outbound socket's SOURCE address before it sends or connects.
+ *
+ *  AT binds its recv sockets to the node's configured address but historically
+ *  left the send sockets unbound, so the kernel chose the source from the route
+ *  to the destination. Any node with more than one candidate source address
+ *  (loopback aliases, multi-homed hosts, containers on several networks) then
+ *  transmitted from an address its peers do not hold in their listing, and
+ *  attribution -- which keys on the datagram's source -- missed every frame.
+ *  Mirrors Python's network/udp.py bind_source_address.
+ *
+ *  Always binds port 0 and NEVER sets SO_REUSEADDR: the recv sockets hold
+ *  (local_addr, comm_port) WITH SO_REUSEADDR, and the kernel grants a second
+ *  socket that same addr:port only when both set it -- so omitting it here is
+ *  precisely what stops autobind from selecting the port this node listens on.
+ *
+ *  @param stream  TCP: also sets IP_BIND_ADDRESS_NO_PORT where available, so
+ *                 pinning the ADDRESS does not reserve a port ahead of
+ *                 connect() and 4-tuple uniqueness is preserved.
+ *  @return 0 if the source was pinned, -1 otherwise. A failure is NOT fatal:
+ *          the caller should send anyway (losing attribution, as before) rather
+ *          than take the node off the air over a bad address.
+ */
+int net_transport_ip_bind_source(int sock, const char *address, int domain,
+                                 bool stream, logger_t *logger);
 
 /** Join a multicast group on an already-bound socket. */
 int net_transport_ip_join_mcast(int sock, bool ipv6, const char *mcast_address,

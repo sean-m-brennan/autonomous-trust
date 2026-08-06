@@ -96,6 +96,16 @@ static void set_env_port(const char *val)
     net_port_resolve_reset();
 }
 
+/* Best-effort scratch-directory cleanup. The status is deliberately ignored:
+ * these run before setup and after teardown, where a missing directory is the
+ * expected case, not a failure. Consume the return value rather than casting
+ * system() to void — gcc's warn_unused_result rejects a bare (void) cast. */
+static void shell_cleanup(const char *cmd)
+{
+    int status = system(cmd);
+    (void)status;
+}
+
 /* Open a UDP transport bound to `addr` on `base`. Returns the descriptor and
  * fills *out_ctx, or NULL on bind failure. net_cfg must outlive the ctx. */
 static const net_transport_t *open_udp(net_transport_ctx_t **out_ctx,
@@ -410,7 +420,7 @@ DEFINE_TEST(test_generator_writes_a_port_only_when_asked)
     char dir_asked[] = "/tmp/at_netport_gen_asked";
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "rm -rf %s %s", dir_unset, dir_asked);
-    (void)system(cmd);
+    shell_cleanup(cmd);
     ck_assert_ret_ok(mkdir(dir_unset, 0755));
     ck_assert_ret_ok(mkdir(dir_asked, 0755));
 
@@ -435,7 +445,7 @@ DEFINE_TEST(test_generator_writes_a_port_only_when_asked)
     ck_assert_int_eq(generated_port(dir_asked), 31234);
     set_env_port(NULL);
 
-    (void)system(cmd);
+    shell_cleanup(cmd);
 }
 END_TEST_DEFINITION()
 
@@ -500,7 +510,7 @@ DEFINE_TEST(test_ping_at_request_is_refused_on_its_own_selector)
      * directory has to exist. CREATE it rather than skipping when it is absent:
      * a skipped test here would report the refusal as verified when nothing ran. */
     static char root[] = "/tmp/at_netport_msg";
-    (void)system("rm -rf /tmp/at_netport_msg && mkdir -p /tmp/at_netport_msg/var/at");
+    shell_cleanup("rm -rf /tmp/at_netport_msg && mkdir -p /tmp/at_netport_msg/var/at");
     ck_assert_ret_ok(setenv("AUTONOMOUS_TRUST_ROOT", root, 1));
 
     static char q_name[] = "netport.pingreq";
@@ -546,7 +556,7 @@ DEFINE_TEST(test_ping_at_request_is_refused_on_its_own_selector)
     json_decref(parsed);
 
     messaging_close();
-    (void)system("rm -rf /tmp/at_netport_msg");
+    shell_cleanup("rm -rf /tmp/at_netport_msg");
 }
 END_TEST_DEFINITION()
 

@@ -156,18 +156,47 @@ int net_port_resolve(int cfg_port, net_port_source_t *src, logger_t *logger);
 */
 const char *net_port_source_name(net_port_source_t src);
 
+/**
+ * @brief Split a CIDR string into its address and prefix-length parts.
+ *
+ * The output lengths are EXPLICIT because callers legitimately differ: the IPv4
+ * helpers pass @c char[IPV4_ADDR_LEN] (16) while the IPv6 helper and both socket
+ * transports pass @c char[IPV6_ADDR_LEN] (46). This used to be a hard-coded
+ * @c snprintf(addr, IPV4_ADDR_LEN, ...) plus @c snprintf(mask, 3, ...), which
+ * silently truncated every IPv6 input -- measured: a 38-char address became 15
+ * chars and a "/128" prefix became "12", and because the prefix 12 passes the
+ * family sanity check, @ref cidr6_to_ip6_binary returned SUCCESS with the wrong
+ * mask. Widening the hard-coded length was not an option: it would have
+ * overflowed the 16-byte callers.
+ *
+ * Truncation is an ERROR (@ref ENET_ADDR_TOO_LONG), not a silent shortening. A
+ * truncated address or prefix is not a usable approximation of anything.
+ *
+ * @param[in]  cidr      "address" or "address/prefix"; not modified.
+ * @param[out] addr      Receives the address part, always NUL-terminated.
+ * @param[in]  addr_len  sizeof the @p addr buffer; must be non-zero.
+ * @param[out] mask      Receives the prefix digits, or untouched when @p cidr
+ *                       carries no '/' (a missing prefix is acceptable). May be
+ *                       NULL to discard.
+ * @param[in]  mask_len  sizeof the @p mask buffer; ignored when @p mask is NULL.
+ *                       Must be >= 4 to represent an IPv6 "128".
+ * @return 0 on success, non-zero on a NULL/empty input, a zero-length buffer, or
+ *         truncation of either field.
+ */
 /*@
   requires cidr != \null && \valid_read(cidr);
-  requires addr != \null && \valid(addr + (0 .. IPV4_ADDR_LEN - 1));
-  requires mask == \null || \valid(mask + (0 .. 2));
-  assigns addr[0 .. IPV4_ADDR_LEN - 1];
+  requires addr != \null && \valid(addr + (0 .. addr_len - 1));
+  requires addr_len > 0;
+  requires mask == \null || \valid(mask + (0 .. mask_len - 1));
+  assigns addr[0 .. addr_len - 1];
   behavior success:
     ensures \result == 0;
   behavior failure:
     ensures \result != 0;
   disjoint behaviors;
 */
-int cidr_split(char * cidr, char *addr, char *mask);
+int cidr_split(char *cidr, char *addr, size_t addr_len,
+               char *mask, size_t mask_len);
 
 /*@
   requires cidr != \null && \valid_read(cidr);
@@ -244,6 +273,8 @@ int network_from_json(const json_t *obj, void *data_struct);
 
 #define ENET_INVALID_MASK 220
 DECLARE_ERROR(ENET_INVALID_MASK, "CIDR prefix length exceeds maximum for address family");
+#define ENET_ADDR_TOO_LONG 221
+DECLARE_ERROR(ENET_ADDR_TOO_LONG, "CIDR address or prefix does not fit the caller's buffer");
 
 
 /** @} */ /* end of internal_network */

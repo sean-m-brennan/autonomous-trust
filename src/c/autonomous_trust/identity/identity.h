@@ -422,6 +422,27 @@ int proto_to_peer(uint8_t *data, size_t len, public_identity_t *peer);
 */
 void identity_free(identity_t *ident);
 
+/**
+ * @brief Is @p verb one this protocol legitimately sends in PLAINTEXT?
+ *
+ * The point-to-point receive path attributes a frame by source address and then
+ * decrypts it, so once a peer is in the peer table every frame from it takes the
+ * decrypt branch. Verbs sent with encrypt=false by design cannot be decrypted,
+ * and were therefore dropped AND annoy-tracked toward blacklisting. This
+ * predicate bounds the plaintext fallback to named verbs, so a peer already in
+ * the table cannot downgrade an arbitrary message to plaintext and have it
+ * honored. Mirrors Python's identity.protocol.UNENCRYPTED_VERBS.
+ *
+ * Receive-side policy, so it covers every verb a PEER may legitimately send
+ * unencrypted, including ones this implementation never sends itself.
+ *
+ * MAINTENANCE: adding an encrypt=false send REQUIRES adding its verb to the
+ * table in id_proc.c, on both sides of the language boundary.
+ *
+ * @param verb Wire function selector; NULL is safe and returns false.
+ */
+bool identity_verb_is_unencrypted(const char *verb);
+
 
 /** @} */ /* end of internal_identity */
 

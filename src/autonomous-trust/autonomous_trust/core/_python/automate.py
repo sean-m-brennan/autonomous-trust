@@ -145,10 +145,23 @@ class AutonomousTrust(Protocol):
         handlers = []
         if not silent:
             handlers.append(logging.StreamHandler(sys.stdout))
-        if logfile != Configuration.log_stdout:
+        if logfile == Configuration.log_stderr:
+            # Explicit stderr destination, honored REGARDLESS of `silent`.
+            # `silent` governs user-facing console chatter (see self.print);
+            # naming a destination governs where logs go. Keeping the two
+            # separate is the point of this sentinel -- without it, a caller
+            # that wants a quiet console and a debug trace has no way to ask.
+            handlers.append(logging.StreamHandler(sys.stderr))
+        elif logfile != Configuration.log_stdout:
             os.makedirs(os.path.dirname(logfile), exist_ok=True)
             handlers.append(TimedRotatingFileHandler(logfile, when="midnight", interval=1, backupCount=5))
         if not handlers:
+            # Reachable only via silent=True + logfile=log_stdout, i.e. "keep the
+            # console quiet" AND "log to the console" -- a contradiction, resolved
+            # by discarding. NOTE: log_level is INERT in this mode; no level makes
+            # anything appear. Pass logfile=Configuration.log_stderr (or a real
+            # file) if you want the logs. Many tests/a_unit/test_automate.py cases
+            # rely on this staying quiet, so the discard is deliberate, not a bug.
             handlers.append(logging.NullHandler())
         for handler in handlers:
             handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d - %(levelname)s %(message)s',
@@ -960,7 +973,18 @@ class AutonomousTrust(Protocol):
         for key in list(results.keys()):
             if results[key].ready():
                 if key in list(self.process_names):
+                    # A long-running process is not supposed to return at all,
+                    # so this stays an error -- but report it ONCE. The entry
+                    # remains ready() forever, so continuing without dropping
+                    # it re-logged the same line on every main-loop pass
+                    # (Process.cadence, 2 Hz) for the rest of the run.
+                    # _monitor_processes runs earlier in the same iteration, so
+                    # any exception traceback is already on the record; a clean
+                    # return leaves no traceback and only this line.
                     self.logger.error('unexpected termination of process %s' % key)
+                    if key not in self._stopped_procs:
+                        self._stopped_procs.append(key)
+                    del results[key]
                     continue
                 try:
                     self.logger.debug(self.name + ': %s Task' % key)

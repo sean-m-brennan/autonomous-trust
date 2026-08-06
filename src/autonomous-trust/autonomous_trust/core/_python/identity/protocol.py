@@ -153,6 +153,37 @@ class IdentityProtocol(Protocol):
     operator_state_resp = 'operator_state_response'  # msg.obj <- json {'attended', 'epoch', 'have_session'}
 
 
+# Verbs this implementation legitimately puts on the wire in PLAINTEXT
+# (`Message(..., encrypt=False)`), and the only ones a receiver will accept
+# unencrypted from a peer it already knows.
+#
+# Why an allowlist exists at all: the point-to-point receive path attributes a
+# frame by source address, then decrypts. Once a peer is in the listing, every
+# frame from it takes the decrypt branch -- so a plaintext handshake verb, which
+# by design cannot be decrypted, was dropped (netprocess.py, and measured: it
+# cost 3-peer convergence). The unknown-sender branch has always tried a
+# plaintext parse first, so plaintext acceptance is not new; what is new is
+# bounding it to named verbs instead of extending it to anything a known peer
+# sends. A peer in the listing must not be able to downgrade, say, a reputation
+# or negotiation message to plaintext and have it honored.
+#
+# MAINTENANCE: adding an `encrypt=False` send REQUIRES adding its verb here, or
+# the receiver will drop it once the peer is known -- silently, on a path that
+# only shows up in multi-peer convergence. test_unencrypted_verbs.py pins the
+# set against the identity process's actual send sites.
+UNENCRYPTED_VERBS = frozenset({
+    IdentityProtocol.announce,           # request_access, pre-admission broadcast
+    IdentityProtocol.accept,             # access_granted, sent before the key lands
+    IdentityProtocol.id_query,           # identity backfill, both directions
+    IdentityProtocol.id_response,
+    IdentityProtocol.attest_req,         # operator-attended pull / answer
+    IdentityProtocol.attest_resp,
+    IdentityProtocol.roster_resp,        # subtree roster answer
+    IdentityProtocol.partition_probe,    # partition recovery, by definition
+    IdentityProtocol.partition_response, # spans a group-key boundary
+})
+
+
 if __name__ == '__main__':
     import napkin
 

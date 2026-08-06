@@ -45,7 +45,42 @@ Options:
   --c                 C harness only (skip Python).
   --python            Python harness only (skip C).
   --strict-coverage   Also fail on coverage gaps.
+  --no-clean          Reuse the C build dir incrementally instead of wiping it
+                      first. Faster, but see the corruption note below.
   -h, --help          Show this help message and exit.
+
+Environment:
+  AT_CONFORMANCE_BUILD_DIR   Where to build the C harness. Default is
+                             src/c/build-zta (or src/c/build without OpenSSL).
+                             Point this at a non-virtiofs filesystem -- e.g.
+                             /tmp/at-conformance-build -- to avoid the object
+                             corruption described below. The results JSON is read
+                             from whichever directory is used, so overriding this
+                             keeps the cross-language diff consistent.
+  CONFORMANCE_NO_CLEAN=1     Same as --no-clean.
+  CONFORMANCE_SKIP_TOX=1     Run pytest directly in the active env, no tox.
+
+Why the C build dir is wiped by default: on this VM's virtiofs-backed repo mount,
+gcc intermittently writes objects whose ELF is structurally valid but whose symbol
+table is wrong -- measured twice in one sitting, as `capabilities.c.o` defining a
+symbol ABSOLUTE at 0 instead of in .text, and `adapters/network.c.o` carrying no
+symbols at all. Both surfaced only as a confusing link failure naming an innocent
+file, and AT_CC_VALIDATE_OUTPUT's launcher did NOT catch either (it flagged a
+different object in the same run). Incremental builds keep such an object forever,
+so the default is to start clean; use --no-clean when iterating and you are
+prepared to diagnose a bad object by hand (nm the archive for the symbol the linker
+calls missing).
+
+Why the cross-language diff can refuse to run: the python side is read from the
+newest src/autonomous-trust/conformance/results/python-*.json, and that directory
+keeps every historical result. If the python harness dies before writing its JSON
+(a missing dep or a pytest collection error will do it), the newest file is a
+PREVIOUS run's -- and diffing against it prints "0 asymmetric", which reads as
+cross-language agreement from a run that never happened. Measured 2026-08-06
+against a file 44 minutes old. So when the python harness runs, its results must
+be newer than the run; otherwise the diff refuses and the summary says symmetry is
+UNKNOWN rather than confirmed. With --c the python harness is deliberately skipped,
+so a previous run's file is accepted and its age is printed.
 
 All non-flag arguments are forwarded to pytest. Flags consumed by this script
 must come before any pytest args; use '--' to force everything after it to
@@ -56,6 +91,10 @@ EOF
 run_c=1
 c_only=0
 strict_coverage=0
+# Wipe the C build dir before building. Default ON; see the usage text for the
+# virtiofs object-corruption measurement that justifies it.
+clean_build=${CONFORMANCE_NO_CLEAN:+0}
+clean_build=${clean_build:-1}
 pytest_args=()
 
 while (("$#")); do
@@ -78,6 +117,10 @@ while (("$#")); do
       strict_coverage=1
       shift
       ;;
+    --no-clean)
+      clean_build=0
+      shift
+      ;;
     --)
       shift
       pytest_args+=("$@")
@@ -91,6 +134,13 @@ while (("$#")); do
 done
 
 py_dir="$here/src/autonomous-trust"
+
+# Touched immediately before the Python harness runs, so run_diff can tell a
+# results JSON this invocation produced from one left behind by an earlier run.
+# Empty when the Python harness was skipped (--c). See run_diff.
+py_run_marker=""
+cleanup_marker() { [[ -n "$py_run_marker" ]] && rm -f "$py_run_marker"; return 0; }
+trap cleanup_marker EXIT
 
 # ---------------------------------------------------------------------------
 # Python harness
@@ -149,13 +199,31 @@ run_c_harness() {
   # unpinned on this side.
   local cmake_zta_arg=""
   local build_dir
+  local have_openssl=0
   if pkg-config --exists openssl 2>/dev/null \
      || [[ -f /usr/include/openssl/ssl.h ]]; then
-    build_dir="$c_dir/build-zta"
+    have_openssl=1
     cmake_zta_arg="-DAT_ZTA=ON"
   else
     echo "OpenSSL not found; building C conformance without AT_ZTA " \
          "(zta-x509-* scenarios will skip on the C side)." >&2
+  fi
+
+  # AT_CONFORMANCE_BUILD_DIR relocates the build, most usefully OFF the
+  # virtiofs repo mount (see the corruption note in --help). The ZTA decision
+  # above is independent of WHERE we build, so an override still gets
+  # -DAT_ZTA=ON when OpenSSL is available -- otherwise pointing the build
+  # elsewhere would silently drop the zta-* pins.
+  if [[ -n "${AT_CONFORMANCE_BUILD_DIR:-}" ]]; then
+    build_dir="$AT_CONFORMANCE_BUILD_DIR"
+    # Absolute, because the build is driven from inside the directory and a
+    # relative path would resolve against the wrong cwd.
+    mkdir -p "$build_dir"
+    build_dir=$(cd -- "$build_dir" && pwd)
+    echo "Using C build dir from AT_CONFORMANCE_BUILD_DIR: $build_dir" >&2
+  elif (( have_openssl )); then
+    build_dir="$c_dir/build-zta"
+  else
     build_dir="$c_dir/build"
   fi
   c_build_dir="$build_dir"
@@ -183,17 +251,41 @@ run_c_harness() {
     fi
   fi
 
+  # Clean before build, by default.
+  #
+  # This used to reuse the build dir unconditionally, on the reasoning that the
+  # AT_CC_VALIDATE_OUTPUT compiler launcher (src/c/CMakeLists.txt) handles the
+  # virtiofs write hazard that had previously forced a wipe every run. Measured
+  # 2026-08-06: it does not handle every shape. Two runs in one sitting linked
+  # against objects whose ELF was structurally valid but whose symbol table was
+  # not -- `capabilities.c.o` defining find_capability ABSOLUTE at 0 rather than
+  # in .text, and `adapters/network.c.o` with no symbols at all, so
+  # at_network_run came out undefined. The launcher flagged a THIRD file
+  # (logger.c.o) in the same run and passed both of those. An incremental build
+  # keeps such an object indefinitely, and the failure presents as a link error
+  # naming an innocent file, which is expensive to diagnose. Starting clean costs
+  # a full compile and removes the whole class.
+  #
+  # --no-clean / CONFORMANCE_NO_CLEAN=1 opts out for fast iteration. If you use
+  # it and hit "undefined reference" or "relocation against absolute symbol",
+  # suspect a corrupt object before suspecting the code: nm the ARCHIVE for the
+  # symbol, delete the offending .o plus lib*.a, and rebuild.
+  if (( clean_build )) && [[ -d "$build_dir" ]]; then
+    echo "Wiping $build_dir for a clean build (--no-clean to reuse) ..." >&2
+    rm -rf "$build_dir"
+  fi
+
   if [[ ! -d "$build_dir" ]]; then
     echo "Initializing C build dir at $build_dir ..." >&2
     mkdir -p "$build_dir"
-    (cd "$build_dir" && cmake .. $cmake_zta_arg)
+    # -S/-B rather than `cd $build_dir && cmake ..`: with
+    # AT_CONFORMANCE_BUILD_DIR pointing outside the source tree, ".." is not the
+    # source dir and cmake would configure whatever happens to be there.
+    cmake -S "$c_dir" -B "$build_dir" $cmake_zta_arg
   else
-    # Reuse existing build dir for incremental builds. The compiler launcher
-    # set up by AT_CC_VALIDATE_OUTPUT (see src/c/CMakeLists.txt) handles the
-    # virtiofs page-cache reconciliation hazard that previously forced us
-    # to wipe build/ on every run; refresh the cmake config in case CMake
-    # files changed since last run (and to apply/keep -DAT_ZTA).
-    (cd "$build_dir" && cmake .. $cmake_zta_arg) >/dev/null
+    # Reused dir (--no-clean): refresh the cmake config in case CMake files
+    # changed since last run, and to apply/keep -DAT_ZTA.
+    cmake -S "$c_dir" -B "$build_dir" $cmake_zta_arg >/dev/null
   fi
 
   echo "Building + running C conformance harness ..."
@@ -204,6 +296,20 @@ run_c_harness() {
 # Cross-language diff
 # ---------------------------------------------------------------------------
 
+# Human-readable age of a file, so a reused results JSON reports how old it is
+# rather than just its name.
+file_age() {
+  local f=$1 now mtime secs
+  now=$(date +%s)
+  mtime=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+  secs=$(( now - mtime ))
+  if   (( secs < 60 ));    then echo "${secs}s"
+  elif (( secs < 3600 ));  then echo "$(( secs / 60 ))m"
+  elif (( secs < 86400 )); then echo "$(( secs / 3600 ))h"
+  else                          echo "$(( secs / 86400 ))d"
+  fi
+}
+
 run_diff() {
   local py_result
   py_result=$(ls -1t "$py_dir"/conformance/results/python-*.json 2>/dev/null | head -n1 || true)
@@ -211,6 +317,37 @@ run_diff() {
     echo "diff: no python results JSON found under $py_dir/conformance/results/" >&2
     echo "diff: skipping (run without --c-only first to produce one)." >&2
     return 0
+  fi
+
+  # Staleness guard. `ls -1t | head -n1` picks the newest file by mtime, which is
+  # NOT necessarily one this run produced -- that directory accumulates every
+  # historical result (months of them). When the Python harness dies BEFORE
+  # writing its JSON, an unguarded diff compares C against a previous run's file
+  # and prints "0 asymmetric", which reads as cross-language agreement from a
+  # Python run that never happened.
+  #
+  # Measured 2026-08-06: a pytest collection error (missing `jcs` and `dateutil`)
+  # produced exactly that -- "0 asymmetric, only-python=0, only-c=0" against a
+  # file 44 minutes old. The summary NOTE below does not cover this case: it warns
+  # that agreement is not the same as passing, not that one side may be a fossil.
+  if [[ -n "$py_run_marker" ]]; then
+    # The Python harness ran this invocation, so it owes us a file newer than the
+    # marker. Anything older means it wrote nothing and we must not pretend.
+    if [[ ! "$py_result" -nt "$py_run_marker" ]]; then
+      echo "diff: REFUSING to diff. The python harness ran this invocation but"   >&2
+      echo "      produced no results JSON, so the newest one predates this run:" >&2
+      echo "      $py_result ($(file_age "$py_result") old)"                      >&2
+      echo "      Diffing against it would report agreement from a python run"    >&2
+      echo "      that did not happen. Fix the harness (see its output above),"   >&2
+      echo "      or use --c to diff deliberately against previous results."      >&2
+      diff_refused=1
+      return 1
+    fi
+  else
+    # --c: reusing an earlier run's python results is the documented intent here,
+    # so allow it -- but name the file and its age so it cannot pass for fresh.
+    echo "diff: --c given, so the python side is a PREVIOUS run's results:" >&2
+    echo "      $py_result ($(file_age "$py_result") old)"                  >&2
   fi
 
   local c_result="${c_build_dir:-$here/src/c/build}/conformance/results/c-latest.json"
@@ -246,8 +383,15 @@ run_diff() {
 py_rc=0
 c_rc=0
 diff_rc=0
+# Set by run_diff when it declines to compare because the python results were not
+# produced by this run. Distinguished from a real asymmetry in the summary.
+diff_refused=0
 
 if (( ! c_only )); then
+  # Stamp BEFORE the harness starts: run_diff requires the results JSON it
+  # consumes to be newer than this, which is what proves the file came from this
+  # run rather than from the pile of historical ones.
+  py_run_marker=$(mktemp -t conformance-pyrun.XXXXXX)
   set +e
   run_python
   py_rc=$?
@@ -273,9 +417,14 @@ echo "==== conformance summary ===="
 (( ! c_only )) && echo "  python harness : rc=$py_rc"
 if (( run_c )); then
   echo "  c harness      : rc=$c_rc"
-  echo "  asymmetry diff : rc=$diff_rc   (0 = 0 asymmetric pass/fail)"
+  if (( diff_refused )); then
+    echo "  asymmetry diff : NOT RUN -- refused, python results were not from this run"
+    echo "                   (so symmetry is UNKNOWN, not confirmed)"
+  else
+    echo "  asymmetry diff : rc=$diff_rc   (0 = 0 asymmetric pass/fail)"
+  fi
 fi
-if (( py_rc != 0 || c_rc != 0 )); then
+if (( py_rc != 0 || c_rc != 0 )) && (( ! diff_refused )); then
   echo "  NOTE: a harness had failing cases; 'asymmetry diff rc=0' means the two" >&2
   echo "        sides AGREE per case, NOT that every case passed. Check the rc"  >&2
   echo "        lines above for actual pass/fail." >&2

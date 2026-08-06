@@ -128,6 +128,43 @@ static char ID_ROSTER_RESPONSE[] = "subtree_roster_response";
 static char ID_ATTEST_QUERY[]    = "operator_attest_query";
 static char ID_ATTEST_RESPONSE[] = "operator_attest_response";
 
+/* Verbs this protocol legitimately puts on the wire in PLAINTEXT
+ * (Message encrypt=false), and the only ones a receiver accepts unencrypted
+ * from a peer it already knows. Mirrors Python's
+ * identity.protocol.UNENCRYPTED_VERBS one-for-one -- the two lists are a
+ * cross-language contract, so a change here needs the same change there.
+ *
+ * Kept beside the verb table on purpose: this is the one place that already
+ * owns these strings, so drift is visible in a single screen.
+ *
+ * ID_ANNOUNCE / ID_ACCEPT are pre-key handshake. The identity-backfill and
+ * partition pair span a group-key boundary by definition. The roster and
+ * attest responses are sent plaintext by the Python side even where this
+ * implementation does not originate them -- this is a RECEIVE policy. */
+static char *const ID_UNENCRYPTED_VERBS[] = {
+    ID_ANNOUNCE,            /* request_access */
+    ID_ACCEPT,              /* access_granted -- the verb measured being dropped */
+    ID_IDENTITY_QUERY,      /* peer_identity_query */
+    ID_IDENTITY_RESPONSE,   /* peer_identity_response */
+    ID_ATTEST_QUERY,        /* operator_attest_query */
+    ID_ATTEST_RESPONSE,     /* operator_attest_response */
+    ID_ROSTER_RESPONSE,     /* subtree_roster_response */
+    ID_PARTITION_PROBE,     /* group_partition_probe */
+    ID_PARTITION_RESPONSE,  /* group_partition_response */
+};
+
+bool identity_verb_is_unencrypted(const char *verb)
+{
+    if (verb == NULL)
+        return false;
+    size_t n = sizeof(ID_UNENCRYPTED_VERBS) / sizeof(ID_UNENCRYPTED_VERBS[0]);
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(verb, ID_UNENCRYPTED_VERBS[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
 /****************************
  * Process state (file-scope static, thread-safe via mutex)
  ****************************/
