@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <sys/wait.h>
+#include <errno.h>
 
 #include "processes/processes.h"
 #include "utilities/exception.h"
@@ -84,6 +85,24 @@ int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
         pid_t gchild = -1;
         (void)!read(io[0], &gchild, sizeof(int));
         close(io[0]);
+        /* Reap the intermediate. It _exit(0)s immediately after writing the pid
+         * we just read, so this cannot block for any meaningful time — and
+         * without it every daemonize() leaks a zombie for the caller's whole
+         * lifetime. A running node accumulated ten (one per subsystem plus the
+         * daemon's own), and they are not merely untidy: a zombie still answers
+         * `kill(pid, 0) == 0`, so any liveness check that happens to be pointed
+         * at one silently reports it alive forever.
+         *
+         * That is NOT what caused ISSUES §2.1.3 — the pids this daemon monitors
+         * are the grandchildren returned through the pipe, never these
+         * intermediates, so the shutdown sweep was reading real processes. Fixed
+         * here because it is a genuine leak found while investigating, not
+         * because it explains that symptom. Retried on EINTR, since a signal
+         * arriving mid-wait would otherwise leave the corpse behind. */
+        if (pid > 0) {
+            int wrc;
+            do { wrc = waitpid(pid, NULL, 0); } while (wrc < 0 && errno == EINTR);
+        }
         if (gchild < 0)
             return EXCEPTION(abs(gchild));
         return gchild;
