@@ -26,6 +26,24 @@ message Signature {
   bytes hex_seed = 1;
 }
 
+// One ZTA credential and the proof that this node may present it.
+//
+// A node carries ONE; several arise only at a network gateway bridging agencies,
+// which needs one per agency it bridges. `binding` is a signature by the
+// credential's own private key over
+//   "at-zta-binding-v1" || uuid(16) || node signing key(32) || sha256(der)(32)
+// (identity/zta_binding.py). Because the pre-image names the node, a harvested
+// (der, binding) pair cannot be re-presented under another identity -- which is
+// what closes the first-use-wins hole in ISSUES §1.5. It may be empty: a
+// certificate whose SAN already names the node is bound by its issuer instead,
+// and a deployment mid-migration may not have provisioned one yet (see the
+// zta_policy binding_mode).
+message ZtaCredential {
+  bytes der = 1;       // raw credential (X.509 DER)
+  bytes binding = 2;   // holder-asserted binding signature; may be empty
+  string issuer = 3;   // issuer/anchor label, advisory only — never trusted
+}
+
 message Identity {
   bytes uuid = 1;
   string address = 2;
@@ -87,6 +105,11 @@ message Identity {
   // Not part of identity equality, like the zta_* fields above.
   bytes operator_pubkey = 14;      // opt-in: the guardian's ed25519 public key
   bytes operator_key_binding = 15; // opt-in: PIV signature binding it to this node
+  // The full credential set, including the primary above (so the primary normally
+  // appears twice — deduplicated by fingerprint on receipt). Fields 6/7/8 are kept
+  // as the primary so a peer predating this field interoperates unchanged, and they
+  // have nowhere to carry a binding, which is the other reason this exists.
+  repeated ZtaCredential zta_credentials = 16;
 }
 
 message Group {

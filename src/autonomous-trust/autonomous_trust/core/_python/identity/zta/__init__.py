@@ -23,9 +23,12 @@ from .zta_verifier import (ZtaStatus, ZtaResult, Verifier, NullVerifier,
 from .mfa import MfaChain, CombinePolicy, MfaCredential
 from .totp import (TotpVerifier, generate_totp_secret, totp_provisioning_uri,
                    totp_now)
-from .zta_policy import ZtaPolicy
+from .zta_policy import (ZtaPolicy, BINDING_MODES, BINDING_MODE_OFF,
+                         BINDING_MODE_PREFER, BINDING_MODE_REQUIRE)
 
 __all__ = ['ZtaStatus', 'ZtaResult', 'Verifier', 'NullVerifier', 'OidcVerifier',
            'X509Verifier', 'MfaChain', 'CombinePolicy', 'MfaCredential',
            'TotpVerifier', 'generate_totp_secret', 'totp_provisioning_uri',
-           'totp_now', 'ZtaPolicy', 'ZTA_HASH_LEN', 'ZTA_CRED_MAX']
+           'totp_now', 'ZtaPolicy', 'ZTA_HASH_LEN', 'ZTA_CRED_MAX',
+           'BINDING_MODES', 'BINDING_MODE_OFF', 'BINDING_MODE_PREFER',
+           'BINDING_MODE_REQUIRE']

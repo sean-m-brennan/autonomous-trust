@@ -418,11 +418,16 @@ The demo creates:
 ## 15. Open design questions
 
 1. **Retroactive reputation adjustment.** When a peer operates for an extended period without ZTA verification and then verification fails, how far back should reputation be unwound? The current implementation applies a single penalty at detection time; historical unwinding is not yet implemented.
-2. **Multi-operator ZTA.** In coalition/multi-agency scenarios (LunaNet, joint ops), peers may have certs from different CAs. The verifier interface supports this in principle (multiple CA bundles), but cross-certification verification and CA trust negotiation are not yet implemented.
-Both are design directions rather than scoped work, and are recorded in
-[`ISSUES.md`](../../ISSUES.md) §10.5.
+2. **Multi-operator ZTA — answered 2026-08-06, both runtimes.** In coalition/multi-agency scenarios (LunaNet, joint ops), peers may have certs from different CAs. The ZTA policy now names trust anchors explicitly and an identity carries a repeated `ZtaCredential{der, binding, issuer}` (proto field 16), so admission is *any-of* across configured anchors and each verified credential earns authority for its own anchor (`zta_anchors` — the observer's finding, never serialized). Group federation then requires a *proved* shared anchor rather than a declared gateway role — gatewayhood is emergent in AT, so a declared rule would rest on the peer's own claim and an attacker would simply decline to claim.
 
-The integration is not C-only: the Python identity process (`idprocess.py`) performs ZTA checks at admission time (`_zta_admit`, gated in `welcoming_committee`), with X.509 verification, DDIL reputation capping, and wire-level credential binding at parity with C. See [ZTA Python Parity](zta-python-parity.md) for that implementation and for the features that are C-only (background re-verification process, audit log, delegated verification).
+   What the question above got wrong is the assumption that this needs cross-certification or CA trust negotiation. It needs neither: nothing has to make two CAs recognize each other, only make *this node* recognize both, and a holder-asserted binding (§1.5) lets a foreign CA's credential bind to an AT identity without that CA knowing AT exists. Coalition deployment is in fact what forces the holder-asserted route — a foreign CA will not put an AT uuid in a SAN, so the CA-asserted route is unavailable exactly where coalitions need it.
+
+Item 1 remains a design direction rather than scoped work, recorded in
+[`ISSUES.md`](../../ISSUES.md) §10.5. Item 2 is closed in both runtimes (§1.5).
+
+The integration is not C-only: the Python identity process (`idprocess.py`) performs ZTA checks at admission time (`_zta_admit`, gated in `welcoming_committee`), with X.509 verification, DDIL reputation capping, and wire-level credential carriage at parity with C. See [ZTA Python Parity](zta-python-parity.md) for that implementation and for the features that are C-only (background re-verification process, audit log, delegated verification).
+
+**As of 2026-08-06 the credential→identity *binding* gate, named trust anchors, multi-credential admission, and derived gateway authority exist in BOTH runtimes** (ISSUES §1.5), pinned by 168/168 conformance cases with 0 asymmetric. `binding_mode: require` is therefore a fleet-wide guarantee rather than a per-runtime one: a C `welcoming_committee` and a Python one refuse the same credentials. The C side is a mirror, not a reimplementation — `zta/zta_binding.{h,c}`, `identity.c::zta_binding_preimage`, `zta_policy_t.anchors`/`binding_mode`/`san_uri_template`, a repeated-credential list on `public_identity_t` (proto field 16), `id_proc.c::_zta_admit`, and `_gateway_authorized`.
 
 ---
 

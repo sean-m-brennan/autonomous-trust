@@ -143,6 +143,45 @@ out:
     return ok;
 }
 
+/* Frama-C: skipped — [syscall] OpenSSL SAN extension parsing */
+bool x509_cert_has_uri_san(const uint8_t *cert_der, size_t cert_len,
+                           const char *uri)
+{
+    if (cert_der == NULL || cert_len == 0 || uri == NULL || uri[0] == '\0')
+        return false;
+    X509 *cert = parse_cert(cert_der, cert_len);
+    if (cert == NULL)
+        return false;
+
+    bool found = false;
+    GENERAL_NAMES *names = X509_get_ext_d2i(cert, NID_subject_alt_name,
+                                            NULL, NULL);
+    if (names != NULL) {
+        int n = sk_GENERAL_NAME_num(names);
+        for (int i = 0; i < n && !found; i++) {
+            const GENERAL_NAME *gn = sk_GENERAL_NAME_value(names, i);
+            if (gn == NULL || gn->type != GEN_URI)
+                continue;
+            const unsigned char *val = ASN1_STRING_get0_data(
+                gn->d.uniformResourceIdentifier);
+            int val_len = ASN1_STRING_length(gn->d.uniformResourceIdentifier);
+            if (val == NULL || val_len <= 0)
+                continue;
+            /* Length-checked rather than strcasecmp: an ASN1_STRING is not
+             * required to be NUL-terminated, and one containing an embedded NUL
+             * would otherwise compare equal on its prefix — the classic way a
+             * SAN check is defeated. */
+            if ((size_t)val_len != strlen(uri))
+                continue;
+            if (strncasecmp((const char *)val, uri, (size_t)val_len) == 0)
+                found = true;
+        }
+        GENERAL_NAMES_free(names);
+    }
+    X509_free(cert);
+    return found;
+}
+
 /**
  * @brief Compute SHA-256 of a DER-encoded certificate
  */

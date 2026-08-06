@@ -32,7 +32,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -76,16 +76,24 @@ def make_leaf_keypair(common_name: str,
                       ca_cert: x509.Certificate,
                       org: str = "AT Mission",
                       not_before: Optional[datetime.datetime] = None,
-                      not_after: Optional[datetime.datetime] = None
+                      not_after: Optional[datetime.datetime] = None,
+                      san_uris: Optional[Sequence[str]] = None
                       ) -> Tuple[ec.EllipticCurvePrivateKey, x509.Certificate]:
     """Mint a leaf cert for ``common_name`` and return ``(leaf_key, cert)``.
 
     The private key is required for PIV challenge-response (the operator console
     signs a nonce with it); `make_leaf_cert` drops it for the X.509-only path.
     Pass ``not_after`` in the past to mint an expired leaf.
+
+    ``san_uris`` adds URI subjectAltNames. Passing ``at://<uuid>`` is the
+    CA-asserted form of the credential->identity binding (SPIFFE-style): the issuer
+    vouches for which node may present the certificate, so no holder-signed binding
+    blob is needed. See `identity/zta_binding.py::san_binds_identity`. Only
+    meaningful for a CA whose issuance AT controls; a foreign agency CA will not
+    mint these, which is why the holder-asserted signature exists.
     """
     leaf_key = ec.generate_private_key(ec.SECP256R1())
-    cert = (
+    builder = (
         x509.CertificateBuilder()
         .subject_name(_name(common_name, org))
         .issuer_name(ca_cert.subject)
@@ -94,9 +102,13 @@ def make_leaf_keypair(common_name: str,
         .not_valid_before(not_before or _NOT_BEFORE)
         .not_valid_after(not_after or _NOT_AFTER)
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-        .sign(ca_key, hashes.SHA256())
     )
-    return leaf_key, cert
+    if san_uris:
+        builder = builder.add_extension(
+            x509.SubjectAlternativeName(
+                [x509.UniformResourceIdentifier(u) for u in san_uris]),
+            critical=False)
+    return leaf_key, builder.sign(ca_key, hashes.SHA256())
 
 
 def make_leaf_cert(common_name: str,
@@ -204,11 +216,28 @@ def provision(out_root: Path, peers: dict) -> None:
         cfg = out_root / peer / "etc" / "at"
         _write(cfg / "zta-ca-bundle.pem", bundle)
         if forgery:
+            # No private key is written for a forged credential, and that is the
+            # point: without it the peer cannot produce a credential->identity
+            # binding, so under `binding_mode: require` it is refused at the
+            # identity layer rather than merely flooring its reputation.
             cred = forged_credential(forgery, peer, rogue_ca=rogue_ca)
+            leaf_key = None
         else:
-            cred = cert_der(make_leaf_cert(peer, ca_key, ca_cert))
+            leaf_key, leaf_cert = make_leaf_keypair(peer, ca_key, ca_cert)
+            cred = cert_der(leaf_cert)
         if cred:
             _write(cfg / "zta_credential.der", cred)
+        if leaf_key is not None:
+            # The credential's PRIVATE key, which the node needs to sign its own
+            # binding once it has an identity. The binding cannot be produced here:
+            # its pre-image names the node's uuid and signing key, and neither exists
+            # until the node first runs (see participant._attach_zta_credential).
+            # This is also why a machine credential can self-bind and a PIV one
+            # cannot -- a card never surrenders its key.
+            _write(cfg / "zta_credential.key.pem", leaf_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption()))
         policy = {
             "__type__": "autonomous_trust.core._python.identity.zta.zta_policy.ZtaPolicy",
             "enabled": True,
@@ -217,6 +246,13 @@ def provision(out_root: Path, peers: dict) -> None:
             "ca_bundle_path": str(cfg / "zta-ca-bundle.pem"),
             "allow_ddil_fallback": True,
             "ddil_fallback_reputation_cap": 0.5,
+            # Explicit rather than relying on the default, because it is the
+            # consequential setting here: a chain-valid credential with no proof that
+            # THIS node may present it is refused (ISSUES §1.5). Legitimate peers get
+            # a private key above and self-bind on first run; the forged ones cannot,
+            # so they are rejected at the identity layer. Set "prefer" to admit
+            # unbound credentials with a reputation cap during a migration.
+            "binding_mode": "require",
         }
         (cfg / "zta_policy.cfg.json").write_text(json.dumps(policy, indent=2) + "\n")
 

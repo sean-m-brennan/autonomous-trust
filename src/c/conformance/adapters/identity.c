@@ -50,6 +50,7 @@
 #include <openssl/evp.h>              /* scenario-time operator-binding signing */
 #include <openssl/pem.h>
 #include "zta/zta_policy.h"           /* zta_policy_t / defaults / from_json */
+#include "zta/zta_binding.h"          /* credential->identity binding (ISSUES §1.5) */
 #endif
 #include "network/net_message.h"
 #include "processes/processes.h"
@@ -430,6 +431,77 @@ out:
     return rc;
 }
 
+/* Mint a credential->identity binding for a scenario participant (ISSUES §1.5).
+ * C twin of the Python adapter's _scenario_zta_binding, variant for variant:
+ *
+ *   "valid"          signed by the leaf whose certificate the peer presents
+ *   "forged"         signed by an unrelated key — somebody tried to prove
+ *                    entitlement and could not
+ *   "other-identity" correctly signed by the real leaf but over a pre-image
+ *                    naming a DIFFERENT node: the harvested credential, and the
+ *                    case the binding exists to stop
+ *
+ * The binding is written into the peer's credential LIST rather than a singular
+ * field, because proto fields 6-8 have nowhere to carry one — which is the whole
+ * reason field 16 exists. */
+static int _scenario_zta_binding(const char *root, const char *variant,
+                                 public_identity_t *pub)
+{
+    if (root == NULL || variant == NULL || pub == NULL
+        || pub->zta_credential == NULL || pub->zta_credential_len == 0)
+        return -1;
+
+    public_identity_t bind_to = *pub;
+    if (strcmp(variant, "other-identity") == 0)
+        for (size_t i = 0; i < UUID_LEN; i++)
+            bind_to.uuid[i] = (uint8_t)((pub->uuid[i] + 1) % 256);
+
+    uint8_t preimage[ZTA_BINDING_PREIMAGE_LEN];
+    if (zta_binding_preimage(&bind_to, pub->zta_credential,
+                             pub->zta_credential_len, preimage) != 0)
+        return -1;
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/testdata/zta/certs/%s", root,
+             strcmp(variant, "forged") == 0 ? "impostor_leaf.key"
+                                            : "operator_leaf.key");
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL)
+        return -1;
+    EVP_PKEY *priv = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
+    fclose(fp);
+    if (priv == NULL)
+        return -1;
+
+    int rc = -1;
+    uint8_t *sig = NULL;
+    size_t siglen = 0;
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (ctx == NULL)
+        goto out;
+    if (EVP_DigestSignInit(ctx, NULL, EVP_sha256(), NULL, priv) != 1)
+        goto out;
+    if (EVP_DigestSign(ctx, NULL, &siglen, preimage, sizeof(preimage)) != 1)
+        goto out;
+    sig = malloc(siglen);
+    if (sig == NULL)
+        goto out;
+    if (EVP_DigestSign(ctx, sig, &siglen, preimage, sizeof(preimage)) != 1)
+        goto out;
+
+    public_identity_zta_credentials_clear(pub);
+    rc = public_identity_add_zta_credential(pub, pub->zta_credential,
+                                            pub->zta_credential_len,
+                                            sig, siglen, pub->zta_issuer);
+
+out:
+    free(sig);
+    if (ctx != NULL)
+        EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(priv);
+    return rc;
+}
+
 /* ZTA fixtures (zta-x509-* scenarios). Mirrors the Python adapter:
  *   fixtures.zta_policy   -> a zta_policy_t in each participant's
  *                            proc->configs["zta_policy"] (object_ptr_data
@@ -467,6 +539,23 @@ static void _apply_zta_fixtures(sce_run_ctx_t *ctx, json_t *fixtures) {
             ic_impl_t *impl = (ic_impl_t *)p->impl;
             impl->pub->zta_credential = buf;
             impl->pub->zta_credential_len = (size_t)n;
+            /* Also onto the participant's OWN identity (proc->configs
+             * ["identity"]), not just the published copy it announces with. A
+             * node's credential belongs to its identity; `pub` is a copy of it.
+             * The gate's replay check reads the self identity to answer "is our
+             * own credential being worn by somebody else", so without this the C
+             * side could not see its own credential and would diverge from
+             * Python, whose adapter uses ONE Identity object for both roles.
+             * Pinned by zta-credential-replay-different-identity. */
+            if (impl->full != NULL) {
+                uint8_t *own = malloc((size_t)n);
+                if (own != NULL) {
+                    memcpy(own, buf, (size_t)n);
+                    free(impl->full->zta_credential);
+                    impl->full->zta_credential = own;
+                    impl->full->zta_credential_len = (size_t)n;
+                }
+            }
         }
     }
 
@@ -519,6 +608,31 @@ static void _apply_zta_fixtures(sce_run_ctx_t *ctx, json_t *fixtures) {
         }
     }
 
+    /* The credential->identity binding. Runs AFTER the credentials loop above
+     * because it signs over the credential attached there. Same fatal-not-skipped
+     * rule as the operator binding: a skipped mint would leave the participant
+     * unbound, which is exactly the expected outcome of the reject cases, so they
+     * would pass vacuously. */
+    json_t *zbinds = json_object_get(fixtures, "zta_bindings");
+    if (json_is_object(zbinds) && root != NULL) {
+        const char *pid; json_t *bv;
+        json_object_foreach(zbinds, pid, bv) {
+            if (!json_is_string(bv)) continue;
+            sce_participant_t *p = sce_find_participant(ctx, pid);
+            if (p == NULL) continue;
+            ic_impl_t *impl = (ic_impl_t *)p->impl;
+            if (_scenario_zta_binding(root, json_string_value(bv),
+                                      impl->pub) != 0) {
+                fprintf(stderr,
+                        "conformance: %s: cannot mint ZTA binding '%s' "
+                        "(missing testdata/zta/certs key?) — aborting rather "
+                        "than running a scenario that would pass vacuously\n",
+                        pid, json_string_value(bv));
+                exit(2);
+            }
+        }
+    }
+
     json_t *zp = json_object_get(fixtures, "zta_policy");
     if (json_is_object(zp)) {
         for (size_t i = 0; i < ctx->participant_count; i++) {
@@ -563,6 +677,19 @@ static void _apply_zta_fixtures(sce_run_ctx_t *ctx, json_t *fixtures) {
                 snprintf(pol->operator_ca_bundle_path,
                          sizeof(pol->operator_ca_bundle_path),
                          "%.*s", (int)(sizeof(pol->operator_ca_bundle_path) - 1), abs);
+            }
+            /* And the NAMED anchors, each carrying its own bundle path. Easy to
+             * miss, and the failure is quiet: an anchor whose bundle will not
+             * load verifies nothing, so the peer is simply not admitted and the
+             * scenario reads as a policy disagreement rather than a path bug.
+             * Mirrors the Python adapter. */
+            for (size_t ai = 0; root != NULL && ai < pol->num_anchors; ai++) {
+                char *p = pol->anchors[ai].ca_bundle_path;
+                if (p[0] == '\0' || p[0] == '/')
+                    continue;
+                char abs[1024];
+                snprintf(abs, sizeof(abs), "%.700s/%.255s", root, p);
+                snprintf(p, ZTA_PATH_LEN, "%.*s", (int)(ZTA_PATH_LEN - 1), abs);
             }
             config_t *cfg = calloc(1, sizeof(config_t));
             if (cfg == NULL) { free(pol); continue; }

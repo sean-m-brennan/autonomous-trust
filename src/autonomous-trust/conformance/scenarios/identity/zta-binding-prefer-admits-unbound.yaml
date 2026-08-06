@@ -1,0 +1,74 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: zta-binding-prefer-admits-unbound
+byte_pinning: false
+description: |
+    `binding_mode: prefer` — the one-hop migration setting, pinned so it cannot
+    quietly become either of its neighbours.
+
+    The same unbound credential that `require` refuses (zta-binding-reject-
+    unbound) is ADMITTED here, because a fleet cannot re-provision every
+    credential atomically. What stands in for the missing binding is the
+    roster-based first-use-wins check, which is weak — so the peer is admitted
+    under the DDIL reputation cap rather than at full standing. `off`, by
+    contrast, admits with no cap at all: absence of a binding carries no penalty
+    there, which is what makes `off` the no-change-in-behavior setting for a
+    deployment that has not provisioned any bindings yet.
+
+    The three modes therefore differ in outcome, not just in logging, and this is
+    the middle one.
+
+    Cross-impl: pinned on BOTH sides, ZTA-gated. The cap itself is Python-side
+    bookkeeping (_zta_capped) with no C equivalent, so the pinned observable is
+    admission — the two runtimes agree on WHO is admitted, and differ only in
+    what they record about it.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  zta_policy:
+    enabled: true
+    require_at_admission: true
+    binding_mode: prefer
+    verifier_type: x509
+    ca_bundle_path: testdata/zta/operator-ca-bundle.pem
+  credentials:
+    newcomer: testdata/zta/certs/operator_leaf.der
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+    description: newcomer announces a chain-valid, UNBOUND credential.
+  - id: 2
+    from: bg
+    to: broadcast
+    function: propose_peer
+    in_response_to: 1
+    description: |
+        `prefer` admits it (capped), so bg proposes — the observable that
+        separates this mode from `require`.
+  - id: 3
+    from: bg
+    to: broadcast
+    function: peer_accepted
+    in_response_to: 1
+    description: After synchronous vote finalization the newcomer is stored.
+  - id: 4
+    from: bg
+    to: newcomer
+    function: access_granted
+    in_response_to: 1
+    description: bg sends its published identity to the newcomer.
+  - id: 5
+    from: bg
+    to: newcomer
+    function: full_history
+    in_response_to: 1
+    description: bg sends the group key + history DAG.

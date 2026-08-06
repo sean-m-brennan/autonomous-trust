@@ -435,6 +435,42 @@ def _scenario_operator_binding(corpus_root: Path, ident: Identity,
     return op_pub, sig
 
 
+def _scenario_zta_binding(corpus_root: Path, ident: Identity, cred: bytes,
+                          variant: str) -> bytes:
+    """Mint a credential->identity binding for a scenario participant (ISSUES §1.5).
+
+    Signed AT SCENARIO TIME rather than pinned as a blob, for the same reason the
+    operator binding is: pinning one recorded signature would let both
+    implementations agree on a byte string while disagreeing about what is signed.
+    RSA PKCS#1 v1.5 over SHA-256 is deterministic, so the two adapters produce
+    identical bytes without either pinning them.
+
+    Variants:
+      valid           signed by the leaf whose certificate the peer presents
+      forged          signed by an unrelated key (impostor_leaf.key) -- somebody
+                      tried to prove entitlement and could not
+      other-identity  correctly signed by the real leaf, but over a pre-image
+                      naming a DIFFERENT node. This is the harvested-credential
+                      case, and the one the whole binding exists to stop.
+    """
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    from autonomous_trust.core.identity.zta_binding import zta_binding_preimage
+
+    bind_to = ident
+    if variant == 'other-identity':
+        bind_to = SimpleNamespace(
+            uuid=UUID(bytes=bytes((b + 1) % 256 for b in _uuid_of(ident))),
+            signature=ident.signature)
+    preimage = zta_binding_preimage(bind_to, cred)
+    key_name = ('impostor_leaf.key' if variant == 'forged'
+                else 'operator_leaf.key')
+    with open(corpus_root / 'testdata' / 'zta' / 'certs' / key_name, 'rb') as fp:
+        priv = serialization.load_pem_private_key(fp.read(), password=None)
+    return priv.sign(preimage, padding.PKCS1v15(), hashes.SHA256())
+
+
 def _to_captured(msg: Any, emitter_id: str) -> CapturedMessage:
     """Project a network-bound `Message` into the engine's CapturedMessage."""
     if not isinstance(msg, Message):
@@ -577,6 +613,28 @@ class IdentityAdapter:
                 with open(self.corpus_root / rel, 'rb') as fp:
                     identities[pid].zta_credential = fp.read()
 
+        # The credential->identity binding (ISSUES §1.5).
+        # `zta_bindings: {<pid>: <variant>}` signs one at scenario time over the
+        # credential attached just above — so this must run after that loop, not
+        # beside it. The binding rides in the repeated `zta_credentials` field
+        # because fields 6-8 have nowhere to put one, which is the whole reason
+        # field 16 exists. A participant absent from the map presents an UNBOUND
+        # credential: legitimate under binding_mode off/prefer, refused under
+        # require, and that difference is what the zta-binding-* pins measure.
+        zbind_fix: dict[str, str] = fixtures.get('zta_bindings', {}) or {}
+        for pid, variant in zbind_fix.items():
+            if pid not in identities:
+                continue
+            ident = identities[pid]
+            cred = getattr(ident, 'zta_credential', b'') or b''
+            if not cred:
+                continue
+            binding = _scenario_zta_binding(self.corpus_root, ident, cred,
+                                            str(variant))
+            ident.zta_credential_binding = binding
+            ident.zta_credentials = [{'der': cred, 'binding': binding,
+                                      'issuer': getattr(ident, 'zta_issuer', '')}]
+
         # Advertised operator-attended claim (ethne D8/Q9): set the announcing
         # identity's operator_bound so the welcoming committee sees the CLAIM on
         # from_whom. The gate always neutralizes it and re-derives the truth from
@@ -635,6 +693,17 @@ class IdentityAdapter:
             if spec.get('operator_ca_bundle_path'):
                 spec['operator_ca_bundle_path'] = str(
                     self.corpus_root / spec['operator_ca_bundle_path'])
+            # Named anchors carry their own bundle paths and need the same
+            # resolution — easy to miss, and the failure is quiet: an anchor whose
+            # bundle will not load verifies nothing, so the peer is simply not
+            # admitted and the scenario looks like a policy disagreement rather
+            # than a path bug. Mirrors the C adapter.
+            if isinstance(spec.get('anchors'), list):
+                spec['anchors'] = [
+                    dict(a, ca_bundle_path=str(self.corpus_root
+                                               / a['ca_bundle_path']))
+                    if isinstance(a, dict) and a.get('ca_bundle_path') else a
+                    for a in spec['anchors']]
             zta_policy = ZtaPolicy(**spec)
 
         # Distinct-group mode (partition-recovery scenarios): when

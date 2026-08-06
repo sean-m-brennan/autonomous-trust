@@ -35,6 +35,48 @@ extern "C" {
 #define ZTA_VERIFIER_TYPE_LEN 32
 #define ZTA_PATH_LEN 256
 
+/* How hard the admission gate insists on a credential->identity binding
+ * (@ref zta_binding.h). REQUIRE is the default because without a binding the gate
+ * falls back on first-use-wins, and TOFU is the whole of ISSUES §1.5. The cost is
+ * a flag day: a credential provisioned before bindings existed is refused until
+ * re-provisioned, so a fleet mid-migration wants PREFER for one hop.
+ *
+ * Keep the wire spellings identical to Python's BINDING_MODE_* — a policy file is
+ * read by both runtimes. */
+typedef enum {
+    ZTA_BINDING_MODE_REQUIRE = 0,  /**< unbound credential -> unusable */
+    ZTA_BINDING_MODE_PREFER,       /**< unbound -> admit, DDIL-capped, TOFU stands */
+    ZTA_BINDING_MODE_OFF,          /**< verify a binding if offered, never require */
+} zta_binding_mode_t;
+
+/**
+ * @brief Parse a binding_mode string.
+ *
+ * An unrecognized value resolves to REQUIRE, deliberately: a typo must tighten the
+ * gate, never open it. Same rule as Python.
+ */
+zta_binding_mode_t zta_binding_mode_parse(const char *s);
+
+/** @brief The wire spelling of a binding mode ("require"/"prefer"/"off"). */
+const char *zta_binding_mode_str(zta_binding_mode_t mode);
+
+#define ZTA_ANCHOR_NAME_MAX 64
+#define ZTA_POLICY_MAX_ANCHORS 8
+
+/**
+ * @brief One named trust anchor: an agency, and the CA bundle that speaks for it.
+ *
+ * Multiple anchors arise because a network gateway bridges agencies. Nothing here
+ * makes two CAs recognize each other — cross-certification is not needed and was
+ * never the obstacle; what is needed is for THIS node to recognize both, which is
+ * a local list.
+ */
+typedef struct {
+    char name[ZTA_ANCHOR_NAME_MAX];      /**< label a peer earns authority for */
+    char ca_bundle_path[ZTA_PATH_LEN];   /**< PEM bundle; an anchor with none is dropped */
+    bool is_operator;                    /**< credentials here mark a human guardian */
+} zta_anchor_t;
+
 /**
  * @brief ZTA policy configuration
  *
@@ -64,6 +106,21 @@ typedef struct {
                                                         the node cannot confirm any peer is human
                                                         (operator_bound stays false, fail-safe).
                                                         Parity with Python ZtaPolicy. */
+    /* Named trust anchors, one per agency (ISSUES §1.5). EMPTY IS THE COMMON CASE
+       AND NOT A DEGENERATE ONE: zta_policy_resolved_anchors() synthesizes the
+       historical pair from ca_bundle_path / operator_ca_bundle_path, so every
+       pre-existing config resolves to exactly the two anchors it already had, in
+       the same roles. That is what makes multi-anchor additive rather than a
+       config flag day (unlike binding_mode, which is a credential one). */
+    zta_anchor_t anchors[ZTA_POLICY_MAX_ANCHORS];
+    size_t num_anchors;
+    zta_binding_mode_t binding_mode;               /**< default REQUIRE; see the enum. */
+    char san_uri_template[ZTA_PATH_LEN];           /**< e.g. "at://{uuid}"; the `{uuid}`
+                                                        placeholder is Python's spelling
+                                                        because the policy file is shared.
+                                                        Empty disables the CA-asserted path,
+                                                        leaving holder-asserted signatures as
+                                                        the only accepted proof. */
 } zta_policy_t;
 
 /**
@@ -120,6 +177,56 @@ int zta_policy_create_verifier(const zta_policy_t *policy, zta_verifier_t **out)
  *        (the peer anchor); parity with Python ZtaPolicy.create_operator_verifier.
  */
 int zta_policy_create_operator_verifier(const zta_policy_t *policy, zta_verifier_t **out);
+
+/**
+ * @brief The trust anchors to evaluate a peer's credentials against, normalized.
+ *
+ * When @c anchors is empty this SYNTHESIZES the historical pair — a "peer" anchor
+ * from @c ca_bundle_path and, if configured, a distinct "operator" anchor from
+ * @c operator_ca_bundle_path. An existing single-CA deployment therefore resolves
+ * to exactly the two anchors it already had, which is what keeps the multi-anchor
+ * work additive.
+ *
+ * Anchors with no bundle path are dropped (one that trusts nothing can verify
+ * nothing, and keeping it would only produce confusing per-anchor failures).
+ * Names are deduplicated by first occurrence, so a config that repeats one cannot
+ * make a credential count twice toward gateway authority.
+ *
+ * Mirrors Python `ZtaPolicy.resolved_anchors`.
+ *
+ * @param[out] out    Caller-provided array.
+ * @param[in]  max    Capacity of @p out.
+ * @return the number written (0 when nothing is configured).
+ */
+size_t zta_policy_resolved_anchors(const zta_policy_t *policy,
+                                   zta_anchor_t *out, size_t max);
+
+/**
+ * @brief Construct a chain-walking verifier for one resolved anchor.
+ *
+ * An anchor IS a CA bundle, so this is always X.509 regardless of
+ * @c verifier_type — mirroring Python `create_anchor_verifiers`, which does the
+ * same and for the same reason.
+ *
+ * @return 0 on success, EZTA_INTERNAL on a bad argument.
+ */
+int zta_policy_create_anchor_verifier(const zta_policy_t *policy,
+                                      const zta_anchor_t *anchor,
+                                      zta_verifier_t **out);
+
+/**
+ * @brief Render a SAN URI template by substituting @c {uuid}.
+ *
+ * Textual substitution of Python's placeholder rather than printf: see
+ * @ref ZTA_SAN_URI_TEMPLATE for why the shared policy file forces this. A template
+ * with no placeholder is copied through unchanged (it names a fixed URI, which is
+ * strange but not an error). Only the FIRST occurrence is substituted, matching
+ * nothing in particular — a second one would name two nodes at once.
+ *
+ * @return 0 on success, EINVAL on a bad argument or a result that would not fit.
+ */
+int zta_render_san_uri(const char *template_str, const char *uuid_str,
+                       char *out, size_t out_len);
 
 #ifdef __cplusplus
 } /* extern "C" */
