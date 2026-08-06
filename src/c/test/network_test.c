@@ -33,7 +33,7 @@ DEFINE_TEST(test_cidr_split_ipv4)
     char mask[4] = {0};
     char cidr[] = "192.168.1.100/24";
 
-    ck_assert_ret_ok(cidr_split(cidr, addr, mask));
+    ck_assert_ret_ok(cidr_split(cidr, addr, sizeof(addr), mask, sizeof(mask)));
     ck_assert_str_eq(addr, "192.168.1.100");
     ck_assert_str_eq(mask, "24");
 }
@@ -45,7 +45,7 @@ DEFINE_TEST(test_cidr_split_no_mask)
     char mask[4] = {0};
     char cidr[] = "10.0.0.1";
 
-    ck_assert_ret_ok(cidr_split(cidr, addr, mask));
+    ck_assert_ret_ok(cidr_split(cidr, addr, sizeof(addr), mask, sizeof(mask)));
     ck_assert_str_eq(addr, "10.0.0.1");
     /* mask should be empty since no /prefix */
     ck_assert_int_eq(mask[0], 0);
