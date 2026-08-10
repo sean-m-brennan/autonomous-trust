@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import select
 import socket
 import struct
 import threading
@@ -246,15 +247,52 @@ class TCPNetworkProcess(UDPNetworkProcess):
         if self._reader_lock is None:
             self._reader_lock = threading.Lock()
 
+    @staticmethod
+    def _peer_gone(sock):
+        """Has the peer already closed this outbound connection?
+
+        Necessary because a write into a socket whose peer has closed
+        SUCCEEDS -- the FIN only puts us in CLOSE_WAIT, and the RST that
+        answers the data arrives after send() has returned. That message is
+        then lost with no error, and only the NEXT send raises EPIPE. Against
+        a peer that accepts one frame per connection -- which is exactly what
+        the C transport did before it learned multi-frame accept, and what any
+        older node in the fleet still does -- that is one silently dropped
+        message per reuse.
+
+        Nothing ever arrives on an outbound connection (AT replies on its own
+        connection, not this one), so ANY readability means the socket is
+        finished: EOF if the peer closed, and unexpected bytes mean the
+        far end is out of step with our framing. Both say the same thing --
+        do not reuse it.
+        """
+        try:
+            readable, _, _ = select.select([sock], [], [], 0)
+            if not readable:
+                return False
+            return True
+        except (OSError, ValueError):
+            return True  # closed/invalid fd: certainly unusable
+
     def _get_pooled(self, key, channel):
         """Return (sock, reused). Reuses the pooled socket for ``key`` if
-        present, else connects a new one (evicting the oldest first if the
-        cap is reached). Runs under the pool lock; sends come from the net
-        main loop, so contention is only the group/ping paths."""
+        present and the peer has not closed it, else connects a new one
+        (evicting the oldest first if the cap is reached). Runs under the
+        pool lock; sends come from the net main loop, so contention is only
+        the group/ping paths."""
         with self._pool_lock:
             pc = self._conn_pool.get(key)
             if pc is not None:
-                return pc.sock, True
+                if not self._peer_gone(pc.sock):
+                    return pc.sock, True
+                # Peer hung up between sends. Drop it here rather than write
+                # into it and lose the frame (see _peer_gone).
+                del self._conn_pool[key]
+                _probes.counter('net.tcp.pool', 'evict_peer_closed', channel)
+                try:
+                    pc.sock.close()
+                except OSError:
+                    pass
             if len(self._conn_pool) >= self._max_live_conns:
                 self._evict_oldest_locked()
             sock = self._open_conn(key[0], key[1])  # may raise TransmissionError

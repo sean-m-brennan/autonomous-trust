@@ -198,8 +198,16 @@ cadence = 0.5
 queue_cadence = 0.01
 
 
-def _env_bool(name: str) -> bool:
-    return os.environ.get(name, '').strip().lower() in ('1', 'true', 'yes', 'on')
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Read a boolean knob. Unset, or set to something unrecognized, gives
+    `default` -- a knob that is on by default must be turned off explicitly,
+    not by a typo."""
+    raw = os.environ.get(name, '').strip().lower()
+    if raw in ('1', 'true', 'yes', 'on'):
+        return True
+    if raw in ('0', 'false', 'no', 'off'):
+        return False
+    return default
 
 
 def _env_num(name: str, default, cast):
@@ -212,14 +220,26 @@ def _env_num(name: str, default, cast):
         return default
 
 
-# Persistent / pooled TCP connections. The TCP transport normally opens one
-# connection per message (connect/send/close); with pooling on it reuses one
-# connection per (peer, channel) for many messages, so steady-state handshakes
-# drop from ~1/message to ~1/peer/idle-period. Framing is unchanged, so a
-# pooling node still interoperates with a per-message peer (Python or C).
-# Default OFF; opt in with AT_NET_POOL=1. See
+# Persistent / pooled TCP connections. Without pooling the TCP transport opens
+# one connection per message (connect/send/close), so `net.tcp.send/connect`
+# tracks the message rate; with it, one connection per (peer, channel) carries
+# many messages and steady-state handshakes drop to ~1/peer/idle-period. That
+# per-message handshake was the remaining half of the connection-churn cost in
+# ISSUES.md §3.6.
+#
+# ON by default since 2026-08-10; set AT_NET_POOL=0 to go back to per-message
+# connections. Framing is unchanged either way, and reuse is guarded on both
+# ends: the sender checks a pooled socket is still open before writing to it
+# (a write into a closed peer succeeds and loses the frame -- see
+# TCPNetworkProcess._peer_gone), and both runtimes' receivers now read many
+# frames from one connection. A peer that still closes after one frame costs a
+# reconnect per message, which is what the un-pooled path did anyway.
+#
+# FLAG DAY: C nodes older than 2026-08-10 close after the first frame AND
+# predate that receive-side fix, so a mixed fleet with such nodes should set
+# AT_NET_POOL=0 until they are updated. See
 # doc/architecture/network-connection-pooling.md.
-net_persistent_conn = _env_bool('AT_NET_POOL')
+net_persistent_conn = _env_bool('AT_NET_POOL', default=True)
 # Close a pooled/accepted connection after this many idle seconds, to bound fds.
 net_conn_idle_ttl = _env_num('AT_NET_CONN_IDLE_TTL', 30.0, float)
 # Cap on simultaneous live connections per direction (outbound pool / inbound

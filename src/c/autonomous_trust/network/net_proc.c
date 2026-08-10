@@ -279,6 +279,18 @@ static net_knob_t knob_mystery_max_age = {
     NET_MYSTERY_MAX_AGE_SEC_MIN, NET_MYSTERY_MAX_AGE_SEC_MAX,
     0, false, false, false, {0},
 };
+/* Env names match Python's (system.py) exactly -- the point of these knobs is
+ * that one deployment setting tunes both runtimes. */
+static net_knob_t knob_conn_idle_ttl = {
+    "AT_NET_CONN_IDLE_TTL", NET_CONN_IDLE_TTL_SEC,
+    NET_CONN_IDLE_TTL_SEC_MIN, NET_CONN_IDLE_TTL_SEC_MAX,
+    0, false, false, false, {0},
+};
+static net_knob_t knob_max_live_conns = {
+    "AT_NET_MAX_CONNS", NET_MAX_LIVE_CONNS,
+    NET_MAX_LIVE_CONNS_MIN, NET_MAX_LIVE_CONNS_MAX,
+    0, false, false, false, {0},
+};
 
 const char *net_knob_source_name(net_knob_source_t src)
 {
@@ -342,12 +354,23 @@ int net_mystery_max_age_resolve(net_knob_source_t *src, logger_t *logger)
     return net_knob_resolve(&knob_mystery_max_age, src, logger);
 }
 
+int net_conn_idle_ttl_resolve(net_knob_source_t *src, logger_t *logger)
+{
+    return net_knob_resolve(&knob_conn_idle_ttl, src, logger);
+}
+
+int net_max_live_conns_resolve(net_knob_source_t *src, logger_t *logger)
+{
+    return net_knob_resolve(&knob_max_live_conns, src, logger);
+}
+
 /* Test seam, as net_port_resolve_reset above: forget every cached tunable so
  * one process can exercise more than one value. Not declared in network.h. */
 void net_knobs_resolve_reset(void)
 {
     net_knob_t *all[] = { &knob_annoy_limit, &knob_recv_poll_ms,
-                          &knob_mystery_max_age };
+                          &knob_mystery_max_age, &knob_conn_idle_ttl,
+                          &knob_max_live_conns };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
         all[i]->value  = 0;
         all[i]->read   = false;
