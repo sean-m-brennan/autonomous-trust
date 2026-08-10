@@ -221,6 +221,16 @@ ffi.cdef("""
     int  load_all_configs(char *cfg_dir, map_t *configs, logger_t *logger);
 
     /* ---- identity/identity.h ---- */
+    /* One ZTA credential (identity.h:129-136). Declared unconditionally there,
+       so it is declared unconditionally here too. */
+    typedef struct {
+        uint8_t *der;
+        size_t der_len;
+        uint8_t *binding;
+        size_t binding_len;
+        char issuer[64];
+    } zta_credential_t;
+
     typedef struct {
         bool alloc; size_t refs;  /* smrt_ptr_t */
         unsigned char private_key[64];  /* crypto_sign_SECRETKEYBYTES */
@@ -275,6 +285,26 @@ ffi.cdef("""
         char zta_issuer[64];
         uint8_t *zta_credential;
         size_t zta_credential_len;
+        /* Multi-credential set + proved anchors (identity.h, same AT_ZTA block;
+           landed with §1.5 on 2026-08-06). MISSING here until 2026-08-10, and
+           the cost was exactly what the comment above describes for the
+           operator-key fields: the mirror ended at zta_credential_len, 840
+           bytes against the C struct's 1752, so `proto_to_peer` wrote 912 bytes
+           past the `ffi.new('public_identity_t *')` allocation and corrupted the
+           heap (`free(): corrupted unsorted chunks`, aborting pytest in
+           tests/d_comparison/test_identity_parity.py::test_proto_roundtrip).
+
+           Sizes are spelled literally because the cdef has no C macros:
+           ZTA_MAX_CREDENTIALS 4, ZTA_MAX_ANCHORS 8, ZTA_ANCHOR_NAME_LEN 64.
+           Verify a change here against the C ABI rather than by eye -- compile
+           a probe that prints sizeof/offsetof from identity.h (with
+           -DAT_ZTA_ENABLED -fms-extensions) and compare to ffi.sizeof /
+           ffi.offsetof. `scripts/audit-ffi-drift.py` compares function ARG
+           COUNTS only and cannot see any of this (ISSUES §9.2). */
+        zta_credential_t zta_credentials[4];
+        size_t num_zta_credentials;
+        char zta_anchors[8][64];
+        size_t num_zta_anchors;
     } public_identity_t;
 
     typedef struct identity_s identity_t;  /* opaque - contains private keys */

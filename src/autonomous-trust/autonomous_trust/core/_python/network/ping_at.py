@@ -130,27 +130,46 @@ class PingATServer(threading.Thread):
     def run(self):
         addr = self.recv_sock.getsockname()
         self.logger.info('Ping server started at %s:%s' % addr)
-        while not self.done:
-            try:
-                packet = self.recv_sock.recvfrom(64)
-            except TimeoutError:
-                packet = None
-            if packet is not None:
-                data, (host, _) = packet
+        try:
+            while not self.done:
                 try:
-                    seq_num = int.from_bytes(data, 'big')
-                    data = (seq_num + 1).to_bytes(4, 'big')
-                except OverflowError:
-                    data = (1).to_bytes(4, 'big')
-                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
-                    self.logger.debug('Echo ping to %s:%s' % (host, ping_at_snd_port))
-                    sent = sock.sendto(data, (host, ping_at_snd_port))
-                    if sent == 0:
-                        raise RuntimeError("Socket connection broken (no bytes sent)")
+                    packet = self.recv_sock.recvfrom(64)
+                except TimeoutError:
+                    packet = None
+                except OSError:
+                    break  # socket closed under us; nothing left to answer on
+                if packet is not None:
+                    data, (host, _) = packet
+                    try:
+                        seq_num = int.from_bytes(data, 'big')
+                        data = (seq_num + 1).to_bytes(4, 'big')
+                    except OverflowError:
+                        data = (1).to_bytes(4, 'big')
+                    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+                        self.logger.debug('Echo ping to %s:%s' % (host, ping_at_snd_port))
+                        sent = sock.sendto(data, (host, ping_at_snd_port))
+                        if sent == 0:
+                            raise RuntimeError("Socket connection broken (no bytes sent)")
+        finally:
+            # Release the port here, in the thread that owns the socket. Left
+            # bound, it denies the port to the next node on this address --
+            # there is deliberately no SO_REUSEADDR on it (see __init__), so
+            # the next bind fails outright rather than silently sharing.
+            self.recv_sock.close()
         self.logger.info('Ping server halted')
 
-    def stop(self):
+    def stop(self, timeout=1.0):
+        """Stop answering pings and release the bound port.
+
+        Idempotent, and safe whether or not the thread was ever started.
+        """
         self.done = True
+        if self.is_alive():
+            self.join(timeout)  # run()'s finally closes the socket
+        try:
+            self.recv_sock.close()  # never started, or join timed out
+        except OSError:
+            pass
 
 
 def ping_at(host: str, seq_num: int = None, count: int = 1, timeout: float = 1.0,

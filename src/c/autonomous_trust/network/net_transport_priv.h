@@ -34,6 +34,26 @@
 #define UDP_PACKET_SIZE 65507
 #define TCP_CHUNK_SIZE  2048
 
+/** Array bound on simultaneously-held inbound TCP connections. The runtime
+ *  cap is the AT_NET_MAX_CONNS knob (default 64), clamped to this; the array
+ *  is sized to the knob's maximum so the table is a plain member with no
+ *  allocation on the receive path. */
+#define TCP_MAX_LIVE_CONNS 256
+
+/** One inbound TCP connection held open between frames.
+ *
+ *  Exists because a sender with connection pooling on (Python's AT_NET_POOL,
+ *  on by default) writes many frames down one connection. Closing after the
+ *  first — which this transport did until 2026-08-10 — made the sender's
+ *  second write land on a closed socket, where it is lost silently (see
+ *  ISSUES.md §3.6). */
+typedef struct {
+    int fd;                     /**< -1 when the slot is free. */
+    net_channel_t channel;      /**< Listener this arrived on. */
+    char peer[IPV6_ADDR_LEN];   /**< Source address, for attribution. */
+    time_t last_used;           /**< Wall clock of the last frame read. */
+} tcp_conn_t;
+
 /** Socket creation parameters: maps directly to socket(2) arguments. */
 typedef struct {
     int domain;    /**< AF_INET | AF_INET6 */
@@ -59,6 +79,13 @@ struct net_transport_ctx_s {
      *  per-send hot path. Empty when the address could not be derived, in which
      *  case the send paths transmit unbound (the historical behavior). */
     char local_addr[IPV6_ADDR_LEN];
+    /** Inbound connections held open between frames (TCP only; UDP leaves
+     *  this zeroed and never looks at it). Slots are free when @c fd is -1,
+     *  which tcp_open_common sets explicitly — calloc's 0 is a REAL
+     *  descriptor (stdin). */
+    tcp_conn_t live_conns[TCP_MAX_LIVE_CONNS];
+    int max_live_conns;   /**< Resolved AT_NET_MAX_CONNS, ≤ TCP_MAX_LIVE_CONNS. */
+    int conn_idle_ttl;    /**< Resolved AT_NET_CONN_IDLE_TTL, seconds. */
 };
 
 /** Shared bind helper used by both UDP and TCP transports — opens a socket,

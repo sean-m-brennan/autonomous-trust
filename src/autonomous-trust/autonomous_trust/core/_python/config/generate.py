@@ -45,6 +45,16 @@ _names = [
     'r.lewis@%s' % _domain,
 ]
 
+def _as_cidr(address, subnet):
+    """Network stores addresses with their prefix; discovery and the operator
+    both hand us bare ones. Attach the local mask when we can."""
+    if not address:
+        return None
+    if '/' in address:
+        return address
+    return Network.cidr(address, subnet) or address
+
+
 def _subsystems(net_impl):
     pt = ProcessTracker()
     for name, impl in core_system.items():
@@ -70,7 +80,13 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
     hostname = socket.getfqdn(unqualified_hostname)
     if hostname == 'localhost':
         hostname = unqualified_hostname
-    ip4_address, ip6_address, mac_address = list(Network.get_addresses().values())[:3]  # TODO multi-device
+    addresses = Network.get_addresses()
+    ip4_address = addresses['ip4']
+    ip6_address = addresses['ip6']
+    mac_address = addresses['mac']
+    if ip4_address is None and ip6_address is None:
+        _logger.warning('No address found for the generated network config; '
+                        'set %s to name the interface to use', Network.device_variable_name)
 
     mod, cls = communications.rsplit('.', 1)
     if mod not in sys.modules:
@@ -78,9 +94,9 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
         import_module(mod)
     proto_cls = getattr(sys.modules[mod], cls)
     address = None
-    if proto_cls.net_proto == NetworkProtocol.IPV4:
+    if proto_cls.net_proto == NetworkProtocol.IPV4 and ip4_address is not None:
         address = ip4_address.split('/')[0]
-    elif proto_cls.net_proto == NetworkProtocol.IPV6:
+    elif proto_cls.net_proto == NetworkProtocol.IPV6 and ip6_address is not None:
         address = ip6_address.split('/')[0]
     elif proto_cls.net_proto == NetworkProtocol.MAC:
         address = mac_address
@@ -103,8 +119,12 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
         if env_name:
             petname = env_name
             nickname = '%s@%s' % (env_name, _domain)
-        # FIXME always dynamic
-        net_cfg = Network.initialize(ip4_address, ip6_address, mac_address)
+        # The addresses recorded here are authoritative only while they remain
+        # valid on this host; Automate re-derives them at load when they don't
+        # (Network.refresh).
+        net_cfg = Network.initialize(_as_cidr(ip4_address, addresses['ip4_subnet']),
+                                     _as_cidr(ip6_address, addresses['ip6_subnet']),
+                                     mac_address)
         ident_cfg = Identity.initialize(nickname, petname, address)
         sub_sys_cfg = _subsystems(communications)
         if not os.path.exists(net_file):
@@ -164,7 +184,9 @@ def generate_identity(cfg_dir, randomize=False, seed=None, silent=True, preserve
 
     sub_sys_cfg = None
     if not os.path.exists(net_file) or not preserve:
-        net_cfg = Network.initialize(ip4_addr, ip6_addr, mac_addr)  # noqa
+        net_cfg = Network.initialize(_as_cidr(ip4_addr, addresses['ip4_subnet']),
+                                     _as_cidr(ip6_addr, addresses['ip6_subnet']),
+                                     mac_addr)  # noqa
     else:
         net_cfg = Network.from_file(net_file)
     if not os.path.exists(ident_file) or not preserve:

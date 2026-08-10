@@ -34,6 +34,16 @@ ssize_t at_send_eintr(int sock, const void *buf, size_t len, int flags)
     }
 }
 
+int at_poll_eintr(struct pollfd *fds, nfds_t nfds, int timeout_ms)
+{
+    for (;;) {
+        int n = poll(fds, nfds, timeout_ms);
+        if (n < 0 && errno == EINTR)
+            continue;
+        return n;
+    }
+}
+
 ssize_t at_recv_eintr(int sock, void *buf, size_t len, int flags)
 {
     for (;;) {
