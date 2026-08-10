@@ -90,7 +90,7 @@ int net_transport_ip_bind_source(int sock, const char *address, int domain,
  * precondition cascade.
  */
 int net_transport_ip_bind(const socket_cfg_t *cfg, const char *address,
-                          int port, bool listen_sock, int *out_fd,
+                          int port, bool listen_sock, bool reuse, int *out_fd,
                           logger_t *logger)
 {
     struct addrinfo hints = {0};
@@ -124,21 +124,41 @@ int net_transport_ip_bind(const socket_cfg_t *cfg, const char *address,
         return -1;
     }
 
-    int one = 1;
-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0)
+    /* Per-socket, deliberately — see the @p reuse contract in the header. Set
+     * on this socket, the option is also what would let a SECOND node bind the
+     * identical addr:port and take delivery of every datagram, so the unicast
+     * recv sockets opt out and get EADDRINUSE instead. */
+    if (reuse)
     {
-        close(sock);
-        freeaddrinfo(res);
-        SYS_EXCEPTION();
-        log_exception(logger);
-        return -1;
+        int one = 1;
+        if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0)
+        {
+            close(sock);
+            freeaddrinfo(res);
+            SYS_EXCEPTION();
+            log_exception(logger);
+            return -1;
+        }
     }
 
     if (bind(sock, res->ai_addr, res->ai_addrlen) != 0)
     {
+        /* Saved before close()/freeaddrinfo()/log_error, any of which may set
+         * errno on their own; the reported cause has to be the bind's. */
+        int bind_errno = errno;
+        /* Name the likely cause: without SO_REUSEADDR this is how a second
+         * node sharing one base and one address now announces itself, and a
+         * bare "Address already in use" does not say which knob to move. */
+        if (bind_errno == EADDRINUSE)
+            log_error(logger,
+                      "Cannot bind %s:%d -- already held, most likely by "
+                      "another AT node on this address. Give each co-located "
+                      "node a distinct base port (config net_cfg.port, or "
+                      "AT_COMM_PORT).\n",
+                      address ? address : "*", port);
         close(sock);
         freeaddrinfo(res);
-        SYS_EXCEPTION();
+        EXCEPTION(bind_errno);
         log_exception(logger);
         return -1;
     }

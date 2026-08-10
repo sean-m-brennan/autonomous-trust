@@ -28,6 +28,7 @@ The original integration tests (which require a live config) are
 preserved at the bottom of this file.
 """
 
+import errno
 import socket
 import struct
 import pytest
@@ -386,16 +387,23 @@ class TestInitUdpPtp:
 
         mock_sock.bind.assert_called_once_with(('192.168.1.10', 8000))
 
-    def test_setsockopt_reuseaddr(self):
-        """_init_udp_ptp sets SO_REUSEADDR on the socket."""
+    def test_no_reuseaddr(self):
+        """_init_udp_ptp must NOT set SO_REUSEADDR (ISSUES.md 2.4.2).
+
+        The peer recv socket is owned by exactly one node on this address.
+        With the option set on both sockets the kernel accepts a second node's
+        bind of the identical addr:port and delivers every datagram to the LAST
+        binder, so the first node goes deaf with nothing logged. Omitting it is
+        what turns that into an EADDRINUSE the operator can see.
+        """
         proc = _make_proc()
         mock_sock = MagicMock()
 
         with patch('socket.socket', return_value=mock_sock):
             UDPNetworkProcess._init_udp_ptp(proc)
 
-        mock_sock.setsockopt.assert_called_once_with(
-            socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        assert socket.SO_REUSEADDR not in [
+            call.args[1] for call in mock_sock.setsockopt.call_args_list]
 
     def test_bind_failure_propagates(self):
         """_init_udp_ptp re-raises OSError from bind."""
@@ -418,6 +426,24 @@ class TestInitUdpPtp:
                 UDPNetworkProcess._init_udp_ptp(proc)
 
         proc.logger.error.assert_called_once()
+
+    def test_bind_eaddrinuse_names_the_likely_cause(self):
+        """EADDRINUSE must say WHICH knob to move, not just that bind failed.
+
+        A bare "Address already in use" leaves an operator with no way to know
+        the cause is a co-located node sharing the base port.
+        """
+        proc = _make_proc()
+        mock_sock = MagicMock()
+        mock_sock.bind.side_effect = OSError(errno.EADDRINUSE, 'Address already in use')
+
+        with patch('socket.socket', return_value=mock_sock):
+            with pytest.raises(OSError):
+                UDPNetworkProcess._init_udp_ptp(proc)
+
+        logged = proc.logger.error.call_args[0][0]
+        assert 'already held' in logged
+        assert 'AT_COMM_PORT' in logged
 
     def test_assigns_recv_ptp_sock(self):
         """_init_udp_ptp assigns the new socket to proc.recv_ptp_sock."""
@@ -445,16 +471,16 @@ class TestInitUdpGrp:
 
         mock_sock.bind.assert_called_once_with(('192.168.1.10', 8001))
 
-    def test_setsockopt_reuseaddr(self):
-        """_init_udp_grp sets SO_REUSEADDR on the group socket."""
+    def test_no_reuseaddr(self):
+        """_init_udp_grp must NOT set SO_REUSEADDR — see TestInitUdpPtp."""
         proc = _make_proc()
         mock_sock = MagicMock()
 
         with patch('socket.socket', return_value=mock_sock):
             UDPNetworkProcess._init_udp_grp(proc)
 
-        mock_sock.setsockopt.assert_called_once_with(
-            socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        assert socket.SO_REUSEADDR not in [
+            call.args[1] for call in mock_sock.setsockopt.call_args_list]
 
     def test_bind_failure_propagates(self):
         """_init_udp_grp re-raises OSError from bind."""
@@ -741,10 +767,19 @@ def test_reject(setup_teardown):
     cfgs = at._configure(start=False)
     net_addr = cfgs[CfgIds.network].ip4
     udp = _UDP(cfgs, dict({}), None)
-    udp.send_peer('test1', net_addr)
-    msg_tpl = udp.recv_peer()
-    # Sending to own address: _recv_udp returns (None, None, None)
-    assert msg_tpl == (None, None, None)
+    try:
+        udp.send_peer('test1', net_addr)
+        msg_tpl = udp.recv_peer()
+        # Sending to own address: _recv_udp returns (None, None, None)
+        assert msg_tpl == (None, None, None)
+    finally:
+        # Both of these tests bind the SAME default port on the same address,
+        # so the first must release it or the second cannot open at all. That
+        # used to pass by accident: with SO_REUSEADDR on the unicast recv
+        # sockets the second bind succeeded silently and took delivery of
+        # every datagram. The option is gone (ISSUES.md 2.4.2), so a leaked
+        # listener is now a visible EADDRINUSE rather than quiet theft.
+        udp.close_listeners()
 
 
 def test_p2p(setup_teardown):
@@ -752,10 +787,13 @@ def test_p2p(setup_teardown):
     cfgs = at._configure(start=False)
     net_addr = cfgs[CfgIds.network].ip4
     udp = _UDP(cfgs, dict({}), None, acceptance_func=lambda x: True)
-    udp.send_peer('test1', net_addr)
-    msg_tpl = udp.recv_peer()
-    assert b'test1' == msg_tpl[0]
-    assert net_addr == msg_tpl[1]
+    try:
+        udp.send_peer('test1', net_addr)
+        msg_tpl = udp.recv_peer()
+        assert b'test1' == msg_tpl[0]
+        assert net_addr == msg_tpl[1]
+    finally:
+        udp.close_listeners()
 
 
 @pytest.mark.skip(reason="blocked by firewall")

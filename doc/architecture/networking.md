@@ -48,12 +48,24 @@ The config generator records `port` only when the operator asked for one, so a
 provisioned root does not pin every node to one port.
 
 **Two nodes on one host** therefore need only different `AT_COMM_PORT` values,
-or different addresses. Same base *and* same address is a silent failure, not a
-loud one: `SO_REUSEADDR` is set on every bind, so both succeed and the last
-binder receives everything (see `ISSUES.md`).
+or different addresses. Same base *and* same address now fails loudly: the
+second node's peer recv socket gets `EADDRINUSE` at open, and the error names
+the likely cause and the knob to move rather than reporting a bare "Address
+already in use".
+
+That is a per-socket property, not a global one. `SO_REUSEADDR` is set only
+where several listeners on one addr:port is the intent — the
+broadcast/multicast recv socket, and the TCP listeners, where the option grants
+a bind over `TIME_WAIT` but never over a live `LISTEN`. The UDP **unicast** recv
+sockets (peer, group) omit it in both runtimes, because with the option on both
+sockets Linux permits a duplicate bind and delivers every datagram to the last
+binder, leaving the first node deaf with nothing logged (`ISSUES.md` 2.4.2).
 
 Python derives two further ports from the same base: `ping_at_rcv` = N+2 and
-`ping_at_snd` = N+3. C has no counterpart: it implements neither.
+`ping_at_snd` = N+3. C has no counterpart: it implements neither. Both PingAT
+sockets bind a specific address — the client derives one from the route to its
+target when the caller supplies none — so co-located nodes separated only by
+address do not receive each other's replies (`ISSUES.md` 2.4.3).
 
 **PingAT is not ICMP.** It asks whether an *AT peer* is present and answering on
 AT's own ports via a cooperating responder (`PingATServer`); `ping(8)` asks
@@ -169,5 +181,27 @@ If the process name is not recognized, the message is logged and dropped.
 ## Pest tracking
 
 Peers that send invalid encrypted messages (returning `None` from decryption but with a known address) are tracked in a `pests` dict. After exceeding `annoy_limit` (5) failed messages, the peer is demoted in the hierarchy.
+
+**Network tunables.** Three operational knobs resolve from an environment
+override, else the compile-time default, identically in both runtimes. They
+carry no config layer — unlike the base port, these are per-node tuning rather
+than provisioned identity, so `network.cfg.json` does not mention them. A value
+that is unparseable or out of range is refused with a warning and the default
+kept, and startup logs each knob with the layer that supplied it, so an ignored
+override is distinguishable from an applied one.
+
+| Knob | Env var | Default | Range |
+|------|---------|---------|-------|
+| duplicate-broadcast threshold | `AT_NET_ANNOY_LIMIT` | 5 | [1, 10000] |
+| receive-poll timeout | `AT_NET_RECV_POLL_MS` | 100 ms | [1, 60000] |
+| mystery-message max age | `AT_MYSTERY_MAX_AGE_SEC` | 30 s | [1, 86400] |
+
+The poll timeout is stated in milliseconds because that is the unit the two
+sides can share exactly as an integer; Python's socket layer wants seconds and
+divides at the point of use. The mystery bound is wall-clock **age** on both
+sides: Python counted retries until 2026-08-10, which only approximated a
+duration and drifted with load, while C's retry is event-driven and could never
+have counted time at all. The `network/tunables-resolution` conformance case
+holds the two implementations to the same table (`ISSUES.md` 2.4.4).
 
 [Identity Protocol >](identity-protocol.md)

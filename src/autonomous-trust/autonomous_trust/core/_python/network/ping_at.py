@@ -23,6 +23,37 @@ import socket
 from ..system import now, ping_at_rcv_port, ping_at_snd_port
 
 
+def local_address_toward(host, logger=None):
+    """The source address this host would use to reach `host`.
+
+    The PingAT client must bind its reply socket to a specific address, not
+    the wildcard. `PingATServer` echoes to the SOURCE address of the datagram
+    it received, so the address the client listens on has to be the address it
+    egresses from -- and with two co-located nodes separated only by address,
+    a wildcard bind on `ping_at_snd_port` means whichever node bound last
+    silently receives the other's replies (SO_REUSEADDR makes that theft rather
+    than an error; same failure class as the transport's duplicate unicast
+    bind).
+
+    Connecting an unbound UDP socket sends nothing -- it only asks the kernel
+    to run the route lookup and assign a local endpoint, which is exactly the
+    address a subsequent unbound send would have used.
+
+    Returns None if the route cannot be resolved; the caller then falls back to
+    the wildcard and warns, rather than taking ping off the air.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as probe:
+            probe.connect((host, ping_at_rcv_port))
+            return probe.getsockname()[0]
+    except OSError as err:
+        (logger or logging.getLogger(__name__)).warning(
+            'PingAT could not resolve a source address toward %s (%s); binding the '
+            'wildcard, so a co-located node on another address may receive these '
+            'replies instead' % (host, err))
+        return None
+
+
 class PingATStats(object):
     def __init__(self, host, times, total):
         self.host = host
@@ -81,8 +112,19 @@ class PingATServer(threading.Thread):
         timeout = 0.1
         socket.setdefaulttimeout(timeout)
         self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        self.recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.recv_sock.bind((host, ping_at_rcv_port))
+        # No SO_REUSEADDR: one node answers on this addr:port. With the option
+        # a second node binds the same pair silently and takes every request,
+        # so the first stops answering pings with nothing logged.
+        try:
+            self.recv_sock.bind((host, ping_at_rcv_port))
+        except OSError as err:
+            self.recv_sock.close()
+            raise OSError(
+                err.errno,
+                'PingAT server cannot bind %s:%s -- already held, most likely by another '
+                'AT node on this address. Give each co-located node a distinct base port '
+                '(config net_cfg.port, or AT_COMM_PORT), from which the PingAT ports are '
+                'derived.' % (host, ping_at_rcv_port)) from err
         self.done = False
 
     def run(self):
@@ -111,7 +153,17 @@ class PingATServer(threading.Thread):
         self.done = True
 
 
-def ping_at(host: str, seq_num: int = None, count: int = 1, timeout: float = 1.0) -> PingATStats:
+def ping_at(host: str, seq_num: int = None, count: int = 1, timeout: float = 1.0,
+            local_address: str = None) -> PingATStats:
+    """Ping an AT peer.
+
+    @param local_address  This node's own address, to bind the reply socket
+                          (and pin the outbound source) to. Defaults to the
+                          source address the route toward `host` selects, which
+                          is what an unbound send would have used anyway --
+                          never the wildcard, so co-located nodes separated by
+                          address do not steal each other's replies.
+    """
     if seq_num is None:
         seq_num = 1
     try:
@@ -119,12 +171,36 @@ def ping_at(host: str, seq_num: int = None, count: int = 1, timeout: float = 1.0
     except OverflowError:
         data = (1).to_bytes(4, 'big')
 
+    if local_address is None:
+        local_address = local_address_toward(host)
+
     socket.setdefaulttimeout(timeout)
     recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    recv_sock.bind(('', ping_at_snd_port))
+    # No SO_REUSEADDR: this port belongs to one node on this address, and with
+    # the option set a second binder takes delivery of every reply instead of
+    # being told the port is taken.
+    try:
+        recv_sock.bind((local_address or '', ping_at_snd_port))
+    except OSError as err:
+        recv_sock.close()
+        raise OSError(
+            err.errno,
+            'PingAT cannot bind %s:%s -- already held, most likely by another AT node '
+            'on this address. Give each co-located node a distinct base port (config '
+            'net_cfg.port, or AT_COMM_PORT), from which the PingAT ports are derived.'
+            % (local_address or '*', ping_at_snd_port)) from err
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+        # Send FROM the address we are listening on: the server echoes to the
+        # datagram's source, so an unbound send on a multi-homed host could
+        # direct the reply at an address this socket does not hold.
+        if local_address:
+            try:
+                sock.bind((local_address, 0))
+            except OSError as err:
+                logging.getLogger(__name__).warning(
+                    'PingAT could not pin source address %s (%s); replies from %s may '
+                    'not arrive' % (local_address, err, host))
         times = {}
         start = now()
         end = now()

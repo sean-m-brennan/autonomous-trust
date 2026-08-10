@@ -134,25 +134,29 @@ static int udp_open_common(net_transport_ctx_t **out_ctx,
     int port = params->port_base;
     int grp_port = port + 1;
 
-    /* Peer-to-peer recv socket */
-    if (net_transport_ip_bind(&ctx->cfg, address, port, false,
+    /* Peer-to-peer recv socket. No SO_REUSEADDR: one node owns this
+     * addr:port, so a second node landing on it must fail loudly rather than
+     * take delivery of the first node's datagrams. */
+    if (net_transport_ip_bind(&ctx->cfg, address, port, false, false,
                               &ctx->recv_ptp, params->logger) != 0)
         goto fail;
     log_info(params->logger, "Bound peer recv to %s:%d (UDP)\n",
              address ? address : "*", port);
 
-    /* Group recv socket */
-    if (net_transport_ip_bind(&ctx->cfg, address, grp_port, false,
+    /* Group recv socket — likewise exclusive. */
+    if (net_transport_ip_bind(&ctx->cfg, address, grp_port, false, false,
                               &ctx->recv_grp, params->logger) != 0)
         goto fail;
     log_info(params->logger, "Bound group recv to %s:%d (UDP)\n",
              address ? address : "*", grp_port);
 
-    /* Broadcast / mcast recv socket */
+    /* Broadcast / mcast recv socket. SO_REUSEADDR here IS load-bearing:
+     * several listeners sharing one group addr:port is the whole point, and
+     * without it a second local subscriber cannot join at all. */
     if (use_mcast) {
         const char *mcast = ipv6 ? params->net_cfg->mcast6_addr
                                  : params->net_cfg->mcast4_addr;
-        if (net_transport_ip_bind(&ctx->cfg, mcast, port, false,
+        if (net_transport_ip_bind(&ctx->cfg, mcast, port, false, true,
                                   &ctx->recv_cast, params->logger) != 0)
             goto fail;
         if (net_transport_ip_join_mcast(ctx->recv_cast, ipv6, mcast, port,
@@ -165,7 +169,7 @@ static int udp_open_common(net_transport_ctx_t **out_ctx,
         }
         char bcast_address[IPV4_ADDR_LEN];
         cidr4_to_broadcast((char *)params->net_cfg->ip4_cidr, bcast_address);
-        if (net_transport_ip_bind(&ctx->cfg, bcast_address, port, false,
+        if (net_transport_ip_bind(&ctx->cfg, bcast_address, port, false, true,
                                   &ctx->recv_cast, params->logger) != 0)
             goto fail;
     }

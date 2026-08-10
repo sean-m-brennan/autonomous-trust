@@ -21,7 +21,9 @@
  *        admission (event-driven, unlike Python's polling thread); these cover
  *        the reclamation half that keeps the bounded queue self-cleaning so a
  *        burst of un-resolvable frames can't permanently starve legitimate
- *        deferrals. Mirrors Python netprocess.py mystery_max_retries age-out.
+ *        deferrals. Mirrors Python netprocess.py's mystery_max_age_s age-out,
+ *        which since 2026-08-10 bounds the same queue by the same quantity
+ *        (wall-clock seconds) rather than by a retry count (ISSUES.md 2.4.4).
  *
  * Unconditional (not AT_NET_ENVELOPE-gated): the age-out path lives in the
  * always-compiled defer_message, and these tests use the non-envelope
@@ -40,6 +42,11 @@
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
 
+/* Test seam in net_proc.c: AT_MYSTERY_MAX_AGE_SEC is read-once-and-cached (the
+ * same habit as AT_COMM_PORT), so a process that wants to exercise more than
+ * one value must forget the cache between them. Not declared in network.h. */
+extern void net_knobs_resolve_reset(void);
+
 static void uuid_fill(uuid_t u, uint8_t seed)
 {
     for (size_t i = 0; i < 16; i++) u[i] = (uint8_t)(seed + i);
@@ -50,6 +57,7 @@ DEFINE_TEST(test_age_out_sweep_evicts_stale)
     /* With a 10s window, fresh entries survive a sweep; once backdated past
      * the window they are reclaimed. */
     setenv("AT_MYSTERY_MAX_AGE_SEC", "10", 1);
+    net_knobs_resolve_reset();
     net_proc_test_reset_deferred();
 
     uint8_t pay[4] = {1, 2, 3, 4};
@@ -68,6 +76,7 @@ DEFINE_TEST(test_age_out_sweep_evicts_stale)
 
     net_proc_test_reset_deferred();
     unsetenv("AT_MYSTERY_MAX_AGE_SEC");
+    net_knobs_resolve_reset();
 }
 END_TEST_DEFINITION()
 
@@ -75,6 +84,7 @@ DEFINE_TEST(test_age_out_partial)
 {
     /* Only entries past the window are reclaimed; fresher ones survive. */
     setenv("AT_MYSTERY_MAX_AGE_SEC", "10", 1);
+    net_knobs_resolve_reset();
     net_proc_test_reset_deferred();
 
     uint8_t pay[4] = {1, 2, 3, 4};
@@ -88,6 +98,7 @@ DEFINE_TEST(test_age_out_partial)
 
     net_proc_test_reset_deferred();
     unsetenv("AT_MYSTERY_MAX_AGE_SEC");
+    net_knobs_resolve_reset();
 }
 END_TEST_DEFINITION()
 
@@ -96,6 +107,7 @@ DEFINE_TEST(test_defer_self_cleans_under_pressure)
     /* defer_message sweeps before inserting, so deferring after time passes
      * reclaims aged slots without any polling thread. */
     setenv("AT_MYSTERY_MAX_AGE_SEC", "5", 1);
+    net_knobs_resolve_reset();
     net_proc_test_reset_deferred();
 
     uint8_t pay[4] = {9, 8, 7, 6};
@@ -112,6 +124,7 @@ DEFINE_TEST(test_defer_self_cleans_under_pressure)
 
     net_proc_test_reset_deferred();
     unsetenv("AT_MYSTERY_MAX_AGE_SEC");
+    net_knobs_resolve_reset();
 }
 END_TEST_DEFINITION()
 
@@ -119,7 +132,8 @@ DEFINE_TEST(test_overflow_evicts_oldest_admits_newest)
 {
     /* Full of fresh (un-aged) entries: a new deferral FIFO-evicts the OLDEST
      * so the newest is admitted, vs. the old behaviour that dropped the new. */
-    setenv("AT_MYSTERY_MAX_AGE_SEC", "100000", 1);  /* disable age-out here */
+    setenv("AT_MYSTERY_MAX_AGE_SEC", "86400", 1);  /* max: age-out effectively off */
+    net_knobs_resolve_reset();
     net_proc_test_reset_deferred();
 
     uint8_t pay[4] = {1, 2, 3, 4};
@@ -147,6 +161,7 @@ DEFINE_TEST(test_overflow_evicts_oldest_admits_newest)
 
     net_proc_test_reset_deferred();
     unsetenv("AT_MYSTERY_MAX_AGE_SEC");
+    net_knobs_resolve_reset();
 }
 END_TEST_DEFINITION()
 

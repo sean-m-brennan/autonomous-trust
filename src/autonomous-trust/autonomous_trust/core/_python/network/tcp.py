@@ -67,6 +67,11 @@ class TCPNetworkProcess(UDPNetworkProcess):
         # immediately with BlockingIOError.
         bind_address = self.net_cfg.ip4
         self.recv_ptp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Kept on the TCP listeners, unlike the UDP unicast recv sockets: on
+        # TCP the option grants a bind only over a socket in TIME_WAIT, never
+        # over a live LISTEN, so a second node on this addr:port still fails
+        # EADDRINUSE. What it buys is a restart that need not wait out
+        # TIME_WAIT on the previous run's connections.
         self.recv_ptp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             self.recv_ptp_sock.bind((bind_address, self.port))

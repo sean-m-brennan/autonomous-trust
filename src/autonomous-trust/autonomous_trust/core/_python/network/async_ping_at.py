@@ -16,7 +16,7 @@
 
 import asyncio
 
-from .ping_at import PingATStats, ping_at_rcv_port, ping_at_snd_port
+from .ping_at import PingATStats, local_address_toward, ping_at_rcv_port, ping_at_snd_port
 from ..system import now
 
 
@@ -89,16 +89,27 @@ async def AsyncPingATServer(host='0.0.0.0'):  # noqa
     return _PingATServer(transport, protocol)
 
 
-async def async_ping_at(host: str, seq_num: int = None, count: int = 1, timeout: float = 1.0) -> PingATStats:
+async def async_ping_at(host: str, seq_num: int = None, count: int = 1, timeout: float = 1.0,
+                        local_address: str = None) -> PingATStats:
+    """Async twin of ping_at(); see it for the local_address contract.
+
+    `local_addr` here binds the reply socket to a specific address rather than
+    the wildcard, so co-located nodes separated only by address do not receive
+    each other's ping replies. asyncio's datagram endpoint does not set
+    SO_REUSEADDR, so a genuine collision raises OSError from create_datagram_endpoint.
+    """
     if seq_num is None:
         seq_num = 1
     try:
         data = seq_num.to_bytes(4, 'big')
     except OverflowError:
         data = (1).to_bytes(4, 'big')
+    if local_address is None:
+        local_address = local_address_toward(host)
     loop = asyncio.get_running_loop()
     transport, protocol = await loop.create_datagram_endpoint(lambda: _PingATClientProtocol(),  # noqa
-                                                              local_addr=('0.0.0.0', ping_at_snd_port),
+                                                              local_addr=(local_address or '0.0.0.0',
+                                                                          ping_at_snd_port),
                                                               remote_addr=(host, ping_at_rcv_port))
     times = {}
     start = now()

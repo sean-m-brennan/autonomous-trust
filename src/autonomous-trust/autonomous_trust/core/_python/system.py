@@ -103,6 +103,79 @@ def resolve_comm_port(cfg_port: int = 0, logger: logging.Logger = None) -> tuple
     return default_comm_port, PortSource.default
 
 
+# Compile-time DEFAULTS for the three network tunables, mirroring C's
+# NET_ANNOY_LIMIT / NET_RECV_POLL_MS / NET_MYSTERY_MAX_AGE_SEC and their bounds
+# (network/network.h). These used to be plain class attributes on
+# NetworkProcess with no C counterpart at all, so a deployment could tune one
+# runtime and not the other (ISSUES.md 2.4.4).
+default_annoy_limit = 5
+annoy_limit_min = 1
+annoy_limit_max = 10000
+
+default_recv_poll_ms = 100
+recv_poll_ms_min = 1
+recv_poll_ms_max = 60000
+
+default_mystery_max_age_s = 30
+mystery_max_age_s_min = 1
+mystery_max_age_s_max = 86400
+
+
+class KnobSource(object, metaclass=ClassEnumMeta):
+    """Which layer supplied a network tunable. Mirrors C's net_knob_source_t."""
+    env = 'env'
+    default = 'default'
+
+
+def resolve_env_int(name: str, default: int, lo: int, hi: int,
+                    logger: logging.Logger = None) -> tuple[int, str]:
+    """Resolve one network tunable from the environment, with its source.
+
+    Two layers -- env then compile-time default -- with the same refusal rules
+    as ``resolve_comm_port``'s env layer, and identical to C's
+    ``net_knob_resolve``: strictly parsed, range-checked, and a bad value
+    refused with a warning while the default is kept. There is deliberately no
+    config layer; see the C header for why.
+    """
+    raw = os.environ.get(name)
+    if raw:
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            val = None
+        if val is None or not (lo <= val <= hi):
+            if logger is not None:
+                logger.warning('refusing %s=%r (want an integer in [%d, %d]); using default %d'
+                               % (name, raw, lo, hi, default))
+        else:
+            return val, KnobSource.env
+    return default, KnobSource.default
+
+
+def resolve_annoy_limit(logger: logging.Logger = None) -> tuple[int, str]:
+    """Duplicate-broadcast threshold before a peer is blacklisted."""
+    return resolve_env_int('AT_NET_ANNOY_LIMIT', default_annoy_limit,
+                           annoy_limit_min, annoy_limit_max, logger)
+
+
+def resolve_recv_poll_ms(logger: logging.Logger = None) -> tuple[int, str]:
+    """Receive-poll timeout in MILLISECONDS.
+
+    Python's socket layer wants seconds and C's poll wants milliseconds, so the
+    knob is stated in the unit the two can share exactly (an integer count of
+    ms); Python divides at the point of use. The unit differs because the APIs
+    do -- the value does not.
+    """
+    return resolve_env_int('AT_NET_RECV_POLL_MS', default_recv_poll_ms,
+                           recv_poll_ms_min, recv_poll_ms_max, logger)
+
+
+def resolve_mystery_max_age_s(logger: logging.Logger = None) -> tuple[int, str]:
+    """How long a deferred encrypted message is held before being reclaimed."""
+    return resolve_env_int('AT_MYSTERY_MAX_AGE_SEC', default_mystery_max_age_s,
+                           mystery_max_age_s_min, mystery_max_age_s_max, logger)
+
+
 # Module-level defaults layer. A lot imports these names, so they stay -- but
 # they are the resolved-at-import view (config is not visible here), not the
 # truth for a node that carries a configured port. Use resolve_comm_port() when
