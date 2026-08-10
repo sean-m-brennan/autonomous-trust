@@ -1,0 +1,237 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: tunables-resolution
+byte_pinning: false
+description: |
+    Network-tunable resolution agreement. Three operational knobs -- the
+    duplicate-broadcast threshold, the receive-poll timeout, and how long a
+    deferred ("mystery") encrypted message is held -- resolve from two layers
+    in one order on both sides: an environment override, else the compile-time
+    default.
+
+    This case exists for the same reason port-resolution does, and it closes
+    the complaint that motivated it. Before it, all three knobs were
+    overridable class attributes in Python and bare macros in C, so a
+    deployment could tune one runtime and not the other; a test already set
+    annoy_limit = 100, meaning the Python side was tuned in practice while C
+    could not be. Nothing anywhere would have noticed the asymmetry.
+
+    A refused override is as much a part of the contract as an accepted one.
+    An unparseable, zero, negative or out-of-range value must keep the default
+    rather than silently producing a degenerate setting: an annoy limit of 0
+    blacklists a peer on its first duplicate, and a poll timeout of 0 turns
+    every receiver thread into a busy-wait.
+
+    There is deliberately NO config layer, unlike the base port. These are
+    per-node operational tuning rather than provisioned identity, so they do
+    not belong in network.cfg.json and the config wire form is unchanged.
+
+    The mystery knob is stated in wall-clock SECONDS on both sides. Python
+    used to bound that queue by a retry count instead (60 retries at a cadence
+    that made it roughly 30 s), which only approximated a duration and drifted
+    with load; C always bounded it by age, because its retry is event-driven
+    rather than polled and a count there would have measured peer admissions
+    rather than time. Both now agree on the quantity as well as the value.
+
+    The poll timeout is stated in MILLISECONDS because that is the unit the two
+    can share exactly as an integer. Python's socket layer wants seconds and
+    divides at the point of use; the unit differs because the APIs do, the
+    value does not.
+
+    Production-code analogue:
+      Python: system.resolve_annoy_limit / resolve_recv_poll_ms /
+              resolve_mystery_max_age_s, all over system.resolve_env_int;
+              NetworkProcess.__init__ resolves all three.
+      C:      net_annoy_limit_resolve / net_recv_poll_ms_resolve /
+              net_mystery_max_age_resolve, all over net_knob_resolve
+              (network/network.h); network_run resolves all three.
+
+participants:
+  - id: node
+    role: resolver
+
+fixtures:
+  # Defaults and bounds, stated here so a drift in either implementation's
+  # constants shows up as a case failure rather than as agreement on a value
+  # neither side got from the other.
+  knobs:
+    - name: annoy_limit
+      env: AT_NET_ANNOY_LIMIT
+      default: 5
+      min: 1
+      max: 10000
+    - name: recv_poll_ms
+      env: AT_NET_RECV_POLL_MS
+      default: 100
+      min: 1
+      max: 60000
+    - name: mystery_max_age_s
+      env: AT_MYSTERY_MAX_AGE_SEC
+      default: 30
+      min: 1
+      max: 86400
+
+  resolutions:
+    # --- accepted overrides -------------------------------------------------
+    - id: annoy-env-applies
+      knob: annoy_limit
+      env: "100"
+      expect_value: 100
+      expect_source: env
+    - id: annoy-default-when-silent
+      knob: annoy_limit
+      env: null
+      expect_value: 5
+      expect_source: default
+    - id: annoy-at-lower-bound
+      knob: annoy_limit
+      env: "1"
+      expect_value: 1
+      expect_source: env
+    - id: annoy-at-upper-bound
+      knob: annoy_limit
+      env: "10000"
+      expect_value: 10000
+      expect_source: env
+
+    - id: poll-env-applies
+      knob: recv_poll_ms
+      env: "250"
+      expect_value: 250
+      expect_source: env
+    - id: poll-default-when-silent
+      knob: recv_poll_ms
+      env: null
+      expect_value: 100
+      expect_source: default
+    - id: poll-at-lower-bound
+      knob: recv_poll_ms
+      env: "1"
+      expect_value: 1
+      expect_source: env
+    - id: poll-at-upper-bound
+      knob: recv_poll_ms
+      env: "60000"
+      expect_value: 60000
+      expect_source: env
+
+    - id: mystery-env-applies
+      knob: mystery_max_age_s
+      env: "90"
+      expect_value: 90
+      expect_source: env
+    - id: mystery-default-when-silent
+      knob: mystery_max_age_s
+      env: null
+      expect_value: 30
+      expect_source: default
+    - id: mystery-at-lower-bound
+      knob: mystery_max_age_s
+      env: "1"
+      expect_value: 1
+      expect_source: env
+    - id: mystery-at-upper-bound
+      knob: mystery_max_age_s
+      env: "86400"
+      expect_value: 86400
+      expect_source: env
+
+    # --- refused overrides --------------------------------------------------
+    # An empty string is "not set", not a refusal: getenv and os.environ.get
+    # both hand back something falsy and the default stands, unremarked.
+    - id: annoy-empty-is-unset
+      knob: annoy_limit
+      env: ""
+      expect_value: 5
+      expect_source: default
+    - id: annoy-refuse-unparseable
+      knob: annoy_limit
+      env: "abc"
+      expect_value: 5
+      expect_source: default
+    - id: annoy-refuse-trailing-garbage
+      knob: annoy_limit
+      env: "100x"
+      expect_value: 5
+      expect_source: default
+    - id: annoy-refuse-zero
+      knob: annoy_limit
+      env: "0"
+      expect_value: 5
+      expect_source: default
+    - id: annoy-refuse-negative
+      knob: annoy_limit
+      env: "-1"
+      expect_value: 5
+      expect_source: default
+    - id: annoy-refuse-above-range
+      knob: annoy_limit
+      env: "10001"
+      expect_value: 5
+      expect_source: default
+
+    - id: poll-refuse-unparseable
+      knob: recv_poll_ms
+      env: "fast"
+      expect_value: 100
+      expect_source: default
+    - id: poll-refuse-zero
+      knob: recv_poll_ms
+      env: "0"
+      expect_value: 100
+      expect_source: default
+    - id: poll-refuse-negative
+      knob: recv_poll_ms
+      env: "-100"
+      expect_value: 100
+      expect_source: default
+    - id: poll-refuse-above-range
+      knob: recv_poll_ms
+      env: "60001"
+      expect_value: 100
+      expect_source: default
+    - id: poll-refuse-float
+      knob: recv_poll_ms
+      env: "0.1"
+      expect_value: 100
+      expect_source: default
+
+    - id: mystery-refuse-unparseable
+      knob: mystery_max_age_s
+      env: "forever"
+      expect_value: 30
+      expect_source: default
+    - id: mystery-refuse-zero
+      knob: mystery_max_age_s
+      env: "0"
+      expect_value: 30
+      expect_source: default
+    - id: mystery-refuse-negative
+      knob: mystery_max_age_s
+      env: "-30"
+      expect_value: 30
+      expect_source: default
+    - id: mystery-refuse-above-range
+      knob: mystery_max_age_s
+      env: "86401"
+      expect_value: 30
+      expect_source: default
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: resolve_tunables
+    description: |
+        The adapter first checks each entry in fixtures.knobs against the
+        implementation's own default and bounds, then for each entry in
+        fixtures.resolutions sets or clears that knob's environment variable,
+        resolves the value, and records the result and its source.
+
+expected_state:
+  node:
+    # Every knob's default and bounds must match the implementation's own
+    # constants, and every resolution must match its expect_value/expect_source.
+    all_knob_constants_match: true
+    all_resolutions_match: true

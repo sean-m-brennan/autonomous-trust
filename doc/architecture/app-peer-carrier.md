@@ -248,11 +248,15 @@ asked for one. (The earlier claim here also blamed `ping.c` / `ntp.c` binding
 implements both, and the C network process answers the `ping` selector with
 `{"error": "unsupported"}`.)
 
-One hazard survives, recorded in `ISSUES.md`: two nodes given the *same* base on
-the *same* address both bind and neither is told. `net_transport_ip.c` sets
-`SO_REUSEADDR` on every bind, and with the option on both sockets Linux permits
-the duplicate and delivers every datagram to the last binder, so the first node
-goes deaf with no error anywhere. Give co-located nodes different bases.
+That hazard is closed as of 2026-08-10 (`ISSUES.md` 2.4.2). Two nodes given the
+*same* base on the *same* address used to both bind with neither being told:
+`net_transport_ip.c` set `SO_REUSEADDR` on every bind, and with the option on
+both sockets Linux permits the duplicate and delivers every datagram to the last
+binder, so the first node went deaf with no error anywhere. The option is now
+per-socket — dropped on the UDP unicast recv sockets, kept for
+broadcast/multicast and the TCP listeners — so the second node fails
+`EADDRINUSE` and says which knob to move. Give co-located nodes different bases;
+if you forget, you will now be told.
 
 The demos remain containerized for isolation of config and state, not because
 co-location is impossible.
