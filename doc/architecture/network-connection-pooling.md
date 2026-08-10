@@ -6,17 +6,17 @@
 
 # TCP Connection Pooling
 
-The TCP transport can reuse one connection per peer for many messages instead
-of opening a fresh connection for each one. Pooling is optional and off by
-default; when it is off, the transport behaves exactly as it always has, one
-`connect`/`send`/`close` per message.
+The TCP transport reuses one connection per peer for many messages instead
+of opening a fresh connection for each one. Pooling is **on by default** since
+2026-08-10; with `AT_NET_POOL=0` the transport behaves exactly as it always
+has, one `connect`/`send`/`close` per message.
 
-> This describes the Python `TCPNetworkProcess`
-> (`network/tcp.py`). The C transport (`src/c/autonomous_trust/network/`) still
-> connects per message. That difference is safe because pooling changes only
-> the connection *lifecycle*, not the wire *format*: a pooling node and a
-> per-message node interoperate on the same network (see
-> [Interoperability](#interoperability)).
+> Sending is pooled in the Python `TCPNetworkProcess` (`network/tcp.py`); C
+> senders (`src/c/autonomous_trust/network/net_transport_tcp.c`) still connect
+> per message. **Receiving** reuses in both runtimes. Pooling changes only the
+> connection *lifecycle*, not the wire *format*, so a pooling node and a
+> per-message node interoperate — with one historical exception that cost
+> silent message loss, described under [Interoperability](#interoperability).
 
 ## Why pooling exists
 
@@ -138,34 +138,70 @@ threads notice the stop flag and close their own sockets.
 Pooling changes lifecycle, not wire bytes, so a pooling node interoperates with
 a per-message node in either direction:
 
-- A pooling sender talking to a per-message receiver (for example a C node, or a
-  Python node with pooling off) succeeds. The receiver reads the first frame and
-  closes; the sender's next write finds a dead socket, and the reconnect-once
-  logic opens a new connection. The gain is smaller against such a peer because
-  it reconnects per message, but it stays correct.
+- A pooling sender talking to a receiver that takes **one frame per connection**
+  is NOT safe, and no sender-side check can make it safe. Measured against a
+  one-frame receiver that waits 0.5 s before reading: of four frames sent 50 ms
+  apart, **one arrived and three were lost, with no error raised on either
+  side.** The reason there is nothing to detect is that the socket is genuinely
+  healthy at write time — the peer has not closed it, it simply is never going
+  to read a second frame from it, and the frames already in its buffer are
+  discarded when it closes.
+
+  (The narrower case, where the peer has *already* closed, is self-correcting
+  and always was: the frame's length prefix and body go out as two `send`s, the
+  RST from the first is seen by the second, and `_send_tcp_pooled`'s
+  reconnect-once retry re-sends the whole frame. Measured 20/20 delivered. The
+  `_peer_gone` probe added in 2026-08-10 turns that failed-write-and-retry into
+  a clean reconnect — worth having, but it is not what makes pooling safe.)
+
+  What makes it safe is the **receiver** reading many frames per connection,
+  which both runtimes now do. Same four-frame scenario against the fixed C
+  receiver: 4/4 delivered over one connection.
 - A per-message sender talking to a pooling receiver succeeds. The persistent
   reader accepts the connection, reads the single frame, and then sees a clean
   close on the next read and exits. Each message costs one short-lived reader
   thread, which is fine at these cohort sizes.
 
+Both runtimes now reuse on the receive side. C's transport
+(`net_transport_tcp.c`) holds accepted connections open between frames, serving
+the ones it already holds before accepting a new one, bounded by the same
+`AT_NET_CONN_IDLE_TTL` / `AT_NET_MAX_CONNS` knobs with the same defaults. C
+senders still connect per message; that is a missed optimization, not a
+correctness gap, since a per-message sender is exactly the case a pooling
+receiver already handles.
+
 Because the two sides negotiate nothing about connection reuse, a cohort can mix
-pooling and non-pooling nodes freely.
+pooling and non-pooling nodes — with one caveat that is a genuine flag day, and
+the reason `AT_NET_POOL` defaulting to on is a fleet-wide decision rather than a
+per-node one:
+
+> **A C node built before 2026-08-10 takes one frame per connection.** A pooling
+> Python sender talking to one loses frames silently, as measured above. Any
+> fleet still running such nodes must set `AT_NET_POOL=0` until they are
+> rebuilt. Nothing detects this at runtime — the sender sees successful writes
+> and the receiver sees well-formed frames; the messages simply are not there.
 
 ## Configuration
 
 Pooling is controlled from `system.py`, which reads the following environment
-variables at import time. All default to the safe, historical behavior.
+variables at import time. C reads the same names, with the same defaults
+(`net_conn_idle_ttl_resolve` / `net_max_live_conns_resolve` in `net_proc.c`),
+so one deployment setting tunes both runtimes.
 
 | Setting | Env var | Default | Meaning |
 |---------|---------|---------|---------|
-| `net_persistent_conn` | `AT_NET_POOL` | off | Enable connection pooling and persistent readers. |
-| `net_conn_idle_ttl` | `AT_NET_CONN_IDLE_TTL` | 30.0 s | Close a pooled or accepted connection after this long idle. |
+| `net_persistent_conn` | `AT_NET_POOL` | **on** (since 2026-08-10) | Connection pooling and persistent readers. Set `0` for the per-message path. |
+| `net_conn_idle_ttl` | `AT_NET_CONN_IDLE_TTL` | 30 s | Close a pooled or accepted connection after this long idle. |
 | `net_max_live_conns` | `AT_NET_MAX_CONNS` | 64 | Cap on simultaneous live connections per direction. |
 
-Rolling it out is a matter of enabling the flag on a subset of nodes, comparing
-the connection-churn metrics and host CPU against the per-message baseline, and
-enabling it by default once the numbers hold. The per-message path stays in
-place as the fallback the flag selects.
+The per-message path stays in place as the fallback `AT_NET_POOL=0` selects; it
+is the right setting for a fleet with pre-2026-08-10 C nodes still in it, and
+the one to try first if a network problem appears after this change.
+
+Still unmeasured under load: the CPU and churn numbers that motivated pooling
+were taken against the per-message baseline, and the pooled path has unit-level
+coverage on both runtimes but has not been run against the multi-agency cohort.
+`net.tcp.send/reuse` dominating `net.tcp.send/connect` is the signal to look for.
 
 ## Metrics
 

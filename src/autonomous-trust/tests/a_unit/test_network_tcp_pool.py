@@ -64,6 +64,12 @@ def _pooled_proc(pool_enabled=True, max_conns=64, idle_ttl=30.0):
     proc.protocol.peers.find_by_address.return_value = None
     proc.track_recv_stats = MagicMock()
     proc.track_recv_error = MagicMock()
+    # The send-side tests drive the pool with mock sockets, which are not real
+    # file descriptors, so the reuse health probe cannot select() on them.
+    # Stub it healthy here; the probe itself is covered against real
+    # socketpairs in TestPeerClosedDetection below, which is where its
+    # behaviour actually matters.
+    proc._peer_gone = lambda _sock: False
     return proc
 
 
@@ -262,3 +268,74 @@ class TestPersistentReader:
         assert not reader.is_alive()
         with proc._reader_lock:
             assert reader not in proc._reader_threads   # reader removed itself
+
+
+# ---------------------------------------------------------------------------
+# Send-side pool: the peer closed between sends (ISSUES §3.6)
+# ---------------------------------------------------------------------------
+
+class TestPeerClosedDetection:
+    """A write into a socket whose peer has closed SUCCEEDS -- the RST comes
+    back after send() returns -- so without a pre-reuse probe that frame is
+    lost silently and only the NEXT send raises. These use real socketpairs;
+    a mock cannot reproduce the kernel behaviour that makes the bug possible.
+    """
+
+    def test_live_peer_is_not_gone(self):
+        proc = TCPNetworkProcess.__new__(TCPNetworkProcess)
+        near, far = socket.socketpair()
+        try:
+            assert proc._peer_gone(near) is False
+        finally:
+            near.close()
+            far.close()
+
+    def test_closed_peer_is_gone(self):
+        proc = TCPNetworkProcess.__new__(TCPNetworkProcess)
+        near, far = socket.socketpair()
+        try:
+            far.close()  # what a one-frame-per-connection peer does after reading
+            assert proc._peer_gone(near) is True
+        finally:
+            near.close()
+
+    def test_unexpected_inbound_bytes_are_gone(self):
+        """Nothing ever arrives on an outbound connection; bytes here mean the
+        far end is out of step with our framing, so the socket is not reusable."""
+        proc = TCPNetworkProcess.__new__(TCPNetworkProcess)
+        near, far = socket.socketpair()
+        try:
+            far.send(b'unexpected')
+            assert proc._peer_gone(near) is True
+        finally:
+            near.close()
+            far.close()
+
+    def test_closed_socket_is_gone(self):
+        proc = TCPNetworkProcess.__new__(TCPNetworkProcess)
+        near, far = socket.socketpair()
+        near.close()
+        far.close()
+        assert proc._peer_gone(near) is True
+
+    def test_reuse_after_peer_close_reconnects_and_delivers(self):
+        """The regression: peer accepted one frame and hung up. The second
+        send must land on a NEW connection, not vanish into the old one."""
+        proc = _pooled_proc()
+        del proc._peer_gone  # exercise the real probe
+
+        near, far = socket.socketpair()
+        far.close()  # peer took frame 1 and closed
+        proc._conn_pool[('10.0.0.9', 8000)] = _PooledConn(near, time.time())
+
+        fresh = _byte_counting_sock()
+        with patch.object(TCPNetworkProcess, '_open_conn', return_value=fresh) as opened:
+            proc._send_tcp_pooled(b'frame two', '10.0.0.9', 8000)
+
+        opened.assert_called_once_with('10.0.0.9', 8000)
+        assert fresh.send.called, 'frame two must go out on the new connection'
+        sent = b''.join(c.args[0] for c in fresh.send.call_args_list)
+        assert sent == struct.pack('!I', len(b'frame two')) + b'frame two'
+        # and the dead socket is out of the pool, replaced by the live one
+        assert proc._conn_pool[('10.0.0.9', 8000)].sock is fresh
+        near.close()

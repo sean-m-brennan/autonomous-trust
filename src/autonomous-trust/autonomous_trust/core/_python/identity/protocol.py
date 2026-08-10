@@ -51,7 +51,12 @@ class IdentityProtocol(Protocol):
        a. add as branch to history
        b. merge if ok
     6. listen on closed broadcast channel for group updates (address list additions) <- Group
-    7. listen for hierarchy roots # FIXME
+    7. listen for hierarchy roots
+       - NOT IMPLEMENTED: the gateway hierarchy (parent_gateway, child_groups,
+         child_gateways) is seeded from config at startup, never discovered at
+         runtime. Doing it means new identity messages in both runtimes; it is
+         tracked with the rest of the runtime-hierarchy work in ISSUES §10.2
+         (gateway reputation tree), not as a config deferral.
 
     Items 3, 4, & 5 are concurrent
     """

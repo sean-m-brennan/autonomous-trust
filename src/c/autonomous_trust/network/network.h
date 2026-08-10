@@ -68,6 +68,24 @@
 #define NET_MYSTERY_MAX_AGE_SEC_MIN 1
 #define NET_MYSTERY_MAX_AGE_SEC_MAX 86400
 
+/* Persistent-connection bounds, shared with Python's AT_NET_CONN_IDLE_TTL /
+ * AT_NET_MAX_CONNS (system.py). A TCP sender with pooling on keeps its
+ * connection open, so the receiver holds one per active peer: the TTL closes
+ * a connection gone quiet, and the cap stops a hostile peer exhausting our
+ * descriptors by opening many. Read via net_conn_idle_ttl_resolve() /
+ * net_max_live_conns_resolve().
+ *
+ * Python's TTL default is 30.0 seconds; the value is the same, only the type
+ * differs (there is no sub-second use for it, and an integer keeps the knob
+ * parseable by the shared resolver). */
+#define NET_CONN_IDLE_TTL_SEC 30
+#define NET_CONN_IDLE_TTL_SEC_MIN 1
+#define NET_CONN_IDLE_TTL_SEC_MAX 86400
+
+#define NET_MAX_LIVE_CONNS 64
+#define NET_MAX_LIVE_CONNS_MIN 1
+#define NET_MAX_LIVE_CONNS_MAX 256
+
 /**
  * @brief Address family / link-layer family a transport operates on.
  *
@@ -223,6 +241,20 @@ int net_recv_poll_ms_resolve(net_knob_source_t *src, logger_t *logger);
           \result <= NET_MYSTERY_MAX_AGE_SEC_MAX;
 */
 int net_mystery_max_age_resolve(net_knob_source_t *src, logger_t *logger);
+
+/*@
+  requires src == \null || \valid(src);
+  ensures \result >= NET_CONN_IDLE_TTL_SEC_MIN &&
+          \result <= NET_CONN_IDLE_TTL_SEC_MAX;
+*/
+int net_conn_idle_ttl_resolve(net_knob_source_t *src, logger_t *logger);
+
+/*@
+  requires src == \null || \valid(src);
+  ensures \result >= NET_MAX_LIVE_CONNS_MIN &&
+          \result <= NET_MAX_LIVE_CONNS_MAX;
+*/
+int net_max_live_conns_resolve(net_knob_source_t *src, logger_t *logger);
 
 /**
  * @brief Split a CIDR string into its address and prefix-length parts.

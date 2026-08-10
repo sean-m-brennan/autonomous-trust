@@ -694,6 +694,16 @@ class AutonomousTrust(Protocol):
         configs[Process.level] = self._log_level
 
         net_cfg = configs[CfgIds.network]
+        # A config directory can outlive the address it recorded -- a container
+        # restarted onto a different subnet keeps its var/at but not its IP --
+        # and an address we no longer hold is one we cannot bind. The stored
+        # address stays authoritative while it is still present on this host.
+        try:
+            if net_cfg.refresh():
+                net_cfg.to_file(os.path.join(cfg_dir, CfgIds.network + Configuration.file_ext))
+        except OSError as err:
+            self.logger.warning('%s:  Could not re-derive the network address: %s'
+                                % (self.name, err))
         self.identity = configs[CfgIds.identity]
         self.identity.address = net_cfg.ip4
         if preferred_proto_ver == 6:
