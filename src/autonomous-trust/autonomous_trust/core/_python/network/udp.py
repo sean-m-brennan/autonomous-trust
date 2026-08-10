@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import errno
 import socket
 import struct
 
@@ -40,13 +41,14 @@ def bind_source_address(sock, address, logger=None, stream=False):
     broadcasts. Binding the source makes the address a node transmits FROM equal
     the address it is known BY.
 
-    Port collisions: always bind port 0 and NEVER set SO_REUSEADDR here. The
-    recv sockets hold (my_address, comm_port) WITH SO_REUSEADDR, and UDP lets two
-    sockets share addr:port only when BOTH set it -- so omitting it is what makes
-    the kernel's autobind unable to hand out the port this node is listening on,
-    even when AT_COMM_PORT is configured inside the ephemeral range. Verified:
-    an explicit same-port bind is refused without the option and succeeds with
-    it, and 4000 concurrent autobinds never landed on the held port.
+    Port collisions: always bind port 0 and NEVER set SO_REUSEADDR here. UDP
+    lets two sockets share addr:port only when BOTH set it -- so omitting it is
+    what makes the kernel's autobind unable to hand out the port this node is
+    listening on, even when AT_COMM_PORT is configured inside the ephemeral
+    range. Verified: an explicit same-port bind is refused without the option
+    and succeeds with it, and 4000 concurrent autobinds never landed on the held
+    port. The unicast recv sockets no longer set it either (see _init_udp_ptp),
+    so that now holds from both directions.
 
     For TCP, `stream=True` sets IP_BIND_ADDRESS_NO_PORT so the kernel defers port
     selection to connect() and keeps 4-tuple uniqueness. Without it, binding
@@ -87,6 +89,24 @@ def bind_source_address(sock, address, logger=None, stream=False):
         return False
 
 
+def log_bind_failure(logger, sock_name, address, port, my_ip, err):
+    """Say which knob to move, not just that a bind failed.
+
+    EADDRINUSE on a unicast recv socket has one overwhelmingly likely cause --
+    a second AT node given the same base port on the same address -- and that
+    is exactly the case an operator cannot read off the bare errno.
+    """
+    if isinstance(err, OSError) and err.errno == errno.EADDRINUSE:
+        logger.error(
+            'Failed to bind %s recv to %s:%s -- already held, most likely by another '
+            'AT node on this address. Give each co-located node a distinct base port '
+            '(config net_cfg.port, or AT_COMM_PORT). Detected IP is %s'
+            % (sock_name, address, port, my_ip))
+    else:
+        logger.error('Failed to bind %s recv to %s:%s (%s), detected IP is %s'
+                     % (sock_name, address, port, err, my_ip))
+
+
 class UDPNetworkProcess(NetworkProcess):
     """
     Implementation of NetworkProcess that uses UDP for point-to-point and one-to-many
@@ -118,21 +138,27 @@ class UDPNetworkProcess(NetworkProcess):
 
     def _init_udp_ptp(self):
         self.recv_ptp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        self.recv_ptp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # No SO_REUSEADDR, deliberately. One node owns (my_address, port); with
+        # the option set on both sockets the kernel accepts a second node's bind
+        # of the identical addr:port and delivers every datagram to the LAST
+        # binder, so the first node goes deaf with nothing logged. Without it,
+        # the second node fails EADDRINUSE here and says so. The mcast/bcast
+        # socket in _init_mcast still sets it -- there, shared listeners are the
+        # point. Mirrors the C side's net_transport_ip_bind(reuse=false).
         try:
             self.recv_ptp_sock.bind((self.my_address, self.port))
         except (Exception, OSError) as err:
-            self.logger.error('Failed to bind to %s:%s, detected IP is %s' % (self.my_address, self.port, self.my_ip))
+            log_bind_failure(self.logger, 'peer', self.my_address, self.port, self.my_ip, err)
             raise err
         self.logger.info('Bound peer recv to %s:%s' % (self.my_address, self.port))
 
     def _init_udp_grp(self):
         self.recv_grp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        self.recv_grp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Likewise exclusive -- see _init_udp_ptp.
         try:
             self.recv_grp_sock.bind((self.my_address, self.group_port))
         except (Exception, OSError) as err:
-            self.logger.error('Failed to bind to %s:%s, detected IP is %s' % (self.my_address, self.port, self.my_ip))
+            log_bind_failure(self.logger, 'group', self.my_address, self.group_port, self.my_ip, err)
             raise err
         self.logger.info('Bound group recv to %s:%s' % (self.my_address, self.group_port))
 
@@ -142,6 +168,9 @@ class UDPNetworkProcess(NetworkProcess):
             self.sock_options = (socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, self.mcast_ttl)
             self.manycast_addr = self.net_cfg.multicast_v4_address
             self.recv_cast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            # Load-bearing here, unlike the unicast sockets: several listeners
+            # sharing one group addr:port is the entire point of multicast, and
+            # without the option a second local subscriber cannot join at all.
             self.recv_cast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 self.recv_cast_sock.bind((self.manycast_addr, self.port))
@@ -159,6 +188,8 @@ class UDPNetworkProcess(NetworkProcess):
             self.sock_options = (socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             self.manycast_addr = self.net_cfg.ip4_broadcast
             self.recv_cast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            # Load-bearing, as in the multicast branch above: the broadcast
+            # addr:port is shared by every listener on the segment.
             self.recv_cast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 self.recv_cast_sock.bind((self.manycast_addr, self.port))

@@ -125,6 +125,22 @@ void net_proc_test_backdate_deferred(int64_t secs);
 /** @brief Run the age-out sweep now; returns the number of surviving entries. */
 size_t net_proc_test_sweep_stale(void);
 
+/* ---- Test-only hooks for the pest / annoy-limit path ----
+ * A tunable that never reaches its comparison is decorative, which is the
+ * failure mode ISSUES.md 2.4.4 is about. These let a test drive the counter
+ * and observe the blacklist promotion without a live socket. */
+
+/** @brief Clear the pest counters and the blacklist. */
+void net_proc_test_reset_pests(void);
+
+/** @brief Record one annoyance from @p address, exactly as the receive path
+ *         does; promotes to the blacklist past the resolved annoy limit. */
+void net_proc_test_track_annoy(const char *address);
+
+/** @brief True iff @p address is currently blacklisted (its traffic is
+ *         dropped before any further processing). */
+bool net_proc_test_is_rejected(const char *address);
+
 /* ---- Test-only: route_to_process capture ----
  * Tests for AT_DISCOVERY_CROSS_CLUSTER observe whether a forwarded
  * broadcast preserved the wire payload's self-reported from_whom.address
