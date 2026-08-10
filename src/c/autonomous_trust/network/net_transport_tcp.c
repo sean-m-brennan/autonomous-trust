@@ -259,13 +259,17 @@ static int tcp_open_common(net_transport_ctx_t **out_ctx,
     int port = params->port_base;
     int grp_port = port + 1;
 
-    if (net_transport_ip_bind(&ctx->cfg, address, port, true,
+    /* SO_REUSEADDR on both listeners, and it costs nothing: TCP grants it only
+     * over a socket in TIME_WAIT, never over a live LISTEN, so a second node
+     * on this addr:port still fails EADDRINUSE. What it buys is a restart that
+     * does not have to wait out TIME_WAIT on the previous run's connections. */
+    if (net_transport_ip_bind(&ctx->cfg, address, port, true, true,
                               &ctx->recv_ptp, params->logger) != 0)
         goto fail;
     log_info(params->logger, "Bound peer recv to %s:%d (TCP)\n",
              address ? address : "*", port);
 
-    if (net_transport_ip_bind(&ctx->cfg, address, grp_port, true,
+    if (net_transport_ip_bind(&ctx->cfg, address, grp_port, true, true,
                               &ctx->recv_grp, params->logger) != 0)
         goto fail;
     log_info(params->logger, "Bound group recv to %s:%d (TCP)\n",

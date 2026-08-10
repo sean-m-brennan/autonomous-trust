@@ -150,7 +150,6 @@ char NET_FN_PING_AT[]    = "ping_at";
 char NET_FN_EXCLUDE[]    = "exclude";
 char NET_FN_READMIT[]    = "readmit";
 
-static const int RECV_POLL_TIMEOUT_MS = 100;
 
 /****************************
  * Base port resolution
@@ -242,6 +241,120 @@ void net_port_resolve_reset(void)
     env_comm_port_read = false;
     env_comm_port_bad  = false;
     env_comm_port_raw[0] = '\0';
+}
+
+/****************************
+ * Network tunables (env → default)
+ *
+ * One resolver shared by all three knobs, because the cache-refuse-and-keep-
+ * the-default logic is the interesting part and triplicating it is how the
+ * three would drift from each other the way C drifted from Python. Same
+ * discipline as comm_port_from_env above: read once, strict parse, range
+ * check, refuse loudly.
+ ****************************/
+
+typedef struct {
+    const char *env_name;
+    int         dflt;
+    int         min;
+    int         max;
+    /* cache */
+    int         value;      /**< resolved override; only meaningful when found */
+    bool        read;
+    bool        found;      /**< a usable override was present */
+    bool        bad;
+    char        raw[32];
+} net_knob_t;
+
+static net_knob_t knob_annoy_limit = {
+    "AT_NET_ANNOY_LIMIT", NET_ANNOY_LIMIT,
+    NET_ANNOY_LIMIT_MIN, NET_ANNOY_LIMIT_MAX, 0, false, false, false, {0},
+};
+static net_knob_t knob_recv_poll_ms = {
+    "AT_NET_RECV_POLL_MS", NET_RECV_POLL_MS,
+    NET_RECV_POLL_MS_MIN, NET_RECV_POLL_MS_MAX, 0, false, false, false, {0},
+};
+static net_knob_t knob_mystery_max_age = {
+    "AT_MYSTERY_MAX_AGE_SEC", NET_MYSTERY_MAX_AGE_SEC,
+    NET_MYSTERY_MAX_AGE_SEC_MIN, NET_MYSTERY_MAX_AGE_SEC_MAX,
+    0, false, false, false, {0},
+};
+
+const char *net_knob_source_name(net_knob_source_t src)
+{
+    switch (src) {
+        case KNOB_SRC_ENV: return "env";
+        case KNOB_SRC_DEFAULT:
+        default:           return "default";
+    }
+}
+
+static int net_knob_resolve(net_knob_t *k, net_knob_source_t *src,
+                            logger_t *logger)
+{
+    if (!k->read) {
+        k->read = true;
+        const char *raw = getenv(k->env_name);
+        if (raw != NULL && raw[0] != '\0') {
+            snprintf(k->raw, sizeof(k->raw), "%s", raw);
+            char *end = NULL;
+            errno = 0;
+            long val = strtol(raw, &end, 10);
+            if (errno != 0 || end == raw || (end != NULL && *end != '\0') ||
+                val < (long)k->min || val > (long)k->max) {
+                k->bad = true;
+            } else {
+                k->value = (int)val;
+                k->found = true;
+            }
+        }
+    }
+    if (k->bad) {
+        /* Reported on every consultation that carries a logger, for the same
+         * reason as the port: the resolver can run before the logger exists,
+         * and a refused override must not be the one thing that goes
+         * unlogged. */
+        log_warn(logger,
+                 "Network: refusing %s='%s' (want an integer in [%d, %d]); "
+                 "using default %d\n",
+                 k->env_name, k->raw, k->min, k->max, k->dflt);
+    }
+    if (k->found) {
+        if (src != NULL) *src = KNOB_SRC_ENV;
+        return k->value;
+    }
+    if (src != NULL) *src = KNOB_SRC_DEFAULT;
+    return k->dflt;
+}
+
+int net_annoy_limit_resolve(net_knob_source_t *src, logger_t *logger)
+{
+    return net_knob_resolve(&knob_annoy_limit, src, logger);
+}
+
+int net_recv_poll_ms_resolve(net_knob_source_t *src, logger_t *logger)
+{
+    return net_knob_resolve(&knob_recv_poll_ms, src, logger);
+}
+
+int net_mystery_max_age_resolve(net_knob_source_t *src, logger_t *logger)
+{
+    return net_knob_resolve(&knob_mystery_max_age, src, logger);
+}
+
+/* Test seam, as net_port_resolve_reset above: forget every cached tunable so
+ * one process can exercise more than one value. Not declared in network.h. */
+void net_knobs_resolve_reset(void)
+{
+    net_knob_t *all[] = { &knob_annoy_limit, &knob_recv_poll_ms,
+                          &knob_mystery_max_age };
+    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
+        all[i]->value  = 0;
+        all[i]->read   = false;
+        all[i]->found  = false;
+        all[i]->bad    = false;
+        all[i]->raw[0] = '\0';
+    }
 }
 
 /****************************
@@ -375,7 +488,10 @@ static void pest_track_annoy(const char *address)
         new_count = 1;
         pest_count++;
     }
-    over_limit = (new_count > NET_ANNOY_LIMIT);
+    /* Resolved, not the bare macro: AT_NET_ANNOY_LIMIT must reach this
+     * comparison or the override is decorative. Cached after the first call,
+     * so this stays cheap on the receive path. */
+    over_limit = (new_count > net_annoy_limit_resolve(NULL, NULL));
     if (over_limit) {
         /* compact slot out of the array */
         for (size_t i = slot; i + 1 < pest_count; i++)
@@ -385,6 +501,28 @@ static void pest_track_annoy(const char *address)
     pthread_mutex_unlock(&pest_lock);
     if (over_limit)
         blacklist_address(address);
+}
+
+/* ---- Test-only hooks; see net_proc_priv.h for why they exist. ---- */
+
+void net_proc_test_reset_pests(void)
+{
+    pthread_mutex_lock(&pest_lock);
+    pest_count = 0;
+    pthread_mutex_unlock(&pest_lock);
+    pthread_mutex_lock(&rejected_lock);
+    rejected_count = 0;
+    pthread_mutex_unlock(&rejected_lock);
+}
+
+void net_proc_test_track_annoy(const char *address)
+{
+    pest_track_annoy(address);
+}
+
+bool net_proc_test_is_rejected(const char *address)
+{
+    return reject_message(address);
 }
 
 /****************************
@@ -429,17 +567,15 @@ static pthread_mutex_t deferred_lock = PTHREAD_MUTEX_INITIALIZER;
  * event-driven (on peer admission), not a polling thread, so we bound the
  * lifetime by wall-time instead of retry count. Without this, a burst of
  * un-resolvable encrypted frames permanently occupies the bounded queue and
- * starves legitimate deferrals. Overridable via AT_MYSTERY_MAX_AGE_SEC. */
-#define DEFERRED_MAX_AGE_SEC_DEFAULT 30
+ * starves legitimate deferrals. Overridable via AT_MYSTERY_MAX_AGE_SEC.
+ *
+ * Python bounds the same queue the same way as of 2026-08-10 (ISSUES.md 2.4.4):
+ * it used to count retries on a ~0.5 s polling loop, which only approximated a
+ * wall-time bound and drifted under load. Both sides now hold a deferral for
+ * NET_MYSTERY_MAX_AGE_SEC seconds. */
 static int64_t _deferred_max_age_s(void)
 {
-    const char *e = getenv("AT_MYSTERY_MAX_AGE_SEC");
-    if (e != NULL && e[0] != '\0') {
-        long v = atol(e);
-        if (v > 0)
-            return (int64_t)v;
-    }
-    return DEFERRED_MAX_AGE_SEC_DEFAULT;
+    return (int64_t)net_mystery_max_age_resolve(NULL, NULL);
 }
 
 static int64_t _deferred_now_s(void)
@@ -452,8 +588,9 @@ static int64_t _deferred_now_s(void)
 
 /* Free + compact out entries older than the age-out window, preserving
  * insertion order (so slot 0 remains the oldest survivor). Caller MUST hold
- * deferred_lock. Emits a net.mystery/aged_out counter per reclaimed entry,
- * mirroring Python's _probes.counter('net.mystery', 'drop', 'max_retries'). */
+ * deferred_lock. Emits a net.mystery/aged_out/max_age counter per reclaimed
+ * entry — the identical triple Python emits since 2026-08-10, when it moved
+ * from a retry count to this age bound (ISSUES.md 2.4.4). */
 static void _deferred_sweep_stale_locked(int64_t now_s)
 {
     int64_t max_age = _deferred_max_age_s();
@@ -1242,7 +1379,8 @@ static int net_encrypt_and_send(const identity_t *myself, const net_wire_msg_t *
  *
  * Fairness (divergence.md H9, Python INBOUND_BUDGET=32): C parallelizes
  * the three logical channels (peer / broadcast / group) across distinct
- * OS threads, each blocking in recv() with RECV_POLL_TIMEOUT_MS=100ms.
+ * OS threads, each blocking in recv() for the resolved poll timeout
+ * (NET_RECV_POLL_MS=100ms by default, AT_NET_RECV_POLL_MS to override).
  * One channel's traffic cannot starve another's because they have no
  * shared drain loop or shared work queue; OS scheduling provides the
  * fairness invariant that Python's single-event-loop drain has to
@@ -1400,6 +1538,9 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
 static void *peer_receiver_thread(void *arg)
 {
     net_thread_ctx_t *ctx = (net_thread_ctx_t *)arg;
+    /* Resolved once per thread rather than per iteration: the value
+     * is cached anyway, and hoisting keeps the recv loop a loop. */
+    const int poll_ms = net_recv_poll_ms_resolve(NULL, NULL);
     while (!(*ctx->stop))
     {
         uint8_t *buf = NULL;
@@ -1409,7 +1550,7 @@ static void *peer_receiver_thread(void *arg)
         int ret = ctx->transport->recv(ctx->ctx, NET_CHAN_PEER,
                                        &buf, &nbytes,
                                        from_addr, sizeof(from_addr),
-                                       RECV_POLL_TIMEOUT_MS);
+                                       poll_ms);
         if (ret == ENOMSG || ret < 0) {
             free(buf);
             continue;
@@ -1516,6 +1657,9 @@ void handle_inbound_broadcast(net_thread_ctx_t *ctx,
 static void *broadcast_receiver_thread(void *arg)
 {
     net_thread_ctx_t *ctx = (net_thread_ctx_t *)arg;
+    /* Resolved once per thread rather than per iteration: the value
+     * is cached anyway, and hoisting keeps the recv loop a loop. */
+    const int poll_ms = net_recv_poll_ms_resolve(NULL, NULL);
     while (!(*ctx->stop))
     {
         uint8_t *buf = NULL;
@@ -1525,7 +1669,7 @@ static void *broadcast_receiver_thread(void *arg)
         int ret = ctx->transport->recv(ctx->ctx, NET_CHAN_BROADCAST,
                                        &buf, &nbytes,
                                        from_addr, sizeof(from_addr),
-                                       RECV_POLL_TIMEOUT_MS);
+                                       poll_ms);
         if (ret == ENOMSG || ret < 0) {
             free(buf);
             continue;
@@ -1548,6 +1692,9 @@ static void *broadcast_receiver_thread(void *arg)
 static void *group_receiver_thread(void *arg)
 {
     net_thread_ctx_t *ctx = (net_thread_ctx_t *)arg;
+    /* Resolved once per thread rather than per iteration: the value
+     * is cached anyway, and hoisting keeps the recv loop a loop. */
+    const int poll_ms = net_recv_poll_ms_resolve(NULL, NULL);
     while (!(*ctx->stop))
     {
         uint8_t *buf = NULL;
@@ -1557,7 +1704,7 @@ static void *group_receiver_thread(void *arg)
         int ret = ctx->transport->recv(ctx->ctx, NET_CHAN_GROUP,
                                        &buf, &nbytes,
                                        from_addr, sizeof(from_addr),
-                                       RECV_POLL_TIMEOUT_MS);
+                                       poll_ms);
         if (ret == ENOMSG || ret < 0) {
             free(buf);
             continue;
@@ -1738,6 +1885,23 @@ static int network_run(const net_transport_t *transport,
     int port_num = net_port_resolve(net_cfg->port, &port_src, logger);
     log_info(logger, "Network: base port %d from %s (group %d)\n",
              port_num, net_port_source_name(port_src), port_num + 1);
+
+    /* Resolve the tunables here too, with a logger, so startup states what is
+     * in force and where it came from. The consumers call the same resolvers
+     * without a logger; the values are cached, so this is the one place a
+     * refused override gets reported and an applied one is visible at all. */
+    net_knob_source_t annoy_src = KNOB_SRC_DEFAULT,
+                      poll_src  = KNOB_SRC_DEFAULT,
+                      myst_src  = KNOB_SRC_DEFAULT;
+    int annoy_limit = net_annoy_limit_resolve(&annoy_src, logger);
+    int poll_ms     = net_recv_poll_ms_resolve(&poll_src, logger);
+    int myst_age    = net_mystery_max_age_resolve(&myst_src, logger);
+    log_info(logger,
+             "Network: annoy limit %d from %s, recv poll %d ms from %s, "
+             "mystery max age %d s from %s\n",
+             annoy_limit, net_knob_source_name(annoy_src),
+             poll_ms, net_knob_source_name(poll_src),
+             myst_age, net_knob_source_name(myst_src));
 
     /* Extract identity before opening the transport — non-IP transports
      * (DTN) derive their local endpoint name from myself->uuid and need

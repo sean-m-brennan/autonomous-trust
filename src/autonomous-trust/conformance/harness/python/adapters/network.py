@@ -349,6 +349,9 @@ class NetworkAdapter:
         if case.name == 'port-resolution':
             self._run_port_resolution(case)
             return
+        if case.name == 'tunables-resolution':
+            self._run_tunables_resolution(case)
+            return
         raise NotImplementedError(
             f'network scenario {case.name!r} not implemented'
         )
@@ -409,6 +412,86 @@ class NetworkAdapter:
                 os.environ.pop('AT_COMM_PORT', None)
             else:
                 os.environ['AT_COMM_PORT'] = saved
+
+    def _run_tunables_resolution(self, case: Case) -> None:
+        """Network-tunable resolution: env -> compile-time default.
+
+        Runs the scenario's table against the production resolvers. The C
+        adapter runs the same table against net_annoy_limit_resolve /
+        net_recv_poll_ms_resolve / net_mystery_max_age_resolve, so a knob that
+        exists on one side only -- which is exactly what this case was written
+        to prevent recurring -- fails here.
+        """
+        from autonomous_trust.core._python import system as at_system
+
+        fixtures = case.data.get('fixtures') or {}
+        knobs = {k['name']: k for k in (fixtures.get('knobs') or [])}
+        table = fixtures.get('resolutions') or []
+        if not knobs:
+            raise AssertionError('scenario: fixtures.knobs missing or empty')
+        if not table:
+            raise AssertionError('scenario: fixtures.resolutions missing or empty')
+
+        # name -> (resolver, default, min, max) as THIS implementation has them.
+        mine = {
+            'annoy_limit': (at_system.resolve_annoy_limit,
+                            at_system.default_annoy_limit,
+                            at_system.annoy_limit_min,
+                            at_system.annoy_limit_max),
+            'recv_poll_ms': (at_system.resolve_recv_poll_ms,
+                             at_system.default_recv_poll_ms,
+                             at_system.recv_poll_ms_min,
+                             at_system.recv_poll_ms_max),
+            'mystery_max_age_s': (at_system.resolve_mystery_max_age_s,
+                                  at_system.default_mystery_max_age_s,
+                                  at_system.mystery_max_age_s_min,
+                                  at_system.mystery_max_age_s_max),
+        }
+
+        # Pinned in the scenario so a drift in either side's constants fails
+        # here instead of agreeing on a value neither side got from the other.
+        for name, spec in knobs.items():
+            if name not in mine:
+                raise AssertionError(f'scenario knob {name!r} has no Python resolver')
+            _, dflt, lo, hi = mine[name]
+            for key, actual in (('default', dflt), ('min', lo), ('max', hi)):
+                if key in spec and spec[key] != actual:
+                    raise AssertionError(
+                        f'{name}.{key}: scenario says {spec[key]}, Python says {actual}')
+
+        env_names = {name: knobs[name]['env'] for name in knobs}
+        saved = {var: os.environ.get(var) for var in env_names.values()}
+        try:
+            for row in table:
+                rid = row.get('id', '?')
+                name = row['knob']
+                if name not in mine:
+                    raise AssertionError(f'{rid}: unknown knob {name!r}')
+                resolver = mine[name][0]
+                var = env_names[name]
+                env = row.get('env')
+                want_value = row['expect_value']
+                want_src = row['expect_source']
+
+                if env is None:
+                    os.environ.pop(var, None)
+                else:
+                    os.environ[var] = str(env)
+
+                got, got_src = resolver()
+                shown = '(unset)' if env is None else repr(env)
+                if got != want_value:
+                    raise AssertionError(
+                        f'{rid}: {var}={shown} -> {name} {got}, want {want_value}')
+                if got_src != want_src:
+                    raise AssertionError(
+                        f'{rid}: {var}={shown} -> source {got_src!r}, want {want_src!r}')
+        finally:
+            for var, val in saved.items():
+                if val is None:
+                    os.environ.pop(var, None)
+                else:
+                    os.environ[var] = val
 
     def _run_peer_encrypted_roundtrip(self, case: Case) -> None:
         """Exercise A.encrypt → B.decrypt → Message.parse end-to-end.

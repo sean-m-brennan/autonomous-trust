@@ -2140,6 +2140,182 @@ static int run_port_resolution(const at_case_t *c, char *err, size_t err_len) {
     return rc;
 }
 
+/* Network-tunable resolution (scenario `tunables-resolution`).
+ *
+ * Walks fixtures.knobs to check this implementation's own defaults and bounds,
+ * then fixtures.resolutions, driving each knob's environment variable and
+ * asserting the resolved (value, source). Python's adapter runs the same table
+ * against system.resolve_annoy_limit / resolve_recv_poll_ms /
+ * resolve_mystery_max_age_s, so a knob that exists on one side only -- which is
+ * exactly what this case was written to prevent recurring -- fails here. */
+extern void net_knobs_resolve_reset(void);  /* test seam, not in network.h */
+
+typedef struct {
+    const char *name;
+    int (*resolve)(net_knob_source_t *, logger_t *);
+    int dflt;
+    int min;
+    int max;
+} knob_spec_t;
+
+static const knob_spec_t knob_specs[] = {
+    { "annoy_limit",       net_annoy_limit_resolve,
+      NET_ANNOY_LIMIT, NET_ANNOY_LIMIT_MIN, NET_ANNOY_LIMIT_MAX },
+    { "recv_poll_ms",      net_recv_poll_ms_resolve,
+      NET_RECV_POLL_MS, NET_RECV_POLL_MS_MIN, NET_RECV_POLL_MS_MAX },
+    { "mystery_max_age_s", net_mystery_max_age_resolve,
+      NET_MYSTERY_MAX_AGE_SEC, NET_MYSTERY_MAX_AGE_SEC_MIN,
+      NET_MYSTERY_MAX_AGE_SEC_MAX },
+};
+#define KNOB_SPEC_COUNT (sizeof(knob_specs) / sizeof(knob_specs[0]))
+
+static const knob_spec_t *knob_spec_find(const char *name) {
+    if (name == NULL) return NULL;
+    for (size_t i = 0; i < KNOB_SPEC_COUNT; i++)
+        if (strcmp(knob_specs[i].name, name) == 0)
+            return &knob_specs[i];
+    return NULL;
+}
+
+/* Check one scenario-pinned constant against this implementation's own. */
+static int knob_const_check(json_t *spec, const char *key, const char *name,
+                            int actual, char *err, size_t err_len) {
+    json_t *j = json_object_get(spec, key);
+    if (json_is_integer(j) && (int)json_integer_value(j) != actual) {
+        snprintf(err, err_len, "%s.%s: scenario says %d, C says %d",
+                 name, key, (int)json_integer_value(j), actual);
+        return -1;
+    }
+    return 0;
+}
+
+static int run_tunables_resolution(const at_case_t *c, char *err, size_t err_len) {
+    json_t *fixtures = json_object_get(c->data, "fixtures");
+    json_t *knobs = fixtures != NULL
+        ? json_object_get(fixtures, "knobs") : NULL;
+    json_t *table = fixtures != NULL
+        ? json_object_get(fixtures, "resolutions") : NULL;
+    if (!json_is_array(knobs) || json_array_size(knobs) == 0) {
+        snprintf(err, err_len, "scenario: fixtures.knobs missing or empty");
+        return -1;
+    }
+    if (!json_is_array(table) || json_array_size(table) == 0) {
+        snprintf(err, err_len, "scenario: fixtures.resolutions missing or empty");
+        return -1;
+    }
+
+    /* Defaults and bounds are pinned in the scenario so a drift in either
+     * side's constants fails here rather than agreeing on a value neither side
+     * got from the other. */
+    size_t nk = json_array_size(knobs);
+    for (size_t i = 0; i < nk; i++) {
+        json_t *spec = json_array_get(knobs, i);
+        const char *name = json_string_value(json_object_get(spec, "name"));
+        const knob_spec_t *k = knob_spec_find(name);
+        if (k == NULL) {
+            snprintf(err, err_len, "scenario knob '%s' has no C resolver",
+                     name != NULL ? name : "(null)");
+            return -1;
+        }
+        if (knob_const_check(spec, "default", name, k->dflt, err, err_len) != 0 ||
+            knob_const_check(spec, "min", name, k->min, err, err_len) != 0 ||
+            knob_const_check(spec, "max", name, k->max, err, err_len) != 0)
+            return -1;
+    }
+
+    /* Restore whatever the runner was invoked with, so one case cannot leak an
+     * override into the next. */
+    char saved_buf[KNOB_SPEC_COUNT][64];
+    bool had_saved[KNOB_SPEC_COUNT];
+    const char *env_names[KNOB_SPEC_COUNT];
+    for (size_t i = 0; i < KNOB_SPEC_COUNT; i++) {
+        env_names[i] = NULL;
+        saved_buf[i][0] = '\0';
+        had_saved[i] = false;
+    }
+    /* Env var names come from the scenario, so the two sides also agree on
+     * WHICH variable each knob reads. */
+    for (size_t i = 0; i < nk; i++) {
+        json_t *spec = json_array_get(knobs, i);
+        const char *name = json_string_value(json_object_get(spec, "name"));
+        const char *var = json_string_value(json_object_get(spec, "env"));
+        if (var == NULL) {
+            snprintf(err, err_len, "scenario knob '%s': missing env name",
+                     name != NULL ? name : "(null)");
+            return -1;
+        }
+        for (size_t j = 0; j < KNOB_SPEC_COUNT; j++) {
+            if (strcmp(knob_specs[j].name, name) == 0) {
+                env_names[j] = var;
+                const char *cur = getenv(var);
+                if (cur != NULL) {
+                    had_saved[j] = true;
+                    snprintf(saved_buf[j], sizeof(saved_buf[j]), "%s", cur);
+                }
+                break;
+            }
+        }
+    }
+
+    int rc = 0;
+    size_t n = json_array_size(table);
+    for (size_t i = 0; i < n && rc == 0; i++) {
+        json_t *row = json_array_get(table, i);
+        const char *id = json_string_value(json_object_get(row, "id"));
+        if (id == NULL) id = "?";
+        const char *name = json_string_value(json_object_get(row, "knob"));
+        const knob_spec_t *k = knob_spec_find(name);
+        if (k == NULL) {
+            snprintf(err, err_len, "%s: unknown knob '%s'", id,
+                     name != NULL ? name : "(null)");
+            rc = -1;
+            break;
+        }
+        const char *var = NULL;
+        for (size_t j = 0; j < KNOB_SPEC_COUNT; j++)
+            if (&knob_specs[j] == k) var = env_names[j];
+        if (var == NULL) {
+            snprintf(err, err_len, "%s: knob '%s' not declared in fixtures.knobs",
+                     id, name);
+            rc = -1;
+            break;
+        }
+
+        json_t *j_env = json_object_get(row, "env");
+        const char *env = json_string_value(j_env);   /* NULL when YAML null */
+        int want_value = (int)json_integer_value(json_object_get(row, "expect_value"));
+        const char *want_src =
+            json_string_value(json_object_get(row, "expect_source"));
+        if (want_src == NULL) want_src = "";
+
+        if (env != NULL) setenv(var, env, 1);
+        else unsetenv(var);
+        net_knobs_resolve_reset();  /* the override is read once and cached */
+
+        net_knob_source_t src = KNOB_SRC_DEFAULT;
+        int got = k->resolve(&src, NULL);
+        const char *got_src = net_knob_source_name(src);
+
+        if (got != want_value) {
+            snprintf(err, err_len, "%s: %s=%s -> %s %d, want %d",
+                     id, var, env != NULL ? env : "(unset)", name, got, want_value);
+            rc = -1;
+        } else if (strcmp(got_src, want_src) != 0) {
+            snprintf(err, err_len, "%s: %s=%s -> source '%s', want '%s'",
+                     id, var, env != NULL ? env : "(unset)", got_src, want_src);
+            rc = -1;
+        }
+    }
+
+    for (size_t j = 0; j < KNOB_SPEC_COUNT; j++) {
+        if (env_names[j] == NULL) continue;
+        if (had_saved[j]) setenv(env_names[j], saved_buf[j], 1);
+        else unsetenv(env_names[j]);
+    }
+    net_knobs_resolve_reset();
+    return rc;
+}
+
 static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
     /* Network scenarios are protocol-specific; each adds a branch here
      * matching by case name. */
@@ -2172,6 +2348,9 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
     }
     if (strcmp(c->name, "port-resolution") == 0) {
         return run_port_resolution(c, err, err_len);
+    }
+    if (strcmp(c->name, "tunables-resolution") == 0) {
+        return run_tunables_resolution(c, err, err_len);
     }
     snprintf(err, err_len, "unknown network scenario: %s", c->name);
     return 1; /* skip */

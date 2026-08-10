@@ -33,7 +33,9 @@ from ..identity.protocol import IdentityProtocol, UNENCRYPTED_VERBS
 from ..processes import Process, ProcMeta
 from .. import _probes
 from ..identity import Group
-from ..system import CfgIds, PortSource, comm_port, net_cadence, resolve_comm_port
+from ..system import (CfgIds, PortSource, comm_port, net_cadence, resolve_comm_port,
+                      default_annoy_limit, default_mystery_max_age_s, default_recv_poll_ms,
+                      resolve_annoy_limit, resolve_mystery_max_age_s, resolve_recv_poll_ms)
 from .network import Network
 from .message import Message
 from .ping_at import PingATServer, ping_at
@@ -89,11 +91,26 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     Abstract class - subclasses must implement send_* and recv_* methods
     """
     enc = Network.encoding
-    annoy_limit = 5
     net_proto = NetworkProtocol.NONE
-    mystery_max_retries = 60  # 30 seconds
-    socket_timeout = 0.1
     unknown_peer = '0'
+
+    # The DEFAULTS layer for the three network tunables, not the tunables
+    # themselves. __init__ overwrites each with the env-resolved value, so an
+    # AT_NET_* override reaches every consumer; these class attributes remain so
+    # a subclass or a test can still pin one directly (several do), and so the
+    # names keep working for anything that reads them off the class.
+    #
+    # C carries the same three knobs with the same names, bounds and defaults
+    # (network.h, resolved in net_proc.c). Before 2026-08-10 these were Python
+    # class attributes with no C counterpart, so a deployment could tune one
+    # runtime and not the other (ISSUES.md 2.4.4).
+    annoy_limit = default_annoy_limit
+    socket_timeout = default_recv_poll_ms / 1000.0
+    # Wall-clock seconds, replacing the old mystery_max_retries count. The
+    # count approximated this bound (60 retries x ~0.5s) but drifted with load,
+    # because the loop's cadence is not the loop's period. C always bounded by
+    # age; both sides now agree on the quantity as well as the value.
+    mystery_max_age_s = default_mystery_max_age_s
 
     def __init__(self, configurations, subsystems, log_q, acceptance_func=None, **kwargs):
         super().__init__(configurations, subsystems, log_q, **kwargs)
@@ -110,6 +127,22 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             self.port = self.default_port  # noqa
         self.logger.info('network base port %d from %s (group %d)'
                          % (self.port, self.port_source, self.port + 1))
+
+        # The three tunables, same two-layer resolution and refusal rules as
+        # C's net_knob_resolve. Assigned as INSTANCE attributes over the class
+        # defaults, so a subclass or test that pins one after construction
+        # still wins -- the env layer sits between the compile-time default and
+        # an explicit override, exactly where the port's does.
+        self.annoy_limit, annoy_src = resolve_annoy_limit(self.logger)
+        recv_poll_ms, poll_src = resolve_recv_poll_ms(self.logger)
+        self.socket_timeout = recv_poll_ms / 1000.0
+        self.mystery_max_age_s, myst_src = resolve_mystery_max_age_s(self.logger)
+        self.logger.info(
+            'network annoy limit %d from %s, recv poll %d ms from %s, '
+            'mystery max age %d s from %s'
+            % (self.annoy_limit, annoy_src, recv_poll_ms, poll_src,
+               self.mystery_max_age_s, myst_src))
+
         self.diplomat = True
         self.ping_at_server = None
         self.myself = configurations[CfgIds.identity]
@@ -429,7 +462,16 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         on no node at all.
         """
         try:
-            stats = ping_at(address, count=count)  # noqa
+            # Pass this node's own address: the reply socket must bind it, not
+            # the wildcard, or a co-located node separated only by address
+            # receives these replies instead (ISSUES.md 2.4.3). A wildcard
+            # my_address (the TCP listener's 0.0.0.0 fallback) is no address at
+            # all -- hand ping_at None and let it derive one from the route.
+            local = (getattr(self, 'my_address', None)
+                     or getattr(getattr(self, 'net_cfg', None), 'ip4', None))
+            if local in ('', '0.0.0.0', '::'):
+                local = None
+            stats = ping_at(address, count=count, local_address=local)  # noqa
             msg = Message(self.name, Network.ping_at, stats,  # noqa
                           from_whom=peer)
             return_queue.put(msg, block=True, timeout=self.q_cadence)
@@ -560,14 +602,25 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     def mystery_handler(self, queues):
         """
         Handle encrypted messages sent before the peer is known
+
+        A deferral whose sender never becomes a known peer is reclaimed once it
+        is `mystery_max_age_s` seconds old. This used to count retries instead
+        (60 of them, at a cadence that made it roughly 30 s), which meant the
+        real bound moved with load: the loop's cadence is not the loop's
+        period, so a busy node aged entries out later than a quiet one, and the
+        number in the config did not name a duration anyone could reason about.
+        C bounded the same queue by age from the start, because its retry is
+        event-driven rather than polled and a count there would have measured
+        peer admissions rather than time. Both sides now agree on the quantity
+        as well as the value (ISSUES.md 2.4.4).
         :return: None
         """
-        try_count = {}
         while not self.stop:
             remaining = deque()
+            now = time.monotonic()
             while True:
                 try:
-                    raw_msg, from_addr = self.encrypted_messages.popleft()
+                    raw_msg, from_addr, deferred_at = self.encrypted_messages.popleft()
                 except IndexError:
                     break
                 peer = self.peers.find_by_address(from_addr)
@@ -578,20 +631,26 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     _probes.emit('net.mystery', 'resolved',
                                  from_addr=from_addr,
                                  peer_uuid=str(peer.uuid),
-                                 retries=try_count.get(from_addr, 0))
+                                 waited_s=round(now - deferred_at, 3))
                     self.logger.debug('Out-of-order message from %s handled' % peer.nickname)
                 else:
-                    if from_addr not in try_count:
-                        try_count[from_addr] = 0
-                    try_count[from_addr] += 1
-                    if try_count[from_addr] > self.mystery_max_retries:
-                        _probes.counter('net.mystery', 'drop', 'max_retries')
+                    age = now - deferred_at
+                    # >= matches C's _deferred_sweep_stale_locked, so a message
+                    # deferred at the same second on both sides is reclaimed on
+                    # the same side of the boundary.
+                    if age >= self.mystery_max_age_s:
+                        # Was ('drop', 'max_retries'); renamed with the switch to
+                        # an age bound so both runtimes emit the SAME probe for
+                        # the same event -- C already emitted this triple. The
+                        # `aged_out` emit below was always the aligned one, which
+                        # is why scripts/probe-flow.py keys on it.
+                        _probes.counter('net.mystery', 'aged_out', 'max_age')
                         _probes.emit('net.mystery', 'aged_out',
                                      from_addr=from_addr,
-                                     retries=try_count[from_addr])
+                                     age_s=round(age, 3))
                         self.logger.debug('Spurious encrypted message from %s dropped' % from_addr)
                     else:
-                        remaining.append((raw_msg, from_addr))
+                        remaining.append((raw_msg, from_addr, deferred_at))
             self.encrypted_messages.extend(remaining)
             time.sleep(self.cadence + self.q_cadence)  # curiously, does not sleep if exactly cadence
 
@@ -921,7 +980,12 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                         except UnicodeDecodeError:
                             _probes.counter('net.ptp', 'unknown_sender', 'deferred_encrypted')
                             self.logger.debug('Out-of-order message from %s detected, retry later' % from_addr)
-                            self.encrypted_messages.append((raw_msg, from_addr))
+                            # Stamp the deferral time here, as C does in
+                            # defer_message: the age-out window runs from when
+                            # the message was deferred, not from when the
+                            # handler happens to look at it. Monotonic, so a
+                            # clock step cannot age the queue out at once.
+                            self.encrypted_messages.append((raw_msg, from_addr, time.monotonic()))
                 total_inbound += drained_ptp
 
                 # async recv group messages

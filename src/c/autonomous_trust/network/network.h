@@ -45,13 +45,28 @@
 #define CIDR6_LEN (IPV6_ADDR_LEN + 4)
 #define MAC_ADDR_LEN 17
 
-/* Per-peer duplicate-broadcast threshold before demotion. Mirrors
- * Python NetworkProcess.annoy_limit (netprocess.py:90). The pest-tracking
- * map IS wired into the C receive path — net_proc.c:287 compares against
- * this constant to set over_limit. Note the tunability divergence: Python
- * exposes annoy_limit as an overridable class attribute, C has only this
- * macro (see ISSUES.md, tunable-on-one-side entry). */
+/* Per-peer duplicate-broadcast threshold before demotion — the DEFAULTS layer
+ * for the knob, not the knob itself. Mirrors Python NetworkProcess.annoy_limit.
+ * Read it through net_annoy_limit_resolve(), which applies AT_NET_ANNOY_LIMIT
+ * first; comparing against this macro directly ignores the override. */
 #define NET_ANNOY_LIMIT 5
+#define NET_ANNOY_LIMIT_MIN 1
+#define NET_ANNOY_LIMIT_MAX 10000
+
+/* Receive-poll timeout, in milliseconds: how long a receiver thread blocks in
+ * recv() before looking at the stop flag. Mirrors Python
+ * NetworkProcess.socket_timeout (0.1 s = 100 ms); the unit differs because the
+ * poll API does, the VALUE does not. Read via net_recv_poll_ms_resolve(). */
+#define NET_RECV_POLL_MS 100
+#define NET_RECV_POLL_MS_MIN 1
+#define NET_RECV_POLL_MS_MAX 60000
+
+/* How long a deferred ("mystery") encrypted message whose sender never became
+ * a known peer is held before it is reclaimed, in seconds. Mirrors Python
+ * NetworkProcess.mystery_max_age_s. Read via net_mystery_max_age_resolve(). */
+#define NET_MYSTERY_MAX_AGE_SEC 30
+#define NET_MYSTERY_MAX_AGE_SEC_MIN 1
+#define NET_MYSTERY_MAX_AGE_SEC_MAX 86400
 
 /**
  * @brief Address family / link-layer family a transport operates on.
@@ -155,6 +170,59 @@ int net_port_resolve(int cfg_port, net_port_source_t *src, logger_t *logger);
   ensures \result != \null;
 */
 const char *net_port_source_name(net_port_source_t src);
+
+/** Which layer supplied a network tunable. */
+typedef enum {
+    KNOB_SRC_ENV     = 0,  /**< An AT_NET_* / AT_MYSTERY_* override supplied it. */
+    KNOB_SRC_DEFAULT = 1,  /**< Nothing did; the compile-time default. */
+} net_knob_source_t;
+
+/**
+ * @brief Human-readable name of a tunable's source, for logs.
+ */
+/*@
+  assigns \nothing;
+  ensures \result != \null;
+*/
+const char *net_knob_source_name(net_knob_source_t src);
+
+/**
+ * @brief Resolve the three network tunables from the environment.
+ *
+ * Resolution order is env → compile-time default, the same two-layer shape and
+ * the same refusal rules as net_port_resolve's env layer: read once and cached,
+ * strictly parsed (no trailing garbage), range-checked, and a bad value refused
+ * with a warning while the default is kept. These exist because the knobs used
+ * to be overridable class attributes in Python and bare macros in C, so a
+ * deployment could tune one runtime and not the other (ISSUES.md 2.4.4).
+ *
+ * There is deliberately NO config layer: unlike the base port, these are
+ * operational tuning rather than provisioned identity, and adding them to
+ * network.cfg.json would widen the config wire form for a knob an operator sets
+ * on a node, not on a fleet.
+ *
+ * @param src     Optional out-param: which layer supplied the result.
+ * @param logger  Optional; used to report a refused override.
+ * @return the resolved value, always within the knob's documented range.
+ */
+/*@
+  requires src == \null || \valid(src);
+  ensures \result >= NET_ANNOY_LIMIT_MIN && \result <= NET_ANNOY_LIMIT_MAX;
+*/
+int net_annoy_limit_resolve(net_knob_source_t *src, logger_t *logger);
+
+/*@
+  requires src == \null || \valid(src);
+  ensures \result >= NET_RECV_POLL_MS_MIN && \result <= NET_RECV_POLL_MS_MAX;
+*/
+int net_recv_poll_ms_resolve(net_knob_source_t *src, logger_t *logger);
+
+/*@
+  requires src == \null || \valid(src);
+  ensures \result >= NET_MYSTERY_MAX_AGE_SEC_MIN &&
+          \result <= NET_MYSTERY_MAX_AGE_SEC_MAX;
+*/
+int net_mystery_max_age_resolve(net_knob_source_t *src, logger_t *logger);
 
 /**
  * @brief Split a CIDR string into its address and prefix-length parts.
