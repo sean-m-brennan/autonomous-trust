@@ -1068,3 +1068,15 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self.stop = True
         self.close_connections()
         self.close_listeners()
+        # The PingAT server holds a bound port too, and only the diplomat
+        # branch above ever stopped it -- so a node that was the diplomat at
+        # shutdown left it bound for the life of the process. That denies the
+        # port to the next node on this address (no SO_REUSEADDR on it, by
+        # design), which is only invisible when the process exits immediately
+        # afterward and the kernel cleans up.
+        # getattr, like close_listeners above: this runs on the way out of
+        # process(), which partial instances also reach.
+        ping_server = getattr(self, 'ping_at_server', None)
+        if ping_server is not None:
+            ping_server.stop()
+            self.ping_at_server = None
