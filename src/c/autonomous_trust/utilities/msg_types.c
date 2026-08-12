@@ -576,6 +576,29 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
 }
 
 /* Frama-C: skipped — [serialization] protobuf unpack with union unpacking */
+/** Copy a fixed-size payload struct, refusing a payload too short to hold it.
+ *
+ * The length check is not defensive tidiness: `value` is peer-supplied, and
+ * without it this memcpy read `sizeof(T)` bytes out of a smaller heap
+ * allocation -- measured under valgrind as "Invalid read of size 8" on a
+ * TRANSACTION_SCORE whose value carried 8 of the 112 bytes the struct wants,
+ * and ACCEPTED with return 0. Whatever followed the payload then flowed onward
+ * as a score, a uuid or an app event. `type_url` selects which struct size is
+ * copied, so the remote also chooses how far past the end to read. */
+#define COPY_FIXED_PAYLOAD(field, type)                                        \
+    do {                                                                       \
+        if (pb_msg->value.len < sizeof(type))                                  \
+        {                                                                      \
+            log_error(NULL, "proto_to_generic_msg: %s payload is %zu bytes, "  \
+                      "needs %zu; dropping\n", #type,                          \
+                      pb_msg->value.len, sizeof(type));                        \
+            ret = -1;                                                          \
+            break;                                                             \
+        }                                                                      \
+        memcpy(&msg->info.field, pb_msg->value.data, sizeof(type));            \
+        ret = 0;                                                               \
+    } while (0)
+
 int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
 {
     Google__Protobuf__Any *pb_msg;
@@ -587,55 +610,71 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
     message_type_t type = string_to_message_type(pb_msg->type_url);
     msg->type = type;
     msg->size = message_size(msg->type);
+    /* Single exit, because the unpacked Any must be freed on EVERY path. It used
+     * to be freed on none: each arm returned directly, leaking 74 bytes
+     * (48 direct + 26 indirect, measured) per inbound message -- unbounded in a
+     * daemon whose whole job is to keep receiving. The `proto_to_*` helpers
+     * unpack their own sub-message and copy out (see proto_to_peer), so nothing
+     * they produce points into `value.data` and freeing it here cannot dangle. */
+    int ret;
     switch (type)
     {
     case SIGNAL:
-        return proto_to_signal(pb_msg->value.data, pb_msg->value.len, &msg->info.signal);
+        ret = proto_to_signal(pb_msg->value.data, pb_msg->value.len, &msg->info.signal);
+        break;
     case GROUP:
-        return proto_to_group(pb_msg->value.data, pb_msg->value.len, &msg->info.group);
+        ret = proto_to_group(pb_msg->value.data, pb_msg->value.len, &msg->info.group);
+        break;
     case PEER:
-        return proto_to_peer(pb_msg->value.data, pb_msg->value.len, &msg->info.peer);
+        ret = proto_to_peer(pb_msg->value.data, pb_msg->value.len, &msg->info.peer);
+        break;
     case PEER_CAPABILITIES:
-        return proto_to_peer_capabilities(pb_msg->value.data, pb_msg->value.len, &msg->info.peer_capabilities);
+        ret = proto_to_peer_capabilities(pb_msg->value.data, pb_msg->value.len, &msg->info.peer_capabilities);
+        break;
     case NET_MESSAGE:
-        return proto_to_net_msg(pb_msg->value.data, pb_msg->value.len, &msg->info.net_msg);
+        ret = proto_to_net_msg(pb_msg->value.data, pb_msg->value.len, &msg->info.net_msg);
+        break;
     case TASK:
-        return proto_to_task(pb_msg->value.data, pb_msg->value.len, &msg->info.task);
+        ret = proto_to_task(pb_msg->value.data, pb_msg->value.len, &msg->info.task);
+        break;
     case TASK_STATUS:
-        memcpy(&msg->info.task_status, pb_msg->value.data, sizeof(task_status_msg_t));
-        return 0;
+        COPY_FIXED_PAYLOAD(task_status, task_status_msg_t);
+        break;
     case TASK_RESULT:
-        memcpy(&msg->info.task_result, pb_msg->value.data, sizeof(task_result_msg_t));
-        return 0;
+        COPY_FIXED_PAYLOAD(task_result, task_result_msg_t);
+        break;
     case TRANSACTION_SCORE:
-        memcpy(&msg->info.tx_score, pb_msg->value.data, sizeof(tx_score_msg_t));
-        return 0;
+        COPY_FIXED_PAYLOAD(tx_score, tx_score_msg_t);
+        break;
     case UPDATE_VOTE:
-        memcpy(&msg->info.update_vote, pb_msg->value.data, sizeof(update_vote_msg_t));
-        return 0;
+        COPY_FIXED_PAYLOAD(update_vote, update_vote_msg_t);
+        break;
     case UPDATE_ACCEPTED:
-        memcpy(&msg->info.update_accepted, pb_msg->value.data, sizeof(update_accepted_msg_t));
-        return 0;
+        COPY_FIXED_PAYLOAD(update_accepted, update_accepted_msg_t);
+        break;
     case PEER_RTT_UPDATE:
-        memcpy(&msg->info.peer_rtt_update, pb_msg->value.data, sizeof(peer_rtt_update_msg_t));
-        return 0;
+        COPY_FIXED_PAYLOAD(peer_rtt_update, peer_rtt_update_msg_t);
+        break;
     case PEER_OBSERVED:
-        memcpy(&msg->info.peer_observed, pb_msg->value.data, sizeof(peer_observed_msg_t));
-        return 0;
+        COPY_FIXED_PAYLOAD(peer_observed, peer_observed_msg_t);
+        break;
     case PEER_REPUTATION:
-        memcpy(&msg->info.peer_reputation, pb_msg->value.data, sizeof(peer_reputation_msg_t));
-        return 0;
+        COPY_FIXED_PAYLOAD(peer_reputation, peer_reputation_msg_t);
+        break;
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:
     case ZTA_VERIFICATION_RESULT:
-        memcpy(&msg->info.zta_event, pb_msg->value.data, sizeof(zta_event_msg_t));
-        return 0;
+        COPY_FIXED_PAYLOAD(zta_event, zta_event_msg_t);
+        break;
 #endif
     case UPDATE_PROPOSAL:
         /* UPDATE_PROPOSAL uses its own JSON serialization, not proto */
-        return -1;
+        ret = -1;
+        break;
     default:
-        return -1;
+        ret = -1;
+        break;
     }
-    return 0;
+    google__protobuf__any__free_unpacked(pb_msg, NULL);
+    return ret;
 }

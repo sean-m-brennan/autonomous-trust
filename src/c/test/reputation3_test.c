@@ -19,6 +19,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 #include <uuid/uuid.h>
 
 #include "autonomous_trust/reputation/reputation.h"
@@ -442,6 +443,46 @@ DEFINE_TEST(test_reputations_get_missing)
 }
 END_TEST_DEFINITION()
 
+DEFINE_TEST(test_tx_score_range_accepts_the_scale)
+{
+    /* ISSUES §11.2: the [0, 1] bound is enforced now, not assumed. Mirrors
+     * TestTransactionScoreRange in the Python twin's test_reputation.py. */
+    ck_assert(tx_score_in_range(0.0) == true);
+    ck_assert(tx_score_in_range(0.2) == true);
+    ck_assert(tx_score_in_range(1.0) == true);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_tx_score_range_rejects_off_scale)
+{
+    /* Rejected, not clamped: a submitter sending 5.0 has a bug, and quietly
+     * recording 1.0 would hide it while still over-rewarding the peer. */
+    ck_assert(tx_score_in_range(1.0001) == false);
+    ck_assert(tx_score_in_range(5.0) == false);
+    ck_assert(tx_score_in_range(1e9) == false);
+    ck_assert(tx_score_in_range(-0.0001) == false);
+    ck_assert(tx_score_in_range(-1.0) == false);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_tx_score_range_rejects_nan_and_infinities)
+{
+    /* NaN fails by the same comparison that rejects 5.0 -- every comparison
+     * against NaN is false -- which matters because NaN is the one value that
+     * would poison an average with no way back. */
+    ck_assert(tx_score_in_range(NAN) == false);
+    ck_assert(tx_score_in_range(INFINITY) == false);
+    ck_assert(tx_score_in_range(-INFINITY) == false);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_tx_score_bounds_match_the_python_twin)
+{
+    ck_assert_double_eq_tol(TX_SCORE_MIN, 0.0, 1e-12);
+    ck_assert_double_eq_tol(TX_SCORE_MAX, 1.0, 1e-12);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(Reputation3, test_tx_history_json_roundtrip, test_tx_two_peer_transaction,
           test_reputation_contrite_tft,
           test_reputation_contrite_tft_cooperative_self_p2,
@@ -451,4 +492,8 @@ RUN_TESTS(Reputation3, test_tx_history_json_roundtrip, test_tx_two_peer_transact
           test_reputation_pure_with_counterparty,
           test_reputation_pure_unknown_counterparty_default_0_5,
           test_reputation_pure_weighted_by_task,
-          test_paxos_id_index, test_reputations_get_missing)
+          test_paxos_id_index, test_reputations_get_missing,
+          test_tx_score_range_accepts_the_scale,
+          test_tx_score_range_rejects_off_scale,
+          test_tx_score_range_rejects_nan_and_infinities,
+          test_tx_score_bounds_match_the_python_twin)

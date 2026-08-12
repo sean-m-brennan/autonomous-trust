@@ -1056,6 +1056,17 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
     int64_t id2 = json_integer_value(j_id2);
     int64_t id1 = json_integer_value(j_id1);
     double score = json_real_value(j_score);
+    /* §11.2: reject a peer-supplied score off AT's [0, 1] scale rather than
+     * grading it. Mirrors the Python twin, which raises in TransactionScore's
+     * constructor and drops the message in handle_transaction. */
+    if (!tx_score_in_range(score))
+    {
+        json_decref(payload);
+        log_warn(proc->logger,
+                 "Reputation: handle_transaction: score %f is off the [%g, %g] "
+                 "scale; dropping proposal\n", score, TX_SCORE_MIN, TX_SCORE_MAX);
+        return true;   /* consumed: a malformed proposal is not another handler's */
+    }
     /* peer_uuid / task_uuid are borrowed from `payload` but are echoed back
      * into the ACCEPTED reply AFTER json_decref(payload) below; copy them out
      * now to avoid a use-after-free. Preserve NULL so an absent field stays
@@ -1360,6 +1371,16 @@ static bool handle_committed(const process_t *proc, directory_t *queues, generic
 
     const char *peer_uuid_str = json_string_value(j_peer_uuid);
     double score = json_real_value(j_score);
+    /* §11.2, and this is the path that WRITES history on every acceptor, so the
+     * bound matters most here. Same rejection as handle_transaction. */
+    if (!tx_score_in_range(score))
+    {
+        json_decref(payload);
+        log_warn(proc->logger,
+                 "Reputation: handle_committed: score %f is off the [%g, %g] "
+                 "scale; dropping\n", score, TX_SCORE_MIN, TX_SCORE_MAX);
+        return true;
+    }
 
     /* No self-bounce check needed in C — handle_accepted's broadcast
      * loop iterates proc->protocol.peers, which excludes self.  The
@@ -2807,6 +2828,17 @@ static void _handle_local_tx_score(const process_t *proc,
     {
         log_warn(proc->logger,
                  "Reputation: dropping local score — self identity unavailable\n");
+        return;
+    }
+    /* §11.2: a LOCAL submitter off the scale is a bug in that submitter, so it is
+     * refused here too rather than forwarded into a Paxos round. The Python twin
+     * raises ValueError at this point (TransactionScore's constructor); C has no
+     * exception to raise into an app, so it logs and drops. */
+    if (!tx_score_in_range(ts->score))
+    {
+        log_warn(proc->logger,
+                 "Reputation: dropping local TRANSACTION_SCORE: score %f is off "
+                 "the [%g, %g] scale\n", ts->score, TX_SCORE_MIN, TX_SCORE_MAX);
         return;
     }
     _forward_transaction(proc, ts->task_uuid, self_uuid, ts->score,

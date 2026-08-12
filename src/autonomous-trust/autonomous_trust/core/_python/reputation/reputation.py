@@ -23,10 +23,48 @@ from ..config import Configuration
 from ..structures.merkle import MerkleTree
 
 
+#: The scale every absolute measure in AT and in the tiers above it assumes.
+#: Named here so the bound is one value rather than a convention repeated in
+#: prose; mirrors TX_SCORE_MIN / TX_SCORE_MAX in the C twin's reputation.h.
+TX_SCORE_MIN = 0.0
+TX_SCORE_MAX = 1.0
+
+
+def validate_tx_score(score, where: str = 'TransactionScore'):
+    """Return `score` as a float in [0, 1], or raise ValueError.
+
+    ISSUES §11.2, asked for by kith-covenant's erosion-legibility audit: the
+    [0, 1] scale was a convention in AT rather than an enforced invariant, so an
+    out-of-range score was *graded* rather than rejected — it flowed into the
+    weighted average and moved a reputation by an unbounded amount. Rejecting is
+    the whole point, so this deliberately does not clamp: a caller submitting 5.0
+    has a bug, and silently recording 1.0 would hide it while still rewarding the
+    peer more than any honest score could.
+
+    NaN is rejected by the same comparison that rejects 5.0 (every comparison
+    against NaN is false), which is worth knowing because NaN is the value that
+    would otherwise poison an average irrecoverably.
+    """
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        raise ValueError('%s: score must be a number, got %r' % (where, score))
+    if not (TX_SCORE_MIN <= value <= TX_SCORE_MAX):
+        raise ValueError('%s: score %r is outside the [%g, %g] scale '
+                         '(NaN is rejected here too)'
+                         % (where, score, TX_SCORE_MIN, TX_SCORE_MAX))
+    return value
+
+
 class TransactionScore(Configuration):
     def __init__(self, task_id, score, capability_name: str = None):
         self.task_id = task_id
-        self.score = score
+        # Enforced, not assumed (§11.2). This constructor is also the wire-side
+        # entry point -- `from_json_string` reconstructs via `cls(**kwargs)` --
+        # so a peer sending an out-of-range score raises here. Handlers on the
+        # remote path therefore CATCH this and drop the message: an exception a
+        # remote can trigger inside the process loop is its own problem.
+        self.score = validate_tx_score(score)
         # Optional: name of the Capability whose execution produced this
         # TS. Used by _pure_reputation to look up transaction_weight at
         # scoring time (Slice 3). None means "unknown / legacy" — weight
@@ -559,6 +597,32 @@ class Reputation(Configuration):
     def __init__(self, peer_id: UUID, score: float):
         self.peer_id = peer_id
         self.score = score
+
+
+class PeerReputation(Configuration):
+    """AT → app: one peer's earned reputation, with whether AT holds one.
+
+    Mirror of the C twin's `peer_reputation_msg_t` (`utilities/msg_types.h`) and
+    the flat `at_app_reputation_t` an app decodes (`app_events.h`); ISSUES §11.1,
+    asked for by kith-covenant and ethne (D18).
+
+    `rated` is the load-bearing field. AT's scale is anchored by fixed constants
+    (PREREP_NEUTRAL, the comm cut-off, the tier floors) rather than normalized
+    across the peer population, so `score` crosses as-is — but a peer AT has
+    never scored reads as exactly PREREP_NEUTRAL, which is *also* a score a peer
+    can genuinely earn. Collapsing those two lets a consumer treat "no
+    information" as a real, mid-range rating.
+
+    Local IPC only, exactly like the C twin: this does NOT change `Reputation`
+    or the peer-to-peer `rep_resp` wire form.
+    """
+
+    def __init__(self, peer_uuid, score, rated: bool = True):
+        self.peer_uuid = peer_uuid
+        self.rated = bool(rated)
+        # Zeroed when unrated, as C's _publish_reputation does, so a consumer
+        # that ignores the flag cannot silently read a plausible-looking number.
+        self.score = float(score) if self.rated else 0.0
 
 
 class Reputations(Configuration):

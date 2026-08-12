@@ -20,6 +20,7 @@
 #include <string.h>
 #include <sodium.h>
 
+#include "google/protobuf/any.pb-c.h"
 #include "autonomous_trust/utilities/msg_types.h"
 #include "autonomous_trust/utilities/msg_types_priv.h"
 
@@ -127,5 +128,86 @@ DEFINE_TEST(test_net_msg_proto_no_payload)
 }
 END_TEST_DEFINITION()
 
+/* --- ISSUES §2.1.4: the fixed-size payload arms of proto_to_generic_msg took a
+ * peer-supplied `Any.value` and memcpy'd sizeof(struct) out of it without ever
+ * checking its length, and leaked the unpacked Any on every path. Both were
+ * measured under valgrind (invalid read of 8 bytes; 74 bytes lost per message)
+ * before the fix, and both are gone after it. --- */
+
+/** Pack an Any with `type_url` and a payload of `value_len` bytes. */
+static uint8_t *_any_with_payload(const char *type_url, size_t value_len,
+                                  size_t *out_len)
+{
+    static uint8_t payload[512];
+    memset(payload, 0xAB, sizeof(payload));
+    Google__Protobuf__Any any = GOOGLE__PROTOBUF__ANY__INIT;
+    any.type_url = (char *)type_url;
+    any.value.data = payload;
+    any.value.len = value_len;
+    *out_len = google__protobuf__any__get_packed_size(&any);
+    uint8_t *buf = malloc(*out_len);
+    google__protobuf__any__pack(&any, buf);
+    return buf;
+}
+
+DEFINE_TEST(test_short_fixed_payload_is_rejected)
+{
+    /* 8 of the 112 bytes tx_score_msg_t wants. This used to return 0 and copy
+     * 104 bytes of whatever followed the allocation into the struct, from where
+     * it flowed on as a score. */
+    size_t len = 0;
+    uint8_t *buf = _any_with_payload("TRANSACTION_SCORE", 8, &len);
+    generic_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    ck_assert_int_eq(proto_to_generic_msg(buf, len, &msg), -1);
+    free(buf);
+}
+
+DEFINE_TEST(test_empty_fixed_payload_is_rejected)
+{
+    size_t len = 0;
+    uint8_t *buf = _any_with_payload("PEER_REPUTATION", 0, &len);
+    generic_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    ck_assert_int_eq(proto_to_generic_msg(buf, len, &msg), -1);
+    free(buf);
+}
+
+DEFINE_TEST(test_full_length_fixed_payload_is_accepted)
+{
+    /* The negative control: the length check must not reject honest traffic. */
+    size_t len = 0;
+    uint8_t *buf = _any_with_payload("TRANSACTION_SCORE",
+                                     sizeof(tx_score_msg_t), &len);
+    generic_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    ck_assert_int_eq(proto_to_generic_msg(buf, len, &msg), 0);
+    ck_assert_int_eq((int)msg.type, (int)TRANSACTION_SCORE);
+    free(buf);
+}
+
+DEFINE_TEST(test_repeated_unpack_does_not_grow_without_bound)
+{
+    /* A leak check cannot be asserted from inside the process, so this is the
+     * shape a leak would take rather than the leak detector itself: the same
+     * message parsed many times, which is what a daemon does. Run under
+     * valgrind (see §2.1.4) for the authoritative result -- it reported 74 bytes
+     * lost per call before the free was added, and 0 after. */
+    size_t len = 0;
+    uint8_t *buf = _any_with_payload("TRANSACTION_SCORE",
+                                     sizeof(tx_score_msg_t), &len);
+    for (int i = 0; i < 200; i++)
+    {
+        generic_msg_t msg;
+        memset(&msg, 0, sizeof(msg));
+        ck_assert_int_eq(proto_to_generic_msg(buf, len, &msg), 0);
+    }
+    free(buf);
+}
+
 RUN_TESTS(MsgTypes3, test_net_msg_pack_unpack_json, test_net_msg_pack_null_json,
-          test_net_msg_proto_roundtrip, test_net_msg_proto_no_payload)
+          test_net_msg_proto_roundtrip, test_net_msg_proto_no_payload,
+          test_short_fixed_payload_is_rejected,
+          test_empty_fixed_payload_is_rejected,
+          test_full_length_fixed_payload_is_accepted,
+          test_repeated_unpack_does_not_grow_without_bound)

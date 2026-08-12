@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "bootstrap": {
+    "enabled": true,
+    "duration_sec": 45,
+    "pairs": 12
+  },
+  "capabilities": {
+    "at.handshake": { "required_tier": 0, "transaction_weight": 1 },
+    "at.time-attest": { "required_tier": 0, "transaction_weight": 1 },
+    "at.echo-challenge": { "required_tier": 0, "transaction_weight": 1 },
+    "demo.sensor-report": { "required_tier": 2, "transaction_weight": 4 },
+    "demo.fusion": { "required_tier": 3 },
+    "demo.command": {}
+  },
+  "tier_demotion_epsilon": 0.05
+}

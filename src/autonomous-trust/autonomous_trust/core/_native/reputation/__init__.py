@@ -23,5 +23,6 @@ from ._native_wrappers import (
 
 # API-compatible exports from Python backend
 from ..._python.reputation.protocol import ReputationProtocol
-from ..._python.reputation.reputation import TransactionHistory, Reputations, TransactionScore
+from ..._python.reputation.reputation import (TransactionHistory, Reputations,
+                                              TransactionScore, PeerReputation)
 from ..._python.reputation.repprocess import ReputationProcess

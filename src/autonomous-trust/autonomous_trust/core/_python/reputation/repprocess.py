@@ -30,7 +30,8 @@ from ..identity.protocol import IdentityProtocol
 from .protocol import ReputationProtocol
 from .reputation import (TransactionHistory, Reputation, Reputations,
                          TransactionScore, SlashAttestation, SignedSlash,
-                         Checkpoint, SignedCheckpoint)
+                         Checkpoint, SignedCheckpoint, validate_tx_score,
+                         PeerReputation)
 from ..system import CfgIds, now, encoding, proc_idle_floor
 from .. import _probes
 
@@ -215,6 +216,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(ReputationProtocol.outdated, self.handle_outdated)
         self.protocol.register_handler(ReputationProtocol.update, self.handle_update)
         self.protocol.register_handler(ReputationProtocol.rep_req, self.handle_reputation_request)
+        self.protocol.register_handler(ReputationProtocol.app_roster_request,
+                                       self.handle_app_roster_request)
         self.protocol.register_handler(
             ReputationProtocol.consensus_rep_req,
             self.handle_consensus_reputation_request)
@@ -711,7 +714,18 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def handle_transaction(self, queues, message):
         if message.function == ReputationProtocol.transaction:
-            (id1, id2, peer_id), score = from_json_string(message.obj)
+            try:
+                (id1, id2, peer_id), score = from_json_string(message.obj)
+            except ValueError as err:
+                # An out-of-range score is rejected in TransactionScore's
+                # constructor (§11.2), which `from_json_string` runs. Dropping
+                # here rather than letting it propagate: the payload is
+                # peer-supplied, so a raise escaping into the process loop would
+                # hand a remote a lever on this node's reputation process.
+                self.logger.warning(
+                    'Dropping Paxos proposal from %s: %s'
+                    % (message.from_whom, err))
+                return True
             idx = self._paxos_id_index(id1, id2)
             if idx not in self.requests:
                 return True  # not granted, drop
@@ -867,8 +881,19 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 return True
             if str(peer_id) == str(self.identity.uuid):
                 return True
+            try:
+                # §11.2: this payload is a BARE float on the wire, not a
+                # TransactionScore, so it bypasses the constructor's check --
+                # and this is the path that writes history on every acceptor.
+                # An out-of-range score here would be averaged into a
+                # reputation by an unbounded amount.
+                score = validate_tx_score(score, 'handle_committed')
+            except ValueError as err:
+                self.logger.warning(
+                    'Dropping committed tx from %s: %s' % (str(peer_id)[:8], err))
+                return True
             chain = self._chain_for_group(group_uuid)
-            chain.update(task_id, peer_id, float(score))
+            chain.update(task_id, peer_id, score)
             # Fold-on-commit: advance the dashboard running consensus EMA as
             # soon as this tx completes (primary chain only; idempotent).
             self._fold_committed_tx(task_id, chain)
@@ -1662,6 +1687,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             if prior is not None and prior > self.REPUTATION_DECAY_ASYMPTOTE:
                 self._consensus_last[key] = self._decayed_score(prior, idle)
             self._publish_tier_change(queues, u, decayed)
+            self._publish_reputation_change(queues, u, decayed)
             changed = True
         if changed:
             try:
@@ -1695,6 +1721,60 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         snapshot = self.reputations.filtered_for_persist(keep_uuids)
         snapshot.to_file(os.path.join(Configuration.get_cfg_dir(),
                                       CfgIds.reputation + Configuration.file_ext))
+
+    def _publish_reputation(self, queues, peer_uuid, score, rated):
+        """Emit one peer's reputation toward the app (ISSUES §11.1).
+
+        Mirror of the C twin's `_publish_reputation` (`rep_proc.c`): local IPC to
+        the main loop — `CfgIds.main` is Python's `AT_MAIN_QUEUE` — which owns the
+        outward hop to `external_feedback`. `rated` travels beside the score
+        because an unrated peer reads as PREREP_NEUTRAL, which is also a score a
+        peer can genuinely earn; `PeerReputation` zeroes the score when unrated so
+        a consumer ignoring the flag cannot read a plausible number.
+        """
+        try:
+            queues[CfgIds.main].put(
+                PeerReputation(str(peer_uuid), score, rated),
+                block=True, timeout=self.q_cadence)
+        except KeyError:
+            # No main queue in this configuration (unit tests, embedded use).
+            # Not an error: nothing is listening for an app feed.
+            pass
+        except Full:
+            self.logger.warning('_publish_reputation: main queue full for %s'
+                                % str(peer_uuid)[:8])
+
+    def _publish_reputation_change(self, queues, peer_uuid, score):
+        """A score this process just computed is by construction rated."""
+        self._publish_reputation(queues, peer_uuid, score, True)
+
+    def emit_all_reputations(self, queues):
+        """Emit one message per known peer, rated or not; returns the count.
+
+        Mirror of C's `reputation_emit_all`. A peer with no rating is reported AS
+        unrated rather than skipped — silence would leave a consumer unable to
+        tell "we hold no rating" from "the message was lost" — and this pull is
+        the ONLY path on which `rated=False` can cross, since every change-driven
+        emission is rated by construction.
+        """
+        emitted = 0
+        for peer in list(self.peers.all) + [self.identity]:
+            peer_uuid = getattr(peer, 'uuid', peer)
+            key = UUID(str(peer_uuid)) if not isinstance(peer_uuid, UUID) \
+                else peer_uuid
+            rated = key in self.reputations
+            score = self.reputations[key] if rated else 0.0
+            self._publish_reputation(queues, peer_uuid, score, rated)
+            emitted += 1
+        return emitted
+
+    def handle_app_roster_request(self, queues, message):
+        """The app asked for the current peer view (C: handle_app_roster_request)."""
+        if message.function != ReputationProtocol.app_roster_request:
+            return False
+        count = self.emit_all_reputations(queues)
+        self.logger.debug('Emitted %d peer reputations for an app pull' % count)
+        return True
 
     def _publish_tier_change(self, queues, peer_uuid, score):
         """Notify IdentityProcess of a trust-tier crossing.
@@ -2494,6 +2574,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 while self.pending_tiers:
                     peer_uuid, rep_score = self.pending_tiers.pop(0)
                     self._publish_tier_change(queues, peer_uuid, rep_score)
+                    # Beside the tier change, exactly as the C twin does
+                    # (rep_proc.c: _publish_tier_change then
+                    # _publish_reputation_change): the tier is coarse, and an
+                    # app watching a score needs every change, not only the four
+                    # that step over a floor.
+                    self._publish_reputation_change(queues, peer_uuid, rep_score)
 
                 present = now().timestamp()
                 # Staleness sweep: relax idle peers' operational

@@ -141,6 +141,28 @@ double reputation_env_double(const char *name, double dflt);
 #define COMM_CUTOFF (reputation_env_double("AT_REP_COMM_CUTOFF", COMM_CUTOFF_DEFAULT))
 #define PREREP_SHRINKAGE_K 3.0
 
+/* The scale every absolute measure in AT — and in the tiers above it — assumes.
+ * Mirror of TX_SCORE_MIN / TX_SCORE_MAX in repprocess.py's reputation.py.
+ *
+ * ISSUES §11.2 (asked for by kith-covenant's erosion-legibility audit): the
+ * bound was a convention rather than something checked, so an out-of-range score
+ * was GRADED rather than rejected — folded into the weighted average, moving a
+ * reputation by an unbounded amount. @ref tx_score_in_range rejects instead of
+ * clamping: a submitter sending 5.0 has a bug, and quietly recording 1.0 hides
+ * it while still rewarding the peer more than any honest score could. */
+#define TX_SCORE_MIN 0.0
+#define TX_SCORE_MAX 1.0
+
+/** True iff @p score is a real number on AT's [0, 1] scale.
+ *
+ * NaN fails by the same comparison that rejects 5.0 (every comparison against
+ * NaN is false), which matters because NaN is the value that would otherwise
+ * poison an average with no way back. */
+static inline bool tx_score_in_range(double score)
+{
+    return score >= TX_SCORE_MIN && score <= TX_SCORE_MAX;
+}
+
 /* EMA half-life (in committed bilateral txs) for reputation_consensus.
  * Smaller → faster crash on a peer that begins producing bad scores,
  * slower rebuild for the rest. 20 gives α ≈ 0.034. */
