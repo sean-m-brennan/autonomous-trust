@@ -19,7 +19,7 @@ from uuid import uuid4
 
 from autonomous_trust.core.reputation.reputation import (
     TransactionScore, Transaction, TransactionHistory,
-    Reputation, Reputations,
+    Reputation, Reputations, PeerReputation,
 )
 from autonomous_trust.core.reputation.repprocess import ReputationProcess
 
@@ -28,6 +28,90 @@ class TestTransactionScore:
     def test_init(self):
         ts = TransactionScore(task_id=uuid4(), score=0.9)
         assert ts.score == 0.9
+
+
+class TestTransactionScoreRange:
+    """ISSUES §11.2, from kith-covenant's erosion-legibility audit: the [0, 1]
+    scale was a convention rather than an enforced invariant, so an out-of-range
+    score was GRADED — folded into the weighted average, moving a reputation by an
+    unbounded amount — instead of rejected."""
+
+    @pytest.mark.parametrize('score', [0.0, 0.2, 1.0])
+    def test_in_range_scores_are_accepted(self, score):
+        assert TransactionScore(task_id=uuid4(), score=score).score == score
+
+    @pytest.mark.parametrize('score', [1.0001, 5.0, 1e9, -0.0001, -1.0])
+    def test_out_of_range_is_rejected_not_clamped(self, score):
+        """Clamping would hide the submitter's bug while still handing the peer
+        more credit than any honest score could earn."""
+        with pytest.raises(ValueError):
+            TransactionScore(task_id=uuid4(), score=score)
+
+    def test_nan_is_rejected(self):
+        """The one value that would poison an average with no way back."""
+        with pytest.raises(ValueError):
+            TransactionScore(task_id=uuid4(), score=float('nan'))
+
+    @pytest.mark.parametrize('score', [float('inf'), float('-inf')])
+    def test_infinities_are_rejected(self, score):
+        with pytest.raises(ValueError):
+            TransactionScore(task_id=uuid4(), score=score)
+
+    def test_a_non_number_is_rejected(self):
+        with pytest.raises(ValueError):
+            TransactionScore(task_id=uuid4(), score='high')
+
+    def test_none_is_rejected(self):
+        with pytest.raises(ValueError):
+            TransactionScore(task_id=uuid4(), score=None)
+
+    def test_an_int_is_accepted_as_a_float(self):
+        assert TransactionScore(task_id=uuid4(), score=1).score == 1.0
+
+    def test_the_message_names_the_scale(self):
+        """An operator reading the log needs the bound, not just a refusal."""
+        with pytest.raises(ValueError, match=r'\[0, 1\]'):
+            TransactionScore(task_id=uuid4(), score=2.0)
+
+    def test_the_wire_form_is_checked_too(self):
+        """`from_json_string` reconstructs via `cls(**kwargs)`, so the constructor
+        IS the wire-side gate -- which is why the handlers catch instead of
+        letting a peer raise inside the process loop."""
+        from autonomous_trust.core import from_json_string, to_json_string
+        good = TransactionScore(task_id=uuid4(), score=0.5)
+        payload = to_json_string(good).replace('0.5', '7.5')
+        with pytest.raises(ValueError):
+            from_json_string(payload)
+
+    def test_the_bound_is_one_value_not_a_repeated_literal(self):
+        from autonomous_trust.core.reputation.reputation import (
+            TX_SCORE_MIN, TX_SCORE_MAX)
+        assert (TX_SCORE_MIN, TX_SCORE_MAX) == (0.0, 1.0)
+
+
+class TestPeerReputationCarrier:
+    """ISSUES §11.1. Mirror of C's `peer_reputation_msg_t` / `at_app_reputation_t`:
+    `rated` says whether AT holds a rating at all, because an unrated peer reads
+    as PREREP_NEUTRAL, which is also a score a peer can genuinely earn."""
+
+    def test_a_rated_carrier_keeps_its_score(self):
+        pr = PeerReputation(str(uuid4()), 0.73, rated=True)
+        assert (pr.rated, pr.score) == (True, 0.73)
+
+    def test_an_unrated_carrier_zeroes_the_score(self):
+        """C's `_publish_reputation` zeroes it regardless of what the caller
+        passed, so a consumer that ignores the flag cannot silently read a
+        plausible-looking number -- and PREREP_NEUTRAL is exactly that."""
+        pr = PeerReputation(str(uuid4()), 0.2, rated=False)
+        assert pr.rated is False
+        assert pr.score == 0.0
+
+    def test_rated_defaults_to_true(self):
+        """Change-driven emissions are rated by construction."""
+        assert PeerReputation(str(uuid4()), 0.4).rated is True
+
+    def test_rated_is_coerced_to_bool(self):
+        assert PeerReputation(str(uuid4()), 0.4, rated=1).rated is True
 
 
 class TestTransaction:

@@ -200,6 +200,11 @@ ffi.cdef("""
         int (*from_json)(const void *obj, void *data_struct);
         size_t data_len;
         void *data_struct;
+        /* Added 2026-08-12 (ISSUES §9.2.1): the proto hooks were missing, so the
+           mirror was 40 bytes against C's 56. Optional in C (NULL = no proto
+           serializer, JSON fallback), but a NULL field still occupies its slot. */
+        int (*to_proto)(const void *data_struct, void **buf_out, size_t *len_out);
+        int (*from_proto)(const void *buf, size_t len, void *data_struct);
     } config_t;
 
     extern config_t configuration_table[];
@@ -445,8 +450,19 @@ ffi.cdef("""
         size_t len;
         public_identity_t to_whom;
         public_identity_t from_whom;
+        /* from_rank / trace_id / verified / has_signature were MISSING here
+           until 2026-08-12 (ISSUES §9.2.1): the mirror was 1848 bytes against
+           C's 1888. Note where each one goes — `from_rank` sits between
+           `from_whom` and `encrypt`, and `trace_id` after `return_to`, exactly as
+           in msg_types.h. Order IS layout, so appending them at the end would
+           have left every field from `encrypt` onward reading at the wrong
+           offset, which is the same defect with a tidier diff. */
+        int from_rank;
         bool encrypt;
         char return_to[65];
+        char trace_id[33];      /* 32-char hex + NUL; NET_TRACE_ID_LEN */
+        bool verified;
+        bool has_signature;
     } net_msg_t;
 
     typedef enum {
@@ -476,6 +492,11 @@ ffi.cdef("""
         unsigned char task_uuid[16];
         unsigned char peer_uuid[16];
         double score;
+        /* Added 2026-08-12 (ISSUES §9.2.1): the mirror was 40 bytes against C's
+           112. CAP_NAMELEN is PROC_NAME_LEN(64), + NUL. Carried verbatim by the
+           whole-struct memcpy in msg_types.c, so a short mirror truncates the
+           capability name that resolves the transaction weight. */
+        char capability_name[65];
     } tx_score_msg_t;
 
     size_t message_size(message_type_t type);
@@ -531,7 +552,11 @@ ffi.cdef("""
     typedef struct task_s task_t;
 
     typedef struct {
-        task_t *task_ptr;       /* opaque pointer */
+        /* `task_t *task_ptr` used to lead this struct and does NOT exist in C
+           (negotiation.h: uuid_t task_uuid; int flood_count). Removed 2026-08-12
+           (ISSUES §9.2.1) — this is the one mirror that was BIGGER than C, 32
+           bytes against 20, so it did not overflow; it read `task_uuid` out of
+           C's `flood_count` and past the end. */
         unsigned char task_uuid[16];
         int flood_count;
     } task_counter_t;
@@ -570,6 +595,9 @@ ffi.cdef("""
         double p2_score;
         bool p2_set;
         int index;
+        /* Added 2026-08-12 (ISSUES §9.2.1): hash-linking's prev_hash was missing,
+           so the mirror was 80 bytes against C's 152. TX_HASH_HEX_LEN(64) + NUL. */
+        char prev_hash[65];
     } transaction_t;
 
     /* tx_history_t/reputations_t contain embedded maps/arrays — opaque */
