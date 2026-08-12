@@ -75,3 +75,63 @@ def test_package_hash_onerror_no_debug():
     ph = PackageHash()
     ph.debug = False
     ph.onerror('test_module')  # should not log
+
+
+class TestPackageHashPycache:
+    """The digest gates peer admission (idprocess rejects a mismatch as a
+    counterfeit), so it must depend on the source alone. An ``__init__.py``
+    inside a ``__pycache__`` makes that directory an importable package, which
+    would otherwise join the walk and perturb the digest. scripts/build-py.sh
+    used to seed exactly such files into the generated protobuf tree, one level
+    deeper per run.
+    """
+
+    pkg_name = 'at_pycache_probe_pkg'
+
+    def _make_tree(self, tmp_path):
+        import sys
+        root = tmp_path / self.pkg_name
+        (root / 'sub').mkdir(parents=True)
+        (root / '__init__.py').touch()
+        (root / 'sub' / '__init__.py').touch()
+        (root / 'sub' / 'thing.py').write_text('VALUE = 1\n')
+        sys.path.insert(0, str(tmp_path))
+        return root
+
+    def _digest(self, root):
+        from autonomous_trust.core.system import PackageHash
+        return PackageHash([str(root)], self.pkg_name)
+
+    def teardown_method(self):
+        import sys
+        sys.path[:] = [p for p in sys.path if self.pkg_name not in p]
+        for name in [m for m in sys.modules if m.startswith(self.pkg_name)]:
+            del sys.modules[name]
+
+    def test_digest_ignores_pycache_init(self, tmp_path):
+        root = self._make_tree(tmp_path)
+        before = self._digest(root)
+        assert before.digest
+
+        cache = root / 'sub' / '__pycache__'
+        cache.mkdir(exist_ok=True)
+        (cache / '__init__.py').touch()
+        after = self._digest(root)
+
+        assert after.digest == before.digest
+        assert not [m for m in after.modules if '__pycache__' in m]
+
+    def test_without_the_exclusion_the_digest_would_move(self, tmp_path, monkeypatch):
+        """Mutation check: proves the assertion above is load-bearing."""
+        from autonomous_trust.core.system import PackageHash
+        root = self._make_tree(tmp_path)
+        monkeypatch.setattr(PackageHash, 'excludes', ['viz'])  # pre-fix value
+        before = self._digest(root)
+
+        cache = root / 'sub' / '__pycache__'
+        cache.mkdir(exist_ok=True)
+        (cache / '__init__.py').touch()
+        after = self._digest(root)
+
+        assert after.digest != before.digest
+        assert [m for m in after.modules if '__pycache__' in m]

@@ -23,6 +23,7 @@ import imutils
 from autonomous_trust.core import Process, ProcMeta, CfgIds, InitializableConfig
 from autonomous_trust.core.network import Message
 from autonomous_trust.services.data.serialize import deserialize
+from ..cohort_sync import CohortSyncMixin
 from .server import VideoProcess, VideoProtocol
 
 
@@ -37,7 +38,7 @@ class VideoRecv(InitializableConfig):
         return cls(size, raw, fast_encoding)
 
 
-class VideoRcvr(Process, metaclass=ProcMeta,
+class VideoRcvr(CohortSyncMixin, Process, metaclass=ProcMeta,
                 proc_name='video-sink', description='Video image stream consumer'):
     header_fmt = VideoProcess.header_fmt
 
@@ -49,6 +50,10 @@ class VideoRcvr(Process, metaclass=ProcMeta,
         self.hdr_size = struct.calcsize(self.header_fmt)
         self.protocol = VideoProtocol(self.name, self.logger, configurations)
         self.protocol.register_handler(VideoProtocol.video, self.handle_video)
+        # Pre-fork: the roster this process looks peers up in does not cross the
+        # process boundary by itself (see cohort_sync).
+        self.subscribe_to_cohort()
+        self._unknown_peer_drops = 0
 
     def handle_video(self, _, message):
         if message.function == VideoProtocol.video:
@@ -65,11 +70,24 @@ class VideoRcvr(Process, metaclass=ProcMeta,
                         _, frame = cv2.imencode('.jpg', frame)
                 if uuid in self.cohort.peers:
                     self.cohort.peers[uuid].video_stream.put((idx, frame, 1), block=True, timeout=self.q_cadence)
+                else:
+                    # Was a SILENT drop, and the roster was empty for every
+                    # frame, so the whole feature failed without a word.
+                    self._unknown_peer_drops += 1
+                    if self._unknown_peer_drops % 100 == 1:
+                        self.logger.warning(
+                            'Dropping video from %s: not in this process\'s cohort '
+                            '(%d so far). The roster arrives as deltas; check the '
+                            'delta channel for %s.'
+                            % (uuid, self._unknown_peer_drops, self.name))
             except (Full, Empty):
                 self.logger.debug("Queue full/empty, dropping video frame from %s", uuid)
 
     def process(self, queues, signal):
         while self.keep_running(signal):
+            # Refresh the roster first: an inbound frame can only be filed
+            # against a peer this process already knows about.
+            self.sync_cohort()
             if VideoProcess.capability_name in self.protocol.peer_capabilities:
                 for peer in self.protocol.peer_capabilities[VideoProcess.capability_name]:
                     if peer not in self.servicers:

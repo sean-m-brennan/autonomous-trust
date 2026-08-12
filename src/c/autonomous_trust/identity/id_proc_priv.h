@@ -22,6 +22,7 @@
 
 #include "processes/processes.h"
 #include "identity/group.h"
+#include "utilities/clock.h"    /* at_clock_sample_t (cohort clock skew) */
 
 /*@
   requires \valid(proc);
@@ -213,8 +214,27 @@ bool handle_roster_request(const process_t *proc, directory_t *queues,
  *  admission-path attestation shape plus the echoed @p nonce and an
  *  always-present operator_attested_at (0 = nobody attending). Shared by
  *  handle_attest_request (wire) and tests / conformance.
- *  See doc/architecture/operator-attended.md. */
-json_t *identity_attest_response(const process_t *proc, const char *nonce);
+ *  See doc/architecture/operator-attended.md.
+ *
+ *  @param received_at when this node took the pull in (the round trip's t2);
+ *         emitted with the answer's own send time so the puller can measure our
+ *         clock without charging our processing time to it. Pass 0 to omit --
+ *         then no clock sample is possible from this exchange.
+ *         See doc/architecture/cohort-clock-skew.md. */
+json_t *identity_attest_response(const process_t *proc, const char *nonce,
+                                 double received_at);
+
+/** This node's clock as the attestation path sees it: the injected value when
+ *  one is pinned (conformance needs determinism), else wall clock. Callers that
+ *  build an answer outside the wire handler need it for @p received_at. */
+double identity_attest_clock(const process_t *proc);
+
+/** Newest cohort clock sample for @p uuid_str (lowercased uuid), or false when
+ *  none has been measured. Measurement only -- see cohort-clock-skew.md.
+ *  Assertion surface for tests / conformance; mirrors reading Python's
+ *  IdentityProcess._peer_clock_samples. */
+bool identity_get_peer_clock_sample(const char *uuid_str,
+                                    at_clock_sample_t *out);
 
 /** Identity-protocol handler for an attest_req: answers with a freshly stamped
  *  attestation. Refuses an un-nonced pull (an attestation bound to nothing is
