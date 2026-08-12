@@ -24,11 +24,38 @@ reading untrusted. Dependency-free, so it runs without the AT/Dash stack.
 
 Run: ``pytest examples/dod_mission/test_reputation_warmstart.py``
 """
+import contextlib
+import importlib
+import os
+import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import reputation_warmstart as rw  # noqa: E402
+
+
+@contextlib.contextmanager
+def _reloaded_with_env(**env):
+    """Reimport the module under a temporary environment, then put both the
+    environment and the module back.
+
+    The thresholds resolve at import, exactly as they do in repprocess.py, so an
+    override is only observable across a reload. Restoring the module matters as
+    much as restoring the environment: every other test in this file reads the
+    module-level constants, so a leaked reload would silently retune them.
+    """
+    saved = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    try:
+        yield importlib.reload(rw)
+    finally:
+        for key, was in saved.items():
+            if was is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = was
+        importlib.reload(rw)
 
 
 # ---- is_pre_trusted -----------------------------------------------------
@@ -106,20 +133,98 @@ def test_seed_constants_are_consistent():
     assert rw.SEED_REPUTATION == 0.7
     assert rw.SEED_TIER == 2
     # Neutral / cold-start on the [0, 1] scale is 0.2, unified across the
-    # consensus and bilateral query paths (mirrors PREREP_NEUTRAL in
-    # repprocess.py / reputation.c).
-    assert rw.NEUTRAL_REP == 0.2
-    assert rw.PREREP_NEUTRAL == 0.2
+    # consensus and bilateral query paths. The value is checked against the two
+    # runtimes it mirrors in test_neutral_mirrors_both_runtimes below; here it is
+    # only asserted that this module resolves ONE neutral for both paths.
+    assert rw.PREREP_NEUTRAL == rw.NEUTRAL_REP
+    assert rw.NEUTRAL_REP_DEFAULT == 0.2
+
+
+# ---- the mirror against its two sources of truth ------------------------
+#
+# This module is the THIRD copy of AT's neutral threshold: repprocess.py and
+# reputation.h are the other two, and both resolve AT_REP_NEUTRAL at runtime.
+# Asserting a literal 0.2 here would pin the drift rather than catch it, which is
+# what this test used to do. It reads the two declarations as TEXT rather than
+# importing them, for two reasons: the module under test is deliberately
+# dependency-free, and an import of the AT stack would skip on a missing dep in
+# exactly the environments where this check matters. A skipped test is not a
+# check, so an unreadable source is a FAILURE below, never a skip.
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_PY_SOURCE = (_REPO_ROOT / 'src' / 'autonomous-trust' / 'autonomous_trust' /
+              'core' / '_python' / 'reputation' / 'repprocess.py')
+_C_SOURCE = (_REPO_ROOT / 'src' / 'c' / 'autonomous_trust' / 'reputation' /
+             'reputation.h')
+
+
+def _declared(path, pattern, what):
+    assert path.is_file(), (
+        f"cannot read {what} at {path}: this test exists to compare the demo's "
+        f"neutral against that source, so a missing source is a failure, not a skip"
+    )
+    match = re.search(pattern, path.read_text())
+    assert match is not None, (
+        f"{what} no longer declares its neutral in the form this test reads "
+        f"({pattern!r} did not match {path}); the mirror is unchecked until the "
+        f"pattern is updated"
+    )
+    return float(match.group(1))
+
+
+def test_neutral_mirrors_both_runtimes():
+    py_default = _declared(
+        _PY_SOURCE,
+        r"PREREP_NEUTRAL\s*=\s*_env_float\(\s*['\"]AT_REP_NEUTRAL['\"]\s*,\s*([0-9.]+)",
+        'repprocess.py')
+    c_default = _declared(
+        _C_SOURCE,
+        r"#define\s+PREREP_NEUTRAL_DEFAULT\s+([0-9.]+)",
+        'reputation.h')
+    assert rw.NEUTRAL_REP_DEFAULT == py_default, (
+        f"demo default {rw.NEUTRAL_REP_DEFAULT} != repprocess.py {py_default}")
+    assert rw.NEUTRAL_REP_DEFAULT == c_default, (
+        f"demo default {rw.NEUTRAL_REP_DEFAULT} != reputation.h {c_default}")
+
+
+def test_neutral_follows_the_operator_override():
+    # Both runtimes honor AT_REP_NEUTRAL. If this module did not, a tuned
+    # deployment would report no cold-start readings at all: every pre-trusted
+    # asset would keep its unsubstituted neutral and draw a 0.0 edge that the
+    # renderer prunes, dropping it off the Trust Network graph silently.
+    with _reloaded_with_env(AT_REP_NEUTRAL='0.35') as mod:
+        assert mod.NEUTRAL_REP == 0.35
+        assert mod.PREREP_NEUTRAL == 0.35
+        assert mod.is_cold_start_reading(0.35)
+        assert mod.is_neutral_rep(0.35)
+        # The compiled-in default is no longer the node's neutral, so it is an
+        # ordinary score.
+        assert not mod.is_cold_start_reading(0.2)
+        assert mod.warm_start_edge_score(0.35, True) == mod.SEED_REPUTATION
+        assert mod.warm_start_edge_score(0.2, True) == 0.2
+    # Restored for every other test in this file.
+    assert rw.NEUTRAL_REP == rw.NEUTRAL_REP_DEFAULT
+
+
+def test_an_unparseable_override_falls_back_like_both_runtimes():
+    for bad in ('', 'not-a-float'):
+        with _reloaded_with_env(AT_REP_NEUTRAL=bad) as mod:
+            assert mod.NEUTRAL_REP == mod.NEUTRAL_REP_DEFAULT, bad
 
 
 # ---- is_cold_start_reading / warm_start_edge_score (bilateral graph) ----
 
-def test_both_cold_start_neutrals_recognized():
-    # On the [0, 1] scale the consensus and bilateral neutrals are unified at
-    # PREREP_NEUTRAL (0.2) — "no earned info" on either query path.
+def test_the_one_neutral_is_recognized_on_both_query_paths():
+    # The consensus and bilateral paths are unified at PREREP_NEUTRAL (0.2) since
+    # the signed-scale framing was reverted, so this is one value under two
+    # names, not two neutrals. (The old name of this test claimed two.)
     assert rw.is_cold_start_reading(0.2)
     assert rw.is_cold_start_reading(rw.PREREP_NEUTRAL)
     assert rw.is_cold_start_reading(rw.NEUTRAL_REP)
+    # is_cold_start_reading is the bilateral name for is_neutral_rep, and
+    # delegates to it, so the two can no longer disagree.
+    for s in (0.2, 0.0, 0.5, 0.35, 0.7):
+        assert rw.is_cold_start_reading(s) == rw.is_neutral_rep(s), s
     # The old-scale neutrals (0.5 pure / 0.0 CTFT) are no longer cold-start.
     assert not rw.is_cold_start_reading(0.5)
     assert not rw.is_cold_start_reading(0.0)

@@ -249,7 +249,11 @@ _run_host_conda() {
   export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
   local rc=0
-  bash -c "$commands" || rc=$?
+  # Prepend the same `set -euo pipefail` the containerized path gets from
+  # _container_prelude. The job strings are written for a fail-fast shell: a
+  # failing early step (e.g. the protobuf regen) must abort the job rather than
+  # let the suites below run against stale or absent bindings.
+  bash -c "set -euo pipefail"$'\n'"$commands" || rc=$?
   conda deactivate || true
   return $rc
 }

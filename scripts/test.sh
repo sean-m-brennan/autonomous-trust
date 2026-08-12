@@ -26,7 +26,7 @@ usage() {
 Usage: test.sh [extra args...] [-h|--help]
 
 Run the full test suite for the code base, in order:
-  - test-packages.sh    (Python package tests)
+  - test-packages.sh    (Protobuf regen, C build, Python package tests)
   - test-c-exe.sh       (C test suites)
   - test-integration.sh (multi-node Docker integration tests)
   - test-sim-pkg.sh     (simulator package tests)

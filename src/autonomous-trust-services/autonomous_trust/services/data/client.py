@@ -19,10 +19,11 @@ from queue import Empty, Full
 
 from autonomous_trust.core import Process, ProcMeta, CfgIds, from_yaml_string
 from autonomous_trust.core.network import Message
+from ..cohort_sync import CohortSyncMixin
 from .server import DataProcess, DataProtocol
 
 
-class DataRcvr(Process, metaclass=ProcMeta,
+class DataRcvr(CohortSyncMixin, Process, metaclass=ProcMeta,
                proc_name='data-sink', description='Data stream consumer'):
     header_fmt = DataProcess.header_fmt
 
@@ -33,6 +34,10 @@ class DataRcvr(Process, metaclass=ProcMeta,
         self.hdr_size = struct.calcsize(self.header_fmt)
         self.protocol = DataProtocol(self.name, self.logger, configurations)
         self.protocol.register_handler(DataProtocol.data, self.handle_data)
+        # Pre-fork: the roster this process looks peers up in does not cross the
+        # process boundary by itself (see cohort_sync).
+        self.subscribe_to_cohort()
+        self._unknown_peer_drops = 0
 
     def handle_data(self, _, message):
         if message.function == DataProtocol.data:
@@ -41,11 +46,24 @@ class DataRcvr(Process, metaclass=ProcMeta,
                 data = from_yaml_string(message.obj)
                 if uuid in self.cohort.peers:
                     self.cohort.peers[uuid].data_stream.put(data, block=True, timeout=self.q_cadence)
+                else:
+                    # Was a SILENT drop, and the roster was empty for every
+                    # payload, so the whole feature failed without a word.
+                    self._unknown_peer_drops += 1
+                    if self._unknown_peer_drops % 100 == 1:
+                        self.logger.warning(
+                            'Dropping data from %s: not in this process\'s cohort '
+                            '(%d so far). The roster arrives as deltas; check the '
+                            'delta channel for %s.'
+                            % (uuid, self._unknown_peer_drops, self.name))
             except (Full, Empty):
                 self.logger.warning("Queue full/empty, dropping data message from %s", uuid)
 
     def process(self, queues, signal):
         while self.keep_running(signal):
+            # Refresh the roster first: an inbound payload can only be filed
+            # against a peer this process already knows about.
+            self.sync_cohort()
             if DataProcess.capability_name in self.protocol.peer_capabilities:
                 for peer in self.protocol.peer_capabilities[DataProcess.capability_name]:
                     if peer not in self.servicers:

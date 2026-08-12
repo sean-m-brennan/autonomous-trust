@@ -25,9 +25,9 @@ usage() {
   cat <<'EOF'
 Usage: test-packages.sh [OPTIONS] [pytest args...]
 
-Build the C library, then run the Python test suites for each autonomous-trust
-package. Extra arguments are forwarded to pytest (the flags consumed here are
-stripped before forwarding).
+Regenerate the Protobuf interfaces and build the C library, then run the Python
+test suites for each autonomous-trust package. Extra arguments are forwarded to
+pytest (the flags consumed here are stripped before forwarding).
 
 Options:
   -q, --quick     Skip the two-node integration test.
@@ -56,6 +56,20 @@ if [[ "${CONDA_DEFAULT_ENV:-}" != "$CONDA_ENV_NAME" ]]; then
     echo "ERROR: conda environment '$CONDA_ENV_NAME' is not active." >&2
     echo "  Run: conda activate $CONDA_ENV_NAME" >&2
     exit 1
+fi
+
+# Regenerate the Protobuf interfaces BEFORE the C build and the suites below.
+# The generated Python package
+# (src/autonomous-trust/autonomous_trust/core/protobuf/) is a build product,
+# gitignored, and imported directly from the source tree by every suite here --
+# so a stale tree silently tests the PREVIOUS .proto, and a fresh checkout has
+# no bindings at all. Regenerating is cheap and idempotent, so it runs
+# unconditionally rather than trying to guess whether the .proto changed.
+echo "========== Regenerating the Protobuf interfaces =========="
+if $verbose; then
+  scripts/build-py.sh proto-only || exit 1
+else
+  scripts/build-py.sh proto-only >/dev/null || exit 1
 fi
 
 echo "========== Building the C library =========="

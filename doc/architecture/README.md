@@ -17,6 +17,7 @@ Technical architecture documentation for the AutonomousTrust cooperative computi
 - [Trust Tiers](trust-tiers.md)) Tiered capabilities, weighted transactions, bootstrap corpus, tier-gated access
 - [Node Lifecycle](node-lifecycle.md) (Startup phases and state transitions
 - [Partition Recovery](partition-recovery.md)) Split-brain detection, probe/response, and group merge
+- [Cohort Clock Skew](cohort-clock-skew.md) (Measuring peer clock disagreement, and why peer reference clocks stay unbuilt
 - [Persistent Cohort](persistent-cohort.md) (On-disk identity/group/reputation state and warm restarts
 - [Integration Testing](integration-testing.md)) Metrics collection and scenario verification
 - [Adversarial Testing](adversarial-testing.md) (Security validation via attack scenarios and CALDERA orchestration

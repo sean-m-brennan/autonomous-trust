@@ -56,5 +56,15 @@ class VideoSimRcvr(VideoRcvr, metaclass=ProcMeta,
                     msg = idx, add_noise(Noise.GAUSSIAN, None, self.image_shape), 100
                 if uuid in self.cohort.peers:
                     self.cohort.peers[uuid].video_stream.put(msg, block=True, timeout=self.q_cadence)
+                else:
+                    # Same silent drop the base VideoRcvr had: this process's
+                    # roster arrives as deltas (see services/cohort_sync), and an
+                    # empty one used to discard every frame without a word.
+                    self._unknown_peer_drops += 1
+                    if self._unknown_peer_drops % 100 == 1:
+                        self.logger.warning(
+                            'Dropping sim video from %s: not in this process\'s '
+                            'cohort (%d so far). Check the delta channel for %s.'
+                            % (uuid, self._unknown_peer_drops, self.name))
             except (Full, Empty):
                 pass
