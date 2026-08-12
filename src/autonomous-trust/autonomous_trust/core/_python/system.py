@@ -303,7 +303,12 @@ def now():
 
 class PackageHash(object):
     key = 'package_hash'
-    excludes = ['viz']
+    # '__pycache__' is not a package, but it becomes importable if anything ever
+    # seeds an __init__.py into it (scripts/build-py.sh used to). Such a file
+    # would otherwise join the walk below and perturb the digest, which peers
+    # compare -- a mismatch is treated as a counterfeit and the peer is refused.
+    # The digest must depend on the source only, so exclude it unconditionally.
+    excludes = ['viz', '__pycache__']
 
     def __init__(self, pkg_path=None, pkg_name=None, debug=False):
         self.logger = logging.getLogger()

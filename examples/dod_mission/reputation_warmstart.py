@@ -12,7 +12,7 @@ WHAT level without importing each other's heavy deps:
 * ``examples/dod_mission/coordinator.py`` warm-starts its *dashboard*
   reputation view, so a pre-trusted peer that is present too briefly to build
   consensus history — the fighter-jet's ~15 s strike window — still reads
-  trusted instead of the cold-start 0.5.
+  trusted instead of the cold-start neutral.
 
 The jet is on the list because its window is too short for consensus to climb.
 NOTE: ``command`` was briefly added here too, but seeding it as a mutual-trust
@@ -21,6 +21,30 @@ re-keying), so it was reverted — the command node cold-bootstraps like the
 other non-field roles. See [[project_sg2_followups]].
 """
 from __future__ import annotations
+
+import os
+
+
+def _env_float(name, default):
+    """Mirror of ``repprocess._env_float``, duplicated rather than imported so
+    this module stays dependency-free (see the module docstring). A missing,
+    empty or unparseable value uses the default, exactly as the two runtimes do.
+
+    Both runtimes resolve the reputation thresholds from the environment --
+    ``repprocess.py`` via this same logic, ``reputation.h`` via
+    ``reputation_env_double`` -- so that "Python<->C stay byte-comparable under
+    the SAME environment". This module is the third copy of those thresholds and
+    has to resolve them the same way or it stops agreeing with the nodes it is
+    reading.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == '':
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
 
 # Peers whose name starts with one of these are pre-trusted from t=0.
 PRE_TRUSTED_PREFIXES = ("squad-", "microdrone-", "jet-")
@@ -35,25 +59,36 @@ SEED_TIER = 2
 # Cold-start neutral placeholder a consensus query returns for a peer with no
 # committed bilateral history yet. On the [0, 1] scale the neutral / cold-start
 # reputation is PREREP_NEUTRAL (0.2) — a small leeway above the COMM_CUTOFF
-# (0.1) communication cut-off — so _consensus_baseline returns 0.2 for a peer
-# with no committed history. A real EMA over the demo's transaction scores
-# (0.3 anomalous / 0.8 clean) never lands exactly here, so an exact 0.2 reading
-# means "no information yet", not an earned score. Mirrors PREREP_NEUTRAL in
-# repprocess.py / reputation.c — kept in sync by hand (this module stays
-# dependency-free); the tests assert consistency.
-NEUTRAL_REP = 0.2
+# (0.1) communication cut-off — so _consensus_baseline returns the neutral for a
+# peer with no committed history. A real EMA over the demo's transaction scores
+# (0.3 anomalous / 0.8 clean) never lands exactly here, so an exact neutral
+# reading means "no information yet", not an earned score.
+#
+# DEFAULT vs RESOLVED, the same split reputation.h draws between
+# PREREP_NEUTRAL_DEFAULT and PREREP_NEUTRAL. The default mirrors
+# repprocess.py's `_env_float('AT_REP_NEUTRAL', 0.2)` and reputation.h's
+# PREREP_NEUTRAL_DEFAULT; test_neutral_mirrors_both_runtimes reads BOTH of those
+# sources and fails if this number stops matching either, so the mirror is
+# checked against what it mirrors rather than against a literal.
+NEUTRAL_REP_DEFAULT = 0.2
+
+# The operator override both runtimes honor. Without this the demo would keep
+# testing for 0.2 while a node tuned by AT_REP_NEUTRAL returned something else:
+# no reading would count as cold-start, no pre-trusted asset would get its prior
+# substituted, and every one of them would draw a 0.0 edge the renderer prunes.
+NEUTRAL_REP = _env_float('AT_REP_NEUTRAL', NEUTRAL_REP_DEFAULT)
 
 # The bilateral (peer-pair / rep_req) query path that feeds the Trust Network
 # graph returns the SAME neutral on the [0, 1] scale: an observer's rep_req of a
 # subject it has no local history with returns ``ReputationProcess.PREREP_NEUTRAL``
-# (0.2) in both pure mode (a warm-start-seeded observer whose stored prior
+# in both pure mode (a warm-start-seeded observer whose stored prior
 # 0.7 > COOP_ENTER) and tit-for-tat mode (a cold observer). Both mean "no earned
 # bilateral info yet". Since the earlier signed-scale framing was reverted, the
-# consensus and bilateral neutrals are unified at PREREP_NEUTRAL (0.2); this
-# constant is kept as a distinct name for the two documented query paths but
-# holds the same value. Mirrors ``PREREP_NEUTRAL`` in repprocess.py /
-# reputation.c.
-PREREP_NEUTRAL = 0.2
+# consensus and bilateral neutrals are unified at PREREP_NEUTRAL; this name is
+# kept for the two documented query paths and is an ALIAS, so there is one
+# definition of the neutral here. If AT ever re-splits the two scales, this is
+# the line that stops being an alias.
+PREREP_NEUTRAL = NEUTRAL_REP
 
 
 def is_pre_trusted(peer_name: str) -> bool:
@@ -63,8 +98,8 @@ def is_pre_trusted(peer_name: str) -> bool:
 
 def is_warm_start_member(peer_name: str, join_phase: int, kind: str) -> bool:
     """True if a peer's DASHBOARD reputation should be warm-started — i.e.
-    surface a seeded prior instead of "forming…"/cold-start 0.5 for a peer
-    that doesn't reliably earn committed consensus in the coordinator's view.
+    surface a seeded prior instead of "forming…"/the cold-start neutral for a
+    peer that doesn't reliably earn committed consensus in the coordinator's view.
 
     Warm-started:
 
@@ -92,19 +127,23 @@ def is_warm_start_member(peer_name: str, join_phase: int, kind: str) -> bool:
 
 
 def is_neutral_rep(score: float) -> bool:
-    """True if a reputation reading is the exact cold-start neutral default."""
+    """True if a reputation reading is the exact cold-start neutral (the resolved
+    ``NEUTRAL_REP``, which follows ``AT_REP_NEUTRAL`` when an operator sets it)."""
     return abs(score - NEUTRAL_REP) < 1e-9
 
 
 def is_cold_start_reading(score: float) -> bool:
     """True if a *bilateral* (peer-pair) reputation reading is a cold-start
-    neutral — i.e. carries no earned bilateral information. Recognizes BOTH
-    neutrals a ``rep_req`` can return: the pure-mode/no-history 0.5
-    (``NEUTRAL_REP``) and the tit-for-tat ``PREREP_NEUTRAL`` 0.0. An earned
-    score (CTFT pivots min(0.49)/max(0.51), or a computed pure score) is not
-    cold-start. Pure."""
-    return (abs(score - NEUTRAL_REP) < 1e-9
-            or abs(score - PREREP_NEUTRAL) < 1e-9)
+    neutral — i.e. carries no earned bilateral information.
+
+    A ``rep_req`` returns the same neutral on both of its paths: pure mode (a
+    warm-start-seeded observer) and tit-for-tat mode (a cold observer). Since the
+    signed-scale framing was reverted they are one value on the [0, 1] scale, so
+    this is ``is_neutral_rep`` under the name the bilateral call sites use, and
+    it delegates rather than repeating the comparison. An earned score (CTFT
+    pivots min(0.49)/max(0.51), or a computed pure score) is not cold-start.
+    Pure."""
+    return is_neutral_rep(score)
 
 
 def warm_start_edge_score(score: float, is_warm_start_subject: bool) -> float:

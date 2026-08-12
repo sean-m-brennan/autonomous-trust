@@ -62,19 +62,33 @@ class PeerStatus(DashComponent):
         PeerStatus._count += 1
         self.peer_detail_id = f'peer_status_{self.idx}'
 
-        # Architectural constraint: VideoFeed is always instantiated
-        # regardless of whether the peer's metadata declares a video
-        # source. The widget renders empty when there's no stream, but
-        # the layout slot is reserved at construct time because the
-        # Dash layout tree can't grow new components after page load.
-        # A future redesign with fully dynamic component injection
-        # would remove this constraint — see peer_status.py:87.
+        # Accepted design (2026-08-12), for the same reason as the panel note
+        # below: VideoFeed is always instantiated regardless of whether the peer's
+        # metadata declares a video source — which it cannot at this point anyway,
+        # since a peer is rostered holding `NullPeerData`. The widget renders empty
+        # when there is no stream, and the layout slot is reserved at construct
+        # time because the Dash layout tree cannot grow components after page load.
         self.vid_feed = VideoFeed(self.ctl, peer, self.idx)
         self.data_feed = DataFeed(self.ctl, peer, self.idx)
-        self.data_type = peer.metadata.data_type
 
         self.net_figs = {}
         self.trust_figs = {}
+        # Is this peer's detail drawer on screen, and how many `others` the
+        # rendered body was built for. Both are needed because the per-other
+        # subplots are pushed by id: pushing a figure cannot populate a div that
+        # is not in the DOM, so a peer discovered after the drawer opened needs
+        # the body rebuilt rather than a figure update. Kept HERE rather than on
+        # the parent: the component already learns its own open/closed state
+        # from its own callback. The previously-intended
+        # `parent.displayed_detail` does exist on `MapDisplay` (initialised to -1)
+        # but is never read or written anywhere else, so the old guard would have
+        # compared -1 to an index forever: a silent no-op, not a crash.
+        self._detail_open = False
+        self._rendered_others = 0
+        # Caption text last delivered to the browser, per div id, so an unchanged
+        # caption costs no message. Seeded by full_div, which renders the same
+        # text through the same helpers.
+        self._pushed_titles: dict[str, str] = {}
         self.fig = go.Figure()
         xes, y1s, y2s, y3s = self.update_summary()
         self.micro_width = 250
@@ -99,21 +113,32 @@ class PeerStatus(DashComponent):
         self.cohort.register_updater(self.update_micrograph)
         self.cohort.register_updater(self.update_trust_levels)
         self.cohort.register_updater(self.update_net_graphs)
+        self.cohort.register_updater(self.update_detail_titles)
+        self.cohort.register_updater(self.update_data_feed)
 
-        # Architectural open: persist all peer data so a
-        # fully-dynamic renderer can drive arbitrary detail panels on
-        # demand; currently only one peer's detail can render at a
-        # time. Pairs with the VideoFeed slot-reservation note above.
+        # ACCEPTED DESIGN (decided 2026-08-12), not a deferral: every peer's
+        # detail panel is pre-created at page load, and that is where it stays.
+        # Dash freezes the layout tree at load and Flask freezes the route table
+        # at app.run(), so panels created on demand would need either dynamic
+        # blueprint registration or panel bodies driven entirely from pushed
+        # children — significant wiring to remove a constraint nothing is
+        # currently hitting, since the pool is sized to MAX_PEERS at startup.
+        # Per-peer state IS fully recorded (roster, metadata, stats, reputation,
+        # sensor series), so any number of open drawers render independently;
+        # what is static is the set of containers, not the data behind them.
+        # Pairs with the VideoFeed slot-reservation note above.
 
         @ctl.callback(Output(f'offcanvas-{self.idx}', 'is_open'),
                       Input(f'more-btn-{self.idx}', "n_clicks"),
                       State(f'offcanvas-{self.idx}', 'is_open'))
         def toggle_peer_detail(clicks, is_open):
             if clicks > 0:
-                ctl.push_mods({f'peer-detail-{self.idx}': {'children': self.full_div()}})
-                self.peer.active = True
-                return not is_open
-            self.peer.active = False
+                # `not is_open` is where the drawer is HEADED. The old code
+                # pushed a rebuilt body and set active=True on every click,
+                # including the closing one, so a peer stayed active — and its
+                # video feed kept streaming — for a drawer nobody was looking at.
+                return self.set_detail_open(not is_open)
+            self.set_detail_open(False)
             return is_open
 
         @ctl.callback(Output(f'follow-target-{self.idx}', 'children'),
@@ -128,6 +153,109 @@ class PeerStatus(DashComponent):
         for idx, other in enumerate(self.peer.others):
             self.add_net_graph(idx, other)
             self.add_trust_gauge(idx)
+
+    def set_detail_open(self, is_open: bool) -> bool:
+        """Record that this peer's detail drawer opened or closed, and push a
+        fresh body when it opens. Returns the new state, so the Dash callback
+        can return it directly.
+
+        `peer.active` follows the drawer because it gates VideoFeed.xmit/rcv:
+        a closed drawer must stop the feed, not keep decoding frames for nobody.
+        """
+        self._detail_open = bool(is_open)
+        self.peer.active = bool(is_open)
+        if is_open:
+            self.ctl.push_mods({f'peer-detail-{self.idx}': {'children': self.full_div()}})
+        return self._detail_open
+
+    def _detail_visible(self) -> bool:
+        """Whether a push would actually land somewhere a user can see.
+
+        Both halves matter: with no browser attached there is nobody to push to,
+        and with the drawer closed the target divs are hidden — pushing a figure
+        per other per tick for every peer's closed drawer is the cost this guard
+        exists to avoid."""
+        return bool(self._detail_open and self.cohort.browser_connected)
+
+    def _resync_detail_body(self) -> bool:
+        """Rebuild the detail body when the set of others changed since it was
+        rendered, and report whether it did.
+
+        The per-other subplot ids are positional (`trust-<peer>-<n>`), so a newly
+        discovered peer has no div to push a figure into; only a rebuilt body
+        creates one. The rebuild already carries current figures, so a caller
+        that rebuilt should skip its own figure pushes for this tick."""
+        if len(self.peer.network_history) == self._rendered_others:
+            return False
+        self.ctl.push_mods({f'peer-detail-{self.idx}': {'children': self.full_div()}})
+        return True
+
+    @property
+    def data_type(self):
+        """Read live, never captured. A peer is rostered with `NullPeerData`
+        (empty `data_type`) and its real metadata arrives later as a `meta`
+        delta, so a value copied in `__init__` is the placeholder for the life of
+        the component -- the caption read ' data' no matter what the peer sent."""
+        return self.peer.metadata.data_type
+
+    def _position_text(self) -> str:
+        """The video panel's caption: where this peer is, as of right now.
+
+        Shared with `update_detail_titles` so pushed text cannot drift from
+        rendered text.
+        """
+        try:
+            pos = self.peer.position.convert(GeoPosition)
+            return f'{pos.alt:f} m above {pos.lat:f}, {pos.lon:f}'
+        except (NotImplementedError, AttributeError, TypeError, ValueError):
+            # NotImplementedError is the LIVE case, not a defensive nicety: a
+            # peer is rostered with `NullPeerData`, whose bare `Position` cannot
+            # convert, so opening the drawer before that peer's metadata arrived
+            # raised inside the Dash callback and built no body at all.
+            # The text says which of the two it is -- a peer that has not
+            # reported is a normal early state, not a fault (and 0, 0 would be a
+            # lie the operator cannot tell from a real fix off Africa).
+            return 'position not yet reported'
+
+    def _data_title(self) -> str:
+        if not self.data_type:
+            # Distinguishes 'this peer has not said yet' from a type named ''.
+            return 'data type not yet reported'
+        return f'{self.data_type} data'
+
+    def update_detail_titles(self):
+        """Push the drawer's live captions (§4.2:360).
+
+        The position under the video feed was rendered once, when the body was
+        built, and never updated again, so a moving peer's open drawer kept
+        showing where it was when the drawer opened. The data caption was worse:
+        it was built from a `data_type` copied before any metadata delta had
+        arrived, so it stayed empty for good.
+
+        Only changed text is pushed -- a stationary peer costs nothing, and a
+        caption is not worth a message per tick when it did not move.
+        """
+        if not self._detail_visible():
+            return
+        for div_id, text in ((self.vid_feed.title_id, self._position_text()),
+                             (self.data_feed.title_id, self._data_title())):
+            if self._pushed_titles.get(div_id) == text:
+                continue
+            self._pushed_titles[div_id] = text
+            self.ctl.push_mods({div_id: {'children': text}})
+
+    def update_data_feed(self):
+        """Record this peer's sensor samples, and render them when watched.
+
+        The drain is unconditional: nothing else consumes `peer.data_stream`, so
+        skipping it while the drawer is closed would both lose the history the
+        drawer exists to show and let an unbounded pooled Queue grow for as long
+        as the peer keeps reporting. Only the PUSH is guarded.
+        """
+        changed = self.data_feed.drain()
+        if changed and self._detail_visible():
+            self.ctl.push_mods({self.data_feed.graph_id:
+                                {'figure': self.data_feed.fig.to_dict()}})
 
     def add_trust_gauge(self, idx):
         if idx in self.trust_figs:
@@ -176,6 +304,7 @@ class PeerStatus(DashComponent):
             self.ctl.push_mods({div_id: {'figure': self.fig.to_dict()}})
 
     def update_trust_levels(self):
+        rebuilt = self._resync_detail_body() if self._detail_visible() else False
         for idx, other in enumerate(self.peer.others):
             div_id = f'trust-{self.idx}-{idx}'
             try:
@@ -190,10 +319,15 @@ class PeerStatus(DashComponent):
                 rep = self.peer.reputation_history[-1] if self.peer.reputation_history else 0.0
             trust_gauge.update_traces(selector=dict(name=f'trust-gauge-{idx}'),
                                       value=rep, overwrite=True)
-            #if self.parent.displayed_detail == self.idx:
-            #    self.ctl.push_mods({div_id: {'figure': trust_gauge.to_dict()}})
+            # The wire-up that was missing (§4.2): the figure was updated here
+            # every tick, but nothing told the browser, so an open drawer showed
+            # whatever the figure held when it opened — permanently empty if it
+            # opened before any data arrived.
+            if not rebuilt and self._detail_visible() and idx < self._rendered_others:
+                self.ctl.push_mods({div_id: {'figure': trust_gauge.to_dict()}})
 
     def update_net_graphs(self):
+        rebuilt = self._resync_detail_body() if self._detail_visible() else False
         for idx, other in enumerate(self.peer.others):
             div_id = f'net-graph-{self.idx}-{idx}'
             try:
@@ -202,8 +336,8 @@ class PeerStatus(DashComponent):
                 net_fig = self.add_net_graph(idx, other)
             x_vals, y_vals = self.update_net(other)
             net_fig.update_traces(selector=dict(name=f'net-fig-{idx}'), x=x_vals, y=y_vals, overwrite=True)
-            #if self.parent.displayed_detail == self.idx:
-            #    self.ctl.push_mods({div_id: {'figure': net_fig.to_dict()}})
+            if not rebuilt and self._detail_visible() and idx < self._rendered_others:
+                self.ctl.push_mods({div_id: {'figure': net_fig.to_dict()}})
 
     def update_summary(self):
         net_history = self.peer.network_history
@@ -211,7 +345,11 @@ class PeerStatus(DashComponent):
         y1s = [sum(i) for i in zip_longest(*rev1, fillvalue=0)][::-1]
         rev2 = [list(map(lambda x: x.down, list(sub)))[::-1] for sub in net_history.values()]
         y2s = [sum(i) for i in zip_longest(*rev2, fillvalue=0)][::-1]
-        xes = list(range(1, len(y1s)))
+        # +1: plotly pairs x[i] with y[i] and drops the tail of the longer
+        # series, so an x one short of y silently hid the NEWEST sample --
+        # exactly the one the micrograph exists to show. Matches update_net's
+        # convention below.
+        xes = list(range(1, len(y1s) + 1))
         y3s = list(self.peer.reputation_history)
         return xes, y1s, y2s, y3s
 
@@ -269,16 +407,14 @@ class PeerStatus(DashComponent):
         )
 
     def full_div(self):
-        pos = self.peer.position.convert(GeoPosition)
         trust_levels = []
         network = []
         self.populate()  # in case it isn't
-        #print(f'Num other peers {len(self.peer.others)}')  # Updating too fast?
+        # The shape this body is being built for. _resync_detail_body compares
+        # against it to notice a peer discovered while the drawer is open, whose
+        # subplot divs do not exist yet.
+        self._rendered_others = len(self.peer.network_history)
         for idx, other in enumerate(self.peer.others):
-            # UI debugging open: trust/network subplots aren't
-            # populating — likely a missing wire-up between PeerDataAcq
-            # updates and self.trust_figs / self.net_figs. Needs a
-            # runtime trace to identify the gap.
             trust_levels.append(dbc.Col([dcc.Graph(id=f'trust-{self.idx}-{idx}',
                                                    figure=self.trust_figs[idx],
                                                    config=dict(displayModeBar=False),
@@ -292,6 +428,14 @@ class PeerStatus(DashComponent):
         #print(f'Trust {len(trust_levels)}')
         #print(f'Net {len(trust_levels)}')
 
+        # The captions this body carries to the browser. Recording them keeps
+        # update_detail_titles from re-pushing text the client already has, and
+        # keeps the cache honest across a rebuild (which replaces the elements).
+        position_text = self._position_text()
+        data_title = self._data_title()
+        self._pushed_titles = {self.vid_feed.title_id: position_text,
+                               self.data_feed.title_id: data_title}
+
         return html.Div([
             html.Div(id=f'peer-details-target-{self.idx}', style={'display': 'none'}),
             html.Div([
@@ -300,15 +444,14 @@ class PeerStatus(DashComponent):
                         dbc.Col([f'{self.peer.name} ({self.peer.nickname}) - {self.peer.uuid}']),
                     ]),
                     dbc.Row([
-                        # Open: the original FIXME tag here read
-                        # "modification" — likely meant "handle live
-                        # updates to the position string without
-                        # rebuilding the whole div". Verify and either
-                        # implement push updates or drop the tag.
-                        dbc.Col(self.vid_feed.div(f"{pos.alt:f} m above {pos.lat:f}, {pos.lon:f}")),
+                        # The caption is live: `update_detail_titles` pushes it
+                        # into `vid_feed.title_id` while the drawer is open, so a
+                        # moving peer's position tracks instead of freezing at
+                        # whatever it was when the body was built (§4.2:360).
+                        dbc.Col(self.vid_feed.div(position_text)),
                     ]),
                     dbc.Row([
-                        dbc.Col(self.data_feed.div(f"{self.data_type} data")),
+                        dbc.Col(self.data_feed.div(data_title)),
                     ]),
                     dbc.Row(trust_levels),
                     dbc.Row(network),

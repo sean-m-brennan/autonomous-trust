@@ -125,8 +125,15 @@ class _Participant:
     attest_accepted: list = field(default_factory=list)
     # The last answer received, kept so trigger_attest_replay can re-present it.
     attest_last_answer: dict = field(default_factory=dict)
-    # Pinned attestation clock from the operator_session fixture (0 = unset).
+    # Pinned attestation clock from the operator_session / clocks fixture
+    # (0 = unset).
     attest_clock: float = 0.0
+    # Cohort clock samples this participant MEASURED as the puller, relabelled
+    # from the production handler's uuid key to the scenario's participant id so
+    # expected_state can name a peer language-agnostically. The values come
+    # straight out of IdentityProcess._peer_clock_samples -- the harness
+    # relabels, it does not compute. See doc/architecture/cohort-clock-skew.md.
+    attest_clock_samples: dict = field(default_factory=dict)
 
     def drain_outbox(self) -> list[CapturedMessage]:
         captured: list[CapturedMessage] = []
@@ -313,6 +320,37 @@ class _Participant:
                 if actual != float(expected):
                     raise AssertionError(
                         f'{self.id}: attested_now={actual}, expected {float(expected)}')
+            elif key in ('peer_clock_offset', 'peer_clock_delay',
+                         'peer_clock_usable'):
+                # Cohort clock skew measured from the attest round trip
+                # (cohort-clock-skew.md, Stage 0). expected = {peer_ref: value},
+                # peer_ref being a participant id.
+                #
+                # These read what the PRODUCTION handler recorded
+                # (_peer_clock_samples), not anything the harness computed --
+                # unlike attested_now/attest_accepted, which the harness derives
+                # itself and which therefore stayed green when
+                # handle_attest_response was half-broken by a signature change.
+                for peer_ref, want in (expected or {}).items():
+                    sample = self.attest_clock_samples.get(peer_ref)
+                    if sample is None:
+                        raise AssertionError(
+                            f'{self.id}: no clock sample for {peer_ref}')
+                    if key == 'peer_clock_usable':
+                        if bool(sample.usable) != bool(want):
+                            raise AssertionError(
+                                f'{self.id}: {peer_ref} clock_usable='
+                                f'{sample.usable}, expected {want}')
+                        continue
+                    actual = (sample.offset if key == 'peer_clock_offset'
+                              else sample.delay).total_seconds()
+                    # Tolerance, not equality: both runtimes reach this through
+                    # double arithmetic, and pinned clocks make the value exact
+                    # to well inside a microsecond.
+                    if abs(actual - float(want)) > 1e-6:
+                        raise AssertionError(
+                            f'{self.id}: {peer_ref} {key}={actual}, '
+                            f'expected {float(want)}')
             elif key == 'attest_accepted':
                 # Per-pull accept/reject verdicts, in step order. The nonce
                 # state machine: an answer counts only against the pull that
@@ -845,7 +883,31 @@ class IdentityAdapter:
         # operator_session fixture: who has a human at the console, and the
         # pinned clock every stamp is taken from.
         self._apply_operator_session(handles, fixtures)
+        # clocks fixture: per-participant clocks, so a scenario can pin two
+        # nodes that DISAGREE. Applied after operator_session so it overrides
+        # that fixture's single shared clock.
+        self._apply_clocks(handles, fixtures)
         return handles
+
+    def _apply_clocks(self, handles, fixtures) -> None:
+        """Wire the ``clocks`` fixture: ``{<pid>: <epoch>}``.
+
+        ``operator_session.clock`` pins ONE clock for every participant, which
+        is all the attended-now scenarios need. Cohort skew is the difference
+        BETWEEN two nodes' clocks, so it needs a distinct value per node. With
+        constant pinned clocks the round trip's t1 and t4 are both the puller's
+        value and t2/t3 are both the target's, so the derived offset is exactly
+        the difference and the delay is exactly zero -- a comparison two
+        languages can agree on to the bit. C mirrors via
+        identity_set_attest_clock per participant.
+        """
+        clocks_fix = (fixtures or {}).get('clocks', {}) or {}
+        for pid, epoch in clocks_fix.items():
+            if pid not in handles:
+                continue
+            impl = handles[pid].impl
+            impl.attest_clock = float(epoch)
+            impl.process._now_epoch = lambda c=float(epoch): c
 
     def _apply_operator_session(self, handles, fixtures) -> None:
         """Wire the operator_session fixture (ethne D8/Q9 attended-now).
@@ -1103,14 +1165,21 @@ class IdentityAdapter:
             # binds an answer to the pull that asked for it — and a fixed value
             # keeps the two runs identical.
             nonce = '%s-%d' % (puller.id, len(puller.attest_accepted))
+            # Third element is the round trip's t1 -- the puller's own clock at
+            # send. Production records it in handle_attest_trigger; here the
+            # pull is injected, so the harness must supply it or no clock sample
+            # can be measured (cohort-clock-skew.md).
             puller.process._attest_sent[nonce] = (
                 str(target.identity.uuid),
-                (puller.attest_clock or 0.0) + 10.0)
-            # The target answers. Its own session state decides the stamp.
+                (puller.attest_clock or 0.0) + 10.0,
+                puller.attest_clock or 0.0)
+            # The target answers. Its own session state decides the stamp, and
+            # its own clock supplies both of the readings it reports.
             session = getattr(target.process, '_operator_session', None)
             attended = bool(session is not None and is_attended(session))
             epoch = target.attest_clock if attended else 0.0
-            answer = target.process._attest_payload(nonce, epoch)
+            answer = target.process._attest_payload(nonce, epoch,
+                                                    target.attest_clock or 0.0)
             puller.attest_last_answer = dict(answer)
 
         before = dict(puller.process._attest_sent)
@@ -1124,6 +1193,12 @@ class IdentityAdapter:
         puller.attest_accepted.append(accepted)
         if accepted:
             puller.attest_stamp = float(answer.get('operator_attested_at') or 0.0)
+        # Relabel whatever the handler measured for this peer under the target's
+        # participant id. Absent (no readings in the answer) records nothing, so
+        # a scenario asserting on it fails loudly rather than reading a stale one.
+        sample = puller.process._peer_clock_samples.get(str(target.identity.uuid))
+        if sample is not None:
+            puller.attest_clock_samples[target.id] = sample
 
     def _dispatch(self, participant: _Participant, inbound: Any) -> list[CapturedMessage]:
         if not isinstance(inbound, Message):

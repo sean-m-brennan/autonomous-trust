@@ -42,12 +42,16 @@ both implementations agree on what "synced" means.
 """
 
 import logging
+import math
 import os
 import shutil
+import statistics
 import subprocess
 from ctypes import (CDLL, Structure, byref, c_int, c_long, get_errno, util)
 from dataclasses import dataclass, field
 from datetime import timedelta
+
+from .. import system
 
 logger = logging.getLogger(__name__)
 
@@ -172,17 +176,26 @@ def chrony_tracking() -> dict:
     return detail
 
 
-def clock_state(with_chrony: bool = True) -> ClockState:
-    """``kernel_clock_state()`` plus chrony detail when it costs nothing."""
+def clock_state(with_chrony: bool = True, samples=None) -> ClockState:
+    """``kernel_clock_state()`` plus chrony detail when it costs nothing.
+
+    ``samples`` are :class:`ClockSample` values from peers, when the caller has
+    any (see :func:`cohort_offset`). They add cohort keys to ``detail`` so the
+    cohort view rides the existing ``describe()`` log line. Local discipline and
+    cohort agreement stay separate facts: cohort keys never change ``synced``,
+    because a cohort cannot vouch for a clock nothing is steering.
+    """
     state = kernel_clock_state()
-    if not with_chrony:
+    detail = chrony_tracking() if with_chrony else {}
+    cohort = cohort_offset(samples)
+    if not detail and not cohort:
         return state
-    detail = chrony_tracking()
-    if not detail:
-        return state
+    merged = dict(detail)
+    merged.update(cohort)
+    source = state.source + ('+chronyc' if detail else '')
     return ClockState(synced=state.synced, max_error=state.max_error,
                       est_error=state.est_error, status=state.status,
-                      source=state.source + '+chronyc', detail=detail)
+                      source=source, detail=merged)
 
 
 def required() -> bool:
@@ -228,3 +241,124 @@ def require_synced_clock(log: logging.Logger = None,
     log.warning('%s [%s: continuing; set %s=1 to make this fatal]',
                 msg, mode, REQUIRE_ENV)
     return state
+
+
+# ---------------------------------------------------------------------------
+# Cohort skew: how far peers' clocks sit from ours.
+#
+# This measures and reports. It steers nothing. AT does not become a time
+# source for its cohort, and an offset measured here is never applied to any
+# clock and never reaches ``system.now()`` -- that last part is exactly the
+# defect for which the old NTP module was retired, and re-creating it would
+# make AT's notion of time diverge from its own host's again.
+#
+# What it is for: a peer whose clock disagrees with ours cannot have its
+# timestamps compared against ours, so a node that can SEE the disagreement can
+# decline to order events against that peer instead of trusting the stamp
+# silently. See doc/architecture/cohort-clock-skew.md.
+# ---------------------------------------------------------------------------
+
+#: Bound past which a peer's timestamps stop being usable for ordering.
+#:
+#: 2 s is the pairwise implication of the existing per-node bound: if each of
+#: two nodes is within ``DEFAULT_MAX_ERROR`` (1 s) of true time, the pair is
+#: within 2 s of each other. So a peer beyond this is telling us something the
+#: local gate would already have refused of itself.
+DEFAULT_MAX_COHORT_SKEW_MS = 2000
+MIN_COHORT_SKEW_MS = 1
+MAX_COHORT_SKEW_MS = 86400000    # a day; past this the bound means nothing
+
+#: Operator switch, in milliseconds to match ``AT_NET_RECV_POLL_MS`` and to keep
+#: both runtimes off float parsing on the knob path.
+SKEW_ENV = 'AT_MAX_COHORT_SKEW_MS'
+
+
+def resolve_max_cohort_skew(log: logging.Logger = None) -> tuple[timedelta, str]:
+    """Resolve the skew bound: env, then compile-time default.
+
+    Same two layers, refusal rules and bounds as the network tunables (§2.4.4),
+    via the shared ``resolve_env_int``, so C's resolver can mirror it exactly.
+    """
+    ms, source = system.resolve_env_int(SKEW_ENV, DEFAULT_MAX_COHORT_SKEW_MS,
+                                        MIN_COHORT_SKEW_MS, MAX_COHORT_SKEW_MS,
+                                        logger=log or logger)
+    return timedelta(milliseconds=ms), source
+
+
+@dataclass(frozen=True)
+class ClockSample:
+    """One peer's clock, measured across one request/response round trip.
+
+    ``offset`` is the peer's clock minus ours: positive means the peer is ahead.
+    ``delay`` is the round trip with the peer's own processing time removed, so
+    a peer that took a second to answer does not read as a second of skew.
+    """
+    peer: str
+    offset: timedelta
+    delay: timedelta
+
+    @property
+    def usable(self) -> bool:
+        """A negative delay is arithmetically impossible, so the timestamps are
+        wrong (a clock stepped mid-exchange, or a peer stamping dishonestly).
+        Such a sample is reported, not silently dropped, but must not be
+        aggregated."""
+        return self.delay >= timedelta(0)
+
+    def exceeds(self, bound: timedelta) -> bool:
+        return abs(self.offset) > bound
+
+    def describe(self) -> str:
+        return ('peer=%s offset=%+.3fs delay=%.3fs%s'
+                % (self.peer, self.offset.total_seconds(),
+                   self.delay.total_seconds(),
+                   '' if self.usable else ' UNUSABLE(negative delay)'))
+
+
+def sample_from_round_trip(peer: str, t1: float, t2: float, t3: float,
+                           t4: float) -> ClockSample:
+    """Build a sample from the four timestamps of one round trip.
+
+    ``t1``/``t4`` are ours (request sent, response received) and ``t2``/``t3``
+    are the peer's (request received, response sent), all wall-clock epoch
+    seconds. The arithmetic is NTP's (RFC 5905 §8), which is why ``t2`` and
+    ``t3`` must be separate readings rather than one: their difference is the
+    peer's processing time, and subtracting it is what keeps a slow responder
+    from being reported as a skewed one. That matters here because the Python
+    responder cannot answer inline at all -- it defers to its main loop -- so
+    the gap is routinely milliseconds, not microseconds.
+
+    Returns ``None`` if any timestamp is missing or not a finite number; a
+    round trip we cannot measure yields no sample rather than a wrong one.
+    """
+    try:
+        t1, t2, t3, t4 = (float(t1), float(t2), float(t3), float(t4))
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(t) for t in (t1, t2, t3, t4)):
+        return None
+    offset = ((t2 - t1) + (t3 - t4)) / 2.0
+    delay = (t4 - t1) - (t3 - t2)
+    return ClockSample(peer=str(peer), offset=timedelta(seconds=offset),
+                       delay=timedelta(seconds=delay))
+
+
+def cohort_offset(samples) -> dict:
+    """Aggregate per-peer samples into the cohort view, as ``detail`` keys.
+
+    The estimator is the **median**, not the mean: a minority of peers reporting
+    wild timestamps -- broken, or lying -- must not be able to drag the cohort
+    estimate, and a mean lets any single sample do exactly that. Dispersion is
+    the peak spread across usable samples, which is the honest summary of "how
+    much do the clocks here actually disagree".
+
+    ``{}`` when there is nothing usable to report, so callers merge
+    unconditionally and an idle node simply says nothing about the cohort.
+    """
+    usable = [s for s in (samples or []) if s is not None and s.usable]
+    if not usable:
+        return {}
+    offsets = sorted(s.offset.total_seconds() for s in usable)
+    return {'cohort_offset': statistics.median(offsets),
+            'cohort_dispersion': offsets[-1] - offsets[0],
+            'cohort_samples': len(offsets)}

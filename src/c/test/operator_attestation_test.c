@@ -338,7 +338,7 @@ DEFINE_TEST(test_attest_response_builder_matches_wire_payload)
     process_t *proc = _mk_process(me);
     identity_set_operator_attended(proc, true, PINNED_CLOCK);
 
-    json_t *direct = identity_attest_response(proc, "n3");
+    json_t *direct = identity_attest_response(proc, "n3", PINNED_CLOCK);
     ck_assert_ptr_nonnull(direct);
     _dispatch_pull(proc, "n3");
 

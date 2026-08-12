@@ -55,12 +55,38 @@ protobuf_src=src/protobuf
 protobuf_py_dir=src/autonomous-trust
 protobuf_py=$protobuf_py_dir/autonomous_trust/core/protobuf
 
-protoc --python_out=$protobuf_py_dir -I $protobuf_src $(find $protobuf_src -name "*.proto")
-leaves=$(find $protobuf_py -type d | sort -r | awk 'index(a,$0)!=1{a=$0;print}' | sort)
-for leaf in $leaves; do
-  touch "$leaf/__init__.py"
-done
-touch "$protobuf_py/__init__.py"
+# Check protoc's status explicitly. This script does not run under `set -e`,
+# and the steps below it (touch, and the sdist build) succeed regardless, so
+# without this a missing protoc or a malformed .proto exits 0 while leaving the
+# bindings untouched -- callers see success and go on to build or test against
+# the PREVIOUS .proto.
+if ! protoc --python_out=$protobuf_py_dir -I $protobuf_src $(find $protobuf_src -name "*.proto"); then
+  echo "ERROR: protoc failed; the Protobuf interfaces in" >&2
+  echo "  $protobuf_py" >&2
+  echo "  are unchanged and do NOT reflect $protobuf_src." >&2
+  echo "  protoc: $(command -v protoc || echo 'not found on PATH')" >&2
+  echo "  It is supplied by the 'autonomous_trust' env via libprotobuf." >&2
+  exit 1
+fi
+# protoc emits no __init__.py, so every directory of the generated tree needs
+# one seeded here to be importable.
+#
+# Two things this must get right, both learned the hard way:
+#   - NEVER seed one into a __pycache__. That makes __pycache__ an importable
+#     package, and `PackageHash` (core/_python/system.py) walks core with
+#     pkgutil.walk_packages, so it imports it -- writing a NESTED
+#     __pycache__/__pycache__, which the next run of this script then seeds in
+#     turn. That ratchet added one level per run and reached 33 levels / 315
+#     stray __init__.py. Worse, each stray file joins the walked module set, so
+#     the package digest came to depend on how many times this script had run:
+#     two nodes off identical source disagreed, and idprocess.py rejects a
+#     mismatched digest as a counterfeit peer.
+#   - Seed EVERY directory, not just the leaves. The former leaves-only scan
+#     silently stopped seeding the real package dirs from run 2 onward, because
+#     once a __pycache__ exists it is the leaf and its parent no longer is.
+while IFS= read -r -d '' dir; do
+  touch "$dir/__init__.py"
+done < <(find "$protobuf_py" -type d -name '__pycache__' -prune -o -type d -print0)
 
 if [[ "$*" != *"proto-only"* ]]; then
   # Create and extract distros

@@ -44,6 +44,34 @@ class QueuePool(object):
                 return pq.queue
         return None
 
+    def reserve(self) -> Optional[int]:
+        """Claim a free slot and return its INDEX rather than the queue itself.
+
+        The index is the part that can be shared. The pool is built before any
+        worker is forked, so slot *i* is the same underlying queue in every
+        process -- whereas each process's ``in_use`` flags are its own private
+        copy, so two processes calling :meth:`next` independently agree only by
+        accident of ordering. Anything that must hand a queue to another process
+        reserves a slot here and publishes the index; the other side resolves it
+        with :meth:`slot`.
+        """
+        for idx, pq in enumerate(self._pool):
+            if not pq.in_use:
+                pq.in_use = True
+                return idx
+        return None
+
+    def slot(self, index: int) -> Optional[QueueType]:
+        """The queue at ``index``, without claiming it.
+
+        For the receiving side of a published assignment: the sender already
+        owns the slot, and marking it in_use here would only consume a second
+        one from this process's private view of the pool.
+        """
+        if index is None or index < 0 or index >= len(self._pool):
+            return None
+        return self._pool[index].queue
+
     def recycle(self, queue: QueueType):
         for pq in self._pool:
             if pq.queue is queue:

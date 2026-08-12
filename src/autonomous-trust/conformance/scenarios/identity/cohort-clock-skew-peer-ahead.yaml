@@ -1,0 +1,83 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: cohort-clock-skew-peer-ahead
+byte_pinning: false
+description: |
+    Cohort clock skew, measured across the attest round trip: the puller derives
+    how far the target's clock sits from its own (Stage 0 of
+    doc/architecture/cohort-clock-skew.md).
+
+    This is MEASUREMENT ONLY. Nothing steers a clock, no offset is applied to
+    either node's own time, and the skew changes no verdict -- the attestation
+    below is accepted on its own merits while the peer sits 4 s away. What the
+    node gains is the ability to SEE the disagreement, so it can decline to
+    order events against a peer whose timestamps are not comparable with its own.
+
+    Why the attest exchange carries it: an offset needs four timestamps, and the
+    pull already makes a round trip both runtimes implement. PingAT would not do
+    -- it is Python-only, and C answers that selector "unsupported" (ISSUES
+    §2.4.1).
+
+    The arithmetic is NTP's (RFC 5905 §8):
+        offset = ((t2 - t1) + (t3 - t4)) / 2
+        delay  = (t4 - t1) - (t3 - t2)
+    t1/t4 are the puller's (send, receive) and t2/t3 the target's (receive,
+    send). With the clocks PINNED per participant, t1 == t4 == consumer's clock
+    and t2 == t3 == node's clock, so the offset is exactly the clock difference
+    and the delay is exactly zero. That is what makes this comparable across two
+    languages: a wall-clock reading never enters it.
+
+    delay == 0.0 is the load-bearing half. t2 and t3 are separate readings
+    precisely so the responder's own processing time is subtracted rather than
+    reported as skew -- and the two runtimes reach this answer by different
+    routes, which is why it is worth pinning. Python's responder cannot answer
+    inline at all (its identity process must ask the main loop for the console
+    session), while C answers in one hop from its seam. Both must still report a
+    zero delay and a 4 s offset.
+
+    Cross-impl: Python reads IdentityProcess._peer_clock_samples; C reads
+    identity_get_peer_clock_sample. Both are what the production handler
+    recorded, not anything the harness computed.
+
+participants:
+  - id: consumer
+    role: border_guard
+  - id: node
+    role: border_guard
+
+fixtures:
+  # Per-participant clocks: the node is 4 s AHEAD of the consumer. This is what
+  # operator_session.clock cannot express, since it pins one clock for everyone.
+  clocks:
+    consumer: 1721800000.0
+    node: 1721800004.0
+  # A human at the node's console, so the pull also returns a live stamp and the
+  # scenario shows skew measurement riding an ordinary, successful attestation.
+  operator_session:
+    clock: 1721800000.0
+    node: active
+
+steps:
+  - id: 1
+    from: consumer
+    to: node
+    function: trigger_attest_pull
+    description: |
+        consumer pulls node's attended-now state; the same round trip yields the
+        four timestamps the clock comparison needs.
+
+expected_state:
+  consumer:
+    # node's clock minus ours: positive because the node is ahead.
+    peer_clock_offset:
+      node: 4.0
+    # Zero: the responder's processing time is subtracted, not counted as skew.
+    peer_clock_delay:
+      node: 0.0
+    peer_clock_usable:
+      node: true
+    # The attestation is unaffected -- the node stamps with its OWN clock, and
+    # 4 s is well inside the acceptance window.
+    attested_now: 1721800004.0
+    attest_accepted: [true]

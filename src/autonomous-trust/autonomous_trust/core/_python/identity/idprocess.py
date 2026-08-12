@@ -45,6 +45,8 @@ from ..config import Configuration, to_json_string, from_json_string, names
 from ..config.configuration import ConfigJSONEncoder, atomic_write
 from ..processes import Process, ProcMeta
 from ..network import Message, Network
+from ..network.clock import (clock_state, resolve_max_cohort_skew,
+                             sample_from_round_trip)
 from .history import IdentityByWork, IdentityByStake, IdentityByAuthority
 from .history import IdentityObj
 from .protocol import IdentityProtocol
@@ -235,17 +237,28 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self._operator_verified: set = set()  # uuids whose operator credential verified
         self._operator_session = None  # live OperatorSession, attached in P-L3
         # Attended-now pulls awaiting the main loop's session answer:
-        # nonce -> (requestor Identity, req_proc, deadline). This process runs
-        # in its own subprocess and cannot see the console's OperatorSession, so
-        # each pull costs one local round trip to the main loop (which shares
-        # the console's address space). Nothing is cached, so nothing goes
-        # stale; a pull the main loop never answers ages out and is answered
-        # honestly as not-attended. See doc/architecture/operator-attended.md.
+        # nonce -> (requestor Identity, deadline, received_at). This process
+        # runs in its own subprocess and cannot see the console's
+        # OperatorSession, so each pull costs one local round trip to the main
+        # loop (which shares the console's address space). Nothing is cached, so
+        # nothing goes stale; a pull the main loop never answers ages out and is
+        # answered honestly as not-attended. See
+        # doc/architecture/operator-attended.md. `received_at` is kept because
+        # the answer reports it: the puller subtracts our processing time so a
+        # slow console does not read to it as clock skew (cohort-clock-skew.md).
         self._attest_pending: dict[str, tuple] = {}
         # Pulls we SENT and have not yet resolved: nonce -> (peer_uuid,
-        # deadline). Keyed by nonce because the nonce is the only thing that
-        # makes a returned stamp attributable to a request we actually made.
+        # deadline, sent_at). Keyed by nonce because the nonce is the only thing
+        # that makes a returned stamp attributable to a request we actually
+        # made. `sent_at` never goes on the wire -- it is ours, and a peer
+        # echoing it back could lie about it.
         self._attest_sent: dict[str, tuple] = {}
+        # Newest clock sample per peer, uuid -> ClockSample. Measurement only:
+        # nothing here steers a clock, and no offset is ever applied to our own
+        # time (see the module header in network/clock.py for why that matters).
+        self._peer_clock_samples: dict[str, object] = {}
+        self._max_cohort_skew, self._max_cohort_skew_src = \
+            resolve_max_cohort_skew(self.logger)
         # Peers ReputationProcess has actually published a trust tier for, as
         # uuid strings. `peer._tier` alone cannot answer this: it is a
         # CONSTRUCTOR DEFAULT of 0 (identity.py:63) and the wire form does not
@@ -774,8 +787,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 # is precisely what attended-NOW must not permit.
                 self.logger.warning('handle_attest_request: missing nonce')
                 return True
-            deadline = self._now_epoch() + self._ATTEST_ROUND_TRIP_SEC
-            self._attest_pending[str(nonce)] = (message.from_whom, deadline)
+            received_at = self._now_epoch()
+            deadline = received_at + self._ATTEST_ROUND_TRIP_SEC
+            self._attest_pending[str(nonce)] = (message.from_whom, deadline,
+                                                received_at)
             query = Message(CfgIds.main, IdentityProtocol.operator_state_req,
                             '', from_whom=self.identity)
             queues[CfgIds.main].put(query, block=True, timeout=self.q_cadence)
@@ -787,13 +802,23 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self.report_exception(err, 'handle_attest_request')
         return True
 
-    def _attest_payload(self, nonce, attested_at):
+    def _attest_payload(self, nonce, attested_at, received_at=None):
         """The attestation to return for one pull: the same shape the admission
         path carries (so the receiver can re-verify the real operator
         credential), with attended-now overridden by what the session just said
-        and the requestor's nonce echoed back to bind it to this request."""
+        and the requestor's nonce echoed back to bind it to this request.
+
+        Also carries our two clock readings for this exchange -- when we
+        received the pull and when we are answering it. They are what let the
+        puller measure our clock against its own without mistaking our
+        processing time (a whole local round trip to the main loop, here) for
+        skew. Purely observational: see doc/architecture/cohort-clock-skew.md.
+        """
         payload = dict(self._operator_attestation())
         payload['nonce'] = str(nonce)
+        if received_at:
+            payload['clock_recv_at'] = float(received_at)
+        payload['clock_sent_at'] = self._now_epoch()
         if attested_at:
             payload['operator_attested_at'] = float(attested_at)
         else:
@@ -802,7 +827,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             payload['operator_attested_at'] = 0.0
         return payload
 
-    def _answer_attest_pull(self, queues, nonce, requestor, attested_at):
+    def _answer_attest_pull(self, queues, nonce, requestor, attested_at,
+                            received_at=None):
         """Send one attest_resp back to the puller.
 
         Addressed to the puller's IDENTITY process (self.name, as
@@ -812,7 +838,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         try:
             reply = Message(self.name, IdentityProtocol.attest_resp,
                             to_json_string(self._attest_payload(nonce,
-                                                                attested_at)),
+                                                                attested_at,
+                                                                received_at)),
                             to_whom=requestor if requestor is not None
                             else Network.broadcast,
                             from_whom=self.identity, encrypt=False)
@@ -841,8 +868,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             attended = bool(payload.get('attended'))
             epoch = float(payload.get('epoch') or 0.0) if attended else 0.0
             pending, self._attest_pending = self._attest_pending, {}
-            for nonce, (requestor, _deadline) in pending.items():
-                self._answer_attest_pull(queues, nonce, requestor, epoch)
+            for nonce, (requestor, _deadline, received_at) in pending.items():
+                self._answer_attest_pull(queues, nonce, requestor, epoch,
+                                         received_at)
         except Exception as err:
             self.report_exception(err, 'handle_operator_state_response')
         return True
@@ -857,13 +885,16 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if not self._attest_pending:
             return
         tick = self._now_epoch()
-        expired = [nonce for nonce, (_r, deadline)
+        expired = [nonce for nonce, (_r, deadline, _rx)
                    in self._attest_pending.items() if deadline <= tick]
         for nonce in expired:
-            requestor, _deadline = self._attest_pending.pop(nonce)
+            requestor, _deadline, received_at = self._attest_pending.pop(nonce)
             self.logger.debug('attest pull %s timed out; answering unattended'
                               % nonce)
-            self._answer_attest_pull(queues, nonce, requestor, 0.0)
+            # Still carries the clock readings: "no human is attending" is a
+            # real answer, and our own timestamps are honest either way, so a
+            # timed-out pull still yields the puller a usable clock sample.
+            self._answer_attest_pull(queues, nonce, requestor, 0.0, received_at)
 
     # --- Operator-attended pull, requestor side (ethne D8/Q9) ----------------
 
@@ -916,25 +947,37 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                           to_whom=target, from_whom=self.identity,
                           encrypt=False)
             queues[CfgIds.network].put(req, block=True, timeout=self.q_cadence)
+            sent_at = self._now_epoch()
             self._attest_sent[nonce] = (
                 str(target.uuid),
-                self._now_epoch() + self._ATTEST_REPLY_WAIT_SEC)
+                sent_at + self._ATTEST_REPLY_WAIT_SEC,
+                sent_at)
         except Full:
             self.logger.error('handle_attest_trigger: Network queue full')
         except Exception as err:
             self.report_exception(err, 'handle_attest_trigger')
         return True
 
-    def _report_attestation(self, queues, peer_uuid, attested_at, verified):
+    def _report_attestation(self, queues, peer_uuid, attested_at, verified,
+                            sample=None):
         """Hand a finished pull back to the main loop for consumers to read
         (AutonomousTrust.peer_attestations, which is what ethne's guardian
         edge reads). Local-only; carries the VERIFIED verdict, never the
-        peer's assertion."""
+        peer's assertion.
+
+        The clock sample rides this same report rather than a message of its own:
+        it is produced by this exact round trip, and a second local message
+        would double the IPC to say something about the same event."""
         try:
+            body = {'peer': str(peer_uuid),
+                    'operator_attested_at': float(attested_at or 0.0),
+                    'operator_verified': bool(verified)}
+            if sample is not None:
+                body['clock_offset'] = sample.offset.total_seconds()
+                body['clock_delay'] = sample.delay.total_seconds()
+                body['clock_usable'] = bool(sample.usable)
             out = Message(CfgIds.main, IdentityProtocol.attest_resp,
-                          to_json_string({'peer': str(peer_uuid),
-                                          'operator_attested_at': float(attested_at or 0.0),
-                                          'operator_verified': bool(verified)}),
+                          to_json_string(body),
                           from_whom=self.identity)
             queues[CfgIds.main].put(out, block=True, timeout=self.q_cadence)
         except Full:
@@ -963,6 +1006,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if message.function != IdentityProtocol.attest_resp:
             return False
         try:
+            # Taken FIRST, before any parsing: this is the round trip's t4, and
+            # work done here would otherwise be charged to the network path.
+            recv_epoch = self._now_epoch()
             payload = message.obj
             if isinstance(payload, str):
                 payload = from_json_string(payload)
@@ -975,7 +1021,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 self.logger.warning('handle_attest_response: unknown nonce %r'
                                     % nonce)
                 return True
-            peer_uuid, _deadline = sent
+            peer_uuid, _deadline, sent_epoch = sent
             responder_uuid = str(getattr(message.from_whom, 'uuid', '') or '')
             if responder_uuid and responder_uuid != peer_uuid:
                 # Right nonce, wrong node — someone else answering for the
@@ -1006,11 +1052,64 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 self.logger.warning('handle_attest_response: stamp %r outside '
                                     'acceptance window (now %r)' % (claimed, tick))
             attested = claimed if (verified and in_window) else 0.0
+            sample = self._record_clock_sample(peer_uuid, sent_epoch,
+                                               payload, recv_epoch)
             self._store_peer_attestation(peer_uuid, attested, verified)
-            self._report_attestation(queues, peer_uuid, attested, verified)
+            self._report_attestation(queues, peer_uuid, attested, verified,
+                                     sample)
         except Exception as err:
             self.report_exception(err, 'handle_attest_response')
         return True
+
+    def _record_clock_sample(self, peer_uuid, sent_epoch, payload, recv_epoch):
+        """Measure this peer's clock against ours from the round trip we just
+        completed, and keep the newest reading.
+
+        Advisory ALWAYS: a peer beyond the skew bound is logged and reported,
+        never refused, and the offset is never applied to anything. Stage 0 of
+        cohort-clock-skew.md exists to find out what real skew looks like before
+        any policy is built on it, and a bound enforced before it was measured
+        could partition a healthy fleet.
+
+        A peer that omits the readings (an older build, or one that declines to
+        answer) simply yields no sample -- absence is not an error here.
+        """
+        try:
+            peer_recv = payload.get('clock_recv_at')
+            peer_sent = payload.get('clock_sent_at')
+            if peer_recv is None or peer_sent is None:
+                return None
+            sample = sample_from_round_trip(peer_uuid, sent_epoch, peer_recv,
+                                            peer_sent, recv_epoch)
+            if sample is None:
+                return None
+            self._peer_clock_samples[str(peer_uuid)] = sample
+            if not sample.usable:
+                # Arithmetically impossible timings: the peer's two readings
+                # span more than the whole round trip. Worth saying out loud —
+                # it means a stepped clock or a dishonest responder.
+                self.logger.warning('clock sample from %s is impossible: %s'
+                                    % (peer_uuid, sample.describe()))
+            elif sample.exceeds(self._max_cohort_skew):
+                self.logger.warning(
+                    'clock skew beyond bound: %s (bound %.3fs from %s) '
+                    '[advisory: timestamps from this peer are not comparable '
+                    'with ours]'
+                    % (sample.describe(),
+                       self._max_cohort_skew.total_seconds(),
+                       self._max_cohort_skew_src))
+            else:
+                self.logger.debug('clock sample: %s' % sample.describe())
+            return sample
+        except Exception as err:
+            self.report_exception(err, '_record_clock_sample')
+            return None
+
+    def cohort_clock_state(self):
+        """Local clock discipline plus what our peers' clocks look like from
+        here. The cohort half is this process's view: the samples live where the
+        attest round trips complete, and a forked sibling holds its own copy."""
+        return clock_state(samples=list(self._peer_clock_samples.values()))
 
     def _store_peer_attestation(self, peer_uuid, attested_at, verified):
         """Write the verified result onto our stored peer identity, so a
@@ -1037,10 +1136,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if not self._attest_sent:
             return
         tick = self._now_epoch()
-        expired = [nonce for nonce, (_u, deadline)
+        expired = [nonce for nonce, (_u, deadline, _tx)
                    in self._attest_sent.items() if deadline <= tick]
         for nonce in expired:
-            peer_uuid, _deadline = self._attest_sent.pop(nonce)
+            peer_uuid, _deadline, _sent_epoch = self._attest_sent.pop(nonce)
             self.logger.debug('attest pull to %s unanswered; reporting '
                               'unattended' % peer_uuid)
             self._report_attestation(queues, peer_uuid, 0.0, False)

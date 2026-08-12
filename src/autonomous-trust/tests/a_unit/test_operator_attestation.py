@@ -32,7 +32,10 @@ import base64
 import hashlib
 import logging
 import uuid as uuid_mod
+from datetime import timedelta
 from types import SimpleNamespace
+
+import pytest
 
 from autonomous_trust.core.identity.identity import (
     Identity, public_identity_to_canonical, public_identity_from_canonical)
@@ -756,6 +759,8 @@ class _ReqProc:
     _ATTEST_WINDOW_SEC = IdentityProcess._ATTEST_WINDOW_SEC
     handle_attest_trigger = IdentityProcess.handle_attest_trigger
     handle_attest_response = IdentityProcess.handle_attest_response
+    _record_clock_sample = IdentityProcess._record_clock_sample
+    cohort_clock_state = IdentityProcess.cohort_clock_state
     _report_attestation = IdentityProcess._report_attestation
     _store_peer_attestation = IdentityProcess._store_peer_attestation
     _expire_attest_sent = IdentityProcess._expire_attest_sent
@@ -772,6 +777,11 @@ class _ReqProc:
         self.logger = logging.getLogger('test.req')
         self.q_cadence = 0.01
         self._attest_sent = {}
+        # Cohort-skew state, mirroring the real __init__. A pinned bound rather
+        # than the resolver, so the environment cannot move these tests.
+        self._peer_clock_samples = {}
+        self._max_cohort_skew = timedelta(seconds=2)
+        self._max_cohort_skew_src = 'default'
         self._now = now
         self.configs = {ZtaPolicy.CONFIG_KEY: ZtaPolicy(enabled=True,
                                                         require_at_admission=True)}
@@ -1038,3 +1048,134 @@ def test_verified_answer_for_an_unstored_peer_still_reports():
     proc._peers.clear()
     proc.handle_attest_response(queues, _peer_answer(nonce, 1721800000.0))
     assert from_json_string(queues[CfgIds.main].last.obj)['operator_attested_at'] == 1721800000.0
+
+
+# --- Cohort clock skew (Stage 0 of doc/architecture/cohort-clock-skew.md) -----
+#
+# The attest round trip carries the four timestamps a clock comparison needs.
+# It is measurement only: no offset is applied to any clock, and a peer beyond
+# the skew bound is reported, never refused.
+
+def _peer_answer_with_clock(nonce, attested_at, responder, recv_at, sent_at):
+    """A peer answer that also carries the peer's own two clock readings."""
+    msg = _peer_answer(nonce, attested_at, responder=responder)
+    body = from_json_string(msg.obj)
+    body['clock_recv_at'] = recv_at
+    body['clock_sent_at'] = sent_at
+    return Message(CfgIds.identity, IdentityProtocol.attest_resp,
+                   to_json_string(body), from_whom=responder)
+
+
+def test_responder_emits_both_of_its_clock_readings():
+    """Two readings, not one: their difference is the responder's own
+    processing time, which the puller subtracts so a slow console does not
+    read as clock skew."""
+    proc, queues = _PullProc(now=5000.0), _queues()
+    proc.handle_attest_request(queues, _pull(requestor=_operator_identity()))
+    assert proc._attest_pending[NONCE][2] == 5000.0     # receipt recorded
+
+    proc._now = 5000.75                                  # console took 750 ms
+    proc.handle_operator_state_response(queues, _state_resp())
+    body = from_json_string(queues[CfgIds.network].last.obj)
+    assert body['clock_recv_at'] == 5000.0
+    assert body['clock_sent_at'] == 5000.75
+
+
+def test_a_timed_out_pull_still_carries_honest_clock_readings():
+    """'Nobody is attending' is a real answer, and our own timestamps are
+    honest either way -- so the puller still gets a usable sample."""
+    proc, queues = _PullProc(now=5000.0), _queues()
+    proc.handle_attest_request(queues, _pull(requestor=_operator_identity()))
+    proc._now = 5000.0 + IdentityProcess._ATTEST_ROUND_TRIP_SEC + 0.1
+    proc._expire_attest_pending(queues)
+
+    body = from_json_string(queues[CfgIds.network].last.obj)
+    assert body['operator_attested_at'] == 0.0           # unattended
+    assert body['clock_recv_at'] == 5000.0               # ...but still measurable
+    assert body['clock_sent_at'] == proc._now
+
+
+def test_requestor_measures_a_peer_that_is_ahead():
+    fresh = 1721800000.0
+    peer = _stored_peer()
+    proc, queues = _ReqProc(peers=[peer], now=1000.0), _req_queues()
+    proc.handle_attest_trigger(queues, _trigger(peer.uuid))
+    nonce = from_json_string(queues[CfgIds.network].last.obj)['nonce']
+
+    # Peer's clock is 4 s ahead; 100 ms each way; it answered in 500 ms.
+    proc._now = 1000.7                                   # t4
+    proc.handle_attest_response(queues, _peer_answer_with_clock(
+        nonce, fresh, peer, recv_at=1004.1, sent_at=1004.6))
+
+    sample = proc._peer_clock_samples[str(peer.uuid)]
+    assert sample.offset.total_seconds() == pytest.approx(4.0, abs=1e-6)
+    assert sample.delay.total_seconds() == pytest.approx(0.2, abs=1e-6)
+    body = from_json_string(queues[CfgIds.main].last.obj)
+    assert body['clock_offset'] == pytest.approx(4.0, abs=1e-6)
+    assert body['clock_usable'] is True
+
+
+def test_skew_beyond_the_bound_is_advisory_only():
+    """Beyond-bound skew is measured and reported; the attestation verdict is
+    untouched. Stage 0 refuses nothing."""
+    fresh = 1721800000.0
+    peer = _stored_peer()
+    # Our clock sits at `fresh` so the stamp is inside the attest window; the
+    # PEER's clock is a minute ahead of it, which is what the bound catches.
+    proc, queues = _ReqProc(peers=[peer], now=fresh), _req_queues()
+    proc._max_cohort_skew = timedelta(milliseconds=100)   # far inside the skew
+    proc.handle_attest_trigger(queues, _trigger(peer.uuid))
+    nonce = from_json_string(queues[CfgIds.network].last.obj)['nonce']
+
+    proc._now = fresh + 0.2
+    proc.handle_attest_response(queues, _peer_answer_with_clock(
+        nonce, fresh, peer, recv_at=fresh + 60.0, sent_at=fresh + 60.0))
+
+    sample = proc._peer_clock_samples[str(peer.uuid)]
+    assert sample.exceeds(proc._max_cohort_skew)
+    body = from_json_string(queues[CfgIds.main].last.obj)
+    assert body['operator_attested_at'] == fresh          # verdict unaffected
+    assert body['operator_verified'] is True
+    assert peer.operator_bound is True
+
+
+def test_a_peer_that_sends_no_readings_yields_no_sample():
+    """Backward compatibility: an older build omits the fields entirely, and
+    absence is not an error -- the attestation still completes."""
+    fresh = 1721800000.0
+    proc, peer, queues = _pull_and_answer(
+        lambda n, p: _peer_answer(n, fresh, responder=p))
+
+    assert proc._peer_clock_samples == {}
+    body = from_json_string(queues[CfgIds.main].last.obj)
+    assert 'clock_offset' not in body
+    assert body['operator_attested_at'] == fresh          # unaffected
+
+
+def test_impossible_peer_timings_are_recorded_unusable():
+    fresh = 1721800000.0
+    peer = _stored_peer()
+    proc, queues = _ReqProc(peers=[peer], now=1000.0), _req_queues()
+    proc.handle_attest_trigger(queues, _trigger(peer.uuid))
+    nonce = from_json_string(queues[CfgIds.network].last.obj)['nonce']
+
+    # Claims 5 s of its own processing inside a 200 ms round trip.
+    proc._now = 1000.2
+    proc.handle_attest_response(queues, _peer_answer_with_clock(
+        nonce, fresh, peer, recv_at=1000.0, sent_at=1005.0))
+
+    sample = proc._peer_clock_samples[str(peer.uuid)]
+    assert not sample.usable
+    body = from_json_string(queues[CfgIds.main].last.obj)
+    assert body['clock_usable'] is False
+
+
+def test_cohort_view_aggregates_the_samples_this_process_holds():
+    from autonomous_trust.core._python.network import clock as clock_mod
+    proc = _ReqProc()
+    for name, off in (('a', 0.01), ('b', 0.02), ('c', 0.03)):
+        proc._peer_clock_samples[name] = clock_mod.ClockSample(
+            name, timedelta(seconds=off), timedelta(seconds=0.01))
+    state = proc.cohort_clock_state()
+    assert state.detail['cohort_samples'] == 3
+    assert state.detail['cohort_offset'] == pytest.approx(0.02)
