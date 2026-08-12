@@ -493,9 +493,20 @@ Capability tier and weight come from this YAML at registration time
 (in the participant / coordinator startup path). Domain code never
 hard-codes either. A new demo adds its own
 `<example>/trust_ladder.yaml` and the rest of the mechanism applies
-automatically. The loader is Python-side (`core/_python/trust_ladder.py`);
-the C runtime registers capabilities in code, which is the one asymmetry
-in §9's mirror and is tracked in [`ISSUES.md`](../../ISSUES.md).
+automatically.
+
+**Both runtimes load the ladder (as of 2026-08-12), from one JSON file.**
+`core/_python/trust_ladder.py` and its C twin
+`src/c/autonomous_trust/config/trust_ladder.c` read the same file: C parses it
+with jansson, and the Python loader needs no change because YAML is a superset of
+JSON. `config/cfg/trust_ladder.example.json` is the shared example both test
+suites assert identical numbers against. The one behavioural difference is
+inherent to the two registries: Python CREATES capabilities from the ladder,
+while C's are declared in code, so C's `trust_ladder_apply` overrides the
+tier/weight of those already present and leaves unlisted ones alone. This closes
+the asymmetry §9's mirror recorded (ISSUES §10.1). A scenario `.yaml` ladder that
+only feeds a demo's own Python loader still parses; a ladder meant for both
+runtimes should be JSON.
 
 ## 9. Python↔C parity
 

@@ -11,6 +11,7 @@ Run from the repo root:
 from __future__ import annotations
 
 import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -147,3 +148,51 @@ def test_bootstrap_ladder_overrides_tier_weight(tmp_path):
     # the domain cap is registered metadata-only.
     assert caps['dod.sensor-report'].required_tier == 2
     assert caps['dod.sensor-report'].function is None
+
+
+# --- ISSUES §10.1: one ladder file, both runtimes -------------------------
+#
+# The C twin (`src/c/autonomous_trust/config/trust_ladder.c`) parses the ladder
+# with jansson, and the format is JSON precisely so this side needs no change:
+# YAML is a superset of JSON, so the Python loader reads the same bytes. These
+# cases assert the SAME numbers `trust_ladder_test.c::test_the_shared_example_
+# parses` asserts, against the SAME file — without that pairing, "both runtimes
+# read one file" is an intention rather than a fact.
+
+_SHARED_EXAMPLE = (Path(__file__).resolve().parents[4]
+                   / 'config' / 'cfg' / 'trust_ladder.example.json')
+
+
+@pytest.mark.skipif(not _SHARED_EXAMPLE.exists(),
+                    reason='shared example ladder not in this tree')
+def test_the_shared_json_example_parses_here_too():
+    ladder = load_trust_ladder(_SHARED_EXAMPLE)
+    assert len(ladder.capabilities) == 6
+    assert ladder.bootstrap.enabled is True
+    assert ladder.bootstrap.duration_sec == 45
+    assert ladder.bootstrap.pairs == 12
+    assert ladder.tier_demotion_epsilon == pytest.approx(0.05)
+
+
+@pytest.mark.skipif(not _SHARED_EXAMPLE.exists(),
+                    reason='shared example ladder not in this tree')
+def test_the_shared_example_capability_metadata_matches_c():
+    ladder = load_trust_ladder(_SHARED_EXAMPLE)
+    assert (ladder['demo.sensor-report'].required_tier,
+            ladder['demo.sensor-report'].transaction_weight) == (2, 4)
+    # Partial entry: tier from the file, weight from the documented default.
+    assert (ladder['demo.fusion'].required_tier,
+            ladder['demo.fusion'].transaction_weight) == (3, 1)
+    # Empty entry: both defaults.
+    assert (ladder['demo.command'].required_tier,
+            ladder['demo.command'].transaction_weight) == (0, 1)
+
+
+def test_a_json_ladder_needs_no_special_handling(tmp_path):
+    """The whole reason the format is JSON: this loader is unchanged."""
+    path = tmp_path / 'trust_ladder.json'
+    path.write_text('{"capabilities": {"x": {"required_tier": 3}},'
+                    ' "bootstrap": {"pairs": 4}}')
+    ladder = load_trust_ladder(path)
+    assert ladder['x'].required_tier == 3
+    assert ladder.bootstrap.pairs == 4

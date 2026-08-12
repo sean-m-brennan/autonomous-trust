@@ -442,6 +442,7 @@ set(libsrc
     autonomous_trust/config/configuration.c
     autonomous_trust/config/discover.c
     autonomous_trust/config/names.c
+    autonomous_trust/config/trust_ladder.c
     autonomous_trust/identity/encryptor.c
     autonomous_trust/identity/group.c
     autonomous_trust/identity/hexlify.c
@@ -1239,6 +1240,15 @@ add_executable(reputation3_test test/reputation3_test.c)
 set_source_files_properties(test/reputation3_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(reputation3_test PRIVATE ${AT_TEST_LIBS})
 
+add_executable(trust_ladder_test test/trust_ladder_test.c)
+set_source_files_properties(test/trust_ladder_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(trust_ladder_test PRIVATE ${AT_TEST_LIBS})
+# The shared-example case reads config/cfg/trust_ladder.example.json -- the very
+# file the Python suite reads -- so the "one file, both runtimes" claim is pinned
+# rather than asserted. It skips itself when the tree is not a source checkout.
+target_compile_definitions(trust_ladder_test PRIVATE
+    AT_REPO_ROOT_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/../..")
+
 add_executable(config2_test test/config2_test.c)
 set_source_files_properties(test/config2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(config2_test PRIVATE ${AT_TEST_LIBS})
@@ -1253,6 +1263,9 @@ target_link_libraries(msg_types2_test PRIVATE ${AT_TEST_LIBS})
 
 add_test(NAME map2_test COMMAND $<TARGET_FILE:map2_test>)
 add_test(NAME reputation3_test COMMAND $<TARGET_FILE:reputation3_test>)
+add_test(NAME trust_ladder_test COMMAND $<TARGET_FILE:trust_ladder_test>)
+set_tests_properties(trust_ladder_test PROPERTIES
+    ENVIRONMENT "AT_REPO_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/../..")
 add_test(NAME config2_test COMMAND $<TARGET_FILE:config2_test>)
 add_test(NAME util2_test COMMAND $<TARGET_FILE:util2_test>)
 add_test(NAME msg_types2_test COMMAND $<TARGET_FILE:msg_types2_test>)

@@ -71,6 +71,15 @@ class ReputationProtocol(Protocol):
     # via rep_req; the reply reuses rep_resp so automate.py's
     # latest_reputation dispatch consumes it unchanged.
     consensus_rep_req = 'request consensus reputation'
+    # AT -> app pull (ISSUES §11.1). Spelled EXACTLY as C's
+    # AT_APP_ROSTER_REQUEST ("app_roster_request", message.h) because the
+    # protocol strings are the wire form shared with the C twin -- a shortened
+    # or prettified spelling here breaks Python<->C interop.
+    #
+    # This is the only path on which `rated=false` can cross: every
+    # change-driven emission is by construction rated, so a consumer that has
+    # never pulled cannot tell "AT holds no rating" from "no message yet".
+    app_roster_request = 'app_roster_request'
     # Slashing — fast-penalty path (default-off; absent in legacy
     # scenarios so byte-pinned corpora are unaffected). A detector
     # broadcasts `slash_propose` (a SlashAttestation); members co-sign

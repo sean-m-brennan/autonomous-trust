@@ -297,6 +297,13 @@ job_tests() {
   _run_conda_job tests '
 echo "[ci-local] Generating protobuf Python interfaces ..."
 bash scripts/build-py.sh proto-only
+# Measured FFI check, inside the env and after codegen because it compiles a
+# probe against the real headers and needs the generated *.pb-c.h. The preflight
+# above compares field NAMES, which cannot see a type-width or padding change;
+# this one measures sizeof/offsetof. It skips with a message if the compiler or
+# cffi is absent, so it never blocks for environmental reasons.
+echo "[ci-local] FFI ABI measurement (audit-ffi-drift.py --only abi) ..."
+python3 scripts/audit-ffi-drift.py --only abi
 echo "[ci-local] Python package test suites (test-packages.sh --quick) ..."
 bash scripts/test-packages.sh --quick
 echo "[ci-local] C unit tests (test-c-exe.sh) ..."
