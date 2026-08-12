@@ -45,11 +45,16 @@ jobs:
   # Native FFI cdef drift (fast, env-free preflight).
   #
   # Compares the CFFI cdef in core/_native/_ffi.py against the authoritative C
-  # declarations and fails on any function whose arg count drifted AND is called
-  # from a _native wrapper (the latent-segfault class). Pure stdlib, no conda /
-  # no build, so it finishes in ~1s and catches this bug class before the heavy
-  # jobs run. Default severity: cdef-only (uncalled) drift is reported but does
-  # not fail; use --strict to fail on that too.
+  # declarations, on two axes: every function's arg count, and every mirrored
+  # struct's ordered FIELD-NAME LIST. Fails on drift in something Python actually
+  # uses — a function a _native wrapper calls (latent segfault) or a struct
+  # Python allocates (heap overflow on every write). The struct half exists
+  # because `public_identity_t` drifted twice in seven days while this job stayed
+  # green (ISSUES §9.2, §9.2.2). Pure stdlib, no conda / no build, ~1s.
+  # Cdef-only (unused) drift is reported but does not fail; --strict fails on it.
+  # A type-width or padding change keeps every field name and is therefore NOT
+  # visible here; `--only abi` measures that by compiling a probe, and runs in
+  # the python-tests job below, where the env and the generated headers exist.
   # ---------------------------------------------------------------------------
   ffi-drift:
     runs-on: ubuntu-latest
@@ -121,6 +126,15 @@ jobs:
         # each tests/conftest.py (which adds sibling pkg dirs to sys.path), so
         # no editable install is needed.
         run: bash scripts/build-py.sh proto-only
+
+      - name: Measure FFI ABI against the real headers
+        # The ffi-drift job compares field NAMES, which cannot see a type-width
+        # or padding change. This compiles a probe from the same struct list and
+        # diffs sizeof/offsetof against ffi.sizeof/ffi.offsetof -- the procedure
+        # that found both `public_identity_t` recurrences by hand (§9.2, §9.2.2),
+        # run automatically. It needs the generated *.pb-c.h, hence this position
+        # after codegen, and skips with a message if clang or cffi is missing.
+        run: python3 scripts/audit-ffi-drift.py --only abi
 
       - name: Run Python package test suites
         run: |

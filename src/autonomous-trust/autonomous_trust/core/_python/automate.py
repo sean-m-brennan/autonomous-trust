@@ -56,7 +56,7 @@ from .system import CfgIds, PackageHash, queue_cadence, max_concurrency, now, pr
 from .protocol import Protocol
 from .negotiation import Task, TaskParameters, TaskStatus, Status, TaskResult, NegotiationProtocol
 from .network import Message, require_synced_clock
-from .reputation import TransactionScore, ReputationProtocol
+from .reputation import TransactionScore, ReputationProtocol, PeerReputation
 from .queue_pool import QueuePool
 from .._zkp import ZKP_AVAILABLE
 from . import _probes
@@ -830,6 +830,18 @@ class AutonomousTrust(Protocol):
                 if isinstance(cmd, Task):
                     message = Message(CfgIds.negotiation, NegotiationProtocol.start, cmd)
                     queues[CfgIds.negotiation].put(message, block=True, timeout=queue_cadence)
+                elif cmd == ReputationProtocol.app_roster_request:
+                    # The app asked for the current peer view (ISSUES §11.1).
+                    # Exactly ONE verb is accepted from an app and forwarded to a
+                    # fixed destination, as the C daemon does: forwarding an
+                    # app-supplied message to whatever process it names would hand
+                    # an app AT's whole internal verb surface. This pull is also
+                    # the only path on which `rated=False` can cross.
+                    query = Message(CfgIds.reputation,
+                                    ReputationProtocol.app_roster_request, '',
+                                    to_whom=None, from_whom=self.identity)
+                    queues[CfgIds.reputation].put(query, block=True,
+                                                  timeout=queue_cadence)
                 elif cmd == Process.sig_quit:
                     self.logger.debug(self.name + ": External signal to quit")
                     return False
@@ -892,6 +904,17 @@ class AutonomousTrust(Protocol):
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
                     if self.external_feedback in queues:
                         queues[self.external_feedback].put(task, block=True, timeout=queue_cadence)
+                elif isinstance(message, PeerReputation):
+                    # AT -> app: the outward hop the reputation process cannot
+                    # make itself, mirroring the C daemon's forward off
+                    # AT_MAIN_QUEUE. `rated` rides along; see PeerReputation.
+                    if self.external_feedback in queues:
+                        try:
+                            queues[self.external_feedback].put(
+                                message, block=True, timeout=queue_cadence)
+                        except queue.Full:
+                            self.logger.error(
+                                self.name + ': external feedback queue full')
                 elif isinstance(message, Task):
                     task = message
                     if task.capability in self.capabilities:

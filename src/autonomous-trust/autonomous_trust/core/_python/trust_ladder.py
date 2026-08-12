@@ -24,9 +24,20 @@ absent (§8: "everything tier 0, weight 1, bootstrap on")::
       dod.sensor-report: { required_tier: 2, transaction_weight: 4 }
     tier_demotion_epsilon: 0.02
 
-Set ``AT_TRUST_LADDER`` to a YAML path to drive registration from config; with
+Set ``AT_TRUST_LADDER`` to a ladder path to drive registration from config; with
 nothing set, :func:`load_trust_ladder` returns the all-defaults ladder so the
 mechanism is inert until a scenario opts in.
+
+**The canonical ladder format is JSON, and one file serves both runtimes**
+(decision 2026-08-12, ISSUES §10.1). The C twin
+(``src/c/autonomous_trust/config/trust_ladder.c``) parses it with jansson, which
+that tree already depends on; this loader needs no change to read it, because
+YAML is a superset of JSON. That is what removes the asymmetry §9's parity table
+recorded, with no new C dependency and no conversion step between the halves.
+``config/cfg/trust_ladder.example.json`` is the shared example both test suites
+read and assert identical numbers against. Scenario ``.yaml`` ladders that only
+feed a demo's own Python loader keep working — this loader still parses them —
+but a ladder meant for both runtimes should be JSON.
 
 The DoD demo ships its own older loader (``examples/dod_mission/
 trust_ladder.py``) that reads a ``dod:`` stanza variant; this core module is

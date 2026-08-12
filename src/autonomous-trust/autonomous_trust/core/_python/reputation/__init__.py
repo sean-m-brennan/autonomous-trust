@@ -14,6 +14,6 @@
 #   limitations under the License.
 # ******************
 
-from .reputation import TransactionScore
+from .reputation import TransactionScore, PeerReputation
 from .repprocess import ReputationProcess
 from .protocol import ReputationProtocol

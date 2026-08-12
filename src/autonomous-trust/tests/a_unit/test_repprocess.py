@@ -16,11 +16,12 @@
 import pytest
 import queue
 from queue import Full
-from uuid import uuid4
+from uuid import uuid4, UUID
 from unittest.mock import MagicMock, patch, PropertyMock
 
 from autonomous_trust.core.reputation.repprocess import ReputationProcess, TxCount
 from autonomous_trust.core.reputation.reputation import (
+    Reputation,
     TransactionScore, Transaction, TransactionHistory, Reputations,
 )
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
@@ -1443,3 +1444,210 @@ class TestRunningConsensus:
         rp._slashed[str(P)] = (0.05, 'test')
         assert rp._consensus_reputation(P) == 0.05
         assert rp._consensus_ema[str(P)] == 0.05
+
+
+class TestScoreRangeAtTheRemoteBoundary:
+    """ISSUES §11.2 on the paths a PEER controls. The constructor raises on an
+    out-of-range score, and `from_json_string` runs the constructor — so without
+    a catch, a remote could raise inside this node's reputation loop. Every
+    handler here must drop the message instead, and history must stay clean.
+    """
+
+    @staticmethod
+    def _proposal(score_json, id1=100, id2=5, peer_id=None):
+        """A `transaction` message whose payload carries `score_json` verbatim,
+        which is how an out-of-range score would actually arrive."""
+        peer_id = peer_id or uuid4()
+        payload = ('[[%d, %d, "%s"], {"__type__": "autonomous_trust.core.'
+                   '_python.reputation.reputation.TransactionScore", '
+                   '"task_id": {"__type__": "UUID", "__value__": "%s"}, '
+                   '"score": %s, "capability_name": null}]'
+                   % (id1, id2, peer_id, uuid4(), score_json))
+        msg = MagicMock()
+        msg.function = ReputationProtocol.transaction
+        msg.obj = payload
+        msg.verified = True
+        msg.from_whom = _make_mock_peer()
+        return msg
+
+    def test_an_out_of_range_proposal_is_dropped_not_raised(self):
+        rp = _make_rep_process()
+        rp.requests.append((100, 5))
+        msg = self._proposal('7.5')
+        assert rp.handle_transaction({}, msg) is True     # consumed, no raise
+        assert rp.proposals == {}                         # nothing recorded
+
+    def test_a_nan_proposal_is_dropped(self):
+        rp = _make_rep_process()
+        rp.requests.append((100, 5))
+        assert rp.handle_transaction({}, self._proposal('NaN')) is True
+        assert rp.proposals == {}
+
+    def test_an_in_range_proposal_still_lands(self):
+        """The negative control: the drop must not swallow honest traffic."""
+        rp = _make_rep_process()
+        rp.requests.append((100, 5))
+        queues = {CfgIds.network: queue.Queue()}
+        assert rp.handle_transaction(queues, self._proposal('0.75')) is True
+        assert list(rp.proposals.values())[0].score == 0.75
+
+    @staticmethod
+    def _committed(score_json, peer_id=None, task_id=None):
+        """`committed` carries a BARE float, so it bypasses the constructor
+        entirely -- and it is the path that writes history on every acceptor."""
+        peer_id = peer_id or uuid4()
+        task_id = task_id or uuid4()
+        msg = MagicMock()
+        msg.function = ReputationProtocol.committed
+        msg.obj = ('[{"__type__": "UUID", "__value__": "%s"}, '
+                   '{"__type__": "UUID", "__value__": "%s"}, %s]'
+                   % (task_id, peer_id, score_json))
+        msg.verified = True
+        msg.from_whom = _make_mock_peer()
+        return msg
+
+    def _assert_not_staged(self, rp, score_json):
+        """A single-sided update STAGES a pending Transaction and leaves the
+        committed chain empty, so asserting on `len(history)` alone would pass
+        whether or not the score was rejected. Assert on the staging map."""
+        task_id = uuid4()
+        before = len(rp.history)
+        assert rp.handle_committed(
+            None, self._committed(score_json, task_id=task_id)) is True
+        assert task_id not in rp.history._task_mapping    # never even staged
+        assert len(rp.history) == before
+
+    def test_an_out_of_range_committed_tx_never_reaches_history(self):
+        self._assert_not_staged(_make_rep_process(), '42.0')
+
+    def test_a_negative_committed_tx_never_reaches_history(self):
+        self._assert_not_staged(_make_rep_process(), '-3.0')
+
+    def test_a_nan_committed_tx_never_reaches_history(self):
+        self._assert_not_staged(_make_rep_process(), 'NaN')
+
+    def test_an_honest_committed_tx_is_staged(self):
+        """Control for the assertion above: an in-range score DOES stage."""
+        rp = _make_rep_process()
+        task_id = uuid4()
+        rp.handle_committed(None, self._committed('0.9', task_id=task_id))
+        assert task_id in rp.history._task_mapping
+
+    def test_an_in_range_committed_tx_is_recorded(self):
+        """The negative control: the drop must not swallow honest traffic.
+
+        Two sides of ONE task, because `len(history)` counts committed BILATERAL
+        entries -- a single-sided update stages a pending tx and leaves the chain
+        empty, which is why the out-of-range assertions above check the chain
+        stayed empty AND this one drives it to a real commit."""
+        rp = _make_rep_process()
+        task_id = uuid4()
+        before = len(rp.history)
+        assert rp.handle_committed(None, self._committed('0.9', task_id=task_id)) is True
+        assert rp.handle_committed(None, self._committed('0.8', task_id=task_id)) is True
+        assert len(rp.history) == before + 1
+
+    def test_a_rejected_side_cannot_complete_a_transaction(self):
+        """The consequence that matters: one honest side plus one out-of-range
+        side must NOT commit, or the rejection would only have delayed it."""
+        rp = _make_rep_process()
+        task_id = uuid4()
+        rp.handle_committed(None, self._committed('0.9', task_id=task_id))
+        rp.handle_committed(None, self._committed('42.0', task_id=task_id))
+        assert len(rp.history) == 0
+
+
+class TestAppFacingReputationRated:
+    """ISSUES §11.1, a copy of the C twin's design (rep_proc.c + app_events.h):
+    the app-facing carrier says whether AT holds a rating at all, because an
+    unrated peer reads as PREREP_NEUTRAL — which is also a score a peer can
+    genuinely earn — and a consumer given only the number cannot tell them apart.
+
+    Deliberately NOT on the peer-to-peer wire: `Reputation` / `rep_resp` are
+    untouched, exactly as in C, so this costs no .proto change.
+    """
+
+    def _rp_with_queue(self, peers=()):
+        rp = _make_rep_process()
+        main_q = queue.Queue()
+        rp.protocol.peers = MagicMock()
+        rp.protocol.peers.all = list(peers)
+        return rp, {CfgIds.main: main_q}, main_q
+
+    @staticmethod
+    def _drain(q):
+        out = []
+        while True:
+            try:
+                out.append(q.get_nowait())
+            except queue.Empty:
+                return out
+
+    def test_the_verb_matches_the_c_spelling(self):
+        """The protocol strings ARE the shared wire form; a prettier Python
+        spelling would break interop (see the REP_PROTO alignment note)."""
+        assert ReputationProtocol.app_roster_request == 'app_roster_request'
+
+    def test_a_rated_peer_carries_its_score(self):
+        peer = _make_mock_peer()
+        rp, queues, main_q = self._rp_with_queue([peer])
+        rp.reputations.update(UUID(str(peer.uuid)), 0.73)
+        assert rp.emit_all_reputations(queues) == 2      # the peer + self
+        emitted = {e.peer_uuid: e for e in self._drain(main_q)}
+        assert emitted[str(peer.uuid)].rated is True
+        assert emitted[str(peer.uuid)].score == pytest.approx(0.73)
+
+    def test_an_unrated_peer_is_emitted_as_unrated_not_skipped(self):
+        """Silence would leave a consumer unable to tell 'we hold no rating'
+        from 'the message was lost'."""
+        peer = _make_mock_peer()
+        rp, queues, main_q = self._rp_with_queue([peer])
+        rp.emit_all_reputations(queues)
+        emitted = {e.peer_uuid: e for e in self._drain(main_q)}
+        assert str(peer.uuid) in emitted
+        assert emitted[str(peer.uuid)].rated is False
+
+    def test_an_unrated_score_is_zeroed_not_neutral(self):
+        """C zeroes it so a consumer that ignores the flag cannot silently read
+        a plausible-looking number; 0.2 would be exactly that."""
+        peer = _make_mock_peer()
+        rp, queues, main_q = self._rp_with_queue([peer])
+        rp.emit_all_reputations(queues)
+        unrated = [e for e in self._drain(main_q) if not e.rated]
+        assert unrated
+        for entry in unrated:
+            assert entry.score == 0.0
+            assert entry.score != rp.PREREP_NEUTRAL
+
+    def test_the_pull_handler_emits_for_every_peer(self):
+        peer_a, peer_b = _make_mock_peer(), _make_mock_peer()
+        rp, queues, main_q = self._rp_with_queue([peer_a, peer_b])
+        msg = MagicMock()
+        msg.function = ReputationProtocol.app_roster_request
+        assert rp.handle_app_roster_request(queues, msg) is True
+        assert len(self._drain(main_q)) == 3            # two peers + self
+
+    def test_the_handler_declines_other_verbs(self):
+        rp, queues, main_q = self._rp_with_queue([_make_mock_peer()])
+        msg = MagicMock()
+        msg.function = ReputationProtocol.rep_req
+        assert rp.handle_app_roster_request(queues, msg) is False
+        assert self._drain(main_q) == []
+
+    def test_a_change_driven_emission_is_rated_by_construction(self):
+        rp, queues, main_q = self._rp_with_queue()
+        rp._publish_reputation_change(queues, uuid4(), 0.42)
+        emitted = self._drain(main_q)
+        assert [e.rated for e in emitted] == [True]
+        assert emitted[0].score == pytest.approx(0.42)
+
+    def test_publishing_without_a_main_queue_is_not_an_error(self):
+        """Unit/embedded use has no app feed; that is not a failure."""
+        rp = _make_rep_process()
+        rp._publish_reputation_change({}, uuid4(), 0.42)    # must not raise
+
+    def test_the_peer_to_peer_wire_form_is_unchanged(self):
+        """The whole point of copying C's placement: no .proto change, no
+        conformance churn. `Reputation` still carries exactly two fields."""
+        rep = Reputation(uuid4(), 0.5)
+        assert not hasattr(rep, 'rated')
