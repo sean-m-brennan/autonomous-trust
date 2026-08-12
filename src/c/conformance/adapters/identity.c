@@ -75,6 +75,9 @@ typedef struct {
     identity_t *full;
     public_identity_t *pub;
     process_t *proc;
+    /* The scenario's participant id, so a result can be reported under the name
+     * the scenario uses rather than a uuid. */
+    char id[SCE_ID_LEN];
     /* Result of a trigger_subtree_roster enumeration: a json array of the
      * flattened subtree's member participant ids (sorted). Read by the
      * subtree_roster expected-state check. Mirrors the Python adapter's
@@ -88,7 +91,15 @@ typedef struct {
     double attest_stamp;
     json_t *attest_accepted;    /* json array of booleans */
     json_t *attest_last_answer;
-    double attest_clock;        /* pinned clock from operator_session */
+    double attest_clock;        /* pinned clock from operator_session / clocks */
+    /* Cohort clock samples this participant MEASURED as the puller, keyed by
+     * the TARGET's participant id so expected_state can name a peer
+     * language-agnostically. Values are {offset, delay, usable} read out of the
+     * production handler's store (identity_get_peer_clock_sample) -- the
+     * adapter relabels, it does not compute. Mirrors the Python adapter's
+     * _Participant.attest_clock_samples.
+     * See doc/architecture/cohort-clock-skew.md. */
+    json_t *attest_clock_samples;
 } ic_impl_t;
 
 /* The engine ctx is global because the messaging-hook signature has no
@@ -167,6 +178,7 @@ static int _make_identity(const char *id, size_t idx, identity_t **out) {
 static ic_impl_t *_build_participant_impl(const char *id, size_t idx) {
     ic_impl_t *impl = calloc(1, sizeof(ic_impl_t));
     if (impl == NULL) return NULL;
+    strncpy(impl->id, id, sizeof(impl->id) - 1);
     if (_make_identity(id, idx, &impl->full) != 0 || impl->full == NULL) goto fail;
     if (identity_publish(impl->full, &impl->pub) != 0 || impl->pub == NULL) goto fail;
     impl->proc = smrt_create(sizeof(process_t));
@@ -306,7 +318,11 @@ static int _ic_run_attest_pull(sce_run_ctx_t *ctx, ic_impl_t *puller,
             snprintf(ctx->err, sizeof(ctx->err), "attest pull: request failed");
             return -1;
         }
-        answer = identity_attest_response(target->proc, nonce);
+        /* The target's own clock is its receive time on this path: the
+         * adapter builds the answer directly instead of dispatching a
+         * wire message, so nothing else can supply t2. */
+        answer = identity_attest_response(target->proc, nonce,
+                                         identity_attest_clock(target->proc));
         if (answer == NULL) {
             snprintf(ctx->err, sizeof(ctx->err), "attest pull: no answer built");
             return -1;
@@ -334,6 +350,26 @@ static int _ic_run_attest_pull(sce_run_ctx_t *ctx, ic_impl_t *puller,
     if (accepted)
         puller->attest_stamp = json_real_value(
             json_object_get(answer, "operator_attested_at"));
+
+    /* Relabel whatever the handler measured for this peer under the target's
+     * participant id. Absent (no readings in the answer) records nothing, so a
+     * scenario asserting on it fails loudly rather than reading a stale one. */
+    {
+        char target_uuid[UUID_STR_LEN + 1] = {0};
+        uuid_unparse_lower(target->pub->uuid, target_uuid);
+        at_clock_sample_t sample;
+        memset(&sample, 0, sizeof(sample));
+        if (identity_get_peer_clock_sample(target_uuid, &sample)
+            && sample.valid) {
+            if (puller->attest_clock_samples == NULL)
+                puller->attest_clock_samples = json_object();
+            json_t *entry = json_object();
+            json_object_set_new(entry, "offset", json_real(sample.offset_s));
+            json_object_set_new(entry, "delay", json_real(sample.delay_s));
+            json_object_set_new(entry, "usable", json_boolean(sample.usable));
+            json_object_set_new(puller->attest_clock_samples, target->id, entry);
+        }
+    }
 
     json_decref(answer);
     return 0;
@@ -951,6 +987,30 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
              * both read as nobody home. */
             bool attended = (state != NULL && strcmp(state, "active") == 0);
             identity_set_operator_attended(impl->proc, attended, clock);
+        }
+    }
+
+    /* clocks: per-participant clocks, so a scenario can pin two nodes that
+     * DISAGREE. operator_session.clock pins ONE clock for everybody, which is
+     * all the attended-now scenarios need; cohort skew is the difference
+     * BETWEEN two nodes' clocks and needs a distinct value each. Applied after
+     * operator_session so it overrides that shared value. Mirrors the Python
+     * adapter's _apply_clocks. See doc/architecture/cohort-clock-skew.md. */
+    json_t *clocks = json_object_get(fixtures, "clocks");
+    if (json_is_object(clocks)) {
+        const char *cpid2;
+        json_t *cval;
+        json_object_foreach(clocks, cpid2, cval) {
+            sce_participant_t *part = sce_find_participant(ctx, cpid2);
+            if (part == NULL) continue;
+            ic_impl_t *impl = (ic_impl_t *)part->impl;
+            double epoch = json_number_value(cval);
+            impl->attest_clock = epoch;
+            identity_set_attest_clock(impl->proc, epoch);
+            /* Re-stamp attendance against THIS node's clock: a node stamps with
+             * its own, which is the whole point of the two clocks differing. */
+            if (impl->proc->protocol.operator_attended)
+                identity_set_operator_attended(impl->proc, true, epoch);
         }
     }
 
@@ -1581,6 +1641,53 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                              "%s: attested_now=%f, expected %f",
                              pid, impl->attest_stamp, want_stamp);
                     return -1;
+                }
+            } else if (strcmp(key, "peer_clock_offset") == 0
+                       || strcmp(key, "peer_clock_delay") == 0
+                       || strcmp(key, "peer_clock_usable") == 0) {
+                /* Cohort clock skew measured from the attest round trip
+                 * (cohort-clock-skew.md, Stage 0). val = {peer_id: value}.
+                 *
+                 * These read what the PRODUCTION handler recorded (via
+                 * identity_get_peer_clock_sample), not anything the adapter
+                 * computed -- unlike attested_now/attest_accepted, which the
+                 * adapter derives itself. */
+                const char *peer_ref;
+                json_t *want;
+                json_object_foreach(val, peer_ref, want) {
+                    json_t *entry = impl->attest_clock_samples != NULL
+                        ? json_object_get(impl->attest_clock_samples, peer_ref)
+                        : NULL;
+                    if (entry == NULL) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: no clock sample for %s", pid, peer_ref);
+                        return -1;
+                    }
+                    if (strcmp(key, "peer_clock_usable") == 0) {
+                        bool got_u = json_is_true(json_object_get(entry, "usable"));
+                        if (got_u != json_is_true(want)) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: %s clock_usable=%s, expected %s",
+                                     pid, peer_ref, got_u ? "true" : "false",
+                                     json_is_true(want) ? "true" : "false");
+                            return -1;
+                        }
+                        continue;
+                    }
+                    const char *field = strcmp(key, "peer_clock_offset") == 0
+                                        ? "offset" : "delay";
+                    double got = json_number_value(json_object_get(entry, field));
+                    double diff = got - json_number_value(want);
+                    if (diff < 0.0) diff = -diff;
+                    /* Tolerance, not equality: both runtimes reach this through
+                     * double arithmetic, and pinned clocks make the value exact
+                     * to well inside a microsecond. Matches Python's 1e-6. */
+                    if (diff > 1e-6) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: %s %s=%f, expected %f", pid, peer_ref,
+                                 key, got, json_number_value(want));
+                        return -1;
+                    }
                 }
             } else if (strcmp(key, "attest_accepted") == 0) {
                 /* Per-pull accept/reject verdicts, in step order — the nonce

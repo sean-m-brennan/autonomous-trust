@@ -51,6 +51,9 @@
 /* Operator-attended signal helpers (ethne D8/Q9); defined below _build_announcement
  * but used earlier in handle_welcoming_committee. */
 static json_t *_operator_attestation_json(const public_identity_t *pub);
+/* Cohort clock skew: drop every stored sample (caller holds id_state.lock).
+ * Defined with the rest of the skew code but used by identity_reset_state. */
+static void _free_clock_samples_locked(void);
 static void _apply_operator_attestation_json(const json_t *att, public_identity_t *pub);
 #ifdef AT_ZTA_ENABLED
 static bool _is_operator_credential(const zta_policy_t *policy,
@@ -216,6 +219,20 @@ static struct {
      * whose nonce is absent here is unsolicited or replayed and is dropped.
      * Mirrors Python IdentityProcess._attest_sent. */
     map_t attest_sent;
+    /* When each outstanding pull was SENT: nonce string -> double epoch. This
+     * is the round trip's t1, and it deliberately never goes on the wire — it
+     * is ours, and a peer echoing it back could lie about it. Parallel to
+     * attest_sent rather than folded into it so that map keeps its single
+     * meaning (nonce -> whom we asked). Mirrors the third element of Python's
+     * _attest_sent tuple. */
+    map_t attest_sent_clock;
+    /* Newest clock sample per peer: lowercased uuid string -> heap
+     * at_clock_sample_t. Measurement only: nothing here steers a clock, and no
+     * offset is ever applied to our own time. Conformance/assertion surface via
+     * identity_get_peer_clock_sample. Mirrors Python's
+     * IdentityProcess._peer_clock_samples. See
+     * doc/architecture/cohort-clock-skew.md. */
+    map_t peer_clock_samples;
     /* Optional per-capability descriptors learned from the descriptor form
      * of caps_response (PIV_MFA_OPERATOR_ACCESS_PLAN.md §3.5). Keyed by
      * capability NAME (not peer uuid — a descriptor is a property of the
@@ -281,6 +298,8 @@ static void _ensure_id_init(void)
         map_init(&id_state.own_caps_by_proc);
         map_init(&id_state.peer_caps_map);
         map_init(&id_state.attest_sent);
+        map_init(&id_state.attest_sent_clock);
+        map_init(&id_state.peer_clock_samples);
         map_init(&id_state.peer_cap_descriptors_map);
         map_init(&id_state.peer_tiers);
         map_init(&id_state.partition_probe_cooldown);
@@ -2022,6 +2041,11 @@ void identity_reset_state(void)
     map_init(&id_state.own_caps_by_proc);
     map_free(&id_state.peer_caps_map);
     map_init(&id_state.peer_caps_map);
+    /* Cleared per scenario so no clock sample leaks from one corpus case into
+     * the next; each sample's heap payload goes with it. */
+    _free_clock_samples_locked();
+    map_free(&id_state.attest_sent_clock);
+    map_init(&id_state.attest_sent_clock);
     map_free(&id_state.peer_cap_descriptors_map);
     map_init(&id_state.peer_cap_descriptors_map);
     map_free(&id_state.peer_tiers);
@@ -5232,7 +5256,88 @@ static int _own_public_identity(const process_t *proc, public_identity_t *out)
  *
  * Shared by handle_attest_request (the wire path) and the conformance adapter,
  * so both see identical content — mirroring identity_roster_response. */
-json_t *identity_attest_response(const process_t *proc, const char *nonce)
+/* --- Cohort clock skew (doc/architecture/cohort-clock-skew.md) -------------- *
+ * Measurement only, mirroring Python's IdentityProcess._record_clock_sample.
+ * Nothing here steers a clock and no offset is applied to our own time.       */
+
+static void _free_clock_sample_data(data_t *dat)
+{
+    if (dat == NULL)
+        return;
+    ptr_t obj = NULL;
+    if (data_object_ptr(dat, &obj) == 0 && obj != NULL)
+        free(obj);
+    smrt_deref(dat);
+}
+
+static void _free_clock_samples_locked(void)
+{
+    map_key_t key = NULL;
+    data_t *value = NULL;
+    map_entries_for_each(&id_state.peer_clock_samples, key, value)
+        _free_clock_sample_data(value);
+    map_end_for_each
+    map_free(&id_state.peer_clock_samples);
+    map_init(&id_state.peer_clock_samples);
+}
+
+/* Keep the NEWEST sample for one peer, releasing the one it replaces.
+ * Unlike peer_caps_map (whose values change rarely), a sample is replaced on
+ * every attest pull, so an unfreed predecessor would grow without bound in a
+ * long-running node. */
+static void _store_clock_sample(const char *uuid_str,
+                                const at_clock_sample_t *sample)
+{
+    if (uuid_str == NULL || sample == NULL || !sample->valid)
+        return;
+    at_clock_sample_t *heap = calloc(1, sizeof(*heap));
+    if (heap == NULL)
+        return;
+    *heap = *sample;
+    data_t *dat = object_ptr_data(heap, sizeof(*heap));
+    if (dat == NULL)
+    {
+        free(heap);
+        return;
+    }
+    pthread_mutex_lock(&id_state.lock);
+    data_t *old = NULL;
+    if (map_get(&id_state.peer_clock_samples, (map_key_t)uuid_str, &old) == 0)
+        _free_clock_sample_data(old);
+    map_set(&id_state.peer_clock_samples, (map_key_t)uuid_str, dat);
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+double identity_attest_clock(const process_t *proc)
+{
+    return _attest_now(proc);
+}
+
+bool identity_get_peer_clock_sample(const char *uuid_str,
+                                    at_clock_sample_t *out)
+{
+    if (uuid_str == NULL || out == NULL)
+        return false;
+    _ensure_id_init();
+    bool found = false;
+    pthread_mutex_lock(&id_state.lock);
+    data_t *dat = NULL;
+    if (map_get(&id_state.peer_clock_samples, (map_key_t)uuid_str, &dat) == 0
+        && dat != NULL)
+    {
+        ptr_t obj = NULL;
+        if (data_object_ptr(dat, &obj) == 0 && obj != NULL)
+        {
+            *out = *(at_clock_sample_t *)obj;
+            found = true;
+        }
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return found;
+}
+
+json_t *identity_attest_response(const process_t *proc, const char *nonce,
+                                 double received_at)
 {
     if (proc == NULL) return NULL;
     public_identity_t self;
@@ -5247,6 +5352,15 @@ json_t *identity_attest_response(const process_t *proc, const char *nonce)
     json_object_set_new(out, "operator_attested_at", json_real(attested));
     if (nonce != NULL)
         json_object_set_new(out, "nonce", json_string(nonce));
+    /* Our two clock readings for this exchange: when we took the pull in, and
+     * when we are answering it. Two readings rather than one because their
+     * difference is OUR processing time, which the puller subtracts so a slow
+     * responder is not reported as a skewed one. C answers inline so the gap is
+     * near zero; Python's defers to its main loop and is routinely
+     * milliseconds. Purely observational. */
+    if (received_at > 0.0)
+        json_object_set_new(out, "clock_recv_at", json_real(received_at));
+    json_object_set_new(out, "clock_sent_at", json_real(_attest_now(proc)));
     return out;
 }
 
@@ -5263,6 +5377,9 @@ bool handle_attest_request(const process_t *proc, directory_t *queues,
     (void)queues;
     if (proc == NULL || msg == NULL) return true;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* Taken before any parsing: this is the round trip's t2, and work done
+     * here would otherwise be charged to the network path. */
+    double received_at = _attest_now(proc);
 
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
@@ -5273,7 +5390,7 @@ bool handle_attest_request(const process_t *proc, directory_t *queues,
         return true;
     }
 
-    json_t *out = identity_attest_response(proc, nonce);
+    json_t *out = identity_attest_response(proc, nonce, received_at);
     json_decref(payload);
     if (out == NULL) return true;
 
@@ -5318,6 +5435,12 @@ int identity_request_attestation(process_t *proc, const public_identity_t *peer,
     if (dat == NULL) return -1;
     if (map_set(&id_state.attest_sent, nonce, dat) != 0)
         return -1;
+    /* t1 of the round trip, kept locally alongside the pull. A failure to
+     * record it costs the clock sample, not the attestation, so it is not
+     * treated as an error. */
+    data_t *tx_dat = floating_pt_dbl_data(_attest_now(proc));
+    if (tx_dat != NULL)
+        (void)map_set(&id_state.attest_sent_clock, nonce, tx_dat);
 
     json_t *body = json_object();
     if (body == NULL) return -1;
@@ -5375,6 +5498,8 @@ bool handle_attest_response(process_t *proc, directory_t *queues,
     if (proc == NULL || msg == NULL) return true;
     _ensure_id_init();
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* t4, before any parsing -- see handle_attest_request for why. */
+    double recv_epoch = _attest_now(proc);
 
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
@@ -5398,6 +5523,15 @@ bool handle_attest_response(process_t *proc, directory_t *queues,
     if (expect_uuid != NULL)
         strncpy(expected, expect_uuid, UUID_STR_LEN);
     map_remove(&id_state.attest_sent, (map_key_t)nonce);
+
+    /* t1 for this pull, retired with it. Absent (an older pull, or a failed
+     * record) simply means no clock sample from this exchange. */
+    double sent_epoch = 0.0;
+    data_t *tx_dat = NULL;
+    if (map_get(&id_state.attest_sent_clock, (map_key_t)nonce, &tx_dat) == 0
+        && tx_dat != NULL)
+        (void)data_floating_pt_dbl(tx_dat, &sent_epoch);
+    map_remove(&id_state.attest_sent_clock, (map_key_t)nonce);
 
     char responder[UUID_STR_LEN + 1] = {0};
     uuid_unparse_lower(nmsg->from_whom.uuid, responder);
@@ -5436,6 +5570,43 @@ bool handle_attest_response(process_t *proc, directory_t *queues,
     if (delta < 0.0) delta = -delta;
     bool in_window = (claimed > 0.0) && (delta <= ATTEST_WINDOW_SEC);
     double attested = (verified && in_window) ? claimed : 0.0;
+
+    /* Cohort clock skew, measured from this same round trip. ADVISORY ALWAYS:
+     * a peer beyond the bound is logged and recorded, never refused, and the
+     * offset is never applied to anything. A peer that omits the readings (an
+     * older build) yields no sample -- absence is not an error. */
+    json_t *j_peer_recv = json_object_get(payload, "clock_recv_at");
+    json_t *j_peer_sent = json_object_get(payload, "clock_sent_at");
+    if (sent_epoch > 0.0 && json_is_number(j_peer_recv)
+        && json_is_number(j_peer_sent))
+    {
+        at_clock_sample_t sample = at_clock_sample_from_round_trip(
+            sent_epoch, json_number_value(j_peer_recv),
+            json_number_value(j_peer_sent), recv_epoch);
+        if (sample.valid)
+        {
+            _store_clock_sample(responder, &sample);
+            char sdesc[160];
+            at_clock_sample_describe(&sample, responder, sdesc, sizeof(sdesc));
+            bool from_env = false;
+            long bound_ms = at_clock_max_cohort_skew_ms(proc->logger, &from_env);
+            if (!sample.usable)
+                /* The peer's two readings span more than the whole round trip:
+                 * a stepped clock or a dishonest responder. Worth saying. */
+                log_warn(proc->logger,
+                         "Identity: clock sample from %s is impossible: %s\n",
+                         responder, sdesc);
+            else if (at_clock_sample_exceeds(&sample, bound_ms))
+                log_warn(proc->logger,
+                         "Identity: clock skew beyond bound: %s (bound %.3fs "
+                         "from %s) [advisory: timestamps from this peer are not "
+                         "comparable with ours]\n",
+                         sdesc, (double)bound_ms / 1000.0,
+                         from_env ? "env" : "default");
+            else
+                log_debug(proc->logger, "Identity: clock sample: %s\n", sdesc);
+        }
+    }
 
     /* Write the verified result onto the stored peer, so a consumer reading
      * the local peer mirror sees a LIVE value instead of the stamp captured

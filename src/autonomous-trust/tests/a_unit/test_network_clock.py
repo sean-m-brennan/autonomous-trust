@@ -232,3 +232,140 @@ class TestNowEquivalence:
     def test_now_carries_no_offset_module(self):
         with pytest.raises(ImportError):
             __import__('autonomous_trust.core._python.network.ntp')
+
+
+class TestClockSampleMath:
+    """Stage 0 of cohort-clock-skew.md: measure how far peers' clocks sit from
+    ours. Nothing here steers a clock -- see TestCohortStaysAdvisory."""
+
+    def test_offset_and_delay_from_a_round_trip(self):
+        # Peer is 4 s ahead; 100 ms each way; peer took 500 ms to answer.
+        t1 = 1000.0
+        t2 = t1 + 4.0 + 0.1
+        t3 = t2 + 0.5
+        t4 = t1 + 0.1 + 0.5 + 0.1
+        s = clock.sample_from_round_trip('peer-a', t1, t2, t3, t4)
+        assert s.offset.total_seconds() == pytest.approx(4.0)
+        # The peer's own 500 ms is subtracted: delay is network time only.
+        assert s.delay.total_seconds() == pytest.approx(0.2)
+        assert s.usable
+
+    def test_a_slow_responder_is_not_reported_as_a_skewed_one(self):
+        """The reason t2 and t3 must be separate readings. Same clocks on both
+        sides, but the peer sits on the request for a full minute."""
+        t1 = 1000.0
+        t2, t3 = t1 + 0.05, t1 + 60.05
+        t4 = t1 + 60.1
+        s = clock.sample_from_round_trip('slow', t1, t2, t3, t4)
+        assert s.offset.total_seconds() == pytest.approx(0.0, abs=1e-9)
+        assert s.delay.total_seconds() == pytest.approx(0.1)
+
+    def test_impossible_timings_are_unusable_not_silently_dropped(self):
+        # Round trip of 1 s, but the peer claims 2 s of processing inside it.
+        s = clock.sample_from_round_trip('liar', 0.0, 0.0, 2.0, 1.0)
+        assert s.delay.total_seconds() < 0
+        assert not s.usable
+        assert 'UNUSABLE' in s.describe()
+        assert clock.cohort_offset([s]) == {}
+
+    @pytest.mark.parametrize('bad', [None, 'x', float('inf'), float('nan')])
+    def test_unmeasurable_round_trip_yields_no_sample(self, bad):
+        assert clock.sample_from_round_trip('p', bad, 1.0, 2.0, 3.0) is None
+
+    def test_exceeds_is_symmetric_about_zero(self):
+        bound = timedelta(seconds=2)
+        behind = clock.ClockSample('b', timedelta(seconds=-5), timedelta(0))
+        ahead = clock.ClockSample('a', timedelta(seconds=5), timedelta(0))
+        assert behind.exceeds(bound) and ahead.exceeds(bound)
+        assert not clock.ClockSample('ok', timedelta(seconds=1),
+                                     timedelta(0)).exceeds(bound)
+
+
+class TestCohortAggregation:
+    def _sample(self, peer, offset_sec, delay_sec=0.01):
+        return clock.ClockSample(peer, timedelta(seconds=offset_sec),
+                                 timedelta(seconds=delay_sec))
+
+    def test_median_resists_a_lying_minority(self):
+        """The reason the estimator is a median. One peer reporting a wild
+        offset must not move the cohort estimate -- with a mean, it would."""
+        good = [self._sample('a', 0.01), self._sample('b', 0.02),
+                self._sample('c', 0.03)]
+        clean = clock.cohort_offset(good)
+        poisoned = clock.cohort_offset(good + [self._sample('evil', 9999.0)])
+        assert clean['cohort_offset'] == pytest.approx(0.02)
+        assert poisoned['cohort_offset'] == pytest.approx(0.025, abs=0.01)
+        # ...while dispersion still reports that something is very wrong.
+        assert poisoned['cohort_dispersion'] > 9000
+
+    def test_unusable_samples_are_excluded_from_the_estimate(self):
+        bad = clock.ClockSample('bad', timedelta(seconds=50), timedelta(seconds=-1))
+        got = clock.cohort_offset([self._sample('a', 0.01), bad])
+        assert got['cohort_samples'] == 1
+        assert got['cohort_offset'] == pytest.approx(0.01)
+
+    @pytest.mark.parametrize('samples', [None, [], [None]])
+    def test_nothing_to_report_is_an_empty_dict(self, samples):
+        assert clock.cohort_offset(samples) == {}
+
+
+class TestCohortStaysAdvisory:
+    """The invariant: cohort time never influences the clock that orders trust
+    decisions. Stage 0 observes only."""
+
+    def test_cohort_keys_never_change_synced(self):
+        wild = clock.ClockSample('p', timedelta(seconds=9999), timedelta(0))
+        with patch.object(clock, 'kernel_clock_state',
+                          return_value=_state(synced=True)):
+            with patch.object(clock, 'chrony_tracking', return_value={}):
+                state = clock.clock_state(samples=[wild])
+        assert state.synced is True          # a cohort cannot unsync a clock...
+        assert state.detail['cohort_offset'] == pytest.approx(9999)  # ...but it is reported
+
+    def test_no_samples_adds_no_cohort_keys(self):
+        with patch.object(clock, 'kernel_clock_state', return_value=_state()):
+            with patch.object(clock, 'chrony_tracking', return_value={}):
+                state = clock.clock_state()
+        assert state.detail == {}
+
+    def test_cohort_and_chrony_detail_coexist(self):
+        s = clock.ClockSample('p', timedelta(seconds=0.5), timedelta(0))
+        with patch.object(clock, 'kernel_clock_state', return_value=_state()):
+            with patch.object(clock, 'chrony_tracking',
+                              return_value={'chrony_stratum': '3'}):
+                state = clock.clock_state(samples=[s])
+        assert state.detail['chrony_stratum'] == '3'
+        assert state.detail['cohort_offset'] == pytest.approx(0.5)
+        assert 'chronyc' in state.source
+
+    def test_the_gate_ignores_cohort_skew_entirely(self):
+        """require_synced_clock is about local discipline. A wildly skewed
+        cohort must not make a locally-synced node refuse to start."""
+        log = logging.getLogger('test.gate')
+        with patch.object(clock, 'clock_state', return_value=_state(
+                synced=True, detail={'cohort_offset': 9999.0})):
+            with patch.dict(os.environ, {clock.REQUIRE_ENV: '1'}):
+                state = clock.require_synced_clock(log)   # must not raise
+        assert state.synced
+
+
+class TestSkewBoundResolution:
+    def test_default_when_unset(self):
+        with patch.dict(os.environ, {}, clear=True):
+            bound, source = clock.resolve_max_cohort_skew()
+        assert bound == timedelta(milliseconds=clock.DEFAULT_MAX_COHORT_SKEW_MS)
+        assert source == 'default'
+
+    def test_env_override(self):
+        with patch.dict(os.environ, {clock.SKEW_ENV: '250'}):
+            bound, source = clock.resolve_max_cohort_skew()
+        assert bound == timedelta(milliseconds=250)
+        assert source == 'env'
+
+    @pytest.mark.parametrize('raw', ['0', '-1', 'abc', '999999999'])
+    def test_out_of_range_is_refused_and_the_default_kept(self, raw):
+        with patch.dict(os.environ, {clock.SKEW_ENV: raw}):
+            bound, source = clock.resolve_max_cohort_skew(
+                logging.getLogger('test.knob'))
+        assert bound == timedelta(milliseconds=clock.DEFAULT_MAX_COHORT_SKEW_MS)
+        assert source == 'default'
