@@ -90,6 +90,11 @@ static void _publish_exclusion(const process_t *proc,
  * slash floor, restores the score to PREREP_NEUTRAL, and re-admits it.
  * Recovery is explicit-only. Mirror: Python SlashAttestation.REASON_REHABILITATE. */
 #define REP_SLASH_REASON_REHABILITATE "rehabilitate"
+/* The other reasons are not branched on here, but the slash designation covers
+ * the reason string, so the spellings have to match Python's
+ * SlashAttestation.REASON_* exactly or a co-signature verifies nowhere.
+ * Declared in rep_proc_priv.h so the conformance adapter shares them rather
+ * than repeating the literals. */
 
 /****************************
  * Protocol-string definitions (declared `extern char[]` in
@@ -216,8 +221,15 @@ static struct {
      * mirrored into rep_state.reputations so reputation_get_peer_reputation
      * (and the consensus handler) reflect it. */
     map_t slashed;        /* target_uuid_str -> integer_data(epoch) */
-    map_t slash_sigs;     /* "target:epoch" -> integer_data(signer count) */
-    map_t slash_pending;  /* "target:epoch" -> integer_data(floor x1000) */
+    /* "target:epoch:voter" -> string_data(detached hex signature over the
+     * attestation designation). Keyed by VOTER, not a bare count: the count
+     * this replaced had no voter identity, so replaying one ack drove it past
+     * quorum and a single peer could finalize alone. */
+    map_t slash_sigs;
+    /* "target:epoch" -> string_data(JSON {slasher_uuid, reason, floor_score}).
+     * The whole round, because a co-signer and the finalizer must both
+     * reproduce the proposer's designation byte for byte. */
+    map_t slash_pending;
     int64_t slash_epoch;
     /* Communication cut-off exclusion set: peers whose reputation fell below
      * COMM_CUTOFF and were excluded at the network layer. Tracks the crossing
@@ -232,8 +244,13 @@ static struct {
      * _checkpoint_pending. A member co-signs a proposed checkpoint only when
      * its own transaction_window_root matches; on quorum the proposer
      * finalizes and every node stores the agreed root. */
-    map_t checkpoint_sigs;     /* "proposer:epoch" -> integer_data(signer count) */
-    map_t checkpoint_pending;  /* "proposer:epoch" -> string_data(root hex) */
+    /* "proposer:epoch:voter" -> string_data(detached hex signature over the
+     * checkpoint designation); same voter-keyed shape and same reason as
+     * slash_sigs above. */
+    map_t checkpoint_sigs;
+    /* "proposer:epoch" -> string_data(JSON {root, first_index, count}) -- the
+     * window bounds travel because the designation covers them. */
+    map_t checkpoint_pending;
     char  checkpoint_root[TX_HASH_HEX_LEN + 1];  /* latest finalized root */
     int64_t checkpoint_epoch;  /* epoch of the latest finalized checkpoint */
     bool  checkpoint_set;      /* a checkpoint has been finalized/stored */
@@ -2069,6 +2086,283 @@ static bool _verify_slash_evidence(json_t *evidence)
     return tx_merkle_verify(leaf, steps, (int)n, root);
 }
 
+/****************************
+ * Quorum co-signatures (slash + checkpoint)
+ *
+ * Mirrors Python repprocess._detached_sig / _cosigner_identity /
+ * _verify_cosignature / _verified_cosigners / _quorum_met.
+ *
+ * Both rounds used to carry no attestation whatsoever. This side was the
+ * thinner of the two: the co-sign ack reported `uuid_clear`'d bytes as its
+ * signer and no signature at all, and the tally was a BARE COUNT
+ * (integer_data) with no voter identity — so replaying one ack drove the count
+ * past quorum and a single peer finalized alone. The `*_final` handlers then
+ * applied whatever arrived, on transport authentication only. Since a slash
+ * floors a peer below COMM_CUTOFF into exclusion that is sticky (recovery only
+ * by explicit REASON_REHABILITATE), that was a permanent-exclusion primitive
+ * available to any admitted member.
+ *
+ * Now: a co-signer signs the round's designation with its own key, the tally is
+ * keyed by VOTER (so one voter is one vote however many acks arrive), the
+ * finalizer carries the retained signatures, and every receiver re-verifies
+ * them against the member keys it holds before acting. Designation bytes are
+ * byte-identical to Python's SlashAttestation.designation /
+ * Checkpoint.designation — the hazard to watch when editing either side.
+ *
+ * Signature form follows _partition_sign_hex / _partition_verify_hex in
+ * id_proc.c: detached Ed25519, carried as ASCII hex.
+ ****************************/
+
+/* Longest designation: tag + 2 uuids (or uuid + 64-hex root) + reason +
+ * fixed-form floor + three integers, plus separators. 512 is generous. */
+#define REP_DESIG_MAX 512
+#define REP_SIG_HEX_LEN (crypto_sign_BYTES * 2)
+/* A pending round record, held as a small JSON string. It carries EVERY field
+ * the round's designation covers, not just the floor / root the maps used to
+ * hold: a co-signer and the finalizer both have to reproduce the proposer's
+ * exact bytes, and a field missing here is a signature that verifies nowhere. */
+#define REP_PENDING_MAX 256
+
+static void _store_pending_locked(map_t *pending, const char *key, json_t *rec)
+{
+    if (rec == NULL)
+        return;
+    char *text = json_dumps(rec, JSON_COMPACT | JSON_SORT_KEYS);
+    if (text != NULL && strlen(text) < REP_PENDING_MAX)
+        map_set(pending, (map_key_t)key,
+                string_data((string_t)text, strlen(text) + 1));
+    free(text);
+}
+
+/* Read a pending round record back. Caller owns the returned reference. */
+static json_t *_load_pending_locked(map_t *pending, const char *key)
+{
+    data_t *dat = NULL;
+    if (map_get(pending, (map_key_t)key, &dat) != 0 || dat == NULL)
+        return NULL;
+    char text[REP_PENDING_MAX] = {0};
+    if (data_string(dat, text, sizeof(text)) != 0)
+        return NULL;
+    json_error_t err;
+    return json_loads(text, 0, &err);
+}
+
+/* Self identity (with the private signing key) out of proc->configs — the same
+ * access path _resolve_self_uuid, net_proc.c and zta_process.c use. */
+static const identity_t *_resolve_self_identity(const process_t *proc)
+{
+    if (proc == NULL || proc->configs == NULL)
+        return NULL;
+    data_t *id_dat = NULL;
+    char id_key[] = "identity";
+    if (map_get(proc->configs, id_key, &id_dat) != 0 || id_dat == NULL)
+        return NULL;
+    config_t *id_cfg = NULL;
+    if (data_object_ptr(id_dat, (void **)&id_cfg) != 0 || id_cfg == NULL
+        || id_cfg->data_struct == NULL)
+        return NULL;
+    return (const identity_t *)id_cfg->data_struct;
+}
+
+/* Canonical bytes a slash co-signer signs. MUST stay byte-identical to
+ * Python SlashAttestation.designation:
+ *   "AT-SLASH\0" slasher "|" target "|" reason "|" %.6f floor "|" epoch
+ * The float is fixed-precision because that is the one byte-pinning hazard
+ * across the two languages. Returns the length, or 0 on bad input. */
+static size_t _slash_designation(const char *slasher, const char *target,
+                                 const char *reason, double floor,
+                                 int64_t epoch, uint8_t *out, size_t cap)
+{
+    if (slasher == NULL || target == NULL || reason == NULL || out == NULL)
+        return 0;
+    static const char tag[] = "AT-SLASH";
+    size_t tag_len = sizeof(tag);   /* includes the NUL separator */
+    int n = snprintf((char *)out + tag_len, cap - tag_len,
+                     "%s|%s|%s|%.6f|%lld", slasher, target, reason, floor,
+                     (long long)epoch);
+    if (n < 0 || (size_t)n >= cap - tag_len)
+        return 0;
+    memcpy(out, tag, tag_len);
+    return tag_len + (size_t)n;
+}
+
+/* Canonical bytes a checkpoint co-signer signs. MUST stay byte-identical to
+ * Python Checkpoint.designation:
+ *   "AT-CKPT\0" proposer "|" root "|" epoch "|" first_index "|" count
+ * `nonce` is deliberately excluded on both sides (anti-replay only). */
+static size_t _checkpoint_designation(const char *proposer, const char *root,
+                                      int64_t epoch, int64_t first_index,
+                                      int64_t count, uint8_t *out, size_t cap)
+{
+    if (proposer == NULL || root == NULL || out == NULL)
+        return 0;
+    static const char tag[] = "AT-CKPT";
+    size_t tag_len = sizeof(tag);
+    int n = snprintf((char *)out + tag_len, cap - tag_len,
+                     "%s|%s|%lld|%lld|%lld", proposer, root,
+                     (long long)epoch, (long long)first_index,
+                     (long long)count);
+    if (n < 0 || (size_t)n >= cap - tag_len)
+        return 0;
+    memcpy(out, tag, tag_len);
+    return tag_len + (size_t)n;
+}
+
+/* Sign `desig` with our own key, ASCII hex out (REP_SIG_HEX_LEN + 1 bytes). */
+static int _cosign_hex(const process_t *proc, const uint8_t *desig,
+                       size_t dlen, char *hex_out, size_t hex_cap)
+{
+    const identity_t *self = _resolve_self_identity(proc);
+    if (self == NULL || desig == NULL || dlen == 0
+        || hex_cap < REP_SIG_HEX_LEN + 1)
+        return -1;
+    unsigned char sig[crypto_sign_BYTES];
+    if (crypto_sign_detached(sig, NULL, desig, dlen,
+                             self->signature.private) != 0)
+        return -1;
+    hexlify(sig, crypto_sign_BYTES, (unsigned char *)hex_out);
+    return 0;
+}
+
+/* Copy out the signing public key for `voter_str`: self first (a proposer
+ * counts its own signature), then the peer roster. False when the claimed
+ * voter is unknown to us — an unknown voter's signature cannot be verified, so
+ * it cannot count. Copies rather than returning a pointer into peers[], which
+ * is only valid under the rwlock. */
+static bool _cosigner_pubkey(const process_t *proc, const char *voter_str,
+                             unsigned char out[crypto_sign_PUBLICKEYBYTES])
+{
+    if (proc == NULL || voter_str == NULL || out == NULL)
+        return false;
+    const identity_t *self = _resolve_self_identity(proc);
+    if (self != NULL)
+    {
+        char self_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(self->uuid, self_str);
+        if (strncmp(self_str, voter_str, sizeof(self_str)) == 0)
+        {
+            memcpy(out, self->signature.public, crypto_sign_PUBLICKEYBYTES);
+            return true;
+        }
+    }
+    bool found = false;
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++)
+    {
+        char peer_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(proc->protocol.peers[i].uuid, peer_str);
+        if (strncmp(peer_str, voter_str, sizeof(peer_str)) == 0)
+        {
+            memcpy(out, proc->protocol.peers[i].signature.public,
+                   crypto_sign_PUBLICKEYBYTES);
+            found = true;
+            break;
+        }
+    }
+    peers_read_unlock(proc);
+    return found;
+}
+
+/* True iff `sig_hex` is `voter_str`'s signature over `desig`. Any malformed /
+ * unknown / bad-signature case is false: a co-signature that cannot be checked
+ * must never be counted. */
+static bool _verify_cosignature(const process_t *proc, const char *voter_str,
+                                const uint8_t *desig, size_t dlen,
+                                const char *sig_hex)
+{
+    if (voter_str == NULL || sig_hex == NULL || desig == NULL || dlen == 0)
+        return false;
+    if (strnlen(sig_hex, REP_SIG_HEX_LEN + 2) != REP_SIG_HEX_LEN)
+        return false;
+    unsigned char pubkey[crypto_sign_PUBLICKEYBYTES];
+    if (!_cosigner_pubkey(proc, voter_str, pubkey))
+        return false;
+    unsigned char sig[crypto_sign_BYTES];
+    if (unhexlify((const unsigned char *)sig_hex, REP_SIG_HEX_LEN, sig) != 0)
+        return false;
+    return crypto_sign_verify_detached(sig, desig, dlen, pubkey) == 0;
+}
+
+/* Count the DISTINCT voters in the `sigs` object whose signature over `desig`
+ * verifies. JSON object keys are unique by construction, so distinctness comes
+ * for free — the property Python gets from keying a dict by voter, and the one
+ * the old bare count lacked. */
+static size_t _verified_cosigners(const process_t *proc, json_t *sigs,
+                                  const uint8_t *desig, size_t dlen)
+{
+    if (sigs == NULL || !json_is_object(sigs))
+        return 0;
+    size_t count = 0;
+    const char *voter = NULL;
+    json_t *val = NULL;
+    json_object_foreach(sigs, voter, val)
+    {
+        if (_verify_cosignature(proc, voter, desig, dlen,
+                                json_string_value(val)))
+            count++;
+    }
+    return count;
+}
+
+/* Receiver-side quorum test: more than floor(N/2) distinct voters must have
+ * signed the exact bytes we re-derive. Sized against OUR OWN roster
+ * (proc->protocol.num_peers, the mirror of Python's len(peers.all)), so the
+ * finalizer cannot also choose the bar it has to clear. */
+static bool _quorum_met(const process_t *proc, json_t *sigs,
+                        const uint8_t *desig, size_t dlen)
+{
+    if (proc == NULL)
+        return false;
+    peers_read_lock(proc);
+    size_t quorum = proc->protocol.num_peers / 2;
+    peers_read_unlock(proc);
+    return _verified_cosigners(proc, sigs, desig, dlen) > quorum;
+}
+
+/* Record one verified co-signature for a round. The map is keyed
+ * "<round>:<voter>" so a voter re-sending its ack overwrites rather than
+ * increments: one voter, one vote. */
+static void _record_cosig_locked(map_t *sigs, const char *round_key,
+                                 const char *voter, const char *sig_hex)
+{
+    char key[UUID_STRING_LEN * 2 + 48];
+    snprintf(key, sizeof(key), "%s:%s", round_key, voter);
+    map_set(sigs, (map_key_t)key,
+            string_data((string_t)sig_hex, strlen(sig_hex) + 1));
+}
+
+/* Collect a round's recorded co-signatures into a fresh JSON object
+ * {voter: sig_hex} for the finalizer to carry, and report how many there are.
+ * Caller owns the returned reference. */
+static json_t *_cosigs_json_locked(map_t *sigs, const char *round_key,
+                                   size_t *count_out)
+{
+    json_t *out = json_object();
+    size_t count = 0;
+    if (out == NULL)
+    {
+        if (count_out) *count_out = 0;
+        return NULL;
+    }
+    size_t prefix_len = strlen(round_key) + 1;   /* "<round>:" */
+    map_key_t key = NULL;
+    data_t *value = NULL;
+    map_entries_for_each(sigs, key, value)
+    {
+        if (strncmp(key, round_key, prefix_len - 1) != 0
+            || key[prefix_len - 1] != ':')
+            continue;
+        char sig_hex[REP_SIG_HEX_LEN + 1] = {0};
+        if (data_string(value, sig_hex, sizeof(sig_hex)) != 0)
+            continue;
+        json_object_set_new(out, key + prefix_len, json_string(sig_hex));
+        count++;
+    }
+    map_end_for_each;
+    if (count_out) *count_out = count;
+    return out;
+}
+
 static bool handle_slash_propose(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -2087,6 +2381,10 @@ static bool handle_slash_propose(const process_t *proc, directory_t *queues, gen
         json_string_value(json_object_get(payload, "target_uuid"));
     double floor = json_real_value(json_object_get(payload, "floor_score"));
     int64_t epoch = json_integer_value(json_object_get(payload, "epoch"));
+    const char *slasher_str =
+        json_string_value(json_object_get(payload, "slasher_uuid"));
+    const char *propose_reason =
+        json_string_value(json_object_get(payload, "reason"));
     if (target_str == NULL)
     {
         json_decref(payload);
@@ -2103,16 +2401,44 @@ static bool handle_slash_propose(const process_t *proc, directory_t *queues, gen
     }
     char key[UUID_STRING_LEN + 32];
     snprintf(key, sizeof(key), "%s:%lld", target_str, (long long)epoch);
+    json_t *pending_rec = json_object();
+    if (pending_rec != NULL)
+    {
+        json_object_set_new(pending_rec, "slasher_uuid",
+                            json_string(slasher_str ? slasher_str : ""));
+        json_object_set_new(pending_rec, "reason",
+                            json_string(propose_reason ? propose_reason : ""));
+        json_object_set_new(pending_rec, "floor_score", json_real(floor));
+    }
     pthread_mutex_lock(&rep_state.lock);
-    map_set(&rep_state.slash_pending, (map_key_t)key,
-            integer_data((int)(floor * 1000.0)));
+    _store_pending_locked(&rep_state.slash_pending, key, pending_rec);
     pthread_mutex_unlock(&rep_state.lock);
+    json_decref(pending_rec);
 
-    /* Co-sign: emit slash_sign back to the proposer. */
+    /* Co-sign: sign the attestation designation with our own key and emit
+     * slash_sign back to the proposer, naming ourselves. A round we cannot
+     * fully identify (no slasher / no reason) cannot be signed — the
+     * designation covers both fields — so decline rather than sign different
+     * bytes than the proposer will verify. */
+    const identity_t *self = _resolve_self_identity(proc);
+    uint8_t desig[REP_DESIG_MAX];
+    size_t dlen = (slasher_str != NULL && propose_reason != NULL)
+        ? _slash_designation(slasher_str, target_str, propose_reason, floor,
+                             epoch, desig, sizeof(desig))
+        : 0;
+    char sig_hex[REP_SIG_HEX_LEN + 1] = {0};
+    if (self == NULL || dlen == 0
+        || _cosign_hex(proc, desig, dlen, sig_hex, sizeof(sig_hex)) != 0)
+    {
+        log_warn(proc->logger,
+                 "Reputation: cannot sign slash_propose (%s); declining to co-sign\n",
+                 self == NULL ? "no self identity"
+                              : "round not fully identified");
+        json_decref(payload);
+        return true;
+    }
     char self_str[UUID_STRING_LEN + 1];
-    uuid_t self_uuid;
-    uuid_clear(self_uuid);
-    uuid_unparse_lower(self_uuid, self_str);
+    uuid_unparse_lower(self->uuid, self_str);
     json_t *sign_json = json_object();
     if (sign_json == NULL)
     {
@@ -2122,6 +2448,7 @@ static bool handle_slash_propose(const process_t *proc, directory_t *queues, gen
     json_object_set_new(sign_json, "target_uuid", json_string(target_str));
     json_object_set_new(sign_json, "epoch", json_integer(epoch));
     json_object_set_new(sign_json, "signer_uuid", json_string(self_str));
+    json_object_set_new(sign_json, "signature", json_string(sig_hex));
     json_decref(payload);
 
     generic_msg_t sign = {0};
@@ -2150,6 +2477,10 @@ static bool handle_slash_sign(const process_t *proc, directory_t *queues, generi
     const char *target_str =
         json_string_value(json_object_get(payload, "target_uuid"));
     int64_t epoch = json_integer_value(json_object_get(payload, "epoch"));
+    const char *claimed =
+        json_string_value(json_object_get(payload, "signer_uuid"));
+    const char *ack_sig =
+        json_string_value(json_object_get(payload, "signature"));
     if (target_str == NULL)
     {
         json_decref(payload);
@@ -2158,38 +2489,77 @@ static bool handle_slash_sign(const process_t *proc, directory_t *queues, generi
     char key[UUID_STRING_LEN + 32];
     snprintf(key, sizeof(key), "%s:%lld", target_str, (long long)epoch);
 
-    pthread_mutex_lock(&rep_state.lock);
-    int count = 0;
-    data_t *cnt_d = NULL;
-    if (map_get(&rep_state.slash_sigs, (map_key_t)key, &cnt_d) == 0
-        && cnt_d != NULL)
-        data_integer(cnt_d, &count);
-    count += 1;
-    map_set(&rep_state.slash_sigs, (map_key_t)key, integer_data(count));
-    double floor = 0.0;
-    int floor_milli = 0;
-    data_t *fl_d = NULL;
-    bool have_floor = (map_get(&rep_state.slash_pending, (map_key_t)key,
-                               &fl_d) == 0 && fl_d != NULL);
-    if (have_floor)
+    /* Credit the AUTHENTICATED sender, never the uuid the payload claims. */
+    char voter[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, voter);
+    if (claimed != NULL && strncmp(claimed, voter, sizeof(voter)) != 0)
     {
-        data_integer(fl_d, &floor_milli);
-        floor = ((double)floor_milli) / 1000.0;
+        log_warn(proc->logger,
+                 "Reputation: slash_sign claims voter %s but was sent by %s; refused\n",
+                 claimed, voter);
+        json_decref(payload);
+        return true;
     }
-    int quorum = rep_state.num_peers / 2;
-    bool finalize = have_floor && count > quorum;
+
+    /* Rebuild the proposer's designation from the pending round and verify the
+     * ack against it. An unverifiable co-signature is not a vote. */
+    pthread_mutex_lock(&rep_state.lock);
+    json_t *pending = _load_pending_locked(&rep_state.slash_pending, key);
     pthread_mutex_unlock(&rep_state.lock);
+    if (pending == NULL)
+    {
+        json_decref(payload);
+        return true;   /* not our round, or already finalized */
+    }
+    const char *slasher_str =
+        json_string_value(json_object_get(pending, "slasher_uuid"));
+    const char *reason_str =
+        json_string_value(json_object_get(pending, "reason"));
+    double floor = json_real_value(json_object_get(pending, "floor_score"));
+    uint8_t desig[REP_DESIG_MAX];
+    size_t dlen = _slash_designation(slasher_str, target_str, reason_str, floor,
+                                    epoch, desig, sizeof(desig));
+    if (dlen == 0 || !_verify_cosignature(proc, voter, desig, dlen, ack_sig))
+    {
+        log_warn(proc->logger,
+                 "Reputation: slash_sign co-signature from %s failed verification; not counted\n",
+                 voter);
+        json_decref(pending);
+        json_decref(payload);
+        return true;
+    }
+
+    pthread_mutex_lock(&rep_state.lock);
+    _record_cosig_locked(&rep_state.slash_sigs, key, voter, ack_sig);
+    size_t count = 0;
+    json_t *sigs = _cosigs_json_locked(&rep_state.slash_sigs, key, &count);
+    pthread_mutex_unlock(&rep_state.lock);
+    peers_read_lock(proc);
+    size_t quorum = proc->protocol.num_peers / 2;
+    peers_read_unlock(proc);
+    bool finalize = count > quorum;
+    json_decref(pending);
     json_decref(payload);
 
     if (finalize)
     {
         json_t *final_json = json_object();
         if (final_json == NULL)
+        {
+            json_decref(sigs);
             return true;
+        }
         json_object_set_new(final_json, "target_uuid",
                             json_string(target_str));
         json_object_set_new(final_json, "floor_score", json_real(floor));
         json_object_set_new(final_json, "epoch", json_integer(epoch));
+        /* The round's identity travels too: a receiver has to re-derive this
+         * designation to check the co-signatures it is being handed. */
+        json_object_set_new(final_json, "slasher_uuid",
+                            json_string(slasher_str ? slasher_str : ""));
+        json_object_set_new(final_json, "reason",
+                            json_string(reason_str ? reason_str : ""));
+        json_object_set(final_json, "sigs", sigs);
         generic_msg_t bcast = {0};
         bcast.type = NET_MESSAGE;
         strncpy(bcast.info.net_msg.process, "reputation", PROC_NAME_LEN);
@@ -2207,6 +2577,7 @@ static bool handle_slash_sign(const process_t *proc, directory_t *queues, generi
         }
         peers_read_unlock(proc);
     }
+    json_decref(sigs);
     return true;
 }
 
@@ -2249,6 +2620,31 @@ static bool handle_slash_final(const process_t *proc, directory_t *queues, gener
                  "Reputation: rejecting slash_final, evidence failed verification\n");
         json_decref(payload);
         return true;
+    }
+    /* Quorum is verified HERE, by us, over the retained co-signatures.
+     * Transport authentication says only that some admitted member sent this;
+     * it says nothing about whether a majority agreed, and a slash floors a
+     * peer into sticky exclusion. A finalizer carrying no verifiable
+     * co-signatures is refused — the flag day noted in reputation.md. */
+    {
+        const char *slasher_str =
+            json_string_value(json_object_get(payload, "slasher_uuid"));
+        uint8_t desig[REP_DESIG_MAX];
+        size_t dlen = (slasher_str != NULL && reason != NULL)
+            ? _slash_designation(slasher_str, target_str, reason, floor, epoch,
+                                 desig, sizeof(desig))
+            : 0;
+        json_t *sigs = json_object_get(payload, "sigs");
+        if (dlen == 0 || !_quorum_met(proc, sigs, desig, dlen))
+        {
+            log_warn(proc->logger,
+                     "Reputation: rejecting slash_final for %s: %zu verified "
+                     "co-signature(s) do not meet quorum\n", target_str,
+                     dlen == 0 ? (size_t)0
+                               : _verified_cosigners(proc, sigs, desig, dlen));
+            json_decref(payload);
+            return true;
+        }
     }
     /* Rehabilitation (explicit-only recovery): release the slash floor and
      * LIFT the score to PREREP_NEUTRAL (above the comm cut-off) so the peer
@@ -2318,6 +2714,10 @@ static bool handle_checkpoint_propose(const process_t *proc, directory_t *queues
     const char *root =
         json_string_value(json_object_get(payload, "root"));
     int64_t epoch = json_integer_value(json_object_get(payload, "epoch"));
+    int64_t first_index =
+        json_integer_value(json_object_get(payload, "first_index"));
+    int64_t count_covered =
+        json_integer_value(json_object_get(payload, "count"));
     if (proposer_str == NULL || root == NULL)
     {
         json_decref(payload);
@@ -2327,15 +2727,24 @@ static bool handle_checkpoint_propose(const process_t *proc, directory_t *queues
     snprintf(key, sizeof(key), "%s:%lld", proposer_str, (long long)epoch);
 
     /* Consensus check: co-sign ONLY if our own committed window produces the
-     * same Merkle root. Record the proposed root as pending either way so the
+     * same Merkle root. Record the proposed round as pending either way so the
      * sign handler (driven by other nodes' co-signs in conformance) can
-     * finalize the agreed value. */
+     * finalize the agreed value. The record carries the window bounds as well
+     * as the root because the designation covers them. */
     char mine[TX_HASH_HEX_LEN + 1];
+    json_t *pending_rec = json_object();
+    if (pending_rec != NULL)
+    {
+        json_object_set_new(pending_rec, "root", json_string(root));
+        json_object_set_new(pending_rec, "first_index",
+                            json_integer(first_index));
+        json_object_set_new(pending_rec, "count", json_integer(count_covered));
+    }
     pthread_mutex_lock(&rep_state.lock);
     transaction_window_root(&rep_state.history, mine);
-    map_set(&rep_state.checkpoint_pending, (map_key_t)key,
-            string_data((string_t)root, strlen(root) + 1));
+    _store_pending_locked(&rep_state.checkpoint_pending, key, pending_rec);
     pthread_mutex_unlock(&rep_state.lock);
+    json_decref(pending_rec);
     bool matches = (strncmp(mine, root, TX_HASH_HEX_LEN + 1) == 0);
     if (!matches)
     {
@@ -2345,11 +2754,24 @@ static bool handle_checkpoint_propose(const process_t *proc, directory_t *queues
         return true;
     }
 
-    /* Co-sign: emit checkpoint_sign back to the proposer. */
+    /* Co-sign: sign the checkpoint designation with our own key and emit
+     * checkpoint_sign back to the proposer, naming ourselves. */
+    const identity_t *self = _resolve_self_identity(proc);
+    uint8_t desig[REP_DESIG_MAX];
+    size_t dlen = _checkpoint_designation(proposer_str, root, epoch,
+                                         first_index, count_covered,
+                                         desig, sizeof(desig));
+    char sig_hex[REP_SIG_HEX_LEN + 1] = {0};
+    if (self == NULL || dlen == 0
+        || _cosign_hex(proc, desig, dlen, sig_hex, sizeof(sig_hex)) != 0)
+    {
+        log_warn(proc->logger,
+                 "Reputation: cannot sign checkpoint_propose; declining to co-sign\n");
+        json_decref(payload);
+        return true;
+    }
     char self_str[UUID_STRING_LEN + 1];
-    uuid_t self_uuid;
-    uuid_clear(self_uuid);
-    uuid_unparse_lower(self_uuid, self_str);
+    uuid_unparse_lower(self->uuid, self_str);
     json_t *sign_json = json_object();
     if (sign_json == NULL)
     {
@@ -2359,6 +2781,7 @@ static bool handle_checkpoint_propose(const process_t *proc, directory_t *queues
     json_object_set_new(sign_json, "proposer_uuid", json_string(proposer_str));
     json_object_set_new(sign_json, "epoch", json_integer(epoch));
     json_object_set_new(sign_json, "signer_uuid", json_string(self_str));
+    json_object_set_new(sign_json, "signature", json_string(sig_hex));
     json_decref(payload);
 
     generic_msg_t sign = {0};
@@ -2387,6 +2810,10 @@ static bool handle_checkpoint_sign(const process_t *proc, directory_t *queues, g
     const char *proposer_str =
         json_string_value(json_object_get(payload, "proposer_uuid"));
     int64_t epoch = json_integer_value(json_object_get(payload, "epoch"));
+    const char *claimed =
+        json_string_value(json_object_get(payload, "signer_uuid"));
+    const char *ack_sig =
+        json_string_value(json_object_get(payload, "signature"));
     if (proposer_str == NULL)
     {
         json_decref(payload);
@@ -2395,34 +2822,82 @@ static bool handle_checkpoint_sign(const process_t *proc, directory_t *queues, g
     char key[UUID_STRING_LEN + 32];
     snprintf(key, sizeof(key), "%s:%lld", proposer_str, (long long)epoch);
 
+    /* Credit the AUTHENTICATED sender, never the payload's claim. */
+    char voter[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, voter);
+    if (claimed != NULL && strncmp(claimed, voter, sizeof(voter)) != 0)
+    {
+        log_warn(proc->logger,
+                 "Reputation: checkpoint_sign claims voter %s but was sent by %s; refused\n",
+                 claimed, voter);
+        json_decref(payload);
+        return true;
+    }
+
     pthread_mutex_lock(&rep_state.lock);
-    int count = 0;
-    data_t *cnt_d = NULL;
-    if (map_get(&rep_state.checkpoint_sigs, (map_key_t)key, &cnt_d) == 0
-        && cnt_d != NULL)
-        data_integer(cnt_d, &count);
-    count += 1;
-    map_set(&rep_state.checkpoint_sigs, (map_key_t)key, integer_data(count));
-    char root[TX_HASH_HEX_LEN + 1] = {0};
-    data_t *root_d = NULL;
-    bool have_root = (map_get(&rep_state.checkpoint_pending, (map_key_t)key,
-                              &root_d) == 0 && root_d != NULL);
-    if (have_root)
-        data_string(root_d, root, sizeof(root));
-    int quorum = rep_state.num_peers / 2;
-    bool finalize = have_root && count > quorum;
+    json_t *pending = _load_pending_locked(&rep_state.checkpoint_pending, key);
     pthread_mutex_unlock(&rep_state.lock);
+    if (pending == NULL)
+    {
+        json_decref(payload);
+        return true;   /* not our round, or already finalized */
+    }
+    char root[TX_HASH_HEX_LEN + 1] = {0};
+    const char *pending_root =
+        json_string_value(json_object_get(pending, "root"));
+    if (pending_root != NULL)
+    {
+        strncpy(root, pending_root, TX_HASH_HEX_LEN);
+        root[TX_HASH_HEX_LEN] = '\0';
+    }
+    int64_t first_index =
+        json_integer_value(json_object_get(pending, "first_index"));
+    int64_t count_covered =
+        json_integer_value(json_object_get(pending, "count"));
+    uint8_t desig[REP_DESIG_MAX];
+    size_t dlen = _checkpoint_designation(proposer_str, root, epoch,
+                                         first_index, count_covered,
+                                         desig, sizeof(desig));
+    if (dlen == 0 || !_verify_cosignature(proc, voter, desig, dlen, ack_sig))
+    {
+        log_warn(proc->logger,
+                 "Reputation: checkpoint_sign co-signature from %s failed "
+                 "verification; not counted\n", voter);
+        json_decref(pending);
+        json_decref(payload);
+        return true;
+    }
+
+    pthread_mutex_lock(&rep_state.lock);
+    _record_cosig_locked(&rep_state.checkpoint_sigs, key, voter, ack_sig);
+    size_t count = 0;
+    json_t *sigs = _cosigs_json_locked(&rep_state.checkpoint_sigs, key, &count);
+    pthread_mutex_unlock(&rep_state.lock);
+    peers_read_lock(proc);
+    size_t quorum = proc->protocol.num_peers / 2;
+    peers_read_unlock(proc);
+    bool finalize = count > quorum;
+    json_decref(pending);
     json_decref(payload);
 
     if (finalize)
     {
         json_t *final_json = json_object();
         if (final_json == NULL)
+        {
+            json_decref(sigs);
             return true;
+        }
         json_object_set_new(final_json, "proposer_uuid",
                             json_string(proposer_str));
         json_object_set_new(final_json, "root", json_string(root));
         json_object_set_new(final_json, "epoch", json_integer(epoch));
+        /* The window bounds travel so a receiver can re-derive the designation
+         * the co-signatures were made over. */
+        json_object_set_new(final_json, "first_index",
+                            json_integer(first_index));
+        json_object_set_new(final_json, "count", json_integer(count_covered));
+        json_object_set(final_json, "sigs", sigs);
         generic_msg_t bcast = {0};
         bcast.type = NET_MESSAGE;
         strncpy(bcast.info.net_msg.process, "reputation", PROC_NAME_LEN);
@@ -2440,6 +2915,7 @@ static bool handle_checkpoint_sign(const process_t *proc, directory_t *queues, g
         }
         peers_read_unlock(proc);
     }
+    json_decref(sigs);
     return true;
 }
 
@@ -2459,10 +2935,39 @@ static bool handle_checkpoint_final(const process_t *proc, directory_t *queues, 
         return false;
     const char *root = json_string_value(json_object_get(payload, "root"));
     int64_t epoch = json_integer_value(json_object_get(payload, "epoch"));
+    const char *proposer_str =
+        json_string_value(json_object_get(payload, "proposer_uuid"));
+    int64_t first_index =
+        json_integer_value(json_object_get(payload, "first_index"));
+    int64_t count_covered =
+        json_integer_value(json_object_get(payload, "count"));
     if (root == NULL)
     {
         json_decref(payload);
         return false;
+    }
+    /* Verify the retained co-signatures before storing the root. This root is
+     * the anchor _verify_slash_evidence measures slash evidence against,
+     * expressly so the root is "not chosen by the accuser" — which only holds
+     * if a quorum is checked here. */
+    {
+        uint8_t desig[REP_DESIG_MAX];
+        size_t dlen = (proposer_str != NULL)
+            ? _checkpoint_designation(proposer_str, root, epoch, first_index,
+                                      count_covered, desig, sizeof(desig))
+            : 0;
+        json_t *sigs = json_object_get(payload, "sigs");
+        if (dlen == 0 || !_quorum_met(proc, sigs, desig, dlen))
+        {
+            log_warn(proc->logger,
+                     "Reputation: rejecting checkpoint_final epoch=%lld: %zu "
+                     "verified co-signature(s) do not meet quorum\n",
+                     (long long)epoch,
+                     dlen == 0 ? (size_t)0
+                               : _verified_cosigners(proc, sigs, desig, dlen));
+            json_decref(payload);
+            return true;
+        }
     }
     pthread_mutex_lock(&rep_state.lock);
     strncpy(rep_state.checkpoint_root, root, TX_HASH_HEX_LEN);

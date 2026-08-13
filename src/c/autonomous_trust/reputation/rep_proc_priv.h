@@ -168,6 +168,14 @@ int reputation_get_peer_reputation(const uuid_t peer_uuid, double *out);
  *  Returns the number emitted. See doc/architecture/app-peer-carrier.md. */
 int reputation_emit_all(const process_t *proc);
 
+/** Slash reasons. The slash designation that co-signers sign covers the reason
+ *  STRING, so these spellings must match Python SlashAttestation.REASON_*
+ *  exactly — a divergence here is a co-signature that verifies on neither side.
+ *  Shared with the conformance adapter, which builds slash payloads. */
+#define REP_SLASH_REASON_SUSTAINED_ANOMALY "sustained_anomaly"
+#define REP_SLASH_REASON_PEER_EXCLUDE      "peer_exclude"
+#define REP_SLASH_REASON_INVALID_TX        "invalid_tx"
+
 #define EREP_PAXOS 253
 DECLARE_ERROR(EREP_PAXOS, "Paxos consensus error");
 
