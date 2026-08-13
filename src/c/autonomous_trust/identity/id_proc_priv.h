@@ -313,6 +313,22 @@ int identity_load_child_groups(process_t *proc, const char *cfg_dir);
  *  _record_child_groups. Returns the number of messages sent; 0 on a leaf. */
 int identity_propagate_child_groups(const process_t *proc, directory_t *queues);
 
+/** Re-derive this node's parent gateway and advertise its position if it moved
+ *  (protocol step 7, ISSUES.md §10.2). Cheap and idempotent, so every input
+ *  change may call it. C twin of Python's _refresh_hierarchy. */
+void identity_refresh_hierarchy(const process_t *proc);
+
+/** Ask the group to state their hierarchy positions. One-shot: a node joining a
+ *  settled mesh would otherwise wait for somebody's next change. C twin of
+ *  Python's _request_hierarchy. */
+void identity_request_hierarchy(const process_t *proc);
+
+/** Write this node's DERIVED parent-gateway uuid into @p out (empty string when
+ *  it is the root of its own cohort), for the `parent_gateway` expected_state
+ *  assertion. Derived on demand: the harness installs ranks and asks, with no
+ *  run loop to tick. Mirrors Python's _derive_parent_gateway. */
+int identity_get_parent_gateway(const process_t *proc, char *out, size_t cap);
+
 /** Emit ONE peer on the app-facing carrier (PEER_OBSERVED via AT_MAIN_QUEUE).
  *  Carries the peer's signing key, its rank from the peer_ranks seam, and
  *  both operator signals; the attendance stamp is zeroed unless the peer is

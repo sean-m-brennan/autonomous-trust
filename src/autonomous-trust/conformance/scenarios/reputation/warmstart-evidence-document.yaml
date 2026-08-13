@@ -1,0 +1,81 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: warmstart-evidence-document
+byte_pinning: false
+description: |
+    Verifiable warm start — the persisted evidence document and the score
+    ceilings it supports (ISSUES.md §10.3, doc/architecture/reputation.md).
+
+    `reputation.cfg.json` records a CONCLUSION and nothing about how it was
+    reached, so reloading it makes trust durable rather than verifiable. The
+    evidence lives beside it in `reputation-history.cfg.json`: the hash-linked
+    committed window plus the quorum-signed checkpoint over it. That file is the
+    ONE artifact both runtimes read — deliberately plain JSON rather than either
+    runtime's config envelope, the same reasoning as the trust ladder (§10.1) —
+    so its shape belongs in this corpus.
+
+    The `evidence_ceiling_of` assertion is the load-bearing half. Verifying that
+    a peer APPEARS in an attested window is not enough: the peer really does
+    transact, so presence alone would still restore a score typed into the score
+    file by hand. The evidence therefore bounds the VALUE — the mean of the
+    counterparty-side scores the window records for that peer, shrunk toward
+    PREREP_NEUTRAL (0.2) by RESTORE_SHRINKAGE_K (3.0). Pinning it across
+    runtimes matters because a silent drift would hand the same peer a different
+    tier on each implementation, with nothing else to show it.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: dave
+    role: acceptor
+
+fixtures:
+  # Three bilateral entries between the two participants, so the window bounds
+  # real participants rather than synthetic per-entry peers.
+  tx_history:
+    dave:
+      - {task_id: w1, p1: alice, p1_score: 0.7, p2: dave, p2_score: 0.5}
+      - {task_id: w2, p1: alice, p1_score: 0.9, p2: dave, p2_score: 0.3}
+      - {task_id: w3, p1: alice, p1_score: 0.6, p2: dave, p2_score: 0.4}
+
+steps:
+  - id: 1
+    from: alice
+    to: dave
+    function: tx committed
+    payload:
+      task_id: w4
+      score: 0.8
+    description: |
+        A `tx committed` broadcast reaches dave. Its purpose here is to make the
+        step dispatch to dave (both adapters snapshot state on dispatch); the
+        entry it creates is one-sided, so it stays OUT of the evidence document
+        and out of the ceiling arithmetic. That is itself the assertion below:
+        an entry no counterparty has agreed to is not evidence of anything yet,
+        and both runtimes must exclude it.
+
+expected_state:
+  dave:
+    evidence_doc:
+      # Pinned so a shape change becomes a refusal to rebuild — which degrades
+      # safely to clamped restoration — rather than a misparse.
+      schema: "1"
+      # Three, not four: the pending entry from step 1 has no index.
+      chain_len: 3
+      # No checkpoint round ran here, so the document carries a null checkpoint:
+      # the honest state after a catch-up, entries present and attestation still
+      # owed.
+      checkpoint_root: ""
+    evidence_ceiling_of:
+      # alice's bound comes from the COUNTERPARTY side of her entries (the same
+      # direction the consensus EMA folds): mean(0.5, 0.3, 0.4) = 0.4, shrunk to
+      # (3*0.4 + 3*0.2) / (3+3) = 0.3.
+      #
+      # Note it lands well below the observed mean. With a three-entry window
+      # the pseudo-count still dominates, which is exactly why a forger cannot
+      # mint a short chain of perfect scores and have it license anything: three
+      # transactions are three data points, not a track record. dave is absent
+      # from this assertion because dave is the node doing the bounding, and its
+      # own score is not a peer judgement.
+      alice: 0.3

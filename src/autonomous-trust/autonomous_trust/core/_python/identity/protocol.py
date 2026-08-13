@@ -51,12 +51,20 @@ class IdentityProtocol(Protocol):
        a. add as branch to history
        b. merge if ok
     6. listen on closed broadcast channel for group updates (address list additions) <- Group
-    7. listen for hierarchy roots
-       - NOT IMPLEMENTED: the gateway hierarchy (parent_gateway, child_groups,
-         child_gateways) is seeded from config at startup, never discovered at
-         runtime. Doing it means new identity messages in both runtimes; it is
-         tracked with the rest of the runtime-hierarchy work in ISSUES §10.2
-         (gateway reputation tree), not as a config deferral.
+    7. listen for hierarchy roots (hierarchy / hierarchy_query)
+       - Each node ADVERTISES its own place in the gateway tree (which cohorts
+         it gateways, which higher-rank node it federates through) on the
+         encrypted group channel when that view changes, and on request so a
+         late joiner converges immediately. Receivers record a peer's claim
+         only if that peer can prove a shared trust anchor.
+       - Our OWN parent is DERIVED, never accepted from others: the
+         highest-rank member of our primary group whose rank exceeds ours and
+         which can prove gateway authority (_derive_parent_gateway). Same rule
+         _discover_child_gateway already applies one level down.
+       - What this does NOT do: hand over a cohort's group key. Child-group
+         KEYS remain operator-provisioned; a runtime cross-group join is a
+         separate question (ISSUES.md §10.2) because the group key is the
+         confidentiality boundary.
 
     Items 3, 4, & 5 are concurrent
     """
@@ -93,6 +101,20 @@ class IdentityProtocol(Protocol):
     # See doc/architecture/gateway-reputation-tree.md.
     roster_req = 'subtree_roster_query'  # msg.obj <- json {'requestor': uuid_str}
     roster_resp = 'subtree_roster_response'  # msg.obj <- json {'members': [...], 'child_gateways': [uuid_str]}
+    # Runtime hierarchy roots (protocol step 7, ISSUES.md §10.2). A node states
+    # its own position in the gateway tree -- which cohorts it gateways, and
+    # which higher-rank node it federates through -- so the mesh AGREES on the
+    # topology instead of each node inferring it privately. Sent on the
+    # encrypted group channel when our own view changes, and on request so a
+    # late joiner converges without waiting for the next change.
+    #
+    # Deliberately carries NO group key and confers no membership: a peer's
+    # advertisement is a claim about ITSELF, recorded only when that peer can
+    # prove a shared trust anchor (_gateway_authorized). Acquiring a second
+    # cohort's key at runtime is a separate, bigger question (§10.2) and is not
+    # this message.
+    hierarchy = 'hierarchy_root'      # msg.obj <- json {'node','parent','children','rank'}
+    hierarchy_req = 'hierarchy_query'  # msg.obj <- json {'requestor': uuid_str}
     # Local-only IPC (no wire egress). ReputationProcess emits these to
     # CfgIds.identity when a peer's reputation crosses a TIER_FLOORS
     # boundary so IdentityProcess can update the peer's trust tier on

@@ -295,6 +295,21 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # behaviour is identical to today. Seeded (group_child_*.cfg.json may
         # name a gateway) or supplied by a test/adapter fixture.
         self.child_gateways: dict[str, str] = {}
+        # Runtime hierarchy roots (protocol step 7). peer_hierarchy records what
+        # each peer says about ITSELF -- {uuid: {parent, children, rank}} --
+        # recorded only from peers that prove a shared anchor. It is a stronger
+        # signal than rank inference for child-gateway selection: a peer that
+        # states it gateways cohort X is better evidence than "it happens to be
+        # the highest-rank member of X". _last_hierarchy_claim suppresses
+        # re-broadcasting an unchanged claim (the group_update flood lesson);
+        # _hierarchy_requested makes the post-admission query one-shot.
+        self.peer_hierarchy: dict[str, dict] = {}
+        # Member-uuid -> topology rank, the seam _member_rank falls back to when
+        # a cohort member is known by address but not yet by Identity. C twin:
+        # protocol.peer_ranks (see set_peer_rank / _member_rank).
+        self.peer_ranks: dict[str, int] = {}
+        self._last_hierarchy_claim: Optional[dict] = None
+        self._hierarchy_requested = False
         # Roster-privacy opt-out (AT config option AT_ROSTER_PRIVATE). When
         # set, this node refuses to disclose its subtree to a roster query:
         # handle_roster_request replies with a `private` marker carrying no
@@ -340,6 +355,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.id_query, self.handle_identity_query)
         self.protocol.register_handler(IdentityProtocol.id_response, self.handle_identity_response)
         self.protocol.register_handler(IdentityProtocol.roster_req, self.handle_roster_request)
+        self.protocol.register_handler(IdentityProtocol.hierarchy, self.handle_hierarchy)
+        self.protocol.register_handler(IdentityProtocol.hierarchy_req,
+                                       self.handle_hierarchy_request)
         self.protocol.register_handler(IdentityProtocol.attest_req, self.handle_attest_request)
         self.protocol.register_handler(IdentityProtocol.attest_resp, self.handle_attest_response)
         self.protocol.register_handler(IdentityProtocol.attest_trigger, self.handle_attest_trigger)
@@ -451,6 +469,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # _peer_accepted at debug level, which is enough.
         self.logger.verbose('Add group')
         self._remember_activity(queues, CfgIds.group, (self.group, self._history))
+        # Our position in the tree is derived from the group's membership and
+        # ranks, so it can move whenever the group does (protocol step 7).
+        self._refresh_hierarchy(queues)
 
     def _record_child_groups(self, queues):
         """Fan the current child-group set out to the other processes.
@@ -469,6 +490,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self.update(ChildGroupSet(self.child_groups), queues)
         except Exception as err:
             self.logger.warning('Could not propagate child groups: %s' % err)
+        # The set we gateway is half of what we advertise, so state it (step 7).
+        self._advertise_hierarchy(queues)
 
     def _adopt_child_group(self, queues, group, peer_idents=None):
         """Adopt a foreign cohort as one of our child groups (gateway).
@@ -580,19 +603,216 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         return [by_uuid[k] for k in sorted(by_uuid)]
 
     def _member_rank(self, uuid):
-        """A peer's rank for child-gateway discovery: operational
-        ``effective_rank`` if present, else the static ``_rank``, else 0
-        (unknown). Mirrors the welcomer-selection rank read (idprocess ~2082)."""
+        """A peer's rank for hierarchy derivation and child-gateway discovery:
+        operational ``effective_rank`` if present, else the static ``_rank``,
+        else the ``peer_ranks`` seam, else 0 (unknown). Mirrors the
+        welcomer-selection rank read (idprocess ~2082).
+
+        The ``peer_ranks`` fallback exists because a group's membership is an
+        ADDRESS MAP, not a roster of Identities: a node can know a member of its
+        cohort — and need that member's rank to decide who leads it — before it
+        holds that member's Identity object. C has carried the same seam from
+        the start (``protocol.peer_ranks``, because its peers are
+        `public_identity_t`, which drops rank); Python inferring rank only from
+        a materialized peer meant the two runtimes could read different ranks
+        from the same group."""
         try:
             peer = self.peers.find_by_uuid(uuid) if self.peers else None
         except Exception:
             peer = None
-        if peer is None:
-            return 0
-        r = getattr(peer, 'effective_rank', None)
+        if peer is not None:
+            r = getattr(peer, 'effective_rank', None)
+            if r is None:
+                r = getattr(peer, '_rank', 0)
+            if r:
+                return r
+        return getattr(self, 'peer_ranks', {}).get(str(uuid), 0) or 0
+
+    def set_peer_rank(self, uuid, rank):
+        """Record a member's topology rank on the ``peer_ranks`` seam. C twin:
+        identity_set_peer_rank."""
+        if not hasattr(self, 'peer_ranks'):
+            self.peer_ranks = {}
+        self.peer_ranks[str(uuid)] = int(rank or 0)
+
+    # --- Runtime hierarchy roots (protocol step 7, ISSUES.md §10.2) ----------
+
+    def _own_rank(self) -> int:
+        """This node's own rank, read the same way a peer's is."""
+        r = getattr(self.identity, 'effective_rank', None)
         if r is None:
-            r = getattr(peer, '_rank', 0)
+            r = getattr(self.identity, '_rank', 0)
         return r or 0
+
+    def _derive_parent_gateway(self):
+        """The higher-rank node we federate through, or None if we are the root
+        of our own primary cohort.
+
+        Derived, never accepted from a peer: our parent is our own conclusion,
+        and a node that could name itself our parent could insert itself into
+        every rollup we perform. The rule is ``_discover_child_gateway``'s, with
+        one difference that matters — a candidate must out-rank US. One level
+        down we are picking somebody else's leader; here we are asking who
+        leads us, and the highest-rank member of a cohort we top is nobody's
+        parent but its own.
+
+        Candidates must also prove gateway authority for a boundary we share
+        (:meth:`_gateway_authorized`), so a peer holding only a foreign
+        agency's credential is never federated through — §10.5's rule, applied
+        upward.
+        """
+        if self.group is None:
+            return None
+        amap = getattr(self.group, '_address_map', None) or {}
+        self_uuid = str(self.identity.uuid)
+        own_rank = self._own_rank()
+        best, best_key = None, None
+        for uuid in amap:
+            u = str(uuid)
+            if u == self_uuid:
+                continue
+            rank = self._member_rank(u)
+            if rank <= own_rank:
+                continue
+            if not self._gateway_authorized(u):
+                continue
+            key = (rank, u)
+            if best_key is None or key > best_key:
+                best, best_key = u, key
+        return best
+
+    def _hierarchy_claim(self) -> dict:
+        """This node's own place in the tree, as it goes on the wire.
+
+        A claim about ourselves only: which cohorts we gateway, whom we
+        federate through, and our rank (so a receiver can sanity-check the
+        claim against what it independently observes). No group key, no
+        membership grant.
+        """
+        return {
+            'node': str(self.identity.uuid),
+            'parent': self.parent_gateway or '',
+            'children': sorted(str(k) for k in self.child_groups),
+            'rank': int(self._own_rank()),
+        }
+
+    def _advertise_hierarchy(self, queues, to_whom=None):
+        """State our place in the tree on the encrypted group channel.
+
+        Emitted when our own view CHANGES, and on request — never in reply to
+        another node's advertisement. Echoing a peer's advertisement is what
+        turns a topology broadcast into a flood; the equal-size
+        ``group_update`` storm is the standing lesson (see
+        handle_group_update's tiebreaker).
+        """
+        if self.group is None:
+            return
+        claim = self._hierarchy_claim()
+        if to_whom is None and claim == self._last_hierarchy_claim:
+            return   # nothing changed; a re-broadcast tells nobody anything
+        try:
+            msg = Message(self.name, IdentityProtocol.hierarchy,
+                          to_json_string(claim), to_whom or self.group,
+                          from_whom=self.identity)
+            queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+            if to_whom is None:
+                self._last_hierarchy_claim = claim
+        except Exception as err:
+            self.logger.warning('Could not advertise hierarchy: %s' % err)
+
+    def _refresh_hierarchy(self, queues):
+        """Re-derive our parent and advertise if our position moved.
+
+        Cheap and idempotent, so it can be called from every place that
+        changes the inputs: the group, the child-group set, or a peer's rank.
+        """
+        parent = self._derive_parent_gateway()
+        if parent != self.parent_gateway:
+            self.parent_gateway = parent
+            self.logger.info('Hierarchy: parent gateway is %s' %
+                             (parent[:8] if parent else 'none (we are root)'))
+        self._advertise_hierarchy(queues)
+
+    def handle_hierarchy(self, queues, message):
+        """Record a peer's claim about its own place in the tree.
+
+        Gated on proved gateway authority: an unauthorized peer's claim is
+        dropped rather than stored, because the recorded value is what
+        ``_child_gateway_uuids`` recurses into — a peer that could install
+        itself there would receive subtree-roster queries for a cohort it has
+        no standing in.
+
+        The claim is about the SENDER only. A claim naming somebody else's
+        parent, or naming us, changes nothing here: our own parent is derived
+        (:meth:`_derive_parent_gateway`), never accepted.
+        """
+        if message.function != IdentityProtocol.hierarchy:
+            return False
+        if not message.verified:
+            self.logger.warning('Rejecting unverified hierarchy from %s' %
+                                message.from_whom)
+            return True
+        try:
+            payload = message.obj
+            if isinstance(payload, str):
+                payload = from_json_string(payload)
+            if not isinstance(payload, dict):
+                return True
+            sender = str(getattr(message.from_whom, 'uuid', '') or '')
+            claimed = str(payload.get('node', '') or '')
+            if not sender:
+                return True
+            if claimed and claimed != sender:
+                # Same reasoning as the co-signature attribution in reputation:
+                # the two disagreeing is either a bug or an attempt, and
+                # neither should quietly become a recorded fact.
+                self.logger.warning(
+                    'Hierarchy claim from %s names %s; refused' %
+                    (sender[:8], claimed[:8]))
+                return True
+            if not self._gateway_authorized(sender):
+                self.logger.debug(
+                    'Hierarchy claim from %s not recorded: no proved shared '
+                    'anchor' % sender[:8])
+                return True
+            children = [str(c) for c in (payload.get('children') or [])]
+            self.peer_hierarchy[sender] = {
+                'parent': str(payload.get('parent', '') or '') or None,
+                'children': children,
+                'rank': int(payload.get('rank', 0) or 0),
+            }
+            self.logger.debug('Hierarchy: %s gateways %d cohort(s)' %
+                              (sender[:8], len(children)))
+        except Exception as err:
+            self.logger.warning('Malformed hierarchy claim: %s' % err)
+        return True
+
+    def handle_hierarchy_request(self, queues, message):
+        """Answer a hierarchy query with our own claim, addressed to the asker.
+
+        The query exists so a late joiner converges at once: advertisements
+        fire on change, and a node that joins a settled mesh would otherwise
+        wait for the next one.
+        """
+        if message.function != IdentityProtocol.hierarchy_req:
+            return False
+        if not message.verified:
+            return True
+        self._advertise_hierarchy(queues, to_whom=message.from_whom)
+        return True
+
+    def _request_hierarchy(self, queues):
+        """Ask the group to state their positions (once, after admission)."""
+        if self.group is None or self._hierarchy_requested:
+            return
+        self._hierarchy_requested = True
+        try:
+            msg = Message(self.name, IdentityProtocol.hierarchy_req,
+                          to_json_string({'requestor': str(self.identity.uuid)}),
+                          self.group, from_whom=self.identity)
+            queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+        except Exception as err:
+            self.logger.warning('Could not query hierarchy: %s' % err)
 
     def _own_zta_anchors(self) -> set:
         """Anchor names OUR OWN credentials verify against. Computed locally, once.
@@ -677,18 +897,51 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         """Node uuids of the child gateways a full-subtree roster recurses into
         — one per gatewayed child group, **discovered by rank** (the highest-rank
         member of the group, excluding self; see :meth:`_discover_child_gateway`).
-        An explicit ``self.child_gateways[cg]`` entry overrides discovery (tests /
-        pinned topologies). Deduped, order-stable. Empty when this node gateways
-        no deeper gateways — a roster query is then purely local. See
+        Three sources, most-authoritative first: an explicit
+        ``self.child_gateways[cg]`` entry (tests / pinned topologies), then a
+        peer's own ADVERTISED claim to gateway that cohort
+        (``self.peer_hierarchy``, protocol step 7), then rank discovery. The
+        advertisement outranks inference for the obvious reason — a node saying
+        "I gateway cohort X" is direct evidence, where "it is the highest-rank
+        member of X" is a guess that happens to be right most of the time. Only
+        claims from peers that proved a shared anchor are ever recorded, so this
+        cannot be used to inject a recursion target.
+
+        Deduped, order-stable. Empty when this node gateways no deeper
+        gateways — a roster query is then purely local. See
         doc/architecture/gateway-reputation-tree.md."""
         self_uuid = str(self.identity.uuid) if self.identity is not None else None
         out = []
         for cg_uuid, group in self.child_groups.items():
             explicit = self.child_gateways.get(cg_uuid)
-            gw = str(explicit) if explicit else self._discover_child_gateway(group, self_uuid)
+            gw = str(explicit) if explicit else self._advertised_child_gateway(cg_uuid)
+            if not gw:
+                gw = self._discover_child_gateway(group, self_uuid)
             if gw and gw not in out:
                 out.append(gw)
         return out
+
+    def _advertised_child_gateway(self, cg_uuid):
+        """The peer that has ADVERTISED it gateways ``cg_uuid``, or None.
+
+        Ties (two peers claiming the same cohort — a legitimately redundant
+        gateway pair, or one of them wrong) break by the same
+        highest-rank-then-greater-uuid rule rank discovery uses, so the choice
+        stays deterministic and identical in C."""
+        self_uuid = str(self.identity.uuid) if self.identity is not None else None
+        best, best_key = None, None
+        # getattr, not attribute access: these helpers stay usable on a
+        # lightweight stand-in with no full __init__ behind it, the same
+        # convention _gateway_authorized documents.
+        for uuid, claim in getattr(self, 'peer_hierarchy', {}).items():
+            if uuid == self_uuid:
+                continue
+            if str(cg_uuid) not in (claim.get('children') or []):
+                continue
+            key = (self._member_rank(uuid), uuid)
+            if best_key is None or key > best_key:
+                best, best_key = uuid, key
+        return best
 
     def _roster_response(self):
         """This node's roster-query answer as a plain dict: ``{'members',
@@ -3525,6 +3778,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     # hold an address for but no Identity (cold/late joiner;
                     # see _periodic_identity_resync + layer 3 memory).
                     self._periodic_identity_resync(queues)
+                    # Runtime hierarchy roots (protocol step 7): ask the group
+                    # to state their positions once (a node joining a settled
+                    # mesh would otherwise wait for somebody's next change),
+                    # and re-derive our own, which moves when ranks do. Both
+                    # are quiet no-ops on a converged leaf.
+                    self._request_hierarchy(queues)
+                    self._refresh_hierarchy(queues)
 
                 # Every iteration, not interval-gated: an attended-now pull
                 # must not outlive its deadline, in either direction — a pull

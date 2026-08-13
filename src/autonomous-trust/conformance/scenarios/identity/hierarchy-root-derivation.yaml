@@ -1,0 +1,90 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: hierarchy-root-derivation
+byte_pinning: false
+description: |
+    Runtime hierarchy roots — identity protocol step 7 (ISSUES.md §10.2).
+
+    The gateway hierarchy used to exist only in seeded config: `parent_gateway`
+    was initialized and never assigned. It is now DERIVED at runtime, and this
+    pins that derivation cross-language, because the two runtimes disagreeing
+    would put the same node under different parents — each side would roll its
+    subtree up to a different place while both looked internally consistent.
+
+    The rule: our parent is the highest-rank member of our primary group whose
+    rank EXCEEDS ours and which can prove gateway authority for a boundary we
+    share, ties broken by the lexicographically greater uuid. The rank
+    comparison is the one place this differs from child-gateway discovery
+    (pinned by subtree-member-roster): there we pick somebody else's leader,
+    here we ask who leads us, so the highest-rank member of a cohort we top is
+    nobody's parent but its own.
+
+    Three participants in one cohort, ranks 1 / 3 / 7:
+      * `low` (rank 1) derives `high` — the highest-rank superior, not the
+        merely-higher `mid`;
+      * `mid` (rank 3) derives `high`;
+      * `high` (rank 7) derives NOTHING — it tops the cohort and is the root.
+
+    Deliberately NOT pinned here: any group key movement. The advertisement that
+    accompanies this derivation carries no key and confers no membership, so
+    there is nothing key-shaped for a scenario to observe. A runtime cross-group
+    join is a separate question precisely because the group key is the
+    confidentiality boundary.
+
+    Both adapters recognize the `ranks` fixture (the topology rank each
+    participant has, applied to its own identity and to every peer's view of it)
+    and expose the derived parent as `parent_gateway`, mapped back to a
+    participant id so the check does not depend on uuid derivation.
+
+participants:
+  - id: low
+    role: border_guard
+  - id: mid
+    role: border_guard
+  - id: high
+    role: border_guard
+
+fixtures:
+  # One shared cohort, so every node sees the same membership and only rank
+  # distinguishes them.
+  # A mapping, not `true`: the C adapter's shared_group fixture takes an
+  # object (an optional pinned uuid), so the boolean form is Python-only.
+  shared_group: {}
+  ranks:
+    low: 1
+    mid: 3
+    high: 7
+
+steps:
+  # One step per node, because both adapters snapshot the DISPATCH TARGET: a
+  # single step would leave the other two participants unobserved on the C side
+  # while Python checked all three, and the pin would be half a pin.
+  - id: 1
+    from: low
+    to: low
+    function: trigger_hierarchy
+    description: Derive on `low` (rank 1) — expects the highest superior.
+  - id: 2
+    from: mid
+    to: mid
+    function: trigger_hierarchy
+    description: Derive on `mid` (rank 3) — the same parent, not `low`.
+  - id: 3
+    from: high
+    to: high
+    function: trigger_hierarchy
+    description: |
+        Derive on `high` (rank 7). No wire traffic is asserted anywhere here:
+        the advertisement restates the derived value, and what matters
+        cross-language is the value itself.
+
+expected_state:
+  low:
+    parent_gateway: high
+  mid:
+    parent_gateway: high
+  high:
+    # Tops its own cohort, so it is nobody's child. An empty string, not the
+    # next-highest member — that is the rank comparison this pins.
+    parent_gateway: ""
