@@ -23,6 +23,9 @@ from queue import Empty, Full
 from uuid import UUID
 from dataclasses import dataclass
 
+from nacl.encoding import HexEncoder
+from nacl.exceptions import BadSignatureError
+
 from ..network import Message, Network
 from ..processes import Process, ProcMeta
 from ..config import Configuration, from_json_string, to_json_string
@@ -373,9 +376,13 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # short-circuit (forcing re-earn from the punished regime) is lost on
         # restart; the exclusion itself survives.
         self._slashed: dict[str, tuple] = {}
-        # Proposer-side co-signature accumulation: slash-key -> set of
-        # voter-uuid-str. Seeded with the slasher itself on initiation.
-        self._slash_sigs: dict[tuple, set] = {}
+        # Proposer-side co-signature accumulation: slash-key -> {voter-uuid-str:
+        # detached hex signature over the attestation's designation}. Seeded
+        # with the slasher's OWN signature on initiation. Signatures, not bare
+        # uuids: the map is what travels on slash_final, and a receiver that
+        # cannot verify a co-signature must not count it (see
+        # _verified_cosigners).
+        self._slash_sigs: dict[tuple, dict] = {}
         # Proposer-side pending attestations awaiting quorum: key -> attestation.
         self._slash_pending: dict[tuple, SlashAttestation] = {}
         # Dedup for finalized slashes (FIFO bounded), so a re-broadcast
@@ -391,10 +398,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # gateway parent / slash adjudicator verifies inclusion proofs
         # against). None until the first checkpoint finalizes. Volatile.
         self._checkpoint: 'Checkpoint | None' = None
-        # Proposer-side co-signature accumulation: checkpoint-key -> set of
-        # voter-uuid-str (only members whose own window_root matched). Seeded
-        # with the proposer itself on initiation.
-        self._checkpoint_sigs: dict[tuple, set] = {}
+        # Proposer-side co-signature accumulation: checkpoint-key ->
+        # {voter-uuid-str: detached hex signature over the checkpoint's
+        # designation}, holding only members whose own window_root matched.
+        # Seeded with the proposer's own signature on initiation; the map
+        # travels on checkpoint_final and is re-verified by each receiver.
+        self._checkpoint_sigs: dict[tuple, dict] = {}
         # Proposer-side pending checkpoints awaiting quorum: key -> Checkpoint.
         self._checkpoint_pending: dict[tuple, Checkpoint] = {}
         # Dedup for finalized checkpoints (FIFO bounded) so a re-broadcast
@@ -926,6 +935,104 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         mirroring handle_accepted."""
         return self._quorum_for_group(group_uuid)
 
+    # ----- Quorum co-signatures (slash + checkpoint) -----------------------
+    # A three-phase quorum round is only worth what its RECEIVERS can check.
+    # Before this, the co-signature bytes were collected and thrown away:
+    # handle_*_sign credited the voter uuid CLAIMED in the payload, the
+    # finalizer broadcast ``sigs={}``, and handle_*_final applied the decision
+    # on transport authentication alone. So any single admitted member could
+    # finalize whatever it liked -- and because a slash floors a peer below
+    # COMM_CUTOFF into exclusion that is sticky (recovery only via explicit
+    # REASON_REHABILITATE), that was an insider primitive for permanently
+    # excluding any peer. Signatures are now retained, attributed to the
+    # authenticated sender, and verified by every receiver. See
+    # doc/architecture/reputation.md (Quorum attestation).
+    #
+    # Signature form follows the partition-probe idiom (idprocess.py): the
+    # signer emits ``identity.sign(designation).signature`` as ASCII hex, and
+    # the verifier hex-decodes and calls the raw-bytes
+    # ``signature.public.verify`` -- Identity.verify's two-arg form
+    # double-encodes under nacl.
+
+    @staticmethod
+    def _detached_sig(identity, designation):
+        """This node's detached signature over ``designation``, ASCII hex."""
+        return identity.sign(designation).signature.decode('ascii')
+
+    def _cosigner_identity(self, voter_uuid):
+        """Resolve a co-signer uuid to the Identity holding its public key:
+        self first (a proposer counts its own signature), then the peer
+        roster. None when the claimed voter is unknown to us -- an unknown
+        voter's signature cannot be verified, so it cannot count."""
+        key = str(voter_uuid)
+        if key == str(self.identity.uuid):
+            return self.identity
+        for peer in self.peers.all:
+            if str(peer.uuid) == key:
+                return peer
+        return None
+
+    def _verify_cosignature(self, designation, voter_uuid, sig) -> bool:
+        """True iff ``sig`` is ``voter_uuid``'s signature over
+        ``designation``. Any malformed / unknown / bad-signature case is
+        False: a co-signature that cannot be checked must never be counted."""
+        ident = self._cosigner_identity(voter_uuid)
+        if ident is None or sig is None:
+            return False
+        try:
+            if isinstance(sig, str):
+                sig = sig.encode('ascii')
+            ident.signature.public.verify(designation, HexEncoder.decode(sig))
+        except (BadSignatureError, ValueError, TypeError, AttributeError):
+            return False
+        return True
+
+    def _verified_cosigners(self, designation, sigs) -> set:
+        """The DISTINCT voters in ``sigs`` whose signature over
+        ``designation`` verifies against a key we hold. Counting the set of
+        verified signers -- rather than tallying arriving messages -- is what
+        makes one peer's replayed signature worth exactly one vote."""
+        if not isinstance(sigs, dict):
+            return set()
+        return {str(voter) for voter, sig in sigs.items()
+                if self._verify_cosignature(designation, voter, sig)}
+
+    def _attributed_voter(self, message, claimed, where: str):
+        """The uuid-str a ``*_sign`` ack may be credited to, or None.
+
+        The vote belongs to the AUTHENTICATED sender (``message.from_whom``),
+        never to the uuid the payload claims. Measured: this is defense in
+        depth, not the primary check -- ``_verify_cosignature`` already bounds
+        the tally to signatures the sender could actually obtain. What it adds
+        is the case where those differ: co-signatures are broadcast on
+        ``*_final`` and so are not secret, and binding the vote to the sender
+        stops a harvested genuine signature from being relayed under its
+        signer's name by somebody else. It also catches the plain bug of a node
+        mislabelling its own ack. A claim that disagrees with the sender is
+        refused rather than silently re-attributed: the two disagreeing is
+        either a bug or an attempt, and neither should quietly become a vote."""
+        sender = getattr(message.from_whom, 'uuid', None)
+        if sender is None:
+            self.logger.warning(
+                '%s: unattributable ack (no sender identity); not counted',
+                where)
+            return None
+        sender = str(sender)
+        if claimed is not None and str(claimed) != sender:
+            self.logger.warning(
+                '%s: ack claims voter %s but was sent by %s; refused',
+                where, str(claimed)[:8], sender[:8])
+            return None
+        return sender
+
+    def _quorum_met(self, designation, sigs, group_uuid=None) -> bool:
+        """Receiver-side quorum test over retained co-signatures: more than
+        ``_quorum_for_group`` distinct voters must have signed the exact bytes
+        this node re-derives. Sized against OUR OWN view of the group, so the
+        finalizer cannot also choose the bar it has to clear."""
+        return len(self._verified_cosigners(designation, sigs)) > \
+            self._quorum_for_group(group_uuid)
+
     def _slash_target_ok(self, attestation) -> bool:
         """Reject self-slash adoption and degenerate slasher==target."""
         if str(attestation.target_uuid) == str(self.identity.uuid):
@@ -1080,7 +1187,18 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     att.signature = None
                 key = att.key()
                 self._slash_pending[key] = att
-                self._slash_sigs[key] = {str(self.identity.uuid)}
+                # Seed the co-signature map with OUR OWN detached signature,
+                # not a bare uuid: every entry that will travel on
+                # slash_final has to be verifiable by its recipients, the
+                # proposer's included.
+                self._slash_sigs[key] = {}
+                try:
+                    self._slash_sigs[key][str(self.identity.uuid)] = \
+                        self._detached_sig(self.identity, att.designation)
+                except Exception:
+                    self.logger.error(
+                        'forward_slash: cannot sign own attestation; '
+                        'this slash cannot reach quorum')
                 # Self-apply now so the detector's own consensus view (the
                 # dashboard) floors the target immediately, independent of
                 # co-sign round-trip latency.
@@ -1126,9 +1244,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     'Declining slash_propose: evidence failed verification')
                 return True
             try:
-                sig = self.identity.sign(att.designation)
+                sig = self._detached_sig(self.identity, att.designation)
             except Exception:
-                sig = None
+                self.logger.error(
+                    'handle_slash_propose: cannot sign; declining to co-sign')
+                return True
             tgt, epoch = att.key()
             ack = (tgt, epoch, str(self.identity.uuid), sig)
             try:
@@ -1149,15 +1269,26 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             payload = message.obj
             if isinstance(payload, str):
                 payload = from_json_string(payload)
-            tgt, epoch, voter, _sig = payload
+            tgt, epoch, claimed, sig = payload
             key = (str(tgt), int(epoch))
             att = self._slash_pending.get(key)
             if att is None:
                 return True  # not our round, or already finalized
-            self._slash_sigs.setdefault(key, set()).add(str(voter))
+            voter = self._attributed_voter(message, claimed, 'slash_sign')
+            if voter is None:
+                return True
+            # A co-signature that does not verify is not a vote. Without this
+            # the tally counted assertions rather than signatures.
+            if not self._verify_cosignature(att.designation, voter, sig):
+                self.logger.warning(
+                    'handle_slash_sign: co-signature from %s failed '
+                    'verification; not counted', voter[:8])
+                return True
+            self._slash_sigs.setdefault(key, {})[voter] = sig
             grp_uuid = str(self.group.uuid) if self.group is not None else None
             if len(self._slash_sigs[key]) > self._slash_quorum(grp_uuid):
-                signed = SignedSlash(attestation=att, sigs={})
+                signed = SignedSlash(attestation=att,
+                                     sigs=dict(self._slash_sigs[key]))
                 try:
                     msg = Message(
                         self.name, ReputationProtocol.slash_final,
@@ -1200,6 +1331,20 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             if not self._verify_slash_evidence(att):
                 self.logger.warning(
                     'Rejecting slash_final: evidence failed verification')
+                return True
+            # Quorum is verified HERE, by us, against the retained
+            # co-signatures. Transport authentication says only that some
+            # admitted member sent this; it says nothing about whether a
+            # majority agreed, and a slash floors a peer into sticky
+            # exclusion. A finalizer carrying no verifiable co-signatures is
+            # refused -- the flag day noted in reputation.md.
+            sigs = getattr(signed, 'sigs', None)
+            if not self._quorum_met(att.designation, sigs):
+                self.logger.warning(
+                    'Rejecting slash_final for %s: %d verified co-signature(s) '
+                    'do not meet quorum',
+                    str(att.target_uuid)[:8],
+                    len(self._verified_cosigners(att.designation, sigs)))
                 return True
             self._apply_slash(att)
             return True
@@ -1245,7 +1390,17 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     ckpt.signature = None
                 key = ckpt.key()
                 self._checkpoint_pending[key] = ckpt
-                self._checkpoint_sigs[key] = {str(self.identity.uuid)}
+                # Our own detached signature, for the same reason as
+                # forward_slash: every entry travelling on checkpoint_final
+                # must be verifiable by its recipients.
+                self._checkpoint_sigs[key] = {}
+                try:
+                    self._checkpoint_sigs[key][str(self.identity.uuid)] = \
+                        self._detached_sig(self.identity, ckpt.designation)
+                except Exception:
+                    self.logger.error(
+                        'forward_checkpoint: cannot sign own checkpoint; '
+                        'this checkpoint cannot reach quorum')
                 # Self-store immediately so a single-node group (or the
                 # originator's own view) has a finalized checkpoint without a
                 # co-sign round-trip, matching forward_slash's self-apply.
@@ -1302,9 +1457,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     'checkpoint_propose: window_root mismatch, declining')
                 return True
             try:
-                sig = self.identity.sign(ckpt.designation)
+                sig = self._detached_sig(self.identity, ckpt.designation)
             except Exception:
-                sig = None
+                self.logger.error(
+                    'handle_checkpoint_propose: cannot sign; '
+                    'declining to co-sign')
+                return True
             proposer, epoch = ckpt.key()
             ack = (proposer, epoch, str(self.identity.uuid), sig)
             try:
@@ -1325,15 +1483,24 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             payload = message.obj
             if isinstance(payload, str):
                 payload = from_json_string(payload)
-            proposer, epoch, voter, _sig = payload
+            proposer, epoch, claimed, sig = payload
             key = (str(proposer), int(epoch))
             ckpt = self._checkpoint_pending.get(key)
             if ckpt is None:
                 return True  # not our round, or already finalized
-            self._checkpoint_sigs.setdefault(key, set()).add(str(voter))
+            voter = self._attributed_voter(message, claimed, 'checkpoint_sign')
+            if voter is None:
+                return True
+            if not self._verify_cosignature(ckpt.designation, voter, sig):
+                self.logger.warning(
+                    'handle_checkpoint_sign: co-signature from %s failed '
+                    'verification; not counted', voter[:8])
+                return True
+            self._checkpoint_sigs.setdefault(key, {})[voter] = sig
             grp_uuid = str(self.group.uuid) if self.group is not None else None
             if len(self._checkpoint_sigs[key]) > self._checkpoint_quorum(grp_uuid):
-                signed = SignedCheckpoint(checkpoint=ckpt, sigs={})
+                signed = SignedCheckpoint(
+                    checkpoint=ckpt, sigs=dict(self._checkpoint_sigs[key]))
                 try:
                     msg = Message(
                         self.name, ReputationProtocol.checkpoint_final,
@@ -1368,8 +1535,19 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             # The proposer already self-stored; skip the bounce-back.
             if str(ckpt.proposer_uuid) == str(self.identity.uuid):
                 return True
-            # Phase 3 will verify signed.sigs against known member identities;
-            # for now trust the transport-verified finalizer.
+            # Verify the retained co-signatures against member identities we
+            # hold. This root is the anchor _verify_slash_evidence measures
+            # slash evidence against, precisely so the root is "not chosen by
+            # the accuser" -- which only holds if a quorum is checked here. A
+            # checkpoint_final without verifiable co-signatures is refused.
+            sigs = getattr(signed, 'sigs', None)
+            if not self._quorum_met(ckpt.designation, sigs):
+                self.logger.warning(
+                    'Rejecting checkpoint_final epoch=%s from %s: %d verified '
+                    'co-signature(s) do not meet quorum', str(ckpt.epoch),
+                    str(ckpt.proposer_uuid)[:8],
+                    len(self._verified_cosigners(ckpt.designation, sigs)))
+                return True
             self._store_checkpoint(ckpt)
             return True
         return False

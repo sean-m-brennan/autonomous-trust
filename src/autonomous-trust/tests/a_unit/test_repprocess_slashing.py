@@ -20,8 +20,9 @@ at the top of the scoring functions, bypassing the slow consensus EMA —
 the principled fix for the dod_mission "mq800 stuck at 0.5" bug. Also
 exercises the propose -> sign -> final quorum flow across two processes.
 """
+import hashlib
 import queue
-from uuid import uuid4
+from uuid import UUID, uuid4
 from unittest.mock import MagicMock
 
 import pytest
@@ -31,19 +32,44 @@ from autonomous_trust.core.reputation.reputation import (
     TransactionScore, SlashAttestation, SignedSlash, Checkpoint,
 )
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
+from autonomous_trust.core._python.identity.identity import Identity
+from autonomous_trust.core._python.identity.sign import Signature
+from autonomous_trust.core._python.identity.encrypt import Encryptor
 from autonomous_trust.core.network.message import Message
 from autonomous_trust.core.processes import ProcessTracker
 from autonomous_trust.core.system import CfgIds
 from autonomous_trust.core.config import to_json_string, from_json_string
 
 
-def _make_rep_process(self_uuid=None):
+def _identity(tag: str, uuid=None) -> Identity:
+    """A real identity with a signing key DISTINCT per tag.
+
+    Real keys because slash co-signatures are now verified by every receiver:
+    a slash floors a peer into sticky exclusion, so the tally has to count
+    signatures rather than assertions. Distinct keys per tag keep the negative
+    controls honest (one member's signature must fail against another's key).
+    Deterministic, so a failure reproduces. ``Identity.uuid`` is read-only,
+    hence passed in rather than assigned afterwards.
+    """
+    seed = hashlib.sha256(tag.encode()).hexdigest().encode('ascii')
+    enc = hashlib.sha256(('enc-' + tag).encode()).hexdigest().encode('ascii')
+    return Identity(uuid or UUID(bytes=hashlib.md5(tag.encode()).digest()),
+                    '10.0.0.1', '%s.test' % tag,
+                    Signature(seed, public_only=False),
+                    Encryptor(enc, public_only=False),
+                    _public_only=False)
+
+
+def _cosign(voter: Identity, att: SlashAttestation) -> str:
+    """A voter's detached co-signature over the attestation designation, in the
+    ASCII-hex form handle_slash_sign verifies."""
+    return voter.sign(att.designation).signature.decode('ascii')
+
+
+def _make_rep_process(self_uuid=None, identity=None):
     log_q = queue.Queue()
-    identity = MagicMock()
-    identity.uuid = self_uuid or uuid4()
-    # Real, JSON-serializable signature so to_json_string(attestation)
-    # (which carries .signature) doesn't choke on a MagicMock.
-    identity.sign = lambda m: b'\x01\x02\x03\x04'
+    if identity is None:
+        identity = _identity('self-node', uuid=self_uuid or uuid4())
 
     procs = []
     for nm in (CfgIds.network, CfgIds.identity, CfgIds.negotiation,
@@ -183,9 +209,10 @@ class TestSlashFlow:
         assert msg.function == ReputationProtocol.slash_propose
 
     def test_acceptor_co_signs_then_applies_on_final(self):
-        slasher_id = uuid4()
+        slasher = _identity('slasher')
+        slasher_id = slasher.uuid
         acc = _make_rep_process()
-        acc.protocol.peers.all = [MagicMock(uuid=slasher_id)]
+        acc.protocol.peers.all = [slasher]
         net_q = queue.Queue()
         queues = {CfgIds.network: net_q}
         target = uuid4()
@@ -194,29 +221,51 @@ class TestSlashFlow:
         # Acceptor receives a verified slash_propose -> emits slash_sign.
         propose = Message(CfgIds.reputation, ReputationProtocol.slash_propose,
                           to_json_string(att), acc.group,
-                          from_whom=MagicMock(uuid=slasher_id))
+                          from_whom=slasher)
         propose.verified = True
         assert acc.handle_slash_propose(queues, propose) is True
         sign = net_q.get_nowait()
         assert sign.function == ReputationProtocol.slash_sign
+        # The ack carries a verifiable detached signature, not a bare uuid.
+        _tgt, _epoch, voter, sig = from_json_string(sign.obj)
+        assert voter == str(acc.identity.uuid)
+        assert acc._verify_cosignature(att.designation, voter, sig)
         # It has NOT applied the floor yet (waits for final).
         assert str(target) not in acc._slashed
 
         # Acceptor receives the finalized slash -> applies the floor.
-        signed = SignedSlash(attestation=att, sigs={})
+        signed = SignedSlash(attestation=att,
+                             sigs={str(slasher_id): _cosign(slasher, att)})
         final = Message(CfgIds.reputation, ReputationProtocol.slash_final,
                         to_json_string(signed), acc.group,
-                        from_whom=MagicMock(uuid=slasher_id))
+                        from_whom=slasher)
         final.verified = True
         assert acc.handle_slash_final(queues, final) is True
         assert str(target) in acc._slashed
         assert acc._consensus_reputation(target) == pytest.approx(0.1)
 
+    def test_final_without_cosignatures_refused(self):
+        """Negative control for the pre-fix behaviour: an evidence-free
+        slash_final used to be applied on transport authentication alone, so
+        any admitted member could floor any peer into sticky exclusion."""
+        slasher = _identity('slasher')
+        acc = _make_rep_process()
+        acc.protocol.peers.all = [slasher, _identity('bystander')]
+        target = uuid4()
+        att = _att(slasher.uuid, target, floor=0.1, epoch=6)
+        final = Message(CfgIds.reputation, ReputationProtocol.slash_final,
+                        to_json_string(SignedSlash(attestation=att, sigs={})),
+                        acc.group, from_whom=slasher)
+        final.verified = True
+        assert acc.handle_slash_final({CfgIds.network: queue.Queue()},
+                                      final) is True
+        assert str(target) not in acc._slashed
+
     def test_slash_sign_finalizes_at_quorum(self):
         rp = _make_rep_process()
         # One peer -> quorum floor(1/2)=0; a single co-sign (>0) finalizes.
-        voter = uuid4()
-        rp.protocol.peers.all = [MagicMock(uuid=voter)]
+        voter = _identity('voter')
+        rp.protocol.peers.all = [voter]
         net_q = queue.Queue()
         target = uuid4()
         att = SlashAttestation(slasher_uuid=None, target_uuid=target,
@@ -226,12 +275,18 @@ class TestSlashFlow:
         net_q.get_nowait()  # drain the slash_propose
         key = att.key()  # epoch stamped by forward_slash
         sign = Message(CfgIds.reputation, ReputationProtocol.slash_sign,
-                       to_json_string((key[0], key[1], str(voter), b'sig')),
-                       rp.group, from_whom=MagicMock(uuid=voter))
+                       to_json_string((key[0], key[1], str(voter.uuid),
+                                       _cosign(voter, att))),
+                       rp.group, from_whom=voter)
         sign.verified = True
         assert rp.handle_slash_sign({CfgIds.network: net_q}, sign) is True
         final = net_q.get_nowait()
         assert final.function == ReputationProtocol.slash_final
+        # The finalizer carries the retained co-signatures (ours + the
+        # voter's), which is what lets a receiver check quorum itself.
+        signed = (final.obj if isinstance(final.obj, SignedSlash)
+                  else from_json_string(final.obj))
+        assert set(signed.sigs) == {str(rp.identity.uuid), str(voter.uuid)}
         # Pending dropped -> a duplicate sign is now a no-op.
         assert key not in rp._slash_pending
 
@@ -314,34 +369,41 @@ class TestSlashEvidence:
 
     def test_slash_final_applies_with_good_evidence(self):
         rp = _make_rep_process()
-        rp.protocol.peers.all = [MagicMock(uuid=uuid4())]
+        slasher_id = _identity('slasher')
+        rp.protocol.peers.all = [slasher_id]
         tids = _seed_window_and_checkpoint(rp, 4)
         target = uuid4()
-        slasher = uuid4()
+        slasher = slasher_id.uuid
         att = _att(slasher, target, floor=0.1, epoch=9)
         att.evidence_ref = rp.build_slash_evidence(tids[0])
-        signed = SignedSlash(attestation=att, sigs={})
+        signed = SignedSlash(attestation=att,
+                             sigs={str(slasher): _cosign(slasher_id, att)})
         final = Message(CfgIds.reputation, ReputationProtocol.slash_final,
                         to_json_string(signed), rp.group,
-                        from_whom=MagicMock(uuid=slasher))
+                        from_whom=slasher_id)
         final.verified = True
         assert rp.handle_slash_final({CfgIds.network: queue.Queue()}, final) is True
         assert str(target) in rp._slashed  # evidence verified -> floored
 
     def test_slash_final_rejected_with_bad_evidence(self):
         rp = _make_rep_process()
-        rp.protocol.peers.all = [MagicMock(uuid=uuid4())]
+        slasher_id = _identity('slasher')
+        rp.protocol.peers.all = [slasher_id]
         tids = _seed_window_and_checkpoint(rp, 4)
         target = uuid4()
-        slasher = uuid4()
+        slasher = slasher_id.uuid
         att = _att(slasher, target, floor=0.1, epoch=9)
         ev = rp.build_slash_evidence(tids[0])
         ev['leaf'] = ('b' if ev['leaf'][0] != 'b' else 'a') + ev['leaf'][1:]
         att.evidence_ref = ev
-        signed = SignedSlash(attestation=att, sigs={})
+        # Co-signatures are deliberately VALID here, so this pin keeps testing
+        # what it claims -- bad Merkle evidence -- rather than passing because
+        # quorum was also absent.
+        signed = SignedSlash(attestation=att,
+                             sigs={str(slasher): _cosign(slasher_id, att)})
         final = Message(CfgIds.reputation, ReputationProtocol.slash_final,
                         to_json_string(signed), rp.group,
-                        from_whom=MagicMock(uuid=slasher))
+                        from_whom=slasher_id)
         final.verified = True
         assert rp.handle_slash_final({CfgIds.network: queue.Queue()}, final) is True
         assert str(target) not in rp._slashed  # bad evidence -> NOT floored

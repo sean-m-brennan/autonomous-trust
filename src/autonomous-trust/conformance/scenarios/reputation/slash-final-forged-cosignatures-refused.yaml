@@ -1,0 +1,57 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: slash-final-forged-cosignatures-refused
+byte_pinning: false
+description: |
+    A slash_final whose co-signature map was minted by ONE member -- every
+    entry signed with alice's key but labelled with a different member's uuid
+    -- must be refused.
+
+    The complement to slash-final-sub-quorum-refused: there the map was honest
+    and too small, here it is the right SIZE and dishonest. Counting entries
+    would admit it; only verifying each signature against the key of the voter
+    it names rejects it. This is also why the tally counts a set of verified
+    signers rather than arriving messages: a signature is worth one vote
+    however many times, and under whatever label, it is presented.
+
+    Note the attacker needs nothing exotic -- co-signatures travel in the clear
+    on every *_final, so they are not secret. What it cannot do is produce a
+    signature under a key it does not hold.
+
+participants:
+  - id: alice
+    role: detector
+  - id: bob
+    role: member
+  - id: carol
+    role: member
+  - id: rogue
+    role: target
+
+fixtures:
+  reputations:
+    bob:
+      rogue: 0.6
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: slash final
+    payload:
+      target: rogue
+      floor_score: 0.1
+      epoch: 4
+      cosigners: [alice, bob, carol]
+      forged_by: alice
+    description: |
+        alice broadcasts a finalized slash naming three co-signers, all three
+        signatures actually made with alice's key. bob verifies each against
+        the named voter's key: only alice's own entry survives, which is under
+        quorum, so the slash is refused.
+
+expected_state:
+  bob:
+    reputation_of:
+      rogue: 0.6

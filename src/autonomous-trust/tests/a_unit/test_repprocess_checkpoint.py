@@ -21,8 +21,9 @@ finalized checkpoint stores the agreed commitment. See
 reputation-vs-blockchain-analysis.md §2.1 and reputation.py
 Checkpoint/SignedCheckpoint.
 """
+import hashlib
 import queue
-from uuid import uuid4
+from uuid import UUID, uuid4
 from unittest.mock import MagicMock
 
 import pytest
@@ -32,17 +33,44 @@ from autonomous_trust.core.reputation.reputation import (
     Checkpoint, SignedCheckpoint,
 )
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
+from autonomous_trust.core._python.identity.identity import Identity
+from autonomous_trust.core._python.identity.sign import Signature
+from autonomous_trust.core._python.identity.encrypt import Encryptor
 from autonomous_trust.core.network.message import Message
 from autonomous_trust.core.processes import ProcessTracker
 from autonomous_trust.core.system import CfgIds
 from autonomous_trust.core.config import to_json_string, from_json_string
 
 
-def _make_rep_process(self_uuid=None):
+def _identity(tag: str, uuid=None) -> Identity:
+    """A real identity with a signing key DISTINCT per tag.
+
+    Distinctness is the whole point since checkpoint co-signatures became
+    verifiable: a signature made by one member must fail against another
+    member's key, so a shared seed would make every negative control pass for
+    the wrong reason. Deterministic (derived from the tag, not `hash()`, which
+    is salted per process) so a failure reproduces. ``Identity.uuid`` is
+    read-only, hence passed in rather than assigned after the fact.
+    """
+    seed = hashlib.sha256(tag.encode()).hexdigest().encode('ascii')
+    enc = hashlib.sha256(('enc-' + tag).encode()).hexdigest().encode('ascii')
+    return Identity(uuid or UUID(bytes=hashlib.md5(tag.encode()).digest()),
+                    '10.0.0.1', '%s.test' % tag,
+                    Signature(seed, public_only=False),
+                    Encryptor(enc, public_only=False),
+                    _public_only=False)
+
+
+def _cosign(voter: Identity, ckpt: Checkpoint) -> str:
+    """A voter's detached co-signature over the checkpoint designation, in the
+    ASCII-hex form handle_checkpoint_sign verifies."""
+    return voter.sign(ckpt.designation).signature.decode('ascii')
+
+
+def _make_rep_process(self_uuid=None, identity=None):
     log_q = queue.Queue()
-    identity = MagicMock()
-    identity.uuid = self_uuid or uuid4()
-    identity.sign = lambda m: b'\x01\x02\x03\x04'
+    if identity is None:
+        identity = _identity('self-node', uuid=self_uuid or uuid4())
 
     procs = []
     for nm in (CfgIds.network, CfgIds.identity, CfgIds.negotiation,
@@ -111,9 +139,10 @@ class TestCheckpointFlow:
         assert msg.function == ReputationProtocol.checkpoint_propose
 
     def test_member_cosigns_only_on_matching_root(self):
-        proposer_id = uuid4()
+        proposer = _identity('proposer')
+        proposer_id = proposer.uuid
         member = _make_rep_process()
-        member.protocol.peers.all = [MagicMock(uuid=proposer_id)]
+        member.protocol.peers.all = [proposer]
         net_q = queue.Queue()
         queues = {CfgIds.network: net_q}
         # Member and proposer share the SAME committed window content.
@@ -126,11 +155,16 @@ class TestCheckpointFlow:
                         epoch=7, first_index=0, count=3)
         propose = Message(CfgIds.reputation, ReputationProtocol.checkpoint_propose,
                           to_json_string(ck), member.group,
-                          from_whom=MagicMock(uuid=proposer_id))
+                          from_whom=proposer)
         propose.verified = True
         assert member.handle_checkpoint_propose(queues, propose) is True
         sign = net_q.get_nowait()
         assert sign.function == ReputationProtocol.checkpoint_sign
+        # The ack carries a real detached signature over the designation, not
+        # a bare uuid: the proposer counts signatures now.
+        _tgt, _epoch, voter, sig = from_json_string(sign.obj)
+        assert voter == str(member.identity.uuid)
+        assert member._verify_cosignature(ck.designation, voter, sig)
 
     def test_member_declines_on_root_mismatch(self):
         proposer_id = uuid4()
@@ -149,8 +183,8 @@ class TestCheckpointFlow:
 
     def test_sign_finalizes_at_quorum_and_stores(self):
         rp = _make_rep_process()
-        voter = uuid4()
-        rp.protocol.peers.all = [MagicMock(uuid=voter)]  # quorum floor(1/2)=0
+        voter = _identity('voter')
+        rp.protocol.peers.all = [voter]  # quorum floor(1/2)=0
         _fill(rp, 3)
         net_q = queue.Queue()
         rp.forward_checkpoint({CfgIds.network: net_q}, Checkpoint(None, b''))
@@ -158,29 +192,52 @@ class TestCheckpointFlow:
         ck = rp._checkpoint  # epoch stamped by forward_checkpoint
         key = ck.key()
         sign = Message(CfgIds.reputation, ReputationProtocol.checkpoint_sign,
-                       to_json_string((key[0], key[1], str(voter), b'sig')),
-                       rp.group, from_whom=MagicMock(uuid=voter))
+                       to_json_string((key[0], key[1], str(voter.uuid),
+                                       _cosign(voter, ck))),
+                       rp.group, from_whom=voter)
         sign.verified = True
         assert rp.handle_checkpoint_sign({CfgIds.network: net_q}, sign) is True
         final = net_q.get_nowait()
         assert final.function == ReputationProtocol.checkpoint_final
+        # The finalizer carries the retained co-signatures -- the proposer's
+        # own plus the voter's -- so a receiver can check quorum itself.
+        signed = (final.obj if isinstance(final.obj, SignedCheckpoint)
+                  else from_json_string(final.obj))
+        assert set(signed.sigs) == {str(rp.identity.uuid), str(voter.uuid)}
         # Pending dropped -> a duplicate sign is now a no-op.
         assert key not in rp._checkpoint_pending
 
     def test_final_stores_checkpoint_on_receiver(self):
-        proposer_id = uuid4()
+        proposer = _identity('proposer')
         rp = _make_rep_process()
-        rp.protocol.peers.all = [MagicMock(uuid=proposer_id)]
-        ck = Checkpoint(proposer_uuid=proposer_id, root=b'c' * 64, epoch=2,
+        rp.protocol.peers.all = [proposer]
+        ck = Checkpoint(proposer_uuid=proposer.uuid, root=b'c' * 64, epoch=2,
                         first_index=0, count=1)
-        signed = SignedCheckpoint(checkpoint=ck, sigs={})
+        signed = SignedCheckpoint(
+            checkpoint=ck, sigs={str(proposer.uuid): _cosign(proposer, ck)})
         final = Message(CfgIds.reputation, ReputationProtocol.checkpoint_final,
                         to_json_string(signed), rp.group,
-                        from_whom=MagicMock(uuid=proposer_id))
+                        from_whom=proposer)
         final.verified = True
         assert rp.handle_checkpoint_final({CfgIds.network: queue.Queue()}, final) is True
         assert rp._checkpoint is not None
         assert rp._checkpoint.key() == ck.key()
+
+    def test_final_without_cosignatures_refused(self):
+        """Negative control for the pre-fix behaviour: an empty `sigs` used to
+        be stored on transport authentication alone, which let any single
+        member choose the root that slash evidence is measured against."""
+        proposer = _identity('proposer')
+        rp = _make_rep_process()
+        rp.protocol.peers.all = [proposer, _identity('bystander')]
+        ck = Checkpoint(proposer_uuid=proposer.uuid, root=b'e' * 64, epoch=3,
+                        first_index=0, count=1)
+        final = Message(CfgIds.reputation, ReputationProtocol.checkpoint_final,
+                        to_json_string(SignedCheckpoint(checkpoint=ck, sigs={})),
+                        rp.group, from_whom=proposer)
+        final.verified = True
+        assert rp.handle_checkpoint_final({CfgIds.network: queue.Queue()}, final) is True
+        assert rp._checkpoint is None
 
     def test_unverified_propose_rejected(self):
         rp = _make_rep_process()
