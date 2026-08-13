@@ -895,6 +895,151 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                 json_object_set(body, "evidence", ev);
         }
     }
+    else if (strcmp(function, REP_PROTO_REP_RESOLVED) == 0)
+    {
+        /* Deep resolution (ISSUES.md 10.2): the answer carries the holder's
+         * WHOLE quorum-signed window, so the receiver can recompute the root
+         * and see both fabrication and OMISSION.
+         *
+         * The window is rebuilt here from the holder's `tx_history` fixture
+         * rather than read out of rep_state: the engine resets rep_state per
+         * step and stages fixtures for the DISPATCH TARGET, so the sender's
+         * chain does not exist while we are building a message to it. Same
+         * entries, same order, same uuids as the Python adapter reads from
+         * the holder's live history -- both sides therefore checkpoint the
+         * same root. */
+        const char *peer_pid = payload ? json_string_value(
+            json_object_get(payload, "peer")) : NULL;
+        const char *qid = payload ? json_string_value(
+            json_object_get(payload, "query_id")) : NULL;
+        if (peer_pid == NULL || qid == NULL)
+        {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "build_inbound: rep_resolved needs peer and query_id");
+            return -1;
+        }
+        tx_history_t tmp;
+        tx_history_init(&tmp);
+        json_t *txh = json_object_get(g_fixtures, "tx_history");
+        json_t *entries = json_is_object(txh)
+            ? json_object_get(txh, from_id) : NULL;
+        size_t ei;
+        json_t *e;
+        if (json_is_array(entries))
+        {
+            json_array_foreach(entries, ei, e)
+            {
+                const char *slug = json_string_value(json_object_get(e, "task_id"));
+                const char *p1_id = json_string_value(json_object_get(e, "p1"));
+                const char *p2_id = json_string_value(json_object_get(e, "p2"));
+                if (slug == NULL || p1_id == NULL || p2_id == NULL)
+                    continue;
+                uuid_t task_uuid;
+                _uuid5("tx:", slug, task_uuid);
+                const uuid_t *p1u = _uuid_of(ctx, p1_id);
+                const uuid_t *p2u = _uuid_of(ctx, p2_id);
+                if (p1u == NULL || p2u == NULL)
+                    continue;
+                tx_history_update(&tmp, task_uuid, *p1u,
+                                  json_number_value(json_object_get(e, "p1_score")));
+                tx_history_update(&tmp, task_uuid, *p2u,
+                                  json_number_value(json_object_get(e, "p2_score")));
+            }
+        }
+        rep_checkpoint_t ckpt;
+        rep_checkpoint_init(&ckpt);
+        ckpt.present = true;
+        transaction_window_root(&tmp, ckpt.root);
+        snprintf(ckpt.proposer_uuid, sizeof(ckpt.proposer_uuid), "%s",
+                 proposer_str);
+        json_t *ep = payload ? json_object_get(payload, "epoch") : NULL;
+        ckpt.epoch = json_is_integer(ep) ? json_integer_value(ep) : 1;
+        ckpt.first_index = 0;
+        ckpt.count = tx_history_len(&tmp);
+        uint8_t desig[RP_DESIG_MAX];
+        size_t dlen = _rp_checkpoint_designation(ckpt.proposer_uuid, ckpt.root,
+                                                ckpt.epoch, ckpt.first_index,
+                                                ckpt.count, desig,
+                                                sizeof(desig));
+        json_t *sigs = _rp_cosignatures(ctx, payload, desig, dlen, NULL);
+        const char *voter = NULL;
+        json_t *sv = NULL;
+        json_object_foreach(sigs, voter, sv)
+        {
+            const char *sig_hex = json_string_value(sv);
+            if (sig_hex != NULL)
+                map_set(&ckpt.sigs, (map_key_t)voter,
+                        string_data((string_t)sig_hex, strlen(sig_hex) + 1));
+        }
+
+        json_t *doc = NULL;
+        if (reputation_evidence_to_json(&tmp, &ckpt, &doc) != 0 || doc == NULL)
+        {
+            json_decref(sigs);
+            rep_checkpoint_free(&ckpt);
+            tx_history_free(&tmp);
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "build_inbound: could not build resolved evidence");
+            return -1;
+        }
+        /* The negative control: signed over the FULL window, one entry then
+         * dropped from what travels. Everything left is genuine, which is
+         * exactly why an inclusion proof would not catch it. */
+        json_t *omit = payload ? json_object_get(payload, "omit_last") : NULL;
+        json_t *chain_arr = json_object_get(doc, "chain");
+        if (omit != NULL && json_is_true(omit) && json_is_array(chain_arr)
+            && json_array_size(chain_arr) > 0)
+            json_array_remove(chain_arr, json_array_size(chain_arr) - 1);
+
+        char peer_uuid_str[UUID_STRING_LEN + 1] = {0};
+        const uuid_t *peer_uu = _uuid_of(ctx, peer_pid);
+        if (peer_uu != NULL)
+            uuid_unparse_lower(*peer_uu, peer_uuid_str);
+        json_object_set_new(doc, "query_id", json_string(qid));
+        json_object_set_new(doc, "peer_uuid", json_string(peer_uuid_str));
+        json_t *claimed = payload ? json_object_get(payload, "score") : NULL;
+        json_object_set_new(doc, "score",
+                            json_is_number(claimed)
+                                ? json_real(json_number_value(claimed))
+                                : json_null());
+        /* Signer identities in the canonical public form, so a receiver that
+         * holds nobody from the answering group can still check a signature. */
+        json_t *signers = json_array();
+        json_object_foreach(sigs, voter, sv)
+        {
+            for (size_t pi = 0; pi < ctx->participant_count; pi++)
+            {
+                const rp_impl_t *pim = (const rp_impl_t *)ctx->participants[pi].impl;
+                if (pim == NULL || pim->pub == NULL)
+                    continue;
+                char pu[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(pim->pub->uuid, pu);
+                if (strcmp(pu, voter) != 0)
+                    continue;
+                json_t *ident = NULL;
+                if (public_identity_to_json(pim->pub, &ident) == 0 && ident != NULL)
+                    json_array_append_new(signers, ident);
+                break;
+            }
+        }
+        json_object_set_new(doc, "signers", signers);
+        json_decref(sigs);
+        rep_checkpoint_free(&ckpt);
+        tx_history_free(&tmp);
+
+        /* The receiver only accepts an answer to a query it is waiting for.
+         * Registering it is harness setup standing in for the resolve this
+         * scenario does not send, so the step tests VERIFICATION rather than
+         * relay bookkeeping (which has its own coverage). */
+        {
+            sce_participant_t *rcv = sce_find_participant(ctx, to_id);
+            const rp_impl_t *rim = (rcv != NULL)
+                ? (const rp_impl_t *)rcv->impl : NULL;
+            if (rim != NULL)
+                reputation_deep_resolve(rim->proc, qid, peer_uuid_str, 4);
+        }
+        body = doc;
+    }
     else if (strcmp(function, REP_PROTO_CHECKPOINT_PROPOSE) == 0
              || strcmp(function, REP_PROTO_CHECKPOINT_SIGN) == 0
              || strcmp(function, REP_PROTO_CHECKPOINT_FINAL) == 0)
@@ -1135,6 +1280,71 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
                              "%s: checkpoint_root=%s, expected %s",
                              pid, snap->checkpoint_root, want ? want : "(null)");
                     return -1;
+                }
+            }
+            else if (strcmp(key, "resolved_reputation") == 0)
+            {
+                /* The verdict on a deep-resolution answer, and the score this
+                 * node computed FROM the attested window rather than the one
+                 * the answer claimed. Both runtimes must reach the same
+                 * verdict on the same evidence, or the same peer is trusted on
+                 * one implementation and refused on the other. */
+                const char *peer_pid = json_string_value(
+                    json_object_get(val, "peer"));
+                const uuid_t *peer_uu = (peer_pid != NULL)
+                    ? _uuid_of(ctx, peer_pid) : NULL;
+                if (peer_uu == NULL)
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: resolved_reputation names unknown "
+                             "participant %s", pid,
+                             peer_pid ? peer_pid : "(none)");
+                    return -1;
+                }
+                char peer_str[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(*peer_uu, peer_str);
+                double score = 0.0;
+                bool have_score = false, verified = false;
+                char reason[192] = {0};
+                if (!reputation_resolved_get(peer_str, &score, &have_score,
+                                             &verified, reason, sizeof(reason)))
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: resolved_reputation[%s]: no answer recorded",
+                             pid, peer_pid);
+                    return -1;
+                }
+                json_t *want_v = json_object_get(val, "verified");
+                if (want_v != NULL
+                    && verified != json_is_true(want_v))
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: resolved_reputation.verified=%s, expected "
+                             "%s (reason: %s)", pid, verified ? "true" : "false",
+                             json_is_true(want_v) ? "true" : "false", reason);
+                    return -1;
+                }
+                json_t *want_s = json_object_get(val, "score");
+                if (want_s != NULL && json_is_null(want_s))
+                {
+                    if (have_score)
+                    {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: resolved_reputation.score=%.6f, expected "
+                                 "none", pid, score);
+                        return -1;
+                    }
+                }
+                else if (json_is_number(want_s))
+                {
+                    double want = json_number_value(want_s);
+                    if (!have_score || fabs(score - want) > 1e-3)
+                    {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: resolved_reputation.score=%.6f, expected "
+                                 "%.6f", pid, have_score ? score : -1.0, want);
+                        return -1;
+                    }
                 }
             }
             else if (strcmp(key, "evidence_doc") == 0)
