@@ -307,6 +307,12 @@ int identity_set_peer_rank(process_t *proc, const char *uuid, int rank);
  *  Bridges the on-disk Python `Group` schema (_uuid / _address_map). */
 int identity_load_child_groups(process_t *proc, const char *cfg_dir);
 
+/** Fan this node's child-group set out to the sibling processes (one
+ *  CHILD_GROUP message per cohort), so the reputation process can keep a
+ *  transaction chain per child group. C twin of Python's
+ *  _record_child_groups. Returns the number of messages sent; 0 on a leaf. */
+int identity_propagate_child_groups(const process_t *proc, directory_t *queues);
+
 /** Emit ONE peer on the app-facing carrier (PEER_OBSERVED via AT_MAIN_QUEUE).
  *  Carries the peer's signing key, its rank from the peer_ranks seam, and
  *  both operator signals; the attendance stamp is zeroed unless the peer is

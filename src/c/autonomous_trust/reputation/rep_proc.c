@@ -19,6 +19,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #include "processes/processes.h"
 #include "processes/capabilities.h"
@@ -32,6 +33,8 @@
 #include "utilities/exception.h"
 #include "utilities/probes.h"
 #include "network/net_message.h"
+#include "config/configuration.h"   /* get_cfg_dir, CFG_PATH_LEN */
+#include "config/discover.h"        /* CFG_FILE_EXT */
 #include "reputation/rep_proc_priv.h"
 
 #define EREP_PAXOS 253
@@ -71,6 +74,52 @@ static int _trust_tier(double score)
     return 0;
 }
 
+/* The highest score that still maps to @p tier — the next tier's floor,
+ * stepped down by one representable double.
+ *
+ * Derived from TIER_FLOORS rather than written as a literal so retuning the
+ * ladder cannot leave a stale ceiling behind that quietly grants the tier
+ * above. nextafter (not a hand-picked epsilon) because the clamp has to
+ * satisfy _trust_tier(ceiling) == tier exactly: an epsilon too small rounds
+ * back onto the floor and grants the very tier the clamp exists to withhold.
+ * The top tier has no ceiling. Mirrors Python _tier_ceiling. */
+static double _tier_ceiling(int tier)
+{
+    for (size_t i = 0; i < NUM_TIER_FLOORS; i++) {
+        if (TIER_FLOORS[i].tier == tier + 1)
+            return nextafter(TIER_FLOORS[i].floor, 0.0);
+    }
+    return 1.0;
+}
+
+/****************************
+ * Verifiable warm start constants — mirror repprocess.py.
+ ****************************/
+
+/* Tier a peer may hold on restoration when the persisted evidence does not
+ * cover it. Tier 1 (presence/communication) because an
+ * authenticated-but-COMPROMISED asset passes ZTA admission by definition —
+ * credentials are exactly what it holds — so restoring a historically-earned
+ * high tier the instant it is admitted re-opens the hole the system exists to
+ * close, and for a short-lived asset there is no time for behavioural
+ * re-evaluation to catch it first. Mirrors UNVERIFIED_RESTORE_TIER. */
+#define REP_UNVERIFIED_RESTORE_TIER 1
+
+/* Basename of the operational reputation snapshot, whose evidence
+ * `reputation-history.cfg.json` attests. Its MTIME is what the offline-gap
+ * decay measures from (_seed_idle_from_snapshot). */
+#define REP_SNAPSHOT_FILE "reputation"
+
+/* Seconds between checkpoint proposals this node originates (0 disables).
+ * Checkpointing used to be reactive only — nothing ever triggered it — so no
+ * deployment held a checkpoint, which meant no warm start could verify: the
+ * mechanism above would have been unreachable in practice. Mirrors Python
+ * CHECKPOINT_INTERVAL / AT_REP_CHECKPOINT_SEC. */
+#define REP_CHECKPOINT_INTERVAL_DEFAULT 300.0
+#define REP_CHECKPOINT_INTERVAL \
+    (reputation_env_double("AT_REP_CHECKPOINT_SEC", \
+                           REP_CHECKPOINT_INTERVAL_DEFAULT))
+
 /* Forward declaration — definition follows _ensure_init/state struct.
  * Emits a local-IPC tier_update to the identity process queue iff the
  * peer's trust tier has changed since the last publication, and an
@@ -85,6 +134,18 @@ static void _publish_tier_change(const process_t *proc,
  * ReputationProcess._publish_exclusion. */
 static void _publish_exclusion(const process_t *proc,
                                const uuid_t peer_uuid, bool excluded);
+/* Forward declaration — definition sits with the rest of the verifiable
+ * warm-start code (ISSUES §10.3), below the state struct it writes. Records a
+ * finalized checkpoint's root, window bounds and co-signatures, and persists
+ * the evidence document. */
+static void _store_checkpoint(const process_t *proc, const char *proposer,
+                              const char *root, int64_t epoch,
+                              int first_index, int count,
+                              const char *chain_key, json_t *sigs);
+/* Forward declaration — stamps "we just transacted with this peer" so the
+ * staleness sweep leaves an actively-interacting peer alone. Takes
+ * rep_state.lock itself, so callers must NOT hold it. */
+static void _note_interaction(const uuid_t peer_uuid);
 
 /* Slash "reason" that lifts (rather than floors) a target: releases the
  * slash floor, restores the score to PREREP_NEUTRAL, and re-admits it.
@@ -155,6 +216,21 @@ static char NET_READMIT_FUNC[] = "readmit";
 
 static struct {
     tx_history_t history;
+    /* Gateway reputation tree: one chain per child group this node gateways,
+     * keyed by group-uuid string -> object_ptr_data(tx_history_t *). Empty on a
+     * leaf node, and every code path below falls back to the single `history`
+     * when it is, so leaf behaviour is unchanged. Mirrors Python
+     * ReputationProcess.child_histories. See
+     * doc/architecture/gateway-reputation-tree.md and ISSUES.md §10.2. */
+    map_t child_hist;
+    /* Per-chain finalized checkpoints: chain key ("" = primary) ->
+     * object_ptr_data(rep_chain_ckpt_t *). See _ckpt_slot_locked. */
+    map_t chain_ckpts;
+    /* Per-paxos-round group binding: paxos key -> string_data(group-uuid), set
+     * by the proposer so the accept/commit path routes to the round's own chain
+     * and sizes its quorum against that group rather than the conflated peer
+     * list. Mirrors Python's round_group. */
+    map_t round_group;
     reputations_t reputations;
     map_t my_requests;     /* uuid_str -> tx_score_t* (pending Paxos requests) */
     map_t updates;         /* uuid_str -> json_t* (pending chain updates) */
@@ -254,6 +330,42 @@ static struct {
     char  checkpoint_root[TX_HASH_HEX_LEN + 1];  /* latest finalized root */
     int64_t checkpoint_epoch;  /* epoch of the latest finalized checkpoint */
     bool  checkpoint_set;      /* a checkpoint has been finalized/stored */
+    /* --- Verifiable warm start (ISSUES §10.3) ---
+     * The rest of the finalized checkpoint, kept because the PERSISTED
+     * evidence has to carry it: a boot-time rebuild verifies the same quorum a
+     * live receiver does, and a root with no window bounds and no signatures
+     * beside it is a number anyone with write access to the config directory
+     * could have chosen. Mirrors Python's _checkpoint / _checkpoint_sigs_final.
+     */
+    int   checkpoint_first_index;
+    int   checkpoint_count;
+    char  checkpoint_proposer[UUID_STRING_LEN + 1];
+    map_t checkpoint_sigs_final;   /* voter uuid-str -> string_data(hex sig) */
+    /* Monotonic epoch for checkpoints THIS node originates (distinct from
+     * checkpoint_epoch, which is whatever epoch we last stored — possibly
+     * another node's). Resumed past the persisted checkpoint at boot so a
+     * restart cannot reuse an epoch its peers have already deduped. */
+    int64_t checkpoint_own_epoch;
+    /* Periodic-origination clocks (see _maybe_checkpoint). The flag rather
+     * than a sentinel value because the host build is -Wfloat-equal: a "not
+     * set yet" double cannot be tested for equality. -1 head == no window has
+     * been checkpointed. */
+    double  next_checkpoint_at;
+    bool    checkpoint_phase_taken;
+    int     last_checkpoint_head;
+    /* Staleness decay: peer uuid-str -> float_data(epoch seconds of our most
+     * recent committed transaction with that peer). Seeded at boot from the
+     * persisted snapshot's mtime, so the gap a peer spent out of contact while
+     * we were down counts as idle time. Mirrors Python _last_interaction. */
+    map_t   last_interaction;
+    double  last_decay_sweep;
+    bool    decay_swept;
+    /* Child-group chains already attempted by _restore_child_evidence, and the
+     * persisted score each clamped peer was clamped away FROM -- the upper
+     * bound on any later lift, so late evidence restores standing instead of
+     * inventing it (§10.2). */
+    map_t   child_evidence_tried;
+    map_t   restore_clamped;
     /* Catch-up quorum: handle_update fires the chain merge once this many
      * peers have reported. Production default is 3 (mirrors Python's
      * self.num_updates); a conformance fixture may lower it to 1 so a
@@ -268,6 +380,9 @@ static void _ensure_init(void)
     if (!rep_state.initialized)
     {
         tx_history_init(&rep_state.history);
+        map_init(&rep_state.child_hist);
+        map_init(&rep_state.chain_ckpts);
+        map_init(&rep_state.round_group);
         reputations_init(&rep_state.reputations);
         map_init(&rep_state.my_requests);
         map_init(&rep_state.updates);
@@ -291,12 +406,246 @@ static void _ensure_init(void)
         rep_state.checkpoint_root[0] = '\0';
         rep_state.checkpoint_epoch = 0;
         rep_state.checkpoint_set = false;
+        map_init(&rep_state.checkpoint_sigs_final);
+        rep_state.checkpoint_first_index = 0;
+        rep_state.checkpoint_count = 0;
+        rep_state.checkpoint_proposer[0] = '\0';
+        rep_state.checkpoint_own_epoch = 0;
+        rep_state.next_checkpoint_at = 0.0;
+        rep_state.checkpoint_phase_taken = false;
+        rep_state.last_checkpoint_head = -1;
+        map_init(&rep_state.last_interaction);
+        rep_state.last_decay_sweep = 0.0;
+        rep_state.decay_swept = false;
+        map_init(&rep_state.child_evidence_tried);
+        map_init(&rep_state.restore_clamped);
         rep_state.num_updates = 3;  /* catch-up quorum; mirrors Python default */
         /* paxos_init is called in reputation_run after num_peers is known */
         rep_state.num_peers = 0;
         pthread_mutex_init(&rep_state.lock, NULL);
         rep_state.initialized = true;
     }
+}
+
+/* ---- Gateway reputation tree: chain routing (ISSUES.md §10.2) -------------
+ *
+ * A gateway belongs to more than one cohort, and their transaction histories
+ * must not be merged: a subtree's reputation is that subtree's, and the parent
+ * cohort has its own. So a commit tagged with a child group's uuid routes to
+ * that group's chain, created on first use. Mirrors Python
+ * ReputationProcess._chain_for_group / _chain_key.
+ */
+
+/* True if `key` names a cohort this node gateways. */
+static bool _is_child_group(const process_t *proc, const char *key)
+{
+    if (proc == NULL || key == NULL || key[0] == '\0'
+        || proc->protocol.child_groups == NULL)
+        return false;
+    data_t *unused = NULL;
+    return map_get(proc->protocol.child_groups, (map_key_t)key, &unused) == 0;
+}
+
+/* Normalize a group-uuid to a CHAIN KEY: "" for the primary chain, the
+ * group-uuid for a child chain.
+ *
+ * NULL, empty, our own primary group's uuid, and any uuid we do NOT gateway all
+ * resolve to the primary chain. That last case is deliberate: an unrecognized
+ * group must not be able to mint a chain, or a peer could make us accumulate
+ * history under a cohort we have nothing to do with. */
+static void _chain_key(const process_t *proc, const char *group_uuid,
+                       char *out, size_t cap)
+{
+    out[0] = '\0';
+    if (group_uuid == NULL || group_uuid[0] == '\0')
+        return;
+    char primary[UUID_STRING_LEN + 1] = {0};
+    if (proc != NULL)
+        uuid_unparse_lower(proc->protocol.group.uuid, primary);
+    if (strncmp(group_uuid, primary, UUID_STRING_LEN + 1) == 0)
+        return;
+    if (!_is_child_group(proc, group_uuid))
+        return;
+    snprintf(out, cap, "%s", group_uuid);
+}
+
+/* The history a chain key names, creating a child chain on first use. Caller
+ * holds rep_state.lock. */
+static tx_history_t *_chain_for_key_locked(const char *chain_key)
+{
+    if (chain_key == NULL || chain_key[0] == '\0')
+        return &rep_state.history;
+    data_t *existing = NULL;
+    if (map_get(&rep_state.child_hist, (map_key_t)chain_key, &existing) == 0
+        && existing != NULL)
+    {
+        void *hp = NULL;
+        if (data_object_ptr(existing, &hp) == 0 && hp != NULL)
+            return (tx_history_t *)hp;
+    }
+    tx_history_t *fresh = calloc(1, sizeof(tx_history_t));
+    if (fresh == NULL)
+        return &rep_state.history;   /* degrade to the primary chain, never NULL */
+    tx_history_init(fresh);
+    data_t *d = object_ptr_data(fresh, sizeof(tx_history_t));
+    if (d == NULL || map_set(&rep_state.child_hist, (map_key_t)chain_key, d) != 0)
+    {
+        tx_history_free(fresh);
+        free(fresh);
+        return &rep_state.history;
+    }
+    return fresh;
+}
+
+/* Convenience: resolve a group-uuid straight to its chain. Caller holds the
+ * lock. */
+static tx_history_t *_chain_for_group_locked(const process_t *proc,
+                                             const char *group_uuid)
+{
+    char key[UUID_STRING_LEN + 1];
+    _chain_key(proc, group_uuid, key, sizeof(key));
+    return _chain_for_key_locked(key);
+}
+
+/* Remember which group a paxos round belongs to, so the accept/commit path can
+ * route to the round's chain. Caller holds the lock. */
+static void _set_round_group_locked(const char *paxos_key, const char *group_uuid)
+{
+    if (paxos_key == NULL || group_uuid == NULL || group_uuid[0] == '\0')
+        return;
+    map_set(&rep_state.round_group, (map_key_t)paxos_key,
+            string_data((string_t)group_uuid, strlen(group_uuid)));
+}
+
+/* The group a paxos round was bound to, or "" (primary). Caller holds the
+ * lock. */
+static void _get_round_group_locked(const char *paxos_key, char *out, size_t cap)
+{
+    out[0] = '\0';
+    if (paxos_key == NULL)
+        return;
+    data_t *d = NULL;
+    if (map_get(&rep_state.round_group, (map_key_t)paxos_key, &d) != 0
+        || d == NULL)
+        return;
+    string_t s = NULL;
+    if (data_string_ptr(d, &s) == 0 && s != NULL)
+        snprintf(out, cap, "%s", s);
+}
+
+/* Members of a group, by filtering the peer list against the group's address
+ * map -- the C twin of Python's _members_of_group. `Group` carries an address
+ * map rather than a uuid roster, and a gateway's peer list conflates every
+ * group it belongs to, so this is how a per-group quorum gets sized. */
+static size_t _members_of_group(const process_t *proc, const char *group_uuid)
+{
+    if (proc == NULL || group_uuid == NULL || group_uuid[0] == '\0')
+        return proc == NULL ? 0 : proc->protocol.num_peers;
+    data_t *gd = NULL;
+    if (proc->protocol.child_groups == NULL
+        || map_get(proc->protocol.child_groups, (map_key_t)group_uuid, &gd) != 0
+        || gd == NULL)
+        return proc->protocol.num_peers;
+    void *gp = NULL;
+    if (data_object_ptr(gd, &gp) != 0 || gp == NULL)
+        return proc->protocol.num_peers;
+    group_t *grp = (group_t *)gp;
+    size_t count = 0;
+    for (size_t i = 0; i < proc->protocol.num_peers; i++)
+    {
+        map_key_t akey = NULL;
+        data_t *aval = NULL;
+        bool found = false;
+        map_entries_for_each(&grp->address_map, akey, aval)
+        {
+            string_t addr = NULL;
+            if (data_string_ptr(aval, &addr) == 0 && addr != NULL
+                && strncmp(addr, proc->protocol.peers[i].address,
+                           sizeof(proc->protocol.peers[i].address)) == 0)
+                found = true;
+        }
+        map_end_for_each
+        if (found)
+            count++;
+    }
+    return count;
+}
+
+/* Majority threshold for a round in `group_uuid`. A non-gateway (no child
+ * groups) always uses the historical num_peers/2, so leaf quorum math is
+ * unchanged. Mirrors Python _quorum_for_group. */
+static size_t _quorum_for_group(const process_t *proc, const char *group_uuid)
+{
+    if (proc == NULL)
+        return 0;
+    if (proc->protocol.child_groups == NULL
+        || map_size(proc->protocol.child_groups) == 0
+        || group_uuid == NULL || group_uuid[0] == '\0')
+        return proc->protocol.num_peers / 2;
+    return _members_of_group(proc, group_uuid) / 2;
+}
+
+/* Per-chain finalized-checkpoint state. A gateway checkpoints each of its
+ * chains separately: its own epoch counter, its own quorum, its own evidence
+ * file. Keyed by CHAIN KEY ("" = primary), so a leaf node simply has one slot
+ * and behaves as before. Mirrors Python's _checkpoints /
+ * _checkpoint_sigs_final / _checkpoint_epochs (ISSUES.md §10.2). */
+typedef struct {
+    char    proposer[UUID_STRING_LEN + 1];
+    char    root[TX_HASH_HEX_LEN + 1];
+    int64_t epoch;
+    int     first_index;
+    int     count;
+    bool    set;
+    map_t   sigs_final;    /* voter uuid-str -> string_data(hex sig) */
+    int64_t own_epoch;     /* monotonic epoch for rounds WE originate */
+    int     last_head;     /* -1 == this chain has never been checkpointed */
+} rep_chain_ckpt_t;
+
+/* The slot for a chain key, created on first use. Caller holds the lock. */
+static rep_chain_ckpt_t *_ckpt_slot_locked(const char *chain_key)
+{
+    const char *key = (chain_key == NULL) ? "" : chain_key;
+    data_t *existing = NULL;
+    if (map_get(&rep_state.chain_ckpts, (map_key_t)key, &existing) == 0
+        && existing != NULL)
+    {
+        void *sp = NULL;
+        if (data_object_ptr(existing, &sp) == 0 && sp != NULL)
+            return (rep_chain_ckpt_t *)sp;
+    }
+    rep_chain_ckpt_t *slot = calloc(1, sizeof(rep_chain_ckpt_t));
+    if (slot == NULL)
+        return NULL;
+    map_init(&slot->sigs_final);
+    slot->last_head = -1;
+    data_t *d = object_ptr_data(slot, sizeof(rep_chain_ckpt_t));
+    if (d == NULL || map_set(&rep_state.chain_ckpts, (map_key_t)key, d) != 0)
+    {
+        map_free(&slot->sigs_final);
+        free(slot);
+        return NULL;
+    }
+    return slot;
+}
+
+/* Mirror the primary slot into the flat fields the older observables read
+ * (reputation_get_checkpoint_root, the conformance snapshot, slash evidence's
+ * fast path). Keeping one mirror in one place beats branching on "primary or
+ * not" at a dozen call sites. Caller holds the lock. */
+static void _mirror_primary_ckpt_locked(void)
+{
+    rep_chain_ckpt_t *slot = _ckpt_slot_locked("");
+    if (slot == NULL)
+        return;
+    snprintf(rep_state.checkpoint_root, sizeof(rep_state.checkpoint_root),
+             "%s", slot->root);
+    snprintf(rep_state.checkpoint_proposer,
+             sizeof(rep_state.checkpoint_proposer), "%s", slot->proposer);
+    rep_state.checkpoint_epoch = slot->epoch;
+    rep_state.checkpoint_first_index = slot->first_index;
+    rep_state.checkpoint_count = slot->count;
+    rep_state.checkpoint_set = slot->set;
 }
 
 /* Look up the transaction_weight for a capability by name. Mirrors
@@ -861,6 +1210,16 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
     {
         /* Remove from my_requests */
         map_remove(&rep_state.my_requests, peer_uuid_key);
+        /* Bind the round to OUR primary group, the C twin of Python's
+         * _start_paxos(round_group). The tag then travels on the commit
+         * broadcast, and each receiver maps it through its own view: a sibling
+         * member sees its primary group, while a GATEWAY sees one of its child
+         * groups and routes the entry to that subtree's chain (§10.2). */
+        char own_group[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(proc->protocol.group.uuid, own_group);
+        char round_key[PAXOS_KEY_LEN];
+        paxos_id_index(round_key, sizeof(round_key), id1, id2);
+        _set_round_group_locked(round_key, own_group);
     }
 
     pthread_mutex_unlock(&rep_state.lock);
@@ -1291,15 +1650,30 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
         const char *task_uuid_str = json_string_value(json_object_get(payload, "task_uuid"));
         bool have_task_uuid = (task_uuid_str
                                && uuid_parse(task_uuid_str, task_uuid) == 0);
+        /* Route to the chain this round belongs to: a gateway keeps one per
+         * child group, and merging a subtree's history into the primary chain
+         * would make every group's reputation everyone else's (§10.2). */
+        char round_group[UUID_STRING_LEN + 1] = {0};
+        _get_round_group_locked(paxos_key, round_group, sizeof(round_group));
+        if (round_group[0] == '\0')
+        {
+            /* Unbound round (a peer that predates the binding, or a replayed
+             * key): it is ours, so it belongs to our primary group. */
+            uuid_unparse_lower(proc->protocol.group.uuid, round_group);
+        }
+        tx_history_t *chain = _chain_for_group_locked(proc, round_group);
         if (have_task_uuid)
         {
-            tx_history_update(&rep_state.history, task_uuid, peer_uuid, score);
+            tx_history_update(chain, task_uuid, peer_uuid, score);
         }
         else
         {
-            tx_history_update(&rep_state.history, peer_uuid, peer_uuid, score);
+            tx_history_update(chain, peer_uuid, peer_uuid, score);
         }
         paxos_advance_chain(&rep_state.paxos);
+        /* Reset this peer's idle clock: the staleness sweep must leave an
+         * actively-transacting peer alone (ISSUES §10.3). */
+        _note_interaction(peer_uuid);
         log_info(proc->logger, "Reputation: Transaction committed\n");
 
         /* Phase 3 — broadcast committed (task_id, peer_id, score) to
@@ -1316,6 +1690,12 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
             json_object_set_new(commit_json, "peer_uuid",
                                 json_string(peer_uuid_str));
             json_object_set_new(commit_json, "score", json_real(score));
+            /* Tag the chain so receivers route it the same way we just did.
+             * Omitted for the primary chain, which keeps the payload
+             * byte-identical for every leaf node. */
+            if (round_group[0] != '\0')
+                json_object_set_new(commit_json, "group_uuid",
+                                    json_string(round_group));
 
             generic_msg_t bcast = {0};
             bcast.type = NET_MESSAGE;
@@ -1415,16 +1795,24 @@ static bool handle_committed(const process_t *proc, directory_t *queues, generic
 
     uuid_t task_uuid;
     const char *task_uuid_str = j_task_uuid ? json_string_value(j_task_uuid) : NULL;
+    /* An untagged commit (or one naming a group we do not gateway) lands on the
+     * primary chain, so a leaf node behaves exactly as it did. */
+    const char *group_str = json_string_value(json_object_get(payload,
+                                                             "group_uuid"));
+    pthread_mutex_lock(&rep_state.lock);
+    tx_history_t *chain = _chain_for_group_locked(proc, group_str);
     if (task_uuid_str && uuid_parse(task_uuid_str, task_uuid) == 0)
     {
-        tx_history_update(&rep_state.history, task_uuid, peer_uuid, score);
+        tx_history_update(chain, task_uuid, peer_uuid, score);
     }
     else
     {
         /* Same fallback handle_accepted uses when task_uuid is
          * missing: key the entry by peer_uuid. */
-        tx_history_update(&rep_state.history, peer_uuid, peer_uuid, score);
+        tx_history_update(chain, peer_uuid, peer_uuid, score);
     }
+    pthread_mutex_unlock(&rep_state.lock);
+    _note_interaction(peer_uuid);   /* idle clock; see §10.3 decay */
     log_debug(proc->logger, "Reputation: Recorded committed tx from %s\n",
               peer_uuid_str);
 
@@ -2077,9 +2465,26 @@ static bool _verify_slash_evidence(json_t *evidence)
         steps[i].sibling[TX_HASH_HEX_LEN] = '\0';
         steps[i].sibling_is_left = json_is_true(json_array_get(step, 1));
     }
+    /* ANY chain we have finalized counts, not only the primary one: a gateway
+     * finalizes a checkpoint per child group, and a tx that offended inside a
+     * child group is anchored in THAT group's root. Accepting only the primary
+     * root would refuse every legitimate subtree slash while adding no
+     * security — each root cleared the same quorum test (§10.2). */
     pthread_mutex_lock(&rep_state.lock);
-    bool root_ok = rep_state.checkpoint_set
-        && (strncmp(root, rep_state.checkpoint_root, TX_HASH_HEX_LEN + 1) == 0);
+    bool root_ok = false;
+    map_key_t ck_key = NULL;
+    data_t *ck_val = NULL;
+    map_entries_for_each(&rep_state.chain_ckpts, ck_key, ck_val)
+    {
+        void *sp = NULL;
+        if (data_object_ptr(ck_val, &sp) != 0 || sp == NULL)
+            continue;
+        rep_chain_ckpt_t *slot = (rep_chain_ckpt_t *)sp;
+        if (slot->set
+            && strncmp(root, slot->root, TX_HASH_HEX_LEN + 1) == 0)
+            root_ok = true;
+    }
+    map_end_for_each
     pthread_mutex_unlock(&rep_state.lock);
     if (!root_ok)
         return false;
@@ -2186,28 +2591,6 @@ static size_t _slash_designation(const char *slasher, const char *target,
     return tag_len + (size_t)n;
 }
 
-/* Canonical bytes a checkpoint co-signer signs. MUST stay byte-identical to
- * Python Checkpoint.designation:
- *   "AT-CKPT\0" proposer "|" root "|" epoch "|" first_index "|" count
- * `nonce` is deliberately excluded on both sides (anti-replay only). */
-static size_t _checkpoint_designation(const char *proposer, const char *root,
-                                      int64_t epoch, int64_t first_index,
-                                      int64_t count, uint8_t *out, size_t cap)
-{
-    if (proposer == NULL || root == NULL || out == NULL)
-        return 0;
-    static const char tag[] = "AT-CKPT";
-    size_t tag_len = sizeof(tag);
-    int n = snprintf((char *)out + tag_len, cap - tag_len,
-                     "%s|%s|%lld|%lld|%lld", proposer, root,
-                     (long long)epoch, (long long)first_index,
-                     (long long)count);
-    if (n < 0 || (size_t)n >= cap - tag_len)
-        return 0;
-    memcpy(out, tag, tag_len);
-    return tag_len + (size_t)n;
-}
-
 /* Sign `desig` with our own key, ASCII hex out (REP_SIG_HEX_LEN + 1 bytes). */
 static int _cosign_hex(const process_t *proc, const uint8_t *desig,
                        size_t dlen, char *hex_out, size_t hex_cap)
@@ -2308,15 +2691,26 @@ static size_t _verified_cosigners(const process_t *proc, json_t *sigs,
  * signed the exact bytes we re-derive. Sized against OUR OWN roster
  * (proc->protocol.num_peers, the mirror of Python's len(peers.all)), so the
  * finalizer cannot also choose the bar it has to clear. */
-static bool _quorum_met(const process_t *proc, json_t *sigs,
-                        const uint8_t *desig, size_t dlen)
+static bool _quorum_met_for(const process_t *proc, json_t *sigs,
+                            const uint8_t *desig, size_t dlen,
+                            const char *group_uuid)
 {
     if (proc == NULL)
         return false;
     peers_read_lock(proc);
-    size_t quorum = proc->protocol.num_peers / 2;
+    /* Sized against the group whose chain the round covers: a child-group
+     * checkpoint must clear THAT group's majority, not the conflated roster a
+     * gateway sees across every group it belongs to. A leaf node (no child
+     * groups) gets num_peers/2 exactly as before. */
+    size_t quorum = _quorum_for_group(proc, group_uuid);
     peers_read_unlock(proc);
     return _verified_cosigners(proc, sigs, desig, dlen) > quorum;
+}
+
+static bool _quorum_met(const process_t *proc, json_t *sigs,
+                        const uint8_t *desig, size_t dlen)
+{
+    return _quorum_met_for(proc, sigs, desig, dlen, NULL);
 }
 
 /* Record one verified co-signature for a round. The map is keyed
@@ -2740,8 +3134,17 @@ static bool handle_checkpoint_propose(const process_t *proc, directory_t *queues
                             json_integer(first_index));
         json_object_set_new(pending_rec, "count", json_integer(count_covered));
     }
+    /* Which chain the proposal names. Compare THAT chain's window, not always
+     * the primary one: a gateway holds several, and comparing the wrong window
+     * would decline every honest child-group proposal (§10.2). */
+    const char *group_str = json_string_value(json_object_get(payload,
+                                                             "group_uuid"));
+    char chain_key[UUID_STRING_LEN + 1];
+    _chain_key(proc, group_str, chain_key, sizeof(chain_key));
+    if (pending_rec != NULL && chain_key[0] != '\0')
+        json_object_set_new(pending_rec, "group_uuid", json_string(chain_key));
     pthread_mutex_lock(&rep_state.lock);
-    transaction_window_root(&rep_state.history, mine);
+    transaction_window_root(_chain_for_key_locked(chain_key), mine);
     _store_pending_locked(&rep_state.checkpoint_pending, key, pending_rec);
     pthread_mutex_unlock(&rep_state.lock);
     json_decref(pending_rec);
@@ -2749,7 +3152,9 @@ static bool handle_checkpoint_propose(const process_t *proc, directory_t *queues
     if (!matches)
     {
         log_debug(proc->logger,
-                  "Reputation: checkpoint_propose window_root mismatch, declining\n");
+                  "Reputation: checkpoint_propose window_root mismatch on "
+                  "chain %s, declining\n",
+                  chain_key[0] ? chain_key : "primary");
         json_decref(payload);
         return true;
     }
@@ -2758,9 +3163,9 @@ static bool handle_checkpoint_propose(const process_t *proc, directory_t *queues
      * checkpoint_sign back to the proposer, naming ourselves. */
     const identity_t *self = _resolve_self_identity(proc);
     uint8_t desig[REP_DESIG_MAX];
-    size_t dlen = _checkpoint_designation(proposer_str, root, epoch,
-                                         first_index, count_covered,
-                                         desig, sizeof(desig));
+    size_t dlen = rep_checkpoint_designation(proposer_str, root, epoch,
+                                            first_index, count_covered,
+                                            chain_key, desig, sizeof(desig));
     char sig_hex[REP_SIG_HEX_LEN + 1] = {0};
     if (self == NULL || dlen == 0
         || _cosign_hex(proc, desig, dlen, sig_hex, sizeof(sig_hex)) != 0)
@@ -2854,10 +3259,15 @@ static bool handle_checkpoint_sign(const process_t *proc, directory_t *queues, g
         json_integer_value(json_object_get(pending, "first_index"));
     int64_t count_covered =
         json_integer_value(json_object_get(pending, "count"));
+    /* The chain came with the round when it was recorded; the co-signature was
+     * made over bytes that include it. */
+    const char *pending_group =
+        json_string_value(json_object_get(pending, "group_uuid"));
     uint8_t desig[REP_DESIG_MAX];
-    size_t dlen = _checkpoint_designation(proposer_str, root, epoch,
-                                         first_index, count_covered,
-                                         desig, sizeof(desig));
+    size_t dlen = rep_checkpoint_designation(proposer_str, root, epoch,
+                                            first_index, count_covered,
+                                            pending_group, desig,
+                                            sizeof(desig));
     if (dlen == 0 || !_verify_cosignature(proc, voter, desig, dlen, ack_sig))
     {
         log_warn(proc->logger,
@@ -2898,6 +3308,14 @@ static bool handle_checkpoint_sign(const process_t *proc, directory_t *queues, g
                             json_integer(first_index));
         json_object_set_new(final_json, "count", json_integer(count_covered));
         json_object_set(final_json, "sigs", sigs);
+        /* Upgrade our own stored copy from the lone self-signature to the
+         * quorum map, so the evidence WE persist is attested by the group
+         * rather than only by us. The proposer never stored its own finalized
+         * checkpoint before this, which left it the one node in the group with
+         * no record of a checkpoint it had itself driven to quorum. */
+        _store_checkpoint(proc, proposer_str, root, epoch, (int)first_index,
+                          (int)count_covered,
+                          pending_group == NULL ? "" : pending_group, sigs);
         generic_msg_t bcast = {0};
         bcast.type = NET_MESSAGE;
         strncpy(bcast.info.net_msg.process, "reputation", PROC_NAME_LEN);
@@ -2946,6 +3364,11 @@ static bool handle_checkpoint_final(const process_t *proc, directory_t *queues, 
         json_decref(payload);
         return false;
     }
+    /* The chain this checkpoint covers, normalized through our own view (§10.2).
+     * Both the signed designation and the quorum size depend on it. */
+    char final_chain[UUID_STRING_LEN + 1];
+    _chain_key(proc, json_string_value(json_object_get(payload, "group_uuid")),
+               final_chain, sizeof(final_chain));
     /* Verify the retained co-signatures before storing the root. This root is
      * the anchor _verify_slash_evidence measures slash evidence against,
      * expressly so the root is "not chosen by the accuser" — which only holds
@@ -2953,11 +3376,12 @@ static bool handle_checkpoint_final(const process_t *proc, directory_t *queues, 
     {
         uint8_t desig[REP_DESIG_MAX];
         size_t dlen = (proposer_str != NULL)
-            ? _checkpoint_designation(proposer_str, root, epoch, first_index,
-                                      count_covered, desig, sizeof(desig))
+            ? rep_checkpoint_designation(proposer_str, root, epoch, first_index,
+                                         count_covered, final_chain, desig,
+                                         sizeof(desig))
             : 0;
         json_t *sigs = json_object_get(payload, "sigs");
-        if (dlen == 0 || !_quorum_met(proc, sigs, desig, dlen))
+        if (dlen == 0 || !_quorum_met_for(proc, sigs, desig, dlen, final_chain))
         {
             log_warn(proc->logger,
                      "Reputation: rejecting checkpoint_final epoch=%lld: %zu "
@@ -2969,16 +3393,989 @@ static bool handle_checkpoint_final(const process_t *proc, directory_t *queues, 
             return true;
         }
     }
-    pthread_mutex_lock(&rep_state.lock);
-    strncpy(rep_state.checkpoint_root, root, TX_HASH_HEX_LEN);
-    rep_state.checkpoint_root[TX_HASH_HEX_LEN] = '\0';
-    rep_state.checkpoint_epoch = epoch;
-    rep_state.checkpoint_set = true;
-    pthread_mutex_unlock(&rep_state.lock);
+    /* Stores the window bounds and the co-signatures alongside the root, and
+     * persists the evidence: this is the instant at which the resident window
+     * and an agreed root describe each other (ISSUES §10.3). */
+    _store_checkpoint(proc, proposer_str, root, epoch, (int)first_index,
+                      (int)count_covered, final_chain,
+                      json_object_get(payload, "sigs"));
     log_info(proc->logger, "Reputation: checkpoint stored epoch=%lld root=%.12s\n",
              (long long)epoch, root);
     json_decref(payload);
     return true;
+}
+
+/****************************
+ * Verifiable warm start (ISSUES.md §10.3)
+ *
+ * Mirrors Python repprocess._persist_history / _rebuild_from_evidence /
+ * _attested_ceilings / _grade_restored_reputations / _maybe_checkpoint, and
+ * reads and writes the SAME `reputation-history.cfg.json` document (plain JSON,
+ * schema-pinned — see reputation.h REP_EVIDENCE_*).
+ ****************************/
+
+/* --- Operational snapshot (`reputation.cfg.json`) -------------------------
+ *
+ * C had no reputation persistence at all before this: nothing wrote the
+ * snapshot and nothing read it, so a C node always cold-started and there was
+ * no warm start for the evidence above to make verifiable.
+ *
+ * Written as plain JSON rather than through the config-registry framework, and
+ * carrying Python's `__type__` tag rather than C's `typename`, for one reason:
+ * warm-start state is the SAME state in both runtimes, so a node of either kind
+ * should be able to resume from a snapshot the other wrote. That is the same
+ * argument that keeps the wire protocol strings byte-identical to Python's enum
+ * values — the identifier is a shared constant, not a language artifact. The
+ * reader tolerates the tag being absent.
+ *
+ * Only peers strictly above the persist threshold survive a restart, mirroring
+ * Python's two-sided filter (see doc/architecture/persistent-cohort.md). Self
+ * is always kept. */
+#define REP_PERSIST_THRESHOLD_DEFAULT 0.5
+#define REP_PERSIST_THRESHOLD \
+    (reputation_env_double("AT_REP_PERSIST_THRESHOLD", \
+                           REP_PERSIST_THRESHOLD_DEFAULT))
+#define REP_SNAPSHOT_TYPE \
+    "autonomous_trust.core._python.reputation.reputation.Reputations"
+
+static int _snapshot_path(char *out, size_t cap)
+{
+    char cfg_dir[CFG_PATH_LEN + 1] = {0};
+    if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) < 0)
+        return -1;
+    int n = snprintf(out, cap, "%s/%s%s", cfg_dir, REP_SNAPSHOT_FILE,
+                     CFG_FILE_EXT);
+    if (n < 0 || (size_t)n >= cap)
+        return -1;
+    return 0;
+}
+
+/* Load the persisted operational snapshot into rep_state.reputations.
+ * Absent/unreadable is a cold start, not an error. */
+static void _load_reputations(const process_t *proc)
+{
+    char path[CFG_PATH_LEN + 64] = {0};
+    if (_snapshot_path(path, sizeof(path)) != 0)
+        return;
+    json_error_t jerr;
+    json_t *doc = json_load_file(path, 0, &jerr);
+    if (doc == NULL)
+        return;
+    json_t *current = json_object_get(doc, "current");
+    int loaded = 0;
+    if (json_is_object(current))
+    {
+        const char *key;
+        json_t *val;
+        json_object_foreach(current, key, val)
+        {
+            if (!json_is_number(val))
+                continue;
+            uuid_t u;
+            if (uuid_parse(key, u) != 0)
+                continue;
+            pthread_mutex_lock(&rep_state.lock);
+            reputations_update(&rep_state.reputations, u,
+                               json_number_value(val));
+            pthread_mutex_unlock(&rep_state.lock);
+            loaded++;
+        }
+    }
+    json_decref(doc);
+    if (loaded > 0)
+        log_info(proc->logger,
+                 "Reputation: warm start loaded %d persisted peer score(s)\n",
+                 loaded);
+}
+
+/* Write the operational snapshot. Failure is logged and swallowed — a node that
+ * cannot persist should keep running, it simply cold-starts next time. */
+static void _persist_reputations(const process_t *proc)
+{
+    char path[CFG_PATH_LEN + 64] = {0};
+    if (_snapshot_path(path, sizeof(path)) != 0)
+        return;
+    json_t *current = json_object();
+    if (current == NULL)
+        return;
+    double threshold = REP_PERSIST_THRESHOLD;
+    pthread_mutex_lock(&rep_state.lock);
+    map_key_t key = NULL;
+    data_t *val = NULL;
+    map_entries_for_each(&rep_state.reputations.scores, key, val)
+    {
+        double score = 0.0;
+        if (data_floating_pt_dbl(val, &score) != 0)
+            continue;
+        if (score <= threshold)
+            continue;
+        json_object_set_new(current, key, json_real(score));
+    }
+    map_end_for_each
+    pthread_mutex_unlock(&rep_state.lock);
+    json_t *doc = json_pack("{s:s, s:o}", "__type__", REP_SNAPSHOT_TYPE,
+                            "current", current);
+    if (doc == NULL)
+    {
+        json_decref(current);
+        return;
+    }
+    if (json_dump_file(doc, path, JSON_INDENT(2)) != 0)
+        log_warn(proc->logger,
+                 "Reputation: could not persist snapshot to %s\n", path);
+    json_decref(doc);
+}
+
+/* Path of one chain's evidence document, or -1 if it does not fit.
+ *
+ * One file per chain rather than one file holding every chain: it mirrors the
+ * group_child_<name>.cfg.json convention already used for child groups, keeps
+ * the primary file's shape byte-for-byte what it was, and means a corrupt or
+ * stale child file costs that subtree its attestation and nothing else. */
+static int _evidence_path(const char *chain_key, char *out, size_t cap)
+{
+    char cfg_dir[CFG_PATH_LEN + 1] = {0};
+    if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) < 0)
+        return -1;
+    int n;
+    if (chain_key != NULL && chain_key[0] != '\0')
+        n = snprintf(out, cap, "%s/%s-%s%s", cfg_dir, REP_EVIDENCE_FILE,
+                     chain_key, CFG_FILE_EXT);
+    else
+        n = snprintf(out, cap, "%s/%s%s", cfg_dir, REP_EVIDENCE_FILE,
+                     CFG_FILE_EXT);
+    if (n < 0 || (size_t)n >= cap)
+        return -1;
+    return 0;
+}
+
+/* Snapshot one chain's finalized checkpoint. Caller holds the lock. */
+static void _current_checkpoint_locked(const char *chain_key,
+                                       rep_checkpoint_t *out)
+{
+    rep_chain_ckpt_t *slot = _ckpt_slot_locked(chain_key);
+    out->present = (slot != NULL && slot->set);
+    if (!out->present)
+        return;
+    snprintf(out->proposer_uuid, sizeof(out->proposer_uuid), "%s",
+             slot->proposer);
+    snprintf(out->root, sizeof(out->root), "%s", slot->root);
+    snprintf(out->group_uuid, sizeof(out->group_uuid), "%s",
+             (chain_key == NULL) ? "" : chain_key);
+    out->epoch = slot->epoch;
+    out->first_index = slot->first_index;
+    out->count = slot->count;
+    map_key_t key = NULL;
+    data_t *val = NULL;
+    map_entries_for_each(&slot->sigs_final, key, val)
+    {
+        string_t sig = NULL;
+        if (data_string_ptr(val, &sig) == 0 && sig != NULL)
+            map_set(&out->sigs, key, string_data(sig, strlen(sig)));
+    }
+    map_end_for_each
+}
+
+/* Write the evidence behind the reputation snapshot: the resident hash-linked
+ * window plus the quorum-signed checkpoint over it.
+ *
+ * Called from the checkpoint-store path, and deliberately only there: at that
+ * instant the resident window and the agreed root describe each other. Writing
+ * on every commit would be both hotter and LESS useful, since a chain that has
+ * moved past its checkpoint is exactly a chain the rebuild cannot attest.
+ *
+ * Failure is logged and swallowed. The evidence is an optimization of trust —
+ * its absence costs a warm start its elevated tiers and nothing else — so it
+ * must never be able to take down the reputation process. */
+static void _persist_history(const process_t *proc, const char *chain_key)
+{
+    char path[CFG_PATH_LEN + 64] = {0};
+    if (_evidence_path(chain_key, path, sizeof(path)) != 0)
+    {
+        log_warn(proc->logger,
+                 "Reputation: cannot build evidence path; not persisting\n");
+        return;
+    }
+    rep_checkpoint_t ckpt;
+    if (rep_checkpoint_init(&ckpt) != 0)
+        return;
+    json_t *doc = NULL;
+    pthread_mutex_lock(&rep_state.lock);
+    _current_checkpoint_locked(chain_key, &ckpt);
+    int err = reputation_evidence_to_json(_chain_for_key_locked(chain_key),
+                                          &ckpt, &doc);
+    pthread_mutex_unlock(&rep_state.lock);
+    rep_checkpoint_free(&ckpt);
+    if (err != 0 || doc == NULL)
+    {
+        log_warn(proc->logger, "Reputation: could not build evidence doc\n");
+        return;
+    }
+    if (json_dump_file(doc, path, JSON_INDENT(2)) != 0)
+        log_warn(proc->logger,
+                 "Reputation: could not persist evidence to %s\n", path);
+    json_decref(doc);
+}
+
+/* Record a finalized checkpoint (root + window bounds + the co-signatures that
+ * finalized it) and persist the evidence beside it.
+ *
+ * The co-signatures are retained past the live round on purpose: at boot the
+ * rebuild has to verify the same quorum a live receiver does. A fuller
+ * signature set for the checkpoint we already hold is an UPGRADE, not a
+ * duplicate — the proposer self-stores holding only its own signature, and the
+ * quorum map only exists a round later. */
+static void _store_checkpoint(const process_t *proc, const char *proposer,
+                              const char *root, int64_t epoch,
+                              int first_index, int count,
+                              const char *chain_key, json_t *sigs)
+{
+    if (proposer == NULL || root == NULL)
+        return;
+    size_t incoming = json_is_object(sigs) ? json_object_size(sigs) : 0;
+    bool write = false;
+    pthread_mutex_lock(&rep_state.lock);
+    rep_chain_ckpt_t *slot = _ckpt_slot_locked(chain_key);
+    if (slot == NULL)
+    {
+        pthread_mutex_unlock(&rep_state.lock);
+        return;
+    }
+    bool same = slot->set && slot->epoch == epoch
+        && strncmp(slot->proposer, proposer, UUID_STRING_LEN + 1) == 0;
+    if (!same || incoming > map_size(&slot->sigs_final))
+    {
+        snprintf(slot->proposer, sizeof(slot->proposer), "%s", proposer);
+        snprintf(slot->root, sizeof(slot->root), "%s", root);
+        slot->epoch = epoch;
+        slot->first_index = first_index;
+        slot->count = count;
+        slot->set = true;
+        map_free(&slot->sigs_final);
+        map_init(&slot->sigs_final);
+        if (json_is_object(sigs))
+        {
+            const char *voter;
+            json_t *sig;
+            json_object_foreach(sigs, voter, sig)
+            {
+                const char *hex = json_string_value(sig);
+                if (hex != NULL)
+                    map_set(&slot->sigs_final, (map_key_t)voter,
+                            string_data((string_t)hex, strlen(hex)));
+            }
+        }
+        if (chain_key == NULL || chain_key[0] == '\0')
+            _mirror_primary_ckpt_locked();
+        write = true;
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    if (write)
+        _persist_history(proc, chain_key);
+}
+
+/* Clamp each restored score to what the evidence supports for that peer: its
+ * `ceilings` entry, or — for a peer the evidence does not cover at all — the
+ * ceiling of REP_UNVERIFIED_RESTORE_TIER.
+ *
+ * Self is never clamped (our own score is not a peer judgement). Clamping is
+ * one-directional, so this can only withhold standing, never confer it, and it
+ * composes with the staleness decay: decay is the time-out-of-contact axis,
+ * this is the "nothing here shows you earned that" axis.
+ *
+ * There is no separate release step — the clamped value is where the peer
+ * resumes climbing, so elevation is re-earned through the ordinary scoring
+ * path. Mirrors Python _grade_restored_reputations. */
+static void _grade_restored_reputations(const process_t *proc, map_t *ceilings,
+                                        const char *self_uuid_str)
+{
+    double unverified = _tier_ceiling(REP_UNVERIFIED_RESTORE_TIER);
+    int clamped = 0;
+    pthread_mutex_lock(&rep_state.lock);
+    map_key_t key = NULL;
+    data_t *val = NULL;
+    map_entries_for_each(&rep_state.reputations.scores, key, val)
+    {
+        if (self_uuid_str != NULL && strcmp(key, self_uuid_str) == 0)
+            continue;
+        double score = 0.0;
+        if (data_floating_pt_dbl(val, &score) != 0)
+            continue;
+        double ceiling = unverified;
+        data_t *cd = NULL;
+        if (ceilings != NULL && map_get(ceilings, key, &cd) == 0 && cd != NULL)
+            data_floating_pt_dbl(cd, &ceiling);
+        if (score <= ceiling)
+            continue;
+        map_set(&rep_state.reputations.scores, key,
+                floating_pt_dbl_data(ceiling));
+        /* Remember what we clamped away from: it bounds any later lift from
+         * child-group evidence (§10.2). */
+        map_set(&rep_state.restore_clamped, key, floating_pt_dbl_data(score));
+        clamped++;
+    }
+    map_end_for_each
+    pthread_mutex_unlock(&rep_state.lock);
+    if (clamped > 0)
+        log_info(proc->logger,
+                 "Reputation: warm start clamped %d peer score(s) to what the "
+                 "evidence supports\n", clamped);
+}
+
+/* Treat the persisted snapshot's mtime as the instant of our last AT-bounded
+ * activity: seed every warm-started peer's idle clock to it and apply the
+ * offline-gap decay up front, so a long-dormant cohort comes up with faded —
+ * not stale-inflated — trust. No-op when there is no snapshot on disk.
+ * Mirrors Python _seed_idle_from_snapshot. */
+static void _seed_idle_from_snapshot(const process_t *proc,
+                                     const char *self_uuid_str)
+{
+    char cfg_dir[CFG_PATH_LEN + 1] = {0};
+    if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) < 0)
+        return;
+    char path[CFG_PATH_LEN + 64] = {0};
+    int n = snprintf(path, sizeof(path), "%s/%s%s", cfg_dir,
+                     REP_SNAPSHOT_FILE, CFG_FILE_EXT);
+    if (n < 0 || (size_t)n >= sizeof(path))
+        return;
+    struct stat st;
+    if (stat(path, &st) != 0)
+        return;
+    double mtime = (double)st.st_mtime;
+    double idle = (double)time(NULL) - mtime;
+    if (idle < 0.0)
+        idle = 0.0;
+    int faded = 0;
+    pthread_mutex_lock(&rep_state.lock);
+    map_key_t key = NULL;
+    data_t *val = NULL;
+    map_entries_for_each(&rep_state.reputations.scores, key, val)
+    {
+        if (self_uuid_str != NULL && strcmp(key, self_uuid_str) == 0)
+            continue;
+        map_set(&rep_state.last_interaction, key, floating_pt_dbl_data(mtime));
+        double score = 0.0;
+        if (data_floating_pt_dbl(val, &score) != 0)
+            continue;
+        double decayed = reputation_decayed_score(score, idle);
+        if (fabs(decayed - score) > 1e-12)
+        {
+            map_set(&rep_state.reputations.scores, key,
+                    floating_pt_dbl_data(decayed));
+            faded++;
+        }
+    }
+    map_end_for_each
+    pthread_mutex_unlock(&rep_state.lock);
+    if (faded > 0)
+        log_info(proc->logger,
+                 "Reputation: warm start faded %d peer score(s) over a "
+                 "%.0fs offline gap\n", faded, idle);
+}
+
+/* Relax idle peers' operational reputation toward almost-neutral. Throttled to
+ * REP_DECAY_SWEEP_INTERVAL. A peer with no recorded interaction is stamped
+ * rather than decayed, so its idle clock starts now instead of at the epoch.
+ * Mirrors Python _decay_reputations. */
+static void _decay_reputations(const process_t *proc, double present)
+{
+    pthread_mutex_lock(&rep_state.lock);
+    if (rep_state.decay_swept
+        && present - rep_state.last_decay_sweep < REP_DECAY_SWEEP_INTERVAL)
+    {
+        pthread_mutex_unlock(&rep_state.lock);
+        return;
+    }
+    rep_state.last_decay_sweep = present;
+    rep_state.decay_swept = true;
+    /* Collect the changes under the lock, publish after releasing it: the
+     * tier/exclusion publication sends IPC and must not hold rep_state. */
+    char changed[MAX_CHAIN_LEN][UUID_STRING_LEN + 1];
+    double changed_score[MAX_CHAIN_LEN];
+    int n_changed = 0;
+    map_key_t key = NULL;
+    data_t *val = NULL;
+    map_entries_for_each(&rep_state.reputations.scores, key, val)
+    {
+        double score = 0.0;
+        if (data_floating_pt_dbl(val, &score) != 0)
+            continue;
+        /* A slashed peer's floor is authoritative; decay would drift the value
+         * the slash pinned. Self is never decayed. */
+        data_t *sl = NULL;
+        if (map_get(&rep_state.slashed, key, &sl) == 0 && sl != NULL)
+            continue;
+        double last = 0.0;
+        data_t *ld = NULL;
+        bool have_last = (map_get(&rep_state.last_interaction, key, &ld) == 0
+                          && ld != NULL
+                          && data_floating_pt_dbl(ld, &last) == 0);
+        if (!have_last)
+        {
+            /* First sight of this peer: start its idle clock now rather than
+             * at the epoch, which would decay it as if absent since 1970. */
+            map_set(&rep_state.last_interaction, key,
+                    floating_pt_dbl_data(present));
+            continue;
+        }
+        double decayed = reputation_decayed_score(score, present - last);
+        if (fabs(decayed - score) < 1e-12)
+            continue;
+        map_set(&rep_state.reputations.scores, key,
+                floating_pt_dbl_data(decayed));
+        if (n_changed < MAX_CHAIN_LEN)
+        {
+            strncpy(changed[n_changed], key, UUID_STRING_LEN);
+            changed[n_changed][UUID_STRING_LEN] = '\0';
+            changed_score[n_changed] = decayed;
+            n_changed++;
+        }
+    }
+    map_end_for_each
+    pthread_mutex_unlock(&rep_state.lock);
+    for (int i = 0; i < n_changed; i++)
+    {
+        uuid_t u;
+        if (uuid_parse(changed[i], u) != 0)
+            continue;
+        _publish_tier_change(proc, u, changed_score[i]);
+        _publish_reputation_change(u, changed_score[i]);
+    }
+}
+
+/* Stamp "we just transacted with this peer" — resets its idle clock so the
+ * staleness sweep leaves an actively-interacting peer alone. */
+static void _note_interaction(const uuid_t peer_uuid)
+{
+    char key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, key);
+    pthread_mutex_lock(&rep_state.lock);
+    map_set(&rep_state.last_interaction, (map_key_t)key,
+            floating_pt_dbl_data((double)time(NULL)));
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+/* At start-up, re-establish the committed history from the persisted evidence
+ * and grade the restored reputations by whether that evidence VERIFIES.
+ *
+ * Three questions, in order, every negative answer degrading to the same safe
+ * outcome rather than failing the process:
+ *   1. Does the chain's hash-linkage hold? (checked inside
+ *      reputation_evidence_from_json — a broken link means the file was
+ *      altered or truncated.)
+ *   2. Does the root recomputed over the checkpoint's window equal the root
+ *      the checkpoint commits to? This is what ties the entries on disk to the
+ *      thing that was signed.
+ *   3. Does a quorum of co-signatures over that checkpoint verify against keys
+ *      WE hold? The same test handle_checkpoint_final applies live, sized
+ *      against our own roster so whoever wrote the file cannot also choose the
+ *      bar it has to clear.
+ *
+ * Only if all three hold is the chain adopted. It is NOT adopted on failure,
+ * and that is the load-bearing part: hash digests are public, so anyone can
+ * produce a self-consistent chain, and adopting one would let the scoring path
+ * re-derive the very elevated scores the clamp withholds. */
+/* Verify and (only then) adopt ONE chain's persisted evidence, folding its
+ * per-peer ceilings into @p ceilings. Returns true if the chain was adopted.
+ *
+ * Where two attested windows bound the same peer, the HIGHER bound wins: both
+ * are quorum-attested statements about that peer and the restored score is a
+ * single scalar, so letting one group's thin window suppress standing another
+ * group's quorum actually witnessed would penalize the peer for our topology
+ * rather than for its behaviour. */
+static bool _rebuild_one_chain(const process_t *proc, const char *chain_key,
+                               const char *self_uuid_str, map_t *ceilings)
+{
+    char path[CFG_PATH_LEN + 64] = {0};
+    if (_evidence_path(chain_key, path, sizeof(path)) != 0)
+        return false;
+    json_error_t jerr;
+    json_t *doc = json_load_file(path, 0, &jerr);
+    if (doc == NULL)
+    {
+        /* No evidence on disk: a cold start, or a warm start from a snapshot
+         * written before checkpointing ever ran. Persisted scores are
+         * unattested, so they are clamped. */
+        return false;
+    }
+
+    tx_history_t *loaded = NULL;
+    rep_checkpoint_t ckpt;
+    bool verified = false;
+    if (tx_history_create(&loaded) == 0 && rep_checkpoint_init(&ckpt) == 0)
+    {
+        if (reputation_evidence_from_json(doc, loaded, &ckpt) != 0)
+        {
+            log_warn(proc->logger,
+                     "Reputation: unusable warm-start evidence (bad schema, "
+                     "malformed entry, or broken hash link); restoring at "
+                     "tier %d\n", REP_UNVERIFIED_RESTORE_TIER);
+        }
+        else if (!ckpt.present)
+        {
+            log_info(proc->logger,
+                     "Reputation: warm-start evidence carries no checkpoint; "
+                     "restoring at tier %d\n", REP_UNVERIFIED_RESTORE_TIER);
+        }
+        else
+        {
+            char recomputed[TX_HASH_HEX_LEN + 1] = {0};
+            if (reputation_checkpoint_window_root(loaded, &ckpt,
+                                                  recomputed) != 0)
+            {
+                log_warn(proc->logger,
+                         "Reputation: warm-start evidence does not cover "
+                         "checkpoint window [%d, %d); restoring at tier %d\n",
+                         ckpt.first_index, ckpt.first_index + ckpt.count,
+                         REP_UNVERIFIED_RESTORE_TIER);
+            }
+            else if (strncmp(recomputed, ckpt.root, TX_HASH_HEX_LEN + 1) != 0)
+            {
+                log_warn(proc->logger,
+                         "Reputation: warm-start evidence root mismatch "
+                         "(checkpoint commits to %.12s, entries hash to "
+                         "%.12s); restoring at tier %d\n", ckpt.root,
+                         recomputed, REP_UNVERIFIED_RESTORE_TIER);
+            }
+            else
+            {
+                uint8_t desig[REP_DESIG_MAX];
+                size_t dlen = rep_checkpoint_designation(
+                    ckpt.proposer_uuid, ckpt.root, ckpt.epoch,
+                    ckpt.first_index, ckpt.count, ckpt.group_uuid, desig,
+                    sizeof(desig));
+                /* Re-use the live path's quorum test verbatim, including its
+                 * roster sizing. A roster we have not yet loaded resolves no
+                 * co-signers, which fails CLOSED: capped, never forged. */
+                json_t *sigs = json_object();
+                map_key_t key = NULL;
+                data_t *val = NULL;
+                map_entries_for_each(&ckpt.sigs, key, val)
+                {
+                    string_t hex = NULL;
+                    if (data_string_ptr(val, &hex) == 0 && hex != NULL)
+                        json_object_set_new(sigs, key, json_string(hex));
+                }
+                map_end_for_each
+                if (dlen == 0
+                    || !_quorum_met_for(proc, sigs, desig, dlen, chain_key))
+                {
+                    log_warn(proc->logger,
+                             "Reputation: warm-start evidence epoch=%lld has "
+                             "%zu verified co-signature(s), short of quorum; "
+                             "restoring at tier %d\n", (long long)ckpt.epoch,
+                             dlen == 0 ? (size_t)0
+                                 : _verified_cosigners(proc, sigs, desig, dlen),
+                             REP_UNVERIFIED_RESTORE_TIER);
+                }
+                else
+                {
+                    verified = true;
+                    reputation_evidence_ceilings(loaded, &ckpt, self_uuid_str,
+                                                 ceilings);
+                }
+                json_decref(sigs);
+            }
+        }
+
+        if (verified)
+        {
+            pthread_mutex_lock(&rep_state.lock);
+            /* Adopt the attested history, and with it the checkpoint that
+             * attests it, so this node resumes with a window a peer can audit
+             * and an anchor slash evidence can be measured against. */
+            tx_history_t *dest = _chain_for_key_locked(chain_key);
+            tx_history_free(dest);
+            *dest = *loaded;
+            memset(loaded, 0, sizeof(*loaded));  /* ownership moved */
+            rep_chain_ckpt_t *slot = _ckpt_slot_locked(chain_key);
+            if (slot != NULL)
+            {
+                snprintf(slot->proposer, sizeof(slot->proposer), "%s",
+                         ckpt.proposer_uuid);
+                snprintf(slot->root, sizeof(slot->root), "%s", ckpt.root);
+                slot->epoch = ckpt.epoch;
+                slot->first_index = ckpt.first_index;
+                slot->count = ckpt.count;
+                slot->set = true;
+                map_free(&slot->sigs_final);
+                map_init(&slot->sigs_final);
+                map_key_t key = NULL;
+                data_t *val = NULL;
+                map_entries_for_each(&ckpt.sigs, key, val)
+                {
+                    string_t hex = NULL;
+                    if (data_string_ptr(val, &hex) == 0 && hex != NULL)
+                        map_set(&slot->sigs_final, key,
+                                string_data(hex, strlen(hex)));
+                }
+                map_end_for_each
+                /* Resume our OWN epoch counter past the persisted checkpoint.
+                 * Peers dedup on (proposer, epoch, chain) and their rings are
+                 * not reset by our restart, so a restarted proposer beginning
+                 * again at 1 would have its first proposals discarded as
+                 * re-broadcasts. */
+                if (self_uuid_str != NULL
+                    && strcmp(ckpt.proposer_uuid, self_uuid_str) == 0
+                    && ckpt.epoch > slot->own_epoch)
+                    slot->own_epoch = ckpt.epoch;
+            }
+            if (chain_key == NULL || chain_key[0] == '\0')
+                _mirror_primary_ckpt_locked();
+            int adopted = dest->committed_count;
+            pthread_mutex_unlock(&rep_state.lock);
+            log_info(proc->logger,
+                     "Reputation: warm start VERIFIED — chain=%s, %d committed "
+                     "entries, checkpoint epoch=%lld, %zu evidence-backed "
+                     "peer(s)\n",
+                     (chain_key != NULL && chain_key[0]) ? chain_key : "primary",
+                     adopted, (long long)ckpt.epoch, map_size(ceilings));
+        }
+        rep_checkpoint_free(&ckpt);
+    }
+    if (loaded != NULL)
+        tx_history_destroy(loaded);
+    json_decref(doc);
+    return verified;
+}
+
+/* Boot-time restore: the PRIMARY chain only, then clamp.
+ *
+ * A gateway's child groups arrive over IPC (CHILD_GROUP from the identity
+ * process) AFTER this runs, so at this point the node does not yet know which
+ * subtrees are its own -- and reading a file for a group we may not gateway is
+ * exactly what must not happen. The child chains are restored by
+ * _restore_child_evidence once the group set lands. */
+static void _rebuild_from_evidence(const process_t *proc,
+                                   const char *self_uuid_str)
+{
+    map_t ceilings;
+    map_init(&ceilings);
+    _rebuild_one_chain(proc, "", self_uuid_str, &ceilings);
+    _grade_restored_reputations(proc, &ceilings, self_uuid_str);
+    map_free(&ceilings);
+}
+
+/* A document must cover the chain it is NAMED for. A child document claiming
+ * the primary chain (or another group's) would otherwise be adopted as that
+ * chain's history on the strength of signatures made over different bytes. */
+static bool _evidence_names_chain(const char *path, const char *chain_key)
+{
+    json_error_t jerr;
+    json_t *doc = json_load_file(path, 0, &jerr);
+    if (doc == NULL)
+        return false;
+    json_t *ck = json_object_get(doc, "checkpoint");
+    bool ok = true;
+    if (json_is_object(ck))
+    {
+        const char *claimed = json_string_value(json_object_get(ck,
+                                                               "group_uuid"));
+        if (claimed == NULL)
+            claimed = "";
+        ok = (strncmp(claimed, chain_key, UUID_STRING_LEN + 1) == 0);
+    }
+    json_decref(doc);
+    return ok;
+}
+
+/* Restore a gateway's child-group chains once the group set has arrived, one
+ * attempt per group (ISSUES.md §10.2).
+ *
+ * This runs late by necessity, which shapes what it may do to a live score: it
+ * only ever LIFTS, and never above what was persisted. A peer attested solely
+ * in a child group was clamped at boot as uncovered, and this returns it to
+ * what its subtree's evidence bears out. Lowering here would be wrong twice
+ * over -- the peer may have earned standing since boot, and late-arriving
+ * evidence is not a reason to discount it. Mirrors Python
+ * _restore_child_evidence. */
+static void _restore_child_evidence(const process_t *proc,
+                                    const char *self_uuid_str)
+{
+    if (proc == NULL || proc->protocol.child_groups == NULL)
+        return;
+    /* Plain iteration over the key array rather than map_entries_for_each:
+     * that macro declares its own locals, so nesting it around the per-peer
+     * loop below shadows them (-Werror=shadow). */
+    array_t *groups = map_keys(proc->protocol.child_groups);
+    size_t n_groups = array_size(groups);
+    for (size_t gi = 0; gi < n_groups; gi++)
+    {
+        data_t *gk_dat = NULL;
+        if (array_get(groups, (int)gi, &gk_dat) != 0)
+            continue;
+        map_key_t gkey = NULL;
+        if (data_string_ptr(gk_dat, &gkey) != 0 || gkey == NULL)
+            continue;
+        pthread_mutex_lock(&rep_state.lock);
+        data_t *seen = NULL;
+        bool tried = (map_get(&rep_state.child_evidence_tried, gkey, &seen) == 0);
+        if (!tried)
+            map_set(&rep_state.child_evidence_tried, gkey, integer_data(1));
+        pthread_mutex_unlock(&rep_state.lock);
+        if (tried)
+            continue;
+        char path[CFG_PATH_LEN + 64] = {0};
+        if (_evidence_path(gkey, path, sizeof(path)) != 0)
+            continue;
+        if (!_evidence_names_chain(path, gkey))
+        {
+            log_warn(proc->logger,
+                     "Reputation: evidence for chain %s names another chain; "
+                     "refusing it\n", gkey);
+            continue;
+        }
+        map_t ceilings;
+        map_init(&ceilings);
+        if (_rebuild_one_chain(proc, gkey, self_uuid_str, &ceilings))
+        {
+            map_key_t pkey = NULL;
+            data_t *pval = NULL;
+            map_entries_for_each(&ceilings, pkey, pval)
+            {
+                double ceiling = 0.0;
+                if (data_floating_pt_dbl(pval, &ceiling) != 0)
+                    continue;
+                uuid_t peer;
+                if (uuid_parse(pkey, peer) != 0)
+                    continue;
+                double current = 0.0;
+                double bound = ceiling;
+                pthread_mutex_lock(&rep_state.lock);
+                bool have = (reputations_get(&rep_state.reputations, peer,
+                                             &current) == 0);
+                data_t *cd = NULL;
+                if (have
+                    && map_get(&rep_state.restore_clamped, pkey, &cd) == 0
+                    && cd != NULL)
+                {
+                    double persisted = 0.0;
+                    if (data_floating_pt_dbl(cd, &persisted) == 0
+                        && persisted < bound)
+                        bound = persisted;
+                }
+                bool lift = have && bound > current;
+                if (lift)
+                    reputations_update(&rep_state.reputations, peer, bound);
+                pthread_mutex_unlock(&rep_state.lock);
+                if (lift)
+                {
+                    log_info(proc->logger,
+                             "Reputation: child-group evidence lifted %s "
+                             "%.3f -> %.3f\n", pkey, current, bound);
+                    _publish_tier_change(proc, peer, bound);
+                    _publish_reputation_change(peer, bound);
+                }
+            }
+            map_end_for_each
+        }
+        map_free(&ceilings);
+    }
+}
+
+/* A per-node offset into the checkpoint interval, so members do not all
+ * propose on the same tick: every member co-signs every proposal, so N nodes
+ * proposing together cost N² messages in one burst. Derived from our own uuid
+ * rather than drawn randomly, so the phase survives a restart. Mirrors Python
+ * _checkpoint_phase. */
+static double _checkpoint_phase(const char *self_uuid_str)
+{
+    if (self_uuid_str == NULL)
+        return 0.0;
+    uuid_t u;
+    if (uuid_parse(self_uuid_str, u) != 0)
+        return 0.0;
+    /* Python takes UUID.int % interval; the low-order bytes of the same uuid
+     * give an equally-uniform offset without 128-bit arithmetic. The phase is
+     * a load-spreading device, not a protocol value, so the two runtimes need
+     * not agree on it. */
+    uint64_t lo = 0;
+    for (int i = 8; i < 16; i++)
+        lo = (lo << 8) | (uint64_t)u[i];
+    int64_t interval = (int64_t)REP_CHECKPOINT_INTERVAL;
+    if (interval < 1)
+        interval = 1;
+    return (double)(lo % (uint64_t)interval);
+}
+
+/* Originate a checkpoint over THIS node's committed window: stamp the epoch,
+ * sign, seed our own co-signature, self-store, and broadcast
+ * checkpoint_propose. Mirrors Python forward_checkpoint.
+ *
+ * The self-store matters as much as the broadcast: a single-node group needs
+ * no round trip, and it is not special-cased — at boot the same quorum rule
+ * applies, so a lone self-signature attests a genuinely single-node group and
+ * nothing more. */
+static void _originate_checkpoint(const process_t *proc,
+                                  const char *self_uuid_str,
+                                  const char *chain_key)
+{
+    if (self_uuid_str == NULL || self_uuid_str[0] == '\0')
+        return;
+    if (chain_key == NULL)
+        chain_key = "";
+    char root[TX_HASH_HEX_LEN + 1] = {0};
+    int64_t epoch = 0;
+    int first_index = 0, count = 0;
+    pthread_mutex_lock(&rep_state.lock);
+    rep_chain_ckpt_t *slot = _ckpt_slot_locked(chain_key);
+    tx_history_t *chain = _chain_for_key_locked(chain_key);
+    if (slot != NULL)
+    {
+        slot->own_epoch++;
+        epoch = slot->own_epoch;
+    }
+    transaction_window_root(chain, root);
+    count = chain->committed_count;
+    first_index = (count > 0) ? chain->first_index : chain->next_index;
+    pthread_mutex_unlock(&rep_state.lock);
+
+    uint8_t desig[REP_DESIG_MAX];
+    size_t dlen = rep_checkpoint_designation(self_uuid_str, root, epoch,
+                                             first_index, count, chain_key,
+                                             desig, sizeof(desig));
+    char sig_hex[REP_SIG_HEX_LEN + 1] = {0};
+    json_t *sigs = json_object();
+    if (dlen > 0 && _cosign_hex(proc, desig, dlen, sig_hex,
+                                sizeof(sig_hex)) == 0)
+    {
+        json_object_set_new(sigs, self_uuid_str, json_string(sig_hex));
+    }
+    else
+    {
+        log_error(proc->logger,
+                  "Reputation: cannot sign own checkpoint; it cannot reach "
+                  "quorum\n");
+    }
+    /* Record the round so our own handle_checkpoint_sign can tally acks
+     * against it, exactly as if a peer had proposed to us. */
+    /* The round key carries the chain too: a gateway's primary and child rounds
+     * can otherwise collide at the same epoch number. */
+    char key[UUID_STRING_LEN * 2 + 32];
+    snprintf(key, sizeof(key), "%s:%lld:%s", self_uuid_str, (long long)epoch,
+             chain_key);
+    json_t *pending = json_pack("{s:s, s:i, s:i, s:s}", "root", root,
+                                "first_index", first_index, "count", count,
+                                "group_uuid", chain_key);
+    if (pending != NULL)
+    {
+        pthread_mutex_lock(&rep_state.lock);
+        _store_pending_locked(&rep_state.checkpoint_pending, key, pending);
+        pthread_mutex_unlock(&rep_state.lock);
+        json_decref(pending);
+    }
+    if (sig_hex[0] != '\0')
+    {
+        pthread_mutex_lock(&rep_state.lock);
+        _record_cosig_locked(&rep_state.checkpoint_sigs, key, self_uuid_str,
+                             sig_hex);
+        pthread_mutex_unlock(&rep_state.lock);
+    }
+    _store_checkpoint(proc, self_uuid_str, root, epoch, first_index, count,
+                      chain_key, sigs);
+
+    json_t *payload = json_pack("{s:s, s:s, s:I, s:i, s:i, s:s}",
+                                "proposer_uuid", self_uuid_str,
+                                "root", root,
+                                "epoch", (json_int_t)epoch,
+                                "first_index", first_index,
+                                "count", count,
+                                "group_uuid", chain_key);
+    if (payload != NULL)
+    {
+        generic_msg_t bcast = {0};
+        bcast.type = NET_MESSAGE;
+        strncpy(bcast.info.net_msg.process, "reputation", PROC_NAME_LEN);
+        bcast.info.net_msg.function = REP_PROTO_CHECKPOINT_PROPOSE;
+        bcast.info.net_msg.encrypt = true;
+        net_msg_pack_json(&bcast.info.net_msg, payload);
+        json_decref(payload);
+        peers_read_lock(proc);
+        for (size_t i = 0; i < proc->protocol.num_peers; i++)
+        {
+            generic_msg_t per = bcast;
+            memcpy(&per.info.net_msg.to_whom, &proc->protocol.peers[i],
+                   sizeof(public_identity_t));
+            messaging_send("network", NET_MESSAGE, &per, false);
+        }
+        peers_read_unlock(proc);
+    }
+    json_decref(sigs);
+    log_info(proc->logger,
+             "Reputation: proposed checkpoint chain=%s epoch=%lld count=%d "
+             "root=%.12s\n", chain_key[0] ? chain_key : "primary",
+             (long long)epoch, count, root);
+}
+
+/* Originate a checkpoint on the interval, when the window has actually moved.
+ *
+ * Two guards, both about not spending the group's bandwidth for nothing. An
+ * empty window has nothing to attest. A window whose head has not advanced
+ * since the last checkpoint is already attested — re-signing it produces a new
+ * epoch committing to the same root, which no verifier can use for anything
+ * the previous one could not. Mirrors Python _maybe_checkpoint. */
+static void _maybe_checkpoint(const process_t *proc, double present,
+                              const char *self_uuid_str)
+{
+    if (REP_CHECKPOINT_INTERVAL <= 0)
+        return;
+    pthread_mutex_lock(&rep_state.lock);
+    if (!rep_state.checkpoint_phase_taken)
+    {
+        rep_state.next_checkpoint_at = present + _checkpoint_phase(self_uuid_str);
+        rep_state.checkpoint_phase_taken = true;
+        pthread_mutex_unlock(&rep_state.lock);
+        return;
+    }
+    if (present < rep_state.next_checkpoint_at)
+    {
+        pthread_mutex_unlock(&rep_state.lock);
+        return;
+    }
+    rep_state.next_checkpoint_at = present + REP_CHECKPOINT_INTERVAL;
+
+    /* Every chain, each on its own: an idle primary chain is skipped while a
+     * busy child group is checkpointed, and each round is confined to the group
+     * that can actually co-sign it (§10.2). Collect the due chains under the
+     * lock, originate after releasing it -- origination signs and sends. */
+    char due_keys[DEFAULT_MAX_PEERS + 1][UUID_STRING_LEN + 1];
+    int n_due = 0;
+    array_t *child_keys = map_keys(&rep_state.child_hist);
+    size_t n_child = array_size(child_keys);
+    for (size_t ci = 0; ci <= n_child && n_due <= DEFAULT_MAX_PEERS; ci++)
+    {
+        const char *chain_key = "";
+        if (ci > 0)
+        {
+            data_t *kd = NULL;
+            map_key_t k = NULL;
+            if (array_get(child_keys, (int)(ci - 1), &kd) != 0
+                || data_string_ptr(kd, &k) != 0 || k == NULL)
+                continue;
+            chain_key = k;
+        }
+        tx_history_t *chain = _chain_for_key_locked(chain_key);
+        rep_chain_ckpt_t *slot = _ckpt_slot_locked(chain_key);
+        if (chain == NULL || slot == NULL)
+            continue;
+        int head = -1;
+        for (int i = chain->chain_len - 1; i >= 0; i--)
+        {
+            if (chain->chain[i].index >= 0)
+            {
+                head = chain->chain[i].index;
+                break;
+            }
+        }
+        if (head < 0 || head <= slot->last_head)
+            continue;
+        slot->last_head = head;
+        snprintf(due_keys[n_due], sizeof(due_keys[0]), "%s", chain_key);
+        n_due++;
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    for (int i = 0; i < n_due; i++)
+        _originate_checkpoint(proc, self_uuid_str, due_keys[i]);
 }
 
 int reputation_register_handlers(process_t *proc)
@@ -3040,6 +4437,42 @@ void reputation_reset_state(int num_peers)
      * member (never malloc'd). tx_history_free clears contents only. */
     tx_history_free(&rep_state.history);
     tx_history_init(&rep_state.history);
+    /* Child chains are heap-allocated per group; free the histories before
+     * dropping the map or their chains leak. */
+    {
+        map_key_t ck = NULL;
+        data_t *cv = NULL;
+        map_entries_for_each(&rep_state.child_hist, ck, cv)
+        {
+            void *hp = NULL;
+            if (data_object_ptr(cv, &hp) == 0 && hp != NULL)
+            {
+                tx_history_free((tx_history_t *)hp);
+                free(hp);
+            }
+        }
+        map_end_for_each
+    }
+    map_free(&rep_state.child_hist);
+    map_init(&rep_state.child_hist);
+    {
+        map_key_t sk = NULL;
+        data_t *sv = NULL;
+        map_entries_for_each(&rep_state.chain_ckpts, sk, sv)
+        {
+            void *sp = NULL;
+            if (data_object_ptr(sv, &sp) == 0 && sp != NULL)
+            {
+                map_free(&((rep_chain_ckpt_t *)sp)->sigs_final);
+                free(sp);
+            }
+        }
+        map_end_for_each
+    }
+    map_free(&rep_state.chain_ckpts);
+    map_init(&rep_state.chain_ckpts);
+    map_free(&rep_state.round_group);
+    map_init(&rep_state.round_group);
     map_free(&rep_state.peer_tiers);
     map_init(&rep_state.peer_tiers);
     map_free(&rep_state.committed_paxos_rounds);
@@ -3071,6 +4504,23 @@ void reputation_reset_state(int num_peers)
     rep_state.checkpoint_root[0] = '\0';
     rep_state.checkpoint_epoch = 0;
     rep_state.checkpoint_set = false;
+    map_free(&rep_state.checkpoint_sigs_final);
+    map_init(&rep_state.checkpoint_sigs_final);
+    rep_state.checkpoint_first_index = 0;
+    rep_state.checkpoint_count = 0;
+    rep_state.checkpoint_proposer[0] = '\0';
+    rep_state.checkpoint_own_epoch = 0;
+    rep_state.next_checkpoint_at = 0.0;
+    rep_state.checkpoint_phase_taken = false;
+    rep_state.last_checkpoint_head = -1;
+    map_free(&rep_state.last_interaction);
+    map_init(&rep_state.last_interaction);
+    rep_state.last_decay_sweep = 0.0;
+    rep_state.decay_swept = false;
+    map_free(&rep_state.child_evidence_tried);
+    map_init(&rep_state.child_evidence_tried);
+    map_free(&rep_state.restore_clamped);
+    map_init(&rep_state.restore_clamped);
     rep_state.num_updates = 3;  /* default; a fixture may lower it per step */
     rep_state.num_peers = num_peers;
     paxos_init(&rep_state.paxos, num_peers, NULL);
@@ -3208,6 +4658,66 @@ void reputation_get_checkpoint_root(char *out)
     pthread_mutex_unlock(&rep_state.lock);
 }
 
+int reputation_get_evidence_doc(json_t **out)
+{
+    if (out == NULL) return -1;
+    *out = NULL;
+    if (!rep_state.initialized) return -1;
+    rep_checkpoint_t ckpt;
+    if (rep_checkpoint_init(&ckpt) != 0) return -1;
+    pthread_mutex_lock(&rep_state.lock);
+    /* The PRIMARY chain's document — what the corpus pins. A gateway's child
+     * chains each have their own file; those are exercised by the unit tests
+     * rather than the scenario snapshot. */
+    _current_checkpoint_locked("", &ckpt);
+    int err = reputation_evidence_to_json(&rep_state.history, &ckpt, out);
+    pthread_mutex_unlock(&rep_state.lock);
+    rep_checkpoint_free(&ckpt);
+    return err;
+}
+
+int reputation_get_evidence_ceiling(const uuid_t self_uuid,
+                                    const uuid_t peer_uuid, double *out)
+{
+    if (out == NULL || !rep_state.initialized) return -1;
+    /* Self is excluded, as it is in production and in the Python twin: our own
+     * score is not a peer judgement. */
+    char self_key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(self_uuid, self_key);
+    /* Bound over the RESIDENT window, treating it as the attested one: the
+     * assertion is about the arithmetic, and a scenario that has not run a
+     * checkpoint round has no attested subrange to name. */
+    rep_checkpoint_t ckpt;
+    if (rep_checkpoint_init(&ckpt) != 0) return -1;
+    map_t ceilings;
+    if (map_init(&ceilings) != 0)
+    {
+        rep_checkpoint_free(&ckpt);
+        return -1;
+    }
+    pthread_mutex_lock(&rep_state.lock);
+    ckpt.present = true;
+    ckpt.count = rep_state.history.committed_count;
+    ckpt.first_index = (ckpt.count > 0) ? rep_state.history.first_index
+                                        : rep_state.history.next_index;
+    int err = reputation_evidence_ceilings(&rep_state.history, &ckpt, self_key,
+                                           &ceilings);
+    pthread_mutex_unlock(&rep_state.lock);
+    if (err == 0)
+    {
+        char key[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(peer_uuid, key);
+        data_t *d = NULL;
+        if (map_get(&ceilings, (map_key_t)key, &d) == 0 && d != NULL)
+            err = data_floating_pt_dbl(d, out);
+        else
+            err = -1;
+    }
+    map_free(&ceilings);
+    rep_checkpoint_free(&ckpt);
+    return err;
+}
+
 int reputation_get_request_count(void)
 {
     if (!rep_state.initialized) return -1;
@@ -3261,10 +4771,18 @@ void reputation_install_checkpoint(const char *root, int64_t epoch)
     pthread_mutex_lock(&rep_state.lock);
     if (root != NULL && root[0] != '\0')
     {
-        strncpy(rep_state.checkpoint_root, root, TX_HASH_HEX_LEN);
-        rep_state.checkpoint_root[TX_HASH_HEX_LEN] = '\0';
-        rep_state.checkpoint_epoch = epoch;
-        rep_state.checkpoint_set = true;
+        /* Seed the PRIMARY chain's slot, not just the flat mirror: slash
+         * evidence is verified against the finalized slots (any chain's root
+         * may anchor it since §10.2), so a fixture that only wrote the mirror
+         * would leave the evidence unverifiable. */
+        rep_chain_ckpt_t *slot = _ckpt_slot_locked("");
+        if (slot != NULL)
+        {
+            snprintf(slot->root, sizeof(slot->root), "%s", root);
+            slot->epoch = epoch;
+            slot->set = true;
+        }
+        _mirror_primary_ckpt_locked();
     }
     pthread_mutex_unlock(&rep_state.lock);
 }
@@ -3374,10 +4892,40 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
 
     uuid_t self_uuid;
     bool have_self = _resolve_self_uuid(proc, self_uuid);
+    char self_str[UUID_STRING_LEN + 1] = {0};
+    if (have_self)
+        uuid_unparse_lower(self_uuid, self_str);
+
+    /* Warm start, in the order the pieces depend on each other: load the
+     * persisted operational snapshot, fade it by the gap we spent out of
+     * contact, then adopt the persisted history if its checkpoint verifies and
+     * clamp every score the evidence does not bear out. See ISSUES.md §10.3 and
+     * doc/architecture/reputation.md. */
+    _load_reputations(proc);
+    _seed_idle_from_snapshot(proc, have_self ? self_str : NULL);
+    _rebuild_from_evidence(proc, have_self ? self_str : NULL);
 
     while (keep_running(proc, &ctx.sig_q, logger))
     {
         sleep_until(proc, cadence);
+
+        /* Periodic work, throttled internally: relax idle peers toward
+         * almost-neutral, commit to our own window so the persisted evidence
+         * carries a quorum-signed root, and keep the snapshot current. */
+        double present = (double)time(NULL);
+        _decay_reputations(proc, present);
+        if (!have_self)
+        {
+            have_self = _resolve_self_uuid(proc, self_uuid);
+            if (have_self)
+                uuid_unparse_lower(self_uuid, self_str);
+        }
+        _maybe_checkpoint(proc, present, have_self ? self_str : NULL);
+        /* A gateway's child groups arrive over IPC (CHILD_GROUP) after this
+         * process was constructed, so their persisted evidence is restored
+         * here rather than at boot. Idempotent per group. */
+        if (proc->protocol.child_groups != NULL)
+            _restore_child_evidence(proc, have_self ? self_str : NULL);
 
         generic_msg_t buf = {0};
         int rerr = messaging_recv(&buf);
@@ -3397,6 +4945,12 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
             run_message_handlers(proc, queues, buf.type, &buf);
         }
     }
+
+    /* Final flush on the way out, so a clean shutdown leaves a snapshot the
+     * next start can warm-start from (mirrors Python's SIGTERM flush). The
+     * evidence file is already current — it is rewritten at every checkpoint
+     * store — so only the operational scores need saving here. */
+    _persist_reputations(proc);
 
     array_free(queues);
     if (ctx.fd1 > 0)

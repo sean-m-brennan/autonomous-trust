@@ -47,7 +47,7 @@ from autonomous_trust.core.reputation.repprocess import ReputationProcess
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
 from autonomous_trust.core.reputation.reputation import (
     TransactionScore, SlashAttestation, SignedSlash,
-    Checkpoint, SignedCheckpoint)
+    Checkpoint, SignedCheckpoint, evidence_to_dict)
 from autonomous_trust.core.system import CfgIds, PackageHash
 
 from ...common.scenario_loader import Case
@@ -147,6 +147,74 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: checkpoint_root={actual}, expected {expected}'
                     )
+            elif key == 'evidence_doc':
+                # Verifiable warm start (ISSUES §10.3). The persisted-evidence
+                # document is the ONE artifact both runtimes read, so its shape
+                # belongs in the corpus. Pinned by the fields that carry
+                # meaning across the boundary: the schema (a mismatch is a
+                # refusal to rebuild rather than a misparse), the entry count,
+                # and the root the checkpoint block commits to.
+                if not isinstance(expected, dict):
+                    raise AssertionError(
+                        f'{self.id}: evidence_doc must be a mapping, got '
+                        f'{type(expected).__name__}'
+                    )
+                ckpt = getattr(self.process, '_checkpoint', None)
+                signed = None
+                if ckpt is not None:
+                    signed = SignedCheckpoint(
+                        checkpoint=ckpt,
+                        sigs=dict(getattr(self.process,
+                                          '_checkpoint_sigs_final', {})))
+                doc = evidence_to_dict(self.process.history, signed)
+                actual = {
+                    'schema': doc['schema'],
+                    'chain_len': len(doc['chain']),
+                    'checkpoint_root': ((doc['checkpoint'] or {}).get('root')
+                                        or ''),
+                }
+                for field, want in expected.items():
+                    if field not in actual:
+                        raise AssertionError(
+                            f'{self.id}: unsupported evidence_doc field '
+                            f'{field!r}'
+                        )
+                    if actual[field] != want:
+                        raise AssertionError(
+                            f'{self.id}: evidence_doc.{field}='
+                            f'{actual[field]!r}, expected {want!r}'
+                        )
+            elif key == 'evidence_ceiling_of':
+                # { "<other_pid>": float } — the score ceiling the resident
+                # window supports for that peer. This is the security
+                # parameter of warm start made observable: if the two runtimes
+                # disagree here they hand the same peer different tiers on
+                # restore, with nothing else to show it.
+                if not isinstance(expected, dict):
+                    raise AssertionError(
+                        f'{self.id}: evidence_ceiling_of must be a mapping, '
+                        f'got {type(expected).__name__}'
+                    )
+                window = self.process.history._indexed_window()
+                ceilings = self.process._evidence_ceilings(window)
+                for other_pid, want in expected.items():
+                    other = participants.get(other_pid)
+                    if other is None:
+                        raise AssertionError(
+                            f'{self.id}.evidence_ceiling_of: unknown '
+                            f'participant {other_pid!r}'
+                        )
+                    got = ceilings.get(str(other.identity.uuid))
+                    if got is None:
+                        raise AssertionError(
+                            f'{self.id}.evidence_ceiling_of[{other_pid}]: not '
+                            f'bounded by the window (expected {want!r})'
+                        )
+                    if abs(got - float(want)) > 1e-3:
+                        raise AssertionError(
+                            f'{self.id}.evidence_ceiling_of[{other_pid}]='
+                            f'{got:.4f}, expected {float(want):.4f}'
+                        )
             elif key == 'last_id_set':
                 actual = self.process.last_id is not None
                 if actual != bool(expected):

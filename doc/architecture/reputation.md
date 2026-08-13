@@ -204,29 +204,182 @@ dormancy comes up with appropriately faded, not stale-inflated, trust. This is
 local-view only: decay is wall-clock driven and never serialized onto the wire,
 so it is invisible to the Python↔C conformance corpus.
 
-### Hardening: floor, not full restoration
+## Verifiable warm start (evidence, not just durability)
 
-This is specified here and not built; it is tracked in
-[`ISSUES.md`](../../ISSUES.md) §10.3. Warm start reloads the persisted
-operational reputation scalar (subject to the decay above), so a *recently*-active
-peer with little decay is restored to whatever tier that scalar maps to
-(including an elevated tier) the instant it passes admission. The decay axis
-covers *time out of contact*, but not the orthogonal *"this session hasn't
-re-validated you yet"* axis.
+`reputation.cfg.json` records a **conclusion** — `{peer: score}` — and nothing
+about how it was reached. Reloading it makes trust *durable*; it does not make it
+*verifiable*. On its own the file says only that some process with write access
+to the config directory believed a number, which is exactly as true of a
+hand-edited file as of an earned one. The decay axis above covers *time out of
+contact*; this is the orthogonal question of whether the score was ever earned at
+all.
 
-The hardening: warm-start should restore only **low-tier** standing (presence /
-communication) immediately, and require **fresh in-session behavioral evidence**
-before re-granting **elevated or safety-critical tiers**. Rationale: an
-*authenticated-but-compromised* asset passes ZTA admission *by definition* (it
-holds valid credentials, the headline threat), and for a short-lived asset there
-is no time for behavioral re-evaluation to catch it before its window closes; so
-restoring its historically-earned high tier instantly re-opens, for short-lived
-assets, exactly the compromised-but-credentialed hole the system exists to close.
-Implementation sketch: at `_seed_idle_from_snapshot` (and on readmission), clamp
-the restored operational reputation to the tier-1 ceiling until the peer accrues
-N fresh committed in-session transactions, then let it climb normally. Decay and
-this floor compose (one is the time axis, the other the in-session axis). Pairs
-with the human-on-the-loop carve-out for safety-critical capabilities.
+So the evidence is persisted beside the conclusion, in
+`reputation-history.cfg.json`: the hash-linked committed window (Phase 1
+`prev_hash` links) plus the quorum-signed Merkle checkpoint over it (Phase 2).
+The file is **plain JSON**, not a `Configuration` dump — one file is read by both
+runtimes and `Configuration`'s encoder emits `__type__` keys naming Python
+classes, so the same reasoning applies as for the trust ladder (§10.1). Its
+schema is pinned (`EVIDENCE_SCHEMA`), so a future shape change is a refusal to
+rebuild rather than a misparse.
+
+**When it is written.** At `_store_checkpoint` — the instant the resident window
+and an agreed root describe each other. Writing on every commit would be both
+hotter (~16/s in the DoD demo) and *less* useful, since a chain that has moved
+past its checkpoint is precisely a chain the rebuild cannot attest. A fuller
+co-signature set for a checkpoint already stored counts as an upgrade, not a
+duplicate, and rewrites the file: the proposer self-stores holding only its own
+signature, and the quorum map only exists a round later.
+
+Checkpoint origination is **periodic** (`_maybe_checkpoint`,
+`AT_REP_CHECKPOINT_SEC`, default 300 s), skipping intervals in which the window
+head has not moved. Before that it was reactive only — a `Checkpoint` had to be
+put on the reputation queue by something outside the process, and nothing ever
+did, so no deployment held a checkpoint and no warm start could have verified.
+Proposals are phase-offset by a node's own uuid so members do not all propose on
+the same tick (every member co-signs every proposal, so N nodes proposing
+together cost N² messages in one burst).
+
+**What is checked at boot** (`_rebuild_from_evidence`, last in `__init__`), each
+negative answer degrading to the same safe outcome rather than raising:
+
+1. **Hash-linkage** of the persisted chain (`verify_chain_links`). A broken link
+   means the file was altered or truncated.
+2. **Root agreement**: the Merkle root recomputed over the checkpoint's window
+   (selected by absolute index, since the chain may legitimately run past its
+   checkpoint) must equal the root the checkpoint commits to. This is what ties
+   the entries on disk to the thing that was signed.
+3. **Quorum**: more than `_quorum_for_group` distinct co-signatures over that
+   checkpoint must verify against keys **we** hold — the same test
+   `handle_checkpoint_final` applies on the live path, sized against our own
+   roster so whoever wrote the file cannot also choose the bar it must clear.
+
+The chain is adopted **only** if all three hold, and that restriction is
+load-bearing: hash digests are public, so anyone can produce a self-consistent
+chain. Adopting an unattested one would let CTFT re-derive the very elevated
+scores the clamp below withholds, making the clamp decoration.
+
+### Graded restoration: the evidence bounds the value
+
+Verifying that a peer *appears* in an attested window is not enough. The peer
+really does transact, so presence alone would still restore a score typed into
+`reputation.cfg.json` — the original hole, unclosed. The evidence therefore
+bounds the **value**:
+
+- **Covered by the attested window** → ceiling = the mean of the
+  counterparty-side scores the window records for that peer, shrunk toward
+  `PREREP_NEUTRAL` by `RESTORE_SHRINKAGE_K` (the `_prereputation_prior` idiom).
+  Shrinkage is the security parameter: it is what makes two entries at 0.9 worth
+  little, so a forger cannot mint the shortest window that verifies. It is
+  computed from the window and nothing else — deriving it from state the
+  persisted file feeds would let the file vouch for itself.
+- **Not covered** → ceiling = the `UNVERIFIED_RESTORE_TIER` (tier 1) ceiling.
+  Tier 1 (presence / communication) because an *authenticated-but-compromised*
+  asset passes ZTA admission *by definition* — credentials are what it holds —
+  so restoring a historically-earned high tier the instant it is admitted
+  re-opens exactly the hole the system exists to close, and for a short-lived
+  asset there is no time for behavioural re-evaluation to catch it first.
+
+Restoration is `min(persisted, ceiling)`: one-directional, so it can only
+withhold standing, never confer it (an excluded peer is not quietly lifted), and
+self is never clamped. There is no separate release step — the clamped value is
+where the peer resumes climbing, so elevation is re-earned through the ordinary
+scoring path. Decay and this clamp compose: one is the time axis, the other the
+"nothing here shows you earned that" axis. Pairs with the human-on-the-loop
+carve-out for safety-critical capabilities.
+
+### A gateway checkpoints each chain separately
+
+A gateway keeps one `TransactionHistory` per child group beside its primary one, and each
+gets its **own** checkpoints: its own epoch counter, quorum sized against that group's
+members, and its own evidence file (`reputation-history-<group_uuid>.cfg.json`). Before
+this, checkpoint rounds covered only the primary chain, so subtree standing could not be
+attested — and therefore, by the rule above, could not be restored.
+
+`Checkpoint.group_uuid` selects the chain (`''` == primary) and is appended to the signed
+designation **only when non-empty**. That does two things at once: a primary-chain
+designation stays byte-identical to what it was before child chains existed, so every
+existing co-signature, pinned scenario and the C twin keep verifying; and a child-chain
+designation can never collide with a primary one, so a co-signature harvested from a
+child-group round cannot be replayed as agreement about the primary chain — which it
+otherwise could, since two chains can perfectly well produce the same root, epoch and
+bounds.
+
+Two consequences worth knowing:
+
+- **The child restore runs late, so it only ever lifts.** `child_groups` is delivered over
+  IPC *after* `ReputationProcess.__init__`, so a boot-time rebuild cannot know which
+  subtrees are this node's — and reading a file for a group we may not gateway is precisely
+  what must not happen. Child chains are restored on the first `process()` iteration,
+  bounded by the persisted value the peer was clamped away from: it returns standing the
+  subtree's evidence bears out and never lowers a score the peer has earned since boot.
+- **Slash evidence may anchor on any finalized root.** A tx that offended inside a child
+  group is anchored in that group's root; accepting only the primary root would refuse
+  every legitimate subtree slash while adding no security, since each root cleared the same
+  quorum test.
+
+**Both runtimes**, as of 2026-08-13. The C mirror was larger than the Python change: C had
+no child chains at all, and no way for the reputation process to learn its child groups —
+`identity_add_child_group` updated only the identity process's own map, with no equivalent
+of Python's `ChildGroupSet` fan-out. So the C side needed a local-IPC `CHILD_GROUP` message
+(same `group_t` payload as `GROUP`, but a distinct tag: landing in `protocol.group` would
+merge a subtree into the primary slot), then `child_hist` + `round_group` and the group tag
+on `committed`, then the per-chain checkpoint slots on top. Tracked in
+[`ISSUES.md`](../../ISSUES.md) §10.2.
+
+### Both runtimes
+
+The C twin mirrors all of the above, and getting there meant building the warm
+start it hardens: **C had no reputation persistence at all** — nothing wrote
+`reputation.cfg.json` and nothing read it, so a C node always cold-started.
+Landed C-side, in dependency order:
+
+- **The operational snapshot.** `_load_reputations` / `_persist_reputations`
+  (written on the periodic tick and flushed on shutdown), with the same
+  above-threshold persist filter as Python. Plain JSON carrying Python's
+  `__type__` tag rather than C's `typename` envelope, deliberately: warm-start
+  state is the *same* state in both runtimes, so a node of either kind should be
+  able to resume from a snapshot the other wrote — the same argument that keeps
+  the wire protocol strings byte-identical to Python's enum values.
+- **Staleness decay.** `reputation_decayed_score` (pure, same asymmetry, onset
+  and half-life), the throttled `_decay_reputations` sweep, `_note_interaction`
+  at both commit sites, and `_seed_idle_from_snapshot` reading the snapshot's
+  mtime for the offline gap.
+- **The evidence document.** `reputation_evidence_to_json` /
+  `_from_json` read and write the byte-identical shared file;
+  `reputation_checkpoint_window_root` and `reputation_evidence_ceilings` are the
+  same two derivations; `_rebuild_from_evidence` runs the same three checks and
+  re-uses the live path's `_quorum_met` verbatim.
+- **Checkpoint origination**, which C could not do at all: it could co-sign a
+  proposal but never make one, and its proposer never stored the checkpoint it
+  had itself driven to quorum. Both are fixed, plus the periodic trigger.
+
+Two things surfaced while mirroring, both fixed:
+
+- **The C loaders never populated `peer_map`.** Every scoring function —
+  `reputation_pure`, `_contrite_tft`, `_consensus`, `_consensus_by_tier` —
+  reaches its transactions through `tx_history_by_peer`, which reads `peer_map`
+  and nothing else. So a chain arriving by **catch-up** (not just a restored one)
+  was resident and simultaneously invisible to every algorithm that consumes it.
+  Now indexed in both loaders.
+- **The phase offset is not a protocol value.** Python takes `UUID.int %
+  interval`; C uses the uuid's low 8 bytes. Both spread load; neither needs the
+  other's answer, and the corpus does not pin it.
+
+Pinned in the conformance corpus by `warmstart-evidence-document`: the document
+shape (`evidence_doc`) and — more importantly — the per-peer ceiling
+(`evidence_ceiling_of`), because a silent drift in that arithmetic would hand the
+same peer a different tier on each implementation with nothing else to show it.
+
+**Consequence for seeded cohorts.** A seeded prior with no evidence beside it
+restores at tier 1. `tools/seed_dod_cohort.py` therefore writes evidence too —
+it holds the cohort's keys, having generated them — sizing the seeded window so
+`SEED_REPUTATION` clears `SEED_TIER` under the shrinkage above, and reporting
+the tier the window actually supports when the resident chain cap binds. The
+demo warm-starts through the verification path rather than around it. Those
+transactions are seeded rather than observed, and they fold into the consensus
+EMA at startup, so a seeded peer's consensus line begins partway up from
+neutral.
 
 ## Communication cut-off enforcement
 
