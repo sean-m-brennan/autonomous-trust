@@ -196,6 +196,34 @@ int reputation_emit_all(const process_t *proc);
 #define REP_SLASH_REASON_PEER_EXCLUDE      "peer_exclude"
 #define REP_SLASH_REASON_INVALID_TX        "invalid_tx"
 
+/** Originate a deep-resolution query for one peer (ISSUES.md 10.2).
+ *
+ *  Fire-and-forget: the answer arrives later on rep_resolved and lands where
+ *  @ref reputation_resolved_get reads it. Returns the number of child groups
+ *  the query went to -- 0 means this node gateways nothing and no answer can
+ *  come back. @p query_id is caller-chosen so a test or conformance step can
+ *  correlate; pass NULL for a generated one. Mirrors Python
+ *  ReputationProcess.resolve_reputation. */
+size_t reputation_deep_resolve(const process_t *proc, const char *query_id,
+                               const char *peer_uuid, int ttl);
+
+/** Read the outcome of a deep resolution for @p peer_uuid.
+ *
+ *  Returns true when an answer (accepted OR refused) has been recorded.
+ *  @p verified_out distinguishes the two, and @p reason carries WHICH gate
+ *  decided it -- an operator reading "unverified" needs that, and so does a
+ *  conformance assertion that would otherwise pass for the wrong reason. */
+bool reputation_resolved_get(const char *peer_uuid, double *score_out,
+                             bool *have_score_out, bool *verified_out,
+                             char *reason_out, size_t reason_cap);
+
+/** Number of queries this node is currently relaying, and the number it has
+ *  outstanding of its own. The relay table is the capability's only state, so
+ *  a scenario that asserts it is released is asserting the thing that would
+ *  otherwise leak. */
+size_t reputation_resolve_pending_count(void);
+size_t reputation_resolve_outstanding_count(void);
+
 #define EREP_PAXOS 253
 DECLARE_ERROR(EREP_PAXOS, "Paxos consensus error");
 

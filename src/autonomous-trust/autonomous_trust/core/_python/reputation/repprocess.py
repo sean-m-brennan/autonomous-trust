@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import base64
 import json
 import math
 import os
@@ -33,12 +34,18 @@ from ..processes import Process, ProcMeta
 from ..config import (Configuration, atomic_write, from_json_string,
                       to_json_string)
 from ..identity.protocol import IdentityProtocol
+from ..identity.identity import (public_identity_to_canonical,
+                                 public_identity_from_canonical)
+from ..identity.zta.zta_policy import ZtaPolicy
 from .protocol import ReputationProtocol
 from .reputation import (TransactionHistory, Reputation, Reputations,
                          TransactionScore, SlashAttestation, SignedSlash,
                          Checkpoint, SignedCheckpoint, validate_tx_score,
                          PeerReputation, EVIDENCE_FILE, evidence_to_dict,
-                         evidence_from_dict)
+                         evidence_from_dict, RESOLVE_TTL_DEFAULT,
+                         resolve_query_to_dict, resolve_query_from_dict,
+                         resolved_to_dict, resolved_from_dict, verify_resolved,
+                         consensus_score_from_window)
 from ..system import CfgIds, now, encoding, proc_idle_floor
 from .. import _probes
 
@@ -199,6 +206,21 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # a few seconds of demo time while honest peers recover gradually.
     CONSENSUS_EMA_HALF_LIFE = 20
 
+    # --- Deep resolution (ISSUES.md §10.2) ----------------------------
+    # How long a relayed query stays in the pending table, and how long a
+    # query we originated stays outstanding. A deep answer crosses several
+    # hops and each may be a busy process loop, so this is generous; it is
+    # a garbage-collection bound, not a latency target.
+    RESOLVE_PENDING_TTL = _env_float('AT_REP_RESOLVE_TTL_SECS', 30.0)
+    # Query-ids retained for loop detection. Bounded like every other FIFO
+    # dedup ring here (_slashed_seen, _checkpoint_seen).
+    RESOLVE_SEEN_MAX = 256
+    # Distinct verified-and-trusted co-signers an answer must carry. This is
+    # NOT a quorum test: quorum is a fraction of a membership that an opaque
+    # subtree deliberately does not disclose (see verify_resolved). It is the
+    # floor below which an answer is not evidence at all.
+    RESOLVE_MIN_SIGNERS = int(_env_float('AT_REP_RESOLVE_MIN_SIGNERS', 1))
+
     # --- Idle reputation decay (warm-start staleness) -----------------
     # A peer's earned operational reputation is a *memory* of past
     # AT-bounded interaction. Memory should fade: the longer since we
@@ -288,6 +310,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             ReputationProtocol.checkpoint_sign, self.handle_checkpoint_sign)
         self.protocol.register_handler(
             ReputationProtocol.checkpoint_final, self.handle_checkpoint_final)
+        self.protocol.register_handler(
+            ReputationProtocol.rep_resolve, self.handle_resolve)
+        self.protocol.register_handler(
+            ReputationProtocol.rep_resolved, self.handle_resolved)
         self.history = TransactionHistory()
         # Gateway reputation tree: one child chain per child group this
         # node gateways (keyed by group-uuid string). Empty on rank-1
@@ -485,6 +511,31 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # instead of inventing it.
         self._child_evidence_tried: set[str] = set()
         self._restore_clamped: dict[str, float] = {}
+
+        # --- Deep resolution: one peer, on demand (ISSUES.md §10.2) --------
+        # A query we are RELAYING: query-id -> (answer-to uuid-str, deadline,
+        # requesting_process). This is the only state the whole capability
+        # adds anywhere, and it exists because the answer travels back along
+        # the path the query took -- nobody outside a boundary ever exchanges
+        # a message with anybody inside it, so each hop has to remember which
+        # neighbour to hand the answer to. Entries expire (they are not
+        # cleared by an answer that never comes), which is what keeps a
+        # gateway's table bounded when a subtree goes dark.
+        self._resolve_pending: 'OrderedDict[str, tuple]' = OrderedDict()
+        # Query-ids already seen, as a FIFO ring. The loop guard: a tree that
+        # is briefly cyclic (a stale hierarchy claim naming a peer that is
+        # actually above us) would otherwise circulate a query until its TTL
+        # burned down at every node it touched.
+        self._resolve_seen: 'OrderedDict[str, None]' = OrderedDict()
+        # Queries WE originated: query-id -> (peer-uuid-str, deadline).
+        self._resolve_outstanding: dict[str, tuple] = {}
+        # Answers we accepted, peer-uuid-str -> (score, verified, reason).
+        # `reason` is kept beside the boolean deliberately: an operator
+        # reading "unverified" needs to know which gate failed, and a caller
+        # may knowingly accept a weaker answer (feedback_operator_diagnostics).
+        self.resolved_reps: dict[str, tuple] = {}
+        self._zta_policy_cache = None
+        self._zta_anchor_cache = None
 
         # Verifiable warm start: adopt the persisted committed history if its
         # checkpoint verifies, and clamp every restored score the evidence
@@ -3048,6 +3099,363 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             self._per_tier_last[str(peer_uuid)] = dict(ema_by_tier)
         return ema_by_tier
 
+    # --- Deep resolution: one peer, on demand (ISSUES.md §10.2) -----------
+    #
+    # The subtree roster below covers this node's DIRECT children, which is
+    # everything it can score: a peer two levels down transacts in a chain
+    # this node is not a member of. Enumerating the whole tree to reach it
+    # would cost the size of the tree on every query to satisfy a need that
+    # is one peer, so instead the query is relayed to whoever holds the
+    # chain and the answer comes back carrying its own proof.
+
+    def _chain_holding(self, peer_uuid):
+        """The key of the chain whose window holds committed bilateral
+        entries for ``peer_uuid``, or None if no chain of ours does.
+
+        Primary chain first, so a peer we transact with directly is always
+        answered from the chain that actually knows it rather than from a
+        child chain that merely mentions it."""
+        target = str(peer_uuid)
+        for key in self._chain_keys():
+            chain = self._chain_for_key(key)
+            for tx in list(chain):
+                if tx.index is None or tx.p1_id is None or tx.p2_id is None:
+                    continue
+                if target in (str(tx.p1_id), str(tx.p2_id)):
+                    return key
+        return None
+
+    def _resolve_signers(self, sigs):
+        """The co-signer identities an answer carries, in the DRY canonical
+        public form. Only signers we actually hold an identity for: a uuid we
+        cannot produce a key for would travel as an unverifiable name, which
+        is worse than absent -- the receiver would count a signature it has
+        no way to check, or spend time deciding not to."""
+        out = []
+        for voter in (sigs or {}):
+            ident = self._cosigner_identity(voter)
+            if ident is None:
+                continue
+            try:
+                canon = public_identity_to_canonical(ident)
+            except Exception:
+                continue
+            if canon:
+                out.append(canon)
+        return out
+
+    def _resolve_answer(self, query_id, peer_uuid, chain_key):
+        """Build the answer for a peer we hold a chain for, or None when that
+        chain has no finalized checkpoint.
+
+        No checkpoint means no answer at all, deliberately. The window would
+        still be true, but nothing would attest it, and a receiver two hops
+        away has no way to tell an unattested truth from a fabrication -- so
+        sending one would only teach requestors to accept unverifiable
+        answers."""
+        ckpt = self._checkpoints.get(chain_key)
+        if ckpt is None:
+            self.logger.debug(
+                'resolve %s: chain %s has no finalized checkpoint; no answer',
+                str(peer_uuid)[:8], chain_key[:8] or 'primary')
+            return None
+        sigs = self._checkpoint_sigs_final.get(chain_key) or {}
+        chain = self._chain_for_key(chain_key)
+        window = [tx for tx in list(chain) if tx.index is not None]
+        score = self._consensus_reputation(
+            peer_uuid, chain=chain if chain_key else None)
+        return resolved_to_dict(
+            query_id, peer_uuid, window,
+            SignedCheckpoint(checkpoint=ckpt, sigs=sigs),
+            signers=self._resolve_signers(sigs), score=score)
+
+    def _prune_resolve_state(self):
+        """Expire relayed and outstanding queries. Called from the process
+        loop: an answer that never arrives is the normal case for a subtree
+        that has gone dark, and nothing else would ever clear these."""
+        stamp = now().timestamp()
+        for qid in [q for q, v in self._resolve_pending.items() if v[1] <= stamp]:
+            self._resolve_pending.pop(qid, None)
+        for qid in [q for q, v in self._resolve_outstanding.items() if v[1] <= stamp]:
+            peer, _ = self._resolve_outstanding.pop(qid)
+            self.logger.info('Deep resolve of %s timed out', str(peer)[:8])
+
+    def _mark_resolve_seen(self, query_id) -> bool:
+        """Record a query-id, returning False if it was already seen (the
+        caller must then drop it). FIFO-bounded like the other dedup rings."""
+        if query_id in self._resolve_seen:
+            return False
+        self._resolve_seen[query_id] = None
+        while len(self._resolve_seen) > self.RESOLVE_SEEN_MAX:
+            self._resolve_seen.popitem(last=False)
+        return True
+
+    def resolve_reputation(self, queues, peer_uuid, ttl=RESOLVE_TTL_DEFAULT,
+                           query_id=None):
+        """Ask the tree for one peer's reputation. Returns the query id.
+
+        Fire-and-forget by design: the answer arrives later on
+        ``rep_resolved`` and lands in ``self.resolved_reps``. Nothing here
+        blocks, so a caller that needs the value polls that dict or waits for
+        the timeout to log.
+
+        ``query_id`` is caller-chosen so a test or conformance step can
+        correlate the answer it feeds back; production leaves it None. Mirrors
+        C ``reputation_deep_resolve``, which takes the same argument for the
+        same reason."""
+        qid = query_id or '%s-%s' % (str(self.identity.uuid)[:8],
+                                     str(now().timestamp()).replace('.', ''))
+        query = resolve_query_to_dict(qid, peer_uuid, ttl=ttl,
+                                      requesting_process=self.name)
+        self._resolve_outstanding[qid] = (
+            str(peer_uuid), now().timestamp() + self.RESOLVE_PENDING_TTL)
+        self._mark_resolve_seen(qid)
+        self._forward_resolve(queues, query)
+        return qid
+
+    def _forward_resolve(self, queues, query):
+        """Send a query one level DOWN: to each child group we gateway.
+
+        Addressed to the child GROUP rather than to a chosen child gateway.
+        The reputation process holds each child group (over the ChildGroupSet
+        IPC) but not the rank data the identity process picks a gateway with,
+        and asking the group is the same answer without a second, drifting
+        copy of that derivation living here. Everyone in the group sees that
+        somebody asked about a peer -- not who asked, since the query carries
+        no originator -- and whoever holds the chain answers.
+
+        Returns the number of groups the query went to; 0 means this branch
+        is a dead end and no answer will ever come back through us."""
+        if int(query.get('ttl', 0)) <= 0:
+            return 0
+        onward = dict(query)
+        onward['ttl'] = int(query['ttl']) - 1
+        sent = 0
+        for grp_uuid, group in self.child_groups.items():
+            try:
+                msg = Message(self.name, ReputationProtocol.rep_resolve,
+                              to_json_string(onward), group,
+                              from_whom=self.identity)
+                queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+                sent += 1
+            except Full:
+                self.logger.error('_forward_resolve: Network queue full')
+            except Exception as err:
+                self.logger.warning('Could not forward resolve to %s: %s',
+                                    str(grp_uuid)[:8], err)
+        return sent
+
+    def handle_resolve(self, queues, message):
+        """Answer a deep query, or relay it one level down.
+
+        Never blocks awaiting a child: the relay records who to answer and
+        returns immediately, and the answer is an independent message that
+        arrives (or does not) later. That is the same non-blocking model the
+        identity roster walk was designed around -- a handler that waited on
+        a child would stall this process's whole loop for the depth of the
+        subtree."""
+        if message.function != ReputationProtocol.rep_resolve:
+            return False
+        if not message.verified:
+            self.logger.warning('Rejecting unverified rep_resolve from %s',
+                                message.from_whom)
+            return True
+        try:
+            payload = message.obj
+            if isinstance(payload, str):
+                payload = from_json_string(payload)
+            query = resolve_query_from_dict(payload)
+        except (ValueError, TypeError) as err:
+            self.logger.warning('Malformed rep_resolve: %s', err)
+            return True
+        qid = query['query_id']
+        if not self._mark_resolve_seen(qid):
+            return True  # already handled; a loop or a duplicate leg
+        sender = getattr(message.from_whom, 'uuid', None)
+        if sender is None:
+            self.logger.warning('rep_resolve with no sender identity; dropped')
+            return True
+        chain_key = self._chain_holding(query['peer_uuid'])
+        if chain_key is not None:
+            answer = self._resolve_answer(qid, query['peer_uuid'], chain_key)
+            if answer is not None:
+                self._send_resolved(queues, message.from_whom, answer,
+                                    query.get('requesting_process'))
+                return True
+            # Held the chain but cannot attest it: fall through and let a
+            # deeper node that can answer instead.
+        if self._forward_resolve(queues, query):
+            self._resolve_pending[qid] = (
+                str(sender), now().timestamp() + self.RESOLVE_PENDING_TTL,
+                query.get('requesting_process') or '')
+        return True
+
+    def _send_resolved(self, queues, to_whom, answer, requesting_process=None):
+        try:
+            msg = Message(requesting_process or self.name,
+                          ReputationProtocol.rep_resolved,
+                          to_json_string(answer), to_whom,
+                          from_whom=self.identity)
+            queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('_send_resolved: Network queue full')
+        except Exception as err:
+            self.logger.warning('Could not send resolved answer: %s', err)
+
+    def handle_resolved(self, queues, message):
+        """Take an answer: relay it back one hop, or accept it if it is ours.
+
+        An answer for a query-id we never relayed and never sent is dropped
+        unread. Answers are unsolicited-by-construction on a relay path, so
+        the pending table is the only thing distinguishing an answer we are
+        carrying from one somebody injected."""
+        if message.function != ReputationProtocol.rep_resolved:
+            return False
+        if not message.verified:
+            self.logger.warning('Rejecting unverified rep_resolved from %s',
+                                message.from_whom)
+            return True
+        try:
+            payload = message.obj
+            if isinstance(payload, str):
+                payload = from_json_string(payload)
+            qid, peer, score, chain, signed, signers = \
+                resolved_from_dict(payload)
+        except (ValueError, TypeError, KeyError) as err:
+            self.logger.warning('Malformed rep_resolved: %s', err)
+            return True
+        relay = self._resolve_pending.pop(qid, None)
+        if relay is not None:
+            answer_to = self._identity_for_uuid(relay[0])
+            if answer_to is None:
+                self.logger.warning(
+                    'rep_resolved %s: cannot relay, %s no longer known',
+                    qid[:8], relay[0][:8])
+                return True
+            # Relayed VERBATIM, not re-serialized from parsed parts: the
+            # signatures are over bytes, and a re-encode that reordered a key
+            # or renormalized a float would invalidate evidence this node has
+            # no business invalidating. Relays carry, they do not curate.
+            self._send_resolved(queues, answer_to, payload, relay[2] or None)
+            return True
+        outstanding = self._resolve_outstanding.pop(qid, None)
+        if outstanding is None:
+            self.logger.debug('Unsolicited rep_resolved %s; dropped', qid[:8])
+            return True
+        self._accept_resolved(peer, score, chain, signed, signers)
+        return True
+
+    def _identity_for_uuid(self, uuid_str):
+        """A peer identity by uuid string, for addressing a relay hop."""
+        for peer in self.peers.all:
+            if str(peer.uuid) == str(uuid_str):
+                return peer
+        return None
+
+    def _accept_resolved(self, peer, claimed_score, chain, signed, signers):
+        """Verify an answer to a query we made and record the result.
+
+        The recorded score is the one WE compute from the attested window,
+        not the number the holder sent. The holder's value travels only as a
+        cross-check, because the weighting that produced it comes from a
+        node-local capability cache that is not part of any hashed entry and
+        so cannot be re-derived here (see consensus_score_from_window)."""
+        ok, reason = verify_resolved(
+            chain, signed, signers, self._resolve_verify_signature,
+            trust_signer=self._resolve_trust_signer,
+            min_signers=self.RESOLVE_MIN_SIGNERS)
+        if not ok:
+            self.logger.warning('Deep resolve of %s REFUSED: %s',
+                                str(peer)[:8], reason)
+            self.resolved_reps[str(peer)] = (None, False, reason)
+            return
+        score = consensus_score_from_window(
+            peer, chain, self.CONSENSUS_EMA_HALF_LIFE)
+        if score is None:
+            self.resolved_reps[str(peer)] = (
+                None, True, 'attested window holds no bilateral entry for peer')
+            return
+        note = reason
+        if claimed_score is not None and abs(float(claimed_score) - score) > 1e-9:
+            # Not a failure: the holder weights by capability tier and we
+            # cannot. Worth surfacing, because a large gap is also what a
+            # holder shading its own subtree would look like.
+            note = ('%s; holder reported %.4f vs %.4f unweighted here'
+                    % (reason, float(claimed_score), score))
+        self.resolved_reps[str(peer)] = (score, True, note)
+        self.logger.info('Deep resolve of %s = %.4f (%s)',
+                         str(peer)[:8], score, note)
+
+    def _resolve_verify_signature(self, designation, voter, sig, signer):
+        """Verify one co-signature, preferring an identity we already hold
+        over the one the answer supplied. Our own copy cannot have been
+        chosen by the sender; the carried one is the fallback that makes a
+        cross-boundary answer checkable at all."""
+        ident = self._cosigner_identity(voter)
+        if ident is None and isinstance(signer, dict):
+            try:
+                ident = public_identity_from_canonical(signer)
+            except Exception:
+                ident = None
+        if ident is None or sig is None:
+            return False
+        try:
+            if isinstance(sig, str):
+                sig = sig.encode('ascii')
+            ident.signature.public.verify(designation, HexEncoder.decode(sig))
+        except (BadSignatureError, ValueError, TypeError, AttributeError):
+            return False
+        return True
+
+    def _resolve_trust_signer(self, voter, signer):
+        """Whether a co-signer may count toward an answer's evidence.
+
+        A peer we already hold counts: it cleared admission. Otherwise the
+        carried identity must present a credential that chains to one of OUR
+        configured trust anchors -- the §10.5 rule, applied to evidence
+        instead of to federation. Without this gate an answer could ship its
+        own freshly-minted signers and satisfy every signature check in
+        ``verify_resolved`` with keys it generated a moment earlier."""
+        if self._cosigner_identity(voter) is not None:
+            return True
+        if not isinstance(signer, dict):
+            return False
+        cred = signer.get('zta_credential')
+        if not cred:
+            return False
+        try:
+            der = base64.b64decode(cred)
+        except Exception:
+            return False
+        for _name, verifier, _is_op in self._resolve_anchor_verifiers():
+            try:
+                if verifier.verify(der):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _resolve_anchor_verifiers(self):
+        """Anchor verifiers for evidence signers, built once per process from
+        the same ZTA policy the identity process admits peers with."""
+        if self._zta_anchor_cache is None:
+            if self._zta_policy_cache is None:
+                cfg = (self.configs.get(ZtaPolicy.CONFIG_KEY)
+                       if hasattr(self.configs, 'get') else None)
+                if isinstance(cfg, ZtaPolicy):
+                    self._zta_policy_cache = cfg
+                else:
+                    try:
+                        self._zta_policy_cache = ZtaPolicy.load()
+                    except Exception:
+                        self._zta_policy_cache = ZtaPolicy.defaults()
+            try:
+                self._zta_anchor_cache = \
+                    self._zta_policy_cache.create_anchor_verifiers()
+            except Exception:
+                self._zta_anchor_cache = []
+        return self._zta_anchor_cache
+
     def _subtree_roster(self, gateway_uuid):
         """Reputation roster for a node and everything below it in the
         cohort tree.
@@ -3392,6 +3800,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     self._publish_reputation_change(queues, peer_uuid, rep_score)
 
                 present = now().timestamp()
+                # Expire deep-resolution state. A relayed query whose subtree
+                # never answers is the ordinary case, not an error, and this
+                # is the only thing that clears it.
+                self._prune_resolve_state()
                 # Staleness sweep: relax idle peers' operational
                 # reputation toward almost-neutral (warm-start memory
                 # fades). Throttled internally to SWEEP_INTERVAL.

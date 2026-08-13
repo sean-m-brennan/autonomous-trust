@@ -1039,6 +1039,10 @@ add_executable(rep_warmstart_test test/rep_warmstart_test.c)
 set_source_files_properties(test/rep_warmstart_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(rep_warmstart_test PRIVATE ${AT_TEST_LIBS} m)
 
+add_executable(rep_resolve_test test/rep_resolve_test.c)
+set_source_files_properties(test/rep_resolve_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_resolve_test PRIVATE ${AT_TEST_LIBS} m)
+
 add_executable(subtree_roster_test test/subtree_roster_test.c)
 set_source_files_properties(test/subtree_roster_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(subtree_roster_test PRIVATE ${AT_TEST_LIBS})
@@ -1151,6 +1155,7 @@ add_test(NAME late_joiner_caps_resync_test COMMAND $<TARGET_FILE:late_joiner_cap
 add_test(NAME identity_resync_test COMMAND $<TARGET_FILE:identity_resync_test>)
 add_test(NAME rep_quorum_test COMMAND $<TARGET_FILE:rep_quorum_test>)
 add_test(NAME rep_warmstart_test COMMAND $<TARGET_FILE:rep_warmstart_test>)
+add_test(NAME rep_resolve_test COMMAND $<TARGET_FILE:rep_resolve_test>)
 add_test(NAME subtree_roster_test COMMAND $<TARGET_FILE:subtree_roster_test>)
 add_test(NAME operator_attestation_test COMMAND $<TARGET_FILE:operator_attestation_test>)
 add_test(NAME data_test COMMAND $<TARGET_FILE:data_test>)
