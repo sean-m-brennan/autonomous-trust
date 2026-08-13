@@ -1,0 +1,63 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: slash-final-sub-quorum-refused
+byte_pinning: false
+description: |
+    A slash_final carrying fewer verified co-signatures than quorum must be
+    REFUSED, leaving the target's score untouched.
+
+    The negative control for the finality gadget. A receiver cannot tell a
+    quorum-finalized decision from one member's unilateral claim by looking at
+    the transport: both arrive signed by an admitted member. It has to check
+    the retained co-signatures itself, sized against its OWN view of the group
+    -- otherwise the finalizer chooses the bar it must clear.
+
+    Why it matters here rather than in general: a slash floors a peer below
+    COMM_CUTOFF, and that exclusion is sticky (recovery only via an explicit
+    REASON_REHABILITATE). So an unchecked slash_final is a permanent-exclusion
+    primitive available to any admitted member -- the compromised-but-
+    credentialed case. Paired with slash-cosign-flow, which finalizes with the
+    same shape and a full co-signer set.
+
+    Five participants make quorum floor(5/2) = 2, so the single co-signature
+    below is genuinely short of it. The signature IS cryptographically valid;
+    the only defect is that there are not enough.
+
+participants:
+  - id: alice
+    role: detector
+  - id: bob
+    role: member
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+  - id: rogue
+    role: target
+
+fixtures:
+  # bob's prior view of rogue. A refused slash must leave this untouched; an
+  # applied one would floor it to 0.1.
+  reputations:
+    bob:
+      rogue: 0.6
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: slash final
+    payload:
+      target: rogue
+      floor_score: 0.1
+      epoch: 3
+      cosigners: [alice]
+    description: |
+        alice broadcasts a finalized slash bearing only its own co-signature.
+        bob verifies one signature against a quorum of two and refuses.
+
+expected_state:
+  bob:
+    reputation_of:
+      rogue: 0.6

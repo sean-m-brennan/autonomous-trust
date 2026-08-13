@@ -131,6 +131,15 @@ sub-protocol is *verifiable* rather than merely social:
   evidence. State: `_checkpoint` / `_checkpoint_sigs` / `_checkpoint_pending`. C twin:
   `REP_PROTO_CHECKPOINT_*` handlers + `checkpoint_root`/`checkpoint_sigs`/`checkpoint_pending`.
 
+  A checkpoint's guarantee is only as good as what a *receiver* checks: from
+  2026-08-13 the co-signature bytes are retained, carried on `checkpoint_final`,
+  and re-verified by every receiver against the member keys it holds before the
+  root is stored. Until then they were collected and discarded and `sigs` went out
+  empty, so any single admitted member could install a root of its choosing — and
+  since §2.3 anchors slash evidence on exactly that root, fabricated evidence then
+  verified perfectly. See
+  [Reputation › Quorum attestation](reputation.md#quorum-attestation-slash-and-checkpoint).
+
   Note: the red-black `MerkleTree` (identity side) is intentionally **not** reused for
   the reputation window. Its root depends on insertion order and rotations, which is
   the wrong primitive for an ordered sequence and infeasible to reproduce
@@ -155,6 +164,14 @@ transactions rather than snapping to neutral. C twin: `_apply_slash_locked` +
 `REP_PROTO_SLASH_*` handlers. This is the principled "detection-driven floor": a
 PoS-style penalty / PKI-style revocation, not a tuning tweak.
 
+The quorum in "on quorum the detector broadcasts" is enforced at **both** ends as
+of 2026-08-13: the finalizer carries its co-signatures and each receiver verifies
+them before flooring anyone. It has to be, because a floor below `COMM_CUTOFF` is
+sticky network exclusion — so a `slash_final` that nobody checks is a
+permanent-exclusion primitive for any admitted member, which is what this was
+until then. See
+[Reputation › Quorum attestation](reputation.md#quorum-attestation-slash-and-checkpoint).
+
 ### 2.3 Evidence-gated slashing (Merkle proof verification)
 
 A slash is only as trustworthy as its evidence. **Phase 3** ties the fast penalty to
@@ -167,6 +184,14 @@ tampered, or mismatched evidence is refused. Evidence-free slashes keep the Phas
 trust-the-detector fallback, so legacy flows are unaffected. `build_slash_evidence`
 constructs evidence from the live window. Pinned by the `slash-evidence-verified` /
 `slash-evidence-rejected` conformance scenarios.
+
+"A root this node has itself finalized" carries the weight of this whole section,
+and it did not hold until the checkpoint quorum was verified on receipt
+(2026-08-13, §2.1): before that any member could hand us a root to anchor on, and
+the evidence gate became a formality it could satisfy at will. Note also what the
+fallback means once that is fixed — an **evidence-free** slash is still applied on
+its quorum alone, so quorum verification is what stands behind every slash, not
+just the evidence-bearing ones.
 
 ### What was deliberately NOT adopted
 

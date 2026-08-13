@@ -1,0 +1,47 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: checkpoint-final-unattested-root-refused
+byte_pinning: false
+description: |
+    A checkpoint_final bearing no verifiable co-signatures must be refused, so
+    the node's finalized checkpoint root stays empty.
+
+    A checkpoint root is not merely a cached digest: it is the anchor
+    _verify_slash_evidence measures inclusion proofs against, chosen that way
+    expressly so the root is "not a root picked by the accuser". That property
+    only holds if the receiver checks a quorum before storing it. Without this
+    check, any admitted member could install a root over a tree it fabricated
+    and then present slash evidence that verified perfectly against it.
+
+    Paired with checkpoint-cosign-flow, which stores a root under the same
+    shape once the co-signatures are present and valid; the observable here is
+    the same `checkpoint_root`, asserted empty.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: member
+  - id: carol
+    role: member
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: checkpoint final
+    payload:
+      root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+      epoch: 5
+      first_index: 0
+      count: 3
+      cosigners: []
+    description: |
+        alice broadcasts a finalized checkpoint with an empty co-signature map
+        -- the pre-fix wire shape, which every receiver stored on transport
+        authentication alone. bob refuses it.
+
+expected_state:
+  bob:
+    checkpoint_root: ""

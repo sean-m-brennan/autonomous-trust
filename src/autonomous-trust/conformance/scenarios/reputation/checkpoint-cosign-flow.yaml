@@ -45,8 +45,15 @@ steps:
     to: alice
     function: checkpoint sign
     payload:
+      root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
       epoch: 7
-    description: bob's co-signature reaches alice (the proposer tallies it).
+      first_index: 0
+      count: 3
+    description: |
+        bob's co-signature reaches alice (the proposer tallies it). The round
+        is restated in full because the co-signature covers the checkpoint
+        designation: a sign step naming different bounds signs different bytes
+        and is refused, which is the point of verifying it.
 
   - id: 3
     from: alice
@@ -55,7 +62,13 @@ steps:
     payload:
       root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
       epoch: 7
-    description: alice broadcasts the finalized checkpoint; bob stores the root.
+      first_index: 0
+      count: 3
+    description: |
+        alice broadcasts the finalized checkpoint; bob stores the root. The
+        adapters sign the co-signature map at scenario time (alice + bob by
+        default), because bob now verifies quorum itself before storing a root
+        -- this root is the anchor slash evidence is measured against.
 
 expected_state:
   bob:
