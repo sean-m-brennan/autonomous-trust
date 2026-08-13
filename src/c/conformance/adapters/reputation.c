@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 
 #include <jansson.h>
@@ -84,6 +85,15 @@ typedef struct {
     int request_count;
     int64_t last_id;
     rp_peer_rep_t peer_reps[SCE_MAX_PARTICIPANTS];
+    /* Verifiable warm start (ISSUES §10.3). The evidence document is the one
+     * artifact BOTH runtimes read, so its shape is worth pinning here; the
+     * ceilings are the arithmetic that decides how much standing a restored
+     * peer may hold, and a silent drift between runtimes would hand the same
+     * peer different tiers on the two implementations. */
+    char evidence_schema[8];
+    int  evidence_chain_len;
+    char evidence_checkpoint_root[TX_HASH_HEX_LEN + 1];
+    rp_peer_rep_t evidence_ceilings[SCE_MAX_PARTICIPANTS];
 } rp_snap_t;
 static rp_snap_t g_snaps[SCE_MAX_PARTICIPANTS];
 
@@ -1012,6 +1022,39 @@ static int _dispatch(sce_run_ctx_t *ctx,
                 s->peer_reps[i].has_value = true;
                 s->peer_reps[i].value = v;
             }
+            snprintf(s->evidence_ceilings[i].id, SCE_ID_LEN, "%s", other_id);
+            s->evidence_ceilings[i].has_value = false;
+            double c = 0.0;
+            const uuid_t *self_u = _uuid_of(ctx, target->id);
+            if (self_u != NULL
+                && reputation_get_evidence_ceiling(*self_u, *u, &c) == 0)
+            {
+                s->evidence_ceilings[i].has_value = true;
+                s->evidence_ceilings[i].value = c;
+            }
+        }
+        /* The document this node would persist right now. */
+        s->evidence_schema[0] = '\0';
+        s->evidence_chain_len = 0;
+        s->evidence_checkpoint_root[0] = '\0';
+        json_t *doc = NULL;
+        if (reputation_get_evidence_doc(&doc) == 0 && doc != NULL)
+        {
+            const char *schema = json_string_value(json_object_get(doc, "schema"));
+            if (schema != NULL)
+                snprintf(s->evidence_schema, sizeof(s->evidence_schema), "%s",
+                         schema);
+            s->evidence_chain_len =
+                (int)json_array_size(json_object_get(doc, "chain"));
+            json_t *ck = json_object_get(doc, "checkpoint");
+            const char *ck_root = json_is_object(ck)
+                ? json_string_value(json_object_get(ck, "root")) : NULL;
+            if (ck_root != NULL)
+            {
+                strncpy(s->evidence_checkpoint_root, ck_root, TX_HASH_HEX_LEN);
+                s->evidence_checkpoint_root[TX_HASH_HEX_LEN] = '\0';
+            }
+            json_decref(doc);
         }
     }
     return 0;
@@ -1092,6 +1135,88 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
                              "%s: checkpoint_root=%s, expected %s",
                              pid, snap->checkpoint_root, want ? want : "(null)");
                     return -1;
+                }
+            }
+            else if (strcmp(key, "evidence_doc") == 0)
+            {
+                /* The persisted-evidence document, pinned by the fields that
+                 * carry meaning across runtimes: the schema (a mismatch is a
+                 * refusal to rebuild, not a misparse), how many entries the
+                 * document carries, and the root the checkpoint block commits
+                 * to. Mirrors Python's `evidence_doc` assertion. */
+                if (!json_is_object(val)) continue;
+                json_t *w_schema = json_object_get(val, "schema");
+                if (json_is_string(w_schema)
+                    && strcmp(snap->evidence_schema,
+                              json_string_value(w_schema)) != 0)
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: evidence_doc.schema=%s, expected %s",
+                             pid, snap->evidence_schema,
+                             json_string_value(w_schema));
+                    return -1;
+                }
+                json_t *w_len = json_object_get(val, "chain_len");
+                if (json_is_integer(w_len)
+                    && snap->evidence_chain_len != (int)json_integer_value(w_len))
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: evidence_doc.chain_len=%d, expected %d",
+                             pid, snap->evidence_chain_len,
+                             (int)json_integer_value(w_len));
+                    return -1;
+                }
+                json_t *w_root = json_object_get(val, "checkpoint_root");
+                if (json_is_string(w_root)
+                    && strncmp(snap->evidence_checkpoint_root,
+                               json_string_value(w_root),
+                               TX_HASH_HEX_LEN + 1) != 0)
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: evidence_doc.checkpoint_root=%s, expected %s",
+                             pid, snap->evidence_checkpoint_root,
+                             json_string_value(w_root));
+                    return -1;
+                }
+            }
+            else if (strcmp(key, "evidence_ceiling_of") == 0)
+            {
+                /* { "<other_pid>": float } — the ceiling the resident window
+                 * supports for that peer, 1e-3 tolerance as reputation_of
+                 * uses. This is the security parameter of warm start made
+                 * observable. */
+                if (!json_is_object(val)) continue;
+                const char *other;
+                json_t *want_j;
+                json_object_foreach(val, other, want_j)
+                {
+                    double want = json_is_real(want_j)
+                        ? json_real_value(want_j)
+                        : (json_is_integer(want_j)
+                           ? (double)json_integer_value(want_j) : 0.0);
+                    const rp_peer_rep_t *found = NULL;
+                    for (size_t i = 0; i < SCE_MAX_PARTICIPANTS; i++)
+                    {
+                        if (strcmp(snap->evidence_ceilings[i].id, other) == 0)
+                        {
+                            found = &snap->evidence_ceilings[i];
+                            break;
+                        }
+                    }
+                    if (found == NULL || !found->has_value)
+                    {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s.evidence_ceiling_of[%s]: not bounded by "
+                                 "the window (expected %.4f)", pid, other, want);
+                        return -1;
+                    }
+                    if (fabs(found->value - want) > 1e-3)
+                    {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s.evidence_ceiling_of[%s]=%.4f, expected "
+                                 "%.4f", pid, other, found->value, want);
+                        return -1;
+                    }
                 }
             }
             else if (strcmp(key, "requests_count") == 0)

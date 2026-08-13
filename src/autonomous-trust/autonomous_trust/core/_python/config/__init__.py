@@ -17,6 +17,7 @@
 from typing import Any
 
 from .configuration import Configuration, InitializableConfig, EmptyObject, SerializeMode, WireFormat, \
-    to_json_string, from_json_string, to_yaml_string, from_yaml_string, register_config_type
+    to_json_string, from_json_string, to_yaml_string, from_yaml_string, register_config_type, \
+    atomic_write
 
 ConfigMap = dict[str, Any]

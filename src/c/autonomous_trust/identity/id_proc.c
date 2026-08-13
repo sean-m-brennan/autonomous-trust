@@ -5733,6 +5733,40 @@ int identity_add_child_group(process_t *proc, group_t *group,
     return 0;
 }
 
+int identity_propagate_child_groups(const process_t *proc, directory_t *queues)
+{
+    /* Fan the child-group set out to the sibling processes, one CHILD_GROUP
+     * message per cohort. The C twin of Python's _record_child_groups, and
+     * needed for the same reason: the REPUTATION process keeps a separate
+     * transaction chain per child group, and it cannot do that if only the
+     * identity process knows the groups exist (gateway-reputation-tree.md,
+     * ISSUES.md §10.2).
+     *
+     * One message per group rather than a set, because generic_msg_t's union
+     * carries one group_t; the receiver accumulates them into its own map, so
+     * the effect matches Python's whole-set delivery.
+     *
+     * No-op on a leaf: child_groups is NULL/empty and no IPC is sent. */
+    if (proc == NULL || queues == NULL || proc->protocol.child_groups == NULL)
+        return 0;
+    int sent = 0;
+    map_key_t key = NULL;
+    data_t *val = NULL;
+    map_entries_for_each(proc->protocol.child_groups, key, val)
+    {
+        void *gp = NULL;
+        if (data_object_ptr(val, &gp) != 0 || gp == NULL)
+            continue;
+        generic_msg_t msg = {0};
+        msg.type = CHILD_GROUP;
+        memcpy(&msg.info.group, gp, sizeof(group_t));
+        _remember_activity(proc, queues, &msg);
+        sent++;
+    }
+    map_end_for_each
+    return sent;
+}
+
 void identity_set_roster_private(process_t *proc, bool enabled)
 {
     if (proc == NULL) return;
@@ -6022,10 +6056,14 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
         char cfg_dir[CFG_PATH_LEN + 1];
         if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) > 0) {
             int adopted = identity_load_child_groups(proc, cfg_dir);
-            if (adopted > 0)
+            if (adopted > 0) {
                 log_info(proc->logger,
                          "Identity: seeded %d child group(s) from config\n",
                          adopted);
+                /* Hand them to the sibling processes: reputation keeps one
+                 * chain per child group and cannot without this. */
+                identity_propagate_child_groups(proc, queues);
+            }
         }
     }
 
