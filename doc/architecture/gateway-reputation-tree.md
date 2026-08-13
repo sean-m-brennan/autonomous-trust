@@ -364,6 +364,40 @@ its own members locally).
   regenerated for the new envelope; both languages emit identical bytes
   (cross-language diff **0 asymmetric**).
 
+## Runtime hierarchy roots (protocol step 7)
+
+The tree used to exist only in seeded config. It is now DISCOVERED at runtime, in two
+halves that are deliberately different in kind:
+
+- **Derived — our own parent.** The highest-rank member of our primary group whose rank
+  *exceeds* ours and which can prove gateway authority for a boundary we share
+  (`_derive_parent_gateway`, C twin of the same name). Never accepted from a peer: a node
+  that could name itself our parent would insert itself into every rollup we perform. The
+  rank comparison is the one place this differs from `_discover_child_gateway` — there we
+  pick somebody else's leader, here we ask who leads us, so a cohort's top node is the root
+  rather than somebody's child.
+- **Advertised — everybody else's position.** `hierarchy` / `hierarchy_query` on the
+  encrypted group channel: each node states which cohorts it gateways, whom it federates
+  through, and its rank, when that view changes and on request (so a late joiner converges
+  without waiting for somebody else's next change). Recorded only from peers that prove a
+  shared anchor — the recorded value is what a roster query recurses into. A claim naming
+  somebody other than its sender is refused.
+
+`_child_gateway_uuids` therefore has three sources, most authoritative first: explicit
+config, a peer's own advertised claim, then rank inference. The advertisement outranks
+inference because "I gateway cohort X" is direct evidence where "it is the highest-rank
+member of X" is a guess.
+
+**No group key ever moves.** An advertisement confers no membership and carries no key;
+child-group keys remain operator-provisioned. A runtime cross-group *join* — a node
+acquiring a second cohort's key over the wire — is a separate question, because that key is
+the confidentiality boundary of the whole system. It is tracked in `ISSUES.md` §10.2.
+
+Rank note: a cohort's membership is an **address map**, so a node can know a member — and
+need its rank to decide who leads it — before it holds that member's Identity. Both runtimes
+therefore read rank from a `peer_ranks` seam as well as from a materialized peer; C has had
+this from the start, Python gained it with this work.
+
 ## Not built
 
 - **C app-facing carrier + async wire-unroll**: new `message_type_t`

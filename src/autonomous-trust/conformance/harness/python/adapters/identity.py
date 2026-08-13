@@ -79,6 +79,11 @@ _TRIGGER_CAPS_RESYNC = 'trigger_caps_resync'
 # gateway for its local members + child gateways). Used by
 # subtree-member-roster. The C adapter recognizes the same string.
 _TRIGGER_SUBTREE_ROSTER = 'trigger_subtree_roster'
+# Pseudo-function: re-derive this participant's place in the gateway tree
+# (protocol step 7). Observable via the `parent_gateway` expected_state key; the
+# advertisement it emits restates the derived value, so nothing wire-shaped is
+# asserted. Mirrors the C adapter's trigger_hierarchy.
+_TRIGGER_HIERARCHY = 'trigger_hierarchy'
 
 # Pseudo-function: drive one operator-attended pull (ethne D8/Q9) from the
 # step's `from` participant against its `to` participant, end to end — mint the
@@ -117,6 +122,10 @@ class _Participant:
     # flattened member uuids (strings) of its cohort subtree. Filled by the
     # engine's _dispatch; read by the subtree_roster expected-state check.
     subtree_roster: list = field(default_factory=list)
+    # Result of trigger_hierarchy: the DERIVED parent gateway as a participant
+    # id, or '' for a node that tops its own cohort. Filled by _dispatch (which
+    # holds the uuid->pid registry) and read by the parent_gateway check.
+    parent_gateway_pid: str = ''
     # Results of trigger_attest_pull / trigger_attest_replay on this
     # participant (as the PULLER): the attested-now stamp the last accepted
     # pull yielded, and the accept/reject verdict of every pull in order.
@@ -301,6 +310,18 @@ class _Participant:
                 if actual != want:
                     raise AssertionError(
                         f'{self.id}: subtree_roster={actual}, expected {want}')
+            elif key == 'parent_gateway':
+                # The higher-rank node this participant DERIVES as its parent
+                # (protocol step 7, ISSUES.md §10.2), as a participant id or ''
+                # for a node that tops its own cohort. Derived, never accepted
+                # from a peer, so the pin is on the arithmetic: rank among
+                # members that can prove a shared anchor, ties by greater uuid.
+                # C mirrors via identity_get_parent_gateway.
+                actual = self.parent_gateway_pid
+                if actual != (expected or ''):
+                    raise AssertionError(
+                        f'{self.id}: parent_gateway={actual!r}, '
+                        f'expected {(expected or "")!r}')
             elif key == 'attested_now':
                 # The attended-now stamp this participant's last ACCEPTED pull
                 # yielded: a pinned epoch when a human is at the target's
@@ -877,6 +898,29 @@ class IdentityAdapter:
             str(h.impl.identity.uuid): h.impl for h in handles.values()}
         self._roster_uuid_to_pid = {
             str(h.impl.identity.uuid): pid for pid, h in handles.items()}
+        # ranks fixture: {pid: int} — the topology rank each participant HAS,
+        # applied both to its own identity and to every other node's view of it.
+        # Rank is what the hierarchy derivation reads (protocol step 7), so a
+        # scenario pinning a parent has to be able to state it. Mirrors the C
+        # adapter's ranks handling (identity_set_peer_rank + identity.rank).
+        ranks_fix: dict[str, int] = fixtures.get('ranks', {}) or {}
+        for pid, rank in ranks_fix.items():
+            h = handles.get(pid)
+            if h is None:
+                raise AssertionError(f'ranks names unknown participant {pid!r}')
+            h.impl.identity._rank = int(rank)
+            for other in handles.values():
+                # The peer_ranks seam, not the peer object: a cohort's
+                # membership is an address map, so a member's rank has to be
+                # knowable before its Identity is. Same seam C uses.
+                other.impl.process.set_peer_rank(h.impl.identity.uuid, rank)
+                try:
+                    peer = other.impl.process.peers.find_by_uuid(
+                        h.impl.identity.uuid)
+                except Exception:
+                    peer = None
+                if peer is not None:
+                    peer._rank = int(rank)
         # cohort_tree fixture: seed each gateway's child group + recursion
         # target so a subtree-roster enumeration spans the whole tree.
         self._apply_cohort_tree(handles, fixtures)
@@ -1219,6 +1263,13 @@ class IdentityAdapter:
                 puller, participant,
                 replay=(inbound.function == _TRIGGER_ATTEST_REPLAY))
             return participant.drain_outbox()
+        if inbound.function == _TRIGGER_HIERARCHY:
+            participant.process._refresh_hierarchy(participant.queues)
+            uuid = participant.process.parent_gateway
+            participant.parent_gateway_pid = (
+                self._roster_uuid_to_pid.get(str(uuid), str(uuid))
+                if uuid else '')
+            return participant.drain_outbox()
         if inbound.function == _TRIGGER_SUBTREE_ROSTER:
             # Pseudo-function: run the requestor-side subtree-roster walk on
             # this participant. fetch asks each gateway (by uuid) for its
@@ -1400,7 +1451,8 @@ class IdentityAdapter:
             obj = to_json_string(payload)
 
         if function in (_TRIGGER_CAPS_RESYNC, _TRIGGER_SUBTREE_ROSTER,
-                        _TRIGGER_ATTEST_PULL, _TRIGGER_ATTEST_REPLAY):
+                        _TRIGGER_ATTEST_PULL, _TRIGGER_ATTEST_REPLAY,
+                        _TRIGGER_HIERARCHY):
             # Pseudo-function: no wire payload; _dispatch invokes the sweep /
             # roster enumeration directly instead of a handler.
             obj = ''

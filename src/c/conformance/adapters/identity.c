@@ -83,6 +83,10 @@ typedef struct {
      * subtree_roster expected-state check. Mirrors the Python adapter's
      * _Participant.subtree_roster. */
     json_t *subtree_roster;
+    /* Result of trigger_hierarchy: the DERIVED parent gateway as a participant
+     * id, or "" for a node that tops its own cohort. Mirrors the Python
+     * adapter's _Participant.parent_gateway_pid. */
+    char parent_gateway_pid[SCE_ID_LEN];
     /* Results of trigger_attest_pull / trigger_attest_replay with this
      * participant as the PULLER (ethne D8/Q9): the attested-now stamp the last
      * ACCEPTED pull yielded, the accept/reject verdict of each pull in order,
@@ -1014,6 +1018,33 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
         }
     }
 
+    /* ranks: {pid: int} -- the topology rank each participant HAS, applied to
+     * its own identity AND to every other node's view of it. Rank is what the
+     * hierarchy derivation reads (protocol step 7), so a scenario pinning a
+     * parent has to be able to state it. Mirrors the Python adapter's ranks
+     * handling; both sides write the peer_ranks seam, because a cohort's
+     * membership is an address map and a member's rank has to be knowable
+     * before its Identity is. */
+    json_t *ranks = json_object_get(fixtures, "ranks");
+    if (json_is_object(ranks)) {
+        const char *rpid;
+        json_t *rval;
+        json_object_foreach(ranks, rpid, rval) {
+            int rank = (int)json_integer_value(rval);
+            sce_participant_t *rpart = sce_find_participant(ctx, rpid);
+            if (rpart == NULL) continue;
+            ic_impl_t *target = (ic_impl_t *)rpart->impl;
+            char ru[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(target->full->uuid, ru);
+            target->full->rank = rank;
+            for (size_t pi = 0; pi < ctx->participant_count; pi++) {
+                ic_impl_t *other = (ic_impl_t *)ctx->participants[pi].impl;
+                if (other != NULL)
+                    identity_set_peer_rank(other->proc, ru, rank);
+            }
+        }
+    }
+
     /* cohort_tree: seed a gateway hierarchy so a subtree-roster enumeration
      * spans multiple levels. Mirrors the Python adapter's _apply_cohort_tree.
      * Each node gets a primary group (self + `members`) and, if it has a
@@ -1485,6 +1516,22 @@ static int _dispatch(sce_run_ctx_t *ctx,
             return -1;
         }
         return _ic_run_attest_pull(ctx, puller, impl, replay);
+    }
+    if (inbound->type == NET_MESSAGE
+        && inbound->info.net_msg.function != NULL
+        && strcmp(inbound->info.net_msg.function, "trigger_hierarchy") == 0) {
+        /* Pseudo-function: re-derive this participant's place in the gateway
+         * tree (protocol step 7) and record the parent as a participant id.
+         * Mirrors the Python adapter's trigger_hierarchy handling. */
+        char parent[UUID_STRING_LEN + 1] = {0};
+        identity_get_parent_gateway(impl->proc, parent, sizeof(parent));
+        impl->parent_gateway_pid[0] = '\0';
+        if (parent[0] != '\0') {
+            const char *pid = _ic_pid_for_uuid(ctx, parent);
+            snprintf(impl->parent_gateway_pid, sizeof(impl->parent_gateway_pid),
+                     "%s", pid != NULL ? pid : parent);
+        }
+        return 0;
     }
     if (inbound->type == NET_MESSAGE
         && inbound->info.net_msg.function != NULL
@@ -1996,6 +2043,19 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: provisional_peer_count=%d, expected %d",
                              pid, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "parent_gateway") == 0) {
+                /* The higher-rank node this participant DERIVES as its parent
+                 * (protocol step 7), as a participant id or "" for a node that
+                 * tops its own cohort. Filled by trigger_hierarchy; mirrors the
+                 * Python adapter's parent_gateway check. */
+                const char *want = json_string_value(val);
+                if (want == NULL) want = "";
+                if (strcmp(impl->parent_gateway_pid, want) != 0) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: parent_gateway='%s', expected '%s'",
+                             pid, impl->parent_gateway_pid, want);
                     return -1;
                 }
             } else if (strcmp(key, "subtree_roster") == 0) {
