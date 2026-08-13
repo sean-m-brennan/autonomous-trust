@@ -1,0 +1,85 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: deep-resolution-evidence
+byte_pinning: false
+description: |
+    Deep resolution — one peer, on demand, at any depth (ISSUES.md §10.2).
+
+    A node scores a peer against the chain that peer's transactions landed in,
+    and holds chains only for the groups it belongs to. Two levels down, that
+    chain belongs to somebody else. Enumerating the whole subtree to reach it
+    costs the size of the TREE to answer a question about one PEER, so instead
+    the query is relayed toward whoever holds the chain and the answer comes
+    back carrying the quorum-signed window that backs it.
+
+    What this pins is the VERDICT on that evidence. The answer crosses nodes
+    the requestor has no reason to trust, so it is checked by recomputing the
+    Merkle root from the entries it carries and comparing against the root a
+    quorum signed. If the two runtimes disagreed here, the same peer would be
+    trusted on one implementation and refused on the other, with nothing to
+    show which was right — the same reason the warm-start ceilings are pinned.
+
+    The negative case is the one the payload shape exists for. An answer that
+    WITHHOLDS an entry is still internally consistent and every entry left in
+    it is genuine, so an inclusion proof over the survivors would verify
+    happily: a proof shows what is present and says nothing about what was
+    removed. A holder shading its own subtree would omit rather than invent,
+    which is why the window travels whole and the root is recomputed.
+
+    Also pinned by construction: the recorded score is the one the RECEIVER
+    computes from the attested window, not the number the answer claims. The
+    holder's own value is weighted by per-capability transaction weights that
+    live in a node-local cache and are part of no hashed entry, so a verifier
+    across a boundary cannot re-derive them — step 1 sends a deliberately
+    wrong `score` and the assertion ignores it.
+
+participants:
+  - id: requestor
+    role: proposer
+  - id: holder
+    role: acceptor
+  - id: subject
+    role: acceptor
+
+fixtures:
+  # The holder's chain: three committed bilateral entries involving the peer
+  # being asked about. This is the window that travels in the answer.
+  tx_history:
+    holder:
+      - {task_id: d1, p1: holder, p1_score: 0.8, p2: subject, p2_score: 0.6}
+      - {task_id: d2, p1: holder, p1_score: 0.9, p2: subject, p2_score: 0.4}
+      - {task_id: d3, p1: holder, p1_score: 0.7, p2: subject, p2_score: 0.5}
+
+steps:
+  - id: 1
+    from: holder
+    to: requestor
+    function: resolved reputation
+    payload:
+      peer: subject
+      query_id: q1
+      cosigners: [holder]
+      # Deliberately not the value the receiver will compute. An answer's
+      # number is a cross-check, never the answer.
+      score: 0.999
+    description: |
+        An honest answer: the holder's whole committed window, the checkpoint
+        over it, and the co-signature that finalized it. The receiver
+        recomputes the root from the entries, verifies the signature against
+        the identity the answer carries, and then computes its OWN score.
+
+expected_state:
+  requestor:
+    resolved_reputation:
+      peer: subject
+      verified: true
+      # The unweighted consensus EMA over the COUNTERPARTY side of the
+      # subject's entries — for an entry where the subject is p2, that is the
+      # p1 score, i.e. what the holder recorded ABOUT the subject (0.8, 0.9,
+      # 0.7 in order). Never the subject's own 0.6/0.4/0.5: the score reflects
+      # what the network observed about a peer, not what the peer reported.
+      # Folded at CONSENSUS_EMA_HALF_LIFE=20, so the series barely moves off
+      # its first observation. Computed from the evidence, not taken from the
+      # answer's 0.999.
+      score: 0.7999

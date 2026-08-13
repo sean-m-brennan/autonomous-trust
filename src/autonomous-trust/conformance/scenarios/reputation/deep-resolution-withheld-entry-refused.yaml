@@ -1,0 +1,69 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: deep-resolution-withheld-entry-refused
+byte_pinning: false
+description: |
+    Deep resolution, negative control: an answer that WITHHOLDS an entry is
+    refused by both runtimes (ISSUES.md §10.2).
+
+    This is the case the answer's payload shape exists for, and it is worth
+    stating why it is not obvious. The answer here is internally consistent and
+    every entry left in it is genuine — signed by a real key, hash-linked to
+    its predecessor, and provably a member of the holder's window. An inclusion
+    proof over the surviving entries would verify without complaint, because a
+    proof shows that what is present is real and says nothing whatever about
+    what was taken out.
+
+    That gap is not hypothetical. A gateway that wanted to flatter a peer in
+    its own subtree would not fabricate transactions — fabrication is the
+    detectable move — it would simply not mention the unflattering ones. So the
+    window travels WHOLE and the verifier recomputes the Merkle root from the
+    entries it was handed: drop one, and the root no longer matches the bytes a
+    quorum signed.
+
+    The cost of closing it is real and was chosen deliberately: the requestor
+    sees every transaction in that window, not only the queried peer's. An
+    opaque relay hides the topology; it does not hide the evidence.
+
+participants:
+  - id: requestor
+    role: proposer
+  - id: holder
+    role: acceptor
+  - id: subject
+    role: acceptor
+
+fixtures:
+  tx_history:
+    holder:
+      - {task_id: d1, p1: holder, p1_score: 0.8, p2: subject, p2_score: 0.6}
+      - {task_id: d2, p1: holder, p1_score: 0.9, p2: subject, p2_score: 0.4}
+      - {task_id: d3, p1: holder, p1_score: 0.7, p2: subject, p2_score: 0.5}
+
+steps:
+  - id: 1
+    from: holder
+    to: requestor
+    function: resolved reputation
+    payload:
+      peer: subject
+      query_id: q1
+      cosigners: [holder]
+      # The whole scenario: the checkpoint is signed over the FULL window, and
+      # then the last entry is dropped from what travels.
+      omit_last: true
+    description: |
+        The answer arrives one entry short. Everything else about it is honest
+        — the signature verifies, the signer is known, the remaining entries
+        are real — so every check except the root recomputation passes.
+
+expected_state:
+  requestor:
+    resolved_reputation:
+      peer: subject
+      # Refused, and refused with no score: a partial window is not a smaller
+      # truth, it is an unverifiable claim, and recording a number from it
+      # would defeat the point of asking for evidence at all.
+      verified: false
+      score: null

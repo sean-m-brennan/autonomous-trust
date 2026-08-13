@@ -33,6 +33,9 @@
 #include "utilities/exception.h"
 #include "utilities/probes.h"
 #include "network/net_message.h"
+#include "identity/identity_priv.h"   /* public_identity_to/from_json, unhexlify */
+#include "zta/zta_verifier.h"
+#include "zta/zta_policy.h"
 #include "config/configuration.h"   /* get_cfg_dir, CFG_PATH_LEN */
 #include "config/discover.h"        /* CFG_FILE_EXT */
 #include "reputation/rep_proc_priv.h"
@@ -187,6 +190,8 @@ char REP_PROTO_SLASH_FINAL[]   = "slash final";
 char REP_PROTO_CHECKPOINT_PROPOSE[] = "checkpoint propose";
 char REP_PROTO_CHECKPOINT_SIGN[]    = "checkpoint sign";
 char REP_PROTO_CHECKPOINT_FINAL[]   = "checkpoint final";
+char REP_PROTO_REP_RESOLVE[]        = "resolve reputation";
+char REP_PROTO_REP_RESOLVED[]       = "resolved reputation";
 
 /* Local-IPC `function` field for the tier_update message reputation
  * emits to identity. Writable buffer so the assignment to
@@ -231,6 +236,23 @@ static struct {
      * and sizes its quorum against that group rather than the conflated peer
      * list. Mirrors Python's round_group. */
     map_t round_group;
+    /* --- Deep resolution: one peer, on demand (ISSUES.md 10.2) ------------
+     * resolve_pending: query-id -> object_ptr_data(rep_resolve_t *), a query
+     * we are RELAYING and the neighbour its answer must go back to. The only
+     * state the capability adds anywhere, and it exists because the answer
+     * travels the reverse path -- nobody outside a boundary ever exchanges a
+     * message with anybody inside it, so each hop must remember its caller.
+     * resolve_outstanding: query-id -> rep_resolve_t *, queries WE originated.
+     * resolve_seen: query-id -> integer_data(1), the loop guard; a briefly
+     * cyclic tree would otherwise circulate a query until its TTL burned down
+     * at every node it touched. Mirrors Python _resolve_pending /
+     * _resolve_outstanding / _resolve_seen. */
+    map_t resolve_pending;
+    map_t resolve_outstanding;
+    map_t resolve_seen;
+    /* peer uuid-str -> object_ptr_data(rep_resolved_t *): answers we accepted
+     * or refused, with the reason kept beside the verdict. */
+    map_t resolved_reps;
     reputations_t reputations;
     map_t my_requests;     /* uuid_str -> tx_score_t* (pending Paxos requests) */
     map_t updates;         /* uuid_str -> json_t* (pending chain updates) */
@@ -383,6 +405,10 @@ static void _ensure_init(void)
         map_init(&rep_state.child_hist);
         map_init(&rep_state.chain_ckpts);
         map_init(&rep_state.round_group);
+        map_init(&rep_state.resolve_pending);
+        map_init(&rep_state.resolve_outstanding);
+        map_init(&rep_state.resolve_seen);
+        map_init(&rep_state.resolved_reps);
         reputations_init(&rep_state.reputations);
         map_init(&rep_state.my_requests);
         map_init(&rep_state.updates);
@@ -537,37 +563,55 @@ static void _get_round_group_locked(const char *paxos_key, char *out, size_t cap
  * map -- the C twin of Python's _members_of_group. `Group` carries an address
  * map rather than a uuid roster, and a gateway's peer list conflates every
  * group it belongs to, so this is how a per-group quorum gets sized. */
+static group_t *_child_group_locked(const process_t *proc, const char *group_uuid)
+{
+    if (proc == NULL || group_uuid == NULL || group_uuid[0] == '\0'
+        || proc->protocol.child_groups == NULL)
+        return NULL;
+    data_t *gd = NULL;
+    if (map_get(proc->protocol.child_groups, (map_key_t)group_uuid, &gd) != 0
+        || gd == NULL)
+        return NULL;
+    void *gp = NULL;
+    if (data_object_ptr(gd, &gp) != 0 || gp == NULL)
+        return NULL;
+    return (group_t *)gp;
+}
+
+/* Whether one peer belongs to a group, by address. Factored out of
+ * _members_of_group because deep resolution forwards to a group's members and
+ * must decide membership by exactly the same rule the quorum is sized by --
+ * two answers to "is this peer in that group" would eventually disagree. */
+static bool _peer_in_group(const process_t *proc, const public_identity_t *peer,
+                           const char *group_uuid)
+{
+    group_t *grp = _child_group_locked(proc, group_uuid);
+    if (grp == NULL || peer == NULL)
+        return false;
+    map_key_t akey = NULL;
+    data_t *aval = NULL;
+    bool found = false;
+    map_entries_for_each(&grp->address_map, akey, aval)
+    {
+        string_t addr = NULL;
+        if (data_string_ptr(aval, &addr) == 0 && addr != NULL
+            && strncmp(addr, peer->address, sizeof(peer->address)) == 0)
+            found = true;
+    }
+    map_end_for_each
+    return found;
+}
+
 static size_t _members_of_group(const process_t *proc, const char *group_uuid)
 {
     if (proc == NULL || group_uuid == NULL || group_uuid[0] == '\0')
         return proc == NULL ? 0 : proc->protocol.num_peers;
-    data_t *gd = NULL;
-    if (proc->protocol.child_groups == NULL
-        || map_get(proc->protocol.child_groups, (map_key_t)group_uuid, &gd) != 0
-        || gd == NULL)
+    if (_child_group_locked(proc, group_uuid) == NULL)
         return proc->protocol.num_peers;
-    void *gp = NULL;
-    if (data_object_ptr(gd, &gp) != 0 || gp == NULL)
-        return proc->protocol.num_peers;
-    group_t *grp = (group_t *)gp;
     size_t count = 0;
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
-    {
-        map_key_t akey = NULL;
-        data_t *aval = NULL;
-        bool found = false;
-        map_entries_for_each(&grp->address_map, akey, aval)
-        {
-            string_t addr = NULL;
-            if (data_string_ptr(aval, &addr) == 0 && addr != NULL
-                && strncmp(addr, proc->protocol.peers[i].address,
-                           sizeof(proc->protocol.peers[i].address)) == 0)
-                found = true;
-        }
-        map_end_for_each
-        if (found)
+        if (_peer_in_group(proc, &proc->protocol.peers[i], group_uuid))
             count++;
-    }
     return count;
 }
 
@@ -3337,6 +3381,850 @@ static bool handle_checkpoint_sign(const process_t *proc, directory_t *queues, g
     return true;
 }
 
+
+/* Defined with the rest of the evidence machinery below; deep resolution
+ * needs it to describe a chain exactly as the persisted evidence does. */
+static void _current_checkpoint_locked(const char *chain_key,
+                                      rep_checkpoint_t *out);
+
+/****************************
+ * Deep resolution: one peer, on demand, at any depth (ISSUES.md 10.2)
+ *
+ * Mirrors Python repprocess handle_resolve / handle_resolved /
+ * _forward_resolve / _accept_resolved and reputation.py's resolve helpers.
+ * A node holds chains only for groups it belongs to, so a peer two levels
+ * down is unscoreable locally. Rather than enumerate the subtree -- a cost
+ * that grows with the TREE to answer about one PEER -- the query is relayed
+ * toward the holder and the answer returns along the reverse path carrying
+ * the quorum-signed window that backs it.
+ *
+ * The window travels whole, not as the peer's entries with inclusion proofs:
+ * a proof shows an entry IS present and says nothing about entries withheld,
+ * so a holder could answer with a peer's good transactions, omit the bad ones
+ * and still verify. Recomputing the root from the entries closes that.
+ ****************************/
+
+/* Hops a resolve may travel, and the ceiling we refuse above. Must match
+ * Python RESOLVE_TTL_DEFAULT / RESOLVE_TTL_MAX -- a runtime that forwarded one
+ * hop further than its twin would answer queries the other dropped. */
+#define REP_RESOLVE_TTL_DEFAULT 4
+#define REP_RESOLVE_TTL_MAX     8
+/* Seconds a relayed or outstanding query is retained. A garbage-collection
+ * bound, not a latency target. */
+#define REP_RESOLVE_TTL_SECS    30.0
+/* Query-ids retained for loop detection, bounded like the other dedup rings. */
+#define REP_RESOLVE_SEEN_MAX    256
+
+typedef struct {
+    char   answer_to[UUID_STRING_LEN + 1];  /* neighbour to hand the answer to */
+    char   peer[UUID_STRING_LEN + 1];       /* only set for queries we originated */
+    char   req_proc[PROC_NAME_LEN + 1];
+    double deadline;
+} rep_resolve_t;
+
+static double _resolve_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* Record a query-id, returning false if it was already seen (caller drops the
+ * query). FIFO-bounded: at the cap the whole ring is cleared rather than
+ * evicted one by one, because map_t has no insertion order to evict by and a
+ * cleared ring only costs the re-forwarding of a query old enough to have
+ * fallen out of it. Caller holds the lock. */
+static bool _mark_resolve_seen_locked(const char *query_id)
+{
+    data_t *unused = NULL;
+    if (map_get(&rep_state.resolve_seen, (map_key_t)query_id, &unused) == 0)
+        return false;
+    if (map_size(&rep_state.resolve_seen) >= REP_RESOLVE_SEEN_MAX)
+    {
+        map_free(&rep_state.resolve_seen);
+        map_init(&rep_state.resolve_seen);
+    }
+    map_set(&rep_state.resolve_seen, (map_key_t)query_id, integer_data(1));
+    return true;
+}
+
+static int _resolve_track(map_t *table, const char *query_id,
+                          const char *answer_to, const char *peer,
+                          const char *req_proc)
+{
+    rep_resolve_t *ent = calloc(1, sizeof(rep_resolve_t));
+    if (ent == NULL)
+        return -1;
+    if (answer_to != NULL)
+        snprintf(ent->answer_to, sizeof(ent->answer_to), "%s", answer_to);
+    if (peer != NULL)
+        snprintf(ent->peer, sizeof(ent->peer), "%s", peer);
+    if (req_proc != NULL)
+        snprintf(ent->req_proc, sizeof(ent->req_proc), "%s", req_proc);
+    ent->deadline = _resolve_now() + REP_RESOLVE_TTL_SECS;
+    data_t *d = object_ptr_data(ent, sizeof(rep_resolve_t));
+    if (d == NULL || map_set(table, (map_key_t)query_id, d) != 0)
+    {
+        free(ent);
+        return -1;
+    }
+    return 0;
+}
+
+/* Take an entry out of a table, copying it out. Caller holds the lock. */
+static bool _resolve_take_locked(map_t *table, const char *query_id,
+                                 rep_resolve_t *out)
+{
+    data_t *d = NULL;
+    if (map_get(table, (map_key_t)query_id, &d) != 0 || d == NULL)
+        return false;
+    void *ptr = NULL;
+    if (data_object_ptr(d, &ptr) != 0 || ptr == NULL)
+        return false;
+    if (out != NULL)
+        memcpy(out, ptr, sizeof(rep_resolve_t));
+    map_remove(table, (map_key_t)query_id);
+    free(ptr);
+    return true;
+}
+
+/* Expire relayed and outstanding queries. A subtree that never answers is the
+ * ordinary case, not an error, and nothing else would ever clear these.
+ * Mirrors Python _prune_resolve_state. */
+static void _prune_resolve_state(const process_t *proc)
+{
+    double stamp = _resolve_now();
+    map_t *tables[2] = { &rep_state.resolve_pending,
+                         &rep_state.resolve_outstanding };
+    pthread_mutex_lock(&rep_state.lock);
+    for (int t = 0; t < 2; t++)
+    {
+        array_t *keys = map_keys(tables[t]);
+        size_t n = array_size(keys);
+        for (size_t i = 0; i < n; i++)
+        {
+            data_t *kd = NULL;
+            map_key_t key = NULL;
+            if (array_get(keys, (int)i, &kd) != 0
+                || data_string_ptr(kd, &key) != 0 || key == NULL)
+                continue;
+            data_t *d = NULL;
+            if (map_get(tables[t], key, &d) != 0 || d == NULL)
+                continue;
+            void *ptr = NULL;
+            if (data_object_ptr(d, &ptr) != 0 || ptr == NULL)
+                continue;
+            rep_resolve_t *ent = (rep_resolve_t *)ptr;
+            if (ent->deadline > stamp)
+                continue;
+            if (t == 1 && proc != NULL)
+                log_info(proc->logger,
+                         "Reputation: deep resolve of %.8s timed out\n",
+                         ent->peer);
+            map_remove(tables[t], key);
+            free(ent);
+        }
+        array_free(keys);
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+/* The key of the chain whose window holds committed bilateral entries for
+ * `peer_str`, or false when no chain of ours does. Primary chain first, so a
+ * peer we transact with directly is answered from the chain that actually
+ * knows it. Caller holds the lock. Mirrors Python _chain_holding. */
+static bool _chain_holding_locked(const char *peer_str, char *out, size_t cap)
+{
+    array_t *child_keys = map_keys(&rep_state.child_hist);
+    size_t n_child = array_size(child_keys);
+    bool found = false;
+    for (size_t ci = 0; ci <= n_child && !found; ci++)
+    {
+        const char *chain_key = "";
+        if (ci > 0)
+        {
+            data_t *kd = NULL;
+            map_key_t k = NULL;
+            if (array_get(child_keys, (int)(ci - 1), &kd) != 0
+                || data_string_ptr(kd, &k) != 0 || k == NULL)
+                continue;
+            chain_key = k;
+        }
+        tx_history_t *chain = _chain_for_key_locked(chain_key);
+        if (chain == NULL)
+            continue;
+        for (int i = 0; i < chain->chain_len; i++)
+        {
+            const transaction_t *tx = &chain->chain[i];
+            if (tx->index < 0 || !tx->p1_set || !tx->p2_set)
+                continue;
+            char p1[UUID_STRING_LEN + 1], p2[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(tx->p1_uuid, p1);
+            uuid_unparse_lower(tx->p2_uuid, p2);
+            if (strcmp(p1, peer_str) == 0 || strcmp(p2, peer_str) == 0)
+            {
+                snprintf(out, cap, "%s", chain_key);
+                found = true;
+                break;
+            }
+        }
+    }
+    array_free(child_keys);
+    return found;
+}
+
+/* The co-signer identities an answer carries, in the DRY canonical public form
+ * (public_identity_to_json). Only signers we hold an identity for: a uuid we
+ * cannot produce a key for would travel as an unverifiable name, which is
+ * worse than absent. Mirrors Python _resolve_signers. */
+static json_t *_resolve_signers(const process_t *proc, map_t *sigs)
+{
+    json_t *arr = json_array();
+    if (arr == NULL || sigs == NULL)
+        return arr;
+    array_t *voters = map_keys(sigs);
+    size_t n_voters = array_size(voters);
+    for (size_t vi = 0; vi < n_voters; vi++)
+    {
+        data_t *vd = NULL;
+        map_key_t voter = NULL;
+        if (array_get(voters, (int)vi, &vd) != 0
+            || data_string_ptr(vd, &voter) != 0 || voter == NULL)
+            continue;
+        peers_read_lock(proc);
+        const public_identity_t *match = NULL;
+        for (size_t i = 0; i < proc->protocol.num_peers; i++)
+        {
+            char uuid_str[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(proc->protocol.peers[i].uuid, uuid_str);
+            if (strcmp(uuid_str, voter) == 0)
+            {
+                match = &proc->protocol.peers[i];
+                break;
+            }
+        }
+        json_t *obj = NULL;
+        if (match != NULL && public_identity_to_json(match, &obj) == 0
+            && obj != NULL)
+            json_array_append_new(arr, obj);
+        else if (obj != NULL)
+            json_decref(obj);
+        peers_read_unlock(proc);
+    }
+    array_free(voters);
+    return arr;
+}
+
+/* Send an answer to one neighbour. */
+static void _send_resolved(const process_t *proc,
+                           const public_identity_t *to_whom, json_t *answer,
+                           const char *req_proc)
+{
+    (void)proc;
+    generic_msg_t out = {0};
+    out.type = NET_MESSAGE;
+    strncpy(out.info.net_msg.process,
+            (req_proc != NULL && req_proc[0] != '\0') ? req_proc : "reputation",
+            PROC_NAME_LEN);
+    out.info.net_msg.function = REP_PROTO_REP_RESOLVED;
+    out.info.net_msg.encrypt = true;
+    memcpy(&out.info.net_msg.to_whom, to_whom, sizeof(public_identity_t));
+    net_msg_pack_json(&out.info.net_msg, answer);
+    messaging_send("network", NET_MESSAGE, &out, false);
+}
+
+/* Send a query one level DOWN, to every child group we gateway, with the TTL
+ * decremented. Addressed to the child GROUP rather than a chosen child gateway:
+ * the reputation process holds the child groups but not the rank data identity
+ * picks a gateway with, and asking the group is the same answer without a
+ * second, drifting copy of that derivation living here. Returns the number of
+ * groups reached; 0 means this branch is a dead end. Mirrors Python
+ * _forward_resolve. */
+static size_t _forward_resolve(const process_t *proc, json_t *query)
+{
+    if (proc == NULL || proc->protocol.child_groups == NULL)
+        return 0;
+    int ttl = (int)json_integer_value(json_object_get(query, "ttl"));
+    if (ttl <= 0)
+        return 0;
+    json_t *onward = json_deep_copy(query);
+    if (onward == NULL)
+        return 0;
+    json_object_set_new(onward, "ttl", json_integer(ttl - 1));
+
+    size_t sent = 0;
+    array_t *groups = map_keys(proc->protocol.child_groups);
+    size_t n_groups = array_size(groups);
+    for (size_t gi = 0; gi < n_groups; gi++)
+    {
+        data_t *gk = NULL;
+        map_key_t gkey = NULL;
+        if (array_get(groups, (int)gi, &gk) != 0
+            || data_string_ptr(gk, &gkey) != 0 || gkey == NULL)
+            continue;
+        /* Every member of that group: the holder answers, a member that is
+         * itself a gateway relays deeper, and the query-id ring keeps a node
+         * reached twice from acting twice. */
+        peers_read_lock(proc);
+        for (size_t i = 0; i < proc->protocol.num_peers; i++)
+        {
+            if (!_peer_in_group(proc, &proc->protocol.peers[i], gkey))
+                continue;
+            generic_msg_t per = {0};
+            per.type = NET_MESSAGE;
+            strncpy(per.info.net_msg.process, "reputation", PROC_NAME_LEN);
+            per.info.net_msg.function = REP_PROTO_REP_RESOLVE;
+            per.info.net_msg.encrypt = true;
+            memcpy(&per.info.net_msg.to_whom, &proc->protocol.peers[i],
+                   sizeof(public_identity_t));
+            net_msg_pack_json(&per.info.net_msg, onward);
+            messaging_send("network", NET_MESSAGE, &per, false);
+            sent++;
+        }
+        peers_read_unlock(proc);
+    }
+    array_free(groups);
+    json_decref(onward);
+    return sent;
+}
+
+/* Build the answer for a peer we hold a chain for, or NULL when that chain has
+ * no finalized checkpoint. No checkpoint means no answer, deliberately: the
+ * window would still be true, but a receiver two hops away cannot tell an
+ * unattested truth from a fabrication, so sending one would only teach
+ * requestors to accept what they cannot check. Mirrors Python _resolve_answer.
+ * Caller owns the result. */
+static json_t *_resolve_answer(const process_t *proc, const char *query_id,
+                               const char *peer_str, const char *chain_key)
+{
+    pthread_mutex_lock(&rep_state.lock);
+    rep_chain_ckpt_t *slot = _ckpt_slot_locked(chain_key);
+    if (slot == NULL || !slot->set)
+    {
+        pthread_mutex_unlock(&rep_state.lock);
+        log_debug(proc->logger,
+                  "Reputation: resolve %.8s: chain %s has no finalized "
+                  "checkpoint; no answer\n", peer_str,
+                  chain_key[0] ? chain_key : "primary");
+        return NULL;
+    }
+    rep_checkpoint_t ckpt;
+    if (rep_checkpoint_init(&ckpt) != 0)
+    {
+        pthread_mutex_unlock(&rep_state.lock);
+        return NULL;
+    }
+    /* Same filler the persisted evidence uses, so an answer and the file on
+     * disk describe the chain identically. */
+    _current_checkpoint_locked(chain_key, &ckpt);
+
+    tx_history_t *chain = _chain_for_key_locked(chain_key);
+    json_t *doc = NULL;
+    int err = reputation_evidence_to_json(chain, &ckpt, &doc);
+    uuid_t peer_uu;
+    double score = 0.0;
+    bool have_score = (uuid_parse(peer_str, peer_uu) == 0);
+    if (have_score)
+        score = reputation_consensus(chain, peer_uu, &rep_state.task_weights);
+    json_t *signers = _resolve_signers(proc, &ckpt.sigs);
+    pthread_mutex_unlock(&rep_state.lock);
+    rep_checkpoint_free(&ckpt);
+
+    if (err != 0 || doc == NULL)
+    {
+        if (signers != NULL)
+            json_decref(signers);
+        return NULL;
+    }
+    json_object_set_new(doc, "query_id", json_string(query_id));
+    json_object_set_new(doc, "peer_uuid", json_string(peer_str));
+    json_object_set_new(doc, "score",
+                        have_score ? json_real(score) : json_null());
+    json_object_set_new(doc, "signers", signers);
+    return doc;
+}
+
+/* One accepted or refused answer, keyed by peer uuid. `reason` sits beside the
+ * boolean deliberately: an operator reading "unverified" needs to know WHICH
+ * gate failed, and a caller may knowingly accept a weaker answer. Mirrors
+ * Python resolved_reps. */
+typedef struct {
+    double score;
+    bool   verified;
+    bool   have_score;
+    char   reason[192];
+} rep_resolved_t;
+
+static void _record_resolved(const char *peer_str, double score,
+                             bool have_score, bool verified,
+                             const char *reason)
+{
+    rep_resolved_t *rec = calloc(1, sizeof(rep_resolved_t));
+    if (rec == NULL)
+        return;
+    rec->score = score;
+    rec->have_score = have_score;
+    rec->verified = verified;
+    snprintf(rec->reason, sizeof(rec->reason), "%s", reason ? reason : "");
+    data_t *d = object_ptr_data(rec, sizeof(rep_resolved_t));
+    pthread_mutex_lock(&rep_state.lock);
+    data_t *old = NULL;
+    if (map_get(&rep_state.resolved_reps, (map_key_t)peer_str, &old) == 0
+        && old != NULL)
+    {
+        void *op = NULL;
+        if (data_object_ptr(old, &op) == 0 && op != NULL)
+            free(op);
+        map_remove(&rep_state.resolved_reps, (map_key_t)peer_str);
+    }
+    if (d == NULL || map_set(&rep_state.resolved_reps, (map_key_t)peer_str, d) != 0)
+        free(rec);
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+/* An anchor verifier built from the SAME policy the identity process admits
+ * peers with, so "an anchor we accept" means one thing on this node. Built on
+ * first use and kept: a deep answer is rare, but rebuilding an OpenSSL store
+ * per co-signature would not be.
+ *
+ * Only the plain policy verifier, not the per-anchor fan-out id_proc does:
+ * this gate asks "is this signer anchored at all", where admission asks the
+ * harder question of WHICH agency vouches for a peer, and answering the
+ * narrower question with the broader machinery would put a second copy of that
+ * decision here to drift. */
+#ifdef AT_ZTA_ENABLED
+static zta_verifier_t *_resolve_zta_verifier(const process_t *proc)
+{
+    static zta_verifier_t *cached = NULL;
+    static bool tried = false;
+    if (tried)
+        return cached;
+    tried = true;
+    if (proc == NULL || proc->configs == NULL)
+        return NULL;
+    data_t *zta_dat = NULL;
+    config_t *zta_cfg = NULL;
+    char zta_key[] = "zta_policy";
+    if (map_get(proc->configs, zta_key, &zta_dat) != 0 || zta_dat == NULL
+        || data_object_ptr(zta_dat, (void **)&zta_cfg) != 0
+        || zta_cfg == NULL || zta_cfg->data_struct == NULL)
+        return NULL;
+    zta_policy_t *policy = (zta_policy_t *)zta_cfg->data_struct;
+    if (zta_policy_create_verifier(policy, &cached) != 0)
+        cached = NULL;
+    return cached;
+}
+#endif  /* AT_ZTA_ENABLED */
+
+/* Whether a co-signer may count toward an answer's evidence: a peer we already
+ * hold cleared admission, otherwise the carried identity must present a
+ * credential that chains to one of OUR anchors. Without this gate an answer
+ * could ship its own freshly-minted signers and satisfy every signature check.
+ * Mirrors Python _resolve_trust_signer. */
+static bool _resolve_trust_signer(const process_t *proc, const char *voter,
+                                  const public_identity_t *carried)
+{
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++)
+    {
+        char uuid_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(proc->protocol.peers[i].uuid, uuid_str);
+        if (strcmp(uuid_str, voter) == 0)
+        {
+            peers_read_unlock(proc);
+            return true;
+        }
+    }
+    peers_read_unlock(proc);
+#ifdef AT_ZTA_ENABLED
+    if (carried == NULL || carried->zta_credential_len == 0)
+        return false;
+    zta_verifier_t *verifier = _resolve_zta_verifier(proc);
+    if (verifier == NULL || verifier->verify_credential == NULL)
+        return false;
+    zta_result_t result = {0};
+    if (verifier->verify_credential(verifier, carried->zta_credential,
+                                    carried->zta_credential_len, &result) != 0)
+        return false;
+    return result.status == ZTA_VERIFIED;
+#else
+    /* Without ZTA compiled in there is no anchor to chain a stranger's
+     * credential to, so an unknown signer cannot be trusted at all. Refusing
+     * is the fail-safe direction: a build with no way to check credentials
+     * must not accept evidence from signers it has never admitted. */
+    (void)carried;
+    return false;
+#endif
+}
+
+/* Verify an answer to a query we made and record the result.
+ *
+ * Three gates, in order of what they buy: the window must reproduce the signed
+ * root (which is what makes OMISSION detectable, since any edit to the entry
+ * list moves the root away from the bytes a quorum signed); the co-signatures
+ * must verify; and each signer must be trusted. NOT checked, and it cannot be
+ * from this side: whether the signers are a MAJORITY of the answering group.
+ * Quorum sizing needs that group's membership, and an opaque subtree is
+ * precisely what does not disclose it.
+ *
+ * The recorded score is the one WE compute from the attested window, not the
+ * number the holder sent: the holder's EMA is weighted by per-capability
+ * weights that live in a node-local cache and are part of no hashed entry, so
+ * it cannot be re-derived here. Mirrors Python _accept_resolved. */
+static void _accept_resolved(const process_t *proc, const char *peer_str,
+                             json_t *doc)
+{
+    tx_history_t parsed;
+    tx_history_init(&parsed);
+    rep_checkpoint_t ckpt = {0};
+    if (reputation_evidence_from_json(doc, &parsed, &ckpt) != 0)
+    {
+        _record_resolved(peer_str, 0.0, false, false,
+                         "malformed or hash-broken evidence document");
+        tx_history_free(&parsed);
+        return;
+    }
+    if (!ckpt.present || ckpt.root[0] == '\0')
+    {
+        _record_resolved(peer_str, 0.0, false, false,
+                         "no checkpoint: the window is unattested");
+        tx_history_free(&parsed);
+        rep_checkpoint_free(&ckpt);
+        return;
+    }
+    char recomputed[TX_HASH_HEX_LEN + 1];
+    transaction_window_root(&parsed, recomputed);
+    if (strcmp(recomputed, ckpt.root) != 0)
+    {
+        _record_resolved(peer_str, 0.0, false, false,
+                         "window does not reproduce the signed root "
+                         "(entries added, altered or withheld)");
+        tx_history_free(&parsed);
+        rep_checkpoint_free(&ckpt);
+        return;
+    }
+    uint8_t desig[REP_DESIG_MAX];
+    size_t dlen = rep_checkpoint_designation(
+        ckpt.proposer_uuid, ckpt.root, ckpt.epoch, ckpt.first_index,
+        ckpt.count, ckpt.group_uuid, desig, sizeof(desig));
+
+    /* Signers the answer carried, by uuid, so a requestor holding no identity
+     * from the answering group can still check a signature. */
+    json_t *signers = json_object_get(doc, "signers");
+    size_t verified_count = 0;
+    array_t *voters = map_keys(&ckpt.sigs);
+    size_t n_voters = array_size(voters);
+    for (size_t vi = 0; dlen > 0 && vi < n_voters; vi++)
+    {
+        data_t *vd = NULL;
+        map_key_t voter = NULL;
+        if (array_get(voters, (int)vi, &vd) != 0
+            || data_string_ptr(vd, &voter) != 0 || voter == NULL)
+            continue;
+        {
+            data_t *sd = NULL;
+            string_t sig_str = NULL;
+            if (map_get(&ckpt.sigs, voter, &sd) != 0 || sd == NULL
+                || data_string_ptr(sd, &sig_str) != 0)
+                continue;
+            const char *sig_hex = sig_str;
+            public_identity_t carried = {0};
+            bool have_carried = false;
+            if (signers != NULL && json_is_array(signers))
+            {
+                size_t si;
+                json_t *sv = NULL;
+                json_array_foreach(signers, si, sv)
+                {
+                    public_identity_t cand = {0};
+                    if (public_identity_from_json(sv, &cand) != 0)
+                        continue;
+                    char cand_str[UUID_STRING_LEN + 1];
+                    uuid_unparse_lower(cand.uuid, cand_str);
+                    if (strcmp(cand_str, voter) == 0)
+                    {
+                        memcpy(&carried, &cand, sizeof(public_identity_t));
+                        have_carried = true;
+                        break;
+                    }
+                }
+            }
+            bool sig_ok = _verify_cosignature(proc, voter, desig, dlen, sig_hex);
+            if (!sig_ok && have_carried && sig_hex != NULL
+                && strnlen(sig_hex, REP_SIG_HEX_LEN + 2) == REP_SIG_HEX_LEN)
+            {
+                unsigned char raw[crypto_sign_BYTES];
+                if (unhexlify((const unsigned char *)sig_hex, REP_SIG_HEX_LEN,
+                              raw) == 0)
+                    sig_ok = crypto_sign_verify_detached(
+                        raw, desig, dlen, carried.signature.public) == 0;
+            }
+            if (!sig_ok)
+                continue;
+            if (!_resolve_trust_signer(proc, voter,
+                                       have_carried ? &carried : NULL))
+                continue;
+            verified_count++;
+        }
+    }
+    array_free(voters);
+    rep_checkpoint_free(&ckpt);
+    if (verified_count < 1)
+    {
+        _record_resolved(peer_str, 0.0, false, false,
+                         "0 signer(s) verified and trusted, needed 1");
+        tx_history_free(&parsed);
+        return;
+    }
+    char reason[192];
+    snprintf(reason, sizeof(reason),
+             "root reproduced; %zu signer(s) verified and trusted "
+             "(quorum size not checkable across a boundary)", verified_count);
+    uuid_t peer_uu;
+    if (uuid_parse(peer_str, peer_uu) != 0)
+    {
+        _record_resolved(peer_str, 0.0, false, true, reason);
+        tx_history_free(&parsed);
+        return;
+    }
+    /* NULL weights: weight 1 for everything, the unweighted consensus over the
+     * same attested entries. */
+    double score = reputation_consensus(&parsed, peer_uu, NULL);
+    _record_resolved(peer_str, score, true, true, reason);
+    log_info(proc->logger, "Reputation: deep resolve of %.8s = %.4f (%s)\n",
+             peer_str, score, reason);
+    tx_history_free(&parsed);
+}
+
+size_t reputation_deep_resolve(const process_t *proc, const char *query_id,
+                               const char *peer_uuid, int ttl)
+{
+    _ensure_init();
+    if (proc == NULL || peer_uuid == NULL)
+        return 0;
+    char qid[128];
+    if (query_id != NULL && query_id[0] != '\0')
+        snprintf(qid, sizeof(qid), "%s", query_id);
+    else
+        snprintf(qid, sizeof(qid), "%.8s-%lld", peer_uuid,
+                 (long long)(_resolve_now() * 1000.0));
+    json_t *query = json_object();
+    if (query == NULL)
+        return 0;
+    json_object_set_new(query, "query_id", json_string(qid));
+    json_object_set_new(query, "peer_uuid", json_string(peer_uuid));
+    json_object_set_new(query, "ttl",
+                        json_integer(ttl > 0 ? ttl : REP_RESOLVE_TTL_DEFAULT));
+    json_object_set_new(query, "requesting_process", json_string("reputation"));
+    pthread_mutex_lock(&rep_state.lock);
+    _mark_resolve_seen_locked(qid);
+    _resolve_track(&rep_state.resolve_outstanding, qid, NULL, peer_uuid,
+                   "reputation");
+    pthread_mutex_unlock(&rep_state.lock);
+    size_t sent = _forward_resolve(proc, query);
+    json_decref(query);
+    return sent;
+}
+
+bool reputation_resolved_get(const char *peer_uuid, double *score_out,
+                             bool *have_score_out, bool *verified_out,
+                             char *reason_out, size_t reason_cap)
+{
+    _ensure_init();
+    if (peer_uuid == NULL)
+        return false;
+    bool found = false;
+    pthread_mutex_lock(&rep_state.lock);
+    data_t *d = NULL;
+    if (map_get(&rep_state.resolved_reps, (map_key_t)peer_uuid, &d) == 0
+        && d != NULL)
+    {
+        void *ptr = NULL;
+        if (data_object_ptr(d, &ptr) == 0 && ptr != NULL)
+        {
+            rep_resolved_t *rec = (rep_resolved_t *)ptr;
+            if (score_out != NULL)
+                *score_out = rec->score;
+            if (have_score_out != NULL)
+                *have_score_out = rec->have_score;
+            if (verified_out != NULL)
+                *verified_out = rec->verified;
+            if (reason_out != NULL && reason_cap > 0)
+                snprintf(reason_out, reason_cap, "%s", rec->reason);
+            found = true;
+        }
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    return found;
+}
+
+size_t reputation_resolve_pending_count(void)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    size_t n = map_size(&rep_state.resolve_pending);
+    pthread_mutex_unlock(&rep_state.lock);
+    return n;
+}
+
+size_t reputation_resolve_outstanding_count(void)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    size_t n = map_size(&rep_state.resolve_outstanding);
+    pthread_mutex_unlock(&rep_state.lock);
+    return n;
+}
+
+/* Answer a deep query, or relay it one level down. Never blocks awaiting a
+ * child: the relay records who to answer and returns, and the answer is an
+ * independent message that arrives (or does not) later. Mirrors Python
+ * handle_resolve. */
+static bool handle_resolve(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    if (!nmsg->verified)
+    {
+        log_warn(proc->logger,
+                 "Reputation: rejecting unverified rep_resolve from %s\n",
+                 nmsg->from_whom.nickname);
+        return true;
+    }
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    const char *qid = json_string_value(json_object_get(payload, "query_id"));
+    const char *peer_str = json_string_value(json_object_get(payload, "peer_uuid"));
+    json_t *ttl_j = json_object_get(payload, "ttl");
+    int ttl = (int)json_integer_value(ttl_j);
+    const char *req_proc =
+        json_string_value(json_object_get(payload, "requesting_process"));
+    /* Bounded, not clamped: TTL is attacker-controlled and an inflated one is
+     * an amplification lever, so an out-of-range query is refused outright
+     * (Python resolve_query_from_dict raises for the same reason). */
+    if (qid == NULL || peer_str == NULL || !json_is_integer(ttl_j)
+        || ttl < 0 || ttl > REP_RESOLVE_TTL_MAX)
+    {
+        log_warn(proc->logger, "Reputation: malformed rep_resolve; dropped\n");
+        json_decref(payload);
+        return true;
+    }
+    char sender[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, sender);
+
+    pthread_mutex_lock(&rep_state.lock);
+    bool fresh = _mark_resolve_seen_locked(qid);
+    pthread_mutex_unlock(&rep_state.lock);
+    if (!fresh)
+    {
+        json_decref(payload);
+        return true;   /* already handled: a loop, or a duplicate leg */
+    }
+
+    char chain_key[UUID_STRING_LEN + 1] = {0};
+    pthread_mutex_lock(&rep_state.lock);
+    bool held = _chain_holding_locked(peer_str, chain_key, sizeof(chain_key));
+    pthread_mutex_unlock(&rep_state.lock);
+    if (held)
+    {
+        json_t *answer = _resolve_answer(proc, qid, peer_str, chain_key);
+        if (answer != NULL)
+        {
+            _send_resolved(proc, &nmsg->from_whom, answer, req_proc);
+            json_decref(answer);
+            json_decref(payload);
+            return true;
+        }
+        /* Held the chain but cannot attest it: fall through so a deeper node
+         * that can answers instead. */
+    }
+    if (_forward_resolve(proc, payload) > 0)
+    {
+        pthread_mutex_lock(&rep_state.lock);
+        _resolve_track(&rep_state.resolve_pending, qid, sender, peer_str,
+                       req_proc);
+        pthread_mutex_unlock(&rep_state.lock);
+    }
+    json_decref(payload);
+    return true;
+}
+
+/* Take an answer: relay it back one hop, or accept it if it is ours. An answer
+ * for a query-id we never relayed and never sent is dropped unread -- on a
+ * relay path answers are unsolicited by construction, so the pending table is
+ * the only thing distinguishing one we are carrying from one injected. Mirrors
+ * Python handle_resolved. */
+static bool handle_resolved(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    if (!nmsg->verified)
+    {
+        log_warn(proc->logger,
+                 "Reputation: rejecting unverified rep_resolved from %s\n",
+                 nmsg->from_whom.nickname);
+        return true;
+    }
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    const char *qid = json_string_value(json_object_get(payload, "query_id"));
+    const char *peer_str = json_string_value(json_object_get(payload, "peer_uuid"));
+    if (qid == NULL || peer_str == NULL)
+    {
+        json_decref(payload);
+        return true;
+    }
+    rep_resolve_t relay = {0};
+    pthread_mutex_lock(&rep_state.lock);
+    bool relaying = _resolve_take_locked(&rep_state.resolve_pending, qid, &relay);
+    pthread_mutex_unlock(&rep_state.lock);
+    if (relaying)
+    {
+        peers_read_lock(proc);
+        const public_identity_t *dest = NULL;
+        for (size_t i = 0; i < proc->protocol.num_peers; i++)
+        {
+            char uuid_str[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(proc->protocol.peers[i].uuid, uuid_str);
+            if (strcmp(uuid_str, relay.answer_to) == 0)
+            {
+                dest = &proc->protocol.peers[i];
+                break;
+            }
+        }
+        /* Relayed VERBATIM: the signatures are over bytes, and a re-encode
+         * that reordered a key or renormalized a float would invalidate
+         * evidence this node has no business invalidating. Relays carry, they
+         * do not curate. */
+        if (dest != NULL)
+            _send_resolved(proc, dest, payload, relay.req_proc);
+        else
+            log_warn(proc->logger,
+                     "Reputation: cannot relay answer %.8s; %.8s no longer "
+                     "known\n", qid, relay.answer_to);
+        peers_read_unlock(proc);
+        json_decref(payload);
+        return true;
+    }
+
+    rep_resolve_t mine = {0};
+    pthread_mutex_lock(&rep_state.lock);
+    bool ours = _resolve_take_locked(&rep_state.resolve_outstanding, qid, &mine);
+    pthread_mutex_unlock(&rep_state.lock);
+    if (!ours)
+    {
+        log_debug(proc->logger,
+                  "Reputation: unsolicited rep_resolved %.8s; dropped\n", qid);
+        json_decref(payload);
+        return true;
+    }
+    _accept_resolved(proc, peer_str, payload);
+    json_decref(payload);
+    return true;
+}
+
 static bool handle_checkpoint_final(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -4402,6 +5290,8 @@ int reputation_register_handlers(process_t *proc)
     process_register_handler(proc, REP_PROTO_CHECKPOINT_PROPOSE, (handler_ptr_t)handle_checkpoint_propose);
     process_register_handler(proc, REP_PROTO_CHECKPOINT_SIGN,    (handler_ptr_t)handle_checkpoint_sign);
     process_register_handler(proc, REP_PROTO_CHECKPOINT_FINAL,   (handler_ptr_t)handle_checkpoint_final);
+    process_register_handler(proc, REP_PROTO_REP_RESOLVE,        (handler_ptr_t)handle_resolve);
+    process_register_handler(proc, REP_PROTO_REP_RESOLVED,       (handler_ptr_t)handle_resolved);
     return 0;
 }
 
@@ -4913,6 +5803,10 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
          * almost-neutral, commit to our own window so the persisted evidence
          * carries a quorum-signed root, and keep the snapshot current. */
         double present = (double)time(NULL);
+        /* Expire deep-resolution state. A relayed query whose subtree never
+         * answers is the ordinary case, not an error, and this is the only
+         * thing that clears it. Mirrors Python's call in process(). */
+        _prune_resolve_state(proc);
         _decay_reputations(proc, present);
         if (!have_self)
         {

@@ -94,6 +94,15 @@ extern char REP_PROTO_CHECKPOINT_PROPOSE[];
 extern char REP_PROTO_CHECKPOINT_SIGN[];
 extern char REP_PROTO_CHECKPOINT_FINAL[];
 
+/* Deep resolution: one peer, on demand, at any depth (ISSUES.md 10.2).
+ * A node holds chains only for its own groups, so a peer two levels down is
+ * unscoreable locally; the query is relayed toward whoever holds its chain and
+ * the answer comes back along the reverse path carrying the quorum-signed
+ * window that backs it. Wire strings match Python ReputationProtocol
+ * verbatim -- see the REP_PROTO alignment note above. */
+extern char REP_PROTO_REP_RESOLVE[];
+extern char REP_PROTO_REP_RESOLVED[];
+
 /****************************
  * Reputation tuning constants — mirror Python class attributes in
  * src/autonomous-trust/.../reputation/repprocess.py:ReputationProcess.
