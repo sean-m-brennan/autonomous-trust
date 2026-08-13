@@ -40,6 +40,7 @@ Output layout::
         group.cfg.json                  # copy of _shared/group.cfg.json
         peers.cfg.json                  # the OTHER seeded peers' Identities
         reputation.cfg.json             # rep = 0.7 for each OTHER peer
+        reputation-history.cfg.json     # the EVIDENCE behind that 0.7
         peer-capabilities.cfg.json      # advertised cap list per peer
       microdrone-1/etc/at/              # ... same structure ...
       ...
@@ -50,6 +51,25 @@ Usage::
     python -m tools.seed_dod_cohort --out /tmp/seed    # explicit path
     python -m tools.seed_dod_cohort --force            # regenerate identities
     python -m tools.seed_dod_cohort --swarm-size 24    # larger swarm
+
+Seeded reputation carries its own evidence. Since ISSUES.md §10.3 a peer
+whose persisted score has no verified evidence beside it is restored at the
+tier-1 ceiling, so a bare ``reputation.cfg.json`` of 0.7 would come up at
+tier 1 and the tier-2 capabilities (``dod.sensor-report``) would be gated
+until the cohort re-earned them. This seeder therefore writes
+``reputation-history.cfg.json`` as well: a hash-linked committed window plus a
+checkpoint over it, co-signed with the cohort's own keys (which this script
+holds, because it generated them). The demo warm-starts through the real
+verification path rather than around it.
+
+Those transactions are SEEDED, not observed, and there are enough of them to
+matter: restoration bounds a peer's score by its shrunk mean attested score, so
+the window has to be long enough (~14 ring rotations, ~28 tx/peer) for 0.7 to
+clear tier 2. A side effect worth knowing before reading a dashboard: those
+entries fold into the consensus EMA at startup, so a seeded peer's consensus
+line begins partway up from neutral rather than at its baseline. Nothing here
+is mesh activity that happened -- real behaviour still comes only from the live
+mesh -- and the printed summary says exactly how much evidence was written.
 
 By default the script is *idempotent*: a re-run on an already-seeded
 directory preserves the previously-generated identity keys so a warm
@@ -63,9 +83,11 @@ import argparse
 import copy
 import json
 import os
+import math
 import shutil
 import sys
 from pathlib import Path
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 # Repo-relative imports — works when invoked via
 # ``python -m tools.seed_dod_cohort`` from the repo root (PYTHONPATH
@@ -80,7 +102,13 @@ from autonomous_trust.core._python.identity.group import Group  # noqa: E402
 from autonomous_trust.core._python.identity.history.history import (  # noqa: E402
     IdentityHistory,
 )
-from autonomous_trust.core._python.reputation.reputation import Reputations  # noqa: E402
+from autonomous_trust.core._python.reputation.repprocess import (  # noqa: E402
+    ReputationProcess,
+)
+from autonomous_trust.core._python.reputation.reputation import (  # noqa: E402
+    Checkpoint, EVIDENCE_FILE, Reputations, SignedCheckpoint,
+    TransactionHistory, evidence_to_dict,
+)
 from autonomous_trust.core._python.capabilities import PeerCapabilities  # noqa: E402
 from autonomous_trust.core._python.system import CfgIds  # noqa: E402
 
@@ -209,6 +237,123 @@ def _save_json(path: Path, obj) -> None:
         json.dump(obj, f, cls=ConfigJSONEncoder, indent=2)
 
 
+# --- Seeded reputation evidence (ISSUES.md §10.3) --------------------------
+# The checkpoint epoch the seeded evidence claims. A restarted node resumes its
+# own epoch counter PAST whatever the file holds, so 1 simply leaves the live
+# sequence starting at 2.
+SEED_EVIDENCE_EPOCH = 1
+# Per-transaction score in the seeded window. The same value as the seeded
+# aggregate: the evidence should attest the prior the demo already shows, not
+# a different number arrived at sideways.
+SEED_TX_SCORE = SEED_REPUTATION
+
+
+def _can_sign(ident: Identity) -> bool:
+    """True if this identity holds a private signing key.
+
+    A C-node participant is registered here as a PUBLIC-only view decoded from
+    its C-format identity file, so it can be named in a roster but cannot
+    co-sign. Probing beats inspecting: what matters is whether ``sign``
+    actually works, not which attributes happen to be present."""
+    try:
+        ident.sign(b'seed-probe')
+        return True
+    except Exception:
+        return False
+
+
+def _seed_evidence_rounds(n_members: int, cap: int) -> tuple[int, int]:
+    """How many ring rotations to lay down, and how many transactions per peer
+    that yields: ``(rounds, per_peer)``.
+
+    The restored score is bounded by the peer's mean attested score shrunk
+    toward neutral by ``RESTORE_SHRINKAGE_K`` -- deliberately, so that a short
+    window cannot license high standing -- so the seeded evidence has to be
+    long enough for SEED_REPUTATION to clear the tier the demo expects.
+    Solving ``(m·s + k·neutral)/(m + k) >= floor`` for m gives the per-peer
+    transaction count needed; each rotation gives a peer two (one on each
+    side), and each rotation costs ``n_members`` chain entries.
+
+    Bounded by the resident chain cap, because evidence that evicts is
+    evidence that cannot be attested. When the cap binds, the caller reports
+    the tier the shortened window actually supports rather than letting the
+    demo come up quietly clamped.
+    """
+    if n_members < 2:
+        return 0, 0
+    floor = next((f for f, t in ReputationProcess.TIER_FLOORS
+                  if t == SEED_TIER), 0.0)
+    k = ReputationProcess.RESTORE_SHRINKAGE_K
+    neutral = ReputationProcess.PREREP_NEUTRAL
+    if SEED_TX_SCORE <= floor:
+        needed = 0  # unreachable at this per-tx score; take what the cap allows
+    else:
+        needed = math.ceil(k * (floor - neutral) / (SEED_TX_SCORE - floor))
+    # A margin of one rotation: the bound is a strict-inequality boundary and
+    # the mean is a float, so landing exactly on the floor is not worth risking.
+    rounds = max(1, math.ceil(needed / 2) + 1)
+    rounds = min(rounds, max(1, cap // n_members))
+    return rounds, rounds * 2
+
+
+def _seed_evidence_chain(members: list[str], identities: dict[str, Identity],
+                         rounds: int) -> TransactionHistory:
+    """A hash-linked committed window in which every seeded member appears as a
+    counterparty, ``rounds`` rotations of a RING (member i with member i+1,
+    wrapping).
+
+    A ring rather than every pair: a ring gives every member the same number of
+    attested transactions in ``n`` entries per rotation, where all-pairs costs
+    O(n²) and spends the chain cap on the peers that happen to sort first.
+
+    UUIDs are normalized through ``UUID(...)`` because the canonical entry
+    bytes are the lowercase hyphenated form; a differently-cased uuid string
+    here would hash to a root the runtime could not reproduce.
+    """
+    history = TransactionHistory()
+    uuids = [str(UUID(str(identities[m].uuid))) for m in members]
+    n = len(uuids)
+    if n < 2:
+        return history  # nothing bilateral is possible
+    for rnd in range(rounds):
+        for i in range(n):
+            nxt = (i + 1) % n
+            task_id = uuid5(NAMESPACE_URL, 'at-dod-seed-tx/%d/%s/%s'
+                            % (rnd, members[i], members[nxt]))
+            history.update(task_id, uuids[i], SEED_TX_SCORE)
+            history.update(task_id, uuids[nxt], SEED_TX_SCORE)
+    return history
+
+
+def _write_seed_evidence(cfg_dir: Path, viewer: Identity,
+                         history: TransactionHistory,
+                         signers: list[Identity]) -> bool:
+    """Write ``viewer``'s ``reputation-history.cfg.json``: the shared committed
+    window plus a checkpoint over it that ``viewer`` proposes and ``signers``
+    co-sign.
+
+    Every member holds the same window -- which is the honest shape, since
+    co-signing a checkpoint means precisely "my own window produces this root"
+    -- so only the proposer differs from file to file, and with it the signed
+    designation.
+
+    The proposer's own signature is not required and is not special-cased: the
+    boot check counts co-signatures that verify against keys the reader holds,
+    and a C-node proposer has no private key here to sign with.
+    """
+    window = history._indexed_window()  # noqa: SLF001
+    if not window:
+        return False
+    ckpt = Checkpoint(proposer_uuid=viewer.uuid, root=history.window_root(),
+                      epoch=SEED_EVIDENCE_EPOCH, first_index=window[0].index,
+                      count=len(window))
+    sigs = {str(s.uuid): s.sign(ckpt.designation).signature.decode('ascii')
+            for s in signers}
+    _save_json(cfg_dir / (EVIDENCE_FILE + Configuration.file_ext),
+               evidence_to_dict(history, SignedCheckpoint(ckpt, sigs)))
+    return True
+
+
 def _peer_view_of(ident: Identity) -> Identity:
     """Return a copy of ``ident`` with ``_tier`` bumped to ``SEED_TIER``
     so any peer that loads this Identity from its peers.cfg.json sees
@@ -314,6 +459,38 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
     # Each field member's peer view includes the OTHER field members AND
     # the gateways (so it recognises and unicasts to them).
     field_and_gw = seeded + gateways
+    # Evidence for the seeded reputations (see the module docstring). One
+    # window shared by every member; per-peer files differ only in which
+    # member proposes the checkpoint over it.
+    seed_cap = TransactionHistory().max_chain_len
+    seed_rounds, seed_per_peer = _seed_evidence_rounds(len(seeded), seed_cap)
+    seed_history = _seed_evidence_chain(seeded, identities, seed_rounds)
+    seed_signers = [identities[m] for m in field_and_gw
+                    if _can_sign(identities[m])]
+    supported = ((seed_per_peer * SEED_TX_SCORE
+                  + ReputationProcess.RESTORE_SHRINKAGE_K
+                  * ReputationProcess.PREREP_NEUTRAL)
+                 / (seed_per_peer + ReputationProcess.RESTORE_SHRINKAGE_K)
+                 if seed_per_peer else 0.0)
+    supported_tier = ReputationProcess._trust_tier(supported)  # noqa: SLF001
+    print(f"  Seeded evidence: {len(seed_history)} entries "
+          f"({seed_rounds} ring rotation(s), {seed_per_peer} tx/peer), "
+          f"supporting rep <= {supported:.3f} (tier {supported_tier})")
+    if supported_tier < SEED_TIER:
+        print(f"  warning: the resident chain cap ({seed_cap}) limits the "
+              f"seeded window to {seed_per_peer} tx/peer, which supports only "
+              f"tier {supported_tier}; the cohort will restore below its "
+              f"seeded tier {SEED_TIER}. Raise AT_TX_HISTORY_CAP (for the "
+              f"seeder AND the peers) or seed fewer members.")
+    # Quorum is sized by the READER against its own roster, so warn here
+    # rather than let a warm start quietly come up clamped. A field member's
+    # roster is everyone else in field_and_gw.
+    quorum_needed = (len(field_and_gw) - 1) // 2
+    if len(seed_signers) <= quorum_needed:
+        print(f"  warning: only {len(seed_signers)} of {len(field_and_gw)} "
+              f"cohort identities can sign (public-only C-node views cannot), "
+              f"short of the {quorum_needed + 1} a reader requires; seeded "
+              f"reputations will restore clamped to tier 1.")
     for peer in seeded:
         if peer in c_nodes:
             # C node loads only its C-format identity; it cold-joins for the
@@ -343,6 +520,11 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
                     for other in seeded if other != peer}
         reputations = Reputations(current=rep_dict)
         _save_json(peer_cfg_dir / "reputation.cfg.json", reputations)
+
+        # ...and the evidence that lets those scores survive restoration at
+        # their seeded tier instead of being clamped as unattested.
+        _write_seed_evidence(peer_cfg_dir, identities[peer], seed_history,
+                             seed_signers)
 
         # Peer capabilities: every OTHER peer is recorded as offering
         # the seeded capability list.
@@ -377,6 +559,8 @@ def seed_cohort(out_root: Path, scenario: DoDMissionScenario,
                     for other in seeded}
         _save_json(gw_cfg_dir / "reputation.cfg.json",
                    Reputations(current=rep_dict))
+        _write_seed_evidence(gw_cfg_dir, identities[gw], seed_history,
+                             seed_signers)
 
         pc = PeerCapabilities()
         for other in seeded:

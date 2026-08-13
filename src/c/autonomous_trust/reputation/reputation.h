@@ -584,6 +584,177 @@ int reputation_consensus_by_tier(const tx_history_t *hist, const uuid_t peer_uui
                                  const map_t *task_tiers, const map_t *task_weights,
                                  tier_score_t *out, int max_out);
 
+/****************************
+ * Persisted reputation evidence (verifiable warm start)
+ ****************************/
+
+/* `reputation.cfg.json` records a CONCLUSION -- {peer: score} -- and nothing
+ * about how it was reached. Reloading it makes trust durable, not verifiable:
+ * on its own the file says only that some process with write access to the
+ * config directory believed a number, which is as true of a hand-edited file
+ * as of an earned one. The evidence is persisted beside it in
+ * `reputation-history.cfg.json`: the hash-linked committed window plus the
+ * quorum-signed Merkle checkpoint over it.
+ *
+ * ONE file serves BOTH runtimes, so this is plain JSON with the field names
+ * Python's evidence_to_dict writes -- deliberately NOT the C config framework
+ * (whose `typename` envelope Python cannot read) and deliberately NOT the
+ * `task`/`p1`/`p1_set` key names of the tx catch-up wire form. Same reasoning
+ * as the trust ladder (ISSUES §10.1). Mirrors
+ * src/autonomous-trust/.../reputation/reputation.py EVIDENCE_* and
+ * ISSUES.md §10.3.
+ *
+ * The schema is pinned so a future shape change is a refusal to rebuild --
+ * which degrades safely to clamped restoration -- rather than a misparse. */
+#define REP_EVIDENCE_SCHEMA "1"
+#define REP_EVIDENCE_FILE   "reputation-history"
+
+/* Hex length of a detached Ed25519 signature (crypto_sign_BYTES * 2). Defined
+ * here rather than only in rep_proc.c because the evidence document carries
+ * these signatures across the file boundary. */
+#define REP_EVIDENCE_SIG_HEX_LEN 128
+
+/** A finalized checkpoint plus the co-signatures that finalized it —
+ *  the C mirror of Python's Checkpoint/SignedCheckpoint pair, flattened
+ *  because C has no need for the two-level object. */
+typedef struct {
+    bool    present;      /**< false when the document carried no checkpoint */
+    char    proposer_uuid[UUID_STRING_LEN + 1];
+    char    root[TX_HASH_HEX_LEN + 1];
+    int64_t epoch;
+    int     first_index;
+    int     count;
+    /** Which chain this checkpoint commits to: "" is the node's PRIMARY chain,
+     *  a group-uuid is one of a gateway's child-group chains. A gateway keeps
+     *  one history per child group, so without this a receiver could not tell
+     *  which of its chains to compare the proposed root against. Mirrors
+     *  Python Checkpoint.group_uuid (ISSUES.md §10.2). */
+    char    group_uuid[UUID_STRING_LEN + 1];
+    /** voter uuid-str -> string_data(detached hex signature over the
+     *  checkpoint designation). Same voter-keyed shape as rep_state's
+     *  checkpoint_sigs, and for the same reason: a signature that cannot be
+     *  attributed cannot be counted. */
+    map_t   sigs;
+} rep_checkpoint_t;
+
+/** Initialize (zero + map_init). Every rep_checkpoint_t must be initialized
+ *  before use and released with rep_checkpoint_free. */
+int  rep_checkpoint_init(rep_checkpoint_t *ckpt);
+void rep_checkpoint_free(rep_checkpoint_t *ckpt);
+
+/** Canonical bytes a checkpoint co-signer signs, byte-identical to Python
+ *  `Checkpoint.designation`:
+ *    "AT-CKPT\0" proposer "|" root "|" epoch "|" first_index "|" count
+ *    [ "|" group_uuid ]
+ *  `nonce` is excluded on both sides (anti-replay only, carried alongside).
+ *
+ *  @p group_uuid is appended ONLY when non-empty (NULL/"" = the primary chain),
+ *  which does two things at once. A primary-chain designation stays
+ *  byte-identical to what it was before child chains existed, so every existing
+ *  co-signature, pinned corpus scenario and the Python twin keep verifying. And
+ *  a child-chain designation can never collide with a primary one, so a
+ *  co-signature harvested from a child-group round cannot be replayed as
+ *  agreement about the primary chain — which it otherwise could, since two
+ *  chains can perfectly well produce the same root, epoch and bounds.
+ *
+ *  Returns the byte count written, or 0 on truncation/bad input. */
+size_t rep_checkpoint_designation(const char *proposer, const char *root,
+                                  int64_t epoch, int64_t first_index,
+                                  int64_t count, const char *group_uuid,
+                                  uint8_t *out, size_t cap);
+
+/** Build the persisted-evidence document for @p hist and @p ckpt.
+ *
+ *  Only entries with an assigned index are written: an index is what a
+ *  committed bilateral entry has, and an un-indexed one is not evidence of
+ *  anything yet. Pass a @p ckpt with `present == false` (or NULL) to write a
+ *  document whose `checkpoint` is null. Caller owns *out (json_decref). */
+int  reputation_evidence_to_json(const tx_history_t *hist,
+                                 const rep_checkpoint_t *ckpt, json_t **out);
+
+/** Parse a persisted-evidence document into @p hist_out and @p ckpt_out.
+ *
+ *  Returns non-zero on anything malformed — wrong schema, non-array chain, an
+ *  entry with no index — and on a chain whose hash-linkage does not hold. The
+ *  caller treats that as "no usable evidence", which is a SAFE outcome
+ *  (restoration falls back to clamped), so strictness costs nothing here while
+ *  a misparse would cost a great deal.
+ *
+ *  @p hist_out is loaded preserving each entry's on-disk index and prev_hash —
+ *  it must be, or the Merkle root could not be reproduced. */
+int  reputation_evidence_from_json(const json_t *doc, tx_history_t *hist_out,
+                                   rep_checkpoint_t *ckpt_out);
+
+/** Merkle root over the sub-window of @p hist that @p ckpt commits to.
+ *
+ *  The window is selected by ABSOLUTE index rather than taken as the whole
+ *  chain: a persisted chain may legitimately run past its checkpoint (commits
+ *  land after the checkpoint finalizes, and the file is rewritten when the
+ *  fuller co-signature set arrives). It may not fall SHORT — a missing entry
+ *  makes the root unreproducible — so this returns non-zero unless exactly
+ *  `ckpt->count` contiguous entries are present. */
+int  reputation_checkpoint_window_root(const tx_history_t *hist,
+                                       const rep_checkpoint_t *ckpt,
+                                       char out[TX_HASH_HEX_LEN + 1]);
+
+/** Per-peer upper bound on a restored score, derived from the attested window
+ *  and NOTHING else: writes uuid_str -> float_data(ceiling) into @p out.
+ *
+ *  Appearing in an attested window is not the same as having earned a number.
+ *  Verifying only presence leaves the original hole open — a score hand-raised
+ *  in `reputation.cfg.json` is still restored in full, because the peer really
+ *  does transact. So the evidence bounds the VALUE: the mean of the
+ *  counterparty-side scores the window records for the peer, shrunk toward
+ *  PREREP_NEUTRAL by REP_RESTORE_SHRINKAGE_K. Shrinkage is what makes a SHORT
+ *  attested history unable to justify a high score, so a forger cannot mint
+ *  the shortest window that verifies.
+ *
+ *  @p self_uuid_str is excluded (our own score is not a peer judgement); pass
+ *  NULL to include every peer. Mirrors Python
+ *  ReputationProcess._evidence_ceilings. */
+int  reputation_evidence_ceilings(const tx_history_t *hist,
+                                  const rep_checkpoint_t *ckpt,
+                                  const char *self_uuid_str, map_t *out);
+
+/* Committed bilateral transactions a peer needs inside the attested window
+ * before the evidence bounds its score at all; below this it is uncovered and
+ * clamped to the unverified tier. Mirrors RESTORE_EVIDENCE_MIN_TX. */
+#define REP_RESTORE_EVIDENCE_MIN_TX 1
+/* Pseudo-count shrinking the evidence-derived ceiling toward PREREP_NEUTRAL.
+ * This is the security parameter of the whole mechanism: it sets how MUCH
+ * attested history a peer needs before the window can justify an elevated
+ * restored tier. Larger -> more history required. Mirrors Python
+ * RESTORE_SHRINKAGE_K; override with AT_REP_RESTORE_SHRINKAGE_K. */
+#define REP_RESTORE_SHRINKAGE_K_DEFAULT 3.0
+#define REP_RESTORE_SHRINKAGE_K \
+    (reputation_env_double("AT_REP_RESTORE_SHRINKAGE_K", \
+                           REP_RESTORE_SHRINKAGE_K_DEFAULT))
+
+/****************************
+ * Staleness decay (why warm start is safe)
+ ****************************/
+
+/* Earned reputation is a MEMORY, and memory must fade: otherwise a
+ * warm-started score would be trusted forever on the strength of activity
+ * hours or days old. These mirror repprocess.py's REPUTATION_DECAY_*.
+ *
+ * ASYMMETRIC by design: decay only erodes reputation ABOVE the asymptote. A
+ * score at or below it is returned unchanged, because mere absence must never
+ * rehabilitate a distrusted node. */
+#define REP_DECAY_ASYMPTOTE_DEFAULT 0.21   /* just above neutral, above cut-off */
+#define REP_DECAY_ASYMPTOTE \
+    (reputation_env_double("AT_REP_DECAY_ASYMPTOTE", REP_DECAY_ASYMPTOTE_DEFAULT))
+#define REP_DECAY_ONSET      3600.0        /* s idle before decay begins */
+#define REP_DECAY_HALF_LIFE  86400.0       /* s for the above-asymptote gap to halve */
+#define REP_DECAY_SWEEP_INTERVAL 60.0      /* min s between live sweeps */
+
+/** Relax an operational reputation toward almost-neutral as a function of
+ *  idle time. A score at or below REP_DECAY_ASYMPTOTE is returned unchanged;
+ *  above it, the gap decays exponentially after the onset grace period and
+ *  never overshoots below the asymptote. Pure function — mirrors Python
+ *  ReputationProcess._decayed_score. */
+double reputation_decayed_score(double score, double idle_seconds);
+
 /* paxos_id_index is provided by algorithms/paxos.h */
 
 /****************************

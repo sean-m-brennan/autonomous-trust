@@ -14,6 +14,8 @@
 #   limitations under the License.
 # ******************
 
+import json
+import math
 import os
 import threading
 import time
@@ -28,13 +30,15 @@ from nacl.exceptions import BadSignatureError
 
 from ..network import Message, Network
 from ..processes import Process, ProcMeta
-from ..config import Configuration, from_json_string, to_json_string
+from ..config import (Configuration, atomic_write, from_json_string,
+                      to_json_string)
 from ..identity.protocol import IdentityProtocol
 from .protocol import ReputationProtocol
 from .reputation import (TransactionHistory, Reputation, Reputations,
                          TransactionScore, SlashAttestation, SignedSlash,
                          Checkpoint, SignedCheckpoint, validate_tx_score,
-                         PeerReputation)
+                         PeerReputation, EVIDENCE_FILE, evidence_to_dict,
+                         evidence_from_dict)
 from ..system import CfgIds, now, encoding, proc_idle_floor
 from .. import _probes
 
@@ -91,6 +95,54 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         (0.80, 3),
         (0.90, 4),
     )
+
+    # --- Verifiable warm start (ISSUES.md §10.3) ----------------------
+    # Restoration is GRADED by whether the persisted score has evidence
+    # behind it. `reputation.cfg.json` is a conclusion; on its own it says
+    # only that some process with write access to the config directory
+    # believed a number, which is exactly as true of a tampered file as of
+    # an earned one. The evidence is `reputation-history.cfg.json`: the
+    # hash-linked committed window plus the quorum-signed Merkle checkpoint
+    # over it (_rebuild_from_evidence).
+    #
+    # Verified -> the peer's score is restored as persisted (still subject to
+    # staleness decay, the orthogonal time axis). Unverified -> the score is
+    # clamped so the peer holds no more than UNVERIFIED_RESTORE_TIER, and has
+    # to earn elevation back through fresh in-session transactions.
+    #
+    # Tier 1 (presence/communication) is the clamp because an
+    # authenticated-but-COMPROMISED asset passes ZTA admission by
+    # definition -- credentials are exactly what it holds -- so restoring a
+    # historically-earned high tier the instant it is admitted re-opens the
+    # hole the system exists to close, and for a short-lived asset there is
+    # no time for behavioural re-evaluation to catch it first. See
+    # doc/architecture/reputation.md ("Hardening: floor, not full
+    # restoration").
+    UNVERIFIED_RESTORE_TIER = 1
+    # Committed bilateral transactions a peer needs INSIDE the attested window
+    # before the evidence bounds its score at all. Below this it is treated as
+    # uncovered and clamped to the unverified tier.
+    RESTORE_EVIDENCE_MIN_TX = 1
+    # Pseudo-count shrinking the evidence-derived ceiling toward
+    # PREREP_NEUTRAL (see _evidence_ceilings). This is the security parameter
+    # of the whole mechanism: it sets how MUCH attested history a peer needs
+    # before the window can justify an elevated restored tier, and so it is
+    # what stops a forger from minting a two-entry window of perfect scores.
+    # Larger -> more history required. Override: AT_REP_RESTORE_SHRINKAGE_K.
+    RESTORE_SHRINKAGE_K = _env_float('AT_REP_RESTORE_SHRINKAGE_K', 3.0)
+
+    # Seconds between checkpoint proposals this node originates (0 disables).
+    # Checkpointing was previously reactive only -- a Checkpoint had to be put
+    # on the reputation queue by something outside this process -- and nothing
+    # ever did, so in a live deployment no checkpoint existed, which meant no
+    # warm start could ever verify: the mechanism above would have been
+    # unreachable in practice. Override: AT_REP_CHECKPOINT_SEC.
+    #
+    # The interval trades evidence freshness against protocol traffic (each
+    # proposal draws a co-signature from every member). It also bounds what a
+    # restart can attest: entries committed after the last checkpoint are
+    # persisted but unattested, so they restore clamped.
+    CHECKPOINT_INTERVAL = _env_float('AT_REP_CHECKPOINT_SEC', 300.0)
 
     # Hysteresis band for the CTFT ↔ pure-reputation dispatch in
     # _compute_reputation. A single 0.5 threshold made peers hovering
@@ -394,10 +446,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self._slash_epoch = 0
 
         # --- Phase 2: quorum-signed Merkle checkpoints --------------------
-        # Latest finalized checkpoint of OUR window (the agreed commitment a
-        # gateway parent / slash adjudicator verifies inclusion proofs
-        # against). None until the first checkpoint finalizes. Volatile.
-        self._checkpoint: 'Checkpoint | None' = None
+        # The finalized checkpoint per chain lives in self._checkpoints below;
+        # `self._checkpoint` is a read-only property naming the primary one.
         # Proposer-side co-signature accumulation: checkpoint-key ->
         # {voter-uuid-str: detached hex signature over the checkpoint's
         # designation}, holding only members whose own window_root matched.
@@ -406,11 +456,42 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self._checkpoint_sigs: dict[tuple, dict] = {}
         # Proposer-side pending checkpoints awaiting quorum: key -> Checkpoint.
         self._checkpoint_pending: dict[tuple, Checkpoint] = {}
+        # --- Per-chain finalized checkpoint state -------------------------
+        # A gateway keeps one chain per child group beside its primary one, and
+        # each chain gets its own checkpoints: its own epoch counter, its own
+        # quorum (sized against that group's members), its own evidence file.
+        # These are keyed by CHAIN KEY -- '' for the primary chain, a
+        # group-uuid string for a child -- so a leaf node simply has a
+        # one-entry dict and behaves exactly as before.
+        #
+        # The co-signatures are kept beyond the live round because they travel
+        # in the persisted evidence: a boot-time rebuild has to verify the same
+        # quorum a live receiver does, and a root with no signatures beside it
+        # is a number anyone with write access to the file could have chosen.
+        self._checkpoints: dict[str, Checkpoint] = {}
+        self._checkpoint_sigs_final: dict[str, dict] = {}
+        self._checkpoint_epochs: dict[str, int] = {}
         # Dedup for finalized checkpoints (FIFO bounded) so a re-broadcast
         # checkpoint_final is a cheap no-op. Mirrors _slashed_seen.
         self._checkpoint_seen: 'OrderedDict[tuple, None]' = OrderedDict()
-        # Monotonic epoch for checkpoints this node originates.
-        self._checkpoint_epoch = 0
+        # Periodic-origination clocks (see _maybe_checkpoint). 0.0 == the
+        # phase offset has not been taken yet. The head map is per chain, so a
+        # busy child group is checkpointed while an idle primary chain is not.
+        self._next_checkpoint_at = 0.0
+        self._last_checkpoint_heads: dict[str, int] = {}
+        # Child-group chains already attempted by _restore_child_evidence, and
+        # the persisted score each clamped peer was clamped away FROM -- the
+        # upper bound on any later lift, so late evidence restores standing
+        # instead of inventing it.
+        self._child_evidence_tried: set[str] = set()
+        self._restore_clamped: dict[str, float] = {}
+
+        # Verifiable warm start: adopt the persisted committed history if its
+        # checkpoint verifies, and clamp every restored score the evidence
+        # does not cover. LAST in __init__ deliberately -- it reads the
+        # loaded reputation snapshot, the peer roster and the checkpoint
+        # state above, and it revises self.history.
+        self._rebuild_from_evidence()
 
     @property
     def peers(self):
@@ -419,6 +500,56 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     @property
     def group(self):
         return self.protocol.group
+
+    @property
+    def _checkpoint(self):
+        """The finalized checkpoint over the PRIMARY chain, or None.
+
+        Kept as a property because most of this class only ever cares about
+        the primary chain (slash evidence, the app-facing observables, the
+        conformance adapters), and because it keeps every prior reader working
+        unchanged now that the store is per chain."""
+        return self._checkpoints.get('')
+
+    @_checkpoint.setter
+    def _checkpoint(self, ckpt):
+        """Assigning the primary checkpoint directly is a fixture / test path.
+        The live path goes through ``_store_checkpoint``, which also retains
+        the co-signatures and writes the evidence file."""
+        if ckpt is None:
+            self._checkpoints.pop('', None)
+        else:
+            self._checkpoints[''] = ckpt
+
+    def _chain_key(self, group_uuid) -> str:
+        """The per-chain bookkeeping key for a group-uuid: '' for the primary
+        chain, the group-uuid string for a child chain.
+
+        Resolves through the same rules as ``_chain_for_group``, so a None or
+        unrecognized group-uuid -- and the node's own primary group's uuid --
+        all land on the primary chain. Anything else is only a child key if we
+        actually gateway that group; an unknown uuid must not mint a chain."""
+        if group_uuid is None:
+            return ''
+        key = str(group_uuid)
+        if not key:
+            return ''
+        if self.group is not None and key == str(self.group.uuid):
+            return ''
+        if key in self.child_groups:
+            return key
+        return ''
+
+    def _chain_for_key(self, chain_key: str):
+        """The TransactionHistory a chain key names."""
+        if not chain_key:
+            return self.history
+        return self._chain_for_group(chain_key)
+
+    def _chain_keys(self):
+        """Every chain this node maintains: the primary, then any child-group
+        chains a gateway has materialized."""
+        return [''] + [k for k in self.child_histories]
 
     @property
     def child_groups(self):
@@ -1074,15 +1205,21 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         - No ``evidence_ref`` -> True (Phase 0 trust-the-detector fallback, so
           legacy / evidence-free slashes are unaffected).
         - With ``evidence_ref`` -> the offending tx's inclusion proof must
-          verify against a root this node has FINALIZED as a checkpoint
-          (``self._checkpoint.root``). Tying it to our own quorum-agreed
-          checkpoint — not a root chosen by the accuser — is what makes the
-          evidence trustworthy. Any malformed / mismatched / unverifiable
-          evidence returns False and the slash is refused."""
+          verify against a root this node has FINALIZED as a checkpoint. Tying
+          it to our own quorum-agreed checkpoint — not a root chosen by the
+          accuser — is what makes the evidence trustworthy. Any malformed /
+          mismatched / unverifiable evidence returns False and the slash is
+          refused.
+
+        ANY of our finalized roots counts, not only the primary chain's: a
+        gateway finalizes a checkpoint per child group, and an offending tx
+        committed in a child group is anchored in that group's root. Accepting
+        only the primary root would refuse every legitimate subtree slash while
+        adding no security — each root cleared the same quorum test."""
         ev = attestation.evidence_ref
         if ev is None:
             return True
-        if self._checkpoint is None:
+        if not self._checkpoints:
             return False  # nothing to verify against
         try:
             leaf = ev['leaf']
@@ -1093,11 +1230,16 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                      for s, left in ev['proof']]
         except (KeyError, TypeError, ValueError):
             return False
-        ck_root = self._checkpoint.root
-        if isinstance(ck_root, str):
-            ck_root = ck_root.encode('ascii')
-        # The evidence must be proven against OUR finalized checkpoint root.
-        if root != ck_root:
+        finalized = set()
+        for ck in self._checkpoints.values():
+            if ck is None or not ck.root:
+                continue
+            ck_root = ck.root
+            if isinstance(ck_root, str):
+                ck_root = ck_root.encode('ascii')
+            finalized.add(ck_root)
+        # The evidence must be proven against one of OUR finalized roots.
+        if root not in finalized:
             return False
         return TransactionHistory.verify_inclusion(leaf, proof, root)
 
@@ -1374,63 +1516,504 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         ignored — the proposer always commits to its own live window. Mirrors
         ``forward_slash``."""
         if isinstance(message, Checkpoint):
-            try:
-                self._checkpoint_epoch += 1
-                window = self.history._indexed_window()
-                root = self.history.window_root()
-                first = window[0].index if window else self.history._next_index
-                ckpt = Checkpoint(
-                    proposer_uuid=self.identity.uuid, root=root,
-                    epoch=self._checkpoint_epoch,
-                    first_index=first, count=len(window),
-                    nonce=os.urandom(8))
-                try:
-                    ckpt.signature = self.identity.sign(ckpt.designation)
-                except Exception:
-                    ckpt.signature = None
-                key = ckpt.key()
-                self._checkpoint_pending[key] = ckpt
-                # Our own detached signature, for the same reason as
-                # forward_slash: every entry travelling on checkpoint_final
-                # must be verifiable by its recipients.
-                self._checkpoint_sigs[key] = {}
-                try:
-                    self._checkpoint_sigs[key][str(self.identity.uuid)] = \
-                        self._detached_sig(self.identity, ckpt.designation)
-                except Exception:
-                    self.logger.error(
-                        'forward_checkpoint: cannot sign own checkpoint; '
-                        'this checkpoint cannot reach quorum')
-                # Self-store immediately so a single-node group (or the
-                # originator's own view) has a finalized checkpoint without a
-                # co-sign round-trip, matching forward_slash's self-apply.
-                self._store_checkpoint(ckpt)
-                if self.group is not None:
-                    msg = Message(self.name,
-                                  ReputationProtocol.checkpoint_propose,
-                                  to_json_string(ckpt), self.group,
-                                  from_whom=self.identity)
-                    queues[CfgIds.network].put(
-                        msg, block=True, timeout=self.q_cadence)
-                self.logger.info(
-                    'Proposed checkpoint: epoch=%d count=%d root=%s',
-                    ckpt.epoch, ckpt.count,
-                    (root.decode() if isinstance(root, bytes) else str(root))[:12])
-            except Full:
-                self.logger.error('forward_checkpoint: network queue full')
+            # The trigger object's fields are ignored EXCEPT group_uuid, which
+            # selects which of our chains to commit to (a gateway has more than
+            # one). Everything else always comes from our own live window.
+            self._originate_checkpoint(
+                queues, self._chain_key(getattr(message, 'group_uuid', '')))
             return True
         return False
 
-    def _store_checkpoint(self, ckpt):
+    def _originate_checkpoint(self, queues, chain_key: str = ''):
+        """Propose a checkpoint over the chain ``chain_key`` names.
+
+        Broadcast goes to THAT chain's group: a child-group checkpoint is only
+        meaningful to that group's members, who are the ones holding the same
+        window to compare roots against, and they are also who sizes its
+        quorum."""
+        try:
+            chain = self._chain_for_key(chain_key)
+            epoch = self._checkpoint_epochs.get(chain_key, 0) + 1
+            self._checkpoint_epochs[chain_key] = epoch
+            window = chain._indexed_window()
+            root = chain.window_root()
+            first = window[0].index if window else chain._next_index
+            ckpt = Checkpoint(
+                proposer_uuid=self.identity.uuid, root=root,
+                epoch=epoch, first_index=first, count=len(window),
+                nonce=os.urandom(8), group_uuid=chain_key)
+            try:
+                ckpt.signature = self.identity.sign(ckpt.designation)
+            except Exception:
+                ckpt.signature = None
+            key = ckpt.key()
+            self._checkpoint_pending[key] = ckpt
+            # Our own detached signature, for the same reason as
+            # forward_slash: every entry travelling on checkpoint_final
+            # must be verifiable by its recipients.
+            self._checkpoint_sigs[key] = {}
+            try:
+                self._checkpoint_sigs[key][str(self.identity.uuid)] = \
+                    self._detached_sig(self.identity, ckpt.designation)
+            except Exception:
+                self.logger.error(
+                    'forward_checkpoint: cannot sign own checkpoint; '
+                    'this checkpoint cannot reach quorum')
+            # Self-store immediately so a single-node group (or the
+            # originator's own view) has a finalized checkpoint without a
+            # co-sign round-trip, matching forward_slash's self-apply.
+            # Only OUR signature exists yet, which is deliberately not
+            # special-cased: at boot the same quorum rule applies, so this
+            # self-store attests a genuinely single-node group and nothing
+            # more. The quorum map replaces it in handle_checkpoint_sign.
+            self._store_checkpoint(ckpt, self._checkpoint_sigs[key])
+            to_whom = (self._group_by_uuid(chain_key) if chain_key
+                       else self.group)
+            if to_whom is not None:
+                msg = Message(self.name,
+                              ReputationProtocol.checkpoint_propose,
+                              to_json_string(ckpt), to_whom,
+                              from_whom=self.identity)
+                queues[CfgIds.network].put(
+                    msg, block=True, timeout=self.q_cadence)
+            self.logger.info(
+                'Proposed checkpoint: chain=%s epoch=%d count=%d root=%s',
+                chain_key[:8] or 'primary', ckpt.epoch, ckpt.count,
+                (root.decode() if isinstance(root, bytes) else str(root))[:12])
+        except Full:
+            self.logger.error('forward_checkpoint: network queue full')
+
+    def _store_checkpoint(self, ckpt, sigs=None):
         """Record ``ckpt`` as the latest finalized checkpoint (idempotent on
-        re-broadcast via the seen-dedup ring)."""
+        re-broadcast via the seen-dedup ring).
+
+        ``sigs`` are the co-signatures that finalized it, retained because the
+        persisted evidence has to carry them: a boot-time rebuild verifies the
+        same quorum a live receiver does, and without the signatures there is
+        nothing to verify (see _rebuild_from_evidence).
+
+        This is also where the evidence file is written, and deliberately so:
+        at this instant the resident window and the agreed root describe each
+        other. Writing on every commit instead would be both hotter (~16/s in
+        the DoD demo) and *less* useful, since a chain that has moved past its
+        checkpoint is exactly a chain the rebuild cannot attest.
+        """
         key = ckpt.key()
+        chain_key = self._chain_key(getattr(ckpt, 'group_uuid', ''))
         if key in self._checkpoint_seen:
+            # Idempotent on re-broadcast, with one exception: a fuller
+            # co-signature set is an upgrade, not a duplicate. The proposer
+            # self-stores at propose time holding only its OWN signature (so a
+            # single-node group needs no round trip), and the quorum map only
+            # exists later.
+            held = self._checkpoint_sigs_final.get(chain_key, {})
+            if sigs and len(sigs) > len(held):
+                self._checkpoint_sigs_final[chain_key] = dict(sigs)
+                self._persist_history(chain_key)
             return
-        self._checkpoint = ckpt
+        self._checkpoints[chain_key] = ckpt
+        self._checkpoint_sigs_final[chain_key] = dict(sigs or {})
         self._checkpoint_seen[key] = None
         while len(self._checkpoint_seen) > self.COMMITTED_ROUNDS_CAP:
             self._checkpoint_seen.popitem(last=False)
+        self._persist_history(chain_key)
+
+    def _evidence_path(self, chain_key: str = ''):
+        """The evidence file for one chain.
+
+        One file per chain rather than one file holding every chain: it mirrors
+        the ``group_child_<name>.cfg.json`` convention already used for child
+        groups, keeps the primary file's shape byte-for-byte what it was, and
+        means a corrupt or stale child file costs that subtree its attestation
+        and nothing else."""
+        name = EVIDENCE_FILE
+        if chain_key:
+            name = '%s-%s' % (EVIDENCE_FILE, chain_key)
+        return os.path.join(Configuration.get_cfg_dir(),
+                            name + Configuration.file_ext)
+
+    def _persist_history(self, chain_key: str = ''):
+        """Write the evidence behind one chain: its resident hash-linked window
+        plus the quorum-signed checkpoint over it.
+
+        Failure is logged and swallowed. The evidence is an *optimization of
+        trust* -- its absence costs a warm start its elevated tiers (see
+        _rebuild_from_evidence) and nothing else -- so it must never be able to
+        take down the reputation process.
+        """
+        try:
+            ckpt = self._checkpoints.get(chain_key)
+            signed = None
+            if ckpt is not None:
+                signed = SignedCheckpoint(
+                    checkpoint=ckpt,
+                    sigs=dict(self._checkpoint_sigs_final.get(chain_key, {})))
+            doc = evidence_to_dict(self._chain_for_key(chain_key), signed)
+            with atomic_write(self._evidence_path(chain_key)) as f:
+                json.dump(doc, f, indent=2)
+        except (OSError, IOError, ValueError, TypeError) as e:
+            self.logger.warning('Could not persist reputation evidence: %s', e)
+
+    def _checkpoint_phase(self) -> float:
+        """A per-node offset into the checkpoint interval, so members do not
+        all propose on the same tick.
+
+        Every member co-signs every proposal, so N nodes proposing together
+        cost N² messages in one burst; spread over the interval they cost the
+        same total at a fraction of the peak. Derived from our own uuid rather
+        than drawn randomly: the phase then survives a restart, which keeps a
+        restarted node from colliding with whichever node has drifted into its
+        slot."""
+        try:
+            seed = UUID(str(self.identity.uuid)).int
+        except (ValueError, AttributeError, TypeError):
+            return 0.0
+        return float(seed % max(1, int(self.CHECKPOINT_INTERVAL)))
+
+    def _maybe_checkpoint(self, queues, present):
+        """Originate a checkpoint over each of our committed windows, on the
+        interval, for every chain whose window has actually moved.
+
+        Two guards, both about not spending a group's bandwidth for nothing.
+        An empty window has nothing to attest. A window whose head has not
+        advanced since the last checkpoint is already attested -- re-signing
+        it produces a new epoch that commits to the same root, which no
+        verifier can use for anything the previous one could not.
+
+        A gateway runs this per chain, so an idle primary chain is skipped
+        while a busy child group is checkpointed, and each round is confined to
+        the group that can actually co-sign it."""
+        if self.CHECKPOINT_INTERVAL <= 0:
+            return
+        if self._next_checkpoint_at == 0.0:
+            self._next_checkpoint_at = present + self._checkpoint_phase()
+            return
+        if present < self._next_checkpoint_at:
+            return
+        self._next_checkpoint_at = present + self.CHECKPOINT_INTERVAL
+        for chain_key in self._chain_keys():
+            window = self._chain_for_key(chain_key)._indexed_window()
+            if not window:
+                continue
+            head = window[-1].index
+            last = self._last_checkpoint_heads.get(chain_key)
+            if last is not None and head <= last:
+                continue
+            self._last_checkpoint_heads[chain_key] = head
+            self._originate_checkpoint(queues, chain_key)
+
+    # ----- Verifiable warm start (ISSUES.md §10.3) ------------------------
+
+    def _rebuild_from_evidence(self):
+        """At start-up, re-establish the committed history from the persisted
+        evidence and grade the restored reputations by whether that evidence
+        VERIFIES. Called last in ``__init__``: it needs the loaded snapshot,
+        the peer roster (to resolve co-signers) and the checkpoint state.
+
+        Three questions, in order, and every negative answer degrades to the
+        same safe outcome rather than raising:
+
+        1. Does the chain's hash-linkage hold? A broken link means the file
+           was altered or truncated.
+        2. Does the recomputed Merkle root over the checkpoint's window equal
+           the root the checkpoint commits to? This is what ties the entries
+           on disk to the thing that was signed.
+        3. Does a quorum of co-signatures over that checkpoint verify against
+           keys WE hold? Same test ``handle_checkpoint_final`` applies live,
+           for the same reason: without it the root is a number whoever wrote
+           the file chose.
+
+        Only if all three hold is the chain adopted and the persisted scores
+        allowed to stand. The chain is NOT loaded on failure, and that is the
+        load-bearing part: hash-linkage is computable by anyone (the digests
+        are public), so a self-consistent chain proves nothing on its own.
+        Loading one would let CTFT re-derive the very elevated scores the
+        clamp below exists to withhold -- the clamp would be decoration.
+        """
+        # Only the PRIMARY chain here. A gateway's child groups arrive later,
+        # over IPC (`ChildGroupSet` from IdentityProcess), so at __init__ time
+        # this node does not yet know which subtrees are its own — and reading a
+        # file for a group we may not gateway is exactly what
+        # _persisted_chain_keys refuses to do. The child chains are restored by
+        # _restore_child_evidence once the group set lands.
+        ceilings: dict = {}
+        self._rebuild_one_chain('', ceilings)
+        self._grade_restored_reputations(ceilings)
+
+    def _persisted_chain_keys(self):
+        """Child-group chain keys with evidence on disk.
+
+        Driven by ``child_groups`` rather than by globbing the directory: a file
+        naming a group we do not gateway is not ours to adopt, and reading only
+        what we are configured for keeps a stale file from resurrecting a
+        subtree we have left."""
+        return [group_uuid for group_uuid in self.child_groups
+                if os.path.exists(self._evidence_path(group_uuid))]
+
+    def _restore_child_evidence(self, queues):
+        """Restore a gateway's child-group chains once the group set has
+        arrived, one attempt per group (ISSUES §10.2).
+
+        This runs late by necessity -- ``child_groups`` is delivered over IPC
+        after ``__init__`` -- which shapes what it may do to a live score. It
+        only ever LIFTS, and never above what was persisted: a peer attested
+        solely in a child group was clamped at boot as uncovered, and this
+        returns it to what its subtree's evidence bears out. Lowering here
+        would be wrong twice over -- the peer may have earned standing in this
+        session since boot, and late-arriving evidence is not a reason to
+        discount it.
+        """
+        for chain_key in self._persisted_chain_keys():
+            if chain_key in self._child_evidence_tried:
+                continue
+            self._child_evidence_tried.add(chain_key)
+            ceilings: dict = {}
+            self._rebuild_one_chain(chain_key, ceilings)
+            for peer, ceiling in ceilings.items():
+                try:
+                    peer_uuid = UUID(peer)
+                except (ValueError, TypeError):
+                    continue
+                current = self.reputations.current.get(peer_uuid)
+                if current is None:
+                    continue
+                # Bounded by the persisted value we clamped away from, so this
+                # restores standing rather than inventing it.
+                lift = min(self._restore_clamped.get(peer, current), ceiling)
+                if lift <= current:
+                    continue
+                self.reputations.current[peer_uuid] = lift
+                self.logger.info(
+                    'Warm start: child-group evidence lifted %s %.3f -> %.3f',
+                    peer[:8], current, lift)
+                self._publish_tier_change(queues, peer_uuid, lift)
+                self._publish_reputation_change(queues, peer_uuid, lift)
+
+    def _rebuild_one_chain(self, chain_key: str, ceilings: dict) -> None:
+        """Verify and (only then) adopt one chain's persisted evidence, folding
+        its per-peer ceilings into ``ceilings``.
+
+        Where two attested windows bound the same peer, the HIGHER bound wins.
+        Both are quorum-attested statements about that peer, and the restored
+        score is a single scalar: letting one group's thin window suppress
+        standing another group's quorum actually witnessed would penalize the
+        peer for our topology rather than for its behaviour."""
+        try:
+            with open(self._evidence_path(chain_key)) as f:
+                doc = json.load(f)
+        except (OSError, IOError):
+            # No evidence on disk: a cold start, or a warm start from a
+            # snapshot written before checkpointing ever ran. Persisted
+            # scores are unattested, so they are clamped.
+            return
+        except ValueError as e:
+            self.logger.warning('Reputation evidence is not valid JSON: %s', e)
+            return
+        try:
+            chain, signed = evidence_from_dict(doc)
+        except (ValueError, KeyError, TypeError) as e:
+            self.logger.warning('Unusable reputation evidence: %s', e)
+            return
+        # A file must cover the chain it is named for. A child document
+        # claiming the primary chain (or another group's) would otherwise be
+        # adopted as that chain's history on the strength of signatures made
+        # over different bytes.
+        ckpt = getattr(signed, 'checkpoint', None)
+        if ckpt is not None and \
+                self._chain_key(getattr(ckpt, 'group_uuid', '')) != chain_key:
+            self.logger.warning(
+                'Reputation evidence for chain %s names chain %s; refusing it',
+                chain_key[:8] or 'primary',
+                str(getattr(ckpt, 'group_uuid', ''))[:8] or 'primary')
+            return
+        found = self._attested_ceilings(chain, signed)
+        if found is None:
+            return
+        # Verified: adopt the chain, and with it the checkpoint that attests
+        # it, so this node resumes with a history a peer can audit and an
+        # anchor slash evidence can be measured against.
+        if chain_key:
+            self.child_histories[chain_key] = TransactionHistory(_chain=chain)
+        else:
+            self.history = TransactionHistory(_chain=chain)
+        self._checkpoints[chain_key] = ckpt
+        self._checkpoint_sigs_final[chain_key] = dict(signed.sigs or {})
+        self._checkpoint_seen[ckpt.key()] = None
+        # Resume our own epoch counter past the persisted checkpoint. Peers
+        # dedup on (proposer, epoch, chain) and their rings are NOT reset by
+        # our restart, so a restarted proposer that began again at epoch 1
+        # would have its first several proposals discarded as re-broadcasts.
+        if str(ckpt.proposer_uuid) == str(self.identity.uuid):
+            self._checkpoint_epochs[chain_key] = max(
+                self._checkpoint_epochs.get(chain_key, 0), int(ckpt.epoch))
+        for peer, ceiling in found.items():
+            if ceiling > ceilings.get(peer, -1.0):
+                ceilings[peer] = ceiling
+        self.logger.info(
+            'Reputation warm start VERIFIED: chain=%s, %d committed entries, '
+            'checkpoint epoch=%d, %d evidence-backed peer(s)',
+            chain_key[:8] or 'primary', len(chain), int(ckpt.epoch),
+            len(found))
+
+    def _attested_ceilings(self, chain, signed):
+        """The per-peer score ceilings the persisted evidence supports (see
+        ``_evidence_ceilings``), or None if the evidence does not verify.
+
+        None and an empty mapping are deliberately distinct: None means "no
+        usable evidence", so nothing may be adopted, whereas an empty mapping
+        means the evidence verified but bounds no peer -- a genuine empty
+        window -- which lets the chain be adopted while every score still
+        restores clamped."""
+        if not TransactionHistory.verify_chain_links(chain):
+            self.logger.warning(
+                'Reputation evidence chain failed hash-link verification; '
+                'discarding it and restoring at tier %d',
+                self.UNVERIFIED_RESTORE_TIER)
+            return None
+        ckpt = getattr(signed, 'checkpoint', None)
+        if ckpt is None:
+            self.logger.info(
+                'Reputation evidence carries no checkpoint; restoring at '
+                'tier %d', self.UNVERIFIED_RESTORE_TIER)
+            return None
+        window = self._checkpoint_window(chain, ckpt)
+        if window is None:
+            self.logger.warning(
+                'Reputation evidence does not cover checkpoint window '
+                '[%d, %d); restoring at tier %d', int(ckpt.first_index),
+                int(ckpt.first_index) + int(ckpt.count),
+                self.UNVERIFIED_RESTORE_TIER)
+            return None
+        recomputed = TransactionHistory._mth([tx.entry_hash() for tx in window])
+        expected = ckpt.root if ckpt.root else b''
+        if isinstance(expected, str):
+            expected = expected.encode('ascii')
+        if recomputed != expected:
+            self.logger.warning(
+                'Reputation evidence root mismatch (checkpoint commits to '
+                '%s, entries hash to %s); restoring at tier %d',
+                expected[:12].decode('ascii', 'replace'),
+                recomputed[:12].decode('ascii', 'replace'),
+                self.UNVERIFIED_RESTORE_TIER)
+            return None
+        # The quorum bar is sized against OUR OWN roster, exactly as on the
+        # live path, so whoever wrote the file cannot also set the bar it has
+        # to clear. A roster we have not yet loaded resolves no co-signers,
+        # which fails closed: the warm start is capped, not forged.
+        if not self._quorum_met(ckpt.designation, signed.sigs):
+            self.logger.warning(
+                'Reputation evidence checkpoint epoch=%s has %d verified '
+                'co-signature(s), short of quorum; restoring at tier %d',
+                str(ckpt.epoch),
+                len(self._verified_cosigners(ckpt.designation, signed.sigs)),
+                self.UNVERIFIED_RESTORE_TIER)
+            return None
+        return self._evidence_ceilings(window)
+
+    def _evidence_ceilings(self, window) -> dict:
+        """Per-peer upper bound on a restored score, derived from the attested
+        window and NOTHING else: ``{peer-uuid-str: ceiling}``.
+
+        Appearing in an attested window is not the same as having earned a
+        number. Verifying only presence leaves the original hole open -- a
+        score hand-raised in `reputation.cfg.json` would still be restored in
+        full, because the peer really does transact. So the evidence has to
+        bound the value, not merely vouch for the peer.
+
+        The bound is the mean of the counterparty-side scores the window
+        records for the peer, shrunk toward PREREP_NEUTRAL by a pseudo-count
+        (the ``_prereputation_prior`` idiom). Shrinkage is what makes a SHORT
+        attested history unable to justify a high restored score: two
+        transactions at 0.9 are two data points, not a track record, and
+        without the pseudo-count they would license the same standing as two
+        hundred.
+
+        Deliberately independent of ``self.reputations`` and of any running
+        EMA. Deriving the bound from state the persisted file feeds would be
+        circular -- the file would end up vouching for itself, which is the
+        one thing this must not do.
+        """
+        self_uuid = str(self.identity.uuid)
+        totals: dict = {}
+        counts: dict = {}
+        for tx in window:
+            if len(tx) < 2:
+                continue  # not bilateral: no counterparty agreed to it
+            # A peer's score in a tx is the COUNTERPARTY's side of it, as in
+            # _fold_tx_for_peer: p1's standing is what p2 scored it.
+            for peer, score in ((tx.p1_id, tx.p2_score),
+                                (tx.p2_id, tx.p1_score)):
+                key = str(peer)
+                if key == self_uuid or score is None:
+                    continue
+                totals[key] = totals.get(key, 0.0) + float(score)
+                counts[key] = counts.get(key, 0) + 1
+        ceilings = {}
+        k = self.RESTORE_SHRINKAGE_K
+        neutral = self.PREREP_NEUTRAL
+        for key, n in counts.items():
+            if n < self.RESTORE_EVIDENCE_MIN_TX:
+                continue
+            observed = totals[key] / n
+            ceilings[key] = min(1.0, max(0.0,
+                                         (n * observed + k * neutral) / (n + k)))
+        return ceilings
+
+    @staticmethod
+    def _checkpoint_window(chain, ckpt):
+        """The ``chain`` slice the checkpoint commits to, or None when the
+        chain cannot produce it.
+
+        A persisted chain may legitimately run PAST its checkpoint (commits
+        land after the checkpoint finalizes and the file is rewritten on the
+        co-signature upgrade), so the window is selected by absolute index
+        rather than taken as the whole chain. It may not fall SHORT: a
+        missing entry means the root cannot be reproduced, so demand exactly
+        ``count`` contiguous entries."""
+        first = int(ckpt.first_index)
+        count = int(ckpt.count)
+        if count < 0:
+            return None
+        window = [tx for tx in chain
+                  if tx.index is not None and first <= tx.index < first + count]
+        if len(window) != count:
+            return None
+        return window
+
+    def _grade_restored_reputations(self, ceilings):
+        """Clamp each restored score to what the evidence supports for that
+        peer: its ``_evidence_ceilings`` entry, or -- for a peer the evidence
+        does not cover at all -- the ``UNVERIFIED_RESTORE_TIER`` ceiling.
+
+        Self is never clamped (our own score is not a peer judgement).
+        Clamping is one-directional -- a score already at or below its ceiling
+        is untouched -- so this can only withhold standing, never confer it.
+        It composes with staleness decay: decay is the time-out-of-contact
+        axis, this is the "nothing here shows you earned that" axis.
+
+        There is no separate release step. The clamped value is where the peer
+        resumes climbing, so fresh in-session transactions re-earn the
+        elevated tier through the ordinary scoring path."""
+        unattested = self._tier_ceiling(self.UNVERIFIED_RESTORE_TIER)
+        self_uuid = str(self.identity.uuid)
+        clamped = []
+        for peer_uuid in list(self.reputations.current.keys()):
+            key = str(peer_uuid)
+            if key == self_uuid:
+                continue
+            ceiling = ceilings.get(key, unattested)
+            score = self.reputations.current.get(peer_uuid)
+            if score is None or score <= ceiling:
+                continue
+            self.reputations.current[peer_uuid] = ceiling
+            self._restore_clamped[key] = score
+            clamped.append((key, score, ceiling))
+        if clamped:
+            self.logger.info(
+                'Warm start: clamped %d peer score(s) to what the evidence '
+                'supports (%s)', len(clamped),
+                ', '.join('%s %.3f->%.3f' % (k[:8], s, c)
+                          for k, s, c in clamped[:8]))
 
     def handle_checkpoint_propose(self, queues, message):
         if message.function == ReputationProtocol.checkpoint_propose:
@@ -1451,10 +2034,17 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             proposed = ckpt.root
             if isinstance(proposed, str):
                 proposed = proposed.encode()
-            mine = self.history.window_root()
+            # Compare against the chain the proposal NAMES, not always our
+            # primary one: a gateway holds several, and comparing the wrong
+            # window would decline every honest child-group proposal (and, in
+            # the degenerate case where two chains share a root, accept one
+            # that says nothing about the chain it claims to cover).
+            chain_key = self._chain_key(getattr(ckpt, 'group_uuid', ''))
+            mine = self._chain_for_key(chain_key).window_root()
             if mine != proposed:
                 self.logger.debug(
-                    'checkpoint_propose: window_root mismatch, declining')
+                    'checkpoint_propose: window_root mismatch on chain %s, '
+                    'declining', chain_key[:8] or 'primary')
                 return True
             try:
                 sig = self._detached_sig(self.identity, ckpt.designation)
@@ -1463,8 +2053,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     'handle_checkpoint_propose: cannot sign; '
                     'declining to co-sign')
                 return True
-            proposer, epoch = ckpt.key()
-            ack = (proposer, epoch, str(self.identity.uuid), sig)
+            proposer, epoch, group = ckpt.key()
+            # The ack carries the chain too: the proposer needs it to find the
+            # right pending round, and it is inside the bytes we just signed.
+            # Length-tolerant on the far side, so a 4-tuple from an older peer
+            # still resolves to the primary chain.
+            ack = (proposer, epoch, str(self.identity.uuid), sig, group)
             try:
                 msg = Message(self.name, ReputationProtocol.checkpoint_sign,
                               to_json_string(ack), message.from_whom,
@@ -1483,8 +2077,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             payload = message.obj
             if isinstance(payload, str):
                 payload = from_json_string(payload)
-            proposer, epoch, claimed, sig = payload
-            key = (str(proposer), int(epoch))
+            # Length-tolerant: a 5th element names the chain (see the ack built
+            # in handle_checkpoint_propose); a 4-tuple is the primary chain.
+            proposer, epoch, claimed, sig = payload[0], payload[1], payload[2], payload[3]
+            group = str(payload[4]) if len(payload) > 4 and payload[4] else ''
+            key = (str(proposer), int(epoch), group)
             ckpt = self._checkpoint_pending.get(key)
             if ckpt is None:
                 return True  # not our round, or already finalized
@@ -1497,10 +2094,18 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     'verification; not counted', voter[:8])
                 return True
             self._checkpoint_sigs.setdefault(key, {})[voter] = sig
-            grp_uuid = str(self.group.uuid) if self.group is not None else None
+            # Quorum is sized by the group whose chain this is: a child-group
+            # checkpoint must clear that group's majority, not the conflated
+            # roster a gateway sees across every group it belongs to.
+            grp_uuid = group or (str(self.group.uuid)
+                                 if self.group is not None else None)
             if len(self._checkpoint_sigs[key]) > self._checkpoint_quorum(grp_uuid):
                 signed = SignedCheckpoint(
                     checkpoint=ckpt, sigs=dict(self._checkpoint_sigs[key]))
+                # Upgrade our own stored copy from the lone self-signature to
+                # the quorum map, so the evidence we persist is attested by the
+                # group rather than only by us.
+                self._store_checkpoint(ckpt, signed.sigs)
                 try:
                     msg = Message(
                         self.name, ReputationProtocol.checkpoint_final,
@@ -1510,8 +2115,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     queues[CfgIds.network].put(
                         msg, block=True, timeout=self.q_cadence)
                     self.logger.info(
-                        'Checkpoint finalized & broadcast: epoch=%d signers=%d',
-                        ckpt.epoch, len(self._checkpoint_sigs[key]))
+                        'Checkpoint finalized & broadcast: chain=%s epoch=%d '
+                        'signers=%d', group[:8] or 'primary', ckpt.epoch,
+                        len(self._checkpoint_sigs[key]))
                 except Full:
                     self.logger.error(
                         'handle_checkpoint_sign: queue full broadcasting final')
@@ -1541,14 +2147,18 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             # the accuser" -- which only holds if a quorum is checked here. A
             # checkpoint_final without verifiable co-signatures is refused.
             sigs = getattr(signed, 'sigs', None)
-            if not self._quorum_met(ckpt.designation, sigs):
+            # Sized against the group whose chain this covers, for the same
+            # reason the propose handler compares that chain's own root.
+            group = self._chain_key(getattr(ckpt, 'group_uuid', ''))
+            if not self._quorum_met(ckpt.designation, sigs, group or None):
                 self.logger.warning(
-                    'Rejecting checkpoint_final epoch=%s from %s: %d verified '
-                    'co-signature(s) do not meet quorum', str(ckpt.epoch),
+                    'Rejecting checkpoint_final chain=%s epoch=%s from %s: %d '
+                    'verified co-signature(s) do not meet quorum',
+                    group[:8] or 'primary', str(ckpt.epoch),
                     str(ckpt.proposer_uuid)[:8],
                     len(self._verified_cosigners(ckpt.designation, sigs)))
                 return True
-            self._store_checkpoint(ckpt)
+            self._store_checkpoint(ckpt, sigs)
             return True
         return False
 
@@ -1755,6 +2365,23 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             if score >= floor:
                 return tier
         return 0
+
+    @classmethod
+    def _tier_ceiling(cls, tier: int) -> float:
+        """The highest score that still maps to ``tier`` -- i.e. the next
+        tier's floor, stepped down by one representable double.
+
+        Derived from TIER_FLOORS rather than written as a literal so
+        retuning the ladder cannot leave a stale ceiling behind that quietly
+        grants the tier above. ``nextafter`` (not a hand-picked epsilon)
+        because the clamp has to satisfy ``_trust_tier(ceiling) == tier``
+        exactly: an epsilon too small rounds back onto the floor and grants
+        the very tier the clamp exists to withhold. The top tier has no
+        ceiling, so it returns 1.0."""
+        for floor, t in cls.TIER_FLOORS:
+            if t == tier + 1:
+                return math.nextafter(floor, 0.0)
+        return 1.0
 
     @classmethod
     def _is_excluded(cls, score) -> bool:
@@ -2716,6 +3343,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     for key in list(self._excluded):
                         self._publish_exclusion(queues, key, True)
                     self._exclusions_synced = True
+                # A gateway's child groups arrive over IPC after __init__, so
+                # their persisted evidence is restored here rather than at boot
+                # (idempotent per group; see _restore_child_evidence).
+                if self.child_groups:
+                    self._restore_child_evidence(queues)
                 drained = 0
                 # First iteration blocks briefly so we don't hot-spin
                 # when the queue is empty; subsequent iterations are
@@ -2764,6 +3396,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # reputation toward almost-neutral (warm-start memory
                 # fades). Throttled internally to SWEEP_INTERVAL.
                 self._decay_reputations(queues, present)
+                # Periodically commit to our own window so the persisted
+                # evidence carries a quorum-signed root (verifiable warm
+                # start). Throttled internally to CHECKPOINT_INTERVAL.
+                self._maybe_checkpoint(queues, present)
                 # Debug instrument: emit this node's own reputation view for
                 # a host-side log harvester (opt-in, throttled internally).
                 self._dump_reputation_trace(present)

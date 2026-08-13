@@ -43,6 +43,7 @@ size_t message_size(message_type_t type)
     case SIGNAL:
         return sizeof(signal_t);
     case GROUP:
+    case CHILD_GROUP:
         return sizeof(group_t);
     case PEER:
         return sizeof(public_identity_t);
@@ -93,6 +94,8 @@ char *message_type_to_string(message_type_t type)
         return (char*)"SIGNAL";
     case GROUP:
         return (char*)autonomous_trust__core__protobuf__identity__group__descriptor.c_name;
+    case CHILD_GROUP:
+        return (char*)"CHILD_GROUP";
     case PEER:
         return (char*)autonomous_trust__core__protobuf__identity__identity__descriptor.c_name;
     case PEER_CAPABILITIES:
@@ -318,7 +321,9 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         break;
     }
     case GROUP:
+    case CHILD_GROUP:
     {
+        /* Same payload as GROUP -- only the routing differs (see the enum). */
         if (group_to_proto(&msg->info.group, &subdata, &subdata_len) != 0)
             return -1;
         break;
@@ -623,6 +628,7 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
         ret = proto_to_signal(pb_msg->value.data, pb_msg->value.len, &msg->info.signal);
         break;
     case GROUP:
+    case CHILD_GROUP:
         ret = proto_to_group(pb_msg->value.data, pb_msg->value.len, &msg->info.group);
         break;
     case PEER:

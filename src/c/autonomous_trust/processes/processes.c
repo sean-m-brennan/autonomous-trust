@@ -314,6 +314,24 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
     case GROUP:
         proc->protocol.group = msg->info.group;
         return true;
+    case CHILD_GROUP: {
+        /* A cohort this node GATEWAYS, not its primary group — so it must
+         * never land in protocol.group. The reputation process keys a separate
+         * transaction chain off this map (gateway-reputation-tree.md). */
+        if (proc->protocol.child_groups == NULL
+            && map_create(&proc->protocol.child_groups) != 0)
+            return true;
+        group_t *copy = calloc(1, sizeof(group_t));
+        if (copy == NULL)
+            return true;
+        *copy = msg->info.group;
+        char cg_uuid[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(copy->uuid, cg_uuid);
+        data_t *gd = object_ptr_data(copy, sizeof(group_t));
+        if (gd == NULL || map_set(proc->protocol.child_groups, cg_uuid, gd) != 0)
+            free(copy);
+        return true;
+    }
     case PEER:
         peers_write_lock(proc);
         if (proc->protocol.num_peers < DEFAULT_MAX_PEERS)

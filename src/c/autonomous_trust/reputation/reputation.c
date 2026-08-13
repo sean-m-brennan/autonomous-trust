@@ -23,6 +23,7 @@
 
 #include "reputation/reputation.h"
 #include "structures/map.h"
+#include "utilities/at_jansson.h"
 #include "structures/data.h"
 #include "identity/identity.h"
 
@@ -314,6 +315,78 @@ int tx_history_init(tx_history_t *hist)
     err = map_init(&hist->peer_map);
     if (err != 0) return err;
     return map_init(&hist->evicted_set);
+}
+
+static void tx_history_evict_oldest(tx_history_t *hist);
+
+/* Append `slot` to peer_map[peer_uuid]'s index list, creating the list on
+ * first sight. Factored out of tx_history_update so the LOADERS
+ * (tx_history_era_from_json, _history_load_committed) can index a peer too.
+ *
+ * They previously did not, and that was a silent hole rather than a cosmetic
+ * one: every scoring function — reputation_pure, reputation_contrite_tft,
+ * reputation_consensus, reputation_consensus_by_tier — reaches its
+ * transactions through tx_history_by_peer, which reads ONLY peer_map. A chain
+ * arriving by catch-up (or restored from persisted evidence) therefore scored
+ * as if it were empty: present in the window, invisible to every algorithm
+ * that consumes it. */
+static int _index_peer_slot(tx_history_t *hist, const uuid_t peer_uuid, int slot)
+{
+    char peer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, peer_str);
+    data_t *peer_indices = NULL;
+    if (map_get(&hist->peer_map, (map_key_t)peer_str, &peer_indices) != 0)
+    {
+        array_t *arr = smrt_create(sizeof(array_t));
+        if (arr == NULL) return EXCEPTION(ENOMEM);
+        array_init(arr);
+        array_append(arr, integer_data(slot));
+        map_set(&hist->peer_map, (map_key_t)peer_str,
+                object_ptr_data(arr, sizeof(array_t)));
+        return 0;
+    }
+    void *arr_ptr = NULL;
+    data_object_ptr(peer_indices, &arr_ptr);
+    if (arr_ptr == NULL) return -1;
+    array_append((array_t *)arr_ptr, integer_data(slot));
+    return 0;
+}
+
+/* Load one already-committed entry verbatim — index, prev_hash and scores as
+ * they were persisted — and wire up the maps and counters around it.
+ *
+ * Verbatim is the whole point: tx_history_update would assign a fresh index
+ * and recompute prev_hash from the local head, which is exactly what a
+ * verifiable warm start must not do. The Merkle root only reproduces if the
+ * entries hash to what they hashed to when they were signed. Assumes the
+ * caller has already verified the segment's linkage. */
+static void _history_load_committed(tx_history_t *hist, const transaction_t *src)
+{
+    if (hist == NULL || src == NULL)
+        return;
+    if (hist->chain_len >= MAX_CHAIN_LEN)
+        tx_history_evict_oldest(hist);
+    int slot = hist->chain_len;
+    transaction_t *tx = &hist->chain[slot];
+    *tx = *src;
+
+    char task_key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(tx->task_uuid, task_key);
+    map_set(&hist->task_map, (map_key_t)task_key, integer_data(slot));
+    if (tx->p1_set)
+        _index_peer_slot(hist, tx->p1_uuid, slot);
+    if (tx->p2_set && uuid_compare(tx->p1_uuid, tx->p2_uuid) != 0)
+        _index_peer_slot(hist, tx->p2_uuid, slot);
+
+    if (hist->committed_count == 0 || tx->index < hist->first_index)
+        hist->first_index = tx->index;
+    hist->committed_count++;
+    hist->chain_len++;
+    if (tx->index + 1 > hist->next_index)
+        hist->next_index = tx->index + 1;
+    /* Resume the link from the loaded tail so subsequent local commits chain
+     * cleanly onto the restored history. */
+    transaction_entry_hash(tx, hist->head_hash);
 }
 
 /* Evict chain[0] FIFO-style: drop its task_map entry, scrub
@@ -652,26 +725,9 @@ int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
     }
 
     /* Update peer_map: add this index to the peer's list */
-    data_t *peer_indices = NULL;
-    if (map_get((map_t *)&hist->peer_map, peer_str, &peer_indices) != 0)
-    {
-        /* Create new array for this peer */
-        array_t *arr = smrt_create(sizeof(array_t));
-        if (arr == NULL) return EXCEPTION(ENOMEM);
-        array_init(arr);
-        data_t *new_idx = integer_data(idx);
-        array_append(arr, new_idx);
-        data_t *arr_dat = object_ptr_data(arr, sizeof(array_t));
-        map_set(&hist->peer_map, peer_str, arr_dat);
-    }
-    else
-    {
-        void *arr_ptr = NULL;
-        data_object_ptr(peer_indices, &arr_ptr);
-        array_t *arr = (array_t *)arr_ptr;
-        data_t *new_idx = integer_data(idx);
-        array_append(arr, new_idx);
-    }
+    int perr = _index_peer_slot(hist, peer_uuid, idx);
+    if (perr != 0)
+        return perr;
 
     return 0;
 }
@@ -942,6 +998,14 @@ int tx_history_era_from_json(tx_history_t *hist, const json_t *arr)
         uuid_unparse_lower(tx->task_uuid, task_key);
         data_t *idx_d = integer_data(hist->chain_len);
         map_set(&hist->task_map, task_key, idx_d);
+        /* ...including peer_map, which this loader used to skip. Every scoring
+         * function reaches its transactions through tx_history_by_peer, and
+         * that reads peer_map only — so a caught-up chain was resident but
+         * invisible to reputation_pure / _contrite_tft / _consensus. */
+        if (tx->p1_set)
+            _index_peer_slot(hist, tx->p1_uuid, hist->chain_len);
+        if (tx->p2_set && uuid_compare(tx->p1_uuid, tx->p2_uuid) != 0)
+            _index_peer_slot(hist, tx->p2_uuid, hist->chain_len);
 
         /* Loaded entries from era_to_json are always bilateral
          * (era_to_json filters unilateral out), but tolerate
@@ -979,6 +1043,374 @@ int tx_history_era_from_json(tx_history_t *hist, const json_t *arr)
         }
     }
     return 0;
+}
+
+/****************************
+ * Persisted reputation evidence (verifiable warm start, ISSUES §10.3)
+ ****************************/
+
+int rep_checkpoint_init(rep_checkpoint_t *ckpt)
+{
+    if (ckpt == NULL) return -1;
+    memset(ckpt, 0, sizeof(*ckpt));
+    return map_init(&ckpt->sigs);
+}
+
+void rep_checkpoint_free(rep_checkpoint_t *ckpt)
+{
+    if (ckpt == NULL) return;
+    map_free(&ckpt->sigs);
+    ckpt->present = false;
+}
+
+size_t rep_checkpoint_designation(const char *proposer, const char *root,
+                                  int64_t epoch, int64_t first_index,
+                                  int64_t count, const char *group_uuid,
+                                  uint8_t *out, size_t cap)
+{
+    if (proposer == NULL || root == NULL || out == NULL)
+        return 0;
+    static const char tag[] = "AT-CKPT";
+    size_t tag_len = sizeof(tag);   /* includes the NUL separator */
+    if (cap <= tag_len)
+        return 0;
+    bool have_group = (group_uuid != NULL && group_uuid[0] != '\0');
+    int n = snprintf((char *)out + tag_len, cap - tag_len,
+                     "%s|%s|%lld|%lld|%lld%s%s", proposer, root,
+                     (long long)epoch, (long long)first_index,
+                     (long long)count,
+                     have_group ? "|" : "",
+                     have_group ? group_uuid : "");
+    if (n < 0 || (size_t)n >= cap - tag_len)
+        return 0;
+    memcpy(out, tag, tag_len);
+    return tag_len + (size_t)n;
+}
+
+int reputation_evidence_to_json(const tx_history_t *hist,
+                                const rep_checkpoint_t *ckpt, json_t **out)
+{
+    if (hist == NULL || out == NULL) return -1;
+
+    json_t *chain = json_array();
+    if (chain == NULL) return EXCEPTION(ENOMEM);
+
+    for (int i = 0; i < hist->chain_len; i++)
+    {
+        const transaction_t *tx = &hist->chain[i];
+        /* An un-indexed entry is not yet evidence of anything: the index is
+         * what a committed bilateral entry has. Mirrors the Python writer's
+         * `if tx.index is None: continue`. */
+        if (tx->index < 0 || !tx->p1_set || !tx->p2_set)
+            continue;
+        char task_str[UUID_STRING_LEN + 1];
+        char p1_str[UUID_STRING_LEN + 1];
+        char p2_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(tx->task_uuid, task_str);
+        uuid_unparse_lower(tx->p1_uuid, p1_str);
+        uuid_unparse_lower(tx->p2_uuid, p2_str);
+        json_t *obj = json_pack("{s:s, s:s, s:f, s:s, s:f, s:i, s:s}",
+            "task_id", task_str,
+            "p1_id", p1_str, "p1_score", tx->p1_score,
+            "p2_id", p2_str, "p2_score", tx->p2_score,
+            "index", tx->index,
+            "prev_hash", tx->prev_hash);
+        if (obj == NULL)
+        {
+            json_decref(chain);
+            return -1;
+        }
+        json_array_append_new(chain, obj);
+    }
+
+    json_t *ck_json = json_null();
+    if (ckpt != NULL && ckpt->present)
+    {
+        json_t *sigs = json_object();
+        if (sigs == NULL)
+        {
+            json_decref(chain);
+            json_decref(ck_json);
+            return EXCEPTION(ENOMEM);
+        }
+        map_key_t key = NULL;
+        data_t *val = NULL;
+        map_entries_for_each((map_t *)&ckpt->sigs, key, val)
+        {
+            string_t sig = NULL;
+            if (data_string_ptr(val, &sig) == 0 && sig != NULL)
+                json_object_set_new(sigs, key, json_string(sig));
+        }
+        map_end_for_each
+        json_decref(ck_json);
+        ck_json = json_pack("{s:s, s:s, s:I, s:i, s:i, s:s, s:o}",
+            "proposer_uuid", ckpt->proposer_uuid,
+            "root", ckpt->root,
+            "epoch", (json_int_t)ckpt->epoch,
+            "first_index", ckpt->first_index,
+            "count", ckpt->count,
+            /* Which chain the checkpoint covers ("" == primary). Part of the
+             * signed designation when non-empty, so it has to travel with the
+             * signatures or a restart could not re-derive the bytes they were
+             * made over. Additive to schema 1: a reader predating child chains
+             * ignores it, and this reader defaults it to "". */
+            "group_uuid", ckpt->group_uuid,
+            "sigs", sigs);
+        if (ck_json == NULL)
+        {
+            json_decref(chain);
+            json_decref(sigs);
+            return -1;
+        }
+    }
+
+    json_t *doc = json_pack("{s:s, s:o, s:o}",
+                            "schema", REP_EVIDENCE_SCHEMA,
+                            "chain", chain,
+                            "checkpoint", ck_json);
+    if (doc == NULL)
+    {
+        json_decref(chain);
+        json_decref(ck_json);
+        return -1;
+    }
+    *out = doc;
+    return 0;
+}
+
+int reputation_evidence_from_json(const json_t *doc, tx_history_t *hist_out,
+                                  rep_checkpoint_t *ckpt_out)
+{
+    if (doc == NULL || !json_is_object(doc) || hist_out == NULL)
+        return -1;
+    const char *schema = json_string_value(json_object_get((json_t *)doc, "schema"));
+    if (schema == NULL || strcmp(schema, REP_EVIDENCE_SCHEMA) != 0)
+        return -1;   /* pinned: refuse rather than misparse */
+    json_t *chain = json_object_get((json_t *)doc, "chain");
+    if (!json_is_array(chain))
+        return -1;
+
+    /* Stage the entries before touching hist_out: the linkage check below
+     * must be able to reject the whole document, and a half-loaded history
+     * would be worse than none. */
+    int n = (int)json_array_size(chain);
+    if (n > MAX_CHAIN_LEN)
+        n = MAX_CHAIN_LEN;   /* the tail is what the checkpoint covers */
+    transaction_t *staged = calloc(n > 0 ? (size_t)n : 1, sizeof(transaction_t));
+    if (staged == NULL)
+        return EXCEPTION(ENOMEM);
+    int staged_n = 0;
+    size_t idx;
+    json_t *obj;
+    json_array_foreach(chain, idx, obj)
+    {
+        if (staged_n >= n)
+            break;
+        if (!json_is_object(obj))
+        {
+            free(staged);
+            return -1;
+        }
+        json_t *index_j = json_object_get(obj, "index");
+        if (!json_is_integer(index_j))
+        {
+            free(staged);
+            return -1;   /* no index == not a committed entry */
+        }
+        const char *task_str = json_string_value(json_object_get(obj, "task_id"));
+        const char *p1_str = json_string_value(json_object_get(obj, "p1_id"));
+        const char *p2_str = json_string_value(json_object_get(obj, "p2_id"));
+        if (task_str == NULL || p1_str == NULL || p2_str == NULL)
+        {
+            free(staged);
+            return -1;   /* an entry no counterparty agreed to is not evidence */
+        }
+        transaction_t *tx = &staged[staged_n];
+        memset(tx, 0, sizeof(*tx));
+        if (uuid_parse(task_str, tx->task_uuid) != 0
+            || uuid_parse(p1_str, tx->p1_uuid) != 0
+            || uuid_parse(p2_str, tx->p2_uuid) != 0)
+        {
+            free(staged);
+            return -1;
+        }
+        tx->p1_score = json_number_value(json_object_get(obj, "p1_score"));
+        tx->p2_score = json_number_value(json_object_get(obj, "p2_score"));
+        /* The set flags are not on the wire: Python's document omits them, and
+         * an entry naming both counterparties with an index IS bilateral by
+         * construction. Deriving them beats trusting a field that could
+         * disagree with the ids beside it. */
+        tx->p1_set = true;
+        tx->p2_set = true;
+        tx->index = (int)json_integer_value(index_j);
+        const char *ph = json_string_value(json_object_get(obj, "prev_hash"));
+        tx->prev_hash[0] = '\0';
+        if (ph != NULL)
+        {
+            strncpy(tx->prev_hash, ph, TX_HASH_HEX_LEN);
+            tx->prev_hash[TX_HASH_HEX_LEN] = '\0';
+        }
+        staged_n++;
+    }
+
+    /* Hash-linkage before anything is adopted. A broken link means the file
+     * was altered or truncated; the caller degrades to clamped restoration. */
+    if (!tx_verify_chain_links(staged, staged_n))
+    {
+        free(staged);
+        return -1;
+    }
+
+    for (int i = 0; i < staged_n; i++)
+        _history_load_committed(hist_out, &staged[i]);
+    free(staged);
+
+    if (ckpt_out != NULL)
+    {
+        json_t *ck = json_object_get((json_t *)doc, "checkpoint");
+        if (json_is_object(ck))
+        {
+            AT_JSON_STRING(ck, "proposer_uuid", ckpt_out->proposer_uuid);
+            AT_JSON_STRING(ck, "root", ckpt_out->root);
+            AT_JSON_STRING(ck, "group_uuid", ckpt_out->group_uuid);
+            ckpt_out->epoch = (int64_t)json_integer_value(json_object_get(ck, "epoch"));
+            ckpt_out->first_index = (int)json_integer_value(json_object_get(ck, "first_index"));
+            ckpt_out->count = (int)json_integer_value(json_object_get(ck, "count"));
+            json_t *sigs = json_object_get(ck, "sigs");
+            if (json_is_object(sigs))
+            {
+                const char *voter;
+                json_t *sig;
+                json_object_foreach(sigs, voter, sig)
+                {
+                    const char *hex = json_string_value(sig);
+                    if (hex == NULL)
+                        continue;
+                    map_set(&ckpt_out->sigs, (map_key_t)voter,
+                            string_data((string_t)hex, strlen(hex)));
+                }
+            }
+            ckpt_out->present = (ckpt_out->proposer_uuid[0] != '\0');
+        }
+    }
+    return 0;
+}
+
+int reputation_checkpoint_window_root(const tx_history_t *hist,
+                                      const rep_checkpoint_t *ckpt,
+                                      char out[TX_HASH_HEX_LEN + 1])
+{
+    if (hist == NULL || ckpt == NULL || out == NULL || ckpt->count < 0)
+        return -1;
+    char leaves[MAX_CHAIN_LEN][TX_HASH_HEX_LEN + 1];
+    int n = 0;
+    int lo = ckpt->first_index;
+    int hi = ckpt->first_index + ckpt->count;
+    for (int i = 0; i < hist->chain_len && n < MAX_CHAIN_LEN; i++)
+    {
+        const transaction_t *tx = &hist->chain[i];
+        if (tx->index < lo || tx->index >= hi)
+            continue;
+        transaction_entry_hash(tx, leaves[n]);
+        n++;
+    }
+    /* Exactly `count` entries or nothing: a short window cannot reproduce the
+     * root, and crediting a partial one would attest entries nobody signed. */
+    if (n != ckpt->count)
+        return -1;
+    mth_range(leaves, 0, n, out);
+    return 0;
+}
+
+int reputation_evidence_ceilings(const tx_history_t *hist,
+                                 const rep_checkpoint_t *ckpt,
+                                 const char *self_uuid_str, map_t *out)
+{
+    if (hist == NULL || ckpt == NULL || out == NULL)
+        return -1;
+    map_t sums, counts;
+    if (map_init(&sums) != 0) return EXCEPTION(ENOMEM);
+    if (map_init(&counts) != 0)
+    {
+        map_free(&sums);
+        return EXCEPTION(ENOMEM);
+    }
+    int lo = ckpt->first_index;
+    int hi = ckpt->first_index + ckpt->count;
+    for (int i = 0; i < hist->chain_len; i++)
+    {
+        const transaction_t *tx = &hist->chain[i];
+        if (tx->index < lo || tx->index >= hi)
+            continue;
+        if (!tx->p1_set || !tx->p2_set)
+            continue;
+        /* A peer's score in a tx is the COUNTERPARTY's side of it — the same
+         * direction reputation_consensus folds. */
+        const uuid_t *who[2] = { &tx->p1_uuid, &tx->p2_uuid };
+        double score[2] = { tx->p2_score, tx->p1_score };
+        for (int s = 0; s < 2; s++)
+        {
+            char key[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(*who[s], key);
+            if (self_uuid_str != NULL && strcmp(key, self_uuid_str) == 0)
+                continue;
+            double prev_sum = 0.0;
+            int prev_count = 0;
+            data_t *d = NULL;
+            if (map_get(&sums, (map_key_t)key, &d) == 0 && d != NULL)
+                data_floating_pt_dbl(d, &prev_sum);
+            if (map_get(&counts, (map_key_t)key, &d) == 0 && d != NULL)
+                data_integer(d, &prev_count);
+            map_set(&sums, (map_key_t)key,
+                    floating_pt_dbl_data(prev_sum + score[s]));
+            map_set(&counts, (map_key_t)key, integer_data(prev_count + 1));
+        }
+    }
+
+    double k = REP_RESTORE_SHRINKAGE_K;
+    double neutral = PREREP_NEUTRAL;
+    map_key_t key = NULL;
+    data_t *val = NULL;
+    map_entries_for_each(&counts, key, val)
+    {
+        int count = 0;
+        if (data_integer(val, &count) != 0 || count < REP_RESTORE_EVIDENCE_MIN_TX)
+            continue;
+        double sum = 0.0;
+        data_t *sd = NULL;
+        if (map_get(&sums, key, &sd) != 0 || sd == NULL
+            || data_floating_pt_dbl(sd, &sum) != 0)
+            continue;
+        double observed = sum / (double)count;
+        double ceiling = ((double)count * observed + k * neutral)
+                         / ((double)count + k);
+        if (ceiling < 0.0) ceiling = 0.0;
+        if (ceiling > 1.0) ceiling = 1.0;
+        map_set(out, key, floating_pt_dbl_data(ceiling));
+    }
+    map_end_for_each
+
+    map_free(&sums);
+    map_free(&counts);
+    return 0;
+}
+
+/****************************
+ * Staleness decay
+ ****************************/
+
+double reputation_decayed_score(double score, double idle_seconds)
+{
+    double asymptote = REP_DECAY_ASYMPTOTE;
+    /* ASYMMETRIC: absence never rehabilitates a distrusted node. */
+    if (score <= asymptote)
+        return score;
+    if (idle_seconds <= REP_DECAY_ONSET)
+        return score;
+    double elapsed = idle_seconds - REP_DECAY_ONSET;
+    double factor = pow(0.5, elapsed / REP_DECAY_HALF_LIFE);
+    double decayed = asymptote + (score - asymptote) * factor;
+    return decayed < asymptote ? asymptote : decayed;
 }
 
 /****************************

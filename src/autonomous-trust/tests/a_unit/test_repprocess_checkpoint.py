@@ -162,7 +162,10 @@ class TestCheckpointFlow:
         assert sign.function == ReputationProtocol.checkpoint_sign
         # The ack carries a real detached signature over the designation, not
         # a bare uuid: the proposer counts signatures now.
-        _tgt, _epoch, voter, sig = from_json_string(sign.obj)
+        # The ack gained a trailing chain key (ISSUES §10.2): '' is the
+        # primary chain, a group-uuid names one of a gateway's child chains.
+        _tgt, _epoch, voter, sig, chain = from_json_string(sign.obj)
+        assert chain == ''
         assert voter == str(member.identity.uuid)
         assert member._verify_cosignature(ck.designation, voter, sig)
 
