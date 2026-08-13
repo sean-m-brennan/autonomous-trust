@@ -38,6 +38,10 @@ from uuid import UUID, uuid5
 
 from autonomous_trust.core.capabilities import PeerCapabilities
 from autonomous_trust.core.config import Configuration, to_json_string
+from autonomous_trust.core.reputation.reputation import (
+    RESOLVE_TTL_DEFAULT, resolve_query_to_dict, resolved_to_dict)
+from autonomous_trust.core._python.identity.identity import (
+    public_identity_to_canonical)
 from autonomous_trust.core.identity import Group, Identity, Peers
 from autonomous_trust.core.identity.encrypt import Encryptor
 from autonomous_trust.core.identity.sign import Signature
@@ -183,6 +187,50 @@ class _Participant:
                         raise AssertionError(
                             f'{self.id}: evidence_doc.{field}='
                             f'{actual[field]!r}, expected {want!r}'
+                        )
+            elif key == 'resolved_reputation':
+                # The verdict on a deep-resolution answer, and the score this
+                # node computed FROM the attested window rather than the one
+                # the answer claimed. Both runtimes must reach the same
+                # verdict on the same evidence, or the same peer is trusted on
+                # one implementation and refused on the other.
+                if not isinstance(expected, dict):
+                    raise AssertionError(
+                        f'{self.id}: resolved_reputation must be a mapping, '
+                        f'got {type(expected).__name__}'
+                    )
+                peer_pid = expected.get('peer')
+                other = participants.get(peer_pid)
+                if other is None:
+                    raise AssertionError(
+                        f'{self.id}.resolved_reputation: unknown participant '
+                        f'{peer_pid!r}'
+                    )
+                entry = self.process.resolved_reps.get(
+                    str(other.identity.uuid))
+                if entry is None:
+                    raise AssertionError(
+                        f'{self.id}.resolved_reputation[{peer_pid}]: no answer '
+                        f'recorded'
+                    )
+                score, verified, reason = entry
+                if 'verified' in expected and verified != bool(expected['verified']):
+                    raise AssertionError(
+                        f'{self.id}.resolved_reputation.verified={verified!r}, '
+                        f'expected {expected["verified"]!r} (reason: {reason})'
+                    )
+                if 'score' in expected:
+                    want = expected['score']
+                    if want is None:
+                        if score is not None:
+                            raise AssertionError(
+                                f'{self.id}.resolved_reputation.score='
+                                f'{score!r}, expected none'
+                            )
+                    elif score is None or abs(score - float(want)) > 1e-3:
+                        raise AssertionError(
+                            f'{self.id}.resolved_reputation.score={score!r}, '
+                            f'expected {want!r}'
                         )
             elif key == 'evidence_ceiling_of':
                 # { "<other_pid>": float } — the score ceiling the resident
@@ -615,6 +663,62 @@ class ReputationAdapter:
                                                       designation)
         return sigs
 
+    def _resolved_answer(self, participants: dict[str, ParticipantHandle],
+                         from_id: str, to_id: str,
+                         payload: dict[str, Any]) -> dict:
+        """The answer document a deep-resolution reply carries, built from the
+        SENDER's real window and checkpoint -- real evidence at scenario time,
+        the same way ``_cosignatures`` builds real signatures rather than
+        placeholder bytes.
+
+        The receiver only accepts an answer to a query it is waiting for, so
+        the query is registered on it here. That is harness setup standing in
+        for the resolve this scenario does not send: registering it is what
+        makes the step test VERIFICATION rather than the relay bookkeeping,
+        which has its own coverage.
+
+        ``omit_last`` drops the final entry, which is the negative control the
+        whole payload shape exists for: the answer stays internally consistent
+        and every entry in it is genuine, but the window no longer reproduces
+        the root a quorum signed.
+        """
+        holder = participants[from_id].impl.process
+        holder_id = participants[from_id].impl.identity
+        target = participants[payload['peer']].impl.identity.uuid
+        qid = str(payload.get('query_id', 'q1'))
+        window = holder.history._indexed_window()
+        if not window:
+            raise AssertionError(
+                f'{from_id} has no committed window to answer with')
+        # The checkpoint is built over the holder's ACTUAL window and signed
+        # here by real keys, rather than taken from the `checkpoint` fixture:
+        # that fixture installs a root and no co-signatures, and an answer
+        # carrying an unsigned root would be refused for a reason the scenario
+        # is not trying to test. Same principle as _cosignatures -- real
+        # cryptography at scenario time.
+        ckpt = Checkpoint(proposer_uuid=holder_id.uuid,
+                          root=holder.history.window_root(),
+                          epoch=int(payload.get('epoch', 1)),
+                          first_index=window[0].index, count=len(window))
+        cosigners = payload.get('cosigners') or [from_id]
+        sigs = {}
+        for pid in cosigners:
+            if pid not in participants:
+                raise AssertionError(f'cosigner {pid!r} not a known participant')
+            ident = participants[pid].impl.identity
+            sigs[str(ident.uuid)] = self._detached_sig(ident, ckpt.designation)
+        signed = SignedCheckpoint(checkpoint=ckpt, sigs=sigs)
+        signers = [public_identity_to_canonical(participants[pid].impl.identity)
+                   for pid in cosigners]
+        doc = resolved_to_dict(qid, target, window, signed, signers=signers,
+                               score=payload.get('score'))
+        if payload.get('omit_last') and doc['chain']:
+            doc['chain'] = doc['chain'][:-1]
+        receiver = participants[to_id].impl.process
+        receiver._resolve_outstanding[qid] = (
+            str(target), float('inf'))
+        return doc
+
     def _build_inbound(self, participants: dict[str, ParticipantHandle], *,
                        from_id: str, to_id: str, function: str,
                        payload: dict[str, Any]) -> Message:
@@ -632,7 +736,17 @@ class ReputationAdapter:
             raise AssertionError(f'proposer {proposer_id!r} not a known participant')
         proposer_uuid = participants[proposer_id].impl.identity.uuid
 
-        if function == ReputationProtocol.request:
+        if function == ReputationProtocol.rep_resolve:
+            # A query names a peer and nothing else -- deliberately no
+            # originator, which is the opacity property (ISSUES §10.2).
+            target = participants[payload['peer']].impl.identity.uuid
+            obj = to_json_string(resolve_query_to_dict(
+                str(payload.get('query_id', 'q1')), target,
+                ttl=int(payload.get('ttl', RESOLVE_TTL_DEFAULT))))
+        elif function == ReputationProtocol.rep_resolved:
+            obj = to_json_string(self._resolved_answer(participants,
+                                                       from_id, to_id, payload))
+        elif function == ReputationProtocol.request:
             tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)
             obj = to_json_string(tup)
         elif function == ReputationProtocol.grant:

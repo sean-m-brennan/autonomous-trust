@@ -147,11 +147,43 @@ group-channel drain to: find the group in `{self.group} ∪ self.child_groups.va
 - **Coordinator** `_query_reputations` (`examples/dod_mission/coordinator.py`): **no change
   required**, querying the gateways now returns the whole field roster.
 
+### Deep resolution replaces grandchild aggregation (2026-08-13)
+
+The "recursive forward and aggregate with timeout" sketched below for depth > 2 was **not
+built, and deliberately not**. Aggregation costs the size of the TREE on every query to
+answer a question about one PEER, and interactions deep in a hierarchy are rare. Instead a
+targeted query (`rep_resolve`) is relayed toward whoever holds the peer's chain and the
+answer (`rep_resolved`) returns along the reverse path carrying the quorum-signed window
+that backs it — O(depth) messages, per interaction.
+
+Two properties carry it, and both were decisions rather than defaults:
+
+- **Opaque both directions.** The query names no originator; the answer retraces the query's
+  path. Each relay's only state is a TTL'd `query_id -> neighbour` entry. Nothing blocks
+  awaiting a child, so the non-blocking model above is preserved.
+- **The answer proves itself, whole.** It carries the full committed window and the verifier
+  recomputes the root. Inclusion proofs were rejected for this: they show what is present
+  and say nothing about what was withheld, and a gateway flattering its own subtree omits
+  rather than invents. The accepted cost is that the requestor sees every transaction in
+  that window, not only the queried peer's.
+
+The score a requestor records is the one IT computes from the attested window; the holder's
+value is a cross-check, because per-capability transaction weights live in a node-local
+cache that no hashed entry covers. Signers ride along in the canonical public identity form
+(a requestor two boundaries away holds no identity from the answering group) and must chain
+to an anchor we accept. What cannot be checked from outside the boundary — whether those
+signers are a majority of that group — is reported as a count rather than assumed.
+
+See `ISSUES.md` §10.2, `tests/a_unit/test_deep_resolution.py`, `src/c/test/rep_resolve_test.c`,
+and the corpus scenarios `deep-resolution-evidence` /
+`deep-resolution-withheld-entry-refused`.
+
 ### Phase 3: not built (see `ISSUES.md` §10.2)
 - C-twin parity for the new `group_uuid` payload field + conformance corpus.
 - Persistence of `child_groups` / child chains across gateway restart (today only primary persists).
 - Partition-recovery reconciliation (see R2).
-- Grandchild recursive aggregation (depth > 2).
+- ~~Grandchild recursive aggregation (depth > 2).~~ Superseded by deep resolution above
+  (2026-08-13): aggregation was rejected as unscalable, and the need is met per-interaction.
 
 ## Critical files
 - `src/autonomous-trust/autonomous_trust/core/_python/identity/idprocess.py`: data model, rank

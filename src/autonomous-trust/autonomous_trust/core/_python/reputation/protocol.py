@@ -104,3 +104,32 @@ class ReputationProtocol(Protocol):
     checkpoint_propose = 'checkpoint propose'
     checkpoint_sign = 'checkpoint sign'
     checkpoint_final = 'checkpoint final'
+    # Deep resolution (ISSUES.md §10.2): one peer, on demand, at any depth.
+    #
+    # The gateway tree scores a peer against the chain its transactions
+    # actually landed in, and a node holds chains only for the groups it is a
+    # member of. A peer two or more levels down is therefore unscoreable
+    # locally, and enumerating the whole subtree to fix that costs the size of
+    # the TREE on every query while the need is one PEER. So: `rep_resolve`
+    # asks for a single peer and is relayed hop by hop toward whoever holds
+    # its chain; `rep_resolved` carries the answer back along the reverse
+    # path. Cost is O(depth) messages for a case assumed rare, and no node
+    # outside a boundary ever exchanges a message with a node inside it.
+    #
+    # Both directions are relayed rather than answered directly so the
+    # topology stays opaque: a requestor learns a score, never the shape of
+    # the subtree that produced it, and a deep holder never learns who asked.
+    # The relay costs each gateway a TTL'd pending table (query id -> the
+    # neighbour to answer), which is the only state this adds anywhere. No
+    # handler ever blocks awaiting a child — the query and the answer are
+    # independent messages, preserving the non-blocking model that the
+    # 2026-07-23 requestor-side-BFS decision established for the identity
+    # roster.
+    #
+    # The answer is EVIDENCE-BACKED (user's call, 2026-08-13): it carries the
+    # quorum-signed checkpoint and the peer's committed entries with their
+    # RFC 6962 inclusion proofs, so the requestor verifies the score itself
+    # and neither the holder nor any relay on the path can fabricate a number.
+    # See reputation.py ResolvedReputation.
+    rep_resolve = 'resolve reputation'
+    rep_resolved = 'resolved reputation'

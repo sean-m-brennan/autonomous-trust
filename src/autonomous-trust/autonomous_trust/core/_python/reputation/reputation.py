@@ -751,6 +751,220 @@ def evidence_from_dict(doc):
     return chain, signed
 
 
+# --- Deep resolution: one peer, on demand, at any depth (ISSUES.md §10.2) ---
+#
+# A node scores a peer against the chain that peer's transactions landed in,
+# and holds chains only for groups it belongs to. Two levels down that chain
+# belongs to somebody else, so the query is relayed to whoever holds it and the
+# ANSWER CARRIES ITS OWN PROOF -- it crosses nodes the requestor has no reason
+# to trust, so a bare number would be an unfalsifiable claim.
+#
+# The proof is the whole quorum-signed window, not the queried peer's entries
+# with inclusion proofs. An audit path proves an entry IS in the window; it
+# proves nothing about what was left out, so a holder could answer with a
+# peer's three good transactions, omit the two bad ones, and pass verification.
+# Shipping the window closes that: the verifier recomputes the root from the
+# entries themselves, and an omitted entry changes the root, which then fails
+# against the signature a quorum made over it. (User's call, 2026-08-13: the
+# cost is that the requestor sees every transaction in that window, not only
+# the queried peer's.)
+
+#: Hops a resolve may travel before it is dropped. The tree is the real bound;
+#: this is the backstop that keeps a routing loop or a lying `children` claim
+#: from circulating a query forever. 4 covers any hierarchy contemplated so far
+#: (ISSUES.md §10.2) with room to spare.
+RESOLVE_TTL_DEFAULT = 4
+#: Refuse a query that arrives claiming more hops than we would ever originate:
+#: TTL is attacker-controlled, and an inflated one is an amplification lever.
+RESOLVE_TTL_MAX = 8
+
+
+def resolve_query_to_dict(query_id: str, peer_uuid, ttl: int = RESOLVE_TTL_DEFAULT,
+                          requesting_process: str = '') -> dict:
+    """A deep-resolution query. Deliberately says nothing about who is asking:
+    the relay answers to the neighbour it heard from, so the originator's
+    identity never travels and a deep holder cannot learn who wanted to know."""
+    return {
+        'query_id': str(query_id),
+        'peer_uuid': str(peer_uuid),
+        'ttl': int(ttl),
+        'requesting_process': str(requesting_process or ''),
+    }
+
+
+def resolve_query_from_dict(doc) -> dict:
+    """Parse and BOUND a query. Raises ValueError on anything malformed or on
+    a TTL above ``RESOLVE_TTL_MAX`` -- clamping silently would let a hostile
+    requestor set the fan-out budget for everyone below it."""
+    if not isinstance(doc, dict):
+        raise ValueError('resolve query is not an object')
+    qid = str(doc.get('query_id') or '')
+    peer = str(doc.get('peer_uuid') or '')
+    if not qid or not peer:
+        raise ValueError('resolve query missing query_id or peer_uuid')
+    ttl = int(doc.get('ttl', 0))
+    if ttl < 0 or ttl > RESOLVE_TTL_MAX:
+        raise ValueError('resolve query ttl %d out of range' % ttl)
+    return {'query_id': qid, 'peer_uuid': peer, 'ttl': ttl,
+            'requesting_process': str(doc.get('requesting_process') or '')}
+
+
+def resolved_to_dict(query_id: str, peer_uuid, chain, signed_checkpoint,
+                     signers=None, score=None) -> dict:
+    """An answer: the queried peer, the holder's own score for it, and the
+    quorum-signed window that backs it.
+
+    ``signers`` is a list of co-signer identities in the DRY canonical public
+    form (``public_identity_to_canonical``, which C emits byte-identically).
+    They are here because the requestor is two boundaries away and holds NO
+    identity from the answering group, so without them it could not check a
+    single signature. That form -- rather than bare keys -- because it also
+    carries each signer's ZTA credential, which is what lets the verifier tie
+    a signer to an anchor it accepts. The identities are not trusted for being
+    present: an answer that ships its own freshly-minted quorum is exactly
+    what the anchor check in ``verify_resolved`` refuses.
+
+    ``score`` is the holder's own value, carried as a cross-check and NOT as
+    the answer: the EMA is weighted by per-capability transaction weights that
+    live in a node-local cache and are not part of any hashed entry, so a
+    remote verifier cannot re-derive them. The attested window is the real
+    payload; the requestor computes its own score from it."""
+    doc = evidence_to_dict(chain, signed_checkpoint)
+    doc['query_id'] = str(query_id)
+    doc['peer_uuid'] = str(peer_uuid)
+    doc['score'] = None if score is None else float(score)
+    doc['signers'] = [dict(s) for s in (signers or []) if isinstance(s, dict)]
+    return doc
+
+
+def resolved_from_dict(doc):
+    """Parse an answer into ``(query_id, peer_uuid, score, chain,
+    signed_checkpoint, signers)``. Raises ValueError on anything malformed;
+    the caller treats that as no answer rather than a bad one."""
+    if not isinstance(doc, dict):
+        raise ValueError('resolved answer is not an object')
+    chain, signed = evidence_from_dict(doc)
+    qid = str(doc.get('query_id') or '')
+    peer = str(doc.get('peer_uuid') or '')
+    if not qid or not peer:
+        raise ValueError('resolved answer missing query_id or peer_uuid')
+    raw_score = doc.get('score')
+    signers = doc.get('signers') or []
+    if not isinstance(signers, list):
+        raise ValueError('resolved answer signers is not a list')
+    return (qid, peer, None if raw_score is None else float(raw_score),
+            chain, signed, [s for s in signers if isinstance(s, dict)])
+
+
+def window_root_of(chain) -> bytes:
+    """The RFC 6962 root over an ordered list of committed ``Transaction`` --
+    the same value ``TransactionHistory.window_root`` produces for a resident
+    window, computed from a bare list so a verifier that never held the chain
+    can reproduce it."""
+    entries = [tx for tx in chain if tx.index is not None]
+    return TransactionHistory._mth([tx.entry_hash() for tx in entries])
+
+
+def consensus_score_from_window(peer_uuid, chain, half_life: int,
+                                weights=None):
+    """The deterministic consensus EMA for ``peer_uuid`` over an ordered
+    window. Returns None when the window holds no bilateral entry for the peer
+    (the caller decides what a no-evidence answer means -- there is no local
+    baseline to fall back to when the chain is somebody else's).
+
+    Extracted so ONE implementation serves both the holder computing its own
+    score and a verifier recomputing it from attested evidence; the C twin
+    mirrors this function rather than the method around it. Keep the fold
+    identical to ``ReputationProcess._consensus_reputation``.
+
+    ``weights`` (task-id-str -> int) reproduces the per-capability transaction
+    weight. A verifier across a trust boundary has no way to know them and
+    passes None, i.e. weight 1 for everything: its number is then the
+    unweighted consensus over the same attested entries, which is why the
+    holder's own score travels alongside as a cross-check rather than as
+    something to be asserted equal."""
+    alpha = 1.0 - 0.5 ** (1.0 / float(half_life))
+    ema = None
+    ordered = sorted(chain, key=lambda t: (t.index if t.index is not None else 0))
+    for tx in ordered:
+        if tx.p1_id is None or tx.p2_id is None:
+            continue
+        if str(tx.p1_id) == str(peer_uuid):
+            cp_score = tx.p2_score
+        elif str(tx.p2_id) == str(peer_uuid):
+            cp_score = tx.p1_score
+        else:
+            continue
+        if cp_score is None:
+            continue
+        w = (weights or {}).get(str(tx.task_id), 1)
+        for _ in range(max(1, int(w))):
+            if ema is None:
+                ema = float(cp_score)
+            else:
+                ema = alpha * float(cp_score) + (1.0 - alpha) * ema
+    return ema
+
+
+def verify_resolved(chain, signed_checkpoint, signers, verify_signature,
+                    trust_signer=None, min_signers: int = 1):
+    """Check an answer's evidence. Returns ``(ok, reason)`` -- a reason string
+    even on success, because an operator reading "unverified" needs to know
+    WHICH check failed and a caller may accept a weaker answer knowingly (see
+    feedback_operator_diagnostics).
+
+    Three gates, in order of what they buy:
+
+    1. **The window reproduces the signed root.** This is the load-bearing
+       one: it makes both fabrication and OMISSION detectable, since any edit
+       to the entry list moves the root away from the bytes a quorum signed.
+    2. **The co-signatures verify** over the checkpoint's designation, via the
+       caller's ``verify_signature(designation, uuid, sig, signer)`` where
+       ``signer`` is that voter's canonical identity dict (or None if the
+       answer did not carry one).
+    3. **Each signer is trusted**, via the caller's ``trust_signer(uuid,
+       signer)`` -- in practice "this signer's credential chains to an anchor
+       we accept". Without it, gate 2 proves only that somebody holding some
+       key signed, and an answer can carry its own invented quorum.
+
+    NOT checked here, and it cannot be from this side: whether the verified
+    signers are a MAJORITY of the group whose chain this is. Quorum sizing
+    needs that group's membership, and an opaque subtree is precisely what
+    does not disclose it. The count is returned in the reason so the caller
+    can apply its own bar."""
+    ckpt = getattr(signed_checkpoint, 'checkpoint', None)
+    if ckpt is None:
+        return False, 'no checkpoint: the window is unattested'
+    root = ckpt.root
+    if isinstance(root, str):
+        root = root.encode('ascii')
+    if not root:
+        return False, 'checkpoint carries no root'
+    recomputed = window_root_of(chain)
+    if recomputed != root:
+        return False, ('window does not reproduce the signed root '
+                       '(entries added, altered or withheld)')
+    sigs = getattr(signed_checkpoint, 'sigs', None) or {}
+    designation = ckpt.designation
+    by_uuid = {str(s.get('uuid')): s for s in (signers or [])
+               if isinstance(s, dict) and s.get('uuid')}
+    verified = set()
+    for voter, sig in sigs.items():
+        voter = str(voter)
+        signer = by_uuid.get(voter)
+        if not verify_signature(designation, voter, sig, signer):
+            continue
+        if trust_signer is not None and not trust_signer(voter, signer):
+            continue
+        verified.add(voter)
+    if len(verified) < max(1, int(min_signers)):
+        return False, ('%d signer(s) verified and trusted, needed %d'
+                       % (len(verified), max(1, int(min_signers))))
+    return True, ('root reproduced; %d signer(s) verified and trusted '
+                  '(quorum size not checkable across a boundary)'
+                  % len(verified))
+
+
 class Reputation(Configuration):
     def __init__(self, peer_id: UUID, score: float):
         self.peer_id = peer_id

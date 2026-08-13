@@ -41,7 +41,17 @@ int identity_from_json(const json_t *obj, void *data_struct);
 /** Serialize a published-form identity (no private key material) to a
  *  fresh JSON object. Caller takes ownership of @p *obj_ptr. Used by
  *  id_proc.c when building the peer-bundle inside the ID_HISTORY wire
- *  payload (matches Python `p.publish()` in idprocess.py:507). */
+ *  payload (matches Python `p.publish()` in idprocess.py:507), and by
+ *  rep_proc.c to carry co-signer identities inside a deep-resolution answer
+ *  (ISSUES.md 10.2) -- a requestor two boundaries away holds no identity from
+ *  the answering group, so the answer must bring the keys its signatures are
+ *  checked against. This is the DRY canonical form shared with Python's
+ *  public_identity_to_canonical; rebuilding it anywhere else would be a second
+ *  copy of a wire shape that must not drift.
+ *
+ *  Stays in the PRIVATE header: the public identity.h does not include
+ *  jansson, and pulling it in there to widen this declaration would put a
+ *  json dependency on every consumer of the public API. */
 int public_identity_to_json(const public_identity_t *p, json_t **obj_ptr);
 
 /** Inverse of @ref public_identity_to_json. Writes into the
