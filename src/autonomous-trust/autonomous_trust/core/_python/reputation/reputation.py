@@ -551,7 +551,7 @@ class Checkpoint(Configuration):
 
     def __init__(self, proposer_uuid: UUID, root: bytes, epoch: int = 0,
                  first_index: int = 0, count: int = 0, nonce: bytes = None,
-                 signature=None):
+                 signature=None, group_uuid: str = ''):
         self.proposer_uuid = proposer_uuid
         self.root = root
         self.epoch = epoch
@@ -559,26 +559,49 @@ class Checkpoint(Configuration):
         self.count = count
         self.nonce = nonce
         self.signature = signature
+        # Which chain this checkpoint commits to: '' (the default) is the
+        # node's PRIMARY chain, and a group-uuid string is one of a gateway's
+        # child-group chains. A gateway keeps one TransactionHistory per child
+        # group, and without this a receiver could not tell which of its
+        # chains to compare the proposed root against. Follows the same
+        # optional-trailing-group_uuid shape the `committed` broadcast already
+        # uses. See doc/architecture/gateway-reputation-tree.md and
+        # ISSUES.md §10.2.
+        self.group_uuid = str(group_uuid) if group_uuid else ''
 
     @property
     def designation(self) -> bytes:
         """Canonical, domain-separated bytes the proposer signs and every
         co-signer / verifier re-derives. Excludes ``signature`` (self-ref) and
-        ``nonce`` (anti-replay only, carried alongside)."""
+        ``nonce`` (anti-replay only, carried alongside).
+
+        ``group_uuid`` is appended ONLY when non-empty, which does two things
+        at once. A primary-chain designation stays byte-identical to what it
+        was before child chains existed, so every co-signature, pinned
+        scenario and C twin keeps verifying. And a child-chain designation can
+        never collide with a primary one, so a co-signature harvested from a
+        child-group round cannot be replayed as agreement about the primary
+        chain — which it otherwise could, since two chains can perfectly well
+        produce the same root, epoch and bounds."""
         root = self.root if self.root else b''
         if isinstance(root, str):
             root = root.encode()
-        return (b'AT-CKPT\x00'
-                + str(self.proposer_uuid).encode()
-                + b'|' + root
-                + b'|' + str(int(self.epoch)).encode()
-                + b'|' + str(int(self.first_index)).encode()
-                + b'|' + str(int(self.count)).encode())
+        desig = (b'AT-CKPT\x00'
+                 + str(self.proposer_uuid).encode()
+                 + b'|' + root
+                 + b'|' + str(int(self.epoch)).encode()
+                 + b'|' + str(int(self.first_index)).encode()
+                 + b'|' + str(int(self.count)).encode())
+        if self.group_uuid:
+            desig += b'|' + self.group_uuid.encode()
+        return desig
 
     def key(self):
-        """Dedup / sig-accumulation key: proposer + epoch. Each proposer
-        numbers its own checkpoints monotonically."""
-        return (str(self.proposer_uuid), int(self.epoch))
+        """Dedup / sig-accumulation key: proposer + epoch + chain. Each
+        proposer numbers its checkpoints monotonically PER CHAIN, so the chain
+        has to be part of the key or a gateway's primary and child rounds
+        would collide at the same epoch number."""
+        return (str(self.proposer_uuid), int(self.epoch), self.group_uuid)
 
 
 class SignedCheckpoint(Configuration):
@@ -591,6 +614,141 @@ class SignedCheckpoint(Configuration):
     def __init__(self, checkpoint: 'Checkpoint' = None, sigs: dict = None):
         self.checkpoint = checkpoint
         self.sigs = sigs if sigs is not None else {}
+
+
+# --- Persisted evidence (reputation-history.cfg.json) ----------------------
+#
+# `reputation.cfg.json` holds the CONCLUSION -- {peer: score} -- and nothing
+# that shows how it was reached, so warm start had no way to tell an earned 0.9
+# from one typed into the file. This is the evidence beside it: the resident
+# hash-linked window plus the quorum-signed checkpoint over it. See
+# doc/architecture/reputation.md (Verifiable warm start) and ISSUES.md §10.3.
+#
+# Deliberately PLAIN JSON rather than a `Configuration` dump: one file is read
+# by both runtimes, and Configuration's encoder emits `__type__` keys naming
+# Python classes that mean nothing to the C reader. Same reasoning as the trust
+# ladder (§10.1). Field names follow the checkpoint wire payload so a reader of
+# either is reading the same vocabulary.
+#
+# Schema is pinned so a future shape change is a refusal to rebuild (which
+# degrades to capped restoration) rather than a misparse.
+EVIDENCE_SCHEMA = '1'
+EVIDENCE_FILE = 'reputation-history'
+
+
+def _hex_str(value) -> str:
+    """Digests are carried as 64-char lowercase hex. Python holds them as
+    hex-ASCII *bytes* (MerkleTree.get_hash), so accept either."""
+    if value is None:
+        return ''
+    if isinstance(value, bytes):
+        return value.decode('ascii')
+    return str(value)
+
+
+def evidence_to_dict(chain, signed_checkpoint=None) -> dict:
+    """The persisted-evidence document for ``chain`` (an iterable of committed
+    ``Transaction``) and the finalized ``SignedCheckpoint`` covering it.
+
+    Only entries with an assigned ``index`` are written: an index is what a
+    committed, bilateral entry has, and an un-indexed one is not evidence of
+    anything yet.
+    """
+    entries = []
+    for tx in chain:
+        if tx.index is None:
+            continue
+        entries.append({
+            'task_id': str(tx.task_id),
+            'p1_id': None if tx.p1_id is None else str(tx.p1_id),
+            'p1_score': None if tx.p1_score is None else float(tx.p1_score),
+            'p2_id': None if tx.p2_id is None else str(tx.p2_id),
+            'p2_score': None if tx.p2_score is None else float(tx.p2_score),
+            'index': int(tx.index),
+            'prev_hash': _hex_str(tx.prev_hash),
+        })
+    doc = {
+        'schema': EVIDENCE_SCHEMA,
+        'chain': entries,
+        'checkpoint': None,
+    }
+    ckpt = getattr(signed_checkpoint, 'checkpoint', None)
+    if ckpt is not None:
+        doc['checkpoint'] = {
+            'proposer_uuid': str(ckpt.proposer_uuid),
+            'root': _hex_str(ckpt.root),
+            'epoch': int(ckpt.epoch),
+            'first_index': int(ckpt.first_index),
+            'count': int(ckpt.count),
+            # Which chain the checkpoint covers ('' == primary). Part of the
+            # signed designation when non-empty, so it has to travel with the
+            # signatures or a restart could not re-derive the bytes they were
+            # made over. Additive to schema 1: a reader that predates child
+            # chains ignores it, and this reader defaults it to ''.
+            'group_uuid': str(getattr(ckpt, 'group_uuid', '') or ''),
+            'sigs': {str(k): _hex_str(v)
+                     for k, v in (signed_checkpoint.sigs or {}).items()},
+        }
+    return doc
+
+
+def evidence_from_dict(doc):
+    """Parse a persisted-evidence document into
+    ``(chain, signed_checkpoint)``.
+
+    Raises ValueError on anything malformed -- a wrong schema, a non-list
+    chain, an entry missing its index. The caller treats that as "no usable
+    evidence", which is a *safe* outcome (restoration falls back to capped),
+    so being strict here costs nothing and misreading would cost a lot.
+    """
+    if not isinstance(doc, dict):
+        raise ValueError('evidence document is not an object')
+    schema = doc.get('schema')
+    if schema != EVIDENCE_SCHEMA:
+        raise ValueError('unsupported evidence schema %r (expected %r)'
+                         % (schema, EVIDENCE_SCHEMA))
+    raw_chain = doc.get('chain')
+    if not isinstance(raw_chain, list):
+        raise ValueError('evidence chain is not a list')
+    chain = []
+    for entry in raw_chain:
+        if not isinstance(entry, dict):
+            raise ValueError('evidence chain entry is not an object')
+        if entry.get('index') is None:
+            raise ValueError('evidence chain entry has no index')
+
+        def _uuid(key):
+            raw = entry.get(key)
+            return None if raw is None else UUID(str(raw))
+
+        def _score(key):
+            raw = entry.get(key)
+            return None if raw is None else float(raw)
+
+        prev = entry.get('prev_hash') or ''
+        chain.append(Transaction(
+            task_id=UUID(str(entry['task_id'])),
+            p1_id=_uuid('p1_id'), p1_score=_score('p1_score'),
+            p2_id=_uuid('p2_id'), p2_score=_score('p2_score'),
+            index=int(entry['index']),
+            prev_hash=prev.encode('ascii') if prev else b''))
+    signed = None
+    raw_ck = doc.get('checkpoint')
+    if isinstance(raw_ck, dict):
+        root = raw_ck.get('root') or ''
+        ckpt = Checkpoint(
+            proposer_uuid=UUID(str(raw_ck['proposer_uuid'])),
+            root=root.encode('ascii') if root else b'',
+            epoch=int(raw_ck.get('epoch', 0)),
+            first_index=int(raw_ck.get('first_index', 0)),
+            count=int(raw_ck.get('count', 0)),
+            group_uuid=str(raw_ck.get('group_uuid', '') or ''))
+        sigs = raw_ck.get('sigs') or {}
+        if not isinstance(sigs, dict):
+            raise ValueError('evidence checkpoint sigs is not an object')
+        signed = SignedCheckpoint(checkpoint=ckpt,
+                                  sigs={str(k): str(v) for k, v in sigs.items()})
+    return chain, signed
 
 
 class Reputation(Configuration):

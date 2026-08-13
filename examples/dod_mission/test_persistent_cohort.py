@@ -34,6 +34,7 @@ module stays at the a_unit-equivalent level so it runs fast.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -179,6 +180,7 @@ def test_seed_cohort_writes_expected_files(tmp_path, scenario_factory):
         d = tmp_path / peer / "etc" / "at"
         for fn in ("identity.cfg.json", "group.cfg.json",
                    "peers.cfg.json", "reputation.cfg.json",
+                   "reputation-history.cfg.json",
                    "peer-capabilities.cfg.json"):
             assert (d / fn).exists(), f"{peer} missing {fn}"
 
@@ -299,3 +301,136 @@ def test_seed_cohort_skips_mq800_and_sensors(tmp_path, scenario_factory):
     for s in sensors:
         assert not any(s.glob("etc/at/*.cfg.json")), \
             f"{s.name} should not be pre-seeded"
+
+
+# ------------------------------------------------- seeded reputation evidence
+#
+# A seeded score with no evidence beside it restores clamped (ISSUES.md §10.3),
+# which would gate the demo's tier-2 capabilities at t=0. These tests hold the
+# seeder to the standard the runtime applies rather than to its own output
+# format: the assertion that matters is that ReputationProcess ACCEPTS what was
+# written, not that a file exists.
+
+
+def _seeded_evidence(peer_dir: Path):
+    from autonomous_trust.core._python.config import Configuration
+    from autonomous_trust.core._python.reputation.reputation import (
+        EVIDENCE_FILE, evidence_from_dict,
+    )
+    path = peer_dir / "etc" / "at" / (EVIDENCE_FILE + Configuration.file_ext)
+    with path.open() as f:
+        return evidence_from_dict(json.load(f))
+
+
+def test_seed_cohort_writes_verifiable_evidence(tmp_path, scenario_factory):
+    """Every seeded peer gets a hash-linked window whose Merkle root the
+    checkpoint over it actually commits to."""
+    from tools.seed_dod_cohort import seed_cohort
+    from autonomous_trust.core._python.reputation.reputation import (
+        TransactionHistory,
+    )
+
+    sc = scenario_factory(squad_size=3, swarm_size=2, sensor_count=2,
+                          hacked_sensors=1, include_command=False)
+    seeded = seed_cohort(tmp_path, sc, force=True)
+    proposers = set()
+    for peer in seeded:
+        chain, signed = _seeded_evidence(tmp_path / peer)
+        assert TransactionHistory.verify_chain_links(chain)
+        assert TransactionHistory(_chain=chain).window_root() == signed.checkpoint.root
+        assert signed.checkpoint.count == len(chain)
+        # Each peer proposes its own checkpoint over the shared window, so the
+        # signed designation differs per file even though the root does not.
+        proposers.add(str(signed.checkpoint.proposer_uuid))
+        assert signed.sigs
+    assert len(proposers) == len(seeded)
+
+
+def test_seed_cohort_evidence_signatures_verify(tmp_path, scenario_factory):
+    """The co-signatures are real signatures by the cohort's own keys, and
+    there are more of them than a reader's quorum requires -- which is the
+    only reason the seeded scores survive restoration."""
+    from tools.seed_dod_cohort import seed_cohort
+    from nacl.encoding import HexEncoder
+
+    sc = scenario_factory(squad_size=3, swarm_size=2, sensor_count=2,
+                          hacked_sensors=1, include_command=False)
+    seeded = seed_cohort(tmp_path, sc, force=True)
+    peer = sorted(seeded)[0]
+    chain, signed = _seeded_evidence(tmp_path / peer)
+    peers_file = tmp_path / peer / "etc" / "at" / "peers.cfg.json"
+    with peers_file.open() as f:
+        roster = json.load(f, object_hook=config_json_decoder)
+    known = {str(p.uuid): p for p in roster.all}
+    verified = 0
+    for voter, sig in signed.sigs.items():
+        ident = known.get(str(voter))
+        if ident is None:
+            continue  # the viewer itself; its own key is not in its roster
+        ident.signature.public.verify(signed.checkpoint.designation,
+                                      HexEncoder.decode(sig.encode('ascii')))
+        verified += 1
+    assert verified > len(roster.all) // 2, "short of a reader's quorum"
+
+
+def test_seed_cohort_evidence_supports_the_seeded_tier(tmp_path,
+                                                      scenario_factory):
+    """The point of the whole exercise: a real ReputationProcess booting on
+    the seeded state restores the cohort at SEED_TIER instead of clamping it.
+
+    Asserted through the runtime, because the seeded window only clears the
+    tier if it is LONG enough -- restoration bounds a score by its shrunk mean
+    attested score -- and that coupling is exactly what a format-only test
+    would miss."""
+    import queue
+    from unittest.mock import MagicMock
+    from autonomous_trust.core.processes import ProcessTracker
+    from autonomous_trust.core.system import CfgIds
+    from autonomous_trust.core._python.config import Configuration
+    from autonomous_trust.core._python.reputation.repprocess import (
+        ReputationProcess,
+    )
+    from tools.seed_dod_cohort import seed_cohort
+    from examples.dod_mission.reputation_warmstart import SEED_TIER
+
+    sc = scenario_factory(squad_size=3, swarm_size=2, sensor_count=2,
+                          hacked_sensors=1, include_command=False)
+    seeded = seed_cohort(tmp_path, sc, force=True)
+    peer = sorted(seeded)[0]
+    root = tmp_path / peer
+
+    def load(name):
+        with (root / "etc" / "at" / name).open() as f:
+            return json.load(f, object_hook=config_json_decoder)
+
+    procs = []
+    for nm in (CfgIds.network, CfgIds.identity, CfgIds.negotiation,
+               CfgIds.reputation):
+        p = MagicMock()
+        p.name = nm
+        procs.append(p)
+    configs = {
+        'processes': procs,
+        CfgIds.identity: load("identity.cfg.json"),
+        CfgIds.peers: load("peers.cfg.json"),
+        CfgIds.group: load("group.cfg.json")[0],
+        CfgIds.reputation: load("reputation.cfg.json"),
+    }
+    prior = os.environ.get(Configuration.ROOT_VARIABLE_NAME)
+    os.environ[Configuration.ROOT_VARIABLE_NAME] = str(root)
+    try:
+        rp = ReputationProcess(configs, ProcessTracker(), queue.Queue(),
+                               suppress_log=True)
+    finally:
+        if prior is None:
+            del os.environ[Configuration.ROOT_VARIABLE_NAME]
+        else:
+            os.environ[Configuration.ROOT_VARIABLE_NAME] = prior
+    # The evidence verified, so the attested history came up with it.
+    assert rp._checkpoint is not None  # noqa: SLF001
+    assert len(rp.history) == rp._checkpoint.count  # noqa: SLF001
+    # ...and every seeded peer holds its seeded tier.
+    assert rp.reputations.current
+    for uuid, score in rp.reputations.current.items():
+        assert rp._trust_tier(score) >= SEED_TIER, \
+            f"{str(uuid)[:8]} restored at {score:.4f}, below tier {SEED_TIER}"

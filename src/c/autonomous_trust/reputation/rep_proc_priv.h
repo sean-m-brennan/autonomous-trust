@@ -109,6 +109,26 @@ void reputation_get_window_root(char *out);
  *  ReputationProcess._checkpoint.root. */
 void reputation_get_checkpoint_root(char *out);
 
+/** Build the persisted-evidence document this node would write right now (the
+ *  resident window plus the finalized checkpoint over it), for the
+ *  `evidence_doc` expected_state assertion. Caller owns *out (json_decref).
+ *
+ *  The document is SHARED with the Python runtime, so pinning it in the corpus
+ *  pins the one artifact both warm starts read. Mirrors Python
+ *  evidence_to_dict(self.history, SignedCheckpoint(...)). */
+int reputation_get_evidence_doc(json_t **out);
+
+/** Write the evidence-derived score ceiling for @p peer_uuid over the resident
+ *  committed window into @p out, for the `evidence_ceiling_of` assertion.
+ *  Returns non-zero when the window bounds nothing for that peer.
+ *
+ *  Worth pinning cross-language on its own: this is the arithmetic that decides
+ *  how much standing a restored peer may hold, so a drift between runtimes
+ *  would silently hand the same peer different tiers on the two
+ *  implementations. Mirrors Python _evidence_ceilings. */
+int reputation_get_evidence_ceiling(const uuid_t self_uuid,
+                                   const uuid_t peer_uuid, double *out);
+
 /** Pre-seed a finalized checkpoint (root hex + epoch) for the `checkpoint`
  *  fixture, so an evidence-bearing slash can be verified against it within a
  *  single conformance step. Mirrors setting Python's
