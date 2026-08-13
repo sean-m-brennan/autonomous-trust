@@ -42,6 +42,7 @@
 #include "identity/identity.h"
 #include "reputation/reputation.h"
 #include "reputation/rep_proc_priv.h"
+#include "config/configuration.h"     /* config_t (proc->configs["identity"]) */
 #include "processes/processes.h"
 #include "structures/array.h"
 #include "structures/map.h"
@@ -190,6 +191,23 @@ static rp_impl_t *_build_participant_impl(const char *id, size_t idx)
     if (map_create(&impl->proc->protocol.handlers) != 0) goto fail;
     impl->proc->protocol.phase = 1;
     if (reputation_register_handlers(impl->proc) != 0) goto fail;
+
+    /* Wire the participant's own identity into proc->configs under the
+     * "identity" key — where _resolve_self_identity looks for the private
+     * signing key. Without it a participant cannot co-sign a slash or
+     * checkpoint round at all (it declines, by design, rather than emitting an
+     * unsigned ack). Same wiring the identity adapter already does. */
+    {
+        config_t *id_cfg = calloc(1, sizeof(config_t));
+        if (id_cfg == NULL) goto fail;
+        id_cfg->name = "identity";
+        id_cfg->data_struct = impl->full;
+        data_t *id_dat = object_ptr_data((ptr_t)id_cfg, sizeof(config_t));
+        if (id_dat == NULL) { free(id_cfg); goto fail; }
+        if (map_create(&impl->proc->configs) != 0) { free(id_cfg); goto fail; }
+        if (map_set(impl->proc->configs, (map_key_t)"identity", id_dat) != 0)
+            goto fail;
+    }
     return impl;
 fail:
     if (impl != NULL)
@@ -479,6 +497,121 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
 /* Inbound construction                                                       */
 /* ------------------------------------------------------------------------- */
 
+/* --- Quorum co-signatures, signed at scenario time -----------------------
+ * The slash / checkpoint finalizers carry real Ed25519 co-signatures over the
+ * round's designation, and every receiver verifies them before acting. The
+ * adapters therefore MINT the signatures here with each named co-signer's own
+ * key rather than replaying pinned blobs, which is what holds both runtimes to
+ * the same pre-image and scheme instead of to one side's recorded output (the
+ * §1.5 precedent). Designation bytes must match Python
+ * SlashAttestation.designation / Checkpoint.designation exactly. */
+#define RP_DESIG_MAX 512
+#define RP_SIG_HEX_LEN (crypto_sign_BYTES * 2)
+
+static size_t _rp_slash_designation(const char *slasher, const char *target,
+                                    const char *reason, double floor,
+                                    int64_t epoch, uint8_t *out, size_t cap)
+{
+    static const char tag[] = "AT-SLASH";
+    size_t tag_len = sizeof(tag);   /* includes the NUL separator */
+    int n = snprintf((char *)out + tag_len, cap - tag_len,
+                     "%s|%s|%s|%.6f|%lld", slasher, target, reason, floor,
+                     (long long)epoch);
+    if (n < 0 || (size_t)n >= cap - tag_len)
+        return 0;
+    memcpy(out, tag, tag_len);
+    return tag_len + (size_t)n;
+}
+
+static size_t _rp_checkpoint_designation(const char *proposer, const char *root,
+                                         int64_t epoch, int64_t first_index,
+                                         int64_t count, uint8_t *out,
+                                         size_t cap)
+{
+    static const char tag[] = "AT-CKPT";
+    size_t tag_len = sizeof(tag);
+    int n = snprintf((char *)out + tag_len, cap - tag_len,
+                     "%s|%s|%lld|%lld|%lld", proposer, root, (long long)epoch,
+                     (long long)first_index, (long long)count);
+    if (n < 0 || (size_t)n >= cap - tag_len)
+        return 0;
+    memcpy(out, tag, tag_len);
+    return tag_len + (size_t)n;
+}
+
+/* Sign `desig` with a participant's own key; hex out. */
+static int _rp_sign_hex(const rp_impl_t *impl, const uint8_t *desig,
+                        size_t dlen, char *hex_out)
+{
+    if (impl == NULL || impl->full == NULL || dlen == 0)
+        return -1;
+    unsigned char sig[crypto_sign_BYTES];
+    if (crypto_sign_detached(sig, NULL, desig, dlen,
+                             impl->full->signature.private) != 0)
+        return -1;
+    hexlify(sig, crypto_sign_BYTES, (unsigned char *)hex_out);
+    return 0;
+}
+
+/* Build the `sigs` map a *_final step carries: {voter_uuid: sig_hex}.
+ *
+ * `cosigners` names the co-signers (participant ids); the default is every
+ * participant except `exclude` (the slash target — a peer does not co-sign its
+ * own slash), the ordinary quorum-agreed case. Negative controls override it: a
+ * shorter list is sub-quorum, and `forged_by` makes ONE participant sign every
+ * entry while the entries stay labelled with the others' uuids. Mirrors the
+ * Python adapter's _cosignatures. */
+static json_t *_rp_cosignatures(sce_run_ctx_t *ctx, json_t *payload,
+                                const uint8_t *desig, size_t dlen,
+                                const char *exclude)
+{
+    json_t *sigs = json_object();
+    if (sigs == NULL || dlen == 0)
+        return sigs;
+    json_t *named = (payload && json_is_object(payload))
+        ? json_object_get(payload, "cosigners") : NULL;
+    const char *forger = NULL;
+    if (payload && json_is_object(payload))
+    {
+        json_t *f = json_object_get(payload, "forged_by");
+        if (json_is_string(f)) forger = json_string_value(f);
+    }
+    const rp_impl_t *signer = NULL;
+    if (forger != NULL)
+    {
+        sce_participant_t *p = sce_find_participant(ctx, forger);
+        if (p != NULL) signer = (const rp_impl_t *)p->impl;
+    }
+    size_t n_ids = (named && json_is_array(named)) ? json_array_size(named)
+                                                   : ctx->participant_count;
+    for (size_t i = 0; i < n_ids; i++)
+    {
+        sce_participant_t *p = NULL;
+        if (named && json_is_array(named))
+        {
+            const char *pid = json_string_value(json_array_get(named, i));
+            if (pid == NULL) continue;
+            p = sce_find_participant(ctx, pid);
+        }
+        else
+        {
+            p = &ctx->participants[i];
+            if (exclude != NULL && strcmp(p->id, exclude) == 0)
+                continue;
+        }
+        if (p == NULL) continue;
+        const rp_impl_t *impl = (const rp_impl_t *)p->impl;
+        if (impl == NULL || impl->pub == NULL) continue;
+        char voter[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(impl->pub->uuid, voter);
+        char sig_hex[RP_SIG_HEX_LEN + 1] = {0};
+        if (_rp_sign_hex(signer ? signer : impl, desig, dlen, sig_hex) != 0)
+            continue;
+        json_object_set_new(sigs, voter, json_string(sig_hex));
+    }
+    return sigs;
+}
+
 static int _build_inbound(sce_run_ctx_t *ctx,
                           const char *from_id,
                           const char *to_id,
@@ -706,14 +839,42 @@ static int _build_inbound(sce_run_ctx_t *ctx,
             if (t_impl && t_impl->pub)
                 uuid_unparse_lower(t_impl->pub->uuid, target_uuid);
         }
+        /* The designation covers the reason as well as the floor, so every
+         * step in a slash round has to name it, and both adapters have to
+         * default it identically (Python's adapter uses REASON_PEER_EXCLUDE). */
+        const char *reason = REP_SLASH_REASON_PEER_EXCLUDE;
+        if (payload && json_is_object(payload))
+        {
+            json_t *r = json_object_get(payload, "reason");
+            if (json_is_string(r)) reason = json_string_value(r);
+        }
+        uint8_t desig[RP_DESIG_MAX];
+        size_t dlen = _rp_slash_designation(proposer_str, target_uuid, reason,
+                                            floor, epoch, desig, sizeof(desig));
         body = json_object();
         json_object_set_new(body, "target_uuid", json_string(target_uuid));
         json_object_set_new(body, "floor_score", json_real(floor));
         json_object_set_new(body, "epoch", json_integer(epoch));
+        json_object_set_new(body, "reason", json_string(reason));
+        json_object_set_new(body, "slasher_uuid", json_string(proposer_str));
         if (strcmp(function, REP_PROTO_SLASH_SIGN) == 0)
-            json_object_set_new(body, "signer_uuid", json_string(proposer_str));
-        if (strcmp(function, REP_PROTO_SLASH_PROPOSE) == 0)
-            json_object_set_new(body, "slasher_uuid", json_string(proposer_str));
+        {
+            /* An ack names its SENDER and carries that sender's own signature:
+             * the receiver credits the authenticated sender, not the claim. */
+            char signer[UUID_STRING_LEN + 1] = {0};
+            if (sender_impl && sender_impl->pub)
+                uuid_unparse_lower(sender_impl->pub->uuid, signer);
+            char sig_hex[RP_SIG_HEX_LEN + 1] = {0};
+            _rp_sign_hex(sender_impl, desig, dlen, sig_hex);
+            json_object_set_new(body, "signer_uuid", json_string(signer));
+            json_object_set_new(body, "signature", json_string(sig_hex));
+        }
+        else if (strcmp(function, REP_PROTO_SLASH_FINAL) == 0)
+        {
+            json_t *sigs = _rp_cosignatures(ctx, payload, desig, dlen,
+                                            target_pid);
+            json_object_set_new(body, "sigs", sigs);
+        }
         /* Phase 3: pass through optional Merkle evidence verbatim
          * ({task_id, leaf, proof, root}); the handler verifies it against the
          * finalized checkpoint root. */
@@ -734,20 +895,47 @@ static int _build_inbound(sce_run_ctx_t *ctx,
          * handlers read proposer_uuid/root/epoch. */
         const char *root = "";
         int64_t epoch = 1;
+        int64_t first_index = 0;
+        int64_t count_covered = 0;
         if (payload && json_is_object(payload))
         {
             json_t *r = json_object_get(payload, "root");
             if (json_is_string(r)) root = json_string_value(r);
             json_t *e = json_object_get(payload, "epoch");
             if (json_is_integer(e)) epoch = json_integer_value(e);
+            json_t *fi = json_object_get(payload, "first_index");
+            if (json_is_integer(fi)) first_index = json_integer_value(fi);
+            json_t *c = json_object_get(payload, "count");
+            if (json_is_integer(c)) count_covered = json_integer_value(c);
         }
+        uint8_t desig[RP_DESIG_MAX];
+        size_t dlen = _rp_checkpoint_designation(proposer_str, root, epoch,
+                                                first_index, count_covered,
+                                                desig, sizeof(desig));
         body = json_object();
         json_object_set_new(body, "proposer_uuid", json_string(proposer_str));
         json_object_set_new(body, "epoch", json_integer(epoch));
+        /* The window bounds ride every step: the designation covers them, so a
+         * sign / final step that omitted them would sign or verify different
+         * bytes than the propose. */
+        json_object_set_new(body, "first_index", json_integer(first_index));
+        json_object_set_new(body, "count", json_integer(count_covered));
+        json_object_set_new(body, "root", json_string(root));
         if (strcmp(function, REP_PROTO_CHECKPOINT_SIGN) == 0)
-            json_object_set_new(body, "signer_uuid", json_string(proposer_str));
-        else
-            json_object_set_new(body, "root", json_string(root));
+        {
+            char signer[UUID_STRING_LEN + 1] = {0};
+            if (sender_impl && sender_impl->pub)
+                uuid_unparse_lower(sender_impl->pub->uuid, signer);
+            char sig_hex[RP_SIG_HEX_LEN + 1] = {0};
+            _rp_sign_hex(sender_impl, desig, dlen, sig_hex);
+            json_object_set_new(body, "signer_uuid", json_string(signer));
+            json_object_set_new(body, "signature", json_string(sig_hex));
+        }
+        else if (strcmp(function, REP_PROTO_CHECKPOINT_FINAL) == 0)
+        {
+            json_t *sigs = _rp_cosignatures(ctx, payload, desig, dlen, NULL);
+            json_object_set_new(body, "sigs", sigs);
+        }
     }
     else
     {

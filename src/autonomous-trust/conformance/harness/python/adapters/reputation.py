@@ -509,6 +509,44 @@ class ReputationAdapter:
     # Inbound construction
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _detached_sig(identity, designation: bytes) -> str:
+        """One participant's detached signature over ``designation``, in the
+        ASCII-hex form both runtimes' handlers verify."""
+        return identity.sign(designation).signature.decode('ascii')
+
+    def _cosignatures(self, participants: dict[str, ParticipantHandle],
+                      payload: dict[str, Any], designation: bytes,
+                      exclude: str = None) -> dict:
+        """Build the ``sigs`` map a ``*_final`` step carries.
+
+        A finalizer is only applied if the RECEIVER can verify more than
+        ``floor(N/2)`` distinct co-signatures over these exact bytes, so the
+        map is real cryptography built at scenario time by each named
+        co-signer's own key.
+
+        ``cosigners`` names them (participant ids); the default is every
+        participant except ``exclude`` (the slash target -- a peer does not
+        co-sign its own slash), which is the ordinary quorum-agreed case.
+        Negative controls override it: a shorter list is sub-quorum, and
+        ``forged_by`` makes ONE participant sign every entry while the entries
+        stay labelled with the others' uuids -- the case where a finalizer
+        mints the whole map itself.
+        """
+        ids = payload.get('cosigners') if isinstance(payload, dict) else None
+        if ids is None:
+            ids = [pid for pid in participants if pid != exclude]
+        forger = payload.get('forged_by') if isinstance(payload, dict) else None
+        signer = participants[forger].impl.identity if forger else None
+        sigs = {}
+        for pid in ids:
+            if pid not in participants:
+                raise AssertionError(f'cosigner {pid!r} not a known participant')
+            ident = participants[pid].impl.identity
+            sigs[str(ident.uuid)] = self._detached_sig(signer or ident,
+                                                      designation)
+        return sigs
+
     def _build_inbound(self, participants: dict[str, ParticipantHandle], *,
                        from_id: str, to_id: str, function: str,
                        payload: dict[str, Any]) -> Message:
@@ -619,20 +657,36 @@ class ReputationAdapter:
             epoch = int(payload.get('epoch', 1))
             reason = payload.get('reason',
                                  SlashAttestation.REASON_PEER_EXCLUDE)
+            att = SlashAttestation(
+                slasher_uuid=str(proposer_uuid), target_uuid=target_uuid,
+                reason=reason, floor_score=floor, epoch=epoch)
             if function == ReputationProtocol.slash_sign:
+                # Co-signatures are SIGNED HERE, at scenario time, by the
+                # sending participant's own key -- not pinned as blobs -- so
+                # both adapters are held to the same pre-image and scheme
+                # rather than to one side's recorded output (the §1.5
+                # precedent). The ack names its sender, because the receiver
+                # credits the authenticated sender rather than the claim. The
+                # sign step's payload must therefore describe the SAME round
+                # as its propose (reason + floor_score + epoch): the
+                # designation covers those fields, so a sign step that omits
+                # them signs different bytes and is correctly refused.
                 obj = to_json_string(
-                    (target_uuid, epoch, str(proposer_uuid), None))
+                    (target_uuid, epoch, str(sender_identity.uuid),
+                     self._detached_sig(sender_identity, att.designation)))
             else:
-                att = SlashAttestation(
-                    slasher_uuid=str(proposer_uuid), target_uuid=target_uuid,
-                    reason=reason, floor_score=floor, epoch=epoch)
                 # Phase 3: optional Merkle evidence {task_id, leaf, proof,
                 # root} tying the slash to a checkpoint-committed tx.
                 if isinstance(payload, dict) and payload.get('evidence'):
                     att.evidence_ref = payload['evidence']
-                obj = (to_json_string(SignedSlash(attestation=att, sigs={}))
-                       if function == ReputationProtocol.slash_final
-                       else to_json_string(att))
+                if function == ReputationProtocol.slash_final:
+                    sigs = self._cosignatures(participants, payload,
+                                              att.designation,
+                                              exclude=target_pid)
+                    obj = to_json_string(SignedSlash(attestation=att,
+                                                     sigs=sigs))
+                else:
+                    obj = to_json_string(att)
         elif function in (ReputationProtocol.checkpoint_propose,
                           ReputationProtocol.checkpoint_sign,
                           ReputationProtocol.checkpoint_final):
@@ -649,18 +703,25 @@ class ReputationAdapter:
             epoch = int(payload.get('epoch', 1))
             first_index = int(payload.get('first_index', 0))
             count = int(payload.get('count', 0))
+            ck = Checkpoint(
+                proposer_uuid=str(proposer_uuid),
+                root=root_hex.encode('ascii') if isinstance(root_hex, str)
+                else root_hex,
+                epoch=epoch, first_index=first_index, count=count)
             if function == ReputationProtocol.checkpoint_sign:
+                # Signed at scenario time by the sender, as for slash_sign.
+                # The sign step's payload must name the same root / epoch /
+                # bounds as its propose, since the designation covers them.
                 obj = to_json_string(
-                    (str(proposer_uuid), epoch, str(proposer_uuid), None))
+                    (str(proposer_uuid), epoch, str(sender_identity.uuid),
+                     self._detached_sig(sender_identity, ck.designation)))
+            elif function == ReputationProtocol.checkpoint_final:
+                sigs = self._cosignatures(participants, payload,
+                                          ck.designation)
+                obj = to_json_string(SignedCheckpoint(checkpoint=ck,
+                                                      sigs=sigs))
             else:
-                ck = Checkpoint(
-                    proposer_uuid=str(proposer_uuid),
-                    root=root_hex.encode('ascii') if isinstance(root_hex, str)
-                    else root_hex,
-                    epoch=epoch, first_index=first_index, count=count)
-                obj = (to_json_string(SignedCheckpoint(checkpoint=ck, sigs={}))
-                       if function == ReputationProtocol.checkpoint_final
-                       else to_json_string(ck))
+                obj = to_json_string(ck)
         else:
             raise AssertionError(f'unsupported reputation function {function!r}')
 

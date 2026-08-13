@@ -254,6 +254,73 @@ at the network layer, not merely reflected in a score:
   it lifts the score to `PREREP_NEUTRAL` (0.2), whose tier recompute publishes
   the readmit through the same `_publish_tier_change` path.
 
+## Quorum attestation (slash and checkpoint)
+
+Both quorum rounds — slashing (§2.2 of the [blockchain
+analysis](reputation-vs-blockchain-analysis.md)) and Merkle checkpoints (§2.1) —
+follow the same three phases: a node proposes, members co-sign only if they
+agree, and the proposer broadcasts a finalizer once more than `floor(N/2)`
+members have signed. What makes the finalizer worth anything is that its
+recipients can **check** the quorum themselves.
+
+Each co-signer signs a **designation**: canonical, domain-separated bytes naming
+everything the decision consists of (`SlashAttestation.designation` /
+`Checkpoint.designation`, mirrored byte-for-byte by `_slash_designation` /
+`_checkpoint_designation` in `rep_proc.c`). The proposer keeps the signature
+bytes keyed by voter, the finalizer carries the whole map, and every receiver
+re-derives the designation and verifies each signature against the member key it
+holds, counting **distinct verified signers** against its own view of the group.
+
+Three properties, and the reason each is separate:
+
+- **A co-signature must verify to count.** Otherwise the tally counts
+  assertions, and any member can assert anything.
+- **A vote belongs to the authenticated sender**, not to the voter the payload
+  names. Verification already bounds the tally to signatures the sender could
+  obtain; this additionally stops a *harvested* genuine signature — they travel
+  in the clear on every finalizer — from being relayed under its signer's name
+  by somebody else, and catches a node mislabelling its own ack.
+- **Quorum is sized by the receiver**, from its own roster, so the finalizer
+  cannot also choose the bar it must clear.
+
+**Flag day.** A finalizer with no verifiable co-signatures is refused, so a node
+built before this change cannot finalize a slash or a checkpoint for a node built
+after it. There is no lenient mode by design: an attacker would simply select it.
+
+### The vulnerability this closed (fixed 2026-08-13)
+
+Before this, both rounds collected the co-signature bytes and **threw them
+away**. `handle_*_sign` credited the voter uuid claimed in the payload,
+the finalizer went out with an empty `sigs` map, and `handle_*_final` applied
+whatever arrived on transport authentication alone. The three-phase quorum was
+therefore enforced only inside the proposer's own head; a receiver could not
+distinguish a quorum-finalized decision from one member's unilateral claim.
+
+Concretely, any **admitted** member could:
+
+- broadcast an evidence-free `slash_final` naming any other peer and have every
+  receiver floor it — and because a floored score sits below `COMM_CUTOFF`, that
+  is network exclusion which is *sticky*, recoverable only by an explicit
+  `REASON_REHABILITATE`. A permanent-exclusion primitive, network-wide, on
+  demand.
+- broadcast a `checkpoint_final` over a root of its choosing and have every
+  receiver store it. Since `_verify_slash_evidence` anchors slash evidence on
+  that root precisely so the root is "not chosen by the accuser", this also made
+  fabricated Merkle evidence verify perfectly.
+
+It needed a credentialed insider rather than an outsider — which is the
+authenticated-but-compromised case ZTA exists to contain, not an argument that it
+did not matter. The C side was thinner still: its co-sign ack reported the **nil
+uuid** as its signer and carried no signature, and its tally was a bare count
+with no voter identity, so replaying a single ack drove the count past quorum.
+
+Pinned by `tests/a_unit/test_repprocess_quorum_attestation.py`,
+`src/c/test/rep_quorum_test.c`, and the conformance scenarios
+`slash-final-sub-quorum-refused`, `slash-final-forged-cosignatures-refused` and
+`checkpoint-final-unattested-root-refused` — whose co-signatures both adapters
+mint at scenario time, so the two runtimes are held to the same pre-image and
+scheme rather than to one side's recorded output.
+
 ## Expiration
 
 Pending requests and proposals expire after 300 seconds to prevent unbounded memory growth.

@@ -36,8 +36,13 @@ steps:
     function: slash sign
     payload:
       target: rogue
+      floor_score: 0.1
       epoch: 7
-    description: bob's co-signature reaches alice (the detector tallies it).
+    description: |
+        bob's co-signature reaches alice (the detector tallies it). The round
+        is restated in full because the co-signature covers the attestation
+        designation, which includes the floor: a sign step naming a different
+        floor signs different bytes and is refused.
 
   - id: 3
     from: alice
