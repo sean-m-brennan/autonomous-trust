@@ -139,6 +139,19 @@ static char ID_ROSTER_RESPONSE[] = "subtree_roster_response";
  * rules are identical. See doc/architecture/operator-attended.md. */
 static char ID_ATTEST_QUERY[]    = "operator_attest_query";
 static char ID_ATTEST_RESPONSE[] = "operator_attest_response";
+/* Runtime hierarchy roots (protocol step 7, ISSUES.md §10.2). A node states its
+ * own position in the gateway tree — which cohorts it gateways, and which
+ * higher-rank node it federates through — so the mesh AGREES on the topology
+ * instead of each node inferring it privately. Advertised on the encrypted group
+ * channel when our own view changes, and on request so a late joiner converges
+ * without waiting for somebody's next change.
+ *
+ * Carries NO group key and confers no membership: an advertisement is a claim
+ * about ITSELF, recorded only from a peer that can prove a shared trust anchor.
+ * Our OWN parent is derived, never accepted from a peer. Mirrors Python
+ * IdentityProtocol.hierarchy / hierarchy_req. */
+static char ID_HIERARCHY[]       = "hierarchy_root";
+static char ID_HIERARCHY_QUERY[] = "hierarchy_query";
 
 /* Verbs this protocol legitimately puts on the wire in PLAINTEXT
  * (Message encrypt=false), and the only ones a receiver accepts unencrypted
@@ -284,6 +297,22 @@ static struct {
      * proc->protocol.admission_quorum, then handle_confirm_peer promotes it
      * and clears the entry. Mirrors Python's _provisional_confirmations. */
     map_t provisional_confirmations;
+    /* Runtime hierarchy roots (protocol step 7, ISSUES.md §10.2).
+     *   peer_hierarchy: peer-uuid string -> string_data(the claim it sent, as
+     *                   rendered JSON). Recorded only from peers that prove a
+     *                   shared anchor; read when choosing a roster-recursion
+     *                   target, where a peer's own claim outranks rank
+     *                   inference.
+     *   parent_gateway: the higher-rank node we federate through, DERIVED (see
+     *                   _derive_parent_gateway) and never accepted from a peer.
+     *                   Empty when we are the root of our own cohort.
+     *   last_hierarchy_claim: the claim we last broadcast, so an unchanged one
+     *                   is not re-sent (the group_update flood lesson).
+     *   hierarchy_requested: one-shot guard on the post-admission query. */
+    map_t peer_hierarchy;
+    char parent_gateway[UUID_STRING_LEN + 1];
+    char last_hierarchy_claim[512];
+    bool hierarchy_requested;
     char partition_recovery_target[64];
     int64_t partition_recovery_started_us;
 } id_state;
@@ -2056,6 +2085,11 @@ void identity_reset_state(void)
     map_init(&id_state.partition_response_cooldown);
     map_free(&id_state.provisional_confirmations);
     map_init(&id_state.provisional_confirmations);
+    map_free(&id_state.peer_hierarchy);
+    map_init(&id_state.peer_hierarchy);
+    id_state.parent_gateway[0] = '\0';
+    id_state.last_hierarchy_claim[0] = '\0';
+    id_state.hierarchy_requested = false;
     id_state.partition_recovery_target[0] = '\0';
     id_state.partition_recovery_started_us = 0;
     id_state.self_tier = 0;
@@ -5079,6 +5113,328 @@ static bool _roster_discover_child_gateway(const process_t *proc,
     return have;
 }
 
+/****************************
+ * Runtime hierarchy roots (protocol step 7, ISSUES.md §10.2)
+ *
+ * Mirrors Python idprocess._derive_parent_gateway / _hierarchy_claim /
+ * _advertise_hierarchy / handle_hierarchy / handle_hierarchy_request. Two
+ * halves: our own parent is DERIVED (never accepted from a peer), and every
+ * node ADVERTISES its own position so the mesh agrees on the tree. No group key
+ * ever moves — a runtime cross-group join is a separate question.
+ ****************************/
+
+/* This node's own rank, read the same way a peer's is. */
+static int _own_rank(const process_t *proc)
+{
+    const identity_t *self = _partition_self_identity(proc);
+    if (self == NULL) return 0;
+    char su[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(self->uuid, su);
+    int r = _roster_member_rank(proc, su);
+    if (r == 0)
+        r = self->rank;
+    return r;
+}
+
+/* The higher-rank node we federate through, or false if we are the root of our
+ * own primary cohort.
+ *
+ * Derived, never accepted from a peer: our parent is our own conclusion, and a
+ * node that could name itself our parent could insert itself into every rollup
+ * we perform. Same rule as _roster_discover_child_gateway with one difference
+ * that matters — a candidate must OUT-RANK us. One level down we pick somebody
+ * else's leader; here we ask who leads us, and the highest-rank member of a
+ * cohort we top is nobody's parent but its own. */
+static bool _derive_parent_gateway(const process_t *proc, char *out)
+{
+    if (proc == NULL || out == NULL) return false;
+    out[0] = '\0';
+    const identity_t *self = _partition_self_identity(proc);
+    char self_uuid[UUID_STRING_LEN + 1] = {0};
+    if (self != NULL)
+        uuid_unparse_lower(self->uuid, self_uuid);
+    int own = _own_rank(proc);
+    bool have = false;
+    int best_rank = 0;
+    char best_uuid[UUID_STRING_LEN + 1] = {0};
+    map_key_t key;
+    data_t *value;
+    map_entries_for_each(&((process_t *)proc)->protocol.group.address_map, key, value)
+        (void)value;
+        const char *u = (const char *)key;
+        if (u == NULL || u[0] == '\0') continue;
+        if (self_uuid[0] != '\0' && strcmp(u, self_uuid) == 0) continue;
+        int rank = _roster_member_rank(proc, u);
+        if (rank <= own) continue;
+#ifdef AT_ZTA_ENABLED
+        if (!_gateway_authorized(proc, u)) continue;
+#endif
+        if (!have || rank > best_rank
+            || (rank == best_rank && strcmp(u, best_uuid) > 0)) {
+            have = true;
+            best_rank = rank;
+            strncpy(best_uuid, u, UUID_STRING_LEN);
+            best_uuid[UUID_STRING_LEN] = '\0';
+        }
+    map_end_for_each
+    if (have)
+        memcpy(out, best_uuid, UUID_STRING_LEN + 1);
+    return have;
+}
+
+/* This node's own place in the tree, as it goes on the wire: a claim about
+ * ourselves only. Caller owns the returned object. */
+static json_t *_hierarchy_claim(const process_t *proc)
+{
+    const identity_t *self = _partition_self_identity(proc);
+    char su[UUID_STRING_LEN + 1] = {0};
+    if (self != NULL)
+        uuid_unparse_lower(self->uuid, su);
+    json_t *children = json_array();
+    if (proc->protocol.child_groups != NULL) {
+        /* Sorted, so the claim is byte-comparable with Python's (which sorts)
+         * and an unchanged claim compares equal across ticks. */
+        array_t *keys = map_keys(proc->protocol.child_groups);
+        size_t n = array_size(keys);
+        const char *sorted[ROSTER_MAX_NODES];
+        size_t n_sorted = 0;
+        for (size_t i = 0; i < n && n_sorted < ROSTER_MAX_NODES; i++) {
+            data_t *kd = NULL;
+            map_key_t k = NULL;
+            if (array_get(keys, (int)i, &kd) != 0
+                || data_string_ptr(kd, &k) != 0 || k == NULL)
+                continue;
+            sorted[n_sorted++] = k;
+        }
+        qsort(sorted, n_sorted, sizeof(sorted[0]), _roster_key_cmp);
+        for (size_t i = 0; i < n_sorted; i++)
+            json_array_append_new(children, json_string(sorted[i]));
+    }
+    return json_pack("{s:s, s:s, s:o, s:i}",
+                     "node", su,
+                     "parent", id_state.parent_gateway,
+                     "children", children,
+                     "rank", _own_rank(proc));
+}
+
+/* State our place in the tree. @p to_whom NULL broadcasts to the group (and is
+ * suppressed when the claim has not changed — echoing a topology broadcast is
+ * how it becomes a flood); non-NULL answers one asker. */
+static void _advertise_hierarchy(const process_t *proc, const public_identity_t *to_whom)
+{
+    if (proc == NULL) return;
+    json_t *claim = _hierarchy_claim(proc);
+    if (claim == NULL) return;
+    char *rendered = json_dumps(claim, JSON_COMPACT | JSON_SORT_KEYS);
+    json_decref(claim);
+    if (rendered == NULL) return;
+    if (to_whom == NULL
+        && strncmp(rendered, id_state.last_hierarchy_claim,
+                   sizeof(id_state.last_hierarchy_claim)) == 0) {
+        free(rendered);
+        return;   /* unchanged; a re-broadcast tells nobody anything */
+    }
+    generic_msg_t msg = {0};
+    msg.type = NET_MESSAGE;
+    strncpy(msg.info.net_msg.process, "identity", PROC_NAME_LEN);
+    msg.info.net_msg.function = ID_HIERARCHY;
+    msg.info.net_msg.encrypt = true;
+    json_error_t jerr;
+    json_t *payload = json_loads(rendered, 0, &jerr);
+    if (payload != NULL) {
+        net_msg_pack_json(&msg.info.net_msg, payload);
+        json_decref(payload);
+        if (to_whom != NULL) {
+            memcpy(&msg.info.net_msg.to_whom, to_whom, sizeof(public_identity_t));
+            messaging_send("network", NET_MESSAGE, &msg, false);
+        } else {
+            peers_read_lock(proc);
+            for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+                generic_msg_t per = msg;
+                memcpy(&per.info.net_msg.to_whom, &proc->protocol.peers[i],
+                       sizeof(public_identity_t));
+                messaging_send("network", NET_MESSAGE, &per, false);
+            }
+            peers_read_unlock(proc);
+            snprintf(id_state.last_hierarchy_claim,
+                     sizeof(id_state.last_hierarchy_claim), "%s", rendered);
+        }
+    }
+    free(rendered);
+}
+
+/* Re-derive our parent and advertise if our position moved. Cheap and
+ * idempotent, so every input change can call it. */
+void identity_refresh_hierarchy(const process_t *proc)
+{
+    if (proc == NULL) return;
+    char parent[UUID_STRING_LEN + 1] = {0};
+    _derive_parent_gateway(proc, parent);
+    if (strncmp(parent, id_state.parent_gateway,
+                sizeof(id_state.parent_gateway)) != 0) {
+        snprintf(id_state.parent_gateway, sizeof(id_state.parent_gateway),
+                 "%s", parent);
+        log_info(proc->logger, "Identity: parent gateway is %s\n",
+                 parent[0] ? parent : "none (we are root)");
+    }
+    _advertise_hierarchy(proc, NULL);
+}
+
+/* Record a peer's claim about its own place in the tree.
+ *
+ * Gated on proved gateway authority: the recorded value is what a roster query
+ * recurses into, so a peer that could install itself there would receive
+ * queries for a cohort it has no standing in. The claim is about the SENDER
+ * only — one naming somebody else is refused rather than quietly recorded. */
+static bool handle_hierarchy(const process_t *proc, directory_t *queues,
+                             generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    if (nmsg->function == NULL || strcmp(nmsg->function, ID_HIERARCHY) != 0)
+        return false;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    char sender[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(nmsg->from_whom.uuid, sender);
+    const char *claimed = json_string_value(json_object_get(payload, "node"));
+    if (claimed != NULL && claimed[0] != '\0'
+        && strcmp(claimed, sender) != 0) {
+        log_warn(proc->logger,
+                 "Identity: hierarchy claim from %s names %s; refused\n",
+                 sender, claimed);
+        json_decref(payload);
+        return true;
+    }
+#ifdef AT_ZTA_ENABLED
+    if (!_gateway_authorized(proc, sender)) {
+        log_debug(proc->logger,
+                  "Identity: hierarchy claim from %s not recorded: no proved "
+                  "shared anchor\n", sender);
+        json_decref(payload);
+        return true;
+    }
+#endif
+    if (id_state.peer_hierarchy.items == NULL)
+        map_init(&id_state.peer_hierarchy);
+    /* Store the claim verbatim (as rendered JSON) so the reader stays one
+     * parse away from whatever the sender said, and nothing is re-derived. */
+    char *rendered = json_dumps(payload, JSON_COMPACT | JSON_SORT_KEYS);
+    if (rendered != NULL) {
+        map_set(&id_state.peer_hierarchy, (map_key_t)sender,
+                string_data((string_t)rendered, strlen(rendered)));
+        free(rendered);
+    }
+    json_decref(payload);
+    return true;
+}
+
+/* Answer a hierarchy query with our own claim, addressed to the asker. The
+ * query exists so a late joiner converges at once. */
+static bool handle_hierarchy_request(const process_t *proc, directory_t *queues,
+                                     generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    if (nmsg->function == NULL
+        || strcmp(nmsg->function, ID_HIERARCHY_QUERY) != 0)
+        return false;
+    _advertise_hierarchy(proc, &nmsg->from_whom);
+    return true;
+}
+
+/* Ask the group to state their positions (once). */
+void identity_request_hierarchy(const process_t *proc)
+{
+    if (proc == NULL || id_state.hierarchy_requested) return;
+    id_state.hierarchy_requested = true;
+    const identity_t *self = _partition_self_identity(proc);
+    char su[UUID_STRING_LEN + 1] = {0};
+    if (self != NULL)
+        uuid_unparse_lower(self->uuid, su);
+    json_t *payload = json_pack("{s:s}", "requestor", su);
+    if (payload == NULL) return;
+    generic_msg_t msg = {0};
+    msg.type = NET_MESSAGE;
+    strncpy(msg.info.net_msg.process, "identity", PROC_NAME_LEN);
+    msg.info.net_msg.function = ID_HIERARCHY_QUERY;
+    msg.info.net_msg.encrypt = true;
+    net_msg_pack_json(&msg.info.net_msg, payload);
+    json_decref(payload);
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+        generic_msg_t per = msg;
+        memcpy(&per.info.net_msg.to_whom, &proc->protocol.peers[i],
+               sizeof(public_identity_t));
+        messaging_send("network", NET_MESSAGE, &per, false);
+    }
+    peers_read_unlock(proc);
+}
+
+/* The peer that has ADVERTISED it gateways @p cg_uuid, or false.
+ *
+ * Direct evidence beats inference: a node saying "I gateway cohort X" outranks
+ * "it is the highest-rank member of X". Ties break by the same
+ * rank-then-greater-uuid rule discovery uses, so the choice is deterministic
+ * and identical in Python. */
+static bool _advertised_child_gateway(const process_t *proc,
+                                      const char *cg_uuid, char *out)
+{
+    if (proc == NULL || cg_uuid == NULL || out == NULL) return false;
+    out[0] = '\0';
+    if (id_state.peer_hierarchy.items == NULL) return false;
+    const identity_t *self = _partition_self_identity(proc);
+    char self_uuid[UUID_STRING_LEN + 1] = {0};
+    if (self != NULL)
+        uuid_unparse_lower(self->uuid, self_uuid);
+    bool have = false;
+    int best_rank = 0;
+    char best_uuid[UUID_STRING_LEN + 1] = {0};
+    array_t *keys = map_keys(&id_state.peer_hierarchy);
+    size_t n = array_size(keys);
+    for (size_t i = 0; i < n; i++) {
+        data_t *kd = NULL;
+        map_key_t k = NULL;
+        if (array_get(keys, (int)i, &kd) != 0
+            || data_string_ptr(kd, &k) != 0 || k == NULL)
+            continue;
+        if (self_uuid[0] != '\0' && strcmp(k, self_uuid) == 0) continue;
+        data_t *vd = NULL;
+        string_t rendered = NULL;
+        if (map_get(&id_state.peer_hierarchy, k, &vd) != 0 || vd == NULL
+            || data_string_ptr(vd, &rendered) != 0 || rendered == NULL)
+            continue;
+        json_error_t jerr;
+        json_t *claim = json_loads(rendered, 0, &jerr);
+        if (claim == NULL) continue;
+        bool claims_it = false;
+        json_t *children = json_object_get(claim, "children");
+        if (json_is_array(children)) {
+            size_t ci;
+            json_t *cv;
+            json_array_foreach(children, ci, cv) {
+                const char *c = json_string_value(cv);
+                if (c != NULL && strcmp(c, cg_uuid) == 0)
+                    claims_it = true;
+            }
+        }
+        json_decref(claim);
+        if (!claims_it) continue;
+        int rank = _roster_member_rank(proc, k);
+        if (!have || rank > best_rank
+            || (rank == best_rank && strcmp(k, best_uuid) > 0)) {
+            have = true;
+            best_rank = rank;
+            strncpy(best_uuid, k, UUID_STRING_LEN);
+            best_uuid[UUID_STRING_LEN] = '\0';
+        }
+    }
+    if (have)
+        memcpy(out, best_uuid, UUID_STRING_LEN + 1);
+    return have;
+}
+
 /* The child gateways a full-subtree roster recurses into (deduped,
  * order-stable) as a NEW json array of node-uuid strings — one per gatewayed
  * child group, DISCOVERED by rank (highest-rank member excluding self), with an
@@ -5106,7 +5462,14 @@ static json_t *_roster_child_gateway_array(const process_t *proc)
         string_t ov_s = NULL;
         if (ov != NULL && data_string_ptr(ov, &ov_s) == 0
             && ov_s != NULL && ov_s[0] != '\0') {
-            gw_p = ov_s;  /* explicit override */
+            gw_p = ov_s;  /* explicit override (tests / pinned topologies) */
+        } else if (_advertised_child_gateway(proc, cg_uuid, gw)) {
+            /* The peer's OWN claim to gateway this cohort (protocol step 7).
+             * Direct evidence beats inference: "I gateway X" outranks "it is
+             * the highest-rank member of X". Only claims from peers that proved
+             * a shared anchor are ever recorded, so this cannot inject a
+             * recursion target. */
+            gw_p = gw;
         } else {
             group_t *cg = NULL;
             if (data_object_ptr(value, (ptr_t *)&cg) == 0 && cg != NULL
@@ -5767,6 +6130,19 @@ int identity_propagate_child_groups(const process_t *proc, directory_t *queues)
     return sent;
 }
 
+int identity_get_parent_gateway(const process_t *proc, char *out, size_t cap)
+{
+    if (out == NULL || cap == 0) return -1;
+    out[0] = '\0';
+    /* Derive on demand rather than reporting a cached value: the conformance
+     * harness installs ranks and then asks, with no run loop to tick. */
+    char parent[UUID_STRING_LEN + 1] = {0};
+    if (proc != NULL)
+        _derive_parent_gateway(proc, parent);
+    snprintf(out, cap, "%s", parent);
+    return 0;
+}
+
 void identity_set_roster_private(process_t *proc, bool enabled)
 {
     if (proc == NULL) return;
@@ -6023,6 +6399,10 @@ int identity_register_handlers(process_t *proc)
                              (handler_ptr_t)handle_partition_probe);
     process_register_handler(proc, ID_PARTITION_RESPONSE,
                              (handler_ptr_t)handle_partition_response);
+    process_register_handler(proc, ID_HIERARCHY,
+                            (handler_ptr_t)handle_hierarchy);
+    process_register_handler(proc, ID_HIERARCHY_QUERY,
+                            (handler_ptr_t)handle_hierarchy_request);
     process_register_handler(proc, ID_ROSTER_QUERY,
                              (handler_ptr_t)handle_roster_request);
     process_register_handler(proc, ID_ATTEST_QUERY,
@@ -6063,6 +6443,8 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
                 /* Hand them to the sibling processes: reputation keeps one
                  * chain per child group and cannot without this. */
                 identity_propagate_child_groups(proc, queues);
+                /* The cohorts we gateway are half of what we advertise. */
+                identity_refresh_hierarchy(proc);
             }
         }
     }
@@ -6292,6 +6674,13 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
              * missing Identities so consensus reputations can be named. A
              * converged node emits no query (have_count >= group_size). */
             identity_periodic_identity_resync(proc);
+            /* Runtime hierarchy roots (protocol step 7): ask the group to
+             * state their positions once (a node joining a settled mesh would
+             * otherwise wait for somebody's next change), and re-derive our
+             * own, which moves when ranks do. Both are quiet no-ops on a
+             * converged leaf. */
+            identity_request_hierarchy(proc);
+            identity_refresh_hierarchy(proc);
         }
 
         generic_msg_t buf = {0};

@@ -47,11 +47,12 @@ class TestIdentityProtocol:
           local-only trigger (attest_trigger), and the local-only
           session round trip it needs
           (operator_state_req, operator_state_resp)
+        - runtime hierarchy roots (hierarchy, hierarchy_req)
         Asserting the exact count here pins the wire contract — a
         new verb without intent will fail this and force a deliberate
         update. Update the expected count alongside any new addition
         to ``IdentityProtocol``.
         """
         values = list(IdentityProtocol)
-        assert len(values) == 24
+        assert len(values) == 26
         assert 'announce' in values
