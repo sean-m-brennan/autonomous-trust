@@ -7,7 +7,7 @@
 When `AutonomousTrust.run_forever()` is called, the node goes through a
 deterministic startup sequence before entering its active state.
 
-0. **Clock gate.** read the host's clock discipline and refuse to continue on a clock nothing is steering (see [Clock discipline](#clock-discipline)). The C side does the same in `at_node_init` before it touches any directory.
+0. **Clock gate.** Read the host's clock discipline and refuse to continue on a clock nothing is steering (see [Clock discipline](#clock-discipline)). The C side does the same in `at_node_init` before it touches any directory.
 
 1. **Configure.** Load configuration files from `$AUTONOMOUS_TRUST_ROOT/etc/at/`. Required configs: network, identity, peers, capabilities. The `ProcessTracker` reads `subsystems.cfg.json` to determine which process classes to instantiate.
 
@@ -140,8 +140,8 @@ the group address map) yet missing either its capabilities
 (`caps_query`/response dropped) or, for a late/cold joiner, the Identity objects
 of co-members. Two periodic Identity sweeps converge these:
 
-- **Caps-resync.** every ~20 s, query admitted peers that have no entry in `peer_capabilities` over the reliable channel (rate-limited; idempotent per-capability dedup).
-- **Identity-resync backfill.** when the known-peer count is below the group address count, broadcast a peer-identity query and backfill responses for addresses already in the group.
+- **Caps-resync.** Every ~20 s, query admitted peers that have no entry in `peer_capabilities` over the reliable channel (rate-limited; idempotent per-capability dedup).
+- **Identity-resync backfill.** When the known-peer count is below the group address count, broadcast a peer-identity query and backfill responses for addresses already in the group.
 
 These are the "layer 3" of partition recovery; their state machine and the
 symmetric **probe-adopt** merge path are documented in [Partition

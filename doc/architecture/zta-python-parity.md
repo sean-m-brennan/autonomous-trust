@@ -167,15 +167,27 @@ the same field names/defaults as the C `zta_policy_t` (zta-integration.md §7).
 When the file is absent the policy defaults to disabled, so existing deployments
 are unaffected.
 
-## 6. Scope vs. the C subsystem
+## 6. Scope vs. The C subsystem
 
 This brings Python to parity for the **admission decision** (verify at join,
-DDIL fallback, reputation cap) and wire binding. Not yet ported, and explicitly
-out of scope here, are the background **ZTA process** (periodic re-verification,
-revocation alerts, delegated verification / distributed PDP, zta-integration.md
-§8-9) and the **audit log** (§10). These remain C-only, and the Python gate logs
-decisions through the standard logger. Porting them is a
-follow-up tracked in zta-integration.md §15.
+DDIL fallback, reputation cap) and wire binding.
+
+**Periodic re-verification reached parity 2026-08-17** (ISSUES §10.5).
+`IdentityProcess._periodic_zta_reverify` sweeps admitted peers on the
+policy's own `reverify_interval_sec`, so a Python node detects a credential
+revoked *after* admission and lifts a DDIL cap once the infrastructure
+returns. It sits in IdentityProcess rather than in a process of its own,
+because that is where Python's ZTA already lives. The split is structural,
+not behavioral. One deliberate difference: Python re-verifies with the full
+admission walk (anchor match + explicit revocation check + binding), where
+C's `_reverify_peers` asks the narrower `check_revocation` for an
+already-admitted peer. The full walk is a superset and cannot admit anything
+the narrower check would reject.
+
+Still C-only, and explicitly out of scope here: **revocation alerts** and
+**delegated verification / distributed PDP** (zta-integration.md §8-9), and
+the **audit log** (§10). The Python gate logs decisions through the standard
+logger. Porting those remains a follow-up tracked in zta-integration.md §15.
 
 ## 7. Conformance
 
