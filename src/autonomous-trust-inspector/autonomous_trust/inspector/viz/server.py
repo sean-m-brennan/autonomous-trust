@@ -23,6 +23,13 @@ _logger = logging.getLogger(__name__)
 
 from . import network_graph as ng
 from . import social_graphs  # noqa  required import
+# Registers the 'live' implementation that the data_q branch below asks for by
+# name. Importing it HERE rather than relying on a caller to have imported it
+# first: `inspector.py` happens to (`from .viz.live_graph import LiveData`), so
+# the live path works in the app, but any other consumer constructing a
+# VizServer with a data_q got `KeyError: 'live'` and a 500 on connect -- a
+# module depending on a registration performed by a module it does not import.
+from . import live_graph  # noqa  required import
 from .middleware import SassASGIMiddleware, _sass_available
 
 default_port = 8000

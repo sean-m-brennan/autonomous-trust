@@ -36,6 +36,8 @@ from .identity import Identity, public_identity_to_canonical, public_identity_fr
 from .operator_binding import (OPERATOR_BINDING_MAX, OPERATOR_PUBKEY_LEN,
                                verify_operator_binding)
 from .group import Group, ChildGroupSet
+from .zta_standing import (ZtaStanding, STANDING_PROVED, STANDING_CAPPED,
+                           STANDING_FAILED)
 from .history.history import IdentityHistory
 from ..algorithms.agreement import AgreementProof
 from ..algorithms.impl import AgreementImpl
@@ -234,6 +236,20 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # so nothing else computes this.
         self._own_anchor_cache = None
         self._zta_capped: set = set()  # uuids admitted via DDIL fallback (rep-capped)
+        # What _zta_admit found on THIS call, for the caller to hand to the
+        # reputation process (§10.5): (status, ceiling, verified_at, reason),
+        # or None when the gate said nothing (policy disabled / not required at
+        # admission), in which case no standing is published at all -- silence
+        # and "proved" are different claims.
+        self._zta_standing_pending = None
+        # Last ZTA re-verification sweep (§10.5). None = never run, so the
+        # first process() iteration sweeps immediately -- which is what catches
+        # a credential revoked while this node was down.
+        self._last_zta_reverify: Optional[datetime] = None
+        # When the loop last ASKED whether that interval had elapsed. Separate
+        # from the sweep's own stamp so the cheap wake and the expensive walk
+        # are paced independently.
+        self._last_zta_reverify_check: Optional[datetime] = None
         self._operator_verified: set = set()  # uuids whose operator credential verified
         self._operator_session = None  # live OperatorSession, attached in P-L3
         # Attended-now pulls awaiting the main loop's session answer:
@@ -304,6 +320,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # re-broadcasting an unchanged claim (the group_update flood lesson);
         # _hierarchy_requested makes the post-admission query one-shot.
         self.peer_hierarchy: dict[str, dict] = {}
+        # Cohorts we have ASKED to join and not yet been admitted to (§10.2).
+        # The gate on _adopt_solicited_group: a group arriving without a
+        # matching entry here is somebody handing us a cohort we never asked
+        # for, and adopting that would let any peer install itself in our tree.
+        self._pending_joins: set[str] = set()
         # Member-uuid -> topology rank, the seam _member_rank falls back to when
         # a cohort member is known by address but not yet by Identity. C twin:
         # protocol.peer_ranks (see set_peer_rank / _member_rank).
@@ -453,7 +474,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     # already persisted to disk above for any process that
                     # needs to reload it.
         except Exception as err:
-            self.logger.error('Error saving %s for %s: %s' % (name, obj.__class__.__name__, err))
+            self.logger.error('Error saving %s for %s: %s', name, obj.__class__.__name__, err)
             try:
                 if os.path.exists(filename) and os.stat(filename).st_size == 0:
                     os.remove(filename)
@@ -473,6 +494,43 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # ranks, so it can move whenever the group does (protocol step 7).
         self._refresh_hierarchy(queues)
 
+    def _publish_zta_standing(self, queues, peer_uuid, status, ceiling=None,
+                              verified_at=None, reason=''):
+        """Hand one ZTA finding to the other processes (ISSUES §10.5).
+
+        Sibling of _record_child_groups: same fan-out, different cargo. The
+        reputation process is the consumer that matters -- it is where a
+        ceiling can actually bound a peer -- but this goes to every process for
+        the same reason a Group does, so nothing has to ask.
+
+        Failure to propagate is logged, not raised: losing a ceiling must not
+        take admission down. It is logged at WARNING with the peer and the
+        ceiling, because the failure is exactly the case where a peer silently
+        keeps an unbounded score.
+        """
+        try:
+            self.update(ZtaStanding(peer_uuid, status, ceiling, verified_at,
+                                    reason), queues)
+        except Exception as err:
+            self.logger.warning(
+                'Could not propagate ZTA standing for %s (%s, ceiling %s): %s', str(peer_uuid)[:8], status, ceiling, err)
+
+    def _publish_zta_decision(self, queues, new_id):
+        """Publish whatever _zta_admit just found, if it found anything.
+
+        Nothing is sent when the gate was a no-op (policy disabled, or not
+        required at admission): reputation must not be told a peer is `proved`
+        merely because nobody checked. Silence leaves the peer unbounded, which
+        is what a deployment that has not turned ZTA on has already chosen.
+        """
+        pending = self._zta_standing_pending
+        self._zta_standing_pending = None
+        if pending is None:
+            return
+        status, ceiling, verified_at, reason = pending
+        self._publish_zta_standing(queues, new_id.uuid, status, ceiling,
+                                   verified_at, reason)
+
     def _record_child_groups(self, queues):
         """Fan the current child-group set out to the other processes.
 
@@ -489,7 +547,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         try:
             self.update(ChildGroupSet(self.child_groups), queues)
         except Exception as err:
-            self.logger.warning('Could not propagate child groups: %s' % err)
+            self.logger.warning('Could not propagate child groups: %s', err)
         # The set we gateway is half of what we advertise, so state it (step 7).
         self._advertise_hierarchy(queues)
 
@@ -509,8 +567,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if self.group is not None and key == str(self.group.uuid):
             return  # never demote our own primary group to a child
         self.child_groups[key] = group
-        self.logger.info('Gateway adopted child group %s (%s)' %
-                         (getattr(group, 'nickname', '?'), key[:8]))
+        self.logger.info('Gateway adopted child group %s (%s)', getattr(group, 'nickname', '?'), key[:8])
         if peer_idents:
             self._populate_peers_from_history(queues, list(peer_idents))
         self._record_child_groups(queues)
@@ -550,9 +607,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self._adopt_child_group(queues, group)
                 except Exception as err:
                     self.logger.warning(
-                        'Could not load child group %s: %s' % (fname, err))
+                        'Could not load child group %s: %s', fname, err)
         except Exception as err:
-            self.logger.warning('_load_child_groups failed: %s' % err)
+            self.logger.warning('_load_child_groups failed: %s', err)
 
     # --- Subtree member-roster enumeration -----------------------------------
 
@@ -718,7 +775,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             if to_whom is None:
                 self._last_hierarchy_claim = claim
         except Exception as err:
-            self.logger.warning('Could not advertise hierarchy: %s' % err)
+            self.logger.warning('Could not advertise hierarchy: %s', err)
 
     def _refresh_hierarchy(self, queues):
         """Re-derive our parent and advertise if our position moved.
@@ -729,8 +786,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         parent = self._derive_parent_gateway()
         if parent != self.parent_gateway:
             self.parent_gateway = parent
-            self.logger.info('Hierarchy: parent gateway is %s' %
-                             (parent[:8] if parent else 'none (we are root)'))
+            self.logger.info('Hierarchy: parent gateway is %s', parent[:8] if parent else 'none (we are root)')
         self._advertise_hierarchy(queues)
 
     def handle_hierarchy(self, queues, message):
@@ -749,8 +805,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if message.function != IdentityProtocol.hierarchy:
             return False
         if not message.verified:
-            self.logger.warning('Rejecting unverified hierarchy from %s' %
-                                message.from_whom)
+            self.logger.warning('Rejecting unverified hierarchy from %s', message.from_whom)
             return True
         try:
             payload = message.obj
@@ -767,13 +822,12 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 # the two disagreeing is either a bug or an attempt, and
                 # neither should quietly become a recorded fact.
                 self.logger.warning(
-                    'Hierarchy claim from %s names %s; refused' %
-                    (sender[:8], claimed[:8]))
+                    'Hierarchy claim from %s names %s; refused', sender[:8], claimed[:8])
                 return True
             if not self._gateway_authorized(sender):
                 self.logger.debug(
                     'Hierarchy claim from %s not recorded: no proved shared '
-                    'anchor' % sender[:8])
+                    'anchor', sender[:8])
                 return True
             children = [str(c) for c in (payload.get('children') or [])]
             self.peer_hierarchy[sender] = {
@@ -781,10 +835,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 'children': children,
                 'rank': int(payload.get('rank', 0) or 0),
             }
-            self.logger.debug('Hierarchy: %s gateways %d cohort(s)' %
-                              (sender[:8], len(children)))
+            self.logger.debug('Hierarchy: %s gateways %d cohort(s)', sender[:8], len(children))
         except Exception as err:
-            self.logger.warning('Malformed hierarchy claim: %s' % err)
+            self.logger.warning('Malformed hierarchy claim: %s', err)
         return True
 
     def handle_hierarchy_request(self, queues, message):
@@ -812,7 +865,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                           self.group, from_whom=self.identity)
             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
         except Exception as err:
-            self.logger.warning('Could not query hierarchy: %s' % err)
+            self.logger.warning('Could not query hierarchy: %s', err)
 
     def _own_zta_anchors(self) -> set:
         """Anchor names OUR OWN credentials verify against. Computed locally, once.
@@ -1142,8 +1195,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                    in self._attest_pending.items() if deadline <= tick]
         for nonce in expired:
             requestor, _deadline, received_at = self._attest_pending.pop(nonce)
-            self.logger.debug('attest pull %s timed out; answering unattended'
-                              % nonce)
+            self.logger.debug('attest pull %s timed out; answering unattended', nonce)
             # Still carries the clock readings: "no human is attending" is a
             # real answer, and our own timestamps are honest either way, so a
             # timed-out pull still yields the puller a usable clock sample.
@@ -1271,8 +1323,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             sent = self._attest_sent.pop(str(nonce), None) if nonce else None
             if sent is None:
                 # Unsolicited, replayed, or an answer to a pull already retired.
-                self.logger.warning('handle_attest_response: unknown nonce %r'
-                                    % nonce)
+                self.logger.warning('handle_attest_response: unknown nonce %r', nonce)
                 return True
             peer_uuid, _deadline, sent_epoch = sent
             responder_uuid = str(getattr(message.from_whom, 'uuid', '') or '')
@@ -1280,8 +1331,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 # Right nonce, wrong node — someone else answering for the
                 # peer we asked.
                 self.logger.warning('handle_attest_response: nonce %s answered '
-                                    'by %s, expected %s'
-                                    % (nonce, responder_uuid, peer_uuid))
+                                    'by %s, expected %s', nonce, responder_uuid, peer_uuid)
                 self._report_attestation(queues, peer_uuid, 0.0, False)
                 return True
             claimed = 0.0
@@ -1303,7 +1353,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             in_window = bool(claimed) and abs(tick - claimed) <= self._ATTEST_WINDOW_SEC
             if claimed and not in_window:
                 self.logger.warning('handle_attest_response: stamp %r outside '
-                                    'acceptance window (now %r)' % (claimed, tick))
+                                    'acceptance window (now %r)', claimed, tick)
             attested = claimed if (verified and in_window) else 0.0
             sample = self._record_clock_sample(peer_uuid, sent_epoch,
                                                payload, recv_epoch)
@@ -1341,18 +1391,14 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 # Arithmetically impossible timings: the peer's two readings
                 # span more than the whole round trip. Worth saying out loud —
                 # it means a stepped clock or a dishonest responder.
-                self.logger.warning('clock sample from %s is impossible: %s'
-                                    % (peer_uuid, sample.describe()))
+                self.logger.warning('clock sample from %s is impossible: %s', peer_uuid, sample.describe())
             elif sample.exceeds(self._max_cohort_skew):
                 self.logger.warning(
                     'clock skew beyond bound: %s (bound %.3fs from %s) '
                     '[advisory: timestamps from this peer are not comparable '
-                    'with ours]'
-                    % (sample.describe(),
-                       self._max_cohort_skew.total_seconds(),
-                       self._max_cohort_skew_src))
+                    'with ours]', sample.describe(), self._max_cohort_skew.total_seconds(), self._max_cohort_skew_src)
             else:
-                self.logger.debug('clock sample: %s' % sample.describe())
+                self.logger.debug('clock sample: %s', sample.describe())
             return sample
         except Exception as err:
             self.report_exception(err, '_record_clock_sample')
@@ -1394,7 +1440,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         for nonce in expired:
             peer_uuid, _deadline, _sent_epoch = self._attest_sent.pop(nonce)
             self.logger.debug('attest pull to %s unanswered; reporting '
-                              'unattended' % peer_uuid)
+                              'unattended', peer_uuid)
             self._report_attestation(queues, peer_uuid, 0.0, False)
 
     def _record_peers(self, queues):
@@ -1556,7 +1602,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             # stand on their own and normal admission proceeds.
             pass
 
-    def _broadcast_request_access(self, queues):
+    def _broadcast_request_access(self, queues, target_group=None):
         """Build and broadcast the `request_access` envelope on the open
         channel. Factored out of announce_identity so the group-merge
         path (see _merge_to_mesh) can re-broadcast without a phase change.
@@ -1582,12 +1628,114 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # the signing formula and no envelope/wire-vector change. Old peers emit
         # a 2-element payload; welcoming_committee tolerates both arities.
         self._refresh_operator_attestation()
-        msg_str = to_json_string((self.package_hash, self.capabilities.to_list(),
-                                  self._operator_attestation()))
+        # A 4th element names the cohort we are asking to join (ISSUES.md
+        # §10.2, runtime cross-group join). Absent -- the ordinary case -- this
+        # is the open request for a primary group and the payload is exactly
+        # what it always was, so a peer on an older build reads it unchanged;
+        # the same arity tolerance the operator attestation already relies on.
+        #
+        # It is a HINT for routing, not authority: every recipient checks it
+        # against its OWN group, and a request naming somebody else's cohort is
+        # simply not ours to answer. Nothing here grants anything.
+        payload = [self.package_hash, self.capabilities.to_list(),
+                   self._operator_attestation()]
+        if target_group:
+            payload.append(str(target_group))
+        msg_str = to_json_string(tuple(payload))
         message = Message(self.name, IdentityProtocol.announce,
                           msg_str, to_whom=Network.broadcast,
                           from_whom=self.identity, encrypt=False)
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
+
+    def request_cohort_join(self, queues, group_uuid):
+        """Ask a cohort we are NOT in to admit us, so a gateway can acquire a
+        child cohort at runtime instead of from a seeded key file
+        (ISSUES.md §10.2).
+
+        The cohort decides (user's call, 2026-08-13): this sends the ordinary
+        `request_access`, its members run the ordinary welcoming-committee
+        vote, and an admitting member delivers the group over the ordinary
+        `full_history`. Membership authority stays where it belongs, and no
+        node can talk its way into a cohort past a quorum that does not want
+        it.
+
+        What is recorded here is only that WE solicited it. Without that,
+        the arriving group would meet `handle_group_update`'s different-uuid
+        branch, which treats a second group as a partition to CONVERGE and
+        would replace our primary group with the cohort we just joined --
+        exactly backwards for a gateway. See ``_pending_joins``.
+        """
+        if group_uuid is None:
+            return False
+        key = str(group_uuid)
+        if self.group is not None and key == str(self.group.uuid):
+            return False  # already our primary group
+        if key in self.child_groups:
+            return False  # already gatewaying it
+        with self.lock:
+            self._pending_joins.add(key)
+        try:
+            self._broadcast_request_access(queues, target_group=key)
+            self.logger.info('Requested membership in cohort %s', key[:8])
+        except Full:
+            self.logger.error('request_cohort_join: Network queue full')
+            with self.lock:
+                self._pending_joins.discard(key)
+            return False
+        return True
+
+    def _join_authorized(self, new_id) -> bool:
+        """Whether a peer may even ASK this cohort to admit it (§10.2).
+
+        Two gates, both reused rather than invented (user's call,
+        2026-08-13):
+
+        * a **proved shared ZTA anchor** -- §10.5's rule, the same one
+          `_gateway_authorized` applies to federation and that deep
+          resolution applies to evidence signers. A peer holding only a
+          foreign agency's credential is not ours to admit.
+        * **out-ranking us**, matching `_derive_parent_gateway`'s direction:
+          a cohort is joined from ABOVE, by the node that will gateway it.
+          A peer at or below our rank asking to join is not forming a
+          hierarchy, and admitting it here would let any anchored peer
+          collect cohort keys sideways.
+
+        This runs BEFORE the vote, not instead of it. It bounds who may
+        solicit; the cohort still decides.
+        """
+        # Must run AFTER _zta_admit, which is what turns an ASSERTED
+        # credential into proved anchors on new_id. Reading them before that
+        # would be reading the requester's own claim about itself.
+        try:
+            policy = self._zta_policy()
+            enforcing = bool(policy.enabled and policy.require_at_admission)
+        except AttributeError:
+            enforcing = False
+        if enforcing:
+            own = self._own_zta_anchors()
+            # Same inert conditions as _gateway_authorized: with no anchors of
+            # our own there is nothing to compare against, and refusing every
+            # requester would break joins for non-ZTA deployments rather than
+            # protect anything.
+            if own:
+                proved = set(getattr(new_id, 'zta_anchors', None) or [])
+                if not (proved & own):
+                    self.logger.warning(
+                        'Join request from %s refused: proved anchors %s share '
+                        'none with ours %s',
+                        str(getattr(new_id, 'uuid', ''))[:8],
+                        sorted(proved) or '[]', sorted(own))
+                    return False
+        their_rank = self._member_rank(str(getattr(new_id, 'uuid', '')))
+        if not their_rank:
+            their_rank = getattr(new_id, 'effective_rank', None) or \
+                getattr(new_id, '_rank', 0) or 0
+        if their_rank <= self._own_rank():
+            self.logger.warning(
+                'Join request from %s refused: rank %s does not exceed ours '
+                '(%s)', str(getattr(new_id, 'uuid', ''))[:8], their_rank, self._own_rank())
+            return False
+        return True
 
     def announce_identity(self, queues):
         """
@@ -1640,7 +1788,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             accepted: tuple[Optional[Group], Optional[list[LinkedStep]]] = None, None
             unioned_peers: dict = {}  # uuid_str -> Identity
 
-            self.logger.debug('%d histories' % len(self.histories))
+            self.logger.debug('%d histories', len(self.histories))
             for hist_tpl in self.histories:
                 # Tolerate 2-tuple (legacy) and 3-tuple (group, steps,
                 # peer_idents) wire shapes.
@@ -1706,7 +1854,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                         self.logger.debug('No history/group key: generate my own.')
                         self.group = Group.initialize({self.identity.uuid: self.identity.address},
                                                       names.random_name())
-                    self.logger.debug('Generated group: %s' % self.group.nickname)
+                    self.logger.debug('Generated group: %s', self.group.nickname)
                     self._record_group(queues)
                     # Mark self-bootstrap so a late-arriving `full_history`
                     # from a real mesh triggers the merge path in
@@ -1732,6 +1880,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if message.function == IdentityProtocol.history:
             self.logger.debug('Received existing history')
             hist_tpl = from_json_string(message.obj)  # from self._peer_accepted()
+            # A history answering a cohort join WE solicited carries that
+            # cohort's group. It must not reach choose_group / _merge_to_mesh:
+            # those decide which group is OUR primary one, and the whole point
+            # of a gateway joining a child cohort is that its primary group
+            # stays what it was. Adopted as a child group instead, and only
+            # when we actually asked for this specific cohort.
+            adopted = self._adopt_solicited_group(queues, hist_tpl)
+            if adopted:
+                return True
             shape = ('3tuple' if isinstance(hist_tpl, (list, tuple))
                      and len(hist_tpl) >= 3 else '2tuple')
             _probes.counter('id.receive_history', 'arrived', shape)
@@ -1752,6 +1909,45 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 self._spawn(self.choose_group, args=(queues,))
             return True
         return False
+
+    def _adopt_solicited_group(self, queues, hist_tpl) -> bool:
+        """If ``hist_tpl`` carries a cohort we asked to join, adopt it as a
+        child group and return True (§10.2).
+
+        Gated on ``_pending_joins``, so an unsolicited history is never
+        adopted this way -- otherwise any peer could hand us a group and
+        silently install itself in our tree. Returning True means the ordinary
+        primary-group path is skipped, which is the point: we already have a
+        primary group.
+        """
+        try:
+            if not isinstance(hist_tpl, (list, tuple)) or not hist_tpl:
+                return False
+            with self.lock:
+                pending = set(self._pending_joins)
+            if not pending:
+                return False
+            raw = hist_tpl[0]
+            group = Group.from_canonical(raw) if isinstance(raw, dict) else raw
+            key = str(getattr(group, 'uuid', '') or '')
+            if key not in pending:
+                return False
+            if not getattr(group, 'owns_private_key', False):
+                # A public-only group cannot decrypt cohort traffic, so
+                # adopting it would leave us a member that can hear nothing.
+                # Refuse and stay pending rather than record a half-join.
+                self.logger.warning(
+                    'Join answer for %s carried no shared key; ignoring', key[:8])
+                return False
+            with self.lock:
+                self._pending_joins.discard(key)
+            self._adopt_child_group(queues, group)
+            self.logger.info('Joined cohort %s at runtime (%d member(s))', key[:8], len(getattr(group, '_address_map', {}) or {}))
+            _probes.counter('id.join', 'adopted')
+            return True
+        except Exception as err:
+            self.logger.warning('Could not adopt solicited group: %s', err)
+            return False
 
     def _merge_to_mesh(self, queues):
         """Merge from a self-bootstrap group of one into a real mesh.
@@ -1800,8 +1996,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self.merging = False
                 return
             self.group, hist = accepted
-            self.logger.info('Merging self-bootstrap into mesh group %s' %
-                             getattr(self.group, 'nickname', '?'))
+            self.logger.info('Merging self-bootstrap into mesh group %s', getattr(self.group, 'nickname', '?'))
             self._record_group(queues)
             # Partition-recovery cleanup: this is the typical exit path
             # for a successful partition-recovery probe → request_access
@@ -1859,9 +2054,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 with self.lock:
                     if vote in self.confirmed_block:
                         self.confirmed_block.remove(vote)
-                self.logger.debug('I voted for %s' % blob.identity.nickname)
+                self.logger.debug('I voted for %s', blob.identity.nickname)
             else:
-                self.logger.debug('I did not vote for %s' % blob.identity.nickname)
+                self.logger.debug('I did not vote for %s', blob.identity.nickname)
             # Short wait for other votes to arrive before finalizing
             start = now()
             while (now() - start).total_seconds() <= self.vote_timeout:
@@ -1876,7 +2071,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
     def _peer_accepted(self, queues, blob: IdentityObj, amnesia=False):
         if self.group is None:  # too early
             return
-        self.logger.debug('Process accepted peer: %s (%s)' % (blob.identity.nickname, amnesia))
+        self.logger.debug('Process accepted peer: %s (%s)', blob.identity.nickname, amnesia)
 
         # inform existing group members about the new peer;  to self.handle_confirm_peer()
         # New-peer identity rides as the DRY canonical public-identity payload
@@ -1911,6 +2106,14 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # (shared byte-shape with C public_identity_to_json) so the joining
         # peer — including a C node — can parse the existing roster. (Was
         # p.publish(), the ConfigJSONEncoder form C cannot read.)
+        # Rotate the shared key BEFORE the joiner is handed the group
+        # (ISSUES.md §10.2, user's call 2026-08-13). The order is the whole
+        # point: the joiner receives only the new key, so cohort ciphertext it
+        # recorded before being admitted stays closed to it. Existing members
+        # are handed the new key by the _update_group below, and keep decrypting
+        # old-key traffic through Group.PREVIOUS_KEY_GRACE while that
+        # propagates -- a rotation is not synchronous across a cohort.
+        self._rotate_group_key(queues)
         peers_payload = [public_identity_to_canonical(p) for p in self.peers.all]
         # Group slot travels as the DRY canonical flat dict (shared byte-shape
         # with C's group_to_json) so a C peer can parse it and recover the
@@ -1920,8 +2123,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         msg_str = to_json_string((self.group.to_canonical(), self._history.recite(),
                                   peers_payload))
         message = Message(self.name, IdentityProtocol.history, msg_str, to_whom=blob.identity)
-        self.logger.debug('Send full history (+%d peer identities)' %
-                          len(peers_payload))
+        self.logger.debug('Send full history (+%d peer identities)', len(peers_payload))
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
 
         if not amnesia:  # otherwise, already in listings
@@ -2191,6 +2393,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # Never trust the peer-advertised operator_bound: start False and earn
         # True only via operator-anchor verification below.
         self._mark_operator_bound(new_id, False)
+        self._zta_standing_pending = None
         # Same rule for the OPT-IN guardian identity, with one wrinkle: the claimed
         # key is part of the pre-image the operator signed, so the gate needs it —
         # it moves aside and the peer's own copy is cleared. A stored peer with a
@@ -2345,7 +2548,16 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self._zta_capped.add(new_id.uuid)
                 except Exception:
                     pass
+                self._zta_standing_pending = (
+                    STANDING_CAPPED, policy.ddil_fallback_reputation_cap, None,
+                    'admitted on an unbound credential (binding_mode %s)' % mode)
                 return 'admit_capped'
+            # Proved: a credential verified against a configured anchor AND is
+            # bound to this identity. This is the only path that anchors the
+            # §10.5 unwind -- everything a peer earns after this moment is
+            # standing a later failure calls into question.
+            self._zta_standing_pending = (
+                STANDING_PROVED, None, time.time(), 'verified at admission')
             return 'admit'
         # Nothing usable. A verifier that could not answer is a DDIL condition and
         # gets the fallback; an answer we did not like is a rejection.
@@ -2362,6 +2574,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self._zta_capped.add(new_id.uuid)
                 except Exception:
                     pass
+                self._zta_standing_pending = (
+                    STANDING_CAPPED, policy.ddil_fallback_reputation_cap, None,
+                    'DDIL fallback (%s): %s' % (deferred.status.value,
+                                                deferred.reason))
                 return 'admit_capped'
             self.logger.warning('ZTA: verification unavailable for %s (%s) and DDIL '
                                 'fallback disabled; rejecting', nick,
@@ -2402,6 +2618,17 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 parts = from_json_string(message.obj)
                 ph, caps = parts[0], parts[1]
                 attestation = parts[2] if len(parts) > 2 and isinstance(parts[2], dict) else {}
+                # Optional 4th element: the cohort the requester is asking to
+                # join (§10.2). Absent = the ordinary open request, handled
+                # exactly as before. Present and naming somebody else's cohort
+                # = not ours to answer, so drop it here rather than admitting
+                # into OUR group a peer that asked for a different one.
+                join_target = (str(parts[3]) if len(parts) > 3 and parts[3]
+                               else '')
+                if join_target:
+                    if self.group is None or join_target != str(self.group.uuid):
+                        return True
+                    _probes.counter('id.join', 'solicited')
                 if attestation:
                     self._apply_operator_attestation(new_id, attestation)
                 if new_id == self.identity:
@@ -2424,7 +2651,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 id_obj = IdentityObj(new_id, new_id.uuid)
                 existing = self.peers.find_by_uuid(new_id.uuid)
                 if new_id == existing:  # don't care if it's a different address
-                    self.logger.debug('Amnesiac peer: %s' % new_id.nickname)
+                    self.logger.debug('Amnesiac peer: %s', new_id.nickname)
                     # Late-arrival cap recovery: if this peer was added
                     # to self.peers via a confirm broadcast that arrived
                     # before its announce (no_prior_potential path), its
@@ -2455,9 +2682,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                         self._peer_accepted(queues, id_obj, amnesia=True)
                     return True
 
-                self.logger.debug('Received new identity: %s - %s - %s' % (new_id.nickname, new_id.address, new_id.uuid))
+                self.logger.debug('Received new identity: %s - %s - %s', new_id.nickname, new_id.address, new_id.uuid)
                 if not id_obj.validate():
-                    self.logger.warning('Invalid identity object from %s' % new_id.nickname)
+                    self.logger.warning('Invalid identity object from %s', new_id.nickname)
                     return True
                 # ZTA credential check at admission (parity with the C gate in
                 # handle_welcoming_committee). A forged/unsigned/expired/
@@ -2467,6 +2694,18 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 # is disabled. See doc/architecture/zta-python-parity.md.
                 zta_decision = self._zta_admit(new_id)
                 if zta_decision == 'reject':
+                    return True
+                # Hand the finding to reputation BEFORE the peer can be scored:
+                # a ceiling that arrives after the first commit has already let
+                # the thing it bounds happen (§10.5).
+                self._publish_zta_decision(queues, new_id)
+                # A targeted join is bounded before the vote: the requester
+                # must prove an anchor we share and out-rank this cohort
+                # (§10.2). Deliberately after _zta_admit, which is what proves
+                # the anchors this reads, and deliberately BEFORE the vote --
+                # it bounds who may solicit, it does not decide.
+                if join_target and not self._join_authorized(new_id):
+                    _probes.counter('id.join', 'refused')
                     return True
                 # Cache the announcement on every peer (regardless of
                 # border_guard_mode). Without this, non-welcomers later
@@ -2486,6 +2725,49 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return True
         return False
 
+    def _rotate_group_key(self, queues):
+        """Mint a new shared key for our own group and hand it to every
+        current member.
+
+        Only the node performing an admission calls this, and only for a group
+        whose private key it holds -- a rotation minted by a node that cannot
+        already decrypt the cohort would fork it into two halves that cannot
+        hear each other.
+
+        Distribution rides the EXISTING per-member `group_key_update`, which
+        already carries the private seed to each member individually
+        (``to_canonical`` emits it when we own it, and the message is encrypted
+        to that member). What makes it safe to ADOPT on the far side is the
+        epoch: see ``Group.accept_rotation``.
+
+        Best-effort by design. A rotation that fails to reach a member costs
+        that member the grace window, not correctness -- and refusing to admit
+        a peer because a key update could not be queued would be a worse
+        trade.
+        """
+        group = self.group
+        if group is None or not getattr(group, 'owns_private_key', False):
+            return False
+        try:
+            epoch = group.rotate_key()
+        except Exception as err:
+            self.logger.warning('Could not rotate group key: %s', err)
+            return False
+        self.logger.info('Rotated group key to epoch %d (%d member(s))', epoch, len(self.peers.all))
+        _probes.counter('id.group', 'key_rotated', str(epoch))
+        try:
+            grp_msg = to_json_string(group.to_canonical())
+            for peer in list(self.peers.all):
+                message = Message(self.name, IdentityProtocol.update, grp_msg,
+                                  to_whom=peer, from_whom=self.identity)
+                queues[CfgIds.network].put(message, block=True,
+                                           timeout=self.q_cadence)
+        except Full:
+            self.logger.error('_rotate_group_key: Network queue full')
+        except Exception as err:
+            self.logger.warning('Could not distribute rotated key: %s', err)
+        return True
+
     def _update_group(self, queues, group, level):
         # DRY canonical flat wire form (shared byte-shape with C's
         # group_to_json) so a C co-member can parse the group_key_update —
@@ -2498,7 +2780,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         for to_peer in list(self.peers.hierarchy[level].values()):
             message = Message(self.name, IdentityProtocol.update, grp_msg, to_whom=to_peer)
             queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
-            self.logger.debug('Sent group %s to %s (%s)' % (group.nickname, to_peer.nickname, to_peer.address))
+            self.logger.debug('Sent group %s to %s (%s)', group.nickname, to_peer.nickname, to_peer.address)
 
     def _populate_peers_from_history(self, queues, peer_idents):
         """Seed self.peers from a welcomer's bundled peer list.
@@ -2551,7 +2833,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if newly_added:
             self._record_peers(queues)
             self.logger.debug('History bundle: added %d previously '
-                              'unknown peer identities' % len(newly_added))
+                              'unknown peer identities', len(newly_added))
             self._announce_self_to_bundled_peers(queues, newly_added)
 
     def _announce_self_to_bundled_peers(self, queues, peer_idents):
@@ -2577,7 +2859,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                                       self.capabilities.to_list()))
         except Exception as err:
             self.logger.error(
-                '_announce_self_to_bundled_peers: payload build failed: %s' % err)
+                '_announce_self_to_bundled_peers: payload build failed: %s', err)
             return
         sent = 0
         for peer in peer_idents:
@@ -2594,7 +2876,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     '_announce_self_to_bundled_peers: Network queue full')
         if sent:
             self.logger.debug(
-                'Announced self to %d bundled peers' % sent)
+                'Announced self to %d bundled peers', sent)
 
     def _confirm_group_membership(self, queues, identity, level=None):
         """Propagate group membership + key to a CONFIRMED peer (§3.1-a).
@@ -2671,7 +2953,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 if blob.identity.uuid == peer.uuid or \
                         blob.identity.signature == peer.signature or \
                         blob.identity.encryptor == peer.encryptor:
-                    self.logger.warning('New identity (%s) using peer id (%s)' % (blob.identity.nickname, peer.nickname))
+                    self.logger.warning('New identity (%s) using peer id (%s)', blob.identity.nickname, peer.nickname)
                     return None
             proof: AgreementProof = self._history.prove(blob)
             sigmsg = self.identity.sign(proof)
@@ -2738,8 +3020,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             # If we proposed this peer (present in our peer_potentials),
             # abstain from voting to avoid self-endorsement bias.
             if vote[0].identity.uuid in self.peer_potentials:
-                self.logger.debug('Abstaining from vote on self-proposed peer %s' %
-                                  vote[0].identity.nickname)
+                self.logger.debug('Abstaining from vote on self-proposed peer %s', vote[0].identity.nickname)
                 return
             msg_str = to_json_string(vote)  # to self.count_vote()
             message = Message(self.name, IdentityProtocol.vote, msg_str, to_whom=self.group)
@@ -2870,8 +3151,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self._provisional_confirmations.pop(peer_key, None)
             else:
                 self.logger.debug(
-                    'Peer %s provisional: %d/%d confirms' %
-                    (peer.nickname, len(confirmers), max(1, self._admission_quorum)))
+                    'Peer %s provisional: %d/%d confirms', peer.nickname, len(confirmers), max(1, self._admission_quorum))
             return True
         return False
 
@@ -3104,10 +3384,183 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 sent += 1
             _probes.counter('peer.set', 'caps_resync_query', str(sent))
             self.logger.debug(
-                'Caps resync: re-queried %d cap-less peer(s)' % sent)
+                'Caps resync: re-queried %d cap-less peer(s)', sent)
         except Exception as err:
             _probes.counter('peer.set', 'caps_resync_exc')
             self.report_exception(err, '_periodic_caps_resync')
+
+    # --- ZTA periodic re-verification (ISSUES §10.5) -----------------------
+
+    #: How often the sweep WAKES to ask whether the policy's re-verification
+    #: interval has elapsed. Distinct from the interval itself
+    #: (``reverify_interval_sec``, default 3600): the check is cheap and the
+    #: verification is not, so a short wake keeps the sweep responsive to a
+    #: freshly-tuned policy without re-walking every chain every time.
+    _ZTA_REVERIFY_CHECK_SEC = 30.0
+
+    def _periodic_zta_reverify(self, queues):
+        """Re-verify admitted peers' credentials, and act on what changed.
+
+        Python's half of the C ``zta_process.c`` loop (``_reverify_peers`` +
+        ``_resolve_deferred``). Until this existed, background re-verification
+        was C-only: a Python node checked a credential once, at admission, and
+        never again — so a credential revoked *afterwards* was never detected
+        at all, and a peer admitted under the DDIL fallback stayed capped for
+        ever even once the infrastructure came back. Both halves matter; the
+        second is the one a disconnected deployment feels.
+
+        It lives in IdentityProcess rather than in a ZTA process of its own
+        because that is where Python's ZTA already lives (``_zta_admit``, the
+        verifier cache, the peer table). C has a separate process because its
+        ZTA subsystem does — see zta-python-parity.md; the split is a
+        difference in structure, not in behavior.
+
+        **Re-verification uses the admission rules, not a narrower check.** It
+        walks ``_zta_match_anchors`` — the same any-of anchor walk
+        ``_zta_admit`` uses — so "still proved" means "would still be admitted
+        today". C's ``_reverify_peers`` asks the narrower
+        ``check_revocation(hash)`` for an already-admitted peer and keeps the
+        full walk for ``_resolve_deferred``; doing the full walk in both cases
+        is a superset (it also catches an anchor that has since been removed
+        from the policy) and cannot admit anything the narrower check would
+        reject.
+
+        **Expiry is graded more leniently than revocation**, mirroring C: a
+        revoked or rejected credential is evidence of a lie, an expired one is
+        evidence of a lapse, so the ceiling the peer falls under differs.
+        """
+        policy = self._zta_policy()
+        if not policy.enabled or policy.reverify_interval_sec <= 0:
+            return
+        tick = now()
+        if (self._last_zta_reverify is not None
+                and (tick - self._last_zta_reverify).total_seconds()
+                < policy.reverify_interval_sec):
+            return
+        self._last_zta_reverify = tick
+        try:
+            anchors = self._zta_anchor_verifiers()
+            if not anchors:
+                return
+            with self.lock:
+                if self.peers is None:
+                    return
+                self_uuid = str(self.identity.uuid)
+                peers = [p for p in self.peers.all
+                         if str(p.uuid) != self_uuid]
+            checked = failed = resolved = 0
+            for peer in peers:
+                outcome = self._zta_reverify_one(peer, anchors, policy)
+                if outcome is None:
+                    continue        # no credential, or the verifier could not answer
+                checked += 1
+                status, ceiling, verified_at, reason = outcome
+                if status == STANDING_FAILED:
+                    failed += 1
+                    self.logger.warning(
+                        'ZTA: re-verification FAILED for %s: %s',
+                        getattr(peer, 'nickname', '?'), reason)
+                elif str(peer.uuid) in self._zta_capped:
+                    # A capped peer that now verifies: the DDIL condition has
+                    # cleared. This is the branch C's _resolve_deferred only
+                    # logs -- the cap it should lift was never enforced there,
+                    # so there was nothing to lift.
+                    resolved += 1
+                    self._zta_capped.discard(peer.uuid)
+                    self.logger.info(
+                        'ZTA: deferred verification resolved for %s: VERIFIED',
+                        getattr(peer, 'nickname', '?'))
+                self._publish_zta_standing(queues, peer.uuid, status, ceiling,
+                                           verified_at, reason)
+            if checked:
+                _probes.counter('id.zta', 'reverified', str(checked))
+            if failed:
+                _probes.counter('id.zta', 'reverify_failed', str(failed))
+            if resolved:
+                _probes.counter('id.zta', 'reverify_resolved', str(resolved))
+            self.logger.debug(
+                'ZTA re-verification: %d checked, %d failed, %d resolved',
+                checked, failed, resolved)
+        except Exception as err:
+            _probes.counter('id.zta', 'reverify_exc')
+            self.report_exception(err, '_periodic_zta_reverify')
+
+    def _zta_reverify_one(self, peer, anchors, policy):
+        """One peer's re-verification outcome as a standing tuple, or None.
+
+        None means "say nothing": the peer carries no credential to check, or
+        every anchor deferred (a DDIL condition, which is not a finding about
+        the peer). Publishing a standing in either case would overwrite a
+        verdict with the absence of one.
+        """
+        creds = self._zta_credentials(peer)
+        if not creds:
+            return None
+        mode = policy.binding_mode
+        san_template = getattr(policy, 'san_uri_template', '') or ''
+        worst = None       # an affirmative failure, if any anchor reported one
+        unbound = False    # chained, but cannot prove entitlement to present it
+        for der, binding, _issuer in creds:
+            matched, _is_op, failure, deferred = self._zta_match_anchors(
+                der, anchors)
+            if not matched:
+                if failure is not None and failure is not deferred:
+                    worst = failure
+                continue
+            # The chain walk does NOT consult the CRL/OCSP source -- it mirrors
+            # C's x509_verify_credential, which checks the chain and expiry and
+            # nothing else. Revocation has to be asked for separately, exactly
+            # as the admission gate asks. Skipping this would make the whole
+            # sweep blind to the one condition it exists to catch: a revoked
+            # certificate still walks its chain perfectly well.
+            revoked = None
+            for _name, verifier, result in matched:
+                rev = verifier.check_revocation(result.credential_hash)
+                if rev.status is ZtaStatus.REVOKED:
+                    revoked = rev
+                    break
+            if revoked is not None:
+                worst = revoked
+                continue
+            # Genuine and unrevoked -- but is this node still entitled to
+            # present it? Re-checked rather than assumed: the answer can change
+            # under the node's feet when an operator tightens `binding_mode`.
+            bound = identity_is_bound(
+                peer, der, binding, san_template,
+                operator_pubkey=getattr(peer, 'operator_pubkey', b'') or b'',
+                operator_key_binding=getattr(peer, 'operator_key_binding',
+                                             b'') or b'')
+            if not bound and mode == BINDING_MODE_REQUIRE:
+                # Unusable under this policy: the peer would not be admitted
+                # today. Not forgery, so it is graded as a failure of proof
+                # rather than of honesty -- but it is no longer `proved`.
+                unbound = True
+                continue
+            if not bound and mode == BINDING_MODE_PREFER:
+                # Exactly the standing admission gave it: chained, unbound,
+                # capped. Re-reporting it keeps a cap that the sweep would
+                # otherwise silently lift on its first pass.
+                return (STANDING_CAPPED, policy.ddil_fallback_reputation_cap,
+                        None, 'unbound credential (binding_mode %s)' % mode)
+            # Any-of: one credential still chaining, unrevoked and bound is
+            # enough, exactly as at admission.
+            return (STANDING_PROVED, None, time.time(),
+                    're-verified against %s' % matched[0][0])
+        if worst is None and unbound:
+            return (STANDING_FAILED,
+                    min(1.0, max(0.0, 1.0 - policy.revocation_reputation_penalty
+                                 * 0.5)), None,
+                    'no bound credential under binding_mode %s' % mode)
+        if worst is None:
+            return None    # nobody could answer — DDIL, not a verdict
+        penalty = policy.revocation_reputation_penalty
+        if worst.status is ZtaStatus.EXPIRED:
+            # Lapsed, not lying. Mirrors the C twin's half-weight penalty for
+            # EXPIRED in _reverify_peers.
+            penalty *= 0.5
+        ceiling = min(1.0, max(0.0, 1.0 - penalty))
+        return (STANDING_FAILED, ceiling, None,
+                '%s: %s' % (worst.status.value, worst.reason))
 
     # --- Identity backfill for cold/late joiners ---------------------------
     # group.addresses can list members whose full Identity never reached us:
@@ -3142,7 +3595,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                             str(group_size - len(have)))
             self.logger.debug(
                 'Identity resync: querying group for %d missing member '
-                'identity/ies' % (group_size - len(have)))
+                'identity/ies', group_size - len(have))
         except Full:
             _probes.counter('peer.set', 'identity_resync_q_full')
             self.logger.error('_periodic_identity_resync: Network queue full')
@@ -3214,7 +3667,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 _probes.counter('peer.set', 'identity_response_added')
                 self.logger.debug(
                     'Identity resync: backfilled identity for group member '
-                    '%s' % getattr(ident, 'nickname', str(ident.uuid)))
+                    '%s', getattr(ident, 'nickname', str(ident.uuid)))
             else:
                 _probes.counter('peer.set', 'identity_response_redundant')
         except Exception as err:
@@ -3249,7 +3702,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             if self._history._validate(branch):
                 self._history.merge(branch)
             else:
-                self.logger.warning('Invalid history diff from %s' % name)
+                self.logger.warning('Invalid history diff from %s', name)
             return True
         return False
 
@@ -3268,7 +3721,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             payload = from_json_string(message.obj) if isinstance(
                 message.obj, (str, bytes)) else message.obj
             if not (isinstance(payload, (list, tuple)) and len(payload) >= 2):
-                self.logger.warning('handle_tier_update: bad payload %r' % payload)
+                self.logger.warning('handle_tier_update: bad payload %r', payload)
                 return True
             peer_uuid_str, new_tier = str(payload[0]), int(payload[1])
             target = None
@@ -3291,9 +3744,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             old = getattr(target, '_tier', 0)
             if old != new_tier:
                 target._tier = new_tier
-                self.logger.debug('Tier update for %s: %d -> %d' %
-                                  (getattr(target, 'nickname', peer_uuid_str),
-                                   old, new_tier))
+                self.logger.debug('Tier update for %s: %d -> %d', getattr(target, 'nickname', peer_uuid_str), old, new_tier)
         except Exception as err:
             self.report_exception(err, 'handle_tier_update')
         return True
@@ -3425,8 +3876,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                                        timeout=self.q_cadence)
             _probes.counter('peer.set', 'partition_probe_sent')
             self.logger.debug(
-                'Partition probe broadcast (group=%s size=%d trigger=%s)' %
-                (self.group.nickname, group_size, from_addr))
+                'Partition probe broadcast (group=%s size=%d trigger=%s)', self.group.nickname, group_size, from_addr)
         except Full:
             _probes.counter('peer.set', 'partition_probe_q_full')
             self.logger.error('handle_partition_signal: Network queue full')
@@ -3515,9 +3965,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self.logger.info(
                         'Partition recovery (from probe): adopting group %s '
                         '(size=%d vs our %d), sent request_access '
-                        '(probe from %s@%s)' %
-                        (group_uuid, their_size, our_group_size,
-                         sender_uuid, payload.get('from_address')))
+                        '(probe from %s@%s)', group_uuid, their_size, our_group_size, sender_uuid, payload.get('from_address'))
             cutoff = now()
             last = self._partition_response_cooldown.get(sender_uuid)
             if (last is not None
@@ -3547,8 +3995,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                                        timeout=self.q_cadence)
             _probes.counter('peer.set', 'partition_response_sent')
             self.logger.debug(
-                'Partition response broadcast (to=%s our_group=%s/%d)' %
-                (sender_uuid, self.group.nickname, our_group_size))
+                'Partition response broadcast (to=%s our_group=%s/%d)', sender_uuid, self.group.nickname, our_group_size)
         except Full:
             _probes.counter('peer.set', 'partition_response_q_full')
             self.logger.error('handle_partition_probe: Network queue full')
@@ -3618,9 +4065,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             _probes.counter('peer.set', 'partition_recovery_initiated')
             self.logger.info(
                 'Partition recovery: adopting group %s (size=%d > our %d), '
-                'sent request_access toward leader %s@%s' %
-                (their_group_uuid, theirs, our_size,
-                 leader_uuid, leader_address))
+                'sent request_access toward leader %s@%s', their_group_uuid, theirs, our_size, leader_uuid, leader_address)
         except Full:
             _probes.counter('peer.set', 'partition_request_access_q_full')
             self.logger.error('handle_partition_response: Network queue full')
@@ -3661,6 +4106,26 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             if mine is None or theirs is None:
                 return True
             if mine.uuid == theirs.uuid:
+                # A rotated key supersedes ours (§10.2). Checked before the
+                # membership comparison because a rotation carries no
+                # membership change of its own, and a smaller-or-equal address
+                # map would otherwise take the quiet no-op path below and drop
+                # the new key on the floor.
+                #
+                # Only from a VERIFIED message: the epoch decides whether a key
+                # is newer, not whether its sender had any business rotating,
+                # and an unauthenticated update naming a higher epoch would be
+                # a way to hand a cohort a key of the attacker's choosing.
+                if theirs.key_epoch > mine.key_epoch:
+                    if not getattr(message, 'verified', False):
+                        self.logger.warning(
+                            'Rejecting unverified group key rotation from %s', message.from_whom)
+                        return True
+                    if mine.accept_rotation(theirs):
+                        self.logger.info(
+                            'Adopted rotated group key, epoch %d', mine.key_epoch)
+                        _probes.counter('id.group', 'key_adopted',
+                                        str(mine.key_epoch))
                 # Same group: adopt strictly larger membership, otherwise no-op.
                 if len(theirs.addresses) > len(mine.addresses):
                     adopt = True
@@ -3693,7 +4158,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 if theirs.owns_private_key or not mine.owns_private_key:
                     # Normal adopt: `theirs` carries the shared private key, or
                     # we hold no key to lose — take it wholesale.
-                    self.logger.debug('Replace %s group with %s group' % (mine.nickname, theirs.nickname))
+                    self.logger.debug('Replace %s group with %s group', mine.nickname, theirs.nickname)
                     self.group = theirs
                 elif mine.uuid == theirs.uuid:
                     # `theirs` is PUBLIC-ONLY but has a larger membership for OUR
@@ -3704,14 +4169,14 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     # divergence that left cold-joining C nodes keyless (right
                     # uuid, wrong key bytes). C's handle_group_update already
                     # keeps its encryptor. See [[dod-microdrone-targets-live-vs-playback]].
-                    self.logger.debug('Adopt %s membership; keep our group key' % theirs.nickname)
+                    self.logger.debug('Adopt %s membership; keep our group key', theirs.nickname)
                     self.group.adopt_membership(theirs)
                 else:
                     # `theirs` is a DIFFERENT, public-only group. Adopting it would
                     # abandon our key-bearing group for one we cannot decrypt;
                     # refuse and wait for a private-bearing full_history / update
                     # to converge. (Quiet no-op — don't echo, that's the flood.)
-                    self.logger.debug('Refuse public-only group %s over our keyed group' % theirs.nickname)
+                    self.logger.debug('Refuse public-only group %s over our keyed group', theirs.nickname)
                     return True
                 self._record_group(queues)
                 # Partition recovery completes here whenever the adopted
@@ -3738,7 +4203,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         """
         self.lock = threading.Lock()  # initialize here to get past pickling
         phase = self.phase
-        self.logger.debug('Phase %s' % self.phase)
+        self.logger.debug('Phase %s', self.phase)
         self.acquire_capabilities(queues)
         self.announce_identity(queues)
         # Seed-assisted dual membership: a gateway adopts its child
@@ -3760,7 +4225,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         while self.keep_running(signal):
             try:
                 if self.phase != phase:
-                    self.logger.debug('Phase %s' % self.phase)
+                    self.logger.debug('Phase %s', self.phase)
                     phase = self.phase
                 self.vote_response(queues)
 
@@ -3785,6 +4250,18 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     # are quiet no-ops on a converged leaf.
                     self._request_hierarchy(queues)
                     self._refresh_hierarchy(queues)
+
+                # ZTA background re-verification (§10.5). Gated on its own,
+                # much longer, POLICY-supplied interval -- the wake below is
+                # only how often we ask whether that interval has elapsed, so
+                # a chain walk per peer does not ride the 20 s sweep above.
+                # Mirrors the C zta_process loop; the sweep itself is a no-op
+                # when the policy is disabled or the interval is 0.
+                if (self._last_zta_reverify_check is None
+                        or (tick - self._last_zta_reverify_check).total_seconds()
+                        >= self._ZTA_REVERIFY_CHECK_SEC):
+                    self._last_zta_reverify_check = tick
+                    self._periodic_zta_reverify(queues)
 
                 # Every iteration, not interval-gated: an attended-now pull
                 # must not outlive its deadline, in either direction — a pull
@@ -3827,4 +4304,4 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self._record_peers(queues)
             self.logger.debug('Final identity-state flush on shutdown')
         except Exception as err:
-            self.logger.warning('Final identity-state flush failed: %s' % err)
+            self.logger.warning('Final identity-state flush failed: %s', err)

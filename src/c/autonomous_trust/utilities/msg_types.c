@@ -75,6 +75,8 @@ size_t message_size(message_type_t type)
     case ZTA_REVOCATION_ALERT:
     case ZTA_VERIFICATION_RESULT:
         return sizeof(zta_event_msg_t);
+    case ZTA_STANDING:
+        return sizeof(zta_standing_msg_t);
 #endif
     default:
         return 0;
@@ -127,6 +129,8 @@ char *message_type_to_string(message_type_t type)
         return (char*)"ZTA_REVOCATION_ALERT";
     case ZTA_VERIFICATION_RESULT:
         return (char*)"ZTA_VERIFICATION_RESULT";
+    case ZTA_STANDING:
+        return (char*)"ZTA_STANDING";
 #endif
     default:
         return (char*)"";
@@ -175,6 +179,10 @@ message_type_t string_to_message_type(const char *str)
         return PEER_OBSERVED;
     if (strcmp(str, "PEER_REPUTATION") == 0)
         return PEER_REPUTATION;
+#ifdef AT_ZTA_ENABLED
+    if (strcmp(str, "ZTA_STANDING") == 0)
+        return ZTA_STANDING;
+#endif
     return -1;  // No matching message type found (all valid types are > 0)
 }
 
@@ -426,6 +434,14 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         memcpy(subdata, &msg->info.zta_event, subdata_len);
         break;
     }
+    case ZTA_STANDING:
+    {
+        subdata_len = sizeof(zta_standing_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.zta_standing, subdata_len);
+        break;
+    }
 #endif
     case UPDATE_PROPOSAL:
         /* UPDATE_PROPOSAL uses its own JSON serialization, not proto */
@@ -671,6 +687,9 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
     case ZTA_REVOCATION_ALERT:
     case ZTA_VERIFICATION_RESULT:
         COPY_FIXED_PAYLOAD(zta_event, zta_event_msg_t);
+        break;
+    case ZTA_STANDING:
+        COPY_FIXED_PAYLOAD(zta_standing, zta_standing_msg_t);
         break;
 #endif
     case UPDATE_PROPOSAL:

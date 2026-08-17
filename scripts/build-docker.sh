@@ -38,6 +38,27 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SRC_DIR="$REPO_DIR/src"
 AT_DIR="$SRC_DIR/autonomous-trust"
 
+# Where run_builder() parks the dev-only subtrees listed in AT_STASH_RELS while
+# conda-build walks a package dir (see run_builder for why they must move).
+#
+# It has to be OUTSIDE the bind-mounted package dir but is otherwise free, and
+# the choice matters: this was /tmp, and `mv` is only a rename WITHIN one
+# filesystem. With /tmp on a separate partition or a tmpfs -- the common case,
+# and true even in the dev sandbox -- every run copied ~1.3GB per package onto
+# that filesystem and back. A sibling of the package dirs is on the source tree's
+# own filesystem, so the move costs nothing. Both .dockerignore files exclude it,
+# so a strand can never reach a build context.
+STASH_ROOT="$SRC_DIR/.at-builder-stash"
+AT_STASH_RELS=("reactjs/node_modules" ".tox" ".venv" ".rustup")
+
+# Pinned conda toolchain (ISSUES.md §9.1): MINIFORGE_IMAGE / MINIFORGE_VERSION.
+# Absence is not fatal -- the Dockerfiles carry the same pin as ARG defaults.
+TOOLCHAIN_PINS="$REPO_DIR/config/cfg/toolchain-pins.env"
+if [[ -f "$TOOLCHAIN_PINS" ]]; then
+    # shellcheck source=../config/cfg/toolchain-pins.env
+    source "$TOOLCHAIN_PINS"
+fi
+
 # Defaults (from config/config.py)
 IMAGE_NAME="autonomous-trust"
 
@@ -108,6 +129,11 @@ fi
 # Source local registry helpers (push after build)
 source "$SCRIPT_DIR/local-registry.sh" 2>/dev/null || true
 
+# build_image() + reclaim_superseded_images(). Every target below rebuilds a
+# FIXED tag unconditionally -- no `docker image inspect` guard -- so each run of
+# this script orphans the previous generation of whatever it builds.
+source "$SCRIPT_DIR/image-prune.sh"
+
 # ---------------------------------------------------------------------------
 # Common build args
 # ---------------------------------------------------------------------------
@@ -122,6 +148,12 @@ common_build_args() {
     if [[ -n "$REGISTRY_URL" ]]; then
         args+=(--build-arg "REGISTRY_URL=$REGISTRY_URL")
     fi
+    # Pinned conda base image (ISSUES.md §9.1). The Dockerfiles carry the same
+    # value as an ARG default, so an un-passed build is still pinned; passing it
+    # keeps the pins file authoritative when the two are edited out of step.
+    if [[ -n "${MINIFORGE_IMAGE:-}" ]]; then
+        args+=(--build-arg "MINIFORGE_IMAGE=$MINIFORGE_IMAGE")
+    fi
     echo "${args[@]}"
 }
 
@@ -132,8 +164,7 @@ build_devel() {
     info "Building ${IMAGE_NAME}-devel ..."
     local args
     read -ra args <<< "$(common_build_args)"
-    docker build "${args[@]}" \
-        -t "${IMAGE_NAME}-devel" \
+    build_image "${IMAGE_NAME}-devel" "${args[@]}" \
         -f "$AT_DIR/Dockerfile-devel" \
         "$REPO_DIR"
     push_to_registry "${IMAGE_NAME}-devel" 2>/dev/null || true
@@ -143,8 +174,7 @@ build_test() {
     info "Building ${IMAGE_NAME}-test ..."
     local args
     read -ra args <<< "$(common_build_args)"
-    docker build "${args[@]}" \
-        -t "${IMAGE_NAME}-test" \
+    build_image "${IMAGE_NAME}-test" "${args[@]}" \
         -f "$AT_DIR/Dockerfile-test" \
         "$AT_DIR"
     push_to_registry "${IMAGE_NAME}-test" 2>/dev/null || true
@@ -154,8 +184,7 @@ build_full_devel() {
     info "Building ${IMAGE_NAME}-full-devel ..."
     local args
     read -ra args <<< "$(common_build_args)"
-    docker build "${args[@]}" \
-        -t "${IMAGE_NAME}-full-devel" \
+    build_image "${IMAGE_NAME}-full-devel" "${args[@]}" \
         -f "$SRC_DIR/Dockerfile-devel" \
         "$REPO_DIR"
     push_to_registry "${IMAGE_NAME}-full-devel" 2>/dev/null || true
@@ -165,11 +194,57 @@ build_builder() {
     info "Building package-builder ..."
     local args
     read -ra args <<< "$(common_build_args)"
-    docker build "${args[@]}" \
-        -t "package-builder" \
+    build_image "package-builder" "${args[@]}" \
         -f "$SRC_DIR/Dockerfile-build" \
         "$SRC_DIR"
     push_to_registry "package-builder" 2>/dev/null || true
+}
+
+# Restore whatever a previous run stranded. The EXIT/INT/TERM trap below covers
+# every ordinary failure, but not SIGKILL, an OOM kill, or a power loss -- and
+# the stash paths used to embed $$, so a strand was unreachable by the next run
+# (which minted a fresh name) and simply leaked ~1.3GB per kill. Deterministic
+# paths, mirroring the source layout, are what make this recovery possible.
+#
+# Runs before any stashing, so an interrupted run self-heals on the next build.
+reap_builder_stash() {
+    [[ -d "$STASH_ROOT" ]] || return 0
+    local pkg_dir pkg rel stashed dest
+    for pkg_dir in "$STASH_ROOT"/*; do
+        [[ -d "$pkg_dir" ]] || continue
+        pkg="$(basename "$pkg_dir")"
+        for rel in "${AT_STASH_RELS[@]}"; do
+            stashed="$pkg_dir/$rel"
+            [[ -e "$stashed" ]] || continue
+            dest="$SRC_DIR/$pkg/$rel"
+            if [[ -e "$dest" ]]; then
+                # Destination was recreated (a `poetry install`, an `npm i`)
+                # after the strand. Both copies are now real; deleting either is
+                # the operator's call, not this script's.
+                warn "stranded stash is redundant: $stashed"
+                warn "    ($dest exists again) -- left in place; remove it manually"
+                continue
+            fi
+            mkdir -p "$(dirname "$dest")"
+            mv "$stashed" "$dest"
+            info "restored $pkg/$rel stranded by an earlier interrupted run"
+        done
+    done
+    # Drop the now-empty skeleton (and STASH_ROOT itself when fully drained).
+    find "$STASH_ROOT" -depth -type d -empty -delete 2>/dev/null || true
+}
+
+# Build the restore command as a STRING with every path already expanded.
+# Reads run_builder's locals by bash's dynamic scoping, which is safe HERE
+# because run_builder is on the stack when the trap is installed -- whereas the
+# trap itself can fire once that frame is gone (errexit propagating out of
+# run_builder's caller), so the trap must not depend on those locals surviving.
+_stash_restore_cmd() {
+    local i out=""
+    for i in "${!_stash_from[@]}"; do
+        out+="[[ -e '${_stash_from[$i]}' && ! -e '${_stash_to[$i]}' ]] && mkdir -p \"\$(dirname '${_stash_to[$i]}')\" && mv '${_stash_from[$i]}' '${_stash_to[$i]}'; "
+    done
+    printf '%s' "$out"
 }
 
 # Run the package-builder image against each source package that has a
@@ -256,27 +331,33 @@ run_builder() {
         #     symlink - ignoring copy" warnings for each.
         #   - .rustup: the Rust toolchain dir (large; internal symlinks).
         # A sibling location inside the dir still gets walked, so the stash
-        # must be OUTSIDE the bind-mounted source. Production runtime needs
-        # only the built wheel; all are dev-time only. Restore on any exit
+        # must be OUTSIDE the bind-mounted source -- see STASH_ROOT for why it
+        # is a sibling of the package dirs rather than /tmp. Production runtime
+        # needs only the built wheel; all are dev-time only. Restore on any exit
         # path (success/failure/Ctrl-C) so a build crash doesn't lose them.
-        local -a _stash_rel=("reactjs/node_modules" ".tox" ".venv" ".rustup")
         local -a _stash_from=() _stash_to=()
         local _rel _sp_dest
-        for _rel in "${_stash_rel[@]}"; do
+        for _rel in "${AT_STASH_RELS[@]}"; do
             [[ -e "$src_pkg/$_rel" ]] || continue
-            _sp_dest="/tmp/at-builder-stash-$$-${sp//\//_}-${_rel//\//_}"
+            _sp_dest="$STASH_ROOT/$sp/$_rel"
+            if [[ -e "$_sp_dest" ]]; then
+                # reap_builder_stash() already had its chance; something else
+                # owns this path. Never clobber it -- skip the stash and let
+                # conda-build emit its copy warnings for this subtree instead.
+                warn "not stashing $sp/$_rel: $_sp_dest is occupied"
+                warn "    (a concurrent build-docker.sh, or a strand that could not be reaped)"
+                continue
+            fi
+            mkdir -p "$(dirname "$_sp_dest")"
             mv "$src_pkg/$_rel" "$_sp_dest"
             _stash_from+=("$_sp_dest")
             _stash_to+=("$src_pkg/$_rel")
-        done
-        if (( ${#_stash_from[@]} )); then
-            local _restore="" _i
-            for _i in "${!_stash_from[@]}"; do
-                _restore+="[[ -e '${_stash_from[$_i]}' && ! -e '${_stash_to[$_i]}' ]] && mkdir -p \"\$(dirname '${_stash_to[$_i]}')\" && mv '${_stash_from[$_i]}' '${_stash_to[$_i]}'; "
-            done
+            # Refresh the trap after EVERY move rather than once after the loop:
+            # a Ctrl-C or a failing mv partway through used to leave the moves
+            # already made with no restore trap at all.
             # shellcheck disable=SC2064
-            trap "$_restore" EXIT INT TERM
-        fi
+            trap "$(_stash_restore_cmd)" EXIT INT TERM
+        done
         info "running package-builder for $sp ..."
         docker run --rm -u "$(id -u):$(id -g)" \
             -e "EXTRA_ARGS=$extra_args" \
@@ -307,6 +388,11 @@ run_builder() {
         fi
         info "  → produced $(basename "$found")"
     done
+    # Everything is restored by here, so the stash skeleton is empty dirs; drop
+    # them (STASH_ROOT included) rather than leaving a mystery directory in src/.
+    if [[ -d "$STASH_ROOT" ]]; then
+        find "$STASH_ROOT" -depth -type d -empty -delete 2>/dev/null || true
+    fi
 }
 
 build_release() {
@@ -314,8 +400,7 @@ build_release() {
     run_builder
     local args
     read -ra args <<< "$(common_build_args)"
-    docker build "${args[@]}" \
-        -t "${IMAGE_NAME}" \
+    build_image "${IMAGE_NAME}" "${args[@]}" \
         -f "$AT_DIR/Dockerfile" \
         "$SRC_DIR"
     push_to_registry "${IMAGE_NAME}" 2>/dev/null || true
@@ -326,8 +411,7 @@ build_full() {
     run_builder
     local args
     read -ra args <<< "$(common_build_args)"
-    docker build "${args[@]}" \
-        -t "${IMAGE_NAME}-full" \
+    build_image "${IMAGE_NAME}-full" "${args[@]}" \
         -f "$SRC_DIR/Dockerfile" \
         "$REPO_DIR"
     push_to_registry "${IMAGE_NAME}-full" 2>/dev/null || true
@@ -338,8 +422,7 @@ build_lite() {
     run_builder
     local args
     read -ra args <<< "$(common_build_args)"
-    docker build "${args[@]}" \
-        -t "${IMAGE_NAME}-lite" \
+    build_image "${IMAGE_NAME}-lite" "${args[@]}" \
         -f "$AT_DIR/Dockerfile-lite" \
         "$REPO_DIR"
     push_to_registry "${IMAGE_NAME}-lite" 2>/dev/null || true
@@ -351,6 +434,11 @@ build_lite() {
 main() {
     info "Building Docker images: ${TARGETS[*]}"
     echo
+
+    # Before anything builds, and for every target -- not just the ones that
+    # call run_builder -- so a subtree stranded by a killed run is back in the
+    # source tree (and out of the build contexts) as early as possible.
+    reap_builder_stash
 
     for target in "${TARGETS[@]}"; do
         case "$target" in
@@ -365,6 +453,12 @@ main() {
         esac
         echo
     done
+
+    # Reclaim the generation each fixed tag moved off. After the loop rather
+    # than per-target: a target's old image can still be the recorded parent of
+    # another target's old image until that one goes too, and push_to_registry
+    # must first move any registry-prefixed tag onto the new image.
+    reclaim_superseded_images
 
     info "Done"
 }

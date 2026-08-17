@@ -44,6 +44,16 @@ StreamType = Union[QueueType, deque]
 #: actually supplies, from QueuePool -- blocks in the kernel and never polls.
 DEQUE_POLL_SEC = 0.005
 
+#: The deque-poll sleep, bound to its own name purely so a test can observe
+#: THIS call site. Patching `time.sleep` instead is process-wide: every other
+#: thread that happens to sleep during the window -- the Cohort tick loop at
+#: the bottom of this same module, for one -- is then indistinguishable from a
+#: poll here, which is exactly how a leaked tick thread once made
+#: `test_a_queue_wait_times_out_without_polling` fail at random. Rebinding
+#: `daq.time` would not separate them either; both look `time` up in these same
+#: globals. Call it, do not inline `time.sleep`, or the seam is lost.
+_poll_sleep = time.sleep
+
 
 def stream_take(stream: StreamType, timeout: float):
     """Take one item from a peer stream, waiting up to ``timeout`` seconds.
@@ -68,7 +78,7 @@ def stream_take(stream: StreamType, timeout: float):
         except IndexError:
             if time.monotonic() >= deadline:
                 raise Empty
-            time.sleep(DEQUE_POLL_SEC)
+            _poll_sleep(DEQUE_POLL_SEC)
 
 
 def stream_take_latest(stream: StreamType, timeout: float):
@@ -203,6 +213,12 @@ class CohortInterface(object):
                                                '%Y-%m-%d %H:%M:%S'))
         handler.setLevel(log_level)
         self.logger = logging.getLogger(self.__class__.__name__)
+        # Loggers are singletons keyed by name, so a second instance of this
+        # class in the same process would otherwise ADD a second handler and
+        # every line would print twice -- N instances, N copies of each line
+        # (a full test session made one error appear 25 times). Same guard, and
+        # the same reason, as Automate's in core/_python/automate.py.
+        self.logger.handlers.clear()
         self.logger.addHandler(handler)
         self.logger.setLevel(log_level)
         self.updaters: list[Callable[[], None]] = []
@@ -238,8 +254,7 @@ class CohortInterface(object):
                     # took every updater after it down with it and the whole UI
                     # sat frozen. Named, because 'the dashboard is stale' with
                     # nothing in the log is the hardest kind of outage to place.
-                    self.logger.error('Updater %s failed: %s' %
-                                      (getattr(updater, '__qualname__', updater), err))
+                    self.logger.error('Updater %s failed: %s', getattr(updater, '__qualname__', updater), err)
 
     def acquire_data(self):
         raise NotImplementedError
@@ -317,7 +332,7 @@ class Cohort(CohortInterface):
         slot = self.queue_pool.reserve()
         if slot is None:
             self.logger.error('QueuePool exhausted; no delta channel for %r. '
-                              'Enlarge QueuePool.pool_size.' % name)
+                              'Enlarge QueuePool.pool_size.', name)
             return None
         self._subscriptions[name] = slot
         return slot
@@ -365,7 +380,7 @@ class Cohort(CohortInterface):
             except Exception as err:
                 # A render error must not kill the acquisition loop, or the UI
                 # goes permanently stale with nothing in the log to say why.
-                self.logger.error('Cohort tick failed: %s' % err)
+                self.logger.error('Cohort tick failed: %s', err)
             time.sleep(self.tick_cadence)
 
     # --- publisher side: runs in the CohortTracker worker -------------------
@@ -391,8 +406,7 @@ class Cohort(CohortInterface):
                 self._dropped_updates += 1
                 if self._dropped_updates % 100 == 1:
                     self.logger.warning('Cohort delta channel for %r unavailable '
-                                        '(%d dropped): %s'
-                                        % (name, self._dropped_updates, err))
+                                        '(%d dropped): %s', name, self._dropped_updates, err)
 
     # --- applier side: runs in the UI process -------------------------------
 
@@ -414,16 +428,14 @@ class Cohort(CohortInterface):
             except Empty:
                 return
             except Exception as err:
-                self.logger.warning('Cohort delta channel read failed: %s' % err)
+                self.logger.warning('Cohort delta channel read failed: %s', err)
                 return
             try:
                 self._apply(delta)
             except Exception as err:
                 # One malformed delta must not stop the rest of the drain.
-                self.logger.error('Cohort could not apply delta %r: %s'
-                                  % (delta.get('kind') if isinstance(delta, dict) else delta, err))
-        self.logger.debug('Cohort delta drain hit the per-tick ceiling (%d)'
-                          % self.max_updates_per_tick)
+                self.logger.error('Cohort could not apply delta %r: %s', delta.get('kind') if isinstance(delta, dict) else delta, err)
+        self.logger.debug('Cohort delta drain hit the per-tick ceiling (%d)', self.max_updates_per_tick)
 
     def _apply(self, delta: dict):
         kind = delta.get('kind')
@@ -509,7 +521,7 @@ class Cohort(CohortInterface):
             if video_slot is None or data_slot is None:
                 self.logger.error('QueuePool exhausted at %d peers; enlarge '
                                   'QueuePool.pool_size rather than creating '
-                                  'queues after the fork' % len(self.peers))
+                                  'queues after the fork', len(self.peers))
                 break
             self._peer_slots[uuid] = (idx, group_ids[uuid], video_slot, data_slot)
             self.peers[uuid] = PeerDataAcq(uuid, idx, group_ids[uuid], NullPeerData(), self,
@@ -676,8 +688,8 @@ class CohortTracker(Process, metaclass=ProcMeta,
                     self.cohort.update_group(peer_idents)
                 elif not self.protocol.run_message_handlers(queues, message):
                     if isinstance(message, Message):
-                        self.logger.error(f'Unhandled message {message.function}')
+                        self.logger.error('Unhandled message %s', message.function)
                     else:
-                        self.logger.error(f'Unhandled message of type {message.__class__.__name__}')  # noqa
+                        self.logger.error('Unhandled message of type %s', message.__class__.__name__)  # noqa
 
             self.sleep_until(self.cadence)

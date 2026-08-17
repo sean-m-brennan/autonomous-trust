@@ -24,7 +24,11 @@
 
 # Note: conda cannot build with croot inside Docker, must mount to *unencrypted* host filesystem
 
-FROM condaforge/miniforge3
+# Pinned by tag AND digest; single source of truth is
+# config/cfg/toolchain-pins.env (ISSUES.md §9.1). Tags get re-pushed, so the
+# digest is the part that actually fixes the contents.
+ARG MINIFORGE_IMAGE=condaforge/miniforge3:26.1.1-3@sha256:958d2675e9a43e199cc85345ff4c60796236b651a9da4982765d99bd34a682d1
+FROM ${MINIFORGE_IMAGE}
 
 ARG http_proxy
 ARG https_proxy
@@ -58,7 +62,10 @@ RUN echo "ALL            ALL = (ALL) NOPASSWD: ALL" >>/etc/sudoers
 #COPY --chown=user:user autonomous-trust/.bashrc /app/.bashrc
 
 RUN conda config --add channels conda-forge
-RUN conda update -y -n base conda
+# Deliberately NO `conda update -n base conda`: an unbounded base-env update
+# floats conda to whatever conda-forge published today, which undoes the digest
+# pin on the FROM above from inside the image (ISSUES.md §9.1). To move conda,
+# move the pin in config/cfg/toolchain-pins.env.
 RUN conda create -n autonomous_trust python=3.13 && conda clean -afy
 
 SHELL ["conda", "run", "--live-stream", "-n", "autonomous_trust", "/bin/bash", "-c"]

@@ -78,8 +78,8 @@ class VideoRcvr(CohortSyncMixin, Process, metaclass=ProcMeta,
                         self.logger.warning(
                             'Dropping video from %s: not in this process\'s cohort '
                             '(%d so far). The roster arrives as deltas; check the '
-                            'delta channel for %s.'
-                            % (uuid, self._unknown_peer_drops, self.name))
+                            'delta channel for %s.',
+                            uuid, self._unknown_peer_drops, self.name)
             except (Full, Empty):
                 self.logger.debug("Queue full/empty, dropping video frame from %s", uuid)
 
@@ -103,6 +103,6 @@ class VideoRcvr(CohortSyncMixin, Process, metaclass=ProcMeta,
             if message:
                 if not self.protocol.run_message_handlers(queues, message):
                     if isinstance(message, Message):
-                        self.logger.error('Unhandled message %s' % message.function)
+                        self.logger.error('Unhandled message %s', message.function)
                     else:
-                        self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
+                        self.logger.error('Unhandled message of type %s', message.__class__.__name__)  # noqa

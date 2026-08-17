@@ -37,6 +37,7 @@ from ..identity.protocol import IdentityProtocol
 from ..identity.identity import (public_identity_to_canonical,
                                  public_identity_from_canonical)
 from ..identity.zta.zta_policy import ZtaPolicy
+from ..identity.zta_standing import STANDING_PROVED, STANDING_FAILED
 from .protocol import ReputationProtocol
 from .reputation import (TransactionHistory, Reputation, Reputations,
                          TransactionScore, SlashAttestation, SignedSlash,
@@ -454,6 +455,15 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # short-circuit (forcing re-earn from the punished regime) is lost on
         # restart; the exclusion itself survives.
         self._slashed: dict[str, tuple] = {}
+        # ISSUES §10.5 (ZTA hardening). Volatile, like _slashed: a restart
+        # re-derives standing from the admission gate rather than trusting a
+        # file for it.
+        #   _zta_proved_index: peer -> chain index at its last PROVED
+        #     verification; the point a later failure unwinds back TO.
+        #   _zta_acted:        peer -> the standing already acted on, so the
+        #     hourly re-verification of an unchanged verdict is a no-op.
+        self._zta_proved_index: dict[str, int] = {}
+        self._zta_acted: dict[str, tuple] = {}
         # Proposer-side co-signature accumulation: slash-key -> {voter-uuid-str:
         # detached hex signature over the attestation's designation}. Seeded
         # with the slasher's OWN signature on initiation. Signatures, not bare
@@ -712,7 +722,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 except Full:
                     self.logger.error('handle_request: Network queue full')
             else:
-                self.logger.debug('Reputation request from non-peer: %s' % peer_id)
+                self.logger.debug('Reputation request from non-peer: %s', peer_id)
             return True
         return False
 
@@ -914,15 +924,14 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # peer-supplied, so a raise escaping into the process loop would
                 # hand a remote a lever on this node's reputation process.
                 self.logger.warning(
-                    'Dropping Paxos proposal from %s: %s'
-                    % (message.from_whom, err))
+                    'Dropping Paxos proposal from %s: %s', message.from_whom, err)
                 return True
             idx = self._paxos_id_index(id1, id2)
             if idx not in self.requests:
                 return True  # not granted, drop
             self.requests.remove(idx)
             if not message.verified:
-                self.logger.warning(f"Rejecting unverified Paxos proposal from {message.from_whom}")
+                self.logger.warning('Rejecting unverified Paxos proposal from %s', message.from_whom)
                 return True  # drop unverified proposal
             if idx not in self.proposals:
                 self.proposals[idx] = score
@@ -972,7 +981,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 self.acceptances[score.task_id] = []
             if message.from_whom not in self.acceptances[score.task_id]:
                 if not message.verified:
-                    self.logger.warning(f"Rejecting unverified Paxos acceptance from {message.from_whom}")
+                    self.logger.warning('Rejecting unverified Paxos acceptance from %s', message.from_whom)
                     return True  # drop unverified acceptance
                 self.acceptances[score.task_id].append(message.from_whom)
             round_group_uuid = self.round_group.get(idx)
@@ -1081,7 +1090,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 score = validate_tx_score(score, 'handle_committed')
             except ValueError as err:
                 self.logger.warning(
-                    'Dropping committed tx from %s: %s' % (str(peer_id)[:8], err))
+                    'Dropping committed tx from %s: %s', str(peer_id)[:8], err)
                 return True
             chain = self._chain_for_group(group_uuid)
             chain.update(task_id, peer_id, score)
@@ -1831,6 +1840,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # Bounded by the persisted value we clamped away from, so this
                 # restores standing rather than inventing it.
                 lift = min(self._restore_clamped.get(peer, current), ceiling)
+                # §10.5: child-group evidence can restore standing, but not
+                # past what ZTA proved about the peer holding it. Evidence that
+                # a peer behaved well is not evidence it is who it claims.
+                lift = self._apply_zta_ceiling(peer_uuid, lift)
                 if lift <= current:
                     continue
                 self.reputations.current[peer_uuid] = lift
@@ -2256,7 +2269,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     self.history.catchup(chain)
                     self.logger.debug('Updated')
                 else:
-                    self.logger.error('Closest %d peers unable to agree on history' % self.num_updates)
+                    self.logger.error('Closest %d peers unable to agree on history', self.num_updates)
                     self._request_update(queues, len(self.peers.all))
             return True
         return False
@@ -2325,7 +2338,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     peer_scores.append(tx.p2_score)
                     my_scores.append(tx.p1_score)
         except KeyError:
-            self.logger.debug('No transaction history for peer %s' % peer_uuid)
+            self.logger.debug('No transaction history for peer %s', peer_uuid)
         if len(peer_scores) < 1 or len(my_scores) < 1:  # no bilateral w/ us
             # Cold-start: before any bilateral history WITH us exists, fall
             # back to a transaction-memory prior rather than a flat neutral.
@@ -2550,7 +2563,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 self._persist_reputations()
             except (OSError, IOError) as e:
                 self.logger.warning(
-                    'Could not persist reputations after decay: %s' % e)
+                    'Could not persist reputations after decay: %s', e)
 
     def _persist_reputations(self):
         """Write the reputation snapshot to disk, filtered two-sided.
@@ -2597,8 +2610,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             # Not an error: nothing is listening for an app feed.
             pass
         except Full:
-            self.logger.warning('_publish_reputation: main queue full for %s'
-                                % str(peer_uuid)[:8])
+            self.logger.warning('_publish_reputation: main queue full for %s', str(peer_uuid)[:8])
 
     def _publish_reputation_change(self, queues, peer_uuid, score):
         """A score this process just computed is by construction rated."""
@@ -2629,7 +2641,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         if message.function != ReputationProtocol.app_roster_request:
             return False
         count = self.emit_all_reputations(queues)
-        self.logger.debug('Emitted %d peer reputations for an app pull' % count)
+        self.logger.debug('Emitted %d peer reputations for an app pull', count)
         return True
 
     def _publish_tier_change(self, queues, peer_uuid, score):
@@ -2672,8 +2684,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             msg = Message(CfgIds.identity, IdentityProtocol.tier_update,
                           payload, to_whom=None, from_whom=self.identity)
             queues[CfgIds.identity].put(msg, block=True, timeout=self.q_cadence)
-            self.logger.debug('Published tier_update for %s: %d (score=%.3f)' %
-                              (key, new_tier, score))
+            self.logger.debug('Published tier_update for %s: %d (score=%.3f)', key, new_tier, score)
             if is_demotion:
                 lost_msg = Message(CfgIds.negotiation, IdentityProtocol.tier_lost,
                                    payload, to_whom=None, from_whom=self.identity)
@@ -2689,7 +2700,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         except Full:
             self.logger.error('_publish_tier_change: identity queue full')
         except Exception as err:
-            self.logger.warning('_publish_tier_change failed: %s' % err)
+            self.logger.warning('_publish_tier_change failed: %s', err)
 
     def _publish_exclusion(self, queues, peer_uuid, excluded):
         """Tell the network process to exclude (or readmit) a peer whose
@@ -2726,7 +2737,174 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         except Full:
             self.logger.error('_publish_exclusion: network queue full')
         except Exception as err:
-            self.logger.warning('_publish_exclusion failed: %s' % err)
+            self.logger.warning('_publish_exclusion failed: %s', err)
+
+    def _current_chain_index(self) -> int:
+        """The absolute index the next committed transaction will take.
+
+        Used as the "everything before here is already recorded" watermark when
+        ZTA proves a peer. Read off the history's own counter, with a fallback
+        derived from the resident chain so a history implementation without the
+        private counter still anchors somewhere truthful rather than at 0 --
+        anchoring at 0 would silently mean "unwind everything".
+        """
+        nxt = getattr(self.history, '_next_index', None)
+        if isinstance(nxt, int):
+            return nxt
+        highest = -1
+        for tx in self.history:
+            idx = getattr(tx, 'index', None)
+            if isinstance(idx, int) and idx > highest:
+                highest = idx
+        return highest + 1
+
+    def _zta_unwind_ceiling(self, peer_uuid, anchor_index):
+        """What the peer's standing may be, judged ONLY on evidence that
+        predates its last proved verification (ISSUES §10.5).
+
+        This is the "how far back" answer: back to the last point ZTA actually
+        proved something, and no further. Standing earned before that point was
+        earned by a peer whose credential verified, so it is not in question;
+        standing earned after it was earned while nobody could confirm the peer
+        was who it claimed, and a later affirmative failure is what calls it in.
+
+        Deliberately a recomputation from the pre-anchor window rather than a
+        stored "score as of then" -- no such score is checkpointed (a
+        ``Checkpoint`` commits to a history WINDOW, not to per-peer values), and
+        inventing one would be the circularity ``_evidence_ceilings`` exists to
+        avoid. Reusing that same routine also means the unwind inherits its
+        shrinkage: a short pre-anchor history cannot justify a high score.
+
+        Falls back to the unverified-restore tier when there is no usable
+        pre-anchor evidence -- including the case where the chain has evicted
+        it. Absent evidence bounds a peer low; it does not excuse it.
+        """
+        floor_tier = self._tier_ceiling(self.UNVERIFIED_RESTORE_TIER)
+        if anchor_index is None:
+            # Never proved at all: nothing this peer holds rests on a verified
+            # credential, so none of it survives the failure.
+            return floor_tier
+        window = [tx for tx in self.history
+                  if isinstance(getattr(tx, 'index', None), int)
+                  and tx.index < anchor_index]
+        if not window:
+            return floor_tier
+        return self._evidence_ceilings(window).get(str(peer_uuid), floor_tier)
+
+    def _apply_zta_standings(self, queues):
+        """Act on ZTA findings that have landed since the last sweep.
+
+        Idempotent by design: it runs every process iteration (like
+        ``_restore_child_evidence``) and acts only on a standing it has not
+        already acted on for that peer. A repeated identical verdict -- which
+        periodic re-verification produces by the hour -- must not re-unwind a
+        peer that was already unwound.
+        """
+        standing = getattr(self.protocol, 'zta_standing', None)
+        if not standing:
+            return
+        for key, found in list(standing.items()):
+            mark = (found.status, found.ceiling, found.verified_at, found.reason)
+            if self._zta_acted.get(key) == mark:
+                continue
+            self._zta_acted[key] = mark
+            if found.status == STANDING_PROVED:
+                # Advance the anchor: everything committed up to now was
+                # observed while this peer's credential verified.
+                self._zta_proved_index[key] = self._current_chain_index()
+                self.logger.info(
+                    'ZTA: %s proved; unwind anchor set at chain index %d',
+                    key[:8], self._zta_proved_index[key])
+            elif found.status == STANDING_FAILED:
+                self._unwind_zta_failure(queues, key, found)
+
+    def _unwind_zta_failure(self, queues, key, found):
+        """A peer that operated unproved has now affirmatively FAILED: unwind
+        its standing to what pre-anchor evidence supports, and let the tier
+        machinery demote it (ISSUES §10.5).
+
+        No scalar penalty is sent. A ZTA verdict is an authority finding, not
+        an interaction outcome, and AT's [0, 1] scale has no representation for
+        one (§11.2) -- which is why the previous attempt, a ``score = -0.8``
+        TRANSACTION_SCORE, was rejected at the boundary and did nothing at all.
+        Bounding the value and republishing the tier is the action; demotion,
+        and exclusion below the cut-off, follow from the score the tier
+        machinery already reacts to.
+        """
+        anchor = self._zta_proved_index.get(key)
+        peer_uuid = None
+        for candidate in self.reputations.current:
+            if str(candidate) == key:
+                peer_uuid = candidate
+                break
+        if peer_uuid is None:
+            # Nothing scored for this peer yet; record the ceiling so the first
+            # score it does earn is bounded, and leave it at that.
+            self.logger.info('ZTA: %s failed (%s); no score to unwind',
+                             key[:8], found.reason)
+            return
+        current = self.reputations.current.get(peer_uuid)
+        unwound = self._zta_unwind_ceiling(peer_uuid, anchor)
+        if current is not None and current <= unwound:
+            self.logger.info(
+                'ZTA: %s failed (%s); score %.3f already at or below what '
+                'pre-verification evidence supports (%.3f)',
+                key[:8], found.reason, current, unwound)
+            return
+        self.reputations.update(peer_uuid, unwound)
+        # Force CTFT so a peer whose credential is later repaired re-earns
+        # trust from the punished regime instead of snapping back into
+        # cooperation -- the same reasoning as the slash override.
+        self._coop_mode[peer_uuid] = False
+        self.logger.warning(
+            'ZTA: %s FAILED (%s); unwound %.3f -> %.3f (anchor %s)',
+            key[:8], found.reason,
+            -1.0 if current is None else current, unwound,
+            'none — never proved' if anchor is None else 'chain index %d' % anchor)
+        _probes.counter('rep.compute', 'zta_unwound')
+        try:
+            self._persist_reputations()
+        except (OSError, IOError) as e:
+            self.logger.warning('Could not persist reputations: %s', e)
+        self._publish_tier_change(queues, peer_uuid, unwound)
+        self._publish_reputation_change(queues, peer_uuid, unwound)
+
+    def _zta_ceiling(self, peer_uuid):
+        """Highest reputation this peer may hold given what ZTA actually proved
+        (ISSUES §10.5), or None for "no bound".
+
+        None covers three different situations that all mean the same thing
+        here: ZTA proved the peer, ZTA is switched off, or IdentityProcess has
+        not spoken about this peer at all. A deployment that has not turned ZTA
+        on is not bounded by it, which is the no-change-in-behavior setting.
+
+        Read off `protocol.zta_standing`, which is this node's OWN finding
+        delivered over IPC -- never anything the peer asserted about itself, so
+        a peer cannot raise its own ceiling.
+        """
+        standing = getattr(self.protocol, 'zta_standing', None)
+        if not standing:
+            return None
+        found = standing.get(str(peer_uuid))
+        return None if found is None else found.ceiling
+
+    def _apply_zta_ceiling(self, peer_uuid, score):
+        """Bound `score` by the peer's ZTA ceiling, if it has one.
+
+        The bound is applied where the score is WRITTEN rather than where it is
+        read, so every consumer -- tier computation, persistence, the app-facing
+        carrier, a peer answering a rep_req -- sees one consistent number. A
+        ceiling enforced only at read time would leave the stored score above
+        it and leak the unbounded value the moment some other path reported it.
+        """
+        ceiling = self._zta_ceiling(peer_uuid)
+        if ceiling is None or score is None or score <= ceiling:
+            return score
+        self.logger.info(
+            'ZTA: %s capped %.3f -> %.3f (credential not proved)',
+            str(peer_uuid)[:8], score, ceiling)
+        _probes.counter('rep.compute', 'zta_capped')
+        return ceiling
 
     def _compute_reputation(self, peer, req_proc, requestor):
         _probes.counter('rep.compute', 'enter')
@@ -2750,7 +2928,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 try:
                     self._persist_reputations()
                 except (OSError, IOError) as e:
-                    self.logger.warning('Could not persist reputations: %s' % e)
+                    self.logger.warning('Could not persist reputations: %s', e)
                 self.pending_tiers.append((peer_uuid, rep_score))
                 self.requested_reps.append(
                     (Reputation(peer_uuid, rep_score), req_proc, requestor))
@@ -2788,11 +2966,14 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     'local history (previous=%.2f)',
                     str(peer_uuid)[:8], n_bilateral, previous)
                 rep_score = self._contrite_tit_for_tat(peer)
+            # §10.5: an unproved credential bounds how far this peer may rise,
+            # whichever regime produced the score above.
+            rep_score = self._apply_zta_ceiling(peer_uuid, rep_score)
             self.reputations.update(peer_uuid, rep_score)
             try:
                 self._persist_reputations()
             except (OSError, IOError) as e:
-                self.logger.warning('Could not persist reputations: %s' % e)
+                self.logger.warning('Could not persist reputations: %s', e)
             # Queue a tier-update for IdentityProcess; drained by the
             # process loop alongside forward_reputation. The spawned
             # _compute_reputation thread doesn't have access to queues
@@ -2802,7 +2983,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             _probes.counter('rep.compute', 'queued')
         except Exception as e:
             _probes.counter('rep.compute', 'exception', type(e).__name__)
-            self.logger.warning('_compute_reputation failed: %s' % e)
+            self.logger.warning('_compute_reputation failed: %s', e)
 
     def _consensus_baseline(self, peer_uuid):
         """Cold-start baseline for a peer with no committed bilateral
@@ -3523,7 +3704,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         except Exception as e:
             _probes.counter('rep.consensus', 'exception', type(e).__name__)
             self.logger.warning(
-                '_compute_consensus_reputation failed: %s' % e)
+                '_compute_consensus_reputation failed: %s', e)
 
     def handle_consensus_reputation_request(self, _, message):
         if message.function != ReputationProtocol.consensus_rep_req:
@@ -3540,7 +3721,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         else:
             self.logger.error(
                 'handle_consensus_reputation_request: unsupported '
-                'payload shape %r' % type(parsed).__name__)
+                'payload shape %r', type(parsed).__name__)
             return True
         requestor = message.from_whom
         self._spawn(self._compute_consensus_reputation,
@@ -3563,8 +3744,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 ident, req_proc = parsed[0], parsed[1]
             else:
                 self.logger.error(
-                    'handle_reputation_request: unsupported payload shape %r'
-                    % type(parsed).__name__)
+                    'handle_reputation_request: unsupported payload shape %r', type(parsed).__name__)
                 return True
             requestor = message.from_whom
             # Tag the requestor type so we can correlate
@@ -3590,7 +3770,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     def forward_reputation(self, queues):
         while len(self.requested_reps) > 0:
             payload, req_proc, requestor = self.requested_reps.pop(0)
-            self.logger.debug('Forward reps to %s at %s' % (req_proc, requestor))
+            self.logger.debug('Forward reps to %s at %s', req_proc, requestor)
             # payload is either a single Reputation (the rep_req /
             # _compute_reputation path) or a list[Reputation] (the
             # consensus subtree path). A 1-element roster is sent as a
@@ -3639,7 +3819,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     queues[req_proc].put(
                         msg, block=True, timeout=self.q_cadence)
             except Full:
-                self.logger.error('forward_reputation: %s queue full' % req_proc)
+                self.logger.error('forward_reputation: %s queue full', req_proc)
 
     def _dump_reputation_trace(self, present):
         """Debug instrument: emit THIS node's own reputation view of every
@@ -3730,9 +3910,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     'exc': key in self._excluded,
                 })
             rec = {'t': round(present, 3), 'self': me, 'view': view}
-            self.logger.info('AT_REPDUMP %s' % to_json_string(rec))
+            self.logger.info('AT_REPDUMP %s', to_json_string(rec))
         except Exception as err:
-            self.logger.error('reputation dump failed: %s' % err)
+            self.logger.error('reputation dump failed: %s', err)
 
     def process(self, queues, signal):
         # Drain budget per iter. Each handle_reputation_request spawns
@@ -3756,6 +3936,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # (idempotent per group; see _restore_child_evidence).
                 if self.child_groups:
                     self._restore_child_evidence(queues)
+                # ZTA findings arrive over IPC from IdentityProcess; act on any
+                # that are new (§10.5). Idempotent, so it is safe every pass.
+                self._apply_zta_standings(queues)
                 drained = 0
                 # First iteration blocks briefly so we don't hot-spin
                 # when the queue is empty; subsequent iterations are
@@ -3782,10 +3965,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                                 if isinstance(message, Message):
                                     _probes.counter('proc.reputation', 'unhandled', message.function)
                                     _probes.trace_msg(message, 'unhandled', proc='reputation')
-                                    self.logger.error('Unhandled message %s' % message.function)
+                                    self.logger.error('Unhandled message %s', message.function)
                                 else:
                                     _probes.counter('proc.reputation', 'unhandled', 'type:' + message.__class__.__name__)
-                                    self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
+                                    self.logger.error('Unhandled message of type %s', message.__class__.__name__)  # noqa
                 _probes.counter('proc.reputation', 'iter_drained', str(drained))
                 self.forward_reputation(queues)
                 # Drain tier updates queued by _compute_reputation.
@@ -3842,4 +4025,4 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             self._persist_reputations()
             self.logger.debug('Final reputation flush on shutdown')
         except Exception as err:
-            self.logger.warning('Final reputation flush failed: %s' % err)
+            self.logger.warning('Final reputation flush failed: %s', err)

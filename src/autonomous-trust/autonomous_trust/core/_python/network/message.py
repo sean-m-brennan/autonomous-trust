@@ -357,7 +357,7 @@ class Message(object):
                         )
                         msg.verified = True
                     except (BadSignatureError, Exception) as e:
-                        logger.warning(f"Message signature verification failed from {eff_sender}: {e}")
+                        logger.warning('Message signature verification failed from %s: %s', eff_sender, e)
                         msg.verified = False
                 return msg
         except (json.JSONDecodeError, ValueError, KeyError):
@@ -395,7 +395,7 @@ class Message(object):
                 )
                 msg.verified = True
             except (BadSignatureError, Exception) as e:
-                logger.warning(f"Message signature verification failed from {sender}: {e}")
+                logger.warning('Message signature verification failed from %s: %s', sender, e)
                 msg.verified = False
 
         return msg

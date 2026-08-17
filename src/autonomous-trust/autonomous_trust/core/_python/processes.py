@@ -113,6 +113,24 @@ class ProcessTracker(Mapping):
         return iter(self._registry)
 
 
+#: The one log-line shape for the whole project (ISSUES.md §5 S13).
+#:
+#: Every AT handler already used these bytes; what drifted is that each
+#: entry-point script called `logging.basicConfig` with a shape of its own
+#: (`%(asctime)s %(levelname)s %(name)s: %(message)s`). In those scripts BOTH
+#: handlers are live at once -- AT's, on its class-named logger, and root's,
+#: from basicConfig -- so a single framework event printed twice, in two
+#: different shapes, which is exactly the confusion that made the module-logger
+#: trap so hard to read. Defining it once here means a change lands everywhere
+#: instead of in eight of nine places.
+#:
+#: NB no `%(name)s`: an AT message says who it is in its own text (the
+#: `'%s: ...', self.name` prefix the processes use), and adding the field would
+#: change every line the framework already emits.
+LOG_FORMAT = '%(asctime)s.%(msecs)03d - %(levelname)s %(message)s'
+LOG_DATEFMT = '%Y-%m-%d %H:%M:%S'
+
+
 class LogLevel(IntEnum):
     CRITICAL = logging.CRITICAL
     ERROR = logging.ERROR
@@ -176,13 +194,13 @@ class Process(metaclass=ProcMeta):
             function = ':'
         else:
             function = ' in ' + function + ':'
-        self.logger.error('%s%s %s\n%s' % (exception.__class__.__name__, function, exception, traceback.format_exc()))
+        self.logger.error('%s%s %s\n%s', exception.__class__.__name__, function, exception, traceback.format_exc())
 
     def keep_running(self, signal):
         running = True
         try:
             sig = signal.get_nowait()
-            self.logger.debug('Quit %s' % self.__class__.__name__)
+            self.logger.debug('Quit %s', self.__class__.__name__)
             if sig == self.sig_quit:
                 running = False
         except queue.Empty:

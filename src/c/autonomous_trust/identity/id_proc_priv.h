@@ -287,6 +287,18 @@ int identity_aggregate_subtree_roster(const char *top_uuid,
                                       json_t **out_members, bool *out_complete,
                                       json_t **out_private);
 
+/** Ask a cohort we are NOT in to admit us, so a gateway can acquire a child
+ *  cohort at runtime rather than from a seeded key file (ISSUES.md §10.2). The
+ *  cohort decides: this only sends the ordinary request_access naming
+ *  @p group_uuid and records that we solicited it. Returns 0 on success.
+ *  C twin of Python IdentityProcess.request_cohort_join. */
+int identity_request_cohort_join(process_t *proc, directory_t *queues,
+                                 const char *group_uuid);
+
+/** Whether a cohort join we solicited is still awaiting admission. Assertion
+ *  surface for tests. */
+bool identity_join_pending(const char *group_uuid);
+
 /** Seed a child cohort this node gateways (C twin of Python child_groups
  *  seeding). @p gateway_uuid names the deeper gateway to recurse into for that
  *  child group (NULL for a 2-level gateway). Returns 0 on success. */

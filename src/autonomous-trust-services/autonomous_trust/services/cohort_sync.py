@@ -51,8 +51,7 @@ class CohortSyncMixin(object):
         try:
             return subscribe(self.name)
         except Exception as err:                                    # noqa: BLE001
-            self.logger.warning('No cohort delta channel for %s: %s'
-                                % (self.name, err))
+            self.logger.warning('No cohort delta channel for %s: %s', self.name, err)
             return None
 
     def sync_cohort(self):
@@ -72,5 +71,4 @@ class CohortSyncMixin(object):
             # it has no delta channel to drain either.
             pass
         except Exception as err:                                    # noqa: BLE001
-            self.logger.warning('Cohort roster sync failed for %s: %s'
-                                % (self.name, err))
+            self.logger.warning('Cohort roster sync failed for %s: %s', self.name, err)

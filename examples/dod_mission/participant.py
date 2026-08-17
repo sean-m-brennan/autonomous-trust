@@ -101,6 +101,7 @@ from contradictory_isr import (  # noqa: E402
     DEFAULT_ACTIVATE_AT,
 )
 from forged_identity import create_forged_identity_sensor  # noqa: E402
+from autonomous_trust.core import LOG_FORMAT, LOG_DATEFMT
 
 
 class _DetectionAugmentedBundle:
@@ -681,7 +682,7 @@ def main():
     logging.basicConfig(
         level=logging.INFO,
         stream=sys.stderr,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format=LOG_FORMAT, datefmt=LOG_DATEFMT,
     )
 
     if len(sys.argv) < 2 and "AT_PEER_NAME" not in os.environ:

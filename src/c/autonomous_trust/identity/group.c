@@ -16,6 +16,7 @@
 
 #include <stdbool.h>
 #include <string.h>
+#include <time.h>
 #include <errno.h>
 
 #include <uuid/uuid.h>
@@ -67,7 +68,104 @@ int group_encrypt(const group_t *ident, const msg_str_t *in, const group_t *whom
 /* Frama-C: skipped — [solver-timeout] libsodium decrypt preconditions */
 int group_decrypt(const group_t *ident, const msg_str_t *cipher, const group_t *whom, const unsigned char *nonce, unsigned char *out)
 {
-    return crypto_box_open_easy(out, cipher->msg, cipher->len, nonce, whom->encryptor.public, ident->encryptor.private);
+    int rc = crypto_box_open_easy(out, cipher->msg, cipher->len, nonce,
+                                  whom->encryptor.public, ident->encryptor.private);
+    if (rc == 0)
+        return rc;
+    /* A rotation is not synchronous across a cohort: a member that has not yet
+     * processed the key update is still sending under the old one. Retry the
+     * recently retired keys rather than drop those frames. Bounded by age, so a
+     * retired key stops working soon after it is retired — an unbounded
+     * fallback would make rotation decorative. Mirrors Python Group.decrypt. */
+    double stamp = (double)time(NULL);
+    for (size_t i = 0; i < ident->num_previous_keys; i++)
+    {
+        if (stamp - ident->previous_retired_at[i] > GROUP_PREVIOUS_KEY_GRACE)
+            continue;
+        if (crypto_box_open_easy(out, cipher->msg, cipher->len, nonce,
+                                 whom->encryptor.public,
+                                 ident->previous_keys[i].private) == 0)
+            return 0;
+    }
+    return rc;
+}
+
+/* Whether this group holds the shared PRIVATE key (and can therefore decrypt
+ * cohort traffic). Same predicate group_to_json uses to decide which key to
+ * emit — one spelling, so "we own this group" cannot mean two things. Mirrors
+ * Python Group.owns_private_key. */
+static bool _group_owns_private(const group_t *group)
+{
+    return group != NULL
+        && !sodium_is_zero(group->encryptor.private, crypto_box_SECRETKEYBYTES);
+}
+
+/* Mint a fresh shared key, retiring the current one into the grace window.
+ * Returns the new epoch, or -1 when we do not hold the current private key —
+ * a public-only view of somebody else's group has no standing to rotate it,
+ * and silently minting a key here would fork the cohort into two halves that
+ * cannot hear each other. Mirrors Python Group.rotate_key. */
+int64_t group_rotate_key(group_t *group)
+{
+    if (!_group_owns_private(group))
+        return -1;
+    size_t keep = group->num_previous_keys;
+    if (keep > GROUP_PREVIOUS_KEY_MAX - 1)
+        keep = GROUP_PREVIOUS_KEY_MAX - 1;
+    for (size_t i = keep; i > 0; i--)
+    {
+        group->previous_keys[i] = group->previous_keys[i - 1];
+        group->previous_retired_at[i] = group->previous_retired_at[i - 1];
+    }
+    group->previous_keys[0] = group->encryptor;
+    group->previous_retired_at[0] = (double)time(NULL);
+    group->num_previous_keys = keep + 1;
+
+    unsigned char *seed = encryptor_generate();
+    if (seed == NULL)
+        return -1;
+    int rc = encryptor_init_from_private(&group->encryptor, seed,
+                                         crypto_box_SECRETKEYBYTES * 2);
+    free(seed);
+    if (rc != 0)
+        return -1;
+    group->key_epoch += 1;
+    return group->key_epoch;
+}
+
+/* Adopt @p other's shared key if it supersedes ours. Same group, strictly
+ * higher epoch, and the sender must actually hold the private key — an equal
+ * or lower epoch is a replay, and accepting one would let a captured old key be
+ * reinstated over a newer one, which is precisely what rotation forecloses.
+ * Authenticating WHO may rotate is the caller's job. Mirrors Python
+ * Group.accept_rotation. */
+bool group_accept_rotation(group_t *group, const group_t *other)
+{
+    if (group == NULL || other == NULL)
+        return false;
+    if (uuid_compare(group->uuid, other->uuid) != 0)
+        return false;
+    if (other->key_epoch <= group->key_epoch)
+        return false;
+    if (!_group_owns_private(other))
+        return false;
+    if (_group_owns_private(group))
+    {
+        size_t keep = group->num_previous_keys;
+        if (keep > GROUP_PREVIOUS_KEY_MAX - 1)
+            keep = GROUP_PREVIOUS_KEY_MAX - 1;
+        for (size_t i = keep; i > 0; i--)
+        {
+            group->previous_keys[i] = group->previous_keys[i - 1];
+            group->previous_retired_at[i] = group->previous_retired_at[i - 1];
+        }
+        group->previous_keys[0] = group->encryptor;
+        group->previous_retired_at[0] = (double)time(NULL);
+        group->num_previous_keys = keep + 1;
+    }
+    group->encryptor = other->encryptor;
+    group->key_epoch = other->key_epoch;
+    return true;
 }
 
 /* Frama-C: skipped — [solver-timeout] array precondition cascade */
@@ -166,6 +264,11 @@ int group_to_json(const void *data_struct, json_t **obj_ptr)
      * to_canonical's "created". Omitted-on-read defaults to 0 (unknown → uuid
      * tiebreak), so a peer that doesn't send it stays compatible. */
     json_object_set_new(obj, "created", json_real(ident->created));
+    /* Key rotation epoch (ISSUES.md 10.2). Additive and defaulted on read, so
+     * a peer predating rotation sends nothing and reads as epoch 0 — which is
+     * exactly "never rotated" and needs no special case. Mirrors Python
+     * to_canonical's "key_epoch". */
+    json_object_set_new(obj, "key_epoch", json_integer(ident->key_epoch));
 
     return 0;
 }
@@ -232,6 +335,9 @@ int group_from_json(const json_t *obj, void *data_struct)
     json_t *created_obj = json_object_get(obj, "created");
     group->created = (created_obj != NULL && json_is_number(created_obj))
                      ? json_number_value(created_obj) : 0.0;
+    json_t *epoch_obj = json_object_get(obj, "key_epoch");
+    group->key_epoch = (epoch_obj != NULL && json_is_integer(epoch_obj))
+                       ? json_integer_value(epoch_obj) : 0;
     return 0;
 }
 

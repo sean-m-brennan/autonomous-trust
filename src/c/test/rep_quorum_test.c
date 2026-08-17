@@ -72,6 +72,8 @@ static char SLASH_PROPOSE_FN[]     = "slash propose";
 static char SLASH_SIGN_FN[]        = "slash sign";
 static char SLASH_FINAL_FN[]       = "slash final";
 static char CHECKPOINT_FINAL_FN[]  = "checkpoint final";
+static char CHECKPOINT_SIGN_FN[]   = "checkpoint sign";
+static char CHECKPOINT_PROPOSE_FN[] = "checkpoint propose";
 
 #define SIG_HEX_LEN (crypto_sign_BYTES * 2)
 
@@ -81,8 +83,15 @@ static char CHECKPOINT_FINAL_FN[]  = "checkpoint final";
 
 static size_t g_slash_final_count;
 static size_t g_slash_sign_count;
+static size_t g_ckpt_final_count;
 static char   g_last_sign_signer[UUID_STRING_LEN + 1];
 static char   g_last_sign_sig[SIG_HEX_LEN + 1];
+/* Last checkpoint_sign ack this node emitted: who it named, the signature, and
+   the chain it echoed back to the proposer. */
+static size_t g_ckpt_sign_count;
+static char   g_last_ckpt_sig[SIG_HEX_LEN + 1];
+static char   g_last_ckpt_group[UUID_STRING_LEN + 1];
+static bool   g_last_ckpt_had_group;
 
 static int _capture_hook(const char *key, const message_type_t type,
                          generic_msg_t *msg, bool blocking)
@@ -93,6 +102,31 @@ static int _capture_hook(const char *key, const message_type_t type,
     const char *fn = msg->info.net_msg.function;
     if (strcmp(fn, SLASH_FINAL_FN) == 0)
         g_slash_final_count++;
+    else if (strcmp(fn, CHECKPOINT_FINAL_FN) == 0)
+        g_ckpt_final_count++;
+    else if (strcmp(fn, CHECKPOINT_SIGN_FN) == 0) {
+        g_ckpt_sign_count++;
+        if (msg->info.net_msg.obj != NULL) {
+            json_error_t err;
+            json_t *p = json_loads((const char *)msg->info.net_msg.obj, 0, &err);
+            if (p != NULL && json_is_object(p)) {
+                const char *s = json_string_value(
+                    json_object_get(p, "signature"));
+                json_t *g = json_object_get(p, "group_uuid");
+                if (s != NULL) {
+                    strncpy(g_last_ckpt_sig, s, SIG_HEX_LEN);
+                    g_last_ckpt_sig[SIG_HEX_LEN] = '\0';
+                }
+                g_last_ckpt_had_group = (g != NULL && json_is_string(g));
+                if (g_last_ckpt_had_group) {
+                    strncpy(g_last_ckpt_group, json_string_value(g),
+                            UUID_STRING_LEN);
+                    g_last_ckpt_group[UUID_STRING_LEN] = '\0';
+                }
+            }
+            if (p != NULL) json_decref(p);
+        }
+    }
     else if (strcmp(fn, SLASH_SIGN_FN) == 0) {
         g_slash_sign_count++;
         if (msg->info.net_msg.obj != NULL) {
@@ -186,17 +220,28 @@ static size_t _slash_desig(const char *slasher, const char *target,
     return tag_len + (size_t)n;
 }
 
-static size_t _ckpt_desig(const char *proposer, const char *root, int64_t epoch,
-                          int64_t first, int64_t count, uint8_t *out, size_t cap)
+static size_t _ckpt_desig_g(const char *proposer, const char *root,
+                            int64_t epoch, int64_t first, int64_t count,
+                            const char *group, uint8_t *out, size_t cap)
 {
     static const char tag[] = "AT-CKPT";
     size_t tag_len = sizeof(tag);
-    int n = snprintf((char *)out + tag_len, cap - tag_len, "%s|%s|%lld|%lld|%lld",
+    bool have_group = (group != NULL && group[0] != '\0');
+    int n = snprintf((char *)out + tag_len, cap - tag_len,
+                     "%s|%s|%lld|%lld|%lld%s%s",
                      proposer, root, (long long)epoch, (long long)first,
-                     (long long)count);
+                     (long long)count, have_group ? "|" : "",
+                     have_group ? group : "");
     ck_assert(n > 0 && (size_t)n < cap - tag_len);
     memcpy(out, tag, tag_len);
     return tag_len + (size_t)n;
+}
+
+/* The primary chain appends no group field, so most rounds want this. */
+static size_t _ckpt_desig(const char *proposer, const char *root, int64_t epoch,
+                          int64_t first, int64_t count, uint8_t *out, size_t cap)
+{
+    return _ckpt_desig_g(proposer, root, epoch, first, count, "", out, cap);
 }
 
 static void _sign_hex(const identity_t *signer, const uint8_t *desig,
@@ -230,6 +275,11 @@ static void _begin(int num_peers)
     reputation_reset_state(num_peers);
     g_slash_final_count = 0;
     g_slash_sign_count = 0;
+    g_ckpt_final_count = 0;
+    g_ckpt_sign_count = 0;
+    g_last_ckpt_sig[0] = '\0';
+    g_last_ckpt_group[0] = '\0';
+    g_last_ckpt_had_group = false;
     g_last_sign_signer[0] = '\0';
     g_last_sign_sig[0] = '\0';
     messaging_set_test_hook(_capture_hook);
@@ -680,6 +730,134 @@ DEFINE_TEST(test_checkpoint_final_with_quorum_stores_root)
 }
 END_TEST_DEFINITION()
 
+DEFINE_TEST(test_originated_round_tallies_a_peer_ack_to_quorum)
+{
+    /* The round we originate has to be FINDABLE by the ack handler.
+     * _originate_checkpoint records the pending round and seeds its own
+     * co-signature under a key that carries the chain; handle_checkpoint_sign
+     * has to build the same key to tally against it. While the two disagreed
+     * (originator keying "<proposer>:<epoch>:<chain>", the handler
+     * "<proposer>:<epoch>"), every ack to a checkpoint THIS node proposed was
+     * dropped as "not our round", so a self-originated checkpoint could never
+     * reach quorum -- silently, since the proposer had already self-stored the
+     * lone-signature version.
+     *
+     * The observable is therefore the checkpoint_final EMISSION, not the stored
+     * root: origination stores the root by itself, and only quorum broadcasts.
+     * Two peers puts quorum at 1, so the seeded self-signature plus one ack is
+     * exactly the boundary. checkpoint_final is addressed per peer, so quorum
+     * shows up as one emission per peer rather than a single broadcast. */
+    _begin(3);
+    identity_t *me = _mk_identity("dave", "10.0.0.4");
+    identity_t *bob = _mk_identity("bob", "10.0.0.2");
+    identity_t *carol = _mk_identity("carol", "10.0.0.3");
+    process_t *proc = _mk_process(me);
+    _add_peer(proc, bob);
+    _add_peer(proc, carol);
+
+    /* A window worth attesting; a checkpoint over nothing is skipped upstream. */
+    uuid_t task;
+    uuid_generate(task);
+    reputation_install_tx_pair(task, me->uuid, 0.8, bob->uuid, 0.8);
+
+    char me_u[UUID_STRING_LEN + 1], bob_u[UUID_STRING_LEN + 1];
+    _uuid_str(me->uuid, me_u);
+    _uuid_str(bob->uuid, bob_u);
+
+    char root[TX_HASH_HEX_LEN + 1] = {0};
+    reputation_get_window_root(root);
+    ck_assert(root[0] != '\0');
+    int count = reputation_get_committed_tx_count();
+
+    reputation_force_checkpoint(proc, me_u, "");   /* epoch 1 on a fresh slot */
+    ck_assert(g_ckpt_final_count == 0);            /* one signature is not quorum */
+
+    /* bob co-signs the same bytes the proposer signed: no group element,
+     * because this is the primary chain. */
+    uint8_t desig[512];
+    size_t dlen = _ckpt_desig(me_u, root, 1, 0, count, desig, sizeof(desig));
+    char b_sig[SIG_HEX_LEN + 1];
+    _sign_hex(bob, desig, dlen, b_sig);
+
+    json_t *p = json_object();
+    json_object_set_new(p, "proposer_uuid", json_string(me_u));
+    json_object_set_new(p, "epoch", json_integer(1));
+    json_object_set_new(p, "signer_uuid", json_string(bob_u));
+    json_object_set_new(p, "signature", json_string(b_sig));
+    _dispatch(proc, bob, CHECKPOINT_SIGN_FN, p);
+    json_decref(p);
+
+    ck_assert(g_ckpt_final_count == proc->protocol.num_peers);
+
+    char stored[TX_HASH_HEX_LEN + 1] = {0};
+    reputation_get_checkpoint_root(stored);
+    ck_assert_str_eq(stored, root);
+    _end();
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_cosign_of_a_child_group_round_uses_the_proposers_chain_name)
+{
+    /* A gateway checkpoints a child group G and broadcasts to G's members. For
+     * a MEMBER of G, G is its own primary group, so _chain_key(G) resolves to
+     * "" -- correct for picking which window to compare, and wrong for both the
+     * signed bytes and the ack, because the proposer never said "". Signing the
+     * resolved name made the member's co-signature verify nowhere on the
+     * proposer, so a child-group checkpoint could not reach quorum across the
+     * boundary §10.2 exists to cross. */
+    _begin(2);
+    identity_t *me = _mk_identity("member", "10.0.0.5");
+    identity_t *gateway = _mk_identity("gateway", "10.0.0.1");
+    process_t *proc = _mk_process(me);
+    _add_peer(proc, gateway);
+
+    /* Our primary group IS the group the proposal names. */
+    uuid_t group_uuid;
+    uuid_generate(group_uuid);
+    memcpy(proc->protocol.group.uuid, group_uuid, sizeof(uuid_t));
+    char group_u[UUID_STRING_LEN + 1];
+    _uuid_str(group_uuid, group_u);
+
+    uuid_t task;
+    uuid_generate(task);
+    reputation_install_tx_pair(task, me->uuid, 0.8, gateway->uuid, 0.8);
+
+    char gw_u[UUID_STRING_LEN + 1];
+    _uuid_str(gateway->uuid, gw_u);
+    char root[TX_HASH_HEX_LEN + 1] = {0};
+    reputation_get_window_root(root);
+    int count = reputation_get_committed_tx_count();
+
+    json_t *p = json_object();
+    json_object_set_new(p, "proposer_uuid", json_string(gw_u));
+    json_object_set_new(p, "root", json_string(root));
+    json_object_set_new(p, "epoch", json_integer(2));
+    json_object_set_new(p, "first_index", json_integer(0));
+    json_object_set_new(p, "count", json_integer(count));
+    json_object_set_new(p, "group_uuid", json_string(group_u));
+    _dispatch(proc, gateway, CHECKPOINT_PROPOSE_FN, p);
+    json_decref(p);
+
+    /* Our window matched, so we co-signed exactly once ... */
+    ck_assert_uint_eq(g_ckpt_sign_count, 1);
+    /* ... the ack echoes the chain AS THE PROPOSER NAMED IT ... */
+    ck_assert(g_last_ckpt_had_group);
+    ck_assert_str_eq(g_last_ckpt_group, group_u);
+    /* ... and the signature verifies over the designation carrying that same
+     * name, which is the one the proposer will check it against. */
+    uint8_t desig[512];
+    size_t dlen = _ckpt_desig_g(gw_u, root, 2, 0, count, group_u, desig,
+                                sizeof(desig));
+    unsigned char sig[crypto_sign_BYTES];
+    ck_assert_uint_eq(strlen(g_last_ckpt_sig), SIG_HEX_LEN);
+    ck_assert_ret_ok(unhexlify((const unsigned char *)g_last_ckpt_sig,
+                               SIG_HEX_LEN, sig));
+    ck_assert_ret_ok(crypto_sign_verify_detached(sig, desig, dlen,
+                                                 me->signature.public));
+    _end();
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(RepQuorum,
           test_slash_designation_bytes_pinned,
           test_checkpoint_designation_bytes_pinned,
@@ -691,4 +869,6 @@ RUN_TESTS(RepQuorum,
           test_slash_final_with_quorum_applies_floor,
           test_slash_final_forged_signature_map_refused,
           test_checkpoint_final_unattested_root_refused,
-          test_checkpoint_final_with_quorum_stores_root)
+          test_checkpoint_final_with_quorum_stores_root,
+          test_originated_round_tallies_a_peer_ack_to_quorum,
+          test_cosign_of_a_child_group_round_uses_the_proposers_chain_name)

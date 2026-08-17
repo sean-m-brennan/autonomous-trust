@@ -47,6 +47,7 @@ from autonomous_trust.inspector.transitive_trust import (
     TransitiveTrustMixin, PEER_PAIR_QUERY_SEC)
 from autonomous_trust.evaluation.scenarios.recording import EventRecorder
 from autonomous_trust.services.data import Reading
+from autonomous_trust.core import LOG_FORMAT, LOG_DATEFMT
 
 # Push-delta for reputation/pair tuple emission — mirrors the bridge's
 # REPUTATION_PUSH_DELTA so the coordinator-hosted UI sees the same debounced
@@ -941,7 +942,7 @@ def main():
     logging.basicConfig(
         level=logging.INFO,
         stream=sys.stderr,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format=LOG_FORMAT, datefmt=LOG_DATEFMT,
     )
 
     setup_mode = "--setup" in sys.argv

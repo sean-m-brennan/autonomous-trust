@@ -137,6 +137,19 @@ static void _publish_tier_change(const process_t *proc,
  * ReputationProcess._publish_exclusion. */
 static void _publish_exclusion(const process_t *proc,
                                const uuid_t peer_uuid, bool excluded);
+#ifdef AT_ZTA_ENABLED
+/* ISSUES.md §10.5. Bound @p score by what ZTA proved about @p peer_uuid, and
+ * act on an arriving standing. Mirrors Python's _apply_zta_ceiling /
+ * _apply_zta_standings / _unwind_zta_failure in repprocess.py. */
+static double _zta_apply_ceiling(const uuid_t peer_uuid, double score);
+static void _handle_zta_standing(const process_t *proc,
+                                 const zta_standing_msg_t *st);
+/* Both defined further down, beside the code that owns them; the ZTA block
+ * sits above both because it belongs with _publish_tier_change, which it
+ * calls. */
+static bool _resolve_self_uuid(const process_t *proc, uuid_t out_uuid);
+static void _persist_reputations(const process_t *proc);
+#endif
 /* Forward declaration — definition sits with the rest of the verifiable
  * warm-start code (ISSUES §10.3), below the state struct it writes. Records a
  * finalized checkpoint's root, window bounds and co-signatures, and persists
@@ -388,6 +401,21 @@ static struct {
      * inventing it (§10.2). */
     map_t   child_evidence_tried;
     map_t   restore_clamped;
+#ifdef AT_ZTA_ENABLED
+    /* ISSUES.md §10.5 (ZTA hardening). Volatile, like the slash floor: a
+     * restart re-derives standing from the admission gate rather than trusting
+     * a file for it. Mirrors Python's _zta_* dicts in repprocess.py.
+     *   zta_ceilings:    peer uuid-str -> highest reputation an UNPROVED peer
+     *                    may hold. Absent == no bound.
+     *   zta_proved_index: peer uuid-str -> chain index at its last PROVED
+     *                    verification; the point a later failure unwinds to.
+     *   zta_acted:       peer uuid-str -> the standing already acted on, so the
+     *                    hourly re-verification of an unchanged verdict is a
+     *                    no-op instead of a second unwind. */
+    map_t   zta_ceilings;
+    map_t   zta_proved_index;
+    map_t   zta_acted;
+#endif
     /* Catch-up quorum: handle_update fires the chain merge once this many
      * peers have reported. Production default is 3 (mirrors Python's
      * self.num_updates); a conformance fixture may lower it to 1 so a
@@ -445,6 +473,11 @@ static void _ensure_init(void)
         rep_state.decay_swept = false;
         map_init(&rep_state.child_evidence_tried);
         map_init(&rep_state.restore_clamped);
+#ifdef AT_ZTA_ENABLED
+        map_init(&rep_state.zta_ceilings);
+        map_init(&rep_state.zta_proved_index);
+        map_init(&rep_state.zta_acted);
+#endif
         rep_state.num_updates = 3;  /* catch-up quorum; mirrors Python default */
         /* paxos_init is called in reputation_run after num_peers is known */
         rep_state.num_peers = 0;
@@ -911,6 +944,216 @@ static void _publish_tier_change(const process_t *proc,
 
     json_decref(arr);
 }
+
+#ifdef AT_ZTA_ENABLED
+/****************************
+ * ZTA standing: the DDIL cap, and the unwind on an affirmative failure
+ * (ISSUES.md §10.5). Mirrors Python repprocess._apply_zta_ceiling /
+ * _apply_zta_standings / _unwind_zta_failure.
+ ****************************/
+
+/** Highest reputation @p peer_uuid may hold given what ZTA proved, or a
+ *  negative sentinel for "no bound". Caller must hold rep_state.lock. */
+static double _zta_ceiling_of(const uuid_t peer_uuid)
+{
+    char key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, key);
+    data_t *d = NULL;
+    if (map_get(&rep_state.zta_ceilings, (map_key_t)key, &d) != 0 || d == NULL)
+        return ZTA_NO_CEILING;
+    double ceiling = ZTA_NO_CEILING;
+    if (data_floating_pt_dbl(d, &ceiling) != 0)
+        return ZTA_NO_CEILING;
+    return ceiling;
+}
+
+/* Bound a score by the peer's ZTA ceiling. Applied where the score is WRITTEN
+ * rather than where it is read, so every consumer -- the tier computation,
+ * persistence, the app-facing carrier, a peer answering a rep_req -- sees one
+ * consistent number. A ceiling enforced only at read time would leave the
+ * stored score above it and leak the unbounded value the moment some other
+ * path reported it. Caller must hold rep_state.lock. */
+static double _zta_apply_ceiling(const uuid_t peer_uuid, double score)
+{
+    double ceiling = _zta_ceiling_of(peer_uuid);
+    if (ceiling < 0.0 || score <= ceiling)
+        return score;
+    return ceiling;
+}
+
+/** The score that evidence PREDATING the peer's last proved verification
+ *  supports (ISSUES.md §10.5): back to the last point ZTA actually proved
+ *  something, and no further.
+ *
+ *  A recomputation over the pre-anchor window rather than a stored "score as of
+ *  then" -- no such score is checkpointed (a checkpoint commits to a history
+ *  WINDOW, not to per-peer values) -- reusing the same arithmetic the warm
+ *  start uses so the unwind inherits its shrinkage: a short pre-anchor history
+ *  cannot justify a high score. Falls back to the unverified-restore tier when
+ *  there is no usable pre-anchor evidence, the evicted-chain case included:
+ *  absent evidence bounds a peer low, it does not excuse it.
+ *
+ *  Caller must hold rep_state.lock. */
+static double _zta_unwind_ceiling(const uuid_t self_uuid,
+                                  const uuid_t peer_uuid, int anchor,
+                                  bool have_anchor)
+{
+    double floor_tier = _tier_ceiling(REP_UNVERIFIED_RESTORE_TIER);
+    if (!have_anchor)
+        return floor_tier;  /* never proved: none of its standing rests on ZTA */
+    int lo = (rep_state.history.committed_count > 0)
+                 ? rep_state.history.first_index
+                 : rep_state.history.next_index;
+    if (anchor <= lo)
+        return floor_tier;  /* nothing committed before the proof point */
+
+    char self_key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(self_uuid, self_key);
+    rep_checkpoint_t window;
+    if (rep_checkpoint_init(&window) != 0)
+        return floor_tier;
+    map_t ceilings;
+    if (map_init(&ceilings) != 0)
+    {
+        rep_checkpoint_free(&window);
+        return floor_tier;
+    }
+    /* The window is [first_index, first_index + count), so the anchor is its
+     * exclusive upper bound: everything committed while the credential was
+     * proved, and nothing after. */
+    window.present = true;
+    window.first_index = lo;
+    window.count = anchor - lo;
+    double bound = floor_tier;
+    if (reputation_evidence_ceilings(&rep_state.history, &window, self_key,
+                                     &ceilings) == 0)
+    {
+        char key[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(peer_uuid, key);
+        data_t *d = NULL;
+        double found = 0.0;
+        if (map_get(&ceilings, (map_key_t)key, &d) == 0 && d != NULL &&
+            data_floating_pt_dbl(d, &found) == 0)
+            bound = found;
+    }
+    map_free(&ceilings);
+    rep_checkpoint_free(&window);
+    return bound;
+}
+
+/* Act on one ZTA finding from the identity process.
+ *
+ * No scalar penalty is sent for a failure. A ZTA verdict is an authority
+ * finding, not an interaction outcome, and AT's [0, 1] scale has no
+ * representation for one (§11.2) -- which is why this function's predecessor,
+ * `_send_reputation_penalty`'s `score = -0.8` TRANSACTION_SCORE, was discarded
+ * at the boundary and cost a revoked peer exactly nothing. Bounding the value
+ * and republishing the tier is the action; demotion, and exclusion below the
+ * cut-off, follow from the score _publish_tier_change already reacts to. */
+static void _handle_zta_standing(const process_t *proc,
+                                 const zta_standing_msg_t *st)
+{
+    if (st == NULL)
+        return;
+    char key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(st->peer_uuid, key);
+
+    /* Idempotence: periodic re-verification restates an unchanged verdict by
+     * the hour, and acting on each restatement would ratchet a peer down for a
+     * single offence. */
+    char mark[128];
+    snprintf(mark, sizeof(mark), "%d|%.17g|%s", (int)st->standing,
+             st->ceiling, st->reason);
+    pthread_mutex_lock(&rep_state.lock);
+    data_t *prev = NULL;
+    if (map_get(&rep_state.zta_acted, (map_key_t)key, &prev) == 0 &&
+        prev != NULL)
+    {
+        char *prev_str = NULL;
+        if (data_string_ptr(prev, &prev_str) == 0 && prev_str != NULL &&
+            strcmp(prev_str, mark) == 0)
+        {
+            pthread_mutex_unlock(&rep_state.lock);
+            return;
+        }
+    }
+    map_set(&rep_state.zta_acted, (map_key_t)key, string_data(mark, strlen(mark)));
+
+    if (st->standing == ZTA_STANDING_PROVED)
+    {
+        /* Everything committed up to now was observed while this peer's
+         * credential verified: that is the point a later failure unwinds to. */
+        map_remove(&rep_state.zta_ceilings, (map_key_t)key);
+        map_set(&rep_state.zta_proved_index, (map_key_t)key,
+                integer_data(rep_state.history.next_index));
+        pthread_mutex_unlock(&rep_state.lock);
+        log_info(proc->logger,
+                 "ZTA: %s proved; unwind anchor set at chain index %d\n",
+                 key, rep_state.history.next_index);
+        return;
+    }
+
+    if (st->ceiling >= 0.0)
+        map_set(&rep_state.zta_ceilings, (map_key_t)key,
+                floating_pt_dbl_data(st->ceiling));
+
+    if (st->standing != ZTA_STANDING_FAILED)
+    {
+        /* CAPPED: a bound going forward, and nothing more. A ceiling must not
+         * itself drive a peer downward -- only an affirmative failure justifies
+         * that -- or every disconnected DDIL deployment would be punished for
+         * being disconnected. */
+        pthread_mutex_unlock(&rep_state.lock);
+        log_info(proc->logger, "ZTA: %s capped at %.3f (%s)\n", key,
+                 st->ceiling, st->reason);
+        return;
+    }
+
+    if (!reputations_contains(&rep_state.reputations, st->peer_uuid))
+    {
+        /* Nothing scored yet; the ceiling recorded above bounds the first score
+         * it does earn, and there is nothing to unwind. */
+        pthread_mutex_unlock(&rep_state.lock);
+        log_info(proc->logger, "ZTA: %s failed (%s); no score to unwind\n",
+                 key, st->reason);
+        return;
+    }
+
+    uuid_t self_uuid;
+    bool have_self = _resolve_self_uuid(proc, self_uuid);
+    data_t *idx_dat = NULL;
+    int anchor = 0;
+    bool have_anchor =
+        (map_get(&rep_state.zta_proved_index, (map_key_t)key, &idx_dat) == 0 &&
+         idx_dat != NULL && data_integer(idx_dat, &anchor) == 0);
+    double current = 0.0;
+    reputations_get(&rep_state.reputations, st->peer_uuid, &current);
+    double unwound = _zta_unwind_ceiling(have_self ? self_uuid : st->peer_uuid,
+                                         st->peer_uuid, anchor, have_anchor);
+    if (current <= unwound)
+    {
+        pthread_mutex_unlock(&rep_state.lock);
+        log_info(proc->logger,
+                 "ZTA: %s failed (%s); score %.3f already at or below what "
+                 "pre-verification evidence supports (%.3f)\n",
+                 key, st->reason, current, unwound);
+        return;
+    }
+    reputations_update(&rep_state.reputations, st->peer_uuid, unwound);
+    /* Force CTFT so a peer whose credential is later repaired re-earns trust
+     * from the punished regime instead of snapping back into cooperation --
+     * the same reasoning as the slash override. */
+    map_set(&rep_state.coop_mode, (map_key_t)key, integer_data(0));
+    pthread_mutex_unlock(&rep_state.lock);
+
+    log_warn(proc->logger,
+             "ZTA: %s FAILED (%s); unwound %.3f -> %.3f (anchor %s)\n",
+             key, st->reason, current, unwound,
+             have_anchor ? "recorded" : "none - never proved");
+    _publish_tier_change(proc, st->peer_uuid, unwound);
+    _persist_reputations(proc);
+}
+#endif /* AT_ZTA_ENABLED */
 
 
 /****************************
@@ -2210,6 +2453,11 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
                                             &rep_state.reputations,
                                             self_uuid, peer_uuid);
         }
+#ifdef AT_ZTA_ENABLED
+        /* §10.5: an unproved credential bounds how far this peer may rise,
+         * whichever regime produced the score above. */
+        score = _zta_apply_ceiling(peer_uuid, score);
+#endif
         reputations_update(&rep_state.reputations, peer_uuid, score);
         pthread_mutex_unlock(&rep_state.lock);
     }
@@ -2763,7 +3011,13 @@ static bool _quorum_met(const process_t *proc, json_t *sigs,
 static void _record_cosig_locked(map_t *sigs, const char *round_key,
                                  const char *voter, const char *sig_hex)
 {
-    char key[UUID_STRING_LEN * 2 + 48];
+    /* Three uuids' worth: a checkpoint round key is already
+     * "<proposer>:<epoch>:<chain>" (two uuids plus an int64), and the voter
+     * appends a third. Sized for the epoch a PEER can put on the wire, not the
+     * small ones real rounds use -- at 19 digits the old two-uuid buffer
+     * truncated the voter out of the key, which recorded the vote under a name
+     * no receiver could verify against. */
+    char key[UUID_STRING_LEN * 3 + 64];
     snprintf(key, sizeof(key), "%s:%s", round_key, voter);
     map_set(sigs, (map_key_t)key,
             string_data((string_t)sig_hex, strlen(sig_hex) + 1));
@@ -3161,8 +3415,35 @@ static bool handle_checkpoint_propose(const process_t *proc, directory_t *queues
         json_decref(payload);
         return false;
     }
-    char key[UUID_STRING_LEN + 32];
-    snprintf(key, sizeof(key), "%s:%lld", proposer_str, (long long)epoch);
+    /* The chain the proposal NAMES, exactly as it came off the wire. Two
+     * distinct values are needed and confusing them breaks different things
+     * (mirrors Python handle_checkpoint_propose):
+     *
+     *   group_raw   -- what the PROPOSER called this chain. It keys the round
+     *                  and it is inside the bytes we sign, so both must use it
+     *                  verbatim: the proposer looks its own round up by the
+     *                  value it sent, and verifies our ack against a
+     *                  designation built from that same value.
+     *   chain_key   -- the same chain resolved to OUR local bookkeeping, used
+     *                  only to pick the window to compare. _chain_key
+     *                  normalizes, so a member of a child group maps that
+     *                  group to its own primary "" -- correct for choosing the
+     *                  window, wrong for the key and the designation, because
+     *                  the proposer never said "".
+     */
+    const char *group_str = json_string_value(json_object_get(payload,
+                                                             "group_uuid"));
+    const char *group_raw = (group_str != NULL) ? group_str : "";
+    char chain_key[UUID_STRING_LEN + 1];
+    _chain_key(proc, group_str, chain_key, sizeof(chain_key));
+
+    /* Round key carries the chain: a gateway's primary and child rounds
+     * otherwise collide at the same epoch number, and the proposer's own
+     * pending round (keyed with the chain in _originate_checkpoint) would be
+     * unreachable from here. Same construction, same bound, both sides. */
+    char key[UUID_STRING_LEN * 2 + 32];
+    snprintf(key, sizeof(key), "%s:%lld:%.*s", proposer_str, (long long)epoch,
+             (int)UUID_STRING_LEN, group_raw);
 
     /* Consensus check: co-sign ONLY if our own committed window produces the
      * same Merkle root. Record the proposed round as pending either way so the
@@ -3177,16 +3458,12 @@ static bool handle_checkpoint_propose(const process_t *proc, directory_t *queues
         json_object_set_new(pending_rec, "first_index",
                             json_integer(first_index));
         json_object_set_new(pending_rec, "count", json_integer(count_covered));
+        /* The RAW name, because the sign handler rebuilds the signed
+         * designation out of this record. */
+        if (group_raw[0] != '\0')
+            json_object_set_new(pending_rec, "group_uuid",
+                               json_string(group_raw));
     }
-    /* Which chain the proposal names. Compare THAT chain's window, not always
-     * the primary one: a gateway holds several, and comparing the wrong window
-     * would decline every honest child-group proposal (§10.2). */
-    const char *group_str = json_string_value(json_object_get(payload,
-                                                             "group_uuid"));
-    char chain_key[UUID_STRING_LEN + 1];
-    _chain_key(proc, group_str, chain_key, sizeof(chain_key));
-    if (pending_rec != NULL && chain_key[0] != '\0')
-        json_object_set_new(pending_rec, "group_uuid", json_string(chain_key));
     pthread_mutex_lock(&rep_state.lock);
     transaction_window_root(_chain_for_key_locked(chain_key), mine);
     _store_pending_locked(&rep_state.checkpoint_pending, key, pending_rec);
@@ -3207,9 +3484,13 @@ static bool handle_checkpoint_propose(const process_t *proc, directory_t *queues
      * checkpoint_sign back to the proposer, naming ourselves. */
     const identity_t *self = _resolve_self_identity(proc);
     uint8_t desig[REP_DESIG_MAX];
+    /* Signed over the chain name the PROPOSER used (group_raw), never our
+     * locally resolved chain_key -- the proposer verifies this signature
+     * against its own designation, and for a member of a child group the two
+     * spellings differ. */
     size_t dlen = rep_checkpoint_designation(proposer_str, root, epoch,
                                             first_index, count_covered,
-                                            chain_key, desig, sizeof(desig));
+                                            group_raw, desig, sizeof(desig));
     char sig_hex[REP_SIG_HEX_LEN + 1] = {0};
     if (self == NULL || dlen == 0
         || _cosign_hex(proc, desig, dlen, sig_hex, sizeof(sig_hex)) != 0)
@@ -3231,6 +3512,12 @@ static bool handle_checkpoint_propose(const process_t *proc, directory_t *queues
     json_object_set_new(sign_json, "epoch", json_integer(epoch));
     json_object_set_new(sign_json, "signer_uuid", json_string(self_str));
     json_object_set_new(sign_json, "signature", json_string(sig_hex));
+    /* The ack names the chain too — the proposer needs it to find the right
+     * pending round, and it is inside the bytes just signed. Mirrors Python's
+     * 5-element ack tuple; the far side treats an absent field as the primary
+     * chain, so an older peer that omits it still resolves. */
+    if (group_raw[0] != '\0')
+        json_object_set_new(sign_json, "group_uuid", json_string(group_raw));
     json_decref(payload);
 
     generic_msg_t sign = {0};
@@ -3268,8 +3555,18 @@ static bool handle_checkpoint_sign(const process_t *proc, directory_t *queues, g
         json_decref(payload);
         return false;
     }
-    char key[UUID_STRING_LEN + 32];
-    snprintf(key, sizeof(key), "%s:%lld", proposer_str, (long long)epoch);
+    /* Which chain this ack is for, as the proposer named it. Absent means the
+     * primary chain, matching Python's length-tolerant 4-vs-5 element ack, so a
+     * peer that predates the field still resolves. Keyed identically to
+     * _originate_checkpoint and handle_checkpoint_propose -- same order, same
+     * bound -- or a round recorded by one is unreachable from the others. */
+    const char *ack_group = json_string_value(json_object_get(payload,
+                                                             "group_uuid"));
+    if (ack_group == NULL)
+        ack_group = "";
+    char key[UUID_STRING_LEN * 2 + 32];
+    snprintf(key, sizeof(key), "%s:%lld:%.*s", proposer_str, (long long)epoch,
+             (int)UUID_STRING_LEN, ack_group);
 
     /* Credit the AUTHENTICATED sender, never the payload's claim. */
     char voter[UUID_STRING_LEN + 1];
@@ -5140,8 +5437,14 @@ static void _originate_checkpoint(const process_t *proc,
     /* The round key carries the chain too: a gateway's primary and child rounds
      * can otherwise collide at the same epoch number. */
     char key[UUID_STRING_LEN * 2 + 32];
-    snprintf(key, sizeof(key), "%s:%lld:%s", self_uuid_str, (long long)epoch,
-             chain_key);
+    /* Both fields are uuid strings (the chain key is a group uuid, or "" for
+     * the primary chain), so the bound is the real maximum and never truncates
+     * a legitimate key -- it is here because the callers pass a row of a 2-D
+     * `due_keys` array, whose row length gcc cannot see through the index, so
+     * -Wformat-truncation assumes the string may run to the end of the whole
+     * array. */
+    snprintf(key, sizeof(key), "%s:%lld:%.*s", self_uuid_str, (long long)epoch,
+             (int)UUID_STRING_LEN, chain_key);
     json_t *pending = json_pack("{s:s, s:i, s:i, s:s}", "root", root,
                                 "first_index", first_index, "count", count,
                                 "group_uuid", chain_key);
@@ -5193,6 +5496,14 @@ static void _originate_checkpoint(const process_t *proc,
              "Reputation: proposed checkpoint chain=%s epoch=%lld count=%d "
              "root=%.12s\n", chain_key[0] ? chain_key : "primary",
              (long long)epoch, count, root);
+}
+
+void reputation_force_checkpoint(const process_t *proc,
+                                const char *self_uuid_str,
+                                const char *chain_key)
+{
+    _originate_checkpoint(proc, self_uuid_str,
+                          chain_key == NULL ? "" : chain_key);
 }
 
 /* Originate a checkpoint on the interval, when the window has actually moved.
@@ -5367,6 +5678,18 @@ void reputation_reset_state(int num_peers)
     map_init(&rep_state.peer_tiers);
     map_free(&rep_state.committed_paxos_rounds);
     map_init(&rep_state.committed_paxos_rounds);
+#ifdef AT_ZTA_ENABLED
+    /* §10.5. Must reset with the rest: the conformance harness resets rep_state
+     * between steps, so a ceiling left behind here would bound a peer in a
+     * later scenario that never capped it -- and an unwind anchor left behind
+     * would silently change how far a later failure reaches back. */
+    map_free(&rep_state.zta_ceilings);
+    map_init(&rep_state.zta_ceilings);
+    map_free(&rep_state.zta_proved_index);
+    map_init(&rep_state.zta_proved_index);
+    map_free(&rep_state.zta_acted);
+    map_init(&rep_state.zta_acted);
+#endif
     rep_state.committed_paxos_ring_head = 0;
     rep_state.committed_paxos_ring_len = 0;
     map_free(&rep_state.coop_mode);
@@ -5608,6 +5931,32 @@ int reputation_get_evidence_ceiling(const uuid_t self_uuid,
     return err;
 }
 
+#ifdef AT_ZTA_ENABLED
+int reputation_apply_zta_standing(const process_t *proc,
+                                  const zta_standing_msg_t *standing)
+{
+    if (!rep_state.initialized || proc == NULL || standing == NULL) return -1;
+    _handle_zta_standing(proc, standing);
+    return 0;
+}
+
+double reputation_zta_unverified_ceiling(void)
+{
+    return _tier_ceiling(REP_UNVERIFIED_RESTORE_TIER);
+}
+
+int reputation_get_zta_ceiling(const uuid_t peer_uuid, double *out)
+{
+    if (!rep_state.initialized || out == NULL) return -1;
+    pthread_mutex_lock(&rep_state.lock);
+    double ceiling = _zta_ceiling_of(peer_uuid);
+    pthread_mutex_unlock(&rep_state.lock);
+    if (ceiling < 0.0) return -1;
+    *out = ceiling;
+    return 0;
+}
+#endif
+
 int reputation_get_request_count(void)
 {
     if (!rep_state.initialized) return -1;
@@ -5826,6 +6175,17 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
         if (rerr == -1 || rerr == ENOMSG)
             continue;
 
+#ifdef AT_ZTA_ENABLED
+        if (buf.type == ZTA_STANDING)
+        {
+            /* Identity's finding about a peer's credential (§10.5). Handled
+             * here rather than via run_message_handlers for the same reason
+             * TRANSACTION_SCORE is: that dispatcher routes net_msg payloads by
+             * function name, and this is a local struct. */
+            _handle_zta_standing(proc, &buf.info.zta_standing);
+        }
+        else
+#endif
         if (buf.type == TRANSACTION_SCORE)
         {
             /* Self identity may not have been loaded at startup; resolve

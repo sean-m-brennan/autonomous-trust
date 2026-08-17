@@ -351,7 +351,7 @@ class Simulator(net.SelectServer):
             s.close()
         except OSError:
             local_ip = '127.0.0.1'
-        self.logger.info('Simulation at %s:%d for %s' % (local_ip, port, self.cfg_file))
+        self.logger.info('Simulation at %s:%d for %s', local_ip, port, self.cfg_file)
         super().run(port, **kwargs)
 
 

@@ -56,7 +56,7 @@ class Net(object):
                 raise ReceiveError('No data, connection closed')
             data += new_data
         if self.logger is not None and self.verbose:
-            self.logger.debug('Recv %s' % data)
+            self.logger.debug('Recv %s', data)
         return data
 
     def _write(self, sock: socket.socket, data: bytes):
@@ -65,7 +65,7 @@ class Net(object):
         while offset != data_len:
             offset += sock.send(data[offset:])
         if self.logger is not None and self.verbose:
-            self.logger.debug('Send %s' % data)
+            self.logger.debug('Send %s', data)
 
 
 class Client(Net):
@@ -109,21 +109,21 @@ class Client(Net):
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.connect((serv_addr, serv_port))
             if self.logger is not None:
-                self.logger.debug('Reconnect to %s:%d' % (serv_addr, serv_port))
+                self.logger.debug('Reconnect to %s:%d', serv_addr, serv_port)
         except ConnectionRefusedError:
             self.sock.close()
             self.sock = None
             if was_connected:
                 self.halt = True
                 if self.logger is not None:
-                    self.logger.warning('Connection refused to %s:%d. Halting.' % (serv_addr, serv_port))
+                    self.logger.warning('Connection refused to %s:%d. Halting.', serv_addr, serv_port)
                 elif self.logger is not None:
-                    self.logger.debug('Connection refused to %s:%d' % (serv_addr, serv_port))
+                    self.logger.debug('Connection refused to %s:%d', serv_addr, serv_port)
         except OSError as e:
             self.sock.close()
             self.sock = None
             if self.logger is not None:
-                self.logger.debug('Reconnect failed to %s:%d (%s)' % (serv_addr, serv_port, e))
+                self.logger.debug('Reconnect failed to %s:%d (%s)', serv_addr, serv_port, e)
 
     def reconnect(self, serv_addr: str, serv_port: int, await_server: bool = True):
         while not self.halt:
@@ -196,7 +196,7 @@ class Server(Net):
                         host = socket.gethostbyaddr(host)[0]
                         if self.short:
                             host = host[:host.find('.')]
-                    self.logger.info('New client at %s:%d' % (host, port))
+                    self.logger.info('New client at %s:%d', host, port)
             except socket.timeout:
                 pass
 
@@ -263,7 +263,7 @@ class SelectServer(Server):
                             host = socket.gethostbyaddr(host)[0]
                             if self.short:
                                 host = host[:host.find('.')]
-                        self.logger.info('New client at %s:%d' % (host, port))
+                        self.logger.info('New client at %s:%d', host, port)
                 else:
                     try:
                         data = self.recv_data(sock)
@@ -278,7 +278,7 @@ class SelectServer(Server):
                         sock.close()
                         del self.queues[sock]
                         if self.logger is not None:
-                            self.logger.info('Client at %s:%d disconnected: %s' % (host, port, error))
+                            self.logger.info('Client at %s:%d disconnected: %s', host, port, error)
             for sock in wr:
                 try:
                     self.queues[sock][1].get_nowait()  # just acts as a semaphore
@@ -298,7 +298,7 @@ class SelectServer(Server):
                     sock.close()
                     del self.queues[sock]
                     if self.logger is not None:
-                        self.logger.info('Client at %s:%d errored out' % (host, port))
+                        self.logger.info('Client at %s:%d errored out', host, port)
 
     def recv_data(self, sock: socket.socket):
         raise NotImplementedError

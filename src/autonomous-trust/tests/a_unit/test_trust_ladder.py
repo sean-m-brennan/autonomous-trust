@@ -159,8 +159,30 @@ def test_bootstrap_ladder_overrides_tier_weight(tmp_path):
 # parses` asserts, against the SAME file — without that pairing, "both runtimes
 # read one file" is an intention rather than a fact.
 
-_SHARED_EXAMPLE = (Path(__file__).resolve().parents[4]
-                   / 'config' / 'cfg' / 'trust_ladder.example.json')
+def _find_shared_example():
+    """Locate the example both suites pin, by searching upward rather than
+    counting directories.
+
+    `parents[4]` assumed this file sits exactly four levels below a repo root
+    (`<repo>/src/<pkg>/tests/a_unit/`). Anywhere the tree is shallower — an
+    installed package, or the test image, where these run from `/app/tests/
+    a_unit` — indexing that far raised `IndexError` while the MODULE was being
+    imported. That is a collection error, not a skip: it fails the run before
+    any of these tests are considered, which defeats the `skipif` below.
+
+    Searching upward also means the tests RUN wherever the file does travel,
+    instead of being skipped on a layout that happens to carry it.
+    """
+    rel = Path('config') / 'cfg' / 'trust_ladder.example.json'
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / rel
+        if candidate.exists():
+            return candidate
+    return here.parent / rel        # absent -> the skipif below fires
+
+
+_SHARED_EXAMPLE = _find_shared_example()
 
 
 @pytest.mark.skipif(not _SHARED_EXAMPLE.exists(),

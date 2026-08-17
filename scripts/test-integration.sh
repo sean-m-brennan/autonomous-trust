@@ -28,6 +28,12 @@
 #   ./test-integration.sh --quick          # skip container rebuild
 #   ./test-integration.sh --shell          # drop into bash in test container
 #   ./test-integration.sh --force          # rebuild containers + network from scratch
+#
+# NOTE: tests/, tox.ini and tools/ are mounted from the host, but the
+# `autonomous_trust` PACKAGE comes from the baked image, and a plain run does not
+# rebuild it (only --force does). A preflight therefore refuses to run when the
+# image's package differs from your working tree — see package_image_stale below,
+# and AT_SKIP_STALE_GUARD=1 to override.
 
 set -euo pipefail
 
@@ -111,6 +117,125 @@ build_containers() {
         # Pull from local registry, build as fallback
         require_image "${IMAGE_NAME}-devel" devel
         require_image "${IMAGE_NAME}-test" devel test
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Stale-package preflight
+#
+# `run_test` mounts tests/, tox.ini and tools/ from the HOST but takes
+# `autonomous_trust` from the baked image, and `build_containers` only rebuilds
+# under --force (otherwise require_image is satisfied by whatever image already
+# exists). So a source change that has not been rebuilt runs LIVE TESTS AGAINST
+# OLD CODE — and a stale package fails new tests exactly as a wrong fix would,
+# which has cost real debugging rounds. The peer nodes run the same baked image,
+# so their behaviour is stale too.
+#
+# Conservative in the same way as run-demo.sh's base_image_identity_stale /
+# guard_inspector_image: report stale ONLY on a definitive difference (the image
+# exists, its package is introspectable, and a .py the host has differs or is
+# missing). Any uncertainty — no image, docker or python failure, unreadable
+# tree — reports fresh so a run is never blocked on a false positive. Bypass
+# with AT_SKIP_STALE_GUARD=1.
+#
+# `etc/` and `var/` are excluded because Dockerfile-devel deletes them from the
+# image after the COPY, so their absence there is by design, not skew.
+# ---------------------------------------------------------------------------
+STALE_REPORT=""
+
+package_image_stale() {
+    local base_ref="$1"
+    [[ "${AT_SKIP_STALE_GUARD:-0}" == "1" ]] && return 1
+    docker image inspect "$base_ref" &>/dev/null || return 1
+
+    local pkg_src="$AT_DIR/autonomous_trust"
+    [[ -d "$pkg_src" ]] || return 1
+
+    local digest_py='
+import hashlib, os, sys
+root = sys.argv[1]
+skip = ("__pycache__", "etc", "var")
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d not in skip]
+    for fn in sorted(filenames):
+        if not fn.endswith(".py"):
+            continue
+        full = os.path.join(dirpath, fn)
+        try:
+            with open(full, "rb") as f:
+                h = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            continue
+        print(os.path.relpath(full, root), h)
+'
+    local img_digests
+    img_digests=$(docker run --rm --entrypoint python3 "$base_ref" \
+                  -c "$digest_py" /app/autonomous_trust 2>/dev/null) || return 1
+    [[ -n "$img_digests" ]] || return 1
+
+    # Compare on the host: exit 10 = definitively stale, 0 = in sync, anything
+    # else = uncertain (treated as fresh by the caller).
+    #
+    # Passed with -c, NOT as `python3 - <<PY`: a heredoc BECOMES stdin, so the
+    # program would consume the very stream the digests arrive on and always
+    # read an empty image set (i.e. silently report fresh, which is the one
+    # outcome this function must not get wrong).
+    local compare_py='
+import hashlib, os, sys
+root = sys.argv[1]
+image = {}
+for line in sys.stdin:
+    parts = line.split()
+    if len(parts) == 2:
+        image[parts[0]] = parts[1]
+if not image:
+    sys.exit(1)                      # uncertain
+skip = ("__pycache__", "etc", "var")
+differ, total = [], 0
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d not in skip]
+    for fn in sorted(filenames):
+        if not fn.endswith(".py"):
+            continue
+        rel = os.path.relpath(os.path.join(dirpath, fn), root)
+        total += 1
+        try:
+            with open(os.path.join(dirpath, fn), "rb") as f:
+                mine = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            continue
+        if image.get(rel) != mine:
+            differ.append(rel)
+if not total:
+    sys.exit(1)                      # uncertain
+if not differ:
+    sys.exit(0)
+print("%d of %d .py files differ (%s%s)"
+      % (len(differ), total, ", ".join(sorted(differ)[:3]),
+         ", ..." if len(differ) > 3 else ""))
+sys.exit(10)
+'
+    local report rc
+    report=$(printf '%s\n' "$img_digests" \
+             | python3 -c "$compare_py" "$pkg_src") && rc=0 || rc=$?
+    if [[ "$rc" == "10" ]]; then
+        STALE_REPORT="$report"
+        return 0
+    fi
+    return 1
+}
+
+# Blocks the run when the image's package predates the working tree. Skipped
+# after --force, which has just rebuilt it.
+check_package_freshness() {
+    $FORCE && return 0
+    if package_image_stale "${IMAGE_NAME}-devel"; then
+        error "image ${IMAGE_NAME}-devel predates your sources:"
+        error "  $STALE_REPORT"
+        error "  The suite mounts tests/ from the host but takes the package"
+        error "  from the image, so it would run stale code against live tests."
+        error "  Rerun with --force, or set AT_SKIP_STALE_GUARD=1 to accept."
+        exit 1
     fi
 }
 
@@ -315,6 +440,7 @@ main() {
         build_containers
     fi
 
+    check_package_freshness
     create_network
     run_test
 }

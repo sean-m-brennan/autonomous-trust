@@ -37,6 +37,7 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 from flight_stub import FlightStub  # noqa: E402
+from autonomous_trust.core import LOG_FORMAT, LOG_DATEFMT
 
 logger = logging.getLogger("pi_peer")
 
@@ -101,7 +102,7 @@ def run(peer_name: str, sock_path: str, cadence: float) -> int:
 def main(argv=None) -> int:
     logging.basicConfig(
         level=logging.INFO, stream=sys.stderr,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+        format=LOG_FORMAT, datefmt=LOG_DATEFMT)
 
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("peer_name", nargs="?", help="microdrone peer name")

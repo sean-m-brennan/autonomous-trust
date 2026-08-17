@@ -18,6 +18,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from .. import rendered_log
+
 try:
     from autonomous_trust.services.network_statistics import (
         NetworkStats, NetStatsProtocol, NetworkSource, NetStatsSource,
@@ -282,4 +284,4 @@ class TestNetStatsSourceProcess:
         queues = {src.name: my_q, CfgIds.network: q.Queue()}
         src.process(queues, MagicMock())
         src.logger.error.assert_called()
-        assert 'str' in src.logger.error.call_args[0][0]
+        assert 'str' in rendered_log(src.logger.error)

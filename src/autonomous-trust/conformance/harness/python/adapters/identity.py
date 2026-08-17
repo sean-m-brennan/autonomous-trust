@@ -41,7 +41,7 @@ from uuid import UUID
 
 from autonomous_trust.core.algorithms.impl import AgreementImpl
 from autonomous_trust.core.capabilities import Capabilities, PeerCapabilities
-from autonomous_trust.core.config import Configuration, to_json_string
+from autonomous_trust.core.config import Configuration, from_json_string, to_json_string
 from autonomous_trust.core.identity import Group, Identity, Peers
 from autonomous_trust.core.identity.encrypt import Encryptor
 from autonomous_trust.core.identity.idprocess import IdentityProcess
@@ -84,6 +84,16 @@ _TRIGGER_SUBTREE_ROSTER = 'trigger_subtree_roster'
 # advertisement it emits restates the derived value, so nothing wire-shaped is
 # asserted. Mirrors the C adapter's trigger_hierarchy.
 _TRIGGER_HIERARCHY = 'trigger_hierarchy'
+
+# Pseudo-function: solicit membership in a cohort this participant is NOT in
+# (runtime cross-group join, ISSUES.md §10.2). The step's payload names the
+# target cohort (`group_uuid`), which the scenario pins via fixtures.groups so
+# it is the same string in both harnesses. Unlike the other pseudo-functions
+# this one DOES emit wire traffic -- the ordinary request_access, now carrying
+# the target in payload slot 3 -- because the whole point is that a join is the
+# ordinary admission and not a private side channel. The C adapter recognizes
+# the same string.
+_TRIGGER_COHORT_JOIN = 'trigger_cohort_join'
 
 # Pseudo-function: drive one operator-attended pull (ethne D8/Q9) from the
 # step's `from` participant against its `to` participant, end to end — mint the
@@ -287,6 +297,41 @@ class _Participant:
                 if actual != int(expected):
                     raise AssertionError(
                         f'{self.id}: group_size={actual}, expected {int(expected)}'
+                    )
+            elif key == 'group_key_epoch':
+                # How many times this participant's group key has been rotated.
+                # Admission rotates (§10.2), so a welcomer that admitted one
+                # peer sits at 1 -- that is what keeps cohort traffic recorded
+                # BEFORE a join closed to the joiner. C mirrors via
+                # group_t.key_epoch.
+                grp = self.process.group
+                actual = int(grp.key_epoch) if grp is not None else 0
+                if actual != int(expected):
+                    raise AssertionError(
+                        f'{self.id}: group_key_epoch={actual}, '
+                        f'expected {int(expected)}'
+                    )
+            elif key == 'group_uuid':
+                # This participant's PRIMARY group. Pinned by fixtures.groups,
+                # so the scenario can state it language-agnostically. The
+                # cross-group join asserts it is UNCHANGED: a gateway joining a
+                # child cohort must not have swapped its own group for the one
+                # it just joined. C mirrors via proc->protocol.group.uuid.
+                grp = self.process.group
+                actual = str(grp.uuid) if grp is not None else ''
+                if actual != str(expected):
+                    raise AssertionError(
+                        f'{self.id}: group_uuid={actual}, expected {expected}'
+                    )
+            elif key == 'child_group_count':
+                # Cohorts this participant gateways. A runtime join lands HERE
+                # and not in the primary group -- that separation is the whole
+                # observable. C mirrors via map_size(protocol.child_groups).
+                actual = len(getattr(self.process, 'child_groups', {}) or {})
+                if actual != int(expected):
+                    raise AssertionError(
+                        f'{self.id}: child_group_count={actual}, '
+                        f'expected {int(expected)}'
                     )
             elif key == 'provisional_peer_count':
                 # Peers this participant is holding PROVISIONAL under two-phase
@@ -1262,6 +1307,12 @@ class IdentityAdapter:
             self._run_attest_pull(
                 puller, participant,
                 replay=(inbound.function == _TRIGGER_ATTEST_REPLAY))
+            return participant.drain_outbox()
+        if inbound.function == _TRIGGER_COHORT_JOIN:
+            target = ''
+            if inbound.obj:
+                target = str(from_json_string(inbound.obj).get('group_uuid', ''))
+            participant.process.request_cohort_join(participant.queues, target)
             return participant.drain_outbox()
         if inbound.function == _TRIGGER_HIERARCHY:
             participant.process._refresh_hierarchy(participant.queues)
