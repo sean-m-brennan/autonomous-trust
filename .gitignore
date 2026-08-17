@@ -67,6 +67,9 @@ deploy
 
 # Custom Dash component
 /src/autonomous-trust-inspector/reactjs/src/AsyncUpdate.jl
+# build-docker.sh run_builder()'s stash for dev-only subtrees; empty except
+# during a package build, or after one was killed (reaped on the next run).
+/src/.at-builder-stash/
 /src/autonomous-trust-inspector/reactjs/src/jl
 /src/autonomous-trust-inspector/reactjs/man
 /src/autonomous-trust-inspector/reactjs/deps

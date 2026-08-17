@@ -119,11 +119,11 @@ class IdentityHistory(StepDAG, VoterTracker):
 
     def insert_peer(self, who, level=None):
         if who.uuid is None or not who.nickname or who.signature is None:
-            self.logger.warning(f'Rejecting peer with incomplete identity')
+            self.logger.warning('Rejecting peer with incomplete identity')
             return
         existing = self._find_identity(who)
         if existing is not None:
-            self.logger.warning(f'Peer {who.nickname} already in history')
+            self.logger.warning('Peer %s already in history', who.nickname)
             return
         if who not in self._peers.all:
             self._merkle.insert(IdentityObj(who, self._merkle.root_digest))
@@ -155,7 +155,7 @@ class IdentityHistory(StepDAG, VoterTracker):
     def _validate(self, branch):
         """Validate a branch of the DAG for structural integrity."""
         if branch not in self._StepDAG__branch_lists:
-            self.logger.error(f'Branch {branch} not found')
+            self.logger.error('Branch %s not found', branch)
             return False
         steps = self._StepDAG__branch_lists[branch]
         if not steps:
@@ -163,7 +163,7 @@ class IdentityHistory(StepDAG, VoterTracker):
         for i in range(1, len(steps)):
             if steps[i].timestamp is not None and steps[i - 1].timestamp is not None:
                 if steps[i - 1].timestamp >= steps[i].timestamp:
-                    self.logger.error(f'Backdating at step {i}.')
+                    self.logger.error('Backdating at step %s.', i)
                     return False
         return True
 
@@ -188,8 +188,7 @@ class IdentityHistory(StepDAG, VoterTracker):
                 voter = self._peers.find_by_uuid(proof.uuid)
             if voter is None:
                 self.logger.warning(
-                    f'Unknown voter {proof.uuid} for proof on '
-                    f'{blob.identity.nickname}')
+                    'Unknown voter %s for proof on %s', proof.uuid, blob.identity.nickname)
                 return False
             # _process_id stores the vote signature as a (msg, sig)
             # tuple, where both are HexEncoder-encoded by Identity.sign
@@ -208,7 +207,7 @@ class IdentityHistory(StepDAG, VoterTracker):
             try:
                 voter.verify(smessage)
             except (BadSignatureError, Exception) as e:
-                self.logger.warning(f'Signature verification failed: {e}')
+                self.logger.warning('Signature verification failed: %s', e)
                 return False
         # Divergence detection (ISSUES.md §3.2): the proof commits the voter
         # to a specific view of the candidate via its digest. Recompute the
@@ -229,8 +228,7 @@ class IdentityHistory(StepDAG, VoterTracker):
             expected = blob.get_hash(nonce)
             if bytes(proof_digest) != expected:
                 self.logger.warning(
-                    'Divergent history view: proof digest mismatch for %s'
-                    % blob.identity.nickname)
+                    'Divergent history view: proof digest mismatch for %s', blob.identity.nickname)
                 return False
         return True
 
@@ -289,11 +287,11 @@ class IdentityHistory(StepDAG, VoterTracker):
     def _pre_verify(self, blob: IdentityObj, proof, sig: bytes):
         ident = self._peers.find_by_uuid(blob.originator)
         if ident is not None:
-            self.logger.error(f'Duplicate of existing peer.')
+            self.logger.error('Duplicate of existing peer.')
             return False
         peer = self._peers.find_by_uuid(proof.uuid)
         if peer is not None and proof != peer.verify(sig):
-            self.logger.error(f'Invalid proof signature.')
+            self.logger.error('Invalid proof signature.')
             return False
         # Divergence detection (ISSUES.md §3.2) is implemented as proof-digest
         # consistency in verify_object(), which every concrete agreement

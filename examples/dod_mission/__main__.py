@@ -38,6 +38,7 @@ import argparse
 import json
 import logging
 import sys
+from autonomous_trust.core import LOG_FORMAT, LOG_DATEFMT
 
 
 _HERE_FOR_LOG = "examples.dod_mission"
@@ -80,7 +81,7 @@ def main(argv=None):
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
         stream=sys.stderr,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format=LOG_FORMAT, datefmt=LOG_DATEFMT,
     )
     logger = logging.getLogger(_HERE_FOR_LOG)
 

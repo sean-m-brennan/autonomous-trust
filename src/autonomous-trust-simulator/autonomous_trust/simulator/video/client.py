@@ -64,7 +64,6 @@ class VideoSimRcvr(VideoRcvr, metaclass=ProcMeta,
                     if self._unknown_peer_drops % 100 == 1:
                         self.logger.warning(
                             'Dropping sim video from %s: not in this process\'s '
-                            'cohort (%d so far). Check the delta channel for %s.'
-                            % (uuid, self._unknown_peer_drops, self.name))
+                            'cohort (%d so far). Check the delta channel for %s.', uuid, self._unknown_peer_drops, self.name)
             except (Full, Empty):
                 pass

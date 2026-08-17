@@ -113,7 +113,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                         if peer is not None:
                             participants.append(peer)
             if len(participants) < 1:
-                self.logger.warning('No capable peers for task %s' % task.capability.name)
+                self.logger.warning('No capable peers for task %s', task.capability.name)
                 queues[CfgIds.main].put(
                     TaskResult(task, Status.no_peers, None),
                     block=True, timeout=self.q_cadence)
@@ -123,7 +123,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                     tracker.results[peer.uuid] = None
                     msg = Message(self.name, NegotiationProtocol.announce, task.to_json_string(), peer)
                     queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
-                    self.logger.debug('Sent task to %s' % peer.nickname)
+                    self.logger.debug('Sent task to %s', peer.nickname)
             except Full:
                 self.logger.error('start_task: Network queue full')
             return True
@@ -142,8 +142,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
             # alignment rationale.
             if self.flood_counts[task.uuid] > self.max_task_duplicates:
                 self.logger.warning(
-                    'Negotiation: flood detected for task %s (count=%d), refusing'
-                    % (task.uuid, self.flood_counts[task.uuid]))
+                    'Negotiation: flood detected for task %s (count=%d), refusing', task.uuid, self.flood_counts[task.uuid])
                 try:
                     msg = Message(self.name, NegotiationProtocol.refusal,
                                   task.to_json_string(), message.from_whom)
@@ -294,7 +293,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                 self.logger.debug('Remote status received')
                 if task.status in [Status.running, Status.sleeping, Status.pending]:
                     if task.status == Status.pending:
-                        self.logger.error('Clock synchronization error with %s' % message.from_whom.nickname)
+                        self.logger.error('Clock synchronization error with %s', message.from_whom.nickname)
                     if task.uuid in self.confirmed and message.from_whom in self.confirmed[task.uuid]:
                         params = task.parameters
                         extend = params.timeout_extension
@@ -361,7 +360,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                        if isinstance(message.obj, (str, bytes))
                        else message.obj)
             if not (isinstance(payload, (list, tuple)) and len(payload) >= 2):
-                self.logger.warning('handle_tier_lost: bad payload %r' % payload)
+                self.logger.warning('handle_tier_lost: bad payload %r', payload)
                 return True
             peer_uuid_str, new_tier = str(payload[0]), int(payload[1])
         except Exception as err:
@@ -377,7 +376,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
             target_str = str(target_uuid)
         except (ValueError, AttributeError):
             self.logger.warning(
-                'handle_tier_lost: bad peer uuid %r' % peer_uuid_str)
+                'handle_tier_lost: bad peer uuid %r', peer_uuid_str)
             return True
 
         cancelled_jobs = 0
@@ -501,10 +500,10 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                                     if isinstance(message, Message):
                                         _probes.counter('proc.negotiation', 'unhandled', message.function)
                                         _probes.trace_msg(message, 'unhandled', proc='negotiation')
-                                        self.logger.error('Unhandled message %s' % message.function)
+                                        self.logger.error('Unhandled message %s', message.function)
                                     else:
                                         _probes.counter('proc.negotiation', 'unhandled', 'type:' + message.__class__.__name__)
-                                        self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
+                                        self.logger.error('Unhandled message of type %s', message.__class__.__name__)  # noqa
                 _probes.counter('proc.negotiation', 'iter_drained', str(drained))
 
                 for job in self._get_jobs():  # local jobs
@@ -525,7 +524,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                             msg = Message(self.name, NegotiationProtocol.status_req,
                                           tx_task.to_json_string(), task.requestor)
                             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
-                            self.logger.debug('Request remote execution status from %s' % task.requestor.nickname)
+                            self.logger.debug('Request remote execution status from %s', task.requestor.nickname)
                             self.status_pending.append(task)
                     except Full:
                         self.logger.error('process: Network queue full')

@@ -88,12 +88,24 @@ static int _build_and_deliver(sce_run_ctx_t *ctx, int step_id,
                 if (strcmp(ctx->participants[i].id, from) == 0) continue;
                 snprintf(ctx->current_dispatcher, sizeof(ctx->current_dispatcher),
                          "%s", ctx->participants[i].id);
-                ctx->dispatch(ctx, &ctx->participants[i], &inbound);
+                /* An adapter that fails a dispatch has already written
+                 * ctx->err. Discarding the return here left that error
+                 * invisible and surfaced instead as an empty outbox two steps
+                 * later -- a failure that says nothing about its own cause.
+                 * Python's engine propagates (the dispatch raises), so this is
+                 * also what keeps the two harnesses reporting alike. */
+                if (ctx->dispatch(ctx, &ctx->participants[i], &inbound) != 0) {
+                    ctx->outbox_end[step_id] = (int)ctx->captured_count;
+                    return -1;
+                }
             }
         } else {
             snprintf(ctx->current_dispatcher, sizeof(ctx->current_dispatcher),
                      "%s", unicast_target->id);
-            ctx->dispatch(ctx, unicast_target, &inbound);
+            if (ctx->dispatch(ctx, unicast_target, &inbound) != 0) {
+                ctx->outbox_end[step_id] = (int)ctx->captured_count;
+                return -1;
+            }
         }
     }
     ctx->outbox_end[step_id] = (int)ctx->captured_count;

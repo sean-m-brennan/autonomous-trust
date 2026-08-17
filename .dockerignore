@@ -1,3 +1,14 @@
+# Build context for every repo-root build: build-docker.sh (devel, full-devel,
+# full, lite), run-demo.sh and scale-test-dod-mission.sh (base, inspector,
+# evaluation, dod demo + peer, C node).
+#
+# Patterns here are anchored at THIS directory, so a bare name like `deploy/`
+# matches only ./deploy -- never examples/*/deploy, which the dod images do copy.
+# .dockerignore is read from the context root only: builds whose context is
+# src/ or src/autonomous-trust/ use the .dockerignore in those directories.
+# Note that a `#` comment must own its whole line; trailing text is part of the
+# pattern.
+
 **/__pycache__/
 **/*.pyc
 **/*.pyo
@@ -8,3 +19,39 @@
 # node_modules is reinstalled inside the inspector Dockerfile's builder stage;
 # keep the ~200MB host tree out of the build context.
 **/node_modules/
+
+# --- Large host-only trees ------------------------------------------------
+# Nothing below is read by any build: checked against every COPY/ADD source and
+# every `RUN --mount=source=` in the repo. Together these are ~31GB of a ~33GB
+# context that was being streamed and cached on every build.
+#
+# embedded/ is the 15G buildroot tree (the Dockerfiles inside it are
+# buildroot's own, never built by our scripts); .scale-results/ is 13G of
+# scale-test output; deploy/ is 2.3G of runtime assets that are bind-mounted at
+# run time rather than built in.
+embedded/
+.scale-results/
+deploy/
+.minikube/
+.demo-state/
+attic/
+
+# --- Host build/venv artifacts --------------------------------------------
+**/.venv/
+**/.rustup/
+**/.pytest_cache/
+# src/c/build* rides along inside `COPY src/c` (Dockerfile-c, Dockerfile-native,
+# Dockerfile.zta) but is never read -- those builds cmake fresh into their own
+# dir, and two of them already `rm -rf` the stale examples/build they inherit.
+src/c/build/
+src/c/build-*/
+# Copied by Dockerfile-native/-devel as part of `COPY src/autonomous-trust/rust`,
+# then rebuilt: the image installs its own rustup, so host artifacts never hit.
+**/rust/target/
+# Where build-docker.sh's run_builder() parks .venv/.tox/node_modules/.rustup
+# while conda-build walks a package dir. Normally empty by the time any build
+# runs, but a killed run can strand ~1.3GB there until the next reap.
+src/.at-builder-stash/
+
+# src/dist/conda-repo is deliberately NOT ignored -- src/Dockerfile mounts it
+# (`RUN --mount=source=src/dist/conda-repo`), which reads the build context.

@@ -22,7 +22,13 @@
 # For rapid development, run as:
 #    docker run --rm -u $(id -u):$(id -g) -v src/autonomous-trust:/app -it autonomous-trust-devel
 
-FROM condaforge/miniforge3
+# Base image pinned by tag AND digest -- Miniforge re-pushes tags, so the tag
+# alone does not fix the contents. Value recorded once in
+# config/cfg/toolchain-pins.env (ISSUES.md §9.1), which is also what
+# build-docker.sh passes as --build-arg; the default here keeps a bare
+# `docker build -f src/autonomous-trust/Dockerfile-devel .` equally pinned.
+ARG MINIFORGE_IMAGE=condaforge/miniforge3:26.1.1-3@sha256:958d2675e9a43e199cc85345ff4c60796236b651a9da4982765d99bd34a682d1
+FROM ${MINIFORGE_IMAGE}
 
 ARG http_proxy
 ARG https_proxy
@@ -58,45 +64,18 @@ RUN mkdir /build
 RUN chown -R user:user /build
 USER user
 
-# The conda-pypi:: specs in devel_environ.yml (jcs, mermaid-cli) resolve through
-# the rattler solver (the classic/libmamba solver can't fetch jcs). Install the
-# rattler solver plugin into base and select it so the env create/update below
-# use it.
-#
-# `repodata_use_shards false` works around an UPSTREAM conda bug, not anything
-# of ours (2026-08-04, conda 26.7.0 / conda-rattler-solver 0.1.1 / py-rattler
-# 0.25.0). conda's sharded-repodata reader decompresses each shard through
-# `capped_decompress(data, max_output_size=ZSTD_MAX_SHARD_SIZE)`
-# (`conda/_private/zstd.py`), and `ZSTD_MAX_SHARD_SIZE` is a hard-coded 16 MiB
-# constant with no config knob. A conda-forge shard has outgrown it, so the
-# fetch dies with `backports.zstd.ZstdError: decompressed output exceeds
-# 16777216 bytes` and the whole solve fails.
-#
-# This setting is the right lever rather than switching solvers, because it is
-# the one the rattler solver itself checks — `conda_rattler_solver/index.py`:
-#
-#     def _is_sharded_repodata_enabled():
-#         return getattr(context, "repodata_use_shards", True)
-#     ...
-#     if self.in_state and self.build_repodata_subset and _is_sharded_repodata_enabled():
-#
-# so a false here takes the documented "fall back to non-sharded path" branch
-# and keeps the rattler solver the conda-pypi:: specs above need. Dropping to
-# classic/libmamba to dodge the shard code would break those instead.
-#
-# That same line explains why `env create` below survived and `env update`
-# failed: the sharded path also requires `in_state`, which is populated for an
-# update against an existing env, not for a fresh create.
-#
-# Cost: repodata fetches go back to full `repodata.json`, so the solve is
-# slower (the shard format exists to avoid exactly that). Revisit when conda
-# either raises the cap or makes it configurable. ISSUES.md §9.1 holds the
-# durable half of this: the base image and this solver plugin are both
-# unpinned, which is why an upstream change reached a working build at all.
-RUN conda install -n base -y conda-rattler-solver && \
-    conda config --set solver rattler && \
-    conda config --set repodata_use_shards false
-
+# No base-env mutation here, on purpose. This used to install and select the
+# conda-rattler-solver plugin, because devel_environ.yml sourced `jcs` and
+# `mermaid-cli` from the conda-pypi:: channel and only rattler could fetch
+# those. Those two specs are now served from the file's `pip:` block, so the
+# plugin had no remaining purpose -- and installing it re-solved the base env,
+# which is how base conda was silently upgraded past the version this image
+# ships and into the sharded-repodata defect that broke the build on
+# 2026-08-04 (ISSUES.md §9.1). With the install gone, base conda is exactly
+# what the pinned base image carries, and `conda config --set
+# repodata_use_shards false` -- a workaround for a code path only the rattler
+# plugin took -- went with it. The env create/update below now use the same
+# solver the CI workflows use on the same spec files.
 COPY --chown=user:user config/cfg/environment.yml /build/config/cfg/environment.yml
 COPY --chown=user:user config/cfg/devel_environ.yml /build/config/cfg/devel_environ.yml
 RUN --mount=type=cache,target=/opt/conda/pkgs conda env create -n autonomous_trust --file /build/config/cfg/environment.yml

@@ -125,8 +125,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             # The metaclass default is the same defaults layer; keep honoring an
             # explicit subclass override of `port=` in that case only.
             self.port = self.default_port  # noqa
-        self.logger.info('network base port %d from %s (group %d)'
-                         % (self.port, self.port_source, self.port + 1))
+        self.logger.info('network base port %d from %s (group %d)', self.port, self.port_source, self.port + 1)
 
         # The three tunables, same two-layer resolution and refusal rules as
         # C's net_knob_resolve. Assigned as INSTANCE attributes over the class
@@ -139,9 +138,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self.mystery_max_age_s, myst_src = resolve_mystery_max_age_s(self.logger)
         self.logger.info(
             'network annoy limit %d from %s, recv poll %d ms from %s, '
-            'mystery max age %d s from %s'
-            % (self.annoy_limit, annoy_src, recv_poll_ms, poll_src,
-               self.mystery_max_age_s, myst_src))
+            'mystery max age %d s from %s', self.annoy_limit, annoy_src, recv_poll_ms, poll_src, self.mystery_max_age_s, myst_src)
 
         self.diplomat = True
         self.ping_at_server = None
@@ -387,7 +384,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         if addr:
             self._rejected_addresses.add(addr)
             _probes.counter('net.exclude', 'add')
-            self.logger.info('Reputation cut-off: excluding %s' % addr)
+            self.logger.info('Reputation cut-off: excluding %s', addr)
         return True
 
     def handle_readmit(self, queues, message):
@@ -396,7 +393,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         if addr:
             self._rejected_addresses.discard(addr)
             _probes.counter('net.exclude', 'remove')
-            self.logger.info('Reputation readmit: %s' % addr)
+            self.logger.info('Reputation readmit: %s', addr)
         return True
 
     _PARTITION_SIGNAL_COOLDOWN = 5.0  # seconds, per from_addr
@@ -476,11 +473,11 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                           from_whom=peer)
             return_queue.put(msg, block=True, timeout=self.q_cadence)
         except TransmissionError as err:
-            self.logger.error('Ping (async): %s' % err)
+            self.logger.error('Ping (async): %s', err)
         except Full:
             self.logger.warning('Ping (async): return queue full, dropping stats')
         except Exception as err:
-            self.logger.error('Ping (async) unexpected: %s' % err)
+            self.logger.error('Ping (async) unexpected: %s', err)
 
     def _encr_recv(self, method, msg_queue):
         # Tag counters by recv_peer/recv_group to distinguish ptp vs group.
@@ -498,11 +495,11 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 # Clean close before any framing bytes — routine during
                 # onboarding/teardown. Counter-only, no error log.
                 _probes.counter(layer, 'recv_error', 'peer_disconnect')
-                self.logger.debug('Network: %s' % err)
+                self.logger.debug('Network: %s', err)
                 continue
             except TransmissionError as err:
                 _probes.counter(layer, 'recv_error', 'transmission')
-                self.logger.error('Network: %s' % err)
+                self.logger.error('Network: %s', err)
                 self.track_recv_error()
                 continue
             except TimeoutError:
@@ -531,7 +528,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 # encrypted message because tcp._recv .decode'd raw
                 # bytes and crashed the thread.)
                 _probes.counter(layer, 'recv_error', err.__class__.__name__)
-                self.logger.error('Network recv crashed: %s' % err)
+                self.logger.error('Network recv crashed: %s', err)
                 self.track_recv_error()
                 continue
             if raw_msg is not None:
@@ -577,7 +574,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 raw_msg, from_addr, from_port = self.recv_any()
             except TransmissionError as err:
                 _probes.counter('net.recv.any', 'recv_error', 'transmission')
-                self.logger.error('Network: %s' % err)
+                self.logger.error('Network: %s', err)
                 continue
             except TimeoutError:
                 continue
@@ -594,7 +591,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 # Mirror _encr_recv: never let a malformed inbound kill
                 # the listener thread for the rest of the run.
                 _probes.counter('net.recv.any', 'recv_error', err.__class__.__name__)
-                self.logger.error('Network recv_any crashed: %s' % err)
+                self.logger.error('Network recv_any crashed: %s', err)
                 continue
             if raw_msg is not None:
                 self.unknown_messages.append((raw_msg, from_addr))
@@ -632,7 +629,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                  from_addr=from_addr,
                                  peer_uuid=str(peer.uuid),
                                  waited_s=round(now - deferred_at, 3))
-                    self.logger.debug('Out-of-order message from %s handled' % peer.nickname)
+                    self.logger.debug('Out-of-order message from %s handled', peer.nickname)
                 else:
                     age = now - deferred_at
                     # >= matches C's _deferred_sweep_stale_locked, so a message
@@ -648,7 +645,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                         _probes.emit('net.mystery', 'aged_out',
                                      from_addr=from_addr,
                                      age_s=round(age, 3))
-                        self.logger.debug('Spurious encrypted message from %s dropped' % from_addr)
+                        self.logger.debug('Spurious encrypted message from %s dropped', from_addr)
                     else:
                         remaining.append((raw_msg, from_addr, deferred_at))
             self.encrypted_messages.extend(remaining)
@@ -684,7 +681,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             _probes.counter('net.ptp', 'unencrypted_refused', str(verb))
             self.logger.warning(
                 'Refusing plaintext %s from known peer %s: not an unencrypted '
-                'verb' % (verb, getattr(from_whom, 'nickname', from_whom)))
+                'verb', verb, getattr(from_whom, 'nickname', from_whom))
             return False
         self._msg_to_queue(raw_msg, from_whom, queues, 'point-to-point',
                            validate=False)
@@ -696,7 +693,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             message = Message.parse(msg, from_whom, validate=validate)
         except TypeError as err:
             _probes.counter('net.parse', 'drop', 'type_error')
-            self.logger.error('Error parsing %s: %s' % (msg, err))
+            self.logger.error('Error parsing %s: %s', msg, err)
             return
         from_addr = from_whom
         if isinstance(from_whom, Identity):
@@ -716,18 +713,16 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 _probes.counter('net.dispatch', 'delivered', target)
                 _probes.trace_msg(message, 'dispatched',
                                   target=target, rcvd_by=rcvd_by, from_addr=str(from_addr))
-                self.logger.debug('Recvd %s message for %s:%s from %s' %
-                                  (rcvd_by, target, message.function, from_addr))
+                self.logger.debug('Recvd %s message for %s:%s from %s', rcvd_by, target, message.function, from_addr)
             except Full:
                 _probes.counter('net.dispatch', 'queue_full', target)
                 _probes.trace_msg(message, 'queue_full', target=target)
-                self.logger.error('Network: %s queue is full' % target)
+                self.logger.error('Network: %s queue is full', target)
         else:
             _probes.counter('net.dispatch', 'unknown_target', target)
             _probes.trace_msg(message, 'unknown_target', target=target)
-            self.logger.error('Recvd message for unknown %s process from %s. Ignoring.' %
-                              (target, from_addr))
-            self.logger.debug('Message: %s' % str(message))
+            self.logger.error('Recvd message for unknown %s process from %s. Ignoring.', target, from_addr)
+            self.logger.debug('Message: %s', str(message))
 
     def process(self, queues, signal):
         """
@@ -796,7 +791,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                           encrypt=message.encrypt,
                                           to_addr=to_addr,
                                           to=str(to_whom)[:80])
-                        self.logger.debug('Send network message: %s:%s' % (message.process, message.function))
+                        self.logger.debug('Send network message: %s:%s', message.process, message.function)
                         try:
                             if message.function == Network.stats_req:
                                 msg = Message(CfgIds.network, Network.stats_resp, self.net_stats)
@@ -814,8 +809,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                 elif message.return_to not in queues:
                                     self.logger.warning(
                                         'Ping: unknown return_to %r '
-                                        '(expected a queue key); skipping' %
-                                        message.return_to)
+                                        '(expected a queue key); skipping', message.return_to)
                                 else:
                                     # Dispatch to a worker thread; ping_at()
                                     # is synchronous and sleeps 1 s per
@@ -832,7 +826,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                     self.send_any(msg)
                                     self.track_send_stats(self.unknown_peer, len(msg))
                                 except TransmissionError as err:
-                                    self.logger.error('Network: %s' % err)
+                                    self.logger.error('Network: %s', err)
                                     self.track_send_error(self.unknown_peer)
                             elif isinstance(message.to_whom, Group):
                                 # Encrypt with the TARGET group's key when
@@ -866,7 +860,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                         self.send_group(msg, addr)
                                         self.track_send_stats(self.unknown_peer, len(msg))
                                     except TransmissionError as err:
-                                        self.logger.error('Network: %s' % err)
+                                        self.logger.error('Network: %s', err)
                                         self.track_send_error(self.unknown_peer)
                             else:  # defaults to pseudo-multicast
                                 for who in message.to_whom:  # Message ensures this is list  # noqa
@@ -886,15 +880,14 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                         self.send_peer(msg, address)
                                         self.track_send_stats(who.uuid, len(msg))
                                     except TransmissionError as err:
-                                        self.logger.error('Network: %s' % err)
+                                        self.logger.error('Network: %s', err)
                                         self.track_send_error(who.uuid)
                         except BrokenPipeError as err:
-                            self.logger.error('Network: %s' % err)
+                            self.logger.error('Network: %s', err)
                     else:
                         _probes.counter('net.outbound', 'drop', 'not_a_message')
-                        self.logger.error('Net process recvd message of type %s - Message required. Ignoring.' %
-                                          type(message))
-                        self.logger.debug('Ignored message: %s' % str(message))
+                        self.logger.error('Net process recvd message of type %s - Message required. Ignoring.', type(message))
+                        self.logger.debug('Ignored message: %s', str(message))
 
                 # Drain inbound deques. Each receiver thread can only
                 # push ~1 msg/0.1s per channel (recv-socket timeout),
@@ -942,8 +935,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                             if not self._accept_unencrypted(raw_msg, from_whom,
                                                             queues):
                                 _probes.counter('net.ptp', 'drop', 'decrypt_failed_known_peer')
-                                self.logger.error('Decryption failed for known peer %s, rejecting message' %
-                                                  from_whom.nickname)
+                                self.logger.error('Decryption failed for known peer %s, rejecting message', from_whom.nickname)
                     else:
                         # Unknown sender — bootstrap (empty peers) or a
                         # late joiner welcoming us. Try unencrypted parse;
@@ -979,7 +971,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                             _probes.counter('net.ptp', 'unknown_sender', 'parsed_unencrypted')
                         except UnicodeDecodeError:
                             _probes.counter('net.ptp', 'unknown_sender', 'deferred_encrypted')
-                            self.logger.debug('Out-of-order message from %s detected, retry later' % from_addr)
+                            self.logger.debug('Out-of-order message from %s detected, retry later', from_addr)
                             # Stamp the deferral time here, as C does in
                             # defer_message: the age-out window runs from when
                             # the message was deferred, not from when the
@@ -1020,8 +1012,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                             else:
                                 _probes.counter('net.group', 'drop', 'sender_not_in_peers')
                                 self.logger.warning(
-                                    'Recvd transmission from %s - not in peers. Ignoring.' % from_addr)
-                                self.logger.debug('Ignored payload: %d bytes from %s' % (len(raw_msg), from_addr))
+                                    'Recvd transmission from %s - not in peers. Ignoring.', from_addr)
+                                self.logger.debug('Ignored payload: %d bytes from %s', len(raw_msg), from_addr)
                         except nacl.exceptions.CryptoError as e:
                             _probes.counter('net.group', 'drop', 'crypto_error')
                             name = from_addr
@@ -1030,11 +1022,11 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                             count = self._crypto_error_counts.get(name, 0) + 1
                             self._crypto_error_counts[name] = count
                             if count == 1 or count % 10 == 0:
-                                self.logger.error('CryptoError decrypting message from %s (count: %d)' % (name, count))
+                                self.logger.error('CryptoError decrypting message from %s (count: %d)', name, count)
                     else:
                         _probes.counter('net.group', 'drop', 'sender_not_in_group')
-                        self.logger.error('Recvd transmission from %s - not in group. Ignoring.' % from_addr)
-                        self.logger.debug('Ignored payload: %d bytes from %s' % (len(raw_msg), from_addr))
+                        self.logger.error('Recvd transmission from %s - not in group. Ignoring.', from_addr)
+                        self.logger.debug('Ignored payload: %d bytes from %s', len(raw_msg), from_addr)
                         # Forward a partition-recovery signal to IdentityProcess
                         # so it can probe the foreign group and, if larger,
                         # initiate a normal request_access against it. The

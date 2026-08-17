@@ -44,7 +44,7 @@ except ImportError:
     version = '?.?.?'
 from .config import Configuration, to_json_string, from_json_string, ConfigMap
 from .config.discover import get_cfg_type, load_configs
-from .processes import Process, LogLevel, ProcessTracker
+from .processes import Process, LogLevel, ProcessTracker, LOG_FORMAT, LOG_DATEFMT
 from .identity import Peers
 from .identity.protocol import IdentityProtocol
 from .bootstrap_capabilities import (
@@ -164,8 +164,7 @@ class AutonomousTrust(Protocol):
             # rely on this staying quiet, so the discard is deliberate, not a bug.
             handlers.append(logging.NullHandler())
         for handler in handlers:
-            handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d - %(levelname)s %(message)s',
-                                                   '%Y-%m-%d %H:%M:%S'))
+            handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATEFMT))
             handler.setLevel(log_level)
             self._logger.addHandler(handler)
         if syslog:
@@ -482,7 +481,7 @@ class AutonomousTrust(Protocol):
             # confirm" — a dropped answer degrades to not-attended, never hangs.
             self.logger.error('_answer_operator_state: identity queue full')
         except Exception as err:
-            self.logger.error('_answer_operator_state: %s' % err)
+            self.logger.error('_answer_operator_state: %s', err)
 
     def request_peer_attestation(self, queues, peer):
         """Ask for a freshly-stamped operator attestation from one peer.
@@ -528,8 +527,7 @@ class AutonomousTrust(Protocol):
         peer_uuid = str(peer_uuid)
         if peer_uuid not in self._attest_sent:
             _probes.counter('proc.automate', 'attest_unsolicited')
-            self.logger.warning('_consume_attest_resp: unsolicited report for %s'
-                                % peer_uuid)
+            self.logger.warning('_consume_attest_resp: unsolicited report for %s', peer_uuid)
             return
         del self._attest_sent[peer_uuid]
         attested = payload.get('operator_attested_at') or 0.0
@@ -564,8 +562,7 @@ class AutonomousTrust(Protocol):
                         sig.put_nowait(Process.sig_quit)
                     break
                 except Exception as err:
-                    self.logger.error(self.name + ':  ' +
-                                      ''.join(traceback.TracebackException.from_exception(err).format()))
+                    self.logger.error('%s:  %s', self.name, ''.join(traceback.TracebackException.from_exception(err).format()))
         self.cleanup()
 
     def run_forever(self, q_in: QueueType = None, q_out: QueueType = None):
@@ -584,11 +581,10 @@ class AutonomousTrust(Protocol):
         procs: list[Process] = configs[Process.key]
         if self._log_level <= LogLevel.WARNING:
             self._banner()
-        self.logger.info(self.name + ':  Package signature %s' % configs[PackageHash.key])
-        self.logger.info(self.name + ":  Configuring '%s' at %s for %s" %
-                         (self.identity.nickname, self.identity.address, '(unknown domain)'))
-        self.logger.info(self.name + ':  Signature: %s' % self.identity.signature.publish())
-        self.logger.info(self.name + ':  Public key: %s' % self.identity.encryptor.publish())
+        self.logger.info('%s:  Package signature %s', self.name, configs[PackageHash.key])
+        self.logger.info("%s:  Configuring '%s' at %s for %s", self.name, self.identity.nickname, self.identity.address, '(unknown domain)')
+        self.logger.info('%s:  Signature: %s', self.name, self.identity.signature.publish())
+        self.logger.info('%s:  Public key: %s', self.name, self.identity.encryptor.publish())
 
         if procs is None:
             return
@@ -604,12 +600,12 @@ class AutonomousTrust(Protocol):
 
         with self._pool_type(len(procs)) as pool:
             for proc in system_procs:
-                self.logger.info(self.name + ':  Starting system %s ...' % proc.name)
+                self.logger.info('%s:  Starting system %s ...', self.name, proc.name)
                 self.process_names.append(proc.name)
                 signals[proc.name] = self.queue_type()
                 results[proc.name] = pool.apply_async(proc.process, (queues, signals[proc.name]))
             for proc in additional_procs:
-                self.logger.info(self.name + ':  Starting worker %s ...' % proc.name)
+                self.logger.info('%s:  Starting worker %s ...', self.name, proc.name)
                 self.process_names.append(proc.name)
                 signals[proc.name] = self.queue_type()
                 results[proc.name] = pool.apply_async(proc.process, (queues, signals[proc.name]))
@@ -628,8 +624,7 @@ class AutonomousTrust(Protocol):
             # cleanly and run its tail-of-loop persistence.
             def _graceful_shutdown(signum, _frame):
                 try:
-                    self.logger.info(self.name + ':  SIGTERM received, '
-                                     'propagating quit to subprocesses')
+                    self.logger.info('%s:  SIGTERM received, propagating quit to subprocesses', self.name)
                 except Exception:
                     pass
                 for sig in signals.values():
@@ -652,11 +647,11 @@ class AutonomousTrust(Protocol):
                     break  # all still running means they started successfully
                 time.sleep(Process.cadence)
                 _ready_wait += Process.cadence
-            self.logger.info(self.name + ':                                          Ready.')
+            self.logger.info('%s:                                          Ready.', self.name)
 
             self.autonomous_loop(results, queues, signals)
 
-        self.logger.info(self.name + ':  Shutdown')
+        self.logger.info('%s:  Shutdown', self.name)
 
     ####################
     # Protected methods
@@ -683,7 +678,7 @@ class AutonomousTrust(Protocol):
                 if cfg_name in defaultable:
                     defaultable[cfg_name]().to_file(os.path.join(cfg_dir, cfg_name + Configuration.file_ext))
                 else:
-                    self.logger.error('%s:  Required %s configuration missing' % (self.name, cfg_name))
+                    self.logger.error('%s:  Required %s configuration missing', self.name, cfg_name)
                     return None
 
         # load configs
@@ -702,8 +697,7 @@ class AutonomousTrust(Protocol):
             if net_cfg.refresh():
                 net_cfg.to_file(os.path.join(cfg_dir, CfgIds.network + Configuration.file_ext))
         except OSError as err:
-            self.logger.warning('%s:  Could not re-derive the network address: %s'
-                                % (self.name, err))
+            self.logger.warning('%s:  Could not re-derive the network address: %s', self.name, err)
         self.identity = configs[CfgIds.identity]
         self.identity.address = net_cfg.ip4
         if preferred_proto_ver == 6:
@@ -773,12 +767,11 @@ class AutonomousTrust(Protocol):
                 self._last_ipc_drop_log = now
                 if alive:
                     self.logger.warning(
-                        '%s: IPC queue connection dropped (%s); reconnecting'
-                        % (self.name, type(ex).__name__))
+                        '%s: IPC queue connection dropped (%s); reconnecting', self.name, type(ex).__name__)
                 else:
                     self.logger.error(
                         '%s: manager server process is down; IPC lost, '
-                        'awaiting restart' % self.name)
+                        'awaiting restart', self.name)
             raise queue.Empty from ex
 
     def _monitor_processes(self, proc_results: dict[str, AsyncResult], show_output: bool = True):
@@ -793,15 +786,14 @@ class AutonomousTrust(Protocol):
                 continue
             if result.ready():
                 try:
-                    self.logger.debug('Check process %s' % name)
+                    self.logger.debug('Check process %s', name)
                     result.get(0)
                 except mp.TimeoutError:
                     pass
                 except KeyboardInterrupt:
                     pass
                 except Exception as ex:
-                    self.logger.error(self.name + ':  ' +
-                                      ''.join(traceback.TracebackException.from_exception(ex).format()))
+                    self.logger.error('%s:  %s', self.name, ''.join(traceback.TracebackException.from_exception(ex).format()))
                     self._stopped_procs.append(name)
 
         if show_output:
@@ -818,8 +810,7 @@ class AutonomousTrust(Protocol):
 
     def _failed_task_cb(self, task: Task):
         def report_error(err: Exception):
-            self.logger.error('Task %s failed: %s' %
-                              (task.capability.name, '\n'.join(traceback.format_exception(type(err), err))))
+            self.logger.error('Task %s failed: %s', task.capability.name, '\n'.join(traceback.format_exception(type(err), err)))
 
         return report_error
 
@@ -843,12 +834,12 @@ class AutonomousTrust(Protocol):
                     queues[CfgIds.reputation].put(query, block=True,
                                                   timeout=queue_cadence)
                 elif cmd == Process.sig_quit:
-                    self.logger.debug(self.name + ": External signal to quit")
+                    self.logger.debug('%s: External signal to quit', self.name)
                     return False
             except queue.Empty:
                 pass
             except queue.Full:
-                self.logger.error(self.name + ': Negotiation queue full')
+                self.logger.error('%s: Negotiation queue full', self.name)
 
         message = None
         try:
@@ -865,10 +856,10 @@ class AutonomousTrust(Protocol):
                     else:
                         message.status = Status.unknown
                     queues[CfgIds.negotiation].put(message, block=True, timeout=queue_cadence)
-                    self.logger.debug('Handled status: %s' % message.status)
+                    self.logger.debug('Handled status: %s', message.status)
                 elif isinstance(message, TaskResult):
                     task = message
-                    self.logger.debug(self.name + ': Task result recvd: %s' % task.result)
+                    self.logger.debug('%s: Task result recvd: %s', self.name, task.result)
                     # Requestor-side score for a returned TaskResult. verify_proof()
                     # is tri-state: True (proof verified), False (proof present but
                     # INVALID -> genuine tamper signal), or None (indeterminate: no
@@ -888,14 +879,12 @@ class AutonomousTrust(Protocol):
                         score = 0.8
                     elif zkp_valid is False:
                         self.logger.warning(
-                            self.name + ': ZKP verification FAILED for task %s'
-                            % task.uuid)
+                            '%s: ZKP verification FAILED for task %s', self.name, task.uuid)
                         score = 0.3
                     elif ZKP_AVAILABLE:
                         # Proof missing despite ZKP being available -> suspicious.
                         self.logger.warning(
-                            self.name + ': task %s result carried no ZKP proof '
-                            'despite ZKP being available' % task.uuid)
+                            '%s: task %s result carried no ZKP proof despite ZKP being available', self.name, task.uuid)
                         score = 0.3
                     else:
                         # ZKP unavailable: score on successful completion.
@@ -914,13 +903,13 @@ class AutonomousTrust(Protocol):
                                 message, block=True, timeout=queue_cadence)
                         except queue.Full:
                             self.logger.error(
-                                self.name + ': external feedback queue full')
+                                '%s: external feedback queue full', self.name)
                 elif isinstance(message, Task):
                     task = message
                     if task.capability in self.capabilities:
                         capability = self.capabilities[task.capability.name]
                         pq = self.queue_type()
-                        self.logger.debug(self.name + ': Running task')
+                        self.logger.debug('%s: Running task', self.name)
                         self.active_tasks[str(task.uuid)] = task
                         results[task.uuid] = pool.apply_async(capability.execute, (task, pq))
                         try:
@@ -929,8 +918,7 @@ class AutonomousTrust(Protocol):
                         except queue.Empty:
                             self.logger.error(
                                 '%s: Process failed to start for task %s (capability=%s, task_uuid=%s). '
-                                'No PID received within timeout.' %
-                                (self.name, task.capability.name, capability.name, task.uuid))
+                                'No PID received within timeout.', self.name, task.capability.name, capability.name, task.uuid)
                 elif isinstance(message, Message) and message.function == ReputationProtocol.rep_resp:
                     # A rep_resp carries either a single Reputation (the
                     # classic rep_req / leaf path) or a subtree roster
@@ -997,10 +985,10 @@ class AutonomousTrust(Protocol):
             if isinstance(message, Message):
                 _probes.counter('proc.automate', 'unhandled', message.function)
                 _probes.trace_msg(message, 'unhandled', proc='automate')
-                self.logger.error(self.name + ': Unhandled message %s' % message.function)
+                self.logger.error('%s: Unhandled message %s', self.name, message.function)
             else:
                 _probes.counter('proc.automate', 'unhandled', 'type:' + message.__class__.__name__)
-                self.logger.error(self.name + ': Unhandled message of type %s' % message.__class__.__name__)  # noqa
+                self.logger.error('%s: Unhandled message of type %s', self.name, message.__class__.__name__)  # noqa
 
     def _handle_results(self, queues: dict[str, QueueType], results: dict[str, AsyncResult]):
         for key in list(results.keys()):
@@ -1014,15 +1002,15 @@ class AutonomousTrust(Protocol):
                     # _monitor_processes runs earlier in the same iteration, so
                     # any exception traceback is already on the record; a clean
                     # return leaves no traceback and only this line.
-                    self.logger.error('unexpected termination of process %s' % key)
+                    self.logger.error('unexpected termination of process %s', key)
                     if key not in self._stopped_procs:
                         self._stopped_procs.append(key)
                     del results[key]
                     continue
                 try:
-                    self.logger.debug(self.name + ': %s Task' % key)
+                    self.logger.debug('%s: %s Task', self.name, key)
                     result = results[key].get()
-                    self.logger.debug(self.name + ': %s Task completed %s' % (key, result))
+                    self.logger.debug('%s: %s Task completed %s', self.name, key, result)
                     orig_task = self.active_tasks[str(key)]
                     tr = TaskResult(orig_task, result)
                     tr.generate_proof()
@@ -1042,12 +1030,12 @@ class AutonomousTrust(Protocol):
                 except KeyboardInterrupt:
                     pass
                 except Exception:
-                    self.logger.error('Task Exception - ' + traceback.format_exc())
+                    self.logger.error('Task Exception - %s', traceback.format_exc())
                     try:
                         error_result = TaskResult(self.active_tasks[str(key)], None)
                         queues[CfgIds.negotiation].put(error_result, block=True, timeout=queue_cadence)
                     except Exception:
-                        self.logger.error('Failed to report task error: ' + traceback.format_exc())
+                        self.logger.error('Failed to report task error: %s', traceback.format_exc())
                 del results[key]
 
     def _random_task(self, queues: dict[str, QueueType]):
@@ -1072,6 +1060,6 @@ class AutonomousTrust(Protocol):
             task = Task(TaskParameters(cap, args=args), self.identity)
             msg = Message(CfgIds.negotiation, NegotiationProtocol.start, task)
             queues[CfgIds.negotiation].put(msg, block=True, timeout=queue_cadence)
-            self.logger.debug(self.name + ': Send task to %d peers' % len(self.peers.all))
+            self.logger.debug('%s: Send task to %d peers', self.name, len(self.peers.all))
         except queue.Full:
-            self.logger.error(self.name + ': Test task: negotiation queue full')
+            self.logger.error('%s: Test task: negotiation queue full', self.name)

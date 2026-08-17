@@ -166,7 +166,7 @@ class SimulationInterface(CohortInterface, ScenarioInterface):
         for handler in self._update_handlers:
             handler(state)
         if state.blank:
-            self.logger.debug('Sim update; reset %s' % state.blank)
+            self.logger.debug('Sim update; reset %s', state.blank)
             self.paused = True
             for obj in self.sync_objects:
                 obj.paused = self.paused

@@ -52,6 +52,7 @@
 
 #include "../negative_runner.h"
 
+#include "utilities/util.h"
 #include "../scenario_engine.h"
 
 typedef struct {
@@ -485,6 +486,54 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
             }
         }
     }
+
+#ifdef AT_ZTA_ENABLED
+    /* zta_standing: { "<pid>": { "<other_pid>": {status, ceiling}, ... } } —
+     * pre-stage what ZTA proved about a peer (ISSUES §10.5). Installed directly
+     * rather than driven through an admission step: the verdict is produced by
+     * the IDENTITY process and this protocol's harness stands up only the
+     * reputation one, so what is pinned cross-language is what reputation DOES
+     * with a standing. Mirrors the Python adapter's preset_zta_standing. */
+    json_t *zs = json_object_get(g_fixtures, "zta_standing");
+    if (json_is_object(zs))
+    {
+        json_t *table = json_object_get(zs, target_id);
+        if (json_is_object(table))
+        {
+            const char *other_id;
+            json_t *spec;
+            json_object_foreach(table, other_id, spec)
+            {
+                const uuid_t *u = _uuid_of(ctx, other_id);
+                if (u == NULL || !json_is_object(spec))
+                    continue;
+                const char *status = json_string_value(
+                    json_object_get(spec, "status"));
+                json_t *ceil_j = json_object_get(spec, "ceiling");
+                zta_standing_msg_t st;
+                memset(&st, 0, sizeof(st));
+                memcpy(st.peer_uuid, *u, sizeof(uuid_t));
+                st.standing = (int32_t)ZTA_STANDING_CAPPED;
+                if (status != NULL && strcmp(status, "proved") == 0)
+                    st.standing = (int32_t)ZTA_STANDING_PROVED;
+                else if (status != NULL && strcmp(status, "failed") == 0)
+                    st.standing = (int32_t)ZTA_STANDING_FAILED;
+                st.ceiling = json_is_number(ceil_j)
+                                 ? json_number_value(ceil_j)
+                                 : ZTA_NO_CEILING;
+                const char *reason = json_string_value(
+                    json_object_get(spec, "reason"));
+                at_strlcpy(st.reason, reason ? reason : "", sizeof(st.reason));
+                /* The standing is applied against the TARGET's process --
+                 * the node whose state this call is installing. */
+                sce_participant_t *self_p = sce_find_participant(ctx, target_id);
+                if (self_p != NULL && self_p->impl != NULL)
+                    reputation_apply_zta_standing(
+                        ((rp_impl_t *)self_p->impl)->proc, &st);
+            }
+        }
+    }
+#endif
 
     /* checkpoint: { "<pid>": {root: <hex>, epoch: N} } — pre-seed a finalized
      * Phase 2 checkpoint so an evidence-bearing slash can verify against it in

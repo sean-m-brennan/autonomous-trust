@@ -133,6 +133,95 @@ def _decoded_frame(frame=b'\x00'):
                  return_value=frame)
 
 
+class TestVideoProcessFanout:
+    """`process()`'s one pass: acquire a frame, encode it once per encoding, and
+    send each client the variant it asked for (ISSUES §5 S12).
+
+    Untested until now, and it is where the per-client bookkeeping lives: the
+    fast/slow choice is read from `client_props` while the recipient comes from
+    `clients`, two dicts keyed alike and populated at different moments, so a
+    client can be in one and not the other.
+    """
+
+    def _proc(self, clients, client_props, queue):
+        from autonomous_trust.core import CfgIds
+        proc = MagicMock(spec=VideoProcess)
+        proc.active = True
+        proc.clients = clients
+        proc.client_props = client_props
+        proc.q_cadence = 0.01
+        proc.cadence = 0
+        proc.logger = MagicMock()
+        proc.header_fmt = VideoProcess.header_fmt
+        # One pass, then stop: the real loop runs until signalled.
+        proc.keep_running = MagicMock(side_effect=[True, False])
+        proc.process_messages = MagicMock()
+        proc.sleep_until = MagicMock()
+        frame = __import__('numpy').zeros((4, 4, 3), dtype='uint8')
+        proc.acquire = MagicMock(return_value=(frame, 7))
+        proc.process = VideoProcess.process.__get__(proc)
+        return proc, {CfgIds.network: queue}
+
+    def test_each_client_gets_the_encoding_it_asked_for(self):
+        from autonomous_trust.core import CfgIds
+        queue = MagicMock()
+        peer_fast, peer_slow = MagicMock(), MagicMock()
+        proc, queues = self._proc(
+            {'fast-id': ('sink-a', peer_fast), 'slow-id': ('sink-b', peer_slow)},
+            {'fast-id': (True,), 'slow-id': (False,)},
+            queue)
+        proc.process(queues, MagicMock())
+
+        sent = [call.args[0] for call in queue.put.call_args_list]
+        assert len(sent) == 2
+        by_peer = {msg.to_whom: msg for msg in sent}
+        hdr = struct.calcsize(VideoProcess.header_fmt)
+        fast_len, fast_flag, fast_idx = struct.unpack(
+            VideoProcess.header_fmt, by_peer[peer_fast].obj[:hdr])
+        slow_len, slow_flag, slow_idx = struct.unpack(
+            VideoProcess.header_fmt, by_peer[peer_slow].obj[:hdr])
+        assert fast_flag is True and slow_flag is False
+        # The index is the frame number, so a receiver can tell a repeat from a
+        # new frame; both clients are shown the same one.
+        assert fast_idx == slow_idx == 7
+        # ...and the header's length field must describe the body that follows,
+        # since that is what the receiver slices on.
+        assert len(by_peer[peer_fast].obj) - hdr == fast_len
+        assert len(by_peer[peer_slow].obj) - hdr == slow_len
+
+    def test_a_full_queue_drops_the_frame_rather_than_raising(self):
+        """Video is lossy by nature and the network queue is shared: a dropped
+        frame is a hiccup, while an exception out of `process()` takes the whole
+        service down and stops every client, not just the slow one."""
+        from queue import Full
+        queue = MagicMock()
+        queue.put.side_effect = Full()
+        proc, queues = self._proc({'c': ('sink', MagicMock())}, {'c': (True,)},
+                                  queue)
+        proc.process(queues, MagicMock())      # must not raise
+        assert proc.logger.debug.called
+
+    def test_an_inactive_source_sends_nothing(self):
+        queue = MagicMock()
+        proc, queues = self._proc({'c': ('sink', MagicMock())}, {'c': (True,)},
+                                  queue)
+        proc.active = False
+        proc.process(queues, MagicMock())
+        assert not queue.put.called
+        assert not proc.acquire.called
+
+    def test_a_dropped_frame_is_not_sent(self):
+        """`acquire` returns None whenever `speed` decimation suppresses a
+        position -- every other call at speed 2 -- so this is the common case,
+        not an error path."""
+        queue = MagicMock()
+        proc, queues = self._proc({'c': ('sink', MagicMock())}, {'c': (True,)},
+                                  queue)
+        proc.acquire = MagicMock(return_value=(None, 3))
+        proc.process(queues, MagicMock())
+        assert not queue.put.called
+
+
 class TestVideoRcvrCohortSync:
     """The receiver's roster does not cross the process boundary on its own: one
     Cohort is pickled into each worker, so `cohort.peers` is a separate dict per

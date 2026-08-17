@@ -121,17 +121,78 @@ class TestPackageHashPycache:
         assert after.digest == before.digest
         assert not [m for m in after.modules if '__pycache__' in m]
 
-    def test_without_the_exclusion_the_digest_would_move(self, tmp_path, monkeypatch):
-        """Mutation check: proves the assertion above is load-bearing."""
+    def test_without_the_exclusion_the_pycache_joins_the_walk(self, tmp_path,
+                                                              monkeypatch):
+        """Mutation check: proves the exclusion above is load-bearing.
+
+        Asserted on the WALK rather than on the digest, because what happens
+        after the walk yields a seeded `__pycache__` is interpreter-dependent:
+        3.14 resolves a spec for it (so the digest moves), while 3.13 resolves
+        None (which used to abort the whole digest computation — see
+        `PackageHash.__init__`). The exclusion is what keeps it out of the walk
+        on every interpreter, and that is the property worth pinning.
+        """
+        import pkgutil
         from autonomous_trust.core.system import PackageHash
         root = self._make_tree(tmp_path)
         monkeypatch.setattr(PackageHash, 'excludes', ['viz'])  # pre-fix value
-        before = self._digest(root)
 
         cache = root / 'sub' / '__pycache__'
         cache.mkdir(exist_ok=True)
         (cache / '__init__.py').touch()
-        after = self._digest(root)
 
-        assert after.digest != before.digest
-        assert [m for m in after.modules if '__pycache__' in m]
+        walked = [name for _l, name, _p in
+                  pkgutil.walk_packages([str(root)], self.pkg_name + '.')]
+        assert [n for n in walked if '__pycache__' in n], \
+            'the walk itself no longer reaches __pycache__; this mutation ' \
+            'check needs rewriting against whatever now keeps it out'
+        # And with the real excludes, the digest is unaffected either way --
+        # asserted positively by test_digest_ignores_pycache_init above.
+
+    def test_the_packagehash_under_test_carries_the_guard(self):
+        """As in test_cross_group_join: a stale package fails the case below
+        with the very AttributeError that case exists to prove is gone, which
+        reads as a broken fix rather than an old one."""
+        import inspect
+        from autonomous_trust.core.system import PackageHash
+        assert 'spec is None' in inspect.getsource(PackageHash.__init__), (
+            'The PackageHash under test still dereferences find_spec(...).origin '
+            'unguarded, so the next case fails with the AttributeError it is '
+            'meant to rule out.\n  PackageHash loaded from: %s\n'
+            'Refresh the package under test rather than the test.'
+            % inspect.getfile(PackageHash))
+
+    def test_an_unresolvable_entry_does_not_abandon_the_digest(self, tmp_path,
+                                                              monkeypatch):
+        """A name the walk yields but `find_spec` will not resolve must cost
+        that one module, not the whole digest.
+
+        This is what `__pycache__` looks like on 3.13, and the AttributeError it
+        used to raise came out of `PackageHash.__init__` uncaught — so a build
+        that seeded one `__init__.py` in the wrong place stopped every node from
+        computing the digest peers compare, rather than perturbing it.
+        """
+        import pkgutil
+        from autonomous_trust.core.system import PackageHash
+        root = self._make_tree(tmp_path)
+        real_walk = pkgutil.walk_packages
+
+        class _NoSpec:
+            @staticmethod
+            def find_spec(_name):
+                return None
+
+        top = self.pkg_name + '.'
+
+        def _walk_with_an_unresolvable(path, prefix='', onerror=None):
+            # walk_packages recurses into itself with (path, prefix, onerror),
+            # so take all three and add the unresolvable entry once, at the top.
+            yield from real_walk(path, prefix, onerror)
+            if prefix == top:
+                yield _NoSpec(), prefix + 'sub.__pycache__', True
+
+        monkeypatch.setattr(pkgutil, 'walk_packages', _walk_with_an_unresolvable)
+        monkeypatch.setattr(PackageHash, 'excludes', ['viz'])  # do not skip it
+        hashed = self._digest(root)          # must not raise
+        assert hashed.digest
+        assert not [m for m in hashed.modules if '__pycache__' in m]

@@ -93,7 +93,7 @@ class SimClient(net.Client):
                 self.last = now
             except net.ReceiveError as err:
                 if self.logger is not None:
-                    self.logger.warning('ReceiveError: server disconnect (%s)' % err)
+                    self.logger.warning('ReceiveError: server disconnect (%s)', err)
                 self.halt = True  # assume server halted
         else:
             if self.logger is not None:
