@@ -1,8 +1,11 @@
-[< Process Architecture](process-architecture.md)
+*Previous: [Node lifecycle](node-lifecycle.md)*
 
 # Networking
 
-The network layer handles all wire communication between nodes. It provides three logical channels with different security properties, runs receiver threads for concurrent I/O, and routes messages between the network and internal process queues.
+The network layer handles all wire communication between nodes. It provides
+three logical channels with different security properties, runs receiver threads
+for concurrent I/O, and routes messages between the network and internal process
+queues.
 
 > This describes the Python `NetworkProcess`. The C implementation
 > (`src/c/autonomous_trust/network/`) implements the **same wire protocol**, and
@@ -34,7 +37,7 @@ N is resolved once per node, from three layers in order:
 
 1. the provisioned config's `port` (a config always wins),
 2. the `AT_COMM_PORT` environment variable (operator override, applied only
-   where the config is silent),
+ where the config is silent),
 3. the compile-time default, 27787.
 
 C: `net_port_resolve()` (`network/network.h`), logged at startup with the layer
@@ -54,21 +57,21 @@ the likely cause and the knob to move rather than reporting a bare "Address
 already in use".
 
 That is a per-socket property, not a global one. `SO_REUSEADDR` is set only
-where several listeners on one addr:port is the intent — the
-broadcast/multicast recv socket, and the TCP listeners, where the option grants
-a bind over `TIME_WAIT` but never over a live `LISTEN`. The UDP **unicast** recv
-sockets (peer, group) omit it in both runtimes, because with the option on both
-sockets Linux permits a duplicate bind and delivers every datagram to the last
-binder, leaving the first node deaf with nothing logged (`ISSUES.md` 2.4.2).
+where several listeners on one addr:port is the intent, the broadcast/multicast
+recv socket, and the TCP listeners, where the option grants a bind over
+`TIME_WAIT` but never over a live `LISTEN`. The UDP **unicast** recv sockets
+(peer, group) omit it in both runtimes, because with the option on both sockets
+Linux permits a duplicate bind and delivers every datagram to the last binder,
+leaving the first node deaf with nothing logged (`ISSUES.md` 2.4.2).
 
 Python derives two further ports from the same base: `ping_at_rcv` = N+2 and
 `ping_at_snd` = N+3. C has no counterpart: it implements neither. Both PingAT
-sockets bind a specific address — the client derives one from the route to its
-target when the caller supplies none — so co-located nodes separated only by
+sockets bind a specific address, the client derives one from the route to its
+target when the caller supplies none, so co-located nodes separated only by
 address do not receive each other's replies (`ISSUES.md` 2.4.3).
 
 **PingAT is not ICMP.** It asks whether an *AT peer* is present and answering on
-AT's own ports via a cooperating responder (`PingATServer`); `ping(8)` asks
+the ports AT itself uses, via a cooperating responder (`PingATServer`); `ping(8)` asks
 whether a *host* is reachable. A host can answer ICMP with no AT process running
 at all, and an AT node can be present while ICMP is filtered, so the two answer
 different questions. The name says which one this is. PingAT is
@@ -76,10 +79,14 @@ non-load-bearing: a missed reply costs a latency sample and changes no AT
 behaviour.
 
 There is no NTP port. AT carries no NTP implementation on either side; a stock
-daemon on the host disciplines the clock and AT only reads what it achieved
-(see [Node Lifecycle](node-lifecycle.md#clock-discipline)).
+daemon on the host disciplines the clock and AT only reads what it achieved (see
+[Node Lifecycle](node-lifecycle.md#clock-discipline)).
 
-The `TCPNetworkProcess` extends this by replacing peer and group UDP with TCP (using `listen`/`accept`), while keeping UDP for broadcast/multicast. TCP uses `[length]\|[data]` framing for reliable delivery. By default it opens one connection per message; it can optionally reuse one connection per peer for many messages, described in [TCP Connection Pooling](network-connection-pooling.md).
+The `TCPNetworkProcess` extends this by replacing peer and group UDP with TCP
+(using `listen`/`accept`), while keeping UDP for broadcast/multicast. TCP uses
+`[length]\|[data]` framing for reliable delivery. By default it opens one
+connection per message; it can optionally reuse one connection per peer for many
+messages, described in [TCP Connection Pooling](network-connection-pooling.md).
 
 ## Wire message format
 
@@ -89,11 +96,12 @@ Messages are serialized as pipe-delimited strings:
 process|function|data
 ```
 
-- **process**: Target subsystem name (e.g., `identity`, `negotiation`, `reputation`)
-- **function**: Protocol message type (e.g., `request_access`, `invitation`, `ask permission`)
-- **data**: JSON-serialized payload (Configuration objects auto-deserialize if they contain `__type__`)
+- **process.** Target subsystem name (e.g., `identity`, `negotiation`, `reputation`)
+- **function.** Protocol message type (e.g., `request_access`, `invitation`, `ask permission`)
+- **data.** JSON-serialized payload (Configuration objects auto-deserialize if they contain `__type__`)
 
-For encrypted channels, the entire serialized string is encrypted before transmission.
+For encrypted channels, the entire serialized string is encrypted before
+transmission.
 
 ## Receiver threads
 
@@ -106,11 +114,14 @@ For encrypted channels, the entire serialized string is encrypted before transmi
 | **unknown_receiver** | `unknown_receiver()` | Broadcast socket | Appends to `unknown_messages` |
 | **mystery_handler** | `mystery_handler()` |, | Retries encrypted messages from unknown peers |
 
-The mystery handler exists because during bootstrapping, encrypted messages may arrive before the sender's identity is known. It holds these messages and retries decryption periodically (up to 30 seconds) as peers are discovered.
+The mystery handler exists because during bootstrapping, encrypted messages may
+arrive before the sending identity is known. It holds these messages and retries
+decryption periodically (up to 30 seconds) as peers are discovered.
 
 ## Send-side message routing
 
-When a process places a `Message` on the network queue, `NetworkProcess` routes it based on `message.to_whom`:
+When a process places a `Message` on the network queue, `NetworkProcess` routes
+it based on `message.to_whom`:
 
 ```mermaid
 flowchart TD
@@ -170,7 +181,8 @@ flowchart TD
 
 ## Queue dispatch
 
-After decryption, `_msg_to_queue()` parses the wire format and routes the resulting `Message` to the correct process queue:
+After decryption, `_msg_to_queue()` parses the wire format and routes the
+resulting `Message` to the correct process queue:
 
 1. Parse `raw_msg` into `Message(process, function, data)`
 2. Look up `message.process` in the subsystem list
@@ -180,11 +192,13 @@ If the process name is not recognized, the message is logged and dropped.
 
 ## Pest tracking
 
-Peers that send invalid encrypted messages (returning `None` from decryption but with a known address) are tracked in a `pests` dict. After exceeding `annoy_limit` (5) failed messages, the peer is demoted in the hierarchy.
+Peers that send invalid encrypted messages (returning `None` from decryption but
+with a known address) are tracked in a `pests` dict. After exceeding
+`annoy_limit` (5) failed messages, the peer is demoted in the hierarchy.
 
 **Network tunables.** Three operational knobs resolve from an environment
 override, else the compile-time default, identically in both runtimes. They
-carry no config layer — unlike the base port, these are per-node tuning rather
+carry no config layer, unlike the base port, these are per-node tuning rather
 than provisioned identity, so `network.cfg.json` does not mention them. A value
 that is unparseable or out of range is refused with a warning and the default
 kept, and startup logs each knob with the layer that supplied it, so an ignored
@@ -204,4 +218,6 @@ duration and drifted with load, while C's retry is event-driven and could never
 have counted time at all. The `network/tunables-resolution` conformance case
 holds the two implementations to the same table (`ISSUES.md` 2.4.4).
 
-[Identity Protocol >](identity-protocol.md)
+---
+
+*Next: [Connection pooling](network-connection-pooling.md)*

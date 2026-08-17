@@ -1,0 +1,87 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: cross-group-join-rank-refused
+byte_pinning: false
+description: |
+    The rank half of the join gate (ISSUES.md §10.2): a peer that does not
+    OUT-RANK a cohort may not solicit membership in it.
+
+    Same topology as `cross-group-join-runtime` with the ranks inverted — gw at
+    1, bg at 5 — so the solicitation reaches a cohort that outranks the asker.
+    Nothing else changes, which is the point: the only difference between
+    admitted and refused here is the rank relationship.
+
+    Why rank and not just "is it anchored": a shared anchor says the requester
+    belongs to the same trust domain, not that it belongs ABOVE this cohort. A
+    cohort is joined from above, by the node that will gateway it — the same
+    direction `_derive_parent_gateway` reads when it asks who leads US. Without
+    the rank comparison, any peer holding an anchor the cohort also holds could
+    ask every cohort in the domain to admit it and collect their keys
+    sideways, one ordinary-looking admission at a time. Each of those
+    admissions would be individually well-formed; the gate is what makes the
+    pattern impossible rather than merely detectable after the fact.
+
+    The refusal happens BEFORE the vote, so the observable is that the
+    admission never starts: bg proposes nothing, admits nobody, and — because
+    no admission happened — never rotates its key. Refusal is silent on the
+    wire by design; a peer told exactly why it was refused learns which rank
+    would have worked.
+
+participants:
+  - id: gw
+    role: border_guard
+  - id: bg
+    role: border_guard
+
+fixtures:
+  groups:
+    gw:
+      uuid: "c1000000-0000-4000-8000-00000000000a"
+      size: 1
+    bg:
+      uuid: "c1000000-0000-4000-8000-00000000000b"
+      size: 1
+  # Inverted against cross-group-join-runtime: the asker is BELOW the cohort.
+  ranks:
+    gw: 1
+    bg: 5
+
+steps:
+  - id: 1
+    from: gw
+    to: gw
+    function: trigger_cohort_join
+    payload:
+      group_uuid: "c1000000-0000-4000-8000-00000000000b"
+    description: |
+        gw solicits. The local side of a join is unconditional — a node may ask
+        anything; what it may be GRANTED is the cohort's business.
+
+  - id: 2
+    from: gw
+    to: broadcast
+    function: request_access
+    in_response_to: 1
+    payload:
+      # Restates the cohort gw named in slot 3. Python re-delivers the captured
+      # message and ignores this; the C engine rebuilds a propagated message
+      # from the step, so without it the solicitation would arrive stripped of
+      # its target and be read as an ordinary open request.
+      group_uuid: "c1000000-0000-4000-8000-00000000000b"
+    description: |
+        Delivered to bg. The cohort uuid matches, so bg does answer for it —
+        and then refuses, because gw's rank does not exceed bg's.
+
+expected_state:
+  bg:
+    # The vote never started. This, not peer_count alone, is what says the
+    # refusal came BEFORE the cohort was asked to decide.
+    propose_emitted: 0
+    peer_count: 0
+    # No admission, so no rotation. A cohort that rotated on a REFUSED request
+    # would let any peer in the domain churn its key at will.
+    group_key_epoch: 0
+  gw:
+    # Nothing was granted, so nothing was adopted.
+    child_group_count: 0

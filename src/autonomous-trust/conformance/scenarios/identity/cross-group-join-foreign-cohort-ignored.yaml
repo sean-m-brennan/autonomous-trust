@@ -1,0 +1,89 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: cross-group-join-foreign-cohort-ignored
+byte_pinning: false
+description: |
+    A targeted `request_access` names the cohort it is asking to join
+    (ISSUES.md §10.2, payload slot 3). That name is a routing HINT, not
+    authority, and this pins the difference.
+
+    The slot travels on an open broadcast, so every node on the domain sees it,
+    including nodes in cohorts it does not name. Each recipient checks the name
+    against its OWN group and answers only for itself. Here gw names a cohort
+    that is nobody's — so bg, whose group uuid differs, drops the request
+    without proposing, voting, or admitting.
+
+    What this forecloses is the reading where the slot means something on
+    arrival. If a recipient treated a named-but-unmatched target as "somebody
+    is joining, go along with it", a single broadcast could pull unrelated
+    cohorts into an admission none of them was asked about. And if a recipient
+    ignored the slot entirely, the opposite failure: a request meant for one
+    cohort would be admitted by every cohort that heard it, which is precisely
+    the sideways key collection the rank gate exists to stop — arriving through
+    the front door instead.
+
+    So the rule is narrow and symmetric: absent slot = the ordinary open
+    request for a primary group, handled exactly as it always was (which is why
+    every pre-existing identity scenario still passes unchanged); present and
+    matching = answer for our cohort, subject to the gate; present and not
+    matching = not ours to answer.
+
+    Ranks are set so gw WOULD out-rank bg. That is deliberate: it removes the
+    rank gate as an alternative explanation for the refusal, leaving the cohort
+    name as the only thing that decided.
+
+participants:
+  - id: gw
+    role: border_guard
+  - id: bg
+    role: border_guard
+
+fixtures:
+  groups:
+    gw:
+      uuid: "c2000000-0000-4000-8000-00000000000a"
+      size: 1
+    bg:
+      uuid: "c2000000-0000-4000-8000-00000000000b"
+      size: 1
+  ranks:
+    gw: 5
+    bg: 1
+
+steps:
+  - id: 1
+    from: gw
+    to: gw
+    function: trigger_cohort_join
+    payload:
+      # Neither participant's cohort. gw is asking a group that is not on this
+      # domain; bg merely overhears it.
+      group_uuid: "c2000000-0000-4000-8000-0000000000ff"
+    description: gw solicits a cohort that is not bg's.
+
+  - id: 2
+    from: gw
+    to: broadcast
+    function: request_access
+    in_response_to: 1
+    payload:
+      # Restates the cohort gw named in slot 3. Python re-delivers the captured
+      # message and ignores this; the C engine rebuilds a propagated message
+      # from the step, so without it the solicitation would arrive stripped of
+      # its target and be read as an ordinary open request.
+      group_uuid: "c2000000-0000-4000-8000-0000000000ff"
+    description: |
+        Delivered to bg, which reads slot 3, finds a cohort that is not its
+        own, and stops there.
+
+expected_state:
+  bg:
+    # Not ours to answer: no proposal, no admission, no rotation.
+    propose_emitted: 0
+    peer_count: 0
+    group_key_epoch: 0
+  gw:
+    # Still soliciting — nothing arrived to adopt. gw's own group is untouched.
+    child_group_count: 0
+    group_uuid: "c2000000-0000-4000-8000-00000000000a"

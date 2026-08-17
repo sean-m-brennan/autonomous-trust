@@ -1,8 +1,8 @@
+*Previous: [The integration API](../api.md)*
+
 ---
-title: AutonomousTrust
-subtitle: Cooperative computing among machines that don't trust each other
-author: Sean M. Brennan
-date: August 2026
+title: AutonomousTrust subtitle: Cooperative computing among machines that don't
+trust each other author: Sean M. Brennan date: August 2026
 ---
 A technical introduction: motivations, philosophy, and mechanisms.
 
@@ -23,16 +23,15 @@ do not fully trust each other and cannot count on a central authority to vouch
 for anyone. Every peer starts untrusted, earns standing through observed
 behavior in an iterated game, and is re-evaluated continuously. Every decision
 is made at the node. Authentication opens the door; AT governs what happens
-inside the room, and keeps governing it when the network is jammed, degraded,
-or partitioned.
+inside the room, and keeps governing it when the network is jammed, degraded, or
+partitioned.
 
 This paper covers the motivation, the philosophy, and then the mechanisms:
 cryptographic identity over a Merkle DAG ledger, a hash-linked bilateral
-reputation chain with evidence-gated slashing, leaderless Byzantine
-Multi-Paxos, capability tier-gating, peer-to-peer negotiation, and a network
-built to survive disconnection. It also covers how AT layers onto NIST SP
-800-207 rather than replacing it, where humans fit, what is built today, and
-how we prove any of it.
+reputation chain with evidence-gated slashing, leaderless Byzantine Multi-Paxos,
+capability tier-gating, peer-to-peer negotiation, and a network built to survive
+disconnection. It also covers how AT layers onto NIST SP 800-207 rather than
+replacing it, where humans fit, what is built today, and how we prove any of it.
 
 ---
 
@@ -63,8 +62,8 @@ center here, not an edge case.
 Conventional ZTA and ICAM grant implicit trust after login. One proof, then
 trusted, for the life of the session. AT augments that with a continuous
 behavioral gradient. Authentication proves *who*; AT governs *what*, *for how
-long*, and revokes in real time. A valid credential earns a peer the right to
-be *heard*, and is never a substitute for trust.
+long*, and revokes in real time. A valid credential earns a peer the right to be
+*heard*, and is never a substitute for trust.
 
 Authentication is not trust. Everything that follows is a consequence of taking
 that sentence literally.
@@ -76,16 +75,16 @@ that sentence literally.
 Six commitments shape every mechanism in the system:
 
 1. Zero-trust default-deny, so that every peer starts untrusted and identity
-   alone implies nothing.
+ alone implies nothing.
 2. Standing accrues from observed behavior in an iterated game, rather than
-   being conferred by fiat.
+ being conferred by fiat.
 3. Peers confer standing, weighted by *their* standing, which yields a
-   PageRank-like web of opinion instead of a central verdict.
+ PageRank-like web of opinion instead of a central verdict.
 4. Assume any peer may be hostile; least privilege, scoped to the task, bounds
-   the blast radius when one turns out to be.
+ the blast radius when one turns out to be.
 5. Uncertainty degrades access gracefully, and never silently grants it.
 6. A human operator is just a privileged peer, running the same machinery with
-   PIV/CAC and MFA.
+ PIV/CAC and MFA.
 
 ### 2.1 Human trust as the design template
 
@@ -102,40 +101,40 @@ Human trust relationships break down into seven structural facets, and each one
 has a direct machine implementation:
 
 1. **Scale.** Social groups are cognitively bounded (Dunbar gives a maximum
-   around 150, with tighter tiers at 5, 15 and 35), and larger organizations
-   use hierarchy to loosely cohere the whole. In AT, peers communicate
-   directly within a bounded enclave, and a dynamic hierarchy of peer leaders
-   handles traversal between enclaves.
+ around 150, with tighter tiers at 5, 15 and 35), and larger organizations
+ use hierarchy to loosely cohere the whole. In AT, peers communicate
+ directly within a bounded enclave, and a dynamic hierarchy of peer leaders
+ handles traversal between enclaves.
 2. **Language.** Shared language is both efficient knowledge transfer and an
-   in-group signifier. In AT, the message schemas an agent implements define
-   which groups it participates in. Schema is membership.
+ in-group signifier. In AT, the message schemas an agent implements define
+ which groups it participates in. Schema is membership.
 3. **Shared goals.** Trust is barely needed when people merely work near each
-   other, and becomes critical when they work *together*. In AT, goals are
-   negotiated explicitly by protocol, and an agent with no business talking to
-   you simply will not.
+ other, and becomes critical when they work *together*. In AT, goals are
+ negotiated explicitly by protocol, and an agent with no business talking to
+ you simply will not.
 4. **Consistent identity.** Human trust cannot function without it, which is
-   why false identity provokes reactions from embarrassment to violence. In
-   AT, identity is cryptographic and recorded in a verifiable ledger.
+ why false identity provokes reactions from embarrassment to violence. In
+ AT, identity is cryptographic and recorded in a verifiable ledger.
 5. **Reputation.** Standing enables indirect reciprocity: you act partly on
-   how your action will affect your standing with third parties. In AT,
-   bilateral transaction scores are weighted by the scorer's own standing.
+ how your action will affect your standing with third parties. In AT,
+ bilateral transaction scores are weighted by the scorer's own standing.
 6. **Optimization for strangers.** Where reputation information is sparse,
-   humans fall back on heuristics such as the two-strikes rule. In AT,
-   game-theoretic strategies carry the cold-start case.
+ humans fall back on heuristics such as the two-strikes rule. In AT,
+ game-theoretic strategies carry the cold-start case.
 7. **Prioritization.** Tracking trust is cognitively expensive, so humans use
-   shortcuts, most visibly social roles. In AT, configurable strategy trades
-   security against opportunity, and hierarchy makes discovery cheap.
+ shortcuts, most visibly social roles. In AT, configurable strategy trades
+ security against opportunity, and hierarchy makes discovery cheap.
 
 ### 2.2 The trust gradient in practice
 
-Because trust is a live value in [0.0, 1.0] rather than a boolean, a single
-node can meter access along a gradient. This is the inverted access model, and
-all four levels operate in the same application at the same time:
+Because trust is a live value in [0.0, 1.0] rather than a boolean, a single node
+can meter access along a gradient. This is the inverted access model, and all
+four levels operate in the same application at the same time:
 
 1. Refuse traffic from badly trusted peers, to save bandwidth
 2. Accept traffic but refuse compute to weakly trusted peers, to protect CPU
 3. Offer compute but withhold data from moderately trusted peers, to protect
-   data
+ data
 4. Share data with well trusted peers
 
 The payoff of treating trust as a number is that the same peer can be good
@@ -150,7 +149,7 @@ leads with the bases that do not require it:
 
 1. authentication and provenance (the existing credential stack)
 2. hardware attestation, for the captured-asset case (TPM or secure element,
-   measured boot)
+ measured boot)
 3. least-privilege containment
 4. delegated or transferred trust (a cohort vouches)
 5. behavioral reputation
@@ -168,13 +167,13 @@ detection refines rather than gates.
 ## 3. Architecture at a glance
 
 AT is decentralized by construction. Groups form organically, reputation is
-maintained by leaderless Byzantine Multi-Paxos, and tasks are negotiated peer
-to peer. Four cooperating subsystem processes do the work:
+maintained by leaderless Byzantine Multi-Paxos, and tasks are negotiated peer to
+peer. Four cooperating subsystem processes do the work:
 
-- **Network**: transport, encryption, discovery
-- **Identity**: who a peer is, and admission
-- **Negotiation**: what work gets done, and for whom
-- **Reputation**: how much each peer is trusted
+- **Network.** transport, encryption, discovery
+- **Identity.** who a peer is, and admission
+- **Negotiation.** what work gets done, and for whom
+- **Reputation.** how much each peer is trusted
 
 Cryptography is NaCl/libsodium throughout, with no novel primitives:
 
@@ -188,13 +187,13 @@ Cryptography is NaCl/libsodium throughout, with no novel primitives:
 Private keys never touch the wire. Announcements carry public keys only.
 
 An AT node deploys as a small resident agent co-located with the application it
-protects, sitting between that application and the network as the node's own
-policy decision and enforcement point. Where a device cannot host code at all,
-the same agent runs as a bump-in-the-wire gateway on its data bus. The C core
-is bounded-memory and deterministic, and the anomaly layer keeps fixed
-per-peer state with no backhaul to a data lake, so the agent can run as a
-low-priority co-resident process or offload to the gateway entirely. A
-compute-starved sensor carries little or none of the trust-evaluation cost.
+protects, sitting between that application and the network as its own policy
+decision and enforcement point. Where a device cannot host code at all, the same
+agent runs as a bump-in-the-wire gateway on its data bus. The C core is
+bounded-memory and deterministic, and the anomaly layer keeps fixed per-peer
+state with no backhaul to a data lake, so the agent can run as a low-priority
+co-resident process or offload to the gateway entirely. A compute-starved sensor
+carries little or none of the trust-evaluation cost.
 
 ---
 
@@ -211,9 +210,9 @@ Naming is Zooko-style, which is how we get decentralized, human-meaningful and
 secure names at once instead of picking two:
 
 - `nickname` is the online global name (for example
-  `squad-warrant@dod-demo`), and it is the only name that appears on the wire.
+ `squad-warrant@dod-demo`), and it is the only name that appears on the wire.
 - `petname` is the local name each receiver mints for itself. It is never
-  serialized, so nobody can inject a name into your namespace.
+ serialized, so nobody can inject a name into your namespace.
 
 Every identity also carries a stable UUID. Duplicate UUID, signing-key, or
 encryption-key collisions are rejected on sight.
@@ -224,10 +223,10 @@ section 11 explains how we hold ourselves to it.
 
 ### 4.2 A verifiable ledger with permissionless admission
 
-Identity history is a DAG of Merkle roots. The useful analogy is *git*:
-identity blobs are diffs, Merkle roots are commits, and divergent branches
-merge at their lowest common ancestor. Membership is provable by Merkle
-inclusion proof, and backdating is rejected by timestamp monotonicity.
+Identity history is a DAG of Merkle roots. The useful analogy is *git*: identity
+blobs are diffs, Merkle roots are commits, and divergent branches merge at their
+lowest common ancestor. Membership is provable by Merkle inclusion proof, and
+backdating is rejected by timestamp monotonicity.
 
 Admission is permissionless but Sybil-resistant, on what amounts to a
 border-guard pattern:
@@ -237,13 +236,13 @@ border-guard pattern:
 `full_history` (group key and DAG, encrypted)
 
 The agreement algorithm behind the vote is pluggable: Proof of Work, Proof of
-Stake, or Proof of Authority, chosen to suit the deployment. Peers with a
-known UUID (the amnesia and restart cases) skip the vote, and a membership
-change propagates a group-key update to the cohort.
+Stake, or Proof of Authority, chosen to suit the deployment. Peers with a known
+UUID (the amnesia and restart cases) skip the vote, and a membership change
+propagates a group-key update to the cohort.
 
-Note what admission does *not* do. It does not confer standing. A peer that
-has just been voted in has been granted the right to be heard, and has a
-reputation of zero.
+Note what admission does *not* do. It does not confer standing. A peer that has
+just been voted in has been granted the right to be heard, and has a reputation
+of zero.
 
 ---
 
@@ -293,8 +292,8 @@ recovery strategy.
 
 ### 5.3 Consensus and slashing
 
-Agreement on reputation runs as leaderless Byzantine Multi-Paxos, so there is
-no coordinator to capture, and none to lose.
+Agreement on reputation runs as leaderless Byzantine Multi-Paxos, so there is no
+coordinator to capture, and none to lose.
 
 
 | Phase | Messages                                   | Purpose                                                                                      |
@@ -304,12 +303,12 @@ no coordinator to capture, and none to lose.
 | 3     | `committed` (broadcast)                    | every peer writes the*same* bilateral entry                                                  |
 
 A node that has fallen behind catches up by querying its top three most-trusted
-peers and majority-voting the result, which is then verifiable against the
-chain links rather than taken on faith.
+peers and majority-voting the result, which is then verifiable against the chain
+links rather than taken on faith.
 
 Slashing is the fast path. A quorum-co-signed (Ed25519), evidence-gated
-`SlashAttestation` floors a score immediately, instead of waiting roughly
-twenty transactions for a weighted average to move. That is what catches the
+`SlashAttestation` floors a score immediately, instead of waiting roughly twenty
+transactions for a weighted average to move. That is what catches the
 short-lived rogue, which is precisely the case a moving average handles worst.
 
 Exclusion is sticky. A cut-off peer cannot transact its way back in, and
@@ -345,17 +344,17 @@ The task lifecycle runs on the encrypted peer-to-peer channel:
 `ack` / `nack` / `haggle` (counter-offer) -> `report results` (with
 zero-knowledge proof)
 
-Invitations are tier-gated: a request is refused when the sender's tier falls
+Invitations are tier-gated: a request is refused when the sending tier falls
 below the capability's `required_tier`. The *local* capability definition is
 authoritative, so a peer cannot talk you into relaxing your own requirement.
 
 Tier loss cancels work in flight. If a peer is demoted mid-task, whatever it is
-no longer authorized for is cancelled automatically rather than being allowed
-to finish on the strength of a standing it no longer has.
+no longer authorized for is cancelled automatically rather than being allowed to
+finish on the strength of a standing it no longer has.
 
-This is where trust composes. The requester verifies the result's
-zero-knowledge proof, then submits a transaction score, which feeds Reputation,
-which adjusts the tier that gates the next invitation.
+This is where trust composes. The requester verifies the result's zero-knowledge
+proof, then submits a transaction score, which feeds Reputation, which adjusts
+the tier that gates the next invitation.
 
 ### 6.2 One agreement framework, two voter bases
 
@@ -364,7 +363,7 @@ eligible voters. The framework is shared; the electorate is not:
 
 - Proof of Authority weights votes by rank, meaning topology and capability.
 - Proof of Trust weights votes by tier, meaning earned reputation. This is the
-  right choice for behavior-dependent decisions such as data sharing.
+ right choice for behavior-dependent decisions such as data sharing.
 
 ### 6.3 Bootstrapping from cold
 
@@ -384,9 +383,9 @@ machinery has something to work with.
 
 1. Open broadcast (UDP, unencrypted) carries *announcements only*
 2. Encrypted group (NaCl SecretBox, shared key) carries proposals, votes, and
-   Paxos traffic
+ Paxos traffic
 3. Encrypted peer-to-peer (NaCl Box) carries history, negotiation, and
-   reputation
+ reputation
 
 ### 7.2 Transports
 
@@ -396,16 +395,16 @@ what allows C and Python nodes to interoperate regardless of which one has it
 enabled.
 
 Messaging is itself a trust-scored transaction, so unwanted or spurious traffic
-costs the sender reputation. Flooding is self-defeating: the attacker's
-standing collapses and the network stops relaying for it. Because decryption is
-streamed, a connection can also be cut mid-message once the sender is known to
-be untrusted.
+costs the sender reputation. Flooding is self-defeating: the attacker's standing
+collapses and the network stops relaying for it. Because decryption is streamed,
+a connection can also be cut mid-message once the sender is known to be
+untrusted.
 
 ### 7.3 Partition recovery
 
 Split-brain groups sharing a broadcast domain detect each other by signed probe
-and response. The larger group wins under a symmetric adopt test, and members
-of the smaller one re-admit and merge. Layer-3 backstops periodically re-sync
+and response. The larger group wins under a symmetric adopt test, and members of
+the smaller one re-admit and merge. Layer-3 backstops periodically re-sync
 per-peer state that was dropped along the way.
 
 Everything degrades to local decisions and reconciles on reconnect. That is the
@@ -418,8 +417,8 @@ central service on the hot path.
 
 AT extends NIST SP 800-207 rather than replacing it. A peer still needs valid
 credentials to be heard, and behavioral reputation is the operative boundary
-*after* connection. Every ZTA requirement stays in place: identity
-verification, least privilege, session management, micro-segmentation.
+*after* connection. Every ZTA requirement stays in place: identity verification,
+least privilege, session management, micro-segmentation.
 
 ### 8.1 The pluggable verifier
 
@@ -427,7 +426,7 @@ The verifier interface is `verify` / `check_revocation` / `is_available`, and
 the whole subsystem is build-gated by `AT_ZTA`:
 
 - An X.509 verifier (OpenSSL and pyca) checks chain and expiry, with optional
-  OCSP and CRL. This ships in both implementations.
+ OCSP and CRL. This ships in both implementations.
 - An OIDC verifier exists as an interface and is a stub today.
 
 The credential is bound to identity by SHA-256 hash and excluded from identity
@@ -469,10 +468,10 @@ communication -> services -> data-sharing), task-specific resource access, and
 mid-message early cutoff.
 
 The tier ladder is hierarchical, and hierarchy alone cannot express
-need-to-know. Compartmented data control adds the missing non-hierarchical
-axis: each datum or capability, and each peer grant, carries an access class of
+need-to-know. Compartmented data control adds the missing non-hierarchical axis:
+each datum or capability, and each peer grant, carries an access class of
 (required_tier, compartment-set). Access requires *both* tier dominance (peer
-tier >= required_tier) and containment (the peer's compartment set contains the
+tier >= required_tier) and containment (the compartment set contains the
 object's). This is ordinary lattice semantics, in the Bell-LaPadula sense,
 layered on top of the existing tier gate without modifying it.
 
@@ -491,9 +490,9 @@ time, and AT enforces the conjunction at runtime.
 
 ### 9.1 Operator attestation
 
-A human operator is a peer, with two signals marking the fact:
-`operator_bound` and `operator_attested_at`, which together say that a human
-stands behind this node.
+A human operator is a peer, with two signals marking the fact: `operator_bound`
+and `operator_attested_at`, which together say that a human stands behind this
+node.
 
 That status is earned, never advertised. A claim arriving on the wire is
 neutralized at admission and set true only if a *distinct operator credential*
@@ -505,21 +504,21 @@ path is fail-safe.
 
 ### 9.2 The behavioral anomaly layer
 
-The behavioral anomaly layer is a Python prototype today, and it is a
-*sensor*, not a decider.
+The behavioral anomaly layer is a Python prototype today, and it is a *sensor*,
+not a decider.
 
 Each node models the behavioral envelope of every peer and role, and emits a
 per-peer anomaly score with per-feature attribution. The detectors are online
-and explainable (River's Half-Space Trees plus a per-feature streaming
-histogram in the HBOS and LODA family), which makes them unsupervised,
-bounded-memory, and deterministic under a fixed seed. Determinism is not an
-aesthetic preference here: a non-deterministic score cannot be signed evidence,
-and signed evidence is the only currency the consensus layer accepts.
+and explainable (River's Half-Space Trees plus a per-feature streaming histogram
+in the HBOS and LODA family), which makes them unsupervised, bounded-memory, and
+deterministic under a fixed seed. Determinism is not an aesthetic preference
+here: a non-deterministic score cannot be signed evidence, and signed evidence
+is the only currency the consensus layer accepts.
 
 ML proposes; consensus disposes. A per-node governor emits a *slash proposal*,
 and the signed quorum flow decides. Safety-critical access stays
-human-on-the-loop by default, with a fail-safe default and manual override by
-an accountable decision-maker. Dwell and quorum guards exist to defeat the
+human-on-the-loop by default, with a fail-safe default and manual override by an
+accountable decision-maker. Dwell and quorum guards exist to defeat the
 base-rate fallacy, which is the failure mode Axelsson identified for intrusion
 detection in 2000: when attacks are rare, a naive detector's false positives
 swamp its true ones.
@@ -539,22 +538,22 @@ advisory.
 signing keys never leave the node. There is nothing useful to intercept and no
 way to impersonate a peer without its private key.
 
-**Compromised but authenticated endpoints.** This is Zero Trust's blind spot
-and our reason for existing. Valid credentials are irrelevant to a tier
-decision; behavior is what counts.
+**Compromised but authenticated endpoints.** This is Zero Trust's blind spot and
+our reason for existing. Valid credentials are irrelevant to a tier decision;
+behavior is what counts.
 
 **Supply-chain compromise of the SunBurst class.** The 2019 to 2020 SunBurst
 attack through SolarWinds Orion was undetectable by state-of-the-art tooling
 once inside the network, because attacker activity was indistinguishable from
-that of valid developers. Under AT, even developers hold no direct access to
-the build system, which removes the injection point, and any component running
-inside an AT network is confined to the scope of its negotiated schema. When
-the Trojan Horse phones home or reaches for systems outside its specification,
-its standing collapses and its access goes with it.
+that of valid developers. Under AT, even developers hold no direct access to the
+build system, which removes the injection point, and any component running
+inside an AT network is confined to the scope of its negotiated schema. When the
+Trojan Horse phones home or reaches for systems outside its specification, its
+standing collapses and its access goes with it.
 
-**Denial of service and flooding.** Messaging is trust-scored, untrusted
-senders are cut off mid-stream, and flooding costs the attacker the reputation
-it needs in order to keep flooding.
+**Denial of service and flooding.** Messaging is trust-scored, untrusted senders
+are cut off mid-stream, and flooding costs the attacker the reputation it needs
+in order to keep flooding.
 
 **Metadata harvesting.** Identity and address pairs appear only in direct
 messaging, the system tolerates long-latency near-contact networking that
@@ -563,23 +562,23 @@ require disclosure.
 
 ### 10.2 Attacks requiring active resistance
 
-**Deceit.** A malicious agent may falsify data or results. This does not
-survive the presence of competing providers, and cross-source physical
-consistency catches it directly where the data are corroborable.
+**Deceit.** A malicious agent may falsify data or results. This does not survive
+the presence of competing providers, and cross-source physical consistency
+catches it directly where the data are corroborable.
 
 **Insider betrayal.** An agent builds standing patiently, then spends it. The
 attack is expensive by construction: reputation is public, betrayal is a
-one-time event for a given identity, and evidence-gated slashing means the
-exit is fast. Starting over starts at zero.
+one-time event for a given identity, and evidence-gated slashing means the exit
+is fast. Starting over starts at zero.
 
 **Collusion and reputation gaming.** A group drives a target's standing down
-through low scores or false gossip. Peer leaders can independently review
-gossip claims, and the target's connections outside the enclave act as a
-check. Whitewashing and on-off strategies are raised in cost by cryptographic
-identity and reputation weighting rather than eliminated. Worth saying plainly:
-any adversary in a position to mount this already holds the credentialed
-foothold at which conventional ZTA has silently failed, and AT at least leaves
-signed, auditable evidence behind.
+through low scores or false gossip. Peer leaders can independently review gossip
+claims, and the target's connections outside the enclave act as a check.
+Whitewashing and on-off strategies are raised in cost by cryptographic identity
+and reputation weighting rather than eliminated. Worth saying plainly: any
+adversary in a position to mount this already holds the credentialed foothold at
+which conventional ZTA has silently failed, and AT at least leaves signed,
+auditable evidence behind.
 
 **Sybil.** Many identities under one entity's control. The textbook defense is
 expensive identity generation. AT inverts that: identities are cheap, and
@@ -592,9 +591,9 @@ feed it false data and false scores. Connections outside the enclave mitigate
 it, and the social fences make isolation structurally hard to arrange.
 
 **Rogue authority.** A peer leader abuses its position to censor or deceive its
-enclave. Leaders are held to stricter standards than peers, any peer can
-compete for leadership, and a leader that stops participating loses standing
-without anyone intervening.
+enclave. Leaders are held to stricter standards than peers, any peer can compete
+for leadership, and a leader that stops participating loses standing without
+anyone intervening.
 
 **Ledger attacks.** Attempts to corrupt a chain by injecting bad entries or
 overwhelming consensus run into two disparate ledgers with different agreement
@@ -607,32 +606,32 @@ A few rules are hard-coded and non-negotiable. Violating one collapses
 reputation immediately, with no appeal, because the alternative is a rule that
 sufficient standing can buy its way past.
 
-**Freedom of association:** no agent may block another agent's communications
-with third parties. Man-in-the-middle blocking is a fence violation. This is
-the fence that makes authoritarian attacks expensive.
+**Freedom of association.** no agent may block another agent's communications
+with third parties. Man-in-the-middle blocking is a fence violation. This is the
+fence that makes authoritarian attacks expensive.
 
-**Rule of law:** agents higher in the emergent hierarchy are held to *stricter*
+**Rule of law.** agents higher in the emergent hierarchy are held to *stricter*
 standards, not looser ones. Reputation thresholds for leadership exceed those
 for peers.
 
-**Skin in the game:** a hierarchical leader must be a full participant in the
+**Skin in the game.** a hierarchical leader must be a full participant in the
 domain it oversees. A leader that does not interact meaningfully with its
 enclave loses reputation, which is what keeps out absentee authorities and
 holders of empty credentials.
 
-The fences cannot be reconfigured, negotiated away, or overridden by
-reputation. They are structural, and closer to a constitutional constraint than
-to a policy rule.
+The fences cannot be reconfigured, negotiated away, or overridden by reputation.
+They are structural, and closer to a constitutional constraint than to a policy
+rule.
 
 ### 10.4 Dispute resolution
 
-When peers disagree about scores, data validity, or negotiated terms,
-resolution is structured rather than ad hoc. Competing claims are tested
-against observable evidence, and corroboration outweighs assertion. The local
-peer leader can review disputed transactions and render judgment, always
-locally, because there is no global arbiter to appeal to. Discipline is
-graduated rather than binary: not every failure ends in exile, and some end in
-reduced standing, closer scrutiny, or a temporary restriction.
+When peers disagree about scores, data validity, or negotiated terms, resolution
+is structured rather than ad hoc. Competing claims are tested against observable
+evidence, and corroboration outweighs assertion. The local peer leader can
+review disputed transactions and render judgment, always locally, because there
+is no global arbiter to appeal to. Discipline is graduated rather than binary:
+not every failure ends in exile, and some end in reduced standing, closer
+scrutiny, or a temporary restriction.
 
 ---
 
@@ -640,9 +639,9 @@ reduced standing, closer scrutiny, or a temporary restriction.
 
 There are two implementations of AT, and the division of labor is deliberate.
 
-Python is the reference and development runtime. It exists for rapid
-iteration, simulation, and scenario authoring, and it serves as an executable
-specification of the semantics.
+Python is the reference and development runtime. It exists for rapid iteration,
+simulation, and scenario authoring, and it serves as an executable specification
+of the semantics.
 
 C is the production and fielded runtime. It runs the embedded and ARM daemon
 (`at_demo`), so no Python is needed on-device, and it is under Frama-C/WP
@@ -659,9 +658,9 @@ byte-pins signatures, proofs, and envelopes. An asymmetry diff fails CI the
 moment the two disagree about anything.
 
 That is the assurance story in one line: the fielded artifact is C, the C is
-formally verified, and the conformance corpus proves the C behaves
-byte-for-byte like the readable Python reference. Provability without giving up
-iteration speed.
+formally verified, and the conformance corpus proves the C behaves byte-for-byte
+like the readable Python reference. Provability without giving up iteration
+speed.
 
 ---
 
@@ -700,11 +699,11 @@ and targeting node, and an effects console spread across disadvantaged nodes on
 a thin link. In steady state, a sensor's tracks reach the targeting node only
 while both endpoints hold standing above the required tier. A sensor that is
 authenticated and certificate-valid, but captured or spoofed, and now injecting
-an off-track return, drifts outside its learned envelope, loses standing, and
-is slashed and gated out of the fires path locally and in real time, with
-signed evidence, while a human retains override on anything safety-critical.
-When the link to the policy engine and the PKI drops, the cohort keeps working:
-the targeting node is vouched for by quorum at a capped tier, each admission is
+an off-track return, drifts outside its learned envelope, loses standing, and is
+slashed and gated out of the fires path locally and in real time, with signed
+evidence, while a human retains override on anything safety-critical. When the
+link to the policy engine and the PKI drops, the cohort keeps working: the
+targeting node is vouched for by quorum at a capped tier, each admission is
 signed, and the audit reconciles on reconnect. No step in that loop waits on a
 reachable central authority.
 
@@ -718,16 +717,16 @@ network cannot be assumed, a PKI round-trip becomes a single point of failure.
 
 Industrial and critical infrastructure operators run thousands of long-lived
 controllers on flat networks, where a stolen certificate opens every door. A
-behavioral envelope per controller means a valid but hijacked device that
-starts issuing off-profile commands is gated out locally, in milliseconds,
-without waiting on a security operations center that may itself be cut off.
-That is a direct limit on ransomware lateral movement.
+behavioral envelope per controller means a valid but hijacked device that starts
+issuing off-profile commands is gated out locally, in milliseconds, without
+waiting on a security operations center that may itself be cut off. That is a
+direct limit on ransomware lateral movement.
 
 Space and delay-tolerant networks live in permanent DDIL, where light-lag makes
 a central check impractical. Cohorts vouch for one another, admit peers at
-capped tiers under partition, and carry signed evidence back for
-reconciliation. Constellations, cislunar relays and deep-space assets need
-trust that survives a twenty-minute round trip.
+capped tiers under partition, and carry signed evidence back for reconciliation.
+Constellations, cislunar relays and deep-space assets need trust that survives a
+twenty-minute round trip.
 
 Financial services need machine-to-machine trust that survives a data-center
 partition and still yields a tamper-evident record for regulators.
@@ -741,15 +740,14 @@ protects device and exchange integrity at the edge and leaves an auditable
 trail.
 
 Agentic AI is the clearest emerging case. As autonomous software agents
-proliferate and act on our behalf, the question stops being whether an
-identity is valid and becomes whether an agent is still behaving as it should.
-That is exactly what AT evaluates, continuously and without a human in the
-loop.
+proliferate and act on our behalf, the question stops being whether an identity
+is valid and becomes whether an agent is still behaving as it should. That is
+exactly what AT evaluates, continuously and without a human in the loop.
 
-The common thread is one capability: keep Zero Trust guarantees when the
-central authority is unreachable, at the scale and cost of operational
-technology. The addressable market is every fleet of machines that cannot
-afford to fail open or fail closed.
+The common thread is one capability: keep Zero Trust guarantees when the central
+authority is unreachable, at the scale and cost of operational technology. The
+addressable market is every fleet of machines that cannot afford to fail open or
+fail closed.
 
 ---
 
@@ -778,8 +776,8 @@ flow. The ZTA overlay ships the X.509 verifier with OCSP and CRL, the DDIL
 fallback, delegated verification, and the append-only JSONL audit log.
 
 Around that core sit the inspector dashboards, the simulator with mobility and
-radio physics, the evaluation and red-team harnesses, and the services layer.
-An earlier demonstration wired an ML ISR pipeline (YOLOv8-OBB) into AT as a
+radio physics, the evaluation and red-team harnesses, and the services layer. An
+earlier demonstration wired an ML ISR pipeline (YOLOv8-OBB) into AT as a
 trust-scored capability and exercised cross-source physical-consistency fusion,
 which is where the 97.5 m compromised-drone detection came from. Cohorts up to
 25 peers form and detect anomalies cleanly; that ceiling is emulation fidelity
@@ -798,10 +796,9 @@ it across the reputation and consensus modules is queued work. The behavioral
 anomaly layer is a Python prototype, and its formally verified C twin is
 deferred. Compartment labels are designed but not yet enforced at runtime. The
 OIDC verifier is a stub, and the operator console needs full CAC and MFA
-integration along with hardware root-of-trust attestation for the
-captured-asset case. Protocol-aware enforcement adapters for operational
-technology (Modbus TCP, DNP3, OPC-UA, BACnet) are not built. Scaling beyond
-100 nodes is unproven.
+integration along with hardware root-of-trust attestation for the captured-asset
+case. Protocol-aware enforcement adapters for operational technology (Modbus
+TCP, DNP3, OPC-UA, BACnet) are not built. Scaling beyond 100 nodes is unproven.
 
 These gaps are documented and tracked. They are engineering work on an
 architecture we consider sound, rather than symptoms of design uncertainty. The
@@ -820,3 +817,7 @@ governing it when the network is jammed, degraded, or partitioned. Everything
 above (the Merkle chains, the Paxos, the tiers, the ZTA layering, the anomaly
 detectors) exists to make those three words hold up against a real adversary in
 a real DDIL environment.
+
+---
+
+*Next: [High-trust computing whitepaper](HighTrust.md)*

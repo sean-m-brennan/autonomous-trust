@@ -1,8 +1,12 @@
-[< Node Lifecycle](node-lifecycle.md)
+*Previous: [Testing approach](../testing.md)*
 
 # Integration Testing Architecture
 
-The simulator's integration testing framework runs real AutonomousTrust processes over terrain-aware simulated networks and measures protocol performance under realistic mesh conditions. An Appalachian mountain scenario serves as the reference topology, with 20 nodes (8 hilltop relays, 12 valley endpoints) deployed across Braxton County, West Virginia.
+The simulator's integration testing framework runs real AutonomousTrust
+processes over terrain-aware simulated networks and measures protocol
+performance under realistic mesh conditions. An Appalachian mountain scenario
+serves as the reference topology, with 20 nodes (8 hilltop relays, 12 valley
+endpoints) deployed across Braxton County, West Virginia.
 
 ## Component overview
 
@@ -12,11 +16,16 @@ The simulator's integration testing framework runs real AutonomousTrust processe
 | Appalachian Compose Generator | `simulator.scenarios.appalachian_compose` | Wraps `gen_compose.py` to map scenario nodes to Docker services with terrain metadata |
 | Test Simulation Script | `config/test-simulation.sh` | Orchestrated Docker launch: simulator + compose + metric collection + teardown |
 
-`MetricsCollector` lives in the `src/autonomous-trust-evaluation/` package; the Appalachian compose generator and `test-simulation.sh` are relative to `src/autonomous-trust-simulator/`.
+`MetricsCollector` lives in the `src/autonomous-trust-evaluation/` package; the
+Appalachian compose generator and `test-simulation.sh` are relative to
+`src/autonomous-trust-simulator/`.
 
 ## MetricsCollector
 
-`MetricsCollector` is an AT `Process` subclass registered via `ProcMeta` (proc_name `metrics-collector`), following the same plugin pattern as `SimMetadataSource`. It receives all broadcast messages through the standard `queues[self.name]` mechanism and requires no changes to core AT processes.
+`MetricsCollector` is an AT `Process` subclass registered via `ProcMeta`
+(proc_name `metrics-collector`), following the same plugin pattern as
+`SimMetadataSource`. It receives all broadcast messages through the standard
+`queues[self.name]` mechanism and requires no changes to core AT processes.
 
 ```python
 class MetricsCollector(Process, metaclass=ProcMeta,
@@ -43,7 +52,12 @@ On shutdown, the collector writes a JSON report to a configurable output path.
 
 ## Appalachian Compose generator
 
-The compose generator wraps `gen_compose.generate_compose()` and patches the output YAML to add scenario-specific metadata. Each Docker service is renamed to its Appalachian node identifier and receives environment variables for coordinates, elevation, antenna tier, and terrain configuration path. Existing properties from `gen_compose` (IP assignment (`172.27.3.{10+i}`), staggered startup delays, backend selection, and `NET_ADMIN` capability) are preserved.
+The compose generator wraps `gen_compose.generate_compose()` and patches the
+output YAML to add scenario-specific metadata. Each Docker service is renamed to
+its Appalachian node identifier and receives environment variables for
+coordinates, elevation, antenna tier, and terrain configuration path. Existing
+properties from `gen_compose` (IP assignment (`172.27.3.{10+i}`), staggered
+startup delays, backend selection, and `NET_ADMIN` capability) are preserved.
 
 ```python
 def generate_appalachian_compose(
@@ -78,7 +92,8 @@ flowchart TB
 
 ## Verification strategy
 
-Testing is layered to separate protocol correctness from infrastructure concerns:
+Testing is layered to separate protocol correctness from infrastructure
+concerns:
 
 - **In-process test** (`tests/test_appalachian_inprocess.py`): Launches AT processes via `multiprocessing.Pool` following the `mock.py` pattern (QueuePool, ProcessTracker, ConfigMap). The simulator computes connectivity from terrain data but no iptables enforcement occurs. Runs in CI without Docker.
 - **Docker system test** (`tests/c_system/test_appalachian_scenario.py`): Full Router enforcement with iptables and traffic control. Marked `@pytest.mark.docker`; requires a running Docker daemon and the AT container image.
@@ -96,8 +111,8 @@ Both layers assert against the same metric targets.
 
 ## Dependencies
 
-- **Phase 1 (Terrain RF Layer)**: Appalachian scenario definition, terrain path-loss model, Router bandwidth shaping from SignalMatrix.
-- **Docker daemon**: Required for the system test and the `test-simulation.sh` orchestration script.
+- **Phase 1 (Terrain RF Layer).** Appalachian scenario definition, terrain path-loss model, Router bandwidth shaping from SignalMatrix.
+- **Docker daemon.** Required for the system test and the `test-simulation.sh` orchestration script.
 - **conda environment** (`muudd_simulation`): All AT packages installed.
 
 ## Integration points
@@ -106,4 +121,6 @@ Both layers assert against the same metric targets.
 - `appalachian_compose.py` imports `gen_compose.generate_compose()` directly, adding no new Docker abstractions.
 - The in-process test reuses `mock.py`'s queue and process infrastructure, keeping test setup consistent with existing integration tests.
 
-[Adversarial Testing >](adversarial-testing.md)
+---
+
+*Next: [Adversarial testing](adversarial-testing.md)*
