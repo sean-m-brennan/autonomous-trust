@@ -1,3 +1,5 @@
+*Previous: [Connection pooling](network-connection-pooling.md)*
+
 # Group Partition Recovery
 
 This design answers the dod_mission demo split-brain
@@ -5,78 +7,78 @@ This design answers the dod_mission demo split-brain
 rejects squad traffic as "not in group"). It carries conformance pins (see §9),
 a layer-3 identity-resync backfill, and a periodic caps-resync sweep (see §12).
 
-This document specifies an extension to the Identity protocol that lets a
-peer detect it is in a different group than one or more of its neighbors
-and converge on a single group via the existing `_merge_to_mesh` machinery.
+This document specifies an extension to the Identity protocol that lets a peer
+detect it is in a different group than one or more of its neighbors and converge
+on a single group via the existing `_merge_to_mesh` machinery.
 
 ## 1. Problem
 
 The Identity protocol uses simultaneous multicast announce + an opportunistic
-"first peer to receive a quorum" group bootstrap. When two or more peers come
-up nearly simultaneously and don't all see each other's announces before
+"first peer to receive a quorum" group bootstrap. When two or more peers come up
+nearly simultaneously and do not all see the announces of the others before
 their own `choose_group` timeout, each falls into the `from_scratch = True`
-branch (`idprocess.py:332`) and constructs its own one-peer group. They are
-now in different groups with different group keys, but on the same multicast
-domain.
+branch (`idprocess.py:332`) and constructs its own one-peer group. They are now
+in different groups with different group keys, but on the same multicast domain.
+The split is silent, local, and fatal to the demo.
 
-Once both groups have ≥1 admitted member, normal group-encrypted traffic
-flows on the group channel. Each peer's `NetProcess` receives the other
-group's traffic and drops it:
+Once both groups have ≥1 admitted member, normal group-encrypted traffic flows
+on the group channel. The `NetProcess` of each peer receives traffic from
+the other group and drops it.
 
 - **Python** (`netprocess.py:628`): `from_addr not in self.group.addresses`
-  → log `"Recvd transmission from X - not in group. Ignoring."` and drop.
+ → log `"Recvd transmission from X - not in group. Ignoring."` and drop.
 - **C** (`net_proc.c:1295`): `group_decrypt` fails (wrong key) → log
-  `"Network: group decrypt failed (%d) from %s"` and drop.
+ `"Network: group decrypt failed (%d) from %s"` and drop.
 
 Neither side ever escalates this to the Identity layer. The existing
 `_merge_to_mesh` logic (`idprocess.py:1135-1150`) handles size-based merge
-*only* when triggered by `full_history` exchange or
-`group_key_update`, which never happens in the split-brain case because
-neither side initiates `request_access` against the other (each thinks
-it's already in a fully-formed group).
+*only* when triggered by `full_history` exchange or `group_key_update`, which
+never happens in the split-brain case because neither side initiates
+`request_access` against the other (each thinks it's already in a fully-formed
+group).
 
-The dod_mission demo surfaces this reliably because the compose stack
-brings up 16+ peers within a 1-second window. Real deployments with
-slower peer arrival are unlikely to hit this, but the gap is real and
-the demo cannot proceed without it.
+The dod_mission demo surfaces this reliably because the compose stack brings up
+16+ peers within a 1-second window. What the window produces is simultaneity,
+ambiguity, and divergence. Real deployments with slower peer arrival
+are unlikely to hit this, but the gap is real and the demo cannot proceed
+without it.
 
-The TODO at `netprocess.py:652-654` (*"Query other group members for the
-unknown sender's identity; they may have admitted this peer while we
-were partitioned"*) is the right instinct but solves the wrong case:
-when the partitioned peer is in a size-1 group (the dod_mission
-coordinator), there are no other group members to query. The fix has to
-probe across the partition.
+The TODO at `netprocess.py:652-654` (*"Query other group members for the unknown
+sender's identity; they may have admitted this peer while we were partitioned"*)
+is the right instinct but solves the wrong case. When the partitioned peer is in
+a size-1 group (the dod_mission coordinator), there are no other group members
+to query. The fix has to probe across the partition.
 
 ## 2. Goals & non-goals
 
 **Goals.**
 
 - Two or more groups on a shared multicast domain converge to a single
-  group within ~5-10 seconds of first cross-group traffic.
-- No new ports, no new transports: reuse the existing unsecured-broadcast
-  channel (the same one `request_access` uses).
-- Reuse `_merge_to_mesh` for the actual adoption; the new protocol only
-  *initiates* a normal join flow.
+ group within ~5-10 seconds of first cross-group traffic.
+- No new ports and no new transports, since it reuses the existing
+ unsecured-broadcast channel (the same one `request_access` uses).
+- Reuse `_merge_to_mesh` for the actual adoption, and the new protocol only
+ *initiates* a normal join flow.
 - No change to wire-format of existing identity messages.
 - Python/C parity from day one (no skewed-only-on-one-side merge logic).
-- Bounded: no broadcast-storm risk even under deliberately adversarial
-  partition signaling.
+- Bounded, with no broadcast-storm risk even under deliberately adversarial
+ partition signaling.
 
 **Non-goals.**
 
 - Wire compatibility with pre-existing AT deployments. The decision
-  recorded for this work is: all peers upgrade together (see prompt
-  on 2026-05-20). The new message types become required parts of the
-  protocol; older peers simply won't participate in partition recovery.
+ recorded for this work is that all peers upgrade together (see prompt
+ on 2026-05-20). The new message types become required parts of the
+ protocol; older peers simply won't participate in partition recovery.
 - General partition tolerance across network partitions (firewalls,
-  unicast-only links). This design assumes both groups can still
-  reach each other on the unsecured multicast channel: i.e. the
-  "partition" here is purely a *group-state* partition, not a network
-  partition. Network-partition recovery is a separate problem.
+ unicast-only links). This design assumes both groups can still
+ reach each other on the unsecured multicast channel, so the
+ "partition" here is purely a *group-state* partition, not a network
+ partition. Network-partition recovery is a separate problem.
 - Byzantine merge under active attack. The existing
-  welcoming-committee + voting already gates new-peer admission; this
-  design adds no weakening of that path. But we also do not attempt
-  to *resist* a partition-recovery probe, see §6.
+ welcoming-committee + voting already gates new-peer admission, and this
+ design adds no weakening of that path. But we also do not attempt
+ to *resist* a partition-recovery probe, see §6.
 
 ## 3. Existing primitives we build on
 
@@ -91,13 +93,13 @@ probe across the partition.
 
 ## 4. Protocol additions
 
-Two new identity-protocol messages, both carried on the **unsecured
-broadcast channel** (same as `request_access`):
+Two new identity-protocol messages, both carried on the **unsecured broadcast
+channel**, the same one `request_access` uses.
 
 ### 4.1 `group_partition_probe`
 
-Sent by a peer that has just seen unrecognized group traffic and wants
-to discover what the *other* group looks like.
+Sent by a peer that has just seen unrecognized group traffic and wants to
+discover what the *other* group looks like.
 
 ```
 msg.obj = {
@@ -110,20 +112,20 @@ msg.obj = {
 }
 ```
 
-> The probe carries the sender's **full published Identity**
+> The probe carries the **full published Identity** of the sender
 > (`self.identity.publish()`), not a bare uuid, so the recipient has the
 > public key needed to verify `signature` without a prior table lookup.
 
-The signature binds the sender's claim ("I see you as not in my group;
-my group looks like this") to their identity. A Sybil with no real
-identity can still send this, but they cannot impersonate a known peer,
-and the response (4.2) carries the responder's *real* group's
-information, which is what the recipient acts on.
+The signature binds the claim being sent ("I see you as not in my group, and my
+group looks like this") to the identity of the sender. A Sybil with no real
+identity can still send this, but they cannot impersonate a known peer, and the
+response (4.2) carries information about the *real* group of the responder,
+which is what the recipient acts on.
 
 ### 4.2 `group_partition_response`
 
-Sent by any peer that receives a `partition_probe` from a peer it does
-not recognize as a group member.
+Sent by any peer that receives a `partition_probe` from a peer it does not
+recognize as a group member.
 
 ```
 msg.obj = {
@@ -139,78 +141,78 @@ msg.obj = {
 }
 ```
 
-`my_group_leader` is *any* admitted peer in the responder's group: it
-doesn't need to be a special "leader" role. Its purpose is to give the
-probe sender a known address to direct a `request_access` to. Choosing
-the responder itself is simplest; an optimization could choose the
-peer with the highest peer-rank in the responder's hierarchy.
+`my_group_leader` is *any* admitted peer in the group of the responder, and it
+does not need to be a special "leader" role. Its purpose is to give the probe
+sender a known address to direct a `request_access` to. Choosing the responder
+itself is simplest, and an optimization could choose the peer with the highest
+peer-rank in the hierarchy of the responder.
 
 ## 5. State machine
 
 ### 5.1 NetProcess side (cross-process signal)
 
-Both Python and C network processes already have the drop site:
+Both Python and C network processes already have the drop site.
 
 - Python: `netprocess.py:648-651` (`else:` of the `from_addr in addresses` check)
 - C: `net_proc.c:1304-1307` (`group_decrypt` failure)
 
-Replace the silent drop with a rate-limited `Message` push onto the
-**existing identity queue** (`queues[CfgIds.identity]`), with
-`function=IdentityProtocol.partition_signal` and `obj=from_addr`. This
-matches the existing pattern for internal-only IPC events
+Replace the silent drop with a rate-limited `Message` push onto the **existing
+identity queue** (`queues[CfgIds.identity]`), with
+`function=IdentityProtocol.partition_signal` and `obj=from_addr`. This matches
+the existing pattern for internal-only IPC events
 (`IdentityProtocol.rank_update` at `protocol.py:78` is the precedent;
-ReputationProcess uses the same approach to nudge IdentityProcess
-without a wire round-trip). No new `CfgIds` entry or new queue is
-needed; the Identity process's existing `Protocol.run_message_handlers`
-dispatch picks it up by function name. This is a design refinement
-from the first-draft "new CfgIds entry" approach; it's identical in
-effect and substantially smaller in surface area.
+ReputationProcess uses the same approach to nudge IdentityProcess without a wire
+round-trip). No new `CfgIds` entry or new queue is needed, since the existing
+`Protocol.run_message_handlers` dispatch in the Identity process picks it up by
+function name. This is a design refinement from the first-draft "new CfgIds
+entry" approach, identical in effect and substantially smaller in surface
+area. The signal is internal, rate-limited, and cheap.
 
-Rate limiting: at most **one signal per `from_addr` per 5 seconds**.
-The NetProcess keeps a small LRU dict (`from_addr → last_signal_ts`).
-This bound is independent of the probe-rate bound in 5.2; it stops
-NetProcess flooding IdentityProcess if the other group is chatty.
+Rate limiting allows at most **one signal per `from_addr` per 5 seconds**. The
+NetProcess keeps a small LRU dict (`from_addr → last_signal_ts`). This bound is
+independent of the probe-rate bound in 5.2, and it stops NetProcess flooding
+IdentityProcess if the other group is chatty.
 
 ### 5.2 IdentityProcess side (probe dispatch)
 
 A new handler `handle_partition_signal(self, queues)` drains
-`queues[CfgIds.partition_signal]`. For each signal:
+`queues[CfgIds.partition_signal]`. For each signal it runs four checks.
 
 1. If `self.group is None` or `self.choosing`: ignore, we're still
-   in initial bootstrap, the normal flow will catch up.
+ in initial bootstrap, the normal flow will catch up.
 2. If we've already sent a probe to this `from_addr` within the last
-   **10 seconds**: ignore (per-addr probe cooldown).
+ **10 seconds.** ignore (per-addr probe cooldown).
 3. If we are already merging (see 5.4): ignore.
 4. Build a `partition_probe` (4.1) and send via unsecured multicast.
-   The probe is **not** directed; any peer in any group can receive
-   and respond. (We don't need to unicast because we don't yet have
-   a trusted endpoint for the other group.)
+ The probe is **not** directed; any peer in any group can receive
+ and respond. (We don't need to unicast because we don't yet have
+ a trusted endpoint for the other group.)
 
-The probe cooldown bounds emitted probes to ≤6/minute per
-`(self, from_addr)` pair. If the other group has N peers all sending
-us group traffic, our cooldown is per *from_addr*, so we'd send up to
-N probes per cooldown window: still bounded.
+The probe cooldown bounds emitted probes to ≤6/minute per `(self, from_addr)`
+pair. If the other group has N peers all sending us group traffic, our cooldown
+is per *from_addr*, so we would send up to N probes per cooldown window, which
+is still bounded.
 
 ### 5.3 IdentityProcess side (probe receipt)
 
-A new handler `handle_partition_probe(self, queues, message)`:
+A new handler `handle_partition_probe(self, queues, message)` runs three steps.
 
 1. Verify `signature` against `message.from_whom.encryptor.public` (the
-   sender's identity public key). Reject if invalid, but **do not log
-   loudly** (would let an attacker burn our log volume).
+ identity public key of the sender). Reject if invalid, but **do not log
+ loudly** (would let an attacker burn our log volume).
 2. Look up `message.from_whom.uuid` in `self.peers`:
-   - If they are already in `self.peers` and in `self.group.addresses`
-     → they're in our group, just slow to update their local view;
-     send a normal `group_key_update` (existing message type) directed
-     at them and return. This shouldn't normally happen but is a
-     graceful no-op.
-   - Otherwise, build a `partition_response` (4.2) and send via
-     unsecured multicast. Pick `my_group_leader` as the most recently
-     admitted peer in our group whose `peer_rank` ≥ ours (so newer
-     peers don't get hammered).
+ - If they are already in `self.peers` and in `self.group.addresses`
+ → they're in our group, just slow to update their local view;
+ send a normal `group_key_update` (existing message type) directed
+ at them and return. This shouldn't normally happen but is a
+ graceful no-op.
+ - Otherwise, build a `partition_response` (4.2) and send via
+ unsecured multicast. Pick `my_group_leader` as the most recently
+ admitted peer in our group whose `peer_rank` ≥ ours (so newer
+ peers don't get hammered).
 3. Rate limit: at most **one response per probing peer uuid per 30
-   seconds**. Prevents a malicious flood-probe from forcing us to
-   re-sign and re-broadcast.
+ seconds**. Prevents a malicious flood-probe from forcing us to
+ re-sign and re-broadcast.
 
 > **As implemented: symmetric probe-adopt.** The probe already advertises the
 > prober's `my_group_size`, so `handle_partition_probe` *also* runs the same
@@ -225,309 +227,316 @@ A new handler `handle_partition_probe(self, queues, message)`:
 
 ### 5.4 IdentityProcess side (response receipt: the merge initiator)
 
-A new handler `handle_partition_response(self, queues, message)`:
+A new handler `handle_partition_response(self, queues, message)` runs five
+steps.
 
 1. Verify signature (as in 5.3).
 2. Check that `in_response_to == self.identity.uuid`: discard if not
-   addressed to us (we may receive responses to other peers' probes).
+ addressed to us (we may receive responses to probes from other peers).
 3. Compare `my_group_size` (theirs) to `len(self.group.addresses)`
-   (ours):
-   - If theirs > ours, or theirs == ours and `theirs.uuid < ours.uuid`
-     → we should adopt theirs. Mark `self._partition_recovery_in_progress
-     = (their_group_uuid, when=now())` and proceed.
-   - Otherwise → ignore; they will reach the same conclusion when
-     they receive *our* probe and respond, and they'll initiate the
-     merge.
+ (ours):
+ - If theirs > ours, or theirs == ours and `theirs.uuid < ours.uuid`
+ → we should adopt theirs. Mark `self._partition_recovery_in_progress
+ = (their_group_uuid, when=now())` and proceed.
+ - Otherwise → ignore; they will reach the same conclusion when
+ they receive *our* probe and respond, and they'll initiate the
+ merge.
 4. If we're adopting: construct a `request_access` (the existing
-   `IdentityProtocol.announce` message, same machinery `announce_identity`
-   uses) directed at `my_group_leader_address`. This re-enters the
-   normal welcoming-committee path on the responder's side, which
-   eventually returns `access_granted` + `full_history` carrying the
-   responder's `Group`. Our existing `receive_history` →
-   `_merge_to_mesh` adopts it.
+ `IdentityProtocol.announce` message, same machinery `announce_identity`
+ uses) directed at `my_group_leader_address`. This re-enters the
+ normal welcoming-committee path on the responder's side, which
+ eventually returns `access_granted` + `full_history` carrying the
+ `Group` of the responder. Our existing `receive_history` →
+ `_merge_to_mesh` adopts it.
 5. Set a timeout on `_partition_recovery_in_progress`: if `full_history`
-   hasn't arrived within **15 seconds**, clear the flag and allow new
-   probes. Without the timeout, a lost-packet `request_access` would
-   wedge us indefinitely.
+ hasn't arrived within **15 seconds**, clear the flag and allow new
+ probes. Without the timeout, a lost-packet `request_access` would
+ wedge us indefinitely.
 
 ### 5.5 Successful merge
 
-When `_merge_to_mesh` runs (via the normal `receive_history` path)
-and adopts the remote group:
+When `_merge_to_mesh` runs (via the normal `receive_history` path) and adopts
+the remote group, five things follow.
 
 - `self.group` is replaced by the remote `Group` (including the
-  remote group key)
+ remote group key)
 - `self.peers` is populated with the remote peers from `full_history`
 - All previously-dropped group traffic from those peers will now
-  decrypt correctly
+ decrypt correctly
 - `self._partition_recovery_in_progress` is cleared
 - The local NetProcess `from_addr → last_signal_ts` LRU is purged of
-  any addresses now in `self.group.addresses` (otherwise the cooldown
-  would prevent re-probing in a future re-partition)
+ any addresses now in `self.group.addresses` (otherwise the cooldown
+ would prevent re-probing in a future re-partition)
 
 ## 6. Security considerations
 
-**Sybil-amplified merge.** An attacker can spawn N Sybil peers all
-claiming to be in a giant group of size M. If we naively accept any
-`partition_response` claiming larger size, the attacker drags us into
-their group. But:
+**Sybil-amplified merge.** An attacker can spawn N Sybil peers all claiming to
+be in a giant group of size M. If we naively accept any `partition_response`
+claiming larger size, the attacker drags us into their group. Three things stand
+in the way.
 
 - Their `partition_response` only tells us "send a request_access here."
 - The actual merge happens via `full_history` after their welcoming
-  committee accepts us. The welcoming committee runs the existing
-  POA voting; a single attacker can't unilaterally admit anyone.
+ committee accepts us. The welcoming committee runs the existing
+ POA voting; a single attacker can't unilaterally admit anyone.
 - The full_history payload they send to us must be signed by their
-  group key. If their group is genuinely just Sybils, those signatures
-  are still cryptographically valid, but every "member" we see in
-  their history is a peer we have to evaluate via the reputation system
-  before granting them weight. The reputation cold-start (new peers
-  default low) limits the damage.
+ group key. If their group is genuinely just Sybils, those signatures
+ are still cryptographically valid, but every "member" we see in
+ their history is a peer we have to evaluate via the reputation system
+ before granting them weight. The reputation cold-start (new peers
+ default low) limits the damage.
 
-This is no weaker than the status quo: the same Sybil attack works
-today against a fresh peer's normal `request_access`. The new protocol
-just makes it work against an *existing* peer too. Treat the residual
-risk as identical to the existing welcoming-committee Sybil exposure;
-hardening the welcoming-committee is out of scope here.
+This is no weaker than the status quo. The same Sybil attack works today against
+the normal `request_access` of a fresh peer. The new protocol just makes it work
+against an *existing* peer too. Treat the residual risk as identical to the
+existing welcoming-committee Sybil exposure, and hardening the
+welcoming-committee is out of scope here.
 
-**Probe amplification.** A single attacker sending a stream of
-`partition_probe` messages can elicit a `partition_response` from us.
-The 30-second per-peer-uuid cooldown (§5.3) bounds the response rate.
-With M honest peers in our group, an attacker probing all of them
-elicits at most M responses per 30s: bounded by group size, not by
-probe rate.
+**Probe amplification.** A single attacker sending a stream of `partition_probe`
+messages can elicit a `partition_response` from us. The 30-second per-peer-uuid
+cooldown (§5.3) bounds the response rate. With M honest peers in our group, an
+attacker probing all of them elicits at most M responses per 30 s, bounded by
+group size rather than by probe rate.
 
-**Cross-deployment leakage.** If two unrelated AT deployments
-accidentally share a multicast domain (e.g. a misconfigured staging
+**Cross-deployment leakage.** If two unrelated AT deployments accidentally share
+a multicast domain (e.g. a misconfigured staging
 + prod), they will now actively try to merge. This is mostly a
-configuration concern, but worth flagging: the multicast group ID and
-the AT deployment ID should be different. Today they aren't: there's
-no "deployment ID" concept. Out of scope here; file as a follow-up.
+configuration concern, but worth flagging. The multicast group ID and the AT
+deployment ID should be different, and today they are not, because there is no
+"deployment ID" concept. That is out of scope here, and it is filed as a
+follow-up.
 
 ## 7. Python implementation outline
 
 Files affected:
 
 - `src/autonomous-trust/autonomous_trust/core/_python/identity/protocol.py`
-  - Add `partition_probe = 'group_partition_probe'`
-  - Add `partition_response = 'group_partition_response'`
+ - Add `partition_probe = 'group_partition_probe'`
+ - Add `partition_response = 'group_partition_response'`
 - `src/autonomous-trust/autonomous_trust/core/_python/identity/idprocess.py`
-  - Add `_partition_probe_cooldown: dict[str, datetime]` (per-addr probe cooldown)
-  - Add `_partition_response_cooldown: dict[uuid_str, datetime]` (per-peer response cooldown)
-  - Add `_partition_recovery_in_progress: Optional[tuple[str, datetime]]`
-  - Add `handle_partition_signal(queues)`, drains the new internal queue
-  - Add `handle_partition_probe(queues, message)`
-  - Add `handle_partition_response(queues, message)`
-  - Register the handlers in the message-dispatch table (look for how
-    `announce` / `accept` / `history` are wired in `process()`)
-  - Hook merge-completion: clear `_partition_recovery_in_progress` and
-    purge stale entries from the NetProcess LRU
+ - Add `_partition_probe_cooldown: dict[str, datetime]` (per-addr probe cooldown)
+ - Add `_partition_response_cooldown: dict[uuid_str, datetime]` (per-peer response cooldown)
+ - Add `_partition_recovery_in_progress: Optional[tuple[str, datetime]]`
+ - Add `handle_partition_signal(queues)`, drains the new internal queue
+ - Add `handle_partition_probe(queues, message)`
+ - Add `handle_partition_response(queues, message)`
+ - Register the handlers in the message-dispatch table (look for how
+ `announce` / `accept` / `history` are wired in `process()`)
+ - Hook merge-completion: clear `_partition_recovery_in_progress` and
+ purge stale entries from the NetProcess LRU
 - `src/autonomous-trust/autonomous_trust/core/_python/network/netprocess.py`
-  - Add `_partition_signal_lru: dict[str, datetime]` (per-from_addr 5s cooldown)
-  - In the `else:` at line 648 (Python), push signal onto
-    `queues[CfgIds.partition_signal]` if cooldown is satisfied;
-    keep the existing `_probes.counter` call
-  - The error log can be downgraded to debug once the recovery path
-    fires (or keep at error for one cycle then quiet, measure first)
+ - Add `_partition_signal_lru: dict[str, datetime]` (per-from_addr 5s cooldown)
+ - In the `else:` at line 648 (Python), push signal onto
+ `queues[CfgIds.partition_signal]` if cooldown is satisfied;
+ keep the existing `_probes.counter` call
+ - The error log can be downgraded to debug once the recovery path
+ fires (or keep at error for one cycle then quiet, measure first)
 - `src/autonomous-trust/autonomous_trust/core/_python/system.py`
-  - **No change needed.** The partition signal is routed via the
-    existing `CfgIds.identity` queue using `IdentityProtocol.partition_signal`
-    as the message function name (see §5.1 design refinement and the
-    `rank_update` precedent in `protocol.py:73-78`).
+ - **No change needed.** The partition signal is routed via the
+ existing `CfgIds.identity` queue using `IdentityProtocol.partition_signal`
+ as the message function name (see §5.1 design refinement and the
+ `rank_update` precedent in `protocol.py:73-78`).
 
 Tests:
 
 - `src/autonomous-trust/autonomous_trust/core/_python/tests/test_partition_recovery.py`
-  (new file): two `IdentityProcess` instances in the same Python
-  process, each with its own `self.group`. Simulate cross-group
-  message → verify probe/response/request_access sequence → verify
-  merged state.
+ (new file): two `IdentityProcess` instances in the same Python
+ process, each with its own `self.group`. Simulate cross-group
+ message → verify probe/response/request_access sequence → verify
+ merged state.
 
 ## 8. C implementation outline
 
 Files affected:
 
 - `src/c/autonomous_trust/identity/id_proc.c` and `id_proc_priv.h`
-  - Add `static char ID_PROTO_PARTITION_PROBE[] = "group_partition_probe";`
-  - Add `static char ID_PROTO_PARTITION_RESPONSE[] = "group_partition_response";`
-  - Add the three cooldown maps (`map_t` from `utilities/map.h`) and
-    the in-progress sentinel to `proc_id_t`
-  - Add C handlers mirroring §5.2-§5.4 logic
-  - Register in the message-dispatch table (look at how `welcoming_committee`
-    and `handle_acceptance` get wired)
-  - Update `proc_id_init` to allocate the maps and the
-    `proc_id_finalize` to release them (use `map_destroy` /
-    `map_free_values` consistently with how `committed_paxos_rounds`
-    is handled in `rep_proc.c`, see the memory `project_dod_demo_status`
-    for the conformance work where that map was added).
+ - Add `static char ID_PROTO_PARTITION_PROBE[] = "group_partition_probe";`
+ - Add `static char ID_PROTO_PARTITION_RESPONSE[] = "group_partition_response";`
+ - Add the three cooldown maps (`map_t` from `utilities/map.h`) and
+ the in-progress sentinel to `proc_id_t`
+ - Add C handlers mirroring §5.2-§5.4 logic
+ - Register in the message-dispatch table (look at how `welcoming_committee`
+ and `handle_acceptance` get wired)
+ - Update `proc_id_init` to allocate the maps and the
+ `proc_id_finalize` to release them (use `map_destroy` /
+ `map_free_values` consistently with how `committed_paxos_rounds`
+ is handled in `rep_proc.c`, see the memory `project_dod_demo_status`
+ for the conformance work where that map was added).
 - `src/c/autonomous_trust/network/net_proc.c`
-  - At the `group_decrypt` failure log (line 1305), push a signal
-    onto a new internal queue (mirror Python's
-    `CfgIds.partition_signal`). The cross-process signal mechanism
-    already exists for things like `proc_event_queue`; reuse it.
-  - Add the same 5-second per-addr LRU bound.
+ - At the `group_decrypt` failure log (line 1305), push a signal
+ onto a new internal queue (mirror Python's
+ `CfgIds.partition_signal`). The cross-process signal mechanism
+ already exists for things like `proc_event_queue`; reuse it.
+ - Add the same 5-second per-addr LRU bound.
 - `src/c/autonomous_trust/identity/id_protocol.h`
-  - If protocol-string headers exist (per the memory
-    `project_proto_string_arrays`, they switched from `#define` to
-    `extern char X[]`), follow that pattern for the two new strings.
+ - If protocol-string headers exist (per the memory
+ `project_proto_string_arrays`, they switched from `#define` to
+ `extern char X[]`), follow that pattern for the two new strings.
 
 Tests:
 
 - `src/c/test/partition_recovery_test.c`: equivalent of the Python
-  test, using whatever fixture pattern the existing identity tests use.
+ test, using whatever fixture pattern the existing identity tests use.
 
 ## 9. Conformance corpus impact
 
-Per the memory `project_conformance_corpus`, the corpus pins v1 at
-114/114 each side. This protocol extension is a corpus-bumping change.
-Concrete deltas:
+Per the memory `project_conformance_corpus`, the corpus pins v1 at 114/114 each
+side. This protocol extension is a corpus-bumping change. The concrete deltas
+follow.
 
 - New scenario file under `src/conformance/scenarios/`:
-  `group_partition_recovery_basic.yaml`, two-peer setup with
-  forced split-brain, expected message sequence:
-  - peer_A sends group msg → peer_B drops → peer_B emits probe
-  - peer_A receives probe → sends response
-  - peer_B receives response → sends request_access to peer_A
-  - peer_A welcomes (existing flow) → full_history → merge
+ `group_partition_recovery_basic.yaml`, two-peer setup with
+ forced split-brain, expected message sequence:
+ - peer_A sends group msg → peer_B drops → peer_B emits probe
+ - peer_A receives probe → sends response
+ - peer_B receives response → sends request_access to peer_A
+ - peer_A welcomes (existing flow) → full_history → merge
 - New scenario: `group_partition_recovery_size_tie.yaml`, same as above
-  but groups are equal size; verify uuid-tiebreak deterministically
-  picks the same winner on both sides.
+ but groups are equal size; verify uuid-tiebreak deterministically
+ picks the same winner on both sides.
 - New scenario: `group_partition_recovery_signal_cooldown.yaml`, flood
-  of cross-group traffic from one peer; verify probe rate is bounded
-  by the 10s per-addr cooldown (count: <=2 probes in a 15s window).
+ of cross-group traffic from one peer; verify probe rate is bounded
+ by the 10s per-addr cooldown (count: <=2 probes in a 15s window).
 - Bump the corpus schema string from `"1"` to `"2"` in the README and
-  emit a corresponding update in the C and Python parsers (the schema
-  pin lives in `src/conformance/schemas/` per the existing layout).
+ emit a corresponding update in the C and Python parsers (the schema
+ pin lives in `src/conformance/schemas/` per the existing layout).
 - Synchronous-dispatch hooks (memory `feedback_synchronous_dispatch_pattern`):
-  add hook points in both Python and C for the new probe/response handlers
-  so conformance tests can drive them deterministically.
+ add hook points in both Python and C for the new probe/response handlers
+ so conformance tests can drive them deterministically.
 
-The bar is the same as v1: parity each side, 0 asymmetric,
-`--strict-coverage` clean.
+The bar is the same as v1, namely parity, symmetry, and coverage: parity each
+side, 0 asymmetric, and `--strict-coverage` clean.
 
-**Three scenarios** cover this, under
-`conformance/scenarios/identity/`:
-`group-partition-recovery-basic.yaml` (full
-signal→probe→response→request_access trigger),
-`group-partition-recovery-size-tie.yaml` (equal-size groups, deterministic
-uuid tiebreak), and `group-partition-recovery-signal-cooldown.yaml` (flood
-bounded by the 10 s per-from_addr probe cooldown). Corpus is **129/129 each
-side, 0 asymmetric, `--strict-coverage` clean**.
+**Three scenarios** cover this, under `conformance/scenarios/identity/`.
+`group-partition-recovery-basic.yaml` (full signal→probe→response→request_access
+trigger), `group-partition-recovery-size-tie.yaml` (equal-size groups,
+deterministic uuid tiebreak), and
+`group-partition-recovery-signal-cooldown.yaml` (flood bounded by the 10 s
+per-from_addr probe cooldown). Corpus is **129/129 each side, 0 asymmetric,
+`--strict-coverage` clean**. The three scenarios cover trigger, tiebreak, and
+cooldown.
 
-Two adapter additions carry it (mirrored in Python and C):
+Two adapter additions carry it, mirrored in Python and C.
 
 - **Distinct-group fixtures** (`fixtures.groups: { <pid>: { uuid, size } }`):
-  each listed participant gets its OWN group of the given size with peers
-  NOT cross-populated, the split-brain precondition. Pinned uuids make the
-  equal-size tiebreak deterministic and identical across harnesses.
+ each listed participant gets its OWN group of the given size with peers
+ NOT cross-populated, the split-brain precondition. Pinned uuids make the
+ equal-size tiebreak deterministic and identical across harnesses.
 - **`partition_probes_emitted` observable** (per-participant count of emitted
-  probes) for the cooldown scenario, plus `in_response_to_id` (a
-  participant-id payload key resolved to that peer's runtime uuid) so the
-  probe→response chain works under the C engine's rebuild-on-propagate model.
+ probes) for the cooldown scenario, plus `in_response_to_id` (a
+ participant-id payload key resolved to that peer's runtime uuid) so the
+ probe→response chain works under the C engine's rebuild-on-propagate model.
 
-**The corpus schema stays at `"1"`**: the YAML structure did not change, so
-no v2 bump (this supersedes §9's original "bump to v2" note and matches the
-later corpus-state decision).
+**The corpus schema stays at `"1"`.** The YAML structure did not change, so no
+v2 bump (this supersedes §9's original "bump to v2" note and matches the later
+corpus-state decision).
 
-**Two latent C bugs surfaced and fixed** (the corpus doing its job):
+**Two latent C bugs surfaced and were fixed**, the corpus doing its job.
 
 1. `net_msg_pack_json` called `json_dumps` without `JSON_ENCODE_ANY`, so a
-   bare-string IPC payload (the `partition_signal` from_addr, §5.1) failed to
-   serialize and the probe was never emitted: broken in production
-   `net_proc.c` too, not just the harness. Fixed by adding
-   `JSON_ENCODE_ANY` / `JSON_DECODE_ANY` to the shared pack/unpack helpers.
+ bare-string IPC payload (the `partition_signal` from_addr, §5.1) failed to
+ serialize and the probe was never emitted. That was broken in production
+ `net_proc.c` too, not just in the harness. Fixed by adding
+ `JSON_ENCODE_ANY` / `JSON_DECODE_ANY` to the shared pack/unpack helpers.
 2. `signature_publish` / `encryptor_publish` malloc'd exactly `KEYBYTES*2`
-   and copied that many bytes, dropping the NUL terminator that `public_hex`
-   carries. `json_string()` in `public_identity_to_json` then over-read the
-   heap, so `public_identity_from_json` rejected the round-tripped key and
-   probe/response signature verification failed. Fixed by copying the
-   terminator (`*2 + 1`). Latent everywhere a published identity is
-   round-tripped + decoded; this is the first conformance case that does so.
+ and copied that many bytes, dropping the NUL terminator that `public_hex`
+ carries. `json_string()` in `public_identity_to_json` then over-read the
+ heap, so `public_identity_from_json` rejected the round-tripped key and
+ probe/response signature verification failed. Fixed by copying the
+ terminator (`*2 + 1`). Latent everywhere a published identity is
+ round-tripped and decoded, and this is the first conformance case that does
+ so.
 
 ## 10. Sequencing & owner notes
 
-Implementation order (one commit chain, but multiple sessions):
+Implementation order runs in six steps, one commit chain across multiple
+sessions.
 
-1. Python side wire-up (§7): protocol constants, handlers, internal
-   queue, NetProcess signal push.
-2. Python tests (`test_partition_recovery.py`): must pass before
-   moving on.
-3. C side wire-up (§8). Mirror everything from step 1; spot-check
-   `id_proc_priv.h` field ordering matches the canonical layout
-   (per `feedback_synchronous_dispatch_pattern`, ordering matters
-   for memcmp-based test fixtures).
+1. Python side wire-up (§7), meaning protocol constants, handlers, internal
+ queue, and NetProcess signal push.
+2. Python tests (`test_partition_recovery.py`), which must pass before
+ moving on.
+3. C side wire-up (§8). Mirror everything from step 1, and spot-check
+ `id_proc_priv.h` field ordering matches the canonical layout
+ (per `feedback_synchronous_dispatch_pattern`, ordering matters
+ for memcmp-based test fixtures).
 4. C tests: same shape as Python.
 5. Conformance corpus updates (§9). At this point both sides should
-   produce identical synchronous-dispatch traces; the corpus is the
-   tie-breaker if they drift.
-6. End-to-end validation: re-run the dod_mission demo and verify the
-   coordinator's `cohort.peers` populates within ~10s of stack startup.
-   This is the original symptom: its disappearance is the integration
-   test.
+ produce identical synchronous-dispatch traces, and the corpus is the
+ tie-breaker if they drift.
+6. End-to-end validation, re-running the dod_mission demo and verifying that
+ `cohort.peers` on the coordinator populates within ~10 s of stack startup.
+ That is the original symptom, and its disappearance is the integration
+ test.
 
-Approximate effort (subject to revision once we start):
+Approximate effort, subject to revision once we start.
 
 - Steps 1-2: ~half a focused session
 - Steps 3-4: ~one focused session (the C-side dispatch table is denser
-  and the map lifecycle needs to match `committed_paxos_rounds`)
+ and the map lifecycle needs to match `committed_paxos_rounds`)
 - Step 5: ~half a session
 - Step 6: minutes if the framework work is right; longer if it isn't
 
 ## 11. Open questions
 
 - Should `partition_probe` carry the *full* address list of our group,
-  not just the size? Doing so lets the responder skip the
-  request_access round-trip and immediately send `full_history` to a
-  larger-group sender. But it leaks our group composition over
-  unsecured multicast: visible to anyone on the link, not just our
-  group. **Tentative answer: no, just the size.** The extra round-trip
-  is cheap and the unsecured-channel hygiene is worth it.
+ not just the size? Doing so lets the responder skip the
+ request_access round-trip and immediately send `full_history` to a
+ larger-group sender. But it leaks our group composition over
+ unsecured multicast, visible to anyone on the link and not just to our
+ group. **Tentative answer: no, just the size.** The extra round-trip
+ is cheap and the unsecured-channel hygiene is worth it.
 
 - Should the merge tiebreaker use group uuid (current convention in
-  `_merge_to_mesh`) or first-admitted-peer timestamp (more robust
-  against uuid-spamming attacks)? Current convention wins for
-  consistency with the existing flood guard; switching it would touch
-  the flood guard too. **Tentative answer: keep uuid tiebreak for now,
-  re-evaluate if Sybil resistance becomes a priority.**
+ `_merge_to_mesh`) or first-admitted-peer timestamp (more robust
+ against uuid-spamming attacks)? Current convention wins for
+ consistency with the existing flood guard; switching it would touch
+ the flood guard too. **Tentative answer: keep uuid tiebreak for now,
+ re-evaluate if Sybil resistance becomes a priority.**
 
 - How does this interact with the cross-group gateway forwarding
-  in `net_proc.c:1237-1265` (`AT_NET_GROUP_FORWARD`)? A gateway is
-  intentionally in *zero* groups but forwards between configured legs.
-  Should gateways respond to `partition_probe`? **Tentative answer:
-  no, gateways skip the probe/response handlers entirely. The
-  `is_gateway` check at `net_proc.c:1233-1234` already exists; use
-  the same gate.**
+ in `net_proc.c:1237-1265` (`AT_NET_GROUP_FORWARD`)? A gateway is
+ intentionally in *zero* groups but forwards between configured legs.
+ Should gateways respond to `partition_probe`? **Tentative answer:
+ no, gateways skip the probe/response handlers entirely. The
+ `is_gateway` check at `net_proc.c:1233-1234` already exists; use
+ the same gate.**
 
 ## 12. Layer 3: post-admission state recovery (implemented)
 
 The probe/response merge (§§4-5) reunites split *groups*. A second, narrower
 failure mode is a peer that is correctly *admitted* but missing per-peer state
 because a directed UDP round-trip was lost (common over the Docker bridge, and
-for cold/late joiners). Two periodic Identity sweeps backstop this. Both are
-one-shot-with-retry: they re-fire until the state arrives, and the responses are
-idempotent.
+for cold/late joiners). Two periodic Identity sweeps backstop this. The sweeps are periodic,
+idempotent, and bounded, re-firing until the state arrives.
 
 ### 12.1 Caps-resync sweep
 
 `_periodic_caps_resync` (idprocess.py) runs every `_CAPS_RESYNC_INTERVAL_SEC`
 (~20 s). It queries each admitted peer that has no entry in `peer_capabilities`
 over the **reliable** channel (not UDP broadcast), rate-limited to a bounded
-number of queries per sweep. `handle_caps_query` answers and `handle_caps_response`
-registers caps with per-capability dedup. This backstops the confirm-time
-directed `caps_query`, which is a one-shot, if it or its response is dropped,
-the peer stays in `self.peers` yet absent from `peer_capabilities`, silently
-blocking cap-driven paths (subscription, negotiation). Tests:
-`test_late_joiner_caps_resync.py` (Python) and `late_joiner_caps_resync_test.c` (C).
+number of queries per sweep. `handle_caps_query` answers and
+`handle_caps_response` registers caps with per-capability dedup. This backstops
+the confirm-time directed `caps_query`, which is a one-shot. If it or its
+response is dropped, the peer stays in `self.peers` yet absent from
+`peer_capabilities`, silently blocking cap-driven paths such as subscription and
+negotiation. The tests are `test_late_joiner_caps_resync.py` (Python) and
+`late_joiner_caps_resync_test.c` (C).
 
 ### 12.2 Identity-resync backfill
 
 `_periodic_identity_resync` (idprocess.py) handles the cold/late-joiner case
 where a peer holds a group address map but is missing the `Identity` objects for
 some co-members. When the known-peer count is below the group address count it
-broadcasts a `peer_identity_query`; `handle_identity_query` responds with the
-published identity (if the sender is a group member) and `handle_identity_response`
-backfills the peer table for addresses already in the group. Pinned by
-`conformance/scenarios/identity/identity-resync-backfill.yaml` (Python in
-`idprocess.py`, C mirror in `src/c/.../id_proc.c`).
+broadcasts a `peer_identity_query`. `handle_identity_query` responds with the
+published identity if the sender is a group member, and
+`handle_identity_response` backfills the peer table for addresses already in the
+group. Pinned by `conformance/scenarios/identity/identity-resync-backfill.yaml`
+(Python in `idprocess.py`, C mirror in `src/c/.../id_proc.c`).
 
-These sweeps are also surfaced from the node's perspective in
-[Node Lifecycle → Post-admission Recovery](node-lifecycle.md).
+These sweeps are also surfaced from the perspective of the node in [Node
+Lifecycle → Post-admission Recovery](node-lifecycle.md).
+
+---
+
+*Next: [Cohort clock skew](cohort-clock-skew.md)*

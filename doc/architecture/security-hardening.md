@@ -1,4 +1,4 @@
-[< Space Communications](space-communications.md)
+*Previous: [The security model](../security.md)*
 
 # Security Hardening
 
@@ -92,3 +92,7 @@ Although the simulator does not run in production, correctness in its radio mode
 | Services | Metadata class allowlist | Arbitrary class instantiation from network input |
 | Simulator | Signal comparison correction | Incorrect peer reachability in radio model |
 | Simulator | Exhaustive enum matching | Silent undefined behavior on enum extension |
+
+---
+
+*Next: [Machine-to-machine security](../m2m_security.md)*

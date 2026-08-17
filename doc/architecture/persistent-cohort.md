@@ -1,20 +1,23 @@
+*Previous: [Cohort clock skew](cohort-clock-skew.md)*
+
 # Persistent Cohort State
 
-How a node's identity, peer table, and reputation survive a restart,
-and how the DoD mission demo pre-seeds the squad / microdrone / jet
-cohort with mutual trust so they boot in a high-trust network.
+How the identity of a node, peer table, and reputation survive a restart, and
+how the DoD mission demo pre-seeds the squad / microdrone / jet cohort with
+mutual trust so they boot in a high-trust network.
 
-**What "warm-start" means.** A warm-started peer is one whose reputation
-is *a memory of its prior AT-bounded activity that becomes operational
-again at machine start-up*: the score it already earned through observed
-AT-mediated transactions, persisted here and reloaded into the live
-reputation store on restart, rather than re-earned from neutral on every
-reboot. It is not a trust grant and not an allow-list; the reloaded score
-is bound to the same cryptographic identity and stays under continuous
-re-evaluation (any transaction can move it; the slashing fast-path can
-floor it). What keeps the shortcut honest is that **re-loaded trust is
-stale trust, and stale trust decays** toward almost-neutral with time out
-of contact, see §3.1 and [Reputation › Staleness decay](reputation.md).
+**What "warm-start" means.** Although a restart looks like a fresh start, it
+need not be one. A warm-started peer is one whose reputation is a memory of
+prior AT-bounded activity becoming operational again at machine start-up. It is
+the score the peer already earned through observed AT-mediated transactions,
+persisted here and reloaded into the live reputation store on restart, rather
+than re-earned from neutral on every reboot. It is not a trust grant and not an
+allow-list. The reloaded score is bound to the same cryptographic identity and
+stays under continuous re-evaluation (any transaction can move it, and the
+slashing fast-path can floor it). What keeps the shortcut honest is that
+**re-loaded trust is stale trust, and stale trust decays** toward almost-neutral
+with time out of contact, see §3.1 and [Reputation › Staleness
+decay](reputation.md).
 
 ## 1. What gets persisted
 
@@ -29,81 +32,78 @@ on each relevant state change:
 | `peer-capabilities.cfg.json` | `IdentityProcess._record_peers` | On capability announcement | `{capability_name: [peer_uuids]}` |
 | `reputation.cfg.json` | `ReputationProcess._persist_reputations` | After every `_compute_reputation()` call | `{peer_uuid: float}` |
 
-JSON is pretty-printed (`indent=2`): diff-friendly, hand-editable for
-debugging.
+JSON is pretty-printed with an indent of two, which makes it diff-friendly and
+hand-editable for debugging.
 
 ## 2. The >0.5 reputation gate
 
-`ReputationProcess` filters `reputation.cfg.json` to peers strictly
-above `REPUTATION_PERSIST_THRESHOLD = 0.5` (defined in
+`ReputationProcess` filters `reputation.cfg.json` to peers strictly above
+`REPUTATION_PERSIST_THRESHOLD = 0.5` (defined in
 [`repprocess.py`](../../src/autonomous-trust/autonomous_trust/core/_python/reputation/repprocess.py)).
 Self is always included regardless of score.
 
-`IdentityProcess._remember_activity` mirrors that gate on
-`peers.cfg.json` and `peer-capabilities.cfg.json` via
-`PERSIST_TIER_FLOOR = 1` (defined in
+`IdentityProcess._remember_activity` mirrors that gate on `peers.cfg.json` and
+`peer-capabilities.cfg.json` via `PERSIST_TIER_FLOOR = 1` (defined in
 [`idprocess.py`](../../src/autonomous-trust/autonomous_trust/core/_python/identity/idprocess.py)).
-Tier 1 corresponds to score ≥ 0.50 per `ReputationProcess.TIER_FLOORS`,
-so the on-disk snapshots agree on which peers count as "trusted".
+Tier 1 corresponds to score ≥ 0.50 per `ReputationProcess.TIER_FLOORS`, so the
+on-disk snapshots agree on which peers count as "trusted".
 
-The in-memory peer table is *not* filtered: only the saved snapshot
-is. A peer that drifts below 0.5 mid-session is still tracked +
-scored in the live process; it just doesn't survive a restart.
+The in-memory peer table is *not* filtered: only the saved snapshot is. A peer
+that drifts below 0.5 mid-session is still tracked + scored in the live process;
+it just doesn't survive a restart.
 
 ## 3. Shutdown flush
 
-The previous design relied entirely on event-driven saves: reputation
-flushed after each transaction, peers after each mutation. That covers
-crash-safety for *committed* state but loses anything in flight when
-the process exits.
+The previous design relied entirely on event-driven saves, flushing reputation
+after each transaction and peers after each mutation. That covers crash-safety
+for *committed* state but loses anything in flight when the process exits.
 
 `automate.py:run_forever` now installs a `SIGTERM` handler that pushes
-`Process.sig_quit` to every subprocess's signal queue. Each subprocess
+`Process.sig_quit` to the signal of every subprocess queue. Each subprocess
 exits its `while self.keep_running(signal):` loop cleanly, then runs a
-tail-of-loop persistence:
+tail-of-loop persistence.
 
 - `ReputationProcess.process` → final `_persist_reputations()` flush
 - `IdentityProcess.process` → final `_record_group()` + `_record_peers()`
 
-`SIGINT` (Ctrl-C) was already handled via `KeyboardInterrupt` in the
-autonomous loop; SIGTERM is the new path: `kubectl delete pod`,
-`docker stop`, `tilt down`, supervisor restart all go through it.
+`SIGINT` (Ctrl-C) was already handled via `KeyboardInterrupt` in the autonomous
+loop. SIGTERM is the new path, covering `kubectl delete pod`, `docker stop`,
+`tilt down`, supervisor restart all go through it.
 
 ### 3.1 Staleness: warm-start memory fades
 
 A reloaded reputation is a *memory*, so it is not trusted indefinitely.
-`ReputationProcess` relaxes an idle peer's operational reputation toward
-*almost-but-not-quite neutral* (`0.51`, just above `0.50`) as a function
-of time since the last transaction with that peer: eroding earned trust
-above the asymptote while leaving a distrusted/corrupt node's low score
-untouched (decay is asymmetric: absence never rehabilitates a bad actor;
-slashed peers and self are never decayed). The time the peer spent out of
-contact **while the node was down counts**: `_seed_idle_from_snapshot`
-reads `reputation.cfg.json`'s mtime as the instant of last activity and
-applies the offline-gap decay at start-up, so a long-dormant cohort warm-
-starts with faded (not stale-inflated) trust. A peer's *elevated* tier
-(2-4) thus lapses over a long absence and must be re-earned on contact,
-while tier 1 (presence) persists. Tunable via `REPUTATION_DECAY_*` in
-`repprocess.py`. Local-view only (wall-clock driven, never on the wire),
-so the conformance corpus is unaffected. Full rationale in
-[Reputation › Staleness decay](reputation.md).
+`ReputationProcess` relaxes the operational reputation of an idle peer toward
+*almost-but-not-quite neutral* (`0.51`, just above `0.50`) as a function of time
+since the last transaction with that peer: eroding earned trust above the
+asymptote while leaving a distrusted/low score untouched (decay is asymmetric:
+absence never rehabilitates a bad actor; slashed peers and self are never
+decayed). The time the peer spent out of contact **while the node was down
+counts**. `_seed_idle_from_snapshot` reads `reputation.cfg.json`'s mtime as the
+instant of last activity and applies the offline-gap decay at start-up, so a
+long-dormant cohort warm-starts with faded (not stale-inflated) trust. A peer's
+*elevated* tier (2-4) thus lapses over a long absence and must be re-earned on
+contact, while tier 1 (presence) persists. Tunable via `REPUTATION_DECAY_*` in
+`repprocess.py`. Local-view only (wall-clock driven, never on the wire), so the
+conformance corpus is unaffected. Full rationale in [Reputation › Staleness
+decay](reputation.md).
 
-**Planned hardening: floor, not full restoration (design, not yet
-implemented).** Decay covers *time out of contact* but not the orthogonal
-*"this session hasn't re-validated you yet"* axis: a recently-active peer
-with little decay is restored to its full earned tier the instant it is
-re-admitted. Because an *authenticated-but-compromised* asset passes
-admission by definition and a short-lived asset gives behavioral
-re-evaluation no time to bite, warm-start should restore only **low-tier**
-(presence/communication) standing instantly and require **fresh in-session
-evidence** before re-granting **elevated/safety-critical** tiers. See
-[Reputation › Planned hardening](reputation.md) for the implementation
-sketch; pairs with the human-on-the-loop safety carve-out.
+**Planned hardening, being a floor rather than full restoration.** Design only,
+not yet implemented. Decay covers *time out of contact* but not the orthogonal
+axis of this session not having re-validated you yet, where a recently-active
+peer with little decay is restored to its full earned tier the instant it is
+re-admitted. Because an *authenticated-but-compromised* asset passes admission
+by definition and a short-lived asset gives behavioral re-evaluation no time to
+bite, warm-start should restore only **low-tier** (presence/communication)
+standing instantly and require **fresh in-session evidence** before re-granting
+**elevated/safety-critical** tiers. See [Reputation › Planned
+hardening](reputation.md) for the implementation sketch. It pairs with the
+human-on-the-loop safety carve-out.
 
 ## 4. The DoD demo's warm-start cohort
 
-The mission scenario has three groups of peers that ought to know each
-other before the first tick:
+The mission scenario has three groups of peers that ought to know each other
+before the first tick:
 
 | Group | Why pre-trusted |
 |---|---|
@@ -122,21 +122,20 @@ Everyone else cold-bootstraps:
 
 ### 4.1 Generating the seed
 
-`tools/seed_dod_cohort.py` writes each pre-trusted peer's persistent
-dir before the demo brings any containers up. For every peer in
-{`squad-*`, `microdrone-*`, `jet-*`}:
+`tools/seed_dod_cohort.py` writes each pre-persistent dir before the demo brings
+any containers up. For every peer in {`squad-*`, `microdrone-*`, `jet-*`}:
 
 1. Generate (or reload: idempotent unless `--force`) a fresh Ed25519
-   + X25519 keypair, write `identity.cfg.json`.
+ + X25519 keypair, write `identity.cfg.json`.
 2. Construct one shared `Group` with all seeded peers in its
-   address map; write its `group.cfg.json` into every seeded peer's dir
-   (so each peer agrees on group UUID + group key).
+ address map; write its `group.cfg.json` into the directory of every seeded peer
+ so that each peer agrees on the group identifier and the group key.
 3. Write `peers.cfg.json` containing the OTHER seeded peers'
-   Identities, each `_tier`-bumped to 2 ("affirmed").
+ Identities, each `_tier`-bumped to 2 ("affirmed").
 4. Write `reputation.cfg.json` with `{other_uuid: 0.7}` for each other
-   seeded peer.
+ seeded peer.
 5. Write `peer-capabilities.cfg.json` advertising the canonical
-   bootstrap capability list per peer.
+ bootstrap capability list per peer.
 
 ```bash
 # Default: writes to .demo-state/dod-mission/
@@ -149,9 +148,9 @@ python -m tools.seed_dod_cohort --out /tmp/seed --swarm-size 24
 python -m tools.seed_dod_cohort --force
 ```
 
-Address-on-disk is the peer name as a placeholder; at runtime the
-network process announces with the actual interface IP and the
-receivers' peer tables update accordingly.
+Address-on-disk is the peer name as a placeholder. At runtime the network
+process announces with the actual interface IP and the receivers' peer tables
+update accordingly.
 
 ### 4.2 Wiring the seed into the containers
 
@@ -162,24 +161,23 @@ receivers' peer tables update accordingly.
 
 ### 4.3 Disabling the seed
 
-Set `AT_PRESEED=0` before `run-demo.sh` to skip the seed step entirely:
-useful for testing the bare handshake / Sybil-rejection paths without
-the warm start. Set `AT_PRESEED_FORCE=1` to regenerate identities even
-on a re-run (default is to preserve so warm restarts stay consistent).
+Set `AT_PRESEED=0` before `run-demo.sh` to skip the seed step entirely, which is
+useful for testing the bare handshake / Sybil-rejection paths without the warm
+start. Set `AT_PRESEED_FORCE=1` to regenerate identities even on a re-run
+(default is to preserve so warm restarts stay consistent).
 
 ## 5. Persistence across pod recreation
 
-**v1: pod-lifetime only on k8s.** The k8s manifests use `emptyDir` for
-the per-peer state volume, which survives container restart within a
-pod but is wiped on pod recreation. For real cross-recreation
-persistence, swap `emptyDir: {}` for a PVC reference in the volume
-spec (`generate_k8s.py`). The compose path bind-mounts a host
-directory so it survives `docker compose down/up`.
+**Version 1 is pod-lifetime only on Kubernetes.** The k8s manifests use
+`emptyDir` for the per-peer state volume, which survives container restart
+within a pod but is wiped on pod recreation. For real cross-recreation
+persistence, swap `emptyDir: {}` for a PVC reference in the volume spec
+(`generate_k8s.py`). The compose path bind-mounts a host directory so it
+survives `docker compose down/up`.
 
-The current scope is the user's requested behaviour: "if a node
-reboots/restarts everything starts from scratch" → no longer true
-within a pod's lifetime. PVCs are the upgrade path for cluster-wide
-persistence.
+The current scope is the requested behaviour. A node that reboots no longer
+starts from scratch, within the lifetime of a pod. PVCs are the upgrade path for
+cluster-wide persistence.
 
 ## 6. Reproducing locally
 
@@ -213,3 +211,7 @@ scripts/run-demo.sh --variant=dod-mission --tilt
 | Seed generator | [`tools/seed_dod_cohort.py`](../../tools/seed_dod_cohort.py) |
 | Tests | [`examples/dod_mission/test_persistent_cohort.py`](../../examples/dod_mission/test_persistent_cohort.py) |
 | Launcher integration | [`scripts/run-demo.sh`](../../scripts/run-demo.sh) (dod-mission variant), [`tilt/dod_mission.tiltfile`](../../tilt/dod_mission.tiltfile) |
+
+---
+
+*Next: [The gateway reputation tree](gateway-reputation-tree.md)*

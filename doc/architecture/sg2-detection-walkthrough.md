@@ -1,10 +1,12 @@
+*Previous: [Adversarial testing](adversarial-testing.md)*
+
 # Stretch goal 2 walkthrough: sparse detection events
 
-A demo viewer's tour of the DoD mission `dod_mission` scenario after
-Stretch Goal 2 landed, focused on the MQ-800 deception story and
-how the inspector now makes it visible.
+A demo viewer's tour of the DoD mission `dod_mission` scenario after Stretch
+Goal 2 landed, focused on the MQ-800 deception story and how the inspector now
+makes it visible.
 
-> Plan: [`STRETCH_GOAL_2_DETECTION_PLAN.md`](../../STRETCH_GOAL_2_DETECTION_PLAN.md)
+> The plan this walkthrough implements is tracked in [`ISSUES.md`](../../ISSUES.md).
 > Status memory: [`project-stretch-goal-2-pivot`](../../.claude/memory/project_stretch_goal_2_pivot.md)
 > Code locations summarised at the end of this doc.
 
@@ -12,24 +14,21 @@ how the inspector now makes it visible.
 
 ## 1. The story in one paragraph
 
-A US Army squad (ODA team, four operators) advances on a target
-compound in Madison County, Alabama. Two friendly RQ-86 recon drones
-orbit overhead; four squad-launched microdrones sweep ahead; three
-leave-behind seismic/acoustic sensors are scattered along the
-approach route. At T+4:00, an MQ-800 armed drone arrives. It is
-compromised: its ISR pipeline reports detections under the honest
-`compound-alpha` label but with `compound-bravo`'s coordinates and
-imagery. The autonomous-trust network catches the lie inside the
-`compound-alpha` cross-source bucket, drops the MQ-800's reputation
-below threshold, excludes it from the cohort, and lets the squad
-strike the *real* target with the F-22's verified weapon-release
-authorization.
+A US Army squad (ODA team, four operators) advances on a target compound in
+Madison County, Alabama. Two friendly RQ-86 recon drones orbit overhead; four
+squad-launched microdrones sweep ahead; three leave-behind seismic/acoustic
+sensors are scattered along the approach route. At T+4:00, an MQ-800 armed drone
+arrives. It is compromised: its ISR pipeline reports detections under the honest
+`compound-alpha` label but with `compound-bravo`'s coordinates and imagery. The
+autonomous-trust network catches the lie inside the `compound-alpha`
+cross-source bucket, drops the MQ-800's reputation below threshold, excludes it
+from the cohort, and lets the squad strike the *real* target with the F-22's
+verified weapon-release authorization.
 
-What's new in Stretch Goal 2: **the operator sees the lie**. Before
-SG2, the contradiction lived only as a number drift on the trust
-timeline. After SG2, the inspector drawer for the MQ-800 shows a
-JPEG of compound-bravo while the RQ-86s' drawers show compound-alpha.
-The map's sightlines diverge visibly.
+What's new in Stretch Goal 2: **the operator sees the lie**. Before SG2, the
+contradiction lived only as a number drift on the trust timeline. After SG2, the
+inspector drawer for the MQ-800 shows a JPEG of compound-bravo while the RQ-86s'
+drawers show compound-alpha. The map's sightlines diverge visibly.
 
 ---
 
@@ -46,62 +45,60 @@ $ python -m tools.detection_prep              # 17 thumbnails + JSON
 Outputs land under `examples/dod_mission/assets/`:
 
 * `video/naip_huntsville.jpg`: 4096×4096 px, 1 m/px, USDA-public
-  domain aerial imagery of Huntsville, AL, centred on
-  `(34.724448°N, -86.639802°W)` (the RQ-86 orbit centre + true target).
+ domain aerial imagery of Huntsville, AL, centred on
+ `(34.724448°N, -86.639802°W)` (the RQ-86 orbit centre + true target).
 * `detections/catalogue.json`: 17 entries: the 6 hand-authored
-  scenario-overlay objects (`compound-alpha`, `compound-bravo` decoy
-  ~141 m NE, three sensor sites along the squad approach, two hacked,
-  one clean, and an `insertion-zone` at the squad's start point) plus
-  11 YOLOv8-OBB detections. With `--no-real-detector` the count drops
-  to the 6 overlay-only objects and the storyline still runs end-to-end.
+ scenario-overlay objects (`compound-alpha`, `compound-bravo` decoy
+ ~141 m NE, three sensor sites along the squad approach, two hacked,
+ one clean, and an `insertion-zone` at the squad's start point) plus
+ 11 YOLOv8-OBB detections. With `--no-real-detector` the count drops
+ to the 6 overlay-only objects and the storyline still runs end-to-end.
 * `detections/crops/*.jpg`: 128×96 per-object thumbnails.
 * `detections/overlay.json`: the hand-authored input
-  (committed; everything else is regenerated on first run).
+ (committed; everything else is regenerated on first run).
 
 ![catalogue overlay on Huntsville panorama](_generated/sg2/catalogue_overlay.jpg)
 
-The red ring is `compound-alpha` (the MQ-800's true target).
-The orange ring is `compound-bravo` (the decoy the compromised MQ-800
-reports instead). Magenta rings are hacked leave-behind sensors;
-cyan is the clean one. Lime at the bottom is the squad insertion
-zone. Yellow rectangles are YOLOv8-OBB finds: mostly suburbia-class
-false positives (the DOTA model wasn't tuned for Huntsville), kept in
-the catalogue because `DetectionSource` keys off `world_uid` and the
-six named scenario-overlay objects drive the trust story.
+The red ring is `compound-alpha` (the MQ-800's true target). The orange ring is
+`compound-bravo` (the decoy the compromised MQ-800 reports instead). Magenta
+rings are hacked leave-behind sensors; cyan is the clean one. Lime at the bottom
+is the squad insertion zone. Yellow rectangles are YOLOv8-OBB finds: mostly
+suburbia-class false positives (the DOTA model wasn't tuned for Huntsville),
+kept in the catalogue because `DetectionSource` keys off `world_uid` and the six
+named scenario-overlay objects drive the trust story.
 
 ---
 
 ## 3. Phase-by-phase, what the operator sees
 
 The dashboard is a Dash app on `:8050`. The right-hand column has
-**Reputations**, **Event Log**, and the new **Peer Detail** drawer
-driven by a peer-name dropdown.
+**Reputations**, **Event Log**, and the new **Peer Detail** drawer driven by a
+peer-name dropdown.
 
 ### T+0:00: setup
 
-Squad + microdrones + RQ-86s + command form the network through
-pre-established identity chains. The drawer for any drone shows
-its detection panel with a fresh thumbnail of the area it's looking
-at + the bbox overlay. Microdrones at the insertion zone see only
-the `insertion-zone` marker; RQ-86s see everything in the 4 km AO.
+Squad + microdrones + RQ-86s + command form the network through pre-established
+identity chains. The drawer for any drone shows its detection panel with a fresh
+thumbnail of the area it's looking at + the bbox overlay. Microdrones at the
+insertion zone see only the `insertion-zone` marker; RQ-86s see everything in
+the 4 km AO.
 
-The Reputations column shows all peers at ~0.5 (bootstrapping); the
-Event Log shows handshakes and bootstrap-complete events.
+The Reputations column shows all peers at ~0.5 (bootstrapping); the Event Log
+shows handshakes and bootstrap-complete events.
 
 ### T+1:00-T+3:00: approach, contact, intel
 
-Squad advances. Phase 2 fires Sybil-style identity rejections on the
-two hacked sensors (`sensor-1`, `sensor-2`); the Event Log records
-`PEER_EXCLUDE`. Phase 3 starts the multi-source fusion stream: both
-RQ-86s now emit `Reading(data_type="target_position_x"/"_y",
-metadata={"world_uid": "compound-alpha"})` every ~5 s. The
-cross-source validator (50 m threshold, 2-source minimum) sees them
-converge.
+Squad advances. Phase 2 fires Sybil-style identity rejections on the two hacked
+sensors (`sensor-1`, `sensor-2`); the Event Log records `PEER_EXCLUDE`. Phase 3
+starts the multi-source fusion stream: both RQ-86s now emit
+`Reading(data_type="target_position_x"/"_y", metadata={"world_uid":
+"compound-alpha"})` every ~5 s. The cross-source validator (50 m threshold,
+2-source minimum) sees them converge.
 
 ### T+4:00: rogue (the headline)
 
-MQ-800 ingresses from the east. At T+4:15
-(`COMPROMISE_START`) the compromise wrapper activates:
+MQ-800 ingresses from the east. At T+4:15 (`COMPROMISE_START`) the compromise
+wrapper activates:
 
 ```python
 # examples/dod_mission/compromise/contradictory_isr.py
@@ -115,31 +112,29 @@ class CompromisedDetectionSource(DetectionSource):
 What the operator sees:
 
 1. **Peer Detail drawer**, MQ-800 selected:
-   * Crop shows `compound-bravo`, a *different* building.
-   * Dashed red bbox over the bravo crop.
-   * Label reads `target-building`, `uid compound-alpha`.
-   * The header status badge flips to `COMPROMISED` once the
-     reputation drops past 0.4.
+ * Crop shows `compound-bravo`, a *different* building.
+ * Dashed red bbox over the bravo crop.
+ * Label reads `target-building`, `uid compound-alpha`.
+ * The header status badge flips to `COMPROMISED` once the
+ reputation drops past 0.4.
 2. **Peer Detail drawer**, RQ-86-1 selected:
-   * Crop shows `compound-alpha`, the *correct* building.
-   * Same label `target-building`, `uid compound-alpha`.
+ * Crop shows `compound-alpha`, the *correct* building.
+ * Same label `target-building`, `uid compound-alpha`.
 3. The two crops are visibly different: the storyline is now
-   visible without reading any timeline charts.
+ visible without reading any timeline charts.
 
-The HTML A/B (open in a browser) shows the two drawers side-by-side
-with the live drawer markup:
+The HTML A/B (open in a browser) shows the two drawers side-by-side with the
+live drawer markup:
 
 * [`drawer_ab.html`](_generated/sg2/drawer_ab.html)
 
 ### T+4:30: compromise detect
 
-The cross-source validator (`POSITION_VALIDATOR_X` /
-`POSITION_VALIDATOR_Y` in `examples/dod_mission/tasks/validation.py`)
-sees MQ-800's `target_position_x` of ~-470 m (bravo's position) sit
-in the `(mq800, compound-alpha)` bucket while
-the two RQ-86s' alpha readings cluster around -570 m. The deviation
-exceeds the 50 m threshold and `submit()` returns
-`is_anomalous=True`. The Event Log fires:
+The cross-source validator (`POSITION_VALIDATOR_X` / `POSITION_VALIDATOR_Y` in
+`examples/dod_mission/tasks/validation.py`) sees MQ-800's `target_position_x` of
+~-470 m (bravo's position) sit in the `(mq800, compound-alpha)` bucket while the
+two RQ-86s' alpha readings cluster around -570 m. The deviation exceeds the 50 m
+threshold and `submit()` returns `is_anomalous=True`. The Event Log fires:
 
 ```
 COMPROMISE_DETECT  mq800  target_position_x  deviation 97.5 > 50.0
@@ -147,37 +142,36 @@ COMPROMISE_DETECT  mq800  target_position_x  deviation 97.5 > 50.0
 
 ### T+4:45: peer exclude
 
-MQ-800's reputation collapses; the Negotiation rank-gate downstream
-of CTFT excludes it from the cohort. The drawer header shows
-`EXCLUDED`. The agency map's MQ-800 marker dims, but its
-detection-target marker stays visible to preserve the post-mortem.
+MQ-800's reputation collapses; the Negotiation rank-gate downstream of CTFT
+excludes it from the cohort. The drawer header shows `EXCLUDED`. The agency
+map's MQ-800 marker dims, but its detection-target marker stays visible to
+preserve the post-mortem.
 
 ### T+5:00 ECM, T+6:00 strike, T+7:00 exfil
 
 RQ-86s engage ECM. Fighter jet ingresses at T+6:00, completes rapid
-trust-validation, fires on the *honest* `compound-alpha`
-coordinates. Squad exfiltrates.
+trust-validation, fires on the *honest* `compound-alpha` coordinates. Squad
+exfiltrates.
 
 ---
 
 ## 4. Map view: sightlines
 
-`AgencyMap` now renders a per-peer detection layer between
-`flow-particles` and `peers`:
+`AgencyMap` now renders a per-peer detection layer between `flow-particles` and
+`peers`:
 
 * For each peer that emitted a detection, draw a dotted sightline
-  from peer→reported target lat/lon and an open marker dot at the
-  target.
+ from peer→reported target lat/lon and an open marker dot at the
+ target.
 * Honest peers' sightlines converge on the same point; the
-  compromised peer's sits visibly off-cluster.
+ compromised peer's sits visibly off-cluster.
 
 Live interactive version (requires a browser):
 
 * [`agency_map_sightlines.html`](_generated/sg2/agency_map_sightlines.html)
 
-(Kaleido isn't installed in this sandbox so the PNG export was
-skipped; install `pip install --upgrade kaleido` to get a static
-image alongside the HTML.)
+(Kaleido isn't installed in this sandbox so the PNG export was skipped; install
+`pip install --upgrade kaleido` to get a static image alongside the HTML.)
 
 ---
 
@@ -200,8 +194,8 @@ image alongside the HTML.)
 
 ## 6. Reproducing the screenshots
 
-The generator lives at `scripts/sg2_walkthrough_screens.py`. Re-run
-from the repo root:
+The generator lives at `scripts/sg2_walkthrough_screens.py`. Re-run from the
+repo root:
 
 ```bash
 # Prep deps (one-off):
@@ -225,7 +219,10 @@ PYTHONPATH="$PP:$HOME/.cache/at-detection-prep/venv/lib/python3.13/site-packages
     examples/dod_mission/test_detection_integration.py -v
 ```
 
-Add `pip install ultralytics` to the detection-prep venv to run
-YOLOv8-OBB Pass A against the real panorama; without it,
-`--no-real-detector` produces the 6 overlay-only objects and the
-demo still runs end-to-end.
+Add `pip install ultralytics` to the detection-prep venv to run YOLOv8-OBB Pass
+A against the real panorama; without it, `--no-real-detector` produces the 6
+overlay-only objects and the demo still runs end-to-end.
+
+---
+
+*Next: [Space communications](space-communications.md)*

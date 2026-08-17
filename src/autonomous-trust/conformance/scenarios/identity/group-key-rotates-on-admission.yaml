@@ -1,0 +1,84 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-key-rotates-on-admission
+byte_pinning: false
+description: |
+    The shared group key ROTATES when a cohort admits a member (ISSUES.md
+    §10.2, user's call 2026-08-13).
+
+    Why this is pinned rather than left to each runtime: the group key used to
+    be permanent. `group_key_update` carried membership changes only, and
+    rotation was deliberately deferred. That made admission hand a joiner the
+    ability to decrypt every cohort frame it had recorded BEFORE it was
+    admitted — a passive listener could sit on the wire, collect ciphertext,
+    then ask to join and read it all retroactively. Rotating at admission
+    closes that, but only if BOTH runtimes rotate, and rotate at the same point
+    in the cascade. A cohort where the C members rotate and the Python members
+    do not is worse than one where neither does: it looks protected while half
+    the members still hand out the retroactive key.
+
+    The cascade is exactly `new-node-admission` — one border guard, one
+    newcomer, the ordinary propose/vote/accept/history sequence. What is added
+    here is the observable: after the admission, bg's group sits at key epoch 1.
+    The epoch is not decoration. It is what makes a rotation safe to ACCEPT on
+    the far side: a member adopts an incoming key only when it arrives with a
+    strictly HIGHER epoch, so a captured older key cannot be replayed back over
+    a newer one. It rides `group_key_update` as an additive field and defaults
+    to 0 on read, so a peer predating rotation reads as "never rotated" with no
+    special case.
+
+    Deliberately NOT asserted here: the joiner's epoch after receiving
+    full_history. It receives the group WHOLE — new key and epoch together —
+    so its epoch restates bg's rather than testing anything independent. What
+    matters is the ORDER, and the state check does capture that: bg rotated
+    before the history was built, so what the newcomer holds is the
+    post-rotation key.
+
+    bg's cohort is pinned via `fixtures.groups` rather than left to the default
+    setup because a rotation is only meaningful for a group whose private key
+    we hold. `group_rotate_key` refuses on a public-only view — minting a key
+    we cannot already decrypt with would fork the cohort into two halves that
+    cannot hear each other — so the fixture is what makes the assertion about
+    rotation rather than about group provisioning.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  groups:
+    bg:
+      uuid: "c3000000-0000-4000-8000-00000000000b"
+      size: 1
+
+steps:
+  - id: 1
+    from: newcomer
+    to: broadcast
+    function: request_access
+    description: |
+        newcomer announces; bg runs welcoming_committee and (synchronous
+        dispatch) drives the whole admission in one delivery.
+
+  - id: 2
+    from: bg
+    to: newcomer
+    function: full_history
+    in_response_to: 1
+    no_propagate: true
+    description: |
+        The history carries the group. Verified-only: the rest of the cascade
+        is pinned by new-node-admission, and what this scenario is about is the
+        state bg is left in.
+
+expected_state:
+  bg:
+    # One admission, one rotation. 0 here would mean the shared key the
+    # newcomer just received is the same one that encrypted everything before
+    # it arrived.
+    group_key_epoch: 1
+    # ...and the admission itself still completed.
+    peer_count: 1

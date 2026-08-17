@@ -1,10 +1,73 @@
-[< Networking](networking.md)
+*Previous: [How a node is built](overview.md)*
 
-# Identity Protocol
+# Becoming a peer
 
-The identity protocol handles peer discovery, group formation, and ongoing admission of new nodes. It is a permissionless consensus protocol that must mitigate Sybil attacks.
+A node arriving on the network knows nothing and is owed nothing. It has a key
+pair it generated itself, a list of what it can do, and no relationship with
+anybody. Getting from there to being a member of a working group is the job of
+the identity protocol, and it is the one place in the framework where a
+permissionless population has to reach a decision.
 
-## Protocol messages
+The difficulty is the one every open network has. Anybody can generate a key
+pair, so anybody can generate ten thousand of them, and a protocol that admits
+whoever asks admits the ten thousand along with the one honest newcomer. That is
+the Sybil attack, and there is no cryptographic answer to it, because every one
+of the ten thousand identities is cryptographically impeccable.
+
+The answer here is that admission is not a fact about the newcomer at all. It is
+a decision made by the peers who are already in, by vote, on the encrypted
+channel the newcomer cannot yet read. A newcomer announces itself in the open,
+existing members propose it, existing members vote, and only a majority admits
+it. The cost of manufacturing a thousand identities is unchanged; the value of
+doing so drops to nothing, because a thousand strangers still get zero votes.
+
+What follows walks that process from the announcement through to full
+membership, then covers what a member does afterward, what travels on which
+channel, and what the protocol checks along the way.
+
+## The channels
+
+Three channels exist, and knowing which is which explains most of the protocol.
+
+The *open broadcast channel* is unencrypted UDP broadcast or multicast. It
+exists because a node that has joined nothing holds no key that anyone else
+holds, so its first word has to be spoken in the clear. Exactly two message
+types use it.
+
+The *encrypted group channel* carries everything the group says to itself,
+encrypted under a shared symmetric key. Proposals, votes, confirmations, and all
+consensus traffic travel here, and a non-member hears noise.
+
+The *encrypted peer-to-peer channel* carries traffic between two named peers,
+encrypted with the private key of the sender and the public key of the
+recipient. Admission hand-offs and history transfers travel here.
+
+## Joining
+
+The protocol runs in numbered phases, and a node walks them in order.
+
+*Phase 0, acquire capabilities.* The identity process waits, up to ten seconds,
+for other local processes to register what services this node can offer. This
+determines what the node will advertise, and it happens before anything touches
+the network, because announcing capabilities the node does not have is the first
+way to lose standing.
+
+*Phase 1, announce.* The node broadcasts its identity on the open channel. The
+announcement carries its published identity, meaning public keys only, a hash of
+the software package it is running, and its capability list.
+
+*Phase 2, choose a group.* The node waits for existing peers to send it group
+histories. Each history contains a group key and the identity history structure.
+After a timeout, one of two things happens. If histories arrived, the node
+selects the one with the longest step list, adopts that group, and sends back
+any steps the group is missing. If none arrived, the node concludes it is alone
+and creates a group of its own.
+
+*Phase 3, border guard.* Once in a group, the node takes up the duty every
+member holds, which is guarding the boundary for everybody else. This phase does
+not end.
+
+The protocol messages, for reference:
 
 | Message | Constant | Payload |
 |---------|----------|---------|
@@ -17,53 +80,36 @@ The identity protocol handles peer discovery, group formation, and ongoing admis
 | `peer_accepted` | `confirm` | `IdentityObj` |
 | `group_key_update` | `update` | `Group` |
 
-## Phases
+## Standing border guard
 
-### Phase 0: acquire capabilities
+Border guard mode is concurrent rather than sequential, and every member runs
+it. A node in this mode listens on the open channel for announcements from
+newcomers, proposes them to the group on the encrypted channel, votes on peers
+others have proposed, collects the votes, confirms accepted peers, sends
+identity acceptance and history to the newly admitted over peer-to-peer
+encryption, and handles history differences, group updates, and confirmations
+arriving from other members.
 
-The identity process waits (up to 10 seconds) for other local processes to register their capabilities via the IPC queue. This determines what services this node can offer to the network.
+Two further mechanisms run alongside it after admission.
 
-### Phase 1: announce identity
+The *bootstrap corpus* issues small bilateral capability exchanges shortly after
+the first peer joins, being a handshake, a time attestation, and an echo
+challenge. Their purpose is not the work itself. It is that a freshly admitted
+peer accumulates a real transaction history immediately rather than sitting at
+flat neutral reputation waiting for something to happen.
 
-The node broadcasts its identity on the **open broadcast channel** (unencrypted UDP broadcast/multicast). The announcement contains the node's published identity (public keys only), package hash (to verify software authenticity), and capability list.
+*Capability and identity resync* covers the case where admission succeeded but
+some of its state did not arrive. The directed capability query sent at
+confirmation time and the announcement broadcast can both be lost, particularly
+over a bridged network or with a late joiner. The identity process therefore
+runs periodic backstop sweeps, re-querying admitted peers with no registered
+capabilities and backfilling missing peer identities for addresses already in
+the group.
 
-### Phase 2: choose group
+## The admission sequence
 
-The node waits to receive `full_history` messages from existing peers. These contain a group key and the identity DAG history. After a timeout period:
-
-- If histories were received, the node selects the one with the longest step list, adopts that group, and sends a `history_diff` on the **encrypted group channel** containing any steps the group doesn't have.
-- If no histories were received, the node creates its own group from scratch.
-
-### Phase 3: border guard mode (concurrent)
-
-Once in a group, the node enters border guard mode and concurrently:
-
-- **Listens** for `request_access` announcements from new nodes on the open channel
-- **Proposes** new peers to the group via `propose_peer` on the **encrypted group channel**
-- **Votes** on proposed peers and collects votes from others
-- **Confirms** accepted peers via `peer_accepted` on the **encrypted group channel**
-- **Sends** identity acceptance and history to newly admitted peers on **encrypted peer-to-peer**
-- **Handles** history diffs, group updates, and peer confirmations from other group members
-
-### Post-admission: bootstrap corpus and recovery (concurrent)
-
-After a node is in a group, two further mechanisms run alongside border guard mode:
-
-- **Bootstrap corpus.** A `BootstrapWorker` issues bilateral bootstrap-capability exchanges (`at.handshake`, `at.time-attest`, `at.echo-challenge`) shortly after the first peer joins, so freshly-admitted peers accumulate a baby-steps transaction history and don't sit at flat reputation. See [Trust Tiers §6](trust-tiers.md) and [Node Lifecycle](node-lifecycle.md).
-- **Capability & identity resync.** Because the confirm-time directed `caps_query` and the announce broadcast can be lost (UDP over a Docker bridge, late joiners), `IdentityProcess` runs periodic backstop sweeps: a caps-resync that re-queries admitted peers with no registered capabilities, and an identity-resync that backfills missing peer Identities for addresses already in the group. See [Partition Recovery §12](partition-recovery.md).
-
-## Cross-runtime serialization
-
-- **Canonical wire form.** Identity and `Group` payloads are serialized in a **DRY canonical flat-dict JSON form** (`to_canonical()` / `from_canonical()`) that is byte-parseable by the C implementation. Python's default `ConfigJSONEncoder` form (with `__type__` / `_uuid` markers and a base64-wrapped hex seed) is *not* C-parseable, so all cross-runtime deliveries (`full_history`, `group_key_update`, accept/confirm) emit the canonical form. The C twin's `group_to_json` produces a byte-identical shape. See [Native / FFI Dual Implementation](native-ffi-dual-implementation.md) §6.
-- **Zooko-triangle names.** An Identity carries two human-readable names. The **`nickname`** is the *online* / global name (formerly `fullname`): e.g. `squad-warrant@dod-demo`, and **is** part of the canonical wire form so a receiver learns the peer's self-asserted global name. The **`petname`** is the *local* name a node assigns for itself (e.g. the bare roster role `squad-warrant`); it is purely local, **never serialized or transmitted**, and each receiver assigns its own. `public_identity_to_canonical()` (`_python/identity/identity.py`, mirrored in `src/c/.../identity/identity.c`) emits `nickname` and omits `petname`; a unit/conformance test asserts the canonical set includes `'nickname'` and that `'petname' not in canonical`.
-
-## Peer hierarchy
-
-Peers are organized into 3 levels with a 10-level valuation scale. New peers enter at the middle level. Peers can be demoted for bad behavior (sending invalid messages, persistent failures). Reputation-derived **trust tiers** layer on top of this, see [Trust Tiers](trust-tiers.md).
-
-## Identity protocol sequence
-
-The diagram below is generated from `conformance/scenarios/identity/identity-canonical.yaml` by `scripts/build-docs.sh`: it cannot drift from the executable corpus.
+The diagram below is generated from a conformance scenario by the documentation
+build, so it cannot drift from the executable corpus.
 
 <!-- at_diagram:start protocol=identity scenario=identity-canonical -->
 ```mermaid
@@ -86,34 +132,102 @@ sequenceDiagram
 ```
 <!-- at_diagram:end -->
 
-**Channel semantics:** `request_access` travels on the **open broadcast channel** (unencrypted UDP). `propose_peer`, `vote_on_peer`, and `peer_accepted` travel on the **encrypted group channel**. `access_granted` is sent peer-to-peer in the open (the newcomer has no group key yet), and `full_history` is peer-to-peer encrypted with the leader's box key once `access_granted` has been processed.
+Channel assignment for the sequence above. The `request_access` travels on the
+open broadcast channel. The `propose_peer`, `vote_on_peer`, and `peer_accepted`
+travel on the encrypted group channel. The `access_granted` is sent peer-to-peer
+in the open, because the newcomer holds neither the group key nor the public key
+of the leader yet, and the subsequent `full_history` is peer-to-peer encrypted
+under the box key of the leader once the acceptance has been processed.
 
-**Internal steps not on the wire** (omitted from the diagram, but part of the protocol):
+Several steps are part of the protocol and never appear on the wire. After
+receiving a proposal, each recipient verifies that the UUID and keys of the
+candidate do not collide with an existing peer, and a rejection short-circuits
+the vote. After each vote, the leader verifies the signature before incrementing
+the tally. After receiving acceptance, the newcomer adds the leader as a peer
+and then adopts the group key from the history that follows. And the
+group-selection step in the newcomer picks the longest history when several
+groups answered, sending back any steps the group turns out to be missing.
 
-- After receiving `propose_peer`, each receiver runs `_process_id()` to verify the candidate's UUID and keys don't collide with existing peers; rejection short-circuits the vote.
-- After receiving each `vote_on_peer`, the leader runs `count_vote()` to verify the signature and increment the vote tally.
-- After receiving `access_granted`, the newcomer runs `handle_acceptance()` to add the leader as a peer, then `receive_history()` on the subsequent `full_history` to adopt the group key.
-- The newcomer's `choose_group()` selects the longest history if multiple groups responded, and sends a `history_diff` back to the group with any steps the group is missing.
+Two alternate paths exist. Under *amnesia readmission*, a leader that recognizes
+the UUID of the newcomer from history, meaning a previously known peer
+rejoining, skips the voting round entirely and emits confirmation, acceptance,
+and history directly. Under *group key rotation*, a change in group composition
+causes the leader to broadcast a key update peer-to-peer so existing members
+rotate to the new key. Both are pinned by their own conformance scenarios.
 
-**Alternate path: amnesia readmission.** If the leader recognizes the newcomer's UUID from history (a previously-known peer rejoining), it skips the voting round and emits `peer_accepted` / `access_granted` / `full_history` directly. The amnesia trace is pinned by `conformance/scenarios/identity/amnesia-readmission.yaml`. v1 of the diagram tool does not render `alt`/`else` branches; the two paths are documented as separate scenarios.
+## What travels, and in what form
 
-**Group key rotation.** When the group composition changes, the leader broadcasts `group_key_update` (encrypted peer-to-peer) so existing members rotate to the new key. Covered by `conformance/scenarios/identity/group-key-update.yaml`.
+Identity and group payloads are serialized in a canonical flat-dictionary JSON
+form that the C implementation can parse byte for byte. The default Python
+encoder form, carrying type markers and a wrapped seed, is not parseable by the
+C side, so every cross-runtime delivery emits the canonical form instead, and
+the C twin produces a byte-identical shape.
 
-## Agreement implementations
+An identity carries two human-readable names, and the distinction between them
+is a Zooko-triangle distinction rather than a convenience. The *nickname* is the
+global, self-asserted name, and it is part of the canonical wire form, so a
+receiver learns what the peer calls itself. The *petname* is the local name a
+node assigns for its own use, it is never serialized or transmitted, and every
+receiver assigns its own. A unit test asserts that the canonical set contains
+the first and not the second, because a leaked petname would turn a local
+convenience into a global namespace, which is exactly what this design refuses.
 
-The voting mechanism is pluggable via `AgreementImpl`:
+## What keeps this honest
+
+Four checks carry the security of the protocol, and each closes a specific
+attack.
+
+*Package hash verification* rejects nodes running different software, which
+prevents a modified implementation from participating on equal terms.
+
+*Duplicate detection* rejects collisions in UUID, signing key, and encryption
+key during voting, which is what stops an existing identity from being
+impersonated by a newcomer claiming it.
+
+*Signature verification* applies to every vote, checked against the public key
+of the voter, so a tally counts signatures rather than assertions.
+
+*Open-channel minimization* confines unencrypted traffic to announcement and
+acceptance. Acceptance is unencrypted only because the new peer holds neither
+the group key nor the public key of the leader at that instant, which is the
+smallest window the protocol can arrange.
+
+The voting mechanism itself is pluggable, and the choice is a deployment
+decision rather than a protocol one.
 
 | Implementation | Class | Description |
 |---------------|-------|-------------|
 | Proof of Work | `IdentityByWork` | Computational proof required |
-| Proof of Stake | `IdentityByStake` | Stake-weighted voting (timeout: 5s) |
-| Proof of Authority | `IdentityByAuthority` | Authority-weighted voting (timeout: 5s) |
+| Proof of Stake | `IdentityByStake` | Stake-weighted voting, five-second timeout |
+| Proof of Authority | `IdentityByAuthority` | Authority-weighted voting, five-second timeout |
 
-## Security properties
+Peers are organized into three levels on a ten-level valuation scale, and a new
+peer enters at the middle level. Peers can be demoted for bad behavior, meaning
+invalid messages or persistent failures. The reputation-derived trust tiers of
+the next chapters layer on top of this rather than replacing it.
 
-- **Package hash verification**: Nodes running different software versions are rejected
-- **Duplicate detection**: UUID, signing key, and encryption key collisions are detected and rejected during voting
-- **Signature verification**: All votes include Ed25519 signatures verified against the voter's public key
-- **Open-channel minimization**: Only `announce` and `accept` use the open channel; `accept` is unencrypted because the new peer doesn't yet have the group key or the leader's public key for Box encryption
+## Pinned scenarios
 
-[Task Negotiation >](negotiation.md)
+| Behavior | Scenario |
+|---|---|
+| Admission happy path | [`identity-canonical.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/identity-canonical.yaml) |
+| Amnesia readmission | [`amnesia-readmission.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/amnesia-readmission.yaml) |
+| Group key rotation | [`group-key-update.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/group-key-update.yaml) |
+
+The diagram tool does not render alternate branches, so the readmission path is
+kept as a separate scenario rather than folded into the canonical one.
+
+## Further reading
+
+- [Networking](networking.md): the socket layer, the three channels, and message
+  routing underneath this protocol.
+- [Partition recovery](partition-recovery.md): split-brain detection, the
+  probe-and-adopt merge path, and the resync sweeps described above.
+- [The dual implementation](native-ffi-dual-implementation.md): cross-runtime
+  serialization, including the canonical form.
+- [Persistent cohort](persistent-cohort.md): what a node remembers about group
+  membership across a restart.
+
+---
+
+*Next: [Getting work done](negotiation.md)*
