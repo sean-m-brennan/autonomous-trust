@@ -1,8 +1,8 @@
-*[AutonomousTrust](autonomous_trust.md) > Verification Oracle*
+*Previous: [Correctness proofs](correctness-proofs.md)*
 
 # The Verification Oracle
 
-AT's reputation machinery is a trust *algebra*. It takes a stream of
+The AT reputation machinery is a trust *algebra*. It takes a stream of
 `TransactionScore` values, weights them by capability, aggregates them across
 peers under Paxos, decays them with staleness, and quantizes the result into
 trust tiers that gate capability access. That algebra is domain-independent and
@@ -93,14 +93,14 @@ uncontested, which is precisely what Cyc's was not.
 Two techniques make it operational:
 
 - **Analytical redundancy and parity relations**, the deployed aerospace
-  fault-detection tradition (Isermann; Blanke et al., *Diagnosis and
-  Fault-Tolerant Control*). Given a physical model and a redundant set of
-  reports, form residuals that vanish under consistency and do not vanish under
-  a fault, then isolate which report is responsible.
+ fault-detection tradition (Isermann; Blanke et al., *Diagnosis and
+ Fault-Tolerant Control*). Given a physical model and a redundant set of
+ reports, form residuals that vanish under consistency and do not vanish under
+ a fault, then isolate which report is responsible.
 - **Set-membership and interval estimation** (Milanese; Jaulin's interval
-  analysis). Where errors are bounded rather than stochastic, the intersection
-  of interval constraints is a guaranteed feasible set. A claim outside it is
-  *refuted*, not merely improbable.
+ analysis). Where errors are bounded rather than stochastic, the intersection
+ of interval constraints is a guaranteed feasible set. A claim outside it is
+ *refuted*, not merely improbable.
 
 The output of this layer is qualitatively different from everything below it. A
 physics violation is a hard falsification and should carry a different
@@ -119,7 +119,7 @@ assessed only by its record of predictions against outcomes.
 
 Score with a proper scoring rule (logarithmic or Brier) applied to the peer's
 predictive *distribution*, not its point estimate. Proper scoring rules are
-uniquely maximized by honest reporting of the peer's actual belief, which is the
+uniquely maximized by honest reporting of the actual belief, which is the
 property that makes them an oracle rather than merely a metric.
 
 Aggregate with the prediction-with-expert-advice machinery: weighted majority
@@ -147,8 +147,8 @@ validity and no distributional assumptions.
 
 This separates two things reputation systems routinely conflate:
 
-- **Competence**: the sets are tight.
-- **Honesty about one's own limits**: the sets cover as advertised.
+- **Competence.** the sets are tight.
+- **Honesty about one's own limits.** the sets cover as advertised.
 
 A peer that is frequently wrong but properly humble is safe to work with. A peer
 that is usually right and systematically overconfident will eventually be
@@ -197,9 +197,9 @@ things make it far cheaper than replicating everything:
 **Sample rather than replicate.** Duplicate a random fraction p of tasks instead
 of all of them. If detection costs the peer a multiplicative reputation loss L
 and a completed task gains it g, cheating is unprofitable whenever p * L > g. In
-AT's terms L is a tier demotion or exclusion, which is large, so p can be small.
-This is the volunteer-computing argument (BOINC and its descendants) and it
-transfers directly.
+the AT terms L is a tier demotion or exclusion, which is large, so p can be
+small. This is the volunteer-computing argument (BOINC and its descendants) and
+it transfers directly.
 
 **Scale replication to consequence, not uniformly.** A `tier 4`
 `command-issue`-class task warrants three-way replication; a routine query
@@ -233,7 +233,7 @@ within tolerance Y at time t plus tau."
 This is a message-schema requirement rather than an algorithm, and it converts
 class C and class D claims into class A over time. The cost is latency in the
 evidence. The prediction cannot gate the decision being made now, but it does
-gate the peer's standing for every decision after t plus tau, which is what a
+gate the standing for every decision after t plus tau, which is what a
 reputation system is for. Most of the "no correlation" worry dissolves under
 this requirement, because in an embodied system almost nothing is truly
 non-sensory. The problem is delayed credit assignment, not absent ground truth.
@@ -247,23 +247,23 @@ delivers 70 percent of the time is an excellent peer.
 ### Score the advice you did not take
 
 If only the accepted recommendation ever generates evidence, reputation becomes
-self-confirming: the currently trusted peer keeps getting scored, its rivals stay
-frozen at their priors, and a peer that degrades quietly while remaining
+self-confirming: the currently trusted peer keeps getting scored, its rivals
+stay frozen at their priors, and a peer that degrades quietly while remaining
 top-ranked is invisible.
 
 **Off-policy evaluation** breaks this. Doubly robust estimators (Dudik, Langford
-and Li, 2011; Jiang and Li, 2016) estimate what the outcome would have been under
-a rejected peer's recommendation, using the logged decisions and outcomes AT
-already keeps. Combined with a small deliberate exploration budget, this yields
-counterfactual evidence about peers whose advice was never followed.
+and Li, 2011; Jiang and Li, 2016) estimate what the outcome would have been
+under a rejected peer's recommendation, using the logged decisions and outcomes
+AT already keeps. Combined with a small deliberate exploration budget, this
+yields counterfactual evidence about peers whose advice was never followed.
 
 ### Self-consistency over a claim archive
 
 The cheapest oracle of all requires no peers, no physics, and no domain
-knowledge: check a peer against its own past claims. A hash-chained, signed claim
-log gives non-repudiation, and contradiction detection over that log is a hard
-falsification. The archive machinery on the kith-covenant and ethne side already
-provides the log shape this needs.
+knowledge: check a peer against its own past claims. A hash-chained, signed
+claim log gives non-repudiation, and contradiction detection over that log is a
+hard falsification. The archive machinery on the kith-covenant and ethne side
+already provides the log shape this needs.
 
 Two signals fall out of the same structure. A peer whose claims contradict each
 other over time is falsified outright. A peer whose claims are never cashable
@@ -308,7 +308,7 @@ The escape is a small trusted anchor. FLTrust (Cao et al., 2021) shows that a
 tiny root of verified data restores robustness well past where unanchored
 aggregation fails. The embodied analogue is the **honeypot probe**: occasionally
 assign a peer a task whose answer is already known or independently cheap to
-verify. AT's bootstrap corpus (`at.handshake`, `at.time-attest`,
+verify. The AT bootstrap corpus (`at.handshake`, `at.time-attest`,
 `at.echo-challenge`) is already this pattern applied at cold start; the
 generalization is to keep probing throughout the relationship rather than only
 during bootstrap.
@@ -318,8 +318,8 @@ problem. Spend probes where the posterior over a peer's quality is widest and
 the capability weight is highest.
 
 All of this presumes identity is costly. Without that, an adversary answers a
-bad reputation by acquiring a new one (Douceur, 2002), and AT's identity layer is
-what holds that door shut.
+bad reputation by acquiring a new one (Douceur, 2002), and the AT identity layer
+is what holds that door shut.
 
 ## Skeptical inference over silence
 
@@ -360,28 +360,28 @@ none of it.
 
 One narrow role does survive: **offline schema alignment**. Translating peer A's
 claim vocabulary into a predicate peer B's checker can evaluate is the brittle
-joint in any multi-agent epistemology, it is genuinely a language problem, and it
-happens at commissioning time rather than in the loop. The embodied competence
-itself belongs to learned forward models, which are then scored prequentially
-like any other predictor.
+joint in any multi-agent epistemology, it is genuinely a language problem, and
+it happens at commissioning time rather than in the loop. The embodied
+competence itself belongs to learned forward models, which are then scored
+prequentially like any other predictor.
 
 ## Build order
 
 Cheapest and most general first:
 
 1. **Physical consistency and dimensional refutation.** No history, no training
-   data, hard verdicts.
+ data, hard verdicts.
 2. **Certificate-carrying task interfaces.** Interface work, not algorithm work,
-   and it collapses most of the non-sensory problem.
+ and it collapses most of the non-sensory problem.
 3. **Conformal coverage audit.** Small, distribution-free, and catches the
-   overconfident peer that averaged reputation cannot see.
+ overconfident peer that averaged reputation cannot see.
 4. **Prequential log-loss with sleeping-expert weights.** Replaces authored
-   per-capability weights with learned regional competence.
+ per-capability weights with learned regional competence.
 5. **Self-consistency checking over the signed claim archive.** Nearly free
-   given the archive already exists.
+ given the archive already exists.
 6. **Sampled replication with bisection dispute resolution**, for what remains.
 7. **Off-policy scoring and honeypot probes**, to break reputation lock-in and
-   anchor against a large adversarial fraction.
+ anchor against a large adversarial fraction.
 8. **Peer prediction** for the unverifiable residue, if any survives step 3.
 
 Steps 1 and 2 are where the leverage is. Steps 7 and 8 are the ones that need
@@ -395,81 +395,85 @@ Trust aggregation and reputation
 
 Diagnosis and physical consistency
 - Reiter, "A Theory of Diagnosis from First Principles," *Artificial
-  Intelligence* 32(1), 1987.
+ Intelligence* 32(1), 1987.
 - de Kleer and Williams, "Diagnosing Multiple Faults," *Artificial Intelligence*
-  32(1), 1987.
+ 32(1), 1987.
 - Forbus, "Qualitative Process Theory," *Artificial Intelligence* 24, 1984.
 - de Kleer and Brown, "A Qualitative Physics Based on Confluences," *Artificial
-  Intelligence* 24, 1984.
+ Intelligence* 24, 1984.
 - Blanke, Kinnaert, Lunze and Staroswiecki, *Diagnosis and Fault-Tolerant
-  Control*.
+ Control*.
 - Jaulin, Kieffer, Didrit and Walter, *Applied Interval Analysis*.
 
 Prequential assessment and online aggregation
 - Dawid, "Present Position and Potential Developments: Some Personal Views.
-  Statistical Theory: The Prequential Approach," *JRSS-A* 147, 1984.
+ Statistical Theory: The Prequential Approach," *JRSS-A* 147, 1984.
 - Littlestone and Warmuth, "The Weighted Majority Algorithm," *Information and
-  Computation* 108, 1994.
+ Computation* 108, 1994.
 - Cesa-Bianchi and Lugosi, *Prediction, Learning, and Games*, 2006.
 - Freund, Schapire, Singer and Warmuth, "Using and Combining Predictors That
-  Specialize," STOC 1997.
+ Specialize," STOC 1997.
 
 Calibration
 - Vovk, Gammerman and Shafer, *Algorithmic Learning in a Random World*, 2005.
 
 Elicitation without verification
 - Dawid and Skene, "Maximum Likelihood Estimation of Observer Error-Rates Using
-  the EM Algorithm," *JRSS-C* 28(1), 1979.
+ the EM Algorithm," *JRSS-C* 28(1), 1979.
 - Miller, Resnick and Zeckhauser, "Eliciting Informative Feedback: The
-  Peer-Prediction Method," *Management Science* 51(9), 2005.
+ Peer-Prediction Method," *Management Science* 51(9), 2005.
 - Prelec, "A Bayesian Truth Serum for Subjective Data," *Science* 306, 2004.
 - Dasgupta and Ghosh, "Crowdsourced Judgement Elicitation with Endogenous
-  Proficiency," WWW 2013.
+ Proficiency," WWW 2013.
 - Shnayder, Agarwal, Frongillo and Parkes, "Informed Truthfulness in Multi-Task
-  Peer Prediction," EC 2016.
+ Peer Prediction," EC 2016.
 - Radanovic and Faltings, Peer Truth Serum.
 
 Certification and verifiable computation
 - McConnell, Mehlhorn, Naeher and Schweitzer, "Certifying Algorithms," *Computer
-  Science Review* 5(2), 2011.
+ Science Review* 5(2), 2011.
 - Freivalds, "Probabilistic Machines Can Use Less Running Time," IFIP 1977.
 - Knight and Leveson, "An Experimental Evaluation of the Assumption of
-  Independence in Multiversion Programming," *IEEE TSE* SE-12(1), 1986.
+ Independence in Multiversion Programming," *IEEE TSE* SE-12(1), 1986.
 
 Byzantine-robust aggregation and anchoring
 - Blanchard, El Mhamdi, Guerraoui and Stainer, "Machine Learning with
-  Adversaries: Byzantine Tolerant Gradient Descent," NeurIPS 2017.
+ Adversaries: Byzantine Tolerant Gradient Descent," NeurIPS 2017.
 - Yin, Chen, Ramchandran and Bartlett, "Byzantine-Robust Distributed Learning,"
-  ICML 2018.
+ ICML 2018.
 - El Mhamdi, Guerraoui and Rouault, "The Hidden Vulnerability of Distributed
-  Learning in Byzantium," ICML 2018.
+ Learning in Byzantium," ICML 2018.
 - Cao, Fang, Liu and Gong, "FLTrust: Byzantine-robust Federated Learning via
-  Trust Bootstrapping," NDSS 2021.
+ Trust Bootstrapping," NDSS 2021.
 
 Counterfactual scoring
 - Dudik, Langford and Li, "Doubly Robust Policy Evaluation and Learning," ICML
-  2011.
+ 2011.
 - Jiang and Li, "Doubly Robust Off-policy Value Evaluation for Reinforcement
-  Learning," ICML 2016.
+ Learning," ICML 2016.
 
 Disclosure and aggregation limits
 - Grossman, "The Informational Role of Warranties and Private Disclosure about
-  Product Quality," *Journal of Law and Economics* 24, 1981.
+ Product Quality," *Journal of Law and Economics* 24, 1981.
 - Milgrom and Roberts, "Relying on the Information of Interested Parties," *RAND
-  Journal of Economics* 17, 1986.
+ Journal of Economics* 17, 1986.
 - List and Pettit, "Aggregating Sets of Judgments: An Impossibility Result,"
-  *Economics and Philosophy* 18, 2002.
+ *Economics and Philosophy* 18, 2002.
 - Dung, "On the Acceptability of Arguments and its Fundamental Role in
-  Nonmonotonic Reasoning, Logic Programming and n-Person Games," *Artificial
-  Intelligence* 77, 1995.
+ Nonmonotonic Reasoning, Logic Programming and n-Person Games," *Artificial
+ Intelligence* 77, 1995.
 
 ## See also
 
 - [Reputation Consensus](architecture/reputation.md): the trust algebra this
-  oracle feeds.
+ oracle feeds.
 - [Trust Tiers](architecture/trust-tiers.md): capability weighting, the
-  bootstrap corpus, and the `trust_ladder.yaml` the oracle is meant to
-  generalize.
+ bootstrap corpus, and the `trust_ladder.yaml` the oracle is meant to
+ generalize.
 - [Concept](concept.md): why behavioral evaluation rather than authored policy.
 - [Adversarial Testing](architecture/adversarial-testing.md): the attack side of
-  the same problem.
+ the same problem.
+
+---
+
+*Next: [Testing approach](testing.md)*

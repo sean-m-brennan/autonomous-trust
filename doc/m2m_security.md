@@ -1,3 +1,5 @@
+*Previous: [Security hardening](architecture/security-hardening.md)*
+
 # The state of machine-to-machine security
 
 Machine-to-machine security is in bad shape, and the evidence for that is not hard to find. The same concerns turn up across academic papers, industry reports, and security write-ups going back years and running through 2025 and into 2026. M2M communication is what sits underneath IoT, industrial IoT, smart infrastructure, and most automated systems, and much of it was built under constraints that make solid security hard to reach once you scale past a handful of devices.
@@ -25,3 +27,7 @@ The more recent incidents follow the same script. In 2021, someone reached the h
 ## The short version
 
 Set against how large the attack surface is and how much rides on these systems, M2M security is widely judged inadequate. Progress is real, with better protocols and zero-trust approaches for machines gaining ground, but in a lot of live deployments, especially the legacy and industrial ones, the security is still weak and still lagging behind the threat.
+
+---
+
+*Next: [Correctness proofs](correctness-proofs.md)*

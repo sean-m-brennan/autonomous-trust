@@ -1,8 +1,12 @@
-*[AutonomousTrust](autonomous_trust.md) > API*
+*Previous: [Traffic over the open internet](at-internet-traffic.md)*
 
 # AutonomousTrust API: Integrating with an Application
 
-You integrate AutonomousTrust by embedding a node in your program. A node is a subclass of `AutonomousTrust`. You attach the capabilities the node offers and the workers it runs, then start it. The node handles identity, peer discovery, group formation, reputation, and messaging; your code decides what the node does and what it exposes to peers.
+You integrate AutonomousTrust by embedding a node in your program. A node is a
+subclass of `AutonomousTrust`. You attach the capabilities the node offers and
+the workers it runs, then start it. The node handles identity, peer discovery,
+group formation, reputation, and messaging; your code decides what the node does
+and what it exposes to peers.
 
 There are four things you will touch, in rough order of how deep you go:
 
@@ -11,7 +15,9 @@ There are four things you will touch, in rough order of how deep you go:
 3. Capabilities and workers: what the node offers to peers and the concurrency it runs.
 4. Messaging and trust state: sending to peers and reading the trust picture.
 
-All imports resolve through the backend redirector, so `autonomous_trust.core.X` works regardless of whether the Python or C backend is active. See [Backend selection](#backend-selection).
+All imports resolve through the backend redirector, so `autonomous_trust.core.X`
+works regardless of whether the Python or C backend is active. See [Backend
+selection](#backend-selection).
 
 ## The node: `AutonomousTrust`
 
@@ -26,7 +32,10 @@ class MyNode(AutonomousTrust):
 MyNode(log_level=LogLevel.INFO).run_forever()   # blocks; runs as the lead process
 ```
 
-`run_forever()` starts the four core subsystems (network, identity, negotiation, reputation) plus any workers you added, then runs the main loop until it receives a quit signal. It installs a SIGTERM handler so `kubectl delete`, `docker stop`, and Tilt teardown shut the subprocesses down cleanly.
+`run_forever()` starts the four core subsystems (network, identity, negotiation,
+reputation) plus any workers you added, then runs the main loop until it
+receives a quit signal. It installs a SIGTERM handler so `kubectl delete`,
+`docker stop`, and Tilt teardown shut the subprocesses down cleanly.
 
 Constructor parameters:
 
@@ -50,7 +59,9 @@ python -m autonomous_trust.core [ident] [--test] [--live] [--log-level info]
 
 ## Identity and configuration bootstrap
 
-Each node needs a root directory for its keys and config. Point `AUTONOMOUS_TRUST_ROOT` at a per-node directory before constructing the node; the node derives `etc/at` and `var/at` under it.
+Each node needs a root directory for its keys and config. Point
+`AUTONOMOUS_TRUST_ROOT` at a per-node directory before constructing the node;
+the node derives `etc/at` and `var/at` under it.
 
 ```python
 import os
@@ -70,11 +81,15 @@ generate_identity(cfg_dir, preserve=True, defaults=True)
 generate_worker_config(cfg_dir, DataProcess.name, DataConfig, True)
 ```
 
-Private keys are written under the node root and never travel the wire. Reusing the same root across restarts gives the node a persistent identity and warm reputation state (see [Persistent Cohort](architecture/persistent-cohort.md)).
+Private keys are written under the node root and never travel the wire. Reusing
+the same root across restarts gives the node a persistent identity and warm
+reputation state (see [Persistent Cohort](architecture/persistent-cohort.md)).
 
 ## Override hooks
 
-Your integration logic lives in methods you override on your subclass. Each receives `queues`, the dictionary of interprocess queues keyed by subsystem name.
+Your integration logic lives in methods you override on your subclass. Each
+receives `queues`, the dictionary of interprocess queues keyed by subsystem
+name.
 
 
 | Method                                      | When it runs          | Use it to                                                                                    |
@@ -85,11 +100,15 @@ Your integration logic lives in methods you override on your subclass. Each rece
 | `cleanup()`                                 | On shutdown           | Release resources.                                                                           |
 | `autonomous_loop(results, queues, signals)` | Replaces the loop     | Full control. You must replicate process monitoring and message handling yourself. Advanced. |
 
-`add_worker(...)` is the exception: it must be called from `__init__`, not from a hook, because workers are launched when the node starts.
+`add_worker(...)` is the exception: it must be called from `__init__`, not from
+a hook, because workers are launched when the node starts.
 
 ## Capabilities: what the node offers
 
-A capability is a named service a node advertises to its peers. Register capabilities in `autonomous_ability`, then broadcast the populated `Capabilities` object to the worker queues so the other subsystems learn what this node offers.
+A capability is a named service a node advertises to its peers. Register
+capabilities in `autonomous_ability`, then broadcast the populated
+`Capabilities` object to the worker queues so the other subsystems learn what
+this node offers.
 
 ```python
 from autonomous_trust.core.system import queue_cadence
@@ -107,13 +126,21 @@ def autonomous_ability(self, queues):
             queues[q_name].put(self.capabilities, block=True, timeout=queue_cadence)
 ```
 
-`register_ability(name, function, arg_names=None, keywords=None, required_tier=0, transaction_weight=1, description="", kind="", arg_schema=None)`. `required_tier` gates access: a peer must have earned at least that trust tier to invoke the capability (0 means any admitted peer). `transaction_weight` sets how much a single use counts toward reputation. See [Trust Tiers](architecture/trust-tiers.md).
+`register_ability(name, function, arg_names=None, keywords=None,
+required_tier=0, transaction_weight=1, description="", kind="",
+arg_schema=None)`. `required_tier` gates access: a peer must have earned at
+least that trust tier to invoke the capability (0 means any admitted peer).
+`transaction_weight` sets how much a single use counts toward reputation. See
+[Trust Tiers](architecture/trust-tiers.md).
 
-The node auto-registers a small bootstrap corpus (`at.handshake`, `at.time-attest`, `at.echo-challenge`) so new peers have low-stakes interactions to earn initial trust. Set `AT_BOOTSTRAP_DISABLED=1` to suppress it.
+The node auto-registers a small bootstrap corpus (`at.handshake`,
+`at.time-attest`, `at.echo-challenge`) so new peers have low-stakes interactions
+to earn initial trust. Set `AT_BOOTSTRAP_DISABLED=1` to suppress it.
 
 ## Workers: attaching concurrency
 
-A worker is a `Process` subclass that runs alongside the core subsystems, typically to serve or consume a capability. Register workers in `__init__`:
+A worker is a `Process` subclass that runs alongside the core subsystems,
+typically to serve or consume a capability. Register workers in `__init__`:
 
 ```python
 def __init__(self, **kwargs):
@@ -122,7 +149,10 @@ def __init__(self, **kwargs):
     self.add_worker(DataProcess, self.system_dependencies)           # start after core subsystems
 ```
 
-`add_worker(process: type[Process], dependencies: list[str] = None, **kwargs)`. `dependencies` is a list of process names that must start first; `self.system_dependencies` gives you the core subsystem names, which is the common case. Extra `kwargs` are passed to the worker.
+`add_worker(process: type[Process], dependencies: list[str] = None, **kwargs)`.
+`dependencies` is a list of process names that must start first;
+`self.system_dependencies` gives you the core subsystem names, which is the
+common case. Extra `kwargs` are passed to the worker.
 
 Prebuilt workers live in the `autonomous_trust.services` package:
 
@@ -136,11 +166,17 @@ Prebuilt workers live in the `autonomous_trust.services` package:
 | `services.video.server`, `services.video.client`   | Video stream server and client.                                                                        |
 | `services.envdata.*`                               | Environmental data sources used by the disaster-response demo (weather, seismic, air quality, fusion). |
 
-To write your own worker, subclass `Process` with the `ProcMeta` metaclass, declare a `capability_name` if it serves one, register handlers for the message verbs it answers, and implement `process(self, queues, signal)` as its run loop. `services/data/server.py` (`DataProcess`) and `services/data/client.py` (`DataRcvr`) are compact worked examples. See [Process Architecture](architecture/process-architecture.md).
+To write your own worker, subclass `Process` with the `ProcMeta` metaclass,
+declare a `capability_name` if it serves one, register handlers for the message
+verbs it answers, and implement `process(self, queues, signal)` as its run loop.
+`services/data/server.py` (`DataProcess`) and `services/data/client.py`
+(`DataRcvr`) are compact worked examples. See [Process
+Architecture](architecture/process-architecture.md).
 
 ## Messaging and trust state
 
-Workers and hooks talk to peers by putting `Message` objects on the queue of the subsystem that should route them.
+Workers and hooks talk to peers by putting `Message` objects on the queue of the
+subsystem that should route them.
 
 ```python
 from autonomous_trust.core.network import Message
@@ -150,9 +186,13 @@ msg = Message(DataProcess.name, DataProtocol.request, payload, to_peer, from_who
 queues[CfgIds.network].put(msg, block=True, timeout=queue_cadence)
 ```
 
-A receiving worker registers a handler (for example `DataRcvr.handle_data`) that the framework calls when a matching message arrives. `DataRcvr.process` shows the pattern: it watches `self.protocol.peer_capabilities` for peers that advertise a capability, subscribes, and handles inbound data.
+A receiving worker registers a handler (for example `DataRcvr.handle_data`) that
+the framework calls when a matching message arrives. `DataRcvr.process` shows
+the pattern: it watches `self.protocol.peer_capabilities` for peers that
+advertise a capability, subscribes, and handles inbound data.
 
-The node exposes the live trust picture as attributes you can read from `autonomous_tasking` or from a worker:
+The node exposes the live trust picture as attributes you can read from
+`autonomous_tasking` or from a worker:
 
 
 | Attribute                      | Contents                                                                  |
@@ -163,7 +203,8 @@ The node exposes the live trust picture as attributes you can read from `autonom
 | `self.latest_reputation`       | `{subject_uuid: Reputation}`, overwritten per response.                   |
 | `self.latest_reputation_pairs` | `{(observer_uuid, subject_uuid): Reputation}`, the full bilateral matrix. |
 
-To request a reputation value explicitly, send a `rep_req` to the reputation subsystem:
+To request a reputation value explicitly, send a `rep_req` to the reputation
+subsystem:
 
 ```python
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
@@ -174,17 +215,26 @@ query = Message(CfgIds.reputation, ReputationProtocol.rep_req,
 queues[CfgIds.reputation].put(query, block=True, timeout=queue_cadence)
 ```
 
-The response lands in `latest_reputation` / `latest_reputation_pairs`. Trust changes are agreed by the reputation subsystem's Paxos rounds, so a value you read is a consensus result, not a local guess. See [Reputation Consensus](architecture/reputation.md).
+The response lands in `latest_reputation` / `latest_reputation_pairs`. Trust
+changes are agreed by the reputation subsystem's Paxos rounds, so a value you
+read is a consensus result, not a local guess. See [Reputation
+Consensus](architecture/reputation.md).
 
 ## Embedding AT inside a larger process
 
-When AT is one component of a bigger application (a dashboard, a coordinator, a mission controller), pass external queues to `run_forever` so your outer process can feed the node and read from it without subclassing the loop:
+When AT is one component of a bigger application (a dashboard, a coordinator, a
+mission controller), pass external queues to `run_forever` so your outer process
+can feed the node and read from it without subclassing the loop:
 
 ```python
 node.run_forever(q_in=control_queue, q_out=feedback_queue)
 ```
 
-`q_in` is watched by the main loop (external control in); `q_out` is where the loop publishes (feedback out). The inspector package uses this shape: a coordinator subclasses `AutonomousTrust`, builds a `Cohort` over the node's `queue_pool`, and adds a `CohortTracker` worker that drains peer state into the cohort for a Dash UI.
+`q_in` is watched by the main loop (external control in); `q_out` is where the
+loop publishes (feedback out). The inspector package uses this shape: a
+coordinator subclasses `AutonomousTrust`, builds a `Cohort` over the
+`queue_pool`, and adds a `CohortTracker` worker that drains peer state into the
+cohort for a Dash UI.
 
 ```python
 from autonomous_trust.inspector.peer.daq import Cohort, CohortTracker
@@ -198,13 +248,15 @@ class MyCoordinator(AutonomousTrust):
 
 ## Backend selection
 
-The core ships two interoperable implementations. Choose one with the `AUTONOMOUS_TRUST_BACKEND` environment variable:
+The core ships two interoperable implementations. Choose one with the
+`AUTONOMOUS_TRUST_BACKEND` environment variable:
 
 - `auto` (default): use the native C backend if its library is present, otherwise Python.
 - `python`: force the pure-Python core.
 - `native`: force the C core via CFFI.
 
-The public API is identical across backends. See [Native/FFI Dual Implementation](architecture/native-ffi-dual-implementation.md).
+The public API is identical across backends. See [Native/FFI Dual
+Implementation](architecture/native-ffi-dual-implementation.md).
 
 ## Worked examples
 
@@ -217,3 +269,7 @@ The public API is identical across backends. See [Native/FFI Dual Implementation
 - [Concept](concept.md): the model behind the API.
 - [Architecture](architecture/README.md): how the subsystems the API drives are built.
 - [Example application](example-application.md): these entrypoints in a full scenario.
+
+---
+
+*Next: [AutonomousTrust whitepaper](whitepaper/AutonomousTrust.md)*
