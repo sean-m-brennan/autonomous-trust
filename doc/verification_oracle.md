@@ -147,8 +147,8 @@ validity and no distributional assumptions.
 
 This separates two things reputation systems routinely conflate:
 
-- **Competence.** the sets are tight.
-- **Honesty about one's own limits.** the sets cover as advertised.
+- **Competence.** The sets are tight.
+- **Honesty about one's own limits.** The sets cover as advertised.
 
 A peer that is frequently wrong but properly humble is safe to work with. A peer
 that is usually right and systematically overconfident will eventually be

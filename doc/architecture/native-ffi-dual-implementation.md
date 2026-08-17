@@ -21,7 +21,7 @@ boundary and its drift guard, and the embedded/microdrone runtime.
 > native backend is selected, and (b) as the standalone `at_demo` daemon for
 > embedded ARM microdrones, which interoperate on the wire with the Python
 > nodes. Feature-wise the native C code currently leads Python in some areas
-> (e.g. the ZTA background process, see [ZTA Python Parity](zta-python-parity.md))
+> (e.g. The ZTA background process, see [ZTA Python Parity](zta-python-parity.md))
 > and Python leads C in others (e.g. recursive subtree reputation, see
 > [Gateway Reputation Tree](gateway-reputation-tree.md), whose phase 3 is the
 > C-parity half).
@@ -40,7 +40,7 @@ The active backend is chosen at import time of `autonomous_trust.core` from the
 Selection installs a `_BackendRedirector` (an `importlib.abc.MetaPathFinder`)
 that transparently rewrites absolute imports of the form
 `autonomous_trust.core.X` → `autonomous_trust.core.<backend>.X`. Downstream code
-keeps writing `from autonomous_trust.core.identity import ...` and never names a
+keeps writing `from autonomous_trust.core.identity import...` and never names a
 backend.
 
 **The native backend is a per-module overlay, not a wholesale replacement.** The
@@ -98,9 +98,9 @@ cheap, dependency-free static check that compares the `cdef` in `_ffi.py`
 against the authoritative C header prototypes in `src/c` and reports any
 function whose **argument count** disagrees:
 
-- **DANGEROUS.** drift in a function a `_native` wrapper actually calls
+- **DANGEROUS.** Drift in a function a `_native` wrapper actually calls
  (`lib.<name>(...)`): a latent segfault → exit 1.
-- **LATENT.** drift in a `cdef`-only function nothing calls from Python yet:
+- **LATENT.** Drift in a `cdef`-only function nothing calls from Python yet:
  reported, fails only under `--strict`.
 
 It runs without the conda env, so it is safe as a fast pre-build gate in
@@ -115,9 +115,9 @@ The embedded target runs the **standalone C daemon** (`at_demo`,
  optionally AMD64) via `docker buildx`, producing architecture-specific
  tarballs in `embedded/dist/`. In an apt-reachable environment, the
  `Dockerfile-c` image build is preferred.
-- **Provisioning / flashing / signing.** see the existing `embedded/` scripts
+- **Provisioning / flashing / signing.** See the existing `embedded/` scripts
  (`provision.sh`, `flash.sh`, `sign-binary.sh`, `verify-binary.sh`).
-- **Demo wiring.** the dod_mission demo incorporates embedded C microdrone
+- **Demo wiring.** The dod_mission demo incorporates embedded C microdrone
  nodes alongside the Python cohort (`scripts/run-demo.sh`,
  `examples/dod_mission/`).
 
@@ -134,14 +134,14 @@ Lifecycle](node-lifecycle.md).
 The live interop test is `embedded/test-interop-cpython.sh`, which brings up one
 C `at_demo` node and Python nodes on a shared Docker bridge and verifies:
 
-- **C → Python.** the Python node reconstructs the C node's identity from the
+- **C → Python.** The Python node reconstructs the C node's identity from the
  envelope `from_*` fields and admits it (`access_granted`).
-- **Python → C.** the C node processes the Python node's announce and unicasts a
+- **Python → C.** The C node processes the Python node's announce and unicasts a
  `peer_caps_query` back.
-- **Group-key sync.** the C node parses Python's `full_history` group payload
+- **Group-key sync.** The C node parses Python's `full_history` group payload
  (the canonical form) and **adopts the shared group key**, so it can
  decrypt/emit encrypted group traffic.
-- **Membership propagation.** a later `group_key_update` (a membership update,
+- **Membership propagation.** A later `group_key_update` (a membership update,
  distinct from the bootstrap `full_history`) is emitted by Python in the
  canonical flat form so the C co-member's `handle_group_update` can parse it.
 

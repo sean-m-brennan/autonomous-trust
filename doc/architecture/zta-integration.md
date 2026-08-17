@@ -17,7 +17,7 @@ Break any link (the CA is unreachable, the OCSP responder is down, the CRL is
 stale) and trust collapses. SP 800-207 acknowledges this in S5.2
 (Denial-of-Service or Network Disruption): "Enterprise resources cannot connect
 to each other without the PA's permission," and an attacker who "disrupts or
-denies access to the PEP(s) or PE/PA ... can adversely impact enterprise
+denies access to the PEP(s) or PE/PA... can adversely impact enterprise
 operations" [1]. The standard offers replication/cyber-resiliency as the
 mitigation, but that still requires connectivity to at least one instance.
 
@@ -272,7 +272,7 @@ explicitly defers. BPSec answers "is this bundle authentic?" AT answers "should
 we trust this relay?" A relay with valid BPSec credentials but degrading
 forwarding reliability loses AT reputation and is routed around.
 
-**Multi-agency.** the AT bilateral negotiation protocol handles
+**Multi-agency.** The AT bilateral negotiation protocol handles
 cross-organizational trust without requiring PKI interoperability or
 cross-certification. New participants enter at neutral reputation regardless of
 ZTA authentication status and earn trust through demonstrated behavior. When
@@ -340,14 +340,14 @@ T+N2; cap lifted."
 | `delegated_verification_min_reputation` | `0.7` | Vouching peer must have at least this reputation |
 | `delegated_verification_quorum` | `1` | Number of independent vouches needed to lift cap |
 
-**Tactical deployment.** quorum 1 (any trusted peer's verification suffices).
+**Tactical deployment.** Quorum 1 (any trusted peer's verification suffices).
 Favors rapid cap-lifting over Byzantine resilience.
 
-**High-assurance deployment.** quorum 2-3 with
+**High-assurance deployment.** Quorum 2-3 with
 `delegated_verification_min_reputation` 0.8+. Multiple independent verifications
 required.
 
-**Space/DTN deployment.** quorum 1, `delegated_verification_min_reputation` 0.6.
+**Space/DTN deployment.** Quorum 1, `delegated_verification_min_reputation` 0.6.
 Ground stations that verify during contact windows can vouch for peers that
 haven't had a contact window yet.
 
@@ -530,22 +530,43 @@ The demo creates:
 
 ## 15. Open design questions
 
-1. **Retroactive reputation adjustment.** When a peer operates for an extended period without ZTA verification and then verification fails, how far back should reputation be unwound? The current implementation applies a single penalty at detection time; historical unwinding is not yet implemented.
+1. **Retroactive reputation adjustment, answered 2026-08-17, both
+   runtimes.** When a peer operates for an extended period without ZTA
+   verification and then verification fails, reputation is unwound
+   **to the last proved verification**, recomputed over the pre-anchor
+   window by the same evidence arithmetic the §10.3 warm start uses,
+   so the unwind inherits its shrinkage and a short pre-anchor history
+   cannot justify a high score. The anchor is a chain index recorded
+   when the peer proves, not a clock reading. A peer never proved
+   keeps nothing.
+
+ The claim this question rested on, that "the current implementation
+ applies a single penalty at detection time", was false. No penalty
+ was applied in either runtime: the C `_send_reputation_penalty` was
+ discarded twice over (a zero `task_uuid` sentinel, and a negative
+ score off the [0, 1] scale §11.2 fixed), and
+ `ddil_fallback_reputation_cap` was logged as enforced while being
+ read by nothing. A ZTA verdict now reaches reputation as an authority
+ finding, a `ZtaStanding` carrying `proved` / `capped` / `failed`,
+ rather than as a score the scale cannot express. See
+ [`ISSUES.md`](../../ISSUES.md) §10.5.
 2. **Multi-operator ZTA, answered 2026-08-06, both runtimes.** In coalition/multi-agency scenarios (LunaNet, joint ops), peers may have certs from different CAs. The ZTA policy now names trust anchors explicitly and an identity carries a repeated `ZtaCredential{der, binding, issuer}` (proto field 16), so admission is *any-of* across configured anchors and each verified credential earns authority for its own anchor (`zta_anchors`, the observer's finding, never serialized). Group federation then requires a *proved* shared anchor rather than a declared gateway role, gatewayhood is emergent in AT, so a declared rule would rest on a claim by the peer itself and an attacker would simply decline to claim.
 
  What the question above got wrong is the assumption that this needs cross-certification or CA trust negotiation. It needs neither. Nothing has to make two CAs recognize each other, only make *this node* recognize both, and a holder-asserted binding (§1.5) lets a foreign CA's credential bind to an AT identity without that CA knowing AT exists. Coalition deployment is in fact what forces the holder-asserted route, a foreign CA will not put an AT uuid in a SAN, so the CA-asserted route is unavailable exactly where coalitions need it.
 
-Item 1 remains a design direction rather than scoped work, recorded in
-[`ISSUES.md`](../../ISSUES.md) §10.5. Item 2 is closed in both runtimes (§1.5).
+Both items are closed in both runtimes: item 1 in §10.5 (2026-08-17), item 2 in
+§1.5 (2026-08-06).
 
 The integration is not C-only. The Python identity process (`idprocess.py`)
 performs ZTA checks at admission time (`_zta_admit`, gated in
 `welcoming_committee`), with verification, capping, and carriage at parity with
 C: X.509 verification, DDIL reputation capping, and wire-level credential
-carriage. See [ZTA Python
-Parity](zta-python-parity.md) for that implementation and for the features that
-are C-only (background re-verification process, audit log, delegated
-verification).
+carriage. **Background re-verification is at parity as of 2026-08-17** (§10.5):
+Python sweeps admitted peers on `reverify_interval_sec` inside IdentityProcess
+rather than in a process of its own, detecting post-admission revocation and
+lifting a DDIL cap once the infrastructure returns. See [ZTA Python
+Parity](zta-python-parity.md) for that implementation and for what remains
+C-only (the audit log and delegated verification).
 
 **As of 2026-08-06 the credential→identity *binding* gate, named trust anchors,
 multi-credential admission, and derived gateway authority exist in BOTH
