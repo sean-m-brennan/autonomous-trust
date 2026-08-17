@@ -108,7 +108,7 @@ Entry Node --[reputation > 0.8]--> Relay A --[reputation > 0.8]--> Exit Node
 - **Peer reputation.** Only route through peers above a configurable
  trust threshold. A node caught tampering with traffic (detectable
  via integrity checks) loses reputation and is routed around.
-- **Capability matching.** the AT negotiation system lets nodes
+- **Capability matching.** The AT negotiation system lets nodes
  advertise capabilities: "I have 100 Mbps exit bandwidth," "I can
  reach the 93.184.0.0/16 subnet." Route selection considers these.
 - **Latency/throughput.** AT could track per-peer performance metrics

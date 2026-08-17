@@ -170,10 +170,10 @@ AT is decentralized by construction. Groups form organically, reputation is
 maintained by leaderless Byzantine Multi-Paxos, and tasks are negotiated peer to
 peer. Four cooperating subsystem processes do the work:
 
-- **Network.** transport, encryption, discovery
-- **Identity.** who a peer is, and admission
-- **Negotiation.** what work gets done, and for whom
-- **Reputation.** how much each peer is trusted
+- **Network.** Transport, encryption, discovery
+- **Identity.** Who a peer is, and admission
+- **Negotiation.** What work gets done, and for whom
+- **Reputation.** How much each peer is trusted
 
 Cryptography is NaCl/libsodium throughout, with no novel primitives:
 
@@ -606,15 +606,15 @@ A few rules are hard-coded and non-negotiable. Violating one collapses
 reputation immediately, with no appeal, because the alternative is a rule that
 sufficient standing can buy its way past.
 
-**Freedom of association.** no agent may block another agent's communications
+**Freedom of association.** No agent may block another agent's communications
 with third parties. Man-in-the-middle blocking is a fence violation. This is the
 fence that makes authoritarian attacks expensive.
 
-**Rule of law.** agents higher in the emergent hierarchy are held to *stricter*
+**Rule of law.** Agents higher in the emergent hierarchy are held to *stricter*
 standards, not looser ones. Reputation thresholds for leadership exceed those
 for peers.
 
-**Skin in the game.** a hierarchical leader must be a full participant in the
+**Skin in the game.** A hierarchical leader must be a full participant in the
 domain it oversees. A leader that does not interact meaningfully with its
 enclave loses reputation, which is what keeps out absentee authorities and
 holders of empty credentials.

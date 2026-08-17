@@ -74,10 +74,10 @@ makes every screen testable headless.
 
 Two distributions carry it.
 
-- **`core/_python/operator/`.** the node-side core (activation, session, DDIL
+- **`core/_python/operator/`.** The node-side core (activation, session, DDIL
  posture, resource directory, `OperatorNode`). Imports as
  `autonomous_trust.core.operator`. No UI dependency.
-- **`src/autonomous-trust-operator/`.** the Textual TUI (`autonomous_trust.
+- **`src/autonomous-trust-operator/`.** The Textual TUI (`autonomous_trust.
  operator`): app, screens, node bridge. Depends on the core but not vice-versa.
 
 ---

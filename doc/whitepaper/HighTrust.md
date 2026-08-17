@@ -378,17 +378,17 @@ A few rules are hard-coded and non-negotiable, and violating one collapses
 reputation immediately and irreversibly. These social fences mark the boundary
 of legitimate behavior within the system.
 
-**Freedom of association.** no agent may block another agent's communications
+**Freedom of association.** No agent may block another agent's communications
 with third parties. Man-in-the-middle blocking of messages is a fence violation.
 This is what prevents authoritarian attacks, in which a malicious peer leader
 censors or isolates its subordinates.
 
-**Rule of law.** agents higher in the emergent hierarchy are held to *stricter*
+**Rule of law.** Agents higher in the emergent hierarchy are held to *stricter*
 standards, not looser ones. Reputation thresholds for leadership roles exceed
 those for peers. Authority is earned by exceeding expectations, and maintained
 the same way.
 
-**Skin in the game.** a hierarchical leader must be a full participant in the
+**Skin in the game.** A hierarchical leader must be a full participant in the
 domain it oversees. A peer leader that does not interact meaningfully with its
 enclave loses reputation. This is what keeps out absentee authorities and
 holders of empty credentials.

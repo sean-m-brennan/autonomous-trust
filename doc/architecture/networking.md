@@ -35,10 +35,10 @@ The `UDPNetworkProcess` binds three UDP sockets:
 
 N is resolved once per node, from three layers in order:
 
-1. the provisioned config's `port` (a config always wins),
-2. the `AT_COMM_PORT` environment variable (operator override, applied only
+1. The provisioned config's `port` (a config always wins),
+2. The `AT_COMM_PORT` environment variable (operator override, applied only
  where the config is silent),
-3. the compile-time default, 27787.
+3. The compile-time default, 27787.
 
 C: `net_port_resolve()` (`network/network.h`), logged at startup with the layer
 that supplied it. Python: `system.resolve_comm_port()`. Both refuse a value that
@@ -112,7 +112,7 @@ transmission.
 | **peer_receiver** | `peer_receiver()` | Peer socket | Appends `(raw_msg, from_addr)` to `peer_messages` |
 | **group_receiver** | `group_receiver()` | Group socket | Appends to `group_messages` |
 | **unknown_receiver** | `unknown_receiver()` | Broadcast socket | Appends to `unknown_messages` |
-| **mystery_handler** | `mystery_handler()` |, | Retries encrypted messages from unknown peers |
+| **mystery_handler** | `mystery_handler()` | n/a | Retries encrypted messages from unknown peers |
 
 The mystery handler exists because during bootstrapping, encrypted messages may
 arrive before the sending identity is known. It holds these messages and retries

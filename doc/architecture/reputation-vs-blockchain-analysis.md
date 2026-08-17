@@ -36,7 +36,7 @@ not gaps.
 ## 1. How the algorithms differ from a "typical" blockchain
 
 It helps to split "typical blockchain" into the **public-Nakamoto** model
-(Bitcoin/Ethereum) vs. the **permissioned-BFT** model
+(Bitcoin/Ethereum) vs. The **permissioned-BFT** model
 (Tendermint/PBFT/Hyperledger), because the system sits in neither cleanly.
 
 ### Reputation consensus (`repprocess.py`, `doc/architecture/reputation.md`)

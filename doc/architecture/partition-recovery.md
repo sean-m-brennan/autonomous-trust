@@ -181,7 +181,7 @@ A new handler `handle_partition_signal(self, queues)` drains
 1. If `self.group is None` or `self.choosing`: ignore, we're still
  in initial bootstrap, the normal flow will catch up.
 2. If we've already sent a probe to this `from_addr` within the last
- **10 seconds.** ignore (per-addr probe cooldown).
+ **10 seconds.** Ignore (per-addr probe cooldown).
 3. If we are already merging (see 5.4): ignore.
 4. Build a `partition_probe` (4.1) and send via unsecured multicast.
  The probe is **not** directed; any peer in any group can receive
@@ -218,7 +218,7 @@ A new handler `handle_partition_probe(self, queues, message)` runs three steps.
 > prober's `my_group_size`, so `handle_partition_probe` *also* runs the same
 > adoption test as §5.4 (strictly larger, or equal size with smaller uuid),
 > guarded by the in-flight lock, before building the response. Without this, a
-> node that never receives a foreign GROUP-channel message: e.g. the
+> node that never receives a foreign GROUP-channel message: e.g. The
 > dod_mission coordinator, which sits in no other group's address map and so
 > only ever *responds* to probes: could never initiate a merge into a larger
 > group and would stay wedged on the losing side (the size-1-coordinator case in
@@ -299,7 +299,7 @@ attacker probing all of them elicits at most M responses per 30 s, bounded by
 group size rather than by probe rate.
 
 **Cross-deployment leakage.** If two unrelated AT deployments accidentally share
-a multicast domain (e.g. a misconfigured staging
+a multicast domain (e.g. A misconfigured staging
 + prod), they will now actively try to merge. This is mostly a
 configuration concern, but worth flagging. The multicast group ID and the AT
 deployment ID should be different, and today they are not, because there is no

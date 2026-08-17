@@ -46,7 +46,7 @@ path. Nothing errored on the app side, and there was simply never anything to
 receive.
 
 **5. The drain switched on the payload, not the type.** The loop queued its
-message with `object_ptr_data(&result_msg.info, ...)` (a pointer to the *union*)
+message with `object_ptr_data(&result_msg.info,...)` (a pointer to the *union*)
 and the drain read each entry back as a whole `generic_msg_t` and switched on
 `->type`. `info` sits at offset 16, so `->type` read the first eight bytes of
 the payload. For an `UPDATE_ACCEPTED` that is the front half of a UUID, measured
@@ -484,7 +484,7 @@ reintroduced. Seven controls, each rebuilt and run.
 | strings borrowed, not copied | 3 failures, `cfg.app_name` reads `"xxxxx"` |
 | bind failure non-fatal again | `at_node_bind_inbound` returned 0 |
 | over-long names truncated | 5 failures, **and `at_app_node_start` forked a real daemon**, which is what the guard prevents |
-| `app_name` bound instead of `q_in` | 5 failures, incl. the bound key being `"bind_probe"` |
+| `app_name` bound instead of `q_in` | 5 failures, incl. The bound key being `"bind_probe"` |
 | log-level range check dropped | 3 failures, and a daemon forked on a level of `0` |
 | failed socket left open | the open-descriptor count, `5 != 4` |
 

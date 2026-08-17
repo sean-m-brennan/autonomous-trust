@@ -86,12 +86,12 @@ process|function|data
 Each message is a self-contained datagram (max 1 MB). This maps cleanly to DTN
 bundles:
 
-- **Primary block.** source EID, destination EID (derived from
+- **Primary block.** Source EID, destination EID (derived from
  process name), creation timestamp, lifetime
 - **Extension block.** AT function name (e.g., "request_access",
  "update vote request"), carried as a custom extension block type
-- **Payload block.** the AT data payload (JSON or protobuf)
-- **BPSec blocks.** confidentiality and/or integrity as needed
+- **Payload block.** The AT data payload (JSON or protobuf)
+- **BPSec blocks.** Confidentiality and/or integrity as needed
 
 AT messages are already atomic and self-describing -- they do not require
 connection state. This is exactly the bundle paradigm.
@@ -242,7 +242,7 @@ The CLA adapter would:
 - Receive inbound bundles and deliver them as AT messages to the
  appropriate process queue
 
-**Advantage.** Minimal changes to AT core. **Limitation.** the AT
+**Advantage.** Minimal changes to AT core. **Limitation.** The AT
 timeout-dependent protocols still break over long-delay links without the
 adaptations described in section 3.1.
 
