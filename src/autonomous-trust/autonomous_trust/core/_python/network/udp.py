@@ -85,7 +85,7 @@ def bind_source_address(sock, address, logger=None, stream=False):
             if logger is not None:
                 logger.warning(
                     'Could not bind source address %s (%s); sending unbound, so '
-                    'peers may fail to attribute these messages' % (address, err))
+                    'peers may fail to attribute these messages', address, err)
         return False
 
 
@@ -100,11 +100,9 @@ def log_bind_failure(logger, sock_name, address, port, my_ip, err):
         logger.error(
             'Failed to bind %s recv to %s:%s -- already held, most likely by another '
             'AT node on this address. Give each co-located node a distinct base port '
-            '(config net_cfg.port, or AT_COMM_PORT). Detected IP is %s'
-            % (sock_name, address, port, my_ip))
+            '(config net_cfg.port, or AT_COMM_PORT). Detected IP is %s', sock_name, address, port, my_ip)
     else:
-        logger.error('Failed to bind %s recv to %s:%s (%s), detected IP is %s'
-                     % (sock_name, address, port, err, my_ip))
+        logger.error('Failed to bind %s recv to %s:%s (%s), detected IP is %s', sock_name, address, port, err, my_ip)
 
 
 class UDPNetworkProcess(NetworkProcess):
@@ -150,7 +148,7 @@ class UDPNetworkProcess(NetworkProcess):
         except (Exception, OSError) as err:
             log_bind_failure(self.logger, 'peer', self.my_address, self.port, self.my_ip, err)
             raise err
-        self.logger.info('Bound peer recv to %s:%s' % (self.my_address, self.port))
+        self.logger.info('Bound peer recv to %s:%s', self.my_address, self.port)
 
     def _init_udp_grp(self):
         self.recv_grp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -160,7 +158,7 @@ class UDPNetworkProcess(NetworkProcess):
         except (Exception, OSError) as err:
             log_bind_failure(self.logger, 'group', self.my_address, self.group_port, self.my_ip, err)
             raise err
-        self.logger.info('Bound group recv to %s:%s' % (self.my_address, self.group_port))
+        self.logger.info('Bound group recv to %s:%s', self.my_address, self.group_port)
 
     def _init_mcast(self, use_mcast=False):
         if use_mcast:
@@ -175,14 +173,15 @@ class UDPNetworkProcess(NetworkProcess):
             try:
                 self.recv_cast_sock.bind((self.manycast_addr, self.port))
             except (Exception, OSError) as err:
-                self.logger.error('Failed to bind to %s:%s' % (self.manycast_addr, self.port))
+                self.logger.error('Failed to bind to %s:%s', self.manycast_addr, self.port)
                 raise err
             if self.my_address == '0.0.0.0':
                 req = struct.pack("=4sl", socket.inet_aton(self.manycast_addr), socket.INADDR_ANY)
             else:
                 req = struct.pack("=4s4s", socket.inet_aton(self.manycast_addr), socket.inet_aton(self.my_address))
             self.recv_cast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, req)
-            self.logger.info('Bound any recv to %s:%s' % self.recv_cast_sock.getsockname())
+            self.logger.info('Bound any recv to %s:%s',
+                             *self.recv_cast_sock.getsockname())
         else:
             self.manycast_packet_size = 65507
             self.sock_options = (socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -194,9 +193,10 @@ class UDPNetworkProcess(NetworkProcess):
             try:
                 self.recv_cast_sock.bind((self.manycast_addr, self.port))
             except (Exception, OSError) as err:
-                self.logger.error('Failed to bind to %s:%s' % (self.manycast_addr, self.port))
+                self.logger.error('Failed to bind to %s:%s', self.manycast_addr, self.port)
                 raise err
-            self.logger.info('Bound any recv to %s:%s' % self.recv_cast_sock.getsockname())
+            self.logger.info('Bound any recv to %s:%s',
+                             *self.recv_cast_sock.getsockname())
 
     def _send_udp(self, msg, host, port):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:

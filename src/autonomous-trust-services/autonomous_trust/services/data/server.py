@@ -75,9 +75,9 @@ class DataProcess(Process, metaclass=ProcMeta,
         if message:
             if not self.protocol.run_message_handlers(queues, message):
                 if isinstance(message, Message):
-                    self.logger.error('Unhandled message %s' % message.function)
+                    self.logger.error('Unhandled message %s', message.function)
                 else:
-                    self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
+                    self.logger.error('Unhandled message of type %s', message.__class__.__name__)  # noqa
 
     def process(self, queues, signal):
         while self.keep_running(signal):

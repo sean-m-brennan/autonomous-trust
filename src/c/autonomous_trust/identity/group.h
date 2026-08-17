@@ -24,6 +24,13 @@
 #include "identity.h"
 #include "structures/map.h"
 
+/* Retired-key grace window and depth. Must match Python
+ * Group.PREVIOUS_KEY_GRACE / PREVIOUS_KEY_MAX: a runtime that kept a retired
+ * key alive longer than its twin would still be reading traffic the other had
+ * already stopped accepting. */
+#define GROUP_PREVIOUS_KEY_GRACE 60.0
+#define GROUP_PREVIOUS_KEY_MAX   2
+
 typedef struct
 {
     smrt_ptr_t;
@@ -35,6 +42,23 @@ typedef struct
      * if unknown. Merge size-tie tiebreaker — the OLDER group wins. Mirrors
      * Python Group._created. Carried on the wire by group_to_json. */
     double created;
+    /* How many times this group's shared key has been rotated (ISSUES.md
+     * 10.2). Mirrors Python Group.key_epoch and rides group_to_json as
+     * "key_epoch". The key used to be permanent, so admitting a member also
+     * handed it the ability to decrypt cohort traffic recorded BEFORE it
+     * joined; admission now rotates, and this is what makes a rotation safe to
+     * accept — a receiver adopts a new key only with a strictly HIGHER epoch,
+     * so a captured older key cannot be replayed back over a newer one.
+     * 0 = never rotated, which is every group minted before this existed. */
+    int64_t key_epoch;
+    /* Superseded keys, newest first, with the time each was retired. Kept only
+     * so traffic already in flight when the key changed still decrypts: a
+     * rotation is not synchronous across a cohort, and dropping every frame
+     * from a member that has not yet processed the update would make rotation
+     * cost more than it buys. Mirrors Python Group._previous_keys. */
+    encryptor_t previous_keys[GROUP_PREVIOUS_KEY_MAX];
+    double      previous_retired_at[GROUP_PREVIOUS_KEY_MAX];
+    size_t      num_previous_keys;
 } group_t;
 
 /**
@@ -136,6 +160,16 @@ int group_encrypt(const group_t *ident, const msg_str_t *in, const group_t *whom
   disjoint behaviors;
 */
 int group_decrypt(const group_t *ident, const msg_str_t *cipher, const group_t *whom, const unsigned char *nonce, unsigned char *out);
+
+/** Mint a fresh shared key, retiring the current one into the grace window
+ *  (ISSUES.md 10.2). Returns the new epoch, or -1 if we do not hold the
+ *  current private key. Mirrors Python Group.rotate_key. */
+int64_t group_rotate_key(group_t *group);
+
+/** Adopt @p other's key if it supersedes ours: same group, strictly higher
+ *  epoch, and @p other must hold the private key. Returns whether it was
+ *  adopted. Mirrors Python Group.accept_rotation. */
+bool group_accept_rotation(group_t *group, const group_t *other);
 
 /**
  * @brief Serialize a group into its protobuf wire representation.

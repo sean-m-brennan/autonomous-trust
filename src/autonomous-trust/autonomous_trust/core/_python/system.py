@@ -83,7 +83,7 @@ def resolve_comm_port(cfg_port: int = 0, logger: logging.Logger = None) -> tuple
         raw = os.environ.get('AT_COMM_PORT')
         if raw and logger is not None:
             # Say so rather than letting an operator believe the override took.
-            logger.info('config port %d overrides AT_COMM_PORT=%s' % (cfg_port, raw))
+            logger.info('config port %d overrides AT_COMM_PORT=%s', cfg_port, raw)
         return cfg_port, PortSource.config
     if cfg_port:
         _warn('refusing configured port %r (want an integer in [%d, %d]); falling back'
@@ -145,8 +145,7 @@ def resolve_env_int(name: str, default: int, lo: int, hi: int,
             val = None
         if val is None or not (lo <= val <= hi):
             if logger is not None:
-                logger.warning('refusing %s=%r (want an integer in [%d, %d]); using default %d'
-                               % (name, raw, lo, hi, default))
+                logger.warning('refusing %s=%r (want an integer in [%d, %d]); using default %d', name, raw, lo, hi, default)
         else:
             return val, KnobSource.env
     return default, KnobSource.default
@@ -333,16 +332,32 @@ class PackageHash(object):
                    for ex in self.excludes):
                 continue
             try:
-                module_path = loader.find_spec(name).origin
+                # `find_spec` can answer None for a name the walk just yielded:
+                # a directory importlib lists but declines to import. A
+                # `__pycache__` that something seeded an `__init__.py` into is
+                # exactly that, and whether it resolves is INTERPRETER-DEPENDENT
+                # -- 3.14 hands back a spec, 3.13 hands back None. Unguarded,
+                # `.origin` on that None raised AttributeError, which the except
+                # below does not catch, so ONE such directory anywhere under the
+                # package abandoned the entire digest. That digest gates peer
+                # admission (a mismatch is treated as a counterfeit), so failing
+                # to compute it is worse than any single module's absence from
+                # it. Skipped here, the same outcome `excludes` already produces.
+                spec = loader.find_spec(name)
+                if spec is None or spec.origin is None:
+                    if self.debug:
+                        self.logger.error('Skipping unresolvable %s', name)
+                    continue
+                module_path = spec.origin
                 with open(module_path, 'r') as src:
                     source = src.read()
                 module_hash = blake2b(source.encode(encoding))
                 self.modules[name] = module_hash
-            except (OSError, TypeError):
+            except (OSError, TypeError, AttributeError):
                 if self.debug:
-                    self.logger.error('Skipping ', name)
+                    self.logger.error('Skipping %s', name)
         self.digest = blake2b(b''.join([dig for dig in self.modules.values()]))
 
     def onerror(self, name):
         if self.debug:
-            self.logger.error("Error importing module %s: %s" % (name, traceback.format_exc()))
+            self.logger.error("Error importing module %s: %s", name, traceback.format_exc())

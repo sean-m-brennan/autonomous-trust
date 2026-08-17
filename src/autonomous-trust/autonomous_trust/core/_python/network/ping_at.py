@@ -129,7 +129,7 @@ class PingATServer(threading.Thread):
 
     def run(self):
         addr = self.recv_sock.getsockname()
-        self.logger.info('Ping server started at %s:%s' % addr)
+        self.logger.info('Ping server started at %s:%s', *addr)
         try:
             while not self.done:
                 try:
@@ -146,7 +146,7 @@ class PingATServer(threading.Thread):
                     except OverflowError:
                         data = (1).to_bytes(4, 'big')
                     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
-                        self.logger.debug('Echo ping to %s:%s' % (host, ping_at_snd_port))
+                        self.logger.debug('Echo ping to %s:%s', host, ping_at_snd_port)
                         sent = sock.sendto(data, (host, ping_at_snd_port))
                         if sent == 0:
                             raise RuntimeError("Socket connection broken (no bytes sent)")

@@ -113,9 +113,9 @@ class NetStatsSource(Process, metaclass=ProcMeta,
                         if message.function == Network.stats_resp:
                             self.network_source.recv(message.obj)
                         else:
-                            self.logger.error('Unhandled message %s' % message.function)
+                            self.logger.error('Unhandled message %s', message.function)
                     else:
-                        self.logger.error('Unhandled message of type %s' % message.__class__.__name__)  # noqa
+                        self.logger.error('Unhandled message of type %s', message.__class__.__name__)  # noqa
 
             statistics = {'total': NetworkStats(*self.compute_rate(), *(self.latest[1:]))}
             try:

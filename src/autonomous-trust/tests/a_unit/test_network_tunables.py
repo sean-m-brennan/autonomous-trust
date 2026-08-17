@@ -31,6 +31,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from .. import rendered_log
+
 from autonomous_trust.core._python import system as at_system
 from autonomous_trust.core._python.system import (
     KnobSource, resolve_annoy_limit, resolve_mystery_max_age_s, resolve_recv_poll_ms)
@@ -111,7 +113,7 @@ def test_refusal_is_logged_not_silent(resolver, var, default, lo, hi):
     logger = MagicMock()
     resolver(logger)
     logger.warning.assert_called_once()
-    assert var in logger.warning.call_args[0][0]
+    assert var in rendered_log(logger.warning)
 
 
 def test_python_and_c_agree_on_the_constants():

@@ -18,7 +18,7 @@ import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from queue import Empty, Queue
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -209,7 +209,18 @@ class TestCohort:
 
     def test_start(self):
         c = self._make_cohort()
-        c.start()  # no-op, should not raise
+        c.tick_cadence = 0.01     # so stop()'s join does not wait out the default
+        c.start()                 # NOT a no-op any more: this spawns the tick loop
+        try:
+            assert c._tick_thread is not None
+        finally:
+            # Must be stopped: a leaked daemon tick thread would otherwise run
+            # for the rest of the session, burning CPU and mutating cohort state
+            # underneath every later test. (It also used to fail TestStreamTake
+            # at random, back when those tests patched the shared `time.sleep`;
+            # they now patch `daq._poll_sleep`, so the two are independent --
+            # keep BOTH halves, neither one is redundant.)
+            c.stop()
 
     def test_acquire_data_on_an_empty_channel_is_a_no_op(self):
         c = self._make_cohort()
@@ -785,18 +796,26 @@ class TestStreamTake:
     no pop.
     """
 
+    # These patch `daq._poll_sleep`, the name the deque-poll branch calls,
+    # NOT `daq.time.sleep`. `daq.time` is the shared stdlib module, so
+    # patching it reaches every thread in the process: any unrelated thread
+    # that sleeps inside the `with` block counts as a poll here (a leaked
+    # Cohort tick thread did exactly that, failing the timeout test at
+    # random), and every real sleep in the process turns into an instant
+    # MagicMock for the duration. The seam observes one call site instead.
+
     def test_a_queue_wait_never_polls(self):
         """The Queue path must block in the kernel, not spin."""
         from autonomous_trust.inspector.peer import daq
         q = Queue()
         q.put('frame')
-        with patch.object(daq.time, 'sleep') as slept:
+        with patch.object(daq, '_poll_sleep') as slept:
             assert daq.stream_take(q, 1.0) == 'frame'
         assert not slept.called
 
     def test_a_queue_wait_times_out_without_polling(self):
         from autonomous_trust.inspector.peer import daq
-        with patch.object(daq.time, 'sleep') as slept:
+        with patch.object(daq, '_poll_sleep') as slept:
             with pytest.raises(Empty):
                 daq.stream_take(Queue(), 0.05)
         assert not slept.called
@@ -805,10 +824,13 @@ class TestStreamTake:
         """Documented asymmetry, not an oversight: a deque has no blocking API.
         Only in-process/test streams take this path."""
         from autonomous_trust.inspector.peer import daq
-        with patch.object(daq.time, 'sleep') as slept:
+        with patch.object(daq, '_poll_sleep') as slept:
             with pytest.raises(Empty):
                 daq.stream_take(deque(), 0.02)
         assert slept.called
+        # ...and it is THIS poll, at the documented cadence -- not some other
+        # sleep that merely happened during the window.
+        assert slept.call_args_list == [call(daq.DEQUE_POLL_SEC)] * slept.call_count
 
     def test_a_deque_still_yields_its_item(self):
         from autonomous_trust.inspector.peer import daq

@@ -57,5 +57,5 @@ class IdentityByStake(AgreementByStake, IdentityHistory):
 
     def finalize(self, blob):
         approve = super().finalize(blob)
-        self.logger.debug("blob approval: %s" % approve)
+        self.logger.debug("blob approval: %s", approve)
         return approve

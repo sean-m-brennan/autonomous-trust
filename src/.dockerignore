@@ -1,0 +1,27 @@
+# Build context for `docker build ... $SRC_DIR`: build_release (src/autonomous-trust/
+# Dockerfile) and build_builder (src/Dockerfile-build) in scripts/build-docker.sh.
+# The repo-root .dockerignore does NOT apply to these builds -- .dockerignore is
+# read from the context root -- so the same host artifacts are re-listed here.
+# A `#` comment must own its whole line; trailing text is part of the pattern.
+#
+# dist/conda-repo is deliberately NOT ignored: src/autonomous-trust/Dockerfile
+# does `RUN --mount=source=dist/conda-repo`, which reads the build context.
+
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.tox/
+**/.venv/
+**/.rustup/
+**/node_modules/
+**/.pytest_cache/
+*.egg-info/
+
+# Host CMake output; the C images cmake fresh into their own build dir.
+c/build/
+c/build-*/
+# Host cargo output; the images install their own rustup and rebuild.
+**/rust/target/
+# build-docker.sh's run_builder() stash (see STASH_ROOT there). This context is
+# `src/` itself, so a strand would otherwise land straight in the release build.
+.at-builder-stash/

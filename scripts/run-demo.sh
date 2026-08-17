@@ -124,6 +124,11 @@ warn()  { echo -e "${YELLOW}[$VARIANT]${NC} $*"; }
 err()   { echo -e "${RED}[$VARIANT]${NC} $*" >&2; }
 event() { echo -e "${GREEN}[T+${1}]${NC} $2"; }
 
+# build_image() + reclaim_superseded_images(): every image below carries a fixed
+# tag, so each --rebuild leaves the previous generation dangling and pinning its
+# snapshot chain. Sourced after the loggers so the helper can bind to log().
+source "$here/scripts/image-prune.sh"
+
 # Ensure a git submodule is checked out. Dockerfile-native COPYs the working
 # tree rather than cloning, so an uninitialized submodule surfaces as a CMake
 # "Cannot find source file" error deep in the build. `git submodule status`
@@ -260,7 +265,9 @@ dod-mission options:
 
 Environment overrides: VARIANT, NAMESPACE, INSPECTOR_PORT, DEPLOY_DIR,
                        REGISTRY, IMAGE_TAG, LOG_LEVEL, TILT_LOG,
-                       AT_RECORD, AT_RECORD_HOST_DIR, AT_RECORD_NODE_PATH
+                       AT_RECORD, AT_RECORD_HOST_DIR, AT_RECORD_NODE_PATH,
+                       AT_KEEP_SUPERSEDED (=1 keeps the image generation a
+                       rebuild replaces, instead of reclaiming it)
 EOF
     exit "${1:-0}"
 }
@@ -755,19 +762,19 @@ ensure_demo_images() {
             # dod-mission branch below for the rationale).
             if (( REBUILD == 1 )) || ! docker image inspect "$full_ref" &>/dev/null; then
                 log "Image $full_ref not found — building ..."
-                docker build "${build_args[@]}" -t "$full_ref" \
+                build_image "$full_ref" "${build_args[@]}" \
                     -f "$here/src/autonomous-trust/Dockerfile-native" "$here"
             fi
             if (( REBUILD == 1 )) || ! docker image inspect "$peer_ref" &>/dev/null; then
                 log "Image $peer_ref not found — building ..."
-                docker build --build-arg "BASE_IMAGE=$full_ref" \
-                    "${build_args[@]}" -t "$peer_ref" \
+                build_image "$peer_ref" --build-arg "BASE_IMAGE=$full_ref" \
+                    "${build_args[@]}" \
                     -f "$here/src/autonomous-trust-evaluation/Dockerfile" "$here"
             fi
             if (( REBUILD == 1 )) || ! docker image inspect "$inspector_ref" &>/dev/null; then
                 log "Image $inspector_ref not found — building ..."
-                docker build --build-arg "BASE_IMAGE=$full_ref" \
-                    "${build_args[@]}" -t "$inspector_ref" \
+                build_image "$inspector_ref" --build-arg "BASE_IMAGE=$full_ref" \
+                    "${build_args[@]}" \
                     -f "$here/src/autonomous-trust-inspector/Dockerfile" "$here"
             fi
             # Whether just built or served from cache, the image that will
@@ -806,13 +813,14 @@ ensure_demo_images() {
             # layer cache and the forced rebuild is nearly free.
             if (( REBUILD == 1 )) || ! docker image inspect "$base_ref" &>/dev/null; then
                 log "Building base image: $base_ref ..."
-                docker build --network host "${base_cache_flag[@]}" "${build_args[@]}" -t "$base_ref" \
+                build_image "$base_ref" --network host "${base_cache_flag[@]}" \
+                    "${build_args[@]}" \
                     -f "$here/src/autonomous-trust/Dockerfile-native" "$here"
             fi
             if (( REBUILD == 1 )) || ! docker image inspect "$inspector_ref" &>/dev/null; then
                 log "Building inspector image: $inspector_ref ..."
-                docker build --network host --build-arg "BASE_IMAGE=$base_ref" \
-                    "${build_args[@]}" -t "$inspector_ref" \
+                build_image "$inspector_ref" --network host \
+                    --build-arg "BASE_IMAGE=$base_ref" "${build_args[@]}" \
                     -f "$here/src/autonomous-trust-inspector/Dockerfile" "$here"
             fi
             # Same shared inspector image -> same stale-code risk; guard it.
@@ -822,14 +830,14 @@ ensure_demo_images() {
             # Docker's content-addressed cache might otherwise miss.
             if (( REBUILD == 1 )) || ! docker image inspect "$demo_ref" &>/dev/null; then
                 log "Building DoD mission demo image (coord + sim): $demo_ref ..."
-                docker build --network host --build-arg "BASE_IMAGE=$inspector_ref" \
-                    "${build_args[@]}" -t "$demo_ref" \
+                build_image "$demo_ref" --network host \
+                    --build-arg "BASE_IMAGE=$inspector_ref" "${build_args[@]}" \
                     -f "$here/examples/dod_mission/deploy/Dockerfile" "$here"
             fi
             if (( REBUILD == 1 )) || ! docker image inspect "$peer_ref" &>/dev/null; then
                 log "Building DoD mission peer image (lean): $peer_ref ..."
-                docker build --network host --build-arg "BASE_IMAGE=$base_ref" \
-                    "${build_args[@]}" -t "$peer_ref" \
+                build_image "$peer_ref" --network host \
+                    --build-arg "BASE_IMAGE=$base_ref" "${build_args[@]}" \
                     -f "$here/examples/dod_mission/deploy/Dockerfile-peer" "$here"
             fi
             # Embedded C at_demo image for --c-microdrones. Standalone build
@@ -840,12 +848,15 @@ ensure_demo_images() {
                 export AT_C_IMAGE="$c_ref"
                 if (( REBUILD == 1 )) || ! docker image inspect "$c_ref" &>/dev/null; then
                     log "Building embedded C at_demo image: $c_ref ..."
-                    docker build --network host "${build_args[@]}" -t "$c_ref" \
+                    build_image "$c_ref" --network host "${build_args[@]}" \
                         -f "$here/src/autonomous-trust/Dockerfile-c" "$here"
                 fi
             fi
             ;;
     esac
+    # After the whole chain, so an old base is reclaimed on the pass following
+    # the old overlay that pinned it as a parent. No-op when nothing was built.
+    reclaim_superseded_images
 }
 
 # --- Manifest generation (per variant) -----------------------------------

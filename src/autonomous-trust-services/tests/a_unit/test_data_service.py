@@ -20,6 +20,8 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
 
+from .. import rendered_log
+
 from autonomous_trust.core.network import Message
 from autonomous_trust.core.system import CfgIds
 from autonomous_trust.services.data.server import DataProtocol, DataConfig, DataProcess
@@ -173,7 +175,7 @@ class TestDataProcessMessages:
         proc.protocol.run_message_handlers.return_value = False
         proc.process_messages(queues)
         proc.logger.error.assert_called_once()
-        assert 'str' in proc.logger.error.call_args[0][0]
+        assert 'str' in rendered_log(proc.logger.error)
 
 
 class TestDataProcessLoop:
@@ -313,7 +315,7 @@ class TestDataRcvr:
         queues = {rcvr.name: my_q, CfgIds.network: queue.Queue()}
         rcvr.process(queues, MagicMock())
         rcvr.logger.error.assert_called()
-        assert 'str' in rcvr.logger.error.call_args[0][0]
+        assert 'str' in rendered_log(rcvr.logger.error)
 
 
 class TestDataRcvrRosterSync:

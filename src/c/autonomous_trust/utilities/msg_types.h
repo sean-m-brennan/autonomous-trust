@@ -52,7 +52,8 @@ typedef enum {
     CHILD_GROUP,             /**< Identity → sibling processes: one cohort this node GATEWAYS, beyond its primary group. Local IPC only. Carries a @ref group_t like @ref GROUP, but must never land in `protocol.group` — the reputation process keeps a separate chain per child group, and clobbering the primary slot would merge a subtree into it. Mirrors Python's ChildGroupSet (see gateway-reputation-tree.md, ISSUES.md §10.2). */
 #ifdef AT_ZTA_ENABLED
     ZTA_REVOCATION_ALERT,    /**< Peer credential revocation notice. */
-    ZTA_VERIFICATION_RESULT  /**< Outcome of a deferred ZTA verification. */
+    ZTA_VERIFICATION_RESULT, /**< Outcome of a deferred ZTA verification. */
+    ZTA_STANDING             /**< Identity → reputation: what ZTA proved about a peer (@ref zta_standing_msg_t). Local IPC only. Mirrors Python's ZtaStanding (ISSUES.md §10.5). */
 #endif
 } message_type_t;
 
@@ -251,6 +252,46 @@ typedef struct {
     int status;                     /* zta_status_t cast to int */
     char reason[64];
 } zta_event_msg_t;
+
+/**
+ * @brief What ZTA proved (or failed to prove) about a peer.
+ *
+ * Mirrors Python's `STANDING_*` in `identity/zta_standing.py`; the three
+ * values are the distinctions the reputation process can act on, deliberately
+ * NOT the six-valued @ref zta_status_t (the verifier's own status rides along
+ * in `reason` for the operator log). ISSUES.md §10.5.
+ */
+typedef enum {
+    ZTA_STANDING_PROVED = 0, /**< Verified against a configured anchor AND bound to this identity. No ceiling; anchors the unwind. */
+    ZTA_STANDING_CAPPED,     /**< Admitted but unproved (DDIL/deferred, or a chained-but-unbound credential under `binding_mode: prefer`). Carries the ceiling. */
+    ZTA_STANDING_FAILED      /**< Affirmative post-admission failure: REVOKED / EXPIRED / REJECTED at re-verification. Unwinds and demotes. */
+} zta_standing_t;
+
+/**
+ * @brief Identity → reputation: one peer's ZTA standing. Local IPC only.
+ *
+ * The verdict is discovered by the identity process (it owns admission and the
+ * verifier) but the thing it must bound, reputation, lives in another process;
+ * this is that hand-off. Nothing here is peer-supplied — it is this node's own
+ * finding — so a peer cannot forge itself a ceiling of 1.0 by claiming one.
+ *
+ * Why a ceiling and not a score: a ZTA verdict is an authority finding about
+ * whether an identity is who it claims, not the outcome of an interaction with
+ * it, and AT's [0, 1] scale (§11.2) has no representation for a penalty. The
+ * predecessor of this message tried to send one as `score = -0.8` on a
+ * TRANSACTION_SCORE and was discarded at the boundary twice over — once for
+ * the zero task_uuid sentinel, once for being off-scale — so a revoked
+ * credential cost a peer exactly nothing.
+ */
+typedef struct {
+    uuid_t peer_uuid;
+    int32_t standing;    /**< @ref zta_standing_t cast to int. */
+    double ceiling;      /**< Highest reputation this peer may hold while unproved; < 0 means "no bound". */
+    char reason[64];
+} zta_standing_msg_t;
+
+/** @brief Sentinel for @ref zta_standing_msg_t::ceiling meaning "no bound". */
+#define ZTA_NO_CEILING (-1.0)
 #endif
 
 /**
@@ -281,6 +322,7 @@ typedef struct
         peer_reputation_msg_t peer_reputation;
 #ifdef AT_ZTA_ENABLED
         zta_event_msg_t zta_event;
+        zta_standing_msg_t zta_standing;
 #endif
     } info;         /**< Discriminated-union payload keyed by @c type. */
 } generic_msg_t;

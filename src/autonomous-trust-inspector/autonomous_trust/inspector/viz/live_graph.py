@@ -126,7 +126,15 @@ class LiveNetwork(ng.NetworkGraph):
     def __init__(self, _, **kwargs):
         # Track reputation (node) + trust_level (edge) in the diff keys so a
         # change in transitive trust triggers an update emit to the client.
-        self.node_data = list(self.node_data) + ['persist', 'reputation']
+        # `latency` and `command` belong here for the same reason and were
+        # missed: a frame's node set is a diff over `node_data` ONLY, so an
+        # attribute absent from this list can change every tick without ever
+        # producing a difference to emit. Both channels reach the graph
+        # (`_apply_latency`, `_apply_command`) and both stopped at the server
+        # for any peer already known -- a PingAT sample updated a node the
+        # client was never told about again.
+        self.node_data = list(self.node_data) + ['persist', 'reputation',
+                                                 'latency', 'command']
         self.link_data = list(self.link_data) + ['trust_level']
         self.iteration = 0
         self._stopped = False

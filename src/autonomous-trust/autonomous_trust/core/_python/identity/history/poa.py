@@ -48,5 +48,5 @@ class IdentityByAuthority(AgreementByAuthority, IdentityHistory):
 
     def finalize(self, blob: IdentityObj):
         approve = super().finalize(blob)
-        self.logger.debug("Approval for %s: %s" % (blob.identity.nickname, approve))
+        self.logger.debug("Approval for %s: %s", blob.identity.nickname, approve)
         return approve

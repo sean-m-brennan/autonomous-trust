@@ -18,6 +18,7 @@ import random
 import time
 import uuid as uuid_mod
 
+from nacl.exceptions import CryptoError
 from nacl.public import Box
 
 from ..config import InitializableConfig
@@ -32,7 +33,7 @@ class Group(InitializableConfig):
     _msg_class = identity_pb2.Group
 
     def __init__(self, _uuid, _address_map, _nickname, _encryptor, _public_only=True,
-                 _created=0.0):
+                 _created=0.0, _key_epoch=0, _previous_keys=None):
         super().__init__(identity_pb2.Group)
         self._uuid = str(_uuid)
         self._address_map = _address_map
@@ -47,6 +48,47 @@ class Group(InitializableConfig):
         # the historical uuid tiebreaker so behavior is unchanged. Only groups
         # minted via `initialize` carry a real age. Local/merge signal only.
         self._created = float(_created) if _created else 0.0
+        # Key rotation (ISSUES.md §10.2). The shared key used to be permanent,
+        # which meant admitting a member handed it the ability to decrypt any
+        # cohort traffic it had recorded BEFORE it joined. Admission now
+        # rotates, and `key_epoch` is what makes a rotation safe to accept:
+        # a receiver adopts a new key only when it comes with a HIGHER epoch,
+        # so a captured older key cannot be replayed back over a newer one.
+        # 0 = never rotated, which is every group minted before this existed.
+        self._key_epoch = int(_key_epoch or 0)
+        # Superseded keys, newest first, as (Encryptor, retired_at). Kept only
+        # so traffic already in flight when the key changed still decrypts --
+        # a rotation is not synchronous across a cohort, and dropping every
+        # frame from a member that has not yet processed the update would make
+        # rotation cost more than it buys. Bounded by count and by age; see
+        # `decrypt`.
+        #
+        # PROCESS-LOCAL, and never serialized: `to_dict` drops it and
+        # `to_canonical` never emitted it, matching C, which holds
+        # previous_keys/previous_retired_at in the group struct and writes
+        # neither. The `_previous_keys` parameter therefore exists only to
+        # ACCEPT AND DISCARD the key that configs written before that fix
+        # carry -- `config_json_decoder` rebuilds via `cls(**kwargs)`, so
+        # without it every such file fails to load with "unexpected keyword
+        # argument". Discarded rather than restored on purpose: the grace
+        # window covers frames in flight across a rotation, and a process that
+        # is only now reading its config off disk has none. Restoring would
+        # just hold retired private keys open past any use for them.
+        self._previous_keys = []
+
+    def to_dict(self):
+        # `_previous_keys` is process-local grace-window state, not part of the
+        # config or wire identity of a group -- the same reason `identity.py`
+        # drops `_rank_adjustment` and `zta_anchors`. Two things go wrong if it
+        # round-trips: `config_json_decoder` rebuilds via `cls(**kwargs)`, and
+        # (worse) a `.cfg.json` on disk would carry SUPERSEDED PRIVATE KEYS,
+        # keeping retired key material readable long after the grace window it
+        # exists for has closed. C holds the same state in the group struct and
+        # serializes it nowhere, so dropping it here is also what keeps the two
+        # runtimes' persisted groups the same shape.
+        d = super().to_dict()
+        d.pop('_previous_keys', None)
+        return d
 
     def __eq__(self, other):
         if not isinstance(other, self.__class__):
@@ -61,6 +103,82 @@ class Group(InitializableConfig):
     def created(self):
         """Comparable creation epoch (seconds); 0.0 if unknown. See §3.1-b."""
         return getattr(self, '_created', 0.0)
+
+    @property
+    def key_epoch(self) -> int:
+        """How many times this group's shared key has been rotated. Only ever
+        compared, never trusted as an identity: see :meth:`accept_rotation`."""
+        return getattr(self, '_key_epoch', 0)
+
+    #: How long a superseded key still decrypts, and how many are kept. A
+    #: rotation propagates as fast as one message to each member, so this is
+    #: generous; it bounds the window in which a key that was deliberately
+    #: retired still opens traffic, which is the whole thing rotation exists
+    #: to shorten.
+    PREVIOUS_KEY_GRACE = 60.0
+    PREVIOUS_KEY_MAX = 2
+
+    def rotate_key(self, now_ts=None):
+        """Mint a fresh shared key, retiring the current one into the grace
+        window, and return the new epoch.
+
+        Called when a cohort admits a member (ISSUES.md §10.2, user's call
+        2026-08-13): the joiner receives only the NEW key, so ciphertext it
+        recorded before being admitted stays closed to it.
+
+        Requires ownership of the current private key -- a public-only view of
+        somebody else's group has no standing to rotate it, and silently
+        minting a key here would fork the cohort into two that cannot hear
+        each other."""
+        if not self.owns_private_key:
+            raise RuntimeError(
+                'Cannot rotate the key of a group whose private key we do not '
+                'hold (%s)' % self.nickname)
+        stamp = time.time() if now_ts is None else float(now_ts)
+        prev = getattr(self, '_previous_keys', None)
+        if prev is None:
+            prev = self._previous_keys = []
+        prev.insert(0, (self._encryptor, stamp))
+        del prev[self.PREVIOUS_KEY_MAX:]
+        self._encryptor = Encryptor.generate()
+        self._public_only = False
+        self._key_epoch = self.key_epoch + 1
+        return self._key_epoch
+
+    def accept_rotation(self, other, now_ts=None) -> bool:
+        """Adopt ``other``'s shared key if it supersedes ours.
+
+        Three conditions, and each is load-bearing:
+
+        * **same group** -- a key for another cohort is not a rotation of this
+          one;
+        * **a strictly higher epoch** -- equal or lower is a replay, and
+          accepting one would let a captured old key be reinstated over a
+          newer one, which is precisely the attack rotation is meant to
+          foreclose;
+        * **the sender actually holds the private key** -- a public-only view
+          carries nothing to adopt, and taking it would leave us unable to
+          decrypt our own cohort.
+
+        Authenticating WHO may rotate is the caller's job (a verified message
+        from a member); this only decides whether the key on offer is newer."""
+        if other is None or str(other.uuid) != str(self.uuid):
+            return False
+        if other.key_epoch <= self.key_epoch:
+            return False
+        if not other.owns_private_key:
+            return False
+        stamp = time.time() if now_ts is None else float(now_ts)
+        prev = getattr(self, '_previous_keys', None)
+        if prev is None:
+            prev = self._previous_keys = []
+        if self.owns_private_key:
+            prev.insert(0, (self._encryptor, stamp))
+            del prev[self.PREVIOUS_KEY_MAX:]
+        self._encryptor = other.encryptor
+        self._public_only = False
+        self._key_epoch = other.key_epoch
+        return True
 
     @property
     def nickname(self):
@@ -136,7 +254,25 @@ class Group(InitializableConfig):
         # Always return bytes — see identity.py:135 for the parity
         # rationale; group.decrypt mirrors identity.decrypt to keep
         # the two encrypt/decrypt entry points symmetric.
-        return Box(self.encryptor.private, whom.encryptor.public).decrypt(msg, nonce)
+        try:
+            return Box(self.encryptor.private, whom.encryptor.public).decrypt(msg, nonce)
+        except CryptoError:
+            # A rotation is not synchronous across a cohort: a member that has
+            # not yet processed the key update is still sending under the old
+            # one. Retry the recently retired keys rather than drop those
+            # frames. Bounded by age so a retired key stops working soon after
+            # it is retired -- an unbounded fallback would make rotation
+            # decorative.
+            stamp = time.time()
+            for old_key, retired_at in list(getattr(self, '_previous_keys', [])):
+                if stamp - retired_at > self.PREVIOUS_KEY_GRACE:
+                    continue
+                try:
+                    return Box(old_key.private,
+                               whom.encryptor.public).decrypt(msg, nonce)
+                except CryptoError:
+                    continue
+            raise
 
     def publish(self):
         return Group(self.uuid, self.addresses, self.nickname, Encryptor(self.encryptor.publish(), True), True)
@@ -198,6 +334,10 @@ class Group(InitializableConfig):
             # read defaults to 0.0 (unknown → uuid tiebreak), so a peer on an
             # older build that doesn't send it stays compatible.
             'created': self.created,
+            # Key rotation epoch (§10.2). Additive and defaulted on read, so a
+            # peer that predates rotation sends nothing and reads as epoch 0 --
+            # which is exactly "never rotated" and needs no special case.
+            'key_epoch': self.key_epoch,
         }
 
     @staticmethod
@@ -213,7 +353,8 @@ class Group(InitializableConfig):
         return Group(d.get('uuid'), dict(d.get('address_map', {}) or {}),
                      d.get('nickname', ''),
                      Encryptor(seed, public_only=public_only), public_only,
-                     _created=d.get('created', 0.0) or 0.0)
+                     _created=d.get('created', 0.0) or 0.0,
+                     _key_epoch=int(d.get('key_epoch', 0) or 0))
 
     @staticmethod
     def initialize(address_map, our_nickname):

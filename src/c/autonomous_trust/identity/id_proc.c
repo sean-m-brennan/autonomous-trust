@@ -64,6 +64,12 @@ static void _verify_operator_key(const process_t *proc,
                                  const uint8_t *cred, size_t cred_len,
                                  const uint8_t claimed_key[crypto_sign_PUBLICKEYBYTES]);
 typedef enum { ZTA_GATE_ADMIT, ZTA_GATE_ADMIT_CAPPED, ZTA_GATE_REJECT } zta_gate_t;
+/* Hand the gate's verdict to the reputation process (ISSUES.md §10.5).
+ * Mirrors Python IdentityProcess._publish_zta_decision. */
+static void _publish_zta_standing(const process_t *proc,
+                                  const zta_policy_t *policy,
+                                  const public_identity_t *peer,
+                                  zta_gate_t decision);
 static zta_gate_t _zta_admit(const process_t *proc, const zta_policy_t *policy,
                              public_identity_t *pub,
                              const uint8_t claimed_key[crypto_sign_PUBLICKEYBYTES]);
@@ -315,6 +321,13 @@ static struct {
     bool hierarchy_requested;
     char partition_recovery_target[64];
     int64_t partition_recovery_started_us;
+    /* Runtime cross-group join (ISSUES.md 10.2). Cohorts we have ASKED to join
+     * and not yet been admitted to: group-uuid string -> string_data(same).
+     * The gate on _adopt_solicited_group -- a group arriving without an entry
+     * here is somebody handing us a cohort we never asked for, and adopting
+     * that would let any peer install itself in our tree. Mirrors Python
+     * IdentityProcess._pending_joins. */
+    map_t pending_joins;
 } id_state;
 
 static void _ensure_id_init(void)
@@ -334,6 +347,7 @@ static void _ensure_id_init(void)
         map_init(&id_state.partition_probe_cooldown);
         map_init(&id_state.partition_response_cooldown);
         map_init(&id_state.provisional_confirmations);
+        map_init(&id_state.pending_joins);
         id_state.partition_recovery_target[0] = '\0';
         id_state.partition_recovery_started_us = 0;
         id_state.self_tier = 0;
@@ -645,6 +659,38 @@ static int _update_group(const process_t *proc, directory_t *queues)
     return 0;
 }
 
+/* Mint a new shared key for our own group and hand it to every current member
+ * (ISSUES.md 10.2, user's call 2026-08-13).
+ *
+ * Only the node performing an admission calls this, and group_rotate_key
+ * refuses when we do not hold the current private key — a rotation minted by a
+ * node that cannot already decrypt the cohort would fork it into two halves
+ * that cannot hear each other.
+ *
+ * Distribution rides the EXISTING per-member group_key_update, which already
+ * carries the private seed to each member individually (group_to_json emits it
+ * when we own it, and the message is encrypted to that member). What makes it
+ * safe to ADOPT on the far side is the epoch: see group_accept_rotation.
+ *
+ * Best-effort by design. A rotation that fails to reach a member costs that
+ * member the grace window, not correctness — and refusing to admit a peer
+ * because a key update could not be sent would be a worse trade. Mirrors Python
+ * _rotate_group_key. */
+/* Frama-C: skipped — [solver-timeout] libsodium/JSON/messaging preconditions */
+static bool _rotate_group_key(process_t *proc, directory_t *queues)
+{
+    if (proc == NULL)
+        return false;
+    int64_t epoch = group_rotate_key(&proc->protocol.group);
+    if (epoch < 0)
+        return false;   /* public-only view: not ours to rotate */
+    log_info(proc->logger,
+             "Identity: rotated group key to epoch %lld (%zu member(s))\n",
+             (long long)epoch, proc->protocol.num_peers);
+    _update_group(proc, queues);
+    return true;
+}
+
 /****************************
  * Helper: _add_peer
  * Adds a new peer to the process's peer list and broadcasts to local processes.
@@ -875,6 +921,15 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
      * actually needs to work. When per-process identity_history_t
      * gets wired up, call dag_recite + linked_step_to_json here and
      * replace the empty array. */
+    /* Rotate the shared key BEFORE the joiner is handed the group (ISSUES.md
+     * 10.2, user's call 2026-08-13). The order is the whole point: the joiner
+     * receives only the new key, so cohort ciphertext it recorded before being
+     * admitted stays closed to it. Existing members are handed the new key by
+     * the _update_group inside, and keep decrypting old-key traffic through
+     * GROUP_PREVIOUS_KEY_GRACE while that propagates — a rotation is not
+     * synchronous across a cohort. Mirrors Python _peer_accepted. */
+    _rotate_group_key(proc, queues);
+
     json_t *hist_arr = json_array();
     if (hist_arr != NULL)
     {
@@ -981,6 +1036,93 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
   requires \valid(msg);
   requires proc->logger == \null || \valid(proc->logger);
 */
+static int _own_rank(const process_t *proc);
+static int _roster_member_rank(const process_t *proc, const char *uuid);
+#ifdef AT_ZTA_ENABLED
+static size_t _own_zta_anchors(const process_t *proc, const zta_policy_t *policy,
+                               char out[][ZTA_ANCHOR_NAME_LEN], size_t max);
+#endif
+
+/* Whether a peer may even ASK this cohort to admit it (ISSUES.md 10.2).
+ *
+ * Two gates, both reused rather than invented (user's call, 2026-08-13):
+ * a PROVED shared ZTA anchor — the same rule federation and deep-resolution
+ * evidence already apply — and out-ranking us, matching _derive_parent_gateway's
+ * direction, because a cohort is joined from ABOVE by the node that will
+ * gateway it. A peer at or below our rank asking to join is not forming a
+ * hierarchy, and admitting it would let any anchored peer collect cohort keys
+ * sideways.
+ *
+ * Inert when the policy is not enforcing at admission or we hold no anchors of
+ * our own: with nothing to compare against, refusing every requester would
+ * break joins for non-ZTA deployments rather than protect anything. Same inert
+ * conditions as _gateway_authorized, deliberately. */
+static bool _join_authorized(const process_t *proc,
+                             const public_identity_t *new_id, int their_rank)
+{
+    if (proc == NULL || new_id == NULL)
+        return false;
+#ifdef AT_ZTA_ENABLED
+    data_t *zta_dat = NULL;
+    config_t *zta_cfg = NULL;
+    char zta_key[] = "zta_policy";
+    if (map_get(proc->configs, zta_key, &zta_dat) == 0 && zta_dat != NULL
+        && data_object_ptr(zta_dat, (void **)&zta_cfg) == 0
+        && zta_cfg != NULL && zta_cfg->data_struct != NULL)
+    {
+        const zta_policy_t *policy = (const zta_policy_t *)zta_cfg->data_struct;
+        if (policy->enabled && policy->require_at_admission)
+        {
+            /* OUR anchors are computed from our own credentials, exactly as
+               Python's _join_authorized calls _own_zta_anchors(): the
+               zta_anchors field on an identity records what a PEER proved to us
+               at admission, and we never admit ourselves, so reading it for our
+               side would compare the requester against an empty set. n_own == 0
+               is the inert case _gateway_authorized also takes. */
+            char own[ZTA_MAX_ANCHORS][ZTA_ANCHOR_NAME_LEN];
+            size_t n_own = _own_zta_anchors(proc, policy, own, ZTA_MAX_ANCHORS);
+            bool shared = (n_own == 0);
+            for (size_t i = 0; i < n_own && !shared; i++)
+                for (size_t j = 0; j < new_id->num_zta_anchors; j++)
+                    if (strncmp(own[i], new_id->zta_anchors[j],
+                                ZTA_ANCHOR_NAME_LEN) == 0)
+                    {
+                        shared = true;
+                        break;
+                    }
+            if (!shared)
+            {
+                log_warn(proc->logger,
+                         "Identity: join request from %s refused: no proved "
+                         "shared anchor\n", new_id->nickname);
+                return false;
+            }
+        }
+    }
+#endif
+    /* Rank sources, in Python's order (_member_rank first, then the identity):
+     * the peer_ranks seam is the live record and outranks a single envelope,
+     * which may legitimately be absent -- public_identity_t drops rank (see the
+     * roster note in doc/architecture/gateway-reputation-tree.md), which is why
+     * the caller passes nmsg->from_rank through as the fallback. Reading only
+     * the envelope would make this gate refuse a peer whose rank we already
+     * know, and the two runtimes would then disagree about who may solicit. */
+    char req_uuid[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(new_id->uuid, req_uuid);
+    int known = _roster_member_rank(proc, req_uuid);
+    if (known != 0)
+        their_rank = known;
+    int own_rank = _own_rank(proc);
+    if (their_rank <= own_rank)
+    {
+        log_warn(proc->logger,
+                 "Identity: join request from %s refused: rank %d does not "
+                 "exceed ours (%d)\n", new_id->nickname, their_rank, own_rank);
+        return false;
+    }
+    return true;
+}
+
 static bool handle_welcoming_committee(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     if (proc->protocol.phase != 3)
@@ -995,6 +1137,38 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
     {
         log_warn(proc->logger, "Identity: rejecting empty identity\n");
         return true;
+    }
+
+    /* Optional payload slot 3: the cohort the requester is asking to join
+     * (ISSUES.md 10.2, runtime cross-group join). Absent = the ordinary open
+     * request, handled exactly as before. Present and naming somebody else's
+     * cohort = not ours to answer, so it is dropped here rather than admitting
+     * into OUR group a peer that asked for a different one. Same arity
+     * tolerance the operator attestation in slot 2 already relies on; mirrors
+     * Python welcoming_committee's join_target. */
+    bool solicited_join = false;
+    {
+        json_t *jpayload = NULL;
+        if (net_msg_unpack_json(nmsg, &jpayload) == 0 && jpayload != NULL)
+        {
+            if (json_is_array(jpayload) && json_array_size(jpayload) > 3)
+            {
+                const char *target =
+                    json_string_value(json_array_get(jpayload, 3));
+                if (target != NULL && target[0] != '\0')
+                {
+                    char own[UUID_STRING_LEN + 1] = {0};
+                    uuid_unparse_lower(proc->protocol.group.uuid, own);
+                    if (strcmp(target, own) != 0)
+                    {
+                        json_decref(jpayload);
+                        return true;   /* not our cohort to answer for */
+                    }
+                    solicited_join = true;
+                }
+            }
+            json_decref(jpayload);
+        }
     }
 
     /* Check if already a peer.  If so, re-send access_granted in case the
@@ -1083,15 +1257,35 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
             /* The whole decision — any-of across anchors, graded failure, the
                credential->identity binding, replay, operator classification —
                lives in _zta_admit, mirroring Python's _zta_admit one-for-one.
-               A capped admission is logged there; C has no reputation-cap set to
-               add the peer to (Python's _zta_capped), so the two runtimes differ
-               in bookkeeping, not in who gets admitted. */
-            if (_zta_admit(proc, zta_policy, &nmsg->from_whom,
-                           claimed_operator_key) == ZTA_GATE_REJECT)
+
+               The gate's verdict is then handed to the reputation process
+               (§10.5). Until that hand-off existed, ZTA_GATE_ADMIT_CAPPED was
+               only ever compared against ZTA_GATE_REJECT -- so a "capped"
+               admission was byte-for-byte an ordinary one, and the
+               `ddil_fallback_reputation_cap` this code logs was enforced
+               nowhere in either runtime. Publishing BEFORE the vote matters: a
+               ceiling that arrives after the peer's first commit has already
+               let the thing it bounds happen. */
+            zta_gate_t gate_decision = _zta_admit(proc, zta_policy,
+                                                  &nmsg->from_whom,
+                                                  claimed_operator_key);
+            if (gate_decision == ZTA_GATE_REJECT)
                 return true; /* reject */
+            _publish_zta_standing(proc, zta_policy, &nmsg->from_whom,
+                                  gate_decision);
         }
     }
 #endif
+
+    /* A targeted join is bounded before the vote (ISSUES.md 10.2): the
+     * requester must prove an anchor we share and out-rank this cohort.
+     * Deliberately AFTER the ZTA block, which is what turns an asserted
+     * credential into proved anchors this reads, and deliberately BEFORE the
+     * vote — it bounds who may solicit, it does not decide. Mirrors Python
+     * _join_authorized. */
+    if (solicited_join
+        && !_join_authorized(proc, &nmsg->from_whom, (int)nmsg->from_rank))
+        return true;
 
     /* Bootstrap: auto-accept when no existing peers (no one to vote).
      * Skipped in synchronous_dispatch (conformance) mode so the harness
@@ -1716,6 +1910,73 @@ static int _merge_to_mesh(process_t *proc, directory_t *queues)
   requires \valid(msg);
   requires proc->logger == \null || \valid(proc->logger);
 */
+/* If @p payload carries a cohort we asked to join, adopt it as a CHILD group
+ * and return true (ISSUES.md 10.2).
+ *
+ * Gated on id_state.pending_joins, so an unsolicited history is never adopted
+ * this way — otherwise any peer could hand us a group and silently install
+ * itself in our tree. Returning true means the ordinary primary-group path is
+ * skipped, which is the point: the whole reason a gateway joins a child cohort
+ * is that its primary group stays what it was, and choose_group / _merge_to_mesh
+ * decide precisely that. Mirrors Python _adopt_solicited_group. */
+/* Frama-C: skipped — [solver-timeout] JSON/map/group preconditions */
+static bool _adopt_solicited_group(process_t *proc, const json_t *payload)
+{
+    if (proc == NULL || payload == NULL || !json_is_array(payload)
+        || json_array_size(payload) == 0)
+        return false;
+    json_t *gj = json_array_get((json_t *)payload, 0);
+    if (gj == NULL || !json_is_object(gj))
+        return false;
+    const char *guuid = json_string_value(json_object_get(gj, "uuid"));
+    if (guuid == NULL || guuid[0] == '\0')
+        return false;
+
+    pthread_mutex_lock(&id_state.lock);
+    data_t *pending = NULL;
+    bool solicited = (map_get(&id_state.pending_joins, (map_key_t)guuid,
+                              &pending) == 0 && pending != NULL);
+    pthread_mutex_unlock(&id_state.lock);
+    if (!solicited)
+        return false;
+
+    group_t *g = calloc(1, sizeof(group_t));
+    if (g == NULL)
+        return false;
+    if (group_from_json(gj, g) != 0) {
+        /* group_from_json map_init's the address map before it can fail on the
+         * encryptor, and g is calloc'd, so this is safe either way. */
+        map_free(&g->address_map);
+        free(g);
+        return false;
+    }
+    /* A public-only group cannot decrypt cohort traffic, so adopting it would
+     * leave us a member that can hear nothing. Refuse and stay pending rather
+     * than record a half-join. */
+    if (sodium_is_zero(g->encryptor.private, crypto_box_SECRETKEYBYTES)) {
+        log_warn(proc->logger,
+                 "Identity: join answer for %s carried no shared key; "
+                 "ignoring\n", guuid);
+        map_free(&g->address_map);
+        free(g);
+        return false;
+    }
+
+    size_t members = map_size(&g->address_map);
+    if (identity_add_child_group(proc, g, NULL) != 0) {
+        map_free(&g->address_map);
+        free(g);
+        return false;
+    }
+    pthread_mutex_lock(&id_state.lock);
+    map_remove(&id_state.pending_joins, (map_key_t)guuid);
+    pthread_mutex_unlock(&id_state.lock);
+    log_info(proc->logger,
+             "Identity: joined cohort %s at runtime (%zu member(s))\n",
+             guuid, members);
+    return true;
+}
+
 static bool handle_receive_history(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -1728,6 +1989,15 @@ static bool handle_receive_history(const process_t *proc, directory_t *queues, g
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
     {
         log_warn(proc->logger, "Identity: handle_receive_history: no JSON payload\n");
+        return true;
+    }
+
+    /* A history answering a cohort join WE solicited becomes a child group and
+     * goes no further — it must not reach choose_group / _merge_to_mesh, which
+     * decide which group is OUR primary one (ISSUES.md 10.2). */
+    if (_adopt_solicited_group((process_t *)proc, payload))
+    {
+        json_decref(payload);
         return true;
     }
 
@@ -2511,6 +2781,51 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
 
     bool same_group = theirs_uuid_valid
                       && uuid_compare(theirs_uuid, proc->protocol.group.uuid) == 0;
+
+    /* A rotated key supersedes ours (ISSUES.md 10.2). Checked BEFORE the
+     * membership comparison because a rotation carries no membership change of
+     * its own, and a smaller-or-equal address map would otherwise take the
+     * quiet no-op path below and drop the new key on the floor.
+     *
+     * Only from a VERIFIED message: the epoch decides whether a key is newer,
+     * not whether its sender had any business rotating, and an unauthenticated
+     * update naming a higher epoch would be a way to hand a cohort a key of the
+     * attacker's choosing. Mirrors Python handle_group_update. */
+    if (same_group)
+    {
+        json_t *j_epoch = json_object_get(payload, "key_epoch");
+        int64_t theirs_epoch = (j_epoch != NULL && json_is_integer(j_epoch))
+                               ? json_integer_value(j_epoch) : 0;
+        if (theirs_epoch > proc->protocol.group.key_epoch)
+        {
+            if (!nmsg->verified)
+            {
+                log_warn(proc->logger,
+                         "Identity: rejecting unverified group key rotation "
+                         "from %s\n", nmsg->from_whom.nickname);
+                json_decref(payload);
+                return true;
+            }
+            /* Only the fields group_accept_rotation reads, on the stack, so no
+             * address_map is allocated to free here. */
+            group_t theirs = {0};
+            memcpy(theirs.uuid, proc->protocol.group.uuid, sizeof(uuid_t));
+            theirs.key_epoch = theirs_epoch;
+            json_t *j_encr = json_object_get(payload, "encryptor");
+            json_t *j_po = j_encr ? json_object_get(j_encr, "public_only") : NULL;
+            const char *seed_hex = j_encr
+                ? json_string_value(json_object_get(j_encr, "hex_seed")) : NULL;
+            bool theirs_public = (j_po == NULL) ? true : json_boolean_value(j_po);
+            if (!theirs_public && seed_hex != NULL
+                && encryptor_init_from_private(&theirs.encryptor,
+                       (const unsigned char *)seed_hex, strlen(seed_hex)) == 0
+                && group_accept_rotation(&((process_t *)proc)->protocol.group,
+                                         &theirs))
+                log_info(proc->logger,
+                         "Identity: adopted rotated group key, epoch %lld\n",
+                         (long long)proc->protocol.group.key_epoch);
+        }
+    }
 
     bool adopt = false;
     if (same_group)
@@ -3505,6 +3820,59 @@ static void _verify_operator_key(const process_t *proc,
  *
  * Caller must already have neutralized pub->operator_bound and moved the claimed
  * guardian key aside; this function sets the authoritative operator_bound. */
+
+/* Hand the ZTA gate's verdict to the reputation process (ISSUES.md §10.5).
+ *
+ * Nothing is sent when the gate did not run -- a disabled policy, or one that
+ * does not require verification at admission, never reaches this call at all.
+ * That silence is deliberate and load-bearing: reputation must not be told a
+ * peer is `proved` merely because nobody checked, and an unbounded peer is
+ * exactly what a deployment that has not enabled ZTA has already chosen.
+ *
+ * Mirrors Python IdentityProcess._publish_zta_decision, including the
+ * failure posture: a propagation error is logged, never raised, because losing
+ * a ceiling must not take admission down -- but it IS logged at WARNING, since
+ * the failure case is precisely a peer that goes on to score unbounded with
+ * nothing saying why.
+ */
+/* Frama-C: skipped — [solver-timeout] logging/network preconditions */
+static void _publish_zta_standing(const process_t *proc,
+                                  const zta_policy_t *policy,
+                                  const public_identity_t *peer,
+                                  zta_gate_t decision)
+{
+    if (peer == NULL || policy == NULL)
+        return;
+    generic_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = ZTA_STANDING;
+    msg.size = sizeof(zta_standing_msg_t);
+    memcpy(msg.info.zta_standing.peer_uuid, peer->uuid, sizeof(uuid_t));
+    if (decision == ZTA_GATE_ADMIT_CAPPED) {
+        msg.info.zta_standing.standing = (int32_t)ZTA_STANDING_CAPPED;
+        msg.info.zta_standing.ceiling = policy->ddil_fallback_reputation_cap;
+        at_strlcpy(msg.info.zta_standing.reason,
+                   "admitted unproved (DDIL fallback or unbound credential)",
+                   sizeof(msg.info.zta_standing.reason));
+    } else {
+        /* Proved: a credential verified against a configured anchor AND is
+         * bound to this identity. The only path that anchors the §10.5
+         * unwind -- everything earned after this moment is standing a later
+         * failure calls into question. */
+        msg.info.zta_standing.standing = (int32_t)ZTA_STANDING_PROVED;
+        msg.info.zta_standing.ceiling = ZTA_NO_CEILING;
+        at_strlcpy(msg.info.zta_standing.reason, "verified at admission",
+                   sizeof(msg.info.zta_standing.reason));
+    }
+    if (messaging_send("reputation", ZTA_STANDING, &msg, false) != 0) {
+        char uuid_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(peer->uuid, uuid_str);
+        log_warn(proc->logger,
+                 "Identity: could not propagate ZTA standing for %s "
+                 "(ceiling %.2f)\n", uuid_str, msg.info.zta_standing.ceiling);
+    }
+}
+
 static zta_gate_t _zta_admit(const process_t *proc, const zta_policy_t *policy,
                              public_identity_t *pub,
                              const uint8_t claimed_key[crypto_sign_PUBLICKEYBYTES])
@@ -3780,7 +4148,8 @@ done:
 }
 #endif
 
-static int _build_announcement(const process_t *proc, generic_msg_t *buf)
+static int _build_announcement_for(const process_t *proc, generic_msg_t *buf,
+                                  const char *target_group)
 {
     memset(buf, 0, sizeof(generic_msg_t));
     buf->type = NET_MESSAGE;
@@ -3842,6 +4211,18 @@ static int _build_announcement(const process_t *proc, generic_msg_t *buf)
          * _broadcast_request_access appending _operator_attestation(). */
         json_array_append_new(payload,
                               _operator_attestation_json(&buf->info.net_msg.from_whom));
+        /* Slot 3 (optional): the cohort we are asking to join (ISSUES.md 10.2,
+         * runtime cross-group join). Absent -- the ordinary case -- this is the
+         * open request for a primary group and the payload is exactly what it
+         * always was, so a peer on an older build reads it unchanged; the same
+         * arity tolerance slot 2 already relies on.
+         *
+         * It is a HINT for routing, not authority: every recipient checks it
+         * against its OWN group, and a request naming somebody else's cohort is
+         * simply not theirs to answer. Nothing here grants anything. Mirrors
+         * Python _broadcast_request_access's target_group. */
+        if (target_group != NULL && target_group[0] != '\0')
+            json_array_append_new(payload, json_string(target_group));
         net_msg_pack_json(&buf->info.net_msg, payload);
         json_decref(payload);
     }
@@ -3851,20 +4232,29 @@ static int _build_announcement(const process_t *proc, generic_msg_t *buf)
     return 0;
 }
 
+/* Ordinary, untargeted announcement: no cohort named, so the payload keeps its
+ * historical 3-element shape. */
+/* Frama-C: skipped - delegates to _build_announcement_for. */
+static int _build_announcement(const process_t *proc, generic_msg_t *buf)
+{
+    return _build_announcement_for(proc, buf, NULL);
+}
+
 /* Parity wrapper for Python's `_broadcast_request_access`
  * (idprocess.py:219-227). Builds and emits the request_access envelope
  * on the open channel — used both by the Phase 1→2 initial announce
  * AND by the group-merge recovery path in `_merge_to_mesh` to
  * re-broadcast without a phase change. */
 /* Frama-C: skipped — [solver-timeout] logging/snprintf/json preconditions */
-static int _announce_identity(const process_t *proc, directory_t *queues)
+static int _announce_identity_for(const process_t *proc, directory_t *queues,
+                                 const char *target_group)
 {
     data_t net = STRING_DATA("network");
     if (!array_contains(queues, &net))
         return EXCEPTION(EID_NOQ);
 
     generic_msg_t buf = {0};
-    _build_announcement(proc, &buf);
+    _build_announcement_for(proc, &buf, target_group);
 
     /* Retry until network process IPC socket is ready */
     int ret = -1;
@@ -3885,6 +4275,12 @@ static int _announce_identity(const process_t *proc, directory_t *queues)
 
     log_info(proc->logger, "Identity: announced self to network\n");
     return 0;
+}
+
+/* Frama-C: skipped - delegates to _announce_identity_for. */
+static int _announce_identity(const process_t *proc, directory_t *queues)
+{
+    return _announce_identity_for(proc, queues, NULL);
 }
 
 /****************************
@@ -6065,6 +6461,72 @@ int identity_aggregate_subtree_roster(const char *top_uuid,
     json_decref(seen);
     json_decref(q);
     return 0;
+}
+
+/* Ask a cohort we are NOT in to admit us, so a gateway can acquire a child
+ * cohort at runtime instead of from a seeded key file (ISSUES.md 10.2).
+ *
+ * The COHORT decides (user's call, 2026-08-13): this sends the ordinary
+ * request_access, its members run the ordinary welcoming-committee vote, and an
+ * admitting member delivers the group over the ordinary full_history.
+ * Membership authority stays where it belongs, and no node can talk its way
+ * into a cohort past a quorum that does not want it.
+ *
+ * What is recorded here is only that WE solicited it. Without that, the
+ * arriving group would meet handle_group_update's different-uuid branch, which
+ * treats a second group as a partition to CONVERGE and would replace our
+ * primary group with the cohort we just joined — exactly backwards for a
+ * gateway. See id_state.pending_joins. Mirrors Python request_cohort_join. */
+/* Frama-C: skipped — [solver-timeout] map/messaging preconditions */
+int identity_request_cohort_join(process_t *proc, directory_t *queues,
+                                 const char *group_uuid)
+{
+    if (proc == NULL || queues == NULL || group_uuid == NULL
+        || group_uuid[0] == '\0')
+        return -1;
+    _ensure_id_init();
+
+    char own[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(proc->protocol.group.uuid, own);
+    if (strcmp(group_uuid, own) == 0)
+        return -1;   /* already our primary group */
+    if (proc->protocol.child_groups != NULL) {
+        data_t *existing = NULL;
+        if (map_get(proc->protocol.child_groups, (map_key_t)group_uuid,
+                    &existing) == 0 && existing != NULL)
+            return -1;   /* already gatewaying it */
+    }
+
+    pthread_mutex_lock(&id_state.lock);
+    map_set(&id_state.pending_joins, (map_key_t)group_uuid,
+            string_data((string_t)group_uuid, strlen(group_uuid) + 1));
+    pthread_mutex_unlock(&id_state.lock);
+
+    int rc = _announce_identity_for(proc, queues, group_uuid);
+    if (rc != 0) {
+        pthread_mutex_lock(&id_state.lock);
+        map_remove(&id_state.pending_joins, (map_key_t)group_uuid);
+        pthread_mutex_unlock(&id_state.lock);
+        return rc;
+    }
+    log_info(proc->logger, "Identity: requested membership in cohort %s\n",
+             group_uuid);
+    return 0;
+}
+
+/* Whether we are still waiting to be admitted to @p group_uuid. Assertion
+ * surface for the conformance/unit tests, which cannot see id_state. */
+bool identity_join_pending(const char *group_uuid)
+{
+    if (group_uuid == NULL || group_uuid[0] == '\0')
+        return false;
+    _ensure_id_init();
+    pthread_mutex_lock(&id_state.lock);
+    data_t *dat = NULL;
+    bool found = (map_get(&id_state.pending_joins, (map_key_t)group_uuid,
+                          &dat) == 0 && dat != NULL);
+    pthread_mutex_unlock(&id_state.lock);
+    return found;
 }
 
 /* Seed a child cohort this node gateways (the C twin of Python's child_groups

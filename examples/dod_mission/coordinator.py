@@ -53,6 +53,7 @@ from autonomous_trust.core.system import now, queue_cadence
 from autonomous_trust.inspector.transitive_trust import (
     TransitiveTrustMixin, PEER_PAIR_QUERY_SEC)
 from autonomous_trust.evaluation.scenarios.recording import EventRecorder
+from autonomous_trust.core import LOG_FORMAT, LOG_DATEFMT
 
 def _roster_name_of(peer):
     """Bare roster name for a peer == the local-part of its ONLINE nickname.
@@ -1776,7 +1777,7 @@ def main():
     logging.basicConfig(
         level=logging.INFO,
         stream=sys.stderr,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format=LOG_FORMAT, datefmt=LOG_DATEFMT,
     )
 
     setup_mode = "--setup" in sys.argv

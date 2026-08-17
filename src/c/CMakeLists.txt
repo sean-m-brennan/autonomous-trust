@@ -1510,6 +1510,16 @@ set_source_files_properties(test/zta_binding_test.c PROPERTIES COMPILE_FLAGS "-W
 target_link_libraries(zta_binding_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME zta_binding_test COMMAND $<TARGET_FILE:zta_binding_test>)
 
+# ISSUES.md §10.5. Guarded by AT_ZTA (unlike zta_binding_test, which builds
+# either way): this one drives zta_standing_msg_t, which only exists when ZTA
+# is compiled in.
+if(AT_ZTA)
+    add_executable(zta_standing_test test/zta_standing_test.c)
+    set_source_files_properties(test/zta_standing_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(zta_standing_test PRIVATE ${AT_TEST_LIBS} m)
+    add_test(NAME zta_standing_test COMMAND $<TARGET_FILE:zta_standing_test>)
+endif()
+
 add_executable(app_node_test test/app_node_test.c)
 set_source_files_properties(test/app_node_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(app_node_test PRIVATE ${AT_TEST_LIBS})

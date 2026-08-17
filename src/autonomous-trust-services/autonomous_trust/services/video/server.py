@@ -51,20 +51,58 @@ class VideoSource(object):
             path = os.path.join(vid_dir, path)
         self.paths = sorted(glob.glob(path))
         self.path_index = 0
+        # How many frames this source has YIELDED, which is what `speed`
+        # decimates on. Distinct from `at_position`, the place in the clip a
+        # caller asks for: the two used to be the same field, so a seek moved
+        # the decimation phase and a fractional seek suppressed every frame
+        # thereafter (`position % speed` was never 0) with no error path.
         self.frame_position = 0
+        # The last `at_position` actually applied, so a caller repeating a
+        # position does not re-seek to it and replay the same frame forever.
+        self._seek_target = None
         self.vid_cap: Optional[cv2.VideoCapture] = None
+
+    def _seek(self, at_position) -> None:
+        """Position the open capture at `at_position`, in this source's metric.
+
+        Wrapped into the clip's own length, because a caller tracking a clock
+        (`VideoSimSource.run` passes seconds since the demo started) runs past
+        the end of a short clip almost immediately, and seeking beyond the end
+        yields a failed read rather than a frame. Wrapping keeps the class's
+        established looping behaviour while the position drives the rate.
+        Skipped when the container will not say how long it is -- a raw seek is
+        better than a wrong modulus.
+        """
+        total = self.vid_cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        src_fps = self.vid_cap.get(cv2.CAP_PROP_FPS)
+        if self.position_metric == VideoPosition.SECONDS:
+            duration = (total / src_fps) if total > 0 and src_fps > 0 else 0
+            if duration > 0:
+                at_position = at_position % duration
+            self.vid_cap.set(cv2.CAP_PROP_POS_MSEC, int(at_position * 1000))
+        else:
+            if total > 0:
+                at_position = at_position % total
+            self.vid_cap.set(cv2.CAP_PROP_POS_FRAMES, int(at_position))
 
     def next(self, at_position: int = 0, post_proc: Callable[[np.ndarray], np.ndarray] = lambda x: x) -> tuple[bool, int, Optional[np.ndarray]]:
         if self.vid_cap is None:
             path = self.paths[self.path_index]
             self.vid_cap = cv2.VideoCapture(path)
             self.frame_position = 0
-            if at_position > self.frame_position:
-                self.frame_position = at_position
-                if self.position_metric == VideoPosition.SECONDS:
-                    self.vid_cap.set(cv2.CAP_PROP_POS_MSEC, int(at_position * 1000))
-                else:
-                    self.vid_cap.set(cv2.CAP_PROP_POS_FRAMES, at_position)
+            self._seek_target = None
+        # Seek on EVERY call that names a new position, not only when the
+        # capture was just opened. The seek used to live inside the branch
+        # above, so a caller passing `at_position` per tick to track a clock --
+        # which is exactly what `VideoSimSource.run` does -- got plain
+        # sequential playback: one frame per call however much time had passed,
+        # and no resync after a pause. An unchanged position is NOT re-applied,
+        # or a caller polling faster than its clock advances would replay one
+        # frame; that is what leaves a caller passing no position (the
+        # `VideoProcess.acquire` path) playing straight through.
+        if at_position and at_position != self._seek_target:
+            self._seek(at_position)
+            self._seek_target = at_position
         frame_count = int(self.vid_cap.get(cv2.CAP_PROP_FPS) / self.fps)  # skip frames if fps is too small
         if frame_count < 1:
             frame_count = 1
@@ -97,6 +135,11 @@ class VideoSource(object):
             self.vid_cap.release()
         self.vid_cap = None
         self.frame_position = 0
+        # A position applied to a released capture means nothing, so it must
+        # not suppress the next seek as "unchanged". The reopen branch of
+        # `next()` is what actually enforces that -- this keeps the closed
+        # object self-consistent, and mirrors `frame_position` above.
+        self._seek_target = None
 
 
 class VideoProcess(DataProcess, metaclass=ProcMeta,
