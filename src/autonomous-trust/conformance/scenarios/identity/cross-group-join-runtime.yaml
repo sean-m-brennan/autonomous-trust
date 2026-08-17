@@ -1,0 +1,122 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: cross-group-join-runtime
+byte_pinning: false
+description: |
+    Runtime cross-group join — the last open piece of identity protocol
+    step 7 (ISSUES.md §10.2).
+
+    A gateway used to acquire a child cohort only from a seeded key file on
+    disk (`group_child_*.cfg.json`). That is fine for a fixed deployment and
+    useless for one where a cohort forms after the gateway is already running.
+    This is the runtime path, and the three design calls it encodes (user's,
+    2026-08-13) are what the scenario pins:
+
+      * **the cohort decides.** A join is the ORDINARY admission: `gw` sends
+        the ordinary `request_access`, the cohort's members run the ordinary
+        welcoming-committee vote, and an admitting member delivers the cohort
+        over the ordinary `full_history`. There is no private side channel by
+        which a node talks its way past a quorum that does not want it. That is
+        why the wire steps below are the same ones `new-node-admission` pins.
+      * **who may even ask is bounded.** Before the vote, the cohort checks the
+        requester proves a ZTA anchor it shares (inert here — no policy is
+        enforcing) and OUT-RANKS it. A cohort is joined from ABOVE, by the node
+        that will gateway it; a peer at or below the cohort's rank asking to
+        join is not forming a hierarchy, and admitting it would let any
+        anchored peer collect cohort keys sideways. Hence `ranks` — gw at 5,
+        bg at 1. This gate bounds who may solicit; it does not decide.
+      * **the key rotates on admission**, so cohort ciphertext recorded before
+        gw joined stays closed to it. Asserted as bg's `group_key_epoch`;
+        rotation itself is pinned by `group-key-rotates-on-admission`.
+
+    The load-bearing assertion is the one that looks least dramatic:
+    `gw.group_uuid` is UNCHANGED. A second group arriving at a node normally
+    means a PARTITION, and `handle_group_update`'s different-uuid branch exists
+    to converge those — it would have replaced gw's primary group with the
+    cohort gw just joined, which is exactly backwards for a gateway. The
+    arriving cohort is therefore routed to `child_groups` instead, and only
+    when gw actually solicited that specific uuid. Without the solicited-set
+    gate, any peer could hand an unsolicited `full_history` to any node and
+    silently install itself in that node's tree.
+
+    Topology: two participants in DIFFERENT groups on the same broadcast
+    domain (`fixtures.groups`), which is what makes this cross-group rather
+    than an ordinary admission. `trigger_cohort_join` is a pseudo-function on
+    both adapters — but unlike the other pseudo-functions it EMITS, because the
+    point is that a join is ordinary wire traffic.
+
+participants:
+  - id: gw
+    role: border_guard
+  - id: bg
+    role: border_guard
+
+fixtures:
+  groups:
+    gw:
+      uuid: "c0000000-0000-4000-8000-00000000000a"
+      size: 1
+    bg:
+      uuid: "c0000000-0000-4000-8000-00000000000b"
+      size: 1
+  # The rank gate. gw must exceed bg or the cohort refuses the solicitation
+  # before any vote — see cross-group-join-rank-refused, which pins that half.
+  ranks:
+    gw: 5
+    bg: 1
+
+steps:
+  - id: 1
+    from: gw
+    to: gw
+    function: trigger_cohort_join
+    payload:
+      group_uuid: "c0000000-0000-4000-8000-00000000000b"
+    description: |
+        gw solicits membership in bg's cohort. It records that it asked (the
+        solicited set) and broadcasts request_access naming that cohort in
+        payload slot 3.
+
+  - id: 2
+    from: gw
+    to: broadcast
+    function: request_access
+    in_response_to: 1
+    payload:
+      # Restates the cohort gw named in slot 3. Python re-delivers the captured
+      # message and ignores this; the C engine rebuilds a propagated message
+      # from the step, so without it the solicitation would arrive stripped of
+      # its target and be read as an ordinary open request.
+      group_uuid: "c0000000-0000-4000-8000-00000000000b"
+    description: |
+        The solicitation on the wire. Delivered to bg, whose group uuid matches
+        the named target, so bg answers for it: rank gate, then the ordinary
+        welcoming-committee cascade.
+
+  - id: 3
+    from: bg
+    to: gw
+    function: full_history
+    in_response_to: 2
+    description: |
+        bg admits gw and hands over the cohort — rotated key included, since
+        the rotation happens before the history is built. Delivered to gw,
+        which matches the uuid against what it solicited and adopts it as a
+        CHILD group.
+
+expected_state:
+  gw:
+    # The whole point: gw's own group is what it always was. A gateway that
+    # swapped its primary group for the cohort it just joined would have
+    # inverted the hierarchy it was trying to build.
+    group_uuid: "c0000000-0000-4000-8000-00000000000a"
+    # ...and the joined cohort landed where a gatewayed cohort belongs.
+    child_group_count: 1
+    # gw admitted nobody, so gw rotated nothing.
+    group_key_epoch: 0
+  bg:
+    # bg admitted gw, so bg rotated: the ciphertext bg's cohort exchanged
+    # before this moment is not readable with the key gw now holds.
+    group_key_epoch: 1
+    peer_count: 1

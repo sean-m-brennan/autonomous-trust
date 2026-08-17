@@ -1,152 +1,170 @@
-# The operator-attended signal: which nodes have a human behind them
+*Previous: [Standing turned into capability](trust-tiers.md)*
 
-> Status: Implemented. Durable half (`operator_bound`) shipped in `3effa38`.
-> Attended-now half (`operator_attested_at`, consumer-pull) completes it: the
-> live IPC gap and the peer-refresh gap described below are closed, in Python
-> and C, pinned by three cross-language conformance scenarios.
->
-> A **third** signal, `operator_pubkey`, names *which* human: opt-in, off by
-> default, and described in "The guardian identity" below.
+# The human behind the machine
 
-## Context
+Everything so far has been about machines judging machines. This chapter is
+about the one question a machine cannot answer about itself, which is whether a
+person stands behind it, and if so, whether that person is there now.
 
-[ethne](../../../ethne/doc/design.md), the polity tier above AutonomousTrust, needs a **guardian
-edge** per machine member (design item D8): which nodes have a human answerable for them. A polity
-that cannot tell an attended workstation from an unattended drone cannot place responsibility
-anywhere.
+The question matters because responsibility has to land somewhere. A network of
+autonomous nodes that misbehaves has misbehaved on somebody's account, and a
+polity that cannot tell an attended workstation from an unattended drone cannot
+place responsibility anywhere at all. The tier above AutonomousTrust needs a
+guardian edge for every machine member, meaning a named human answerable for it,
+and that edge has to be fed by something the machines can actually observe.
 
-AT answers with two distinct signals, both carried per node and per peer:
+AutonomousTrust supplies two signals, and keeping them apart is the whole
+design.
 
 | Signal | Question | Lifetime |
 |---|---|---|
-| `operator_bound` | Does this node have a human guardian at all? | **Durable**, set once at operator activation, persisted with the identity |
-| `operator_attested_at` | Is a human at its console **right now**? | **Live**, an epoch stamp, meaningless the moment it ages |
+| `operator_bound` | Does this node have a human guardian at all? | Durable, set once at operator activation, persisted with the identity |
+| `operator_attested_at` | Is a human at its console right now? | Live, an epoch stamp, meaningless the moment it ages |
 
-The two answer different questions and fail differently. A node can be `operator_bound` with nobody
-at the keyboard for a week; that is a normal state, not an error. What the guardian edge must never
-do is read the first as if it were the second.
+They answer different questions and they fail differently. A node can be bound
+to a guardian with nobody at the keyboard for a week, and that is a normal state
+rather than an error. What a guardian edge must never do is read the first as if
+it were the second. One is a fact about the node, the other a fact about the
+minute, and conflating them puts responsibility in the wrong place.
 
-Neither signal is taken on a peer's word. Both are derived by the receiver from verifying the
-operator's actual credential against a **distinct operator trust anchor**, see
-[operator-access.md](operator-access.md) for the credential itself (PIV/CAC + MFA) and
-[zta-python-parity.md](zta-python-parity.md) for the verification chain. A node that simply asserts
-`operator_bound: true` and cannot produce a credential that chains to the operator anchor is
-recorded as `false`; that neutralization is pinned by the `operator-bound-lying-rejected`
-conformance scenario.
+Neither signal is taken on the word of a peer. Both are derived by the receiver
+from verifying the actual credential of the operator against a distinct operator
+trust anchor. A node that simply asserts it is operator-bound and cannot produce
+a credential chaining to that anchor is recorded as false, and the
+neutralization is pinned by its own conformance scenario.
 
-## The problem this design solves
+## Two structural failures the live half had
 
-The durable half worked from the start. The live half did not, for two structural reasons, neither
-of which showed up in unit tests.
+The durable signal worked from the start. The live one did not, for two reasons
+that were structural rather than accidental, and neither showed up in unit
+tests.
 
-**1. The stamp was always zero on a real node.** Attendance is derived from a live
-`OperatorSession`, which the console app builds in its own process. But `IdentityProcess` (the
-process that assembles every outgoing attestation) runs in a *separate* `multiprocessing`
-subprocess and cannot see that object. `set_operator_session()` existed, but on a real
-multiprocess node nothing could ever call it with the real session. `operator_attested_at` was
-structurally pinned at 0, forever. Worse, a reader could not distinguish that from an honest "no
-one is attending".
+*The stamp was always zero on a real node.* Attendance is derived from a live
+operator session, which the console application builds in its own process. The
+identity process, which assembles every outgoing attestation, runs in a separate
+subprocess and cannot see that object. A setter existed, and on a real
+multiprocess node nothing could ever call it with the real session, so the stamp
+was structurally pinned at zero forever. Worse, a reader could not distinguish
+that from an honest report that nobody was attending.
 
-**2. Nothing ever refreshed a peer's stamp.** An attestation crossed to a peer exactly once, inside
-the `request_access` / `peer_accepted` admission payload. After admission it was never updated. A
-consumer reading a peer's `operator_attested_at` was reading *history* (the moment that peer
-joined) and mistaking it for attendance.
+*Nothing ever refreshed the stamp of a peer.* An attestation crossed to a peer
+exactly once, inside the admission payload, and after admission it was never
+updated. A consumer reading the attendance stamp of a peer was reading history,
+being the moment that peer joined, and mistaking it for attendance.
 
-The fix for (1) turned out to be cheap because of a structural accident: the node's main loop runs
-in a **daemon thread of the console app's process** (`bridge.py` → `run_forever`). The main loop
-therefore *already shares an address space with the live session*. The only missing hop was
-main-loop → identity-subprocess, and that hop had an established pattern: local-only IPC verbs
-(`tier_update`, `partition_signal`) that never reach the wire.
+The first fix turned out to be cheap because of a structural accident. The main
+loop of a node runs in a daemon thread of the console application process, so it
+already shares an address space with the live session. The only missing hop was
+from the main loop to the identity subprocess, and that hop had an established
+pattern in the local-only messages that never reach the wire.
 
-## Key decisions
+## Five decisions
 
-**Consumer-pull, not keepalive.** Freshness is established when someone asks, not by re-announcing
-on a cadence. A periodic re-announce was considered and rejected: it puts constant attestation
-traffic on an idle network to answer a question nobody asked, and it *still* serves a stamp that is
-up to one interval stale. Pull inverts that: an idle network carries no attestation traffic at
-all, and staleness is bounded by a round trip taken at the moment of asking.
+Firstly, *consumer-pull rather than keepalive*. Freshness is established when
+somebody asks, not by re-announcing on a cadence. A periodic re-announce was
+considered and rejected, because it puts constant attestation traffic on an idle
+network to answer a question nobody asked, and it still serves a stamp that is
+up to one interval stale. Pull inverts that. An idle network carries no
+attestation traffic at all, and staleness is bounded by a round trip taken at
+the moment of asking.
 
-**No cached session mirror.** The identity process stores no copy of the session state. It could
-have (that would make answering a pull instant) but a cached mirror is precisely a thing that can
-be stale, and this signal exists to not be stale. The cost is a local round trip per pull and a
-pending-pull state machine; the benefit is that there is no stale state to serve.
+Second, *no cached session mirror*. The identity process stores no copy of the
+session state. It could, and that would make answering a pull instant, and a
+cached mirror is precisely a thing that can be stale, which is what this signal
+exists not to be. The cost is a local round trip per pull and a pending-pull
+state machine. The benefit is that there is no stale state to serve.
 
-**The nonce is load-bearing.** Each pull mints a nonce; the answer echoes it; the requestor retires
-it on receipt. Without it, a signed attestation could be captured once and re-presented forever,
-which would make "attended now" mean "attended at some point": the exact failure the signal
-exists to prevent. An answer is good exactly once.
+Third, *the nonce is load-bearing*. Each pull mints a nonce, the answer echoes
+it, and the requestor retires it on receipt. Without that, a signed attestation
+could be captured once and re-presented forever, which would make attended-now
+mean attended-at-some-point, being the exact failure the signal exists to
+prevent. An answer is good exactly once.
 
-**Verification lives with the verifier.** The pull is issued and checked by `IdentityProcess`, not
-by the main loop, because an attestation is worth nothing until its credential is re-verified
-against the operator anchor, and that anchor lives in the identity process beside the admission
-gate. The process that *can* verify is the process that asks. The main loop keeps only the
-consumer-facing API and the answer table.
+Fourth, *verification lives with the verifier*. The pull is issued and checked
+by the identity process rather than by the main loop, because an attestation is
+worth nothing until its credential is re-verified against the operator anchor,
+and that anchor lives in the identity process beside the admission gate. The
+process that can verify is the process that asks. The main loop keeps only the
+consumer-facing interface and the answer table.
 
-**Silence resolves to an answer.** Every pull, in both directions, has a deadline. A node whose
-console never replies, or a peer that has gone quiet, resolves to *not attended* rather than
-hanging. For a guardian edge, "cannot confirm a human is present" and "no human is present" are the
-same operational answer; an unbounded wait is the only genuinely useless outcome.
+Lastly, *silence resolves to an answer*. Every pull, in both directions, has a
+deadline. A node whose console never replies, or a peer that has gone quiet,
+resolves to not attended rather than hanging. For a guardian edge, being unable
+to confirm that a human is present and knowing that no human is present are the
+same operational answer, and an unbounded wait is the only genuinely useless
+outcome.
 
-## The guardian identity (`operator_pubkey`): opt-in
+## Naming which human, by choice
 
-The two signals above answer *whether* a human stands behind a node and *when* one was last there.
-Neither says **which** human, and for a long time nothing did: the operator credential is a PIV/CAC
-X.509, which holds no ed25519 key that could become a `did:key`. That mattered more than a missing
-field usually would, because ethne's chartered node→guardian edge (**D15**) requires a guardian to
-*co-sign*: a guardian who cannot sign is unusable, so a chartered rule was running with no live
-source at all.
+The two signals above answer whether a human stands behind a node and when one
+was last there. Neither says which human, and for a long time nothing did, since
+the operator credential is an X.509 certificate holding no key of the kind an
+identity would need. That mattered more than a missing field usually would,
+because the chartered node-to-guardian edge one tier up requires a guardian to
+co-sign, and a guardian who cannot sign is unusable, so a chartered rule was
+running with no live source at all.
 
-A node may now advertise `operator_pubkey`, the guardian's ed25519 public key, together with
-`operator_key_binding`, a signature by that operator's PIV private key over
+A node may now advertise a guardian public key together with a binding, being a
+signature by the private key of that operator over
 
     "at-operator-binding-v1" || uuid (16) || node signing key (32) || operator key (32)
 
-verified at admission against the credential's own public key: the same credential the gate has
-already classified operator-class against the distinct operator anchor. Both halves are required
-and neither substitutes for the other: **a chain without a binding names no human, and a binding
-whose credential is not operator-class is a human with no standing to name one.**
+verified at admission against the public key of the credential itself, which is
+the same credential the gate has already classified as operator-class against
+the distinct operator anchor. Both halves are required and neither substitutes
+for the other. A chain without a binding names no human, and a binding whose
+credential is not operator-class is a human with no standing to name one.
 
-**Opting out is free, and that is a rule, not a default.** AT never requires a guardian identity. A
-node that declines is admitted identically, keeps `operator_bound` and its attendance stamp, and
-serializes byte-for-byte as it did before this field existed: both fields are emitted only when
-non-default, so a declining node puts nothing on the wire. A consumer that *requires* a guardian is
-applying its own rule; that is ethne's business, and there absence means "unguarded machine", never
-an error.
+*Opting out is free, and that is a rule rather than a default.* The framework
+never requires a guardian identity. A node that declines is admitted
+identically, keeps its bound flag and its attendance stamp, and serializes byte
+for byte as it did before the field existed, since both fields are emitted only
+when non-default and a declining node puts nothing on the wire. A consumer that
+requires a guardian is applying a rule of its own, which is the business of the
+tier above, and there an absence means an unguarded machine rather than an
+error.
 
-The reason to protect that is specific. **One key per operator, stable across every node that human
-guards**: per-node keys would let one person present as N guardians, which is ethne D24's chorus
-moved down a layer. But a stable key is a persistent pseudonym: anyone watching two cohorts can link
-an operator's nodes to each other. That is a real cost, paid by a real person, so it is theirs to
-choose. Off by default is the mitigation, and the CLI is where the choice is made
-(`--bind-operator-key` on activation) rather than the TUI's recurring unlock screen: a decision
-that de-anonymizes a whole fleet does not belong on a daily login prompt.
+The reason to protect that is specific. There is one key per operator, stable
+across every node that human guards, because per-node keys would let one person
+present as several guardians, which is the sockpuppet problem moved down a
+layer. Although stability is what makes the count meaningful, a stable key is
+also a persistent pseudonym, so anyone watching two cohorts can link the nodes
+of an operator to each other. That is a real cost paid by a real person, so it
+is theirs to choose. Off by default is the mitigation, and the choice is made on
+the command line at activation rather than on the recurring unlock screen,
+because a decision that de-anonymizes a whole fleet does not belong on a daily
+login prompt.
 
-The pre-image names the node deliberately. Without the uuid and signing key inside the signed
-bytes, a `(key, binding)` pair lifted from another node's clear-text announce would let any node
-claim that human, and a count of guardians would mean nothing. This also gives ISSUES.md §1.5 a
-narrow, honest answer for opted-in operator nodes, and none at all for anyone else.
+The pre-image names the node deliberately. Without the identifier and the
+signing key inside the signed bytes, a key and binding pair lifted from the
+clear-text announcement of another node would let any node claim that human, and
+a count of guardians would mean nothing. The bytes therefore bind a key, a node,
+and a human together, and none of the three travels alone.
 
-**What a bad binding costs.** Absent: no guardian key, nothing else changes. Present but invalid
-(forged, naming another node, wrong length), the key is refused and the peer is stored without one.
-`operator_bound` is **not** demoted: it was earned independently from the anchor, and node key
-rotation legitimately stales a binding, so demotion would turn an honest re-keying into a lost
-credential. Losing a guardian edge is the failure mode; losing admission is not.
+*What a bad binding costs.* When absent, there is no guardian key and nothing
+else changes. When present but invalid, whether forged, naming another node, or
+of the wrong length, the key is refused and the peer is stored without one. The
+bound flag is not demoted, because it was earned independently from the anchor,
+and node key rotation legitimately stales a binding, so demotion would turn an
+honest re-keying into a lost credential. Losing a guardian edge is the failure
+mode here; losing admission is not.
 
-Two limits worth stating. The operator's ed25519 key is software-held, so a stolen keystore
-impersonates that human on every node they guard: hardware-held ed25519 is the successor. And
-distinct guardian keys are still not distinct humans; ethne must not count them as such without an
-independence attestation (its D24 finding), which is not built here.
+Two limits are worth stating. The guardian key is software-held, so a stolen
+keystore impersonates that human on every node they guard, and hardware-held
+keys are the successor. And distinct guardian keys are still not distinct
+humans, so the tier above must not count them as such without an independence
+attestation, which is not built here.
 
-## Protocol
+## The protocol
 
-Four verbs (`identity/protocol.py`), two on the wire and two local-only:
+Four verbs, two on the wire and two local only.
 
 | Verb | Scope | Payload |
 |---|---|---|
 | `attest_req` (`operator_attest_query`) | wire | `{nonce}` |
 | `attest_resp` (`operator_attest_response`) | wire | `{nonce, operator_attested_at, ...attestation}` |
-| `attest_trigger` (`operator_attest_trigger`) | local | `{target}`, consumer asks its own node to pull a peer |
-| `operator_state_req/resp` (`operator_state_query/response`) | local | `{}` / `{attended, epoch, have_session}` |
+| `attest_trigger` (`operator_attest_trigger`) | local | `{target}`, a consumer asking its own node to pull a peer |
+| `operator_state_req/resp` (`operator_state_query/response`) | local | `{}` and `{attended, epoch, have_session}` |
 
 A pull, end to end:
 
@@ -165,67 +183,68 @@ A pull, end to end:
                              peer_attestations ◀┘ record verdict
 ```
 
-`operator_attested_at` is **always present** in the answer, including as an explicit `0.0`. "Asked,
-and nobody is attending" is a real answer and must not be confusable with "declined to say".
+The stamp is always present in the answer, including as an explicit zero. Having
+asked and learned that nobody is attending is a real answer, and it must not be
+confusable with a refusal to say.
 
-### What the requestor checks
+*What the requestor checks.* Three independent checks, all of which must pass
+before a stamp is recorded. Firstly the nonce, which must be one this node
+minted and has not retired, killing replay. Second the credential, which must
+chain to the distinct operator anchor with its hash recomputed from the actual
+bytes, using the same gate admission uses, killing a node talking itself into
+operator class. Lastly the window, which requires the stamp to sit within one
+hundred twenty seconds of the local clock, killing a peer that mints permanent
+freshness by stamping far ahead.
 
-Three independent checks, all of which must pass before a stamp is recorded:
+Any failure records not-attended rather than raising. The second and third
+checks are independent, and the case that separates them matters: a peer that
+verifies and reports zero is genuinely operator-bound hardware with nobody at
+the console, and it is recorded exactly that way, bound and unattended.
 
-1. **Nonce**: one we minted and have not retired. Kills replay.
-2. **Credential**: chains to the distinct operator anchor, with its hash recomputed from the
-   actual bytes (`_is_operator_credential`, the same gate admission uses). Kills a node talking
-   itself into operator class.
-3. **Window**: the stamp sits within `_ATTEST_WINDOW_SEC` (120s) of our clock. Kills a peer minting
-   permanent freshness by stamping far ahead.
+## A deliberate asymmetry between the runtimes
 
-Any failure records *not attended* rather than raising. Note that (2) and (3) are independent: a
-peer that verifies but reports `0` is genuinely operator-bound hardware with nobody at the console,
-and is recorded exactly that way, `operator_bound: true`, `operator_attested_at: 0`.
+The C runtime has no operator session and no console application, since there is
+no hardware-credential path in C by design. So the Python side derives
+attendance by polling the live session through the local round trip to the main
+loop, and the C side answers from a single seam in one hop.
 
-## Python / C asymmetry (deliberate)
+The asymmetry is confined to where the attended state comes from. The verb
+shape, the payload, the always-present zero, the nonce state machine, and all
+three verification checks are identical. The single definition of attended on
+the Python side lives in one function shared by both the in-process seam and the
+main loop, so the two cannot drift.
 
-C has no `OperatorSession` and no console app: there is no PIV/MFA in C, by design. So:
+## Pinned scenarios
 
-- **Python** derives attendance by polling the live session, reached via the local
-  `operator_state_query` round trip to the main loop.
-- **C** answers from the `identity_set_operator_attended()` seam in one hop.
+Unit coverage runs to sixty-three cases on the Python side, covering the data
+model, the admission gate, the responder round trip, and the requestor
+verification including replay, imposter, and window edges, plus ten cases on the
+C side and the bridge wiring in the operator package.
 
-The asymmetry is confined to *where the attended state comes from*. The verb shape, the payload,
-the always-present zero, the nonce state machine, and all three verification checks are identical.
-The single definition of "attended" for Python lives in `operator/session.py::is_attended`, shared
-by both the in-process seam and the main loop so the two cannot drift.
-
-## Verification
-
-Unit tests: `tests/a_unit/test_operator_attestation.py` (63 cases, data model, admission gate,
-responder round trip, requestor verification incl. replay/imposter/window edges),
-`src/c/test/operator_attestation_test.c` (10 cases), and bridge wiring in
-`autonomous-trust-operator/tests/a_unit/test_operator_tui.py`.
-
-Cross-language conformance (`conformance/scenarios/identity/`):
+Cross-language conformance scenarios live under the identity protocol:
 
 | Scenario | Pins |
 |---|---|
-| `attest-pull-attended` | ACTIVE session ⇒ the pinned epoch |
-| `attest-pull-unattended` | LOCKED session ⇒ explicit `0.0` |
-| `attest-pull-replay-rejected` | re-presented answer refused; recorded stamp unchanged |
-| `operator-bound-verified` | operator credential ⇒ `operator_bound: true` |
-| `operator-bound-lying-rejected` | asserted claim on a non-operator credential ⇒ `false` |
-| `operator-key-bound-verified` | a binding signed by the presented credential ⇒ the guardian key is kept |
-| `operator-key-binding-forged-rejected` | same everything, signed by an unrelated key ⇒ refused, `operator_bound` still true |
-| `operator-key-bound-to-another-identity-rejected` | a perfect signature naming a *different* node ⇒ refused (ISSUES §1.5's harvested credential) |
-| `operator-key-absent-is-normal` | the opt-out: bound, attended, no guardian, no penalty |
+| `attest-pull-attended` | an active session yields the pinned epoch |
+| `attest-pull-unattended` | a locked session yields an explicit zero |
+| `attest-pull-replay-rejected` | a re-presented answer is refused, and the recorded stamp is unchanged |
+| `operator-bound-verified` | an operator credential yields a bound flag of true |
+| `operator-bound-lying-rejected` | an asserted claim on a non-operator credential yields false |
+| `operator-key-bound-verified` | a binding signed by the presented credential keeps the guardian key |
+| `operator-key-binding-forged-rejected` | the same everything signed by an unrelated key is refused, and the bound flag stays true |
+| `operator-key-bound-to-another-identity-rejected` | a perfect signature naming a different node is refused |
+| `operator-key-absent-is-normal` | the opt-out, being bound and attended with no guardian and no penalty |
 
-Those four bindings are **signed at scenario time** by both adapters from
-`testdata/zta/certs/operator_leaf.key`, not pinned as recorded blobs. That is deliberate: a pinned
-signature would hold the two implementations to one of them having saved its own output, whereas
-signing live holds them to the same pre-image and the same scheme. RSA PKCS#1 v1.5 over SHA-256 is
-deterministic, so they agree byte for byte or the scenario fails. The leaf's private key is
-committed for exactly this reason: it is a test anchor with standing nowhere.
+The four bindings are signed at scenario time by both adapters from a committed
+test key rather than pinned as recorded blobs. That is deliberate. A pinned
+signature would hold the two implementations to one of them having saved its own
+output, where signing live holds them to the same pre-image and the same scheme.
+The signature algorithm is deterministic, so they agree byte for byte or the
+scenario fails. The private key of the test leaf is committed for exactly this
+reason, being a test anchor with standing nowhere.
 
-The clock is **pinned** in these scenarios (`fixtures.operator_session.clock`), never wall-clock: a
-live stamp could not match across two runs, let alone two languages.
+The clock is pinned in these scenarios and never read from the wall, since a
+live stamp could not match across two runs, let alone across two languages.
 
 ## Consuming the signal
 
@@ -236,9 +255,24 @@ stamp = node.peer_attestations.get(str(peer.uuid), 0.0)
 attended_now = stamp > 0.0                         # already verified when it lands
 ```
 
-The pull is asynchronous: the answer arrives on `peer_attestations` when it arrives, or resolves to
-`0.0` at the deadline. A consumer should treat "not yet answered" and "answered zero" the same way,
-which the deadline guarantees it can, since every pull terminates.
+The pull is asynchronous. The answer arrives on the attestation table when it
+arrives, or resolves to zero at the deadline. A consumer should treat not yet
+answered and answered zero the same way, which the deadline guarantees it can,
+since every pull terminates.
 
-`ethne` reads this through its own node rather than talking to AT peers directly; the ethne-side
-adapter is out of scope here.
+The polity tier reads this through its own node rather than talking to peers
+directly, and the adapter on that side is the subject of a later chapter.
+
+## Further reading
+
+- [Operator access](operator-access.md): the credential itself, the session
+  lifecycle, and the request-only operator node.
+- [Zero Trust parity in Python](zta-python-parity.md): the verification chain the
+  operator anchor sits in.
+- [Which human answers for which machine](../../../ethne/doc/guardianship.md):
+  what the tier above does with these two signals, and why it treats an
+  unguarded machine as an honest state rather than a missing value.
+
+---
+
+*Next: [A worked scenario](../example-application.md)*
