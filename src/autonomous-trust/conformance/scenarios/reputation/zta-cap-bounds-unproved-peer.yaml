@@ -1,0 +1,74 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: zta-cap-bounds-unproved-peer
+byte_pinning: false
+description: |
+    A peer ZTA could not prove may not rise above its ceiling, and the bound
+    lands on the STORED score (ISSUES.md §10.5).
+
+    What this pins is a fix for something that was broken in both runtimes at
+    once, which is exactly the case a cross-language corpus exists to catch.
+    `ddil_fallback_reputation_cap` was in the policy, was serialized, and was
+    printed in the operator log as though it were being enforced -- "admitting
+    with reputation cap 0.50" -- while being read by nothing. The capped
+    admission decision was only ever compared against *reject*, so a peer
+    admitted on a deferred or unbound credential accrued reputation exactly like
+    a fully verified one, on both sides, with nothing to notice.
+
+    The ceiling is deliberately set BELOW what this scenario's scoring produces.
+    An assertion of "at most the cap" against a scenario that scores under it
+    anyway would pass whether or not the cap exists -- a control that cannot
+    fail. Pinning the exact clamped value is what makes the case bite.
+
+    The bound is asserted on the stored score rather than on the emitted
+    response for the same reason the runtimes apply it at write time: a ceiling
+    enforced only where a value is reported leaves the unbounded number in the
+    store, and the next consumer to read it -- persistence, the app-facing
+    carrier, a peer answering its own rep_req -- leaks what the cap withheld.
+
+    The standing is installed as a fixture rather than driven through an
+    admission step because the verdict is produced by the IDENTITY process,
+    while the thing it bounds lives here. What is pinned cross-language is what
+    reputation DOES with a standing; how identity arrives at one is pinned by
+    the zta-* identity scenarios.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: oracle
+  - id: rogue
+    role: subject
+
+fixtures:
+  # bob's prior view of rogue, high enough that the scoring path has something
+  # to bring forward.
+  reputations:
+    bob:
+      rogue: 0.9
+  # ...but ZTA never proved rogue's credential, so bob holds it under a ceiling.
+  zta_standing:
+    bob:
+      rogue:
+        status: capped
+        ceiling: 0.15
+        reason: DDIL fallback
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: request reputation
+    payload:
+      target: rogue
+      proc: negotiation
+    description: |
+        alice asks bob for rogue's reputation. bob scores it by the ordinary
+        algebra and then bounds the result by what ZTA actually proved, which
+        for rogue is nothing.
+
+expected_state:
+  bob:
+    reputation_of:
+      rogue: 0.15

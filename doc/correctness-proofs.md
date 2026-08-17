@@ -94,7 +94,7 @@ sequence (see category 5).
 Patterns like `peers_free` and `for (i=0; i<LEVELS; i++) map_free(&arr[i]);`
 cannot currently be verified. Three dead ends were tried on 2026-04-17.
 
-- **Loop invariants** (`\forall k; i <= k < LEVELS ==> arr[k].items != \null`
+- **Loop invariants** (`\forall k; i <= k < LEVELS ==> arr[k].items!= \null`
  + sliding `loop assigns arr[0..i-1]`): WP times out on
  `loop_invariant_*_preserved` because it cannot prove
  `\separated(&arr[i], &arr[k])` for `k > i` from typed memory alone, and
