@@ -19,6 +19,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from .. import rendered_log
+
 try:
     from autonomous_trust.services.peer import metadata as _metadata_mod
     from autonomous_trust.services.peer.metadata import (
@@ -428,4 +430,4 @@ class TestMetadataSourceProcess:
         queues = {src.name: my_q, CfgIds.network: q.Queue()}
         src.process(queues, MagicMock())
         src.logger.error.assert_called_once()
-        assert 'str' in src.logger.error.call_args[0][0]
+        assert 'str' in rendered_log(src.logger.error)

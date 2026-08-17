@@ -32,6 +32,8 @@ import errno
 import socket
 import struct
 import pytest
+
+from .. import rendered_log
 from unittest.mock import patch, MagicMock, call
 
 from autonomous_trust.core.network.udp import UDPNetworkProcess
@@ -441,7 +443,7 @@ class TestInitUdpPtp:
             with pytest.raises(OSError):
                 UDPNetworkProcess._init_udp_ptp(proc)
 
-        logged = proc.logger.error.call_args[0][0]
+        logged = rendered_log(proc.logger.error)
         assert 'already held' in logged
         assert 'AT_COMM_PORT' in logged
 

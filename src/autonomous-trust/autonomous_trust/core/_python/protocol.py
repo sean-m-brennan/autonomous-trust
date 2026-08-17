@@ -21,7 +21,7 @@ import icontract
 
 from .system import CfgIds, QueueType
 from .util import ClassEnumMeta
-from .identity import Group, ChildGroupSet, Peers
+from .identity import Group, ChildGroupSet, Peers, ZtaStanding
 from .network import Message
 from .capabilities import Capabilities, PeerCapabilities
 
@@ -38,6 +38,11 @@ class Protocol(object, metaclass=ClassEnumMeta):
         # Empty on leaf nodes; kept separate from self.group so the
         # primary/parent group slot is never clobbered.
         self.child_groups = {}
+        # peer-uuid-str -> ZtaStanding, propagated from IdentityProcess
+        # (ISSUES §10.5). This node's OWN findings about its peers, never
+        # anything a peer asserted about itself; reputation reads it to bound
+        # a peer whose credential ZTA has not actually proved.
+        self.zta_standing = {}
         if configurations is not None:
             if CfgIds.peers in configurations:
                 self.peers = configurations[CfgIds.peers]
@@ -59,6 +64,12 @@ class Protocol(object, metaclass=ClassEnumMeta):
             return True
         if isinstance(message, ChildGroupSet):
             self.child_groups = message.groups
+            return True
+        if isinstance(message, ZtaStanding):
+            # Last writer wins, deliberately: IdentityProcess is the single
+            # source of ZTA findings and sends these in the order it learns
+            # them, so the newest verdict is the current one (§10.5).
+            self.zta_standing[message.peer_uuid] = message
             return True
         if isinstance(message, Peers):
             self.peers = message

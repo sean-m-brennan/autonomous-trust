@@ -42,6 +42,7 @@ import logging
 import sys
 
 from autonomous_trust.core import LogLevel
+from autonomous_trust.core import LOG_FORMAT, LOG_DATEFMT
 
 
 _LOG_LEVEL_BY_NAME = {
@@ -148,7 +149,7 @@ def main(argv=None):
     logging.basicConfig(
         level=logging.INFO,
         stream=sys.stderr,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format=LOG_FORMAT, datefmt=LOG_DATEFMT,
     )
 
     args = _parse_args(argv if argv is not None else sys.argv[1:])

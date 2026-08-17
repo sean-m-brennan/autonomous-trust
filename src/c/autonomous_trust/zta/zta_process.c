@@ -22,6 +22,7 @@
 #include "processes/processes.h"
 #include "utilities/message.h"
 #include "utilities/msg_types.h"
+#include "utilities/util.h"
 #include "utilities/msg_types_priv.h"
 #include "config/configuration.h"
 
@@ -109,28 +110,62 @@ static struct {
  ****************************/
 
 /**
- * @brief Send a reputation penalty for a peer via TRANSACTION_SCORE message
+ * @brief Tell the reputation process what ZTA now knows about a peer.
+ *
+ * ISSUES.md §10.5. This replaces `_send_reputation_penalty`, which did
+ * nothing: it stamped a zero `task_uuid`, which the reputation process
+ * discards by design as the "system score" sentinel
+ * (`rep_proc.c::_handle_local_tx_score`), AND it sent `score = -penalty`,
+ * which `tx_score_in_range` has rejected since §11.2 fixed the scale at
+ * [0, 1] with no negatives. A revoked credential therefore produced two log
+ * lines and cost the peer nothing at all, in the fielded runtime, with no test
+ * covering it.
+ *
+ * A ZTA verdict is an authority finding about whether an identity is who it
+ * claims -- not the outcome of an interaction with it -- so it is carried as a
+ * standing (a bound, plus for a failure an unwind) rather than as a score that
+ * the reputation scale has no room to express.
  */
 /* Frama-C: skipped — [solver-timeout] logging/network preconditions */
-static void _send_reputation_penalty(process_t *proc, const uuid_t peer_uuid,
-                                     double penalty, logger_t *logger)
+static void _send_zta_standing(process_t *proc, const uuid_t peer_uuid,
+                               zta_standing_t standing, double ceiling,
+                               const char *reason, logger_t *logger)
 {
+    (void)proc;
     generic_msg_t msg;
     memset(&msg, 0, sizeof(msg));
-    msg.type = TRANSACTION_SCORE;
-    msg.size = sizeof(tx_score_msg_t);
+    msg.type = ZTA_STANDING;
+    msg.size = sizeof(zta_standing_msg_t);
+    memcpy(msg.info.zta_standing.peer_uuid, peer_uuid, sizeof(uuid_t));
+    msg.info.zta_standing.standing = (int32_t)standing;
+    msg.info.zta_standing.ceiling = ceiling;
+    at_strlcpy(msg.info.zta_standing.reason, reason ? reason : "",
+               sizeof(msg.info.zta_standing.reason));
 
-    /* Use a zero task UUID to indicate a system-generated score */
-    memset(msg.info.tx_score.task_uuid, 0, sizeof(uuid_t));
-    memcpy(msg.info.tx_score.peer_uuid, peer_uuid, sizeof(uuid_t));
-    msg.info.tx_score.score = -penalty;
-
-    messaging_send("reputation", TRANSACTION_SCORE, &msg, false);
+    messaging_send("reputation", ZTA_STANDING, &msg, false);
 
     char uuid_str[37];
     uuid_unparse_lower(peer_uuid, uuid_str);
-    log_info(logger, "ZTA: sent reputation penalty %.2f for peer %s\n",
-             penalty, uuid_str);
+    log_info(logger, "ZTA: standing %d (ceiling %.2f) for peer %s: %s\n",
+             (int)standing, ceiling, uuid_str, reason ? reason : "");
+}
+
+/** A post-admission verification failure: unwind and demote (§10.5). The peer
+ *  also stays bounded going forward -- unwinding once is not enough when the
+ *  peer keeps transacting. */
+static void _send_reputation_penalty(process_t *proc, const uuid_t peer_uuid,
+                                     double penalty, logger_t *logger)
+{
+    /* The configured penalty is repurposed as the ceiling a failed peer is
+     * held under: `revocation_reputation_penalty` is expressed as "how much
+     * standing this costs", so what remains available is its complement. It
+     * keeps one knob meaning one thing for an operator who has already tuned
+     * it. */
+    double ceiling = 1.0 - penalty;
+    if (ceiling < 0.0) ceiling = 0.0;
+    if (ceiling > 1.0) ceiling = 1.0;
+    _send_zta_standing(proc, peer_uuid, ZTA_STANDING_FAILED, ceiling,
+                       "credential verification failed", logger);
 }
 
 /**
@@ -548,6 +583,13 @@ static void _reverify_peers(process_t *proc, logger_t *logger)
 
         case ZTA_VERIFIED:
             log_debug(logger, "ZTA: peer %s credential still valid\n", uuid_str);
+            /* Re-anchor the unwind (§10.5): everything committed up to now was
+             * observed while this credential verified, so a LATER failure must
+             * not reach back past this point. Also lifts any ceiling the peer
+             * was under, which is what lets a DDIL admission recover once the
+             * infrastructure returns. Mirrors the Python sweep. */
+            _send_zta_standing(proc, peer->uuid, ZTA_STANDING_PROVED,
+                               ZTA_NO_CEILING, "re-verified", logger);
             /* Share result so DDIL peers can use it for delegated verification */
             _broadcast_verification(proc, peer->uuid, &result, logger);
             break;
@@ -622,6 +664,13 @@ static void _resolve_deferred(process_t *proc, logger_t *logger)
         if (result.status == ZTA_VERIFIED) {
             log_info(logger, "ZTA: deferred verification resolved for peer %s: VERIFIED\n",
                      uuid_str);
+            /* The DDIL condition has cleared: lift the ceiling this peer was
+             * admitted under and anchor the unwind here (§10.5). Until the cap
+             * was actually enforced there was nothing for this branch to lift,
+             * which is why it only logged. */
+            _send_zta_standing(proc, entry.peer_uuid, ZTA_STANDING_PROVED,
+                               ZTA_NO_CEILING, "deferred verification resolved",
+                               logger);
         } else {
             log_warn(logger, "ZTA: deferred verification resolved for peer %s: %s - %s\n",
                      uuid_str, zta_status_str(result.status), result.reason);

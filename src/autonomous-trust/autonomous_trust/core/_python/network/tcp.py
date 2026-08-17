@@ -77,11 +77,11 @@ class TCPNetworkProcess(UDPNetworkProcess):
         try:
             self.recv_ptp_sock.bind((bind_address, self.port))
         except OSError as err1:
-            self.logger.warning('Address %s:%s error: %s' % (bind_address, self.port, str(err1)))
+            self.logger.warning('Address %s:%s error: %s', bind_address, self.port, str(err1))
             bind_address = '0.0.0.0'
             self.recv_ptp_sock.bind((bind_address, self.port))
         self.my_address, self.port = self.recv_ptp_sock.getsockname()
-        self.logger.info('Bound peer recv to %s:%s' % (self.my_address, self.port))
+        self.logger.info('Bound peer recv to %s:%s', self.my_address, self.port)
         self.recv_ptp_sock.listen(self.rcv_backlog)
 
         self.recv_grp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -90,10 +90,10 @@ class TCPNetworkProcess(UDPNetworkProcess):
         try:
             self.recv_grp_sock.bind((bind_address, self.group_port))
         except OSError as err1:
-            self.logger.warning('Address %s:%s error: %s' % (bind_address, self.group_port, str(err1)))
+            self.logger.warning('Address %s:%s error: %s', bind_address, self.group_port, str(err1))
             bind_address = '0.0.0.0'
             self.recv_grp_sock.bind((bind_address, self.group_port))
-        self.logger.info('Bound group recv to %s:%s' % (self.my_address, self.group_port))
+        self.logger.info('Bound group recv to %s:%s', self.my_address, self.group_port)
         self.recv_grp_sock.listen(self.rcv_backlog)
 
         self._init_mcast(use_mcast)
@@ -142,7 +142,7 @@ class TCPNetworkProcess(UDPNetworkProcess):
             if sent == 0:
                 raise TransmissionError("Socket connection broken (no bytes sent)")
             total_sent += sent
-        self.logger.debug('Sent %s bytes' % total_sent)
+        self.logger.debug('Sent %s bytes', total_sent)
 
     def _open_conn(self, host, port):
         """Open one outbound TCP connection with the send timeout, enabling
@@ -208,7 +208,7 @@ class TCPNetworkProcess(UDPNetworkProcess):
             # my_address a no-op rather than a crash.
             bind_source_address(sock, getattr(self, 'my_address', None),
                                 getattr(self, 'logger', None), stream=True)
-            self.logger.debug('Solo connect to %s:%s' % (host, port))
+            self.logger.debug('Solo connect to %s:%s', host, port)
             try:
                 sock.connect((host, port))
             except socket.error as err:
@@ -234,7 +234,7 @@ class TCPNetworkProcess(UDPNetworkProcess):
                 if sent == 0:
                     raise TransmissionError("Socket connection broken (no bytes sent)")
                 total_sent += sent
-            self.logger.debug('Sent %s bytes' % total_sent)
+            self.logger.debug('Sent %s bytes', total_sent)
 
     # --- Connection pool (send side) -----------------------------------
 

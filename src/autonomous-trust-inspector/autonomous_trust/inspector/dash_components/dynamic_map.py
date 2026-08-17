@@ -219,7 +219,7 @@ class DynamicMap(DashComponent):
         # component-update side-effects during the first render;
         # currently it runs the full update path.
         self.cohort.update(initial=True)
-        self.logger.debug(f'Initialize map: {len(self.cohort.peers)} peers')
+        self.logger.debug('Initialize map: %s peers', len(self.cohort.peers))
         center = self.cohort.center.convert(GeoPosition)
         if self.use_map:
             # UI tuning open: compute z_scale from cohort bounding box;

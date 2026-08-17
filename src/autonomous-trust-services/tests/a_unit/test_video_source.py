@@ -68,12 +68,19 @@ def _frame_index(frame, base=0):
     return round((float(frame[:, :, 0].mean()) - base) / STEP)
 
 
-def _source(path, fps=60, speed=1, size=None,
-            metric=VideoPosition.SECONDS):
+def _source(path, fps=60, speed=1, size=None, metric=None):
     """`fps` defaults high so `next()` consumes exactly one frame per call
-    unless a test is specifically about rate decimation."""
+    unless a test is specifically about rate decimation.
+
+    `metric` resolves to VideoPosition.SECONDS at CALL time, not as a default
+    argument: defaults are evaluated when this module is imported, which happens
+    even when the cv2 guard above already failed -- naming VideoPosition there
+    turned a clean skip into a collection-time NameError for the whole file.
+    """
     return VideoSource(DataConfig(path, frame_size=size, speed=speed),
-                       frames_per_second=fps, position_metric=metric)
+                       frames_per_second=fps,
+                       position_metric=VideoPosition.SECONDS if metric is None
+                       else metric)
 
 
 @pytest.fixture

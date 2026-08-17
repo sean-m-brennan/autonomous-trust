@@ -33,6 +33,17 @@ CFG_DIR="$CONFIG_DIR/cfg"
 ENV_NAME="autonomous_trust"
 MINIFORGE_HOME="$HOME/.miniforge3"
 
+# Pinned conda toolchain (ISSUES.md §9.1). MINIFORGE_VERSION selects the
+# installer release below; the file also carries the container-image pin the
+# Dockerfiles use. Fall back to `latest` only if the file is missing, and say so
+# -- a floating installer is exactly the drift §9.1 records.
+TOOLCHAIN_PINS="$CFG_DIR/toolchain-pins.env"
+if [ -f "$TOOLCHAIN_PINS" ]; then
+    # shellcheck source=../config/cfg/toolchain-pins.env
+    source "$TOOLCHAIN_PINS"
+fi
+MINIFORGE_VERSION="${MINIFORGE_VERSION:-}"
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -66,9 +77,17 @@ install_miniforge() {
         return 0
     fi
 
-    info "Installing Miniforge to $MINIFORGE_HOME ..."
+    local url
+    if [ -n "$MINIFORGE_VERSION" ]; then
+        info "Installing Miniforge $MINIFORGE_VERSION (pinned) to $MINIFORGE_HOME ..."
+        url="https://github.com/conda-forge/miniforge/releases/download/${MINIFORGE_VERSION}/Miniforge3-${PLATFORM}-${ARCH}.sh"
+    else
+        warn "No MINIFORGE_VERSION in $TOOLCHAIN_PINS -- falling back to the" \
+             "floating latest release (see ISSUES.md §9.1)"
+        info "Installing Miniforge to $MINIFORGE_HOME ..."
+        url="https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-${PLATFORM}-${ARCH}.sh"
+    fi
     local installer="/tmp/miniforge-installer.sh"
-    local url="https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-${PLATFORM}-${ARCH}.sh"
     curl -fsSL "$url" -o "$installer"
     bash "$installer" -b -p "$MINIFORGE_HOME"
     rm -f "$installer"
@@ -127,7 +146,10 @@ create_conda_env() {
 }
 
 update_conda_env() {
-    conda update -n base -c conda-forge conda
+    # No `conda update -n base conda` here: it floats base conda to whatever
+    # conda-forge published today, which defeats the pinned installer above and
+    # is one of the drifts behind ISSUES.md §9.1. To move conda, move the pin in
+    # config/cfg/toolchain-pins.env and re-run the install path.
     activate_conda
     info "Updating conda environment '$ENV_NAME' ..."
     conda env update -n "$ENV_NAME" --file "$REPO_DIR/environment.yml" --prune

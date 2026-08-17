@@ -36,6 +36,7 @@ import sys
 
 from .activate import activate
 from ..identity.zta import ZtaStatus
+from ..processes import LOG_FORMAT, LOG_DATEFMT
 
 
 def _build_token(args):
@@ -59,7 +60,7 @@ def _build_token(args):
 
 def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
-                        format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+                        format=LOG_FORMAT, datefmt=LOG_DATEFMT)
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--module',
                     help='PKCS#11 module path (default: autodetected '

@@ -40,7 +40,11 @@ class Graphs(object):
         aenum.extend_enum(cls.Implementation, name.upper(), name.lower())
         cls._MAP[name.lower()] = impl_cls
         if is_default:
-            cls._MAP[cls.Implementation.DEFAULT] = impl_cls
+            # Keyed by the enum's VALUE, not the member: get_graph is always
+            # called with a string (server.py passes `impl.value`), so keying by
+            # the member left the default unreachable -- a client selecting the
+            # default '' matched the enum and then raised KeyError.
+            cls._MAP[cls.Implementation.DEFAULT.value] = impl_cls
 
 
 ####################
@@ -378,10 +382,32 @@ class NetworkGraph(object):
                 data_obj[lk] = self.edgeset_diff(self.previous_links,
                                                  data_obj[lk])
             elif self.change_type == self.PhaseChange.META:
-                data_obj['nodes'] = self.nodeset_diff(self.previous_nodes,
-                                                      data_obj['nodes'])
-                data_obj[lk] = self.edgeset_diff(self.previous_links,
-                                                 data_obj[lk])
+                # BOTH directions, unlike ADD and REMOVE which each name one.
+                # `nodeset_diff(a, b)` yields what is in `a` and not in `b`, so
+                # (previous, current) alone reports only what DISAPPEARED —
+                # and META is the change type every live-graph frame carries,
+                # because `LiveData._peer_node` adds straight to the networkx
+                # graph rather than through `add_node()` (which is what would
+                # have set ADD). A peer that joined after the client connected
+                # was therefore held by the server and never sent: the graph
+                # knew about it, every frame said `meta` with an empty node
+                # list, and the display stayed at whatever it held on connect.
+                # Additions first so a link's endpoints are present before the
+                # link that references them. Simulation graphs reach META only
+                # via `grouping()` when membership did NOT change, so their
+                # added set is empty and their frames are unchanged.
+                added_nodes = self.nodeset_diff(data_obj['nodes'],
+                                                self.previous_nodes)
+                dropped_nodes = self.nodeset_diff(self.previous_nodes,
+                                                  data_obj['nodes'])
+                added_links = self.edgeset_diff(data_obj[lk],
+                                                self.previous_links)
+                dropped_links = self.edgeset_diff(self.previous_links,
+                                                  data_obj[lk])
+                data_obj['nodes'] = added_nodes + [n for n in dropped_nodes
+                                                   if n not in added_nodes]
+                data_obj[lk] = added_links + [e for e in dropped_links
+                                              if e not in added_links]
         return data_obj
 
     def __str__(self):

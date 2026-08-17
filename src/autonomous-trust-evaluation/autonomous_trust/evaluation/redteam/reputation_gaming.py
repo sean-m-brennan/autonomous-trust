@@ -48,8 +48,7 @@ class GamingReputationProcess(ReputationProcess, metaclass=ProcMeta,
 
     def handle_transaction(self, queues, message):
         if self._is_defecting and message.function == ReputationProtocol.transaction:
-            self.logger.debug("Gaming: defecting — dropping transaction from %s" %
-                            message.from_whom)
+            self.logger.debug("Gaming: defecting — dropping transaction from %s", message.from_whom)
             return True
         return super().handle_transaction(queues, message)
 

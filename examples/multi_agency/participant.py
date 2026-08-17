@@ -42,6 +42,7 @@ from autonomous_trust.core.config.generate import generate_identity, generate_wo
 from autonomous_trust.core.system import queue_cadence
 from autonomous_trust.services.data.server import DataProcess, DataConfig
 from autonomous_trust.services.network_statistics import NetStatsSource
+from autonomous_trust.core import LOG_FORMAT, LOG_DATEFMT
 
 try:
     from autonomous_trust.simulator.peer.peer_metadata import SimMetadataSource, SimMetadata
@@ -120,7 +121,7 @@ def main():
     logging.basicConfig(
         level=logging.INFO,
         stream=sys.stderr,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format=LOG_FORMAT, datefmt=LOG_DATEFMT,
     )
 
     if len(sys.argv) < 2:

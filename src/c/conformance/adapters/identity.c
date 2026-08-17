@@ -1173,6 +1173,21 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     out->info.net_msg.encrypt = false;
     memcpy(&out->info.net_msg.from_whom, sender_impl->pub, sizeof(public_identity_t));
 
+    /* trigger_cohort_join — the only pseudo-function that carries a payload:
+     * it names the cohort to solicit (ISSUES.md 10.2). Without packing it the
+     * adapter would ask to join "" and the request would be refused locally,
+     * which reads downstream as "emitted nothing". Mirrors the Python adapter,
+     * which likewise leaves the payload in place for this one pseudo-function
+     * while blanking it for the others. */
+    if (strcmp(function, "trigger_cohort_join") == 0 && json_is_object(payload)) {
+        json_t *body = json_deep_copy(payload);
+        if (body != NULL) {
+            net_msg_pack_json(&out->info.net_msg, body);
+            json_decref(body);
+        }
+        return 0;
+    }
+
     /* peer_caps_response — pack the payload as the JSON array
      * handle_caps_response expects. Two YAML forms (mirrors the Python
      * adapter):
@@ -1411,6 +1426,62 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         }
     }
 
+    /* request_access with a JOIN TARGET (ISSUES.md 10.2). The C engine
+     * REBUILDS a propagated message from the step rather than re-delivering
+     * the captured bytes (it records from/to/function, not the payload), so a
+     * targeted solicitation would arrive here stripped of the cohort it names
+     * and be handled as an ordinary open request — the opposite of what the
+     * scenario is pinning. Emitted only when the step names `group_uuid`, so
+     * every untargeted request_access keeps its historical empty payload and
+     * no pre-existing scenario changes shape. Slots 0-2 mirror
+     * _build_announcement: package_hash (empty; C has no package hash),
+     * capabilities, attestation. */
+    if (strcmp(function, "request_access") == 0 && json_is_object(payload)) {
+        const char *jt = json_string_value(json_object_get(payload,
+                                                           "group_uuid"));
+        if (jt != NULL && jt[0] != '\0') {
+            json_t *body = json_array();
+            json_array_append_new(body, json_string(""));
+            json_array_append_new(body, json_array());
+            json_array_append_new(body, json_object());
+            json_array_append_new(body, json_string(jt));
+            net_msg_pack_json(&out->info.net_msg, body);
+            json_decref(body);
+            return 0;
+        }
+    }
+
+    /* full_history — the SENDER's group, history steps, and peer roster, the
+     * same three-slot payload _peer_accepted emits. The C engine rebuilds
+     * propagated messages (see request_access above), and a full_history
+     * carrying no group is not a full history: the receiver's handler reads no
+     * payload and returns, so nothing about group transfer could be observed
+     * cross-language. The group is serialized AFTER the sender's admission, so
+     * it carries the rotated key -- which is exactly what the joiner should
+     * receive. Steps ship empty (the harness drives no DAG); the peers slot is
+     * what late-joiner sync actually consumes. */
+    if (strcmp(function, "full_history") == 0) {
+        json_t *body = json_array();
+        json_t *gj = NULL;
+        if (group_to_json(&sender_impl->proc->protocol.group, &gj) == 0
+            && gj != NULL)
+            json_array_append_new(body, gj);
+        else
+            json_array_append_new(body, json_null());
+        json_array_append_new(body, json_array());
+        json_t *peers_json = json_array();
+        for (size_t i = 0; i < sender_impl->proc->protocol.num_peers; i++) {
+            json_t *pj = NULL;
+            if (public_identity_to_json(&sender_impl->proc->protocol.peers[i],
+                                        &pj) == 0 && pj != NULL)
+                json_array_append_new(peers_json, pj);
+        }
+        json_array_append_new(body, peers_json);
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+        return 0;
+    }
+
     /* group_key_update — serialize the SENDER's group as the DRY canonical
      * flat form (group_to_json), matching the Python adapter which sends
      * sender.process.group.to_canonical(). handle_group_update parses it via
@@ -1516,6 +1587,47 @@ static int _dispatch(sce_run_ctx_t *ctx,
             return -1;
         }
         return _ic_run_attest_pull(ctx, puller, impl, replay);
+    }
+    if (inbound->type == NET_MESSAGE
+        && inbound->info.net_msg.function != NULL
+        && strcmp(inbound->info.net_msg.function, "trigger_cohort_join") == 0) {
+        /* Pseudo-function: solicit membership in a cohort this participant is
+         * NOT in (runtime cross-group join, ISSUES.md 10.2). The payload names
+         * the target cohort; the scenario pins that uuid via fixtures.groups so
+         * it is the same string in both harnesses. Unlike the other
+         * pseudo-functions this one DOES emit wire traffic — the ordinary
+         * request_access, now carrying the target in payload slot 3 — because
+         * the whole point is that a join IS the ordinary admission and not a
+         * private side channel. Mirrors the Python adapter's
+         * trigger_cohort_join handling. */
+        json_t *jp = NULL;
+        char join_target[UUID_STRING_LEN + 1] = {0};
+        if (net_msg_unpack_json(&inbound->info.net_msg, &jp) == 0 && jp != NULL) {
+            const char *g = json_string_value(json_object_get(jp, "group_uuid"));
+            if (g != NULL)
+                snprintf(join_target, sizeof(join_target), "%s", g);
+            json_decref(jp);
+        }
+        /* Same synthetic directory the wire path below builds: without
+         * "network" in it, _announce_identity returns early and the join would
+         * emit nothing at all. */
+        array_t *jq = NULL;
+        array_create(&jq);
+        static const char *const jq_names[] = {"network", "identity",
+                                               "negotiation", "main"};
+        for (size_t i = 0; i < sizeof(jq_names) / sizeof(jq_names[0]); i++) {
+            data_t *qn = string_data((string_t)jq_names[i], strlen(jq_names[i]));
+            if (qn != NULL) array_append(jq, qn);
+        }
+        int jrc = identity_request_cohort_join(impl->proc, jq, join_target);
+        array_free(jq);
+        if (jrc != 0) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "trigger_cohort_join: request for %s refused",
+                     join_target);
+            return -1;
+        }
+        return 0;
     }
     if (inbound->type == NET_MESSAGE
         && inbound->info.net_msg.function != NULL
@@ -1979,6 +2091,48 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                 if (got != want) {
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: group_size=%d, expected %d", pid, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "group_key_epoch") == 0) {
+                /* How many times this participant's group key has been rotated.
+                 * Admission rotates (ISSUES.md 10.2), so a welcomer that
+                 * admitted one peer sits at 1 — that is what keeps cohort
+                 * traffic recorded BEFORE a join closed to the joiner. Mirrors
+                 * Python Group.key_epoch. */
+                int want = (int)json_integer_value(val);
+                int got = (int)proc->protocol.group.key_epoch;
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: group_key_epoch=%d, expected %d",
+                             pid, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "group_uuid") == 0) {
+                /* This participant's PRIMARY group, pinned by fixtures.groups
+                 * so the scenario can state it language-agnostically. The
+                 * cross-group join asserts it is UNCHANGED: a gateway joining a
+                 * child cohort must not have swapped its own group for the one
+                 * it just joined. Mirrors Python str(group.uuid). */
+                const char *want = json_string_value(val);
+                char got[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(proc->protocol.group.uuid, got);
+                if (want == NULL || strcmp(got, want) != 0) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: group_uuid=%s, expected %s", pid, got,
+                             want != NULL ? want : "(non-string)");
+                    return -1;
+                }
+            } else if (strcmp(key, "child_group_count") == 0) {
+                /* Cohorts this participant gateways. A runtime join lands HERE
+                 * and not in the primary group — that separation is the whole
+                 * observable. Mirrors Python len(process.child_groups). */
+                int want = (int)json_integer_value(val);
+                int got = (proc->protocol.child_groups == NULL)
+                          ? 0 : (int)map_size(proc->protocol.child_groups);
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: child_group_count=%d, expected %d",
+                             pid, got, want);
                     return -1;
                 }
             } else if (strcmp(key, "peer_caps_descriptor") == 0) {
