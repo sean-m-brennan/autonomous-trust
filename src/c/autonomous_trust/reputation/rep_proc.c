@@ -148,9 +148,12 @@ static void _handle_zta_standing(const process_t *proc,
 /* Both defined further down, beside the code that owns them; the ZTA block
  * sits above both because it belongs with _publish_tier_change, which it
  * calls. */
-static bool _resolve_self_uuid(const process_t *proc, uuid_t out_uuid);
 static void _persist_reputations(const process_t *proc);
 #endif
+/* Declared unconditionally: the batched consensus handler skips our own uuid,
+ * and that path is not ZTA-gated (this declaration used to sit inside the
+ * AT_ZTA_ENABLED block, where a default build could not see it). */
+static bool _resolve_self_uuid(const process_t *proc, uuid_t out_uuid);
 /* Forward declaration — definition sits with the rest of the verifiable
  * warm-start code (doc/architecture/reputation.md), below the state struct it writes. Records a
  * finalized checkpoint's root, window bounds and co-signatures, and persists
@@ -193,6 +196,10 @@ char REP_PROTO_UPDATE[]      = "latest update";
 char REP_PROTO_REP_REQ[]     = "request reputation";
 char REP_PROTO_REP_RESP[]    = "reputation response";
 char REP_PROTO_CONSENSUS_REP_REQ[] = "request consensus reputation";
+/* Batched form: one request naming many subjects, one roster reply. Byte-
+ * identical to Python's ReputationProtocol.consensus_rep_batch_req — the
+ * string IS the wire form, so a prettier spelling here breaks interop. */
+char REP_PROTO_CONSENSUS_REP_BATCH_REQ[] = "request consensus reputation batch";
 char REP_PROTO_LOCAL_QUERY[] = "local_rep_query";
 char REP_PROTO_LOCAL_RESP[]  = "local_rep_response";
 /* App -> AT (via the daemon main loop): re-emit the peer view on the
@@ -2270,6 +2277,112 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
     return true;
 }
 
+/* Python's type tag for a single Reputation. Carried for the same reason the
+ * warm-start snapshot carries one (see REP_SNAPSHOT_TYPE below): a reputation
+ * response is the SAME state in both runtimes, and the requestor deserialises
+ * each entry by this tag. Without it every entry arrives as a bare dict that a
+ * Python requestor cannot read — it reaches for `.peer_id` and raises. */
+#define REP_REPUTATION_TYPE \
+    "autonomous_trust.core._python.reputation.reputation.Reputation"
+
+/****************************
+ * _reputation_json — one Reputation entry, in the form both runtimes read.
+ *
+ * Exactly Python's Reputation serialisation: the type tag, `peer_id`, `score`
+ * and NOTHING else. An extra key is not harmless — the requestor reconstructs
+ * the object by keyword, so a stray field is a TypeError rather than a value it
+ * ignores. In particular the requesting process does NOT belong in here; it
+ * routes the reply and travels in the envelope (see _send_rep_response).
+ ****************************/
+
+/*@
+  requires peer_uuid_str != \null;
+*/
+static json_t *_reputation_json(const char *peer_uuid_str, double score)
+{
+    return json_pack("{s:s, s:s, s:f}",
+                     "__type__", REP_REPUTATION_TYPE,
+                     "peer_id", peer_uuid_str,
+                     "score", score);
+}
+
+/****************************
+ * _send_rep_response — emit a rep_resp for @p body back to the requestor.
+ *
+ * Takes ownership of @p body.
+ *
+ * The envelope's `process` is the REQUESTING process, not "reputation". A
+ * requestor routes an inbound message by that field, so a reply that names
+ * "reputation" is delivered to the requestor's reputation process — which has no
+ * rep_resp handler on the Python side — instead of to the process that asked.
+ * All three reply sites got this wrong identically, which is why there is now
+ * one of them. Mirrors Python's forward_reputation, which builds
+ * `Message(req_proc, rep_resp, ...)`.
+ *
+ * `return_to` stays "reputation": that is where an answer to THIS message would
+ * come back to, and it is us.
+ ****************************/
+
+/*@
+  requires \valid(req);
+  requires body != \null;
+*/
+static void _send_rep_response(const net_msg_t *req, const char *req_proc,
+                               json_t *body)
+{
+    generic_msg_t resp = {0};
+    resp.type = NET_MESSAGE;
+    /* An absent or empty requesting process would address the reply to nothing;
+     * fall back to our own process so it is at least deliverable and visible. */
+    at_strlcpy(resp.info.net_msg.process,
+               (req_proc != NULL && req_proc[0] != '\0') ? req_proc : "reputation",
+               PROC_NAME_LEN);
+    resp.info.net_msg.function = REP_PROTO_REP_RESP;
+    resp.info.net_msg.encrypt = true;
+    memcpy(&resp.info.net_msg.to_whom, &req->from_whom, sizeof(public_identity_t));
+    at_strlcpy(resp.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+    net_msg_pack_json(&resp.info.net_msg, body);
+    json_decref(body);
+    messaging_send("network", NET_MESSAGE, &resp, false);
+}
+
+/****************************
+ * _consensus_score_for — the consensus score for one peer.
+ *
+ * Factored out so the single-subject and batched request handlers compute the
+ * SAME number by construction: the batch verb exists to cut message count, and
+ * a second copy of this arithmetic is how it would quietly become a scoring
+ * change instead. Takes rep_state.lock itself, so callers must NOT hold it.
+ ****************************/
+
+/*@
+  requires peer_uuid_str != \null;
+  ensures \result >= 0.0 && \result <= 1.0;
+*/
+static double _consensus_score_for(const char *peer_uuid_str, const uuid_t peer_uuid)
+{
+    double score = 0.5;
+    pthread_mutex_lock(&rep_state.lock);
+    /* Slash override (fast-penalty path): a finalized slash floors the score,
+     * bypassing the chain/EMA. Mirrors Python _consensus_reputation's
+     * top-of-function check. The floor value lives in rep_state.reputations
+     * (written by _apply_slash). */
+    data_t *sl = NULL;
+    if (map_get(&rep_state.slashed, (map_key_t)peer_uuid_str, &sl) == 0)
+    {
+        double floor = 0.0;
+        reputations_get(&rep_state.reputations, peer_uuid, &floor);
+        score = floor;
+    }
+    else
+    {
+        score = reputation_consensus(&rep_state.history, peer_uuid,
+                                     &rep_state.task_weights);
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    return score;
+}
+
 /****************************
  * Handler: handle_consensus_rep_request (consensus reputation request)
  *
@@ -2322,49 +2435,171 @@ static bool handle_consensus_rep_request(const process_t *proc, directory_t *que
     double score = 0.5;
     if (uuid_parse(peer_uuid_str, peer_uuid) == 0)
     {
-        pthread_mutex_lock(&rep_state.lock);
-        /* Slash override (fast-penalty path): a finalized slash floors
-         * the score, bypassing the chain/EMA. Mirrors Python
-         * _consensus_reputation's top-of-function check. The floor value
-         * lives in rep_state.reputations (written by _apply_slash). */
-        data_t *sl = NULL;
-        if (map_get(&rep_state.slashed, (map_key_t)peer_uuid_str, &sl) == 0)
-        {
-            double floor = 0.0;
-            reputations_get(&rep_state.reputations, peer_uuid, &floor);
-            score = floor;
-        }
-        else
-        {
-            score = reputation_consensus(&rep_state.history, peer_uuid,
-                                         &rep_state.task_weights);
-        }
-        pthread_mutex_unlock(&rep_state.lock);
+        score = _consensus_score_for(peer_uuid_str, peer_uuid);
         probes_counter("rep.consensus", "queued", NULL);
     }
 
-    json_t *resp_json = json_object();
+    json_t *resp_json = _reputation_json(peer_uuid_str, score);
     if (resp_json == NULL) {
-        log_error(proc->logger, "Reputation: json_object OOM (consensus rep_resp)\n");
+        log_error(proc->logger, "Reputation: json_pack OOM (consensus rep_resp)\n");
         json_decref(payload);
         return true;
     }
-    json_object_set_new(resp_json, "peer_uuid", json_string(peer_uuid_str));
-    json_object_set_new(resp_json, "score", json_real(score));
-    json_object_set_new(resp_json, "requesting_process", json_string(req_proc_str));
+    /* Copied out, not borrowed: req_proc_str points into `payload`, which is
+     * freed before the reply goes out. */
+    char req_proc[PROC_NAME_LEN] = {0};
+    at_strlcpy(req_proc, req_proc_str, PROC_NAME_LEN);
+    json_decref(payload);
+    _send_rep_response(nmsg, req_proc, resp_json);
+    return true;
+}
+
+/* Upper bound on how many subjects one batched request may name. Each named
+ * subject costs a chain walk, so an unbounded list would let one small message
+ * ask for arbitrary work. Mirrors Python's MAX_REP_BATCH_SUBJECTS. */
+#define AT_MAX_REP_BATCH_SUBJECTS 256
+
+/****************************
+ * Handler: handle_consensus_rep_batch_request
+ *
+ * One request naming many subjects, answered with ONE roster: a JSON array of
+ * Reputation objects, which is exactly what Python's forward_reputation emits
+ * for a multi-element roster and what its rep_resp handling already unpacks one
+ * entry per peer.
+ *
+ * Why it exists: an observer-by-subject sweep (the inspector's transitive-trust
+ * round) cost N(N-1) messages with the per-subject verb — 6320 requests plus
+ * 6320 signed replies at N=80, each with its own chain walk. Batched, a round is
+ * N requests and N replies. Scores are unchanged: every entry comes from the
+ * same _consensus_score_for the single-subject verb uses.
+ *
+ * Our own uuid is skipped, matching Python: the sweep has no use for a
+ * self-pair, and excluding it responder-side is what lets one request body
+ * (hence one signature) serve every observer in a round.
+ *
+ * Mirrors Python's handle_consensus_reputation_batch_request.
+ ****************************/
+
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
+static bool handle_consensus_rep_batch_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    log_debug(proc->logger, "Reputation: consensus rep batch request from %s\n",
+              nmsg->from_whom.nickname);
+    probes_counter("rep.consensus_batch", "enter", NULL);
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+    {
+        log_error(proc->logger,
+                  "Reputation: handle_consensus_rep_batch_request: failed to unpack JSON\n");
+        probes_counter("rep.consensus_batch", "exception", "unpack_failed");
+        return false;
+    }
+
+    json_t *j_uuids    = json_object_get(payload, "peer_uuids");
+    json_t *j_req_proc = json_object_get(payload, "requesting_process");
+    if (!json_is_array(j_uuids) || !json_is_string(j_req_proc))
+    {
+        json_decref(payload);
+        log_error(proc->logger,
+                  "Reputation: handle_consensus_rep_batch_request: expected a "
+                  "peer_uuids array and requesting_process\n");
+        probes_counter("rep.consensus_batch", "exception", "bad_payload");
+        return false;
+    }
+    /* Copied out, not borrowed: the reply is sent after the payload is freed,
+     * and the routing string must outlive it. */
+    char req_proc[PROC_NAME_LEN] = {0};
+    at_strlcpy(req_proc, json_string_value(j_req_proc), PROC_NAME_LEN);
+
+    size_t count = json_array_size(j_uuids);
+    if (count > AT_MAX_REP_BATCH_SUBJECTS)
+    {
+        /* Truncated rather than refused: a legitimately oversized cohort still
+         * gets a partial answer, and the count is logged so the cause is
+         * visible instead of presenting as a silently incomplete graph. */
+        log_warn(proc->logger,
+                 "Reputation: consensus batch from %s named %zu subjects; "
+                 "answering the first %d only\n",
+                 nmsg->from_whom.nickname, count,
+                 AT_MAX_REP_BATCH_SUBJECTS);
+        probes_counter("rep.consensus_batch", "truncated", NULL);
+        count = AT_MAX_REP_BATCH_SUBJECTS;
+    }
+
+    uuid_t self_uuid;
+    char self_key[UUID_STR_LEN] = "";
+    if (_resolve_self_uuid(proc, self_uuid))
+        uuid_unparse_lower(self_uuid, self_key);
+
+    json_t *roster = json_array();
+    if (roster == NULL)
+    {
+        log_error(proc->logger, "Reputation: json_array OOM (consensus batch)\n");
+        json_decref(payload);
+        return true;
+    }
+
+    for (size_t i = 0; i < count; i++)
+    {
+        const char *peer_uuid_str = json_string_value(json_array_get(j_uuids, i));
+        if (peer_uuid_str == NULL)
+            continue;
+        if (self_key[0] != '\0' && strcmp(peer_uuid_str, self_key) == 0)
+            continue;
+        uuid_t peer_uuid;
+        if (uuid_parse(peer_uuid_str, peer_uuid) != 0)
+            continue;
+        /* Deduplicate against what we have already scored. A linear scan is
+         * right here: this runtime's reply carries one entry per requested
+         * subject (no child-group roster, unlike Python's gateway path), so the
+         * only source of duplicates is a repeated uuid in the request, and the
+         * array is bounded by AT_MAX_REP_BATCH_SUBJECTS. */
+        bool already = false;
+        size_t have = json_array_size(roster);
+        for (size_t k = 0; k < have; k++)
+        {
+            const char *seen = json_string_value(
+                json_object_get(json_array_get(roster, k), "peer_id"));
+            if (seen != NULL && strcmp(seen, peer_uuid_str) == 0)
+            {
+                already = true;
+                break;
+            }
+        }
+        if (already)
+            continue;
+
+        double score = _consensus_score_for(peer_uuid_str, peer_uuid);
+        json_t *entry = _reputation_json(peer_uuid_str, score);
+        if (entry == NULL)
+        {
+            log_error(proc->logger,
+                      "Reputation: json_pack OOM (consensus batch entry)\n");
+            continue;
+        }
+        json_array_append_new(roster, entry);
+    }
     json_decref(payload);
 
-    generic_msg_t resp = {0};
-    resp.type = NET_MESSAGE;
-    strncpy(resp.info.net_msg.process, "reputation", PROC_NAME_LEN);
-    resp.info.net_msg.function = REP_PROTO_REP_RESP;
-    resp.info.net_msg.encrypt = true;
-    memcpy(&resp.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
-    strncpy(resp.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
-    net_msg_pack_json(&resp.info.net_msg, resp_json);
-    json_decref(resp_json);
+    if (json_array_size(roster) == 0)
+    {
+        /* Nothing to say: an empty roster would cost a signature and a round
+         * trip to convey no information. */
+        probes_counter("rep.consensus_batch", "empty", NULL);
+        json_decref(roster);
+        return true;
+    }
+    probes_counter("rep.consensus_batch", "queued", NULL);
 
-    messaging_send("network", NET_MESSAGE, &resp, false);
+    _send_rep_response(nmsg, req_proc, roster);
     return true;
 }
 
@@ -2477,30 +2712,19 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
         probes_counter("rep.compute", "queued", NULL);
     }
 
-    /* Pack response (peer_uuid, score, requesting_process) */
-    json_t *resp_json = json_object();
+    /* Pack the response as a Reputation, the form both runtimes read. */
+    json_t *resp_json = _reputation_json(peer_uuid_str, score);
     if (resp_json == NULL) {
-        log_error(proc->logger, "Reputation: json_object OOM (rep_resp)\n");
+        log_error(proc->logger, "Reputation: json_pack OOM (rep_resp)\n");
         json_decref(payload);
         return true;
     }
-    json_object_set_new(resp_json, "peer_uuid", json_string(peer_uuid_str));
-    json_object_set_new(resp_json, "score", json_real(score));
-    json_object_set_new(resp_json, "requesting_process", json_string(req_proc_str));
-
+    /* Copied out, not borrowed: req_proc_str points into `payload`, which is
+     * freed before the reply goes out. */
+    char req_proc[PROC_NAME_LEN] = {0};
+    at_strlcpy(req_proc, req_proc_str, PROC_NAME_LEN);
     json_decref(payload);
-
-    generic_msg_t resp = {0};
-    resp.type = NET_MESSAGE;
-    strncpy(resp.info.net_msg.process, "reputation", PROC_NAME_LEN);
-    resp.info.net_msg.function = REP_PROTO_REP_RESP;
-    resp.info.net_msg.encrypt = true;
-    memcpy(&resp.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
-    strncpy(resp.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
-    net_msg_pack_json(&resp.info.net_msg, resp_json);
-    json_decref(resp_json);
-
-    messaging_send("network", NET_MESSAGE, &resp, false);
+    _send_rep_response(nmsg, req_proc, resp_json);
     return true;
 }
 
@@ -5596,6 +5820,8 @@ int reputation_register_handlers(process_t *proc)
     process_register_handler(proc, REP_PROTO_REP_RESP,  (handler_ptr_t)handle_rep_response);
     process_register_handler(proc, REP_PROTO_CONSENSUS_REP_REQ,
                              (handler_ptr_t)handle_consensus_rep_request);
+    process_register_handler(proc, REP_PROTO_CONSENSUS_REP_BATCH_REQ,
+                             (handler_ptr_t)handle_consensus_rep_batch_request);
     process_register_handler(proc, REP_PROTO_LOCAL_QUERY, (handler_ptr_t)handle_local_rep_query);
     process_register_handler(proc, REP_PROTO_APP_ROSTER, (handler_ptr_t)handle_app_roster_request);
     process_register_handler(proc, REP_PROTO_SLASH_PROPOSE, (handler_ptr_t)handle_slash_propose);
