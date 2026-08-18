@@ -135,7 +135,7 @@ def _decoded_frame(frame=b'\x00'):
 
 class TestVideoProcessFanout:
     """`process()`'s one pass: acquire a frame, encode it once per encoding, and
-    send each client the variant it asked for (ISSUES §5 S12).
+    send each client the variant it asked for (the S12 video-coverage gap).
 
     Untested until now, and it is where the per-client bookkeeping lives: the
     fast/slow choice is read from `client_props` while the recipient comes from

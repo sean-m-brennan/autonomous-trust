@@ -99,7 +99,7 @@ const char *rootDir(void);
  *       own correct bounds check ran against a number up to 147 bytes too large.
  *       `unix_addr` passes a 108-byte `sun_path`-sized buffer, and a long
  *       `AUTONOMOUS_TRUST_ROOT` therefore smashed the caller's stack. See
- *       ISSUES.md §2.1.1. The ACSL below said `CFG_PATH_LEN` too, so the contract
+ *       the startup stack overflow. The ACSL below said `CFG_PATH_LEN` too, so the contract
  *       was contradicted by a caller and nothing noticed.
  */
 /*@

@@ -140,14 +140,14 @@ class TestGroup:
         assert str(g2.uuid) == str(g.uuid)
 
     def test_proto_roundtrip_address_map_created(self):
-        # ISSUES.md §1.4: the protobuf Group carries the FULL address_map (not
-        # just a single `address`) and the §3.1-b `created` age, matching the
+        # doc/architecture/identity-protocol.md: the protobuf Group carries the
+        # FULL address_map (not just a single `address`) and the `created` age, matching the
         # canonical JSON form. Exercises to_wire_bytes/from_wire_bytes (the
         # binary-proto path -> sync_to_message/sync_from_message).
         from autonomous_trust.core.protobuf.identity import identity_pb2
         fields = [f.name for f in identity_pb2.Group.DESCRIPTOR.fields]
         if 'address_map' not in fields or 'created' not in fields:
-            pytest.skip('identity_pb2 not regenerated for §1.4 '
+            pytest.skip('identity_pb2 not regenerated for '
                         '(run scripts/build-py.sh proto-only)')
         g = Group(uuid4(), {'u1': '10.0.0.1', 'u2': '10.0.0.2'}, 'squad',
                   Encryptor.generate(), _public_only=False, _created=1700000000.5)
@@ -161,7 +161,7 @@ class TestGroup:
         # `address` (no address_map) reconstructs a one-entry map keyed by uuid.
         from autonomous_trust.core.protobuf.identity import identity_pb2
         if 'address_map' not in [f.name for f in identity_pb2.Group.DESCRIPTOR.fields]:
-            pytest.skip('identity_pb2 not regenerated for §1.4')
+            pytest.skip('identity_pb2 not regenerated for doc/architecture/identity-protocol.md')
         msg = identity_pb2.Group()
         msg.uuid = b'grp-legacy'
         msg.address = '10.9.9.9'

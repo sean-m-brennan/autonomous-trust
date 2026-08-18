@@ -25,6 +25,7 @@
 #include <jansson.h>
 #include "utilities/allocation.h"
 #include "utilities/logger.h"
+#include "network/net_wire_format.h"
 
 /* Compile-time DEFAULT base port, not a fixed one. The port a node actually
  * uses is resolved by net_port_resolve() below; the transports derive the
@@ -212,7 +213,7 @@ const char *net_knob_source_name(net_knob_source_t src);
  * strictly parsed (no trailing garbage), range-checked, and a bad value refused
  * with a warning while the default is kept. These exist because the knobs used
  * to be overridable class attributes in Python and bare macros in C, so a
- * deployment could tune one runtime and not the other (ISSUES.md 2.4.4).
+ * deployment could tune one runtime and not the other (doc/architecture/networking.md).
  *
  * There is deliberately NO config layer: unlike the base port, these are
  * operational tuning rather than provisioned identity, and adding them to
@@ -255,6 +256,35 @@ int net_conn_idle_ttl_resolve(net_knob_source_t *src, logger_t *logger);
           \result <= NET_MAX_LIVE_CONNS_MAX;
 */
 int net_max_live_conns_resolve(net_knob_source_t *src, logger_t *logger);
+
+/** Default envelope encoding for a group this node MINTS (doc/architecture/network-wire-format.md).
+ *  JSON, because a group's format is what all its members must speak and JSON
+ *  is the one every AT node can read; a deployment opts a new cohort into proto
+ *  with AT_NET_WIRE_MODE=proto. Mirrors Python system.default_net_wire_mode. */
+#define NET_WIRE_MODE_DEFAULT NET_WIRE_JSON
+
+/**
+ * @brief Envelope encoding for a group this node mints, from AT_NET_WIRE_MODE.
+ *
+ * This knob does NOT decide what goes on the wire for an existing group -- that
+ * comes from the group itself (@c group_t::wire_format), which is what keeps a
+ * cohort consistent and why there is no per-message override. It decides only
+ * what a NEW group is stamped with, so an operator stands up a proto cohort by
+ * setting it on the node that forms the group; every joiner adopts it at
+ * admission.
+ *
+ * Named values rather than numbers ("json" / "proto"), matching Python's
+ * AT_NET_WIRE_MODE. Refusal discipline is the numeric knobs': an unrecognized
+ * value is reported and the default kept. Case-insensitive, because an operator
+ * writing "Proto" means proto and silently falling back to JSON there would
+ * look like this whole path simply not happening.
+ *
+ * Mirrors Python system.resolve_net_wire_mode.
+ */
+/*@
+  requires src == \null || \valid(src);
+*/
+net_wire_format_t net_wire_mode_resolve(net_knob_source_t *src, logger_t *logger);
 
 /**
  * @brief Split a CIDR string into its address and prefix-length parts.

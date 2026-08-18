@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Two-phase (provisional -> confirmed) admission — ISSUES.md §3.1-a.
+"""Two-phase (provisional -> confirmed) admission — doc/architecture/identity-protocol.md.
 
 A member receiving a `confirm` broadcast holds the peer PROVISIONAL (known in
 self.peers/history but the group key is withheld) until `_admission_quorum`

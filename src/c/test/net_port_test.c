@@ -335,7 +335,7 @@ END_TEST_DEFINITION()
 
 DEFINE_TEST(test_same_base_same_address_bind_is_loud)
 {
-    /* ISSUES.md 2.4.2, resolved: two nodes given the same base on the same
+    /* doc/architecture/networking.md, socket layout: two nodes given the same base on the same
      * address no longer both succeed.
      *
      * The defect this replaces: net_transport_ip.c set SO_REUSEADDR on EVERY
@@ -616,7 +616,7 @@ DEFINE_TEST(test_ping_at_request_is_refused_on_its_own_selector)
 END_TEST_DEFINITION()
 
 /****************************
- * Network tunables (ISSUES.md 2.4.4)
+ * Network tunables (doc/architecture/networking.md)
  ****************************/
 
 /* Test seam in net_proc.c: the AT_NET_* / AT_MYSTERY_* lookups are

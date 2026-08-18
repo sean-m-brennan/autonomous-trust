@@ -93,6 +93,28 @@ class NetworkAdapter:
                 f'{expected_path!r}\n  expected: {expected!r}\n  actual:   {actual_canonical!r}'
             )
 
+    def _assert_proto_byte_pin(self, spec: dict[str, Any], actual: bytes,
+                               label: str) -> None:
+        """Compare emitted proto-envelope bytes to the vector's inline hex.
+
+        Compared LITERALLY, unlike the JSON pin's canonical-form comparison:
+        protobuf has no canonical encoding to normalize toward, so "equal after
+        normalization" is not a thing one could check. That strictness is the
+        point -- it is exactly how a runtime whose field order or default-value
+        handling drifted gets caught, which is the risk that made byte-pinning
+        this worth doing.
+        """
+        if not spec.get('byte_pinning'):
+            return
+        expected_hex = (spec.get('expected') or {}).get('proto_wire_hex')
+        if not expected_hex:
+            return
+        actual_hex = actual.hex()
+        if actual_hex != expected_hex:
+            raise AssertionError(
+                f'{label}: proto wire bytes diverge from the pinned hex\n'
+                f'  expected: {expected_hex}\n  actual:   {actual_hex}')
+
     @staticmethod
     def _iter_formats(spec: str) -> list[str]:
         if spec == 'any':
@@ -181,6 +203,16 @@ class NetworkAdapter:
         raise AssertionError(f'unsupported wire_vector constructor: {constructor!r}')
 
     def _message_round_trip(self, args: dict[str, Any], spec: dict[str, Any]) -> None:
+        """Round-trip the Message envelope in the format(s) the case asks for.
+
+        `envelope_format` selects the NETWORK envelope encoding
+        (doc/architecture/network-wire-format.md) and is independent of
+        `wire_format`/`serialize_mode`, which govern how a Configuration *payload*
+        serializes. Default json, so every vector
+        written before the proto envelope existed keeps exercising exactly what
+        it did.
+        """
+        from autonomous_trust.core.config import NetWireFormat
         from autonomous_trust.core.network.message import Message
 
         process = args['process']
@@ -189,17 +221,45 @@ class NetworkAdapter:
         encrypt = bool(args.get('encrypt', False))
         trace_id = args.get('trace_id')
         msg = Message(process, function, obj, encrypt=encrypt, trace_id=trace_id)
-        wire = bytes(msg)
-        restored = Message.parse(wire, sender=None, validate=False)
-        assert restored.process == msg.process, 'Message.process drift'
-        assert restored.function == msg.function, 'Message.function drift'
-        # Message.parse re-runs the obj-coercion logic (Configuration auto-deser
-        # only fires for objects with __type__); for the simple string case we
-        # built, restored.obj should be string-equal.
-        assert str(restored.obj) == str(msg.obj), \
-            f'Message.obj drift: {restored.obj!r} != {msg.obj!r}'
-        assert restored.encrypt == msg.encrypt, 'Message.encrypt drift'
-        self._assert_byte_pin(spec, wire, 'Message')
+
+        which = spec.get('envelope_format', 'json')
+        formats = ([NetWireFormat.json, NetWireFormat.proto] if which == 'both'
+                   else [NetWireFormat.proto] if which == 'proto'
+                   else [NetWireFormat.json])
+
+        parsed: dict[str, Any] = {}
+        for fmt in formats:
+            wire = msg.to_wire(fmt)
+            restored = Message.parse(wire, sender=None, validate=False,
+                                     wire_format=fmt)
+            assert restored.process == msg.process, f'Message.process drift ({fmt})'
+            assert restored.function == msg.function, f'Message.function drift ({fmt})'
+            # Message.parse re-runs the obj-coercion logic (Configuration auto-deser
+            # only fires for objects with __type__); for the simple string case we
+            # built, restored.obj should be string-equal.
+            assert str(restored.obj) == str(msg.obj), \
+                f'Message.obj drift ({fmt}): {restored.obj!r} != {msg.obj!r}'
+            assert restored.encrypt == msg.encrypt, f'Message.encrypt drift ({fmt})'
+            assert restored.trace_id == msg.trace_id, f'Message.trace_id drift ({fmt})'
+            if fmt == NetWireFormat.proto:
+                # The marker is not part of the protobuf; a receiver reads it
+                # before deciding which parser the frame is eligible for.
+                assert wire[:1] == bytes([0xAB]), \
+                    f'proto envelope missing its 0xAB marker: got {wire[:1]!r}'
+                self._assert_proto_byte_pin(spec, wire, 'Message')
+            else:
+                self._assert_byte_pin(spec, wire, 'Message')
+            parsed[fmt] = restored
+
+        if which == 'both':
+            # Cross-format equivalence: the two encodings must mean the same
+            # thing, not merely each survive its own round trip.
+            j, p = parsed[NetWireFormat.json], parsed[NetWireFormat.proto]
+            for field in ('process', 'function', 'encrypt', 'trace_id'):
+                jv, pv = getattr(j, field), getattr(p, field)
+                assert jv == pv, f'cross-format {field} drift: json={jv!r} proto={pv!r}'
+            assert str(j.obj) == str(p.obj), \
+                f'cross-format obj drift: json={j.obj!r} proto={p.obj!r}'
 
     @staticmethod
     def _coerce_bytes(value: Any) -> bytes:
@@ -352,6 +412,15 @@ class NetworkAdapter:
         if case.name == 'tunables-resolution':
             self._run_tunables_resolution(case)
             return
+        if case.name == 'wire-format-mismatch-refused':
+            self._run_wire_format_mismatch_refused(case)
+            return
+        if case.name == 'wire-mode-resolution':
+            self._run_wire_mode_resolution(case)
+            return
+        if case.name == 'group-wire-format-canonical':
+            self._run_group_wire_format_canonical(case)
+            return
         raise NotImplementedError(
             f'network scenario {case.name!r} not implemented'
         )
@@ -412,6 +481,138 @@ class NetworkAdapter:
                 os.environ.pop('AT_COMM_PORT', None)
             else:
                 os.environ['AT_COMM_PORT'] = saved
+
+    def _run_wire_format_mismatch_refused(self, case: Case) -> None:
+        """The strict envelope-format gate, both directions
+        (doc/architecture/network-wire-format.md).
+
+        Asserts the four combinations of (frame format, expected format) and,
+        for the two mismatches, that the refusal is FORMAT-specific rather than
+        generic malformed-input -- the operator-visible difference between "this
+        peer is broken" and "this cohort is misprovisioned".
+        """
+        from autonomous_trust.core.config import NetWireFormat
+        from autonomous_trust.core.network.message import Message, WireFormatMismatch
+
+        fx = case.data.get('fixtures') or {}
+        msg = Message(fx.get('process', 'identity'), fx.get('function', 'request_access'),
+                      fx.get('obj_json', '{}'), encrypt=False,
+                      trace_id=fx.get('trace_id'))
+        json_wire = msg.to_wire(NetWireFormat.json)
+        proto_wire = msg.to_wire(NetWireFormat.proto)
+
+        def accepted(raw, fmt):
+            """(ok, format_specific_refusal)"""
+            try:
+                Message.parse(raw, sender=None, validate=False, wire_format=fmt)
+                return True, False
+            except WireFormatMismatch:
+                return False, True
+            except Exception:
+                return False, False
+
+        json_as_json_ok, _ = accepted(json_wire, NetWireFormat.json)
+        proto_as_proto_ok, _ = accepted(proto_wire, NetWireFormat.proto)
+        proto_as_json_ok, p_fmt_specific = accepted(proto_wire, NetWireFormat.json)
+        json_as_proto_ok, j_fmt_specific = accepted(json_wire, NetWireFormat.proto)
+
+        state = {
+            'json_as_json_ok': json_as_json_ok,
+            'proto_as_proto_ok': proto_as_proto_ok,
+            'proto_as_json_refused': not proto_as_json_ok,
+            'json_as_proto_refused': not json_as_proto_ok,
+            'refusal_is_format_specific': p_fmt_specific and j_fmt_specific,
+        }
+        _assert_expected_flags(case, 'node', state)
+
+    def _run_wire_mode_resolution(self, case: Case) -> None:
+        """AT_NET_WIRE_MODE resolution: env -> compile-time default.
+
+        Same shape as _run_tunables_resolution, against the named-value
+        resolver. The C adapter runs this identical table against
+        net_wire_mode_resolve, so a knob that accepts a spelling on one side
+        only fails here rather than at a cohort that cannot form.
+        """
+        from autonomous_trust.core._python import system as at_system
+
+        fx = case.data.get('fixtures') or {}
+        knob = fx.get('knob') or {}
+        table = fx.get('resolutions') or []
+        if not table:
+            raise AssertionError('scenario: fixtures.resolutions missing or empty')
+
+        constants_match = True
+        if 'default' in knob and knob['default'] != at_system.default_net_wire_mode:
+            constants_match = False
+        if 'choices' in knob and tuple(knob['choices']) != tuple(at_system.net_wire_modes):
+            constants_match = False
+
+        var = knob.get('env', 'AT_NET_WIRE_MODE')
+        saved = os.environ.get(var)
+        all_match = True
+        try:
+            for row in table:
+                rid = row.get('id', '?')
+                env = row.get('env')
+                if env is None:
+                    os.environ.pop(var, None)
+                else:
+                    os.environ[var] = str(env)
+                got, got_src = at_system.resolve_net_wire_mode()
+                if got != row['expect_value'] or got_src != row['expect_source']:
+                    all_match = False
+                    raise AssertionError(
+                        f'{rid}: {var}={"(unset)" if env is None else env!r} -> '
+                        f'({got!r}, {got_src!r}), want '
+                        f'({row["expect_value"]!r}, {row["expect_source"]!r})')
+        finally:
+            if saved is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = saved
+
+        _assert_expected_flags(case, 'node', {
+            'knob_constants_match': constants_match,
+            'all_resolutions_match': all_match,
+        })
+
+    def _run_group_wire_format_canonical(self, case: Case) -> None:
+        """The group's envelope format crosses the wire with the group (doc/architecture/network-wire-format.md)."""
+        from autonomous_trust.core.config import NetWireFormat
+        from autonomous_trust.core.identity.group import Group
+        from autonomous_trust.core.identity.encrypt import Encryptor
+
+        fx = case.data.get('fixtures') or {}
+        addr_map = dict(fx.get('address_map') or {})
+
+        def make(fmt):
+            return Group(fx.get('group_uuid'), addr_map, '',
+                         Encryptor.generate(), False, _wire_format=fmt)
+
+        proto_canon = make(NetWireFormat.proto).to_canonical()
+        json_canon = make(NetWireFormat.json).to_canonical()
+
+        # Absent field: a group from a peer predating this, or a config written
+        # before it. Must read as json, not error and not proto.
+        absent = dict(proto_canon)
+        absent.pop('wire_format', None)
+        # Unrecognized value: a provisioning typo, which must tighten to the
+        # format every node can read.
+        unknown = dict(proto_canon)
+        unknown['wire_format'] = 'yaml'
+
+        state = {
+            'canonical_key_present': 'wire_format' in proto_canon,
+            'proto_roundtrips':
+                Group.from_canonical(proto_canon).wire_format == NetWireFormat.proto,
+            'json_roundtrips':
+                Group.from_canonical(json_canon).wire_format == NetWireFormat.json,
+            'absent_reads_json':
+                Group.from_canonical(absent).wire_format == NetWireFormat.json,
+            'unknown_reads_json':
+                Group.from_canonical(unknown).wire_format == NetWireFormat.json,
+        }
+        _assert_expected_flags(case, 'node', state)
 
     def _run_tunables_resolution(self, case: Case) -> None:
         """Network-tunable resolution: env -> compile-time default.
@@ -923,6 +1124,31 @@ def _assert_expected_state(case: Case, participant_id: str, parsed) -> None:
             f'{participant_id}: verified mismatch: '
             f'expected {ver}, got {parsed.verified}'
         )
+
+
+def _assert_expected_flags(case: Case, participant_id: str,
+                           actual: dict[str, Any]) -> None:
+    """Compare a dict of BOOLEAN observables against `expected_state`.
+
+    The sibling of `_assert_expected_state`, which compares a parsed Message.
+    Table-driven cases (resolution tables, format gates) observe flags rather
+    than a routed message, and their scenarios declare those flags -- so they
+    should be CHECKED rather than left as documentation the adapter happens to
+    agree with. Every key the scenario declares must be present here: a
+    scenario asserting something the adapter never measured would otherwise
+    pass vacuously, which is the failure mode that makes a corpus reassuring
+    and wrong.
+    """
+    expected = case.data.get('expected_state', {}).get(participant_id, {}) or {}
+    for key, want in expected.items():
+        if key not in actual:
+            raise AssertionError(
+                f'{participant_id}: scenario expects {key!r} but the adapter '
+                f'did not measure it')
+        if bool(actual[key]) != bool(want):
+            raise AssertionError(
+                f'{participant_id}: {key} mismatch: expected {want}, '
+                f'got {actual[key]}')
 
 
 def _assert_expected_state_b(case: Case, parsed) -> None:

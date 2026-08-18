@@ -13,7 +13,8 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Tests for `scripts/audit-ffi-drift.py`'s struct field-name check (ISSUES §9.2).
+"""Tests for `scripts/audit-ffi-drift.py`'s struct field-name check
+(doc/architecture/native-ffi-dual-implementation.md).
 
 The auditor is the gate that was supposed to catch `public_identity_t` drifting
 twice in seven days and did not, because it compared only function arity. These

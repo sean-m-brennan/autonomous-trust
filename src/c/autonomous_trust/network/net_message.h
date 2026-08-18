@@ -27,6 +27,7 @@
 
 #include "identity/identity.h"
 #include "utilities/util.h"
+#include "network/net_wire_format.h"
 
 #define NET_MSG_MAX_DATA (1024 * 1024)  /* 1 MB max wire message */
 
@@ -69,6 +70,19 @@ typedef struct {
     bool has_signature;                     /**< Discriminant: true when @c signature is populated. */
     bool verified;                          /**< Receiver-side flag after signature verification (not wire-serialized). */
 } net_wire_msg_t;
+
+/**
+ * @brief A frame arrived in an envelope format this context does not speak.
+ *
+ * Its own error number, declared HERE rather than kept private to
+ * net_message.c, because the distinction is the caller's business: a cohort
+ * misprovisioned into two formats presents as one peer having gone silent, and
+ * only a counter that says "foreign format" rather than "bad message" explains
+ * it. Read it off `_exception.errnum` after a non-zero return (EXCEPTION always
+ * returns -1). NOT a signal to retry with the other parser -- see
+ * doc/architecture/network-wire-format.md.
+ */
+#define ENET_WIRE_FORMAT 233
 
 /**
  * @brief Serialize a wire message to JSON, optionally signing it.
@@ -141,6 +155,79 @@ int net_message_from_wire(const uint8_t *data, size_t len,
   complete behaviors;
 */
 void net_wire_msg_free(net_wire_msg_t *msg);
+
+/**
+ * @brief Serialize a wire message in @p fmt, optionally signing it.
+ *
+ * @ref net_message_to_wire is this with @ref NET_WIRE_JSON, kept as its own
+ * name because every caller that has no group in hand (discovery, tests) is
+ * asking for JSON specifically.
+ *
+ * The SIGNED bytes do not depend on @p fmt: both forms sign the canonical
+ * "<process>|<function>|<base64(data)>" pre-image, so the two encodings of one
+ * message carry the same signature and re-encoding cannot invalidate it.
+ */
+/*@
+  requires msg == \null || \valid(msg);
+  requires \valid(wire_out);
+  requires \valid(wire_len);
+  allocates *wire_out;
+  behavior null_msg:
+    assumes msg == \null;
+    ensures \result != 0;
+  behavior success:
+    assumes msg != \null;
+    ensures \result == 0 ==> *wire_out != \null && *wire_len > 0;
+  behavior failure:
+    assumes msg != \null;
+    ensures \result != 0;
+  disjoint behaviors null_msg, success;
+*/
+int net_message_to_wire_fmt(const net_wire_msg_t *msg, const identity_t *signer,
+                            net_wire_format_t fmt,
+                            uint8_t **wire_out, size_t *wire_len);
+
+/**
+ * @brief Parse a wire buffer KNOWN to be in @p fmt.
+ *
+ * The format is stated by the caller -- the group the frame arrived on, or
+ * JSON outside a group -- and never inferred from the bytes. A frame whose
+ * leading byte disagrees is refused with @c ENET_WIRE_FORMAT before the
+ * parser for the other format sees it, so the caller can count and log the
+ * event (a cohort misprovisioned into two formats otherwise presents as
+ * unexplained silence). @ref net_message_from_wire is this with
+ * @ref NET_WIRE_JSON.
+ */
+/*@
+  requires data == \null || \valid_read(data + (0 .. len - 1));
+  requires msg_out == \null || \valid(msg_out);
+  assigns *msg_out;
+  behavior null_args:
+    assumes data == \null || msg_out == \null;
+    ensures \result != 0;
+  behavior success:
+    assumes data != \null && msg_out != \null;
+    ensures \result == 0 || \result != 0;
+  disjoint behaviors;
+*/
+int net_message_from_wire_fmt(const uint8_t *data, size_t len,
+                              const public_identity_t *peer,
+                              net_wire_format_t fmt, net_wire_msg_t *msg_out);
+
+/**
+ * @brief The protobuf envelope specifically (magic byte + packed NetMessage).
+ *
+ * Callers normally go through @ref net_message_to_wire_fmt; these are exposed
+ * because the JSON pair is, and because the tests drive each encoding
+ * directly.
+ */
+int net_message_to_wire_proto(const net_wire_msg_t *msg, const identity_t *signer,
+                              uint8_t **wire_out, size_t *wire_len);
+
+/** @brief Inverse of @ref net_message_to_wire_proto. See @ref net_message_from_wire_fmt. */
+int net_message_from_wire_proto(const uint8_t *data, size_t len,
+                                const public_identity_t *peer,
+                                net_wire_msg_t *msg_out);
 
 
 /** @} */ /* end of internal_network */

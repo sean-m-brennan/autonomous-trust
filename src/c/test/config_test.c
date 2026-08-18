@@ -204,7 +204,7 @@ DEFINE_TEST(test_load_config_cfg_name_bounded)
 }
 END_TEST_DEFINITION()
 
-/* The defect these cover is ISSUES.md §2.1.1: both functions hardcoded 255 as
+/* The defect these cover: both functions hardcoded 255 as
  * path_join's destination length while taking an unsized `char path[]`, so
  * path_join's own correct bounds check ran against a number that had nothing to do
  * with the caller's buffer. unix_addr passes 108 bytes, and a long

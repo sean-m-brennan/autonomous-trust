@@ -188,7 +188,7 @@ DEFINE_TEST(test_identity_history_merkle_changes)
 }
 END_TEST_DEFINITION()
 
-/* §3.2 divergence detection: verify_object must reject a vote whose proof
+/* doc/architecture/identity-protocol.md divergence detection: verify_object must reject a vote whose proof
  * digest disagrees with the canonical blob hash (a conflicting history view),
  * and accept a matching one. sig=NULL skips the signature step so the digest
  * check is exercised in isolation. Mirrors the Python

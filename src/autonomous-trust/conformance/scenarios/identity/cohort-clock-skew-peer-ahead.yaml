@@ -16,8 +16,8 @@ description: |
 
     Why the attest exchange carries it: an offset needs four timestamps, and the
     pull already makes a round trip both runtimes implement. PingAT would not do
-    -- it is Python-only, and C answers that selector "unsupported" (ISSUES
-    §2.4.1).
+    -- it is Python-only, and C answers that selector "unsupported"
+    (doc/architecture/networking.md).
 
     The arithmetic is NTP's (RFC 5905 §8):
         offset = ((t2 - t1) + (t3 - t4)) / 2

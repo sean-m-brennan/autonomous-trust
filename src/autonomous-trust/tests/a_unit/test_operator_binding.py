@@ -44,14 +44,14 @@ while _ROOT != '/':
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from tools.provision_zta_certs import (  # noqa: E402
+from tools.provision_zta_certs import (# noqa: E402
     make_ca, make_leaf_keypair, ca_bundle_pem, cert_der)
 
 from autonomous_trust.core._python.identity.identity import Identity  # noqa: E402
 from autonomous_trust.core._python.identity.sign import Signature  # noqa: E402
 from autonomous_trust.core._python.identity.encrypt import Encryptor  # noqa: E402
 from autonomous_trust.core._python.identity.idprocess import IdentityProcess  # noqa: E402
-from autonomous_trust.core._python.identity.operator_binding import (  # noqa: E402
+from autonomous_trust.core._python.identity.operator_binding import (# noqa: E402
     OPERATOR_BINDING_PREIMAGE_LEN, OPERATOR_BINDING_TAG, OPERATOR_PUBKEY_LEN,
     node_signing_pubkey, operator_binding_preimage, verify_operator_binding)
 from autonomous_trust.core.identity.zta import ZtaPolicy, BINDING_MODE_OFF  # noqa: E402
@@ -235,7 +235,8 @@ def test_a_forged_binding_is_refused_and_operator_bound_stands(world):
 
 
 def test_a_binding_made_for_another_node_is_refused(world):
-    """ISSUES.md §1.5's shape: a credential AND its binding harvested from another
+    """The credential-binding replay shape (doc/architecture/zta-integration.md):
+    a credential AND its binding harvested from another
     peer's clear-text announce, re-presented under this identity. The signature is
     genuine; it just does not name this node."""
     gate = _Gate(world.mission_bundle, world.operator_bundle)

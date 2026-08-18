@@ -13,9 +13,9 @@
  *   See the License for the specific language governing permissions and
  *   limitations under the License.
  * ****************** */
-/* ISSUES §10.1: the trust-ladder loader's C half. The Python half existed and
- * C registered capabilities in code only, which was the one asymmetry in
- * trust-tiers.md §9's parity table.
+/* The trust-ladder loader's C half (doc/architecture/trust-tiers.md). The Python
+ * half existed and C registered capabilities in code only, which was the one
+ * asymmetry in that doc's §9 parity table.
  *
  * The ladder is JSON so ONE file serves both runtimes (Python's loader reads it
  * unchanged, YAML being a superset of JSON). `test_the_shared_example_parses`

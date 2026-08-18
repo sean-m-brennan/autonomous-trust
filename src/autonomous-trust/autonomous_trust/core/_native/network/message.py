@@ -33,6 +33,26 @@ class RecipientType(enum.IntEnum):
     BROADCAST = 1
 
 
+#: Envelope-format names accepted by to_wire/from_wire, mapped to the C enum
+#: values in network/net_wire_format.h. Spelled here rather than imported from
+#: the pure-Python NetWireFormat so the native backend does not depend on it.
+_WIRE_FORMATS = {'json': 0, 'proto': 1}
+
+
+def _fmt_value(name: str) -> int:
+    """Map an envelope-format name to its C enum value, refusing anything else.
+
+    Refused rather than defaulted: a caller that passes an unknown name has a
+    bug, and silently sending JSON would surface as a peer that cannot read us.
+    """
+    try:
+        return _WIRE_FORMATS[name]
+    except KeyError:
+        raise ValueError(
+            'unknown wire format %r (want one of %s)'
+            % (name, '|'.join(sorted(_WIRE_FORMATS)))) from None
+
+
 class NetWireMessage:
     """Wrapper around C ``net_wire_msg_t``."""
 
@@ -91,14 +111,23 @@ class NetWireMessage:
     def encrypt(self) -> bool:
         return bool(self._ptr.encrypt)
 
-    def to_wire(self) -> bytes:
-        """Serialize to wire format bytes."""
+    def to_wire(self, wire_format: str = 'json') -> bytes:
+        """Serialize to wire format bytes.
+
+        `wire_format` is the ENVELOPE encoding (doc/architecture/network-wire-format.md):
+        'json' (the
+        default, and what every caller outside a group wants) or 'proto'. It is
+        a property of the addressed group, not of this message, so the caller
+        supplies it -- there is no per-peer negotiation and no detection (§2.5).
+        """
         wire_out = ffi.new('uint8_t **')
         wire_len = ffi.new('size_t *')
         # 2nd arg is `const identity_t *signer`; NULL = serialize without
         # signing (matches the C NULL-signer path). Omitting it left the C
         # function reading a garbage pointer for the wire-out slot.
-        rc = lib.net_message_to_wire(self._ptr, ffi.NULL, wire_out, wire_len)
+        rc = lib.net_message_to_wire_fmt(self._ptr, ffi.NULL,
+                                         _fmt_value(wire_format),
+                                         wire_out, wire_len)
         if rc != 0:
             raise RuntimeError(f"net_message_to_wire failed with rc={rc}")
         result = bytes(ffi.buffer(wire_out[0], wire_len[0]))
@@ -106,10 +135,17 @@ class NetWireMessage:
         return result
 
     @classmethod
-    def from_wire(cls, data: bytes, peer: PublicIdentity) -> 'NetWireMessage':
-        """Deserialize from wire format bytes."""
+    def from_wire(cls, data: bytes, peer: PublicIdentity,
+                  wire_format: str = 'json') -> 'NetWireMessage':
+        """Deserialize from wire format bytes.
+
+        The format is STATED, never inferred: a frame whose marker disagrees is
+        refused by the C parser (ENET_WIRE_FORMAT) rather than being handed to
+        the other decoder. See doc/architecture/network-wire-format.md.
+        """
         msg = ffi.new('net_wire_msg_t *')
-        rc = lib.net_message_from_wire(data, len(data), peer._ptr, msg)
+        rc = lib.net_message_from_wire_fmt(data, len(data), peer._ptr,
+                                           _fmt_value(wire_format), msg)
         if rc != 0:
             raise RuntimeError(f"net_message_from_wire failed with rc={rc}")
         return cls(_ptr=msg, _owned=True)

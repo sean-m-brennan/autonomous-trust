@@ -192,14 +192,14 @@ void reputation_install_coop_mode(const uuid_t peer_uuid, bool in_coop);
 int reputation_get_peer_reputation(const uuid_t peer_uuid, double *out);
 
 #ifdef AT_ZTA_ENABLED
-/** Deliver one ZTA standing exactly as the process loop would (ISSUES.md
- *  §10.5), so a test or conformance step can exercise the DDIL cap and the
- *  retroactive unwind without standing up the identity process.
+/** Deliver one ZTA standing exactly as the process loop would
+ * (doc/architecture/zta-integration.md), so a test or conformance step can exercise the
+ * DDIL cap and the retroactive unwind without standing up the identity process.
  *
- *  Worth reaching for deliberately: the defect this whole entry exists to fix
- *  was a ZTA→reputation path that no test could see, so the seam is exposed
- *  rather than left to an integration run nobody performs. Returns 0 when the
- *  standing was applied, -1 if uninitialized. */
+ * Worth reaching for deliberately: the defect this whole entry exists to fix was a
+ * ZTA→reputation path that no test could see, so the seam is exposed rather than left
+ * to an integration run nobody performs. Returns 0 when the standing was applied, -1 if
+ * uninitialized. */
 int reputation_apply_zta_standing(const process_t *proc,
                                   const zta_standing_msg_t *standing);
 
@@ -230,7 +230,7 @@ int reputation_emit_all(const process_t *proc);
 #define REP_SLASH_REASON_PEER_EXCLUDE      "peer_exclude"
 #define REP_SLASH_REASON_INVALID_TX        "invalid_tx"
 
-/** Originate a deep-resolution query for one peer (ISSUES.md 10.2).
+/** Originate a deep-resolution query for one peer (doc/architecture/gateway-reputation-tree.md).
  *
  *  Fire-and-forget: the answer arrives later on rep_resolved and lands where
  *  @ref reputation_resolved_get reads it. Returns the number of child groups

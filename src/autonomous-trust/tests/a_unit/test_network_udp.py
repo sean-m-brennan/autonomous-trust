@@ -390,7 +390,7 @@ class TestInitUdpPtp:
         mock_sock.bind.assert_called_once_with(('192.168.1.10', 8000))
 
     def test_no_reuseaddr(self):
-        """_init_udp_ptp must NOT set SO_REUSEADDR (ISSUES.md 2.4.2).
+        """_init_udp_ptp must NOT set SO_REUSEADDR (doc/architecture/networking.md).
 
         The peer recv socket is owned by exactly one node on this address.
         With the option set on both sockets the kernel accepts a second node's
@@ -779,7 +779,7 @@ def test_reject(setup_teardown):
         # so the first must release it or the second cannot open at all. That
         # used to pass by accident: with SO_REUSEADDR on the unicast recv
         # sockets the second bind succeeded silently and took delivery of
-        # every datagram. The option is gone (ISSUES.md 2.4.2), so a leaked
+        # every datagram. The option is gone (doc/architecture/networking.md), so a leaked
         # listener is now a visible EADDRINUSE rather than quiet theft.
         udp.close_listeners()
 

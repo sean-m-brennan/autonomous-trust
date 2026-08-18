@@ -778,14 +778,14 @@ bool identity_history_verify_object(identity_history_t *history,
         }
     }
 
-    /* Divergence detection (ISSUES.md §3.2): the proof commits the voter to a
-     * specific view of the candidate via its digest. Recompute the blob's hash
-     * — with the proof's nonce, so PoW's mined digest also matches — and reject
-     * a proof whose digest disagrees: that voter is voting on a conflicting
-     * history view of this blob. get_hash is byte-identical Python<->C (pinned
-     * by pow-cross-language-byte-pin), so this is interop-safe. Enforced only
-     * when a digest is present (empty-digest proofs fall through, matching
-     * prior behavior). Mirrors Python IdentityHistory.verify_object. */
+    /* Divergence detection (doc/architecture/identity-protocol.md): the proof commits
+     * the voter to a specific view of the candidate via its digest. Recompute the
+     * blob's hash — with the proof's nonce, so PoW's mined digest also matches — and
+     * reject a proof whose digest disagrees: that voter is voting on a conflicting
+     * history view of this blob. get_hash is byte-identical Python<->C (pinned by
+     * pow-cross-language-byte-pin), so this is interop-safe. Enforced only when a
+     * digest is present (empty-digest proofs fall through, matching prior behavior).
+     * Mirrors Python IdentityHistory.verify_object. */
     if (proof != NULL && proof->digest != NULL && proof->digest_len > 0 &&
         blob->get_hash != NULL) {
         uint8_t computed[MERKLE_DIGEST_LEN];

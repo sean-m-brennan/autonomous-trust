@@ -14,7 +14,7 @@
 #   limitations under the License.
 # ******************
 
-"""`VideoSource`, against real video files (ISSUES §5 S12).
+"""`VideoSource`, against real video files (the S12 video-coverage gap).
 
 `VideoSource.next()` is the video service's capture state machine — rate
 decimation, `speed` dropping, end-of-file rotation, seeking, resize — and it had

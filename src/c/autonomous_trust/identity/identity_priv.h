@@ -43,7 +43,8 @@ int identity_from_json(const json_t *obj, void *data_struct);
  *  id_proc.c when building the peer-bundle inside the ID_HISTORY wire
  *  payload (matches Python `p.publish()` in idprocess.py:507), and by
  *  rep_proc.c to carry co-signer identities inside a deep-resolution answer
- *  (ISSUES.md 10.2) -- a requestor two boundaries away holds no identity from
+ * (doc/architecture/gateway-reputation-tree.md) -- a requestor two boundaries away holds
+ * no identity from
  *  the answering group, so the answer must bring the keys its signatures are
  *  checked against. This is the DRY canonical form shared with Python's
  *  public_identity_to_canonical; rebuilding it anywhere else would be a second

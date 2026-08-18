@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Deep resolution: one peer, on demand, at any depth (ISSUES.md §10.2).
+"""Deep resolution: one peer, on demand, at any depth (doc/architecture/gateway-reputation-tree.md).
 
 A gateway scores a peer against the chain that peer's transactions landed in,
 and holds chains only for groups it belongs to. Two levels down, that chain

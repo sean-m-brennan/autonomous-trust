@@ -79,7 +79,8 @@ typedef struct
  * reasoning as ZTA_CRED_MAX, three orders of magnitude smaller. */
 #define OPERATOR_BINDING_MAX 1024u
 
-/* Domain separation for the CREDENTIAL->identity binding (ISSUES §1.5): which
+/* Domain separation for the CREDENTIAL->identity binding
+ * (doc/architecture/zta-integration.md): which
  * node a ZTA credential authorizes, and the holder's proof of it. Distinct from
  * OPERATOR_BINDING_TAG, which binds the *operator's* ed25519 key to the node
  * (WHICH human); this one binds the *credential* to the node (WHO may present
@@ -357,7 +358,7 @@ int operator_binding_preimage(const public_identity_t *ident,
 
 /**
  * @brief Build the pre-image a ZTA credential's private key signs to authorize
- *        @p ident to present it (ISSUES §1.5).
+ *        @p ident to present it (doc/architecture/zta-integration.md).
  *
  *     ZTA_BINDING_TAG || uuid (16) || ident->signature.public (32)
  *                     || sha256(credential) (32)

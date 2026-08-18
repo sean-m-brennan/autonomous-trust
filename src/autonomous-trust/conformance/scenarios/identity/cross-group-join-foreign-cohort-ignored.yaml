@@ -5,7 +5,7 @@ name: cross-group-join-foreign-cohort-ignored
 byte_pinning: false
 description: |
     A targeted `request_access` names the cohort it is asking to join
-    (ISSUES.md §10.2, payload slot 3). That name is a routing HINT, not
+    (doc/architecture/gateway-reputation-tree.md, payload slot 3). That name is a routing HINT, not
     authority, and this pins the difference.
 
     The slot travels on an open broadcast, so every node on the domain sees it,

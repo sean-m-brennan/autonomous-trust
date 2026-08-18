@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""One logging convention, enforced (ISSUES.md §5 S13).
+"""One logging convention, enforced (the S13 logging sweep).
 
 The convention: build a log message with **lazy %-args** --
 ``logger.info('peer %s joined', uuid)`` -- never by interpolating first

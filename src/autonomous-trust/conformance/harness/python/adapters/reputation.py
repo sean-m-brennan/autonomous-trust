@@ -154,7 +154,7 @@ class _Participant:
                         f'{self.id}: checkpoint_root={actual}, expected {expected}'
                     )
             elif key == 'evidence_doc':
-                # Verifiable warm start (ISSUES §10.3). The persisted-evidence
+                # Verifiable warm start (doc/architecture/reputation.md). The persisted-evidence
                 # document is the ONE artifact both runtimes read, so its shape
                 # belongs in the corpus. Pinned by the fields that carry
                 # meaning across the boundary: the schema (a mismatch is a
@@ -394,7 +394,7 @@ class ReputationAdapter:
         # / handle_grant to recognize the round and look up the score.
         preset_my_requests: dict[str, list[dict[str, Any]]] = fixtures.get('my_requests', {}) or {}
         # tx_history pre-stages bilateral Transactions in self.process.history.
-        # { pid -> [ {task_id, p1, p1_score, p2, p2_score}, ... ] }. p1/p2
+        # { pid -> [{task_id, p1, p1_score, p2, p2_score}, ... ] }. p1/p2
         # reference other participant ids; the adapter resolves them to
         # UUIDv5(rep:<pid>). Required by reputation_pure / _contrite_tft
         # to score against committed bilateral txs.
@@ -411,7 +411,7 @@ class ReputationAdapter:
         # Hysteresis latch read by _compute_reputation; combined with `reputations`,
         # pins which branch (pure vs. CTFT) runs.
         preset_coop_mode: dict[str, dict[str, bool]] = fixtures.get('coop_mode', {}) or {}
-        # zta_standing pre-sets what ZTA proved about a peer (ISSUES §10.5):
+        # zta_standing pre-sets what ZTA proved about a peer (doc/architecture/zta-integration.md):
         # { pid -> { other_pid -> {status, ceiling} } }. Installed directly
         # rather than driven through an admission step because the verdict is
         # produced by the IDENTITY process and this protocol's harness stands up
@@ -765,8 +765,8 @@ class ReputationAdapter:
         proposer_uuid = participants[proposer_id].impl.identity.uuid
 
         if function == ReputationProtocol.rep_resolve:
-            # A query names a peer and nothing else -- deliberately no
-            # originator, which is the opacity property (ISSUES §10.2).
+            # A query names a peer and nothing else -- deliberately no originator, which
+            # is the opacity property (doc/architecture/gateway-reputation-tree.md).
             target = participants[payload['peer']].impl.identity.uuid
             obj = to_json_string(resolve_query_to_dict(
                 str(payload.get('query_id', 'q1')), target,
@@ -874,7 +874,7 @@ class ReputationAdapter:
                 # Co-signatures are SIGNED HERE, at scenario time, by the
                 # sending participant's own key -- not pinned as blobs -- so
                 # both adapters are held to the same pre-image and scheme
-                # rather than to one side's recorded output (the §1.5
+                # rather than to one side's recorded output (the doc/architecture/zta-integration.md
                 # precedent). The ack names its sender, because the receiver
                 # credits the authenticated sender rather than the claim. The
                 # sign step's payload must therefore describe the SAME round

@@ -16,7 +16,7 @@
 
 /**
  * @file broadcast_except_leg_test.c
- * @brief Per-leg broadcast exclusion (at-over-dtn §4.3 D-followup).
+ * @brief Per-leg broadcast exclusion (at-over-dtn D-followup).
  *
  * Verifies that handle_inbound_broadcast, when the transport reports a
  * valid last_recv_leg and provides send_broadcast_except_leg, uses the

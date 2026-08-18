@@ -1447,7 +1447,8 @@ class TestRunningConsensus:
 
 
 class TestScoreRangeAtTheRemoteBoundary:
-    """ISSUES §11.2 on the paths a PEER controls. The constructor raises on an
+    """The [0, 1] score bound (doc/architecture/reputation.md) on the paths a PEER
+    controls. The constructor raises on an
     out-of-range score, and `from_json_string` runs the constructor — so without
     a catch, a remote could raise inside this node's reputation loop. Every
     handler here must drop the message instead, and history must stay clean.
@@ -1558,7 +1559,8 @@ class TestScoreRangeAtTheRemoteBoundary:
 
 
 class TestAppFacingReputationRated:
-    """ISSUES §11.1, a copy of the C twin's design (rep_proc.c + app_events.h):
+    """The app-facing peer carrier (doc/architecture/app-peer-carrier.md), a copy
+    of the C twin's design (rep_proc.c + app_events.h):
     the app-facing carrier says whether AT holds a rating at all, because an
     unrated peer reads as PREREP_NEUTRAL — which is also a score a peer can
     genuinely earn — and a consumer given only the number cannot tell them apart.

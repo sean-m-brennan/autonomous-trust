@@ -276,7 +276,7 @@ SKEW_ENV = 'AT_MAX_COHORT_SKEW_MS'
 def resolve_max_cohort_skew(log: logging.Logger = None) -> tuple[timedelta, str]:
     """Resolve the skew bound: env, then compile-time default.
 
-    Same two layers, refusal rules and bounds as the network tunables (§2.4.4),
+    Same two layers, refusal rules and bounds as the network tunables (doc/architecture/networking.md),
     via the shared ``resolve_env_int``, so C's resolver can mirror it exactly.
     """
     ms, source = system.resolve_env_int(SKEW_ENV, DEFAULT_MAX_COHORT_SKEW_MS,

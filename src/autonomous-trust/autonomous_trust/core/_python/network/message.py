@@ -18,15 +18,36 @@ import json
 import logging
 import uuid as _uuid
 from base64 import b64encode, b64decode
+from uuid import UUID
 
 from nacl.encoding import HexEncoder
 from nacl.exceptions import BadSignatureError
 
-from ..config import Configuration
+from ..config import Configuration, NetWireFormat, NET_WIRE_PROTO_MAGIC
 from .network import Network
 from .. import _probes
+from autonomous_trust.core.protobuf.network import net_message_pb2
 
 logger = logging.getLogger(__name__)
+
+
+class WireFormatMismatch(ValueError):
+    """A frame's format marker disagrees with the format the receiving context
+    speaks (doc/architecture/network-wire-format.md).
+
+    Its own type so a caller can COUNT and LOG the event without inspecting the
+    bytes itself -- a misprovisioned cohort has to be diagnosable, and the
+    operator-facing counter is the whole point (feedback: status text must carry
+    a reason beside the boolean).
+
+    Deliberately NOT an instruction to retry with the other parser. Doing that
+    would be format detection, which is an R&D item with unresolved security
+    questions (doc/architecture/network-wire-format.md), not an accident of
+    the current implementation. A
+    ValueError subclass so every existing `except ValueError` around parse
+    (the conformance negative_runner among them) keeps classifying it as a
+    refusal.
+    """
 
 
 def _sig_to_hex_str(sig):
@@ -215,7 +236,88 @@ class Message(object):
             return content + '|' + _sig_to_hex_str(self.signature)
         return content
 
+    def to_wire(self, wire_format=NetWireFormat.json):
+        """Serialize this message for transmission in *wire_format*.
+
+        The two forms carry the same envelope; see
+        ``network/net_message.proto`` for what differs (encoding of each field)
+        and what does not (the signature pre-image, which is why re-encoding
+        one form as the other cannot invalidate a signature).
+
+        Which form to use is NOT this object's decision and not the peer's: it
+        is the addressed group's ``wire_format``, resolved by the caller
+        (``netprocess``), with JSON for anything outside a group. See
+        See doc/architecture/network-wire-format.md.
+        """
+        if wire_format == NetWireFormat.proto:
+            return self._to_wire_proto()
+        if wire_format != NetWireFormat.json:
+            raise ValueError('unknown wire format %r' % (wire_format,))
+        return self._to_wire_json()
+
+    def _to_wire_proto(self):
+        """The protobuf envelope, prefixed with its one-byte format marker.
+
+        Binary values ride raw here (uuid, public keys, signature, payload)
+        rather than as the JSON form's base64/hex text -- that inflation is the
+        reason this path exists. The SIGNED bytes are unchanged: the signature
+        was computed over ``<process>|<function>|<base64(data)>`` at
+        construction time and is merely carried, so a peer verifies it
+        identically whichever form it arrives in.
+        """
+        from ..identity import Identity
+
+        pb = net_message_pb2.NetMessage()
+        pb.process = self.process
+        pb.function = self.function
+        # RAW payload. The JSON form base64s exactly these bytes.
+        pb.data = self._obj_str().encode(Network.encoding)
+        pb.encrypt = self.encrypt
+        pb.trace_id = self.trace_id
+
+        if self.from_whom is not None and isinstance(self.from_whom, Identity):
+            # A malformed uuid raises rather than being dropped: unlike the
+            # JSON form, which would carry any string through verbatim, the
+            # binary field has no way to represent one -- and silently sending
+            # an identity-less envelope would present as an unadmittable peer
+            # rather than as the encoding fault it is. This is OUR object, not
+            # peer-supplied input, so strictness here costs nothing.
+            try:
+                pb.from_uuid = UUID(str(self.from_whom.uuid)).bytes
+            except (ValueError, AttributeError, TypeError) as err:
+                raise ValueError('cannot encode from_uuid %r for the proto wire '
+                                 'form: %s' % (getattr(self.from_whom, 'uuid', None), err))
+            pb.from_name = getattr(self.from_whom, 'nickname', '') or ''
+            pb.from_address = getattr(self.from_whom, 'address', '') or ''
+            pb.from_rank = int(getattr(self.from_whom, '_rank', 0) or 0)
+            # publish() hands back the 64-char ASCII hex public key; the proto
+            # field is the 32 raw bytes behind it.
+            try:
+                sig_pub = self.from_whom.signature.publish()
+                if sig_pub:
+                    pb.from_sig_key = bytes.fromhex(sig_pub.decode('ascii'))
+            except (AttributeError, TypeError, ValueError):
+                pass
+            try:
+                enc_pub = self.from_whom.encryptor.publish()
+                if enc_pub:
+                    pb.from_enc_key = bytes.fromhex(enc_pub.decode('ascii'))
+            except (AttributeError, TypeError, ValueError):
+                pass
+
+        if self.signature is not None:
+            # 128 hex chars on the JSON wire -> the 64 raw bytes here.
+            pb.signature = bytes.fromhex(_sig_to_hex_str(self.signature))
+
+        return bytes([NET_WIRE_PROTO_MAGIC]) + pb.SerializeToString()
+
     def __bytes__(self):
+        """The JSON envelope. Unchanged, and still what ``bytes(msg)`` means:
+        every caller that has no group in hand (discovery, pre-admission,
+        tests) is asking for the format every AT node can read."""
+        return self._to_wire_json()
+
+    def _to_wire_json(self):
         from ..identity import Identity
 
         data_b64 = self._obj_b64()
@@ -267,10 +369,24 @@ class Message(object):
         return json.dumps(wire, separators=(',', ':')).encode(Network.encoding)
 
     @staticmethod
-    def parse(raw_msg, sender, validate=True):
+    def parse(raw_msg, sender, validate=True, wire_format=NetWireFormat.json):
+        """Revive a message from wire bytes known to be in *wire_format*.
+
+        The format is stated by the caller, never inferred from the bytes
+        (doc/architecture/network-wire-format.md): it is the format of the group the frame
+        arrived on, or
+        JSON for anything outside a group. A frame whose format marker
+        disagrees is REFUSED without being handed to the other parser -- so on
+        a JSON-format node the protobuf parser never sees peer-supplied bytes
+        at all, and vice versa. Sniffing the format instead is an R&D item with
+        its own security questions (doc/architecture/network-wire-format.md),
+        not a shortcut this takes.
+        """
         from ..identity import Identity
         if validate and sender is not None and not isinstance(sender, Identity):
             raise RuntimeError('Sender must be an Identity')
+        if wire_format not in (NetWireFormat.json, NetWireFormat.proto):
+            raise ValueError('unknown wire format %r' % (wire_format,))
         # Envelope-level size cap (parser-side defense-in-depth). The TCP
         # transport already caps inbound bytes at NET_MSG_MAX_DATA, but
         # parse() is also called on in-process / alternate-transport
@@ -282,15 +398,37 @@ class Message(object):
         # produces). Reject reason surfaces as ValueError so the
         # conformance negative_runner classifies it as
         # payload_oversized.
-        wire_len = (len(raw_msg) if isinstance(raw_msg, (bytes, bytearray))
-                    else len(raw_msg.encode(Network.encoding)))
+        raw_bytes = (bytes(raw_msg) if isinstance(raw_msg, (bytes, bytearray))
+                     else raw_msg.encode(Network.encoding))
+        wire_len = len(raw_bytes)
         if wire_len > Network.max_wire_bytes:
             raise ValueError(
                 f'wire envelope exceeds size cap '
                 f'({wire_len} > {Network.max_wire_bytes} bytes)'
             )
-        if isinstance(raw_msg, bytes):
-            raw_msg = raw_msg.decode(Network.encoding)
+
+        # Format gate. One byte decides, before any parser runs: a proto
+        # envelope carries NET_WIRE_PROTO_MAGIC and a JSON one begins '{'.
+        # Both mismatches are ValueError with the reason named, because a
+        # cohort that has been misprovisioned into two formats has to be
+        # DIAGNOSABLE -- the caller counts these and logs them rate-limited.
+        marked_proto = wire_len > 0 and raw_bytes[0] == NET_WIRE_PROTO_MAGIC
+        if wire_format == NetWireFormat.proto:
+            if not marked_proto:
+                raise WireFormatMismatch(
+                    'expected a proto envelope (0x%02X marker) on a proto-format '
+                    'path; first byte is %s'
+                    % (NET_WIRE_PROTO_MAGIC,
+                       ('0x%02X' % raw_bytes[0]) if wire_len else 'absent (empty frame)'))
+            return Message._parse_proto(raw_bytes, sender)
+        if marked_proto:
+            raise WireFormatMismatch(
+                'refusing a proto envelope (0x%02X marker) on a json-format path; '
+                'the sender is using a wire format this group does not speak'
+                % NET_WIRE_PROTO_MAGIC)
+
+        if isinstance(raw_msg, (bytes, bytearray)):
+            raw_msg = raw_bytes.decode(Network.encoding)
 
         # Try JSON wire format first (C interop)
         try:
@@ -324,42 +462,9 @@ class Message(object):
                 # the envelope carries from_* (every request_access does, C and
                 # Python alike), reconstruct the real sender Identity from it so
                 # handlers receive an Identity rather than a bare address/None.
-                eff_sender = sender
-                if not isinstance(eff_sender, Identity):
-                    reconstructed = _identity_from_wire(wire)
-                    if reconstructed is not None:
-                        eff_sender = reconstructed
-                msg = Message(process, function, obj_str, from_whom=eff_sender,
-                              encrypt=wire.get('encrypt', False),
-                              trace_id=wire_trace)
-                msg.verified = False
-
-                # Verify signature if present. Bypass Identity.verify's
-                # two-arg path here: it forwards encoder=HexEncoder to
-                # PyNaCl, but PyNaCl only applies that encoder to the
-                # message arg (not the signature), so any raw signature
-                # is rejected with "must be exactly 64 bytes long". Decode
-                # the wire hex once ourselves and hand the 64-byte
-                # signature straight to VerifyKey.verify with no encoder.
-                sig_hex = wire.get('signature')
-                if sig_hex and eff_sender is not None and isinstance(eff_sender, Identity):
-                    try:
-                        sig_raw = HexEncoder.decode(sig_hex.encode('ascii'))
-                        # Verify over the base64 body (the exact wire `data`
-                        # string), matching the sender's _signable_content and
-                        # the C/_native canonical. Verifying over the decoded
-                        # obj_str was the bug: it rejected every non-empty
-                        # C-signed message ("forged or corrupt").
-                        content = Message._signable_content(
-                            process, function, data_b64)
-                        eff_sender.signature.public.verify(
-                            content.encode(Network.encoding), sig_raw,
-                        )
-                        msg.verified = True
-                    except (BadSignatureError, Exception) as e:
-                        logger.warning('Message signature verification failed from %s: %s', eff_sender, e)
-                        msg.verified = False
-                return msg
+                return Message._assemble(process, function, obj_str, data_b64,
+                                         wire.get('encrypt', False), wire_trace,
+                                         wire.get('signature'), wire, sender)
         except (json.JSONDecodeError, ValueError, KeyError):
             pass
 
@@ -398,4 +503,109 @@ class Message(object):
                 logger.warning('Message signature verification failed from %s: %s', sender, e)
                 msg.verified = False
 
+        return msg
+
+    @staticmethod
+    def _parse_proto(raw_bytes, sender):
+        """Revive a message from a marker-prefixed protobuf envelope.
+
+        Only the DECODING differs from the JSON path; everything downstream --
+        sender reconstruction, the signature pre-image, verification -- runs
+        through the shared :meth:`_assemble`, so the two formats cannot drift
+        into disagreeing about what a message means.
+        """
+        pb = net_message_pb2.NetMessage()
+        try:
+            pb.ParseFromString(raw_bytes[1:])
+        except Exception as err:  # protobuf raises DecodeError (a ValueError subclass in some versions)
+            raise ValueError('malformed proto envelope: %s' % err)
+
+        # An empty process/function is refused, where the JSON path only
+        # requires the keys to be present. This is not gratuitous strictness:
+        # protobuf will happily decode arbitrary bytes into an all-defaults
+        # message, so without this a corrupt frame becomes Message('', '', '')
+        # and gets routed nowhere with no diagnostic. Every real encoder (C and
+        # Python) sets both.
+        if not pb.process or not pb.function:
+            raise ValueError('proto envelope missing process/function '
+                             '(process=%r, function=%r)' % (pb.process, pb.function))
+
+        obj_str = pb.data.decode(Network.encoding) if pb.data else ''
+        # Re-present the binary sender fields in the SAME shape the JSON
+        # envelope uses, so _identity_from_wire is the one implementation of
+        # "reconstruct an unknown sender" for both formats.
+        wire = {
+            'from_uuid': str(UUID(bytes=pb.from_uuid)) if len(pb.from_uuid) == 16 else '',
+            'from_name': pb.from_name,
+            'from_address': pb.from_address,
+            'from_sig_hex': pb.from_sig_key.hex() if pb.from_sig_key else '',
+            'from_enc_hex': pb.from_enc_key.hex() if pb.from_enc_key else '',
+            'from_rank': pb.from_rank,
+            'encrypt': pb.encrypt,
+        }
+        # The signature pre-image is base64(data) in BOTH forms (see
+        # net_message.proto), so the raw payload is re-encoded here rather than
+        # the signature being computed over anything proto-specific.
+        data_b64 = b64encode(pb.data).decode('ascii') if pb.data else ''
+        sig_hex = pb.signature.hex() if pb.signature else None
+        return Message._assemble(pb.process, pb.function, obj_str, data_b64,
+                                 pb.encrypt, pb.trace_id or None, sig_hex,
+                                 wire, sender)
+
+    @staticmethod
+    def _assemble(process, function, obj_str, data_b64, encrypt, trace_id,
+                  sig_hex, wire, sender):
+        """Build the Message and verify its signature — shared by both formats.
+
+        Split out of :meth:`parse`'s JSON branch when the proto envelope landed:
+        the two encodings must agree on sender resolution and on what is
+        verified, and the only way to guarantee that is for there to be one
+        copy of it.
+        """
+        from ..identity import Identity
+
+        # Resolve the sender. When the network layer couldn't map the source
+        # address to a known peer (sender is None) — the request_access
+        # discovery broadcast from a brand-new node, C or Python — reconstruct
+        # the sender identity from the canonical envelope from_* fields. This is
+        # what lets a C at_demo peer (which puts its identity ONLY in from_*,
+        # not the payload) be admitted, and is the receive-side half of the DRY
+        # request_access contract (identity in from_*, payload =
+        # [package_hash, capabilities]).
+        # On the broadcast/multicast channel the network layer passes the source
+        # ADDRESS string as `sender` (netprocess.py, validate=False), and on an
+        # unmatched p2p address it passes None — in both cases the peer identity
+        # is not yet known.
+        eff_sender = sender
+        if not isinstance(eff_sender, Identity):
+            reconstructed = _identity_from_wire(wire)
+            if reconstructed is not None:
+                eff_sender = reconstructed
+        msg = Message(process, function, obj_str, from_whom=eff_sender,
+                      encrypt=encrypt, trace_id=trace_id)
+        msg.verified = False
+
+        # Verify signature if present. Bypass Identity.verify's two-arg path
+        # here: it forwards encoder=HexEncoder to PyNaCl, but PyNaCl only
+        # applies that encoder to the message arg (not the signature), so any
+        # raw signature is rejected with "must be exactly 64 bytes long".
+        # Decode the wire hex once ourselves and hand the 64-byte signature
+        # straight to VerifyKey.verify with no encoder.
+        if sig_hex and eff_sender is not None and isinstance(eff_sender, Identity):
+            try:
+                sig_raw = HexEncoder.decode(sig_hex.encode('ascii'))
+                # Verify over the base64 body (the exact JSON-wire `data`
+                # string, and the re-encoded payload on the proto path),
+                # matching the sender's _signable_content and the C/_native
+                # canonical. Verifying over the decoded obj_str was the bug: it
+                # rejected every non-empty C-signed message ("forged or
+                # corrupt").
+                content = Message._signable_content(process, function, data_b64)
+                eff_sender.signature.public.verify(
+                    content.encode(Network.encoding), sig_raw,
+                )
+                msg.verified = True
+            except (BadSignatureError, Exception) as e:
+                logger.warning('Message signature verification failed from %s: %s', eff_sender, e)
+                msg.verified = False
         return msg

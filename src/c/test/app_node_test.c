@@ -31,7 +31,7 @@
  *     reads `app_name` — an obligation no foreign host was told about.
  *  3. A failed inbound bind was logged and ignored, so a host could hold a live
  *     daemon it could never receive from (break #4's shape again — see
- *     doc/architecture/app-peer-carrier.md).
+ *    doc/architecture/app-peer-carrier.md).
  */
 
 #define DEBUG_TESTS 1

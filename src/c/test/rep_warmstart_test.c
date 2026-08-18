@@ -14,7 +14,7 @@
  *   limitations under the License.
  *******************/
 
-/* Verifiable warm start (ISSUES.md §10.3): the persisted evidence document,
+/* Verifiable warm start (doc/architecture/reputation.md): the persisted evidence document,
  * the checks that gate adopting it, the per-peer ceilings it supports, and the
  * staleness decay it composes with.
  *
@@ -305,7 +305,7 @@ DEFINE_TEST(test_checkpoint_designation_is_the_python_form)
     /* A CHILD-chain designation appends the group, so a co-signature harvested
      * from a child-group round can never read as agreement about the primary
      * chain -- two chains can perfectly well share a root, epoch and bounds
-     * (§10.2). The primary form above is unchanged, which is what keeps every
+     * (doc/architecture/gateway-reputation-tree.md). The primary form above is unchanged, which is what keeps every
      * pinned scenario and the Python twin verifying. */
     uint8_t child[512];
     size_t cn = rep_checkpoint_designation(
@@ -320,7 +320,8 @@ DEFINE_TEST(test_checkpoint_designation_is_the_python_form)
 }
 END_TEST_DEFINITION()
 
-/* --- gateway child chains (ISSUES.md §10.2) ------------------------------ */
+/* --- gateway child chains (doc/architecture/gateway-reputation-tree.md)
+ * ------------------------------ */
 
 DEFINE_TEST(test_evidence_document_carries_the_chain)
 {

@@ -85,6 +85,32 @@ flowchart TB
     Main -- "transaction scores" --> Rep
 ```
 
+## Starting a subsystem, and why the child must never return
+
+A subsystem runner (`identity_run`, `net_process_run`, …) calls `process_setup`,
+which calls `daemonize`, which **forks**. The runner therefore returns *in both
+processes*: the daemon receives the new subsystem's pid, and the subsystem
+receives its own run loop's return value — which happens at shutdown.
+
+**A forked subsystem must `_exit`, never return.** When the six C runners all
+returned instead, each subsystem resumed the daemon's start-every-subsystem loop
+*inside its own process* at shutdown, walking `map_entries_for_each` over the
+registry and forking a fresh generation on the way out. The symptom was survivors
+after a clean stop, with pids higher than anything registered — not because the
+wrong pid was recorded, but because they were forked *during shutdown by the
+exiting subsystems*. Fixed 2026-08-06; a clean shutdown now logs no
+`did not exit; sending SIGKILL` at all.
+
+`daemonize` reports the **grandchild** back through its pipe, which is what the
+pipe is for, so the tracker holds the real workers rather than an intermediate.
+Pinned by `src/c/test/process_child_exit_test.c`.
+
+## Collaborators travel as one context
+
+The recurring `{procs, procs_lock, queues, logger}` collaborators are bundled
+into a single `proc_context_t` (`processes.h`) rather than threaded individually:
+`restart_process` takes 3 parameters instead of 6, `start_process` 5 instead of 8.
+
 ---
 
 *Next: [Node lifecycle](node-lifecycle.md)*

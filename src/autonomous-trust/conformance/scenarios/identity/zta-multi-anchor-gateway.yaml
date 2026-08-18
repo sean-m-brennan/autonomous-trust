@@ -4,7 +4,7 @@ protocol: identity
 name: zta-multi-anchor-gateway
 byte_pinning: false
 description: |
-    Named trust anchors, and admission as ANY-OF across them (ISSUES §1.5).
+    Named trust anchors, and admission as ANY-OF across them (doc/architecture/zta-integration.md).
 
     The policy configures TWO anchors by name — "dod" and "operator" — pointing at
     different CA bundles. The newcomer's credential chains to only one of them.

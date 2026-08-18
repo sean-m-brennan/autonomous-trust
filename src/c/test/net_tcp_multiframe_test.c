@@ -24,7 +24,7 @@
  * first frame, which does not merely cost a reconnect: the sender's next
  * write lands in a half-closed socket and SUCCEEDS, the RST arrives after
  * send() has returned, and that message is gone with no error raised on
- * either side. One silent loss per reuse (ISSUES.md §3.6).
+ * either side. One silent loss per reuse (doc/architecture/network-connection-pooling.md).
  *
  * These drive the real vtable with a plain client socket standing in for the
  * pooled sender, so what is pinned is the observable transport contract:
@@ -349,8 +349,8 @@ END_TEST_DEFINITION()
 
 DEFINE_TEST(test_knob_defaults_match_python)
 {
-    /* Same values, same env names, both runtimes -- the reason these are
-     * knobs at all (ISSUES.md 2.4.4). Python: system.py net_conn_idle_ttl /
+    /* Same values, same env names, both runtimes -- the reason these are knobs at all
+     * (doc/architecture/networking.md). Python: system.py net_conn_idle_ttl /
      * net_max_live_conns. */
     ck_assert_int_eq(NET_CONN_IDLE_TTL_SEC, 30);
     ck_assert_int_eq(NET_MAX_LIVE_CONNS, 64);

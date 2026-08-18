@@ -40,7 +40,7 @@ class Simulator(net.SelectServer):
     seq_fmt = SimClient.seq_fmt
     time_resolution = 'seconds'
 
-    # Default finite comms-range cutoff in metres (ISSUES.md §6). Applied when
+    # Default finite comms-range cutoff in metres. Applied when
     # a scenario leaves SimConfig.max_range_m unset (opt-OUT: finite range is
     # the default). 200 km is generous enough to leave every current
     # terrestrial demo fully connected (the widest, dod_mission, spans ~135 km)
@@ -116,7 +116,7 @@ class Simulator(net.SelectServer):
             self.peers[peer_info.uuid] = PeerMovement(self.start_time, self.cadence, peer_info.path_list)
 
     def _effective_max_range(self) -> float:
-        """Finite comms-range cutoff in metres (ISSUES.md §6, opt-OUT).
+        """Finite comms-range cutoff in metres (opt-OUT).
 
         `SimConfig.max_range_m` unset (None) -> ``DEFAULT_MAX_RANGE_M``; a
         positive value overrides it; a value <= 0 DISABLES the cutoff, returning
@@ -184,7 +184,7 @@ class Simulator(net.SelectServer):
         return max_dist
 
     def _connectivity_terrestrial(self, eligible, mapp, matrix, sig_quality, path_loss):
-        """Terrestrial mode (ISSUES.md §6): emit a SPARSE, reachable-only matrix.
+        """Terrestrial mode: emit a SPARSE, reachable-only matrix.
 
         With a finite comms range (the opt-out default) a uniform spatial grid
         limits candidate pairs to spatial neighbours, so cost scales with actual

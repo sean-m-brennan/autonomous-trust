@@ -1,0 +1,64 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: wire-format-mismatch-refused
+byte_pinning: false
+description: |
+    The strict format gate, in both directions (doc/architecture/network-wire-format.md).
+
+    A receiver is TOLD which envelope format to expect -- the format of the
+    group the frame arrived on, or JSON for anything outside a group -- and
+    refuses a frame whose one-byte marker disagrees. It does not sniff. This
+    case exists because that refusal is a SECURITY property, not a convenience:
+    on a JSON-format node the protobuf parser must never be handed
+    peer-supplied bytes, and on a proto-format node the JSON parser must not.
+    Format detection has unresolved questions of its own (§2.5) and is
+    deliberately unimplemented; if a future change adds sniffing, this case is
+    what fails.
+
+    Refusal must also be DISTINGUISHABLE from "malformed", because the operator
+    consequence differs: a cohort misprovisioned into two formats presents as
+    one peer having gone silent, and the only thing that explains it is a
+    counter that says "foreign format" rather than "bad message". Python raises
+    `WireFormatMismatch` (a ValueError subclass, so existing refusal handling
+    still classifies it); C returns ENET_WIRE_FORMAT.
+
+    The negative controls matter as much as the refusals: each frame must still
+    parse in its OWN format. Two broken encoders would otherwise satisfy the
+    two refusal assertions.
+
+    Production-code analogue:
+      Python: Message.parse(..., wire_format=...) -> WireFormatMismatch;
+              NetworkProcess._msg_to_queue counts net.wire/drop/foreign_format.
+      C:      net_message_from_wire_fmt -> ENET_WIRE_FORMAT.
+
+participants:
+  - id: node
+    role: receiver
+
+fixtures:
+  process: identity
+  function: request_access
+  obj_json: "{}"
+  trace_id: "beefbeefbeefbeefbeefbeefbeefbeef"
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: wire_format_gate
+    description: |
+        The adapter encodes one message in each format, then offers each to the
+        parser under BOTH expectations, recording whether each combination was
+        accepted.
+
+expected_state:
+  node:
+    # Matching format + expectation: accepted.
+    json_as_json_ok: true
+    proto_as_proto_ok: true
+    # Mismatched: refused, and refused as a FORMAT error rather than as
+    # generic malformed input.
+    proto_as_json_refused: true
+    json_as_proto_refused: true
+    refusal_is_format_specific: true

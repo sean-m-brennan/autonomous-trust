@@ -4,7 +4,8 @@ protocol: identity
 name: cross-group-join-rank-refused
 byte_pinning: false
 description: |
-    The rank half of the join gate (ISSUES.md §10.2): a peer that does not
+    The rank half of the join gate (doc/architecture/gateway-reputation-tree.md): a peer
+    that does not
     OUT-RANK a cohort may not solicit membership in it.
 
     Same topology as `cross-group-join-runtime` with the ranks inverted — gw at

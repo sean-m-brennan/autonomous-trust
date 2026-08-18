@@ -287,7 +287,7 @@ DEFINE_TEST(test_tx_history_evicted_task_does_not_reanimate)
 END_TEST_DEFINITION()
 
 /* ----- Phase 1: prev-hash linking (reputation-vs-blockchain-analysis
- * §2.1). Lockstep with the Python twin in tests/a_unit/test_reputation.py
+ * doc/architecture/process-architecture.md). Lockstep with the Python twin in tests/a_unit/test_reputation.py
  * (TestTransactionHistory Phase-1 tests). The canonical serialization and
  * blake2b hashing are byte-identical across languages. */
 

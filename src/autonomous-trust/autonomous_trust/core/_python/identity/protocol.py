@@ -63,7 +63,8 @@ class IdentityProtocol(Protocol):
          _discover_child_gateway already applies one level down.
        - What this does NOT do: hand over a cohort's group key. Child-group
          KEYS remain operator-provisioned; a runtime cross-group join is a
-         separate question (ISSUES.md §10.2) because the group key is the
+         separate question (doc/architecture/gateway-reputation-tree.md) because the group
+         key is the
          confidentiality boundary.
 
     Items 3, 4, & 5 are concurrent
@@ -101,7 +102,8 @@ class IdentityProtocol(Protocol):
     # See doc/architecture/gateway-reputation-tree.md.
     roster_req = 'subtree_roster_query'  # msg.obj <- json {'requestor': uuid_str}
     roster_resp = 'subtree_roster_response'  # msg.obj <- json {'members': [...], 'child_gateways': [uuid_str]}
-    # Runtime hierarchy roots (protocol step 7, ISSUES.md §10.2). A node states
+    # Runtime hierarchy roots (protocol step 7,
+    # doc/architecture/gateway-reputation-tree.md). A node states
     # its own position in the gateway tree -- which cohorts it gateways, and
     # which higher-rank node it federates through -- so the mesh AGREES on the
     # topology instead of each node inferring it privately. Sent on the
@@ -111,7 +113,7 @@ class IdentityProtocol(Protocol):
     # Deliberately carries NO group key and confers no membership: a peer's
     # advertisement is a claim about ITSELF, recorded only when that peer can
     # prove a shared trust anchor (_gateway_authorized). Acquiring a second
-    # cohort's key at runtime is a separate, bigger question (§10.2) and is not
+    # cohort's key at runtime is a separate, bigger question (doc/architecture/gateway-reputation-tree.md) and is not
     # this message.
     hierarchy = 'hierarchy_root'      # msg.obj <- json {'node','parent','children','rank'}
     hierarchy_req = 'hierarchy_query'  # msg.obj <- json {'requestor': uuid_str}
@@ -123,9 +125,9 @@ class IdentityProtocol(Protocol):
     tier_update = 'tier_update'  # msg.obj <- (peer_uuid_str, new_tier_int)
     # Local-only IPC (no wire egress). ReputationProcess emits this to
     # CfgIds.negotiation when a peer's trust tier drops (demotion).
-    # NegotiationProcess.handle_tier_lost cancels any in-flight tasks
-    # whose capability.required_tier exceeds new_tier. See
-    # doc/architecture/trust-tiers.md §7.2.
+    # NegotiationProcess.handle_tier_lost cancels any in-flight tasks whose
+    # capability.required_tier exceeds new_tier. See doc/architecture/trust-tiers.md
+    # §7.2.
     tier_lost = 'tier_lost'  # msg.obj <- (peer_uuid_str, new_tier_int)
     # Group partition recovery (doc/architecture/partition-recovery.md).
     # partition_signal: local-only IPC. NetProcess emits this when it
@@ -148,15 +150,14 @@ class IdentityProtocol(Protocol):
     partition_response = 'group_partition_response'
     # Operator-attended pull (ethne D8 guardian edge, attended-now half).
     # A consumer asks a node whether a human is at its console RIGHT NOW;
-    # the node answers with a freshly stamped, independently verifiable
-    # attestation (the same payload shape the admission path carries, so the
-    # receiver re-verifies the real operator credential rather than trusting
-    # an asserted bool). Pull-on-demand by design: there is no periodic
-    # keepalive re-announce, so an idle network carries no attestation
-    # traffic at all. The requestor's nonce is echoed back and is
-    # load-bearing — without it a signed attestation could be replayed
-    # forever, which would defeat the whole point of attended-NOW.
-    # See doc/architecture/operator-attended.md.
+    # the node answers with a freshly stamped, independently verifiable attestation (the
+    # same payload shape the admission path carries, so the receiver re-verifies the
+    # real operator credential rather than trusting an asserted bool). Pull-on-demand by
+    # design: there is no periodic keepalive re-announce, so an idle network carries no
+    # attestation traffic at all. The requestor's nonce is echoed back and is
+    # load-bearing — without it a signed attestation could be replayed forever, which
+    # would defeat the whole point of attended-NOW. See
+    # doc/architecture/operator-attended.md.
     attest_req = 'operator_attest_query'  # msg.obj <- json {'nonce': hex_str}
     attest_resp = 'operator_attest_response'  # msg.obj <- json {'nonce': hex_str, ...attestation}
     # Local-only IPC (no wire egress). A consumer (ethne's guardian edge, the
@@ -168,14 +169,13 @@ class IdentityProtocol(Protocol):
     # mints the nonce, emits the query, verifies the reply, and reports the
     # verified stamp back for consumers to read.
     attest_trigger = 'operator_attest_trigger'  # msg.obj <- json {'target': uuid_str}
-    # Local-only IPC (no wire egress). The live OperatorSession lives in the
-    # console app's address space, which the node's MAIN LOOP shares (the
-    # bridge runs run_forever in a daemon thread) — but IdentityProcess runs
-    # in its own subprocess and cannot see it. So on an inbound attest_req
-    # the identity process asks the main loop for the current session state
-    # and answers the pull once it replies. A round trip per pull, rather
-    # than a cached mirror: nothing is stored, so nothing can go stale.
-    # See doc/architecture/operator-attended.md.
+    # Local-only IPC (no wire egress). The live OperatorSession lives in the console
+    # app's address space, which the node's MAIN LOOP shares (the bridge runs
+    # run_forever in a daemon thread) — but IdentityProcess runs in its own subprocess
+    # and cannot see it. So on an inbound attest_req the identity process asks the main
+    # loop for the current session state and answers the pull once it replies. A round
+    # trip per pull, rather than a cached mirror: nothing is stored, so nothing can go
+    # stale. See doc/architecture/operator-attended.md.
     operator_state_req = 'operator_state_query'  # msg.obj <- '' (identity asks main)
     operator_state_resp = 'operator_state_response'  # msg.obj <- json {'attended', 'epoch', 'have_session'}
 

@@ -44,7 +44,7 @@ void zta_policy_defaults(zta_policy_t *policy)
     strncpy(policy->verifier_type, "x509", ZTA_VERIFIER_TYPE_LEN - 1);
     /* ca_bundle_path, ocsp_url, crl_path left empty (zeroed) */
     /* REQUIRE by default: an unbound credential leaves the gate on first-use-wins,
-       which is the hole §1.5 is about. Matches Python's default. */
+       which is the hole doc/architecture/zta-integration.md is about. Matches Python's default. */
     policy->binding_mode = ZTA_BINDING_MODE_REQUIRE;
     snprintf(policy->san_uri_template, ZTA_PATH_LEN, "%s", ZTA_SAN_URI_TEMPLATE);
     /* anchors left empty; resolved_anchors() synthesizes the historical pair. */

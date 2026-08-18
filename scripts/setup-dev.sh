@@ -33,7 +33,7 @@ CFG_DIR="$CONFIG_DIR/cfg"
 ENV_NAME="autonomous_trust"
 MINIFORGE_HOME="$HOME/.miniforge3"
 
-# Pinned conda toolchain (ISSUES.md §9.1). MINIFORGE_VERSION selects the
+# Pinned conda toolchain (config/cfg/toolchain-pins.env). MINIFORGE_VERSION selects the
 # installer release below; the file also carries the container-image pin the
 # Dockerfiles use. Fall back to `latest` only if the file is missing, and say so
 # -- a floating installer is exactly the drift §9.1 records.
@@ -83,7 +83,7 @@ install_miniforge() {
         url="https://github.com/conda-forge/miniforge/releases/download/${MINIFORGE_VERSION}/Miniforge3-${PLATFORM}-${ARCH}.sh"
     else
         warn "No MINIFORGE_VERSION in $TOOLCHAIN_PINS -- falling back to the" \
-             "floating latest release (see ISSUES.md §9.1)"
+             "floating latest release (want config/cfg/toolchain-pins.env)"
         info "Installing Miniforge to $MINIFORGE_HOME ..."
         url="https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-${PLATFORM}-${ARCH}.sh"
     fi
@@ -148,7 +148,7 @@ create_conda_env() {
 update_conda_env() {
     # No `conda update -n base conda` here: it floats base conda to whatever
     # conda-forge published today, which defeats the pinned installer above and
-    # is one of the drifts behind ISSUES.md §9.1. To move conda, move the pin in
+    # is one of the drifts that broke a working build. To move conda, move the pin in
     # config/cfg/toolchain-pins.env and re-run the install path.
     activate_conda
     info "Updating conda environment '$ENV_NAME' ..."

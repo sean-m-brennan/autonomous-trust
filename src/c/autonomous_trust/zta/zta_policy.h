@@ -37,7 +37,8 @@ extern "C" {
 
 /* How hard the admission gate insists on a credential->identity binding
  * (@ref zta_binding.h). REQUIRE is the default because without a binding the gate
- * falls back on first-use-wins, and TOFU is the whole of ISSUES §1.5. The cost is
+ * falls back on first-use-wins, and TOFU is the whole of
+ * doc/architecture/zta-integration.md. The cost is
  * a flag day: a credential provisioned before bindings existed is refused until
  * re-provisioned, so a fleet mid-migration wants PREFER for one hop.
  *
@@ -106,7 +107,8 @@ typedef struct {
                                                         the node cannot confirm any peer is human
                                                         (operator_bound stays false, fail-safe).
                                                         Parity with Python ZtaPolicy. */
-    /* Named trust anchors, one per agency (ISSUES §1.5). EMPTY IS THE COMMON CASE
+    /* Named trust anchors, one per agency (doc/architecture/zta-integration.md). EMPTY IS
+     * THE COMMON CASE
        AND NOT A DEGENERATE ONE: zta_policy_resolved_anchors() synthesizes the
        historical pair from ca_bundle_path / operator_ca_bundle_path, so every
        pre-existing config resolves to exactly the two anchors it already had, in

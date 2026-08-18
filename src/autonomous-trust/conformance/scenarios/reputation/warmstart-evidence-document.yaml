@@ -5,14 +5,14 @@ name: warmstart-evidence-document
 byte_pinning: false
 description: |
     Verifiable warm start — the persisted evidence document and the score
-    ceilings it supports (ISSUES.md §10.3, doc/architecture/reputation.md).
+    ceilings it supports (doc/architecture/reputation.md, doc/architecture/reputation.md).
 
     `reputation.cfg.json` records a CONCLUSION and nothing about how it was
     reached, so reloading it makes trust durable rather than verifiable. The
     evidence lives beside it in `reputation-history.cfg.json`: the hash-linked
     committed window plus the quorum-signed checkpoint over it. That file is the
     ONE artifact both runtimes read — deliberately plain JSON rather than either
-    runtime's config envelope, the same reasoning as the trust ladder (§10.1) —
+    runtime's config envelope, the same reasoning as the trust ladder —
     so its shape belongs in this corpus.
 
     The `evidence_ceiling_of` assertion is the load-bearing half. Verifying that

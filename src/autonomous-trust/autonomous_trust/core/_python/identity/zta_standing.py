@@ -16,7 +16,7 @@
 
 """IPC carrier for what ZTA proved (or failed to prove) about a peer.
 
-ISSUES.md §10.5. The ZTA verdict is discovered by IdentityProcess -- it owns
+See doc/architecture/zta-integration.md. The ZTA verdict is discovered by IdentityProcess -- it owns
 admission and the verifier -- but the thing it must bound, reputation, lives in
 another process. This is that hand-off, fanned out exactly like
 :class:`ChildGroupSet` via ``ProcessTracker.update`` and consumed in
@@ -24,7 +24,7 @@ another process. This is that hand-off, fanned out exactly like
 
 Why a *ceiling* and not a score: a ZTA verdict is an authority finding about
 whether an identity is who it claims, not the outcome of an interaction with
-it. AT's reputation scale is [0, 1] with no negatives (§11.2), so a "penalty"
+it. AT's reputation scale is [0, 1] with no negatives (doc/architecture/reputation.md), so a "penalty"
 has no representation on it at all, and the earlier attempt to send one as
 ``score = -0.8`` was rejected at the boundary twice over -- see
 ``zta_process.c::_send_reputation_penalty``. A bound on how far an unproved
@@ -51,7 +51,8 @@ STANDING_FAILED = 'failed'
 #: Deliberately NOT the six-valued `ZtaStatus`. These three are the distinctions
 #: reputation can act on; the verifier's own status rides along in `reason` for
 #: the operator log. Keeping the acted-on vocabulary small is the same argument
-#: ISSUES §12.8 makes about evidence channels, applied in the small: a consumer
+#: doc/architecture/reputation.md makes about evidence channels, applied in the
+#: small: a consumer
 #: should be handed the distinction it needs, not a wider enum it must re-derive.
 STANDINGS = (STANDING_PROVED, STANDING_CAPPED, STANDING_FAILED)
 
@@ -70,7 +71,7 @@ class ZtaStanding(object):
                         credential is unproved, or None for "no bound"
     :param verified_at: epoch seconds of the most recent PROVED verification,
                         or None if this peer has never verified. This is the
-                        anchor the retroactive unwind reaches back to (§10.5):
+                        anchor the retroactive unwind reaches back to (doc/architecture/zta-integration.md):
                         standing earned after the last point ZTA actually
                         proved something is what a later failure calls into
                         question, and standing earned before it is not.

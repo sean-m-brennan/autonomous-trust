@@ -135,29 +135,28 @@ int _process_start(pid_t orig, char *pname, handler_ptr_t runner, map_t *configs
     char sig[SIG_NAME_LEN + 1] = {0};
     process_name_to_signal(pname, sig);
 
-    /* The runner FORKS (process_setup -> daemonize) and returns in BOTH
-     * processes: the caller gets the new subsystem's pid, the subsystem itself
-     * gets whatever its own run loop returned once that loop ends — which is at
-     * shutdown.
+    /* The runner FORKS (process_setup -> daemonize) and returns in BOTH processes: the
+     * caller gets the new subsystem's pid, the subsystem itself gets whatever its own
+     * run loop returned once that loop ends — which is at shutdown.
      *
      * A subsystem must therefore never RETURN from here. Returning resumes this
-     * function, and then the daemon's start-every-subsystem loop
-     * (autonomous_trust.c), inside the subsystem process — so at shutdown each
-     * exiting subsystem forks a fresh generation of subsystems, which are
-     * orphaned when the daemon goes. That is ISSUES §2.1.3: a stopped daemon
-     * leaving live processes behind, still logging identity and network work on
-     * a node the operator believes is down.
+     * function, and then the daemon's start-every-subsystem loop (autonomous_trust.c),
+     * inside the subsystem process — so at shutdown each exiting subsystem forks a
+     * fresh generation of subsystems, which are orphaned when the daemon goes. That is
+     * doc/architecture/process-architecture.md: a stopped daemon leaving live processes
+     * behind, still logging identity and network work on a node the operator believes
+     * is down.
      *
-     * Detected by comparing pids across the call rather than by the runner's
-     * return value: the value means different things in the two processes and
-     * differs per runner, while "am I the process that called this" is exactly
-     * the question and is never ambiguous. Fixing it here rather than in each of
-     * the six runners keeps the next runner from inheriting the bug by omission.
+     * Detected by comparing pids across the call rather than by the runner's return
+     * value: the value means different things in the two processes and differs per
+     * runner, while "am I the process that called this" is exactly the question and is
+     * never ambiguous. Fixing it here rather than in each of the six runners keeps the
+     * next runner from inheriting the bug by omission.
      *
-     * _exit, not exit: this process is a fork of the daemon and shares its
-     * atexit handlers and stdio buffers. Running them here would flush and tear
-     * down state the daemon still owns. The runner has already closed its own
-     * descriptors by this point. */
+     * _exit, not exit: this process is a fork of the daemon and shares its atexit
+     * handlers and stdio buffers. Running them here would flush and tear down state the
+     * daemon still owns. The runner has already closed its own descriptors by this
+     * point. */
     pid_t caller = getpid();
     pid_t pid = proc->runner(proc, queues, sig, logger);
     if (getpid() != caller)

@@ -1045,9 +1045,9 @@ int tx_history_era_from_json(tx_history_t *hist, const json_t *arr)
     return 0;
 }
 
-/****************************
- * Persisted reputation evidence (verifiable warm start, ISSUES §10.3)
- ****************************/
+/****************************  *
+ * Persisted reputation evidence (verifiable warm start, doc/architecture/reputation.md)
+ * ************************** */
 
 int rep_checkpoint_init(rep_checkpoint_t *ckpt)
 {
@@ -1669,7 +1669,7 @@ static double reputation_prereputation_prior(const tx_history_t *hist,
  * in [0.0, 1.0], not the binary 0.0/1.0 the previous implementation
  * returned from the last direct tx alone.
  *
- *   - No bilateral history with us → reputation_prereputation_prior (§2.4),
+ *   - No bilateral history with us → reputation_prereputation_prior (doc/architecture/networking.md),
  *       which is PREREP_NEUTRAL (0.2) when the chain knows nothing of the peer
  *   - peer defected last AND my standing is poor → max(0.51, peer_standing)
  *   - peer defected last AND my standing is good  → min(0.49, peer_standing)
@@ -1716,7 +1716,7 @@ double reputation_contrite_tft(const tx_history_t *hist, const reputations_t *re
 
     if (n < 1)
         /* Cold-start: no bilateral history WITH us. Fall back to a
-         * transaction-memory prior rather than a flat neutral (§2.4). */
+         * transaction-memory prior rather than a flat neutral (doc/architecture/networking.md). */
         return reputation_prereputation_prior(hist, reps, self_uuid, peer_uuid);
 
     double peer_standing = peer_sum / (double)n;

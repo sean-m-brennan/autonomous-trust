@@ -31,7 +31,8 @@ class TestTransactionScore:
 
 
 class TestTransactionScoreRange:
-    """ISSUES §11.2, from kith-covenant's erosion-legibility audit: the [0, 1]
+    """The [0, 1] score bound (doc/architecture/reputation.md), from
+    kith-covenant's erosion-legibility audit. The [0, 1]
     scale was a convention rather than an enforced invariant, so an out-of-range
     score was GRADED — folded into the weighted average, moving a reputation by an
     unbounded amount — instead of rejected."""
@@ -90,7 +91,8 @@ class TestTransactionScoreRange:
 
 
 class TestPeerReputationCarrier:
-    """ISSUES §11.1. Mirror of C's `peer_reputation_msg_t` / `at_app_reputation_t`:
+    """The app-facing peer carrier (doc/architecture/app-peer-carrier.md).
+    Mirror of C's `peer_reputation_msg_t` / `at_app_reputation_t`:
     `rated` says whether AT holds a rating at all, because an unrated peer reads
     as PREREP_NEUTRAL, which is also a score a peer can genuinely earn."""
 
@@ -286,7 +288,7 @@ class TestTransactionHistory:
         assert first_tid not in th._task_mapping
 
     # ----- Phase 1: prev-hash linking (reputation-vs-blockchain-analysis
-    # §2.1). Lockstep with the C twin's hash-link tests in
+    # doc/architecture/process-architecture.md). Lockstep with the C twin's hash-link tests in
     # src/c/test/reputation2_test.c — keep the canonical serialization and
     # blake2b hashing byte-identical so the two languages agree on links.
 
@@ -484,13 +486,11 @@ class TestReputations:
         assert r[pid] == 0.7
 
 
-# Algorithm pins for ReputationProcess._contrite_tit_for_tat and
-# ._pure_reputation.  These mirror the C unit tests in
-# src/c/test/reputation3_test.c (test_reputation_contrite_tft,
-# test_reputation_pure_with_counterparty) using identical input shapes
-# and expected outputs, so cross-language divergence in the algorithm
-# fails one side's tests immediately.  Documented in
-# doc/architecture/reputation.md:71-83.
+# Algorithm pins for ReputationProcess._contrite_tit_for_tat and ._pure_reputation.
+# These mirror the C unit tests in src/c/test/reputation3_test.c
+# (test_reputation_contrite_tft, test_reputation_pure_with_counterparty) using identical
+# input shapes and expected outputs, so cross-language divergence in the algorithm fails
+# one side's tests immediately.  Documented in doc/architecture/reputation.md:71-83.
 
 def _stub_proc(self_uuid, reputations=None):
     """Build the minimal SimpleNamespace that _contrite_tit_for_tat /

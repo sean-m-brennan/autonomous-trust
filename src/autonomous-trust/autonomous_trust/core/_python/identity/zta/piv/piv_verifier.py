@@ -145,7 +145,7 @@ class PivVerifier(Verifier):
             # *peer* presents on the wire). PivVerifier is a strict superset of
             # X509Verifier: chain-only here, chain + challenge-response below.
             # This lets verifier_type="mfa" gate both peer admission (bare cert)
-            # and operator activation (envelope) -- see §3.2 "no change to the
+            # and operator activation (envelope) -- see doc/architecture/identity-protocol.md "no change to the
             # admission gate". (A DER cert begins 0x30 0x82..., never the
             # 0x0000.... length prefix of an envelope, so the two never alias.)
             return self._x509.verify_credential(cred_data)

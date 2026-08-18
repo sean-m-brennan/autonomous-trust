@@ -406,6 +406,7 @@ set(protos
     autonomous_trust/core/protobuf/identity/identity.proto
     autonomous_trust/core/protobuf/identity/protocol.proto
     autonomous_trust/core/protobuf/negotiation/task.proto
+    autonomous_trust/core/protobuf/network/net_message.proto
     autonomous_trust/core/protobuf/processes/capabilities.proto
     autonomous_trust/core/protobuf/structures/dag.proto
     autonomous_trust/core/protobuf/structures/data.proto
