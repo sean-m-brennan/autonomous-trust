@@ -30,7 +30,7 @@ description: |
 
     Note: ping and ntp ports are deliberately absent. C implements neither, so
     there is no cross-language contract to assert; Python derives its own from
-    the same base (see ISSUES.md, ping/ntp are Python-only).
+    the same base (doc/architecture/networking.md; ping/ntp are Python-only).
 
 participants:
   - id: node

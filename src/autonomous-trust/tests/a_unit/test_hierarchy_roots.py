@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Runtime hierarchy roots — identity protocol step 7 (ISSUES.md §10.2).
+"""Runtime hierarchy roots — identity protocol step 7 (doc/architecture/gateway-reputation-tree.md).
 
 The gateway hierarchy used to exist only in seeded config: `parent_gateway` was
 initialized and never assigned, and a second group could not arrive at runtime
@@ -99,7 +99,7 @@ def _node(uuid='me', primary=None, child_groups=None, child_gateways=None,
     proc.q_cadence = 0.01
     proc.logger = MagicMock()
     proc.report_exception = MagicMock()
-    # Gateway authority is §10.5's proved-shared-anchor gate; the tests that
+    # Gateway authority is doc/architecture/zta-integration.md's proved-shared-anchor gate; the tests that
     # care about it override this.
     proc._gateway_authorized = (lambda u: True) if authorized is True else authorized
     return proc
@@ -133,7 +133,7 @@ class TestDeriveParent:
         assert node._derive_parent_gateway() == 'zzz'
 
     def test_unauthorized_candidate_is_passed_over(self):
-        """§10.5's rule applied upward: a peer holding only a foreign agency's
+        """See doc/architecture/zta-integration.md's rule applied upward: a peer holding only a foreign agency's
         credential is never federated through, even at higher rank."""
         node = _node(primary=_group('g0', {'me': 'a0', 'foreign': 'a1',
                                            'ours': 'a2'}),

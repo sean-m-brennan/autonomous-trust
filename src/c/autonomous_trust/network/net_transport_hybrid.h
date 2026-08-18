@@ -112,7 +112,7 @@ typedef struct hybrid_inner_s {
  *      net_transport_hybrid.c) allocates this struct and populates
  *      from JSON; net_proc.c finds it in proc->configs["hybrid"]
  *      and points transport_specific at it. */
-/** Group-routing entry for AT_NET_GROUP_FORWARD (at-over-dtn §4.3 stage F).
+/** Group-routing entry for AT_NET_GROUP_FORWARD (at-over-dtn stage F).
  *  A gateway receiving a GROUP-addressed envelope whose dst_uuid matches
  *  @c group_uuid re-emits the frame via @c leg_index. Stored inline in
  *  hybrid_config_t regardless of build flags so the JSON schema is stable;

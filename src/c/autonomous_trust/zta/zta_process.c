@@ -112,11 +112,11 @@ static struct {
 /**
  * @brief Tell the reputation process what ZTA now knows about a peer.
  *
- * ISSUES.md §10.5. This replaces `_send_reputation_penalty`, which did
+ * doc/architecture/zta-integration.md. This replaces `_send_reputation_penalty`, which did
  * nothing: it stamped a zero `task_uuid`, which the reputation process
  * discards by design as the "system score" sentinel
  * (`rep_proc.c::_handle_local_tx_score`), AND it sent `score = -penalty`,
- * which `tx_score_in_range` has rejected since §11.2 fixed the scale at
+ * which `tx_score_in_range` has rejected since fixed the scale at
  * [0, 1] with no negatives. A revoked credential therefore produced two log
  * lines and cost the peer nothing at all, in the fielded runtime, with no test
  * covering it.
@@ -150,7 +150,7 @@ static void _send_zta_standing(process_t *proc, const uuid_t peer_uuid,
              (int)standing, ceiling, uuid_str, reason ? reason : "");
 }
 
-/** A post-admission verification failure: unwind and demote (§10.5). The peer
+/** A post-admission verification failure: unwind and demote (doc/architecture/zta-integration.md). The peer
  *  also stays bounded going forward -- unwinding once is not enough when the
  *  peer keeps transacting. */
 static void _send_reputation_penalty(process_t *proc, const uuid_t peer_uuid,
@@ -583,7 +583,7 @@ static void _reverify_peers(process_t *proc, logger_t *logger)
 
         case ZTA_VERIFIED:
             log_debug(logger, "ZTA: peer %s credential still valid\n", uuid_str);
-            /* Re-anchor the unwind (§10.5): everything committed up to now was
+            /* Re-anchor the unwind (doc/architecture/zta-integration.md): everything committed up to now was
              * observed while this credential verified, so a LATER failure must
              * not reach back past this point. Also lifts any ceiling the peer
              * was under, which is what lets a DDIL admission recover once the
@@ -665,7 +665,7 @@ static void _resolve_deferred(process_t *proc, logger_t *logger)
             log_info(logger, "ZTA: deferred verification resolved for peer %s: VERIFIED\n",
                      uuid_str);
             /* The DDIL condition has cleared: lift the ceiling this peer was
-             * admitted under and anchor the unwind here (§10.5). Until the cap
+             * admitted under and anchor the unwind here (doc/architecture/zta-integration.md). Until the cap
              * was actually enforced there was nothing for this branch to lift,
              * which is why it only logged. */
             _send_zta_standing(proc, entry.peer_uuid, ZTA_STANDING_PROVED,

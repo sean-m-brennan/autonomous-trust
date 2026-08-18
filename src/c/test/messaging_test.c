@@ -111,7 +111,7 @@ DEFINE_TEST(test_messages)
 }
 END_TEST_DEFINITION()
 
-/* --- ISSUES.md §2.1.1: the socket path -------------------------------------
+/* --- The socket-path length overflow -------------------------------------
  *
  * `unix_addr` built its path in a 108-byte `sun_path`-sized buffer and told
  * `get_data_dir` the buffer held 255, so a long AUTONOMOUS_TRUST_ROOT wrote past

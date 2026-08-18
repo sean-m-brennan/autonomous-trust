@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Adopt the older/larger group on merge — ISSUES.md §3.1-b.
+"""Adopt the older/larger group on merge — doc/architecture/identity-protocol.md.
 
 Membership size stays the PRIMARY merge signal (handled elsewhere / unchanged);
 on a size TIE between different groups the OLDER group (smaller `created`

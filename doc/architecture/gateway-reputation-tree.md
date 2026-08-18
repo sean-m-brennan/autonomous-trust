@@ -2,9 +2,13 @@
 
 # Tree-structured reputation blockchain for gateway nodes
 
-> Phases 0-2 are what the code carries; phase 3 (C parity and persistence) is
-> specified below and tracked in [`ISSUES.md`](../../ISSUES.md) §10.2. The phasing
-> described here is the design, not a plan of work.
+> **All phases are built, in both runtimes (2026-08-13).** Phase 3 — C parity for
+> the chain-per-child-group, child-chain persistence across gateway restart,
+> hierarchy-root discovery, and the runtime cross-group join — landed with the
+> earlier phases; grandchild *aggregation* was rejected as unscalable and replaced
+> by deep resolution (below). The phasing described here is the design, not a plan
+> of work. This document is the reference for that design; source comments point
+> here rather than at a tracker entry.
 
 ## Context
 
@@ -191,14 +195,30 @@ anchor we accept. What cannot be checked from outside the boundary, whether
 those signers are a majority of that group, is reported as a count rather than
 assumed.
 
-See `ISSUES.md` §10.2, `tests/a_unit/test_deep_resolution.py`,
+See `tests/a_unit/test_deep_resolution.py`,
 `src/c/test/rep_resolve_test.c`, and the corpus scenarios
 `deep-resolution-evidence` / `deep-resolution-withheld-entry-refused`.
 
-### Phase 3: not built (see `ISSUES.md` §10.2)
-- C-twin parity for the new `group_uuid` payload field + conformance corpus.
-- Persistence of `child_groups` / child chains across gateway restart (today only primary persists).
-- Partition-recovery reconciliation (see R2).
+### Phase 3: built, both runtimes (2026-08-13)
+- **C-twin parity** for the `group_uuid` payload field, plus corpus coverage.
+- **Child-chain persistence** across gateway restart. Checkpoints are *per chain*:
+ `Checkpoint.group_uuid` ('' == primary) selects which chain a round covers, and each
+ chain carries its own epoch counter and its own evidence file
+ (`reputation-history-<group_uuid>.cfg.json`). The chain id rides *inside* the signed
+ designation, but only when non-empty — so a primary designation stays byte-identical
+ to what it always was (every existing co-signature, pinned scenario and the C twin keep
+ verifying) while a child designation can never collide with a primary one. Without
+ that, a co-signature harvested from a child round would read as agreement about the
+ primary chain, since two chains can share a root, epoch and bounds.
+- **Child-chain restore is deliberately late, and therefore only lifts.**
+ `child_groups` arrives over IPC *after* `ReputationProcess.__init__`, so a boot-time
+ rebuild cannot know which subtrees are ours — and reading the evidence file for a group
+ we may not gateway is exactly what must not happen. Child chains are restored on the
+ first `process()` iteration instead, bounded by the persisted value the peer was clamped
+ away from: restore returns standing the subtree's evidence bears out, and never lowers a
+ score the peer has since earned.
+- Partition-recovery reconciliation (see R2) — see
+ [Partition recovery](partition-recovery.md).
 - ~~Grandchild recursive aggregation (depth > 2).~~ Superseded by deep resolution above
  (2026-08-13). Aggregation was rejected as unscalable, and the need is met per-interaction.
 
@@ -448,7 +468,11 @@ where "it is the highest-rank member of X" is a guess.
 no key; child-group keys remain operator-provisioned. A runtime cross-group
 *join*, a node acquiring a second cohort's key over the wire, is a separate
 question, because that key is the confidentiality boundary of the whole system.
-It is tracked in `ISSUES.md` §10.2.
+**It is built (2026-08-13):** admission is decided by the receiving cohort rather
+than by the joiner, gated on an anchor + rank solicitation, and the group key
+*rotates* on admission with an epoch that makes a rotation safe to accept. See
+`conformance/scenarios/identity/cross-group-join-runtime` and
+`group-key-rotates-on-admission`.
 
 Rank note: the membership of a cohort is an **address map**, so a node can know a
 member, and need its rank to decide who leads it, before it holds the Identity of

@@ -1,0 +1,29 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: message-envelope-proto-empty-obj
+description: |
+    Proto envelope boundary: obj="". Proto3 omits a default-valued field, so an
+    empty payload means the `data` field is ABSENT from the encoding rather than
+    present-and-empty — the opposite of the JSON form, which must emit `""`
+    explicitly (see message-envelope-empty-obj). Both readings have to agree on
+    what an absent `data` means, and pinning the bytes is how a runtime that
+    started emitting a zero-length `data` field (harmless-looking, different
+    bytes) gets caught.
+
+    The signature pre-image is unaffected: base64("") == "", so the trailing
+    "|" of "<process>|<function>|<base64(data)>" is present in both forms and an
+    empty-payload message signed on one side verifies on the other.
+byte_pinning: true
+envelope_format: proto
+wire_format: json
+serialize_mode: json
+constructor: Message
+input:
+  process: "identity"
+  function: "noop"
+  obj: ""
+  encrypt: false
+  trace_id: "0000000000000000ffffffffffffffff"
+expected:
+  proto_wire_hex: "ab0a086964656e7469747912046e6f6f702a203030303030303030303030303030303066666666666666666666666666666666"

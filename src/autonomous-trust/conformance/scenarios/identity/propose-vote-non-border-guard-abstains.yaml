@@ -4,7 +4,7 @@ protocol: identity
 name: propose-vote-non-border-guard-abstains
 byte_pinning: false
 description: |
-    Border-guards-only voting (ISSUES.md §3.1-c, Policy B). This is the
+    Border-guards-only voting (doc/architecture/identity-protocol.md, Policy B). This is the
     negative control for propose-vote-admit: same happy-path propose→vote
     topology, but the recipient bob is designated a NON-border-guard
     (`border_guard: false`). A non-border-guard consumes the proposal but

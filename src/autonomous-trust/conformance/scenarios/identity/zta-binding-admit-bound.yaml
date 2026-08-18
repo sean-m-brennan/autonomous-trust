@@ -5,7 +5,7 @@ name: zta-binding-admit-bound
 byte_pinning: false
 description: |
     The credential->identity binding, happy path, and the case that makes
-    `binding_mode: require` usable at all (ISSUES §1.5).
+    `binding_mode: require` usable at all (doc/architecture/zta-integration.md).
 
     The newcomer presents a chain-valid credential AND a holder-asserted binding
     — a signature by that credential's own private key over

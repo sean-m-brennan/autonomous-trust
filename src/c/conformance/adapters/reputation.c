@@ -86,7 +86,7 @@ typedef struct {
     int request_count;
     int64_t last_id;
     rp_peer_rep_t peer_reps[SCE_MAX_PARTICIPANTS];
-    /* Verifiable warm start (ISSUES §10.3). The evidence document is the one
+    /* Verifiable warm start (doc/architecture/reputation.md). The evidence document is the one
      * artifact BOTH runtimes read, so its shape is worth pinning here; the
      * ceilings are the arithmetic that decides how much standing a restored
      * peer may hold, and a silent drift between runtimes would hand the same
@@ -489,7 +489,8 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
 
 #ifdef AT_ZTA_ENABLED
     /* zta_standing: { "<pid>": { "<other_pid>": {status, ceiling}, ... } } —
-     * pre-stage what ZTA proved about a peer (ISSUES §10.5). Installed directly
+     * pre-stage what ZTA proved about a peer (doc/architecture/zta-integration.md).
+     * Installed directly
      * rather than driven through an admission step: the verdict is produced by
      * the IDENTITY process and this protocol's harness stands up only the
      * reputation one, so what is pinned cross-language is what reputation DOES
@@ -562,7 +563,7 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
  * adapters therefore MINT the signatures here with each named co-signer's own
  * key rather than replaying pinned blobs, which is what holds both runtimes to
  * the same pre-image and scheme instead of to one side's recorded output (the
- * §1.5 precedent). Designation bytes must match Python
+ * doc/architecture/zta-integration.md precedent). Designation bytes must match Python
  * SlashAttestation.designation / Checkpoint.designation exactly. */
 #define RP_DESIG_MAX 512
 #define RP_SIG_HEX_LEN (crypto_sign_BYTES * 2)
@@ -946,17 +947,16 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     }
     else if (strcmp(function, REP_PROTO_REP_RESOLVED) == 0)
     {
-        /* Deep resolution (ISSUES.md 10.2): the answer carries the holder's
-         * WHOLE quorum-signed window, so the receiver can recompute the root
-         * and see both fabrication and OMISSION.
+        /* Deep resolution (doc/architecture/gateway-reputation-tree.md): the answer
+         * carries the holder's WHOLE quorum-signed window, so the receiver can
+         * recompute the root and see both fabrication and OMISSION.
          *
-         * The window is rebuilt here from the holder's `tx_history` fixture
-         * rather than read out of rep_state: the engine resets rep_state per
-         * step and stages fixtures for the DISPATCH TARGET, so the sender's
-         * chain does not exist while we are building a message to it. Same
-         * entries, same order, same uuids as the Python adapter reads from
-         * the holder's live history -- both sides therefore checkpoint the
-         * same root. */
+         * The window is rebuilt here from the holder's `tx_history` fixture rather than
+         * read out of rep_state: the engine resets rep_state per step and stages
+         * fixtures for the DISPATCH TARGET, so the sender's chain does not exist while
+         * we are building a message to it. Same entries, same order, same uuids as the
+         * Python adapter reads from the holder's live history -- both sides therefore
+         * checkpoint the same root. */
         const char *peer_pid = payload ? json_string_value(
             json_object_get(payload, "peer")) : NULL;
         const char *qid = payload ? json_string_value(

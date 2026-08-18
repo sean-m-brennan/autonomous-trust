@@ -238,7 +238,7 @@ int tracker_from_file(const char *filename, logger_t *logger, tracker_t **tracke
 int tracker_config(char *config_file, size_t destlen)
 {
     /* Both bounds come from the caller now. This function had the same shape as
-     * the defect in ISSUES.md §2.1.1 — an unsized `char config_file[]` parameter
+     * the socket-path overflow — an unsized `char config_file[]` parameter
      * with `CFG_PATH_LEN` hardcoded as its length — and was safe only because its
      * one caller happened to pass a buffer that big. */
     if (config_file == NULL || destlen == 0)

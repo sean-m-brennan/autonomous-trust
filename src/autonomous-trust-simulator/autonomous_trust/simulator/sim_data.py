@@ -104,7 +104,7 @@ class SimConfig(Configuration):
         self.space_mode: bool = kwargs.get('space_mode', False)
         self.comm_freq_hz: Optional[float] = kwargs.get('comm_freq_hz')
         self.sun_position: Optional[Position] = kwargs.get('sun_position')
-        # Finite comms-range cutoff in metres (ISSUES.md §6, opt-OUT: finite by
+        # Finite comms-range cutoff in metres (opt-OUT: finite by
         # default). None -> Simulator.DEFAULT_MAX_RANGE_M is applied; a positive
         # value overrides it; <= 0 DISABLES the cutoff (restores the legacy
         # all-pairs, effectively-infinite-range behaviour). Ignored in space

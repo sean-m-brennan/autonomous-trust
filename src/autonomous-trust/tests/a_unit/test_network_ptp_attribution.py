@@ -14,7 +14,8 @@
 #   limitations under the License.
 # ******************
 
-"""ISSUES §3.6 item 2: the point-to-point drain must attribute inbound frames
+"""Inbound attribution (doc/architecture/network-connection-pooling.md, the
+attribution-miss item): the point-to-point drain must attribute inbound frames
 against the LIVE roster (``self.peers``), never the bootstrap ``Peers`` object
 in ``configs[CfgIds.peers]``.
 

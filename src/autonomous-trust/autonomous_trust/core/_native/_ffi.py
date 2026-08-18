@@ -200,7 +200,8 @@ ffi.cdef("""
         int (*from_json)(const void *obj, void *data_struct);
         size_t data_len;
         void *data_struct;
-        /* Added 2026-08-12 (ISSUES §9.2.1): the proto hooks were missing, so the
+        /* Added 2026-08-12 (doc/architecture/native-ffi-dual-implementation.md): the proto
+         * hooks were missing, so the
            mirror was 40 bytes against C's 56. Optional in C (NULL = no proto
            serializer, JSON fallback), but a NULL field still occupies its slot. */
         int (*to_proto)(const void *data_struct, void **buf_out, size_t *len_out);
@@ -210,7 +211,7 @@ ffi.cdef("""
     extern config_t configuration_table[];
     extern size_t configuration_table_size;
 
-    /* Both gained an explicit `destlen` on 2026-08-04 (ISSUES.md §2.1.1: they
+    /* Both gained an explicit `destlen` on 2026-08-04 (the path-length overflow: they
        used to hardcode 255 as path_join's bound while taking an unsized
        `char path[]`, which overflowed a 108-byte caller). Keep the arity in step
        with the C header — `ffi.dlopen` is ABI mode, so CFFI validates nothing
@@ -291,7 +292,7 @@ ffi.cdef("""
         uint8_t *zta_credential;
         size_t zta_credential_len;
         /* Multi-credential set + proved anchors (identity.h, same AT_ZTA block;
-           landed with §1.5 on 2026-08-06). MISSING here until 2026-08-10, and
+           landed with doc/architecture/zta-integration.md on 2026-08-06). MISSING here until 2026-08-10, and
            the cost was exactly what the comment above describes for the
            operator-key fields: the mirror ended at zta_credential_len, 840
            bytes against the C struct's 1752, so `proto_to_peer` wrote 912 bytes
@@ -305,7 +306,8 @@ ffi.cdef("""
            a probe that prints sizeof/offsetof from identity.h (with
            -DAT_ZTA_ENABLED -fms-extensions) and compare to ffi.sizeof /
            ffi.offsetof. `scripts/audit-ffi-drift.py` compares function ARG
-           COUNTS only and cannot see any of this (ISSUES §9.2). */
+           COUNTS only and cannot see any of this
+           (doc/architecture/native-ffi-dual-implementation.md). */
         zta_credential_t zta_credentials[4];
         size_t num_zta_credentials;
         char zta_anchors[8][64];
@@ -396,6 +398,21 @@ ffi.cdef("""
                                net_wire_msg_t *msg_out);
     void net_wire_msg_free(net_wire_msg_t *msg);
 
+    /* Envelope format (doc/architecture/network-wire-format.md). The enum is spelled `int`
+     * here because
+     * the cdef needs its WIDTH, not its identity; NET_WIRE_JSON = 0,
+     * NET_WIRE_PROTO = 1 (network/net_wire_format.h). The `_fmt` pair is what a
+     * caller with a group in hand uses; the two above stay the JSON-fixed entry
+     * points, which is what every caller outside a group wants. */
+    int  net_message_to_wire_fmt(const net_wire_msg_t *msg,
+                                 const identity_t *signer,
+                                 int fmt,
+                                 uint8_t **wire_out, size_t *wire_len);
+    int  net_message_from_wire_fmt(const uint8_t *data, size_t len,
+                                   const public_identity_t *peer,
+                                   int fmt, net_wire_msg_t *msg_out);
+    const char *net_wire_format_name(int fmt);
+
     /* ---- network/network.h ---- */
     /* Base-port resolution: config -> AT_COMM_PORT -> COMM_PORT. Declared so
        the Python side can assert it agrees with C for a given base instead of
@@ -451,7 +468,8 @@ ffi.cdef("""
         public_identity_t to_whom;
         public_identity_t from_whom;
         /* from_rank / trace_id / verified / has_signature were MISSING here
-           until 2026-08-12 (ISSUES §9.2.1): the mirror was 1848 bytes against
+           until 2026-08-12 (doc/architecture/native-ffi-dual-implementation.md): the
+           mirror was 1848 bytes against
            C's 1888. Note where each one goes — `from_rank` sits between
            `from_whom` and `encrypt`, and `trace_id` after `return_to`, exactly as
            in msg_types.h. Order IS layout, so appending them at the end would
@@ -492,7 +510,8 @@ ffi.cdef("""
         unsigned char task_uuid[16];
         unsigned char peer_uuid[16];
         double score;
-        /* Added 2026-08-12 (ISSUES §9.2.1): the mirror was 40 bytes against C's
+        /* Added 2026-08-12 (doc/architecture/native-ffi-dual-implementation.md): the
+         * mirror was 40 bytes against C's
            112. CAP_NAMELEN is PROC_NAME_LEN(64), + NUL. Carried verbatim by the
            whole-struct memcpy in msg_types.c, so a short mirror truncates the
            capability name that resolves the transaction weight. */
@@ -531,7 +550,8 @@ ffi.cdef("""
     typedef int (*handler_ptr_t)(process_t *, array_t *, char *, logger_t *);
 
     /* The four trailing collaborators became a `proc_context_t` in the
-       2026-07-01 refactor (ISSUES.md §2.1, autonomous_trust.c:283); this cdef
+       2026-07-01 refactor (doc/architecture/process-architecture.md,
+       autonomous_trust.c:283); this cdef
        kept the old 8-arg form until 2026-08-04. Nothing calls it from Python,
        so it was LATENT rather than a live segfault — `audit-ffi-drift.py`
        classifies it exactly that way. */
@@ -554,7 +574,8 @@ ffi.cdef("""
     typedef struct {
         /* `task_t *task_ptr` used to lead this struct and does NOT exist in C
            (negotiation.h: uuid_t task_uuid; int flood_count). Removed 2026-08-12
-           (ISSUES §9.2.1) — this is the one mirror that was BIGGER than C, 32
+           (doc/architecture/native-ffi-dual-implementation.md) — this is the one mirror
+           that was BIGGER than C, 32
            bytes against 20, so it did not overflow; it read `task_uuid` out of
            C's `flood_count` and past the end. */
         unsigned char task_uuid[16];
@@ -595,7 +616,8 @@ ffi.cdef("""
         double p2_score;
         bool p2_set;
         int index;
-        /* Added 2026-08-12 (ISSUES §9.2.1): hash-linking's prev_hash was missing,
+        /* Added 2026-08-12 (doc/architecture/native-ffi-dual-implementation.md):
+         * hash-linking's prev_hash was missing,
            so the mirror was 80 bytes against C's 152. TX_HASH_HEX_LEN(64) + NUL. */
         char prev_hash[65];
     } transaction_t;

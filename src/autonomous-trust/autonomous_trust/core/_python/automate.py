@@ -178,8 +178,8 @@ class AutonomousTrust(Protocol):
         # AT-core bootstrap corpus: register at.handshake /
         # at.time-attest / at.echo-challenge unless explicitly
         # disabled (AT_BOOTSTRAP_DISABLED=1). These are tier-0,
-        # weight-1 — the baby-steps signal documented in
-        # doc/architecture/trust-tiers.md §6.
+        # weight-1 — the baby-steps signal documented in doc/architecture/trust-tiers.md
+        # §6.
         if not os.environ.get('AT_BOOTSTRAP_DISABLED'):
             register_bootstrap_capabilities(self.capabilities)
         self._output: QueueType = self.queue_type()  # subsystem logging
@@ -822,11 +822,12 @@ class AutonomousTrust(Protocol):
                     message = Message(CfgIds.negotiation, NegotiationProtocol.start, cmd)
                     queues[CfgIds.negotiation].put(message, block=True, timeout=queue_cadence)
                 elif cmd == ReputationProtocol.app_roster_request:
-                    # The app asked for the current peer view (ISSUES §11.1).
-                    # Exactly ONE verb is accepted from an app and forwarded to a
-                    # fixed destination, as the C daemon does: forwarding an
-                    # app-supplied message to whatever process it names would hand
-                    # an app AT's whole internal verb surface. This pull is also
+                    # The app asked for the current peer view
+                    # (doc/architecture/app-peer-carrier.md). Exactly ONE verb is
+                    # accepted from an app and forwarded to a fixed destination, as the
+                    # C daemon does: forwarding an app-supplied message to whatever
+                    # process it names would hand an app AT's whole internal verb
+                    # surface. This pull is also
                     # the only path on which `rated=False` can cross.
                     query = Message(CfgIds.reputation,
                                     ReputationProtocol.app_roster_request, '',

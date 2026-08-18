@@ -69,10 +69,10 @@ def _env_float(name, default):
         return default
 
 
-# Reputation save gate: only peers strictly above this threshold survive
-# a process restart. Self is always persisted regardless. See
-# doc/architecture/persistent-cohort.md for the rationale.
-# Override: AT_REP_PERSIST_THRESHOLD.
+# Reputation save gate: only peers strictly above this threshold survive a process
+# restart. Self is always persisted regardless. See
+# doc/architecture/persistent-cohort.md for the rationale. Override:
+# AT_REP_PERSIST_THRESHOLD.
 REPUTATION_PERSIST_THRESHOLD = _env_float('AT_REP_PERSIST_THRESHOLD', 0.5)
 
 
@@ -93,10 +93,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # Sorted ascending so _trust_tier can iterate and pick the highest
     # matching tier. Tunable, but keep monotonically increasing.
     #
-    # NOTE: trust tier is distinct from network rank (peer._rank) —
-    # rank is topology / one-hop reachability, populated from
-    # identity.json. See doc/architecture/trust-tiers.md §1 for the
-    # disambiguation.
+    # NOTE: trust tier is distinct from network rank (peer._rank) — rank is topology /
+    # one-hop reachability, populated from identity.json. See
+    # doc/architecture/trust-tiers.md §1 for the disambiguation.
     TIER_FLOORS = (
         (0.50, 1),
         (0.65, 2),
@@ -104,7 +103,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         (0.90, 4),
     )
 
-    # --- Verifiable warm start (ISSUES.md §10.3) ----------------------
+    # --- Verifiable warm start (doc/architecture/reputation.md) ----------------------
     # Restoration is GRADED by whether the persisted score has evidence
     # behind it. `reputation.cfg.json` is a conclusion; on its own it says
     # only that some process with write access to the config directory
@@ -119,12 +118,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # to earn elevation back through fresh in-session transactions.
     #
     # Tier 1 (presence/communication) is the clamp because an
-    # authenticated-but-COMPROMISED asset passes ZTA admission by
-    # definition -- credentials are exactly what it holds -- so restoring a
-    # historically-earned high tier the instant it is admitted re-opens the
-    # hole the system exists to close, and for a short-lived asset there is
-    # no time for behavioural re-evaluation to catch it first. See
-    # doc/architecture/reputation.md ("Hardening: floor, not full
+    # authenticated-but-COMPROMISED asset passes ZTA admission by definition --
+    # credentials are exactly what it holds -- so restoring a historically-earned high
+    # tier the instant it is admitted re-opens the hole the system exists to close, and
+    # for a short-lived asset there is no time for behavioural re-evaluation to catch it
+    # first. See doc/architecture/reputation.md ("Hardening: floor, not full
     # restoration").
     UNVERIFIED_RESTORE_TIER = 1
     # Committed bilateral transactions a peer needs INSIDE the attested window
@@ -207,7 +205,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # a few seconds of demo time while honest peers recover gradually.
     CONSENSUS_EMA_HALF_LIFE = 20
 
-    # --- Deep resolution (ISSUES.md §10.2) ----------------------------
+    # --- Deep resolution (doc/architecture/gateway-reputation-tree.md) ----------------------------
     # How long a relayed query stays in the pending table, and how long a
     # query we originated stays outstanding. A deep answer crosses several
     # hops and each may be a busy process loop, so this is generous; it is
@@ -316,12 +314,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(
             ReputationProtocol.rep_resolved, self.handle_resolved)
         self.history = TransactionHistory()
-        # Gateway reputation tree: one child chain per child group this
-        # node gateways (keyed by group-uuid string). Empty on rank-1
-        # leaf nodes — every code path below degrades to the single
-        # self.history chain when this is empty, so leaves are
-        # byte-for-byte unchanged. Lazily populated by _chain_for_group
-        # the first time a commit routes to a known child group. See
+        # Gateway reputation tree: one child chain per child group this node gateways
+        # (keyed by group-uuid string). Empty on rank-1 leaf nodes — every code path
+        # below degrades to the single self.history chain when this is empty, so leaves
+        # are byte-for-byte unchanged. Lazily populated by _chain_for_group the first
+        # time a commit routes to a known child group. See
         # doc/architecture/gateway-reputation-tree.md.
         self.child_histories: dict[str, TransactionHistory] = {}
         # Per-paxos-round group binding (idx -> group-uuid string). Set
@@ -455,10 +452,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # short-circuit (forcing re-earn from the punished regime) is lost on
         # restart; the exclusion itself survives.
         self._slashed: dict[str, tuple] = {}
-        # ISSUES §10.5 (ZTA hardening). Volatile, like _slashed: a restart
-        # re-derives standing from the admission gate rather than trusting a
-        # file for it.
-        #   _zta_proved_index: peer -> chain index at its last PROVED
+        # ZTA hardening (doc/architecture/zta-integration.md). Volatile, like _slashed:
+        # a restart re-derives standing from the admission gate rather than trusting a
+        # file for it. _zta_proved_index: peer -> chain index at its last PROVED
         #     verification; the point a later failure unwinds back TO.
         #   _zta_acted:        peer -> the standing already acted on, so the
         #     hourly re-verification of an unchanged verdict is a no-op.
@@ -522,7 +518,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self._child_evidence_tried: set[str] = set()
         self._restore_clamped: dict[str, float] = {}
 
-        # --- Deep resolution: one peer, on demand (ISSUES.md §10.2) --------
+        # --- Deep resolution: one peer, on demand
+        # (doc/architecture/gateway-reputation-tree.md) --------
         # A query we are RELAYING: query-id -> (answer-to uuid-str, deadline,
         # requesting_process). This is the only state the whole capability
         # adds anywhere, and it exists because the answer travels back along
@@ -908,7 +905,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self.proposals[idx] = score
         # Cache the weight for this task so _pure_reputation can later
         # aggregate it correctly (Slice 3 / trust-tiers.md §5), and the tier
-        # so the per-tier consensus view can bucket it (§2.3).
+        # so the per-tier consensus view can bucket it (doc/architecture/network-wire-format.md).
         self._record_task_weight(score.task_id, self._resolve_tx_weight(score))
         self._record_task_tier(score.task_id, self._resolve_tx_tier(score))
         self.logger.debug('Start a Paxos round')
@@ -919,7 +916,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 (id1, id2, peer_id), score = from_json_string(message.obj)
             except ValueError as err:
                 # An out-of-range score is rejected in TransactionScore's
-                # constructor (§11.2), which `from_json_string` runs. Dropping
+                # constructor (doc/architecture/reputation.md), which `from_json_string` runs. Dropping
                 # here rather than letting it propagate: the payload is
                 # peer-supplied, so a raise escaping into the process loop would
                 # hand a remote a lever on this node's reputation process.
@@ -1082,7 +1079,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             if str(peer_id) == str(self.identity.uuid):
                 return True
             try:
-                # §11.2: this payload is a BARE float on the wire, not a
+                # doc/architecture/reputation.md: this payload is a BARE float on the wire, not a
                 # TransactionScore, so it bypasses the constructor's check --
                 # and this is the path that writes history on every acceptor.
                 # An out-of-range score here would be averaged into a
@@ -1762,7 +1759,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             self._last_checkpoint_heads[chain_key] = head
             self._originate_checkpoint(queues, chain_key)
 
-    # ----- Verifiable warm start (ISSUES.md §10.3) ------------------------
+    # ----- Verifiable warm start (doc/architecture/reputation.md) ------------------------
 
     def _rebuild_from_evidence(self):
         """At start-up, re-establish the committed history from the persisted
@@ -1812,7 +1809,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def _restore_child_evidence(self, queues):
         """Restore a gateway's child-group chains once the group set has
-        arrived, one attempt per group (ISSUES §10.2).
+        arrived, one attempt per group (doc/architecture/gateway-reputation-tree.md).
 
         This runs late by necessity -- ``child_groups`` is delivered over IPC
         after ``__init__`` -- which shapes what it may do to a live score. It
@@ -1840,7 +1837,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # Bounded by the persisted value we clamped away from, so this
                 # restores standing rather than inventing it.
                 lift = min(self._restore_clamped.get(peer, current), ceiling)
-                # §10.5: child-group evidence can restore standing, but not
+                # doc/architecture/zta-integration.md: child-group evidence can restore standing, but not
                 # past what ZTA proved about the peer holding it. Evidence that
                 # a peer behaved well is not evidence it is who it claims.
                 lift = self._apply_zta_ceiling(peer_uuid, lift)
@@ -2275,20 +2272,17 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         return False
 
     def _pure_reputation(self, peer):
-        # Counterparty's-score weighted by counterparty's-reputation
-        # AND by the originating capability's transaction_weight
-        # (doc/architecture/trust-tiers.md §5). Default PREREP_NEUTRAL
-        # (0.2) on no-history OR no-valid-tx (returning a lower value
-        # would route the peer back into CTFT mode on the next compute,
-        # the very condition we supposedly graduated from). Counterparties
-        # absent from self.reputations use the PREREP_NEUTRAL fallback
-        # rather than being silently skipped (skipping made the result
-        # sensitive to whether the local reputations dict had caught
-        # up to the history chain).
-        # `peer` may be a Peer object (production sender path), a
-        # raw UUID, or a uuid string (rep_req wire path — the
-        # canonical object form's `peer_uuid` field is a string,
-        # and Identity.uuid is also a string in this codebase).
+        # Counterparty's-score weighted by counterparty's-reputation AND by the
+        # originating capability's transaction_weight (doc/architecture/trust-tiers.md
+        # §5). Default PREREP_NEUTRAL (0.2) on no-history OR no-valid-tx (returning a
+        # lower value would route the peer back into CTFT mode on the next compute, the
+        # very condition we supposedly graduated from). Counterparties absent from
+        # self.reputations use the PREREP_NEUTRAL fallback rather than being silently
+        # skipped (skipping made the result sensitive to whether the local reputations
+        # dict had caught up to the history chain). `peer` may be a Peer object
+        # (production sender path), a raw UUID, or a uuid string (rep_req wire path —
+        # the canonical object form's `peer_uuid` field is a string, and Identity.uuid
+        # is also a string in this codebase).
         peer_uuid = peer if isinstance(peer, (UUID, str)) else peer.uuid
         try:
             txs = list(self.history.by_peer(peer_uuid))
@@ -2592,7 +2586,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                                       CfgIds.reputation + Configuration.file_ext))
 
     def _publish_reputation(self, queues, peer_uuid, score, rated):
-        """Emit one peer's reputation toward the app (ISSUES §11.1).
+        """Emit one peer's reputation toward the app (doc/architecture/app-peer-carrier.md).
 
         Mirror of the C twin's `_publish_reputation` (`rep_proc.c`): local IPC to
         the main loop — `CfgIds.main` is Python's `AT_MAIN_QUEUE` — which owns the
@@ -2760,7 +2754,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def _zta_unwind_ceiling(self, peer_uuid, anchor_index):
         """What the peer's standing may be, judged ONLY on evidence that
-        predates its last proved verification (ISSUES §10.5).
+        predates its last proved verification (doc/architecture/zta-integration.md).
 
         This is the "how far back" answer: back to the last point ZTA actually
         proved something, and no further. Standing earned before that point was
@@ -2821,11 +2815,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     def _unwind_zta_failure(self, queues, key, found):
         """A peer that operated unproved has now affirmatively FAILED: unwind
         its standing to what pre-anchor evidence supports, and let the tier
-        machinery demote it (ISSUES §10.5).
+        machinery demote it (doc/architecture/zta-integration.md).
 
         No scalar penalty is sent. A ZTA verdict is an authority finding, not
         an interaction outcome, and AT's [0, 1] scale has no representation for
-        one (§11.2) -- which is why the previous attempt, a ``score = -0.8``
+        one -- which is why the previous attempt, a ``score = -0.8``
         TRANSACTION_SCORE, was rejected at the boundary and did nothing at all.
         Bounding the value and republishing the tier is the action; demotion,
         and exclusion below the cut-off, follow from the score the tier
@@ -2871,7 +2865,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def _zta_ceiling(self, peer_uuid):
         """Highest reputation this peer may hold given what ZTA actually proved
-        (ISSUES §10.5), or None for "no bound".
+        (doc/architecture/zta-integration.md), or None for "no bound".
 
         None covers three different situations that all mean the same thing
         here: ZTA proved the peer, ZTA is switched off, or IdentityProcess has
@@ -2966,7 +2960,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     'local history (previous=%.2f)',
                     str(peer_uuid)[:8], n_bilateral, previous)
                 rep_score = self._contrite_tit_for_tat(peer)
-            # §10.5: an unproved credential bounds how far this peer may rise,
+            # doc/architecture/zta-integration.md: an unproved credential bounds how far this peer may rise,
             # whichever regime produced the score above.
             rep_score = self._apply_zta_ceiling(peer_uuid, rep_score)
             self.reputations.update(peer_uuid, rep_score)
@@ -3280,7 +3274,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             self._per_tier_last[str(peer_uuid)] = dict(ema_by_tier)
         return ema_by_tier
 
-    # --- Deep resolution: one peer, on demand (ISSUES.md §10.2) -----------
+    # --- Deep resolution: one peer, on demand
+    # (doc/architecture/gateway-reputation-tree.md) -----------
     #
     # The subtree roster below covers this node's DIRECT children, which is
     # everything it can score: a peer two levels down transacts in a chain
@@ -3593,7 +3588,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
         A peer we already hold counts: it cleared admission. Otherwise the
         carried identity must present a credential that chains to one of OUR
-        configured trust anchors -- the §10.5 rule, applied to evidence
+        configured trust anchors -- the doc/architecture/zta-integration.md rule, applied to evidence
         instead of to federation. Without this gate an answer could ship its
         own freshly-minted signers and satisfy every signature check in
         ``verify_resolved`` with keys it generated a moment earlier."""
@@ -3937,7 +3932,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 if self.child_groups:
                     self._restore_child_evidence(queues)
                 # ZTA findings arrive over IPC from IdentityProcess; act on any
-                # that are new (§10.5). Idempotent, so it is safe every pass.
+                # that are new (doc/architecture/zta-integration.md). Idempotent, so it is safe every pass.
                 self._apply_zta_standings(queues)
                 drained = 0
                 # First iteration blocks briefly so we don't hot-spin

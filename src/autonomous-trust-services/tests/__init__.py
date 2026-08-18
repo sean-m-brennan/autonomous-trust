@@ -21,8 +21,8 @@ def rendered_log(mock_method):
     Asserting on ``call_args[0][0]`` asserts on the format string, which
     silently stops covering anything the moment a call is written lazily --
     ``logger.error('unhandled %s', kind)`` has no ``kind`` in argument 0. That
-    is not a hypothetical: converting this package to lazy logging (ISSUES §5
-    S13) broke four such assertions at once, each of which had been passing by
+    is not a hypothetical: converting this package to lazy logging (the S13
+    logging sweep) broke four such assertions at once, each of which had been passing by
     reading a value that is no longer there.
 
     Rendering the way `logging` does keeps the assertion on what an operator

@@ -17,7 +17,7 @@
  * @file trust_ladder.h
  * @brief Trust-ladder loader: capability tier/weight metadata from config.
  *
- * C twin of `core/_python/trust_ladder.py` (ISSUES §10.1, the one asymmetry in
+ * C twin of `core/_python/trust_ladder.py` (doc/architecture/trust-tiers.md, the one asymmetry in
  * doc/architecture/trust-tiers.md §9's parity table — the Python half existed
  * and C registered capabilities in code only).
  *

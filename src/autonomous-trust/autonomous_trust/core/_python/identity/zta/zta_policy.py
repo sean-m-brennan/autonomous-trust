@@ -31,7 +31,8 @@ from .mfa import MfaChain, CombinePolicy
 
 #: How hard the admission gate insists on a credential->identity binding
 #: (`identity/zta_binding.py`). ``require`` is the default because without a binding
-#: the gate falls back on first-use-wins, and TOFU is the whole of ISSUES §1.5. The
+#: the gate falls back on first-use-wins, and TOFU is the whole of
+# doc/architecture/zta-integration.md. The
 #: cost is a flag day: a credential provisioned before bindings existed is refused
 #: until re-provisioned, so a fleet mid-migration wants ``prefer`` for one hop.
 BINDING_MODE_REQUIRE = 'require'   # unbound credential -> reject

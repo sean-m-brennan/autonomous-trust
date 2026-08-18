@@ -14,7 +14,7 @@
 #   limitations under the License.
 # ******************
 
-"""The inspector's live pipeline, end to end, with real objects (ISSUES §4.4 I21).
+"""The inspector's live pipeline, end to end, with real objects (the I21 integration/system-test gap).
 
 Every unit in this chain is already unit-tested and the chain still broke,
 repeatedly and silently, in ways the unit tests could not see — because the

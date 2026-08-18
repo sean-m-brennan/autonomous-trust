@@ -224,7 +224,7 @@ class PeerStatus(DashComponent):
         return f'{self.data_type} data'
 
     def update_detail_titles(self):
-        """Push the drawer's live captions (§4.2:360).
+        """Push the drawer's live captions.
 
         The position under the video feed was rendered once, when the body was
         built, and never updated again, so a moving peer's open drawer kept
@@ -311,7 +311,7 @@ class PeerStatus(DashComponent):
                 trust_gauge = self.trust_figs[idx]
             except KeyError:
                 trust_gauge = self.add_trust_gauge(idx)
-            # Per-other (transitive) trust when available (§4.2:159): this
+            # Per-other (transitive) trust when available: this
             # peer's own reputation of `other`, keyed by uuid. Falls back to the
             # aggregate reputation stand-in when no per-other view has arrived.
             rep = self.peer.reputation_of(other)
@@ -319,7 +319,7 @@ class PeerStatus(DashComponent):
                 rep = self.peer.reputation_history[-1] if self.peer.reputation_history else 0.0
             trust_gauge.update_traces(selector=dict(name=f'trust-gauge-{idx}'),
                                       value=rep, overwrite=True)
-            # The wire-up that was missing (§4.2): the figure was updated here
+            # The wire-up that was missing: the figure was updated here
             # every tick, but nothing told the browser, so an open drawer showed
             # whatever the figure held when it opened — permanently empty if it
             # opened before any data arrived.
@@ -447,7 +447,7 @@ class PeerStatus(DashComponent):
                         # The caption is live: `update_detail_titles` pushes it
                         # into `vid_feed.title_id` while the drawer is open, so a
                         # moving peer's position tracks instead of freezing at
-                        # whatever it was when the body was built (§4.2:360).
+                        # whatever it was when the body was built.
                         dbc.Col(self.vid_feed.div(position_text)),
                     ]),
                     dbc.Row([

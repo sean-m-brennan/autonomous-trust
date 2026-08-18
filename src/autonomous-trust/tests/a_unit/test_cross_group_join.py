@@ -13,7 +13,8 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Runtime cross-group join, and the key rotation it forced (ISSUES.md §10.2).
+"""Runtime cross-group join, and the key rotation it forced
+(doc/architecture/gateway-reputation-tree.md).
 
 A gateway used to acquire a child cohort's key only from a seeded
 `group_child_*.cfg.json` file. It can now ask the cohort to admit it, and the
@@ -177,7 +178,7 @@ class TestJoinGate:
         assert node._join_authorized(self._requester())
 
     def test_foreign_anchor_is_refused(self):
-        """§10.5's rule, applied to admission: a peer holding only another
+        """See doc/architecture/zta-integration.md's rule, applied to admission: a peer holding only another
         agency's credential is not ours to admit."""
         node = self._cohort_node()
         assert not node._join_authorized(self._requester(anchors=('agency-b',)))

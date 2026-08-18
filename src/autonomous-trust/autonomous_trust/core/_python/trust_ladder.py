@@ -29,7 +29,7 @@ nothing set, :func:`load_trust_ladder` returns the all-defaults ladder so the
 mechanism is inert until a scenario opts in.
 
 **The canonical ladder format is JSON, and one file serves both runtimes**
-(decision 2026-08-12, ISSUES §10.1). The C twin
+(decision 2026-08-12, doc/architecture/trust-tiers.md). The C twin
 (``src/c/autonomous_trust/config/trust_ladder.c``) parses it with jansson, which
 that tree already depends on; this loader needs no change to read it, because
 YAML is a superset of JSON. That is what removes the asymmetry §9's parity table

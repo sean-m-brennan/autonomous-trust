@@ -128,7 +128,7 @@ DEFINE_TEST(test_net_msg_proto_no_payload)
 }
 END_TEST_DEFINITION()
 
-/* --- ISSUES §2.1.4: the fixed-size payload arms of proto_to_generic_msg took a
+/* --- The fixed-size payload arms of proto_to_generic_msg took a
  * peer-supplied `Any.value` and memcpy'd sizeof(struct) out of it without ever
  * checking its length, and leaked the unpacked Any on every path. Both were
  * measured under valgrind (invalid read of 8 bytes; 74 bytes lost per message)
@@ -191,7 +191,7 @@ DEFINE_TEST(test_repeated_unpack_does_not_grow_without_bound)
     /* A leak check cannot be asserted from inside the process, so this is the
      * shape a leak would take rather than the leak detector itself: the same
      * message parsed many times, which is what a daemon does. Run under
-     * valgrind (see §2.1.4) for the authoritative result -- it reported 74 bytes
+     * valgrind (see) for the authoritative result -- it reported 74 bytes
      * lost per call before the free was added, and 0 after. */
     size_t len = 0;
     uint8_t *buf = _any_with_payload("TRANSACTION_SCORE",

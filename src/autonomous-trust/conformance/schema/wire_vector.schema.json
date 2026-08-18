@@ -23,6 +23,12 @@
       "enum": ["json", "proto", "pjson", "any"],
       "default": "any"
     },
+    "envelope_format": {
+      "type": "string",
+      "enum": ["json", "proto", "both"],
+      "default": "json",
+      "description": "Which NETWORK ENVELOPE encoding to exercise (ISSUES.md 2.3): the Message wire form itself. Distinct from wire_format/serialize_mode above, which select how a Configuration PAYLOAD serializes -- the two are independent choices. 'both' encodes the message each way and asserts the decodings agree."
+    },
     "constructor": {
       "type": "string",
       "description": "Adapter-recognized factory name for building the input object (e.g. 'Message', 'Identity', 'Group', 'AgreementProof')."
@@ -38,7 +44,12 @@
       "description": "Optional pinned bytes/JSON. Only honored when byte_pinning is true. Round-trip semantic equivalence is always checked.",
       "properties": {
         "json_wire": {"type": "string"},
-        "protobuf_bin": {"type": "string"}
+        "protobuf_bin": {"type": "string"},
+        "proto_wire_hex": {
+          "type": "string",
+          "pattern": "^[0-9a-f]*$",
+          "description": "Exact bytes of a marker-prefixed proto envelope, as lowercase hex. Inline rather than a fixture path so a wire-shape change is visible in the vector's own diff; compared literally, since protobuf has no canonical form to normalize toward."
+        }
       }
     },
     "keys": {

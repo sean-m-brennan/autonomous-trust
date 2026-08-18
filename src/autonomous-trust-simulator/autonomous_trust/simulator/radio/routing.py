@@ -56,7 +56,7 @@ class Router(net.Client):
         self.rate_limit = rate_limit
         self.orig_tc_qdisc = None
         self._mark_to_classid: dict[int, int] = {}
-        # Ingress rate-limiting (ISSUES.md §6): tc only shapes egress, so
+        # Ingress rate-limiting: tc only shapes egress, so
         # ingress is shaped by redirecting the iface's ingress to this IFB
         # device and applying the same class tree there. Set once ingress
         # shaping is successfully wired in _setup_ingress_ifb(); when False
@@ -135,7 +135,7 @@ class Router(net.Client):
                                  % (net_iface.mark, classid))
 
     def _setup_ingress_ifb(self):
-        """Wire ingress shaping (ISSUES.md §6) via an IFB device.
+        """Wire ingress shaping via an IFB device.
 
         `tc` shapes egress only; to rate-limit INGRESS we attach an ingress
         qdisc to self.iface and redirect all arriving packets to the IFB
@@ -273,7 +273,7 @@ class Router(net.Client):
         return '%dbit' % rate_bps
 
     def _apply_reachability(self, state, chain):
-        """Default-deny reachability (ISSUES.md §6). The connectivity matrix is
+        """Default-deny reachability. The connectivity matrix is
         now SPARSE: ``state.reachable[p]`` lists only the peers p can reach, so
         an absent pair means "unreachable". Iterating only the present keys (the
         old behaviour) would therefore never install a block, so we enumerate
@@ -300,7 +300,7 @@ class Router(net.Client):
                         self.iptables('-A %s -s %s -d %s -j DROP' % (chain, peer.ip4_addr, other.ip4_addr))
 
     def _apply_rate_marks(self, state):
-        """Per-peer traffic classification for rate-limiting (ISSUES.md §6).
+        """Per-peer traffic classification for rate-limiting.
 
         EGRESS: mark packets by DESTINATION on the mangle POSTROUTING chain with
         the peer's fw mark; the egress fw filter (self.iface tree) shapes them.

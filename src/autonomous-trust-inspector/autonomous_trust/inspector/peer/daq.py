@@ -126,7 +126,7 @@ class PeerDataAcq(object):
         self.reputation_history: deque[float] = deque(maxlen=self.max_history)
         # Per-other (transitive) trust: THIS peer's reputation of each other
         # peer, keyed by the other's uuid. Populated from peer-pair rep_resp
-        # (§4.2:159) so the per-other trust gauges are precise rather than the
+        # so the per-other trust gauges are precise rather than the
         # aggregate stand-in.
         self.reputation_by_other: dict[str, deque[float]] = {}
 
@@ -655,7 +655,7 @@ class CohortTracker(Process, metaclass=ProcMeta,
             self.cohort.peers[subject].reputation_history.append(rep.score)
             self.cohort.publish({'kind': 'reputation', 'uuid': subject,
                                  'score': rep.score})
-        # Transitive view (§4.2:159): a rep_resp routed back from a peer
+        # Transitive view: a rep_resp routed back from a peer
         # (observer != subject) is THAT observer's opinion of the subject —
         # record it as the observer's per-other reputation of the subject.
         observer = getattr(getattr(message, 'from_whom', None), 'uuid', None)

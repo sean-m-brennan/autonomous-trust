@@ -7,7 +7,7 @@ description: |
     NEGATIVE CONTROL: a binding that is cryptographically perfect and still
     refused, because it names a different node.
 
-    This is ISSUES.md §1.5 made concrete — a chain-valid credential harvested
+    This is doc/architecture/zta-integration.md made concrete — a chain-valid credential harvested
     from another peer's clear-text announce and re-presented under a new
     identity. The signature verifies against the operator credential; the
     operator really did sign it; the operator key is a real one. It simply was
@@ -17,7 +17,7 @@ description: |
 
     The binding closes that hole for opted-in operator nodes specifically.
     Ordinary device credentials and opted-out nodes are exactly as exposed as
-    before, and §1.5 stays open.
+    before, and doc/architecture/zta-integration.md stays open.
 
 participants:
   - id: bg
@@ -29,7 +29,8 @@ fixtures:
   zta_policy:
     enabled: true
     require_at_admission: true
-    # These fixtures PREDATE the credential->identity binding (ISSUES §1.5) and
+    # These fixtures PREDATE the credential->identity binding
+    # (doc/architecture/zta-integration.md) and
     # provision none, so `off` keeps each pin testing what it claims: this case is
     # about the chain / operator classification, not about bindings. Without it a
     # reject-* pin would pass for the wrong reason (unbound, not bad chain) and the

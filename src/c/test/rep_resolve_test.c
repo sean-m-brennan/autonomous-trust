@@ -14,7 +14,7 @@
  *   limitations under the License.
  *******************/
 
-/* Deep resolution: one peer, on demand, at any depth (ISSUES.md §10.2).
+/* Deep resolution: one peer, on demand, at any depth (doc/architecture/gateway-reputation-tree.md).
  *
  * A node holds chains only for its own groups, so a peer two levels down is
  * unscoreable locally. Rather than enumerate the subtree -- a cost that grows

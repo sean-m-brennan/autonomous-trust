@@ -27,7 +27,7 @@ pytestmark = pytest.mark.skipif(not _has_redteam,
 
 
 class TestSybilBoundCheck:
-    """§8.1: collect() must report a real distinct-identity bound, not None."""
+    """See doc/architecture/adversarial-testing.md: collect() must report a real distinct-identity bound, not None."""
 
     def test_bounded_when_no_sybil_admitted(self):
         # Legitimate roster is 5; exactly 5 identities admitted -> bounded.

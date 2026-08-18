@@ -206,7 +206,7 @@ from an 81/81 baseline.
 **~~Not verifiable in-sandbox:~~ verifiable in-sandbox since 2026-08-04.** This
 said a live-daemon end-to-end run was impossible here, because the daemon
 aborted with `*** stack smashing detected ***` during startup (including on the
-unmodified `at_demo -g` path) and ISSUES.md §2.1.1 recorded that the abort did
+unmodified `at_demo -g` path) and the startup-abort investigation recorded that it did
 not reproduce on a host machine.
 
 **That was a real overflow, not an environment quirk.** §2.1.1 is now RESOLVED.
@@ -257,7 +257,8 @@ asked for one. (The earlier claim here also blamed `ping.c` / `ntp.c` binding
 implements both, and the C network process answers the `ping` selector with
 `{"error": "unsupported"}`.)
 
-That hazard is closed as of 2026-08-10 (`ISSUES.md` 2.4.2). Two nodes given the
+That hazard is closed as of 2026-08-10 (see [Networking](networking.md), socket
+layout). Two nodes given the
 *same* base on the *same* address used to both bind with neither being told.
 `net_transport_ip.c` set `SO_REUSEADDR` on every bind, and with the option on
 both sockets Linux permits the duplicate and delivers every datagram to the last
@@ -509,7 +510,7 @@ which every app-to-AT verb needs and which this slice deliberately did not take.
 
 **Start and stop are not covered by a test, only by their arguments.** A unit
 test cannot follow a fork, and the daemon cannot start in this sandbox at all
-(ISSUES.md §2.1.1). What is tested is everything that decides what the daemon is
+(the socket-path length overflow). What is tested is everything that decides what the daemon is
 told, plus the bind that used to fail silently. A live `start` → `poll` → `stop`
 through the flat ABI is a cohort-run check, not an in-sandbox one.
 
