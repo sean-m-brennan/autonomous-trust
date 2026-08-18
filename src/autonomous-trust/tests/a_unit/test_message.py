@@ -293,3 +293,90 @@ def test_top_level_configuration_still_autodeserializes():
     # Should be the Identity instance, not the raw JSON string.
     assert isinstance(msg.obj, Identity), \
         f"expected Identity (auto-deserialized), got {type(msg.obj).__name__}"
+
+
+class TestForRecipient:
+    """Readdressing a signed message for fan-out.
+
+    The signature pre-image is ``process|function|base64(data)`` — the recipient
+    is not part of it — so identical content addressed to N peers needs one
+    signature, not N. This is what makes the batched reputation round cost one
+    Ed25519 operation instead of one per observer.
+    """
+
+    def test_signature_is_reused_verbatim(self):
+        me, a, b = (_real_identity(p) for p in ('me', 'a', 'b'))
+        msg = Message('proc', 'func', 'data', to_whom=a, from_whom=me)
+        clone = msg.for_recipient(b)
+        assert clone.signature == msg.signature
+        assert clone.signature is not None, 'nothing was signed to begin with'
+
+    def test_recipient_is_replaced_and_the_original_untouched(self):
+        me, a, b = (_real_identity(p) for p in ('me', 'a', 'b'))
+        msg = Message('proc', 'func', 'data', to_whom=a, from_whom=me)
+        clone = msg.for_recipient(b)
+        assert clone.to_whom == [b]
+        assert msg.to_whom == [a], 'the template must survive for the next copy'
+
+    def test_content_is_carried_over(self):
+        me, a, b = (_real_identity(p) for p in ('me', 'a', 'b'))
+        msg = Message('proc', 'func', 'data', to_whom=a, from_whom=me)
+        clone = msg.for_recipient(b)
+        for field in ('process', 'function', 'obj', 'from_whom', 'verified'):
+            assert getattr(clone, field) == getattr(msg, field), field
+
+    def test_trace_id_is_fresh_per_copy(self):
+        """Sharing one trace id across a fan-out makes the copies
+        indistinguishable in a trace exactly where the question is which
+        recipient got what."""
+        me, a, b, c = (_real_identity(p) for p in ('me', 'a', 'b', 'c'))
+        msg = Message('proc', 'func', 'data', to_whom=a, from_whom=me)
+        ids = {msg.trace_id, msg.for_recipient(b).trace_id,
+               msg.for_recipient(c).trace_id}
+        assert len(ids) == 3
+
+    def test_readdressed_copy_still_validates_on_receipt(self):
+        """The point of the whole exercise: a receiver must accept the copy."""
+        me, a, b = (_real_identity(p) for p in ('me', 'a', 'b'))
+        msg = Message('proc', 'func', 'payload', to_whom=a, from_whom=me)
+        parsed = Message.parse(msg.for_recipient(b).to_wire(), me, validate=True)
+        assert parsed.verified is True
+        assert parsed.function == 'func'
+
+    def test_every_addressing_shape_is_accepted(self):
+        me, a = (_real_identity(p) for p in ('me', 'a'))
+        msg = Message('proc', 'func', 'data', to_whom=a, from_whom=me)
+        group = MagicMock(spec=Group)
+        assert msg.for_recipient(Network.broadcast).to_whom == Network.broadcast
+        assert msg.for_recipient(group).to_whom is group
+        assert msg.for_recipient(None).to_whom == []
+        assert msg.for_recipient([a]).to_whom == [a]
+
+    def test_bad_recipient_raises_rather_than_going_on_the_wire(self):
+        me, a = (_real_identity(p) for p in ('me', 'a'))
+        msg = Message('proc', 'func', 'data', to_whom=a, from_whom=me)
+        with pytest.raises(RuntimeError):
+            msg.for_recipient(42)
+
+    def test_unsigned_message_copies_without_inventing_a_signature(self):
+        # No from_whom means nothing was signed; the copy must not claim to be.
+        msg = Message('proc', 'func', 'data', to_whom=_real_identity('a'))
+        clone = msg.for_recipient(_real_identity('b'))
+        assert clone.signature is None
+        assert clone.verified is False
+
+
+class TestNormalizeToWhom:
+    """``__init__`` and ``for_recipient`` share one addressing rule, so that a
+    readdressed message cannot be addressed by different rules than a fresh
+    one."""
+
+    def test_init_and_for_recipient_agree(self):
+        me, a = _real_identity('me'), _real_identity('a')
+        group = MagicMock(spec=Group)
+        for shape in (None, a, [a], group, Network.broadcast):
+            fresh = Message('proc', 'func', 'data', to_whom=shape, from_whom=me)
+            copied = Message('proc', 'func', 'data', to_whom=a,
+                             from_whom=me).for_recipient(shape)
+            assert type(fresh.to_whom) is type(copied.to_whom)
+            assert fresh.to_whom == copied.to_whom

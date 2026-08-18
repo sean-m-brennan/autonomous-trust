@@ -851,6 +851,24 @@ class ReputationAdapter:
                 'peer_uuid': target_uuid,
                 'requesting_process': req_proc,
             })
+        elif function == ReputationProtocol.consensus_rep_batch_req:
+            # Batched consensus request: one message naming MANY subjects,
+            # answered with one roster. Same fields as the single-subject form
+            # but plural (`peer_uuids`), and both adapters build these identical
+            # bytes so cross-language wire interop is pinned here too. `targets`
+            # is a list of participant ids; a non-participant id passes through
+            # verbatim so a scenario can name an unknown uuid deliberately.
+            target_pids = payload.get('targets') or [payload.get('target', from_id)]
+            uuids = []
+            for target_pid in target_pids:
+                if target_pid in participants:
+                    uuids.append(str(participants[target_pid].impl.identity.uuid))
+                else:
+                    uuids.append(target_pid)
+            obj = to_json_string({
+                'peer_uuids': uuids,
+                'requesting_process': payload.get('proc', 'negotiation'),
+            })
         elif function in (ReputationProtocol.slash_propose,
                           ReputationProtocol.slash_sign,
                           ReputationProtocol.slash_final):

@@ -1036,6 +1036,10 @@ add_executable(rep_quorum_test test/rep_quorum_test.c)
 set_source_files_properties(test/rep_quorum_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(rep_quorum_test PRIVATE ${AT_TEST_LIBS})
 
+add_executable(rep_resp_shape_test test/rep_resp_shape_test.c)
+set_source_files_properties(test/rep_resp_shape_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_resp_shape_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(rep_warmstart_test test/rep_warmstart_test.c)
 set_source_files_properties(test/rep_warmstart_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(rep_warmstart_test PRIVATE ${AT_TEST_LIBS} m)
@@ -1155,6 +1159,7 @@ add_test(NAME partition_recovery_test COMMAND $<TARGET_FILE:partition_recovery_t
 add_test(NAME late_joiner_caps_resync_test COMMAND $<TARGET_FILE:late_joiner_caps_resync_test>)
 add_test(NAME identity_resync_test COMMAND $<TARGET_FILE:identity_resync_test>)
 add_test(NAME rep_quorum_test COMMAND $<TARGET_FILE:rep_quorum_test>)
+add_test(NAME rep_resp_shape_test COMMAND $<TARGET_FILE:rep_resp_shape_test>)
 add_test(NAME rep_warmstart_test COMMAND $<TARGET_FILE:rep_warmstart_test>)
 add_test(NAME rep_resolve_test COMMAND $<TARGET_FILE:rep_resolve_test>)
 add_test(NAME subtree_roster_test COMMAND $<TARGET_FILE:subtree_roster_test>)
