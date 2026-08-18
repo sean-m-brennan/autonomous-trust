@@ -57,7 +57,7 @@ CENV=autonomous_trust
 # Conformance runs in a Miniforge container by default (matches conformance.yml's
 # setup-miniconda, and needs no host conda). Override the tag with --conda-image
 # or CI_LOCAL_CONDA_IMAGE; force the host's conda instead with --host-conda.
-# Default comes from the recorded pin (ISSUES.md §9.1) so a local run mirrors
+# Default comes from the recorded pin (config/cfg/toolchain-pins.env) so a local run mirrors
 # the same toolchain the images and CI use, rather than whatever `latest` is
 # today; explicit overrides still win.
 if [ -f "$REPO/config/cfg/toolchain-pins.env" ]; then

@@ -17,7 +17,7 @@
 #
 # verify_prerouting_ingress.sh
 # =============================
-# Validates the ISSUES.md §6 PREROUTING / IFB *ingress* rate-limit added to
+# Validates the PREROUTING / IFB *ingress* rate-limit added to
 # autonomous_trust/simulator/radio/routing.py. This CANNOT run in the Claude
 # sandbox (no docker, no root netfilter); run it on a real Linux host with root.
 #

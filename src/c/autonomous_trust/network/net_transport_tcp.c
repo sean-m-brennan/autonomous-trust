@@ -29,7 +29,8 @@
  * on by default -- writes many frames down one connection, and a receiver
  * that closes after the first turns the sender's next write into a silent
  * loss (the write succeeds into a half-closed socket; the RST arrives after
- * send() returns; see ISSUES.md §3.6). Each recv() call therefore serves the
+ * send() returns; see doc/architecture/network-connection-pooling.md). Each recv() call
+ * therefore serves the
  * connections already held first, then accepts at most one new one. Held
  * connections are bounded by AT_NET_CONN_IDLE_TTL and AT_NET_MAX_CONNS,
  * the same knobs and defaults Python uses.
@@ -289,7 +290,7 @@ static int tcp_service_live(net_transport_ctx_t *ctx, net_channel_t channel,
  *
  * Holding it open is the whole point: a pooled sender writes many frames down
  * one connection, and closing after the first loses the sender's next write
- * silently (ISSUES.md §3.6).
+ * silently (doc/architecture/network-connection-pooling.md).
  */
 /* Frama-C: skipped —
  * [syscall] all socket-touching functions: send/recv/connect/setsockopt/close

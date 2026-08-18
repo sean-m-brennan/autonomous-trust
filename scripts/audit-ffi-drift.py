@@ -8,16 +8,15 @@
 #   src/autonomous-trust/autonomous_trust/core/_native/_ffi.py
 # against the authoritative C declarations in src/c. Two independent checks:
 #
-#   FUNCTIONS  argument COUNT per function. CFFI does NOT validate arity until
-#              call time, where a mismatch is a segfault (the C function reads a
-#              garbage extra arg off the stack).
-#   STRUCTS    ordered FIELD-NAME LIST per struct the cdef mirrors. The cdef
-#              hand-mirrors C struct layouts, and a layout mismatch is worse
-#              than an arity one: it corrupts memory on every call, silently,
-#              until an unrelated free() aborts. `public_identity_t` drifted
-#              twice in seven days (ISSUES §9.2, §9.2.2) -- 48 bytes short, then
-#              912 -- and both times this script was blind to it because it
-#              compared only arity. A comment in the cdef stated the rule that
+# FUNCTIONS  argument COUNT per function. CFFI does NOT validate arity until call time,
+# where a mismatch is a segfault (the C function reads a garbage extra arg off the
+# stack). STRUCTS    ordered FIELD-NAME LIST per struct the cdef mirrors. The cdef
+# hand-mirrors C struct layouts, and a layout mismatch is worse than an arity one: it
+# corrupts memory on every call, silently, until an unrelated free() aborts.
+# `public_identity_t` drifted twice in seven days
+# (doc/architecture/native-ffi-dual-implementation.md, §9.2.2) -- 48 bytes short, then
+# 912 -- and both times this script was blind to it because it compared only arity. A
+# comment in the cdef stated the rule that
 #              the next commit broke; a comment is not a check.
 #
 # Severity (both checks):
@@ -151,7 +150,8 @@ def parse_cdef():
     return funcs
 
 
-# --- struct field-name mirroring (ISSUES §9.2) ----------------------------
+# --- struct field-name mirroring (doc/architecture/native-ffi-dual-implementation.md)
+# ----------------------------
 
 #: Macros the native library IS built with, so fields they guard are part of the
 #: ABI the cdef must mirror. `build-native.sh` passes -DAT_ZTA=ON, which defines

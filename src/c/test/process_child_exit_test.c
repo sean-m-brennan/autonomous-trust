@@ -17,7 +17,7 @@
 /**
  * @file process_child_exit_test.c
  * @brief A forked subsystem must never RETURN through start_process
- *        (ISSUES §2.1.3), and daemonize must not leak its intermediate.
+ * (doc/architecture/process-architecture.md), and daemonize must not leak its intermediate.
  *
  * The runner a subsystem is started with forks, and then RETURNS IN BOTH
  * PROCESSES: the daemon gets the new subsystem's pid, and the subsystem itself

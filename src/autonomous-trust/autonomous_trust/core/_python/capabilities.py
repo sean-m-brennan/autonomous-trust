@@ -87,7 +87,7 @@ class Capability(Configuration):
         self.required_tier = required_tier
         self.transaction_weight = transaction_weight
         # Operator-console descriptor metadata (PIV_MFA_OPERATOR_ACCESS_PLAN.md
-        # §3.5). Runtime-only and NOT serialized -- like arg_names/keywords,
+        #). Runtime-only and NOT serialized -- like arg_names/keywords,
         # these are cleared by sync_from_message and have no wire form, so they
         # don't touch the Python<->C conformance corpus. The operator's local
         # registry carries them so its resource directory is self-describing;

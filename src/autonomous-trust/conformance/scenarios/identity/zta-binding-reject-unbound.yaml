@@ -9,7 +9,8 @@ description: |
     credential and the same anchor that zta-binding-admit-bound admits, with the
     binding as the only difference.
 
-    That difference is the whole of ISSUES §1.5. Without a binding the gate has
+    That difference is the whole of doc/architecture/zta-integration.md. Without a binding
+    the gate has
     no way to distinguish holder from thief and falls back on first-use-wins;
     TOFU is not a weakness of ZTA but what is left over when the
     credential->identity binding is inferred rather than asserted.

@@ -96,7 +96,7 @@ class TestGroupWire:
         restored = Group.from_string(data)
         assert str(restored.uuid) == str(grp.uuid)
         assert restored.encryptor.publish() == enc.publish()
-        # §1.4: the full address_map now round-trips on the wire — the proto
+        # doc/architecture/identity-protocol.md: the full address_map now round-trips on the wire — the proto
         # gained a `map<string,string> address_map` field (and JSON carries it),
         # so it is no longer lossy.
         assert restored._address_map == addr_map

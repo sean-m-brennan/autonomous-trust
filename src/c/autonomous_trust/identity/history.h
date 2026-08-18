@@ -290,7 +290,7 @@ int identity_history_prove(identity_history_t *history,
 /** Structural + signature verification on an identity blob before its
  *  vote is counted. Mirrors Python's IdentityHistory.verify_object
  *  (history.py:170-213): rejects bad blob shape, missing identity
- *  fields, unknown voters, bad signatures, and (ISSUES.md §3.2
+ *  fields, unknown voters, bad signatures, and (doc/architecture/identity-protocol.md
  *  divergence detection) a proof whose digest disagrees with the
  *  canonical blob hash recomputed with the proof nonce — a voter
  *  committing to a conflicting history view of the candidate. The

@@ -1,0 +1,33 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: message-envelope-format-parity
+description: |
+    The same message encoded BOTH ways must decode to the same message
+    (doc/architecture/network-wire-format.md). Not a byte pin — a cross-format equivalence
+    check, run
+    inside each runtime.
+
+    This is the case that would fail if the two encodings ever disagreed about
+    a field's MEANING rather than its representation: an escaped payload that
+    one form double-encodes, an `encrypt` flag that survives one hop and not the
+    other, a trace_id preserved in JSON and minted fresh in proto. The payload
+    carries a quote, a backslash and a newline for exactly that reason — the
+    JSON form must base64 the raw bytes (never the JSON-escaped ones) and the
+    proto form must carry those same bytes verbatim.
+byte_pinning: false
+envelope_format: both
+wire_format: json
+serialize_mode: json
+constructor: Message
+input:
+  process: "logger"
+  function: "log_event"
+  obj: "line1\"q\\b\nline2"
+  encrypt: true
+  trace_id: "aaaabbbbccccdddd1111222233334444"
+expected:
+  # No pin: this case's assertion is cross-format EQUIVALENCE, checked inside
+  # each runtime. The byte agreement between runtimes is pinned by the two
+  # message-envelope-proto-* cases.
+  {}

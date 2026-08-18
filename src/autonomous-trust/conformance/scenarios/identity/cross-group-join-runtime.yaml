@@ -5,7 +5,7 @@ name: cross-group-join-runtime
 byte_pinning: false
 description: |
     Runtime cross-group join — the last open piece of identity protocol
-    step 7 (ISSUES.md §10.2).
+    step 7 (doc/architecture/gateway-reputation-tree.md).
 
     A gateway used to acquire a child cohort only from a seeded key file on
     disk (`group_child_*.cfg.json`). That is fine for a fixed deployment and

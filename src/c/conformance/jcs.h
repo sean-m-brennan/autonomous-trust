@@ -49,7 +49,7 @@ extern "C" {
  */
 int jcs_canonicalize(const char *json_utf8, size_t len, char **out, size_t *out_len);
 
-/* Test seam (ISSUES §2.1.2).  Reshape a Ryu `d2s_buffered_n` output to the
+/* Test seam for the garbage-exponent defect.  Reshape a Ryu `d2s_buffered_n` output to the
  * ES6/JCS canonical form, reading EXACTLY @p n_in bytes of @p ryu.
  *
  * Exposed only so a test can hand it a buffer that is deliberately NOT

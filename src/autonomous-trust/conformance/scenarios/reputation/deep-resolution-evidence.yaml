@@ -4,7 +4,8 @@ protocol: reputation
 name: deep-resolution-evidence
 byte_pinning: false
 description: |
-    Deep resolution — one peer, on demand, at any depth (ISSUES.md §10.2).
+    Deep resolution — one peer, on demand, at any depth
+    (doc/architecture/gateway-reputation-tree.md).
 
     A node scores a peer against the chain that peer's transactions landed in,
     and holds chains only for the groups it belongs to. Two levels down, that

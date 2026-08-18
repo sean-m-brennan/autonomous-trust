@@ -23,7 +23,7 @@
  *        burst of un-resolvable frames can't permanently starve legitimate
  *        deferrals. Mirrors Python netprocess.py's mystery_max_age_s age-out,
  *        which since 2026-08-10 bounds the same queue by the same quantity
- *        (wall-clock seconds) rather than by a retry count (ISSUES.md 2.4.4).
+ *        (wall-clock seconds) rather than by a retry count (doc/architecture/networking.md).
  *
  * Unconditional (not AT_NET_ENVELOPE-gated): the age-out path lives in the
  * always-compiled defer_message, and these tests use the non-envelope

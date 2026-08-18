@@ -127,7 +127,7 @@ size_t net_proc_test_sweep_stale(void);
 
 /* ---- Test-only hooks for the pest / annoy-limit path ----
  * A tunable that never reaches its comparison is decorative, which is the
- * failure mode ISSUES.md 2.4.4 is about. These let a test drive the counter
+ * failure mode doc/architecture/networking.md is about. These let a test drive the counter
  * and observe the blacklist promotion without a live socket. */
 
 /** @brief Clear the pest counters and the blacklist. */

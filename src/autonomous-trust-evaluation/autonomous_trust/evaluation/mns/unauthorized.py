@@ -76,10 +76,12 @@ TAXONOMY: Tuple[AttackType, ...] = (
                'measured: red-team compromised-credential detection = 1.00'),
     AttackType('cred_replay', 'Harvested-credential replay under new identity',
                'T1550.001', 'Defense Evasion', 0.15, 0.90, 0.20, 'M2b',
-               'modeled; residual = ISSUES §1.5 (TOFU race + C-parity pending)'),
+               'modeled; residual = credential binding, '
+               'doc/architecture/zta-integration.md (TOFU race + C-parity pending)'),
     AttackType('sybil_admission', 'Sybil / fabricated identity at admission',
                'T1136', 'Persistence', 0.12, 0.60, 0.15, 'M1',
-               'modeled; residual = ISSUES §8.1 (admission-bounding unproven)'),
+               'modeled; residual = Sybil admission-bounding, '
+               'doc/architecture/adversarial-testing.md (unproven)'),
     AttackType('open_channel', 'Unauthorized interception over open channel',
                'T1040', 'Collection', 0.12, 0.40, 0.02, 'M7', 'modeled gate'),
     AttackType('tier_escalation', 'Privilege / tier escalation',
@@ -93,8 +95,9 @@ TAXONOMY: Tuple[AttackType, ...] = (
                'modeled; ZTA baseline also revocation-checks → small delta'),
 )
 
-#: Tracked-gap closures (gap-closure plan): full cert↔identity binding (G11 /
-#: ISSUES §1.5) and proven Sybil admission-bounding (ISSUES §8.1). Used for the
+#: Tracked-gap closures (gap-closure plan): full cert↔identity binding
+#: (G11 / doc/architecture/zta-integration.md) and proven Sybil
+#: admission-bounding (doc/architecture/adversarial-testing.md). Used for the
 #: "projected with tracked gaps closed" line — NOT the current state.
 GAPS_CLOSED_PAT = {'cred_replay': 0.05, 'sybil_admission': 0.05}
 
@@ -238,14 +241,16 @@ def main(argv=None):
           f'(w/o AT) → {result.total_at} (w/ AT) | — | — |')
     print(f'| Unauthorized-access reduction | {_pct(result.reduction)} | ↑ ≥ 90% '
           f'| {"PASS" if result.meets_target else "NEAR-MISS"} |')
-    print(f'| Projected w/ tracked gaps closed (G11 §1.5 + §8.1) '
+    print(f'| Projected w/ tracked gaps closed (G11 binding + Sybil bounding) '
           f'| {_pct(result.reduction_gaps_closed)} | ↑ ≥ 90% '
           f'| {"PASS" if result.reduction_gaps_closed >= 0.90 else "FAIL"} |')
     print()
     if not result.meets_target:
         print('_Residual concentrated in the two TRACKED gaps — harvested-credential '
-              'replay (G11 / ISSUES §1.5: full cert↔identity binding + C parity) and '
-              'Sybil admission-bounding (ISSUES §8.1). Closing both lifts the modeled '
+              'replay (G11 / doc/architecture/zta-integration.md: full '
+              'cert↔identity binding + C parity) and '
+              'Sybil admission-bounding (doc/architecture/adversarial-testing.md). '
+              'Closing both lifts the modeled '
               'reduction over the 90% target (line above); this harness shows where '
               'to invest, consistent with the gap-closure plan._')
 

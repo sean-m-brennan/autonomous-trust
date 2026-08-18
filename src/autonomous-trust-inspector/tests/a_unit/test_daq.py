@@ -399,7 +399,7 @@ class TestCohortTracker:
 
     def test_handle_reputation_records_transitive_view(self):
         # A rep_resp routed back FROM observer 'peer-1' ABOUT subject 'peer-2'
-        # is peer-1's per-other view of peer-2 (§4.2:159); peer-2 still gets the
+        # is peer-1's per-other view of peer-2; peer-2 still gets the
         # direct aggregate append.
         def _pda(uuid):
             return PeerDataAcq(uuid, 0, MagicMock(), MagicMock(), MagicMock(),
@@ -422,7 +422,7 @@ class TestCohortTracker:
         assert list(observer.reputation_history) == []        # observer's own untouched
 
 
-# --- ISSUES §4.3: Cohort.acquire_data ---------------------------------------
+# --- Cohort.acquire_data ---------------------------------------
 #
 # The blocker was never "which queue to drain". One Cohort is handed to the DAQ
 # worker, the video/data receivers and the UI, then the workers are pickled into

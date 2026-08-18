@@ -404,7 +404,7 @@ class TestPeerStatus:
 
 
 class TestPeerDetailPushes:
-    """ISSUES §4.2: the trust/network subplots in the peer-detail drawer never
+    """The trust/network subplots in the peer-detail drawer never
     populated. The figures were updated server-side on every cohort tick, but
     nothing told the browser: the push calls were commented out, guarded on
     `parent.displayed_detail` -- which `MapDisplay` sets to -1 and never touches
@@ -634,7 +634,7 @@ def _reported_metadata(lat=34.0, lon=-86.0, alt=100.0, data_type='video'):
 
 
 class TestDetailCaptionsAreLive:
-    """ISSUES §4.2:360. The drawer's captions were rendered once, when the body
+    """`peer_status.py` captions. The drawer's captions were rendered once, when the body
     was built, and never updated: the position under the video feed froze at
     wherever the peer was when the drawer opened -- for a moving peer, the one
     value that panel exists to show. The data caption was worse than stale: it was
@@ -760,7 +760,7 @@ class TestDetailCaptionsAreLive:
 
 
 class TestDataFeedRecords:
-    """ISSUES §4.2:113 (data recording + rendering). The per-peer sensor plot had
+    """`peer_status.py` data recording + rendering. The per-peer sensor plot had
     never worked, for four independent reasons, each measured rather than assumed:
     nothing ever called `rcv()` (no route, no thread, no caller), so
     `peer.data_stream` -- an unbounded pooled Queue the receiver keeps filing into
@@ -904,7 +904,7 @@ class TestDataFeedRecords:
 
 class TestDataFeedRendersWhenWatched:
     """The recording half is useless if nothing tells the browser -- the same
-    break as the trust/net subplots (§4.2:279)."""
+    break as the trust/net subplots."""
 
     def _make_status(self, samples=((1.0, 2.0, 3.0),)):
         from queue import Queue

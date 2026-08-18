@@ -83,7 +83,7 @@ int identity_get_peer_caps_count(const uuid_t uuid);
 int identity_get_peer_cap_descriptor(const char *cap_name, char *buf, size_t buflen);
 
 /** Number of peers @p proc is holding PROVISIONAL under two-phase admission
- *  (ISSUES.md §3.1-a) — a confirm was seen but the distinct-confirmer quorum
+ * (doc/architecture/identity-protocol.md) — a confirm was seen but the distinct-confirmer quorum
  *  is not yet met, so the group key is withheld. Conformance scenarios assert
  *  against this via the `provisional_peer_count` expected_state key. */
 size_t identity_provisional_count(const process_t *proc);
@@ -126,7 +126,7 @@ void identity_periodic_identity_resync(const process_t *proc);
  *  a TIER_FLOORS boundary. Mirrors Python's per-peer `peer._tier`
  *  field consulted by negotiation's capability tier-gate. Distinct
  *  from topology rank (identity_t::rank); see
- *  doc/architecture/trust-tiers.md §1. */
+ * doc/architecture/trust-tiers.md §1. */
 int identity_get_peer_tier(const uuid_t uuid);
 
 /** Return the trust tier last applied to the local identity via ID_TIER. */
@@ -136,7 +136,7 @@ int identity_get_self_tier(void);
  *  @p out. Returns the number of bytes written (excluding the trailing
  *  NUL), or 0 if no recovery is in flight. Test-only accessor for the
  *  conformance harness and the C unit test. See
- *  doc/architecture/partition-recovery.md. */
+ * doc/architecture/partition-recovery.md. */
 size_t identity_get_partition_recovery_target(char *out, size_t out_len);
 
 /** Build the canonical signature input for a partition_probe payload.
@@ -167,7 +167,7 @@ int identity_partition_canonical_response(const char *group_uuid,
  *  same id_state struct. Production code MUST leave this off. */
 void identity_set_synchronous_dispatch(bool enabled);
 
-/** Set a participant's border-guard flag (ISSUES.md §3.1-c, Policy B).
+/** Set a participant's border-guard flag (doc/architecture/identity-protocol.md, Policy B).
  *  Per-process (mirrors Python's per-instance
  *  IdentityProcess.border_guard_mode), so it takes the target @p proc rather
  *  than touching the global id_state. Defaults true in
@@ -175,7 +175,7 @@ void identity_set_synchronous_dispatch(bool enabled);
  *  received proposals (border-guards-only quorum). */
 void identity_set_border_guard_mode(process_t *proc, bool enabled);
 
-/** Set a participant's two-phase admission quorum (ISSUES.md §3.1-a).
+/** Set a participant's two-phase admission quorum (doc/architecture/identity-protocol.md).
  *  Per-process (mirrors Python's per-instance
  *  IdentityProcess._admission_quorum). Default 1 = promote on the first
  *  confirm; higher values withhold the group key until that many DISTINCT
@@ -288,7 +288,8 @@ int identity_aggregate_subtree_roster(const char *top_uuid,
                                       json_t **out_private);
 
 /** Ask a cohort we are NOT in to admit us, so a gateway can acquire a child
- *  cohort at runtime rather than from a seeded key file (ISSUES.md §10.2). The
+ *  cohort at runtime rather than from a seeded key file
+ * (doc/architecture/gateway-reputation-tree.md). The
  *  cohort decides: this only sends the ordinary request_access naming
  *  @p group_uuid and records that we solicited it. Returns 0 on success.
  *  C twin of Python IdentityProcess.request_cohort_join. */
@@ -325,9 +326,9 @@ int identity_load_child_groups(process_t *proc, const char *cfg_dir);
  *  _record_child_groups. Returns the number of messages sent; 0 on a leaf. */
 int identity_propagate_child_groups(const process_t *proc, directory_t *queues);
 
-/** Re-derive this node's parent gateway and advertise its position if it moved
- *  (protocol step 7, ISSUES.md §10.2). Cheap and idempotent, so every input
- *  change may call it. C twin of Python's _refresh_hierarchy. */
+/** Re-derive this node's parent gateway and advertise its position if it moved (protocol
+ * step 7, doc/architecture/gateway-reputation-tree.md). Cheap and idempotent, so every
+ * input change may call it. C twin of Python's _refresh_hierarchy. */
 void identity_refresh_hierarchy(const process_t *proc);
 
 /** Ask the group to state their hierarchy positions. One-shot: a node joining a

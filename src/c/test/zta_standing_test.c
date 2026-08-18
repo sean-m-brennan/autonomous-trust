@@ -14,7 +14,8 @@
  *   limitations under the License.
  *******************/
 
-/** @file ZTA hardening: the DDIL cap binds, and a failure unwinds (ISSUES §10.5).
+/** @file ZTA hardening: the DDIL cap binds, and a failure unwinds
+ * (doc/architecture/zta-integration.md).
  *
  *  Two things were broken here in the FIELDED runtime, both invisible because
  *  nothing tested the ZTA→reputation path at all.
@@ -27,7 +28,7 @@
  *
  *  The penalty: `_send_reputation_penalty` stamped a zero `task_uuid`, which
  *  `_handle_local_tx_score` discards by design as the "system score" sentinel,
- *  AND sent `score = -0.8`, which `tx_score_in_range` has rejected since §11.2
+ *  AND sent `score = -0.8`, which `tx_score_in_range` has rejected since doc/architecture/reputation.md
  *  put the scale at [0, 1] with no negatives. A revoked credential cost a peer
  *  nothing, twice over.
  *

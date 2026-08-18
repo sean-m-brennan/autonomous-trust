@@ -6,7 +6,8 @@ A demo viewer's tour of the DoD mission `dod_mission` scenario after Stretch
 Goal 2 landed, focused on the MQ-800 deception story and how the inspector now
 makes it visible.
 
-> The plan this walkthrough implements is tracked in [`ISSUES.md`](../../ISSUES.md).
+> Stretch Goal 2 is complete; it has no tracker entry (it was never a defect or a
+> deferral, and ISSUES.md carries neither). This walkthrough is its reference.
 > Status memory: [`project-stretch-goal-2-pivot`](../../.claude/memory/project_stretch_goal_2_pivot.md)
 > Code locations summarised at the end of this doc.
 

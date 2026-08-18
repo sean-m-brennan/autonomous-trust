@@ -5,7 +5,7 @@ name: zta-cap-bounds-unproved-peer
 byte_pinning: false
 description: |
     A peer ZTA could not prove may not rise above its ceiling, and the bound
-    lands on the STORED score (ISSUES.md §10.5).
+    lands on the STORED score (doc/architecture/zta-integration.md).
 
     What this pins is a fix for something that was broken in both runtimes at
     once, which is exactly the case a cross-language corpus exists to catch.

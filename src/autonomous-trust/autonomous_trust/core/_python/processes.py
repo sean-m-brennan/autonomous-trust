@@ -113,7 +113,7 @@ class ProcessTracker(Mapping):
         return iter(self._registry)
 
 
-#: The one log-line shape for the whole project (ISSUES.md §5 S13).
+#: The one log-line shape for the whole project.
 #:
 #: Every AT handler already used these bytes; what drifted is that each
 #: entry-point script called `logging.basicConfig` with a shape of its own

@@ -16,7 +16,8 @@
 """The ZTA credential binding: which node this credential authorizes, and the proof.
 
 A chain-valid certificate says nothing about *who may present it*. That is the whole
-of ISSUES §1.5: a credential lifted from another peer's clear-text `announce` chains
+of doc/architecture/zta-integration.md: a credential lifted from another peer's clear-text
+`announce` chains
 to the agency CA exactly as well under a different uuid, so the admission gate had
 no way to tell holder from thief and fell back on first-use-wins (TOFU). TOFU is not
 a weakness of ZTA; it is what is left when the credential↔identity binding is
@@ -48,7 +49,7 @@ The two are not quite equal and the difference is worth stating rather than glos
 The signature covers the uuid **and** the node's signing key; a SAN names only the
 uuid. So a SAN match alone does not bind the key, and it leans on the existing Sybil
 uuid/key-collision checks to stop a peer announcing a victim's uuid under its own
-key. Both, however, fully close the §1.5 threat, which is a credential moving to a
+key. Both, however, fully close the doc/architecture/zta-integration.md threat, which is a credential moving to a
 *different* identity.
 
 **Durable, not a live challenge-response.** There is no nonce, deliberately, and for
@@ -220,7 +221,8 @@ def operator_binding_binds_identity(identity, cred_der: bytes,
     signature from that key over bytes naming this node, and those bytes name it.
     A node that already carries a verifying operator-key binding has therefore
     already proven entitlement, and requiring a second signature would demand
-    another operator session for nothing. (ISSUES §1.5 credits the operator binding
+    another operator session for nothing. (doc/architecture/zta-integration.md credits the
+    operator binding
     with closing the replay case for exactly this reason.)
 
     Narrower than it looks, so worth being plain: it only helps a node that opted in

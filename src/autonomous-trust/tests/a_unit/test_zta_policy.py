@@ -203,7 +203,8 @@ class TestAnchors:
 
 class TestBindingMode:
     def test_defaults_to_require(self):
-        # TOFU is the whole of ISSUES §1.5, so the default must be the strict one.
+        # TOFU is the whole of doc/architecture/zta-integration.md, so the default must
+        # be the strict one.
         assert ZtaPolicy.defaults().binding_mode == BINDING_MODE_REQUIRE
 
     @pytest.mark.parametrize('mode', [BINDING_MODE_REQUIRE, BINDING_MODE_PREFER,

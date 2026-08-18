@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""ISSUES §3.5b: a config directory outlives the address it recorded, so
+"""A config directory outlives the address it recorded, so
 Automate re-derives the address at load when the stored one is no longer
 present on this host -- and leaves it alone when it is."""
 import json

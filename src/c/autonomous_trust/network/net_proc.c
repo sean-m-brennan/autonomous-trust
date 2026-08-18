@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <ctype.h>
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -292,6 +293,69 @@ static net_knob_t knob_max_live_conns = {
     0, false, false, false, {0},
 };
 
+/* The named counterpart of net_knob_t, for a knob whose values are NAMES
+ * rather than numbers. Separate rather than generalized: the numeric resolver's
+ * range check IS most of it, and a knob with two legal spellings needs a
+ * membership test instead. Same cache-once and same refusal discipline. */
+typedef struct {
+    const char *env_name;
+    /* cache */
+    char        raw[32];
+    bool        read;
+    bool        found;
+    bool        bad;
+    net_wire_format_t value;
+} net_str_knob_t;
+
+static net_str_knob_t knob_wire_mode = { "AT_NET_WIRE_MODE", {0}, false, false, false, NET_WIRE_JSON };
+
+net_wire_format_t net_wire_mode_resolve(net_knob_source_t *src, logger_t *logger)
+{
+    net_str_knob_t *k = &knob_wire_mode;
+    if (!k->read) {
+        k->read = true;
+        const char *raw = getenv(k->env_name);
+        if (raw != NULL && raw[0] != '\0') {
+            snprintf(k->raw, sizeof(k->raw), "%s", raw);
+            /* Trim and lowercase before matching: an operator writing " Proto"
+             * means proto, and treating that as a refusal would present as this
+             * whole path not happening. Python's resolve_env_choice does the
+             * same. */
+            char norm[sizeof(k->raw)];
+            size_t n = 0;
+            for (const char *c = raw; *c != '\0' && n + 1 < sizeof(norm); c++) {
+                if (n == 0 && (*c == ' ' || *c == '\t')) continue;
+                norm[n++] = (char)tolower((unsigned char)*c);
+            }
+            while (n > 0 && (norm[n - 1] == ' ' || norm[n - 1] == '\t')) n--;
+            norm[n] = '\0';
+            if (strcmp(norm, "proto") == 0) {
+                k->value = NET_WIRE_PROTO;
+                k->found = true;
+            } else if (strcmp(norm, "json") == 0) {
+                k->value = NET_WIRE_JSON;
+                k->found = true;
+            } else {
+                k->bad = true;
+            }
+        }
+    }
+    if (k->bad) {
+        /* Reported on every consultation that carries a logger, as the numeric
+         * knobs are: the resolver can run before the logger exists, and a
+         * refused override must not be the one thing that goes unlogged. */
+        log_warn(logger,
+                 "Network: refusing %s='%s' (want json|proto); using default %s\n",
+                 k->env_name, k->raw, net_wire_format_name(NET_WIRE_MODE_DEFAULT));
+    }
+    if (k->found) {
+        if (src != NULL) *src = KNOB_SRC_ENV;
+        return k->value;
+    }
+    if (src != NULL) *src = KNOB_SRC_DEFAULT;
+    return NET_WIRE_MODE_DEFAULT;
+}
+
 const char *net_knob_source_name(net_knob_source_t src)
 {
     switch (src) {
@@ -378,6 +442,14 @@ void net_knobs_resolve_reset(void)
         all[i]->bad    = false;
         all[i]->raw[0] = '\0';
     }
+    /* The named knob caches separately and must reset with them, or a test that
+     * exercises two AT_NET_WIRE_MODE values silently measures the first one
+     * twice -- exactly the failure this seam exists to prevent. */
+    knob_wire_mode.value  = NET_WIRE_JSON;
+    knob_wire_mode.read   = false;
+    knob_wire_mode.found  = false;
+    knob_wire_mode.bad    = false;
+    knob_wire_mode.raw[0] = '\0';
 }
 
 /****************************
@@ -592,7 +664,7 @@ static pthread_mutex_t deferred_lock = PTHREAD_MUTEX_INITIALIZER;
  * un-resolvable encrypted frames permanently occupies the bounded queue and
  * starves legitimate deferrals. Overridable via AT_MYSTERY_MAX_AGE_SEC.
  *
- * Python bounds the same queue the same way as of 2026-08-10 (ISSUES.md 2.4.4):
+ * Python bounds the same queue the same way as of 2026-08-10 (doc/architecture/networking.md):
  * it used to count retries on a ~0.5 s polling loop, which only approximated a
  * wall-time bound and drifted under load. Both sides now hold a deferral for
  * NET_MYSTERY_MAX_AGE_SEC seconds. */
@@ -613,7 +685,7 @@ static int64_t _deferred_now_s(void)
  * insertion order (so slot 0 remains the oldest survivor). Caller MUST hold
  * deferred_lock. Emits a net.mystery/aged_out/max_age counter per reclaimed
  * entry — the identical triple Python emits since 2026-08-10, when it moved
- * from a retry count to this age bound (ISSUES.md 2.4.4). */
+ * from a retry count to this age bound (doc/architecture/networking.md). */
 static void _deferred_sweep_stale_locked(int64_t now_s)
 {
     int64_t max_age = _deferred_max_age_s();
@@ -1140,7 +1212,7 @@ static int envelope_forward(const net_envelope_t *env_in,
 static int net_encrypt_and_send(const identity_t *myself, const net_wire_msg_t *msg,
                                 const net_transport_t *transport,
                                 net_transport_ctx_t *ctx,
-                                int port, logger_t *logger);
+                                int port, net_wire_format_t fmt, logger_t *logger);
 
 /****************************
  * stats_req / ping_at outbound interception (divergence.md H7, H8)
@@ -1191,7 +1263,7 @@ static uint8_t *peer_stats_to_json_bytes(size_t *out_len)
  *
  * Returns 0 when the refusal was posted, non-zero on allocation/send failure
  * (caller logs). Python performs the PingAT instead (netprocess.py) and
- * is the only implementation — see ISSUES.md. */
+ * is the only implementation — see doc/architecture/networking.md. */
 int refuse_ping_at_unsupported(const char *target_addr,
                             const char *return_to, logger_t *logger)
 {
@@ -1227,7 +1299,8 @@ static int handle_outbound_stats_req(const net_msg_t *nmsg,
                                      const identity_t *myself,
                                      const net_transport_t *transport,
                                      net_transport_ctx_t *tctx,
-                                     int port, logger_t *logger)
+                                     int port, net_wire_format_t fmt,
+                                     logger_t *logger)
 {
     size_t body_len = 0;
     uint8_t *body = peer_stats_to_json_bytes(&body_len);
@@ -1244,7 +1317,7 @@ static int handle_outbound_stats_req(const net_msg_t *nmsg,
     resp.to_whom.type = RECIPIENT_PEER;
     memcpy(&resp.to_whom.target.peer, &nmsg->from_whom, sizeof(public_identity_t));
 
-    int rc = net_encrypt_and_send(myself, &resp, transport, tctx, port, logger);
+    int rc = net_encrypt_and_send(myself, &resp, transport, tctx, port, fmt, logger);
     if (rc != 0)
         log_error(logger, "Network: stats_resp send to %s failed\n",
                   nmsg->from_whom.address);
@@ -1264,11 +1337,14 @@ static int handle_outbound_stats_req(const net_msg_t *nmsg,
 static int net_encrypt_and_send(const identity_t *myself, const net_wire_msg_t *msg,
                                 const net_transport_t *transport,
                                 net_transport_ctx_t *ctx,
-                                int port, logger_t *logger)
+                                int port, net_wire_format_t fmt, logger_t *logger)
 {
     uint8_t *wire = NULL;
     size_t wire_len = 0;
-    if (net_message_to_wire(msg, myself, &wire, &wire_len) != 0)
+    /* `fmt` comes from the ADDRESSED group (doc/architecture/network-wire-format.md),
+     * resolved by the caller -- this function encrypts and sends, it does not decide
+     * policy. */
+    if (net_message_to_wire_fmt(msg, myself, fmt, &wire, &wire_len) != 0)
         return -1;
 
     /* Broadcast: no encryption; falls back to per-peer unicast if the
@@ -1429,6 +1505,37 @@ static void my_address(const network_config_t *net_cfg, bool ipv6, char *out,
         cidr_split((char *)net_cfg->ip4_cidr, out, out_len, NULL, 0);
 }
 
+/* The envelope format traffic with `address` rides in
+ * (doc/architecture/network-wire-format.md).
+ *
+ * A group lookup, because the format belongs to the GROUP: an address we can place in
+ * our cohort speaks the cohort's format, and anything we cannot place -- a stranger, a
+ * pre-admission newcomer, a peer in a group we do not hold -- is JSON. JSON is the
+ * format every AT node can read, so it is the only safe answer when there is no group
+ * to consult, and that is also why bootstrap is JSON unconditionally: discovery happens
+ * before a group exists to ask.
+ *
+ * Mirrors Python NetworkProcess._wire_format_for_addr. Note what this does NOT do: look
+ * at the arriving bytes. Deciding the format from the frame is detection, which is
+ * deliberately unimplemented (doc/architecture/network-wire-format.md).
+ */
+static net_wire_format_t wire_format_for_address(const group_t *grp,
+                                                 const char *address)
+{
+    if (grp == NULL || address == NULL || address[0] == '\0')
+        return NET_WIRE_JSON;
+    bool in_group = false;
+    map_key_t key;
+    data_t *value;
+    map_entries_for_each((map_t *)&grp->address_map, key, value)
+        string_t addr = NULL;
+        if (data_string_ptr(value, &addr) == 0 && addr != NULL &&
+            strcmp((const char *)addr, address) == 0)
+            in_group = true;
+    map_end_for_each
+    return in_group ? grp->wire_format : NET_WIRE_JSON;
+}
+
 /* Deliver a PLAINTEXT frame from a peer we already know, but only an
  * allowlisted verb that declares itself unencrypted.
  *
@@ -1449,10 +1556,11 @@ static void my_address(const network_config_t *net_cfg, bool ipv6, char *out,
  */
 static bool try_unencrypted_from_known_peer(net_thread_ctx_t *ctx,
                                            const uint8_t *buf, size_t len,
-                                           const char *from_addr)
+                                           const char *from_addr,
+                                           net_wire_format_t fmt)
 {
     net_wire_msg_t wmsg;
-    if (net_message_from_wire(buf, len, NULL, &wmsg) != 0)
+    if (net_message_from_wire_fmt(buf, len, NULL, fmt, &wmsg) != 0)
         return false;
     if (wmsg.encrypt || !identity_verb_is_unencrypted(wmsg.function)) {
         if (!wmsg.encrypt && wmsg.function != NULL)
@@ -1511,7 +1619,12 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
                                   &plain, &plain_len);
         if (dec == 0) {
             net_wire_msg_t wmsg;
-            if (net_message_from_wire(plain, plain_len, peer, &wmsg) == 0) {
+            /* Keyed on the PEER's own address, not from_addr: under a forwarded
+             * envelope from_addr is the gateway, and the format belongs to the
+             * originator's group. */
+            net_wire_format_t fmt =
+                wire_format_for_address(&ctx->proc->protocol.group, peer->address);
+            if (net_message_from_wire_fmt(plain, plain_len, peer, fmt, &wmsg) == 0) {
                 route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
             } else {
                 /* Decrypted successfully but the inner wire is malformed —
@@ -1520,8 +1633,10 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
             }
             free(plain);
             net_wire_msg_free(&wmsg);
-        } else if (try_unencrypted_from_known_peer(ctx, inner_buf, inner_len,
-                                                   from_addr)) {
+        } else if (try_unencrypted_from_known_peer(
+                       ctx, inner_buf, inner_len, from_addr,
+                       wire_format_for_address(&ctx->proc->protocol.group,
+                                               peer->address))) {
             /* A verb this protocol sends in plaintext by design. Delivered, and
              * deliberately NOT annoy-tracked: penalising it would have driven a
              * well-behaved peer toward blacklist for following the protocol. */
@@ -1534,9 +1649,12 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
             pest_track_annoy(from_addr);
         }
     } else {
-        /* Try as unencrypted (e.g. access_granted to unknown peer) */
+        /* Try as unencrypted (e.g. access_granted to unknown peer).
+         * JSON, not a lookup: a sender we cannot place in any group is
+         * bootstrap traffic by definition (doc/architecture/network-wire-format.md). */
         net_wire_msg_t wmsg;
-        if (net_message_from_wire(inner_buf, inner_len, NULL, &wmsg) == 0) {
+        if (net_message_from_wire_fmt(inner_buf, inner_len, NULL,
+                                      NET_WIRE_JSON, &wmsg) == 0) {
             snprintf(wmsg.from_whom.address, sizeof(wmsg.from_whom.address),
                      "%s", from_addr);
             route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
@@ -1612,9 +1730,13 @@ void handle_inbound_broadcast(net_thread_ctx_t *ctx,
         return;
 #endif
 
-    /* Broadcast messages are unencrypted */
+    /* Broadcast messages are unencrypted -- and JSON unconditionally: the
+     * broadcast channel IS discovery, so there is no group to consult and the
+     * receivers include nodes that hold no group at all
+     * (doc/architecture/network-wire-format.md). */
     net_wire_msg_t wmsg;
-    if (net_message_from_wire(inner_buf, inner_len, NULL, &wmsg) == 0) {
+    if (net_message_from_wire_fmt(inner_buf, inner_len, NULL,
+                                  NET_WIRE_JSON, &wmsg) == 0) {
         bool preserve_self_reported = false;
 #ifdef AT_DISCOVERY_CROSS_CLUSTER
         /* Cross-cluster discovery: when the envelope was forwarded by a
@@ -1642,7 +1764,7 @@ void handle_inbound_broadcast(net_thread_ctx_t *ctx,
      * transport. On a hybrid transport, send_broadcast_except_leg fans
      * out to every leg except the one that delivered this frame — so
      * nodes on the origin leg don't receive a duplicate of the broadcast
-     * they sent (§4.3 D-followup). Single-leg transports leave the
+     * they sent (D-followup). Single-leg transports leave the
      * except_leg method NULL and fall back to send_broadcast. */
     bool gw = (ctx->transport->is_gateway != NULL &&
                ctx->transport->is_gateway(ctx->ctx));
@@ -1831,7 +1953,9 @@ void handle_inbound_group(net_thread_ctx_t *ctx,
     int dec = group_decrypt(grp, &cmsg, grp, nonce, plain);
     if (dec == 0) {
         net_wire_msg_t wmsg;
-        if (net_message_from_wire(plain, plain_len, NULL, &wmsg) == 0) {
+        /* The group whose key opened it names the encoding it is in (2.3). */
+        if (net_message_from_wire_fmt(plain, plain_len, NULL,
+                                      grp->wire_format, &wmsg) == 0) {
             snprintf(wmsg.from_whom.address, sizeof(wmsg.from_whom.address),
                      "%s", from_addr);
             route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
@@ -2027,8 +2151,14 @@ static int network_run(const net_transport_t *transport,
             if (nmsg->function != NULL &&
                 strcmp(nmsg->process, "network") == 0) {
                 if (strcmp(nmsg->function, NET_FN_STATS_REQ) == 0) {
-                    handle_outbound_stats_req(nmsg, myself, transport, tctx,
-                                              port_num, logger);
+                    /* The requester is a peer, so its group decides the
+                     * reply's encoding -- a stats_resp in the wrong format
+                     * would be dropped by the very node that asked (2.3). */
+                    handle_outbound_stats_req(
+                        nmsg, myself, transport, tctx, port_num,
+                        wire_format_for_address(&proc->protocol.group,
+                                                nmsg->from_whom.address),
+                        logger);
                     continue;
                 }
                 if (strcmp(nmsg->function, NET_FN_PING_AT) == 0) {
@@ -2127,8 +2257,15 @@ static int network_run(const net_transport_t *transport,
                        sizeof(public_identity_t));
             }
 
+            /* Broadcast is discovery -> JSON; a peer we can place speaks its
+             * group's format; one we cannot place gets JSON, which is what
+             * makes pre-admission traffic work in a proto cohort (2.3). */
+            net_wire_format_t send_fmt = is_broadcast
+                ? NET_WIRE_JSON
+                : wire_format_for_address(&proc->protocol.group,
+                                          nmsg->to_whom.address);
             int send_ret = net_encrypt_and_send(myself, &wmsg, transport, tctx,
-                                                port_num, logger);
+                                                port_num, send_fmt, logger);
             if (send_ret != 0) {
                 log_error(logger, "Network: send failed for %s.%s\n",
                           nmsg->process, nmsg->function);
@@ -2218,7 +2355,18 @@ static int network_run(const net_transport_t *transport,
                         if (decrypt_message(myself, new_peer, dm->data, dm->len,
                                             &plain, &plain_len) == 0) {
                             net_wire_msg_t wmsg;
-                            if (net_message_from_wire(plain, plain_len, new_peer, &wmsg) == 0) {
+                            /* The peer is known NOW, so its group answers the
+                             * format question that could not be answered when
+                             * the frame was deferred
+                             * (doc/architecture/network-wire-format.md). A frame
+                             * deferred before admission was sent by a peer that
+                             * had no group of ours yet, so in practice this
+                             * resolves to JSON unless it was already a member. */
+                            if (net_message_from_wire_fmt(
+                                    plain, plain_len, new_peer,
+                                    wire_format_for_address(&proc->protocol.group,
+                                                            new_peer->address),
+                                    &wmsg) == 0) {
                                 route_to_process(&wmsg, proc, queues, logger);
                                 log_info(logger, "Network: replayed deferred message from %s\n",
                                          dm->from_addr);

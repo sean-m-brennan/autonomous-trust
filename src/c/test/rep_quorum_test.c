@@ -804,7 +804,7 @@ DEFINE_TEST(test_cosign_of_a_child_group_round_uses_the_proposers_chain_name)
      * signed bytes and the ack, because the proposer never said "". Signing the
      * resolved name made the member's co-signature verify nowhere on the
      * proposer, so a child-group checkpoint could not reach quorum across the
-     * boundary §10.2 exists to cross. */
+     * boundary doc/architecture/gateway-reputation-tree.md exists to cross. */
     _begin(2);
     identity_t *me = _mk_identity("member", "10.0.0.5");
     identity_t *gateway = _mk_identity("gateway", "10.0.0.1");

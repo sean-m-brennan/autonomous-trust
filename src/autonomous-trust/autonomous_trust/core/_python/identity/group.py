@@ -21,7 +21,7 @@ import uuid as uuid_mod
 from nacl.exceptions import CryptoError
 from nacl.public import Box
 
-from ..config import InitializableConfig
+from ..config import InitializableConfig, NetWireFormat
 from .encrypt import Encryptor
 from autonomous_trust.core.protobuf.identity import identity_pb2
 
@@ -33,27 +33,27 @@ class Group(InitializableConfig):
     _msg_class = identity_pb2.Group
 
     def __init__(self, _uuid, _address_map, _nickname, _encryptor, _public_only=True,
-                 _created=0.0, _key_epoch=0, _previous_keys=None):
+                 _created=0.0, _key_epoch=0, _previous_keys=None, _wire_format=None):
         super().__init__(identity_pb2.Group)
         self._uuid = str(_uuid)
         self._address_map = _address_map
         self._nickname = _nickname
         self._encryptor = _encryptor  # group-shared key
         self._public_only = _public_only
-        # Group age (ISSUES.md §3.1-b): a comparable creation epoch (seconds).
-        # Used only as the group-merge tiebreaker on a MEMBERSHIP-SIZE TIE — the
-        # OLDER (smaller `created`) group wins, so the more-established group
+        # Group age (doc/architecture/identity-protocol.md): a comparable creation epoch
+        # (seconds). Used only as the group-merge tiebreaker on a MEMBERSHIP-SIZE TIE —
+        # the OLDER (smaller `created`) group wins, so the more-established group
         # absorbs the younger one. 0.0 = "unknown age" (the default for
         # wire/test-constructed groups), in which case the merge falls back to
         # the historical uuid tiebreaker so behavior is unchanged. Only groups
         # minted via `initialize` carry a real age. Local/merge signal only.
         self._created = float(_created) if _created else 0.0
-        # Key rotation (ISSUES.md §10.2). The shared key used to be permanent,
-        # which meant admitting a member handed it the ability to decrypt any
-        # cohort traffic it had recorded BEFORE it joined. Admission now
-        # rotates, and `key_epoch` is what makes a rotation safe to accept:
-        # a receiver adopts a new key only when it comes with a HIGHER epoch,
-        # so a captured older key cannot be replayed back over a newer one.
+        # Key rotation (doc/architecture/gateway-reputation-tree.md). The shared key
+        # used to be permanent, which meant admitting a member handed it the ability to
+        # decrypt any cohort traffic it had recorded BEFORE it joined. Admission now
+        # rotates, and `key_epoch` is what makes a rotation safe to accept: a receiver
+        # adopts a new key only when it comes with a HIGHER epoch, so a captured older
+        # key cannot be replayed back over a newer one.
         # 0 = never rotated, which is every group minted before this existed.
         self._key_epoch = int(_key_epoch or 0)
         # Superseded keys, newest first, as (Encryptor, retired_at). Kept only
@@ -75,6 +75,26 @@ class Group(InitializableConfig):
         # is only now reading its config off disk has none. Restoring would
         # just hold retired private keys open past any use for them.
         self._previous_keys = []
+        # Envelope encoding every member of this group speaks
+        # (doc/architecture/network-wire-format.md), as a NetWireFormat string. The
+        # GROUP owns this, not the node: a cohort in which two members disagree cannot
+        # talk, and there is deliberately no per-peer negotiation and no format
+        # detection to reconcile a disagreement after the fact (§2.5). A joining node
+        # therefore adopts its group's value at admission (from_canonical /
+        # adopt_membership) instead of applying its own AT_NET_WIRE_MODE, which only
+        # stamps a group this node MINTS (see `initialize`).
+        #
+        # None/absent -> json, which is what every group minted before this
+        # existed is, and what every group config written before this field
+        # decodes as.
+        self._wire_format = str(_wire_format) if _wire_format else NetWireFormat.json
+        if self._wire_format not in (NetWireFormat.json, NetWireFormat.proto):
+            # An unrecognized value tightens to the format every node can read
+            # rather than failing the load: a group config is provisioned data,
+            # and refusing to start over a typo in a field that has a safe
+            # reading would cost more than it protects. Same discipline as
+            # zta_policy.binding_mode falling back to `require`.
+            self._wire_format = NetWireFormat.json
 
     def to_dict(self):
         # `_previous_keys` is process-local grace-window state, not part of the
@@ -101,7 +121,7 @@ class Group(InitializableConfig):
 
     @property
     def created(self):
-        """Comparable creation epoch (seconds); 0.0 if unknown. See §3.1-b."""
+        """Comparable creation epoch (seconds); 0.0 if unknown. See doc/architecture/identity-protocol.md."""
         return getattr(self, '_created', 0.0)
 
     @property
@@ -109,6 +129,16 @@ class Group(InitializableConfig):
         """How many times this group's shared key has been rotated. Only ever
         compared, never trusted as an identity: see :meth:`accept_rotation`."""
         return getattr(self, '_key_epoch', 0)
+
+    @property
+    def wire_format(self) -> str:
+        """The envelope encoding this group's members speak
+        (doc/architecture/network-wire-format.md).
+
+        A :class:`NetWireFormat` value. ``getattr`` with a default because a
+        Group unpickled or decoded from a config written before this field
+        existed has no attribute at all, and every such group is JSON."""
+        return getattr(self, '_wire_format', NetWireFormat.json)
 
     #: How long a superseded key still decrypts, and how many are kept. A
     #: rotation propagates as fast as one message to each member, so this is
@@ -122,7 +152,8 @@ class Group(InitializableConfig):
         """Mint a fresh shared key, retiring the current one into the grace
         window, and return the new epoch.
 
-        Called when a cohort admits a member (ISSUES.md §10.2, user's call
+        Called when a cohort admits a member (doc/architecture/gateway-reputation-tree.md,
+        user's call
         2026-08-13): the joiner receives only the NEW key, so ciphertext it
         recorded before being admitted stays closed to it.
 
@@ -224,10 +255,19 @@ class Group(InitializableConfig):
                              else {a: a for a in other.addresses})
         if other.nickname:
             self._nickname = other.nickname
-        # Inherit the adopted group's age (§3.1-b) so subsequent merges compare
+        # Inherit the adopted group's age (doc/architecture/identity-protocol.md) so subsequent merges compare
         # against the established group's creation epoch, not ours.
         if other.created:
             self._created = other.created
+        # Adopt the surviving group's envelope format too (doc/architecture/network-wire-format.md, user's call
+        # 2026-08-18: "surviving group's format"). The merge winner is already
+        # decided by size -> created -> uuid, so the format needs no tiebreaker
+        # of its own -- it travels with the uuid and the address map, and this
+        # node speaks the absorbing cohort's format from here on. Without this
+        # line an absorbed node would keep talking in its old format inside its
+        # new group, which is precisely the split a group-carried format exists
+        # to prevent.
+        self._wire_format = other.wire_format
 
     def encrypt(self, msg, whom, nonce=None):
         """
@@ -275,31 +315,45 @@ class Group(InitializableConfig):
             raise
 
     def publish(self):
-        return Group(self.uuid, self.addresses, self.nickname, Encryptor(self.encryptor.publish(), True), True)
+        # wire_format travels with the published view: it is a property of the
+        # GROUP, not of holding its private key, and a member handed a
+        # public-only view still has to know which envelope the cohort speaks.
+        return Group(self.uuid, self.addresses, self.nickname, Encryptor(self.encryptor.publish(), True), True,
+                     _wire_format=self.wire_format)
 
     def sync_to_message(self):
         self.message.uuid = str(self._uuid).encode('utf-8')
         addr_map = dict(self._address_map) if isinstance(self._address_map, dict) \
             else {a: a for a in (self._address_map or [])}
-        # Full UUID->address map (§1.4).
+        # Full UUID->address map (doc/architecture/identity-protocol.md).
         self.message.address_map.clear()
         for uuid, addr in addr_map.items():
             self.message.address_map[str(uuid)] = str(addr)
         # Legacy single address = first value, for older peers that only read it.
         self.message.address = next(iter(addr_map.values()), '')
-        self.message.created = float(self.created)  # §3.1-b group age
+        self.message.created = float(self.created)  # doc/architecture/identity-protocol.md group age
+        # Envelope format (doc/architecture/network-wire-format.md). json is the proto3 default, so a JSON group
+        # still encodes to the bytes it did before this field existed.
+        self.message.wire_format = (identity_pb2.NET_WIRE_PROTO
+                                    if self.wire_format == NetWireFormat.proto
+                                    else identity_pb2.NET_WIRE_JSON)
         self._encryptor.sync_to_message()
         self.message.encryptor.CopyFrom(self._encryptor.message)
 
     def sync_from_message(self):
         self._uuid = self.message.uuid.decode('utf-8')
-        # Prefer the full map (§1.4); fall back to the legacy single `address`
+        # Prefer the full map (doc/architecture/identity-protocol.md); fall back to the legacy single `address`
         # from an older peer (keyed by the group uuid, the best we can do
         # without the original key).
         self._address_map = dict(self.message.address_map)
         if not self._address_map and self.message.address:
             self._address_map = {self._uuid: self.message.address}
         self._created = float(self.message.created) if self.message.created else 0.0
+        # Absent/0 reads as json, which is what a group from a peer predating
+        # this field is (doc/architecture/network-wire-format.md).
+        self._wire_format = (NetWireFormat.proto
+                             if self.message.wire_format == identity_pb2.NET_WIRE_PROTO
+                             else NetWireFormat.json)
         self._nickname = ''
         self._public_only = True
         # Reconstruct nested Encryptor
@@ -330,14 +384,19 @@ class Group(InitializableConfig):
             'nickname': self._nickname or '',
             'address_map': addr_map,
             'encryptor': {'hex_seed': seed, 'public_only': not owns_private},
-            # Group age (§3.1-b) for the merge size-tie tiebreaker. Omitted-on-
+            # Group age (doc/architecture/identity-protocol.md) for the merge size-tie tiebreaker. Omitted-on-
             # read defaults to 0.0 (unknown → uuid tiebreak), so a peer on an
             # older build that doesn't send it stays compatible.
             'created': self.created,
-            # Key rotation epoch (§10.2). Additive and defaulted on read, so a
+            # Key rotation epoch (doc/architecture/gateway-reputation-tree.md). Additive and defaulted on read, so a
             # peer that predates rotation sends nothing and reads as epoch 0 --
             # which is exactly "never rotated" and needs no special case.
             'key_epoch': self.key_epoch,
+            # Envelope encoding for this group's traffic (doc/architecture/network-wire-format.md). This is the
+            # field a joining node adopts, which is what keeps a cohort from
+            # ending up half in one format: it arrives with the group key, in
+            # the same message, from the member that admitted us.
+            'wire_format': self.wire_format,
         }
 
     @staticmethod
@@ -354,18 +413,28 @@ class Group(InitializableConfig):
                      d.get('nickname', ''),
                      Encryptor(seed, public_only=public_only), public_only,
                      _created=d.get('created', 0.0) or 0.0,
-                     _key_epoch=int(d.get('key_epoch', 0) or 0))
+                     _key_epoch=int(d.get('key_epoch', 0) or 0),
+                     # Absent -> json (the constructor's default), which is both
+                     # what an older peer means and the safe reading (doc/architecture/network-wire-format.md).
+                     _wire_format=d.get('wire_format'))
 
     @staticmethod
     def initialize(address_map, our_nickname):
         time.sleep(random.random())  # reduce chance of collision
-        # Stamp a real creation epoch (§3.1-b) so a group minted here carries a
+        # Stamp a real creation epoch (doc/architecture/identity-protocol.md) so a group minted here carries a
         # comparable age for the merge tiebreaker. now() is the NTP-adjusted
         # clock (autonomous_trust.core.system.now).
-        from ..system import now
+        from ..system import now, resolve_net_wire_mode
         created = now().timestamp()
+        # AT_NET_WIRE_MODE applies HERE and only here: this is the one moment a
+        # node decides a format rather than adopting one. Every other group this
+        # node ever holds arrived from a peer with its format already set
+        # (doc/architecture/network-wire-format.md), so an operator stands up a proto cohort by setting the knob on
+        # whichever node forms the group.
+        wire_format, _src = resolve_net_wire_mode()
         return Group(uuid_mod.uuid4(), address_map, our_nickname,
-                     Encryptor.generate(), False, _created=created)
+                     Encryptor.generate(), False, _created=created,
+                     _wire_format=wire_format)
 
 
 class ChildGroupSet(object):

@@ -71,7 +71,7 @@ class ReputationProtocol(Protocol):
     # via rep_req; the reply reuses rep_resp so automate.py's
     # latest_reputation dispatch consumes it unchanged.
     consensus_rep_req = 'request consensus reputation'
-    # AT -> app pull (ISSUES §11.1). Spelled EXACTLY as C's
+    # AT -> app pull (doc/architecture/app-peer-carrier.md). Spelled EXACTLY as C's
     # AT_APP_ROSTER_REQUEST ("app_roster_request", message.h) because the
     # protocol strings are the wire form shared with the C twin -- a shortened
     # or prettified spelling here breaks Python<->C interop.
@@ -84,11 +84,10 @@ class ReputationProtocol(Protocol):
     # scenarios so byte-pinned corpora are unaffected). A detector
     # broadcasts `slash_propose` (a SlashAttestation); members co-sign
     # with `slash_sign`; on quorum the slasher broadcasts `slash_final`
-    # (a SignedSlash) and every node floors the target's reputation at
-    # the top of _consensus_reputation/_compute_reputation, bypassing the
-    # slow EMA. Mirrors the transaction/accepted/committed three-phase
-    # shape. See reputation.py SlashAttestation and
-    # doc/architecture/reputation.md.
+    # (a SignedSlash) and every node floors the target's reputation at the top of
+    # _consensus_reputation/_compute_reputation, bypassing the slow EMA. Mirrors the
+    # transaction/accepted/committed three-phase shape. See reputation.py
+    # SlashAttestation and doc/architecture/reputation.md.
     slash_propose = 'slash propose'
     slash_sign = 'slash sign'
     slash_final = 'slash final'
@@ -104,7 +103,8 @@ class ReputationProtocol(Protocol):
     checkpoint_propose = 'checkpoint propose'
     checkpoint_sign = 'checkpoint sign'
     checkpoint_final = 'checkpoint final'
-    # Deep resolution (ISSUES.md §10.2): one peer, on demand, at any depth.
+    # Deep resolution (doc/architecture/gateway-reputation-tree.md): one peer, on
+    # demand, at any depth.
     #
     # The gateway tree scores a peer against the chain its transactions
     # actually landed in, and a node holds chains only for the groups it is a

@@ -14,7 +14,7 @@
 #   limitations under the License.
 # ******************
 """Verifiable warm start: persisted reputation evidence and the graded
-restoration it gates (ISSUES.md §10.3).
+restoration it gates (doc/architecture/reputation.md).
 
 The claim under test is narrow and worth stating plainly: a persisted
 reputation score is restored in full ONLY when the evidence file beside it
@@ -214,7 +214,7 @@ class TestVerifiedWarmStart:
         assert rp._checkpoint is not None
         assert rp._checkpoint.epoch == 4
         # Per chain now: '' is the primary chain (a gateway also keys
-        # child-group chains here). See ISSUES §10.2.
+        # child-group chains here). See doc/architecture/gateway-reputation-tree.md.
         assert len(rp._checkpoint_sigs_final['']) == 3
 
     def test_score_beyond_the_evidence_is_pulled_back(self, cfg_root):
@@ -444,13 +444,14 @@ class TestTierCeiling:
         assert ReputationProcess._tier_ceiling(top) == 1.0
 
 
-# --- gateway child chains (ISSUES §10.2) ------------------------------------
+# --- gateway child chains (doc/architecture/gateway-reputation-tree.md)
+# ------------------------------------
 
 class TestChildChainEvidence:
     """A gateway keeps one chain per child group, and each gets its own
     checkpoints and its own evidence file. Before this, checkpoint rounds only
     ever covered the primary chain, so a gateway's subtree standing could not be
-    attested — and therefore could not be restored under §10.3's rule."""
+    attested — and therefore could not be restored under's rule."""
 
     def _gateway(self, cfg_root, child_uuid, peers=(), reputations=None):
         me = _identity('gw')
@@ -560,7 +561,7 @@ class TestChildChainEvidence:
         assert rp._checkpoint_epochs[''] == epochs['']
 
     def test_child_evidence_restores_on_restart(self, cfg_root):
-        """The point of §10.2's phase-3 persistence item: a restarted gateway
+        """The point of doc/architecture/gateway-reputation-tree.md's phase-3 persistence item: a restarted gateway
         comes back with its subtree chain, verified, instead of relearning it."""
         me = _identity('gw')
         peer = _identity('member')

@@ -46,7 +46,7 @@
  *  on by default) writes many frames down one connection. Closing after the
  *  first — which this transport did until 2026-08-10 — made the sender's
  *  second write land on a closed socket, where it is lost silently (see
- *  ISSUES.md §3.6). */
+ * doc/architecture/network-connection-pooling.md). */
 typedef struct {
     int fd;                     /**< -1 when the slot is free. */
     net_channel_t channel;      /**< Listener this arrived on. */

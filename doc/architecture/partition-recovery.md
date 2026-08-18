@@ -1,4 +1,4 @@
-*Previous: [Connection pooling](network-connection-pooling.md)*
+*Previous: [Network wire format](network-wire-format.md)*
 
 # Group Partition Recovery
 

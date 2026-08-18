@@ -4,7 +4,8 @@ protocol: identity
 name: zta-binding-reject-other-identity
 byte_pinning: false
 description: |
-    The harvested credential — the attack ISSUES §1.5 is about, and the reason
+    The harvested credential — the attack doc/architecture/zta-integration.md is about, and
+    the reason
     the pre-image names the node at all.
 
     The binding here is CORRECT in every respect except one: it is signed by the

@@ -14,7 +14,7 @@
 #   limitations under the License.
 # ******************
 
-"""A RUNNING inspector, over the network it actually serves (ISSUES §4.4 I21).
+"""A RUNNING inspector, over the network it actually serves (the I21 integration/system-test gap).
 
 The integration suite drives the same pipeline in-process, which covers every
 contract between our own modules and nothing about deployment: whether the

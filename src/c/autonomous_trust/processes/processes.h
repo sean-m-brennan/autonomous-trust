@@ -62,16 +62,16 @@ struct process_s
         map_t *peer_capabilities;
         int phase;
         array_t *unhandled_messages;
-        /* Border-guard flag (identity process only; ISSUES.md §3.1-c).
+        /* Border-guard flag (identity process only; doc/architecture/identity-protocol.md).
          * Mirrors Python IdentityProcess.border_guard_mode. When true (the
          * default, set in identity_register_handlers) this peer welcomes
          * newcomers AND votes on received proposals; when false it abstains
          * from voting (Policy B — border-guards-only). Non-identity
          * processes never read it. */
         bool border_guard_mode;
-        /* Two-phase admission quorum (identity process only; ISSUES.md
-         * §3.1-a). Mirrors Python IdentityProcess._admission_quorum. A member
-         * withholds the group key from a peer until this many DISTINCT
+        /* Two-phase admission quorum (identity process only;
+         * doc/architecture/identity-protocol.md). Mirrors Python
+         * IdentityProcess._admission_quorum. A member withholds the group key from a peer until this many DISTINCT
          * border-guards have confirmed the admission. Default 1 (set in
          * identity_register_handlers) = promote on first confirm = historical
          * behavior. Non-identity processes never read it. */

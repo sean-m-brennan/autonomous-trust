@@ -5,7 +5,7 @@ name: deep-resolution-withheld-entry-refused
 byte_pinning: false
 description: |
     Deep resolution, negative control: an answer that WITHHOLDS an entry is
-    refused by both runtimes (ISSUES.md §10.2).
+    refused by both runtimes (doc/architecture/gateway-reputation-tree.md).
 
     This is the case the answer's payload shape exists for, and it is worth
     stating why it is not obvious. The answer here is internally consistent and

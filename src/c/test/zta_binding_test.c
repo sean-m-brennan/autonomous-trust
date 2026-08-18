@@ -16,7 +16,7 @@
 
 /**
  * @file zta_binding_test.c
- * @brief The credential->identity binding (ISSUES §1.5): which node a ZTA
+ * @brief The credential->identity binding (doc/architecture/zta-integration.md): which node a ZTA
  *        credential authorizes, and the proof.
  *
  * Three things are under test, and the first matters most.
@@ -523,7 +523,7 @@ DEFINE_TEST(test_a_real_binding_verifies_and_a_forged_one_does_not)
 }
 
 /* The harvested credential: the pair is genuine, the identity presenting it is
- * not. This is the case §1.5 exists for, so it gets its own test rather than
+ * not. This is the case doc/architecture/zta-integration.md exists for, so it gets its own test rather than
  * riding along in the one above. */
 DEFINE_TEST(test_a_harvested_binding_does_not_verify_under_another_identity)
 {

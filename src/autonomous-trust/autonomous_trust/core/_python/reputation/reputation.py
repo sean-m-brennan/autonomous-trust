@@ -33,7 +33,8 @@ TX_SCORE_MAX = 1.0
 def validate_tx_score(score, where: str = 'TransactionScore'):
     """Return `score` as a float in [0, 1], or raise ValueError.
 
-    ISSUES §11.2, asked for by kith-covenant's erosion-legibility audit: the
+    The [0, 1] score bound, enforced (doc/architecture/reputation.md; asked for
+    by kith-covenant's erosion-legibility audit). The
     [0, 1] scale was a convention in AT rather than an enforced invariant, so an
     out-of-range score was *graded* rather than rejected — it flowed into the
     weighted average and moved a reputation by an unbounded amount. Rejecting is
@@ -59,7 +60,7 @@ def validate_tx_score(score, where: str = 'TransactionScore'):
 class TransactionScore(Configuration):
     def __init__(self, task_id, score, capability_name: str = None):
         self.task_id = task_id
-        # Enforced, not assumed (§11.2). This constructor is also the wire-side
+        # Enforced, not assumed (doc/architecture/reputation.md). This constructor is also the wire-side
         # entry point -- `from_json_string` reconstructs via `cls(**kwargs)` --
         # so a peer sending an out-of-range score raises here. Handlers on the
         # remote path therefore CATCH this and drop the message: an exception a
@@ -88,7 +89,7 @@ class Transaction(Configuration):
         # by TransactionHistory when the tx goes bilateral and is appended.
         # Makes a committed Transaction tamper-evident on its own and the
         # catch-up sync verifiable (see reputation-vs-blockchain-analysis.md
-        # §2.1). Mirrors transaction_t.prev_hash in the C twin; the canonical
+        # doc/architecture/process-architecture.md). Mirrors transaction_t.prev_hash in the C twin; the canonical
         # serialization below MUST stay byte-identical across languages.
         self.prev_hash = prev_hash
 
@@ -559,14 +560,13 @@ class Checkpoint(Configuration):
         self.count = count
         self.nonce = nonce
         self.signature = signature
-        # Which chain this checkpoint commits to: '' (the default) is the
-        # node's PRIMARY chain, and a group-uuid string is one of a gateway's
-        # child-group chains. A gateway keeps one TransactionHistory per child
-        # group, and without this a receiver could not tell which of its
-        # chains to compare the proposed root against. Follows the same
-        # optional-trailing-group_uuid shape the `committed` broadcast already
-        # uses. See doc/architecture/gateway-reputation-tree.md and
-        # ISSUES.md §10.2.
+        # Which chain this checkpoint commits to: '' (the default) is the node's PRIMARY
+        # chain, and a group-uuid string is one of a gateway's child-group chains. A
+        # gateway keeps one TransactionHistory per child group, and without this a
+        # receiver could not tell which of its chains to compare the proposed root
+        # against. Follows the same optional-trailing-group_uuid shape the `committed`
+        # broadcast already uses. See doc/architecture/gateway-reputation-tree.md and
+        # doc/architecture/gateway-reputation-tree.md.
         self.group_uuid = str(group_uuid) if group_uuid else ''
 
     @property
@@ -622,12 +622,12 @@ class SignedCheckpoint(Configuration):
 # that shows how it was reached, so warm start had no way to tell an earned 0.9
 # from one typed into the file. This is the evidence beside it: the resident
 # hash-linked window plus the quorum-signed checkpoint over it. See
-# doc/architecture/reputation.md (Verifiable warm start) and ISSUES.md §10.3.
+# doc/architecture/reputation.md (Verifiable warm start) and doc/architecture/reputation.md.
 #
 # Deliberately PLAIN JSON rather than a `Configuration` dump: one file is read
 # by both runtimes, and Configuration's encoder emits `__type__` keys naming
 # Python classes that mean nothing to the C reader. Same reasoning as the trust
-# ladder (§10.1). Field names follow the checkpoint wire payload so a reader of
+# ladder. Field names follow the checkpoint wire payload so a reader of
 # either is reading the same vocabulary.
 #
 # Schema is pinned so a future shape change is a refusal to rebuild (which
@@ -751,7 +751,8 @@ def evidence_from_dict(doc):
     return chain, signed
 
 
-# --- Deep resolution: one peer, on demand, at any depth (ISSUES.md §10.2) ---
+# --- Deep resolution: one peer, on demand, at any depth
+# (doc/architecture/gateway-reputation-tree.md) ---
 #
 # A node scores a peer against the chain that peer's transactions landed in,
 # and holds chains only for groups it belongs to. Two levels down that chain
@@ -772,7 +773,7 @@ def evidence_from_dict(doc):
 #: Hops a resolve may travel before it is dropped. The tree is the real bound;
 #: this is the backstop that keeps a routing loop or a lying `children` claim
 #: from circulating a query forever. 4 covers any hierarchy contemplated so far
-#: (ISSUES.md §10.2) with room to spare.
+#: (doc/architecture/gateway-reputation-tree.md) with room to spare.
 RESOLVE_TTL_DEFAULT = 4
 #: Refuse a query that arrives claiming more hops than we would ever originate:
 #: TTL is attacker-controlled, and an inflated one is an amplification lever.
@@ -975,7 +976,8 @@ class PeerReputation(Configuration):
     """AT → app: one peer's earned reputation, with whether AT holds one.
 
     Mirror of the C twin's `peer_reputation_msg_t` (`utilities/msg_types.h`) and
-    the flat `at_app_reputation_t` an app decodes (`app_events.h`); ISSUES §11.1,
+    the flat `at_app_reputation_t` an app decodes (`app_events.h`);
+    doc/architecture/app-peer-carrier.md,
     asked for by kith-covenant and ethne (D18).
 
     `rated` is the load-bearing field. AT's scale is anchored by fixed constants

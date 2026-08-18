@@ -445,7 +445,8 @@ END_TEST_DEFINITION()
 
 DEFINE_TEST(test_tx_score_range_accepts_the_scale)
 {
-    /* ISSUES §11.2: the [0, 1] bound is enforced now, not assumed. Mirrors
+    /* The [0, 1] bound is enforced now, not assumed
+     * (doc/architecture/reputation.md). Mirrors
      * TestTransactionScoreRange in the Python twin's test_reputation.py. */
     ck_assert(tx_score_in_range(0.0) == true);
     ck_assert(tx_score_in_range(0.2) == true);

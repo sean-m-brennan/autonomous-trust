@@ -138,7 +138,8 @@ static void _publish_tier_change(const process_t *proc,
 static void _publish_exclusion(const process_t *proc,
                                const uuid_t peer_uuid, bool excluded);
 #ifdef AT_ZTA_ENABLED
-/* ISSUES.md §10.5. Bound @p score by what ZTA proved about @p peer_uuid, and
+/* ZTA standing as an authority finding (doc/architecture/zta-integration.md).
+ * Bound @p score by what ZTA proved about @p peer_uuid, and
  * act on an arriving standing. Mirrors Python's _apply_zta_ceiling /
  * _apply_zta_standings / _unwind_zta_failure in repprocess.py. */
 static double _zta_apply_ceiling(const uuid_t peer_uuid, double score);
@@ -151,7 +152,7 @@ static bool _resolve_self_uuid(const process_t *proc, uuid_t out_uuid);
 static void _persist_reputations(const process_t *proc);
 #endif
 /* Forward declaration — definition sits with the rest of the verifiable
- * warm-start code (ISSUES §10.3), below the state struct it writes. Records a
+ * warm-start code (doc/architecture/reputation.md), below the state struct it writes. Records a
  * finalized checkpoint's root, window bounds and co-signatures, and persists
  * the evidence document. */
 static void _store_checkpoint(const process_t *proc, const char *proposer,
@@ -239,7 +240,8 @@ static struct {
      * leaf node, and every code path below falls back to the single `history`
      * when it is, so leaf behaviour is unchanged. Mirrors Python
      * ReputationProcess.child_histories. See
-     * doc/architecture/gateway-reputation-tree.md and ISSUES.md §10.2. */
+     * doc/architecture/gateway-reputation-tree.md and
+     * doc/architecture/gateway-reputation-tree.md. */
     map_t child_hist;
     /* Per-chain finalized checkpoints: chain key ("" = primary) ->
      * object_ptr_data(rep_chain_ckpt_t *). See _ckpt_slot_locked. */
@@ -249,7 +251,8 @@ static struct {
      * and sizes its quorum against that group rather than the conflated peer
      * list. Mirrors Python's round_group. */
     map_t round_group;
-    /* --- Deep resolution: one peer, on demand (ISSUES.md 10.2) ------------
+    /* --- Deep resolution: one peer, on demand
+     * (doc/architecture/gateway-reputation-tree.md) ------------
      * resolve_pending: query-id -> object_ptr_data(rep_resolve_t *), a query
      * we are RELAYING and the neighbour its answer must go back to. The only
      * state the capability adds anywhere, and it exists because the answer
@@ -365,7 +368,7 @@ static struct {
     char  checkpoint_root[TX_HASH_HEX_LEN + 1];  /* latest finalized root */
     int64_t checkpoint_epoch;  /* epoch of the latest finalized checkpoint */
     bool  checkpoint_set;      /* a checkpoint has been finalized/stored */
-    /* --- Verifiable warm start (ISSUES §10.3) ---
+    /* --- Verifiable warm start (doc/architecture/reputation.md) ---
      * The rest of the finalized checkpoint, kept because the PERSISTED
      * evidence has to carry it: a boot-time rebuild verifies the same quorum a
      * live receiver does, and a root with no window bounds and no signatures
@@ -398,11 +401,11 @@ static struct {
     /* Child-group chains already attempted by _restore_child_evidence, and the
      * persisted score each clamped peer was clamped away FROM -- the upper
      * bound on any later lift, so late evidence restores standing instead of
-     * inventing it (§10.2). */
+     * inventing it. */
     map_t   child_evidence_tried;
     map_t   restore_clamped;
 #ifdef AT_ZTA_ENABLED
-    /* ISSUES.md §10.5 (ZTA hardening). Volatile, like the slash floor: a
+    /* ZTA hardening (doc/architecture/zta-integration.md). Volatile, like the slash floor: a
      * restart re-derives standing from the admission gate rather than trusting
      * a file for it. Mirrors Python's _zta_* dicts in repprocess.py.
      *   zta_ceilings:    peer uuid-str -> highest reputation an UNPROVED peer
@@ -486,7 +489,8 @@ static void _ensure_init(void)
     }
 }
 
-/* ---- Gateway reputation tree: chain routing (ISSUES.md §10.2) -------------
+/* ---- Gateway reputation tree: chain routing
+ * (doc/architecture/gateway-reputation-tree.md) -------------
  *
  * A gateway belongs to more than one cohort, and their transaction histories
  * must not be merged: a subtree's reputation is that subtree's, and the parent
@@ -666,7 +670,7 @@ static size_t _quorum_for_group(const process_t *proc, const char *group_uuid)
  * chains separately: its own epoch counter, its own quorum, its own evidence
  * file. Keyed by CHAIN KEY ("" = primary), so a leaf node simply has one slot
  * and behaves as before. Mirrors Python's _checkpoints /
- * _checkpoint_sigs_final / _checkpoint_epochs (ISSUES.md §10.2). */
+ * _checkpoint_sigs_final / _checkpoint_epochs (doc/architecture/gateway-reputation-tree.md). */
 typedef struct {
     char    proposer[UUID_STRING_LEN + 1];
     char    root[TX_HASH_HEX_LEN + 1];
@@ -774,7 +778,7 @@ static void _record_task_weight_locked(char *task_uuid_str, int weight)
         && existing != NULL)
     {
         map_remove(&rep_state.task_weights, task_uuid_str);
-        map_remove(&rep_state.task_tiers, task_uuid_str);  /* lockstep (§2.3) */
+        map_remove(&rep_state.task_tiers, task_uuid_str);  /* lockstep (doc/architecture/network-wire-format.md) */
         /* Best-effort ring compaction: walk and remove matching slot.
          * O(N) but N <= 2*MAX_CHAIN_LEN, and refresh hits are rare. */
         for (int i = 0; i < rep_state.task_weights_ring_len; i++)
@@ -814,7 +818,7 @@ static void _record_task_weight_locked(char *task_uuid_str, int weight)
         {
             map_remove(&rep_state.task_weights,
                        rep_state.task_weights_ring[evict_slot]);
-            map_remove(&rep_state.task_tiers,           /* lockstep (§2.3) */
+            map_remove(&rep_state.task_tiers,           /* lockstep (doc/architecture/network-wire-format.md) */
                        rep_state.task_weights_ring[evict_slot]);
             rep_state.task_weights_ring[evict_slot][0] = '\0';
         }
@@ -831,7 +835,7 @@ static void _record_task_weight_locked(char *task_uuid_str, int weight)
 }
 
 /* Record a task's capability tier into rep_state.task_tiers (deferred.md
- * §2.3). No own ring: every tier key is recorded together with its weight
+ * doc/architecture/network-wire-format.md). No own ring: every tier key is recorded together with its weight
  * key, and _record_task_weight_locked removes both at the same eviction
  * points, so the tier map stays bounded in lockstep with task_weights.
  * Caller must hold rep_state.lock. */
@@ -948,7 +952,7 @@ static void _publish_tier_change(const process_t *proc,
 #ifdef AT_ZTA_ENABLED
 /****************************
  * ZTA standing: the DDIL cap, and the unwind on an affirmative failure
- * (ISSUES.md §10.5). Mirrors Python repprocess._apply_zta_ceiling /
+ * (doc/architecture/zta-integration.md). Mirrors Python repprocess._apply_zta_ceiling /
  * _apply_zta_standings / _unwind_zta_failure.
  ****************************/
 
@@ -981,19 +985,19 @@ static double _zta_apply_ceiling(const uuid_t peer_uuid, double score)
     return ceiling;
 }
 
-/** The score that evidence PREDATING the peer's last proved verification
- *  supports (ISSUES.md §10.5): back to the last point ZTA actually proved
- *  something, and no further.
+/** The score that evidence PREDATING the peer's last proved verification supports
+ * (doc/architecture/zta-integration.md): back to the last point ZTA actually proved
+ * something, and no further.
  *
- *  A recomputation over the pre-anchor window rather than a stored "score as of
- *  then" -- no such score is checkpointed (a checkpoint commits to a history
- *  WINDOW, not to per-peer values) -- reusing the same arithmetic the warm
- *  start uses so the unwind inherits its shrinkage: a short pre-anchor history
- *  cannot justify a high score. Falls back to the unverified-restore tier when
- *  there is no usable pre-anchor evidence, the evicted-chain case included:
- *  absent evidence bounds a peer low, it does not excuse it.
+ * A recomputation over the pre-anchor window rather than a stored "score as of then" --
+ * no such score is checkpointed (a checkpoint commits to a history WINDOW, not to
+ * per-peer values) -- reusing the same arithmetic the warm start uses so the unwind
+ * inherits its shrinkage: a short pre-anchor history cannot justify a high score. Falls
+ * back to the unverified-restore tier when there is no usable pre-anchor evidence, the
+ * evicted-chain case included: absent evidence bounds a peer low, it does not excuse
+ * it.
  *
- *  Caller must hold rep_state.lock. */
+ * Caller must hold rep_state.lock. */
 static double _zta_unwind_ceiling(const uuid_t self_uuid,
                                   const uuid_t peer_uuid, int anchor,
                                   bool have_anchor)
@@ -1045,7 +1049,7 @@ static double _zta_unwind_ceiling(const uuid_t self_uuid,
  *
  * No scalar penalty is sent for a failure. A ZTA verdict is an authority
  * finding, not an interaction outcome, and AT's [0, 1] scale has no
- * representation for one (§11.2) -- which is why this function's predecessor,
+ * representation for one (doc/architecture/reputation.md) -- which is why this function's predecessor,
  * `_send_reputation_penalty`'s `score = -0.8` TRANSACTION_SCORE, was discarded
  * at the boundary and cost a revoked peer exactly nothing. Bounding the value
  * and republishing the tier is the action; demotion, and exclusion below the
@@ -1501,7 +1505,7 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
          * _start_paxos(round_group). The tag then travels on the commit
          * broadcast, and each receiver maps it through its own view: a sibling
          * member sees its primary group, while a GATEWAY sees one of its child
-         * groups and routes the entry to that subtree's chain (§10.2). */
+         * groups and routes the entry to that subtree's chain (doc/architecture/gateway-reputation-tree.md). */
         char own_group[UUID_STRING_LEN + 1];
         uuid_unparse_lower(proc->protocol.group.uuid, own_group);
         char round_key[PAXOS_KEY_LEN];
@@ -1719,7 +1723,7 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
     int64_t id2 = json_integer_value(j_id2);
     int64_t id1 = json_integer_value(j_id1);
     double score = json_real_value(j_score);
-    /* §11.2: reject a peer-supplied score off AT's [0, 1] scale rather than
+    /* doc/architecture/reputation.md: reject a peer-supplied score off AT's [0, 1] scale rather than
      * grading it. Mirrors the Python twin, which raises in TransactionScore's
      * constructor and drops the message in handle_transaction. */
     if (!tx_score_in_range(score))
@@ -1939,7 +1943,7 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
                                && uuid_parse(task_uuid_str, task_uuid) == 0);
         /* Route to the chain this round belongs to: a gateway keeps one per
          * child group, and merging a subtree's history into the primary chain
-         * would make every group's reputation everyone else's (§10.2). */
+         * would make every group's reputation everyone else's (doc/architecture/gateway-reputation-tree.md). */
         char round_group[UUID_STRING_LEN + 1] = {0};
         _get_round_group_locked(paxos_key, round_group, sizeof(round_group));
         if (round_group[0] == '\0')
@@ -1959,7 +1963,7 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
         }
         paxos_advance_chain(&rep_state.paxos);
         /* Reset this peer's idle clock: the staleness sweep must leave an
-         * actively-transacting peer alone (ISSUES §10.3). */
+         * actively-transacting peer alone (doc/architecture/reputation.md). */
         _note_interaction(peer_uuid);
         log_info(proc->logger, "Reputation: Transaction committed\n");
 
@@ -2055,7 +2059,7 @@ static bool handle_committed(const process_t *proc, directory_t *queues, generic
 
     const char *peer_uuid_str = json_string_value(j_peer_uuid);
     double score = json_real_value(j_score);
-    /* §11.2, and this is the path that WRITES history on every acceptor, so the
+    /* doc/architecture/reputation.md, and this is the path that WRITES history on every acceptor, so the
      * bound matters most here. Same rejection as handle_transaction. */
     if (!tx_score_in_range(score))
     {
@@ -2099,7 +2103,7 @@ static bool handle_committed(const process_t *proc, directory_t *queues, generic
         tx_history_update(chain, peer_uuid, peer_uuid, score);
     }
     pthread_mutex_unlock(&rep_state.lock);
-    _note_interaction(peer_uuid);   /* idle clock; see §10.3 decay */
+    _note_interaction(peer_uuid);   /* idle clock; see doc/architecture/reputation.md decay */
     log_debug(proc->logger, "Reputation: Recorded committed tx from %s\n",
               peer_uuid_str);
 
@@ -2454,7 +2458,7 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
                                             self_uuid, peer_uuid);
         }
 #ifdef AT_ZTA_ENABLED
-        /* §10.5: an unproved credential bounds how far this peer may rise,
+        /* doc/architecture/zta-integration.md: an unproved credential bounds how far this peer may rise,
          * whichever regime produced the score above. */
         score = _zta_apply_ceiling(peer_uuid, score);
 #endif
@@ -2761,7 +2765,7 @@ static bool _verify_slash_evidence(json_t *evidence)
      * finalizes a checkpoint per child group, and a tx that offended inside a
      * child group is anchored in THAT group's root. Accepting only the primary
      * root would refuse every legitimate subtree slash while adding no
-     * security — each root cleared the same quorum test (§10.2). */
+     * security — each root cleared the same quorum test (doc/architecture/gateway-reputation-tree.md). */
     pthread_mutex_lock(&rep_state.lock);
     bool root_ok = false;
     map_key_t ck_key = NULL;
@@ -3684,22 +3688,21 @@ static bool handle_checkpoint_sign(const process_t *proc, directory_t *queues, g
 static void _current_checkpoint_locked(const char *chain_key,
                                       rep_checkpoint_t *out);
 
-/****************************
- * Deep resolution: one peer, on demand, at any depth (ISSUES.md 10.2)
+/****************************  *
+ * Deep resolution: one peer, on demand, at any depth
+ * (doc/architecture/gateway-reputation-tree.md)
  *
- * Mirrors Python repprocess handle_resolve / handle_resolved /
- * _forward_resolve / _accept_resolved and reputation.py's resolve helpers.
- * A node holds chains only for groups it belongs to, so a peer two levels
- * down is unscoreable locally. Rather than enumerate the subtree -- a cost
- * that grows with the TREE to answer about one PEER -- the query is relayed
- * toward the holder and the answer returns along the reverse path carrying
- * the quorum-signed window that backs it.
+ * Mirrors Python repprocess handle_resolve / handle_resolved / _forward_resolve /
+ * _accept_resolved and reputation.py's resolve helpers. A node holds chains only for
+ * groups it belongs to, so a peer two levels down is unscoreable locally. Rather than
+ * enumerate the subtree -- a cost that grows with the TREE to answer about one PEER --
+ * the query is relayed toward the holder and the answer returns along the reverse path
+ * carrying the quorum-signed window that backs it.
  *
- * The window travels whole, not as the peer's entries with inclusion proofs:
- * a proof shows an entry IS present and says nothing about entries withheld,
- * so a holder could answer with a peer's good transactions, omit the bad ones
- * and still verify. Recomputing the root from the entries closes that.
- ****************************/
+ * The window travels whole, not as the peer's entries with inclusion proofs: a proof
+ * shows an entry IS present and says nothing about entries withheld, so a holder could
+ * answer with a peer's good transactions, omit the bad ones and still verify.
+ * Recomputing the root from the entries closes that. ************************** */
 
 /* Hops a resolve may travel, and the ceiling we refuse above. Must match
  * Python RESOLVE_TTL_DEFAULT / RESOLVE_TTL_MAX -- a runtime that forwarded one
@@ -4549,7 +4552,7 @@ static bool handle_checkpoint_final(const process_t *proc, directory_t *queues, 
         json_decref(payload);
         return false;
     }
-    /* The chain this checkpoint covers, normalized through our own view (§10.2).
+    /* The chain this checkpoint covers, normalized through our own view (doc/architecture/gateway-reputation-tree.md).
      * Both the signed designation and the quorum size depend on it. */
     char final_chain[UUID_STRING_LEN + 1];
     _chain_key(proc, json_string_value(json_object_get(payload, "group_uuid")),
@@ -4580,7 +4583,7 @@ static bool handle_checkpoint_final(const process_t *proc, directory_t *queues, 
     }
     /* Stores the window bounds and the co-signatures alongside the root, and
      * persists the evidence: this is the instant at which the resident window
-     * and an agreed root describe each other (ISSUES §10.3). */
+     * and an agreed root describe each other (doc/architecture/reputation.md). */
     _store_checkpoint(proc, proposer_str, root, epoch, (int)first_index,
                       (int)count_covered, final_chain,
                       json_object_get(payload, "sigs"));
@@ -4591,7 +4594,7 @@ static bool handle_checkpoint_final(const process_t *proc, directory_t *queues, 
 }
 
 /****************************
- * Verifiable warm start (ISSUES.md §10.3)
+ * Verifiable warm start (doc/architecture/reputation.md)
  *
  * Mirrors Python repprocess._persist_history / _rebuild_from_evidence /
  * _attested_ceilings / _grade_restored_reputations / _maybe_checkpoint, and
@@ -4895,7 +4898,7 @@ static void _grade_restored_reputations(const process_t *proc, map_t *ceilings,
         map_set(&rep_state.reputations.scores, key,
                 floating_pt_dbl_data(ceiling));
         /* Remember what we clamped away from: it bounds any later lift from
-         * child-group evidence (§10.2). */
+         * child-group evidence (doc/architecture/gateway-reputation-tree.md). */
         map_set(&rep_state.restore_clamped, key, floating_pt_dbl_data(score));
         clamped++;
     }
@@ -5265,7 +5268,7 @@ static bool _evidence_names_chain(const char *path, const char *chain_key)
 }
 
 /* Restore a gateway's child-group chains once the group set has arrived, one
- * attempt per group (ISSUES.md §10.2).
+ * attempt per group (doc/architecture/gateway-reputation-tree.md).
  *
  * This runs late by necessity, which shapes what it may do to a live score: it
  * only ever LIFTS, and never above what was persisted. A peer attested solely
@@ -5535,7 +5538,7 @@ static void _maybe_checkpoint(const process_t *proc, double present,
 
     /* Every chain, each on its own: an idle primary chain is skipped while a
      * busy child group is checkpointed, and each round is confined to the group
-     * that can actually co-sign it (§10.2). Collect the due chains under the
+     * that can actually co-sign it (doc/architecture/gateway-reputation-tree.md). Collect the due chains under the
      * lock, originate after releasing it -- origination signs and sends. */
     char due_keys[DEFAULT_MAX_PEERS + 1][UUID_STRING_LEN + 1];
     int n_due = 0;
@@ -5679,7 +5682,7 @@ void reputation_reset_state(int num_peers)
     map_free(&rep_state.committed_paxos_rounds);
     map_init(&rep_state.committed_paxos_rounds);
 #ifdef AT_ZTA_ENABLED
-    /* §10.5. Must reset with the rest: the conformance harness resets rep_state
+    /* doc/architecture/zta-integration.md. Must reset with the rest: the conformance harness resets rep_state
      * between steps, so a ceiling left behind here would bound a peer in a
      * later scenario that never capped it -- and an unwind anchor left behind
      * would silently change how far a later failure reaches back. */
@@ -5699,7 +5702,7 @@ void reputation_reset_state(int num_peers)
     rep_state.task_weights_ring_head = 0;
     rep_state.task_weights_ring_len = 0;
     memset(rep_state.task_weights_ring, 0, sizeof(rep_state.task_weights_ring));
-    map_free(&rep_state.task_tiers);   /* lockstep with task_weights (§2.3) */
+    map_free(&rep_state.task_tiers);   /* lockstep with task_weights (doc/architecture/network-wire-format.md) */
     map_init(&rep_state.task_tiers);
     map_free(&rep_state.slashed);
     map_init(&rep_state.slashed);
@@ -6012,7 +6015,7 @@ void reputation_install_checkpoint(const char *root, int64_t epoch)
     {
         /* Seed the PRIMARY chain's slot, not just the flat mirror: slash
          * evidence is verified against the finalized slots (any chain's root
-         * may anchor it since §10.2), so a fixture that only wrote the mirror
+         * may anchor it since doc/architecture/gateway-reputation-tree.md), so a fixture that only wrote the mirror
          * would leave the evidence unverifiable. */
         rep_chain_ckpt_t *slot = _ckpt_slot_locked("");
         if (slot != NULL)
@@ -6092,7 +6095,7 @@ static void _handle_local_tx_score(const process_t *proc,
                  "Reputation: dropping local score — self identity unavailable\n");
         return;
     }
-    /* §11.2: a LOCAL submitter off the scale is a bug in that submitter, so it is
+    /* doc/architecture/reputation.md: a LOCAL submitter off the scale is a bug in that submitter, so it is
      * refused here too rather than forwarded into a Paxos round. The Python twin
      * raises ValueError at this point (TransactionScore's constructor); C has no
      * exception to raise into an app, so it logs and drops. */
@@ -6138,7 +6141,7 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
     /* Warm start, in the order the pieces depend on each other: load the
      * persisted operational snapshot, fade it by the gap we spent out of
      * contact, then adopt the persisted history if its checkpoint verifies and
-     * clamp every score the evidence does not bear out. See ISSUES.md §10.3 and
+     * clamp every score the evidence does not bear out. See doc/architecture/reputation.md and
      * doc/architecture/reputation.md. */
     _load_reputations(proc);
     _seed_idle_from_snapshot(proc, have_self ? self_str : NULL);
@@ -6178,7 +6181,7 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
 #ifdef AT_ZTA_ENABLED
         if (buf.type == ZTA_STANDING)
         {
-            /* Identity's finding about a peer's credential (§10.5). Handled
+            /* Identity's finding about a peer's credential (doc/architecture/zta-integration.md). Handled
              * here rather than via run_message_handlers for the same reason
              * TRANSACTION_SCORE is: that dispatcher routes net_msg payloads by
              * function name, and this is a local struct. */

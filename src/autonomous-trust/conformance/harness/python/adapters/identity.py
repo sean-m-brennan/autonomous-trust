@@ -85,14 +85,13 @@ _TRIGGER_SUBTREE_ROSTER = 'trigger_subtree_roster'
 # asserted. Mirrors the C adapter's trigger_hierarchy.
 _TRIGGER_HIERARCHY = 'trigger_hierarchy'
 
-# Pseudo-function: solicit membership in a cohort this participant is NOT in
-# (runtime cross-group join, ISSUES.md §10.2). The step's payload names the
-# target cohort (`group_uuid`), which the scenario pins via fixtures.groups so
-# it is the same string in both harnesses. Unlike the other pseudo-functions
-# this one DOES emit wire traffic -- the ordinary request_access, now carrying
-# the target in payload slot 3 -- because the whole point is that a join is the
-# ordinary admission and not a private side channel. The C adapter recognizes
-# the same string.
+# Pseudo-function: solicit membership in a cohort this participant is NOT in (runtime
+# cross-group join, doc/architecture/gateway-reputation-tree.md). The step's payload
+# names the target cohort (`group_uuid`), which the scenario pins via fixtures.groups so
+# it is the same string in both harnesses. Unlike the other pseudo-functions this one
+# DOES emit wire traffic -- the ordinary request_access, now carrying the target in
+# payload slot 3 -- because the whole point is that a join is the ordinary admission and
+# not a private side channel. The C adapter recognizes the same string.
 _TRIGGER_COHORT_JOIN = 'trigger_cohort_join'
 
 # Pseudo-function: drive one operator-attended pull (ethne D8/Q9) from the
@@ -300,7 +299,7 @@ class _Participant:
                     )
             elif key == 'group_key_epoch':
                 # How many times this participant's group key has been rotated.
-                # Admission rotates (§10.2), so a welcomer that admitted one
+                # Admission rotates (doc/architecture/gateway-reputation-tree.md), so a welcomer that admitted one
                 # peer sits at 1 -- that is what keeps cohort traffic recorded
                 # BEFORE a join closed to the joiner. C mirrors via
                 # group_t.key_epoch.
@@ -335,7 +334,7 @@ class _Participant:
                     )
             elif key == 'provisional_peer_count':
                 # Peers this participant is holding PROVISIONAL under two-phase
-                # admission (§3.1-a): confirm(s) received but the distinct-
+                # admission (doc/architecture/identity-protocol.md): confirm(s) received but the distinct-
                 # confirmer quorum not yet met, so the group key is withheld.
                 # Cleared on promotion. C mirrors via identity_provisional_count.
                 actual = len(getattr(self.process, '_provisional_confirmations', {}))
@@ -356,12 +355,12 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: subtree_roster={actual}, expected {want}')
             elif key == 'parent_gateway':
-                # The higher-rank node this participant DERIVES as its parent
-                # (protocol step 7, ISSUES.md §10.2), as a participant id or ''
-                # for a node that tops its own cohort. Derived, never accepted
-                # from a peer, so the pin is on the arithmetic: rank among
-                # members that can prove a shared anchor, ties by greater uuid.
-                # C mirrors via identity_get_parent_gateway.
+                # The higher-rank node this participant DERIVES as its parent (protocol
+                # step 7, doc/architecture/gateway-reputation-tree.md), as a participant
+                # id or '' for a node that tops its own cohort. Derived, never accepted
+                # from a peer, so the pin is on the arithmetic: rank among members that
+                # can prove a shared anchor, ties by greater uuid. C mirrors via
+                # identity_get_parent_gateway.
                 actual = self.parent_gateway_pid
                 if actual != (expected or ''):
                     raise AssertionError(
@@ -523,7 +522,7 @@ def _scenario_operator_binding(corpus_root: Path, ident: Identity,
     if variant == 'other-identity':
         # Correctly signed by the real operator, but naming a DIFFERENT node —
         # exactly what an attacker gets by harvesting a credential from a
-        # clear-text announce (ISSUES.md §1.5). Valid in every way except the
+        # clear-text announce (doc/architecture/zta-integration.md). Valid in every way except the
         # one that matters, which is why the pre-image names the node at all.
         bind_to = SimpleNamespace(
             uuid=UUID(bytes=bytes((b + 1) % 256 for b in _uuid_of(ident))),
@@ -541,7 +540,8 @@ def _scenario_operator_binding(corpus_root: Path, ident: Identity,
 
 def _scenario_zta_binding(corpus_root: Path, ident: Identity, cred: bytes,
                           variant: str) -> bytes:
-    """Mint a credential->identity binding for a scenario participant (ISSUES §1.5).
+    """Mint a credential->identity binding for a scenario participant
+    (doc/architecture/zta-integration.md).
 
     Signed AT SCENARIO TIME rather than pinned as a blob, for the same reason the
     operator binding is: pinning one recorded signature would let both
@@ -717,7 +717,7 @@ class IdentityAdapter:
                 with open(self.corpus_root / rel, 'rb') as fp:
                     identities[pid].zta_credential = fp.read()
 
-        # The credential->identity binding (ISSUES §1.5).
+        # The credential->identity binding (doc/architecture/zta-integration.md).
         # `zta_bindings: {<pid>: <variant>}` signs one at scenario time over the
         # credential attached just above — so this must run after that loop, not
         # beside it. The binding rides in the repeated `zta_credentials` field
@@ -892,14 +892,14 @@ class IdentityAdapter:
                 this_group = group
             participant = self._build_one(pid, role, identity, peers, this_group,
                                           zta_policy=zta_policy)
-            # Border-guard flag (ISSUES.md §3.1-c, Policy B). Optional
+            # Border-guard flag (doc/architecture/identity-protocol.md, Policy B). Optional
             # per-participant `border_guard: false` makes this peer abstain
             # from voting on received proposals; defaults true (set in
             # _build_one) so existing scenarios are unaffected. Mirrors the C
             # adapter's identity_set_border_guard_mode plumbing.
             if 'border_guard' in spec:
                 participant.process.border_guard_mode = bool(spec['border_guard'])
-            # Two-phase admission quorum (§3.1-a). fixtures.admission_quorum is
+            # Two-phase admission quorum. fixtures.admission_quorum is
             # {participant_id: int}; a member withholds the group key until that
             # many distinct border-guards confirm. Default 1 (no fixture) keeps
             # single-confirm admission. Mirrors the C adapter's
@@ -1463,7 +1463,7 @@ class IdentityAdapter:
                 if isinstance(payload, dict) else 'mock-addr:0'
             obj = from_addr
         elif function == IdentityProtocol.partition_probe:
-            # Cross-group probe: structured JSON payload (see §4.1).
+            # Cross-group probe: structured JSON payload (see).
             # For conformance the harness builds a self-consistent
             # payload signed by the sender; the receiver verifies and
             # emits a partition_response.

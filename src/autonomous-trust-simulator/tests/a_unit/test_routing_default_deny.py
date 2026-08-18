@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""ISSUES.md §6: Router._apply_reachability default-denies absent pairs.
+"""Router._apply_reachability default-denies absent pairs.
 
 The connectivity matrix is now sparse (reachable pairs only), so the router
 must block every ordered pair of active peers that is NOT present-and-reachable,

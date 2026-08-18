@@ -164,7 +164,7 @@ static int es6_from_ryu(buf_t *b, const char *ryu, size_t n_in)
      * string: d2s_buffered_n writes the digits and returns the length but does
      * NOT terminate (d2s_buffered is the variant that appends the NUL).  Calling
      * strtol here read past the written bytes into uninitialized stack, picking
-     * up whatever leftover digits happened to follow — which is ISSUES §2.1.2:
+     * up whatever leftover digits happened to follow — the garbage-exponent defect:
      * 12345.678 canonicalized as 1.2345678e+46 in ~3% of runs, mantissa always
      * right and only the exponent varying, because the real leading digit was
      * being concatenated with garbage.
@@ -298,7 +298,7 @@ static int emit_number(buf_t *b, double v)
      * NOTE: d2s_buffered_n returns a COUNTED buffer and does NOT terminate it
      * (d2s_buffered is the variant that appends the NUL). Everything downstream
      * must respect `n` — treating ryu_buf as a C string reads uninitialized
-     * stack, which is exactly what ISSUES §2.1.2 was. */
+     * stack, which is exactly what the garbage-exponent defect was. */
     char ryu_buf[32];
     int n = d2s_buffered_n(v, ryu_buf);
     if (n <= 0 || (size_t)n >= sizeof(ryu_buf)) return -1;

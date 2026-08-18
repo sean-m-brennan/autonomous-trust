@@ -62,13 +62,13 @@ recv socket, and the TCP listeners, where the option grants a bind over
 `TIME_WAIT` but never over a live `LISTEN`. The UDP **unicast** recv sockets
 (peer, group) omit it in both runtimes, because with the option on both sockets
 Linux permits a duplicate bind and delivers every datagram to the last binder,
-leaving the first node deaf with nothing logged (`ISSUES.md` 2.4.2).
+leaving the first node deaf with nothing logged.
 
 Python derives two further ports from the same base: `ping_at_rcv` = N+2 and
 `ping_at_snd` = N+3. C has no counterpart: it implements neither. Both PingAT
 sockets bind a specific address, the client derives one from the route to its
 target when the caller supplies none, so co-located nodes separated only by
-address do not receive each other's replies (`ISSUES.md` 2.4.3).
+address do not receive each other's replies, and never bind the wildcard.
 
 **PingAT is not ICMP.** It asks whether an *AT peer* is present and answering on
 the ports AT itself uses, via a cooperating responder (`PingATServer`); `ping(8)` asks
@@ -216,7 +216,21 @@ divides at the point of use. The mystery bound is wall-clock **age** on both
 sides: Python counted retries until 2026-08-10, which only approximated a
 duration and drifted with load, while C's retry is event-driven and could never
 have counted time at all. The `network/tunables-resolution` conformance case
-holds the two implementations to the same table (`ISSUES.md` 2.4.4).
+holds the two implementations to the same table.
+
+One further knob resolves the same way but is narrower than the three above, and
+the narrowness is the design:
+
+| Knob | Env var | Default | Values |
+|------|---------|---------|--------|
+| envelope encoding for a group this node **mints** | `AT_NET_WIRE_MODE` | `json` | `json` \| `proto` |
+
+It does **not** decide what goes on the wire for an existing group — that is
+carried by the group itself, so a cohort cannot end up half in one format and a
+joiner adopts its group's choice at admission. Setting it therefore only matters
+on whichever node forms a group. See
+[Network wire format](network-wire-format.md), pinned by
+`network/wire-mode-resolution`.
 
 ---
 

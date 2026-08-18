@@ -94,7 +94,7 @@ extern char REP_PROTO_CHECKPOINT_PROPOSE[];
 extern char REP_PROTO_CHECKPOINT_SIGN[];
 extern char REP_PROTO_CHECKPOINT_FINAL[];
 
-/* Deep resolution: one peer, on demand, at any depth (ISSUES.md 10.2).
+/* Deep resolution: one peer, on demand, at any depth (doc/architecture/gateway-reputation-tree.md).
  * A node holds chains only for its own groups, so a peer two levels down is
  * unscoreable locally; the query is relayed toward whoever holds its chain and
  * the answer comes back along the reverse path carrying the quorum-signed
@@ -153,7 +153,8 @@ double reputation_env_double(const char *name, double dflt);
 /* The scale every absolute measure in AT — and in the tiers above it — assumes.
  * Mirror of TX_SCORE_MIN / TX_SCORE_MAX in repprocess.py's reputation.py.
  *
- * ISSUES §11.2 (asked for by kith-covenant's erosion-legibility audit): the
+ * The [0, 1] score bound, enforced (doc/architecture/reputation.md; asked for by
+ * kith-covenant's erosion-legibility audit). The
  * bound was a convention rather than something checked, so an out-of-range score
  * was GRADED rather than rejected — folded into the weighted average, moving a
  * reputation by an unbounded amount. @ref tx_score_in_range rejects instead of
@@ -609,9 +610,9 @@ int reputation_consensus_by_tier(const tx_history_t *hist, const uuid_t peer_uui
  * Python's evidence_to_dict writes -- deliberately NOT the C config framework
  * (whose `typename` envelope Python cannot read) and deliberately NOT the
  * `task`/`p1`/`p1_set` key names of the tx catch-up wire form. Same reasoning
- * as the trust ladder (ISSUES §10.1). Mirrors
+ * as the trust ladder (doc/architecture/trust-tiers.md). Mirrors
  * src/autonomous-trust/.../reputation/reputation.py EVIDENCE_* and
- * ISSUES.md §10.3.
+ * See doc/architecture/reputation.md, warm start.
  *
  * The schema is pinned so a future shape change is a refusal to rebuild --
  * which degrades safely to clamped restoration -- rather than a misparse. */
@@ -637,7 +638,7 @@ typedef struct {
      *  a group-uuid is one of a gateway's child-group chains. A gateway keeps
      *  one history per child group, so without this a receiver could not tell
      *  which of its chains to compare the proposed root against. Mirrors
-     *  Python Checkpoint.group_uuid (ISSUES.md §10.2). */
+     *  Python Checkpoint.group_uuid (doc/architecture/gateway-reputation-tree.md). */
     char    group_uuid[UUID_STRING_LEN + 1];
     /** voter uuid-str -> string_data(detached hex signature over the
      *  checkpoint designation). Same voter-keyed shape as rep_state's
@@ -654,7 +655,7 @@ void rep_checkpoint_free(rep_checkpoint_t *ckpt);
 /** Canonical bytes a checkpoint co-signer signs, byte-identical to Python
  *  `Checkpoint.designation`:
  *    "AT-CKPT\0" proposer "|" root "|" epoch "|" first_index "|" count
- *    [ "|" group_uuid ]
+ *    ["|" group_uuid ]
  *  `nonce` is excluded on both sides (anti-replay only, carried alongside).
  *
  *  @p group_uuid is appended ONLY when non-empty (NULL/"" = the primary chain),

@@ -36,8 +36,9 @@ from ..identity import Group
 from ..system import (CfgIds, PortSource, comm_port, net_cadence, resolve_comm_port,
                       default_annoy_limit, default_mystery_max_age_s, default_recv_poll_ms,
                       resolve_annoy_limit, resolve_mystery_max_age_s, resolve_recv_poll_ms)
+from ..config import NetWireFormat
 from .network import Network
-from .message import Message
+from .message import Message, WireFormatMismatch
 from .ping_at import PingATServer, ping_at
 
 
@@ -103,7 +104,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     # C carries the same three knobs with the same names, bounds and defaults
     # (network.h, resolved in net_proc.c). Before 2026-08-10 these were Python
     # class attributes with no C counterpart, so a deployment could tune one
-    # runtime and not the other (ISSUES.md 2.4.4).
+    # runtime and not the other (doc/architecture/networking.md).
     annoy_limit = default_annoy_limit
     socket_timeout = default_recv_poll_ms / 1000.0
     # Wall-clock seconds, replacing the old mystery_max_retries count. The
@@ -160,11 +161,14 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self.statistics = {}
         self._rejected_addresses: set[str] = set()
         self._crypto_error_counts: dict[str, int] = {}
-        # Partition-recovery signal cooldown: per-source-address timestamp
-        # of the last signal we forwarded to IdentityProcess. Bounded at
-        # one signal per address per 5 seconds so a chatty rejected-group
-        # peer can't flood the identity queue.
-        #   See doc/architecture/partition-recovery.md §5.1.
+        # Per-address count of frames dropped for arriving in a wire format
+        # this context does not speak. Rate-limits the log the same way
+        # _crypto_error_counts does; the probe counter is unconditional.
+        self._foreign_format_counts: dict[str, int] = {}
+        # Partition-recovery signal cooldown: per-source-address timestamp of the last
+        # signal we forwarded to IdentityProcess. Bounded at one signal per address per
+        # 5 seconds so a chatty rejected-group peer can't flood the identity queue. See
+        # doc/architecture/partition-recovery.md §5.1.
         self._partition_signal_lru: dict[str, datetime] = {}
         # Lazily created in process(). ThreadPoolExecutor can't be
         # pickled, so creating it here would break the multiprocessing
@@ -222,6 +226,32 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             except Exception:
                 continue
         return None
+
+    @staticmethod
+    def _wire_format_for_group(grp):
+        """*grp*'s envelope format, or JSON when there is no group
+        (doc/architecture/network-wire-format.md). A node with no group yet is a
+        node that has not been admitted anywhere, and all of its traffic is
+        bootstrap traffic."""
+        return getattr(grp, 'wire_format', None) or NetWireFormat.json
+
+    def _wire_format_for_addr(self, addr):
+        """The envelope format traffic with *addr* rides in
+        (doc/architecture/network-wire-format.md).
+
+        The format belongs to the GROUP, so this is a group lookup: a peer we
+        can place in our primary group or in a child group we gateway speaks
+        that group's format. Anything we cannot place -- a stranger, a
+        pre-admission newcomer, a peer in a group we do not hold -- is JSON,
+        which is the format every AT node can read and therefore the only safe
+        answer when we have no group to consult. That is also why bootstrap is
+        JSON unconditionally: discovery happens before there is a group to ask.
+
+        Detecting the sender's actual format instead is deliberately not done;
+        see doc/architecture/network-wire-format.md.
+        """
+        grp = self._group_for_sender(addr)
+        return grp.wire_format if grp is not None else NetWireFormat.json
 
     def track_send_stats(self, uuid, num_bytes):
         if uuid not in self.statistics:
@@ -461,7 +491,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         try:
             # Pass this node's own address: the reply socket must bind it, not
             # the wildcard, or a co-located node separated only by address
-            # receives these replies instead (ISSUES.md 2.4.3). A wildcard
+            # receives these replies instead (doc/architecture/networking.md). A wildcard
             # my_address (the TCP listener's 0.0.0.0 fallback) is no address at
             # all -- hand ping_at None and let it derive one from the route.
             local = (getattr(self, 'my_address', None)
@@ -609,7 +639,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         C bounded the same queue by age from the start, because its retry is
         event-driven rather than polled and a count there would have measured
         peer admissions rather than time. Both sides now agree on the quantity
-        as well as the value (ISSUES.md 2.4.4).
+        as well as the value (doc/architecture/networking.md).
         :return: None
         """
         while not self.stop:
@@ -623,7 +653,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 peer = self.peers.find_by_address(from_addr)
                 if peer is not None:
                     decrypt_msg = self.myself.decrypt(raw_msg, peer)
-                    self._msg_to_queue(decrypt_msg, peer, queues, 'point-to-point')
+                    self._msg_to_queue(decrypt_msg, peer, queues, 'point-to-point',
+                                       wire_format=self._wire_format_for_addr(from_addr))
                     _probes.counter('net.mystery', 'resolved')
                     _probes.emit('net.mystery', 'resolved',
                                  from_addr=from_addr,
@@ -651,7 +682,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             self.encrypted_messages.extend(remaining)
             time.sleep(self.cadence + self.q_cadence)  # curiously, does not sleep if exactly cadence
 
-    def _accept_unencrypted(self, raw_msg, from_whom, queues):
+    def _accept_unencrypted(self, raw_msg, from_whom, queues,
+                            wire_format=NetWireFormat.json):
         """Deliver a plaintext frame from a KNOWN peer, but only an allowlisted
         verb that declares itself unencrypted.
 
@@ -666,7 +698,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         branch, and the alternative is duplicating the dispatch logic.
         """
         try:
-            probe = Message.parse(raw_msg, from_whom, validate=False)
+            probe = Message.parse(raw_msg, from_whom, validate=False,
+                                  wire_format=wire_format)
         except Exception:
             # Not a parseable envelope -- almost certainly real ciphertext.
             _probes.counter('net.ptp', 'unencrypted_refused', 'unparseable')
@@ -684,13 +717,30 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 'verb', verb, getattr(from_whom, 'nickname', from_whom))
             return False
         self._msg_to_queue(raw_msg, from_whom, queues, 'point-to-point',
-                           validate=False)
+                           validate=False, wire_format=wire_format)
         _probes.counter('net.ptp', 'unencrypted_accepted', str(verb))
         return True
 
-    def _msg_to_queue(self, msg, from_whom, queues, rcvd_by, validate=True):
+    def _msg_to_queue(self, msg, from_whom, queues, rcvd_by, validate=True,
+                      wire_format=NetWireFormat.json):
         try:
-            message = Message.parse(msg, from_whom, validate=validate)
+            message = Message.parse(msg, from_whom, validate=validate,
+                                    wire_format=wire_format)
+        except WireFormatMismatch as err:
+            # The frame is in a format this context does not speak (doc/architecture/network-wire-format.md). The
+            # parser for that format was never run over it, which is the point.
+            # Counted and logged rate-limited rather than silently dropped: a
+            # cohort misprovisioned into two formats presents as total silence
+            # from one peer, and this counter is the only thing that says why.
+            _probes.counter('net.wire', 'drop', 'foreign_format')
+            _addr = from_whom.address if isinstance(from_whom, Identity) else from_whom
+            _n = self._foreign_format_counts.get(str(_addr), 0) + 1
+            self._foreign_format_counts[str(_addr)] = _n
+            if _n == 1 or _n % 10 == 0:
+                self.logger.error(
+                    'Dropping %s frame from %s: %s (expected %s; count: %d)',
+                    rcvd_by, _addr, err, wire_format, _n)
+            return
         except TypeError as err:
             _probes.counter('net.parse', 'drop', 'type_error')
             self.logger.error('Error parsing %s: %s', msg, err)
@@ -821,6 +871,10 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                         target.address, message.obj,
                                         queues[message.return_to], target)
                             elif message.to_whom == Network.broadcast:
+                                # Broadcast is discovery: it goes to nodes we
+                                # cannot place in any group, so JSON
+                                # unconditionally (doc/architecture/network-wire-format.md). `bytes(message)` IS
+                                # the JSON form.
                                 msg = bytes(message)
                                 try:
                                     self.send_any(msg)
@@ -843,10 +897,19 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                         enc_grp = tgt
                                 except Exception:
                                     enc_grp = self.group
+                                # Format follows the ADDRESSED group, which
+                                # for a gateway is the child cohort, not our
+                                # own (doc/architecture/network-wire-format.md). Note this is a different question
+                                # from which key encrypts it (enc_grp above):
+                                # the key is about what we HOLD, the format
+                                # about what the recipients SPEAK.
+                                tgt_fmt = getattr(tgt, 'wire_format', None) or \
+                                    self._wire_format_for_group(self.group)
+                                wire = message.to_wire(tgt_fmt)
                                 if message.encrypt and enc_grp is not None:
-                                    msg = enc_grp.encrypt(bytes(message), enc_grp)
+                                    msg = enc_grp.encrypt(wire, enc_grp)
                                 else:
-                                    msg = bytes(message)
+                                    msg = wire
                                 for addr in message.to_whom.addresses:
                                     if addr == self.myself.address:
                                         continue
@@ -872,10 +935,16 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                     if self.reject_message(address):
                                         _probes.counter('net.ptp', 'skip', 'excluded_target')
                                         continue
+                                    # A peer we can place speaks its group's
+                                    # format; one we cannot place gets JSON,
+                                    # which is what makes pre-admission traffic
+                                    # work in a proto cohort (doc/architecture/network-wire-format.md).
+                                    wire = message.to_wire(
+                                        self._wire_format_for_addr(address))
                                     if message.encrypt:
-                                        msg = self.myself.encrypt(bytes(message), who)
+                                        msg = self.myself.encrypt(wire, who)
                                     else:
-                                        msg = bytes(message)
+                                        msg = wire
                                     try:
                                         self.send_peer(msg, address)
                                         self.track_send_stats(who.uuid, len(msg))
@@ -922,7 +991,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     if from_whom is not None:
                         try:
                             decrypt_msg = self.myself.decrypt(raw_msg, from_whom)
-                            self._msg_to_queue(decrypt_msg, from_whom, queues, 'point-to-point')
+                            self._msg_to_queue(decrypt_msg, from_whom, queues, 'point-to-point',
+                                               wire_format=self._wire_format_for_addr(from_addr))
                         except Exception:
                             # Decrypt failed. Some protocol verbs are sent in
                             # PLAINTEXT by design (encrypt=False), and once a
@@ -932,8 +1002,9 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                             # plaintext parse only for an allowlisted verb; a
                             # known peer must not be able to downgrade anything
                             # else. See identity.protocol.UNENCRYPTED_VERBS.
-                            if not self._accept_unencrypted(raw_msg, from_whom,
-                                                            queues):
+                            if not self._accept_unencrypted(
+                                    raw_msg, from_whom, queues,
+                                    wire_format=self._wire_format_for_addr(from_addr)):
                                 _probes.counter('net.ptp', 'drop', 'decrypt_failed_known_peer')
                                 self.logger.error('Decryption failed for known peer %s, rejecting message', from_whom.nickname)
                     else:
@@ -947,10 +1018,11 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                         # CHURN DIAGNOSTIC: attribution misses on ~every
                         # inbound (deferred_encrypted == accepted). Is it a
                         # format mismatch (from_addr shape != listing keys)
-                        # or a timing race (address registered a beat later)?
-                        # Categorize cheaply always, and capture a bounded
-                        # sample of from_addr vs listing keys to compare shapes.
-                        # See ISSUES.md (connection churn / attribution miss).
+                        # or a timing race (address registered a beat later)? Categorize
+                        # cheaply always, and capture a bounded sample of from_addr vs
+                        # listing keys to compare shapes. See
+                        # doc/architecture/network-connection-pooling.md (the
+                        # attribution-miss item).
                         _listing = getattr(self.peers, 'listing', None) or {}
                         _probes.counter('net.ptp', 'attrib_miss',
                                         'listing_empty' if not _listing
@@ -967,6 +1039,9 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                          listing_size=len(_listing),
                                          listing_keys=_keys)
                         try:
+                            # JSON, not a lookup: we could not place this sender
+                            # in any group, and a frame from an unplaced sender
+                            # is bootstrap traffic by definition (doc/architecture/network-wire-format.md).
                             self._msg_to_queue(raw_msg, from_addr, queues, 'point-to-point', validate=False)
                             _probes.counter('net.ptp', 'unknown_sender', 'parsed_unencrypted')
                         except UnicodeDecodeError:
@@ -996,19 +1071,22 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     if self.reject_message(from_addr):
                         _probes.counter('net.group', 'drop', 'excluded')
                         continue
-                    # Resolve which group this sender belongs to. For a
-                    # leaf node this is always the primary group (or
-                    # None), so the path is identical to before. A
-                    # gateway additionally matches its child groups,
-                    # decrypting a cohort-below frame with that cohort's
-                    # own key. See doc/architecture/gateway-reputation-tree.md.
+                    # Resolve which group this sender belongs to. For a leaf node this
+                    # is always the primary group (or None), so the path is identical to
+                    # before. A gateway additionally matches its child groups,
+                    # decrypting a cohort-below frame with that cohort's own key. See
+                    # doc/architecture/gateway-reputation-tree.md.
                     sender_group = self._group_for_sender(from_addr)
                     if sender_group is not None:
                         from_whom = self.peers.find_by_address(from_addr)
                         try:
                             decrypt_msg = sender_group.decrypt(raw_msg, sender_group)
                             if from_whom is not None:
-                                self._msg_to_queue(decrypt_msg, from_whom, queues, 'group')
+                                # The group that decrypted it names the format
+                                # it is encoded in (doc/architecture/network-wire-format.md) -- for a gateway that
+                                # is the child cohort's format, not its own.
+                                self._msg_to_queue(decrypt_msg, from_whom, queues, 'group',
+                                                   wire_format=sender_group.wire_format)
                             else:
                                 _probes.counter('net.group', 'drop', 'sender_not_in_peers')
                                 self.logger.warning(
@@ -1049,6 +1127,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     if self.reject_message(from_addr):
                         _probes.counter('net.multicast', 'drop', 'excluded')
                         continue
+                    # The stranger/multicast channel is discovery, so JSON
+                    # unconditionally (doc/architecture/network-wire-format.md) -- there is no group to consult.
                     self._msg_to_queue(raw_msg, from_addr, queues, 'multicast', validate=False)
                 total_inbound += drained_unk
 

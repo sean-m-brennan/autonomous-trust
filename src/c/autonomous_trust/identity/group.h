@@ -23,6 +23,7 @@
 
 #include "identity.h"
 #include "structures/map.h"
+#include "network/net_wire_format.h"
 
 /* Retired-key grace window and depth. Must match Python
  * Group.PREVIOUS_KEY_GRACE / PREVIOUS_KEY_MAX: a runtime that kept a retired
@@ -38,13 +39,13 @@ typedef struct
     char address[ADDR_LEN+1];
     map_t address_map;  /* UUID string -> address string (mirrors Python _address_map) */
     encryptor_t encryptor;
-    /* Group age (ISSUES.md §3.1-b): comparable creation epoch (seconds), or 0
-     * if unknown. Merge size-tie tiebreaker — the OLDER group wins. Mirrors
-     * Python Group._created. Carried on the wire by group_to_json. */
+    /* Group age (doc/architecture/identity-protocol.md): comparable creation epoch
+     * (seconds), or 0 if unknown. Merge size-tie tiebreaker — the OLDER group wins.
+     * Mirrors Python Group._created. Carried on the wire by group_to_json. */
     double created;
-    /* How many times this group's shared key has been rotated (ISSUES.md
-     * 10.2). Mirrors Python Group.key_epoch and rides group_to_json as
-     * "key_epoch". The key used to be permanent, so admitting a member also
+    /* How many times this group's shared key has been rotated
+     * (doc/architecture/gateway-reputation-tree.md). Mirrors Python
+     * Group.key_epoch and rides group_to_json as "key_epoch". The key used to be permanent, so admitting a member also
      * handed it the ability to decrypt cohort traffic recorded BEFORE it
      * joined; admission now rotates, and this is what makes a rotation safe to
      * accept — a receiver adopts a new key only with a strictly HIGHER epoch,
@@ -59,6 +60,22 @@ typedef struct
     encryptor_t previous_keys[GROUP_PREVIOUS_KEY_MAX];
     double      previous_retired_at[GROUP_PREVIOUS_KEY_MAX];
     size_t      num_previous_keys;
+    /* Which envelope encoding this group's members speak (doc/architecture/network-wire-format.md).
+     * Mirrors Python Group.wire_format, rides group_to_json as "wire_format"
+     * ("json"/"proto") and identity.proto Group.wire_format.
+     *
+     * The GROUP carries it rather than the node because a cohort whose members
+     * disagree cannot talk, and nothing reconciles a disagreement after the
+     * fact -- format detection is deliberately unimplemented
+     * (doc/architecture/network-wire-format.md). A joiner
+     * therefore ADOPTS this at admission; AT_NET_WIRE_MODE only stamps a group
+     * its node mints. NET_WIRE_JSON == 0, so group_init's zeroed struct, an
+     * absent proto field and a group config predating this all mean JSON.
+     *
+     * Placed LAST on purpose: every other field keeps its offset, so a stale
+     * consumer built against the older header misreads only this one rather
+     * than everything after it. */
+    net_wire_format_t wire_format;
 } group_t;
 
 /**
@@ -162,8 +179,8 @@ int group_encrypt(const group_t *ident, const msg_str_t *in, const group_t *whom
 int group_decrypt(const group_t *ident, const msg_str_t *cipher, const group_t *whom, const unsigned char *nonce, unsigned char *out);
 
 /** Mint a fresh shared key, retiring the current one into the grace window
- *  (ISSUES.md 10.2). Returns the new epoch, or -1 if we do not hold the
- *  current private key. Mirrors Python Group.rotate_key. */
+ * (doc/architecture/gateway-reputation-tree.md). Returns the new epoch, or -1 if we do
+ * not hold the current private key. Mirrors Python Group.rotate_key. */
 int64_t group_rotate_key(group_t *group);
 
 /** Adopt @p other's key if it supersedes ours: same group, strictly higher

@@ -139,10 +139,10 @@ def test_derived_ports_follow_an_override_on_reimport():
 
 
 def test_two_bases_do_not_overlap_on_one_address():
-    # The co-location property the resolver exists to provide, asserted on real
-    # sockets. No SO_REUSEADDR: with it set on both sockets this kernel permits
-    # a duplicate bind silently (see ISSUES.md), so a plain socket is the only
-    # honest occupancy probe.
+    # The co-location property the resolver exists to provide, asserted on real sockets.
+    # No SO_REUSEADDR: with it set on both sockets this kernel permits a duplicate bind
+    # silently (doc/architecture/networking.md), so a plain socket is the only honest
+    # occupancy probe.
     base_a, base_b = 31300, 31400
     socks = []
     try:

@@ -80,7 +80,7 @@ void messaging_set_max_size(size_t size)
   disjoint behaviors;
 */
 /* The socket path is built here and nowhere else. Two constructors of it is how
- * ISSUES.md §2.1.1 happened: `get_data_dir` was told this buffer held 255 bytes
+ * the startup overflow happened: `get_data_dir` was told this buffer held 255 bytes
  * when it holds 108, so a long AUTONOMOUS_TRUST_ROOT wrote past the end of the
  * caller's stack frame. Both bounds are now this function's own, and a root that
  * does not fit is REFUSED — a truncated socket path is a different socket, which

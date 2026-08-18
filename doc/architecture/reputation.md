@@ -435,7 +435,7 @@ side.
 Unit coverage for the attestation rules lives in
 `tests/a_unit/test_repprocess_quorum_attestation.py` on the Python side and
 `src/c/test/rep_quorum_test.c` on the C side. The child-chain checkpoint work is
-tracked in [`ISSUES.md`](../../ISSUES.md) section 10.2, and the closure of the
+described in [Gateway reputation tree](gateway-reputation-tree.md), and the closure of the
 original last-identifier divergence in `BUGS.md` section P6.
 
 ## Further reading

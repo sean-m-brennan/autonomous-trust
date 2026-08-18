@@ -49,11 +49,11 @@ typedef enum {
     PEER_RTT_UPDATE,         /**< Net-proc → sibling processes: peer RTT telemetry. Local IPC only — not part of identity.proto / public_identity_t network serialization. */
     PEER_OBSERVED,           /**< Identity → app: one observed peer (@ref peer_observed_msg_t). Local IPC only. */
     PEER_REPUTATION,         /**< Reputation → app: one peer's earned score (@ref peer_reputation_msg_t). Local IPC only. */
-    CHILD_GROUP,             /**< Identity → sibling processes: one cohort this node GATEWAYS, beyond its primary group. Local IPC only. Carries a @ref group_t like @ref GROUP, but must never land in `protocol.group` — the reputation process keeps a separate chain per child group, and clobbering the primary slot would merge a subtree into it. Mirrors Python's ChildGroupSet (see gateway-reputation-tree.md, ISSUES.md §10.2). */
+    CHILD_GROUP,             /**< Identity → sibling processes: one cohort this node GATEWAYS, beyond its primary group. Local IPC only. Carries a @ref group_t like @ref GROUP, but must never land in `protocol.group` — the reputation process keeps a separate chain per child group, and clobbering the primary slot would merge a subtree into it. Mirrors Python's ChildGroupSet (see gateway-reputation-tree.md, doc/architecture/gateway-reputation-tree.md). */
 #ifdef AT_ZTA_ENABLED
     ZTA_REVOCATION_ALERT,    /**< Peer credential revocation notice. */
     ZTA_VERIFICATION_RESULT, /**< Outcome of a deferred ZTA verification. */
-    ZTA_STANDING             /**< Identity → reputation: what ZTA proved about a peer (@ref zta_standing_msg_t). Local IPC only. Mirrors Python's ZtaStanding (ISSUES.md §10.5). */
+    ZTA_STANDING             /**< Identity → reputation: what ZTA proved about a peer (@ref zta_standing_msg_t). Local IPC only. Mirrors Python's ZtaStanding (doc/architecture/zta-integration.md). */
 #endif
 } message_type_t;
 
@@ -259,7 +259,7 @@ typedef struct {
  * Mirrors Python's `STANDING_*` in `identity/zta_standing.py`; the three
  * values are the distinctions the reputation process can act on, deliberately
  * NOT the six-valued @ref zta_status_t (the verifier's own status rides along
- * in `reason` for the operator log). ISSUES.md §10.5.
+ * in `reason` for the operator log). doc/architecture/zta-integration.md.
  */
 typedef enum {
     ZTA_STANDING_PROVED = 0, /**< Verified against a configured anchor AND bound to this identity. No ceiling; anchors the unwind. */
@@ -277,7 +277,7 @@ typedef enum {
  *
  * Why a ceiling and not a score: a ZTA verdict is an authority finding about
  * whether an identity is who it claims, not the outcome of an interaction with
- * it, and AT's [0, 1] scale (§11.2) has no representation for a penalty. The
+ * it, and AT's [0, 1] scale (doc/architecture/reputation.md) has no representation for a penalty. The
  * predecessor of this message tried to send one as `score = -0.8` on a
  * TRANSACTION_SCORE and was discarded at the boundary twice over — once for
  * the zero task_uuid sentinel, once for being off-scale — so a revoked

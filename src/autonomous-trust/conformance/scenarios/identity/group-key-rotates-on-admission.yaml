@@ -4,8 +4,8 @@ protocol: identity
 name: group-key-rotates-on-admission
 byte_pinning: false
 description: |
-    The shared group key ROTATES when a cohort admits a member (ISSUES.md
-    §10.2, user's call 2026-08-13).
+    The shared group key ROTATES when a cohort admits a member
+    (doc/architecture/gateway-reputation-tree.md; user's call 2026-08-13).
 
     Why this is pinned rather than left to each runtime: the group key used to
     be permanent. `group_key_update` carried membership changes only, and

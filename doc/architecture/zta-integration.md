@@ -548,20 +548,21 @@ The demo creates:
  `ddil_fallback_reputation_cap` was logged as enforced while being
  read by nothing. A ZTA verdict now reaches reputation as an authority
  finding, a `ZtaStanding` carrying `proved` / `capped` / `failed`,
- rather than as a score the scale cannot express. See
- [`ISSUES.md`](../../ISSUES.md) §10.5.
+ rather than as a score the scale cannot express. The unwind reaches back to
+ the last *proved* verification, bounded by the evidence arithmetic in
+ [Reputation](reputation.md).
 2. **Multi-operator ZTA, answered 2026-08-06, both runtimes.** In coalition/multi-agency scenarios (LunaNet, joint ops), peers may have certs from different CAs. The ZTA policy now names trust anchors explicitly and an identity carries a repeated `ZtaCredential{der, binding, issuer}` (proto field 16), so admission is *any-of* across configured anchors and each verified credential earns authority for its own anchor (`zta_anchors`, the observer's finding, never serialized). Group federation then requires a *proved* shared anchor rather than a declared gateway role, gatewayhood is emergent in AT, so a declared rule would rest on a claim by the peer itself and an attacker would simply decline to claim.
 
  What the question above got wrong is the assumption that this needs cross-certification or CA trust negotiation. It needs neither. Nothing has to make two CAs recognize each other, only make *this node* recognize both, and a holder-asserted binding (§1.5) lets a foreign CA's credential bind to an AT identity without that CA knowing AT exists. Coalition deployment is in fact what forces the holder-asserted route, a foreign CA will not put an AT uuid in a SAN, so the CA-asserted route is unavailable exactly where coalitions need it.
 
-Both items are closed in both runtimes: item 1 in §10.5 (2026-08-17), item 2 in
-§1.5 (2026-08-06).
+Both items are closed in both runtimes: item 1 on 2026-08-17, item 2 on
+2026-08-06.
 
 The integration is not C-only. The Python identity process (`idprocess.py`)
 performs ZTA checks at admission time (`_zta_admit`, gated in
 `welcoming_committee`), with verification, capping, and carriage at parity with
 C: X.509 verification, DDIL reputation capping, and wire-level credential
-carriage. **Background re-verification is at parity as of 2026-08-17** (§10.5):
+carriage. **Background re-verification is at parity as of 2026-08-17:**
 Python sweeps admitted peers on `reverify_interval_sec` inside IdentityProcess
 rather than in a process of its own, detecting post-admission revocation and
 lifting a DDIL cap once the infrastructure returns. See [ZTA Python
@@ -570,7 +571,7 @@ C-only (the audit log and delegated verification).
 
 **As of 2026-08-06 the credential→identity *binding* gate, named trust anchors,
 multi-credential admission, and derived gateway authority exist in BOTH
-runtimes** (ISSUES §1.5), pinned by 168/168 conformance cases with 0 asymmetric.
+runtimes**, pinned by 168/168 conformance cases with 0 asymmetric.
 `binding_mode: require` is therefore a fleet-wide guarantee rather than a
 per-runtime one: a C `welcoming_committee` and a Python one refuse the same
 credentials. The C side is a mirror, not a reimplementation,

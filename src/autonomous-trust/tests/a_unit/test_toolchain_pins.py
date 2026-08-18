@@ -15,7 +15,7 @@
 # ******************
 """The conda toolchain pin is stated in seven places; this fails when they drift.
 
-ISSUES §9.1: a working docker build broke because every conda input floated --
+A working docker build broke because every conda input floated --
 an untagged `FROM condaforge/miniforge3`, an unbounded base-env install that
 dragged conda forward with it, a `releases/latest/download` installer, and
 `miniforge-version: latest` in CI. The fix records one pin in
@@ -101,7 +101,7 @@ class TestDockerfiles:
         text = _read(rel)
         assert not re.search(r'^FROM\s+condaforge/miniforge3\s*$', text,
                              re.MULTILINE), \
-            '%s builds FROM an untagged conda base (ISSUES §9.1)' % rel
+            '%s builds FROM an untagged conda base (want config/cfg/toolchain-pins.env)' % rel
 
     @pytest.mark.parametrize('rel', _DOCKERFILES)
     def test_arg_default_matches_the_pins_file(self, rel):

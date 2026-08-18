@@ -150,7 +150,7 @@ def test_bootstrap_ladder_overrides_tier_weight(tmp_path):
     assert caps['dod.sensor-report'].function is None
 
 
-# --- ISSUES §10.1: one ladder file, both runtimes -------------------------
+# --- One ladder file, both runtimes (doc/architecture/trust-tiers.md) -----
 #
 # The C twin (`src/c/autonomous_trust/config/trust_ladder.c`) parses the ladder
 # with jansson, and the format is JSON precisely so this side needs no change:

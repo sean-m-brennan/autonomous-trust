@@ -109,7 +109,7 @@ DEFINE_TEST(test_jcs_parity)
 }
 END_TEST_DEFINITION()
 
-/* ISSUES §2.1.2 regression.
+/* Garbage-exponent regression: an unterminated Ryu buffer read by `strtol`.
  *
  * `d2s_buffered_n` returns a COUNTED buffer and does not terminate it, so the
  * exponent parse must respect the length. It used to call `strtol`, which ran

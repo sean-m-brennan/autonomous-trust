@@ -8,6 +8,7 @@ Technical architecture documentation for the AutonomousTrust cooperative computi
 - [Process Architecture](process-architecture.md)) Multiprocessing orchestration and IPC
 - [Networking](networking.md) (Network layer, channels, and message routing
 - [TCP Connection Pooling](network-connection-pooling.md)) Optional persistent connections, reuse, and persistent readers
+- [Network Wire Format](network-wire-format.md) (The JSON and protobuf envelopes, the group-carried format choice, and why detection stays unbuilt
 - [Native/FFI Dual Implementation](native-ffi-dual-implementation.md) (C runtime, CFFI bridge, Python↔C interoperability, and embedded/microdrone nodes
 - [Identity Protocol](identity-protocol.md)) Peer discovery, voting, and group formation
 - [Task Negotiation](negotiation.md) (Distributed task lifecycle

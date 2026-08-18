@@ -130,7 +130,7 @@ periodic re-verification is a documented follow-up, since there is no Python ZTA
 
 > **Naming collision, worth reading before §3.** "Identity binding" in this section
 > means *wire carriage*, the credential riding the announce/propose/confirm payloads.
-> It is **not** the credential→identity **binding gate** added 2026-08-06 (ISSUES §1.5,
+> It is **not** the credential→identity **binding gate** added 2026-08-06 (see §8 below,
 > `identity/zta_binding.py` / `zta/zta_binding.c`), which proves the announcing node is
 > entitled to present the credential. See §8.
 
@@ -172,7 +172,7 @@ are unaffected.
 This brings Python to parity for the **admission decision** (verify at join,
 DDIL fallback, reputation cap) and wire binding.
 
-**Periodic re-verification reached parity 2026-08-17** (ISSUES §10.5).
+**Periodic re-verification reached parity 2026-08-17.**
 `IdentityProcess._periodic_zta_reverify` sweeps admitted peers on the
 policy's own `reverify_interval_sec`, so a Python node detects a credential
 revoked *after* admission and lifts a DDIL cap once the infrastructure
@@ -202,7 +202,7 @@ built with `-DAT_ZTA=ON` for these to run on the C side.
 ## 8. The credential→identity binding (2026-08-06), both runtimes
 
 Everything above describes Python catching up to C. This section is work that
-landed in **both**, on the same day, and it is the substance of ISSUES §1.5.
+landed in **both**, on the same day.
 The gate is graded, anchored, and symmetric. `binding_mode: require` IS a
 fleet-wide guarantee, since a C `welcoming_committee` and a Python one make the
 same admission decision, pinned by 168/168 conformance cases with 0 asymmetric.

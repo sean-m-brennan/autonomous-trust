@@ -100,6 +100,45 @@ class WireFormat(Enum):
     JSON = 2
 
 
+class NetWireFormat(object, metaclass=ClassEnumMeta):
+    """Which envelope encoding an inter-host network message rides in
+    (doc/architecture/network-wire-format.md). Mirrors C's ``net_wire_format_t``.
+
+    Distinct from :class:`WireFormat` above, which selects how a
+    *Configuration* serializes itself (on disk, and as a message *payload*).
+    This selects how the *envelope around* that payload is encoded, and the two
+    are independent: a proto-mode cohort still carries whatever payload form
+    ``AT_SERIALIZE_MODE`` asks for.
+
+    A node does not choose this per message or per peer -- it is a property of
+    the GROUP (``Group.wire_format``), and everything outside a group
+    (discovery, pre-admission) is :attr:`json` unconditionally. Detecting a
+    peer's format is deliberately not implemented; see
+    doc/architecture/network-wire-format.md.
+
+    Values are the strings that ride the canonical group wire form, so C's
+    ``group_to_json`` and this agree without a mapping table.
+
+    Lives here rather than in the network package because ``identity/group.py``
+    carries the value and must reach it without importing ``core.network``
+    (which imports identity -- a cycle). ``config`` is already below both.
+    """
+    json = 'json'
+    proto = 'proto'
+
+
+#: The one-byte format marker that prefixes every packed protobuf envelope
+#: (``network/net_message.proto``). A JSON envelope always begins ``{``
+#: (0x7B), so a receiver can refuse a frame in a format it does not speak
+#: WITHOUT running the other parser over peer-supplied bytes -- which is the
+#: point, given that format detection is a deliberate non-goal
+#: (doc/architecture/network-wire-format.md). It also
+#: serves as the envelope version slot: an incompatible future proto envelope
+#: takes 0xAC and is distinguishable rather than guessed. Must match C's
+#: ``NET_WIRE_PROTO_MAGIC`` (network/net_message.h).
+NET_WIRE_PROTO_MAGIC = 0xAB
+
+
 class Configuration(object):
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)

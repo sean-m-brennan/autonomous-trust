@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""ZTA hardening: the DDIL cap is real, and a failure unwinds (ISSUES.md §10.5).
+"""ZTA hardening: the DDIL cap is real, and a failure unwinds (doc/architecture/zta-integration.md).
 
 Two claims, both of which were previously false in a way nothing detected.
 
@@ -28,7 +28,7 @@ accrued reputation with no ceiling at all.
 **The failure.** The C twin's ``_send_reputation_penalty`` was blocked twice
 over: it stamped ``task_uuid = 0``, which the reputation process discards by
 design as the "system score" sentinel, and it sent ``score = -penalty``, which
-``tx_score_in_range`` has rejected since §11.2 put the scale at [0, 1] with no
+``tx_score_in_range`` has rejected since doc/architecture/reputation.md put the scale at [0, 1] with no
 negatives. A revocation therefore produced a log line and nothing else.
 
 So the tests here assert the *effect* on the score, never that a message was
@@ -221,7 +221,7 @@ class TestUnwind:
         assert anchor == 2
 
     def test_only_pre_anchor_evidence_supports_the_unwound_score(self):
-        """The §10.5 answer to 'how far back': back to the last proved
+        """The doc/architecture/zta-integration.md answer to 'how far back': back to the last proved
         verification. Standing earned while nobody could confirm the peer is
         what the failure calls into question; standing earned before it is
         not."""
