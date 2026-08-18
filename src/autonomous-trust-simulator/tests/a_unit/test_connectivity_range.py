@@ -13,7 +13,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""ISSUES.md §6: finite comms-range cutoff + sparse reachability matrix +
+"""Finite comms-range cutoff + sparse reachability matrix +
 spatial-grid candidate pruning in Simulator.compute_step.
 
 Exercises the connectivity helpers directly (no path/movement plumbing) with a

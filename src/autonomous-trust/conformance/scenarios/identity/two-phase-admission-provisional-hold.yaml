@@ -4,7 +4,7 @@ protocol: identity
 name: two-phase-admission-provisional-hold
 byte_pinning: false
 description: |
-    Two-phase (provisional→confirmed) admission — ISSUES.md §3.1-a. A member
+    Two-phase (provisional→confirmed) admission — doc/architecture/identity-protocol.md. A member
     withholds the group key from a newly-confirmed peer until a QUORUM of
     distinct border-guards have independently confirmed the admission.
 

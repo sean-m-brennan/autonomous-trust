@@ -271,7 +271,7 @@ class TestPersistentReader:
 
 
 # ---------------------------------------------------------------------------
-# Send-side pool: the peer closed between sends (ISSUES §3.6)
+# Send-side pool: the peer closed between sends (doc/architecture/network-connection-pooling.md)
 # ---------------------------------------------------------------------------
 
 class TestPeerClosedDetection:

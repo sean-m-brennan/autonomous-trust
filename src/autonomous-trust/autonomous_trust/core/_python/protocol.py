@@ -39,7 +39,7 @@ class Protocol(object, metaclass=ClassEnumMeta):
         # primary/parent group slot is never clobbered.
         self.child_groups = {}
         # peer-uuid-str -> ZtaStanding, propagated from IdentityProcess
-        # (ISSUES §10.5). This node's OWN findings about its peers, never
+        # (doc/architecture/zta-integration.md). This node's OWN findings about its peers, never
         # anything a peer asserted about itself; reputation reads it to bound
         # a peer whose credential ZTA has not actually proved.
         self.zta_standing = {}
@@ -68,7 +68,7 @@ class Protocol(object, metaclass=ClassEnumMeta):
         if isinstance(message, ZtaStanding):
             # Last writer wins, deliberately: IdentityProcess is the single
             # source of ZTA findings and sends these in the order it learns
-            # them, so the newest verdict is the current one (§10.5).
+            # them, so the newest verdict is the current one (doc/architecture/zta-integration.md).
             self.zta_standing[message.peer_uuid] = message
             return True
         if isinstance(message, Peers):

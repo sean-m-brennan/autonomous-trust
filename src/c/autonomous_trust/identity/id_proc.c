@@ -33,6 +33,7 @@
 #include "utilities/timeout.h"
 #include "structures/data.h"
 #include "network/net_message.h"
+#include "network/network.h"  /* net_wire_mode_resolve (2.3) */
 #include "config/configuration.h"
 #include "peers.h"
 #include "history.h"
@@ -45,7 +46,8 @@
 #include "zta/zta_verifier.h"
 #include "zta/zta_audit.h"
 #include "zta/x509_verifier.h"   /* x509_verify_data_signature, for the binding */
-#include "zta/zta_binding.h"     /* the credential->identity binding (ISSUES §1.5) */
+#include "zta/zta_binding.h"     /* the credential->identity binding
+# (doc/architecture/zta-integration.md) */
 #endif
 
 /* Operator-attended signal helpers (ethne D8/Q9); defined below _build_announcement
@@ -64,7 +66,7 @@ static void _verify_operator_key(const process_t *proc,
                                  const uint8_t *cred, size_t cred_len,
                                  const uint8_t claimed_key[crypto_sign_PUBLICKEYBYTES]);
 typedef enum { ZTA_GATE_ADMIT, ZTA_GATE_ADMIT_CAPPED, ZTA_GATE_REJECT } zta_gate_t;
-/* Hand the gate's verdict to the reputation process (ISSUES.md §10.5).
+/* Hand the gate's verdict to the reputation process (doc/architecture/zta-integration.md).
  * Mirrors Python IdentityProcess._publish_zta_decision. */
 static void _publish_zta_standing(const process_t *proc,
                                   const zta_policy_t *policy,
@@ -145,16 +147,16 @@ static char ID_ROSTER_RESPONSE[] = "subtree_roster_response";
  * rules are identical. See doc/architecture/operator-attended.md. */
 static char ID_ATTEST_QUERY[]    = "operator_attest_query";
 static char ID_ATTEST_RESPONSE[] = "operator_attest_response";
-/* Runtime hierarchy roots (protocol step 7, ISSUES.md §10.2). A node states its
- * own position in the gateway tree — which cohorts it gateways, and which
- * higher-rank node it federates through — so the mesh AGREES on the topology
- * instead of each node inferring it privately. Advertised on the encrypted group
- * channel when our own view changes, and on request so a late joiner converges
- * without waiting for somebody's next change.
+/* Runtime hierarchy roots (protocol step 7,
+ * doc/architecture/gateway-reputation-tree.md). A node states its own position in the
+ * gateway tree — which cohorts it gateways, and which higher-rank node it federates
+ * through — so the mesh AGREES on the topology instead of each node inferring it
+ * privately. Advertised on the encrypted group channel when our own view changes, and
+ * on request so a late joiner converges without waiting for somebody's next change.
  *
- * Carries NO group key and confers no membership: an advertisement is a claim
- * about ITSELF, recorded only from a peer that can prove a shared trust anchor.
- * Our OWN parent is derived, never accepted from a peer. Mirrors Python
+ * Carries NO group key and confers no membership: an advertisement is a claim about
+ * ITSELF, recorded only from a peer that can prove a shared trust anchor. Our OWN
+ * parent is derived, never accepted from a peer. Mirrors Python
  * IdentityProtocol.hierarchy / hierarchy_req. */
 static char ID_HIERARCHY[]       = "hierarchy_root";
 static char ID_HIERARCHY_QUERY[] = "hierarchy_query";
@@ -297,13 +299,13 @@ static struct {
      *                                independently in the handlers. */
     map_t partition_probe_cooldown;
     map_t partition_response_cooldown;
-    /* Two-phase admission (ISSUES.md §3.1-a). Key "<proc>|<peer_uuid>",
+    /* Two-phase admission (doc/architecture/identity-protocol.md). Key "<proc>|<peer_uuid>",
      * value array_t* of DISTINCT confirmer uuid strings. A peer stays
      * PROVISIONAL (group key withheld in _add_peer) until the entry reaches
      * proc->protocol.admission_quorum, then handle_confirm_peer promotes it
      * and clears the entry. Mirrors Python's _provisional_confirmations. */
     map_t provisional_confirmations;
-    /* Runtime hierarchy roots (protocol step 7, ISSUES.md §10.2).
+    /* Runtime hierarchy roots (protocol step 7, doc/architecture/gateway-reputation-tree.md).
      *   peer_hierarchy: peer-uuid string -> string_data(the claim it sent, as
      *                   rendered JSON). Recorded only from peers that prove a
      *                   shared anchor; read when choosing a roster-recursion
@@ -321,10 +323,10 @@ static struct {
     bool hierarchy_requested;
     char partition_recovery_target[64];
     int64_t partition_recovery_started_us;
-    /* Runtime cross-group join (ISSUES.md 10.2). Cohorts we have ASKED to join
-     * and not yet been admitted to: group-uuid string -> string_data(same).
-     * The gate on _adopt_solicited_group -- a group arriving without an entry
-     * here is somebody handing us a cohort we never asked for, and adopting
+    /* Runtime cross-group join (doc/architecture/gateway-reputation-tree.md). Cohorts
+     * we have ASKED to join and not yet been admitted to: group-uuid string ->
+     * string_data(same). The gate on _adopt_solicited_group -- a group arriving without
+     * an entry here is somebody handing us a cohort we never asked for, and adopting
      * that would let any peer install itself in our tree. Mirrors Python
      * IdentityProcess._pending_joins. */
     map_t pending_joins;
@@ -499,9 +501,9 @@ int identity_get_peer_caps_count(const uuid_t uuid)
 
 size_t identity_provisional_count(const process_t *proc)
 {
-    /* Two-phase admission observable (ISSUES.md §3.1-a): number of peers this
-     * process is holding PROVISIONAL (confirm seen, quorum not yet met, group
-     * key withheld). Counts provisional_confirmations keys prefixed "<proc>|".
+    /* Two-phase admission observable (doc/architecture/identity-protocol.md): number of
+     * peers this process is holding PROVISIONAL (confirm seen, quorum not yet met,
+     * group key withheld). Counts provisional_confirmations keys prefixed "<proc>|".
      * Mirrors the Python adapter's provisional_peer_count. */
     if (!id_state.initialized || proc == NULL) return 0;
     char prefix[64];
@@ -660,7 +662,7 @@ static int _update_group(const process_t *proc, directory_t *queues)
 }
 
 /* Mint a new shared key for our own group and hand it to every current member
- * (ISSUES.md 10.2, user's call 2026-08-13).
+ * (doc/architecture/gateway-reputation-tree.md, user's call 2026-08-13).
  *
  * Only the node performing an admission calls this, and group_rotate_key
  * refuses when we do not hold the current private key — a rotation minted by a
@@ -699,7 +701,7 @@ static bool _rotate_group_key(process_t *proc, directory_t *queues)
  ****************************/
 
 /* Helper: _confirm_group_membership — the CONFIRMED half of two-phase
- * admission (ISSUES.md §3.1-a). Records the peer's address in our group's
+ * admission (doc/architecture/identity-protocol.md). Records the peer's address in our group's
  * address_map and propagates the updated group (which carries the shared
  * private key) to existing peers. Split out of _add_peer so a PROVISIONAL
  * member can be tracked without the group key ever leaving this node until
@@ -763,7 +765,7 @@ static int _add_peer(process_t *proc, directory_t *queues,
      * Two-phase admission gates the GROUP KEY, not visibility. */
     identity_emit_peer_observed(proc, new_peer);
 
-    /* Two-phase admission (§3.1-a): propagate the group key only for a
+    /* Two-phase admission (doc/architecture/identity-protocol.md): propagate the group key only for a
      * CONFIRMED peer. A provisional add records the peer above (visibility /
      * reputation) but withholds the group key until the quorum is met. */
     if (confirmed)
@@ -921,12 +923,12 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
      * actually needs to work. When per-process identity_history_t
      * gets wired up, call dag_recite + linked_step_to_json here and
      * replace the empty array. */
-    /* Rotate the shared key BEFORE the joiner is handed the group (ISSUES.md
-     * 10.2, user's call 2026-08-13). The order is the whole point: the joiner
-     * receives only the new key, so cohort ciphertext it recorded before being
-     * admitted stays closed to it. Existing members are handed the new key by
-     * the _update_group inside, and keep decrypting old-key traffic through
-     * GROUP_PREVIOUS_KEY_GRACE while that propagates — a rotation is not
+    /* Rotate the shared key BEFORE the joiner is handed the group
+     * (doc/architecture/gateway-reputation-tree.md, user's call 2026-08-13). The order
+     * is the whole point: the joiner receives only the new key, so cohort ciphertext it
+     * recorded before being admitted stays closed to it. Existing members are handed
+     * the new key by the _update_group inside, and keep decrypting old-key traffic
+     * through GROUP_PREVIOUS_KEY_GRACE while that propagates — a rotation is not
      * synchronous across a cohort. Mirrors Python _peer_accepted. */
     _rotate_group_key(proc, queues);
 
@@ -1043,7 +1045,8 @@ static size_t _own_zta_anchors(const process_t *proc, const zta_policy_t *policy
                                char out[][ZTA_ANCHOR_NAME_LEN], size_t max);
 #endif
 
-/* Whether a peer may even ASK this cohort to admit it (ISSUES.md 10.2).
+/* Whether a peer may even ASK this cohort to admit it
+ * (doc/architecture/gateway-reputation-tree.md).
  *
  * Two gates, both reused rather than invented (user's call, 2026-08-13):
  * a PROVED shared ZTA anchor — the same rule federation and deep-resolution
@@ -1140,7 +1143,8 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
     }
 
     /* Optional payload slot 3: the cohort the requester is asking to join
-     * (ISSUES.md 10.2, runtime cross-group join). Absent = the ordinary open
+     * (doc/architecture/gateway-reputation-tree.md, runtime cross-group join). Absent =
+     * the ordinary open
      * request, handled exactly as before. Present and naming somebody else's
      * cohort = not ours to answer, so it is dropped here rather than admitting
      * into OUR group a peer that asked for a different one. Same arity
@@ -1259,7 +1263,7 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
                lives in _zta_admit, mirroring Python's _zta_admit one-for-one.
 
                The gate's verdict is then handed to the reputation process
-               (§10.5). Until that hand-off existed, ZTA_GATE_ADMIT_CAPPED was
+ (doc/architecture/zta-integration.md). Until that hand-off existed, ZTA_GATE_ADMIT_CAPPED was
                only ever compared against ZTA_GATE_REJECT -- so a "capped"
                admission was byte-for-byte an ordinary one, and the
                `ddil_fallback_reputation_cap` this code logs was enforced
@@ -1277,7 +1281,7 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
     }
 #endif
 
-    /* A targeted join is bounded before the vote (ISSUES.md 10.2): the
+    /* A targeted join is bounded before the vote (doc/architecture/gateway-reputation-tree.md): the
      * requester must prove an anchor we share and out-rank this cohort.
      * Deliberately AFTER the ZTA block, which is what turns an asserted
      * credential into proved anchors this reads, and deliberately BEFORE the
@@ -1911,7 +1915,7 @@ static int _merge_to_mesh(process_t *proc, directory_t *queues)
   requires proc->logger == \null || \valid(proc->logger);
 */
 /* If @p payload carries a cohort we asked to join, adopt it as a CHILD group
- * and return true (ISSUES.md 10.2).
+ * and return true (doc/architecture/gateway-reputation-tree.md).
  *
  * Gated on id_state.pending_joins, so an unsolicited history is never adopted
  * this way — otherwise any peer could hand us a group and silently install
@@ -1994,7 +1998,7 @@ static bool handle_receive_history(const process_t *proc, directory_t *queues, g
 
     /* A history answering a cohort join WE solicited becomes a child group and
      * goes no further — it must not reach choose_group / _merge_to_mesh, which
-     * decide which group is OUR primary one (ISSUES.md 10.2). */
+     * decide which group is OUR primary one (doc/architecture/gateway-reputation-tree.md). */
     if (_adopt_solicited_group((process_t *)proc, payload))
     {
         json_decref(payload);
@@ -2088,7 +2092,7 @@ static bool handle_vote_on_peer(const process_t *proc, directory_t *queues, gene
     if (proc->protocol.phase != 3)
         return false;
 
-    /* Policy B — border-guards-only voting (ISSUES.md §3.1-c). Mirrors the
+    /* Policy B — border-guards-only voting (doc/architecture/identity-protocol.md). Mirrors the
      * Python handle_vote_on_peer gate: a non-border-guard consumes the
      * proposal but abstains rather than voting on a candidate it has no
      * welcoming-committee validation context for. Default is border-guard
@@ -2309,14 +2313,14 @@ void identity_set_synchronous_dispatch(bool enabled)
 void identity_set_border_guard_mode(process_t *proc, bool enabled)
 {
     /* Per-process (not global id_state) — mirrors Python's per-instance
-     * IdentityProcess.border_guard_mode. See ISSUES.md §3.1-c. */
+     * IdentityProcess.border_guard_mode. See doc/architecture/identity-protocol.md. */
     if (proc != NULL)
         proc->protocol.border_guard_mode = enabled;
 }
 
 void identity_set_admission_quorum(process_t *proc, int quorum)
 {
-    /* Per-process two-phase admission quorum (ISSUES.md §3.1-a). Mirrors
+    /* Per-process two-phase admission quorum (doc/architecture/identity-protocol.md). Mirrors
      * Python's per-instance IdentityProcess._admission_quorum. */
     if (proc != NULL)
         proc->protocol.admission_quorum = quorum > 0 ? quorum : 1;
@@ -2477,7 +2481,8 @@ static bool handle_count_vote(process_t *proc, directory_t *queues, generic_msg_
   requires \valid(msg);
   requires proc->logger == \null || \valid(proc->logger);
 */
-/* Two-phase admission bookkeeping (ISSUES.md §3.1-a). Record `confirmer_uuid`
+/* Two-phase admission bookkeeping (doc/architecture/identity-protocol.md). Record
+ * `confirmer_uuid`
  * as having confirmed `peer_uuid` for `proc`; return the count of DISTINCT
  * confirmers so far. Keyed "<proc>|<peer_uuid>" in id_state so per-participant
  * conformance runs don't collide. A NULL confirmer is stored as a distinct
@@ -2599,7 +2604,7 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
         }
     }
 
-    /* Two-phase admission (ISSUES.md §3.1-a). Count DISTINCT confirmers; the
+    /* Two-phase admission (doc/architecture/identity-protocol.md). Count DISTINCT confirmers; the
      * group key is propagated only once the quorum is met. The confirmer is
      * the message sender (nmsg->from_whom, populated on receive / auto-stamped
      * by the net layer). Quorum 1 (default) promotes on the first confirm =
@@ -2708,7 +2713,7 @@ static bool handle_history_diff(const process_t *proc, directory_t *queues, gene
  *   different uuid:
  *     theirs > mine  → adopt
  *     theirs < mine  → push our group (we are larger; canonical winner)
- *     equal size     → older group wins (ISSUES.md §3.1-b): adopt iff
+ *     equal size     → older group wins (doc/architecture/identity-protocol.md): adopt iff
  *                      theirs.created < mine.created when both ages known
  *                      and differ; else adopt iff strcmp(theirs.uuid,
  *                      mine.uuid) < 0. Otherwise push our group (we win).
@@ -2754,7 +2759,7 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
     size_t theirs_size = (j_addr_map != NULL && json_is_object(j_addr_map))
                          ? json_object_size(j_addr_map) : 0;
 
-    /* Group age (ISSUES.md §3.1-b): the size-tie tiebreaker. Absent/non-
+    /* Group age (doc/architecture/identity-protocol.md): the size-tie tiebreaker. Absent/non-
      * numeric defaults to 0 (unknown → uuid tiebreak). Mirrors Python
      * from_canonical's "created" default. */
     json_t *j_created = json_object_get(payload, "created");
@@ -2782,15 +2787,15 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
     bool same_group = theirs_uuid_valid
                       && uuid_compare(theirs_uuid, proc->protocol.group.uuid) == 0;
 
-    /* A rotated key supersedes ours (ISSUES.md 10.2). Checked BEFORE the
-     * membership comparison because a rotation carries no membership change of
-     * its own, and a smaller-or-equal address map would otherwise take the
+    /* A rotated key supersedes ours (doc/architecture/gateway-reputation-tree.md).
+     * Checked BEFORE the membership comparison because a rotation carries no membership
+     * change of its own, and a smaller-or-equal address map would otherwise take the
      * quiet no-op path below and drop the new key on the floor.
      *
-     * Only from a VERIFIED message: the epoch decides whether a key is newer,
-     * not whether its sender had any business rotating, and an unauthenticated
-     * update naming a higher epoch would be a way to hand a cohort a key of the
-     * attacker's choosing. Mirrors Python handle_group_update. */
+     * Only from a VERIFIED message: the epoch decides whether a key is newer, not
+     * whether its sender had any business rotating, and an unauthenticated update
+     * naming a higher epoch would be a way to hand a cohort a key of the attacker's
+     * choosing. Mirrors Python handle_group_update. */
     if (same_group)
     {
         json_t *j_epoch = json_object_get(payload, "key_epoch");
@@ -2851,7 +2856,7 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
             adopt = false;
         else if (theirs_uuid_valid)
         {
-            /* Size tie (ISSUES.md §3.1-b): the OLDER group wins — the more-
+            /* Size tie (doc/architecture/identity-protocol.md): the OLDER group wins — the more-
              * established group absorbs the younger one — so adopt theirs iff
              * it is older. Only when both carry a known age (created > 0) that
              * differs; otherwise fall back to the deterministic uuid tiebreak
@@ -2918,8 +2923,8 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
                     incoming_addr, ADDR_LEN);
             ((process_t *)proc)->protocol.group.address[ADDR_LEN] = '\0';
         }
-        /* Inherit the adopted group's age (ISSUES.md §3.1-b) when known, so
-         * subsequent merges compare against the established group's creation
+        /* Inherit the adopted group's age (doc/architecture/identity-protocol.md) when
+         * known, so subsequent merges compare against the established group's creation
          * epoch, not ours. Mirrors Python Group.update_from. */
         if (theirs_created > 0.0)
             ((process_t *)proc)->protocol.group.created = theirs_created;
@@ -3687,7 +3692,7 @@ static bool _is_operator_credential(const zta_policy_t *policy,
 }
 
 /* True if this exact credential is already bound to a DIFFERENT network identity
- * — a harvested/replayed credential (ISSUES §1.5). C twin of Python
+ * — a harvested/replayed credential (doc/architecture/zta-integration.md). C twin of Python
  * IdentityProcess._zta_credential_replayed.
  *
  * The chain-only verifier accepts a chain-valid certificate regardless of WHO
@@ -3801,7 +3806,8 @@ static void _verify_operator_key(const process_t *proc,
 
 /* The ZTA admission decision. C twin of Python IdentityProcess._zta_admit.
  *
- * ADMISSION IS ANY-OF (ISSUES §1.5): at least one credential must chain to some
+ * ADMISSION IS ANY-OF (doc/architecture/zta-integration.md): at least one credential must
+ * chain to some
  * configured anchor AND be bound to this identity. Each verified credential
  * records authority for its anchor on the peer (zta_anchors), and that — not a
  * self-declared role — is what lets a node gateway across an agency boundary.
@@ -3821,19 +3827,19 @@ static void _verify_operator_key(const process_t *proc,
  * Caller must already have neutralized pub->operator_bound and moved the claimed
  * guardian key aside; this function sets the authoritative operator_bound. */
 
-/* Hand the ZTA gate's verdict to the reputation process (ISSUES.md §10.5).
+/* Hand the ZTA gate's verdict to the reputation process
+ * (doc/architecture/zta-integration.md).
  *
- * Nothing is sent when the gate did not run -- a disabled policy, or one that
- * does not require verification at admission, never reaches this call at all.
- * That silence is deliberate and load-bearing: reputation must not be told a
- * peer is `proved` merely because nobody checked, and an unbounded peer is
- * exactly what a deployment that has not enabled ZTA has already chosen.
+ * Nothing is sent when the gate did not run -- a disabled policy, or one that does not
+ * require verification at admission, never reaches this call at all. That silence is
+ * deliberate and load-bearing: reputation must not be told a peer is `proved` merely
+ * because nobody checked, and an unbounded peer is exactly what a deployment that has
+ * not enabled ZTA has already chosen.
  *
- * Mirrors Python IdentityProcess._publish_zta_decision, including the
- * failure posture: a propagation error is logged, never raised, because losing
- * a ceiling must not take admission down -- but it IS logged at WARNING, since
- * the failure case is precisely a peer that goes on to score unbounded with
- * nothing saying why.
+ * Mirrors Python IdentityProcess._publish_zta_decision, including the failure posture:
+ * a propagation error is logged, never raised, because losing a ceiling must not take
+ * admission down -- but it IS logged at WARNING, since the failure case is precisely a
+ * peer that goes on to score unbounded with nothing saying why.
  */
 /* Frama-C: skipped — [solver-timeout] logging/network preconditions */
 static void _publish_zta_standing(const process_t *proc,
@@ -3856,7 +3862,7 @@ static void _publish_zta_standing(const process_t *proc,
                    sizeof(msg.info.zta_standing.reason));
     } else {
         /* Proved: a credential verified against a configured anchor AND is
-         * bound to this identity. The only path that anchors the §10.5
+         * bound to this identity. The only path that anchors the doc/architecture/zta-integration.md
          * unwind -- everything earned after this moment is standing a later
          * failure calls into question. */
         msg.info.zta_standing.standing = (int32_t)ZTA_STANDING_PROVED;
@@ -4211,7 +4217,8 @@ static int _build_announcement_for(const process_t *proc, generic_msg_t *buf,
          * _broadcast_request_access appending _operator_attestation(). */
         json_array_append_new(payload,
                               _operator_attestation_json(&buf->info.net_msg.from_whom));
-        /* Slot 3 (optional): the cohort we are asking to join (ISSUES.md 10.2,
+        /* Slot 3 (optional): the cohort we are asking to join
+         * (doc/architecture/gateway-reputation-tree.md,
          * runtime cross-group join). Absent -- the ordinary case -- this is the
          * open request for a primary group and the payload is exactly what it
          * always was, so a peer on an older build reads it unchanged; the same
@@ -5509,15 +5516,15 @@ static bool _roster_discover_child_gateway(const process_t *proc,
     return have;
 }
 
-/****************************
- * Runtime hierarchy roots (protocol step 7, ISSUES.md §10.2)
+/****************************  *
+ * Runtime hierarchy roots (protocol step 7,
+ * doc/architecture/gateway-reputation-tree.md)
  *
  * Mirrors Python idprocess._derive_parent_gateway / _hierarchy_claim /
- * _advertise_hierarchy / handle_hierarchy / handle_hierarchy_request. Two
- * halves: our own parent is DERIVED (never accepted from a peer), and every
- * node ADVERTISES its own position so the mesh agrees on the tree. No group key
- * ever moves — a runtime cross-group join is a separate question.
- ****************************/
+ * _advertise_hierarchy / handle_hierarchy / handle_hierarchy_request. Two halves: our
+ * own parent is DERIVED (never accepted from a peer), and every node ADVERTISES its own
+ * position so the mesh agrees on the tree. No group key ever moves — a runtime
+ * cross-group join is a separate question. ************************** */
 
 /* This node's own rank, read the same way a peer's is. */
 static int _own_rank(const process_t *proc)
@@ -6464,7 +6471,8 @@ int identity_aggregate_subtree_roster(const char *top_uuid,
 }
 
 /* Ask a cohort we are NOT in to admit us, so a gateway can acquire a child
- * cohort at runtime instead of from a seeded key file (ISSUES.md 10.2).
+ * cohort at runtime instead of from a seeded key file
+ * (doc/architecture/gateway-reputation-tree.md).
  *
  * The COHORT decides (user's call, 2026-08-13): this sends the ordinary
  * request_access, its members run the ordinary welcoming-committee vote, and an
@@ -6564,8 +6572,8 @@ int identity_propagate_child_groups(const process_t *proc, directory_t *queues)
      * message per cohort. The C twin of Python's _record_child_groups, and
      * needed for the same reason: the REPUTATION process keeps a separate
      * transaction chain per child group, and it cannot do that if only the
-     * identity process knows the groups exist (gateway-reputation-tree.md,
-     * ISSUES.md §10.2).
+     * identity process knows the groups exist
+     * (doc/architecture/gateway-reputation-tree.md).
      *
      * One message per group rather than a set, because generic_msg_t's union
      * carries one group_t; the receiver accumulates them into its own map, so
@@ -6832,9 +6840,9 @@ int identity_register_handlers(process_t *proc)
     /* Default to border-guard (mirrors Python IdentityProcess.border_guard_mode
      * = True). A deployment/harness may clear it via
      * identity_set_border_guard_mode to make this peer abstain from voting
-     * (Policy B, ISSUES.md §3.1-c). */
+     * (Policy B, doc/architecture/identity-protocol.md). */
     proc->protocol.border_guard_mode = true;
-    /* Two-phase admission quorum (ISSUES.md §3.1-a). Default 1 = promote on
+    /* Two-phase admission quorum (doc/architecture/identity-protocol.md). Default 1 = promote on
      * the first confirm (historical behavior); a deployment/harness sets it
      * higher via identity_set_admission_quorum for corroborated key handover. */
     proc->protocol.admission_quorum = 1;
@@ -7071,7 +7079,7 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
                 char uuid_str[UUID_STRING_LEN + 1];
                 uuid_unparse_lower(pub->uuid, uuid_str);
                 group_add_address(&proc->protocol.group, uuid_str, pub->address);
-                /* Stamp a real creation epoch (ISSUES.md §3.1-b) so a group
+                /* Stamp a real creation epoch (doc/architecture/identity-protocol.md) so a group
                  * minted at genesis carries a comparable age for the merge
                  * size-tie tiebreaker. Unix epoch seconds, directly
                  * comparable to Python initialize's now().timestamp() on the
@@ -7080,6 +7088,15 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
                  * tiebreak), so the stamp lives here at the runtime genesis
                  * mint only. Mirrors Python Group.initialize. */
                 proc->protocol.group.created = (double)time(NULL);
+                /* Same reasoning for the envelope format
+                 * (doc/architecture/network-wire-format.md): AT_NET_WIRE_MODE applies
+                 * at the one moment a node DECIDES a format rather than adopting one.
+                 * Every other group this node holds arrived from a peer with its format
+                 * already set, so an operator stands up a proto cohort by setting the
+                 * knob on whichever node forms the group. group_init leaves it JSON,
+                 * which keeps the conformance adapters format-agnostic. Mirrors Python
+                 * Group.initialize. */
+                proc->protocol.group.wire_format = net_wire_mode_resolve(NULL, logger);
             }
             if (pub != NULL)
                 smrt_deref(pub);

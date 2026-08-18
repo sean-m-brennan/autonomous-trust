@@ -50,7 +50,8 @@
 #include <openssl/evp.h>              /* scenario-time operator-binding signing */
 #include <openssl/pem.h>
 #include "zta/zta_policy.h"           /* zta_policy_t / defaults / from_json */
-#include "zta/zta_binding.h"          /* credential->identity binding (ISSUES §1.5) */
+#include "zta/zta_binding.h"          /* credential->identity binding
+# (doc/architecture/zta-integration.md) */
 #endif
 #include "network/net_message.h"
 #include "processes/processes.h"
@@ -395,7 +396,7 @@ static int _ic_run_attest_pull(sce_run_ctx_t *ctx, ic_impl_t *puller,
  *   "forged"         signed by an unrelated key of the same kind, so the ONE
  *                    difference from "valid" is who held the private key
  *   "other-identity" correctly signed by the real operator, but over a
- *                    pre-image naming a DIFFERENT node (ISSUES.md §1.5's
+ *                    pre-image naming a DIFFERENT node (doc/architecture/zta-integration.md's
  *                    harvested credential)
  */
 static int _scenario_operator_binding(const char *root, const char *variant,
@@ -471,7 +472,8 @@ out:
     return rc;
 }
 
-/* Mint a credential->identity binding for a scenario participant (ISSUES §1.5).
+/* Mint a credential->identity binding for a scenario participant
+ * (doc/architecture/zta-integration.md).
  * C twin of the Python adapter's _scenario_zta_binding, variant for variant:
  *
  *   "valid"          signed by the leaf whose certificate the peer presents
@@ -748,7 +750,7 @@ static void _apply_zta_fixtures(sce_run_ctx_t *ctx, json_t *fixtures) {
  * already-known branch is reachable). */
 static void _apply_fixtures(sce_run_ctx_t *ctx) {
     /* border_guard: optional per-participant bool on the participant spec
-     * (ISSUES.md §3.1-c, Policy B). Default true (set in
+     * (doc/architecture/identity-protocol.md, Policy B). Default true (set in
      * identity_register_handlers); `border_guard: false` makes that peer
      * abstain from voting on received proposals. Read here — before the
      * fixtures early-return — because it lives on the participant entry, not
@@ -809,7 +811,7 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
     }
 
     /* admission_quorum: { "<participant>": <int>, ... } — two-phase admission
-     * (ISSUES.md §3.1-a). A member withholds the group key until this many
+     * (doc/architecture/identity-protocol.md). A member withholds the group key until this many
      * DISTINCT border-guards confirm. Default 1 (no fixture). Mirrors the
      * Python adapter reading fixtures.admission_quorum. */
     json_t *quorums = json_object_get(fixtures, "admission_quorum");
@@ -1173,12 +1175,12 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     out->info.net_msg.encrypt = false;
     memcpy(&out->info.net_msg.from_whom, sender_impl->pub, sizeof(public_identity_t));
 
-    /* trigger_cohort_join — the only pseudo-function that carries a payload:
-     * it names the cohort to solicit (ISSUES.md 10.2). Without packing it the
-     * adapter would ask to join "" and the request would be refused locally,
-     * which reads downstream as "emitted nothing". Mirrors the Python adapter,
-     * which likewise leaves the payload in place for this one pseudo-function
-     * while blanking it for the others. */
+    /* trigger_cohort_join — the only pseudo-function that carries a payload: it names
+     * the cohort to solicit (doc/architecture/gateway-reputation-tree.md). Without
+     * packing it the adapter would ask to join "" and the request would be refused
+     * locally, which reads downstream as "emitted nothing". Mirrors the Python adapter,
+     * which likewise leaves the payload in place for this one pseudo-function while
+     * blanking it for the others. */
     if (strcmp(function, "trigger_cohort_join") == 0 && json_is_object(payload)) {
         json_t *body = json_deep_copy(payload);
         if (body != NULL) {
@@ -1426,7 +1428,7 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         }
     }
 
-    /* request_access with a JOIN TARGET (ISSUES.md 10.2). The C engine
+    /* request_access with a JOIN TARGET (doc/architecture/gateway-reputation-tree.md). The C engine
      * REBUILDS a propagated message from the step rather than re-delivering
      * the captured bytes (it records from/to/function, not the payload), so a
      * targeted solicitation would arrive here stripped of the cohort it names
@@ -1592,7 +1594,8 @@ static int _dispatch(sce_run_ctx_t *ctx,
         && inbound->info.net_msg.function != NULL
         && strcmp(inbound->info.net_msg.function, "trigger_cohort_join") == 0) {
         /* Pseudo-function: solicit membership in a cohort this participant is
-         * NOT in (runtime cross-group join, ISSUES.md 10.2). The payload names
+         * NOT in (runtime cross-group join, doc/architecture/gateway-reputation-tree.md).
+         * The payload names
          * the target cohort; the scenario pins that uuid via fixtures.groups so
          * it is the same string in both harnesses. Unlike the other
          * pseudo-functions this one DOES emit wire traffic — the ordinary
@@ -2095,7 +2098,8 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                 }
             } else if (strcmp(key, "group_key_epoch") == 0) {
                 /* How many times this participant's group key has been rotated.
-                 * Admission rotates (ISSUES.md 10.2), so a welcomer that
+                 * Admission rotates (doc/architecture/gateway-reputation-tree.md), so a
+                 * welcomer that
                  * admitted one peer sits at 1 — that is what keeps cohort
                  * traffic recorded BEFORE a join closed to the joiner. Mirrors
                  * Python Group.key_epoch. */
@@ -2188,7 +2192,7 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                     }
                 }
             } else if (strcmp(key, "provisional_peer_count") == 0) {
-                /* Two-phase admission (§3.1-a): peers held provisional
+                /* Two-phase admission (doc/architecture/identity-protocol.md): peers held provisional
                  * (confirm seen, quorum not met, group key withheld). Mirrors
                  * the Python adapter's provisional_peer_count. */
                 int want = (int)json_integer_value(val);

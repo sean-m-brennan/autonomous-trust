@@ -236,7 +236,7 @@ class TestSelectDevice:
         assert Network._select_device() == ('eth1', False)
 
     def test_no_eth0_no_route(self, mock_addrs, _mock_dev, _mock_out):
-        """The §3.5a bug: a host with neither a parseable default route nor
+        """Thea bug: a host with neither a parseable default route nor
         an interface literally named eth0 used to raise KeyError."""
         mock_addrs.return_value = {
             'lo': [_addr(socket.AF_INET, '127.0.0.1', '255.0.0.0')],
@@ -335,7 +335,7 @@ class TestGetDefaultDeviceParsing:
 
 
 class TestStaleness:
-    """§3.5b: the stored address is authoritative while it is still valid on
+    """b: the stored address is authoritative while it is still valid on
     this host, and re-derived when it isn't."""
 
     @patch('autonomous_trust.core.network.network.psutil.net_if_addrs')

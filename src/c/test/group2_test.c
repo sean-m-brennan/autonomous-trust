@@ -161,7 +161,8 @@ DEFINE_TEST(test_group_init_nul_terminates_long_address)
 END_TEST_DEFINITION()
 
 
-/* --- Group key rotation (ISSUES.md §10.2) --------------------------------
+/* --- Group key rotation (doc/architecture/gateway-reputation-tree.md)
+ * --------------------------------
  * Admission used to hand a joiner a PERMANENT shared key, so a new member
  * could decrypt cohort traffic it had recorded before it joined. Admission now
  * rotates; these pin the three things that makes safe. */

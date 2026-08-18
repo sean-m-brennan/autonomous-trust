@@ -51,7 +51,7 @@ AT_DIR="$SRC_DIR/autonomous-trust"
 STASH_ROOT="$SRC_DIR/.at-builder-stash"
 AT_STASH_RELS=("reactjs/node_modules" ".tox" ".venv" ".rustup")
 
-# Pinned conda toolchain (ISSUES.md §9.1): MINIFORGE_IMAGE / MINIFORGE_VERSION.
+# Pinned conda toolchain (config/cfg/toolchain-pins.env): MINIFORGE_IMAGE / MINIFORGE_VERSION.
 # Absence is not fatal -- the Dockerfiles carry the same pin as ARG defaults.
 TOOLCHAIN_PINS="$REPO_DIR/config/cfg/toolchain-pins.env"
 if [[ -f "$TOOLCHAIN_PINS" ]]; then
@@ -148,7 +148,7 @@ common_build_args() {
     if [[ -n "$REGISTRY_URL" ]]; then
         args+=(--build-arg "REGISTRY_URL=$REGISTRY_URL")
     fi
-    # Pinned conda base image (ISSUES.md §9.1). The Dockerfiles carry the same
+    # Pinned conda base image (config/cfg/toolchain-pins.env). The Dockerfiles carry the same
     # value as an ARG default, so an un-passed build is still pinned; passing it
     # keeps the pins file authoritative when the two are edited out of step.
     if [[ -n "${MINIFORGE_IMAGE:-}" ]]; then

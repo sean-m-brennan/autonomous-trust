@@ -200,7 +200,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             raise RuntimeError('Invalid identity history implementation: %s' % impl)
         self.messages: list[Message] = []
         self.border_guard_mode = True
-        # Two-phase admission (ISSUES.md §3.1-a). A member receiving a
+        # Two-phase admission (doc/architecture/identity-protocol.md). A member receiving a
         # `confirm` broadcast holds the peer PROVISIONAL — known in
         # self.peers/history for reputation/routing, but the group key is NOT
         # propagated to it (no group.add_address + _update_group) — until
@@ -237,12 +237,12 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self._own_anchor_cache = None
         self._zta_capped: set = set()  # uuids admitted via DDIL fallback (rep-capped)
         # What _zta_admit found on THIS call, for the caller to hand to the
-        # reputation process (§10.5): (status, ceiling, verified_at, reason),
+        # reputation process (doc/architecture/zta-integration.md): (status, ceiling, verified_at, reason),
         # or None when the gate said nothing (policy disabled / not required at
         # admission), in which case no standing is published at all -- silence
         # and "proved" are different claims.
         self._zta_standing_pending = None
-        # Last ZTA re-verification sweep (§10.5). None = never run, so the
+        # Last ZTA re-verification sweep (doc/architecture/zta-integration.md). None = never run, so the
         # first process() iteration sweeps immediately -- which is what catches
         # a credential revoked while this node was down.
         self._last_zta_reverify: Optional[datetime] = None
@@ -294,13 +294,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.self_bootstrapped = False
         self.merging = False
         self.peer_potentials = {}
-        # Gateway multi-group state — see
-        # doc/architecture/gateway-reputation-tree.md.
-        #   child_groups:   group-uuid-str -> Group (with key) we gateway
-        #   parent_gateway: uuid-str of the higher-rank node we federate
-        #                   through, or None
-        # Both empty/None on rank-1 leaf nodes, which keeps every
-        # multi-group path inert and behaviour identical to today.
+        # Gateway multi-group state — see doc/architecture/gateway-reputation-tree.md.
+        # child_groups:   group-uuid-str -> Group (with key) we gateway parent_gateway:
+        # uuid-str of the higher-rank node we federate through, or None Both empty/None
+        # on rank-1 leaf nodes, which keeps every multi-group path inert and behaviour
+        # identical to today.
         self.child_groups: dict[str, Group] = {}
         self.parent_gateway: Optional[str] = None
         # Subtree member-roster recursion targets: child-group-uuid-str ->
@@ -320,7 +318,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # re-broadcasting an unchanged claim (the group_update flood lesson);
         # _hierarchy_requested makes the post-admission query one-shot.
         self.peer_hierarchy: dict[str, dict] = {}
-        # Cohorts we have ASKED to join and not yet been admitted to (§10.2).
+        # Cohorts we have ASKED to join and not yet been admitted to (doc/architecture/gateway-reputation-tree.md).
         # The gate on _adopt_solicited_group: a group arriving without a
         # matching entry here is somebody handing us a cohort we never asked
         # for, and adopting that would let any peer install itself in our tree.
@@ -496,7 +494,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
 
     def _publish_zta_standing(self, queues, peer_uuid, status, ceiling=None,
                               verified_at=None, reason=''):
-        """Hand one ZTA finding to the other processes (ISSUES §10.5).
+        """Hand one ZTA finding to the other processes (doc/architecture/zta-integration.md).
 
         Sibling of _record_child_groups: same fan-out, different cargo. The
         reputation process is the consumer that matters -- it is where a
@@ -692,7 +690,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self.peer_ranks = {}
         self.peer_ranks[str(uuid)] = int(rank or 0)
 
-    # --- Runtime hierarchy roots (protocol step 7, ISSUES.md §10.2) ----------
+    # --- Runtime hierarchy roots (protocol step 7,
+    # doc/architecture/gateway-reputation-tree.md) ----------
 
     def _own_rank(self) -> int:
         """This node's own rank, read the same way a peer's is."""
@@ -715,7 +714,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
 
         Candidates must also prove gateway authority for a boundary we share
         (:meth:`_gateway_authorized`), so a peer holding only a foreign
-        agency's credential is never federated through — §10.5's rule, applied
+        agency's credential is never federated through — doc/architecture/zta-integration.md's rule, applied
         upward.
         """
         if self.group is None:
@@ -1628,9 +1627,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # the signing formula and no envelope/wire-vector change. Old peers emit
         # a 2-element payload; welcoming_committee tolerates both arities.
         self._refresh_operator_attestation()
-        # A 4th element names the cohort we are asking to join (ISSUES.md
-        # §10.2, runtime cross-group join). Absent -- the ordinary case -- this
-        # is the open request for a primary group and the payload is exactly
+        # A 4th element names the cohort we are asking to join
+        # (doc/architecture/gateway-reputation-tree.md, runtime cross-group join).
+        # Absent -- the ordinary case -- this is the open request for a primary group and the payload is exactly
         # what it always was, so a peer on an older build reads it unchanged;
         # the same arity tolerance the operator attestation already relies on.
         #
@@ -1650,7 +1649,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
     def request_cohort_join(self, queues, group_uuid):
         """Ask a cohort we are NOT in to admit us, so a gateway can acquire a
         child cohort at runtime instead of from a seeded key file
-        (ISSUES.md §10.2).
+        (doc/architecture/gateway-reputation-tree.md).
 
         The cohort decides (user's call, 2026-08-13): this sends the ordinary
         `request_access`, its members run the ordinary welcoming-committee
@@ -1685,12 +1684,12 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         return True
 
     def _join_authorized(self, new_id) -> bool:
-        """Whether a peer may even ASK this cohort to admit it (§10.2).
+        """Whether a peer may even ASK this cohort to admit it (doc/architecture/gateway-reputation-tree.md).
 
         Two gates, both reused rather than invented (user's call,
         2026-08-13):
 
-        * a **proved shared ZTA anchor** -- §10.5's rule, the same one
+        * a **proved shared ZTA anchor** -- doc/architecture/zta-integration.md's rule, the same one
           `_gateway_authorized` applies to federation and that deep
           resolution applies to evidence signers. A peer holding only a
           foreign agency's credential is not ours to admit.
@@ -1912,7 +1911,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
 
     def _adopt_solicited_group(self, queues, hist_tpl) -> bool:
         """If ``hist_tpl`` carries a cohort we asked to join, adopt it as a
-        child group and return True (§10.2).
+        child group and return True (doc/architecture/gateway-reputation-tree.md).
 
         Gated on ``_pending_joins``, so an unsolicited history is never
         adopted this way -- otherwise any peer could hand us a group and
@@ -1998,9 +1997,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self.group, hist = accepted
             self.logger.info('Merging self-bootstrap into mesh group %s', getattr(self.group, 'nickname', '?'))
             self._record_group(queues)
-            # Partition-recovery cleanup: this is the typical exit path
-            # for a successful partition-recovery probe → request_access
-            # → full_history round-trip (see
+            # Partition-recovery cleanup: this is the typical exit path for a successful
+            # partition-recovery probe → request_access → full_history round-trip (see
             # doc/architecture/partition-recovery.md §5.5).
             self._partition_recovery_in_progress = None
             self._partition_probe_cooldown.clear()
@@ -2078,7 +2076,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # (shared byte-shape with C public_identity_to_json) so a C member can
         # parse it — the new peer is a third party, so it can't use from_*.
         # from_whom carries the CONFIRMER (us) so a member can count distinct
-        # confirmers for the two-phase admission quorum (§3.1-a). The new-peer
+        # confirmers for the two-phase admission quorum (doc/architecture/identity-protocol.md). The new-peer
         # identity is the payload; the confirmer rides the envelope (idiomatic,
         # mirrors `accept`). Harmless at the default quorum of 1.
         msg_str = to_json_string(public_identity_to_canonical(blob.identity))
@@ -2097,21 +2095,19 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                           from_whom=self.identity, encrypt=False)
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
 
-        # send group key + history + my peer set so the new peer can
-        # decrypt future group messages AND populate identities for the
-        # peers I already admitted (otherwise it never receives confirm
-        # broadcasts for those peers — see project_inspector_peer_set_gap).
-        # Peer identities are stripped of private keys via publish().
-        # Peer bundle (slot 2) rides as DRY canonical public-identity dicts
-        # (shared byte-shape with C public_identity_to_json) so the joining
-        # peer — including a C node — can parse the existing roster. (Was
-        # p.publish(), the ConfigJSONEncoder form C cannot read.)
-        # Rotate the shared key BEFORE the joiner is handed the group
-        # (ISSUES.md §10.2, user's call 2026-08-13). The order is the whole
-        # point: the joiner receives only the new key, so cohort ciphertext it
-        # recorded before being admitted stays closed to it. Existing members
-        # are handed the new key by the _update_group below, and keep decrypting
-        # old-key traffic through Group.PREVIOUS_KEY_GRACE while that
+        # send group key + history + my peer set so the new peer can decrypt future
+        # group messages AND populate identities for the peers I already admitted
+        # (otherwise it never receives confirm broadcasts for those peers — see
+        # project_inspector_peer_set_gap). Peer identities are stripped of private keys
+        # via publish(). Peer bundle (slot 2) rides as DRY canonical public-identity
+        # dicts (shared byte-shape with C public_identity_to_json) so the joining peer —
+        # including a C node — can parse the existing roster. (Was p.publish(), the
+        # ConfigJSONEncoder form C cannot read.) Rotate the shared key BEFORE the joiner
+        # is handed the group (doc/architecture/gateway-reputation-tree.md, user's call
+        # 2026-08-13). The order is the whole point: the joiner receives only the new
+        # key, so cohort ciphertext it recorded before being admitted stays closed to
+        # it. Existing members are handed the new key by the _update_group below, and
+        # keep decrypting old-key traffic through Group.PREVIOUS_KEY_GRACE while that
         # propagates -- a rotation is not synchronous across a cohort.
         self._rotate_group_key(queues)
         peers_payload = [public_identity_to_canonical(p) for p in self.peers.all]
@@ -2240,7 +2236,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
 
     def _zta_credential_replayed(self, new_id, cred) -> bool:
         """True if this exact credential is already bound to a DIFFERENT network
-        identity — a harvested/replayed credential (closes ISSUES §1.5).
+        identity — a harvested/replayed credential (closes doc/architecture/zta-integration.md).
 
         The chain-only verifier accepts a chain-valid certificate regardless of
         WHO presents it, so a credential lifted from one peer's (clear-text)
@@ -2365,7 +2361,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         (do not propose). A no-op ('admit') when the policy is disabled or does
         not require verification at admission.
 
-        **Admission is any-of** (ISSUES §1.5): at least one credential must verify
+        **Admission is any-of** (doc/architecture/zta-integration.md): at least one
+        * credential must verify
         against some configured anchor AND be bound to this identity. Each verified
         credential records authority for its anchor on the peer
         (``zta_anchors``), and that -- not a self-declared role -- is what lets a
@@ -2554,7 +2551,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 return 'admit_capped'
             # Proved: a credential verified against a configured anchor AND is
             # bound to this identity. This is the only path that anchors the
-            # §10.5 unwind -- everything a peer earns after this moment is
+            # doc/architecture/zta-integration.md unwind -- everything a peer earns after this moment is
             # standing a later failure calls into question.
             self._zta_standing_pending = (
                 STANDING_PROVED, None, time.time(), 'verified at admission')
@@ -2619,7 +2616,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 ph, caps = parts[0], parts[1]
                 attestation = parts[2] if len(parts) > 2 and isinstance(parts[2], dict) else {}
                 # Optional 4th element: the cohort the requester is asking to
-                # join (§10.2). Absent = the ordinary open request, handled
+                # join (doc/architecture/gateway-reputation-tree.md). Absent = the ordinary open request, handled
                 # exactly as before. Present and naming somebody else's cohort
                 # = not ours to answer, so drop it here rather than admitting
                 # into OUR group a peer that asked for a different one.
@@ -2697,11 +2694,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     return True
                 # Hand the finding to reputation BEFORE the peer can be scored:
                 # a ceiling that arrives after the first commit has already let
-                # the thing it bounds happen (§10.5).
+                # the thing it bounds happen.
                 self._publish_zta_decision(queues, new_id)
                 # A targeted join is bounded before the vote: the requester
                 # must prove an anchor we share and out-rank this cohort
-                # (§10.2). Deliberately after _zta_admit, which is what proves
+                # (doc/architecture/gateway-reputation-tree.md). Deliberately after _zta_admit, which is what proves
                 # the anchors this reads, and deliberately BEFORE the vote --
                 # it bounds who may solicit, it does not decide.
                 if join_target and not self._join_authorized(new_id):
@@ -2879,7 +2876,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 'Announced self to %d bundled peers', sent)
 
     def _confirm_group_membership(self, queues, identity, level=None):
-        """Propagate group membership + key to a CONFIRMED peer (§3.1-a).
+        """Propagate group membership + key to a CONFIRMED peer (doc/architecture/identity-protocol.md).
 
         Adds the peer's address to our group and re-publishes the group —
         which carries the shared private key (Group.to_canonical) — to the
@@ -2916,7 +2913,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # The parameter is retained so future per-callsite recovery
         # policy can plug in here without changing the signature.
         #
-        # `confirmed` (§3.1-a two-phase admission): when False, the peer is
+        # `confirmed` (doc/architecture/identity-protocol.md two-phase admission): when False, the peer is
         # recorded in history/peers/caps but the group key is NOT propagated
         # (the group-address add + _update_group are withheld) — the
         # PROVISIONAL state. handle_confirm_peer promotes to confirmed once
@@ -2979,7 +2976,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.propose:
             self.logger.debug('Received peer proposal')
-            # Policy B — border-guards-only voting (ISSUES.md §3.1-c).
+            # Policy B — border-guards-only voting (doc/architecture/identity-protocol.md).
             # `welcoming_committee` only *emits* a proposal when this peer is a
             # border guard; the vote side now mirrors that: only border guards
             # vote on a received proposal. A non-border-guard has no
@@ -3114,7 +3111,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 # but missing from peer_capabilities, so DataRcvr never
                 # subscribes to their streams.
                 self._send_caps_query(queues, peer)
-            # Two-phase admission (§3.1-a). Count DISTINCT confirmers for this
+            # Two-phase admission (doc/architecture/identity-protocol.md). Count DISTINCT confirmers for this
             # peer; propagate the group key only once the quorum is met.
             #   - quorum 1 (default): first confirm promotes immediately —
             #     identical to the historical single-welcomer behavior.
@@ -3389,7 +3386,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             _probes.counter('peer.set', 'caps_resync_exc')
             self.report_exception(err, '_periodic_caps_resync')
 
-    # --- ZTA periodic re-verification (ISSUES §10.5) -----------------------
+    # --- ZTA periodic re-verification (doc/architecture/zta-integration.md) -----------------------
 
     #: How often the sweep WAKES to ask whether the policy's re-verification
     #: interval has elapsed. Distinct from the interval itself
@@ -4106,7 +4103,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             if mine is None or theirs is None:
                 return True
             if mine.uuid == theirs.uuid:
-                # A rotated key supersedes ours (§10.2). Checked before the
+                # A rotated key supersedes ours (doc/architecture/gateway-reputation-tree.md). Checked before the
                 # membership comparison because a rotation carries no
                 # membership change of its own, and a smaller-or-equal address
                 # map would otherwise take the quiet no-op path below and drop
@@ -4142,7 +4139,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 elif len(theirs.addresses) < len(mine.addresses):
                     adopt = False
                 else:
-                    # Size tie (ISSUES.md §3.1-b): the OLDER group wins — the
+                    # Size tie (doc/architecture/identity-protocol.md): the OLDER group wins — the
                     # more-established group absorbs the younger one — so we
                     # adopt theirs iff it is older. Only when both carry a known
                     # age (created > 0) that differs; otherwise fall back to the
@@ -4251,7 +4248,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self._request_hierarchy(queues)
                     self._refresh_hierarchy(queues)
 
-                # ZTA background re-verification (§10.5). Gated on its own,
+                # ZTA background re-verification (doc/architecture/zta-integration.md). Gated on its own,
                 # much longer, POLICY-supplied interval -- the wake below is
                 # only how often we ask whether that interval has elapsed, so
                 # a chain walk per peer does not ride the 20 s sweep above.

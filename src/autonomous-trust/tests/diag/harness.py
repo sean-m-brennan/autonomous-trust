@@ -33,9 +33,9 @@ Peers can be separated on either of two axes (`separate_by`):
 - `'port'`: every peer binds ONE address and gets its own base port via
   `AT_COMM_PORT`, `port_stride` apart. This is the axis `AT_COMM_PORT`
   exists for, and the only one that also separates the derived ports, so
-  anything still binding a wildcard address (see ISSUES.md on ping.py's
-  receive bind) stops contending. Convergence helpers that identify peers
-  by address refuse to run in this mode rather than pass vacuously.
+  anything still binding a wildcard address (see
+  doc/architecture/networking.md on ping.py's receive bind) stops contending.
+  Convergence helpers that identify peers by address refuse to run in this mode rather than pass vacuously.
 
 UDP broadcast goes to `127.255.255.255` (the /8 broadcast). Linux loopback
 supports SO_REUSEADDR + broadcast on all of 127/8 by default; macOS does
@@ -194,8 +194,8 @@ class MultiPeerHarness:
     # every peer on ONE address and separates them by base port instead, which
     # is what AT_COMM_PORT exists for and the only axis that also separates the
     # derived ports (group, and Python's ping/ntp). Separating by address alone
-    # leaves anything that binds a wildcard address contending — see ISSUES.md
-    # on ping.py's receive bind.
+    # leaves anything that binds a wildcard address contending — see
+    # doc/architecture/networking.md on ping.py's receive bind.
     separate_by: str = 'address'
     port_stride: int = 100   # gap between peers' bases; > 1 leaves room for +1
 

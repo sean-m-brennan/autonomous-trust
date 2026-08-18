@@ -240,4 +240,4 @@ reconnect, and accept.
 
 ---
 
-*Next: [Partition recovery](partition-recovery.md)*
+*Next: [Network wire format](network-wire-format.md)*

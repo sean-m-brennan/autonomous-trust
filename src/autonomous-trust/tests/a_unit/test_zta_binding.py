@@ -13,7 +13,8 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""The credential->identity binding: who may present this credential (ISSUES §1.5).
+"""The credential->identity binding: who may present this credential
+(doc/architecture/zta-integration.md).
 
 Real CAs, real leaf keys, real ECDSA signatures over the real pre-image. The thing
 under test is whether a signature made for one node verifies for that node and for
@@ -21,7 +22,7 @@ nobody else, so a stubbed verifier could not tell -- the same reason
 `test_operator_binding.py` drives the real verifiers.
 
 The case that matters most is `test_binding_does_not_verify_for_another_identity`:
-that is precisely the harvested-credential replay §1.5 describes, and it is what TOFU
+that is precisely the harvested-credential replay doc/architecture/zta-integration.md describes, and it is what TOFU
 was standing in for.
 """
 import hashlib
@@ -42,15 +43,15 @@ while _ROOT != '/':
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from tools.provision_zta_certs import (  # noqa: E402
+from tools.provision_zta_certs import (# noqa: E402
     make_ca, make_leaf_keypair, cert_der)
 
 from autonomous_trust.core._python.identity.identity import Identity  # noqa: E402
 from autonomous_trust.core._python.identity.sign import Signature  # noqa: E402
 from autonomous_trust.core._python.identity.encrypt import Encryptor  # noqa: E402
-from autonomous_trust.core._python.identity.operator_binding import (  # noqa: E402
+from autonomous_trust.core._python.identity.operator_binding import (# noqa: E402
     operator_binding_preimage)
-from autonomous_trust.core._python.identity.zta_binding import (  # noqa: E402
+from autonomous_trust.core._python.identity.zta_binding import (# noqa: E402
     ZTA_BINDING_MAX, ZTA_BINDING_PREIMAGE_LEN, ZTA_BINDING_TAG,
     ZTA_SAN_URI_TEMPLATE, credential_fingerprint, identity_is_bound,
     node_signing_pubkey, operator_binding_binds_identity, san_binds_identity,
@@ -78,7 +79,7 @@ def _sign(leaf_key, data: bytes) -> bytes:
 @pytest.fixture
 def agency():
     """One agency CA and a leaf credential with its private key -- a machine/device
-    credential, the class §1.5 left exposed."""
+    credential, the class doc/architecture/zta-integration.md left exposed."""
     ca_key, ca_cert = make_ca('Agency Root')
     leaf_key, leaf_cert = make_leaf_keypair('drone-alpha', ca_key, ca_cert)
     return ca_key, ca_cert, leaf_key, cert_der(leaf_cert)
@@ -123,7 +124,8 @@ class TestHolderAssertedBinding:
         assert verify_zta_binding(me, cred, binding) is True
 
     def test_binding_does_not_verify_for_another_identity(self, agency):
-        """ISSUES §1.5, in one assertion: the attacker harvests a chain-valid
+        """Credential-to-identity binding (doc/architecture/zta-integration.md), in
+        one assertion: the attacker harvests a chain-valid
         credential AND its binding from a clear-text announce, and re-presents both
         under its own identity. The pre-image names the victim, so the signature
         cannot verify -- and the attacker cannot mint a fresh one without the

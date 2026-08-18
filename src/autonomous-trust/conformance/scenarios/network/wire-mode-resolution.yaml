@@ -1,0 +1,109 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: wire-mode-resolution
+byte_pinning: false
+description: |
+    AT_NET_WIRE_MODE resolution (doc/architecture/network-wire-format.md): env override, else the
+    compile-time default.
+
+    This knob is narrower than it looks, and the narrowness is the design. It
+    does NOT decide what goes on the wire for an existing group -- that comes
+    from the group itself (`Group.wire_format` / `group_t::wire_format`), which
+    is what keeps a cohort consistent and why there is no per-message or
+    per-peer override. It decides only what a group this node MINTS is stamped
+    with. An operator stands up a proto cohort by setting it on whichever node
+    forms the group; every joiner adopts the group's value at admission.
+
+    Values are NAMES here rather than the integers the other tunables use,
+    because the same two names ride the group wire form ("json" / "proto") and
+    a second spelling of the same choice is a second thing to keep in sync.
+
+    Refusals are part of the contract, as with the numeric knobs: an
+    unrecognized value keeps the default rather than silently producing
+    something degenerate. Matching is case-insensitive and trims surrounding
+    whitespace, because an operator writing "Proto" means proto -- refusing that
+    would present as this whole envelope path simply not happening, which is the
+    hardest kind of failure to diagnose.
+
+    Production-code analogue:
+      Python: system.resolve_net_wire_mode over system.resolve_env_choice.
+      C:      net_wire_mode_resolve (network/network.h), same cache-once and
+              same refusal reporting as net_knob_resolve.
+
+participants:
+  - id: node
+    role: resolver
+
+fixtures:
+  # Stated here so a drift in either implementation's default shows up as a
+  # case failure rather than as agreement on a value neither side got from the
+  # other.
+  knob:
+    name: wire_mode
+    env: AT_NET_WIRE_MODE
+    default: json
+    choices: ["json", "proto"]
+
+  resolutions:
+    # --- accepted overrides -------------------------------------------------
+    - id: proto-env-applies
+      env: "proto"
+      expect_value: proto
+      expect_source: env
+    - id: json-env-applies
+      env: "json"
+      expect_value: json
+      expect_source: env
+    - id: default-when-silent
+      env: null
+      expect_value: json
+      expect_source: default
+    # Case and surrounding whitespace are normalized, not refused.
+    - id: mixed-case-accepted
+      env: "Proto"
+      expect_value: proto
+      expect_source: env
+    - id: upper-case-accepted
+      env: "JSON"
+      expect_value: json
+      expect_source: env
+    - id: leading-space-accepted
+      env: " proto"
+      expect_value: proto
+      expect_source: env
+
+    # --- refused overrides --------------------------------------------------
+    # An empty string is "not set", not a refusal: getenv and os.environ.get
+    # both hand back something falsy and the default stands, unremarked.
+    - id: empty-is-unset
+      env: ""
+      expect_value: json
+      expect_source: default
+    - id: refuse-unknown-name
+      env: "yaml"
+      expect_value: json
+      expect_source: default
+    - id: refuse-numeric
+      env: "1"
+      expect_value: json
+      expect_source: default
+    - id: refuse-partial
+      env: "prot"
+      expect_value: json
+      expect_source: default
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: resolve_wire_mode
+    description: |
+        The adapter first checks the scenario's stated default and choices
+        against the implementation's own constants, then for each row sets or
+        clears AT_NET_WIRE_MODE, resolves, and records the value and its source.
+
+expected_state:
+  node:
+    knob_constants_match: true
+    all_resolutions_match: true

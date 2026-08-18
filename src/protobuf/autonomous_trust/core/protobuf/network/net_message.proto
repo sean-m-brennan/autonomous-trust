@@ -1,0 +1,78 @@
+/********************
+ *  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+ *
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ *******************/
+
+syntax = "proto3";
+
+package autonomous_trust.core.protobuf.network;
+
+// The protobuf form of the inter-host network envelope (ISSUES.md §2.3).
+//
+// This is the SAME envelope the JSON wire form carries (C
+// `net_message_to_wire`, Python `Message.__bytes__`), field for field. What
+// differs is only the encoding of each field: JSON must inflate every binary
+// value to text (base64 payload, hex keys, hex signature, hyphenated uuid),
+// while this form carries them raw. That inflation is the whole reason this
+// schema exists -- a 1 KB payload rides in ~1.05 KB here against ~1.4 KB of
+// JSON, and the keys/signature alone cost 320 bytes of hex on every signed
+// message.
+//
+// TWO INVARIANTS, both load-bearing:
+//
+//  1. THE SIGNATURE PRE-IMAGE IS NOT THIS MESSAGE. It stays the canonical
+//     string "<process>|<function>|<base64(data)>" (net_message.c,
+//     Message._signable_content) in BOTH wire forms -- base64 of the payload,
+//     even here where the payload itself is raw. A message therefore verifies
+//     identically whichever form it arrived in, and re-encoding one form as
+//     the other cannot invalidate a signature. Signing the packed protobuf
+//     instead would have been the obvious choice and is wrong: protobuf
+//     encoding is not canonical, so two conformant encoders may emit
+//     different bytes for the same message and each would reject the other's
+//     signature.
+//
+//  2. A PACKED NetMessage IS NEVER ON THE WIRE BARE. It is always prefixed
+//     with the one-byte format marker NET_WIRE_PROTO_MAGIC (0xAB), which is
+//     what lets a receiver refuse a frame in a format it does not speak
+//     WITHOUT running the other parser over peer-supplied bytes (a JSON
+//     envelope always begins '{' = 0x7B). The marker doubles as the version
+//     slot: a future incompatible envelope takes 0xAC and is distinguishable
+//     rather than guessed.
+//
+// Format selection is NOT negotiated per peer: it is a property of the group
+// (Group.wire_format), and everything outside a group -- discovery,
+// pre-admission -- is JSON unconditionally. Detecting a peer's format is
+// deliberately not implemented; see ISSUES.md §2.5 for why that is an R&D
+// item and not an omission.
+message NetMessage {
+  string process = 1;       // destination process name
+  string function = 2;      // function/verb selector
+  bytes data = 3;           // payload, RAW (the JSON form base64s this)
+  bool encrypt = 4;         // sender asked for per-peer encryption of `data`
+  string trace_id = 5;      // 32 lowercase hex chars (uuid4 without hyphens)
+
+  // Sender identity. Same five values as the JSON envelope's from_* keys, in
+  // binary: this is how a peer we do not yet know is admitted, so it travels
+  // on the envelope rather than in the payload.
+  bytes from_uuid = 6;      // 16 raw uuid bytes; EMPTY = no sender (JSON "")
+  string from_name = 7;     // Zooko ONLINE nickname; may be empty
+  string from_address = 8;
+  bytes from_sig_key = 9;   // raw 32-byte ed25519 public signing key
+  bytes from_enc_key = 10;  // raw 32-byte curve25519 public box key
+  int32 from_rank = 11;     // sender topology rank; 0 = unknown
+
+  // Detached ed25519 signature over the canonical pre-image above (invariant
+  // 1), raw rather than the JSON form's 128 hex chars. EMPTY = unsigned.
+  bytes signature = 12;
+}

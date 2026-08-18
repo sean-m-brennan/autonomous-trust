@@ -95,7 +95,7 @@ DEFINE_TEST(test_group_proto_roundtrip)
 
     group_t *grp = NULL;
     ck_assert_ret_ok(group_create(&uuid, addr, &grp));
-    /* ISSUES.md §1.4 + §3.1-b: populate the full address_map + a group age so
+    /* doc/architecture/identity-protocol.md: populate the full address_map + a group age so
      * the proto round-trip below pins that both survive (not just the single
      * legacy `address`). */
     ck_assert_ret_ok(group_add_address(grp, "uuid-a", "172.16.0.1"));
@@ -115,7 +115,7 @@ DEFINE_TEST(test_group_proto_roundtrip)
     ck_assert_ret_ok(proto_to_group((uint8_t *)data, data_len, &grp2));
 
     ck_assert_mem_eq(grp2.uuid, uuid, sizeof(uuid_t));
-    /* §1.4: the full address_map round-trips */
+    /* doc/architecture/identity-protocol.md: the full address_map round-trips */
     ck_assert_int_eq((int)map_size(&grp2.address_map), 2);
     data_t *v = NULL;
     string_t s = NULL;
@@ -125,7 +125,7 @@ DEFINE_TEST(test_group_proto_roundtrip)
     ck_assert_ret_ok(map_get(&grp2.address_map, (map_key_t)"uuid-b", &v));
     ck_assert_ret_ok(data_string_ptr(v, &s));
     ck_assert_str_eq(s, "172.16.0.2");
-    /* §3.1-b: the group age round-trips */
+    /* doc/architecture/identity-protocol.md: the group age round-trips */
     ck_assert_double_eq_tol(grp2.created, 1700000000.5, 1e-6);
 
     free(data);
@@ -225,7 +225,7 @@ END_TEST_DEFINITION()
 
 DEFINE_TEST(test_group_created_age_roundtrip)
 {
-    /* ISSUES.md §3.1-b: the group "created" age (merge size-tie tiebreaker,
+    /* The group "created" age (doc/architecture/identity-protocol.md; merge size-tie tiebreaker,
      * older group wins) must survive the canonical JSON round-trip so a peer
      * can compare our group's age against its own. Also pins two invariants:
      *   - group_init leaves created == 0 (its callers include the conformance

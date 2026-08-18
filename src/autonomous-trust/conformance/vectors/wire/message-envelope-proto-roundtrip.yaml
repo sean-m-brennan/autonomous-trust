@@ -1,0 +1,35 @@
+schema_version: "1"
+kind: wire_vector
+protocol: network
+name: message-envelope-proto-roundtrip
+description: |
+    The PROTOBUF envelope (doc/architecture/network-wire-format.md), byte-pinned. Same
+    message as the
+    JSON `message-envelope-roundtrip` case; what is pinned here is that both
+    runtimes emit the SAME protobuf bytes for it, which is not free: protobuf
+    encoding is not canonical, so two conformant encoders may legitimately
+    differ in field order or in whether they emit a default-valued field. This
+    case is what makes "C and Python agree on the proto envelope" a measured
+    fact rather than an assumption.
+
+    Pinned as inline lowercase hex rather than a fixture file, deliberately: a
+    change in the wire shape then shows up in the DIFF OF THIS FILE, where a
+    reviewer sees it, instead of inside an opaque binary blob.
+
+    The leading 0xab is the format marker, outside the protobuf (see
+    net_message.proto): it is what lets a receiver refuse a frame in a format
+    it does not speak without running the other parser over peer-supplied
+    bytes. The payload rides RAW here where the JSON form base64s it.
+byte_pinning: true
+envelope_format: proto
+wire_format: json
+serialize_mode: json
+constructor: Message
+input:
+  process: "identity"
+  function: "request_access"
+  obj: "hello"
+  encrypt: false
+  trace_id: "0123456789abcdef0123456789abcdef"
+expected:
+  proto_wire_hex: "ab0a086964656e74697479120e726571756573745f6163636573731a0568656c6c6f2a203031323334353637383961626364656630313233343536373839616263646566"

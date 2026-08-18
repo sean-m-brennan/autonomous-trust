@@ -27,33 +27,37 @@
 #include "config/configuration.h"
 #include "utilities/util.h"
 
-/* Design note — protobuf wire path for inter-host network messages.
+/* Protobuf wire path for inter-host network messages — IMPLEMENTED (2026-08-18;
+ * doc/architecture/network-wire-format.md). This note used to describe the four
+ * coordinated pieces the work needed; all four shipped together, which was the whole point, since a
+ * one-sided switch silently breaks interop. Where they live now:
  *
- * Inter-host network messages currently ride the JSON wire format in
- * `network/net_message.c::net_message_to_wire`. A protobuf wire path is
- * structurally enabled by `at_serialize_mode_current()` + per-mode
- * dispatch already in `config/configuration.c`; applying the same shape
- * here is straightforward in C but requires four coordinated pieces:
+ *   1. Schema: `network/net_message.proto` (NetMessage). Codegen lands in
+ *      `src/c/build/protobuf/...` via the existing CMake protobuf-c plumbing.
+ *   2. Encoders: `net_message_to_wire_proto` / `net_message_from_wire_proto`,
+ *      siblings of the JSON pair in `network/net_message.c`, with
+ *      `net_message_{to,from}_wire_fmt` dispatching. The signature pre-image is
+ *      SHARED with the JSON path (`wire_signable_content`), so it stays
+ *      byte-identical to Python's `Message._signable_content`: both forms sign
+ *      "<process>|<function>|<base64(data)>" and only the envelope differs.
+ *   3. Dispatch: NOT on `at_serialize_mode_current()`, which is the on-disk
+ *      CONFIG format and an unrelated decision. The envelope format is a
+ *      property of the GROUP (`group_t::wire_format`); `AT_NET_WIRE_MODE`
+ *      (`net_wire_mode_resolve`) only stamps a group this node MINTS, and a
+ *      joiner adopts its group's value at admission. Traffic outside any group
+ *      -- discovery, pre-admission -- is JSON unconditionally, so a proto cohort
+ *      stays joinable by any node.
+ *   4. Python: `Message.to_wire` / `Message.parse(wire_format=...)` and
+ *      `Group.wire_format`, with the conformance corpus carrying byte-pinned
+ *      proto vectors and the mixed-format refusal.
  *
- *   1. A `network/net_message.proto` schema for `net_wire_msg_t`
- *      (process, function, data bytes, encrypt, trace_id, from_whom,
- *      to_whom, signature). Codegen lands in `src/c/build/...` via the
- *      existing CMake protobuf-c plumbing.
- *   2. `net_message_to_wire_proto` / `net_message_from_wire_proto`
- *      siblings of the JSON path. Signature canonicalization (the
- *      "<process>|<function>|<base64(data)>" pre-image in
- *      net_message.c:98-119) MUST stay byte-identical to Python; the
- *      proto path signs the same canonical string, only the envelope
- *      changes.
- *   3. Dispatch by `at_serialize_mode_current()` at the top of
- *      `net_message_to_wire` (read side branches on a one-byte magic
- *      prefix to support mixed-mode peers during migration).
- *   4. The Python side adds the matching `to_wire_proto` /
- *      `from_wire_proto` paths in `core/_python/network/net_message.py`
- *      and the conformance corpus gains a `--wire-mode=proto` variant.
- *
- * Until items 1 and 4 ship together, JSON remains the only safe wire
- * format — a one-sided switch would silently break interop. */
+ * The read side does NOT sniff. A receiver is told which format to expect (the
+ * group the frame arrived on, else JSON) and refuses a frame whose one-byte
+ * marker disagrees, with `ENET_WIRE_FORMAT`, before the other parser sees
+ * peer-supplied bytes. Detecting a peer's format is a separate R&D item with
+ * unresolved security questions -- gateway-only detection, opt-in receipt of
+ * foreign formats, reply-in-kind and per-process scoping -- recorded as
+ * doc/architecture/network-wire-format.md. Do not add sniffing here without settling those. */
 
 
 /* Frama-C: skipped — [inet] inet_pton with network byte order */

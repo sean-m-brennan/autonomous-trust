@@ -104,7 +104,8 @@ bool x509_verify_data_signature(const uint8_t *cert_der, size_t cert_len,
 /**
  * @brief Whether the certificate carries @p uri as a URI Subject Alternative Name.
  *
- * The CA-asserted half of the credential->identity binding (ISSUES §1.5): where AT
+ * The CA-asserted half of the credential->identity binding
+ * (doc/architecture/zta-integration.md): where AT
  * controls issuance it can have the issuer name the node in the certificate itself
  * (`at://<uuid>`, SPIFFE/IDevID style), and then the presenter has nothing to
  * assert and carries no binding blob. Unavailable, by construction, wherever AT
@@ -147,7 +148,7 @@ DECLARE_ERROR(EX509_VERIFY, "X.509 certificate verification failed");
  * private key) rather than being merely unreadable -- a configuration mix-up,
  * distinguished so it is not diagnosed as a missing/corrupt bundle. The Python
  * mirror names it in the reject reason; see doc/architecture/zta-python-parity.md
- * §2.1. */
+ *. */
 /* NB: no commas in the description -- preprocess.py splits DECLARE_ERROR args on
  * commas when building the error table. */
 #define EX509_CAKIND  293

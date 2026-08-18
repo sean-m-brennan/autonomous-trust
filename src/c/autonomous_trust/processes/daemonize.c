@@ -93,7 +93,8 @@ int daemonize(char *data_dir, int flags, int *fd1, int *fd2)
          * `kill(pid, 0) == 0`, so any liveness check that happens to be pointed
          * at one silently reports it alive forever.
          *
-         * That is NOT what caused ISSUES §2.1.3 — the pids this daemon monitors
+         * That is NOT what caused doc/architecture/process-architecture.md — the pids this
+         * daemon monitors
          * are the grandchildren returned through the pipe, never these
          * intermediates, so the shutdown sweep was reading real processes. Fixed
          * here because it is a genuine leak found while investigating, not

@@ -30,7 +30,7 @@ class SybilAttack(AttackScenario):
     is counted as a Sybil that slipped past the gate. Sybil UUIDs are
     generated inside the attacker containers at runtime and are therefore
     not known to this scenario, so precise name matching is infeasible; the
-    count bound is the observable invariant (cf. ISSUES.md §8.1).
+    count bound is the observable invariant (cf. doc/architecture/adversarial-testing.md).
     """
 
     name = "sybil_attack"

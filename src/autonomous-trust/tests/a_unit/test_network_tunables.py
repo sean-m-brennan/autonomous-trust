@@ -20,8 +20,8 @@ The Python mirror of the tunables half of ``src/c/test/net_port_test.c``. Both
 sides also run the same table through the conformance corpus
 (``scenarios/network/tunables-resolution.yaml``); these tests cover what a
 corpus case cannot -- that the resolved value reaches the code that uses it,
-which is the difference between a tunable and a decorative one (ISSUES.md
-2.4.4).
+which is the difference between a tunable and a decorative one
+(doc/architecture/networking.md).
 """
 
 import os

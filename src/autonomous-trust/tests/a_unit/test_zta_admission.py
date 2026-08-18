@@ -60,8 +60,9 @@ class _GateProc:
     _mark_operator_bound = staticmethod(IdentityProcess._mark_operator_bound)
     _zta_admit = IdentityProcess._zta_admit
     _zta_credential_replayed = IdentityProcess._zta_credential_replayed
-    # Multi-credential admission (ISSUES §1.5): the credential list, the per-anchor
-    # chain walk, and the anchor-verifier seam _zta_admit now goes through.
+    # Multi-credential admission (doc/architecture/zta-integration.md): the credential
+    # list, the per-anchor chain walk, and the anchor-verifier seam _zta_admit now goes
+    # through.
     _zta_credentials = IdentityProcess._zta_credentials
     _zta_match_anchors = IdentityProcess._zta_match_anchors
     _zta_anchor_verifiers = IdentityProcess._zta_anchor_verifiers
@@ -163,7 +164,8 @@ class TestZtaAdmissionRevocation:
 
 @requires_ca
 class TestZtaCredentialReplay:
-    """ISSUES §1.5: a chain-valid credential harvested from one peer's announce
+    """Credential-to-identity binding (doc/architecture/zta-integration.md):
+    a chain-valid credential harvested from one peer's announce
     and re-presented under a DIFFERENT identity must be rejected as a replay.
     Uniqueness is enforced against credentials already bound to known peers (the
     roster, built from announces propagated across the mesh) and our own

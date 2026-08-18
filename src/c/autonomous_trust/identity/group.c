@@ -260,15 +260,24 @@ int group_to_json(const void *data_struct, json_t **obj_ptr)
     free(hex);
     json_object_set_new(obj, "encryptor", encr);
 
-    /* Group age (§3.1-b) for the merge size-tie tiebreaker. Mirrors Python
+    /* Group age for the merge size-tie tiebreaker. Mirrors Python
      * to_canonical's "created". Omitted-on-read defaults to 0 (unknown → uuid
      * tiebreak), so a peer that doesn't send it stays compatible. */
     json_object_set_new(obj, "created", json_real(ident->created));
-    /* Key rotation epoch (ISSUES.md 10.2). Additive and defaulted on read, so
-     * a peer predating rotation sends nothing and reads as epoch 0 — which is
-     * exactly "never rotated" and needs no special case. Mirrors Python
+    /* Key rotation epoch (doc/architecture/gateway-reputation-tree.md). Additive and
+     * defaulted on read, so a peer predating rotation sends nothing and reads as epoch
+     * 0 — which is exactly "never rotated" and needs no special case. Mirrors Python
      * to_canonical's "key_epoch". */
     json_object_set_new(obj, "key_epoch", json_integer(ident->key_epoch));
+    /* Envelope encoding for this group's traffic
+     * (doc/architecture/network-wire-format.md), as the same
+     * lowercase name Python's to_canonical writes. This is the field a joining
+     * node ADOPTS -- it arrives with the group key, in the same message, from
+     * the member that admitted us, which is what keeps a cohort from ending up
+     * half in one format. Omitted-on-read defaults to json, so a peer that
+     * predates it stays compatible. */
+    json_object_set_new(obj, "wire_format",
+                        json_string(net_wire_format_name(ident->wire_format)));
 
     return 0;
 }
@@ -331,13 +340,18 @@ int group_from_json(const json_t *obj, void *data_struct)
     if (rc != 0)
         return -1;
 
-    /* Group age (§3.1-b): absent defaults to 0 (unknown → uuid tiebreak). */
+    /* Group age (doc/architecture/identity-protocol.md): absent defaults to 0 (unknown → uuid tiebreak). */
     json_t *created_obj = json_object_get(obj, "created");
     group->created = (created_obj != NULL && json_is_number(created_obj))
                      ? json_number_value(created_obj) : 0.0;
     json_t *epoch_obj = json_object_get(obj, "key_epoch");
     group->key_epoch = (epoch_obj != NULL && json_is_integer(epoch_obj))
                        ? json_integer_value(epoch_obj) : 0;
+    /* Absent -> json, and an unrecognized name -> json too (see
+     * net_wire_format_from_name): a typo in provisioned data must tighten to
+     * the format every node can read rather than fail the load. */
+    const char *wf = json_string_value(json_object_get(obj, "wire_format"));
+    group->wire_format = net_wire_format_from_name(wf);
     return 0;
 }
 
@@ -348,9 +362,15 @@ int group_sync_out(group_t *group, AutonomousTrust__Core__Protobuf__Identity__Gr
     proto->uuid.data = group->uuid;
     proto->uuid.len = sizeof(uuid_t);
     proto->address = group->address;
-    proto->created = group->created;  /* §3.1-b group age */
+    proto->created = group->created;  /* doc/architecture/identity-protocol.md group age */
+    /* Envelope format (2.3). NET_WIRE_JSON is the proto3 default, so a JSON
+     * group still encodes to exactly the bytes it did before this field
+     * existed -- which is what keeps every byte-pinned group vector valid. */
+    proto->wire_format = (group->wire_format == NET_WIRE_PROTO)
+        ? AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__NET_WIRE_FORMAT__NET_WIRE_PROTO
+        : AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__NET_WIRE_FORMAT__NET_WIRE_JSON;
 
-    /* Full address_map (§1.4) as a proto3 map (repeated key/value entries).
+    /* Full address_map (doc/architecture/identity-protocol.md) as a proto3 map (repeated key/value entries).
      * Keys/values are SHARED with group->address_map: group_to_proto packs
      * immediately, and group_proto_free releases only the entry structs + the
      * array, never the shared strings (which the map still owns). */
@@ -399,9 +419,14 @@ int group_sync_in(AutonomousTrust__Core__Protobuf__Identity__Group *proto, group
     memcpy(group->uuid, proto->uuid.data, sizeof(uuid_t));
     strncpy(group->address, proto->address, ADDR_LEN);
     group->address[ADDR_LEN] = '\0';  /* strncpy does not terminate when src is >= ADDR_LEN */
-    group->created = proto->created;  /* §3.1-b group age */
+    group->created = proto->created;  /* doc/architecture/identity-protocol.md group age */
+    /* Absent/0 reads as json, which is what a group from a peer predating this
+     * field is (2.3). */
+    group->wire_format =
+        (proto->wire_format == AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__NET_WIRE_FORMAT__NET_WIRE_PROTO)
+        ? NET_WIRE_PROTO : NET_WIRE_JSON;
 
-    /* Rebuild the full address_map (§1.4). proto_to_group deserializes into a
+    /* Rebuild the full address_map (doc/architecture/identity-protocol.md). proto_to_group deserializes into a
      * fresh (zeroed) group, so initialise the map before populating it. */
     map_init(&group->address_map);
     for (size_t i = 0; i < proto->n_address_map; i++)

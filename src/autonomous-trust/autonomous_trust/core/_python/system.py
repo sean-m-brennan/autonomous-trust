@@ -107,7 +107,7 @@ def resolve_comm_port(cfg_port: int = 0, logger: logging.Logger = None) -> tuple
 # NET_ANNOY_LIMIT / NET_RECV_POLL_MS / NET_MYSTERY_MAX_AGE_SEC and their bounds
 # (network/network.h). These used to be plain class attributes on
 # NetworkProcess with no C counterpart at all, so a deployment could tune one
-# runtime and not the other (ISSUES.md 2.4.4).
+# runtime and not the other (doc/architecture/networking.md).
 default_annoy_limit = 5
 annoy_limit_min = 1
 annoy_limit_max = 10000
@@ -175,6 +175,50 @@ def resolve_mystery_max_age_s(logger: logging.Logger = None) -> tuple[int, str]:
                            mystery_max_age_s_min, mystery_max_age_s_max, logger)
 
 
+def resolve_env_choice(name: str, default: str, choices: tuple,
+                       logger: logging.Logger = None) -> tuple[str, str]:
+    """Resolve a network tunable whose values are NAMES rather than numbers.
+
+    Same two layers and same refusal discipline as :func:`resolve_env_int` (and
+    C's ``net_knob_str_resolve``): a value outside ``choices`` is refused with a
+    warning and the default kept. Comparison is case-insensitive and
+    whitespace-trimmed, because an operator writing ``AT_NET_WIRE_MODE=Proto``
+    means proto and a silent fall back to JSON there would look like the
+    envelope work simply not happening.
+    """
+    raw = os.environ.get(name)
+    if raw:
+        val = raw.strip().lower()
+        if val in choices:
+            return val, KnobSource.env
+        if logger is not None:
+            logger.warning('refusing %s=%r (want one of %s); using default %r',
+                           name, raw, '|'.join(choices), default)
+    return default, KnobSource.default
+
+
+#: Default envelope encoding for a group this node MINTS (doc/architecture/network-wire-format.md).
+#: JSON, because a group's format is what its members must all speak and JSON
+#: is the format every AT node can read; a deployment opts a new cohort into
+#: proto with AT_NET_WIRE_MODE=proto. Mirrors C's NET_WIRE_MODE_DEFAULT.
+default_net_wire_mode = 'json'
+net_wire_modes = ('json', 'proto')
+
+
+def resolve_net_wire_mode(logger: logging.Logger = None) -> tuple[str, str]:
+    """Envelope encoding for a group this node mints, with its source.
+
+    This knob does NOT decide what goes on the wire for an existing group --
+    that comes from the group itself (``Group.wire_format``), which is what
+    keeps a cohort consistent and is why there is no per-message override. It
+    decides only what a *new* group is stamped with, so an operator standing up
+    a proto cohort sets it on the node that forms the group and every joiner
+    adopts it at admission. Mirrors C's ``net_wire_mode_resolve``.
+    """
+    return resolve_env_choice('AT_NET_WIRE_MODE', default_net_wire_mode,
+                              net_wire_modes, logger)
+
+
 # Module-level defaults layer. A lot imports these names, so they stay -- but
 # they are the resolved-at-import view (config is not visible here), not the
 # truth for a node that carries a configured port. Use resolve_comm_port() when
@@ -190,7 +234,7 @@ preferred_proto_ver = 4
 # whenever a loop iteration exceeds the cadence), pegging a core per node —
 # pathological when the whole cohort is co-located on one host. 5ms trades
 # sub-millisecond network latency (irrelevant for this demo) for far lower
-# idle CPU. See ISSUES.md (net CPU / connection churn).
+# idle CPU. See doc/architecture/network-connection-pooling.md.
 net_cadence = 0.005
 encoding = 'utf-8'
 cadence = 0.5
@@ -224,7 +268,7 @@ def _env_num(name: str, default, cast):
 # tracks the message rate; with it, one connection per (peer, channel) carries
 # many messages and steady-state handshakes drop to ~1/peer/idle-period. That
 # per-message handshake was the remaining half of the connection-churn cost in
-# ISSUES.md §3.6.
+# See doc/architecture/network-connection-pooling.md.
 #
 # ON by default since 2026-08-10; set AT_NET_POOL=0 to go back to per-message
 # connections. Framing is unchanged either way, and reuse is guarded on both

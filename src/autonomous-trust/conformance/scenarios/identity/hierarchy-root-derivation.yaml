@@ -4,7 +4,8 @@ protocol: identity
 name: hierarchy-root-derivation
 byte_pinning: false
 description: |
-    Runtime hierarchy roots — identity protocol step 7 (ISSUES.md §10.2).
+    Runtime hierarchy roots — identity protocol step 7
+    (doc/architecture/gateway-reputation-tree.md).
 
     The gateway hierarchy used to exist only in seeded config: `parent_gateway`
     was initialized and never assigned. It is now DERIVED at runtime, and this

@@ -24,10 +24,10 @@
 /**
  * @file
  * @brief The ZTA credential binding: which node a credential authorizes, and the
- *        proof (ISSUES §1.5). C twin of Python `identity/zta_binding.py`.
+ *        proof (doc/architecture/zta-integration.md). C twin of Python `identity/zta_binding.py`.
  *
  * A chain-valid certificate says nothing about *who may present it*. That is the
- * whole of §1.5: a credential lifted from another peer's clear-text `announce`
+ * whole of: a credential lifted from another peer's clear-text `announce`
  * chains to the agency CA exactly as well under a different uuid, so the admission
  * gate had no way to tell holder from thief and fell back on first-use-wins. TOFU
  * is not a weakness of ZTA; it is what is left when the credential->identity
@@ -50,7 +50,7 @@
  * the holder signature covers the uuid AND the node's signing key, while a SAN
  * names only the uuid, so a SAN match leans on the existing Sybil uuid/key-collision
  * checks to stop a peer announcing a victim's uuid under its own key. All three
- * close the §1.5 threat, which is a credential moving to a *different* identity.
+ * close the doc/architecture/zta-integration.md threat, which is a credential moving to a *different* identity.
  *
  * **Durable, not a live challenge-response.** No nonce, deliberately, and for the
  * same reason operator attestation is consumer-pull: a binding must verify offline

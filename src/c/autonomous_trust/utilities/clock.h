@@ -184,7 +184,7 @@ at_cohort_view_t at_clock_cohort_offset(const at_clock_sample_t *samples,
 /**
  * Resolve the skew bound: env, then compile-time default.
  *
- * Same two layers, bounds and refusal rules as the network tunables (§2.4.4) —
+ * Same two layers, bounds and refusal rules as the network tunables (doc/architecture/networking.md) —
  * a bad value is refused with a warning and the default kept. Implemented here
  * rather than via `net_knob_resolve` because that machinery is private to the
  * network module, and utilities must not depend upward on it.

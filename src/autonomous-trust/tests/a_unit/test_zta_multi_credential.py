@@ -13,13 +13,13 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-"""Multi-anchor admission and binding enforcement (ISSUES §1.5).
+"""Multi-anchor admission and binding enforcement (doc/architecture/zta-integration.md).
 
 Two things are under test and they are easy to conflate:
 
 * **Binding enforcement.** `binding_mode` decides whether a credential with no
   proof of entitlement may be used at all. `require` is the default because the
-  alternative is first-use-wins, which is what §1.5 is about.
+  alternative is first-use-wins, which is what is about.
 * **Derived gateway authority.** Several credentials arise only at a network
   gateway bridging agencies. Nothing on the wire declares gatewayhood -- it emerges
   from group membership -- so a rule of the form "a gateway must present N
@@ -54,17 +54,17 @@ while _ROOT != '/':
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from tools.provision_zta_certs import (  # noqa: E402
+from tools.provision_zta_certs import (# noqa: E402
     make_ca, make_leaf_keypair, ca_bundle_pem, cert_der)
 
-from autonomous_trust.core._python.identity.identity import (  # noqa: E402
+from autonomous_trust.core._python.identity.identity import (# noqa: E402
     Identity, _HAS_ZTA_CREDENTIALS)
 from autonomous_trust.core._python.identity.sign import Signature  # noqa: E402
 from autonomous_trust.core._python.identity.encrypt import Encryptor  # noqa: E402
 from autonomous_trust.core._python.identity.idprocess import IdentityProcess  # noqa: E402
-from autonomous_trust.core._python.identity.zta_binding import (  # noqa: E402
+from autonomous_trust.core._python.identity.zta_binding import (# noqa: E402
     ZTA_BINDING_MAX, ZTA_SAN_URI_TEMPLATE, zta_binding_preimage)
-from autonomous_trust.core.identity.zta import (  # noqa: E402
+from autonomous_trust.core.identity.zta import (# noqa: E402
     ZtaPolicy, BINDING_MODE_OFF, BINDING_MODE_PREFER, BINDING_MODE_REQUIRE)
 
 

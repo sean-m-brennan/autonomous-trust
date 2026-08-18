@@ -23,12 +23,12 @@ from ..conftest import QuickTrust, Configuration
 
 def run_nominal(mp=True, debug=False, runtime=None, base_port=None):
     # Each nominal run gets its own base port. Both run on the same address
-    # (setup_local_net_teardown -> 127.0.0.1) back to back, and the previous
-    # run's PingAT socket (base+2) can still be held when the next one binds
-    # -- AT refuses that bind by design (no SO_REUSEADDR on unicast recv
-    # sockets, ISSUES §2.4.2), so sharing a base port makes the pair depend on
-    # shutdown timing. Distinct ports is the framework's own advice for
-    # co-located nodes.
+    # (setup_local_net_teardown -> 127.0.0.1) back to back, and the previous run's
+    # PingAT socket (base+2) can still be held when the next one binds -- AT refuses
+    # that bind by design (no SO_REUSEADDR on unicast recv sockets,
+    # doc/architecture/networking.md), so sharing a base port makes the pair depend on
+    # shutdown timing. Distinct ports is the framework's own advice for co-located
+    # nodes.
     if base_port is not None:
         os.environ['AT_COMM_PORT'] = str(base_port)
     at = QuickTrust(runtime=runtime, multiproc=mp, logfile=Configuration.log_stdout)

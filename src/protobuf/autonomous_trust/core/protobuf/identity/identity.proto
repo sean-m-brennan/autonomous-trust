@@ -112,6 +112,19 @@ message Identity {
   repeated ZtaCredential zta_credentials = 16;
 }
 
+// Which envelope encoding a group's members speak (ISSUES.md §2.3). Mirrors
+// Python's NetWireFormat and C's net_wire_format_t; the JSON group wire form
+// carries the same choice as the lowercase strings "json" / "proto".
+//
+// NET_WIRE_JSON is 0 SO THAT IT IS FREE: proto3 omits default-valued fields, so
+// a JSON group encodes to exactly the bytes it did before this field existed
+// and every byte-pinned group vector stays valid. It is also the right default
+// on read -- a group from a peer that predates this field is a JSON group.
+enum NetWireFormat {
+  NET_WIRE_JSON = 0;
+  NET_WIRE_PROTO = 1;
+}
+
 message Group {
   bytes uuid = 1;
   string address = 2;  // Legacy single address (first of address_map); kept so
@@ -125,4 +138,9 @@ message Group {
   // Group age for the merge size-tie tiebreaker (§3.1-b): epoch seconds, or 0
   // when unknown. Mirrors the canonical JSON `created`.
   double created = 5;
+  // The envelope encoding this group's members speak (§2.3). Group-carried
+  // rather than per-node so a cohort cannot end up half in one format: a
+  // joiner adopts this at admission, and AT_NET_WIRE_MODE only stamps a group
+  // its node MINTS. Absent/0 = json.
+  NetWireFormat wire_format = 6;
 }
