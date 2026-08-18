@@ -75,6 +75,14 @@ def _env_float(name, default):
 # AT_REP_PERSIST_THRESHOLD.
 REPUTATION_PERSIST_THRESHOLD = _env_float('AT_REP_PERSIST_THRESHOLD', 0.5)
 
+# Upper bound on how many subjects one `consensus_rep_batch_req` may name. The
+# batch verb exists so an observer-by-subject sweep costs N messages instead of
+# N**2, but each named subject costs a chain walk on the responder, so an
+# unbounded list would let one small message ask for arbitrary work. 256 is far
+# above any cohort this runs on and far below anything that hurts. Mirrored in C
+# as AT_MAX_REP_BATCH_SUBJECTS.
+MAX_REP_BATCH_SUBJECTS = 256
+
 
 @dataclass
 class TxCount(object):
@@ -297,6 +305,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(
             ReputationProtocol.consensus_rep_req,
             self.handle_consensus_reputation_request)
+        self.protocol.register_handler(
+            ReputationProtocol.consensus_rep_batch_req,
+            self.handle_consensus_reputation_batch_request)
         self.protocol.register_handler(
             ReputationProtocol.slash_propose, self.handle_slash_propose)
         self.protocol.register_handler(
@@ -3700,6 +3711,84 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             _probes.counter('rep.consensus', 'exception', type(e).__name__)
             self.logger.warning(
                 '_compute_consensus_reputation failed: %s', e)
+
+    def _compute_consensus_reputation_batch(self, peer_uuids, req_proc, requestor):
+        """Answer one batched consensus request with a single deduplicated roster.
+
+        Equivalent to running _compute_consensus_reputation once per named
+        subject and concatenating, minus the duplication: a gateway's
+        _subtree_roster carries its child-group members alongside the requested
+        subject, and those entries do not depend on which subject was asked, so
+        naming N subjects would otherwise repeat them N times.
+
+        Our own uuid is skipped. The caller is sweeping observer-by-subject and
+        has no use for a self-pair, and skipping it here is what lets one request
+        body (hence one signature) serve every observer in a round.
+        """
+        _probes.counter('rep.consensus_batch', 'enter')
+        try:
+            roster = []
+            seen = set()
+            my_uuid = str(self.identity.uuid)
+            for peer_uuid in peer_uuids:
+                if str(peer_uuid) == my_uuid:
+                    continue
+                for rep in self._subtree_roster(peer_uuid):
+                    key = str(rep.peer_id)
+                    if key in seen or key == my_uuid:
+                        continue
+                    seen.add(key)
+                    roster.append(rep)
+            if not roster:
+                _probes.counter('rep.consensus_batch', 'empty')
+                return
+            self.requested_reps.append((roster, req_proc, requestor))
+            _probes.counter('rep.consensus_batch', 'queued', str(len(roster)))
+        except Exception as e:
+            _probes.counter('rep.consensus_batch', 'exception', type(e).__name__)
+            self.logger.warning(
+                '_compute_consensus_reputation_batch failed: %s', e)
+
+    def handle_consensus_reputation_batch_request(self, _, message):
+        if message.function != ReputationProtocol.consensus_rep_batch_req:
+            return False
+        if isinstance(message.obj, str):
+            parsed = from_json_string(message.obj)
+        else:
+            parsed = message.obj
+        if isinstance(parsed, dict):
+            uuids = parsed.get('peer_uuids')
+            req_proc = parsed.get('requesting_process')
+        elif isinstance(parsed, (list, tuple)) and len(parsed) >= 2:
+            uuids, req_proc = parsed[0], parsed[1]
+        else:
+            self.logger.error(
+                'handle_consensus_reputation_batch_request: unsupported '
+                'payload shape %r', type(parsed).__name__)
+            return True
+        if not isinstance(uuids, (list, tuple)):
+            self.logger.error(
+                'handle_consensus_reputation_batch_request: peer_uuids must be '
+                'a list, got %r', type(uuids).__name__)
+            return True
+        if len(uuids) > MAX_REP_BATCH_SUBJECTS:
+            # Each named subject costs a chain walk, so an unbounded list turns
+            # one cheap message into arbitrary work for the responder. Truncated
+            # rather than refused: a legitimate oversized cohort still gets a
+            # partial answer, and the count is logged so the cause is visible
+            # instead of appearing as a silently incomplete graph.
+            self.logger.warning(
+                'consensus reputation batch from %s named %d subjects; '
+                'answering the first %d only (MAX_REP_BATCH_SUBJECTS bounds the '
+                'work one message may ask for)',
+                getattr(message.from_whom, 'nickname', '?'), len(uuids),
+                MAX_REP_BATCH_SUBJECTS)
+            _probes.counter('rep.consensus_batch', 'truncated')
+            uuids = list(uuids)[:MAX_REP_BATCH_SUBJECTS]
+        requestor = message.from_whom
+        self._spawn(self._compute_consensus_reputation_batch,
+                    args=(uuids, req_proc, requestor))
+        return True
 
     def handle_consensus_reputation_request(self, _, message):
         if message.function != ReputationProtocol.consensus_rep_req:

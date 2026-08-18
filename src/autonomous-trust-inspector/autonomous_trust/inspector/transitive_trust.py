@@ -47,50 +47,83 @@ class TransitiveTrustMixin:
     def query_peer_pairs(self, queues, *, logger=None):
         """Send one peer-pair reputation-query round.
 
-        For every ordered (observer, subject) pair of distinct peers, send a
-        ``consensus_rep_req`` addressed to the *observer* (so it is routed over
-        the network and the observer computes its own view of the subject).
-        ``from_whom`` MUST be our identity so the observer's
+        Asks every observer peer for its view of every *other* peer, as one
+        batched ``consensus_rep_batch_req`` per observer addressed to that
+        observer (so it is routed over the network and the observer computes the
+        scores itself). ``from_whom`` MUST be our identity so the observer's
         ``forward_reputation`` can route the ``rep_resp`` back to us.
 
-        We use ``consensus_rep_req`` (the deterministic, chain-derived
-        third-party view) rather than ``rep_req`` (contrite-tit-for-tat).
-        CTFT is *bilateral*: an observer with no direct shared-task history
-        with a subject reports ``PREREP_NEUTRAL`` (0.0), which the
-        trust-network graph treats as "no relationship" (``EDGE_TRUST_EPS``)
-        and draws no edge — so in a cohort whose committed transactions
-        concentrate on a few hubs, almost every pair reads 0.0 and the graph
-        stays edgeless even while per-peer consensus is healthy. The
-        consensus view has data for any peer the cohort has transacted with,
-        so it is the correct "who does the cohort trust whom" signal for the
-        graph (and matches the per-peer Trust-Dynamics timeline, which is
-        already consensus-sourced). For a leaf observer ``_subtree_roster``
-        returns exactly ``Reputation(subject, consensus)``, so the per-pair
-        query shape and ``rep_resp`` capture into
-        ``latest_reputation_pairs`` are unchanged.
+        **One request per observer, not one per pair.** The per-subject verb
+        made a round cost N(N-1) messages -- 6320 requests plus 6320 responses at
+        N=80, each triggering its own chain walk and its own signed reply -- while
+        the answers were always a roster the response side already knew how to
+        read. The batched verb names every subject in one body, so a round is N
+        requests and N responses. Coverage, the scores themselves, and the
+        ``latest_reputation_pairs[(observer, subject)]`` capture in ``automate.py``
+        are all unchanged; only the number of messages differs.
 
-        Returns the number of queries actually enqueued.
+        The body names subjects by **uuid**, not as full Identity objects: the
+        responder only ever reads ``peer.uuid`` off it, and sending N identities
+        to N observers would trade N-squared messages for N-squared bytes. That
+        also makes the body identical for every observer in a round, which is why
+        the first message is signed and the rest are readdressed copies of it
+        (see ``Message.for_recipient``) -- one Ed25519 operation per round rather
+        than one per recipient. Each observer skips its own uuid responder-side,
+        so no self-pairs appear.
+
+        We use the consensus view (deterministic, chain-derived, third-party)
+        rather than ``rep_req``'s contrite-tit-for-tat. CTFT is *bilateral*: an
+        observer with no direct shared-task history with a subject reports
+        ``PREREP_NEUTRAL`` (0.0), which the trust-network graph treats as "no
+        relationship" (``EDGE_TRUST_EPS``) and draws no edge -- so in a cohort
+        whose committed transactions concentrate on a few hubs, almost every pair
+        reads 0.0 and the graph stays edgeless even while per-peer consensus is
+        healthy. The consensus view has data for any peer the cohort has
+        transacted with, so it is the correct "who does the cohort trust whom"
+        signal for the graph (and matches the per-peer Trust-Dynamics timeline,
+        which is already consensus-sourced).
+
+        Returns the number of REQUESTS enqueued -- one per observer, so at most
+        ``len(peers)``. This counted pair-queries before the batch verb; a caller
+        comparing it against N(N-1) is reading the old contract.
         """
         peers = list(self.peers.all)
+        if len(peers) < 2:
+            # A single peer has no other subject to be asked about, and a lone
+            # observer asked about only itself would answer with an empty roster.
+            return 0
+        try:
+            body = to_json_string({
+                'peer_uuids': [str(peer.uuid) for peer in peers],
+                'requesting_process': self.proc_name,
+            })
+        except Exception:
+            # Nothing partial to salvage: the body is shared by every request in
+            # the round, so a failure here is the whole round.
+            if logger is not None:
+                logger.exception('peer-pair query body could not be built')
+            return 0
+        signed = None
         sent = 0
         for observer in peers:
-            for subject in peers:
-                if str(observer.uuid) == str(subject.uuid):
-                    continue
-                try:
+            try:
+                if signed is None:
+                    # First message carries the signing cost; the rest reuse it.
                     query = Message(
                         CfgIds.reputation,
-                        ReputationProtocol.consensus_rep_req,
-                        to_json_string((subject, self.proc_name)),
+                        ReputationProtocol.consensus_rep_batch_req,
+                        body,
                         observer,               # routed over the network
                         from_whom=self.identity,
                     )
-                    queues[CfgIds.network].put(
-                        query, block=True, timeout=queue_cadence)
-                    sent += 1
-                except Exception:
-                    if logger is not None:
-                        logger.exception(
-                            "peer-pair consensus_rep_req %r->%r failed",
-                            observer, subject)
+                    signed = query
+                else:
+                    query = signed.for_recipient(observer)
+                queues[CfgIds.network].put(
+                    query, block=True, timeout=queue_cadence)
+                sent += 1
+            except Exception:
+                if logger is not None:
+                    logger.exception(
+                        "peer-pair consensus_rep_batch_req to %r failed", observer)
         return sent

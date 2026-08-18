@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import copy as _copy
 import json
 import logging
 import uuid as _uuid
@@ -123,7 +124,8 @@ class Message(object):
                  trace_id=None):
         # Deferred import to break circular dependency:
         # network.__init__ -> message -> identity -> idprocess -> network
-        from ..identity import Identity, Group
+        # (Group is needed only by _normalize_to_whom, which imports its own.)
+        from ..identity import Identity
 
         # Always-on field (Stage 2 of debug-tooling subproject). Caller
         # may supply trace_id to preserve identity across a parse hop;
@@ -140,19 +142,7 @@ class Message(object):
         self.encrypt = encrypt
         self.function = function
         self.obj = obj
-        self.to_whom = to_whom
-        if to_whom != Network.broadcast:
-            if to_whom is None:
-                self.to_whom = []
-            elif isinstance(to_whom, Identity):
-                self.to_whom = [to_whom]
-            elif isinstance(to_whom, Group):
-                pass
-            elif hasattr(to_whom, '__iter__'):
-                if len(to_whom) > 0 and not isinstance(to_whom[0], Identity):
-                    raise RuntimeError('Invalid to_whom arg. Must be a list of Identity, but got %s' % type(to_whom[0]))
-            else:
-                raise RuntimeError('Invalid to_whom arg. Must be an Identity, but got %s' % type(to_whom))
+        self.to_whom = self._normalize_to_whom(to_whom)
         self.from_whom = from_whom
         self.return_to = return_to
         if isinstance(obj, str):
@@ -229,6 +219,67 @@ class Message(object):
         request_access but rejected every non-empty C-signed message as
         "forged or corrupt"."""
         return '|'.join([process, function, data_b64])
+
+    @staticmethod
+    def _normalize_to_whom(to_whom):
+        """The addressing rule, shared by ``__init__`` and ``for_recipient``.
+
+        Four accepted shapes, each with its own handling: the broadcast sentinel
+        and a Group pass through as-is, a bare Identity is wrapped in a list, and
+        None means "unaddressed" (IPC-local). Anything else is a programming
+        error worth raising on rather than putting on the wire.
+        """
+        # Deferred import to break the circular dependency documented in
+        # __init__ (network -> message -> identity -> idprocess -> network).
+        from ..identity import Identity, Group
+        if to_whom == Network.broadcast:
+            return to_whom
+        if to_whom is None:
+            return []
+        if isinstance(to_whom, Identity):
+            return [to_whom]
+        if isinstance(to_whom, Group):
+            return to_whom
+        if hasattr(to_whom, '__iter__'):
+            if len(to_whom) > 0 and not isinstance(to_whom[0], Identity):
+                raise RuntimeError('Invalid to_whom arg. Must be a list of Identity, but got %s'
+                                   % type(to_whom[0]))
+            return to_whom
+        raise RuntimeError('Invalid to_whom arg. Must be an Identity, but got %s' % type(to_whom))
+
+    def for_recipient(self, to_whom):
+        """This message readdressed to *to_whom*, reusing the signature.
+
+        For fan-out of identical content to many peers. The signature pre-image
+        is ``<process>|<function>|<base64(data)>`` (see ``_signable_content``) --
+        the recipient is deliberately NOT part of it, so a copy addressed
+        elsewhere carries a signature that is already valid and re-signing would
+        only reproduce the same bytes. One Ed25519 operation per round therefore
+        replaces one per recipient.
+
+        This does not weaken anything: the recipient was never bound into the
+        signature, so a holder of any signed message could already present it to
+        a different peer. That property is a protocol question recorded in
+        ``R+D.md``, not something this method introduces -- and if a future
+        pre-image does bind the recipient, this method must re-sign instead of
+        copying, which is why it lives here rather than being open-coded by
+        callers.
+
+        A fresh ``trace_id`` is minted per copy and its own probe emitted, so
+        each readdressed message remains individually traceable; sharing one
+        trace id across a fan-out would make the copies indistinguishable in a
+        trace exactly where the interesting question is which recipient got what.
+        """
+        clone = _copy.copy(self)
+        clone.trace_id = _uuid.uuid4().hex
+        # Route through __init__'s normalization rather than reimplementing it:
+        # to_whom may be an Identity, a Group, a list, or the broadcast sentinel,
+        # and each shape has its own rule.
+        clone.to_whom = Message._normalize_to_whom(to_whom)
+        _probes.emit('msg', 'readdress', trace_id=clone.trace_id,
+                     process=clone.process, function=clone.function,
+                     has_from=clone.from_whom is not None)
+        return clone
 
     def __str__(self):
         content = self._content_str()

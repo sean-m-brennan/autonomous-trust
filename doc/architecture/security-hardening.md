@@ -14,6 +14,7 @@ AutonomousTrust operates in adversarial network environments where peers are not
 | Python configuration | Unrestricted class instantiation from JSON `__type__` field | Remote code execution via crafted configuration payloads |
 | Python messaging | Unsigned Paxos proposals accepted without verification | Forged reputation scores, consensus poisoning |
 | Inspector server | Hardcoded debug mode, open WebSocket binding | Information disclosure, cross-origin hijacking |
+| Inspector transport | Dashboard and WebSocket published off-host in plaintext with no client authentication | Live mesh state disclosure, command injection by any reachable client |
 | Services serialization | Pickle deserialization of untrusted network data | Arbitrary code execution on unpickle |
 | Services metadata | Unrestricted class resolution from qualified names | Instantiation of arbitrary classes from peer-supplied strings |
 | Simulator radio model | Inverted signal comparison, silent enum fallthrough | Incorrect reachability decisions, undefined property values |
@@ -54,7 +55,116 @@ The inspector provides a Dash-based web UI and WebSocket data feeds for monitori
 
 **Debug mode control.** The Quart application server accepts a `debug` parameter but previously ignored it in favor of a hardcoded `True`. Debug mode exposes stack traces, reloading endpoints, and internal state. The server now honors the caller-supplied debug flag, defaulting to disabled in production configurations.
 
-**WebSocket origin validation.** The WebSocket handler validates the `Origin` header of incoming connections against an allowlist (localhost by default). Connections from disallowed origins are closed immediately. The server binds to `127.0.0.1` rather than `0.0.0.0`, restricting access to the local machine unless explicitly configured otherwise.
+**WebSocket origin validation.** The WebSocket handler validates the `Origin` header of incoming connections against an allowlist (localhost by default). Connections from disallowed origins are closed immediately. The server binds to `127.0.0.1` rather than `0.0.0.0`, restricting access to the local machine unless explicitly configured otherwise — see *Bind address and advertised address* below for how that configuration works and what it requires.
+
+**Origin validation actually running.** The allowlist above was unreachable code
+under a current `websockets`. Its asyncio `ServerConnection` carries the
+handshake in `request.headers` and has no `origin` attribute at all, where the
+legacy server had one, so `websocket.origin` raised `AttributeError` on *every*
+inbound connection — killing the handler before the allowlist could refuse
+anything, before authentication could run, and before the client could register.
+From outside it presented as a connection that opened and then went quiet.
+`pyproject.toml` admits `websockets>=10,<15`, which spans both APIs, so
+`websocket_origin()` reads whichever shape the connection has rather than pinning
+one. Verified against a live listener: a disallowed `Origin` now closes with 4003
+and an allowed one registers a client, neither of which the fake-socket unit tests
+could have shown.
+
+**Bind address and advertised address.** The two used to be independent values,
+and they disagreed. `DashControl`'s WebSocket listener bound `127.0.0.1` while
+`ws_url()` advertised the *dashboard's* host — the routable address returned by
+`get_ip_addr()` — so any client not on the server's own machine was handed an
+address nothing was listening on, and no server-side record of the attempt
+existed because the connection never arrived. It went unnoticed because the live
+dashboard's socket is the visualization server's `/ws` on the page's own origin,
+leaving the system tests as this listener's only clients.
+
+The fix is structural rather than a corrected string. `SocketExposure` owns one
+address; the listener binds it and `ws_url()` advertises it, so the two cannot
+drift apart again. The invariant is that **the advertised host is always one the
+listener accepts on**. A wildcard bind is the single case where the advertised
+value differs from the configured one — `0.0.0.0` is not somewhere a client can
+connect, so the routable address is advertised instead, which stays truthful
+precisely because a wildcard listener does accept there.
+
+The default is unchanged: loopback, reachable only from the host. Moving it is a
+deliberate act via `AT_INSPECTOR_WS_BIND`, and it carries deliberate
+consequences. An exposed bind with **no client authentication is refused** — the
+setting is new, so no existing deployment can be broken by the requirement, and
+the alternative would be a knob whose only effect is publishing an
+unauthenticated live feed. An exposed bind without TLS *warns* rather than
+refuses, because terminating TLS in a proxy ahead of a private-network bind is a
+legitimate deployment this code cannot distinguish from a careless one. Exposing
+the listener also extends the `Origin` allowlist to the exposed host, since an
+allowlist still naming only loopback would refuse every client the knob just made
+reachable. Note that nothing in either shipped deployment publishes this port:
+exposing the listener means publishing 5005 (compose) or adding a Service port
+(Kubernetes) as well, which is why neither manifest does so by default.
+
+**Transport encryption.** The `Origin` allowlist and the loopback bind above are
+sufficient only while the port stays on the host. Both shipped deployments break
+that assumption: `deploy/multi_agency/docker-compose.yaml` publishes `8050:8050`
+and the Kubernetes Service exposes the same port, so the dashboard and its data
+feed are reachable off-host. `inspector/security.py` adds server-side TLS to both
+listeners — the Dash control surface with its WebSocket, and the visualization
+server that serves the graph page and `/ws`. It is configured by
+`AT_INSPECTOR_TLS_CERT` and `AT_INSPECTOR_TLS_KEY`, with an optional
+`AT_INSPECTOR_TLS_KEY_PASSWORD` and `AT_INSPECTOR_TLS_CLIENT_CA` (a CA bundle
+that turns on client-certificate verification).
+
+The configuration is **opt-in but fail-closed**. Unset means the previous
+behavior exactly — plaintext on a loopback bind, which is the right posture for a
+developer machine and the one every demo relies on. *Half*-set raises
+`SecurityConfigError` before any listener opens: a certificate without its key, a
+path that does not resolve inside the container, a client CA with no server
+certificate. Each of those would otherwise produce a plaintext listener on a port
+an operator believes is encrypted, which is worse than a refusal to start. The
+advertised scheme is derived from the same object that configures the listener
+(`ws_url()` returns `wss://` exactly when the socket is wrapped), because a
+mismatch there fails in the browser with no server-side record of the attempt.
+
+One limit is enforced rather than hidden. The visualization server runs on Quart's
+built-in server, which accepts a certificate and an unencrypted key path and has
+no argument for a passphrase, nor one that makes `ca_certs` a *requirement*.
+Rather than accept those two settings and drop them — the client-CA case being a
+real downgrade, since the operator believes client certificates are being
+verified — `VizServer.run()` refuses to start and names the setting it cannot
+honor, pointing at a reverse proxy or a direct hypercorn deployment.
+
+**Client authentication.** TLS establishes who the *server* is; it says nothing
+about who connected. A shared bearer token, set in `AT_INSPECTOR_WS_TOKEN` and
+compared with `hmac.compare_digest`, gates both WebSocket listeners. The token
+travels as the **first frame** of the connection rather than in the URL, where
+every proxy in the path would log it and the browser would keep it in history.
+Absent token means no authentication, which is again the previous behavior.
+
+The frame position is a protocol contract, not an implementation detail. When
+authentication is off the server reads **nothing** before the application
+protocol starts, because that first frame already belongs to the application —
+`viz/js/force.js` sends a graph selector there, and the live feed sends no frame
+at all. When authentication is on, the client must send its credential before the
+selector; the page receives the token and the scheme rendered into it by the
+server, so the client knows which of the two protocols it is speaking. A refused
+connection is closed with application code **4401** (chosen over 1008 so an
+operator reading a browser console can distinguish "not authenticated" from any
+other policy refusal) and the browser logs the refusal unconditionally, since a
+viewer whose graph is merely empty has no other way to learn it was rejected.
+Server-side, refusals are logged per peer with the first attempt in full and
+one line per 50 thereafter, carrying the running count: a rejected client
+normally retries in a loop, and unthrottled logging would bury the very message
+that explains the misconfiguration.
+
+A shared token is deliberately the weakest of three possible schemes, and its
+limits are worth stating: one secret for every viewer, no revocation short of a
+restart with a new value, and no notion of *which* human is connected. It is here
+because it needs no provisioning. The check sits behind an `Authenticator`
+interface so the stronger mechanisms this tree already has — an `OperatorSession`
+from the PIV+MFA flow ([Operator Access](operator-access.md)), or an mTLS client
+certificate chaining to the configured ZTA anchors ([ZTA
+Integration](zta-integration.md)) — can replace it without touching a connection
+handler. Whether a credential may be embedded in a served page is asked of the
+authenticator rather than assumed: a shared token may travel that way, a session
+token or a client certificate may not.
 
 **Safe collection iteration.** Peer tracking structures are modified during cleanup passes. Deleting dictionary entries during iteration causes `RuntimeError` in Python and can skip entries silently in other runtimes. The cleanup pass collects keys to remove before mutating the dictionary, ensuring deterministic behavior.
 
@@ -87,6 +197,10 @@ Although the simulator does not run in production, correctness in its radio mode
 | Python core | Message verification field | Forged Paxos proposals and consensus poisoning |
 | Inspector | Debug mode parameterization | Information disclosure in production |
 | Inspector | WebSocket origin validation | Cross-origin data exfiltration |
+| Inspector | Opt-in, fail-closed TLS on both listeners | Plaintext mesh state on a published port |
+| Inspector | First-frame bearer token, constant-time compare | Unauthenticated viewing and control of a live fleet |
+| Inspector | Single-source bind/advertise, auth required to expose | Unreachable advertised address; accidental publication of the data feed |
+| Inspector | API-tolerant `Origin` read | Origin allowlist and auth gate silently never running |
 | Inspector | Safe dict iteration | Runtime errors during peer cleanup |
 | Services | Pickle removal (msgpack only) | Arbitrary code execution via deserialization |
 | Services | Metadata class allowlist | Arbitrary class instantiation from network input |

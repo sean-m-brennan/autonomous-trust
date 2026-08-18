@@ -414,6 +414,95 @@ Both adapters mint the co-signatures at scenario time, so the two runtimes are
 held to the same pre-image and scheme rather than to the recorded output of one
 side.
 
+## Asking others what they think
+
+A score computed here is one node's view. An observer dashboard wants the whole
+matrix — every observer's view of every subject — and that is what makes the
+*shape* of the request matter rather than only its arithmetic.
+
+Two verbs answer it. `request consensus reputation` names one subject and
+returns one score (or, from a gateway, that subject plus every member of the
+child groups it bridges — see [Gateway reputation
+tree](gateway-reputation-tree.md)). `request consensus reputation batch` names
+many subjects and returns one roster. Both compute each entry through the same
+consensus path, so the batch verb changes what a round *costs*, never what it
+says: in C the arithmetic is factored into `_consensus_score_for` precisely so a
+second copy could not drift into being a scoring change, and in Python both
+verbs run `_subtree_roster`.
+
+The cost is the reason it exists. An observer-by-subject sweep over N peers is
+N(N-1) messages with the single-subject verb — at N=80 that is 6320 requests and
+6320 signed replies per round, each with its own chain walk — while the answers
+were always a roster the reply path already knew how to read. Batched, the same
+round is N requests and N replies:
+
+| Peers | Single-subject | Batched |
+|---|---|---|
+| 10 | 90 requests + 90 replies | 10 + 10 |
+| 40 | 1560 + 1560 | 40 + 40 |
+| 80 | 6320 + 6320 | 80 + 80 |
+
+Three properties make the batched form behave:
+
+1. **Subjects are named by uuid, not as identities.** The responder reads only
+ `peer.uuid` off the request, and sending N full identities to N observers
+ would trade N-squared messages for N-squared bytes.
+2. **The responder skips its own uuid, and answers at most once per subject.** A
+ self-pair is not part of an observer-by-subject sweep. Skipping it
+ responder-side is also what makes one request body correct for every
+ observer, which in turn means a round carries one signature rather than one
+ per recipient (`Message.for_recipient`; the signature pre-image
+ `process|function|base64(data)` never covered the recipient, so a readdressed
+ copy is already valid). Deduplication matters because a repeated entry would
+ be read as two observations of one pair.
+3. **The named-subject count is bounded** (`MAX_REP_BATCH_SUBJECTS` /
+ `AT_MAX_REP_BATCH_SUBJECTS`, 256). Each subject costs a chain walk, so an
+ unbounded list would let one small message ask for arbitrary work. Over the
+ bound the request is truncated and logged rather than refused — a legitimately
+ oversized cohort still gets a partial answer, and the log is what keeps the
+ cause visible instead of presenting as a silently incomplete graph.
+
+### The reply, and where it goes
+
+A `reputation response` carries `Reputation` objects — one, or an array of them
+for a roster — and both runtimes now write the same form: the `__type__` tag,
+`peer_id`, `score`, and nothing else. Each part of that is load-bearing.
+
+The **tag** is what makes a requestor rebuild a `Reputation` instead of handing
+its caller a bare mapping. C omitted it and sent `{peer_uuid, score,
+requesting_process}` instead, so a Python requestor deserialized a dict, reached
+for `.peer_id`, and raised out of its message loop — meaning a C peer's view of
+the cohort reached neither `latest_reputation` nor `latest_reputation_pairs`. The
+symptom was an inspector trust graph with no C opinions in it and nothing saying
+why. C carries the tag for the same reason the warm-start snapshot does: this is
+the same state in both runtimes, so the identifier is a shared constant rather
+than a language artifact.
+
+**Nothing else** in the body, because the requestor reconstructs the object by
+keyword — a stray field is a `TypeError` there, not a value it ignores. That is
+why `requesting_process` is not in the payload.
+
+It belongs in the **envelope** instead, as the reply's `process`, because that is
+the field a requestor routes an inbound message by. C named `"reputation"` at all
+three reply sites, which delivered every reply to the requestor's *reputation*
+process — where Python has no `rep_resp` handler — rather than to the process that
+asked. Shape and routing had to be fixed together: either alone leaves the answer
+undelivered or unreadable. An absent or empty requesting process falls back to
+`"reputation"` so a malformed request produces a deliverable reply rather than one
+addressed to nothing.
+
+The consumer no longer trusts the shape it is handed either. A mapping with
+`peer_id` (or the older `peer_uuid`) and a numeric score is accepted, anything
+else is dropped with a warning that names the sender, and neither can raise: that
+loop services every message the node receives, so one peer's malformed reply must
+not be able to stop the rest. A mixed-version cohort keeps working while it
+catches up.
+
+Pinned on both sides: `src/c/test/rep_resp_shape_test.c` asserts the emitted tag,
+the exact key set, and the routed envelope for all three verbs;
+`tests/a_unit/test_rep_resp_interop.py` asserts the consumer reads the tagged
+form, the legacy C form, and refuses the rest.
+
 ## Pinned scenarios
 
 | Behavior | Scenario |
@@ -431,6 +520,8 @@ side.
 | Sub-quorum slash finalizer refused | [`slash-final-sub-quorum-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/slash-final-sub-quorum-refused.yaml) |
 | Forged co-signatures refused | [`slash-final-forged-cosignatures-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/slash-final-forged-cosignatures-refused.yaml) |
 | Unattested checkpoint root refused | [`checkpoint-final-unattested-root-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/checkpoint-final-unattested-root-refused.yaml) |
+| Single-subject reputation request | [`request-reputation-cross-process.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/request-reputation-cross-process.yaml) |
+| Batched consensus request, self skipped and duplicates collapsed | [`consensus-reputation-batch.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/consensus-reputation-batch.yaml) |
 
 Unit coverage for the attestation rules lives in
 `tests/a_unit/test_repprocess_quorum_attestation.py` on the Python side and

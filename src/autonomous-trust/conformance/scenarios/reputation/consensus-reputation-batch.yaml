@@ -1,0 +1,69 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: consensus-reputation-batch
+byte_pinning: false
+description: |
+    Exercises `request consensus reputation batch`
+    (ReputationProtocol.consensus_rep_batch_req) — ONE request naming
+    several subjects, answered with ONE roster.
+
+    Why the verb exists: an observer-by-subject sweep, which is exactly
+    what the inspector's transitive-trust round does, cost N(N-1)
+    messages with the single-subject `request consensus reputation`
+    (6320 requests plus 6320 signed replies at N=80, each with its own
+    chain walk). Batched, a round is N requests and N replies. The
+    scores are unchanged: both runtimes compute each entry through the
+    same consensus path the single-subject verb uses, factored out in C
+    as `_consensus_score_for` and reached in Python via
+    `_subtree_roster`.
+
+    Wire format: object form with a PLURAL field,
+    `{peer_uuids: [...], requesting_process}`. Both adapters build
+    identical bytes, so cross-language wire interop is pinned the same
+    way `request-reputation-cross-process` pins the singular form.
+
+    Responder semantics exercised here: the responder answers for every
+    named subject EXCEPT itself, and at most once per subject. charlie
+    is named twice so the deduplication path is traversed on both sides
+    rather than assumed — a batched roster that repeated an entry would
+    be read as two observations of the same pair. A self-pair is not part of an
+    observer-by-subject sweep, and excluding it responder-side is what
+    lets one request body — hence one signature — serve every observer
+    in a round. bob is deliberately named among the targets so that
+    skip is exercised rather than assumed.
+
+    Reply shape is `reputation response` carrying a JSON ARRAY of
+    Reputation objects, which is what Python's forward_reputation
+    already emits for a multi-element roster and what its rep_resp
+    handling unpacks one entry per peer. C carries Python's `__type__`
+    tag on each entry for the same reason the warm-start snapshot does:
+    the roster is the same state in both runtimes.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: oracle
+  - id: charlie
+    role: subject
+  - id: dave
+    role: subject
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: request consensus reputation batch
+    payload:
+      targets: [charlie, dave, charlie, bob]
+      proc: negotiation
+    description: |
+        alice asks bob, in one message, for its consensus view of
+        charlie, dave, charlie again, and bob itself. bob scores charlie
+        and dave from whatever its local history supports (zero history
+        → the consensus baseline is fine), collapses the repeated
+        charlie, skips its own uuid, and emits one `reputation response`
+        carrying the roster back to alice. The pre-batch equivalent of
+        this step was three separate `request consensus reputation`
+        messages plus three replies.

@@ -870,6 +870,46 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_object_set_new(body, "peer_uuid", json_string(target_uuid));
         json_object_set_new(body, "requesting_process", json_string(req_proc));
     }
+    else if (strcmp(function, REP_PROTO_CONSENSUS_REP_BATCH_REQ) == 0)
+    {
+        /* Batched consensus request: one message naming MANY subjects, answered
+         * with one roster. Same fields as the single-subject form but plural
+         * (`peer_uuids`); both adapters build these identical bytes, so wire
+         * interop is pinned here as it is for the single form. `targets` is a
+         * list of participant ids; an id that is not a participant passes
+         * through verbatim so a scenario can name an unknown uuid on purpose. */
+        const char *req_proc = "negotiation";
+        json_t *targets = NULL;
+        if (payload && json_is_object(payload))
+        {
+            json_t *p = json_object_get(payload, "proc");
+            if (json_is_string(p)) req_proc = json_string_value(p);
+            json_t *t = json_object_get(payload, "targets");
+            if (json_is_array(t)) targets = t;
+        }
+        json_t *uuids = json_array();
+        size_t n = (targets != NULL) ? json_array_size(targets) : 0;
+        for (size_t i = 0; i < n; i++)
+        {
+            const char *target_pid = json_string_value(json_array_get(targets, i));
+            if (target_pid == NULL)
+                continue;
+            char target_uuid[UUID_STRING_LEN + 1] = {0};
+            sce_participant_t *target = sce_find_participant(ctx, target_pid);
+            if (target != NULL)
+            {
+                rp_impl_t *t_impl = (rp_impl_t *)target->impl;
+                if (t_impl && t_impl->pub)
+                    uuid_unparse_lower(t_impl->pub->uuid, target_uuid);
+            }
+            json_array_append_new(uuids,
+                                  json_string(target_uuid[0] != '\0'
+                                              ? target_uuid : target_pid));
+        }
+        body = json_object();
+        json_object_set_new(body, "peer_uuids", uuids);
+        json_object_set_new(body, "requesting_process", json_string(req_proc));
+    }
     else if (strcmp(function, REP_PROTO_SLASH_PROPOSE) == 0
              || strcmp(function, REP_PROTO_SLASH_SIGN) == 0
              || strcmp(function, REP_PROTO_SLASH_FINAL) == 0)

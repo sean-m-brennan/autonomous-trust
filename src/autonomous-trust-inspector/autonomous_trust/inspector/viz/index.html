@@ -26,9 +26,21 @@
     <script src="js/force.js"></script>
 
     <script>
+      // Socket parameters are rendered in by VizServer.page() rather than
+      // hardcoded in force.js: the scheme follows whether TLS is configured,
+      // and ws_token is empty whenever client authentication is off (the
+      // default), in which case force.js sends no credential frame at all.
+      // The `default` filters keep this template renderable by anything that
+      // serves it without supplying them.
+      const AT_WS = {
+          scheme: "{{ ws_scheme|default('ws') }}",
+          port: {{ ws_port|default(8000) }},
+          token: "{{ ws_token|default('') }}"
+      };
       $(document).ready(function() {
           const forcesGraph = createForcesGraph()
-          forcesGraph.init();
+          forcesGraph.init(AT_WS.port, 500, 10, null, true,
+                           {scheme: AT_WS.scheme, token: AT_WS.token});
           forcesGraph.start();
       });
     </script>

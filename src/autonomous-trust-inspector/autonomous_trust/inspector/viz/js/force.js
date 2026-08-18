@@ -28,6 +28,10 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
     // optionally set in init()
     let max_msgs = 500;
     let ws_port = 8000;
+    // Set from init()'s options. `ws_scheme` follows the server's TLS posture
+    // and `ws_token` is empty unless the server requires a credential.
+    let ws_scheme = "ws";
+    let ws_token = "";
     let max_link_weight = 10;
     let with_legend = true;
 
@@ -462,8 +466,13 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
     }
 
     return ({
-        init: function (port=8000, duration=500, max_weight=10, msg=null, legend=true) {
+        init: function (port=8000, duration=500, max_weight=10, msg=null, legend=true,
+                        options={}) {
             ws_port = port;
+            if (options.scheme)
+                ws_scheme = options.scheme;
+            if (options.token)
+                ws_token = options.token;
             max_msgs = duration;
             max_link_weight = max_weight;
             if (msg != null)
@@ -472,12 +481,27 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
 
             if (use_ws) {
                 ws_active = false;
-                ws = new WebSocket("ws://127.0.0.1:" + ws_port + "/ws");
+                // The /ws route lives on the SAME server that served this
+                // page, so its host comes from the document rather than a
+                // hardcoded 127.0.0.1 — which could never match a TLS
+                // certificate, and broke any viewer that was not on the
+                // server's own machine.
+                const ws_host = window.location.hostname || "127.0.0.1";
+                ws = new WebSocket(ws_scheme + "://" + ws_host + ":" + ws_port + "/ws");
                 ws.onmessage = function (event) {
                     process_msg(jQuery.parseJSON(event.data));
                 }
                 ws.onopen = function () {
                     ws_active = true;
+                    // Credential FIRST, before any application frame: the
+                    // server consumes exactly one frame as the credential when
+                    // it requires one, so sending the graph selector first
+                    // would authenticate with the selector and then starve the
+                    // protocol. Sent only when a token was supplied, because a
+                    // server with authentication off reads no credential frame
+                    // and would take this as the selector.
+                    if (ws_token)
+                        ws.send(ws_token);
                     if (ws_init) {
                         ws.send(initialMessage);
                         msg_num++;
@@ -486,10 +510,20 @@ createForcesGraph = function (containerSelect=".graph-container", debugging=fals
                     if (debug)
                         console.log("WS opened");
                 }
-                ws.onclose = function () {
+                ws.onclose = function (e) {
                     ws_active = false;
                     ws_init = false;
-                    if (debug)
+                    // 4401 is this server's "unauthorized" (see
+                    // inspector/security.py). Logged unconditionally, not
+                    // behind `debug`: a viewer whose graph is simply empty has
+                    // no other way to learn that it was refused.
+                    if (e && e.code === 4401)
+                        console.error("WS refused: not authorized. " +
+                                      "The page supplied " +
+                                      (ws_token ? "a token the server rejected"
+                                                : "no token, but the server requires one") +
+                                      ".");
+                    else if (debug)
                         console.log("WS closed");
                 }
                 ws.onerror = function (e) {

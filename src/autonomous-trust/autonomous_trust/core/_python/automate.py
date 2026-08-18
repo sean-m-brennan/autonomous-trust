@@ -57,6 +57,7 @@ from .protocol import Protocol
 from .negotiation import Task, TaskParameters, TaskStatus, Status, TaskResult, NegotiationProtocol
 from .network import Message, require_synced_clock
 from .reputation import TransactionScore, ReputationProtocol, PeerReputation
+from .reputation.reputation import Reputation
 from .queue_pool import QueuePool
 from .._zkp import ZKP_AVAILABLE
 from . import _probes
@@ -391,6 +392,87 @@ class AutonomousTrust(Protocol):
             return
         self._roster_visited.add(str(target.uuid))
         self._send_roster_req(queues, target)
+
+    @staticmethod
+    def _reputation_entry(entry):
+        """One rep_resp entry as a Reputation, or None if it is not one.
+
+        A reply may arrive already deserialized (a `Reputation`, because the
+        sender is this runtime and the payload carried its `__type__` tag) or as
+        a bare mapping. The mapping case is real: a peer running the C library
+        answered with plain JSON fields, and reaching for `.peer_id` on the dict
+        that produced raised `AttributeError` out of the message loop — so a
+        C peer's view of the cohort reached nothing, and the failure did not
+        name its cause. Accepting the mapping here means one runtime's reply
+        shape cannot silence the other's; C now sends the tagged form, and this
+        keeps a mixed-version cohort working while it catches up.
+
+        Both spellings of the key are read: `peer_id` is the Reputation field
+        name, `peer_uuid` was the C wire name.
+
+        The test is what an entry ANSWERS, not what class it is: anything already
+        carrying a usable `peer_id` and `score` is passed through untouched. A
+        stricter isinstance check would reject a stand-in that behaves like a
+        Reputation for no gain — the two attributes are the entire contract the
+        caller relies on.
+        """
+        peer_id = getattr(entry, 'peer_id', None)
+        score = getattr(entry, 'score', None)
+        if peer_id is not None and score is not None:
+            try:
+                float(score)
+            except (TypeError, ValueError):
+                return None     # answers the right names with the wrong value
+            return entry
+        if isinstance(entry, dict):
+            peer_id = entry.get('peer_id', entry.get('peer_uuid'))
+            score = entry.get('score')
+            if peer_id is None or score is None:
+                return None
+            try:
+                return Reputation(peer_id, float(score))
+            except (TypeError, ValueError):
+                return None
+        # Anything else (a bare score, a string, None) is not an observation and
+        # must not be guessed at.
+        return None
+
+    def _reputation_entries(self, payload, observer=None):
+        """Every usable Reputation in a rep_resp payload.
+
+        A rep_resp carries either a single Reputation (the classic rep_req /
+        leaf path) or a subtree roster from a gateway, which arrives as a JSON
+        array. Normalising to a list here lets the caller run its per-entry body
+        once per entry; the maps it writes are keyed per-uuid, so a gateway's
+        reply populates one entry for every peer in its subtree.
+
+        Unusable entries are dropped with a warning rather than raised on. This
+        loop services every message the node receives, so one malformed reply
+        must not be able to stop the rest — and the warning names the sender,
+        because "which peer is sending me nonsense" is the only actionable part.
+        """
+        if isinstance(payload, str):
+            try:
+                payload = from_json_string(payload)
+            except Exception as err:  # noqa - malformed or foreign payload
+                self.logger.warning(
+                    'rep_resp from %s could not be deserialized: %s',
+                    getattr(observer, 'nickname', observer), err)
+                return []
+        entries = payload if isinstance(payload, list) else [payload]
+        usable = []
+        for entry in entries:
+            rep = self._reputation_entry(entry)
+            if rep is None:
+                self.logger.warning(
+                    'rep_resp from %s carried an unusable entry (%s); ignoring '
+                    'it. Expected a Reputation or a mapping with '
+                    'peer_id/peer_uuid and score.',
+                    getattr(observer, 'nickname', observer),
+                    type(entry).__name__)
+                continue
+            usable.append(rep)
+        return usable
 
     def _consume_roster_resp(self, queues, message):
         """Merge one roster_resp and pursue any newly-named child gateways —
@@ -929,12 +1011,9 @@ class AutonomousTrust(Protocol):
                     # the per-Reputation body once per entry — the maps
                     # below are keyed per-uuid, so a gateway's reply
                     # populates one entry for every peer in its subtree.
-                    rep = message.obj
-                    if isinstance(rep, str):
-                        rep = from_json_string(rep)
-                    reps = rep if isinstance(rep, list) else [rep]
                     observer = getattr(message, "from_whom", None)
                     observer_uuid = getattr(observer, "uuid", None)
+                    reps = self._reputation_entries(message.obj, observer)
                     for rep in reps:
                         if rep.peer_id == self.identity.uuid:
                             self.print('My current reputation score:\033[32m %s\033[00m' % rep.score)

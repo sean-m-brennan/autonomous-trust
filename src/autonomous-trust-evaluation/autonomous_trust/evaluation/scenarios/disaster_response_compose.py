@@ -225,6 +225,18 @@ def _inspector_entry(opts: ComposeOptions) -> list[str]:
         if val:
             safe = val.replace('"', '\\"')
             env_lines.append(f'      {var}: "{safe}"')
+    # Inspector transport security, passed through from the host rather than
+    # baked in (see doc/architecture/security-hardening.md, "Inspector
+    # security"). The dashboard port is PUBLISHED, so plaintext with no client
+    # authentication is reachable off-host; these three variables are how an
+    # operator turns TLS and a bearer token on. They are emitted unconditionally
+    # with a `:-` default because compose forwards nothing it was not told to
+    # forward, and an absent value leaves the listener exactly as it is today.
+    # A certificate must also be mounted into the container: the paths are read
+    # verbatim by the process.
+    for var in ("AT_INSPECTOR_TLS_CERT", "AT_INSPECTOR_TLS_KEY",
+                "AT_INSPECTOR_WS_TOKEN"):
+        env_lines.append(f'      {var}: "${{{var}:-}}"')
     volume_lines = [f"      - ./scenario:{opts.scenario_mount}:ro"]
     if opts.probes:
         volume_lines.append(f"      - {opts.probes_host_dir}:{opts.probes_container_dir}")
@@ -366,6 +378,34 @@ def _env_block(env: dict[str, str], indent: str = "            ") -> str:
 # 30000-32767 range that k8s reserves for NodePort services.
 _INSPECTOR_NODE_PORT = 30850
 
+# Inspector transport security on the cluster path (doc/architecture/
+# security-hardening.md, "Inspector security"). One optional Secret carries all
+# of it: the certificate and key as files, plus the two paths they land on.
+_INSPECTOR_TLS_SECRET = "inspector-transport"
+_INSPECTOR_TLS_MOUNT = "/etc/at-inspector-tls"
+# Every reference is `optional: true`, so with no Secret present the variables
+# stay unset and the listener keeps today's plaintext posture — the manifest is
+# inert until an operator creates it:
+#   kubectl create secret generic inspector-transport \
+#     --from-literal=ws-token=<32+ random chars> \
+#     --from-file=tls.crt=<cert> --from-file=tls.key=<key> \
+#     --from-literal=cert-path=/etc/at-inspector-tls/tls.crt \
+#     --from-literal=key-path=/etc/at-inspector-tls/tls.key
+# The paths are Secret entries rather than plain `value:` lines on purpose: a
+# path pointing at a file that is not mounted is a configuration error the
+# process refuses to start on, so the variable and the file have to appear
+# together or not at all.
+_INSPECTOR_TLS_ENV = "\n".join(
+    f"""            - name: {var}
+              valueFrom:
+                secretKeyRef:
+                  name: {_INSPECTOR_TLS_SECRET}
+                  key: {key}
+                  optional: true"""
+    for var, key in (("AT_INSPECTOR_WS_TOKEN", "ws-token"),
+                     ("AT_INSPECTOR_TLS_CERT", "cert-path"),
+                     ("AT_INSPECTOR_TLS_KEY", "key-path")))
+
 
 def _inspector_k8s_yaml(opts: ComposeOptions, namespace: str) -> str:
     """Deployment + NodePort Service for the multi-agency coordinator.
@@ -454,10 +494,19 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
 {_env_block(env)}
+{_INSPECTOR_TLS_ENV}
           volumeMounts:
             - name: scenario-cfg
               mountPath: {opts.scenario_mount}
               readOnly: true
+            - name: inspector-tls
+              mountPath: {_INSPECTOR_TLS_MOUNT}
+              readOnly: true
+          # NOTE: this probe speaks plaintext HTTP. Enabling inspector TLS
+          # (AT_INSPECTOR_TLS_CERT/KEY above) requires `scheme: HTTPS` here as
+          # well, or the pod never passes readiness and the Service publishes
+          # nothing — a failure that presents as a broken dashboard rather than
+          # as a probe mismatch.
           readinessProbe:
             httpGet:
               path: /
@@ -466,6 +515,10 @@ spec:
             periodSeconds: 5
             failureThreshold: 12
       volumes:
+        - name: inspector-tls
+          secret:
+            secretName: {_INSPECTOR_TLS_SECRET}
+            optional: true
         - name: scenario-cfg
           configMap:
             name: disaster-response-scenario

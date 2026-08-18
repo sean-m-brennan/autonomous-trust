@@ -71,6 +71,19 @@ class ReputationProtocol(Protocol):
     # via rep_req; the reply reuses rep_resp so automate.py's
     # latest_reputation dispatch consumes it unchanged.
     consensus_rep_req = 'request consensus reputation'
+    # Batched form of consensus_rep_req: ONE request naming many subjects,
+    # answered with one roster. The per-subject form makes an observer-by-subject
+    # sweep cost N**2 messages per round (the inspector's transitive-trust round
+    # is exactly that sweep); this makes it N. Semantics are otherwise identical
+    # -- same deterministic history-only score per subject, reply reused as
+    # rep_resp, and automate.py already captures a multi-element roster one
+    # entry per peer, so nothing on the response side changes.
+    #
+    # A responder answers for every named subject EXCEPT itself: a self-pair is
+    # not part of the observer-by-subject sweep, and excluding it responder-side
+    # is what lets one request body serve every observer in a round (identical
+    # bytes, so identical signature). See doc/architecture/reputation.md.
+    consensus_rep_batch_req = 'request consensus reputation batch'
     # AT -> app pull (doc/architecture/app-peer-carrier.md). Spelled EXACTLY as C's
     # AT_APP_ROSTER_REQUEST ("app_roster_request", message.h) because the
     # protocol strings are the wire form shared with the C twin -- a shortened

@@ -39,6 +39,9 @@ except ImportError:
     from websockets.legacy.server import WebSocketConnection as WebSocketConnection  # noqa
 
 from .async_update import bin_data_pb2 as BinaryData
+from ..security import (InspectorTLS, Authenticator, AuthLogLimiter, SocketExposure,
+                        authenticator_from_env, ws_exposure_from_env,
+                        WS_CLOSE_UNAUTHORIZED, WS_CLOSE_BAD_ORIGIN)
 
 # for imports:
 from dash import Patch  # noqa
@@ -97,15 +100,42 @@ def get_ip_addr():
         return '127.0.0.1'
 
 
+def websocket_origin(websocket) -> Optional[str]:
+    """The `Origin` header of an inbound connection, across both APIs.
+
+    `websockets` exposes this differently either side of its asyncio rewrite:
+    the legacy server hung an `origin` attribute on the connection, while the
+    asyncio `ServerConnection` carries the handshake in `request.headers` and has
+    no `origin` at all. Reading `websocket.origin` unconditionally therefore
+    raised `AttributeError` on every connection under the modern API, killing the
+    handler before the allowlist could refuse anything or the client could
+    register — a protection that reported nothing because it never ran. Both
+    forms are accepted here rather than pinning one, since `pyproject.toml`
+    admits the whole `>=10,<15` range.
+
+    Returns None when the client sent no `Origin`, which is normal for a
+    non-browser client and is not a refusal.
+    """
+    if hasattr(websocket, 'origin'):  # legacy server
+        return websocket.origin
+    request = getattr(websocket, 'request', None)  # asyncio server
+    if request is not None:
+        return request.headers.get('Origin')
+    return None
+
+
 class WSClient(object):
-    # Minimal client record: just the socket + peer IP. Extending this
-    # (auth token, session id, capability hints) is held back until a
-    # concrete use case asks for it — the dashboard fan-out currently
-    # treats all clients identically (see DashControl.serve_websockets
-    # below for the "differentiate" companion deferral).
-    def __init__(self, sock):
+    # Minimal client record: the socket, the peer IP, and how the client
+    # authenticated. `auth_method` is the authenticator's name ('none' when
+    # authentication is off), which is what makes an unauthenticated fan-out
+    # visible rather than merely undocumented. Session id / capability hints
+    # are still held back until a concrete use case asks (see
+    # DashControl.serve_websockets below for the "differentiate" companion
+    # deferral).
+    def __init__(self, sock, auth_method: str = 'none'):
         self.socket: WebSocketConnection = sock
         self.address = sock.remote_address[0]
+        self.auth_method = auth_method
 
 
 class DashControl(object):
@@ -114,7 +144,18 @@ class DashControl(object):
 
     def __init__(self, name: str, title: str, host: str = '0.0.0.0', port: int = 8050,
                  stylesheets: list[str] = None, pages_dir: str = None, logger: logging.Logger = None,
-                 verbose: bool = False, proxied: bool = False):
+                 verbose: bool = False, proxied: bool = False,
+                 tls: InspectorTLS = None, authenticator: Authenticator = None,
+                 exposure: SocketExposure = None):
+        # TLS, client authentication and listener exposure all default to
+        # whatever the environment configures, which is "off"/"loopback" unless
+        # an operator says otherwise. Passing them explicitly is for tests and
+        # for an embedder that carries its own configuration.
+        self.tls = InspectorTLS.from_env() if tls is None else tls
+        self.authenticator = (authenticator_from_env() if authenticator is None
+                              else authenticator)
+        self.exposure = ws_exposure_from_env() if exposure is None else exposure
+        self._auth_log = AuthLogLimiter()
         if stylesheets is None:
             stylesheets = []
         pages = False
@@ -123,6 +164,15 @@ class DashControl(object):
         if host == '0.0.0.0':
             host = get_ip_addr()
         self.server_address = host, port
+        # The websocket's bind address and the address `ws_url` advertises come
+        # from the same object, so the listener can no longer hand out an
+        # address it does not accept on. `server_address` is the DASHBOARD's
+        # address and is deliberately not reused here: the two listeners are
+        # separate sockets, and conflating them is what produced a loopback
+        # listener advertising a routable host.
+        self.ws_bind_host = self.exposure.bind_host
+        self.ws_advertise_host = self.exposure.advertise_host(routable=host)
+        self.exposure.validate(self.authenticator, self.tls, log=logger)
 
         if not verbose:
             logging.getLogger('werkzeug').setLevel(logging.WARNING)  # reduce useless callback noise from Flask
@@ -148,6 +198,17 @@ class DashControl(object):
             "http://localhost:5005", "http://127.0.0.1:5005",
             "http://localhost:8050", "http://127.0.0.1:8050",
         }
+        if self.exposure.exposed:
+            # An exposed listener is reached by pages served from the exposed
+            # host, so the allowlist has to name it or the Origin check refuses
+            # every real client — an exposure knob whose only effect is a 4003
+            # would be worse than no knob at all. Both schemes and both ports
+            # are listed because the page may be served with or without TLS and
+            # from either listener.
+            for scheme in ('http', 'https'):
+                for a_port in (port, self.ws_port):
+                    self.allowed_origins.add('%s://%s:%d'
+                                             % (scheme, self.ws_advertise_host, a_port))
 
         self.server = flask.Flask(name)
         dash_class = dash.Dash
@@ -178,7 +239,11 @@ class DashControl(object):
         param_str = ''
         if params is not None and len(params) > 0:
             param_str = '/' + '/'.join(map(str, params))
-        return f'ws://{self.server_address[0]}:{self.ws_port}/{component_name}{param_str}'
+        # Scheme follows the listener: advertising ws:// for a wss:// server
+        # produces a browser error with no server-side trace of the attempt.
+        # Host likewise follows the listener, not the dashboard.
+        return (f'{self.tls.ws_scheme()}://{self.ws_advertise_host}:{self.ws_port}'
+                f'/{component_name}{param_str}')
 
     def _websocket_event_loop(self):
         asyncio.set_event_loop(self.ws_loop)
@@ -193,19 +258,29 @@ class DashControl(object):
         #if self.inherited_logger is not None:
         #    for handler in self.inherited_logger.handlers:
         #      logger.addHandler(handler)
-        async with websocket_serve(self._websocket_handler, '127.0.0.1', self.ws_port,
-                                   logger=logger, compression=None):
-            logger.info('Serving websockets at ws://%s:%d', self.server_address[0], self.ws_port)
+        async with websocket_serve(self._websocket_handler, self.ws_bind_host, self.ws_port,
+                                   logger=logger, compression=None,
+                                   ssl=self.tls.context()):
+            logger.info('Serving websockets at %s://%s:%d (%s)', self.tls.ws_scheme(),
+                        self.ws_advertise_host, self.ws_port,
+                        self.exposure.describe())
+            # Both postures are logged at startup, on purpose: "no TLS" and "no
+            # authentication" are states an operator should be able to see
+            # without reading the configuration back.
+            logger.info('Inspector websocket: %s; %s',
+                        self.tls.describe(), self.authenticator.describe())
             await self.ws_stop
 
     async def _websocket_handler(self, websocket: WebSocketConnection):
-        origin = websocket.origin
+        origin = websocket_origin(websocket)
         if self.allowed_origins and origin and origin not in self.allowed_origins:
-            await websocket.close(4003, "Origin not allowed")
+            await websocket.close(WS_CLOSE_BAD_ORIGIN, "Origin not allowed")
+            return
+        if not await self._authenticate(websocket, origin):
             return
         async for message in websocket:
             if message == 'connect':
-                client = WSClient(websocket)
+                client = WSClient(websocket, self.authenticator.name)
                 self.clients.append(client)
                 self._client_dir[websocket] = client
             elif message == 'disconnect':
@@ -223,6 +298,50 @@ class DashControl(object):
             if event in self.websocket_handlers:
                 for func in self.websocket_handlers[event]:
                     func(data)
+
+    async def _authenticate(self, websocket: WebSocketConnection, origin) -> bool:
+        """Consume and check the credential frame. True = carry on.
+
+        When authentication is off this reads NOTHING and returns True: the
+        first frame belongs to the application protocol, and stealing it would
+        break every existing client for a check that is not being made.
+
+        When it is on, the first frame must be the credential. That costs one
+        round trip and keeps the credential out of the URL, where it would be
+        logged by every proxy in the path and land in browser history.
+        """
+        if not self.authenticator.required:
+            return True
+        peer = 'unknown'
+        try:
+            peer = websocket.remote_address[0]
+        except (AttributeError, TypeError, IndexError):
+            pass
+        try:
+            credential = await websocket.recv()
+        except Exception as err:  # noqa - connection died before authenticating
+            self._log_auth_refusal(peer, origin, 'no credential frame: %s' % err)
+            return False
+        result = self.authenticator.verify(credential, origin=origin, peer=peer)
+        if not result:
+            self._log_auth_refusal(peer, origin, result.reason)
+            # The close reason names the mechanism but never why the credential
+            # failed in detail -- "token mismatch" vs "no credential" is a
+            # distinction the server logs and the client does not need.
+            await websocket.close(WS_CLOSE_UNAUTHORIZED,
+                                  'Unauthorized: %s credential required'
+                                  % self.authenticator.name)
+            return False
+        self._auth_log.clear(peer)
+        return True
+
+    def _log_auth_refusal(self, peer: str, origin, reason: str) -> None:
+        should, count = self._auth_log.should_log(peer)
+        if not should:
+            return
+        self.app.logger.warning(
+            'inspector websocket: refused %s (origin %r): %s [%d attempt(s) '
+            'from this peer]', peer, origin, reason, count)
 
     async def _websocket_sender(self):
         while not self.ws_stop.cancelled():
@@ -371,4 +490,13 @@ class DashControl(object):
         if threading.current_thread() is threading.main_thread():
             signal.signal(signal.SIGINT, lambda s, f: self.halt())
         self.serve_websockets()
+        # Serve the PAGE over the same posture as the socket. A token typed
+        # into a page delivered over plaintext http is a token on the wire, so
+        # the two listeners are configured together or not at all.
+        ssl_context = self.tls.context()
+        if ssl_context is not None and 'ssl_context' not in kwargs:
+            kwargs['ssl_context'] = ssl_context
+        self.app.logger.info('Inspector dashboard on %s://%s:%s — %s; %s',
+                             self.tls.http_scheme(), host, port,
+                             self.tls.describe(), self.authenticator.describe())
         self.app.run(host, port, **kwargs)
