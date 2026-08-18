@@ -73,6 +73,9 @@ extern char REP_PROTO_REP_RESP[];
  * response dispatch consumes it unchanged. Mirrors Python's
  * ReputationProtocol.consensus_rep_req — string must match verbatim. */
 extern char REP_PROTO_CONSENSUS_REP_REQ[];
+/** Batched consensus request: many subjects in one message, one roster back.
+ * Mirrors Python ReputationProtocol.consensus_rep_batch_req. */
+extern char REP_PROTO_CONSENSUS_REP_BATCH_REQ[];
 extern char REP_PROTO_LOCAL_QUERY[];
 extern char REP_PROTO_LOCAL_RESP[];
 extern char REP_PROTO_APP_ROSTER[];
