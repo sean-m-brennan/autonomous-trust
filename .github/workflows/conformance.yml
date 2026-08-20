@@ -71,7 +71,7 @@ jobs:
       - name: Set up conda env from environment.yml (Miniforge + mamba)
         uses: conda-incubator/setup-miniconda@v3
         with:
-          # Pinned Miniforge release, not `latest` (ISSUES.md §9.1); the
+          # Pinned Miniforge release, not `latest`; the
           # value is recorded in config/cfg/toolchain-pins.env alongside the
           # container-image digest the Dockerfiles pin to.
           miniforge-version: 26.1.1-3

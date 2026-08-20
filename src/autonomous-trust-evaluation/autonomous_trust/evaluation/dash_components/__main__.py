@@ -25,8 +25,14 @@ from .map_display import MapDisplay
 if __name__ == '__main__':
     host: str = '127.0.0.1'
     port: int = 8050
+    # examples/ lives at the REPO root, not inside the package: five levels up
+    # from dash_components/ (evaluation, autonomous_trust,
+    # autonomous-trust-evaluation, src, repo). The ground/ coordinator is the
+    # display node -- it is the config dir that carries display.cfg.json, which
+    # is what MapDisplay.name == 'display' resolves to.
     coord_cfg = os.path.abspath(os.path.join(os.path.dirname(__file__),
-                                             '..', '..', '..', 'examples', 'mission', 'coordinator'))
+                                             '..', '..', '..', '..', '..',
+                                             'examples', 'mission', 'ground', 'coordinator'))
     os.environ[Configuration.ROOT_VARIABLE_NAME] = coord_cfg
 
     MapDisplay(SimCohort(log_level=logging.DEBUG), force_local=True).run(host, port, debug=True)

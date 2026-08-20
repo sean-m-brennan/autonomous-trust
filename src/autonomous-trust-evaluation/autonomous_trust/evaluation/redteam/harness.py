@@ -113,9 +113,13 @@ class RedTeamHarness:
                         sim_config: dict, caldera: bool = False,
                         caldera_attacks: str = '') -> dict:
         """Launch test-simulation-scenarios.sh and collect metrics."""
+        # Four levels up from redteam/ lands on src/, and the shell scripts
+        # live in the SIMULATOR package's config/ -- the repo-root config/ is
+        # a Python package (config.py, cfg/, env/), not scripts, so the old
+        # src/config path matched nothing.
         script_dir = os.path.join(
             os.path.dirname(__file__), '..', '..', '..', '..',
-            'config')
+            'autonomous-trust-simulator', 'config')
         script = os.path.join(script_dir, 'test-simulation-scenarios.sh')
 
         cmd = ['bash', script]

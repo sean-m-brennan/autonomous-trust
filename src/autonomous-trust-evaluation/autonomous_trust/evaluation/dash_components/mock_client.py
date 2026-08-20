@@ -77,6 +77,9 @@ class SimCohort(CohortInterface):
         self.client.halt = True
 
     def interrupt(self):
+        # Own halt flag first: populate_data loops on it, and nothing else
+        # ever set it, so that thread outlived every shutdown attempt.
+        self.halt = True
         for serv in self.servers:
             serv.halt = True
         # for thread in self.threads:
@@ -141,9 +144,15 @@ class SimCohort(CohortInterface):
                 # FIXME merge video and data sources
                 video = None
                 if idx in self.vid_map:
+                    # examples/ is at the REPO root -- five levels up from
+                    # dash_components/ -- and the clips vid_map names
+                    # (220505_02_MTB_4k_0{15,17,18,20,21}.mp4) live under
+                    # mission/ground/, not a mission/participant/ (which does
+                    # not exist). Neither the old 3-deep path nor the 4-deep
+                    # one commented beside it ever resolved, so every clip
+                    # silently produced no frames.
                     vid_dir = os.path.join(os.path.dirname(__file__),
-                                           '../../../examples/mission/participant/var/at/video')
-                                           #'../../../../examples/mission/participant/var/at/video')
+                                           '../../../../../examples/mission/ground/var/at/video')
                     vid = os.path.abspath(os.path.join(vid_dir, '220505_02_MTB_4k_0%d.mp4' % self.vid_map[idx]))
                     video = SimVideoSource(vid)
                     if 'video' not in self.disables:
@@ -155,12 +164,18 @@ class SimCohort(CohortInterface):
                         self.threads.append(thread)
                 data = SimDataSource()
                 if 'data' not in self.disables:
+                    # Register alongside the video sources: interrupt() halts
+                    # everything in self.servers, and omitting the data source
+                    # here left its thread running forever.
+                    self.servers.append(data)
                     thread = threading.Thread(target=data.run)
                     thread.start()
                     data_q = data.buffer
                     self.threads.append(thread)
                 peer_data = PeerData(self.state.time, self.state.center, 0., peer_id.kind, 'mock', 1)
-                self.peers[uuid] = PeerDataAcq(uuid, idx, MockIdentity(peer_id.nickname, peer_id.nickname),  # noqa intentional
+                # The simulator's Ident carries exactly one name (petname);
+                # PeerDataAcq wants both Zooko slots, so it fills both.
+                self.peers[uuid] = PeerDataAcq(uuid, idx, MockIdentity(peer_id.petname, peer_id.petname),  # noqa intentional
                                                peer_data, self, vid_q, data_q)
                 if video is not None:
                     video.connect(self.peers[uuid])
