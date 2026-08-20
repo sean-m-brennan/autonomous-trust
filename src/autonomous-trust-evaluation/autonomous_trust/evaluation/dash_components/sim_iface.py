@@ -43,6 +43,14 @@ class SimulationInterface(CohortInterface, ScenarioInterface):
 
     cadence = 1
 
+    # ScenarioInterface declares `paused` as an abstract read-only property,
+    # but CohortInterface owns it as a plain read/write attribute set in its
+    # __init__ -- and an instance attribute never satisfies an ABC, so without
+    # this the class stays abstract and cannot be instantiated at all. Declared
+    # at class level rather than as a property because toggle() (and the
+    # sync_objects fan-out) assigns to it.
+    paused = True
+
     def __init__(self, dash_info: DashControl, sim_host: str = '127.0.0.1', sim_port: int = default_port,
                  sync_objects: list[CohortInterface] = None, log_level: int = logging.INFO, logfile: str = None):
         # Initialize both bases. CohortInterface owns the AT-side

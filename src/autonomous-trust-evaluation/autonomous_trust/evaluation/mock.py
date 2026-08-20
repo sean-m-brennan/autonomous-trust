@@ -45,8 +45,13 @@ if __name__ == '__main__':
     steps = default_steps
     config = sys.argv[1]
 
+    # examples/ lives at the REPO root, not inside the package: four levels up
+    # from evaluation/ (autonomous_trust, autonomous-trust-evaluation, src,
+    # repo). Must stay in step with dash_components/__main__.py -- both build
+    # a MapDisplay, so both need the ground/ coordinator's display.cfg.json.
     coord_cfg = os.path.abspath(os.path.join(os.path.dirname(__file__),
-                                             '..', '..', 'examples', 'mission', 'coordinator'))
+                                             '..', '..', '..', '..',
+                                             'examples', 'mission', 'ground', 'coordinator'))
     os.environ[Configuration.ROOT_VARIABLE_NAME] = coord_cfg
     ctx = multiprocessing.get_context('forkserver')
     manager = ctx.Manager()

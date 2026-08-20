@@ -97,18 +97,49 @@ class TestDynamicMap:
         assert d is not None
 
     def test_trim_traces(self):
+        """Trims from the OLD end only. The pre-2026-08-19 slice was
+        `[num:-1]`, which also dropped the newest sample -- 3 not 2."""
         dm = self._make_map()
         dm.cohort.peers = {'uuid-1': MagicMock(active=True)}
         dm.coords = {'uuid-1': Coord(deque([1, 2, 3, 4, 5]), deque([10, 20, 30, 40, 50]))}
         dm.trim_traces(2)
         assert dm.skip_trace is True
-        assert len(dm.coords['uuid-1'].lat) == 2
+        assert list(dm.coords['uuid-1'].lat) == [3, 4, 5]
+        assert list(dm.coords['uuid-1'].lon) == [30, 40, 50]
+
+    def test_trim_traces_keeps_maxlen(self):
+        """A trimmed trail still rolls over at trace_len. Rebuilding the
+        deques without maxlen made every trail unbounded after one trim, so
+        trails grew forever once the skip-back button was pressed."""
+        dm = self._make_map()
+        dm.cohort.peers = {'uuid-1': MagicMock(active=True)}
+        n = DynamicMap.trace_len
+        dm.coords = {'uuid-1': Coord(deque(range(n), maxlen=n), deque(range(n), maxlen=n))}
+        dm.trim_traces(2)
+        assert dm.coords['uuid-1'].lat.maxlen == n
+        for i in range(n * 2):  # overfill
+            dm.coords['uuid-1'].lat.append(i)
+            dm.coords['uuid-1'].lon.append(i)
+        assert len(dm.coords['uuid-1'].lat) == n
+        assert len(dm.coords['uuid-1'].lon) == n
+
+    def test_trim_traces_before_first_update(self):
+        """Active peers exist before any position sample does:
+        acquire_initial_conditions adds their traces without seeding `coords`,
+        so a trim in that window used to raise KeyError."""
+        dm = self._make_map()
+        dm.cohort.peers = {'uuid-1': MagicMock(active=True)}
+        dm.coords = {}
+        dm.trim_traces(5)
+        assert dm.skip_trace is True
+        assert 'uuid-1' not in dm.coords
 
     def test_trim_traces_inactive_peer(self):
         dm = self._make_map()
         dm.cohort.peers = {'uuid-1': MagicMock(active=False)}
         dm.coords = {'uuid-1': Coord(deque([1, 2, 3]), deque([10, 20, 30]))}
         dm.trim_traces(1)
+        assert list(dm.coords['uuid-1'].lat) == [1, 2, 3]
 
     def test_update_paths_no_center(self):
         dm = self._make_map()

@@ -24,7 +24,7 @@
 
 # Base image pinned by tag AND digest -- Miniforge re-pushes tags, so the tag
 # alone does not fix the contents. Value recorded once in
-# config/cfg/toolchain-pins.env (ISSUES.md §9.1), which is also what
+# config/cfg/toolchain-pins.env, which is also what
 # build-docker.sh passes as --build-arg; the default here keeps a bare
 # `docker build -f src/autonomous-trust/Dockerfile-devel .` equally pinned.
 ARG MINIFORGE_IMAGE=condaforge/miniforge3:26.1.1-3@sha256:958d2675e9a43e199cc85345ff4c60796236b651a9da4982765d99bd34a682d1
@@ -71,7 +71,7 @@ USER user
 # plugin had no remaining purpose -- and installing it re-solved the base env,
 # which is how base conda was silently upgraded past the version this image
 # ships and into the sharded-repodata defect that broke the build on
-# 2026-08-04 (ISSUES.md §9.1). With the install gone, base conda is exactly
+# 2026-08-04. With the install gone, base conda is exactly
 # what the pinned base image carries, and `conda config --set
 # repodata_use_shards false` -- a workaround for a code path only the rattler
 # plugin took -- went with it. The env create/update below now use the same

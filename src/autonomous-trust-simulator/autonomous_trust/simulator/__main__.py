@@ -22,12 +22,12 @@ from .simulator import Simulator
 
 parser = argparse.ArgumentParser()
 parser.add_argument('config')
-parser.add_argument('--steps', nargs='?', default=default_steps)
+parser.add_argument('--steps', nargs='?', type=int, default=default_steps)
 parser.add_argument('--log', nargs='?', default=None)
 parser.add_argument('--log-level', nargs='?', default='warning')
 parser.add_argument('--resolve-fqdn', action='store_true')
 parser.add_argument('--resolve-short-name', action='store_true')
-parser.add_argument('--port', nargs='?', default=default_port)
+parser.add_argument('--port', nargs='?', type=int, default=default_port)
 args = parser.parse_args()
 
 log_level = logging.WARNING
