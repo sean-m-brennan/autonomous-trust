@@ -254,4 +254,19 @@ class MapDisplay(object):
             self.prev_full_status = OrderedDict(current)
             return patched
 
-        self.ctl.run(host, port, debug=debug)
+        try:
+            self.ctl.run(host, port, debug=debug)
+        finally:
+            # Stop the worker threads HERE, not from the atexit hooks the
+            # interfaces register. Python joins non-daemon threads *before*
+            # running atexit handlers, so an atexit-only shutdown can never
+            # release them -- populate_data, the mock sources and the sim_net
+            # reconnect loops kept the interpreter alive and the process had
+            # to be killed. Each interrupt() is independent, so one failing
+            # must not strand the others.
+            for iface in interfaces:
+                try:
+                    iface.interrupt()
+                except Exception:  # noqa: BLE001 - best-effort shutdown
+                    logger.debug('interrupt failed for %s', type(iface).__name__,
+                                 exc_info=True)

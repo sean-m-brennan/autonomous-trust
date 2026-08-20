@@ -144,10 +144,13 @@ process (`autonomous_trust.simulator`) and pushed to the dashboard
 over a socket. The dashboard side uses `SimulationInterface` directly:
 no new code required.
 
-### 1. Define a simulator scenario YAML
+### 1. Define a simulator scenario file
 
-The simulator consumes a scenario YAML describing peers, paths,
-antennas, and data streams. See
+The simulator consumes a scenario file describing peers, paths,
+antennas, and data streams. Despite the historical `.yaml` name, the
+content is the JSON `Configuration` form (`__type__`-tagged objects,
+loaded by `SimConfig.load`); the YAML tag format (`!Cfg:...`) was
+retired with the JSON serialization switch. See
 `examples/mission/simulator/scenario.yaml` for a worked example. The
 multi-agency demo also has a generator
 (`examples/multi_agency/simulator/generate_scenario.py`) that

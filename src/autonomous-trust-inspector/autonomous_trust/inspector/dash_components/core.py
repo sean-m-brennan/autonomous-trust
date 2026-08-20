@@ -488,7 +488,19 @@ class DashControl(object):
         # ValueError — and the owning main thread should handle signals
         # anyway. Only grab SIGINT when we ARE the main thread.
         if threading.current_thread() is threading.main_thread():
-            signal.signal(signal.SIGINT, lambda s, f: self.halt())
+            def _on_sigint(_sig, _frame):
+                # halt() only stops the websocket loop. Installing it as the
+                # SIGINT handler REPLACED Python's default KeyboardInterrupt,
+                # so ^C tore down the sockets and left the HTTP server in
+                # serve_forever -- the app kept answering requests and had to
+                # be killed. Re-raise so werkzeug unwinds normally, and drop
+                # back to SIG_DFL first so a second ^C always hard-quits even
+                # if shutdown wedges.
+                self.halt()
+                signal.signal(signal.SIGINT, signal.SIG_DFL)
+                raise KeyboardInterrupt
+
+            signal.signal(signal.SIGINT, _on_sigint)
         self.serve_websockets()
         # Serve the PAGE over the same posture as the socket. A token typed
         # into a page delivered over plaintext http is a token on the wire, so

@@ -60,17 +60,21 @@ class DynamicMap(DashComponent):
         self.initialized = False
         self.peer_tracker: dict[str, bool] = {}
 
-        @ctl.callback(Output('map-slider-target', 'children'),
-                      [Input('pitch-slider', 'value'),
-                       Input('bearing-slider', 'value')],
-                      # prevent_initial_call=True
-                      )
-        def handle_sliders(pitch, bearing):
-            if 'pitch-slider' == ctx.triggered_id:
-                self.pitch = pitch
-            elif 'bearing-slider' == ctx.triggered_id:
-                self.bearing = bearing
-            return ''
+        # Registered only alongside the sliders div() emits: layout.geo has no
+        # pitch/bearing, so in geo mode the controls do not exist and a
+        # callback bound to their ids would have nothing to listen to.
+        if self.use_map:
+            @ctl.callback(Output('map-slider-target', 'children'),
+                          [Input('pitch-slider', 'value'),
+                           Input('bearing-slider', 'value')],
+                          # prevent_initial_call=True
+                          )
+            def handle_sliders(pitch, bearing):
+                if 'pitch-slider' == ctx.triggered_id:
+                    self.pitch = pitch
+                elif 'bearing-slider' == ctx.triggered_id:
+                    self.bearing = bearing
+                return ''
 
         @ctl.callback(Output('map-scale-target', 'children'),
                       [Input('map-graph', 'relayoutData')])
@@ -133,25 +137,36 @@ class DynamicMap(DashComponent):
                     self.fig.update_traces(selector=dict(name=f'follow-{uuid}'), mode='markers',
                                            overwrite=True,
                                            lat=[self.coords[uuid].lat[-1]], lon=[self.coords[uuid].lon[-1]])
-        # UI tuning open: also trigger this branch on pitch / bearing
-        # / follow changes — z_scale alone misses camera-state edits.
-        if self.z_scale != self.default_scale:
-            margin = dict(l=self.fig_margin, r=self.fig_margin, t=self.fig_margin, b=self.fig_margin)
-            if self.use_map:
-                self.fig.update_layout(dict(**self.basic_layout,
-                                            map=dict(style=self.map_style,
-                                                     center=dict(lat=self.center.lat, lon=self.center.lon),
-                                                     zoom=self.z_scale,
-                                                     pitch=self.pitch,
-                                                     bearing=self.bearing,
-                                                     ), ),
-                                       True)
-            else:
-                self.fig.update_layout(dict(**self.basic_layout,
-                                            geo=dict(center=dict(lat=self.center.lat, lon=self.center.lon),
-                                                     projection=dict(scale=self.z_scale),
-                                                     ), ),
-                                       True)
+        # Camera state is re-applied on EVERY update. This used to be gated on
+        # `self.z_scale != self.default_scale`, which silently meant two
+        # different things per mode: acquire_initial_conditions sets z_scale=14
+        # for tiles (gate always open), but in geo mode z_scale starts *at*
+        # default_scale, so the gate stayed shut until the user happened to
+        # zoom -- and until then pitch, bearing and follow-recenter were all
+        # discarded. Camera state changes for reasons z_scale cannot observe
+        # (a slider move, a new follow target), so there is nothing useful to
+        # gate on; re-emitting it is part of the figure push either way.
+        if self.use_map:
+            self.fig.update_layout(dict(**self.basic_layout,
+                                        map=dict(style=self.map_style,
+                                                 center=dict(lat=self.center.lat, lon=self.center.lon),
+                                                 zoom=self.z_scale,
+                                                 pitch=self.pitch,
+                                                 bearing=self.bearing,
+                                                 ), ),
+                                   True)
+        else:
+            # NB pitch/bearing are deliberately absent: layout.geo has no such
+            # properties. `projection.tilt` is satellite-projection-only and
+            # `projection.rotation` does not apply to the `albers usa`
+            # composite that scope='usa' selects, so honouring the sliders here
+            # needs a projection-type change -- a visible design decision, not
+            # a bug fix. Follow-recenter and zoom DO work now.
+            self.fig.update_layout(dict(**self.basic_layout,
+                                        geo=dict(center=dict(lat=self.center.lat, lon=self.center.lon),
+                                                 projection=dict(scale=self.z_scale),
+                                                 ), ),
+                                   True)
         if self.ctl.legacy:
             config = dict(displayModeBar=False)
             self.ctl.emit('update_figure', ['map-graph', self.fig.to_dict(), config])
@@ -159,39 +174,57 @@ class DynamicMap(DashComponent):
             self.ctl.push_mods({'map-graph': {'figure': self.fig.to_dict()}})
 
     def trim_traces(self, num: int):
+        """Drop the oldest `num` samples from every active peer's trail.
+
+        Rebuilding a Coord must restate `maxlen`: a bare `deque(...)` is
+        unbounded, so a trimmed trail would keep growing past `trace_len` on
+        every later append instead of rolling over. The slice ends at the end
+        of the trail on purpose -- `[num:-1]` also threw away the newest
+        sample, so the marker lagged its own trace by one update per trim.
+        """
         for uuid in self.cohort.peers:
             if not self.cohort.peers[uuid].active:
                 continue
-            self.coords[uuid] = Coord(deque(list(self.coords[uuid].lat)[num:-1]),
-                                      deque(list(self.coords[uuid].lon)[num:-1]))
+            if uuid not in self.coords:
+                # Active with no samples yet: acquire_initial_conditions adds a
+                # peer's traces without seeding `coords`, so a trim arriving
+                # before the first update_paths has nothing to cut.
+                continue
+            self.coords[uuid] = Coord(deque(list(self.coords[uuid].lat)[num:], maxlen=self.trace_len),
+                                      deque(list(self.coords[uuid].lon)[num:], maxlen=self.trace_len))
         self.skip_trace = True
 
     def div(self):
-        return html.Div([
-            html.Div(id='map-scale-target', style={'display': 'none'}),
-            html.Div(id='map-slider-target', style={'display': 'none'}),
-            dbc.Row([
-                dbc.Col([
-                    dbc.Stack([
-                        html.Div([
-                            'Pitch',
-                            dcc.Slider(0, self.max_pitch, 5, value=self.pitch,
-                                       id='pitch-slider', vertical=True, verticalHeight=self.height),
-                        ]),
-                        dcc.Graph(id='map-graph', figure=self.fig, config=dict(displayModeBar=False),
-                                  animate=True),
-                    ], direction="horizontal"),
+        graph = dcc.Graph(id='map-graph', figure=self.fig, config=dict(displayModeBar=False),
+                          animate=True)
+        # Pitch and bearing are tiles-only. layout.geo exposes neither (see
+        # update_paths), so offering the sliders in geo mode would be shipping
+        # two controls that silently do nothing.
+        if self.use_map:
+            map_row = dbc.Stack([
+                html.Div([
+                    'Pitch',
+                    dcc.Slider(0, self.max_pitch, 5, value=self.pitch,
+                               id='pitch-slider', vertical=True, verticalHeight=self.height),
                 ]),
-            ]),
-            dbc.Row([
+                graph,
+            ], direction="horizontal")
+        else:
+            map_row = graph
+        rows = [dbc.Row([dbc.Col([map_row])])]
+        if self.use_map:
+            rows.append(dbc.Row([
                 dbc.Col(
                     html.Div([
                         'Bearing',
                         dcc.Slider(0, 340, 20, value=self.bearing, id='bearing-slider'),
                     ]),
                 ),
-            ]),
-        ])
+            ]))
+        return html.Div([
+            html.Div(id='map-scale-target', style={'display': 'none'}),
+            html.Div(id='map-slider-target', style={'display': 'none'}),
+        ] + rows)
 
     def add_traces(self, idx, uuid):
         position = self.cohort.peers[uuid].position.convert(GeoPosition)
