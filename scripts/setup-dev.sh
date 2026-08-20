@@ -36,7 +36,7 @@ MINIFORGE_HOME="$HOME/.miniforge3"
 # Pinned conda toolchain (config/cfg/toolchain-pins.env). MINIFORGE_VERSION selects the
 # installer release below; the file also carries the container-image pin the
 # Dockerfiles use. Fall back to `latest` only if the file is missing, and say so
-# -- a floating installer is exactly the drift §9.1 records.
+# -- a floating installer is exactly the drift that file exists to prevent.
 TOOLCHAIN_PINS="$CFG_DIR/toolchain-pins.env"
 if [ -f "$TOOLCHAIN_PINS" ]; then
     # shellcheck source=../config/cfg/toolchain-pins.env

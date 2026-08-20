@@ -1,413 +1,1283 @@
-!Cfg:autonomous_trust.simulator.sim_data.SimConfig
-end: &id001 !datetime 2023-12-12T13:00:00
-peers:
-- !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
-  antenna: &id011 !Enumcfg:autonomous_trust.simulator.radio.iface.Antenna DIPOLE
-  data_streams:
-  - video003c01
-  iface: &id012 !Enumcfg:autonomous_trust.simulator.radio.iface.NetInterface SMALL
-  initial_position: &id003 !Cfg:autonomous_trust.services.peer.position.UTMPosition
-    alt: 197.0
-    easting: 533548.4100504565
-    northing: 3840557.439307108
-    zone: 16N
-  initial_time: &id002 !datetime 2023-12-12T12:00:00
-  ip4_addr: 172.27.3.103
-  kind: microdrone
-  last_seen: *id001
-  nickname: Fixer
-  path_list:
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: &id004 !Enumcfg:autonomous_trust.simulator.peer.path.Variability UNIFORM
-    begin: *id002
-    end: &id005 !datetime 2023-12-12T12:24:00
-    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
-      ctl_pts:
-      - &id010 !Cfg:autonomous_trust.services.peer.position.UTMPosition
-        alt: 196.0
-        easting: 534048.4100504565
-        northing: 3842545.1389517114
-        zone: 16N
-      - &id009 !Cfg:autonomous_trust.services.peer.position.UTMPosition
-        alt: 196.0
-        easting: 532478.5459671372
-        northing: 3840557.439307108
-        zone: 16N
-      end: &id006 !Cfg:autonomous_trust.services.peer.position.UTMPosition
-        alt: 195.0
-        easting: 532978.5459671372
-        northing: 3842545.1389517114
-        zone: 16N
-      start: *id003
-    speed: 2.0
-    variability: &id007 !Enumcfg:autonomous_trust.simulator.peer.path.Variability GAUSSIAN
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: *id004
-    begin: *id005
-    end: &id008 !datetime 2023-12-12T12:33:00
-    shape: !Cfg:autonomous_trust.simulator.peer.path.PointData
-      start: *id006
-    speed: 2.0
-    variability: *id007
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: *id004
-    begin: *id008
-    end: *id001
-    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
-      ctl_pts:
-      - *id009
-      - *id010
-      end: *id003
-      start: *id006
-    speed: 2.0
-    variability: *id007
-  signal: -200.0
-  uuid: d595e9ed-5600-473f-b551-8670cbf3796d
-- !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
-  antenna: *id011
-  data_streams:
-  - audio001c01
-  - audio001c02
-  - audio001c03
-  - audio001c04
-  - audio001c05
-  - video001c01
-  iface: *id012
-  initial_position: *id003
-  initial_time: *id002
-  ip4_addr: 172.27.3.101
-  kind: microdrone
-  last_seen: *id001
-  nickname: Boss
-  path_list:
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: *id004
-    begin: *id002
-    end: *id005
-    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
-      ctl_pts:
-      - *id010
-      - *id009
-      end: *id006
-      start: *id003
-    speed: 2.0
-    variability: *id007
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: *id004
-    begin: *id005
-    end: *id008
-    shape: !Cfg:autonomous_trust.simulator.peer.path.PointData
-      start: *id006
-    speed: 2.0
-    variability: *id007
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: *id004
-    begin: *id008
-    end: *id001
-    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
-      ctl_pts:
-      - *id009
-      - *id010
-      end: *id003
-      start: *id006
-    speed: 2.0
-    variability: *id007
-  signal: -200.0
-  uuid: af56b7d9-e05b-4d4d-9c75-b6f6b2c76fde
-- !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
-  antenna: &id014 !Enumcfg:autonomous_trust.simulator.radio.iface.Antenna PARABOLIC
-  data_streams: []
-  iface: &id015 !Enumcfg:autonomous_trust.simulator.radio.iface.NetInterface LARGE
-  initial_position: &id013 !Cfg:autonomous_trust.services.peer.position.UTMPosition
-    alt: 5000.0
-    easting: 532978.5459671372
-    northing: 3842545.1389517114
-    zone: 16N
-  initial_time: *id002
-  ip4_addr: 172.27.3.108
-  kind: recon
-  last_seen: *id001
-  nickname: RQ-86-008
-  path_list:
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: *id004
-    begin: *id002
-    end: *id001
-    shape: !Cfg:autonomous_trust.simulator.peer.path.EllipseData
-      angle: -90.0
-      center: *id013
-      loops: 3
-      semi_major: 1800
-      semi_minor: 1200
-    speed: 90.2
-    variability: *id007
-  signal: -1200.0
-  uuid: 99603269-984d-4bdb-aedd-9918dd14f4c8
-- !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
-  antenna: *id011
-  data_streams:
-  - video002c01
-  iface: *id012
-  initial_position: *id003
-  initial_time: *id002
-  ip4_addr: 172.27.3.102
-  kind: microdrone
-  last_seen: *id001
-  nickname: Scorch
-  path_list:
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: *id004
-    begin: *id002
-    end: *id005
-    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
-      ctl_pts:
-      - *id010
-      - *id009
-      end: *id006
-      start: *id003
-    speed: 2.0
-    variability: *id007
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: *id004
-    begin: *id005
-    end: *id008
-    shape: !Cfg:autonomous_trust.simulator.peer.path.PointData
-      start: *id006
-    speed: 2.0
-    variability: *id007
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: *id004
-    begin: *id008
-    end: *id001
-    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
-      ctl_pts:
-      - *id009
-      - *id010
-      end: *id003
-      start: *id006
-    speed: 2.0
-    variability: *id007
-  signal: -200.0
-  uuid: c7b2c7f1-572f-464d-8661-a736ddba729a
-- !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
-  antenna: *id011
-  data_streams:
-  - comm004c01
-  - comm004c02
-  - comm004c03
-  - comm004c04
-  - comm004c05
-  - comm004c06
-  - comm004c07
-  - comm004c08
-  - comm004c09
-  - comm004c10
-  - video004c01
-  iface: *id012
-  initial_position: *id003
-  initial_time: *id002
-  ip4_addr: 172.27.3.104
-  kind: microdrone
-  last_seen: *id001
-  nickname: Sev
-  path_list:
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: *id004
-    begin: *id002
-    end: *id005
-    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
-      ctl_pts:
-      - *id010
-      - *id009
-      end: *id006
-      start: *id003
-    speed: 2.0
-    variability: *id007
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: *id004
-    begin: *id005
-    end: *id008
-    shape: !Cfg:autonomous_trust.simulator.peer.path.PointData
-      start: *id006
-    speed: 2.0
-    variability: *id007
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: *id004
-    begin: *id008
-    end: *id001
-    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
-      ctl_pts:
-      - *id009
-      - *id010
-      end: *id003
-      start: *id006
-    speed: 2.0
-    variability: *id007
-  signal: -200.0
-  uuid: 4767eaf1-92e3-4a64-b04e-6384e60802dc
-- !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
-  antenna: *id011
-  data_streams: []
-  iface: *id012
-  initial_position: *id003
-  initial_time: *id002
-  ip4_addr: 172.27.3.106
-  kind: soldier
-  last_seen: *id001
-  nickname: CWONovosel
-  path_list:
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: *id004
-    begin: *id002
-    end: *id005
-    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
-      ctl_pts:
-      - *id010
-      - *id009
-      end: *id006
-      start: *id003
-    speed: 1.2
-    variability: *id007
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: *id004
-    begin: *id005
-    end: *id008
-    shape: !Cfg:autonomous_trust.simulator.peer.path.PointData
-      start: *id006
-    speed: 0
-    variability: *id007
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: *id004
-    begin: *id008
-    end: *id001
-    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
-      ctl_pts:
-      - *id009
-      - *id010
-      end: *id003
-      start: *id006
-    speed: 1.6
-    variability: *id007
-  signal: -200.0
-  uuid: 9ce3e8ef-2767-4063-b8e8-e00efe24cc20
-- !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
-  antenna: *id011
-  data_streams:
-  - video005c01
-  iface: *id012
-  initial_position: *id003
-  initial_time: *id002
-  ip4_addr: 172.27.3.105
-  kind: soldier
-  last_seen: *id001
-  nickname: SGMPayne
-  path_list:
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: *id004
-    begin: *id002
-    end: *id005
-    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
-      ctl_pts:
-      - *id010
-      - *id009
-      end: *id006
-      start: *id003
-    speed: 1.2
-    variability: *id007
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: *id004
-    begin: *id005
-    end: *id008
-    shape: !Cfg:autonomous_trust.simulator.peer.path.PointData
-      start: *id006
-    speed: 0
-    variability: *id007
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: *id004
-    begin: *id008
-    end: *id001
-    shape: !Cfg:autonomous_trust.simulator.peer.path.BezierData
-      ctl_pts:
-      - *id009
-      - *id010
-      end: *id003
-      start: *id006
-    speed: 1.6
-    variability: *id007
-  signal: -200.0
-  uuid: fc69acad-797a-4e63-be98-2f00ea26dffa
-- !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
-  antenna: *id014
-  data_streams:
-  - comm007c01
-  - comm007c02
-  - comm007c03
-  - comm007c04
-  - comm007c05
-  - comm007c06
-  - comm007c07
-  - comm007c08
-  - comm007c09
-  - comm007c10
-  - comm007c11
-  - comm007c12
-  - comm007c13
-  - comm007c14
-  - comm007c15
-  - comm007c16
-  - comm007c17
-  - comm007c18
-  - comm007c19
-  - comm007c20
-  iface: *id015
-  initial_position: *id013
-  initial_time: *id002
-  ip4_addr: 172.27.3.107
-  kind: recon
-  last_seen: *id001
-  nickname: RQ-86-007
-  path_list:
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: *id004
-    begin: *id002
-    end: *id001
-    shape: !Cfg:autonomous_trust.simulator.peer.path.EllipseData
-      angle: 90.0
-      center: *id013
-      loops: 3
-      semi_major: 1200
-      semi_minor: -1800
-    speed: 90.2
-    variability: *id007
-  signal: -1200.0
-  uuid: 1cb38d6b-7443-48a1-8f87-6f77d9cfea24
-- !Cfg:autonomous_trust.simulator.peer.peer.PeerInfo
-  antenna: !Enumcfg:autonomous_trust.simulator.radio.iface.Antenna YAGI
-  data_streams: []
-  iface: *id015
-  initial_position: &id017 !Cfg:autonomous_trust.services.peer.position.UTMPosition
-    alt: 400.0
-    easting: 550009.4806139951
-    northing: 3842621.8774011643
-    zone: 16N
-  initial_time: &id016 !datetime 2023-12-12T12:21:40
-  ip4_addr: 172.27.3.109
-  kind: jet
-  last_seen: *id001
-  nickname: ColJones
-  path_list:
-  - !Cfg:autonomous_trust.simulator.peer.path.PathData
-    accel: *id004
-    begin: *id016
-    end: *id001
-    shape: !Cfg:autonomous_trust.simulator.peer.path.EllipseData
-      angle: 135.0
-      center: *id017
-      loops: 1
-      semi_major: 18000
-      semi_minor: 480
-    speed: 203.4
-    variability: *id007
-  signal: -1200.0
-  uuid: b305dc70-b39d-4150-aafa-2bfb7fe4dc58
-start: *id002
+{
+  "__type__": "autonomous_trust.simulator.sim_data.SimConfig",
+  "end": {
+    "__type__": "datetime",
+    "__value__": "2023-12-12T13:00:00"
+  },
+  "peers": [
+    {
+      "__type__": "autonomous_trust.simulator.peer.peer.PeerInfo",
+      "antenna": {
+        "__type__": "Enumcfg:autonomous_trust.simulator.radio.iface.Antenna",
+        "__value__": "DIPOLE"
+      },
+      "data_streams": [
+        "video003c01"
+      ],
+      "iface": {
+        "__type__": "Enumcfg:autonomous_trust.simulator.radio.iface.NetInterface",
+        "__value__": "SMALL"
+      },
+      "initial_position": {
+        "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+        "alt": 197.0,
+        "easting": 533548.4100504565,
+        "northing": 3840557.439307108,
+        "zone": "16N"
+      },
+      "initial_time": {
+        "__type__": "datetime",
+        "__value__": "2023-12-12T12:00:00"
+      },
+      "ip4_addr": "172.27.3.103",
+      "kind": "microdrone",
+      "last_seen": {
+        "__type__": "datetime",
+        "__value__": "2023-12-12T13:00:00"
+      },
+      "petname": "Fixer",
+      "path_list": [
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:00:00"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:24:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.BezierData",
+            "ctl_pts": [
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 534048.4100504565,
+                "northing": 3842545.1389517114,
+                "zone": "16N"
+              },
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 532478.5459671372,
+                "northing": 3840557.439307108,
+                "zone": "16N"
+              }
+            ],
+            "end": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 195.0,
+              "easting": 532978.5459671372,
+              "northing": 3842545.1389517114,
+              "zone": "16N"
+            },
+            "start": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 197.0,
+              "easting": 533548.4100504565,
+              "northing": 3840557.439307108,
+              "zone": "16N"
+            }
+          },
+          "speed": 2.0,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        },
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:24:00"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:33:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.PointData",
+            "start": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 195.0,
+              "easting": 532978.5459671372,
+              "northing": 3842545.1389517114,
+              "zone": "16N"
+            }
+          },
+          "speed": 2.0,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        },
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:33:00"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T13:00:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.BezierData",
+            "ctl_pts": [
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 532478.5459671372,
+                "northing": 3840557.439307108,
+                "zone": "16N"
+              },
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 534048.4100504565,
+                "northing": 3842545.1389517114,
+                "zone": "16N"
+              }
+            ],
+            "end": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 197.0,
+              "easting": 533548.4100504565,
+              "northing": 3840557.439307108,
+              "zone": "16N"
+            },
+            "start": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 195.0,
+              "easting": 532978.5459671372,
+              "northing": 3842545.1389517114,
+              "zone": "16N"
+            }
+          },
+          "speed": 2.0,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        }
+      ],
+      "signal": -200.0,
+      "uuid": "d595e9ed-5600-473f-b551-8670cbf3796d"
+    },
+    {
+      "__type__": "autonomous_trust.simulator.peer.peer.PeerInfo",
+      "antenna": {
+        "__type__": "Enumcfg:autonomous_trust.simulator.radio.iface.Antenna",
+        "__value__": "DIPOLE"
+      },
+      "data_streams": [
+        "audio001c01",
+        "audio001c02",
+        "audio001c03",
+        "audio001c04",
+        "audio001c05",
+        "video001c01"
+      ],
+      "iface": {
+        "__type__": "Enumcfg:autonomous_trust.simulator.radio.iface.NetInterface",
+        "__value__": "SMALL"
+      },
+      "initial_position": {
+        "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+        "alt": 197.0,
+        "easting": 533548.4100504565,
+        "northing": 3840557.439307108,
+        "zone": "16N"
+      },
+      "initial_time": {
+        "__type__": "datetime",
+        "__value__": "2023-12-12T12:00:00"
+      },
+      "ip4_addr": "172.27.3.101",
+      "kind": "microdrone",
+      "last_seen": {
+        "__type__": "datetime",
+        "__value__": "2023-12-12T13:00:00"
+      },
+      "petname": "Boss",
+      "path_list": [
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:00:00"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:24:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.BezierData",
+            "ctl_pts": [
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 534048.4100504565,
+                "northing": 3842545.1389517114,
+                "zone": "16N"
+              },
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 532478.5459671372,
+                "northing": 3840557.439307108,
+                "zone": "16N"
+              }
+            ],
+            "end": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 195.0,
+              "easting": 532978.5459671372,
+              "northing": 3842545.1389517114,
+              "zone": "16N"
+            },
+            "start": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 197.0,
+              "easting": 533548.4100504565,
+              "northing": 3840557.439307108,
+              "zone": "16N"
+            }
+          },
+          "speed": 2.0,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        },
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:24:00"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:33:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.PointData",
+            "start": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 195.0,
+              "easting": 532978.5459671372,
+              "northing": 3842545.1389517114,
+              "zone": "16N"
+            }
+          },
+          "speed": 2.0,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        },
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:33:00"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T13:00:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.BezierData",
+            "ctl_pts": [
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 532478.5459671372,
+                "northing": 3840557.439307108,
+                "zone": "16N"
+              },
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 534048.4100504565,
+                "northing": 3842545.1389517114,
+                "zone": "16N"
+              }
+            ],
+            "end": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 197.0,
+              "easting": 533548.4100504565,
+              "northing": 3840557.439307108,
+              "zone": "16N"
+            },
+            "start": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 195.0,
+              "easting": 532978.5459671372,
+              "northing": 3842545.1389517114,
+              "zone": "16N"
+            }
+          },
+          "speed": 2.0,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        }
+      ],
+      "signal": -200.0,
+      "uuid": "af56b7d9-e05b-4d4d-9c75-b6f6b2c76fde"
+    },
+    {
+      "__type__": "autonomous_trust.simulator.peer.peer.PeerInfo",
+      "antenna": {
+        "__type__": "Enumcfg:autonomous_trust.simulator.radio.iface.Antenna",
+        "__value__": "PARABOLIC"
+      },
+      "data_streams": [],
+      "iface": {
+        "__type__": "Enumcfg:autonomous_trust.simulator.radio.iface.NetInterface",
+        "__value__": "LARGE"
+      },
+      "initial_position": {
+        "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+        "alt": 5000.0,
+        "easting": 532978.5459671372,
+        "northing": 3842545.1389517114,
+        "zone": "16N"
+      },
+      "initial_time": {
+        "__type__": "datetime",
+        "__value__": "2023-12-12T12:00:00"
+      },
+      "ip4_addr": "172.27.3.108",
+      "kind": "recon",
+      "last_seen": {
+        "__type__": "datetime",
+        "__value__": "2023-12-12T13:00:00"
+      },
+      "petname": "RQ-86-008",
+      "path_list": [
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:00:00"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T13:00:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.EllipseData",
+            "angle": -90.0,
+            "center": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 5000.0,
+              "easting": 532978.5459671372,
+              "northing": 3842545.1389517114,
+              "zone": "16N"
+            },
+            "loops": 3,
+            "semi_major": 1800,
+            "semi_minor": 1200
+          },
+          "speed": 90.2,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        }
+      ],
+      "signal": -1200.0,
+      "uuid": "99603269-984d-4bdb-aedd-9918dd14f4c8"
+    },
+    {
+      "__type__": "autonomous_trust.simulator.peer.peer.PeerInfo",
+      "antenna": {
+        "__type__": "Enumcfg:autonomous_trust.simulator.radio.iface.Antenna",
+        "__value__": "DIPOLE"
+      },
+      "data_streams": [
+        "video002c01"
+      ],
+      "iface": {
+        "__type__": "Enumcfg:autonomous_trust.simulator.radio.iface.NetInterface",
+        "__value__": "SMALL"
+      },
+      "initial_position": {
+        "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+        "alt": 197.0,
+        "easting": 533548.4100504565,
+        "northing": 3840557.439307108,
+        "zone": "16N"
+      },
+      "initial_time": {
+        "__type__": "datetime",
+        "__value__": "2023-12-12T12:00:00"
+      },
+      "ip4_addr": "172.27.3.102",
+      "kind": "microdrone",
+      "last_seen": {
+        "__type__": "datetime",
+        "__value__": "2023-12-12T13:00:00"
+      },
+      "petname": "Scorch",
+      "path_list": [
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:00:00"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:24:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.BezierData",
+            "ctl_pts": [
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 534048.4100504565,
+                "northing": 3842545.1389517114,
+                "zone": "16N"
+              },
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 532478.5459671372,
+                "northing": 3840557.439307108,
+                "zone": "16N"
+              }
+            ],
+            "end": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 195.0,
+              "easting": 532978.5459671372,
+              "northing": 3842545.1389517114,
+              "zone": "16N"
+            },
+            "start": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 197.0,
+              "easting": 533548.4100504565,
+              "northing": 3840557.439307108,
+              "zone": "16N"
+            }
+          },
+          "speed": 2.0,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        },
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:24:00"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:33:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.PointData",
+            "start": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 195.0,
+              "easting": 532978.5459671372,
+              "northing": 3842545.1389517114,
+              "zone": "16N"
+            }
+          },
+          "speed": 2.0,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        },
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:33:00"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T13:00:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.BezierData",
+            "ctl_pts": [
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 532478.5459671372,
+                "northing": 3840557.439307108,
+                "zone": "16N"
+              },
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 534048.4100504565,
+                "northing": 3842545.1389517114,
+                "zone": "16N"
+              }
+            ],
+            "end": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 197.0,
+              "easting": 533548.4100504565,
+              "northing": 3840557.439307108,
+              "zone": "16N"
+            },
+            "start": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 195.0,
+              "easting": 532978.5459671372,
+              "northing": 3842545.1389517114,
+              "zone": "16N"
+            }
+          },
+          "speed": 2.0,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        }
+      ],
+      "signal": -200.0,
+      "uuid": "c7b2c7f1-572f-464d-8661-a736ddba729a"
+    },
+    {
+      "__type__": "autonomous_trust.simulator.peer.peer.PeerInfo",
+      "antenna": {
+        "__type__": "Enumcfg:autonomous_trust.simulator.radio.iface.Antenna",
+        "__value__": "DIPOLE"
+      },
+      "data_streams": [
+        "comm004c01",
+        "comm004c02",
+        "comm004c03",
+        "comm004c04",
+        "comm004c05",
+        "comm004c06",
+        "comm004c07",
+        "comm004c08",
+        "comm004c09",
+        "comm004c10",
+        "video004c01"
+      ],
+      "iface": {
+        "__type__": "Enumcfg:autonomous_trust.simulator.radio.iface.NetInterface",
+        "__value__": "SMALL"
+      },
+      "initial_position": {
+        "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+        "alt": 197.0,
+        "easting": 533548.4100504565,
+        "northing": 3840557.439307108,
+        "zone": "16N"
+      },
+      "initial_time": {
+        "__type__": "datetime",
+        "__value__": "2023-12-12T12:00:00"
+      },
+      "ip4_addr": "172.27.3.104",
+      "kind": "microdrone",
+      "last_seen": {
+        "__type__": "datetime",
+        "__value__": "2023-12-12T13:00:00"
+      },
+      "petname": "Sev",
+      "path_list": [
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:00:00"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:24:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.BezierData",
+            "ctl_pts": [
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 534048.4100504565,
+                "northing": 3842545.1389517114,
+                "zone": "16N"
+              },
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 532478.5459671372,
+                "northing": 3840557.439307108,
+                "zone": "16N"
+              }
+            ],
+            "end": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 195.0,
+              "easting": 532978.5459671372,
+              "northing": 3842545.1389517114,
+              "zone": "16N"
+            },
+            "start": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 197.0,
+              "easting": 533548.4100504565,
+              "northing": 3840557.439307108,
+              "zone": "16N"
+            }
+          },
+          "speed": 2.0,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        },
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:24:00"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:33:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.PointData",
+            "start": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 195.0,
+              "easting": 532978.5459671372,
+              "northing": 3842545.1389517114,
+              "zone": "16N"
+            }
+          },
+          "speed": 2.0,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        },
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:33:00"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T13:00:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.BezierData",
+            "ctl_pts": [
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 532478.5459671372,
+                "northing": 3840557.439307108,
+                "zone": "16N"
+              },
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 534048.4100504565,
+                "northing": 3842545.1389517114,
+                "zone": "16N"
+              }
+            ],
+            "end": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 197.0,
+              "easting": 533548.4100504565,
+              "northing": 3840557.439307108,
+              "zone": "16N"
+            },
+            "start": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 195.0,
+              "easting": 532978.5459671372,
+              "northing": 3842545.1389517114,
+              "zone": "16N"
+            }
+          },
+          "speed": 2.0,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        }
+      ],
+      "signal": -200.0,
+      "uuid": "4767eaf1-92e3-4a64-b04e-6384e60802dc"
+    },
+    {
+      "__type__": "autonomous_trust.simulator.peer.peer.PeerInfo",
+      "antenna": {
+        "__type__": "Enumcfg:autonomous_trust.simulator.radio.iface.Antenna",
+        "__value__": "DIPOLE"
+      },
+      "data_streams": [],
+      "iface": {
+        "__type__": "Enumcfg:autonomous_trust.simulator.radio.iface.NetInterface",
+        "__value__": "SMALL"
+      },
+      "initial_position": {
+        "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+        "alt": 197.0,
+        "easting": 533548.4100504565,
+        "northing": 3840557.439307108,
+        "zone": "16N"
+      },
+      "initial_time": {
+        "__type__": "datetime",
+        "__value__": "2023-12-12T12:00:00"
+      },
+      "ip4_addr": "172.27.3.106",
+      "kind": "soldier",
+      "last_seen": {
+        "__type__": "datetime",
+        "__value__": "2023-12-12T13:00:00"
+      },
+      "petname": "CWONovosel",
+      "path_list": [
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:00:00"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:24:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.BezierData",
+            "ctl_pts": [
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 534048.4100504565,
+                "northing": 3842545.1389517114,
+                "zone": "16N"
+              },
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 532478.5459671372,
+                "northing": 3840557.439307108,
+                "zone": "16N"
+              }
+            ],
+            "end": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 195.0,
+              "easting": 532978.5459671372,
+              "northing": 3842545.1389517114,
+              "zone": "16N"
+            },
+            "start": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 197.0,
+              "easting": 533548.4100504565,
+              "northing": 3840557.439307108,
+              "zone": "16N"
+            }
+          },
+          "speed": 1.2,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        },
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:24:00"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:33:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.PointData",
+            "start": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 195.0,
+              "easting": 532978.5459671372,
+              "northing": 3842545.1389517114,
+              "zone": "16N"
+            }
+          },
+          "speed": 0,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        },
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:33:00"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T13:00:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.BezierData",
+            "ctl_pts": [
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 532478.5459671372,
+                "northing": 3840557.439307108,
+                "zone": "16N"
+              },
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 534048.4100504565,
+                "northing": 3842545.1389517114,
+                "zone": "16N"
+              }
+            ],
+            "end": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 197.0,
+              "easting": 533548.4100504565,
+              "northing": 3840557.439307108,
+              "zone": "16N"
+            },
+            "start": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 195.0,
+              "easting": 532978.5459671372,
+              "northing": 3842545.1389517114,
+              "zone": "16N"
+            }
+          },
+          "speed": 1.6,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        }
+      ],
+      "signal": -200.0,
+      "uuid": "9ce3e8ef-2767-4063-b8e8-e00efe24cc20"
+    },
+    {
+      "__type__": "autonomous_trust.simulator.peer.peer.PeerInfo",
+      "antenna": {
+        "__type__": "Enumcfg:autonomous_trust.simulator.radio.iface.Antenna",
+        "__value__": "DIPOLE"
+      },
+      "data_streams": [
+        "video005c01"
+      ],
+      "iface": {
+        "__type__": "Enumcfg:autonomous_trust.simulator.radio.iface.NetInterface",
+        "__value__": "SMALL"
+      },
+      "initial_position": {
+        "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+        "alt": 197.0,
+        "easting": 533548.4100504565,
+        "northing": 3840557.439307108,
+        "zone": "16N"
+      },
+      "initial_time": {
+        "__type__": "datetime",
+        "__value__": "2023-12-12T12:00:00"
+      },
+      "ip4_addr": "172.27.3.105",
+      "kind": "soldier",
+      "last_seen": {
+        "__type__": "datetime",
+        "__value__": "2023-12-12T13:00:00"
+      },
+      "petname": "SGMPayne",
+      "path_list": [
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:00:00"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:24:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.BezierData",
+            "ctl_pts": [
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 534048.4100504565,
+                "northing": 3842545.1389517114,
+                "zone": "16N"
+              },
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 532478.5459671372,
+                "northing": 3840557.439307108,
+                "zone": "16N"
+              }
+            ],
+            "end": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 195.0,
+              "easting": 532978.5459671372,
+              "northing": 3842545.1389517114,
+              "zone": "16N"
+            },
+            "start": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 197.0,
+              "easting": 533548.4100504565,
+              "northing": 3840557.439307108,
+              "zone": "16N"
+            }
+          },
+          "speed": 1.2,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        },
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:24:00"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:33:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.PointData",
+            "start": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 195.0,
+              "easting": 532978.5459671372,
+              "northing": 3842545.1389517114,
+              "zone": "16N"
+            }
+          },
+          "speed": 0,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        },
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:33:00"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T13:00:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.BezierData",
+            "ctl_pts": [
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 532478.5459671372,
+                "northing": 3840557.439307108,
+                "zone": "16N"
+              },
+              {
+                "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+                "alt": 196.0,
+                "easting": 534048.4100504565,
+                "northing": 3842545.1389517114,
+                "zone": "16N"
+              }
+            ],
+            "end": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 197.0,
+              "easting": 533548.4100504565,
+              "northing": 3840557.439307108,
+              "zone": "16N"
+            },
+            "start": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 195.0,
+              "easting": 532978.5459671372,
+              "northing": 3842545.1389517114,
+              "zone": "16N"
+            }
+          },
+          "speed": 1.6,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        }
+      ],
+      "signal": -200.0,
+      "uuid": "fc69acad-797a-4e63-be98-2f00ea26dffa"
+    },
+    {
+      "__type__": "autonomous_trust.simulator.peer.peer.PeerInfo",
+      "antenna": {
+        "__type__": "Enumcfg:autonomous_trust.simulator.radio.iface.Antenna",
+        "__value__": "PARABOLIC"
+      },
+      "data_streams": [
+        "comm007c01",
+        "comm007c02",
+        "comm007c03",
+        "comm007c04",
+        "comm007c05",
+        "comm007c06",
+        "comm007c07",
+        "comm007c08",
+        "comm007c09",
+        "comm007c10",
+        "comm007c11",
+        "comm007c12",
+        "comm007c13",
+        "comm007c14",
+        "comm007c15",
+        "comm007c16",
+        "comm007c17",
+        "comm007c18",
+        "comm007c19",
+        "comm007c20"
+      ],
+      "iface": {
+        "__type__": "Enumcfg:autonomous_trust.simulator.radio.iface.NetInterface",
+        "__value__": "LARGE"
+      },
+      "initial_position": {
+        "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+        "alt": 5000.0,
+        "easting": 532978.5459671372,
+        "northing": 3842545.1389517114,
+        "zone": "16N"
+      },
+      "initial_time": {
+        "__type__": "datetime",
+        "__value__": "2023-12-12T12:00:00"
+      },
+      "ip4_addr": "172.27.3.107",
+      "kind": "recon",
+      "last_seen": {
+        "__type__": "datetime",
+        "__value__": "2023-12-12T13:00:00"
+      },
+      "petname": "RQ-86-007",
+      "path_list": [
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:00:00"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T13:00:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.EllipseData",
+            "angle": 90.0,
+            "center": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 5000.0,
+              "easting": 532978.5459671372,
+              "northing": 3842545.1389517114,
+              "zone": "16N"
+            },
+            "loops": 3,
+            "semi_major": 1200,
+            "semi_minor": -1800
+          },
+          "speed": 90.2,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        }
+      ],
+      "signal": -1200.0,
+      "uuid": "1cb38d6b-7443-48a1-8f87-6f77d9cfea24"
+    },
+    {
+      "__type__": "autonomous_trust.simulator.peer.peer.PeerInfo",
+      "antenna": {
+        "__type__": "Enumcfg:autonomous_trust.simulator.radio.iface.Antenna",
+        "__value__": "YAGI"
+      },
+      "data_streams": [],
+      "iface": {
+        "__type__": "Enumcfg:autonomous_trust.simulator.radio.iface.NetInterface",
+        "__value__": "LARGE"
+      },
+      "initial_position": {
+        "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+        "alt": 400.0,
+        "easting": 550009.4806139951,
+        "northing": 3842621.8774011643,
+        "zone": "16N"
+      },
+      "initial_time": {
+        "__type__": "datetime",
+        "__value__": "2023-12-12T12:21:40"
+      },
+      "ip4_addr": "172.27.3.109",
+      "kind": "jet",
+      "last_seen": {
+        "__type__": "datetime",
+        "__value__": "2023-12-12T13:00:00"
+      },
+      "petname": "ColJones",
+      "path_list": [
+        {
+          "__type__": "autonomous_trust.simulator.peer.path.PathData",
+          "accel": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "UNIFORM"
+          },
+          "begin": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T12:21:40"
+          },
+          "end": {
+            "__type__": "datetime",
+            "__value__": "2023-12-12T13:00:00"
+          },
+          "shape": {
+            "__type__": "autonomous_trust.simulator.peer.path.EllipseData",
+            "angle": 135.0,
+            "center": {
+              "__type__": "autonomous_trust.services.peer.position.UTMPosition",
+              "alt": 400.0,
+              "easting": 550009.4806139951,
+              "northing": 3842621.8774011643,
+              "zone": "16N"
+            },
+            "loops": 1,
+            "semi_major": 18000,
+            "semi_minor": 480
+          },
+          "speed": 203.4,
+          "variability": {
+            "__type__": "Enumcfg:autonomous_trust.simulator.peer.path.Variability",
+            "__value__": "GAUSSIAN"
+          }
+        }
+      ],
+      "signal": -1200.0,
+      "uuid": "b305dc70-b39d-4150-aafa-2bfb7fe4dc58"
+    }
+  ],
+  "start": {
+    "__type__": "datetime",
+    "__value__": "2023-12-12T12:00:00"
+  }
+}

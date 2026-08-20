@@ -121,7 +121,8 @@ class TestDockerfiles:
 
     def test_no_dockerfile_floats_base_conda_forward(self):
         # An unbounded base-env update undoes the digest pin from inside the
-        # image; that is how conda reached the version in the §9.1 traceback.
+        # image; that is how conda reached the conda version in the traceback
+        # quoted in config/cfg/toolchain-pins.env.
         for rel in _DOCKERFILES:
             for line in _read(rel).splitlines():
                 stripped = line.strip()
