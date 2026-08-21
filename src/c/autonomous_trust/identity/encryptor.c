@@ -109,7 +109,8 @@ unsigned char *encryptor_generate()
 {
     unsigned char key[crypto_box_SEEDBYTES];
     randombytes(key, crypto_box_SEEDBYTES);
-    unsigned char *hex = malloc(crypto_box_SEEDBYTES * 2);
+    /* +1 for the NUL hexlify writes at result[len*2]; see signature.c. */
+    unsigned char *hex = malloc(crypto_box_SEEDBYTES * 2 + 1);
     if (hex == NULL)
     {
         EXCEPTION(ENOMEM);

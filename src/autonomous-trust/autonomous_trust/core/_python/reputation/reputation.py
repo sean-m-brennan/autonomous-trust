@@ -634,6 +634,11 @@ class SignedCheckpoint(Configuration):
 # degrades to capped restoration) rather than a misparse.
 EVIDENCE_SCHEMA = '1'
 EVIDENCE_FILE = 'reputation-history'
+# Per-(target, slasher) slash high-water marks. Separate from the chain
+# evidence deliberately: the evidence is an optimization of trust that a node
+# can lose harmlessly, while these marks are the memory a replayed slash has
+# to clear, so the two should not share a failure.
+SLASH_MARKS_FILE = 'reputation-slash-marks'
 
 
 def _hex_str(value) -> str:

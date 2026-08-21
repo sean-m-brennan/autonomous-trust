@@ -108,12 +108,32 @@ class TaskParameters(Configuration):
 
 
 class TaskInfo(Configuration):
-    def __init__(self, requestor, uuid: UUID = None, size=1, **kwargs):
+    def __init__(self, requestor, uuid: UUID = None, size=1, seq=0, **kwargs):
         self.uuid = uuid
         if uuid is None:
             self.uuid = uuid4()
         self.requestor = requestor
         self.size = size
+        # Freshness sequence of the INVITATION that carried this task; 0 means
+        # unstamped, which `handle_invite` refuses. The requestor's monotonic
+        # per-process counter (``core/freshness.py``), stamped by `start_task`
+        # and by the re-announce in `handle_haggle`, and checked against the
+        # receiver's per-(sender, verb) high-water mark.
+        #
+        # Why the task and not a separate envelope: an invitation's payload IS
+        # a serialized task, in both runtimes and in the protobuf schema
+        # (`negotiation/task.proto`, field 12), so there is nowhere else to put
+        # it without inventing a second wrapper for one verb. It lives on
+        # TaskInfo rather than Task so the field survives the
+        # `Task(**task.to_dict())` round-trips that TaskStatus, TaskResult,
+        # TaskCounter and TaskTracker are built from.
+        #
+        # Only the `announce` verb stamps it and only `handle_invite` reads it.
+        # The other verbs that reuse this serialization (acceptance, refusal,
+        # status, results) carry whatever value came in and nothing looks at
+        # it -- deliberately inert rather than zeroed, so a task object stays a
+        # faithful copy of the invitation it came from.
+        self.seq = int(seq or 0)
         # ignore kwargs
 
 

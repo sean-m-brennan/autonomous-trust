@@ -337,9 +337,12 @@ static int _index_peer_slot(tx_history_t *hist, const uuid_t peer_uuid, int slot
     data_t *peer_indices = NULL;
     if (map_get(&hist->peer_map, (map_key_t)peer_str, &peer_indices) != 0)
     {
-        array_t *arr = smrt_create(sizeof(array_t));
-        if (arr == NULL) return EXCEPTION(ENOMEM);
-        array_init(arr);
+        /* array_create, not smrt_create + array_init: init zeroes the smrt
+         * header for the embedded case, and create is what re-asserts it for
+         * a heap array_t. Hand-rolling the pair left this array_t with
+         * refs==0, so the array_free in tx_history_free never released it. */
+        array_t *arr = NULL;
+        if (array_create(&arr) != 0) return EXCEPTION(ENOMEM);
         array_append(arr, integer_data(slot));
         map_set(&hist->peer_map, (map_key_t)peer_str,
                 object_ptr_data(arr, sizeof(array_t)));

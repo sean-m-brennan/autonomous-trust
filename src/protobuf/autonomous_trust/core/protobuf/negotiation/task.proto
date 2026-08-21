@@ -29,4 +29,19 @@ message Task {
   int64 timeout = 9;
   bool flexible = 10;
   int32 argc = 11;
+  // Freshness sequence: the requestor's monotonic per-process counter, stamped
+  // on every invitation it emits (see core/freshness.py and
+  // utilities/freshness.h). The receiver keeps a per-(sender, verb) high-water
+  // mark and refuses anything at or below it.
+  //
+  // An invitation is command-carrying -- it asks a peer to run work -- and
+  // carried no freshness token of its own, so a captured one could be
+  // re-presented, or presented to a DIFFERENT capable peer than it was signed
+  // for, and be executed. See doc/architecture/security-hardening.md,
+  // "Replay resistance, per verb".
+  //
+  // Appended as field 12 so every existing field keeps its number and wire
+  // type; a peer that has not been rebuilt simply omits it, and an omitted
+  // sequence reads as 0, which the receiver refuses (sequences start at 1).
+  int64 seq = 12;
 }
