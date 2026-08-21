@@ -25,7 +25,11 @@ from ..identity import PublicIdentity
 # re-exported too: the native backend parses envelopes through this same
 # Python Message (which calls _identity_from_wire internally), so exposing it
 # here keeps `core.network.message` import-compatible across both backends.
-from ..._python.network.message import Message, _identity_from_wire  # noqa: F401
+# WireFormatMismatch rides along for the same reason: the envelope parse that
+# raises it is that Python Message, so a caller that catches it has to be able
+# to name it through whichever backend is active.
+from ..._python.network.message import (Message, _identity_from_wire,  # noqa: F401
+                                        WireFormatMismatch)
 
 
 class RecipientType(enum.IntEnum):

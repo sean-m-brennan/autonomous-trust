@@ -23,6 +23,7 @@ behavior; quorum >1 exercises the two-phase path. These tests drive
 handle_confirm_peer directly and assert which admission stage runs.
 """
 import logging
+import tempfile
 from unittest.mock import MagicMock, patch
 
 from autonomous_trust.core.identity import Identity, Peers, Group
@@ -30,6 +31,8 @@ from autonomous_trust.core.identity.idprocess import IdentityProcess
 from autonomous_trust.core.identity.identity import public_identity_to_canonical
 from autonomous_trust.core.identity.protocol import IdentityProtocol
 from autonomous_trust.core.system import CfgIds
+from autonomous_trust.core.config import Configuration
+from autonomous_trust.core._python.freshness import Freshness
 
 _MOCK_ADDRESSES = {
     'ip4': '192.168.1.1', 'ip6': '::1', 'mac': '00:11:22:33:44:55',
@@ -71,13 +74,31 @@ def _build_process(identity, group, quorum=1):
         if confirmed:
             proc._confirm_group_membership(queues, ident)
     proc._add_peer = MagicMock(side_effect=_fake_add_peer)
+    # Freshness state in a per-test temp dir: a confirm carries the confirmer's
+    # monotonic sequence and the receiver keeps a per-(sender, verb) high-water
+    # mark, so the handler cannot run without it.
+    tmp = tempfile.mkdtemp(prefix='at-freshness-')
+    with patch.object(Configuration, 'get_cfg_dir', staticmethod(lambda: tmp)):
+        proc.freshness = Freshness(CfgIds.identity, proc.logger)
     return proc
 
 
-def _confirm_msg(peer, confirmer):
+_CONFIRM_SEQ = [0]
+
+
+def _confirm_msg(peer, confirmer, seq=None):
+    """A confirm envelope: the canonical identity plus the confirmer's
+    freshness sequence.
+
+    Sequences advance by default so successive confirms in one test are
+    distinct rounds; pass an explicit ``seq`` to replay a round.
+    """
+    if seq is None:
+        _CONFIRM_SEQ[0] += 1
+        seq = _CONFIRM_SEQ[0]
     msg = MagicMock()
     msg.function = IdentityProtocol.confirm
-    msg.obj = public_identity_to_canonical(peer)  # dict -> from_canonical path
+    msg.obj = {'peer': public_identity_to_canonical(peer), 'seq': seq}
     msg.from_whom = confirmer
     return msg
 
@@ -124,3 +145,50 @@ class TestTwoPhaseAdmission:
         proc.handle_confirm_peer({CfgIds.network: MagicMock()}, _confirm_msg(peer, bg1))
         assert not proc._confirm_group_membership.called
         assert len(proc._provisional_confirmations[str(peer.uuid)]) == 1
+
+    def test_replayed_confirm_does_not_readmit_a_removed_peer(self):
+        """A confirm is good once.
+
+        This verb re-admits a peer and, at quorum, reissues the CURRENT group
+        key to it (_confirm_group_membership). Unstamped, it was replayable:
+        capture one confirm off the group channel and a peer that had since
+        been removed could be put back, with a live key.
+        """
+        proc, peer = self._setup(quorum=1)
+        confirmer = _new_identity('bg', '10.0.0.2')
+        queues = {}
+        msg = _confirm_msg(peer, confirmer, seq=5)
+        proc.handle_confirm_peer(queues, msg)
+        assert proc.peers.find_by_uuid(peer.uuid) is not None
+        assert proc._confirm_group_membership.call_count == 1
+
+        # The SAME confirm is presented again. Asserted on the handler's
+        # actions rather than on peer-set contents: _add_peer is the
+        # re-admission and _confirm_group_membership is the key reissue, and
+        # neither may fire a second time.
+        proc._add_peer.reset_mock()
+        proc.handle_confirm_peer(queues, msg)
+        assert proc._add_peer.call_count == 0
+        assert proc._confirm_group_membership.call_count == 1
+
+    def test_unstamped_confirm_refused(self):
+        """No lenient path for a confirm with no sequence."""
+        proc, peer = self._setup(quorum=1)
+        confirmer = _new_identity('bg', '10.0.0.2')
+        msg = MagicMock()
+        msg.function = IdentityProtocol.confirm
+        msg.obj = {'peer': public_identity_to_canonical(peer)}  # no 'seq'
+        msg.from_whom = confirmer
+        proc.handle_confirm_peer({}, msg)
+        assert proc.peers.find_by_uuid(peer.uuid) is None
+        assert proc._add_peer.call_count == 0
+
+    def test_later_confirm_from_same_confirmer_still_admits(self):
+        """The guard bounds replay, not legitimate later admissions."""
+        proc, first = self._setup(quorum=1)
+        second = _new_identity('newcomer-2', '10.0.0.10')
+        confirmer = _new_identity('bg', '10.0.0.2')
+        proc.handle_confirm_peer({}, _confirm_msg(first, confirmer, seq=1))
+        proc.handle_confirm_peer({}, _confirm_msg(second, confirmer, seq=2))
+        assert proc.peers.find_by_uuid(first.uuid) is not None
+        assert proc.peers.find_by_uuid(second.uuid) is not None

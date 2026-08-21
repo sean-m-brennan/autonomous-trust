@@ -208,6 +208,19 @@ class AgreementProtocol(VoterTracker):
         approvals = []
         if blob.uuid not in self._votes:
             return False
+        # One voter, one vote. ``verify`` appends every arriving vote, and a
+        # vote message carries nothing that distinguishes a second delivery
+        # from a second voter, so a replayed ballot used to be counted again.
+        # Under stake-weighted accumulation that is not merely redundant: it
+        # adds the voter's stake a second time and flips the outcome at a
+        # tight margin. Rank/tier accumulation was already insensitive to it
+        # (both reduce a tally to the leader's verdict), so this changes the
+        # observable result for stake only.
+        #
+        # Scoped to this tally deliberately: the round's votes are consumed
+        # and deleted below, so the set does not outlive the decision it
+        # bounds and a genuine later round starts clean.
+        counted = set()
         for id_obj, proof, sig in self._votes[blob.uuid]:
             if proof.uuid not in voters:
                 continue
@@ -224,6 +237,14 @@ class AgreementProtocol(VoterTracker):
                 voter.verify(smessage)
             except Exception:
                 continue  # skip votes with invalid signatures
+            # AFTER the signature check, never before: claiming a voter's
+            # slot must cost that voter's key. Deduping on the asserted
+            # ``proof.uuid`` first would let anyone squat a voter's slot with
+            # a forged ballot and have the real one skipped as the duplicate
+            # — trading a vote-inflation bug for a vote-suppression one.
+            if proof.uuid in counted:
+                continue
+            counted.add(proof.uuid)
             approvals.append(self._count_vote(id_obj, proof, voter))
         del self._votes[blob.uuid]
         return self._accumulate_votes(approvals)

@@ -42,7 +42,8 @@ from .protocol import ReputationProtocol
 from .reputation import (TransactionHistory, Reputation, Reputations,
                          TransactionScore, SlashAttestation, SignedSlash,
                          Checkpoint, SignedCheckpoint, validate_tx_score,
-                         PeerReputation, EVIDENCE_FILE, evidence_to_dict,
+                         PeerReputation, EVIDENCE_FILE, SLASH_MARKS_FILE,
+                         evidence_to_dict,
                          evidence_from_dict, RESOLVE_TTL_DEFAULT,
                          resolve_query_to_dict, resolve_query_from_dict,
                          resolved_to_dict, resolved_from_dict, verify_resolved,
@@ -482,10 +483,35 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self._slash_pending: dict[tuple, SlashAttestation] = {}
         # Dedup for finalized slashes (FIFO bounded), so a re-broadcast
         # slash_final is a cheap no-op. Mirrors committed_paxos_rounds.
+        #
+        # Kept as a cheap first-line filter only. It is a RING, so on a busy
+        # node an old key ages out -- and a slash whose key has aged out could
+        # be replayed to re-floor a peer that had since been rehabilitated,
+        # back into an exclusion that is sticky by design. _slash_hw below is
+        # what actually bounds that; this stays because it is O(1) and stops
+        # the common re-broadcast before any of the work below.
         self._slashed_seen: 'OrderedDict[tuple, None]' = OrderedDict()
+        # Per-(target, slasher) high-water mark: the highest slash epoch this
+        # node has ever APPLIED for that pair. Never evicted, unlike the ring
+        # above -- it is sized by the cohort (targets x slashers), not by how
+        # many rounds have passed, so there is no window for an old slash to
+        # come back through. Persisted, because the guard is only as good as
+        # its memory: see _persist_slash_marks.
+        #
+        # Keyed by slasher as well as target because the epoch is a
+        # per-SLASHER counter (see forward_slash), so two detectors' epoch
+        # sequences are independent and a single per-target mark would refuse
+        # one detector's legitimate slash on the strength of the other's.
+        self._slash_hw: dict[tuple, int] = {}
         # Monotonic epoch for slashes this node originates (distinguishes a
         # re-slash of the same target). Phase 2 will tie this to checkpoint
         # epochs; standalone counter suffices for Phase 0.
+        #
+        # Resumed from the persisted marks below rather than restarting at 0.
+        # Receivers hold high-water marks that our own restart does not reset,
+        # so a node that began again at epoch 1 would have its next several
+        # slashes refused as replays -- the same trap the checkpoint counter
+        # documents in _rebuild_from_evidence.
         self._slash_epoch = 0
 
         # --- Phase 2: quorum-signed Merkle checkpoints --------------------
@@ -554,6 +580,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self.resolved_reps: dict[str, tuple] = {}
         self._zta_policy_cache = None
         self._zta_anchor_cache = None
+
+        # Slash replay marks, before any message can be handled. Also resumes
+        # our own slash epoch, so this has to precede the first forward_slash.
+        self._load_slash_marks()
 
         # Verifiable warm start: adopt the persisted committed history if its
         # checkpoint verifies, and clamp every restored score the evidence
@@ -1314,11 +1344,31 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     def _apply_slash(self, attestation):
         """Pin (or, for 'rehabilitate', lift) the target's reputation floor
         and queue a tier recompute so tier_lost flows through the existing
-        path. Idempotent per (target, epoch)."""
+        path. Idempotent per (target, epoch).
+
+        Replay-bounded per (target, slasher): a slash is applied only if its
+        epoch EXCEEDS every epoch already applied from that slasher against
+        that target. Since each slasher numbers its own slashes upward, a
+        second presentation of any earlier decision -- including one whose
+        ring entry has aged out, and including a punitive slash replayed after
+        a rehabilitation lifted it -- cannot move the floor again."""
         key = attestation.key()
         if key in self._slashed_seen:
             return
         target = str(attestation.target_uuid)
+        slasher = str(attestation.slasher_uuid)
+        epoch = int(attestation.epoch)
+        hw_key = (target, slasher)
+        # Epochs are assigned pre-incremented from 1 (forward_slash), so 0 is
+        # the never-seen floor and an attestation claiming epoch <= 0 is
+        # malformed; both land on the same refusal.
+        if epoch <= self._slash_hw.get(hw_key, 0):
+            self.logger.warning(
+                'Refusing slash for %s from %s: epoch %d not above applied '
+                'high-water %d (replay)',
+                target[:8], slasher[:8], epoch,
+                self._slash_hw.get(hw_key, 0))
+            return
         if attestation.reason == SlashAttestation.REASON_REHABILITATE:
             self._slashed.pop(target, None)
             # Drop the sticky floor AND the running-EMA latch so the score
@@ -1364,6 +1414,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self._slashed_seen[key] = None
         while len(self._slashed_seen) > self.COMMITTED_ROUNDS_CAP:
             self._slashed_seen.popitem(last=False)
+        # Advance the durable mark and write it out. Recorded for a
+        # rehabilitation too: a rehab is itself a decision that must not be
+        # replayable, and leaving the mark behind would let the punitive slash
+        # it superseded back in at the same epoch.
+        self._slash_hw[hw_key] = epoch
+        self._persist_slash_marks()
         # Queue a tier recompute (drained in process()): _compute_reputation
         # short-circuits on a floor and publishes tier 0 / tier_lost; a rehab
         # lift republishes the restored (neutral) tier and readmits.
@@ -1685,6 +1741,74 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         while len(self._checkpoint_seen) > self.COMMITTED_ROUNDS_CAP:
             self._checkpoint_seen.popitem(last=False)
         self._persist_history(chain_key)
+
+    def _slash_marks_path(self):
+        """The file holding the per-(target, slasher) slash high-water marks."""
+        return os.path.join(Configuration.get_cfg_dir(),
+                            SLASH_MARKS_FILE + Configuration.file_ext)
+
+    def _persist_slash_marks(self):
+        """Write the slash high-water marks.
+
+        Unlike the chain evidence, this is NOT an optimization of trust: the
+        marks are what stop a superseded slash from being replayed into a
+        sticky exclusion, so losing them reopens that window. A write failure
+        is therefore logged at warning, not debug -- but it is still swallowed,
+        because the alternative is taking down the reputation process over a
+        full disk and leaving the node with no reputation at all.
+
+        Flat "target|slasher" keys: JSON has no tuple key, and the pair is
+        already two uuid strings.
+        """
+        try:
+            doc = {'%s|%s' % (t, s): int(e)
+                   for (t, s), e in self._slash_hw.items()}
+            with atomic_write(self._slash_marks_path()) as f:
+                json.dump(doc, f, indent=2)
+        except (OSError, IOError, ValueError, TypeError) as e:
+            self.logger.warning('Could not persist slash marks: %s', e)
+
+    def _load_slash_marks(self):
+        """Restore the marks and resume our own slash epoch past them.
+
+        A missing file is the cold-start case and not an error: the marks are
+        empty and the first slash from any slasher is accepted, which is the
+        behaviour a node with no history has to have. A CORRUPT file is
+        different -- it is refused loudly and left in place rather than being
+        silently treated as empty, because "no marks" is exactly the state an
+        attacker would want to induce.
+        """
+        path = self._slash_marks_path()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path) as f:
+                doc = json.load(f)
+            if not isinstance(doc, dict):
+                raise ValueError('not an object')
+            marks = {}
+            for flat, epoch in doc.items():
+                target, _, slasher = str(flat).partition('|')
+                if not target or not slasher:
+                    raise ValueError('malformed key %r' % flat)
+                marks[(target, slasher)] = int(epoch)
+        except (OSError, IOError, ValueError, TypeError) as e:
+            self.logger.error(
+                'Slash marks unreadable (%s); replay protection for slashes '
+                'starts from empty this boot', e)
+            return
+        self._slash_hw = marks
+        # Resume our own counter past anything we have already emitted, so our
+        # next slash clears the high-water marks our peers are holding for us.
+        # This is the same trap _rebuild_from_evidence documents for checkpoint
+        # epochs, and the reason the marks record our OWN slashes too.
+        me = str(self.identity.uuid)
+        mine = [e for (_, slasher), e in self._slash_hw.items() if slasher == me]
+        if mine:
+            self._slash_epoch = max(self._slash_epoch, max(mine))
+        self.logger.debug(
+            'Slash marks restored: %d pair(s), own epoch resumed at %d',
+            len(self._slash_hw), self._slash_epoch)
 
     def _evidence_path(self, chain_key: str = ''):
         """The evidence file for one chain.

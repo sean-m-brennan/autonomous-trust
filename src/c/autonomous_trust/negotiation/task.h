@@ -34,6 +34,14 @@ typedef struct {
     uuid_t uuid;
     uuid_t requestor_uuid;
     bool flexible;
+    /** Freshness sequence of the INVITATION that carried this task; 0 means
+     *  unstamped, which handle_invite refuses. The requestor's monotonic
+     *  per-process counter (utilities/freshness.h), checked against the
+     *  receiver's per-(sender, verb) high-water mark. Field 12 of
+     *  negotiation/task.proto and the "seq" key of the JSON form; C twin of
+     *  Python TaskInfo.seq. Only NEG_PROTO_ANNOUNCE stamps or reads it -- the
+     *  other verbs that reuse this struct carry whatever arrived. */
+    int64_t seq;
 } task_t;
 
 /*@

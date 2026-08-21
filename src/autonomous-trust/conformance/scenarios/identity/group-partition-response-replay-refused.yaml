@@ -1,0 +1,174 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-partition-response-replay-refused
+byte_pinning: false
+description: |
+    Group partition response, replay WITHIN one probe round: a response
+    re-presented to the same prober in the same round is refused — while a
+    DIFFERENT responder's fresh answer in that same round is still accepted
+    and acted on.
+
+    Background. A response is bound to a probe by `in_response_to`, which is
+    only the prober's uuid, and that never changes for the life of the node.
+    Two guards narrow it. The echoed round (`in_response_to_seq`) ties a
+    response to the one probe it answers, so a response captured in round N
+    cannot be re-presented in round N+1. Inside a single round the echoed
+    round matches by construction, so a captured response could still be
+    delivered repeatedly — which is what the responder's own `seq` and the
+    receiver's per-(sender, verb) mark close: one answer per responder per
+    round.
+
+    Why it asserts `freshness_refusals`, and why the count must be exactly 1.
+    `handle_partition_response` returns at its first line while a recovery is
+    in flight, so once an adoption has fired no later response is looked at,
+    by any mechanism — an emission count cannot separate the mark from that
+    marker. The refusal tally can: neither the marker nor the echoed-round
+    check touches it. And `1` rather than `0` or `2` is itself the statement
+    that peer_b's first delivery was ACCEPTED: two refusals would mean the
+    first was rejected too (a receiver that refuses the verb outright), zero
+    would mean the replay went through.
+
+    Deliberately, peer_b's group is SMALLER than peer_a's, so accepting its
+    response does not adopt and does not set the in-flight marker — the round
+    stays open and the mark is the only thing left that can refuse the replay.
+    The unit twins instead clear the marker through a test-only hook and
+    observe the same refusal as a missing emission; this case needs no hook.
+
+    peer_c is what makes the case stronger than "ignore everything after the
+    first response". The mark is per RESPONDER: after peer_b's replay is
+    refused, peer_c's first answer in the same round is still accepted, and
+    being the larger group it drives the adoption. An implementation that
+    closed the round on the first response would pass a two-party version of
+    this case and fail here.
+
+    Nothing is delivered TO peer_b or peer_c — peer_a's probe is verified but
+    not propagated, and both responses are source steps. That is forced by the
+    C runtime, whose `id_state` is one process-global singleton shared by every
+    participant in a run:
+
+      * one multicast probe delivered to two receivers is a first sighting to
+        one of them and, because the freshness marks are shared, a REPLAY to
+        the other — an asymmetry against Python that the corpus cannot pin;
+      * a receiver that adopts from the probe sets the in-flight recovery
+        marker for the whole process, which then makes peer_a's response
+        handler return at its first line. With equal-size groups exactly one
+        side's adopt test is True by design, so no size arrangement avoids
+        this while still keeping peer_a from adopting on peer_b's response.
+
+    The cost is that the responses are harness-signed rather than
+    handler-emitted; the real chained probe → response → adopt path is pinned
+    by `group-partition-recovery-basic` and
+    `group-partition-recovery-probe-adopt`.
+
+    Both engines take a different route to the same replay. Python's builds a
+    source step's inbound once and dispatches it `repeat` times, so step 3 is
+    literally one message delivered twice; C's rebuilds from the step payload,
+    which pins `probe_seq` and `seq` and so rebuilds identically (Ed25519
+    signatures are deterministic, so the second is byte-identical too). Either
+    way the responder's sequence repeats, which is what the mark refuses.
+
+    Topology. peer_a is the mid-size prober (3); peer_b is smaller (1) and
+    replays; peer_c is larger (5) and is adopted.
+
+    C reads the same tally through `identity_freshness_refusals()`. It is
+    process-global there, so this case keeps exactly one participant — peer_a —
+    receiving anything at all, and therefore one refuser. The unit twins are
+    `test_replayed_response_refused_within_round` in
+    tests/a_unit/test_partition_recovery.py and
+    src/c/test/partition_recovery_test.c.
+
+participants:
+  - id: peer_a
+    role: group_member
+  - id: peer_b
+    role: group_member
+  - id: peer_c
+    role: group_member
+
+fixtures:
+  groups:
+    peer_a:
+      uuid: "0a000000-0000-4000-8000-000000000001"
+      size: 3
+    peer_b:
+      uuid: "0b000000-0000-4000-8000-000000000002"
+      size: 1
+    peer_c:
+      uuid: "0c000000-0000-4000-8000-000000000003"
+      size: 5
+
+steps:
+  - id: 1
+    from: peer_b
+    to: peer_a
+    function: partition_signal
+    payload:
+      from_addr: "10.7.7.7:6000"
+    description: |
+        Local IPC into peer_a: a group frame arrived from an address outside
+        its group. peer_a emits a `group_partition_probe` advertising its
+        size-3 group and stamps the round it is now running — the scenario's
+        first stamp, so that round is sequence 1.
+
+  - id: 2
+    from: peer_a
+    to: broadcast
+    function: group_partition_probe
+    in_response_to: 1
+    no_propagate: true
+    description: |
+        Assert peer_a really did probe: the round the responses below echo has
+        to exist, or the echoed-round check would be what refuses them rather
+        than the mark. Verified-only — delivering it would set marks and adopt
+        decisions on the receivers, which in C are shared process-wide.
+
+  - id: 3
+    from: peer_b
+    to: peer_a
+    function: group_partition_response
+    repeat: 2
+    payload:
+      group_uuid: "0b000000-0000-4000-8000-000000000002"
+      group_size: 1
+      in_response_to_id: peer_a
+      probe_seq: 1
+      seq: 3
+    description: |
+        One response from peer_b, delivered twice. The first is accepted: it
+        echoes the round peer_a is running, and sequence 3 is above peer_a's
+        mark for peer_b (0), which advances to 3. peer_b's group is smaller
+        (1 < 3), so peer_a does not adopt — no in-flight marker to mask what
+        happens on the second delivery, which carries sequence 3 again and is
+        refused by the mark. That is the one refusal `expected_state` counts.
+
+  - id: 4
+    from: peer_c
+    to: peer_a
+    function: group_partition_response
+    payload:
+      group_uuid: "0c000000-0000-4000-8000-000000000003"
+      group_size: 5
+      in_response_to_id: peer_a
+      probe_seq: 1
+      seq: 7
+    description: |
+        peer_c answers the same round, after the refusal. A different
+        responder, so a different mark, and its first answer at sequence 7:
+        peer_a accepts it and — finding 5 > 3 — adopts.
+
+  - id: 5
+    from: peer_a
+    to: broadcast
+    function: request_access
+    in_response_to: 4
+    no_propagate: true
+    description: |
+        peer_a's adoption trigger, and the proof that refusing peer_b's replay
+        neither closed the round nor wedged the handler. Verified-only: the
+        admission it re-enters is pinned by `new-node-admission`.
+
+expected_state:
+  peer_a:
+    freshness_refusals:
+      group_partition_response: 1

@@ -237,6 +237,25 @@ class _Participant:
                         f'{self.id}: partition_responses_emitted={actual}, '
                         f'expected {expected}'
                     )
+            elif key == 'freshness_refusals':
+                # {verb: N} -- messages this participant refused as stale,
+                # per verb. The POSITIVE observable for the freshness guard:
+                # every other partition observable is an emission count, and a
+                # second delivery is already suppressed by the per-sender
+                # response cooldown (and adoption by the in-flight recovery
+                # marker), so "one response after two deliveries" is a number
+                # the cooldown alone produces. Only the mark can produce a
+                # refusal. C reads the same tally through
+                # identity_freshness_refusals(); note it is process-global
+                # there, so a case asserting this must have exactly one
+                # participant doing the refusing.
+                for verb, want in expected.items():
+                    actual = self.process.freshness.refusals(verb)
+                    if actual != int(want):
+                        raise AssertionError(
+                            f'{self.id}: freshness_refusals[{verb!r}]={actual}, '
+                            f'expected {want}'
+                        )
             elif key == 'caps_query_emitted':
                 # Number of directed `peer_caps_query` messages this participant
                 # emitted -- driven by the periodic caps-resync sweep (triggered
@@ -1380,7 +1399,14 @@ class IdentityAdapter:
             target = participants[target_pid].impl.identity
             from autonomous_trust.core.identity.history import IdentityObj
             blob = IdentityObj(target.publish(), target.uuid)
-            obj = blob.to_string()
+            # Envelope carrying the confirmer's freshness sequence beside the
+            # identity blob. `unstamped: true` omits it, modelling a
+            # pre-change sender or a stripped field; both runtimes must refuse
+            # that rather than fall back to a lenient path.
+            body = {'peer': blob.to_string()}
+            if not payload.get('unstamped'):
+                body['seq'] = int(payload.get('seq', 1))
+            obj = to_json_string(body)
         elif function == IdentityProtocol.propose:
             # A peer proposal for voting. `handle_vote_on_peer` reads
             # message.obj as the candidate's IdentityObj (Configuration
@@ -1430,15 +1456,22 @@ class IdentityAdapter:
             # is something parseable but unused.
             obj = ''
         elif function == IdentityProtocol.caps_response:
-            # handle_caps_response parses `from_json_string(message.obj)` as a
-            # list whose items are either bare capability names (legacy) or
+            # handle_caps_response parses an envelope {caps: [...], seq: N}
+            # whose items are either bare capability names (legacy) or
             # descriptor objects {name, required_tier, description, kind,
             # arg_schema}. `caps` -> names; `descriptors` -> objects.
+            # `seq` is the responder's freshness sequence; `unstamped: true`
+            # omits it, modelling a pre-change sender or a stripped field,
+            # which must be refused rather than accepted leniently.
             if isinstance(payload, dict) and payload.get('descriptors'):
-                obj = to_json_string(payload['descriptors'])
+                items = payload['descriptors']
             else:
-                caps_list = payload.get('caps', []) if isinstance(payload, dict) else []
-                obj = to_json_string(caps_list)
+                items = payload.get('caps', []) if isinstance(payload, dict) else []
+            body = {'caps': items}
+            if not (isinstance(payload, dict) and payload.get('unstamped')):
+                seq = int(payload.get('seq', 1)) if isinstance(payload, dict) else 1
+                body['seq'] = seq
+            obj = to_json_string(body)
         elif function == IdentityProtocol.id_query:
             # Identity-resync query (layer 3): {group_uuid, have:[uuids]}.
             # The group_uuid is the asker's group (== the responder's in a
@@ -1470,32 +1503,75 @@ class IdentityAdapter:
             from nacl.encoding import HexEncoder
             group_uuid = payload.get('group_uuid', '00000000-0000-0000-0000-000000000000')
             group_size = int(payload.get('group_size', 1))
+            # `seq` is the prober's freshness sequence and is part of the
+            # SIGNED bytes. Defaults to 1 so existing single-probe scenarios
+            # are unchanged; `unstamped: true` drops the field, which is
+            # `group-partition-probe-unstamped-refused`.
+            #
+            # A probe-replay scenario delivers the same seq twice (via the
+            # engine's `repeat`), which the mark refuses -- but the per-sender
+            # response cooldown suppresses the second reply on its own, so an
+            # emission count cannot tell the two mechanisms apart. That case,
+            # `group-partition-probe-replay-refused`, asserts the
+            # `freshness_refusals` observable instead, which only the mark can
+            # move. The unit twins get the same isolation by clearing the
+            # cooldown: `test_replayed_probe_refused` and
+            # `test_replayed_response_refused_within_round` in
+            # tests/a_unit/test_partition_recovery.py.
+            seq = int(payload.get('seq', 1))
             from autonomous_trust.core.identity.idprocess import IdentityProcess
-            canon = IdentityProcess._partition_probe_canonical(group_uuid, group_size)
+            canon = IdentityProcess._partition_probe_canonical(
+                group_uuid, group_size, seq)
             signed = sender_identity.sign(canon)
-            obj = to_json_string({
+            probe_body = {
                 'from_identity':   sender_identity.publish(),
                 'from_address':    sender_identity.address,
                 'my_group_uuid':   group_uuid,
                 'my_group_size':   group_size,
+                'seq':             seq,
                 'signature':       signed.signature.decode('ascii'),
-            })
+            }
+            # `unstamped: true` models a sender from before the freshness
+            # change (or an attacker stripping the field): the seq is omitted
+            # entirely. Both runtimes must REFUSE it rather than fall back to
+            # a lenient path — see doc/architecture/reputation.md, "Quorum
+            # attestation", for why there is no lenient mode.
+            if payload.get('unstamped'):
+                probe_body.pop('seq')
+            obj = to_json_string(probe_body)
         elif function == IdentityProtocol.partition_response:
             from autonomous_trust.core.identity.idprocess import IdentityProcess
             group_uuid = payload.get('group_uuid', '00000000-0000-0000-0000-000000000000')
             group_size = int(payload.get('group_size', 1))
             in_response_to = payload.get('in_response_to', '00000000-0000-0000-0000-000000000000')
+            # `in_response_to_id` names the PROBING participant instead of
+            # hard-coding its uuid, which is runtime-derived and differs
+            # between the two harnesses. Only a source-step response needs it:
+            # an assertion step re-delivers the captured response, whose
+            # `in_response_to` the real handler already filled in. C resolves
+            # the same key the same way (its engine rebuilds every step from
+            # the payload, so it needs it on assertion steps too).
+            in_resp_pid = payload.get('in_response_to_id')
+            if in_resp_pid is not None:
+                in_response_to = str(participants[in_resp_pid].impl.identity.uuid)
+            # `probe_seq` names the probe round being answered; the receiver
+            # refuses an echo that does not match the probe it is currently
+            # running. `seq` is the responder's own sequence.
+            probe_seq = int(payload.get('probe_seq', 1))
+            seq = int(payload.get('seq', 1))
             canon = IdentityProcess._partition_response_canonical(
-                group_uuid, group_size, in_response_to)
+                group_uuid, group_size, in_response_to, probe_seq, seq)
             signed = sender_identity.sign(canon)
             obj = to_json_string({
                 'from_identity':           sender_identity.publish(),
                 'from_address':            sender_identity.address,
                 'in_response_to':          in_response_to,
+                'in_response_to_seq':      probe_seq,
                 'my_group_uuid':           group_uuid,
                 'my_group_size':           group_size,
                 'my_group_leader':         payload.get('leader_uuid', '00000000-0000-0000-0000-000000000000'),
                 'my_group_leader_address': payload.get('leader_address', sender_identity.address),
+                'seq':                     seq,
                 'signature':               signed.signature.decode('ascii'),
             })
         else:

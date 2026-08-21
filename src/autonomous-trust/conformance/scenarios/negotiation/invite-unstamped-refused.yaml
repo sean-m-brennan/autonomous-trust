@@ -1,0 +1,63 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: invite-unstamped-refused
+byte_pinning: false
+description: |
+    Invitation freshness, flag day: an `invitation` carrying no `seq` is
+    REFUSED by both runtimes — the task is not admitted and nothing is emitted
+    in reply.
+
+    Background. The invitation is the negotiation verb that asks a peer to RUN
+    something, and its payload — a serialized task — carried no freshness token
+    of any kind. The task now carries `seq`, the requestor's monotonic
+    per-process counter (`core/freshness.py`, `utilities/freshness.h`): field 12
+    of `negotiation/task.proto` and the `"seq"` key of the JSON form. The
+    receiver keeps a per-(sender, verb) high-water mark and refuses anything at
+    or below it.
+
+    `unstamped: true` sends seq 0. That single value covers three cases that
+    are indistinguishable on the wire and must land on the same refusal: a
+    requestor that has not been rebuilt (an omitted proto field 12 unpacks as
+    0), an attacker stripping the field, and a payload that could not be parsed
+    at all. Sequences start at 1, so 0 is the never-seen floor.
+
+    What this pins is that there is no lenient path. A receiver that accepted
+    unstamped invitations is one an attacker selects by simply not stamping,
+    and for THIS verb what it buys is execution of work on somebody else's
+    node. Same call as the quorum-attestation flag day
+    (doc/architecture/reputation.md) and the peer-confirmation one
+    (`identity/peer-accepted-unstamped-refused`).
+
+    The replay case — a stamped invitation presented twice — is
+    `invite-replay-survives`, which also pins that the refusal happens ahead of
+    the per-task flood counter.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: [data_fetch]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: data_fetch
+      task_id: t-unstamped
+      unstamped: true
+    description: |
+        An invitation bob is fully capable of and would otherwise accept, with
+        the `seq` field at 0. bob must drop it before the capability and
+        tier gates are even reached: nothing enters the task stack, and no
+        `ack`, `nack` or `haggle` goes back to alice.
+
+expected_state:
+  bob:
+    task_in_stack: false

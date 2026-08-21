@@ -1625,6 +1625,27 @@ void at_reputation_run(const at_case_t *c, at_case_result_t *out)
         return;
     }
 
+    /* Scenarios that pre-stage a ZTA standing (fixtures.zta_standing) need the
+     * ceiling machinery, which is compiled in only under AT_ZTA — and AT_ZTA is
+     * OFF by default. Skip rather than run: without the gate the fixture is
+     * silently ignored, the scenario scores as though nothing were capped, and
+     * the miss surfaces as a plain value mismatch that reads exactly like a
+     * cross-language divergence. A skip on one side is not asymmetric
+     * (diff_results), and the Python adapter still pins the case. Mirrors the
+     * identity adapter's fixtures.zta_policy skip. */
+#ifndef AT_ZTA_ENABLED
+    {
+        json_t *fx = json_object_get(c->data, "fixtures");
+        if (json_is_object(fx) && json_object_get(fx, "zta_standing") != NULL)
+        {
+            at_case_result_set_skip(
+                out, "ZTA scenario skipped: C built without AT_ZTA "
+                     "(build -DAT_ZTA=ON to run it symmetrically)");
+            return;
+        }
+    }
+#endif
+
     char err[256] = {0};
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);

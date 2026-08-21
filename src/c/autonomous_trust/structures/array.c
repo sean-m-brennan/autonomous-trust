@@ -24,6 +24,16 @@
 
 int array_init(array_t *a)
 {
+    /* The smrt header belongs to the EMBEDDED case, which is what init is
+     * for: a stack local or a struct member (map->keys, id_state.histories)
+     * whose header no allocator ever wrote. array_free ends in
+     * smrt_deref(a), which reads alloc/refs — so leaving them untouched is a
+     * read of uninitialized memory, and a garbage alloc/refs pair would make
+     * that deref call free() on a stack address. alloc=false makes the deref
+     * the intended no-op. array_create, whose struct IS an smrt allocation,
+     * re-asserts the header afterwards. Mirrors map_init. */
+    a->alloc = false;
+    a->refs = 0;
     a->size = 0;
     a->array = smrt_create(sizeof(data_t));
     if (a->array == NULL)
@@ -41,6 +51,11 @@ int array_create(array_t **array_ptr)
         return EXCEPTION(ENOMEM);
     array_t *arr = *array_ptr;
     int err = array_init(arr);
+    /* array_init zeroes the header for the embedded case; this struct is a
+     * real smrt allocation, so restore what smrt_create established or
+     * array_free's closing deref would never free it. */
+    arr->alloc = true;
+    arr->refs = 1;
     return err;
 }
 

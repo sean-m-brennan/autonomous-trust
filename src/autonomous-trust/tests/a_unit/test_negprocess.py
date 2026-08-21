@@ -29,6 +29,7 @@ from autonomous_trust.core.network.message import Message
 from autonomous_trust.core.processes import ProcessTracker
 from autonomous_trust.core.system import CfgIds
 from autonomous_trust.core.capabilities import Capability, Capabilities
+from autonomous_trust.core.config import Configuration
 from autonomous_trust.core.identity import Identity
 
 
@@ -287,6 +288,10 @@ class TestHandleInviteDeeper:
 
         tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
+        # handle_invite refuses an unstamped invitation (TaskInfo.seq 0),
+        # so every invite test has to carry a freshness sequence to reach
+        # the behaviour it is actually about. See core/freshness.py.
+        task.seq = 1
         task.to_json_string = MagicMock(return_value='yaml')
         msg = Message(CfgIds.negotiation, NegotiationProtocol.announce,
                       task, from_whom=peer)
@@ -302,6 +307,10 @@ class TestHandleInviteDeeper:
 
         tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
+        # handle_invite refuses an unstamped invitation (TaskInfo.seq 0),
+        # so every invite test has to carry a freshness sequence to reach
+        # the behaviour it is actually about. See core/freshness.py.
+        task.seq = 1
         task.to_json_string = MagicMock(return_value='yaml')
         task.parameters.acceptable = MagicMock(return_value=True)
         msg = Message(CfgIds.negotiation, NegotiationProtocol.announce,
@@ -326,7 +335,14 @@ class TestHandleInviteDeeper:
         # Send more than max_task_duplicates times. The past-threshold
         # iterations short-circuit to refuse-and-return (mirrors C's
         # handle_invite). Peer is NOT demoted — the canonical action.
-        for _ in range(np.max_task_duplicates + 2):
+        #
+        # Each delivery carries a FRESH sequence, because that is what a
+        # flood is: a requestor emitting distinct invitations for one task.
+        # Re-delivering one stamped invitation is a replay, refused by the
+        # freshness gate before the counter ever sees it — pinned separately
+        # in TestHandleInviteFreshness.
+        for n in range(np.max_task_duplicates + 2):
+            task.seq = n + 1
             np.handle_invite({CfgIds.network: queue.Queue()}, msg)
         np.protocol.peers.demote.assert_not_called()
 
@@ -445,6 +461,10 @@ class TestHandleInviteNotAcceptable:
 
         tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
+        # handle_invite refuses an unstamped invitation (TaskInfo.seq 0),
+        # so every invite test has to carry a freshness sequence to reach
+        # the behaviour it is actually about. See core/freshness.py.
+        task.seq = 1
         task.to_json_string = MagicMock(return_value='yaml')
         task.parameters.acceptable = MagicMock(return_value=False)
         task.adjust = MagicMock()
@@ -575,6 +595,10 @@ class TestHandleInviteFullException:
 
         tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
+        # handle_invite refuses an unstamped invitation (TaskInfo.seq 0),
+        # so every invite test has to carry a freshness sequence to reach
+        # the behaviour it is actually about. See core/freshness.py.
+        task.seq = 1
         task.to_json_string = MagicMock(return_value='yaml')
         msg = Message(CfgIds.negotiation, NegotiationProtocol.announce,
                       task, from_whom=peer)
@@ -594,6 +618,10 @@ class TestHandleInviteFullException:
 
         tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
+        # handle_invite refuses an unstamped invitation (TaskInfo.seq 0),
+        # so every invite test has to carry a freshness sequence to reach
+        # the behaviour it is actually about. See core/freshness.py.
+        task.seq = 1
         task.to_json_string = MagicMock(return_value='yaml')
         # acceptable() returns True by default; _add_task will succeed on empty stack
         msg = Message(CfgIds.negotiation, NegotiationProtocol.announce,
@@ -612,6 +640,10 @@ class TestHandleInviteFullException:
 
         tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
+        # handle_invite refuses an unstamped invitation (TaskInfo.seq 0),
+        # so every invite test has to carry a freshness sequence to reach
+        # the behaviour it is actually about. See core/freshness.py.
+        task.seq = 1
         task.to_json_string = MagicMock(return_value='yaml')
         # Force _add_task to return False
         np._add_task = MagicMock(return_value=False)
@@ -632,6 +664,10 @@ class TestHandleInviteFullException:
 
         tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
+        # handle_invite refuses an unstamped invitation (TaskInfo.seq 0),
+        # so every invite test has to carry a freshness sequence to reach
+        # the behaviour it is actually about. See core/freshness.py.
+        task.seq = 1
         task.to_json_string = MagicMock(return_value='yaml')
         task.parameters.acceptable = MagicMock(return_value=False)
         # task.adjust() is called in negprocess but Task has no adjust; mock it
@@ -659,6 +695,10 @@ class TestHandleInviteAddTaskFail:
 
         tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
+        # handle_invite refuses an unstamped invitation (TaskInfo.seq 0),
+        # so every invite test has to carry a freshness sequence to reach
+        # the behaviour it is actually about. See core/freshness.py.
+        task.seq = 1
         task.to_json_string = MagicMock(return_value='yaml')
         # acceptable() returns True by default; force _add_task to fail
         np._add_task = MagicMock(return_value=False)
@@ -682,6 +722,10 @@ class TestHandleInviteAddTaskFail:
 
         tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
+        # handle_invite refuses an unstamped invitation (TaskInfo.seq 0),
+        # so every invite test has to carry a freshness sequence to reach
+        # the behaviour it is actually about. See core/freshness.py.
+        task.seq = 1
         task.to_json_string = MagicMock(return_value='yaml')
         task.parameters.acceptable = MagicMock(return_value=False)
         # task.adjust() is called in negprocess on the Task (which lacks adjust); mock it
@@ -710,6 +754,10 @@ class TestHandleInviteNewTask:
 
         tp = TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC))
         task = Task(tp, peer)
+        # handle_invite refuses an unstamped invitation (TaskInfo.seq 0),
+        # so every invite test has to carry a freshness sequence to reach
+        # the behaviour it is actually about. See core/freshness.py.
+        task.seq = 1
         task.to_json_string = MagicMock(return_value='yaml')
         assert task.uuid not in np.proposed_tasks
         msg = Message(CfgIds.negotiation, NegotiationProtocol.announce,
@@ -738,7 +786,12 @@ class TestHandleInviteFloodCounter:
                       task, from_whom=peer)
         net_q = queue.Queue()
 
-        for _ in range(np.max_task_duplicates + 1):
+        # Fresh sequence per delivery: a flood is distinct invitations for one
+        # task, not one invitation redelivered. The replay case is refused by
+        # the freshness gate ahead of this counter — see
+        # TestHandleInviteFreshness.
+        for n in range(np.max_task_duplicates + 1):
+            task.seq = n + 1
             assert np.handle_invite({CfgIds.network: net_q}, msg) is True
 
         # Counter advanced once per invite and was NOT cleared by _add_task.
@@ -1092,3 +1145,232 @@ class TestHandleTierLost:
         assert task.uuid in np.my_tasks
         assert demoted.uuid in tracker.results
         assert main_q.empty()
+
+
+class TestHandleInviteFreshness:
+    """The invitation's replay gate: a per-process monotonic sequence on the
+    task (``TaskInfo.seq``, field 12 of ``negotiation/task.proto``) against the
+    receiver's per-(sender, verb) high-water mark.
+
+    The invitation is the negotiation verb that asks a peer to RUN something,
+    and it was the one whose payload carried no freshness token of its own.
+    See ``core/freshness.py`` and ``doc/architecture/security-hardening.md``,
+    "Replay resistance, per verb".
+    """
+
+
+    @pytest.fixture(autouse=True)
+    def _cold_freshness_root(self, tmp_path, monkeypatch):
+        """A private, empty config root for each test in this class.
+
+        Freshness state is deliberately persisted under
+        ``Configuration.get_cfg_dir()`` -- a sender that rewound its counter
+        would have its next messages refused by peers whose marks it cannot
+        see. That is the right production behaviour and the wrong test
+        behaviour: without an isolated root, the counter and marks carry over
+        from whichever earlier test last pointed the config root somewhere
+        writable, and the sequence numbers below stop being predictable.
+        """
+        monkeypatch.setenv(Configuration.ROOT_VARIABLE_NAME, str(tmp_path))
+        (tmp_path / 'etc' / 'at').mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _invite(np, peer, seq, task=None, cap_name='video'):
+        """A stamped invitation for a capable, acceptable task."""
+        # A real registration, not a mocked __contains__: the tier gate reads
+        # `required_tier` off the LOCALLY registered capability, and a MagicMock
+        # there makes the gate refuse before the freshness behaviour under test
+        # can be observed.
+        np.protocol.capabilities.register_ability(cap_name, lambda: None)
+        if task is None:
+            tp = TaskParameters(Capability(cap_name),
+                                when=datetime(2020, 1, 1, tzinfo=UTC))
+            task = Task(tp, peer)
+            task.to_json_string = MagicMock(return_value='yaml')
+            task.parameters.acceptable = MagicMock(return_value=True)
+        task.seq = seq
+        return task, Message(CfgIds.negotiation, NegotiationProtocol.announce,
+                             task, from_whom=peer)
+
+    def test_first_stamped_invitation_is_accepted(self):
+        np = _make_neg_process()
+        peer = _make_mock_peer()
+        task, msg = self._invite(np, peer, 1)
+        net_q = queue.Queue()
+        assert np.handle_invite({CfgIds.network: net_q}, msg) is True
+        assert not net_q.empty()
+        assert net_q.get_nowait().function == NegotiationProtocol.acceptance
+        assert np.freshness.mark(str(peer.uuid),
+                                 NegotiationProtocol.announce) == 1
+
+    def test_replayed_invitation_is_refused_silently(self):
+        """The same stamped invitation, redelivered, is dropped: no second
+        admission, and no reply at all -- answering would spend a message on a
+        sender we cannot vouch for and disclose where the mark sits."""
+        np = _make_neg_process()
+        peer = _make_mock_peer()
+        task, msg = self._invite(np, peer, 1)
+        net_q = queue.Queue()
+        assert np.handle_invite({CfgIds.network: net_q}, msg) is True
+        net_q.get_nowait()  # the acceptance for the genuine delivery
+
+        assert np.handle_invite({CfgIds.network: net_q}, msg) is True
+        assert net_q.empty()
+        # The replay never reached the flood counter either.
+        assert np.flood_counts[task.uuid] == 1
+
+    def test_unstamped_invitation_is_refused(self):
+        """seq 0 -- an omitted proto field, a stripped JSON key, or a peer that
+        has not been rebuilt. There is deliberately no lenient path: a receiver
+        that accepts unstamped invitations is one an attacker selects by not
+        stamping (doc/architecture/reputation.md, "Quorum attestation")."""
+        np = _make_neg_process()
+        peer = _make_mock_peer()
+        task, msg = self._invite(np, peer, 0)
+        net_q = queue.Queue()
+        assert np.handle_invite({CfgIds.network: net_q}, msg) is True
+        assert net_q.empty()
+        assert task.uuid not in np.flood_counts
+        assert len(np.task_stack) == 0
+
+    def test_stale_sequence_is_refused(self):
+        np = _make_neg_process()
+        peer = _make_mock_peer()
+        _, msg = self._invite(np, peer, 5)
+        net_q = queue.Queue()
+        assert np.handle_invite({CfgIds.network: net_q}, msg) is True
+        net_q.get_nowait()
+
+        task, older = self._invite(np, peer, 4)
+        assert np.handle_invite({CfgIds.network: net_q}, older) is True
+        assert net_q.empty()
+
+    def test_marks_are_per_sender(self):
+        """Two requestors' sequences do not interfere: the mark is keyed
+        per (sender, verb), so one peer's seq 1 does not consume another's."""
+        np = _make_neg_process()
+        alice, bob = _make_mock_peer(), _make_mock_peer(nickname='peer2')
+        net_q = queue.Queue()
+        for peer in (alice, bob):
+            _, msg = self._invite(np, peer, 1)
+            assert np.handle_invite({CfgIds.network: net_q}, msg) is True
+            assert net_q.get_nowait().function == NegotiationProtocol.acceptance
+
+    def test_replay_cannot_trip_the_flood_refusal(self):
+        """The reason the freshness gate sits AHEAD of the flood counter.
+
+        Redelivering one captured invitation past ``max_task_duplicates`` would
+        otherwise make us emit a refusal -- which the requestor reads as "this
+        worker is out" (``_cancel_participant``), turning a replay into a way
+        of evicting a worker from a task it had already accepted.
+        """
+        np = _make_neg_process()
+        peer = _make_mock_peer()
+        task, msg = self._invite(np, peer, 1)
+        net_q = queue.Queue()
+        for _ in range(np.max_task_duplicates + 3):
+            assert np.handle_invite({CfgIds.network: net_q}, msg) is True
+        # One admission, one acceptance, and no refusal at any point.
+        assert np.flood_counts[task.uuid] == 1
+        emitted = [m.function for m in list(net_q.queue)]
+        assert emitted == [NegotiationProtocol.acceptance]
+
+
+class TestInvitationStamping:
+    """The sender half: every invitation this process emits carries a fresh,
+    monotonically increasing sequence."""
+
+
+    @pytest.fixture(autouse=True)
+    def _cold_freshness_root(self, tmp_path, monkeypatch):
+        """A private, empty config root for each test in this class.
+
+        Freshness state is deliberately persisted under
+        ``Configuration.get_cfg_dir()`` -- a sender that rewound its counter
+        would have its next messages refused by peers whose marks it cannot
+        see. That is the right production behaviour and the wrong test
+        behaviour: without an isolated root, the counter and marks carry over
+        from whichever earlier test last pointed the config root somewhere
+        writable, and the sequence numbers below stop being predictable.
+        """
+        monkeypatch.setenv(Configuration.ROOT_VARIABLE_NAME, str(tmp_path))
+        (tmp_path / 'etc' / 'at').mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _capable(np, peer, cap_name='video'):
+        np.protocol.peer_capabilities.items = MagicMock(
+            return_value=[(cap_name, [peer.uuid])])
+        np.protocol.peers.find_by_uuid = MagicMock(return_value=peer)
+
+    def test_start_task_stamps_one_sequence_for_the_whole_fanout(self):
+        """One stamp per announcement, not per peer: the invitation is a single
+        act fanned out, and each receiver keeps its own mark."""
+        np = _make_neg_process()
+        peer_a = _make_mock_peer()
+        peer_b = _make_mock_peer(nickname='peer2', address='10.0.0.2')
+        np.protocol.peer_capabilities.items = MagicMock(
+            return_value=[('video', [peer_a.uuid, peer_b.uuid])])
+        np.protocol.peers.find_by_uuid = MagicMock(
+            side_effect=lambda u: peer_a if u == peer_a.uuid else peer_b)
+
+        tp = TaskParameters(Capability('video'),
+                            when=datetime(2020, 1, 1, tzinfo=UTC))
+        task = Task(tp, peer_a)
+        task.to_json_string = MagicMock(return_value='yaml')
+        net_q = queue.Queue()
+        assert np.start_task({CfgIds.network: net_q}, Message(
+            CfgIds.negotiation, NegotiationProtocol.start, task)) is True
+
+        assert task.seq == 1
+        assert len(list(net_q.queue)) == 2
+        # Stamped before the fan-out, so both copies carry the one sequence.
+        assert task.to_json_string.call_count == 2
+
+    def test_successive_announcements_increase(self):
+        np = _make_neg_process()
+        peer = _make_mock_peer()
+        self._capable(np, peer)
+        seqs = []
+        for _ in range(3):
+            tp = TaskParameters(Capability('video'),
+                                when=datetime(2020, 1, 1, tzinfo=UTC))
+            task = Task(tp, peer)
+            task.to_json_string = MagicMock(return_value='yaml')
+            np.start_task({CfgIds.network: queue.Queue()}, Message(
+                CfgIds.negotiation, NegotiationProtocol.start, task))
+            seqs.append(task.seq)
+        assert seqs == [1, 2, 3]
+
+    def test_haggle_reannounce_draws_a_new_sequence(self):
+        """The haggle resolution is a NEW invitation. Reusing the first
+        invitation's sequence would have the peer refuse the resolution as a
+        replay -- correctly, since it cannot tell the two apart otherwise."""
+        np = _make_neg_process()
+        peer = _make_mock_peer()
+        self._capable(np, peer)
+
+        tp = TaskParameters(Capability('video'), _flexible=True,
+                            when=datetime(2020, 1, 1, tzinfo=UTC))
+        task = Task(tp, peer)
+        task.to_json_string = MagicMock(return_value='yaml')
+        assert np.start_task({CfgIds.network: queue.Queue()}, Message(
+            CfgIds.negotiation, NegotiationProtocol.start, task)) is True
+        assert task.seq == 1
+
+        # The peer counter-proposes a later start time.
+        counter_tp = TaskParameters(Capability('video'), _flexible=True,
+                                    when=datetime(2020, 1, 2, tzinfo=UTC))
+        counter = Task(counter_tp, peer, uuid=task.uuid, seq=task.seq)
+        tracker = np.my_tasks[task.uuid]
+        tracker.to_json_string = MagicMock(return_value='yaml')
+        net_q = queue.Queue()
+        assert np.handle_haggle({CfgIds.network: net_q}, Message(
+            CfgIds.negotiation, NegotiationProtocol.response,
+            counter, from_whom=peer)) is True
+
+        out = list(net_q.queue)
+        assert [m.function for m in out] == [NegotiationProtocol.announce]
+        # Above the first invitation's sequence, so the peer's mark accepts it.
+        assert tracker.seq == 2
+        # And the conceded schedule actually moved.
+        assert tracker.parameters.when == counter_tp.when

@@ -32,6 +32,7 @@ Deliberately absent, and asserted so: nothing here moves a group key. Acquiring
 a second cohort's key at runtime is a separate question, because the group key
 is the confidentiality boundary.
 """
+import tempfile
 import queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -43,6 +44,8 @@ from autonomous_trust.core.identity.protocol import IdentityProtocol
 from autonomous_trust.core.network.message import Message
 from autonomous_trust.core.system import CfgIds
 from autonomous_trust.core.config import from_json_string, to_json_string
+from autonomous_trust.core.config import Configuration
+from autonomous_trust.core._python.freshness import Freshness
 
 _MOCK_ADDRESSES = {'mac_bcast': 'ff:ff:ff:ff:ff:ff'}
 
@@ -98,6 +101,13 @@ def _node(uuid='me', primary=None, child_groups=None, child_gateways=None,
     proc.name = CfgIds.identity
     proc.q_cadence = 0.01
     proc.logger = MagicMock()
+    # Freshness state in a per-test temp dir: a hierarchy claim carries the
+    # claimant's monotonic sequence and the receiver keeps a per-(sender, verb)
+    # high-water mark, so neither the advertise nor the receive path can run
+    # without it.
+    _tmp = tempfile.mkdtemp(prefix='at-freshness-')
+    with patch.object(Configuration, 'get_cfg_dir', staticmethod(lambda: _tmp)):
+        proc.freshness = Freshness(CfgIds.identity, proc.logger)
     proc.report_exception = MagicMock()
     # Gateway authority is doc/architecture/zta-integration.md's proved-shared-anchor gate; the tests that
     # care about it override this.
@@ -215,9 +225,21 @@ class TestAdvertise:
 # --- receive ---------------------------------------------------------------
 
 class TestReceive:
-    def _claim_msg(self, sender, payload, verified=True):
+    _CLAIM_SEQ = [0]
+
+    def _claim_msg(self, sender, payload, verified=True, seq=None):
+        """A hierarchy claim, stamped with the claimant's sequence.
+
+        Sequences advance by default so successive claims in a test are
+        distinct rounds; pass an explicit ``seq`` to replay one.
+        """
+        if seq is None:
+            self._CLAIM_SEQ[0] += 1
+            seq = self._CLAIM_SEQ[0]
+        body = dict(payload)
+        body.setdefault('seq', seq)
         msg = Message(CfgIds.identity, IdentityProtocol.hierarchy,
-                      to_json_string(payload), from_whom=sender)
+                      to_json_string(body), from_whom=sender)
         msg.verified = verified
         return msg
 

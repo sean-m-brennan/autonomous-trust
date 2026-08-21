@@ -21,6 +21,7 @@ from uuid import UUID
 
 from ..capabilities import Capability
 from ..config import from_json_string
+from ..freshness import Freshness
 from ..identity.protocol import IdentityProtocol
 from ..network import Message
 from ..processes import Process, ProcMeta
@@ -52,6 +53,16 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
         self.my_tasks = {}  # TaskTrackers for remote tasks I've requested
         self.confirmed = {}
         self.status_pending = []
+        # Per-verb replay state: our own monotonic send counter and the
+        # per-(sender, verb) high-water marks, both persisted. Used by the
+        # `announce` verb only -- the invitation was the one negotiation verb
+        # whose payload carried no freshness token of its own, and it is the
+        # verb that asks a peer to RUN something. The other verbs are bounded
+        # by state that already exists: an acceptance is deduped per
+        # participant, a status response spends an outstanding request. See
+        # core/freshness.py and doc/architecture/security-hardening.md,
+        # "Replay resistance, per verb".
+        self.freshness = Freshness(self.name, self.logger)
         self.max_concurrency = max_cores
         self.protocol = NegotiationProtocol(self.name, self.logger, configurations)
         self.protocol.register_handler(NegotiationProtocol.start, self.start_task)
@@ -118,6 +129,15 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                     TaskResult(task, Status.no_peers, None),
                     block=True, timeout=self.q_cadence)
                 return True
+            # One stamp for the whole announcement, not one per peer. The
+            # invitation is a single act fanned out to every capable peer, and
+            # each receiver keeps its OWN high-water mark -- so it is
+            # per-receiver monotonicity that does the work, and numbering the
+            # copies separately would only make one act look like N. A later
+            # re-announce (the haggle resolution below) draws a new, higher
+            # number, which is what makes it distinguishable from a replay of
+            # this one.
+            task.seq = self.freshness.stamp()
             try:
                 for peer in participants:
                     tracker.results[peer.uuid] = None
@@ -132,6 +152,37 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
     def handle_invite(self, queues, message):
         if message.function == NegotiationProtocol.announce:
             task = message.obj
+            # Freshness FIRST, ahead of the flood counter, and silently.
+            #
+            # Ahead, because the counter is the thing a replay would otherwise
+            # drive: six copies of one captured invitation would push
+            # `flood_counts` past `max_task_duplicates` and make us refuse --
+            # and a refusal is what the requestor reads as "this worker is out"
+            # (`_cancel_participant`). That turns a replay into a way of
+            # evicting a worker from a task it had already accepted. Past the
+            # gate, the counter counts what it was built to count: distinct,
+            # freshly stamped invitations for one task, which is a requestor
+            # misbehaving rather than an attacker echoing.
+            #
+            # Silently, because a replay deserves no reply. Answering would
+            # both spend a message on a sender we cannot vouch for and tell an
+            # attacker exactly where our mark sits.
+            #
+            # Unstamped (seq 0, the proto3 default and what a peer that has not
+            # been rebuilt emits) is refused, not admitted as legacy: a
+            # receiver that accepts unstamped invitations is one an attacker
+            # selects by not stamping. See doc/architecture/reputation.md,
+            # "Quorum attestation", for the standing rule.
+            sender = str(getattr(message.from_whom, 'uuid', '') or '')
+            if not self.freshness.accept(sender, NegotiationProtocol.announce,
+                                         getattr(task, 'seq', 0)):
+                self.logger.debug(
+                    'Invitation for %s from %s refused: sequence %s not above '
+                    'mark %d (replay or unstamped)',
+                    getattr(task, 'uuid', None), sender[:8],
+                    getattr(task, 'seq', 0),
+                    self.freshness.mark(sender, NegotiationProtocol.announce))
+                return True
             if task.uuid not in self.proposed_tasks:
                 self.proposed_tasks[task.uuid] = TaskCounter(task)
             self.proposed_tasks[task.uuid].count += 1
@@ -210,6 +261,13 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
         result = self.my_tasks[task.uuid].results
         if result[message.from_whom.uuid] is None:
             del result[message.from_whom.uuid]
+        # Drop the confirmation too, mirroring the C twin's removal of its
+        # per-(task, peer) marker: a peer we have cancelled out of a task must
+        # not still read as confirmed in handle_stat_resp, or it can go on
+        # spending the extension token for work it is no longer doing.
+        confirmed = self.confirmed.get(task.uuid)
+        if confirmed is not None and message.from_whom in confirmed:
+            confirmed.remove(message.from_whom)
         if len(result) < task.size:
             queues[CfgIds.main].put(result, block=True, timeout=self.q_cadence)
 
@@ -220,11 +278,23 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                 try:
                     # Accept the peer's counter-proposal if our parameters allow it
                     if task.uuid in self.my_tasks:
-                        original = self.my_tasks[task.uuid].task
+                        # The tracker IS the task (TaskTracker subclasses
+                        # Task); it has no `.task` attribute, so the old
+                        # `.task` raised AttributeError out of this handler and
+                        # no re-announce was ever sent. Likewise `adjust` is
+                        # defined on TaskParameters, not on Task.
+                        original = self.my_tasks[task.uuid]
                         if task.parameters.when != original.parameters.when:
                             original.parameters.when = task.parameters.when
-                        original.adjust()
+                        original.parameters.adjust()
                         task = original
+                    # A fresh stamp: this is a NEW invitation, carrying the
+                    # schedule we just conceded, and the peer's mark has
+                    # already consumed the sequence of the first one. Reusing
+                    # that sequence would have the peer refuse the resolution
+                    # as a replay -- correctly, since it cannot tell the two
+                    # apart otherwise.
+                    task.seq = self.freshness.stamp()
                     msg = Message(self.name, NegotiationProtocol.announce, task.to_json_string(), message.from_whom)
                     queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                     self.logger.debug('Attempt to resolve haggling')
@@ -243,7 +313,15 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
             task = message.obj
             if task.uuid not in self.confirmed:
                 self.confirmed[task.uuid] = []
-            self.confirmed[task.uuid].append(message.from_whom)
+            # One participant, one promise. An `ack` carries nothing that
+            # separates a second delivery from a second promise, so a replayed
+            # one used to lengthen this list — inflating the count of peers
+            # believed to have committed to the task. Same dedup-by-sender
+            # shape as ReputationProcess.handle_accepted, and it keeps this
+            # list consistent with the `in` test handle_stat_resp already
+            # runs against it (Identity.__eq__ compares uuid/address/keys).
+            if message.from_whom not in self.confirmed[task.uuid]:
+                self.confirmed[task.uuid].append(message.from_whom)
             self.logger.debug('Execution of my task promised')
             return True
         return False
@@ -295,14 +373,42 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                     if task.status == Status.pending:
                         self.logger.error('Clock synchronization error with %s', message.from_whom.nickname)
                     if task.uuid in self.confirmed and message.from_whom in self.confirmed[task.uuid]:
-                        params = task.parameters
-                        extend = params.timeout_extension
-                        if params.timeout.total_seconds() > 0:
-                            extend = params.timeout.total_seconds()
-                        elif params.duration.total_seconds() > 0:
-                            extend = int(params.duration.total_seconds() * params.duration_fraction / 100) + 1
-                        params.timeout += timedelta(seconds=extend)
-                        self.status_pending.remove(task)
+                        # The outstanding status request is the token that
+                        # authorises one extension, and it is consumed here, so
+                        # a replayed (or unsolicited) status response finds
+                        # nothing to consume and cannot extend the deadline a
+                        # second time.
+                        #
+                        # Matched by uuid throughout, for two reasons. The wire
+                        # object is a fresh TaskStatus while the entries are the
+                        # original Task / TaskTracker, and Configuration defines
+                        # no __eq__ — so the old identity-based `remove` matched
+                        # nothing and raised ValueError out of this handler
+                        # instead of extending anything. And `status_pending`
+                        # can legitimately hold two entries for one task (the
+                        # Task from start_task, the TaskTracker from the
+                        # re-request in process()), so ALL of them are drained:
+                        # leaving one behind would leave a second token for a
+                        # replay to spend.
+                        tracker = self.my_tasks.get(task.uuid)
+                        pending = [t for t in self.status_pending
+                                   if t.uuid == task.uuid]
+                        if tracker is not None and pending:
+                            # OUR parameters, not the peer's. The deadline being
+                            # extended is the one process() checks against
+                            # `tracker.parameters`, so extending a copy of the
+                            # peer's parameters moved nothing; and the size of
+                            # our own patience is not the remote end's call to
+                            # make.
+                            params = tracker.parameters
+                            extend = params.timeout_extension
+                            if params.timeout.total_seconds() > 0:
+                                extend = params.timeout.total_seconds()
+                            elif params.duration.total_seconds() > 0:
+                                extend = int(params.duration.total_seconds() * params.duration_fraction / 100) + 1
+                            params.timeout += timedelta(seconds=extend)
+                            for entry in pending:
+                                self.status_pending.remove(entry)
                 elif task.status in [Status.dead, Status.zombie, Status.stopped, Status.unknown]:
                     try:
                         self._cancel_participant(queues, message)
@@ -518,7 +624,13 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                     task = self.my_tasks[task_id]
                     params = task.parameters
                     try:
-                        if task not in self.status_pending and \
+                        # Outstanding-request test by uuid, matching the way
+                        # handle_stat_resp consumes the entry. Identity
+                        # comparison here saw start_task's Task and this
+                        # tracker as different objects, so a task could carry
+                        # two pending entries at once — and two entries are two
+                        # extension tokens.
+                        if not any(t.uuid == task.uuid for t in self.status_pending) and \
                                 present > params.when + params.duration + params.timeout:
                             tx_task = Task(**task.to_dict())
                             msg = Message(self.name, NegotiationProtocol.status_req,

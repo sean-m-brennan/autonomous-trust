@@ -310,6 +310,25 @@ static json_t *_build_task_json(json_t *payload, const uuid_t task_uuid,
      * to avoid spurious haggling on a fresh task_stack. */
     json_object_set_new(j, "when_sec", json_integer((json_int_t)time(NULL)));
     json_object_set_new(j, "duration_sec", json_integer(60));
+
+    /* Freshness sequence for the invitation (task_t.seq; field 12 of
+     * negotiation/task.proto). Defaults to 1 so existing single-invite
+     * scenarios are unchanged. `unstamped: true` sends 0 — the shape a peer
+     * that has not been rebuilt emits, and the shape an attacker produces by
+     * stripping the field; handle_invite must refuse it. A replay is the SAME
+     * seq delivered twice (`repeat: 2`, built once); a genuine flood is
+     * distinct, increasing seqs across steps. Mirrors the Python adapter's
+     * `_build_inbound`. */
+    json_int_t seq = 1;
+    json_t *unstamped_j = json_object_get(payload, "unstamped");
+    if (json_is_true(unstamped_j))
+        seq = 0;
+    else
+    {
+        json_t *seq_j = json_object_get(payload, "seq");
+        if (json_is_integer(seq_j)) seq = json_integer_value(seq_j);
+    }
+    json_object_set_new(j, "seq", json_integer(seq));
     return j;
 }
 
