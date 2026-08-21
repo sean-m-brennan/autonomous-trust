@@ -28,6 +28,7 @@
 #include "network/net_message.h"
 #include "negotiation/neg_proc_priv.h"
 #include "identity/id_proc_priv.h"  /* identity_get_peer_tier */
+#include "utilities/freshness.h"
 
 DEFINE_ERROR(ENEG_NOPEERS, "No capable peers available");
 
@@ -98,6 +99,15 @@ static struct {
     map_t own_caps_by_proc;
     map_t peer_tiers;
     map_t cap_required_tiers;
+    /* Per-verb replay state: our own monotonic send counter and the
+     * per-(sender, verb) high-water marks, both persisted. Used by
+     * NEG_PROTO_ANNOUNCE only -- the invitation was the one negotiation verb
+     * whose payload carried no freshness token of its own, and it is the verb
+     * that asks a peer to RUN something. The others are bounded by state that
+     * already exists: an ack is deduped per participant, a status response
+     * spends an outstanding request. C twin of Python
+     * NegotiationProcess.freshness; see utilities/freshness.h. */
+    freshness_t freshness;
 } neg_state;
 
 static void _ensure_init(void)
@@ -115,6 +125,7 @@ static void _ensure_init(void)
         map_init(&neg_state.own_caps_by_proc);
         map_init(&neg_state.peer_tiers);
         map_init(&neg_state.cap_required_tiers);
+        freshness_init(&neg_state.freshness, "negotiation", NULL);
         neg_state.initialized = true;
     }
 }
@@ -307,6 +318,11 @@ void negotiation_reset_state(void)
     map_init(&neg_state.peer_tiers);
     map_free(&neg_state.cap_required_tiers);
     map_init(&neg_state.cap_required_tiers);
+    /* Replay marks too. The harness derives participant uuids
+     * deterministically from their slugs, so "alice" is the same sender in
+     * every scenario; a mark left behind by one would refuse the next
+     * scenario's first invitation as a replay. */
+    freshness_reset(&neg_state.freshness);
     pthread_mutex_unlock(&neg_state.lock);
 }
 
@@ -370,6 +386,13 @@ static json_t *_task_to_json(const task_t *task)
     json_object_set_new(j, "timeout",         json_integer(task->timeout));
     json_object_set_new(j, "when_sec",        json_integer((json_int_t)when_sec));
     json_object_set_new(j, "duration_sec",    json_integer((json_int_t)duration_sec));
+    /* Freshness sequence. Emitted unconditionally, including as 0, so that an
+     * unstamped invitation is visibly unstamped on the wire rather than
+     * indistinguishable from a field the serializer forgot. Only the invite
+     * senders set it (handle_start_task, handle_haggle's re-announce); the
+     * other users of this helper pass whatever the task already carried, and
+     * nothing reads it there. Field 12 of negotiation/task.proto. */
+    json_object_set_new(j, "seq",             json_integer((json_int_t)task->seq));
 
     return j;
 }
@@ -426,6 +449,12 @@ static int _task_from_json(const json_t *j, task_t *task)
         task->duration.seconds = (unsigned int)(dur % 86400L);
         task->duration.nsecs   = 0;
     }
+
+    /* Absent or non-integer leaves seq at the caller's memset 0 -- unstamped,
+     * which handle_invite refuses. */
+    json_t *j_seq = json_object_get(j, "seq");
+    if (j_seq && json_is_integer(j_seq))
+        task->seq = (int64_t)json_integer_value(j_seq);
 
     return 0;
 }
@@ -541,6 +570,23 @@ static bool handle_start_task(const process_t *proc, directory_t *queues, generi
         map_set(&neg_state.my_tasks, task_uuid_str, trk_dat);
     }
 
+    /* One stamp for the whole announcement, not one per peer. The invitation
+     * is a single act fanned out to every capable peer, and each receiver
+     * keeps its OWN high-water mark -- so it is per-receiver monotonicity that
+     * does the work, and numbering the copies separately would only make one
+     * act look like N. A later re-announce (handle_haggle) draws a new, higher
+     * number, which is what distinguishes it from a replay of this one.
+     * Mirrors Python NegotiationProcess.start_task. */
+    task.seq = freshness_stamp(&neg_state.freshness, proc->logger);
+    if (task.seq <= 0)
+    {
+        log_warn(proc->logger,
+                 "Negotiation: no freshness sequence; not announcing task %s\n",
+                 task_uuid_str);
+        pthread_mutex_unlock(&neg_state.lock);
+        return true;
+    }
+
     /* Build JSON payload for invitation */
     json_t *invite_json = _task_to_json(&task);
 
@@ -624,6 +670,42 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
         uuid_unparse_lower(task.uuid, task_uuid_str);
 
     pthread_mutex_lock(&neg_state.lock);
+
+    /* Freshness FIRST, ahead of the flood counter, and silently.
+     *
+     * Ahead, because the counter is the thing a replay would otherwise drive:
+     * six copies of one captured invitation would push the "flood:<uuid>"
+     * count past the threshold and make us refuse -- and a refusal is what the
+     * requestor reads as "this worker is out" (handle_refuse drops the
+     * participant). That turns a replay into a way of evicting a worker from a
+     * task it had already accepted. Past this gate the counter counts what it
+     * was built to count: distinct, freshly stamped invitations for one task.
+     *
+     * Silently, because a replay deserves no reply -- answering would spend a
+     * message on a sender we cannot vouch for and tell an attacker where our
+     * mark sits.
+     *
+     * Unstamped (seq 0: an omitted proto field 12, a missing JSON "seq", or a
+     * payload we could not parse at all) is refused rather than admitted as
+     * legacy. A receiver that accepts unstamped invitations is one an attacker
+     * selects by not stamping. Mirrors Python handle_invite. */
+    char inviter_uuid_str[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(nmsg->from_whom.uuid, inviter_uuid_str);
+    if (!freshness_accept(&neg_state.freshness, inviter_uuid_str,
+                          NEG_PROTO_ANNOUNCE, have_task ? task.seq : 0,
+                          proc->logger))
+    {
+        log_debug(proc->logger,
+                  "Negotiation: invitation for %s from %s refused: seq %lld "
+                  "not above mark %lld (replay or unstamped)\n",
+                  task_uuid_str, inviter_uuid_str,
+                  (long long)(have_task ? task.seq : 0),
+                  (long long)freshness_mark(&neg_state.freshness,
+                                            inviter_uuid_str,
+                                            NEG_PROTO_ANNOUNCE));
+        pthread_mutex_unlock(&neg_state.lock);
+        return true;
+    }
 
     /* Flood detection: count how many times we have seen this task */
     if (have_task)
@@ -840,6 +922,21 @@ static bool handle_haggle(const process_t *proc, directory_t *queues, generic_ms
         log_info(proc->logger,
                  "Negotiation: re-announcing flexible task with adjusted params\n");
 
+        /* A fresh stamp: this is a NEW invitation, carrying the schedule we
+         * just conceded, and the peer's mark has already consumed the
+         * sequence of the first one. Reusing it would have the peer refuse
+         * the resolution as a replay -- correctly, since it cannot tell the
+         * two apart otherwise. Mirrors Python handle_haggle. */
+        pthread_mutex_lock(&neg_state.lock);
+        task.seq = freshness_stamp(&neg_state.freshness, proc->logger);
+        pthread_mutex_unlock(&neg_state.lock);
+        if (task.seq <= 0)
+        {
+            log_warn(proc->logger,
+                     "Negotiation: no freshness sequence; not re-announcing\n");
+            return true;
+        }
+
         json_t *rj = _task_to_json(&task);
         generic_msg_t announce = {0};
         _build_reply(nmsg, NEG_PROTO_ANNOUNCE, &announce);
@@ -1050,28 +1147,51 @@ static bool handle_accept(const process_t *proc, directory_t *queues, generic_ms
         strncpy(key, "unknown", UUID_STRING_LEN);
     key[UUID_STRING_LEN] = '\0';
 
-    data_t *count_dat = NULL;
-    int count = 0;
-    if (map_get(&neg_state.confirmed, key, &count_dat) == 0 && count_dat)
-        data_integer(count_dat, &count);
-
-    count++;
-    data_t *new_count = integer_data(count);
-    map_set(&neg_state.confirmed, key, new_count);
-
     /* Per-peer membership entry. Composite key "<task>:<peer>" so
      * handle_stat_resp can answer the Python check
      * `message.from_whom in self.confirmed[task.uuid]`
-     * (negprocess.py:271) without restructuring the count map above. */
+     * (negprocess.py:271) without restructuring the count map below.
+     *
+     * Established BEFORE the count, because it is what makes the count
+     * dedup: one participant, one promise. An `ack` carries nothing that
+     * separates a second delivery from a second promise, so a replayed one
+     * used to increment the tally again and inflate the number of peers
+     * believed to have committed to the task. The pair map was already
+     * set-like (map_set on the same key is idempotent), so it is the
+     * natural place to ask "have we counted this peer yet". Mirrors
+     * Python NegotiationProcess.handle_accept's dedup on self.confirmed. */
+    bool already_confirmed = false;
     if (have_task_uuid)
     {
         char peer_lower[UUID_STRING_LEN + 1];
         uuid_unparse_lower(nmsg->from_whom.uuid, peer_lower);
         char pair_key[UUID_STRING_LEN * 2 + 4];
         snprintf(pair_key, sizeof(pair_key), "%s:%s", task_uuid_str, peer_lower);
-        data_t *marker = integer_data(1);
-        if (marker != NULL)
-            map_set(&neg_state.confirmed_pairs, pair_key, marker);
+        data_t *existing_pair = NULL;
+        if (map_get(&neg_state.confirmed_pairs, pair_key, &existing_pair) == 0
+            && existing_pair != NULL)
+            already_confirmed = true;
+        else
+        {
+            data_t *marker = integer_data(1);
+            if (marker != NULL)
+                map_set(&neg_state.confirmed_pairs, pair_key, marker);
+        }
+    }
+
+    data_t *count_dat = NULL;
+    int count = 0;
+    if (map_get(&neg_state.confirmed, key, &count_dat) == 0 && count_dat)
+        data_integer(count_dat, &count);
+
+    /* No task uuid means no pair key and so no dedup is possible; that
+     * degenerate path keeps its previous behaviour rather than silently
+     * dropping the acceptance. */
+    if (!already_confirmed)
+    {
+        count++;
+        data_t *new_count = integer_data(count);
+        map_set(&neg_state.confirmed, key, new_count);
     }
 
     log_debug(proc->logger,
@@ -1243,7 +1363,40 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
                         data_object_ptr(t_dat, (ptr_t *)&live_task);
                 }
 
-                if (tracker && peer_confirmed && live_task) {
+                /* An extension is authorised by an OUTSTANDING status
+                 * request, and the pending entry IS that authorisation:
+                 * draining it here is what stops a replayed (or entirely
+                 * unsolicited) status response from extending the deadline
+                 * again. Mirrors Python's handle_stat_resp. EVERY matching
+                 * slot is drained rather than the first — two slots for one
+                 * task would be two extension tokens. An already-drained
+                 * slot holds "" and cannot match a real uuid, so this is
+                 * naturally idempotent.
+                 *
+                 * NOTE: this runtime has no status-request SENDER yet
+                 * (NEG_PROTO_STAT_REQ is handled, never emitted), so nothing
+                 * appends to status_pending and the gate below is currently
+                 * always the refusal path. That is the correct behaviour
+                 * meanwhile: with no request outstanding there is no
+                 * extension to authorise. When a requester side lands it
+                 * must append the task uuid at its send site, the way
+                 * Python's process() loop does. */
+                bool had_pending = false;
+                for (size_t i = 0; i < array_size(&neg_state.status_pending); i++)
+                {
+                    data_t *item = NULL;
+                    if (array_get(&neg_state.status_pending, i, &item) != 0)
+                        continue;
+                    char *stored = NULL;
+                    if (data_string_ptr(item, &stored) == 0 && stored
+                        && strncmp(stored, task_uuid_str, UUID_STRING_LEN) == 0)
+                    {
+                        stored[0] = '\0';
+                        had_pending = true;
+                    }
+                }
+
+                if (tracker && peer_confirmed && live_task && had_pending) {
                     /* Compute the extension. Mirrors Python's
                      * three-way choice at negprocess.py:273-277.
                      * Order matters: explicit timeout wins over
@@ -1264,26 +1417,12 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
                               "extending timeout by %lds (peer %s)\n",
                               task_uuid_str, (int)status, extend,
                               nmsg->from_whom.nickname);
-
-                    /* Drop the matching task uuid from status_pending —
-                     * Python does `self.status_pending.remove(task)` so
-                     * the periodic poller stops nagging until the next
-                     * cycle. The C status_pending array holds uuid
-                     * strings; zero out the slot like the cleanup loop
-                     * already does below for the response itself. */
-                    for (size_t i = 0; i < array_size(&neg_state.status_pending); i++)
-                    {
-                        data_t *item = NULL;
-                        if (array_get(&neg_state.status_pending, i, &item) != 0)
-                            continue;
-                        char *stored = NULL;
-                        if (data_string_ptr(item, &stored) == 0 && stored
-                            && strncmp(stored, task_uuid_str, UUID_STRING_LEN) == 0)
-                        {
-                            stored[0] = '\0';
-                            break;
-                        }
-                    }
+                } else if (tracker && peer_confirmed && live_task) {
+                    log_debug(proc->logger,
+                              "Negotiation: stat_resp for task %s with no "
+                              "outstanding status request — not extending "
+                              "timeout\n",
+                              task_uuid_str);
                 } else if (tracker && !peer_confirmed) {
                     log_debug(proc->logger,
                               "Negotiation: stat_resp from unconfirmed peer "

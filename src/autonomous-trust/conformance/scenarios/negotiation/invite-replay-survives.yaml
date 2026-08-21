@@ -4,37 +4,46 @@ protocol: negotiation
 name: invite-replay-survives
 byte_pinning: false
 description: |
-    Negotiation replay-handling probe — alice's `invitation` is
-    delivered to bob twice via the universal scenario engine's
-    `repeat: N` grammar. Goal: confirm bob's handle_invite path
-    survives a duplicate delivery without crashing, and that the
-    end-state still shows the task admitted (task_in_stack: true).
+    Invitation replay: alice's `invitation` is delivered to bob twice via the
+    universal scenario engine's `repeat: N` grammar, which builds the inbound
+    ONCE and dispatches it N times — the same wire bytes, which is what a
+    replay actually is. The first delivery admits the task; the second is
+    refused, silently, by the freshness gate.
 
-    Both implementations track per-task flood counts —
-    Python: `proposed_tasks[task.uuid].count` in
-    `autonomous_trust/.../negotiation/negprocess.py:122-125`;
-    C: `flood:<uuid>` key in `proposed_tasks` map at
-    `src/c/autonomous_trust/negotiation/neg_proc.c:529-540`.
-    Both gate flood-refusal at count > 5, so `repeat: 2` stays
-    well below threshold; both impls accept the invitation each
-    time and the task ends up in bob's task_stack.
+    What changed. An invitation is the negotiation verb that asks a peer to RUN
+    something, and its payload — a serialized task — used to carry no freshness
+    token of any kind. Both runtimes counted every delivery, so a captured
+    invitation could be re-presented for as long as the flood counter tolerated
+    it. The task now carries `seq`: the requestor's monotonic per-process
+    counter (`core/freshness.py`, `utilities/freshness.h`), field 12 of
+    `negotiation/task.proto` and the `"seq"` key of the JSON form. The receiver
+    keeps a per-(sender, verb) high-water mark and refuses anything at or below
+    it. `repeat: 2` therefore delivers seq 1 twice: accepted, then refused.
 
-    Limitations of this scenario as a strict idempotency probe:
-      - The Python adapter's _check_expected_state for
-        `task_in_stack` is boolean ("stack non-empty"); it does
-        NOT count entries, so a hypothetical double-push of the
-        same task isn't caught here.
-      - The C scenario_engine has no expected_state hook for
-        negotiation (its check is a no-op stub), so the C side
-        validates only that the second delivery didn't abort.
-    Both gaps are acceptable for an initial breadth-of-replay
-    probe; tightening either requires adapter work.
+    The gate sits AHEAD of the per-task flood counter, which is what
+    `flood_count: 1` pins. Behind it, the replays would drive the counter past
+    `max_task_duplicates = 5` and make bob emit a `refusal` — which alice reads
+    as "this worker is out" (`_cancel_participant`). That would turn a replay
+    into a way of evicting a worker from a task it had already accepted. Past
+    the gate the counter counts what it was built to count: distinct, freshly
+    stamped invitations for one task, which is `invite-flood-past-threshold`.
 
-    What this scenario IS valid for: it confirms the universal
-    `repeat: N` engine path dispatches negotiation envelopes
-    cleanly in both languages, alongside reputation
-    (ask-permission-replay-rejected) and identity
-    (request-access-replay-idempotent).
+    The refusal is silent. Answering a replay would spend a message on a sender
+    we cannot vouch for and tell an attacker where our mark sits, so nothing is
+    emitted for the second delivery — pinned by step 2's absence of any second
+    `ack`, and by the outbox comparison the engine runs across both runtimes.
+
+    The scenario name is unchanged from before the fix and still reads true:
+    bob's `handle_invite` survives the duplicate, and the task stays admitted.
+    Names are cited identifiers here, so it keeps the one it has (same call as
+    `pos-vote-replay-tight-margin-flips`).
+
+    Limitations, inherited and still true:
+      - The Python adapter's `task_in_stack` check is boolean ("stack
+        non-empty"); it does not count entries, so it is `flood_count`, not
+        `task_in_stack`, that carries the once-only evidence here.
+      - The C scenario_engine's negotiation expected_state hook enforces the
+        same keys, but a double-push of one task would show up in neither.
 
 participants:
   - id: alice
@@ -54,14 +63,29 @@ steps:
     payload:
       capability: data_fetch
       task_id: t-replay
+      seq: 1
     repeat: 2
     description: |
-        alice invites bob to perform data_fetch — the same
-        invitation envelope is delivered to bob twice. bob's
-        handle_invite increments the per-task flood counter on
-        each delivery; both stay under the threshold of 5, so
-        no demote and no refusal. The task ends up admitted.
+        alice invites bob to perform data_fetch. The envelope is built once and
+        delivered twice, both carrying seq 1. Delivery 1 is fresh (bob's mark
+        for (alice, invitation) is 0) and is accepted. Delivery 2 is at the
+        mark and is dropped before the flood counter, with no reply.
+  - id: 2
+    from: bob
+    to: alice
+    function: ack
+    in_response_to: 1
+    no_propagate: true
+    description: |
+        Assertion-only: an `ack` (NegotiationProtocol.acceptance) appears in
+        step 1's captured outbox — the genuine first delivery was accepted.
+        `no_propagate: true` keeps this an observation step. The engine's
+        cross-runtime outbox comparison is what pins that there is exactly one
+        emission and no `nack`.
 
 expected_state:
   bob:
     task_in_stack: true
+    flood_count:
+      task: t-replay
+      count: 1

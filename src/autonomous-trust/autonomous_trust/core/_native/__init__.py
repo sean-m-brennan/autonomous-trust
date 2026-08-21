@@ -41,5 +41,6 @@ from .._python.automate import AutonomousTrust  # noqa: F401
 # NativeAutonomousTrust available via ._automate_native if needed
 
 # Processes, system — delegate to Python (not yet C-backed)
-from .._python.processes import ProcessTracker, Process, ProcMeta, LogLevel
+from .._python.processes import (ProcessTracker, Process, ProcMeta, LogLevel,
+                                LOG_FORMAT, LOG_DATEFMT)
 from .._python.system import CfgIds, QueueType

@@ -166,6 +166,106 @@ class TestApplySlash:
         assert not rp._is_excluded(rp._consensus_reputation(target))
 
 
+# --- replay bounds (epoch high-water marks) ---------------------------------
+
+class TestSlashReplayBounds:
+    """A slash decision must not be re-applicable.
+
+    The FIFO ring alone could not promise this: it is bounded, so on a busy
+    node an old key ages out and the slash behind it becomes replayable again
+    — and because a slash floors a peer into an exclusion that is sticky by
+    design, that is a durable penalty an attacker gets to re-impose. The
+    per-(target, slasher) high-water mark is what closes it.
+    """
+
+    def test_replay_refused_after_ring_eviction(self):
+        rp = _make_rep_process()
+        rp._persist_slash_marks = lambda: None  # no disk in unit tests
+        target = uuid4()
+        att = _att(rp.identity.uuid, target, floor=0.1, epoch=1)
+        rp._apply_slash(att)
+        # Evict the ring entry the cheap filter relies on, leaving the
+        # high-water mark as the only thing standing between the replay and
+        # a second application. This is the state a busy node reaches on its
+        # own, once COMMITTED_ROUNDS_CAP rounds have passed.
+        rp._slashed_seen.clear()
+        n = len(rp.pending_tiers)
+        rp._apply_slash(att)
+        assert len(rp.pending_tiers) == n
+
+    def test_replayed_slash_cannot_undo_a_rehabilitation(self):
+        rp = _make_rep_process()
+        rp._persist_slash_marks = lambda: None
+        target = uuid4()
+        punitive = _att(rp.identity.uuid, target, floor=0.0, epoch=1)
+        rp._apply_slash(punitive)
+        rp._apply_slash(_att(rp.identity.uuid, target,
+                             reason=SlashAttestation.REASON_REHABILITATE,
+                             floor=0.0, epoch=2))
+        assert str(target) not in rp._slashed
+        # Re-present the punitive slash, with its ring entry aged out. The
+        # rehabilitation must hold: this is the whole point of the mark.
+        rp._slashed_seen.clear()
+        rp._apply_slash(punitive)
+        assert str(target) not in rp._slashed
+        assert not rp._is_excluded(rp._consensus_reputation(target))
+
+    def test_mark_is_per_slasher_not_per_target(self):
+        """Two detectors number their slashes independently, so one
+        detector's high epoch must not gag the other's legitimate low one."""
+        rp = _make_rep_process()
+        rp._persist_slash_marks = lambda: None
+        target, other = uuid4(), uuid4()
+        rp._apply_slash(_att(rp.identity.uuid, target, floor=0.1, epoch=7))
+        rp._slashed.pop(str(target), None)
+        rp._apply_slash(_att(other, target, floor=0.2, epoch=1))
+        assert str(target) in rp._slashed  # accepted on its own sequence
+
+    def test_higher_epoch_from_same_slasher_still_applies(self):
+        rp = _make_rep_process()
+        rp._persist_slash_marks = lambda: None
+        target = uuid4()
+        rp._apply_slash(_att(rp.identity.uuid, target, floor=0.1, epoch=1))
+        rp._slashed_seen.clear()
+        rp._apply_slash(_att(rp.identity.uuid, target, floor=0.0, epoch=2))
+        assert rp._slashed[str(target)][0] == pytest.approx(0.0)
+
+    def test_marks_roundtrip_and_resume_own_epoch(self, tmp_path, monkeypatch):
+        """The marks survive a restart, and our own counter resumes past
+        them — otherwise a restarted detector would begin again at epoch 1
+        and have its next slashes refused by peers still holding marks."""
+        from autonomous_trust.core.config import Configuration
+        monkeypatch.setattr(Configuration, 'get_cfg_dir',
+                            staticmethod(lambda: str(tmp_path)))
+        rp = _make_rep_process()
+        target = uuid4()
+        rp._slash_epoch = 4
+        rp._apply_slash(_att(rp.identity.uuid, target, floor=0.1, epoch=5))
+
+        fresh = _make_rep_process(identity=rp.identity)
+        assert fresh._slash_hw.get((str(target), str(rp.identity.uuid))) == 5
+        assert fresh._slash_epoch >= 5
+        # And the replay is refused by the RESTARTED node, which is the case
+        # a volatile ring could never cover.
+        n = len(fresh.pending_tiers)
+        fresh._apply_slash(_att(rp.identity.uuid, target, floor=0.1, epoch=5))
+        assert len(fresh.pending_tiers) == n
+
+    def test_corrupt_marks_file_is_refused_not_silently_emptied(self, tmp_path,
+                                                               monkeypatch):
+        from autonomous_trust.core.config import Configuration
+        monkeypatch.setattr(Configuration, 'get_cfg_dir',
+                            staticmethod(lambda: str(tmp_path)))
+        rp = _make_rep_process()
+        with open(rp._slash_marks_path(), 'w') as f:
+            f.write('[not an object]')
+        rp._slash_hw = {('a', 'b'): 3}
+        rp._load_slash_marks()
+        # Refused, and the in-memory marks are left alone rather than being
+        # replaced by the empty state the corrupt file asserts.
+        assert rp._slash_hw == {('a', 'b'): 3}
+
+
 # --- serialization ----------------------------------------------------------
 
 class TestSlashSerialization:

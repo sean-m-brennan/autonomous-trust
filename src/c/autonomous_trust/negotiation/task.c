@@ -67,6 +67,7 @@ int task_to_proto(task_t *msg, size_t size, void **data_ptr, size_t *data_len_pt
     proto.timeout = msg->timeout;
     proto.flexible = msg->flexible;
     proto.argc = (int32_t)msg->argc;
+    proto.seq = msg->seq;
 
     *data_len_ptr = autonomous_trust__core__protobuf__negotiation__task__get_packed_size(&proto);
     *data_ptr = smrt_create(*data_len_ptr);
@@ -98,6 +99,10 @@ int proto_to_task(uint8_t *data, size_t len, task_t *task)
     task->timeout = proto->timeout;
     task->flexible = proto->flexible;
     task->argc = (size_t)proto->argc;
+    /* An omitted field 12 unpacks as 0 -- an unstamped task, which
+     * handle_invite refuses. That is the wanted reading for a peer that has
+     * not been rebuilt: refusal, not a lenient path. */
+    task->seq = proto->seq;
 
     autonomous_trust__core__protobuf__negotiation__task__free_unpacked(proto, NULL);
     return 0;

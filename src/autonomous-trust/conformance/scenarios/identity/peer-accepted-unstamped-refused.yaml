@@ -1,0 +1,58 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: peer-accepted-unstamped-refused
+byte_pinning: false
+description: |
+    Peer confirmation, freshness flag day: a `peer_accepted` carrying no
+    `seq` is REFUSED by both runtimes — the named peer is not admitted.
+
+    Background. A confirm used to be a bare canonical public identity with no
+    freshness token of any kind. It is also the verb that ADMITS: the receiver
+    records the peer and, once the admission quorum is met, propagates the
+    CURRENT group key to it (`_confirm_group_membership`). So a confirm
+    captured off the group channel could be re-presented later to put back a
+    peer that had since been removed, and hand it a live key. The confirmer
+    dedup already in place bounded the quorum tally, not the message.
+
+    The payload is now an envelope, `{"peer": {...canonical...}, "seq": N}`,
+    where `seq` is the confirmer's monotonic freshness sequence
+    (core/freshness.py) and the receiver keeps a per-(sender, verb) high-water
+    mark. The stamp sits beside the identity rather than inside it because the
+    canonical public-identity shape is shared byte-for-byte with C's
+    `public_identity_to_json`.
+
+    What this pins is the flag day: an unstamped confirm admits nobody. There
+    is deliberately no lenient path — a receiver that accepted unstamped
+    confirms is one an attacker selects by simply not stamping, and for THIS
+    verb the prize is group-key issuance. Mirrors the quorum-attestation flag
+    day (doc/architecture/reputation.md).
+
+    The replay case (a stamped confirm presented twice) is pinned in the unit
+    suite, where the peer-add and key-propagation halves can be observed
+    directly: `test_replayed_confirm_does_not_readmit_a_removed_peer` in
+    tests/a_unit/test_two_phase_admission.py.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: bg
+    to: bg
+    function: peer_accepted
+    payload:
+      peer: newcomer
+      unstamped: true
+    description: |
+        A confirm naming newcomer, with the `seq` field omitted — the shape a
+        pre-change sender emits and the shape an attacker produces by
+        stripping it. bg must drop it: newcomer is not added, so bg's peer
+        count stays 0.
+
+expected_state:
+  bg:
+    peer_count: 0
