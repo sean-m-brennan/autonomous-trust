@@ -26,6 +26,8 @@ from ..._python.config import (
     EmptyObject,
     SerializeMode,
     WireFormat,
+    NetWireFormat,
+    NET_WIRE_PROTO_MAGIC,
     to_json_string,
     from_json_string,
     to_yaml_string,

@@ -43,6 +43,7 @@
 #include "identity/identity.h"
 #include "identity/identity_priv.h"   /* hexlify / public_identity_to_json */
 #include "identity/id_proc_priv.h"
+#include "utilities/util.h"
 #include "identity/group.h"           /* group_init / group_add_address */
 #include "config/configuration.h"     /* config_t (proc->configs["identity"]) */
 #include "structures/data.h"          /* object_ptr_data */
@@ -1148,6 +1149,58 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
 }
 
 /* ------------------------------------------------------------------------- */
+/* Freshness sequences on inbound payloads                                     */
+/* ------------------------------------------------------------------------- */
+
+/* Read the freshness sequence a step wants on the payload it is building.
+ *
+ * Several identity verbs now carry a monotonic per-process sequence that the
+ * receiver checks against a per-(sender, verb) high-water mark
+ * (utilities/freshness.h; doc/architecture/security-hardening.md, "Replay
+ * resistance, per verb"). The scenario grammar for it is shared with the
+ * Python adapter, so both runtimes read the same YAML:
+ *
+ *   - absent            -> 1, which is fresh against a scenario's empty marks,
+ *                          so every pre-existing scenario keeps working with
+ *                          no edit.
+ *   - `seq: N`          -> N. Two steps with the same N is a replay; N below a
+ *                          mark already advanced is a stale message.
+ *   - `unstamped: true` -> 0, the never-seen floor. Stands for a peer that has
+ *                          not been rebuilt, and for an attacker stripping the
+ *                          field; both must be refused, not admitted.
+ *
+ * Named `_ic_step_seq` rather than folded into each builder because four verbs
+ * need it and they must not drift apart. */
+static int64_t _ic_step_seq(json_t *payload, const char *key)
+{
+    if (!json_is_object(payload))
+        return 1;
+    if (json_is_true(json_object_get(payload, "unstamped")))
+        return 0;
+    json_t *j = json_object_get(payload, key);
+    if (json_is_integer(j))
+        return (int64_t)json_integer_value(j);
+    return 1;
+}
+
+/* Set `seq` on an envelope, or leave it off entirely when the step asked for
+ * an unstamped message.
+ *
+ * Off rather than zero, because for the envelope-shaped verbs (caps_response,
+ * peer_accepted) the receiver's check is `json_is_integer(seq)` — a missing key
+ * is exactly the pre-change wire shape being modelled, and a literal 0 would
+ * test a different thing (a sender that stamped a nonsense value). The
+ * signature-covered verbs differ and are handled at their own call sites. */
+static void _ic_set_seq(json_t *body, json_t *payload)
+{
+    if (json_is_object(payload)
+        && json_is_true(json_object_get(payload, "unstamped")))
+        return;
+    json_object_set_new(body, "seq",
+                        json_integer((json_int_t)_ic_step_seq(payload, "seq")));
+}
+
+/* ------------------------------------------------------------------------- */
 /* Engine callbacks                                                           */
 /* ------------------------------------------------------------------------- */
 
@@ -1190,34 +1243,39 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         return 0;
     }
 
-    /* peer_caps_response — pack the payload as the JSON array
+    /* peer_caps_response — pack the payload as the JSON envelope
      * handle_caps_response expects. Two YAML forms (mirrors the Python
      * adapter):
      *   - `descriptors: [{name, required_tier, description, kind, arg_schema}]`
      *     → packed verbatim as an array of objects (descriptor form).
      *   - `caps: [name, ...]` → packed as an array of name strings (legacy).
-     * Without this the C handler sees no payload and silently no-ops. */
+     * Either array goes under the `caps` key of the envelope, beside the
+     * freshness `seq` (see _ic_step_seq). Without this the C handler sees no
+     * payload and silently no-ops. */
     if (strcmp(function, "peer_caps_response") == 0 && json_is_object(payload)) {
+        json_t *items = NULL;
         json_t *descs = json_object_get(payload, "descriptors");
         if (json_is_array(descs)) {
             /* deep-copy so the body is independent of the scenario JSON's
              * lifetime; net_msg_pack_json serializes the array of objects. */
-            json_t *body = json_deep_copy(descs);
-            if (body != NULL) {
-                net_msg_pack_json(&out->info.net_msg, body);
-                json_decref(body);
+            items = json_deep_copy(descs);
+        } else {
+            json_t *src = json_object_get(payload, "caps");
+            if (json_is_array(src)) {
+                items = json_array();
+                size_t n = json_array_size(src);
+                for (size_t i = 0; i < n; i++) {
+                    json_t *v = json_array_get(src, i);
+                    if (json_is_string(v))
+                        json_array_append_new(items,
+                                              json_string(json_string_value(v)));
+                }
             }
-            return 0;
         }
-        json_t *src = json_object_get(payload, "caps");
-        if (json_is_array(src)) {
-            json_t *body = json_array();
-            size_t n = json_array_size(src);
-            for (size_t i = 0; i < n; i++) {
-                json_t *v = json_array_get(src, i);
-                if (json_is_string(v))
-                    json_array_append_new(body, json_string(json_string_value(v)));
-            }
+        if (items != NULL) {
+            json_t *body = json_object();
+            json_object_set_new(body, "caps", items);
+            _ic_set_seq(body, payload);
             net_msg_pack_json(&out->info.net_msg, body);
             json_decref(body);
         }
@@ -1261,7 +1319,13 @@ static int _build_inbound(sce_run_ctx_t *ctx,
      * empty payload and returns early, so no confirmation is recorded and the
      * provisional hold never registers (provisional_peer_count stays 0).
      * Mirrors the Python adapter's IdentityProtocol.confirm case
-     * (`payload.get('peer') or payload.get('candidate')`). */
+     * (`payload.get('peer') or payload.get('candidate')`).
+     *
+     * The identity goes under `peer` in an envelope carrying the confirmer's
+     * freshness sequence beside it, which is the shape handle_confirm_peer
+     * now requires. It sits beside the identity rather than inside it because
+     * the canonical public-identity form is shared byte-for-byte with
+     * Python's public_identity_to_json and must not gain a field. */
     if (strcmp(function, "peer_accepted") == 0 && json_is_object(payload)) {
         json_t *p = json_object_get(payload, "peer");
         if (!json_is_string(p)) p = json_object_get(payload, "candidate");
@@ -1270,9 +1334,12 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         if (pp != NULL) {
             ic_impl_t *pp_impl = (ic_impl_t *)pp->impl;
             if (pp_impl != NULL && pp_impl->pub != NULL) {
-                json_t *body = NULL;
-                if (public_identity_to_json(pp_impl->pub, &body) == 0
-                    && body != NULL) {
+                json_t *peer_json = NULL;
+                if (public_identity_to_json(pp_impl->pub, &peer_json) == 0
+                    && peer_json != NULL) {
+                    json_t *body = json_object();
+                    json_object_set_new(body, "peer", peer_json);
+                    _ic_set_seq(body, payload);
                     net_msg_pack_json(&out->info.net_msg, body);
                     json_decref(body);
                 }
@@ -1329,9 +1396,23 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_t *sz = json_object_get(payload, "group_size");
         if (json_is_integer(sz)) group_size = (int)json_integer_value(sz);
 
-        char canon[UUID_STRING_LEN + 32];
-        int clen = snprintf(canon, sizeof(canon), "%s|%d",
-                            group_uuid, group_size);
+        /* The sequence is part of the SIGNED bytes, via the same canonical
+         * builder production uses. The old pre-image covered only the group
+         * uuid and size, neither of which changes between rounds, so a
+         * captured probe — plaintext multicast, no prior access needed — was
+         * replayable indefinitely.
+         *
+         * Signed even when the step asks for `unstamped`: the field is
+         * stripped from the body below but the signature still covers it, so
+         * what the receiver sees is a well-signed message missing its
+         * sequence. That is precisely an attacker's strip, and the refusal
+         * being pinned has to come from the freshness check rather than
+         * incidentally from a bad signature. */
+        int64_t probe_seq = _ic_step_seq(payload, "seq");
+        char canon[UUID_STRING_LEN + 64];
+        int clen = identity_partition_canonical_probe(group_uuid, group_size,
+                                                     probe_seq, canon,
+                                                     sizeof(canon));
         unsigned char sig[crypto_sign_BYTES];
         if (clen > 0 && (size_t)clen < sizeof(canon)
             && sender_impl->full != NULL) {
@@ -1351,6 +1432,13 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                                 json_string(group_uuid));
             json_object_set_new(body, "my_group_size",
                                 json_integer(group_size));
+            /* Omitted entirely when the step asked for an unstamped probe;
+             * handle_partition_probe requires json_is_integer(seq), so a
+             * missing key is the pre-change wire shape. */
+            if (!(json_is_object(payload)
+                  && json_is_true(json_object_get(payload, "unstamped"))))
+                json_object_set_new(body, "seq",
+                                    json_integer((json_int_t)probe_seq));
             json_object_set_new(body, "signature", json_string(sig_hex));
             net_msg_pack_json(&out->info.net_msg, body);
             json_decref(body);
@@ -1394,9 +1482,27 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_t *la = json_object_get(payload, "leader_address");
         if (json_is_string(la)) leader_addr = json_string_value(la);
 
-        char canon[UUID_STRING_LEN * 2 + 64];
-        int clen = snprintf(canon, sizeof(canon), "%s|%d|%s",
-                            group_uuid, group_size, in_resp);
+        /* Two sequences, both inside the signed bytes (same canonical builder
+         * production uses):
+         *
+         *   `probe_seq` echoes the probe ROUND being answered. Without it,
+         *   `in_response_to` is only the prober's uuid, which never changes,
+         *   so a genuine response could be captured and re-presented for the
+         *   life of the node — each time steering a request_access toward the
+         *   group the responder named. The receiver refuses an echo that does
+         *   not match the probe it is currently running, so this has to line
+         *   up with the round the scenario's earlier step started. Default 1:
+         *   the first stamp of a scenario, which is what a probe emitted by
+         *   step 1 draws.
+         *
+         *   `seq` is the responder's own, bounding a responder to one answer
+         *   within that round. */
+        int64_t probe_seq = _ic_step_seq(payload, "probe_seq");
+        int64_t resp_seq = _ic_step_seq(payload, "seq");
+        char canon[UUID_STRING_LEN * 2 + 96];
+        int clen = identity_partition_canonical_response(
+            group_uuid, group_size, in_resp, probe_seq, resp_seq,
+            canon, sizeof(canon));
         unsigned char sig[crypto_sign_BYTES];
         if (clen > 0 && (size_t)clen < sizeof(canon)
             && sender_impl->full != NULL) {
@@ -1422,6 +1528,10 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                                 json_string(leader_uuid));
             json_object_set_new(body, "my_group_leader_address",
                                 json_string(leader_addr));
+            json_object_set_new(body, "in_response_to_seq",
+                                json_integer((json_int_t)probe_seq));
+            json_object_set_new(body, "seq",
+                                json_integer((json_int_t)resp_seq));
             json_object_set_new(body, "signature", json_string(sig_hex));
             net_msg_pack_json(&out->info.net_msg, body);
             json_decref(body);
@@ -1643,8 +1753,16 @@ static int _dispatch(sce_run_ctx_t *ctx,
         impl->parent_gateway_pid[0] = '\0';
         if (parent[0] != '\0') {
             const char *pid = _ic_pid_for_uuid(ctx, parent);
-            snprintf(impl->parent_gateway_pid, sizeof(impl->parent_gateway_pid),
-                     "%s", pid != NULL ? pid : parent);
+            /* at_strlcpy, not snprintf: the fallback value is a 36-char uuid
+             * string and this field is SCE_ID_LEN (32), so the truncation is
+             * deliberate — it keeps a recognisable prefix in the mismatch
+             * message at the check site, and a truncated uuid can never equal
+             * a participant id, which is the "no match" outcome wanted. Said
+             * with a bounded copy rather than a format, so it does not read as
+             * an accidental overflow (GCC 15 -Wformat-truncation flags the
+             * snprintf form as an error under -Werror). */
+            at_strlcpy(impl->parent_gateway_pid, pid != NULL ? pid : parent,
+                       sizeof(impl->parent_gateway_pid));
         }
         return 0;
     }
@@ -2017,6 +2135,29 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: %s=%d, expected %d", pid, key, got, want);
                     return -1;
+                }
+            } else if (strcmp(key, "freshness_refusals") == 0) {
+                /* {verb: N} -- messages refused as stale, per verb. The
+                 * positive observable for the freshness guard: every other
+                 * partition observable counts emissions, and a second
+                 * delivery is already suppressed by the per-sender response
+                 * cooldown, so "one response after two deliveries" is a
+                 * number the cooldown alone produces. Only the mark produces
+                 * a refusal. id_state is process-global, so the count is not
+                 * per-participant -- the cases asserting it have exactly one
+                 * refusing participant. Mirrors the Python adapter's
+                 * Freshness.refusals(verb). */
+                const char *verb = NULL;
+                json_t *want_val = NULL;
+                json_object_foreach(val, verb, want_val) {
+                    int64_t want = (int64_t)json_integer_value(want_val);
+                    int64_t got = identity_freshness_refusals(verb);
+                    if (got != want) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: freshness_refusals[%s]=%lld, expected %lld",
+                                 pid, verb, (long long)got, (long long)want);
+                        return -1;
+                    }
                 }
             } else if (strcmp(key, "caps_query_emitted") == 0) {
                 /* Directed peer_caps_query emissions from the periodic caps-

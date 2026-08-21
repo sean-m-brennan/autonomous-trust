@@ -401,8 +401,18 @@ class NegotiationAdapter:
         flexible = bool(payload.get('flexible', True))
         params = TaskParameters(cap, _flexible=flexible, when=when)
 
+        # Freshness sequence for the invitation (TaskInfo.seq; field 12 of
+        # negotiation/task.proto). Defaults to 1 so existing single-invite
+        # scenarios are unchanged. `unstamped: true` sends 0 -- the shape a
+        # peer that has not been rebuilt emits, and the shape an attacker
+        # produces by stripping the field; both runtimes must refuse it rather
+        # than fall back to a lenient path. A replay is expressed by
+        # delivering the SAME seq twice (`repeat: 2`, which builds the inbound
+        # once); a genuine flood is distinct, increasing seqs across steps.
+        seq = 0 if payload.get('unstamped') else int(payload.get('seq', 1))
+
         if function == 'spawn task':
-            task = Task(params, sender_identity, uuid=task_uuid)
+            task = Task(params, sender_identity, uuid=task_uuid, seq=seq)
             obj = task
         elif function in ('invitation', 'haggle', 'ack', 'nack', 'status request'):
             # `Task.requestor` is the original inviter. The requestor
@@ -418,7 +428,7 @@ class NegotiationAdapter:
             # similarly routes by task.requestor.
             requestor_is_sender = function in ('invitation', 'status request')
             requestor = sender_identity if requestor_is_sender else recipient
-            task = Task(params, requestor, uuid=task_uuid)
+            task = Task(params, requestor, uuid=task_uuid, seq=seq)
             obj = task
         elif function == 'status response':
             from autonomous_trust.core.negotiation.negotiation import Status

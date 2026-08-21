@@ -8,8 +8,13 @@ description: |
     `pos-vote-replay-outcome-invariant`. That case picked a wide
     stake margin where neither impl's outcome could change under
     vote-replay; this case picks a TIGHT margin where the outcome
-    DOES flip — and BOTH implementations flip it the same way,
-    because neither dedups votes by voter when accumulating stake.
+    USED TO flip, and now must NOT — this is the regression pin in
+    the opposite direction that the note below anticipated.
+
+    HARDENED 2026-08-21: both impls now dedup by voter on the count
+    path (Python `AgreementProtocol.finalize`, C `agreement_finalize`),
+    so bob's replayed nay is counted exactly once and the outcome
+    stays at the single-delivery value, TRUE.
 
     Setup:
       voters: alice (stake 10), bob (stake 6)
@@ -26,24 +31,31 @@ description: |
       agreement.c:208-222`) and `_stake_accumulate` are byte-equal
       in semantics.
 
-      Single delivery (hypothetical):
+      Single delivery:
         approvals iterated: [(alice, yes, +10), (bob, no, +6)]
         → yea=10, nay=6 → 10 > 6 → outcome: TRUE
 
-      Replay (repeat: 2 on bob's nay):
+      Replay (repeat: 2 on bob's nay), BEFORE hardening:
         approvals iterated: [(alice, yes, +10), (bob, no, +6),
                              (bob, no, +6)]
         → yea=10, nay=12 → 10 > 12 → outcome: FALSE
 
+      Replay (repeat: 2 on bob's nay), AFTER hardening:
+        bob's second ballot hits the per-voter dedup and is skipped
+        approvals iterated: [(alice, yes, +10), (bob, no, +6)]
+        → yea=10, nay=6 → 10 > 6 → outcome: TRUE
+
     What this scenario documents at the conformance gate:
-      - POS is NOT replay-resistant: a single replayed nay-vote at a
-        tight stake margin flips the outcome.
-      - Both impls flip it the SAME way (no asymmetry).
-      - If a future hardening adds dedup-by-voter on the count
-        path, this scenario's expected outcome flips back to TRUE
-        (and the YAML's expected_state needs to follow). The
-        scenario then becomes a regression pin in the opposite
-        direction — "dedup is in place; replay no longer flips."
+      - POS is now replay-resistant at a tight margin: the replayed
+        nay no longer flips the outcome.
+      - Both impls dedup the SAME way (no asymmetry). Python dedups
+        after its signature check in `finalize`; C's votes cleared
+        `pre_verify` at store time, so in both runtimes claiming a
+        voter's slot costs that voter's key — dedup can't be used to
+        suppress a real ballot with a forged one.
+      - The dedup set is scoped to one tally and dies with it, so a
+        genuine later round for the same blob starts clean (see
+        `late-vote-after-finalize`).
 
     Pairs with `pos-vote-replay-outcome-invariant`:
       - The wide-margin case proves outcome doesn't change when
@@ -89,11 +101,11 @@ steps:
       approval: false
     repeat: 2
     description: |
-        bob (stake 6) rejects blob-x — delivered TWICE. Neither impl
-        dedups; nay accumulates 6+6=12. Yea=10 < 12 → outcome flips
-        from the single-delivery TRUE to FALSE.
+        bob (stake 6) rejects blob-x — delivered TWICE. Both impls
+        dedup by voter, so nay accumulates 6 once. Yea=10 > 6 →
+        outcome stays at the single-delivery TRUE.
 
 expected_state:
   agreement:
     blob-x:
-      outcome: false
+      outcome: true

@@ -485,6 +485,7 @@ set(libsrc
     autonomous_trust/utilities/clock.c
     autonomous_trust/utilities/err_str.c
     autonomous_trust/utilities/exception.c
+    autonomous_trust/utilities/freshness.c
     autonomous_trust/utilities/logger.c
     autonomous_trust/utilities/message.c
     autonomous_trust/utilities/msg_types.c

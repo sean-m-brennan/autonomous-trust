@@ -483,7 +483,11 @@ static bool handle_update_accepted(const process_t *proc, directory_t *queues, g
     bool is_proposer = false;
     if (map_get(&fleet_state.pending_proposals, prop_uuid_str, &prop_dat) == 0 && prop_dat != NULL)
     {
-        /* Move to accepted */
+        /* Move to accepted. The ref is what makes it a move: map_set
+         * adopts the reference pending_proposals holds, and the map_remove
+         * releases it — without a second one the value would be freed out
+         * from under accepted_updates (see map.h on map_set). */
+        smrt_ref(prop_dat);
         map_set(&fleet_state.accepted_updates, prop_uuid_str, prop_dat);
         map_remove(&fleet_state.pending_proposals, prop_uuid_str);
         is_proposer = true;

@@ -49,6 +49,93 @@ The framework maintains an allowlist of permitted configuration types. Every `Co
 
 Paxos proposals carry reputation scores that all peers commit to their local history upon consensus. If an adversary forges a proposal message, the group may accept fabricated scores. The `Message` class carries a `verified` field that the network layer sets after cryptographic verification. The reputation process logs a warning when processing unverified consensus messages, providing an audit trail as full signature-based authentication is integrated incrementally.
 
+### Replay resistance, per verb
+
+A signed AT message binds the content but not the recipient and carries no nonce
+or timestamp of its own (`Message._signable_content`), so freshness is a
+per-verb property rather than an envelope one. Most verbs already carry the
+token that supplies it — a monotonic ballot id, a key epoch, a chain index, a
+challenge nonce, a query-id table — and those are replay-inert. The verbs that
+carried nothing were the exposure.
+
+Four were closed without a payload change, each by making an existing piece of
+state the token:
+
+- **Admission ballots.** `AgreementProtocol.finalize` counted every arriving
+  vote, so a replayed ballot voted twice. Under stake-weighted accumulation
+  that flipped the outcome at a tight margin (rank- and tier-weighted
+  accumulation reduce a tally to the leader's verdict and were unaffected).
+  Now one voter, one vote — deduped after the signature check, so claiming a
+  voter's slot costs that voter's key and the dedup cannot be turned around
+  into vote suppression.
+- **Slashing.** A slash floors a peer into an exclusion that is sticky by
+  design, so a replayable slash is a durable penalty an attacker can re-impose.
+  The old FIFO dedup ring was bounded and volatile: an aged-out or
+  restart-forgotten key let a superseded slash — including one a rehabilitation
+  had lifted — be re-applied. A per-(target, slasher) epoch high-water mark,
+  never evicted and persisted separately from the chain evidence, now bounds
+  it. Keyed by slasher because the epoch is a per-slasher counter; a slasher
+  resumes its own counter from the marks so a restart cannot rewind into the
+  marks its peers hold.
+- **Task status and acceptance.** A status response now spends an outstanding
+  status request, and an acceptance is counted once per participant.
+
+Six more needed a freshness field in the payload itself, and now carry one:
+the partition probe and response, peer confirmation, the hierarchy
+advertisement, the access grant, the capability response, and the task
+invitation. One mechanism serves all of them — a per-process monotonic sequence stamped into the payload
+(`core/freshness.py`, `utilities/freshness.c`) and a receiver-side high-water
+mark per (sender, verb). Both halves are persisted: a sender that rewound its
+counter would have its next messages refused by peers whose marks it cannot
+see, and a receiver that forgot its marks would accept one replay per
+(sender, verb) on every restart.
+
+A sequence rather than a timestamp, deliberately. A clock-based window would
+make the advisory cohort-clock subsystem load-bearing, and would still leave
+replay free inside the window.
+
+The stamp lives in `data`, which the pre-image already covers as
+`base64(data)`, so a stripped sequence is an invalid message rather than an
+unstamped one — and the pre-image itself never moved, which is what keeps the
+byte-pinned corpus valid. For the partition probe and response, where the
+signature is a separate detached one over a canonical string, the sequence went
+into that string instead. The response carries two: one echoing the probe round
+it answers, since `in_response_to` is only the prober's uuid and never changes,
+and one of the responder's own.
+
+An unstamped message is refused in every case. Same reasoning as the quorum
+attestation flag day above: a receiver that accepts unstamped messages is one
+an attacker selects by not stamping.
+
+The task invitation was the one that cost a schema change rather than a
+payload edit. Its payload IS a serialized task, in both runtimes and in
+`negotiation/task.proto`, so there was nowhere to put a sequence except on the
+task itself: `seq` is field 12 of that message and the `"seq"` key of the JSON
+form, appended so every existing field keeps its number and wire type. A peer
+that has not been rebuilt simply omits it, an omitted field unpacks as 0, and 0
+is the never-seen floor — so the flag day falls out of the encoding rather than
+needing a version check. The verb matters because an invitation asks a peer to
+RUN something: a captured one could be re-presented and executed, and the
+per-task flood counter bounded how many times, not whether.
+
+Where that check sits is load-bearing. It runs BEFORE the flood counter, not
+after. Behind the counter, replaying one captured invitation past
+`max_task_duplicates` would make the worker emit a refusal — which the
+requestor reads as "this worker is out" and acts on by dropping it from the
+task. Ordering the gate that way would have turned a replay into a way of
+evicting a worker from work it had already accepted. Ahead of the counter, the
+counter goes back to counting what it was built for: distinct, freshly stamped
+invitations for one task, which is a requestor misbehaving rather than an
+attacker echoing. The same reasoning as the vote dedup above — a defence that
+can be aimed at the honest party is not yet a defence.
+
+One stamp covers a whole announcement rather than one per invited peer. The
+invitation is a single act fanned out to every capable peer, and each receiver
+keeps its own mark, so it is per-receiver monotonicity that does the work;
+numbering the copies separately would only make one act look like several. The
+haggle resolution is a genuinely new invitation and draws a new number, which
+is what distinguishes it from a replay of the first.
+
 ## Inspector security
 
 The inspector provides a Dash-based web UI and WebSocket data feeds for monitoring live networks.
@@ -195,6 +282,11 @@ Although the simulator does not run in production, correctness in its radio mode
 | C utilities | Use-after-free prevention | Exploitable dangling pointer access |
 | Python core | Configuration class allowlist | Remote code execution via crafted `__type__` |
 | Python core | Message verification field | Forged Paxos proposals and consensus poisoning |
+| Python core / C library | One voter, one vote on the count path | Replayed ballots flipping a stake-weighted admission |
+| Python core / C library | Persisted per-(target, slasher) slash epoch marks | A superseded slash replayed into sticky exclusion, undoing a rehabilitation |
+| Python core / C library | Status request consumed as a one-shot token | Unbounded remote extension of a task deadline |
+| Python core / C library | Monotonic payload sequence + per-(sender, verb) high-water marks | Replayed partition probes/responses, peer confirmations, hierarchy claims, access grants, and capability responses |
+| Protobuf schema / both runtimes | `Task.seq`, checked ahead of the flood counter | A replayed task invitation re-executing work, or being replayed to trip the flood refusal and evict an honest worker |
 | Inspector | Debug mode parameterization | Information disclosure in production |
 | Inspector | WebSocket origin validation | Cross-origin data exfiltration |
 | Inspector | Opt-in, fail-closed TLS on both listeners | Plaintext mesh state on a published port |

@@ -705,9 +705,35 @@ static void wire_peer(public_identity_t *p, uint8_t seed, const char *address)
     snprintf(p->address, sizeof(p->address), "%s", address);
 }
 
+/* Attach the freshness sequence an `access_granted` now has to carry.
+ *
+ * handle_acceptance reads the body as [package_hash, capabilities, seq] and
+ * refuses anything whose sequence is not above its per-(granter, verb)
+ * high-water mark — 0, the unstamped floor, included. The verb is plaintext
+ * and it APPENDS the granter to our peer set, so there is deliberately no
+ * lenient path for an unstamped one (utilities/freshness.h and
+ * doc/architecture/security-hardening.md, "Replay resistance, per verb").
+ * These tests are about what admission tells the app, so they have to get
+ * past that gate first. */
+static void stamp_accept(net_msg_t *nmsg, int seq)
+{
+    json_t *body = json_array();
+    ck_assert_ptr_nonnull(body);
+    json_array_append_new(body, json_string(""));   /* package_hash: unused here */
+    json_array_append_new(body, json_array());      /* capabilities: unused here */
+    json_array_append_new(body, json_integer(seq));
+    ck_assert_int_eq(net_msg_pack_json(nmsg, body), 0);
+    json_decref(body);
+}
+
 DEFINE_TEST(test_acceptance_admission_tells_the_app)
 {
     capture_reset();
+    /* id_state is a file-static singleton whose freshness marks are PERSISTED,
+     * so without this the mark this test advances survives into the next run
+     * of the binary and the stamped message below is refused as a replay.
+     * That persistence is the point in production; here it has to be dropped. */
+    identity_reset_state();
 
     /* No peers yet: a joining node, which is the case that failed. */
     process_t idp;
@@ -726,6 +752,7 @@ DEFINE_TEST(test_acceptance_admission_tells_the_app)
              "%s", idp.name);
     accept.info.net_msg.function = (char *)"access_granted";
     wire_peer(&accept.info.net_msg.from_whom, 0x71, "10.0.0.71");
+    stamp_accept(&accept.info.net_msg, 1);
 
     ck_assert(run_message_handlers(&idp, &queues, NET_MESSAGE, &accept));
 
@@ -754,6 +781,7 @@ END_TEST_DEFINITION()
 DEFINE_TEST(test_a_repeated_acceptance_is_not_re_announced)
 {
     capture_reset();
+    identity_reset_state();   /* drop persisted freshness marks; see above */
 
     process_t idp;
     proc_with_peers(&idp, 0, 0);
@@ -770,7 +798,13 @@ DEFINE_TEST(test_a_repeated_acceptance_is_not_re_announced)
              "%s", idp.name);
     accept.info.net_msg.function = (char *)"access_granted";
     wire_peer(&accept.info.net_msg.from_whom, 0x72, "10.0.0.72");
+    stamp_accept(&accept.info.net_msg, 1);
 
+    /* The same stamped message twice. The first delivery admits; the second is
+     * now turned away by the freshness gate rather than by the peer-table
+     * dedup this test was written for. Both are the same observable outcome —
+     * one peer, one announcement — which is what is asserted, and it is worth
+     * being explicit that two distinct mechanisms now guard it. */
     ck_assert(run_message_handlers(&idp, &queues, NET_MESSAGE, &accept));
     ck_assert(run_message_handlers(&idp, &queues, NET_MESSAGE, &accept));
 

@@ -95,6 +95,8 @@ face no gate at all.
 Third, *flood threshold*. Past five invitations carrying the same task
 identifier, the worker refuses and stops processing that invitation. The counter
 persists across admissions, so a peer cannot reset it by leaving and rejoining.
+It counts *distinct* invitations: a replayed one is turned away earlier, by the
+freshness check described below, and never reaches the counter.
 
 Refusal is not the only alternative to acceptance. When the parameters proposed
 by the worker disagree with the ones the requester sent, whether over timing or
@@ -142,9 +144,27 @@ rather than merely logging. It is canonical behavior in both the Python and C
 implementations, which matters because a defense present in one runtime and
 absent in the other is a defense an adversary selects around.
 
-Re-delivering an invitation is survivable by design. The flood counter advances
-and the admission of the task is unchanged, so a duplicate on an unreliable
-transport costs nothing and a deliberate replay buys nothing.
+A re-delivered invitation is refused rather than counted. Every invitation
+carries a freshness sequence — the requester's monotonic counter, stamped into
+the task itself — and the worker keeps the highest it has accepted from that
+requester, refusing anything at or below it. A duplicate on an unreliable
+transport costs nothing, because the task was already admitted the first time,
+and a deliberate replay buys nothing, because it never reaches the handler's
+working parts at all.
+
+That check runs *before* the flood counter, and the order is the security
+property rather than an implementation detail. Behind the counter, replaying one
+captured invitation six times would trip the flood refusal — and a refusal is
+what the requester reads as the worker dropping out, which it acts on by
+cancelling that participant. A replay would then be a way to evict an honest
+worker from work it had already accepted. Ahead of the counter, the counter
+counts what it was built to count: distinct invitations for one task, which is
+a requester misbehaving rather than an attacker echoing.
+
+An invitation carrying no sequence at all is refused too, with no lenient path
+for senders that predate the field. A worker that accepted unstamped
+invitations would be a worker an attacker selects by simply not stamping, and
+what that buys is execution of work on somebody else's node.
 
 ## Pinned scenarios
 
@@ -162,7 +182,8 @@ both runtimes must reproduce.
 | Haggle, counter-proposal | [`invite-haggle-counterprop.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-haggle-counterprop.yaml) |
 | Results forwarded on completion | [`report-results-forwarded.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/report-results-forwarded.yaml) |
 | Demotion cancels running work | [`tier-loss-cancels-running-task.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/tier-loss-cancels-running-task.yaml) |
-| Invitation replay survives | [`invite-replay-survives.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-replay-survives.yaml) |
+| Invitation replay refused, worker keeps the task | [`invite-replay-survives.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-replay-survives.yaml) |
+| Unstamped invitation refused | [`invite-unstamped-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-unstamped-refused.yaml) |
 
 The v1 binary floor, refusing whenever the peer level was zero, is still pinned
 alongside the per-capability tier comparison that replaced it.

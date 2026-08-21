@@ -622,6 +622,12 @@ int reputation_consensus_by_tier(const tx_history_t *hist, const uuid_t peer_uui
 #define REP_EVIDENCE_SCHEMA "1"
 #define REP_EVIDENCE_FILE   "reputation-history"
 
+/* Per-(target, slasher) slash high-water marks. A separate file from the chain
+ * evidence deliberately: the evidence is an optimization of trust that a node
+ * can lose harmlessly, while these marks are the memory a replayed slash has to
+ * clear, so the two must not share a failure. */
+#define REP_SLASH_MARKS_FILE "reputation-slash-marks"
+
 /* Hex length of a detached Ed25519 signature (crypto_sign_BYTES * 2). Defined
  * here rather than only in rep_proc.c because the evidence document carries
  * these signatures across the file boundary. */

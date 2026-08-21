@@ -443,7 +443,9 @@ static bool handle_config_accepted(const process_t *proc, directory_t *queues, g
     data_t *prop_dat = NULL;
     if (map_get(&config_state.pending_proposals, prop_uuid_str, &prop_dat) == 0 && prop_dat != NULL)
     {
-        /* Move to accepted */
+        /* Move to accepted; the ref keeps the value alive across the
+         * map_remove below (see map.h on map_set). */
+        smrt_ref(prop_dat);
         map_set(&config_state.accepted_configs, prop_uuid_str, prop_dat);
         map_remove(&config_state.pending_proposals, prop_uuid_str);
         log_info(proc->logger, "Config: Proposal %s accepted and moved to accepted_configs\n",

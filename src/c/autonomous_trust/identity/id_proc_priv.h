@@ -141,19 +141,77 @@ size_t identity_get_partition_recovery_target(char *out, size_t out_len);
 
 /** Build the canonical signature input for a partition_probe payload.
  *  Mirrors Python's `IdentityProcess._partition_probe_canonical`:
- *  `"%s|%d"` of (group_uuid, group_size). Returns bytes written
+ *  `"%s|%d|%lld"` of (group_uuid, group_size, seq). Returns bytes written
  *  (excluding the NUL), -1 on buffer overflow. Exposed for the test
- *  suite to verify byte-for-byte interop with Python. */
+ *  suite to verify byte-for-byte interop with Python.
+ *
+ *  `seq` is the prober's monotonic freshness sequence and is part of the
+ *  SIGNED bytes: without it the pre-image covered only the group uuid and
+ *  size, neither of which changes between rounds, so a captured probe was
+ *  replayable indefinitely by anyone on the wire. */
 int identity_partition_canonical_probe(const char *group_uuid,
-                                       int group_size,
+                                       int group_size, int64_t seq,
                                        char *out, size_t out_len);
 
 /** As @ref identity_partition_canonical_probe but for partition_response:
- *  `"%s|%d|%s"` of (group_uuid, group_size, in_response_to). */
+ *  `"%s|%d|%s|%lld|%lld"` of (group_uuid, group_size, in_response_to,
+ *  probe_seq, seq). `probe_seq` echoes the probe round being answered —
+ *  `in_response_to` is only the prober's uuid, which never changes, so it
+ *  cannot distinguish an answer to the current round from one captured
+ *  earlier. `seq` is the responder's own freshness sequence. */
 int identity_partition_canonical_response(const char *group_uuid,
                                           int group_size,
                                           const char *in_response_to,
+                                          int64_t probe_seq, int64_t seq,
                                           char *out, size_t out_len);
+
+/** Messages this process refused as stale, for @p verb (NULL: every verb).
+ *
+ *  Reads the identity process's freshness state; see @ref freshness_refusals
+ *  for what is and is not counted. Unlike the marks it reports, this is not
+ *  security state — it is the evidence that a refusal happened, which is
+ *  otherwise unobservable from outside: the per-sender cooldowns above these
+ *  handlers suppress a second delivery on their own, so a scenario that only
+ *  counts emissions cannot tell a working mark from a rate limiter.
+ *
+ *  Process-global, like the rest of `id_state` — every participant in a C
+ *  conformance run shares it — so a case asserting it must arrange for exactly
+ *  one participant to do the refusing. Same compromise as
+ *  @ref identity_get_peer_caps_count. */
+int64_t identity_freshness_refusals(const char *verb);
+
+/** Test-only: clear the per-sender partition probe/response cooldown windows.
+ *
+ *  The cooldown and the freshness mark refuse an immediate re-probe for
+ *  different reasons — the cooldown rate-limits a legitimate prober, the mark
+ *  rejects a replayed round — and on a live node they overlap, with the
+ *  cooldown firing first in wall-clock terms. A test that wants to observe the
+ *  MARK has to take the cooldown out of the way, or it proves only that the
+ *  rate limiter works. Python's twin does the same thing by clearing
+ *  `_partition_response_cooldown` between deliveries.
+ *
+ *  Production code must never call this: it reopens exactly the window the
+ *  cooldown exists to close. */
+void identity_clear_partition_cooldowns(void);
+
+/** Test-only: declare the freshness sequence of the probe round this node is
+ *  to be treated as currently running (0 = none).
+ *
+ *  `handle_partition_response` refuses any response whose echoed round does
+ *  not match this, so a test that delivers a response without having driven a
+ *  real probe first must state the round the response answers. Mirrors setting
+ *  `_probe_seq` directly in the Python twin. */
+void identity_set_partition_probe_round(int64_t seq);
+
+/** Test-only: clear the in-flight partition-recovery marker.
+ *
+ *  Adoption sets the marker and `handle_partition_response` returns early
+ *  while it is set, so it would refuse a replay on its own. Clearing it
+ *  between deliveries leaves the freshness mark as the only thing that can
+ *  refuse — the same isolation the Python twin gets by assigning
+ *  `_partition_recovery_in_progress = None`. Deliberately narrower than
+ *  @ref identity_reset_state, which would also wipe the marks under test. */
+void identity_clear_partition_recovery(void);
 
 /** Toggle synchronous-dispatch mode for the conformance harness.
  *

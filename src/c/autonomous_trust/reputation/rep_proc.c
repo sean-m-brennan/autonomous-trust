@@ -150,6 +150,14 @@ static void _handle_zta_standing(const process_t *proc,
  * calls. */
 static void _persist_reputations(const process_t *proc);
 #endif
+/* Forward declarations — the slash replay marks are written from
+ * _apply_slash_locked and the rehabilitation path, both of which sit well
+ * above the persistence block that owns the file. */
+static void _persist_slash_marks(const process_t *proc);
+static void _load_slash_marks(const process_t *proc);
+static bool _slash_mark_advance_locked(const char *target_str,
+                                       const char *slasher_str,
+                                       int64_t epoch);
 /* Declared unconditionally: the batched consensus handler skips our own uuid,
  * and that path is not ZTA-gated (this declaration used to sit inside the
  * AT_ZTA_ENABLED block, where a default build could not see it). */
@@ -352,6 +360,19 @@ static struct {
      * reproduce the proposer's designation byte for byte. */
     map_t slash_pending;
     int64_t slash_epoch;
+    /* "target:slasher" -> integer_data(epoch): the highest slash epoch this
+     * node has ever APPLIED for that pair. Never removed, unlike `slashed`
+     * (which a rehabilitation clears) — it is sized by the cohort, not by how
+     * many rounds have passed, so there is no window in which an old slash
+     * becomes applicable again. Persisted: the guard is only as good as its
+     * memory, and a slash floors a peer into an exclusion that is sticky by
+     * design, so a forgotten mark is a penalty an attacker gets to re-impose.
+     *
+     * Keyed by slasher as well as target because the epoch is a per-SLASHER
+     * counter, so two detectors' sequences are independent and a single
+     * per-target mark would refuse one detector's legitimate slash on the
+     * strength of the other's. Mirrors Python ReputationProcess._slash_hw. */
+    map_t slash_hw;
     /* Communication cut-off exclusion set: peers whose reputation fell below
      * COMM_CUTOFF and were excluded at the network layer. Tracks the crossing
      * so _publish_tier_change emits exclude/readmit only on an actual
@@ -464,6 +485,7 @@ static void _ensure_init(void)
         map_init(&rep_state.slash_sigs);
         map_init(&rep_state.slash_pending);
         rep_state.slash_epoch = 0;
+        map_init(&rep_state.slash_hw);
         map_init(&rep_state.excluded);
         map_init(&rep_state.checkpoint_sigs);
         map_init(&rep_state.checkpoint_pending);
@@ -2937,14 +2959,46 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
  * self, and applying an idempotent floor twice is harmless.
  ****************************/
 
+/* Advance the per-(target, slasher) high-water mark, or refuse.
+ *
+ * Returns true when `epoch` is strictly above every epoch already applied
+ * from that slasher against that target — the only case in which a slash
+ * decision is new. A second presentation of any earlier decision returns
+ * false, INCLUDING a punitive slash replayed after a rehabilitation lifted
+ * it, which the `slashed` set alone could not catch because a rehabilitation
+ * removes the target from it.
+ *
+ * Epochs are assigned pre-incremented from 1, so 0 is the never-seen floor
+ * and an attestation claiming epoch <= 0 is malformed; both land on the same
+ * refusal. Caller holds the lock. */
+static bool _slash_mark_advance_locked(const char *target_str,
+                                       const char *slasher_str,
+                                       int64_t epoch)
+{
+    char hw_key[UUID_STRING_LEN * 2 + 4];
+    snprintf(hw_key, sizeof(hw_key), "%s:%s", target_str,
+             (slasher_str == NULL) ? "" : slasher_str);
+    data_t *mark = NULL;
+    int applied = 0;
+    if (map_get(&rep_state.slash_hw, (map_key_t)hw_key, &mark) == 0 && mark)
+        data_integer(mark, &applied);
+    if (epoch <= (int64_t)applied)
+        return false;
+    map_set(&rep_state.slash_hw, (map_key_t)hw_key, integer_data((int)epoch));
+    return true;
+}
+
 /* Mirror the floor into the reputations store (so
  * reputation_get_peer_reputation + handle_consensus_rep_request reflect
  * it) and record the target in the slashed set. Caller holds the lock.
- * Idempotent per target. */
+ * Idempotent per target, and replay-bounded per (target, slasher). */
 static void _apply_slash_locked(const char *target_str,
+                                const char *slasher_str,
                                 const uuid_t target_uuid,
                                 double floor, int64_t epoch)
 {
+    if (!_slash_mark_advance_locked(target_str, slasher_str, epoch))
+        return;  /* replay of a decision already applied (or superseded) */
     data_t *seen = NULL;
     if (map_get(&rep_state.slashed, (map_key_t)target_str, &seen) == 0)
         return;  /* already slashed */
@@ -3521,6 +3575,10 @@ static bool handle_slash_final(const process_t *proc, directory_t *queues, gener
     int64_t epoch = json_integer_value(json_object_get(payload, "epoch"));
     const char *reason =
         json_string_value(json_object_get(payload, "reason"));
+    /* Function scope: the replay mark below is keyed by (target, slasher), so
+     * the slasher is needed past the quorum block that first read it. */
+    const char *slasher_str =
+        json_string_value(json_object_get(payload, "slasher_uuid"));
     if (target_str == NULL)
     {
         json_decref(payload);
@@ -3547,8 +3605,6 @@ static bool handle_slash_final(const process_t *proc, directory_t *queues, gener
      * peer into sticky exclusion. A finalizer carrying no verifiable
      * co-signatures is refused — the flag day noted in reputation.md. */
     {
-        const char *slasher_str =
-            json_string_value(json_object_get(payload, "slasher_uuid"));
         uint8_t desig[REP_DESIG_MAX];
         size_t dlen = (slasher_str != NULL && reason != NULL)
             ? _slash_designation(slasher_str, target_str, reason, floor, epoch,
@@ -3578,9 +3634,30 @@ static bool handle_slash_final(const process_t *proc, directory_t *queues, gener
     if (reason != NULL && strcmp(reason, REP_SLASH_REASON_REHABILITATE) == 0)
     {
         pthread_mutex_lock(&rep_state.lock);
-        map_remove(&rep_state.slashed, (map_key_t)target_str);
-        reputations_update(&rep_state.reputations, target_uuid, PREREP_NEUTRAL);
+        /* A rehabilitation is itself a decision that must not be replayable,
+         * and it takes the same mark: without this, the punitive slash it
+         * supersedes could be re-presented at its own epoch and re-floor the
+         * peer, and the rehab itself could be replayed to lift a LATER
+         * legitimate slash. Refused when it does not advance the mark. */
+        bool fresh = _slash_mark_advance_locked(target_str, slasher_str, epoch);
+        if (fresh)
+        {
+            map_remove(&rep_state.slashed, (map_key_t)target_str);
+            reputations_update(&rep_state.reputations, target_uuid,
+                               PREREP_NEUTRAL);
+        }
         pthread_mutex_unlock(&rep_state.lock);
+        if (!fresh)
+        {
+            log_warn(proc->logger,
+                     "Reputation: refusing rehabilitate for %s from %s: epoch "
+                     "%lld not above the applied high-water (replay)\n",
+                     target_str, (slasher_str == NULL) ? "?" : slasher_str,
+                     (long long)epoch);
+            json_decref(payload);
+            return true;
+        }
+        _persist_slash_marks(proc);
         _publish_tier_change(proc, target_uuid, PREREP_NEUTRAL);
         _publish_reputation_change(target_uuid, PREREP_NEUTRAL);
         log_info(proc->logger,
@@ -3590,8 +3667,9 @@ static bool handle_slash_final(const process_t *proc, directory_t *queues, gener
         return true;
     }
     pthread_mutex_lock(&rep_state.lock);
-    _apply_slash_locked(target_str, target_uuid, floor, epoch);
+    _apply_slash_locked(target_str, slasher_str, target_uuid, floor, epoch);
     pthread_mutex_unlock(&rep_state.lock);
+    _persist_slash_marks(proc);
     /* Drive the tier/exclusion publication so a sub-cut-off floor excludes
      * the peer at the network layer immediately (mirrors Python's
      * pending_tiers -> _compute_reputation -> _publish_tier_change flow). */
@@ -5029,6 +5107,136 @@ static void _persist_history(const process_t *proc, const char *chain_key)
     json_decref(doc);
 }
 
+/* Path of the slash replay-mark file. */
+static int _slash_marks_path(char *out, size_t cap)
+{
+    char cfg_dir[CFG_PATH_LEN + 1] = {0};
+    if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) < 0)
+        return -1;
+    int n = snprintf(out, cap, "%s/%s%s", cfg_dir, REP_SLASH_MARKS_FILE,
+                     CFG_FILE_EXT);
+    if (n < 0 || (size_t)n >= cap)
+        return -1;
+    return 0;
+}
+
+/* Write the per-(target, slasher) slash high-water marks.
+ *
+ * Unlike the chain evidence, this is NOT an optimization of trust: the marks
+ * are what stop a superseded slash from being replayed into a sticky
+ * exclusion, so losing them reopens that window. A failure is therefore
+ * logged at warning — but still swallowed, because the alternative is taking
+ * the reputation process down over a full disk and leaving the node with no
+ * reputation at all.
+ *
+ * The map keys are already the flat "target:slasher" form, so the document is
+ * a direct dump of them. Mirrors Python _persist_slash_marks. */
+static void _persist_slash_marks(const process_t *proc)
+{
+    char path[CFG_PATH_LEN + 64] = {0};
+    if (_slash_marks_path(path, sizeof(path)) != 0)
+    {
+        log_warn(proc->logger,
+                 "Reputation: cannot build slash-marks path; not persisting\n");
+        return;
+    }
+    json_t *doc = json_object();
+    if (doc == NULL)
+        return;
+    pthread_mutex_lock(&rep_state.lock);
+    map_key_t key = NULL;
+    data_t *val = NULL;
+    map_entries_for_each(&rep_state.slash_hw, key, val)
+    {
+        int epoch = 0;
+        if (data_integer(val, &epoch) == 0)
+            json_object_set_new(doc, (const char *)key,
+                                json_integer((json_int_t)epoch));
+    }
+    map_end_for_each
+    pthread_mutex_unlock(&rep_state.lock);
+    if (json_dump_file(doc, path, JSON_INDENT(2)) != 0)
+        log_warn(proc->logger,
+                 "Reputation: could not persist slash marks to %s\n", path);
+    json_decref(doc);
+}
+
+/* Restore the marks and resume our own slash epoch past them.
+ *
+ * A missing file is the cold-start case and not an error: the marks are empty
+ * and the first slash from any slasher is accepted, which is the only
+ * behaviour a node with no history can have. A CORRUPT file is different — it
+ * is refused loudly and left in place rather than being silently treated as
+ * empty, because "no marks" is exactly the state an attacker would want to
+ * induce.
+ *
+ * Resuming rep_state.slash_epoch matters as much as the marks themselves:
+ * peers hold high-water marks that our restart does not reset, so a detector
+ * that began again at epoch 1 would have its next slashes refused as replays
+ * — the same trap _rebuild_from_evidence documents for checkpoint epochs.
+ * Mirrors Python _load_slash_marks.
+ *
+ * NOTE: this runtime does not ORIGINATE slashes yet (nothing increments
+ * rep_state.slash_epoch — there is no forward_slash twin), so the resume half
+ * is currently inert while the receive guard above is not. It is written now
+ * because a detector added later must not silently rewind its epochs, and
+ * because a node self-applying its own slash is what puts its own epochs in
+ * this file in the first place. */
+static void _load_slash_marks(const process_t *proc)
+{
+    char path[CFG_PATH_LEN + 64] = {0};
+    if (_slash_marks_path(path, sizeof(path)) != 0)
+        return;
+    json_error_t err;
+    json_t *doc = json_load_file(path, 0, &err);
+    if (doc == NULL)
+        return;  /* absent (cold start) or unreadable; nothing to restore */
+    if (!json_is_object(doc))
+    {
+        log_error(proc->logger,
+                  "Reputation: slash marks malformed (%s); replay protection "
+                  "for slashes starts from empty this boot\n", path);
+        json_decref(doc);
+        return;
+    }
+    uuid_t self_uuid;
+    char self_str[UUID_STRING_LEN + 1] = {0};
+    bool have_self = _resolve_self_uuid(proc, self_uuid);
+    if (have_self)
+        uuid_unparse_lower(self_uuid, self_str);
+
+    size_t restored = 0;
+    int64_t own_high = 0;
+    pthread_mutex_lock(&rep_state.lock);
+    const char *k = NULL;
+    json_t *v = NULL;
+    json_object_foreach(doc, k, v)
+    {
+        if (!json_is_integer(v))
+            continue;
+        int64_t epoch = (int64_t)json_integer_value(v);
+        map_set(&rep_state.slash_hw, (map_key_t)k, integer_data((int)epoch));
+        restored++;
+        /* Our OWN emitted epochs are in here because a detector self-applies
+         * its slashes, which is what makes one file serve both the receive
+         * guard and the resume point. */
+        if (have_self)
+        {
+            const char *sep = strrchr(k, ':');
+            if (sep != NULL && strcmp(sep + 1, self_str) == 0
+                && epoch > own_high)
+                own_high = epoch;
+        }
+    }
+    if (own_high > rep_state.slash_epoch)
+        rep_state.slash_epoch = own_high;
+    pthread_mutex_unlock(&rep_state.lock);
+    json_decref(doc);
+    log_debug(proc->logger,
+              "Reputation: slash marks restored: %zu pair(s), own epoch "
+              "resumed at %lld\n", restored, (long long)rep_state.slash_epoch);
+}
+
 /* Record a finalized checkpoint (root + window bounds + the co-signatures that
  * finalized it) and persist the evidence beside it.
  *
@@ -5937,6 +6145,8 @@ void reputation_reset_state(int num_peers)
     map_free(&rep_state.slash_pending);
     map_init(&rep_state.slash_pending);
     rep_state.slash_epoch = 0;
+    map_free(&rep_state.slash_hw);
+    map_init(&rep_state.slash_hw);
     map_free(&rep_state.excluded);
     map_init(&rep_state.excluded);
     map_free(&rep_state.checkpoint_sigs);
@@ -6372,6 +6582,9 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
     _load_reputations(proc);
     _seed_idle_from_snapshot(proc, have_self ? self_str : NULL);
     _rebuild_from_evidence(proc, have_self ? self_str : NULL);
+    /* Slash replay marks, before the loop can handle a slash_final. Also
+     * resumes our own slash epoch, so it must precede the first origination. */
+    _load_slash_marks(proc);
 
     while (keep_running(proc, &ctx.sig_q, logger))
     {

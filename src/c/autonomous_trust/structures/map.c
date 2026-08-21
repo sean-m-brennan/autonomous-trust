@@ -230,6 +230,12 @@ int map_create(map_t **map_ptr)
         smrt_deref(map);
         return err;
     }
+    /* map_init zeroes the smrt header for the embedded case (a stack map_t or
+     * a struct member, whose header no allocator wrote); this struct IS an
+     * smrt allocation, so restore what smrt_create established or map_free's
+     * closing deref would never free it. Mirrors array_create. */
+    map->alloc = true;
+    map->refs = 1;
     return err;
 }
 
@@ -294,8 +300,15 @@ int map_set(map_t *map, const map_key_t key, data_t *value)
             break;
         if (strcmp(key, map->items[index].key) == 0)
         {
-            smrt_ref(value);
+            /* Overwrite: the map ADOPTS the caller's reference (see the
+             * ownership note on map_set in map.h) and releases the value it
+             * is displacing — that one is leaving the map and nothing else
+             * holds it. Guarded against a self-assign, where deref'ing first
+             * would free the value we are about to store. */
+            data_t *displaced = map->items[index].value;
             map->items[index].value = value;
+            if (displaced != value)
+                smrt_deref(displaced);
             return 0;
         }
         index++;
@@ -310,8 +323,7 @@ int map_set(map_t *map, const map_key_t key, data_t *value)
         return EXCEPTION(ENOMEM);
     item->key = key_cpy; // map owns this strdup'd copy; freed in map_delete/map_free
     item->hash = hash;
-    smrt_ref(value);
-    item->value = value;
+    item->value = value;  /* adopted, not referenced; see map.h */
     data_t *str_dat = string_data(key_cpy, strlen(key_cpy));
     int err = array_append(&map->keys, str_dat);
     if (err != 0)
@@ -337,11 +349,16 @@ int map_remove(map_t *map, map_key_t key)
     {
         if (strcmp(key, map->items[index].key) == 0)
         {
+            /* The dropped value's reference is the map's to release. A caller
+             * moving a value to another map must smrt_ref it before the
+             * map_set, or this deref is the last one (see peers_promote). */
+            data_t *dropped = map->items[index].value;
             free(map->items[index].key);
             map->items[index].key = NULL;
             map->items[index].value = NULL;
             map->items[index].hash = 0;
             map->length--;
+            smrt_deref(dropped);
 
             //@ assert map->length < \old(map->length);
 
@@ -413,7 +430,18 @@ void map_free(map_t *map)
     {
         if (map->items[i].key != NULL)
             free(map->items[i].key);
+        /* The map holds one reference per stored value (map_set adopts the
+         * caller's), so tearing the map down releases them — the same
+         * contract array_free has always had for its elements. Without this
+         * every value ever stored in any map outlived its map. */
+        if (map->items[i].value != NULL)
+            smrt_deref(map->items[i].value);
     }
+    /* The parallel array of key copies is the map's too. Safe now that
+     * array_init initializes the smrt header of an embedded array_t: this is
+     * a struct member, so array_free's closing deref must find alloc=false
+     * and do nothing rather than free() an interior pointer. */
+    array_free(&map->keys);
     smrt_deref(map->items);
     smrt_deref(map);
 }

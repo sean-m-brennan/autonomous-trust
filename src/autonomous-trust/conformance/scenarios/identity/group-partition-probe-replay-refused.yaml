@@ -1,0 +1,90 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-partition-probe-replay-refused
+byte_pinning: false
+description: |
+    Group partition probe, replay: the same signed probe delivered twice is
+    answered ONCE, and the second delivery is refused by the freshness mark —
+    not merely rate-limited by the response cooldown.
+
+    Background. The probe pre-image used to be `"{group_uuid}|{group_size}"`.
+    Neither field changes between rounds, and the probe is plaintext multicast
+    on the unsecured channel, so a captured probe could be re-presented
+    indefinitely, by anyone on the wire, with no prior access to the group at
+    all — each replay driving the receiver's response and its
+    symmetric-adoption decision. The pre-image is now
+    `"{group_uuid}|{group_size}|{seq}"` with `seq` the prober's monotonic
+    freshness sequence (core/freshness.py), and the receiver keeps a
+    per-(sender, verb) high-water mark. `group-partition-probe-unstamped-refused`
+    pins the flag day for a probe with no `seq` at all; this pins the replay of
+    a properly stamped one.
+
+    Why this case asserts `freshness_refusals` and not just an emission count.
+    The receiver already had two reasons to ignore a second delivery: the 30s
+    per-prober response cooldown, and the in-flight recovery marker on the
+    adopt path. Both fire long before the wall clock moves at conformance
+    timescales, so `partition_responses_emitted: 1` after two deliveries is a
+    number the OLD code produces too — a control that cannot fail. The refusal
+    tally can only be moved by the mark: the cooldown returns without touching
+    it. Asserting both together says the first probe was answered AND the
+    second was refused for the right reason.
+
+    Ordering this depends on (see handle_partition_probe): signature, then
+    freshness, then adoption, then cooldown. The mark is checked before either
+    suppressor, so it is what refuses the replay, and it is advanced only by a
+    probe the claimed prober actually signed — a forged probe cannot burn a
+    sequence and gag the real prober's next one.
+
+    Topology. peer_a is the LARGER group (size 3), peer_b the probing size-1
+    group. The inversion relative to `group-partition-probe-unstamped-refused`
+    is deliberate: with the prober's advertised group smaller, peer_a's adopt
+    test is False on every delivery, so no `request_access` is emitted and the
+    response count is unambiguous. The adopt-from-probe path is pinned by
+    `group-partition-recovery-probe-adopt`.
+
+    C reads the same tally through `identity_freshness_refusals()`. It is
+    process-global there (one `id_state` per run), so this case keeps exactly
+    one participant — peer_a — in the refusing role. The unit twins are
+    `test_replayed_probe_refused` in tests/a_unit/test_partition_recovery.py
+    and src/c/test/partition_recovery_test.c.
+
+participants:
+  - id: peer_a
+    role: group_member
+  - id: peer_b
+    role: group_member
+
+fixtures:
+  groups:
+    peer_a:
+      uuid: "0a000000-0000-4000-8000-000000000001"
+      size: 3
+    peer_b:
+      uuid: "0b000000-0000-4000-8000-000000000002"
+      size: 1
+
+steps:
+  - id: 1
+    from: peer_b
+    to: peer_a
+    function: group_partition_probe
+    repeat: 2
+    payload:
+      group_uuid: "0b000000-0000-4000-8000-000000000002"
+      group_size: 1
+      seq: 5
+    description: |
+        One probe, built once and dispatched twice — the same wire bytes a
+        network replay would re-present, not a re-signed second probe (the
+        engine's `repeat` builds the inbound once). peer_a answers the first:
+        the sequence is above its mark (0), so the mark advances to 5. The
+        second carries sequence 5 again, which is no longer above the mark, so
+        peer_a refuses it before reaching either the adopt decision or the
+        response cooldown.
+
+expected_state:
+  peer_a:
+    partition_responses_emitted: 1
+    freshness_refusals:
+      group_partition_probe: 1

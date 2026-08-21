@@ -42,6 +42,7 @@ from .history.history import IdentityHistory
 from ..algorithms.agreement import AgreementProof
 from ..algorithms.impl import AgreementImpl
 from ..capabilities import PeerCapabilities
+from ..freshness import Freshness
 import json
 from ..config import Configuration, to_json_string, from_json_string, names
 from ..config.configuration import ConfigJSONEncoder, atomic_write
@@ -355,6 +356,16 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self._partition_probe_cooldown: dict[str, datetime] = {}
         self._partition_response_cooldown: dict[str, datetime] = {}
         self._partition_recovery_in_progress: Optional[tuple[str, datetime]] = None
+        # Freshness sequence of the probe we are currently running, or None.
+        # A response must echo it (handle_partition_response): `in_response_to`
+        # is only our uuid, which never changes, so it cannot distinguish an
+        # answer to this round from one captured in an earlier one.
+        self._probe_seq: Optional[int] = None
+        # Per-verb replay marks and our own send sequence, persisted. Used by
+        # the verbs whose payloads carried no freshness token of their own; the
+        # verbs that already carry one (key epochs, attestation nonces, relayed
+        # query ids) are untouched. See core/freshness.py.
+        self.freshness = Freshness(self.name, self.logger)
         # Late-joiner capability-loss backstop (see feedback_late_joiner_caps):
         # the confirm-time directed caps_query is a one-shot; if it OR its
         # response is lost in UDP, a peer stays in self.peers but invisible to
@@ -767,8 +778,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if to_whom is None and claim == self._last_hierarchy_claim:
             return   # nothing changed; a re-broadcast tells nobody anything
         try:
+            # The sequence is stamped onto the OUTGOING payload, not into
+            # _hierarchy_claim(): the claim doubles as the unchanged-since-last
+            # comparison above, and a claim carrying a fresh sequence every
+            # time would never compare equal, turning the suppression off and
+            # the advertisement into the flood this docstring warns about.
+            payload = dict(claim)
+            payload['seq'] = self.freshness.stamp()
             msg = Message(self.name, IdentityProtocol.hierarchy,
-                          to_json_string(claim), to_whom or self.group,
+                          to_json_string(payload), to_whom or self.group,
                           from_whom=self.identity)
             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
             if to_whom is None:
@@ -827,6 +845,20 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 self.logger.debug(
                     'Hierarchy claim from %s not recorded: no proved shared '
                     'anchor', sender[:8])
+                return True
+            # Freshness per claimant. The record below is last-writer-wins with
+            # no epoch of its own, so an unstamped claim was replayable to roll
+            # the recorded topology BACK to a superseded one -- and this dict is
+            # what _child_gateway_uuids recurses into. Unstamped is refused,
+            # not accepted as legacy (doc/architecture/reputation.md, "Quorum
+            # attestation").
+            if not self.freshness.accept(sender, IdentityProtocol.hierarchy,
+                                         payload.get('seq')):
+                self.logger.debug(
+                    'Hierarchy claim from %s refused: sequence %s not above '
+                    'mark %d (replay or unstamped)', sender[:8],
+                    payload.get('seq'),
+                    self.freshness.mark(sender, IdentityProtocol.hierarchy))
                 return True
             children = [str(c) for c in (payload.get('children') or [])]
             self.peer_hierarchy[sender] = {
@@ -2079,7 +2111,16 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # confirmers for the two-phase admission quorum (doc/architecture/identity-protocol.md). The new-peer
         # identity is the payload; the confirmer rides the envelope (idiomatic,
         # mirrors `accept`). Harmless at the default quorum of 1.
-        msg_str = to_json_string(public_identity_to_canonical(blob.identity))
+        # Envelope, not a bare canonical identity: the confirm needs a freshness
+        # sequence and the canonical public-identity shape is shared with C's
+        # public_identity_to_json, so the stamp goes BESIDE it rather than into
+        # it. Without a stamp a confirm was replayable — re-adding a peer that
+        # had since been removed and, at quorum, reissuing the CURRENT group
+        # key to it (_confirm_group_membership).
+        msg_str = to_json_string({
+            'peer': public_identity_to_canonical(blob.identity),
+            'seq': self.freshness.stamp(),
+        })
         message = Message(self.name, IdentityProtocol.confirm, msg_str, to_whom=self.group,
                           from_whom=self.identity)
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
@@ -2090,7 +2131,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # envelope from_* (from_whom), payload is [package_hash, capabilities],
         # so a C peer reads the granter identity where C always stamps it.
         # to self.handle_acceptance()
-        msg_str = to_json_string((self.package_hash, self.capabilities.to_list()))
+        # Third element is the granter's freshness sequence. Appended rather
+        # than wrapped so the first two slots stay exactly where the C twin
+        # reads them. This verb is PLAINTEXT and adds the granter to the
+        # receiver's peer set on arrival, so unstamped it could be harvested
+        # off the wire and replayed at any node in phase >= 2.
+        msg_str = to_json_string((self.package_hash, self.capabilities.to_list(),
+                                  self.freshness.stamp()))
         message = Message(self.name, IdentityProtocol.accept, msg_str, to_whom=blob.identity,
                           from_whom=self.identity, encrypt=False)
         queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
@@ -3039,10 +3086,24 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 self.logger.warning('access_granted with no sender identity; ignoring')
                 return True
             payload = from_json_string(message.obj) if message.obj else None
-            if payload and len(payload) >= 2:
-                pkh, caps = payload[0], payload[1]
+            if payload and len(payload) >= 3:
+                pkh, caps, seq = payload[0], payload[1], payload[2]
+            elif payload and len(payload) >= 2:
+                pkh, caps, seq = payload[0], payload[1], None
             else:
-                pkh, caps = '', []  # C granter sends an empty payload
+                pkh, caps, seq = '', [], None  # C granter sends an empty payload
+            # Freshness per granter. Unstamped is refused rather than accepted
+            # as legacy: this verb is plaintext, so anyone on the wire can
+            # harvest one, and it writes the granter into our peer set
+            # (doc/architecture/reputation.md, "Quorum attestation").
+            if not self.freshness.accept(str(ident.uuid),
+                                         IdentityProtocol.accept, seq):
+                self.logger.warning(
+                    'access_granted from %s refused: sequence %s not above '
+                    'mark %d (replay or unstamped)', str(ident.uuid)[:8], seq,
+                    self.freshness.mark(str(ident.uuid),
+                                        IdentityProtocol.accept))
+                return True
             # Counterfeit check: skip when the granter advertises an empty
             # package hash (heterogeneous runtime, e.g. a C node) — same
             # allowance as the request_access welcoming committee.
@@ -3070,13 +3131,20 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         if message.function == IdentityProtocol.confirm:
             self.logger.debug('Received peer confirmation')
-            # DRY canonical confirm contract: the new-peer identity rides as a
-            # flat public-identity dict (shared byte-shape with C
-            # public_identity_to_json). Tolerate a legacy Configuration/
-            # IdentityObj blob (in-process / pre-canonical path).
+            # DRY canonical confirm contract: an envelope carrying the new-peer
+            # identity as a flat public-identity dict (shared byte-shape with C
+            # public_identity_to_json) plus the confirmer's freshness sequence.
+            # A legacy Configuration/IdentityObj blob is still parsed for the
+            # identity, but only inside the envelope -- see the refusal below.
             blob = message.obj
             if isinstance(blob, str):
                 blob = from_json_string(blob)
+            seq = None
+            if isinstance(blob, dict) and 'peer' in blob:
+                seq = blob.get('seq')
+                blob = blob['peer']
+                if isinstance(blob, str):
+                    blob = from_json_string(blob)
             if isinstance(blob, dict):
                 peer = public_identity_from_canonical(blob)
             else:
@@ -3088,6 +3156,21 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             if peer is None or not hasattr(peer, 'uuid'):
                 _probes.counter('peer.set', 'silent_drop', 'invalid_blob')
                 self.logger.warning('Invalid peer confirmation blob')
+                return True
+            # Freshness per confirmer. An unstamped confirm is REFUSED, not
+            # accepted as legacy: this verb re-admits a peer and can reissue
+            # the group key, so a lenient path is one an attacker selects by
+            # simply not stamping (doc/architecture/reputation.md, "Quorum
+            # attestation").
+            confirmer_uuid = getattr(getattr(message, 'from_whom', None),
+                                     'uuid', None)
+            if confirmer_uuid is None or not self.freshness.accept(
+                    str(confirmer_uuid), IdentityProtocol.confirm, seq):
+                _probes.counter('peer.set', 'confirm_replay')
+                self.logger.warning(
+                    'Peer confirmation from %s refused: sequence %s not above '
+                    'mark (replay or unstamped)',
+                    str(confirmer_uuid)[:8] if confirmer_uuid else '?', seq)
                 return True
             # Note: peer_potentials membership was previously a hard gate here.
             # It was redundant — blob.validate() already checked authenticity,
@@ -3222,8 +3305,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             # Carry per-capability descriptors (name + optional required_tier/
             # description/kind/arg_schema). Receivers are tolerant of both this
             # object form and a legacy bare-name string.
-            payload = to_json_string(
-                [self._capability_descriptor(n) for n in caps_list])
+            # Envelope, because the body is a LIST of descriptors and a
+            # sequence appended to it would be parsed as another descriptor.
+            # Capability registration is additive with no revocation, so
+            # unstamped this could be replayed to reinstall a capability the
+            # peer has since dropped.
+            payload = to_json_string({
+                'caps': [self._capability_descriptor(n) for n in caps_list],
+                'seq': self.freshness.stamp(),
+            })
             sender = getattr(message, 'from_whom', None)
             if sender is None:
                 _probes.counter('peer.set', 'caps_query_no_sender')
@@ -3257,7 +3347,23 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             _probes.counter('peer.set', 'caps_response_no_sender')
             return True
         try:
-            items = from_json_string(message.obj)
+            body = from_json_string(message.obj)
+            # Envelope {caps: [...], seq: N}. Unstamped is refused, not
+            # accepted as legacy (doc/architecture/reputation.md, "Quorum
+            # attestation").
+            if not isinstance(body, dict):
+                _probes.counter('peer.set', 'caps_response_bad_shape')
+                return True
+            if not self.freshness.accept(str(getattr(sender, 'uuid', None)),
+                                         IdentityProtocol.caps_response,
+                                         body.get('seq')):
+                _probes.counter('peer.set', 'caps_response_replay')
+                self.logger.debug(
+                    'caps_response from %s refused: sequence %s not above '
+                    'mark (replay or unstamped)',
+                    str(getattr(sender, 'uuid', ''))[:8], body.get('seq'))
+                return True
+            items = body.get('caps')
             if not isinstance(items, list) or not items:
                 _probes.counter('peer.set', 'caps_response_bad_shape')
                 return True
@@ -3774,15 +3880,38 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         return None
 
     @staticmethod
-    def _partition_probe_canonical(group_uuid, group_size):
-        """Canonical byte form for probe signature input."""
-        return ('%s|%s' % (group_uuid, int(group_size))).encode('utf-8')
+    def _partition_probe_canonical(group_uuid, group_size, seq):
+        """Canonical byte form for probe signature input.
+
+        ``seq`` is the prober's monotonic freshness sequence (see
+        ``core/freshness.py``). It is inside the SIGNED bytes, not merely
+        beside them, so a stripped or edited sequence is an invalid probe
+        rather than an unstamped one. Without it the probe was replayable by
+        anyone on the wire, indefinitely -- it is plaintext multicast and the
+        old pre-image covered only the group uuid and size, neither of which
+        changes between rounds.
+
+        Keep byte-identical to the C twin (``id_proc_priv.h``)."""
+        return ('%s|%s|%d' % (group_uuid, int(group_size),
+                              int(seq))).encode('utf-8')
 
     @staticmethod
-    def _partition_response_canonical(group_uuid, group_size, in_response_to):
-        """Canonical byte form for response signature input."""
-        return ('%s|%s|%s' % (group_uuid, int(group_size),
-                              in_response_to)).encode('utf-8')
+    def _partition_response_canonical(group_uuid, group_size, in_response_to,
+                                      probe_seq, seq):
+        """Canonical byte form for response signature input.
+
+        Two sequences, doing two different jobs. ``probe_seq`` echoes the
+        sequence of the probe being answered, which binds this response to
+        THAT round -- ``in_response_to`` alone is just the prober's uuid, so a
+        genuine response could otherwise be kept and re-presented to the same
+        prober forever. ``seq`` is the responder's own freshness sequence,
+        which stops the response being re-presented inside a round that is
+        still current.
+
+        Keep byte-identical to the C twin (``id_proc_priv.h``)."""
+        return ('%s|%s|%s|%d|%d' % (group_uuid, int(group_size),
+                                    in_response_to, int(probe_seq),
+                                    int(seq))).encode('utf-8')
 
     def _partition_recovery_active(self):
         """True iff a recovery is currently in flight and not yet timed out."""
@@ -3857,13 +3986,20 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         try:
             group_uuid = str(self.group.uuid)
             group_size = len(list(self.group.addresses))
-            sig_bytes = self._partition_probe_canonical(group_uuid, group_size)
+            # Remembered so a response can be tied to THIS probe; a responder
+            # echoes it back and handle_partition_response refuses an echo
+            # that names a round we are no longer running.
+            seq = self.freshness.stamp()
+            self._probe_seq = seq
+            sig_bytes = self._partition_probe_canonical(group_uuid, group_size,
+                                                        seq)
             signed = self.identity.sign(sig_bytes)
             payload = to_json_string({
                 'from_identity': self.identity.publish(),
                 'from_address': self.identity.address,
                 'my_group_uuid': group_uuid,
                 'my_group_size': group_size,
+                'seq': seq,
                 'signature': signed.signature.decode('ascii'),
             })
             probe = Message(self.name, IdentityProtocol.partition_probe,
@@ -3905,8 +4041,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             group_uuid = payload.get('my_group_uuid')
             group_size = payload.get('my_group_size')
             sig_hex = payload.get('signature')
+            probe_seq = payload.get('seq')
             if (sender_id is None or group_uuid is None
-                    or group_size is None or sig_hex is None):
+                    or group_size is None or sig_hex is None
+                    or probe_seq is None):
+                # An unstamped probe is refused rather than accepted as
+                # legacy: a lenient path here is the path an attacker picks
+                # (doc/architecture/reputation.md, "Quorum attestation").
                 _probes.counter('peer.set', 'partition_probe_missing_fields')
                 return True
             # sender_id normalized to an Identity by _as_identity (a Python
@@ -3917,12 +4058,26 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             try:
                 sig_raw = HexEncoder.decode(sig_hex.encode('ascii'))
                 sender_id.signature.public.verify(
-                    self._partition_probe_canonical(group_uuid, group_size),
+                    self._partition_probe_canonical(group_uuid, group_size,
+                                                    probe_seq),
                     sig_raw)
             except (BadSignatureError, ValueError):
                 _probes.counter('peer.set', 'partition_probe_bad_sig')
                 return True
             sender_uuid = str(sender_id.uuid)
+            # Freshness, AFTER the signature check: the mark is advanced only
+            # by a probe the claimed prober actually signed, so a forged probe
+            # cannot burn a sequence and gag the real prober's next one.
+            if not self.freshness.accept(sender_uuid,
+                                         IdentityProtocol.partition_probe,
+                                         probe_seq):
+                _probes.counter('peer.set', 'partition_probe_replay')
+                self.logger.debug(
+                    'Partition probe from %s refused: seq %s not above mark '
+                    '%d (replay)', sender_uuid[:8], probe_seq,
+                    self.freshness.mark(sender_uuid,
+                                        IdentityProtocol.partition_probe))
+                return True
             our_group_uuid = str(self.group.uuid)
             our_group_size = len(list(self.group.addresses))
             # If the sender is already in our group, this is the
@@ -3972,17 +4127,21 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self._partition_response_cooldown[sender_uuid] = cutoff
             # Build the response.
             leader = self._select_partition_leader()
+            resp_seq = self.freshness.stamp()
             resp_sig_bytes = self._partition_response_canonical(
-                our_group_uuid, our_group_size, sender_uuid)
+                our_group_uuid, our_group_size, sender_uuid, probe_seq,
+                resp_seq)
             resp_signed = self.identity.sign(resp_sig_bytes)
             resp_payload = to_json_string({
                 'from_identity': self.identity.publish(),
                 'from_address': self.identity.address,
                 'in_response_to': sender_uuid,
+                'in_response_to_seq': int(probe_seq),
                 'my_group_uuid': our_group_uuid,
                 'my_group_size': our_group_size,
                 'my_group_leader': str(leader.uuid),
                 'my_group_leader_address': leader.address,
+                'seq': resp_seq,
                 'signature': resp_signed.signature.decode('ascii'),
             })
             reply = Message(self.name, IdentityProtocol.partition_response,
@@ -4024,22 +4183,46 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             leader_uuid = payload.get('my_group_leader')
             leader_address = payload.get('my_group_leader_address')
             sig_hex = payload.get('signature')
+            resp_seq = payload.get('seq')
+            echoed_seq = payload.get('in_response_to_seq')
             if (sender_id is None or in_response_to is None
                     or their_group_uuid is None or their_group_size is None
-                    or leader_address is None or sig_hex is None):
+                    or leader_address is None or sig_hex is None
+                    or resp_seq is None or echoed_seq is None):
+                # Unstamped: refused, not accepted as legacy. See the probe
+                # handler for why there is no lenient path.
                 _probes.counter('peer.set', 'partition_response_missing_fields')
                 return True
             if in_response_to != str(self.identity.uuid):
                 # Response to someone else's probe — multicast bleed-through.
                 return True
+            # ...and to a probe we are STILL running. `in_response_to` is only
+            # our uuid, which never changes, so without this a genuine response
+            # could be captured and re-presented to us for the life of the
+            # node. The echoed sequence names one probe round.
+            if self._probe_seq is None or int(echoed_seq) != int(self._probe_seq):
+                _probes.counter('peer.set', 'partition_response_stale_round')
+                self.logger.debug(
+                    'Partition response ignored: answers probe %s, our '
+                    'current probe is %s', echoed_seq, self._probe_seq)
+                return True
             try:
                 sig_raw = HexEncoder.decode(sig_hex.encode('ascii'))
                 sender_id.signature.public.verify(
                     self._partition_response_canonical(
-                        their_group_uuid, their_group_size, in_response_to),
+                        their_group_uuid, their_group_size, in_response_to,
+                        echoed_seq, resp_seq),
                     sig_raw)
             except (BadSignatureError, ValueError):
                 _probes.counter('peer.set', 'partition_response_bad_sig')
+                return True
+            # Freshness per responder, after the signature check. The echoed
+            # round above bounds this to the current probe; this bounds a
+            # responder to one answer within it.
+            if not self.freshness.accept(str(sender_id.uuid),
+                                         IdentityProtocol.partition_response,
+                                         resp_seq):
+                _probes.counter('peer.set', 'partition_response_replay')
                 return True
             our_size = len(list(self.group.addresses))
             theirs = int(their_group_size)

@@ -1,0 +1,74 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-partition-probe-unstamped-refused
+byte_pinning: false
+description: |
+    Group partition probe, freshness flag day: a probe carrying no `seq` is
+    REFUSED by both runtimes, not answered.
+
+    Background. The probe signature pre-image used to be
+    `"{group_uuid}|{group_size}"` — neither field changes between rounds, and
+    the probe is plaintext multicast on the unsecured channel. So a captured
+    probe could be re-presented indefinitely, by anyone on the wire, with no
+    prior access to the group at all; each replay drove the receiver's
+    response and its symmetric-adoption decision. The 30s per-prober response
+    cooldown only ever narrowed that, it never closed it.
+
+    The pre-image is now `"{group_uuid}|{group_size}|{seq}"`, where `seq` is
+    the prober's monotonic freshness sequence (core/freshness.py), and the
+    receiver keeps a per-(sender, verb) high-water mark. The sequence sits
+    INSIDE the signed bytes rather than beside them, so a stripped sequence is
+    an invalid probe rather than an unstamped one.
+
+    What this scenario pins is the flag day: an UNSTAMPED probe gets no
+    response. There is deliberately no lenient path for one — a receiver that
+    accepted unstamped probes is a receiver an attacker selects by simply not
+    stamping. This mirrors the quorum-attestation flag day
+    (doc/architecture/reputation.md).
+
+    The replay of a properly stamped probe is a separate case,
+    `group-partition-probe-replay-refused`. It cannot be pinned by emission
+    counts alone — at conformance timescales the 30s response cooldown
+    suppresses a second probe from the same prober regardless of freshness —
+    so it asserts the `freshness_refusals` observable, which only the mark can
+    move. The unit suites pin the same behaviour through emission counts with
+    the cooldown cleared explicitly: `test_replayed_probe_refused` /
+    `test_replayed_response_refused_within_round` in
+    tests/a_unit/test_partition_recovery.py and
+    src/c/test/partition_recovery_test.c.
+
+participants:
+  - id: peer_a
+    role: group_member
+  - id: peer_b
+    role: group_member
+
+fixtures:
+  groups:
+    peer_a:
+      uuid: "0a000000-0000-4000-8000-000000000001"
+      size: 1
+    peer_b:
+      uuid: "0b000000-0000-4000-8000-000000000002"
+      size: 3
+
+steps:
+  - id: 1
+    from: peer_b
+    to: peer_a
+    function: group_partition_probe
+    payload:
+      group_uuid: "0b000000-0000-4000-8000-000000000002"
+      group_size: 3
+      unstamped: true
+    description: |
+        A probe with the `seq` field omitted — the shape a pre-change sender
+        emits, and the shape an attacker produces by stripping the field from
+        a captured probe. peer_a must drop it: no partition_response, and no
+        adoption, even though the advertised group (3) is larger than its own
+        (1) and would otherwise trigger the symmetric-adopt path.
+
+expected_state:
+  peer_a:
+    partition_responses_emitted: 0

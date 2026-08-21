@@ -4,30 +4,42 @@ protocol: negotiation
 name: invite-flood-past-threshold
 byte_pinning: false
 description: |
-    Flood-counter probe at the threshold boundary. alice's
-    `invitation` for a single task is delivered to bob 6 times
-    via the universal scenario engine's `repeat: N` grammar — one
-    over the `max_task_duplicates = 5` ceiling both implementations
-    track:
-      - Python: `flood_counts[uuid]` in
-        `negotiation/negprocess.py` (persistent dict, separate
-        from `proposed_tasks` which `_add_task` clears on every
+    Flood-counter probe at the threshold boundary. alice invites bob to the
+    SAME task six times — one over the `max_task_duplicates = 5` ceiling both
+    implementations track:
+      - Python: `flood_counts[uuid]` in `negotiation/negprocess.py` (persistent
+        dict, separate from `proposed_tasks`, which `_add_task` clears on every
         admission — see BUGS.md §P7).
-      - C: `flood:<uuid>` key on the `proposed_tasks` map in
-        `negotiation/neg_proc.c:529-540` (structurally separate
-        from the task-pointer entries).
+      - C: the `flood:<uuid>` key on the `proposed_tasks` map in
+        `negotiation/neg_proc.c` (structurally separate from the task-pointer
+        entries).
+    Both counters persist across admissions, so `flood_count: 6` holds
+    symmetrically and `task_in_stack: true` still holds.
 
-    Both counters now persist across admissions, so the
-    `flood_count: {task: t-flood, count: 6}` assertion holds
-    symmetrically. Pairs with `invite-replay-survives` (N=2;
-    engine path under the threshold) by exercising the same path
-    one over the documented `max_task_duplicates = 5` ceiling.
+    Six distinct steps with increasing `seq`, NOT one step with `repeat: 6`.
+    That is the substantive change here, not a stylistic one. The invitation
+    now carries a freshness sequence (`TaskInfo.seq` / `task_t.seq`, field 12 of
+    `negotiation/task.proto`) and the receiver refuses anything at or below its
+    per-(sender, verb) high-water mark — and that gate sits AHEAD of the flood
+    counter. `repeat: 6` builds the envelope once and redelivers it, so five of
+    the six deliveries would be refused as replays and the counter would read
+    1, never reaching the threshold.
 
-    Past-threshold action: refuse-and-return on both sides
-    (canonical AT v1 behavior). Python and C both emit a
-    `refusal` and short-circuit further dispatch when
-    `flood_counts[uuid] > max_task_duplicates`. Step 2 asserts
-    that at least one refusal appears in step 1's outbox.
+    Which is the point: a flood and a replay are different things, and only one
+    of them is this scenario's subject. A flood is a requestor emitting
+    DISTINCT invitations for one task — a misbehaving or malicious requestor,
+    which is what the counter was built to bound, and what the increasing
+    sequences model. A replay is one captured invitation re-presented, which is
+    now refused outright; `invite-replay-survives` pins that, including the
+    `flood_count: 1` that shows the replays never reach this counter. Ordering
+    the gate the other way round would have made the replay path itself a way
+    to trip this refusal, and a refusal is what alice reads as "this worker is
+    out" (`_cancel_participant`).
+
+    Past-threshold action: refuse-and-return on both sides (canonical AT v1
+    behavior). Python and C both emit a `refusal` and short-circuit further
+    dispatch when the count exceeds `max_task_duplicates`. Step 7 asserts that
+    the refusal appears in step 6's outbox.
 
 participants:
   - id: alice
@@ -47,25 +59,72 @@ steps:
     payload:
       capability: data_fetch
       task_id: t-flood
-    repeat: 6
+      seq: 1
     description: |
-        alice invites bob to perform data_fetch — the same
-        invitation envelope is delivered 6 times, one past the
-        `max_task_duplicates = 5` threshold. Both impls' flood
-        counter is expected to read 6 after the run; iteration 6
-        emits a refusal back to alice (refuse-and-return).
+        First invitation for t-flood: fresh (bob's mark is 0), admitted, flood
+        count 1.
   - id: 2
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: data_fetch
+      task_id: t-flood
+      seq: 2
+    description: Second distinct invitation for the same task; flood count 2.
+  - id: 3
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: data_fetch
+      task_id: t-flood
+      seq: 3
+    description: Third; flood count 3.
+  - id: 4
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: data_fetch
+      task_id: t-flood
+      seq: 4
+    description: Fourth; flood count 4.
+  - id: 5
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: data_fetch
+      task_id: t-flood
+      seq: 5
+    description: |
+        Fifth; flood count 5 — at the `max_task_duplicates` ceiling, still
+        accepted, since the threshold is `> 5`.
+  - id: 6
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: data_fetch
+      task_id: t-flood
+      seq: 6
+    description: |
+        Sixth; flood count 6, one past the ceiling. Each of these is fresh —
+        the sequence rises every time — so the freshness gate passes all six
+        and the flood counter is what acts. This one trips refuse-and-return on
+        both sides.
+  - id: 7
     from: bob
     to: alice
     function: nack
-    in_response_to: 1
+    in_response_to: 6
     no_propagate: true
     description: |
-        Assertion-only: at least one `nack` (NegotiationProtocol.refusal)
-        appears in step 1's captured outbox (iteration 6 trips the flood
-        threshold on both Python and C). `no_propagate: true` keeps this
-        an observation step — the engine does not deliver this message
-        back to alice.
+        Assertion-only: the `nack` (NegotiationProtocol.refusal) emitted by the
+        past-threshold delivery appears in step 6's captured outbox.
+        `no_propagate: true` keeps this an observation step — the engine does
+        not deliver this message back to alice.
 
 expected_state:
   bob:

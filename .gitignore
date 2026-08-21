@@ -102,6 +102,9 @@ deploy
 /src/c/CMakeFiles/
 /src/c/cmake_install.cmake
 /src/c/CTestTestfile.cmake
+# proc_track_test writes its fixture into the cwd; the test now removes it,
+# this catches a run that was killed mid-test (or an older binary).
+/proc_track_test.cfg.json
 /src/c/Makefile
 /src/c/conformance/CMakeCache.txt
 /src/c/conformance/CMakeFiles/

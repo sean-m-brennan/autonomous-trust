@@ -215,9 +215,20 @@ int map_get(map_t *map, const map_key_t key, data_t **value);
 /**
  * @brief Insert or update a key-value pair in the map.
  *
+ * @details OWNERSHIP: the map ADOPTS the caller's reference to @p value. It
+ * does not take one of its own, so a caller that wants to keep using @p value
+ * beyond the map's lifetime — or store it in a second container — must
+ * @c smrt_ref it first. The map releases what it holds in @ref map_remove,
+ * @ref map_free, and when an insert displaces an existing value. This is the
+ * same contract @c array_set / @c array_free have always had, and it is what
+ * every call site in the tree already assumed: the prevailing idiom is
+ * @c map_set(&m, k, integer_data(n)) with no matching deref, which under the
+ * old behaviour (map_set took a second reference, map_free released none)
+ * leaked every value ever stored in any map.
+ *
  * @param map Pointer to an initialized map.
  * @param key Null-terminated string key.
- * @param value Non-null data_t pointer to associate with the key.
+ * @param value Non-null data_t pointer to associate with the key; adopted.
  * @return int 0 on success, EINVAL if value is null, ENOMEM on allocation failure.
  */
 /*@
@@ -252,6 +263,11 @@ int map_set(map_t *map, const map_key_t key, data_t *value);
 /**
  * @brief Remove a key-value pair from the map.
  *
+ * @details Releases the map's reference to the removed value (see
+ * @ref map_set for the ownership contract), so the value is freed unless
+ * someone else has referenced it. Moving an entry to another map therefore
+ * reads @c smrt_ref, @c map_set, @c map_remove — in that order.
+ *
  * @param map Pointer to an initialized map.
  * @param key Null-terminated string key to remove.
  * @return int 0 on success, EMAP_NOKEY if the key is not present.
@@ -280,7 +296,16 @@ int map_set(map_t *map, const map_key_t key, data_t *value);
 int map_remove(map_t *map, map_key_t key);
 
 /**
- * @brief Free all map resources (keys and internal storage).
+ * @brief Free all map resources (keys, stored values, internal storage).
+ *
+ * @details Releases the map's reference to every value it still holds — see
+ * @ref map_set for why the map owns exactly one — then frees @c map->keys,
+ * the parallel array of key copies. What it still does NOT release is the
+ * @c map_t itself when the map came from @ref map_create: @c map_init zeroes
+ * the smrt header that @c map_create's allocation established, so the closing
+ * @c smrt_deref finds alloc=false and does nothing. @c array_create restores
+ * its header after @c array_init for exactly this reason; @c map_create does
+ * not.
  *
  * @param map Pointer to an initialized map.
  */

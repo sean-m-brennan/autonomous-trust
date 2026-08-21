@@ -40,6 +40,7 @@
 #include "identity_priv.h"
 #include "id_proc_priv.h"
 #include "utilities/b64.h"
+#include "utilities/freshness.h"
 
 #ifdef AT_ZTA_ENABLED
 #include "zta/zta_policy.h"
@@ -330,6 +331,16 @@ static struct {
      * that would let any peer install itself in our tree. Mirrors Python
      * IdentityProcess._pending_joins. */
     map_t pending_joins;
+    /* Per-verb replay marks and our own send sequence, persisted. Used by the
+     * verbs whose payloads carried no freshness token of their own; verbs that
+     * already carry one (group key epochs, attestation nonces, relayed query
+     * ids) are untouched. C twin of Python IdentityProcess.freshness. */
+    freshness_t freshness;
+    /* Freshness sequence of the probe round we are currently running, 0 if
+     * none. A partition_response must echo it: `in_response_to` is only our
+     * uuid, which never changes, so it cannot tell an answer to this round
+     * from one captured in an earlier one. */
+    int64_t probe_seq;
 } id_state;
 
 static void _ensure_id_init(void)
@@ -350,6 +361,8 @@ static void _ensure_id_init(void)
         map_init(&id_state.partition_response_cooldown);
         map_init(&id_state.provisional_confirmations);
         map_init(&id_state.pending_joins);
+        freshness_init(&id_state.freshness, "identity", NULL);
+        id_state.probe_seq = 0;
         id_state.partition_recovery_target[0] = '\0';
         id_state.partition_recovery_started_us = 0;
         id_state.self_tier = 0;
@@ -482,6 +495,15 @@ void identity_set_own_capabilities(const process_t *proc,
     data_t *arr_dat = object_ptr_data(arr, sizeof(array_t));
     map_set(&id_state.own_caps_by_proc, key, arr_dat);
     pthread_mutex_unlock(&id_state.lock);
+}
+
+int64_t identity_freshness_refusals(const char *verb)
+{
+    if (!id_state.initialized) return 0;
+    pthread_mutex_lock(&id_state.lock);
+    int64_t n = freshness_refusals(&id_state.freshness, verb);
+    pthread_mutex_unlock(&id_state.lock);
+    return n;
 }
 
 int identity_get_peer_caps_count(const uuid_t uuid)
@@ -829,6 +851,68 @@ static int _send_caps_query(const process_t *proc, const public_identity_t *peer
  ****************************/
 
 /* Frama-C: skipped — [solver-timeout] identity/peers preconditions */
+/* The access_granted body: ["", [], seq].
+ *
+ * This runtime does not advertise a package hash or a capability list on
+ * access_granted (the identity rides on the envelope, and Python's
+ * handle_acceptance skips its counterfeit check when the package hash is
+ * empty -- the standing heterogeneous-runtime allowance). It DOES have to
+ * carry the freshness sequence, because access_granted is plaintext and adds
+ * the granter to the receiver's peer set on arrival, so unstamped it can be
+ * harvested off the wire and replayed at any node past the handshake.
+ *
+ * Slot order matches Python's (package_hash, capabilities, seq) exactly; the
+ * first two are left empty rather than removed so the receiver's indices are
+ * the same for both runtimes. Returns NULL on failure (caller must not send).
+ */
+static json_t *_accept_body(const process_t *proc)
+{
+    pthread_mutex_lock(&id_state.lock);
+    int64_t seq = freshness_stamp(&id_state.freshness, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (seq <= 0)
+        return NULL;
+    json_t *body = json_array();
+    if (body == NULL)
+        return NULL;
+    json_array_append_new(body, json_string(""));
+    json_array_append_new(body, json_array());
+    json_array_append_new(body, json_integer((json_int_t)seq));
+    return body;
+}
+
+/* Wrap a canonical public identity in the confirm envelope:
+ * {"peer": {...}, "seq": N}. The stamp goes BESIDE the identity rather than
+ * into it because the canonical public-identity shape is shared with Python's
+ * public_identity_to_canonical and must stay byte-identical.
+ *
+ * Unstamped, a confirm was replayable: capture one off the group channel and a
+ * peer that had since been removed could be put back and, at quorum, handed
+ * the CURRENT group key. Returns NULL on failure (caller must not send).
+ * Mirrors Python IdentityProcess._peer_accepted. */
+static json_t *_confirm_envelope(const process_t *proc,
+                                 const public_identity_t *new_peer)
+{
+    json_t *peer_json = NULL;
+    if (public_identity_to_json(new_peer, &peer_json) != 0 || peer_json == NULL)
+        return NULL;
+    pthread_mutex_lock(&id_state.lock);
+    int64_t seq = freshness_stamp(&id_state.freshness, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (seq <= 0) {
+        json_decref(peer_json);
+        return NULL;
+    }
+    json_t *env = json_object();
+    if (env == NULL) {
+        json_decref(peer_json);
+        return NULL;
+    }
+    json_object_set_new(env, "peer", peer_json);
+    json_object_set_new(env, "seq", json_integer((json_int_t)seq));
+    return env;
+}
+
 static int _peer_accepted(process_t *proc, directory_t *queues,
                           const public_identity_t *new_peer, int rank,
                           bool amnesia)
@@ -866,9 +950,9 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
          * shared byte-shape with Python public_identity_to_canonical, so a
          * Python member can parse the confirm announcement. (Was a
          * {uuid,nickname,address} subset that dropped the public keys.) */
-        json_t *peer_json = NULL;
-        if (public_identity_to_json(new_peer, &peer_json) != 0 || peer_json == NULL) {
-            log_error(proc->logger, "Identity: public_identity_to_json failed (confirm broadcast)\n");
+        json_t *peer_json = _confirm_envelope(proc, new_peer);
+        if (peer_json == NULL) {
+            log_error(proc->logger, "Identity: confirm envelope failed (confirm broadcast)\n");
             return EXCEPTION(ENOMEM);
         }
         net_msg_pack_json(&confirm.info.net_msg, peer_json);
@@ -888,9 +972,13 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
             memcpy(&confirm.info.net_msg.to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
             /* DRY canonical full public-identity payload (see the broadcast
              * arm above) so a Python member can parse the confirm fanout. */
-            json_t *peer_json = NULL;
-            if (public_identity_to_json(new_peer, &peer_json) != 0 || peer_json == NULL) {
-                log_error(proc->logger, "Identity: public_identity_to_json failed (confirm fanout)\n");
+            /* A fresh stamp per recipient: these are separate messages, and a
+             * receiver's mark is per (sender, verb), so reusing one sequence
+             * across the fanout would have every recipient after the first
+             * refuse it as a replay. */
+            json_t *peer_json = _confirm_envelope(proc, new_peer);
+            if (peer_json == NULL) {
+                log_error(proc->logger, "Identity: confirm envelope failed (confirm fanout)\n");
                 continue;
             }
             net_msg_pack_json(&confirm.info.net_msg, peer_json);
@@ -906,6 +994,14 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
     accept.info.net_msg.function = ID_ACCEPT;
     accept.info.net_msg.encrypt = false;
     memcpy(&accept.info.net_msg.to_whom, new_peer, sizeof(public_identity_t));
+    json_t *accept_body = _accept_body(proc);
+    if (accept_body == NULL) {
+        log_error(proc->logger,
+                  "Identity: no freshness sequence; not sending access_granted\n");
+        return EXCEPTION(ENOMEM);
+    }
+    net_msg_pack_json(&accept.info.net_msg, accept_body);
+    json_decref(accept_body);
     messaging_send("network", NET_MESSAGE, &accept, false);
 
     /* Send ID_HISTORY to the new peer so they can decrypt subsequent
@@ -1446,6 +1542,41 @@ static bool handle_acceptance(const process_t *proc, directory_t *queues, generi
     log_info(proc->logger, "Identity: access granted by %s\n",
              nmsg->from_whom.nickname);
 
+    /* Freshness per granter, before anything is written. The body is
+     * [package_hash, capabilities, seq]; this runtime leaves the first two
+     * empty (see _accept_body) but the sequence is required. Unstamped is
+     * refused, not accepted as legacy: this verb is PLAINTEXT, so anyone on
+     * the wire can harvest one, and it appends the granter to our peer set
+     * below (doc/architecture/reputation.md, "Quorum attestation"). */
+    {
+        json_t *accept_payload = NULL;
+        int64_t accept_seq = 0;
+        if (net_msg_unpack_json(nmsg, &accept_payload) == 0
+            && accept_payload != NULL && json_is_array(accept_payload)
+            && json_array_size(accept_payload) >= 3)
+        {
+            json_t *j = json_array_get(accept_payload, 2);
+            if (json_is_integer(j))
+                accept_seq = (int64_t)json_integer_value(j);
+        }
+        if (accept_payload != NULL)
+            json_decref(accept_payload);
+        char granter[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(nmsg->from_whom.uuid, granter);
+        pthread_mutex_lock(&id_state.lock);
+        bool accept_fresh = freshness_accept(&id_state.freshness, granter,
+                                             ID_ACCEPT, accept_seq,
+                                             proc->logger);
+        pthread_mutex_unlock(&id_state.lock);
+        if (!accept_fresh) {
+            log_warn(proc->logger,
+                     "Identity: access_granted from %s refused: sequence %lld "
+                     "not above mark (replay or unstamped)\n", granter,
+                     (long long)accept_seq);
+            return true;
+        }
+    }
+
     /* Dedup + append under the write lock */
     peers_write_lock((process_t *)proc);
     bool duplicate = false;
@@ -1557,6 +1688,16 @@ static int _announce_self_to_bundled_peers(const process_t *proc,
         generic_msg_t accept = accept_template;
         memcpy(&accept.info.net_msg.to_whom, &peers[i],
                sizeof(public_identity_t));
+        /* A fresh stamp per recipient: separate messages, and a receiver's
+         * mark is per (sender, verb), so reusing one sequence across the
+         * fanout would have every recipient after the first refuse it. */
+        json_t *accept_body = _accept_body(proc);
+        if (accept_body == NULL) {
+            probes_counter("peer.set", "self_announce", "no_sequence");
+            continue;
+        }
+        net_msg_pack_json(&accept.info.net_msg, accept_body);
+        json_decref(accept_body);
         if (messaging_send("network", NET_MESSAGE, &accept, false) == 0) {
             sent++;
             probes_counter("peer.set", "self_announce", "sent");
@@ -2371,6 +2512,12 @@ void identity_reset_state(void)
     id_state.self_bootstrapped = false;
     id_state.merging = false;
     id_state.synchronous_dispatch = was_sync;
+    /* Replay marks too, and the probe round they pair with. The harness
+     * derives participant uuids deterministically from their slugs, so
+     * "alice" is the same sender in every scenario; a mark left behind by one
+     * would refuse the next scenario's first stamped message as a replay. */
+    freshness_reset(&id_state.freshness);
+    id_state.probe_seq = 0;
     pthread_mutex_unlock(&id_state.lock);
 }
 
@@ -2562,14 +2709,50 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
         return true;
     }
 
+    /* Envelope: {"peer": {...canonical...}, "seq": N}. The identity is parsed
+     * out of "peer"; the sequence is the confirmer's freshness token. */
+    json_t *peer_obj = json_object_get(payload, "peer");
+    json_t *j_seq = json_object_get(payload, "seq");
+    if (!json_is_object(peer_obj) || !json_is_integer(j_seq))
+    {
+        /* An unstamped confirm is REFUSED, not accepted as legacy: this verb
+         * re-admits a peer and can reissue the group key, so a lenient path is
+         * one an attacker selects by simply not stamping
+         * (doc/architecture/reputation.md, "Quorum attestation"). */
+        json_decref(payload);
+        log_warn(proc->logger,
+                 "Identity: handle_confirm_peer: unstamped or malformed "
+                 "envelope, refusing\n");
+        return true;
+    }
+    int64_t confirm_seq = (int64_t)json_integer_value(j_seq);
+
     public_identity_t new_peer;
-    if (public_identity_from_json(payload, &new_peer) != 0)
+    if (public_identity_from_json(peer_obj, &new_peer) != 0)
     {
         json_decref(payload);
         log_warn(proc->logger, "Identity: handle_confirm_peer: malformed peer identity\n");
         return true;
     }
     json_decref(payload);
+
+    /* Freshness per confirmer, credited to the AUTHENTICATED sender rather
+     * than anything the payload claims. */
+    char confirmer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, confirmer_str);
+    pthread_mutex_lock(&id_state.lock);
+    bool confirm_fresh = freshness_accept(&id_state.freshness, confirmer_str,
+                                          ID_CONFIRM, confirm_seq,
+                                          proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (!confirm_fresh)
+    {
+        log_warn(proc->logger,
+                 "Identity: peer confirmation from %s refused: sequence %lld "
+                 "not above mark (replay)\n", confirmer_str,
+                 (long long)confirm_seq);
+        return true;
+    }
 
     char uuid_str_buf[UUID_STRING_LEN + 1];
     uuid_unparse_lower(new_peer.uuid, uuid_str_buf);
@@ -3034,8 +3217,28 @@ static bool handle_caps_query(const process_t *proc, directory_t *queues, generi
     memcpy(&response.info.net_msg.to_whom, &nmsg->from_whom,
            sizeof(public_identity_t));
     strncpy(response.info.net_msg.return_to, "identity", PROC_NAME_LEN);
-    net_msg_pack_json(&response.info.net_msg, caps_arr);
-    json_decref(caps_arr);
+    /* Envelope {caps: [...], seq: N}: the body is a LIST, so a sequence
+     * appended to it would be parsed as another descriptor. Capability
+     * registration is additive with no revocation, so unstamped this could be
+     * replayed to reinstall a capability the peer has since dropped. */
+    pthread_mutex_lock(&id_state.lock);
+    int64_t caps_seq = freshness_stamp(&id_state.freshness, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (caps_seq <= 0) {
+        json_decref(caps_arr);
+        log_warn(proc->logger,
+                 "Identity: no freshness sequence; not answering caps query\n");
+        return true;
+    }
+    json_t *caps_env = json_object();
+    if (caps_env == NULL) {
+        json_decref(caps_arr);
+        return true;
+    }
+    json_object_set_new(caps_env, "caps", caps_arr);
+    json_object_set_new(caps_env, "seq", json_integer((json_int_t)caps_seq));
+    net_msg_pack_json(&response.info.net_msg, caps_env);
+    json_decref(caps_env);
     messaging_send("network", NET_MESSAGE, &response, false);
     return true;
 }
@@ -3171,13 +3374,40 @@ static bool handle_caps_response(const process_t *proc, directory_t *queues, gen
                  "Identity: handle_caps_response: no JSON payload\n");
         return true;
     }
-    if (!json_is_array(payload))
+    /* Envelope {caps: [...], seq: N}. Unstamped is refused, not accepted as
+     * legacy (doc/architecture/reputation.md, "Quorum attestation"). */
+    json_t *caps_body = json_object_get(payload, "caps");
+    json_t *j_caps_seq = json_object_get(payload, "seq");
+    if (!json_is_array(caps_body) || !json_is_integer(j_caps_seq))
     {
         json_decref(payload);
         log_warn(proc->logger,
-                 "Identity: handle_caps_response: payload not a JSON array\n");
+                 "Identity: handle_caps_response: unstamped or malformed "
+                 "envelope, refusing\n");
         return true;
     }
+    {
+        char caps_sender[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(nmsg->from_whom.uuid, caps_sender);
+        int64_t caps_seq = (int64_t)json_integer_value(j_caps_seq);
+        pthread_mutex_lock(&id_state.lock);
+        bool caps_fresh = freshness_accept(&id_state.freshness, caps_sender,
+                                           ID_CAPS_RESPONSE, caps_seq,
+                                           proc->logger);
+        pthread_mutex_unlock(&id_state.lock);
+        if (!caps_fresh) {
+            json_decref(payload);
+            log_debug(proc->logger,
+                      "Identity: caps_response from %s refused: sequence %lld "
+                      "not above mark (replay)\n", caps_sender,
+                      (long long)caps_seq);
+            return true;
+        }
+    }
+    /* From here the array IS the body; the envelope is only unwrapped once. */
+    json_t *caps_envelope = payload;
+    payload = json_incref(caps_body);
+    json_decref(caps_envelope);
 
     array_t *arr = NULL;
     if (array_create(&arr) != 0 || arr == NULL)
@@ -3389,12 +3619,41 @@ size_t identity_get_partition_recovery_target(char *out, size_t out_len)
     return n;
 }
 
+void identity_clear_partition_cooldowns(void)
+{
+    _ensure_id_init();
+    pthread_mutex_lock(&id_state.lock);
+    map_free(&id_state.partition_probe_cooldown);
+    map_init(&id_state.partition_probe_cooldown);
+    map_free(&id_state.partition_response_cooldown);
+    map_init(&id_state.partition_response_cooldown);
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+void identity_set_partition_probe_round(int64_t seq)
+{
+    _ensure_id_init();
+    pthread_mutex_lock(&id_state.lock);
+    id_state.probe_seq = seq;
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+void identity_clear_partition_recovery(void)
+{
+    _ensure_id_init();
+    pthread_mutex_lock(&id_state.lock);
+    id_state.partition_recovery_target[0] = '\0';
+    id_state.partition_recovery_started_us = 0;
+    pthread_mutex_unlock(&id_state.lock);
+}
+
 int identity_partition_canonical_probe(const char *group_uuid,
-                                       int group_size,
+                                       int group_size, int64_t seq,
                                        char *out, size_t out_len)
 {
     if (group_uuid == NULL || out == NULL || out_len == 0) return -1;
-    int n = snprintf(out, out_len, "%s|%d", group_uuid, group_size);
+    int n = snprintf(out, out_len, "%s|%d|%lld", group_uuid, group_size,
+                     (long long)seq);
     if (n < 0 || (size_t)n >= out_len) return -1;
     return n;
 }
@@ -3402,12 +3661,13 @@ int identity_partition_canonical_probe(const char *group_uuid,
 int identity_partition_canonical_response(const char *group_uuid,
                                           int group_size,
                                           const char *in_response_to,
+                                          int64_t probe_seq, int64_t seq,
                                           char *out, size_t out_len)
 {
     if (group_uuid == NULL || in_response_to == NULL
         || out == NULL || out_len == 0) return -1;
-    int n = snprintf(out, out_len, "%s|%d|%s", group_uuid, group_size,
-                     in_response_to);
+    int n = snprintf(out, out_len, "%s|%d|%s|%lld|%lld", group_uuid, group_size,
+                     in_response_to, (long long)probe_seq, (long long)seq);
     if (n < 0 || (size_t)n >= out_len) return -1;
     return n;
 }
@@ -4313,9 +4573,20 @@ static int _announce_identity(const process_t *proc, directory_t *queues)
  * 2. The canonical signature inputs MUST byte-match Python's
  *    `IdentityProcess._partition_probe_canonical` /
  *    `_partition_response_canonical`. Python format:
- *      probe:    "{group_uuid}|{group_size}"           (no spaces)
+ *      probe:    "{group_uuid}|{group_size}|{seq}"     (no spaces)
  *      response: "{group_uuid}|{group_size}|{in_response_to}"
- *    Use `snprintf` with `"%s|%d"` / `"%s|%d|%s"` exactly.
+ *                "|{probe_seq}|{seq}"
+ *    Use `snprintf` with `"%s|%d|%lld"` / `"%s|%d|%s|%lld|%lld"` exactly.
+ *
+ *    The sequences are the freshness tokens (core/freshness.py). They are
+ *    INSIDE the signed bytes, so a stripped sequence is an invalid message
+ *    rather than an unstamped one. `seq` is the sender's own monotonic
+ *    counter; the response's `probe_seq` echoes the probe it answers, which
+ *    is what stops a genuine response being kept and re-presented to the
+ *    same prober later — `in_response_to` is only the prober's uuid and
+ *    never changes. An unstamped probe or response is REFUSED, not accepted
+ *    as legacy: see doc/architecture/reputation.md, "Quorum attestation",
+ *    for why there is no lenient mode.
  *
  * 3. Cooldown timestamps use `CLOCK_MONOTONIC` microseconds — not
  *    wall-clock — so NTP / DST adjustments don't invalidate them.
@@ -4838,14 +5109,30 @@ static bool handle_partition_signal(const process_t *proc, directory_t *queues, 
         return true;
     }
 
-    /* Build canonical signing input: "{group_uuid_str}|{group_size}". */
+    /* Build canonical signing input:
+     * "{group_uuid_str}|{group_size}|{seq}". The sequence is INSIDE the
+     * signed bytes: the old pre-image covered only the uuid and size, neither
+     * of which changes between rounds, so a captured probe — plaintext
+     * multicast, no prior access needed — was replayable indefinitely. */
     char group_uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(proc->protocol.group.uuid, group_uuid_str);
     int group_size = (int)map_size(&((process_t *)proc)->protocol.group.address_map);
-    char canonical[UUID_STRING_LEN + 32];
-    int clen = snprintf(canonical, sizeof(canonical), "%s|%d",
-                        group_uuid_str, group_size);
-    if (clen < 0 || (size_t)clen >= sizeof(canonical)) {
+    pthread_mutex_lock(&id_state.lock);
+    int64_t probe_seq = freshness_stamp(&id_state.freshness, proc->logger);
+    /* Remembered so a response can be tied to THIS round. */
+    id_state.probe_seq = probe_seq;
+    pthread_mutex_unlock(&id_state.lock);
+    if (probe_seq <= 0) {
+        log_warn(proc->logger,
+                 "Identity: no freshness sequence; not probing\n");
+        json_decref(payload);
+        return true;
+    }
+    char canonical[UUID_STRING_LEN + 64];
+    int clen = identity_partition_canonical_probe(group_uuid_str, group_size,
+                                                 probe_seq, canonical,
+                                                 sizeof(canonical));
+    if (clen < 0) {
         json_decref(payload);
         return true;
     }
@@ -4886,6 +5173,8 @@ static bool handle_partition_signal(const process_t *proc, directory_t *queues, 
                         json_string(group_uuid_str));
     json_object_set_new(probe_json, "my_group_size",
                         json_integer(group_size));
+    json_object_set_new(probe_json, "seq",
+                        json_integer((json_int_t)probe_seq));
     json_object_set_new(probe_json, "signature",
                         json_string(sig_hex));
 
@@ -4926,14 +5215,20 @@ static bool handle_partition_probe(const process_t *proc, directory_t *queues, g
     json_t *j_group_uuid = json_object_get(payload, "my_group_uuid");
     json_t *j_group_size = json_object_get(payload, "my_group_size");
     json_t *j_signature  = json_object_get(payload, "signature");
+    json_t *j_seq        = json_object_get(payload, "seq");
+    /* An unstamped probe is REFUSED, not accepted as legacy: a lenient path
+     * is the path an attacker picks (doc/architecture/reputation.md, "Quorum
+     * attestation"). */
     if (!json_is_object(j_from_id) || !json_is_string(j_group_uuid)
-        || !json_is_integer(j_group_size) || !json_is_string(j_signature)) {
+        || !json_is_integer(j_group_size) || !json_is_string(j_signature)
+        || !json_is_integer(j_seq)) {
         json_decref(payload);
         return true;
     }
     const char *sender_group_uuid = json_string_value(j_group_uuid);
     int sender_group_size = (int)json_integer_value(j_group_size);
     const char *sig_hex = json_string_value(j_signature);
+    int64_t sender_seq = (int64_t)json_integer_value(j_seq);
 
     /* Decode the sender's public identity. */
     public_identity_t sender_pub;
@@ -4944,10 +5239,12 @@ static bool handle_partition_probe(const process_t *proc, directory_t *queues, g
     }
 
     /* Verify signature. */
-    char canonical[UUID_STRING_LEN + 32];
-    int clen = snprintf(canonical, sizeof(canonical), "%s|%d",
-                        sender_group_uuid, sender_group_size);
-    if (clen < 0 || (size_t)clen >= sizeof(canonical)) {
+    char canonical[UUID_STRING_LEN + 64];
+    int clen = identity_partition_canonical_probe(sender_group_uuid,
+                                                 sender_group_size,
+                                                 sender_seq, canonical,
+                                                 sizeof(canonical));
+    if (clen < 0) {
         json_decref(payload);
         return true;
     }
@@ -4962,6 +5259,26 @@ static bool handle_partition_probe(const process_t *proc, directory_t *queues, g
 
     char sender_uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(sender_pub.uuid, sender_uuid_str);
+
+    /* Freshness, AFTER the signature check: the mark advances only for a probe
+     * the claimed prober actually signed, so a forged probe cannot burn a
+     * sequence and gag the real prober's next one. */
+    pthread_mutex_lock(&id_state.lock);
+    bool fresh = freshness_accept(&id_state.freshness, sender_uuid_str,
+                                  ID_PARTITION_PROBE, sender_seq, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (!fresh) {
+        /* Mirrors Python's `_probes.counter('peer.set',
+         * 'partition_probe_replay')`; the deterministic count a test asserts
+         * is freshness_refusals(), this is the operational telemetry. */
+        probes_counter("peer.set", "partition_probe_replay", NULL);
+        log_debug(proc->logger,
+                  "Identity: partition_probe from %s refused: seq %lld not "
+                  "above mark (replay)\n", sender_uuid_str,
+                  (long long)sender_seq);
+        json_decref(payload);
+        return true;
+    }
 
     pthread_mutex_lock(&id_state.lock);
     bool may_send = _partition_cooldown_check(
@@ -4997,11 +5314,23 @@ static bool handle_partition_probe(const process_t *proc, directory_t *queues, g
         leader_address = proc->protocol.peers[idx].address;
     }
 
-    char resp_canonical[UUID_STRING_LEN * 2 + 64];
-    int rclen = snprintf(resp_canonical, sizeof(resp_canonical),
-                         "%s|%d|%s", our_group_uuid_str, our_group_size,
-                         sender_uuid_str);
-    if (rclen < 0 || (size_t)rclen >= sizeof(resp_canonical)) {
+    pthread_mutex_lock(&id_state.lock);
+    int64_t resp_seq = freshness_stamp(&id_state.freshness, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (resp_seq <= 0) {
+        log_warn(proc->logger,
+                 "Identity: no freshness sequence; not responding to probe\n");
+        json_decref(payload);
+        return true;
+    }
+    char resp_canonical[UUID_STRING_LEN * 2 + 96];
+    /* Two sequences: `sender_seq` echoes the probe round being answered (so a
+     * genuine response cannot be kept and re-presented in a later round), and
+     * `resp_seq` is our own, bounding us to one answer inside this round. */
+    int rclen = identity_partition_canonical_response(
+        our_group_uuid_str, our_group_size, sender_uuid_str, sender_seq,
+        resp_seq, resp_canonical, sizeof(resp_canonical));
+    if (rclen < 0) {
         json_decref(payload);
         return true;
     }
@@ -5032,6 +5361,8 @@ static bool handle_partition_probe(const process_t *proc, directory_t *queues, g
                         json_string(self->address));
     json_object_set_new(resp_json, "in_response_to",
                         json_string(sender_uuid_str));
+    json_object_set_new(resp_json, "in_response_to_seq",
+                        json_integer((json_int_t)sender_seq));
     json_object_set_new(resp_json, "my_group_uuid",
                         json_string(our_group_uuid_str));
     json_object_set_new(resp_json, "my_group_size",
@@ -5040,6 +5371,8 @@ static bool handle_partition_probe(const process_t *proc, directory_t *queues, g
                         json_string(leader_uuid_str));
     json_object_set_new(resp_json, "my_group_leader_address",
                         json_string(leader_address));
+    json_object_set_new(resp_json, "seq",
+                        json_integer((json_int_t)resp_seq));
     json_object_set_new(resp_json, "signature",
                         json_string(resp_sig_hex));
 
@@ -5121,12 +5454,18 @@ static bool handle_partition_response(const process_t *proc, directory_t *queues
     json_t *j_group_size  = json_object_get(payload, "my_group_size");
     json_t *j_leader_addr = json_object_get(payload, "my_group_leader_address");
     json_t *j_signature   = json_object_get(payload, "signature");
+    json_t *j_seq         = json_object_get(payload, "seq");
+    json_t *j_echo_seq    = json_object_get(payload, "in_response_to_seq");
+    /* Unstamped: refused, not accepted as legacy. See handle_partition_probe. */
     if (!json_is_object(j_from_id) || !json_is_string(j_in_resp)
         || !json_is_string(j_group_uuid) || !json_is_integer(j_group_size)
-        || !json_is_string(j_leader_addr) || !json_is_string(j_signature)) {
+        || !json_is_string(j_leader_addr) || !json_is_string(j_signature)
+        || !json_is_integer(j_seq) || !json_is_integer(j_echo_seq)) {
         json_decref(payload);
         return true;
     }
+    int64_t resp_seq = (int64_t)json_integer_value(j_seq);
+    int64_t echo_seq = (int64_t)json_integer_value(j_echo_seq);
 
     /* Filter responses addressed to other peers' probes. */
     const identity_t *self = _partition_self_identity(proc);
@@ -5141,6 +5480,21 @@ static bool handle_partition_response(const process_t *proc, directory_t *queues
         json_decref(payload);
         return true;
     }
+    /* ...and to a probe round we are STILL running. `in_response_to` is only
+     * our uuid, which never changes, so without this a genuine response could
+     * be captured and re-presented to us for the life of the node, each time
+     * driving a request_access toward a group the responder named. */
+    pthread_mutex_lock(&id_state.lock);
+    int64_t current_probe = id_state.probe_seq;
+    pthread_mutex_unlock(&id_state.lock);
+    if (current_probe <= 0 || echo_seq != current_probe) {
+        log_debug(proc->logger,
+                  "Identity: partition_response ignored: answers probe %lld, "
+                  "our current probe is %lld\n",
+                  (long long)echo_seq, (long long)current_probe);
+        json_decref(payload);
+        return true;
+    }
 
     public_identity_t sender_pub;
     memset(&sender_pub, 0, sizeof(sender_pub));
@@ -5152,10 +5506,11 @@ static bool handle_partition_response(const process_t *proc, directory_t *queues
     int their_size = (int)json_integer_value(j_group_size);
     const char *sig_hex = json_string_value(j_signature);
 
-    char canonical[UUID_STRING_LEN * 2 + 64];
-    int clen = snprintf(canonical, sizeof(canonical), "%s|%d|%s",
-                        their_group_uuid, their_size, self_uuid_str);
-    if (clen < 0 || (size_t)clen >= sizeof(canonical)) {
+    char canonical[UUID_STRING_LEN * 2 + 96];
+    int clen = identity_partition_canonical_response(
+        their_group_uuid, their_size, self_uuid_str, echo_seq, resp_seq,
+        canonical, sizeof(canonical));
+    if (clen < 0) {
         json_decref(payload);
         return true;
     }
@@ -5164,6 +5519,25 @@ static bool handle_partition_response(const process_t *proc, directory_t *queues
                               (size_t)clen, sig_hex) != 0) {
         log_debug(proc->logger,
                   "Identity: partition_response: bad signature, dropping\n");
+        json_decref(payload);
+        return true;
+    }
+    /* Freshness per responder, after the signature check. The echoed round
+     * above bounds this to the current probe; this bounds a responder to one
+     * answer within it. */
+    char resp_sender_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(sender_pub.uuid, resp_sender_str);
+    pthread_mutex_lock(&id_state.lock);
+    bool resp_fresh = freshness_accept(&id_state.freshness, resp_sender_str,
+                                       ID_PARTITION_RESPONSE, resp_seq,
+                                       proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (!resp_fresh) {
+        probes_counter("peer.set", "partition_response_replay", NULL);
+        log_debug(proc->logger,
+                  "Identity: partition_response from %s refused: seq %lld not "
+                  "above mark (replay)\n", resp_sender_str,
+                  (long long)resp_seq);
         json_decref(payload);
         return true;
     }
@@ -5645,6 +6019,21 @@ static void _advertise_hierarchy(const process_t *proc, const public_identity_t 
     json_error_t jerr;
     json_t *payload = json_loads(rendered, 0, &jerr);
     if (payload != NULL) {
+        /* Stamped onto the OUTGOING payload, not into the claim compared
+         * above: the claim doubles as the unchanged-since-last test, and a
+         * claim carrying a fresh sequence every time would never compare
+         * equal, turning the suppression off and the advertisement into the
+         * flood this function exists to avoid. */
+        pthread_mutex_lock(&id_state.lock);
+        int64_t hier_seq = freshness_stamp(&id_state.freshness, proc->logger);
+        pthread_mutex_unlock(&id_state.lock);
+        if (hier_seq <= 0) {
+            json_decref(payload);
+            free(rendered);
+            return;
+        }
+        json_object_set_new(payload, "seq",
+                            json_integer((json_int_t)hier_seq));
         net_msg_pack_json(&msg.info.net_msg, payload);
         json_decref(payload);
         if (to_whom != NULL) {
@@ -5719,6 +6108,26 @@ static bool handle_hierarchy(const process_t *proc, directory_t *queues,
         return true;
     }
 #endif
+    /* Freshness per claimant. The record below is last-writer-wins with no
+     * epoch of its own, so an unstamped claim was replayable to roll the
+     * recorded topology BACK to a superseded one -- and this map is what the
+     * child-gateway walk recurses into. Unstamped is refused, not accepted as
+     * legacy (doc/architecture/reputation.md, "Quorum attestation"). */
+    json_t *j_hier_seq = json_object_get(payload, "seq");
+    int64_t hier_seq = json_is_integer(j_hier_seq)
+        ? (int64_t)json_integer_value(j_hier_seq) : 0;
+    pthread_mutex_lock(&id_state.lock);
+    bool hier_fresh = freshness_accept(&id_state.freshness, sender,
+                                       ID_HIERARCHY, hier_seq, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (!hier_fresh) {
+        log_debug(proc->logger,
+                  "Identity: hierarchy claim from %s refused: sequence %lld "
+                  "not above mark (replay or unstamped)\n", sender,
+                  (long long)hier_seq);
+        json_decref(payload);
+        return true;
+    }
     if (id_state.peer_hierarchy.items == NULL)
         map_init(&id_state.peer_hierarchy);
     /* Store the claim verbatim (as rendered JSON) so the reader stays one
@@ -6026,14 +6435,19 @@ static int _own_public_identity(const process_t *proc, public_identity_t *out)
  * Measurement only, mirroring Python's IdentityProcess._record_clock_sample.
  * Nothing here steers a clock and no offset is applied to our own time.       */
 
-static void _free_clock_sample_data(data_t *dat)
+/* Release the heap sample a stored data_t WRAPS, and only that.
+ *
+ * object_ptr_data wraps a pointer the map knows nothing about, so the sample
+ * is ours to free; the data_t around it belongs to the map, which adopted our
+ * reference at map_set (structures/map.h) and releases it in map_free and when
+ * an insert displaces it. Deref'ing here as well is a double free. */
+static void _free_clock_sample_obj(data_t *dat)
 {
     if (dat == NULL)
         return;
     ptr_t obj = NULL;
     if (data_object_ptr(dat, &obj) == 0 && obj != NULL)
         free(obj);
-    smrt_deref(dat);
 }
 
 static void _free_clock_samples_locked(void)
@@ -6041,8 +6455,10 @@ static void _free_clock_samples_locked(void)
     map_key_t key = NULL;
     data_t *value = NULL;
     map_entries_for_each(&id_state.peer_clock_samples, key, value)
-        _free_clock_sample_data(value);
+        _free_clock_sample_obj(value);
     map_end_for_each
+    /* map_free releases the data_t of every entry; the loop above released
+     * what those wrapped. */
     map_free(&id_state.peer_clock_samples);
     map_init(&id_state.peer_clock_samples);
 }
@@ -6069,7 +6485,9 @@ static void _store_clock_sample(const char *uuid_str,
     pthread_mutex_lock(&id_state.lock);
     data_t *old = NULL;
     if (map_get(&id_state.peer_clock_samples, (map_key_t)uuid_str, &old) == 0)
-        _free_clock_sample_data(old);
+        _free_clock_sample_obj(old);
+    /* map_set derefs the data_t it displaces; the line above freed the sample
+     * that one wrapped, which the map does not own. */
     map_set(&id_state.peer_clock_samples, (map_key_t)uuid_str, dat);
     pthread_mutex_unlock(&id_state.lock);
 }

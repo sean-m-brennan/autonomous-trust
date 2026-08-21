@@ -681,6 +681,28 @@ bool agreement_finalize(agreement_protocol_t *proto, merkle_blob_t *blob)
         return false;
     }
 
+    /* One voter, one vote — mirrors Python AgreementProtocol.finalize.
+     * agreement_verify appends every arriving vote, and a vote carries
+     * nothing that distinguishes a second delivery from a second voter, so
+     * a replayed ballot used to be counted again. Under stake-weighted
+     * accumulation that adds the voter's stake twice and flips the outcome
+     * at a tight margin; rank/tier accumulation reduces to the leader's
+     * verdict and was already insensitive.
+     *
+     * Indexed by voter slot rather than by uuid string: the slot is already
+     * resolved below, and voter_count is small and fixed for the round.
+     * Everything on this list cleared pre_verify at store time, so a
+     * duplicate here is a genuine second delivery from a real voter, not a
+     * forged ballot squatting a voter's slot. */
+    bool *counted = calloc((size_t)(proto->voter_count > 0 ? proto->voter_count : 1),
+                           sizeof(bool));
+    if (counted == NULL)
+    {
+        free(ranks);
+        free(approvals);
+        return false;
+    }
+
     int actual = 0;
     for (int i = 0; i < vote_count; i++)
     {
@@ -694,16 +716,21 @@ bool agreement_finalize(agreement_protocol_t *proto, merkle_blob_t *blob)
 
         /* find the voter */
         agreement_voter_t *voter = NULL;
+        int voter_idx = -1;
         for (int j = 0; j < proto->voter_count; j++)
         {
             if (strcmp(proto->voters[j].uuid, proof->uuid) == 0)
             {
                 voter = &proto->voters[j];
+                voter_idx = j;
                 break;
             }
         }
         if (voter == NULL)
             continue;
+        if (counted[voter_idx])
+            continue;
+        counted[voter_idx] = true;
 
         if (proto->count_vote != NULL)
         {
@@ -716,6 +743,7 @@ bool agreement_finalize(agreement_protocol_t *proto, merkle_blob_t *blob)
     if (proto->accumulate_votes != NULL)
         result = proto->accumulate_votes(proto, ranks, approvals, actual);
 
+    free(counted);
     free(ranks);
     free(approvals);
     map_remove(proto->votes, blob->uuid);
