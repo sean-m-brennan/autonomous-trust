@@ -54,6 +54,11 @@ def _make_worker(env_overrides=None, peer_count=3, register_caps=True,
     env_overrides = dict(env_overrides or {})
     if not register_caps:
         env_overrides.setdefault('AT_BOOTSTRAP_DISABLED', '1')
+    # Continuous probing (R+D.md §12.7) is ON in production but OFF by default
+    # here, so the window/coverage tests below keep measuring the window alone.
+    # Without this, every test that counts queue depth after the window closes
+    # would also be counting probes. TestContinuousProbing opts back in.
+    env_overrides.setdefault('AT_PROBE_CONTINUOUS_DISABLED', '1')
     # Hold a token outside the patch so the test isolates env state.
     saved = {k: os.environ.get(k) for k in env_overrides}
     for k, v in env_overrides.items():
@@ -254,6 +259,139 @@ class TestTickWindow:
             worker._tick(queues)
         # Exactly 1 pair issued at t=0; nothing more.
         assert worker._pairs_issued == 1
+
+
+class TestContinuousProbing:
+    """Probing past the bootstrap window (R+D.md §12.7).
+
+    The window seeds reputation and stops, which applied the honeypot pattern
+    only at cold start: a peer had to misbehave in its first 30 seconds to be
+    caught by a known-answer check, and one that degraded later was never
+    challenged again."""
+
+    @staticmethod
+    def _drain(q):
+        out = []
+        while True:
+            try:
+                out.append(q.get_nowait())
+            except queue.Empty:
+                return out
+
+    def _closed_window_worker(self, **env):
+        overrides = {
+            'AT_BOOTSTRAP_PAIRS': '1',
+            'AT_BOOTSTRAP_DURATION_SEC': '999',
+            'AT_PROBE_CONTINUOUS_DISABLED': None,   # opt back in
+            'AT_PROBE_INTERVAL_SEC': '0',           # no rate limit in tests
+        }
+        overrides.update(env)
+        return _make_worker(env_overrides=overrides)
+
+    def test_probes_continue_after_the_window(self, setup_teardown):
+        worker, _ = self._closed_window_worker()
+        queues = {CfgIds.negotiation: queue.Queue()}
+        for _ in range(6):
+            worker._tick(queues)
+        assert worker._pairs_issued == 1        # window budget respected
+        assert worker._probes_issued >= 4       # and probing kept going
+        assert len(self._drain(queues[CfgIds.negotiation])) == 1 + worker._probes_issued
+
+    def test_continuous_can_be_disabled(self, setup_teardown):
+        """The historical behavior stays reachable: seed, then idle."""
+        worker, _ = self._closed_window_worker(
+            **{'AT_PROBE_CONTINUOUS_DISABLED': '1'})
+        queues = {CfgIds.negotiation: queue.Queue()}
+        for _ in range(6):
+            worker._tick(queues)
+        assert worker._probes_issued == 0
+
+    def test_probes_are_addressed_to_one_peer(self, setup_teardown):
+        """A fanned-out probe is answered by whoever replies first, so it
+        cannot express "probe THIS peer" and a slow peer is never probed."""
+        worker, _ = self._closed_window_worker()
+        queues = {CfgIds.negotiation: queue.Queue()}
+        for _ in range(4):
+            worker._tick(queues)
+        msgs = self._drain(queues[CfgIds.negotiation])
+        probes = msgs[1:]                        # msgs[0] is the window pair
+        assert probes, 'expected at least one probe'
+        assert all(getattr(m, 'to_whom', None) is not None for m in probes)
+
+    def test_allocation_spreads_across_peers_before_repeating(self, setup_teardown):
+        """UCB over per-peer counts: the least-probed peer is chosen next, so
+        with three peers the first three probes hit three distinct peers."""
+        worker, _ = self._closed_window_worker()
+        queues = {CfgIds.negotiation: queue.Queue()}
+        for _ in range(4):
+            worker._tick(queues)
+        assert worker._probes_issued >= 3
+        # Every peer probed, and no peer probed twice before all were probed.
+        assert len(worker._probes_by_peer) == 3
+        assert max(worker._probes_by_peer.values()) <= 1 + (
+            worker._probes_issued - 3)
+
+    def test_allocation_prefers_the_least_probed_peer(self, setup_teardown):
+        worker, _ = self._closed_window_worker()
+        peers = list(worker.peers.all)
+        uuids = [str(p.uuid) for p in peers]
+        # Pretend two peers are well covered and one is not.
+        worker._probes_issued = 20
+        worker._probes_by_peer = {uuids[0]: 10, uuids[1]: 10, uuids[2]: 0}
+        assert str(worker._select_target(peers).uuid) == uuids[2]
+
+    def test_heavier_capability_is_probed_more_but_not_exclusively(self, setup_teardown):
+        """weight * uncertainty, not weight alone: a pure weight ranking would
+        probe the heaviest cap forever, losing coverage and leaving an
+        adversary only one capability to answer correctly."""
+        worker, _ = self._closed_window_worker()
+        heavy = 'at.handshake'
+        worker.capabilities[heavy].transaction_weight = 8
+        chosen = []
+        for _ in range(30):
+            name = worker._select_capability(list(BOOTSTRAP_CAPABILITY_NAMES))
+            chosen.append(name)
+            worker._probes_by_cap[name] = worker._probes_by_cap.get(name, 0) + 1
+            worker._probes_issued += 1
+        assert chosen.count(heavy) > len(chosen) / 3      # favored
+        assert set(chosen) == set(BOOTSTRAP_CAPABILITY_NAMES)  # not exclusive
+
+    def test_rate_limit_spaces_probes(self, setup_teardown):
+        worker, _ = self._closed_window_worker(
+            **{'AT_PROBE_INTERVAL_SEC': '3600'})
+        queues = {CfgIds.negotiation: queue.Queue()}
+        for _ in range(10):
+            worker._tick(queues)
+        # First post-window tick probes immediately; the interval blocks the
+        # rest (waiting an hour to start probing would serve nobody).
+        assert worker._probes_issued == 1
+
+    def test_capability_probes_settle_proportional_to_weight(self, setup_teardown):
+        """The design claim of `weight / (n + 1)`: probe counts converge to the
+        weight ratio. Pinned because the obvious alternative (weight * the UCB
+        bonus) converges to weight SQUARED instead, which starves light
+        capabilities on any normally-weighted ladder."""
+        worker, _ = self._closed_window_worker()
+        weights = {'at.handshake': 6, 'at.time-attest': 3, 'at.echo-challenge': 1}
+        for name, w in weights.items():
+            worker.capabilities[name].transaction_weight = w
+        for _ in range(1000):
+            name = worker._select_capability(list(BOOTSTRAP_CAPABILITY_NAMES))
+            worker._probes_by_cap[name] = worker._probes_by_cap.get(name, 0) + 1
+            worker._probes_issued += 1
+        counts = worker._probes_by_cap
+        total_w = sum(weights.values())
+        for name, w in weights.items():
+            expected = 1000 * w / total_w
+            assert abs(counts[name] - expected) < 0.05 * 1000, (
+                '%s: got %d, expected ~%.0f' % (name, counts[name], expected))
+
+    def test_ucb_bonus_is_widest_for_an_unprobed_arm(self, setup_teardown):
+        worker, _ = self._closed_window_worker()
+        assert worker._ucb_bonus(0, 100) > worker._ucb_bonus(5, 100)
+        assert worker._ucb_bonus(5, 100) > worker._ucb_bonus(50, 100)
+        # Defined on the very first draw rather than dividing by zero.
+        assert worker._ucb_bonus(0, 0) > 0
 
 
 class TestBootstrapCoverage:

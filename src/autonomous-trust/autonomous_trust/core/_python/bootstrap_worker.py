@@ -43,10 +43,40 @@ Configuration (all env-overridable):
   ``bootstrap/bootstrap-corpus-runs-on-admission.yaml`` and the
   unit tests in ``test_bootstrap_worker.py`` set this so the
   capability/peer sequence is deterministic.
+
+Continuous probing (R+D.md §12.7)
+---------------------------------
+
+The bootstrap window seeds reputation and then stops, which leaves the
+honeypot pattern applied only at cold start. A peer therefore has to
+misbehave inside its first 30 seconds to be caught by a known-answer
+check, and a peer that degrades later — or that behaves well until it is
+trusted — is never challenged again. Probing continues past the window
+for exactly that reason, and it is what makes the probe channel an
+*anchor* rather than a one-off initiation rite: it is the only evidence
+that does not degrade as the adversarial fraction rises.
+
+- ``AT_PROBE_INTERVAL_SEC`` (default 60.0) — minimum spacing between
+  continuous probes. This is a rate limit, not a schedule: probes cost a
+  real task round trip on both peers, so the default is deliberately
+  slack compared to the bootstrap window's per-tick pacing.
+- ``AT_PROBE_CONTINUOUS_DISABLED`` (default unset) — set to ``1`` to keep
+  the historical behavior (bootstrap window only, then idle).
+  ``AT_BOOTSTRAP_DISABLED=1`` still disables the worker entirely.
+
+Allocation differs between the two phases, and the split is principled
+rather than incidental. Inside the bootstrap window every peer is equally
+unknown, so there is no posterior to be widest and uniform-random
+selection is the correct allocation (it is also what the seeded
+conformance contract pins). Once counts diverge, the doc's rule applies:
+spend probes where the posterior over a peer's quality is widest and the
+capability weight is highest. See ``_select_target`` and
+``_select_capability``.
 """
 
 from __future__ import annotations
 
+import math
 import os
 import queue
 import random
@@ -83,6 +113,8 @@ class BootstrapWorker(Process, metaclass=ProcMeta,
 
     DEFAULT_DURATION_SEC = 30.0
     DEFAULT_PAIRS_TARGET = 20
+    #: Minimum seconds between continuous (post-window) probes.
+    DEFAULT_PROBE_INTERVAL_SEC = 60.0
 
     def __init__(self, configurations: dict, subsystems, log_q,
                  dependencies: list[str] = None, **kwargs: Any) -> None:
@@ -127,8 +159,25 @@ class BootstrapWorker(Process, metaclass=ProcMeta,
         else:
             self._rng = random.Random()
 
+        self.probe_interval_sec = self._read_float_env(
+            'AT_PROBE_INTERVAL_SEC', self.DEFAULT_PROBE_INTERVAL_SEC)
+        self.continuous_enabled = (
+            os.environ.get('AT_PROBE_CONTINUOUS_DISABLED') != '1')
+
         self._window_start = None
         self._pairs_issued = 0
+        # Continuous-phase state (R+D.md §12.7). Counts are the posterior:
+        # with no outcome feedback reaching this process, how *uncertain* we
+        # are about a peer is a function of how often we have challenged it,
+        # which is exactly what the UCB exploration term measures. See
+        # _ucb_bonus for why this is the honest reading of "widest posterior"
+        # here rather than a Beta posterior we have no way to update.
+        self._probes_by_peer: dict[str, int] = {}
+        self._probes_by_cap: dict[str, int] = {
+            name: 0 for name in BOOTSTRAP_CAPABILITY_NAMES
+        }
+        self._probes_issued = 0
+        self._last_probe_at = None
         # cap_name -> issuance count. Lets the conformance pin assert
         # that each of the three bootstrap caps fired at least once.
         self._counts_by_cap: dict[str, int] = {
@@ -167,6 +216,159 @@ class BootstrapWorker(Process, metaclass=ProcMeta,
         if cap_name == 'at.echo-challenge':
             return ((), {'payload': f'echo:{self._rng.randrange(0, 2**32):08x}'})
         return ((), {})
+
+    @staticmethod
+    def _ucb_bonus(count: int, total: int) -> float:
+        """UCB1 exploration term for an arm probed ``count`` times out of
+        ``total`` draws: ``sqrt(2 * ln(total + 1) / (count + 1))``.
+
+        This is the "widest posterior" of R+D.md §12.7, read honestly for the
+        information this process actually has. A Beta posterior over a peer's
+        quality would need the probe *outcomes*, and those are scored in
+        ``automate.py`` on the requestor's main loop — a different process,
+        which does not report back here. What is available is how many times
+        each peer and capability has been challenged, and under a
+        count-only posterior the width is a function of exactly that. Writing
+        it as UCB1 keeps it a standard, citable quantity rather than an
+        invented heuristic, and it degrades correctly: an unprobed peer has
+        the widest interval and is chosen first.
+
+        ``total + 2`` rather than ``total + 1`` inside the log: at
+        ``total == 0`` the latter is ``ln(1) == 0``, which zeroes the bonus for
+        every arm and silently degenerates the whole selection to its
+        tie-break on the very first draw. ``+ 1`` on the count avoids dividing
+        by zero for an arm never drawn.
+        """
+        return math.sqrt(2.0 * math.log(total + 2) / (count + 1))
+
+    def _select_target(self, peers: list):
+        """Pick the peer whose quality we are least sure of.
+
+        Deterministic ``argmax`` of :meth:`_ucb_bonus` over per-peer probe
+        counts, tie-broken on the uuid string so the choice is reproducible
+        across runs and mirrorable by the C twin (which has no ``random``
+        parity with Python — see the conformance scenario's note). With all
+        counts equal, the tie-break makes this a round-robin, which is the
+        right cold behavior: nothing is known, so spread.
+        """
+        candidates = []
+        for peer in peers:
+            uuid_str = str(getattr(peer, 'uuid', ''))
+            if not uuid_str:
+                continue
+            bonus = self._ucb_bonus(
+                self._probes_by_peer.get(uuid_str, 0), self._probes_issued)
+            # Highest bonus first, then lowest uuid: one total order, so the
+            # winner does not depend on iteration order of `peers`.
+            candidates.append(((-bonus, uuid_str), peer))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: item[0])[1]
+
+    def _capability_weight(self, cap_name: str) -> float:
+        """``transaction_weight`` for ``cap_name``, defaulting to 1.
+
+        Read from the locally registered Capability, which
+        ``register_bootstrap_capabilities`` populates from the trust ladder —
+        so an operator who declares a bootstrap cap heavier in
+        ``trust_ladder.json`` also gets it probed more often, with no code
+        change here.
+        """
+        try:
+            cap = self.capabilities[cap_name]
+        except (KeyError, TypeError):
+            return 1.0
+        try:
+            return float(getattr(cap, 'transaction_weight', 1) or 1)
+        except (TypeError, ValueError):
+            return 1.0
+
+    def _select_capability(self, registered: list) -> str:
+        """Pick the capability to probe with: ``argmax`` of
+        ``weight / (per-cap count + 1)``.
+
+        This is the doc's "and the capability weight is highest", and the
+        *form* is deliberate. Peers and capabilities are not the same problem:
+        for a peer we are trying to identify a bad arm, which is what UCB is
+        for; for a capability there is nothing to identify — the question is
+        how to divide a fixed probe budget across capabilities of differing
+        stakes. This rule settles at ``n_cap`` proportional to ``weight``,
+        which is exactly "spend more where it matters" while still covering
+        everything.
+
+        Two shapes were tried and rejected. Ranking by weight alone probes the
+        heaviest capability forever, which loses coverage and leaves an
+        adversary a single capability to answer correctly. Multiplying weight
+        by the UCB bonus looks reasonable but allocates ``n_cap`` proportional
+        to ``weight**2``, because the bonus falls off as ``1/sqrt(n)`` — with
+        a weight of 8 a light capability is not selected until the heavy one
+        has been probed 64 times more, so a normally-weighted trust ladder
+        would silently stop exercising most of the corpus.
+        """
+        if not registered:
+            return None
+        scored = [
+            ((-(self._capability_weight(name)
+                / (self._probes_by_cap.get(name, 0) + 1.0)), name), name)
+            for name in registered
+        ]
+        return min(scored, key=lambda item: item[0])[1]
+
+    def _registered_bootstrap_caps(self) -> list:
+        """The bootstrap caps actually registered locally, in canonical
+        order."""
+        try:
+            local = self.capabilities.to_list()
+        except AttributeError:
+            return []
+        return [n for n in BOOTSTRAP_CAPABILITY_NAMES if n in local]
+
+    def _try_issue_probe(self, queues: dict) -> bool:
+        """Issue one *directed* probe: a chosen capability, addressed to a
+        chosen peer.
+
+        Distinct from :meth:`_try_issue_pair`, which broadcasts. Addressing
+        matters here because a fanned-out probe is answered by whichever peer
+        replies first (``start_task`` pre-seeds ``tracker.results`` for every
+        participant and ``handle_results`` forwards on the first one), so a
+        broadcast cannot express "probe THIS peer" and a slow peer would never
+        be probed at all.
+        """
+        peers = list(self.peers.all)
+        if not peers:
+            return False
+        registered = self._registered_bootstrap_caps()
+        if not registered:
+            return False
+        target = self._select_target(peers)
+        if target is None:
+            return False
+        cap_name = self._select_capability(registered)
+        if cap_name is None:
+            return False
+        cap = self.capabilities[cap_name]
+        args, kwargs = self._build_task_args(cap_name)
+        task = Task(TaskParameters(cap, args=args, kwargs=kwargs),
+                    self.identity)
+        msg = Message(CfgIds.negotiation, NegotiationProtocol.start, task,
+                      to_whom=target)
+        try:
+            queues[CfgIds.negotiation].put(
+                msg, block=True, timeout=self.q_cadence)
+        except queue.Full:
+            self.logger.warning(
+                'BootstrapWorker: negotiation queue full, probe deferred')
+            return False
+        uuid_str = str(getattr(target, 'uuid', ''))
+        self._probes_by_peer[uuid_str] = self._probes_by_peer.get(uuid_str, 0) + 1
+        self._probes_by_cap[cap_name] = self._probes_by_cap.get(cap_name, 0) + 1
+        self._probes_issued += 1
+        self._counts_by_cap[cap_name] = self._counts_by_cap.get(cap_name, 0) + 1
+        self.logger.debug(
+            'BootstrapWorker: probe %d (cap=%s, peer=%s, n_peer=%d)',
+            self._probes_issued, cap_name, uuid_str[:8],
+            self._probes_by_peer[uuid_str])
+        return True
 
     def _try_issue_pair(self, queues: dict) -> bool:
         """Schedule one Task invitation against a random bootstrap cap.
@@ -218,12 +420,37 @@ class BootstrapWorker(Process, metaclass=ProcMeta,
                     len(list(self.peers.all)))
             else:
                 return
-        if self._pairs_issued >= self.pairs_target:
-            return
         elapsed = (now() - self._window_start).total_seconds()
-        if elapsed > self.duration_sec:
+        window_done = (self._pairs_issued >= self.pairs_target
+                       or elapsed > self.duration_sec)
+        if not window_done:
+            self._try_issue_pair(queues)
             return
-        self._try_issue_pair(queues)
+        # Window closed. Historically the worker idled here forever, which
+        # left the honeypot pattern applied only at cold start (R+D.md §12.7).
+        if not self.continuous_enabled:
+            return
+        self._maybe_probe(queues)
+
+    def _maybe_probe(self, queues: dict) -> bool:
+        """Issue a directed probe if the rate limit allows it.
+
+        Rate-limited rather than issued every tick: a probe is a real task
+        round trip on both peers, and the point of continuing past the window
+        is coverage over time, not volume. The first call after the window
+        closes probes immediately (there is no reason to wait an interval to
+        start), and every later one waits ``probe_interval_sec``.
+        """
+        current = now()
+        if self._last_probe_at is not None:
+            since = (current - self._last_probe_at).total_seconds()
+            if since < self.probe_interval_sec:
+                return False
+        # Stamp before issuing, not after: a full negotiation queue returns
+        # False from _try_issue_probe, and retrying it on every tick would
+        # ignore the rate limit exactly when the node is most loaded.
+        self._last_probe_at = current
+        return self._try_issue_probe(queues)
 
     def process(self, queues: dict, signal) -> None:
         """Process entry point. Honors ``AT_BOOTSTRAP_DISABLED`` and then

@@ -51,6 +51,148 @@ All four thresholds honor environment overrides, read once at startup, and the
 inspector dashboard reads the same cut-off variable so its displayed line tracks
 a re-adjusted backend rather than a compiled-in assumption.
 
+### Where a score came from
+
+A score says how well a peer did. It does not, on its own, say how we know — and
+those are different facts. "The proof it returned was invalid" and "the task came
+back empty" can both be 0.3, and until 2026-08-21 nothing downstream could tell
+them apart, because the number was all that crossed the wire.
+
+Each `TransactionScore` therefore also carries an **evidence channel**, naming
+which kind of finding produced it:
+
+| Channel | What it means |
+|---|---|
+| `task_outcome` | ordinary grading of a completed task; the default |
+| `physical` | refuted by a conservation law or dimensional analysis |
+| `certificate` | a certificate-carrying interface checked out, or failed to |
+| `calibration` | coverage or calibration drift, rather than a wrong answer |
+| `self_consistency` | contradicted the peer's own signed claim archive |
+| `replication` | outcome of sampled replication of the peer's work |
+| `swarm_disagreement` | disagrees with the swarm |
+| `probe` | failed or passed a challenge whose answer we already knew |
+
+`probe` is worth separating from the rest even though it is also, mechanically,
+a completed task. It is the only channel that does not weaken as the adversarial
+fraction of a cohort rises: every other channel is ultimately an aggregate over
+peers, and a majority cannot be beaten without an external reference. A probe is
+that reference. It is also distinct from `certificate`, and the difference is who
+chose the question — a certificate is a proof the peer supplies about its own
+work, while a probe is a question the verifier authored and already knows the
+answer to, which a peer cannot tell from real work. The bootstrap corpus is
+where these come from; see [Trust tiers](trust-tiers.md) §6.
+
+Where these scores come from is worth stating once, because the two runtimes
+place it differently and both places are correct for the runtime they are in.
+The peer that *ran* the work submits its own half — its claim to have done the
+job. The peer that *asked* submits the judgment: a known-answer probe checked
+against the challenge it retained, or, failing that, a completion score.
+Python does the judging in its orchestrator, which is also where it verifies any
+proof attached to the result. C does it in its negotiation process, because that
+is where C keeps the requestor's record of what it asked, and it attaches no
+proofs, so it always takes the arm Python takes when proofs are unavailable.
+See [Getting work done](negotiation.md).
+
+The set is closed. A channel that is present but unrecognized is refused and the
+proposal dropped, on the same reasoning as an off-scale score: the value of the
+field is that a demotion reason means one agreed thing on both sides of the wire,
+and an unrecognized spelling passed through, or quietly recorded as
+`task_outcome`, would forfeit exactly that. Matching is case-sensitive. An
+*absent* channel is a different matter and is not an error — it means a peer or
+an app predating the field, which was grading a task outcome by construction, so
+it normalizes to `task_outcome` and every earlier producer keeps its meaning.
+
+The channel deliberately does not enter a committed chain entry's canonical
+bytes — a chain entry records who transacted and how well, while the channel is
+provenance for the score. Making it tamper-evident would be its own slice, with
+its own chain migration.
+
+### What a channel does
+
+Two things, and only for evidence this node produced itself.
+
+**It weights the consensus average.** Each channel carries an integer multiplier,
+composed with the per-capability `transaction_weight` from
+[Trust tiers](trust-tiers.md) — they multiply, so a heavy capability refuted on
+physics counts as both. The multiplier is applied the same way the capability
+weight is, by folding the score into the EMA that many times, which is why these
+are small integers.
+
+| Multiplier | Channels | Why |
+|---|---|---|
+| 1 | `task_outcome`, `calibration`, `swarm_disagreement` | one peer's reading of one event |
+| 2 | `replication`, `probe` | corroborated by construction — a replication has several executors, a probe is checked against an answer the verifier authored |
+| 3 | `physical`, `certificate`, `self_consistency` | a verdict that needs no history at all |
+
+These are a ranking of how much one observation tells you, not a tuning surface.
+`calibration` sits at 1 on purpose: it is the channel that should decay a peer
+*gradually*. An unrecognized spelling weighs 1 and never more, so adding a
+channel on one side of the wire cannot silently amplify it on the other.
+
+The multiplier is not a ranking of how *trustworthy* a channel is, which is why
+`probe` sits below the three above it despite being the channel that survives an
+adversarial majority. Those are different virtues: a probe's strength is that the
+aggregate cannot be captured by a colluding cohort, while a physics refutation's
+strength is that one observation settles the question outright. The multiplier
+measures the second.
+
+**A hard channel makes a defection grounds to accuse.** `physical`,
+`certificate`, and `self_consistency` are *falsifications* rather than grades —
+the peer did not do poorly, it asserted something that is not true. Each is a
+verdict reachable without consulting any other peer, which is what makes a single
+observation of one sufficient grounds to accuse. So a score on one of those
+channels that is also below the per-transaction cooperate threshold (0.5, the
+same number that means "peer defected" elsewhere in this document) **proposes** a
+slash. It does not impose one: the quorum co-signature described under
+[Quorum attestation](#quorum-attestation) accepts or refuses it like any other, so a refutation is an
+accusation with evidence, not a verdict.
+
+The floor is 0.45 — demotion, not exclusion. That is below the tier-1 floor, so
+the peer drops to tier 0 and is shed by tier-gated negotiation, but well above
+the communication cutoff, so it is not silenced and can earn its way back.
+Exclusion is reversible only by operator rehabilitation, which is far too heavy
+for one automated verdict. The slash reason names the channel —
+`refuted_physical`, `refuted_certificate`, `refuted_self_consistency` — so the
+closed channel set defines the closed reason set and neither can drift from the
+other. Because the reason is part of the signed designation, a channel claim
+carried there cannot be altered in flight, unlike an evidence reference.
+
+`probe` is not a hard channel even though its ground truth is certain. A probe is
+synthetic traffic the verifier generates continuously, so making one failed probe
+slash-eligible would put every node's exclusion in the hands of its own probe
+cadence. It gets the corroborated multiplier instead.
+
+`AT_TX_CHANNEL_SLASH_DISABLED` stops the accusation and keeps the weighting, for
+a deployment that wants the legibility without the automated demotion.
+
+### Only your own evidence counts
+
+Both responses apply *only* to a score this node produced. The scorer chooses its
+own tag, so honouring a remote peer's channel would hand every peer a lever on
+every other peer's reputation: tag a fabricated 0.0 as `physical` and it would
+land with triple weight and an accusation attached. A score that arrived from the
+wire keeps its channel for legibility, and is weighted by capability alone.
+
+This is structural rather than a check that could be forgotten. Accusing requires
+naming a subject, and a score's subject is local-only — it is never serialized,
+so a score off the wire has *no subject to accuse* whatever it claims in its
+channel. The requestor stamps the subject from the transport-verified sender of
+the reply, and only for a single-participant task; a fan-out is not attributable
+to one peer.
+
+The cost is that two nodes can compute slightly different consensus averages for
+the same peer. That is already true of the per-capability weights — a verifier
+across a trust boundary cannot reproduce them either — so this adds a term to an
+existing local-view divergence rather than introducing one.
+
+### What is still missing
+
+`swarm_disagreement` should open a **dispute** rather than levy a penalty, and
+there is no dispute machinery in either runtime. Weighting it like a hard channel
+would be the opposite of what is wanted, since a majority is not an oracle, so it
+sits at the baseline multiplier and levies an ordinary penalty for now. See
+R+D.md section 12.8 and [the verification oracle](../verification_oracle.md).
+
 ## Computing a score
 
 When a reputation query arrives, the score is computed by one of two strategies,
@@ -512,6 +654,8 @@ form, the legacy C form, and refuses the rest.
 | Backdate on a chain mismatch | [`request-backdated-chain-mismatch.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/request-backdated-chain-mismatch.yaml) |
 | Phase 2 acceptance | [`transaction-accepted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/transaction-accepted.yaml) |
 | Phase 3 bilateral commit | [`transaction-committed-bilateral.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/transaction-committed-bilateral.yaml) |
+| Evidence channel carried; a channel from a peer changes nothing | [`transaction-channel-carried.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/transaction-channel-carried.yaml) |
+| A refutation from a peer accuses nobody | [`remote-refutation-cannot-accuse.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/remote-refutation-cannot-accuse.yaml) |
 | Sync, outdated notification | [`chain-outdated-notification.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/chain-outdated-notification.yaml) |
 | Sync, replay of an update | [`chain-replay-update.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/chain-replay-update.yaml) |
 | Replay of a ballot refused | [`ask-permission-replay-rejected.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/ask-permission-replay-rejected.yaml) |

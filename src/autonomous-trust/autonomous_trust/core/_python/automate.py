@@ -49,14 +49,16 @@ from .identity import Peers
 from .identity.protocol import IdentityProtocol
 from .bootstrap_capabilities import (
     register_bootstrap_capabilities,
-    BOOTSTRAP_CAPABILITY_NAMES,
+    BOOTSTRAP_CAPABILITY_NAMES, is_probe_capability, verify_bootstrap_result,
 )
 from .capabilities import Capabilities, Capability, PeerCapabilities
 from .system import CfgIds, PackageHash, queue_cadence, max_concurrency, now, preferred_proto_ver, QueueType
 from .protocol import Protocol
 from .negotiation import Task, TaskParameters, TaskStatus, Status, TaskResult, NegotiationProtocol
 from .network import Message, require_synced_clock
-from .reputation import TransactionScore, ReputationProtocol, PeerReputation
+from .reputation import (TransactionScore, ReputationProtocol, PeerReputation,
+                         TX_CHANNEL_CERTIFICATE, TX_CHANNEL_TASK_OUTCOME,
+                         TX_CHANNEL_PROBE)
 from .reputation.reputation import Reputation
 from .queue_pool import QueuePool
 from .._zkp import ZKP_AVAILABLE
@@ -84,6 +86,74 @@ class Ctx(str, Enum):
 
 
 ################################################################################
+
+
+def score_task_result(task, logger=None, name: str = '') -> tuple[float, str]:
+    """Score a returned :class:`TaskResult` and name its evidence channel.
+
+    Returns ``(score, channel)``. The channel is one of ``TX_CHANNELS``
+    (R+D.md §12.8) and says how the number was arrived at, which is what makes
+    a tamper signal distinguishable downstream from a dud task when both are
+    0.3.
+
+    ``verify_proof()`` is tri-state: True (proof verified), False (proof
+    present but INVALID -> a genuine tamper signal), or None (indeterminate:
+    no proof attached, or ZKP unavailable in this process).
+
+    None must NOT be scored as a defection. Split by cause:
+
+    * ZKP unavailable process-wide -> proofs cannot attest anything, so score
+      on the fact the task completed with a result; missing infrastructure is
+      not the peer's fault.
+    * ZKP available but proof absent -> suspicious; score as a defection, like
+      an invalid proof.
+
+    Previously ``0.8 if zkp_valid else 0.3`` collapsed None into the defection
+    bucket, so with the ZKP extension unshipped every requestor scored 0.3 and
+    honest reputation cratered.
+
+    A known-answer probe is checked FIRST (R+D.md §12.7) and subsumes the ZKP
+    question: for a capability whose right answer is already in hand, "it came
+    back" is not the question. A result tampered in transit will not match the
+    expected value either, and it scores 0.1 here rather than the ZKP path's
+    0.3. The expected value comes from ``requested_kwargs``, which the
+    requestor's own negotiation process stamped on from its retained Task --
+    never from the responder's reply.
+    """
+    probe_score = None
+    cap_name = getattr(task, 'requested_capability_name', None)
+    if is_probe_capability(cap_name):
+        probe_score = verify_bootstrap_result(
+            cap_name, task.result, getattr(task, 'requested_kwargs', None))
+    if probe_score is not None:
+        if logger is not None:
+            logger.info('%s: probe %s scored %.2f for task %s',
+                        name, cap_name, probe_score, task.uuid)
+        return probe_score, TX_CHANNEL_PROBE
+
+    zkp_valid = task.verify_proof()
+    if zkp_valid is True:
+        return 0.8, TX_CHANNEL_CERTIFICATE
+    if zkp_valid is False:
+        if logger is not None:
+            logger.warning('%s: ZKP verification FAILED for task %s',
+                           name, task.uuid)
+        return 0.3, TX_CHANNEL_CERTIFICATE
+    if ZKP_AVAILABLE:
+        # Proof missing despite ZKP being available -> suspicious.
+        if logger is not None:
+            logger.warning(
+                '%s: task %s result carried no ZKP proof despite ZKP being '
+                'available', name, task.uuid)
+        # Still the certificate channel: a certificate-carrying interface was
+        # expected here and nothing was presented, which is a fact about the
+        # proof, not about the work.
+        return 0.3, TX_CHANNEL_CERTIFICATE
+    # ZKP unavailable: score on successful completion. No certificate was in
+    # play, so this is an ordinary task outcome -- and saying so is the point:
+    # it keeps an infrastructure gap from reading as a failed proof. This is
+    # also the only arm the C twin has, since that runtime attaches no proofs.
+    return (0.8 if task.result is not None else 0.3), TX_CHANNEL_TASK_OUTCOME
 
 
 class AutonomousTrust(Protocol):
@@ -943,36 +1013,29 @@ class AutonomousTrust(Protocol):
                 elif isinstance(message, TaskResult):
                     task = message
                     self.logger.debug('%s: Task result recvd: %s', self.name, task.result)
-                    # Requestor-side score for a returned TaskResult. verify_proof()
-                    # is tri-state: True (proof verified), False (proof present but
-                    # INVALID -> genuine tamper signal), or None (indeterminate: no
-                    # proof attached, or ZKP unavailable in this process).
-                    #
-                    # None must NOT be scored as a defection. Split by cause:
-                    #   * ZKP unavailable process-wide -> proofs cannot attest
-                    #     anything, so score on the fact the task completed with a
-                    #     result; missing infrastructure is not the peer's fault.
-                    #   * ZKP available but proof absent -> suspicious; score as a
-                    #     defection, like an invalid proof.
-                    # Previously `0.8 if zkp_valid else 0.3` collapsed None into the
-                    # defection bucket, so with the ZKP extension unshipped every
-                    # requestor scored 0.3 and honest reputation cratered.
-                    zkp_valid = task.verify_proof()
-                    if zkp_valid is True:
-                        score = 0.8
-                    elif zkp_valid is False:
-                        self.logger.warning(
-                            '%s: ZKP verification FAILED for task %s', self.name, task.uuid)
-                        score = 0.3
-                    elif ZKP_AVAILABLE:
-                        # Proof missing despite ZKP being available -> suspicious.
-                        self.logger.warning(
-                            '%s: task %s result carried no ZKP proof despite ZKP being available', self.name, task.uuid)
-                        score = 0.3
-                    else:
-                        # ZKP unavailable: score on successful completion.
-                        score = 0.8 if task.result is not None else 0.3
-                    tx = TransactionScore(task.uuid, score)
+                    # Requestor-side score, plus the evidence channel that says
+                    # how it was arrived at. The rules live in
+                    # `score_task_result` (module level, just above) rather than
+                    # here so the C twin's
+                    # `negotiation_score_task_result` can be pinned against the
+                    # same behaviour from the conformance corpus -- C scores in
+                    # its negotiation process, which is where its requestor-side
+                    # record of the task lives, so the two runtimes cannot share
+                    # a call site, only the rules.
+                    score, channel = score_task_result(
+                        task, logger=self.logger, name=self.name)
+                    cap_name = getattr(task, 'requested_capability_name', None)
+                    # subject_uuid: who the score is ABOUT, stamped on the
+                    # requestor side by negprocess.handle_results from the
+                    # verified sender. None for a fan-out (not attributable
+                    # to one peer). Local-only and never serialized; it is
+                    # what lets a hard-channel refutation propose a slash
+                    # against the right peer (R+D.md §12.8).
+                    tx = TransactionScore(task.uuid, score,
+                                          capability_name=cap_name,
+                                          channel=channel,
+                                          subject_uuid=getattr(
+                                              task, 'executor_uuid', None))
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
                     if self.external_feedback in queues:
                         queues[self.external_feedback].put(task, block=True, timeout=queue_cadence)

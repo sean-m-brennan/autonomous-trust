@@ -818,6 +818,39 @@ async def test_live_listener_accepts_an_allowed_origin():
 
 
 @pytest.mark.asyncio
+async def test_halt_closes_the_listener_and_unwinds_the_service():
+    """Shutdown has to happen INSIDE the websocket loop while it still runs.
+
+    `halt()` used to stop the loop and cancel `ws_stop` in the same breath, so
+    the cancellation was never delivered: `_websocket_service` stayed suspended
+    at `await self.ws_stop`, the `async with websocket_serve(...)` block never
+    exited, and the listening socket was closed by nothing. Python finalized
+    the coroutine during GC instead -- after the loop had been closed by its
+    own `__del__` -- and `Server.close()` raised "Event loop is closed" out of a
+    `GeneratorExit`, which surfaces as an unraisable exception (pytest reports
+    it; an operator sees it as noise at ^C).
+
+    Binding the port is the assertion that matters: it can only succeed if the
+    listener was really closed, which only happens if `__aexit__` ran.
+    """
+    import socket as _socket
+    listener = _Listener(authenticator=NullAuthenticator())
+    with listener as ctl:
+        port = ctl.ws_port
+        assert await _probe(ctl.ws_url('graph')) is None
+
+    assert ctl._ws_service.done(), 'the service coroutine was abandoned, not unwound'
+    assert ctl._ws_sender.done(), 'the sender coroutine was abandoned, not unwound'
+    assert ctl.ws_loop.is_closed(), 'the loop thread must close the loop it ran'
+    with _socket.socket() as sock:
+        # SO_REUSEADDR only forgives the TIME_WAIT left by the probe's own
+        # connection; binding over a socket that is still LISTENing is still
+        # EADDRINUSE, which is the leak this is looking for.
+        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        sock.bind(('127.0.0.1', port))
+
+
+@pytest.mark.asyncio
 async def test_live_listener_unauthenticated_default_still_accepts():
     """The default posture, end to end: no credential expected, and the first
     frame is the application's."""

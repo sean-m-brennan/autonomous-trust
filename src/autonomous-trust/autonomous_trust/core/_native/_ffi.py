@@ -441,6 +441,12 @@ ffi.cdef("""
     typedef struct capability_s capability_t;
 
     capability_t *find_capability(const char *name);
+    /* Result-producing invocation. `capability_function_t` returns void, so a
+       capability's answer could not be collected until this existed and a C
+       worker had nothing to report; see processes/capabilities.h. */
+    int capability_execute_result(const capability_t *cap,
+                                 const char *kwargs_json,
+                                 char *result_out, size_t result_len);
 
     /* ---- utilities/msg_types.h ---- */
     typedef enum {
@@ -516,6 +522,12 @@ ffi.cdef("""
            whole-struct memcpy in msg_types.c, so a short mirror truncates the
            capability name that resolves the transaction weight. */
         char capability_name[65];
+        /* Evidence channel (R+D.md §12.8). TX_CHANNEL_NAMELEN is 31, + NUL.
+           Carried verbatim by the same whole-struct memcpy, so a short or
+           missing mirror truncates the channel into an unknown spelling --
+           which the far end then refuses rather than grades, an obscure way to
+           learn the mirror drifted. Mirrors reputation/tx_channel.h. */
+        char channel[32];
     } tx_score_msg_t;
 
     size_t message_size(message_type_t type);
@@ -594,6 +606,12 @@ ffi.cdef("""
                                 const unsigned char *peer_uuid,
                                 const uint8_t *data, size_t len);
     int  task_tracker_result_count(const task_tracker_t *tracker);
+    /* What the requestor asked for, retained so the reply can be judged
+       against it (R+D.md §12.7). Python's TaskTracker subclasses Task and
+       keeps `parameters` for free. */
+    int  task_tracker_set_request(task_tracker_t *tracker,
+                                  const char *capability_name,
+                                  const char *kwargs_json);
     void task_tracker_free(task_tracker_t *tracker);
 
     /* ---- negotiation/negotiation.h ---- */

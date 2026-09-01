@@ -38,12 +38,26 @@ RUN --mount=source=src/dist/conda-repo,target=/app/dist \
 RUN --mount=source=src/dist/conda-repo,target=/app/dist \
     conda install -y -c file:///app/dist autonomous_trust_simulator && conda clean -afy
 
-# pykcs11 (a pip dep in environment.yml) ships no cp313 wheel, so pip compiles
-# its C++/SWIG extension at env-update time and needs g++ on PATH. (SWIG itself
-# is supplied by pykcs11's own pip build isolation; only the compiler is
-# missing -- the base image ships clang, not g++.) Install it just for the
-# build and purge it afterward so the release image stays lean: the compiled
-# .so links only libstdc++6, which is part of the base runtime and is retained.
+# g++ for a pip dep that has to compile at env-update time. pykcs11 is the case
+# in hand: it publishes no Linux wheel for ANY version (PyPI index checked
+# 2026-09-01 -- macOS and Windows only), so pip always builds its SWIG/C++
+# extension from the sdist here, and the version pinned in
+# config/cfg/environment.yml is floor-critical for that build (see the note
+# beside it: anything below 1.5.19 no longer compiles with current SWIG). SWIG itself comes from pykcs11's own pip build
+# isolation; only the compiler is missing -- the base image ships clang, not
+# g++. Install it just for the build and purge it afterward so the release image
+# stays lean: the compiled .so links only libstdc++6, which is part of the base
+# runtime and is retained.
+#
+# Plain apt g++ is the right answer HERE and would be the wrong answer in the
+# devel image, which is worth one line so the two are not "fixed" alike. This
+# env holds no conda compiler package, so nothing exports CXX and setuptools
+# falls back to what python's sysconfig names, which g++ satisfies. The devel
+# env DOES hold gxx_linux-64, whose activation exports
+# CXX=x86_64-conda-linux-gnu-c++ -- and when a `--prune` deleted that package
+# while the variable stayed exported, the pip build went looking for a compiler
+# that no longer existed (2026-09-01; see scripts/setup-dev.sh and the note
+# beside the dep in config/cfg/environment.yml).
 # update and install any new (i.e. pip) dependencies from environment.yml
 COPY --chown=user:user config/cfg/environment.yml /app/environment.yml
 RUN --mount=type=cache,target=/opt/conda/pkgs \

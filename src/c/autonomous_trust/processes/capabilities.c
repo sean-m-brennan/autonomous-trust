@@ -22,6 +22,7 @@
 
 #include "config/configuration.h"
 #include "capabilities_priv.h"
+#include "bootstrap/bootstrap_capabilities.h"
 #include "capability_table_priv.h"
 
 /*@
@@ -59,6 +60,19 @@ int capability_execute(const capability_t *cap, thread_args_t args)
         return -1;
     cap->function(args);
     return 0;
+}
+
+/* Frama-C: skipped — [func-ptr] indirect call through
+ * capability_result_function_t. */
+int capability_execute_result(const capability_t *cap, const char *kwargs_json,
+                             char *result_out, size_t result_len)
+{
+    if (cap == NULL || cap->result_function == NULL
+        || result_out == NULL || result_len == 0)
+        return -1;
+    result_out[0] = '\0';
+    return cap->result_function((kwargs_json != NULL) ? kwargs_json : "",
+                                result_out, result_len);
 }
 
 /* Frama-C: skipped —
@@ -424,6 +438,13 @@ int build_local_capabilities(const char *my_uuid, array_t **caps_out)
         capability_t *src = &capability_table[i];
         if (!src->local)
             continue;
+        /* AT_BOOTSTRAP_DISABLED suppresses the three AT-core probe
+         * capabilities, mirroring Python's gate on the registration call
+         * itself (automate.py). A static table cannot skip its own rows, so
+         * the gate is read here, where the table becomes an advertisement:
+         * a node that will not answer a probe must not claim it can. */
+        if (is_probe_capability(src->name) && !bootstrap_capabilities_enabled())
+            continue;
         capability_t *cap = smrt_create(sizeof(capability_t));
         if (cap == NULL)
             return EXCEPTION(ENOMEM);
@@ -431,6 +452,11 @@ int build_local_capabilities(const char *my_uuid, array_t **caps_out)
         map_init(&cap->arguments);
         cap->local = true;
         cap->function = NULL;  /* don't expose function pointer */
+        /* Nor the result-producing one. smrt_create callocs, so this is
+         * already NULL; set it beside `function` so the two stay obviously
+         * paired and a later reader does not have to check the allocator to
+         * know an advertised capability carries no callable. */
+        cap->result_function = NULL;
         cap->required_tier = src->required_tier;
         /* weight 0 in capability_table means "use default 1" — same
          * sentinel as the proto wire form. */

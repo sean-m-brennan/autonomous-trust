@@ -95,6 +95,14 @@ typedef struct {
     int  evidence_chain_len;
     char evidence_checkpoint_root[TX_HASH_HEX_LEN + 1];
     rp_peer_rep_t evidence_ceilings[SCE_MAX_PARTICIPANTS];
+    /* Slash proposals this participant ORIGINATED, cumulative over the whole
+     * scenario (R+D.md §12.8). Unlike every other field here this is a TALLY
+     * rather than a snapshot: it is incremented by _send_hook as messages go
+     * out, not re-read after a dispatch, because the assertion it exists for
+     * is "over the whole scenario, none" and the engine's step matching is
+     * permissive about extra messages. g_snaps is zeroed per scenario, which
+     * is exactly the lifetime a cumulative count wants. */
+    int slashes_proposed;
 } rp_snap_t;
 static rp_snap_t g_snaps[SCE_MAX_PARTICIPANTS];
 
@@ -160,6 +168,13 @@ static const char *_resolve_to_id(const generic_msg_t *msg)
     return "unknown";
 }
 
+/* Whose handler is running right now. _send_hook sees the message but not the
+ * emitter, and a tally has to be attributed to somebody; _dispatch is the only
+ * place that knows. NULL outside a dispatch (participant construction also
+ * sends), in which case there is nobody to attribute to and the tally is
+ * skipped. */
+static const char *g_current_emitter = NULL;
+
 static int _send_hook(const char *key,
                       const message_type_t type,
                       generic_msg_t *msg,
@@ -170,6 +185,13 @@ static int _send_hook(const char *key,
     const char *to_id = _resolve_to_id(msg);
     const char *function = (type == NET_MESSAGE && msg->info.net_msg.function != NULL)
         ? msg->info.net_msg.function : "__internal__";
+    if (g_current_emitter != NULL
+        && strcmp(function, REP_PROTO_SLASH_PROPOSE) == 0)
+    {
+        rp_snap_t *es = _snap_get_or_make(g_current_emitter);
+        if (es != NULL)
+            es->slashes_proposed++;
+    }
     sce_capture(g_active_ctx, to_id, function);
     return 0;
 }
@@ -735,6 +757,13 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     {
         double score = 1.0;
         const char *task_slug = NULL;
+        /* Evidence channel (R+D.md §12.8), passed through VERBATIM and
+         * deliberately unvalidated here: a scenario needs to be able to send a
+         * bogus channel and assert that handle_transaction refuses it. The
+         * adapter's job is to put on the wire exactly what the scenario said.
+         * Kept at parity with the Python adapter so one scenario can drive
+         * both. */
+        const char *channel = NULL;
         if (payload && json_is_object(payload))
         {
             json_t *s_j = json_object_get(payload, "score");
@@ -742,12 +771,18 @@ static int _build_inbound(sce_run_ctx_t *ctx,
             else if (json_is_integer(s_j)) score = (double)json_integer_value(s_j);
             json_t *t_j = json_object_get(payload, "task_id");
             if (json_is_string(t_j)) task_slug = json_string_value(t_j);
+            json_t *c_j = json_object_get(payload, "channel");
+            if (json_is_string(c_j)) channel = json_string_value(c_j);
         }
         body = json_object();
         json_object_set_new(body, "id1", json_integer(id1));
         json_object_set_new(body, "id2", json_integer(id2));
         json_object_set_new(body, "peer_uuid", json_string(proposer_str));
         json_object_set_new(body, "score", json_real(score));
+        /* Omitted when the scenario says nothing, which is how a receiver reads
+         * "task outcome" -- so every pre-channel scenario keeps its meaning. */
+        if (channel)
+            json_object_set_new(body, "channel", json_string(channel));
         if (task_slug)
         {
             uuid_t task_uuid;
@@ -1225,7 +1260,9 @@ static int _dispatch(sce_run_ctx_t *ctx,
     rp_impl_t *impl = (rp_impl_t *)target->impl;
     array_t *queues = NULL;
     array_create(&queues);
+    g_current_emitter = target->id;
     run_message_handlers(impl->proc, queues, NET_MESSAGE, inbound);
+    g_current_emitter = NULL;
     array_free(queues);
 
     /* Snapshot the dispatcher's resulting state. Subsequent dispatches
@@ -1526,6 +1563,25 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: requests_count=%d, expected %d",
                              pid, snap->request_count, want);
+                    return -1;
+                }
+            }
+            else if (strcmp(key, "slashes_proposed") == 0)
+            {
+                /* How many slash proposals this participant ORIGINATED
+                 * (R+D.md §12.8). Its reason for existing is the zero case: a
+                 * hard-channel refutation that arrived FROM A PEER must not
+                 * let that peer accuse a third party, because the sender picks
+                 * its own channel tag. Both runtimes enforce that structurally
+                 * -- the accused subject is local-only and never serialized --
+                 * and this key is what makes the two agree about it in the
+                 * corpus rather than only in each side's unit tests. */
+                int want = (int)json_integer_value(val);
+                if (snap->slashes_proposed != want)
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: slashes_proposed=%d, expected %d",
+                             pid, snap->slashes_proposed, want);
                     return -1;
                 }
             }

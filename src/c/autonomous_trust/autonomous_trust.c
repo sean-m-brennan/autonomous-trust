@@ -148,11 +148,6 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
         {
             switch (inner->type)
             {
-            case TASK_RESULT:
-                /* Task results go to reputation for scoring */
-                if (messaging_send("reputation", TASK_RESULT, inner, false) != 0)
-                    log_exception(logger);
-                break;
             case TASK_STATUS:
                 /* Task status updates go to negotiation */
                 if (messaging_send("negotiation", TASK_STATUS, inner, false) != 0)
@@ -160,7 +155,20 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
                 break;
             /* App-bound: sent as we drain, in FIFO order. Batching them into a
              * second array and sending one message after the loop is what
-             * silently dropped every message but the last. */
+             * silently dropped every message but the last.
+             *
+             * TASK_RESULT joined this group when the C twin gained a scoring
+             * path. It used to be forwarded to the reputation process "for
+             * scoring", but nothing there ever handled it -- that process
+             * dispatches net_msg payloads by function name plus its own
+             * locally-submitted TRANSACTION_SCORE, so every result was
+             * received and dropped. The score is now raised where the
+             * requestor's own record of the task lives (neg_proc.c
+             * handle_results, which submits the TRANSACTION_SCORE itself), and
+             * this hop delivers the result to whoever asked for the work --
+             * mirroring automate.py putting the TaskResult on the app's
+             * external-feedback queue. */
+            case TASK_RESULT:
             case TRANSACTION_SCORE:
             case UPDATE_ACCEPTED:
             case PEER_OBSERVED:

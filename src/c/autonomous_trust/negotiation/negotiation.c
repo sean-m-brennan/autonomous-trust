@@ -24,6 +24,7 @@
 #include "structures/data.h"
 #include "utilities/allocation.h"
 #include "utilities/exception.h"
+#include "utilities/util.h"
 
 DEFINE_ERROR(ENEG_NOCAP, "Required capability not available");
 DEFINE_ERROR(ENEG_FULL,  "Job queue is full");
@@ -234,7 +235,28 @@ int task_tracker_init(task_tracker_t *tracker, const uuid_t task_uuid, int expec
 {
     uuid_copy(tracker->task_uuid, task_uuid);
     tracker->expected = expected;
+    /* Cleared, not left to the caller: a tracker whose request record held
+     * stack garbage would be read as a capability name at scoring time. */
+    tracker->capability_name[0] = '\0';
+    tracker->kwargs_json[0] = '\0';
     return map_init(&tracker->results);
+}
+
+int task_tracker_set_request(task_tracker_t *tracker,
+                             const char *capability_name,
+                             const char *kwargs_json)
+{
+    if (tracker == NULL)
+        return -1;
+    tracker->capability_name[0] = '\0';
+    tracker->kwargs_json[0] = '\0';
+    if (capability_name != NULL)
+        at_strlcpy(tracker->capability_name, capability_name,
+                   sizeof(tracker->capability_name));
+    if (kwargs_json != NULL)
+        at_strlcpy(tracker->kwargs_json, kwargs_json,
+                   sizeof(tracker->kwargs_json));
+    return 0;
 }
 
 void task_tracker_destroy(task_tracker_t *tracker)

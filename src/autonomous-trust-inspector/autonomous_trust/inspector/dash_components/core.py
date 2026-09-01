@@ -16,11 +16,13 @@
 
 import asyncio
 import base64
+import concurrent.futures
 import json
 import logging
 import os.path
 import socket
 import threading
+import time
 from collections import defaultdict
 from enum import Enum, auto
 from queue import Queue, Empty
@@ -189,6 +191,11 @@ class DashControl(object):
 
         self.ws_loop = asyncio.new_event_loop()
         self.ws_stop: Optional[asyncio.Future] = None
+        # Set by serve_websockets(); halt() needs all three to shut the
+        # service down in order rather than pulling the loop out from under it.
+        self._ws_thread: Optional[threading.Thread] = None
+        self._ws_service: Optional[concurrent.futures.Future] = None
+        self._ws_sender: Optional[concurrent.futures.Future] = None
         self.ws_send_queue = Queue()
         self.websocket_handlers: dict[str, list[Callable]] = {}
         self.clients: list[WSClient] = []
@@ -246,11 +253,31 @@ class DashControl(object):
                 f'/{component_name}{param_str}')
 
     def _websocket_event_loop(self):
-        asyncio.set_event_loop(self.ws_loop)
-        self.ws_loop.run_forever()
+        loop = self.ws_loop
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_forever()
+        finally:
+            # Closing the loop belongs to the thread that ran it, and halt()
+            # joins here before anything else touches it. Left open, the loop
+            # is closed instead by its own __del__ during interpreter GC --
+            # which is where a still-suspended _websocket_service was being
+            # finalized and calling Server.close() -> loop.create_task() on an
+            # already-closed loop ("Event loop is closed", raised out of a
+            # GeneratorExit and reported as PytestUnraisableExceptionWarning).
+            try:
+                loop.close()
+            except Exception:  # pragma: no cover - shutdown best-effort
+                pass
 
     async def _websocket_service(self):
-        self.ws_stop = asyncio.Future()
+        if self.ws_stop is None:  # pragma: no cover - serve_websockets sets it
+            self.ws_stop = asyncio.Future()
+        if self.ws_stop.cancelled():
+            # halt() landed between serve_websockets() scheduling this and the
+            # loop getting to it. Never open the listener at all rather than
+            # opening one nothing will close.
+            return
         logger = logging.Logger(__name__ + '_websockets')
         logger.log_level = logging.INFO
         if self.verbose:
@@ -269,7 +296,14 @@ class DashControl(object):
             # without reading the configuration back.
             logger.info('Inspector websocket: %s; %s',
                         self.tls.describe(), self.authenticator.describe())
-            await self.ws_stop
+            try:
+                await self.ws_stop
+            except asyncio.CancelledError:
+                # halt() cancels ws_stop to end the service. Caught rather than
+                # propagated so that leaving this `async with` -- which is what
+                # closes the listening socket and drains open connections -- is
+                # an ordinary unwind on a still-running loop.
+                logger.info('Inspector websocket: shutting down')
 
     async def _websocket_handler(self, websocket: WebSocketConnection):
         origin = websocket_origin(websocket)
@@ -361,14 +395,94 @@ class DashControl(object):
     # WSClient state (see above) and (b) a routing predicate plumbed
     # through ws_send_queue. Not blocking current dashboard use cases.
     def serve_websockets(self):
-        threading.Thread(target=self._websocket_event_loop, daemon=True).start()
-        asyncio.run_coroutine_threadsafe(self._websocket_service(), self.ws_loop)
-        asyncio.run_coroutine_threadsafe(self._websocket_sender(), self.ws_loop)
+        if self.ws_loop is None or self.ws_loop.is_closed():
+            # halt() closes the loop, so a restart gets a fresh one rather
+            # than "Event loop is closed" from run_coroutine_threadsafe.
+            self.ws_loop = asyncio.new_event_loop()
+        # Created here, not in the coroutine: halt() has to have something to
+        # cancel even if it is called before the service has been scheduled.
+        self.ws_stop = asyncio.Future(loop=self.ws_loop)
+        self._ws_thread = threading.Thread(target=self._websocket_event_loop,
+                                           daemon=True)
+        self._ws_thread.start()
+        self._ws_service = asyncio.run_coroutine_threadsafe(
+            self._websocket_service(), self.ws_loop)
+        self._ws_sender = asyncio.run_coroutine_threadsafe(
+            self._websocket_sender(), self.ws_loop)
 
-    def halt(self):
-        self.ws_loop.call_soon_threadsafe(self.ws_loop.stop)
-        if self.ws_stop is not None:
-            self.ws_stop.cancel()
+    def halt(self, timeout: float = 2.0):
+        """Stop the websocket service from inside its own event loop.
+
+        Cancelling ``ws_stop`` from this thread while stopping the loop in the
+        same breath -- what this used to do -- leaves ``_websocket_service``
+        suspended at ``await self.ws_stop`` forever: the loop stops before the
+        cancellation is ever delivered, so the ``async with
+        websocket_serve(...)`` block never exits and nothing closes the
+        listener. The coroutine is finalized later during GC, by which time the
+        loop has been closed by its own ``__del__``, and the ``Server.close()``
+        in ``__aexit__`` raises "Event loop is closed" out of a ``GeneratorExit``
+        -- an unraisable exception, which pytest reports and an operator sees as
+        noise at shutdown.
+
+        So the order matters: deliver the cancellation ON the loop thread, wait
+        for both service coroutines to unwind (that is what runs ``__aexit__``
+        and actually closes the socket), and only then stop the loop and join.
+        Bounded by *timeout* because this also runs from the SIGINT handler in
+        :meth:`run`, where a wedged shutdown must not cost the user the second
+        ^C that hard-quits.
+        """
+        loop = self.ws_loop
+        if loop is None or loop.is_closed():
+            return
+
+        def _cancel_stop():
+            # cancel() on a future that is already done is a no-op that
+            # returns False, so this needs no state check of its own.
+            if self.ws_stop is not None:
+                self.ws_stop.cancel()
+
+        if loop.is_running():
+            try:
+                loop.call_soon_threadsafe(_cancel_stop)
+            except RuntimeError:  # pragma: no cover - closed under us
+                pass
+            deadline = time.monotonic() + timeout
+            for fut in (self._ws_service, self._ws_sender):
+                if fut is None:
+                    continue
+                try:
+                    fut.result(max(0.0, deadline - time.monotonic()))
+                except (concurrent.futures.CancelledError,
+                        asyncio.CancelledError, TimeoutError):
+                    pass  # bounded on purpose; the loop stop below is the backstop
+                except Exception as err:
+                    self.app.logger.warning(
+                        'inspector websocket: shutdown raised %s: %s',
+                        err.__class__.__name__, err)
+        else:
+            # No loop thread to deliver it -- either the service was never
+            # started, or its thread has not reached run_forever yet. Cancel
+            # here; a service that starts afterwards sees a cancelled ws_stop
+            # and declines to open the listener.
+            _cancel_stop()
+        try:
+            # Also arms a loop that has not started running yet: the stop is
+            # the first thing it will do.
+            loop.call_soon_threadsafe(loop.stop)
+        except RuntimeError:  # pragma: no cover - already stopped
+            pass
+        if self._ws_thread is not None:
+            # The loop is closed by the thread on its way out, so joining is
+            # also what makes it safe to reuse this DashControl.
+            self._ws_thread.join(timeout)
+            self._ws_thread = None
+        elif not loop.is_running():
+            # Nobody else will: halt() without a serve_websockets().
+            loop.close()
+        # `_ws_service` / `_ws_sender` are deliberately left in place: they are
+        # done by now, and holding the finished futures is what lets a caller
+        # (or a test) see HOW the service ended. serve_websockets() replaces
+        # them on a restart.
 
     def callback(self, *args, **kwargs) -> Callable:
         """Pass-through decorator for callback handler definitions - pull from server"""

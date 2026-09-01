@@ -14,8 +14,10 @@
  *   limitations under the License.
  *******************/
 
+#include <math.h>      /* NAN, for an unparseable probe answer */
 #include <string.h>
 #include <pthread.h>
+#include <unistd.h>   /* close, for the custom run loop */
 
 #include "processes/processes.h"
 #include "negotiation/negotiation.h"
@@ -29,6 +31,11 @@
 #include "negotiation/neg_proc_priv.h"
 #include "identity/id_proc_priv.h"  /* identity_get_peer_tier */
 #include "utilities/freshness.h"
+#include "utilities/util.h"       /* at_strlcpy */
+#include "bootstrap/bootstrap_capabilities.h"  /* known-answer probe verifiers */
+#include "bootstrap/bootstrap_worker.h"        /* probe allocation + window */
+#include "config/configuration.h"             /* config_t, for our own identity */
+#include "reputation/tx_channel.h"             /* evidence channels */
 
 DEFINE_ERROR(ENEG_NOPEERS, "No capable peers available");
 
@@ -108,6 +115,12 @@ static struct {
      * spends an outstanding request. C twin of Python
      * NegotiationProcess.freshness; see utilities/freshness.h. */
     freshness_t freshness;
+    /* The bootstrap corpus's prober state: window bookkeeping, per-peer and
+     * per-capability probe counts, and the continuous-probe rate limit. Python
+     * keeps this in a BootstrapWorker process of its own; here it rides this
+     * process, which is the one that owns the announce path the worker needs.
+     * See _bootstrap_tick. */
+    bootstrap_worker_t bootstrap;
 } neg_state;
 
 static void _ensure_init(void)
@@ -125,6 +138,10 @@ static void _ensure_init(void)
         map_init(&neg_state.own_caps_by_proc);
         map_init(&neg_state.peer_tiers);
         map_init(&neg_state.cap_required_tiers);
+        /* Reads AT_BOOTSTRAP_{DURATION_SEC,PAIRS,SEED,DISABLED}; marks all
+         * three capabilities registered, which matches the static capability
+         * table this runtime advertises them from. */
+        bootstrap_worker_init(&neg_state.bootstrap);
         freshness_init(&neg_state.freshness, "negotiation", NULL);
         neg_state.initialized = true;
     }
@@ -393,6 +410,23 @@ static json_t *_task_to_json(const task_t *task)
      * other users of this helper pass whatever the task already carried, and
      * nothing reads it there. Field 12 of negotiation/task.proto. */
     json_object_set_new(j, "seq",             json_integer((json_int_t)task->seq));
+    /* Keyword arguments, as a real JSON object rather than a quoted string:
+     * the invitation is what carries a probe's challenge to the responder, and
+     * an object is what Python's TaskParameters.kwargs serializes to. Omitted
+     * entirely when empty, so a task with no arguments looks exactly as it did
+     * before the field existed. A blob that does not parse is dropped rather
+     * than emitted as a string -- a responder reading `kwargs` as an object
+     * would find a string there and silently see no arguments, which for a
+     * probe means computing the wrong answer and being scored for it. */
+    if (task->kwargs_json[0] != '\0')
+    {
+        json_error_t jerr;
+        json_t *kw = json_loads(task->kwargs_json, 0, &jerr);
+        if (kw && json_is_object(kw))
+            json_object_set_new(j, "kwargs", kw);
+        else if (kw)
+            json_decref(kw);
+    }
 
     return j;
 }
@@ -455,6 +489,26 @@ static int _task_from_json(const json_t *j, task_t *task)
     json_t *j_seq = json_object_get(j, "seq");
     if (j_seq && json_is_integer(j_seq))
         task->seq = (int64_t)json_integer_value(j_seq);
+
+    /* Keyword arguments back into their compact-JSON carrier. Absent leaves
+     * the caller's memset "" -- no arguments. A blob that does not fit is
+     * dropped whole, not truncated: half a JSON object parses as nothing and
+     * would be a worse lie than an honest absence (the executor then produces
+     * no result and the requestor scores an empty return, rather than the
+     * executor answering a corrupted challenge). */
+    task->kwargs_json[0] = '\0';
+    json_t *j_kwargs = json_object_get(j, "kwargs");
+    if (j_kwargs && json_is_object(j_kwargs) && json_object_size(j_kwargs) > 0)
+    {
+        char *dumped = json_dumps(j_kwargs, JSON_COMPACT | JSON_SORT_KEYS);
+        if (dumped != NULL)
+        {
+            if (strlen(dumped) < sizeof(task->kwargs_json))
+                at_strlcpy(task->kwargs_json, dumped,
+                           sizeof(task->kwargs_json));
+            free(dumped);
+        }
+    }
 
     return 0;
 }
@@ -519,53 +573,44 @@ static bool _peer_has_capability(const process_t *proc, const char *peer_uuid_st
  * wired (probes.h is included via processes.c) — just add focused
  * `probes_counter` calls inside each handler when interesting branches
  * fire (haggle-vs-accept, refuse-with-reason, etc.). */
-static bool handle_start_task(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+/* Announce @p task to the peers that can run it, retaining a tracker for the
+ * results. Split out of handle_start_task so the probe dispatcher can start a
+ * task directly rather than posting a message to this very process and waiting
+ * a cadence for it to come back around. Caller holds neg_state.lock.
+ *
+ * @p target_uuid, when non-zero, narrows the fan-out to one peer. */
+static void _announce_task_locked(const process_t *proc, task_t *task,
+                                  const uuid_t target_uuid)
 {
-    (void)queues;
-    net_msg_t *nmsg = &msg->info.net_msg;
-    log_info(proc->logger, "Negotiation: start task from %s\n", nmsg->from_whom.nickname);
-
-    pthread_mutex_lock(&neg_state.lock);
-
-    /* Deserialize task from JSON payload */
-    json_t *j = NULL;
-    task_t task;
-    memset(&task, 0, sizeof(task));
-
-    bool have_task = false;
-    if (nmsg->obj && nmsg->len > 0 && net_msg_unpack_json(nmsg, &j) == 0 && j)
-    {
-        if (_task_from_json(j, &task) == 0)
-            have_task = true;
-        json_decref(j);
-    }
-
-    if (!have_task)
-    {
-        /* Fallback: generate a new UUID for this task */
-        uuid_generate(task.uuid);
-        uuid_copy(task.requestor_uuid, nmsg->from_whom.uuid);
-    }
-
     /* Store task in proposed_tasks keyed by task UUID string */
     char task_uuid_str[UUID_STRING_LEN + 1] = {0};
-    uuid_unparse_lower(task.uuid, task_uuid_str);
+    uuid_unparse_lower(task->uuid, task_uuid_str);
 
     task_t *task_copy = (task_t *)malloc(sizeof(task_t));
     if (task_copy)
     {
-        memcpy(task_copy, &task, sizeof(task_t));
+        memcpy(task_copy, task, sizeof(task_t));
         data_t *task_dat = object_ptr_data(task_copy, sizeof(task_t));
         map_set(&neg_state.proposed_tasks, task_uuid_str, task_dat);
     }
 
-    /* Create a task tracker for result collection (expect num_peers responses) */
+    /* Create a task tracker for result collection. `expected` is corrected to
+     * the number actually invited once the fan-out below has filtered by
+     * capability (and by an addressed target); seeding it from num_peers and
+     * leaving it there means a task whose capability only some peers hold
+     * never reaches its expected count, so handle_results never forwards and
+     * my_tasks grows forever. */
     task_tracker_t *tracker = NULL;
     peers_read_lock(proc);
     int expected = (int)proc->protocol.num_peers;
     peers_read_unlock(proc);
-    if (task_tracker_create(&tracker, task.uuid, expected) == 0 && tracker)
+    if (task_tracker_create(&tracker, task->uuid, expected) == 0 && tracker)
     {
+        /* Retain what we asked for, before the announcement goes out. This is
+         * the requestor's own record and the only thing the scorer in
+         * handle_results will trust -- see task_tracker_t and R+D.md §12.7. */
+        task_tracker_set_request(tracker, task->capability.name,
+                                 task->kwargs_json);
         data_t *trk_dat = object_ptr_data(tracker, sizeof(task_tracker_t));
         map_set(&neg_state.my_tasks, task_uuid_str, trk_dat);
     }
@@ -577,18 +622,30 @@ static bool handle_start_task(const process_t *proc, directory_t *queues, generi
      * act look like N. A later re-announce (handle_haggle) draws a new, higher
      * number, which is what distinguishes it from a replay of this one.
      * Mirrors Python NegotiationProcess.start_task. */
-    task.seq = freshness_stamp(&neg_state.freshness, proc->logger);
-    if (task.seq <= 0)
+    task->seq = freshness_stamp(&neg_state.freshness, proc->logger);
+    if (task->seq <= 0)
     {
         log_warn(proc->logger,
                  "Negotiation: no freshness sequence; not announcing task %s\n",
                  task_uuid_str);
-        pthread_mutex_unlock(&neg_state.lock);
-        return true;
+        return;
     }
 
     /* Build JSON payload for invitation */
-    json_t *invite_json = _task_to_json(&task);
+    json_t *invite_json = _task_to_json(task);
+
+    /* An addressed start narrows the fan-out to one peer. A probe has to be
+     * able to say "this peer": fanned out, an invitation is answered by
+     * whichever peer replies first, so a broadcast cannot express a directed
+     * challenge and a slow peer is never probed at all. Mirrors Python
+     * start_task's `to_whom` handling; a zero target means the ordinary
+     * announce-to-all. A named peer that turns out not to hold the capability
+     * is invited to nothing -- deliberately not widened back to everyone,
+     * which would score the wrong peer. */
+    uuid_t zero_uuid;
+    uuid_clear(zero_uuid);
+    bool addressed = (target_uuid != NULL
+                      && uuid_compare(target_uuid, zero_uuid) != 0);
 
     /* Send invitation to capable peers */
     int invited = 0;
@@ -598,8 +655,11 @@ static bool handle_start_task(const process_t *proc, directory_t *queues, generi
         char peer_uuid_str[UUID_STRING_LEN + 1] = {0};
         uuid_unparse_lower(proc->protocol.peers[i].uuid, peer_uuid_str);
 
+        if (addressed && uuid_compare(proc->protocol.peers[i].uuid, target_uuid) != 0)
+            continue;
+
         /* Filter by capability if peer_capabilities map is available */
-        if (!_peer_has_capability(proc, peer_uuid_str, task.capability.name))
+        if (!_peer_has_capability(proc, peer_uuid_str, task->capability.name))
             continue;
 
         generic_msg_t invite = {0};
@@ -622,10 +682,74 @@ static bool handle_start_task(const process_t *proc, directory_t *queues, generi
     if (invite_json)
         json_decref(invite_json);
 
+    /* Correct the tracker to what was actually invited, so completion is
+     * reachable. Seeded from num_peers and left there, a task whose capability
+     * only some peers hold never reaches its expected count: handle_results
+     * never forwards, never scores, and my_tasks grows forever.
+     *
+     * The tracker is kept even when nothing was invited, which is what Python
+     * does (start_task registers it before the participant check and leaves it
+     * on the no-peers path). It is also why a stray `report results` for a
+     * task nobody was invited to still scores -- true of both runtimes, and
+     * recorded in ISSUES.md rather than changed here, since it is a question
+     * about who may answer an invitation and not about this scoring path. */
+    if (tracker != NULL)
+        tracker->expected = invited;
+
     if (invited == 0)
         log_warn(proc->logger, "Negotiation: no capable peers found for task %s\n",
                  task_uuid_str);
+}
 
+/****************************
+ * Handler: handle_start_task (spawn task) — NEG_PROTO_START
+ * Deserialize task JSON, then announce it (see _announce_task_locked).
+ ****************************/
+
+/* Frama-C: skipped —
+ * negotiation_run + handlers + helpers: [solver-timeout] memcpy of
+ * public_identity_t + JSON serialization + complex peer-loop msg-build
+ * cascades.
+ */
+/*@
+  requires \valid(proc);
+  requires \valid(queues);
+  requires \valid(msg);
+  requires proc->logger == \null || \valid(proc->logger);
+*/
+static bool handle_start_task(const process_t *proc, directory_t *queues,
+                              generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    log_info(proc->logger, "Negotiation: start task from %s\n",
+             nmsg->from_whom.nickname);
+
+    /* Deserialize task from JSON payload */
+    json_t *j = NULL;
+    task_t task;
+    memset(&task, 0, sizeof(task));
+
+    bool have_task = false;
+    if (nmsg->obj && nmsg->len > 0 && net_msg_unpack_json(nmsg, &j) == 0 && j)
+    {
+        if (_task_from_json(j, &task) == 0)
+            have_task = true;
+        json_decref(j);
+    }
+
+    if (!have_task)
+    {
+        /* Fallback: generate a new UUID for this task */
+        uuid_generate(task.uuid);
+        uuid_copy(task.requestor_uuid, nmsg->from_whom.uuid);
+    }
+
+    /* `to_whom` on a start message is the peer the requestor wants, not a
+     * destination for this message -- it is already local. Mirrors Python
+     * start_task reading `message.to_whom`. */
+    pthread_mutex_lock(&neg_state.lock);
+    _announce_task_locked(proc, &task, nmsg->to_whom.uuid);
     pthread_mutex_unlock(&neg_state.lock);
     return true;
 }
@@ -1478,6 +1602,135 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
 }
 
 /****************************
+ * Requestor-side scoring of a returned task result (R+D.md §12.7 / §12.8)
+ ****************************/
+
+/* Pull the probe challenge out of the requestor's OWN retained kwargs. Never
+ * from the responder's reply: see task_tracker_t. @p payload_buf backs the
+ * echo token, because probe_challenge_t holds a non-owning pointer. */
+static void _challenge_from_kwargs(const char *kwargs_json,
+                                   char *payload_buf, size_t payload_len,
+                                   probe_challenge_t *out)
+{
+    out->nonce = 0;
+    out->payload = NULL;
+    payload_buf[0] = '\0';
+    if (kwargs_json == NULL || kwargs_json[0] == '\0')
+        return;
+    json_error_t jerr;
+    json_t *kw = json_loads(kwargs_json, 0, &jerr);
+    if (kw == NULL)
+        return;
+    if (json_is_object(kw))
+    {
+        json_t *j_nonce = json_object_get(kw, "nonce");
+        if (j_nonce && json_is_integer(j_nonce))
+            out->nonce = (long)json_integer_value(j_nonce);
+        json_t *j_payload = json_object_get(kw, "payload");
+        if (j_payload && json_is_string(j_payload))
+        {
+            at_strlcpy(payload_buf, json_string_value(j_payload), payload_len);
+            out->payload = payload_buf;
+        }
+    }
+    json_decref(kw);
+}
+
+/* Score one returned result and name the evidence channel it came from.
+ * Exported (declared in negotiation.h) so tests and the conformance adapter
+ * pin the same function production uses, rather than a copy of its rules.
+ *
+ * Mirrors the requestor-side branch of Python automate.py's TaskResult
+ * handling, minus the ZKP arm: this runtime attaches no proofs, so it is
+ * always Python's "ZKP unavailable" case -- score on the fact the task came
+ * back with something, and say `task_outcome` so that an absent proof
+ * infrastructure does not read as a failed one.
+ *
+ * A known-answer probe is checked FIRST and subsumes the completion score: for
+ * a capability whose right answer we already hold, "it came back" is not the
+ * question. A tampered or fabricated answer lands on 0.1 here rather than the
+ * 0.3 a dud task gets, and carries the `probe` channel so "failed a challenge
+ * whose answer we knew" stays distinguishable downstream from "scored badly on
+ * a task" when both are the same number. */
+double negotiation_score_task_result(const char *cap_name,
+                                    const char *kwargs_json,
+                                    const char *result_str, size_t result_len,
+                                    const char **channel_out)
+{
+    const char *channel_sink = NULL;
+    if (channel_out == NULL)
+        channel_out = &channel_sink;
+    if (cap_name != NULL && cap_name[0] != '\0' && is_probe_capability(cap_name))
+    {
+        char payload_buf[TASK_KWARGS_LEN + 1];
+        probe_challenge_t challenge;
+        _challenge_from_kwargs(kwargs_json, payload_buf,
+                               sizeof(payload_buf), &challenge);
+        /* A numeric answer arrives as its decimal text (at.handshake,
+         * at.time-attest). A reply that is not a number at all becomes NaN,
+         * not 0: the verifiers treat non-finite as "unparseable" and score it
+         * 0.1, where 0.0 would be a finite wrong answer -- and for
+         * at.time-attest a finite 0 is "forgivable drift" (0.5), so parsing
+         * prose as zero would grade a nonsense reply more kindly than a late
+         * clock. Python's verifiers reach 0.1 through float() raising on the
+         * same input; this is that behaviour in C. */
+        double result_num = NAN;
+        if (result_str != NULL && result_str[0] != '\0')
+        {
+            char *parse_end = NULL;
+            double parsed = strtod(result_str, &parse_end);
+            /* Whole-string parse only: "42abc" is not 42. */
+            if (parse_end != NULL && *parse_end == '\0')
+                result_num = parsed;
+        }
+        double score = 0.0;
+        if (verify_bootstrap_result(cap_name, result_num, result_str,
+                                    &challenge, 0.0, &score))
+        {
+            *channel_out = TX_CHANNEL_PROBE;
+            return score;
+        }
+    }
+    *channel_out = TX_CHANNEL_TASK_OUTCOME;
+    return (result_str != NULL && result_len > 0) ? 0.8 : 0.3;
+}
+
+/* Submit a requestor-side score to the reputation process, which resolves our
+ * own identity as the proposer and starts a Paxos round (rep_proc.c
+ * _handle_local_tx_score). Mirrors automate.py putting a TransactionScore on
+ * the reputation queue. The capability name rides along so the reputation
+ * process can apply the capability's configured transaction_weight instead of
+ * the weight-1 default. */
+static void _submit_tx_score(const process_t *proc, const uuid_t task_uuid,
+                             double score, const char *capability_name,
+                             const char *channel, const uuid_t subject_uuid)
+{
+    generic_msg_t msg = {0};
+    msg.type = TRANSACTION_SCORE;
+    msg.size = sizeof(tx_score_msg_t);
+    uuid_copy(msg.info.tx_score.task_uuid, task_uuid);
+    /* peer_uuid is the SUBJECT -- the peer this score is ABOUT, not the
+     * proposer (the reputation process fills our own identity in for that,
+     * since it owns our half of the bilateral transaction). It is what lets a
+     * hard-channel refutation name the peer it accuses (R+D.md §12.8), and it
+     * is IPC-only, so a score that arrives from the wire can never carry one.
+     * Zero when the result is not attributable to a single peer. */
+    if (subject_uuid != NULL)
+        uuid_copy(msg.info.tx_score.peer_uuid, subject_uuid);
+    msg.info.tx_score.score = score;
+    if (capability_name != NULL)
+        at_strlcpy(msg.info.tx_score.capability_name, capability_name,
+                   sizeof(msg.info.tx_score.capability_name));
+    if (channel != NULL)
+        at_strlcpy(msg.info.tx_score.channel, channel,
+                   sizeof(msg.info.tx_score.channel));
+    if (messaging_send("reputation", TRANSACTION_SCORE, &msg, false) != 0)
+        log_warn(proc->logger,
+                 "Negotiation: could not submit score %.2f (via %s)\n",
+                 score, (channel != NULL) ? channel : "-");
+}
+
+/****************************
  * Handler: handle_results (report results) — NEG_PROTO_RESULT
  * Collect result, forward to main process when all results arrive.
  ****************************/
@@ -1545,12 +1798,44 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
                           "Negotiation: task %s collected %d/%d results\n",
                           task_uuid_str, collected, tracker->expected);
 
-                /* If all expected results have arrived, forward to main process */
+                /* If all expected results have arrived, score and forward.
+                 *
+                 * Scored here rather than in the main process, where Python
+                 * scores it: the judgment needs what the requestor asked for,
+                 * and this is the process that retained it. Carrying the
+                 * capability name and the challenge onward through
+                 * task_result_msg_t would have meant widening an IPC struct
+                 * that the CFFI mirror also declares, to move a fact that is
+                 * already in hand here. One score per completed task, from
+                 * the last result to arrive, which is what Python's
+                 * handle_results forwards. */
                 if (collected >= tracker->expected)
                 {
                     log_info(proc->logger,
                              "Negotiation: task %s complete — forwarding results\n",
                              task_uuid_str);
+
+                    const char *channel = TX_CHANNEL_TASK_OUTCOME;
+                    double score = negotiation_score_task_result(
+                        tracker->capability_name, tracker->kwargs_json,
+                        (const char *)result_data, result_len, &channel);
+                    log_info(proc->logger,
+                             "Negotiation: task %s scored %.2f (cap %s, via %s)\n",
+                             task_uuid_str, score,
+                             tracker->capability_name[0] != '\0'
+                                 ? tracker->capability_name : "-",
+                             channel);
+                    /* The executor, from the AUTHENTICATED sender of the
+                     * reply -- and only for a single-participant task: the
+                     * results of a fan-out arrive from several peers and only
+                     * the last to answer carries the object that gets scored,
+                     * so naming it would attribute the whole task's outcome to
+                     * whoever happened to reply last. Mirrors Python
+                     * TaskResult.attach_executor. */
+                    _submit_tx_score(proc, task_uuid, score,
+                                     tracker->capability_name, channel,
+                                     (tracker->expected == 1)
+                                         ? nmsg->from_whom.uuid : NULL);
 
                     /* Build TASK_RESULT message to the main (requestor) process */
                     generic_msg_t result_msg;
@@ -1582,6 +1867,342 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
 
     pthread_mutex_unlock(&neg_state.lock);
     return true;
+}
+
+/****************************
+ * Worker side: run accepted jobs and report their results
+ *
+ * Until this existed, `job_queue_pop` had no caller in the whole tree: an
+ * accepted invitation was pushed onto the task stack and sat there. No C node
+ * ever executed a task, so none ever reported a result, and the requestor-side
+ * scoring above had nothing to score. That is what "no C node scores a probe
+ * end to end" meant (R+D.md §12.7).
+ ****************************/
+
+/* This node's own identity, from the process's config map. Same shape as the
+ * reputation process's _resolve_self_uuid. */
+static const identity_t *_self_identity(const process_t *proc)
+{
+    if (proc == NULL || proc->configs == NULL)
+        return NULL;
+    data_t *id_dat = NULL;
+    char id_key[] = "identity";
+    if (map_get(proc->configs, id_key, &id_dat) != 0 || id_dat == NULL)
+        return NULL;
+    config_t *id_cfg = NULL;
+    if (data_object_ptr(id_dat, (void **)&id_cfg) != 0 || id_cfg == NULL
+        || id_cfg->data_struct == NULL)
+        return NULL;
+    return (const identity_t *)id_cfg->data_struct;
+}
+
+/* Copy the peer record for @p peer_uuid into @p out. Takes the peers read
+ * lock itself, so callers must not already hold it. */
+static bool _peer_by_uuid(const process_t *proc, const uuid_t peer_uuid,
+                          public_identity_t *out)
+{
+    bool found = false;
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++)
+    {
+        if (uuid_compare(proc->protocol.peers[i].uuid, peer_uuid) == 0)
+        {
+            memcpy(out, &proc->protocol.peers[i], sizeof(public_identity_t));
+            found = true;
+            break;
+        }
+    }
+    peers_read_unlock(proc);
+    return found;
+}
+
+/* Report a finished job's answer to the peer that asked for it. Payload keys
+ * are the ones handle_results reads (`task_uuid`, `result_data`), so a C
+ * requestor and a C worker agree; Python serializes a TaskResult as a
+ * Configuration dump instead, which is a pre-existing divergence in this verb's
+ * payload shape and not one this path introduces. */
+static void _report_result(const process_t *proc, const task_t *task,
+                           const char *result)
+{
+    public_identity_t requestor;
+    memset(&requestor, 0, sizeof(requestor));
+    if (!_peer_by_uuid(proc, task->requestor_uuid, &requestor))
+    {
+        char req_str[UUID_STRING_LEN + 1] = {0};
+        uuid_unparse_lower(task->requestor_uuid, req_str);
+        log_warn(proc->logger,
+                 "Negotiation: cannot report results, requestor %s unknown\n",
+                 req_str);
+        return;
+    }
+
+    char task_uuid_str[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(task->uuid, task_uuid_str);
+
+    json_t *j = json_object();
+    if (j == NULL)
+    {
+        log_error(proc->logger, "Negotiation: json_object OOM (report)\n");
+        return;
+    }
+    json_object_set_new(j, "task_uuid", json_string(task_uuid_str));
+    /* Absent rather than null when the capability produced nothing: the
+     * requestor's scorer reads a missing result as an empty return (0.3),
+     * which is what an execution that failed deserves. */
+    if (result != NULL && result[0] != '\0')
+        json_object_set_new(j, "result_data", json_string(result));
+
+    generic_msg_t out = {0};
+    out.type = NET_MESSAGE;
+    strncpy(out.info.net_msg.process, "negotiation", PROC_NAME_LEN);
+    out.info.net_msg.function = NEG_PROTO_RESULT;
+    out.info.net_msg.encrypt = true;
+    memcpy(&out.info.net_msg.to_whom, &requestor, sizeof(public_identity_t));
+    strncpy(out.info.net_msg.return_to, "negotiation", PROC_NAME_LEN);
+    net_msg_pack_json(&out.info.net_msg, j);
+    json_decref(j);
+
+    messaging_send("network", NET_MESSAGE, &out, false);
+}
+
+/* Execute every job whose start time has arrived, report each answer, and
+ * submit our own (executor) half of the bilateral transaction.
+ *
+ * Executed inline on the process loop rather than on a thread: these
+ * capabilities are pure functions of their arguments, and a thread per job
+ * would need a completion channel back to this loop for no gain. A capability
+ * that blocks belongs behind `task_run`'s detached-thread path, which stays as
+ * it was for the fire-and-forget shape.
+ *
+ * The 0.9 executor score mirrors automate.py's `_handle_results`: it is our
+ * claim to have done the work, and it is the requestor's own score for the
+ * same task that decides what the work was worth. */
+static void _drain_task_stack(const process_t *proc)
+{
+    time_t now_sec = time(NULL);
+    for (;;)
+    {
+        job_t job;
+        memset(&job, 0, sizeof(job));
+        bool have_job = false;
+
+        pthread_mutex_lock(&neg_state.lock);
+        job_t peek;
+        memset(&peek, 0, sizeof(peek));
+        /* Peek before popping: a job scheduled for later must stay queued,
+         * and the queue is start-time ordered, so the earliest not being due
+         * means none is. */
+        if (job_queue_min(&neg_state.task_stack, &peek) == 0
+            && peek.start_time <= now_sec
+            && job_queue_pop(&neg_state.task_stack, &job) == 0)
+            have_job = true;
+        pthread_mutex_unlock(&neg_state.lock);
+
+        if (!have_job)
+            break;
+
+        char task_uuid_str[UUID_STRING_LEN + 1] = {0};
+        uuid_unparse_lower(job.task.uuid, task_uuid_str);
+
+        /* A node with AT_BOOTSTRAP_DISABLED advertises no probe capability, so
+         * it should not answer one either -- an invitation that arrived before
+         * the peer's capability view caught up is dropped rather than
+         * answered. */
+        if (is_probe_capability(job.task.capability.name)
+            && !bootstrap_capabilities_enabled())
+        {
+            log_debug(proc->logger,
+                      "Negotiation: bootstrap disabled; dropping job %s (%s)\n",
+                      task_uuid_str, job.task.capability.name);
+            continue;
+        }
+
+        capability_t *cap = find_capability(job.task.capability.name);
+        if (cap == NULL)
+        {
+            log_warn(proc->logger,
+                     "Negotiation: accepted job %s names unknown capability "
+                     "'%s'; reporting no result\n",
+                     task_uuid_str, job.task.capability.name);
+            _report_result(proc, &job.task, NULL);
+            continue;
+        }
+
+        char result[CAP_RESULT_LEN + 1] = {0};
+        int rc = capability_execute_result(cap, job.task.kwargs_json,
+                                          result, sizeof(result));
+        if (rc != 0)
+        {
+            /* No result-producing entry point (the fire-and-forget shape) or
+             * the capability failed. Run the void form if there is one, so a
+             * legacy capability still does its work, and report nothing.
+             *
+             * The requestor then scores that as an empty return (0.3), which
+             * is worth being explicit about because it is a judgment and not
+             * an accident: a capability that cannot answer leaves the
+             * requestor with nothing, and the alternative -- staying silent --
+             * leaves it waiting on a tracker that never completes. Reporting
+             * an empty result is the honest half of a bad trade. No capability
+             * in the tree is in this shape today (`data` declares neither
+             * entry point and does its real work as a subscription, not a
+             * task), so this is the path for a future one. */
+            if (cap->function != NULL)
+                task_run(&job.task);
+            log_debug(proc->logger,
+                      "Negotiation: job %s (%s) produced no result (rc=%d)\n",
+                      task_uuid_str, job.task.capability.name, rc);
+            _report_result(proc, &job.task, NULL);
+            continue;
+        }
+
+        log_info(proc->logger, "Negotiation: job %s (%s) done\n",
+                 task_uuid_str, job.task.capability.name);
+        _report_result(proc, &job.task, result);
+        /* Executor side, scoring our own completion: no subject, and none
+         * needed -- task_outcome is not slash-eligible. */
+        _submit_tx_score(proc, job.task.uuid, 0.9, job.task.capability.name,
+                         TX_CHANNEL_TASK_OUTCOME, NULL);
+    }
+}
+
+/****************************
+ * Prober side: the bootstrap corpus, during the window and after it
+ *
+ * Python runs this as its own BootstrapWorker process, which posts a `start`
+ * message onto the negotiation queue. Here it rides the negotiation loop
+ * directly: the sink it needs is the announce path, and this is the process
+ * that owns it. Same probes, same allocation rules, one less process.
+ ****************************/
+
+/* Context for the two emit sinks below. */
+typedef struct {
+    const process_t *proc;
+    size_t peer_count;
+} probe_ctx_t;
+
+/* Build and announce one bootstrap task. @p target_index, when >= 0, addresses
+ * a single peer (a probe); < 0 fans out to every capable peer (a window pair).
+ * Takes neg_state.lock, so the caller must not hold it. */
+static bool _emit_bootstrap_task(const probe_ctx_t *ctx, const char *cap_name,
+                                 long nonce, const char *echo_payload,
+                                 int target_index)
+{
+    const process_t *proc = ctx->proc;
+    const identity_t *self = _self_identity(proc);
+
+    task_t task;
+    memset(&task, 0, sizeof(task));
+    uuid_generate(task.uuid);
+    if (self != NULL)
+        uuid_copy(task.requestor_uuid, self->uuid);
+    at_strlcpy(task.capability.name, cap_name, sizeof(task.capability.name));
+    task.flexible = true;
+    /* Now, and briefly: a probe that a peer schedules for later is a probe
+     * whose answer arrives after the question stopped being interesting. */
+    time_t now_sec = time(NULL);
+    struct tm *tm_ptr = gmtime(&now_sec);
+    if (tm_ptr != NULL)
+        memcpy(&task.when, tm_ptr, sizeof(struct tm));
+    task.duration.days = 0;
+    task.duration.seconds = 1;
+    task.timeout = 30;
+
+    /* The challenge. This is the requestor's copy and the only one that will
+     * be trusted when the answer comes back; _announce_task_locked hands it to
+     * the tracker. Keys match Python BootstrapWorker._build_task_args, because
+     * the responder reads them by name.
+     *
+     * Built through jansson rather than printf'd: the payload is a generated
+     * token today, but hand-interpolating a string into JSON is the shape that
+     * breaks the moment one contains a quote or a backslash, and a malformed
+     * challenge is a probe that scores an honest peer 0.1. */
+    json_t *kw = json_object();
+    if (kw != NULL)
+    {
+        if (strcmp(cap_name, "at.handshake") == 0)
+            json_object_set_new(kw, "nonce", json_integer((json_int_t)nonce));
+        else if (echo_payload != NULL && echo_payload[0] != '\0')
+            json_object_set_new(kw, "payload", json_string(echo_payload));
+        if (json_object_size(kw) > 0)
+        {
+            char *dumped = json_dumps(kw, JSON_COMPACT | JSON_SORT_KEYS);
+            if (dumped != NULL)
+            {
+                if (strlen(dumped) < sizeof(task.kwargs_json))
+                    at_strlcpy(task.kwargs_json, dumped,
+                               sizeof(task.kwargs_json));
+                free(dumped);
+            }
+        }
+        json_decref(kw);
+    }
+    /* A challenge that did not fit (or could not be built) would be sent as no
+     * challenge at all, and the responder would answer the default one and be
+     * scored wrong for it. Refuse to issue the probe instead. */
+    if (strcmp(cap_name, "at.time-attest") != 0 && task.kwargs_json[0] == '\0')
+    {
+        log_warn(proc->logger,
+                 "Negotiation: no challenge built for %s; probe not issued\n",
+                 cap_name);
+        return false;
+    }
+
+    uuid_t target;
+    uuid_clear(target);
+    if (target_index >= 0)
+    {
+        if ((size_t)target_index >= ctx->peer_count)
+            return false;
+        peers_read_lock(proc);
+        if ((size_t)target_index < proc->protocol.num_peers)
+            uuid_copy(target, proc->protocol.peers[target_index].uuid);
+        peers_read_unlock(proc);
+        /* The peer set can shrink between the worker's choice and this read;
+         * a probe with no addressee is not issued rather than fanned out. */
+        if (uuid_is_null(target))
+            return false;
+    }
+
+    pthread_mutex_lock(&neg_state.lock);
+    _announce_task_locked(proc, &task, target);
+    pthread_mutex_unlock(&neg_state.lock);
+    return true;
+}
+
+static bool _pair_emit(void *vctx, const char *cap_name, long nonce,
+                       const char *echo_payload)
+{
+    return _emit_bootstrap_task((const probe_ctx_t *)vctx, cap_name, nonce,
+                                echo_payload, -1);
+}
+
+static bool _probe_emit(void *vctx, const char *cap_name, size_t peer_index,
+                        long nonce, const char *echo_payload)
+{
+    return _emit_bootstrap_task((const probe_ctx_t *)vctx, cap_name, nonce,
+                                echo_payload, (int)peer_index);
+}
+
+/* One pass of the bootstrap worker: open the window when peers first appear,
+ * emit pairs while it is open, and issue rate-limited directed probes
+ * thereafter (bootstrap_worker_tick_all). */
+static void _bootstrap_tick(const process_t *proc)
+{
+    if (neg_state.bootstrap.disabled)
+        return;
+    peers_read_lock(proc);
+    size_t peer_count = proc->protocol.num_peers;
+    peers_read_unlock(proc);
+    if (peer_count == 0)
+        return;
+
+    probe_ctx_t ctx = { .proc = proc, .peer_count = peer_count };
+    struct timespec ts;
+    double now_sec = (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        ? (double)ts.tv_sec + (double)ts.tv_nsec / 1e9
+        : (double)time(NULL);
+    bootstrap_worker_tick_all(&neg_state.bootstrap, peer_count, now_sec,
+                              _pair_emit, _probe_emit, &ctx);
 }
 
 /****************************
@@ -1873,6 +2494,36 @@ int negotiation_run(process_t *proc, directory_t *queues, queue_id_t signal, log
     _ensure_init();
     negotiation_register_handlers(proc);
     proc->protocol.phase = 1;
-    return process_run(proc, queues, signal, logger);
+
+    /* Custom loop = process_loop plus the two periodic duties this process
+     * gained: running the jobs it accepted, and issuing the bootstrap
+     * corpus's challenges. Both sit at the documented "sub-process specific
+     * post-message activity" hook point, and both run on every pass rather
+     * than only when a message arrived -- process_loop `continue`s past that
+     * hook on an empty queue, which is exactly when a queued job is waiting.
+     * Same shape as data_source_run. */
+    process_ctx_t ctx = {0};
+    int err = process_setup(proc, signal, logger, &ctx);
+    if (err != 0)
+        return err;
+
+    while (keep_running(proc, &ctx.sig_q, logger))
+    {
+        sleep_until(proc, cadence);
+
+        generic_msg_t buf = {0};
+        int rerr = messaging_recv(&buf);
+        if (rerr != -1 && rerr != ENOMSG)
+            run_message_handlers(proc, queues, buf.type, &buf);
+
+        _drain_task_stack(proc);
+        _bootstrap_tick(proc);
+    }
+
+    if (ctx.fd1 > 0)
+        close(ctx.fd1);
+    if (ctx.fd2 > 0)
+        close(ctx.fd2);
+    return 0;
 }
 DECLARE_PROCESS(negotiation, neg_proc, negotiation_run);

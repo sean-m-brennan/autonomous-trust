@@ -22,6 +22,7 @@
 
 #include "task_priv.h"
 #include "negotiation/negotiation.h"
+#include "utilities/util.h"
 #include "negotiation/task.pb-c.h"
 
 typedef void * (*pthread_function_t)(void *);
@@ -68,6 +69,10 @@ int task_to_proto(task_t *msg, size_t size, void **data_ptr, size_t *data_len_pt
     proto.flexible = msg->flexible;
     proto.argc = (int32_t)msg->argc;
     proto.seq = msg->seq;
+    /* Field 13. protobuf-c requires a non-NULL char* for a string field;
+     * INIT leaves it pointing at "" so an empty kwargs_json is simply the
+     * default and costs no bytes on the wire. */
+    proto.kwargs_json = msg->kwargs_json;
 
     *data_len_ptr = autonomous_trust__core__protobuf__negotiation__task__get_packed_size(&proto);
     *data_ptr = smrt_create(*data_len_ptr);
@@ -103,6 +108,12 @@ int proto_to_task(uint8_t *data, size_t len, task_t *task)
      * handle_invite refuses. That is the wanted reading for a peer that has
      * not been rebuilt: refusal, not a lenient path. */
     task->seq = proto->seq;
+    /* An omitted field 13 unpacks as "" -- no keyword arguments, which is
+     * what every pre-field task meant. */
+    task->kwargs_json[0] = '\0';
+    if (proto->kwargs_json)
+        at_strlcpy(task->kwargs_json, proto->kwargs_json,
+                   sizeof(task->kwargs_json));
 
     autonomous_trust__core__protobuf__negotiation__task__free_unpacked(proto, NULL);
     return 0;

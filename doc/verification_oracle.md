@@ -257,6 +257,15 @@ under a rejected peer's recommendation, using the logged decisions and outcomes
 AT already keeps. Combined with a small deliberate exploration budget, this
 yields counterfactual evidence about peers whose advice was never followed.
 
+*Correction, 2026-08-21:* "the logged decisions AT already keeps" overstates
+what exists. AT does not choose among peers at all. A requestor announces a task
+to every capable peer and every peer that accepts is enrolled, so there is no
+rejected recommendation, no action selected from alternatives, and no propensity
+to divide by — the estimator has nothing to be off-policy about. This is a
+missing mechanism rather than a missing log, and the mechanism (a requestor
+selecting among willing peers) has consequences of its own for redundancy and
+for how bilateral history accumulates. R+D.md §12.7 carries the design.
+
 ### Self-consistency over a claim archive
 
 The cheapest oracle of all requires no peers, no physics, and no domain
@@ -317,6 +326,44 @@ Probe allocation is a best-arm-identification problem, not a uniform sampling
 problem. Spend probes where the posterior over a peer's quality is widest and
 the capability weight is highest.
 
+**Implemented, 2026-08-21, with one correction to the above.** The bootstrap
+corpus now probes throughout the relationship rather than only at cold start,
+allocating by the rule in this paragraph, and — the part that turned out to
+matter most — it now actually *checks the answers*. The known-answer verifiers
+had been present in both runtimes since the corpus shipped and were called by
+nothing, so the pattern this section treats as already-applied-at-cold-start was
+not applied at all: a peer that tampered with an echo scored what an honest peer
+scored. The anchor was nominal.
+
+The correction concerns the allocation rule as stated. "Widest posterior" is
+implemented as the UCB1 exploration term over per-peer probe counts, which is
+the honest reading given that probe *outcomes* are scored elsewhere and do not
+return to the prober; a Beta posterior would need feedback that does not exist
+yet. And "capability weight is highest" cannot be combined with the uncertainty
+term multiplicatively, which is the obvious implementation: because the UCB
+bonus falls off as the inverse square root of the count, weight times bonus
+allocates probes proportional to weight *squared*, so at a weight of 8 a light
+capability is not selected until the heavy one has been probed 64 times more.
+Capabilities are therefore allocated by weight over count, which settles at
+counts proportional to weight and keeps the whole corpus exercised. Peers and
+capabilities get different rules because they are different problems: for a peer
+there is a bad arm to identify, and for a capability there is only a budget to
+divide.
+
+**Both runtimes now score a probe end to end** (a later pass, same entry). The
+C side had three separate gaps rather than one: a serialized task carried no
+invocation arguments, so the challenge could not reach a responder; the C
+capability signature returns void, so an answer could not be collected even
+after the work ran; and nothing drained the queue of accepted jobs at all. All
+three are closed, and the C requestor now judges a reply against the challenge
+it retained and submits the score with its evidence channel. The scoring lives
+in C's negotiation process rather than its main process, because that is where
+that runtime keeps the requestor's record of what it asked — so what the
+conformance corpus pins across the two is the scoring *rules*, fed through each
+runtime's own scorer. See `doc/architecture/trust-tiers.md` §6 for the shape and
+R+D.md §12.7 for what remains, which is now the off-policy half and its
+dependency on AT having no peer-selection decision to be off-policy about.
+
 All of this presumes identity is costly. Without that, an adversary answers a
 bad reputation by acquiring a new one (Douceur, 2002), and the AT identity layer
 is what holds that door shut.
@@ -349,7 +396,44 @@ responses. A physics refutation should be able to demote a peer immediately; a
 drifting calibration score should decay it gradually; swarm disagreement should
 open a dispute rather than a penalty. Feeding them as separate evidence channels
 into the existing consensus keeps the tier machinery unchanged while making the
-demotion reason legible.
+demotion reason legible. The first two of those three responses are now wired;
+see below.
+
+**The channel, 2026-08-21.** `TransactionScore` now carries a `channel` naming
+which of these produced the score, on both runtimes and across the wire. The
+vocabulary is the build order below: `task_outcome` (the default), `physical`,
+`certificate`, `calibration`, `self_consistency`, `replication`,
+`swarm_disagreement`, plus `probe` from step 7. It is a closed set — an unknown
+spelling is refused rather than graded — and it is defined once per language, in
+`src/c/autonomous_trust/reputation/tx_channel.h` and the Python `TX_CHANNEL_*`
+twin.
+
+**Two of the three responses, 2026-09-01.** Also on both runtimes:
+
+- **Gradual versus decisive decay** is now a per-channel multiplier on the
+  consensus average, composed with the per-capability weight. `calibration` sits
+  at the baseline, exactly as the paragraph above asks; a verdict that needs no
+  history at all (`physical`, `certificate`, `self_consistency`) counts triple;
+  evidence corroborated by construction (`replication`, `probe`) counts double.
+- **Immediate demotion on a hard refutation** reuses the slash path rather than
+  inventing a mechanism. A defection-grade score on one of the three
+  falsification channels *proposes* a slash, which the existing quorum
+  co-signature accepts or refuses, pinning the peer below the tier-1 floor —
+  demotion, not exclusion. The slash reason names the channel
+  (`refuted_physical` and its siblings), and because the reason is signed, that
+  claim cannot be altered in flight.
+
+Both apply only to evidence the scoring node produced itself. The scorer picks
+its own tag, so honouring a remote peer's channel would let any peer treble the
+weight of a score it fabricated against any other, or attach an accusation to it.
+A channel that arrived from the wire stays legibility.
+
+**Still missing: the dispute.** Swarm disagreement should open one rather than
+levy a penalty, and there is no dispute machinery in either runtime — so it sits
+at the baseline multiplier and levies an ordinary penalty. Weighting it like a
+hard channel would be precisely the wrong reading of this section, since a
+majority is not an oracle. This is also the joint where step 6's bisection dispute
+resolution would land. See R+D.md §12.8 for the forks settled at each step.
 
 ## On LLMs
 
