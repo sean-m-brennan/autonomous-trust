@@ -767,12 +767,24 @@ for src in "${files[@]}"; do
             # allocation postconditions; job_queue_push/pop: struct assignment
             # in loops causes solver OOM (9 memory maps per 154-byte job_t);
             # task_tracker_set_result: uuid_unparse + bytes_data + map_set
-            skip_fns="job_queue_create,job_queue_push,job_queue_pop,task_tracker_create,task_tracker_set_result" ;;
+            # task_tracker_set_request: at_strlcpy into two fixed buffers, same
+            # string-bounds shape WP cannot discharge for its neighbours.
+            skip_fns="job_queue_create,job_queue_push,job_queue_pop,task_tracker_create,task_tracker_set_result,task_tracker_set_request" ;;
         neg_proc.c)
             # negotiation_run + handlers + helpers: [solver-timeout] memcpy of
             # public_identity_t (9 sites) + JSON serialization + capability
             # iteration + complex peer-loop msg-build cascades.
-            skip_fns="negotiation_run,_build_reply,_task_to_json,_task_from_json,_peer_has_capability,handle_start_task,handle_invite,handle_haggle,handle_accept,handle_stat_req,handle_results" ;;
+            # _announce_task_locked: the fan-out lifted out of handle_start_task,
+            # same peer-loop msg-build cascade.
+            # Requestor-side scoring + worker-side job drain (R+D.md §12.7):
+            # [serialization] _challenge_from_kwargs / negotiation_score_task_result
+            # (jansson parse + strtod), [solver-timeout] _submit_tx_score /
+            # _report_result / _self_identity / _peer_by_uuid (config-map walk +
+            # public_identity_t memcpy + messaging_send), _drain_task_stack
+            # ([func-ptr] indirect capability call), and the prober sinks
+            # _emit_bootstrap_task / _pair_emit / _probe_emit / _bootstrap_tick
+            # ([func-ptr] through bootstrap_emit_fn).
+            skip_fns="negotiation_run,_build_reply,_task_to_json,_task_from_json,_peer_has_capability,_announce_task_locked,handle_start_task,handle_invite,handle_haggle,handle_accept,handle_stat_req,handle_results,_challenge_from_kwargs,negotiation_score_task_result,_submit_tx_score,_self_identity,_peer_by_uuid,_report_result,_drain_task_stack,_emit_bootstrap_task,_pair_emit,_probe_emit,_bootstrap_tick" ;;
 
         # -- reputation --
         reputation.c)

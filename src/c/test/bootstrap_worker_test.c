@@ -44,6 +44,208 @@ static bool _capture_emit(void *ctx, const char *cap_name,
     return true;
 }
 
+/* Probe sink: records which peer index and capability each addressed probe
+ * went to. The per-peer tally is what the allocation assertions read. */
+typedef struct {
+    int  calls;
+    char last_cap[32];
+    size_t last_peer;
+    int  per_peer[8];
+    bool fail;
+} probe_ctx_t;
+
+static bool _capture_probe(void *ctx, const char *cap_name, size_t peer_index,
+                           long nonce, const char *echo_payload)
+{
+    (void)nonce; (void)echo_payload;
+    probe_ctx_t *p = (probe_ctx_t *)ctx;
+    if (p->fail)
+        return false;
+    p->calls++;
+    p->last_peer = peer_index;
+    if (peer_index < 8)
+        p->per_peer[peer_index]++;
+    strncpy(p->last_cap, cap_name, sizeof(p->last_cap) - 1);
+    p->last_cap[sizeof(p->last_cap) - 1] = '\0';
+    return true;
+}
+
+/* Both sinks in one run need one ctx pointer, and the two callbacks cast it to
+ * different types -- so route them through a struct that holds both rather than
+ * aliasing an emit_ctx_t as a (larger) probe_ctx_t. */
+typedef struct {
+    emit_ctx_t  e;
+    probe_ctx_t p;
+} both_ctx_t;
+
+static bool _both_emit(void *ctx, const char *cap_name, long nonce,
+                       const char *echo_payload)
+{
+    return _capture_emit(&((both_ctx_t *)ctx)->e, cap_name, nonce, echo_payload);
+}
+
+static bool _both_probe(void *ctx, const char *cap_name, size_t peer_index,
+                        long nonce, const char *echo_payload)
+{
+    return _capture_probe(&((both_ctx_t *)ctx)->p, cap_name, peer_index, nonce,
+                          echo_payload);
+}
+
+DEFINE_TEST(test_probes_continue_after_the_window)
+{
+    /* The window seeds and stops; probing past it is what makes the honeypot
+     * an anchor rather than a one-off initiation rite (R+D.md §12.7). */
+    bootstrap_worker_t w;
+    bootstrap_worker_init_config(&w, 999, 1 /* one pair, then done */, 1, false);
+    w.probe_interval_sec = 0.0;
+    both_ctx_t both = {0};
+    for (int i = 0; i < 6; i++)
+        bootstrap_worker_tick_all(&w, 3, 0.0, _both_emit, _both_probe, &both);
+    ck_assert_int_eq(w.pairs_issued, 1);
+    ck_assert_int_eq(both.e.emit_calls, 1);
+    ck_assert(w.probes_issued >= 4);
+    ck_assert_int_eq(both.p.calls, w.probes_issued);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_tick_without_probe_sink_is_window_only)
+{
+    /* bootstrap_worker_tick must stay exactly what it was: the seeded unit
+     * tests and the conformance coverage pin depend on it. */
+    bootstrap_worker_t w;
+    bootstrap_worker_init_config(&w, 999, 1, 1, false);
+    w.probe_interval_sec = 0.0;
+    emit_ctx_t e = {0};
+    for (int i = 0; i < 6; i++)
+        bootstrap_worker_tick(&w, 3, 0.0, _capture_emit, &e);
+    ck_assert_int_eq(w.pairs_issued, 1);
+    ck_assert_int_eq(w.probes_issued, 0);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_continuous_can_be_disabled)
+{
+    bootstrap_worker_t w;
+    bootstrap_worker_init_config(&w, 999, 1, 1, false);
+    w.probe_interval_sec = 0.0;
+    w.continuous_enabled = false;
+    both_ctx_t both = {0};
+    for (int i = 0; i < 6; i++)
+        bootstrap_worker_tick_all(&w, 3, 0.0, _both_emit, _both_probe, &both);
+    ck_assert_int_eq(w.probes_issued, 0);
+    ck_assert_int_eq(both.p.calls, 0);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_probe_rate_limit_spaces_probes)
+{
+    bootstrap_worker_t w;
+    bootstrap_worker_init_config(&w, 999, 1, 1, false);
+    w.probe_interval_sec = 3600.0;
+    both_ctx_t both = {0};
+    for (int i = 0; i < 10; i++)
+        bootstrap_worker_tick_all(&w, 3, 0.0, _both_emit, _both_probe, &both);
+    /* First post-window tick probes immediately (waiting an hour to START
+     * probing serves nobody); the interval blocks the rest. */
+    ck_assert_int_eq(w.probes_issued, 1);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_ucb_bonus_widest_for_unprobed)
+{
+    ck_assert_double_lt(bootstrap_ucb_bonus(5, 100), bootstrap_ucb_bonus(0, 100));
+    ck_assert_double_lt(bootstrap_ucb_bonus(50, 100), bootstrap_ucb_bonus(5, 100));
+    /* Positive on the very first draw: ln(total + 1) would be 0 here and would
+     * zero every arm's bonus, degenerating selection to its tie-break. */
+    ck_assert_double_lt(0.0, bootstrap_ucb_bonus(0, 0));
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_target_selection_prefers_least_probed)
+{
+    bootstrap_worker_t w;
+    bootstrap_worker_init_config(&w, 999, 20, 1, false);
+    w.probes_issued = 20;
+    w.probes_by_peer[0] = 10;
+    w.probes_by_peer[1] = 10;
+    w.probes_by_peer[2] = 0;
+    ck_assert_uint_eq(bootstrap_worker_select_target(&w, 3), 2);
+    /* All equal → lowest index, so equal counts round-robin rather than
+     * depending on iteration direction. */
+    bootstrap_worker_init_config(&w, 999, 20, 1, false);
+    ck_assert_uint_eq(bootstrap_worker_select_target(&w, 3), 0);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_probes_spread_across_peers)
+{
+    /* Three peers, three probes → each peer probed once. */
+    bootstrap_worker_t w;
+    bootstrap_worker_init_config(&w, 999, 0 /* window done immediately */, 1, false);
+    w.probe_interval_sec = 0.0;
+    probe_ctx_t p = {0};
+    for (int i = 0; i < 3; i++)
+        bootstrap_worker_tick_all(&w, 3, 0.0, NULL, _capture_probe, &p);
+    ck_assert_int_eq(p.calls, 3);
+    ck_assert_int_eq(p.per_peer[0], 1);
+    ck_assert_int_eq(p.per_peer[1], 1);
+    ck_assert_int_eq(p.per_peer[2], 1);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_capability_allocation_covers_all_and_is_proportional)
+{
+    /* weight / (n + 1): with equal weights this round-robins, so every
+     * capability keeps getting exercised. Ranking by weight alone would leave
+     * an adversary a single capability to answer correctly. */
+    bootstrap_worker_t w;
+    bootstrap_worker_init_config(&w, 999, 0, 1, false);
+    w.probe_interval_sec = 0.0;
+    probe_ctx_t p = {0};
+    for (int i = 0; i < 30; i++)
+        bootstrap_worker_tick_all(&w, 3, 0.0, NULL, _capture_probe, &p);
+    ck_assert_int_eq(p.calls, 30);
+    for (int i = 0; i < BOOTSTRAP_CAPABILITY_COUNT; i++)
+        ck_assert(w.probes_by_cap[i] > 0);
+    /* Equal weights → within one of each other. */
+    int lo = w.probes_by_cap[0], hi = w.probes_by_cap[0];
+    for (int i = 1; i < BOOTSTRAP_CAPABILITY_COUNT; i++) {
+        if (w.probes_by_cap[i] < lo) lo = w.probes_by_cap[i];
+        if (w.probes_by_cap[i] > hi) hi = w.probes_by_cap[i];
+    }
+    ck_assert(hi - lo <= 1);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_unregistered_caps_are_not_probed)
+{
+    bootstrap_worker_t w;
+    bootstrap_worker_init_config(&w, 999, 0, 1, false);
+    w.probe_interval_sec = 0.0;
+    bootstrap_worker_set_registered(&w, "at.handshake", false);
+    bootstrap_worker_set_registered(&w, "at.time-attest", false);
+    probe_ctx_t p = {0};
+    for (int i = 0; i < 5; i++)
+        bootstrap_worker_tick_all(&w, 3, 0.0, NULL, _capture_probe, &p);
+    ck_assert_int_eq(p.calls, 5);
+    ck_assert_str_eq(p.last_cap, "at.echo-challenge");
+    ck_assert_int_eq(w.probes_by_cap[0], 0);
+    ck_assert_int_eq(w.probes_by_cap[1], 0);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_probe_queue_full_no_count)
+{
+    bootstrap_worker_t w;
+    bootstrap_worker_init_config(&w, 999, 0, 1, false);
+    w.probe_interval_sec = 0.0;
+    probe_ctx_t p = {0};
+    p.fail = true;
+    bootstrap_worker_tick_all(&w, 3, 0.0, NULL, _capture_probe, &p);
+    ck_assert_int_eq(w.probes_issued, 0);
+}
+END_TEST_DEFINITION()
+
 DEFINE_TEST(test_config_defaults)
 {
     bootstrap_worker_t w;
@@ -189,4 +391,14 @@ RUN_TESTS(BootstrapWorker,
           test_all_three_caps_fired_over_run,
           test_window_respects_pairs_target,
           test_window_closes_after_duration,
-          test_disabled_no_issue)
+          test_disabled_no_issue,
+          test_probes_continue_after_the_window,
+          test_tick_without_probe_sink_is_window_only,
+          test_continuous_can_be_disabled,
+          test_probe_rate_limit_spaces_probes,
+          test_ucb_bonus_widest_for_unprobed,
+          test_target_selection_prefers_least_probed,
+          test_probes_spread_across_peers,
+          test_capability_allocation_covers_all_and_is_proportional,
+          test_unregistered_caps_are_not_probed,
+          test_probe_queue_full_no_count)

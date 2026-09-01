@@ -31,6 +31,7 @@
 #include "identity/identity.h"
 #include "utilities/exception.h"
 #include "processes/capabilities.h"   /* CAP_NAMELEN */
+#include "reputation/tx_channel.h"   /* TX_CHANNEL_* */
 #include "autonomous_trust/algorithms/paxos.h"
 
 /****************************
@@ -176,6 +177,36 @@ static inline bool tx_score_in_range(double score)
     return score >= TX_SCORE_MIN && score <= TX_SCORE_MAX;
 }
 
+/* --- Hard-channel slash eligibility (R+D.md §12.8) ---
+ * A locally-produced score on a hard-falsification channel (tx_channel.h:
+ * physical / certificate / self_consistency) that is ALSO a defection
+ * PROPOSES a slash. It does not impose one: the existing quorum co-signature
+ * accepts or refuses it.
+ *
+ * The trigger is this codebase's own per-transaction cooperate threshold
+ * (0.5, the same number the CTFT branch calls "peer defected"), NOT a new
+ * magic number: on a hard channel a defection-grade score IS the refutation.
+ * That deliberately catches the case §12.8 exists for — a ZKP proof that
+ * failed to verify scores 0.3 on `certificate`.
+ *
+ * The floor is DEMOTION, not exclusion: 0.45 is below the tier-1 floor (0.50)
+ * so the peer drops to tier 0 and is shed by tier-gated negotiation, but well
+ * above COMM_CUTOFF (0.10) so it is not silenced and can earn its way back.
+ * Exclusion is sticky and reversible only by operator rehabilitation, far too
+ * heavy for one automated verdict.
+ *
+ * Same names, same defaults as Python's ReputationProcess
+ * CHANNEL_SLASH_MAX_SCORE / CHANNEL_SLASH_FLOOR / CHANNEL_SLASH_DISABLED, so
+ * the two runtimes behave identically under the same environment. */
+#define CHANNEL_SLASH_MAX_SCORE_DEFAULT 0.5
+#define CHANNEL_SLASH_FLOOR_DEFAULT     0.45
+#define CHANNEL_SLASH_MAX_SCORE \
+    (reputation_env_double("AT_TX_CHANNEL_SLASH_MAX_SCORE", \
+                           CHANNEL_SLASH_MAX_SCORE_DEFAULT))
+#define CHANNEL_SLASH_FLOOR \
+    (reputation_env_double("AT_TX_CHANNEL_SLASH_FLOOR", \
+                           CHANNEL_SLASH_FLOOR_DEFAULT))
+
 /* EMA half-life (in committed bilateral txs) for reputation_consensus.
  * Smaller → faster crash on a peer that begins producing bad scores,
  * slower rebuild for the rest. 20 gives α ≈ 0.034. */
@@ -206,6 +237,13 @@ typedef struct {
      * Python TransactionScore.capability_name. See
      * doc/architecture/trust-tiers.md §4.4. */
     char capability_name[CAP_NAMELEN+1];
+    /* Which evidence channel produced this score (R+D.md §12.8). Empty
+     * string == absent, which normalizes to TX_CHANNEL_TASK_OUTCOME via
+     * tx_channel_or_default -- every producer predating this field was
+     * grading a completed task. Carried and logged only: nothing in the
+     * reputation algebra branches on it. Mirrors Python
+     * TransactionScore.channel. See reputation/tx_channel.h. */
+    char channel[TX_CHANNEL_NAMELEN+1];
 } tx_score_t;
 
 /****************************

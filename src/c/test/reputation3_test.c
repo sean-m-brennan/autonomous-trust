@@ -484,6 +484,194 @@ DEFINE_TEST(test_tx_score_bounds_match_the_python_twin)
 }
 END_TEST_DEFINITION()
 
+DEFINE_TEST(test_tx_channel_accepts_the_closed_set)
+{
+    /* Every spelling in the vocabulary, checked by the same predicate the wire
+     * boundary uses (R+D.md §12.8). */
+    ck_assert(tx_channel_valid(TX_CHANNEL_TASK_OUTCOME));
+    ck_assert(tx_channel_valid(TX_CHANNEL_PHYSICAL));
+    ck_assert(tx_channel_valid(TX_CHANNEL_CERTIFICATE));
+    ck_assert(tx_channel_valid(TX_CHANNEL_CALIBRATION));
+    ck_assert(tx_channel_valid(TX_CHANNEL_SELF_CONSISTENCY));
+    ck_assert(tx_channel_valid(TX_CHANNEL_REPLICATION));
+    ck_assert(tx_channel_valid(TX_CHANNEL_SWARM_DISAGREEMENT));
+    ck_assert(tx_channel_valid(TX_CHANNEL_PROBE));
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_tx_channel_refuses_unknown_spellings)
+{
+    /* The set is CLOSED: an unrecognized channel is refused, not passed
+     * through. A channel that becomes "some string a peer sent" is worth less
+     * than no channel at all, because the whole value of the field is that a
+     * demotion reason means one agreed thing on both sides of the wire. */
+    ck_assert(tx_channel_valid("nonsense") == false);
+    ck_assert(tx_channel_valid("physicall") == false);
+    ck_assert(tx_channel_valid("task-outcome") == false);
+    /* Case-sensitive for the same reason -- a set that accepts near-misses is
+     * not closed. */
+    ck_assert(tx_channel_valid("Physical") == false);
+    ck_assert(tx_channel_valid("PHYSICAL") == false);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_tx_channel_absence_is_not_invalidity)
+{
+    /* NULL/"" are ABSENT, not wrong: a peer or app predating the field is not
+     * in error. tx_channel_valid answers "is this a legal name" (no), while
+     * tx_channel_or_default resolves absence (task_outcome). Keeping the two
+     * apart is what lets a caller report "unknown channel 'x'" instead of
+     * silently grading a typo'd refutation as an ordinary task outcome. */
+    ck_assert(tx_channel_valid(NULL) == false);
+    ck_assert(tx_channel_valid("") == false);
+    ck_assert_str_eq(tx_channel_or_default(NULL), TX_CHANNEL_TASK_OUTCOME);
+    ck_assert_str_eq(tx_channel_or_default(""), TX_CHANNEL_TASK_OUTCOME);
+    /* A set channel passes through untouched... */
+    ck_assert_str_eq(tx_channel_or_default(TX_CHANNEL_PHYSICAL),
+                     TX_CHANNEL_PHYSICAL);
+    /* ...and so does a bad one -- or_default deliberately does NOT validate,
+     * so the refusal happens at the boundary that can report it. */
+    ck_assert_str_eq(tx_channel_or_default("nonsense"), "nonsense");
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_tx_channel_spellings_match_the_python_twin)
+{
+    /* These strings cross the wire verbatim, so a divergence from Python's
+     * TX_CHANNEL_* is a score one twin accepts and the other drops. Pinned
+     * here as literals so a rename cannot pass silently on one side. */
+    ck_assert_str_eq(TX_CHANNEL_TASK_OUTCOME, "task_outcome");
+    ck_assert_str_eq(TX_CHANNEL_PHYSICAL, "physical");
+    ck_assert_str_eq(TX_CHANNEL_CERTIFICATE, "certificate");
+    ck_assert_str_eq(TX_CHANNEL_CALIBRATION, "calibration");
+    ck_assert_str_eq(TX_CHANNEL_SELF_CONSISTENCY, "self_consistency");
+    ck_assert_str_eq(TX_CHANNEL_REPLICATION, "replication");
+    ck_assert_str_eq(TX_CHANNEL_SWARM_DISAGREEMENT, "swarm_disagreement");
+    ck_assert_str_eq(TX_CHANNEL_PROBE, "probe");
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_tx_channel_field_holds_the_longest_spelling)
+{
+    /* A silently truncated channel would be refused as "unknown" at the far
+     * end, which is a confusing way to learn the field is too small. */
+    tx_score_t tx;
+    memset(&tx, 0, sizeof(tx));
+    strncpy(tx.channel, TX_CHANNEL_SWARM_DISAGREEMENT, TX_CHANNEL_NAMELEN);
+    tx.channel[TX_CHANNEL_NAMELEN] = '\0';
+    ck_assert_str_eq(tx.channel, TX_CHANNEL_SWARM_DISAGREEMENT);
+    ck_assert(tx_channel_valid(tx.channel));
+
+    /* A zeroed tx_score_t (how reputation_install_my_request and every
+     * `= {0}` message producer leaves it) reads as absent -> task outcome. */
+    tx_score_t zeroed;
+    memset(&zeroed, 0, sizeof(zeroed));
+    ck_assert_str_eq(tx_channel_or_default(zeroed.channel),
+                     TX_CHANNEL_TASK_OUTCOME);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_tx_channel_weights_match_the_python_twin)
+{
+    /* R+D.md §12.8's first response: a channel multiplies the EMA weight of a
+     * score THIS node produced. The values are a ranking of how much one
+     * observation tells you -- 1 = one peer's reading of one event, 2 =
+     * corroborated by construction, 3 = a verdict needing no history -- and
+     * they must match Python's TX_CHANNEL_WEIGHTS exactly, or the two runtimes
+     * fold the same evidence differently. */
+    ck_assert_int_eq(tx_channel_weight(TX_CHANNEL_TASK_OUTCOME), 1);
+    /* Deliberately 1: the oracle doc names calibration as the channel that
+     * should decay a peer GRADUALLY... */
+    ck_assert_int_eq(tx_channel_weight(TX_CHANNEL_CALIBRATION), 1);
+    /* ...and swarm disagreement as the one that should open a DISPUTE rather
+     * than levy a bigger penalty. A majority is not an oracle. */
+    ck_assert_int_eq(tx_channel_weight(TX_CHANNEL_SWARM_DISAGREEMENT), 1);
+    ck_assert_int_eq(tx_channel_weight(TX_CHANNEL_REPLICATION), 2);
+    ck_assert_int_eq(tx_channel_weight(TX_CHANNEL_PROBE), 2);
+    ck_assert_int_eq(tx_channel_weight(TX_CHANNEL_PHYSICAL), 3);
+    ck_assert_int_eq(tx_channel_weight(TX_CHANNEL_CERTIFICATE), 3);
+    ck_assert_int_eq(tx_channel_weight(TX_CHANNEL_SELF_CONSISTENCY), 3);
+    /* Absent -> the default channel's weight, and an unknown spelling weighs
+     * 1: an unrecognized channel must never weigh MORE than a recognized one,
+     * or adding a channel on one side of the wire would silently amplify it
+     * on the other. */
+    ck_assert_int_eq(tx_channel_weight(NULL), 1);
+    ck_assert_int_eq(tx_channel_weight(""), 1);
+    ck_assert_int_eq(tx_channel_weight("a_channel_from_the_future"), 1);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_tx_channel_hard_set_matches_the_python_twin)
+{
+    /* The falsification channels: the peer did not do poorly, it asserted
+     * something untrue. Each is reachable without consulting any other peer,
+     * which is what makes one observation sufficient grounds to accuse. */
+    ck_assert(tx_channel_is_hard(TX_CHANNEL_PHYSICAL));
+    ck_assert(tx_channel_is_hard(TX_CHANNEL_CERTIFICATE));
+    ck_assert(tx_channel_is_hard(TX_CHANNEL_SELF_CONSISTENCY));
+    /* A grade is a grade, however bad. */
+    ck_assert(tx_channel_is_hard(TX_CHANNEL_TASK_OUTCOME) == false);
+    ck_assert(tx_channel_is_hard(TX_CHANNEL_CALIBRATION) == false);
+    ck_assert(tx_channel_is_hard(TX_CHANNEL_REPLICATION) == false);
+    ck_assert(tx_channel_is_hard(TX_CHANNEL_SWARM_DISAGREEMENT) == false);
+    /* `probe` is excluded even though its ground truth is certain: it is
+     * synthetic traffic a node generates continuously, so slashing on one
+     * failed probe would put every node's demotion in the hands of its own
+     * probe cadence. */
+    ck_assert(tx_channel_is_hard(TX_CHANNEL_PROBE) == false);
+    ck_assert(tx_channel_is_hard(NULL) == false);
+    ck_assert(tx_channel_is_hard("") == false);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_tx_channel_slash_reason_names_the_channel)
+{
+    /* The reason is inside the signed slash designation, so unlike an
+     * evidence_ref it cannot be altered in flight -- and it is what makes the
+     * demotion legible, which is the whole point of §12.8. Pinned as literals
+     * on both sides: a divergence is a slash one runtime can verify and the
+     * other cannot. */
+    char reason[TX_CHANNEL_NAMELEN + 16];
+    ck_assert(tx_channel_slash_reason(TX_CHANNEL_PHYSICAL, reason,
+                                      sizeof(reason)));
+    ck_assert_str_eq(reason, "refuted_physical");
+    ck_assert(tx_channel_slash_reason(TX_CHANNEL_CERTIFICATE, reason,
+                                      sizeof(reason)));
+    ck_assert_str_eq(reason, "refuted_certificate");
+    ck_assert(tx_channel_slash_reason(TX_CHANNEL_SELF_CONSISTENCY, reason,
+                                      sizeof(reason)));
+    ck_assert_str_eq(reason, "refuted_self_consistency");
+    /* Refused for a graded channel rather than invented: a minted reason
+     * would produce a slash no reader could place. */
+    ck_assert(tx_channel_slash_reason(TX_CHANNEL_TASK_OUTCOME, reason,
+                                      sizeof(reason)) == false);
+    ck_assert(tx_channel_slash_reason(TX_CHANNEL_PROBE, reason,
+                                      sizeof(reason)) == false);
+    /* And refused rather than truncated when the buffer cannot hold it. */
+    char tiny[4];
+    ck_assert(tx_channel_slash_reason(TX_CHANNEL_PHYSICAL, tiny,
+                                      sizeof(tiny)) == false);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_channel_slash_floor_is_demotion_not_exclusion)
+{
+    /* 0.45 drops the peer to tier 0 (below the 0.50 tier-1 floor) so it is
+     * shed by tier-gated negotiation, but leaves it above COMM_CUTOFF so it is
+     * not silenced and can earn its way back. Exclusion is sticky and
+     * reversible only by operator rehabilitation -- far too heavy for one
+     * automated verdict. Same values as Python's CHANNEL_SLASH_*. */
+    ck_assert(CHANNEL_SLASH_FLOOR > COMM_CUTOFF);
+    ck_assert(CHANNEL_SLASH_FLOOR < 0.5);
+    ck_assert_double_eq_tol(CHANNEL_SLASH_FLOOR_DEFAULT, 0.45, 1e-12);
+    /* The trigger is the codebase's own per-transaction cooperate threshold,
+     * not a new number -- which is what makes the certificate case §12.8 was
+     * written around (an invalid ZKP proof scores 0.3) actually fire. */
+    ck_assert_double_eq_tol(CHANNEL_SLASH_MAX_SCORE_DEFAULT, 0.5, 1e-12);
+    ck_assert(0.3 < CHANNEL_SLASH_MAX_SCORE);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(Reputation3, test_tx_history_json_roundtrip, test_tx_two_peer_transaction,
           test_reputation_contrite_tft,
           test_reputation_contrite_tft_cooperative_self_p2,
@@ -497,4 +685,13 @@ RUN_TESTS(Reputation3, test_tx_history_json_roundtrip, test_tx_two_peer_transact
           test_tx_score_range_accepts_the_scale,
           test_tx_score_range_rejects_off_scale,
           test_tx_score_range_rejects_nan_and_infinities,
-          test_tx_score_bounds_match_the_python_twin)
+          test_tx_score_bounds_match_the_python_twin,
+          test_tx_channel_accepts_the_closed_set,
+          test_tx_channel_refuses_unknown_spellings,
+          test_tx_channel_absence_is_not_invalidity,
+          test_tx_channel_spellings_match_the_python_twin,
+          test_tx_channel_field_holds_the_longest_spelling,
+          test_tx_channel_weights_match_the_python_twin,
+          test_tx_channel_hard_set_matches_the_python_twin,
+          test_tx_channel_slash_reason_names_the_channel,
+          test_channel_slash_floor_is_demotion_not_exclusion)

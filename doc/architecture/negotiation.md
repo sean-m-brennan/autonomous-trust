@@ -67,12 +67,37 @@ is invited who could not have done the work.
 
 Several steps are part of the protocol and never appear on the wire. After
 accepting, the worker pushes the task onto a priority queue ordered by scheduled
-execution time. When the scheduled moment arrives it pops the task and hands it
-to its own orchestrator for execution, and the result flows back through the
-negotiation process before going out as a report. On the requester side, the
-orchestrator submits a transaction score to the reputation process after
-verifying the proof attached to the result, and that hand-off is exactly where
-the negotiation and reputation protocols compose end to end.
+execution time. When the scheduled moment arrives it pops the task, runs the
+capability, and the answer flows back out as a report. Having run the work, the
+worker also submits its own half of the bilateral transaction — its claim to
+have done the job, which is worth whatever the requester's score for the same
+task says it was worth.
+
+On the requester side a returned result is scored and the score goes to the
+reputation process, which is where the negotiation and reputation protocols
+compose end to end. Two things ride with that score. The capability that
+produced it, so the reputation process can apply the capability's configured
+transaction weight rather than a default of one. And the evidence channel: how
+the number was arrived at, which keeps a failed proof, a failed known-answer
+challenge and a task that simply came back empty distinguishable downstream
+when all three are the same number.
+
+The judgment reads the challenge from the requester's own retained record of the
+task, never from anything on the reply. That is not a defensive nicety, it is
+the whole property: a peer that computed the wrong answer would report the
+challenge its answer *does* satisfy, so a check that trusted the reply's account
+of what was asked would verify nothing at all.
+
+The two runtimes place that scoring differently, and the difference is worth
+knowing when reading either one. Python scores in its orchestrator, which is
+also where it verifies any proof attached to the result. C scores in its
+negotiation process, because that is where C keeps the requester's record; its
+orchestrator is a router that knows nothing about capabilities, and moving the
+capability and the challenge to it would have meant widening an inter-process
+struct to carry a fact that was already in hand. What the conformance corpus
+pins across the two is therefore the scoring rules rather than a shared call
+site. C also attaches no proofs, so it always takes the arm Python takes when
+proofs are unavailable: score on completion, and say so.
 
 ## Three ways to say no
 
@@ -134,10 +159,17 @@ The *peer capabilities* map associates capability names with the peers that
 registered them, so invitations reach only plausible workers. It bounds
 invitation traffic.
 
-The *task tracker* records outstanding remote tasks by identifier and the
-results expected from each participant, and a task completes when every expected
-result has arrived. Once complete, the entry is deleted, which is what makes
-later results for the same task rejected rather than accepted.
+The *task tracker* records outstanding remote tasks by identifier, the results
+expected from each participant, and what the requester asked for — the
+capability and the invocation's arguments — because a returned answer can only
+be judged against the question. Once the task completes the entry is deleted,
+which is what makes later results for the same task rejected rather than
+accepted.
+
+What counts as complete is one of the few places the two runtimes still
+disagree: Python forwards on the first reply, C waits for every peer it
+invited. For a directed probe, addressed to exactly one peer, the two coincide.
+See ISSUES.md.
 
 *Spam protection* is the flood counter described above, refusing and returning
 rather than merely logging. It is canonical behavior in both the Python and C

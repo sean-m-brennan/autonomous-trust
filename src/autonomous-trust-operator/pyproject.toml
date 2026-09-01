@@ -25,7 +25,12 @@ autonomous-trust-services = ">=0.2.1"
 textual = ">=0.60"
 # Second-factor: TOTP (RFC 6238) is the §6.1 default.
 pyotp = ">=2.9"
-# PKCS#11 binding (§6.5 decision: PyKCS11) for live PIV/CAC cards -- mirrors the
-# `pykcs11` pip entry in config/cfg/environment.yml. The card paths lazy-import
-# it, so demo/CI still runs where the binding or middleware is absent.
-PyKCS11 = ">=1.5.12"
+# PKCS#11 binding (§6.5 decision: PyKCS11) for live PIV/CAC cards. The card
+# paths lazy-import it, so demo/CI still runs where the binding or middleware is
+# absent. The floor is 1.5.19 for a build reason, not an API one: earlier
+# releases use the Python-2 C API in their SWIG interface file, and SWIG 4.3+
+# (PyPI ships 4.5) dropped the macros that used to paper over it, so 1.5.18 and
+# below no longer compile from source -- which is the only way this package
+# installs on Linux. config/cfg/environment.yml pins the exact version the
+# images install and carries the details; keep this floor at or below it.
+PyKCS11 = ">=1.5.19"

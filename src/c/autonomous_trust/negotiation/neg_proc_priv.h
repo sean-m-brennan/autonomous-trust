@@ -120,6 +120,23 @@ bool negotiation_has_my_task_uuid(const uuid_t uuid);
  *  assertion exercised by the flood-probe scenario. */
 int negotiation_get_task_flood_count(const uuid_t uuid);
 
+/** Score a returned task result the way the requestor-side path does, and
+ *  name the evidence channel it came from (R+D.md §12.7 / §12.8).
+ *
+ *  @p cap_name and @p kwargs_json are what the REQUESTOR asked for -- in
+ *  production, the record `handle_results` reads off the task tracker, never
+ *  anything the responder sent back. A known-answer capability is checked
+ *  against its expected value (0.9 correct / 0.5 forgivable clock drift / 0.1
+ *  wrong) and reports the `probe` channel; anything else is scored on
+ *  completion (0.8 with a result, 0.3 without) and reports `task_outcome`.
+ *
+ *  Exported so tests and the conformance adapter exercise the same function
+ *  production does. @p channel_out may be NULL. */
+double negotiation_score_task_result(const char *cap_name,
+                                     const char *kwargs_json,
+                                     const char *result_str, size_t result_len,
+                                     const char **channel_out);
+
 #define ENEG_NOPEERS 243
 DECLARE_ERROR(ENEG_NOPEERS, "No capable peers available");
 

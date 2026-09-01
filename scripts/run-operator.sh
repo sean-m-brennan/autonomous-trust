@@ -72,7 +72,9 @@ Card presence
   With no token flags, presence comes from a PIN-less PKCS#11 probe against an
   autodetected opensc-pkcs11.so. If the Activate tab says "no token detected"
   with a card inserted, the parenthetical reason names the cause; the usual fixes
-  are installing the binding (pip install pykcs11), starting pcscd, or pointing
+  are installing the binding (pip install 'pykcs11>=1.5.19' -- earlier releases
+  no longer build from source, and source is the only Linux path), starting
+  pcscd, or pointing
   AUTONOMOUS_TRUST_PKCS11_MODULE at vendor/CACKey middleware.
 
 Environment:

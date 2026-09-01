@@ -1,0 +1,134 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: transaction-channel-carried
+byte_pinning: false
+description: |
+    An evidence channel rides the Paxos round-2 wire, and a channel that
+    ARRIVED FROM A PEER changes nothing (R+D.md §12.8,
+    doc/verification_oracle.md "Keep the channels separate").
+
+    A transaction score says how well a peer did; the channel says how we
+    know. "Refuted by conservation of energy" and "the task came back
+    empty" warrant different responses, and before this field the wire
+    collapsed both into one scalar, so the reason could not survive the
+    trip to the reputation algebra.
+
+    This scenario is the cross-language half of that field's contract, and
+    its job is deliberately narrow: prove BOTH runtimes accept a
+    channel-bearing `transaction` proposal, agree the spelling `physical`
+    is in the closed set, and then behave exactly as
+    `transaction-accepted` does. It is a copy of that scenario with one key
+    added, so any divergence it reports is attributable to the channel and
+    nothing else.
+
+    Why "changes nothing" is still the point, now that channels DO have
+    consequences: the first slice (2026-08-21) branched on nothing, and the
+    prose here said that if a later slice made a physics refutation demote
+    faster, this scenario should start failing and be re-decided
+    deliberately rather than drifting. The later slice landed, and this is
+    that deliberate re-decision — the vector holds, for two reasons that
+    are the whole shape of the second slice:
+
+      - The channel's EMA multiplier and its slash eligibility apply ONLY
+        to evidence the scoring node produced ITSELF. This step is a
+        proposal alice sent to bob; on bob's side the tag is bob's
+        knowledge of what alice claims, not bob's own finding. Honouring it
+        would hand every peer a lever on every other peer's reputation, so
+        the wire path weighs by capability alone.
+      - The score here is 0.8 — a PASS. Even locally, a hard channel
+        reporting success is the common case and must be silent; only a
+        defection-grade score on a hard channel is a refutation.
+
+    So the invariant this scenario pins is sharper than before, not weaker:
+    a channel crossing the wire is legibility, and the two runtimes must
+    agree on that. The consequences of a LOCAL channel are pinned by unit
+    tests on each side (see below), because they have no wire form to
+    compare — which is exactly why they are safe.
+
+    Cross-language wiring:
+      - Python: the adapter passes `payload.channel` into
+        `TransactionScore(channel=...)`, whose constructor runs
+        `validate_tx_channel` — so the closed set is enforced on the
+        wire-side reconstruction path (`from_json_string` → `cls(**kwargs)`).
+      - C: the adapter emits `channel` as a top-level JSON key and
+        `handle_transaction` checks it with `tx_channel_valid`, dropping
+        the proposal on an unknown spelling.
+      Absence is not error on either side: an omitted key means
+      `task_outcome`, which is what every pre-channel producer meant. That
+      tolerance is what keeps the other reputation scenarios meaningful,
+      and it is exercised by every one of them that omits the key.
+
+    No expected_state pin, for the same reason as
+    `transaction-committed-bilateral`: the assertion here is that the
+    channel-bearing proposal routes and validates identically on both
+    runtimes, not any new observable. Two things are pinned by unit tests
+    instead, on both sides, because neither has a wire form for a scenario
+    to compare:
+
+      - The closed-set REFUSAL — `tests/a_unit/test_reputation.py`
+        (`TestTransactionScoreChannel`) and `src/c/test/reputation3_test.c`
+        (`test_tx_channel_refuses_unknown_spellings`) — because expressing
+        it as a negative vector needs `op: set_field` / `reason_class:
+        schema_violation`, and both negative runners currently implement
+        only `flip_byte`.
+      - The per-channel weights and the hard set — same two files
+        (`TestChannelResponses`,
+        `test_tx_channel_weights_match_the_python_twin`,
+        `test_tx_channel_hard_set_matches_the_python_twin`). These are the
+        real cross-language risk in this slice: the two runtimes must agree
+        on the NUMBERS even though the numbers never cross the wire, so
+        each side asserts the literal table rather than deriving it.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+
+fixtures:
+  requests:
+    bob:
+      - [1000, 1]
+  my_requests:
+    alice:
+      - id1: 1000
+        id2: 1
+        task_id: t-1
+        score: 0.8
+        channel: physical
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: transaction
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+      task_id: t-1
+      score: 0.8
+      channel: physical
+    description: |
+        alice proposes a score of 0.8 tagged as a physics-layer finding.
+        bob must accept it exactly as he accepts the untagged proposal in
+        `transaction-accepted` — on the receiving side the channel is
+        carried, not acted on, and a passing score would be silent even if
+        bob had produced it himself.
+
+  - id: 2
+    from: bob
+    to: alice
+    function: tx accepted
+    in_response_to: 1
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+    description: |
+        Round commits unchanged. The channel does not reach the committed
+        chain entry's canonical bytes (it is provenance for the score, not
+        part of the committed fact), so entry hashes are unaffected on both
+        sides — pinned directly by
+        `test_the_channel_does_not_reach_the_chain_entry_hash`.

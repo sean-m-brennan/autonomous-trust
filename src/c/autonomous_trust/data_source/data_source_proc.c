@@ -540,6 +540,6 @@ int data_source_run(process_t *proc, directory_t *queues, queue_id_t signal,
  * row; build_local_capabilities includes it in the announce so the
  * coordinator's DataRcvr subscribes). Name must equal Python
  * DataProcess.capability_name == "data". */
-DECLARE_CAPABILITY(data, NULL);
+DECLARE_CAPABILITY(data, NULL, NULL);
 
 DECLARE_PROCESS(data_source, data_source_proc, data_source_run);

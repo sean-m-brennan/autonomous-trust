@@ -32,12 +32,16 @@
  * substitutes macro args by plain substring replace, and `func` is a
  * substring of the `.function` field name (it would corrupt it to
  * `.NULLtion`). Mirrors how process_table_priv.h.in names its first
- * param `type_name` (not `type`) to avoid clobbering `.type`. */
-#define DECLARE_CAPABILITY(cap_name, cap_func) \
+ * param `type_name` (not `type`) to avoid clobbering `.type`. The third
+ * parameter is `cap_res_func` for the same reason and with one more
+ * constraint: it must not CONTAIN `cap_func` as a substring, or the
+ * second parameter's substitution would rewrite half of it. */
+#define DECLARE_CAPABILITY(cap_name, cap_func, cap_res_func) \
     {                                          \
         .name = QUOTE(cap_name),               \
         .local = true,                         \
         .function = cap_func,                  \
+        .result_function = cap_res_func,       \
     },
 
 

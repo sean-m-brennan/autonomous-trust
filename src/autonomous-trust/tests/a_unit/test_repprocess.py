@@ -446,6 +446,37 @@ class TestHandleTransactionDeeper:
         assert idx not in rp.requests
         assert idx in rp.proposals
 
+    def test_unknown_evidence_channel_is_dropped_not_raised(self):
+        """A peer-supplied evidence channel outside the closed set is refused
+        (R+D.md §12.8) — but the refusal must not escape as an exception.
+
+        The check lives in TransactionScore's constructor, which the wire-side
+        `from_yaml_string`/`from_json_string` reconstruction runs, so without the
+        handler's catch a remote could raise inside this node's reputation
+        process loop just by misspelling a channel. Same reasoning as the
+        off-scale score path. The grant is left UNCONSUMED, since the drop
+        happens before the `requests` lookup."""
+        rp = _make_rep_process()
+        peer = _make_mock_peer()
+        id1, id2 = 100, 1
+        idx = rp._paxos_id_index(id1, id2)
+        rp.requests.append(idx)
+        score = TransactionScore(uuid4(), 0.8, channel='physical')
+
+        payload = to_yaml_string(((id1, id2, peer.uuid), score))
+        assert 'physical' in payload
+        payload = payload.replace('physical', 'physicall')
+
+        net_q = queue.Queue()
+        msg = Message(CfgIds.reputation, ReputationProtocol.transaction,
+                      payload, from_whom=peer)
+        msg.verified = True
+        result = rp.handle_transaction({CfgIds.network: net_q}, msg)
+        assert result is True          # consumed, not passed to another handler
+        assert idx in rp.requests      # grant not consumed by a refused proposal
+        assert net_q.empty()           # and no `tx accepted` went back
+        assert idx not in rp.proposals  # nothing recorded from a refused payload
+
 
 class TestHandleAcceptedDeeper:
     def test_accepted_with_quorum(self):

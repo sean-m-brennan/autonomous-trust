@@ -47,7 +47,8 @@ from .reputation import (TransactionHistory, Reputation, Reputations,
                          evidence_from_dict, RESOLVE_TTL_DEFAULT,
                          resolve_query_to_dict, resolve_query_from_dict,
                          resolved_to_dict, resolved_from_dict, verify_resolved,
-                         consensus_score_from_window)
+                         consensus_score_from_window, tx_channel_weight,
+                         tx_channel_is_hard, slash_reason_for_channel)
 from ..system import CfgIds, now, encoding, proc_idle_floor
 from .. import _probes
 
@@ -213,6 +214,33 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # 20 txs gives α ≈ 0.034 — a hacked peer falls visibly within
     # a few seconds of demo time while honest peers recover gradually.
     CONSENSUS_EMA_HALF_LIFE = 20
+
+    # --- Hard-channel slash eligibility (R+D.md §12.8) -----------------
+    # A locally-produced score on a hard-falsification channel
+    # (TX_CHANNELS_HARD: physical / certificate / self_consistency) that is
+    # ALSO a defection PROPOSES a slash. It does not impose one: the existing
+    # quorum co-signature accepts or refuses it, exactly as for the behaviour
+    # governor's anomaly slashes, so "ML proposes, deterministic consensus
+    # disposes" holds for the oracle channels too.
+    #
+    # The trigger is the codebase's own per-transaction cooperate threshold
+    # (0.5, the same number `_ctft_reputation` calls "peer defected"), NOT a
+    # new magic number: on a hard channel a defection-grade score IS the
+    # refutation. That deliberately catches the case §12.8 exists for -- a
+    # ZKP proof that failed to verify scores 0.3 on `certificate`.
+    CHANNEL_SLASH_MAX_SCORE = _env_float('AT_TX_CHANNEL_SLASH_MAX_SCORE', 0.5)
+    # The floor a channel slash pins to. 0.45 is DEMOTION, not exclusion: it
+    # sits below the tier-1 floor (0.50), so the peer drops to tier 0 and is
+    # shed by tier-gated negotiation, but stays well above COMM_CUTOFF (0.10),
+    # so it is not silenced and can earn its way back. Exclusion (floor 0.0)
+    # is sticky and reversible only by operator rehabilitation, which is far
+    # too heavy for one automated verdict. Same value and same reasoning as
+    # the behaviour governor's DEFAULT_SLASH_FLOOR.
+    CHANNEL_SLASH_FLOOR = _env_float('AT_TX_CHANNEL_SLASH_FLOOR', 0.45)
+    # Kill switch. The channel keeps its EMA weight; only the accusation
+    # stops. For a deployment that wants the legibility without the automated
+    # demotion (and for a demo that must not shed peers).
+    CHANNEL_SLASH_DISABLED = bool(os.environ.get('AT_TX_CHANNEL_SLASH_DISABLED'))
 
     # --- Deep resolution (doc/architecture/gateway-reputation-tree.md) ----------------------------
     # How long a relayed query stays in the pending table, and how long a
@@ -867,23 +895,35 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # default; tunable via AT_TX_HISTORY_CAP picks the same factor.
     _TASK_WEIGHTS_CAP = 2 * TransactionHistory.DEFAULT_MAX_CHAIN_LEN
 
-    def _resolve_tx_weight(self, score: TransactionScore) -> int:
-        """Map a TS's capability_name to its transaction_weight, with a
-        graceful default. The lookup goes through the local Capabilities
-        registry (self.protocol.capabilities); peers that don't have
-        the capability registered locally treat the weight as 1.
-        Returns at least 1 (the 0-sentinel from proto3 is normalised to
-        1 in Capability.sync_from_message; this is a defence in depth).
+    def _resolve_tx_weight(self, score: TransactionScore, local: bool = False) -> int:
+        """Map a TS to its EMA weight: the capability's transaction_weight,
+        times the evidence channel's multiplier when the evidence is ours.
+
+        The capability half looks up the local Capabilities registry
+        (self.protocol.capabilities); peers that don't have the capability
+        registered locally treat the weight as 1. Returns at least 1 (the
+        0-sentinel from proto3 is normalised to 1 in
+        Capability.sync_from_message; this is a defence in depth).
+
+        *local* says this score was produced ON THIS NODE — the IPC path from
+        our own subsystems (`forward_transaction`), never the wire path
+        (`handle_transaction`). Only then does the channel multiply
+        (R+D.md §12.8): the scorer chooses its own channel, so honoring a
+        remote tag would let any peer treble the weight of a score it
+        fabricated against any other. See `tx_channel_weight`.
         """
         cap_name = getattr(score, 'capability_name', None)
-        if not cap_name:
-            return 1
-        try:
-            cap = self.protocol.capabilities[cap_name]
-        except (KeyError, AttributeError, TypeError):
-            return 1
-        w = getattr(cap, 'transaction_weight', 1) or 1
-        return max(1, int(w))
+        weight = 1
+        if cap_name:
+            try:
+                cap = self.protocol.capabilities[cap_name]
+            except (KeyError, AttributeError, TypeError):
+                cap = None
+            if cap is not None:
+                weight = max(1, int(getattr(cap, 'transaction_weight', 1) or 1))
+        if local:
+            weight *= tx_channel_weight(getattr(score, 'channel', None))
+        return max(1, int(weight))
 
     def _record_task_weight(self, task_id, weight: int) -> None:
         """Insert into self.task_weights with FIFO eviction at the cap.
@@ -947,7 +987,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # Cache the weight for this task so _pure_reputation can later
         # aggregate it correctly (Slice 3 / trust-tiers.md §5), and the tier
         # so the per-tier consensus view can bucket it (doc/architecture/network-wire-format.md).
-        self._record_task_weight(score.task_id, self._resolve_tx_weight(score))
+        # local=True: every _start_paxos is OUR OWN proposal (the wire path
+        # replies from `handle_transaction` and never lands here), so this is
+        # the one weighting site where the evidence channel counts.
+        self._record_task_weight(score.task_id,
+                                 self._resolve_tx_weight(score, local=True))
         self._record_task_tier(score.task_id, self._resolve_tx_tier(score))
         self.logger.debug('Start a Paxos round')
 
@@ -976,7 +1020,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 self.logger.debug("Tx to proposals ")
             # Cache the weight for this task — incoming TS payload carries
             # capability_name (Slice 1). Receivers that don't register the
-            # capability locally fall back to weight 1.
+            # capability locally fall back to weight 1. No `local=True`: the
+            # channel on a peer's score is legibility only (R+D.md §12.8).
             if hasattr(score, 'task_id'):
                 self._record_task_weight(score.task_id, self._resolve_tx_weight(score))
                 self._record_task_tier(score.task_id, self._resolve_tx_tier(score))
@@ -1006,8 +1051,84 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 self._start_paxos(queues, message)
             except Full:
                 self.logger.error('handle_transaction: Network queue full')
+            # After the round is under way, not before: a refutation is an
+            # accusation about a peer, and the score that carries the evidence
+            # still belongs in the chain whatever the accusation does.
+            self._maybe_slash_for_channel(queues, message)
             return True
         return False
+
+    def _maybe_slash_for_channel(self, queues, score: TransactionScore):
+        """Propose a slash when a LOCALLY-PRODUCED score refutes a peer.
+
+        R+D.md §12.8's second response. Five conditions, all required:
+
+        1. Slashing on channels is enabled (``CHANNEL_SLASH_DISABLED``).
+        2. The channel is a falsification, not a grade (``TX_CHANNELS_HARD``).
+        3. The score is defection-grade (``CHANNEL_SLASH_MAX_SCORE``). A hard
+           channel reporting a PASS is the common case and must be silent.
+        4. The score names its subject. Only a locally-produced score can --
+           `subject_uuid` never crosses the wire (see ``TransactionScore``) --
+           which is what makes "locally-produced evidence only" structural
+           here rather than a check somebody could forget to write.
+        5. The subject is a known peer other than ourselves. Refusing to
+           self-slash mirrors ``_slash_target_ok``; requiring a known peer
+           keeps a stale or malformed subject from minting an accusation
+           against a uuid nobody in the cohort can even resolve.
+
+        Deliberately carries NO ``evidence_ref``. The Merkle form
+        (``build_slash_evidence``) proves inclusion against a root the
+        co-signers have FINALIZED as a checkpoint, and a score that was
+        submitted moments ago is in no finalized window yet -- attaching it
+        would get the slash refused by every co-signer rather than trusted
+        (``_verify_slash_evidence``). This takes the documented Phase-0
+        trust-the-detector path instead, and the accusation stays legible
+        because the CHANNEL is named in the signed `reason`.
+        """
+        if self.CHANNEL_SLASH_DISABLED:
+            return False
+        channel = getattr(score, 'channel', None)
+        if not tx_channel_is_hard(channel):
+            return False
+        try:
+            value = float(getattr(score, 'score', 1.0))
+        except (TypeError, ValueError):
+            return False
+        if value >= self.CHANNEL_SLASH_MAX_SCORE:
+            return False
+        subject = getattr(score, 'subject_uuid', None)
+        if not subject:
+            # A hard channel with no subject is a scoring producer that has
+            # not been taught to name the peer it is accusing. Say so once
+            # per task: silently declining to act on a refutation is exactly
+            # the kind of "protection that never ran" this entry is about.
+            self.logger.warning(
+                'Refutation on channel %s for task %s names no subject; '
+                'scored but not actionable (producer must set subject_uuid)',
+                channel, getattr(score, 'task_id', None))
+            return False
+        subject = str(subject)
+        if subject == str(self.identity.uuid):
+            return False
+        # str-compared against the roster rather than `peers.find_by_uuid`,
+        # which keys on UUID objects and so never matches a string subject.
+        # Same idiom as `_cosigner_identity`.
+        if not any(str(peer.uuid) == subject for peer in self.peers.all):
+            self.logger.warning(
+                'Refutation on channel %s names unknown peer %s; not slashing',
+                channel, subject[:8])
+            return False
+        att = SlashAttestation(slasher_uuid=self.identity.uuid,
+                               target_uuid=subject,
+                               reason=slash_reason_for_channel(channel),
+                               floor_score=self.CHANNEL_SLASH_FLOOR)
+        _probes.counter('rep.channel', 'slash_proposed', str(channel))
+        self.logger.warning(
+            'Refuted by %s: task %s scored %.2f against peer %s; '
+            'proposing slash to floor %.2f',
+            channel, getattr(score, 'task_id', None), value, subject[:8],
+            self.CHANNEL_SLASH_FLOOR)
+        return self.forward_slash(queues, att)
 
     def handle_accepted(self, queues, message):
         if message.function == ReputationProtocol.accepted:
@@ -1302,7 +1423,16 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
         - No ``evidence_ref`` -> True (Phase 0 trust-the-detector fallback, so
           legacy / evidence-free slashes are unaffected).
-        - With ``evidence_ref`` -> the offending tx's inclusion proof must
+        - An ``evidence_ref`` that is not an inclusion proof at all -> also the
+          Phase-0 path. A detector's own verdict (the behaviour governor's
+          per-feature attribution, ``kind='behavioural_anomaly'``) is evidence
+          for a HUMAN, not something a co-signer can check, and running it
+          through the Merkle branch refused it on a missing 'leaf' key --
+          which quietly made every governor slash un-cosignable, i.e. the
+          SOW Task 3 path stopped at the proposer's own view. Accepting it
+          opens no hole that is not already open: a slasher wanting to dodge
+          the Merkle branch can simply send no evidence at all.
+        - With a Merkle ``evidence_ref`` -> the offending tx's inclusion proof must
           verify against a root this node has FINALIZED as a checkpoint. Tying
           it to our own quorum-agreed checkpoint — not a root chosen by the
           accuser — is what makes the evidence trustworthy. Any malformed /
@@ -1316,6 +1446,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         adding no security — each root cleared the same quorum test."""
         ev = attestation.evidence_ref
         if ev is None:
+            return True
+        # Kind dispatch before the Merkle branch: only an inclusion proof is
+        # verifiable here, and only an inclusion proof claims to be. A dict
+        # that carries no proof is a detector's own account of what it saw.
+        if isinstance(ev, dict) and not ({'leaf', 'proof', 'root'} <= set(ev)):
             return True
         if not self._checkpoints:
             return False  # nothing to verify against
