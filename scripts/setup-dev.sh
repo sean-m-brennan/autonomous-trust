@@ -152,9 +152,35 @@ update_conda_env() {
     # config/cfg/toolchain-pins.env and re-run the install path.
     activate_conda
     info "Updating conda environment '$ENV_NAME' ..."
-    conda env update -n "$ENV_NAME" --file "$REPO_DIR/environment.yml" --prune
+    # NO --prune. This env is described by TWO spec files, and prune deletes
+    # everything the file in hand does not name -- so pruning against
+    # environment.yml removes the whole dev toolchain that devel_environ.yml
+    # installs (gxx_linux-64, clang, poetry, pytest, ...). Two ways that bites,
+    # and it bit both on 2026-09-01, breaking the autonomous-trust-full-devel
+    # image build:
+    #   * `conda env update` runs the file's `pip:` block with -U in the SAME
+    #     invocation, after the prune. This runs inside the activated env, and
+    #     gxx_linux-64's activation script has already exported
+    #     CXX=x86_64-conda-linux-gnu-c++ -- so once the prune deletes that
+    #     package, a pip dep that has to compile (pykcs11 has no Linux wheel,
+    #     ever) invokes a compiler that is no longer there: "No such file or
+    #     directory: 'x86_64-conda-linux-gnu-c++'". The env is left with
+    #     dangling deactivate.d scripts, which is the tell.
+    #   * the failure aborts the run before the devel_environ.yml pass below
+    #     could put the toolchain back -- and an image that ships only
+    #     environment.yml (src/Dockerfile-devel did) never had that pass
+    #     available anyway, so the removal was permanent: a devel image with no
+    #     compiler, no poetry and no pytest.
+    # Losing prune costs only that a package dropped from a spec file lingers
+    # in an existing env until the env is recreated (the no-argument path,
+    # which runs `conda env create` against both files).
+    conda env update -n "$ENV_NAME" --file "$REPO_DIR/environment.yml"
     if [ -f "$CFG_DIR/devel_environ.yml" ]; then
         conda env update -n "$ENV_NAME" --file "$CFG_DIR/devel_environ.yml"
+    else
+        # Not fatal, but say so: the dev toolchain is what this env is FOR, and
+        # a silent skip is how an image ends up without a compiler.
+        warn "devel_environ.yml not found at $CFG_DIR — dev toolchain not updated"
     fi
     info "Environment updated"
 }

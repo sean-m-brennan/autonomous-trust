@@ -14,6 +14,7 @@
  *   limitations under the License.
  *******************/
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -84,8 +85,18 @@ static void _init_common(bootstrap_worker_t *w, double duration_sec,
     w->rng_state = seed;
     for (int i = 0; i < BOOTSTRAP_CAPABILITY_COUNT; i++) {
         w->counts_by_cap[i] = 0;
+        w->probes_by_cap[i] = 0;
         w->registered[i] = true;
     }
+    /* Defaults, so the explicit-config initializer (tests, conformance) gets a
+     * sane continuous phase without having to know about it. The env-reading
+     * initializer overrides both below. */
+    w->probe_interval_sec = AT_PROBE_DEFAULT_INTERVAL_SEC;
+    w->continuous_enabled = true;
+    w->probes_issued = 0;
+    w->last_probe_sec = 0.0;
+    w->probed_ever = false;
+    /* memset above already zeroed probes_by_peer. */
 }
 
 void bootstrap_worker_init(bootstrap_worker_t *w)
@@ -109,6 +120,10 @@ void bootstrap_worker_init(bootstrap_worker_t *w)
     const char *dis = getenv("AT_BOOTSTRAP_DISABLED");
     bool disabled = (dis != NULL && strcmp(dis, "1") == 0);
     _init_common(w, duration, pairs, seed, disabled);
+    w->probe_interval_sec = _read_float_env("AT_PROBE_INTERVAL_SEC",
+                                           AT_PROBE_DEFAULT_INTERVAL_SEC);
+    const char *nocont = getenv("AT_PROBE_CONTINUOUS_DISABLED");
+    w->continuous_enabled = !(nocont != NULL && strcmp(nocont, "1") == 0);
 }
 
 void bootstrap_worker_init_config(bootstrap_worker_t *w, double duration_sec,
@@ -165,6 +180,121 @@ bool bootstrap_worker_try_issue_pair(bootstrap_worker_t *w, size_t peer_count,
 void bootstrap_worker_tick(bootstrap_worker_t *w, size_t peer_count,
                            double now_sec, bootstrap_emit_fn emit, void *ctx)
 {
+    /* Window-only: no probe sink, so bootstrap_worker_tick_all stops after the
+     * window exactly as this function always has. Existing callers (the seeded
+     * unit tests and the conformance coverage pin) keep their behavior
+     * unchanged. */
+    bootstrap_worker_tick_all(w, peer_count, now_sec, emit, NULL, ctx);
+}
+
+/* ----------------------------------------------------------------------------
+ * Continuous probing (R+D.md §12.7)
+ * -------------------------------------------------------------------------- */
+
+double bootstrap_ucb_bonus(int count, int total)
+{
+    if (count < 0)
+        count = 0;
+    if (total < 0)
+        total = 0;
+    return sqrt(2.0 * log((double)total + 2.0) / ((double)count + 1.0));
+}
+
+size_t bootstrap_worker_select_target(const bootstrap_worker_t *w,
+                                     size_t peer_count)
+{
+    if (w == NULL || peer_count == 0)
+        return 0;
+    if (peer_count > AT_PROBE_MAX_TRACKED_PEERS) {
+        /* No per-peer state to compare beyond the cap. Round-robin rather than
+         * silently probing only the first AT_PROBE_MAX_TRACKED_PEERS peers,
+         * which would leave the rest permanently unchallenged. */
+        return (size_t)w->probes_issued % peer_count;
+    }
+    size_t best = 0;
+    double best_bonus = -1.0;
+    for (size_t i = 0; i < peer_count; i++) {
+        double bonus = bootstrap_ucb_bonus(w->probes_by_peer[i],
+                                          w->probes_issued);
+        /* Strict >: ties keep the lowest index, so the result does not depend
+         * on iteration direction and equal counts round-robin. */
+        if (bonus > best_bonus) {
+            best_bonus = bonus;
+            best = i;
+        }
+    }
+    return best;
+}
+
+const char *bootstrap_worker_select_capability(const bootstrap_worker_t *w)
+{
+    if (w == NULL)
+        return NULL;
+    /* transaction_weight is 1 for all three as registered today; read it from
+     * the registration table rather than hard-coding 1, so a ladder that
+     * weights them differently changes allocation with no change here. */
+    bootstrap_capability_t caps[BOOTSTRAP_CAPABILITY_COUNT];
+    if (register_bootstrap_capabilities(caps) != BOOTSTRAP_CAPABILITY_COUNT)
+        return NULL;
+    const char *best = NULL;
+    double best_score = -1.0;
+    for (int i = 0; i < BOOTSTRAP_CAPABILITY_COUNT; i++) {
+        if (!w->registered[i])
+            continue;
+        double weight = (double)caps[i].transaction_weight;
+        if (weight <= 0.0)
+            weight = 1.0;
+        double score = weight / ((double)w->probes_by_cap[i] + 1.0);
+        if (score > best_score) {
+            best_score = score;
+            best = BOOTSTRAP_CAPABILITY_NAMES[i];
+        }
+    }
+    return best;
+}
+
+bool bootstrap_worker_try_issue_probe(bootstrap_worker_t *w, size_t peer_count,
+                                     bootstrap_probe_emit_fn emit, void *ctx)
+{
+    if (w == NULL || peer_count == 0)
+        return false;
+    const char *cap_name = bootstrap_worker_select_capability(w);
+    if (cap_name == NULL)
+        return false;
+    int idx = _cap_index(cap_name);
+    if (idx < 0)
+        return false;
+    size_t target = bootstrap_worker_select_target(w, peer_count);
+
+    /* Same per-cap argument shapes as the window path, drawing from the same
+     * PRNG so a probe's challenge is as unpredictable as a bootstrap pair's --
+     * a fixed nonce would let a peer precompute the one right answer. */
+    long nonce = 0;
+    char echo_payload[32];
+    const char *payload_arg = NULL;
+    if (idx == 0) {                       /* at.handshake */
+        nonce = (long)(1 + _rng_below(w, 1000000));
+    } else if (idx == 2) {                /* at.echo-challenge */
+        uint32_t r = (uint32_t)_rng_next(w);
+        snprintf(echo_payload, sizeof(echo_payload), "echo:%08x", r);
+        payload_arg = echo_payload;
+    }
+
+    if (emit != NULL && !emit(ctx, cap_name, target, nonce, payload_arg))
+        return false;                     /* queue full → retry next tick */
+
+    if (target < AT_PROBE_MAX_TRACKED_PEERS)
+        w->probes_by_peer[target] += 1;
+    w->probes_by_cap[idx] += 1;
+    w->probes_issued += 1;
+    w->counts_by_cap[idx] += 1;
+    return true;
+}
+
+void bootstrap_worker_tick_all(bootstrap_worker_t *w, size_t peer_count,
+                               double now_sec, bootstrap_emit_fn emit,
+                               bootstrap_probe_emit_fn probe_emit, void *ctx)
+{
     if (w == NULL || w->disabled)
         return;
     if (!w->window_open) {
@@ -175,12 +305,24 @@ void bootstrap_worker_tick(bootstrap_worker_t *w, size_t peer_count,
             return;
         }
     }
-    if (w->pairs_issued >= w->pairs_target)
-        return;
     double elapsed = now_sec - w->window_start_sec;
-    if (elapsed > w->duration_sec)
+    bool window_done = (w->pairs_issued >= w->pairs_target
+                        || elapsed > w->duration_sec);
+    if (!window_done) {
+        bootstrap_worker_try_issue_pair(w, peer_count, emit, ctx);
         return;
-    bootstrap_worker_try_issue_pair(w, peer_count, emit, ctx);
+    }
+    if (!w->continuous_enabled || probe_emit == NULL)
+        return;
+    /* Rate limit. The first probe after the window closes goes immediately --
+     * waiting an interval to START probing serves nobody -- and every later
+     * one waits probe_interval_sec. Stamp before issuing, so a full queue does
+     * not turn into a retry on every tick exactly when the node is loaded. */
+    if (w->probed_ever && (now_sec - w->last_probe_sec) < w->probe_interval_sec)
+        return;
+    w->probed_ever = true;
+    w->last_probe_sec = now_sec;
+    bootstrap_worker_try_issue_probe(w, peer_count, probe_emit, ctx);
 }
 
 int bootstrap_worker_count_for(const bootstrap_worker_t *w, const char *cap_name)

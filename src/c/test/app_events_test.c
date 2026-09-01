@@ -204,10 +204,20 @@ DEFINE_TEST(test_drain_forwards_sibling_traffic_by_type)
 
     int sent = at_route_internal_msgs(&unhandled, "app_q", NULL);
 
-    /* Neither is app-bound. */
-    ck_assert_int_eq(sent, 0);
-    ck_assert_int_eq(count_to("app_q"), 0);
-    ck_assert_int_eq(count_to("reputation"), 1);
+    /* A finished task's result is app-bound; a status update is not.
+     *
+     * TASK_RESULT used to be forwarded to the reputation process "for
+     * scoring", and this test pinned that. Nothing there ever handled it --
+     * the reputation process routes net_msg payloads by function name plus
+     * its own locally-submitted TRANSACTION_SCORE -- so the result was
+     * received and dropped. Scoring now happens in the negotiation process,
+     * which holds the requestor's own record of what was asked and submits a
+     * TRANSACTION_SCORE from there (neg_proc.c handle_results); this hop
+     * delivers the result to the application, mirroring automate.py's put on
+     * the external-feedback queue. */
+    ck_assert_int_eq(sent, 1);
+    ck_assert_int_eq(count_to("app_q"), 1);
+    ck_assert_int_eq(count_to("reputation"), 0);
     ck_assert_int_eq(count_to("negotiation"), 1);
     ck_assert_int_eq((int)array_size(&unhandled), 0);
 

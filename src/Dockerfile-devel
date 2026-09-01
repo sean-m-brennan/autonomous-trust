@@ -38,7 +38,18 @@ COPY --chown=user:user src/autonomous-trust-services/autonomous_trust/services a
 COPY --chown=user:user src/autonomous-trust-simulator/autonomous_trust/simulator autonomous_trust/simulator
 
 # update and install any new dependencies from environment.yml
+#
+# BOTH spec files, and both where setup-dev.sh looks for them. The script reads
+# `$REPO_DIR/environment.yml` (= /app/environment.yml, the second copy below)
+# and `$CFG_DIR/devel_environ.yml` (= /app/config/cfg/devel_environ.yml). Only
+# environment.yml used to be copied, so the toolchain half of the update was a
+# silent no-op -- and while the update still pruned, that meant this image lost
+# the dev toolchain (gxx_linux-64, clang, poetry, pytest) the base image had
+# installed, with nothing to put it back. A devel image without a compiler also
+# cannot build the one pip dep that has no wheel; see the pykcs11 note in
+# config/cfg/environment.yml.
 COPY --chown=user:user config/cfg/environment.yml /build/config/cfg/environment.yml
 COPY --chown=user:user config/cfg/environment.yml ./environment.yml
+COPY --chown=user:user config/cfg/devel_environ.yml config/cfg/devel_environ.yml
 COPY --chown=user:user scripts/*.sh scripts/
 RUN scripts/setup-dev.sh --update

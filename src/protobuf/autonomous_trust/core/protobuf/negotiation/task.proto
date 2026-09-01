@@ -44,4 +44,18 @@ message Task {
   // type; a peer that has not been rebuilt simply omits it, and an omitted
   // sequence reads as 0, which the receiver refuses (sequences start at 1).
   int64 seq = 12;
+  // The invocation's keyword arguments, as a compact JSON object ("" for
+  // none). C twin of Python TaskParameters.kwargs; see task_t::kwargs_json.
+  //
+  // A JSON string rather than a map<string, ...> field because the values are
+  // heterogeneous (an integer nonce, a string echo token) and the C side
+  // hands the whole blob to the capability's executor without interpreting
+  // it. Only the C runtime uses this schema -- it is C's IPC encoding for a
+  // task (utilities/msg_types.c), and Python serializes a Task as a
+  // Configuration JSON dump -- so the shape follows what C needs to carry.
+  //
+  // Appended as field 13 for the same reason `seq` was appended as 12: every
+  // existing field keeps its number and wire type, and an omitted field
+  // unpacks as the empty string, which reads as "no keyword arguments".
+  string kwargs_json = 13;
 }

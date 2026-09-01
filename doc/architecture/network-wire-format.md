@@ -116,6 +116,26 @@ Two things fall out of that, both deliberate:
   presents as one peer having silently gone quiet; the counter is the only thing
   that says why.
 
+### Except where the bytes are not known to be an envelope
+
+One receive path gets the marker's verdict but not its *meaning*: the
+point-to-point frame from a sender we cannot yet place. There the bytes are as
+likely to be ciphertext awaiting the sender's admission as they are an
+envelope — and ciphertext is uniform bytes, so **one such frame in 256 opens
+with `0xAB` by chance**. Read as a foreign-format drop, those frames were
+discarded instead of deferred, which surfaced as an intermittent
+`Dropping point-to-point frame ... refusing a proto envelope` on a cohort where
+both nodes speak JSON (`tests/b_integration/test_two_node.py`).
+
+So on that path a refusal means only "not a plaintext JSON envelope", the same
+verdict a `UnicodeDecodeError` carries, and the frame is deferred for retry once
+the sender is known. Python: `_msg_to_queue(..., opaque=True)` re-raises rather
+than counting a drop, and the caller defers. C already did this — every parse
+failure in `handle_inbound_peer`'s unknown-sender branch reaches
+`defer_message`. Everywhere the bytes *are* known to be an envelope — a frame
+that decrypted, or the multicast/discovery channel, which never carries
+ciphertext — the refusal keeps its counter and its rate-limited log.
+
 The proto parser is additionally strict about emptiness: a frame must carry a
 non-empty `process` and `function`. Protobuf decodes plenty of arbitrary byte
 strings into an all-defaults message, and without that check a corrupt frame

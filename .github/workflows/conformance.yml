@@ -81,8 +81,12 @@ jobs:
           auto-activate-base: false
 
       - name: Layer dev/test deps from devel_environ.yml
-        # Same env name (autonomous_trust); --prune keeps it consistent
-        # with the union of both spec files.
+        # Same env name (autonomous_trust), layered rather than pruned. The
+        # env is the UNION of two spec files, so `--prune` against either one
+        # deletes what the other named -- notably the gxx_linux-64 toolchain
+        # this file installs, which the pip build of pykcs11 needs. The comment
+        # here used to claim a --prune the command never passed; scripts/
+        # setup-dev.sh had the real one and it broke a build on 2026-09-01.
         run: mamba env update -n autonomous_trust -f config/cfg/devel_environ.yml
 
       - name: Show toolchain
