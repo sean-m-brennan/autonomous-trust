@@ -99,6 +99,14 @@ class _Participant:
         # it to resolve pid -> Identity.uuid for self.process.reputations
         # lookups.
         self._all_participants: dict[str, '_Participant'] = {}
+        # Cumulative count of slash proposals this participant ORIGINATED,
+        # tallied in _record_and_put rather than read off a drained outbox:
+        # the engine clears the outbox each step, and the assertion this
+        # exists for is "over the whole scenario, none" (R+D.md §12.8). A
+        # per-step outbox cannot express that, and the engine's step matching
+        # is permissive about extra messages, so an unpinned stray proposal
+        # would pass silently.
+        self.slashes_proposed = 0
 
     def drain_outbox(self) -> list[CapturedMessage]:
         captured: list[CapturedMessage] = []
@@ -270,6 +278,21 @@ class _Participant:
                 if actual != bool(expected):
                     raise AssertionError(
                         f'{self.id}: last_id_set={actual}, expected {expected}'
+                    )
+            elif key == 'slashes_proposed':
+                # How many slash proposals this participant ORIGINATED
+                # (R+D.md §12.8). Its reason for existing is the zero case:
+                # a hard-channel refutation that arrived FROM A PEER must not
+                # let that peer accuse a third party, because the sender picks
+                # its own channel tag. Both runtimes enforce that structurally
+                # -- the accused subject is local-only and never serialized --
+                # and this key is what makes the two agree about it in the
+                # corpus rather than only in each side's unit tests.
+                actual = self.slashes_proposed
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: slashes_proposed={actual}, '
+                        f'expected {expected}'
                     )
             elif key == 'requests_count':
                 actual = len(self.process.requests)
@@ -506,6 +529,9 @@ class ReputationAdapter:
                 score = TransactionScore(
                     task_id=str(uuid5(_NS, f'tx:{entry.get("task_id", "default")}')),
                     score=float(entry.get('score', 1.0)),
+                    # Absent -> TX_CHANNEL_TASK_OUTCOME, so every existing
+                    # scenario keeps its meaning unchanged (R+D.md §12.8).
+                    channel=entry.get('channel'),
                 )
                 participant.process.my_requests[idx] = TxCount(score, 0)
                 # Also stage the proposals dict so handle_grant /
@@ -633,6 +659,8 @@ class ReputationAdapter:
         def _record_and_put(item, *args, **kwargs):
             if isinstance(item, Message):
                 captured.outbox_buffer.append(item)
+                if item.function == ReputationProtocol.slash_propose:
+                    captured.slashes_proposed += 1
             original_put(item, *args, **kwargs)
 
         queues[CfgIds.network].put = _record_and_put  # type: ignore[method-assign]
@@ -792,6 +820,11 @@ class ReputationAdapter:
             score = TransactionScore(
                 task_id=str(uuid5(_NS, f'tx:{payload.get("task_id", "default")}')),
                 score=float(payload.get('score', 1.0)),
+                # Lets a scenario drive the evidence channel across the wire and
+                # assert the C twin agrees on the closed set -- including that an
+                # unknown spelling is REFUSED by both (R+D.md §12.8). Absent
+                # keeps the pre-channel behavior.
+                channel=payload.get('channel'),
             )
             obj = to_json_string((id_tup, score))
         elif function == ReputationProtocol.accepted:

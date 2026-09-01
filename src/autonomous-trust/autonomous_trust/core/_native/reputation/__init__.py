@@ -24,5 +24,15 @@ from ._native_wrappers import (
 # API-compatible exports from Python backend
 from ..._python.reputation.protocol import ReputationProtocol
 from ..._python.reputation.reputation import (TransactionHistory, Reputations,
-                                              TransactionScore, PeerReputation)
+                                              TransactionScore, PeerReputation,
+                                              TX_CHANNELS, TX_CHANNEL_DEFAULT,
+                                              TX_CHANNEL_TASK_OUTCOME,
+                                              TX_CHANNEL_PHYSICAL,
+                                              TX_CHANNEL_CERTIFICATE,
+                                              TX_CHANNEL_CALIBRATION,
+                                              TX_CHANNEL_SELF_CONSISTENCY,
+                                              TX_CHANNEL_REPLICATION,
+                                              TX_CHANNEL_SWARM_DISAGREEMENT,
+                                              TX_CHANNEL_PROBE,
+                                              validate_tx_channel)
 from ..._python.reputation.repprocess import ReputationProcess

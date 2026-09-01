@@ -97,6 +97,19 @@ typedef struct {
     uuid_t task_uuid;
     map_t results;     /* uuid_str -> data_t* (result blob) */
     int expected;
+    /** What WE asked for, kept so the returned result can be judged against
+     *  it. Python's TaskTracker subclasses Task and so keeps the whole
+     *  `parameters` for free; this is the same fact, narrowed to the two
+     *  pieces the requestor-side scorer needs.
+     *
+     *  It must be our own record and never anything read back off the
+     *  responder's reply: a known-answer check that trusts the reply's account
+     *  of the challenge verifies nothing, because a peer that computed the
+     *  wrong answer reports the challenge its answer would have satisfied
+     *  (result 99 with a claimed nonce of 98 is a perfect increment). Mirrors
+     *  Python TaskResult.attach_requested_parameters. See R+D.md §12.7. */
+    char capability_name[CAP_NAMELEN + 1];
+    char kwargs_json[TASK_KWARGS_LEN + 1];
 } task_tracker_t;
 
 /*@
@@ -142,6 +155,21 @@ int  task_tracker_set_result(task_tracker_t *tracker, const uuid_t peer_uuid, co
   ensures \result >= 0;
 */
 int  task_tracker_result_count(const task_tracker_t *tracker);
+
+/** Record what the requestor asked for on this tracker: the capability name
+ *  and the compact-JSON keyword arguments (either may be NULL, which clears
+ *  that field). Separate from @ref task_tracker_init so the existing
+ *  two-and-three-argument creators keep their signatures; call it from the
+ *  announce path, where the task is still in hand. */
+/*@
+  requires \valid(tracker);
+  assigns tracker->capability_name[0 .. CAP_NAMELEN],
+          tracker->kwargs_json[0 .. TASK_KWARGS_LEN];
+  ensures \result == 0;
+*/
+int  task_tracker_set_request(task_tracker_t *tracker,
+                              const char *capability_name,
+                              const char *kwargs_json);
 
 /*@
   requires \valid(tracker);

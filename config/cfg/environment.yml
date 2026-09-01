@@ -80,5 +80,29 @@ dependencies:
 
   - pip
   - pip:
-      - pykcs11  # operator: PKCS#11 second-factor binding
+      # Pinned at a FLOOR-CRITICAL version, not for reproducibility. pykcs11
+      # publishes no Linux wheel for any version (PyPI index checked
+      # 2026-09-01 -- macOS and Windows only), so on this platform pip always
+      # builds its SWIG/C++ extension from the sdist, with whatever `swig` its
+      # unpinned build-requirement resolves to. PyPI now ships swig 4.5.0, and
+      # SWIG 4.3 REMOVED the Python-2 compatibility macros
+      # (`#define PyInt_FromLong PyLong_FromLong` and friends). 1.5.18's
+      # interface file still uses `PyInt_FromLong` (src/pykcs11.i:66), so its
+      # generated wrapper no longer compiles anywhere:
+      #     error: 'PyInt_FromLong' was not declared in this scope
+      # 1.5.19 removed the Python-2 API. Verified both directions outside
+      # docker on 2026-09-01: 1.5.18 fails exactly as above, 1.5.19 builds and
+      # imports. Do NOT move this below 1.5.19.
+      #
+      # Also worth knowing, since it is the other way this dep breaks a build:
+      # `conda env update` runs this block with pip's -U, INSIDE the activated
+      # env. The conda `gxx_linux-64` package (a devel_environ.yml dep)
+      # exports CXX=x86_64-conda-linux-gnu-c++ from its activation script, so
+      # removing that package while the variable stays exported -- which is
+      # what `conda env update --prune` against this file did, since this file
+      # names no compiler -- leaves pip invoking a compiler that is no longer
+      # there. scripts/setup-dev.sh no longer prunes. An env built from this
+      # file ALONE has no conda compiler, exports no CXX, and builds against
+      # what python's sysconfig names, which an apt g++ satisfies.
+      - pykcs11==1.5.19  # operator: PKCS#11 second-factor binding
       - mediapipe>=0.10.5  # services: on-node EfficientDet object detection (VideoProcessor)

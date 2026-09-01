@@ -219,25 +219,134 @@ transaction, scoring 0.9 or 0.1. The defection is hard to commit accidentally,
 since a malicious modification has to survive the signature check, which forces
 it to be a real attack rather than a transmission glitch.
 
+*Checking the answer.* The scores above are the point of the corpus, and until
+2026-08-21 they were not actually awarded: the verifiers existed in both
+runtimes and nothing called them. The cause was structural rather than a
+forgotten call. A returned result carries no task parameters, so the requestor's
+scorer knew neither which capability had produced a result nor what challenge
+had been sent, and it fell back to scoring completion — 0.8 for anything that
+came back at all. A peer that echoed a tampered payload, replayed a stale nonce,
+or lied about its clock scored exactly what an honest peer scored.
+
+The requestor's own negotiation process now stamps each returned result with the
+capability name and the challenge it sent, taken from the task it retained, and
+the scorer dispatches on that. The provenance matters more than the plumbing: a
+known-answer check that reads the challenge out of the *reply* verifies nothing,
+because a peer that computed the wrong answer can simply report the challenge
+its answer would have been right for. Nothing secret moves — the challenge was
+sent to the responder in the first place — so what is being protected is
+integrity, not confidentiality. When no retained record is available the fields
+are cleared rather than left as the peer supplied them, and an absent capability
+name reads downstream as "not a probe", which falls back to ordinary scoring.
+
+Probe scores carry the `probe` evidence channel, which keeps "failed a
+known-answer challenge" distinguishable from "scored badly on a task" even
+though both may be the same number. See
+[Reputation](reputation.md), "Where a score came from".
+
 *The worker.* A core worker, registered by default, opens a window of roughly
 thirty seconds of random pairwise interactions across all admitted peers on
 admission, picking uniformly among handshake, attestation, and echo. Three
 environment variables configure it, being the window duration defaulting to
 thirty seconds, the per-peer interaction count defaulting to twenty, and a
 disable flag for unit tests that want a quiet network. A seed variable is
-honored so tests and scenarios get deterministic sequences. After the window
-closes the worker stops scheduling new pairs and in-flight transactions complete
-normally, by which point reputation has accumulated enough bilateral entries to
-move peers off tier 0.
+honored so tests and scenarios get deterministic sequences. By the time the
+window closes, reputation has accumulated enough bilateral entries to move peers
+off tier 0.
+
+*Probing past the window.* The worker does not then fall silent. A window-only
+corpus applies the known-answer pattern solely at cold start, so a peer has to
+misbehave inside its first thirty seconds to ever meet a challenge whose answer
+is already known, and one that degrades later — or that behaves well precisely
+until it is trusted — is never challenged again. Since a probe is the only
+evidence that does not weaken as the adversarial fraction of the cohort rises,
+confining it to the opening seconds gives away the anchor. Continuous probing is
+rate-limited rather than scheduled, at one probe per sixty seconds by default,
+because each one costs a real task round trip on both peers; an environment
+variable sets the interval and another restores the historical window-only
+behavior.
+
+Allocation differs between the two phases, and the split is principled rather
+than incidental. Inside the window every peer is equally unknown, so there is no
+posterior to be widest and uniform-random selection is correct — it is also what
+the seeded conformance pin measures. Once counts diverge, probes go where they
+buy the most: the peer chosen is the one with the widest interval over its
+quality, scored as the standard UCB exploration term over how many times it has
+been challenged, and the capability chosen maximizes its declared transaction
+weight divided by its own probe count. The two use different rules on purpose.
+For a peer there is a bad arm to identify, which is what UCB is for. For a
+capability there is nothing to identify — the question is how to divide a fixed
+budget across capabilities of differing stakes — and weight-over-count settles
+at per-capability counts proportional to weight, which spends more where it
+matters while still exercising everything. Ranking capabilities by weight alone
+would probe the heaviest forever and leave an adversary a single challenge to
+answer correctly.
+
+Probes are addressed to one peer, where window invitations fan out to every
+capable peer. That is load-bearing: a fanned-out invitation is answered by
+whichever peer replies first, so a broadcast cannot express "probe this peer"
+and a slow peer would never be probed at all, which would make allocation
+meaningless.
 
 Both runtimes carry the corpus. The Python side auto-registers all three
 capabilities on every instance, with server-side functions and client-side
 verifiers shipping as first-version constructions rather than
 zero-knowledge-strength ones. The C side carries matching implementations, a
-name registry, and a seeded worker using its own pseudorandom generator. The
-conformance pin uses an observable that is agnostic to the generator, being the
-coverage set rather than the selection sequence, so the two runtimes need not
-produce identical orderings to be held to the same contract.
+name registry, a seeded worker using its own pseudorandom generator, and the
+same probe dispatcher and allocation rules. The conformance pin for the window
+uses an observable that is agnostic to the generator, being the coverage set
+rather than the selection sequence, so the two runtimes need not produce
+identical orderings to be held to the same contract; the probe allocation is
+deterministic in both, so its pin asserts probe and peer counts directly.
+
+That bound on C parity is now closed, and how it was closed is worth stating
+because it did not simply mirror the Python arrangement. Until it was, the C
+corpus was a tested library rather than a running subsystem: nothing in
+production C supplied the worker's invitation sink, and the C negotiation
+process had no task-result-to-reputation path at all, so no C node scored a
+probe end to end. Three separate things were missing, not one.
+
+*The challenge could not cross.* C's serialized task carried the capability
+name, the schedule and the freshness sequence, and nothing about the
+invocation's arguments. A responder cannot answer a challenge it cannot see, so
+the task now carries its keyword arguments as a compact JSON object — the
+carriage of Python's task parameters, as a string rather than a parsed map
+because a task is copied by value at three hops and a map would need an owner at
+each. It is field 13 of the task schema, appended so every existing field keeps
+its number, and the requestor keeps its own copy on the result tracker.
+
+*A capability could be invoked but not collected.* The C capability signature
+returns void, so a worker had nothing to report even after running the work.
+Capabilities may now also declare a result-producing entry point, taking the
+keyword arguments and writing an answer as text, and the three bootstrap
+capabilities declare one. Existing fire-and-forget capabilities are untouched:
+either shape is allowed, and a capability offering neither reports no result,
+which a requestor scores as an empty return.
+
+*Nothing ran the accepted work.* An accepted invitation was pushed onto the job
+queue and sat there — the pop had no caller anywhere in the tree. The
+negotiation process now drains due jobs on its own loop, executes them, reports
+each answer to the requestor, and submits its own executor half of the bilateral
+transaction. The same loop ticks the prober, so the invitation sink the worker
+always needed is the announce path of the process it runs in. Python keeps the
+prober in a process of its own; C folds it into the process that owns the
+announce path, which is the same probes and the same allocation rules with one
+fewer process.
+
+The scoring itself lives in C's negotiation process rather than its main
+process, where Python scores. The judgment needs what the requestor asked for,
+and that is what the negotiation process retained; carrying the capability and
+the challenge onward to the main process would have meant widening an
+inter-process struct that the foreign-function mirror also declares, to move a
+fact that was already in hand. So the two runtimes cannot share a call site,
+which is why the conformance corpus pins the *rules* — a scenario feeds a table
+of replies through each runtime's own scorer and asserts the score and the
+channel for each.
+
+One thing did not survive the mirroring and is recorded rather than papered
+over: the two runtimes still disagree on when a fan-out is complete. Python
+forwards on the first reply; C waits for every peer it invited. For a probe,
+which is addressed to exactly one peer, the two agree. See ISSUES.md.
 
 ## 7. Moving up and moving down
 
@@ -363,6 +472,17 @@ for the other.
 New scenarios cover the bootstrap corpus running on admission, refusal below a
 required tier, tier loss cancelling a running task, weighted pure reputation,
 and the trust-agreement threshold filter.
+
+`bootstrap/probes-continue-past-the-window` pins the continuous phase: that
+probing does not stop when the window closes, that probes spread across peers
+rather than piling onto one, and that every capability keeps being exercised.
+Unlike the window's pin, which is deliberately agnostic to each runtime's
+pseudorandom generator, probe allocation is deterministic in both, so this one
+asserts counts directly. It does not cover whether an answer is *checked* —
+that is requestor-side scoring rather than worker behavior, exists only in
+Python, and is pinned by unit tests on both sides
+(`tests/a_unit/test_probe_verification.py`,
+`src/c/test/bootstrap_capabilities_test.c`).
 
 Existing scenarios survive unchanged where the observable behavior is the same.
 The old low-reputation refusal still holds, because tier 0 still refuses any

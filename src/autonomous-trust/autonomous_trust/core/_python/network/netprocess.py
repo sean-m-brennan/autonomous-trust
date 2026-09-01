@@ -651,8 +651,26 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 except IndexError:
                     break
                 peer = self.peers.find_by_address(from_addr)
+                decrypt_msg = None
                 if peer is not None:
-                    decrypt_msg = self.myself.decrypt(raw_msg, peer)
+                    try:
+                        decrypt_msg = self.myself.decrypt(raw_msg, peer)
+                    except Exception as err:
+                        # Not this peer's ciphertext after all -- unrelated
+                        # noise from that address, a frame under a key that has
+                        # since rotated, or a plaintext frame that only looked
+                        # opaque. An unguarded decrypt here KILLED this thread
+                        # (both loops are inside the `while not self.stop`),
+                        # which silently retired the whole out-of-order queue
+                        # for the life of the node. Retained rather than
+                        # dropped, matching C's replay pass, which keeps a
+                        # deferred entry whose decrypt fails and lets the age
+                        # bound below reclaim it.
+                        _probes.counter('net.mystery', 'decrypt_failed')
+                        self.logger.debug(
+                            'Deferred message from %s still does not decrypt '
+                            '(%s); retaining until it ages out', from_addr, err)
+                if decrypt_msg is not None:
                     self._msg_to_queue(decrypt_msg, peer, queues, 'point-to-point',
                                        wire_format=self._wire_format_for_addr(from_addr))
                     _probes.counter('net.mystery', 'resolved')
@@ -722,11 +740,27 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         return True
 
     def _msg_to_queue(self, msg, from_whom, queues, rcvd_by, validate=True,
-                      wire_format=NetWireFormat.json):
+                      wire_format=NetWireFormat.json, opaque=False):
+        """Parse *msg* in *wire_format* and route it.
+
+        *opaque* says the caller does not yet know whether these bytes are an
+        envelope at all -- the unknown-sender point-to-point path, where the
+        frame is just as likely to be ciphertext awaiting the sender's
+        admission. There, a format-marker refusal is NOT the diagnosis "a
+        misprovisioned cohort is talking proto at us": ciphertext is uniform
+        bytes, so one frame in 256 opens with NET_WIRE_PROTO_MAGIC by chance.
+        The refusal is re-raised instead of being counted and logged as a
+        foreign-format drop, so the caller defers the frame exactly as it does
+        for ciphertext that fails to decode -- which is what C's
+        handle_inbound_peer already does (every parse failure on that path
+        reaches defer_message).
+        """
         try:
             message = Message.parse(msg, from_whom, validate=validate,
                                     wire_format=wire_format)
         except WireFormatMismatch as err:
+            if opaque:
+                raise
             # The frame is in a format this context does not speak (doc/architecture/network-wire-format.md). The
             # parser for that format was never run over it, which is the point.
             # Counted and logged rate-limited rather than silently dropped: a
@@ -1042,9 +1076,14 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                             # JSON, not a lookup: we could not place this sender
                             # in any group, and a frame from an unplaced sender
                             # is bootstrap traffic by definition (doc/architecture/network-wire-format.md).
-                            self._msg_to_queue(raw_msg, from_addr, queues, 'point-to-point', validate=False)
+                            # `opaque`: these bytes are as likely to be
+                            # ciphertext as an envelope, so a format-marker
+                            # refusal means "not a plaintext JSON envelope"
+                            # (defer it), not "foreign cohort" (drop it).
+                            self._msg_to_queue(raw_msg, from_addr, queues, 'point-to-point',
+                                               validate=False, opaque=True)
                             _probes.counter('net.ptp', 'unknown_sender', 'parsed_unencrypted')
-                        except UnicodeDecodeError:
+                        except (UnicodeDecodeError, WireFormatMismatch):
                             _probes.counter('net.ptp', 'unknown_sender', 'deferred_encrypted')
                             self.logger.debug('Out-of-order message from %s detected, retry later', from_addr)
                             # Stamp the deferral time here, as C does in

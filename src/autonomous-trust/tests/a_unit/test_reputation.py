@@ -90,6 +90,353 @@ class TestTransactionScoreRange:
         assert (TX_SCORE_MIN, TX_SCORE_MAX) == (0.0, 1.0)
 
 
+class TestTransactionScoreChannel:
+    """Evidence channels (R+D.md §12.8, doc/verification_oracle.md "Keep the
+    channels separate"). A score says how well a peer did; the channel says how
+    we know. "Refuted by conservation of energy" and "failed a replicated task"
+    warrant different responses, and collapsing both into one scalar before the
+    reputation algebra sees it destroys what an escalation path would need.
+
+    The first slice was legibility only; the second (R+D.md §12.8's
+    differentiated responses) gives the channel consequences. These tests pin
+    the vocabulary, the closed-set refusal and the wire round-trip; what the
+    channel now DOES is pinned in TestChannelResponses below."""
+
+    def test_default_is_task_outcome(self):
+        """Every producer predating the field was grading a completed task, so
+        absence has one right answer rather than needing a None sentinel."""
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_TASK_OUTCOME)
+        ts = TransactionScore(task_id=uuid4(), score=0.9)
+        assert ts.channel == TX_CHANNEL_TASK_OUTCOME
+
+    @pytest.mark.parametrize('channel', [None, ''])
+    def test_absence_normalizes_rather_than_staying_none(self, channel):
+        """Normalized so a reader never has to know whether None meant "task
+        outcome" or "producer forgot"."""
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_DEFAULT)
+        ts = TransactionScore(task_id=uuid4(), score=0.9, channel=channel)
+        assert ts.channel == TX_CHANNEL_DEFAULT
+
+    def test_every_known_channel_is_accepted(self):
+        from autonomous_trust.core.reputation.reputation import TX_CHANNELS
+        for channel in TX_CHANNELS:
+            ts = TransactionScore(task_id=uuid4(), score=0.9, channel=channel)
+            assert ts.channel == channel
+
+    @pytest.mark.parametrize('channel', ['nonsense', 'physicall',
+                                         'task-outcome', 'Physical', 'PHYSICAL'])
+    def test_unknown_is_refused_not_coerced(self, channel):
+        """Refused rather than passed through OR silently defaulted. Passing it
+        through makes the channel "some string a peer sent"; defaulting it turns
+        a typo'd physics refutation into an ordinary task grade with no trace
+        that anything was lost. Case-sensitive because a closed set that
+        accepts near-misses is not closed."""
+        with pytest.raises(ValueError):
+            TransactionScore(task_id=uuid4(), score=0.9, channel=channel)
+
+    def test_a_non_string_is_refused(self):
+        with pytest.raises(ValueError):
+            TransactionScore(task_id=uuid4(), score=0.9, channel=7)
+
+    def test_the_message_names_the_vocabulary(self):
+        """An operator reading the log needs to know what WOULD have been
+        accepted, not just that this was not."""
+        with pytest.raises(ValueError, match=r'task_outcome'):
+            TransactionScore(task_id=uuid4(), score=0.9, channel='nope')
+
+    def test_the_wire_form_is_checked_too(self):
+        """Same reasoning as the score bound: `from_json_string` reconstructs
+        via `cls(**kwargs)`, so the constructor IS the wire-side gate, and the
+        handlers catch ValueError rather than let a peer raise inside the
+        process loop."""
+        from autonomous_trust.core import from_json_string, to_json_string
+        good = TransactionScore(task_id=uuid4(), score=0.5, channel='physical')
+        payload = to_json_string(good).replace('"physical"', '"physicall"')
+        with pytest.raises(ValueError):
+            from_json_string(payload)
+
+    def test_the_channel_survives_the_wire(self):
+        from autonomous_trust.core import from_json_string, to_json_string
+        ts = TransactionScore(task_id=uuid4(), score=0.5,
+                              capability_name='cap', channel='self_consistency')
+        back = from_json_string(to_json_string(ts))
+        assert back.channel == 'self_consistency'
+        assert back.capability_name == 'cap'
+        assert back.score == 0.5
+
+    def test_a_legacy_payload_without_the_field_still_parses(self):
+        """A peer running a build from before channels existed is absent, not
+        wrong — its scores must keep flowing."""
+        import json
+        from autonomous_trust.core import from_json_string, to_json_string
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_TASK_OUTCOME)
+        payload = json.loads(to_json_string(
+            TransactionScore(task_id=uuid4(), score=0.5)))
+        del payload['channel']
+        back = from_json_string(json.dumps(payload))
+        assert back.channel == TX_CHANNEL_TASK_OUTCOME
+
+    def test_the_vocabulary_matches_the_c_twin(self):
+        """These strings cross the wire verbatim, so a divergence from the C
+        twin's TX_CHANNEL_* is a score one side accepts and the other drops.
+        Pinned as literals here and in reputation3_test.c so a rename cannot
+        pass silently on one side."""
+        from autonomous_trust.core.reputation.reputation import TX_CHANNELS
+        assert TX_CHANNELS == ('task_outcome', 'physical', 'certificate',
+                               'calibration', 'self_consistency',
+                               'replication', 'swarm_disagreement', 'probe')
+
+    def test_the_channel_does_not_reach_the_chain_entry_hash(self):
+        """The channel rides on the TS and stops at the chain boundary: a
+        committed entry answers "who transacted, and how well," and the channel
+        is provenance for the score rather than part of the committed fact.
+        Pinned because adding it to the canonical bytes would silently change
+        every entry hash in every resident chain and break C parity."""
+        tx = Transaction(task_id=uuid4(), p1_id=uuid4(), p1_score=0.9,
+                         p2_id=uuid4(), p2_score=0.5, index=0)
+        assert b'physical' not in tx._canonical_bytes()
+        assert b'task_outcome' not in tx._canonical_bytes()
+        assert b'channel' not in tx._canonical_bytes()
+
+    def test_a_remote_channel_does_not_change_the_weight(self):
+        """A peer picks its own channel, so honoring its tag would let anyone
+        treble the weight of a score they fabricated. The wire path
+        (`handle_transaction`) therefore weights by capability alone, exactly
+        as before channels existed."""
+        proc = ReputationProcess.__new__(ReputationProcess)
+        proc.capabilities = []
+        plain = TransactionScore(task_id=uuid4(), score=0.9)
+        tagged = TransactionScore(task_id=uuid4(), score=0.9,
+                                  channel='physical')
+        assert (proc._resolve_tx_weight(plain)
+                == proc._resolve_tx_weight(tagged))
+
+    def test_the_subject_never_reaches_the_wire(self):
+        """`subject_uuid` is the requestor's own attribution. Dropping it from
+        the serialized form is what makes "locally-produced evidence only"
+        structural: a score off the wire has no subject to accuse."""
+        from autonomous_trust.core import from_json_string, to_json_string
+        ts = TransactionScore(task_id=uuid4(), score=0.1, channel='physical',
+                              subject_uuid=uuid4())
+        payload = to_json_string(ts)
+        assert 'subject_uuid' not in payload
+        assert from_json_string(payload).subject_uuid is None
+
+
+
+class TestChannelResponses:
+    """What a channel DOES (R+D.md §12.8, the differentiated responses).
+
+    Two responses, and one rule that bounds both: a channel only has power
+    over evidence THIS node produced. The scorer chooses its own channel, so
+    the moment a remote tag carries weight or an accusation, every peer holds
+    a lever on every other peer's reputation.
+
+    Mirror in C: reputation3_test.c (tx_channel weights + hard set) and the
+    `reputation/channel-*` conformance scenarios.
+    """
+
+    # --- weighting --------------------------------------------------------
+
+    def _proc(self, **attrs):
+        proc = ReputationProcess.__new__(ReputationProcess)
+        proc.capabilities = []
+        for k, v in attrs.items():
+            setattr(proc, k, v)
+        return proc
+
+    def test_a_local_hard_channel_outweighs_a_task_outcome(self):
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_PHYSICAL, TX_CHANNEL_TASK_OUTCOME)
+        proc = self._proc()
+        graded = TransactionScore(task_id=uuid4(), score=0.3,
+                                  channel=TX_CHANNEL_TASK_OUTCOME)
+        refuted = TransactionScore(task_id=uuid4(), score=0.3,
+                                   channel=TX_CHANNEL_PHYSICAL)
+        assert (proc._resolve_tx_weight(refuted, local=True)
+                > proc._resolve_tx_weight(graded, local=True))
+
+    def test_calibration_stays_at_the_baseline(self):
+        """The oracle doc names calibration as the channel that should decay a
+        peer GRADUALLY; amplifying it would be the opposite."""
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_CALIBRATION)
+        proc = self._proc()
+        ts = TransactionScore(task_id=uuid4(), score=0.3,
+                              channel=TX_CHANNEL_CALIBRATION)
+        assert proc._resolve_tx_weight(ts, local=True) == 1
+
+    def test_swarm_disagreement_stays_at_the_baseline(self):
+        """It should open a DISPUTE, not levy a bigger penalty — a majority is
+        not an oracle. Until the dispute path exists, the honest response is
+        no amplification at all."""
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_SWARM_DISAGREEMENT)
+        proc = self._proc()
+        ts = TransactionScore(task_id=uuid4(), score=0.3,
+                              channel=TX_CHANNEL_SWARM_DISAGREEMENT)
+        assert proc._resolve_tx_weight(ts, local=True) == 1
+
+    def test_the_channel_multiplies_the_capability_weight(self):
+        """They compose rather than override: a heavy capability refuted on
+        physics is both."""
+        from types import SimpleNamespace as NS
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_PHYSICAL, tx_channel_weight)
+        proc = self._proc(protocol=NS(capabilities={
+            'heavy': NS(transaction_weight=4)}))
+        ts = TransactionScore(task_id=uuid4(), score=0.3,
+                              capability_name='heavy',
+                              channel=TX_CHANNEL_PHYSICAL)
+        assert (proc._resolve_tx_weight(ts, local=True)
+                == 4 * tx_channel_weight(TX_CHANNEL_PHYSICAL))
+
+    def test_an_unknown_channel_never_outweighs_a_known_one(self):
+        """Reading a raw string off an older record must not amplify it, or
+        adding a channel on one side of the wire would silently give it weight
+        on the other."""
+        from autonomous_trust.core.reputation.reputation import tx_channel_weight
+        assert tx_channel_weight('a_channel_from_the_future') == 1
+
+    # --- slash eligibility ------------------------------------------------
+
+    def _slash_proc(self, peer_uuid, self_uuid=None, **attrs):
+        from types import SimpleNamespace as NS
+        proposed = []
+        proc = ReputationProcess.__new__(ReputationProcess)
+        proc.identity = NS(uuid=self_uuid or uuid4())
+        proc.protocol = NS(peers=NS(all=[NS(uuid=peer_uuid)]))
+        proc.logger = NS(warning=lambda *a, **k: None,
+                         info=lambda *a, **k: None,
+                         debug=lambda *a, **k: None,
+                         error=lambda *a, **k: None)
+        proc.forward_slash = lambda q, att: proposed.append(att) or True
+        for k, v in attrs.items():
+            setattr(proc, k, v)
+        return proc, proposed
+
+    def _score(self, subject, channel, score=0.3):
+        return TransactionScore(task_id=uuid4(), score=score,
+                                channel=channel, subject_uuid=subject)
+
+    def test_a_local_refutation_proposes_a_slash(self):
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_CERTIFICATE)
+        peer = uuid4()
+        proc, proposed = self._slash_proc(peer)
+        # 0.3 is the real case: automate.py scores an INVALID ZKP proof 0.3 on
+        # the certificate channel (R+D.md §12.8's own worked example).
+        assert proc._maybe_slash_for_channel(
+            {}, self._score(peer, TX_CHANNEL_CERTIFICATE, 0.3)) is True
+        assert len(proposed) == 1
+        assert str(proposed[0].target_uuid) == str(peer)
+        assert proposed[0].floor_score == ReputationProcess.CHANNEL_SLASH_FLOOR
+
+    def test_the_reason_names_the_channel(self):
+        """The demotion reason is the whole point of the entry, and `reason` is
+        inside `designation`, so it is signed and co-signed — unlike
+        evidence_ref, it cannot be altered in flight."""
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_PHYSICAL)
+        peer = uuid4()
+        proc, proposed = self._slash_proc(peer)
+        proc._maybe_slash_for_channel(
+            {}, self._score(peer, TX_CHANNEL_PHYSICAL))
+        assert proposed[0].reason == 'refuted_physical'
+        assert b'refuted_physical' in proposed[0].designation
+
+    def test_the_floor_is_demotion_not_exclusion(self):
+        """0.45 drops the peer to tier 0 but leaves it above COMM_CUTOFF, so it
+        is shed by tier-gated negotiation and can still earn its way back.
+        Exclusion is sticky and operator-only, which is far too heavy for one
+        automated verdict."""
+        assert (ReputationProcess.CHANNEL_SLASH_FLOOR
+                > ReputationProcess.COMM_CUTOFF)
+        assert ReputationProcess.CHANNEL_SLASH_FLOOR < 0.5
+
+    def test_a_passing_score_on_a_hard_channel_is_silent(self):
+        """A physical check that PASSES is the common case."""
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_PHYSICAL)
+        peer = uuid4()
+        proc, proposed = self._slash_proc(peer)
+        assert proc._maybe_slash_for_channel(
+            {}, self._score(peer, TX_CHANNEL_PHYSICAL, 0.95)) is False
+        assert proposed == []
+
+    def test_a_graded_channel_never_slashes(self):
+        """A bad task grade is a grade, however bad."""
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_TASK_OUTCOME, TX_CHANNEL_PROBE)
+        peer = uuid4()
+        for channel in (TX_CHANNEL_TASK_OUTCOME, TX_CHANNEL_PROBE):
+            proc, proposed = self._slash_proc(peer)
+            assert proc._maybe_slash_for_channel(
+                {}, self._score(peer, channel, 0.0)) is False
+            assert proposed == []
+
+    def test_a_remote_refutation_cannot_accuse(self):
+        """The wire form carries no subject, so a peer's `physical` tag has
+        nobody to accuse however damning its score. This is the structural half
+        of "locally-produced evidence only"."""
+        from autonomous_trust.core import from_json_string, to_json_string
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_PHYSICAL)
+        peer = uuid4()
+        proc, proposed = self._slash_proc(peer)
+        off_the_wire = from_json_string(to_json_string(
+            self._score(peer, TX_CHANNEL_PHYSICAL, 0.0)))
+        assert proc._maybe_slash_for_channel({}, off_the_wire) is False
+        assert proposed == []
+
+    def test_it_will_not_slash_us(self):
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_PHYSICAL)
+        me = uuid4()
+        proc, proposed = self._slash_proc(uuid4(), self_uuid=me)
+        assert proc._maybe_slash_for_channel(
+            {}, self._score(me, TX_CHANNEL_PHYSICAL, 0.0)) is False
+        assert proposed == []
+
+    def test_an_unknown_subject_is_not_accused(self):
+        """A stale or malformed subject must not mint an accusation against a
+        uuid nobody in the cohort can resolve."""
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_PHYSICAL)
+        proc, proposed = self._slash_proc(uuid4())
+        assert proc._maybe_slash_for_channel(
+            {}, self._score(uuid4(), TX_CHANNEL_PHYSICAL, 0.0)) is False
+        assert proposed == []
+
+    def test_the_kill_switch_keeps_the_weight_and_stops_the_accusation(self):
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_PHYSICAL, tx_channel_weight)
+        peer = uuid4()
+        proc, proposed = self._slash_proc(peer, CHANNEL_SLASH_DISABLED=True)
+        assert proc._maybe_slash_for_channel(
+            {}, self._score(peer, TX_CHANNEL_PHYSICAL, 0.0)) is False
+        assert proposed == []
+        assert tx_channel_weight(TX_CHANNEL_PHYSICAL) > 1
+
+    def test_a_reason_is_refused_for_a_graded_channel(self):
+        """Minting one would produce a slash no reader could place."""
+        from autonomous_trust.core.reputation.reputation import (
+            slash_reason_for_channel, TX_CHANNEL_TASK_OUTCOME)
+        with pytest.raises(ValueError):
+            slash_reason_for_channel(TX_CHANNEL_TASK_OUTCOME)
+
+    def test_the_hard_set_matches_the_c_twin(self):
+        """These reasons cross the wire inside a signed designation, so a
+        divergence is a slash one runtime can verify and the other cannot.
+        Pinned as literals here and in reputation3_test.c."""
+        from autonomous_trust.core.reputation.reputation import TX_CHANNELS_HARD
+        assert TX_CHANNELS_HARD == frozenset(
+            {'physical', 'certificate', 'self_consistency'})
+
+
 class TestPeerReputationCarrier:
     """The app-facing peer carrier (doc/architecture/app-peer-carrier.md).
     Mirror of C's `peer_reputation_msg_t` / `at_app_reputation_t`:
@@ -834,6 +1181,9 @@ class TestProposerHistoryBilateral:
         stub.logger = SimpleNamespace(
             error=lambda *a, **k: None, debug=lambda *a, **k: None)
         stub._start_paxos = lambda q, m: start_paxos_calls.append((q, m))
+        # The channel-slash hook (R+D.md §12.8) runs after the round starts;
+        # it has its own tests, and this one is about history staying empty.
+        stub._maybe_slash_for_channel = lambda q, s: False
 
         task = uuid4()
         ts = TransactionScore(task_id=task, score=0.9)

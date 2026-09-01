@@ -27,6 +27,7 @@
 #include "identity/group.h"
 #include "identity/peers.h"
 #include "processes/capabilities.h"
+#include "reputation/tx_channel.h"
 #include "negotiation/task.h"
 #include "utilities/util.h"
 
@@ -129,6 +130,13 @@ typedef struct {
 
 typedef struct {
     uuid_t task_uuid;
+    /* The peer this score is ABOUT (the SUBJECT), not the proposer: the
+     * reputation process fills our own identity in for that. Zero == not
+     * attributable to a single peer, which is the honest answer for a fan-out.
+     * IPC-only by construction -- this struct never crosses the wire, and the
+     * paxos payload that does carries no subject -- which is what makes
+     * R+D.md §12.8's "locally-produced evidence only" rule structural: a score
+     * off the wire has nobody to accuse whatever channel it claims. */
     uuid_t peer_uuid;
     double score;
     /* Name of the Capability that produced this score, so the reputation
@@ -137,6 +145,15 @@ typedef struct {
      * weight 1. Carried verbatim by the whole-struct memcpy in
      * msg_types.c (TRANSACTION_SCORE ser/de), so no field-wise packing. */
     char capability_name[CAP_NAMELEN + 1];
+    /* Which evidence channel this score came from (R+D.md §12.8), so an app
+     * submitting a physics refutation or a certificate verdict can say so
+     * rather than handing AT a bare number. Empty string == absent ->
+     * TX_CHANNEL_TASK_OUTCOME, which is what every pre-channel submitter
+     * meant. An unknown spelling is refused at the reputation process
+     * boundary, not silently graded. Carried verbatim by the whole-struct
+     * memcpy in msg_types.c (TRANSACTION_SCORE ser/de), so no field-wise
+     * packing. Mirrors Python TransactionScore.channel. */
+    char channel[TX_CHANNEL_NAMELEN + 1];
 } tx_score_msg_t;
 
 typedef struct {

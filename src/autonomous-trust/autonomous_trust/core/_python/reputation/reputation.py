@@ -57,8 +57,270 @@ def validate_tx_score(score, where: str = 'TransactionScore'):
     return value
 
 
+#: Evidence channels (R+D.md §12.8, doc/verification_oracle.md "Keep the
+#: channels separate").
+#:
+#: A transaction score says HOW WELL a peer did. The channel says HOW WE KNOW
+#: — and those are not the same fact. "Refuted by conservation of energy,"
+#: "poorly calibrated over the last hundred predictions," "disagrees with the
+#: swarm," "failed a replicated task," and "contradicted its own signed
+#: archive" are different findings warranting different responses (immediate
+#: demotion, gradual decay, an opened dispute). Collapsing them into one scalar
+#: before the score reaches the reputation algebra destroys exactly what an
+#: escalation path would need to choose between those responses, and a bare
+#: score is what the wire carried before this field existed.
+#:
+#: The first slice (2026-08-21) carried the channel and branched on nothing.
+#: The second (below, :data:`TX_CHANNEL_WEIGHTS` / :data:`TX_CHANNELS_HARD`)
+#: gives it consequences: a graded channel weights the consensus EMA, and a
+#: hard-falsification channel additionally makes a defection-grade score
+#: grounds to PROPOSE a slash. Both apply ONLY to evidence this node produced
+#: itself — see :func:`tx_channel_weight` for why a peer's tag stays
+#: legibility-only.
+#:
+#: Mirrors TX_CHANNEL_* in the C twin's reputation/tx_channel.h; the spellings
+#: must match verbatim, since a divergence is a score one twin accepts and the
+#: other drops.
+
+#: Ordinary grading of a completed task: the negotiation-driven path that
+#: produced every score before channels existed. The default, and what an
+#: absent/empty channel normalizes to, so a legacy peer's scores stay
+#: indistinguishable from a tagged peer's task outcomes.
+TX_CHANNEL_TASK_OUTCOME = 'task_outcome'
+
+#: Hard refutation by conservation law or dimensional analysis. Needs no
+#: history and no training data (oracle layer 1) — a verdict, not a drift.
+TX_CHANNEL_PHYSICAL = 'physical'
+
+#: A certificate-carrying task interface checked out (or failed to). Interface
+#: work rather than algorithm work (oracle layer 2); this is where a ZKP
+#: verdict on a task result lands (see automate.py).
+TX_CHANNEL_CERTIFICATE = 'certificate'
+
+#: Conformal coverage audit / prequential log-loss: the peer is not wrong so
+#: much as overconfident, which averaged reputation cannot see (layers 3-4).
+TX_CHANNEL_CALIBRATION = 'calibration'
+
+#: The peer contradicted its own signed, hash-chained claim archive (layer 5).
+#: The cheapest channel of the set: falsification needing no peers, no physics,
+#: and no domain knowledge.
+TX_CHANNEL_SELF_CONSISTENCY = 'self_consistency'
+
+#: Outcome of sampled replication of the peer's work (layer 6).
+TX_CHANNEL_REPLICATION = 'replication'
+
+#: The peer disagrees with the swarm (layers 7-8). Named separately BECAUSE it
+#: is the one that should eventually open a dispute rather than levy a penalty
+#: — a majority is not an oracle.
+TX_CHANNEL_SWARM_DISAGREEMENT = 'swarm_disagreement'
+
+#: A honeypot probe: a task whose correct answer the requestor already knows,
+#: checked against that answer (R+D.md §12.7). The AT bootstrap corpus
+#: (at.handshake / at.time-attest / at.echo-challenge) is this pattern.
+#:
+#: Kept distinct from :data:`TX_CHANNEL_TASK_OUTCOME` because a probe verdict is
+#: the one piece of evidence that does not degrade as the adversarial fraction
+#: rises — every other channel is ultimately an aggregate over peers, and a
+#: majority cannot be beaten without an external reference. A probe IS that
+#: reference. Distinct from :data:`TX_CHANNEL_CERTIFICATE` too: a certificate is
+#: a proof the PEER supplies about its own work, while a probe is a question the
+#: VERIFIER authored and already knows the answer to.
+TX_CHANNEL_PROBE = 'probe'
+
+#: The closed set, in the build order of doc/verification_oracle.md. Mirrors
+#: TX_CHANNEL_ALL in the C twin. Ordered (not a set literal) so error messages
+#: list the vocabulary the same way on both sides of the wire.
+TX_CHANNELS = (TX_CHANNEL_TASK_OUTCOME,
+               TX_CHANNEL_PHYSICAL,
+               TX_CHANNEL_CERTIFICATE,
+               TX_CHANNEL_CALIBRATION,
+               TX_CHANNEL_SELF_CONSISTENCY,
+               TX_CHANNEL_REPLICATION,
+               TX_CHANNEL_SWARM_DISAGREEMENT,
+               TX_CHANNEL_PROBE)
+
+#: What an absent channel resolves to. Absence means "a peer or an app that
+#: predates channels," which is a task outcome by construction — every
+#: producer before this field was grading a completed task.
+TX_CHANNEL_DEFAULT = TX_CHANNEL_TASK_OUTCOME
+
+
+def validate_tx_channel(channel, where: str = 'TransactionScore'):
+    """Return `channel` as one of :data:`TX_CHANNELS`, or raise ValueError.
+
+    ``None`` and ``''`` resolve to :data:`TX_CHANNEL_DEFAULT` — absence is a
+    different question from invalidity, and a legacy producer (or a peer
+    running a build from before this field) is *absent*, not wrong. Anything
+    else must match a known channel byte-exactly.
+
+    Unknown spellings are REFUSED rather than passed through or coerced to the
+    default. A channel that silently becomes "some string a peer sent" is worth
+    less than no channel at all, since the entire value of the field is that a
+    demotion reason means one agreed thing on both sides of the wire; and
+    coercing an unknown to ``task_outcome`` would be worse still, because it
+    turns a typo'd physics refutation into an ordinary task grade with no trace
+    that anything was lost. Matching is case-sensitive for the same reason
+    (``'Physical'`` is refused): a closed set that accepts near-misses is not
+    closed.
+
+    Like :func:`validate_tx_score`, this runs in ``TransactionScore``'s
+    constructor and therefore on the remote path, where ``from_json_string``
+    reconstructs via ``cls(**kwargs)``. Handlers there already catch
+    ``ValueError`` and drop the message, so a peer sending an unknown channel
+    loses its proposal rather than raising inside the process loop.
+    """
+    if channel is None or channel == '':
+        return TX_CHANNEL_DEFAULT
+    if not isinstance(channel, str):
+        raise ValueError('%s: channel must be a string, got %r'
+                         % (where, channel))
+    if channel not in TX_CHANNELS:
+        raise ValueError('%s: unknown evidence channel %r (known: %s)'
+                         % (where, channel, ', '.join(TX_CHANNELS)))
+    return channel
+
+
+# --- What a channel DOES (R+D.md §12.8, the differentiated responses) ------
+#
+# Two responses, both settled with the user before implementing:
+#
+#   weighting        every channel carries an integer multiplier on the
+#                    consensus EMA, composed with the per-capability
+#                    transaction weight (they multiply: a heavy capability
+#                    refuted on physics counts as both).
+#   slash-eligible   the hard-falsification channels additionally make a
+#                    defection-grade score grounds to PROPOSE a slash, which
+#                    the EXISTING quorum co-signature then accepts or refuses.
+#
+# Deliberately NOT a third mechanism: `swarm_disagreement` should open a
+# DISPUTE rather than levy a penalty (doc/verification_oracle.md), and no
+# dispute machinery exists in either runtime. Weighting it like a hard channel
+# would be the opposite of what that entry asks for -- a majority is not an
+# oracle -- so it sits at the baseline weight until the dispute path is built.
+
+#: Multiplier on a locally-produced score's EMA weight, by channel.
+#:
+#: The weight is applied by folding the score into the EMA that many times
+#: (``consensus_score_from_window``), which is why these are small integers
+#: rather than floats: the existing per-capability ``transaction_weight`` uses
+#: the same repeat mechanism, and the two multiply.
+#:
+#: The values are a ranking of how much one observation tells you, not a tuning
+#: surface: 1 = one peer's reading of one event; 2 = corroborated by
+#: construction (a replication has several executors; a probe is checked
+#: against an answer the verifier authored); 3 = a verdict that needs no
+#: history at all. `calibration` is deliberately 1 — it is the channel the
+#: oracle doc names as the one that should decay a peer *gradually*.
+#:
+#: Mirrors TX_CHANNEL_WEIGHT_* in the C twin's reputation/tx_channel.h.
+TX_CHANNEL_WEIGHTS = {
+    TX_CHANNEL_TASK_OUTCOME: 1,
+    TX_CHANNEL_CALIBRATION: 1,
+    TX_CHANNEL_SWARM_DISAGREEMENT: 1,
+    TX_CHANNEL_REPLICATION: 2,
+    TX_CHANNEL_PROBE: 2,
+    TX_CHANNEL_PHYSICAL: 3,
+    TX_CHANNEL_CERTIFICATE: 3,
+    TX_CHANNEL_SELF_CONSISTENCY: 3,
+}
+
+#: The channels whose findings are FALSIFICATIONS rather than grades: the peer
+#: did not do poorly, it asserted something that is not true. Each is a verdict
+#: reachable without consulting any other peer — physics refutes, a certificate
+#: fails to verify, an archive contradicts itself — which is exactly what makes
+#: a single observation of one sufficient grounds to accuse.
+#:
+#: `probe` is deliberately NOT here even though its ground truth is certain.
+#: A probe is synthetic traffic the verifier generates continuously (§12.7), so
+#: making one failed probe slash-eligible would put every node's exclusion in
+#: the hands of its own probe cadence. It gets the corroborated weight instead.
+#:
+#: Mirrors TX_CHANNEL_IS_HARD in the C twin.
+TX_CHANNELS_HARD = frozenset({TX_CHANNEL_PHYSICAL,
+                              TX_CHANNEL_CERTIFICATE,
+                              TX_CHANNEL_SELF_CONSISTENCY})
+
+
+def tx_channel_weight(channel) -> int:
+    """The EMA multiplier for *channel*, defaulting to 1 for anything unknown.
+
+    Unknown is impossible through ``TransactionScore`` (the constructor refuses
+    it), so the default is for a caller reading a raw string off an older
+    record — and 1 is the right answer there: an unrecognized channel must
+    never weigh MORE than a recognized one, or adding a channel on one side of
+    the wire would silently amplify it on the other.
+
+    **Only ever applied to locally-produced evidence.** The channel is chosen
+    by whoever wrote the score, so honoring a remote peer's tag here would hand
+    every peer a lever on every other peer's reputation: tag a fabricated 0.0
+    `physical` and it lands with triple weight. A remote score keeps its
+    channel for legibility and is weighted by capability alone. The cost is
+    that two nodes can compute slightly different EMAs for the same peer — but
+    that is already true of the per-capability weights (see
+    ``consensus_score_from_window``'s ``weights`` argument, which a verifier
+    across a trust boundary cannot reproduce either), so this adds a term to an
+    existing local-view divergence rather than introducing one.
+    """
+    return int(TX_CHANNEL_WEIGHTS.get(channel, 1))
+
+
+def tx_channel_is_hard(channel) -> bool:
+    """Whether *channel* is a falsification (see :data:`TX_CHANNELS_HARD`)."""
+    return channel in TX_CHANNELS_HARD
+
+
+def slash_reason_for_channel(channel) -> str:
+    """The ``SlashAttestation.reason`` a hard channel slashes under.
+
+    ``'refuted_' + channel``, so the accusation names the evidence that
+    produced it rather than collapsing to a generic "bad peer" — which is the
+    whole point of §12.8, and what an operator reading a demotion needs. The
+    reason is part of ``designation``, so it is SIGNED and co-signed: unlike
+    ``evidence_ref``, a channel claim carried here cannot be altered in flight.
+
+    Raises ValueError for a channel that is not slash-eligible, rather than
+    inventing a reason for it: a caller asking this about `task_outcome` has a
+    bug, and a silently-minted reason would produce a slash no reader could
+    place.
+    """
+    if not tx_channel_is_hard(channel):
+        raise ValueError('channel %r is not slash-eligible (hard channels: %s)'
+                         % (channel, ', '.join(sorted(TX_CHANNELS_HARD))))
+    return SlashAttestation.REASON_REFUTED_PREFIX + channel
+
+
 class TransactionScore(Configuration):
-    def __init__(self, task_id, score, capability_name: str = None):
+    """One peer's score for one task, plus how that score was arrived at.
+
+    ``channel`` names the evidence channel the score came from (see
+    :data:`TX_CHANNELS` and R+D.md §12.8). On a score THIS node produced it
+    also carries consequences — an EMA multiplier
+    (:data:`TX_CHANNEL_WEIGHTS`) and, for a hard channel, slash eligibility
+    (:data:`TX_CHANNELS_HARD`). On a score that arrived from a peer it stays
+    legibility only, because the sender picks its own tag.
+
+    ``subject_uuid`` is the peer this score is ABOUT. It is local-only and
+    never serialized (see :meth:`to_dict`): the wire form pairs the two sides
+    of a transaction by ``task_id``, and nothing downstream of the chain needs
+    it. It exists so a locally-produced hard-channel score can name the peer it
+    accuses without waiting for the bilateral pairing to close, and dropping it
+    from the wire is also what makes the "locally-produced evidence only" rule
+    structural rather than a check that could be forgotten: a score off the
+    wire has no subject to accuse, so it cannot originate a slash whatever it
+    claims in its channel.
+
+    Deliberately NOT part of ``Transaction._canonical_bytes`` — the channel
+    rides on the TS and stops at the chain boundary. Adding a field to the
+    canonical bytes would change every entry hash in every resident chain and
+    invalidate the byte-pinned C parity, which is a migration this slice has no
+    reason to spend: a committed chain entry answers "who transacted, and how
+    well," and the channel is provenance for the score rather than part of the
+    fact being committed. If a future escalation path needs the channel to be
+    tamper-evident, that is its own slice with its own chain migration.
+    """
+
+    def __init__(self, task_id, score, capability_name: str = None,
+                 channel: str = None, subject_uuid=None):
         self.task_id = task_id
         # Enforced, not assumed (doc/architecture/reputation.md). This constructor is also the wire-side
         # entry point -- `from_json_string` reconstructs via `cls(**kwargs)` --
@@ -71,6 +333,29 @@ class TransactionScore(Configuration):
         # scoring time (Slice 3). None means "unknown / legacy" — weight
         # defaults to 1. See doc/architecture/trust-tiers.md §4.4.
         self.capability_name = capability_name
+        # Which evidence channel produced this score (R+D.md §12.8). Refused
+        # here if unknown, on the same remote path and for the same reason as
+        # `score` above. Normalized rather than left None so every TS on the
+        # wire carries an explicit channel and a reader never has to know
+        # whether None meant "task outcome" or "producer forgot".
+        self.channel = validate_tx_channel(channel)
+        # Local-only; see the class docstring. Accepted as a keyword because
+        # `from_json_string` rebuilds via `cls(**kwargs)` and a record written
+        # by some future producer could carry it -- but `to_dict` drops it, so
+        # nothing this node SENDS ever has one, and a peer that sets it anyway
+        # gets it back out of the reputation process's hands at the one place
+        # that matters (`forward_transaction` is IPC-only; see there).
+        self.subject_uuid = None if subject_uuid is None else str(subject_uuid)
+
+    def to_dict(self):
+        # `subject_uuid` is process-local provenance, not part of the score:
+        # the committed wire form pairs p1/p2 by task_id and has never carried
+        # a subject. Dropping it here is the same discipline as Group.to_dict
+        # dropping `_previous_keys` and Identity dropping `_rank_adjustment`,
+        # and it keeps every byte-pinned TransactionScore vector valid.
+        d = super().to_dict()
+        d.pop('subject_uuid', None)
+        return d
 
 
 class Transaction(Configuration):
@@ -471,7 +756,8 @@ class SlashAttestation(Configuration):
     PKI-style revocation).
 
     ``reason`` ∈ {sustained_anomaly, peer_exclude, invalid_tx,
-    rehabilitate}. ``evidence_ref`` is an optional
+    rehabilitate} plus the per-channel `refuted_*` set
+    (:data:`REASON_REFUTED_PREFIX`, R+D.md §12.8). ``evidence_ref`` is an optional
     ``(task_id, inclusion_proof)`` tying the slash to a Merkle-committed
     anomalous transaction — unused/optional in the Phase-0 trust-the-
     detector path; verified against a finalized checkpoint root once the
@@ -484,6 +770,14 @@ class SlashAttestation(Configuration):
     REASON_PEER_EXCLUDE = 'peer_exclude'
     REASON_INVALID_TX = 'invalid_tx'
     REASON_REHABILITATE = 'rehabilitate'
+
+    #: Prefix for the evidence-channel reasons (R+D.md §12.8). The suffix is
+    #: the channel verbatim, so the closed channel set defines the closed
+    #: reason set and neither can drift from the other:
+    #: `refuted_physical`, `refuted_certificate`, `refuted_self_consistency`.
+    #: Minted only by :func:`slash_reason_for_channel`. Mirrors
+    #: REP_SLASH_REASON_REFUTED_PREFIX in the C twin.
+    REASON_REFUTED_PREFIX = 'refuted_'
 
     def __init__(self, slasher_uuid: UUID, target_uuid: UUID,
                  reason: str, floor_score: float, epoch: int = 0,

@@ -2376,6 +2376,13 @@ static int network_run(const net_transport_t *transport,
                             free(dm);             /* slot consumed */
                             deferred_messages[di] = NULL;
                         } else {
+                            /* Matched the new peer but still does not decrypt:
+                             * unrelated noise from that address, or a frame
+                             * under a key that has since rotated. Retained for
+                             * the age bound to reclaim (Python's
+                             * mystery_handler keeps it and emits the same
+                             * counter). */
+                            probes_counter("net.mystery", "decrypt_failed", NULL);
                             if (remaining != di) {
                                 deferred_messages[remaining] = dm;
                                 deferred_messages[di] = NULL;

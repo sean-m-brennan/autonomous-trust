@@ -159,7 +159,15 @@ class TaskStatus(Task):
 
 
 class TaskResult(TaskInfo):
-    def __init__(self, task=None, result=None, proof=None, **kwargs):
+    """A returned result. Note ``TaskInfo`` carries no ``parameters``, so a
+    TaskResult does NOT know which capability produced it or what it was
+    asked — see ``attach_requested_parameters`` for how the requestor
+    supplies that from its own record.
+    """
+
+    def __init__(self, task=None, result=None, proof=None,
+                 requested_capability_name: str = None,
+                 requested_args=None, requested_kwargs=None, **kwargs):
         if task is None:
             task_args = {}
         else:
@@ -167,6 +175,93 @@ class TaskResult(TaskInfo):
         super().__init__(**task_args, **kwargs)
         self.result = result
         self.proof = proof
+        # What the REQUESTOR asked for, filled in on the requestor side by
+        # `attach_requested_parameters` (R+D.md §12.7). Default None/empty:
+        # an executor building a TaskResult has no business asserting these,
+        # and a peer that sends them populated is simply ignored, because the
+        # requestor overwrites them from its own record before anything reads
+        # them. See the integrity note on that method.
+        self.requested_capability_name = requested_capability_name
+        self.requested_args = tuple(requested_args or ())
+        self.requested_kwargs = dict(requested_kwargs or {})
+        # WHO produced this result, stamped on the requestor side by
+        # `attach_executor` from the authenticated sender of the reply
+        # (R+D.md §12.8). Local-only: `to_dict` drops it, so it is never
+        # serialized and an executor cannot assert its own identity here --
+        # the same integrity argument as `requested_*` above, and what lets a
+        # refutation name the peer it accuses.
+        self.executor_uuid = None
+
+    def to_dict(self):
+        # `executor_uuid` is the requestor's own attribution, not part of the
+        # result: it is derived from the transport-verified sender of the
+        # reply, so serializing it would let a forwarded copy carry an
+        # assertion nobody re-checked. Same discipline as
+        # TransactionScore.subject_uuid.
+        d = super().to_dict()
+        d.pop('executor_uuid', None)
+        return d
+
+    def attach_executor(self, executor_uuid) -> bool:
+        """Stamp this result with the peer that produced it.
+
+        ``executor_uuid`` comes from ``message.from_whom`` on the reply --
+        transport-authenticated and verified -- never from the payload. Pass
+        None to record explicitly that the result is NOT attributable to one
+        peer, which is the honest answer for a multi-participant task: the
+        results of a fan-out arrive from several peers and only the last one
+        to answer carries the object that gets scored, so naming it would
+        attribute the whole task's outcome to whoever happened to reply last.
+
+        Clears first, like ``attach_requested_parameters`` and for the same
+        reason. Returns True if an executor was attached.
+        """
+        self.executor_uuid = None
+        if executor_uuid is None:
+            return False
+        self.executor_uuid = str(executor_uuid)
+        return True
+
+    def attach_requested_parameters(self, original) -> bool:
+        """Stamp this result with what *we* asked for, from ``original``.
+
+        ``original`` is the requestor's own retained Task (the
+        ``TaskTracker`` in ``NegotiationProcess.my_tasks``), NOT anything
+        the responder sent. That distinction is the whole point, and it is
+        what makes a honeypot probe verifiable at all: a known-answer check
+        that reads the challenge out of the *responder's* reply verifies
+        nothing, because a peer that computed the wrong answer can simply
+        report the challenge its answer would have been right for
+        (``result=99, nonce=98`` scores as a correct increment). The
+        expected value therefore has to come from this side of the wire.
+
+        Nothing secret is being moved: the challenge was sent TO the
+        responder in the invitation, so it already knows it. The property
+        this protects is integrity, not confidentiality — which is also why
+        these fields are safe to serialize if a TaskResult is ever forwarded
+        onward.
+
+        Returns True if parameters were found and attached.
+        """
+        # Clear FIRST, unconditionally. These fields arrive from the wire on
+        # the responder's reply, where a peer is free to populate them with
+        # whatever makes its answer look right. Overwriting them only on the
+        # success path would leave those attacker-chosen values standing
+        # whenever we have no record of our own -- exactly the case where a
+        # caller most needs "unknown" rather than "the peer says". The
+        # downstream scorer treats an absent capability name as "not a probe"
+        # and falls back to ordinary task scoring, which is the safe default.
+        self.requested_capability_name = None
+        self.requested_args = ()
+        self.requested_kwargs = {}
+        params = getattr(original, 'parameters', None)
+        if params is None:
+            return False
+        capability = getattr(params, 'capability', None)
+        self.requested_capability_name = getattr(capability, 'name', None)
+        self.requested_args = tuple(getattr(params, 'args', ()) or ())
+        self.requested_kwargs = dict(getattr(params, 'kwargs', {}) or {})
+        return self.requested_capability_name is not None
 
     def generate_proof(self):
         """Generate a ZK-STARK proof of data integrity for this result.

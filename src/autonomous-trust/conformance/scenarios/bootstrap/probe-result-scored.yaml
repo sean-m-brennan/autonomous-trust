@@ -1,0 +1,119 @@
+schema_version: "1"
+kind: scenario
+protocol: bootstrap
+name: probe-result-scored
+byte_pinning: false
+description: |
+    A returned result is scored against the challenge the REQUESTOR kept, and
+    the score says which evidence channel it came from (R+D.md §12.7 / §12.8;
+    doc/architecture/trust-tiers.md §6).
+
+    Why this matters. Issuing a known-answer challenge and never checking the
+    answer is what the corpus did for its whole life: every result scored as a
+    completion, so a peer that tampered with an echo, replayed a stale nonce or
+    lied about its clock scored exactly what an honest peer scored. Verification
+    is the half that makes a probe evidence rather than traffic, and it is the
+    half that has to agree across runtimes — the two share the wire, so a peer
+    graded 0.9 by one and 0.1 by the other would make reputation depend on which
+    implementation happened to ask.
+
+    The expected value comes from the requestor's own record and never from the
+    reply. Rows 1 and 2 are the same answer, `42`, judged against two different
+    retained challenges: honest against the nonce we sent, a defection against
+    one we did not. That asymmetry IS the integrity property — a peer that
+    computed the wrong answer would report the challenge its answer satisfies,
+    so reading the challenge off the reply would verify nothing.
+
+    The bands, and why there are three rather than two:
+      - 0.9, the answer we already knew;
+      - 0.5, at.time-attest only: a clock outside tolerance but still a clock.
+        The comparison happens on the requestor at scoring time, so the measured
+        delta includes the round trip, and a truthful distant peer must not be
+        graded as a liar for it;
+      - 0.1, wrong, or not an answer at all. `forty-two` and `soon` are parsed
+        as unparseable rather than as zero, which matters most for
+        at.time-attest: a finite 0 there lands on 0.5, so reading prose as zero
+        would grade nonsense more kindly than a merely late clock. Python gets
+        there by float() raising; C parses to NaN and its verifiers treat
+        non-finite as unparseable.
+
+    The last two rows are the fall-through: an ordinary capability has no known
+    answer, so it is scored on completion (0.8 with a result, 0.3 without) and
+    carries `task_outcome`. Saying so is the point of the channel — it keeps a
+    dud task distinguishable from a failed challenge downstream, where both are
+    otherwise just a number.
+
+    Those two rows are scored with the ZKP extension treated as ABSENT, which
+    the Python adapter forces rather than inheriting from the host. That is the
+    only arm the C twin can reach — it attaches no proofs, so `certificate` is
+    not a verdict it can produce — and where the extension IS built, Python
+    reads a missing proof as suspicious (0.3, `certificate`) instead. Left
+    ambient, these rows would pin a property of the machine rather than of the
+    runtime, and the scenario would pass on a host without the extension and
+    report asymmetric on one with it. The probe rows are unaffected: the
+    known-answer verdict is taken before any proof is considered.
+
+    Shape. Non-message-driven, like the other two bootstrap scenarios: each
+    adapter feeds `fixtures.scored_results` through its own runtime's scorer and
+    asserts the score and channel per row. The two runtimes cannot share a call
+    site — Python scores in its main process (`automate.score_task_result`),
+    C in its negotiation process (`negotiation_score_task_result`), because that
+    is where each keeps the requestor's record of what it asked — so what is
+    pinned here is the rules, which is the part a peer's reputation depends on.
+
+    A numeric answer is spelled as a number in the fixture and reaches each
+    runtime the way that runtime carries it: Python passes the value, C the
+    decimal text its `report results` payload holds.
+
+participants:
+  - id: requestor
+    role: new_node
+  - id: worker
+    role: peer
+
+fixtures:
+  bootstrap:
+    ticks: 0            # no probing here; this scenario scores replies
+  scored_results:
+    - capability: at.handshake
+      kwargs: {nonce: 41}
+      result: 42
+    - capability: at.handshake
+      kwargs: {nonce: 77}
+      result: 42
+    - capability: at.handshake
+      kwargs: {nonce: 41}
+      result: "forty-two"
+    - capability: at.echo-challenge
+      kwargs: {payload: "echo:cafe"}
+      result: "echo:cafe"
+    - capability: at.echo-challenge
+      kwargs: {payload: "echo:cafe"}
+      result: "echo:beef"
+    - capability: at.time-attest
+      kwargs: {}
+      result: 0
+    - capability: at.time-attest
+      kwargs: {}
+      result: "soon"
+    - capability: data_fetch
+      kwargs: {}
+      result: "done"
+    - capability: data_fetch
+      kwargs: {}
+      result: null
+
+steps:
+  - id: 1
+    from: requestor
+    to: requestor
+    function: score_task_results
+    description: |
+        Trigger. The requestor scores each row of `fixtures.scored_results`
+        against the challenge it retained for that row.
+
+expected_state:
+  requestor:
+    result_scores: [0.9, 0.1, 0.1, 0.9, 0.1, 0.5, 0.1, 0.8, 0.3]
+    result_channels: [probe, probe, probe, probe, probe, probe, probe,
+                      task_outcome, task_outcome]

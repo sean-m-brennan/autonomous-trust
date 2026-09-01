@@ -146,3 +146,49 @@ def test_genuinely_unknown_sender_still_defers():
 
     assert len(proc.encrypted_messages) == 1
     assert proc.encrypted_messages[0][1] == '10.0.4.99'
+
+
+def _real_msg_to_queue(proc):
+    """Bind the real `_msg_to_queue` (the other tests mock it) plus the one
+    instance attribute it keeps state in."""
+    proc._foreign_format_counts = {}
+    proc._msg_to_queue = NetworkProcess._msg_to_queue.__get__(proc)
+    return proc
+
+
+def test_unknown_sender_ciphertext_opening_with_the_proto_marker_defers():
+    """Ciphertext is uniform bytes, so one deferred frame in 256 opens with
+    NET_WIRE_PROTO_MAGIC by chance. On the unknown-sender path that byte does
+    NOT mean a foreign cohort -- it means "not a plaintext JSON envelope", the
+    same verdict a UnicodeDecodeError carries -- so the frame must be deferred
+    for the sender's admission, not dropped. Dropping it made
+    tests/b_integration/test_two_node.py fail intermittently with a
+    'Dropping point-to-point frame ... refusing a proto envelope' error, and
+    C's handle_inbound_peer defers every parse failure on this path.
+    """
+    live = _roster()                # knows nobody yet
+    proc = _real_msg_to_queue(_drain_proc(live, _roster()))
+    proc.peer_messages.append((b'\xabciphertext that is not an envelope', '10.0.4.99'))
+
+    _run_drain(proc)
+
+    assert len(proc.encrypted_messages) == 1, \
+        'a 0xAB-leading frame from an unknown sender must reach the mystery ' \
+        'defer path, not the foreign-format drop'
+    assert proc.encrypted_messages[0][1] == '10.0.4.99'
+    assert not proc.logger.error.called
+
+
+def test_foreign_format_frame_from_a_placed_sender_is_still_dropped():
+    """The other side of it: once the bytes ARE known to be an envelope (a
+    decrypted frame, or the multicast channel, where nothing is ever
+    ciphertext), a foreign marker is the real diagnosis and keeps its
+    rate-limited error -- `opaque` must not relax the gate everywhere."""
+    proc = _real_msg_to_queue(_drain_proc(_roster(), _roster()))
+
+    proc._msg_to_queue(b'\xab\x01proto envelope', '10.0.4.99', {},
+                       'multicast', validate=False)
+
+    assert proc._foreign_format_counts['10.0.4.99'] == 1
+    proc.logger.error.assert_called_once()
+    assert 'refusing a proto envelope' in str(proc.logger.error.call_args[0][3])

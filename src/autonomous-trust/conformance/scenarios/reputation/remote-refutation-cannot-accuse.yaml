@@ -1,0 +1,106 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: remote-refutation-cannot-accuse
+byte_pinning: false
+description: |
+    A hard-channel refutation that ARRIVED FROM A PEER commits like any other
+    score and accuses nobody (R+D.md §12.8, doc/architecture/reputation.md
+    "Only your own evidence counts").
+
+    This is the security boundary of the differentiated-response slice, and
+    the only half of it with a wire form, so it belongs in the corpus rather
+    than only in each side's unit tests.
+
+    Since 2026-09-01 an evidence channel has consequences: `physical`,
+    `certificate`, and `self_consistency` are falsifications rather than
+    grades, and a defection-grade score on one of them proposes a slash. But
+    the scorer chooses its own tag. If a channel arriving from the wire were
+    honoured, any peer could tag a fabricated 0.1 as `physical` and have the
+    receiver accuse a third party on its behalf — turning a legibility field
+    into a forgeable demotion lever, which is worse than the collapsed scalar
+    it replaced.
+
+    So alice sends bob exactly that: `physical`, score 0.1, the shape a
+    refutation takes. bob must treat it as an ordinary proposal — accept it,
+    commit it, weight it by capability alone — and originate NO slash.
+    `slashes_proposed: 0` is the assertion; the two runtimes must agree on it.
+
+    Why an `expected_state` key rather than the step list: the scenario engine
+    matches the messages a step DECLARES and is permissive about extra ones,
+    on both sides. A stray slash proposal would therefore pass a step-list-only
+    scenario silently — which is exactly the failure this scenario exists to
+    catch. The tally is cumulative over the whole scenario for the same reason:
+    the assertion is "none, ever," not "none this step."
+
+    How each runtime makes this structural rather than a check that could be
+    forgotten: accusing requires naming the accused, and the subject of a score
+    is local-only on both sides — Python's `TransactionScore.subject_uuid` is
+    dropped by `to_dict`, and C's subject rides `tx_score_msg_t`, an IPC struct
+    whose `peer_uuid` never crosses the wire. A score off the wire has no
+    subject to accuse whatever it claims in its channel. Correspondingly, the
+    origination path is reachable from the local submit path only (Python
+    `_maybe_slash_for_channel` off `forward_transaction`, C
+    `_originate_channel_slash` off `_forward_transaction`), never from the wire
+    handler.
+
+    The mirror-image positive case — a LOCAL refutation that does propose —
+    has no wire form to compare, so it is unit-pinned on each side
+    (`TestChannelResponses.test_a_local_refutation_proposes_a_slash`,
+    `reputation3_test.c`'s channel-slash tests). That asymmetry is the point:
+    the dangerous direction is the one the corpus covers.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+
+fixtures:
+  requests:
+    bob:
+      - [1000, 1]
+  my_requests:
+    alice:
+      - id1: 1000
+        id2: 1
+        task_id: t-1
+        score: 0.1
+        channel: physical
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: transaction
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+      task_id: t-1
+      score: 0.1
+      channel: physical
+    description: |
+        alice proposes a defection-grade score tagged as a physics refutation
+        — the exact shape that, had bob produced it himself, would propose a
+        slash. bob accepts it as an ordinary proposal.
+
+  - id: 2
+    from: bob
+    to: alice
+    function: tx accepted
+    in_response_to: 1
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+    description: |
+        The round commits unchanged. A refuting score is still a score, and it
+        still belongs in the chain; what it must not do is originate an
+        accusation on a claim bob cannot check.
+
+expected_state:
+  bob:
+    slashes_proposed: 0
+  alice:
+    slashes_proposed: 0
