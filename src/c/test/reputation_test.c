@@ -37,11 +37,11 @@ DEFINE_TEST(test_tx_history_basic)
     /* First slot fill keeps the tx pending — mirrors Python's
      * TransactionHistory.__len__ returning len(_chain), which
      * only counts bilateral entries. */
-    ck_assert_ret_ok(tx_history_update(&hist, task_uuid, peer1_uuid, 0.75));
+    ck_assert_ret_ok(tx_history_update(&hist, task_uuid, peer1_uuid, 0.75, NULL));
     ck_assert_int_eq(tx_history_len(&hist), 0);
 
     /* Second slot fill promotes to committed and bumps len. */
-    ck_assert_ret_ok(tx_history_update(&hist, task_uuid, peer2_uuid, 0.85));
+    ck_assert_ret_ok(tx_history_update(&hist, task_uuid, peer2_uuid, 0.85, NULL));
     ck_assert_int_eq(tx_history_len(&hist), 1);
 
     tx_history_free(&hist);
@@ -96,11 +96,11 @@ DEFINE_TEST(test_consensus_by_tier)
     uuid_generate(t3);
 
     /* tier-1 interaction: counterparty o1 scores the peer 0.9 */
-    ck_assert_ret_ok(tx_history_update(&hist, t1, peer, 0.5));
-    ck_assert_ret_ok(tx_history_update(&hist, t1, o1, 0.9));
+    ck_assert_ret_ok(tx_history_update(&hist, t1, peer, 0.5, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t1, o1, 0.9, NULL));
     /* tier-3 interaction: counterparty o3 scores the peer 0.4 */
-    ck_assert_ret_ok(tx_history_update(&hist, t3, peer, 0.5));
-    ck_assert_ret_ok(tx_history_update(&hist, t3, o3, 0.4));
+    ck_assert_ret_ok(tx_history_update(&hist, t3, peer, 0.5, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t3, o3, 0.4, NULL));
 
     map_t task_tiers, task_weights;
     map_init(&task_tiers);

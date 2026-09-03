@@ -421,6 +421,18 @@ class NetworkAdapter:
         if case.name == 'group-wire-format-canonical':
             self._run_group_wire_format_canonical(case)
             return
+        if case.name == 'cross-group-format-fallback':
+            self._run_cross_group_format_fallback(case)
+            return
+        if case.name == 'gateway-boundary-verbs':
+            self._run_gateway_boundary_verbs(case)
+            return
+        if case.name == 'unencrypted-verbs':
+            self._run_unencrypted_verbs(case)
+            return
+        if case.name == 'transport-binds-the-recipient':
+            self._run_transport_binds_the_recipient(case)
+            return
         raise NotImplementedError(
             f'network scenario {case.name!r} not implemented'
         )
@@ -613,6 +625,158 @@ class NetworkAdapter:
                 Group.from_canonical(unknown).wire_format == NetWireFormat.json,
         }
         _assert_expected_flags(case, 'node', state)
+
+    def _run_cross_group_format_fallback(self, case: Case) -> None:
+        """A group answers with its own format for its own members and with
+        JSON for anyone it cannot place -- the rule that lets two
+        differently-formatted cohorts complete a merge handshake
+        (doc/architecture/network-wire-format.md).
+        """
+        from autonomous_trust.core.config import NetWireFormat
+        from autonomous_trust.core.identity import Group, Encryptor
+
+        fx = case.data.get('fixtures') or {}
+        proto_member = fx.get('proto_member', '10.0.0.1')
+        json_member = fx.get('json_member', '10.0.1.1')
+        stranger = fx.get('stranger', '10.0.9.9')
+
+        def _group(uuid_str, member, fmt):
+            # The key is irrelevant here -- this asks only about the address
+            # map and the format field -- but Group wants a real Encryptor.
+            return Group(uuid_str, {member: member}, 'cohort',
+                         Encryptor.generate(), False, _wire_format=fmt)
+
+        proto_grp = _group(fx.get('proto_group_uuid'), proto_member,
+                           NetWireFormat.proto)
+        json_grp = _group(fx.get('json_group_uuid'), json_member,
+                          NetWireFormat.json)
+
+        state = {
+            'proto_group_to_own_member_is_proto':
+                proto_grp.wire_format_for_address(proto_member) == NetWireFormat.proto,
+            'json_group_to_own_member_is_json':
+                json_grp.wire_format_for_address(json_member) == NetWireFormat.json,
+            # The merge handshake: neither can place the other's member.
+            'proto_group_to_foreign_member_is_json':
+                proto_grp.wire_format_for_address(json_member) == NetWireFormat.json,
+            'json_group_to_foreign_member_is_json':
+                json_grp.wire_format_for_address(proto_member) == NetWireFormat.json,
+            'proto_group_to_stranger_is_json':
+                proto_grp.wire_format_for_address(stranger) == NetWireFormat.json,
+        }
+        _assert_expected_flags(case, 'node', state)
+
+    def _run_gateway_boundary_verbs(self, case: Case) -> None:
+        """The membership of BOOTSTRAP_VERBS -- the verbs the gateway boundary
+        refuses to carry (doc/architecture/network-wire-format.md).
+
+        Two hand-maintained lists in two languages, so the negative half is
+        what earns this case: a verb added on one side only would otherwise
+        open the boundary on one runtime and close it on the other.
+        """
+        from autonomous_trust.core.identity.protocol import BOOTSTRAP_VERBS
+
+        fx = case.data.get('fixtures') or {}
+        boots = list(fx.get('bootstrap_verbs') or [])
+        others = list(fx.get('not_bootstrap_verbs') or [])
+
+        state = {
+            'all_bootstrap_verbs_recognized':
+                all(v in BOOTSTRAP_VERBS for v in boots),
+            'no_other_verb_is_bootstrap':
+                not any(v in BOOTSTRAP_VERBS for v in others),
+            'bootstrap_verb_count_is_three': len(BOOTSTRAP_VERBS) == 3,
+            # C's classifier takes NULL; Python's set is asked with None/''.
+            'empty_verb_is_not_bootstrap':
+                (None not in BOOTSTRAP_VERBS) and ('' not in BOOTSTRAP_VERBS),
+        }
+        _assert_expected_flags(case, 'node', state)
+
+    def _run_unencrypted_verbs(self, case: Case) -> None:
+        """The plaintext allowlist: which verbs a receiver accepts unencrypted
+        from a known peer, and how that set relates to the bootstrap set.
+
+        Two hand-maintained lists in two languages, so the negative half is
+        where the value is: a verb added on one side only becomes a downgrade
+        opening on that runtime alone. The `full_history` assertion is the
+        sharpest one -- it is bootstrap yet must never ride in the clear,
+        because it carries the group key.
+        """
+        from autonomous_trust.core.identity.protocol import (
+            UNENCRYPTED_VERBS, BOOTSTRAP_VERBS)
+
+        fx = case.data.get('fixtures') or {}
+        plain = list(fx.get('unencrypted_verbs') or [])
+        enc_only = list(fx.get('encrypted_only_verbs') or [])
+        both = list(fx.get('both_bootstrap_and_unencrypted') or [])
+        boot_enc = list(fx.get('bootstrap_but_encrypted') or [])
+
+        state = {
+            'all_unencrypted_verbs_recognized':
+                all(v in UNENCRYPTED_VERBS for v in plain),
+            'no_other_verb_is_unencrypted':
+                not any(v in UNENCRYPTED_VERBS for v in enc_only),
+            'unencrypted_verb_count_is_nine': len(UNENCRYPTED_VERBS) == 9,
+            'empty_verb_is_not_unencrypted':
+                (None not in UNENCRYPTED_VERBS) and ('' not in UNENCRYPTED_VERBS),
+            'overlap_verbs_are_both':
+                bool(both) and all(v in UNENCRYPTED_VERBS and v in BOOTSTRAP_VERBS
+                                   for v in both),
+            # Bootstrap, but encrypted: the group key never rides in plaintext.
+            'full_history_is_bootstrap_but_not_unencrypted':
+                bool(boot_enc) and all(v in BOOTSTRAP_VERBS
+                                       and v not in UNENCRYPTED_VERBS
+                                       for v in boot_enc),
+        }
+        _assert_expected_flags(case, 'node', state)
+
+    def _run_transport_binds_the_recipient(self, case: Case) -> None:
+        """The envelope's `from_*` claim is read ONLY when the transport gave
+        no peer (R+D.md §2.6).
+
+        One signed frame, parsed three ways per format: attributed to its true
+        signer, attributed to a relayer, and unattributed. The relay row is the
+        security property; the override row is what proves the ORDERING rather
+        than merely a disagreement being caught.
+        """
+        from autonomous_trust.core.config import NetWireFormat
+        from autonomous_trust.core.network.message import Message
+
+        fx = case.data.get('fixtures') or {}
+        signer = _make_test_identity('a', addr='10.0.80.1')
+        relayer = _make_test_identity('b', addr='10.0.80.2')
+        signer_pub, relayer_pub = signer.publish(), relayer.publish()
+
+        msg = Message(fx.get('process', 'idproc'),
+                      fx.get('function', 'peer_caps_query'),
+                      fx.get('obj_json', 'payload'),
+                      from_whom=signer, encrypt=False,
+                      trace_id=fx.get('trace_id'))
+
+        state = {}
+        for label, fmt in (('json', NetWireFormat.json),
+                           ('proto', NetWireFormat.proto)):
+            wire = msg.to_wire(fmt)
+
+            # Row 1: honest. Doubles as the control -- without it a parser that
+            # verified nothing would satisfy row 2.
+            true_sender = Message.parse(wire, signer_pub, wire_format=fmt)
+            # Row 2: the SAME bytes, attributed to someone else. The relay.
+            relayed = Message.parse(wire, relayer_pub, wire_format=fmt)
+            # Row 3: no transport peer -- the bootstrap channel.
+            unattributed = Message.parse(wire, None, wire_format=fmt)
+
+            state['%s_verified_for_true_sender' % label] = true_sender.verified
+            state['%s_relay_refused' % label] = not relayed.verified
+            # The ordering: with a peer supplied, the parsed sender IS that
+            # peer, not the envelope's claim.
+            state['%s_transport_peer_overrides_envelope' % label] = (
+                str(getattr(relayed.from_whom, 'uuid', None)) == str(relayer.uuid))
+            state['%s_unattributed_verified' % label] = unattributed.verified
+            state['%s_unattributed_sender_is_envelope_claim' % label] = (
+                str(getattr(unattributed.from_whom, 'uuid', None)) == str(signer.uuid))
+
+        _assert_expected_flags(case, 'signer', state)
 
     def _run_tunables_resolution(self, case: Case) -> None:
         """Network-tunable resolution: env -> compile-time default.

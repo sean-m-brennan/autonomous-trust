@@ -174,6 +174,20 @@ void reputation_install_tx_pair(const uuid_t task_uuid,
                                 const uuid_t p1_uuid, double p1_score,
                                 const uuid_t p2_uuid, double p2_score);
 
+/** Pre-install ONE SIDE of a Transaction (@p task_uuid): @p peer_uuid scored
+ *  at @p score, the counterparty slot left open.
+ *
+ *  Exists so a single-step scenario can drive the arrival that COMPLETES the
+ *  entry and then assert on the committed window -- which a two-step scenario
+ *  cannot do here, because this harness resets rep_state between steps. Used
+ *  by `reputation/committed-channel-in-the-entry-hash` to pin that both
+ *  runtimes hash a channel-bearing entry identically (R+D.md §12.8).
+ *
+ *  Untagged deliberately: the staged side is an ordinary task outcome, and the
+ *  channel under test arrives on the wire. Conformance hook only. */
+void reputation_install_tx_single(const uuid_t task_uuid,
+                                  const uuid_t peer_uuid, double score);
+
 /** Pre-install a peer's reputation in rep_state.reputations.
  *  Conformance scenarios use this to set the counterparty's reputation
  *  (consumed by reputation_pure) and the subject peer's `previous`

@@ -1522,18 +1522,140 @@ static void my_address(const network_config_t *net_cfg, bool ipv6, char *out,
 static net_wire_format_t wire_format_for_address(const group_t *grp,
                                                  const char *address)
 {
+    /* Delegates rather than walking the address map itself: the rule belongs to
+     * the group (group_wire_format_for_address), and one copy is what keeps the
+     * production selection and the conformance-pinned one from drifting. */
+    return group_wire_format_for_address(grp, address);
+}
+
+/* ---- The gateway boundary ------------------------------------------------
+ *
+ * Two invariants, both normative
+ * (doc/architecture/network-wire-format.md, "The gateway boundary"), and the
+ * C twin of Python NetworkProcess._held_groups / _groups_containing /
+ * _crosses_gateway / _boundary_refuse:
+ *
+ *   G. A GROUP STOPS AT THE GATEWAY. A gateway is a full MEMBER of each cohort
+ *      it bridges; no group spans it. So no address but the gateway's own may
+ *      appear in two of the groups it holds.
+ *   B. BOOTSTRAP DOES NOT CROSS THE GATEWAY. The pre-admission handshake
+ *      (identity_verb_is_bootstrap) is domain-local. This is what ENFORCES G:
+ *      the only way a group comes to span a gateway is for a node on one side
+ *      to be admitted by a cohort on the other.
+ *
+ * Together these are why wire-format DETECTION is unnecessary rather than
+ * merely risky (R+D.md Sec 2.5): every frame is either from a member of a group
+ * we hold -- so the format is a lookup, wire_format_for_address above -- or it
+ * is local bootstrap, so the format is JSON by rule. Relax either one and
+ * detection is back on the table.
+ *
+ * NOTE the one build that can violate G: AT_NET_GROUP_FORWARD (OFF by default)
+ * relays opaque group ciphertext across transport legs by operator-configured
+ * route, which by construction carries a group past a gateway that is not in
+ * it. See handle_inbound_group and doc/architecture/network-wire-format.md.
+ */
+
+/* Whether `address` is listed by a group, by walking its address_map values.
+ * Factored out of wire_format_for_address so the boundary checks and the format
+ * lookup cannot disagree about what "in this group" means. */
+static bool group_lists_address(const group_t *grp, const char *address)
+{
     if (grp == NULL || address == NULL || address[0] == '\0')
-        return NET_WIRE_JSON;
-    bool in_group = false;
+        return false;
+    bool found = false;
     map_key_t key;
     data_t *value;
     map_entries_for_each((map_t *)&grp->address_map, key, value)
         string_t addr = NULL;
         if (data_string_ptr(value, &addr) == 0 && addr != NULL &&
             strcmp((const char *)addr, address) == 0)
-            in_group = true;
+            found = true;
     map_end_for_each
-    return in_group ? grp->wire_format : NET_WIRE_JSON;
+    return found;
+}
+
+/* How many of the groups we hold (primary + every child cohort we gateway)
+ * list `address`, EXCLUDING our own address.
+ *
+ * A gateway is by construction a member of both its primary group and each
+ * child cohort, so its own address is in every map and is never a violation.
+ * Any OTHER address in two maps means those groups have merged across this
+ * gateway -- invariant G. */
+static size_t held_groups_containing(const process_t *proc,
+                                     const identity_t *myself,
+                                     const char *address)
+{
+    if (proc == NULL || address == NULL || address[0] == '\0')
+        return 0;
+    if (myself != NULL && strcmp(myself->address, address) == 0)
+        return 0;
+    size_t count = 0;
+    if (group_lists_address(&proc->protocol.group, address))
+        count++;
+    if (proc->protocol.child_groups != NULL) {
+        map_key_t key;
+        data_t *value;
+        map_entries_for_each(proc->protocol.child_groups, key, value)
+            void *gp = NULL;
+            if (data_object_ptr(value, &gp) == 0 && gp != NULL &&
+                group_lists_address((const group_t *)gp, address))
+                count++;
+        map_end_for_each
+    }
+    return count;
+}
+
+/* True when `address` sits on the FAR side of a gateway boundary from our
+ * primary group: a member of a child cohort we bridge but not of our own group.
+ * Always false on a leaf node (no child groups), so the historical path is
+ * untouched. */
+static bool address_crosses_gateway(const process_t *proc,
+                                    const identity_t *myself,
+                                    const char *address)
+{
+    if (proc == NULL || proc->protocol.child_groups == NULL)
+        return false;
+    if (myself != NULL && address != NULL &&
+        strcmp(myself->address, address) == 0)
+        return false;
+    if (group_lists_address(&proc->protocol.group, address))
+        return false;   /* in our own group: not across anything */
+    bool in_child = false;
+    map_key_t key;
+    data_t *value;
+    map_entries_for_each(proc->protocol.child_groups, key, value)
+        void *gp = NULL;
+        if (data_object_ptr(value, &gp) == 0 && gp != NULL &&
+            group_lists_address((const group_t *)gp, address))
+            in_child = true;
+    map_end_for_each
+    return in_child;
+}
+
+/* Count + rate-limited log for a boundary refusal. Always returns true so call
+ * sites read `if (boundary_refuse(...)) return;`.
+ *
+ * Logged at error, not debug, for the same reason the foreign-format drop is:
+ * a boundary violation presents downstream as a peer having silently gone
+ * quiet, and this line is the only thing that says why. The counter is
+ * per-KIND rather than per-address (no dict here), which is enough to keep a
+ * chatty violator from flooding the log. */
+static bool boundary_refuse(logger_t *logger, const char *kind,
+                            const char *address, const char *detail)
+{
+    static unsigned long counts[4] = {0, 0, 0, 0};
+    size_t slot = 0;
+    if (kind != NULL)
+        slot = (size_t)((unsigned char)kind[0]) % 4;
+    unsigned long n = ++counts[slot];
+    if (n == 1 || (n % 10) == 0)
+        log_error(logger,
+                  "Network: gateway boundary refusing %s involving %s -- %s "
+                  "(count: %lu)\n",
+                  kind != NULL ? kind : "?",
+                  (address != NULL && address[0] != '\0') ? address : "<unknown>",
+                  detail != NULL ? detail : "", n);
+    return true;
 }
 
 /* Deliver a PLAINTEXT frame from a peer we already know, but only an
@@ -1625,7 +1747,18 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
             net_wire_format_t fmt =
                 wire_format_for_address(&ctx->proc->protocol.group, peer->address);
             if (net_message_from_wire_fmt(plain, plain_len, peer, fmt, &wmsg) == 0) {
-                route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
+                /* Gateway boundary, invariant B. False on a leaf node and for
+                 * a peer in our own group, so this is a gateway-only gate. */
+                if (identity_verb_is_bootstrap(wmsg.function) &&
+                    address_crosses_gateway(ctx->proc, ctx->myself,
+                                            peer->address)) {
+                    boundary_refuse(ctx->logger, "bootstrap_across_gateway",
+                                    peer->address,
+                                    "admitting across the boundary would make a "
+                                    "group span it");
+                } else {
+                    route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
+                }
             } else {
                 /* Decrypted successfully but the inner wire is malformed —
                  * still annoy-worthy from a known peer. */
@@ -1958,7 +2091,19 @@ void handle_inbound_group(net_thread_ctx_t *ctx,
                                       grp->wire_format, &wmsg) == 0) {
             snprintf(wmsg.from_whom.address, sizeof(wmsg.from_whom.address),
                      "%s", from_addr);
-            route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
+            /* Gateway boundary, invariant B: the pre-admission handshake is
+             * never a group message -- announce is broadcast, accept and
+             * history are point-to-point to an unplaced identity -- so a
+             * bootstrap verb arriving group-encrypted is either a bug or an
+             * attempt to admit across the boundary. */
+            if (identity_verb_is_bootstrap(wmsg.function)) {
+                boundary_refuse(ctx->logger, "bootstrap_on_group_channel",
+                                from_addr,
+                                "the pre-admission handshake is never a group "
+                                "message");
+            } else {
+                route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
+            }
             net_wire_msg_free(&wmsg);
         }
     } else {
@@ -2255,6 +2400,32 @@ static int network_run(const net_transport_t *transport,
                 wmsg.to_whom.type = RECIPIENT_PEER;
                 memcpy(&wmsg.to_whom.target.peer, &nmsg->to_whom,
                        sizeof(public_identity_t));
+            }
+
+            /* Gateway boundary, invariants B and G. Both are gateway-only
+             * gates -- address_crosses_gateway is false without child groups,
+             * and held_groups_containing can only exceed 1 when we hold more
+             * than one group -- so a leaf node takes exactly the historical
+             * path. A broadcast is exempt from B: discovery is how a node in
+             * OUR domain gets admitted, and it never leaves the segment. */
+            if (!is_broadcast) {
+                if (identity_verb_is_bootstrap(nmsg->function) &&
+                    address_crosses_gateway(proc, myself,
+                                            nmsg->to_whom.address)) {
+                    boundary_refuse(logger, "bootstrap_across_gateway",
+                                    nmsg->to_whom.address,
+                                    "refusing to send the pre-admission "
+                                    "handshake to a cohort we gateway");
+                    continue;
+                }
+                if (held_groups_containing(proc, myself,
+                                           nmsg->to_whom.address) > 1) {
+                    boundary_refuse(logger, "group_spans_gateway",
+                                    nmsg->to_whom.address,
+                                    "target is a member of more than one group "
+                                    "we hold");
+                    continue;
+                }
             }
 
             /* Broadcast is discovery -> JSON; a peer we can place speaks its

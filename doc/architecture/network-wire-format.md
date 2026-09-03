@@ -7,11 +7,12 @@
 
 # Network Wire Format
 
-**Status (2026-08-18): BUILT in both runtimes.** This document is the reference
-for the wire format; source comments point here. Format *detection* — a node
-working out which format a peer is speaking — is deliberately **not** built. The
-open questions are `R+D.md` §2.5, and
-[Why detection is not here](#why-detection-is-not-here) says why.
+**Status (2026-08-18): BUILT in both runtimes. Gateway boundary enforced
+2026-09-03.** This document is the reference for the wire format; source
+comments point here. Format *detection* — a node working out which format a peer
+is speaking — is **not built and not needed**: under the two invariants in
+[The gateway boundary](#the-gateway-boundary) every frame's format is known
+before the frame is read. That closed `R+D.md` §2.5.
 
 An inter-host AT message is an envelope around a payload. The envelope has
 carried the same eleven fields since the beginning; what changed is that it can
@@ -142,26 +143,108 @@ strings into an all-defaults message, and without that check a corrupt frame
 becomes a message addressed to process `""` that routes nowhere with no
 diagnostic.
 
-## Why detection is not here
+## The gateway boundary
 
-The obvious next step — let a node work out a peer's format from the frame — was
-scoped and then **declined for now**, because it turns the format marker from a
-guard into an input. The questions it opens are not implementation details:
+Two invariants, both **normative**. They are assumptions the rest of this
+document rests on, and until 2026-09-03 they were only implicit — which is why
+they are written down here rather than left to be inferred from the code.
 
-- Which nodes may sniff at all? (A gateway bridging two cohorts has a reason to;
-  an internal node does not.)
-- May an internal node **opt in** to reading a foreign format from a foreign
-  sender, and what counts as foreign — an unplaced first-contact sender, a
-  member of another known group, or both?
-- If it reads one, does it **reply in kind** (per-peer local state, never
-  serialized) or always answer in its own group's format?
-- Should the exception be scoped to identity/negotiation traffic, so a foreign
-  format can get a node admitted but cannot inject payloads into data or
-  application processes?
+> **G. A group stops at the gateway.** A gateway is a full **member** of each
+> cohort it bridges. No group spans a gateway, so no address but the gateway's
+> own may appear in two of the groups it holds.
+>
+> **B. Bootstrap does not cross the gateway.** The pre-admission handshake —
+> `request_access`, `access_granted`, `full_history` — is domain-local.
 
-Those are recorded as `R+D.md` §2.5. **Do not add sniffing to either runtime
-without settling them** — the strict gate above is what makes the current design
-safe, and it is one `if` away from not being.
+B is what **enforces** G. The only way a group comes to span a gateway is for a
+node on one side to be *admitted* by a cohort on the other, and those three
+verbs are the only ones that move membership. Everything else crosses freely:
+`group_key_update` moves membership but not admission, and the partition pair
+deliberately spans a group-*key* boundary
+([partition recovery](partition-recovery.md)) while staying inside one domain.
+
+### What they buy: detection is unnecessary, not merely deferred
+
+With both invariants held, the case analysis on an arriving frame is **total**:
+
+| The sender is… | The format is… | How we know |
+|---|---|---|
+| a member of a group we hold | that group's format | address → group lookup |
+| a local unadmitted node | JSON | the bootstrap rule |
+
+There is no third case. Cross-domain traffic reaches a node only from a gateway
+that is *itself a member of that node's group*, so it arrives in the group's own
+format like any other member's traffic; and bootstrap never traverses the
+boundary, so a remote domain cannot reach a node's pre-admission path at all.
+
+That is a stronger statement than the one this document used to make. Format
+**detection** was previously described as risky and deferred, with its open
+questions parked in `R+D.md` §2.5. Under G and B it is not needed: every frame's
+format is already known before the frame is read. §2.5 is closed on that basis —
+what remains open there is not detection but the residual items listed below.
+
+It also narrows the one surface two formats cannot avoid. Bootstrap is
+unconditionally JSON, so every node runs the JSON parser no matter what its
+cohort speaks; B confines the population that can exercise it to nodes **on the
+local segment**, rather than anyone who can route to a gateway.
+
+### A case that works without anyone designing it
+
+Two groups with *different* formats can still complete a merge. `_update_group`
+addresses a peer in another group, which the lookup cannot place → JSON; the
+receiver cannot place the sender either → it expects JSON. Both sides fall to
+JSON independently and the `group_key_update` gets through.
+
+This is worth stating because it is load-bearing and accidental-looking. Without
+it a cross-format merge would **deadlock**: the message that tells a node to
+switch formats would itself be encoded in the format that node cannot yet read.
+Pinned by `network/cross-group-format-fallback`.
+
+### How they are enforced
+
+Refusals are counted and logged (rate-limited) rather than silent, for the same
+reason the foreign-format drop is: a boundary violation presents downstream as a
+peer having gone quiet, and the counter is the only thing that says why.
+
+| Check | Python | C |
+|---|---|---|
+| Bootstrap never rides the group channel | `_msg_to_queue`, `rcvd_by == 'group'` | `handle_inbound_group` |
+| Bootstrap not accepted from a cohort we gateway | `_msg_to_queue` + `_crosses_gateway` | `handle_inbound_peer` + `address_crosses_gateway` |
+| Bootstrap not sent to a cohort we gateway | outbound peer branch | outbound send path |
+| No address in two groups we hold | `_groups_containing` on group send + group receive | `held_groups_containing` on the send path |
+
+Probe counters: `net.boundary/drop/{bootstrap_on_group_channel,
+bootstrap_across_gateway, group_spans_gateway}`. Every one of these is a
+**gateway-only** gate — `_crosses_gateway` is false without child groups, and
+the two-group count cannot exceed one on a leaf — so a leaf node takes exactly
+the historical path.
+
+The verb set itself is two hand-maintained lists in two languages
+(`identity.protocol.BOOTSTRAP_VERBS`, C `ID_BOOTSTRAP_VERBS`), so its membership
+and size are pinned by `network/gateway-boundary-verbs`. Its sibling
+`UNENCRYPTED_VERBS` has the same shape and is pinned by
+`network/unencrypted-verbs`, which also holds the one relationship between the
+two sets that matters: they overlap on the two verbs that run before a key
+exists, but `full_history` is bootstrap and must **never** be accepted in
+plaintext, because it hands over the group key.
+
+### The one build that can violate G
+
+Tracked as `ISSUES.md` §2.12, which carries the four candidate resolutions.
+
+`AT_NET_GROUP_FORWARD` (CMake option, **OFF** by default) lets a gateway relay
+opaque group ciphertext across transport legs by operator-configured
+`dst_uuid → leg` route (`handle_inbound_group`, at-over-dtn stage F). It forwards
+precisely *because* it is not in the group, which is a group spanning a gateway
+by construction — and with it a foreign-format frame can reach internal nodes,
+putting every §2.5 question back on the table. Enabling it is therefore not a
+transport tuning decision; it is a decision to give up invariant G and the
+"detection is unnecessary" argument that rests on it.
+
+Note the boundary gates above do **not** catch it: they key on address→group
+maps and on bootstrap verbs, and a forwarded frame is opaque ciphertext from an
+address in no group we hold, so it takes the forward branch and returns before
+any check runs.
 
 ## What is pinned
 
@@ -175,6 +258,10 @@ Conformance (`protocol: network`), both runtimes:
 | `wire-format-mismatch-refused` | the strict gate both ways, and that the refusal is format-specific |
 | `wire-mode-resolution` | the `AT_NET_WIRE_MODE` table, including refusals |
 | `group-wire-format-canonical` | the group field's name, both values, and the absent/unknown readings |
+| `cross-group-format-fallback` | a group answers JSON for any address it cannot place — the cross-format merge handshake |
+| `gateway-boundary-verbs` | the membership AND size of the pre-admission verb set, both runtimes |
+| `unencrypted-verbs` | the plaintext allowlist, its size, and that `full_history` is bootstrap yet never plaintext |
+| `transport-binds-the-recipient` | the envelope's `from_*` claim is read ONLY with no transport peer — both formats |
 
 The proto bytes are pinned as **inline hex in the vector**, not a fixture file,
 so a change in wire shape shows up in a diff a reviewer reads. They are compared

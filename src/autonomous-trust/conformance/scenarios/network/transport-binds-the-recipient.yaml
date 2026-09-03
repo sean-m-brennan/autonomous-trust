@@ -1,0 +1,88 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: transport-binds-the-recipient
+byte_pinning: false
+description: |
+    The envelope's self-declared sender is consulted ONLY when the transport
+    supplied no peer -- and that ordering is what binds a signed message to its
+    recipient (R+D.md §2.6).
+
+    The signature pre-image is `<process>|<function>|<base64(data)>`. It names
+    no recipient, so a captured message would verify at ANY receiver if the
+    envelope's own `from_sig_key` were trusted whenever it happens to be
+    present. It is not: when the transport hands the parser an attributed peer,
+    the envelope's `from_*` claim is ignored and the signature is checked
+    against the TRANSPORT peer's key. A frame relayed by an attacker therefore
+    verifies against the ATTACKER's key -- and fails.
+
+    This is the entire basis for §2.6 being narrowed from "true of every signed
+    AT message" to "true only on the unattributed channel", so it is pinned
+    rather than left to a comment. The refactor it guards against is a
+    plausible-looking one: collapsing the branch into "always reconstruct the
+    sender from the envelope" reads like a simplification and silently restores
+    the full cross-recipient attack, in one runtime at a time.
+
+    Three rows, and the THIRD assertion is the one that distinguishes "the
+    transport wins" from the weaker "both are read and it fails when they
+    disagree": with an attributed peer present, the parsed sender must BE the
+    transport peer, not the envelope's claim.
+
+    Both formats are exercised deliberately. Python shares one `_assemble` for
+    the two encodings, but C duplicates the branch in `net_message_from_wire`
+    and `net_message_from_wire_proto`, so a divergence between C's own two
+    parsers is exactly what a single-format case would miss.
+
+    The unattributed row is not a defect: it is the discovery broadcast and the
+    unplaced point-to-point frame, where a brand-new peer is in no listing yet
+    and the envelope is the only identity available. Those verbs carry their own
+    freshness token instead (`core/freshness.py`); see
+    `network/unencrypted-verbs` for the set.
+
+    Production-code analogue:
+      Python: Message._assemble -- `if not isinstance(eff_sender, Identity)`.
+      C:      net_message_from_wire / _proto -- `if (peer != NULL)`.
+
+participants:
+  - id: signer
+    role: sender        # alice: signs the message
+  - id: relayer
+    role: receiver      # mallory: on-path, a known peer of the victim
+
+fixtures:
+  process: idproc
+  function: peer_caps_query
+  obj_json: "payload"
+  trace_id: "aaaabbbbccccddddeeeeffff00001111"
+
+steps:
+  - id: 1
+    from: signer
+    to: relayer
+    function: transport_attribution_precedence
+    description: |
+        The adapter has `signer` sign one message, then parses that same frame
+        three ways in each wire format: attributed to the true signer,
+        attributed to the relayer (the relay attack), and unattributed.
+
+expected_state:
+  signer:
+    # Row 1 -- the honest path. Also the negative control: without this a
+    # parser that never verifies anything would satisfy row 2.
+    json_verified_for_true_sender: true
+    proto_verified_for_true_sender: true
+    # Row 2 -- the relay attack. The frame is byte-identical to row 1; only the
+    # transport attribution differs, and that alone must refuse it.
+    json_relay_refused: true
+    proto_relay_refused: true
+    # Row 3 -- the ordering itself. With a transport peer present the parsed
+    # sender is the TRANSPORT peer, proving the envelope's claim was ignored
+    # rather than merely contradicted.
+    json_transport_peer_overrides_envelope: true
+    proto_transport_peer_overrides_envelope: true
+    # The unattributed channel, where the envelope IS the only identity there
+    # is. Pinned so a future tightening does not break bootstrap by accident.
+    json_unattributed_verified: true
+    proto_unattributed_verified: true
+    json_unattributed_sender_is_envelope_claim: true
+    proto_unattributed_sender_is_envelope_claim: true

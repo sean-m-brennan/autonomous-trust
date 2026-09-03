@@ -29,7 +29,7 @@ import nacl
 
 from ..protocol import Protocol
 from ..identity import Identity
-from ..identity.protocol import IdentityProtocol, UNENCRYPTED_VERBS
+from ..identity.protocol import IdentityProtocol, UNENCRYPTED_VERBS, BOOTSTRAP_VERBS
 from ..processes import Process, ProcMeta
 from .. import _probes
 from ..identity import Group
@@ -165,6 +165,10 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         # this context does not speak. Rate-limits the log the same way
         # _crypto_error_counts does; the probe counter is unconditional.
         self._foreign_format_counts: dict[str, int] = {}
+        # Per-(kind, address) count of frames refused by the gateway-boundary
+        # gate (_boundary_refuse). Rate-limits the log exactly as
+        # _foreign_format_counts does; the probe counter is unconditional.
+        self._boundary_counts: dict[str, int] = {}
         # Partition-recovery signal cooldown: per-source-address timestamp of the last
         # signal we forwarded to IdentityProcess. Bounded at one signal per address per
         # 5 seconds so a chatty rejected-group peer can't flood the identity queue. See
@@ -227,6 +231,90 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 continue
         return None
 
+    # ---- The gateway boundary -------------------------------------------
+    #
+    # Two invariants, both normative
+    # (doc/architecture/network-wire-format.md, "The gateway boundary"):
+    #
+    #   G. A GROUP STOPS AT THE GATEWAY. A gateway is a full MEMBER of each
+    #      cohort it bridges; no group spans it. So no address other than the
+    #      gateway's own may appear in two of the groups it holds, and a
+    #      group-addressed frame never leaves the address map of the group that
+    #      addressed it.
+    #   B. BOOTSTRAP DOES NOT CROSS THE GATEWAY. The pre-admission handshake
+    #      (BOOTSTRAP_VERBS) is domain-local. This is what ENFORCES G: the only
+    #      way a group comes to span a gateway is for a node on one side to be
+    #      admitted by a cohort on the other, and those three verbs are the only
+    #      ones that move membership.
+    #
+    # Together these make wire-format detection unnecessary rather than merely
+    # risky: every frame is either from a member of a group we hold (so the
+    # format is a lookup) or local bootstrap (so the format is JSON by rule).
+    # Relaxing either one puts that back on the table -- R+D.md Sec 2.5.
+
+    def _held_groups(self):
+        """Every group whose address map this node holds: the primary plus any
+        child cohort it gateways. Empty-to-one-element on a leaf node."""
+        grps = []
+        if self.group is not None:
+            grps.append(self.group)
+        grps.extend(list(self.child_groups.values()))
+        return grps
+
+    def _groups_containing(self, addr):
+        """The held groups listing *addr*, excluding our own address.
+
+        A gateway is by construction a member of BOTH its primary group and
+        every child cohort it bridges, so its own address is in every map and
+        is never a violation. Any OTHER address in two maps means those two
+        groups have merged across this gateway -- invariant G above.
+        """
+        try:
+            if addr == self.myself.address:
+                return []
+        except AttributeError:
+            pass
+        found = []
+        for grp in self._held_groups():
+            try:
+                if addr in grp.addresses:
+                    found.append(grp)
+            except Exception:
+                continue
+        return found
+
+    def _boundary_refuse(self, kind, addr, detail):
+        """Count, rate-limited-log, and report a gateway-boundary refusal.
+
+        Always returns True, so call sites read ``if ...: continue`` /
+        ``return``. Logged at ERROR rather than WARNING for the same reason the
+        foreign-format drop is: a boundary violation presents downstream as a
+        peer having silently gone quiet, and this line is the only thing that
+        says why.
+        """
+        _probes.counter('net.boundary', 'drop', kind)
+        key = '%s|%s' % (kind, addr)
+        n = self._boundary_counts.get(key, 0) + 1
+        self._boundary_counts[key] = n
+        if n == 1 or n % 10 == 0:
+            self.logger.error(
+                'Gateway boundary: refusing %s involving %s -- %s (count: %d)',
+                kind, addr, detail, n)
+        return True
+
+    def _crosses_gateway(self, addr):
+        """True when *addr* sits on the far side of a gateway boundary from our
+        primary group: a member of a child cohort we bridge but NOT of our own
+        group. On a leaf node (no child groups) this is always False, so the
+        historical path is untouched."""
+        if not self.child_groups:
+            return False
+        holding = self._groups_containing(addr)
+        if not holding:
+            return False
+        primary = self.group
+        return all(grp is not primary for grp in holding)
+
     @staticmethod
     def _wire_format_for_group(grp):
         """*grp*'s envelope format, or JSON when there is no group
@@ -251,7 +339,12 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         see doc/architecture/network-wire-format.md.
         """
         grp = self._group_for_sender(addr)
-        return grp.wire_format if grp is not None else NetWireFormat.json
+        # Delegate rather than reading grp.wire_format directly: the rule is the
+        # group's (Group.wire_format_for_address, mirrored by C's
+        # group_wire_format_for_address), and one copy is what keeps the
+        # production selection and the conformance-pinned one from drifting.
+        return (grp.wire_format_for_address(addr) if grp is not None
+                else NetWireFormat.json)
 
     def track_send_stats(self, uuid, num_bytes):
         if uuid not in self.statistics:
@@ -782,6 +875,27 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         from_addr = from_whom
         if isinstance(from_whom, Identity):
             from_addr = from_whom.address
+
+        # Gateway boundary, invariant B (see the block above _held_groups):
+        # bootstrap is domain-local. Two refusals, and neither can fire on a
+        # leaf node -- the first because the pre-admission verbs are never
+        # group-addressed in the first place (announce is broadcast, accept and
+        # history are point-to-point to an unplaced identity), the second
+        # because _crosses_gateway is False without child groups.
+        if message.function in BOOTSTRAP_VERBS:
+            if rcvd_by == 'group':
+                self._boundary_refuse(
+                    'bootstrap_on_group_channel', from_addr,
+                    '%s arrived group-encrypted; the pre-admission handshake '
+                    'is never a group message' % message.function)
+                return
+            if self._crosses_gateway(from_addr):
+                self._boundary_refuse(
+                    'bootstrap_across_gateway', from_addr,
+                    '%s from a cohort we gateway; admitting across the boundary '
+                    'would make a group span it' % message.function)
+                return
+
         # Deliver to any known process queue, not just subsystems.
         # Cross-instance request/response patterns (e.g. an inspector
         # bridge soliciting peer-to-peer reputation: rep_req carries
@@ -947,6 +1061,15 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                 for addr in message.to_whom.addresses:
                                     if addr == self.myself.address:
                                         continue
+                                    # Gateway boundary, invariant G: a group's
+                                    # traffic never reaches an address that also
+                                    # belongs to another group we hold.
+                                    if len(self._groups_containing(addr)) > 1:
+                                        self._boundary_refuse(
+                                            'group_spans_gateway', addr,
+                                            'target is a member of more than one '
+                                            'group we hold')
+                                        continue
                                     # Reputation cut-off: do not forward
                                     # to/for an excluded member (a gateway
                                     # thus stops relaying toward it).
@@ -964,6 +1087,16 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                     address = who.address
                                     if '/' in address:
                                         address = address.split('/')[0]
+                                    # Gateway boundary, invariant B: the
+                                    # pre-admission handshake stays inside the
+                                    # domain it started in.
+                                    if (message.function in BOOTSTRAP_VERBS
+                                            and self._crosses_gateway(address)):
+                                        self._boundary_refuse(
+                                            'bootstrap_across_gateway', address,
+                                            'refusing to send %s to a cohort we '
+                                            'gateway' % message.function)
+                                        continue
                                     # Reputation cut-off: skip an excluded
                                     # recipient.
                                     if self.reject_message(address):
@@ -1115,6 +1248,16 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     # before. A gateway additionally matches its child groups,
                     # decrypting a cohort-below frame with that cohort's own key. See
                     # doc/architecture/gateway-reputation-tree.md.
+                    # Gateway boundary, invariant G: an address in two of the
+                    # groups we hold means those groups have merged across this
+                    # gateway. Refuse rather than let _group_for_sender resolve
+                    # it primary-first, which would pick a group -- and so a
+                    # decrypt key AND a wire format -- on map-ordering alone.
+                    if len(self._groups_containing(from_addr)) > 1:
+                        self._boundary_refuse(
+                            'group_spans_gateway', from_addr,
+                            'sender is a member of more than one group we hold')
+                        continue
                     sender_group = self._group_for_sender(from_addr)
                     if sender_group is not None:
                         from_whom = self.peers.find_by_address(from_addr)

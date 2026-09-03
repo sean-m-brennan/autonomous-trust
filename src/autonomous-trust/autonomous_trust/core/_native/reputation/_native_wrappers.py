@@ -57,11 +57,29 @@ class TransactionHistory:
         self._ptr = ptr_holder[0]
 
     def update(self, task_uuid: _uuid.UUID, peer_uuid: _uuid.UUID,
-               score: float):
-        """Record a transaction score."""
+               score: float, channel: str = None):
+        """Record a transaction score.
+
+        ``channel`` is the evidence channel of the score, part of the
+        committed entry and of its hash (doc/architecture/reputation.md,
+        "The reason is part of the committed fact"). ``None`` means absent,
+        which is what every producer predating the field meant; C refuses a
+        spelling outside the closed set rather than coercing it, so an
+        unknown one raises here like any other non-zero return.
+
+        Keyword-defaulted to mirror the pure-Python
+        ``TransactionHistory.update``, whose channel argument is also
+        optional -- the two are overlaid per module, so a caller must not
+        have to know which one it holds.
+        """
         task_buf = ffi.new('unsigned char[16]', task_uuid.bytes)
         peer_buf = ffi.new('unsigned char[16]', peer_uuid.bytes)
-        rc = lib.tx_history_update(self._ptr, task_buf, peer_buf, score)
+        # NULL, not b'': C reads an empty string as absent too, but passing
+        # the null pointer keeps the "no channel" case one representation.
+        chan_buf = ffi.NULL if not channel else ffi.new('char[]',
+                                                        str(channel).encode())
+        rc = lib.tx_history_update(self._ptr, task_buf, peer_buf, score,
+                                   chan_buf)
         if rc != 0:
             raise RuntimeError(f"tx_history_update failed with rc={rc}")
 

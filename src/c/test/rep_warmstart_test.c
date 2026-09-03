@@ -46,8 +46,8 @@ static void _fill_pair(tx_history_t *hist, const uuid_t p1, const uuid_t p2,
     {
         uuid_t task;
         uuid_generate(task);
-        tx_history_update(hist, task, p1, score);
-        tx_history_update(hist, task, p2, score);
+        tx_history_update(hist, task, p1, score, NULL);
+        tx_history_update(hist, task, p2, score, NULL);
     }
 }
 
@@ -133,7 +133,7 @@ DEFINE_TEST(test_evidence_omits_uncommitted_entries)
     uuid_t task, peer;
     uuid_generate(task);
     uuid_generate(peer);
-    tx_history_update(&hist, task, peer, 0.8);   /* one-sided */
+    tx_history_update(&hist, task, peer, 0.8, NULL);   /* one-sided */
 
     json_t *doc = NULL;
     ck_assert_ret_ok(reputation_evidence_to_json(&hist, NULL, &doc));

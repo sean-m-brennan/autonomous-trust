@@ -1,0 +1,86 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: gateway-boundary-verbs
+byte_pinning: false
+description: |
+    Which verbs the gateway boundary refuses to carry
+    (doc/architecture/network-wire-format.md, "The gateway boundary").
+
+    Two normative invariants hold the wire-format design together:
+
+      G. A GROUP STOPS AT THE GATEWAY. A gateway is a full MEMBER of each
+         cohort it bridges; no group spans it.
+      B. BOOTSTRAP DOES NOT CROSS THE GATEWAY. The pre-admission handshake is
+         domain-local.
+
+    B is what ENFORCES G: the only way a group comes to span a gateway is for a
+    node on one side to be ADMITTED by a cohort on the other, so the boundary
+    gate keys on exactly the verbs that move membership. Together they are why
+    wire-format detection is unnecessary rather than merely deferred (R+D.md
+    2.5) -- every frame is from a placeable member (format by lookup) or is
+    local bootstrap (format JSON by rule).
+
+    This case pins the MEMBERSHIP of that verb set, because it is two
+    hand-maintained lists in two languages -- Python
+    identity.protocol.BOOTSTRAP_VERBS and C's ID_BOOTSTRAP_VERBS -- and a list
+    that drifts opens the boundary on one runtime while closing it on the
+    other, silently. (Its sibling UNENCRYPTED_VERBS has the same shape and is
+    NOT yet pinned; see ISSUES.md.)
+
+    The negative controls carry most of the value. `group_key_update` moves
+    MEMBERSHIP but not ADMISSION and must cross freely or a gateway could not
+    hold two cohorts at all. The partition pair deliberately spans a group-KEY
+    boundary (doc/architecture/partition-recovery.md) but stays inside one
+    domain and confers no membership -- classifying either as bootstrap would
+    break partition recovery at every gateway.
+
+    Production-code analogue:
+      Python: identity.protocol.BOOTSTRAP_VERBS, consulted by
+              NetworkProcess._msg_to_queue and the outbound peer path.
+      C:      identity_verb_is_bootstrap, consulted by handle_inbound_group,
+              handle_inbound_peer and the outbound send path.
+
+participants:
+  - id: node
+    role: receiver
+
+fixtures:
+  bootstrap_verbs:
+    - request_access     # asks to be admitted
+    - access_granted     # grants admission
+    - full_history       # hands over the group and its key
+  not_bootstrap_verbs:
+    - group_key_update       # membership, not admission
+    - group_partition_probe  # spans a key boundary, inside one domain
+    - group_partition_response
+    - peer_accepted
+    - propose_peer
+    - vote_on_peer
+    - peer_identity_query
+    - peer_identity_response
+    - subtree_roster_query
+    - subtree_roster_response
+    - hierarchy_root
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: classify_bootstrap_verbs
+    description: |
+        The adapter asks the production classifier about every verb in both
+        fixture lists and records whether the answers match exactly.
+
+expected_state:
+  node:
+    # Every verb in the bootstrap list classifies as bootstrap.
+    all_bootstrap_verbs_recognized: true
+    # And nothing else does -- the negative half, which is what catches a list
+    # that grew a member on one side only.
+    no_other_verb_is_bootstrap: true
+    # Exactly three verbs move admission. A change here is a protocol change
+    # and must be made deliberately on both sides.
+    bootstrap_verb_count_is_three: true
+    # NULL/empty is safe and is not bootstrap (C takes NULL; Python None).
+    empty_verb_is_not_bootstrap: true
