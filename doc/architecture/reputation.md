@@ -102,10 +102,11 @@ and an unrecognized spelling passed through, or quietly recorded as
 an app predating the field, which was grading a task outcome by construction, so
 it normalizes to `task_outcome` and every earlier producer keeps its meaning.
 
-The channel deliberately does not enter a committed chain entry's canonical
-bytes — a chain entry records who transacted and how well, while the channel is
-provenance for the score. Making it tamper-evident would be its own slice, with
-its own chain migration.
+The channel is part of the committed chain entry, not only of the score that
+produced it: it rides the commit broadcast, is written to every acceptor's
+history, and enters the entry's canonical bytes. See
+[The reason is part of the committed fact](#the-reason-is-part-of-the-committed-fact)
+for why, and for the one condition that keeps it from being a chain migration.
 
 ### What a channel does
 
@@ -136,49 +137,94 @@ aggregate cannot be captured by a colluding cohort, while a physics refutation's
 strength is that one observation settles the question outright. The multiplier
 measures the second.
 
-**A hard channel makes a defection grounds to accuse.** `physical`,
-`certificate`, and `self_consistency` are *falsifications* rather than grades —
-the peer did not do poorly, it asserted something that is not true. Each is a
-verdict reachable without consulting any other peer, which is what makes a single
-observation of one sufficient grounds to accuse. So a score on one of those
-channels that is also below the per-transaction cooperate threshold (0.5, the
-same number that means "peer defected" elsewhere in this document) **proposes** a
-slash. It does not impose one: the quorum co-signature described under
-[Quorum attestation](#quorum-attestation) accepts or refuses it like any other, so a refutation is an
-accusation with evidence, not a verdict.
+**It is retained as the reason.** See the next section: the channel enters the
+committed entry, so every peer that holds the chain holds the reason a score was
+poor, not just the number.
 
-The floor is 0.45 — demotion, not exclusion. That is below the tier-1 floor, so
-the peer drops to tier 0 and is shed by tier-gated negotiation, but well above
-the communication cutoff, so it is not silenced and can earn its way back.
-Exclusion is reversible only by operator rehabilitation, which is far too heavy
-for one automated verdict. The slash reason names the channel —
-`refuted_physical`, `refuted_certificate`, `refuted_self_consistency` — so the
-closed channel set defines the closed reason set and neither can drift from the
-other. Because the reason is part of the signed designation, a channel claim
-carried there cannot be altered in flight, unlike an evidence reference.
+There is deliberately no third response, and in particular no automatic
+accusation. Between 2026-09-01 and 2026-09-02 a defection-grade score on one of
+the three hard-falsification channels *proposed* a slash, pinning the peer's
+reputation from outside the consensus average on one detector's verdict. That was
+removed at the user's direction, and the reasoning is the reasoning of this whole
+section: a transaction is scored poorly **with its reason given**, every peer sees
+both, and each judges for itself. Discipline is then the consensus average and the
+tier machinery working at their own pace — which is graduated by construction —
+rather than a fast path around them.
 
-`probe` is not a hard channel even though its ground truth is certain. A probe is
-synthetic traffic the verifier generates continuously, so making one failed probe
-slash-eligible would put every node's exclusion in the hands of its own probe
-cadence. It gets the corroborated multiplier instead.
+That also disposes of the question this section used to leave open. Since no
+channel levies a verdict, there is nothing to dispute, so `swarm_disagreement`
+needs no adjudicator and none is planned for either runtime. (A majority is not
+an oracle, which is why weighting it like a hard channel would have been the
+wrong answer too; it sits at the baseline multiplier.)
 
-`AT_TX_CHANNEL_SLASH_DISABLED` stops the accusation and keeps the weighting, for
-a deployment that wants the legibility without the automated demotion.
+`physical`, `certificate` and `self_consistency` remain distinguished — they are
+*falsifications* rather than grades, and the peer did not do poorly so much as
+assert something untrue — but what that buys them is the top multiplier and a
+legible reason, not an accusation.
+
+What survives of slashing is the deliberate act: the behaviour governor's
+human-on-the-loop path, and an operator's explicit exclude or rehabilitate. The
+protocol they use is now opt-in to match. With `AT_SLASH_ENABLED` unset — the
+default — a node originates no slash, declines to co-sign a peer's proposal, and
+ignores a finalized one rather than applying its floor. Arm it fleet-wide if you
+arm it at all: a group where only some members are armed will disagree about the
+floor, which is inherent to slashing being a policy rather than a fact.
+
+### The reason is part of the committed fact
+
+A response that consists of "every peer judges for itself" only works if every
+peer *retains* what it is judging. Until 2026-09-02 the channel stopped at the
+chain boundary: the commit broadcast carried a bare score, so an acceptor wrote
+the number and dropped the reason, and the reason survived only in the scorer's
+own log and in flight (where a relay could alter it undetected).
+
+So a chain entry now carries the channel of each side's score, and
+`Transaction._canonical_bytes` covers it — which means the entry hash covers it,
+and therefore so do the chain link, the window root, and the quorum-signed
+checkpoint over that root. Stripping a refutation off an entry breaks the link.
+The reason also travels wherever the entry does: the catch-up wire, the persisted
+evidence document a warm start verifies, and the evidence-backed answers deep
+resolution returns.
+
+The one condition, which is what makes this an additive change rather than a
+chain migration: the `|p1_channel|p2_channel` block is appended **only when at
+least one side carries a channel other than `task_outcome`**. Three consequences,
+each load-bearing:
+
+- The same fact still hashes to the same bytes. An absent channel and an explicit
+  `task_outcome` are the same claim, and both omit the block, so two nodes cannot
+  disagree about an entry's hash because one of them received the default spelled
+  out.
+- Every entry committed before the field keeps its hash. Entry hashes chain and
+  roll up into roots that are already signed, so appending unconditionally would
+  have invalidated every stored chain, every finalized checkpoint and every
+  byte-pinned corpus vector at once.
+- The tampering that matters is still caught. Stripping a real channel changes
+  the bytes; adding `task_outcome` to an untagged entry is a no-op because it
+  asserts nothing.
+
+An unknown spelling arriving on the commit path drops the whole commit rather
+than being coerced to the default. Coercing would either fork this node's entry
+hash away from the group's or silently rewrite the reason — and a peer sending
+one is speaking a vocabulary this node does not have, which is exactly what the
+closed set exists to catch.
+
+`capability_name` deliberately did *not* travel with the channel. It would
+publish a per-peer record of which capability every transaction exercised, and
+per-capability weighting stays local.
 
 ### Only your own evidence counts
 
-Both responses apply *only* to a score this node produced. The scorer chooses its
-own tag, so honouring a remote peer's channel would hand every peer a lever on
-every other peer's reputation: tag a fabricated 0.0 as `physical` and it would
-land with triple weight and an accusation attached. A score that arrived from the
-wire keeps its channel for legibility, and is weighted by capability alone.
+The *multiplier* applies only to a score this node produced. The scorer chooses
+its own tag, so honouring a remote peer's channel would hand every peer a lever
+on every other peer's reputation: tag a fabricated 0.0 as `physical` and it would
+land with triple weight. A score that arrived from the wire keeps its channel —
+it is retained, committed and legible, which is the point — and is weighted by
+capability alone.
 
-This is structural rather than a check that could be forgotten. Accusing requires
-naming a subject, and a score's subject is local-only — it is never serialized,
-so a score off the wire has *no subject to accuse* whatever it claims in its
-channel. The requestor stamps the subject from the transport-verified sender of
-the reply, and only for a single-participant task; a fan-out is not attributable
-to one peer.
+Retention and weighting are different powers, and only the second is withheld. A
+peer's claim about how it knows something is worth recording; it is not worth
+letting that peer decide how heavily this node folds it in.
 
 The cost is that two nodes can compute slightly different consensus averages for
 the same peer. That is already true of the per-capability weights — a verifier
@@ -187,11 +233,16 @@ existing local-view divergence rather than introducing one.
 
 ### What is still missing
 
-`swarm_disagreement` should open a **dispute** rather than levy a penalty, and
-there is no dispute machinery in either runtime. Weighting it like a hard channel
-would be the opposite of what is wanted, since a majority is not an oracle, so it
-sits at the baseline multiplier and levies an ordinary penalty for now. See
-R+D.md section 12.8 and [the verification oracle](../verification_oracle.md).
+Nothing in the channel machinery itself: the vocabulary, the multiplier and the
+retention are all in place on both runtimes, and the third response the design
+once called for (a dispute) was answered by deciding there is no verdict to
+dispute.
+
+What is missing is *producers*. Only `task_outcome`, `certificate` and `probe`
+have any: `physical`, `calibration`, `self_consistency`, `replication` and
+`swarm_disagreement` are vocabulary waiting for the oracle layers that would emit
+them. See R+D.md section 12 and
+[the verification oracle](../verification_oracle.md).
 
 ## Computing a score
 

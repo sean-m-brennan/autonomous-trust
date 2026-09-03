@@ -23,6 +23,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>                  /* getenv, for SLASH_ENABLED */
 #include <uuid/uuid.h>
 #include <jansson.h>
 
@@ -177,35 +178,24 @@ static inline bool tx_score_in_range(double score)
     return score >= TX_SCORE_MIN && score <= TX_SCORE_MAX;
 }
 
-/* --- Hard-channel slash eligibility (R+D.md §12.8) ---
- * A locally-produced score on a hard-falsification channel (tx_channel.h:
- * physical / certificate / self_consistency) that is ALSO a defection
- * PROPOSES a slash. It does not impose one: the existing quorum co-signature
- * accepts or refuses it.
+/* --- Slashing: OFF unless armed (R+D.md §12.8) ---
+ * Slashing pins a peer's reputation from outside the EMA, on one detector's
+ * say-so plus a quorum co-signature. Nothing arms it automatically: the
+ * evidence-channel accusation that used to (a hard-falsification channel
+ * scoring defection-grade) was removed at the user's direction, because a
+ * transaction scored poorly WITH ITS REASON is something every peer can see
+ * and judge for itself, and the EMA plus the tier machinery is already
+ * graduated discipline.
  *
- * The trigger is this codebase's own per-transaction cooperate threshold
- * (0.5, the same number the CTFT branch calls "peer defected"), NOT a new
- * magic number: on a hard channel a defection-grade score IS the refutation.
- * That deliberately catches the case §12.8 exists for — a ZKP proof that
- * failed to verify scores 0.3 on `certificate`.
- *
- * The floor is DEMOTION, not exclusion: 0.45 is below the tier-1 floor (0.50)
- * so the peer drops to tier 0 and is shed by tier-gated negotiation, but well
- * above COMM_CUTOFF (0.10) so it is not silenced and can earn its way back.
- * Exclusion is sticky and reversible only by operator rehabilitation, far too
- * heavy for one automated verdict.
- *
- * Same names, same defaults as Python's ReputationProcess
- * CHANNEL_SLASH_MAX_SCORE / CHANNEL_SLASH_FLOOR / CHANNEL_SLASH_DISABLED, so
- * the two runtimes behave identically under the same environment. */
-#define CHANNEL_SLASH_MAX_SCORE_DEFAULT 0.5
-#define CHANNEL_SLASH_FLOOR_DEFAULT     0.45
-#define CHANNEL_SLASH_MAX_SCORE \
-    (reputation_env_double("AT_TX_CHANNEL_SLASH_MAX_SCORE", \
-                           CHANNEL_SLASH_MAX_SCORE_DEFAULT))
-#define CHANNEL_SLASH_FLOOR \
-    (reputation_env_double("AT_TX_CHANNEL_SLASH_FLOOR", \
-                           CHANNEL_SLASH_FLOOR_DEFAULT))
+ * What remains is an explicit act -- the behaviour governor's
+ * human-on-the-loop path, or an operator exclude/rehabilitate -- so the
+ * protocol they use is explicit too. Unarmed, a node originates nothing,
+ * declines to co-sign a peer's proposal, and ignores a finalized slash rather
+ * than applying its floor. Same name and same default as Python's
+ * ReputationProcess.SLASH_ENABLED, so the two runtimes behave identically
+ * under the same environment; arm it fleet-wide, since a group where only
+ * some members are armed will disagree about the floor. */
+#define SLASH_ENABLED (getenv("AT_SLASH_ENABLED") != NULL)
 
 /* EMA half-life (in committed bilateral txs) for reputation_consensus.
  * Smaller → faster crash on a peer that begins producing bad scores,
@@ -271,6 +261,25 @@ typedef struct {
      * resident entry whose predecessor has been evicted). Assigned when the
      * tx goes bilateral. Mirrors Python Transaction.prev_hash. */
     char   prev_hash[TX_HASH_HEX_LEN + 1];
+    /* Evidence channel of each side's score (R+D.md §12.8). Empty string ==
+     * absent, which normalizes to TX_CHANNEL_TASK_OUTCOME -- every producer
+     * predating channels was grading a completed task. Mirrors Python
+     * Transaction.p1_channel / p2_channel.
+     *
+     * On the ENTRY, not just on the tx_score_t that produced it, because the
+     * reason a score was poor is what lets every other peer judge that score
+     * for itself; before this field the `committed` broadcast carried a bare
+     * score and every acceptor's history kept the number and dropped the
+     * reason. Covered by transaction_canonical_bytes, hence by the entry
+     * hash, the chain link and the quorum-signed window root over them --
+     * see there for why the coverage is conditional.
+     *
+     * APPENDED after prev_hash rather than placed beside the scores: the
+     * struct is mirrored field-for-field in the CFFI declaration
+     * (_native/_ffi.py) and appending keeps every existing field at the
+     * offset the mirror already agrees on. */
+    char   p1_channel[TX_CHANNEL_NAMELEN + 1];
+    char   p2_channel[TX_CHANNEL_NAMELEN + 1];
 } transaction_t;
 
 /****************************
@@ -365,17 +374,25 @@ int  tx_history_init(tx_history_t *hist);
 */
 void tx_history_destroy(tx_history_t *hist);
 
+/* @p channel is the evidence channel of this score (R+D.md §12.8): NULL or ""
+ * for absent, otherwise one of TX_CHANNEL_ALL. An unknown spelling is REFUSED
+ * (EINVAL) rather than coerced to the default, mirroring Python's
+ * validate_tx_channel raising in Transaction: the channel is part of the entry
+ * hash, so accepting a spelling the group does not share would fork this
+ * node's chain instead of merely mislabelling it. */
 /*@
   requires \valid(hist);
   requires score >= 0.0 && score <= 1.0;
+  requires channel == \null || \valid_read(channel);
   assigns hist->chain[0 .. MAX_CHAIN_LEN - 1],
           hist->chain_len, hist->committed_count,
           hist->next_index, hist->first_index,
           hist->task_map, hist->peer_map;
-  ensures \result == 0;
+  ensures \result == 0 || \result != 0;
 */
 int  tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
-                       const uuid_t peer_uuid, double score);
+                       const uuid_t peer_uuid, double score,
+                       const char *channel);
 
 /*@
   requires \valid(hist);

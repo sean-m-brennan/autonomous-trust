@@ -188,6 +188,29 @@ int64_t group_rotate_key(group_t *group);
  *  adopted. Mirrors Python Group.accept_rotation. */
 bool group_accept_rotation(group_t *group, const group_t *other);
 
+
+/**
+ * @brief The envelope format this group speaks to @p address.
+ *
+ * A membership question: a member speaks the group's own wire_format, and any
+ * address this group cannot place gets NET_WIRE_JSON -- the format every AT
+ * node can read (doc/architecture/network-wire-format.md).
+ *
+ * The JSON fallback is what lets two groups with DIFFERENT formats complete a
+ * merge handshake without negotiating it: neither can place the other's
+ * members, so both fall to JSON independently. Pinned by conformance
+ * `network/cross-group-format-fallback`.
+ *
+ * Mirrors Python Group.wire_format_for_address, and is the single copy of the
+ * rule -- net_proc.c's wire_format_for_address delegates here.
+ *
+ * @param group   Group to ask; NULL yields NET_WIRE_JSON.
+ * @param address Peer address; NULL or empty yields NET_WIRE_JSON.
+ * @return The format to encode in.
+ */
+net_wire_format_t group_wire_format_for_address(const group_t *group,
+                                                const char *address);
+
 /**
  * @brief Serialize a group into its protobuf wire representation.
  *

@@ -1,0 +1,105 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: unencrypted-verbs
+byte_pinning: false
+description: |
+    Which verbs a receiver accepts in PLAINTEXT from a peer it already knows.
+
+    Some protocol verbs are sent unencrypted by design -- the pre-admission
+    handshake runs before a shared key exists, identity backfill and the
+    partition pair span a key boundary by definition. So a frame from a known
+    peer that fails to decrypt is not automatically hostile, and a receiver that
+    refused all of them would drop traffic the protocol requires. (That refusal
+    is what once cost three-peer convergence.)
+
+    The allowlist is therefore load-bearing in BOTH directions, and each
+    direction fails differently:
+
+      * Too SMALL and a legitimate verb is dropped, which presents as a peer
+        going silent for reasons nothing explains.
+      * Too LARGE and it is a DOWNGRADE opening: a verb that should only ever
+        arrive encrypted becomes acceptable in the clear, and an attacker
+        selects it simply by not encrypting.
+
+    This case pins the MEMBERSHIP and the SIZE of that list, because it is two
+    hand-maintained lists in two languages -- Python
+    identity.protocol.UNENCRYPTED_VERBS and C's ID_UNENCRYPTED_VERBS -- kept in
+    sync by comment alone. A verb added on one side only opens the downgrade on
+    that runtime and nowhere else, which is precisely the asymmetry a corpus
+    exists to catch and no single-runtime test can see.
+
+    THE ASSERTION THAT MATTERS MOST is the relationship to the bootstrap set
+    (see `gateway-boundary-verbs`). The two overlap on `request_access` and
+    `access_granted` -- both run before a key exists -- but `full_history` is
+    bootstrap and is NOT unencrypted, because it hands over the GROUP KEY.
+    Neither set is a subset of the other, and a "tidying" change that merged
+    them, or that added full_history here for symmetry, would put the group key
+    on the wire in the clear.
+
+    Production-code analogue:
+      Python: identity.protocol.UNENCRYPTED_VERBS, consulted by
+              NetworkProcess._accept_unencrypted.
+      C:      identity_verb_is_unencrypted, consulted by
+              try_unencrypted_from_known_peer.
+
+participants:
+  - id: node
+    role: receiver
+
+fixtures:
+  unencrypted_verbs:
+    - request_access             # pre-admission: no key exists yet
+    - access_granted             # sent before the key lands
+    - peer_identity_query        # identity backfill, both directions
+    - peer_identity_response
+    - operator_attest_query      # operator-attended pull / answer
+    - operator_attest_response
+    - subtree_roster_response    # roster answer
+    - group_partition_probe      # partition recovery spans a key boundary
+    - group_partition_response
+  encrypted_only_verbs:
+    - full_history               # HANDS OVER THE GROUP KEY -- never plaintext
+    - group_key_update
+    - propose_peer
+    - vote_on_peer
+    - peer_accepted
+    - peer_caps_query
+    - peer_caps_response
+    - subtree_roster_query
+    - hierarchy_root
+    - hierarchy_query
+  # Verbs in BOTH sets: run before a key exists, so they are bootstrap AND
+  # plaintext. Named here so the overlap is deliberate rather than incidental.
+  both_bootstrap_and_unencrypted:
+    - request_access
+    - access_granted
+  # Bootstrap but NOT plaintext. The security-critical asymmetry.
+  bootstrap_but_encrypted:
+    - full_history
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: classify_unencrypted_verbs
+    description: |
+        The adapter asks the production classifier about every verb in each
+        fixture list, and cross-checks the membership relationship between the
+        plaintext allowlist and the bootstrap set.
+
+expected_state:
+  node:
+    # Every verb the protocol sends in the clear is accepted in the clear.
+    all_unencrypted_verbs_recognized: true
+    # And nothing else is -- the downgrade half.
+    no_other_verb_is_unencrypted: true
+    # Nine verbs, exactly. A change is a protocol change, made on both sides.
+    unencrypted_verb_count_is_nine: true
+    # NULL/empty is safe and is not on the allowlist.
+    empty_verb_is_not_unencrypted: true
+    # The two sets overlap where a key does not yet exist ...
+    overlap_verbs_are_both: true
+    # ... and full_history is bootstrap yet must NEVER ride in plaintext,
+    # because it carries the group key.
+    full_history_is_bootstrap_but_not_unencrypted: true

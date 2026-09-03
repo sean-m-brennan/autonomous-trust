@@ -257,13 +257,30 @@ class Message(object):
         only reproduce the same bytes. One Ed25519 operation per round therefore
         replaces one per recipient.
 
-        This does not weaken anything: the recipient was never bound into the
-        signature, so a holder of any signed message could already present it to
-        a different peer. That property is a protocol question recorded in
-        ``R+D.md``, not something this method introduces -- and if a future
-        pre-image does bind the recipient, this method must re-sign instead of
-        copying, which is why it lives here rather than being open-coded by
-        callers.
+        This does not weaken anything, and the reason is stronger than it once
+        looked (``R+D.md`` §2.6, narrowed 2026-09-03 after being measured rather
+        than reasoned about). **The recipient is bound by the transport, not by
+        the signature**, on every channel that carries an attributed sender:
+
+        * Point-to-point is sealed in a NaCl box to the recipient's public key,
+          so a captured frame is not readable elsewhere unless an attacker
+          re-boxes it as herself -- and :meth:`_assemble` then verifies against
+          the peer the TRANSPORT attributed, not the envelope's ``from_*``
+          claim, so the re-boxed copy verifies as the attacker and fails.
+        * A group message is a broadcast; every member is an intended
+          recipient, so there is no "different recipient" to present it to.
+
+        Binding the recipient into the pre-image would therefore add nothing on
+        either channel while costing one Ed25519 operation per member on exactly
+        the fan-out paths this method exists to make cheap. It is not
+        contemplated. The one place the unbound property is genuinely visible is
+        the *unattributed* channel -- discovery broadcast and unplaced
+        point-to-point, where there is no transport peer to verify against --
+        and those verbs carry their own freshness token (``core/freshness.py``),
+        which is the defence that actually fits the attack.
+
+        This still lives here rather than being open-coded by callers, so there
+        is one place to change if that reasoning ever stops holding.
 
         A fresh ``trace_id`` is minted per copy and its own probe emitted, so
         each readdressed message remains individually traceable; sharing one
@@ -627,6 +644,18 @@ class Message(object):
         # ADDRESS string as `sender` (netprocess.py, validate=False), and on an
         # unmatched p2p address it passes None — in both cases the peer identity
         # is not yet known.
+        # SECURITY: the transport-supplied peer WINS over the envelope's own
+        # from_* claim, and that ordering is what binds a signed message to its
+        # recipient (R+D.md 2.6). The signature pre-image deliberately does not
+        # name a recipient, so a captured message would verify anywhere if the
+        # envelope's self-declared key were trusted whenever it is present.
+        # Because the transport peer wins, a frame relayed by an attacker
+        # verifies against the ATTACKER's key and fails. Do not "simplify" this
+        # into always reading the envelope: the fallback exists only for the
+        # unattributed channel -- the discovery broadcast and the unplaced
+        # point-to-point frame, where a brand-new peer (including a C at_demo
+        # node) is not yet in any listing and there is no transport peer to use.
+        # Those verbs carry their own freshness token instead.
         eff_sender = sender
         if not isinstance(eff_sender, Identity):
             reconstructed = _identity_from_wire(wire)

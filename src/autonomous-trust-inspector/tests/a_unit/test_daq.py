@@ -15,6 +15,7 @@
 # ******************
 import logging
 import time
+import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from queue import Empty, Queue
@@ -1082,3 +1083,155 @@ class TestPeerIndexUniqueness:
         assert {entry['index'] for entry in roster.values()} == \
             {p.index for p in c.peers.values()}
         assert len({entry['index'] for entry in roster.values()}) == len(roster)
+
+
+class TestQueueSlotsAreReturned:
+    """A departing peer's two queue slots stayed claimed for the life of the
+    process: `QueuePool.recycle` existed and had no caller anywhere in the tree.
+
+    That is a leak, not a sizing problem, and it presents as one -- the log said
+    `QueuePool exhausted at 3 peers` against a pool of 128, because ~60 slots
+    were outstanding for peers that had long since left. Measured before the
+    fix: two slots per single-peer flap, six per whole-roster flap, so ~21
+    flaps exhausted the pool with three peers resident.
+    """
+
+    def _cohort(self, size=16):
+        return Cohort(_pool(size))
+
+    @staticmethod
+    def _ident(uuid):
+        m = MagicMock()
+        m.uuid = uuid
+        return m
+
+    def _group(self, *uuids):
+        return {u: self._ident(u) for u in uuids}
+
+    def test_a_departure_returns_both_slots(self):
+        c = self._cohort()
+        c.update_group(self._group('A', 'B'))
+        before = c.queue_pool.free_count()
+        c.update_group(self._group('B'))
+        assert c.queue_pool.free_count() == before + 2
+
+    def test_repeated_churn_does_not_consume_the_pool(self):
+        """The shape that exhausted production: the same roster leaving and
+        returning. Far more flaps here than the pool has slot-pairs, so a
+        two-per-flap leak could not survive this."""
+        c = self._cohort()
+        roster = self._group('A', 'B', 'C')
+        c.update_group(roster)
+        steady = c.queue_pool.free_count()
+        for _ in range(40):
+            c.update_group({})
+            c.update_group(roster)
+        assert c.queue_pool.free_count() == steady
+        assert len(c.peers) == 3
+
+    def test_a_released_slot_is_handed_out_again(self):
+        """Freed is not enough; it has to be REUSED, or the next arrival
+        silently gets no channel."""
+        c = self._cohort(size=8)      # 1 subscription + 3 pairs = full
+        c.update_group(self._group('A', 'B', 'C'))
+        assert c.queue_pool.free_count() == 1
+        c.update_group(self._group('A', 'B'))
+        c.update_group(self._group('A', 'B', 'D'))
+        assert 'D' in c.peers
+        assert c.peers['D'].data_stream is not None
+
+    def test_a_reused_slot_carries_nothing_from_its_last_holder(self):
+        """The reason release drains. A stale frame delivered on a recycled
+        slot arrives under the NEW peer's name -- a wrong attribution, which is
+        worse than the leak it replaces."""
+        c = self._cohort(size=8)
+        c.update_group(self._group('A', 'B', 'C'))
+        c.peers['C'].data_stream.put('C-was-here')
+        c.update_group(self._group('A', 'B'))
+        c.update_group(self._group('A', 'B', 'D'))
+        assert c.peers['D'].data_stream.empty()
+
+    def test_a_half_claim_is_given_back_on_exhaustion(self):
+        """An odd number of free slots meant the first reserve succeeded and the
+        second failed; returning early would leak the one just taken."""
+        c = self._cohort(size=8)
+        c.update_group(self._group('A', 'B', 'C'))
+        assert c.queue_pool.free_count() == 1      # one, so the pair cannot fit
+        c.update_group(self._group('A', 'B', 'C', 'D'))
+        assert 'D' not in c.peers
+        assert c.queue_pool.free_count() == 1
+
+    def test_the_applier_side_releases_nothing(self):
+        """`_apply_roster` resolves slots it never reserved. Releasing there
+        would free the OWNER's reservation from a sibling process and hand one
+        queue to two peers."""
+        ui = Cohort(_pool())
+        owner = Cohort(_pool())
+        owner.update_group(self._group('A', 'B'))
+        roster = {uuid: {'index': slots[0], 'identity': slots[1],
+                         'video_slot': slots[2], 'data_slot': slots[3]}
+                  for uuid, slots in owner._peer_slots.items()}
+        ui._apply_roster(roster)
+        free_before = ui.queue_pool.free_count()
+        ui._apply_roster({})
+        assert ui.peers == {}
+        assert ui.queue_pool.free_count() == free_before
+
+
+class TestRosterKeysAreCanonical:
+    """The two roster producers disagreed about key type -- `CohortTracker`
+    builds `{p.uuid: p}` from a `Peers` message (UUID objects), the mission
+    coordinators build `{str(p.uuid): p}` from `protocol.peers.all`. Each
+    process was self-consistent, so nothing failed outright; but both publish to
+    the same UI channel, and `_apply_roster` deletes any peer "not in roster",
+    so the UI churned its whole peer set on alternating ticks."""
+
+    @staticmethod
+    def _ident(uuid):
+        m = MagicMock()
+        m.uuid = uuid
+        return m
+
+    def test_either_key_type_finds_the_same_peer(self):
+        c = Cohort(_pool())
+        u = uuid.uuid4()
+        c.update_group({u: self._ident(u)})
+        assert u in c.peers                 # the UUID object...
+        assert str(u) in c.peers            # ...and its string
+        assert c.peers[u] is c.peers[str(u)]
+
+    def test_the_two_producers_do_not_fight(self):
+        """Alternating the two forms used to cost six slots a tick with three
+        peers, and a full delete/re-add of the roster each time."""
+        c = Cohort(_pool())
+        ids = [uuid.uuid4() for _ in range(3)]
+        c.update_group({u: self._ident(u) for u in ids})
+        steady = c.queue_pool.free_count()
+        indices = {str(u): c.peers[u].index for u in ids}
+        for _ in range(10):
+            c.update_group({str(u): self._ident(u) for u in ids})
+            c.update_group({u: self._ident(u) for u in ids})
+        assert c.queue_pool.free_count() == steady
+        assert len(c.peers) == 3
+        # ...and nobody was re-created, so no panel moved under the operator.
+        assert {str(u): c.peers[u].index for u in ids} == indices
+
+    def test_the_published_roster_is_canonically_keyed(self):
+        """Whatever the producer used, the UI sees one form -- otherwise the
+        applier's "not in roster" test compares two vocabularies."""
+        c = Cohort(_pool())
+        published = []
+        c.publish = lambda delta: published.append(delta)
+        u = uuid.uuid4()
+        c.update_group({u: self._ident(u)})
+        assert list(published[-1]['peers']) == [str(u)]
+
+    def test_the_applier_normalizes_too(self):
+        """A roster published by an older producer can still arrive UUID-keyed;
+        the applier must not then hold keys the readers cannot match."""
+        ui = Cohort(_pool())
+        u = uuid.uuid4()
+        ui._apply_roster({u: {'index': 0, 'identity': self._ident(u),
+                              'video_slot': 1, 'data_slot': 2}})
+        assert list(ui.peers) == [str(u)]
+        assert u in ui.peers

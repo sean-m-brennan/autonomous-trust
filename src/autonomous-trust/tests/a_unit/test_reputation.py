@@ -301,140 +301,116 @@ class TestChannelResponses:
         from autonomous_trust.core.reputation.reputation import tx_channel_weight
         assert tx_channel_weight('a_channel_from_the_future') == 1
 
-    # --- slash eligibility ------------------------------------------------
+    # --- durability: the channel is part of the committed fact -----------
 
-    def _slash_proc(self, peer_uuid, self_uuid=None, **attrs):
-        from types import SimpleNamespace as NS
-        proposed = []
-        proc = ReputationProcess.__new__(ReputationProcess)
-        proc.identity = NS(uuid=self_uuid or uuid4())
-        proc.protocol = NS(peers=NS(all=[NS(uuid=peer_uuid)]))
-        proc.logger = NS(warning=lambda *a, **k: None,
-                         info=lambda *a, **k: None,
-                         debug=lambda *a, **k: None,
-                         error=lambda *a, **k: None)
-        proc.forward_slash = lambda q, att: proposed.append(att) or True
-        for k, v in attrs.items():
-            setattr(proc, k, v)
-        return proc, proposed
-
-    def _score(self, subject, channel, score=0.3):
-        return TransactionScore(task_id=uuid4(), score=score,
-                                channel=channel, subject_uuid=subject)
-
-    def test_a_local_refutation_proposes_a_slash(self):
+    def test_the_committed_entry_keeps_the_reason(self):
+        """§12.8's second response. A score's channel reaches the chain entry,
+        so every acceptor retains WHY a score was poor and can judge it for
+        itself -- which is the whole basis for there being no accusation
+        mechanism. Before this the `committed` broadcast carried a bare score
+        and the reason stopped at the chain boundary."""
         from autonomous_trust.core.reputation.reputation import (
-            TX_CHANNEL_CERTIFICATE)
-        peer = uuid4()
-        proc, proposed = self._slash_proc(peer)
-        # 0.3 is the real case: automate.py scores an INVALID ZKP proof 0.3 on
-        # the certificate channel (R+D.md §12.8's own worked example).
-        assert proc._maybe_slash_for_channel(
-            {}, self._score(peer, TX_CHANNEL_CERTIFICATE, 0.3)) is True
-        assert len(proposed) == 1
-        assert str(proposed[0].target_uuid) == str(peer)
-        assert proposed[0].floor_score == ReputationProcess.CHANNEL_SLASH_FLOOR
+            TransactionHistory, TX_CHANNEL_PHYSICAL)
+        task, a, b = uuid4(), uuid4(), uuid4()
+        hist = TransactionHistory()
+        hist.update(task, a, 0.9)
+        hist.update(task, b, 0.2, TX_CHANNEL_PHYSICAL)
+        tx = list(hist)[0]
+        assert tx.p2_channel == TX_CHANNEL_PHYSICAL
+        assert tx.p1_channel is None       # absent, not defaulted in
 
-    def test_the_reason_names_the_channel(self):
-        """The demotion reason is the whole point of the entry, and `reason` is
-        inside `designation`, so it is signed and co-signed — unlike
-        evidence_ref, it cannot be altered in flight."""
+    def test_an_untagged_entry_hashes_exactly_as_it_did_before(self):
+        """The condition on the canonical bytes, and the reason this is not a
+        chain migration: entry hashes chain and roll up into the window root
+        that checkpoints are quorum-signed over, so appending a field
+        unconditionally would invalidate every stored chain and every
+        finalized checkpoint at once. An explicit default is the SAME CLAIM as
+        absence, so it must be the same bytes."""
         from autonomous_trust.core.reputation.reputation import (
-            TX_CHANNEL_PHYSICAL)
-        peer = uuid4()
-        proc, proposed = self._slash_proc(peer)
-        proc._maybe_slash_for_channel(
-            {}, self._score(peer, TX_CHANNEL_PHYSICAL))
-        assert proposed[0].reason == 'refuted_physical'
-        assert b'refuted_physical' in proposed[0].designation
+            TransactionHistory, TX_CHANNEL_TASK_OUTCOME, TX_CHANNEL_PHYSICAL)
 
-    def test_the_floor_is_demotion_not_exclusion(self):
-        """0.45 drops the peer to tier 0 but leaves it above COMM_CUTOFF, so it
-        is shed by tier-gated negotiation and can still earn its way back.
-        Exclusion is sticky and operator-only, which is far too heavy for one
-        automated verdict."""
-        assert (ReputationProcess.CHANNEL_SLASH_FLOOR
-                > ReputationProcess.COMM_CUTOFF)
-        assert ReputationProcess.CHANNEL_SLASH_FLOOR < 0.5
+        task, a, b = uuid4(), uuid4(), uuid4()
 
-    def test_a_passing_score_on_a_hard_channel_is_silent(self):
-        """A physical check that PASSES is the common case."""
-        from autonomous_trust.core.reputation.reputation import (
-            TX_CHANNEL_PHYSICAL)
-        peer = uuid4()
-        proc, proposed = self._slash_proc(peer)
-        assert proc._maybe_slash_for_channel(
-            {}, self._score(peer, TX_CHANNEL_PHYSICAL, 0.95)) is False
-        assert proposed == []
+        def canon(channel):
+            # Same ids every time, so the only difference is the channel.
+            hist = TransactionHistory()
+            hist.update(task, a, 0.9)
+            hist.update(task, b, 0.2, channel)
+            return list(hist)[0]._canonical_bytes()
 
-    def test_a_graded_channel_never_slashes(self):
-        """A bad task grade is a grade, however bad."""
-        from autonomous_trust.core.reputation.reputation import (
-            TX_CHANNEL_TASK_OUTCOME, TX_CHANNEL_PROBE)
-        peer = uuid4()
-        for channel in (TX_CHANNEL_TASK_OUTCOME, TX_CHANNEL_PROBE):
-            proc, proposed = self._slash_proc(peer)
-            assert proc._maybe_slash_for_channel(
-                {}, self._score(peer, channel, 0.0)) is False
-            assert proposed == []
+        assert canon(None) == canon(TX_CHANNEL_TASK_OUTCOME)
+        assert b'task_outcome' not in canon(None)
+        # A real channel DOES change the bytes -- which is what makes
+        # STRIPPING a refutation off an entry break the chain link.
+        assert canon(TX_CHANNEL_PHYSICAL) != canon(None)
+        assert canon(TX_CHANNEL_PHYSICAL).endswith(b'|task_outcome|physical')
 
-    def test_a_remote_refutation_cannot_accuse(self):
-        """The wire form carries no subject, so a peer's `physical` tag has
-        nobody to accuse however damning its score. This is the structural half
-        of "locally-produced evidence only"."""
-        from autonomous_trust.core import from_json_string, to_json_string
-        from autonomous_trust.core.reputation.reputation import (
-            TX_CHANNEL_PHYSICAL)
-        peer = uuid4()
-        proc, proposed = self._slash_proc(peer)
-        off_the_wire = from_json_string(to_json_string(
-            self._score(peer, TX_CHANNEL_PHYSICAL, 0.0)))
-        assert proc._maybe_slash_for_channel({}, off_the_wire) is False
-        assert proposed == []
-
-    def test_it_will_not_slash_us(self):
-        from autonomous_trust.core.reputation.reputation import (
-            TX_CHANNEL_PHYSICAL)
-        me = uuid4()
-        proc, proposed = self._slash_proc(uuid4(), self_uuid=me)
-        assert proc._maybe_slash_for_channel(
-            {}, self._score(me, TX_CHANNEL_PHYSICAL, 0.0)) is False
-        assert proposed == []
-
-    def test_an_unknown_subject_is_not_accused(self):
-        """A stale or malformed subject must not mint an accusation against a
-        uuid nobody in the cohort can resolve."""
-        from autonomous_trust.core.reputation.reputation import (
-            TX_CHANNEL_PHYSICAL)
-        proc, proposed = self._slash_proc(uuid4())
-        assert proc._maybe_slash_for_channel(
-            {}, self._score(uuid4(), TX_CHANNEL_PHYSICAL, 0.0)) is False
-        assert proposed == []
-
-    def test_the_kill_switch_keeps_the_weight_and_stops_the_accusation(self):
-        from autonomous_trust.core.reputation.reputation import (
-            TX_CHANNEL_PHYSICAL, tx_channel_weight)
-        peer = uuid4()
-        proc, proposed = self._slash_proc(peer, CHANNEL_SLASH_DISABLED=True)
-        assert proc._maybe_slash_for_channel(
-            {}, self._score(peer, TX_CHANNEL_PHYSICAL, 0.0)) is False
-        assert proposed == []
-        assert tx_channel_weight(TX_CHANNEL_PHYSICAL) > 1
-
-    def test_a_reason_is_refused_for_a_graded_channel(self):
-        """Minting one would produce a slash no reader could place."""
-        from autonomous_trust.core.reputation.reputation import (
-            slash_reason_for_channel, TX_CHANNEL_TASK_OUTCOME)
+    def test_an_unknown_channel_cannot_reach_the_entry(self):
+        """Refused rather than coerced: the channel is in the entry hash now,
+        so a spelling the group does not share would fork this node's chain
+        rather than merely mislabel it."""
+        from autonomous_trust.core.reputation.reputation import Transaction
         with pytest.raises(ValueError):
-            slash_reason_for_channel(TX_CHANNEL_TASK_OUTCOME)
+            Transaction(task_id=uuid4(), p1_id=uuid4(), p1_score=0.2,
+                        p1_channel='a_channel_from_the_future')
 
-    def test_the_hard_set_matches_the_c_twin(self):
-        """These reasons cross the wire inside a signed designation, so a
-        divergence is a slash one runtime can verify and the other cannot.
-        Pinned as literals here and in reputation3_test.c."""
-        from autonomous_trust.core.reputation.reputation import TX_CHANNELS_HARD
-        assert TX_CHANNELS_HARD == frozenset(
-            {'physical', 'certificate', 'self_consistency'})
+    def test_the_evidence_document_round_trips_the_reason(self):
+        """A verifier recomputing entry hashes from attested evidence needs
+        the channel, or its inclusion proofs miss the root it was handed."""
+        from autonomous_trust.core.reputation.reputation import (
+            TransactionHistory, evidence_to_dict, evidence_from_dict,
+            TX_CHANNEL_SELF_CONSISTENCY)
+        task, a, b = uuid4(), uuid4(), uuid4()
+        hist = TransactionHistory()
+        hist.update(task, a, 0.9)
+        hist.update(task, b, 0.2, TX_CHANNEL_SELF_CONSISTENCY)
+        chain, _ = evidence_from_dict(evidence_to_dict(list(hist)))
+        assert chain[0].p2_channel == TX_CHANNEL_SELF_CONSISTENCY
+        assert chain[0].entry_hash() == list(hist)[0].entry_hash()
+
+    def test_an_untagged_evidence_document_is_unchanged(self):
+        """Additive: an entry with no channel serializes exactly as it did
+        before the field existed, so a reader predating it sees no new keys."""
+        from autonomous_trust.core.reputation.reputation import (
+            TransactionHistory, evidence_to_dict)
+        task, a, b = uuid4(), uuid4(), uuid4()
+        hist = TransactionHistory()
+        hist.update(task, a, 0.9)
+        hist.update(task, b, 0.2)
+        entry = evidence_to_dict(list(hist))['chain'][0]
+        assert 'p1_channel' not in entry and 'p2_channel' not in entry
+
+    # --- and no third response: no accusation ----------------------------
+
+    def test_a_channel_no_longer_accuses_anyone(self):
+        """The accusation path is GONE (user's call, 2026-09-02): a poorly
+        scored transaction carries its reason, every peer sees both, and each
+        judges for itself. Pinned as an absence because the alternative --
+        one detector's verdict pinning a peer's reputation from outside the
+        EMA -- is what was deliberately removed."""
+        assert not hasattr(ReputationProcess, '_maybe_slash_for_channel')
+        from autonomous_trust.core.reputation import reputation as rep
+        for gone in ('TX_CHANNELS_HARD', 'tx_channel_is_hard',
+                     'slash_reason_for_channel'):
+            assert not hasattr(rep, gone), gone
+
+    def test_slashing_is_disarmed_by_default(self):
+        """What remains of the slash path is opt-in. Unarmed, a node
+        originates nothing, declines to co-sign, and ignores a finalized
+        slash -- so a quorum elsewhere cannot pin a peer here."""
+        assert ReputationProcess.SLASH_ENABLED is False
+
+    def test_a_disarmed_node_does_not_originate(self):
+        from types import SimpleNamespace as NS
+        from autonomous_trust.core.reputation.reputation import SlashAttestation
+        proc = ReputationProcess.__new__(ReputationProcess)
+        proc.logger = NS(warning=lambda *a, **k: None)
+        att = SlashAttestation(slasher_uuid=uuid4(), target_uuid=uuid4(),
+                               reason=SlashAttestation.REASON_PEER_EXCLUDE,
+                               floor_score=0.45)
+        # Consumed and logged, never signed or broadcast: with no queues in
+        # hand, reaching the broadcast would raise rather than return.
+        assert proc.forward_slash(None, att) is True
 
 
 class TestPeerReputationCarrier:
@@ -1181,9 +1157,6 @@ class TestProposerHistoryBilateral:
         stub.logger = SimpleNamespace(
             error=lambda *a, **k: None, debug=lambda *a, **k: None)
         stub._start_paxos = lambda q, m: start_paxos_calls.append((q, m))
-        # The channel-slash hook (R+D.md §12.8) runs after the round starts;
-        # it has its own tests, and this one is about history staying empty.
-        stub._maybe_slash_for_channel = lambda q, s: False
 
         task = uuid4()
         ts = TransactionScore(task_id=task, score=0.9)

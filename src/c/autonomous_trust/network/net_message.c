@@ -320,6 +320,10 @@ int net_message_from_wire(const uint8_t *data, size_t len,
         msg_out->data_len = bin_len;
     }
 
+    /* Transport-supplied peer WINS over the envelope's claim; see the proto
+     * path's note (net_message_from_wire_proto) for why that ordering is what
+     * binds a signed message to its recipient (R+D.md 2.6), and why the else
+     * branch must stay scoped to the unattributed channel. */
     if (peer != NULL)
     {
         memcpy(&msg_out->from_whom, peer, sizeof(public_identity_t));
@@ -574,8 +578,16 @@ int net_message_from_wire_proto(const uint8_t *data, size_t len,
         msg_out->data_len = proto->data.len;
     }
 
-    /* Transport-supplied peer wins over the envelope's claim, exactly as in the
-     * JSON path. */
+    /* Transport-supplied peer WINS over the envelope's claim, exactly as in the
+     * JSON path -- and that ordering is what binds a signed message to its
+     * recipient (R+D.md 2.6). The pre-image names no recipient, so a captured
+     * message would verify anywhere if the envelope's self-declared key were
+     * trusted whenever present; because the transport peer wins, a frame
+     * relayed by an attacker verifies against the ATTACKER's key and fails.
+     * Do NOT collapse this into always reading the envelope: the else branch
+     * exists only for the unattributed channel (discovery broadcast, unplaced
+     * point-to-point), where a brand-new peer is in no listing yet. Mirrors
+     * Python Message._assemble. */
     if (peer != NULL) {
         memcpy(&msg_out->from_whom, peer, sizeof(public_identity_t));
     } else {

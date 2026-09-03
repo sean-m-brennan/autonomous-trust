@@ -195,10 +195,63 @@ class PeerDataAcq(object):
         return hist[-1] if hist else None
 
 
+class PeerRoster(dict):
+    """The peer map, keyed canonically by ``str(uuid)`` however it is indexed.
+
+    Every key operation normalizes, so a caller holding a ``UUID`` object and a
+    caller holding its string reach the same entry. That is not tidiness: the
+    two roster producers disagree, and the disagreement is invisible until it
+    corrupts state. ``CohortTracker`` builds its roster from a ``Peers``
+    message (``{p.uuid: p}`` -- UUID objects) while the mission coordinators
+    build theirs from ``protocol.peers.all`` (``{str(p.uuid): p}`` -- strings).
+    Each process was internally consistent, so nothing failed outright; but
+    both publish to the same UI channel (``publish`` fans out to every
+    subscription, and subscriptions are inherited pre-fork), and
+    ``_apply_roster`` deletes any peer "not in roster". Two rosters keyed two
+    ways therefore made the UI delete and re-add its entire peer set on
+    alternating ticks. Measured cost when the two forms meet in one Cohort: six
+    queue slots per tick, permanently.
+
+    Normalizing at the container rather than at each call site is deliberate --
+    there are a dozen readers (``handle_metadata`` looks up a UUID object,
+    ``handle_reputation`` a string, the dash components iterate keys) and a
+    convention that has to be remembered at every one of them is the kind that
+    already failed here once.
+
+    ``None`` is passed through rather than becoming ``'None'``: a lookup with a
+    missing uuid should miss, not collide with other missing uuids.
+    """
+
+    @staticmethod
+    def _key(key):
+        return key if key is None else str(key)
+
+    def __getitem__(self, key):
+        return dict.__getitem__(self, self._key(key))
+
+    def __setitem__(self, key, value):
+        dict.__setitem__(self, self._key(key), value)
+
+    def __delitem__(self, key):
+        dict.__delitem__(self, self._key(key))
+
+    def __contains__(self, key):
+        return dict.__contains__(self, self._key(key))
+
+    def get(self, key, default=None):
+        return dict.get(self, self._key(key), default)
+
+    def pop(self, key, *default):
+        return dict.pop(self, self._key(key), *default)
+
+    def setdefault(self, key, default=None):
+        return dict.setdefault(self, self._key(key), default)
+
+
 class CohortInterface(object):
     def __init__(self, log_level: int = logging.INFO, logfile: str = None):
         self.paused = True  # always start in paused state
-        self.peers: dict[str, PeerDataAcq] = {}
+        self.peers: dict[str, PeerDataAcq] = PeerRoster()
         self._time: datetime = datetime.now()
         self._center = GeoPosition(0, 0)
 
@@ -331,8 +384,11 @@ class Cohort(CohortInterface):
             return self._subscriptions[name]
         slot = self.queue_pool.reserve()
         if slot is None:
-            self.logger.error('QueuePool exhausted; no delta channel for %r. '
-                              'Enlarge QueuePool.pool_size.', name)
+            self.logger.error(
+                'QueuePool exhausted; no delta channel for %r (%d of %d slots '
+                'free). Check for outstanding per-peer slots before enlarging '
+                'pool_size -- a departure that does not release leaks two.',
+                name, self.queue_pool.free_count(), self.queue_pool.pool_size)
             return None
         self._subscriptions[name] = slot
         return slot
@@ -469,6 +525,7 @@ class Cohort(CohortInterface):
         them, and claiming them again here would consume a second pair from this
         process's private view of the pool.
         """
+        roster = {str(uuid): entry for uuid, entry in roster.items()}
         for uuid, entry in roster.items():
             if uuid in self.peers:
                 continue
@@ -476,6 +533,10 @@ class Cohort(CohortInterface):
                 uuid, entry['index'], entry['identity'], NullPeerData(), self,
                 self.queue_pool.slot(entry['video_slot']),
                 self.queue_pool.slot(entry['data_slot']))
+        # No release here: this side RESOLVED its slots, it never reserved
+        # them (see the docstring), so there is nothing of its own to free --
+        # and freeing the owner's reservation from a sibling process would
+        # hand the same queue to two peers.
         for uuid in [u for u in self.peers if u not in roster]:
             del self.peers[uuid]
 
@@ -502,15 +563,31 @@ class Cohort(CohortInterface):
     def update_group(self, group_ids: dict[str, Identity]):
         """Own the roster and the queue assignment, then publish both.
 
-        Known limitation (documented as deferred for security reasons):
-        each new peer consumes two pre-allocated slots from `self.queue_pool`
-        rather than creating fresh queues. Spawning multiprocessing.Queue objects
-        after the daemon parent has forked workers triggers Python's "Pickling an
-        AuthenticationString object is disallowed for security reasons" — an
-        intentional CPython mitigation against cross-process credential leakage.
-        The pool is sized to MAX_PEERS at startup; if a deployment exceeds it the
-        right fix is enlarging the pool, not dynamic creation.
+        Each peer consumes two pre-allocated slots from `self.queue_pool`
+        rather than creating fresh queues, and that is not a limitation to be
+        engineered away: spawning multiprocessing.Queue objects after the
+        daemon parent has forked workers triggers Python's "Pickling an
+        AuthenticationString object is disallowed for security reasons", an
+        intentional CPython mitigation against cross-process credential
+        leakage.
+
+        What WAS a defect, fixed 2026-09-02: the slots were never given back.
+        A departing peer's pair stayed claimed for the life of the process, so
+        a flapping roster exhausted a 128-slot pool with three peers resident
+        (measured: two slots per single-peer flap, six per whole-roster flap).
+        `QueuePool.recycle` existed and had no caller anywhere. The removal
+        loop below now releases, which also drains -- see
+        `PooledQueue.close` for why a silent hand-back would be worse than the
+        leak.
+
+        Keys are canonicalized on entry, because the two producers in this
+        codebase disagree about their type; see `PeerRoster`.
         """
+        # Canonical keys, whatever the caller passed (see PeerRoster): one
+        # producer keys by UUID object and another by string, and an
+        # unnormalized comparison below treats the same peer as both a
+        # departure and an arrival on every tick.
+        group_ids = {str(uuid): ident for uuid, ident in group_ids.items()}
         changed = False
         for uuid in group_ids:
             if uuid in self.peers:
@@ -519,9 +596,22 @@ class Cohort(CohortInterface):
             video_slot = self.queue_pool.reserve()
             data_slot = self.queue_pool.reserve()
             if video_slot is None or data_slot is None:
-                self.logger.error('QueuePool exhausted at %d peers; enlarge '
-                                  'QueuePool.pool_size rather than creating '
-                                  'queues after the fork', len(self.peers))
+                # A half-claim is still a claim: if the second reserve failed,
+                # give the first one back or this branch leaks the very slot
+                # it is complaining about.
+                if video_slot is not None:
+                    self.queue_pool.release(video_slot)
+                if data_slot is not None:
+                    self.queue_pool.release(data_slot)
+                self.logger.error(
+                    'QueuePool exhausted with %d peer(s) resident and %d of '
+                    '%d slots free: %d slots are outstanding for %d peers, so '
+                    'they are LEAKING, not merely undersized. Enlarging '
+                    'pool_size only delays this.',
+                    len(self.peers), self.queue_pool.free_count(),
+                    self.queue_pool.pool_size,
+                    self.queue_pool.pool_size - self.queue_pool.free_count(),
+                    len(self.peers))
                 break
             self._peer_slots[uuid] = (idx, group_ids[uuid], video_slot, data_slot)
             self.peers[uuid] = PeerDataAcq(uuid, idx, group_ids[uuid], NullPeerData(), self,
@@ -531,7 +621,17 @@ class Cohort(CohortInterface):
         to_remove = [uuid for uuid in self.peers if uuid not in group_ids]
         for uuid in to_remove:
             del self.peers[uuid]
-            self._peer_slots.pop(uuid, None)
+            # Hand the slots back. Without this a departure burns two slots
+            # for the life of the process, so roster churn exhausts the pool
+            # at a peer count far below its size -- measured: six slots per
+            # whole-roster flap with three peers, so ~21 flaps exhaust 128.
+            # Released here, in the process that reserved them (see
+            # QueuePool.release), and drained, so the next holder of a slot
+            # cannot receive the departed peer's leftovers.
+            slots = self._peer_slots.pop(uuid, None)
+            if slots is not None:
+                self.queue_pool.release(slots[2])
+                self.queue_pool.release(slots[3])
             changed = True
         if changed:
             self.publish({'kind': 'roster',

@@ -392,12 +392,12 @@ reputation algebra destroys information the escalation path needs.
 "Refuted by conservation of energy," "poorly calibrated over the last hundred
 predictions," "disagrees with the swarm," "failed a replicated task," and
 "contradicted its own archive" have different diagnoses and warrant different
-responses. A physics refutation should be able to demote a peer immediately; a
-drifting calibration score should decay it gradually; swarm disagreement should
-open a dispute rather than a penalty. Feeding them as separate evidence channels
-into the existing consensus keeps the tier machinery unchanged while making the
-demotion reason legible. The first two of those three responses are now wired;
-see below.
+responses. A physics refutation should be able to demote a peer faster than a drifting
+calibration score does; swarm disagreement was expected to want a dispute rather
+than a penalty. Feeding them as separate evidence channels into the existing
+consensus keeps the tier machinery unchanged while making the demotion reason
+legible. What that came to in practice is below, and the third response turned
+out not to be needed.
 
 **The channel, 2026-08-21.** `TransactionScore` now carries a `channel` naming
 which of these produced the score, on both runtimes and across the wire. The
@@ -408,32 +408,50 @@ spelling is refused rather than graded — and it is defined once per language, 
 `src/c/autonomous_trust/reputation/tx_channel.h` and the Python `TX_CHANNEL_*`
 twin.
 
-**Two of the three responses, 2026-09-01.** Also on both runtimes:
+**Gradual versus decisive decay, 2026-09-01.** A per-channel multiplier on the
+consensus average, composed with the per-capability weight, on both runtimes.
+`calibration` sits at the baseline, exactly as the paragraph above asks; a
+verdict that needs no history at all (`physical`, `certificate`,
+`self_consistency`) counts triple; evidence corroborated by construction
+(`replication`, `probe`) counts double. It applies only to evidence the scoring
+node produced itself: the scorer picks its own tag, so honouring a remote peer's
+channel would let any peer treble the weight of a score it fabricated against
+any other.
 
-- **Gradual versus decisive decay** is now a per-channel multiplier on the
-  consensus average, composed with the per-capability weight. `calibration` sits
-  at the baseline, exactly as the paragraph above asks; a verdict that needs no
-  history at all (`physical`, `certificate`, `self_consistency`) counts triple;
-  evidence corroborated by construction (`replication`, `probe`) counts double.
-- **Immediate demotion on a hard refutation** reuses the slash path rather than
-  inventing a mechanism. A defection-grade score on one of the three
-  falsification channels *proposes* a slash, which the existing quorum
-  co-signature accepts or refuses, pinning the peer below the tier-1 floor —
-  demotion, not exclusion. The slash reason names the channel
-  (`refuted_physical` and its siblings), and because the reason is signed, that
-  claim cannot be altered in flight.
+**The reason became part of the committed fact, 2026-09-02.** This section asked
+for the reason to be *legible*; it was not yet *durable*. The commit broadcast
+carried a bare score, so every acceptor wrote the number and dropped the reason,
+which survived only in the scorer's own log. A chain entry now carries each
+side's channel and the canonical bytes cover it, so the entry hash, the chain
+link, the window root and the quorum-signed checkpoint over it all cover it too
+— and the reason travels with the entry onto the catch-up wire, into the
+persisted evidence a warm start verifies, and into the answers deep resolution
+returns. The block is appended to the canonical bytes only when a channel other
+than `task_outcome` is present, which is what keeps every stored chain and every
+byte-pinned root valid; stripping a real channel still changes the bytes.
 
-Both apply only to evidence the scoring node produced itself. The scorer picks
-its own tag, so honouring a remote peer's channel would let any peer treble the
-weight of a score it fabricated against any other, or attach an accusation to it.
-A channel that arrived from the wire stays legibility.
+**No immediate demotion, and no dispute.** The two mechanisms this section
+anticipated are both gone, for one reason.
 
-**Still missing: the dispute.** Swarm disagreement should open one rather than
-levy a penalty, and there is no dispute machinery in either runtime — so it sits
-at the baseline multiplier and levies an ordinary penalty. Weighting it like a
-hard channel would be precisely the wrong reading of this section, since a
-majority is not an oracle. This is also the joint where step 6's bisection dispute
-resolution would land. See R+D.md §12.8 for the forks settled at each step.
+For a day (2026-09-01 to 2026-09-02) a defection-grade score on a hard
+falsification channel *proposed* a slash, pinning the peer below the tier-1
+floor. That was removed at the user's direction, and the argument generalizes:
+a transaction is scored poorly **with its reason given**, every peer sees both,
+and each judges for itself. Discipline is then the consensus average and the
+tier machinery at their own pace — graduated by construction — rather than one
+detector's verdict on a fast path around them. What remains of slashing is the
+deliberate act (the behaviour governor's human-on-the-loop path, an operator's
+exclude or rehabilitate), and its protocol is opt-in to match.
+
+With no verdict levied, there is nothing to dispute. `swarm_disagreement` needs
+no adjudicator, and none is planned for either runtime; it sits at the baseline
+multiplier, which is the honest weight for one peer's reading of one event.
+Weighting it like a hard channel would have been precisely the wrong reading of
+this section, since a majority is not an oracle. Step 6's bisection would still
+be a way to *resolve a disagreement about a replicated computation* — that is a
+falsification procedure, not an adjudication of standing, and it lands on the
+`replication` channel like any other finding. See R+D.md §12.8 for the forks
+settled at each step.
 
 ## On LLMs
 

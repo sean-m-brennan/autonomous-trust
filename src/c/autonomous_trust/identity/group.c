@@ -202,6 +202,43 @@ int group_add_address(group_t *group, const char *uuid_str, const char *address)
 }
 
 /* Frama-C: skipped — [serialization] jansson JSON serialization */
+/* The envelope format this group speaks to `address`
+ * (doc/architecture/network-wire-format.md).
+ *
+ * The format belongs to the GROUP, so this is a membership question: a member
+ * speaks the group's format, and anything this group cannot place -- a
+ * stranger, a pre-admission newcomer, a member of a DIFFERENT group -- gets
+ * JSON, the format every AT node can read and the only safe answer when there
+ * is no group to consult.
+ *
+ * That last case is what makes a cross-group exchange work without anyone
+ * negotiating it: when two groups with DIFFERENT formats meet -- the merge
+ * handshake, where a group_key_update crosses from one cohort to another --
+ * neither can place the other's members, so both independently fall to JSON
+ * and the exchange succeeds. Pinned by conformance
+ * `network/cross-group-format-fallback`.
+ *
+ * The single copy of this rule: net_proc.c's wire_format_for_address delegates
+ * here rather than walking the address map itself, so the production selection
+ * and the pinned one cannot drift. Mirrors Python Group.wire_format_for_address.
+ */
+net_wire_format_t group_wire_format_for_address(const group_t *group,
+                                                const char *address)
+{
+    if (group == NULL || address == NULL || address[0] == '\0')
+        return NET_WIRE_JSON;
+    bool member = false;
+    map_key_t key;
+    data_t *value;
+    map_entries_for_each((map_t *)&group->address_map, key, value)
+        string_t addr = NULL;
+        if (data_string_ptr(value, &addr) == 0 && addr != NULL &&
+            strcmp((const char *)addr, address) == 0)
+            member = true;
+    map_end_for_each
+    return member ? group->wire_format : NET_WIRE_JSON;
+}
+
 int group_to_json(const void *data_struct, json_t **obj_ptr)
 {
     const group_t *ident = data_struct;

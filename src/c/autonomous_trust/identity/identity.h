@@ -603,6 +603,44 @@ void identity_free(identity_t *ident);
 bool identity_verb_is_unencrypted(const char *verb);
 
 
+/**
+ * @brief How many verbs this protocol accepts in plaintext.
+ *
+ * Exists so conformance can pin the SIZE of the list, not just its members: a
+ * verb added on one side of the language boundary and not the other is exactly
+ * the drift `network/unencrypted-verbs` is there to catch. A verb that gains
+ * plaintext acceptance on one runtime only is a downgrade opening on that
+ * runtime alone.
+ */
+size_t identity_unencrypted_verb_count(void);
+
+
+/**
+ * @brief True if @p verb is part of the pre-admission handshake.
+ *
+ * The three verbs that move MEMBERSHIP: request_access, access_granted and
+ * full_history. The gateway boundary refuses to carry these
+ * (doc/architecture/network-wire-format.md, "The gateway boundary"), because
+ * admitting across a gateway is the only way a group comes to span one.
+ *
+ * MAINTENANCE: mirrors Python identity.protocol.BOOTSTRAP_VERBS; a change here
+ * needs the same change there.
+ *
+ * @param verb Wire function selector; NULL is safe and returns false.
+ */
+bool identity_verb_is_bootstrap(const char *verb);
+
+
+/**
+ * @brief How many verbs are in the pre-admission set.
+ *
+ * Exists so conformance can pin the SIZE of the list, not just its members: a
+ * verb added on one side of the language boundary and not the other is exactly
+ * the drift `network/gateway-boundary-verbs` is there to catch.
+ */
+size_t identity_bootstrap_verb_count(void);
+
+
 /** @} */ /* end of internal_identity */
 
 #endif  // IDENTITY_H

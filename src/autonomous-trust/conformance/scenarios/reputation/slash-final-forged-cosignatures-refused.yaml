@@ -29,7 +29,12 @@ participants:
   - id: rogue
     role: target
 
+# The slash protocol is opt-in (R+D.md §12.8): nothing arms it automatically,
+# since a poorly scored transaction carries its reason and every peer judges
+# for itself. This scenario drives that protocol, so it arms it -- and every
+# scenario that does NOT set this is a pin that the default is off.
 fixtures:
+  slash_enabled: true
   reputations:
     bob:
       rogue: 0.6

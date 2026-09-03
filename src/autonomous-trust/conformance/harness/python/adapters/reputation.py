@@ -453,6 +453,14 @@ class ReputationAdapter:
         # conformance harness resets state per step, so cross-step quorum
         # accumulation isn't portable. Default stays the production value (3).
         preset_num_updates: dict[str, int] = fixtures.get('num_updates', {}) or {}
+        # slash_enabled arms the slash protocol for this case. It is opt-in in
+        # production (R+D.md §12.8): unarmed, a node originates nothing,
+        # declines to co-sign a proposal, and ignores a finalized slash, so a
+        # scenario that drives that protocol has to say so -- and every
+        # scenario that does NOT say so is a pin that the default is off.
+        # Scenario-level rather than per-participant, because the C twin's
+        # knob is an environment variable and the whole cohort shares it.
+        preset_slash_enabled: bool = bool(fixtures.get('slash_enabled', False))
 
         identities: dict[str, Identity] = {}
         for idx, spec in enumerate(spec_participants):
@@ -506,6 +514,10 @@ class ReputationAdapter:
 
             if pid in preset_num_updates:
                 participant.process.num_updates = int(preset_num_updates[pid])
+            # Instance attribute, shadowing the class-level default that reads
+            # the environment at import: the corpus must not depend on how the
+            # harness process was launched.
+            participant.process.SLASH_ENABLED = preset_slash_enabled
 
             if pid in preset_checkpoint:
                 spec_ck = preset_checkpoint[pid]
@@ -546,15 +558,26 @@ class ReputationAdapter:
                 slug = entry.get('task_id')
                 p1_id = entry.get('p1')
                 p2_id = entry.get('p2')
-                if slug is None or p1_id not in identities or p2_id not in identities:
+                if slug is None or p1_id not in identities:
                     continue
                 task_uuid = uuid5(_NS, f'tx:{slug}')
                 participant.process.history.update(
                     task_uuid, identities[p1_id].uuid,
-                    float(entry.get('p1_score', 0.0)))
+                    float(entry.get('p1_score', 0.0)),
+                    entry.get('p1_channel'))
+                if p2_id is None:
+                    # One side only, counterparty slot left open (mirrors C's
+                    # reputation_install_tx_single): lets a single step drive
+                    # the arrival that COMPLETES the entry, which is the only
+                    # way to assert on the committed window in the C harness,
+                    # since it resets state between steps.
+                    continue
+                if p2_id not in identities:
+                    continue
                 participant.process.history.update(
                     task_uuid, identities[p2_id].uuid,
-                    float(entry.get('p2_score', 0.0)))
+                    float(entry.get('p2_score', 0.0)),
+                    entry.get('p2_channel'))
 
             for other_pid, score in preset_reputations.get(pid, {}).items():
                 if other_pid not in identities:
@@ -831,11 +854,23 @@ class ReputationAdapter:
             tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)
             obj = to_json_string(tup)
         elif function == ReputationProtocol.committed:
-            # Phase 3 broadcast — (task_id, peer_id, score).  Mirrors
-            # repprocess.py's commit_msg payload in handle_accepted.
-            task_id = str(uuid5(_NS, f'tx:{payload.get("task_id", "default")}'))
-            obj = to_json_string((task_id, proposer_uuid,
-                                  float(payload.get('score', 1.0))))
+            # Phase 3 broadcast — (task_id, peer_id, score, group_uuid,
+            # channel).  Mirrors repprocess.py's commit_msg payload in
+            # handle_accepted, which appends both trailing elements the same
+            # length-tolerant way. A scenario that names no channel sends the
+            # legacy 3-tuple, so every pre-channel vector is unchanged.
+            # UUID objects, not strings: `ConfigJSONEncoder` round-trips them
+            # with a `__type__` tag, so the handler receives the same types
+            # production puts in (`repprocess.handle_accepted` passes
+            # `score.task_id` and `peer_id` unchanged). Stringifying here made
+            # the task key a `str` while a staged fixture keyed the same task
+            # by `UUID` -- two entries for one task, so an arriving commit
+            # could never complete a staged one.
+            task_id = uuid5(_NS, f'tx:{payload.get("task_id", "default")}')
+            tup = (task_id, proposer_uuid, float(payload.get('score', 1.0)))
+            if payload.get('channel') is not None:
+                tup = tup + (None, str(payload['channel']))
+            obj = to_json_string(tup)
         elif function == ReputationProtocol.outdated:
             obj = str(payload.get('length', 0))
         elif function == ReputationProtocol.update:
