@@ -198,6 +198,29 @@ class IdentityProtocol(Protocol):
 # the receiver will drop it once the peer is known -- silently, on a path that
 # only shows up in multi-peer convergence. test_unencrypted_verbs.py pins the
 # set against the identity process's actual send sites.
+#: The pre-admission handshake: the verbs that place a node INTO a group.
+#: These are "bootstrap" in the wire-format sense (always JSON, because they
+#: run before there is a group to consult -- see
+#: doc/architecture/network-wire-format.md), and they are the verbs the gateway
+#: boundary refuses to carry.
+#:
+#: WHY these three and not the wider unencrypted set: a gateway boundary exists
+#: to keep a group from spanning it, and the only way a group spans a gateway is
+#: if a node on one side is ADMITTED by a cohort on the other. `announce` asks,
+#: `accept` grants, and `history` hands over the group (and its key) -- those
+#: three, and nothing else, move membership. `partition_probe` /
+#: `partition_response` deliberately span a group-key boundary
+#: (doc/architecture/partition-recovery.md) but do so WITHIN a domain and confer
+#: no membership, so they are not bootstrap and must keep working.
+#:
+#: See doc/architecture/network-wire-format.md, "The gateway boundary".
+BOOTSTRAP_VERBS = frozenset({
+    IdentityProtocol.announce,           # request_access -- asks to be admitted
+    IdentityProtocol.accept,             # access_granted -- grants admission
+    IdentityProtocol.history,            # full_history -- hands over the group + key
+})
+
+
 UNENCRYPTED_VERBS = frozenset({
     IdentityProtocol.announce,           # request_access, pre-admission broadcast
     IdentityProtocol.accept,             # access_granted, sent before the key lands

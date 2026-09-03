@@ -55,8 +55,8 @@ static void _fill_pair(tx_history_t *hist, const uuid_t p1, const uuid_t p2,
     {
         uuid_t task;
         uuid_generate(task);
-        tx_history_update(hist, task, p1, score);
-        tx_history_update(hist, task, p2, score);
+        tx_history_update(hist, task, p1, score, NULL);
+        tx_history_update(hist, task, p2, score, NULL);
     }
 }
 

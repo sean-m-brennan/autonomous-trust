@@ -22,9 +22,7 @@ from .reputation import (TransactionScore, PeerReputation,
                          TX_CHANNEL_REPLICATION,
                          TX_CHANNEL_SWARM_DISAGREEMENT,
                          TX_CHANNEL_PROBE,
-                         TX_CHANNEL_WEIGHTS, TX_CHANNELS_HARD,
-                         tx_channel_weight, tx_channel_is_hard,
-                         slash_reason_for_channel,
+                         TX_CHANNEL_WEIGHTS, tx_channel_weight,
                          validate_tx_channel)
 from .repprocess import ReputationProcess
 from .protocol import ReputationProtocol

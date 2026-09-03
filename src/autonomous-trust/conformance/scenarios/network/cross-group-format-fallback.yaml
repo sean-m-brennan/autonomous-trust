@@ -1,0 +1,71 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: cross-group-format-fallback
+byte_pinning: false
+description: |
+    The JSON fallback that lets two DIFFERENTLY-FORMATTED groups talk to each
+    other without negotiating a format
+    (doc/architecture/network-wire-format.md).
+
+    The format belongs to the group, so selection is a membership question:
+    a member of this group speaks this group's format, and an address this
+    group cannot place gets JSON. The second half is the load-bearing one and
+    is easy to mistake for a mere default. It is what makes the group-merge
+    handshake work: when a `group_key_update` crosses from a proto cohort to a
+    JSON one, NEITHER side can place the other's members, so both independently
+    resolve JSON and the exchange succeeds. Without it a cross-format merge
+    would deadlock -- the message that tells a node to switch formats would
+    itself be encoded in the format that node cannot yet read.
+
+    Pinned because nothing in the merge path asks for this behavior explicitly;
+    it falls out of the lookup, and a "simplification" that answered with the
+    node's own group format instead would break cross-format merge silently.
+    Note this is also why format DETECTION is unnecessary rather than merely
+    risky (R+D.md 2.5): every sender is either placeable (format known by
+    lookup) or unplaceable (format JSON by rule), and there is no third case.
+
+    The controls matter as much as the fallback: a group must still answer with
+    its OWN format for its OWN members, or an implementation that returned JSON
+    unconditionally would satisfy the fallback assertions.
+
+    Production-code analogue:
+      Python: Group.wire_format_for_address; NetworkProcess._wire_format_for_addr
+              delegates to it.
+      C:      group_wire_format_for_address; net_proc.c wire_format_for_address
+              delegates to it.
+
+participants:
+  - id: node
+    role: receiver
+
+fixtures:
+  # Two groups that would never agree on a format if they had to.
+  proto_group_uuid: "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+  proto_member: "10.0.0.1"
+  json_group_uuid: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+  json_member: "10.0.1.1"
+  # An address in neither group: a stranger, the pre-admission case.
+  stranger: "10.0.9.9"
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: wire_format_for_address
+    description: |
+        The adapter builds a proto-format group holding `proto_member` and a
+        JSON-format group holding `json_member`, then asks each group which
+        format it speaks to each of the three addresses.
+
+expected_state:
+  node:
+    # Controls: a group answers with its own format for its own member.
+    proto_group_to_own_member_is_proto: true
+    json_group_to_own_member_is_json: true
+    # The fallback, both directions: neither group can place the other's
+    # member, so both answer JSON. This is the merge handshake.
+    proto_group_to_foreign_member_is_json: true
+    json_group_to_foreign_member_is_json: true
+    # And the pre-admission case, which is the same rule.
+    proto_group_to_stranger_is_json: true

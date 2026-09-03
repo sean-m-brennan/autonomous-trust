@@ -187,6 +187,11 @@ static char *const ID_UNENCRYPTED_VERBS[] = {
     ID_PARTITION_RESPONSE,  /* group_partition_response */
 };
 
+size_t identity_unencrypted_verb_count(void)
+{
+    return sizeof(ID_UNENCRYPTED_VERBS) / sizeof(ID_UNENCRYPTED_VERBS[0]);
+}
+
 bool identity_verb_is_unencrypted(const char *verb)
 {
     if (verb == NULL)
@@ -194,6 +199,44 @@ bool identity_verb_is_unencrypted(const char *verb)
     size_t n = sizeof(ID_UNENCRYPTED_VERBS) / sizeof(ID_UNENCRYPTED_VERBS[0]);
     for (size_t i = 0; i < n; i++) {
         if (strcmp(verb, ID_UNENCRYPTED_VERBS[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* The pre-admission handshake: the verbs that place a node INTO a group, and
+ * the ones the gateway boundary refuses to carry. Mirrors Python's
+ * identity.protocol.BOOTSTRAP_VERBS one-for-one -- another cross-language
+ * contract, same maintenance rule as ID_UNENCRYPTED_VERBS above.
+ *
+ * WHY these three: a gateway boundary exists to keep a group from spanning it,
+ * and the only way a group spans a gateway is for a node on one side to be
+ * ADMITTED by a cohort on the other. ID_ANNOUNCE asks, ID_ACCEPT grants and
+ * ID_HISTORY hands over the group and its key -- those three, and nothing
+ * else, move membership. The partition pair deliberately spans a group-KEY
+ * boundary (doc/architecture/partition-recovery.md) but stays inside one
+ * domain and confers no membership, so it is NOT bootstrap and must keep
+ * working across this gate.
+ *
+ * See doc/architecture/network-wire-format.md, "The gateway boundary". */
+static char *const ID_BOOTSTRAP_VERBS[] = {
+    ID_ANNOUNCE,            /* request_access -- asks to be admitted */
+    ID_ACCEPT,              /* access_granted -- grants admission */
+    ID_HISTORY,             /* full_history  -- hands over the group + key */
+};
+
+size_t identity_bootstrap_verb_count(void)
+{
+    return sizeof(ID_BOOTSTRAP_VERBS) / sizeof(ID_BOOTSTRAP_VERBS[0]);
+}
+
+bool identity_verb_is_bootstrap(const char *verb)
+{
+    if (verb == NULL)
+        return false;
+    size_t n = sizeof(ID_BOOTSTRAP_VERBS) / sizeof(ID_BOOTSTRAP_VERBS[0]);
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(verb, ID_BOOTSTRAP_VERBS[i]) == 0)
             return true;
     }
     return false;

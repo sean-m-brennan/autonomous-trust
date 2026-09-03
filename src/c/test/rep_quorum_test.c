@@ -343,6 +343,10 @@ END_TEST_DEFINITION()
 
 DEFINE_TEST(test_cosign_ack_names_self_and_carries_verifiable_signature)
 {
+    /* The slash protocol is opt-in (R+D.md §12.8): nothing arms it
+     * automatically, so a test that drives it has to say so. */
+    setenv("AT_SLASH_ENABLED", "1", 1);
+
     _begin(2);
     identity_t *me = _mk_identity("bob", "10.0.0.2");
     identity_t *slasher = _mk_identity("alice", "10.0.0.1");
@@ -535,6 +539,10 @@ static double _rep_of(identity_t *who)
 
 DEFINE_TEST(test_slash_final_without_signatures_refused)
 {
+    /* The slash protocol is opt-in (R+D.md §12.8): nothing arms it
+     * automatically, so a test that drives it has to say so. */
+    setenv("AT_SLASH_ENABLED", "1", 1);
+
     _begin(4);
     identity_t *me = _mk_identity("dave", "10.0.0.4");
     identity_t *alice = _mk_identity("alice", "10.0.0.1");
@@ -563,6 +571,10 @@ END_TEST_DEFINITION()
 
 DEFINE_TEST(test_slash_final_with_quorum_applies_floor)
 {
+    /* The slash protocol is opt-in (R+D.md §12.8): nothing arms it
+     * automatically, so a test that drives it has to say so. */
+    setenv("AT_SLASH_ENABLED", "1", 1);
+
     _begin(4);
     identity_t *me = _mk_identity("dave", "10.0.0.4");
     identity_t *alice = _mk_identity("alice", "10.0.0.1");
@@ -606,6 +618,10 @@ END_TEST_DEFINITION()
 
 DEFINE_TEST(test_slash_final_forged_signature_map_refused)
 {
+    /* The slash protocol is opt-in (R+D.md §12.8): nothing arms it
+     * automatically, so a test that drives it has to say so. */
+    setenv("AT_SLASH_ENABLED", "1", 1);
+
     /* The right SIZE, all of it minted by the sender: only its own entry
      * verifies, which is under quorum. */
     _begin(4);

@@ -162,31 +162,44 @@ static inline const char *tx_channel_or_default(const char *channel)
                ? channel : TX_CHANNEL_TASK_OUTCOME;
 }
 
+/** What an absent channel resolves to. Mirrors Python TX_CHANNEL_DEFAULT;
+ *  spelled as its own name because the places that compare AGAINST the
+ *  default (transaction_canonical_bytes) are asking a different question
+ *  from the places that name the task-outcome channel itself. */
+#define TX_CHANNEL_DEFAULT TX_CHANNEL_TASK_OUTCOME
+
 /****************************
  * What a channel DOES (R+D.md §12.8, the differentiated responses)
  *
  * Two responses, both settled with the user before implementing:
  *
- *   weighting        every channel carries an integer multiplier on the
- *                    consensus EMA, composed with the per-capability
- *                    transaction weight (they multiply: a heavy capability
- *                    refuted on physics counts as both).
- *   slash-eligible   the hard-falsification channels additionally make a
- *                    defection-grade score grounds to PROPOSE a slash, which
- *                    the EXISTING quorum co-signature then accepts or refuses.
+ *   weighting     every channel carries an integer multiplier on the
+ *                 consensus EMA, composed with the per-capability transaction
+ *                 weight (they multiply: a heavy capability refuted on
+ *                 physics counts as both). Applied ONLY to locally-produced
+ *                 evidence -- the scorer picks its own tag, so honouring a
+ *                 remote peer's would hand every peer a lever on every other
+ *                 peer's reputation. A score off the wire keeps its channel
+ *                 for legibility and is weighted by capability alone.
+ *   durability    the channel is part of the COMMITTED FACT: it rides the
+ *                 `committed` broadcast, is written to every acceptor's
+ *                 history (transaction_t.p1_channel / p2_channel) and is
+ *                 covered by transaction_canonical_bytes, hence by the entry
+ *                 hash, the chain link and the quorum-signed window root.
  *
- * Both apply ONLY to evidence this node produced itself. The scorer chooses
- * its own channel, so honoring a remote tag would hand every peer a lever on
- * every other peer's reputation — tag a fabricated 0.0 `physical` and it lands
- * with triple weight and an accusation attached. A score off the wire keeps
- * its channel for legibility and is weighted by capability alone.
+ * There is deliberately NO third mechanism, and no automatic accusation.
  *
- * Deliberately NOT a third mechanism: `swarm_disagreement` should open a
- * DISPUTE rather than levy a penalty (doc/verification_oracle.md), and no
- * dispute machinery exists in either runtime.
+ * An earlier slice made a defection-grade score on a hard-falsification
+ * channel grounds to propose a slash. That was removed at the user's
+ * direction: a transaction is scored poorly with a reason given, every peer
+ * sees both, and each judges for itself. Discipline is the EMA and the tier
+ * machinery working at their own pace -- graduated by construction -- rather
+ * than one detector's verdict pinning a floor. That also disposes of the
+ * dispute question §12.8 left open: with no verdict levied there is nothing
+ * to dispute, so `swarm_disagreement` needs no adjudicator and none is
+ * planned for either runtime.
  *
- * These values and this set MUST match Python's TX_CHANNEL_WEIGHTS /
- * TX_CHANNELS_HARD (reputation.py).
+ * These values MUST match Python's TX_CHANNEL_WEIGHTS (reputation.py).
  ****************************/
 
 /** EMA multiplier for a locally-produced score, by channel.
@@ -216,52 +229,6 @@ static inline int tx_channel_weight(const char *channel)
         || strcmp(ch, TX_CHANNEL_PROBE) == 0)
         return 2;
     return 1;
-}
-
-/** True iff @p channel is a FALSIFICATION rather than a grade: the peer did
- *  not do poorly, it asserted something that is not true.
- *
- *  Each of the three is a verdict reachable without consulting any other peer
- *  — physics refutes, a certificate fails to verify, an archive contradicts
- *  itself — which is exactly what makes a single observation of one sufficient
- *  grounds to accuse.
- *
- *  `probe` is deliberately NOT here even though its ground truth is certain: a
- *  probe is synthetic traffic the verifier generates continuously (§12.7), so
- *  making one failed probe slash-eligible would put every node's exclusion in
- *  the hands of its own probe cadence. It gets the corroborated weight
- *  instead. Mirrors Python TX_CHANNELS_HARD. */
-static inline bool tx_channel_is_hard(const char *channel)
-{
-    if (channel == NULL || channel[0] == '\0')
-        return false;
-    return strcmp(channel, TX_CHANNEL_PHYSICAL) == 0
-           || strcmp(channel, TX_CHANNEL_CERTIFICATE) == 0
-           || strcmp(channel, TX_CHANNEL_SELF_CONSISTENCY) == 0;
-}
-
-/** Prefix of the evidence-channel slash reasons (R+D.md §12.8). The suffix is
- *  the channel verbatim, so the closed channel set defines the closed reason
- *  set and neither can drift from the other. Mirrors Python
- *  SlashAttestation.REASON_REFUTED_PREFIX. */
-#define REP_SLASH_REASON_REFUTED_PREFIX "refuted_"
-
-/** Write the slash reason for a hard @p channel into @p out ("refuted_" plus
- *  the channel). Returns false — leaving @p out untouched — for a channel that
- *  is not slash-eligible, rather than inventing a reason no reader could
- *  place. The reason is part of the signed slash designation, so unlike an
- *  evidence_ref it cannot be altered in flight. */
-static inline bool tx_channel_slash_reason(const char *channel,
-                                           char *out, size_t outlen)
-{
-    if (out == NULL || outlen == 0 || !tx_channel_is_hard(channel))
-        return false;
-    size_t pfx = sizeof(REP_SLASH_REASON_REFUTED_PREFIX) - 1;
-    if (strlen(channel) + pfx + 1 > outlen)
-        return false;
-    memcpy(out, REP_SLASH_REASON_REFUTED_PREFIX, pfx);
-    memcpy(out + pfx, channel, strlen(channel) + 1);
-    return true;
 }
 
 /** @} */ /* end of internal_reputation */

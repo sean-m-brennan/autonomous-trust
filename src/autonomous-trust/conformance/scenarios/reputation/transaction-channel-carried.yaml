@@ -26,25 +26,27 @@ description: |
     consequences: the first slice (2026-08-21) branched on nothing, and the
     prose here said that if a later slice made a physics refutation demote
     faster, this scenario should start failing and be re-decided
-    deliberately rather than drifting. The later slice landed, and this is
-    that deliberate re-decision — the vector holds, for two reasons that
-    are the whole shape of the second slice:
+    deliberately rather than drifting. Two later slices landed, and this is
+    that deliberate re-decision — the vector holds, for reasons that are the
+    shape of both:
 
-      - The channel's EMA multiplier and its slash eligibility apply ONLY
-        to evidence the scoring node produced ITSELF. This step is a
-        proposal alice sent to bob; on bob's side the tag is bob's
-        knowledge of what alice claims, not bob's own finding. Honouring it
-        would hand every peer a lever on every other peer's reputation, so
-        the wire path weighs by capability alone.
-      - The score here is 0.8 — a PASS. Even locally, a hard channel
-        reporting success is the common case and must be silent; only a
-        defection-grade score on a hard channel is a refutation.
+      - The channel's EMA multiplier applies ONLY to evidence the scoring
+        node produced ITSELF. This step is a proposal alice sent to bob; on
+        bob's side the tag is bob's knowledge of what alice claims, not
+        bob's own finding. Honouring it would hand every peer a lever on
+        every other peer's reputation, so the wire path weighs by capability
+        alone.
+      - No channel accuses anyone, from any origin. The slash eligibility
+        the 2026-09-01 slice gave the hard channels was removed a day later
+        at the user's direction: a poorly scored transaction carries its
+        reason, every peer sees both, and each judges for itself.
+      - The channel DOES reach the committed fact, but this scenario stops
+        at `tx accepted` — the entry is written by the commit leg, which
+        `committed-channel-in-the-entry-hash` pins (including the window
+        root both runtimes must reproduce).
 
-    So the invariant this scenario pins is sharper than before, not weaker:
-    a channel crossing the wire is legibility, and the two runtimes must
-    agree on that. The consequences of a LOCAL channel are pinned by unit
-    tests on each side (see below), because they have no wire form to
-    compare — which is exactly why they are safe.
+    So the invariant here is narrow and still worth having: a channel-
+    bearing proposal routes and validates identically on both runtimes.
 
     Cross-language wiring:
       - Python: the adapter passes `payload.channel` into
@@ -62,9 +64,8 @@ description: |
     No expected_state pin, for the same reason as
     `transaction-committed-bilateral`: the assertion here is that the
     channel-bearing proposal routes and validates identically on both
-    runtimes, not any new observable. Two things are pinned by unit tests
-    instead, on both sides, because neither has a wire form for a scenario
-    to compare:
+    runtimes, not any new observable. Two things stay unit-pinned on both
+    sides, because neither has a wire form for a scenario to compare:
 
       - The closed-set REFUSAL — `tests/a_unit/test_reputation.py`
         (`TestTransactionScoreChannel`) and `src/c/test/reputation3_test.c`
@@ -72,13 +73,11 @@ description: |
         it as a negative vector needs `op: set_field` / `reason_class:
         schema_violation`, and both negative runners currently implement
         only `flip_byte`.
-      - The per-channel weights and the hard set — same two files
-        (`TestChannelResponses`,
-        `test_tx_channel_weights_match_the_python_twin`,
-        `test_tx_channel_hard_set_matches_the_python_twin`). These are the
-        real cross-language risk in this slice: the two runtimes must agree
-        on the NUMBERS even though the numbers never cross the wire, so
-        each side asserts the literal table rather than deriving it.
+      - The per-channel weights — same two files (`TestChannelResponses`,
+        `test_tx_channel_weights_match_the_python_twin`). These are the
+        real cross-language risk: the two runtimes must agree on the
+        NUMBERS even though the numbers never cross the wire, so each side
+        asserts the literal table rather than deriving it.
 
 participants:
   - id: alice
@@ -127,8 +126,8 @@ steps:
       id2: 1
       proposer: alice
     description: |
-        Round commits unchanged. The channel does not reach the committed
-        chain entry's canonical bytes (it is provenance for the score, not
-        part of the committed fact), so entry hashes are unaffected on both
-        sides — pinned directly by
-        `test_the_channel_does_not_reach_the_chain_entry_hash`.
+        Round commits unchanged. The entry itself is written by the commit
+        leg, which this scenario does not drive; that the channel reaches
+        the entry's canonical bytes (and that an UNTAGGED entry's hash is
+        unchanged by the field existing) is pinned by
+        `committed-channel-in-the-entry-hash`.

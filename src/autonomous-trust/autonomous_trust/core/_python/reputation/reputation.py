@@ -71,12 +71,11 @@ def validate_tx_score(score, where: str = 'TransactionScore'):
 #: score is what the wire carried before this field existed.
 #:
 #: The first slice (2026-08-21) carried the channel and branched on nothing.
-#: The second (below, :data:`TX_CHANNEL_WEIGHTS` / :data:`TX_CHANNELS_HARD`)
-#: gives it consequences: a graded channel weights the consensus EMA, and a
-#: hard-falsification channel additionally makes a defection-grade score
-#: grounds to PROPOSE a slash. Both apply ONLY to evidence this node produced
-#: itself — see :func:`tx_channel_weight` for why a peer's tag stays
-#: legibility-only.
+#: The second gives it consequences, and there are two: a graded channel
+#: weights the consensus EMA (:data:`TX_CHANNEL_WEIGHTS`, locally-produced
+#: evidence only — see :func:`tx_channel_weight`), and the channel is part of
+#: the committed fact, so every peer retains the reason alongside the score
+#: and judges for itself. No channel levies a verdict of its own.
 #:
 #: Mirrors TX_CHANNEL_* in the C twin's reputation/tx_channel.h; the spellings
 #: must match verbatim, since a divergence is a score one twin accepts and the
@@ -184,19 +183,37 @@ def validate_tx_channel(channel, where: str = 'TransactionScore'):
 #
 # Two responses, both settled with the user before implementing:
 #
-#   weighting        every channel carries an integer multiplier on the
-#                    consensus EMA, composed with the per-capability
-#                    transaction weight (they multiply: a heavy capability
-#                    refuted on physics counts as both).
-#   slash-eligible   the hard-falsification channels additionally make a
-#                    defection-grade score grounds to PROPOSE a slash, which
-#                    the EXISTING quorum co-signature then accepts or refuses.
+#   weighting     every channel carries an integer multiplier on the consensus
+#                 EMA, composed with the per-capability transaction weight
+#                 (they multiply: a heavy capability refuted on physics counts
+#                 as both). Applied ONLY to locally-produced evidence -- see
+#                 `tx_channel_weight`.
+#   durability    the channel is part of the COMMITTED FACT: it rides the
+#                 `committed` broadcast, is written to every acceptor's
+#                 history, and is covered by `Transaction._canonical_bytes`
+#                 and therefore by the entry hash, the chain link, the window
+#                 root and the quorum-signed checkpoint over it. A peer that
+#                 strips a refutation off a chain entry breaks the link.
 #
-# Deliberately NOT a third mechanism: `swarm_disagreement` should open a
-# DISPUTE rather than levy a penalty (doc/verification_oracle.md), and no
-# dispute machinery exists in either runtime. Weighting it like a hard channel
-# would be the opposite of what that entry asks for -- a majority is not an
-# oracle -- so it sits at the baseline weight until the dispute path is built.
+# There is deliberately NO third mechanism, and no automatic accusation.
+#
+# An earlier slice (2026-09-01) made a defection-grade score on a
+# hard-falsification channel grounds to propose a slash. That was removed at
+# the user's direction: a transaction is scored poorly with a reason given,
+# every peer sees both, and each judges for itself. Discipline is the EMA and
+# the tier machinery working at their own pace -- which is graduated by
+# construction -- rather than one detector's verdict pinning a floor. That
+# also disposes of the dispute question the entry left open: with no verdict
+# levied there is nothing to dispute, so `swarm_disagreement` needs no
+# adjudicator, and none is planned for either runtime.
+#
+# What that decision COSTS the reason, and what pays for it: a reason nobody
+# retains is not something a peer can judge on. The channel used to stop at
+# the chain boundary, so every acceptor's persisted history kept the number
+# and dropped the reason. Hence `durability` above -- the migration the
+# earlier slice deferred, taken here because "peers judge for themselves" is
+# only true if the reason survives, is attributable, and cannot be edited in
+# flight.
 
 #: Multiplier on a locally-produced score's EMA weight, by channel.
 #:
@@ -224,23 +241,6 @@ TX_CHANNEL_WEIGHTS = {
     TX_CHANNEL_SELF_CONSISTENCY: 3,
 }
 
-#: The channels whose findings are FALSIFICATIONS rather than grades: the peer
-#: did not do poorly, it asserted something that is not true. Each is a verdict
-#: reachable without consulting any other peer — physics refutes, a certificate
-#: fails to verify, an archive contradicts itself — which is exactly what makes
-#: a single observation of one sufficient grounds to accuse.
-#:
-#: `probe` is deliberately NOT here even though its ground truth is certain.
-#: A probe is synthetic traffic the verifier generates continuously (§12.7), so
-#: making one failed probe slash-eligible would put every node's exclusion in
-#: the hands of its own probe cadence. It gets the corroborated weight instead.
-#:
-#: Mirrors TX_CHANNEL_IS_HARD in the C twin.
-TX_CHANNELS_HARD = frozenset({TX_CHANNEL_PHYSICAL,
-                              TX_CHANNEL_CERTIFICATE,
-                              TX_CHANNEL_SELF_CONSISTENCY})
-
-
 def tx_channel_weight(channel) -> int:
     """The EMA multiplier for *channel*, defaulting to 1 for anything unknown.
 
@@ -264,59 +264,29 @@ def tx_channel_weight(channel) -> int:
     return int(TX_CHANNEL_WEIGHTS.get(channel, 1))
 
 
-def tx_channel_is_hard(channel) -> bool:
-    """Whether *channel* is a falsification (see :data:`TX_CHANNELS_HARD`)."""
-    return channel in TX_CHANNELS_HARD
-
-
-def slash_reason_for_channel(channel) -> str:
-    """The ``SlashAttestation.reason`` a hard channel slashes under.
-
-    ``'refuted_' + channel``, so the accusation names the evidence that
-    produced it rather than collapsing to a generic "bad peer" — which is the
-    whole point of §12.8, and what an operator reading a demotion needs. The
-    reason is part of ``designation``, so it is SIGNED and co-signed: unlike
-    ``evidence_ref``, a channel claim carried here cannot be altered in flight.
-
-    Raises ValueError for a channel that is not slash-eligible, rather than
-    inventing a reason for it: a caller asking this about `task_outcome` has a
-    bug, and a silently-minted reason would produce a slash no reader could
-    place.
-    """
-    if not tx_channel_is_hard(channel):
-        raise ValueError('channel %r is not slash-eligible (hard channels: %s)'
-                         % (channel, ', '.join(sorted(TX_CHANNELS_HARD))))
-    return SlashAttestation.REASON_REFUTED_PREFIX + channel
-
-
 class TransactionScore(Configuration):
     """One peer's score for one task, plus how that score was arrived at.
 
     ``channel`` names the evidence channel the score came from (see
     :data:`TX_CHANNELS` and R+D.md §12.8). On a score THIS node produced it
-    also carries consequences — an EMA multiplier
-    (:data:`TX_CHANNEL_WEIGHTS`) and, for a hard channel, slash eligibility
-    (:data:`TX_CHANNELS_HARD`). On a score that arrived from a peer it stays
-    legibility only, because the sender picks its own tag.
+    also carries an EMA multiplier (:data:`TX_CHANNEL_WEIGHTS`); on a score
+    that arrived from a peer it is weighted by capability alone, because the
+    sender picks its own tag. It is never an accusation on either path.
 
     ``subject_uuid`` is the peer this score is ABOUT. It is local-only and
     never serialized (see :meth:`to_dict`): the wire form pairs the two sides
     of a transaction by ``task_id``, and nothing downstream of the chain needs
-    it. It exists so a locally-produced hard-channel score can name the peer it
-    accuses without waiting for the bilateral pairing to close, and dropping it
-    from the wire is also what makes the "locally-produced evidence only" rule
-    structural rather than a check that could be forgotten: a score off the
-    wire has no subject to accuse, so it cannot originate a slash whatever it
-    claims in its channel.
+    it. Producers that know which peer they are grading set it so the log names
+    the peer without waiting for the bilateral pairing to close.
 
-    Deliberately NOT part of ``Transaction._canonical_bytes`` — the channel
-    rides on the TS and stops at the chain boundary. Adding a field to the
-    canonical bytes would change every entry hash in every resident chain and
-    invalidate the byte-pinned C parity, which is a migration this slice has no
-    reason to spend: a committed chain entry answers "who transacted, and how
-    well," and the channel is provenance for the score rather than part of the
-    fact being committed. If a future escalation path needs the channel to be
-    tamper-evident, that is its own slice with its own chain migration.
+    ``channel`` DOES reach the committed fact, unlike the two fields above it.
+    :meth:`Transaction.add` carries it onto the chain entry and
+    ``Transaction._canonical_bytes`` covers it, so the reason a score was poor
+    is retained by every acceptor and is as tamper-evident as the score. That
+    is what lets peers judge a poor score for themselves instead of taking one
+    node's verdict for it (R+D.md §12.8). ``capability_name`` deliberately does
+    NOT travel with it: it would publish a per-peer record of which capability
+    every transaction exercised, and per-capability weighting stays local.
     """
 
     def __init__(self, task_id, score, capability_name: str = None,
@@ -359,15 +329,41 @@ class TransactionScore(Configuration):
 
 
 class Transaction(Configuration):
+    """A committed chain entry: who transacted, how well, and how we know.
+
+    The last of those is ``p1_channel`` / ``p2_channel``, the evidence channel
+    of each side's score (R+D.md §12.8). It is here rather than only on the
+    ``TransactionScore`` because the reason a score was poor is what lets every
+    other peer judge that score for itself, and a reason nobody retains is not
+    something anyone can judge on: before this field the ``committed``
+    broadcast carried a bare score, so every acceptor's history kept the number
+    and dropped the reason.
+
+    Absent normalizes to :data:`TX_CHANNEL_DEFAULT`, which is what every
+    producer predating channels meant.
+    """
+
     def __init__(self, task_id: UUID, p1_id: UUID = None, p1_score: float = None,
                  p2_id: UUID = None, p2_score: float = None, index: int = None,
-                 prev_hash: bytes = None):
+                 prev_hash: bytes = None, p1_channel: str = None,
+                 p2_channel: str = None):
         self.task_id = task_id
         self.p1_id = p1_id
         self.p1_score = p1_score
         self.p2_id = p2_id
         self.p2_score = p2_score
         self.index = index
+        # Evidence channel of each side's score. Validated, so an unknown
+        # spelling cannot reach the canonical bytes and fork the chain: the
+        # closed set is what makes the entry hash mean the same thing on both
+        # sides of the wire. Kept as None when absent (rather than eagerly
+        # defaulted) so `_canonical_bytes` can tell "no channels here" from
+        # "explicitly a task outcome" -- they hash identically either way, but
+        # only the first can keep a legacy entry's hash unchanged.
+        self.p1_channel = (None if p1_channel is None
+                           else validate_tx_channel(p1_channel, 'Transaction'))
+        self.p2_channel = (None if p2_channel is None
+                           else validate_tx_channel(p2_channel, 'Transaction'))
         # Phase 1 hash-linking: digest of the entry committed immediately
         # before this one in the resident chain (b'' / None for the genesis
         # entry or the oldest entry whose predecessor has been evicted). Set
@@ -385,6 +381,22 @@ class Transaction(Configuration):
             return 1
         return 2
 
+    def to_dict(self):
+        # Channels are OMITTED when absent rather than serialized as null.
+        # `Configuration.to_dict` is `dict(self.__dict__)`, so without this an
+        # untagged entry -- i.e. every entry a legacy peer holds -- would
+        # change shape on the catchup wire (`ReputationProtocol.update`) and in
+        # persisted history the moment this field appeared, for no information
+        # gained. Same rule as `_canonical_bytes` and the evidence document:
+        # absent adds nothing, present travels. `from_json_string` rebuilds
+        # via `cls(**kwargs)`, where an omitted key is exactly None.
+        d = super().to_dict()
+        if d.get('p1_channel') is None:
+            d.pop('p1_channel', None)
+        if d.get('p2_channel') is None:
+            d.pop('p2_channel', None)
+        return d
+
     def _canonical_bytes(self) -> bytes:
         """Deterministic, language-agnostic serialization of the entry's
         identifying content (everything EXCEPT prev_hash). Floats use
@@ -392,7 +404,29 @@ class Transaction(Configuration):
         C's ``snprintf("%.17g", …)``); UUIDs use the canonical lowercase
         hyphenated form (== C's ``uuid_unparse_lower``); None is ``null``.
         Keep this in lockstep with ``transaction_canonical_bytes`` in
-        ``src/c/autonomous_trust/reputation/reputation.c``."""
+        ``src/c/autonomous_trust/reputation/reputation.c``.
+
+        ``task_id|p1_id|p1_score|p2_id|p2_score|index``, with
+        ``|p1_channel|p2_channel`` APPENDED only when at least one side
+        carries a channel other than :data:`TX_CHANNEL_DEFAULT` (R+D.md
+        §12.8). The condition is what makes covering the channel a
+        non-migration rather than a chain break:
+
+        * The same fact still hashes to the same bytes. An absent channel and
+          an explicit ``task_outcome`` are the same claim (see
+          :func:`validate_tx_channel`), and both omit the block, so two nodes
+          cannot disagree about an entry's hash because one of them received
+          the default spelled out.
+        * Every entry committed before this field keeps its hash. Entry hashes
+          chain (``prev_hash``) and roll up into the window root that
+          checkpoints are quorum-signed over, so unconditionally appending
+          would invalidate every stored chain, every finalized checkpoint and
+          every byte-pinned corpus vector at once.
+        * The tampering that matters is still caught. STRIPPING a refutation
+          off an entry drops the block and changes the bytes, so the link and
+          the window root no longer verify; ADDING ``task_outcome`` to an
+          untagged entry is a no-op because it asserts nothing.
+        """
         def _u(x):
             return 'null' if x is None else str(x)
 
@@ -402,9 +436,13 @@ class Transaction(Configuration):
         def _i(x):
             return 'null' if x is None else str(int(x))
 
-        return '|'.join((_u(self.task_id), _u(self.p1_id), _f(self.p1_score),
-                         _u(self.p2_id), _f(self.p2_score),
-                         _i(self.index))).encode('utf-8')
+        fields = [_u(self.task_id), _u(self.p1_id), _f(self.p1_score),
+                  _u(self.p2_id), _f(self.p2_score), _i(self.index)]
+        c1 = self.p1_channel or TX_CHANNEL_DEFAULT
+        c2 = self.p2_channel or TX_CHANNEL_DEFAULT
+        if c1 != TX_CHANNEL_DEFAULT or c2 != TX_CHANNEL_DEFAULT:
+            fields += [c1, c2]
+        return '|'.join(fields).encode('utf-8')
 
     def entry_hash(self) -> bytes:
         """blake2b digest (64-char lowercase-hex bytes, matching
@@ -414,10 +452,12 @@ class Transaction(Configuration):
         prev = self.prev_hash if self.prev_hash else b''
         return MerkleTree.get_hash(self._canonical_bytes() + prev)
 
-    def add(self, peer_id: UUID, score: float):
+    def add(self, peer_id: UUID, score: float, channel: str = None):
         if self.p1_id is None:
             self.p1_id = peer_id
             self.p1_score = score
+            self.p1_channel = (None if channel is None
+                               else validate_tx_channel(channel, 'Transaction'))
         elif self.p2_id is None and peer_id != self.p1_id:
             # A Transaction is intrinsically bilateral; the same peer cannot
             # occupy both slots. Without this guard a duplicate `committed`
@@ -426,6 +466,8 @@ class Transaction(Configuration):
             # silently rejects.
             self.p2_id = peer_id
             self.p2_score = score
+            self.p2_channel = (None if channel is None
+                               else validate_tx_channel(channel, 'Transaction'))
 
 
 class TransactionHistory(Mapping):
@@ -557,7 +599,8 @@ class TransactionHistory(Mapping):
     def __getitem__(self, key):
         return self._task_mapping[key]
 
-    def update(self, task_id: UUID, peer_id: UUID, score: float):
+    def update(self, task_id: UUID, peer_id: UUID, score: float,
+               channel: str = None):
         if task_id not in self._task_mapping:
             # Refuse to reanimate a task we already committed and
             # rolled out of the resident chain. handle_committed
@@ -579,7 +622,7 @@ class TransactionHistory(Mapping):
             # `_peer_mapping[p1_id]` (which would inflate by_peer() results
             # and skew downstream peer-tx counts).
             return
-        tx.add(peer_id, score)
+        tx.add(peer_id, score, channel)
         self._map_peers(tx)
         if len(tx) > 1:
             tx.index = self._next_index
@@ -654,8 +697,15 @@ class TransactionHistory(Mapping):
             if link.index is None:
                 continue
             if link.index >= self._next_index:
-                self.update(link.task_id, link.p1_id, link.p1_score)
-                self.update(link.task_id, link.p2_id, link.p2_score)
+                # Channels replay with their scores: dropping them here would
+                # cost the reason a synced entry was poor AND recompute the
+                # entry hash without it, so this node's window root could
+                # never match the peer it synced from and no checkpoint over
+                # the window would reach quorum.
+                self.update(link.task_id, link.p1_id, link.p1_score,
+                            link.p1_channel)
+                self.update(link.task_id, link.p2_id, link.p2_score,
+                            link.p2_channel)
 
     # ----- Phase 2: ordered Merkle root over the resident window ----------
     # The prev_hash chain (Phase 1) makes the window tamper-EVIDENT in
@@ -756,8 +806,8 @@ class SlashAttestation(Configuration):
     PKI-style revocation).
 
     ``reason`` ∈ {sustained_anomaly, peer_exclude, invalid_tx,
-    rehabilitate} plus the per-channel `refuted_*` set
-    (:data:`REASON_REFUTED_PREFIX`, R+D.md §12.8). ``evidence_ref`` is an optional
+    rehabilitate}. (There was briefly a per-channel `refuted_*` set; evidence
+    channels no longer accuse — R+D.md §12.8.) ``evidence_ref`` is an optional
     ``(task_id, inclusion_proof)`` tying the slash to a Merkle-committed
     anomalous transaction — unused/optional in the Phase-0 trust-the-
     detector path; verified against a finalized checkpoint root once the
@@ -770,14 +820,6 @@ class SlashAttestation(Configuration):
     REASON_PEER_EXCLUDE = 'peer_exclude'
     REASON_INVALID_TX = 'invalid_tx'
     REASON_REHABILITATE = 'rehabilitate'
-
-    #: Prefix for the evidence-channel reasons (R+D.md §12.8). The suffix is
-    #: the channel verbatim, so the closed channel set defines the closed
-    #: reason set and neither can drift from the other:
-    #: `refuted_physical`, `refuted_certificate`, `refuted_self_consistency`.
-    #: Minted only by :func:`slash_reason_for_channel`. Mirrors
-    #: REP_SLASH_REASON_REFUTED_PREFIX in the C twin.
-    REASON_REFUTED_PREFIX = 'refuted_'
 
     def __init__(self, slasher_uuid: UUID, target_uuid: UUID,
                  reason: str, floor_score: float, epoch: int = 0,
@@ -966,6 +1008,16 @@ def evidence_to_dict(chain, signed_checkpoint=None) -> dict:
             'index': int(tx.index),
             'prev_hash': _hex_str(tx.prev_hash),
         })
+        # Additive to schema 1, and OMITTED when absent: a reader predating
+        # channels ignores the keys, and an entry that has none serializes
+        # exactly as it did before (which is also what keeps its entry hash
+        # unchanged -- see Transaction._canonical_bytes). A verifier
+        # recomputing entry hashes from this document over an entry that DOES
+        # carry a channel needs it, or its inclusion proofs miss the root.
+        if tx.p1_channel is not None:
+            entries[-1]['p1_channel'] = str(tx.p1_channel)
+        if tx.p2_channel is not None:
+            entries[-1]['p2_channel'] = str(tx.p2_channel)
     doc = {
         'schema': EVIDENCE_SCHEMA,
         'chain': entries,
@@ -1030,7 +1082,9 @@ def evidence_from_dict(doc):
             p1_id=_uuid('p1_id'), p1_score=_score('p1_score'),
             p2_id=_uuid('p2_id'), p2_score=_score('p2_score'),
             index=int(entry['index']),
-            prev_hash=prev.encode('ascii') if prev else b''))
+            prev_hash=prev.encode('ascii') if prev else b'',
+            p1_channel=entry.get('p1_channel'),
+            p2_channel=entry.get('p2_channel')))
     signed = None
     raw_ck = doc.get('checkpoint')
     if isinstance(raw_ck, dict):

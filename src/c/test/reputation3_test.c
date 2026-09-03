@@ -43,10 +43,10 @@ DEFINE_TEST(test_tx_history_json_roundtrip)
      * era_to_json now correctly filters that out. To keep the
      * "2 entries on the wire" assertion meaningful, finish task2
      * bilaterally too. */
-    ck_assert_ret_ok(tx_history_update(&hist, task1, peer1, 0.8));
-    ck_assert_ret_ok(tx_history_update(&hist, task1, peer2, 0.6));
-    ck_assert_ret_ok(tx_history_update(&hist, task2, peer1, 0.9));
-    ck_assert_ret_ok(tx_history_update(&hist, task2, peer2, 0.5));
+    ck_assert_ret_ok(tx_history_update(&hist, task1, peer1, 0.8, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task1, peer2, 0.6, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task2, peer1, 0.9, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task2, peer2, 0.5, NULL));
 
     /* Serialize to JSON */
     json_t *json_out = NULL;
@@ -86,12 +86,12 @@ DEFINE_TEST(test_tx_two_peer_transaction)
     /* First update: fills p1 slot — tx is pending, not yet
      * committed (mirrors Python `_chain.append` gated on
      * `len(tx) > 1`). */
-    ck_assert_ret_ok(tx_history_update(&hist, task, peer1, 0.7));
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer1, 0.7, NULL));
     ck_assert_int_eq(tx_history_len(&hist), 0);
 
     /* Second update same task: fills p2 slot — bilateral commit
      * promotes the tx and bumps len to 1. */
-    ck_assert_ret_ok(tx_history_update(&hist, task, peer2, 0.3));
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer2, 0.3, NULL));
     ck_assert_int_eq(tx_history_len(&hist), 1);
 
     transaction_t out;
@@ -122,8 +122,8 @@ DEFINE_TEST(test_reputation_contrite_tft)
     ck_assert_double_eq_tol(score, 0.2, 0.001);
 
     /* Add a cooperative transaction (both peers, high scores) */
-    ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 0.9));
-    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.8));
+    ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 0.9, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.8, NULL));
 
     score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
     /* One cooperative direct interaction: peer_standing = 0.8,
@@ -157,8 +157,8 @@ DEFINE_TEST(test_reputation_contrite_tft_cooperative_self_p2)
     uuid_generate(peer_id);
     uuid_generate(task);
 
-    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.8));  /* peer → p1 */
-    ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 0.9));  /* self → p2 */
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.8, NULL));  /* peer → p1 */
+    ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 0.9, NULL));  /* self → p2 */
 
     double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
     ck_assert_double_eq_tol(score, 0.8, 0.001);
@@ -184,11 +184,11 @@ DEFINE_TEST(test_reputation_contrite_tft_retaliation)
     uuid_generate(t2);
 
     /* tx1: cooperate/cooperate. */
-    ck_assert_ret_ok(tx_history_update(&hist, t1, self_id, 0.9));
-    ck_assert_ret_ok(tx_history_update(&hist, t1, peer_id, 0.8));
+    ck_assert_ret_ok(tx_history_update(&hist, t1, self_id, 0.9, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t1, peer_id, 0.8, NULL));
     /* tx2: self cooperates, peer defects. peer_last = 0.2. */
-    ck_assert_ret_ok(tx_history_update(&hist, t2, self_id, 0.9));
-    ck_assert_ret_ok(tx_history_update(&hist, t2, peer_id, 0.2));
+    ck_assert_ret_ok(tx_history_update(&hist, t2, self_id, 0.9, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t2, peer_id, 0.2, NULL));
 
     double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
     /* peer_standing = (0.8 + 0.2)/2 = 0.5; my_standing = 0.9.
@@ -216,10 +216,10 @@ DEFINE_TEST(test_reputation_contrite_tft_contrition)
     uuid_generate(t2);
 
     /* Both defect, both times. */
-    ck_assert_ret_ok(tx_history_update(&hist, t1, self_id, 0.2));
-    ck_assert_ret_ok(tx_history_update(&hist, t1, peer_id, 0.3));
-    ck_assert_ret_ok(tx_history_update(&hist, t2, self_id, 0.2));
-    ck_assert_ret_ok(tx_history_update(&hist, t2, peer_id, 0.4));
+    ck_assert_ret_ok(tx_history_update(&hist, t1, self_id, 0.2, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t1, peer_id, 0.3, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t2, self_id, 0.2, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, t2, peer_id, 0.4, NULL));
 
     double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
     /* peer_standing = (0.3 + 0.4)/2 = 0.35; my_standing = 0.2.
@@ -250,8 +250,8 @@ DEFINE_TEST(test_reputation_contrite_tft_third_party_informs_prior)
     uuid_generate(task);
 
     /* peer ↔ other tx, no self involvement; other scores the peer 0.1. */
-    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.1));
-    ck_assert_ret_ok(tx_history_update(&hist, task, other,   0.1));
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.1, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task, other,   0.1, NULL));
 
     double score = reputation_contrite_tft(&hist, &reps, self_id, peer_id);
     /* observed=0.1, cp_rep(other)=PREREP_NEUTRAL (0.2) default, n=1,
@@ -276,8 +276,8 @@ DEFINE_TEST(test_reputation_pure_with_counterparty)
     uuid_generate(task);
 
     /* Set up a complete transaction between peer1 and peer2 */
-    ck_assert_ret_ok(tx_history_update(&hist, task, peer1, 0.9));
-    ck_assert_ret_ok(tx_history_update(&hist, task, peer2, 0.7));
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer1, 0.9, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer2, 0.7, NULL));
 
     /* Set reputations */
     ck_assert_ret_ok(reputations_update(&reps, peer1, 0.8));
@@ -314,8 +314,8 @@ DEFINE_TEST(test_reputation_pure_unknown_counterparty_default_0_5)
     uuid_generate(peer_id);
     uuid_generate(task);
 
-    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.9));
-    ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 0.6));
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer_id, 0.9, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task, self_id, 0.6, NULL));
     /* No reputations set — counterparty fallback is PREREP_NEUTRAL (0.2). */
 
     double score = reputation_pure(&hist, &reps, peer_id, NULL);
@@ -350,10 +350,10 @@ DEFINE_TEST(test_reputation_pure_weighted_by_task)
     /* Two transactions involving `peer` and `counterparty`. Both score
      * the counterparty at 0.9; counterparty's reputation is 1.0 so
      * cp_score * cp_rep = 0.9 for each tx. */
-    ck_assert_ret_ok(tx_history_update(&hist, task_w1, peer, 0.0));
-    ck_assert_ret_ok(tx_history_update(&hist, task_w1, counterparty, 0.9));
-    ck_assert_ret_ok(tx_history_update(&hist, task_w4, peer, 0.0));
-    ck_assert_ret_ok(tx_history_update(&hist, task_w4, counterparty, 0.9));
+    ck_assert_ret_ok(tx_history_update(&hist, task_w1, peer, 0.0, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task_w1, counterparty, 0.9, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task_w4, peer, 0.0, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task_w4, counterparty, 0.9, NULL));
     ck_assert_ret_ok(reputations_update(&reps, counterparty, 1.0));
 
     char k1[UUID_STRING_LEN + 1], k4[UUID_STRING_LEN + 1];
@@ -381,10 +381,10 @@ DEFINE_TEST(test_reputation_pure_weighted_by_task)
      * total / total_weight = 4.0 / 5 = 0.8. */
     tx_history_free(&hist);
     tx_history_init(&hist);
-    ck_assert_ret_ok(tx_history_update(&hist, task_w1, peer, 0.0));
-    ck_assert_ret_ok(tx_history_update(&hist, task_w1, counterparty, 0.4));
-    ck_assert_ret_ok(tx_history_update(&hist, task_w4, peer, 0.0));
-    ck_assert_ret_ok(tx_history_update(&hist, task_w4, counterparty, 0.9));
+    ck_assert_ret_ok(tx_history_update(&hist, task_w1, peer, 0.0, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task_w1, counterparty, 0.4, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task_w4, peer, 0.0, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task_w4, counterparty, 0.9, NULL));
     double weighted_asym = reputation_pure(&hist, &reps, peer, &weights);
     ck_assert_double_eq_tol(weighted_asym, 0.8, 0.001);
 
@@ -601,74 +601,108 @@ DEFINE_TEST(test_tx_channel_weights_match_the_python_twin)
 }
 END_TEST_DEFINITION()
 
-DEFINE_TEST(test_tx_channel_hard_set_matches_the_python_twin)
+DEFINE_TEST(test_committed_channel_is_part_of_the_entry_hash)
 {
-    /* The falsification channels: the peer did not do poorly, it asserted
-     * something untrue. Each is reachable without consulting any other peer,
-     * which is what makes one observation sufficient grounds to accuse. */
-    ck_assert(tx_channel_is_hard(TX_CHANNEL_PHYSICAL));
-    ck_assert(tx_channel_is_hard(TX_CHANNEL_CERTIFICATE));
-    ck_assert(tx_channel_is_hard(TX_CHANNEL_SELF_CONSISTENCY));
-    /* A grade is a grade, however bad. */
-    ck_assert(tx_channel_is_hard(TX_CHANNEL_TASK_OUTCOME) == false);
-    ck_assert(tx_channel_is_hard(TX_CHANNEL_CALIBRATION) == false);
-    ck_assert(tx_channel_is_hard(TX_CHANNEL_REPLICATION) == false);
-    ck_assert(tx_channel_is_hard(TX_CHANNEL_SWARM_DISAGREEMENT) == false);
-    /* `probe` is excluded even though its ground truth is certain: it is
-     * synthetic traffic a node generates continuously, so slashing on one
-     * failed probe would put every node's demotion in the hands of its own
-     * probe cadence. */
-    ck_assert(tx_channel_is_hard(TX_CHANNEL_PROBE) == false);
-    ck_assert(tx_channel_is_hard(NULL) == false);
-    ck_assert(tx_channel_is_hard("") == false);
+    /* R+D.md §12.8's second response: the channel reaches the COMMITTED FACT,
+     * so a peer retains the reason a score was poor and can judge it for
+     * itself -- and so the reason is as tamper-evident as the score.
+     *
+     * Conditionally, which is the part worth pinning: an entry with no
+     * channel (every entry a pre-channel peer holds) must hash EXACTLY as it
+     * did before this field existed, or adding it would invalidate every
+     * stored chain and every quorum-signed checkpoint at once. */
+    uuid_t task, p1, p2;
+    uuid_generate(task);
+    uuid_generate(p1);
+    uuid_generate(p2);
+
+    tx_history_t plain, tagged;
+    tx_history_init(&plain);
+    tx_history_init(&tagged);
+    ck_assert_ret_ok(tx_history_update(&plain, task, p1, 0.9, NULL));
+    ck_assert_ret_ok(tx_history_update(&plain, task, p2, 0.2, NULL));
+    /* An explicit default is the SAME CLAIM as absence, so it must be the
+     * same bytes: two nodes cannot be allowed to disagree about an entry's
+     * hash because one of them received the default spelled out. */
+    ck_assert_ret_ok(tx_history_update(&tagged, task, p1, 0.9,
+                                       TX_CHANNEL_TASK_OUTCOME));
+    ck_assert_ret_ok(tx_history_update(&tagged, task, p2, 0.2, NULL));
+
+    char plain_canon[512], tagged_canon[512];
+    ck_assert(transaction_canonical_bytes(&plain.chain[0], plain_canon,
+                                          sizeof(plain_canon)) > 0);
+    ck_assert(transaction_canonical_bytes(&tagged.chain[0], tagged_canon,
+                                          sizeof(tagged_canon)) > 0);
+    ck_assert_str_eq(plain_canon, tagged_canon);
+    /* ...and the block is genuinely absent, not defaulted in. */
+    ck_assert(strstr(plain_canon, TX_CHANNEL_TASK_OUTCOME) == NULL);
+
+    /* A real channel DOES change the bytes, which is what makes stripping a
+     * refutation off an entry break the chain link and the window root. */
+    tx_history_t refuted;
+    tx_history_init(&refuted);
+    ck_assert_ret_ok(tx_history_update(&refuted, task, p1, 0.9, NULL));
+    ck_assert_ret_ok(tx_history_update(&refuted, task, p2, 0.2,
+                                       TX_CHANNEL_PHYSICAL));
+    char refuted_canon[512];
+    ck_assert(transaction_canonical_bytes(&refuted.chain[0], refuted_canon,
+                                          sizeof(refuted_canon)) > 0);
+    ck_assert(strcmp(plain_canon, refuted_canon) != 0);
+    /* Both sides are spelled out once either is, so the field positions are
+     * unambiguous. */
+    ck_assert(strstr(refuted_canon, "|task_outcome|physical") != NULL);
+    ck_assert_str_eq(refuted.chain[0].p2_channel, TX_CHANNEL_PHYSICAL);
+    ck_assert_str_eq(refuted.chain[0].p1_channel, "");
+
+    /* An unknown spelling is REFUSED rather than coerced: it would otherwise
+     * fork this node's entry hash away from the group's. */
+    uuid_t task2;
+    uuid_generate(task2);
+    ck_assert_ret_nonzero(tx_history_update(&refuted, task2, p1, 0.9,
+                                            "a_channel_from_the_future"));
+
+    tx_history_free(&plain);
+    tx_history_free(&tagged);
+    tx_history_free(&refuted);
 }
 END_TEST_DEFINITION()
 
-DEFINE_TEST(test_tx_channel_slash_reason_names_the_channel)
+DEFINE_TEST(test_committed_channel_survives_the_catchup_wire)
 {
-    /* The reason is inside the signed slash designation, so unlike an
-     * evidence_ref it cannot be altered in flight -- and it is what makes the
-     * demotion legible, which is the whole point of §12.8. Pinned as literals
-     * on both sides: a divergence is a slash one runtime can verify and the
-     * other cannot. */
-    char reason[TX_CHANNEL_NAMELEN + 16];
-    ck_assert(tx_channel_slash_reason(TX_CHANNEL_PHYSICAL, reason,
-                                      sizeof(reason)));
-    ck_assert_str_eq(reason, "refuted_physical");
-    ck_assert(tx_channel_slash_reason(TX_CHANNEL_CERTIFICATE, reason,
-                                      sizeof(reason)));
-    ck_assert_str_eq(reason, "refuted_certificate");
-    ck_assert(tx_channel_slash_reason(TX_CHANNEL_SELF_CONSISTENCY, reason,
-                                      sizeof(reason)));
-    ck_assert_str_eq(reason, "refuted_self_consistency");
-    /* Refused for a graded channel rather than invented: a minted reason
-     * would produce a slash no reader could place. */
-    ck_assert(tx_channel_slash_reason(TX_CHANNEL_TASK_OUTCOME, reason,
-                                      sizeof(reason)) == false);
-    ck_assert(tx_channel_slash_reason(TX_CHANNEL_PROBE, reason,
-                                      sizeof(reason)) == false);
-    /* And refused rather than truncated when the buffer cannot hold it. */
-    char tiny[4];
-    ck_assert(tx_channel_slash_reason(TX_CHANNEL_PHYSICAL, tiny,
-                                      sizeof(tiny)) == false);
-}
-END_TEST_DEFINITION()
+    /* A synced entry must arrive with its channel, or the receiver rebuilds
+     * it without one and computes a different entry hash -- so its window
+     * root could never match the peer it synced from and no checkpoint over
+     * the window would reach quorum. (era_from_json verifies the linkage it
+     * is handed, so a dropped channel shows up as a rejected segment.) */
+    uuid_t task, p1, p2;
+    uuid_generate(task);
+    uuid_generate(p1);
+    uuid_generate(p2);
 
-DEFINE_TEST(test_channel_slash_floor_is_demotion_not_exclusion)
-{
-    /* 0.45 drops the peer to tier 0 (below the 0.50 tier-1 floor) so it is
-     * shed by tier-gated negotiation, but leaves it above COMM_CUTOFF so it is
-     * not silenced and can earn its way back. Exclusion is sticky and
-     * reversible only by operator rehabilitation -- far too heavy for one
-     * automated verdict. Same values as Python's CHANNEL_SLASH_*. */
-    ck_assert(CHANNEL_SLASH_FLOOR > COMM_CUTOFF);
-    ck_assert(CHANNEL_SLASH_FLOOR < 0.5);
-    ck_assert_double_eq_tol(CHANNEL_SLASH_FLOOR_DEFAULT, 0.45, 1e-12);
-    /* The trigger is the codebase's own per-transaction cooperate threshold,
-     * not a new number -- which is what makes the certificate case §12.8 was
-     * written around (an invalid ZKP proof scores 0.3) actually fire. */
-    ck_assert_double_eq_tol(CHANNEL_SLASH_MAX_SCORE_DEFAULT, 0.5, 1e-12);
-    ck_assert(0.3 < CHANNEL_SLASH_MAX_SCORE);
+    tx_history_t src;
+    tx_history_init(&src);
+    ck_assert_ret_ok(tx_history_update(&src, task, p1, 0.9, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, task, p2, 0.2,
+                                       TX_CHANNEL_SELF_CONSISTENCY));
+    json_t *arr = NULL;
+    ck_assert_ret_ok(tx_history_era_to_json(&src, 0, tx_history_len(&src),
+                                            &arr));
+    ck_assert_ptr_nonnull(arr);
+
+    tx_history_t dst;
+    tx_history_init(&dst);
+    ck_assert_ret_ok(tx_history_era_from_json(&dst, arr));
+    ck_assert_int_eq(tx_history_len(&dst), 1);
+    ck_assert_str_eq(dst.chain[0].p2_channel, TX_CHANNEL_SELF_CONSISTENCY);
+
+    char src_hash[TX_HASH_HEX_LEN + 1], dst_hash[TX_HASH_HEX_LEN + 1];
+    transaction_entry_hash(&src.chain[0], src_hash);
+    transaction_entry_hash(&dst.chain[0], dst_hash);
+    ck_assert_str_eq(src_hash, dst_hash);
+
+    json_decref(arr);
+    tx_history_free(&src);
+    tx_history_free(&dst);
 }
 END_TEST_DEFINITION()
 
@@ -692,6 +726,5 @@ RUN_TESTS(Reputation3, test_tx_history_json_roundtrip, test_tx_two_peer_transact
           test_tx_channel_spellings_match_the_python_twin,
           test_tx_channel_field_holds_the_longest_spelling,
           test_tx_channel_weights_match_the_python_twin,
-          test_tx_channel_hard_set_matches_the_python_twin,
-          test_tx_channel_slash_reason_names_the_channel,
-          test_channel_slash_floor_is_demotion_not_exclusion)
+          test_committed_channel_is_part_of_the_entry_hash,
+          test_committed_channel_survives_the_catchup_wire)

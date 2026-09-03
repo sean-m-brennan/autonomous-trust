@@ -347,6 +347,19 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
             reputation_set_num_updates((int)json_integer_value(n_j));
     }
 
+    /* slash_enabled: true — arm the slash protocol for this case. It is
+     * opt-in in production (R+D.md §12.8): unarmed, a node originates
+     * nothing, declines to co-sign a proposal, and ignores a finalized
+     * slash. Set/cleared on every install rather than only when present, so
+     * one armed case cannot leak into the next. Scenario-level (not
+     * per-participant) because the knob is an environment variable that the
+     * whole cohort in this process shares -- the Python twin reads the same
+     * fixture and sets its instance attribute. */
+    if (json_is_true(json_object_get(g_fixtures, "slash_enabled")))
+        setenv("AT_SLASH_ENABLED", "1", 1);
+    else
+        unsetenv("AT_SLASH_ENABLED");
+
     /* requests: { "<pid>": [[id1, id2], ...] } — pre-stage granted Paxos
      * rounds (so handle_transaction's paxos_has_granted_id check passes). */
     json_t *reqs = json_object_get(g_fixtures, "requests");
@@ -422,7 +435,7 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
                 const char *slug = json_string_value(json_object_get(e, "task_id"));
                 const char *p1_id = json_string_value(json_object_get(e, "p1"));
                 const char *p2_id = json_string_value(json_object_get(e, "p2"));
-                if (slug == NULL || p1_id == NULL || p2_id == NULL) continue;
+                if (slug == NULL || p1_id == NULL) continue;
                 json_t *p1s_j = json_object_get(e, "p1_score");
                 json_t *p2s_j = json_object_get(e, "p2_score");
                 double p1_score = json_is_real(p1s_j) ? json_real_value(p1s_j)
@@ -438,6 +451,16 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
                     reputation_install_tx_pair(task_uuid,
                                                *p1_uuid, p1_score,
                                                *p2_uuid, p2_score);
+                else if (p1_uuid && p2_id == NULL)
+                    /* One side only, counterparty slot left open: lets a
+                     * single step drive the arrival that COMPLETES the entry,
+                     * which is the only way to assert on the committed window
+                     * in a harness that resets state between steps. */
+                    reputation_install_tx_single(task_uuid, *p1_uuid, p1_score);
+                /* A staged pair is untagged on both sides. A scenario that
+                 * needs a channel on a committed entry drives the
+                 * `tx committed` path, which carries one -- the seeding hook
+                 * deliberately has no channel argument (R+D.md §12.8). */
             }
         }
     }
@@ -798,6 +821,7 @@ static int _build_inbound(sce_run_ctx_t *ctx,
          * commit-broadcast payload built by handle_accepted. */
         double score = 1.0;
         const char *task_slug = NULL;
+        const char *channel = NULL;
         if (payload && json_is_object(payload))
         {
             json_t *s_j = json_object_get(payload, "score");
@@ -805,10 +829,17 @@ static int _build_inbound(sce_run_ctx_t *ctx,
             else if (json_is_integer(s_j)) score = (double)json_integer_value(s_j);
             json_t *t_j = json_object_get(payload, "task_id");
             if (json_is_string(t_j)) task_slug = json_string_value(t_j);
+            json_t *c_j = json_object_get(payload, "channel");
+            if (json_is_string(c_j)) channel = json_string_value(c_j);
         }
         body = json_object();
         json_object_set_new(body, "peer_uuid", json_string(proposer_str));
         json_object_set_new(body, "score", json_real(score));
+        /* The evidence channel is part of the committed fact (R+D.md §12.8),
+         * so a scenario can drive one; omitted when the scenario names none,
+         * which keeps every pre-channel vector byte-identical. */
+        if (channel != NULL)
+            json_object_set_new(body, "channel", json_string(channel));
         if (task_slug)
         {
             uuid_t task_uuid;
@@ -858,8 +889,8 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                 _uuid5("chain:", task, tk);
                 _uuid5("chainp1:", task, p1u);
                 _uuid5("chainp2:", task, p2u);
-                tx_history_update(&tmp, tk, p1u, p1s);
-                tx_history_update(&tmp, tk, p2u, p2s);
+                tx_history_update(&tmp, tk, p1u, p1s, NULL);
+                tx_history_update(&tmp, tk, p2u, p2s, NULL);
             }
             json_t *arr = NULL;
             tx_history_era_to_json(&tmp, 0, tx_history_len(&tmp), &arr);
@@ -1065,9 +1096,11 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                 if (p1u == NULL || p2u == NULL)
                     continue;
                 tx_history_update(&tmp, task_uuid, *p1u,
-                                  json_number_value(json_object_get(e, "p1_score")));
+                                  json_number_value(json_object_get(e, "p1_score")),
+                                  json_string_value(json_object_get(e, "p1_channel")));
                 tx_history_update(&tmp, task_uuid, *p2u,
-                                  json_number_value(json_object_get(e, "p2_score")));
+                                  json_number_value(json_object_get(e, "p2_score")),
+                                  json_string_value(json_object_get(e, "p2_channel")));
             }
         }
         rep_checkpoint_t ckpt;

@@ -41,6 +41,16 @@ from autonomous_trust.core.system import CfgIds
 from autonomous_trust.core.config import to_json_string, from_json_string
 
 
+@pytest.fixture(autouse=True)
+def _arm_slashing(monkeypatch):
+    """The slash protocol is opt-in (R+D.md §12.8): unarmed, a node
+    originates nothing, declines to co-sign, and ignores a finalized slash.
+    Every flow test in this module drives that protocol deliberately, so it
+    arms it deliberately -- which is also the pin that the DEFAULT is off,
+    since these tests fail without this fixture."""
+    monkeypatch.setattr(ReputationProcess, 'SLASH_ENABLED', True)
+
+
 def _identity(tag: str, uuid=None) -> Identity:
     """A real identity with a signing key DISTINCT per tag.
 

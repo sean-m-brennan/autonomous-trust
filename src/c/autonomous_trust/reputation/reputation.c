@@ -24,6 +24,7 @@
 #include "reputation/reputation.h"
 #include "structures/map.h"
 #include "utilities/at_jansson.h"
+#include "utilities/util.h"          /* at_strlcpy */
 #include "structures/data.h"
 #include "identity/identity.h"
 
@@ -54,8 +55,26 @@ int transaction_canonical_bytes(const transaction_t *tx, char *out, size_t outsz
      * UUIDs lowercase-hyphenated (or "null"), floats "%.17g" (or "null"),
      * index decimal (or "null" when pending / -1). The task_uuid is always
      * present. p1/p2 follow their *_set flags; a pending (index < 0) tx
-     * serializes index as "null" to match Python's None. */
-    char buf[UUID_STRING_LEN * 3 + 128];
+     * serializes index as "null" to match Python's None.
+     *
+     * |p1_channel|p2_channel is APPENDED only when at least one side carries
+     * a channel other than the default (R+D.md §12.8). The condition is what
+     * makes covering the channel a non-migration rather than a chain break:
+     *
+     *  - The same fact still hashes the same. Absent and an explicit
+     *    "task_outcome" are the same claim, and both omit the block, so two
+     *    nodes cannot disagree about an entry's hash because one of them
+     *    received the default spelled out.
+     *  - Every entry committed before this field keeps its hash. Entry hashes
+     *    chain (prev_hash) and roll up into the window root that checkpoints
+     *    are quorum-signed over, so appending unconditionally would
+     *    invalidate every stored chain, every finalized checkpoint and every
+     *    byte-pinned corpus vector at once.
+     *  - The tampering that matters is still caught. STRIPPING a refutation
+     *    drops the block and changes the bytes, so the link and the window
+     *    root stop verifying; ADDING "task_outcome" to an untagged entry is a
+     *    no-op because it asserts nothing. */
+    char buf[UUID_STRING_LEN * 3 + 128 + 2 * (TX_CHANNEL_NAMELEN + 1)];
     int n = 0;
     char tstr[UUID_STRING_LEN + 1];
     uuid_unparse_lower(tx->task_uuid, tstr);
@@ -74,6 +93,10 @@ int transaction_canonical_bytes(const transaction_t *tx, char *out, size_t outsz
         n += snprintf(buf + n, sizeof(buf) - n, "null");
     else
         n += snprintf(buf + n, sizeof(buf) - n, "%d", tx->index);
+    const char *c1 = tx_channel_or_default(tx->p1_channel);
+    const char *c2 = tx_channel_or_default(tx->p2_channel);
+    if (strcmp(c1, TX_CHANNEL_DEFAULT) != 0 || strcmp(c2, TX_CHANNEL_DEFAULT) != 0)
+        n += snprintf(buf + n, sizeof(buf) - n, "|%s|%s", c1, c2);
     if (n < 0 || (size_t)n >= sizeof(buf) || (size_t)n >= outsz)
         return -1;
     memcpy(out, buf, (size_t)n + 1);
@@ -86,7 +109,7 @@ void transaction_entry_hash(const transaction_t *tx, char out[TX_HASH_HEX_LEN + 
      * Python MerkleTree.get_hash(canonical + prev_hash): 32-byte digest,
      * lowercase hex. prev_hash is appended as its raw ASCII hex bytes (the
      * same concatenation Python performs on the b'' / 64-hex-byte value). */
-    char canon[UUID_STRING_LEN * 3 + 128];
+    char canon[UUID_STRING_LEN * 3 + 128 + 2 * (TX_CHANNEL_NAMELEN + 1)];
     int clen = transaction_canonical_bytes(tx, canon, sizeof(canon));
     if (clen < 0)
     {
@@ -584,8 +607,18 @@ void tx_history_destroy(tx_history_t *hist)
  */
 /* Frama-C: skipped — [solver-timeout] map/array mutation preconditions */
 int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
-                      const uuid_t peer_uuid, double score)
+                      const uuid_t peer_uuid, double score,
+                      const char *channel)
 {
+    /* Refused before anything is written, and refused rather than coerced:
+     * the channel is part of the entry hash (transaction_canonical_bytes), so
+     * a spelling this node's vocabulary does not have would fork its chain
+     * away from the group's. Mirrors Python validate_tx_channel raising in
+     * Transaction's constructor. Absence (NULL / "") is legal -- that is a
+     * pre-channel producer, not a wrong one. */
+    if (channel != NULL && channel[0] != '\0' && !tx_channel_valid(channel))
+        return EXCEPTION(EINVAL);
+
     char task_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(task_uuid, task_str);
 
@@ -631,6 +664,10 @@ int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
         uuid_copy(tx->p1_uuid, peer_uuid);
         tx->p1_score = score;
         tx->p1_set = true;
+        /* memset above already left this empty for an absent channel, which
+         * is how "no channel" is spelled in the struct. */
+        if (channel != NULL && channel[0] != '\0')
+            at_strlcpy(tx->p1_channel, channel, sizeof(tx->p1_channel));
         /* index is assigned monotonically only when the tx goes
          * bilateral (p2 also fills). Mark pending with -1 so callers
          * that look at tx->index for an unfinished tx see a sentinel.
@@ -678,6 +715,8 @@ int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
             uuid_copy(tx->p1_uuid, peer_uuid);
             tx->p1_score = score;
             tx->p1_set = true;
+            if (channel != NULL && channel[0] != '\0')
+                at_strlcpy(tx->p1_channel, channel, sizeof(tx->p1_channel));
         }
         else if (!tx->p2_set)
         {
@@ -694,6 +733,8 @@ int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
             uuid_copy(tx->p2_uuid, peer_uuid);
             tx->p2_score = score;
             tx->p2_set = true;
+            if (channel != NULL && channel[0] != '\0')
+                at_strlcpy(tx->p2_channel, channel, sizeof(tx->p2_channel));
         }
         else
         {
@@ -855,6 +896,26 @@ void tx_history_free(tx_history_t *hist)
  * JSON serialization for chain sync
  ****************************/
 
+/* Read the optional p1_channel / p2_channel keys onto @p tx.
+ *
+ * Absent leaves the field empty (a pre-channel sender); a spelling outside
+ * the closed set is also left empty rather than stored, because storing it
+ * would put a channel this node cannot name into the entry hash. That is
+ * detected rather than silent: the entry then hashes without the channel the
+ * sender hashed with, the link check fails, and the segment is rejected
+ * whole -- the same treatment tampering gets. */
+static void _tx_channels_from_json(const json_t *obj, transaction_t *tx)
+{
+    const char *c1 = json_string_value(json_object_get((json_t *)obj, "p1_channel"));
+    const char *c2 = json_string_value(json_object_get((json_t *)obj, "p2_channel"));
+    tx->p1_channel[0] = '\0';
+    tx->p2_channel[0] = '\0';
+    if (tx_channel_valid(c1))
+        at_strlcpy(tx->p1_channel, c1, sizeof(tx->p1_channel));
+    if (tx_channel_valid(c2))
+        at_strlcpy(tx->p2_channel, c2, sizeof(tx->p2_channel));
+}
+
 /* Frama-C: skipped — [serialization] jansson JSON serialization */
 int tx_history_era_to_json(const tx_history_t *hist, int start_idx, int end_idx, json_t **out)
 {
@@ -898,6 +959,16 @@ int tx_history_era_to_json(const tx_history_t *hist, int start_idx, int end_idx,
             json_decref(arr);
             return -1;
         }
+        /* Channels are OMITTED when absent (R+D.md §12.8), the same rule
+         * transaction_canonical_bytes follows: an untagged entry -- every
+         * entry a legacy peer holds -- goes on the wire exactly as it did
+         * before this field existed. A tagged one must carry them, or the
+         * receiver rebuilds the entry without the channel and computes a
+         * different entry hash for it, breaking the link it just verified. */
+        if (tx->p1_channel[0] != '\0')
+            json_object_set_new(obj, "p1_channel", json_string(tx->p1_channel));
+        if (tx->p2_channel[0] != '\0')
+            json_object_set_new(obj, "p2_channel", json_string(tx->p2_channel));
         json_array_append_new(arr, obj);
         committed_seen++;
     }
@@ -943,6 +1014,14 @@ int tx_history_era_from_json(tx_history_t *hist, const json_t *arr)
             cur.p2_score = json_number_value(json_object_get(obj, "p2_score"));
             cur.p2_set = json_boolean_value(json_object_get(obj, "p2_set"));
             cur.index = (int)json_integer_value(json_object_get(obj, "index"));
+            /* Channels feed the entry hash, so the link-verification pass
+             * needs them too -- verifying without them would compute a
+             * different digest than the sender did and reject a sound
+             * segment. Unknown spellings are dropped rather than refused
+             * here: the resulting hash then mismatches and the segment is
+             * rejected as a broken link, which is the same outcome by the
+             * path this pass already has for tampering. */
+            _tx_channels_from_json(obj, &cur);
             const char *ph = json_string_value(json_object_get(obj, "prev_hash"));
             cur.prev_hash[0] = '\0';
             if (ph != NULL)
@@ -985,6 +1064,7 @@ int tx_history_era_from_json(tx_history_t *hist, const json_t *arr)
         tx->p2_score = json_number_value(json_object_get(obj, "p2_score"));
         tx->p2_set = json_boolean_value(json_object_get(obj, "p2_set"));
         tx->index = (int)json_integer_value(json_object_get(obj, "index"));
+        _tx_channels_from_json(obj, tx);
         /* Preserve the wire prev_hash (consistent with preserving the wire
          * index above); the verified segment is self-consistent, so the
          * loaded chain's links hold. */
@@ -1123,6 +1203,15 @@ int reputation_evidence_to_json(const tx_history_t *hist,
             json_decref(chain);
             return -1;
         }
+        /* Additive to schema 1, omitted when absent (R+D.md §12.8) -- the
+         * same rule as the canonical bytes, so an untagged entry's document
+         * is byte-for-byte what it was before this field. A verifier
+         * recomputing entry hashes over a TAGGED entry needs them, or its
+         * inclusion proofs miss the root. Mirrors Python evidence_to_dict. */
+        if (tx->p1_channel[0] != '\0')
+            json_object_set_new(obj, "p1_channel", json_string(tx->p1_channel));
+        if (tx->p2_channel[0] != '\0')
+            json_object_set_new(obj, "p2_channel", json_string(tx->p2_channel));
         json_array_append_new(chain, obj);
     }
 
@@ -1246,6 +1335,7 @@ int reputation_evidence_from_json(const json_t *doc, tx_history_t *hist_out,
         tx->p1_set = true;
         tx->p2_set = true;
         tx->index = (int)json_integer_value(index_j);
+        _tx_channels_from_json(obj, tx);
         const char *ph = json_string_value(json_object_get(obj, "prev_hash"));
         tx->prev_hash[0] = '\0';
         if (ph != NULL)

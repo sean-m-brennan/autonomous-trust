@@ -239,6 +239,29 @@ class Group(InitializableConfig):
         the wire with ``public_only`` set — returns False."""
         return (not self._public_only) and self.encryptor.private is not None
 
+    def wire_format_for_address(self, address) -> str:
+        """This group's envelope format for traffic with *address*
+        (doc/architecture/network-wire-format.md).
+
+        A membership question, because the format belongs to the GROUP: a
+        member speaks this group's format, and an address this group cannot
+        place -- a stranger, a pre-admission newcomer, a member of a DIFFERENT
+        group -- gets JSON, which every AT node can read and is therefore the
+        only safe answer when there is no group to consult.
+
+        That last case is what lets two groups with DIFFERENT formats complete a
+        merge handshake without negotiating one: when a ``group_key_update``
+        crosses from one cohort to another, neither side can place the other's
+        members, so both fall to JSON independently and the exchange succeeds.
+        Pinned by conformance ``network/cross-group-format-fallback``; the C
+        twin is ``group_wire_format_for_address``.
+        """
+        try:
+            member = address in self.addresses
+        except Exception:
+            member = False
+        return self.wire_format if member else NetWireFormat.json
+
     def adopt_membership(self, other):
         """Adopt *other*'s group identity (uuid) and membership (address map)
         while KEEPING our own private encryptor. Used by ``handle_group_update``
