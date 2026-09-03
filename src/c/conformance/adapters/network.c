@@ -2515,6 +2515,323 @@ out:
     return rc;
 }
 
+/* The JSON fallback that lets two differently-formatted groups talk
+ * (scenario `cross-group-format-fallback`).
+ *
+ * A group answers with its OWN format for its own members and with JSON for
+ * anyone it cannot place. The second half is what makes a cross-format group
+ * merge work: neither side can place the other, so both fall to JSON and the
+ * group_key_update gets through. See doc/architecture/network-wire-format.md.
+ */
+static int run_cross_group_format_fallback(const at_case_t *c,
+                                           char *err, size_t err_len) {
+    json_t *fx = json_object_get(c->data, "fixtures");
+    const char *pg_uuid = fx ? json_string_value(json_object_get(fx, "proto_group_uuid")) : NULL;
+    const char *jg_uuid = fx ? json_string_value(json_object_get(fx, "json_group_uuid")) : NULL;
+    const char *p_member = fx ? json_string_value(json_object_get(fx, "proto_member")) : NULL;
+    const char *j_member = fx ? json_string_value(json_object_get(fx, "json_member")) : NULL;
+    const char *stranger = fx ? json_string_value(json_object_get(fx, "stranger")) : NULL;
+    if (pg_uuid == NULL) pg_uuid = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+    if (jg_uuid == NULL) jg_uuid = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+    if (p_member == NULL) p_member = "10.0.0.1";
+    if (j_member == NULL) j_member = "10.0.1.1";
+    if (stranger == NULL) stranger = "10.0.9.9";
+
+    uuid_t pgu, jgu;
+    if (uuid_parse(pg_uuid, pgu) != 0 || uuid_parse(jg_uuid, jgu) != 0) {
+        snprintf(err, err_len, "scenario: bad group uuid");
+        return -1;
+    }
+
+    group_t pgrp = {0}, jgrp = {0};
+    if (group_init(&pgu, (char *)p_member, &pgrp) != 0 ||
+        group_init(&jgu, (char *)j_member, &jgrp) != 0) {
+        snprintf(err, err_len, "scenario: group_init failed");
+        return -1;
+    }
+    pgrp.wire_format = NET_WIRE_PROTO;
+    jgrp.wire_format = NET_WIRE_JSON;
+
+    int rc = -1;
+    /* group_init records the group's own address but does not populate the
+     * member map, which is what the lookup walks -- so seed each group with
+     * its one member explicitly. */
+    if (group_add_address(&pgrp, pg_uuid, p_member) != 0 ||
+        group_add_address(&jgrp, jg_uuid, j_member) != 0) {
+        snprintf(err, err_len, "scenario: group_add_address failed");
+        goto out;
+    }
+
+    bool p_own   = (group_wire_format_for_address(&pgrp, p_member) == NET_WIRE_PROTO);
+    bool j_own   = (group_wire_format_for_address(&jgrp, j_member) == NET_WIRE_JSON);
+    bool p_far   = (group_wire_format_for_address(&pgrp, j_member) == NET_WIRE_JSON);
+    bool j_far   = (group_wire_format_for_address(&jgrp, p_member) == NET_WIRE_JSON);
+    bool p_strng = (group_wire_format_for_address(&pgrp, stranger) == NET_WIRE_JSON);
+
+    if (expect_flag(c, "node", "proto_group_to_own_member_is_proto", p_own, err, err_len) != 0 ||
+        expect_flag(c, "node", "json_group_to_own_member_is_json", j_own, err, err_len) != 0 ||
+        expect_flag(c, "node", "proto_group_to_foreign_member_is_json", p_far, err, err_len) != 0 ||
+        expect_flag(c, "node", "json_group_to_foreign_member_is_json", j_far, err, err_len) != 0 ||
+        expect_flag(c, "node", "proto_group_to_stranger_is_json", p_strng, err, err_len) != 0)
+        goto out;
+    rc = 0;
+out:
+    group_free(&pgrp);
+    group_free(&jgrp);
+    return rc;
+}
+
+/* Which verbs the gateway boundary refuses to carry
+ * (scenario `gateway-boundary-verbs`).
+ *
+ * Pins the MEMBERSHIP and the SIZE of the pre-admission set, because it is two
+ * hand-maintained lists in two languages: a verb added on one side only opens
+ * the boundary on one runtime and closes it on the other, silently. The
+ * negative list carries most of the value -- group_key_update and the
+ * partition pair must NOT classify as bootstrap or a gateway could not hold
+ * two cohorts / could not recover from a partition.
+ */
+static int run_gateway_boundary_verbs(const at_case_t *c,
+                                      char *err, size_t err_len) {
+    json_t *fx = json_object_get(c->data, "fixtures");
+    json_t *boots = fx ? json_object_get(fx, "bootstrap_verbs") : NULL;
+    json_t *others = fx ? json_object_get(fx, "not_bootstrap_verbs") : NULL;
+    if (!json_is_array(boots) || json_array_size(boots) == 0) {
+        snprintf(err, err_len, "scenario: fixtures.bootstrap_verbs missing or empty");
+        return -1;
+    }
+
+    bool all_recognized = true;
+    size_t i;
+    json_t *item;
+    json_array_foreach(boots, i, item) {
+        const char *verb = json_string_value(item);
+        if (verb == NULL || !identity_verb_is_bootstrap(verb))
+            all_recognized = false;
+    }
+
+    bool none_other = true;
+    if (json_is_array(others)) {
+        json_array_foreach(others, i, item) {
+            const char *verb = json_string_value(item);
+            if (verb != NULL && identity_verb_is_bootstrap(verb))
+                none_other = false;
+        }
+    }
+
+    bool count_is_three = (identity_bootstrap_verb_count() == 3);
+    /* NULL is the C spelling of Python's None/'' -- safe, and not bootstrap. */
+    bool empty_safe = (!identity_verb_is_bootstrap(NULL) &&
+                       !identity_verb_is_bootstrap(""));
+
+    if (expect_flag(c, "node", "all_bootstrap_verbs_recognized", all_recognized, err, err_len) != 0 ||
+        expect_flag(c, "node", "no_other_verb_is_bootstrap", none_other, err, err_len) != 0 ||
+        expect_flag(c, "node", "bootstrap_verb_count_is_three", count_is_three, err, err_len) != 0 ||
+        expect_flag(c, "node", "empty_verb_is_not_bootstrap", empty_safe, err, err_len) != 0)
+        return -1;
+    return 0;
+}
+
+/* The plaintext allowlist (scenario `unencrypted-verbs`).
+ *
+ * Pins the membership AND the size of the set a receiver accepts unencrypted
+ * from a known peer. Two hand-maintained lists in two languages, and the
+ * failure is asymmetric: too small drops protocol traffic, too large is a
+ * DOWNGRADE opening an attacker selects by simply not encrypting.
+ *
+ * The sharpest assertion is the relationship to the bootstrap set: the two
+ * overlap on request_access / access_granted (both run before a key exists),
+ * but full_history is bootstrap and must NEVER be accepted in the clear
+ * because it hands over the group key. Neither set is a subset of the other.
+ */
+static int run_unencrypted_verbs(const at_case_t *c, char *err, size_t err_len) {
+    json_t *fx = json_object_get(c->data, "fixtures");
+    json_t *plain = fx ? json_object_get(fx, "unencrypted_verbs") : NULL;
+    json_t *enc_only = fx ? json_object_get(fx, "encrypted_only_verbs") : NULL;
+    json_t *both = fx ? json_object_get(fx, "both_bootstrap_and_unencrypted") : NULL;
+    json_t *boot_enc = fx ? json_object_get(fx, "bootstrap_but_encrypted") : NULL;
+    if (!json_is_array(plain) || json_array_size(plain) == 0) {
+        snprintf(err, err_len, "scenario: fixtures.unencrypted_verbs missing or empty");
+        return -1;
+    }
+
+    size_t i;
+    json_t *item;
+
+    bool all_recognized = true;
+    json_array_foreach(plain, i, item) {
+        const char *verb = json_string_value(item);
+        if (verb == NULL || !identity_verb_is_unencrypted(verb))
+            all_recognized = false;
+    }
+
+    bool none_other = true;
+    if (json_is_array(enc_only)) {
+        json_array_foreach(enc_only, i, item) {
+            const char *verb = json_string_value(item);
+            if (verb != NULL && identity_verb_is_unencrypted(verb))
+                none_other = false;
+        }
+    }
+
+    bool count_is_nine = (identity_unencrypted_verb_count() == 9);
+    bool empty_safe = (!identity_verb_is_unencrypted(NULL) &&
+                       !identity_verb_is_unencrypted(""));
+
+    /* Overlap: run before a key exists, so bootstrap AND plaintext. */
+    bool overlap_ok = json_is_array(both) && json_array_size(both) > 0;
+    if (overlap_ok) {
+        json_array_foreach(both, i, item) {
+            const char *verb = json_string_value(item);
+            if (verb == NULL || !identity_verb_is_unencrypted(verb) ||
+                !identity_verb_is_bootstrap(verb))
+                overlap_ok = false;
+        }
+    }
+
+    /* Bootstrap but encrypted: the group key never rides in the clear. */
+    bool boot_enc_ok = json_is_array(boot_enc) && json_array_size(boot_enc) > 0;
+    if (boot_enc_ok) {
+        json_array_foreach(boot_enc, i, item) {
+            const char *verb = json_string_value(item);
+            if (verb == NULL || !identity_verb_is_bootstrap(verb) ||
+                identity_verb_is_unencrypted(verb))
+                boot_enc_ok = false;
+        }
+    }
+
+    if (expect_flag(c, "node", "all_unencrypted_verbs_recognized", all_recognized, err, err_len) != 0 ||
+        expect_flag(c, "node", "no_other_verb_is_unencrypted", none_other, err, err_len) != 0 ||
+        expect_flag(c, "node", "unencrypted_verb_count_is_nine", count_is_nine, err, err_len) != 0 ||
+        expect_flag(c, "node", "empty_verb_is_not_unencrypted", empty_safe, err, err_len) != 0 ||
+        expect_flag(c, "node", "overlap_verbs_are_both", overlap_ok, err, err_len) != 0 ||
+        expect_flag(c, "node", "full_history_is_bootstrap_but_not_unencrypted", boot_enc_ok, err, err_len) != 0)
+        return -1;
+    return 0;
+}
+
+/* The envelope's from_* claim is read ONLY when the transport gave no peer
+ * (scenario `transport-binds-the-recipient`, R+D.md 2.6).
+ *
+ * One signed frame, parsed three ways per format: attributed to its true
+ * signer, attributed to a RELAYER (the cross-recipient attack), and
+ * unattributed. Row 2 is the security property; row 3 proves the ORDERING --
+ * with a peer supplied the parsed sender IS that peer, so the envelope's claim
+ * was ignored rather than merely contradicted.
+ *
+ * Both formats on purpose: C duplicates this branch in net_message_from_wire
+ * and net_message_from_wire_proto, so a divergence between our own two parsers
+ * is exactly what a single-format case would miss.
+ */
+static int run_transport_binds_the_recipient(const at_case_t *c,
+                                             char *err, size_t err_len) {
+    json_t *fx = json_object_get(c->data, "fixtures");
+    const char *process = fx ? json_string_value(json_object_get(fx, "process")) : NULL;
+    const char *function = fx ? json_string_value(json_object_get(fx, "function")) : NULL;
+    const char *obj = fx ? json_string_value(json_object_get(fx, "obj_json")) : NULL;
+    const char *trace = fx ? json_string_value(json_object_get(fx, "trace_id")) : NULL;
+    if (process == NULL) process = "idproc";
+    if (function == NULL) function = "peer_caps_query";
+    if (obj == NULL) obj = "payload";
+
+    int rc = -1;
+    identity_t *signer = NULL, *relayer = NULL;
+    public_identity_t *signer_pub = NULL, *relayer_pub = NULL;
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+
+    if (_make_deterministic_identity("a", "10.0.80.1", &signer) != 0 ||
+        _make_deterministic_identity("b", "10.0.80.2", &relayer) != 0) {
+        snprintf(err, err_len, "scenario: identity setup failed");
+        goto out;
+    }
+    if (identity_publish(signer, &signer_pub) != 0 ||
+        identity_publish(relayer, &relayer_pub) != 0) {
+        snprintf(err, err_len, "scenario: identity_publish failed");
+        goto out;
+    }
+
+    net_wire_msg_t msg = {0};
+    at_strlcpy(msg.process, process, sizeof(msg.process));
+    msg.function = (char *)function;
+    msg.data     = (uint8_t *)obj;
+    msg.data_len = strlen(obj);
+    msg.to_whom.type = RECIPIENT_BROADCAST;
+    /* The envelope carries the SIGNER's identity; that claim is what the
+     * transport peer must override below. */
+    memcpy(&msg.from_whom, signer_pub, sizeof(public_identity_t));
+    if (trace != NULL) {
+        size_t tlen = strlen(trace);
+        if (tlen > NET_TRACE_ID_LEN) tlen = NET_TRACE_ID_LEN;
+        memcpy(msg.trace_id, trace, tlen);
+        msg.trace_id[tlen] = '\0';
+    }
+
+    const struct { const char *label; net_wire_format_t fmt; } formats[] = {
+        { "json",  NET_WIRE_JSON  },
+        { "proto", NET_WIRE_PROTO },
+    };
+
+    for (size_t i = 0; i < 2; i++) {
+        free(wire);
+        wire = NULL;
+        if (net_message_to_wire_fmt(&msg, signer, formats[i].fmt,
+                                    &wire, &wire_len) != 0) {
+            snprintf(err, err_len, "scenario: encode failed (%s)", formats[i].label);
+            goto out;
+        }
+
+        net_wire_msg_t out_msg;
+        char flag[96];
+
+        /* Row 1: honest attribution. Also the control -- a parser that never
+         * verifies would satisfy row 2 on its own. */
+        memset(&out_msg, 0, sizeof(out_msg));
+        bool ok_true = (net_message_from_wire_fmt(wire, wire_len, signer_pub,
+                                                  formats[i].fmt, &out_msg) == 0)
+                       && out_msg.verified;
+        net_wire_msg_free(&out_msg);
+
+        /* Row 2: the SAME bytes attributed to the relayer. The relay attack. */
+        memset(&out_msg, 0, sizeof(out_msg));
+        bool parsed_relay = (net_message_from_wire_fmt(wire, wire_len, relayer_pub,
+                                                       formats[i].fmt, &out_msg) == 0);
+        bool relay_refused = !parsed_relay || !out_msg.verified;
+        /* Row 3: the ordering -- the parsed sender must BE the transport peer. */
+        bool overrides = parsed_relay &&
+            (memcmp(out_msg.from_whom.uuid, relayer_pub->uuid, sizeof(uuid_t)) == 0);
+        net_wire_msg_free(&out_msg);
+
+        /* The unattributed channel: the envelope is the only identity there is. */
+        memset(&out_msg, 0, sizeof(out_msg));
+        bool parsed_unattr = (net_message_from_wire_fmt(wire, wire_len, NULL,
+                                                        formats[i].fmt, &out_msg) == 0);
+        bool unattr_verified = parsed_unattr && out_msg.verified;
+        bool unattr_is_claim = parsed_unattr &&
+            (memcmp(out_msg.from_whom.uuid, signer_pub->uuid, sizeof(uuid_t)) == 0);
+        net_wire_msg_free(&out_msg);
+
+        snprintf(flag, sizeof(flag), "%s_verified_for_true_sender", formats[i].label);
+        if (expect_flag(c, "signer", flag, ok_true, err, err_len) != 0) goto out;
+        snprintf(flag, sizeof(flag), "%s_relay_refused", formats[i].label);
+        if (expect_flag(c, "signer", flag, relay_refused, err, err_len) != 0) goto out;
+        snprintf(flag, sizeof(flag), "%s_transport_peer_overrides_envelope", formats[i].label);
+        if (expect_flag(c, "signer", flag, overrides, err, err_len) != 0) goto out;
+        snprintf(flag, sizeof(flag), "%s_unattributed_verified", formats[i].label);
+        if (expect_flag(c, "signer", flag, unattr_verified, err, err_len) != 0) goto out;
+        snprintf(flag, sizeof(flag), "%s_unattributed_sender_is_envelope_claim", formats[i].label);
+        if (expect_flag(c, "signer", flag, unattr_is_claim, err, err_len) != 0) goto out;
+    }
+    rc = 0;
+out:
+    free(wire);
+    if (signer_pub != NULL) smrt_deref(signer_pub);
+    if (relayer_pub != NULL) smrt_deref(relayer_pub);
+    if (signer != NULL) smrt_deref(signer);
+    if (relayer != NULL) smrt_deref(relayer);
+    return rc;
+}
+
 /* AT_NET_WIRE_MODE resolution (scenario `wire-mode-resolution`). Same shape as
  * run_tunables_resolution, against the named-value resolver. */
 static int run_wire_mode_resolution(const at_case_t *c, char *err, size_t err_len) {
@@ -2730,6 +3047,18 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
     }
     if (strcmp(c->name, "group-wire-format-canonical") == 0) {
         return run_group_wire_format_canonical(c, err, err_len);
+    }
+    if (strcmp(c->name, "cross-group-format-fallback") == 0) {
+        return run_cross_group_format_fallback(c, err, err_len);
+    }
+    if (strcmp(c->name, "gateway-boundary-verbs") == 0) {
+        return run_gateway_boundary_verbs(c, err, err_len);
+    }
+    if (strcmp(c->name, "unencrypted-verbs") == 0) {
+        return run_unencrypted_verbs(c, err, err_len);
+    }
+    if (strcmp(c->name, "transport-binds-the-recipient") == 0) {
+        return run_transport_binds_the_recipient(c, err, err_len);
     }
     snprintf(err, err_len, "unknown network scenario: %s", c->name);
     return 1; /* skip */

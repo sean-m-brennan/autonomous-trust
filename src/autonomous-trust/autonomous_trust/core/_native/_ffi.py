@@ -638,6 +638,12 @@ ffi.cdef("""
          * hash-linking's prev_hash was missing,
            so the mirror was 80 bytes against C's 152. TX_HASH_HEX_LEN(64) + NUL. */
         char prev_hash[65];
+        /* Added 2026-09-02 (R+D.md §12.8): the evidence channel of each side's
+         * score is part of the committed fact, so it is part of this struct.
+         * TX_CHANNEL_NAMELEN(31) + NUL, appended after prev_hash exactly as C
+         * appends it. */
+        char p1_channel[32];
+        char p2_channel[32];
     } transaction_t;
 
     /* tx_history_t/reputations_t contain embedded maps/arrays — opaque */
@@ -648,7 +654,8 @@ ffi.cdef("""
     int  tx_history_init(tx_history_t *hist);
     void tx_history_destroy(tx_history_t *hist);
     int  tx_history_update(tx_history_t *hist, const unsigned char *task_uuid,
-                           const unsigned char *peer_uuid, double score);
+                           const unsigned char *peer_uuid, double score,
+                           const char *channel);
     int  tx_history_len(const tx_history_t *hist);
     void tx_history_free(tx_history_t *hist);
 

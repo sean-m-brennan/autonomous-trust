@@ -158,11 +158,6 @@ static void _load_slash_marks(const process_t *proc);
 static bool _slash_mark_advance_locked(const char *target_str,
                                        const char *slasher_str,
                                        int64_t epoch);
-/* Forward declaration — originating a channel slash (R+D.md §12.8) is driven
- * from _forward_transaction, which sits above the whole slash section. */
-static void _originate_channel_slash(const process_t *proc,
-                                     const uuid_t target_uuid,
-                                     const char *channel, double score);
 /* Declared unconditionally: the batched consensus handler skips our own uuid,
  * and that path is not ZTA-gated (this declaration used to sit inside the
  * AT_ZTA_ENABLED block, where a default build could not see it). */
@@ -348,6 +343,18 @@ static struct {
      * consensus view (reputation_consensus_by_tier). Mirrors Python's
      * self.task_tiers (deferred.md §2.3). */
     map_t task_tiers;
+    /* Per-task evidence channel cache (task_uuid_str -> string), parallel to
+     * task_weights and evicted in lockstep with it, exactly as task_tiers is.
+     *
+     * This is the C answer to a fact Python gets for free: Python's
+     * handle_accepted reads the channel off its own retained
+     * `self.proposals[idx]` (a whole TransactionScore), while C's paxos
+     * instance is generic (`paxos_proposal_t` in algorithms/ carries a score
+     * and a grant count, and a reputation-specific channel string has no
+     * business in it). So the proposer stashes the channel here when it wins
+     * the floor and reads it back when the round commits -- its OWN claim,
+     * never the acceptor's echo of it (R+D.md §12.8). */
+    map_t task_channels;
     /* --- Slashing (fast-penalty path) ---
      * Mirrors Python ReputationProcess._slashed / _slash_sigs /
      * _slash_pending. A finalized slash floors the target's reputation
@@ -486,6 +493,7 @@ static void _ensure_init(void)
         rep_state.task_weights_ring_head = 0;
         rep_state.task_weights_ring_len = 0;
         map_init(&rep_state.task_tiers);
+        map_init(&rep_state.task_channels);
         map_init(&rep_state.slashed);
         map_init(&rep_state.slash_sigs);
         map_init(&rep_state.slash_pending);
@@ -828,6 +836,7 @@ static void _record_task_weight_locked(char *task_uuid_str, int weight)
     {
         map_remove(&rep_state.task_weights, task_uuid_str);
         map_remove(&rep_state.task_tiers, task_uuid_str);  /* lockstep (doc/architecture/network-wire-format.md) */
+        map_remove(&rep_state.task_channels, task_uuid_str);   /* same lockstep */
         /* Best-effort ring compaction: walk and remove matching slot.
          * O(N) but N <= 2*MAX_CHAIN_LEN, and refresh hits are rare. */
         for (int i = 0; i < rep_state.task_weights_ring_len; i++)
@@ -869,6 +878,8 @@ static void _record_task_weight_locked(char *task_uuid_str, int weight)
                        rep_state.task_weights_ring[evict_slot]);
             map_remove(&rep_state.task_tiers,           /* lockstep (doc/architecture/network-wire-format.md) */
                        rep_state.task_weights_ring[evict_slot]);
+            map_remove(&rep_state.task_channels,        /* same lockstep */
+                       rep_state.task_weights_ring[evict_slot]);
             rep_state.task_weights_ring[evict_slot][0] = '\0';
         }
     }
@@ -894,6 +905,39 @@ static void _record_task_tier_locked(char *task_uuid_str, int tier)
     data_t *t_dat = integer_data(tier > 0 ? tier : 0);
     if (t_dat == NULL) return;
     map_set(&rep_state.task_tiers, task_uuid_str, t_dat);
+}
+
+/* Record a task's evidence channel into rep_state.task_channels. No own ring,
+ * for the same reason task_tiers has none: every channel key is recorded
+ * together with its weight key and evicted with it. An absent/default channel
+ * is NOT stored -- the entry it would produce is indistinguishable from no
+ * entry (both mean `task_outcome`), and storing it would fill the map with
+ * the common case. Caller must hold rep_state.lock. */
+static void _record_task_channel_locked(char *task_uuid_str, const char *channel)
+{
+    if (task_uuid_str == NULL || task_uuid_str[0] == '\0') return;
+    if (channel == NULL || channel[0] == '\0') return;
+    if (strcmp(channel, TX_CHANNEL_DEFAULT) == 0) return;
+    if (!tx_channel_valid(channel)) return;
+    data_t *c_dat = string_data((string_t)channel, strlen(channel) + 1);
+    if (c_dat == NULL) return;
+    map_set(&rep_state.task_channels, task_uuid_str, c_dat);
+}
+
+/* The channel recorded for @p task_uuid_str, or NULL when none was (which
+ * means `task_outcome`). Caller must hold rep_state.lock; the returned
+ * pointer is owned by the map. */
+static const char *_task_channel_locked(const char *task_uuid_str)
+{
+    if (task_uuid_str == NULL || task_uuid_str[0] == '\0') return NULL;
+    data_t *dat = NULL;
+    if (map_get(&rep_state.task_channels, (map_key_t)task_uuid_str, &dat) != 0
+        || dat == NULL)
+        return NULL;
+    string_t val = NULL;
+    if (data_string_ptr(dat, &val) != 0)
+        return NULL;
+    return (const char *)val;
 }
 
 static void _publish_tier_change(const process_t *proc,
@@ -1547,10 +1591,17 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
         strncpy(channel_local, tx->channel, TX_CHANNEL_NAMELEN);
         channel_local[TX_CHANNEL_NAMELEN] = '\0';
         if (task_uuid_str[0] != '\0')
+        {
             /* Our own round, so the channel counts (R+D.md §12.8). */
             _record_task_weight_locked(task_uuid_str,
                                        _resolve_tx_weight_local(cap_name_local,
                                                                 channel_local));
+            /* ...and it has to survive to handle_accepted, which writes this
+             * entry to our history and broadcasts it: the channel is part of
+             * the committed fact now, and `tx` is freed by the map_remove
+             * below. */
+            _record_task_channel_locked(task_uuid_str, channel_local);
+        }
     }
 
     if (send_tx)
@@ -2041,13 +2092,31 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
             uuid_unparse_lower(proc->protocol.group.uuid, round_group);
         }
         tx_history_t *chain = _chain_for_group_locked(proc, round_group);
+        /* Our own proposal's channel, stashed when we won the floor. Empty
+         * (i.e. `task_outcome`) for a task we never tagged, and for the
+         * task_uuid-less fallback below, which has no task key to stash
+         * under.
+         *
+         * COPIED out of the map rather than borrowed: the pointer the map
+         * owns can be evicted (task_channels is bounded and evicts in
+         * lockstep with task_weights), and it is still needed further down
+         * for the broadcast. Same copy-before-use discipline as
+         * `round_group` above and `cap_name_local` in handle_grant. */
+        char commit_channel[TX_CHANNEL_NAMELEN + 1] = {0};
         if (have_task_uuid)
         {
-            tx_history_update(chain, task_uuid, peer_uuid, score);
+            const char *stashed = _task_channel_locked(task_uuid_str);
+            if (stashed != NULL)
+                at_strlcpy(commit_channel, stashed, sizeof(commit_channel));
+        }
+        if (have_task_uuid)
+        {
+            tx_history_update(chain, task_uuid, peer_uuid, score,
+                              commit_channel);
         }
         else
         {
-            tx_history_update(chain, peer_uuid, peer_uuid, score);
+            tx_history_update(chain, peer_uuid, peer_uuid, score, NULL);
         }
         paxos_advance_chain(&rep_state.paxos);
         /* Reset this peer's idle clock: the staleness sweep must leave an
@@ -2069,6 +2138,16 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
             json_object_set_new(commit_json, "peer_uuid",
                                 json_string(peer_uuid_str));
             json_object_set_new(commit_json, "score", json_real(score));
+            /* The evidence channel rides along (R+D.md §12.8): without it an
+             * acceptor writes the score and drops the reason, and "every peer
+             * can judge a poor score for itself" is only true if the reason
+             * reaches every peer. Omitted when absent/default, which keeps
+             * the payload byte-identical for every untagged commit -- and
+             * matches the entry hash, where absent and an explicit
+             * `task_outcome` are the same bytes. */
+            if (commit_channel[0] != '\0')
+                json_object_set_new(commit_json, "channel",
+                                    json_string(commit_channel));
             /* Tag the chain so receivers route it the same way we just did.
              * Omitted for the primary chain, which keeps the payload
              * byte-identical for every leaf node. */
@@ -2172,6 +2251,25 @@ static bool handle_committed(const process_t *proc, directory_t *queues, generic
         return false;
     }
 
+    /* Evidence channel of the committed score (R+D.md §12.8). Absent means a
+     * pre-channel proposer, which is `task_outcome`. A spelling outside the
+     * closed set drops the whole commit rather than being coerced away: the
+     * channel is part of the entry hash, so accepting one this node cannot
+     * name would fork this chain away from the group's. Mirrors the Python
+     * twin's validate_tx_channel call in handle_committed, and the same
+     * refusal handle_transaction already makes for a proposal. */
+    const char *chan_borrowed = json_string_value(json_object_get(payload,
+                                                                 "channel"));
+    if (chan_borrowed != NULL && chan_borrowed[0] != '\0'
+        && !tx_channel_valid(chan_borrowed))
+    {
+        log_warn(proc->logger,
+                 "Reputation: handle_committed: unknown evidence channel "
+                 "'%s'; dropping commit\n", chan_borrowed);
+        json_decref(payload);
+        return true;
+    }
+
     uuid_t task_uuid;
     const char *task_uuid_str = j_task_uuid ? json_string_value(j_task_uuid) : NULL;
     /* An untagged commit (or one naming a group we do not gateway) lands on the
@@ -2182,18 +2280,18 @@ static bool handle_committed(const process_t *proc, directory_t *queues, generic
     tx_history_t *chain = _chain_for_group_locked(proc, group_str);
     if (task_uuid_str && uuid_parse(task_uuid_str, task_uuid) == 0)
     {
-        tx_history_update(chain, task_uuid, peer_uuid, score);
+        tx_history_update(chain, task_uuid, peer_uuid, score, chan_borrowed);
     }
     else
     {
         /* Same fallback handle_accepted uses when task_uuid is
          * missing: key the entry by peer_uuid. */
-        tx_history_update(chain, peer_uuid, peer_uuid, score);
+        tx_history_update(chain, peer_uuid, peer_uuid, score, chan_borrowed);
     }
     pthread_mutex_unlock(&rep_state.lock);
     _note_interaction(peer_uuid);   /* idle clock; see doc/architecture/reputation.md decay */
-    log_debug(proc->logger, "Reputation: Recorded committed tx from %s\n",
-              peer_uuid_str);
+    log_debug(proc->logger, "Reputation: Recorded committed tx from %s via %s\n",
+              peer_uuid_str, tx_channel_or_default(chan_borrowed));
 
     json_decref(payload);
     return true;
@@ -3015,7 +3113,6 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
     /* After the round is under way, not before: a refutation is an accusation
      * about a peer, and the score that carries the evidence still belongs in
      * the chain whatever the accusation does (R+D.md §12.8). */
-    _originate_channel_slash(proc, subject_uuid, chan, score);
 }
 
 /****************************
@@ -3435,169 +3532,22 @@ static json_t *_cosigs_json_locked(map_t *sigs, const char *round_key,
     return out;
 }
 
-/* Originate a slash from a LOCALLY-PRODUCED refutation (R+D.md §12.8).
- *
- * The twin of Python's `_maybe_slash_for_channel` + `forward_slash`, and the
- * first origination path this runtime has had: until now C could co-sign and
- * apply a slash but never propose one (see _load_slash_marks' note, now
- * obsolete). Five conditions, all required, mirroring Python exactly:
- *
- *   1. slashing on channels is enabled (AT_TX_CHANNEL_SLASH_DISABLED);
- *   2. the channel is a falsification, not a grade (tx_channel_is_hard);
- *   3. the score is defection-grade (CHANNEL_SLASH_MAX_SCORE) -- a hard
- *      channel reporting a PASS is the common case and must be silent;
- *   4. the score names its subject. Only a locally-produced score can:
- *      tx_score_msg_t is an IPC struct and its peer_uuid never crosses the
- *      wire, which is what makes "locally-produced evidence only" structural
- *      rather than a check somebody could forget to write;
- *   5. the subject is a known peer other than ourselves.
- *
- * Carries NO evidence: the Merkle form proves inclusion against a root the
- * co-signers have FINALIZED, and a score submitted moments ago is in no
- * finalized window yet, so attaching it would get the slash refused rather
- * than trusted. This is the documented Phase-0 trust-the-detector path, and
- * the accusation stays legible because the CHANNEL is named in the signed
- * reason.
- */
-static void _originate_channel_slash(const process_t *proc,
-                                     const uuid_t target_uuid,
-                                     const char *channel, double score)
-{
-    if (getenv("AT_TX_CHANNEL_SLASH_DISABLED") != NULL)
-        return;
-    if (!tx_channel_is_hard(channel))
-        return;
-    if (score >= CHANNEL_SLASH_MAX_SCORE)
-        return;
-
-    uuid_t zero;
-    uuid_clear(zero);
-    if (target_uuid == NULL || uuid_compare(target_uuid, zero) == 0)
-    {
-        /* Say so rather than declining silently: a hard channel with no
-         * subject is a scoring producer that has not been taught to name the
-         * peer it is accusing, and a protection that never runs is exactly
-         * what this entry is about. */
-        log_warn(proc->logger,
-                 "Reputation: refutation via %s names no subject; scored but "
-                 "not actionable\n", channel);
-        return;
-    }
-    const identity_t *self = _resolve_self_identity(proc);
-    if (self == NULL)
-        return;
-    if (uuid_compare(target_uuid, self->uuid) == 0)
-        return;   /* never self-slash; mirrors _slash_target_ok */
-
-    char target_str[UUID_STRING_LEN + 1];
-    uuid_unparse_lower(target_uuid, target_str);
-
-    bool known = false;
-    peers_read_lock(proc);
-    for (size_t i = 0; i < proc->protocol.num_peers; i++)
-    {
-        if (uuid_compare(proc->protocol.peers[i].uuid, target_uuid) == 0)
-        {
-            known = true;
-            break;
-        }
-    }
-    peers_read_unlock(proc);
-    if (!known)
-    {
-        log_warn(proc->logger,
-                 "Reputation: refutation via %s names unknown peer %s; not "
-                 "slashing\n", channel, target_str);
-        return;
-    }
-
-    char reason[TX_CHANNEL_NAMELEN + sizeof(REP_SLASH_REASON_REFUTED_PREFIX)];
-    if (!tx_channel_slash_reason(channel, reason, sizeof(reason)))
-        return;
-
-    char self_str[UUID_STRING_LEN + 1];
-    uuid_unparse_lower(self->uuid, self_str);
-    double floor = CHANNEL_SLASH_FLOOR;
-
-    pthread_mutex_lock(&rep_state.lock);
-    int64_t epoch = ++rep_state.slash_epoch;
-    pthread_mutex_unlock(&rep_state.lock);
-
-    uint8_t desig[REP_DESIG_MAX];
-    size_t dlen = _slash_designation(self_str, target_str, reason, floor,
-                                     epoch, desig, sizeof(desig));
-    char sig_hex[REP_SIG_HEX_LEN + 1] = {0};
-    if (dlen == 0 || _cosign_hex(proc, desig, dlen, sig_hex,
-                                 sizeof(sig_hex)) != 0)
-    {
-        log_error(proc->logger,
-                  "Reputation: cannot sign own attestation; this slash cannot "
-                  "reach quorum\n");
-        return;
-    }
-
-    char key[UUID_STRING_LEN + 32];
-    snprintf(key, sizeof(key), "%s:%lld", target_str, (long long)epoch);
-    json_t *pending_rec = json_object();
-    if (pending_rec == NULL)
-        return;
-    json_object_set_new(pending_rec, "slasher_uuid", json_string(self_str));
-    json_object_set_new(pending_rec, "reason", json_string(reason));
-    json_object_set_new(pending_rec, "floor_score", json_real(floor));
-
-    pthread_mutex_lock(&rep_state.lock);
-    _store_pending_locked(&rep_state.slash_pending, key, pending_rec);
-    /* Seed the co-signature map with our OWN detached signature, not a bare
-     * uuid: every entry that will travel on slash_final has to be verifiable
-     * by its recipients, the proposer's included. */
-    _record_cosig_locked(&rep_state.slash_sigs, key, self_str, sig_hex);
-    /* Self-apply now, so our own view (and the dashboard reading it) floors
-     * the target immediately, independent of co-sign round-trip latency. A
-     * node always trusts its own detection. */
-    _apply_slash_locked(target_str, self_str, target_uuid, floor, epoch);
-    pthread_mutex_unlock(&rep_state.lock);
-    json_decref(pending_rec);
-    /* Our own epoch now has to survive a restart, or the next slash we
-     * originate is refused by every peer as a replay. */
-    _persist_slash_marks(proc);
-
-    json_t *att = json_object();
-    if (att == NULL)
-        return;
-    json_object_set_new(att, "slasher_uuid", json_string(self_str));
-    json_object_set_new(att, "target_uuid", json_string(target_str));
-    json_object_set_new(att, "reason", json_string(reason));
-    json_object_set_new(att, "floor_score", json_real(floor));
-    json_object_set_new(att, "epoch", json_integer(epoch));
-
-    peers_read_lock(proc);
-    size_t num_peers = proc->protocol.num_peers;
-    for (size_t i = 0; i < num_peers; i++)
-    {
-        generic_msg_t prop = {0};
-        prop.type = NET_MESSAGE;
-        strncpy(prop.info.net_msg.process, "reputation", PROC_NAME_LEN);
-        prop.info.net_msg.function = REP_PROTO_SLASH_PROPOSE;
-        prop.info.net_msg.encrypt = true;
-        memcpy(&prop.info.net_msg.to_whom, &proc->protocol.peers[i],
-               sizeof(public_identity_t));
-        strncpy(prop.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
-        net_msg_pack_json(&prop.info.net_msg, att);
-        messaging_send("network", NET_MESSAGE, &prop, false);
-    }
-    peers_read_unlock(proc);
-    json_decref(att);
-
-    log_warn(proc->logger,
-             "Reputation: refuted by %s (score %.2f) — proposing slash of %s "
-             "to floor %.2f (epoch %lld)\n",
-             channel, score, target_str, floor, (long long)epoch);
-}
-
 static bool handle_slash_propose(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* Declining to co-sign is a disarmed node's whole contribution: it
+     * neither vouches for the accusation nor argues with it, and the proposer
+     * simply fails to reach quorum if enough of the group is disarmed.
+     * Consumed (true) rather than passed on, so it is logged instead of
+     * falling through. Mirrors Python handle_slash_propose. */
+    if (!SLASH_ENABLED)
+    {
+        log_info(proc->logger,
+                 "Reputation: not co-signing slash_propose from %s "
+                 "(slashing disarmed)\n", nmsg->from_whom.nickname);
+        return true;
+    }
     if (!nmsg->verified)
     {
         log_warn(proc->logger,
@@ -3818,6 +3768,17 @@ static bool handle_slash_sign(const process_t *proc, directory_t *queues, generi
 
 static bool handle_slash_final(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
+    /* A disarmed node does not apply a floor it declined to co-sign. This is
+     * the half that makes the knob a real policy rather than decoration:
+     * origination and co-signing can both be refused and a quorum elsewhere
+     * in the group would still pin the peer here. */
+    if (!SLASH_ENABLED)
+    {
+        log_info(proc->logger,
+                 "Reputation: ignoring slash_final from %s "
+                 "(slashing disarmed)\n", msg->info.net_msg.from_whom.nickname);
+        return true;
+    }
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
     if (!nmsg->verified)
@@ -6403,6 +6364,8 @@ void reputation_reset_state(int num_peers)
     memset(rep_state.task_weights_ring, 0, sizeof(rep_state.task_weights_ring));
     map_free(&rep_state.task_tiers);   /* lockstep with task_weights (doc/architecture/network-wire-format.md) */
     map_init(&rep_state.task_tiers);
+    map_free(&rep_state.task_channels);   /* same lockstep */
+    map_init(&rep_state.task_channels);
     map_free(&rep_state.slashed);
     map_init(&rep_state.slashed);
     map_free(&rep_state.slash_sigs);
@@ -6685,8 +6648,21 @@ void reputation_install_tx_pair(const uuid_t task_uuid,
 {
     _ensure_init();
     pthread_mutex_lock(&rep_state.lock);
-    tx_history_update(&rep_state.history, task_uuid, p1_uuid, p1_score);
-    tx_history_update(&rep_state.history, task_uuid, p2_uuid, p2_score);
+    /* No channel: this hook installs a bare committed pair for tests and
+     * conformance fixtures, and an untagged entry is what every pre-channel
+     * fixture means. A scenario that needs a tagged entry drives the message
+     * path (transaction -> accepted -> committed), which carries it. */
+    tx_history_update(&rep_state.history, task_uuid, p1_uuid, p1_score, NULL);
+    tx_history_update(&rep_state.history, task_uuid, p2_uuid, p2_score, NULL);
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+void reputation_install_tx_single(const uuid_t task_uuid,
+                                  const uuid_t peer_uuid, double score)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    tx_history_update(&rep_state.history, task_uuid, peer_uuid, score, NULL);
     pthread_mutex_unlock(&rep_state.lock);
 }
 

@@ -39,10 +39,10 @@ DEFINE_TEST(test_tx_history_by_task)
      * matches Python TransactionHistory semantics where __len__
      * == len(_chain) and `_chain.append` runs only on the
      * bilateral transition. */
-    ck_assert_ret_ok(tx_history_update(&hist, task1, peer1, 0.9));
-    ck_assert_ret_ok(tx_history_update(&hist, task1, cp, 0.7));
-    ck_assert_ret_ok(tx_history_update(&hist, task2, peer1, 0.5));
-    ck_assert_ret_ok(tx_history_update(&hist, task2, cp, 0.4));
+    ck_assert_ret_ok(tx_history_update(&hist, task1, peer1, 0.9, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task1, cp, 0.7, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task2, peer1, 0.5, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task2, cp, 0.4, NULL));
     ck_assert_int_eq(tx_history_len(&hist), 2);
 
     transaction_t out;
@@ -71,12 +71,12 @@ DEFINE_TEST(test_tx_history_by_peer)
      * peer2 is in one (task3). After Bug 6 fix the chain only
      * tracks bilateral commits, but peer_map is appended on
      * every update() call so the count of peer1 entries is 2. */
-    ck_assert_ret_ok(tx_history_update(&hist, task1, peer1, 0.8));
-    ck_assert_ret_ok(tx_history_update(&hist, task1, cp, 0.5));
-    ck_assert_ret_ok(tx_history_update(&hist, task2, peer1, 0.6));
-    ck_assert_ret_ok(tx_history_update(&hist, task2, cp, 0.4));
-    ck_assert_ret_ok(tx_history_update(&hist, task3, peer2, 0.9));
-    ck_assert_ret_ok(tx_history_update(&hist, task3, cp, 0.3));
+    ck_assert_ret_ok(tx_history_update(&hist, task1, peer1, 0.8, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task1, cp, 0.5, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task2, peer1, 0.6, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task2, cp, 0.4, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task3, peer2, 0.9, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, task3, cp, 0.3, NULL));
 
     transaction_t results[10];
     int count = 0;
@@ -100,8 +100,8 @@ DEFINE_TEST(test_tx_history_era)
      * subsequence (mirrors Python's _chain[offset:]). */
     for (int i = 0; i < 5; i++) {
         uuid_generate(tasks[i]);
-        ck_assert_ret_ok(tx_history_update(&hist, tasks[i], peer, 0.1 * (i + 1)));
-        ck_assert_ret_ok(tx_history_update(&hist, tasks[i], cp, 0.05 * (i + 1)));
+        ck_assert_ret_ok(tx_history_update(&hist, tasks[i], peer, 0.1 * (i + 1), NULL));
+        ck_assert_ret_ok(tx_history_update(&hist, tasks[i], cp, 0.05 * (i + 1), NULL));
     }
     ck_assert_int_eq(tx_history_len(&hist), 5);
 
@@ -126,7 +126,7 @@ DEFINE_TEST(test_reputation_pure)
     uuid_generate(task1);
 
     /* Set up some history and reputation */
-    ck_assert_ret_ok(tx_history_update(&hist, task1, peer1, 0.9));
+    ck_assert_ret_ok(tx_history_update(&hist, task1, peer1, 0.9, NULL));
     ck_assert_ret_ok(reputations_update(&reps, peer1, 0.85));
 
     double score = reputation_pure(&hist, &reps, peer1, NULL);
@@ -151,7 +151,7 @@ DEFINE_TEST(test_reputation_compute)
     uuid_generate(peer_uuid);
     uuid_generate(task);
 
-    ck_assert_ret_ok(tx_history_update(&hist, task, peer_uuid, 0.7));
+    ck_assert_ret_ok(tx_history_update(&hist, task, peer_uuid, 0.7, NULL));
     ck_assert_ret_ok(reputations_update(&reps, peer_uuid, 0.8));
 
     double score = reputation_compute(&hist, &reps, self_uuid, peer_uuid, NULL);
@@ -207,8 +207,8 @@ DEFINE_TEST(test_tx_history_eviction)
         uuid_generate(tasks[i]);
         uuid_t cp_peer;
         uuid_generate(cp_peer);
-        ck_assert_ret_ok(tx_history_update(&hist, tasks[i], shared_peer, 0.7));
-        ck_assert_ret_ok(tx_history_update(&hist, tasks[i], cp_peer, 0.3));
+        ck_assert_ret_ok(tx_history_update(&hist, tasks[i], shared_peer, 0.7, NULL));
+        ck_assert_ret_ok(tx_history_update(&hist, tasks[i], cp_peer, 0.3, NULL));
     }
     ck_assert_int_eq(tx_history_len(&hist), MAX_CHAIN_LEN);
 
@@ -251,10 +251,10 @@ DEFINE_TEST(test_tx_history_evicted_task_does_not_reanimate)
     {
         uuid_t cp;
         uuid_generate(cp);
-        ck_assert_ret_ok(tx_history_update(&hist, first_task, cp, 0.7));
+        ck_assert_ret_ok(tx_history_update(&hist, first_task, cp, 0.7, NULL));
         uuid_t cp2;
         uuid_generate(cp2);
-        ck_assert_ret_ok(tx_history_update(&hist, first_task, cp2, 0.3));
+        ck_assert_ret_ok(tx_history_update(&hist, first_task, cp2, 0.3, NULL));
     }
     for (int i = 0; i < MAX_CHAIN_LEN + 1; i++)
     {
@@ -262,8 +262,8 @@ DEFINE_TEST(test_tx_history_evicted_task_does_not_reanimate)
         uuid_generate(tid);
         uuid_generate(p1);
         uuid_generate(p2);
-        ck_assert_ret_ok(tx_history_update(&hist, tid, p1, 0.7));
-        ck_assert_ret_ok(tx_history_update(&hist, tid, p2, 0.3));
+        ck_assert_ret_ok(tx_history_update(&hist, tid, p1, 0.7, NULL));
+        ck_assert_ret_ok(tx_history_update(&hist, tid, p2, 0.3, NULL));
     }
     ck_assert_int_eq(tx_history_len(&hist), MAX_CHAIN_LEN);
     /* first_task should be gone from task_map. */
@@ -277,8 +277,8 @@ DEFINE_TEST(test_tx_history_evicted_task_does_not_reanimate)
     uuid_t late_p1, late_p2;
     uuid_generate(late_p1);
     uuid_generate(late_p2);
-    ck_assert_ret_ok(tx_history_update(&hist, first_task, late_p1, 0.7));
-    ck_assert_ret_ok(tx_history_update(&hist, first_task, late_p2, 0.3));
+    ck_assert_ret_ok(tx_history_update(&hist, first_task, late_p1, 0.7, NULL));
+    ck_assert_ret_ok(tx_history_update(&hist, first_task, late_p2, 0.3, NULL));
     ck_assert_int_eq(tx_history_len(&hist), len_before);
     ck_assert(tx_history_by_task(&hist, first_task, &probe) != 0);
 
@@ -301,8 +301,8 @@ DEFINE_TEST(test_tx_history_hash_links)
         uuid_generate(tid);
         uuid_generate(p1);
         uuid_generate(p2);
-        ck_assert_ret_ok(tx_history_update(&hist, tid, p1, 0.7));
-        ck_assert_ret_ok(tx_history_update(&hist, tid, p2, 0.5));
+        ck_assert_ret_ok(tx_history_update(&hist, tid, p1, 0.7, NULL));
+        ck_assert_ret_ok(tx_history_update(&hist, tid, p2, 0.5, NULL));
     }
     /* Genesis entry chains from the empty digest. */
     ck_assert_int_eq((int)strlen(hist.chain[0].prev_hash), 0);
@@ -328,8 +328,8 @@ DEFINE_TEST(test_tx_history_verify_links_detects_tampering)
         uuid_generate(tid);
         uuid_generate(p1);
         uuid_generate(p2);
-        ck_assert_ret_ok(tx_history_update(&hist, tid, p1, 0.7));
-        ck_assert_ret_ok(tx_history_update(&hist, tid, p2, 0.5));
+        ck_assert_ret_ok(tx_history_update(&hist, tid, p1, 0.7, NULL));
+        ck_assert_ret_ok(tx_history_update(&hist, tid, p2, 0.5, NULL));
     }
     ck_assert(tx_history_verify_links(&hist));
     /* Mutating a committed score changes that entry's hash, breaking the
@@ -353,8 +353,8 @@ DEFINE_TEST(test_tx_history_links_survive_eviction)
         uuid_generate(tid);
         uuid_generate(p1);
         uuid_generate(p2);
-        ck_assert_ret_ok(tx_history_update(&hist, tid, p1, 0.7));
-        ck_assert_ret_ok(tx_history_update(&hist, tid, p2, 0.5));
+        ck_assert_ret_ok(tx_history_update(&hist, tid, p1, 0.7, NULL));
+        ck_assert_ret_ok(tx_history_update(&hist, tid, p2, 0.5, NULL));
     }
     ck_assert_int_eq(tx_history_len(&hist), MAX_CHAIN_LEN);
     ck_assert(tx_history_verify_links(&hist));
@@ -376,8 +376,8 @@ DEFINE_TEST(test_tx_history_catchup_rejects_broken_chain)
         uuid_generate(tid);
         uuid_generate(p1);
         uuid_generate(p2);
-        ck_assert_ret_ok(tx_history_update(&src, tid, p1, 0.7));
-        ck_assert_ret_ok(tx_history_update(&src, tid, p2, 0.5));
+        ck_assert_ret_ok(tx_history_update(&src, tid, p1, 0.7, NULL));
+        ck_assert_ret_ok(tx_history_update(&src, tid, p2, 0.5, NULL));
     }
     json_t *good = NULL;
     ck_assert_ret_ok(tx_history_era_to_json(&src, 0, tx_history_len(&src), &good));
@@ -420,8 +420,8 @@ static void fill_committed(tx_history_t *hist, int n)
         uuid_generate(tid);
         uuid_generate(p1);
         uuid_generate(p2);
-        ck_assert_ret_ok(tx_history_update(hist, tid, p1, 0.7));
-        ck_assert_ret_ok(tx_history_update(hist, tid, p2, 0.5));
+        ck_assert_ret_ok(tx_history_update(hist, tid, p1, 0.7, NULL));
+        ck_assert_ret_ok(tx_history_update(hist, tid, p2, 0.5, NULL));
     }
 }
 
