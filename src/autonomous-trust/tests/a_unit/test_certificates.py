@@ -401,6 +401,21 @@ class TestInventory:
 
 
 class TestScorerWiring:
+    @pytest.fixture(autouse=True)
+    def _zkp_absent(self, monkeypatch):
+        """Pin the ambient ZKP flag so these tests assert the arm they mean.
+
+        ``ZKP_AVAILABLE`` is a fact about the installation, not about the
+        result: with the extension unbuilt a missing proof cannot attest
+        anything and completion is the honest score, while with it built a
+        missing proof is suspicious and scores 0.3 on `certificate`. Every
+        fall-through assertion below means the first, so it says so -- left
+        unpinned they pass only where the Rust extension is absent. Same
+        reason as ``test_probe_verification.py``'s pair.
+        """
+        monkeypatch.setattr(
+            'autonomous_trust.core._python.automate.ZKP_AVAILABLE', False)
+
     @staticmethod
     def _result(capability, value, certificate=None, kwargs=None):
         from autonomous_trust.core.negotiation import TaskResult
