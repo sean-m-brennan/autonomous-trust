@@ -40,6 +40,13 @@ typedef struct {
     uuid_t uuid;
     uuid_t requestor_uuid;
     bool flexible;
+    /** How many participants the requestor expects to hear back from. C twin
+     *  of Python @c TaskInfo.size, and carried rather than assumed because a
+     *  Python requestor's @c handle_results forwards only once
+     *  @c len(results) >= task.size -- and it reads that off the reply the
+     *  worker sends back, not off its own record. 0 (the memset default) and
+     *  1 both mean single-participant; every C-originated task is one. */
+    int size;
     /** Freshness sequence of the INVITATION that carried this task; 0 means
      *  unstamped, which handle_invite refuses. The requestor's monotonic
      *  per-process counter (utilities/freshness.h), checked against the
