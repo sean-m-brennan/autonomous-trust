@@ -1,0 +1,26 @@
+schema_version: "1"
+kind: wire_vector
+protocol: negotiation
+name: negotiation-task-result
+description: |
+    The `report results` payload: Python's __type__-tagged TaskResult, which
+    extends TaskInfo rather than Task and so carries NO `parameters` -- the
+    requestor supplies what it asked from its own record, because reading the
+    challenge back off the reply would verify nothing.
+
+    C used to read `task_uuid` / `result_data` and Python writes `uuid` /
+    `result`, so a Python requestor and a C worker had no key in common here
+    (doc/architecture/negotiation.md). `certificate` is pinned alongside the answer to hold the
+    R+D.md §12.3 split: the answer and the witness that makes it checkable are
+    separate keys, so a reader that does not know the checker still reads the
+    answer.
+
+    `proof` and the `requested_*` trio are pinned at their defaults: Python
+    always serializes them, C never fills them, and one key set for both
+    runtimes is the whole point of the vector.
+byte_pinning: true
+constructor: TaskResult
+input:
+  json_wire: testdata/wire/negotiation-task-result/expected.json
+expected:
+  json_wire: testdata/wire/negotiation-task-result/expected.json

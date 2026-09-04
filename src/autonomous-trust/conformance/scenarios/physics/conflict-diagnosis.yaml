@@ -1,0 +1,155 @@
+schema_version: "1"
+kind: scenario
+protocol: physics
+name: conflict-diagnosis
+byte_pinning: false
+description: |
+    When reports cannot all be true, the diagnosis says WHO — and, more often,
+    says that it cannot say (R+D.md §12.2, consistency-based diagnosis after
+    Reiter 1987 and de Kleer & Williams 1987, with "peer" substituted for
+    "component").
+
+    A conflict is a set of peers who cannot all be reporting honestly; a
+    diagnosis is a minimal hitting set over the conflicts. A peer in EVERY
+    minimal diagnosis is refuted — no consistent story leaves it honest. A peer
+    in SOME is implicated, and lands on `swarm_disagreement` at the baseline
+    channel weight rather than on `physical` at three times it. A peer in none
+    is untouched.
+
+    That distinction is the whole scenario, and it is why this is pinned across
+    runtimes rather than left to each. Scoring every disagreeing peer as
+    refuted would let any peer refute an honest one simply by lying about the
+    same quantity, on the hardest evidence channel AT has.
+
+    What each row pins:
+
+      - Rows 1-2: two peers whose intervals do not intersect. One of them is
+        wrong and the physics does not say which, so the peer in hand is
+        IMPLICATED, not refuted.
+      - Rows 3-5: the case that decides the algorithm. C disagrees with both A
+        and B, who agree with each other. Conflicts {C,A} and {C,B} have
+        minimal diagnoses {C} AND {A,B} — subset-minimal, not
+        cardinality-minimal — so C is in some but not all, and stays
+        IMPLICATED. Preferring the smaller diagnosis would convict the lone
+        outlier whenever two others corroborate each other, which is majority
+        rule wearing physics' clothes; R+D.md §12.8 is explicit that a majority
+        is not an oracle, and three colluding peers would otherwise be able to
+        refute an honest one.
+      - Row 6: a quantity with no declared tolerance is not intersected at all.
+        A zero-width interval would make every distinct float a conflict, and
+        two honest sensors of the same thing would report each other.
+      - Row 7: a stale observation does not conflict. Peers legitimately
+        disagree about a quantity that has moved on, and the window is what
+        keeps that from refuting them.
+      - Rows 8-11: a linear parity relation — the residual form from the
+        aerospace fault-detection tradition, restricted to a signed sum, which
+        is what conservation of mass, energy, momentum and charge all are.
+        1000 - 400 - 600 balances; 1000 - 400 - 100 does not, and the conflict
+        is ALL THREE reporters, so each is only implicated. A violated
+        conservation law does not say which term was the lie.
+      - Rows 12-14: the same relation violated by ONE peer that supplied every
+        term. That is a conflict of size one — the peer contradicted itself —
+        so it is refuted, on `physical`. Nothing about the arithmetic changed;
+        only who was standing behind it.
+      - Rows 15-16: a residual is not evaluated over terms that are missing or
+        stale. Doing so would invent violations out of ordinary change.
+
+    Shape and delivery are as in the sibling scenario `claim-refuted-by-physics`.
+
+participants:
+  - id: requestor
+    role: new_node
+  - id: worker
+    role: peer
+
+fixtures:
+  physics:
+    version: 1
+    window_sec: 60.0
+    quantities:
+      sat.solar-power:
+        capability: sat.solar
+        unit: W
+        min: 0.0
+        max: 2000.0
+        tolerance: 5.0
+      sat.load-power:
+        capability: sat.load
+        unit: W
+        min: 0.0
+        max: 2000.0
+      sat.batt-rate:
+        capability: sat.batt
+        unit: W
+        min: -2000.0
+        max: 2000.0
+      sat.bus-temp:
+        capability: sat.temp
+        unit: degC
+        min: -80.0
+        max: 120.0
+        tolerance: 1.0
+    relations:
+      - name: power-balance
+        terms:
+          sat.solar-power: 1.0
+          sat.load-power: -1.0
+          sat.batt-rate: -1.0
+        constant: 0.0
+        tolerance: 2.0
+        window_sec: 5.0
+  claims:
+    #  1-2 two peers, incompatible intervals: implicated, never refuted
+    - {capability: sat.temp, result: 20.0, subject: A, t: 100.0}
+    - {capability: sat.temp, result: 60.0, subject: B, t: 101.0}
+    #  3-5 a lone outlier against two who agree is STILL only implicated
+    - {capability: sat.temp, result: 20.0, subject: D, t: 200.0}
+    - {capability: sat.temp, result: 20.5, subject: E, t: 201.0}
+    - {capability: sat.temp, result: 90.0, subject: F, t: 202.0}
+    #  6 no declared tolerance: no intersection check at all
+    - {capability: sat.load, result: 400.0,  subject: A, t: 300.0}
+    - {capability: sat.load, result: 1200.0, subject: B, t: 301.0}
+    #  8-11 a parity relation that balances, then one that does not
+    - {capability: sat.solar, result: 1000.0, subject: A, t: 500.0}
+    - {capability: sat.load,  result: 400.0,  subject: B, t: 500.0}
+    - {capability: sat.batt,  result: 600.0,  subject: C, t: 500.0}
+    - {capability: sat.batt,  result: 100.0,  subject: C, t: 501.0}
+    # 12-14 the same violation, every term from ONE peer: refuted
+    - {capability: sat.solar, result: 1000.0, subject: S, t: 600.0}
+    - {capability: sat.load,  result: 400.0,  subject: S, t: 600.0}
+    - {capability: sat.batt,  result: 100.0,  subject: S, t: 600.0}
+    # 15-16 stale terms: the residual is not evaluated
+    - {capability: sat.batt,  result: 100.0,  subject: C, t: 900.0}
+    - {capability: sat.solar, result: 1000.0, subject: A, t: 901.0}
+
+steps:
+  - id: 1
+    from: requestor
+    to: requestor
+    function: check_claims
+    description: |
+        Trigger. The requestor feeds each row of `fixtures.claims` through its
+        own runtime's physical-consistency checker, in order, carrying the
+        observation store from row to row — the store is what makes a conflict
+        visible at all.
+
+expected_state:
+  requestor:
+    claim_verdicts: [none, implicated,
+                     none, none, implicated,
+                     none, none,
+                     none, none, none, implicated,
+                     none, none, refuted,
+                     none, none]
+    claim_scores:   [null, 0.3,
+                     null, null, 0.3,
+                     null, null,
+                     null, null, null, 0.3,
+                     null, null, 0.1,
+                     null, null]
+    claim_channels: [null, swarm_disagreement,
+                     null, null, swarm_disagreement,
+                     null, null,
+                     null, null, null, swarm_disagreement,
+                     null, null, physical,
+                     null, null]

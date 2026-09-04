@@ -1,0 +1,21 @@
+schema_version: "1"
+kind: wire_vector
+protocol: negotiation
+name: negotiation-status-response
+description: |
+    The `status response` payload: Python's __type__-tagged TaskStatus, which
+    subclasses Task and so carries the task's own fields plus `status`.
+
+    The status rides as the `Enumcfg:` member NAME, which is what
+    config_json_decoder rebuilds the enum from. Pinned for two reasons beyond
+    the shape: C used to send `status` as an INTEGER (its own neg_status_t),
+    which Python would have read as a plain int; and `Status` was not in
+    Python's `_ALLOWED_ENUM_TYPES`, so decoding this verb raised ValueError in
+    the receiver -- Python-to-Python as much as cross-runtime. See
+    doc/architecture/negotiation.md.
+byte_pinning: true
+constructor: TaskStatus
+input:
+  json_wire: testdata/wire/negotiation-status-response/expected.json
+expected:
+  json_wire: testdata/wire/negotiation-status-response/expected.json

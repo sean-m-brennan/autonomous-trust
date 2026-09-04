@@ -1,0 +1,198 @@
+schema_version: "1"
+kind: scenario
+protocol: calibration
+name: coverage-audit
+byte_pinning: false
+description: |
+    A peer that emits prediction sets is audited on whether they cover as
+    often as it claims (R+D.md §12.4; doc/verification_oracle.md layer 3;
+    doc/architecture/calibration-audit.md).
+
+    Why this has to agree across runtimes. Both grade the same peers off the
+    same `calibration.json`, and the whole point of the layer is to catch the
+    peer that is usually right and systematically overconfident — the one an
+    averaged reputation cannot see coming. A peer one runtime rejects and the
+    other clears would make that judgment depend on which implementation
+    happened to be asking.
+
+    What each row pins:
+
+      - Rows 1-2: the layer is OPT-IN. An undeclared capability yields no
+        verdict; a declared one that attaches no set yields 0.3 on
+        `calibration` — declared predictive and produced nothing, the mirror
+        of the certificate layer's "declared to certify and did not". It is a
+        fact about the claim, not evidence of dishonesty, which is why it is
+        not the 0.1 an over-claim earns.
+      - Rows 3-5: a set has to be usable before it can be audited. A coverage
+        outside the declared band, an inverted interval and mismatched arities
+        are all 0.3. The band matters: without a floor a peer passes forever
+        by advertising 0.01, since sets that need never contain anything are
+        trivially well calibrated.
+      - Rows 6-21: an HONEST peer. Ten predictions, each resolved by another
+        peer's report through the physics-declared path, every one covered.
+        Under min_samples the audit is SILENT rather than lenient — that is
+        the finite-sample validity the exact test buys, and reporting "no
+        verdict" is the honest answer when eight resolutions is all there is.
+        At and past the threshold it is still silent, because covering as
+        advertised earns nothing here. Falsification only.
+      - Rows 22-41: an OVERCONFIDENT peer. Same claim of 0.9, half the sets
+        miss. Silent until the eighth resolution, then 0.1 on `calibration`.
+        With four hits in eight the exact tail is 0.005, well inside the 0.05
+        the declaration allows, so the verdict does not turn on a last-ulp
+        difference between the runtimes.
+      - Rows 42-44: an OVER-CAUTIOUS peer, whose sets cover every time against
+        a claim of 0.9, is NOT penalised. The test is one-sided on purpose:
+        its sets are useless and that is a competence problem, but it is not
+        dishonest about its own limits, and separating those two is the entire
+        reason this layer exists.
+      - Rows 45-47: a peer's own report never settles its own prediction. The
+        report lands, the prediction stays outstanding, and the record does not
+        grow — otherwise the peer supplies the truth it is audited against and
+        the layer is self-graded.
+      - Rows 48-50: the EXPLICIT resolution path, for a truth that never
+        arrives as a task result. Same effect on the record as a peer's report.
+      - Rows 51-53: a prediction that outlives its horizon is DROPPED, not
+        counted as a miss. Nothing was observed, so there is no evidence
+        either way, and counting silence against a peer would let a quiet
+        sensor convict it.
+      - Rows 54-56: a vector set is a box — membership is componentwise, and a
+        miss on any component is a miss.
+
+    Shape. Non-message-driven, like the physics and bootstrap scenarios: each
+    adapter loads `fixtures.calibration` (and `fixtures.physics`, for the
+    reporting capability -> quantity link) into its own runtime's auditor and
+    replays `fixtures.events` in order. A `predict` event asserts the verdict,
+    the score and the channel; `null` for both is the no-verdict case. The two
+    runtimes cannot share a call site — Python audits from its main process,
+    C from its negotiation process — so what is pinned is the rules.
+
+    `t` is supplied by the fixture rather than read from a clock, so a replay
+    produces the verdicts the live path did.
+
+participants:
+  - id: requestor
+    role: new_node
+  - id: worker
+    role: peer
+
+fixtures:
+  physics:
+    version: 1
+    quantities:
+      sat.bus-temp:
+        capability: sat.temp
+        unit: degC
+        min: -80.0
+        max: 120.0
+      sat.position:
+        capability: sat.pos
+        unit: m
+        components: 3
+  calibration:
+    version: 1
+    min_samples: 8
+    audit_alpha: 0.05
+    max_outcomes: 64
+    max_outstanding: 32
+    horizon_sec: 100.0
+    capabilities:
+      fc.temp:
+        quantity: sat.bus-temp
+        min_coverage: 0.5
+        max_coverage: 0.999
+      fc.pos:
+        quantity: sat.position
+        min_coverage: 0.5
+      fc.brief:
+        quantity: sat.bus-temp
+        horizon_sec: 2.0
+
+  events:
+    #  1 undeclared capability: no declaration, no verdict
+    - {predict: {capability: other.thing, coverage: 0.9, lo: [0.0], hi: [1.0]}, subject: A, t: 0.0, score: null, channel: null}
+    #  2 declared predictive, nothing attached
+    - {predict: {capability: fc.temp}, subject: A, t: 0.0, score: 0.3, channel: calibration}
+    #  3 coverage under the declared floor
+    - {predict: {capability: fc.temp, coverage: 0.01, lo: [0.0], hi: [1.0]}, subject: A, t: 0.0, score: 0.3, channel: calibration}
+    #  4 inverted interval
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [5.0], hi: [1.0]},  subject: A, t: 0.0, score: 0.3, channel: calibration}
+    #  5 mismatched arities
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [1.0, 2.0], hi: [5.0]}, subject: A, t: 0.0, score: 0.3, channel: calibration}
+
+    #  6-21 an honest peer: ten covered predictions, resolved by another peer
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [18.0], hi: [24.0]}, subject: H, t: 1.0, score: null, channel: null}
+    - {report: {capability: sat.temp, result: 21.0}, subject: R, t: 1.5}
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [18.0], hi: [24.0]}, subject: H, t: 2.0, score: null, channel: null}
+    - {report: {capability: sat.temp, result: 21.0}, subject: R, t: 2.5}
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [18.0], hi: [24.0]}, subject: H, t: 3.0, score: null, channel: null}
+    - {report: {capability: sat.temp, result: 21.0}, subject: R, t: 3.5}
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [18.0], hi: [24.0]}, subject: H, t: 4.0, score: null, channel: null}
+    - {report: {capability: sat.temp, result: 21.0}, subject: R, t: 4.5}
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [18.0], hi: [24.0]}, subject: H, t: 5.0, score: null, channel: null}
+    - {report: {capability: sat.temp, result: 21.0}, subject: R, t: 5.5}
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [18.0], hi: [24.0]}, subject: H, t: 6.0, score: null, channel: null}
+    - {report: {capability: sat.temp, result: 21.0}, subject: R, t: 6.5}
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [18.0], hi: [24.0]}, subject: H, t: 7.0, score: null, channel: null}
+    - {report: {capability: sat.temp, result: 21.0}, subject: R, t: 7.5}
+    # the eighth resolution lands here; the next predict is the first the
+    # audit could speak on, and it stays silent because the peer is honest
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [18.0], hi: [24.0]}, subject: H, t: 8.0, score: null, channel: null}
+    - {report: {capability: sat.temp, result: 21.0}, subject: R, t: 8.5}
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [18.0], hi: [24.0]}, subject: H, t: 9.0, score: null, channel: null}
+
+    # 22-41 an overconfident peer: same claim, every other set misses
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [18.0], hi: [24.0]}, subject: B, t: 10.0, score: null, channel: null}
+    - {report: {capability: sat.temp, result: 21.0}, subject: R, t: 10.5}
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [18.0], hi: [24.0]}, subject: B, t: 11.0, score: null, channel: null}
+    - {report: {capability: sat.temp, result: 90.0}, subject: R, t: 11.5}
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [18.0], hi: [24.0]}, subject: B, t: 12.0, score: null, channel: null}
+    - {report: {capability: sat.temp, result: 21.0}, subject: R, t: 12.5}
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [18.0], hi: [24.0]}, subject: B, t: 13.0, score: null, channel: null}
+    - {report: {capability: sat.temp, result: 90.0}, subject: R, t: 13.5}
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [18.0], hi: [24.0]}, subject: B, t: 14.0, score: null, channel: null}
+    - {report: {capability: sat.temp, result: 21.0}, subject: R, t: 14.5}
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [18.0], hi: [24.0]}, subject: B, t: 15.0, score: null, channel: null}
+    - {report: {capability: sat.temp, result: 90.0}, subject: R, t: 15.5}
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [18.0], hi: [24.0]}, subject: B, t: 16.0, score: null, channel: null}
+    - {report: {capability: sat.temp, result: 21.0}, subject: R, t: 16.5}
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [18.0], hi: [24.0]}, subject: B, t: 17.0, score: null, channel: null}
+    - {report: {capability: sat.temp, result: 90.0}, subject: R, t: 17.5}
+    # eight resolved, four covered: the exact tail is 0.005, so this rejects
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [18.0], hi: [24.0]}, subject: B, t: 18.0, score: 0.1, channel: calibration}
+
+    # 42-44 over-cautious: covers every time, claims 0.9, and is left alone
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [-50.0], hi: [110.0]}, subject: C, t: 19.0, score: null, channel: null}
+    - {report: {capability: sat.temp, result: 21.0}, subject: R, t: 19.5}
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [-50.0], hi: [110.0]}, subject: C, t: 20.0, score: null, channel: null}
+
+    # 45-47 a peer's own report does not settle its own prediction
+    - {predict: {capability: fc.temp, coverage: 0.9, lo: [18.0], hi: [24.0]}, subject: S, t: 21.0, score: null, channel: null}
+    - {report: {capability: sat.temp, result: 21.0}, subject: S, t: 21.5}
+    - {outstanding: {quantity: sat.bus-temp, count: 1}}
+
+    # 48-50 the explicit resolution path settles it instead
+    - {resolve: {quantity: sat.bus-temp, value: 21.0}, t: 22.0}
+    - {outstanding: {quantity: sat.bus-temp, count: 0}}
+    - {outcomes: {subject: S, capability: fc.temp, count: 1, hits: 1}}
+
+    # 51-53 a prediction past its horizon is dropped, not counted as a miss
+    - {predict: {capability: fc.brief, coverage: 0.9, lo: [18.0], hi: [24.0]}, subject: E, t: 23.0, score: null, channel: null}
+    - {resolve: {quantity: sat.bus-temp, value: 90.0}, t: 40.0}
+    - {outcomes: {subject: E, capability: fc.brief, count: 0, hits: 0}}
+
+    # 54-56 a vector set is a box: componentwise, and any component misses
+    - {predict: {capability: fc.pos, coverage: 0.9, lo: [0.0, 0.0, 0.0], hi: [10.0, 10.0, 10.0]}, subject: V, t: 41.0, score: null, channel: null}
+    - {resolve: {quantity: sat.position, value: [5.0, 5.0, 50.0]}, t: 41.5}
+    - {outcomes: {subject: V, capability: fc.pos, count: 1, hits: 0}}
+
+steps:
+  - id: 1
+    from: requestor
+    to: requestor
+    function: replay_events
+    description: |
+        Trigger. The requestor replays each row of `fixtures.events` through
+        its own runtime's coverage auditor, in order, carrying the
+        outstanding-prediction and outcome stores from row to row. A `predict`
+        row asserts the verdict it produced; `outstanding` and `outcomes` rows
+        assert store state that no single verdict makes visible.

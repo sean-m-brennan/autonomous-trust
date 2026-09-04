@@ -16,6 +16,9 @@ Technical architecture documentation for the AutonomousTrust cooperative computi
 - [Gateway Reputation Tree](gateway-reputation-tree.md): Multi-group membership and recursive subtree reputation
 - [Reputation vs. Blockchain Analysis](reputation-vs-blockchain-analysis.md) (Hash-linking, Merkle checkpoints, and slashing
 - [Trust Tiers](trust-tiers.md)) Tiered capabilities, weighted transactions, bootstrap corpus, tier-gated access
+- [Physical Consistency](physical-consistency.md) (Refuting a peer's claim on dimensions, bounds, kinematics and conservation, before any reputation math runs
+- [Certificate-Carrying Interfaces](certificate-interfaces.md)) Answers that arrive with a witness: duals, DRAT refutations, potentials and cuts, checked exactly
+- [Calibration Audit](calibration-audit.md) (Auditing whether a peer's prediction sets cover as often as it claims: the overconfident peer an averaged reputation cannot see coming
 - [Node Lifecycle](node-lifecycle.md) (Startup phases and state transitions
 - [Partition Recovery](partition-recovery.md)) Split-brain detection, probe/response, and group merge
 - [Cohort Clock Skew](cohort-clock-skew.md) (Measuring peer clock disagreement, and why peer reference clocks stay unbuilt

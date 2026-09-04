@@ -468,6 +468,14 @@ set(libsrc
     autonomous_trust/network/network.c
     autonomous_trust/bootstrap/bootstrap_capabilities.c
     autonomous_trust/bootstrap/bootstrap_worker.c
+    autonomous_trust/certificates/certificates.c
+    autonomous_trust/certificates/checkers.c
+    autonomous_trust/certificates/drat.c
+    autonomous_trust/certificates/rng.c
+    autonomous_trust/calibration/calibration.c
+    autonomous_trust/calibration/conformal.c
+    autonomous_trust/physics/physics.c
+    autonomous_trust/physics/units.c
     autonomous_trust/processes/capabilities.c
     autonomous_trust/processes/daemonize.c
     autonomous_trust/processes/process_tracker.c
@@ -985,6 +993,18 @@ add_executable(bootstrap_worker_test test/bootstrap_worker_test.c)
 set_source_files_properties(test/bootstrap_worker_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(bootstrap_worker_test PRIVATE ${AT_TEST_LIBS})
 
+add_executable(physics_test test/physics_test.c)
+set_source_files_properties(test/physics_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(physics_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(calibration_test test/calibration_test.c)
+set_source_files_properties(test/calibration_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(calibration_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(certificates_test test/certificates_test.c)
+set_source_files_properties(test/certificates_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(certificates_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(net_message_test test/net_message_test.c)
 set_source_files_properties(test/net_message_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(net_message_test PRIVATE ${AT_TEST_LIBS})
@@ -1147,6 +1167,9 @@ add_test(NAME dag_test COMMAND $<TARGET_FILE:dag_test>)
 add_test(NAME agreement_test COMMAND $<TARGET_FILE:agreement_test>)
 add_test(NAME bootstrap_capabilities_test COMMAND $<TARGET_FILE:bootstrap_capabilities_test>)
 add_test(NAME bootstrap_worker_test COMMAND $<TARGET_FILE:bootstrap_worker_test>)
+add_test(NAME physics_test COMMAND $<TARGET_FILE:physics_test>)
+add_test(NAME calibration_test COMMAND $<TARGET_FILE:calibration_test>)
+add_test(NAME certificates_test COMMAND $<TARGET_FILE:certificates_test>)
 add_test(NAME net_message_test COMMAND $<TARGET_FILE:net_message_test>)
 add_test(NAME socket_helpers_test COMMAND $<TARGET_FILE:socket_helpers_test>)
 add_test(NAME at_jansson_test COMMAND $<TARGET_FILE:at_jansson_test>)

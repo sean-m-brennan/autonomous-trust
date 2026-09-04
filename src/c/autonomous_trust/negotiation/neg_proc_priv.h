@@ -130,12 +130,81 @@ int negotiation_get_task_flood_count(const uuid_t uuid);
  *  wrong) and reports the `probe` channel; anything else is scored on
  *  completion (0.8 with a result, 0.3 without) and reports `task_outcome`.
  *
+ *  Between those two, physical consistency (R+D.md §12.2): a claim that is
+ *  impossible, or that no consistent story leaves honest, reports `physical`
+ *  (0.1); a peer implicated by a conflict that does not name it uniquely
+ *  reports `swarm_disagreement` (0.3). The layer speaks only to refute, so a
+ *  claim it has nothing to say about falls through to the completion arm.
+ *  @p subject is the peer the observation is filed under -- NULL for a fan-out,
+ *  which runs only the checks needing no identity -- and @p now is monotonic
+ *  seconds, a parameter rather than a clock read so a replay produces the
+ *  verdicts the live path did.
+ *
+ *  Then the coverage audit (R+D.md §12.4): @p prediction_json is the peer's
+ *  attached prediction set and claimed coverage, judged against the record of
+ *  its OWN previously resolved predictions — `calibration` at 0.1 for a
+ *  coverage claim the exact test rejects, 0.3 for a capability declared
+ *  predictive that produced no usable set. Falsification only; a peer that has
+ *  not been caught over-claiming earns nothing here.
+ *
+ *  Then certificate-carrying interfaces (R+D.md §12.3): @p certificate_json is
+ *  the witness the peer attached, checked against the problem in
+ *  @p kwargs_json -- OUR record, never the peer's account of it -- to give
+ *  `certificate` at 0.9 (proved right), 0.1 (proved wrong) or 0.3 (declared to
+ *  certify and did not). @p seed is this verifier's challenge for the one
+ *  probabilistic checker and must not be derivable from the problem; see
+ *  certificates/rng.h.
+ *
  *  Exported so tests and the conformance adapter exercise the same function
  *  production does. @p channel_out may be NULL. */
 double negotiation_score_task_result(const char *cap_name,
                                      const char *kwargs_json,
                                      const char *result_str, size_t result_len,
+                                     const char *certificate_json,
+                                     const char *prediction_json,
+                                     const char *subject, double now,
+                                     uint64_t seed,
                                      const char **channel_out);
+
+/** Python type tags carried by every negotiation payload (doc/architecture/negotiation.md).
+ *
+ *  Shared constants rather than language artifacts -- the same argument that
+ *  keeps the wire protocol strings byte-identical to Python's enum values.
+ *  Declared here, not inside neg_proc.c, so the conformance adapter builds its
+ *  inbound payloads from the SAME tags the serializer emits: a mirrored copy is
+ *  a copy that can drift, and a drifted adapter is exactly how the two
+ *  runtimes' payload shapes stayed divergent through a green corpus.
+ *  @{ */
+#define PY_NEG_MOD          "autonomous_trust.core._python.negotiation.negotiation."
+#define PY_TYPE_TASK        PY_NEG_MOD "Task"
+#define PY_TYPE_TASK_STATUS PY_NEG_MOD "TaskStatus"
+#define PY_TYPE_TASK_RESULT PY_NEG_MOD "TaskResult"
+#define PY_TYPE_TASK_PARAMS PY_NEG_MOD "TaskParameters"
+#define PY_TYPE_CAPABILITY  "autonomous_trust.core._python.capabilities.Capability"
+#define PY_ENUM_STATUS      "Enumcfg:" PY_NEG_MOD "Status"
+/** @} */
+
+/** @brief Parse a negotiation payload and re-emit it, for the corpus's
+ *         byte-pinned payload-shape vectors.
+ *
+ *  Negotiation payloads are Python's `__type__`-tagged Configuration dump,
+ *  except `requestor`, which is the flat DRY canonical PUBLIC identity
+ *  (doc/architecture/negotiation.md). The corpus pins that shape by round-tripping ONE fixture
+ *  through both runtimes: parse the pinned bytes, re-emit, compare. Neither
+ *  side can then drift without failing, which is exactly what the
+ *  envelope-only pinning allowed for months.
+ *
+ *  @param verb      NEG_PROTO_RESULT for a TaskResult, NEG_PROTO_STAT_RSP for
+ *                   a TaskStatus, anything else for a Task.
+ *  @param in_json   The payload to parse.
+ *  @param requestor Identity the re-emitted `requestor` field is built from;
+ *                   production resolves it from the peer table instead.
+ *  @param out_json  Receives a compact, key-sorted dump. Caller frees.
+ *  @return 0, or EINVAL / ENOMEM.
+ */
+int negotiation_payload_roundtrip(const char *verb, const char *in_json,
+                                  const public_identity_t *requestor,
+                                  char **out_json);
 
 #define ENEG_NOPEERS 243
 DECLARE_ERROR(ENEG_NOPEERS, "No capable peers available");

@@ -34,6 +34,9 @@ from ..common.scenario_loader import Case, discover
 
 from .adapters.agreement import AgreementAdapter
 from .adapters.bootstrap import BootstrapAdapter
+from .adapters.physics import PhysicsAdapter
+from .adapters.calibration import CalibrationAdapter
+from .adapters.certificate import CertificateAdapter
 from .adapters.identity import IdentityAdapter
 from .adapters.negotiation import NegotiationAdapter
 from .adapters.network import NetworkAdapter
@@ -98,6 +101,9 @@ def _adapters() -> dict[str, Any]:
         'negotiation': NegotiationAdapter(corpus_root=CORPUS_ROOT),
         'reputation': ReputationAdapter(corpus_root=CORPUS_ROOT),
         'bootstrap': BootstrapAdapter(corpus_root=CORPUS_ROOT),
+        'physics': PhysicsAdapter(corpus_root=CORPUS_ROOT),
+        'certificate': CertificateAdapter(corpus_root=CORPUS_ROOT),
+        'calibration': CalibrationAdapter(corpus_root=CORPUS_ROOT),
     }
 
 
