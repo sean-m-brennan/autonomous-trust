@@ -137,9 +137,14 @@ static bool _score_results(json_t *data, json_t *rows,
         }
 
         const char *channel = NULL;
+        /* No subject and t=0: this scenario scores REPLIES, and the physical
+         * layer (R+D.md §12.2) is inert here anyway because no physics.json is
+         * configured. Passing NULL keeps that explicit rather than resting on
+         * the empty model -- see the `physics` protocol for its own vectors. */
         double score = negotiation_score_task_result(
             cap, kwargs_json, result_str,
-            (result_str != NULL) ? strlen(result_str) : 0, &channel);
+            (result_str != NULL) ? strlen(result_str) : 0,
+            NULL, NULL, NULL, 0.0, 0, &channel);
 
         if (json_is_array(want_scores)) {
             json_t *w = json_array_get(want_scores, i);

@@ -478,58 +478,6 @@ static int assert_byte_pin_proto_hex(json_t *case_data, const uint8_t *wire,
     return rc;
 }
 
-static int assert_byte_pin_json(json_t *case_data, const char *emitted_json,
-                                const char *label, char *err, size_t err_len) {
-    json_t *bp = json_object_get(case_data, "byte_pinning");
-    if (!json_is_true(bp)) return 0;
-
-    json_t *expected = json_object_get(case_data, "expected");
-    json_t *jwire = expected ? json_object_get(expected, "json_wire") : NULL;
-    if (!json_is_string(jwire)) {
-        snprintf(err, err_len, "%s: byte_pinning=true but expected.json_wire missing",
-                 label);
-        return -1;
-    }
-
-    char *expected_bytes = NULL;
-    size_t expected_len = 0;
-    if (at_load_testdata_bytes(json_string_value(jwire),
-                               &expected_bytes, &expected_len) != 0) {
-        snprintf(err, err_len, "%s: cannot load fixture %s",
-                 label, json_string_value(jwire));
-        return -1;
-    }
-
-    char *emit_canon = NULL, *exp_canon = NULL;
-    size_t emit_canon_len = 0, exp_canon_len = 0;
-    int rc = -1;
-    if (jcs_canonicalize(emitted_json, strlen(emitted_json),
-                         &emit_canon, &emit_canon_len) != 0) {
-        snprintf(err, err_len, "%s: canonicalize(emitted) failed", label);
-        goto out;
-    }
-    if (jcs_canonicalize(expected_bytes, expected_len,
-                         &exp_canon, &exp_canon_len) != 0) {
-        snprintf(err, err_len, "%s: canonicalize(expected) failed", label);
-        goto out;
-    }
-    if (emit_canon_len != exp_canon_len ||
-        memcmp(emit_canon, exp_canon, emit_canon_len) != 0) {
-        snprintf(err, err_len,
-                 "%s: wire bytes diverge from pinned fixture %s\n"
-                 "  expected: %.*s\n  actual:   %.*s",
-                 label, json_string_value(jwire),
-                 (int)exp_canon_len, exp_canon,
-                 (int)emit_canon_len, emit_canon);
-        goto out;
-    }
-    rc = 0;
-out:
-    free(emit_canon);
-    free(exp_canon);
-    free(expected_bytes);
-    return rc;
-}
 
 /* Build the JSON form the Python adapter emits for an AgreementProof
  * under SerializeMode.PROTO + WireFormat.JSON: protobuf-JSON mapping with
@@ -698,7 +646,7 @@ static int run_wv_agreement_proof(json_t *case_data, json_t *input,
         snprintf(err, err_len, "wv/agreement_proof: json emit failed");
         goto cleanup_restored;
     }
-    int bp_rc = assert_byte_pin_json(case_data, emitted, "wv/agreement_proof",
+    int bp_rc = at_byte_pin_json(case_data, emitted, "wv/agreement_proof",
                                      err, err_len);
     free(emitted);
     if (bp_rc != 0) goto cleanup_restored;
@@ -772,7 +720,7 @@ static int run_wv_signature_byte_pin(json_t *case_data, json_t *input,
         snprintf(err, err_len, "wv/signature: json_dumps failed");
         return -1;
     }
-    int bp_rc = assert_byte_pin_json(case_data, emitted, "wv/signature",
+    int bp_rc = at_byte_pin_json(case_data, emitted, "wv/signature",
                                      err, err_len);
     free(emitted);
     return bp_rc;
@@ -941,7 +889,7 @@ static int run_wv_message_envelope(json_t *case_data, json_t *input,
      * difference between the runtimes is exactly what this pins. */
     int bp_rc = (fmt == NET_WIRE_PROTO)
         ? assert_byte_pin_proto_hex(case_data, wire, wire_len, "wv/message", err, err_len)
-        : assert_byte_pin_json(case_data, (const char *)wire, "wv/message", err, err_len);
+        : at_byte_pin_json(case_data, (const char *)wire, "wv/message", err, err_len);
     if (bp_rc != 0) goto cleanup;
 
     rc = 0;

@@ -52,6 +52,8 @@
 #include "../negative_runner.h"
 
 #include "../scenario_engine.h"
+#include "../scenario_loader.h"  /* at_byte_pin_json, at_load_testdata_bytes */
+#include "identity/identity_priv.h"  /* public_identity_from_json */
 
 /* ------------------------------------------------------------------------- */
 /* Per-participant impl carries a process_t plus the identity used to        */
@@ -278,38 +280,36 @@ static void _apply_fixtures(sce_run_ctx_t *ctx)
 /* Inbound construction                                                       */
 /* ------------------------------------------------------------------------- */
 
+/* Build the inbound payload in the form BOTH runtimes now read: Python's
+ * __type__-tagged Task / TaskStatus / TaskResult, with `requestor` as the flat
+ * DRY canonical PUBLIC identity (doc/architecture/negotiation.md).
+ *
+ * @p py_type picks the form. PY_TYPE_TASK_RESULT carries no `parameters` (a
+ * TaskResult extends TaskInfo, not Task) and carries the answer instead.
+ *
+ * The tags come from neg_proc_priv.h rather than being spelled out here: this
+ * builder mirroring the serializer by hand is precisely how the two shapes
+ * drifted apart while every case passed. */
 static json_t *_build_task_json(json_t *payload, const uuid_t task_uuid,
-                                const uuid_t requestor_uuid,
-                                bool include_full)
+                                const public_identity_t *requestor,
+                                const char *py_type)
 {
     json_t *j = json_object();
     if (j == NULL) return NULL;
 
+    json_object_set_new(j, "__type__", json_string(py_type));
+
     char uuid_buf[UUID_STRING_LEN + 1];
     uuid_unparse_lower(task_uuid, uuid_buf);
-    json_object_set_new(j, "task_uuid", json_string(uuid_buf));
-    if (!include_full) return j;
+    json_object_set_new(j, "uuid",
+                        json_pack("{s:s, s:s}", "__type__", "UUID",
+                                  "__value__", uuid_buf));
 
-    uuid_unparse_lower(requestor_uuid, uuid_buf);
-    json_object_set_new(j, "requestor_uuid", json_string(uuid_buf));
+    json_t *req_j = NULL;
+    if (requestor != NULL && public_identity_to_json(requestor, &req_j) == 0)
+        json_object_set_new(j, "requestor", req_j);
 
-    const char *cap_name = "noop";
-    json_t *cap_j = json_object_get(payload, "capability");
-    if (json_is_string(cap_j)) cap_name = json_string_value(cap_j);
-    json_object_set_new(j, "capability_name", json_string(cap_name));
-
-    bool flexible = true;
-    json_t *flex_j = json_object_get(payload, "flexible");
-    if (json_is_boolean(flex_j)) flexible = json_boolean_value(flex_j);
-    json_object_set_new(j, "flexible", json_boolean(flexible));
-
-    json_object_set_new(j, "timeout", json_integer(0));
-
-    /* when_sec / duration_sec: pin a stable time so handle_invite's
-     * schedule check is deterministic. when=now, duration=60s is plenty
-     * to avoid spurious haggling on a fresh task_stack. */
-    json_object_set_new(j, "when_sec", json_integer((json_int_t)time(NULL)));
-    json_object_set_new(j, "duration_sec", json_integer(60));
+    json_object_set_new(j, "size", json_integer(1));
 
     /* Freshness sequence for the invitation (task_t.seq; field 12 of
      * negotiation/task.proto). Defaults to 1 so existing single-invite
@@ -329,6 +329,66 @@ static json_t *_build_task_json(json_t *payload, const uuid_t task_uuid,
         if (json_is_integer(seq_j)) seq = json_integer_value(seq_j);
     }
     json_object_set_new(j, "seq", json_integer(seq));
+
+    if (strcmp(py_type, PY_TYPE_TASK_RESULT) == 0)
+    {
+        /* Mirrors the Python adapter's
+         * `TaskResult(task=base_task, result=payload.get('result'))`. */
+        json_t *res_j = json_object_get(payload, "result");
+        json_object_set_new(j, "result",
+                            res_j != NULL ? json_incref(res_j) : json_null());
+        json_object_set_new(j, "certificate", json_null());
+        json_object_set_new(j, "proof", json_null());
+        json_object_set_new(j, "requested_capability_name", json_null());
+        json_object_set_new(j, "requested_args", json_array());
+        json_object_set_new(j, "requested_kwargs", json_object());
+        return j;
+    }
+
+    json_t *params = json_object();
+    if (params == NULL) { json_decref(j); return NULL; }
+    json_object_set_new(params, "__type__", json_string(PY_TYPE_TASK_PARAMS));
+
+    const char *cap_name = "noop";
+    json_t *cap_j = json_object_get(payload, "capability");
+    if (json_is_string(cap_j)) cap_name = json_string_value(cap_j);
+    json_object_set_new(params, "_capability",
+                        json_pack("{s:s, s:s, s:i, s:i}",
+                                  "__type__", PY_TYPE_CAPABILITY,
+                                  "name", cap_name,
+                                  "required_tier", 0,
+                                  "transaction_weight", 1));
+
+    bool flexible = true;
+    json_t *flex_j = json_object_get(payload, "flexible");
+    if (json_is_boolean(flex_j)) flexible = json_boolean_value(flex_j);
+    json_object_set_new(params, "_flexible", json_boolean(flexible));
+
+    /* when / duration / timeout: pin a stable time so handle_invite's schedule
+     * check is deterministic. when=now, duration=60s is plenty to avoid
+     * spurious haggling on a fresh task_stack — the values the C scenarios
+     * have always used, kept because they are behavioural fixtures; the wire
+     * SHAPE is pinned by vectors/wire/negotiation-*, not by these. */
+    time_t now_sec = time(NULL);
+    struct tm tm_utc;
+    gmtime_r(&now_sec, &tm_utc);
+    char when_buf[64] = {0};
+    snprintf(when_buf, sizeof(when_buf),
+             "%04d-%02d-%02dT%02d:%02d:%02d+00:00",
+             tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday,
+             tm_utc.tm_hour, tm_utc.tm_min, tm_utc.tm_sec);
+    json_object_set_new(params, "when",
+                        json_pack("{s:s, s:s}", "__type__", "datetime",
+                                  "__value__", when_buf));
+    json_object_set_new(params, "duration",
+                        json_pack("{s:s, s:f}", "__type__", "timedelta",
+                                  "__value__", 60.0));
+    json_object_set_new(params, "timeout",
+                        json_pack("{s:s, s:f}", "__type__", "timedelta",
+                                  "__value__", 0.0));
+    json_object_set_new(params, "args", json_array());
+    json_object_set_new(params, "kwargs", json_object());
+    json_object_set_new(j, "parameters", params);
     return j;
 }
 
@@ -371,46 +431,50 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     bool requestor_is_sender = (strcmp(function, "invitation") == 0
                                 || strcmp(function, "status request") == 0
                                 || strcmp(function, "spawn task") == 0);
-    const uuid_t *requestor_uuid;
+    const public_identity_t *requestor;
     if (requestor_is_sender || recipient_impl == NULL)
-        requestor_uuid = (const uuid_t *)&sender_impl->pub->uuid;
+        requestor = sender_impl->pub;
     else
-        requestor_uuid = (const uuid_t *)&recipient_impl->pub->uuid;
+        requestor = recipient_impl->pub;
 
     /* Build the JSON payload appropriate to each handler. */
     json_t *body = NULL;
     if (strcmp(function, "invitation") == 0
         || strcmp(function, "haggle") == 0
-        || strcmp(function, "spawn task") == 0)
+        || strcmp(function, "spawn task") == 0
+        || strcmp(function, "ack") == 0
+        || strcmp(function, "nack") == 0
+        || strcmp(function, "status request") == 0)
     {
-        body = _build_task_json(payload, task_uuid, *requestor_uuid, true);
-    }
-    else if (strcmp(function, "ack") == 0
-             || strcmp(function, "nack") == 0
-             || strcmp(function, "status request") == 0)
-    {
-        body = _build_task_json(payload, task_uuid, *requestor_uuid, false);
+        /* Every one of these verbs carries a whole serialized Task in
+         * production, on both sides -- a bare uuid was C's own shortcut and
+         * Python's handlers read `message.obj.uuid` off a reconstructed
+         * Task. */
+        body = _build_task_json(payload, task_uuid, requestor, PY_TYPE_TASK);
     }
     else if (strcmp(function, "status response") == 0)
     {
-        body = _build_task_json(payload, task_uuid, *requestor_uuid, false);
+        body = _build_task_json(payload, task_uuid, requestor,
+                                PY_TYPE_TASK_STATUS);
         if (body)
         {
-            /* status enum: harness uses 'pending', 'running', etc.; the
-             * C handle_stat_resp reads the integer so map common
-             * strings. NEG_RUNNING == 1 in neg_status_t per neg_proc.c. */
+            /* The `Enumcfg:` member NAME, which is what Python's decoder
+             * rebuilds the enum from. C used to send its own neg_status_t
+             * integer here, which Python would have read as a plain int.
+             * Mirrors the Python adapter's Status[payload['status']]. */
             const char *st = "running";
             json_t *st_j = json_object_get(payload, "status");
             if (json_is_string(st_j)) st = json_string_value(st_j);
-            int status_int = 0; /* unknown */
-            if (strcmp(st, "running") == 0 || strcmp(st, "pending") == 0)
-                status_int = 1;
-            json_object_set_new(body, "status", json_integer(status_int));
+            json_object_set_new(body, "status",
+                                json_pack("{s:s, s:s}",
+                                          "__type__", PY_ENUM_STATUS,
+                                          "__value__", st));
         }
     }
     else if (strcmp(function, "report results") == 0)
     {
-        body = _build_task_json(payload, task_uuid, *requestor_uuid, false);
+        body = _build_task_json(payload, task_uuid, requestor,
+                                PY_TYPE_TASK_RESULT);
     }
     else if (strcmp(function, "tier_lost") == 0)
     {
@@ -636,6 +700,89 @@ static int _negotiation_check_expected_state(sce_run_ctx_t *ctx)
     return 0;
 }
 
+
+/* ------------------------------------------------------------------------- */
+/* Wire vectors: byte-pin the PAYLOAD shape (doc/architecture/negotiation.md)                  */
+/* ------------------------------------------------------------------------- */
+
+/* Round-trip the pinned fixture through this runtime's payload serializer and
+ * require the result to canonicalize back to the fixture.
+ *
+ * The fixture is BOTH the input and the expectation, and the SAME file feeds
+ * the Python adapter. That is the point: envelope-only pinning let C and
+ * Python carry mutually unreadable negotiation payloads through 198 green
+ * cases, because each adapter built its own runtime's shape from the scenario
+ * step and nothing ever compared the two. Parse-then-re-emit against one
+ * shared file cannot pass unless both runtimes agree on every key.
+ *
+ * `requestor` is lifted out of the fixture and handed back to the serializer,
+ * which in production resolves it from the peer table -- a payload-shape
+ * vector has no reason to stand up a cohort to say what an identity
+ * serializes to. */
+static int run_wire_vector(const at_case_t *c, char *err, size_t err_len)
+{
+    json_t *ctor_j = json_object_get(c->data, "constructor");
+    if (!json_is_string(ctor_j)) {
+        snprintf(err, err_len, "wire_vector missing constructor");
+        return -1;
+    }
+    const char *ctor = json_string_value(ctor_j);
+
+    const char *verb;
+    if (strcmp(ctor, "Task") == 0)            verb = NEG_PROTO_ANNOUNCE;
+    else if (strcmp(ctor, "TaskStatus") == 0) verb = NEG_PROTO_STAT_RSP;
+    else if (strcmp(ctor, "TaskResult") == 0) verb = NEG_PROTO_RESULT;
+    else {
+        snprintf(err, err_len, "unsupported constructor: %s", ctor);
+        return 1;  /* skip sentinel */
+    }
+
+    json_t *expected = json_object_get(c->data, "expected");
+    json_t *jwire = expected ? json_object_get(expected, "json_wire") : NULL;
+    if (!json_is_string(jwire)) {
+        snprintf(err, err_len, "%s: expected.json_wire missing", ctor);
+        return -1;
+    }
+
+    char *fixture = NULL;
+    size_t fixture_len = 0;
+    if (at_load_testdata_bytes(json_string_value(jwire), &fixture, &fixture_len) != 0) {
+        snprintf(err, err_len, "%s: cannot load fixture %s", ctor,
+                 json_string_value(jwire));
+        return -1;
+    }
+
+    int rc = -1;
+    json_error_t jerr;
+    json_t *doc = json_loadb(fixture, fixture_len, 0, &jerr);
+    if (doc == NULL) {
+        snprintf(err, err_len, "%s: fixture is not JSON: %s", ctor, jerr.text);
+        goto out;
+    }
+
+    public_identity_t requestor;
+    memset(&requestor, 0, sizeof(requestor));
+    if (public_identity_from_json(json_object_get(doc, "requestor"), &requestor) != 0) {
+        snprintf(err, err_len, "%s: fixture `requestor` is not a canonical "
+                 "public identity", ctor);
+        goto out;
+    }
+
+    char *emitted = NULL;
+    if (negotiation_payload_roundtrip(verb, fixture, &requestor, &emitted) != 0
+        || emitted == NULL) {
+        snprintf(err, err_len, "%s: payload round-trip failed", ctor);
+        goto out;
+    }
+    rc = at_byte_pin_json(c->data, emitted, ctor, err, err_len);
+    free(emitted);
+
+out:
+    if (doc != NULL) json_decref(doc);
+    free(fixture);
+    return rc;
+}
+
 void at_negotiation_run(const at_case_t *c, at_case_result_t *out)
 {
     if (strcmp(c->kind, "negative") == 0)
@@ -643,11 +790,26 @@ void at_negotiation_run(const at_case_t *c, at_case_result_t *out)
         at_neg_run_wire(c, out);
         return;
     }
+    if (strcmp(c->kind, "wire_vector") == 0)
+    {
+        char wv_err[512] = {0};
+        struct timespec w0, w1;
+        clock_gettime(CLOCK_MONOTONIC, &w0);
+        int wv_rc = run_wire_vector(c, wv_err, sizeof(wv_err));
+        clock_gettime(CLOCK_MONOTONIC, &w1);
+        int wv_ms = (int)((w1.tv_sec - w0.tv_sec) * 1000
+                          + (w1.tv_nsec - w0.tv_nsec) / 1000000);
+        if (wv_rc == 0)      at_case_result_set_pass(out, wv_ms);
+        else if (wv_rc > 0)  at_case_result_set_skip(out, wv_err);
+        else                 at_case_result_set_fail(out, wv_ms, "AssertionError", wv_err);
+        return;
+    }
     if (strcmp(c->kind, "scenario") != 0)
     {
         char detail[160];
         snprintf(detail, sizeof(detail),
-                 "C negotiation adapter only handles kind:scenario|negative (got %s)", c->kind);
+                 "C negotiation adapter only handles kind:scenario|negative|wire_vector "
+                 "(got %s)", c->kind);
         at_case_result_set_skip(out, detail);
         return;
     }

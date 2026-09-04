@@ -78,6 +78,21 @@
  */
 
 /**
+ * @defgroup internal_certificates Certificate checking
+ * @ingroup internal
+ * @brief Verifying the witness that comes with an answer: duals, refutations,
+ *        potentials and cuts (R+D.md §12.3).
+ */
+
+/**
+ * @defgroup internal_physics Physical consistency
+ * @ingroup internal
+ * @brief Dimensional analysis, feasibility bounds and conflict diagnosis:
+ *        refuting a peer's claim before any reputation math runs (R+D.md
+ *        §12.2).
+ */
+
+/**
  * @defgroup internal_algorithms Algorithms
  * @ingroup internal
  * @brief Consensus (Paxos, stake, work) and agreement protocols.

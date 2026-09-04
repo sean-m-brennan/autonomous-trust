@@ -106,10 +106,31 @@ The output of this layer is qualitatively different from everything below it. A
 physics violation is a hard falsification and should carry a different
 consequence than a poor statistical score. See "Keep the channels separate."
 
+**Built, both runtimes, 2026-09-03.** Dimensional coherence, range and
+kinematic feasibility, set-membership intersection and linear parity relations,
+with the diagnosis below, feeding the `physical` channel at 0.1 and the
+`swarm_disagreement` channel at 0.3. Declared in a `physics.json` that both
+runtimes read; the units table is code in both and is deliberately not
+declarable, since an operator who could redefine a newton could refute any peer.
+It is opt-in and silent by default, and it never returns a good score --
+surviving the check earns nothing, because a claim inside the feasible set is
+merely not-refuted. See `doc/architecture/physical-consistency.md` and R+D.md
+§12.2.
+
 Substituting "peer" for "component" in the GDE formulation gives peer fault
 isolation directly: conflicts are sets of peers who cannot all be reporting
 honestly, and the diagnosis is a minimal hitting set over those conflicts. This
 needs no reputation history and no learned model.
+
+One refinement had to be *declined* in the build. The usual GDE move is to
+prefer the cardinality-minimal diagnosis, which would convict a lone outlier
+whenever two other peers corroborate each other -- conflicts {A,C} and {B,C}
+resolve to {C} rather than to {C} *and* {A,B}. That is majority rule wearing
+physics' clothes, and it would let three colluding peers refute an honest one on
+the hardest channel in the system. Every subset-minimal diagnosis is kept
+instead, so a peer in all of them is refuted and a peer in some is only
+implicated. The distinction between those two is what keeps this layer from
+becoming a vote.
 
 ### Layer 2: prequential scoring and regret-bounded weighting
 
@@ -156,6 +177,21 @@ catastrophic, and an averaged reputation score will not see it coming until it
 does. This layer is small to implement and needs no training data, which makes
 it the best value per line of code in the whole stack.
 
+As built it is falsification-only, like the physics layer: a rejected coverage
+claim scores 0.1 on its own `calibration` channel and a passing audit earns
+nothing, since covering as advertised is the least a peer can do. The gradualism
+this section asks for -- a physical refutation should demote faster than a
+drifting calibration score -- is the channel WEIGHT rather than a softened
+number, `physical` at 3 against `calibration` at the baseline 1. The test is the
+exact binomial tail, one-sided, so an over-cautious peer is not penalised: its
+sets are useless, which is a competence problem, not a dishonest one. Below
+`min_samples` resolutions it is silent rather than lenient. Predictions are
+resolved by ANOTHER peer's later report of the same declared quantity, through
+the `physics.json` mapping, with an explicit `resolve()` for truth that never
+arrives as a task result. Declared in a `calibration.json` both runtimes read;
+the arithmetic, like the units table, is code in both. See
+`doc/architecture/calibration-audit.md` and R+D.md §12.4.
+
 ## Non-sensory work
 
 The layers above depend on a shared observable state, and a large share of what
@@ -188,6 +224,27 @@ Where a certificate exists, peer judgment reduces to running the checker, and
 the oracle becomes exact rather than statistical. Where one does not exist yet,
 redesigning the task interface to produce one is usually a better investment
 than any amount of reputation modelling.
+
+**Built, both runtimes, 2026-09-03.** All eight rows, checked exactly and pinned
+against each other by the `certificate` conformance protocol. This is the only
+layer in the oracle that returns a GOOD score --- a verified witness means the
+answer is proved right, where surviving the physics layer means only that it was
+not refuted --- so it both rewards and punishes, and a disagreement between
+runtimes would matter in both directions.
+
+Two rows needed their naive form rejected. "The path plus an admissible lower
+bound" is not checkable as stated, because a peer returning a detour can assert
+a bound equal to its own cost; what is checkable is the bound's own witness, a
+feasible potential (the LP dual), verified in one pass over the edges. And a
+DRAT replay must insist the proof reaches the EMPTY CLAUSE: a hundred sound
+lemmas that never do prove nothing about satisfiability, and accepting them
+would let a peer claim UNSAT by emitting arbitrary valid inferences.
+
+The declaration also carries the negative case, which is what makes the last
+paragraph above actionable: `checker: null` marks a capability somebody examined
+and found uncertifiable, distinct from one nobody has considered, and each node
+reports the inventory of both. See
+`doc/architecture/certificate-interfaces.md` and R+D.md §12.3.
 
 ### Replication, made affordable
 
@@ -472,9 +529,12 @@ prequentially like any other predictor.
 Cheapest and most general first:
 
 1. **Physical consistency and dimensional refutation.** No history, no training
- data, hard verdicts.
+ data, hard verdicts. **DONE 2026-09-03**, both runtimes, pinned by the
+ `physics` conformance protocol.
 2. **Certificate-carrying task interfaces.** Interface work, not algorithm work,
- and it collapses most of the non-sensory problem.
+ and it collapses most of the non-sensory problem. **DONE 2026-09-03**, both
+ runtimes, all eight rows of the table above, pinned by the `certificate`
+ conformance protocol.
 3. **Conformal coverage audit.** Small, distribution-free, and catches the
  overconfident peer that averaged reputation cannot see.
 4. **Prequential log-loss with sleeping-expert weights.** Replaces authored
@@ -488,6 +548,9 @@ Cheapest and most general first:
 
 Steps 1 and 2 are where the leverage is. Steps 7 and 8 are the ones that need
 real statistical care, and they are needed least often.
+
+Steps 1 and 2 are now built in both runtimes (2026-09-03). Step 3, the conformal
+coverage audit, is next in this order.
 
 ## References
 
@@ -573,6 +636,13 @@ Disclosure and aggregation limits
  bootstrap corpus, and the `trust_ladder.yaml` the oracle is meant to
  generalize.
 - [Concept](concept.md): why behavioral evaluation rather than authored policy.
+- [Physical Consistency](architecture/physical-consistency.md): step 1 as built
+ -- the checks, the diagnosis, and the declaration format.
+- [Certificate-Carrying Interfaces](architecture/certificate-interfaces.md):
+ step 2 as built -- the eight checkers, the three declared states, and the
+ inventory.
+- [Calibration Audit](architecture/calibration-audit.md): step 3 as built -- the
+ exact test, the two resolution paths, and why a passing audit earns nothing.
 - [Adversarial Testing](architecture/adversarial-testing.md): the attack side of
  the same problem.
 

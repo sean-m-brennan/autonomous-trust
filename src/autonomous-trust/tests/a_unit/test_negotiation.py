@@ -423,3 +423,88 @@ class TestFindNearestSlotOccupied:
         slot = jq.find_nearest_slot(task)
         assert isinstance(slot, datetime)
         assert slot == datetime.fromtimestamp(1000000, tz=UTC)
+
+
+class TestPayloadWireForm:
+    """The serialized form every negotiation verb puts on the wire.
+
+    See doc/architecture/negotiation.md, "What a payload looks like". The C
+    twin emits the same shape; the cross-runtime pins are the
+    `negotiation-*` wire vectors in the conformance corpus.
+    """
+
+    @staticmethod
+    def _identity():
+        from autonomous_trust.core.identity.identity import Identity
+        return Identity.initialize('alice.neg', 'alice-local-petname', '10.0.50.1')
+
+    def _task(self):
+        from autonomous_trust.core.capabilities import Capability
+        ident = self._identity()
+        return ident, Task(TaskParameters(Capability('echo')), ident, seq=5)
+
+    def test_requestor_private_keys_never_serialized(self):
+        """A task's requestor is the node's OWN, private Identity.
+
+        Serializing it through the default encoder returns
+        ``Signature.to_dict()``, which hands back ``private.encode()`` for a
+        key that is not public-only -- so every invitation, nack, ack, haggle,
+        status request/response and result used to carry the requester's
+        Ed25519 signing seed and Curve25519 secret to every invited peer.
+        """
+        ident, task = self._task()
+        for payload in (task,
+                        TaskStatus(task, Status.pending),
+                        TaskResult(task=task, result=1)):
+            wire = payload.to_json_string()
+            kind = type(payload).__name__
+            assert '"public_only": false' not in wire, \
+                f'{kind} carries a non-public-only key dump'
+            assert ident.signature.serialize().decode('ascii') not in wire, \
+                f'{kind} carries the private signing seed'
+
+    def test_requestor_petname_never_serialized(self):
+        """petname is a local Zooko name; it belongs to no one but its assigner."""
+        ident, task = self._task()
+        assert 'alice-local-petname' not in task.to_json_string()
+
+    def test_requestor_round_trips_as_an_identity(self):
+        """Handlers read `.uuid` / `.nickname` off the requestor and address
+        replies to it, so the canonical dict has to rebuild into an Identity."""
+        from autonomous_trust.core.config import from_json_string
+        from autonomous_trust.core.identity.identity import Identity
+
+        ident, task = self._task()
+        back = from_json_string(task.to_json_string())
+        assert isinstance(back, Task)
+        assert isinstance(back.requestor, Identity)
+        assert back.requestor.uuid == ident.uuid
+        assert back.requestor.nickname == ident.nickname
+        assert back.requestor.signature.publish() == ident.signature.publish()
+        assert back.requestor.encryptor.publish() == ident.encryptor.publish()
+        # Equality is uuid/address/nickname/keys, so the public copy still
+        # compares equal to what was published.
+        assert back.requestor == ident.publish()
+
+    def test_internal_round_trip_survives_canonical_requestor(self):
+        """TaskStatus/TaskResult/TaskCounter/TaskTracker are all built from
+        ``Task(**task.to_dict())``; the canonical requestor must survive it."""
+        from autonomous_trust.core.identity.identity import Identity
+        _, task = self._task()
+        assert isinstance(Task(**task.to_dict()).requestor, Identity)
+
+    def test_status_enum_survives_the_wire(self):
+        """`Status` has to be a registered enum type or `config_json_decoder`
+        refuses the tag -- which made every status response raise in the
+        receiver, Python-to-Python as much as cross-runtime."""
+        from autonomous_trust.core.config import from_json_string
+        _, task = self._task()
+        back = from_json_string(TaskStatus(task, Status.pending).to_json_string())
+        assert isinstance(back, TaskStatus)
+        assert back.status is Status.pending
+
+    def test_non_identity_requestor_is_left_alone(self):
+        """Tests and some conformance steps pass a bare uuid string."""
+        from autonomous_trust.core.capabilities import Capability
+        task = Task(TaskParameters(Capability('echo')), 'req-uuid-string')
+        assert '"requestor": "req-uuid-string"' in task.to_json_string()

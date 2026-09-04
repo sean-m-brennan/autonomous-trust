@@ -25,6 +25,9 @@ import psutil
 
 from ..system import max_concurrency, now
 from ..config import Configuration
+from ..config.configuration import register_enum_type
+from ..identity.identity import (public_identity_to_canonical,
+                                 public_identity_from_canonical)
 
 
 # TODO tie clock quality to reputation. AT no longer implements NTP: a stock
@@ -32,6 +35,13 @@ from ..config import Configuration
 # (NtpTimeSource.trustworthy). A peer whose clock nothing is steering is the
 # reputation-relevant signal, not a sync AT performs itself.
 
+# Registered because the `status response` verb puts this enum ON THE WIRE
+# (`forward_status` serializes a TaskStatus whose `status` is a member).
+# `config_json_decoder` refuses any `Enumcfg:` tag that is not registered, so
+# without this every status response raised ValueError in the receiver's
+# decode -- Python-to-Python as much as cross-runtime. Found while making the
+# C twin emit this form (doc/architecture/negotiation.md).
+@register_enum_type
 class Status(Enum):
     running = 'running'
     sleeping = 'sleeping'
@@ -112,6 +122,19 @@ class TaskInfo(Configuration):
         self.uuid = uuid
         if uuid is None:
             self.uuid = uuid4()
+        # A requestor arriving as a dict is the flat cross-runtime PUBLIC form
+        # (`public_identity_to_canonical`) this class now emits -- from a peer
+        # of either runtime, or from one of the `Task(**task.to_dict())`
+        # round-trips TaskStatus/TaskResult/TaskCounter/TaskTracker are built
+        # from. Rebuild it into an Identity so every reader downstream keeps
+        # using `requestor.uuid` / `.nickname` / `.address` as before.
+        #
+        # A malformed dict reconstructs as None rather than being kept as a
+        # dict: `None` is what the `getattr(task, 'requestor', None)` guards
+        # already expect, whereas a dict masquerading as an identity raises
+        # AttributeError deep inside a handler.
+        if isinstance(requestor, dict):
+            requestor = public_identity_from_canonical(requestor)
         self.requestor = requestor
         self.size = size
         # Freshness sequence of the INVITATION that carried this task; 0 means
@@ -135,6 +158,40 @@ class TaskInfo(Configuration):
         # faithful copy of the invitation it came from.
         self.seq = int(seq or 0)
         # ignore kwargs
+
+    def to_dict(self):
+        """Serialize `requestor` as the flat cross-runtime PUBLIC identity form.
+
+        Two reasons, and the first is a leak. `requestor` is the requesting
+        node's OWN `Identity` object (`automate.py` passes `self.identity`,
+        which is the private one loaded from `identity.cfg.json`), and the
+        default `ConfigJSONEncoder` path dumps it whole -- including
+        `Signature.to_dict()`, which returns `self.private.encode(HexEncoder)`
+        when `public_only` is False. Every invitation, nack, ack, haggle,
+        status request/response and result therefore carried the requestor's
+        Ed25519 signing seed and Curve25519 secret to every invited peer, plus
+        the `petname`, which is a local-only Zooko name that must never be
+        serialized. The envelope was always careful about this
+        (`network/message.py` publishes only public keys); the payload was not.
+
+        Second, it is what makes the payload readable by the C twin: the flat
+        form is byte-identical to C's `public_identity_to_json`, which is
+        exactly why `public_identity_to_canonical` exists (see its docstring,
+        and the `peer_accepted` / `full_history` payloads that already use it).
+        The rest of the task keeps Python's `__type__`-tagged form, which C now
+        speaks. See doc/architecture/negotiation.md.
+
+        A requestor that is not an identity at all (tests and some conformance
+        steps pass a bare uuid string) is left exactly as it was.
+        """
+        d = super().to_dict()
+        req = d.get('requestor')
+        if req is not None and not isinstance(req, (dict, str, bytes)):
+            try:
+                d['requestor'] = public_identity_to_canonical(req)
+            except AttributeError:
+                pass  # not an Identity; leave the caller's object alone
+        return d
 
 
 class Task(TaskInfo):
@@ -166,6 +223,7 @@ class TaskResult(TaskInfo):
     """
 
     def __init__(self, task=None, result=None, proof=None,
+                 certificate=None, prediction=None,
                  requested_capability_name: str = None,
                  requested_args=None, requested_kwargs=None, **kwargs):
         if task is None:
@@ -175,6 +233,43 @@ class TaskResult(TaskInfo):
         super().__init__(**task_args, **kwargs)
         self.result = result
         self.proof = proof
+        # The witness that makes this answer checkable (R+D.md §12.3). A
+        # SEPARATE field from `proof`, and from `result`, because the three are
+        # different claims: `result` is the answer, `certificate` is what makes
+        # the answer verifiable, and `proof` is a ZK-STARK attesting the bytes
+        # were not altered in transit. Folding the witness into the result
+        # would make every certified capability's return type a convention, and
+        # a reader that did not know the checker would see a wrapper where it
+        # expected an answer; folding it into `proof` would leave a reader
+        # sniffing bytes to tell a witness from a STARK, which is the format
+        # detection R+D.md §2.5 spent an entry proving unnecessary.
+        #
+        # UNLIKE `requested_*` and `executor_uuid`, this one is the executor's
+        # to assert and is serialized: the whole point is that the peer
+        # supplies it. That is safe precisely because it is checked rather than
+        # believed -- the checker's INPUTS come from the requestor's own record
+        # (`requested_kwargs`), so a peer can choose its witness but not the
+        # problem the witness has to satisfy.
+        self.certificate = certificate
+        # The prediction SET this answer came with, and the coverage the peer
+        # claims for it (R+D.md §12.4). A THIRD separate field, for the same
+        # reason `certificate` is separate from `proof`: `result` is the
+        # answer, `certificate` is what makes the answer checkable, `proof`
+        # attests the bytes were not altered, and this is the peer's statement
+        # about how often answers of this kind land inside the set it quotes.
+        # Only the last one is a claim about the PEER rather than about this
+        # answer, which is why the audit that reads it is historical and the
+        # others are per-result.
+        #
+        # Like `certificate` and unlike `requested_*`, this is the executor's
+        # to assert and is serialized: the whole point is that the peer commits
+        # to a coverage in advance. That is safe because it is audited rather
+        # than believed -- the OUTCOMES it is checked against are resolved by
+        # the requestor, and a peer's own report never settles its own
+        # prediction (calibration/audit.py).
+        #
+        # Shape: {"quantity": str, "coverage": float, "lo": [...], "hi": [...]}
+        self.prediction = prediction
         # What the REQUESTOR asked for, filled in on the requestor side by
         # `attach_requested_parameters` (R+D.md §12.7). Default None/empty:
         # an executor building a TaskResult has no business asserting these,

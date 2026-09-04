@@ -203,7 +203,7 @@ DEFINE_TEST(test_score_probe_result_uses_our_own_challenge)
     /* Honest answer to the nonce WE sent. */
     double score = negotiation_score_task_result("at.handshake",
                                                  "{\"nonce\":41}", "42", 2,
-                                                 &channel);
+                                                 NULL, NULL, NULL, 0.0, 0, &channel);
     ck_assert_double_eq_tol(score, 0.9, 1e-9);
     ck_assert_str_eq(channel, TX_CHANNEL_PROBE);
 
@@ -212,7 +212,7 @@ DEFINE_TEST(test_score_probe_result_uses_our_own_challenge)
      * peer that computed the wrong answer would report the challenge its
      * answer satisfies, so the expected value has to come from our side. */
     score = negotiation_score_task_result("at.handshake", "{\"nonce\":77}",
-                                          "42", 2, &channel);
+                                          "42", 2, NULL, NULL, NULL, 0.0, 0, &channel);
     ck_assert_double_eq_tol(score, 0.1, 1e-9);
     ck_assert_str_eq(channel, TX_CHANNEL_PROBE);
 
@@ -222,33 +222,33 @@ DEFINE_TEST(test_score_probe_result_uses_our_own_challenge)
      * would grade nonsense more kindly than a merely late clock. Python
      * reaches the same 0.1 by float() raising on the same input. */
     score = negotiation_score_task_result("at.handshake", "{\"nonce\":41}",
-                                          "forty-two", 9, &channel);
+                                          "forty-two", 9, NULL, NULL, NULL, 0.0, 0, &channel);
     ck_assert_double_eq_tol(score, 0.1, 1e-9);
     ck_assert_str_eq(channel, TX_CHANNEL_PROBE);
     /* Nor is a partly-numeric one: "42abc" is not 42. */
     score = negotiation_score_task_result("at.handshake", "{\"nonce\":41}",
-                                          "42abc", 5, &channel);
+                                          "42abc", 5, NULL, NULL, NULL, 0.0, 0, &channel);
     ck_assert_double_eq_tol(score, 0.1, 1e-9);
 
     /* at.time-attest: a clock far from ours is forgivable (0.5), because the
      * comparison includes the round trip; an unparseable one is not (0.1). */
     score = negotiation_score_task_result("at.time-attest", "", "0", 1,
-                                          &channel);
+                                          NULL, NULL, NULL, 0.0, 0, &channel);
     ck_assert_double_eq_tol(score, 0.5, 1e-9);
     ck_assert_str_eq(channel, TX_CHANNEL_PROBE);
     score = negotiation_score_task_result("at.time-attest", "", "soon", 4,
-                                          &channel);
+                                          NULL, NULL, NULL, 0.0, 0, &channel);
     ck_assert_double_eq_tol(score, 0.1, 1e-9);
 
     /* Echo: byte-equal to the token we sent, or nothing. */
     score = negotiation_score_task_result("at.echo-challenge",
                                           "{\"payload\":\"echo:cafe\"}",
-                                          "echo:cafe", 9, &channel);
+                                          "echo:cafe", 9, NULL, NULL, NULL, 0.0, 0, &channel);
     ck_assert_double_eq_tol(score, 0.9, 1e-9);
     ck_assert_str_eq(channel, TX_CHANNEL_PROBE);
     score = negotiation_score_task_result("at.echo-challenge",
                                           "{\"payload\":\"echo:cafe\"}",
-                                          "echo:beef", 9, &channel);
+                                          "echo:beef", 9, NULL, NULL, NULL, 0.0, 0, &channel);
     ck_assert_double_eq_tol(score, 0.1, 1e-9);
 }
 END_TEST_DEFINITION()
@@ -261,21 +261,21 @@ DEFINE_TEST(test_score_non_probe_result_is_completion)
      * came back, and say `task_outcome` so a missing proof infrastructure
      * does not read as a failed proof. */
     double score = negotiation_score_task_result("data_fetch", "", "done", 4,
-                                                 &channel);
+                                                 NULL, NULL, NULL, 0.0, 0, &channel);
     ck_assert_double_eq_tol(score, 0.8, 1e-9);
     ck_assert_str_eq(channel, TX_CHANNEL_TASK_OUTCOME);
 
-    score = negotiation_score_task_result("data_fetch", "", NULL, 0, &channel);
+    score = negotiation_score_task_result("data_fetch", "", NULL, 0, NULL, NULL, NULL, 0.0, 0, &channel);
     ck_assert_double_eq_tol(score, 0.3, 1e-9);
     ck_assert_str_eq(channel, TX_CHANNEL_TASK_OUTCOME);
 
     /* No retained capability name at all (a pre-§12.7 tracker, or a result
      * for a task we have no record of): ordinary completion scoring, never a
      * probe verdict against a challenge we do not have. */
-    score = negotiation_score_task_result("", "", "done", 4, &channel);
+    score = negotiation_score_task_result("", "", "done", 4, NULL, NULL, NULL, 0.0, 0, &channel);
     ck_assert_double_eq_tol(score, 0.8, 1e-9);
     ck_assert_str_eq(channel, TX_CHANNEL_TASK_OUTCOME);
-    score = negotiation_score_task_result(NULL, NULL, "done", 4, &channel);
+    score = negotiation_score_task_result(NULL, NULL, "done", 4, NULL, NULL, NULL, 0.0, 0, &channel);
     ck_assert_double_eq_tol(score, 0.8, 1e-9);
 }
 END_TEST_DEFINITION()
@@ -289,7 +289,7 @@ DEFINE_TEST(test_score_probe_with_no_retained_challenge)
      * an ordinary bad task grade. */
     const char *channel = NULL;
     double score = negotiation_score_task_result("at.handshake", "", "42", 2,
-                                                 &channel);
+                                                 NULL, NULL, NULL, 0.0, 0, &channel);
     ck_assert_double_eq_tol(score, 0.1, 1e-9);
     ck_assert_str_eq(channel, TX_CHANNEL_PROBE);
 
@@ -298,7 +298,7 @@ DEFINE_TEST(test_score_probe_with_no_retained_challenge)
     char now_str[32] = {0};
     snprintf(now_str, sizeof(now_str), "%.3f", at_time_attest());
     score = negotiation_score_task_result("at.time-attest", "", now_str,
-                                          strlen(now_str), &channel);
+                                          strlen(now_str), NULL, NULL, NULL, 0.0, 0, &channel);
     ck_assert_double_eq_tol(score, 0.9, 1e-9);
     ck_assert_str_eq(channel, TX_CHANNEL_PROBE);
 }

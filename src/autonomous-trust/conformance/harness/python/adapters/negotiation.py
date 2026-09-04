@@ -50,7 +50,8 @@ from autonomous_trust.core.network.message import Message
 from autonomous_trust.core.processes import ProcessTracker
 from autonomous_trust.core.system import CfgIds, PackageHash
 
-from ...common.scenario_loader import Case
+from ...common.canonical import canonicalize
+from ...common.scenario_loader import Case, load_testdata_bytes
 from ..scenario_engine import (
     CapturedMessage,
     ParticipantHandle,
@@ -176,19 +177,49 @@ def _to_captured(msg: Any, emitter_id: str) -> CapturedMessage:
             function=f'__ipc__/{type(msg).__name__}', payload=msg, raw=msg,
         )
     to_id = _resolve_to_id(msg)
+    # Stamp the sender, which is what the network process does on the way out
+    # (it signs as self and writes the envelope's from_* fields). The engine
+    # re-delivers this very object to the target instead of serializing it, so
+    # without this the receiver sees `from_whom is None` -- and a handler that
+    # reads the sender off it, as handle_stat_resp does, gets nothing. Only
+    # ever fills a blank; a message that already names its sender is untouched.
+    if getattr(msg, 'from_whom', None) is None:
+        sender = _PARTICIPANT_IDENTITIES.get(emitter_id)
+        if sender is not None:
+            msg.from_whom = sender
     return CapturedMessage(
         from_id=emitter_id, to_id=to_id,
         function=msg.function, payload=msg.obj, raw=msg,
     )
 
 
+# Scenario-scoped uuid -> participant-slug map, populated by
+# `_build_participants`. Recipient resolution keys on the UUID, matching the C
+# adapter's `_resolve_to_id`, because the petname it used to read is a
+# LOCAL-ONLY Zooko name and is therefore not reliably the scenario's slug: a
+# `requestor` that arrived over the wire is rebuilt by
+# `public_identity_from_canonical`, which assigns a freshly DERIVED petname
+# (`derive_local_petname`). `forward_status` and `forward_result` address their
+# replies to that rebuilt identity, so matching on petname reported
+# `alice.neg-0242` where the scenario said `alice`. The uuid is the identity;
+# the petname is one node's private label for it.
+_PARTICIPANT_IDS: dict[str, str] = {}
+# Slug -> Identity, for the `from_whom` stamp in `_to_captured`.
+_PARTICIPANT_IDENTITIES: dict[str, Identity] = {}
+
+
 def _resolve_to_id(msg: Message) -> str:
     to = msg.to_whom
-    if isinstance(to, Identity):
-        return getattr(to, 'petname', '') or str(to.uuid)
     if isinstance(to, list) and to:
-        first = to[0]
-        return getattr(first, 'petname', '') or str(getattr(first, 'uuid', first))
+        to = to[0]
+    if to is None:
+        return 'broadcast'
+    uuid_str = str(getattr(to, 'uuid', '') or '')
+    resolved = _PARTICIPANT_IDS.get(uuid_str)
+    if resolved is not None:
+        return resolved
+    if isinstance(to, Identity):
+        return uuid_str or getattr(to, 'petname', '') or 'unknown'
     return 'broadcast'
 
 
@@ -201,6 +232,79 @@ class NegotiationAdapter:
         self._package_hash = PackageHash().digest
         # Slug -> UUID, populated as scenarios reference task slugs.
         self._task_uuids: dict[str, UUID] = {}
+
+    def run_wire_vector(self, case: Case) -> None:
+        """Byte-pin a negotiation PAYLOAD's shape (doc/architecture/negotiation.md).
+
+        The fixture is both the input and the expectation, and the same file
+        feeds the C adapter: parse it, re-emit it through this runtime's own
+        serializer, and require the result to canonicalize back to the
+        fixture. That is what envelope-only pinning could not do -- each
+        adapter used to build its own runtime's payload from the scenario
+        step, so the corpus stayed green while a Python requestor's invitation
+        and a C worker's result had no key in common.
+
+        Checking the reconstructed object, not just the bytes, is deliberate:
+        a payload that round-trips to the right JSON but rebuilds as a plain
+        dict is exactly the failure a C-emitted payload used to produce on
+        this side, and the handlers then raise on `task.uuid`.
+        """
+        from autonomous_trust.core.config.configuration import from_json_string
+
+        spec = case.data
+        ctor = spec.get('constructor')
+        if not ctor:
+            raise AssertionError('wire_vector missing required field: constructor')
+        if ctor not in ('Task', 'TaskStatus', 'TaskResult'):
+            raise NotImplementedError(
+                f'negotiation wire_vector constructor {ctor!r} not supported')
+
+        fixture_path = (spec.get('input') or {}).get('json_wire')
+        if not fixture_path:
+            raise AssertionError('wire_vector missing input.json_wire')
+        fixture = load_testdata_bytes(self.corpus_root, fixture_path)
+
+        obj = from_json_string(fixture.decode('utf-8'))
+        assert type(obj).__name__ == ctor, (
+            f'{ctor}: fixture rebuilt as {type(obj).__name__}, not {ctor} '
+            '-- the payload is not a tagged Configuration this runtime knows')
+        # The requestor has to come back as an Identity, not the canonical
+        # dict: every handler downstream reads `.uuid` / `.nickname` /
+        # `.address` off it, and `forward_result` addresses its reply to it.
+        requestor = getattr(obj, 'requestor', None)
+        assert isinstance(requestor, Identity), (
+            f'{ctor}: requestor rebuilt as {type(requestor).__name__}, '
+            'not Identity')
+        assert getattr(requestor, 'public_only', True) is not False, (
+            f'{ctor}: requestor carries PRIVATE key material')
+
+        emitted = obj.to_json_string()
+        assert 'public_only' not in emitted, (
+            f'{ctor}: re-emitted payload carries a Signature/Encryptor dump, '
+            'which serializes the private seed for a non-public-only key')
+        self._assert_byte_pin(spec, emitted.encode('utf-8'), ctor)
+
+    def _assert_byte_pin(self, spec: dict[str, Any], actual: bytes,
+                         label: str) -> None:
+        """Compare emitted bytes to the pinned fixture, canonically.
+
+        Canonical rather than lexical, matching the network adapter and the C
+        side's ``at_byte_pin_json``: key order and integer-vs-float spelling
+        are not the contract, the key set and the values are.
+        """
+        if not spec.get('byte_pinning'):
+            return
+        expected_path = (spec.get('expected') or {}).get('json_wire')
+        if not expected_path:
+            raise AssertionError(
+                f'{label}: byte_pinning=true but expected.json_wire missing')
+        expected = canonicalize(load_testdata_bytes(self.corpus_root, expected_path))
+        actual_canonical = canonicalize(actual)
+        if actual_canonical != expected:
+            raise AssertionError(
+                f'{label}: payload diverges from pinned fixture '
+                f'{expected_path!r}\n  expected: {expected!r}\n'
+                f'  actual:   {actual_canonical!r}')
 
     def run_scenario(self, case: Case) -> None:
         self._scratch = tempfile.TemporaryDirectory(prefix='at-conformance-neg-')
@@ -256,6 +360,8 @@ class NegotiationAdapter:
         cap_tier_fix: dict[str, int] = fixtures.get('capability_tiers', {}) or {}
 
         identities: dict[str, Identity] = {}
+        _PARTICIPANT_IDS.clear()
+        _PARTICIPANT_IDENTITIES.clear()
         for idx, spec in enumerate(spec_participants):
             pid = spec['id']
             sig = hashlib.sha256(b'neg:sig:' + pid.encode()).hexdigest().encode('ascii')
@@ -267,6 +373,8 @@ class NegotiationAdapter:
                 Encryptor(enc, public_only=False),
                 pid, False, 0, 'authority',
             )
+            _PARTICIPANT_IDS[str(identity.uuid)] = pid
+            _PARTICIPANT_IDENTITIES[pid] = identity
             identities[pid] = identity
 
         handles: dict[str, ParticipantHandle] = {}
