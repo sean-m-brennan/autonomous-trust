@@ -65,5 +65,22 @@ const char *at_corpus_root(void);
  *  the caller must free(*out).  Refuses paths that escape the corpus
  *  root via `..` segments. */
 int at_load_testdata_bytes(const char *rel_path, char **out, size_t *out_len);
+/**
+ * @brief Compare emitted JSON against a case's pinned `expected.json_wire`.
+ *
+ * A no-op returning 0 unless the case sets `byte_pinning: true`. Both the
+ * emitted bytes and the fixture are canonicalized before comparison, so the
+ * contract is canonical-form equality rather than lexical.
+ *
+ * @param case_data    The case's full data block (holds `byte_pinning` and
+ *                     `expected.json_wire`).
+ * @param emitted_json NUL-terminated JSON the implementation produced.
+ * @param label        Prefix for the error message.
+ * @param err          Receives a diagnostic on mismatch.
+ * @param err_len      Size of @p err.
+ * @return 0 on match, non-zero on mismatch or a malformed pin.
+ */
+int at_byte_pin_json(json_t *case_data, const char *emitted_json,
+                     const char *label, char *err, size_t err_len);
 
 #endif /* AT_CONFORMANCE_LOADER_H */

@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "min_samples": 30,
+  "audit_alpha": 0.05,
+  "max_outcomes": 256,
+  "max_outstanding": 32,
+  "horizon_sec": 60.0,
+  "capabilities": {
+    "demo.thermal-forecast": {
+      "quantity": "demo.bus-temp",
+      "horizon_sec": 120.0,
+      "min_coverage": 0.5,
+      "max_coverage": 0.99,
+      "tolerance": 0.5,
+      "note": "quantity is declared in physics.example.json, which is what lets an ordinary demo.thermal-report result resolve these predictions with no application involvement"
+    },
+    "demo.power-forecast": {
+      "quantity": "demo.bus-power",
+      "horizon_sec": 60.0,
+      "min_coverage": 0.8,
+      "note": "a higher floor: a peer offering this is claiming it is usually right, and may not dodge the audit by advertising a coverage its sets trivially meet"
+    },
+    "demo.track-forecast": {
+      "quantity": "demo.position",
+      "horizon_sec": 30.0,
+      "min_coverage": 0.5,
+      "note": "a 3-component quantity; the set is a box and a miss on any axis is a miss"
+    }
+  }
+}

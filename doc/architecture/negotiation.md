@@ -198,6 +198,64 @@ for senders that predate the field. A worker that accepted unstamped
 invitations would be a worker an attacker selects by simply not stamping, and
 what that buys is execution of work on somebody else's node.
 
+## What a payload looks like
+
+Every negotiation verb carries a serialized task object, and both runtimes
+write the same one: Python's `__type__`-tagged `Configuration` dump. An
+`invitation`, `nack`, `ack`, `haggle` and `status request` each carry a `Task`;
+a `status response` carries a `TaskStatus`, which is a `Task` plus the status;
+`report results` carries a `TaskResult`, which extends `TaskInfo` and so has no
+`parameters` at all.
+
+That last omission is deliberate. The requester supplies what it asked for from
+its own record when the result arrives, never from the reply — reading the
+challenge back off the answer would verify nothing.
+
+The status on a `status response` rides as the enum's member *name*, not its
+value, because that is what rebuilds an enum on the other side. An integer
+would arrive as an integer.
+
+### The requestor is the exception
+
+One field is not the tagged form: `requestor` is the flat canonical *public*
+identity, the same shape the `peer_accepted` and `full_history` payloads use.
+
+The reason is that the tagged form would leak. A task's requestor is the
+requesting node's own `Identity` object, and that object is the private one —
+serializing it whole hands out the Ed25519 signing seed and the Curve25519
+secret, because `Signature.to_dict()` returns the private seed for a key that
+is not public-only. It also carries the petname, which is a local name and
+belongs to no one but the node that assigned it. The envelope has always been
+careful here, publishing only public keys; the payload now is too.
+
+A peer that receives an identity it does not already know cannot reply to it
+anyway, so nothing is lost by carrying public material only.
+
+### Why this is pinned
+
+The two runtimes' payloads once shared no key but `seq`. C hand-built a flat
+object mirroring `negotiation/task.proto`, a schema Python does not use, so a C
+worker could not read a Python requester's invitation and a Python requester
+could not read a C worker's result. Negotiation between them did not work at
+all, and nothing looked wrong: an invitation arriving with every key missing
+left `seq` at zero, and an unstamped invitation is refused rather than
+misexecuted.
+
+The corpus did not catch it because only the message *envelope* was
+byte-pinned. Each adapter built its own runtime's payload from the scenario
+step, so every case passed with the two shapes mutually unreadable.
+
+The payload vectors close that. Each is one fixture that is both the input and
+the expectation, fed to both runtimes: parse it, re-emit it through your own
+serializer, and land back on the fixture. Neither side can drift without
+failing.
+
+| Payload | Vector |
+|---|---|
+| `invitation` — a `Task` | [`negotiation-invitation.yaml`](../../src/autonomous-trust/conformance/vectors/wire/negotiation-invitation.yaml) |
+| `status response` — a `TaskStatus` | [`negotiation-status-response.yaml`](../../src/autonomous-trust/conformance/vectors/wire/negotiation-status-response.yaml) |
+| `report results` — a `TaskResult` | [`negotiation-task-result.yaml`](../../src/autonomous-trust/conformance/vectors/wire/negotiation-task-result.yaml) |
+
 ## Pinned scenarios
 
 The executable corpus that holds the behavior above. Each is a recorded trace

@@ -400,7 +400,17 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                 self.logger.debug('Remote status received')
                 if task.status in [Status.running, Status.sleeping, Status.pending]:
                     if task.status == Status.pending:
-                        self.logger.error('Clock synchronization error with %s', message.from_whom.nickname)
+                        # `from_whom` is only guaranteed once the network layer
+                        # has filled it from the envelope, and this is a log
+                        # line -- it must not be the thing that takes the
+                        # handler down. Same guarded read handle_invite already
+                        # uses. Reachable at all only since `Status` became a
+                        # registered enum type: before that this payload never
+                        # deserialized to a TaskStatus and the whole branch was
+                        # dead (doc/architecture/negotiation.md).
+                        self.logger.error(
+                            'Clock synchronization error with %s',
+                            getattr(message.from_whom, 'nickname', 'an unidentified peer'))
                     if task.uuid in self.confirmed and message.from_whom in self.confirmed[task.uuid]:
                         # The outstanding status request is the token that
                         # authorises one extension, and it is consumed here, so

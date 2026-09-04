@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "window_sec": 60.0,
+  "max_observations": 8,
+  "quantities": {
+    "demo.bus-power": {
+      "capability": "demo.power-report",
+      "unit": "W",
+      "min": 0.0,
+      "max": 2000.0,
+      "max_rate": 250.0,
+      "tolerance": 5.0
+    },
+    "demo.load-power": {
+      "capability": "demo.load-report",
+      "unit": "W",
+      "min": 0.0,
+      "max": 2000.0
+    },
+    "demo.battery-rate": {
+      "capability": "demo.battery-report",
+      "unit": "W",
+      "min": -2000.0,
+      "max": 2000.0
+    },
+    "demo.bus-temp": {
+      "capability": "demo.thermal-report",
+      "unit": "degC",
+      "min": -80.0,
+      "max": 120.0,
+      "max_rate": 2.0,
+      "tolerance": 1.0
+    },
+    "demo.position": {
+      "capability": "demo.position-report",
+      "unit": "m",
+      "components": 3,
+      "max_rate": 8000.0,
+      "max_accel": 50.0
+    }
+  },
+  "relations": [
+    {
+      "name": "power-balance",
+      "terms": {
+        "demo.bus-power": 1.0,
+        "demo.load-power": -1.0,
+        "demo.battery-rate": -1.0
+      },
+      "constant": 0.0,
+      "tolerance": 2.0,
+      "window_sec": 5.0
+    }
+  ]
+}
