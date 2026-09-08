@@ -1,0 +1,124 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: tier-update-applied
+byte_pinning: false
+description: |
+    A reputation-derived trust tier, applied to a peer's local mirror
+    (doc/architecture/trust-tiers.md §7.2).
+
+    `tier_update` is LOCAL IPC, not a wire verb: the reputation process
+    publishes it on the identity queue when a peer's consensus score crosses a
+    tier boundary, and the identity process writes it onto that peer's local
+    record. Nothing about it is signed or broadcast, because nothing about it
+    leaves the node — which is exactly why it needs pinning. The value it
+    writes is what the next negotiation tier-gate reads, so the two runtimes
+    disagreeing would let a capability be granted on one node and refused on
+    the other for the same peer at the same score.
+
+    Tier is not rank. Rank is topology and comes from config; tier is the
+    runtime, local-view trust attribute this handler is the only writer of.
+
+    Steps 1-2 exist only to give this node a peer to score: a tier lands on a
+    peer's LOCAL record, and no fixture seeds one, so the scenario backfills
+    `worker` through the identity-resync path first (the same exchange
+    `identity-resync-backfill` pins). Without it every tier update would hit
+    the drop branch and the scenario would assert nothing.
+
+    What each remaining step pins:
+
+      * Step 3 — an ordinary elevation. `worker` is a known peer, so tier 3
+        lands on its local record.
+      * Step 4 — the SELF case. A node's own tier arrives the same way, and
+        the handler resolves the target against its own identity before
+        searching its peer list. Skipping that would make a node's own tier
+        permanently 0 while every peer saw the real value.
+      * Step 5 — a tier for a peer this node has never met. Dropped quietly:
+        the update arrived before the identity did, and the next reputation
+        cycle will retry. Dropping is the only safe answer, since the
+        alternative is inventing a peer record from an unauthenticated local
+        message.
+      * Step 6 — a re-publication of the SAME tier. Idempotent: the handler
+        records that the peer has been scored whether or not the value moved,
+        and a repeat leaves the value where it was.
+
+participants:
+  - id: node
+    role: border_guard
+  - id: worker
+    role: group_member
+
+fixtures:
+  # The uuid is PINNED, not left to the adapter: the identity-resync query in
+  # step 1 is gated on the asker's group uuid matching the responder's, and
+  # without a pin each runtime mints its own per-participant group — the query
+  # is then refused and the setup silently produces no peer.
+  shared_group:
+    uuid: "0c000000-0000-4000-8000-000000000007"
+
+steps:
+  - id: 1
+    from: node
+    to: worker
+    function: peer_identity_query
+    payload:
+      have: []
+    description: |
+        Setup. node holds the group's addresses but not worker's Identity, so
+        it asks; worker answers with its published identity.
+  - id: 2
+    from: worker
+    to: node
+    function: peer_identity_response
+    in_response_to: 1
+    payload: {}
+    description: |
+        Setup. node backfills worker into its peer list — the local record a
+        tier is written onto.
+  - id: 3
+    from: node
+    to: node
+    function: tier_update
+    payload:
+      peer: worker
+      tier: 3
+    description: |
+        The reputation process publishes worker at tier 3. Local IPC, so
+        from and to are the same node.
+  - id: 4
+    from: node
+    to: node
+    function: tier_update
+    payload:
+      peer: node
+      tier: 2
+    description: A node's own tier, resolved against its own identity.
+  - id: 5
+    from: node
+    to: node
+    function: tier_update
+    payload:
+      unknown_peer: true
+      tier: 4
+    description: |
+        A tier for a uuid this node has no record of. Dropped without
+        inventing a peer; nothing else changes.
+  - id: 6
+    from: node
+    to: node
+    function: tier_update
+    payload:
+      peer: worker
+      tier: 3
+    repeat: 2
+    description: |
+        The same value again, twice. A correct handler is idempotent here —
+        the tier does not move and nothing else is disturbed.
+
+expected_state:
+  node:
+    # Step 5's unknown uuid invented nobody.
+    peer_count: 1
+    peer_tier:
+      worker: 3
+      node: 2
