@@ -37,7 +37,7 @@ from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from autonomous_trust.core.algorithms.impl import AgreementImpl
 from autonomous_trust.core.capabilities import Capabilities, PeerCapabilities
@@ -78,6 +78,12 @@ _TRIGGER_CAPS_RESYNC = 'trigger_caps_resync'
 # target participant (aggregate_subtree_roster over a fetch that asks each
 # gateway for its local members + child gateways). Used by
 # subtree-member-roster. The C adapter recognizes the same string.
+#: Namespace for the synthetic uuids these constructors mint -- the cohort ids
+#: in a hierarchy claim, and the "nobody" peer a tier update can name. Fixed
+#: so a replay produces the same bytes, and distinct from the participant-uuid
+#: namespace so a minted cohort can never collide with a participant.
+_HIER_NS = UUID('00000000-0000-0000-0000-000000000bbb')
+
 _TRIGGER_SUBTREE_ROSTER = 'trigger_subtree_roster'
 # Pseudo-function: re-derive this participant's place in the gateway tree
 # (protocol step 7). Observable via the `parent_gateway` expected_state key; the
@@ -152,6 +158,23 @@ class _Participant:
     # straight out of IdentityProcess._peer_clock_samples -- the harness
     # relabels, it does not compute. See doc/architecture/cohort-clock-skew.md.
     attest_clock_samples: dict = field(default_factory=dict)
+    # participant id -> uuid string, for every participant in the scenario.
+    # Filled by the adapter at setup; see _uuid_for_pid.
+    pid_to_uuid: dict = field(default_factory=dict)
+
+    def _uuid_for_pid(self, pid: str) -> str:
+        """Resolve a scenario participant id to its uuid string.
+
+        Raises rather than returning a miss: a state key naming a participant
+        that does not exist is a broken fixture, and silently comparing
+        against nothing would make the assertion pass vacuously.
+        """
+        try:
+            return self.pid_to_uuid[pid]
+        except KeyError:
+            raise AssertionError(
+                f'{self.id}: expected_state names unknown participant {pid!r}'
+            ) from None
 
     def drain_outbox(self) -> list[CapturedMessage]:
         captured: list[CapturedMessage] = []
@@ -373,6 +396,64 @@ class _Participant:
                 if actual != want:
                     raise AssertionError(
                         f'{self.id}: subtree_roster={actual}, expected {want}')
+            elif key == 'hierarchy_of':
+                # What this participant RECORDED from a peer's hierarchy claim
+                # (protocol step 7), as {participant_id: {rank, children}}.
+                # The recording is gated -- proved gateway authority, the
+                # claim naming its own sender, and a freshness sequence above
+                # the mark -- and every one of those gates is invisible in the
+                # emitted traffic, so the store is the only place a refusal
+                # can be observed. `null` asserts nothing was recorded for
+                # that peer. C mirrors via identity_get_peer_hierarchy.
+                for pid, want in (expected or {}).items():
+                    peer_uuid = str(self._uuid_for_pid(pid))
+                    claim = (getattr(self.process, 'peer_hierarchy', {})
+                             or {}).get(peer_uuid)
+                    if want is None:
+                        if claim is not None:
+                            raise AssertionError(
+                                f'{self.id}: recorded a hierarchy claim from '
+                                f'{pid}, expected none')
+                        continue
+                    if claim is None:
+                        raise AssertionError(
+                            f'{self.id}: no hierarchy claim recorded from '
+                            f'{pid}, expected {want}')
+                    if 'rank' in want and int(claim.get('rank', 0)) != int(want['rank']):
+                        raise AssertionError(
+                            f'{self.id}: hierarchy_of[{pid}].rank='
+                            f'{claim.get("rank")}, expected {want["rank"]}')
+                    if 'children' in want:
+                        got_n = len(claim.get('children') or [])
+                        if got_n != int(want['children']):
+                            raise AssertionError(
+                                f'{self.id}: hierarchy_of[{pid}].children='
+                                f'{got_n}, expected {want["children"]}')
+            elif key == 'peer_tier':
+                # The reputation-derived trust tier this participant applied
+                # to a peer, as {participant_id: tier}. Distinct from rank:
+                # tier is the runtime, local-view trust attribute a
+                # negotiation tier-gate reads (doc/architecture/trust-tiers.md),
+                # and it arrives only over local IPC. C mirrors via
+                # identity_get_peer_tier.
+                for pid, want in (expected or {}).items():
+                    peer_uuid = self._uuid_for_pid(pid)
+                    actual = None
+                    if str(self.identity.uuid) == str(peer_uuid):
+                        actual = int(getattr(self.identity, '_tier', 0) or 0)
+                    else:
+                        for peer in self.process.peers.all:
+                            if str(getattr(peer, 'uuid', '')) == str(peer_uuid):
+                                actual = int(getattr(peer, '_tier', 0) or 0)
+                                break
+                    if actual is None:
+                        raise AssertionError(
+                            f'{self.id}: peer_tier names {pid}, which is not '
+                            f'a known peer here')
+                    if actual != int(want):
+                        raise AssertionError(
+                            f'{self.id}: peer_tier[{pid}]={actual}, '
+                            f'expected {int(want)}')
             elif key == 'parent_gateway':
                 # The higher-rank node this participant DERIVES as its parent (protocol
                 # step 7, doc/architecture/gateway-reputation-tree.md), as a participant
@@ -962,6 +1043,16 @@ class IdentityAdapter:
             str(h.impl.identity.uuid): h.impl for h in handles.values()}
         self._roster_uuid_to_pid = {
             str(h.impl.identity.uuid): pid for pid, h in handles.items()}
+        # The reverse map, handed to every participant so an expected_state key
+        # can name a peer by participant id even when the store it reads is
+        # keyed by uuid (hierarchy_of, peer_tier). The relabel-at-dispatch
+        # trick the roster and clock-sample keys use does not work for those:
+        # a handler writes them into process state directly, and there is no
+        # adapter-side moment that sees both the uuid and the id.
+        pid_to_uuid = {pid: str(h.impl.identity.uuid)
+                       for pid, h in handles.items()}
+        for h in handles.values():
+            h.impl.pid_to_uuid = dict(pid_to_uuid)
         # ranks fixture: {pid: int} — the topology rank each participant HAS,
         # applied both to its own identity and to every other node's view of it.
         # Rank is what the hierarchy derivation reads (protocol step 7), so a
@@ -1369,7 +1460,52 @@ class IdentityAdapter:
         # this is what makes votes_emitted symmetric across the two impls.
         if inbound.function == IdentityProtocol.propose:
             participant.process.vote_response(participant.queues)
+        # Same reason, one seam further out: the attest responder cannot answer
+        # inline either. handle_attest_request parks the pull and asks the MAIN
+        # loop, because only the main loop shares an address space with the
+        # console's OperatorSession; handle_operator_state_response is what
+        # finally emits the attestation. C reaches the answer in one hop from
+        # its own seam, so without a main loop here the Python responder half
+        # never runs at all and the two runtimes are compared on nothing.
+        if inbound.function == IdentityProtocol.attest_req:
+            self._answer_operator_state_query(participant)
         return participant.drain_outbox()
+
+    def _answer_operator_state_query(self, participant: _Participant) -> None:
+        """Stand in for the main loop's `_answer_operator_state`.
+
+        Consumes whatever operator_state_query the identity process just put on
+        its main queue and feeds back the reply that loop would send, deriving
+        attendance from the stub session through the SAME `is_attended` the
+        production loop uses -- so the two processes cannot drift apart here any
+        more than they can in the real node. The epoch is the participant's
+        fixture clock rather than `time.time()`: production stamps wall clock,
+        and a scenario has to be reproducible.
+        """
+        from autonomous_trust.core.operator.session import is_attended
+
+        sink = participant.queues[CfgIds.main]._sink
+        queries = [m for m in sink
+                   if isinstance(m, Message)
+                   and m.function == IdentityProtocol.operator_state_req]
+        if not queries:
+            return
+        for m in queries:
+            sink.remove(m)
+        session = getattr(participant.process, '_operator_session', None)
+        attended = bool(session is not None and is_attended(session))
+        # One answer serves every pull in flight -- they all asked the same
+        # question of the same session -- which is exactly what the handler
+        # assumes when it drains the whole pending table.
+        reply = Message(CfgIds.identity, IdentityProtocol.operator_state_resp,
+                        to_json_string({
+                            'attended': attended,
+                            'epoch': (participant.attest_clock or 0.0) if attended else 0.0,
+                            'have_session': session is not None,
+                        }),
+                        from_whom=participant.identity)
+        participant.process.handle_operator_state_response(participant.queues,
+                                                           reply)
 
     # ------------------------------------------------------------------
     # Inbound construction
@@ -1431,6 +1567,78 @@ class IdentityAdapter:
             # via Group.from_canonical. See [[project_group_key_sync]].
             target_group = sender.process.group
             obj = to_json_string(target_group.to_canonical()) if target_group else ''
+        elif function == IdentityProtocol.hierarchy_req:
+            # A late joiner asking the group to state their positions
+            # (protocol step 7). The handler answers from its own claim and
+            # reads nothing out of the payload, so the requestor field is
+            # informational -- carried anyway, because it is what production
+            # sends (_request_hierarchy) and a scenario should exercise the
+            # bytes the wire actually has.
+            obj = to_json_string({'requestor': str(sender_identity.uuid)})
+        elif function == IdentityProtocol.hierarchy:
+            # A node's claim about ITS OWN place in the tree. `node` is the
+            # sender by construction: handle_hierarchy refuses a claim naming
+            # anybody else, and `payload.claims` lets a scenario name another
+            # participant deliberately to exercise that refusal.
+            #
+            # `children` are the GROUP uuids of the cohorts the sender
+            # gateways (idprocess._hierarchy_claim reads self.child_groups),
+            # not peer uuids -- so a scenario gives a count-shaped list and
+            # the adapter mints stable uuid5s for it. That keeps the fixture
+            # from having to know a group uuid it never created.
+            claimant = payload.get('claims')
+            node = (str(participants[claimant].impl.identity.uuid)
+                    if claimant else str(sender_identity.uuid))
+            parent_pid = payload.get('parent')
+            n_children = int(payload.get('children', 0) or 0)
+            children = [str(uuid5(_HIER_NS, f'{node}:cohort:{i}'))
+                        for i in range(n_children)]
+            body = {
+                'node':     node,
+                'parent':   (str(participants[parent_pid].impl.identity.uuid)
+                             if parent_pid else ''),
+                'children': children,
+                'rank':     int(payload.get('rank', 0) or 0),
+            }
+            # `unstamped: true` omits the freshness sequence, modelling a
+            # replayable claim; both runtimes must refuse it rather than
+            # record it, because this dict is what child-gateway discovery
+            # recurses into.
+            if not payload.get('unstamped'):
+                body['seq'] = int(payload.get('seq', 1))
+            obj = to_json_string(body)
+        elif function == IdentityProtocol.roster_req:
+            # Subtree-roster query. `requesting_process` is load-bearing: the
+            # answer is addressed to the process the requestor names, and the
+            # aggregation that consumes it lives in the main loop, not here.
+            obj = to_json_string({
+                'requestor': str(sender_identity.uuid),
+                'requesting_process': payload.get('proc', CfgIds.main),
+            })
+        elif function == IdentityProtocol.attest_req:
+            # Attended-now pull, as it arrives on the wire. The nonce is what
+            # binds an answer to the request that asked for it, so it is
+            # spelled out by the scenario rather than minted here; omitting it
+            # (`no_nonce`) is a distinct case, because an unnonced attestation
+            # is replayable forever and must be refused rather than answered.
+            body = {}
+            if not payload.get('no_nonce'):
+                body['nonce'] = str(payload.get('nonce', 'n1'))
+            obj = to_json_string(body)
+        elif function == IdentityProtocol.tier_update:
+            # Local IPC from the reputation process, not a wire message: the
+            # payload is the (peer_uuid, tier) pair _publish_tier_change
+            # emits. `peer` names a participant; `unknown_peer` sends a uuid
+            # for nobody, which both runtimes must drop quietly rather than
+            # apply to somebody.
+            target_pid = payload.get('peer')
+            if payload.get('unknown_peer'):
+                target_uuid = str(uuid5(_HIER_NS, 'tier:nobody'))
+            elif target_pid:
+                target_uuid = str(participants[target_pid].impl.identity.uuid)
+            else:
+                target_uuid = str(sender_identity.uuid)
+            obj = to_json_string((target_uuid, int(payload.get('tier', 0))))
         elif function == IdentityProtocol.diff:
             obj = to_json_string([])
         elif function == IdentityProtocol.history:

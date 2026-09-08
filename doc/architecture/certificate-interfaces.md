@@ -244,4 +244,9 @@ second true.
   why certificates are step 2.
 - [Physical Consistency](physical-consistency.md) — step 1, the layer above this
   one in the scorer.
+- [Calibration Audit](calibration-audit.md) — step 3, whose verdict arm sits
+  just below this one, because an exact check of *this* answer outranks a
+  statistical claim about a hundred of them.
+- [Prequential Competence](prequential-competence.md) — step 4, which renders no
+  verdict at all and so sits outside this arm order entirely.
 - [Reputation Consensus](reputation.md) — the algebra these verdicts feed.

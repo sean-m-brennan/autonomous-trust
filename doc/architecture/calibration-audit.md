@@ -308,6 +308,9 @@ natural home for the competence half this layer deliberately does not score.
   the `quantity` declarations this layer resolves against
 * [Certificate-Carrying Interfaces](certificate-interfaces.md) — step 2, and
   the only layer that can return a good score
+* [Prequential Competence](prequential-competence.md) — step 4, which scores
+  the *tightness* of the same `prediction` box this layer audits the *honesty*
+  of, and so completes the one-sidedness this layer is deliberately limited to
 * [Task Negotiation](negotiation.md) — the task lifecycle the prediction rides on
 * [Reputation Consensus](reputation.md) — where the verdict lands
 * [The Verification Oracle](../verification_oracle.md) — the full research framing

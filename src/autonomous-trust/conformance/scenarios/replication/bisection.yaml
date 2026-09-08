@@ -1,0 +1,171 @@
+schema_version: "1"
+kind: scenario
+protocol: replication
+name: bisection
+byte_pinning: false
+description: |
+    Resolving a two-way dispute by the bisection game (R+D.md §12.6 slice C;
+    doc/verification_oracle.md build-order step 6, "Resolve disputes by
+    bisection, not by re-execution"; doc/architecture/replication.md). When the
+    adjudicator (slice B) returns `dispute` and scores nobody, this localizes
+    the fault to a single step of a hash-chained trace -- logarithmic in the
+    computation length -- and adjudicates that one step against a reference,
+    rather than re-running the whole thing or taking a vote.
+
+    Why this has to agree across runtimes. Two things are pinned and both must
+    be bit-identical. The COMMITTED ROOT is the blake2b hash chain each
+    executor commits to; if the two runtimes hashed a trace differently, an
+    executor's own commitment would not verify against itself across a boundary
+    -- the same reason the reputation Merkle root is pinned. The DIVERGENCE
+    INDEX is what the binary search finds; the search is only sound because the
+    chain makes "the two chains differ at i" monotonic (h_i depends on every
+    prior state), so a runtime that searched a bare state list -- where two
+    states can differ at k and agree again at k+1 -- could localize the fault to
+    the wrong step and convict the honest executor.
+
+    What each row pins:
+
+      - Rows 1-2: the honest-vs-cheater case the game exists for. The honest
+        trace matches the reference throughout, so the first place the two
+        executors' chains part IS the cheater's first departure from the
+        truth; the single-step check there corroborates the honest executor
+        (0.9) and outvotes the cheater (0.1), on the `replication` channel that
+        already weighs a corroborated finding twice. The committed roots are
+        pinned to all 64 hex digits so the two runtimes are shown to hash
+        identically, not merely to agree on the verdict.
+      - Row 3: a cheater that diverges LATE. Binary search still finds the
+        first divergent step; a linear "compare from the start" would too, but
+        the point of bisection is that it costs log(n) challenges, and the
+        index it returns is the same.
+      - Row 4: BOTH executors wrong at the divergence, in different ways. Both
+        are outvoted (0.1 each) -- the honest outcome, not a tie and not a
+        pass. The reference, not either executor, is the ground truth.
+      - Row 5: no divergence at all. Two identical traces are not a dispute the
+        game resolves; `divergence_index` is null and both are corroborated.
+        This is the guard against the game inventing a fault where there is
+        none.
+      - Row 6: a LENGTH divergence. One executor computed a step the other did
+        not; the divergence is at the common length, and the check compares
+        each executor's state there (the shorter one has none, which the
+        reference's real state cannot equal) -- so the one that kept computing
+        correctly is corroborated and the one that stopped short is outvoted.
+      - Row 7: a longer trace (eight steps) diverging in the middle, so the
+        binary search does real work -- the divergence at step 5 is found by
+        halving, and the committed roots differ.
+
+    Shape and scope. Non-message-driven, like the other replication scenarios:
+    the adapter runs its runtime's bisection over `traces` (exactly two) and a
+    `reference`, asserting the committed `roots`, the `divergence_index`, the
+    per-executor `verdicts` and their `scores`. What is pinned is the GAME.
+    Wiring it to live tasks is deliberately NOT here: the game requires
+    deterministic replay of a peer's work, a constraint on how a capability is
+    written that AT cannot impose on an arbitrary one, so the live path is gated
+    on that precondition (doc/architecture/replication.md). States are opaque
+    tokens compared exactly -- numeric tolerance is a property of a final result
+    (slice B), not of the bit-exact intermediate states a replay reproduces.
+
+participants:
+  - id: requestor
+    role: new_node
+  - id: worker
+    role: peer
+
+fixtures:
+  replication:
+    version: 1
+    default_prob: 0.05
+
+  events:
+    # 1 honest vs cheater, diverging at step 2; roots pinned to all 64 digits
+    - bisect:
+        capability: cmd
+        traces:
+          A: [s0, s1, s2, s3, s4]
+          B: [s0, s1, X2, X3, X4]
+        reference: [s0, s1, s2, s3, s4]
+      divergence_index: 2
+      roots:
+        A: "4339f13f00492a5b54735f094c5ce6e70d7956e1a56fce6eed6c496fe4d955a6"
+        B: "e6daf84814a49eff7e0b8260601f1c53e3d1d37401f7dbab3b3a5839d5df9240"
+      verdicts: {A: corroborated, B: outvoted}
+      scores: {A: [0.9, replication], B: [0.1, replication]}
+
+    # 2 same shape, the other executor is the honest one (order independence)
+    - bisect:
+        capability: cmd
+        traces:
+          B: [s0, s1, X2, X3, X4]
+          A: [s0, s1, s2, s3, s4]
+        reference: [s0, s1, s2, s3, s4]
+      divergence_index: 2
+      verdicts: {A: corroborated, B: outvoted}
+      scores: {A: [0.9, replication], B: [0.1, replication]}
+
+    # 3 a cheater diverging at the LAST step
+    - bisect:
+        capability: cmd
+        traces:
+          A: [a, b, c, d, e]
+          B: [a, b, c, d, z]
+        reference: [a, b, c, d, e]
+      divergence_index: 4
+      verdicts: {A: corroborated, B: outvoted}
+      scores: {A: [0.9, replication], B: [0.1, replication]}
+
+    # 4 BOTH wrong at the divergence -> both outvoted
+    - bisect:
+        capability: cmd
+        traces:
+          A: [a, q, c]
+          B: [a, w, c]
+        reference: [a, b, c]
+      divergence_index: 1
+      verdicts: {A: outvoted, B: outvoted}
+      scores: {A: [0.1, replication], B: [0.1, replication]}
+
+    # 5 identical traces: no dispute, divergence_index null, both corroborated
+    - bisect:
+        capability: cmd
+        traces:
+          A: [a, b, c]
+          B: [a, b, c]
+        reference: [a, b, c]
+      divergence_index: null
+      verdicts: {A: corroborated, B: corroborated}
+      scores: {A: [0.9, replication], B: [0.9, replication]}
+
+    # 6 a length divergence: A computed a fourth step, B stopped short
+    - bisect:
+        capability: cmd
+        traces:
+          A: [a, b, c, d]
+          B: [a, b, c]
+        reference: [a, b, c, d]
+      divergence_index: 3
+      verdicts: {A: corroborated, B: outvoted}
+      scores: {A: [0.9, replication], B: [0.1, replication]}
+
+    # 7 an eight-step trace diverging in the middle; the search does real work
+    - bisect:
+        capability: cmd
+        traces:
+          A: [a, b, c, d, e, f, g, h]
+          B: [a, b, c, d, e, Z, g, h]
+        reference: [a, b, c, d, e, f, g, h]
+      divergence_index: 5
+      roots:
+        A: "aaa436a4a95c8a44ae585c69657418dba75b1d05a9629e2c0c1142dad9829cd9"
+        B: "1755636484c794a58ed53f2986ac5af39c0d0f071047b8dc9818646fbca2adf3"
+      verdicts: {A: corroborated, B: outvoted}
+      scores: {A: [0.9, replication], B: [0.1, replication]}
+
+steps:
+  - id: 1
+    from: requestor
+    to: requestor
+    function: replay_events
+    description: |
+        Trigger. For each `bisect` row the requestor runs its runtime's
+        bisection over the two committed traces and the reference, asserting
+        the committed roots, the divergence index the binary search finds, and
+        the per-executor verdicts and scores the single-step check renders.

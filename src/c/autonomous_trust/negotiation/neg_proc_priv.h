@@ -166,6 +166,28 @@ double negotiation_score_task_result(const char *cap_name,
                                      uint64_t seed,
                                      const char **channel_out);
 
+/** The learned EMA weight multiplier for @p subject on @p cap_name
+ *  (R+D.md §12.5), NOT a score.
+ *
+ *  Prequential competence is deliberately not one of the arms of
+ *  ::negotiation_score_task_result: a peer whose forecasts are wide or wrong
+ *  has told no lie, so it earns no evidence channel and no score. What it
+ *  produces is a multiplier on how much this score weighs in the EMA,
+ *  composed with the capability's authored `transaction_weight` and §12.8's
+ *  channel weight in the reputation process.
+ *
+ *  Confined to the declared band around 1.0, and exactly
+ *  ::AT_PREQ_NEUTRAL_COMPETENCE (1.0, the authored weight verbatim) with the
+ *  layer off, the capability undeclared, @p subject unknown or NULL, or the
+ *  peer's record shorter than `min_samples`. @p subject is a peer uuid string,
+ *  the same key ::negotiation_score_task_result files observations under.
+ *
+ *  Exported for the same reason the scorer is: tests and the conformance
+ *  adapter must exercise the function production uses.
+ *  See doc/architecture/prequential-competence.md. */
+double negotiation_competence_weight(const char *cap_name,
+                                     const char *subject);
+
 /** Python type tags carried by every negotiation payload (doc/architecture/negotiation.md).
  *
  *  Shared constants rather than language artifacts -- the same argument that

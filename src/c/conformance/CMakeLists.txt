@@ -41,6 +41,8 @@ set(AT_CONFORMANCE_SOURCES
     adapters/bootstrap.c
     adapters/physics.c
     adapters/calibration.c
+    adapters/prequential.c
+    adapters/replication.c
     adapters/certificate.c
 )
 

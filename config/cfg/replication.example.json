@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "default_prob": 0.05,
+  "capabilities": {
+    "demo.command-issue": {
+      "replicate_prob": 0.5,
+      "note": "high consequence: a tier-4 command-class task. The doc's 'scale replication to consequence' is realized here by the OPERATOR setting a large probability, in proportion to the capability weight it already authors in trust_ladder.json -- not by deriving one opaquely. p*L>g makes cheating unprofitable, and L is a tier demotion, so even this need not be 1.0"
+    },
+    "demo.thermal-forecast": {
+      "replicate_prob": 0.1,
+      "note": "a routine predictive capability the certificate and calibration layers already constrain; replication is the last recourse (build-order step 6), so its share is small"
+    },
+    "demo.query": {
+      "replicate_prob": 0.0,
+      "note": "a read-only query verifiable by other means; never worth a second executor. 0.0 is a real setting, not the absence of one"
+    }
+  }
+}

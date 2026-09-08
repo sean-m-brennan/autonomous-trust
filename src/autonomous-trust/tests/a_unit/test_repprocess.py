@@ -1625,7 +1625,7 @@ class TestAppFacingReputationRated:
         peer = _make_mock_peer()
         rp, queues, main_q = self._rp_with_queue([peer])
         rp.reputations.update(UUID(str(peer.uuid)), 0.73)
-        assert rp.emit_all_reputations(queues) == 2      # the peer + self
+        assert rp.emit_all_reputations(queues) == 1      # the peer; never self
         emitted = {e.peer_uuid: e for e in self._drain(main_q)}
         assert emitted[str(peer.uuid)].rated is True
         assert emitted[str(peer.uuid)].score == pytest.approx(0.73)
@@ -1658,7 +1658,20 @@ class TestAppFacingReputationRated:
         msg = MagicMock()
         msg.function = ReputationProtocol.app_roster_request
         assert rp.handle_app_roster_request(queues, msg) is True
-        assert len(self._drain(main_q)) == 3            # two peers + self
+        assert len(self._drain(main_q)) == 2            # the peers; never self
+
+    def test_the_roster_never_carries_this_node_itself(self):
+        """Peers only. A reputation is what the network observed ABOUT a peer,
+        and a node holds no such observation of itself; a self-entry could only
+        carry its own unrated 0.0, which a consumer cannot tell from a genuine
+        unrated peer. C's reputation_emit_all walks its peers array and has
+        always emitted N -- Python emitted N+1 until this was aligned."""
+        peer = _make_mock_peer()
+        rp, queues, main_q = self._rp_with_queue([peer])
+        rp.emit_all_reputations(queues)
+        emitted = {e.peer_uuid for e in self._drain(main_q)}
+        assert emitted == {str(peer.uuid)}
+        assert str(rp.identity.uuid) not in emitted
 
     def test_the_handler_declines_other_verbs(self):
         rp, queues, main_q = self._rp_with_queue([_make_mock_peer()])

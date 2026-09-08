@@ -476,6 +476,12 @@ set(libsrc
     autonomous_trust/calibration/conformal.c
     autonomous_trust/physics/physics.c
     autonomous_trust/physics/units.c
+    autonomous_trust/prequential/prequential.c
+    autonomous_trust/prequential/scoring.c
+    autonomous_trust/replication/replication.c
+    autonomous_trust/replication/sampling.c
+    autonomous_trust/replication/adjudication.c
+    autonomous_trust/replication/bisection.c
     autonomous_trust/processes/capabilities.c
     autonomous_trust/processes/daemonize.c
     autonomous_trust/processes/process_tracker.c
@@ -1001,6 +1007,14 @@ add_executable(calibration_test test/calibration_test.c)
 set_source_files_properties(test/calibration_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(calibration_test PRIVATE ${AT_TEST_LIBS})
 
+add_executable(prequential_test test/prequential_test.c)
+set_source_files_properties(test/prequential_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(prequential_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(replication_test test/replication_test.c)
+set_source_files_properties(test/replication_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(replication_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(certificates_test test/certificates_test.c)
 set_source_files_properties(test/certificates_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(certificates_test PRIVATE ${AT_TEST_LIBS})
@@ -1169,6 +1183,8 @@ add_test(NAME bootstrap_capabilities_test COMMAND $<TARGET_FILE:bootstrap_capabi
 add_test(NAME bootstrap_worker_test COMMAND $<TARGET_FILE:bootstrap_worker_test>)
 add_test(NAME physics_test COMMAND $<TARGET_FILE:physics_test>)
 add_test(NAME calibration_test COMMAND $<TARGET_FILE:calibration_test>)
+add_test(NAME prequential_test COMMAND $<TARGET_FILE:prequential_test>)
+add_test(NAME replication_test COMMAND $<TARGET_FILE:replication_test>)
 add_test(NAME certificates_test COMMAND $<TARGET_FILE:certificates_test>)
 add_test(NAME net_message_test COMMAND $<TARGET_FILE:net_message_test>)
 add_test(NAME socket_helpers_test COMMAND $<TARGET_FILE:socket_helpers_test>)

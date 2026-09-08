@@ -154,6 +154,23 @@ typedef struct {
      * memcpy in msg_types.c (TRANSACTION_SCORE ser/de), so no field-wise
      * packing. Mirrors Python TransactionScore.channel. */
     char channel[TX_CHANNEL_NAMELEN + 1];
+    /* The learned multiplier on this score's EMA weight (R+D.md §12.5): the
+     * subject peer's prequential record on this capability, measured by the
+     * negotiation process that observed the forecast and carried to the
+     * reputation process that applies the weight. Mirrors Python
+     * TransactionScore.competence.
+     *
+     * Zero or negative == absent -> 1.0, the authored transaction_weight
+     * verbatim, which is what every producer predating this field meant (and
+     * what a zeroed struct says). Local-only by exactly the construction that
+     * makes `peer_uuid` above local-only: this struct never crosses the wire.
+     * That is not tidiness -- a peer that could stamp its own competence
+     * would hold a lever on every EMA it appears in, the same reason §12.8's
+     * channel weight applies to locally-produced evidence only.
+     *
+     * Carried verbatim by the whole-struct memcpy in msg_types.c
+     * (TRANSACTION_SCORE ser/de), so no field-wise packing. */
+    double competence;
 } tx_score_msg_t;
 
 typedef struct {

@@ -61,6 +61,8 @@ from .reputation import (TransactionScore, ReputationProtocol, PeerReputation,
                          TX_CHANNEL_PHYSICAL, TX_CHANNEL_PROBE)
 from .reputation.reputation import Reputation
 from .physics import PhysicsChecker, PhysicsDeclarationError
+from .prequential import (NEUTRAL_COMPETENCE, PrequentialDeclarationError,
+                          PrequentialEstimator)
 from .calibration import (CalibrationAuditor, CalibrationDeclarationError,
                           OVERCONFIDENT_SCORE)
 from .certificates import (CertificateDeclarationError, CertificateVerifier,
@@ -193,12 +195,70 @@ def calibration_auditor() -> CalibrationAuditor:
     return _CALIBRATION
 
 
+#: Process-wide prequential estimator (R+D.md §12.5), built lazily from
+#: ``$AT_PREQUENTIAL``. A singleton for the same reason the coverage auditor
+#: is, and rather more so: the competence multiplier IS the accumulated record
+#: of resolved forecasts, so a fresh estimator per result would weight every
+#: peer at exactly 1.0 forever.
+#:
+#: Handed the physics model because that is what maps a reporting capability to
+#: the quantity it reports, which is how a later result resolves an earlier
+#: forecast with no application involvement -- the same link the coverage audit
+#: uses, and the same declaration.
+_PREQUENTIAL: 'PrequentialEstimator | None' = None
+
+
+def prequential_estimator() -> PrequentialEstimator:
+    """The process-wide estimator, built on first call.
+
+    This is also the access point for the aggregation half: an in-process
+    application asks ``prequential_estimator().combine(quantity, now)`` for the
+    mesh's aggregate forecast, and ``.regret(quantity)`` for the realized
+    regret and Hedge's bound on it. Nothing in AT core consumes either.
+    """
+    global _PREQUENTIAL
+    if _PREQUENTIAL is None:
+        try:
+            _PREQUENTIAL = PrequentialEstimator.from_env(
+                physics_model=physics_checker().model)
+        except PrequentialDeclarationError:
+            logging.getLogger(__name__).error(
+                'prequential: declaration rejected, layer stays OFF: %s',
+                traceback.format_exc())
+            _PREQUENTIAL = PrequentialEstimator()
+    return _PREQUENTIAL
+
+
+def competence_weight(capability_name, subject_uuid,
+                      prequential: 'PrequentialEstimator | None' = None
+                      ) -> float:
+    """The learned EMA weight multiplier for this peer on this capability.
+
+    Read where the ``TransactionScore`` is BUILT rather than inside
+    :func:`score_task_result`, because this layer contributes no score and no
+    channel: it changes how much a peer's evidence counts, not what the
+    evidence says (R+D.md §12.5, doc/architecture/prequential-competence.md).
+    Keeping it out of the scoring function also keeps that function's arms
+    exactly the set of things that can *speak*.
+
+    :data:`~.prequential.NEUTRAL_COMPETENCE` -- 1.0, the authored
+    ``transaction_weight`` verbatim -- whenever the layer is off, the
+    capability is undeclared, or the record is too short to say anything.
+    """
+    estimator = (prequential if prequential is not None
+                 else prequential_estimator())
+    if not estimator.enabled:
+        return NEUTRAL_COMPETENCE
+    return estimator.competence(_subject_key(subject_uuid), capability_name)
+
+
 def score_task_result(task, logger=None, name: str = '',
                       physics: 'PhysicsChecker | None' = None,
                       now_sec: float = None,
                       certificates: 'CertificateVerifier | None' = None,
                       seed: int = None,
-                      calibration: 'CalibrationAuditor | None' = None
+                      calibration: 'CalibrationAuditor | None' = None,
+                      prequential: 'PrequentialEstimator | None' = None
                       ) -> tuple[float, str]:
     """Score a returned :class:`TaskResult` and name its evidence channel.
 
@@ -296,6 +356,30 @@ def score_task_result(task, logger=None, name: str = '',
         if settled and logger is not None:
             logger.debug('%s: task %s resolved %d outstanding prediction(s)',
                          name, task.uuid, settled)
+
+    # Prequential competence (R+D.md §12.5), both halves, here and not lower
+    # down. This layer renders NO verdict -- it produces the weight multiplier
+    # `competence_weight` reads when the score is built -- so it has no place
+    # in the arm order below, and putting it there would make the record
+    # depend on which other layer happened to speak first: a forecast on a
+    # reply whose certificate arm is about to score it still has to be
+    # recorded. After physics for the same reason the audit's settle is: a
+    # refuted observation must not resolve an honest forecaster's forecast,
+    # and a refuted result records no forecast of its own either, since a
+    # refuted claim is not evidence in either direction.
+    #
+    # Settle before observe, so a peer forecasting the same quantity it just
+    # reported is weighted against a record including everything this result
+    # settled.
+    estimator = (prequential if prequential is not None
+                 else prequential_estimator())
+    if estimator.enabled:
+        resolved = estimator.settle(cap_name, task.result, subject, audit_now)
+        if resolved and logger is not None:
+            logger.debug('%s: task %s resolved %d outstanding forecast(s)',
+                         name, task.uuid, resolved)
+        estimator.observe(cap_name, getattr(task, 'prediction', None), subject,
+                          audit_now)
 
     # Certificate-carrying interfaces (R+D.md §12.3), after physics and before
     # the ZKP arms. After physics because a witness proves the answer satisfies
@@ -1251,11 +1335,19 @@ class AutonomousTrust(Protocol):
                     # to one peer). Local-only and never serialized; it is
                     # what lets a hard-channel refutation propose a slash
                     # against the right peer (R+D.md §12.8).
+                    # competence: the learned multiplier on this score's EMA
+                    # weight (R+D.md §12.5). Local-only and never serialized,
+                    # like subject_uuid above -- a peer that could stamp its
+                    # own would hold a lever on every EMA it appears in, which
+                    # is the same reason a remote score's channel does not
+                    # weigh (R+D.md §12.8).
+                    executor = getattr(task, 'executor_uuid', None)
                     tx = TransactionScore(task.uuid, score,
                                           capability_name=cap_name,
                                           channel=channel,
-                                          subject_uuid=getattr(
-                                              task, 'executor_uuid', None))
+                                          subject_uuid=executor,
+                                          competence=competence_weight(
+                                              cap_name, executor))
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
                     if self.external_feedback in queues:
                         queues[self.external_feedback].put(task, block=True, timeout=queue_cadence)
