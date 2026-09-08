@@ -1,0 +1,129 @@
+schema_version: "1"
+kind: scenario
+protocol: replication
+name: adjudication
+byte_pinning: false
+description: |
+    What a replicated task's results say about each executor (R+D.md §12.6
+    slice B; doc/verification_oracle.md build-order step 6;
+    doc/architecture/replication.md). Once sampling has said a task is checked,
+    several executors return a result and this decides the verdict for each and
+    the score it maps to on the `replication` evidence channel.
+
+    Why this has to agree across runtimes. The verdict decides whether a peer's
+    reputation moves up, down, or not at all, and the channel it moves on is
+    weighted TWICE (corroborated by construction, R+D.md §12.8). A task one
+    runtime reads as corroborated and the other as outvoted would move the same
+    peer in opposite directions depending on which implementation adjudicated.
+
+    What each row pins:
+
+      - Rows 1-2: unanimity and a clear majority. All agreeing is every
+        executor corroborated (0.9, the certificate layer's proved-right
+        number, because an independent executor reproducing the work is
+        positive evidence). A lone dissenter against a majority is outvoted
+        (0.1, proved-wrong).
+      - Rows 3-4: the two-way cases, which are the crux. Two executors that
+        AGREE are both corroborated -- 2 of 2 is a strict majority. Two that
+        DISAGREE are a `dispute`: NOBODY is scored, because a majority is not
+        an oracle and one replica's word must never let it defame the executor
+        it was checking. The disputed task is what the bisection game resolves,
+        not a vote. `scores: {}` pins that no score crosses.
+      - Row 5: a 2-2 split among four executors is also a dispute -- 2 is not
+        strictly more than half of 4. "Most" is not "more than half".
+      - Row 6: a 3-1-1 split. Three agreeing of five IS a strict majority
+        (6 > 5), so the three are corroborated and both singletons outvoted,
+        even though neither singleton agrees with the other either.
+      - Rows 7-8: agreement within a declared tolerance. `sensor` tolerates
+        0.1, so 20.00 and 20.05 are the same answer and 20.00 and 20.2 are
+        not; `cmd` tolerates nothing, so 1.0 and 1.0000001 already disagree.
+        The tolerance is a property of the capability, declared once.
+      - Row 9: a numeric result never agrees with a string one -- Python's
+        `42 == "42"` is false, and the C twin keeps numbers and non-numbers
+        apart for exactly this reason. Two results, no agreement, so a dispute.
+      - Row 10: non-numeric results compare by exact equality: two "ok" and one
+        "bad" is a majority for "ok".
+      - Row 11: a single result is `single`, not a verdict -- nothing was
+        actually replicated, so there is nothing to corroborate or contradict,
+        and no score crosses.
+
+    Shape. Non-message-driven, like sampling and the physics/calibration/
+    prequential scenarios: the adapter loads `fixtures.replication` and, for
+    each `adjudicate` row, runs its runtime's adjudicator over the results and
+    asserts the per-executor `verdicts` and the `scores` that survive the
+    verdict->score mapping. A verdict with no score (`dispute`, `single`) is
+    absent from `scores` by construction, which `scores: {}` or an omitted
+    peer pins.
+
+participants:
+  - id: requestor
+    role: new_node
+  - id: worker
+    role: peer
+
+fixtures:
+  replication:
+    version: 1
+    default_prob: 0.05
+    capabilities:
+      cmd:
+        replicate_prob: 0.5
+      sensor:
+        replicate_prob: 0.2
+        tolerance: 0.1
+
+  events:
+    # 1 unanimity
+    - adjudicate: {capability: cmd, results: [{peer: E, value: 42}, {peer: R1, value: 42}, {peer: R2, value: 42}]}
+      verdicts: {E: corroborated, R1: corroborated, R2: corroborated}
+      scores: {E: [0.9, replication], R1: [0.9, replication], R2: [0.9, replication]}
+    # 2 clear majority, one dissenter
+    - adjudicate: {capability: cmd, results: [{peer: E, value: 42}, {peer: R1, value: 42}, {peer: R2, value: 7}]}
+      verdicts: {E: corroborated, R1: corroborated, R2: outvoted}
+      scores: {E: [0.9, replication], R1: [0.9, replication], R2: [0.1, replication]}
+    # 3 two agree -> both corroborated (2 of 2 is a strict majority)
+    - adjudicate: {capability: cmd, results: [{peer: E, value: 42}, {peer: R1, value: 42}]}
+      verdicts: {E: corroborated, R1: corroborated}
+      scores: {E: [0.9, replication], R1: [0.9, replication]}
+    # 4 two disagree -> dispute, nobody scored
+    - adjudicate: {capability: cmd, results: [{peer: E, value: 42}, {peer: R1, value: 7}]}
+      verdicts: {E: dispute, R1: dispute}
+      scores: {}
+    # 5 a 2-2 split is a dispute
+    - adjudicate: {capability: cmd, results: [{peer: E, value: 1}, {peer: R1, value: 1}, {peer: R2, value: 2}, {peer: R3, value: 2}]}
+      verdicts: {E: dispute, R1: dispute, R2: dispute, R3: dispute}
+      scores: {}
+    # 6 a 3-1-1 split: three is a strict majority of five
+    - adjudicate: {capability: cmd, results: [{peer: E, value: 5}, {peer: R1, value: 5}, {peer: R2, value: 5}, {peer: R3, value: 8}, {peer: R4, value: 9}]}
+      verdicts: {E: corroborated, R1: corroborated, R2: corroborated, R3: outvoted, R4: outvoted}
+      scores: {E: [0.9, replication], R1: [0.9, replication], R2: [0.9, replication], R3: [0.1, replication], R4: [0.1, replication]}
+    # 7 within tolerance -> agree
+    - adjudicate: {capability: sensor, results: [{peer: E, value: 20.0}, {peer: R1, value: 20.05}, {peer: R2, value: 20.2}]}
+      verdicts: {E: corroborated, R1: corroborated, R2: outvoted}
+      scores: {E: [0.9, replication], R1: [0.9, replication], R2: [0.1, replication]}
+    # 8 exact capability: a hair's difference already disagrees -> dispute
+    - adjudicate: {capability: cmd, results: [{peer: E, value: 1.0}, {peer: R1, value: 1.0000001}]}
+      verdicts: {E: dispute, R1: dispute}
+      scores: {}
+    # 9 number never agrees with a string -> dispute
+    - adjudicate: {capability: cmd, results: [{peer: E, value: 42}, {peer: R1, value: "42"}]}
+      verdicts: {E: dispute, R1: dispute}
+      scores: {}
+    # 10 non-numeric results compare exactly
+    - adjudicate: {capability: cmd, results: [{peer: E, value: "ok"}, {peer: R1, value: "ok"}, {peer: R2, value: "bad"}]}
+      verdicts: {E: corroborated, R1: corroborated, R2: outvoted}
+      scores: {E: [0.9, replication], R1: [0.9, replication], R2: [0.1, replication]}
+    # 11 a single result is not a verdict
+    - adjudicate: {capability: cmd, results: [{peer: E, value: 42}]}
+      verdicts: {E: single}
+      scores: {}
+
+steps:
+  - id: 1
+    from: requestor
+    to: requestor
+    function: replay_events
+    description: |
+        Trigger. For each `adjudicate` row the requestor runs its runtime's
+        adjudicator over the results and asserts the per-executor verdicts and
+        the scores that survive the verdict->score mapping.

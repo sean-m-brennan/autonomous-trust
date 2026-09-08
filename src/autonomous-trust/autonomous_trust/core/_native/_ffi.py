@@ -528,6 +528,13 @@ ffi.cdef("""
            which the far end then refuses rather than grades, an obscure way to
            learn the mirror drifted. Mirrors reputation/tx_channel.h. */
         char channel[32];
+        /* Learned EMA weight multiplier (R+D.md §12.5). Same whole-struct
+           memcpy, so an absent mirror shifts nothing but loses the field and
+           silently weights every peer at the authored number. Non-positive
+           (a zeroed struct) means 1.0, which is what pre-field producers
+           meant. Local-only: this struct never crosses the wire. Mirrors
+           Python TransactionScore.competence. */
+        double competence;
     } tx_score_msg_t;
 
     size_t message_size(message_type_t type);

@@ -49,6 +49,11 @@ from .reputation import (TransactionHistory, Reputation, Reputations,
                          resolve_query_to_dict, resolve_query_from_dict,
                          resolved_to_dict, resolved_from_dict, verify_resolved,
                          consensus_score_from_window, tx_channel_weight)
+# The one shared rounding rule for a composed EMA weight (R+D.md §12.5). Taken
+# from the prequential package rather than redefined here so there is exactly
+# one `floor(x + 0.5)` in the runtime, matching the C twin's; that package
+# imports nothing from reputation, so this direction is the acyclic one.
+from ..prequential import weight_round
 from ..system import CfgIds, now, encoding, proc_idle_floor
 from .. import _probes
 
@@ -892,7 +897,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def _resolve_tx_weight(self, score: TransactionScore, local: bool = False) -> int:
         """Map a TS to its EMA weight: the capability's transaction_weight,
-        times the evidence channel's multiplier when the evidence is ours.
+        times the learned competence multiplier and the evidence channel's
+        multiplier when the evidence is ours.
 
         The capability half looks up the local Capabilities registry
         (self.protocol.capabilities); peers that don't have the capability
@@ -902,10 +908,20 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
         *local* says this score was produced ON THIS NODE — the IPC path from
         our own subsystems (`forward_transaction`), never the wire path
-        (`handle_transaction`). Only then does the channel multiply
-        (R+D.md §12.8): the scorer chooses its own channel, so honoring a
-        remote tag would let any peer treble the weight of a score it
-        fabricated against any other. See `tx_channel_weight`.
+        (`handle_transaction`). Only then do the channel and the competence
+        multiplier apply (R+D.md §12.8, §12.5): the scorer chooses its own
+        channel and measures its own competence record, so honoring either
+        from a remote would let any peer treble the weight of a score it
+        fabricated against any other. See `tx_channel_weight` and
+        `competence_weight`.
+
+        The composed weight is `transaction_weight × competence × channel`,
+        rounded by `weight_round` (floor(x + 0.5), the one both runtimes
+        share) and floored at 1, because the EMA applies a weight by folding
+        the score in that many times. A capability authored at weight 1
+        therefore cannot be demoted by competence — see
+        doc/architecture/prequential-competence.md, which records that as a
+        limitation rather than working around it.
         """
         cap_name = getattr(score, 'capability_name', None)
         weight = 1
@@ -917,6 +933,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             if cap is not None:
                 weight = max(1, int(getattr(cap, 'transaction_weight', 1) or 1))
         if local:
+            competence = getattr(score, 'competence', None)
+            if competence is not None and float(competence) > 0.0:
+                weight = weight_round(float(weight) * float(competence))
             weight *= tx_channel_weight(getattr(score, 'channel', None))
         return max(1, int(weight))
 
@@ -2865,9 +2884,17 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         tell "we hold no rating" from "the message was lost" — and this pull is
         the ONLY path on which `rated=False` can cross, since every change-driven
         emission is rated by construction.
+
+        PEERS ONLY: this node's own uuid is not in the roster. A reputation is
+        what the network observed ABOUT a peer, and a node holds no such
+        observation of itself — a self-entry could only ever carry its own
+        unrated 0.0, which a consumer cannot distinguish from a genuine
+        unrated peer. C's `reputation_emit_all` walks `proc->protocol.peers`
+        and has always emitted N; Python emitted N+1 until this was aligned,
+        so the two "mirrors" disagreed by exactly the self-entry.
         """
         emitted = 0
-        for peer in list(self.peers.all) + [self.identity]:
+        for peer in list(self.peers.all):
             peer_uuid = getattr(peer, 'uuid', peer)
             key = UUID(str(peer_uuid)) if not isinstance(peer_uuid, UUID) \
                 else peer_uuid

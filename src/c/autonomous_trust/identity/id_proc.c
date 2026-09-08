@@ -6199,6 +6199,47 @@ static bool handle_hierarchy_request(const process_t *proc, directory_t *queues,
     return true;
 }
 
+/* Read back what we RECORDED from a peer's hierarchy claim (protocol step 7).
+ *
+ * Exists for the conformance adapter: the recording is gated on proved gateway
+ * authority, on the claim naming its own sender, and on a freshness sequence
+ * above the mark, and not one of those refusals is visible in the traffic the
+ * node emits. Without a reader for this store a scenario could only assert
+ * that an answer was sent, never that it was believed. Mirrors the Python
+ * twin's `peer_hierarchy` dict, which the Python adapter reads directly.
+ *
+ * @return false when nothing is recorded for @p peer_uuid — which is the
+ *         observable a refusal produces, so the caller must be able to tell it
+ *         apart from a record holding zeros. */
+bool identity_get_peer_hierarchy(const char *peer_uuid, int *rank_out,
+                                 int *n_children_out)
+{
+    if (rank_out != NULL) *rank_out = 0;
+    if (n_children_out != NULL) *n_children_out = 0;
+    if (peer_uuid == NULL || id_state.peer_hierarchy.items == NULL)
+        return false;
+    data_t *vd = NULL;
+    string_t rendered = NULL;
+    if (map_get(&id_state.peer_hierarchy, (map_key_t)peer_uuid, &vd) != 0
+        || vd == NULL || data_string_ptr(vd, &rendered) != 0
+        || rendered == NULL)
+        return false;
+    json_error_t jerr;
+    json_t *claim = json_loads(rendered, 0, &jerr);
+    if (claim == NULL)
+        return false;
+    if (rank_out != NULL)
+        *rank_out = (int)json_integer_value(json_object_get(claim, "rank"));
+    if (n_children_out != NULL)
+    {
+        json_t *children = json_object_get(claim, "children");
+        *n_children_out = json_is_array(children)
+                              ? (int)json_array_size(children) : 0;
+    }
+    json_decref(claim);
+    return true;
+}
+
 /* Ask the group to state their positions (once). */
 void identity_request_hierarchy(const process_t *proc)
 {

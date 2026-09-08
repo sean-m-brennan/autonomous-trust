@@ -234,6 +234,17 @@ typedef struct {
      * reputation algebra branches on it. Mirrors Python
      * TransactionScore.channel. See reputation/tx_channel.h. */
     char channel[TX_CHANNEL_NAMELEN+1];
+    /* The learned EMA weight multiplier for the subject peer on this
+     * capability (R+D.md §12.5), stamped by the process that observed the
+     * forecast and staged here for the same reason the channel is: the weight
+     * is recorded twice, once when the round starts and once when handle_grant
+     * re-records our own round, and the two must agree or the EMA would depend
+     * on which path last wrote the cache.
+     *
+     * Zero or negative == absent -> 1.0, the authored transaction_weight
+     * verbatim. Mirrors Python TransactionScore.competence. See
+     * prequential/prequential.h. */
+    double competence;
 } tx_score_t;
 
 /****************************
