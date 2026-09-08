@@ -1,0 +1,66 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: consensus-reputation-answered
+byte_pinning: false
+description: |
+    Drives the single-subject `request consensus reputation`
+    (ReputationProtocol.consensus_rep_req) inbound handler and asserts that
+    the responder ANSWERS.
+
+    Why this exists separately from consensus-reputation-batch: the batched
+    verb had a scenario, the singular one it was factored out of did not, so
+    `handle_consensus_reputation_request` / C's
+    `handle_consensus_rep_request` was reachable only through code no case
+    executed. The batch scenario also asserts nothing — it runs one step and
+    passes if neither runtime raises — so it cannot tell an answer from
+    silence.
+
+    What is pinned here is the answer itself. The two runtimes reach it by
+    different routes: C replies from inside the handler
+    (`_send_rep_response`), while Python's handler computes the roster and
+    parks it on `requested_reps` for the process loop's
+    `forward_reputation` to send. Those are the same behaviour one tick
+    apart in production, but only if the Python leg actually runs — and
+    until this case existed, nothing in the corpus ever ran it. The harness
+    drains that queue after each dispatch to stand in for the loop.
+
+    The reply is addressed to the process the request named
+    (`requesting_process`), not to the responder's own — a responder that
+    answered on its own process name would be sending into a queue the
+    requestor is not reading.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: oracle
+  - id: charlie
+    role: subject
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: request consensus reputation
+    payload:
+      target: charlie
+      proc: negotiation
+    description: |
+        alice asks bob for its consensus view of charlie, scoped to the
+        negotiation process. bob scores charlie from whatever its local
+        history supports — zero history yields the consensus baseline, which
+        is fine: what is under test is that a reply is produced and
+        addressed, not the number.
+  - id: 2
+    from: bob
+    to: alice
+    function: reputation response
+    in_response_to: 1
+    no_propagate: true
+    description: |
+        The answer, asserted as emitted and not delivered: it is addressed to
+        alice's negotiation process, which this corpus does not model. A
+        runtime that computed a score and never sent it — which is exactly
+        what Python did here before the harness drained the forwarding queue
+        — fails at this step.
