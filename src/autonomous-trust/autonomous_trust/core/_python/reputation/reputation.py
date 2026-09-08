@@ -279,6 +279,15 @@ class TransactionScore(Configuration):
     it. Producers that know which peer they are grading set it so the log names
     the peer without waiting for the bilateral pairing to close.
 
+    ``competence`` is the learned multiplier on this score's EMA weight
+    (R+D.md §12.5): the subject peer's prequential record on this capability,
+    measured by whichever process observed the forecast, carried to the
+    reputation process that applies the weight. Local-only and never
+    serialized for the same reason ``subject_uuid`` is, and one more: a peer
+    that could stamp its own competence would hold a lever on every EMA it
+    appears in. ``None`` means 1.0 -- the authored ``transaction_weight``,
+    verbatim -- which is what every producer predating the field meant.
+
     ``channel`` DOES reach the committed fact, unlike the two fields above it.
     :meth:`Transaction.add` carries it onto the chain entry and
     ``Transaction._canonical_bytes`` covers it, so the reason a score was poor
@@ -290,7 +299,8 @@ class TransactionScore(Configuration):
     """
 
     def __init__(self, task_id, score, capability_name: str = None,
-                 channel: str = None, subject_uuid=None):
+                 channel: str = None, subject_uuid=None,
+                 competence: float = None):
         self.task_id = task_id
         # Enforced, not assumed (doc/architecture/reputation.md). This constructor is also the wire-side
         # entry point -- `from_json_string` reconstructs via `cls(**kwargs)` --
@@ -316,6 +326,14 @@ class TransactionScore(Configuration):
         # gets it back out of the reputation process's hands at the one place
         # that matters (`forward_transaction` is IPC-only; see there).
         self.subject_uuid = None if subject_uuid is None else str(subject_uuid)
+        # Local-only, on the same terms as `subject_uuid`: accepted as a
+        # keyword because `from_json_string` rebuilds via `cls(**kwargs)`, and
+        # dropped by `to_dict` so nothing this node SENDS ever carries one.
+        # Non-positive is normalized away rather than trusted: a multiplier of
+        # 0 or less would zero or invert an EMA weight, and the only way to
+        # get one is a producer bug or a peer trying it on.
+        self.competence = (None if competence is None or float(competence) <= 0.0
+                           else float(competence))
 
     def to_dict(self):
         # `subject_uuid` is process-local provenance, not part of the score:
@@ -325,6 +343,10 @@ class TransactionScore(Configuration):
         # and it keeps every byte-pinned TransactionScore vector valid.
         d = super().to_dict()
         d.pop('subject_uuid', None)
+        # `competence` likewise: a learned weight is this node's measurement of
+        # the peer, has no meaning in another node's EMA, and would be a lever
+        # if it travelled. See the class docstring and R+D.md §12.5.
+        d.pop('competence', None)
         return d
 
 

@@ -19,6 +19,7 @@ Technical architecture documentation for the AutonomousTrust cooperative computi
 - [Physical Consistency](physical-consistency.md) (Refuting a peer's claim on dimensions, bounds, kinematics and conservation, before any reputation math runs
 - [Certificate-Carrying Interfaces](certificate-interfaces.md)) Answers that arrive with a witness: duals, DRAT refutations, potentials and cuts, checked exactly
 - [Calibration Audit](calibration-audit.md) (Auditing whether a peer's prediction sets cover as often as it claims: the overconfident peer an averaged reputation cannot see coming
+- [Prequential Competence](prequential-competence.md)) How much a peer's evidence weighs, learned from its record of forecasts against outcomes, and the regret bound that comes with it
 - [Node Lifecycle](node-lifecycle.md) (Startup phases and state transitions
 - [Partition Recovery](partition-recovery.md)) Split-brain detection, probe/response, and group merge
 - [Cohort Clock Skew](cohort-clock-skew.md) (Measuring peer clock disagreement, and why peer reference clocks stay unbuilt

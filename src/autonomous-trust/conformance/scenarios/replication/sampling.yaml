@@ -1,0 +1,103 @@
+schema_version: "1"
+kind: scenario
+protocol: replication
+name: sampling
+byte_pinning: false
+description: |
+    Which completed tasks get a second executor (R+D.md §12.6;
+    doc/verification_oracle.md build-order step 6, "Replication, made
+    affordable"; doc/architecture/replication.md). This is the first of the
+    three affordances that make replication cheap: sample a fraction p rather
+    than replicate everything.
+
+    Why this has to agree across runtimes. The decision is one SplitMix64 draw
+    against a probability. If one runtime replicates a task the other skips, a
+    peer's exposure to being checked depends on which implementation happened
+    to be watching -- and the whole deterrent (p*L>g, with L a tier demotion)
+    rests on the peer not being able to predict, or the mesh not being able to
+    disagree about, whether a given task is the one that gets checked. So the
+    draw itself is pinned, not merely the direction.
+
+    What each row pins:
+
+      - Rows 1-3: the declaration resolves a capability to its probability.
+        A named capability gets its own number; anything unnamed gets
+        default_prob. `query` at 0.0 is a real setting ("never replicate a
+        read-only query"), not the absence of one.
+      - Rows 4-7: the decision at a declared probability. The draw is pinned to
+        all its digits so the two runtimes are shown to compute the SAME double
+        from the SAME seed, not merely to fall on the same side of the
+        threshold. seed 3 draws 0.1134..., which is below 0.5 (replicate a
+        command-class task) and above 0.05 (skip a routine one) and below
+        nothing at 0.0 (never).
+      - Row 8: the seed is what makes the draw unpredictable to the peer. The
+        SAME seed that skipped a routine capability (row 6) replicates a
+        command-class one (row 4), because the probability, not the seed,
+        decides -- the executor cannot look at the task and know it is safe.
+      - Rows 9-11: the endpoints. p=1.0 replicates even the highest draw; p=0.0
+        replicates none even the lowest; and `draw < p` is STRICT, so a draw
+        exactly equal to the probability does NOT replicate. The strict form is
+        what makes p=0 mean "never" rather than "never, except on a zero draw".
+      - Rows 12-13: a per-task override is CLAMPED, not refused, unlike a
+        declared number. An override arrives at runtime where a bad value must
+        not drop the round; 2.0 reads as "always" and -1.0 as "never". (A
+        declaration with an out-of-range probability is refused on load; that
+        is the negative corpus's job, not this scenario's.)
+
+    Shape. Non-message-driven, like the physics, calibration and prequential
+    scenarios: the adapter loads `fixtures.replication` into its runtime's
+    sampler and evaluates each row of `fixtures.events`. A `sample` row asserts
+    the decision (and optionally the exact draw and the effective probability);
+    a bare `prob`/`capability` row asserts only the declaration's resolution.
+
+participants:
+  - id: requestor
+    role: new_node
+  - id: worker
+    role: peer
+
+fixtures:
+  replication:
+    version: 1
+    default_prob: 0.05
+    capabilities:
+      cmd:
+        replicate_prob: 0.5
+      query:
+        replicate_prob: 0.0
+
+  events:
+    # 1-3 the declaration resolves a capability to its probability
+    - {capability: cmd, prob: 0.5}
+    - {capability: query, prob: 0.0}
+    - {capability: unlisted.thing, prob: 0.05}
+
+    # 4-7 the decision at a declared probability, with the draw pinned
+    - {sample: {capability: cmd, seed: 3}, replicate: true, draw: 0.11345034205715454}
+    - {sample: {capability: cmd, seed: 0}, replicate: false, draw: 0.8833108082136426}
+    - {sample: {capability: unlisted.thing, seed: 3}, replicate: false, effective_prob: 0.05}
+    - {sample: {capability: query, seed: 3}, replicate: false, effective_prob: 0.0}
+
+    # 8 the same seed that skipped a routine capability replicates a command one
+    - {sample: {capability: cmd, seed: 1000}, replicate: true, draw: 0.2348438825700212}
+    - {sample: {capability: unlisted.thing, seed: 1000}, replicate: false}
+
+    # 9-11 the endpoints, and the strict inequality
+    - {sample: {capability: cmd, seed: 0, prob: 1.0}, replicate: true}
+    - {sample: {capability: cmd, seed: 3, prob: 0.0}, replicate: false}
+    - {sample: {capability: cmd, seed: 3, prob: 0.11345034205715454}, replicate: false}
+
+    # 12-13 a per-task override is clamped, not refused
+    - {sample: {capability: cmd, seed: 0, prob: 2.0}, replicate: true}
+    - {sample: {capability: cmd, seed: 3, prob: -1.0}, replicate: false}
+
+steps:
+  - id: 1
+    from: requestor
+    to: requestor
+    function: replay_events
+    description: |
+        Trigger. The requestor evaluates each row of `fixtures.events` through
+        its own runtime's sampler: `sample` rows assert the replicate/skip
+        decision and, where pinned, the exact draw and effective probability;
+        `prob` rows assert the declaration's capability resolution.

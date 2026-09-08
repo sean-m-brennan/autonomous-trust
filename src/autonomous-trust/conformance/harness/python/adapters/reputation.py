@@ -39,7 +39,8 @@ from uuid import UUID, uuid5
 from autonomous_trust.core.capabilities import PeerCapabilities
 from autonomous_trust.core.config import Configuration, to_json_string
 from autonomous_trust.core.reputation.reputation import (
-    RESOLVE_TTL_DEFAULT, resolve_query_to_dict, resolved_to_dict)
+    RESOLVE_TTL_DEFAULT, PeerReputation, resolve_query_to_dict,
+    resolved_to_dict)
 from autonomous_trust.core._python.identity.identity import (
     public_identity_to_canonical)
 from autonomous_trust.core.identity import Group, Identity, Peers
@@ -293,6 +294,30 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: slashes_proposed={actual}, '
                         f'expected {expected}'
+                    )
+            elif key == 'app_roster':
+                # Which peers the app-facing roster pull reported, as
+                # participant ids. The carrier is local IPC toward the main
+                # loop -- a PeerReputation object on AT_MAIN_QUEUE, not a
+                # network Message (doc/architecture/app-peer-carrier.md) --
+                # so it is read off the main queue rather than the outbox.
+                #
+                # Asserted as a SET of ids rather than a count because the
+                # content is the point: the roster is peers only and never
+                # carries this node itself. Python emitted a self-entry (N+1)
+                # while C emitted N until that was aligned, and a bare count
+                # would have hidden which entry differed.
+                seen = set()
+                for item in participants[self.id].queues[CfgIds.main]._sink:
+                    if isinstance(item, PeerReputation):
+                        seen.add(str(item.peer_uuid))
+                by_uuid = {str(p.identity.uuid): pid
+                           for pid, p in participants.items()}
+                actual = sorted(by_uuid.get(u, u) for u in seen)
+                if actual != sorted(expected):
+                    raise AssertionError(
+                        f'{self.id}: app_roster={actual}, '
+                        f'expected {sorted(expected)}'
                     )
             elif key == 'requests_count':
                 actual = len(self.process.requests)
@@ -698,6 +723,16 @@ class ReputationAdapter:
         if not isinstance(inbound, Message):
             raise AssertionError(f'expected a Message, got {type(inbound).__name__}')
         participant.process.protocol.run_message_handlers(participant.queues, inbound)
+        # Stand in for the process loop's forwarding tick. The rep_req and
+        # consensus_rep_req handlers do not answer inline: they compute a
+        # roster and park it on `requested_reps`, which production drains
+        # from ReputationProcess.process() on the next pass. C answers from
+        # inside its handler (`_send_rep_response`), so without this the two
+        # runtimes are not comparable on the reply at all -- Python would
+        # emit nothing and any assertion on the answer could only ever hold
+        # on one side. Draining here is a no-op for every handler that
+        # already replied inline.
+        participant.process.forward_reputation(participant.queues)
         return participant.drain_outbox()
 
     # ------------------------------------------------------------------
@@ -919,6 +954,11 @@ class ReputationAdapter:
                 'peer_uuid': target_uuid,
                 'requesting_process': req_proc,
             })
+        elif function == ReputationProtocol.app_roster_request:
+            # The app pulling the current peer view. The verb carries no
+            # payload at all: it names no subject, because the answer is the
+            # whole roster (doc/architecture/app-peer-carrier.md).
+            obj = to_json_string({})
         elif function == ReputationProtocol.consensus_rep_batch_req:
             # Batched consensus request: one message naming MANY subjects,
             # answered with one roster. Same fields as the single-subject form

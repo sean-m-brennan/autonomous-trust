@@ -1601,6 +1601,197 @@ static int _build_inbound(sce_run_ctx_t *ctx,
      * an empty obj and no-op, diverging from Python on any non-degenerate
      * group update. A public_only sender (key zeroed at fixture time) emits
      * public_only=true, driving the keep-our-private-key adopt path. */
+    /* hierarchy_query — a late joiner asking the group to state their
+     * positions (protocol step 7). The handler answers from its own claim and
+     * reads nothing out of the payload; the requestor field is carried anyway
+     * because it is what production sends (identity_request_hierarchy), and a
+     * scenario should exercise the bytes the wire actually has. */
+    if (strcmp(function, "hierarchy_query") == 0) {
+        char su[UUID_STRING_LEN + 1] = {0};
+        uuid_unparse_lower(sender_impl->pub->uuid, su);
+        json_t *body = json_pack("{s:s}", "requestor", su);
+        if (body != NULL) {
+            net_msg_pack_json(&out->info.net_msg, body);
+            json_decref(body);
+        }
+        return 0;
+    }
+
+    /* hierarchy_root — a node's claim about ITS OWN place in the tree.
+     * `node` is the sender by construction (handle_hierarchy refuses a claim
+     * naming anybody else); `claims` lets a scenario name another participant
+     * deliberately to exercise that refusal. `children` is a COUNT: the real
+     * field holds the group uuids of the cohorts the sender gateways, and a
+     * scenario has no group it created to name, so the adapter mints them.
+     * They are never compared across runtimes — only the count is. `seq` is
+     * the freshness stamp; `unstamped` omits it, which both runtimes must
+     * refuse rather than record. */
+    if (strcmp(function, "hierarchy_root") == 0) {
+        char node[UUID_STRING_LEN + 1] = {0};
+        const char *claims = NULL;
+        int rank = 0, n_children = 0;
+        bool unstamped = false;
+        json_int_t seq = 1;
+        const char *parent_pid = NULL;
+        if (json_is_object(payload)) {
+            json_t *c = json_object_get(payload, "claims");
+            if (json_is_string(c)) claims = json_string_value(c);
+            json_t *r = json_object_get(payload, "rank");
+            if (json_is_integer(r)) rank = (int)json_integer_value(r);
+            json_t *k = json_object_get(payload, "children");
+            if (json_is_integer(k)) n_children = (int)json_integer_value(k);
+            json_t *u = json_object_get(payload, "unstamped");
+            unstamped = json_is_true(u);
+            json_t *q = json_object_get(payload, "seq");
+            if (json_is_integer(q)) seq = json_integer_value(q);
+            json_t *pp = json_object_get(payload, "parent");
+            if (json_is_string(pp)) parent_pid = json_string_value(pp);
+        }
+        const public_identity_t *claimant = sender_impl->pub;
+        if (claims != NULL) {
+            sce_participant_t *cp = sce_find_participant(ctx, claims);
+            if (cp == NULL) {
+                snprintf(ctx->err, sizeof(ctx->err),
+                         "build_inbound: hierarchy_root claims unknown %s",
+                         claims);
+                return -1;
+            }
+            claimant = ((ic_impl_t *)cp->impl)->pub;
+        }
+        uuid_unparse_lower(claimant->uuid, node);
+        char parent[UUID_STRING_LEN + 1] = {0};
+        if (parent_pid != NULL) {
+            sce_participant_t *pp2 = sce_find_participant(ctx, parent_pid);
+            if (pp2 == NULL) {
+                snprintf(ctx->err, sizeof(ctx->err),
+                         "build_inbound: hierarchy_root parent unknown %s",
+                         parent_pid);
+                return -1;
+            }
+            uuid_unparse_lower(((ic_impl_t *)pp2->impl)->pub->uuid, parent);
+        }
+        json_t *children = json_array();
+        for (int i = 0; i < n_children; i++) {
+            /* Deterministic per (node, index), the same shape the Python
+             * adapter mints. Hashed rather than uuid5 because this adapter
+             * already derives its participant uuids by hash, so the two
+             * runtimes' uuids differ everywhere and only counts are compared. */
+            char label[128];
+            snprintf(label, sizeof(label), "%s:cohort:%d", node, i);
+            uuid_t cu;
+            crypto_generichash(cu, sizeof(uuid_t),
+                               (const unsigned char *)label, strlen(label),
+                               NULL, 0);
+            cu[6] = (cu[6] & 0x0F) | 0x40;
+            cu[8] = (cu[8] & 0x3F) | 0x80;
+            char cus[UUID_STRING_LEN + 1] = {0};
+            uuid_unparse_lower(cu, cus);
+            json_array_append_new(children, json_string(cus));
+        }
+        json_t *body = json_pack("{s:s, s:s, s:o, s:i}",
+                                 "node", node, "parent", parent,
+                                 "children", children, "rank", rank);
+        if (body != NULL) {
+            if (!unstamped)
+                json_object_set_new(body, "seq", json_integer(seq));
+            net_msg_pack_json(&out->info.net_msg, body);
+            json_decref(body);
+        } else {
+            json_decref(children);
+        }
+        return 0;
+    }
+
+    /* subtree_roster_query — {requestor, requesting_process}.
+     * `requesting_process` is load-bearing: the answer is addressed to the
+     * process the requestor names, and the aggregation that consumes it lives
+     * in the main loop, not in the identity process. */
+    /* operator_attest_query — the attended-now pull as it arrives on the wire.
+     * The nonce binds an answer to the request that asked for it, so the
+     * scenario spells it out rather than having the adapter mint one; omitting
+     * it (`no_nonce`) is a distinct case, because an attestation bound to
+     * nothing is replayable forever and must be refused rather than answered.
+     * Mirrors the Python adapter's IdentityProtocol.attest_req branch. */
+    if (strcmp(function, "operator_attest_query") == 0) {
+        const char *nonce = "n1";
+        bool no_nonce = false;
+        if (json_is_object(payload)) {
+            json_t *nn = json_object_get(payload, "no_nonce");
+            no_nonce = json_is_true(nn);
+            json_t *nj = json_object_get(payload, "nonce");
+            if (json_is_string(nj)) nonce = json_string_value(nj);
+        }
+        json_t *body = no_nonce ? json_object()
+                                : json_pack("{s:s}", "nonce", nonce);
+        if (body != NULL) {
+            net_msg_pack_json(&out->info.net_msg, body);
+            json_decref(body);
+        }
+        return 0;
+    }
+
+    if (strcmp(function, "subtree_roster_query") == 0) {
+        char su[UUID_STRING_LEN + 1] = {0};
+        uuid_unparse_lower(sender_impl->pub->uuid, su);
+        const char *req_proc = "main";
+        if (json_is_object(payload)) {
+            json_t *pr = json_object_get(payload, "proc");
+            if (json_is_string(pr)) req_proc = json_string_value(pr);
+        }
+        json_t *body = json_pack("{s:s, s:s}", "requestor", su,
+                                 "requesting_process", req_proc);
+        if (body != NULL) {
+            net_msg_pack_json(&out->info.net_msg, body);
+            json_decref(body);
+        }
+        return 0;
+    }
+
+    /* tier_update — local IPC from the reputation process, not a wire
+     * message: the (peer_uuid, tier) pair _publish_tier_change emits. `peer`
+     * names a participant; `unknown_peer` sends a uuid for nobody, which both
+     * runtimes must drop quietly rather than apply to somebody. */
+    if (strcmp(function, "tier_update") == 0) {
+        char target[UUID_STRING_LEN + 1] = {0};
+        int tier = 0;
+        const char *peer_pid = NULL;
+        bool unknown = false;
+        if (json_is_object(payload)) {
+            json_t *pp = json_object_get(payload, "peer");
+            if (json_is_string(pp)) peer_pid = json_string_value(pp);
+            json_t *t = json_object_get(payload, "tier");
+            if (json_is_integer(t)) tier = (int)json_integer_value(t);
+            unknown = json_is_true(json_object_get(payload, "unknown_peer"));
+        }
+        if (unknown) {
+            uuid_t nobody;
+            const char label[] = "tier:nobody";
+            crypto_generichash(nobody, sizeof(uuid_t),
+                               (const unsigned char *)label, strlen(label),
+                               NULL, 0);
+            nobody[6] = (nobody[6] & 0x0F) | 0x40;
+            nobody[8] = (nobody[8] & 0x3F) | 0x80;
+            uuid_unparse_lower(nobody, target);
+        } else if (peer_pid != NULL) {
+            sce_participant_t *tp = sce_find_participant(ctx, peer_pid);
+            if (tp == NULL) {
+                snprintf(ctx->err, sizeof(ctx->err),
+                         "build_inbound: tier_update names unknown %s",
+                         peer_pid);
+                return -1;
+            }
+            uuid_unparse_lower(((ic_impl_t *)tp->impl)->pub->uuid, target);
+        } else {
+            uuid_unparse_lower(sender_impl->pub->uuid, target);
+        }
+        json_t *body = json_array();
+        json_array_append_new(body, json_string(target));
+        json_array_append_new(body, json_integer(tier));
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+        return 0;
+    }
+
     if (strcmp(function, "group_key_update") == 0) {
         json_t *gj = NULL;
         if (group_to_json(&sender_impl->proc->protocol.group, &gj) == 0
@@ -2343,6 +2534,103 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                              "%s: provisional_peer_count=%d, expected %d",
                              pid, got, want);
                     return -1;
+                }
+            } else if (strcmp(key, "hierarchy_of") == 0) {
+                /* What this participant RECORDED from a peer's hierarchy
+                 * claim, as {participant_id: {rank, children}} (or null for
+                 * "nothing recorded"). The gates that can refuse a claim are
+                 * invisible in emitted traffic, so the store is the only
+                 * place a refusal is observable. Mirrors the Python adapter's
+                 * hierarchy_of check; `children` is a COUNT, because the
+                 * cohort uuids inside a claim are minted per runtime and
+                 * never compared. */
+                const char *sub_pid;
+                json_t *want;
+                json_object_foreach(val, sub_pid, want) {
+                    sce_participant_t *sp = sce_find_participant(ctx, sub_pid);
+                    if (sp == NULL) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: hierarchy_of names unknown participant %s",
+                                 pid, sub_pid);
+                        return -1;
+                    }
+                    ic_impl_t *s_impl = (ic_impl_t *)sp->impl;
+                    char peer_uuid[UUID_STRING_LEN + 1] = {0};
+                    if (s_impl != NULL && s_impl->pub != NULL)
+                        uuid_unparse_lower(s_impl->pub->uuid, peer_uuid);
+                    int got_rank = 0, got_children = 0;
+                    bool have = identity_get_peer_hierarchy(peer_uuid,
+                                                            &got_rank,
+                                                            &got_children);
+                    if (json_is_null(want)) {
+                        if (have) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: recorded a hierarchy claim from %s, "
+                                     "expected none", pid, sub_pid);
+                            return -1;
+                        }
+                        continue;
+                    }
+                    if (!have) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: no hierarchy claim recorded from %s",
+                                 pid, sub_pid);
+                        return -1;
+                    }
+                    json_t *w_rank = json_object_get(want, "rank");
+                    if (w_rank != NULL
+                        && got_rank != (int)json_integer_value(w_rank)) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: hierarchy_of[%s].rank=%d, expected %d",
+                                 pid, sub_pid, got_rank,
+                                 (int)json_integer_value(w_rank));
+                        return -1;
+                    }
+                    json_t *w_kids = json_object_get(want, "children");
+                    if (w_kids != NULL
+                        && got_children != (int)json_integer_value(w_kids)) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: hierarchy_of[%s].children=%d, "
+                                 "expected %d", pid, sub_pid, got_children,
+                                 (int)json_integer_value(w_kids));
+                        return -1;
+                    }
+                }
+            } else if (strcmp(key, "peer_tier") == 0) {
+                /* The reputation-derived trust tier this participant applied
+                 * to a peer, as {participant_id: tier}. Distinct from rank:
+                 * tier is the runtime, local-view trust attribute a
+                 * negotiation tier-gate reads, and it arrives only over local
+                 * IPC. Mirrors the Python adapter's peer_tier check. */
+                const char *sub_pid;
+                json_t *want;
+                json_object_foreach(val, sub_pid, want) {
+                    sce_participant_t *sp = sce_find_participant(ctx, sub_pid);
+                    if (sp == NULL) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: peer_tier names unknown participant %s",
+                                 pid, sub_pid);
+                        return -1;
+                    }
+                    ic_impl_t *s_impl = (ic_impl_t *)sp->impl;
+                    int got = 0;
+                    if (s_impl != NULL && s_impl->pub != NULL) {
+                        /* Self-target reads the node's own tier, exactly as
+                         * the handler writes it. */
+                        if (impl->pub != NULL
+                            && uuid_compare(s_impl->pub->uuid,
+                                            impl->pub->uuid) == 0)
+                            got = identity_get_self_tier();
+                        else
+                            got = identity_get_peer_tier(s_impl->pub->uuid);
+                    }
+                    if (got != (int)json_integer_value(want)) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: peer_tier[%s]=%d, expected %d",
+                                 pid, sub_pid, got,
+                                 (int)json_integer_value(want));
+                        return -1;
+                    }
                 }
             } else if (strcmp(key, "parent_gateway") == 0) {
                 /* The higher-rank node this participant DERIVES as its parent
