@@ -1,0 +1,120 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: hierarchy-query-answered
+byte_pinning: false
+description: |
+    The two WIRE halves of runtime hierarchy roots — identity protocol step 7
+    (doc/architecture/gateway-reputation-tree.md).
+
+    `hierarchy-root-derivation` pins the requestor side: what a node derives
+    as its own parent. It drives that through the `trigger_hierarchy`
+    pseudo-function, which calls the derivation directly, so neither inbound
+    handler ever runs. This scenario is the other side of the same protocol
+    step: the handler that ANSWERS a query, and the handler that RECORDS the
+    answer.
+
+    Why it has to agree across runtimes. What `handle_hierarchy` records is
+    what child-gateway discovery recurses into, so a peer that one runtime
+    records and the other refuses would send subtree-roster queries to
+    different places — and the refusals are the whole point of the gate. A
+    claim is about the SENDER only, and our own parent stays derived, never
+    accepted, so nothing here can install a parent on anybody.
+
+    What each step pins:
+
+      * Step 1 — a late joiner's query. The advertisement fires on CHANGE, so
+        a node joining a settled mesh would otherwise wait for somebody's next
+        move; the query exists to make it converge at once. The handler answers
+        from its own claim and reads nothing out of the payload, addressed to
+        the asker rather than broadcast — echoing a topology claim to the whole
+        group is what turns an advertisement into a flood.
+      * Step 2 — the claim, recorded. `gw` states rank 7 and two gatewayed
+        cohorts; `joiner` records it.
+      * Step 3 — a claim naming SOMEBODY ELSE as the node, refused. The sender
+        and the claimed node disagreeing is either a bug or an attempt, and
+        neither should quietly become a recorded fact. Nothing is recorded for
+        `other`, and `gw`'s own earlier record is untouched.
+      * Step 4 — an UNSTAMPED claim, refused. The record is last-writer-wins
+        with no epoch of its own, so without a freshness sequence a superseded
+        claim replays forever and rolls the recorded topology back. `other`
+        stays unrecorded, which is what distinguishes "refused" from
+        "recorded with old values".
+
+    Shape: two source steps rather than a query plus an `in_response_to`
+    assertion, because both adapters build the response inbound explicitly and
+    that keeps the recorded side observable on each runtime independently.
+
+participants:
+  - id: joiner
+    role: group_member
+  - id: gw
+    role: border_guard
+  - id: other
+    role: group_member
+
+fixtures:
+  # One shared cohort, so the claim travels inside a group both nodes hold and
+  # the gateway-authority gate has a membership to read.
+  shared_group: {}
+  ranks:
+    joiner: 1
+    gw: 7
+    other: 3
+
+steps:
+  - id: 1
+    from: joiner
+    to: gw
+    function: hierarchy_query
+    payload: {}
+    description: |
+        joiner asks gw to state its position. gw's handle_hierarchy_request
+        answers with its own hierarchy_root claim addressed to joiner.
+  - id: 2
+    from: gw
+    to: joiner
+    function: hierarchy_root
+    payload:
+      rank: 7
+      children: 2
+      seq: 1
+    description: |
+        gw's claim, delivered. joiner's handle_hierarchy checks the claim
+        names its own sender, that the sender can prove gateway authority,
+        and that the sequence is above the mark — then records it.
+  - id: 3
+    from: other
+    to: joiner
+    function: hierarchy_root
+    payload:
+      claims: gw
+      rank: 9
+      children: 5
+      seq: 1
+    description: |
+        other sends a claim naming gw as the node. Refused: a claim is about
+        its sender, and this one would let any group member rewrite gw's
+        recorded position — the place child-gateway discovery recurses into.
+  - id: 4
+    from: other
+    to: joiner
+    function: hierarchy_root
+    payload:
+      rank: 3
+      children: 1
+      unstamped: true
+    description: |
+        other's own claim, with no freshness sequence. Refused rather than
+        accepted as legacy, because an unstamped claim is replayable and this
+        record has no epoch of its own to protect it.
+
+expected_state:
+  joiner:
+    hierarchy_of:
+      # Recorded from step 2, and unchanged by steps 3 and 4.
+      gw:
+        rank: 7
+        children: 2
+      # Never recorded: step 3 named somebody else, step 4 was unstamped.
+      other: null

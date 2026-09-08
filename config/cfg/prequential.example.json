@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "min_samples": 8,
+  "max_outcomes": 64,
+  "max_outstanding": 32,
+  "horizon_sec": 60.0,
+  "eta": 1.0,
+  "weight_band": {
+    "min": 0.5,
+    "max": 2.0,
+    "note": "how far a learned record may move the AUTHORED transaction_weight from trust_ladder.json. It must contain 1.0: the operator's number is the anchor, and competence moves the weight inside the range the operator allowed, never outside it"
+  },
+  "capabilities": {
+    "demo.thermal-forecast": {
+      "quantity": "demo.bus-temp",
+      "scale": 20.0,
+      "alpha": 0.1,
+      "horizon_sec": 120.0,
+      "tolerance": 0.5,
+      "note": "same quantity and the same prediction field the coverage audit reads (calibration.example.json). alpha is the OPERATOR's level, not the coverage the peer claims: a peer allowed to pick its own would lower it to make misses cheap, since the interval score's miss penalty is 2/alpha"
+    },
+    "demo.power-forecast": {
+      "quantity": "demo.bus-power",
+      "scale": 50.0,
+      "alpha": 0.1,
+      "note": "scale is one unit of loss in the quantity's own units, and it is required: a guessed scale would silently decide how much a watt matters against a degree"
+    },
+    "demo.track-forecast": {
+      "quantity": "demo.position",
+      "scale": 100.0,
+      "alpha": 0.2,
+      "horizon_sec": 30.0,
+      "note": "a 3-component quantity; the interval score is the mean over components, so a vector forecast is not three times worse than a scalar one"
+    }
+  }
+}

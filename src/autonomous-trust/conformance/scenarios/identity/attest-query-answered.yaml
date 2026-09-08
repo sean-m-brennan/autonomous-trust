@@ -1,0 +1,87 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: attest-query-answered
+byte_pinning: false
+description: |
+    Drives the RESPONDER half of the attended-now pull from the wire:
+    `operator_attest_query` arrives, and the node must answer with
+    `operator_attest_response`.
+
+    Why this exists alongside attest-pull-attended: that scenario drives the
+    pull through a harness trigger that stands in for the whole responder,
+    deriving attendance itself and handing the answer straight to the
+    consumer's handle_attest_response. It compares the OUTCOME, which was the
+    right call for the clock and stamp semantics it pins — but it means
+    `handle_attest_request` and `handle_operator_state_response` were never
+    executed by any case on the Python side. The responder chain the real node
+    runs was compared against C's responder on nothing.
+
+    The chain this case runs, in full: handle_attest_request refuses to answer
+    inline (the live OperatorSession belongs to the console's address space,
+    which the identity subprocess does not share), parks the pull against its
+    nonce, and asks the main loop; the main loop answers with the session
+    state; handle_operator_state_response drains the pending table and emits
+    the attestation. C has no console and answers from its own seam in one
+    hop. The routes differ and are meant to; the answer must not.
+
+    A node with no console attached is the same code path, not an error case:
+    have_session=False is an honest answer meaning not-attended. That is why
+    `drone` is here — a responder that answered only when attended, or that
+    stayed silent when it had nothing to report, would leave the puller unable
+    to tell "no human" from "message lost", and it fails at step 4.
+
+participants:
+  - id: consumer
+    role: border_guard
+  - id: node
+    role: border_guard
+  - id: drone
+    role: border_guard
+
+fixtures:
+  # node has a human at the console; drone has none at all. The clock is
+  # pinned so the stamp is a fixed value both languages can be compared on.
+  operator_session:
+    clock: 1721800000.0
+    node: active
+    drone: absent
+
+steps:
+  - id: 1
+    from: consumer
+    to: node
+    function: operator_attest_query
+    payload:
+      nonce: n1
+    description: |
+        The pull arrives at an attended node. Nothing may block here: the
+        handler records the nonce and asks the main loop, returning at once.
+  - id: 2
+    from: node
+    to: consumer
+    function: operator_attest_response
+    in_response_to: 1
+    no_propagate: true
+    description: |
+        The attestation, asserted as emitted and not delivered — the consumer
+        never sent this pull through its own send path, so it holds no
+        outstanding nonce and would (correctly) refuse the answer as
+        unsolicited. What is under test is the responder, not the matcher.
+  - id: 3
+    from: consumer
+    to: drone
+    function: operator_attest_query
+    payload:
+      nonce: n2
+    description: |
+        The same pull at a node with no console attached at all.
+  - id: 4
+    from: drone
+    to: consumer
+    function: operator_attest_response
+    in_response_to: 3
+    no_propagate: true
+    description: |
+        Answered, not ignored. "No human is attending" is a real answer, and a
+        silent responder is indistinguishable from a lost message.
