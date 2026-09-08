@@ -1,0 +1,63 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: subtree-roster-query-answered
+byte_pinning: false
+description: |
+    The RESPONDER half of subtree-roster enumeration
+    (doc/architecture/gateway-reputation-tree.md).
+
+    `subtree-member-roster` pins the requestor half — the breadth-first walk
+    that flattens a subtree — but it drives that through the
+    `trigger_subtree_roster` pseudo-function, which calls the roster helper on
+    each gateway directly. The inbound handler that answers a query off the
+    wire therefore never runs there. This scenario runs it.
+
+    Why the split matters. The walk is deliberately NON-BLOCKING: a handler
+    that waited on its children would stall the identity process for the depth
+    of the subtree, so the responder answers with its own local members plus
+    the child gateways to recurse into, and the REQUESTOR does the recursion.
+    That means the answer is a single message whose shape both runtimes have
+    to agree on, and the handler that produces it is worth exercising directly.
+
+    The reply is addressed to the process the requestor NAMED, defaulting to
+    the main loop, and that default is the answer's real home: inbound
+    messages route by process alone, and the aggregation that consumes a
+    roster response lives in the main loop, not in the identity process.
+    Replying to our own process name would deliver every answer to the
+    requestor's identity process, which has no handler for it — the walk would
+    never complete on a real multiprocess node while still looking correct in
+    a single-process test. So the assertion here is `no_propagate`: the
+    scenario checks that the answer was EMITTED, and deliberately does not
+    deliver it, because its destination is a process this corpus does not model.
+
+participants:
+  - id: asker
+    role: group_member
+  - id: gw
+    role: border_guard
+
+fixtures:
+  shared_group: {}
+
+steps:
+  - id: 1
+    from: asker
+    to: gw
+    function: subtree_roster_query
+    payload:
+      proc: main
+    description: |
+        asker queries gw's subtree. gw's handle_roster_request answers from
+        its LOCAL view — its own members and its child gateways — without
+        waiting on anything below it.
+  - id: 2
+    from: gw
+    to: asker
+    function: subtree_roster_response
+    in_response_to: 1
+    no_propagate: true
+    description: |
+        The answer, asserted as emitted and not delivered: it is addressed to
+        the asker's MAIN process, which this corpus does not model. A runtime
+        that answered nothing, or answered on its own process name, fails here.

@@ -1,0 +1,55 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: app-roster-pull
+byte_pinning: false
+description: |
+    Drives `app_roster_request` — the app-facing pull for the node's current
+    peer view (doc/architecture/app-peer-carrier.md) — and pins WHO the answer
+    covers.
+
+    The carrier is local IPC toward the main loop: one `PeerReputation` per
+    peer on AT_MAIN_QUEUE, not a network message, so this is asserted through
+    state rather than an `in_response_to` step.
+
+    Asserted as a set of ids, not a count, because the content is the whole
+    point. The roster is PEERS ONLY and never carries the answering node
+    itself: a reputation is what the network observed ABOUT a peer, and a node
+    holds no such observation of itself, so a self-entry could only carry its
+    own unrated 0.0 — which a consumer cannot tell from a genuinely unrated
+    peer. Until this case existed the two runtimes disagreed by exactly that
+    entry (Python walked `peers.all + [self.identity]` and emitted N+1; C's
+    `reputation_emit_all` walks its peers array and emitted N), and each
+    docstring called itself a mirror of the other.
+
+    The requestor is itself a peer of the node, so it appears in the roster —
+    the pull is not scoped to "everyone but you", only to "not me".
+
+    An unrated peer is reported AS unrated rather than skipped, which is why
+    no reputations fixture is needed here: silence would leave a consumer
+    unable to tell "we hold no rating" from "the message was lost". That this
+    pull is the only path on which `rated=False` can cross is pinned by each
+    side's unit tests; what the corpus pins is the roster's membership.
+
+participants:
+  - id: app
+    role: requestor
+  - id: node
+    role: oracle
+  - id: alpha
+    role: subject
+  - id: beta
+    role: subject
+
+steps:
+  - id: 1
+    from: app
+    to: node
+    function: app_roster_request
+    description: |
+        The app asks node for its whole peer view. node answers for every peer
+        it knows — app, alpha and beta — and for none of itself.
+
+expected_state:
+  node:
+    app_roster: [app, alpha, beta]
