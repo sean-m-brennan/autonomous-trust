@@ -157,7 +157,38 @@ specialists (Freund, Schapire, Singer and Warmuth, 1997), where a peer opines
 only on some rounds and is scored only on those. This yields regional
 competence, a peer trusted on thermal and distrusted on attitude, without anyone
 declaring the regions in advance. That is a direct generalization of the
-per-capability weighting in `trust_ladder.yaml`, learned rather than authored.
+per-capability weighting in the trust ladder, learned rather than authored.
+
+**Built, both runtimes, 2026-09-08.** Three things about the build differ from
+what this section proposes, and each is deliberate.
+
+The rule is the **Winkler interval score**, not log-loss or Brier. Those need a
+predictive distribution, and what a reply actually carries is layer 3's
+`prediction` box -- a central interval at a level. The interval score is proper
+for exactly that object, and it decomposes into sharpness plus a miss penalty,
+so a peer scores badly for being vague *or* for being confidently wrong. That
+is the division of labour with layer 3, which is required to forgive the
+over-cautious peer: the useless-but-honest forecaster is penalised here and
+nowhere else. Nothing new went on the wire.
+
+It **modulates** the authored per-capability weight rather than replacing it.
+The learned multiplier is confined to a band the operator declares which must
+contain 1.0, so the authored `transaction_weight` stays the anchor and a peer
+with an excellent record on a trivial region cannot inflate its say on a heavy
+one. Silent -- exactly 1.0 -- below `min_samples`.
+
+And it is the one layer here that renders **no verdict at all**: no score, no
+evidence channel. A peer whose forecasts are wide or wrong has told no lie, and
+scoring it like a physically impossible claim would undo the distinction layer
+3 exists to draw. What it produces is a weight.
+
+The aggregation half was built with a claimant: `combine()` returns the
+Hedge-weighted vincentized forecast and `regret()` reports the realized gap
+against every peer beside `ln N / eta + eta T / 8`, so the O(sqrt(T log N))
+guarantee this section claims is measured rather than asserted. Nothing in AT
+core consumes the aggregate -- it is an API for an application that wants the
+mesh's best estimate. See `doc/architecture/prequential-competence.md` and
+R+D.md §12.5.
 
 ### Layer 3: calibration audit
 
@@ -536,12 +567,21 @@ Cheapest and most general first:
  runtimes, all eight rows of the table above, pinned by the `certificate`
  conformance protocol.
 3. **Conformal coverage audit.** Small, distribution-free, and catches the
- overconfident peer that averaged reputation cannot see.
+ overconfident peer that averaged reputation cannot see. **DONE 2026-09-04**,
+ both runtimes, pinned by the `calibration` conformance protocol.
 4. **Prequential log-loss with sleeping-expert weights.** Replaces authored
- per-capability weights with learned regional competence.
+ per-capability weights with learned regional competence. **DONE 2026-09-08**,
+ both runtimes, pinned by the `prequential` conformance protocol — and it
+ *modulates* the authored weights rather than replacing them, within a band
+ the operator declares, so the operator's number stays the anchor. It is the
+ only layer here that renders no verdict: what it produces is a weight.
 5. **Self-consistency checking over the signed claim archive.** Nearly free
  given the archive already exists.
 6. **Sampled replication with bisection dispute resolution**, for what remains.
+   **BUILT 2026-09-08** at the conformance level (A sampling, B agreement
+   adjudication, C the bisection game), both runtimes, pinned by the
+   `replication` protocol; live replica dispatch stays gated on deterministic
+   replay. See `doc/architecture/replication.md`.
 7. **Off-policy scoring and honeypot probes**, to break reputation lock-in and
  anchor against a large adversarial fraction.
 8. **Peer prediction** for the unverifiable residue, if any survives step 3.
@@ -549,8 +589,9 @@ Cheapest and most general first:
 Steps 1 and 2 are where the leverage is. Steps 7 and 8 are the ones that need
 real statistical care, and they are needed least often.
 
-Steps 1 and 2 are now built in both runtimes (2026-09-03). Step 3, the conformal
-coverage audit, is next in this order.
+Steps 1 through 4 are now built in both runtimes (2026-09-03 through
+2026-09-08). Step 5, self-consistency checking over the signed claim archive,
+is next in this order.
 
 ## References
 
@@ -643,6 +684,9 @@ Disclosure and aggregation limits
  inventory.
 - [Calibration Audit](architecture/calibration-audit.md): step 3 as built -- the
  exact test, the two resolution paths, and why a passing audit earns nothing.
+- [Prequential Competence](architecture/prequential-competence.md): step 4 as
+ built -- the interval score, the bounded weight band, and the one layer here
+ that renders no verdict.
 - [Adversarial Testing](architecture/adversarial-testing.md): the attack side of
  the same problem.
 

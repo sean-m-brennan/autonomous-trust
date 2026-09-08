@@ -278,6 +278,14 @@ follows.
 
 - [The Verification Oracle](../verification_oracle.md) — the whole programme, and
   why physics is step 1.
+- [Certificate-Carrying Interfaces](certificate-interfaces.md) — step 2, and the
+  layer below this one in the scorer.
+- [Calibration Audit](calibration-audit.md) — step 3, which resolves its
+  predictions through this layer's `quantity` declarations, and which must not
+  settle one against an observation this layer has refuted.
+- [Prequential Competence](prequential-competence.md) — step 4, which resolves
+  forecasts through the same declarations and for the same reason sits after
+  this layer's arm.
 - [Reputation Consensus](reputation.md) — the algebra these verdicts feed.
 - [Trust Tiers](trust-tiers.md) — capability weighting, and the declaration file
   this one is modelled on.

@@ -400,6 +400,21 @@ void identity_request_hierarchy(const process_t *proc);
  *  run loop to tick. Mirrors Python's _derive_parent_gateway. */
 int identity_get_parent_gateway(const process_t *proc, char *out, size_t cap);
 
+/** Read back what this node RECORDED from a peer's hierarchy claim
+ *  (protocol step 7, doc/architecture/gateway-reputation-tree.md).
+ *
+ *  For the conformance adapter. The recording is gated on proved gateway
+ *  authority, on the claim naming its own sender, and on a freshness sequence
+ *  above the mark; none of those refusals shows up in emitted traffic, so
+ *  without this a scenario could assert only that an answer was sent, never
+ *  that it was believed. Mirrors the Python twin's `peer_hierarchy`.
+ *
+ *  @return false when nothing is recorded for @p peer_uuid — the observable a
+ *          refusal produces, and deliberately distinct from a record of
+ *          zeros. */
+bool identity_get_peer_hierarchy(const char *peer_uuid, int *rank_out,
+                                 int *n_children_out);
+
 /** Emit ONE peer on the app-facing carrier (PEER_OBSERVED via AT_MAIN_QUEUE).
  *  Carries the peer's signing key, its rank from the peer_ranks seam, and
  *  both operator signals; the attendance stamp is zeroed unless the peer is

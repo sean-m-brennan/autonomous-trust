@@ -171,6 +171,16 @@ the originating score. When the capability is unknown locally, the weight falls
 back to 1, which is the conservative default and matches a tier-0 baseline.
 Contrite tit-for-tat is unchanged.
 
+The authored weight is the anchor rather than the whole story for a score this
+node produced itself. Two later multipliers compose with it on that path only:
+the evidence channel's, so a heavy capability refuted on physics counts as both
+([Reputation consensus](reputation.md#what-a-channel-does)), and the peer's
+learned competence on the capability, confined to an operator-declared band
+around 1.0 ([Prequential competence](prequential-competence.md)). Both are
+exactly 1 unless configured, so an operator who declares neither sees the
+schedule above verbatim, and neither applies to a score that arrived from the
+wire — the scorer picks its own channel and measures its own record.
+
 The *consensus average* driving the dashboard applies the same multiplier at
 each update step, and its half-life is interpreted in weight units rather than
 in transactions. A single tier-4 result therefore moves the average eight times

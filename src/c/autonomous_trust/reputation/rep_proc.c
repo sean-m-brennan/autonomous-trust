@@ -39,6 +39,7 @@
 #include "config/configuration.h"   /* get_cfg_dir, CFG_PATH_LEN */
 #include "config/discover.h"        /* CFG_FILE_EXT */
 #include "reputation/rep_proc_priv.h"
+#include "prequential/scoring.h"   /* at_preq_weight_round, the rounding rule both runtimes share */
 
 #define EREP_PAXOS 253
 DEFINE_ERROR(EREP_PAXOS, "Paxos consensus error");
@@ -795,9 +796,27 @@ static int _resolve_tx_weight(const char *cap_name)
  * the capability-only form above, because the scorer picks its own channel and
  * honoring a remote tag would let any peer treble the weight of a score it
  * fabricated against any other. See tx_channel.h. */
-static int _resolve_tx_weight_local(const char *cap_name, const char *channel)
+static int _resolve_tx_weight_local(const char *cap_name, const char *channel,
+                                    double competence)
 {
-    int w = _resolve_tx_weight(cap_name) * tx_channel_weight(channel);
+    int w = _resolve_tx_weight(cap_name);
+    /* The learned competence multiplier (R+D.md §12.5), between the authored
+     * weight and the channel's, and on the LOCAL path only for the same reason
+     * the channel is: this node measured the record, and a peer that could
+     * stamp its own would hold a lever on every EMA it appears in.
+     *
+     * Non-positive is absence (a zeroed struct, or a producer predating the
+     * field), which means the authored weight verbatim. Rounded by
+     * at_preq_weight_round -- floor(x + 0.5), the one rule both runtimes share
+     * -- because C's lround and Python's round disagree at exactly 0.5, and a
+     * weight is how many times the EMA folds the score in. Floored at 1 by the
+     * return below: a capability authored at weight 1 therefore cannot be
+     * demoted by competence, which
+     * doc/architecture/prequential-competence.md records as a limitation of
+     * the integer fold rather than working around. */
+    if (competence > 0.0)
+        w = at_preq_weight_round((double)w * competence);
+    w *= tx_channel_weight(channel);
     return w > 0 ? w : 1;
 }
 
@@ -1590,12 +1609,17 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
          * the map_remove below, and the channel is needed for the broadcast. */
         strncpy(channel_local, tx->channel, TX_CHANNEL_NAMELEN);
         channel_local[TX_CHANNEL_NAMELEN] = '\0';
+        /* Same copy-before-removal reason again: the staged competence
+         * multiplier has to outlive `tx` so this re-record reproduces the
+         * weight the round started with (R+D.md §12.5). */
+        double competence_local = tx->competence;
         if (task_uuid_str[0] != '\0')
         {
             /* Our own round, so the channel counts (R+D.md §12.8). */
             _record_task_weight_locked(task_uuid_str,
                                        _resolve_tx_weight_local(cap_name_local,
-                                                                channel_local));
+                                                                channel_local,
+                                                                competence_local));
             /* ...and it has to survive to handle_accepted, which writes this
              * entry to our history and broadcasts it: the channel is part of
              * the committed fact now, and `tx` is freed by the map_remove
@@ -3028,7 +3052,7 @@ static bool handle_local_rep_query(const process_t *proc, directory_t *queues, g
 void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
                           const uuid_t peer_uuid, double score,
                           const char *capability_name, const char *channel,
-                          const uuid_t subject_uuid)
+                          const uuid_t subject_uuid, double competence)
 {
     char task_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(task_uuid, task_str);
@@ -3061,6 +3085,9 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
          * the REP_PROTO_TX broadcast when this round reaches majority. */
         strncpy(tx->channel, chan, TX_CHANNEL_NAMELEN);
         tx->channel[TX_CHANNEL_NAMELEN] = '\0';
+        /* Stage the learned multiplier too (R+D.md §12.5), so handle_grant
+         * re-records the SAME weight this round was started with. */
+        tx->competence = competence;
         data_t *tx_dat = object_ptr_data(tx, sizeof(tx_score_t));
         map_set(&rep_state.my_requests, task_str, tx_dat);
     }
@@ -3069,7 +3096,8 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
      * (mirrors Python _start_paxos → _record_task_weight). Done under the
      * same lock as the my_requests insert. */
     _record_task_weight_locked(task_str,
-                               _resolve_tx_weight_local(capability_name, chan));
+                               _resolve_tx_weight_local(capability_name, chan,
+                                                        competence));
     _record_task_tier_locked(task_str, _resolve_tx_tier(capability_name));
 
     pthread_mutex_unlock(&rep_state.lock);
@@ -6799,8 +6827,16 @@ static void _handle_local_tx_score(const process_t *proc,
      * the producer that knows it (neg_proc's handle_results, config_proc's
      * identity-modification penalty). Zero == not attributable to one peer,
      * which is the honest answer for a fan-out. */
+    /* ts->competence is the learned EMA weight multiplier (R+D.md §12.5),
+     * measured by the producer that observed the peer's forecasts. Unvalidated
+     * on purpose, unlike the score and the channel above: it arrives only over
+     * IPC from our own subsystems, it is bounded at the source by the declared
+     * weight band, and a non-positive value is read as absence rather than
+     * refused -- a zeroed struct from a producer predating the field means
+     * "the authored weight, verbatim". */
     _forward_transaction(proc, ts->task_uuid, self_uuid, ts->score,
-                         ts->capability_name, ts->channel, ts->peer_uuid);
+                         ts->capability_name, ts->channel, ts->peer_uuid,
+                         ts->competence);
 }
 
 int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)

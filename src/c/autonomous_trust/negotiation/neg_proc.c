@@ -37,6 +37,7 @@
 #include "bootstrap/bootstrap_worker.h"        /* probe allocation + window */
 #include "physics/physics.h"                   /* §12.2 falsification layer */
 #include "calibration/calibration.h"           /* §12.4 coverage audit */
+#include "prequential/prequential.h"         /* §12.5 competence weight */
 #include "certificates/certificates.h"         /* §12.3 witness checking */
 #include "config/configuration.h"             /* config_t, for our own identity */
 #include "reputation/tx_channel.h"             /* evidence channels */
@@ -144,6 +145,13 @@ static struct {
      * and would be permanently silent. */
     at_calibration_auditor_t calibration;
     bool calibration_loaded;
+    /* §12.5 prequential competence. Held here for the same reason the auditor
+     * above it is, and rather more so: the competence multiplier IS the
+     * accumulated record of resolved forecasts, so an estimator built per
+     * result would weight every peer at exactly 1.0 forever -- which is
+     * indistinguishable from the layer being switched off. */
+    at_prequential_estimator_t prequential;
+    bool prequential_loaded;
     /* The certificate declaration (R+D.md §12.3). Stateless apart from the
      * model -- a witness is self-contained by construction, so unlike the
      * physics checker there is no observation window to carry -- but held here
@@ -2192,6 +2200,29 @@ static at_calibration_auditor_t *_calibration_auditor(void)
     return &neg_state.calibration;
 }
 
+/* The §12.5 estimator, built on first use. Same load policy as the two layers
+ * above (mirrors Python automate.prequential_estimator): a rejected
+ * declaration is logged and the layer stays OFF rather than taking the scoring
+ * path down with it, because a node that cannot learn a weighting must still
+ * be able to score a task. */
+static at_prequential_estimator_t *_prequential_estimator(void)
+{
+    if (!neg_state.prequential_loaded)
+    {
+        at_prequential_model_t model;
+        char err[AT_PREQ_ERR_LEN] = {0};
+        if (!at_prequential_model_load(NULL, &model, err, sizeof(err)))
+        {
+            log_error(NULL, "prequential: declaration rejected, layer stays "
+                            "OFF: %s\n", err);
+            at_prequential_model_parse(NULL, &model, NULL, 0);
+        }
+        at_prequential_estimator_init(&neg_state.prequential, &model);
+        neg_state.prequential_loaded = true;
+    }
+    return &neg_state.prequential;
+}
+
 /* The declared quantity a capability REPORTS, or NULL. Walks the physics model
  * rather than asking the calibration one: the link lives in physics.json (each
  * quantity names its reporting capability), and keeping the lookup here is what
@@ -2377,6 +2408,48 @@ double negotiation_score_task_result(const char *cap_name,
         }
     }
 
+    /* Prequential competence (R+D.md §12.5), both halves, here and not lower
+     * down. This layer renders NO verdict -- it produces the weight
+     * multiplier `negotiation_competence_weight` reads when the score is
+     * submitted -- so it has no place in the arm ORDER below, and putting it
+     * there would make the record depend on which other layer happened to
+     * speak first: a forecast attached to a reply whose certificate arm is
+     * about to score it still has to be recorded.
+     *
+     * After physics for the same reason the coverage audit's settle is: a
+     * refuted observation must not resolve an honest forecaster's forecast,
+     * and a refuted result records no forecast of its own either, since a
+     * claim physics has refuted is not evidence in either direction.
+     *
+     * Settle before observe, so a peer forecasting the same quantity it just
+     * reported is weighted against a record including everything this result
+     * settled. Mirrors Python automate.score_task_result. */
+    {
+        at_prequential_estimator_t *est = _prequential_estimator();
+        if (at_prequential_enabled(est))
+        {
+            const char *quantity = _reported_quantity(cap_name);
+            if (quantity != NULL)
+            {
+                int resolved = at_prequential_settle_result(
+                    est, quantity, result_str, subject, now);
+                if (resolved > 0)
+                    log_debug(NULL, "prequential: resolved %d outstanding "
+                                    "forecast(s) about %s\n",
+                              resolved, quantity);
+            }
+            json_t *pred = NULL;
+            if (prediction_json != NULL && prediction_json[0] != '\0')
+            {
+                json_error_t perr;
+                pred = json_loads(prediction_json, 0, &perr);
+            }
+            at_prequential_observe(est, cap_name, pred, subject, now);
+            if (pred != NULL)
+                json_decref(pred);
+        }
+    }
+
     /* Certificate-carrying interfaces (R+D.md §12.3), after physics and before
      * the completion arm. After physics because a witness proves the answer
      * satisfies the problem AS STATED, which says nothing about whether the
@@ -2457,6 +2530,14 @@ double negotiation_score_task_result(const char *cap_name,
     return (result_str != NULL && result_len > 0) ? 0.8 : 0.3;
 }
 
+double negotiation_competence_weight(const char *cap_name, const char *subject)
+{
+    at_prequential_estimator_t *est = _prequential_estimator();
+    if (!at_prequential_enabled(est))
+        return AT_PREQ_NEUTRAL_COMPETENCE;
+    return at_prequential_competence(est, subject, cap_name);
+}
+
 /* Submit a requestor-side score to the reputation process, which resolves our
  * own identity as the proposer and starts a Paxos round (rep_proc.c
  * _handle_local_tx_score). Mirrors automate.py putting a TransactionScore on
@@ -2465,7 +2546,8 @@ double negotiation_score_task_result(const char *cap_name,
  * the weight-1 default. */
 static void _submit_tx_score(const process_t *proc, const uuid_t task_uuid,
                              double score, const char *capability_name,
-                             const char *channel, const uuid_t subject_uuid)
+                             const char *channel, const uuid_t subject_uuid,
+                             double competence)
 {
     generic_msg_t msg = {0};
     msg.type = TRANSACTION_SCORE;
@@ -2480,6 +2562,12 @@ static void _submit_tx_score(const process_t *proc, const uuid_t task_uuid,
     if (subject_uuid != NULL)
         uuid_copy(msg.info.tx_score.peer_uuid, subject_uuid);
     msg.info.tx_score.score = score;
+    /* The learned EMA weight multiplier (R+D.md §12.5), measured HERE -- this
+     * is the process holding the record of resolved forecasts -- and applied
+     * in the reputation process, which owns the weighted EMA. Local-only on
+     * the same terms as peer_uuid above: the struct never crosses the wire, so
+     * no peer can stamp a multiplier on a score about itself. */
+    msg.info.tx_score.competence = competence;
     if (capability_name != NULL)
         at_strlcpy(msg.info.tx_score.capability_name, capability_name,
                    sizeof(msg.info.tx_score.capability_name));
@@ -2656,10 +2744,16 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
                      * so naming it would attribute the whole task's outcome to
                      * whoever happened to reply last. Mirrors Python
                      * TaskResult.attach_executor. */
+                    /* The competence multiplier for the SAME peer the
+                     * score is filed against: a fan-out has no subject, so it
+                     * carries no learned weight either -- there is no single
+                     * peer whose record it would be. */
                     _submit_tx_score(proc, task_uuid, score,
                                      tracker->capability_name, channel,
                                      (tracker->expected == 1)
-                                         ? nmsg->from_whom.uuid : NULL);
+                                         ? nmsg->from_whom.uuid : NULL,
+                                     negotiation_competence_weight(
+                                         tracker->capability_name, subject));
 
                     /* Build TASK_RESULT message to the main (requestor) process */
                     generic_msg_t result_msg;
@@ -2891,8 +2985,12 @@ static void _drain_task_stack(const process_t *proc)
         _report_result(proc, &job.task, result);
         /* Executor side, scoring our own completion: no subject, and none
          * needed -- task_outcome is not slash-eligible. */
+        /* No subject, so no learned weight: competence is a fact about a
+         * peer's forecasting record, and this score is about our own
+         * completion. Neutral == the authored transaction_weight verbatim. */
         _submit_tx_score(proc, job.task.uuid, 0.9, job.task.capability.name,
-                         TX_CHANNEL_TASK_OUTCOME, NULL);
+                         TX_CHANNEL_TASK_OUTCOME, NULL,
+                         AT_PREQ_NEUTRAL_COMPETENCE);
     }
 }
 

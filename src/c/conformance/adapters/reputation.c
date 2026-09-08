@@ -103,6 +103,14 @@ typedef struct {
      * permissive about extra messages. g_snaps is zeroed per scenario, which
      * is exactly the lifetime a cumulative count wants. */
     int slashes_proposed;
+    /* Peers this participant reported on the app-facing carrier
+     * (doc/architecture/app-peer-carrier.md). Like slashes_proposed this is a
+     * TALLY filled by _send_hook, not a snapshot: PeerReputation goes to
+     * AT_MAIN_QUEUE as a PEER_REPUTATION message rather than onto the network
+     * outbox, so there is nothing for the engine to capture. Recorded as
+     * uuids and mapped back to participant ids at check time. */
+    char app_roster[SCE_MAX_PARTICIPANTS][UUID_STRING_LEN + 1];
+    int  app_roster_n;
 } rp_snap_t;
 static rp_snap_t g_snaps[SCE_MAX_PARTICIPANTS];
 
@@ -191,6 +199,13 @@ static int _send_hook(const char *key,
         rp_snap_t *es = _snap_get_or_make(g_current_emitter);
         if (es != NULL)
             es->slashes_proposed++;
+    }
+    if (g_current_emitter != NULL && type == PEER_REPUTATION)
+    {
+        rp_snap_t *es = _snap_get_or_make(g_current_emitter);
+        if (es != NULL && es->app_roster_n < SCE_MAX_PARTICIPANTS)
+            uuid_unparse_lower(msg->info.peer_reputation.peer_uuid,
+                               es->app_roster[es->app_roster_n++]);
     }
     sce_capture(g_active_ctx, to_id, function);
     return 0;
@@ -936,6 +951,13 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_object_set_new(body, "peer_uuid", json_string(target_uuid));
         json_object_set_new(body, "requesting_process", json_string(req_proc));
     }
+    else if (strcmp(function, REP_PROTO_APP_ROSTER) == 0)
+    {
+        /* The app pulling the current peer view. The verb carries no payload
+         * at all: it names no subject, because the answer is the whole roster
+         * (doc/architecture/app-peer-carrier.md). */
+        body = json_object();
+    }
     else if (strcmp(function, REP_PROTO_CONSENSUS_REP_BATCH_REQ) == 0)
     {
         /* Batched consensus request: one message naming MANY subjects, answered
@@ -1616,6 +1638,56 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
                              "%s: slashes_proposed=%d, expected %d",
                              pid, snap->slashes_proposed, want);
                     return -1;
+                }
+            }
+            else if (strcmp(key, "app_roster") == 0)
+            {
+                /* Which peers the app-facing roster pull reported, as
+                 * participant ids. Asserted as a SET rather than a count
+                 * because the content is the point: the roster is peers only
+                 * and never carries the answering node itself. Python emitted
+                 * a self-entry (N+1) while C emitted N until that was
+                 * aligned, and a bare count would have hidden which entry
+                 * differed. */
+                size_t want_n = json_is_array(val) ? json_array_size(val) : 0;
+                if ((size_t)snap->app_roster_n != want_n)
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: app_roster has %d entries, expected %zu",
+                             pid, snap->app_roster_n, want_n);
+                    return -1;
+                }
+                for (size_t wi = 0; wi < want_n; wi++)
+                {
+                    const char *want_pid =
+                        json_string_value(json_array_get(val, wi));
+                    if (want_pid == NULL)
+                        continue;
+                    sce_participant_t *wp =
+                        sce_find_participant(ctx, want_pid);
+                    if (wp == NULL)
+                    {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: app_roster names %s, not a participant",
+                                 pid, want_pid);
+                        return -1;
+                    }
+                    char wu[UUID_STRING_LEN + 1];
+                    uuid_unparse_lower(((rp_impl_t *)wp->impl)->pub->uuid, wu);
+                    bool found = false;
+                    for (int ri = 0; ri < snap->app_roster_n; ri++)
+                        if (strcmp(snap->app_roster[ri], wu) == 0)
+                        {
+                            found = true;
+                            break;
+                        }
+                    if (!found)
+                    {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: app_roster is missing %s",
+                                 pid, want_pid);
+                        return -1;
+                    }
                 }
             }
             else if (strcmp(key, "last_id_set") == 0)

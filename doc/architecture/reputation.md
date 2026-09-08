@@ -119,6 +119,18 @@ physics counts as both. The multiplier is applied the same way the capability
 weight is, by folding the score into the EMA that many times, which is why these
 are small integers.
 
+A third factor sits between those two when it has anything to say: the peer's
+learned competence on this capability
+([Prequential competence](prequential-competence.md)), a multiplier confined to
+an operator-declared band around 1.0. So the full composition on the local path
+is `transaction_weight x competence x channel`, rounded by `floor(x + 0.5)` and
+floored at one fold. It is exactly 1.0 — the authored weight, verbatim —
+whenever that layer is off, the capability is undeclared, or the peer's record
+is too short to say anything, which is every case that predates it. Like the
+channel multiplier, it applies to locally-produced evidence only, and for the
+same reason: a peer that could stamp its own competence would hold a lever on
+every average it appears in.
+
 | Multiplier | Channels | Why |
 |---|---|---|
 | 1 | `task_outcome`, `calibration`, `swarm_disagreement` | one peer's reading of one event |
@@ -238,10 +250,24 @@ retention are all in place on both runtimes, and the third response the design
 once called for (a dispute) was answered by deciding there is no verdict to
 dispute.
 
-What is missing is *producers*. Only `task_outcome`, `certificate` and `probe`
-have any: `physical`, `calibration`, `self_consistency`, `replication` and
-`swarm_disagreement` are vocabulary waiting for the oracle layers that would emit
-them. See R+D.md section 12 and
+What is missing is *producers*, and by now most of them exist. Six of the eight
+channels are emitted by both runtimes: `task_outcome` and `probe` from the
+scoring path itself, `certificate` from the certificate-carrying interfaces
+(R+D.md §12.3), and `physical` plus `swarm_disagreement` from the
+physical-consistency layer (§12.2) — the first for a claim it refutes outright,
+the second for a peer a conflict implicates without naming uniquely.
+`calibration` arrived with the coverage audit (§12.4).
+
+Two remain vocabulary waiting for the oracle layers that would emit them:
+`self_consistency` (build-order step 5, over the signed claim archive) and
+`replication` (step 6, sampled re-execution).
+
+The set is not expected to grow to meet every layer. Prequential competence
+(§12.5) deliberately emits **no** channel: it produces the learned weight
+multiplier described above rather than evidence of its own, because a peer
+whose forecasts are wide or wrong has told no lie, and a channel is part of the
+committed fact — adding one is a flag day, since an acceptor that does not know
+a spelling drops the score carrying it. See R+D.md section 12 and
 [the verification oracle](../verification_oracle.md).
 
 ## Computing a score
@@ -310,9 +336,9 @@ sequenceDiagram
     participant alice as proposer
     participant bob as acceptor
     alice->>+bob: ask permission
-    Note right of alice: Phase 1, alice broadcasts an ask-permission ballot on the encrypted group channel. (id1, id2, proposer) uniquely tags the round; id1 is a millisecond timestamp, id2 is the proposer's chain index.
+    Note right of alice: Phase 1 — alice broadcasts an ask-permission ballot on the encrypted group channel. (id1, id2, proposer) uniquely tags the round; id1 is a millisecond timestamp, id2 is the proposer's chain index.
     bob-->>-alice: permission granted (re: 1)
-    Note right of bob: Phase 1, bob's last_id is None and chain is empty, so the strict-inequality guard passes; handle_request emits a grant ack back to alice. (Out-of-band nack / backdate / sync branches are documented in separate scenarios.)
+    Note right of bob: Phase 1 — bob's last_id is None and chain is empty, so the strict-inequality guard passes; handle_request emits a grant ack back to alice. (Out-of-band nack / backdate / sync branches are documented in separate scenarios.)
 ```
 <!-- at_diagram:end -->
 
