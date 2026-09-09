@@ -1,4 +1,4 @@
-*Previous: [Becoming a peer](identity-protocol.md)*
+*Previous: [First contact](first-contact.md)*
 
 # Getting work done
 

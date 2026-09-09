@@ -452,6 +452,9 @@ set(libsrc
     autonomous_trust/identity/id_proc.c
     autonomous_trust/identity/peers.c
     autonomous_trust/identity/signature.c
+    autonomous_trust/contacts/contact.c
+    autonomous_trust/contacts/invitation.c
+    autonomous_trust/contacts/store.c
     autonomous_trust/negotiation/task.c
     autonomous_trust/negotiation/negotiation.c
     autonomous_trust/negotiation/neg_proc.c

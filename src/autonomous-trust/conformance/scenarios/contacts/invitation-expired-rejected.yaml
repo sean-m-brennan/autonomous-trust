@@ -1,0 +1,28 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: "1"
+kind: "scenario"
+protocol: "contacts"
+name: "invitation-expired-rejected"
+description: |
+  An invitation past its expiry is refused even though its signature is valid (a fixed past expiry, so the result is clock-independent).
+byte_pinning: false
+participants:
+  - id: "host"
+    role: "recipient"
+fixtures:
+  contacts:
+    op: "redeem"
+    blob: "eyJib2R5Ijoie1wiZXhwaXJ5XCI6MTAwLFwiaWRlbnRpdHlcIjp7XCJhZGRyZXNzXCI6XCIxMC4wLjAuMVwiLFwiZW5jcnlwdG9yXCI6e1wiaGV4X3NlZWRcIjpcIjA1MmE1MDc3M2FjOGQ5MTc3M2YyZGM5NjYyZTEyZjBkZWZlOTE1ZTQxNWI4YTFjOGUyMGE1YTNkNmFiMmI4NDNcIn0sXCJuaWNrbmFtZVwiOlwiYWxpY2VAZXhhbXBsZVwiLFwic2lnbmF0dXJlXCI6e1wiaGV4X3NlZWRcIjpcImQwNGFiMjMyNzQyYmI0YWIzYTEzNjhiZDQ2MTVlNGU2ZDAyMjRhYjcxYTAxNmJhZjg1MjBhMzMyYzk3Nzg3MzdcIn0sXCJ0eXBlbmFtZVwiOlwiaWRlbnRpdHlcIixcInV1aWRcIjpcImFhYWFhYWFhLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMVwifSxcIm5vbmNlXCI6XCJERUFEQkVFRjAwMTEyMjM0XCIsXCJyZW5kZXp2b3VzXCI6W10sXCJ0eXBlbmFtZVwiOlwiYXQtaW52aXRhdGlvblwiLFwidlwiOjF9Iiwic2lnIjoiYzExNzIzMmYzZjM1NWQyMDgyNzBjM2MxYzU0ZTdiZTg3YzdiNTMwNDg4MjY2MDZmZWU4ODc0M2ViNGZkZmFkNGZiMDRlZDM1ZTYwZDhjM2Y1ODVjNTgzYWZiY2ZlY2UzMGQ3MDM5ZjIzYjAzNzk3ZmM2NjVkOTM0ZmQ1OTU0MGMifQ"
+    in_person: false
+steps:
+  - id: 1
+    from: "host"
+    to: "host"
+    function: "redeem"
+    description: "trigger: redeem"
+expected_state:
+  host:
+    redeem_status: "expired"

@@ -1,0 +1,28 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: "1"
+kind: "scenario"
+protocol: "contacts"
+name: "invitation-tampered-rejected"
+description: |
+  An invitation whose signature byte was flipped must fail detached ed25519 verification and be refused (no contact produced).
+byte_pinning: false
+participants:
+  - id: "host"
+    role: "recipient"
+fixtures:
+  contacts:
+    op: "redeem"
+    blob: "eyJib2R5Ijoie1wiZXhwaXJ5XCI6MCxcImlkZW50aXR5XCI6e1wiYWRkcmVzc1wiOlwiMTAuMC4wLjFcIixcImVuY3J5cHRvclwiOntcImhleF9zZWVkXCI6XCIwNTJhNTA3NzNhYzhkOTE3NzNmMmRjOTY2MmUxMmYwZGVmZTkxNWU0MTViOGExYzhlMjBhNWEzZDZhYjJiODQzXCJ9LFwibmlja25hbWVcIjpcImFsaWNlQGV4YW1wbGVcIixcInNpZ25hdHVyZVwiOntcImhleF9zZWVkXCI6XCJkMDRhYjIzMjc0MmJiNGFiM2ExMzY4YmQ0NjE1ZTRlNmQwMjI0YWI3MWEwMTZiYWY4NTIwYTMzMmM5Nzc4NzM3XCJ9LFwidHlwZW5hbWVcIjpcImlkZW50aXR5XCIsXCJ1dWlkXCI6XCJhYWFhYWFhYS0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDFcIn0sXCJub25jZVwiOlwiREVBREJFRUYwMDExMjIzM1wiLFwicmVuZGV6dm91c1wiOltcInJlbGF5LUFcIl0sXCJ0eXBlbmFtZVwiOlwiYXQtaW52aXRhdGlvblwiLFwidlwiOjF9Iiwic2lnIjoiMGExNDg5YWM1ZGY3MGRmYmU1MDhlMDNjNTg3NDU5MzBhMTg0MjM0YzAyZWQxNGQwM2M1YzVmODBhMjZmNTk2NmM5MjgxN2IxYmZkNmJhYzFiOTU1Yjk1OTUwMDNlNmEzMGY4MzJlNjRjYTY0YWY0ODM2MzJkZGVjMjRlNDdlMDQifQ"
+    in_person: false
+steps:
+  - id: 1
+    from: "host"
+    to: "host"
+    function: "redeem"
+    description: "trigger: redeem"
+expected_state:
+  host:
+    redeem_status: "bad_sig"
