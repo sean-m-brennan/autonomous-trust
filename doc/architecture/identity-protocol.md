@@ -230,4 +230,4 @@ kept as a separate scenario rather than folded into the canonical one.
 
 ---
 
-*Next: [Getting work done](negotiation.md)*
+*Next: [First contact](first-contact.md)*

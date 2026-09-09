@@ -4479,9 +4479,9 @@ static void _send_resolved(const process_t *proc,
     (void)proc;
     generic_msg_t out = {0};
     out.type = NET_MESSAGE;
-    strncpy(out.info.net_msg.process,
-            (req_proc != NULL && req_proc[0] != '\0') ? req_proc : "reputation",
-            PROC_NAME_LEN);
+    at_strlcpy(out.info.net_msg.process,
+               (req_proc != NULL && req_proc[0] != '\0') ? req_proc : "reputation",
+               sizeof(out.info.net_msg.process));
     out.info.net_msg.function = REP_PROTO_REP_RESOLVED;
     out.info.net_msg.encrypt = true;
     memcpy(&out.info.net_msg.to_whom, to_whom, sizeof(public_identity_t));

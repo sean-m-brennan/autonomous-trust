@@ -41,6 +41,7 @@ class CfgIds(object, metaclass=ClassEnumMeta):
     group = 'group'
     negotiation = 'negotiation'
     reputation = 'reputation'
+    contacts = 'contacts'  # durable user-owned address book (first-contact.md)
 
 
 # Constants for system tweaking

@@ -1,0 +1,75 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: "1"
+kind: "scenario"
+protocol: "contacts"
+name: "store-roundtrip"
+description: |
+  A contacts.cfg.json in the DRY canonical form loads identically in both runtimes (FIRST_CONTACT_PLAN.md §4.0). Proves the store format is cross-runtime: a file written by one twin is read by the other, fields intact.
+byte_pinning: false
+participants:
+  - id: "host"
+    role: "recipient"
+fixtures:
+  contacts:
+    op: "store_roundtrip"
+    store:
+      contacts:
+        aaaaaaaa-0000-4000-8000-000000000001:
+          added_at: 1000.0
+          identity:
+            address: "10.0.0.1"
+            encryptor:
+              hex_seed: "052a50773ac8d91773f2dc9662e12f0defe915e415b8a1c8e20a5a3d6ab2b843"
+            nickname: "alice@example"
+            signature:
+              hex_seed: "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
+            typename: "identity"
+            uuid: "aaaaaaaa-0000-4000-8000-000000000001"
+          nonce: "NA"
+          petname: "ally"
+          provenance: "in_person"
+          rendezvous:
+            - "relay-A"
+          trust_seed: 0.3
+          verified: true
+          verified_at: 1001.0
+        bbbbbbbb-0000-4000-8000-000000000002:
+          added_at: 2000.0
+          identity:
+            address: "10.0.0.1"
+            encryptor:
+              hex_seed: "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20"
+            nickname: "bob@example"
+            signature:
+              hex_seed: "884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0b"
+            typename: "identity"
+            uuid: "bbbbbbbb-0000-4000-8000-000000000002"
+          nonce: "NB"
+          petname: "bobby"
+          provenance: "token"
+          rendezvous: "[]"
+          trust_seed: 0.0
+          verified: false
+          verified_at: 0.0
+      typename: "contacts"
+      version: 1
+steps:
+  - id: 1
+    from: "host"
+    to: "host"
+    function: "store_roundtrip"
+    description: "trigger: store_roundtrip"
+expected_state:
+  host:
+    count: 2
+    a_uuid: "aaaaaaaa-0000-4000-8000-000000000001"
+    a_petname: "ally"
+    a_verified: true
+    a_provenance: "in_person"
+    a_trust_seed: 0.3
+    b_uuid: "bbbbbbbb-0000-4000-8000-000000000002"
+    b_verified: false
+    b_trust_seed: 0.0
