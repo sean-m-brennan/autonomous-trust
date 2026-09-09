@@ -1,0 +1,44 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: "1"
+kind: "scenario"
+protocol: "contacts"
+name: "safety-number-pinned"
+description: |
+  The safety number two humans compare (§4.4) is a deterministic, order-independent function of both public identities. Byte-pinned so the C and Python fingerprint math must agree exactly.
+byte_pinning: false
+participants:
+  - id: "host"
+    role: "recipient"
+fixtures:
+  contacts:
+    op: "safety_number"
+    identity_a:
+      address: "10.0.0.1"
+      encryptor:
+        hex_seed: "052a50773ac8d91773f2dc9662e12f0defe915e415b8a1c8e20a5a3d6ab2b843"
+      nickname: "alice@example"
+      signature:
+        hex_seed: "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
+      typename: "identity"
+      uuid: "aaaaaaaa-0000-4000-8000-000000000001"
+    identity_b:
+      address: "10.0.0.1"
+      encryptor:
+        hex_seed: "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20"
+      nickname: "bob@example"
+      signature:
+        hex_seed: "884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0b"
+      typename: "identity"
+      uuid: "bbbbbbbb-0000-4000-8000-000000000002"
+steps:
+  - id: 1
+    from: "host"
+    to: "host"
+    function: "safety_number"
+    description: "trigger: safety_number"
+expected_state:
+  host:
+    safety_number: "52787 56223 92578 07320 37099 35054 53467 76516 97557 49062 70922 15957"
