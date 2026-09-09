@@ -39,6 +39,7 @@ set(AT_CONFORMANCE_SOURCES
     adapters/negotiation.c
     adapters/reputation.c
     adapters/bootstrap.c
+    adapters/contacts.c
     adapters/physics.c
     adapters/calibration.c
     adapters/prequential.c

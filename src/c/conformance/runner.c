@@ -46,6 +46,7 @@
 #include "adapters/prequential.h"
 #include "adapters/certificate.h"
 #include "adapters/replication.h"
+#include "adapters/contacts.h"
 
 /* Adapters that handle kind:negative need the JSON corpus root to resolve
  * `based_on` references; one runner invocation processes one root, so a
@@ -78,6 +79,8 @@ static void dispatch(const at_case_t *c, at_case_result_t *out) {
         at_prequential_conformance_run(c, out);
     } else if (strcmp(c->protocol, "replication") == 0) {
         at_replication_conformance_run(c, out);
+    } else if (strcmp(c->protocol, "contacts") == 0) {
+        at_contacts_run(c, out);
     } else {
         char detail[160];
         snprintf(detail, sizeof(detail),

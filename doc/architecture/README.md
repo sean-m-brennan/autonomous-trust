@@ -11,6 +11,7 @@ Technical architecture documentation for the AutonomousTrust cooperative computi
 - [Network Wire Format](network-wire-format.md) (The JSON and protobuf envelopes, the group-carried format choice, and why detection stays unbuilt
 - [Native/FFI Dual Implementation](native-ffi-dual-implementation.md) (C runtime, CFFI bridge, Python↔C interoperability, and embedded/microdrone nodes
 - [Identity Protocol](identity-protocol.md)) Peer discovery, voting, and group formation
+- [First Contact](first-contact.md) (Adding a specific person you already know: the 1:1 introduction, signed invitations, and safety-number verification
 - [Task Negotiation](negotiation.md) (Distributed task lifecycle
 - [Reputation Consensus](reputation.md)) Paxos-based reputation scoring
 - [Gateway Reputation Tree](gateway-reputation-tree.md): Multi-group membership and recursive subtree reputation

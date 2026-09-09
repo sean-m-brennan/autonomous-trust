@@ -85,6 +85,61 @@ Private keys are written under the node root and never travel the wire. Reusing
 the same root across restarts gives the node a persistent identity and warm
 reputation state (see [Persistent Cohort](architecture/persistent-cohort.md)).
 
+## First contact: finding and adding a specific person
+
+The first thing a new user does is add a specific human they already know. AT's
+peer discovery is **LAN-only** — UDP broadcast/multicast finds peers on the same
+local network — so it is *not* the answer for a friend across town, behind NAT, or
+not currently on your Wi-Fi. Adding that person is a separate, one-to-one
+primitive, distinct from the cohort vote that admits a newcomer to a group. It
+lives in `autonomous_trust.core.contacts`; the concept is in
+[First contact](architecture/first-contact.md).
+
+The trust root is always the cryptographic identity, never the identifier that
+led to it. The default path is an out-of-band **invitation** carrying the inviter's
+public key, so no directory is involved and there is nothing to spoof.
+
+| Call | Role |
+|---|---|
+| `create_invitation(identity, rendezvous=…, ttl_seconds=…) -> Invitation` | Mint a signed OOB token from your own identity. `.encode()` / `.to_uri()` render it as a QR blob or `at+contact:` link. |
+| `redeem_invitation(blob, in_person=False) -> Contact` | Ingest a friend's token, verifying its signature; produce a `Contact`. |
+| `safety_number(id_a, id_b) -> str` | The symmetric digit string the two humans compare over a trusted channel. |
+| `verify_contact(contact, presented, my_identity) -> Contact` | Confirm the safety number and promote the contact to verified. |
+| `Contacts.load(data_dir)` / `.save(data_dir)` / `.add` / `.get` | The durable, user-owned address book (`<data_dir>/contacts.cfg.json`). |
+
+Your first five minutes, end to end — Alice shares a link, Bob adds her. Each
+`*_identity` is that node's own generated `Identity`; they live on different
+machines, shown together only to make the values explicit:
+
+```python
+from autonomous_trust.core.contacts import (create_invitation, redeem_invitation,
+                                             safety_number, verify_contact, Contacts)
+
+# On Alice's node: mint an invitation from her own identity and share the link.
+invite = create_invitation(alice_identity, rendezvous=["relay-hint"], ttl_seconds=3600)
+link = invite.to_uri()          # "at+contact:eyJib2R5..."; send over SMS/Signal/QR
+
+# On Bob's node: ingest the link and store the contact.
+contact = redeem_invitation(link)          # signature verified; remote => unverified
+store = Contacts.load(data_dir)
+store.add(contact); store.save(data_dir)   # durable; survives restarts and networks
+
+# Verify out of band (the MITM defense): Alice reads her safety number to Bob
+# over a trusted channel. The number is symmetric, so Bob confirms the match.
+presented = safety_number(alice_identity, bob_identity)   # what Alice reads aloud
+verify_contact(contact, presented, bob_identity)          # flips verified on match
+store.save(data_dir)
+```
+
+A QR code scanned in person is stronger still: pass `in_person=True` to
+`redeem_invitation` and the contact is verified on the spot, because the key
+arrived over a channel with no man in the middle. A contact added from a remote
+link is usable while **unverified** — you may message it — but it reads as
+unverified until the safety number is confirmed, and higher-trust actions should
+gate on `contact.verified`. Rendezvous relays (reaching a contact across NAT) and
+an optional find-by-handle directory are later phases; the invitation path above
+needs neither.
+
 ## Override hooks
 
 Your integration logic lives in methods you override on your subclass. Each
