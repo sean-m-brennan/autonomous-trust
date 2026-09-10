@@ -29,6 +29,17 @@ description: |
     that runtime and nowhere else, which is precisely the asymmetry a corpus
     exists to catch and no single-runtime test can see.
 
+    The first-contact pair is the newest entry and the clearest illustration of
+    the "too small" failure: the very first `first_contact_hello` arrives from
+    somebody who is not a peer yet, so there is no key it could have been
+    encrypted under, and a receiver that demanded one would make the 1:1
+    introduction impossible to start. They are plaintext for the same reason
+    `access_granted` is, and -- like the partition pair, and unlike
+    `full_history` -- they are NOT bootstrap: they confer no group membership
+    and hand over no group key, so the gateway boundary must keep carrying
+    them. (The handlers themselves are opt-in per node; the allowlist is a
+    RECEIVE policy and is not gated on the opt-in, on either runtime.)
+
     THE ASSERTION THAT MATTERS MOST is the relationship to the bootstrap set
     (see `gateway-boundary-verbs`). The two overlap on `request_access` and
     `access_granted` -- both run before a key exists -- but `full_history` is
@@ -58,6 +69,8 @@ fixtures:
     - subtree_roster_response    # roster answer
     - group_partition_probe      # partition recovery spans a key boundary
     - group_partition_response
+    - first_contact_hello        # 1:1 introduction, before the peer is known
+    - first_contact_hello_ack    # and the answer, before the peer knows us
   encrypted_only_verbs:
     - full_history               # HANDS OVER THE GROUP KEY -- never plaintext
     - group_key_update
@@ -94,8 +107,8 @@ expected_state:
     all_unencrypted_verbs_recognized: true
     # And nothing else is -- the downgrade half.
     no_other_verb_is_unencrypted: true
-    # Nine verbs, exactly. A change is a protocol change, made on both sides.
-    unencrypted_verb_count_is_nine: true
+    # Eleven verbs, exactly. A change is a protocol change, made on both sides.
+    unencrypted_verb_count_is_eleven: true
     # NULL/empty is safe and is not on the allowlist.
     empty_verb_is_not_unencrypted: true
     # The two sets overlap where a key does not yet exist ...

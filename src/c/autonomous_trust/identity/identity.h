@@ -48,7 +48,36 @@ typedef struct
     unsigned char public_hex[crypto_box_PUBLICKEYBYTES * 2 + 1];
 } encryptor_t;
 
-#define ADDR_LEN 32
+/* Maximum length of an address STRING, excluding the NUL: every declaration is
+ * `char address[ADDR_LEN + 1]`, so the buffer is 46 bytes = INET6_ADDRSTRLEN =
+ * network.h's IPV6_ADDR_LEN. 45 is the longest text form of an IP address
+ * ("ffff:...:255.255.255.255"), so a numeric address of either family now fits
+ * whole.
+ *
+ * It was 32 until 2026-09-10, which truncated a long IPv6 literal, and every
+ * consequence of that was silent because half an address is still a
+ * syntactically valid address:
+ *   - config/generate.c clipped this node's OWN discovered IPv6 address while
+ *     hand-rolling a memcpy specifically to keep the compiler quiet about it;
+ *   - net_proc.c's my_address feeds a self-filter (`strcmp(from_addr,
+ *     my_addr)`), so a clipped value stops a node recognising its own traffic
+ *     (see [[c-cidr-split-hardcoded-lengths]]: its three callers had already
+ *     been widened to IPV6_ADDR_LEN as a local workaround for THIS constant);
+ *   - identity/first_contact.c had to refuse an over-long rendezvous endpoint
+ *     outright rather than send a hello to a mangled host.
+ * Python has no bound on Identity.address at all, so 32 was also a live
+ * C-only divergence that the conformance corpus never exercised.
+ *
+ * NOT sized for more, deliberately:
+ *   - a scoped literal (`fe80::1%eth0`) needs up to ~55, but nothing here
+ *     accepts one: the transport resolves with inet_pton (net_transport_ip.c),
+ *     which rejects a zone id outright;
+ *   - a DNS name needs 253. Every writer of this field stores the output of
+ *     inet_ntop or a literal, so it holds a numeric address; a name-valued
+ *     address would be a separate design change, not a wider buffer.
+ * network/net_message.c carries a _Static_assert tying this to IPV6_ADDR_LEN so
+ * the two cannot drift apart again. */
+#define ADDR_LEN 45
 
 #define NAME_LEN 128
 

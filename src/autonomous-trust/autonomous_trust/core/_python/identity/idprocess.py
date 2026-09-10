@@ -397,6 +397,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.partition_signal, self.handle_partition_signal)
         self.protocol.register_handler(IdentityProtocol.partition_probe, self.handle_partition_probe)
         self.protocol.register_handler(IdentityProtocol.partition_response, self.handle_partition_response)
+        # First contact (OPTIONAL, opt-in via AT_FIRST_CONTACT). Off by default:
+        # a normal node registers no first-contact handlers and is unaffected.
+        # Local import so the contacts dependency is only touched when opted in.
+        from . import first_contact as _first_contact
+        if _first_contact.enabled():
+            _first_contact.register(self)
+            self.logger.info('First contact (1:1 introduction) enabled')
         self.lock = None
 
     @property

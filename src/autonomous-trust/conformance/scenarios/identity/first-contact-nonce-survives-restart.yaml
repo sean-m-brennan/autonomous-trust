@@ -1,0 +1,99 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: first-contact-nonce-survives-restart
+byte_pinning: false
+description: |
+    The single-use guard is DURABLE: a restart must not re-open a spent
+    invitation.
+
+    An in-memory-only guard would make the refusal in
+    `first-contact-invitation-single-use` trivially defeatable -- wait for the
+    inviter to restart (or make it restart) and replay the same ticket. That is
+    not a remote possibility for a mobile node; it is the normal case. So the
+    spent nonce is written through to `<data_dir>/first_contact_nonces.cfg.json`
+    before the ack goes out, atomically (temp + rename), and reloaded on the
+    next start.
+
+    A nonce is stored with its invitation's expiry so the record can be pruned
+    once the ticket would be rejected as expired anyway -- and an expiry of 0
+    is kept FOREVER, because such an invitation is never self-limiting and
+    single use is then the only thing bounding replay. This case uses expiry 0
+    on purpose: it pins the forever branch.
+
+    `trigger_first_contact_restart` drops each runtime's in-memory guard
+    without touching the file, which is the closest a single-process harness
+    gets to a restart. Both runtimes then have to answer from disk -- Python
+    from a fresh `SpentNonces`, C from a fresh `_fc_load_locked`. This is also
+    the only case that compares the two stores' FORMAT: they read each other's
+    file only if they agree on it.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  # Alice and Bob are strangers, each in a cohort of their own -- the actual
+  # first-contact precondition, and what makes the group half of `direct_peers`
+  # mean something on BOTH sides. (With the harness's default shared group they
+  # would already be cohort members, and "did not become a group member" would
+  # be asserted against a fixture rather than against the handler.)
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000000a5"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000000b5"
+      size: 1
+
+steps:
+  - id: 1
+    from: bob
+    to: alice
+    function: first_contact_hello
+    payload:
+      minted_by: alice
+      nonce: fc-restart
+      expiry: 0
+    description: |
+        The legitimate redemption. The nonce is spent and persisted here.
+  - id: 2
+    from: alice
+    to: bob
+    function: first_contact_hello_ack
+    in_response_to: 1
+    no_propagate: true
+    payload:
+      nonce: fc-restart
+    description: |
+        Honored once.
+  - id: 3
+    from: alice
+    to: alice
+    function: trigger_first_contact_restart
+    description: |
+        Pseudo-step (no wire traffic): forget the in-memory guard, keep the
+        file. Whatever the node knows after this, it read back off disk.
+  - id: 4
+    from: bob
+    to: alice
+    function: first_contact_hello
+    payload:
+      minted_by: alice
+      nonce: fc-restart
+      expiry: 0
+    description: |
+        The replay, post-restart. Must be refused from the reloaded guard.
+
+expected_state:
+  alice:
+    # Still exactly one ack across BOTH deliveries.
+    first_contact_acks_emitted: 1
+    # And the guard says so, having come back from the store rather than from
+    # process memory.
+    first_contact_nonce_spent:
+      fc-restart: true

@@ -39,6 +39,7 @@
 #include "history.h"
 #include "identity_priv.h"
 #include "id_proc_priv.h"
+#include "first_contact.h"
 #include "utilities/b64.h"
 #include "utilities/freshness.h"
 
@@ -161,6 +162,23 @@ static char ID_ATTEST_RESPONSE[] = "operator_attest_response";
  * IdentityProtocol.hierarchy / hierarchy_req. */
 static char ID_HIERARCHY[]       = "hierarchy_root";
 static char ID_HIERARCHY_QUERY[] = "hierarchy_query";
+/* First contact: the OPTIONAL 1:1 introduction handshake (opt-in via
+ * AT_FIRST_CONTACT; identity/first_contact.c, doc/architecture/first-contact.md).
+ * DISTINCT from the cohort vote: a node holding a signed invitation reaches the
+ * inviter directly, and each side admits the other as a DIRECT peer
+ * (identity_admit_direct_peer -- no group key) rather than as a group member.
+ *
+ * Both ride the OPEN unencrypted channel because the first hello arrives before
+ * the sender is a known peer, exactly like ID_ACCEPT. They are deliberately NOT
+ * bootstrap verbs: they confer no group membership and hand over no group key,
+ * so the gateway boundary need not refuse them.
+ *
+ * Non-static (unlike the rest of this table) so identity/first_contact.c, which
+ * sends and receives them, shares the definition instead of respelling it --
+ * declared `extern` in first_contact.h. Mirrors Python IdentityProtocol.hello /
+ * .hello_ack. */
+char ID_FC_HELLO[]     = "first_contact_hello";
+char ID_FC_HELLO_ACK[] = "first_contact_hello_ack";
 
 /* Verbs this protocol legitimately puts on the wire in PLAINTEXT
  * (Message encrypt=false), and the only ones a receiver accepts unencrypted
@@ -185,6 +203,8 @@ static char *const ID_UNENCRYPTED_VERBS[] = {
     ID_ROSTER_RESPONSE,     /* subtree_roster_response */
     ID_PARTITION_PROBE,     /* group_partition_probe */
     ID_PARTITION_RESPONSE,  /* group_partition_response */
+    ID_FC_HELLO,            /* first_contact_hello -- arrives before the peer is known */
+    ID_FC_HELLO_ACK,        /* first_contact_hello_ack -- and so does the answer */
 };
 
 size_t identity_unencrypted_verb_count(void)
@@ -836,6 +856,26 @@ static int _add_peer(process_t *proc, directory_t *queues,
     if (confirmed)
         _confirm_group_membership(proc, queues, new_peer);
     return 0;
+}
+
+/* No-vote, no-group-key admission of a DIRECT (1:1) peer -- the seam the
+ * optional first-contact handshake admits through (identity/first_contact.c).
+ *
+ * Records the peer exactly as a PROVISIONAL admission does (peers[], the local
+ * activity broadcast, the app-facing peer_observed) so the encrypted P2P
+ * channel can attribute its frames and reputation can score it, but never
+ * calls _confirm_group_membership (which would hand over the group key) and
+ * never touches the identity history: a first-contact peer is directly
+ * reachable, not a group member. Idempotent on the UUID.
+ *
+ * Mirrors Python first_contact._admit_direct_peer, which calls peers.add at
+ * mid_level plus _record_peers. C's peers[] is a flat array with no levels, so
+ * there is no level to pass -- the asymmetry is structural and predates this. */
+int identity_admit_direct_peer(process_t *proc, directory_t *queues,
+                               const public_identity_t *who)
+{
+    if (proc == NULL || who == NULL) return -1;
+    return _add_peer(proc, queues, who, false);
 }
 
 /****************************
@@ -6505,6 +6545,15 @@ static int _own_public_identity(const process_t *proc, public_identity_t *out)
     return 0;
 }
 
+/* Public wrapper over _own_public_identity, for the sibling translation units
+ * that need this node's own published identity (identity/first_contact.c has to
+ * check that an invitation was minted by US). Declared in id_proc_priv.h. */
+int identity_own_public_identity(const process_t *proc, public_identity_t *out)
+{
+    return _own_public_identity(proc, out);
+}
+
+
 /* This node's attested-now answer as a NEW json object (caller owns): the same
  * attestation shape the admission path carries — so the receiver re-verifies a
  * real operator credential rather than trusting an asserted bool — plus the
@@ -7386,6 +7435,14 @@ int identity_register_handlers(process_t *proc)
      * (empty) until seeded — a leaf node then answers a roster query purely
      * locally, identical to today. See gateway-reputation-tree.md. */
     proc->protocol.roster_private = _roster_env_private();
+    /* First contact (OPTIONAL, opt-in via AT_FIRST_CONTACT). Off by default: a
+     * normal node registers no first-contact handlers and is unaffected.
+     * Mirrors Python IdentityProcess.__init__'s gated registration. */
+    if (at_first_contact_enabled()) {
+        at_first_contact_register(proc);
+        log_info(proc->logger,
+                 "Identity: first contact (1:1 introduction) enabled\n");
+    }
     return 0;
 }
 
