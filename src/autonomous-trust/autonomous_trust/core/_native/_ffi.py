@@ -254,7 +254,7 @@ ffi.cdef("""
     typedef struct {
         bool alloc; size_t refs;  /* smrt_ptr_t */
         unsigned char uuid[16];
-        char address[33];
+        char address[46];     /* ADDR_LEN(45) + 1 == IPV6_ADDR_LEN; was 33 */
         char nickname[129];   /* NAME_LEN+1; Zooko ONLINE name (was fullname) */
         char petname[129];    /* NAME_LEN+1; local-only Zooko name -- never */
                               /* serialized (see identity.c sync_out/sync_in). */

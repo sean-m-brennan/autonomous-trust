@@ -1,0 +1,59 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: first-contact-invitation-expired-ignored
+byte_pinning: false
+description: |
+    An expired invitation is refused, even though Alice signed it.
+
+    An invitation minted with a deadline is a standing offer that has lapsed:
+    the whole point of setting `expiry` is that a link shared into a channel
+    the sender does not control stops working on its own. Honoring it late
+    would silently convert every time-boxed invitation into a permanent one.
+
+    Deliberately paired with `first-contact-foreign-invitation-ignored`: these
+    are two independent refusals of an otherwise well-formed, correctly signed
+    ticket, and a runtime that collapsed the gates into one check would pass
+    one case and fail the other.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  # Alice and Bob are strangers, each in a cohort of their own -- the actual
+  # first-contact precondition, and what makes the group half of `direct_peers`
+  # mean something on BOTH sides. (With the harness's default shared group they
+  # would already be cohort members, and "did not become a group member" would
+  # be asserted against a fixture rather than against the handler.)
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000000a4"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000000b4"
+      size: 1
+
+steps:
+  - id: 1
+    from: bob
+    to: alice
+    function: first_contact_hello
+    payload:
+      minted_by: alice
+      nonce: fc-expired
+      # A fixed epoch far in the past, so the case never becomes
+      # clock-dependent (an expiry of 0 means "no expiry", not "expired").
+      expiry: 100
+    description: |
+        Alice's own ticket, presented after its deadline.
+
+expected_state:
+  alice:
+    direct_peers:
+      bob: false
+    first_contact_acks_emitted: 0

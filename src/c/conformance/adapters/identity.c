@@ -31,6 +31,7 @@
 
 #include "identity.h"
 
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,6 +61,9 @@
 #include "structures/map.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
+#include "utilities/allocation.h"
+#include "contacts/contacts.h"
+#include "identity/first_contact.h"
 
 #include "../negative_runner.h"
 #include "../scenario_engine.h"
@@ -106,6 +110,12 @@ typedef struct {
      * _Participant.attest_clock_samples.
      * See doc/architecture/cohort-clock-skew.md. */
     json_t *attest_clock_samples;
+    /* Where trigger_first_contact_initiate actually addressed its hello: the
+     * host on the outbound to_whom, recorded by _send_hook. Read by the
+     * first_contact_hello_endpoint check, which pins that `initiate` prefers
+     * the invitation's rendezvous hint over the inviter's advertised address.
+     * Mirrors the Python adapter's _Participant.fc_hello_endpoint. */
+    char fc_hello_endpoint[ADDR_LEN + 1];
 } ic_impl_t;
 
 /* The engine ctx is global because the messaging-hook signature has no
@@ -159,6 +169,23 @@ static int _send_hook(const char *key,
     const char *to_id = _resolve_to_id(msg);
     const char *function = (type == NET_MESSAGE && msg->info.net_msg.function != NULL)
         ? msg->info.net_msg.function : "__internal__";
+    /* A first-contact hello carries WHERE it was addressed, which the captured
+     * (from, to, function) triple does not. Recorded against the emitter so
+     * first_contact_hello_endpoint can pin the resolution order `initiate`
+     * used. */
+    if (type == NET_MESSAGE && strcmp(function, ID_FC_HELLO) == 0) {
+        for (size_t i = 0; i < g_active_ctx->participant_count; i++) {
+            if (strcmp(g_active_ctx->participants[i].id,
+                       g_active_ctx->current_dispatcher) != 0)
+                continue;
+            ic_impl_t *emitter = (ic_impl_t *)g_active_ctx->participants[i].impl;
+            if (emitter != NULL)
+                at_strlcpy(emitter->fc_hello_endpoint,
+                           msg->info.net_msg.to_whom.address,
+                           sizeof(emitter->fc_hello_endpoint));
+            break;
+        }
+    }
     sce_capture(g_active_ctx, to_id, function);
     return 0;
 }
@@ -1234,7 +1261,9 @@ static int _build_inbound(sce_run_ctx_t *ctx,
      * locally, which reads downstream as "emitted nothing". Mirrors the Python adapter,
      * which likewise leaves the payload in place for this one pseudo-function while
      * blanking it for the others. */
-    if (strcmp(function, "trigger_cohort_join") == 0 && json_is_object(payload)) {
+    if ((strcmp(function, "trigger_cohort_join") == 0
+         || strcmp(function, "trigger_first_contact_initiate") == 0)
+        && json_is_object(payload)) {
         json_t *body = json_deep_copy(payload);
         if (body != NULL) {
             net_msg_pack_json(&out->info.net_msg, body);
@@ -1384,6 +1413,88 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_t *body = json_string(from_addr);
         net_msg_pack_json(&out->info.net_msg, body);
         json_decref(body);
+    }
+
+    /* first_contact_hello — the OPTIONAL 1:1 handshake's ticket. The scenario
+     * names WHO minted the invitation (`minted_by`) plus the nonce and expiry,
+     * and the adapter mints it here from that participant's own signable
+     * identity rather than pinning a blob, because the participants' keys are
+     * generated per run. What the case compares is the inviter's DECISION.
+     *
+     * The obj is the RAW base64url blob, not JSON: Python's Message puts
+     * str(obj) straight on the wire (network/message.py _obj_str), and the
+     * inviter's signature covers exactly those bytes. net_msg_pack_json would
+     * JSON-quote it and the handler would (correctly) fail to decode it.
+     * Mirrors the Python adapter's IdentityProtocol.hello branch. */
+    if (strcmp(function, ID_FC_HELLO) == 0) {
+        const char *minter_pid = from_id;
+        const char *nonce = "";
+        long expiry = 0;
+        json_t *rv_list = NULL;
+        if (json_is_object(payload)) {
+            json_t *m = json_object_get(payload, "minted_by");
+            if (json_is_string(m)) minter_pid = json_string_value(m);
+            json_t *n = json_object_get(payload, "nonce");
+            if (json_is_string(n)) nonce = json_string_value(n);
+            json_t *e = json_object_get(payload, "expiry");
+            if (json_is_integer(e)) expiry = (long)json_integer_value(e);
+            json_t *r = json_object_get(payload, "rendezvous");
+            if (json_is_array(r)) rv_list = r;
+        }
+        sce_participant_t *minter = sce_find_participant(ctx, minter_pid);
+        if (minter == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "build_inbound: first_contact_hello names unknown "
+                     "minted_by %s", minter_pid);
+            return -1;
+        }
+        size_t n_rv = rv_list != NULL ? json_array_size(rv_list) : 0;
+        const char *rv[8];
+        if (n_rv > 8) n_rv = 8;
+        for (size_t i = 0; i < n_rv; i++) {
+            const char *hint = json_string_value(json_array_get(rv_list, i));
+            rv[i] = hint != NULL ? hint : "";
+        }
+        char *blob = NULL;
+        if (at_create_invitation(((ic_impl_t *)minter->impl)->full,
+                                 n_rv > 0 ? rv : NULL, n_rv,
+                                 expiry, nonce, &blob) != 0 || blob == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "build_inbound: could not mint an invitation for %s",
+                     minter_pid);
+            return -1;
+        }
+        size_t blen = strlen(blob);
+        out->info.net_msg.obj = smrt_create(blen + 1);
+        if (out->info.net_msg.obj == NULL) {
+            free(blob);
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "build_inbound: out of memory for the invitation blob");
+            return -1;
+        }
+        memcpy(out->info.net_msg.obj, blob, blen + 1);
+        out->info.net_msg.len = blen;
+        free(blob);
+        return 0;
+    }
+
+    /* first_contact_hello_ack — the accept. The echoed nonce is informational
+     * (the initiator already holds the accepter's key from the invitation it
+     * redeemed), so the handler reads no further on either runtime; carried
+     * anyway because it is what production sends. */
+    if (strcmp(function, ID_FC_HELLO_ACK) == 0) {
+        const char *nonce = "";
+        if (json_is_object(payload)) {
+            json_t *n = json_object_get(payload, "nonce");
+            if (json_is_string(n)) nonce = json_string_value(n);
+        }
+        json_t *body = json_object();
+        if (body != NULL) {
+            json_object_set_new(body, "nonce", json_string(nonce));
+            net_msg_pack_json(&out->info.net_msg, body);
+            json_decref(body);
+        }
+        return 0;
     }
 
     /* partition_probe — cross-group probe, signed JSON payload. */
@@ -1856,6 +1967,75 @@ static int _dispatch(sce_run_ctx_t *ctx,
                      generic_msg_t *inbound) {
     (void)ctx;
     ic_impl_t *impl = (ic_impl_t *)target->impl;
+    /* trigger_first_contact_initiate — drive the INITIATOR half through the
+     * production call rather than handing the target a hello the harness
+     * built. A pseudo-step because `initiate` is an API call, not an inbound
+     * message. Mirrors the Python adapter's _TRIGGER_FC_INITIATE. */
+    if (inbound->type == NET_MESSAGE && inbound->info.net_msg.function != NULL
+        && strcmp(inbound->info.net_msg.function,
+                  "trigger_first_contact_initiate") == 0) {
+        json_t *spec = NULL;
+        if (net_msg_unpack_json(&inbound->info.net_msg, &spec) != 0
+            || !json_is_object(spec)) {
+            if (spec != NULL) json_decref(spec);
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "trigger_first_contact_initiate: missing payload");
+            return -1;
+        }
+        const char *minter_pid =
+            json_string_value(json_object_get(spec, "minted_by"));
+        const char *nonce = json_string_value(json_object_get(spec, "nonce"));
+        json_t *e = json_object_get(spec, "expiry");
+        long expiry = json_is_integer(e) ? (long)json_integer_value(e) : 0;
+        json_t *rv_list = json_object_get(spec, "rendezvous");
+        sce_participant_t *minter = minter_pid != NULL
+            ? sce_find_participant(ctx, minter_pid) : NULL;
+        if (minter == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "trigger_first_contact_initiate: unknown minted_by %s",
+                     minter_pid != NULL ? minter_pid : "(null)");
+            json_decref(spec);
+            return -1;
+        }
+        size_t n_rv = json_is_array(rv_list) ? json_array_size(rv_list) : 0;
+        const char *rv[8];
+        if (n_rv > 8) n_rv = 8;
+        for (size_t i = 0; i < n_rv; i++) {
+            const char *hint = json_string_value(json_array_get(rv_list, i));
+            rv[i] = hint != NULL ? hint : "";
+        }
+        char *blob = NULL;
+        int mrc = at_create_invitation(((ic_impl_t *)minter->impl)->full,
+                                       n_rv > 0 ? rv : NULL, n_rv, expiry,
+                                       nonce != NULL ? nonce : "", &blob);
+        json_decref(spec);
+        if (mrc != 0 || blob == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "trigger_first_contact_initiate: could not mint the ticket");
+            return -1;
+        }
+        int rc = at_first_contact_initiate(impl->proc, NULL, blob, NULL, NULL);
+        free(blob);
+        if (rc != 0) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "trigger_first_contact_initiate: initiate failed (%d)", rc);
+            return -1;
+        }
+        return 0;
+    }
+
+    /* trigger_first_contact_restart — drop the OPTIONAL 1:1 handshake's
+     * in-memory spent-nonce guard WITHOUT touching the file it persists to:
+     * the closest a single-process harness gets to restarting the node.
+     * Whatever the guard knows afterwards it read back off disk. Mirrors the
+     * Python adapter's _TRIGGER_FC_RESTART, which rebuilds SpentNonces. */
+    if (inbound->type == NET_MESSAGE
+        && inbound->info.net_msg.function != NULL
+        && strcmp(inbound->info.net_msg.function,
+                  "trigger_first_contact_restart") == 0) {
+        at_first_contact_reset();
+        return 0;
+    }
     if (inbound->type == NET_MESSAGE
         && inbound->info.net_msg.function != NULL
         && strcmp(inbound->info.net_msg.function, "trigger_caps_resync") == 0) {
@@ -2091,6 +2271,125 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                              "%s: has_peer %s not present (have %d peers)",
                              pid, uuid_str, (int)proc->protocol.num_peers);
                     return -1;
+                }
+            } else if (strcmp(key, "direct_peers") == 0) {
+                /* The OPTIONAL 1:1 first-contact handshake's admission, as
+                 * {participant_id: bool}. True asserts BOTH halves of what a
+                 * direct peer is: present in peers[], and ABSENT from the
+                 * group address map. The second half is the security property
+                 * -- a first-contact peer is directly reachable, not a group
+                 * member, so the shared group key must not follow it in.
+                 * False asserts the peer was not admitted at all (the refusal
+                 * cases). Mirrors the Python adapter's direct_peers. */
+                const char *dp_pid;
+                json_t *dp_want;
+                json_object_foreach(val, dp_pid, dp_want) {
+                    sce_participant_t *other = sce_find_participant(ctx, dp_pid);
+                    if (other == NULL) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: direct_peers names unknown participant %s",
+                                 pid, dp_pid);
+                        return -1;
+                    }
+                    const public_identity_t *want_id =
+                        ((ic_impl_t *)other->impl)->pub;
+                    bool found = false;
+                    for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+                        if (memcmp(proc->protocol.peers[i].uuid, want_id->uuid,
+                                   sizeof(uuid_t)) == 0) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!json_is_true(dp_want)) {
+                        if (found) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: %s was admitted as a peer, expected "
+                                     "refusal", pid, dp_pid);
+                            return -1;
+                        }
+                        continue;
+                    }
+                    if (!found) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: %s is not a peer, expected a direct-peer "
+                                 "admission", pid, dp_pid);
+                        return -1;
+                    }
+                    char want_uuid[UUID_STR_LEN + 1];
+                    uuid_unparse_lower(want_id->uuid, want_uuid);
+                    data_t *addr_dat = NULL;
+                    if (map_get(&proc->protocol.group.address_map, want_uuid,
+                                &addr_dat) == 0) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: %s landed in the GROUP address map; a "
+                                 "first-contact peer must not become a group "
+                                 "member (the group key would follow)",
+                                 pid, dp_pid);
+                        return -1;
+                    }
+                }
+            } else if (strcmp(key, "first_contact_hello_endpoint") == 0) {
+                /* Where trigger_first_contact_initiate addressed its hello.
+                 * Pins the resolution ORDER: the invitation's rendezvous hint
+                 * wins over the address the inviter's identity advertises.
+                 * Both are well-formed addresses, so preferring the wrong one
+                 * fails silently -- it works on a LAN and never reaches a
+                 * remote friend. Mirrors the Python adapter's check. */
+                const char *want = json_string_value(val);
+                if (want == NULL) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: first_contact_hello_endpoint expects a string",
+                             pid);
+                    return -1;
+                }
+                if (strcmp(impl->fc_hello_endpoint, want) != 0) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: first_contact_hello_endpoint=%s, expected %s",
+                             pid, impl->fc_hello_endpoint, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "first_contact_acks_emitted") == 0) {
+                /* How many first_contact_hello_ack messages this participant
+                 * emitted over the whole scenario. The observable for the
+                 * single-use guard: the peer is legitimately admitted on the
+                 * first redemption, so a replay that was honored twice differs
+                 * ONLY in what went back out. Mirrors the Python adapter's
+                 * emit_tally-based check. */
+                int want = (int)json_integer_value(val);
+                int got = 0;
+                for (size_t i = 0; i < ctx->captured_count; i++) {
+                    if (strcmp(ctx->captured[i].from, pid) == 0
+                        && strcmp(ctx->captured[i].function,
+                                  ID_FC_HELLO_ACK) == 0)
+                        got++;
+                }
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: first_contact_acks_emitted=%d, expected %d",
+                             pid, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "first_contact_nonce_spent") == 0) {
+                /* The durable single-use guard itself, as {nonce: bool}. Read
+                 * after a trigger_first_contact_restart, this is the only
+                 * place the on-disk store is observed rather than inferred --
+                 * and the two runtimes read each other's file only if they
+                 * agree on its shape. Mirrors the Python adapter, which reads
+                 * the process's SpentNonces. */
+                const char *nonce;
+                json_t *nwant;
+                json_object_foreach(val, nonce, nwant) {
+                    bool got = at_first_contact_nonce_spent(nonce);
+                    bool want = json_is_true(nwant);
+                    if (got != want) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: first_contact_nonce_spent[%s]=%s, "
+                                 "expected %s", pid, nonce,
+                                 got ? "true" : "false",
+                                 want ? "true" : "false");
+                        return -1;
+                    }
                 }
             } else if (strcmp(key, "attested_now") == 0) {
                 /* The attended-now stamp this participant's last ACCEPTED pull
@@ -2739,6 +3038,42 @@ void at_identity_run(const at_case_t *c, at_case_result_t *out) {
      * not polluted by prior scenarios. Preserves synchronous_dispatch. */
     identity_reset_state();
 
+    /* First contact is OPT-IN, and the opt-in is read when the process
+     * registers its handlers -- so it has to be set BEFORE the participants
+     * are built, and restored after, or the next scenario inherits it. The
+     * durable spent-nonce store is redirected to a per-scenario temp root for
+     * the same reason: a nonce spent by one case must not be spent for the
+     * next. Mirrors the Python adapter, whose scratch TemporaryDirectory does
+     * both jobs. */
+    at_first_contact_reset();
+    bool fc_enabled = false;
+    {
+        json_t *fx = json_object_get(c->data, "fixtures");
+        json_t *fc = json_is_object(fx) ? json_object_get(fx, "first_contact")
+                                        : NULL;
+        fc_enabled = json_is_object(fc)
+                     && json_is_true(json_object_get(fc, "enabled"));
+    }
+    char fc_root[] = "/tmp/at-conformance-fc-XXXXXX";
+    char fc_saved_flag[64] = {0};
+    char fc_saved_root[PATH_MAX] = {0};
+    bool fc_had_flag = false, fc_had_root = false;
+    if (fc_enabled) {
+        const char *prior = getenv(AT_FIRST_CONTACT_ENV);
+        if (prior != NULL) {
+            fc_had_flag = true;
+            at_strlcpy(fc_saved_flag, prior, sizeof(fc_saved_flag));
+        }
+        prior = getenv("AUTONOMOUS_TRUST_ROOT");
+        if (prior != NULL) {
+            fc_had_root = true;
+            at_strlcpy(fc_saved_root, prior, sizeof(fc_saved_root));
+        }
+        setenv(AT_FIRST_CONTACT_ENV, "1", 1);
+        if (mkdtemp(fc_root) != NULL)
+            setenv("AUTONOMOUS_TRUST_ROOT", fc_root, 1);
+    }
+
     /* Build participants. */
     json_t *parts = json_object_get(c->data, "participants");
     if (!json_is_array(parts)) {
@@ -2783,6 +3118,15 @@ void at_identity_run(const at_case_t *c, at_case_result_t *out) {
     messaging_set_test_hook(NULL);
     g_active_ctx = NULL;
     identity_set_synchronous_dispatch(false);
+    /* Undo the first-contact opt-in and the redirected data root (no-ops when
+     * the scenario never asked for them), so neither leaks into the next case. */
+    if (fc_enabled) {
+        at_first_contact_reset();
+        if (fc_had_flag) setenv(AT_FIRST_CONTACT_ENV, fc_saved_flag, 1);
+        else unsetenv(AT_FIRST_CONTACT_ENV);
+        if (fc_had_root) setenv("AUTONOMOUS_TRUST_ROOT", fc_saved_root, 1);
+        else unsetenv("AUTONOMOUS_TRUST_ROOT");
+    }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     int duration_ms = (int)((t1.tv_sec - t0.tv_sec) * 1000
@@ -2804,6 +3148,16 @@ fail:
     g_active_ctx = NULL;
     messaging_set_test_hook(NULL);
     identity_set_synchronous_dispatch(false);
+    /* Undo the first-contact opt-in and the redirected data root (no-ops when
+     * the scenario never asked for them), so neither leaks into the next case. */
+    if (fc_enabled) {
+        at_first_contact_reset();
+        if (fc_had_flag) setenv(AT_FIRST_CONTACT_ENV, fc_saved_flag, 1);
+        else unsetenv(AT_FIRST_CONTACT_ENV);
+        if (fc_had_root) setenv("AUTONOMOUS_TRUST_ROOT", fc_saved_root, 1);
+        else unsetenv("AUTONOMOUS_TRUST_ROOT");
+    }
+
     for (size_t i = 0; i < ctx.participant_count; i++) {
         _free_participant_impl((ic_impl_t *)ctx.participants[i].impl);
     }
