@@ -417,7 +417,7 @@ DEFINE_TEST(test_extern_msg_routes_inbound_types)
 }
 END_TEST_DEFINITION()
 
-DEFINE_TEST(test_roster_request_reaches_both_carrier_halves)
+DEFINE_TEST(test_roster_request_reaches_all_carrier_thirds)
 {
     capture_reset();
 
@@ -427,10 +427,12 @@ DEFINE_TEST(test_roster_request_reaches_both_carrier_halves)
 
     ck_assert_int_eq(at_route_extern_msg(&req, NULL), 0);
 
-    /* Identity holds the peer facts, reputation the scores — both answer,
-     * and each copy is addressed to its own process so dispatch matches. */
+    /* Identity holds the peer facts, reputation the scores, network the RTT —
+     * all three answer, and each copy is addressed to its own process so
+     * dispatch matches. */
     ck_assert_int_eq(count_to("identity"), 1);
     ck_assert_int_eq(count_to("reputation"), 1);
+    ck_assert_int_eq(count_to("network"), 1);
     for (int i = 0; i < num_captured; i++)
         ck_assert_str_eq(captured[i].msg.info.net_msg.process, captured[i].key);
 
@@ -981,6 +983,59 @@ DEFINE_TEST(test_carrier_crosses_a_real_socket_to_the_app)
 }
 END_TEST_DEFINITION()
 
+/****************************
+ * The RTT carrier third: serializer round trip + app-facing decode.
+ * Placed here, after uuid_fill / socket_root_setup are defined above.
+ ****************************/
+
+DEFINE_TEST(test_rtt_round_trips_and_polls_as_an_rtt_event)
+{
+    /* message_size must know the new tag, or the queue cannot size it. */
+    ck_assert_int_eq((int)message_size(PEER_RTT_OBSERVED),
+                     (int)sizeof(peer_rtt_update_msg_t));
+
+    /* IPC serializer round trip: pins the string tag both ways (msg_types.c
+     * msg_type_to_str <-> str_to_msg_type) plus the fixed-payload copy. */
+    generic_msg_t out = {0};
+    out.type = PEER_RTT_OBSERVED;
+    out.size = sizeof(peer_rtt_update_msg_t);
+    uuid_fill(out.info.peer_rtt_update.peer_uuid, 0x5A);
+    out.info.peer_rtt_update.rtt_ms = 137;
+
+    void *data = NULL;
+    size_t data_len = 0;
+    ck_assert_int_eq(generic_msg_to_proto(&out, &data, &data_len), 0);
+    generic_msg_t back = {0};
+    ck_assert_int_eq(proto_to_generic_msg(data, data_len, &back), 0);
+    ck_assert_int_eq((int)back.type, (int)PEER_RTT_OBSERVED);
+    ck_assert_int_eq(back.info.peer_rtt_update.rtt_ms, 137);
+    ck_assert_int_eq(back.info.peer_rtt_update.peer_uuid[0], 0x5A);
+
+    /* End to end over a real socket: the drain forwards PEER_RTT_OBSERVED to
+     * q_out and the app decodes it through the flat ABI as an RTT event. */
+    messaging_set_test_hook(NULL);
+    socket_root_setup();
+    at_app_events_t *ev = at_app_events_open("test_rtt_to_app");
+    ck_assert_ptr_nonnull(ev);
+
+    array_t unhandled = {0};
+    array_init(&unhandled);
+    at_route_queue_msg(&unhandled, &out);
+    int sent = at_route_internal_msgs(&unhandled, "test_rtt_to_app", NULL);
+    ck_assert_int_eq(sent, 1);
+
+    at_app_event_t batch[4];
+    memset(batch, 0, sizeof(batch));
+    int n = at_app_events_poll(ev, batch, 4);
+    ck_assert_int_eq(n, 1);
+    ck_assert_int_eq((int)batch[0].kind, (int)AT_APP_EVENT_PEER_RTT);
+    ck_assert_int_eq(batch[0].data.rtt.rtt_ms, 137);
+    ck_assert_int_eq(batch[0].data.rtt.peer_uuid[0], 0x5A);
+
+    at_app_events_close(ev);
+}
+END_TEST_DEFINITION()
+
 DEFINE_TEST(test_app_bound_to_the_wrong_name_receives_nothing)
 {
     messaging_set_test_hook(NULL);
@@ -1068,7 +1123,8 @@ RUN_TESTS(App_Events,
           test_drain_drops_unroutable_type_without_sending,
           test_drain_survives_send_failure,
           test_extern_msg_routes_inbound_types,
-          test_roster_request_reaches_both_carrier_halves,
+          test_roster_request_reaches_all_carrier_thirds,
+          test_rtt_round_trips_and_polls_as_an_rtt_event,
           test_extern_net_msg_verb_is_allowlisted,
           test_identity_emits_one_observation_per_peer,
           test_identity_roster_pull_with_no_peers_emits_nothing,
