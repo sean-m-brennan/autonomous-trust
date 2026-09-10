@@ -142,13 +142,21 @@ class TestAllowlistMatchesTheSendSites:
 
     def _unencrypted_sends(self):
         """Every `Message(CfgIds.x, IdentityProtocol.verb, ..., encrypt=False)`
-        in the identity process, resolved to its wire verb."""
-        path = os.path.join(
+        in the identity process, resolved to its wire verb. Scans idprocess.py
+        and first_contact.py (the opt-in 1:1 handshake sends hello/hello_ack
+        plaintext from that module)."""
+        id_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(
                 os.path.abspath(__file__)))),
-            'autonomous_trust', 'core', '_python', 'identity', 'idprocess.py')
-        tree = ast.parse(open(path).read())
+            'autonomous_trust', 'core', '_python', 'identity')
         found = {}
+        for fname in ('idprocess.py', 'first_contact.py'):
+            tree = ast.parse(open(os.path.join(id_dir, fname)).read())
+            self._scan_sends(tree, found)
+        return found
+
+    @staticmethod
+    def _scan_sends(tree, found):
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue

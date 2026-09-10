@@ -1,0 +1,74 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: first-contact-foreign-invitation-ignored
+byte_pinning: false
+description: |
+    A ticket Alice did not sign is not Alice's to honor.
+
+    Mallory mints a perfectly valid invitation -- correct shape, correct
+    version, signature that verifies against the identity embedded in it -- and
+    Bob presents it to Alice. It verifies, and it must still be refused,
+    because the only invitation that admits a peer to Alice is one Alice
+    herself minted.
+
+    This is the check that keeps the handshake from degenerating into "anybody
+    with any signed blob gets in". A runtime that only validated the signature
+    (the easy reading of "verify the invitation") would pass every other case
+    in this corpus and fail this one, which is why the case exists: the
+    verification and the ownership test are two separate gates, and the second
+    one is the one an implementer forgets.
+
+    Neither Bob nor Mallory ends up admitted, and the second half of that is
+    the subtler one: a runtime tempted to "helpfully" record the identity
+    embedded in an invitation it just verified would add MALLORY as a peer on
+    the strength of her own signature, which is self-assertion, not
+    introduction.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+  - id: mallory
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  # Alice and Bob are strangers, each in a cohort of their own -- the actual
+  # first-contact precondition, and what makes the group half of `direct_peers`
+  # mean something on BOTH sides. (With the harness's default shared group they
+  # would already be cohort members, and "did not become a group member" would
+  # be asserted against a fixture rather than against the handler.)
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000000a3"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000000b3"
+      size: 1
+    mallory:
+      uuid: "fc000000-0000-4000-8000-0000000000c3"
+      size: 1
+
+steps:
+  - id: 1
+    from: bob
+    to: alice
+    function: first_contact_hello
+    payload:
+      minted_by: mallory
+      nonce: fc-foreign
+      expiry: 0
+    description: |
+        A valid invitation, signed by the wrong person. Alice must not treat
+        somebody else's signature as authority over her own peer list.
+
+expected_state:
+  alice:
+    # Not admitted at all: the ticket was never hers.
+    direct_peers:
+      bob: false
+      mallory: false
+    first_contact_acks_emitted: 0

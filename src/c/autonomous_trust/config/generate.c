@@ -331,12 +331,14 @@ int generate_identity(const char *fullname, const char *cfg_dir,
     const net_transport_t *active = net_transport_find(default_transport_name());
     network_protocol_t fam = (active != NULL) ? active->net_proto : NETPROTO_IPV4;
 
-    /* Manual byte-copy with explicit truncation — ADDR_LEN (32) is shorter
-     * than IPV6_ADDR_LEN (46), so a long IPv6 address may truncate. The
-     * compiler's -Wformat-truncation / -Wstringop-truncation can't see
-     * that truncation is intentional here, so we copy bytes and NUL-
-     * terminate by hand. Widening `public_identity_t.address` is a
-     * separate (L4-class) wire-format change. */
+    /* ADDR_LEN + 1 is now IPV6_ADDR_LEN (identity.h, widened 2026-09-10), so a
+     * numeric address of either family fits whole and this copy no longer has
+     * to truncate. It used to: this block hand-rolled a memcpy precisely to
+     * stop -Wstringop-truncation complaining about clipping the node's OWN
+     * discovered IPv6 address, which is about the worst thing to silently
+     * shorten -- everything downstream compares against it. Kept as a CHECKED
+     * copy rather than reverting to strncpy: if the two constants ever drift
+     * again, this must fail loudly, not quietly clip. */
     const char *src = NULL;
     if (disc == 0) {
         switch (fam) {
@@ -355,10 +357,13 @@ int generate_identity(const char *fullname, const char *cfg_dir,
     } else {
         src = "127.0.0.1";
     }
-    size_t copy_len = strlen(src);
-    if (copy_len > ADDR_LEN) copy_len = ADDR_LEN;
-    memcpy(address, src, copy_len);
-    address[copy_len] = '\0';
+    if (at_strlcpy(address, src, sizeof(address)) >= sizeof(address)) {
+        /* Unreachable while ADDR_LEN + 1 >= IPV6_ADDR_LEN (net_proc.c pins
+         * that with a _Static_assert), and an error rather than a clip
+         * because a node whose own address is wrong cannot recognise its own
+         * traffic -- it would look like a network fault, not a config one. */
+        return EXCEPTION(ENET_ADDR_TOO_LONG);
+    }
 
     identity_t *ident = NULL;
     /* fullname is the online nickname to embed; petname (local) defaults NULL */

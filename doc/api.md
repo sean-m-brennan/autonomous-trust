@@ -140,6 +140,47 @@ gate on `contact.verified`. Rendezvous relays (reaching a contact across NAT) an
 an optional find-by-handle directory are later phases; the invitation path above
 needs neither.
 
+### Going live: the 1:1 handshake (opt-in)
+
+Everything above is offline — Bob now holds Alice's key and remembers her, but
+the two nodes have not spoken. The handshake makes the pair live. It is **off by
+default**: set `AT_FIRST_CONTACT=1` on both nodes, and a node that has not opted
+in registers no handlers for it.
+
+```python
+from autonomous_trust.core.identity import first_contact
+
+# Runs INSIDE the identity process: `proc` is the IdentityProcess, which is what
+# owns the identity, the network queue, and the handlers for the reply.
+inviter = first_contact.initiate(proc, queues, link)   # sends the hello
+```
+
+**Not yet reachable from an application hook.** `initiate` takes the identity
+process, not your `AutonomousTrust` subclass, and there is no local IPC verb yet
+by which an app asks the identity process to open a handshake (the way
+`AT_APP_ROSTER_REQUEST` asks it to re-emit the peer view). Until that trigger
+exists this call is reachable from inside the identity process and from tests;
+an integration that needs it today has to add the trigger.
+
+Alice's node validates the ticket — her signature, not expired, nonce not
+already spent (an invitation is **single-use**, and the spent nonce survives a
+restart) — admits Bob, and acknowledges; Bob's node admits Alice on the ack.
+Both messages ride the open channel by necessity: the first hello arrives before
+either side is a known peer.
+
+What admission means here is narrower than joining a group, and worth being
+explicit about if you are building on it: each side gains the other as a
+**direct peer** — reachable, attributable on the encrypted point-to-point
+channel, and scorable by reputation — and **not** a group member. The group key
+is not propagated, so an invitation can never be used as a back door into the
+cohort. The contact also stays `verified=False` until the safety-number
+comparison above; the handshake proves reachability, not identity.
+
+The C twin is `at_first_contact_initiate` /
+`handle_first_contact_hello` (`identity/first_contact.h`), gated on the same
+`AT_FIRST_CONTACT` flag, with the same three gates and the same durable
+single-use guard.
+
 ## Override hooks
 
 Your integration logic lives in methods you override on your subclass. Each

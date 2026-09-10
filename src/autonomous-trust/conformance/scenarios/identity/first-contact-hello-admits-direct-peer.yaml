@@ -1,0 +1,91 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: first-contact-hello-admits-direct-peer
+byte_pinning: false
+description: |
+    The live 1:1 first-contact handshake, both halves
+    (doc/architecture/first-contact.md §4.0/§4.1). Alice minted a signed
+    invitation and handed it to Bob out of band; Bob presents it as his ticket
+    on the OPEN channel, and each side ends holding the other as a peer.
+
+    This is NOT the cohort vote. Admission here is a two-party decision on a
+    ticket Alice herself signed -- no propose, no vote, no confirm -- which is
+    exactly why it needed a primitive of its own: "connect me to this specific
+    person" was unreachable through an admission path that requires a majority
+    of an existing cohort.
+
+    THE ASSERTION THAT MATTERS is the second half of `direct_peers`: the peer
+    is in the peer list and NOT in the group address map. A first-contact peer
+    is directly reachable, not a group member, so the group key must not follow
+    it in. Getting that wrong is not a cosmetic mislabel -- it would hand the
+    cohort's shared private key to anybody holding one out-of-band invitation,
+    turning a 1:1 introduction into unilateral group admission. Python enforces
+    it by calling `peers.add` + `_record_peers` and deliberately NOT
+    `_confirm_group_membership`; C enforces it by admitting through
+    `identity_admit_direct_peer`, which is `_add_peer(confirmed=false)`. Two
+    different mechanisms, one observable, and only a corpus case compares them.
+
+    The feature is opt-in on both runtimes (AT_FIRST_CONTACT); the fixture
+    turns it on, and a node without it registers no handler at all.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  # Alice and Bob are strangers, each in a cohort of their own -- the actual
+  # first-contact precondition, and what makes the group half of `direct_peers`
+  # mean something on BOTH sides. (With the harness's default shared group they
+  # would already be cohort members, and "did not become a group member" would
+  # be asserted against a fixture rather than against the handler.)
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000000a1"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000000b1"
+      size: 1
+
+steps:
+  - id: 1
+    from: bob
+    to: alice
+    function: first_contact_hello
+    payload:
+      minted_by: alice
+      nonce: fc-admit-1
+      expiry: 0
+      rendezvous:
+        - 10.0.0.1
+    description: |
+        Bob's hello, carrying Alice's own invitation as the ticket and his
+        identity on the envelope. Plaintext by necessity: Alice does not know
+        Bob yet, so there is no key to encrypt under.
+  - id: 2
+    from: alice
+    to: bob
+    function: first_contact_hello_ack
+    in_response_to: 1
+    payload:
+      nonce: fc-admit-1
+    description: |
+        Alice honored her own ticket and acknowledges. Delivered (not merely
+        asserted) so Bob's half of the handshake runs too: the ack is what
+        tells him the introduction landed.
+
+expected_state:
+  alice:
+    # Bob is a peer -- and is NOT in the group address map.
+    direct_peers:
+      bob: true
+    first_contact_acks_emitted: 1
+  bob:
+    # Symmetric on the initiator side: Alice is a direct peer, not a group
+    # member. Bob already held her key from the invitation he redeemed.
+    direct_peers:
+      alice: true

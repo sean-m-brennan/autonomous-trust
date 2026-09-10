@@ -45,7 +45,7 @@
 
 #include "identity/identity.h"
 
-/* The nine verbs, as WIRE STRINGS. Spelled literally rather than via the
+/* The eleven verbs, as WIRE STRINGS. Spelled literally rather than via the
  * ID_* symbols (which are file-static in id_proc.c) precisely so that renaming
  * a constant cannot silently change what this test asserts -- the wire string
  * is the contract with the Python side. */
@@ -59,6 +59,13 @@ static const char *const ALLOWED[] = {
     "subtree_roster_response",
     "group_partition_probe",
     "group_partition_response",
+    /* The OPTIONAL 1:1 first-contact handshake. Plaintext by necessity: the
+     * first hello arrives from somebody who is not a peer yet, so no shared
+     * key exists to encrypt it under. On the allowlist unconditionally --
+     * the handlers are opt-in per node, but this is a RECEIVE policy, and
+     * Python's UNENCRYPTED_VERBS is not gated on the opt-in either. */
+    "first_contact_hello",
+    "first_contact_hello_ack",
 };
 
 /* Verbs that must NEVER be acceptable in plaintext from a known peer. Each is a
@@ -119,14 +126,14 @@ DEFINE_TEST(test_allowlist_size_is_deliberate)
 {
     /* Not a count for its own sake: it forces anyone widening the allowlist to
      * come here, read the cross-language contract note, and update Python too.
-     * Nine verbs, matching UNENCRYPTED_VERBS. */
+     * Eleven verbs, matching UNENCRYPTED_VERBS. */
     size_t n = sizeof(ALLOWED) / sizeof(ALLOWED[0]);
-    ck_assert_int_eq((int)n, 9);
+    ck_assert_int_eq((int)n, 11);
     size_t accepted = 0;
     for (size_t i = 0; i < n; i++)
         if (identity_verb_is_unencrypted(ALLOWED[i]))
             accepted++;
-    ck_assert_int_eq((int)accepted, 9);
+    ck_assert_int_eq((int)accepted, 11);
 }
 
 RUN_TESTS(UnencryptedVerbs,

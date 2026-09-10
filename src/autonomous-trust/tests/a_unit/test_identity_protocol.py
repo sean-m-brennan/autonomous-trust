@@ -48,11 +48,13 @@ class TestIdentityProtocol:
           session round trip it needs
           (operator_state_req, operator_state_resp)
         - runtime hierarchy roots (hierarchy, hierarchy_req)
+        - the OPTIONAL 1:1 first-contact handshake (hello, hello_ack;
+          opt-in via AT_FIRST_CONTACT, see first-contact.md)
         Asserting the exact count here pins the wire contract — a
         new verb without intent will fail this and force a deliberate
         update. Update the expected count alongside any new addition
         to ``IdentityProtocol``.
         """
         values = list(IdentityProtocol)
-        assert len(values) == 26
+        assert len(values) == 28
         assert 'announce' in values

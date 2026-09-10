@@ -1,0 +1,77 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: first-contact-invitation-single-use
+byte_pinning: false
+description: |
+    An invitation is SINGLE-USE. The same hello, redelivered, must be ignored.
+
+    Why this is load-bearing: the ticket travels out of band -- a QR code, a
+    chat message, a pasted link -- so it is exactly the kind of bearer token
+    that gets forwarded, screenshotted, and logged. Without a spent-nonce
+    guard, anyone who ever saw Alice's invitation could present it as their own
+    ticket, and Alice would admit each of them as a peer. Expiry alone does not
+    close that: an invitation with no expiry (the convenient default for "come
+    find me") would otherwise be replayable forever.
+
+    `repeat: 2` redelivers the same wire bytes, which is what a replay actually
+    looks like. The observable is the ACK COUNT rather than the peer list,
+    because the peer was legitimately admitted on the first delivery -- a
+    handler that honored the ticket twice would look identical in `peers` and
+    differ only in what it emitted.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  # Alice and Bob are strangers, each in a cohort of their own -- the actual
+  # first-contact precondition, and what makes the group half of `direct_peers`
+  # mean something on BOTH sides. (With the harness's default shared group they
+  # would already be cohort members, and "did not become a group member" would
+  # be asserted against a fixture rather than against the handler.)
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000000a2"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000000b2"
+      size: 1
+
+steps:
+  - id: 1
+    from: bob
+    to: alice
+    function: first_contact_hello
+    repeat: 2
+    payload:
+      minted_by: alice
+      nonce: fc-single-use
+      expiry: 0
+    description: |
+        The same ticket, twice. The first delivery is honored; the second must
+        hit the spent-nonce guard.
+  - id: 2
+    from: alice
+    to: bob
+    function: first_contact_hello_ack
+    in_response_to: 1
+    no_propagate: true
+    payload:
+      nonce: fc-single-use
+    description: |
+        An ack WAS emitted -- the guard must not make the legitimate first
+        redemption fail. Asserted, not delivered: what is under test is the
+        inviter, and the count below is the real pin.
+
+expected_state:
+  alice:
+    direct_peers:
+      bob: true
+    # Exactly one, from the first delivery. Two would mean the ticket is a
+    # reusable bearer token.
+    first_contact_acks_emitted: 1

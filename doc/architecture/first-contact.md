@@ -100,18 +100,117 @@ so a store written by the Python implementation loads in the C twin and vice
 versa; the identity inside it is the flat cross-runtime public form, never the
 Python-only config encoding the C side cannot parse.
 
+## The live handshake
+
+The invitation and the contact record are offline: they let Bob learn Alice's key
+and remember her, but neither node has spoken to the other. The handshake is the
+step that turns a redeemed invitation into a live, mutually-known pair. It is
+**optional and off by default** — a node opts in with the `AT_FIRST_CONTACT`
+environment flag, and a default deployment registers no handlers for it at all,
+so the feature adds no surface to a node that has not asked for it.
+
+It is two messages, hosted in the identity process beside the cohort protocol it
+deliberately is not:
+
+1. Bob calls `initiate` with the invitation blob. His node sends
+   `first_contact_hello` to the endpoint the invitation names, carrying his
+   identity on the envelope and the invitation itself as his ticket.
+2. Alice validates the ticket, admits Bob, and replies
+   `first_contact_hello_ack`. Bob's node admits Alice in turn.
+
+Both ride the **open, unencrypted channel**, and that is forced rather than
+chosen: the first hello arrives from somebody who is not yet a peer, so there is
+no shared key it could have been encrypted under — the same reason
+`access_granted` is plaintext. They are correspondingly *not* bootstrap verbs:
+they confer no membership and hand over no group key, so a gateway boundary must
+keep carrying them (see [the wire format](network-wire-format.md)).
+
+Alice's side applies three gates, and each closes a distinct hole:
+
+- **The ticket must be one Alice signed.** A valid invitation minted by anyone
+  else — even a fellow cohort member — is not authority over Alice's peer list.
+  Verifying the signature and checking who signed it are two separate tests, and
+  a runtime that conflated them would admit anybody holding any signed blob.
+- **It must not have expired.** The point of setting an expiry is that a link
+  shared into a channel the sender does not control stops working on its own.
+- **The nonce must not already be spent.** An invitation is **single-use**.
+  Because the ticket travels out of band it is exactly the kind of bearer token
+  that gets forwarded and screenshotted, and an invitation with no expiry (the
+  convenient default for "come find me") would otherwise be replayable forever.
+  The spent nonce is written through to
+  `<data_dir>/first_contact_nonces.cfg.json` before the acknowledgement goes out,
+  atomically, and reloaded on the next start — an in-memory-only guard would be
+  defeated by waiting for the inviter to restart. A nonce is stored with its
+  invitation's expiry so the record can be pruned once the ticket would be
+  refused as expired anyway; an expiry of zero is kept forever, because single
+  use is then the only thing bounding replay.
+
+### Direct peer, not group member
+
+Admission here adds the peer to `Peers` — so the encrypted point-to-point channel
+can attribute its frames and reputation can score it — and stops there. It does
+**not** propagate the group key, and does not insert into the group identity
+history. A first-contact peer is *directly reachable*, not a member of the
+inviter's cohort.
+
+That distinction is the security property, not a labelling nicety. Were the group
+key to follow a direct peer in, one out-of-band invitation would become
+unilateral group admission: anybody Alice ever invited would hold the cohort's
+shared private key, and the majority vote the identity protocol exists to enforce
+would be bypassed by a QR code. The two runtimes reach the property by different
+mechanisms — Python by calling `peers.add` and deliberately not
+`_confirm_group_membership`, C by admitting through `identity_admit_direct_peer`,
+which is the provisional half of `_add_peer` — so it is a corpus case, not a
+comment, that keeps them agreeing.
+
+A contact admitted this way is still **unverified**: the handshake proves
+reachability and possession of the ticket, not that the human on the other end is
+who Bob thinks. Only the out-of-band safety-number comparison flips that.
+
+### Resolving the endpoint
+
+`initiate` reduces the invitation's rendezvous hint to a bare host, preferring
+the hint over the address the inviter's identity advertises — the advertised
+address is where the inviter *was* when it published, while the hint is where it
+says to reach it *now*, so reading them in the other order works on a LAN and
+never reaches a remote friend.
+
+Reducing the hint is not the two-line job it looks like, because a **bracketless
+IPv6 literal cannot express a port**: its colons are part of the address. Only a
+single colon (`10.5.5.5:7000`) or a bracketed literal (`[2001:db8::1]:9000`)
+carries one, and only those two are split; `fe80::1` is passed through entire. A
+path tail is dropped first. Both runtimes implement the same table (Python
+`endpoint_host`, C `at_first_contact_endpoint_host`), and the C side treats a
+host too long for its fixed `ADDR_LEN` as a **failure** rather than truncating
+it, on the same reasoning as
+[`cidr_split`](../../src/c/autonomous_trust/network/network.c): half an address
+still looks like an address, so clipping it turns a local mistake into an
+apparently-unreachable peer.
+
+`ADDR_LEN` is 45, so the buffer behind every C address —
+`char address[ADDR_LEN + 1]` — is exactly `INET6_ADDRSTRLEN`, and any numeric
+address of either family fits whole. It was 32 until this work, which silently
+clipped a long IPv6 literal in three places at once: a node's own discovered
+address at config generation, the self-filter that lets a node recognise its own
+traffic, and this endpoint. Python bounds `Identity.address` not at all, so the
+old width was also a C-only divergence the corpus never exercised; the refusal
+branch now triggers only for what genuinely does not fit — a scoped literal
+(`fe80::1%eth0`, which the transport's `inet_pton` rejects regardless) or a DNS
+name, neither of which this field is meant to hold.
+
 ## What is built, and what is not
 
 This chapter describes the primitive as it stands: the contact record, the signed
-invitation (QR and invite-link encodings), safety-number verification, and the
-durable store — the offline, no-directory, no-relay path. It is complete on both
-runtimes and pinned by conformance. Two roles the invitation names are still
-ahead:
+invitation (QR and invite-link encodings), safety-number verification, the
+durable store, and the opt-in live handshake — the no-directory, no-relay path.
+It is complete on both runtimes and pinned by conformance. Two roles the
+invitation names are still ahead:
 
 - **Rendezvous relays** — reaching a contact across NAT and changing networks via
   content-blind, signed reachability records addressed by identity-hash. The
-  invitation already carries a rendezvous hint; the relay layer that resolves it
-  is not yet built.
+  invitation already carries a rendezvous hint, and the handshake will use it as
+  a direct endpoint on the shared comm port; the relay layer that resolves a hint
+  into a route across NAT, and across ports, is not yet built.
 - **An optional, opt-in directory** — the "type a handle to find a friend"
   convenience, tightly bounded against squatting and harvesting. The strongest,
   most private paths need no directory at all, which is why it is last.
@@ -138,6 +237,14 @@ asymmetry.
 | Safety-number match promotes the contact | [`verify-contact-match.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/verify-contact-match.yaml) |
 | Safety-number mismatch leaves it unverified | [`verify-contact-mismatch.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/verify-contact-mismatch.yaml) |
 | Store round-trips across runtimes | [`store-roundtrip.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/store-roundtrip.yaml) |
+| Handshake admits a DIRECT peer, not a group member | [`first-contact-hello-admits-direct-peer.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-hello-admits-direct-peer.yaml) |
+| An invitation is single-use | [`first-contact-invitation-single-use.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-invitation-single-use.yaml) |
+| Single use survives a restart | [`first-contact-nonce-survives-restart.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-nonce-survives-restart.yaml) |
+| A ticket we did not sign is refused | [`first-contact-foreign-invitation-ignored.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-foreign-invitation-ignored.yaml) |
+| An expired ticket is refused | [`first-contact-invitation-expired-ignored.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-invitation-expired-ignored.yaml) |
+| `initiate` prefers the rendezvous hint | [`first-contact-initiate-reaches-the-hint.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-initiate-reaches-the-hint.yaml) |
+| IPv4/port, bare IPv6 and bracketed IPv6 hints all resolve | [`first-contact-initiate-endpoint-forms.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-initiate-endpoint-forms.yaml) |
+| Both handshake verbs are plaintext-allowlisted, neither is bootstrap | [`unencrypted-verbs.yaml`](../../src/autonomous-trust/conformance/scenarios/network/unencrypted-verbs.yaml) |
 
 ## Further reading
 

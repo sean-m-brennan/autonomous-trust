@@ -1,0 +1,87 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: first-contact-initiate-reaches-the-hint
+byte_pinning: false
+description: |
+    The INITIATOR half, driven through the production call. Bob redeemed
+    Alice's invitation; `initiate` is what turns that stored contact into an
+    actual packet.
+
+    Everything else in the first-contact set drives Alice's handlers with a
+    hello the harness built. This case is the other direction: it calls the
+    real `initiate` (Python `first_contact.initiate`, C
+    `at_first_contact_initiate`) and asserts what it put on the wire. Without
+    it the initiator side is compared on nothing -- Python has unit tests for
+    it and C had no coverage at all, which is exactly the shape of asymmetry a
+    corpus exists to find.
+
+    Two things are pinned, and the second is the interesting one:
+
+      * A `first_contact_hello` goes out, addressed to the INVITER named in the
+        ticket -- not broadcast, not to whoever happened to be nearby. First
+        contact is a decision about one specific person.
+      * It is sent to the invitation's RENDEZVOUS HINT (10.5.5.5), not to the
+        address the inviter's identity advertises. (The advertised address is
+        NOT pinned here on purpose: the two harnesses assign participant
+        addresses by their own schemes, and what this case is about is which of
+        the two values wins, not what either one is.) That ordering is
+        the whole reason the hint is in the invitation: the address inside an
+        identity is where the inviter was when it published, while the hint is
+        where the inviter says to reach it now. A runtime that read the
+        identity's address first would work on a LAN and fail for every remote
+        friend -- the exact case first contact exists to serve -- and would do
+        it silently, because both values are well-formed addresses.
+
+    The ticket also carries no expiry (0), so this case doubles as the "a
+    standing invitation is still usable" path.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  # Strangers in separate cohorts of their own -- the first-contact
+  # precondition. See first-contact-hello-admits-direct-peer.
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000000a6"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000000b6"
+      size: 1
+
+steps:
+  - id: 1
+    from: bob
+    to: bob
+    function: trigger_first_contact_initiate
+    payload:
+      minted_by: alice
+      nonce: fc-initiate
+      expiry: 0
+      rendezvous:
+        - 10.5.5.5
+    description: |
+        Pseudo-step: mint Alice's invitation, hand it to Bob's `initiate`, and
+        let the production call decide what to send and where.
+  - id: 2
+    from: bob
+    to: alice
+    function: first_contact_hello
+    in_response_to: 1
+    no_propagate: true
+    description: |
+        The hello, addressed to Alice by identity. Asserted, not delivered:
+        Alice's receive half is what the other cases drive, and delivering a
+        rebuilt copy here would test the harness rather than `initiate`.
+
+expected_state:
+  bob:
+    # Where it was actually sent: the invitation's hint, not Alice's
+    # advertised address.
+    first_contact_hello_endpoint: "10.5.5.5"

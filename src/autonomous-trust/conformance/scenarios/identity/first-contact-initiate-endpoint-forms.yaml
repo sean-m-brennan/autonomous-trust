@@ -1,0 +1,145 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: first-contact-initiate-endpoint-forms
+byte_pinning: false
+description: |
+    The three shapes a rendezvous hint arrives in, resolved by the production
+    call on both runtimes.
+
+    `initiate` has to turn a hint into a bare host, and the obvious way to do
+    that — drop everything after the last colon — is wrong for IPv6, where the
+    colons ARE the address. It turned `fe80::1` into `fe80:`. That is the worst
+    shape of defect available here: both strings are well-formed addresses, so
+    nothing downstream can distinguish "we mangled the address" from "that peer
+    is unreachable", and the failure lands far from its cause. A remote friend
+    on an IPv6 network — precisely the case first contact exists to serve —
+    would simply never be reached, while every IPv4 test kept passing.
+
+    A port is expressible in exactly two forms, and only those two may be
+    split:
+
+      * `10.5.5.5:7000`      — a single colon separates host from port.
+      * `[2001:db8::1]:9000` — brackets delimit the host, so a port can follow.
+      * `fe80::1`            — bracketless literal: more than one colon means
+                               the colons belong to the ADDRESS, and there is
+                               nowhere for a port to go, so nothing is stripped.
+
+    Each initiator here takes one form, so a single case pins all three on both
+    sides at once; `first_contact_hello_endpoint` is recorded per emitter. The
+    per-runtime tables (Python `test_endpoint_host`, C
+    `first_contact_endpoint_test.c`) cover the rest of the grid — path tails,
+    unterminated brackets, zone ids, and C's refuse-rather-than-truncate policy
+    for an address too long for `ADDR_LEN`. What this case adds that neither
+    table can is that the two runtimes agree while actually running.
+
+    A fourth initiator carries a FULL uncompressed IPv6 literal (39 chars),
+    which is a LENGTH case as much as a parsing one: C keeps an address in a
+    fixed `char[ADDR_LEN + 1]`, and ADDR_LEN was 32 until it was widened to 45.
+    Under the old width C refused that hint rather than send a hello to a
+    clipped host, while Python — unbounded — sent it, so the row was genuinely
+    asymmetric. It is here to keep the widening from being quietly reverted.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+  - id: carol
+    role: new_node
+  - id: dave
+    role: new_node
+  - id: erin
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  # Every participant in a cohort of its own: strangers, which is the
+  # first-contact precondition. See first-contact-hello-admits-direct-peer.
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000000a7"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000000b7"
+      size: 1
+    carol:
+      uuid: "fc000000-0000-4000-8000-0000000000c7"
+      size: 1
+    dave:
+      uuid: "fc000000-0000-4000-8000-0000000000d7"
+      size: 1
+    erin:
+      uuid: "fc000000-0000-4000-8000-0000000000e7"
+      size: 1
+
+steps:
+  - id: 1
+    from: bob
+    to: bob
+    function: trigger_first_contact_initiate
+    payload:
+      minted_by: alice
+      nonce: fc-ep-bracketed
+      expiry: 0
+      rendezvous:
+        - "[2001:db8::1]:9000"
+    description: |
+        Bracketed IPv6 with a port: both the brackets and the `:9000` come off,
+        and the literal inside survives whole.
+  - id: 2
+    from: carol
+    to: carol
+    function: trigger_first_contact_initiate
+    payload:
+      minted_by: alice
+      nonce: fc-ep-bare-v6
+      expiry: 0
+      rendezvous:
+        - "fe80::1"
+    description: |
+        Bracketless IPv6: nothing may be stripped. This is the row that used to
+        come out as `fe80:`.
+  - id: 3
+    from: dave
+    to: dave
+    function: trigger_first_contact_initiate
+    payload:
+      minted_by: alice
+      nonce: fc-ep-v4-port
+      expiry: 0
+      rendezvous:
+        - "10.5.5.5:7000"
+    description: |
+        IPv4 with a port: the one case the old code got right, kept here so a
+        fix that over-corrected (never stripping a port) would fail too.
+
+  - id: 4
+    from: erin
+    to: erin
+    function: trigger_first_contact_initiate
+    payload:
+      minted_by: alice
+      nonce: fc-ep-full-v6
+      expiry: 0
+      rendezvous:
+        - "2001:0db8:85a3:0000:0000:8a2e:0370:7334"
+    description: |
+        A FULL uncompressed IPv6 literal, 39 characters. This is a length case
+        as much as a parsing one: C stores an address in a fixed
+        `char[ADDR_LEN + 1]`, and ADDR_LEN was 32 until it was widened to 45
+        (`ADDR_LEN + 1` == INET6_ADDRSTRLEN). Before that, C refused this hint
+        outright rather than send a hello to a clipped host, while Python — which
+        has no length bound at all — sent it happily. So this row would have
+        been ASYMMETRIC, and it guards the widening from being quietly reverted.
+
+expected_state:
+  bob:
+    first_contact_hello_endpoint: "2001:db8::1"
+  carol:
+    first_contact_hello_endpoint: "fe80::1"
+  dave:
+    first_contact_hello_endpoint: "10.5.5.5"
+  erin:
+    first_contact_hello_endpoint: "2001:0db8:85a3:0000:0000:8a2e:0370:7334"

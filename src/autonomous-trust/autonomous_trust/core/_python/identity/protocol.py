@@ -178,6 +178,17 @@ class IdentityProtocol(Protocol):
     # stale. See doc/architecture/operator-attended.md.
     operator_state_req = 'operator_state_query'  # msg.obj <- '' (identity asks main)
     operator_state_resp = 'operator_state_response'  # msg.obj <- json {'attended', 'epoch', 'have_session'}
+    # First contact (OPTIONAL, opt-in via AT_FIRST_CONTACT; see
+    # doc/architecture/first-contact.md and identity/first_contact.py). The 1:1
+    # introduction handshake, DISTINCT from the cohort vote: a node holding a
+    # signed invitation reaches the inviter directly, and each side admits the
+    # other as a DIRECT peer (Peers.add, no group key) — never a group member.
+    # Both ride the OPEN unencrypted channel because the first `hello` arrives
+    # before the sender is a known peer, exactly like access_granted. They are
+    # deliberately NOT BOOTSTRAP_VERBS: they confer no group membership and hand
+    # over no group key, so the gateway boundary need not refuse them.
+    hello = 'first_contact_hello'          # msg.obj <- invitation blob (the ticket); from_whom = sender identity
+    hello_ack = 'first_contact_hello_ack'  # msg.obj <- json {'nonce': hex}; from_whom = accepter identity
 
 
 # Verbs this implementation legitimately puts on the wire in PLAINTEXT
@@ -231,6 +242,8 @@ UNENCRYPTED_VERBS = frozenset({
     IdentityProtocol.roster_resp,        # subtree roster answer
     IdentityProtocol.partition_probe,    # partition recovery, by definition
     IdentityProtocol.partition_response, # spans a group-key boundary
+    IdentityProtocol.hello,              # first-contact 1:1 handshake (opt-in)
+    IdentityProtocol.hello_ack,          # first-contact accept, before the peer is known
 })
 
 
