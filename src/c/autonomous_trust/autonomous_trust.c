@@ -75,30 +75,41 @@ int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
         return 0;
     case NET_MESSAGE:
     {
-        /* An app may invoke exactly ONE local verb, at a fixed pair of
-         * processes. Forwarding a NET_MESSAGE to whatever process it names
-         * would hand an app the whole internal verb surface. */
-        if (msg->info.net_msg.function == NULL
-            || strcmp(msg->info.net_msg.function, AT_APP_ROSTER_REQUEST) != 0)
+        /* An app may invoke only a small, explicit allowlist of local verbs,
+         * each at a fixed set of processes. Forwarding a NET_MESSAGE to whatever
+         * process it names would hand an app the whole internal verb surface. */
+        const char *fn = msg->info.net_msg.function;
+        if (fn != NULL && strcmp(fn, AT_APP_ROSTER_REQUEST) == 0)
         {
-            log_warn(logger, "AutonomousTrust: refused extern net_msg '%s'\n",
-                     msg->info.net_msg.function == NULL
-                         ? "(none)" : msg->info.net_msg.function);
-            return -1;
+            /* All three carrier producers answer: identity holds the peer facts
+             * (and now positions), reputation the scores, network the RTT. Each
+             * copy is addressed to its own process, since dispatch matches
+             * net_msg.process against proc->name. */
+            static const char *const roster_targets[] = { "identity", "reputation", "network" };
+            for (size_t i = 0; i < sizeof(roster_targets) / sizeof(*roster_targets); i++)
+            {
+                generic_msg_t fwd = *msg;
+                snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
+                         "%s", roster_targets[i]);
+                if (messaging_send(roster_targets[i], NET_MESSAGE, &fwd, false) != 0)
+                    log_exception(logger);
+            }
+            return 0;
         }
-        /* Both halves of the carrier answer: identity holds the peer facts,
-         * reputation holds the scores. Each copy is addressed to its own
-         * process, since dispatch matches net_msg.process against proc->name. */
-        static const char *const roster_targets[] = { "identity", "reputation" };
-        for (size_t i = 0; i < sizeof(roster_targets) / sizeof(*roster_targets); i++)
+        if (fn != NULL && strcmp(fn, AT_APP_SET_POSITION) == 0)
         {
+            /* Opt-in own-position: forwarded ONLY to identity, which owns the
+             * position store and answers peers' directed position queries. */
             generic_msg_t fwd = *msg;
             snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
-                     "%s", roster_targets[i]);
-            if (messaging_send(roster_targets[i], NET_MESSAGE, &fwd, false) != 0)
+                     "%s", "identity");
+            if (messaging_send("identity", NET_MESSAGE, &fwd, false) != 0)
                 log_exception(logger);
+            return 0;
         }
-        return 0;
+        log_warn(logger, "AutonomousTrust: refused extern net_msg '%s'\n",
+                 fn == NULL ? "(none)" : fn);
+        return -1;
     }
     default:
         log_warn(logger, "AutonomousTrust: unexpected extern message type %ld\n",
@@ -173,6 +184,8 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
             case UPDATE_ACCEPTED:
             case PEER_OBSERVED:
             case PEER_REPUTATION:
+            case PEER_RTT_OBSERVED:
+            case PEER_POSITION_OBSERVED:
                 if (q_out == NULL)
                     break;   /* no app attached; nothing to do */
                 if (messaging_send(q_out, (message_type_t)inner->type, inner, false) != 0)

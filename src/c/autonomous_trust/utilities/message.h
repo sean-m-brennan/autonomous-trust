@@ -49,11 +49,22 @@
  * single shared switch that cannot reach process-specific code, whereas a
  * function string dispatches to whichever process registered it.
  *
- * This is the ONLY verb the daemon accepts from an app, and it is forwarded
- * to a fixed pair of processes — an app must not be able to inject arbitrary
- * internal verbs at an arbitrary process.
+ * One of a small, explicit allowlist of verbs the daemon accepts from an app,
+ * each forwarded to a fixed set of processes — an app must not be able to
+ * inject arbitrary internal verbs at an arbitrary process.
  */
 #define AT_APP_ROSTER_REQUEST "app_roster_request"
+
+/**
+ * @brief App → AT local-only verb: set (or clear) THIS node's own opt-in coarse
+ * position, so the identity process can answer peers' directed position queries.
+ *
+ * The payload is the operator's chosen geohash bucket, or empty to opt out
+ * (clears it). STRICTLY OPT-IN: absent this verb, `own_geohash` stays empty and
+ * the node advertises and answers nothing geographic. Forwarded only to the
+ * identity process. Second (and only other) verb on the app→AT allowlist.
+ */
+#define AT_APP_SET_POSITION "app_set_position"
 
 #define DEFAULT_MAX_MSG_SIZE 1024
 /* MAX_MSG_SIZE is configurable at runtime via messaging_set_max_size() */

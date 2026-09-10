@@ -341,6 +341,19 @@ class _Participant:
                             raise AssertionError(
                                 f'{self.id}: descriptor[{cap_name!r}][{fk!r}]='
                                 f'{stored.get(fk)!r}, expected {fv!r}')
+            elif key == 'peer_position':
+                # {peer_id: geohash} -- the coarse position this participant
+                # recorded for another peer, via get_peer_position. '' means
+                # "none recorded" (the peer opted out, or the response was
+                # dropped/refused) -- the ordinary default. C mirrors via
+                # identity_get_peer_position keyed by the same uuid.
+                for peer_id, want in expected.items():
+                    peer_uuid = self._uuid_for_pid(peer_id)
+                    actual = self.process.get_peer_position(peer_uuid)
+                    if actual != want:
+                        raise AssertionError(
+                            f'{self.id}: peer_position[{peer_id!r}]={actual!r}, '
+                            f'expected {want!r}')
             elif key == 'partition_probes_emitted':
                 # Number of group_partition_probe messages this participant
                 # emitted over the whole scenario. The signal-cooldown
@@ -391,6 +404,20 @@ class _Participant:
                 if actual != expected:
                     raise AssertionError(
                         f'{self.id}: caps_query_emitted={actual}, '
+                        f'expected {expected}'
+                    )
+            elif key == 'position_responses_emitted':
+                # Number of peer_position_response messages this participant
+                # emitted (Increment 2). The observable for the opt-in guard:
+                # an opted-OUT node emits 0 (position-absent-is-normal), an
+                # opted-IN one emits 1 per query answered. This is what makes
+                # the opt-out case non-vacuous — dropping the guard would emit a
+                # response even with no own position. C mirrors by scanning
+                # captured[] for (from==self, peer_position_response).
+                actual = self.emit_tally.get(IdentityProtocol.position_response, 0)
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: position_responses_emitted={actual}, '
                         f'expected {expected}'
                     )
             elif key == 'propose_emitted':
@@ -1150,6 +1177,14 @@ class IdentityAdapter:
             for cap_name in cap_fix.get(pid, []):
                 participant.process.protocol.capabilities.register_ability(
                     cap_name, None, [], {})
+            # Install own coarse position from fixtures.positions (Increment 2,
+            # the "with-distance" feature); mirrors the C adapter's
+            # `identity_set_own_geohash` seam. An opted-in participant's
+            # handle_position_query answers with this geohash; absent or empty,
+            # the participant is opted OUT (the default) and answers nothing.
+            pos_fix: dict[str, str] = fixtures.get('positions', {}) or {}
+            if pid in pos_fix:
+                participant.process.own_geohash = str(pos_fix[pid] or '')
             # Inject N synthetic cap-less peers (fixtures.capless_peers[pid])
             # directly into this participant's roster: present in self.peers but
             # absent from peer_capabilities -- exactly the state the periodic
@@ -1876,6 +1911,21 @@ class IdentityAdapter:
             if not (isinstance(payload, dict) and payload.get('unstamped')):
                 seq = int(payload.get('seq', 1)) if isinstance(payload, dict) else 1
                 body['seq'] = seq
+            obj = to_json_string(body)
+        elif function == IdentityProtocol.position_query:
+            # handle_position_query reads no payload -- it answers with our own
+            # coarse position IFF opted in (own_geohash set, via
+            # fixtures.positions), else nothing. Empty obj, parseable but unused
+            # (mirrors caps_query). C's builder likewise takes the generic path.
+            obj = ''
+        elif function == IdentityProtocol.position_response:
+            # handle_position_response parses {pos: geohash, seq: N}. `seq` is
+            # the responder's freshness sequence; `unstamped: true` omits it,
+            # modelling a stripped field, which must be refused rather than
+            # stored. Mirrors the C peer_position_response builder.
+            body = {'pos': payload.get('pos', '') if isinstance(payload, dict) else ''}
+            if not (isinstance(payload, dict) and payload.get('unstamped')):
+                body['seq'] = int(payload.get('seq', 1)) if isinstance(payload, dict) else 1
             obj = to_json_string(body)
         elif function == IdentityProtocol.id_query:
             # Identity-resync query (layer 3): {group_uuid, have:[uuids]}.

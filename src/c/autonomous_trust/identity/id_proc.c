@@ -100,6 +100,8 @@ static char ID_CONFIRM[]     = "peer_accepted";
 static char ID_UPDATE[]      = "group_key_update";
 static char ID_CAPS_QUERY[]  = "peer_caps_query";
 static char ID_CAPS_RESPONSE[] = "peer_caps_response";
+static char ID_POSITION_QUERY[]    = "peer_position_query";
+static char ID_POSITION_RESPONSE[] = "peer_position_response";
 /* Identity backfill for a cold/late joiner that holds a group member's
  * address but never received its full Identity (merge/partition path fills
  * group.address_map but peers[] stays sparse). See identity_periodic_identity
@@ -113,6 +115,12 @@ static char ID_TIER[]        = "tier_update";
 /* Local-only IPC from the app (via the daemon main loop): re-emit the peer
  * view on the app-facing carrier. See doc/architecture/app-peer-carrier.md. */
 static char ID_APP_ROSTER[]  = AT_APP_ROSTER_REQUEST;
+static char ID_APP_SET_POSITION[] = AT_APP_SET_POSITION;
+
+/* Forward decls: defined below beside the position handlers, but used earlier
+ * (the query from the admission path, the validator from state init). */
+static int _send_position_query(const process_t *proc, const public_identity_t *peer);
+static bool _geohash_valid(const char *s);
 /* Group partition recovery (doc/architecture/partition-recovery.md).
  *   ID_PARTITION_SIGNAL: local-only IPC from NetProcess when group-channel
  *                        traffic is rejected (no wire egress). Payload is
@@ -298,6 +306,16 @@ static struct {
      * lowercased uuid string; values are array_t* of cap-name strings.
      * Conformance assertion surface via identity_get_peer_caps_count. */
     map_t peer_caps_map;
+    /* This node's OWN opt-in coarse position — a geohash bucket the operator
+     * chose to share (Increment 2, the "with-distance" feature). Empty = opted
+     * out, which is the DEFAULT: while empty, handle_position_query answers
+     * nothing and no position is ever advertised. Set/cleared at runtime via the
+     * AT_APP_SET_POSITION app verb. mutex-guarded by id_state.lock. */
+    char own_geohash[AT_GEOHASH_MAX_LEN + 1];
+    /* Peer positions recorded by handle_position_response. Keyed by lowercased
+     * uuid string; values are string_data(geohash). Mirrors peer_caps_map.
+     * Conformance/assertion surface via identity_get_peer_position. */
+    map_t peer_position_map;
     /* Outstanding operator-attended pulls WE issued: nonce string -> peer uuid
      * string (heap-dup'd). The nonce is the only thing that makes a returned
      * attestation attributable to a request this node actually made; a reply
@@ -415,6 +433,16 @@ static void _ensure_id_init(void)
         map_init(&id_state.vote_collection);
         map_init(&id_state.own_caps_by_proc);
         map_init(&id_state.peer_caps_map);
+        map_init(&id_state.peer_position_map);
+        /* Opt-in own position: seed from $AT_OWN_GEOHASH for headless/testing
+         * (the Flutter UI sets it at runtime via AT_APP_SET_POSITION instead).
+         * Empty/invalid/unset => opted out, the default. */
+        {
+            const char *env_geo = getenv("AT_OWN_GEOHASH");
+            if (env_geo != NULL && _geohash_valid(env_geo))
+                snprintf(id_state.own_geohash, sizeof(id_state.own_geohash),
+                         "%s", env_geo);
+        }
         map_init(&id_state.attest_sent);
         map_init(&id_state.attest_sent_clock);
         map_init(&id_state.peer_clock_samples);
@@ -582,6 +610,51 @@ int identity_get_peer_caps_count(const uuid_t uuid)
     int n = (arr != NULL) ? (int)array_size(arr) : 0;
     pthread_mutex_unlock(&id_state.lock);
     return n;
+}
+
+/* Conformance/harness seam: set (or clear) THIS node's opt-in coarse position
+ * in the singleton id_state (Increment 2, the "with-distance" feature). The
+ * analog of the app's handle_set_position, but called directly by the harness,
+ * which drives the wire handlers rather than the app IPC verb. A valid non-empty
+ * geohash opts in; NULL/""/invalid opts out — the default. Mirrors the Python
+ * adapter setting process.own_geohash from fixtures.positions. */
+void identity_set_own_geohash(const char *geohash)
+{
+    _ensure_id_init();
+    pthread_mutex_lock(&id_state.lock);
+    if (geohash != NULL && _geohash_valid(geohash))
+        snprintf(id_state.own_geohash, sizeof(id_state.own_geohash), "%s",
+                 geohash);
+    else
+        id_state.own_geohash[0] = '\0';
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+/* Conformance seam: copy the stored coarse geohash for peer @p uuid_str into
+ * @p buf (always NUL-terminated). Returns true if a position is stored, false
+ * (and buf="") otherwise. The map is filled by handle_position_response on an
+ * inbound peer_position_response; scenarios assert via the `peer_position`
+ * expected_state key. Twin of Python IdentityProcess.get_peer_position. */
+bool identity_get_peer_position(const char *uuid_str, char *buf, size_t buflen)
+{
+    if (buf != NULL && buflen > 0) buf[0] = '\0';
+    if (uuid_str == NULL || buf == NULL || buflen == 0) return false;
+    _ensure_id_init();
+    bool found = false;
+    pthread_mutex_lock(&id_state.lock);
+    data_t *dat = NULL;
+    if (map_get(&id_state.peer_position_map, (map_key_t)uuid_str, &dat) == 0
+        && dat != NULL)
+    {
+        char *g = NULL;
+        if (data_string_ptr(dat, &g) == 0 && g != NULL)
+        {
+            snprintf(buf, buflen, "%s", g);
+            found = true;
+        }
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return found;
 }
 
 size_t identity_provisional_count(const process_t *proc)
@@ -2568,6 +2641,9 @@ void identity_reset_state(void)
     map_init(&id_state.own_caps_by_proc);
     map_free(&id_state.peer_caps_map);
     map_init(&id_state.peer_caps_map);
+    map_free(&id_state.peer_position_map);
+    map_init(&id_state.peer_position_map);
+    id_state.own_geohash[0] = '\0';
     /* Cleared per scenario so no clock sample leaks from one corpus case into
      * the next; each sample's heap payload goes with it. */
     _free_clock_samples_locked();
@@ -2868,6 +2944,10 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
                      nickname, uuid_str);
             _send_caps_query(proc, &new_peer);
         }
+        /* Opt-in position (Increment 2): ask every confirmed peer for its coarse
+         * position. If it opted out it answers nothing; the periodic resync
+         * re-asks, so a peer that opts in later is still picked up. */
+        _send_position_query(proc, &new_peer);
     }
 
     /* Two-phase admission (doc/architecture/identity-protocol.md). Count DISTINCT confirmers; the
@@ -3575,6 +3655,227 @@ static bool handle_caps_response(const process_t *proc, directory_t *queues, gen
               "Identity: registered %zu cap(s) for peer %s\n",
               array_size(arr), uuid_str);
     return true;
+}
+
+/****************************
+ * Opt-in coarse position (Increment 2, the "with-distance" feature).
+ *
+ * Design mirrors the caps directed exchange above: a node shares its own coarse
+ * geohash bucket ONLY with admitted peers that ask, over an encrypted,
+ * freshness-stamped {"pos", "seq"} response. STRICTLY OPT-IN: own_geohash is
+ * empty by default, and while empty handle_position_query answers nothing — no
+ * geographic datum leaves the node. The geohash is opaque here; the app decodes
+ * it and computes distance. A received geohash is untrusted peer input, bounded
+ * and charset-validated on the way in.
+ ****************************/
+
+/* Geohash base32 alphabet (a/i/l/o excluded). Validation only — never decoded. */
+static bool _geohash_valid(const char *s)
+{
+    if (s == NULL) return false;
+    size_t n = strlen(s);
+    if (n == 0 || n > AT_GEOHASH_MAX_LEN) return false;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') ||
+              (c >= 'b' && c <= 'z' && c != 'i' && c != 'l' && c != 'o')))
+            return false;
+    }
+    return true;
+}
+
+/* AT -> app: surface one peer's shared position as PEER_POSITION_OBSERVED to
+ * AT_MAIN_QUEUE; the main loop forwards it to the app queue, where app_events.c
+ * decodes it as AT_APP_EVENT_PEER_POSITION. Mirrors identity_emit_peer_observed's
+ * route. @p geohash "" is valid (peer shared none). */
+static int identity_emit_peer_position(const uuid_t peer_uuid, const char *geohash)
+{
+    generic_msg_t msg = {0};
+    msg.type = PEER_POSITION_OBSERVED;
+    msg.size = sizeof(peer_position_msg_t);
+    memcpy(msg.info.peer_position.peer_uuid, peer_uuid, 16);
+    if (geohash != NULL)
+        snprintf(msg.info.peer_position.geohash,
+                 sizeof(msg.info.peer_position.geohash), "%s", geohash);
+    return messaging_send(AT_MAIN_QUEUE, PEER_POSITION_OBSERVED, &msg, false);
+}
+
+/* Handler: a peer asks for our coarse position. Opted out (empty own_geohash) =>
+ * answer NOTHING. Otherwise reply directed + encrypted with {"pos","seq"}. */
+static bool handle_position_query(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+
+    char own[AT_GEOHASH_MAX_LEN + 1];
+    pthread_mutex_lock(&id_state.lock);
+    snprintf(own, sizeof(own), "%s", id_state.own_geohash);
+    pthread_mutex_unlock(&id_state.lock);
+    if (own[0] == '\0') {
+        log_debug(proc->logger,
+                  "Identity: position_query from %s; opted out, no answer\n",
+                  nmsg->from_whom.nickname);
+        return true;   /* opted out: share nothing */
+    }
+
+    generic_msg_t response = {0};
+    response.type = NET_MESSAGE;
+    strncpy(response.info.net_msg.process, "identity", PROC_NAME_LEN);
+    response.info.net_msg.function = ID_POSITION_RESPONSE;
+    response.info.net_msg.encrypt = true;
+    memcpy(&response.info.net_msg.to_whom, &nmsg->from_whom,
+           sizeof(public_identity_t));
+    strncpy(response.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+
+    pthread_mutex_lock(&id_state.lock);
+    int64_t seq = freshness_stamp(&id_state.freshness, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (seq <= 0) {
+        log_warn(proc->logger,
+                 "Identity: no freshness sequence; not answering position query\n");
+        return true;
+    }
+    json_t *env = json_object();
+    if (env == NULL) return true;
+    json_object_set_new(env, "pos", json_string(own));
+    json_object_set_new(env, "seq", json_integer((json_int_t)seq));
+    net_msg_pack_json(&response.info.net_msg, env);
+    json_decref(env);
+    messaging_send("network", NET_MESSAGE, &response, false);
+    return true;
+}
+
+/* Handler: store a peer's position from a {"pos","seq"} response, freshness-
+ * checked and validated, then surface it to the app. */
+static bool handle_position_response(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *j_pos = json_object_get(payload, "pos");
+    json_t *j_seq = json_object_get(payload, "seq");
+    if (!json_is_string(j_pos) || !json_is_integer(j_seq)) {
+        json_decref(payload);
+        log_warn(proc->logger,
+                 "Identity: position_response unstamped/malformed, refusing\n");
+        return true;
+    }
+
+    char sender[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, sender);
+    int64_t seq = (int64_t)json_integer_value(j_seq);
+    pthread_mutex_lock(&id_state.lock);
+    bool fresh = freshness_accept(&id_state.freshness, sender,
+                                  ID_POSITION_RESPONSE, seq, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (!fresh) {
+        json_decref(payload);
+        log_debug(proc->logger,
+                  "Identity: position_response from %s refused (replay)\n", sender);
+        return true;
+    }
+
+    const char *pos = json_string_value(j_pos);
+    if (!_geohash_valid(pos)) {
+        json_decref(payload);
+        log_warn(proc->logger,
+                 "Identity: position_response from %s: invalid geohash, dropping\n",
+                 sender);
+        return true;
+    }
+
+    size_t len = strlen(pos);
+    char *dup = smrt_create(len + 1);
+    if (dup == NULL) { json_decref(payload); return true; }
+    memcpy(dup, pos, len + 1);
+    data_t *pos_dat = string_data(dup, len + 1);
+    if (pos_dat == NULL) { smrt_deref(dup); json_decref(payload); return true; }
+    pthread_mutex_lock(&id_state.lock);
+    map_set(&id_state.peer_position_map, sender, pos_dat);
+    pthread_mutex_unlock(&id_state.lock);
+    json_decref(payload);
+
+    identity_emit_peer_position(nmsg->from_whom.uuid, pos);
+    log_debug(proc->logger, "Identity: recorded position for peer %s\n", sender);
+    return true;
+}
+
+/* App -> AT verb (AT_APP_SET_POSITION): set or clear THIS node's opt-in coarse
+ * position. Payload {"pos": "<geohash>"}; empty/missing/invalid clears it (opt
+ * out). Runtime-updatable so the operator can toggle sharing live. */
+static bool handle_set_position(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    json_t *payload = NULL;
+    char geo[AT_GEOHASH_MAX_LEN + 1] = {0};
+    if (net_msg_unpack_json(nmsg, &payload) == 0 && payload != NULL) {
+        json_t *j_pos = json_object_get(payload, "pos");
+        if (json_is_string(j_pos)) {
+            const char *p = json_string_value(j_pos);
+            if (_geohash_valid(p))
+                snprintf(geo, sizeof(geo), "%s", p);
+            /* invalid or empty -> geo stays "" (opt out) */
+        }
+        json_decref(payload);
+    }
+    pthread_mutex_lock(&id_state.lock);
+    snprintf(id_state.own_geohash, sizeof(id_state.own_geohash), "%s", geo);
+    pthread_mutex_unlock(&id_state.lock);
+    log_info(proc->logger, "Identity: own position %s\n",
+             geo[0] ? "set (opted in)" : "cleared (opted out)");
+    return true;
+}
+
+/* Directed position query to one admitted peer (mirrors _send_caps_query). */
+static int _send_position_query(const process_t *proc, const public_identity_t *peer)
+{
+    generic_msg_t query = {0};
+    query.type = NET_MESSAGE;
+    strncpy(query.info.net_msg.process, "identity", PROC_NAME_LEN);
+    query.info.net_msg.function = ID_POSITION_QUERY;
+    query.info.net_msg.encrypt = false;
+    memcpy(&query.info.net_msg.to_whom, peer, sizeof(public_identity_t));
+    strncpy(query.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    messaging_send("network", NET_MESSAGE, &query, false);
+    log_debug(proc->logger, "Identity: sent position_query to %s\n", peer->nickname);
+    return 0;
+}
+
+/* Emit the stored position for every known peer — the roster-pull answer for
+ * the position half. Snapshot peer uuids under peers_read_lock, look each up in
+ * peer_position_map, emit outside the peers lock. Returns count emitted. */
+static int identity_emit_all_positions(const process_t *proc)
+{
+    if (proc == NULL) return 0;
+    uuid_t uuids[DEFAULT_MAX_PEERS];
+    peers_read_lock(proc);
+    size_t n = proc->protocol.num_peers;
+    if (n > DEFAULT_MAX_PEERS) n = DEFAULT_MAX_PEERS;
+    for (size_t i = 0; i < n; i++)
+        memcpy(uuids[i], proc->protocol.peers[i].uuid, sizeof(uuid_t));
+    peers_read_unlock(proc);
+
+    int emitted = 0;
+    for (size_t i = 0; i < n; i++) {
+        char uuid_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(uuids[i], uuid_str);
+        char geo[AT_GEOHASH_MAX_LEN + 1] = {0};
+        pthread_mutex_lock(&id_state.lock);
+        data_t *dat = NULL;
+        if (map_get(&id_state.peer_position_map, uuid_str, &dat) == 0 && dat != NULL) {
+            char *g = NULL;
+            if (data_string_ptr(dat, &g) == 0 && g != NULL)
+                snprintf(geo, sizeof(geo), "%s", g);
+        }
+        pthread_mutex_unlock(&id_state.lock);
+        if (geo[0] != '\0' && identity_emit_peer_position(uuids[i], geo) == 0)
+            emitted++;
+    }
+    return emitted;
 }
 
 /****************************
@@ -4863,6 +5164,32 @@ void identity_periodic_caps_resync(const process_t *proc)
                   "Identity: caps resync re-queried %zu cap-less peer(s)\n",
                   cnt);
     }
+
+    /* Position resync (Increment 2): re-query admitted peers we hold no stored
+     * position for. Opted-out peers answer nothing and are simply re-asked next
+     * sweep; a peer that opts in later is picked up here. Same lock order as
+     * above (id_state.lock nested under peers_read_lock). */
+    public_identity_t posless[CAPS_RESYNC_MAX_PER_SWEEP];
+    size_t pcnt = 0;
+    peers_read_lock(proc);
+    size_t np = proc->protocol.num_peers;
+    for (size_t i = 0; i < np && pcnt < CAPS_RESYNC_MAX_PER_SWEEP; i++) {
+        const public_identity_t *peer = &proc->protocol.peers[i];
+        if (self != NULL && uuid_compare(peer->uuid, self->uuid) == 0)
+            continue;
+        char uuid_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(peer->uuid, uuid_str);
+        pthread_mutex_lock(&id_state.lock);
+        data_t *pdat = NULL;
+        bool have = (map_get(&id_state.peer_position_map, uuid_str, &pdat) == 0
+                     && pdat != NULL);
+        pthread_mutex_unlock(&id_state.lock);
+        if (have) continue;
+        memcpy(&posless[pcnt++], peer, sizeof(public_identity_t));
+    }
+    peers_read_unlock(proc);
+    for (size_t i = 0; i < pcnt; i++)
+        _send_position_query(proc, &posless[i]);
 }
 
 /****************************
@@ -7296,8 +7623,10 @@ static bool handle_peer_roster_request(const process_t *proc,
     (void)queues;
     (void)msg;
     int n = identity_emit_all_peers(proc);
+    int p = identity_emit_all_positions(proc);
     log_debug(proc->logger,
-              "Identity: peer roster request -> %d observation(s)\n", n);
+              "Identity: peer roster request -> %d observation(s), %d position(s)\n",
+              n, p);
     return true;
 }
 
@@ -7407,6 +7736,9 @@ int identity_register_handlers(process_t *proc)
     process_register_handler(proc, ID_UPDATE,   (handler_ptr_t)handle_group_update);
     process_register_handler(proc, ID_CAPS_QUERY,    (handler_ptr_t)handle_caps_query);
     process_register_handler(proc, ID_CAPS_RESPONSE, (handler_ptr_t)handle_caps_response);
+    process_register_handler(proc, ID_POSITION_QUERY,    (handler_ptr_t)handle_position_query);
+    process_register_handler(proc, ID_POSITION_RESPONSE, (handler_ptr_t)handle_position_response);
+    process_register_handler(proc, ID_APP_SET_POSITION,  (handler_ptr_t)handle_set_position);
     process_register_handler(proc, ID_IDENTITY_QUERY,
                              (handler_ptr_t)handle_identity_query);
     process_register_handler(proc, ID_IDENTITY_RESPONSE,

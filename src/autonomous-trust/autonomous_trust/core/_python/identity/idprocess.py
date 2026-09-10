@@ -372,6 +372,17 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # cap-driven discovery. This timestamp paces a periodic re-query sweep
         # over cap-less peers. Set on first process() iteration (post-fork).
         self._last_caps_resync: Optional[datetime] = None
+        # Opt-in coarse position (Increment 2, the "with-distance" feature).
+        # own_geohash: THIS node's shared bucket; empty = opted OUT, the DEFAULT,
+        # so nothing geographic is advertised or answered. Seeded from
+        # $AT_OWN_GEOHASH for headless/conformance parity with the C
+        # _ensure_id_init seed; the Flutter UI (C runtime) sets it live via the
+        # app IPC verb, which a Python node has no equivalent of. peer_positions
+        # maps a peer uuid string -> its shared geohash, filled by
+        # handle_position_response. See SOCIAL_APP_PLAN.md §3.2/§4.2.
+        _own_geo = os.environ.get('AT_OWN_GEOHASH', '')
+        self.own_geohash = _own_geo if self._geohash_valid(_own_geo) else ''
+        self.peer_positions: dict = {}
         self.protocol.register_handler(IdentityProtocol.announce, self.welcoming_committee)
         self.protocol.register_handler(IdentityProtocol.accept, self.handle_acceptance)
         self.protocol.register_handler(IdentityProtocol.history, self.receive_history)
@@ -382,6 +393,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.update, self.handle_group_update)
         self.protocol.register_handler(IdentityProtocol.caps_query, self.handle_caps_query)
         self.protocol.register_handler(IdentityProtocol.caps_response, self.handle_caps_response)
+        self.protocol.register_handler(IdentityProtocol.position_query, self.handle_position_query)
+        self.protocol.register_handler(IdentityProtocol.position_response, self.handle_position_response)
         self.protocol.register_handler(IdentityProtocol.id_query, self.handle_identity_query)
         self.protocol.register_handler(IdentityProtocol.id_response, self.handle_identity_response)
         self.protocol.register_handler(IdentityProtocol.roster_req, self.handle_roster_request)
@@ -3201,6 +3214,14 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 # but missing from peer_capabilities, so DataRcvr never
                 # subscribes to their streams.
                 self._send_caps_query(queues, peer)
+            # Opt-in position (Increment 2, the "with-distance" feature): ask
+            # every confirmed peer for its coarse position — unconditionally,
+            # unlike caps_query (a recovery-only path), because position has no
+            # announce-broadcast path to recover from. An opted-out peer answers
+            # nothing; the resync sweep re-asks, so a peer that opts in later is
+            # still picked up. Mirrors the C _send_position_query in
+            # handle_confirm_peer.
+            self._send_position_query(queues, peer)
             # Two-phase admission (doc/architecture/identity-protocol.md). Count DISTINCT confirmers for this
             # peer; propagate the group key only once the quorum is met.
             #   - quorum 1 (default): first confirm promotes immediately —
@@ -3440,6 +3461,143 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self.report_exception(err, 'handle_caps_response')
         return True
 
+    # ------------------------------------------------------------------
+    # Opt-in coarse position (Increment 2, the "with-distance" feature).
+    #
+    # Twin of the C block in id_proc.c (handle_position_query/_response,
+    # _send_position_query). Mirrors the caps directed exchange above: a node
+    # shares its own coarse geohash bucket ONLY with admitted peers that ask,
+    # over a freshness-stamped, group-encrypted {'pos','seq'} response. STRICTLY
+    # OPT-IN: ``own_geohash`` is empty by default, and while empty
+    # ``handle_position_query`` answers nothing — no geographic datum leaves the
+    # node. The geohash is opaque here (the app decodes it and computes
+    # distance); a received one is untrusted peer input, charset- and
+    # length-validated on the way in. The app-facing surface (set/clear own
+    # position over IPC, and the PEER_POSITION_OBSERVED app event) is C-only —
+    # the app-events carrier is C (SOCIAL_APP_PLAN.md §5.1); a Python node sets
+    # its own position only via $AT_OWN_GEOHASH, the same headless seed C uses.
+    # ------------------------------------------------------------------
+
+    #: Max geohash length carried on the wire. MUST match C AT_GEOHASH_MAX_LEN
+    #: (msg_types.h): a ~5-char geohash is the ~5km "neighborhood" bucket; the
+    #: bound allows finer precision later without a wire change.
+    _GEOHASH_MAX_LEN = 12
+
+    @staticmethod
+    def _geohash_valid(s) -> bool:
+        """True iff `s` is a non-empty, length-bounded geohash base32 string.
+
+        Base32 alphabet is 0-9 plus b-z excluding a/i/l/o (the geohash
+        alphabet). Validation only — the string is never decoded here. Mirrors
+        C ``_geohash_valid``; a peer's geohash is untrusted, so this gates it on
+        the way in exactly as the C twin does.
+        """
+        if not isinstance(s, str):
+            return False
+        n = len(s)
+        if n == 0 or n > IdentityProcess._GEOHASH_MAX_LEN:
+            return False
+        for c in s:
+            if not (('0' <= c <= '9')
+                    or ('b' <= c <= 'z' and c not in ('i', 'l', 'o'))):
+                return False
+        return True
+
+    def _send_position_query(self, queues, peer):
+        """Ask `peer` directly for its coarse position (mirrors
+        ``_send_caps_query`` and C ``_send_position_query``).
+
+        Sent to a confirmed peer over the reliable group/TCP channel, so it is
+        group-encrypted like caps_query — NOT a plaintext pre-admission verb,
+        hence not in ``UNENCRYPTED_VERBS``. Fire-and-forget: an opted-out or
+        unreachable peer simply yields no response, and the resync sweep re-asks.
+        """
+        try:
+            message = Message(self.name, IdentityProtocol.position_query,
+                              '', to_whom=peer)
+            queues[CfgIds.network].put(message, block=True,
+                                       timeout=self.q_cadence)
+        except Full:
+            self.logger.error('_send_position_query: Network queue full')
+
+    def handle_position_query(self, queues, message):
+        """Respond to a peer's position_query with our own coarse position —
+        but ONLY if the operator opted in. Empty ``own_geohash`` (the default)
+        answers nothing, so no position is ever disclosed unbidden."""
+        if message.function != IdentityProtocol.position_query:
+            return False
+        sender = getattr(message, 'from_whom', None)
+        if sender is None:
+            return True
+        with self.lock:
+            own = self.own_geohash
+        if not own:
+            self.logger.debug(
+                'position_query from %s; opted out, no answer',
+                str(getattr(sender, 'uuid', ''))[:8])
+            return True   # opted out: share nothing
+        try:
+            # Envelope {pos, seq}: stamped so a captured response cannot be
+            # replayed (freshness.accept refuses a non-increasing seq), matching
+            # the caps_response contract and the C handler.
+            payload = to_json_string({'pos': own,
+                                      'seq': self.freshness.stamp()})
+            reply = Message(self.name, IdentityProtocol.position_response,
+                            payload, to_whom=sender)
+            queues[CfgIds.network].put(reply, block=True,
+                                       timeout=self.q_cadence)
+        except Full:
+            self.logger.error('handle_position_query: Network queue full')
+        except Exception as err:
+            self.report_exception(err, 'handle_position_query')
+        return True
+
+    def handle_position_response(self, queues, message):
+        """Record a peer's coarse position from a {'pos','seq'} response:
+        freshness-checked (replay-refused) and geohash-validated, then stored in
+        ``self.peer_positions`` keyed by the sender's uuid string.
+
+        No app emission here — surfacing to the app (PEER_POSITION_OBSERVED) is
+        the C runtime's job; a Python node only maintains the peer map, which is
+        the conformance-observable surface (``get_peer_position``)."""
+        if message.function != IdentityProtocol.position_response:
+            return False
+        sender = getattr(message, 'from_whom', None)
+        if sender is None:
+            return True
+        try:
+            body = from_json_string(message.obj)
+            if not isinstance(body, dict):
+                return True
+            # Unstamped/replayed is refused, not accepted as legacy — same rule
+            # as caps_response (doc/architecture/reputation.md).
+            if not self.freshness.accept(str(getattr(sender, 'uuid', None)),
+                                         IdentityProtocol.position_response,
+                                         body.get('seq')):
+                self.logger.debug(
+                    'position_response from %s refused (replay/unstamped)',
+                    str(getattr(sender, 'uuid', ''))[:8])
+                return True
+            pos = body.get('pos')
+            if not self._geohash_valid(pos):
+                self.logger.warning(
+                    'position_response from %s: invalid geohash, dropping',
+                    str(getattr(sender, 'uuid', ''))[:8])
+                return True
+            with self.lock:
+                self.peer_positions[str(sender.uuid)] = pos
+            self.logger.debug('recorded position for peer %s',
+                              str(sender.uuid)[:8])
+        except Exception as err:
+            self.report_exception(err, 'handle_position_response')
+        return True
+
+    def get_peer_position(self, uuid_str):
+        """The stored coarse geohash for a peer uuid, or '' if none recorded.
+        Conformance/assertion surface; twin of C ``identity_get_peer_position``."""
+        with self.lock:
+            return self.peer_positions.get(str(uuid_str), '')
+
     # How often the cap-resync sweep runs, and the max queries it emits per
     # sweep (so a large degraded group can't burst the network queue). The
     # interval is long relative to the q_cadence loop so steady-state cost is
@@ -3482,19 +3640,43 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     if str(peer.uuid) != self_uuid
                     and str(peer.uuid) not in known
                 ]
-            if not capless:
-                return
-            sent = 0
-            for peer in capless:
-                if sent >= self._CAPS_RESYNC_MAX_PER_SWEEP:
-                    _probes.counter('peer.set', 'caps_resync_truncated',
-                                    str(len(capless) - sent))
+            if capless:
+                sent = 0
+                for peer in capless:
+                    if sent >= self._CAPS_RESYNC_MAX_PER_SWEEP:
+                        _probes.counter('peer.set', 'caps_resync_truncated',
+                                        str(len(capless) - sent))
+                        break
+                    self._send_caps_query(queues, peer)
+                    sent += 1
+                _probes.counter('peer.set', 'caps_resync_query', str(sent))
+                self.logger.debug(
+                    'Caps resync: re-queried %d cap-less peer(s)', sent)
+
+            # Position resync (Increment 2, opt-in coarse position): re-query
+            # admitted peers we hold NO stored position for. An opted-out peer
+            # answers nothing and is simply re-asked next sweep; a peer that opts
+            # in later is picked up here. Mirrors the C position block in
+            # identity_periodic_caps_resync. Reuses the reliable directed query
+            # — no new wire message, so Python/C wire parity is unaffected.
+            with self.lock:
+                if self.peers is None:
+                    return
+                self_uuid = str(self.identity.uuid)
+                posless = [
+                    peer for peer in self.peers.all
+                    if str(peer.uuid) != self_uuid
+                    and str(peer.uuid) not in self.peer_positions
+                ]
+            psent = 0
+            for peer in posless:
+                if psent >= self._CAPS_RESYNC_MAX_PER_SWEEP:
                     break
-                self._send_caps_query(queues, peer)
-                sent += 1
-            _probes.counter('peer.set', 'caps_resync_query', str(sent))
-            self.logger.debug(
-                'Caps resync: re-queried %d cap-less peer(s)', sent)
+                self._send_position_query(queues, peer)
+                psent += 1
+            if psent:
+                self.logger.debug(
+                    'Position resync: re-queried %d position-less peer(s)', psent)
         except Exception as err:
             _probes.counter('peer.set', 'caps_resync_exc')
             self.report_exception(err, '_periodic_caps_resync')
