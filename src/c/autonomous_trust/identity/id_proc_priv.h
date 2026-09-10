@@ -40,6 +40,22 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
  *  identity_run path also calls this helper internally. */
 int identity_register_handlers(process_t *proc);
 
+/** This node's own PUBLISHED identity (public-only, freshly serialized from
+ *  the identity config). Exposed for the sibling translation units that need
+ *  it -- identity/first_contact.c must check that an invitation presented to
+ *  it was minted by US. Returns 0 on success. The caller frees any
+ *  `operator_key_binding` on the result. */
+int identity_own_public_identity(const process_t *proc, public_identity_t *out);
+
+/** No-vote, no-group-key admission of a DIRECT (1:1) peer: the seam the
+ *  optional first-contact handshake admits through. Records the peer as a
+ *  PROVISIONAL admission does -- peers[], the local activity broadcast, the
+ *  app-facing peer_observed -- but never propagates the group key and never
+ *  inserts into the identity history: a contact is not a group member.
+ *  Idempotent on the UUID. Mirrors Python first_contact._admit_direct_peer. */
+int identity_admit_direct_peer(process_t *proc, directory_t *queues,
+                               const public_identity_t *who);
+
 /* Vote-collection critical section, exposed for concurrency regression tests.
  * Both helpers are thread-safe; they internally acquire id_state.lock.
  *

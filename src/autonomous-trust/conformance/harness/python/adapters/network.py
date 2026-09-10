@@ -716,7 +716,7 @@ class NetworkAdapter:
                 all(v in UNENCRYPTED_VERBS for v in plain),
             'no_other_verb_is_unencrypted':
                 not any(v in UNENCRYPTED_VERBS for v in enc_only),
-            'unencrypted_verb_count_is_nine': len(UNENCRYPTED_VERBS) == 9,
+            'unencrypted_verb_count_is_eleven': len(UNENCRYPTED_VERBS) == 11,
             'empty_verb_is_not_unencrypted':
                 (None not in UNENCRYPTED_VERBS) and ('' not in UNENCRYPTED_VERBS),
             'overlap_verbs_are_both':

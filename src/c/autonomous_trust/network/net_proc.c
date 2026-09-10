@@ -56,6 +56,15 @@
 #include "structures/map.h"
 #include "structures/data.h"
 
+/* ADDR_LEN (identity.h) sizes `public_identity_t.address` as
+ * `char[ADDR_LEN + 1]`, and that buffer must hold any address inet_ntop can
+ * produce -- IPV6_ADDR_LEN is INET6_ADDRSTRLEN. The two constants live in
+ * different headers and were out of step for a long time (32 vs 46), which
+ * truncated IPv6 addresses silently. This is the only file that includes both,
+ * so it is where they get pinned together. */
+_Static_assert(ADDR_LEN + 1 >= IPV6_ADDR_LEN,
+               "ADDR_LEN + 1 must hold a full IPv6 literal (IPV6_ADDR_LEN)");
+
 /* Group partition recovery — drop-site signal to IdentityProcess.
  *   See doc/architecture/partition-recovery.md §5.1 and the matching
  *   id_proc.c side. The string MUST match id_proc.c's
@@ -1489,11 +1498,14 @@ static int net_encrypt_and_send(const identity_t *myself, const net_wire_msg_t *
  ****************************/
 
 /* Return the local address string for comparing to the packet sender.
- * `out_len` is explicit and callers pass IPV6_ADDR_LEN buffers: ADDR_LEN (32) is
- * too small for a full IPv6 literal (up to 45 chars), and the result feeds a
- * self-filter -- `strcmp(from_addr, my_addr) == 0` -- so a truncated value would
- * silently stop a node recognising its own traffic. cidr_split now clears `out`
- * and reports ENET_ADDR_TOO_LONG rather than truncating, which turns that into a
+ * `out_len` is explicit and callers pass IPV6_ADDR_LEN buffers. That was
+ * originally a local workaround: ADDR_LEN was 32, too small for a full IPv6
+ * literal (up to 45 chars), and the result feeds a self-filter --
+ * `strcmp(from_addr, my_addr) == 0` -- so a truncated value silently stopped a
+ * node recognising its own traffic. ADDR_LEN is now 45, so an ADDR_LEN + 1
+ * buffer would also be exactly big enough; the explicit `out_len` stays because
+ * it is the right shape regardless, and cidr_split clears `out` and reports
+ * ENET_ADDR_TOO_LONG rather than truncating, turning any future overflow into a
  * non-match instead of a wrong match. */
 static void my_address(const network_config_t *net_cfg, bool ipv6, char *out,
                        size_t out_len)

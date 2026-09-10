@@ -46,6 +46,7 @@ from autonomous_trust.core.identity import Group, Identity, Peers
 from autonomous_trust.core.identity.encrypt import Encryptor
 from autonomous_trust.core.identity.idprocess import IdentityProcess
 from autonomous_trust.core.identity.protocol import IdentityProtocol
+from autonomous_trust.core.identity.first_contact import _FLAG as FIRST_CONTACT_FLAG
 from autonomous_trust.core.identity.sign import Signature
 from autonomous_trust.core.identity.zta import ZtaPolicy
 from autonomous_trust.core.network.message import Message
@@ -116,6 +117,21 @@ _TRIGGER_ATTEST_PULL = 'trigger_attest_pull'
 # say nothing about attendance NOW. The C adapter recognizes the same string.
 _TRIGGER_ATTEST_REPLAY = 'trigger_attest_replay'
 
+# Pseudo-function: drop the OPTIONAL first-contact handshake's in-memory
+# spent-nonce guard without touching the file it persists to -- the closest a
+# single-process harness gets to restarting the node. What the guard knows
+# afterwards it read back off disk, which is the whole point of
+# first-contact-nonce-survives-restart. The C adapter recognizes the same
+# string. See doc/architecture/first-contact.md.
+_TRIGGER_FC_RESTART = 'trigger_first_contact_restart'
+
+# Pseudo-function: drive the INITIATOR half of the 1:1 handshake through the
+# production call (first_contact.initiate) rather than handing the target a
+# hello the harness built. A pseudo-step because `initiate` is an API call, not
+# an inbound message -- there is nothing to dispatch. The C adapter recognizes
+# the same string. See first-contact-initiate-reaches-the-hint.
+_TRIGGER_FC_INITIATE = 'trigger_first_contact_initiate'
+
 
 @dataclass
 class _Participant:
@@ -161,6 +177,11 @@ class _Participant:
     # participant id -> uuid string, for every participant in the scenario.
     # Filled by the adapter at setup; see _uuid_for_pid.
     pid_to_uuid: dict = field(default_factory=dict)
+    # Where trigger_first_contact_initiate actually addressed its hello: the
+    # host on the outbound to_whom. Read by the
+    # first_contact_hello_endpoint check, which pins that `initiate` prefers
+    # the invitation's rendezvous hint over the inviter's advertised address.
+    fc_hello_endpoint: str = ''
 
     def _uuid_for_pid(self, pid: str) -> str:
         """Resolve a scenario participant id to its uuid string.
@@ -178,8 +199,12 @@ class _Participant:
 
     def drain_outbox(self) -> list[CapturedMessage]:
         captured: list[CapturedMessage] = []
+        # uuid -> participant id, inverted from the map every participant is
+        # handed at setup. See _pid_of for why uuid and not petname.
+        uuid_to_pid = {str(u): p for p, u in (self.pid_to_uuid or {}).items()}
         for msg in self.outbox_buffer:
-            captured.append(_to_captured(msg, emitter_id=self.id))
+            captured.append(_to_captured(msg, emitter_id=self.id,
+                                         uuid_to_pid=uuid_to_pid))
         self.outbox_buffer.clear()
         return captured
 
@@ -207,6 +232,82 @@ class _Participant:
                         f'{self.id}: expected peer uuid {expected} in peer list, '
                         f'got {sorted(actual_uuids)}'
                     )
+            elif key == 'direct_peers':
+                # The OPTIONAL 1:1 first-contact handshake's admission, as
+                # {participant_id: bool}. True asserts BOTH halves of what a
+                # direct peer is: present in the peer list, and ABSENT from the
+                # group address map. The second half is the security property --
+                # a first-contact peer is directly reachable, not a group
+                # member, so the shared group key must not follow it in.
+                # False asserts the peer was not admitted at all (the refusal
+                # cases). C mirrors by scanning protocol.peers[] and
+                # protocol.group.address_map.
+                grp = self.process.group
+                # The address map's KEYS are the member uuids. Reached through
+                # the private attribute deliberately: `Group.addresses` yields
+                # the map's VALUES (the addresses), so comparing a uuid against
+                # it would never match and the group half of this assertion
+                # would pass vacuously -- which is exactly what a mutation test
+                # of "let the group key follow a direct peer in" caught. The
+                # map degrades to a non-dict in one legacy form (see
+                # Group.to_canonical), which carries no uuids at all.
+                raw = getattr(grp, '_address_map', None) if grp is not None else None
+                in_group = {str(u) for u in raw} if isinstance(raw, dict) else set()
+                have = {str(getattr(p, 'uuid', '')) for p in self.process.peers.all}
+                for pid, want in (expected or {}).items():
+                    peer_uuid = str(self._uuid_for_pid(pid))
+                    if not want:
+                        if peer_uuid in have:
+                            raise AssertionError(
+                                f'{self.id}: {pid} was admitted as a peer, '
+                                f'expected refusal')
+                        continue
+                    if peer_uuid not in have:
+                        raise AssertionError(
+                            f'{self.id}: {pid} is not a peer, expected a '
+                            f'direct-peer admission')
+                    if peer_uuid in in_group:
+                        raise AssertionError(
+                            f'{self.id}: {pid} landed in the GROUP address map; '
+                            f'a first-contact peer must not become a group '
+                            f'member (the group key would follow)')
+            elif key == 'first_contact_hello_endpoint':
+                # Where trigger_first_contact_initiate addressed its hello.
+                # Pins the resolution ORDER: the invitation's rendezvous hint
+                # wins over the address the inviter's identity advertises.
+                # Both are well-formed addresses, so preferring the wrong one
+                # fails silently -- it works on a LAN and never reaches a
+                # remote friend. C mirrors via ic_impl_t.fc_hello_endpoint.
+                actual = self.fc_hello_endpoint
+                if actual != str(expected):
+                    raise AssertionError(
+                        f'{self.id}: first_contact_hello_endpoint={actual!r}, '
+                        f'expected {str(expected)!r}')
+            elif key == 'first_contact_acks_emitted':
+                # How many first_contact_hello_ack messages this participant
+                # emitted over the whole scenario. The observable for the
+                # single-use guard: the peer is legitimately admitted on the
+                # first redemption, so a replay that was honored twice differs
+                # ONLY in what went back out. C mirrors by scanning the
+                # engine's captured[] for the same function.
+                actual = self.emit_tally.get(IdentityProtocol.hello_ack, 0)
+                if actual != int(expected):
+                    raise AssertionError(
+                        f'{self.id}: first_contact_acks_emitted={actual}, '
+                        f'expected {int(expected)}')
+            elif key == 'first_contact_nonce_spent':
+                # The durable single-use guard itself, as {nonce: bool}. Read
+                # after a trigger_first_contact_restart, this is the only place
+                # the on-disk store is observed rather than inferred -- and the
+                # two runtimes read each other's file only if they agree on its
+                # shape. C mirrors via at_first_contact_nonce_spent.
+                guard = getattr(self.process, '_first_contact_nonces', None)
+                for nonce, want in (expected or {}).items():
+                    actual = bool(guard is not None and str(nonce) in guard)
+                    if actual != bool(want):
+                        raise AssertionError(
+                            f'{self.id}: first_contact_nonce_spent[{nonce!r}]='
+                            f'{actual}, expected {bool(want)}')
             elif key == 'peer_caps_count':
                 # Number of caps registered in self.peer_capabilities for
                 # any OTHER participant's uuid. With per-cap dedup in
@@ -675,7 +776,8 @@ def _scenario_zta_binding(corpus_root: Path, ident: Identity, cred: bytes,
     return priv.sign(preimage, padding.PKCS1v15(), hashes.SHA256())
 
 
-def _to_captured(msg: Any, emitter_id: str) -> CapturedMessage:
+def _to_captured(msg: Any, emitter_id: str,
+                 uuid_to_pid: dict | None = None) -> CapturedMessage:
     """Project a network-bound `Message` into the engine's CapturedMessage."""
     if not isinstance(msg, Message):
         # Non-Message items (Group, Peers, PeerCapabilities updates) are
@@ -685,7 +787,7 @@ def _to_captured(msg: Any, emitter_id: str) -> CapturedMessage:
             from_id=emitter_id, to_id='internal',
             function=f'__ipc__/{type(msg).__name__}', payload=msg, raw=msg,
         )
-    to_id = _resolve_to_id(msg)
+    to_id = _resolve_to_id(msg, uuid_to_pid)
     return CapturedMessage(
         from_id=emitter_id,
         to_id=to_id,
@@ -695,7 +797,24 @@ def _to_captured(msg: Any, emitter_id: str) -> CapturedMessage:
     )
 
 
-def _resolve_to_id(msg: Message) -> str:
+def _pid_of(ident, uuid_to_pid) -> str:
+    """One recipient -> participant id, by UUID first.
+
+    The petname is only a usable label for an identity the HARNESS built: it is
+    a local Zooko name, never transmitted, so an identity reconstructed from the
+    wire (a first-contact invitation carries the canonical public form, which is
+    petname-free) gets a locally-DERIVED petname instead, matching no
+    participant. Resolving by uuid first fixes that; the petname stays as the
+    fallback for a recipient that is not a participant at all. The C adapter's
+    _resolve_to_id has always matched on uuid.
+    """
+    uuid = str(getattr(ident, 'uuid', '') or '')
+    if uuid_to_pid and uuid in uuid_to_pid:
+        return uuid_to_pid[uuid]
+    return getattr(ident, 'petname', '') or uuid or str(ident)
+
+
+def _resolve_to_id(msg: Message, uuid_to_pid: dict | None = None) -> str:
     """Map a Message's to_whom into a scenario-level participant id."""
     to = msg.to_whom
     if to == Network.broadcast:
@@ -703,10 +822,9 @@ def _resolve_to_id(msg: Message) -> str:
     if isinstance(to, Group):
         return 'broadcast'  # group-encrypted broadcast; engine treats both alike
     if isinstance(to, Identity):
-        return getattr(to, 'petname', '') or str(to.uuid)
+        return _pid_of(to, uuid_to_pid)
     if isinstance(to, list) and to:
-        first = to[0]
-        return getattr(first, 'petname', '') or str(getattr(first, 'uuid', first))
+        return _pid_of(to[0], uuid_to_pid)
     return 'broadcast'
 
 
@@ -750,9 +868,21 @@ class IdentityAdapter:
 
     def run_scenario(self, case: Case) -> None:
         self._scratch = tempfile.TemporaryDirectory(prefix='at-conformance-id-')
+        fc_fix = (case.data.get('fixtures', {}) or {}).get('first_contact') or {}
+        fc_prior = os.environ.get(FIRST_CONTACT_FLAG)
         try:
             os.environ[Configuration.ROOT_VARIABLE_NAME] = self._scratch.name
             os.makedirs(os.path.join(self._scratch.name, 'etc/at'), exist_ok=True)
+            # The 1:1 handshake is opt-in, and the opt-in is read when the
+            # IdentityProcess registers its handlers -- so it has to be set
+            # BEFORE the participants are built, and cleared after, or the
+            # next scenario inherits it. The durable spent-nonce store lands
+            # in the per-scenario scratch root above, so nonces cannot leak
+            # from one case into the next. Mirrors the C adapter.
+            if fc_fix.get('enabled'):
+                os.environ[FIRST_CONTACT_FLAG] = '1'
+            else:
+                os.environ.pop(FIRST_CONTACT_FLAG, None)
 
             participants = self._build_participants(case)
             ctx = ScenarioContext(
@@ -763,6 +893,10 @@ class IdentityAdapter:
             )
             run_scenario(ctx)
         finally:
+            if fc_prior is None:
+                os.environ.pop(FIRST_CONTACT_FLAG, None)
+            else:
+                os.environ[FIRST_CONTACT_FLAG] = fc_prior
             self._scratch.cleanup()
             self._scratch = None
 
@@ -1431,6 +1565,41 @@ class IdentityAdapter:
                 self._roster_uuid_to_pid.get(str(uuid), str(uuid))
                 if uuid else '')
             return participant.drain_outbox()
+        if inbound.function == _TRIGGER_FC_INITIATE:
+            # `participant` is the INITIATOR. Mint the ticket from the
+            # participant the step names, then let the production call decide
+            # what to send and where -- the point is the decision, not the
+            # bytes the harness could have assembled itself.
+            from autonomous_trust.core.contacts import create_invitation
+            from autonomous_trust.core.identity import first_contact as _fc
+            spec = from_json_string(inbound.obj) if inbound.obj else {}
+            minter_pid = str(spec.get('minted_by'))
+            minter_uuid = participant._uuid_for_pid(minter_pid)
+            minter = self._roster_by_uuid[str(minter_uuid)].identity
+            blob = create_invitation(
+                minter,
+                rendezvous=list(spec.get('rendezvous') or []),
+                expiry=int(spec.get('expiry', 0) or 0),
+                ttl_seconds=0,
+                nonce=str(spec.get('nonce', '')),
+            ).encode()
+            _fc.initiate(participant.process, participant.queues, blob)
+            emitted = participant.drain_outbox()
+            for cm in emitted:
+                if cm.function == IdentityProtocol.hello:
+                    to_whom = cm.raw.to_whom
+                    target = to_whom[0] if isinstance(to_whom, list) else to_whom
+                    participant.fc_hello_endpoint = str(
+                        getattr(target, 'address', '') or '')
+            return emitted
+        if inbound.function == _TRIGGER_FC_RESTART:
+            # Forget the in-memory spent-nonce guard, keep the file: a fresh
+            # SpentNonces re-reads <data_dir>/first_contact_nonces.cfg.json,
+            # which is exactly what a restarted node does. C mirrors with
+            # at_first_contact_reset().
+            from autonomous_trust.core.identity import first_contact as _fc
+            participant.process._first_contact_nonces = _fc.SpentNonces()
+            return participant.drain_outbox()
         if inbound.function == _TRIGGER_SUBTREE_ROSTER:
             # Pseudo-function: run the requestor-side subtree-roster walk on
             # this participant. fetch asks each gateway (by uuid) for its
@@ -1607,6 +1776,34 @@ class IdentityAdapter:
             if not payload.get('unstamped'):
                 body['seq'] = int(payload.get('seq', 1))
             obj = to_json_string(body)
+        elif function == IdentityProtocol.hello:
+            # The OPTIONAL 1:1 handshake's ticket. The scenario names WHO minted
+            # the invitation (`minted_by`) plus the nonce and expiry, and the
+            # adapter mints it here from that participant's own signable
+            # identity -- rather than pinning a blob in the fixture -- because
+            # the participants' keys are generated per run. ed25519 signing is
+            # deterministic, so both runtimes mint the same bytes from the same
+            # seed anyway; what the case compares is the inviter's DECISION.
+            #
+            # The obj is the raw base64url blob, exactly as production sends it
+            # (first_contact.initiate forwards the link untouched, and the
+            # signature covers those bytes).
+            from autonomous_trust.core.contacts import create_invitation
+            minter_pid = payload.get('minted_by') or from_id
+            minter = participants[minter_pid].impl.identity
+            obj = create_invitation(
+                minter,
+                rendezvous=list(payload.get('rendezvous') or []),
+                expiry=int(payload.get('expiry', 0) or 0),
+                ttl_seconds=0,
+                nonce=str(payload.get('nonce', '')),
+            ).encode()
+        elif function == IdentityProtocol.hello_ack:
+            # The accept. The echoed nonce is informational -- what makes the
+            # ack trustworthy is that the initiator already holds the
+            # accepter's key from the invitation it redeemed -- so the handler
+            # reads no further, on either runtime.
+            obj = to_json_string({'nonce': str(payload.get('nonce', ''))})
         elif function == IdentityProtocol.roster_req:
             # Subtree-roster query. `requesting_process` is load-bearing: the
             # answer is addressed to the process the requestor names, and the

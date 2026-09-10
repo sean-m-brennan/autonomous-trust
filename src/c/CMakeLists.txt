@@ -450,6 +450,7 @@ set(libsrc
     autonomous_trust/identity/history.c
     autonomous_trust/identity/identity.c
     autonomous_trust/identity/id_proc.c
+    autonomous_trust/identity/first_contact.c
     autonomous_trust/identity/peers.c
     autonomous_trust/identity/signature.c
     autonomous_trust/contacts/contact.c
@@ -1243,6 +1244,10 @@ add_executable(unencrypted_verbs_test test/unencrypted_verbs_test.c)
 set_source_files_properties(test/unencrypted_verbs_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(unencrypted_verbs_test PRIVATE ${AT_TEST_LIBS})
 
+add_executable(first_contact_endpoint_test test/first_contact_endpoint_test.c)
+set_source_files_properties(test/first_contact_endpoint_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(first_contact_endpoint_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(net_source_bind_test test/net_source_bind_test.c)
 set_source_files_properties(test/net_source_bind_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(net_source_bind_test PRIVATE ${AT_TEST_LIBS})
@@ -1268,6 +1273,7 @@ add_test(NAME network2_test COMMAND $<TARGET_FILE:network2_test>)
 add_test(NAME net_port_test COMMAND $<TARGET_FILE:net_port_test>)
 add_test(NAME cidr_split_test COMMAND $<TARGET_FILE:cidr_split_test>)
 add_test(NAME unencrypted_verbs_test COMMAND $<TARGET_FILE:unencrypted_verbs_test>)
+add_test(NAME first_contact_endpoint_test COMMAND $<TARGET_FILE:first_contact_endpoint_test>)
 add_test(NAME net_source_bind_test COMMAND $<TARGET_FILE:net_source_bind_test>)
 add_test(NAME net_tcp_multiframe_test COMMAND $<TARGET_FILE:net_tcp_multiframe_test>)
 add_test(NAME proc_tracker2_test COMMAND $<TARGET_FILE:proc_tracker2_test>)
