@@ -90,6 +90,19 @@ void identity_set_own_capabilities(const process_t *proc,
  *  `peer_caps_count` expected_state key. */
 int identity_get_peer_caps_count(const uuid_t uuid);
 
+/** Set (or clear) THIS node's opt-in coarse position (Increment 2, the
+ *  "with-distance" feature) in the singleton id_state. A valid non-empty
+ *  geohash opts in; NULL/""/invalid opts out (the default). The harness analog
+ *  of the app's set-position IPC verb; conformance installs it from
+ *  `fixtures.positions`. */
+void identity_set_own_geohash(const char *geohash);
+
+/** Copy the coarse geohash recorded for peer @p uuid_str (lowercased uuid
+ *  string) into @p buf, always NUL-terminated. Returns true iff a position is
+ *  stored. The map is filled by handle_position_response; conformance asserts
+ *  via the `peer_position` expected_state key. */
+bool identity_get_peer_position(const char *uuid_str, char *buf, size_t buflen);
+
 /** Copy the size-bounded capability descriptor recorded for @p cap_name (from
  *  the descriptor form of `peer_caps_response`) into @p buf as a JSON string
  *  ({required_tier, description, kind, arg_schema}; name excluded). Returns 0

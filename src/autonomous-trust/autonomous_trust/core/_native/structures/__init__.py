@@ -13,3 +13,10 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
+
+# Anything this shim does not name above falls back to the `_python` twin, so
+# the import surface does not depend on which backend is active. See
+# _delegate.python_fallback -- native submodules and explicit re-exports win.
+from .._delegate import python_fallback
+
+__getattr__ = python_fallback(__name__)

@@ -1,0 +1,60 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: position-shared-on-request
+byte_pinning: false
+description: |
+    Opt-in coarse position, the happy path (Increment 2, the "with-distance"
+    feature). bg has opted in — fixtures.positions sets its own_geohash — so
+    when newcomer asks, bg answers with its coarse geohash bucket and newcomer
+    records it. STRICTLY OPT-IN: a geographic datum crosses ONLY because bg
+    chose to share one. The substrate carries the opaque bucket; distance is
+    computed app-side, so the corpus pins carriage, not decoding.
+
+    Step 1: newcomer -> bg peer_position_query.
+      - Both runtimes: handle_position_query sees a non-empty own_geohash and
+        emits ONE freshness-stamped peer_position_response carrying the bucket.
+        (Asserted via bg.position_responses_emitted=1, which is also what makes
+        the opt-in guard non-vacuous against position-absent-is-normal.)
+    Step 2: bg -> newcomer peer_position_response {pos, seq}.
+      - Both runtimes: handle_position_response validates the geohash, accepts
+        the freshness seq, and stores it under bg's uuid.
+        (Python: self.peer_positions; C: id_state.peer_position_map — read
+        symmetrically via get_peer_position / identity_get_peer_position.)
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  positions:
+    bg: u4pruy
+
+steps:
+  - id: 1
+    from: newcomer
+    to: bg
+    function: peer_position_query
+    payload: {}
+    description: |
+        newcomer asks bg for its coarse position. bg is opted in, so its
+        handle_position_query emits a peer_position_response back.
+  - id: 2
+    from: bg
+    to: newcomer
+    function: peer_position_response
+    payload:
+      pos: u4pruy
+      seq: 1
+    description: |
+        bg's answer delivered to newcomer. handle_position_response records
+        the bucket under bg's uuid in newcomer's view.
+
+expected_state:
+  bg:
+    position_responses_emitted: 1
+  newcomer:
+    peer_position:
+      bg: u4pruy

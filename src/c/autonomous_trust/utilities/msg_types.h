@@ -51,6 +51,8 @@ typedef enum {
     PEER_OBSERVED,           /**< Identity → app: one observed peer (@ref peer_observed_msg_t). Local IPC only. */
     PEER_REPUTATION,         /**< Reputation → app: one peer's earned score (@ref peer_reputation_msg_t). Local IPC only. */
     CHILD_GROUP,             /**< Identity → sibling processes: one cohort this node GATEWAYS, beyond its primary group. Local IPC only. Carries a @ref group_t like @ref GROUP, but must never land in `protocol.group` — the reputation process keeps a separate chain per child group, and clobbering the primary slot would merge a subtree into it. Mirrors Python's ChildGroupSet (see gateway-reputation-tree.md, doc/architecture/gateway-reputation-tree.md). */
+    PEER_RTT_OBSERVED,       /**< Net-proc → app: one peer's latest RTT (ms). Local IPC only. Reuses @ref peer_rtt_update_msg_t; distinct from @ref PEER_RTT_UPDATE (which stays net-proc → sibling processes). */
+    PEER_POSITION_OBSERVED,  /**< Identity → app: one peer's shared coarse position (opt-in geohash, @ref peer_position_msg_t). Local IPC only. */
 #ifdef AT_ZTA_ENABLED
     ZTA_REVOCATION_ALERT,    /**< Peer credential revocation notice. */
     ZTA_VERIFICATION_RESULT, /**< Outcome of a deferred ZTA verification. */
@@ -270,6 +272,26 @@ typedef struct {
     bool   rated;
 } peer_reputation_msg_t;
 
+/* Max geohash length carried across the AT->app boundary. The app shares a
+ * ~5-char geohash (the ~5km "neighborhood" bucket); the buffer allows finer
+ * precision later without an ABI change. MUST match AT_APP_GEOHASH_LEN in
+ * app_events.h. */
+#define AT_GEOHASH_MAX_LEN 12
+
+/**
+ * @brief AT → app: one peer's shared coarse position, as an opt-in geohash
+ * bucket. Half of the geographic-distance feature (Increment 2); the app
+ * computes distance from its own opted-in bucket. An empty @c geohash means the
+ * peer shared none (opted out) — the ordinary, default case. Treat the geohash
+ * as opaque and untrusted peer input. Local IPC only — the on-wire exchange is
+ * the directed peer_position_query/response, not this message.
+ */
+typedef struct {
+    uuid_t peer_uuid;
+    /** NUL-terminated geohash; "" = none / opted out. */
+    char   geohash[AT_GEOHASH_MAX_LEN + 1];
+} peer_position_msg_t;
+
 #define SIGNAL_LEN 32
 
 typedef struct
@@ -354,6 +376,7 @@ typedef struct
         peer_rtt_update_msg_t peer_rtt_update;
         peer_observed_msg_t peer_observed;
         peer_reputation_msg_t peer_reputation;
+        peer_position_msg_t peer_position;
 #ifdef AT_ZTA_ENABLED
         zta_event_msg_t zta_event;
         zta_standing_msg_t zta_standing;

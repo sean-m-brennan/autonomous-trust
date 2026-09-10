@@ -17,9 +17,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <jansson.h>
+
 #include "app_events.h"
 #include "utilities/message.h"
 #include "utilities/msg_types.h"
+#include "utilities/msg_types_priv.h"   /* net_msg_pack_json */
 
 struct at_app_events_s {
     queue_t queue;
@@ -126,6 +129,30 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
                     ? msg.info.peer_reputation.score : 0.0;
             break;
         }
+        case PEER_RTT_OBSERVED:
+        {
+            at_app_event_t *ev = &out[n++];
+            memset(ev, 0, sizeof(*ev));
+            ev->kind = AT_APP_EVENT_PEER_RTT;
+            memcpy(ev->data.rtt.peer_uuid,
+                   msg.info.peer_rtt_update.peer_uuid, AT_APP_UUID_LEN);
+            ev->data.rtt.rtt_ms = msg.info.peer_rtt_update.rtt_ms;
+            break;
+        }
+        case PEER_POSITION_OBSERVED:
+        {
+            at_app_event_t *ev = &out[n++];
+            memset(ev, 0, sizeof(*ev));
+            ev->kind = AT_APP_EVENT_PEER_POSITION;
+            memcpy(ev->data.position.peer_uuid,
+                   msg.info.peer_position.peer_uuid, AT_APP_UUID_LEN);
+            /* Bounded copy of the opaque geohash; the emitter already NUL-caps
+             * it, and the event was memset so a short string stays terminated. */
+            memcpy(ev->data.position.geohash, msg.info.peer_position.geohash,
+                   AT_APP_GEOHASH_LEN);
+            ev->data.position.geohash[AT_APP_GEOHASH_LEN] = '\0';
+            break;
+        }
         default:
             /* Not app-facing: skipped rather than surfaced as an event. A
              * consumer of this ABI is not given AT's internal traffic. */
@@ -149,6 +176,33 @@ int at_app_events_request_roster(at_app_events_t *handle, const char *q_out)
              "identity");
     req.info.net_msg.function = (char *)AT_APP_ROSTER_REQUEST;
     req.info.net_msg.encrypt = false;
+    return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
+}
+
+int at_app_events_set_position(at_app_events_t *handle, const char *q_out,
+                               const char *geohash)
+{
+    if (handle == NULL || !name_survives(q_out))
+        return -1;
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),
+             "identity");
+    req.info.net_msg.function = (char *)AT_APP_SET_POSITION;
+    req.info.net_msg.encrypt = false;
+    /* {"pos": "<geohash>"}; NULL/"" opts out (clears own position). */
+    json_t *env = json_object();
+    if (env == NULL)
+        return -1;
+    json_object_set_new(env, "pos",
+                        json_string(geohash != NULL ? geohash : ""));
+    if (net_msg_pack_json(&req.info.net_msg, env) != 0) {
+        json_decref(env);
+        return -1;
+    }
+    json_decref(env);
     return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
 }
 
