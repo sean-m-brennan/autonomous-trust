@@ -1,0 +1,46 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: position-absent-is-normal
+byte_pinning: false
+description: |
+    The DEFAULT, opted-out case for coarse position (Increment 2, the
+    "with-distance" feature). bg has NOT opted in (no fixtures.positions), so
+    its own_geohash is empty. When newcomer asks, bg's handle_position_query
+    answers NOTHING — no geographic datum leaves the node, and newcomer records
+    no position for bg. Opting out is silent and ordinary, not an error (cf.
+    operator-key-absent-is-normal).
+
+    NON-VACUITY: the load-bearing assertion is bg.position_responses_emitted=0.
+    A single query step alone would let newcomer.peer_position[bg]='' pass even
+    if the feature were broken; the emission count is what fails a mutation that
+    drops the opt-out guard (an opted-out node answering with an empty bucket).
+
+    Step 1: newcomer -> bg peer_position_query.
+      - Both runtimes: handle_position_query, seeing an empty own_geohash,
+        returns without emitting any response.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+# No `positions` fixture: bg is opted OUT, the default.
+
+steps:
+  - id: 1
+    from: newcomer
+    to: bg
+    function: peer_position_query
+    payload: {}
+    description: |
+        newcomer asks bg for its coarse position. bg is opted out, so
+        handle_position_query answers nothing.
+
+expected_state:
+  bg:
+    position_responses_emitted: 0
+  newcomer:
+    peer_position:
+      bg: ''

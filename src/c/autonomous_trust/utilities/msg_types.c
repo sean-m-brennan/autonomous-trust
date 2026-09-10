@@ -66,11 +66,14 @@ size_t message_size(message_type_t type)
     case UPDATE_ACCEPTED:
         return sizeof(update_accepted_msg_t);
     case PEER_RTT_UPDATE:
+    case PEER_RTT_OBSERVED:
         return sizeof(peer_rtt_update_msg_t);
     case PEER_OBSERVED:
         return sizeof(peer_observed_msg_t);
     case PEER_REPUTATION:
         return sizeof(peer_reputation_msg_t);
+    case PEER_POSITION_OBSERVED:
+        return sizeof(peer_position_msg_t);
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:
     case ZTA_VERIFICATION_RESULT:
@@ -120,10 +123,14 @@ char *message_type_to_string(message_type_t type)
         return (char*)"UPDATE_ACCEPTED";
     case PEER_RTT_UPDATE:
         return (char*)"PEER_RTT_UPDATE";
+    case PEER_RTT_OBSERVED:
+        return (char*)"PEER_RTT_OBSERVED";
     case PEER_OBSERVED:
         return (char*)"PEER_OBSERVED";
     case PEER_REPUTATION:
         return (char*)"PEER_REPUTATION";
+    case PEER_POSITION_OBSERVED:
+        return (char*)"PEER_POSITION_OBSERVED";
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:
         return (char*)"ZTA_REVOCATION_ALERT";
@@ -175,10 +182,14 @@ message_type_t string_to_message_type(const char *str)
         return UPDATE_ACCEPTED;
     if (strcmp(str, "PEER_RTT_UPDATE") == 0)
         return PEER_RTT_UPDATE;
+    if (strcmp(str, "PEER_RTT_OBSERVED") == 0)
+        return PEER_RTT_OBSERVED;
     if (strcmp(str, "PEER_OBSERVED") == 0)
         return PEER_OBSERVED;
     if (strcmp(str, "PEER_REPUTATION") == 0)
         return PEER_REPUTATION;
+    if (strcmp(str, "PEER_POSITION_OBSERVED") == 0)
+        return PEER_POSITION_OBSERVED;
 #ifdef AT_ZTA_ENABLED
     if (strcmp(str, "ZTA_STANDING") == 0)
         return ZTA_STANDING;
@@ -401,6 +412,7 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         break;
     }
     case PEER_RTT_UPDATE:
+    case PEER_RTT_OBSERVED:
     {
         subdata_len = sizeof(peer_rtt_update_msg_t);
         subdata = smrt_create(subdata_len);
@@ -422,6 +434,14 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         subdata = smrt_create(subdata_len);
         if (subdata == NULL) return EXCEPTION(ENOMEM);
         memcpy(subdata, &msg->info.peer_reputation, subdata_len);
+        break;
+    }
+    case PEER_POSITION_OBSERVED:
+    {
+        subdata_len = sizeof(peer_position_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.peer_position, subdata_len);
         break;
     }
 #ifdef AT_ZTA_ENABLED
@@ -675,10 +695,14 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
         COPY_FIXED_PAYLOAD(update_accepted, update_accepted_msg_t);
         break;
     case PEER_RTT_UPDATE:
+    case PEER_RTT_OBSERVED:
         COPY_FIXED_PAYLOAD(peer_rtt_update, peer_rtt_update_msg_t);
         break;
     case PEER_OBSERVED:
         COPY_FIXED_PAYLOAD(peer_observed, peer_observed_msg_t);
+        break;
+    case PEER_POSITION_OBSERVED:
+        COPY_FIXED_PAYLOAD(peer_position, peer_position_msg_t);
         break;
     case PEER_REPUTATION:
         COPY_FIXED_PAYLOAD(peer_reputation, peer_reputation_msg_t);

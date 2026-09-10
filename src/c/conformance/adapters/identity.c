@@ -838,6 +838,27 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
         }
     }
 
+    /* positions: { "<participant>": "<geohash>", ... } (Increment 2, the
+     * "with-distance" feature) — install each named participant's opt-in coarse
+     * position via identity_set_own_geohash so its handle_position_query answers
+     * with that bucket. id_state is a singleton per scenario, so a scenario opts
+     * in exactly ONE participant (the responder); an unlisted participant is
+     * opted OUT, the default. Mirrors the Python adapter reading
+     * fixtures.positions into process.own_geohash. */
+    json_t *positions = json_object_get(fixtures, "positions");
+    if (json_is_object(positions))
+    {
+        const char *ppid;
+        json_t *pval;
+        json_object_foreach(positions, ppid, pval) {
+            sce_participant_t *part = sce_find_participant(ctx, ppid);
+            if (part == NULL) continue;
+            ic_impl_t *impl = (ic_impl_t *)part->impl;
+            if (impl == NULL || impl->proc == NULL) continue;
+            identity_set_own_geohash(json_string_value(pval));
+        }
+    }
+
     /* admission_quorum: { "<participant>": <int>, ... } — two-phase admission
      * (doc/architecture/identity-protocol.md). A member withholds the group key until this many
      * DISTINCT border-guards confirm. Default 1 (no fixture). Mirrors the
@@ -1308,6 +1329,26 @@ static int _build_inbound(sce_run_ctx_t *ctx,
             net_msg_pack_json(&out->info.net_msg, body);
             json_decref(body);
         }
+        return 0;
+    }
+
+    /* peer_position_response — pack {pos, seq} as the envelope
+     * handle_position_response expects (Increment 2, the "with-distance"
+     * feature). `pos` is the opaque geohash bucket; `seq` is the responder's
+     * freshness sequence (_ic_set_seq honors `unstamped: true` by omitting it,
+     * so the replay/unstamped-refusal case is exercised the same way caps is).
+     * Mirrors the Python position_response builder; peer_position_query needs
+     * no branch (empty payload, generic path, like caps_query). Without this
+     * the C handler sees no payload and silently no-ops. */
+    if (strcmp(function, "peer_position_response") == 0 && json_is_object(payload)) {
+        json_t *body = json_object();
+        json_t *jpos = json_object_get(payload, "pos");
+        json_object_set_new(body, "pos",
+                            json_string(json_is_string(jpos)
+                                        ? json_string_value(jpos) : ""));
+        _ic_set_seq(body, payload);
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
         return 0;
     }
 
@@ -2329,6 +2370,38 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                         return -1;
                     }
                 }
+            } else if (strcmp(key, "peer_position") == 0) {
+                /* {peer_id: geohash} (Increment 2) — the coarse position this
+                 * participant recorded for another, via
+                 * identity_get_peer_position. '' means none recorded (the peer
+                 * opted out, or the response was dropped/refused) — the ordinary
+                 * default. Mirrors the Python adapter's peer_position, keyed by
+                 * the same lowercased uuid. */
+                const char *pp_pid;
+                json_t *pp_want;
+                json_object_foreach(val, pp_pid, pp_want) {
+                    sce_participant_t *other = sce_find_participant(ctx, pp_pid);
+                    if (other == NULL) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: peer_position names unknown participant %s",
+                                 pid, pp_pid);
+                        return -1;
+                    }
+                    const public_identity_t *want_id =
+                        ((ic_impl_t *)other->impl)->pub;
+                    char want_uuid[UUID_STR_LEN + 1];
+                    uuid_unparse_lower(want_id->uuid, want_uuid);
+                    char got[64];
+                    identity_get_peer_position(want_uuid, got, sizeof(got));
+                    const char *want = json_string_value(pp_want);
+                    if (want == NULL) want = "";
+                    if (strcmp(got, want) != 0) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: peer_position[%s]=%s, expected %s",
+                                 pid, pp_pid, got, want);
+                        return -1;
+                    }
+                }
             } else if (strcmp(key, "first_contact_hello_endpoint") == 0) {
                 /* Where trigger_first_contact_initiate addressed its hello.
                  * Pins the resolution ORDER: the invitation's rendezvous hint
@@ -2666,6 +2739,26 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                 if (got != want) {
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: caps_query_emitted=%d, expected %d",
+                             pid, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "position_responses_emitted") == 0) {
+                /* peer_position_response emissions by this participant
+                 * (Increment 2). The opt-in guard's observable: an opted-OUT
+                 * node emits 0 (position-absent-is-normal), an opted-IN one
+                 * emits 1 per answered query — so dropping the guard makes the
+                 * opt-out case fail. Mirrors the Python emit_tally check. */
+                int want = (int)json_integer_value(val);
+                int got = 0;
+                for (size_t i = 0; i < ctx->captured_count; i++) {
+                    if (strcmp(ctx->captured[i].from, pid) == 0
+                        && strcmp(ctx->captured[i].function,
+                                  "peer_position_response") == 0)
+                        got++;
+                }
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: position_responses_emitted=%d, expected %d",
                              pid, got, want);
                     return -1;
                 }

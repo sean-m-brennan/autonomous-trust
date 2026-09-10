@@ -84,6 +84,16 @@ class IdentityProtocol(Protocol):
     # messages flow via reliable group/TCP, not UDP broadcast.
     caps_query = 'peer_caps_query'  # msg.obj <- '' (sender just asks)
     caps_response = 'peer_caps_response'  # msg.obj <- caps list (json)
+    # Opt-in coarse position (Increment 2, the "with-distance" feature). Mirrors
+    # the caps directed exchange above: a confirmed peer asks for our coarse
+    # geohash bucket; we answer ONLY if the operator opted in (own_geohash set),
+    # with a freshness-stamped, group-encrypted {'pos', 'seq'} response. STRICTLY
+    # OPT-IN — absent an own position we answer nothing, so no geographic datum
+    # leaves the node. The geohash is opaque here (the app decodes it and computes
+    # distance); a received one is untrusted, charset- and length-validated on the
+    # way in. Both flow reliably via group/TCP like caps, not UDP broadcast.
+    position_query = 'peer_position_query'  # msg.obj <- '' (sender just asks)
+    position_response = 'peer_position_response'  # msg.obj <- json {'pos','seq'}
     # Identity backfill for a node that holds a group member's address (in
     # group.addresses) but never received its full Identity — the cold/late
     # joiner case (e.g. the dod_mission coordinator: group.addresses grows via

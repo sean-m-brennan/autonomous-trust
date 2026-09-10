@@ -2171,6 +2171,54 @@ static void broadcast_rtt_update(const process_t *proc, directory_t *queues,
     }
 }
 
+/* AT → app: emit one peer's latest RTT as PEER_RTT_OBSERVED to AT_MAIN_QUEUE.
+ * The main loop (at_route_internal_msgs) forwards it to the app's q_out, where
+ * app_events.c decodes it as AT_APP_EVENT_PEER_RTT. Mirrors the route
+ * identity_emit_peer_observed takes (id_proc.c). Local IPC only; distinct from
+ * broadcast_rtt_update, which fans PEER_RTT_UPDATE to SIBLING processes. */
+static int net_emit_rtt_observed(const uuid_t peer_uuid, int rtt_ms)
+{
+    generic_msg_t msg = {0};
+    msg.type = PEER_RTT_OBSERVED;
+    msg.size = sizeof(peer_rtt_update_msg_t);
+    memcpy(msg.info.peer_rtt_update.peer_uuid, peer_uuid, 16);
+    msg.info.peer_rtt_update.rtt_ms = rtt_ms;
+    return messaging_send(AT_MAIN_QUEUE, PEER_RTT_OBSERVED, &msg, false);
+}
+
+/* AT → app: emit the RTT for every known peer — the proximity half of the
+ * roster-pull answer. Snapshot uuid + peer_rtt_ms[] under peers_rwlock, then
+ * emit outside it (messaging_send is a syscall; holding the lock across it would
+ * block every writer). Mirrors identity_emit_all_peers (id_proc.c). Returns the
+ * count emitted. An rtt of 0 means "not yet measured" and crosses as-is — the
+ * app ABI reads 0 as unknown. */
+static int net_emit_all_rtts(const process_t *proc, logger_t *logger)
+{
+    if (proc == NULL)
+        return 0;
+    uuid_t uuids[DEFAULT_MAX_PEERS];
+    int    rtts[DEFAULT_MAX_PEERS];
+    peers_read_lock(proc);
+    size_t n = proc->protocol.num_peers;
+    if (n > DEFAULT_MAX_PEERS)
+        n = DEFAULT_MAX_PEERS;
+    for (size_t i = 0; i < n; i++) {
+        memcpy(uuids[i], proc->protocol.peers[i].uuid, sizeof(uuid_t));
+        rtts[i] = proc->protocol.peer_rtt_ms[i];
+    }
+    peers_read_unlock(proc);
+
+    int emitted = 0;
+    for (size_t i = 0; i < n; i++) {
+        int rc = net_emit_rtt_observed(uuids[i], rtts[i]);
+        if (rc == 0)
+            emitted++;
+        else
+            log_debug(logger, "Network: rtt_observed emit returned %d\n", rc);
+    }
+    return emitted;
+}
+
 /****************************
  * Network process main
  ****************************/
@@ -2326,6 +2374,18 @@ static int network_run(const net_transport_t *transport,
                              "request for %s (requester '%s')\n",
                              nmsg->to_whom.address, ret_q);
                     refuse_ping_at_unsupported(nmsg->to_whom.address, ret_q, logger);
+                    continue;
+                }
+                /* App roster pull, RTT half: at_route_extern_msg fans
+                 * AT_APP_ROSTER_REQUEST to identity + reputation + network. We
+                 * answer with one PEER_RTT_OBSERVED per known peer. The trailing
+                 * `continue;` is MANDATORY: without it this verb falls through to
+                 * net_encrypt_and_send below and leaks onto the wire. Local IPC
+                 * only — an app never learns another node's whole verb surface. */
+                if (strcmp(nmsg->function, AT_APP_ROSTER_REQUEST) == 0) {
+                    int n = net_emit_all_rtts(proc, logger);
+                    log_debug(logger,
+                              "Network: rtt roster request -> %d observation(s)\n", n);
                     continue;
                 }
                 /* Reputation communication cut-off enforcement. rep_proc's
@@ -2515,6 +2575,11 @@ static int network_run(const net_transport_t *transport,
                  * Uses the snapshot captured under the write lock above. */
                 broadcast_rtt_update(proc, queues, new_peer->uuid,
                                      snapshot_rtt, logger);
+
+                /* Also surface it to the app (AT_APP_EVENT_PEER_RTT) as the peer
+                 * is admitted. Change-driven; the roster pull (net_emit_all_rtts)
+                 * re-emits a full view, so a lost live emit self-heals. */
+                net_emit_rtt_observed(new_peer->uuid, snapshot_rtt);
 
                 /* Retry deferred encrypted messages with the new peer. Match
                  * by envelope src_uuid when the entry has one (gateway-

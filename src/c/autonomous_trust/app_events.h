@@ -58,6 +58,10 @@ extern "C" {
 #define AT_APP_SIGNING_KEY_LEN 32
 /** Length of a UUID in bytes. */
 #define AT_APP_UUID_LEN 16
+/** Max geohash length carried across the app boundary. The app shares a
+ *  ~5-char geohash (~5km "neighborhood" bucket); the buffer allows finer later
+ *  without an ABI change. MUST match AT_GEOHASH_MAX_LEN in msg_types.h. */
+#define AT_APP_GEOHASH_LEN 12
 
 /** Returned instead of -1 when the daemon exists but has not bound its queue
  *  yet, so a caller can retry rather than treat a normal cold start as an error.
@@ -73,7 +77,14 @@ typedef enum {
     /** A peer as this node observes it (@c peer). */
     AT_APP_EVENT_PEER_OBSERVED = 1,
     /** A peer's earned reputation (@c reputation). */
-    AT_APP_EVENT_PEER_REPUTATION = 2
+    AT_APP_EVENT_PEER_REPUTATION = 2,
+    /** A peer's latest round-trip time (@c rtt). A network-latency proximity
+     *  proxy, in milliseconds — NOT a geographic distance. */
+    AT_APP_EVENT_PEER_RTT = 3,
+    /** A peer's shared coarse position (@c position), as an opt-in geohash
+     *  bucket. Empty geohash = the peer shared none (the default). The consumer
+     *  computes geographic distance from its own opted-in bucket. */
+    AT_APP_EVENT_PEER_POSITION = 4
 } at_app_event_kind_t;
 
 /** One observed peer. Mirrors `peer_observed_msg_t` in flat, fixed-width form. */
@@ -118,12 +129,33 @@ typedef struct {
     bool    rated;
 } at_app_reputation_t;
 
+/** One peer's latest round-trip time. Mirrors `peer_rtt_update_msg_t`. */
+typedef struct {
+    uint8_t peer_uuid[AT_APP_UUID_LEN];
+    /** Latest RTT estimate in milliseconds. 0 means unknown / not yet
+     *  measured (net_proc's fast-LAN default) — read it as "unknown", never as
+     *  "0 ms". A network-latency proxy for proximity, not a geographic distance. */
+    int32_t rtt_ms;
+} at_app_rtt_t;
+
+/** One peer's shared coarse position. Mirrors `peer_position_msg_t`. */
+typedef struct {
+    uint8_t peer_uuid[AT_APP_UUID_LEN];
+    /** NUL-terminated geohash bucket the peer opted to share; empty string ""
+     *  means the peer shared none (opted out) — the ordinary, default case.
+     *  Opaque and untrusted; the consumer decodes it to compute distance from
+     *  its own opted-in bucket. */
+    char    geohash[AT_APP_GEOHASH_LEN + 1];
+} at_app_position_t;
+
 /** A decoded app-facing event. */
 typedef struct {
     at_app_event_kind_t kind;
     union {
         at_app_peer_t       peer;
         at_app_reputation_t reputation;
+        at_app_rtt_t        rtt;
+        at_app_position_t   position;
     } data;
 } at_app_event_t;
 
@@ -206,6 +238,20 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
  *       bind, so it is the common one. See @ref at_app_node_ready.
  */
 int at_app_events_request_roster(at_app_events_t *handle, const char *q_out);
+
+/**
+ * @brief Set (or clear) THIS node's own opt-in coarse position.
+ *
+ * Sends the app→AT `AT_APP_SET_POSITION` verb on @p q_out (same queue as the
+ * roster request). @p geohash is the operator's chosen bucket; NULL or "" opts
+ * out (clears it). STRICTLY OPT-IN: until this is called with a non-empty
+ * geohash, the node advertises and answers nothing geographic.
+ *
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound yet,
+ *         -1 on any other failure.
+ */
+int at_app_events_set_position(at_app_events_t *handle, const char *q_out,
+                               const char *geohash);
 
 /** @brief Close the queue and release the handle. NULL-safe. */
 void at_app_events_close(at_app_events_t *handle);
