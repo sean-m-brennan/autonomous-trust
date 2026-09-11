@@ -452,6 +452,7 @@ set(libsrc
     autonomous_trust/identity/id_proc.c
     autonomous_trust/identity/profile.c
     autonomous_trust/identity/connection.c
+    autonomous_trust/identity/dm.c
     autonomous_trust/identity/first_contact.c
     autonomous_trust/identity/peers.c
     autonomous_trust/identity/signature.c
@@ -1077,6 +1078,10 @@ add_executable(connection_test test/connection_test.c)
 set_source_files_properties(test/connection_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(connection_test PRIVATE ${AT_TEST_LIBS})
 
+add_executable(dm_test test/dm_test.c)
+set_source_files_properties(test/dm_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(dm_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(identity_resync_test test/identity_resync_test.c)
 set_source_files_properties(test/identity_resync_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(identity_resync_test PRIVATE ${AT_TEST_LIBS})
@@ -1213,6 +1218,7 @@ add_test(NAME partition_recovery_test COMMAND $<TARGET_FILE:partition_recovery_t
 add_test(NAME late_joiner_caps_resync_test COMMAND $<TARGET_FILE:late_joiner_caps_resync_test>)
 add_test(NAME profile_test COMMAND $<TARGET_FILE:profile_test>)
 add_test(NAME connection_test COMMAND $<TARGET_FILE:connection_test>)
+add_test(NAME dm_test COMMAND $<TARGET_FILE:dm_test>)
 add_test(NAME identity_resync_test COMMAND $<TARGET_FILE:identity_resync_test>)
 add_test(NAME rep_quorum_test COMMAND $<TARGET_FILE:rep_quorum_test>)
 add_test(NAME rep_resp_shape_test COMMAND $<TARGET_FILE:rep_resp_shape_test>)

@@ -132,6 +132,17 @@ int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
                 log_exception(logger);
             return 0;
         }
+        if (fn != NULL && strcmp(fn, AT_APP_SEND_DM) == 0)
+        {
+            /* Direct message (Increment 6): forwarded ONLY to identity, which
+             * sends the directed encrypted peer_dm to the target peer. */
+            generic_msg_t fwd = *msg;
+            snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
+                     "%s", "identity");
+            if (messaging_send("identity", NET_MESSAGE, &fwd, false) != 0)
+                log_exception(logger);
+            return 0;
+        }
         log_warn(logger, "AutonomousTrust: refused extern net_msg '%s'\n",
                  fn == NULL ? "(none)" : fn);
         return -1;

@@ -109,6 +109,12 @@ class IdentityProtocol(Protocol):
     # (not auto-sent on confirm). Encrypted directed, so NOT in UNENCRYPTED_VERBS.
     connection_request = 'peer_connection_request'  # msg.obj <- '' (bare ask)
     connection_response = 'peer_connection_response'  # msg.obj <- json {'decision','sig','seq'}
+    # Direct message (Increment 6): a single one-way peer->peer text message
+    # carrying {text, seq, ts}. crypto_box authenticates the sender, so there is
+    # NO signature (unlike connection accept). NO request/response, NO gossip,
+    # NO roster replay -- delivered on arrival. Encrypted directed, so NOT in
+    # UNENCRYPTED_VERBS. `seq` is a per-sender freshness/replay guard.
+    dm = 'peer_dm'  # msg.obj <- json {'text','seq','ts'}
     # Identity backfill for a node that holds a group member's address (in
     # group.addresses) but never received its full Identity — the cold/late
     # joiner case (e.g. the dod_mission coordinator: group.addresses grows via
