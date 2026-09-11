@@ -1,0 +1,44 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: connection-decline
+byte_pinning: false
+description: |
+    The decline path (Increment 5). Same shape as connection-accept-connects,
+    but bg DECLINES: a peer_connection_response {decision:0, sig, seq}, validly
+    signed. newcomer verifies it and records the edge declined (4). The decision
+    is inside the signed canonical, so a decline cannot be flipped to an accept.
+
+    Step 1: newcomer -> bg peer_connection_request  (bg: edge[newcomer]=pending_in).
+    Step 2: bg -> newcomer peer_connection_response {accept:false, seq:1}
+      - Both runtimes: verify + freshness accept, edge[bg]=declined.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: newcomer
+    to: bg
+    function: peer_connection_request
+    payload: {}
+    description: newcomer asks bg to connect; bg records pending_in.
+  - id: 2
+    from: bg
+    to: newcomer
+    function: peer_connection_response
+    payload:
+      accept: false
+      seq: 1
+    description: bg's signed decline; newcomer records declined under bg's uuid.
+
+expected_state:
+  bg:
+    connection_state:
+      newcomer: 2   # pending_in
+  newcomer:
+    connection_state:
+      bg: 4         # declined

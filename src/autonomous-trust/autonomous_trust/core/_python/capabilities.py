@@ -242,6 +242,61 @@ def profile_verify(verify_key: '_VerifyKey', uuid_bytes: bytes, profile: dict,
         return False
 
 
+# --- explicit connections (with-distance Increment 5) ----------------------- #
+# A connection is an EXPLICIT, revocable, bilateral edge kept SEPARATE from
+# reputation. Edge states (this node's local viewpoint): none=0, pending_out=1,
+# pending_in=2, connected=3, declined=4. Only the RESPONSE is signed — it carries
+# a detached Ed25519 signature over the canonical (requester, accepter, decision,
+# seq) form, so the requester verifies it against the accepter's signing key
+# before acting. MUST stay byte-identical to C at_connection_canonical.
+CONN_NONE = 0
+CONN_PENDING_OUT = 1
+CONN_PENDING_IN = 2
+CONN_CONNECTED = 3
+CONN_DECLINED = 4
+
+
+def connection_canonical(requester_uuid, accepter_uuid, decision: int,
+                         seq: int) -> bytes:
+    """THE cross-language signing contract (see C identity/connection.h):
+      requester_uuid[16] || accepter_uuid[16] || u8(decision) || u64le(seq)
+    where decision = 1 (accept) or 0 (decline). MUST stay byte-identical to C
+    at_connection_canonical."""
+    out = bytearray(_uuid16(requester_uuid))
+    out += _uuid16(accepter_uuid)
+    out += bytes((1 if decision else 0,))
+    out += int(seq).to_bytes(8, 'little')
+    return bytes(out)
+
+
+def connection_sign(signing_key: '_SigningKey', requester_uuid, accepter_uuid,
+                    decision: int, seq: int) -> str:
+    """Detached Ed25519 signature over connection_canonical, lowercase hex."""
+    sig = signing_key.sign(
+        connection_canonical(requester_uuid, accepter_uuid, decision, seq)
+    ).signature
+    return sig.hex()
+
+
+def connection_verify(verify_key: '_VerifyKey', requester_uuid, accepter_uuid,
+                      decision: int, seq: int, sig_hex: str) -> bool:
+    """Verify a detached signature (lowercase hex) over connection_canonical."""
+    try:
+        sig = bytes.fromhex(sig_hex)
+    except (ValueError, TypeError):
+        return False
+    if len(sig) != 64:
+        return False
+    from nacl.exceptions import BadSignatureError
+    try:
+        verify_key.verify(
+            connection_canonical(requester_uuid, accepter_uuid, decision, seq),
+            sig)
+        return True
+    except BadSignatureError:
+        return False
+
+
 class Capability(Configuration):
     """Name and function"""
     _msg_class = capabilities_pb2.Capability

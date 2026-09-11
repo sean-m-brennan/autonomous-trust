@@ -54,6 +54,8 @@ typedef enum {
     PEER_RTT_OBSERVED,       /**< Net-proc → app: one peer's latest RTT (ms). Local IPC only. Reuses @ref peer_rtt_update_msg_t; distinct from @ref PEER_RTT_UPDATE (which stays net-proc → sibling processes). */
     PEER_POSITION_OBSERVED,  /**< Identity → app: one peer's shared coarse position (opt-in geohash, @ref peer_position_msg_t). Local IPC only. */
     PEER_PROFILE_OBSERVED,   /**< Identity → app: one peer's shared agora.profile (opt-in, signature-verified, @ref peer_profile_msg_t). Local IPC only. */
+    PEER_CONNECTION_REQUEST_OBSERVED, /**< Identity → app: an inbound connection ASK from a peer (Increment 5, @ref peer_connection_msg_t). Local IPC only. */
+    PEER_CONNECTION_STATE_OBSERVED,   /**< Identity → app: our connection edge-state toward a peer changed (Increment 5, @ref peer_connection_msg_t). Local IPC only. */
 #ifdef AT_ZTA_ENABLED
     ZTA_REVOCATION_ALERT,    /**< Peer credential revocation notice. */
     ZTA_VERIFICATION_RESULT, /**< Outcome of a deferred ZTA verification. */
@@ -313,6 +315,22 @@ typedef struct {
     char   profile_json[AT_PROFILE_JSON_LEN + 1];
 } peer_profile_msg_t;
 
+/**
+ * @brief AT → app: a connection edge event toward one peer (Increment 5).
+ *
+ * Carries the peer's uuid and this node's local edge state toward it
+ * (@ref at_conn_state_t cast to int): none=0, pending_out=1, pending_in=2,
+ * connected=3, declined=4. Used for BOTH @ref PEER_CONNECTION_REQUEST_OBSERVED
+ * (an inbound ask; @c state is pending_in) and @ref PEER_CONNECTION_STATE_OBSERVED
+ * (any edge transition). A connection is EXPLICIT and separate from reputation.
+ * Local IPC only — the on-wire exchange is the directed peer_connection_request
+ * / signed peer_connection_response, not this message.
+ */
+typedef struct {
+    uuid_t  peer_uuid;
+    int32_t state;   /**< @ref at_conn_state_t cast to int. */
+} peer_connection_msg_t;
+
 #define SIGNAL_LEN 32
 
 typedef struct
@@ -399,6 +417,7 @@ typedef struct
         peer_reputation_msg_t peer_reputation;
         peer_position_msg_t peer_position;
         peer_profile_msg_t peer_profile;
+        peer_connection_msg_t peer_connection;
 #ifdef AT_ZTA_ENABLED
         zta_event_msg_t zta_event;
         zta_standing_msg_t zta_standing;

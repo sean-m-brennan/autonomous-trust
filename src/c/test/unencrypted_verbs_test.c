@@ -84,6 +84,8 @@ static const char *const REFUSED[] = {
     "peer_position_response",
     "peer_profile_query",  /* opt-in signed profile: encrypted directed (Increment 3) */
     "peer_profile_response",
+    "peer_connection_request",  /* explicit connection: encrypted directed (Increment 5) */
+    "peer_connection_response", /* signed accept/decline: encrypted directed (Increment 5) */
     "tier_update",         /* local IPC; never legitimate off the wire */
     "subtree_roster_query",
     "request reputation",

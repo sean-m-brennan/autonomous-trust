@@ -1,0 +1,34 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: connection-request-observed
+byte_pinning: false
+description: |
+    A peer's explicit connection ASK (Increment 5). newcomer sends bg a
+    peer_connection_request; bg's handle_connection_request records the inbound
+    ask as an edge state pending_in (2) toward newcomer. A connection is
+    EXPLICIT and SEPARATE from reputation, and USER-INITIATED — bg emits no wire
+    response (its app decides). Both runtimes must land the same pending_in edge.
+
+    Step 1: newcomer -> bg peer_connection_request.
+      - Both runtimes: handle_connection_request sets edge[newcomer]=pending_in.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: newcomer
+    to: bg
+    function: peer_connection_request
+    payload: {}
+    description: |
+        newcomer asks bg to connect; bg records pending_in toward newcomer.
+
+expected_state:
+  bg:
+    connection_state:
+      newcomer: 2   # pending_in

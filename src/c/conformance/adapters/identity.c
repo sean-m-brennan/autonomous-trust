@@ -44,6 +44,7 @@
 #include "identity/identity.h"
 #include "identity/identity_priv.h"   /* hexlify / public_identity_to_json */
 #include "identity/profile.h"         /* at_profile_* for the profile builder */
+#include "identity/connection.h"      /* at_connection_* for the connection builder */
 #include "identity/id_proc_priv.h"
 #include "utilities/util.h"
 #include "identity/group.h"           /* group_init / group_add_address */
@@ -63,6 +64,7 @@
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/allocation.h"
+#include <math.h>
 #include "contacts/contacts.h"
 #include "identity/first_contact.h"
 
@@ -1404,6 +1406,43 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         return 0;
     }
 
+    /* peer_connection_request — no payload; the handler reads only from_whom
+     * (the requester). The generic path packs an empty body, like caps_query. */
+
+    /* peer_connection_response — pack {decision, sig, seq} (Increment 5). The
+     * signature is computed over the canonical (requester, accepter, decision,
+     * seq) form with the SENDER's (accepter's) key: requester is the recipient
+     * (to_id), accepter is the sender — exactly as the real
+     * handle_app_connect_respond would sign it. A scenario may override `sig`
+     * (bad-signature drop). `accept` (bool) selects the decision; `seq` /
+     * `unstamped` are honored like the profile builder, so replay is exercised
+     * the same way. */
+    if (strcmp(function, "peer_connection_response") == 0 && json_is_object(payload)) {
+        int decision = json_is_true(json_object_get(payload, "accept")) ? 1 : 0;
+        bool unstamped = json_is_true(json_object_get(payload, "unstamped"));
+        int64_t seq = _ic_step_seq(payload, "seq");
+        sce_participant_t *recip = sce_find_participant(ctx, to_id);
+        char sig[AT_CONNECTION_SIG_HEX_LEN + 1] = {0};
+        json_t *jsig = json_object_get(payload, "sig");
+        if (json_is_string(jsig))
+            snprintf(sig, sizeof(sig), "%s", json_string_value(jsig));
+        else if (sender_impl != NULL && sender_impl->full != NULL
+                 && recip != NULL && recip->impl != NULL) {
+            const public_identity_t *rpub = ((ic_impl_t *)recip->impl)->pub;
+            at_connection_sign(sender_impl->full->signature.private,
+                               rpub->uuid, sender_impl->full->uuid,
+                               (uint8_t)decision, (uint64_t)seq, sig);
+        }
+        json_t *body = json_object();
+        json_object_set_new(body, "decision", json_integer(decision));
+        json_object_set_new(body, "sig", json_string(sig));
+        if (!unstamped)
+            json_object_set_new(body, "seq", json_integer((json_int_t)seq));
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+        return 0;
+    }
+
     /* vote_on_peer is the only identity function whose C handler
      * (`handle_count_vote`) requires a structured JSON payload —
      * `{uuid, approved}` keyed off the candidate's uuid. Other
@@ -2493,6 +2532,35 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                         return -1;
                     }
                 }
+            } else if (strcmp(key, "connection_state") == 0) {
+                /* {peer_id: <int>} (Increment 5) — the connection edge state
+                 * this participant holds toward another, via
+                 * identity_get_connection_state: none=0, pending_out=1,
+                 * pending_in=2, connected=3, declined=4. Mirrors the Python
+                 * adapter's connection_state check. */
+                const char *cs_pid;
+                json_t *cs_want;
+                json_object_foreach(val, cs_pid, cs_want) {
+                    sce_participant_t *other = sce_find_participant(ctx, cs_pid);
+                    if (other == NULL) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: connection_state names unknown participant %s",
+                                 pid, cs_pid);
+                        return -1;
+                    }
+                    const public_identity_t *want_id =
+                        ((ic_impl_t *)other->impl)->pub;
+                    char want_uuid[UUID_STR_LEN + 1];
+                    uuid_unparse_lower(want_id->uuid, want_uuid);
+                    int got = identity_get_connection_state(want_uuid);
+                    int want = (int)json_integer_value(cs_want);
+                    if (got != want) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: connection_state[%s]=%d, expected %d",
+                                 pid, cs_pid, got, want);
+                        return -1;
+                    }
+                }
             } else if (strcmp(key, "first_contact_hello_endpoint") == 0) {
                 /* Where trigger_first_contact_initiate addressed its hello.
                  * Pins the resolution ORDER: the invitation's rendezvous hint
@@ -2513,6 +2581,169 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                              pid, impl->fc_hello_endpoint, want);
                     return -1;
                 }
+            } else if (strcmp(key, "contacts") == 0) {
+                /* The durable address book the handshake leaves behind, as
+                 * {participant_id: {field: value} | false}. Read from DISK,
+                 * because the file is the cross-runtime artifact: both
+                 * runtimes write the same contacts.cfg.json, so a scenario
+                 * that passes on both proves they agree on its contents and
+                 * not merely on their own in-memory shape. Mirrors the Python
+                 * adapter's contacts key. */
+                char cdir[CFG_PATH_LEN + 1] = {0};
+                if (get_data_dir(cdir, sizeof(cdir)) <= 0) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: contacts: no data dir", pid);
+                    return -1;
+                }
+                contacts_t cstore;
+                contacts_init(&cstore);
+                (void)contacts_load(cdir, &cstore);
+                const char *cpid;
+                json_t *cwant;
+                int crc = 0;
+                json_object_foreach(val, cpid, cwant) {
+                    sce_participant_t *other = sce_find_participant(ctx, cpid);
+                    if (other == NULL) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: contacts names unknown participant %s",
+                                 pid, cpid);
+                        crc = -1;
+                        break;
+                    }
+                    const public_identity_t *cid =
+                        ((ic_impl_t *)other->impl)->pub;
+                    char cuuid[UUID_STRING_LEN + 1] = {0};
+                    uuid_unparse(cid->uuid, cuuid);
+                    contact_t *have = contacts_get(&cstore, cuuid);
+                    if (!json_is_object(cwant) || json_object_size(cwant) == 0) {
+                        /* `false` (or an empty map): no record expected. */
+                        if (!json_is_object(cwant) && have != NULL) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: recorded a contact for %s, expected "
+                                     "none", pid, cpid);
+                            crc = -1;
+                            break;
+                        }
+                        continue;
+                    }
+                    if (have == NULL) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: no contact recorded for %s", pid, cpid);
+                        crc = -1;
+                        break;
+                    }
+                    const char *field;
+                    json_t *fval;
+                    json_object_foreach(cwant, field, fval) {
+                        if (strcmp(field, "verified") == 0) {
+                            bool want_v = json_is_true(fval);
+                            if (have->verified != want_v) {
+                                snprintf(ctx->err, sizeof(ctx->err),
+                                         "%s: contact[%s].verified=%d, expected "
+                                         "%d", pid, cpid, (int)have->verified,
+                                         (int)want_v);
+                                crc = -1;
+                            }
+                        } else if (strcmp(field, "provenance") == 0) {
+                            const char *want_p = json_string_value(fval);
+                            const char *got_p = at_provenance_str(have->provenance);
+                            if (want_p == NULL || strcmp(got_p, want_p) != 0) {
+                                snprintf(ctx->err, sizeof(ctx->err),
+                                         "%s: contact[%s].provenance=%s, "
+                                         "expected %s", pid, cpid, got_p,
+                                         want_p != NULL ? want_p : "(null)");
+                                crc = -1;
+                            }
+                        } else if (strcmp(field, "petname") == 0) {
+                            const char *want_n = json_string_value(fval);
+                            if (want_n == NULL
+                                || strcmp(have->petname, want_n) != 0) {
+                                snprintf(ctx->err, sizeof(ctx->err),
+                                         "%s: contact[%s].petname=%s, expected "
+                                         "%s", pid, cpid, have->petname,
+                                         want_n != NULL ? want_n : "(null)");
+                                crc = -1;
+                            }
+                        } else if (strcmp(field, "nonce") == 0) {
+                            const char *want_n = json_string_value(fval);
+                            if (want_n == NULL
+                                || strcmp(have->nonce, want_n) != 0) {
+                                snprintf(ctx->err, sizeof(ctx->err),
+                                         "%s: contact[%s].nonce=%s, expected "
+                                         "%s", pid, cpid, have->nonce,
+                                         want_n != NULL ? want_n : "(null)");
+                                crc = -1;
+                            }
+                        } else if (strcmp(field, "trust_seed") == 0) {
+                            double want_s = json_number_value(fval);
+                            if (fabs(have->trust_seed - want_s) > 1e-6) {
+                                snprintf(ctx->err, sizeof(ctx->err),
+                                         "%s: contact[%s].trust_seed=%.6f, "
+                                         "expected %.6f", pid, cpid,
+                                         have->trust_seed, want_s);
+                                crc = -1;
+                            }
+                        } else if (strcmp(field, "rendezvous_count") == 0) {
+                            /* COUNT, not contents: the two harnesses hand
+                             * participants different addresses (Python
+                             * 10.0.0.N, C 10.0.70.N), so the hint the
+                             * handshake just learned is not a value a
+                             * cross-runtime case can name. */
+                            int want_c = (int)json_integer_value(fval);
+                            if ((int)have->rendezvous_count != want_c) {
+                                snprintf(ctx->err, sizeof(ctx->err),
+                                         "%s: contact[%s].rendezvous_count=%d, "
+                                         "expected %d", pid, cpid,
+                                         (int)have->rendezvous_count, want_c);
+                                crc = -1;
+                            }
+                        } else if (strcmp(field, "rendezvous_tail") == 0) {
+                            /* Everything after the newest hint: fixture
+                             * values, so nameable. Pins that a refresh
+                             * PREPENDS rather than replaces. */
+                            size_t want_n = json_array_size(fval);
+                            size_t have_n = have->rendezvous_count > 0
+                                            ? have->rendezvous_count - 1 : 0;
+                            if (have_n != want_n) {
+                                snprintf(ctx->err, sizeof(ctx->err),
+                                         "%s: contact[%s].rendezvous_tail has "
+                                         "%d entries, expected %d", pid, cpid,
+                                         (int)have_n, (int)want_n);
+                                crc = -1;
+                            } else {
+                                for (size_t i = 0; i < want_n; i++) {
+                                    const char *want_h = json_string_value(
+                                        json_array_get(fval, i));
+                                    const char *got_h = have->rendezvous[i + 1];
+                                    if (want_h == NULL || got_h == NULL
+                                        || strcmp(got_h, want_h) != 0) {
+                                        snprintf(ctx->err, sizeof(ctx->err),
+                                                 "%s: contact[%s]."
+                                                 "rendezvous_tail[%d]=%s, "
+                                                 "expected %s", pid, cpid,
+                                                 (int)i,
+                                                 got_h != NULL ? got_h : "(null)",
+                                                 want_h != NULL ? want_h : "(null)");
+                                        crc = -1;
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: unsupported contacts field %s",
+                                     pid, field);
+                            crc = -1;
+                        }
+                        if (crc != 0)
+                            break;
+                    }
+                    if (crc != 0)
+                        break;
+                }
+                contacts_free(&cstore);
+                if (crc != 0)
+                    return -1;
             } else if (strcmp(key, "first_contact_acks_emitted") == 0) {
                 /* How many first_contact_hello_ack messages this participant
                  * emitted over the whole scenario. The observable for the
@@ -3191,6 +3422,82 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
     return 0;
 }
 
+/* Pre-seed the durable address book from `fixtures.contacts`, the C twin of
+ * the Python adapter's _install_contacts.
+ *
+ * Shape is {participant_id: {verified, petname, provenance, rendezvous,
+ * trust_seed, nonce}}, and the record is built from THAT participant's own
+ * public identity -- a fixture cannot pin keys it does not generate. One store
+ * per scenario (the scenario gets one redirected data root), which is all the
+ * re-handshake cases need: they assert what a SECOND handshake does to a
+ * record that already exists.
+ *
+ * Both runtimes must write the same canonical file, or the preserve rule would
+ * be tested against two different starting states. */
+static void _install_contacts(sce_run_ctx_t *ctx)
+{
+    json_t *fx = json_object_get(ctx->case_data, "fixtures");
+    json_t *fixture = json_is_object(fx) ? json_object_get(fx, "contacts") : NULL;
+    if (!json_is_object(fixture) || json_object_size(fixture) == 0)
+        return;
+    char data_dir[CFG_PATH_LEN + 1] = {0};
+    if (get_data_dir(data_dir, sizeof(data_dir)) <= 0)
+        return;
+
+    contacts_t store;
+    contacts_init(&store);
+    const char *pid;
+    json_t *spec;
+    json_object_foreach(fixture, pid, spec) {
+        sce_participant_t *part = sce_find_participant(ctx, pid);
+        if (part == NULL)
+            continue;
+        const public_identity_t *pub = ((ic_impl_t *)part->impl)->pub;
+        contact_t c;
+        memset(&c, 0, sizeof(c));
+        c.identity = *pub;          /* borrowed; contacts_add deep-copies */
+        const char *petname = json_string_value(json_object_get(spec, "petname"));
+        at_strlcpy(c.petname, petname != NULL ? petname : pub->petname,
+                   sizeof(c.petname));
+        const char *prov = json_string_value(json_object_get(spec, "provenance"));
+        c.provenance = AT_PROV_TOKEN;
+        if (prov != NULL && strcmp(prov, "in_person") == 0)
+            c.provenance = AT_PROV_IN_PERSON;
+        else if (prov != NULL && strcmp(prov, "directory") == 0)
+            c.provenance = AT_PROV_DIRECTORY;
+        const char *nonce = json_string_value(json_object_get(spec, "nonce"));
+        if (nonce != NULL)
+            at_strlcpy(c.nonce, nonce, sizeof(c.nonce));
+        c.added_at = (double)time(NULL);
+        json_t *rv = json_object_get(spec, "rendezvous");
+        if (json_is_array(rv) && json_array_size(rv) > 0) {
+            size_t cnt = json_array_size(rv);
+            c.rendezvous = calloc(cnt, sizeof(char *));
+            if (c.rendezvous != NULL) {
+                for (size_t i = 0; i < cnt; i++) {
+                    const char *hint =
+                        json_string_value(json_array_get(rv, i));
+                    if (hint != NULL)
+                        c.rendezvous[c.rendezvous_count++] = strdup(hint);
+                }
+            }
+        }
+        if (json_is_true(json_object_get(spec, "verified"))) {
+            json_t *seed = json_object_get(spec, "trust_seed");
+            contact_mark_verified(&c, json_is_number(seed)
+                                      ? json_number_value(seed)
+                                      : AT_FIRST_CONTACT_VERIFIED_SEED);
+        }
+        (void)contacts_add(&store, &c);
+        /* Only the hint list is ours; the identity is borrowed above. */
+        for (size_t i = 0; i < c.rendezvous_count; i++)
+            free(c.rendezvous[i]);
+        free(c.rendezvous);
+    }
+    (void)contacts_save(&store, data_dir);
+    contacts_free(&store);
+}
+
 void at_identity_run(const at_case_t *c, at_case_result_t *out) {
     if (strcmp(c->kind, "negative") == 0) {
         at_neg_run_wire(c, out);
@@ -3277,6 +3584,7 @@ void at_identity_run(const at_case_t *c, at_case_result_t *out) {
             setenv("AUTONOMOUS_TRUST_ROOT", fc_root, 1);
     }
 
+
     /* Build participants. */
     json_t *parts = json_object_get(c->data, "participants");
     if (!json_is_array(parts)) {
@@ -3308,6 +3616,7 @@ void at_identity_run(const at_case_t *c, at_case_result_t *out) {
     }
 
     _apply_fixtures(&ctx);
+    _install_contacts(&ctx);
 
     g_active_ctx = &ctx;
     messaging_set_test_hook(_send_hook);

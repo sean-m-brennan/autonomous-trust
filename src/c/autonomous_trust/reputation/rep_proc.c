@@ -38,6 +38,7 @@
 #include "zta/zta_policy.h"
 #include "config/configuration.h"   /* get_cfg_dir, CFG_PATH_LEN */
 #include "config/discover.h"        /* CFG_FILE_EXT */
+#include "contacts/contacts.h"     /* the first-contact address book (trust seeds) */
 #include "reputation/rep_proc_priv.h"
 #include "prequential/scoring.h"   /* at_preq_weight_round, the rounding rule both runtimes share */
 
@@ -5596,6 +5597,71 @@ static void _grade_restored_reputations(const process_t *proc, map_t *ceilings,
                  "evidence supports\n", clamped);
 }
 
+/* mtime of contacts.cfg.json as of the last seed pass. The identity process
+ * rewrites that file on every handshake and every verification, so its mtime is
+ * the cheap "anything new?" test that makes a per-iteration call affordable.
+ * 0 == not yet read. */
+static double contact_seed_mtime;
+
+/* Give each VERIFIED first-contact contact its cold-start reputation prior.
+ *
+ * The C twin of Python _apply_contact_seeds (FIRST_CONTACT_PLAN.md §10.5), and
+ * it reads the same file: contacts.cfg.json is already shared byte-for-byte
+ * between the runtimes, which is why the seed travels through the store rather
+ * than through a new identity->reputation message.
+ *
+ * The seed is a PRIOR, not a score. It is written only where this node has NO
+ * reputation for the peer at all, so it can never overwrite an earned value, a
+ * warm-started one, or a slashed one -- a contact cannot be verified back into
+ * good standing. Both halves of the record are checked (verified AND a seed
+ * above zero): the file is plain JSON in the user's data dir, so honouring a
+ * hand-written trust_seed on an unverified record would make one editable float
+ * into a reputation prior. */
+static void _apply_contact_seeds(const process_t *proc)
+{
+    char data_dir[CFG_PATH_LEN + 1] = {0};
+    if (get_data_dir(data_dir, sizeof(data_dir)) <= 0)
+        return;
+    char path[CFG_PATH_LEN + 64] = {0};
+    if ((size_t)snprintf(path, sizeof(path), "%s/%s", data_dir,
+                         AT_CONTACTS_FILENAME) >= sizeof(path))
+        return;
+
+    struct stat st;
+    if (stat(path, &st) != 0)
+        return;         /* no contacts file at all: the norm for most nodes */
+    double mtime = (double)st.st_mtime;
+    if (mtime <= contact_seed_mtime)
+        return;         /* nothing written since the last pass */
+    contact_seed_mtime = mtime;
+
+    contacts_t store;
+    contacts_init(&store);
+    if (contacts_load(data_dir, &store) != 0) {
+        log_warn(proc->logger,
+                 "Reputation: contacts store unreadable; no trust seeds "
+                 "applied this pass\n");
+        contacts_free(&store);
+        return;
+    }
+    size_t total = contacts_count(&store);
+    for (size_t i = 0; i < total; i++) {
+        const contact_t *c = &store.items[i];
+        if (!c->verified || c->trust_seed <= 0.0)
+            continue;
+        if (reputations_contains(&rep_state.reputations, c->identity.uuid))
+            continue;   /* already known here; earned beats seeded */
+        reputations_update(&rep_state.reputations, c->identity.uuid,
+                           c->trust_seed);
+        char uuid_s[UUID_STRING_LEN + 1] = {0};
+        uuid_unparse_lower(c->identity.uuid, uuid_s);
+        log_info(proc->logger,
+                 "Reputation: first contact: seeded verified contact %s at "
+                 "%.2f\n", uuid_s, c->trust_seed);
+    }
+    contacts_free(&store);
+}
+
 /* Treat the persisted snapshot's mtime as the instant of our last AT-bounded
  * activity: seed every warm-started peer's idle clock to it and apply the
  * offline-gap decay up front, so a long-dormant cohort comes up with faded —
@@ -6873,6 +6939,9 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
      * clamp every score the evidence does not bear out. See doc/architecture/reputation.md and
      * doc/architecture/reputation.md. */
     _load_reputations(proc);
+    /* First-contact trust seeds, after the snapshot so a persisted value always
+     * wins, and before the idle fade so a seed ages like any other prior. */
+    _apply_contact_seeds(proc);
     _seed_idle_from_snapshot(proc, have_self ? self_str : NULL);
     _rebuild_from_evidence(proc, have_self ? self_str : NULL);
     /* Slash replay marks, before the loop can handle a slash_final. Also
@@ -6891,6 +6960,10 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
          * answers is the ordinary case, not an error, and this is the only
          * thing that clears it. Mirrors Python's call in process(). */
         _prune_resolve_state(proc);
+        /* A contact verified since boot gets its seed here; guarded by the
+         * contacts file's mtime, so the usual pass is one stat() and nothing
+         * else. Mirrors Python's call in process(). */
+        _apply_contact_seeds(proc);
         _decay_reputations(proc, present);
         if (!have_self)
         {
