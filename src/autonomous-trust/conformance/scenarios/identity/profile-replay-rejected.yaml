@@ -1,0 +1,62 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: profile-replay-rejected
+byte_pinning: false
+description: |
+    Freshness on the signed profile response (Increment 3). A
+    peer_profile_response carries a freshness `seq`; a captured response
+    replayed with a stale (non-increasing) seq must be REFUSED, not stored —
+    otherwise an eavesdropper could pin a peer to an old profile. Both replayed
+    values below are correctly SIGNED (the adapter signs each with bg's key), so
+    the refusal is attributable to the freshness gate alone, never to a bad
+    signature or an over-bound field.
+
+    Step 1: bg -> newcomer peer_profile_response {profile:First, seq: 2}.
+      - Both runtimes: accepted (first stamp), stored under bg's uuid.
+    Step 2: bg -> newcomer peer_profile_response {profile:Spoofed, seq: 1}.
+      - Both runtimes: seq 1 is not above the mark (2), so the freshness gate
+        refuses it; the stored profile stays First and the per-verb refusal
+        tally ticks once.
+
+    Assertions: newcomer.peer_profile[bg] is still the FIRST profile (the replay
+    did not overwrite it), and freshness_refusals[peer_profile_response]=1.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_profile_response
+    payload:
+      profile:
+        display_name: First
+        handle: bg_node
+      seq: 2
+    description: bg's genuine profile; newcomer records it.
+  - id: 2
+    from: bg
+    to: newcomer
+    function: peer_profile_response
+    payload:
+      profile:
+        display_name: Spoofed
+        handle: bg_node
+      seq: 1
+    description: |
+        A replayed/stale response (seq below the mark), validly signed. Refused
+        by freshness; the stored profile must not change to the spoofed value.
+
+expected_state:
+  newcomer:
+    peer_profile:
+      bg:
+        display_name: First
+        handle: bg_node
+    freshness_refusals:
+      peer_profile_response: 1

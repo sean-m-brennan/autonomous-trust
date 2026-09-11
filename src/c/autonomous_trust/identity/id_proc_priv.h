@@ -103,6 +103,18 @@ void identity_set_own_geohash(const char *geohash);
  *  via the `peer_position` expected_state key. */
 bool identity_get_peer_position(const char *uuid_str, char *buf, size_t buflen);
 
+/** Set (or clear) THIS node's opt-in agora.profile (Increment 3) in the
+ *  singleton id_state, from a JSON object string of profile fields. NULL/""/an
+ *  empty object opts out (the default). The harness analog of the app's
+ *  set-profile IPC verb; conformance installs it from `fixtures.profiles`. */
+void identity_set_own_profile(const char *profile_json);
+
+/** Copy the compact profile JSON recorded for peer @p uuid_str (lowercased uuid
+ *  string) into @p buf, always NUL-terminated. Returns true iff a (verified)
+ *  profile is stored. The map is filled by handle_profile_response; conformance
+ *  asserts via the `peer_profile` expected_state key. */
+bool identity_get_peer_profile(const char *uuid_str, char *buf, size_t buflen);
+
 /** Copy the size-bounded capability descriptor recorded for @p cap_name (from
  *  the descriptor form of `peer_caps_response`) into @p buf as a JSON string
  *  ({required_tier, description, kind, arg_schema}; name excluded). Returns 0

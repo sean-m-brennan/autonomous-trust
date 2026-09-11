@@ -1,0 +1,75 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: profile-shared-on-request
+byte_pinning: false
+description: |
+    Opt-in signed agora.profile, the happy path (Increment 3). bg has opted in
+    — fixtures.profiles sets its own_profile — so when newcomer asks, bg answers
+    with a peer_profile_response carrying {profile, sig, seq}: the profile fields
+    plus a detached Ed25519 signature over the canonical (bg uuid + profile)
+    form, signed with bg's own identity key. newcomer validates the field bounds,
+    verifies the signature against bg's signing key, and records the profile.
+    STRICTLY OPT-IN: a profile crosses ONLY because bg chose to share one.
+
+    This is also the definitive CROSS-LANGUAGE signature-interop check: run with
+    a Python bg and a C newcomer (and vice versa), a signature produced by one
+    runtime's canonical serialization must verify under the other's.
+
+    Step 1: newcomer -> bg peer_profile_query.
+      - Both runtimes: handle_profile_query sees a non-empty own_profile and
+        emits ONE signed peer_profile_response (bg.profile_responses_emitted=1,
+        which makes the opt-in guard non-vacuous vs profile-absent-is-normal).
+    Step 2: bg -> newcomer peer_profile_response {profile, sig, seq}.
+      - Both runtimes: handle_profile_response bound-validates the fields,
+        verifies the signature, accepts the freshness seq, and stores it under
+        bg's uuid (Python self.peer_profiles; C id_state.peer_profile_map — read
+        symmetrically via get_peer_profile / identity_get_peer_profile).
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  profiles:
+    bg:
+      display_name: Border Guard
+      handle: bg_node
+      bio: keeps the gate
+
+steps:
+  - id: 1
+    from: newcomer
+    to: bg
+    function: peer_profile_query
+    payload: {}
+    description: |
+        newcomer asks bg for its profile. bg is opted in, so its
+        handle_profile_query emits a signed peer_profile_response back.
+  - id: 2
+    from: bg
+    to: newcomer
+    function: peer_profile_response
+    payload:
+      profile:
+        display_name: Border Guard
+        handle: bg_node
+        bio: keeps the gate
+      seq: 1
+    description: |
+        bg's signed answer delivered to newcomer. The adapter signs (bg uuid +
+        profile) with bg's key, exactly as the real handler would.
+        handle_profile_response verifies it and records the profile under bg's
+        uuid in newcomer's view.
+
+expected_state:
+  bg:
+    profile_responses_emitted: 1
+  newcomer:
+    peer_profile:
+      bg:
+        display_name: Border Guard
+        handle: bg_node
+        bio: keeps the gate
