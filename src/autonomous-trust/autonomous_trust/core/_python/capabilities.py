@@ -67,6 +67,181 @@ def sanitize_descriptor(descriptor: dict) -> dict:
     return clean
 
 
+# --- agora.profile (with-distance Increment 3) ------------------------------ #
+# A profile is a small set of OPTIONAL, operator-set fields a node shares with
+# admitted peers on request, over the signed peer_profile_query/response
+# exchange (idprocess.py). Bounds are in BYTES (not codepoints) so the receiver's
+# bound-check unit matches the signer's clamp unit across the Python and C
+# runtimes. MUST stay in lockstep with C identity/profile.h (AT_PROFILE_MAX_*)
+# and the app-boundary caps in app_events.h.
+import re as _re
+from nacl.signing import SigningKey as _SigningKey, VerifyKey as _VerifyKey
+
+PROFILE_MAX_DISPLAY_NAME = 64
+PROFILE_MAX_HANDLE = 32
+PROFILE_MAX_BIO = 256
+PROFILE_MAX_AVATAR_REF = 128
+PROFILE_MAX_LINK = 128
+PROFILE_MAX_LINKS = 4
+_PROFILE_HANDLE_RE = _re.compile(r'^[A-Za-z0-9_.\-]*$')
+# Fixed field order — load-bearing for the canonical signing bytes below.
+_PROFILE_STR_FIELDS = (
+    ('display_name', PROFILE_MAX_DISPLAY_NAME),
+    ('handle', PROFILE_MAX_HANDLE),
+    ('bio', PROFILE_MAX_BIO),
+    ('avatar_ref', PROFILE_MAX_AVATAR_REF),
+)
+
+
+def _clamp_bytes(s: str, bound: int) -> str:
+    """Truncate `s` to at most `bound` UTF-8 bytes without splitting a char."""
+    b = s.encode('utf-8')
+    if len(b) <= bound:
+        return s
+    return b[:bound].decode('utf-8', 'ignore')
+
+
+def _has_control(s: str) -> bool:
+    """ASCII control chars (< 0x20) are forbidden in profile fields — unbounded,
+    their JSON escaping would inflate the fixed app-boundary buffer. Mirrors C
+    has_control_chars in identity/profile.c."""
+    return any(ord(c) < 0x20 for c in s)
+
+
+def sanitize_profile(profile: dict) -> dict:
+    """Clamp an operator-set profile to the byte bounds above (SIGNER side).
+
+    Returns a new dict with only the recognized, non-empty fields, each
+    truncated (UTF-8-safe) to its bound; a `handle` with any char outside
+    [A-Za-z0-9_.-] is dropped; `links` is capped to PROFILE_MAX_LINKS entries
+    each clamped to PROFILE_MAX_LINK bytes. Mirrors C at_profile_from_json
+    (validate=false).
+    """
+    clean: dict = {}
+    if not isinstance(profile, dict):
+        return clean
+    for key, bound in _PROFILE_STR_FIELDS:
+        v = profile.get(key)
+        if isinstance(v, str) and v:
+            v = _clamp_bytes(v, bound)
+            if _has_control(v):
+                continue  # drop a field with control chars, keep the rest
+            if key == 'handle' and not _PROFILE_HANDLE_RE.match(v):
+                continue  # drop a bad-charset handle, keep the rest
+            if v:
+                clean[key] = v
+    links = profile.get('links')
+    if isinstance(links, list) and links:
+        out = []
+        for item in links:
+            if len(out) >= PROFILE_MAX_LINKS:
+                break
+            if isinstance(item, str) and item:
+                clamped = _clamp_bytes(item, PROFILE_MAX_LINK)
+                if not _has_control(clamped):
+                    out.append(clamped)
+        if out:
+            clean['links'] = out
+    return clean
+
+
+def profile_valid_bounded(profile: dict) -> bool:
+    """True iff every present field is within its byte bound, `handle` is
+    charset-clean, and links count/length are within bounds (RECEIVE side —
+    a misbehaving peer's over-bound profile is rejected, like an invalid
+    geohash). Mirrors C at_profile_from_json (validate=true) acceptance.
+    """
+    if not isinstance(profile, dict):
+        return False
+    for key, bound in _PROFILE_STR_FIELDS:
+        v = profile.get(key)
+        if v is None:
+            continue
+        if not isinstance(v, str) or len(v.encode('utf-8')) > bound:
+            return False
+        if _has_control(v):
+            return False
+        if key == 'handle' and v and not _PROFILE_HANDLE_RE.match(v):
+            return False
+    links = profile.get('links')
+    if links is not None:
+        if not isinstance(links, list) or len(links) > PROFILE_MAX_LINKS:
+            return False
+        for item in links:
+            if not isinstance(item, str) or len(item.encode('utf-8')) > PROFILE_MAX_LINK:
+                return False
+            if _has_control(item):
+                return False
+    return True
+
+
+import uuid as _uuidmod
+
+
+def _uuid16(u) -> bytes:
+    """Normalize a uuid (str / uuid.UUID / 16 raw bytes) to the same 16-byte
+    form C signs over (uuid_t). Identity.uuid is a STRING in this runtime, so
+    callers pass it directly and this converts to UUID(...).bytes — byte-for-byte
+    identical to libuuid's uuid_t and to a raw-bytes vector."""
+    if isinstance(u, (bytes, bytearray)):
+        return bytes(u[:16])
+    if isinstance(u, _uuidmod.UUID):
+        return u.bytes
+    return _uuidmod.UUID(str(u)).bytes
+
+
+def _u32le(n: int) -> bytes:
+    return int(n).to_bytes(4, 'little')
+
+
+def _canon_field(s) -> bytes:
+    b = s.encode('utf-8') if isinstance(s, str) else b''
+    return _u32le(len(b)) + b
+
+
+def profile_canonical(uuid_bytes: bytes, profile: dict) -> bytes:
+    """THE cross-language signing contract (see C identity/profile.h):
+      signer_uuid[16] || field(display_name) || field(handle) || field(bio)
+      || field(avatar_ref) || u32le(num_links) || field(link)*
+    where field(s) = u32le(byte_len) || utf8_bytes. Absent field => len 0.
+    Built from the profile's values AS-IS so a receiver reproduces the signer's
+    bytes exactly. MUST stay byte-identical to C at_profile_canonical.
+    """
+    out = bytearray(_uuid16(uuid_bytes))
+    for key, _bound in _PROFILE_STR_FIELDS:
+        out += _canon_field(profile.get(key, ''))
+    links = profile.get('links') or []
+    if not isinstance(links, list):
+        links = []
+    out += _u32le(len(links))
+    for item in links:
+        out += _canon_field(item)
+    return bytes(out)
+
+
+def profile_sign(signing_key: '_SigningKey', uuid_bytes: bytes, profile: dict) -> str:
+    """Detached Ed25519 signature over profile_canonical, lowercase hex."""
+    sig = signing_key.sign(profile_canonical(uuid_bytes, profile)).signature
+    return sig.hex()
+
+
+def profile_verify(verify_key: '_VerifyKey', uuid_bytes: bytes, profile: dict,
+                   sig_hex: str) -> bool:
+    """Verify a detached signature (lowercase hex) over profile_canonical."""
+    try:
+        sig = bytes.fromhex(sig_hex)
+    except (ValueError, TypeError):
+        return False
+    if len(sig) != 64:
+        return False
+    from nacl.exceptions import BadSignatureError
+    try:
+        verify_key.verify(profile_canonical(uuid_bytes, profile), sig)
+        return True
+    except BadSignatureError:
+        return False
+
+
 class Capability(Configuration):
     """Name and function"""
     _msg_class = capabilities_pb2.Capability

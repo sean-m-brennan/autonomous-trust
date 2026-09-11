@@ -43,6 +43,7 @@
 
 #include "identity/identity.h"
 #include "identity/identity_priv.h"   /* hexlify / public_identity_to_json */
+#include "identity/profile.h"         /* at_profile_* for the profile builder */
 #include "identity/id_proc_priv.h"
 #include "utilities/util.h"
 #include "identity/group.h"           /* group_init / group_add_address */
@@ -859,6 +860,26 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
         }
     }
 
+    /* profiles: { "<participant>": {<profile fields>}, ... } (Increment 3) —
+     * install each named participant's opt-in agora.profile via
+     * identity_set_own_profile so its handle_profile_query answers, signed.
+     * Same singleton semantics as positions above. Mirrors the Python adapter
+     * reading fixtures.profiles into process.own_profile. */
+    json_t *profiles = json_object_get(fixtures, "profiles");
+    if (json_is_object(profiles))
+    {
+        const char *fpid;
+        json_t *fval;
+        json_object_foreach(profiles, fpid, fval) {
+            sce_participant_t *part = sce_find_participant(ctx, fpid);
+            if (part == NULL) continue;
+            ic_impl_t *impl = (ic_impl_t *)part->impl;
+            if (impl == NULL || impl->proc == NULL) continue;
+            char *pj = json_dumps(fval, JSON_COMPACT);
+            if (pj != NULL) { identity_set_own_profile(pj); free(pj); }
+        }
+    }
+
     /* admission_quorum: { "<participant>": <int>, ... } — two-phase admission
      * (doc/architecture/identity-protocol.md). A member withholds the group key until this many
      * DISTINCT border-guards confirm. Default 1 (no fixture). Mirrors the
@@ -1346,6 +1367,37 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_object_set_new(body, "pos",
                             json_string(json_is_string(jpos)
                                         ? json_string_value(jpos) : ""));
+        _ic_set_seq(body, payload);
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+        return 0;
+    }
+
+    /* peer_profile_response — pack {profile, sig, seq} (Increment 3). The
+     * `profile` object comes from the scenario; the signature is computed over
+     * the SENDER's canonical form (sender uuid + profile) with the sender's own
+     * key, exactly as the real handle_profile_query would — so a C receiver
+     * verifies a signature this adapter produced, and cross-runtime a Python
+     * receiver does too. A scenario may override `sig` with an explicit string
+     * to exercise the bad-signature drop. `seq` honors `unstamped` via
+     * _ic_set_seq, like the position/caps builders. */
+    if (strcmp(function, "peer_profile_response") == 0 && json_is_object(payload)) {
+        json_t *jprof = json_object_get(payload, "profile");
+        at_profile_t pp;
+        memset(&pp, 0, sizeof(pp));
+        if (json_is_object(jprof))
+            at_profile_from_json(jprof, false, &pp);
+        char sig[AT_PROFILE_SIG_HEX_LEN + 1] = {0};
+        json_t *jsig = json_object_get(payload, "sig");
+        if (json_is_string(jsig))
+            snprintf(sig, sizeof(sig), "%s", json_string_value(jsig));
+        else if (sender_impl != NULL && sender_impl->full != NULL)
+            at_profile_sign(sender_impl->full->signature.private,
+                            sender_impl->full->uuid, &pp, sig);
+        json_t *body = json_object();
+        json_t *pj = at_profile_to_json(&pp);
+        json_object_set_new(body, "profile", pj != NULL ? pj : json_object());
+        json_object_set_new(body, "sig", json_string(sig));
         _ic_set_seq(body, payload);
         net_msg_pack_json(&out->info.net_msg, body);
         json_decref(body);
@@ -2402,6 +2454,45 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                         return -1;
                     }
                 }
+            } else if (strcmp(key, "peer_profile") == 0) {
+                /* {peer_id: {profile fields}} (Increment 3) — the profile this
+                 * participant recorded for another (via identity_get_peer_profile,
+                 * a compact JSON object), compared structurally. An empty object
+                 * {} means none recorded (opted out, or dropped on bad signature /
+                 * over-bound field / replay). Mirrors the Python adapter's
+                 * peer_profile check. */
+                const char *fp_pid;
+                json_t *fp_want;
+                json_object_foreach(val, fp_pid, fp_want) {
+                    sce_participant_t *other = sce_find_participant(ctx, fp_pid);
+                    if (other == NULL) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: peer_profile names unknown participant %s",
+                                 pid, fp_pid);
+                        return -1;
+                    }
+                    const public_identity_t *want_id =
+                        ((ic_impl_t *)other->impl)->pub;
+                    char want_uuid[UUID_STR_LEN + 1];
+                    uuid_unparse_lower(want_id->uuid, want_uuid);
+                    char got[AT_PROFILE_JSON_MAX + 1];
+                    identity_get_peer_profile(want_uuid, got, sizeof(got));
+                    json_t *got_obj = (got[0] != '\0')
+                        ? json_loads(got, 0, NULL) : json_object();
+                    if (got_obj == NULL) got_obj = json_object();
+                    bool eq = json_is_object(fp_want)
+                        ? json_equal(got_obj, fp_want)
+                        : (json_object_size(got_obj) == 0);
+                    json_decref(got_obj);
+                    if (!eq) {
+                        char *want_str = json_dumps(fp_want, JSON_COMPACT);
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: peer_profile[%s]=%.120s, expected %.120s",
+                                 pid, fp_pid, got, want_str ? want_str : "?");
+                        free(want_str);
+                        return -1;
+                    }
+                }
             } else if (strcmp(key, "first_contact_hello_endpoint") == 0) {
                 /* Where trigger_first_contact_initiate addressed its hello.
                  * Pins the resolution ORDER: the invitation's rendezvous hint
@@ -2759,6 +2850,25 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                 if (got != want) {
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: position_responses_emitted=%d, expected %d",
+                             pid, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "profile_responses_emitted") == 0) {
+                /* peer_profile_response emissions by this participant (Increment
+                 * 3) — the opt-in guard's observable, same shape as
+                 * position_responses_emitted: 0 when opted out, 1 per answered
+                 * query when opted in. Mirrors the Python emit_tally check. */
+                int want = (int)json_integer_value(val);
+                int got = 0;
+                for (size_t i = 0; i < ctx->captured_count; i++) {
+                    if (strcmp(ctx->captured[i].from, pid) == 0
+                        && strcmp(ctx->captured[i].function,
+                                  "peer_profile_response") == 0)
+                        got++;
+                }
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: profile_responses_emitted=%d, expected %d",
                              pid, got, want);
                     return -1;
                 }

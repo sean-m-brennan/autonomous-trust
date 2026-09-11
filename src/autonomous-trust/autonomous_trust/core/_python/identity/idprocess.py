@@ -383,6 +383,23 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         _own_geo = os.environ.get('AT_OWN_GEOHASH', '')
         self.own_geohash = _own_geo if self._geohash_valid(_own_geo) else ''
         self.peer_positions: dict = {}
+        # Opt-in agora.profile (Increment 3): own_profile is THIS node's shared,
+        # signed profile fields; empty = opted OUT (the default). Seeded from
+        # $AT_OWN_PROFILE (a JSON object) for headless/conformance parity with C
+        # _ensure_id_init; the app IPC set-path is C-only. peer_profiles maps a
+        # peer uuid string -> its shared (verified) profile dict, filled by
+        # handle_profile_response.
+        self.own_profile: dict = {}
+        _own_prof_raw = os.environ.get('AT_OWN_PROFILE', '')
+        if _own_prof_raw:
+            try:
+                from ..capabilities import sanitize_profile
+                parsed = from_json_string(_own_prof_raw)
+                if isinstance(parsed, dict):
+                    self.own_profile = sanitize_profile(parsed)
+            except Exception:  # noqa: BLE001 — bad env seed => opted out
+                self.own_profile = {}
+        self.peer_profiles: dict = {}
         self.protocol.register_handler(IdentityProtocol.announce, self.welcoming_committee)
         self.protocol.register_handler(IdentityProtocol.accept, self.handle_acceptance)
         self.protocol.register_handler(IdentityProtocol.history, self.receive_history)
@@ -395,6 +412,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.caps_response, self.handle_caps_response)
         self.protocol.register_handler(IdentityProtocol.position_query, self.handle_position_query)
         self.protocol.register_handler(IdentityProtocol.position_response, self.handle_position_response)
+        self.protocol.register_handler(IdentityProtocol.profile_query, self.handle_profile_query)
+        self.protocol.register_handler(IdentityProtocol.profile_response, self.handle_profile_response)
         self.protocol.register_handler(IdentityProtocol.id_query, self.handle_identity_query)
         self.protocol.register_handler(IdentityProtocol.id_response, self.handle_identity_response)
         self.protocol.register_handler(IdentityProtocol.roster_req, self.handle_roster_request)
@@ -3222,6 +3241,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             # still picked up. Mirrors the C _send_position_query in
             # handle_confirm_peer.
             self._send_position_query(queues, peer)
+            # Opt-in profile (Increment 3): same pattern — ask every confirmed
+            # peer for its agora.profile; an opted-out peer answers nothing.
+            self._send_profile_query(queues, peer)
             # Two-phase admission (doc/architecture/identity-protocol.md). Count DISTINCT confirmers for this
             # peer; propagate the group key only once the quorum is met.
             #   - quorum 1 (default): first confirm promotes immediately —
@@ -3598,6 +3620,116 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         with self.lock:
             return self.peer_positions.get(str(uuid_str), '')
 
+    # ------------------------------------------------------------------
+    # Opt-in agora.profile (Increment 3): SIGNED directed exchange.
+    #
+    # Twin of the C block in id_proc.c (handle_profile_query/_response,
+    # _send_profile_query). Same directed shape as the position exchange, plus a
+    # detached Ed25519 SIGNATURE over a canonical serialization of the profile
+    # (capabilities.profile_canonical) so a profile is self-verifying beyond the
+    # transport. STRICTLY OPT-IN: ``own_profile`` empty (the default) answers
+    # nothing. On receive the fields are bound-validated (an over-bound field is
+    # dropped, like an invalid geohash) and the signature verified against the
+    # SENDER's signing key before storing. As with position, the app-facing
+    # surface is C-only; a Python node maintains peer_profiles (the conformance
+    # surface, get_peer_profile) and sets its own via $AT_OWN_PROFILE.
+    # ------------------------------------------------------------------
+
+    def _send_profile_query(self, queues, peer):
+        """Ask `peer` directly for its agora.profile (mirrors
+        ``_send_position_query`` and C ``_send_profile_query``)."""
+        try:
+            message = Message(self.name, IdentityProtocol.profile_query,
+                              '', to_whom=peer)
+            queues[CfgIds.network].put(message, block=True,
+                                       timeout=self.q_cadence)
+        except Full:
+            self.logger.error('_send_profile_query: Network queue full')
+
+    def handle_profile_query(self, queues, message):
+        """Respond to a peer's profile_query with our own profile — but ONLY if
+        the operator opted in. Empty ``own_profile`` (the default) answers
+        nothing. The reply carries {profile, sig, seq}: the signature is computed
+        fresh from our identity key over the canonical profile form."""
+        if message.function != IdentityProtocol.profile_query:
+            return False
+        sender = getattr(message, 'from_whom', None)
+        if sender is None:
+            return True
+        with self.lock:
+            own = dict(self.own_profile)
+        if not own:
+            self.logger.debug(
+                'profile_query from %s; opted out, no answer',
+                str(getattr(sender, 'uuid', ''))[:8])
+            return True   # opted out: share nothing
+        try:
+            from ..capabilities import profile_sign
+            sig = profile_sign(self.identity.signature.private,
+                               self.identity.uuid, own)
+            payload = to_json_string({'profile': own, 'sig': sig,
+                                      'seq': self.freshness.stamp()})
+            reply = Message(self.name, IdentityProtocol.profile_response,
+                            payload, to_whom=sender)
+            queues[CfgIds.network].put(reply, block=True,
+                                       timeout=self.q_cadence)
+        except Full:
+            self.logger.error('handle_profile_query: Network queue full')
+        except Exception as err:
+            self.report_exception(err, 'handle_profile_query')
+        return True
+
+    def handle_profile_response(self, queues, message):
+        """Record a peer's profile from a {'profile','sig','seq'} response:
+        freshness-checked, bound-validated, and SIGNATURE-verified against the
+        sender's signing key, then stored in ``self.peer_profiles`` keyed by the
+        sender's uuid string. No app emission here (C runtime's job)."""
+        if message.function != IdentityProtocol.profile_response:
+            return False
+        sender = getattr(message, 'from_whom', None)
+        if sender is None:
+            return True
+        try:
+            body = from_json_string(message.obj)
+            if not isinstance(body, dict):
+                return True
+            if not self.freshness.accept(str(getattr(sender, 'uuid', None)),
+                                         IdentityProtocol.profile_response,
+                                         body.get('seq')):
+                self.logger.debug(
+                    'profile_response from %s refused (replay/unstamped)',
+                    str(getattr(sender, 'uuid', ''))[:8])
+                return True
+            profile = body.get('profile')
+            sig = body.get('sig')
+            if not isinstance(profile, dict) or not isinstance(sig, str):
+                return True
+            from ..capabilities import profile_valid_bounded, profile_verify
+            if not profile_valid_bounded(profile):
+                self.logger.warning(
+                    'profile_response from %s: over-bound/invalid field, dropping',
+                    str(getattr(sender, 'uuid', ''))[:8])
+                return True
+            if not profile_verify(sender.signature.public,
+                                  sender.uuid, profile, sig):
+                self.logger.warning(
+                    'profile_response from %s: BAD SIGNATURE, dropping',
+                    str(getattr(sender, 'uuid', ''))[:8])
+                return True
+            with self.lock:
+                self.peer_profiles[str(sender.uuid)] = profile
+            self.logger.debug('recorded profile for peer %s',
+                              str(sender.uuid)[:8])
+        except Exception as err:
+            self.report_exception(err, 'handle_profile_response')
+        return True
+
+    def get_peer_profile(self, uuid_str):
+        """The stored profile dict for a peer uuid, or {} if none recorded.
+        Conformance/assertion surface; twin of C ``identity_get_peer_profile``."""
+        with self.lock:
+            return dict(self.peer_profiles.get(str(uuid_str), {}))
+
     # How often the cap-resync sweep runs, and the max queries it emits per
     # sweep (so a large degraded group can't burst the network queue). The
     # interval is long relative to the q_cadence loop so steady-state cost is
@@ -3677,6 +3809,25 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             if psent:
                 self.logger.debug(
                     'Position resync: re-queried %d position-less peer(s)', psent)
+            # Profile resync (Increment 3): same pattern, keyed on peer_profiles.
+            with self.lock:
+                if self.peers is None:
+                    return
+                self_uuid = str(self.identity.uuid)
+                profless = [
+                    peer for peer in self.peers.all
+                    if str(peer.uuid) != self_uuid
+                    and str(peer.uuid) not in self.peer_profiles
+                ]
+            fsent = 0
+            for peer in profless:
+                if fsent >= self._CAPS_RESYNC_MAX_PER_SWEEP:
+                    break
+                self._send_profile_query(queues, peer)
+                fsent += 1
+            if fsent:
+                self.logger.debug(
+                    'Profile resync: re-queried %d profile-less peer(s)', fsent)
         except Exception as err:
             _probes.counter('peer.set', 'caps_resync_exc')
             self.report_exception(err, '_periodic_caps_resync')

@@ -366,12 +366,47 @@ class Cohort(CohortInterface):
         # forked copy inherits the full subscriber list.
         self._subscriptions: dict[str, int] = {}
         self._dropped_updates = 0
-        self.subscribe(self.UI_CONSUMER)
         # Owner-side record of what was assigned to whom, so a roster delta can
-        # restate the whole assignment rather than only the change.
+        # restate the whole assignment rather than only the change. Set BEFORE
+        # the first subscribe(): its exhaustion verdict counts these slots, and
+        # a pool that is already full at construction would otherwise fail
+        # inside the diagnostic rather than report.
         self._peer_slots: dict[str, tuple] = {}
+        self.subscribe(self.UI_CONSUMER)
         self._tick_thread = None
         self._halt = False
+
+    def _slot_verdict(self) -> str:
+        """Who is holding the pool, and whether that adds up.
+
+        Two slots per peer this process reserved for (`_peer_slots` is the
+        OWNER-side record; the applier resolves slots it never reserved) plus
+        one per delta subscription is everything this Cohort can name a holder
+        for. Anything outstanding beyond that was reserved and never released.
+        The distinction is the whole point of the message: a leak is not cured
+        by a bigger pool, and an undersized pool is not cured by hunting a leak
+        that is not there.
+
+        Measured against the pool that EXISTS -- `len(_pool)`, the same list
+        `free_count()` counts -- not the class-level `pool_size` default, which
+        reads 128 however many slots were actually built.
+        """
+        total = len(self.queue_pool._pool)
+        free = self.queue_pool.free_count()
+        outstanding = total - free
+        accounted = 2 * len(self._peer_slots) + len(self._subscriptions)
+        census = '%d of %d slots free: ' % (free, total)
+        holders = ('%d peer(s) x 2 + %d subscription(s)'
+                   % (len(self._peer_slots), len(self._subscriptions)))
+        if outstanding > accounted:
+            return census + (
+                '%d slots are outstanding but only %d are accounted for (%s), '
+                'so %d are LEAKING. Enlarging pool_size only delays this.'
+                % (outstanding, accounted, holders, outstanding - accounted))
+        return census + (
+            'all %d outstanding slots are accounted for (%s), so this pool is '
+            'undersized for the roster, not leaking. Enlarging pool_size is '
+            'the fix here.' % (outstanding, holders))
 
     def subscribe(self, name: str):
         """Claim a delta channel for one consumer, returning its slot index.
@@ -385,10 +420,8 @@ class Cohort(CohortInterface):
         slot = self.queue_pool.reserve()
         if slot is None:
             self.logger.error(
-                'QueuePool exhausted; no delta channel for %r (%d of %d slots '
-                'free). Check for outstanding per-peer slots before enlarging '
-                'pool_size -- a departure that does not release leaks two.',
-                name, self.queue_pool.free_count(), self.queue_pool.pool_size)
+                'QueuePool exhausted; no delta channel for %r -- %s',
+                name, self._slot_verdict())
             return None
         self._subscriptions[name] = slot
         return slot
@@ -604,14 +637,8 @@ class Cohort(CohortInterface):
                 if data_slot is not None:
                     self.queue_pool.release(data_slot)
                 self.logger.error(
-                    'QueuePool exhausted with %d peer(s) resident and %d of '
-                    '%d slots free: %d slots are outstanding for %d peers, so '
-                    'they are LEAKING, not merely undersized. Enlarging '
-                    'pool_size only delays this.',
-                    len(self.peers), self.queue_pool.free_count(),
-                    self.queue_pool.pool_size,
-                    self.queue_pool.pool_size - self.queue_pool.free_count(),
-                    len(self.peers))
+                    'QueuePool exhausted with %d peer(s) resident and %s',
+                    len(self.peers), self._slot_verdict())
                 break
             self._peer_slots[uuid] = (idx, group_ids[uuid], video_slot, data_slot)
             self.peers[uuid] = PeerDataAcq(uuid, idx, group_ids[uuid], NullPeerData(), self,

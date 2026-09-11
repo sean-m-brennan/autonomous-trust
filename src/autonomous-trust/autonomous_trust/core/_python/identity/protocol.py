@@ -94,6 +94,13 @@ class IdentityProtocol(Protocol):
     # way in. Both flow reliably via group/TCP like caps, not UDP broadcast.
     position_query = 'peer_position_query'  # msg.obj <- '' (sender just asks)
     position_response = 'peer_position_response'  # msg.obj <- json {'pos','seq'}
+    # Opt-in agora.profile (Increment 3): same directed shape as position, plus a
+    # detached Ed25519 signature over the canonical profile form so a profile is
+    # self-verifying beyond the transport. A confirmed peer asks; we answer ONLY
+    # if opted in (own_profile set) with {'profile','sig','seq'}. STRICTLY OPT-IN.
+    # Not plaintext (rides group/TCP like caps), so NOT in UNENCRYPTED_VERBS.
+    profile_query = 'peer_profile_query'  # msg.obj <- '' (sender just asks)
+    profile_response = 'peer_profile_response'  # msg.obj <- json {'profile','sig','seq'}
     # Identity backfill for a node that holds a group member's address (in
     # group.addresses) but never received its full Identity — the cold/late
     # joiner case (e.g. the dod_mission coordinator: group.addresses grows via

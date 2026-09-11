@@ -66,6 +66,11 @@
  */
 #define AT_APP_SET_POSITION "app_set_position"
 
+/* App→AT: set/replace THIS node's opt-in agora.profile (Increment 3). The
+ * payload is the profile object itself; empty clears it (opt out). Forwarded
+ * only to the identity process. Third verb on the app→AT allowlist. */
+#define AT_APP_SET_PROFILE "app_set_profile"
+
 #define DEFAULT_MAX_MSG_SIZE 1024
 /* MAX_MSG_SIZE is configurable at runtime via messaging_set_max_size() */
 #define MAX_MSG_SIZE (messaging_max_size())
