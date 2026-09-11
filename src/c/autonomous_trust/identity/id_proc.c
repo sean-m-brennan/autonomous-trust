@@ -40,6 +40,7 @@
 #include "identity_priv.h"
 #include "id_proc_priv.h"
 #include "profile.h"
+#include "connection.h"
 #include "first_contact.h"
 #include "utilities/b64.h"
 #include "utilities/freshness.h"
@@ -105,6 +106,12 @@ static char ID_POSITION_QUERY[]    = "peer_position_query";
 static char ID_POSITION_RESPONSE[] = "peer_position_response";
 static char ID_PROFILE_QUERY[]     = "peer_profile_query";
 static char ID_PROFILE_RESPONSE[]  = "peer_profile_response";
+/* Explicit connection edge-state (Increment 5). Directed + ENCRYPTED (never on
+ * the plaintext allowlist): the request is a bare ask, the response carries a
+ * detached Ed25519 signature over the canonical (requester, accepter, decision,
+ * seq) form (identity/connection.c). USER-INITIATED — not auto-sent on confirm. */
+static char ID_CONNECTION_REQUEST[]  = "peer_connection_request";
+static char ID_CONNECTION_RESPONSE[] = "peer_connection_response";
 /* Identity backfill for a cold/late joiner that holds a group member's
  * address but never received its full Identity (merge/partition path fills
  * group.address_map but peers[] stays sparse). See identity_periodic_identity
@@ -120,6 +127,8 @@ static char ID_TIER[]        = "tier_update";
 static char ID_APP_ROSTER[]  = AT_APP_ROSTER_REQUEST;
 static char ID_APP_SET_POSITION[] = AT_APP_SET_POSITION;
 static char ID_APP_SET_PROFILE[]  = AT_APP_SET_PROFILE;
+static char ID_APP_CONNECT_REQUEST[] = AT_APP_CONNECT_REQUEST;
+static char ID_APP_CONNECT_RESPOND[] = AT_APP_CONNECT_RESPOND;
 
 /* Forward decls: defined below beside the position handlers, but used earlier
  * (the query from the admission path, the validator from state init). */
@@ -336,6 +345,13 @@ static struct {
      * JSON — the app-boundary form). Conformance surface via
      * identity_get_peer_profile. */
     map_t peer_profile_map;
+    /* Explicit connection edges (Increment 5), keyed by lowercased peer uuid
+     * string; values are string_data(compact JSON {"state","seq","ts"}) where
+     * state is an at_conn_state_t (none/pending_out/pending_in/connected/
+     * declined). A connection is EXPLICIT, revocable, and SEPARATE from
+     * reputation. Filled by handle_connection_request/response and the app
+     * connect verbs; conformance surface via identity_get_connection_state. */
+    map_t connection_edges;
     /* Outstanding operator-attended pulls WE issued: nonce string -> peer uuid
      * string (heap-dup'd). The nonce is the only thing that makes a returned
      * attestation attributable to a request this node actually made; a reply
@@ -464,6 +480,7 @@ static void _ensure_id_init(void)
                          "%s", env_geo);
         }
         map_init(&id_state.peer_profile_map);
+        map_init(&id_state.connection_edges);
         /* Opt-in own profile (Increment 3): seed from $AT_OWN_PROFILE (a JSON
          * object string) for headless/conformance; the Flutter UI sets it at
          * runtime via AT_APP_SET_PROFILE instead. Absent/invalid => opted out. */
@@ -739,6 +756,36 @@ bool identity_get_peer_profile(const char *uuid_str, char *buf, size_t buflen)
     }
     pthread_mutex_unlock(&id_state.lock);
     return found;
+}
+
+/* Conformance seam: the connection edge-state this node holds toward peer
+ * @p uuid_str (lowercased uuid string), as an at_conn_state_t int; 0 (none) if
+ * no edge is recorded. The map is filled by handle_connection_request/response
+ * and the app connect verbs; scenarios assert via the `connection_state`
+ * expected_state key. Twin of Python IdentityProcess.get_connection_state. */
+int identity_get_connection_state(const char *uuid_str)
+{
+    if (uuid_str == NULL) return AT_CONN_NONE;
+    _ensure_id_init();
+    int state = AT_CONN_NONE;
+    pthread_mutex_lock(&id_state.lock);
+    data_t *dat = NULL;
+    if (map_get(&id_state.connection_edges, (map_key_t)uuid_str, &dat) == 0
+        && dat != NULL)
+    {
+        char *s = NULL;
+        if (data_string_ptr(dat, &s) == 0 && s != NULL) {
+            json_error_t jerr;
+            json_t *o = json_loads(s, 0, &jerr);
+            if (o != NULL) {
+                json_t *js = json_object_get(o, "state");
+                if (json_is_integer(js)) state = (int)json_integer_value(js);
+                json_decref(o);
+            }
+        }
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return state;
 }
 
 size_t identity_provisional_count(const process_t *proc)
@@ -2733,6 +2780,8 @@ void identity_reset_state(void)
     id_state.own_geohash[0] = '\0';
     map_free(&id_state.peer_profile_map);
     map_init(&id_state.peer_profile_map);
+    map_free(&id_state.connection_edges);
+    map_init(&id_state.connection_edges);
     memset(&id_state.own_profile, 0, sizeof(id_state.own_profile));
     /* Cleared per scenario so no clock sample leaks from one corpus case into
      * the next; each sample's heap payload goes with it. */
@@ -4200,6 +4249,333 @@ static int identity_emit_all_profiles(const process_t *proc)
         }
         pthread_mutex_unlock(&id_state.lock);
         if (compact[0] != '\0' && identity_emit_peer_profile(uuids[i], compact) == 0)
+            emitted++;
+    }
+    return emitted;
+}
+
+/****************************
+ * Explicit connections (Increment 5, the "connect with this peer" surface).
+ *
+ * A connection is an EXPLICIT, revocable, bilateral edge kept SEPARATE from
+ * reputation. USER-INITIATED: nothing is auto-sent on admission (unlike the
+ * position/profile queries) — the app's CONNECT verb starts it. The request is
+ * a bare directed encrypted ask; the response carries a detached Ed25519
+ * SIGNATURE over the canonical (requester, accepter, decision, seq) form
+ * (identity/connection.c), freshness-stamped so a captured accept cannot be
+ * replayed. States: none/pending_out/pending_in/connected/declined.
+ ****************************/
+
+/* AT -> app: surface a connection edge event. @p type is
+ * PEER_CONNECTION_REQUEST_OBSERVED (inbound ask) or
+ * PEER_CONNECTION_STATE_OBSERVED (any transition). */
+static int identity_emit_connection(message_type_t type, const uuid_t peer_uuid,
+                                    int state)
+{
+    generic_msg_t msg = {0};
+    msg.type = type;
+    msg.size = sizeof(peer_connection_msg_t);
+    memcpy(msg.info.peer_connection.peer_uuid, peer_uuid, 16);
+    msg.info.peer_connection.state = state;
+    return messaging_send(AT_MAIN_QUEUE, type, &msg, false);
+}
+
+/* Record our edge state toward peer @p uuid_str as compact JSON
+ * {"state","seq","ts"} (string_data, like peer_profile_map). Own locking.
+ * Returns 0 on success. */
+static int _connection_store(const char *uuid_str, int state, uint64_t seq)
+{
+    char buf[96];
+    int len = snprintf(buf, sizeof(buf),
+                       "{\"state\":%d,\"seq\":%llu,\"ts\":%lld}",
+                       state, (unsigned long long)seq, (long long)time(NULL));
+    if (len <= 0 || (size_t)len >= sizeof(buf)) return -1;
+    char *dup = smrt_create((size_t)len + 1);
+    if (dup == NULL) return -1;
+    memcpy(dup, buf, (size_t)len + 1);
+    data_t *dat = string_data(dup, (size_t)len + 1);
+    if (dat == NULL) { smrt_deref(dup); return -1; }
+    pthread_mutex_lock(&id_state.lock);
+    map_set(&id_state.connection_edges, (map_key_t)uuid_str, dat);
+    pthread_mutex_unlock(&id_state.lock);
+    return 0;
+}
+
+/* Copy the current public_identity_t of the admitted peer with @p uuid into
+ * @p out (under peers_read_lock). Returns true iff found. */
+static bool _find_peer_pub_by_uuid(const process_t *proc, const uuid_t uuid,
+                                   public_identity_t *out)
+{
+    bool found = false;
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+        if (uuid_compare(proc->protocol.peers[i].uuid, uuid) == 0) {
+            memcpy(out, &proc->protocol.peers[i], sizeof(public_identity_t));
+            found = true;
+            break;
+        }
+    }
+    peers_read_unlock(proc);
+    return found;
+}
+
+/* Directed connection request to one admitted peer (a bare ask; mirrors
+ * _send_profile_query but with no query payload). Encrypt=true: NOT on the
+ * plaintext allowlist. */
+static int _send_connection_request(const process_t *proc,
+                                    const public_identity_t *peer)
+{
+    generic_msg_t query = {0};
+    query.type = NET_MESSAGE;
+    strncpy(query.info.net_msg.process, "identity", PROC_NAME_LEN);
+    query.info.net_msg.function = ID_CONNECTION_REQUEST;
+    query.info.net_msg.encrypt = true;
+    memcpy(&query.info.net_msg.to_whom, peer, sizeof(public_identity_t));
+    strncpy(query.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    messaging_send("network", NET_MESSAGE, &query, false);
+    log_debug(proc->logger, "Identity: sent connection_request to %s\n",
+              peer->nickname);
+    return 0;
+}
+
+/* Directed, signed connection response to one admitted peer: {decision,sig,seq}.
+ * @p sig_hex is the detached signature over the canonical (requester=peer,
+ * accepter=self, decision, seq) form. Encrypt=true. */
+static int _send_connection_response(const process_t *proc,
+                                     const public_identity_t *peer,
+                                     int decision, int64_t seq,
+                                     const char *sig_hex)
+{
+    generic_msg_t response = {0};
+    response.type = NET_MESSAGE;
+    strncpy(response.info.net_msg.process, "identity", PROC_NAME_LEN);
+    response.info.net_msg.function = ID_CONNECTION_RESPONSE;
+    response.info.net_msg.encrypt = true;
+    memcpy(&response.info.net_msg.to_whom, peer, sizeof(public_identity_t));
+    strncpy(response.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    json_t *env = json_object();
+    if (env == NULL) return -1;
+    json_object_set_new(env, "decision", json_integer(decision ? 1 : 0));
+    json_object_set_new(env, "sig", json_string(sig_hex));
+    json_object_set_new(env, "seq", json_integer((json_int_t)seq));
+    net_msg_pack_json(&response.info.net_msg, env);
+    json_decref(env);
+    messaging_send("network", NET_MESSAGE, &response, false);
+    return 0;
+}
+
+/* Handler: a peer asks to connect. Set our edge to pending_in (idempotent; an
+ * already-connected edge is left alone), then surface the inbound ask AND the
+ * state to the app. No wire response here — the app decides (connections are
+ * user-initiated). */
+static bool handle_connection_request(const process_t *proc, directory_t *queues,
+                                      generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    char requester[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, requester);
+    if (identity_get_connection_state(requester) == AT_CONN_CONNECTED) {
+        log_debug(proc->logger,
+                  "Identity: connection_request from %s; already connected\n",
+                  requester);
+        return true;
+    }
+    _connection_store(requester, AT_CONN_PENDING_IN, 0);
+    identity_emit_connection(PEER_CONNECTION_REQUEST_OBSERVED,
+                             nmsg->from_whom.uuid, AT_CONN_PENDING_IN);
+    identity_emit_connection(PEER_CONNECTION_STATE_OBSERVED,
+                             nmsg->from_whom.uuid, AT_CONN_PENDING_IN);
+    log_debug(proc->logger, "Identity: connection request from peer %s\n",
+              requester);
+    return true;
+}
+
+/* Handler: the accepter's answer to OUR request — {decision,sig,seq}. Freshness-
+ * checked, then SIGNATURE-verified against the accepter's signing key over the
+ * canonical (requester=us, accepter=sender, decision, seq) form. On success set
+ * our edge connected/declined and surface it. */
+static bool handle_connection_response(const process_t *proc, directory_t *queues,
+                                       generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *j_dec = json_object_get(payload, "decision");
+    json_t *j_sig = json_object_get(payload, "sig");
+    json_t *j_seq = json_object_get(payload, "seq");
+    if (!json_is_integer(j_dec) || !json_is_string(j_sig) || !json_is_integer(j_seq)) {
+        json_decref(payload);
+        log_warn(proc->logger,
+                 "Identity: connection_response unstamped/malformed, refusing\n");
+        return true;
+    }
+
+    char accepter[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, accepter);
+    int64_t seq = (int64_t)json_integer_value(j_seq);
+    pthread_mutex_lock(&id_state.lock);
+    bool fresh = freshness_accept(&id_state.freshness, accepter,
+                                  ID_CONNECTION_RESPONSE, seq, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (!fresh) {
+        json_decref(payload);
+        log_debug(proc->logger,
+                  "Identity: connection_response from %s refused (replay)\n",
+                  accepter);
+        return true;
+    }
+
+    int decision = json_integer_value(j_dec) ? 1 : 0;
+    char sig_hex[AT_CONNECTION_SIG_HEX_LEN + 1];
+    snprintf(sig_hex, sizeof(sig_hex), "%s", json_string_value(j_sig));
+
+    const identity_t *self = _partition_self_identity(proc);
+    if (self == NULL) {
+        json_decref(payload);
+        log_debug(proc->logger,
+                  "Identity: connection_response but self identity unresolved; skipping\n");
+        return true;
+    }
+    if (!at_connection_verify(nmsg->from_whom.signature.public,
+                              self->uuid, nmsg->from_whom.uuid,
+                              (uint8_t)decision, (uint64_t)seq, sig_hex)) {
+        json_decref(payload);
+        log_warn(proc->logger,
+                 "Identity: connection_response from %s: BAD SIGNATURE, dropping\n",
+                 accepter);
+        return true;
+    }
+    json_decref(payload);
+
+    int new_state = decision ? AT_CONN_CONNECTED : AT_CONN_DECLINED;
+    _connection_store(accepter, new_state, (uint64_t)seq);
+    identity_emit_connection(PEER_CONNECTION_STATE_OBSERVED,
+                             nmsg->from_whom.uuid, new_state);
+    log_debug(proc->logger, "Identity: connection with peer %s -> %s\n",
+              accepter, decision ? "connected" : "declined");
+    return true;
+}
+
+/* App -> AT verb (AT_APP_CONNECT_REQUEST): the operator asks to connect to a
+ * peer. Payload {"peer": "<uuid_str>"}. Set our edge pending_out, send the
+ * directed request, surface the state. */
+static bool handle_app_connect_request(const process_t *proc, directory_t *queues,
+                                       generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *j_peer = json_object_get(payload, "peer");
+    if (!json_is_string(j_peer)) { json_decref(payload); return true; }
+    uuid_t peer_uuid;
+    int rc = uuid_parse(json_string_value(j_peer), peer_uuid);
+    json_decref(payload);
+    if (rc != 0) {
+        log_warn(proc->logger, "Identity: app connect_request: bad peer uuid\n");
+        return true;
+    }
+    public_identity_t peer;
+    if (!_find_peer_pub_by_uuid(proc, peer_uuid, &peer)) {
+        log_warn(proc->logger, "Identity: app connect_request: unknown peer\n");
+        return true;
+    }
+    char peer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, peer_str);
+    _connection_store(peer_str, AT_CONN_PENDING_OUT, 0);
+    _send_connection_request(proc, &peer);
+    identity_emit_connection(PEER_CONNECTION_STATE_OBSERVED, peer_uuid,
+                             AT_CONN_PENDING_OUT);
+    log_info(proc->logger, "Identity: connection requested to %s\n", peer_str);
+    return true;
+}
+
+/* App -> AT verb (AT_APP_CONNECT_RESPOND): the operator accepts/declines an
+ * inbound request. Payload {"peer": "<uuid_str>", "accept": <bool>}. Stamp a
+ * freshness seq, SIGN the canonical (requester=peer, accepter=us, decision,
+ * seq), set our edge, send the signed response, surface the state. */
+static bool handle_app_connect_respond(const process_t *proc, directory_t *queues,
+                                       generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *j_peer = json_object_get(payload, "peer");
+    json_t *j_acc  = json_object_get(payload, "accept");
+    if (!json_is_string(j_peer)) { json_decref(payload); return true; }
+    bool accept = json_is_true(j_acc);
+    uuid_t peer_uuid;
+    int rc = uuid_parse(json_string_value(j_peer), peer_uuid);
+    json_decref(payload);
+    if (rc != 0) {
+        log_warn(proc->logger, "Identity: app connect_respond: bad peer uuid\n");
+        return true;
+    }
+    public_identity_t peer;
+    if (!_find_peer_pub_by_uuid(proc, peer_uuid, &peer)) {
+        log_warn(proc->logger, "Identity: app connect_respond: unknown peer\n");
+        return true;
+    }
+    const identity_t *self = _partition_self_identity(proc);
+    if (self == NULL) {
+        log_debug(proc->logger,
+                  "Identity: app connect_respond but self identity unresolved\n");
+        return true;
+    }
+    pthread_mutex_lock(&id_state.lock);
+    int64_t seq = freshness_stamp(&id_state.freshness, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (seq <= 0) {
+        log_warn(proc->logger,
+                 "Identity: no freshness sequence; not responding to connection\n");
+        return true;
+    }
+    int decision = accept ? 1 : 0;
+    char sig_hex[AT_CONNECTION_SIG_HEX_LEN + 1];
+    if (at_connection_sign(self->signature.private, peer_uuid, self->uuid,
+                           (uint8_t)decision, (uint64_t)seq, sig_hex) != 0) {
+        log_warn(proc->logger, "Identity: connect_respond: signing failed\n");
+        return true;
+    }
+    int new_state = accept ? AT_CONN_CONNECTED : AT_CONN_DECLINED;
+    char peer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, peer_str);
+    _connection_store(peer_str, new_state, (uint64_t)seq);
+    _send_connection_response(proc, &peer, decision, seq, sig_hex);
+    identity_emit_connection(PEER_CONNECTION_STATE_OBSERVED, peer_uuid, new_state);
+    log_info(proc->logger, "Identity: connection to %s -> %s\n", peer_str,
+             accept ? "connected" : "declined");
+    return true;
+}
+
+/* Emit our edge state for every known peer that has one — the roster-pull answer
+ * for the connection half. Mirrors identity_emit_all_profiles. */
+static int identity_emit_all_connections(const process_t *proc)
+{
+    if (proc == NULL) return 0;
+    uuid_t uuids[DEFAULT_MAX_PEERS];
+    peers_read_lock(proc);
+    size_t n = proc->protocol.num_peers;
+    if (n > DEFAULT_MAX_PEERS) n = DEFAULT_MAX_PEERS;
+    for (size_t i = 0; i < n; i++)
+        memcpy(uuids[i], proc->protocol.peers[i].uuid, sizeof(uuid_t));
+    peers_read_unlock(proc);
+
+    int emitted = 0;
+    for (size_t i = 0; i < n; i++) {
+        char uuid_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(uuids[i], uuid_str);
+        int state = identity_get_connection_state(uuid_str);
+        if (state != AT_CONN_NONE
+            && identity_emit_connection(PEER_CONNECTION_STATE_OBSERVED,
+                                        uuids[i], state) == 0)
             emitted++;
     }
     return emitted;
@@ -7976,9 +8352,10 @@ static bool handle_peer_roster_request(const process_t *proc,
     int n = identity_emit_all_peers(proc);
     int p = identity_emit_all_positions(proc);
     int f = identity_emit_all_profiles(proc);
+    int c = identity_emit_all_connections(proc);
     log_debug(proc->logger,
               "Identity: peer roster request -> %d observation(s), %d position(s), "
-              "%d profile(s)\n", n, p, f);
+              "%d profile(s), %d connection(s)\n", n, p, f, c);
     return true;
 }
 
@@ -8094,6 +8471,10 @@ int identity_register_handlers(process_t *proc)
     process_register_handler(proc, ID_PROFILE_QUERY,     (handler_ptr_t)handle_profile_query);
     process_register_handler(proc, ID_PROFILE_RESPONSE,  (handler_ptr_t)handle_profile_response);
     process_register_handler(proc, ID_APP_SET_PROFILE,   (handler_ptr_t)handle_set_profile);
+    process_register_handler(proc, ID_CONNECTION_REQUEST,  (handler_ptr_t)handle_connection_request);
+    process_register_handler(proc, ID_CONNECTION_RESPONSE, (handler_ptr_t)handle_connection_response);
+    process_register_handler(proc, ID_APP_CONNECT_REQUEST, (handler_ptr_t)handle_app_connect_request);
+    process_register_handler(proc, ID_APP_CONNECT_RESPOND, (handler_ptr_t)handle_app_connect_respond);
     process_register_handler(proc, ID_IDENTITY_QUERY,
                              (handler_ptr_t)handle_identity_query);
     process_register_handler(proc, ID_IDENTITY_RESPONSE,

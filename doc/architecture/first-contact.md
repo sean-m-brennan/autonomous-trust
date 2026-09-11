@@ -82,7 +82,8 @@ order-independent function of both public identities (an iterated hash over the
 public keys, the two per-identity fingerprints concatenated in sorted order), so
 both parties read the same twelve groups of digits regardless of who calls which
 identity "mine". Only when they match does `verified` flip and the trust edge
-seed apply.
+seed apply, and the reputation process picks that seed up from the store (see
+[The seed reaches reputation](#the-seed-reaches-reputation)).
 
 An unverified contact is usable but visibly unverified: a node may message it, but
 higher-trust actions gate on verification, so a user is never silently talking to
@@ -167,6 +168,48 @@ A contact admitted this way is still **unverified**: the handshake proves
 reachability and possession of the ticket, not that the human on the other end is
 who Bob thinks. Only the out-of-band safety-number comparison flips that.
 
+### What the handshake records
+
+Admission is the live half; the address book is the durable one. `Peers` is
+cohort-shaped state a node rebuilds every session, so a handshake that admitted a
+peer and wrote nothing would leave the user re-adding the same friend on every
+restart. Both handlers therefore write a Contact to the durable store — the
+accepter when it honours a ticket, the initiator when the ack lands.
+
+A NEW record is always `token` provenance and **unverified**, with no trust seed.
+The accepter cannot know how its own invitation travelled: `create_invitation`
+carries no in-person flag, because in-person-ness is the *redeemer's* local
+knowledge. A key that arrived over the wire has had no out-of-band confirmation,
+and recording it as verified would hand safety-number-grade posture — and with it
+the reputation seed — to anyone presenting a ticket.
+
+An EXISTING record keeps everything the user or an earlier verification
+established: verified state, petname, provenance, trust seed, and the time it was
+added. Only reachability and the originating nonce are refreshed, newest hint
+first, the previous ones behind it, capped at four (the same cap in both
+runtimes, because both write the same file). Rewriting the record instead would
+mean that re-presenting a ticket — something anyone who obtained one can do —
+strips the verified flag off a confirmed contact, and drops its reputation prior
+with it. That is a downgrade an attacker drives, not a refresh.
+
+### The seed reaches reputation
+
+The seed a verified contact carries is a **cold-start prior**, and reputation
+reads it from the store rather than being pushed it: `contacts.cfg.json` is
+already shared byte-for-byte between the runtimes, so the trust-seed decision
+stays in one file instead of introducing an identity→reputation message. The
+reputation process applies it at boot and, guarded by the file's mtime, once per
+pass afterwards, so a contact verified while the node is running is picked up
+without a restart.
+
+It is written **only where the node has no reputation for that peer at all**. It
+can never overwrite an earned score, a warm-started one, or a slashed one — a
+contact cannot be verified back into good standing, or safety-number confirmation
+would become an attack on reputation rather than a convenience. Both halves of
+the record are checked, verified *and* a seed above zero: the store is plain JSON
+in the user's data dir, and honouring a hand-written `trust_seed` on an
+unverified record would turn one editable float into a reputation prior.
+
 ### Resolving the endpoint
 
 `initiate` reduces the invitation's rendezvous hint to a bare host, preferring
@@ -244,6 +287,8 @@ asymmetry.
 | An expired ticket is refused | [`first-contact-invitation-expired-ignored.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-invitation-expired-ignored.yaml) |
 | `initiate` prefers the rendezvous hint | [`first-contact-initiate-reaches-the-hint.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-initiate-reaches-the-hint.yaml) |
 | IPv4/port, bare IPv6 and bracketed IPv6 hints all resolve | [`first-contact-initiate-endpoint-forms.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-initiate-endpoint-forms.yaml) |
+| A handshake records an unverified contact | [`first-contact-hello-records-a-contact.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-hello-records-a-contact.yaml) |
+| A re-handshake never downgrades a verified one | [`first-contact-rehandshake-preserves-verification.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-rehandshake-preserves-verification.yaml) |
 | Both handshake verbs are plaintext-allowlisted, neither is bootstrap | [`unencrypted-verbs.yaml`](../../src/autonomous-trust/conformance/scenarios/network/unencrypted-verbs.yaml) |
 
 ## Further reading

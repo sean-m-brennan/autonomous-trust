@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include <jansson.h>
+#include <uuid/uuid.h>
 
 #include "app_events.h"
 #include "utilities/message.h"
@@ -167,6 +168,26 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
             ev->data.profile.profile_json[AT_APP_PROFILE_JSON_LEN] = '\0';
             break;
         }
+        case PEER_CONNECTION_REQUEST_OBSERVED:
+        {
+            at_app_event_t *ev = &out[n++];
+            memset(ev, 0, sizeof(*ev));
+            ev->kind = AT_APP_EVENT_CONNECTION_REQUEST;
+            memcpy(ev->data.connection.peer_uuid,
+                   msg.info.peer_connection.peer_uuid, AT_APP_UUID_LEN);
+            ev->data.connection.state = msg.info.peer_connection.state;
+            break;
+        }
+        case PEER_CONNECTION_STATE_OBSERVED:
+        {
+            at_app_event_t *ev = &out[n++];
+            memset(ev, 0, sizeof(*ev));
+            ev->kind = AT_APP_EVENT_CONNECTION_STATE;
+            memcpy(ev->data.connection.peer_uuid,
+                   msg.info.peer_connection.peer_uuid, AT_APP_UUID_LEN);
+            ev->data.connection.state = msg.info.peer_connection.state;
+            break;
+        }
         default:
             /* Not app-facing: skipped rather than surfaced as an event. A
              * consumer of this ABI is not given AT's internal traffic. */
@@ -252,6 +273,55 @@ int at_app_events_set_profile(at_app_events_t *handle, const char *q_out,
     }
     json_decref(env);
     return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
+}
+
+/* Shared body for the two connection app→AT verbs (Increment 5): pack
+ * {"peer": "<uuid_str>"} plus, for a respond, {"accept": <bool>}, and send the
+ * verb to identity. @p accept is ignored unless @p include_accept. */
+static int connect_send(at_app_events_t *handle, const char *q_out,
+                        const char *verb,
+                        const uint8_t peer_uuid[AT_APP_UUID_LEN],
+                        bool include_accept, bool accept)
+{
+    if (handle == NULL || !name_survives(q_out) || peer_uuid == NULL)
+        return -1;
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
+    char uuid_str[37];
+    uuid_unparse_lower((const unsigned char *)peer_uuid, uuid_str);
+    json_t *env = json_object();
+    if (env == NULL)
+        return -1;
+    json_object_set_new(env, "peer", json_string(uuid_str));
+    if (include_accept)
+        json_object_set_new(env, "accept", json_boolean(accept));
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),
+             "identity");
+    req.info.net_msg.function = (char *)verb;
+    req.info.net_msg.encrypt = false;
+    if (net_msg_pack_json(&req.info.net_msg, env) != 0) {
+        json_decref(env);
+        return -1;
+    }
+    json_decref(env);
+    return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
+}
+
+int at_app_events_connect_request(at_app_events_t *handle, const char *q_out,
+                                  const uint8_t peer_uuid[AT_APP_UUID_LEN])
+{
+    return connect_send(handle, q_out, AT_APP_CONNECT_REQUEST, peer_uuid,
+                        false, false);
+}
+
+int at_app_events_connect_respond(at_app_events_t *handle, const char *q_out,
+                                  const uint8_t peer_uuid[AT_APP_UUID_LEN],
+                                  bool accept)
+{
+    return connect_send(handle, q_out, AT_APP_CONNECT_RESPOND, peer_uuid,
+                        true, accept);
 }
 
 void at_app_events_close(at_app_events_t *handle)
