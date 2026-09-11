@@ -45,6 +45,7 @@
 #include "identity/identity_priv.h"   /* hexlify / public_identity_to_json */
 #include "identity/profile.h"         /* at_profile_* for the profile builder */
 #include "identity/connection.h"      /* at_connection_* for the connection builder */
+#include "identity/dm.h"              /* AT_DM_TEXT_MAX for the dm_last check */
 #include "identity/id_proc_priv.h"
 #include "utilities/util.h"
 #include "identity/group.h"           /* group_init / group_add_address */
@@ -1443,6 +1444,29 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         return 0;
     }
 
+    /* peer_dm — pack {text, seq, ts} (Increment 6). A DM carries no signature
+     * (crypto_box authenticates the sender on the wire; in the harness the
+     * from_whom identity stands in), so this is the trivial payload builder:
+     * `text` and `ts` from the scenario, `seq` honored via _ic_set_seq so
+     * `unstamped: true` drops it and the replay/unstamped-refusal case is
+     * exercised the same way the position/profile responses are. Mirrors the
+     * Python peer_dm builder. */
+    if (strcmp(function, "peer_dm") == 0 && json_is_object(payload)) {
+        json_t *body = json_object();
+        json_t *jtext = json_object_get(payload, "text");
+        json_t *jts = json_object_get(payload, "ts");
+        json_object_set_new(body, "text",
+                            json_string(json_is_string(jtext)
+                                        ? json_string_value(jtext) : ""));
+        json_object_set_new(body, "ts",
+                            json_real(json_is_number(jts)
+                                      ? json_number_value(jts) : 0.0));
+        _ic_set_seq(body, payload);
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+        return 0;
+    }
+
     /* vote_on_peer is the only identity function whose C handler
      * (`handle_count_vote`) requires a structured JSON payload —
      * `{uuid, approved}` keyed off the candidate's uuid. Other
@@ -2558,6 +2582,54 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                         snprintf(ctx->err, sizeof(ctx->err),
                                  "%s: connection_state[%s]=%d, expected %d",
                                  pid, cs_pid, got, want);
+                        return -1;
+                    }
+                }
+            } else if (strcmp(key, "dm_last") == 0) {
+                /* {peer_id: {seq, text}} (Increment 6) — the most-recent DM this
+                 * participant received from another, via identity_get_last_dm.
+                 * An absent DM (never delivered, or dropped by the replay gate)
+                 * fails the presence check. Mirrors the Python adapter's dm_last,
+                 * keyed by the same lowercased uuid. */
+                const char *dm_pid;
+                json_t *dm_want;
+                json_object_foreach(val, dm_pid, dm_want) {
+                    sce_participant_t *other = sce_find_participant(ctx, dm_pid);
+                    if (other == NULL) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: dm_last names unknown participant %s",
+                                 pid, dm_pid);
+                        return -1;
+                    }
+                    const public_identity_t *want_id =
+                        ((ic_impl_t *)other->impl)->pub;
+                    char want_uuid[UUID_STR_LEN + 1];
+                    uuid_unparse_lower(want_id->uuid, want_uuid);
+                    char got_text[AT_DM_TEXT_MAX + 1];
+                    int64_t got_seq = 0;
+                    bool have = identity_get_last_dm(want_uuid, got_text,
+                                                     sizeof(got_text), &got_seq);
+                    if (!have) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: dm_last[%s] absent, expected a DM", pid,
+                                 dm_pid);
+                        return -1;
+                    }
+                    json_t *jt = json_object_get(dm_want, "text");
+                    if (json_is_string(jt)
+                        && strcmp(got_text, json_string_value(jt)) != 0) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: dm_last[%s].text=%.80s, expected %.80s",
+                                 pid, dm_pid, got_text, json_string_value(jt));
+                        return -1;
+                    }
+                    json_t *js = json_object_get(dm_want, "seq");
+                    if (json_is_integer(js)
+                        && got_seq != (int64_t)json_integer_value(js)) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: dm_last[%s].seq=%lld, expected %lld", pid,
+                                 dm_pid, (long long)got_seq,
+                                 (long long)json_integer_value(js));
                         return -1;
                     }
                 }

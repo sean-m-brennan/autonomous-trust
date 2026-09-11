@@ -67,6 +67,10 @@ extern "C" {
  *  AT_PROFILE_JSON_MAX in identity/profile.h, and AGORA_PROFILE_JSON_MAX in the
  *  shim / cohort ctypes. */
 #define AT_APP_PROFILE_JSON_LEN 2560
+/** Max bytes of a DM body carried across the app boundary (Increment 6). MUST
+ *  match AT_DM_TEXT_LEN (msg_types.h), AT_DM_TEXT_MAX (identity/dm.h), and
+ *  AGORA_DM_TEXT_MAX in the shim / cohort ctypes. */
+#define AT_APP_DM_TEXT_LEN 1024
 
 /** Returned instead of -1 when the daemon exists but has not bound its queue
  *  yet, so a caller can retry rather than treat a normal cold start as an error.
@@ -102,7 +106,12 @@ typedef enum {
      *  Increment 5): none=0, pending_out=1, pending_in=2, connected=3,
      *  declined=4. A connection is EXPLICIT and separate from reputation; the
      *  app derives trust tier from reputation, not from this. */
-    AT_APP_EVENT_CONNECTION_STATE = 7
+    AT_APP_EVENT_CONNECTION_STATE = 7,
+    /** A directed text message received from a peer (@c dm; Increment 6). A DM
+     *  is a single directed, ENCRYPTED peer→peer message; crypto_box already
+     *  authenticated the sender, so @c dm.peer_uuid is trustworthy. Delivered on
+     *  arrival — a live stream, never replayed as roster state. */
+    AT_APP_EVENT_DM = 8
 } at_app_event_kind_t;
 
 /** One observed peer. Mirrors `peer_observed_msg_t` in flat, fixed-width form. */
@@ -188,6 +197,19 @@ typedef struct {
     int32_t state;
 } at_app_connection_t;
 
+/** One directed text message received from a peer (Increment 6). @c peer_uuid is
+ *  the SENDER (crypto_box authenticated it, so it is trustworthy); @c seq is the
+ *  sender's freshness sequence; @c ts the sender's send time (epoch seconds);
+ *  @c text the NUL-terminated body, bound-truncated to AT_APP_DM_TEXT_LEN bytes.
+ *  Carried by AT_APP_EVENT_DM. A live stream — delivered on arrival, not roster
+ *  state. */
+typedef struct {
+    uint8_t peer_uuid[AT_APP_UUID_LEN];
+    int64_t seq;
+    double  ts;
+    char    text[AT_APP_DM_TEXT_LEN + 1];
+} at_app_dm_t;
+
 /** A decoded app-facing event. */
 typedef struct {
     at_app_event_kind_t kind;
@@ -198,6 +220,7 @@ typedef struct {
         at_app_position_t   position;
         at_app_profile_t    profile;
         at_app_connection_t connection;
+        at_app_dm_t         dm;
     } data;
 } at_app_event_t;
 
@@ -340,6 +363,22 @@ int at_app_events_connect_request(at_app_events_t *handle, const char *q_out,
 int at_app_events_connect_respond(at_app_events_t *handle, const char *q_out,
                                   const uint8_t peer_uuid[AT_APP_UUID_LEN],
                                   bool accept);
+
+/**
+ * @brief Send a directed text message to a peer (Increment 6).
+ *
+ * Sends the app→AT `AT_APP_SEND_DM` verb on @p q_out. @p peer_uuid is the
+ * recipient's 16-byte identity; @p text is the message body (truncated to
+ * AT_APP_DM_TEXT_LEN bytes). The identity process sends a directed encrypted
+ * peer_dm carrying {text, seq, ts} to that peer. The core does NOT echo the
+ * outgoing message back — the app echoes it locally.
+ *
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound yet,
+ *         -1 on any other failure.
+ */
+int at_app_events_send_dm(at_app_events_t *handle, const char *q_out,
+                          const uint8_t peer_uuid[AT_APP_UUID_LEN],
+                          const char *text);
 
 /** @brief Close the queue and release the handle. NULL-safe. */
 void at_app_events_close(at_app_events_t *handle);

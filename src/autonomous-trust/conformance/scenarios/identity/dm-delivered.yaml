@@ -1,0 +1,42 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: dm-delivered
+byte_pinning: false
+description: |
+    A direct message, the happy path (Increment 6). A DM is a single directed,
+    ENCRYPTED, one-way peer→peer text message carrying {text, seq, ts}. crypto_box
+    already authenticates the sender on the wire, so — UNLIKE the connection accept
+    — there is NO signature. NO request/response and NO gossip: bg sends newcomer a
+    peer_dm and newcomer's handle_dm accepts the freshness seq, bound-truncates the
+    body, and delivers it to its app (here observed via the last-DM seam). DMs are
+    allowed between any two admitted peers — no connection/tier gate.
+
+    Step 1: bg -> newcomer peer_dm {text:"hello there", seq:1}.
+      - Both runtimes: handle_dm freshness-accepts and records the DM from bg
+        with the carried text and seq.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_dm
+    payload:
+      text: hello there
+      seq: 1
+    description: |
+        bg's directed message delivered to newcomer. handle_dm accepts the
+        freshness seq and records it under bg's uuid in newcomer's view.
+
+expected_state:
+  newcomer:
+    dm_last:
+      bg:
+        seq: 1
+        text: hello there

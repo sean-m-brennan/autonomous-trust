@@ -54,11 +54,13 @@ class TestIdentityProtocol:
           (position_query, position_response)
         - opt-in signed agora.profile, Increment 3
           (profile_query, profile_response)
+        - explicit, revocable connection edges, Increment 5
+          (connection_request, connection_response)
         Asserting the exact count here pins the wire contract — a
         new verb without intent will fail this and force a deliberate
         update. Update the expected count alongside any new addition
         to ``IdentityProtocol``.
         """
         values = list(IdentityProtocol)
-        assert len(values) == 32
+        assert len(values) == 34
         assert 'announce' in values
