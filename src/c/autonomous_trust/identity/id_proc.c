@@ -39,6 +39,7 @@
 #include "history.h"
 #include "identity_priv.h"
 #include "id_proc_priv.h"
+#include "profile.h"
 #include "first_contact.h"
 #include "utilities/b64.h"
 #include "utilities/freshness.h"
@@ -102,6 +103,8 @@ static char ID_CAPS_QUERY[]  = "peer_caps_query";
 static char ID_CAPS_RESPONSE[] = "peer_caps_response";
 static char ID_POSITION_QUERY[]    = "peer_position_query";
 static char ID_POSITION_RESPONSE[] = "peer_position_response";
+static char ID_PROFILE_QUERY[]     = "peer_profile_query";
+static char ID_PROFILE_RESPONSE[]  = "peer_profile_response";
 /* Identity backfill for a cold/late joiner that holds a group member's
  * address but never received its full Identity (merge/partition path fills
  * group.address_map but peers[] stays sparse). See identity_periodic_identity
@@ -116,11 +119,15 @@ static char ID_TIER[]        = "tier_update";
  * view on the app-facing carrier. See doc/architecture/app-peer-carrier.md. */
 static char ID_APP_ROSTER[]  = AT_APP_ROSTER_REQUEST;
 static char ID_APP_SET_POSITION[] = AT_APP_SET_POSITION;
+static char ID_APP_SET_PROFILE[]  = AT_APP_SET_PROFILE;
 
 /* Forward decls: defined below beside the position handlers, but used earlier
  * (the query from the admission path, the validator from state init). */
 static int _send_position_query(const process_t *proc, const public_identity_t *peer);
 static bool _geohash_valid(const char *s);
+/* Profile (Increment 3): the directed query is issued from the admission path
+ * (handle_confirm_peer) and the resync sweep, both earlier than the definition. */
+static int _send_profile_query(const process_t *proc, const public_identity_t *peer);
 /* Group partition recovery (doc/architecture/partition-recovery.md).
  *   ID_PARTITION_SIGNAL: local-only IPC from NetProcess when group-channel
  *                        traffic is rejected (no wire egress). Payload is
@@ -316,6 +323,19 @@ static struct {
      * uuid string; values are string_data(geohash). Mirrors peer_caps_map.
      * Conformance/assertion surface via identity_get_peer_position. */
     map_t peer_position_map;
+    /* This node's OWN opt-in agora.profile (Increment 3): operator-set, bounded
+     * fields shared only with admitted peers that ask, over the SIGNED
+     * peer_profile_query/response exchange. Empty (at_profile_is_empty) = opted
+     * out (the default): handle_profile_query answers nothing. Set at runtime via
+     * AT_APP_SET_PROFILE (seeded from $AT_OWN_PROFILE for headless/conformance).
+     * mutex-guarded by id_state.lock. Signed per-query from the node identity's
+     * key, so no stored signature. */
+    at_profile_t own_profile;
+    /* Peer profiles recorded by handle_profile_response (after signature verify).
+     * Keyed by lowercased uuid string; values are string_data(compact profile
+     * JSON — the app-boundary form). Conformance surface via
+     * identity_get_peer_profile. */
+    map_t peer_profile_map;
     /* Outstanding operator-attended pulls WE issued: nonce string -> peer uuid
      * string (heap-dup'd). The nonce is the only thing that makes a returned
      * attestation attributable to a request this node actually made; a reply
@@ -442,6 +462,22 @@ static void _ensure_id_init(void)
             if (env_geo != NULL && _geohash_valid(env_geo))
                 snprintf(id_state.own_geohash, sizeof(id_state.own_geohash),
                          "%s", env_geo);
+        }
+        map_init(&id_state.peer_profile_map);
+        /* Opt-in own profile (Increment 3): seed from $AT_OWN_PROFILE (a JSON
+         * object string) for headless/conformance; the Flutter UI sets it at
+         * runtime via AT_APP_SET_PROFILE instead. Absent/invalid => opted out. */
+        memset(&id_state.own_profile, 0, sizeof(id_state.own_profile));
+        {
+            const char *env_prof = getenv("AT_OWN_PROFILE");
+            if (env_prof != NULL && env_prof[0] != '\0') {
+                json_error_t jerr;
+                json_t *pj = json_loads(env_prof, 0, &jerr);
+                if (pj != NULL) {
+                    at_profile_from_json(pj, false, &id_state.own_profile);
+                    json_decref(pj);
+                }
+            }
         }
         map_init(&id_state.attest_sent);
         map_init(&id_state.attest_sent_clock);
@@ -644,6 +680,54 @@ bool identity_get_peer_position(const char *uuid_str, char *buf, size_t buflen)
     pthread_mutex_lock(&id_state.lock);
     data_t *dat = NULL;
     if (map_get(&id_state.peer_position_map, (map_key_t)uuid_str, &dat) == 0
+        && dat != NULL)
+    {
+        char *g = NULL;
+        if (data_string_ptr(dat, &g) == 0 && g != NULL)
+        {
+            snprintf(buf, buflen, "%s", g);
+            found = true;
+        }
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return found;
+}
+
+/* Conformance seam: set (or clear) THIS node's opt-in agora.profile from a JSON
+ * object string (Increment 3). Empty/invalid/empty-object opts out. The harness
+ * analog of the AT_APP_SET_PROFILE IPC verb; scenarios install it from
+ * `fixtures.profiles`. Twin of setting Python IdentityProcess.own_profile. */
+void identity_set_own_profile(const char *profile_json)
+{
+    _ensure_id_init();
+    at_profile_t p;
+    memset(&p, 0, sizeof(p));
+    if (profile_json != NULL && profile_json[0] != '\0') {
+        json_error_t jerr;
+        json_t *o = json_loads(profile_json, 0, &jerr);
+        if (o != NULL) {
+            at_profile_from_json(o, false, &p);   /* trusted: truncate */
+            json_decref(o);
+        }
+    }
+    pthread_mutex_lock(&id_state.lock);
+    memcpy(&id_state.own_profile, &p, sizeof(p));
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+/* Conformance seam: copy the stored compact profile JSON for peer @p uuid_str
+ * into @p buf (always NUL-terminated). Returns true iff a verified profile is
+ * stored. The map is filled by handle_profile_response; scenarios assert via
+ * the `peer_profile` expected_state key. Twin of Python get_peer_profile. */
+bool identity_get_peer_profile(const char *uuid_str, char *buf, size_t buflen)
+{
+    if (buf != NULL && buflen > 0) buf[0] = '\0';
+    if (uuid_str == NULL || buf == NULL || buflen == 0) return false;
+    _ensure_id_init();
+    bool found = false;
+    pthread_mutex_lock(&id_state.lock);
+    data_t *dat = NULL;
+    if (map_get(&id_state.peer_profile_map, (map_key_t)uuid_str, &dat) == 0
         && dat != NULL)
     {
         char *g = NULL;
@@ -2647,6 +2731,9 @@ void identity_reset_state(void)
     map_free(&id_state.peer_position_map);
     map_init(&id_state.peer_position_map);
     id_state.own_geohash[0] = '\0';
+    map_free(&id_state.peer_profile_map);
+    map_init(&id_state.peer_profile_map);
+    memset(&id_state.own_profile, 0, sizeof(id_state.own_profile));
     /* Cleared per scenario so no clock sample leaks from one corpus case into
      * the next; each sample's heap payload goes with it. */
     _free_clock_samples_locked();
@@ -2951,6 +3038,9 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
          * position. If it opted out it answers nothing; the periodic resync
          * re-asks, so a peer that opts in later is still picked up. */
         _send_position_query(proc, &new_peer);
+        /* Opt-in profile (Increment 3): same pattern — ask every confirmed peer
+         * for its agora.profile; an opted-out peer answers nothing. */
+        _send_profile_query(proc, &new_peer);
     }
 
     /* Two-phase admission (doc/architecture/identity-protocol.md). Count DISTINCT confirmers; the
@@ -3879,6 +3969,237 @@ static int identity_emit_all_positions(const process_t *proc)
         }
         pthread_mutex_unlock(&id_state.lock);
         if (geo[0] != '\0' && identity_emit_peer_position(uuids[i], geo) == 0)
+            emitted++;
+    }
+    return emitted;
+}
+
+/****************************
+ * Opt-in agora.profile (Increment 3, the "who is this peer" surface).
+ *
+ * Same directed shape as the position exchange, with one addition: the
+ * response carries a DETACHED Ed25519 SIGNATURE over a canonical serialization
+ * of the profile (identity/profile.c), so a profile is self-verifying beyond
+ * the transport. STRICTLY OPT-IN: own_profile is empty by default and while
+ * empty handle_profile_query answers nothing. On receive the profile is
+ * bound-validated (a misbehaving peer's over-bound field is dropped, like an
+ * invalid geohash) and its signature verified against the SENDER's signing key
+ * before anything is stored or surfaced. The app-boundary form is the compact
+ * field JSON only — the signature, already verified here, does not cross.
+ ****************************/
+
+/* AT -> app: surface one peer's profile (compact JSON) as PEER_PROFILE_OBSERVED.
+ * Mirrors identity_emit_peer_position. @p profile_json "" is valid. */
+static int identity_emit_peer_profile(const uuid_t peer_uuid, const char *profile_json)
+{
+    generic_msg_t msg = {0};
+    msg.type = PEER_PROFILE_OBSERVED;
+    msg.size = sizeof(peer_profile_msg_t);
+    memcpy(msg.info.peer_profile.peer_uuid, peer_uuid, 16);
+    if (profile_json != NULL)
+        snprintf(msg.info.peer_profile.profile_json,
+                 sizeof(msg.info.peer_profile.profile_json), "%s", profile_json);
+    return messaging_send(AT_MAIN_QUEUE, PEER_PROFILE_OBSERVED, &msg, false);
+}
+
+/* Handler: a peer asks for our profile. Opted out (empty own_profile) => answer
+ * NOTHING. Otherwise reply directed + encrypted with {"profile","sig","seq"},
+ * the signature computed fresh from our identity key over the canonical form. */
+static bool handle_profile_query(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+
+    at_profile_t own;
+    pthread_mutex_lock(&id_state.lock);
+    memcpy(&own, &id_state.own_profile, sizeof(own));
+    pthread_mutex_unlock(&id_state.lock);
+    if (at_profile_is_empty(&own)) {
+        log_debug(proc->logger,
+                  "Identity: profile_query from %s; opted out, no answer\n",
+                  nmsg->from_whom.nickname);
+        return true;
+    }
+
+    const identity_t *self = _partition_self_identity(proc);
+    if (self == NULL) {
+        log_debug(proc->logger,
+                  "Identity: profile_query but self identity unresolved; skipping\n");
+        return true;   /* bootstrap incomplete: cannot sign yet */
+    }
+    char sig_hex[AT_PROFILE_SIG_HEX_LEN + 1];
+    if (at_profile_sign(self->signature.private, self->uuid, &own, sig_hex) != 0) {
+        log_warn(proc->logger, "Identity: profile_query: signing failed\n");
+        return true;
+    }
+
+    pthread_mutex_lock(&id_state.lock);
+    int64_t seq = freshness_stamp(&id_state.freshness, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (seq <= 0) {
+        log_warn(proc->logger,
+                 "Identity: no freshness sequence; not answering profile query\n");
+        return true;
+    }
+
+    generic_msg_t response = {0};
+    response.type = NET_MESSAGE;
+    strncpy(response.info.net_msg.process, "identity", PROC_NAME_LEN);
+    response.info.net_msg.function = ID_PROFILE_RESPONSE;
+    response.info.net_msg.encrypt = true;
+    memcpy(&response.info.net_msg.to_whom, &nmsg->from_whom,
+           sizeof(public_identity_t));
+    strncpy(response.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+
+    json_t *env = json_object();
+    if (env == NULL) return true;
+    json_t *prof = at_profile_to_json(&own);
+    if (prof == NULL) { json_decref(env); return true; }
+    json_object_set_new(env, "profile", prof);
+    json_object_set_new(env, "sig", json_string(sig_hex));
+    json_object_set_new(env, "seq", json_integer((json_int_t)seq));
+    net_msg_pack_json(&response.info.net_msg, env);
+    json_decref(env);
+    messaging_send("network", NET_MESSAGE, &response, false);
+    return true;
+}
+
+/* Handler: store a peer's profile from a {"profile","sig","seq"} response —
+ * freshness-checked, bound-validated, and SIGNATURE-verified against the
+ * sender's signing key — then surface it to the app. */
+static bool handle_profile_response(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *j_prof = json_object_get(payload, "profile");
+    json_t *j_sig  = json_object_get(payload, "sig");
+    json_t *j_seq  = json_object_get(payload, "seq");
+    if (!json_is_object(j_prof) || !json_is_string(j_sig) || !json_is_integer(j_seq)) {
+        json_decref(payload);
+        log_warn(proc->logger,
+                 "Identity: profile_response unstamped/malformed, refusing\n");
+        return true;
+    }
+
+    char sender[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, sender);
+    int64_t seq = (int64_t)json_integer_value(j_seq);
+    pthread_mutex_lock(&id_state.lock);
+    bool fresh = freshness_accept(&id_state.freshness, sender,
+                                  ID_PROFILE_RESPONSE, seq, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (!fresh) {
+        json_decref(payload);
+        log_debug(proc->logger,
+                  "Identity: profile_response from %s refused (replay)\n", sender);
+        return true;
+    }
+
+    at_profile_t p;
+    if (at_profile_from_json(j_prof, true, &p) != 0) {
+        json_decref(payload);
+        log_warn(proc->logger,
+                 "Identity: profile_response from %s: over-bound/invalid field, dropping\n",
+                 sender);
+        return true;
+    }
+    if (!at_profile_verify(nmsg->from_whom.signature.public, nmsg->from_whom.uuid,
+                           &p, json_string_value(j_sig))) {
+        json_decref(payload);
+        log_warn(proc->logger,
+                 "Identity: profile_response from %s: BAD SIGNATURE, dropping\n",
+                 sender);
+        return true;
+    }
+    json_decref(payload);
+
+    char compact[AT_PROFILE_JSON_MAX + 1];
+    if (at_profile_to_compact_str(&p, compact, sizeof(compact)) < 0)
+        return true;
+    size_t len = strlen(compact);
+    char *dup = smrt_create(len + 1);
+    if (dup == NULL) return true;
+    memcpy(dup, compact, len + 1);
+    data_t *prof_dat = string_data(dup, len + 1);
+    if (prof_dat == NULL) { smrt_deref(dup); return true; }
+    pthread_mutex_lock(&id_state.lock);
+    map_set(&id_state.peer_profile_map, sender, prof_dat);
+    pthread_mutex_unlock(&id_state.lock);
+
+    identity_emit_peer_profile(nmsg->from_whom.uuid, compact);
+    log_debug(proc->logger, "Identity: recorded profile for peer %s\n", sender);
+    return true;
+}
+
+/* App -> AT verb (AT_APP_SET_PROFILE): set or clear THIS node's opt-in profile.
+ * Payload is the profile object itself ({display_name, handle, bio, avatar_ref,
+ * links}); an empty/missing object clears it (opt out). Locally-trusted input,
+ * so fields are truncated (validate=false) rather than rejected. */
+static bool handle_set_profile(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    at_profile_t p;
+    memset(&p, 0, sizeof(p));
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) == 0 && payload != NULL) {
+        at_profile_from_json(payload, false, &p);   /* empty/invalid => cleared */
+        json_decref(payload);
+    }
+    pthread_mutex_lock(&id_state.lock);
+    memcpy(&id_state.own_profile, &p, sizeof(p));
+    pthread_mutex_unlock(&id_state.lock);
+    log_info(proc->logger, "Identity: own profile %s\n",
+             at_profile_is_empty(&p) ? "cleared (opted out)" : "set (opted in)");
+    return true;
+}
+
+/* Directed profile query to one admitted peer (mirrors _send_position_query). */
+static int _send_profile_query(const process_t *proc, const public_identity_t *peer)
+{
+    generic_msg_t query = {0};
+    query.type = NET_MESSAGE;
+    strncpy(query.info.net_msg.process, "identity", PROC_NAME_LEN);
+    query.info.net_msg.function = ID_PROFILE_QUERY;
+    query.info.net_msg.encrypt = true;
+    memcpy(&query.info.net_msg.to_whom, peer, sizeof(public_identity_t));
+    strncpy(query.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    messaging_send("network", NET_MESSAGE, &query, false);
+    log_debug(proc->logger, "Identity: sent profile_query to %s\n", peer->nickname);
+    return 0;
+}
+
+/* Emit the stored profile for every known peer — the roster-pull answer for the
+ * profile half. Mirrors identity_emit_all_positions. Returns count emitted. */
+static int identity_emit_all_profiles(const process_t *proc)
+{
+    if (proc == NULL) return 0;
+    uuid_t uuids[DEFAULT_MAX_PEERS];
+    peers_read_lock(proc);
+    size_t n = proc->protocol.num_peers;
+    if (n > DEFAULT_MAX_PEERS) n = DEFAULT_MAX_PEERS;
+    for (size_t i = 0; i < n; i++)
+        memcpy(uuids[i], proc->protocol.peers[i].uuid, sizeof(uuid_t));
+    peers_read_unlock(proc);
+
+    int emitted = 0;
+    for (size_t i = 0; i < n; i++) {
+        char uuid_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(uuids[i], uuid_str);
+        char compact[AT_PROFILE_JSON_MAX + 1] = {0};
+        pthread_mutex_lock(&id_state.lock);
+        data_t *dat = NULL;
+        if (map_get(&id_state.peer_profile_map, uuid_str, &dat) == 0 && dat != NULL) {
+            char *g = NULL;
+            if (data_string_ptr(dat, &g) == 0 && g != NULL)
+                snprintf(compact, sizeof(compact), "%s", g);
+        }
+        pthread_mutex_unlock(&id_state.lock);
+        if (compact[0] != '\0' && identity_emit_peer_profile(uuids[i], compact) == 0)
             emitted++;
     }
     return emitted;
@@ -5196,6 +5517,30 @@ void identity_periodic_caps_resync(const process_t *proc)
     peers_read_unlock(proc);
     for (size_t i = 0; i < pcnt; i++)
         _send_position_query(proc, &posless[i]);
+
+    /* Profile resync (Increment 3): same pattern — re-query admitted peers we
+     * hold no stored profile for, so an opted-in-later peer is picked up. */
+    public_identity_t profless[CAPS_RESYNC_MAX_PER_SWEEP];
+    size_t fcnt = 0;
+    peers_read_lock(proc);
+    size_t nf = proc->protocol.num_peers;
+    for (size_t i = 0; i < nf && fcnt < CAPS_RESYNC_MAX_PER_SWEEP; i++) {
+        const public_identity_t *peer = &proc->protocol.peers[i];
+        if (self != NULL && uuid_compare(peer->uuid, self->uuid) == 0)
+            continue;
+        char uuid_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(peer->uuid, uuid_str);
+        pthread_mutex_lock(&id_state.lock);
+        data_t *fdat = NULL;
+        bool have = (map_get(&id_state.peer_profile_map, uuid_str, &fdat) == 0
+                     && fdat != NULL);
+        pthread_mutex_unlock(&id_state.lock);
+        if (have) continue;
+        memcpy(&profless[fcnt++], peer, sizeof(public_identity_t));
+    }
+    peers_read_unlock(proc);
+    for (size_t i = 0; i < fcnt; i++)
+        _send_profile_query(proc, &profless[i]);
 }
 
 /****************************
@@ -7630,9 +7975,10 @@ static bool handle_peer_roster_request(const process_t *proc,
     (void)msg;
     int n = identity_emit_all_peers(proc);
     int p = identity_emit_all_positions(proc);
+    int f = identity_emit_all_profiles(proc);
     log_debug(proc->logger,
-              "Identity: peer roster request -> %d observation(s), %d position(s)\n",
-              n, p);
+              "Identity: peer roster request -> %d observation(s), %d position(s), "
+              "%d profile(s)\n", n, p, f);
     return true;
 }
 
@@ -7745,6 +8091,9 @@ int identity_register_handlers(process_t *proc)
     process_register_handler(proc, ID_POSITION_QUERY,    (handler_ptr_t)handle_position_query);
     process_register_handler(proc, ID_POSITION_RESPONSE, (handler_ptr_t)handle_position_response);
     process_register_handler(proc, ID_APP_SET_POSITION,  (handler_ptr_t)handle_set_position);
+    process_register_handler(proc, ID_PROFILE_QUERY,     (handler_ptr_t)handle_profile_query);
+    process_register_handler(proc, ID_PROFILE_RESPONSE,  (handler_ptr_t)handle_profile_response);
+    process_register_handler(proc, ID_APP_SET_PROFILE,   (handler_ptr_t)handle_set_profile);
     process_register_handler(proc, ID_IDENTITY_QUERY,
                              (handler_ptr_t)handle_identity_query);
     process_register_handler(proc, ID_IDENTITY_RESPONSE,

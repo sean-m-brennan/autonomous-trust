@@ -62,6 +62,11 @@ extern "C" {
  *  ~5-char geohash (~5km "neighborhood" bucket); the buffer allows finer later
  *  without an ABI change. MUST match AT_GEOHASH_MAX_LEN in msg_types.h. */
 #define AT_APP_GEOHASH_LEN 12
+/** Max bytes of the compact profile JSON carried across the app boundary
+ *  (Increment 3). MUST match AT_PROFILE_JSON_LEN in msg_types.h,
+ *  AT_PROFILE_JSON_MAX in identity/profile.h, and AGORA_PROFILE_JSON_MAX in the
+ *  shim / cohort ctypes. */
+#define AT_APP_PROFILE_JSON_LEN 2560
 
 /** Returned instead of -1 when the daemon exists but has not bound its queue
  *  yet, so a caller can retry rather than treat a normal cold start as an error.
@@ -84,7 +89,11 @@ typedef enum {
     /** A peer's shared coarse position (@c position), as an opt-in geohash
      *  bucket. Empty geohash = the peer shared none (the default). The consumer
      *  computes geographic distance from its own opted-in bucket. */
-    AT_APP_EVENT_PEER_POSITION = 4
+    AT_APP_EVENT_PEER_POSITION = 4,
+    /** A peer's shared agora.profile (@c profile), as compact field JSON. The
+     *  core already bound-validated and signature-verified it before emitting;
+     *  an empty profile_json = the peer shared none (the default). */
+    AT_APP_EVENT_PEER_PROFILE = 5
 } at_app_event_kind_t;
 
 /** One observed peer. Mirrors `peer_observed_msg_t` in flat, fixed-width form. */
@@ -148,6 +157,17 @@ typedef struct {
     char    geohash[AT_APP_GEOHASH_LEN + 1];
 } at_app_position_t;
 
+/** One peer's shared agora.profile. Mirrors `peer_profile_msg_t`. */
+typedef struct {
+    uint8_t peer_uuid[AT_APP_UUID_LEN];
+    /** NUL-terminated compact JSON object of the peer's profile fields; empty
+     *  string "" means the peer shared none (opted out). The core already
+     *  bound-validated the fields and verified the peer's Ed25519 signature, so
+     *  the consumer may trust this without re-checking; the signature does not
+     *  cross. */
+    char    profile_json[AT_APP_PROFILE_JSON_LEN + 1];
+} at_app_profile_t;
+
 /** A decoded app-facing event. */
 typedef struct {
     at_app_event_kind_t kind;
@@ -156,6 +176,7 @@ typedef struct {
         at_app_reputation_t reputation;
         at_app_rtt_t        rtt;
         at_app_position_t   position;
+        at_app_profile_t    profile;
     } data;
 } at_app_event_t;
 
@@ -252,6 +273,21 @@ int at_app_events_request_roster(at_app_events_t *handle, const char *q_out);
  */
 int at_app_events_set_position(at_app_events_t *handle, const char *q_out,
                                const char *geohash);
+
+/**
+ * @brief Set (or clear) THIS node's own opt-in agora.profile (Increment 3).
+ *
+ * Sends the app→AT `AT_APP_SET_PROFILE` verb on @p q_out. @p profile_json is a
+ * JSON object of the profile fields ({display_name, handle, bio, avatar_ref,
+ * links}); NULL or "" clears the profile (opts out). The identity process
+ * truncates each field to its bound and shares the result, signed, only with
+ * admitted peers that ask.
+ *
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound yet,
+ *         -1 on any other failure (including malformed @p profile_json).
+ */
+int at_app_events_set_profile(at_app_events_t *handle, const char *q_out,
+                              const char *profile_json);
 
 /** @brief Close the queue and release the handle. NULL-safe. */
 void at_app_events_close(at_app_events_t *handle);
