@@ -93,7 +93,16 @@ typedef enum {
     /** A peer's shared agora.profile (@c profile), as compact field JSON. The
      *  core already bound-validated and signature-verified it before emitting;
      *  an empty profile_json = the peer shared none (the default). */
-    AT_APP_EVENT_PEER_PROFILE = 5
+    AT_APP_EVENT_PEER_PROFILE = 5,
+    /** An inbound connection ASK from a peer (@c connection; Increment 5). The
+     *  peer requested an explicit connection; @c connection.state is pending_in.
+     *  The app surfaces an accept/decline affordance. */
+    AT_APP_EVENT_CONNECTION_REQUEST = 6,
+    /** This node's connection edge-state toward a peer changed (@c connection;
+     *  Increment 5): none=0, pending_out=1, pending_in=2, connected=3,
+     *  declined=4. A connection is EXPLICIT and separate from reputation; the
+     *  app derives trust tier from reputation, not from this. */
+    AT_APP_EVENT_CONNECTION_STATE = 7
 } at_app_event_kind_t;
 
 /** One observed peer. Mirrors `peer_observed_msg_t` in flat, fixed-width form. */
@@ -168,6 +177,17 @@ typedef struct {
     char    profile_json[AT_APP_PROFILE_JSON_LEN + 1];
 } at_app_profile_t;
 
+/** One connection edge event toward a peer (Increment 5). Mirrors
+ *  `peer_connection_msg_t`. Carried by both AT_APP_EVENT_CONNECTION_REQUEST
+ *  (an inbound ask; @c state == 2 pending_in) and AT_APP_EVENT_CONNECTION_STATE
+ *  (any edge transition). @c state: none=0, pending_out=1, pending_in=2,
+ *  connected=3, declined=4. NO trust tier here — the app derives that from
+ *  reputation; a connection is an explicit, separate axis. */
+typedef struct {
+    uint8_t peer_uuid[AT_APP_UUID_LEN];
+    int32_t state;
+} at_app_connection_t;
+
 /** A decoded app-facing event. */
 typedef struct {
     at_app_event_kind_t kind;
@@ -177,6 +197,7 @@ typedef struct {
         at_app_rtt_t        rtt;
         at_app_position_t   position;
         at_app_profile_t    profile;
+        at_app_connection_t connection;
     } data;
 } at_app_event_t;
 
@@ -288,6 +309,37 @@ int at_app_events_set_position(at_app_events_t *handle, const char *q_out,
  */
 int at_app_events_set_profile(at_app_events_t *handle, const char *q_out,
                               const char *profile_json);
+
+/**
+ * @brief Request an explicit connection to a peer (Increment 5).
+ *
+ * Sends the app→AT `AT_APP_CONNECT_REQUEST` verb on @p q_out. @p peer_uuid is
+ * the 16-byte identity of the peer to connect to. The identity process sets our
+ * edge to pending_out and sends a directed encrypted peer_connection_request;
+ * an AT_APP_EVENT_CONNECTION_STATE(pending_out) is emitted back. A connection is
+ * EXPLICIT and revocable, and SEPARATE from reputation.
+ *
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound yet,
+ *         -1 on any other failure.
+ */
+int at_app_events_connect_request(at_app_events_t *handle, const char *q_out,
+                                  const uint8_t peer_uuid[AT_APP_UUID_LEN]);
+
+/**
+ * @brief Respond to an inbound connection request (Increment 5).
+ *
+ * Sends the app→AT `AT_APP_CONNECT_RESPOND` verb on @p q_out. @p peer_uuid is
+ * the requester's 16-byte identity; @p accept true connects, false declines. The
+ * identity process sets our edge accordingly and sends a directed encrypted,
+ * SIGNED peer_connection_response; an AT_APP_EVENT_CONNECTION_STATE is emitted
+ * back.
+ *
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound yet,
+ *         -1 on any other failure.
+ */
+int at_app_events_connect_respond(at_app_events_t *handle, const char *q_out,
+                                  const uint8_t peer_uuid[AT_APP_UUID_LEN],
+                                  bool accept);
 
 /** @brief Close the queue and release the handle. NULL-safe. */
 void at_app_events_close(at_app_events_t *handle);

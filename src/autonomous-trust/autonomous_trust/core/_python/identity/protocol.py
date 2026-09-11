@@ -101,6 +101,14 @@ class IdentityProtocol(Protocol):
     # Not plaintext (rides group/TCP like caps), so NOT in UNENCRYPTED_VERBS.
     profile_query = 'peer_profile_query'  # msg.obj <- '' (sender just asks)
     profile_response = 'peer_profile_response'  # msg.obj <- json {'profile','sig','seq'}
+    # Explicit connection edge-state (Increment 5): an EXPLICIT, revocable,
+    # bilateral edge kept SEPARATE from reputation. The request is a bare ask;
+    # the response carries a detached Ed25519 signature over the canonical
+    # (requester, accepter, decision, seq) form (capabilities.connection_*), so
+    # the requester verifies it before setting connected/declined. USER-INITIATED
+    # (not auto-sent on confirm). Encrypted directed, so NOT in UNENCRYPTED_VERBS.
+    connection_request = 'peer_connection_request'  # msg.obj <- '' (bare ask)
+    connection_response = 'peer_connection_response'  # msg.obj <- json {'decision','sig','seq'}
     # Identity backfill for a node that holds a group member's address (in
     # group.addresses) but never received its full Identity — the cold/late
     # joiner case (e.g. the dod_mission coordinator: group.addresses grows via

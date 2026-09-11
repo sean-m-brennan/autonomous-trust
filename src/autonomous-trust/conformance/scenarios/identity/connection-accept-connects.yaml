@@ -1,0 +1,54 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: connection-accept-connects
+byte_pinning: false
+description: |
+    The happy path (Increment 5). newcomer asks bg to connect (bg records
+    pending_in), then bg ACCEPTS: a peer_connection_response {decision:1, sig,
+    seq} carrying a detached Ed25519 signature over the canonical (requester,
+    accepter, decision, seq) form, signed with bg's own identity key. newcomer's
+    handle_connection_response accepts the freshness seq, verifies the signature
+    against bg's signing key, and records the edge connected (3).
+
+    This is also the definitive CROSS-LANGUAGE signature-interop check for
+    connections: a signature produced by one runtime's canonical serialization
+    must verify under the other's.
+
+    Step 1: newcomer -> bg peer_connection_request  (bg: edge[newcomer]=pending_in).
+    Step 2: bg -> newcomer peer_connection_response {accept, seq:1}
+      - Both runtimes: verify + freshness accept, edge[bg]=connected.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: newcomer
+    to: bg
+    function: peer_connection_request
+    payload: {}
+    description: newcomer asks bg to connect; bg records pending_in.
+  - id: 2
+    from: bg
+    to: newcomer
+    function: peer_connection_response
+    payload:
+      accept: true
+      seq: 1
+    description: |
+        bg's signed accept delivered to newcomer. The adapter signs the canonical
+        (newcomer uuid, bg uuid, decision=1, seq) with bg's key, exactly as the
+        real handle_app_connect_respond would. handle_connection_response verifies
+        it and records connected under bg's uuid.
+
+expected_state:
+  bg:
+    connection_state:
+      newcomer: 2   # pending_in (bg's own accept edge is set app-side, C-only)
+  newcomer:
+    connection_state:
+      bg: 3         # connected

@@ -1,0 +1,84 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: first-contact-hello-records-a-contact
+byte_pinning: false
+description: |
+    What the handshake leaves behind on disk (FIRST_CONTACT_PLAN.md §4.0).
+
+    `direct_peers` covers the live half -- the peer is reachable now. This
+    covers the DURABLE half: Peers is cohort-shaped state a node rebuilds every
+    session, while a Contact is the user's address book and has to survive a
+    restart, a network change, and eventually a new device. A handshake that
+    admitted a peer and recorded nothing would leave the user re-adding the
+    same friend every time the process came up.
+
+    THE ASSERTION THAT MATTERS is `verified: false` with `trust_seed: 0`. The
+    accepter cannot know how its own invitation travelled -- create_invitation
+    carries no in-person flag, because in-person-ness is the REDEEMER's local
+    knowledge -- so a key that arrived over the wire has had no out-of-band
+    confirmation. Recording it as verified would hand a safety-number-grade
+    posture, and with it the reputation seed, to anyone who presented a ticket;
+    the whole §4.4 MITM defense is that verification is a separate human act.
+
+    Only Bob's hello is delivered, so only ALICE records. Bob's own store entry
+    would come from his ack handler, which never runs here -- which is why
+    `alice: false` under Bob's own view is not redundant: it pins that the
+    record was written by the side that handled the hello.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  # Strangers, each in a cohort of one: the actual first-contact precondition.
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000000a2"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000000b2"
+      size: 1
+
+steps:
+  - id: 1
+    from: bob
+    to: alice
+    function: first_contact_hello
+    payload:
+      minted_by: alice
+      nonce: fc-record-1
+      expiry: 0
+      rendezvous:
+        - 10.0.0.1
+    description: |
+        Bob presents Alice's own invitation. No ack step: this case is about
+        what Alice writes, not about the round trip.
+
+expected_state:
+  alice:
+    direct_peers:
+      bob: true
+    contacts:
+      bob:
+        # Unverified and unseeded -- see the description.
+        verified: false
+        trust_seed: 0.0
+        # The ticket path, not in-person: the accepter cannot know otherwise.
+        provenance: token
+        # The invitation's nonce, kept for audit / replay correlation.
+        nonce: fc-record-1
+        # One hint (where Bob reached us from). Its VALUE differs by harness --
+        # Python addresses participants 10.0.0.N and C 10.0.70.N -- so the
+        # count and the tail are what both runtimes can agree on.
+        rendezvous_count: 1
+        rendezvous_tail: []
+  bob:
+    # Bob never handled an ack, so he wrote nothing: the record above belongs
+    # to the side that handled the hello.
+    contacts:
+      alice: false

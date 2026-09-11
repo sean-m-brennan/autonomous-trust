@@ -115,6 +115,14 @@ void identity_set_own_profile(const char *profile_json);
  *  asserts via the `peer_profile` expected_state key. */
 bool identity_get_peer_profile(const char *uuid_str, char *buf, size_t buflen);
 
+/** The connection edge-state this node holds toward peer @p uuid_str (lowercased
+ *  uuid string), as an at_conn_state_t int (Increment 5): none=0, pending_out=1,
+ *  pending_in=2, connected=3, declined=4. 0 if no edge is recorded. The map is
+ *  filled by handle_connection_request/response and the app connect verbs;
+ *  conformance asserts via the `connection_state` expected_state key. Twin of
+ *  Python IdentityProcess.get_connection_state. */
+int identity_get_connection_state(const char *uuid_str);
+
 /** Copy the size-bounded capability descriptor recorded for @p cap_name (from
  *  the descriptor form of `peer_caps_response`) into @p buf as a JSON string
  *  ({required_tier, description, kind, arg_schema}; name excluded). Returns 0

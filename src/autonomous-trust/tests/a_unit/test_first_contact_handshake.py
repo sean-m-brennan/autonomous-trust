@@ -32,7 +32,9 @@ from autonomous_trust.core.identity import Identity, Peers
 from autonomous_trust.core.identity.protocol import IdentityProtocol, UNENCRYPTED_VERBS
 from autonomous_trust.core.system import CfgIds
 from autonomous_trust.core.config import Configuration
-from autonomous_trust.core.contacts import create_invitation
+from autonomous_trust.core.contacts import (create_invitation, Contact,
+                                           Contacts, Provenance)
+from autonomous_trust.core.config.configuration import to_json_string
 from autonomous_trust.core.identity import first_contact as fc
 
 
@@ -308,3 +310,105 @@ def test_corrupt_nonce_store_fails_safe(tmp_path):
         fh.write('{ not valid json')
     s = fc.SpentNonces(data_dir=str(tmp_path))   # must not raise
     assert 'anything' not in s                    # empty (fail-safe) guard
+
+
+# -- the durable contact the handshake leaves behind -------------------------
+# The handshake admits a direct PEER (cohort-adjacent, rebuilt every session);
+# the address book is the part that has to survive a restart. Loaded from disk
+# in each assertion rather than read off the process, so these also pin that the
+# record was actually persisted.
+def _stored(uuid):
+    return Contacts.load().get(str(uuid))
+
+
+def test_hello_records_an_unverified_contact(alice, bob):
+    proc = StubProc(alice)
+    invite = create_invitation(alice, rendezvous=['10.0.0.1'], ttl_seconds=3600)
+    q = {CfgIds.network: queue.Queue()}
+
+    fc.handle_hello(proc, q, _inbound(bob, invite.encode()))
+
+    contact = _stored(bob.uuid)
+    assert contact is not None
+    # UNVERIFIED is the whole point: the accepter cannot know how its ticket
+    # travelled, so a key that arrived over the wire has had no out-of-band
+    # confirmation and earns no seed until a safety-number compare.
+    assert contact.verified is False
+    assert contact.trust_seed == 0.0
+    assert contact.provenance is Provenance.token
+    assert contact.nonce == invite.nonce
+    assert contact.rendezvous == ['10.0.0.2']      # where Bob reached us from
+
+
+def test_ack_records_the_inviter(alice, bob):
+    proc = StubProc(bob)
+    q = {CfgIds.network: queue.Queue()}
+
+    fc.handle_hello_ack(proc, q, _inbound(alice, to_json_string({'nonce': 'n1'})))
+
+    contact = _stored(alice.uuid)
+    assert contact is not None
+    assert contact.verified is False
+    assert contact.nonce == 'n1'
+
+
+def test_a_re_handshake_never_downgrades_a_verified_contact(alice, bob):
+    """A re-presented ticket must not strip the verified flag or rename the
+    contact -- that would hand an attacker a downgrade they could drive."""
+    store = Contacts()
+    known = Contact(bob.publish(), petname='old-friend',
+                    rendezvous=['192.168.1.9'], provenance=Provenance.in_person)
+    known.mark_verified()
+    store.add(known)
+    store.save()
+    seed, added_at = known.trust_seed, known.added_at
+
+    proc = StubProc(alice)
+    invite = create_invitation(alice, ttl_seconds=3600)
+    q = {CfgIds.network: queue.Queue()}
+    fc.handle_hello(proc, q, _inbound(bob, invite.encode()))
+
+    contact = _stored(bob.uuid)
+    assert contact.verified is True                 # preserved
+    assert contact.petname == 'old-friend'          # never re-derived
+    assert contact.provenance is Provenance.in_person
+    assert contact.trust_seed == seed
+    assert contact.added_at == added_at
+    # ...only reachability moved, newest first, with the old hint kept behind it
+    assert contact.rendezvous == ['10.0.0.2', '192.168.1.9']
+
+
+def test_rendezvous_hints_stay_bounded(alice, bob):
+    """A peer that re-handshakes from a new network every join must not grow
+    the record without bound -- the file is never pruned."""
+    proc = StubProc(alice)
+    q = {CfgIds.network: queue.Queue()}
+    seen = []
+    for i in range(fc.MAX_RENDEZVOUS_HINTS + 3):
+        addr = '10.0.%d.2' % i
+        seen.append(addr)
+        peer = bob.publish()
+        peer.address = addr
+        invite = create_invitation(alice, ttl_seconds=3600)
+        fc.handle_hello(proc, q, types.SimpleNamespace(from_whom=peer,
+                                                       obj=invite.encode()))
+
+    contact = _stored(bob.uuid)
+    assert len(contact.rendezvous) == fc.MAX_RENDEZVOUS_HINTS
+    assert contact.rendezvous == list(reversed(seen))[:fc.MAX_RENDEZVOUS_HINTS]
+
+
+def test_an_unwritable_store_does_not_break_the_handshake(alice, bob, monkeypatch):
+    """The peer is admitted either way; a lost record costs a re-add, not a
+    security property."""
+    def boom(self, data_dir=None):
+        raise OSError('read-only file system')
+    monkeypatch.setattr(Contacts, 'save', boom)
+
+    proc = StubProc(alice)
+    invite = create_invitation(alice, ttl_seconds=3600)
+    q = {CfgIds.network: queue.Queue()}
+
+    assert fc.handle_hello(proc, q, _inbound(bob, invite.encode())) is True
+    assert proc.peers.find_by_uuid(bob.uuid) is not None
+    assert q[CfgIds.network].get_nowait().function == IdentityProtocol.hello_ack

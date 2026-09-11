@@ -316,6 +316,129 @@ static void _free_public(public_identity_t *p)
     }
 }
 
+/* How many reachability hints one contact keeps. The C twin of Python's
+ * first_contact.MAX_RENDEZVOUS_HINTS, and it has to be the same number: both
+ * runtimes write the SAME contacts.cfg.json, so a different cap would make the
+ * file's contents depend on which runtime last touched it. */
+#define AT_FC_MAX_RENDEZVOUS_HINTS 4
+
+/* Put `endpoint` at the head of the hint list, deduped and capped. Newest
+ * first because it is the one worth trying; capped because a peer that
+ * re-handshakes from a new network on every join would otherwise grow a record
+ * in a file nothing prunes. */
+static void _rendezvous_refresh(contact_t *c, const char *endpoint)
+{
+    if (c == NULL || endpoint == NULL || endpoint[0] == '\0')
+        return;
+    char **hints = calloc(AT_FC_MAX_RENDEZVOUS_HINTS, sizeof(char *));
+    if (hints == NULL)
+        return;             /* keep what we have rather than lose it */
+    size_t n = 0;
+    hints[n] = strdup(endpoint);
+    if (hints[n] == NULL) {
+        free(hints);
+        return;
+    }
+    n++;
+    for (size_t i = 0; i < c->rendezvous_count
+                       && n < AT_FC_MAX_RENDEZVOUS_HINTS; i++) {
+        if (c->rendezvous[i] == NULL
+            || strcmp(c->rendezvous[i], endpoint) == 0)
+            continue;
+        char *dup = strdup(c->rendezvous[i]);
+        if (dup == NULL)
+            break;
+        hints[n++] = dup;
+    }
+    for (size_t i = 0; i < c->rendezvous_count; i++)
+        free(c->rendezvous[i]);
+    free(c->rendezvous);
+    c->rendezvous = hints;
+    c->rendezvous_count = n;
+}
+
+/* Write or refresh the durable contact for a peer we just handshook with.
+ *
+ * Mirrors Python first_contact._record_contact exactly, because both runtimes
+ * write the same file:
+ *
+ *   - a NEW contact is always token-provenance and UNVERIFIED. The accepter
+ *     cannot know how its invitation travelled (at_create_invitation carries no
+ *     in-person flag -- that is the redeemer's local knowledge), so a key that
+ *     arrived over the wire has had no out-of-band confirmation, and earns no
+ *     trust seed until a safety-number compare.
+ *   - an EXISTING contact keeps verified / petname / provenance / trust_seed /
+ *     added_at, and only its reachability and nonce are refreshed. A handshake
+ *     must never downgrade a verified contact -- a re-presented ticket would
+ *     otherwise be a way to strip the verified flag -- and must never rename
+ *     one the user already sees.
+ *
+ * Best-effort: every failure is logged and the handshake continues, because the
+ * peer is admitted either way and a lost record costs a re-add, not a security
+ * property. */
+static void _record_contact(const process_t *proc, const public_identity_t *who,
+                            const char *nonce, const char *endpoint)
+{
+    if (who == NULL)
+        return;
+    char data_dir[CFG_PATH_LEN + 1] = {0};
+    if (get_data_dir(data_dir, sizeof(data_dir)) <= 0) {
+        log_warn(proc->logger,
+                 "Identity: first contact: no data dir; contact not recorded\n");
+        return;
+    }
+
+    contacts_t store;
+    contacts_init(&store);
+    /* A missing file is the normal first-run state, and contacts_load reports
+     * it as an empty store rather than an error. */
+    (void)contacts_load(data_dir, &store);
+
+    char uuid_s[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse(who->uuid, uuid_s);
+    contact_t *existing = contacts_get(&store, uuid_s);
+    if (existing != NULL) {
+        _rendezvous_refresh(existing, endpoint);
+        if (nonce != NULL && nonce[0] != '\0')
+            at_strlcpy(existing->nonce, nonce, sizeof(existing->nonce));
+        log_debug(proc->logger,
+                  "Identity: first contact: refreshed reachability for %s\n",
+                  existing->petname);
+    } else {
+        contact_t fresh;
+        memset(&fresh, 0, sizeof(fresh));
+        /* Borrowed: contacts_add deep-copies, so this never owns the identity
+         * and must not free it. */
+        fresh.identity = *who;
+        at_strlcpy(fresh.petname, who->petname, sizeof(fresh.petname));
+        fresh.provenance = AT_PROV_TOKEN;
+        fresh.verified = false;
+        fresh.trust_seed = 0.0;
+        fresh.added_at = (double)time(NULL);
+        if (nonce != NULL)
+            at_strlcpy(fresh.nonce, nonce, sizeof(fresh.nonce));
+        _rendezvous_refresh(&fresh, endpoint);
+        if (contacts_add(&store, &fresh) == 0)
+            log_info(proc->logger,
+                     "Identity: first contact: recorded %s as an unverified "
+                     "contact\n", fresh.petname);
+        else
+            log_warn(proc->logger,
+                     "Identity: first contact: could not record contact %s\n",
+                     uuid_s);
+        /* Only the hint list is ours; the identity is borrowed (above). */
+        for (size_t i = 0; i < fresh.rendezvous_count; i++)
+            free(fresh.rendezvous[i]);
+        free(fresh.rendezvous);
+    }
+
+    if (contacts_save(&store, data_dir) != 0)
+        log_warn(proc->logger,
+                 "Identity: first contact: could not persist contacts (%s)\n",
+                 strerror(errno));
+    contacts_free(&store);
+}
+
 bool handle_first_contact_hello(const process_t *proc, directory_t *queues,
                                 generic_msg_t *msg)
 {
@@ -421,6 +544,9 @@ bool handle_first_contact_hello(const process_t *proc, directory_t *queues,
     json_decref(body);
     messaging_send("network", NET_MESSAGE, &ack, false);
     _free_public(&ack.info.net_msg.from_whom);
+    /* After the ack is on its way: the address book is durable state, not part
+     * of the handshake's critical path. */
+    _record_contact(proc, &nmsg->from_whom, nonce_copy, nmsg->from_whom.address);
     return true;
 }
 
@@ -440,6 +566,19 @@ bool handle_first_contact_hello_ack(const process_t *proc, directory_t *queues,
      * so the envelope signature is checked against it upstream. Python's
      * handle_hello_ack reads the payload no further either. */
     identity_admit_direct_peer((process_t *)proc, queues, &nmsg->from_whom);
+    /* Our own side of the address book. The redeemer usually already has a
+     * contact for this identity (at_redeem_invitation built one, possibly
+     * verified in person); the preserve rule in _record_contact keeps that
+     * posture and only refreshes where the inviter answered from. */
+    char ack_nonce[AT_CONTACT_NONCE_MAX + 1] = {0};
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) == 0 && payload != NULL) {
+        const char *n = json_string_value(json_object_get(payload, "nonce"));
+        if (n != NULL)
+            at_strlcpy(ack_nonce, n, sizeof(ack_nonce));
+        json_decref(payload);
+    }
+    _record_contact(proc, &nmsg->from_whom, ack_nonce, nmsg->from_whom.address);
     log_info(proc->logger,
              "Identity: first contact: %s accepted; direct peer established\n",
              nmsg->from_whom.nickname);

@@ -52,7 +52,8 @@ from ..network.message import Message
 from ..config.configuration import to_json_string, atomic_write, Configuration
 from .identity import Identity
 from .protocol import IdentityProtocol
-from ..contacts import Invitation, InvalidInvitation
+from ..contacts import (Invitation, InvalidInvitation, Contact, Contacts,
+                       Provenance)
 
 _logger = logging.getLogger(__name__)
 
@@ -163,6 +164,81 @@ def _admit_direct_peer(proc, queues, identity) -> bool:
     return True
 
 
+#: How many reachability hints one contact keeps. A peer that re-handshakes
+#: from a new network on every join would otherwise grow its hint list without
+#: bound in a file that is never pruned; the newest is the one worth trying
+#: first, so the list is most-recent-first and truncated here.
+MAX_RENDEZVOUS_HINTS = 4
+
+
+def _contacts_store(proc):
+    """Lazy handle on the durable contacts store, cached on the process.
+
+    Read once per process rather than per handshake: the file is this node's
+    own address book, and only the identity process writes it (the same
+    single-writer argument :class:`SpentNonces` relies on). An unreadable store
+    degrades to an empty in-memory one -- loud, because it means this node will
+    re-add contacts it already had."""
+    store = getattr(proc, '_first_contact_contacts', None)
+    if store is None:
+        try:
+            store = Contacts.load()
+        except (OSError, ValueError, TypeError) as err:
+            proc.logger.warning('contacts store unreadable (%s); starting empty', err)
+            store = Contacts()
+        proc._first_contact_contacts = store
+    return store
+
+
+def _record_contact(proc, identity, nonce='', endpoint=''):
+    """Write or refresh the durable :class:`..contacts.Contact` for a peer we
+    just completed a handshake with.
+
+    A NEW contact is always ``token``-provenance and UNVERIFIED: the accepter
+    cannot know how its invitation travelled (``create_invitation`` carries no
+    in-person flag -- ``in_person`` is the *redeemer's* local knowledge), so the
+    key that just arrived over the wire has had no out-of-band confirmation.
+    Verification, and the trust seed that follows it, still come from a
+    safety-number compare (:func:`..contacts.verify_contact`).
+
+    An EXISTING contact keeps everything the user or an earlier verification
+    established -- verified state, petname, provenance, trust seed, added_at --
+    and only its reachability and originating nonce are refreshed. A handshake
+    must never downgrade a verified contact (a re-presented ticket would
+    otherwise be an attacker's way to strip the verified flag), and must never
+    re-derive the petname, which is random-suffixed and already on the user's
+    screen.
+
+    Returns the stored Contact, or None if it could not be recorded."""
+    store = _contacts_store(proc)
+    try:
+        contact = store.get(str(identity.uuid))
+    except (AttributeError, TypeError):
+        contact = None
+    if contact is None:
+        contact = Contact(identity, rendezvous=[endpoint] if endpoint else [],
+                          provenance=Provenance.token, nonce=nonce)
+        store.add(contact)
+        proc.logger.info('first contact: recorded %s as an unverified contact',
+                         contact.petname)
+    else:
+        if endpoint:
+            hints = [endpoint] + [h for h in contact.rendezvous if h != endpoint]
+            contact.rendezvous = hints[:MAX_RENDEZVOUS_HINTS]
+        if nonce:
+            contact.nonce = nonce
+        proc.logger.debug('first contact: refreshed reachability for %s',
+                          contact.petname)
+    try:
+        store.save()
+    except OSError as err:
+        # In-memory only for this run: the peer is admitted either way, and a
+        # lost record costs a re-add, not a security property.
+        proc.logger.warning('could not persist contact for %s (%s)',
+                            contact.petname, err)
+    return contact
+
+
 def handle_hello(proc, queues, message) -> bool:
     """Inviter side: honor a valid, single-use invitation we minted, admit the
     sender as a direct peer, and acknowledge."""
@@ -199,6 +275,10 @@ def handle_hello(proc, queues, message) -> bool:
                   to_json_string({'nonce': nonce}),
                   to_whom=sender, from_whom=proc.identity, encrypt=False)
     queues[CfgIds.network].put(ack, block=True, timeout=proc.q_cadence)
+    # After the ack is on its way: the address book is durable state, not part
+    # of the handshake's critical path.
+    _record_contact(proc, sender, nonce=nonce,
+                    endpoint=getattr(sender, 'address', '') or '')
     return True
 
 
@@ -210,6 +290,19 @@ def handle_hello_ack(proc, queues, message) -> bool:
         proc.logger.warning('first-contact ack with no sender identity; ignoring')
         return True
     _admit_direct_peer(proc, queues, accepter)
+    # Our own side of the address book. The redeemer usually already has a
+    # Contact for this identity (redeem_invitation built one, possibly verified
+    # in-person); the preserve rule above keeps that posture and only refreshes
+    # where the inviter answered from.
+    nonce = ''
+    try:
+        payload = json.loads(message.obj) if isinstance(message.obj, str) else message.obj
+        if isinstance(payload, dict):
+            nonce = str(payload.get('nonce', '') or '')
+    except (ValueError, TypeError):
+        pass
+    _record_contact(proc, accepter, nonce=nonce,
+                    endpoint=getattr(accepter, 'address', '') or '')
     proc.logger.info('first contact: %s accepted; direct peer established',
                      accepter.nickname)
     return True

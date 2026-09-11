@@ -47,6 +47,7 @@ from autonomous_trust.core.identity.encrypt import Encryptor
 from autonomous_trust.core.identity.idprocess import IdentityProcess
 from autonomous_trust.core.identity.protocol import IdentityProtocol
 from autonomous_trust.core.identity.first_contact import _FLAG as FIRST_CONTACT_FLAG
+from autonomous_trust.core.contacts import FIRST_CONTACT_VERIFIED_SEED
 from autonomous_trust.core.identity.sign import Signature
 from autonomous_trust.core.identity.zta import ZtaPolicy
 from autonomous_trust.core.network.message import Message
@@ -271,6 +272,69 @@ class _Participant:
                             f'{self.id}: {pid} landed in the GROUP address map; '
                             f'a first-contact peer must not become a group '
                             f'member (the group key would follow)')
+            elif key == 'contacts':
+                # The durable address book the handshake leaves behind, as
+                # {participant_id: {field: value} | false}. Read from DISK, not
+                # from the process, because the file is the cross-runtime
+                # artifact: both runtimes write the same contacts.cfg.json, so
+                # a scenario that passes on both proves they agree on its
+                # contents and not merely on their own in-memory shape.
+                # C mirrors via contacts_load + contacts_get.
+                from autonomous_trust.core.contacts import Contacts
+                store = Contacts.load()
+                for pid, want in (expected or {}).items():
+                    peer_uuid = str(self._uuid_for_pid(pid))
+                    contact = store.get(peer_uuid)
+                    if not want:
+                        if contact is not None:
+                            raise AssertionError(
+                                f'{self.id}: recorded a contact for {pid}, '
+                                f'expected none')
+                        continue
+                    if contact is None:
+                        raise AssertionError(
+                            f'{self.id}: no contact recorded for {pid}')
+                    for field, value in want.items():
+                        if field == 'verified':
+                            actual = bool(contact.verified)
+                            value = bool(value)
+                        elif field == 'provenance':
+                            actual = contact.provenance.value
+                            value = str(value)
+                        elif field == 'petname':
+                            actual = contact.petname
+                            value = str(value)
+                        elif field == 'nonce':
+                            actual = contact.nonce
+                            value = str(value)
+                        elif field == 'trust_seed':
+                            actual = round(float(contact.trust_seed), 6)
+                            value = round(float(value), 6)
+                        elif field == 'rendezvous_count':
+                            # COUNT, not contents: the two harnesses hand
+                            # participants different addresses (Python
+                            # 10.0.0.N, C 10.0.70.N), so the hint the handshake
+                            # just learned is not a value a cross-runtime case
+                            # can name. What both runtimes must agree on is how
+                            # MANY hints survive and what sits behind the new
+                            # one -- the dedup, the cap, and the "newest first"
+                            # order.
+                            actual = len(contact.rendezvous)
+                            value = int(value)
+                        elif field == 'rendezvous_tail':
+                            # Everything after the newest hint: fixture-supplied
+                            # values, so this is nameable. Pins that a refresh
+                            # PREPENDS rather than replaces.
+                            actual = list(contact.rendezvous[1:])
+                            value = [str(v) for v in value]
+                        else:
+                            raise AssertionError(
+                                f'{self.id}: unsupported contacts field '
+                                f'{field!r}')
+                        if actual != value:
+                            raise AssertionError(
+                                f'{self.id}: contact[{pid}].{field}={actual!r}, '
+                                f'expected {value!r}')
             elif key == 'first_contact_hello_endpoint':
                 # Where trigger_first_contact_initiate addressed its hello.
                 # Pins the resolution ORDER: the invitation's rendezvous hint
@@ -368,6 +432,19 @@ class _Participant:
                         raise AssertionError(
                             f'{self.id}: peer_profile[{peer_id!r}]={actual!r}, '
                             f'expected {want_obj!r}')
+            elif key == 'connection_state':
+                # {peer_id: <int>} (Increment 5) -- the connection edge state
+                # this participant holds toward another, via
+                # get_connection_state: none=0, pending_out=1, pending_in=2,
+                # connected=3, declined=4. C mirrors via
+                # identity_get_connection_state keyed by the same uuid.
+                for peer_id, want in expected.items():
+                    peer_uuid = self._uuid_for_pid(peer_id)
+                    actual = self.process.get_connection_state(peer_uuid)
+                    if actual != want:
+                        raise AssertionError(
+                            f'{self.id}: connection_state[{peer_id!r}]={actual!r}, '
+                            f'expected {want!r}')
             elif key == 'partition_probes_emitted':
                 # Number of group_partition_probe messages this participant
                 # emitted over the whole scenario. The signal-cooldown
@@ -918,6 +995,45 @@ class IdentityAdapter:
         # in configs[PackageHash.key]; mirror that contract.
         self._package_hash = PackageHash().digest
 
+    @staticmethod
+    def _install_contacts(case: Case, participants) -> None:
+        """Pre-seed the durable address book from ``fixtures.contacts``.
+
+        Shape is ``{participant_id: {verified, petname, provenance,
+        rendezvous, trust_seed}}``, and the record is built from THAT
+        participant's own public identity -- the fixture cannot pin keys it
+        does not generate. One store per scenario (the harness gives the whole
+        scenario one data root), which is all the re-handshake cases need: they
+        assert what a SECOND handshake does to a record that already exists.
+
+        C mirrors this in its adapter; both runtimes must write the same
+        canonical file or the preserve rule would be tested against two
+        different starting states.
+        """
+        fixture = (case.data.get('fixtures', {}) or {}).get('contacts') or {}
+        if not fixture:
+            return
+        from autonomous_trust.core.contacts import Contact, Contacts, Provenance
+        store = Contacts()
+        for pid, spec in fixture.items():
+            participant = participants.get(pid)
+            if participant is None:
+                raise AssertionError(
+                    f'fixtures.contacts names unknown participant {pid!r}')
+            spec = spec or {}
+            identity = participant.impl.process.identity.publish()
+            provenance = Provenance(spec.get('provenance', Provenance.token.value))
+            contact = Contact(identity, petname=spec.get('petname', ''),
+                              rendezvous=list(spec.get('rendezvous') or []),
+                              provenance=provenance,
+                              nonce=spec.get('nonce', ''))
+            if spec.get('verified'):
+                contact.mark_verified(float(spec['trust_seed'])
+                                      if 'trust_seed' in spec
+                                      else FIRST_CONTACT_VERIFIED_SEED)
+            store.add(contact)
+        store.save()
+
     def run_scenario(self, case: Case) -> None:
         self._scratch = tempfile.TemporaryDirectory(prefix='at-conformance-id-')
         fc_fix = (case.data.get('fixtures', {}) or {}).get('first_contact') or {}
@@ -937,6 +1053,7 @@ class IdentityAdapter:
                 os.environ.pop(FIRST_CONTACT_FLAG, None)
 
             participants = self._build_participants(case)
+            self._install_contacts(case, participants)
             ctx = ScenarioContext(
                 case=case,
                 participants=participants,
@@ -1984,6 +2101,33 @@ class IdentityAdapter:
             body = {'profile': profile, 'sig': sig}
             if not (isinstance(payload, dict) and payload.get('unstamped')):
                 body['seq'] = int(payload.get('seq', 1)) if isinstance(payload, dict) else 1
+            obj = to_json_string(body)
+        elif function == IdentityProtocol.connection_request:
+            # handle_connection_request reads no payload -- it sets pending_in
+            # from from_whom. Empty obj, generic path (mirrors the C builder).
+            obj = ''
+        elif function == IdentityProtocol.connection_response:
+            # handle_connection_response parses {decision, sig, seq}. The
+            # signature is over the canonical (requester=recipient,
+            # accepter=sender, decision, seq) with the sender's key -- exactly as
+            # handle_app_connect_respond would -- so a Python or C receiver
+            # verifies it. A scenario may override `sig` (bad-signature drop) or
+            # set `unstamped: true` (replay/unstamped refusal); `accept` (bool)
+            # selects the decision. Mirrors the C peer_connection_response builder.
+            from autonomous_trust.core.capabilities import connection_sign
+            decision = 1 if (isinstance(payload, dict) and payload.get('accept')) else 0
+            recipient = participants[to_id].impl.identity
+            seq = int(payload.get('seq', 1)) if isinstance(payload, dict) else 1
+            if isinstance(payload, dict) and isinstance(payload.get('sig'), str):
+                sig = payload['sig']
+            else:
+                sig = connection_sign(sender.process.identity.signature.private,
+                                      recipient.uuid,
+                                      sender.process.identity.uuid,
+                                      decision, seq)
+            body = {'decision': decision, 'sig': sig}
+            if not (isinstance(payload, dict) and payload.get('unstamped')):
+                body['seq'] = seq
             obj = to_json_string(body)
         elif function == IdentityProtocol.id_query:
             # Identity-resync query (layer 3): {group_uuid, have:[uuids]}.

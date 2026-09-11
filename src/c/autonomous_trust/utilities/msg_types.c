@@ -76,6 +76,9 @@ size_t message_size(message_type_t type)
         return sizeof(peer_position_msg_t);
     case PEER_PROFILE_OBSERVED:
         return sizeof(peer_profile_msg_t);
+    case PEER_CONNECTION_REQUEST_OBSERVED:
+    case PEER_CONNECTION_STATE_OBSERVED:
+        return sizeof(peer_connection_msg_t);
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:
     case ZTA_VERIFICATION_RESULT:
@@ -135,6 +138,10 @@ char *message_type_to_string(message_type_t type)
         return (char*)"PEER_POSITION_OBSERVED";
     case PEER_PROFILE_OBSERVED:
         return (char*)"PEER_PROFILE_OBSERVED";
+    case PEER_CONNECTION_REQUEST_OBSERVED:
+        return (char*)"PEER_CONNECTION_REQUEST_OBSERVED";
+    case PEER_CONNECTION_STATE_OBSERVED:
+        return (char*)"PEER_CONNECTION_STATE_OBSERVED";
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:
         return (char*)"ZTA_REVOCATION_ALERT";
@@ -196,6 +203,10 @@ message_type_t string_to_message_type(const char *str)
         return PEER_POSITION_OBSERVED;
     if (strcmp(str, "PEER_PROFILE_OBSERVED") == 0)
         return PEER_PROFILE_OBSERVED;
+    if (strcmp(str, "PEER_CONNECTION_REQUEST_OBSERVED") == 0)
+        return PEER_CONNECTION_REQUEST_OBSERVED;
+    if (strcmp(str, "PEER_CONNECTION_STATE_OBSERVED") == 0)
+        return PEER_CONNECTION_STATE_OBSERVED;
 #ifdef AT_ZTA_ENABLED
     if (strcmp(str, "ZTA_STANDING") == 0)
         return ZTA_STANDING;
@@ -456,6 +467,15 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         subdata = smrt_create(subdata_len);
         if (subdata == NULL) return EXCEPTION(ENOMEM);
         memcpy(subdata, &msg->info.peer_profile, subdata_len);
+        break;
+    }
+    case PEER_CONNECTION_REQUEST_OBSERVED:
+    case PEER_CONNECTION_STATE_OBSERVED:
+    {
+        subdata_len = sizeof(peer_connection_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.peer_connection, subdata_len);
         break;
     }
 #ifdef AT_ZTA_ENABLED
@@ -720,6 +740,10 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
         break;
     case PEER_PROFILE_OBSERVED:
         COPY_FIXED_PAYLOAD(peer_profile, peer_profile_msg_t);
+        break;
+    case PEER_CONNECTION_REQUEST_OBSERVED:
+    case PEER_CONNECTION_STATE_OBSERVED:
+        COPY_FIXED_PAYLOAD(peer_connection, peer_connection_msg_t);
         break;
     case PEER_REPUTATION:
         COPY_FIXED_PAYLOAD(peer_reputation, peer_reputation_msg_t);
