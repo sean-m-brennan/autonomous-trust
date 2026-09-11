@@ -400,6 +400,14 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             except Exception:  # noqa: BLE001 — bad env seed => opted out
                 self.own_profile = {}
         self.peer_profiles: dict = {}
+        # Explicit connections (Increment 5): peer uuid string -> edge state int
+        # (an EXPLICIT, revocable edge SEPARATE from reputation; none=0,
+        # pending_out=1, pending_in=2, connected=3, declined=4). Filled by
+        # handle_connection_request/response. The app-driven request/respond
+        # verbs and app-event emission are C-only (as with position/profile);
+        # a Python node maintains the edge map (get_connection_state, the
+        # conformance surface). USER-INITIATED: nothing is auto-sent on confirm.
+        self.connection_edges: dict = {}
         self.protocol.register_handler(IdentityProtocol.announce, self.welcoming_committee)
         self.protocol.register_handler(IdentityProtocol.accept, self.handle_acceptance)
         self.protocol.register_handler(IdentityProtocol.history, self.receive_history)
@@ -414,6 +422,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.position_response, self.handle_position_response)
         self.protocol.register_handler(IdentityProtocol.profile_query, self.handle_profile_query)
         self.protocol.register_handler(IdentityProtocol.profile_response, self.handle_profile_response)
+        self.protocol.register_handler(IdentityProtocol.connection_request, self.handle_connection_request)
+        self.protocol.register_handler(IdentityProtocol.connection_response, self.handle_connection_response)
         self.protocol.register_handler(IdentityProtocol.id_query, self.handle_identity_query)
         self.protocol.register_handler(IdentityProtocol.id_response, self.handle_identity_response)
         self.protocol.register_handler(IdentityProtocol.roster_req, self.handle_roster_request)
@@ -3729,6 +3739,89 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         Conformance/assertion surface; twin of C ``identity_get_peer_profile``."""
         with self.lock:
             return dict(self.peer_profiles.get(str(uuid_str), {}))
+
+    # ------------------------------------------------------------------
+    # Explicit connections (Increment 5): an EXPLICIT, revocable edge SEPARATE
+    # from reputation. Twin of the C block in id_proc.c
+    # (handle_connection_request/_response). The request is a bare ask that sets
+    # our edge to pending_in; the response carries a detached Ed25519 SIGNATURE
+    # over the canonical (requester, accepter, decision, seq) form
+    # (capabilities.connection_canonical) so a captured accept cannot be replayed
+    # or re-attributed. USER-INITIATED: nothing is auto-sent on confirm. The
+    # app-driven request/respond verbs and app-event emission are C-only; a
+    # Python node maintains the edge map (get_connection_state).
+    # ------------------------------------------------------------------
+
+    def handle_connection_request(self, queues, message):
+        """A peer asks to connect: set our edge toward it to pending_in (an
+        already-connected edge is left alone; a re-ask is idempotent). No wire
+        response — connections are user-initiated (the app decides)."""
+        if message.function != IdentityProtocol.connection_request:
+            return False
+        sender = getattr(message, 'from_whom', None)
+        if sender is None:
+            return True
+        from ..capabilities import CONN_CONNECTED, CONN_PENDING_IN
+        key = str(getattr(sender, 'uuid', None))
+        with self.lock:
+            if self.connection_edges.get(key) == CONN_CONNECTED:
+                return True
+            self.connection_edges[key] = CONN_PENDING_IN
+        self.logger.debug('connection request from peer %s', key[:8])
+        return True
+
+    def handle_connection_response(self, queues, message):
+        """The accepter's answer to OUR request — {decision, sig, seq}:
+        freshness-checked (replay-refused) and SIGNATURE-verified against the
+        accepter's signing key over the canonical (requester=us, accepter=sender,
+        decision, seq) form, then our edge is set connected/declined. No app
+        emission here (C runtime's job)."""
+        if message.function != IdentityProtocol.connection_response:
+            return False
+        sender = getattr(message, 'from_whom', None)
+        if sender is None:
+            return True
+        try:
+            body = from_json_string(message.obj)
+            if not isinstance(body, dict):
+                return True
+            decision = body.get('decision')
+            sig = body.get('sig')
+            if not isinstance(decision, int) or not isinstance(sig, str):
+                return True
+            if not self.freshness.accept(str(getattr(sender, 'uuid', None)),
+                                         IdentityProtocol.connection_response,
+                                         body.get('seq')):
+                self.logger.debug(
+                    'connection_response from %s refused (replay/unstamped)',
+                    str(getattr(sender, 'uuid', ''))[:8])
+                return True
+            from ..capabilities import (connection_verify, CONN_CONNECTED,
+                                        CONN_DECLINED)
+            if not connection_verify(sender.signature.public,
+                                     self.identity.uuid, sender.uuid,
+                                     1 if decision else 0, int(body.get('seq')),
+                                     sig):
+                self.logger.warning(
+                    'connection_response from %s: BAD SIGNATURE, dropping',
+                    str(getattr(sender, 'uuid', ''))[:8])
+                return True
+            new_state = CONN_CONNECTED if decision else CONN_DECLINED
+            with self.lock:
+                self.connection_edges[str(sender.uuid)] = new_state
+            self.logger.debug('connection with peer %s -> %s',
+                              str(sender.uuid)[:8],
+                              'connected' if decision else 'declined')
+        except Exception as err:
+            self.report_exception(err, 'handle_connection_response')
+        return True
+
+    def get_connection_state(self, uuid_str):
+        """The connection edge state toward a peer uuid, or 0 (none) if no edge.
+        Conformance/assertion surface; twin of C
+        ``identity_get_connection_state``."""
+        with self.lock:
+            return self.connection_edges.get(str(uuid_str), 0)
 
     # How often the cap-resync sweep runs, and the max queries it emits per
     # sweep (so a large degraded group can't burst the network queue). The

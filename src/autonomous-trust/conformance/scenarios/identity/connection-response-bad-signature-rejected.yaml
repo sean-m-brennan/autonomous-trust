@@ -1,0 +1,47 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: connection-response-bad-signature-rejected
+byte_pinning: false
+description: |
+    The integrity surface for the connection response (Increment 5): the edge is
+    only set if the response's detached Ed25519 signature verifies against the
+    accepter's signing key. This delivers a well-formed, freshness-stamped accept
+    whose `sig` is garbage (an explicit override the adapter passes through
+    instead of signing). Both runtimes must DROP it — the decision looks fine and
+    the seq is fresh, so only the signature check stands between a forged accept
+    and a connected edge.
+
+    Step 1: bg -> newcomer peer_connection_response {accept, sig:"00..", seq:3}.
+      - Both runtimes: accept the freshness seq, fail signature verification,
+        set nothing.
+
+    Assertion: newcomer.connection_state[bg] is none (0) — the forged accept
+    never landed. (Freshness is consumed by the accept, so this is the signature
+    gate, not a freshness refusal; the control is connection-accept-connects,
+    where the same delivery with a valid signature yields connected.)
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_connection_response
+    payload:
+      accept: true
+      sig: "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+      seq: 3
+    description: |
+        A freshly-stamped accept carrying a bogus signature (the adapter forwards
+        the explicit `sig` verbatim). Must be dropped on signature verification,
+        never applied to the edge.
+
+expected_state:
+  newcomer:
+    connection_state:
+      bg: 0   # none — forged accept dropped

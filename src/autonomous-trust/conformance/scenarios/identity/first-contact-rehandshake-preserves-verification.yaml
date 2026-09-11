@@ -1,0 +1,87 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: first-contact-rehandshake-preserves-verification
+byte_pinning: false
+description: |
+    A second handshake with a contact that is already verified.
+
+    THE ASSERTION THAT MATTERS is `verified: true` surviving. A contact becomes
+    verified only by a human comparing safety numbers out of band (§4.4), and
+    the seed that follows is a reputation prior. If a later handshake rewrote
+    the record, then re-presenting a ticket -- something anyone who obtained one
+    can do -- would strip the verified flag off a confirmed contact and, on the
+    next pass, drop its reputation prior with it. That is a downgrade an
+    attacker drives, not a refresh.
+
+    The petname is the same story in miniature: it is the local Zooko name the
+    user already reads on screen, derived once with a random suffix and never
+    on the wire. Re-deriving it on a re-handshake would rename a friend.
+
+    What a re-handshake MAY do is refresh reachability: the newest hint moves
+    to the front and the previous one stays behind it, so a contact that moved
+    networks is still reachable at either. The count pins the dedup and the cap
+    (4, both runtimes -- they write the same file, so a different cap would make
+    the file's contents depend on which runtime last touched it).
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  # The store already holds Bob, verified in person, under a petname the user
+  # chose. Built from Bob's own generated identity -- a fixture cannot pin keys
+  # it does not generate.
+  contacts:
+    bob:
+      verified: true
+      petname: old-friend
+      provenance: in_person
+      trust_seed: 0.3
+      rendezvous:
+        - 192.168.1.9
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000000a3"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000000b3"
+      size: 1
+
+steps:
+  - id: 1
+    from: bob
+    to: alice
+    function: first_contact_hello
+    payload:
+      minted_by: alice
+      nonce: fc-rehandshake-1
+      expiry: 0
+      rendezvous:
+        - 10.0.0.1
+    description: |
+        Bob handshakes again, from a different network than the one the stored
+        hint records.
+
+expected_state:
+  alice:
+    direct_peers:
+      bob: true
+    contacts:
+      bob:
+        # Everything the user or an earlier verification established, intact.
+        verified: true
+        petname: old-friend
+        provenance: in_person
+        trust_seed: 0.3
+        # ...and only reachability moved: the new hint in front, the stored one
+        # kept behind it.
+        rendezvous_count: 2
+        rendezvous_tail:
+          - 192.168.1.9
+        # The originating nonce follows the latest ticket.
+        nonce: fc-rehandshake-1

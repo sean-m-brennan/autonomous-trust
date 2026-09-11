@@ -71,6 +71,19 @@
  * only to the identity process. Third verb on the app→AT allowlist. */
 #define AT_APP_SET_PROFILE "app_set_profile"
 
+/* App→AT: request an explicit connection to a peer (Increment 5). The payload
+ * is {"peer": "<uuid_str>"}; identity sets our edge to pending_out and sends a
+ * directed encrypted peer_connection_request to that peer. Forwarded only to
+ * the identity process. Fourth verb on the app→AT allowlist. */
+#define AT_APP_CONNECT_REQUEST "app_connect_request"
+
+/* App→AT: respond to an inbound connection request (Increment 5). The payload
+ * is {"peer": "<uuid_str>", "accept": <bool>}; identity sets our edge to
+ * connected/declined and sends a directed encrypted, SIGNED
+ * peer_connection_response. Forwarded only to the identity process. Fifth verb
+ * on the app→AT allowlist. */
+#define AT_APP_CONNECT_RESPOND "app_connect_respond"
+
 #define DEFAULT_MAX_MSG_SIZE 1024
 /* MAX_MSG_SIZE is configurable at runtime via messaging_set_max_size() */
 #define MAX_MSG_SIZE (messaging_max_size())

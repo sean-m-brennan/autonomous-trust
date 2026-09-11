@@ -60,9 +60,10 @@ class Provenance(Enum):
 # (bands: reputation/repprocess.py PREREP_NEUTRAL/COMM_CUTOFF). Handing a fresh
 # contact ~0.5 for free is exactly the "flat all-to-all trust mesh" the neutral
 # band was introduced to avoid, so the bump is small and must still be EARNED
-# upward by real interaction. This slice only RECORDS the seed on the Contact;
-# injecting it into the running reputation process is a later (live) slice.
-# Override via AT_FIRST_CONTACT_SEED.
+# upward by real interaction. The value recorded here is read back by the
+# reputation process (repprocess._apply_contact_seeds and its C twin), which
+# applies it as a COLD-START PRIOR only -- never over an earned, warm-started or
+# slashed score. Override via AT_FIRST_CONTACT_SEED.
 FIRST_CONTACT_VERIFIED_SEED = float(os.environ.get('AT_FIRST_CONTACT_SEED', '0.3'))
 
 

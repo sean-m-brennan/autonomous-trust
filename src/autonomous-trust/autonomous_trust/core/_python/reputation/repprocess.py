@@ -53,6 +53,7 @@ from .reputation import (TransactionHistory, Reputation, Reputations,
 # from the prequential package rather than redefined here so there is exactly
 # one `floor(x + 0.5)` in the runtime, matching the C twin's; that package
 # imports nothing from reputation, so this direction is the acyclic one.
+from ..contacts import Contacts
 from ..prequential import weight_round
 from ..system import CfgIds, now, encoding, proc_idle_floor
 from .. import _probes
@@ -396,6 +397,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # per-node reputation-view dump emitted from process(). See
         # _dump_reputation_trace. 0 == last dump not yet taken.
         self._last_rep_dump = 0.0
+        # First-contact trust seeds (FIRST_CONTACT_PLAN.md §10.5). Applied
+        # AFTER the warm-start snapshot above, so a persisted value always
+        # wins -- see _apply_contact_seeds.
+        self._contact_seed_mtime = None
+        self._apply_contact_seeds()
         self._seed_idle_from_snapshot()
         # Communication-cut-off exclusion set (peer-uuid-str). A peer whose
         # aggregate reputation is below COMM_CUTOFF is excluded from the
@@ -2742,6 +2748,60 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             (score - cls.REPUTATION_DECAY_ASYMPTOTE) * factor
         return max(cls.REPUTATION_DECAY_ASYMPTOTE, decayed)
 
+    def _apply_contact_seeds(self):
+        """Give each VERIFIED first-contact contact its cold-start prior.
+
+        FIRST_CONTACT_PLAN.md §10.5, the user's settled fork: a contact whose
+        key the two humans confirmed out of band (the safety-number compare)
+        starts SLIGHTLY above the neutral cold-start band rather than at it --
+        ``FIRST_CONTACT_VERIFIED_SEED`` (0.3) against ``PREREP_NEUTRAL`` (0.2).
+        A deliberate human confirmation is worth more than no information, and
+        much less than earned standing, which is why the bump is one notch and
+        not a jump into the CTFT pivot band.
+
+        The seed is a PRIOR, not a score. It is written only where this node
+        has NO reputation for the peer at all, so it can never overwrite a
+        value the peer earned, a warm-started one from ``reputation.cfg.json``,
+        or a slashed one -- a contact cannot be verified back into good
+        standing. From there ``_consensus_baseline`` already prefers
+        ``reputations.current`` over the neutral, so the seed reaches every
+        reader without a second mechanism.
+
+        Read from the contacts store rather than pushed by the identity
+        process: the store is durable, already shared byte-for-byte with the C
+        runtime, and this keeps the trust-seed decision in one file instead of
+        adding the tree's first identity->reputation IPC path. The cost is that
+        a seed lands on the next pass rather than the instant of verification,
+        which is immaterial for a cold-start prior.
+        """
+        try:
+            mtime = os.path.getmtime(Contacts.default_path())
+        except OSError:
+            return       # no contacts file at all: the norm for most nodes
+        if mtime == self._contact_seed_mtime:
+            return       # nothing has been written since the last pass
+        self._contact_seed_mtime = mtime
+        try:
+            store = Contacts.load()
+        except (OSError, ValueError, TypeError) as err:
+            self.logger.warning('contacts store unreadable (%s); no trust seeds '
+                                'applied this pass', err)
+            return
+        for contact in store.verified():
+            seed = float(getattr(contact, 'trust_seed', 0.0) or 0.0)
+            if seed <= 0.0:
+                continue
+            try:
+                peer_uuid = UUID(str(contact.uuid))
+            except (ValueError, TypeError, AttributeError):
+                continue
+            current = self.reputations.current
+            if peer_uuid in current or str(peer_uuid) in current:
+                continue     # already known here; earned beats seeded
+            self.reputations.update(peer_uuid, seed)
+            self.logger.info('first contact: seeded verified contact %s at %.2f',
+                             str(peer_uuid)[:8], seed)
+
     def _seed_idle_from_snapshot(self):
         """At start-up, treat the persisted reputation snapshot's mtime as
         the moment of our last AT-bounded activity: seed every warm-started
@@ -4286,6 +4346,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # ZTA findings arrive over IPC from IdentityProcess; act on any
                 # that are new (doc/architecture/zta-integration.md). Idempotent, so it is safe every pass.
                 self._apply_zta_standings(queues)
+                # A contact verified since boot (the identity process rewrites
+                # contacts.cfg.json on every handshake and verification) gets
+                # its seed here. Guarded by mtime, so the usual pass is one
+                # stat() and nothing else.
+                self._apply_contact_seeds()
                 drained = 0
                 # First iteration blocks briefly so we don't hot-spin
                 # when the queue is empty; subsequent iterations are

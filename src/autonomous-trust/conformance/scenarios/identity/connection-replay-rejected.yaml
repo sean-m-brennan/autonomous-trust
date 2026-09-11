@@ -1,0 +1,55 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: connection-replay-rejected
+byte_pinning: false
+description: |
+    Freshness on the signed connection response (Increment 5). A
+    peer_connection_response carries a freshness `seq`; a captured response
+    replayed with a stale (non-increasing) seq must be REFUSED, not applied —
+    otherwise an eavesdropper could flip a connected edge with an old capture.
+    Both delivered responses below are correctly SIGNED (the adapter signs each
+    with bg's key), so the refusal is attributable to the freshness gate alone,
+    never to a bad signature.
+
+    Step 1: bg -> newcomer peer_connection_response {accept:true, seq:2}.
+      - Both runtimes: accepted (first stamp), edge[bg]=connected.
+    Step 2: bg -> newcomer peer_connection_response {accept:false, seq:1}.
+      - Both runtimes: seq 1 is not above the mark (2), so the freshness gate
+        refuses it; the edge stays connected and the per-verb refusal tally ticks.
+
+    Assertions: newcomer.connection_state[bg] is still connected (3) — the replay
+    did not flip it — and freshness_refusals[peer_connection_response]=1.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_connection_response
+    payload:
+      accept: true
+      seq: 2
+    description: bg's genuine accept; newcomer records connected.
+  - id: 2
+    from: bg
+    to: newcomer
+    function: peer_connection_response
+    payload:
+      accept: false
+      seq: 1
+    description: |
+        A replayed/stale response (seq below the mark), validly signed. Refused
+        by freshness; the connected edge must not flip to declined.
+
+expected_state:
+  newcomer:
+    connection_state:
+      bg: 3   # still connected
+    freshness_refusals:
+      peer_connection_response: 1
