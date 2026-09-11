@@ -41,6 +41,7 @@
 #include "id_proc_priv.h"
 #include "profile.h"
 #include "connection.h"
+#include "dm.h"
 #include "first_contact.h"
 #include "utilities/b64.h"
 #include "utilities/freshness.h"
@@ -112,6 +113,10 @@ static char ID_PROFILE_RESPONSE[]  = "peer_profile_response";
  * seq) form (identity/connection.c). USER-INITIATED — not auto-sent on confirm. */
 static char ID_CONNECTION_REQUEST[]  = "peer_connection_request";
 static char ID_CONNECTION_RESPONSE[] = "peer_connection_response";
+/* Direct message (Increment 6). Directed + ENCRYPTED (never on the plaintext
+ * allowlist): a single one-way peer→peer text message carrying {text, seq, ts}.
+ * crypto_box authenticates the sender, so NO extra signature is needed. */
+static char ID_DM[]          = "peer_dm";
 /* Identity backfill for a cold/late joiner that holds a group member's
  * address but never received its full Identity (merge/partition path fills
  * group.address_map but peers[] stays sparse). See identity_periodic_identity
@@ -129,6 +134,7 @@ static char ID_APP_SET_POSITION[] = AT_APP_SET_POSITION;
 static char ID_APP_SET_PROFILE[]  = AT_APP_SET_PROFILE;
 static char ID_APP_CONNECT_REQUEST[] = AT_APP_CONNECT_REQUEST;
 static char ID_APP_CONNECT_RESPOND[] = AT_APP_CONNECT_RESPOND;
+static char ID_APP_SEND_DM[] = AT_APP_SEND_DM;
 
 /* Forward decls: defined below beside the position handlers, but used earlier
  * (the query from the admission path, the validator from state init). */
@@ -352,6 +358,14 @@ static struct {
      * reputation. Filled by handle_connection_request/response and the app
      * connect verbs; conformance surface via identity_get_connection_state. */
     map_t connection_edges;
+    /* Most-recent DM received per sender (Increment 6), keyed by lowercased
+     * sender uuid string; values are string_data(compact JSON {"text","seq",
+     * "ts"}). A DM is a LIVE STREAM delivered to the app on arrival, so this is
+     * NOT roster-replayed state (unlike peer_profile_map): it exists purely as
+     * the conformance/observability surface for identity_get_last_dm, the twin
+     * of Python IdentityProcess.get_last_dm. Filled by handle_dm after the
+     * freshness gate, right before the app emit. */
+    map_t last_dm_map;
     /* Outstanding operator-attended pulls WE issued: nonce string -> peer uuid
      * string (heap-dup'd). The nonce is the only thing that makes a returned
      * attestation attributable to a request this node actually made; a reply
@@ -481,6 +495,7 @@ static void _ensure_id_init(void)
         }
         map_init(&id_state.peer_profile_map);
         map_init(&id_state.connection_edges);
+        map_init(&id_state.last_dm_map);
         /* Opt-in own profile (Increment 3): seed from $AT_OWN_PROFILE (a JSON
          * object string) for headless/conformance; the Flutter UI sets it at
          * runtime via AT_APP_SET_PROFILE instead. Absent/invalid => opted out. */
@@ -786,6 +801,45 @@ int identity_get_connection_state(const char *uuid_str)
     }
     pthread_mutex_unlock(&id_state.lock);
     return state;
+}
+
+/* Conformance seam: the most-recent DM this node received from peer @p uuid_str
+ * (Increment 6). Copies the body into @p text_buf (always NUL-terminated) and,
+ * when non-NULL, the sender's freshness seq into @p seq_out. Returns true iff a
+ * DM is recorded for that peer. The map is filled by handle_dm; scenarios assert
+ * via the `dm_last` expected_state key. Twin of Python get_last_dm. A DM is a
+ * live stream, so this is observability only — never roster-replayed. */
+bool identity_get_last_dm(const char *uuid_str, char *text_buf, size_t text_sz,
+                          int64_t *seq_out)
+{
+    if (text_buf != NULL && text_sz > 0) text_buf[0] = '\0';
+    if (seq_out != NULL) *seq_out = 0;
+    if (uuid_str == NULL) return false;
+    _ensure_id_init();
+    bool found = false;
+    pthread_mutex_lock(&id_state.lock);
+    data_t *dat = NULL;
+    if (map_get(&id_state.last_dm_map, (map_key_t)uuid_str, &dat) == 0
+        && dat != NULL)
+    {
+        char *s = NULL;
+        if (data_string_ptr(dat, &s) == 0 && s != NULL) {
+            json_error_t jerr;
+            json_t *o = json_loads(s, 0, &jerr);
+            if (o != NULL) {
+                json_t *jt = json_object_get(o, "text");
+                json_t *js = json_object_get(o, "seq");
+                if (json_is_string(jt) && text_buf != NULL && text_sz > 0)
+                    snprintf(text_buf, text_sz, "%s", json_string_value(jt));
+                if (json_is_integer(js) && seq_out != NULL)
+                    *seq_out = (int64_t)json_integer_value(js);
+                json_decref(o);
+                found = true;
+            }
+        }
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return found;
 }
 
 size_t identity_provisional_count(const process_t *proc)
@@ -2782,6 +2836,8 @@ void identity_reset_state(void)
     map_init(&id_state.peer_profile_map);
     map_free(&id_state.connection_edges);
     map_init(&id_state.connection_edges);
+    map_free(&id_state.last_dm_map);
+    map_init(&id_state.last_dm_map);
     memset(&id_state.own_profile, 0, sizeof(id_state.own_profile));
     /* Cleared per scenario so no clock sample leaks from one corpus case into
      * the next; each sample's heap payload goes with it. */
@@ -4579,6 +4635,162 @@ static int identity_emit_all_connections(const process_t *proc)
             emitted++;
     }
     return emitted;
+}
+
+/****************************
+ * Direct messages (Increment 6, the "message this peer" surface).
+ *
+ * A DM is a single directed, ENCRYPTED, one-way peer→peer text message carrying
+ * {text, seq, ts}. crypto_box already authenticates the sender (only the real
+ * peer's key produces the frame), so — UNLIKE the connection accept — there is
+ * NO extra Ed25519 signature. NO request/response and NO gossip: it is delivered
+ * to the recipient's app on arrival and never replayed as roster state. DMs are
+ * allowed between any two admitted peers (no connection/tier gate — that gates
+ * the feed, Increment 7). The freshness seq is a per-sender replay guard.
+ ****************************/
+
+/* AT -> app: surface one received DM as PEER_DM_OBSERVED. @p sender_uuid is the
+ * authenticated sender. Mirrors identity_emit_connection. */
+static int identity_emit_dm(const uuid_t sender_uuid, int64_t seq, double ts,
+                            const char *text)
+{
+    generic_msg_t msg = {0};
+    msg.type = PEER_DM_OBSERVED;
+    msg.size = sizeof(peer_dm_msg_t);
+    memcpy(msg.info.peer_dm.peer_uuid, sender_uuid, 16);
+    msg.info.peer_dm.seq = seq;
+    msg.info.peer_dm.ts = ts;
+    at_dm_bound_text(text, msg.info.peer_dm.text, sizeof(msg.info.peer_dm.text));
+    return messaging_send(AT_MAIN_QUEUE, PEER_DM_OBSERVED, &msg, false);
+}
+
+/* Record the most-recent DM from @p sender_str for the conformance/observability
+ * seam (identity_get_last_dm). A DM is a live stream, so this is NOT roster
+ * state — it is never replayed. Own locking. */
+static void _last_dm_store(const char *sender_str, const char *text,
+                           int64_t seq, double ts)
+{
+    json_t *env = at_dm_to_json(text, seq, ts);
+    if (env == NULL) return;
+    char *compact = json_dumps(env, JSON_COMPACT);
+    json_decref(env);
+    if (compact == NULL) return;
+    size_t len = strlen(compact);
+    char *dup = smrt_create(len + 1);
+    if (dup == NULL) { free(compact); return; }
+    memcpy(dup, compact, len + 1);
+    free(compact);
+    data_t *dat = string_data(dup, len + 1);
+    if (dat == NULL) { smrt_deref(dup); return; }
+    pthread_mutex_lock(&id_state.lock);
+    map_set(&id_state.last_dm_map, (map_key_t)sender_str, dat);
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+/* Directed, encrypted DM to one admitted peer: {text,seq,ts}. crypto_box
+ * authenticates us, so no signature. Encrypt=true: NOT on the plaintext
+ * allowlist. */
+static int _send_dm(const process_t *proc, const public_identity_t *peer,
+                    const char *text, int64_t seq, double ts)
+{
+    generic_msg_t out = {0};
+    out.type = NET_MESSAGE;
+    strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
+    out.info.net_msg.function = ID_DM;
+    out.info.net_msg.encrypt = true;
+    memcpy(&out.info.net_msg.to_whom, peer, sizeof(public_identity_t));
+    strncpy(out.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    json_t *env = at_dm_to_json(text, seq, ts);
+    if (env == NULL) return -1;
+    net_msg_pack_json(&out.info.net_msg, env);
+    json_decref(env);
+    messaging_send("network", NET_MESSAGE, &out, false);
+    return 0;
+}
+
+/* App -> AT verb (AT_APP_SEND_DM): the operator sends a text message to a peer.
+ * Payload {"peer": "<uuid_str>", "text": "<body>"}. Stamp a freshness seq, set
+ * ts=now, send the directed encrypted peer_dm. The core does NOT echo the
+ * outgoing message back — the app echoes it locally. */
+static bool handle_app_send_dm(const process_t *proc, directory_t *queues,
+                               generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *j_peer = json_object_get(payload, "peer");
+    json_t *j_text = json_object_get(payload, "text");
+    if (!json_is_string(j_peer)) { json_decref(payload); return true; }
+    uuid_t peer_uuid;
+    int rc = uuid_parse(json_string_value(j_peer), peer_uuid);
+    char text[AT_DM_TEXT_MAX + 1];
+    at_dm_bound_text(json_is_string(j_text) ? json_string_value(j_text) : "",
+                     text, sizeof(text));
+    json_decref(payload);
+    if (rc != 0) {
+        log_warn(proc->logger, "Identity: app send_dm: bad peer uuid\n");
+        return true;
+    }
+    public_identity_t peer;
+    if (!_find_peer_pub_by_uuid(proc, peer_uuid, &peer)) {
+        log_warn(proc->logger, "Identity: app send_dm: unknown peer\n");
+        return true;
+    }
+    pthread_mutex_lock(&id_state.lock);
+    int64_t seq = freshness_stamp(&id_state.freshness, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (seq <= 0) {
+        log_warn(proc->logger, "Identity: no freshness sequence; not sending DM\n");
+        return true;
+    }
+    double ts = (double)time(NULL);
+    _send_dm(proc, &peer, text, seq, ts);
+    char peer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, peer_str);
+    log_info(proc->logger, "Identity: DM sent to %s\n", peer_str);
+    return true;
+}
+
+/* Handler: an inbound directed DM from a peer — {text,seq,ts}. Freshness-checked
+ * (per-sender replay guard), bound-truncated, then surfaced to the app. No wire
+ * response and no echo. The sender is the authenticated envelope's from_whom. */
+static bool handle_dm(const process_t *proc, directory_t *queues,
+                      generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    char text[AT_DM_TEXT_MAX + 1];
+    int64_t seq = 0;
+    double ts = 0.0;
+    if (at_dm_from_json(payload, text, sizeof(text), &seq, &ts) != 0) {
+        json_decref(payload);
+        log_warn(proc->logger, "Identity: peer_dm unstamped/malformed, refusing\n");
+        return true;
+    }
+    json_decref(payload);
+
+    char sender[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, sender);
+    pthread_mutex_lock(&id_state.lock);
+    bool fresh = freshness_accept(&id_state.freshness, sender, ID_DM, seq,
+                                  proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (!fresh) {
+        log_debug(proc->logger, "Identity: peer_dm from %s refused (replay)\n",
+                  sender);
+        return true;
+    }
+
+    _last_dm_store(sender, text, seq, ts);
+    identity_emit_dm(nmsg->from_whom.uuid, seq, ts, text);
+    log_debug(proc->logger, "Identity: DM received from peer %s\n", sender);
+    return true;
 }
 
 /****************************
@@ -8475,6 +8687,8 @@ int identity_register_handlers(process_t *proc)
     process_register_handler(proc, ID_CONNECTION_RESPONSE, (handler_ptr_t)handle_connection_response);
     process_register_handler(proc, ID_APP_CONNECT_REQUEST, (handler_ptr_t)handle_app_connect_request);
     process_register_handler(proc, ID_APP_CONNECT_RESPOND, (handler_ptr_t)handle_app_connect_respond);
+    process_register_handler(proc, ID_DM,          (handler_ptr_t)handle_dm);
+    process_register_handler(proc, ID_APP_SEND_DM, (handler_ptr_t)handle_app_send_dm);
     process_register_handler(proc, ID_IDENTITY_QUERY,
                              (handler_ptr_t)handle_identity_query);
     process_register_handler(proc, ID_IDENTITY_RESPONSE,

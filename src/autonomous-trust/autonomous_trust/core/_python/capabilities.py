@@ -256,6 +256,21 @@ CONN_CONNECTED = 3
 CONN_DECLINED = 4
 
 
+# Direct message body bound (Increment 6). MUST match C AT_DM_TEXT_LEN
+# (msg_types.h) / AT_DM_TEXT_MAX (identity/dm.h) and AT_APP_DM_TEXT_LEN
+# (app_events.h). A DM carries NO signature (crypto_box authenticates the
+# sender), so there is no canonical form here — only the body bound.
+DM_TEXT_MAX = 1024
+
+
+def bound_dm_text(text: str) -> str:
+    """Truncate a DM body to DM_TEXT_MAX UTF-8 bytes. Twin of C
+    at_dm_bound_text (the app-boundary buffer clamp)."""
+    if not isinstance(text, str):
+        return ''
+    return _clamp_bytes(text, DM_TEXT_MAX)
+
+
 def connection_canonical(requester_uuid, accepter_uuid, decision: int,
                          seq: int) -> bytes:
     """THE cross-language signing contract (see C identity/connection.h):

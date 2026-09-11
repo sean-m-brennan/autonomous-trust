@@ -123,6 +123,15 @@ bool identity_get_peer_profile(const char *uuid_str, char *buf, size_t buflen);
  *  Python IdentityProcess.get_connection_state. */
 int identity_get_connection_state(const char *uuid_str);
 
+/** The most-recent DM this node received from peer @p uuid_str (Increment 6).
+ *  Copies the body into @p text_buf (always NUL-terminated) and, when non-NULL,
+ *  the sender's freshness seq into @p seq_out. Returns true iff a DM is recorded
+ *  for that peer. The map is filled by handle_dm (observability only — a DM is a
+ *  live stream, never roster-replayed); conformance asserts via the `dm_last`
+ *  expected_state key. Twin of Python IdentityProcess.get_last_dm. */
+bool identity_get_last_dm(const char *uuid_str, char *text_buf, size_t text_sz,
+                          int64_t *seq_out);
+
 /** Copy the size-bounded capability descriptor recorded for @p cap_name (from
  *  the descriptor form of `peer_caps_response`) into @p buf as a JSON string
  *  ({required_tier, description, kind, arg_schema}; name excluded). Returns 0

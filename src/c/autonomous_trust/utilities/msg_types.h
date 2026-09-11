@@ -56,6 +56,7 @@ typedef enum {
     PEER_PROFILE_OBSERVED,   /**< Identity → app: one peer's shared agora.profile (opt-in, signature-verified, @ref peer_profile_msg_t). Local IPC only. */
     PEER_CONNECTION_REQUEST_OBSERVED, /**< Identity → app: an inbound connection ASK from a peer (Increment 5, @ref peer_connection_msg_t). Local IPC only. */
     PEER_CONNECTION_STATE_OBSERVED,   /**< Identity → app: our connection edge-state toward a peer changed (Increment 5, @ref peer_connection_msg_t). Local IPC only. */
+    PEER_DM_OBSERVED,        /**< Identity → app: a directed text message received from a peer (Increment 6, @ref peer_dm_msg_t). Local IPC only. Live stream — delivered on arrival, never roster state. */
 #ifdef AT_ZTA_ENABLED
     ZTA_REVOCATION_ALERT,    /**< Peer credential revocation notice. */
     ZTA_VERIFICATION_RESULT, /**< Outcome of a deferred ZTA verification. */
@@ -331,6 +332,31 @@ typedef struct {
     int32_t state;   /**< @ref at_conn_state_t cast to int. */
 } peer_connection_msg_t;
 
+/* Max bytes of a DM body carried across the AT->app boundary (Increment 6).
+ * MUST match AT_DM_TEXT_MAX in identity/dm.h, AT_APP_DM_TEXT_LEN in app_events.h,
+ * and AGORA_DM_TEXT_MAX in the shim / cohort ctypes. */
+#define AT_DM_TEXT_LEN 1024
+
+/**
+ * @brief AT → app: one directed text message received from a peer (Increment 6).
+ *
+ * A DM is a single directed, ENCRYPTED peer→peer message; crypto_box already
+ * authenticates the sender, so no extra signature is needed and the sender uuid
+ * is trustworthy. @c seq is the sender's freshness sequence (a replayed/stale
+ * seq is dropped before this is emitted); @c ts is the sender's send time (epoch
+ * seconds). @c text is bound-truncated to @ref AT_DM_TEXT_LEN bytes. Local IPC
+ * only, and a LIVE STREAM — delivered on arrival, never replayed as roster
+ * state. The on-wire form is the directed encrypted peer_dm verb, not this
+ * message.
+ */
+typedef struct {
+    uuid_t  peer_uuid;   /**< The SENDER's uuid. */
+    int64_t seq;         /**< The sender's freshness sequence. */
+    double  ts;          /**< The sender's send time (epoch seconds). */
+    /** NUL-terminated message body, bound-truncated to AT_DM_TEXT_LEN bytes. */
+    char    text[AT_DM_TEXT_LEN + 1];
+} peer_dm_msg_t;
+
 #define SIGNAL_LEN 32
 
 typedef struct
@@ -418,6 +444,7 @@ typedef struct
         peer_position_msg_t peer_position;
         peer_profile_msg_t peer_profile;
         peer_connection_msg_t peer_connection;
+        peer_dm_msg_t peer_dm;
 #ifdef AT_ZTA_ENABLED
         zta_event_msg_t zta_event;
         zta_standing_msg_t zta_standing;
