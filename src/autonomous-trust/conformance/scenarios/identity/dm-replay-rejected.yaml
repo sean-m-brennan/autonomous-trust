@@ -1,0 +1,57 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: dm-replay-rejected
+byte_pinning: false
+description: |
+    Freshness on the direct message (Increment 6). A peer_dm carries a freshness
+    `seq`; a captured DM replayed with a stale (non-increasing) seq must be
+    REFUSED, not delivered — otherwise an eavesdropper could re-inject an old
+    capture into the recipient's thread. There is no signature on a DM (crypto_box
+    authenticates the sender), so the refusal here is attributable to the freshness
+    gate alone.
+
+    Step 1: bg -> newcomer peer_dm {text:"first", seq:2}.
+      - Both runtimes: accepted (first stamp), recorded as the last DM from bg.
+    Step 2: bg -> newcomer peer_dm {text:"replayed", seq:1}.
+      - Both runtimes: seq 1 is not above the mark (2), so the freshness gate
+        refuses it; the recorded DM stays "first" and the per-verb refusal tally
+        ticks once.
+
+    Assertions: newcomer.dm_last[bg] is still the FIRST message (the replay did not
+    overwrite it), and freshness_refusals[peer_dm]=1.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_dm
+    payload:
+      text: first
+      seq: 2
+    description: bg's genuine DM; newcomer records it.
+  - id: 2
+    from: bg
+    to: newcomer
+    function: peer_dm
+    payload:
+      text: replayed
+      seq: 1
+    description: |
+        A replayed/stale DM (seq below the mark). Refused by freshness; the
+        recorded DM must not change to the replayed body.
+
+expected_state:
+  newcomer:
+    dm_last:
+      bg:
+        seq: 2
+        text: first
+    freshness_refusals:
+      peer_dm: 1

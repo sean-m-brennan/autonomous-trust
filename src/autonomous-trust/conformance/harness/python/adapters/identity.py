@@ -445,6 +445,23 @@ class _Participant:
                         raise AssertionError(
                             f'{self.id}: connection_state[{peer_id!r}]={actual!r}, '
                             f'expected {want!r}')
+            elif key == 'dm_last':
+                # {peer_id: {seq, text}} (Increment 6) -- the most-recent DM this
+                # participant received from another, via get_last_dm. An absent DM
+                # (never delivered, or dropped by the replay gate) fails. C mirrors
+                # this via identity_get_last_dm keyed by the same uuid.
+                for peer_id, want in expected.items():
+                    peer_uuid = self._uuid_for_pid(peer_id)
+                    actual = self.process.get_last_dm(peer_uuid)
+                    if not actual:
+                        raise AssertionError(
+                            f'{self.id}: dm_last[{peer_id!r}] absent, expected a DM')
+                    want_obj = want if isinstance(want, dict) else {}
+                    for fk, fv in want_obj.items():
+                        if actual.get(fk) != fv:
+                            raise AssertionError(
+                                f'{self.id}: dm_last[{peer_id!r}].{fk}='
+                                f'{actual.get(fk)!r}, expected {fv!r}')
             elif key == 'partition_probes_emitted':
                 # Number of group_partition_probe messages this participant
                 # emitted over the whole scenario. The signal-cooldown
@@ -2128,6 +2145,20 @@ class IdentityAdapter:
             body = {'decision': decision, 'sig': sig}
             if not (isinstance(payload, dict) and payload.get('unstamped')):
                 body['seq'] = seq
+            obj = to_json_string(body)
+        elif function == IdentityProtocol.dm:
+            # handle_dm parses {text, seq, ts}. A DM carries NO signature
+            # (crypto_box authenticates the sender on the wire; in the harness the
+            # from_whom identity stands in). `unstamped: true` drops the seq,
+            # modelling a stripped field which must be refused. Mirrors the C
+            # peer_dm builder.
+            text = payload.get('text', '') if isinstance(payload, dict) else ''
+            ts = payload.get('ts', 0.0) if isinstance(payload, dict) else 0.0
+            body = {'text': text if isinstance(text, str) else '',
+                    'ts': float(ts) if isinstance(ts, (int, float)) else 0.0}
+            if not (isinstance(payload, dict) and payload.get('unstamped')):
+                body['seq'] = int(payload.get('seq', 1)) \
+                    if isinstance(payload, dict) else 1
             obj = to_json_string(body)
         elif function == IdentityProtocol.id_query:
             # Identity-resync query (layer 3): {group_uuid, have:[uuids]}.

@@ -84,6 +84,13 @@
  * on the app→AT allowlist. */
 #define AT_APP_CONNECT_RESPOND "app_connect_respond"
 
+/* App→AT: send a directed text message to a peer (Increment 6). The payload is
+ * {"peer": "<uuid_str>", "text": "<body>"}; identity sends a directed encrypted
+ * peer_dm carrying {text, seq, ts} to that peer. The app echoes the outgoing
+ * message locally (the core does not echo it back). Forwarded only to the
+ * identity process. Sixth verb on the app→AT allowlist. */
+#define AT_APP_SEND_DM "app_send_dm"
+
 #define DEFAULT_MAX_MSG_SIZE 1024
 /* MAX_MSG_SIZE is configurable at runtime via messaging_set_max_size() */
 #define MAX_MSG_SIZE (messaging_max_size())

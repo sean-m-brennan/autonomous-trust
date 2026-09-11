@@ -408,6 +408,14 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # a Python node maintains the edge map (get_connection_state, the
         # conformance surface). USER-INITIATED: nothing is auto-sent on confirm.
         self.connection_edges: dict = {}
+        # Direct messages (Increment 6): the most-recent DM received per sender,
+        # peer uuid string -> {'seq','ts','text'}. A DM is a LIVE STREAM
+        # delivered to the app on arrival, so this is NOT roster state (it is
+        # never replayed); it exists purely as the conformance/observability
+        # surface for get_last_dm, the twin of C identity_get_last_dm. The
+        # app-driven send verb and app-event emission are C-only (as with
+        # position/profile/connection). Filled by handle_dm after freshness.
+        self.last_dm: dict = {}
         self.protocol.register_handler(IdentityProtocol.announce, self.welcoming_committee)
         self.protocol.register_handler(IdentityProtocol.accept, self.handle_acceptance)
         self.protocol.register_handler(IdentityProtocol.history, self.receive_history)
@@ -424,6 +432,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.profile_response, self.handle_profile_response)
         self.protocol.register_handler(IdentityProtocol.connection_request, self.handle_connection_request)
         self.protocol.register_handler(IdentityProtocol.connection_response, self.handle_connection_response)
+        self.protocol.register_handler(IdentityProtocol.dm, self.handle_dm)
         self.protocol.register_handler(IdentityProtocol.id_query, self.handle_identity_query)
         self.protocol.register_handler(IdentityProtocol.id_response, self.handle_identity_response)
         self.protocol.register_handler(IdentityProtocol.roster_req, self.handle_roster_request)
@@ -3822,6 +3831,64 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         ``identity_get_connection_state``."""
         with self.lock:
             return self.connection_edges.get(str(uuid_str), 0)
+
+    # ------------------------------------------------------------------
+    # Direct messages (Increment 6): a single one-way, directed ENCRYPTED
+    # peer->peer text message carrying {text, seq, ts}. crypto_box authenticates
+    # the sender on the wire, so — UNLIKE the connection accept — there is NO
+    # signature. NO request/response, NO gossip, NO roster replay: delivered on
+    # arrival. Twin of the C block in id_proc.c (handle_dm). The app-driven send
+    # verb and app-event emission are C-only; a Python node records the most
+    # recent DM per sender (get_last_dm) for the conformance observable.
+    # ------------------------------------------------------------------
+
+    def handle_dm(self, queues, message):
+        """An inbound directed DM from a peer — {text, seq, ts}: freshness-checked
+        (per-sender replay guard), body bound-truncated, then recorded as the most
+        recent DM from that sender. No app emission here (C runtime's job)."""
+        if message.function != IdentityProtocol.dm:
+            return False
+        sender = getattr(message, 'from_whom', None)
+        if sender is None:
+            return True
+        try:
+            body = from_json_string(message.obj)
+            if not isinstance(body, dict):
+                return True
+            seq = body.get('seq')
+            text = body.get('text')
+            ts = body.get('ts')
+            # seq must be an int and text a str; a stripped/mistyped field is
+            # refused (the replay guard needs the seq), mirroring the C handler.
+            if not isinstance(seq, int) or not isinstance(text, str) \
+                    or not isinstance(ts, (int, float)):
+                self.logger.warning('peer_dm unstamped/malformed, refusing')
+                return True
+            if not self.freshness.accept(str(getattr(sender, 'uuid', None)),
+                                         IdentityProtocol.dm, seq):
+                self.logger.debug(
+                    'peer_dm from %s refused (replay/unstamped)',
+                    str(getattr(sender, 'uuid', ''))[:8])
+                return True
+            from ..capabilities import bound_dm_text
+            with self.lock:
+                self.last_dm[str(sender.uuid)] = {
+                    'seq': int(seq),
+                    'ts': float(ts),
+                    'text': bound_dm_text(text),
+                }
+            self.logger.debug('DM received from peer %s',
+                              str(sender.uuid)[:8])
+        except Exception as err:
+            self.report_exception(err, 'handle_dm')
+        return True
+
+    def get_last_dm(self, uuid_str):
+        """The most-recent DM received from a peer uuid, as {'seq','ts','text'},
+        or {} if none. Conformance/assertion surface; twin of C
+        ``identity_get_last_dm``."""
+        with self.lock:
+            return dict(self.last_dm.get(str(uuid_str), {}))
 
     # How often the cap-resync sweep runs, and the max queries it emits per
     # sweep (so a large degraded group can't burst the network queue). The

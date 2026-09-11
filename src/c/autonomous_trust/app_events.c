@@ -188,6 +188,21 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
             ev->data.connection.state = msg.info.peer_connection.state;
             break;
         }
+        case PEER_DM_OBSERVED:
+        {
+            at_app_event_t *ev = &out[n++];
+            memset(ev, 0, sizeof(*ev));
+            ev->kind = AT_APP_EVENT_DM;
+            memcpy(ev->data.dm.peer_uuid,
+                   msg.info.peer_dm.peer_uuid, AT_APP_UUID_LEN);
+            ev->data.dm.seq = msg.info.peer_dm.seq;
+            ev->data.dm.ts = msg.info.peer_dm.ts;
+            /* Bounded copy of the message body; the emitter NUL-caps it and the
+             * event was memset, so a short string stays terminated. */
+            memcpy(ev->data.dm.text, msg.info.peer_dm.text, AT_APP_DM_TEXT_LEN);
+            ev->data.dm.text[AT_APP_DM_TEXT_LEN] = '\0';
+            break;
+        }
         default:
             /* Not app-facing: skipped rather than surfaced as an event. A
              * consumer of this ABI is not given AT's internal traffic. */
@@ -322,6 +337,37 @@ int at_app_events_connect_respond(at_app_events_t *handle, const char *q_out,
 {
     return connect_send(handle, q_out, AT_APP_CONNECT_RESPOND, peer_uuid,
                         true, accept);
+}
+
+int at_app_events_send_dm(at_app_events_t *handle, const char *q_out,
+                          const uint8_t peer_uuid[AT_APP_UUID_LEN],
+                          const char *text)
+{
+    if (handle == NULL || !name_survives(q_out) || peer_uuid == NULL)
+        return -1;
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
+    char uuid_str[37];
+    uuid_unparse_lower((const unsigned char *)peer_uuid, uuid_str);
+    /* {"peer": "<uuid_str>", "text": "<body>"}; identity bound-truncates text
+     * and sends the directed encrypted peer_dm. */
+    json_t *env = json_object();
+    if (env == NULL)
+        return -1;
+    json_object_set_new(env, "peer", json_string(uuid_str));
+    json_object_set_new(env, "text", json_string(text != NULL ? text : ""));
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),
+             "identity");
+    req.info.net_msg.function = (char *)AT_APP_SEND_DM;
+    req.info.net_msg.encrypt = false;
+    if (net_msg_pack_json(&req.info.net_msg, env) != 0) {
+        json_decref(env);
+        return -1;
+    }
+    json_decref(env);
+    return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
 }
 
 void at_app_events_close(at_app_events_t *handle)
