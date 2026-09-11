@@ -153,6 +153,20 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
             ev->data.position.geohash[AT_APP_GEOHASH_LEN] = '\0';
             break;
         }
+        case PEER_PROFILE_OBSERVED:
+        {
+            at_app_event_t *ev = &out[n++];
+            memset(ev, 0, sizeof(*ev));
+            ev->kind = AT_APP_EVENT_PEER_PROFILE;
+            memcpy(ev->data.profile.peer_uuid,
+                   msg.info.peer_profile.peer_uuid, AT_APP_UUID_LEN);
+            /* Bounded copy of the compact profile JSON; the emitter NUL-caps it
+             * and the event was memset, so a short string stays terminated. */
+            memcpy(ev->data.profile.profile_json,
+                   msg.info.peer_profile.profile_json, AT_APP_PROFILE_JSON_LEN);
+            ev->data.profile.profile_json[AT_APP_PROFILE_JSON_LEN] = '\0';
+            break;
+        }
         default:
             /* Not app-facing: skipped rather than surfaced as an event. A
              * consumer of this ABI is not given AT's internal traffic. */
@@ -198,6 +212,40 @@ int at_app_events_set_position(at_app_events_t *handle, const char *q_out,
         return -1;
     json_object_set_new(env, "pos",
                         json_string(geohash != NULL ? geohash : ""));
+    if (net_msg_pack_json(&req.info.net_msg, env) != 0) {
+        json_decref(env);
+        return -1;
+    }
+    json_decref(env);
+    return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
+}
+
+int at_app_events_set_profile(at_app_events_t *handle, const char *q_out,
+                              const char *profile_json)
+{
+    if (handle == NULL || !name_survives(q_out))
+        return -1;
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
+    /* Payload IS the profile object; NULL/"" => empty object => clears it. */
+    json_t *env = NULL;
+    if (profile_json != NULL && profile_json[0] != '\0') {
+        json_error_t jerr;
+        env = json_loads(profile_json, 0, &jerr);
+        if (env == NULL || !json_is_object(env)) {
+            if (env != NULL) json_decref(env);
+            return -1;
+        }
+    } else {
+        env = json_object();
+        if (env == NULL) return -1;
+    }
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),
+             "identity");
+    req.info.net_msg.function = (char *)AT_APP_SET_PROFILE;
+    req.info.net_msg.encrypt = false;
     if (net_msg_pack_json(&req.info.net_msg, env) != 0) {
         json_decref(env);
         return -1;

@@ -580,11 +580,13 @@ class TestCohortDeltaChannel:
 
     def test_a_malformed_delta_does_not_stop_the_drain(self):
         ui, worker = self._pair()
+        ui.logger = MagicMock()
         worker.update_group({'uuid-1': _ident()})
         worker.publish({'kind': 'roster'})                    # no 'peers' -> KeyError
         worker.publish({'kind': 'meta', 'uuid': 'uuid-1', 'metadata': 'GOOD'})
         ui.acquire_data()
         assert ui.peers['uuid-1'].metadata == 'GOOD'          # the good one still applied
+        assert ui.logger.error.called                         # and the bad one was named
 
     def test_the_drain_is_bounded_per_tick(self):
         """A burst must not stall the render loop."""
@@ -641,6 +643,12 @@ class TestCohortDeltaAcrossARealFork:
             pool = QueuePool.__new__(QueuePool)
             pool._pool = [PooledQueue(mgr.Queue) for _ in range(4)]
             ui = Cohort(pool)
+            # The roster publish below carries a MagicMock identity, which a
+            # manager queue cannot pickle -- an artifact of the fixture, not of
+            # the delta path under test. `update_group` applies the roster
+            # locally first, so the drop costs this test nothing; mock the
+            # logger so its warning does not read as a failure in the output.
+            ui.logger = MagicMock()
             ui.update_group({'uuid-1': _ident()})    # roster owned here for brevity
             channel = ui.updates
 
@@ -990,6 +998,7 @@ class TestUpdaterIsolation:
 
     def test_one_failing_updater_does_not_silence_the_rest(self):
         ci = self._live()
+        ci.logger = MagicMock()
         called = []
 
         def broken():
@@ -1157,9 +1166,53 @@ class TestQueueSlotsAreReturned:
         c = self._cohort(size=8)
         c.update_group(self._group('A', 'B', 'C'))
         assert c.queue_pool.free_count() == 1      # one, so the pair cannot fit
+        c.logger = MagicMock()
         c.update_group(self._group('A', 'B', 'C', 'D'))
         assert 'D' not in c.peers
         assert c.queue_pool.free_count() == 1
+        assert c.logger.error.called               # exhaustion is reported...
+        # ...against the pool that EXISTS: 8 slots with 1 free, not the
+        # class-level default of 128 (which read as 127 outstanding, a leak
+        # report off by the whole default).
+        reported = c.logger.error.call_args[0][0] % c.logger.error.call_args[0][1:]
+        assert '1 of 8 slots free' in reported
+        # ...and every outstanding slot here is held by somebody: 3 peers x 2
+        # plus the delta subscription. Nothing leaked, so nothing may be
+        # accused of leaking -- the operator's next move is a bigger pool.
+        assert 'not leaking' in reported
+        assert 'LEAKING' not in reported
+
+    def test_a_real_leak_is_named_as_one(self):
+        """The other half of that distinction. A slot reserved by nobody is
+        not a sizing problem, and telling the operator to enlarge the pool
+        would send them after the wrong thing entirely."""
+        c = self._cohort(size=8)
+        # Two slots reserved by nobody -- the shape a departure that does not
+        # release leaves behind. 8 slots, less these two and the delta
+        # subscription, leaves room for two peers, not three.
+        assert c.queue_pool.reserve() is not None
+        assert c.queue_pool.reserve() is not None
+        c.logger = MagicMock()
+        c.update_group(self._group('A', 'B', 'C'))
+        assert 'C' not in c.peers                  # the leak already costs a peer
+        reported = c.logger.error.call_args[0][0] % c.logger.error.call_args[0][1:]
+        assert '2 are LEAKING' in reported         # the stranded pair, named
+        assert 'undersized' not in reported
+
+    def test_the_subscribe_side_names_the_verdict_too(self):
+        """The other exhaustion site. It advised checking for outstanding
+        slots without ever saying whether there were any -- the one question
+        the process asking it can answer."""
+        pool = _pool(size=3)
+        assert pool.reserve() is not None      # two slots held by nobody
+        assert pool.reserve() is not None
+        c = Cohort(pool)                       # the UI channel takes the last
+        assert c.channel_for(Cohort.UI_CONSUMER) is not None
+        c.logger = MagicMock()
+        assert c.subscribe('video-sink') is None
+        reported = c.logger.error.call_args[0][0] % c.logger.error.call_args[0][1:]
+        assert "no delta channel for 'video-sink'" in reported
+        assert '2 are LEAKING' in reported     # the stranded pair, not the UI's
 
     def test_the_applier_side_releases_nothing(self):
         """`_apply_roster` resolves slots it never reserved. Releasing there

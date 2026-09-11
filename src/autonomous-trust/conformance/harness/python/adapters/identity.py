@@ -354,6 +354,20 @@ class _Participant:
                         raise AssertionError(
                             f'{self.id}: peer_position[{peer_id!r}]={actual!r}, '
                             f'expected {want!r}')
+            elif key == 'peer_profile':
+                # {peer_id: {profile fields}} (Increment 3) -- the profile this
+                # participant recorded for another, via get_peer_profile (a dict),
+                # compared structurally. {} means none recorded (opted out, or
+                # dropped on bad signature / over-bound field / replay). C mirrors
+                # via identity_get_peer_profile keyed by the same uuid.
+                for peer_id, want in expected.items():
+                    peer_uuid = self._uuid_for_pid(peer_id)
+                    actual = self.process.get_peer_profile(peer_uuid)
+                    want_obj = want if isinstance(want, dict) else {}
+                    if actual != want_obj:
+                        raise AssertionError(
+                            f'{self.id}: peer_profile[{peer_id!r}]={actual!r}, '
+                            f'expected {want_obj!r}')
             elif key == 'partition_probes_emitted':
                 # Number of group_partition_probe messages this participant
                 # emitted over the whole scenario. The signal-cooldown
@@ -418,6 +432,17 @@ class _Participant:
                 if actual != expected:
                     raise AssertionError(
                         f'{self.id}: position_responses_emitted={actual}, '
+                        f'expected {expected}'
+                    )
+            elif key == 'profile_responses_emitted':
+                # peer_profile_response emissions by this participant (Increment
+                # 3) -- same opt-in-guard observable as position: 0 when opted
+                # out, 1 per answered query when opted in. C mirrors by scanning
+                # captured[] for (from==self, peer_profile_response).
+                actual = self.emit_tally.get(IdentityProtocol.profile_response, 0)
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: profile_responses_emitted={actual}, '
                         f'expected {expected}'
                     )
             elif key == 'propose_emitted':
@@ -1185,6 +1210,15 @@ class IdentityAdapter:
             pos_fix: dict[str, str] = fixtures.get('positions', {}) or {}
             if pid in pos_fix:
                 participant.process.own_geohash = str(pos_fix[pid] or '')
+            # Install own agora.profile from fixtures.profiles (Increment 3);
+            # mirrors the C adapter's `identity_set_own_profile` seam. An opted-in
+            # participant's handle_profile_query answers with this (sanitized,
+            # signed) profile; absent/empty, it is opted OUT (the default).
+            prof_fix: dict[str, dict] = fixtures.get('profiles', {}) or {}
+            if pid in prof_fix:
+                from autonomous_trust.core.capabilities import sanitize_profile
+                raw = prof_fix[pid] if isinstance(prof_fix[pid], dict) else {}
+                participant.process.own_profile = sanitize_profile(raw)
             # Inject N synthetic cap-less peers (fixtures.capless_peers[pid])
             # directly into this participant's roster: present in self.peers but
             # absent from peer_capabilities -- exactly the state the periodic
@@ -1924,6 +1958,30 @@ class IdentityAdapter:
             # modelling a stripped field, which must be refused rather than
             # stored. Mirrors the C peer_position_response builder.
             body = {'pos': payload.get('pos', '') if isinstance(payload, dict) else ''}
+            if not (isinstance(payload, dict) and payload.get('unstamped')):
+                body['seq'] = int(payload.get('seq', 1)) if isinstance(payload, dict) else 1
+            obj = to_json_string(body)
+        elif function == IdentityProtocol.profile_query:
+            # handle_profile_query reads no payload -- answers with our own
+            # profile IFF opted in (own_profile set, via fixtures.profiles).
+            obj = ''
+        elif function == IdentityProtocol.profile_response:
+            # handle_profile_response parses {profile, sig, seq}. The signature
+            # is computed over the SENDER's canonical form with the sender's key
+            # -- exactly as handle_profile_query would -- so a Python or C
+            # receiver verifies it. A scenario may override `sig` (bad-signature
+            # drop) or set `unstamped: true` (replay/unstamped refusal). Mirrors
+            # the C peer_profile_response builder.
+            from autonomous_trust.core.capabilities import profile_sign
+            profile = payload.get('profile', {}) if isinstance(payload, dict) else {}
+            if not isinstance(profile, dict):
+                profile = {}
+            if isinstance(payload, dict) and isinstance(payload.get('sig'), str):
+                sig = payload['sig']
+            else:
+                sig = profile_sign(sender.process.identity.signature.private,
+                                   sender.process.identity.uuid, profile)
+            body = {'profile': profile, 'sig': sig}
             if not (isinstance(payload, dict) and payload.get('unstamped')):
                 body['seq'] = int(payload.get('seq', 1)) if isinstance(payload, dict) else 1
             obj = to_json_string(body)

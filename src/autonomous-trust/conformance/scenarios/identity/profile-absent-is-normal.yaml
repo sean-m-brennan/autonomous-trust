@@ -1,0 +1,41 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: profile-absent-is-normal
+byte_pinning: false
+description: |
+    The opt-in DEFAULT for agora.profile (Increment 3): silence. With no
+    profiles fixture, bg is opted OUT, so handle_profile_query answers nothing —
+    no profile leaves the node. This is the control that makes the opt-in guard
+    non-vacuous: the positive observable is bg.profile_responses_emitted=0
+    (dropping the empty-own_profile guard would emit a response even with no
+    profile set), and newcomer records an empty profile for bg.
+
+    Step 1: newcomer -> bg peer_profile_query.
+      - Both runtimes: bg's handle_profile_query sees an empty own_profile and
+        returns without emitting anything.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+# No `profiles` fixture: bg is opted OUT, the default.
+
+steps:
+  - id: 1
+    from: newcomer
+    to: bg
+    function: peer_profile_query
+    payload: {}
+    description: |
+        newcomer asks bg for its profile. bg is opted out, so
+        handle_profile_query answers nothing.
+
+expected_state:
+  bg:
+    profile_responses_emitted: 0
+  newcomer:
+    peer_profile:
+      bg: {}

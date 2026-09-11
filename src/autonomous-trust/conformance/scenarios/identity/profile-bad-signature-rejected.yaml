@@ -1,0 +1,48 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: profile-bad-signature-rejected
+byte_pinning: false
+description: |
+    The new integrity surface for agora.profile (Increment 3): a profile is only
+    stored if its detached Ed25519 signature verifies against the SENDER's
+    signing key. This scenario delivers a well-formed, freshness-stamped,
+    field-valid profile whose `sig` is garbage (an explicit override the adapter
+    passes through instead of signing). Both runtimes must DROP it — the fields
+    look fine and the seq is fresh, so only the signature check stands between a
+    forged profile and the store.
+
+    Step 1: bg -> newcomer peer_profile_response {profile, sig:"00..", seq: 3}.
+      - Both runtimes: handle_profile_response accepts the freshness seq and the
+        field bounds, then fails signature verification and stores nothing.
+
+    Assertion: newcomer.peer_profile[bg] is empty — the forged profile never
+    landed. (freshness is consumed by the accept, so this is deliberately NOT a
+    freshness refusal; it is the signature gate doing its job.)
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_profile_response
+    payload:
+      profile:
+        display_name: Forged
+        handle: bg_node
+      sig: "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+      seq: 3
+    description: |
+        A field-valid, freshly-stamped profile carrying a bogus signature (the
+        adapter forwards the explicit `sig` verbatim). Must be dropped on
+        signature verification, never stored.
+
+expected_state:
+  newcomer:
+    peer_profile:
+      bg: {}

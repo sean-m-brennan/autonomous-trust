@@ -32,6 +32,7 @@ server would hide behind timing.
 """
 import asyncio
 import ssl
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -299,8 +300,14 @@ class TestDashControlAuthGate:
 
     @staticmethod
     def _ctl(authenticator):
-        return DashControl('test', 'Test', host='127.0.0.1', port=8050,
-                           authenticator=authenticator, tls=InspectorTLS())
+        ctl = DashControl('test', 'Test', host='127.0.0.1', port=8050,
+                          authenticator=authenticator, tls=InspectorTLS())
+        # Every refusal below is deliberate, and `_log_auth_refusal` writes it
+        # through `app.logger` (core.py). Mock that logger so the tests ASSERT
+        # the refusal was logged instead of printing it into the suite output,
+        # where a deliberate refusal reads as a failure.
+        ctl.app.logger = MagicMock()
+        return ctl
 
     def test_no_frame_consumed_when_auth_is_off(self):
         # THE regression guard for every existing client: the application's
@@ -322,6 +329,8 @@ class TestDashControlAuthGate:
         sock = _FakeSocket(frames=['wrong-token-value-here'])
         assert asyncio.run(ctl._authenticate(sock, None)) is False
         assert sock.closed_with[0] == WS_CLOSE_UNAUTHORIZED
+        # The server's side of the refusal: silent rejections are unoperable.
+        assert ctl.app.logger.warning.called
 
     def test_close_reason_does_not_leak_which_check_failed(self):
         ctl = self._ctl(TokenAuthenticator(GOOD_TOKEN))
@@ -333,6 +342,7 @@ class TestDashControlAuthGate:
         ctl = self._ctl(TokenAuthenticator(GOOD_TOKEN))
         sock = _FakeSocket(frames=[])
         assert asyncio.run(ctl._authenticate(sock, None)) is False
+        assert ctl.app.logger.warning.called
 
     def test_ws_url_scheme_follows_tls(self, tmp_path):
         cert, key = _self_signed(tmp_path)
@@ -732,6 +742,11 @@ class _Listener:
         self.ctl = DashControl('live', 'Live', host='127.0.0.1', port=8050,
                                tls=InspectorTLS(), **kw)
         self.ctl.ws_port = _free_port()
+        # The refusal tests below expect refusals, and each one logs from the
+        # listener thread. Mock the logger so the expected warnings stay out of
+        # the suite output; the verdict is read from the close code, which is
+        # the client-observable truth these tests are about.
+        self.ctl.app.logger = MagicMock()
 
     def __enter__(self):
         import time

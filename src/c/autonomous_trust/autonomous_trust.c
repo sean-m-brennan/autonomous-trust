@@ -107,6 +107,18 @@ int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
                 log_exception(logger);
             return 0;
         }
+        if (fn != NULL && strcmp(fn, AT_APP_SET_PROFILE) == 0)
+        {
+            /* Opt-in own-profile (Increment 3): forwarded ONLY to identity,
+             * which owns the profile store and signs/answers peers' directed
+             * profile queries. */
+            generic_msg_t fwd = *msg;
+            snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
+                     "%s", "identity");
+            if (messaging_send("identity", NET_MESSAGE, &fwd, false) != 0)
+                log_exception(logger);
+            return 0;
+        }
         log_warn(logger, "AutonomousTrust: refused extern net_msg '%s'\n",
                  fn == NULL ? "(none)" : fn);
         return -1;
@@ -186,6 +198,7 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
             case PEER_REPUTATION:
             case PEER_RTT_OBSERVED:
             case PEER_POSITION_OBSERVED:
+            case PEER_PROFILE_OBSERVED:
                 if (q_out == NULL)
                     break;   /* no app attached; nothing to do */
                 if (messaging_send(q_out, (message_type_t)inner->type, inner, false) != 0)

@@ -53,6 +53,7 @@ typedef enum {
     CHILD_GROUP,             /**< Identity → sibling processes: one cohort this node GATEWAYS, beyond its primary group. Local IPC only. Carries a @ref group_t like @ref GROUP, but must never land in `protocol.group` — the reputation process keeps a separate chain per child group, and clobbering the primary slot would merge a subtree into it. Mirrors Python's ChildGroupSet (see gateway-reputation-tree.md, doc/architecture/gateway-reputation-tree.md). */
     PEER_RTT_OBSERVED,       /**< Net-proc → app: one peer's latest RTT (ms). Local IPC only. Reuses @ref peer_rtt_update_msg_t; distinct from @ref PEER_RTT_UPDATE (which stays net-proc → sibling processes). */
     PEER_POSITION_OBSERVED,  /**< Identity → app: one peer's shared coarse position (opt-in geohash, @ref peer_position_msg_t). Local IPC only. */
+    PEER_PROFILE_OBSERVED,   /**< Identity → app: one peer's shared agora.profile (opt-in, signature-verified, @ref peer_profile_msg_t). Local IPC only. */
 #ifdef AT_ZTA_ENABLED
     ZTA_REVOCATION_ALERT,    /**< Peer credential revocation notice. */
     ZTA_VERIFICATION_RESULT, /**< Outcome of a deferred ZTA verification. */
@@ -292,6 +293,26 @@ typedef struct {
     char   geohash[AT_GEOHASH_MAX_LEN + 1];
 } peer_position_msg_t;
 
+/* Max bytes of the compact profile JSON carried across the AT->app boundary
+ * (the sanitized field object; the signature stays in the core). MUST match
+ * AT_PROFILE_JSON_MAX in identity/profile.h and AT_APP_PROFILE_JSON_LEN in
+ * app_events.h. */
+#define AT_PROFILE_JSON_LEN 2560
+
+/**
+ * @brief AT → app: one peer's shared agora.profile, as compact field JSON
+ * (Increment 3). Emitted only AFTER the core has bound-validated the fields and
+ * verified the peer's Ed25519 signature, so the app receives already-trusted
+ * data; the signature itself does not cross. An empty @c profile_json means the
+ * peer shared none (opted out). Local IPC only — the on-wire exchange is the
+ * directed, signed peer_profile_query/response, not this message.
+ */
+typedef struct {
+    uuid_t peer_uuid;
+    /** NUL-terminated compact JSON object of profile fields; "" = none. */
+    char   profile_json[AT_PROFILE_JSON_LEN + 1];
+} peer_profile_msg_t;
+
 #define SIGNAL_LEN 32
 
 typedef struct
@@ -377,6 +398,7 @@ typedef struct
         peer_observed_msg_t peer_observed;
         peer_reputation_msg_t peer_reputation;
         peer_position_msg_t peer_position;
+        peer_profile_msg_t peer_profile;
 #ifdef AT_ZTA_ENABLED
         zta_event_msg_t zta_event;
         zta_standing_msg_t zta_standing;
