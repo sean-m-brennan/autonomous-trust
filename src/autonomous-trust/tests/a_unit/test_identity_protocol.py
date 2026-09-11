@@ -56,11 +56,12 @@ class TestIdentityProtocol:
           (profile_query, profile_response)
         - explicit, revocable connection edges, Increment 5
           (connection_request, connection_response)
+        - directed encrypted direct messages, Increment 6 (dm)
         Asserting the exact count here pins the wire contract — a
         new verb without intent will fail this and force a deliberate
         update. Update the expected count alongside any new addition
         to ``IdentityProtocol``.
         """
         values = list(IdentityProtocol)
-        assert len(values) == 34
+        assert len(values) == 35
         assert 'announce' in values
