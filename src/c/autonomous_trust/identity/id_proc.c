@@ -963,11 +963,14 @@ int identity_admit_direct_peer(process_t *proc, directory_t *queues,
  * the late joiner ends up in `peers[]` but absent from `peer_capabilities`,
  * invisible to cap-driven discovery (see memory feedback_late_joiner_caps).
  *
- * Encrypt=false: when the announce is lost we typically lack the peer's
- * crypto material, so we can't authenticated-encrypt to them. The peer's
- * `handle_caps_query` doesn't gate on encryption; the response back to us
- * (which has the encryptor key needed) is the encrypted leg. The caller
- * must populate `peer->address` for routing.
+ * Encrypt=true: peer_caps_query is NOT on the plaintext allowlist
+ * (identity_verb_is_unencrypted / Python UNENCRYPTED_VERBS), so a KNOWN peer's
+ * receive path refuses it as plaintext and annoy-tracks the decrypt failure --
+ * a plaintext query is simply dropped. Mirrors Python _send_caps_query, which
+ * builds the Message with the default encrypt=True. The encryptor public key
+ * rides the canonical confirm envelope, so `peer` (copied whole into to_whom)
+ * carries the material needed to authenticated-encrypt. The caller must
+ * populate `peer->address` for routing.
  ****************************/
 
 /* Frama-C: skipped — [solver-timeout] identity/messaging preconditions */
@@ -977,7 +980,7 @@ static int _send_caps_query(const process_t *proc, const public_identity_t *peer
     query.type = NET_MESSAGE;
     strncpy(query.info.net_msg.process, "identity", PROC_NAME_LEN);
     query.info.net_msg.function = ID_CAPS_QUERY;
-    query.info.net_msg.encrypt = false;
+    query.info.net_msg.encrypt = true;
     memcpy(&query.info.net_msg.to_whom, peer, sizeof(public_identity_t));
     strncpy(query.info.net_msg.return_to, "identity", PROC_NAME_LEN);
     messaging_send("network", NET_MESSAGE, &query, false);
@@ -3830,14 +3833,17 @@ static bool handle_set_position(const process_t *proc, directory_t *queues, gene
     return true;
 }
 
-/* Directed position query to one admitted peer (mirrors _send_caps_query). */
+/* Directed position query to one admitted peer (mirrors _send_caps_query).
+ * Encrypt=true: peer_position_query is NOT on the plaintext allowlist, so a
+ * known peer refuses it in plaintext; it must ride the encrypted leg. Matches
+ * Python _send_position_query (default encrypt=True). */
 static int _send_position_query(const process_t *proc, const public_identity_t *peer)
 {
     generic_msg_t query = {0};
     query.type = NET_MESSAGE;
     strncpy(query.info.net_msg.process, "identity", PROC_NAME_LEN);
     query.info.net_msg.function = ID_POSITION_QUERY;
-    query.info.net_msg.encrypt = false;
+    query.info.net_msg.encrypt = true;
     memcpy(&query.info.net_msg.to_whom, peer, sizeof(public_identity_t));
     strncpy(query.info.net_msg.return_to, "identity", PROC_NAME_LEN);
     messaging_send("network", NET_MESSAGE, &query, false);

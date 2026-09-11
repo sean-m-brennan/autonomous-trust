@@ -156,7 +156,7 @@ class TestTwoPhaseAdmission:
         """
         proc, peer = self._setup(quorum=1)
         confirmer = _new_identity('bg', '10.0.0.2')
-        queues = {}
+        queues = {CfgIds.network: MagicMock()}
         msg = _confirm_msg(peer, confirmer, seq=5)
         proc.handle_confirm_peer(queues, msg)
         assert proc.peers.find_by_uuid(peer.uuid) is not None
@@ -188,7 +188,8 @@ class TestTwoPhaseAdmission:
         proc, first = self._setup(quorum=1)
         second = _new_identity('newcomer-2', '10.0.0.10')
         confirmer = _new_identity('bg', '10.0.0.2')
-        proc.handle_confirm_peer({}, _confirm_msg(first, confirmer, seq=1))
-        proc.handle_confirm_peer({}, _confirm_msg(second, confirmer, seq=2))
+        queues = {CfgIds.network: MagicMock()}
+        proc.handle_confirm_peer(queues, _confirm_msg(first, confirmer, seq=1))
+        proc.handle_confirm_peer(queues, _confirm_msg(second, confirmer, seq=2))
         assert proc.peers.find_by_uuid(first.uuid) is not None
         assert proc.peers.find_by_uuid(second.uuid) is not None
