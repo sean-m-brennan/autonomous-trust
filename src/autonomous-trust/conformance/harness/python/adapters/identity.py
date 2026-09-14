@@ -462,6 +462,32 @@ class _Participant:
                             raise AssertionError(
                                 f'{self.id}: dm_last[{peer_id!r}].{fk}='
                                 f'{actual.get(fk)!r}, expected {fv!r}')
+            elif key == 'post_last':
+                # {author_id: {seq, tier, body} | {absent: true}} (Increment 7) --
+                # the most-recent feed post this participant accepted from another
+                # AUTHOR, via get_last_post. A post that never arrived, was dropped
+                # by the signature/tier-gate, or was deduped away is ABSENT;
+                # `absent: true` asserts that. C mirrors this via
+                # identity_get_last_post keyed by the same author uuid.
+                for author_id, want in expected.items():
+                    author_uuid = self._uuid_for_pid(author_id)
+                    actual = self.process.get_last_post(author_uuid)
+                    want_obj = want if isinstance(want, dict) else {}
+                    if want_obj.get('absent'):
+                        if actual:
+                            raise AssertionError(
+                                f'{self.id}: post_last[{author_id!r}] present '
+                                f'(body={actual.get("body")!r}), expected ABSENT')
+                        continue
+                    if not actual:
+                        raise AssertionError(
+                            f'{self.id}: post_last[{author_id!r}] absent, '
+                            f'expected a post')
+                    for fk, fv in want_obj.items():
+                        if actual.get(fk) != fv:
+                            raise AssertionError(
+                                f'{self.id}: post_last[{author_id!r}].{fk}='
+                                f'{actual.get(fk)!r}, expected {fv!r}')
             elif key == 'partition_probes_emitted':
                 # Number of group_partition_probe messages this participant
                 # emitted over the whole scenario. The signal-cooldown
@@ -2160,6 +2186,41 @@ class IdentityAdapter:
                 body['seq'] = int(payload.get('seq', 1)) \
                     if isinstance(payload, dict) else 1
             obj = to_json_string(body)
+        elif function == IdentityProtocol.post:
+            # handle_post parses {author, author_pk, seq, ts, tier, body, sig,
+            # hops}. The post is SIGNED with the SENDER's (author's) key over the
+            # canonical (author, seq, ts, tier, body) form, exactly as
+            # handle_app_publish_post would; author/author_pk name the sender. A
+            # scenario may override `sig` (bad-signature drop) and `author_pk`
+            # (impersonation); `unstamped: true` drops the seq. Mirrors the C
+            # peer_post builder.
+            from autonomous_trust.core.capabilities import post_sign
+            text = payload.get('body') if isinstance(payload, dict) else ''
+            if not isinstance(text, str):
+                text = payload.get('text', '') if isinstance(payload, dict) else ''
+            if not isinstance(text, str):
+                text = ''
+            ts = payload.get('ts', 0.0) if isinstance(payload, dict) else 0.0
+            ts = float(ts) if isinstance(ts, (int, float)) else 0.0
+            tier = payload.get('tier', 0) if isinstance(payload, dict) else 0
+            tier = int(tier) if isinstance(tier, int) else 0
+            hops = payload.get('hops', 0) if isinstance(payload, dict) else 0
+            hops = int(hops) if isinstance(hops, int) else 0
+            seq = int(payload.get('seq', 1)) if isinstance(payload, dict) else 1
+            author_uuid = sender.process.identity.uuid
+            author_str = str(author_uuid)
+            if isinstance(payload, dict) and isinstance(payload.get('author_pk'), str):
+                author_pk = payload['author_pk']
+            else:
+                author_pk = bytes(sender.process.identity.signature.public).hex()
+            if isinstance(payload, dict) and isinstance(payload.get('sig'), str):
+                sig = payload['sig']
+            else:
+                sig = post_sign(sender.process.identity.signature.private,
+                                author_uuid, seq, ts, tier, text)
+            obj = to_json_string({'author': author_str, 'author_pk': author_pk,
+                                  'seq': seq, 'ts': ts, 'tier': tier,
+                                  'body': text, 'sig': sig, 'hops': hops})
         elif function == IdentityProtocol.id_query:
             # Identity-resync query (layer 3): {group_uuid, have:[uuids]}.
             # The group_uuid is the asker's group (== the responder's in a

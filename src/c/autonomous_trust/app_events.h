@@ -58,6 +58,7 @@ extern "C" {
 #define AT_APP_SIGNING_KEY_LEN 32
 /** Length of a UUID in bytes. */
 #define AT_APP_UUID_LEN 16
+#ifdef AT_SOCIAL_ENABLED
 /** Max geohash length carried across the app boundary. The app shares a
  *  ~5-char geohash (~5km "neighborhood" bucket); the buffer allows finer later
  *  without an ABI change. MUST match AT_GEOHASH_MAX_LEN in msg_types.h. */
@@ -71,6 +72,15 @@ extern "C" {
  *  match AT_DM_TEXT_LEN (msg_types.h), AT_DM_TEXT_MAX (identity/dm.h), and
  *  AGORA_DM_TEXT_MAX in the shim / cohort ctypes. */
 #define AT_APP_DM_TEXT_LEN 1024
+/** Max bytes of a feed-post body carried across the app boundary (Increment 7).
+ *  MUST match AT_POST_BODY_LEN (msg_types.h), AT_POST_BODY_MAX (identity/post.h),
+ *  and AGORA_POST_BODY_MAX in the shim / cohort ctypes. */
+#define AT_APP_POST_BODY_LEN 4096
+/** Length of a post content id (blake2b-256 lowercase hex). MUST match
+ *  AT_POST_ID_LEN (msg_types.h), AT_POST_ID_HEX_LEN (identity/post.h), and
+ *  AGORA_POST_ID_MAX in the shim / cohort ctypes. */
+#define AT_APP_POST_ID_LEN 64
+#endif /* AT_SOCIAL_ENABLED */
 
 /** Returned instead of -1 when the daemon exists but has not bound its queue
  *  yet, so a caller can retry rather than treat a normal cold start as an error.
@@ -90,6 +100,7 @@ typedef enum {
     /** A peer's latest round-trip time (@c rtt). A network-latency proximity
      *  proxy, in milliseconds — NOT a geographic distance. */
     AT_APP_EVENT_PEER_RTT = 3,
+#ifdef AT_SOCIAL_ENABLED
     /** A peer's shared coarse position (@c position), as an opt-in geohash
      *  bucket. Empty geohash = the peer shared none (the default). The consumer
      *  computes geographic distance from its own opted-in bucket. */
@@ -111,7 +122,21 @@ typedef enum {
      *  is a single directed, ENCRYPTED peer→peer message; crypto_box already
      *  authenticated the sender, so @c dm.peer_uuid is trustworthy. Delivered on
      *  arrival — a live stream, never replayed as roster state. */
-    AT_APP_EVENT_DM = 8
+    AT_APP_EVENT_DM = 8,
+    /** A signed feed post received over the group channel (@c post; Increment 7).
+     *  The core verified the author's Ed25519 signature, tier-gated it against
+     *  this node's view of the author's tier, and content-id-deduped it before
+     *  emitting; @c post.author_uuid is the signature-bound author. Distributed
+     *  by encrypted group multicast and gossip-forwarded a bounded number of
+     *  hops — a live stream, never replayed as roster state. */
+    AT_APP_EVENT_POST = 9,
+    /** A peer reacted to one of THIS node's posts (@c reaction; Increment 8). A
+     *  reaction is a single directed, ENCRYPTED reactor→author message; crypto_box
+     *  authenticated the reactor, so @c reaction.peer_uuid is trustworthy. It is
+     *  the return signal a fire-and-forget post lacks, and it accrues reputation
+     *  for both peers. Delivered on arrival — a live stream. */
+    AT_APP_EVENT_REACTION = 10
+#endif /* AT_SOCIAL_ENABLED */
 } at_app_event_kind_t;
 
 /** One observed peer. Mirrors `peer_observed_msg_t` in flat, fixed-width form. */
@@ -165,6 +190,7 @@ typedef struct {
     int32_t rtt_ms;
 } at_app_rtt_t;
 
+#ifdef AT_SOCIAL_ENABLED
 /** One peer's shared coarse position. Mirrors `peer_position_msg_t`. */
 typedef struct {
     uint8_t peer_uuid[AT_APP_UUID_LEN];
@@ -210,6 +236,37 @@ typedef struct {
     char    text[AT_APP_DM_TEXT_LEN + 1];
 } at_app_dm_t;
 
+/** One signed feed post received over the group channel (Increment 7).
+ *  @c author_uuid is the SIGNATURE-BOUND author (the core verified the Ed25519
+ *  signature over the canonical form, so it is trustworthy even though the post
+ *  was gossip-relayed by other peers); @c post_id is the blake2b content-address
+ *  (the dedup/merge key); @c seq the author's post sequence; @c ts the author's
+ *  post time (epoch seconds); @c required_tier the audience floor (0..4);
+ *  @c body the NUL-terminated body, bound-truncated to AT_APP_POST_BODY_LEN
+ *  bytes. Carried by AT_APP_EVENT_POST. A live stream — delivered on arrival,
+ *  not roster state. */
+typedef struct {
+    uint8_t author_uuid[AT_APP_UUID_LEN];
+    char    post_id[AT_APP_POST_ID_LEN + 1];
+    int64_t seq;
+    double  ts;
+    int32_t required_tier;
+    char    body[AT_APP_POST_BODY_LEN + 1];
+} at_app_post_t;
+
+/** One reaction to one of THIS node's posts (Increment 8). @c peer_uuid is the
+ *  REACTOR (crypto_box-authenticated, so trustworthy); @c post_id is the
+ *  content-id of the post reacted to; @c seq the reactor's freshness sequence;
+ *  @c ts the reactor's send time (epoch seconds). Carried by AT_APP_EVENT_REACTION.
+ *  A live stream — delivered on arrival, not roster state. */
+typedef struct {
+    uint8_t peer_uuid[AT_APP_UUID_LEN];
+    char    post_id[AT_APP_POST_ID_LEN + 1];
+    int64_t seq;
+    double  ts;
+} at_app_reaction_t;
+#endif /* AT_SOCIAL_ENABLED */
+
 /** A decoded app-facing event. */
 typedef struct {
     at_app_event_kind_t kind;
@@ -217,10 +274,14 @@ typedef struct {
         at_app_peer_t       peer;
         at_app_reputation_t reputation;
         at_app_rtt_t        rtt;
+#ifdef AT_SOCIAL_ENABLED
         at_app_position_t   position;
         at_app_profile_t    profile;
         at_app_connection_t connection;
         at_app_dm_t         dm;
+        at_app_post_t       post;
+        at_app_reaction_t   reaction;
+#endif /* AT_SOCIAL_ENABLED */
     } data;
 } at_app_event_t;
 
@@ -304,6 +365,7 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
  */
 int at_app_events_request_roster(at_app_events_t *handle, const char *q_out);
 
+#ifdef AT_SOCIAL_ENABLED
 /**
  * @brief Set (or clear) THIS node's own opt-in coarse position.
  *
@@ -379,6 +441,44 @@ int at_app_events_connect_respond(at_app_events_t *handle, const char *q_out,
 int at_app_events_send_dm(at_app_events_t *handle, const char *q_out,
                           const uint8_t peer_uuid[AT_APP_UUID_LEN],
                           const char *text);
+
+/**
+ * @brief Publish a feed post to the local group (Increment 7).
+ *
+ * Sends the app→AT `AT_APP_PUBLISH_POST` verb on @p q_out. @p body is the post
+ * body (truncated to AT_APP_POST_BODY_LEN bytes); @p required_tier is the
+ * audience floor (0..4) — a reader delivers the post only when its own view of
+ * this node's tier meets it. The identity process signs the post with this
+ * node's Ed25519 key, group-encrypts it, and multicasts it on the group channel;
+ * inbound copies are verified, tier-gated, content-id-deduped and gossip-
+ * forwarded a bounded number of hops. The core does NOT echo the outgoing post
+ * back — the app echoes it locally.
+ *
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound yet,
+ *         -1 on any other failure.
+ */
+int at_app_events_publish_post(at_app_events_t *handle, const char *q_out,
+                               const char *body, int required_tier);
+
+/**
+ * @brief React to a peer's post (Increment 8). Sends AT_APP_REACT_POST with
+ * {"author", "post_id"}; identity delivers a directed encrypted reaction to the
+ * author and both peers accrue reputation for the engagement.
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound, -1 otherwise.
+ */
+int at_app_events_react_post(at_app_events_t *handle, const char *q_out,
+                             const uint8_t author_uuid[AT_APP_UUID_LEN],
+                             const char *post_id);
+
+/**
+ * @brief Locally block a peer (Increment 8). Sends AT_APP_BLOCK with {"peer"};
+ * identity clamps the peer's effective trust tier to 0 for this node only. Purely
+ * local — no wire traffic, no reputation transaction.
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound, -1 otherwise.
+ */
+int at_app_events_block(at_app_events_t *handle, const char *q_out,
+                        const uint8_t peer_uuid[AT_APP_UUID_LEN]);
+#endif /* AT_SOCIAL_ENABLED */
 
 /** @brief Close the queue and release the handle. NULL-safe. */
 void at_app_events_close(at_app_events_t *handle);

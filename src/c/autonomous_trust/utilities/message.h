@@ -55,6 +55,7 @@
  */
 #define AT_APP_ROSTER_REQUEST "app_roster_request"
 
+#ifdef AT_SOCIAL_ENABLED
 /**
  * @brief App → AT local-only verb: set (or clear) THIS node's own opt-in coarse
  * position, so the identity process can answer peers' directed position queries.
@@ -90,6 +91,30 @@
  * message locally (the core does not echo it back). Forwarded only to the
  * identity process. Sixth verb on the app→AT allowlist. */
 #define AT_APP_SEND_DM "app_send_dm"
+
+/* App→AT: publish a feed post to the local group (Increment 7). The payload is
+ * {"body": "<body>", "tier": <int 0..4>}; identity signs the post with this
+ * node's Ed25519 key, group-encrypts it and multicasts it on the group channel.
+ * The app echoes the outgoing post locally (the core does not echo it back).
+ * Forwarded only to the identity process. Seventh verb on the app→AT allowlist. */
+#define AT_APP_PUBLISH_POST "app_publish_post"
+
+/* App→AT: react to a feed post (Increment 8). The payload is {"author":
+ * "<uuid_str>", "post_id": "<hex>"}; identity sends a directed encrypted
+ * peer_reaction {post_id, seq, ts} to the post's author. The reaction is the
+ * return signal a fire-and-forget post otherwise lacks, so both the reactor and
+ * the author submit a reputation score for the same post-derived task and the
+ * engagement accrues. Forwarded only to the identity process. Eighth verb on the
+ * app→AT allowlist. */
+#define AT_APP_REACT_POST "app_react_post"
+
+/* App→AT: locally block a peer (Increment 8). The payload is {"peer":
+ * "<uuid_str>"}; identity clamps that peer's effective trust tier to 0 for THIS
+ * node only. Purely local: no reputation transaction and nothing on the wire
+ * (unlike a decline). Forwarded only to the identity process. Ninth verb on the
+ * app→AT allowlist. */
+#define AT_APP_BLOCK "app_block"
+#endif /* AT_SOCIAL_ENABLED */
 
 #define DEFAULT_MAX_MSG_SIZE 1024
 /* MAX_MSG_SIZE is configurable at runtime via messaging_set_max_size() */

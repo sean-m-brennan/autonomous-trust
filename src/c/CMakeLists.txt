@@ -150,6 +150,11 @@ option(AT_STATIC "Link at_demo fully statically (no shared library dependencies)
 # Zero Trust Architecture integration (requires OpenSSL)
 option(AT_ZTA "Enable Zero Trust Architecture credential integration" OFF)
 
+# Agora social app features (position/profile/connection/DM/feed) built over the
+# generic app-events carrier. A pure machine-to-machine node does not need them,
+# so they are OFF by default; the Agora native build forces this ON.
+option(AT_SOCIAL "Enable Agora social app features (position/profile/connection/DM/feed) over the app-events carrier" OFF)
+
 # DTN / Bundle Protocol transport (see at-over-dtn.md). Adds the "dtn_bp"
 # network transport and compiles a DTN-specific receiver path.
 option(AT_NET_DTN "Enable DTN/Bundle-Protocol network transport" OFF)
@@ -450,9 +455,6 @@ set(libsrc
     autonomous_trust/identity/history.c
     autonomous_trust/identity/identity.c
     autonomous_trust/identity/id_proc.c
-    autonomous_trust/identity/profile.c
-    autonomous_trust/identity/connection.c
-    autonomous_trust/identity/dm.c
     autonomous_trust/identity/first_contact.c
     autonomous_trust/identity/peers.c
     autonomous_trust/identity/signature.c
@@ -542,6 +544,19 @@ if(AT_ZTA)
         autonomous_trust/zta/zta_audit.c
         autonomous_trust/zta/zta_process.c
         autonomous_trust/zta/zta_binding.c
+    )
+endif()
+
+# Agora social sources (only compiled when AT_SOCIAL is enabled). The base
+# app-events carrier (app_events.c/app_node.c) and id_proc.c stay unconditional;
+# their social portions are guarded in-source with #ifdef AT_SOCIAL_ENABLED.
+if(AT_SOCIAL)
+    list(APPEND libsrc
+        autonomous_trust/identity/profile.c
+        autonomous_trust/identity/connection.c
+        autonomous_trust/identity/dm.c
+        autonomous_trust/identity/post.c
+        autonomous_trust/identity/social_tx.c
     )
 endif()
 
@@ -897,6 +912,14 @@ if(AT_ZTA)
     include_directories(${OPENSSL_INCLUDE_DIR})
 endif()
 
+# When AT_SOCIAL is enabled, ALL targets must see AT_SOCIAL_ENABLED because it
+# changes the size of generic_msg_t and at_app_event_t (adds the social payload
+# union members / structs). A struct size mismatch between the library and
+# consumers causes crashes — same reasoning as AT_ZTA above.
+if(AT_SOCIAL)
+    add_compile_definitions(AT_SOCIAL_ENABLED)
+endif()
+
 # Ryu (shortest-decimal d2s) for JCS number formatting.  Pulled in as a
 # git submodule under third_party/ryu/; the upstream repo's C sources live
 # in its `ryu/` subdir, so source paths read `third_party/ryu/ryu/...`.
@@ -1070,17 +1093,32 @@ add_executable(late_joiner_caps_resync_test test/late_joiner_caps_resync_test.c)
 set_source_files_properties(test/late_joiner_caps_resync_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(late_joiner_caps_resync_test PRIVATE ${AT_TEST_LIBS})
 
-add_executable(profile_test test/profile_test.c)
-set_source_files_properties(test/profile_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(profile_test PRIVATE ${AT_TEST_LIBS})
+# Agora social tests (only when AT_SOCIAL is enabled)
+if(AT_SOCIAL)
+    add_executable(profile_test test/profile_test.c)
+    set_source_files_properties(test/profile_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(profile_test PRIVATE ${AT_TEST_LIBS})
 
-add_executable(connection_test test/connection_test.c)
-set_source_files_properties(test/connection_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(connection_test PRIVATE ${AT_TEST_LIBS})
+    add_executable(connection_test test/connection_test.c)
+    set_source_files_properties(test/connection_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(connection_test PRIVATE ${AT_TEST_LIBS})
 
-add_executable(dm_test test/dm_test.c)
-set_source_files_properties(test/dm_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(dm_test PRIVATE ${AT_TEST_LIBS})
+    add_executable(dm_test test/dm_test.c)
+    set_source_files_properties(test/dm_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(dm_test PRIVATE ${AT_TEST_LIBS})
+
+    add_executable(post_test test/post_test.c)
+    set_source_files_properties(test/post_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(post_test PRIVATE ${AT_TEST_LIBS})
+
+    add_executable(post_multicast_test test/post_multicast_test.c)
+    set_source_files_properties(test/post_multicast_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(post_multicast_test PRIVATE ${AT_TEST_LIBS})
+
+    add_executable(social_tx_test test/social_tx_test.c)
+    set_source_files_properties(test/social_tx_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(social_tx_test PRIVATE ${AT_TEST_LIBS})
+endif() # AT_SOCIAL
 
 add_executable(identity_resync_test test/identity_resync_test.c)
 set_source_files_properties(test/identity_resync_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1216,9 +1254,14 @@ add_test(NAME network_test COMMAND $<TARGET_FILE:network_test>)
 add_test(NAME identity_test COMMAND $<TARGET_FILE:identity_test>)
 add_test(NAME partition_recovery_test COMMAND $<TARGET_FILE:partition_recovery_test>)
 add_test(NAME late_joiner_caps_resync_test COMMAND $<TARGET_FILE:late_joiner_caps_resync_test>)
-add_test(NAME profile_test COMMAND $<TARGET_FILE:profile_test>)
-add_test(NAME connection_test COMMAND $<TARGET_FILE:connection_test>)
-add_test(NAME dm_test COMMAND $<TARGET_FILE:dm_test>)
+if(AT_SOCIAL)
+    add_test(NAME profile_test COMMAND $<TARGET_FILE:profile_test>)
+    add_test(NAME connection_test COMMAND $<TARGET_FILE:connection_test>)
+    add_test(NAME dm_test COMMAND $<TARGET_FILE:dm_test>)
+    add_test(NAME post_test COMMAND $<TARGET_FILE:post_test>)
+    add_test(NAME post_multicast_test COMMAND $<TARGET_FILE:post_multicast_test>)
+    add_test(NAME social_tx_test COMMAND $<TARGET_FILE:social_tx_test>)
+endif() # AT_SOCIAL
 add_test(NAME identity_resync_test COMMAND $<TARGET_FILE:identity_resync_test>)
 add_test(NAME rep_quorum_test COMMAND $<TARGET_FILE:rep_quorum_test>)
 add_test(NAME rep_resp_shape_test COMMAND $<TARGET_FILE:rep_resp_shape_test>)
@@ -1559,10 +1602,14 @@ set_source_files_properties(test/peer_rtt_update_test.c PROPERTIES COMPILE_FLAGS
 target_link_libraries(peer_rtt_update_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME peer_rtt_update_test COMMAND $<TARGET_FILE:peer_rtt_update_test>)
 
-add_executable(app_events_test test/app_events_test.c)
-set_source_files_properties(test/app_events_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(app_events_test PRIVATE ${AT_TEST_LIBS})
-add_test(NAME app_events_test COMMAND $<TARGET_FILE:app_events_test>)
+# app_events_test exercises the social app-event kinds (position/profile/
+# connection/DM/post), so it is only built when AT_SOCIAL is enabled.
+if(AT_SOCIAL)
+    add_executable(app_events_test test/app_events_test.c)
+    set_source_files_properties(test/app_events_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(app_events_test PRIVATE ${AT_TEST_LIBS})
+    add_test(NAME app_events_test COMMAND $<TARGET_FILE:app_events_test>)
+endif() # AT_SOCIAL
 
 # The flat lifecycle ABI (app_node.h) and the non-forking half of
 # at_node_start. Creates and binds under its own AUTONOMOUS_TRUST_ROOT.

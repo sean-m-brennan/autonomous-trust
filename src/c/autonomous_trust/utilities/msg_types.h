@@ -52,11 +52,15 @@ typedef enum {
     PEER_REPUTATION,         /**< Reputation → app: one peer's earned score (@ref peer_reputation_msg_t). Local IPC only. */
     CHILD_GROUP,             /**< Identity → sibling processes: one cohort this node GATEWAYS, beyond its primary group. Local IPC only. Carries a @ref group_t like @ref GROUP, but must never land in `protocol.group` — the reputation process keeps a separate chain per child group, and clobbering the primary slot would merge a subtree into it. Mirrors Python's ChildGroupSet (see gateway-reputation-tree.md, doc/architecture/gateway-reputation-tree.md). */
     PEER_RTT_OBSERVED,       /**< Net-proc → app: one peer's latest RTT (ms). Local IPC only. Reuses @ref peer_rtt_update_msg_t; distinct from @ref PEER_RTT_UPDATE (which stays net-proc → sibling processes). */
+#ifdef AT_SOCIAL_ENABLED
     PEER_POSITION_OBSERVED,  /**< Identity → app: one peer's shared coarse position (opt-in geohash, @ref peer_position_msg_t). Local IPC only. */
     PEER_PROFILE_OBSERVED,   /**< Identity → app: one peer's shared agora.profile (opt-in, signature-verified, @ref peer_profile_msg_t). Local IPC only. */
     PEER_CONNECTION_REQUEST_OBSERVED, /**< Identity → app: an inbound connection ASK from a peer (Increment 5, @ref peer_connection_msg_t). Local IPC only. */
     PEER_CONNECTION_STATE_OBSERVED,   /**< Identity → app: our connection edge-state toward a peer changed (Increment 5, @ref peer_connection_msg_t). Local IPC only. */
     PEER_DM_OBSERVED,        /**< Identity → app: a directed text message received from a peer (Increment 6, @ref peer_dm_msg_t). Local IPC only. Live stream — delivered on arrival, never roster state. */
+    PEER_POST_OBSERVED,      /**< Identity → app: a signed feed post received over the group channel (Increment 7, @ref peer_post_msg_t). Local IPC only. Signature-verified, tier-gated and content-id-deduped before emit. */
+    PEER_REACTION_OBSERVED,  /**< Identity → app: a peer reacted to one of our posts (Increment 8, @ref peer_reaction_msg_t). Local IPC only. Live stream — delivered on arrival. */
+#endif /* AT_SOCIAL_ENABLED */
 #ifdef AT_ZTA_ENABLED
     ZTA_REVOCATION_ALERT,    /**< Peer credential revocation notice. */
     ZTA_VERIFICATION_RESULT, /**< Outcome of a deferred ZTA verification. */
@@ -90,6 +94,15 @@ typedef struct
      * See doc/architecture/gateway-reputation-tree.md. */
     int from_rank;
     bool encrypt;
+    /* Route this message as an encrypted GROUP MULTICAST on NET_CHAN_GROUP
+     * (Increment 7) rather than a directed peer send or an open broadcast. The
+     * identity process sets this for a feed post; net_proc maps it to
+     * RECIPIENT_GROUP. Serialized across the IPC hop by net_msg_to_proto /
+     * proto_to_net_msg (absent/false on the wire = the historical peer/broadcast
+     * behavior). */
+#ifdef AT_SOCIAL_ENABLED
+    bool group_multicast;
+#endif /* AT_SOCIAL_ENABLED */
     char return_to[PROC_NAME_LEN+1];
     /* 32-char hex (UUID4 without dashes) + NUL — must match
      * NET_TRACE_ID_LEN in network/net_message.h. Carried across the IPC
@@ -276,6 +289,7 @@ typedef struct {
     bool   rated;
 } peer_reputation_msg_t;
 
+#ifdef AT_SOCIAL_ENABLED
 /* Max geohash length carried across the AT->app boundary. The app shares a
  * ~5-char geohash (the ~5km "neighborhood" bucket); the buffer allows finer
  * precision later without an ABI change. MUST match AT_APP_GEOHASH_LEN in
@@ -356,6 +370,60 @@ typedef struct {
     /** NUL-terminated message body, bound-truncated to AT_DM_TEXT_LEN bytes. */
     char    text[AT_DM_TEXT_LEN + 1];
 } peer_dm_msg_t;
+
+/* Max bytes of a post body carried across the AT->app boundary (Increment 7).
+ * MUST match AT_POST_BODY_MAX in identity/post.h, AT_APP_POST_BODY_LEN in
+ * app_events.h, and AGORA_POST_BODY_MAX in the shim / cohort ctypes. */
+#define AT_POST_BODY_LEN 4096
+/* Content id: blake2b-256 digest as lowercase hex (32 bytes -> 64 chars). MUST
+ * match AT_POST_ID_HEX_LEN in identity/post.h, AT_APP_POST_ID_LEN in
+ * app_events.h, and AGORA_POST_ID_MAX in the shim / cohort ctypes. */
+#define AT_POST_ID_LEN 64
+
+/**
+ * @brief AT → app: one signed feed post received over the group channel
+ * (Increment 7).
+ *
+ * A post is a signed, content-addressed feed item distributed by encrypted group
+ * multicast and gossip-forwarded a bounded number of hops. @c peer_uuid is the
+ * AUTHOR (bound by the Ed25519 signature the core verified before emitting, NOT
+ * by the wire envelope). @c post_id is the blake2b content-address of the
+ * canonical form — the dedup/merge key. @c seq is the author's post sequence,
+ * @c ts the author's post time (epoch seconds), @c required_tier the audience
+ * floor (0..4). @c body is bound-truncated to @ref AT_POST_BODY_LEN bytes. Local
+ * IPC only; the on-wire form is the group-encrypted peer_post verb, not this
+ * message.
+ */
+typedef struct {
+    uuid_t  peer_uuid;   /**< The AUTHOR's uuid (signature-bound). */
+    /** NUL-terminated blake2b content id (lowercase hex). */
+    char    post_id[AT_POST_ID_LEN + 1];
+    int64_t seq;         /**< The author's post sequence. */
+    double  ts;          /**< The author's post time (epoch seconds). */
+    int32_t required_tier; /**< Audience floor 0..4. */
+    /** NUL-terminated post body, bound-truncated to AT_POST_BODY_LEN bytes. */
+    char    body[AT_POST_BODY_LEN + 1];
+} peer_post_msg_t;
+
+/**
+ * @brief AT → app: one reaction to one of OUR posts, received from a peer
+ * (Increment 8).
+ *
+ * A reaction is a single directed, ENCRYPTED reactor→author message; crypto_box
+ * authenticates the reactor, so no extra signature is needed and @c peer_uuid (the
+ * REACTOR) is trustworthy. @c post_id is the content-id of the post reacted to.
+ * @c seq is the reactor's freshness sequence (a stale/replayed seq is dropped
+ * before this is emitted); @c ts is the reactor's send time. Local IPC only; the
+ * on-wire form is the directed encrypted peer_reaction verb, not this message.
+ */
+typedef struct {
+    uuid_t  peer_uuid;   /**< The REACTOR's uuid. */
+    /** NUL-terminated content id of the post reacted to (lowercase hex). */
+    char    post_id[AT_POST_ID_LEN + 1];
+    int64_t seq;         /**< The reactor's freshness sequence. */
+    double  ts;          /**< The reactor's send time (epoch seconds). */
+} peer_reaction_msg_t;
+#endif /* AT_SOCIAL_ENABLED */
 
 #define SIGNAL_LEN 32
 
@@ -441,10 +509,14 @@ typedef struct
         peer_rtt_update_msg_t peer_rtt_update;
         peer_observed_msg_t peer_observed;
         peer_reputation_msg_t peer_reputation;
+#ifdef AT_SOCIAL_ENABLED
         peer_position_msg_t peer_position;
         peer_profile_msg_t peer_profile;
         peer_connection_msg_t peer_connection;
         peer_dm_msg_t peer_dm;
+        peer_post_msg_t peer_post;
+        peer_reaction_msg_t peer_reaction;
+#endif /* AT_SOCIAL_ENABLED */
 #ifdef AT_ZTA_ENABLED
         zta_event_msg_t zta_event;
         zta_standing_msg_t zta_standing;

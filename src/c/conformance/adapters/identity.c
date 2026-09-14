@@ -43,9 +43,12 @@
 
 #include "identity/identity.h"
 #include "identity/identity_priv.h"   /* hexlify / public_identity_to_json */
+#ifdef AT_SOCIAL_ENABLED
 #include "identity/profile.h"         /* at_profile_* for the profile builder */
 #include "identity/connection.h"      /* at_connection_* for the connection builder */
 #include "identity/dm.h"              /* AT_DM_TEXT_MAX for the dm_last check */
+#include "identity/post.h"            /* at_post_* for the peer_post builder */
+#endif /* AT_SOCIAL_ENABLED */
 #include "identity/id_proc_priv.h"
 #include "utilities/util.h"
 #include "identity/group.h"           /* group_init / group_add_address */
@@ -842,6 +845,7 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
         }
     }
 
+#ifdef AT_SOCIAL_ENABLED
     /* positions: { "<participant>": "<geohash>", ... } (Increment 2, the
      * "with-distance" feature) — install each named participant's opt-in coarse
      * position via identity_set_own_geohash so its handle_position_query answers
@@ -882,6 +886,7 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
             if (pj != NULL) { identity_set_own_profile(pj); free(pj); }
         }
     }
+#endif /* AT_SOCIAL_ENABLED */
 
     /* admission_quorum: { "<participant>": <int>, ... } — two-phase admission
      * (doc/architecture/identity-protocol.md). A member withholds the group key until this many
@@ -1356,6 +1361,7 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         return 0;
     }
 
+#ifdef AT_SOCIAL_ENABLED
     /* peer_position_response — pack {pos, seq} as the envelope
      * handle_position_response expects (Increment 2, the "with-distance"
      * feature). `pos` is the opaque geohash bucket; `seq` is the responder's
@@ -1466,6 +1472,66 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_decref(body);
         return 0;
     }
+
+    /* peer_post — pack the group-multicast feed post {author, author_pk, seq, ts,
+     * tier, body, sig, hops} (Increment 7). The post is SIGNED with the SENDER's
+     * (author's) key over the canonical (author, seq, ts, tier, body) form,
+     * exactly as handle_app_publish_post would; author/author_pk name the sender.
+     * A scenario may override `sig` (bad-signature drop) and `author_pk`
+     * (impersonation). `body`/`text`, `ts`, `tier`, `hops` come from the scenario;
+     * `seq` is honored via _ic_step_seq. Mirrors the Python peer_post builder. */
+    if (strcmp(function, "peer_post") == 0 && json_is_object(payload)) {
+        json_t *jbody = json_object_get(payload, "body");
+        if (!json_is_string(jbody)) jbody = json_object_get(payload, "text");
+        const char *body_str = json_is_string(jbody) ? json_string_value(jbody) : "";
+        int64_t seq = _ic_step_seq(payload, "seq");
+        json_t *jts = json_object_get(payload, "ts");
+        double ts = json_is_number(jts) ? json_number_value(jts) : 0.0;
+        json_t *jtier = json_object_get(payload, "tier");
+        int tier = json_is_integer(jtier) ? (int)json_integer_value(jtier) : 0;
+        json_t *jhops = json_object_get(payload, "hops");
+        int hops = json_is_integer(jhops) ? (int)json_integer_value(jhops) : 0;
+
+        /* author_pk: the sender's ed25519 signing pubkey hex, unless overridden. */
+        char pk_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1] = {0};
+        json_t *jpk = json_object_get(payload, "author_pk");
+        if (json_is_string(jpk))
+            snprintf(pk_hex, sizeof(pk_hex), "%s", json_string_value(jpk));
+        else if (sender_impl != NULL && sender_impl->full != NULL)
+            sodium_bin2hex(pk_hex, sizeof(pk_hex),
+                           sender_impl->full->signature.public,
+                           crypto_sign_PUBLICKEYBYTES);
+
+        /* sig over the canonical form with the sender's key, unless overridden. */
+        char sig[AT_POST_SIG_HEX_LEN + 1] = {0};
+        json_t *jsig = json_object_get(payload, "sig");
+        if (json_is_string(jsig))
+            snprintf(sig, sizeof(sig), "%s", json_string_value(jsig));
+        else if (sender_impl != NULL && sender_impl->full != NULL)
+            at_post_sign(sender_impl->full->signature.private,
+                         sender_impl->full->uuid, seq, ts, (uint8_t)tier,
+                         body_str, sig);
+
+        json_t *env = json_object();
+        if (sender_impl != NULL && sender_impl->full != NULL) {
+            char author_str[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(sender_impl->full->uuid, author_str);
+            json_object_set_new(env, "author", json_string(author_str));
+        } else {
+            json_object_set_new(env, "author", json_string(""));
+        }
+        json_object_set_new(env, "author_pk", json_string(pk_hex));
+        json_object_set_new(env, "seq", json_integer((json_int_t)seq));
+        json_object_set_new(env, "ts", json_real(ts));
+        json_object_set_new(env, "tier", json_integer(tier));
+        json_object_set_new(env, "body", json_string(body_str));
+        json_object_set_new(env, "sig", json_string(sig));
+        json_object_set_new(env, "hops", json_integer(hops));
+        net_msg_pack_json(&out->info.net_msg, env);
+        json_decref(env);
+        return 0;
+    }
+#endif /* AT_SOCIAL_ENABLED */
 
     /* vote_on_peer is the only identity function whose C handler
      * (`handle_count_vote`) requires a structured JSON payload —
@@ -2485,7 +2551,9 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                         return -1;
                     }
                 }
-            } else if (strcmp(key, "peer_position") == 0) {
+            }
+#ifdef AT_SOCIAL_ENABLED
+            else if (strcmp(key, "peer_position") == 0) {
                 /* {peer_id: geohash} (Increment 2) — the coarse position this
                  * participant recorded for another, via
                  * identity_get_peer_position. '' means none recorded (the peer
@@ -2633,7 +2701,82 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                         return -1;
                     }
                 }
-            } else if (strcmp(key, "first_contact_hello_endpoint") == 0) {
+            } else if (strcmp(key, "post_last") == 0) {
+                /* {author_id: {seq, tier, body} | {absent: true}} (Increment 7) —
+                 * the most-recent feed post this participant accepted from
+                 * another AUTHOR, via identity_get_last_post. A post that never
+                 * arrived, was dropped by the signature/tier-gate, or was deduped
+                 * away is ABSENT; `absent: true` asserts that. Mirrors the Python
+                 * adapter's post_last, keyed by the same lowercased author uuid. */
+                const char *post_pid;
+                json_t *post_want;
+                json_object_foreach(val, post_pid, post_want) {
+                    sce_participant_t *other = sce_find_participant(ctx, post_pid);
+                    if (other == NULL) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: post_last names unknown participant %s",
+                                 pid, post_pid);
+                        return -1;
+                    }
+                    const public_identity_t *want_id =
+                        ((ic_impl_t *)other->impl)->pub;
+                    char want_uuid[UUID_STR_LEN + 1];
+                    uuid_unparse_lower(want_id->uuid, want_uuid);
+                    char got_post_id[AT_POST_ID_HEX_LEN + 1];
+                    char got_body[AT_POST_BODY_MAX + 1];
+                    int64_t got_seq = 0;
+                    int got_tier = 0;
+                    bool have = identity_get_last_post(want_uuid, got_post_id,
+                                                       sizeof(got_post_id),
+                                                       got_body, sizeof(got_body),
+                                                       &got_seq, &got_tier);
+                    bool want_absent =
+                        json_is_true(json_object_get(post_want, "absent"));
+                    if (want_absent) {
+                        if (have) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: post_last[%s] present (body=%.40s), "
+                                     "expected ABSENT", pid, post_pid, got_body);
+                            return -1;
+                        }
+                        continue;
+                    }
+                    if (!have) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: post_last[%s] absent, expected a post", pid,
+                                 post_pid);
+                        return -1;
+                    }
+                    json_t *jb = json_object_get(post_want, "body");
+                    if (json_is_string(jb)
+                        && strcmp(got_body, json_string_value(jb)) != 0) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: post_last[%s].body=%.80s, expected %.80s",
+                                 pid, post_pid, got_body, json_string_value(jb));
+                        return -1;
+                    }
+                    json_t *js = json_object_get(post_want, "seq");
+                    if (json_is_integer(js)
+                        && got_seq != (int64_t)json_integer_value(js)) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: post_last[%s].seq=%lld, expected %lld", pid,
+                                 post_pid, (long long)got_seq,
+                                 (long long)json_integer_value(js));
+                        return -1;
+                    }
+                    json_t *jtr = json_object_get(post_want, "tier");
+                    if (json_is_integer(jtr)
+                        && got_tier != (int)json_integer_value(jtr)) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: post_last[%s].tier=%d, expected %lld", pid,
+                                 post_pid, got_tier,
+                                 (long long)json_integer_value(jtr));
+                        return -1;
+                    }
+                }
+            }
+#endif /* AT_SOCIAL_ENABLED */
+            else if (strcmp(key, "first_contact_hello_endpoint") == 0) {
                 /* Where trigger_first_contact_initiate addressed its hello.
                  * Pins the resolution ORDER: the invitation's rendezvous hint
                  * wins over the address the inviter's identity advertises.
@@ -3597,6 +3740,36 @@ void at_identity_run(const at_case_t *c, at_case_result_t *out) {
                 out, "ZTA scenario skipped: C built without AT_ZTA "
                      "(build -DAT_ZTA=ON to run it symmetrically)");
             return;
+        }
+    }
+#endif
+
+    /* Agora social scenarios (position/profile/connection/DM/post) drive verbs
+     * and assertion seams that are compiled in only under AT_SOCIAL. When built
+     * without it, skip — a skip on one side is not an asymmetric failure
+     * (diff_results.py) and the Python adapter still runs the scenario. Detect
+     * one by any step whose `function` names a social verb. Built with
+     * -DAT_SOCIAL=ON, the social builders/checks run and it is symmetric. */
+#ifndef AT_SOCIAL_ENABLED
+    {
+        json_t *steps = json_object_get(c->data, "steps");
+        if (json_is_array(steps)) {
+            size_t ns = json_array_size(steps);
+            for (size_t i = 0; i < ns; i++) {
+                const char *fn = json_string_value(
+                    json_object_get(json_array_get(steps, i), "function"));
+                if (fn != NULL &&
+                    (strncmp(fn, "peer_position", 13) == 0 ||
+                     strncmp(fn, "peer_profile", 12) == 0 ||
+                     strncmp(fn, "peer_connection", 15) == 0 ||
+                     strncmp(fn, "peer_dm", 7) == 0 ||
+                     strncmp(fn, "peer_post", 9) == 0)) {
+                    at_case_result_set_skip(
+                        out, "agora scenario skipped: C built without AT_SOCIAL "
+                             "(build -DAT_SOCIAL=ON to run it symmetrically)");
+                    return;
+                }
+            }
         }
     }
 #endif

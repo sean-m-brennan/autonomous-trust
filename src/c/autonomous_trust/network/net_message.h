@@ -38,7 +38,10 @@
 /** @brief Whether a wire message is addressed to one peer or to all. */
 typedef enum {
     RECIPIENT_PEER = 0,     /**< @c target.peer holds the intended recipient. */
-    RECIPIENT_BROADCAST = 1 /**< Message is broadcast to the group; @c target is unused. */
+    RECIPIENT_BROADCAST = 1, /**< Message is broadcast to the group; @c target is unused. */
+#ifdef AT_SOCIAL_ENABLED
+    RECIPIENT_GROUP = 2      /**< Encrypted group multicast on NET_CHAN_GROUP; @c target is unused (Increment 7). */
+#endif /* AT_SOCIAL_ENABLED */
 } recipient_type_t;
 
 /** @brief Recipient descriptor discriminated by @ref recipient_type_t. */

@@ -115,6 +115,19 @@ class IdentityProtocol(Protocol):
     # NO roster replay -- delivered on arrival. Encrypted directed, so NOT in
     # UNENCRYPTED_VERBS. `seq` is a per-sender freshness/replay guard.
     dm = 'peer_dm'  # msg.obj <- json {'text','seq','ts'}
+    # Feed post (Increment 7): a signed, content-addressed feed item distributed
+    # by encrypted GROUP MULTICAST and gossip-forwarded a bounded number of hops.
+    # UNLIKE a DM, a post is relayed by peers other than its author, so authorship
+    # comes from a detached Ed25519 signature over the canonical (author, seq, ts,
+    # required_tier, body) form (capabilities.post_*), verified before the tier-
+    # gate/dedup/emit. Group-encrypted, so NOT in UNENCRYPTED_VERBS.
+    post = 'peer_post'  # msg.obj <- json {author,author_pk,seq,ts,tier,body,sig,hops}
+    # Post reaction (Increment 8): the return signal a fire-and-forget post lacks.
+    # A directed, ENCRYPTED reactor->author message {post_id, seq, ts}, exactly
+    # like a DM (crypto_box authenticates the reactor). It lets both peers submit a
+    # reputation score for the same post-derived task, so the engagement accrues.
+    # Encrypted, so NOT in UNENCRYPTED_VERBS.
+    reaction = 'peer_reaction'  # msg.obj <- json {post_id, seq, ts}
     # Identity backfill for a node that holds a group member's address (in
     # group.addresses) but never received its full Identity — the cold/late
     # joiner case (e.g. the dod_mission coordinator: group.addresses grows via
