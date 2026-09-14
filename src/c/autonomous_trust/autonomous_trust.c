@@ -250,6 +250,17 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
 #ifdef AT_SOCIAL_ENABLED
             case PEER_POSITION_OBSERVED:
             case PEER_PROFILE_OBSERVED:
+            /* Every social app-event added after Increment 3 must be listed here
+             * too, or the identity process emits it to AT_MAIN_QUEUE and it is
+             * silently dropped at this drain instead of reaching the app queue:
+             * connection edges (Increment 5 — the inbound-request ASK and every
+             * edge-state change), DMs (Increment 6), feed posts (Increment 7), and
+             * post reactions (Increment 8). */
+            case PEER_CONNECTION_REQUEST_OBSERVED:
+            case PEER_CONNECTION_STATE_OBSERVED:
+            case PEER_DM_OBSERVED:
+            case PEER_POST_OBSERVED:
+            case PEER_REACTION_OBSERVED:
 #endif /* AT_SOCIAL_ENABLED */
                 if (q_out == NULL)
                     break;   /* no app attached; nothing to do */
