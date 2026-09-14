@@ -1,0 +1,51 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: accrual-connection-bilateral
+byte_pinning: false
+description: |
+    Social-interaction reputation accrual over a connection (Increment 8). A
+    connection accept is structurally bilateral — both peers ran the request/accept
+    exchange — so it accrues a diminishing positive score S_pos(count) without a
+    recency gate. On the FIRST interaction on the edge count is 1, so the staged
+    score is S_pos(1) = 0.65 + 0.25/1 = 0.90 (the tier-4 floor). The score is staged
+    for the SAME bilateral task both peers derive from the identical signed
+    {requester, accepter, decision, seq} tuple; here we assert the deterministic
+    staged score on the requester (newcomer), independent of the Paxos round.
+
+    Step 1: newcomer -> bg peer_connection_request  (bg: edge[newcomer]=pending_in).
+    Step 2: bg -> newcomer peer_connection_response {accept, seq:1}
+      - Both runtimes: newcomer verifies + records connected AND stages S_pos(1)=0.90
+        about bg.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: newcomer
+    to: bg
+    function: peer_connection_request
+    payload: {}
+    description: newcomer asks bg to connect; bg records pending_in.
+  - id: 2
+    from: bg
+    to: newcomer
+    function: peer_connection_response
+    payload:
+      accept: true
+      seq: 1
+    description: |
+        bg's signed accept; newcomer records connected and stages a 0.90 accrual
+        score about bg (first interaction on the edge, S_pos(1)).
+
+expected_state:
+  newcomer:
+    connection_state:
+      bg: 3            # connected
+    social_tx_last:
+      bg:
+        score: 0.9     # S_pos(1) = 0.65 + 0.25/1

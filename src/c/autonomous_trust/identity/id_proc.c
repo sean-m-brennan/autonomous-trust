@@ -423,6 +423,14 @@ static struct {
      * peers there is no explicit connection edge to, and overloading the edge map
      * would corrupt identity_get_connection_state. Guarded by id_state.lock. */
     map_t social_edges;
+    /* Conformance/observability surface (Increment 8): the last interaction score
+     * WE staged about each subject peer, keyed by lowercased subject uuid string;
+     * values are string_data(compact JSON {"task","score"}). Written by
+     * _submit_interaction_score at the moment we would move the peer's reputation,
+     * so a scenario can assert the deterministic staged score without running the
+     * Paxos round. Surface via identity_get_last_social_tx; twin of Python
+     * get_last_social_tx. Guarded by id_state.lock. */
+    map_t social_tx_observed;
     /* How many social accrual commits WE have submitted today, across all edges —
      * the global daily cap against a Sybil fan-out. Rolls over with social_day. */
     int   social_day;
@@ -569,6 +577,7 @@ static void _ensure_id_init(void)
         id_state.seen_post_next = 0;
         id_state.seen_post_count = 0;
         map_init(&id_state.social_edges);
+        map_init(&id_state.social_tx_observed);
         id_state.social_day = 0;
         id_state.social_day_count = 0;
         map_init(&id_state.social_blocks);
@@ -2925,6 +2934,8 @@ void identity_reset_state(void)
     id_state.seen_post_count = 0;
     map_free(&id_state.social_edges);
     map_init(&id_state.social_edges);
+    map_free(&id_state.social_tx_observed);
+    map_init(&id_state.social_tx_observed);
     id_state.social_day = 0;
     id_state.social_day_count = 0;
     map_free(&id_state.social_blocks);
@@ -4481,6 +4492,65 @@ static void _submit_interaction_score(const process_t *proc,
     if (messaging_send("reputation", TRANSACTION_SCORE, &msg, false) != 0)
         log_warn(proc->logger,
                  "Identity: could not submit social score %.3f\n", score);
+
+    /* Record the staged score as the conformance/observability surface — the
+     * deterministic thing a scenario asserts, independent of the Paxos round. */
+    if (subject != NULL) {
+        char subj[UUID_STRING_LEN + 1];
+        char task_hex[33];
+        uuid_unparse_lower(subject, subj);
+        uuid_unparse_lower(task_uuid, task_hex);
+        char buf[96];
+        int len = snprintf(buf, sizeof(buf), "{\"task\":\"%s\",\"score\":%.6f}",
+                           task_hex, score);
+        if (len > 0 && (size_t)len < sizeof(buf)) {
+            char *dup = smrt_create((size_t)len + 1);
+            if (dup != NULL) {
+                memcpy(dup, buf, (size_t)len + 1);
+                data_t *dat = string_data(dup, (size_t)len + 1);
+                if (dat != NULL) {
+                    pthread_mutex_lock(&id_state.lock);
+                    map_set(&id_state.social_tx_observed, (map_key_t)subj, dat);
+                    pthread_mutex_unlock(&id_state.lock);
+                } else {
+                    smrt_deref(dup);
+                }
+            }
+        }
+    }
+}
+
+/* Conformance seam: the last interaction score this node staged ABOUT peer
+ * @p uuid_str (lowercased subject uuid). Copies the task_uuid hex into @p task_out
+ * (>= 37 bytes) and the score into @p score_out when non-NULL. Returns true iff a
+ * staged score is recorded. Twin of Python IdentityProcess.get_last_social_tx. */
+bool identity_get_last_social_tx(const char *uuid_str, char *task_out,
+                                 double *score_out)
+{
+    if (uuid_str == NULL) return false;
+    bool found = false;
+    pthread_mutex_lock(&id_state.lock);
+    data_t *dat = NULL;
+    if (map_get(&id_state.social_tx_observed, (map_key_t)uuid_str, &dat) == 0
+        && dat != NULL) {
+        char *s = NULL;
+        if (data_string_ptr(dat, &s) == 0 && s != NULL) {
+            json_error_t jerr;
+            json_t *o = json_loads(s, 0, &jerr);
+            if (o != NULL) {
+                json_t *jt = json_object_get(o, "task");
+                json_t *js = json_object_get(o, "score");
+                if (json_is_string(jt) && task_out != NULL)
+                    snprintf(task_out, 37, "%s", json_string_value(jt));
+                if (json_is_number(js) && score_out != NULL)
+                    *score_out = json_number_value(js);
+                found = true;
+                json_decref(o);
+            }
+        }
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return found;
 }
 
 /* Read the per-edge accrual record for @p uuid_str; absent => all zeros. Caller
