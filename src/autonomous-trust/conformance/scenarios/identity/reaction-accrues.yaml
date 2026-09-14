@@ -1,0 +1,43 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: reaction-accrues
+byte_pinning: false
+description: |
+    A post reaction accrues reputation for both peers (Increment 8). A post is
+    fire-and-forget group multicast, so its author never learns of engagement on
+    its own; a reaction is the directed encrypted return signal that closes the
+    loop. It is structurally bilateral (the reaction message itself makes both the
+    reactor and the author submit for the same post-derived task), so it accrues the
+    diminishing positive without a recency gate. Here newcomer reacts to a post by
+    bg; bg's handle_reaction freshness-accepts it and stages S_pos(1) = 0.90 about
+    newcomer (the reactor). The post content-id binds the task; any 64-hex id works
+    for the observable (the reaction carries no post body).
+
+    Step 1: newcomer -> bg peer_reaction {post_id, seq:1}
+      - Both runtimes: bg records nothing DM/post-like but stages a 0.90 accrual
+        score about newcomer.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: newcomer
+    to: bg
+    function: peer_reaction
+    payload:
+      post_id: "abababababababababababababababababababababababababababababababab"
+      seq: 1
+    description: |
+        newcomer reacts to one of bg's posts; bg stages a 0.90 accrual score about
+        newcomer.
+
+expected_state:
+  bg:
+    social_tx_last:
+      newcomer:
+        score: 0.9

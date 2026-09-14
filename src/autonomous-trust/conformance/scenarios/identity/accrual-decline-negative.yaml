@@ -1,0 +1,48 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: accrual-decline-negative
+byte_pinning: false
+description: |
+    A connection DECLINE stages the in-model bilateral negative (Increment 8). Both
+    peers know the decline (it rides the same signed {requester, accepter,
+    decision=0, seq} tuple), so both submit the fixed negative score S_neg = 0.30 —
+    a clear demerit, but above the COMM_CUTOFF (0.10) so a single decline is not an
+    exile. Unlike the positive path this is not diminishing and not gated: freshness
+    forecloses replay. Asserted on the requester (newcomer).
+
+    Step 1: newcomer -> bg peer_connection_request.
+    Step 2: bg -> newcomer peer_connection_response {accept:false, seq:1}
+      - Both runtimes: newcomer records declined AND stages S_neg=0.30 about bg.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: newcomer
+    to: bg
+    function: peer_connection_request
+    payload: {}
+    description: newcomer asks bg to connect; bg records pending_in.
+  - id: 2
+    from: bg
+    to: newcomer
+    function: peer_connection_response
+    payload:
+      accept: false
+      seq: 1
+    description: |
+        bg's signed decline; newcomer records declined and stages the 0.30 negative
+        score about bg.
+
+expected_state:
+  newcomer:
+    connection_state:
+      bg: 4            # declined
+    social_tx_last:
+      bg:
+        score: 0.3     # S_neg

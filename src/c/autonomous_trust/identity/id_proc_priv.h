@@ -144,6 +144,16 @@ bool identity_get_last_dm(const char *uuid_str, char *text_buf, size_t text_sz,
 bool identity_get_last_post(const char *uuid_str, char *post_id_buf,
                             size_t post_id_sz, char *body_buf, size_t body_sz,
                             int64_t *seq_out, int *tier_out);
+
+/** The last interaction score this node STAGED about subject peer @p uuid_str
+ *  (Increment 8) — the deterministic accrual observable, recorded at submit time
+ *  independent of the Paxos round. Copies the task_uuid hex into @p task_out
+ *  (>= 37 bytes) and, when non-NULL, the score into @p score_out. Returns true iff
+ *  a staged score is recorded for that subject. Twin of Python
+ *  IdentityProcess.get_last_social_tx; conformance asserts via the
+ *  `social_tx_last` expected_state key. */
+bool identity_get_last_social_tx(const char *uuid_str, char *task_out,
+                                 double *score_out);
 #endif /* AT_SOCIAL_ENABLED */
 
 /** Copy the size-bounded capability descriptor recorded for @p cap_name (from

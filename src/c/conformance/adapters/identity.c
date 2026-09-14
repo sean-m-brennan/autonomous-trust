@@ -1531,6 +1531,27 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_decref(env);
         return 0;
     }
+
+    /* peer_reaction — pack {post_id, seq, ts} (Increment 8). A reaction carries no
+     * signature (crypto_box authenticates the reactor on the wire; in the harness
+     * the from_whom identity stands in). `post_id` and `ts` come from the scenario;
+     * `seq` is honored via _ic_set_seq so `unstamped: true` drops it. Mirrors the
+     * Python peer_reaction builder. */
+    if (strcmp(function, "peer_reaction") == 0 && json_is_object(payload)) {
+        json_t *body = json_object();
+        json_t *jpid = json_object_get(payload, "post_id");
+        json_t *jts = json_object_get(payload, "ts");
+        json_object_set_new(body, "post_id",
+                            json_string(json_is_string(jpid)
+                                        ? json_string_value(jpid) : ""));
+        json_object_set_new(body, "ts",
+                            json_real(json_is_number(jts)
+                                      ? json_number_value(jts) : 0.0));
+        _ic_set_seq(body, payload);
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+        return 0;
+    }
 #endif /* AT_SOCIAL_ENABLED */
 
     /* vote_on_peer is the only identity function whose C handler
@@ -2774,6 +2795,61 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                         return -1;
                     }
                 }
+            } else if (strcmp(key, "social_tx_last") == 0) {
+                /* {subject_id: {score} | {absent: true}} (Increment 8) — the last
+                 * interaction reputation score this participant STAGED about
+                 * another peer, via identity_get_last_social_tx. A one-way (bilateral
+                 * gate unmet) or capped interaction stages NOTHING -> ABSENT;
+                 * `absent: true` asserts that. The score is the deterministic
+                 * accrual observable, independent of the Paxos round. Mirrors the
+                 * Python adapter's social_tx_last, keyed by the same lowercased
+                 * subject uuid. */
+                const char *stx_pid;
+                json_t *stx_want;
+                json_object_foreach(val, stx_pid, stx_want) {
+                    sce_participant_t *other = sce_find_participant(ctx, stx_pid);
+                    if (other == NULL) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: social_tx_last names unknown participant %s",
+                                 pid, stx_pid);
+                        return -1;
+                    }
+                    const public_identity_t *want_id =
+                        ((ic_impl_t *)other->impl)->pub;
+                    char want_uuid[UUID_STR_LEN + 1];
+                    uuid_unparse_lower(want_id->uuid, want_uuid);
+                    char got_task[UUID_STR_LEN + 1] = {0};
+                    double got_score = 0.0;
+                    bool have = identity_get_last_social_tx(want_uuid, got_task,
+                                                            &got_score);
+                    bool want_absent =
+                        json_is_true(json_object_get(stx_want, "absent"));
+                    if (want_absent) {
+                        if (have) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: social_tx_last[%s] present (score=%.6f), "
+                                     "expected ABSENT", pid, stx_pid, got_score);
+                            return -1;
+                        }
+                        continue;
+                    }
+                    if (!have) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: social_tx_last[%s] absent, expected a staged "
+                                 "score", pid, stx_pid);
+                        return -1;
+                    }
+                    json_t *jsc = json_object_get(stx_want, "score");
+                    if (json_is_number(jsc)) {
+                        double want_score = json_number_value(jsc);
+                        if (fabs(got_score - want_score) > 1e-6) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: social_tx_last[%s].score=%.6f, expected "
+                                     "%.6f", pid, stx_pid, got_score, want_score);
+                            return -1;
+                        }
+                    }
+                }
             }
 #endif /* AT_SOCIAL_ENABLED */
             else if (strcmp(key, "first_contact_hello_endpoint") == 0) {
@@ -3763,7 +3839,8 @@ void at_identity_run(const at_case_t *c, at_case_result_t *out) {
                      strncmp(fn, "peer_profile", 12) == 0 ||
                      strncmp(fn, "peer_connection", 15) == 0 ||
                      strncmp(fn, "peer_dm", 7) == 0 ||
-                     strncmp(fn, "peer_post", 9) == 0)) {
+                     strncmp(fn, "peer_post", 9) == 0 ||
+                     strncmp(fn, "peer_reaction", 13) == 0)) {
                     at_case_result_set_skip(
                         out, "agora scenario skipped: C built without AT_SOCIAL "
                              "(build -DAT_SOCIAL=ON to run it symmetrically)");
