@@ -1,0 +1,64 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: accrual-cap-enforced
+byte_pinning: false
+description: |
+    The per-edge daily cap bounds a chatty pair (Increment 8). Accrual on one edge
+    is capped at SOCIAL_PER_EDGE_DAILY_CAP (3) commits per day, so a fourth
+    interaction the same day stages NOTHING new — the observable stays at the third
+    commit's diminishing score S_pos(3) = 0.65 + 0.25/3 = 0.733333. Here newcomer
+    reacts to four of bg's posts in quick succession; bg accrues on the first three
+    (count 1,2,3 -> 0.90, 0.775, 0.733333) and the fourth is refused by the cap, so
+    bg's last staged score about newcomer remains S_pos(3). This is the anti-spam
+    bound: reacting more cannot keep lifting a peer.
+
+    Steps 1-4: newcomer -> bg peer_reaction {seq:1..4} (distinct posts).
+      - Both runtimes: bg accrues 3 times then the 4th is cap-refused; the staged
+        score stays at S_pos(3).
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: newcomer
+    to: bg
+    function: peer_reaction
+    payload:
+      post_id: "1111111111111111111111111111111111111111111111111111111111111111"
+      seq: 1
+    description: reaction 1 -> bg accrues count 1 (0.90).
+  - id: 2
+    from: newcomer
+    to: bg
+    function: peer_reaction
+    payload:
+      post_id: "2222222222222222222222222222222222222222222222222222222222222222"
+      seq: 2
+    description: reaction 2 -> bg accrues count 2 (0.775).
+  - id: 3
+    from: newcomer
+    to: bg
+    function: peer_reaction
+    payload:
+      post_id: "3333333333333333333333333333333333333333333333333333333333333333"
+      seq: 3
+    description: reaction 3 -> bg accrues count 3 (0.733333).
+  - id: 4
+    from: newcomer
+    to: bg
+    function: peer_reaction
+    payload:
+      post_id: "4444444444444444444444444444444444444444444444444444444444444444"
+      seq: 4
+    description: reaction 4 -> per-edge daily cap refuses accrual; score unchanged.
+
+expected_state:
+  bg:
+    social_tx_last:
+      newcomer:
+        score: 0.733333    # S_pos(3); the 4th interaction was cap-refused
