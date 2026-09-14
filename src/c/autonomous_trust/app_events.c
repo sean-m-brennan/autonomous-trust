@@ -140,6 +140,7 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
             ev->data.rtt.rtt_ms = msg.info.peer_rtt_update.rtt_ms;
             break;
         }
+#ifdef AT_SOCIAL_ENABLED
         case PEER_POSITION_OBSERVED:
         {
             at_app_event_t *ev = &out[n++];
@@ -203,6 +204,43 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
             ev->data.dm.text[AT_APP_DM_TEXT_LEN] = '\0';
             break;
         }
+        case PEER_POST_OBSERVED:
+        {
+            at_app_event_t *ev = &out[n++];
+            memset(ev, 0, sizeof(*ev));
+            ev->kind = AT_APP_EVENT_POST;
+            memcpy(ev->data.post.author_uuid,
+                   msg.info.peer_post.peer_uuid, AT_APP_UUID_LEN);
+            /* The emitter NUL-caps both strings; the event was memset, so a
+             * short string stays terminated after the bounded copy. */
+            memcpy(ev->data.post.post_id, msg.info.peer_post.post_id,
+                   AT_APP_POST_ID_LEN);
+            ev->data.post.post_id[AT_APP_POST_ID_LEN] = '\0';
+            ev->data.post.seq = msg.info.peer_post.seq;
+            ev->data.post.ts = msg.info.peer_post.ts;
+            ev->data.post.required_tier = msg.info.peer_post.required_tier;
+            memcpy(ev->data.post.body, msg.info.peer_post.body,
+                   AT_APP_POST_BODY_LEN);
+            ev->data.post.body[AT_APP_POST_BODY_LEN] = '\0';
+            break;
+        }
+        case PEER_REACTION_OBSERVED:
+        {
+            at_app_event_t *ev = &out[n++];
+            memset(ev, 0, sizeof(*ev));
+            ev->kind = AT_APP_EVENT_REACTION;
+            memcpy(ev->data.reaction.peer_uuid,
+                   msg.info.peer_reaction.peer_uuid, AT_APP_UUID_LEN);
+            /* The emitter NUL-caps the id; the event was memset, so a short
+             * string stays terminated after the bounded copy. */
+            memcpy(ev->data.reaction.post_id, msg.info.peer_reaction.post_id,
+                   AT_APP_POST_ID_LEN);
+            ev->data.reaction.post_id[AT_APP_POST_ID_LEN] = '\0';
+            ev->data.reaction.seq = msg.info.peer_reaction.seq;
+            ev->data.reaction.ts = msg.info.peer_reaction.ts;
+            break;
+        }
+#endif /* AT_SOCIAL_ENABLED */
         default:
             /* Not app-facing: skipped rather than surfaced as an event. A
              * consumer of this ABI is not given AT's internal traffic. */
@@ -229,6 +267,7 @@ int at_app_events_request_roster(at_app_events_t *handle, const char *q_out)
     return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
 }
 
+#ifdef AT_SOCIAL_ENABLED
 int at_app_events_set_position(at_app_events_t *handle, const char *q_out,
                                const char *geohash)
 {
@@ -369,6 +408,97 @@ int at_app_events_send_dm(at_app_events_t *handle, const char *q_out,
     json_decref(env);
     return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
 }
+
+int at_app_events_publish_post(at_app_events_t *handle, const char *q_out,
+                               const char *body, int required_tier)
+{
+    if (handle == NULL || !name_survives(q_out))
+        return -1;
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
+    if (required_tier < 0) required_tier = 0;
+    if (required_tier > 4) required_tier = 4;
+    /* {"body": "<body>", "tier": <int>}; identity signs, group-encrypts and
+     * multicasts the post. */
+    json_t *env = json_object();
+    if (env == NULL)
+        return -1;
+    json_object_set_new(env, "body", json_string(body != NULL ? body : ""));
+    json_object_set_new(env, "tier", json_integer(required_tier));
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),
+             "identity");
+    req.info.net_msg.function = (char *)AT_APP_PUBLISH_POST;
+    req.info.net_msg.encrypt = false;
+    if (net_msg_pack_json(&req.info.net_msg, env) != 0) {
+        json_decref(env);
+        return -1;
+    }
+    json_decref(env);
+    return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
+}
+
+int at_app_events_react_post(at_app_events_t *handle, const char *q_out,
+                             const uint8_t author_uuid[AT_APP_UUID_LEN],
+                             const char *post_id)
+{
+    if (handle == NULL || !name_survives(q_out) || author_uuid == NULL
+        || post_id == NULL)
+        return -1;
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
+    char uuid_str[37];
+    uuid_unparse_lower((const unsigned char *)author_uuid, uuid_str);
+    /* {"author": "<uuid_str>", "post_id": "<hex>"}; identity sends the directed
+     * encrypted peer_reaction to the author. */
+    json_t *env = json_object();
+    if (env == NULL)
+        return -1;
+    json_object_set_new(env, "author", json_string(uuid_str));
+    json_object_set_new(env, "post_id", json_string(post_id));
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),
+             "identity");
+    req.info.net_msg.function = (char *)AT_APP_REACT_POST;
+    req.info.net_msg.encrypt = false;
+    if (net_msg_pack_json(&req.info.net_msg, env) != 0) {
+        json_decref(env);
+        return -1;
+    }
+    json_decref(env);
+    return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
+}
+
+int at_app_events_block(at_app_events_t *handle, const char *q_out,
+                        const uint8_t peer_uuid[AT_APP_UUID_LEN])
+{
+    if (handle == NULL || !name_survives(q_out) || peer_uuid == NULL)
+        return -1;
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
+    char uuid_str[37];
+    uuid_unparse_lower((const unsigned char *)peer_uuid, uuid_str);
+    /* {"peer": "<uuid_str>"}; identity clamps the peer's local tier to 0. */
+    json_t *env = json_object();
+    if (env == NULL)
+        return -1;
+    json_object_set_new(env, "peer", json_string(uuid_str));
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),
+             "identity");
+    req.info.net_msg.function = (char *)AT_APP_BLOCK;
+    req.info.net_msg.encrypt = false;
+    if (net_msg_pack_json(&req.info.net_msg, env) != 0) {
+        json_decref(env);
+        return -1;
+    }
+    json_decref(env);
+    return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
+}
+#endif /* AT_SOCIAL_ENABLED */
 
 void at_app_events_close(at_app_events_t *handle)
 {

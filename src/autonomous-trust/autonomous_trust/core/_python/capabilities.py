@@ -312,6 +312,134 @@ def connection_verify(verify_key: '_VerifyKey', requester_uuid, accepter_uuid,
         return False
 
 
+# --- feed posts (with-distance Increment 7) --------------------------------- #
+# A post is a signed, content-addressed feed item distributed by encrypted group
+# multicast and gossip-forwarded a bounded number of hops. UNLIKE a DM, whose
+# crypto_box envelope authenticates the sender, a post is relayed by peers other
+# than its author, so authorship comes from a detached Ed25519 signature over the
+# canonical (author, seq, ts, required_tier, body) form — verified before acting.
+# The blake2b-256 of the canonical is the content id (dedup/merge key). MUST stay
+# byte-identical to C identity/post.c (at_post_canonical / at_post_content_id).
+import struct as _struct
+
+# Post body bound (bytes). MUST match C AT_POST_BODY_LEN / AT_POST_BODY_MAX and
+# AT_APP_POST_BODY_LEN.
+POST_BODY_MAX = 4096
+# Content id length (blake2b-256 lowercase hex). MUST match C AT_POST_ID_LEN.
+POST_ID_HEX_LEN = 64
+# Feed gossip reach: highest hop_count a post carries on the wire (active network
+# + one hop). MUST match C POST_MAX_HOPS.
+POST_MAX_HOPS = 1
+POST_TIER_MIN = 0
+POST_TIER_MAX = 4
+
+
+def bound_post_body(text: str) -> str:
+    """Truncate a post body to POST_BODY_MAX UTF-8 bytes. Twin of C
+    at_post_bound_body (the app-boundary buffer clamp)."""
+    if not isinstance(text, str):
+        return ''
+    return _clamp_bytes(text, POST_BODY_MAX)
+
+
+def post_canonical(author_uuid, seq: int, ts: float, required_tier: int,
+                   body: str) -> bytes:
+    """THE cross-language signing/hash contract (see C identity/post.h):
+      author_uuid[16] || u64le(seq) || f64le(ts) || u8(required_tier)
+      || u32le(body_len) || utf8_body
+    where ts is the raw IEEE-754 little-endian double (struct '<d'). The body is
+    bound-truncated first, so the canonical matches what crosses the wire. MUST
+    stay byte-identical to C at_post_canonical."""
+    out = bytearray(_uuid16(author_uuid))
+    out += int(seq).to_bytes(8, 'little')
+    out += _struct.pack('<d', float(ts))
+    out += bytes((int(required_tier) & 0xFF,))
+    b = bound_post_body(body).encode('utf-8')
+    out += _u32le(len(b))
+    out += b
+    return bytes(out)
+
+
+def post_content_id(author_uuid, seq: int, ts: float, required_tier: int,
+                    body: str) -> str:
+    """blake2b-256 of the canonical bytes, lowercase hex (POST_ID_HEX_LEN chars).
+    Same primitive as libsodium crypto_generichash (BLAKE2b-256). Twin of C
+    at_post_content_id."""
+    import hashlib
+    return hashlib.blake2b(
+        post_canonical(author_uuid, seq, ts, required_tier, body),
+        digest_size=32).hexdigest()
+
+
+# Increment 8: social-interaction reputation accrual. Both peers of an
+# interaction derive the SAME task id independently and must agree byte-for-byte,
+# or their two scores never pair into one bilateral transaction. MUST stay in
+# lockstep with C identity/social_tx.h.
+SOCIAL_DOMAIN_CONN = b'agora-conn'
+SOCIAL_DOMAIN_DM = b'agora-dm'
+SOCIAL_DOMAIN_POST = b'agora-post'
+
+SOCIAL_POS_BASELINE = 0.65
+SOCIAL_POS_DELTA = 0.25
+SOCIAL_NEG_SCORE = 0.30
+SOCIAL_RECENCY_WINDOW = 604800.0
+SOCIAL_PER_EDGE_DAILY_CAP = 3
+SOCIAL_GLOBAL_DAILY_CAP = 20
+SOCIAL_DM_BUCKET_SECONDS = 3600
+SOCIAL_DAY_SECONDS = 86400
+
+
+def social_task_uuid(domain, a_uuid, b_uuid, tail: bytes = b'') -> str:
+    """The shared bilateral task id for a social interaction. Canonical bytes:
+      domain || 0x00 || uuid_min(a,b)[16] || uuid_max(a,b)[16] || tail
+    blake2b-256, first 16 bytes as a UUID string (lowercase). Order-independent in
+    a,b (both peers converge). Twin of C at_social_task_uuid."""
+    import hashlib
+    if isinstance(domain, str):
+        domain = domain.encode('ascii')
+    a = _uuid16(a_uuid)
+    b = _uuid16(b_uuid)
+    lo, hi = (a, b) if a <= b else (b, a)   # byte compare == libuuid uuid_compare
+    canon = bytes(domain) + b'\x00' + lo + hi + bytes(tail)
+    digest = hashlib.blake2b(canon, digest_size=32).digest()
+    return str(_uuidmod.UUID(bytes=digest[:16]))
+
+
+def social_pos_score(count: int) -> float:
+    """Diminishing-returns positive score S_pos(count) = 0.65 + 0.25/count, clamped
+    to the TX [0,1] scale. count <= 0 is treated as 1. Twin of C at_social_pos_score."""
+    if count < 1:
+        count = 1
+    s = SOCIAL_POS_BASELINE + SOCIAL_POS_DELTA / float(count)
+    return max(0.0, min(1.0, s))
+
+
+def post_sign(signing_key: '_SigningKey', author_uuid, seq: int, ts: float,
+              required_tier: int, body: str) -> str:
+    """Detached Ed25519 signature over post_canonical, lowercase hex."""
+    sig = signing_key.sign(
+        post_canonical(author_uuid, seq, ts, required_tier, body)).signature
+    return sig.hex()
+
+
+def post_verify(verify_key: '_VerifyKey', author_uuid, seq: int, ts: float,
+                required_tier: int, body: str, sig_hex: str) -> bool:
+    """Verify a detached signature (lowercase hex) over post_canonical."""
+    try:
+        sig = bytes.fromhex(sig_hex)
+    except (ValueError, TypeError):
+        return False
+    if len(sig) != 64:
+        return False
+    from nacl.exceptions import BadSignatureError
+    try:
+        verify_key.verify(
+            post_canonical(author_uuid, seq, ts, required_tier, body), sig)
+        return True
+    except BadSignatureError:
+        return False
+
+
 class Capability(Configuration):
     """Name and function"""
     _msg_class = capabilities_pb2.Capability

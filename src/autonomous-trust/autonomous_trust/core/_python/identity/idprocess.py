@@ -416,6 +416,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # app-driven send verb and app-event emission are C-only (as with
         # position/profile/connection). Filled by handle_dm after freshness.
         self.last_dm: dict = {}
+        # Feed posts (Increment 7): the most-recent post accepted per AUTHOR uuid
+        # string -> {'post_id','seq','ts','tier','body'} (get_last_post, twin of C
+        # identity_get_last_post), and the bounded app-content dedup ring of
+        # accepted content ids (twin of C id_state.seen_post_ids). Both are the
+        # observability surface; a post is a live stream, never roster-replayed.
+        self.last_post: dict = {}
+        self._seen_post_ids: list = []
         self.protocol.register_handler(IdentityProtocol.announce, self.welcoming_committee)
         self.protocol.register_handler(IdentityProtocol.accept, self.handle_acceptance)
         self.protocol.register_handler(IdentityProtocol.history, self.receive_history)
@@ -433,6 +440,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.connection_request, self.handle_connection_request)
         self.protocol.register_handler(IdentityProtocol.connection_response, self.handle_connection_response)
         self.protocol.register_handler(IdentityProtocol.dm, self.handle_dm)
+        self.protocol.register_handler(IdentityProtocol.post, self.handle_post)
         self.protocol.register_handler(IdentityProtocol.id_query, self.handle_identity_query)
         self.protocol.register_handler(IdentityProtocol.id_response, self.handle_identity_response)
         self.protocol.register_handler(IdentityProtocol.roster_req, self.handle_roster_request)
@@ -3889,6 +3897,113 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         ``identity_get_last_dm``."""
         with self.lock:
             return dict(self.last_dm.get(str(uuid_str), {}))
+
+    # ------------------------------------------------------------------
+    # Feed posts (Increment 7): a signed, content-addressed feed item distributed
+    # by encrypted GROUP MULTICAST and gossip-forwarded a bounded number of hops.
+    # UNLIKE a DM, a post is relayed by peers other than its author, so authorship
+    # comes from a detached Ed25519 signature over the canonical (author, seq, ts,
+    # required_tier, body) form (capabilities.post_*), verified before the tier-
+    # gate/content-id dedup/emit. Twin of the C block in id_proc.c (handle_post).
+    # The app-driven publish verb and app-event emission are C-only; a Python node
+    # records the most recent post per author (get_last_post) for the conformance
+    # observable. Re-multicast (gossip) has no wire in the harness, so — like the C
+    # node's effective no-op there — it is omitted; parity is on the observable.
+    # ------------------------------------------------------------------
+
+    def handle_post(self, queues, message):
+        """An inbound group-multicast feed post. Verify the author's Ed25519
+        signature (for a KNOWN peer the carried author_pk MUST match the stored
+        signing key — impersonation guard; an unknown author is verified against
+        the carried key, best-effort one-hop), tier-gate against this node's view
+        of the author's tier, content-id dedup, then record it. Twin of the C
+        handle_post."""
+        if message.function != IdentityProtocol.post:
+            return False
+        try:
+            body = from_json_string(message.obj)
+            if not isinstance(body, dict):
+                return True
+            author = body.get('author')
+            author_pk = body.get('author_pk')
+            seq = body.get('seq')
+            ts = body.get('ts')
+            tier = body.get('tier')
+            text = body.get('body')
+            sig = body.get('sig')
+            hops = body.get('hops')
+            if not (isinstance(author, str) and isinstance(author_pk, str)
+                    and isinstance(seq, int) and isinstance(ts, (int, float))
+                    and isinstance(tier, int) and isinstance(text, str)
+                    and isinstance(sig, str) and isinstance(hops, int)):
+                self.logger.warning('peer_post malformed, refusing')
+                return True
+            from ..capabilities import (post_verify, post_content_id,
+                                        bound_post_body, POST_TIER_MIN,
+                                        POST_TIER_MAX)
+            if tier < POST_TIER_MIN or tier > POST_TIER_MAX:
+                self.logger.warning('peer_post bad tier %r, refusing', tier)
+                return True
+            from nacl.signing import VerifyKey
+            # Resolve the verify key, binding uuid <-> key where we can.
+            peer = self.peers.find_by_uuid(author) if self.peers else None
+            if peer is not None:
+                known_pk_hex = bytes(peer.signature.public).hex()
+                if known_pk_hex != author_pk:
+                    self.logger.warning(
+                        'peer_post from %s: author_pk != known key, dropping '
+                        '(impersonation)', str(author)[:8])
+                    return True
+                vk = peer.signature.public
+            else:
+                try:
+                    vk = VerifyKey(bytes.fromhex(author_pk))
+                except (ValueError, TypeError):
+                    self.logger.warning(
+                        'peer_post from %s: bad author_pk, dropping',
+                        str(author)[:8])
+                    return True
+            if not post_verify(vk, author, int(seq), float(ts), int(tier),
+                               text, sig):
+                self.logger.warning(
+                    'peer_post from %s: BAD SIGNATURE, dropping', str(author)[:8])
+                return True
+            # Tier-gate: deliver only if this node's view of the author's tier
+            # meets the post's required audience floor (unknown author => tier 0).
+            author_tier = (getattr(peer, '_tier', 0) or 0) if peer is not None else 0
+            if author_tier < int(tier):
+                self.logger.debug(
+                    'peer_post from %s tier-gated (need %d, have %d)',
+                    str(author)[:8], int(tier), author_tier)
+                return True
+            # Content-id dedup (the app-content store): drop a repeat.
+            pid = post_content_id(author, int(seq), float(ts), int(tier), text)
+            with self.lock:
+                if pid in self._seen_post_ids:
+                    self.logger.debug('peer_post %s already seen, dropping', pid)
+                    return True
+                self._seen_post_ids.append(pid)
+                if len(self._seen_post_ids) > 256:
+                    self._seen_post_ids.pop(0)
+                self.last_post[str(author)] = {
+                    'post_id': pid,
+                    'seq': int(seq),
+                    'ts': float(ts),
+                    'tier': int(tier),
+                    'body': bound_post_body(text),
+                }
+            self.logger.debug('post %s from %s accepted (hops=%d)',
+                              pid, str(author)[:8], int(hops))
+        except Exception as err:
+            self.report_exception(err, 'handle_post')
+        return True
+
+    def get_last_post(self, uuid_str):
+        """The most-recent post accepted from an AUTHOR uuid, as
+        {'post_id','seq','ts','tier','body'}, or {} if none. Conformance/
+        assertion surface; twin of C ``identity_get_last_post``."""
+        with self.lock:
+            return dict(self.last_post.get(str(uuid_str), {}))
 
     # How often the cap-resync sweep runs, and the max queries it emits per
     # sweep (so a large degraded group can't burst the network queue). The

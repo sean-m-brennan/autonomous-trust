@@ -1,0 +1,44 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: feed-post-tier-gated
+byte_pinning: false
+description: |
+    The audience gate for a feed post (Increment 7). A post carries a
+    required_tier (0=public .. 4=close); a reader delivers it only when its own
+    view of the AUTHOR's trust tier meets that floor. Here bg publishes a post
+    requiring tier 1, but newcomer holds no elevated tier for bg (default 0), so
+    the post is tier-gated and never reaches newcomer's feed. This is the
+    substrate-level enforcement of §3.4's post audiences — a signed post is still
+    dropped when the reader does not qualify for its audience.
+
+    Step 1: bg -> newcomer peer_post {body, seq:1, tier:1}.
+      - Both runtimes: signature verifies, but tier-gate (need 1, have 0) drops it.
+
+    Assertion: newcomer.post_last[bg] is ABSENT — gated by audience tier.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_post
+    payload:
+      body: friends only
+      seq: 1
+      ts: 0
+      tier: 1
+    description: |
+        A well-signed post requiring tier 1; newcomer's view of bg's tier is 0, so
+        the tier-gate drops it before recording.
+
+expected_state:
+  newcomer:
+    post_last:
+      bg:
+        absent: true

@@ -72,6 +72,7 @@ size_t message_size(message_type_t type)
         return sizeof(peer_observed_msg_t);
     case PEER_REPUTATION:
         return sizeof(peer_reputation_msg_t);
+#ifdef AT_SOCIAL_ENABLED
     case PEER_POSITION_OBSERVED:
         return sizeof(peer_position_msg_t);
     case PEER_PROFILE_OBSERVED:
@@ -81,6 +82,11 @@ size_t message_size(message_type_t type)
         return sizeof(peer_connection_msg_t);
     case PEER_DM_OBSERVED:
         return sizeof(peer_dm_msg_t);
+    case PEER_POST_OBSERVED:
+        return sizeof(peer_post_msg_t);
+    case PEER_REACTION_OBSERVED:
+        return sizeof(peer_reaction_msg_t);
+#endif /* AT_SOCIAL_ENABLED */
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:
     case ZTA_VERIFICATION_RESULT:
@@ -136,6 +142,7 @@ char *message_type_to_string(message_type_t type)
         return (char*)"PEER_OBSERVED";
     case PEER_REPUTATION:
         return (char*)"PEER_REPUTATION";
+#ifdef AT_SOCIAL_ENABLED
     case PEER_POSITION_OBSERVED:
         return (char*)"PEER_POSITION_OBSERVED";
     case PEER_PROFILE_OBSERVED:
@@ -146,6 +153,11 @@ char *message_type_to_string(message_type_t type)
         return (char*)"PEER_CONNECTION_STATE_OBSERVED";
     case PEER_DM_OBSERVED:
         return (char*)"PEER_DM_OBSERVED";
+    case PEER_POST_OBSERVED:
+        return (char*)"PEER_POST_OBSERVED";
+    case PEER_REACTION_OBSERVED:
+        return (char*)"PEER_REACTION_OBSERVED";
+#endif /* AT_SOCIAL_ENABLED */
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:
         return (char*)"ZTA_REVOCATION_ALERT";
@@ -203,6 +215,7 @@ message_type_t string_to_message_type(const char *str)
         return PEER_OBSERVED;
     if (strcmp(str, "PEER_REPUTATION") == 0)
         return PEER_REPUTATION;
+#ifdef AT_SOCIAL_ENABLED
     if (strcmp(str, "PEER_POSITION_OBSERVED") == 0)
         return PEER_POSITION_OBSERVED;
     if (strcmp(str, "PEER_PROFILE_OBSERVED") == 0)
@@ -213,6 +226,11 @@ message_type_t string_to_message_type(const char *str)
         return PEER_CONNECTION_STATE_OBSERVED;
     if (strcmp(str, "PEER_DM_OBSERVED") == 0)
         return PEER_DM_OBSERVED;
+    if (strcmp(str, "PEER_POST_OBSERVED") == 0)
+        return PEER_POST_OBSERVED;
+    if (strcmp(str, "PEER_REACTION_OBSERVED") == 0)
+        return PEER_REACTION_OBSERVED;
+#endif /* AT_SOCIAL_ENABLED */
 #ifdef AT_ZTA_ENABLED
     if (strcmp(str, "ZTA_STANDING") == 0)
         return ZTA_STANDING;
@@ -279,6 +297,12 @@ int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr
     json_object_set_new(root, "process", json_string(msg->process));
     json_object_set_new(root, "function", json_string(msg->function ? msg->function : ""));
     json_object_set_new(root, "encrypt", json_boolean(msg->encrypt));
+    /* Group-multicast routing flag (Increment 7). Omitted-on-read defaults to
+     * false, so a peer predating this field stays byte-compatible. */
+#ifdef AT_SOCIAL_ENABLED
+    if (msg->group_multicast)
+        json_object_set_new(root, "group_multicast", json_boolean(true));
+#endif /* AT_SOCIAL_ENABLED */
     json_object_set_new(root, "return_to", json_string(msg->return_to));
 
     char uuid_str[UUID_STRING_LEN + 1];
@@ -459,6 +483,7 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         memcpy(subdata, &msg->info.peer_reputation, subdata_len);
         break;
     }
+#ifdef AT_SOCIAL_ENABLED
     case PEER_POSITION_OBSERVED:
     {
         subdata_len = sizeof(peer_position_msg_t);
@@ -492,6 +517,23 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         memcpy(subdata, &msg->info.peer_dm, subdata_len);
         break;
     }
+    case PEER_POST_OBSERVED:
+    {
+        subdata_len = sizeof(peer_post_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.peer_post, subdata_len);
+        break;
+    }
+    case PEER_REACTION_OBSERVED:
+    {
+        subdata_len = sizeof(peer_reaction_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.peer_reaction, subdata_len);
+        break;
+    }
+#endif /* AT_SOCIAL_ENABLED */
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:
     case ZTA_VERIFICATION_RESULT:
@@ -606,6 +648,11 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
     }
 
     net_msg->encrypt = json_boolean_value(json_object_get(root, "encrypt"));
+    /* Group-multicast routing flag (Increment 7); absent -> false. */
+#ifdef AT_SOCIAL_ENABLED
+    net_msg->group_multicast =
+        json_boolean_value(json_object_get(root, "group_multicast"));
+#endif /* AT_SOCIAL_ENABLED */
 
     const char *ret = json_string_value(json_object_get(root, "return_to"));
     if (ret)
@@ -749,6 +796,7 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
     case PEER_OBSERVED:
         COPY_FIXED_PAYLOAD(peer_observed, peer_observed_msg_t);
         break;
+#ifdef AT_SOCIAL_ENABLED
     case PEER_POSITION_OBSERVED:
         COPY_FIXED_PAYLOAD(peer_position, peer_position_msg_t);
         break;
@@ -762,6 +810,13 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
     case PEER_DM_OBSERVED:
         COPY_FIXED_PAYLOAD(peer_dm, peer_dm_msg_t);
         break;
+    case PEER_POST_OBSERVED:
+        COPY_FIXED_PAYLOAD(peer_post, peer_post_msg_t);
+        break;
+    case PEER_REACTION_OBSERVED:
+        COPY_FIXED_PAYLOAD(peer_reaction, peer_reaction_msg_t);
+        break;
+#endif /* AT_SOCIAL_ENABLED */
     case PEER_REPUTATION:
         COPY_FIXED_PAYLOAD(peer_reputation, peer_reputation_msg_t);
         break;

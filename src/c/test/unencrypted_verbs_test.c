@@ -80,6 +80,7 @@ static const char *const REFUSED[] = {
     "history_diff",
     "peer_caps_query",
     "peer_caps_response",
+#ifdef AT_SOCIAL_ENABLED
     "peer_position_query", /* opt-in position: encrypted directed, never plaintext */
     "peer_position_response",
     "peer_profile_query",  /* opt-in signed profile: encrypted directed (Increment 3) */
@@ -87,6 +88,8 @@ static const char *const REFUSED[] = {
     "peer_connection_request",  /* explicit connection: encrypted directed (Increment 5) */
     "peer_connection_response", /* signed accept/decline: encrypted directed (Increment 5) */
     "peer_dm",             /* direct message: encrypted directed (Increment 6) */
+    "peer_post",           /* feed post: group-encrypted multicast (Increment 7) */
+#endif /* AT_SOCIAL_ENABLED */
     "tier_update",         /* local IPC; never legitimate off the wire */
     "subtree_roster_query",
     "request reputation",

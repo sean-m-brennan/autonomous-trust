@@ -96,6 +96,7 @@ int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
             }
             return 0;
         }
+#ifdef AT_SOCIAL_ENABLED
         if (fn != NULL && strcmp(fn, AT_APP_SET_POSITION) == 0)
         {
             /* Opt-in own-position: forwarded ONLY to identity, which owns the
@@ -143,6 +144,31 @@ int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
                 log_exception(logger);
             return 0;
         }
+        if (fn != NULL && strcmp(fn, AT_APP_PUBLISH_POST) == 0)
+        {
+            /* Feed post (Increment 7): forwarded ONLY to identity, which signs
+             * the post and group-multicasts it on the encrypted group channel. */
+            generic_msg_t fwd = *msg;
+            snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
+                     "%s", "identity");
+            if (messaging_send("identity", NET_MESSAGE, &fwd, false) != 0)
+                log_exception(logger);
+            return 0;
+        }
+        if (fn != NULL && (strcmp(fn, AT_APP_REACT_POST) == 0
+                           || strcmp(fn, AT_APP_BLOCK) == 0))
+        {
+            /* Reaction / local block (Increment 8): forwarded ONLY to identity,
+             * which sends the directed reaction to the author (react) or clamps
+             * the peer's local tier (block, no wire traffic). */
+            generic_msg_t fwd = *msg;
+            snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
+                     "%s", "identity");
+            if (messaging_send("identity", NET_MESSAGE, &fwd, false) != 0)
+                log_exception(logger);
+            return 0;
+        }
+#endif /* AT_SOCIAL_ENABLED */
         log_warn(logger, "AutonomousTrust: refused extern net_msg '%s'\n",
                  fn == NULL ? "(none)" : fn);
         return -1;
@@ -221,8 +247,10 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
             case PEER_OBSERVED:
             case PEER_REPUTATION:
             case PEER_RTT_OBSERVED:
+#ifdef AT_SOCIAL_ENABLED
             case PEER_POSITION_OBSERVED:
             case PEER_PROFILE_OBSERVED:
+#endif /* AT_SOCIAL_ENABLED */
                 if (q_out == NULL)
                     break;   /* no app attached; nothing to do */
                 if (messaging_send(q_out, (message_type_t)inner->type, inner, false) != 0)
