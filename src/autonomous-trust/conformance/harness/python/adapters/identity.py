@@ -488,6 +488,43 @@ class _Participant:
                             raise AssertionError(
                                 f'{self.id}: post_last[{author_id!r}].{fk}='
                                 f'{actual.get(fk)!r}, expected {fv!r}')
+            elif key == 'social_tx_last':
+                # {subject_id: {score} | {absent: true}} (Increment 8) -- the last
+                # interaction reputation score this participant STAGED about another
+                # peer, via get_last_social_tx. A one-way interaction (bilateral gate
+                # unmet) or a capped one stages NOTHING -> ABSENT; `absent: true`
+                # asserts that. The score is the deterministic accrual observable,
+                # independent of the Paxos round. C mirrors this via
+                # identity_get_last_social_tx keyed by the same subject uuid. The
+                # `task` id is also comparable (both runtimes derive it identically),
+                # but the score alone pins the gating/diminishing behavior the
+                # scenarios exercise.
+                for subject_id, want in expected.items():
+                    subject_uuid = self._uuid_for_pid(subject_id)
+                    actual = self.process.get_last_social_tx(subject_uuid)
+                    want_obj = want if isinstance(want, dict) else {}
+                    if want_obj.get('absent'):
+                        if actual:
+                            raise AssertionError(
+                                f'{self.id}: social_tx_last[{subject_id!r}] present '
+                                f'(score={actual.get("score")}), expected ABSENT')
+                        continue
+                    if not actual:
+                        raise AssertionError(
+                            f'{self.id}: social_tx_last[{subject_id!r}] absent, '
+                            f'expected a staged score')
+                    for fk, fv in want_obj.items():
+                        av = actual.get(fk)
+                        if fk == 'score' and isinstance(av, (int, float)) \
+                                and isinstance(fv, (int, float)):
+                            if abs(float(av) - float(fv)) > 1e-6:
+                                raise AssertionError(
+                                    f'{self.id}: social_tx_last[{subject_id!r}].score='
+                                    f'{av}, expected {fv}')
+                        elif av != fv:
+                            raise AssertionError(
+                                f'{self.id}: social_tx_last[{subject_id!r}].{fk}='
+                                f'{av!r}, expected {fv!r}')
             elif key == 'partition_probes_emitted':
                 # Number of group_partition_probe messages this participant
                 # emitted over the whole scenario. The signal-cooldown
@@ -2221,6 +2258,20 @@ class IdentityAdapter:
             obj = to_json_string({'author': author_str, 'author_pk': author_pk,
                                   'seq': seq, 'ts': ts, 'tier': tier,
                                   'body': text, 'sig': sig, 'hops': hops})
+        elif function == IdentityProtocol.reaction:
+            # handle_reaction parses {post_id, seq, ts} (Increment 8). A reaction
+            # carries NO signature (crypto_box authenticates the reactor on the
+            # wire; in the harness the from_whom identity stands in). The reactor is
+            # the sender, the post's author is the recipient. `unstamped: true`
+            # drops the seq. Mirrors the C peer_reaction builder.
+            post_id = payload.get('post_id', '') if isinstance(payload, dict) else ''
+            ts = payload.get('ts', 0.0) if isinstance(payload, dict) else 0.0
+            body = {'post_id': post_id if isinstance(post_id, str) else '',
+                    'ts': float(ts) if isinstance(ts, (int, float)) else 0.0}
+            if not (isinstance(payload, dict) and payload.get('unstamped')):
+                body['seq'] = int(payload.get('seq', 1)) \
+                    if isinstance(payload, dict) else 1
+            obj = to_json_string(body)
         elif function == IdentityProtocol.id_query:
             # Identity-resync query (layer 3): {group_uuid, have:[uuids]}.
             # The group_uuid is the asker's group (== the responder's in a

@@ -423,6 +423,19 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # observability surface; a post is a live stream, never roster-replayed.
         self.last_post: dict = {}
         self._seen_post_ids: list = []
+        # Social-interaction reputation accrual (Increment 8). Per-edge bookkeeping
+        # (peer uuid str -> {'count','last_out','last_in','day','day_count'}) drives
+        # the diminishing S_pos(count) and the bilateral_recent + daily-cap gate,
+        # exactly as C id_state.social_edges. social_tx_last (subject uuid str ->
+        # {'task','score'}) is the deterministic accrual observable, recorded at the
+        # moment we would move a peer's reputation (twin of C
+        # identity_get_last_social_tx; conformance asserts via social_tx_last).
+        # social_blocks clamps a peer's local tier to 0 (twin of C social_blocks).
+        self.social_edges: dict = {}
+        self.social_tx_last: dict = {}
+        self.social_blocks: set = set()
+        self._social_day: int = 0
+        self._social_day_count: int = 0
         self.protocol.register_handler(IdentityProtocol.announce, self.welcoming_committee)
         self.protocol.register_handler(IdentityProtocol.accept, self.handle_acceptance)
         self.protocol.register_handler(IdentityProtocol.history, self.receive_history)
@@ -441,6 +454,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.connection_response, self.handle_connection_response)
         self.protocol.register_handler(IdentityProtocol.dm, self.handle_dm)
         self.protocol.register_handler(IdentityProtocol.post, self.handle_post)
+        self.protocol.register_handler(IdentityProtocol.reaction, self.handle_reaction)
         self.protocol.register_handler(IdentityProtocol.id_query, self.handle_identity_query)
         self.protocol.register_handler(IdentityProtocol.id_response, self.handle_identity_response)
         self.protocol.register_handler(IdentityProtocol.roster_req, self.handle_roster_request)
@@ -3826,6 +3840,11 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             new_state = CONN_CONNECTED if decision else CONN_DECLINED
             with self.lock:
                 self.connection_edges[str(sender.uuid)] = new_state
+                # Increment 8 accrual (requester side): same signed {requester=us,
+                # accepter=sender, decision, seq} tuple both peers hold, so the
+                # order-independent task pairs the two submissions.
+                self._social_accrue_connection(self.identity.uuid, sender.uuid,
+                                               int(body.get('seq')), bool(decision))
             self.logger.debug('connection with peer %s -> %s',
                               str(sender.uuid)[:8],
                               'connected' if decision else 'declined')
@@ -3885,6 +3904,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     'ts': float(ts),
                     'text': bound_dm_text(text),
                 }
+                # Increment 8 accrual (inbound stamp; gated on bilateral recency).
+                self._social_accrue_dm(sender.uuid, True)
             self.logger.debug('DM received from peer %s',
                               str(sender.uuid)[:8])
         except Exception as err:
@@ -3897,6 +3918,155 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         ``identity_get_last_dm``."""
         with self.lock:
             return dict(self.last_dm.get(str(uuid_str), {}))
+
+    # ------------------------------------------------------------------
+    # Social-interaction reputation accrual (Increment 8). Mirrors the C block in
+    # id_proc.c: a qualifying interaction stages a diminishing S_pos(count) score
+    # for the SAME bilateral task both peers derive (capabilities.social_task_uuid),
+    # so a commit — and the reputation move it carries — happens only when both
+    # take part. Here, the conformance twin, we record the staged score as the
+    # deterministic observable (get_last_social_tx); the real Paxos round and the
+    # PEER_REPUTATION emit are the C runtime's job. The caller holds self.lock.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _now():
+        import time as _time
+        return float(int(_time.time()))
+
+    def _social_edge(self, key):
+        return self.social_edges.get(
+            key, {'count': 0, 'last_out': 0, 'last_in': 0, 'day': 0, 'day_count': 0})
+
+    def _social_stamp(self, key, inbound, now):
+        e = dict(self._social_edge(key))
+        if inbound:
+            e['last_in'] = now
+        else:
+            e['last_out'] = now
+        self.social_edges[key] = e
+
+    def _social_accrue(self, key, now, require_bilateral):
+        """Decide whether to accrue for an interaction with peer ``key`` now; on a
+        yes, bump the edge + daily counters and return the 1-based interaction count
+        to score with, else None. Twin of C ``_social_accrue``."""
+        from ..capabilities import (SOCIAL_RECENCY_WINDOW, SOCIAL_DAY_SECONDS,
+                                    SOCIAL_PER_EDGE_DAILY_CAP,
+                                    SOCIAL_GLOBAL_DAILY_CAP)
+        e = dict(self._social_edge(key))
+        if require_bilateral:
+            w = SOCIAL_RECENCY_WINDOW
+            recent = (e['last_out'] > 0 and e['last_in'] > 0
+                      and (now - e['last_out']) < w and (now - e['last_in']) < w)
+            if not recent:
+                return None
+        today = int(now // SOCIAL_DAY_SECONDS)
+        if e['day'] != today:
+            e['day'] = today
+            e['day_count'] = 0
+        if self._social_day != today:
+            self._social_day = today
+            self._social_day_count = 0
+        if (e['day_count'] >= SOCIAL_PER_EDGE_DAILY_CAP
+                or self._social_day_count >= SOCIAL_GLOBAL_DAILY_CAP):
+            return None
+        e['count'] += 1
+        e['day_count'] += 1
+        self._social_day_count += 1
+        self.social_edges[key] = e
+        return e['count']
+
+    def _social_record_tx(self, task, subject_key, score):
+        self.social_tx_last[subject_key] = {'task': str(task), 'score': float(score)}
+
+    def _social_accrue_connection(self, self_uuid, peer_uuid, seq, connected):
+        """Connected => diminishing positive (structurally bilateral, caps only);
+        declined => the in-model bilateral negative. Twin of C
+        ``_social_accrue_connection``."""
+        from ..capabilities import (social_task_uuid, social_pos_score,
+                                    SOCIAL_DOMAIN_CONN, SOCIAL_NEG_SCORE)
+        task = social_task_uuid(SOCIAL_DOMAIN_CONN, self_uuid, peer_uuid,
+                                int(seq).to_bytes(8, 'little'))
+        key = str(peer_uuid)
+        if connected:
+            count = self._social_accrue(key, self._now(), False)
+            if count is not None:
+                self._social_record_tx(task, key, social_pos_score(count))
+        else:
+            self._social_record_tx(task, key, SOCIAL_NEG_SCORE)
+
+    def _social_accrue_dm(self, peer_uuid, inbound):
+        """A single DM is one-directional, so accrual is gated on BOTH directions
+        inside the recency window; both peers key the transaction to the same
+        hourly bucket. Twin of C ``_social_accrue_dm``."""
+        from ..capabilities import (social_task_uuid, social_pos_score,
+                                    SOCIAL_DOMAIN_DM, SOCIAL_DM_BUCKET_SECONDS)
+        now = self._now()
+        key = str(peer_uuid)
+        self._social_stamp(key, inbound, now)
+        bucket = int(now // SOCIAL_DM_BUCKET_SECONDS)
+        task = social_task_uuid(SOCIAL_DOMAIN_DM, self.identity.uuid, peer_uuid,
+                                int(bucket).to_bytes(8, 'little'))
+        count = self._social_accrue(key, now, True)
+        if count is not None:
+            self._social_record_tx(task, key, social_pos_score(count))
+
+    def _social_accrue_reaction(self, self_uuid, peer_uuid, post_id_hex):
+        """A reaction is structurally bilateral (the message itself makes both
+        submit), so no recency gate — caps only. Twin of C
+        ``_social_accrue_reaction``."""
+        from ..capabilities import (social_task_uuid, social_pos_score,
+                                    SOCIAL_DOMAIN_POST)
+        try:
+            tail = bytes.fromhex(post_id_hex[:32])
+        except (ValueError, TypeError):
+            return
+        if len(tail) != 16:
+            return
+        task = social_task_uuid(SOCIAL_DOMAIN_POST, self_uuid, peer_uuid, tail)
+        key = str(peer_uuid)
+        count = self._social_accrue(key, self._now(), False)
+        if count is not None:
+            self._social_record_tx(task, key, social_pos_score(count))
+
+    def get_last_social_tx(self, uuid_str):
+        """The last interaction score this node STAGED about subject ``uuid_str``
+        (Increment 8), as {'task','score'}, or {} if none. The deterministic
+        accrual observable; twin of C ``identity_get_last_social_tx``."""
+        with self.lock:
+            return dict(self.social_tx_last.get(str(uuid_str), {}))
+
+    def handle_reaction(self, queues, message):
+        """An inbound reaction to one of OUR posts — {post_id, seq, ts}:
+        freshness-checked (per-sender replay guard), then accrued (author side).
+        No app emission here (C runtime's job)."""
+        if message.function != IdentityProtocol.reaction:
+            return False
+        sender = getattr(message, 'from_whom', None)
+        if sender is None:
+            return True
+        try:
+            body = from_json_string(message.obj)
+            if not isinstance(body, dict):
+                return True
+            post_id = body.get('post_id')
+            seq = body.get('seq')
+            if not isinstance(post_id, str) or not isinstance(seq, int):
+                self.logger.warning('peer_reaction unstamped/malformed, refusing')
+                return True
+            if not self.freshness.accept(str(getattr(sender, 'uuid', None)),
+                                         IdentityProtocol.reaction, seq):
+                self.logger.debug('peer_reaction from %s refused (replay)',
+                                  str(getattr(sender, 'uuid', ''))[:8])
+                return True
+            with self.lock:
+                self._social_accrue_reaction(self.identity.uuid, sender.uuid,
+                                             post_id)
+            self.logger.debug('reaction received from peer %s',
+                              str(sender.uuid)[:8])
+        except Exception as err:
+            self.report_exception(err, 'handle_reaction')
+        return True
 
     # ------------------------------------------------------------------
     # Feed posts (Increment 7): a signed, content-addressed feed item distributed
