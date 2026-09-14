@@ -49,6 +49,7 @@
 #include "autonomous_trust/node_priv.h"
 #include "config/configuration.h"
 #include "utilities/message.h"
+#include "autonomous_trust/at_route_priv.h"   /* at_route_internal_msgs forward */
 
 /****************************
  * Roots. at_node_init creates <root>/etc/at and <root>/var/at, and the socket
@@ -511,6 +512,65 @@ DEFINE_TEST(test_a_roster_pull_says_not_ready_rather_than_just_failing)
 }
 END_TEST_DEFINITION()
 
+/* The daemon forwards process->app events by an explicit type switch in
+ * at_route_internal_msgs; a social increment that adds a PEER_*_OBSERVED type but
+ * forgets that switch silently drops the event on the way to the app/GUI. That
+ * regressed connection edges (Inc 5), DMs (Inc 6), posts (Inc 7) and reactions
+ * (Inc 8) at once, invisibly — the Dart tests drive ingestEvents directly and the
+ * integration round-trip only exercised PROFILE (which was on the list). This pins
+ * every app-facing observed type to actually forward, so the next one added here
+ * (and to the at_app_events_poll decode) fails loudly if this switch is missed. */
+DEFINE_TEST(test_every_app_event_type_forwards_to_the_app_queue)
+{
+    queue_t app_q, sender_q;
+    ck_assert_ret_ok(messaging_init("_route_app_q", &app_q));
+    ck_assert_ret_ok(messaging_init("_route_sender_q", &sender_q));
+    messaging_assign(&sender_q);
+
+    static const message_type_t app_types[] = {
+        PEER_OBSERVED, PEER_REPUTATION, PEER_RTT_OBSERVED,
+#ifdef AT_SOCIAL_ENABLED
+        PEER_POSITION_OBSERVED, PEER_PROFILE_OBSERVED,
+        PEER_CONNECTION_REQUEST_OBSERVED, PEER_CONNECTION_STATE_OBSERVED,
+        PEER_DM_OBSERVED, PEER_POST_OBSERVED, PEER_REACTION_OBSERVED,
+#endif
+    };
+    const size_t n = sizeof(app_types) / sizeof(app_types[0]);
+
+    generic_msg_t msgs[16] = {0};   /* fixed (no VLA); must outlive the drain */
+    ck_assert(n <= 16);
+    array_t unhandled;
+    ck_assert_ret_ok(array_init(&unhandled));
+    for (size_t i = 0; i < n; i++) {
+        msgs[i].type = app_types[i];
+        msgs[i].size = message_size(app_types[i]);
+        ck_assert_ret_ok(at_route_queue_msg(&unhandled, &msgs[i]));
+    }
+
+    /* Every queued app event must be forwarded (sent == n): a type that falls
+     * through the switch is NOT sent and drops sent below n. The array is drained
+     * either way. */
+    int sent = at_route_internal_msgs(&unhandled, "_route_app_q", NULL);
+    ck_assert_int_eq(sent, (int)n);
+    ck_assert_int_eq((int)array_size(&unhandled), 0);
+
+    /* Drain exactly what was forwarded (never more than `sent`), so a dropped case
+     * fails the sent==n check above rather than blocking here; each lands on the
+     * app queue with its type intact, in FIFO order. */
+    for (int i = 0; i < sent; i++) {
+        generic_msg_t got = {0};
+        ck_assert_ret_ok(messaging_recv_on(&app_q, &got, NULL, true));
+        if (i < (int)n)
+            ck_assert_int_eq((int)got.type, (int)app_types[i]);
+    }
+
+    array_free(&unhandled);
+    messaging_assign(NULL);
+    messaging_qclose(&app_q);
+    messaging_qclose(&sender_q);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(App_Node,
           test_the_config_survives_an_init_that_aliases_it,
           test_an_empty_config_still_gets_the_documented_defaults,
@@ -526,4 +586,5 @@ RUN_TESTS(App_Node,
           test_a_null_handle_is_harmless,
           test_readiness_is_about_a_bound_queue_not_a_live_process,
           test_wait_ready_does_not_wait_out_the_timeout_for_nothing,
-          test_a_roster_pull_says_not_ready_rather_than_just_failing)
+          test_a_roster_pull_says_not_ready_rather_than_just_failing,
+          test_every_app_event_type_forwards_to_the_app_queue)

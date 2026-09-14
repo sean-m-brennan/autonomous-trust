@@ -4932,6 +4932,12 @@ static bool handle_app_connect_request(const process_t *proc, directory_t *queue
     public_identity_t peer;
     if (!_find_peer_pub_by_uuid(proc, peer_uuid, &peer)) {
         log_warn(proc->logger, "Identity: app connect_request: unknown peer\n");
+        /* The peer is not an admitted identity, so no request can be sent. Signal
+         * the app that the edge is (still) NONE so it can revert an optimistic
+         * pending_out and tell the operator, rather than leave a pending state
+         * that will never resolve (the request never went out). */
+        identity_emit_connection(PEER_CONNECTION_STATE_OBSERVED, peer_uuid,
+                                 AT_CONN_NONE);
         return true;
     }
     char peer_str[UUID_STRING_LEN + 1];
