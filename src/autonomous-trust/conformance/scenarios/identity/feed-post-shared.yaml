@@ -1,0 +1,45 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: feed-post-shared
+byte_pinning: false
+description: |
+    A feed post, the happy path (Increment 7). A post is a signed, content-
+    addressed feed item distributed by encrypted GROUP MULTICAST and gossip-
+    forwarded a bounded number of hops. UNLIKE a DM, a post is relayed by peers
+    other than its author, so authorship comes from a detached Ed25519 signature
+    over the canonical (author, seq, ts, required_tier, body) form — verified
+    before the tier-gate/dedup/emit. Here bg publishes a public (tier 0) post and
+    newcomer's handle_post verifies the signature, passes the tier-gate (needs
+    tier 0, has 0), content-id records it and delivers it to its app (observed via
+    the last-post seam).
+
+    Step 1: bg -> newcomer peer_post {body:"hello feed", seq:1, tier:0}.
+      - Both runtimes: handle_post verifies bg's signature and records the post.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_post
+    payload:
+      body: hello feed
+      seq: 1
+      ts: 0
+      tier: 0
+    description: |
+        bg's signed public post; newcomer verifies and records it under bg's uuid.
+
+expected_state:
+  newcomer:
+    post_last:
+      bg:
+        seq: 1
+        tier: 0
+        body: hello feed

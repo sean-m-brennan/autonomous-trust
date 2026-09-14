@@ -90,6 +90,7 @@ void identity_set_own_capabilities(const process_t *proc,
  *  `peer_caps_count` expected_state key. */
 int identity_get_peer_caps_count(const uuid_t uuid);
 
+#ifdef AT_SOCIAL_ENABLED
 /** Set (or clear) THIS node's opt-in coarse position (Increment 2, the
  *  "with-distance" feature) in the singleton id_state. A valid non-empty
  *  geohash opts in; NULL/""/invalid opts out (the default). The harness analog
@@ -131,6 +132,19 @@ int identity_get_connection_state(const char *uuid_str);
  *  expected_state key. Twin of Python IdentityProcess.get_last_dm. */
 bool identity_get_last_dm(const char *uuid_str, char *text_buf, size_t text_sz,
                           int64_t *seq_out);
+
+/** The most-recent feed post this node accepted from AUTHOR @p uuid_str
+ *  (Increment 7). Copies the content id into @p post_id_buf and the body into
+ *  @p body_buf (both always NUL-terminated) and, when non-NULL, the author's
+ *  post seq into @p seq_out and the required audience tier into @p tier_out.
+ *  Returns true iff a post is recorded for that author. Filled by handle_post
+ *  after signature-verify + tier-gate + dedup (observability only — a post is a
+ *  live stream, never roster-replayed); conformance asserts via the `post_last`
+ *  expected_state key. Twin of Python IdentityProcess.get_last_post. */
+bool identity_get_last_post(const char *uuid_str, char *post_id_buf,
+                            size_t post_id_sz, char *body_buf, size_t body_sz,
+                            int64_t *seq_out, int *tier_out);
+#endif /* AT_SOCIAL_ENABLED */
 
 /** Copy the size-bounded capability descriptor recorded for @p cap_name (from
  *  the descriptor form of `peer_caps_response`) into @p buf as a JSON string
