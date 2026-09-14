@@ -1218,7 +1218,8 @@ static int envelope_forward(const net_envelope_t *env_in,
 #endif /* AT_NET_ENVELOPE */
 
 /* Forward declaration; defined immediately below this section. */
-static int net_encrypt_and_send(const identity_t *myself, const net_wire_msg_t *msg,
+static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
+                                const net_wire_msg_t *msg,
                                 const net_transport_t *transport,
                                 net_transport_ctx_t *ctx,
                                 int port, net_wire_format_t fmt, logger_t *logger);
@@ -1306,6 +1307,7 @@ int refuse_ping_at_unsupported(const char *target_addr,
  * skips net_encrypt_and_send for this message). */
 static int handle_outbound_stats_req(const net_msg_t *nmsg,
                                      const identity_t *myself,
+                                     const group_t *grp,
                                      const net_transport_t *transport,
                                      net_transport_ctx_t *tctx,
                                      int port, net_wire_format_t fmt,
@@ -1326,7 +1328,7 @@ static int handle_outbound_stats_req(const net_msg_t *nmsg,
     resp.to_whom.type = RECIPIENT_PEER;
     memcpy(&resp.to_whom.target.peer, &nmsg->from_whom, sizeof(public_identity_t));
 
-    int rc = net_encrypt_and_send(myself, &resp, transport, tctx, port, fmt, logger);
+    int rc = net_encrypt_and_send(myself, grp, &resp, transport, tctx, port, fmt, logger);
     if (rc != 0)
         log_error(logger, "Network: stats_resp send to %s failed\n",
                   nmsg->from_whom.address);
@@ -1343,7 +1345,8 @@ static int handle_outbound_stats_req(const net_msg_t *nmsg,
  * Encrypt + send (transport-agnostic)
  ****************************/
 
-static int net_encrypt_and_send(const identity_t *myself, const net_wire_msg_t *msg,
+static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
+                                const net_wire_msg_t *msg,
                                 const net_transport_t *transport,
                                 net_transport_ctx_t *ctx,
                                 int port, net_wire_format_t fmt, logger_t *logger)
@@ -1388,6 +1391,75 @@ static int net_encrypt_and_send(const identity_t *myself, const net_wire_msg_t *
         free(wire);
         return ret;
     }
+
+    /* Encrypted group multicast (Increment 7): group_encrypt the wire bytes
+     * under the shared cohort key and send on NET_CHAN_GROUP. Mirrors the
+     * broadcast branch's transport shape and the encrypted-peer branch's
+     * nonce|ciphertext framing, but keyed to the group instead of one peer. The
+     * receive side is handle_inbound_group (group_decrypt + route_to_process). */
+#ifdef AT_SOCIAL_ENABLED
+    if (msg->to_whom.type == RECIPIENT_GROUP) {
+        if (grp == NULL || grp->address[0] == '\0') {
+            /* No group key held (not admitted / public-only view): a multicast
+             * we cannot encrypt is dropped rather than leaked in the clear. */
+            log_debug(logger, "Network: group multicast with no group key; dropping\n");
+            free(wire);
+            return -1;
+        }
+        if (sodium_init() < 0) {
+            free(wire);
+            return SYS_EXCEPTION();
+        }
+        unsigned char nonce[crypto_box_NONCEBYTES];
+        randombytes_buf(nonce, sizeof(nonce));
+
+        msg_str_t plain = {.msg = wire, .len = wire_len};
+        size_t cipher_len = wire_len + crypto_box_MACBYTES;
+        unsigned char *cipher = malloc(cipher_len);
+        if (cipher == NULL) {
+            free(wire);
+            return SYS_EXCEPTION();
+        }
+        int enc = group_encrypt(grp, &plain, grp, nonce, cipher);
+        free(wire);
+        if (enc != 0) {
+            free(cipher);
+            return enc;
+        }
+        size_t frame_len = sizeof(nonce) + cipher_len;
+        uint8_t *frame = malloc(frame_len);
+        if (frame == NULL) {
+            free(cipher);
+            return SYS_EXCEPTION();
+        }
+        memcpy(frame, nonce, sizeof(nonce));
+        memcpy(frame + sizeof(nonce), cipher, cipher_len);
+        free(cipher);
+
+        const uint8_t *send_buf = frame;
+        size_t         send_len = frame_len;
+#ifdef AT_NET_ENVELOPE
+        uint8_t *env_frame = NULL;
+        size_t   env_frame_len = 0;
+        if (envelope_wrap(NET_ENV_TYPE_GROUP, myself->uuid, grp->uuid,
+                          frame, frame_len, &env_frame, &env_frame_len) != 0) {
+            free(frame);
+            return SYS_EXCEPTION();
+        }
+        send_buf = env_frame;
+        send_len = env_frame_len;
+#endif
+        int ret = transport->send_broadcast(ctx, NET_CHAN_GROUP,
+                                            send_buf, send_len, port);
+        if (ret == -1)
+            log_debug(logger, "Network: transport lacks group multicast; skipping\n");
+#ifdef AT_NET_ENVELOPE
+        free(env_frame);
+#endif
+        free(frame);
+        return ret;
+    }
+#endif /* AT_SOCIAL_ENABLED */
 
     /* Encrypted peer: wrap wire bytes in nonce|ciphertext. */
     if (msg->encrypt && msg->to_whom.type == RECIPIENT_PEER) {
@@ -2360,7 +2432,8 @@ static int network_run(const net_transport_t *transport,
                      * reply's encoding -- a stats_resp in the wrong format
                      * would be dropped by the very node that asked (2.3). */
                     handle_outbound_stats_req(
-                        nmsg, myself, transport, tctx, port_num,
+                        nmsg, myself, &proc->protocol.group, transport, tctx,
+                        port_num,
                         wire_format_for_address(&proc->protocol.group,
                                                 nmsg->from_whom.address),
                         logger);
@@ -2460,8 +2533,25 @@ static int network_run(const net_transport_t *transport,
             wmsg.from_rank = (my_public != NULL && myself != NULL)
                              ? myself->rank : nmsg->from_rank;
 
-            bool is_broadcast = (nmsg->to_whom.address[0] == '\0');
+            /* Group multicast (Increment 7): an encrypted send to the whole
+             * cohort on NET_CHAN_GROUP, signalled by the identity process via
+             * nmsg->group_multicast (there is no per-peer to_whom). Checked
+             * BEFORE is_broadcast because a group message also carries an empty
+             * to_whom.address. */
+            bool is_group = false;
+#ifdef AT_SOCIAL_ENABLED
+            is_group = nmsg->group_multicast;
+#endif /* AT_SOCIAL_ENABLED */
+            bool is_broadcast = (!is_group && nmsg->to_whom.address[0] == '\0');
+#ifdef AT_SOCIAL_ENABLED
+            if (is_group) {
+                wmsg.to_whom.type = RECIPIENT_GROUP;
+                log_debug(logger, "Network: group-multicasting %s.%s\n",
+                          nmsg->process, nmsg->function);
+            } else if (is_broadcast) {
+#else
             if (is_broadcast) {
+#endif /* AT_SOCIAL_ENABLED */
                 wmsg.to_whom.type = RECIPIENT_BROADCAST;
                 snprintf(wmsg.to_whom.target.peer.address,
                          sizeof(wmsg.to_whom.target.peer.address),
@@ -2480,7 +2570,7 @@ static int network_run(const net_transport_t *transport,
              * than one group -- so a leaf node takes exactly the historical
              * path. A broadcast is exempt from B: discovery is how a node in
              * OUR domain gets admitted, and it never leaves the segment. */
-            if (!is_broadcast) {
+            if (!is_broadcast && !is_group) {
                 if (identity_verb_is_bootstrap(nmsg->function) &&
                     address_crosses_gateway(proc, myself,
                                             nmsg->to_whom.address)) {
@@ -2503,11 +2593,16 @@ static int network_run(const net_transport_t *transport,
             /* Broadcast is discovery -> JSON; a peer we can place speaks its
              * group's format; one we cannot place gets JSON, which is what
              * makes pre-admission traffic work in a proto cohort (2.3). */
-            net_wire_format_t send_fmt = is_broadcast
-                ? NET_WIRE_JSON
-                : wire_format_for_address(&proc->protocol.group,
-                                          nmsg->to_whom.address);
-            int send_ret = net_encrypt_and_send(myself, &wmsg, transport, tctx,
+            /* A group multicast rides the cohort's own wire format (that is what
+             * handle_inbound_group decodes the decrypted plaintext with). */
+            net_wire_format_t send_fmt = is_group
+                ? proc->protocol.group.wire_format
+                : (is_broadcast
+                   ? NET_WIRE_JSON
+                   : wire_format_for_address(&proc->protocol.group,
+                                             nmsg->to_whom.address));
+            int send_ret = net_encrypt_and_send(myself, &proc->protocol.group,
+                                                &wmsg, transport, tctx,
                                                 port_num, send_fmt, logger);
             if (send_ret != 0) {
                 log_error(logger, "Network: send failed for %s.%s\n",

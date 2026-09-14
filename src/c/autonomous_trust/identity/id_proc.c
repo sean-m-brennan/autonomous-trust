@@ -39,9 +39,13 @@
 #include "history.h"
 #include "identity_priv.h"
 #include "id_proc_priv.h"
+#ifdef AT_SOCIAL_ENABLED
 #include "profile.h"
 #include "connection.h"
 #include "dm.h"
+#include "post.h"
+#include "social_tx.h"
+#endif /* AT_SOCIAL_ENABLED */
 #include "first_contact.h"
 #include "utilities/b64.h"
 #include "utilities/freshness.h"
@@ -103,6 +107,7 @@ static char ID_CONFIRM[]     = "peer_accepted";
 static char ID_UPDATE[]      = "group_key_update";
 static char ID_CAPS_QUERY[]  = "peer_caps_query";
 static char ID_CAPS_RESPONSE[] = "peer_caps_response";
+#ifdef AT_SOCIAL_ENABLED
 static char ID_POSITION_QUERY[]    = "peer_position_query";
 static char ID_POSITION_RESPONSE[] = "peer_position_response";
 static char ID_PROFILE_QUERY[]     = "peer_profile_query";
@@ -117,6 +122,19 @@ static char ID_CONNECTION_RESPONSE[] = "peer_connection_response";
  * allowlist): a single one-way peer→peer text message carrying {text, seq, ts}.
  * crypto_box authenticates the sender, so NO extra signature is needed. */
 static char ID_DM[]          = "peer_dm";
+/* Feed post (Increment 7). Encrypted GROUP MULTICAST (never on the plaintext
+ * allowlist; rides NET_CHAN_GROUP, group_encrypt'd): a signed, content-addressed
+ * feed item carrying {author, author_pk, seq, ts, tier, body, sig, hops}. The
+ * detached Ed25519 signature (not crypto_box) authenticates the author, because a
+ * post is gossip-forwarded by peers other than its author. */
+static char ID_POST[]        = "peer_post";
+/* Post reaction (Increment 8). Directed + ENCRYPTED (never on the plaintext
+ * allowlist), exactly like a DM: a one-way reactor→author message carrying
+ * {post_id, seq, ts}. crypto_box authenticates the reactor, so NO extra signature
+ * is needed. It is the return signal a fire-and-forget post lacks, letting the
+ * engagement accrue reputation for both peers. */
+static char ID_REACTION[]    = "peer_reaction";
+#endif /* AT_SOCIAL_ENABLED */
 /* Identity backfill for a cold/late joiner that holds a group member's
  * address but never received its full Identity (merge/partition path fills
  * group.address_map but peers[] stays sparse). See identity_periodic_identity
@@ -130,11 +148,25 @@ static char ID_TIER[]        = "tier_update";
 /* Local-only IPC from the app (via the daemon main loop): re-emit the peer
  * view on the app-facing carrier. See doc/architecture/app-peer-carrier.md. */
 static char ID_APP_ROSTER[]  = AT_APP_ROSTER_REQUEST;
+#ifdef AT_SOCIAL_ENABLED
 static char ID_APP_SET_POSITION[] = AT_APP_SET_POSITION;
 static char ID_APP_SET_PROFILE[]  = AT_APP_SET_PROFILE;
 static char ID_APP_CONNECT_REQUEST[] = AT_APP_CONNECT_REQUEST;
 static char ID_APP_CONNECT_RESPOND[] = AT_APP_CONNECT_RESPOND;
 static char ID_APP_SEND_DM[] = AT_APP_SEND_DM;
+static char ID_APP_PUBLISH_POST[] = AT_APP_PUBLISH_POST;
+static char ID_APP_REACT_POST[] = AT_APP_REACT_POST;
+static char ID_APP_BLOCK[] = AT_APP_BLOCK;
+#endif /* AT_SOCIAL_ENABLED */
+
+/* Feed gossip bounds (Increment 7, SOCIAL_APP_PLAN §7 Q2 "active network + one
+ * hop"). POST_MAX_HOPS is the highest hop_count a post may carry on the wire: a
+ * post arrives at the author's own cohort at hop 0 and is forwarded once (to
+ * hop 1), so a post that already carries hop >= POST_MAX_HOPS is delivered but
+ * not re-forwarded. POST_DEDUP_CAP bounds the app-content dedup ring. */
+#ifdef AT_SOCIAL_ENABLED
+#define POST_MAX_HOPS 1
+#define POST_DEDUP_CAP 256
 
 /* Forward decls: defined below beside the position handlers, but used earlier
  * (the query from the admission path, the validator from state init). */
@@ -143,6 +175,7 @@ static bool _geohash_valid(const char *s);
 /* Profile (Increment 3): the directed query is issued from the admission path
  * (handle_confirm_peer) and the resync sweep, both earlier than the definition. */
 static int _send_profile_query(const process_t *proc, const public_identity_t *peer);
+#endif /* AT_SOCIAL_ENABLED */
 /* Group partition recovery (doc/architecture/partition-recovery.md).
  *   ID_PARTITION_SIGNAL: local-only IPC from NetProcess when group-channel
  *                        traffic is rejected (no wire egress). Payload is
@@ -328,6 +361,7 @@ static struct {
      * lowercased uuid string; values are array_t* of cap-name strings.
      * Conformance assertion surface via identity_get_peer_caps_count. */
     map_t peer_caps_map;
+#ifdef AT_SOCIAL_ENABLED
     /* This node's OWN opt-in coarse position — a geohash bucket the operator
      * chose to share (Increment 2, the "with-distance" feature). Empty = opted
      * out, which is the DEFAULT: while empty, handle_position_query answers
@@ -366,6 +400,39 @@ static struct {
      * of Python IdentityProcess.get_last_dm. Filled by handle_dm after the
      * freshness gate, right before the app emit. */
     map_t last_dm_map;
+    /* Feed posts (Increment 7). post_seq is our own monotonic post counter, used
+     * to make each published post's canonical form (and thus its content id)
+     * unique. seen_post_ids is a bounded ring of content ids this node has
+     * already accepted, the APP-CONTENT dedup store (distinct from net_proc's
+     * transport dedup ring): a repeat is dropped rather than re-emitted or
+     * re-forwarded. last_post_map is the conformance/observability surface for
+     * identity_get_last_post (keyed by lowercased AUTHOR uuid, value string_data
+     * of {"post_id","seq","ts","tier","body"}); like last_dm_map it is a live
+     * stream, never roster-replayed. All guarded by id_state.lock. */
+    int64_t post_seq;
+    char    seen_post_ids[POST_DEDUP_CAP][AT_POST_ID_HEX_LEN + 1];
+    size_t  seen_post_next;
+    size_t  seen_post_count;
+    map_t   last_post_map;
+    /* Per-edge social-interaction accrual bookkeeping (Increment 8), keyed by
+     * lowercased peer uuid string; values are string_data(compact JSON
+     * {"count","last_out","last_in","day","day_count"}). count drives the
+     * diminishing-returns positive score; last_out/last_in gate bilateral_recent;
+     * day/day_count enforce the per-edge daily cap. A PARALLEL map to
+     * connection_edges, not an extension of it: DMs and post reactions accrue with
+     * peers there is no explicit connection edge to, and overloading the edge map
+     * would corrupt identity_get_connection_state. Guarded by id_state.lock. */
+    map_t social_edges;
+    /* How many social accrual commits WE have submitted today, across all edges —
+     * the global daily cap against a Sybil fan-out. Rolls over with social_day. */
+    int   social_day;
+    int   social_day_count;
+    /* Locally blocked peers (Increment 8): lowercased uuid string -> integer_data(1).
+     * A block is PURELY LOCAL — it clamps identity_get_peer_tier to 0 for this peer
+     * (so our own tier-gates deny it) and emits/gossips nothing. No reputation
+     * transaction, unlike a decline. Guarded by id_state.lock. */
+    map_t social_blocks;
+#endif /* AT_SOCIAL_ENABLED */
     /* Outstanding operator-attended pulls WE issued: nonce string -> peer uuid
      * string (heap-dup'd). The nonce is the only thing that makes a returned
      * attestation attributable to a request this node actually made; a reply
@@ -483,6 +550,7 @@ static void _ensure_id_init(void)
         map_init(&id_state.vote_collection);
         map_init(&id_state.own_caps_by_proc);
         map_init(&id_state.peer_caps_map);
+#ifdef AT_SOCIAL_ENABLED
         map_init(&id_state.peer_position_map);
         /* Opt-in own position: seed from $AT_OWN_GEOHASH for headless/testing
          * (the Flutter UI sets it at runtime via AT_APP_SET_POSITION instead).
@@ -496,6 +564,14 @@ static void _ensure_id_init(void)
         map_init(&id_state.peer_profile_map);
         map_init(&id_state.connection_edges);
         map_init(&id_state.last_dm_map);
+        map_init(&id_state.last_post_map);
+        id_state.post_seq = 0;
+        id_state.seen_post_next = 0;
+        id_state.seen_post_count = 0;
+        map_init(&id_state.social_edges);
+        id_state.social_day = 0;
+        id_state.social_day_count = 0;
+        map_init(&id_state.social_blocks);
         /* Opt-in own profile (Increment 3): seed from $AT_OWN_PROFILE (a JSON
          * object string) for headless/conformance; the Flutter UI sets it at
          * runtime via AT_APP_SET_PROFILE instead. Absent/invalid => opted out. */
@@ -511,6 +587,7 @@ static void _ensure_id_init(void)
                 }
             }
         }
+#endif /* AT_SOCIAL_ENABLED */
         map_init(&id_state.attest_sent);
         map_init(&id_state.attest_sent_clock);
         map_init(&id_state.peer_clock_samples);
@@ -680,6 +757,7 @@ int identity_get_peer_caps_count(const uuid_t uuid)
     return n;
 }
 
+#ifdef AT_SOCIAL_ENABLED
 /* Conformance/harness seam: set (or clear) THIS node's opt-in coarse position
  * in the singleton id_state (Increment 2, the "with-distance" feature). The
  * analog of the app's handle_set_position, but called directly by the harness,
@@ -841,6 +919,7 @@ bool identity_get_last_dm(const char *uuid_str, char *text_buf, size_t text_sz,
     pthread_mutex_unlock(&id_state.lock);
     return found;
 }
+#endif /* AT_SOCIAL_ENABLED */
 
 size_t identity_provisional_count(const process_t *proc)
 {
@@ -2829,6 +2908,7 @@ void identity_reset_state(void)
     map_init(&id_state.own_caps_by_proc);
     map_free(&id_state.peer_caps_map);
     map_init(&id_state.peer_caps_map);
+#ifdef AT_SOCIAL_ENABLED
     map_free(&id_state.peer_position_map);
     map_init(&id_state.peer_position_map);
     id_state.own_geohash[0] = '\0';
@@ -2838,7 +2918,19 @@ void identity_reset_state(void)
     map_init(&id_state.connection_edges);
     map_free(&id_state.last_dm_map);
     map_init(&id_state.last_dm_map);
+    map_free(&id_state.last_post_map);
+    map_init(&id_state.last_post_map);
+    id_state.post_seq = 0;
+    id_state.seen_post_next = 0;
+    id_state.seen_post_count = 0;
+    map_free(&id_state.social_edges);
+    map_init(&id_state.social_edges);
+    id_state.social_day = 0;
+    id_state.social_day_count = 0;
+    map_free(&id_state.social_blocks);
+    map_init(&id_state.social_blocks);
     memset(&id_state.own_profile, 0, sizeof(id_state.own_profile));
+#endif /* AT_SOCIAL_ENABLED */
     /* Cleared per scenario so no clock sample leaks from one corpus case into
      * the next; each sample's heap payload goes with it. */
     _free_clock_samples_locked();
@@ -3139,6 +3231,7 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
                      nickname, uuid_str);
             _send_caps_query(proc, &new_peer);
         }
+#ifdef AT_SOCIAL_ENABLED
         /* Opt-in position (Increment 2): ask every confirmed peer for its coarse
          * position. If it opted out it answers nothing; the periodic resync
          * re-asks, so a peer that opts in later is still picked up. */
@@ -3146,6 +3239,7 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
         /* Opt-in profile (Increment 3): same pattern — ask every confirmed peer
          * for its agora.profile; an opted-out peer answers nothing. */
         _send_profile_query(proc, &new_peer);
+#endif /* AT_SOCIAL_ENABLED */
     }
 
     /* Two-phase admission (doc/architecture/identity-protocol.md). Count DISTINCT confirmers; the
@@ -3855,6 +3949,7 @@ static bool handle_caps_response(const process_t *proc, directory_t *queues, gen
     return true;
 }
 
+#ifdef AT_SOCIAL_ENABLED
 /****************************
  * Opt-in coarse position (Increment 2, the "with-distance" feature).
  *
@@ -4357,6 +4452,228 @@ static int _connection_store(const char *uuid_str, int state, uint64_t seq)
     return 0;
 }
 
+/**************** Increment 8: social-interaction reputation accrual ****************
+ * A qualifying social interaction submits a diminishing-returns score into the
+ * SAME bilateral transaction the counterparty submits into (shared task_uuid), so
+ * a commit — and the reputation move it carries — happens only when both peers
+ * actually take part. See identity/social_tx.h for the model. The reputation
+ * process owns Paxos + the earned-score algebra; here we only stage our half.
+ ***********************************************************************************/
+
+/* Stage OUR half of a bilateral social transaction: send a TRANSACTION_SCORE to
+ * the reputation process for @p task_uuid, about subject @p subject (the peer this
+ * score concerns). Channel is left absent so the reputation process normalizes it
+ * to TX_CHANNEL_TASK_OUTCOME; competence 0 means the authored weight verbatim.
+ * Mirrors negotiation/neg_proc.c:_submit_tx_score. */
+static void _submit_interaction_score(const process_t *proc,
+                                      const uuid_t task_uuid, double score,
+                                      const uuid_t subject)
+{
+    generic_msg_t msg = {0};
+    msg.type = TRANSACTION_SCORE;
+    msg.size = sizeof(tx_score_msg_t);
+    uuid_copy(msg.info.tx_score.task_uuid, task_uuid);
+    if (subject != NULL)
+        uuid_copy(msg.info.tx_score.peer_uuid, subject);
+    msg.info.tx_score.score = score;
+    /* channel[] and competence stay zeroed: absent channel -> task_outcome,
+     * absent competence -> weight 1.0, both resolved in the reputation process. */
+    if (messaging_send("reputation", TRANSACTION_SCORE, &msg, false) != 0)
+        log_warn(proc->logger,
+                 "Identity: could not submit social score %.3f\n", score);
+}
+
+/* Read the per-edge accrual record for @p uuid_str; absent => all zeros. Caller
+ * MUST hold id_state.lock. */
+static void _social_edge_get_locked(const char *uuid_str, int *count,
+                                    long *last_out, long *last_in,
+                                    int *day, int *day_count)
+{
+    *count = 0; *last_out = 0; *last_in = 0; *day = 0; *day_count = 0;
+    data_t *dat = NULL;
+    if (map_get(&id_state.social_edges, (map_key_t)uuid_str, &dat) == 0
+        && dat != NULL) {
+        char *s = NULL;
+        if (data_string_ptr(dat, &s) == 0 && s != NULL) {
+            json_error_t jerr;
+            json_t *o = json_loads(s, 0, &jerr);
+            if (o != NULL) {
+                json_t *j;
+                if ((j = json_object_get(o, "count")) && json_is_integer(j))
+                    *count = (int)json_integer_value(j);
+                if ((j = json_object_get(o, "last_out")) && json_is_integer(j))
+                    *last_out = (long)json_integer_value(j);
+                if ((j = json_object_get(o, "last_in")) && json_is_integer(j))
+                    *last_in = (long)json_integer_value(j);
+                if ((j = json_object_get(o, "day")) && json_is_integer(j))
+                    *day = (int)json_integer_value(j);
+                if ((j = json_object_get(o, "day_count")) && json_is_integer(j))
+                    *day_count = (int)json_integer_value(j);
+                json_decref(o);
+            }
+        }
+    }
+}
+
+/* Write the per-edge accrual record. Caller MUST hold id_state.lock. */
+static int _social_edge_put_locked(const char *uuid_str, int count,
+                                   long last_out, long last_in,
+                                   int day, int day_count)
+{
+    char buf[128];
+    int len = snprintf(buf, sizeof(buf),
+                       "{\"count\":%d,\"last_out\":%ld,\"last_in\":%ld,"
+                       "\"day\":%d,\"day_count\":%d}",
+                       count, last_out, last_in, day, day_count);
+    if (len <= 0 || (size_t)len >= sizeof(buf)) return -1;
+    char *dup = smrt_create((size_t)len + 1);
+    if (dup == NULL) return -1;
+    memcpy(dup, buf, (size_t)len + 1);
+    data_t *dat = string_data(dup, (size_t)len + 1);
+    if (dat == NULL) { smrt_deref(dup); return -1; }
+    map_set(&id_state.social_edges, (map_key_t)uuid_str, dat);
+    return 0;
+}
+
+/* Stamp an interaction with peer @p uuid_str as having occurred now in the given
+ * direction (inbound = they acted toward us). Updates only the recency clocks; the
+ * accrual decision is separate (@ref _social_accrue). */
+static void _social_stamp(const char *uuid_str, bool inbound, long now)
+{
+    pthread_mutex_lock(&id_state.lock);
+    int count, day, dc; long lo, li;
+    _social_edge_get_locked(uuid_str, &count, &lo, &li, &day, &dc);
+    if (inbound) li = now; else lo = now;
+    _social_edge_put_locked(uuid_str, count, lo, li, day, dc);
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+/* Decide whether to accrue positive reputation for an interaction with
+ * @p uuid_str now, and if so bump the edge/daily counters and return the 1-based
+ * interaction count to score with (via @p out_count). When @p require_bilateral is
+ * true, accrual is refused unless BOTH directions were seen inside
+ * AT_SOCIAL_RECENCY_WINDOW (the sustained-DM rule); connection accepts and post
+ * reactions are structurally bilateral (the act itself makes both peers submit) and
+ * pass false. Per-edge and global daily caps always apply. Returns true iff the
+ * caller should submit S_pos(*out_count). */
+static bool _social_accrue(const char *uuid_str, long now,
+                           bool require_bilateral, int *out_count)
+{
+    bool ok = false;
+    pthread_mutex_lock(&id_state.lock);
+    int count, day, dc; long lo, li;
+    _social_edge_get_locked(uuid_str, &count, &lo, &li, &day, &dc);
+
+    bool recent = true;
+    if (require_bilateral) {
+        long win = (long)AT_SOCIAL_RECENCY_WINDOW;
+        recent = (lo > 0 && li > 0 && (now - lo) < win && (now - li) < win);
+    }
+    if (recent) {
+        int today = (int)(now / AT_SOCIAL_DAY_SECONDS);
+        if (day != today) { day = today; dc = 0; }
+        if (id_state.social_day != today) {
+            id_state.social_day = today;
+            id_state.social_day_count = 0;
+        }
+        if (dc < AT_SOCIAL_PER_EDGE_DAILY_CAP
+            && id_state.social_day_count < AT_SOCIAL_GLOBAL_DAILY_CAP) {
+            count++; dc++; id_state.social_day_count++;
+            _social_edge_put_locked(uuid_str, count, lo, li, day, dc);
+            *out_count = count;
+            ok = true;
+        }
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return ok;
+}
+
+/* Accrue for a resolved connection between @p self_uuid and @p peer_uuid at the
+ * shared signed @p seq. Both peers hold the identical {requester,accepter,decision,
+ * seq} tuple, so the uuid-order-independent task_uuid pairs their two submissions
+ * into one bilateral transaction. Connected => diminishing positive (structurally
+ * bilateral, caps only); declined => the in-model bilateral negative. */
+static void _social_accrue_connection(const process_t *proc,
+                                      const uuid_t self_uuid,
+                                      const uuid_t peer_uuid,
+                                      uint64_t seq, bool connected)
+{
+    uuid_t task;
+    uint8_t tail[8];
+    for (int i = 0; i < 8; i++) tail[i] = (uint8_t)((seq >> (8 * i)) & 0xFF);
+    if (at_social_task_uuid(AT_SOCIAL_DOMAIN_CONN, self_uuid, peer_uuid,
+                            tail, sizeof(tail), task) != 0)
+        return;
+    if (connected) {
+        long now = (long)time(NULL);
+        int count = 0;
+        char peer_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(peer_uuid, peer_str);
+        if (_social_accrue(peer_str, now, false, &count))
+            _submit_interaction_score(proc, task, at_social_pos_score(count),
+                                      peer_uuid);
+    } else {
+        _submit_interaction_score(proc, task, AT_SOCIAL_NEG_SCORE, peer_uuid);
+    }
+}
+
+/* Record a DM interaction with @p peer_uuid (inbound = received from them) and, if
+ * the edge is now bilaterally recent, accrue. Unlike a connection, a single DM is
+ * one-directional, so accrual is gated on BOTH directions inside the recency
+ * window (the "sustained exchange" rule). Both peers key the transaction to the
+ * same hourly bucket, so their scores pair when they exchange within one hour. */
+static void _social_accrue_dm(const process_t *proc, const uuid_t peer_uuid,
+                              bool inbound)
+{
+    const identity_t *self = _partition_self_identity(proc);
+    if (self == NULL) return;
+    long now = (long)time(NULL);
+    char peer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, peer_str);
+    _social_stamp(peer_str, inbound, now);
+
+    uint64_t bucket = (uint64_t)(now / AT_SOCIAL_DM_BUCKET_SECONDS);
+    uint8_t tail[8];
+    for (int i = 0; i < 8; i++) tail[i] = (uint8_t)((bucket >> (8 * i)) & 0xFF);
+    uuid_t task;
+    if (at_social_task_uuid(AT_SOCIAL_DOMAIN_DM, self->uuid, peer_uuid,
+                            tail, sizeof(tail), task) != 0)
+        return;
+    int count = 0;
+    if (_social_accrue(peer_str, now, true, &count))
+        _submit_interaction_score(proc, task, at_social_pos_score(count),
+                                  peer_uuid);
+}
+
+/* Accrue for a post reaction between @p self_uuid and the counterparty
+ * @p peer_uuid over the post @p post_id_hex. Both the reactor (on send) and the
+ * author (on receipt) call this with the same two uuids and the same content id,
+ * so the order-independent task pairs their submissions. A reaction is
+ * structurally bilateral (the message itself makes both submit), so no recency
+ * gate — caps only. */
+static void _social_accrue_reaction(const process_t *proc, const uuid_t self_uuid,
+                                    const uuid_t peer_uuid, const char *post_id_hex)
+{
+    if (post_id_hex == NULL) return;
+    unsigned char id_bin[16];
+    size_t binlen = 0;
+    /* First 16 bytes of the 64-hex content id bind the task. */
+    if (sodium_hex2bin(id_bin, sizeof(id_bin), post_id_hex, 32,
+                       NULL, &binlen, NULL) != 0 || binlen != sizeof(id_bin))
+        return;
+    uuid_t task;
+    if (at_social_task_uuid(AT_SOCIAL_DOMAIN_POST, self_uuid, peer_uuid,
+                            id_bin, sizeof(id_bin), task) != 0)
+        return;
+    long now = (long)time(NULL);
+    int count = 0;
+    char peer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, peer_str);
+    if (_social_accrue(peer_str, now, false, &count))
+        _submit_interaction_score(proc, task, at_social_pos_score(count),
+                                  peer_uuid);
+}
+
 /* Copy the current public_identity_t of the admitted peer with @p uuid into
  * @p out (under peers_read_lock). Returns true iff found. */
 static bool _find_peer_pub_by_uuid(const process_t *proc, const uuid_t uuid,
@@ -4513,6 +4830,12 @@ static bool handle_connection_response(const process_t *proc, directory_t *queue
                              nmsg->from_whom.uuid, new_state);
     log_debug(proc->logger, "Identity: connection with peer %s -> %s\n",
               accepter, decision ? "connected" : "declined");
+
+    /* Increment 8 accrual (requester side). The signed tuple {requester=self,
+     * accepter=peer, decision, seq} is identical on both peers, so both derive the
+     * same task_uuid and their two scores pair into one bilateral transaction. */
+    _social_accrue_connection(proc, self->uuid, nmsg->from_whom.uuid,
+                              (uint64_t)seq, decision != 0);
     return true;
 }
 
@@ -4608,6 +4931,12 @@ static bool handle_app_connect_respond(const process_t *proc, directory_t *queue
     identity_emit_connection(PEER_CONNECTION_STATE_OBSERVED, peer_uuid, new_state);
     log_info(proc->logger, "Identity: connection to %s -> %s\n", peer_str,
              accept ? "connected" : "declined");
+
+    /* Increment 8 accrual (accepter side): same signed {requester=peer,
+     * accepter=self, decision, seq} tuple as the requester verifies, so the
+     * order-independent task_uuid pairs the two submissions into one transaction. */
+    _social_accrue_connection(proc, self->uuid, peer_uuid, (uint64_t)seq,
+                              accept != 0);
     return true;
 }
 
@@ -4750,6 +5079,7 @@ static bool handle_app_send_dm(const process_t *proc, directory_t *queues,
     char peer_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(peer_uuid, peer_str);
     log_info(proc->logger, "Identity: DM sent to %s\n", peer_str);
+    _social_accrue_dm(proc, peer_uuid, false);   /* Increment 8: outbound stamp */
     return true;
 }
 
@@ -4790,8 +5120,508 @@ static bool handle_dm(const process_t *proc, directory_t *queues,
     _last_dm_store(sender, text, seq, ts);
     identity_emit_dm(nmsg->from_whom.uuid, seq, ts, text);
     log_debug(proc->logger, "Identity: DM received from peer %s\n", sender);
+    _social_accrue_dm(proc, nmsg->from_whom.uuid, true);  /* Increment 8: inbound */
     return true;
 }
+
+/****************************
+ * Post reactions (Increment 8): the return signal a fire-and-forget post lacks.
+ * A reaction is a directed, ENCRYPTED reactor→author message {post_id, seq, ts},
+ * exactly like a DM (crypto_box authenticates the reactor). Both peers submit a
+ * reputation score for the same post-derived task, so the engagement accrues.
+ ****************************/
+
+/* AT -> app: surface a reaction to one of our posts. */
+static int identity_emit_reaction(const uuid_t reactor_uuid, const char *post_id,
+                                  int64_t seq, double ts)
+{
+    generic_msg_t msg = {0};
+    msg.type = PEER_REACTION_OBSERVED;
+    msg.size = sizeof(peer_reaction_msg_t);
+    memcpy(msg.info.peer_reaction.peer_uuid, reactor_uuid, 16);
+    snprintf(msg.info.peer_reaction.post_id,
+             sizeof(msg.info.peer_reaction.post_id), "%s",
+             post_id != NULL ? post_id : "");
+    msg.info.peer_reaction.seq = seq;
+    msg.info.peer_reaction.ts = ts;
+    return messaging_send(AT_MAIN_QUEUE, PEER_REACTION_OBSERVED, &msg, false);
+}
+
+/* Directed, encrypted reaction to the post's author: {post_id, seq, ts}.
+ * crypto_box authenticates us, so no signature. Encrypt=true. */
+static int _send_reaction(const process_t *proc, const public_identity_t *author,
+                          const char *post_id, int64_t seq, double ts)
+{
+    generic_msg_t out = {0};
+    out.type = NET_MESSAGE;
+    strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
+    out.info.net_msg.function = ID_REACTION;
+    out.info.net_msg.encrypt = true;
+    memcpy(&out.info.net_msg.to_whom, author, sizeof(public_identity_t));
+    strncpy(out.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    json_t *env = json_object();
+    if (env == NULL) return -1;
+    json_object_set_new(env, "post_id", json_string(post_id));
+    json_object_set_new(env, "seq", json_integer(seq));
+    json_object_set_new(env, "ts", json_real(ts));
+    net_msg_pack_json(&out.info.net_msg, env);
+    json_decref(env);
+    messaging_send("network", NET_MESSAGE, &out, false);
+    (void)proc;
+    return 0;
+}
+
+/* App -> AT verb (AT_APP_REACT_POST): the operator reacts to a peer's post.
+ * Payload {"author": "<uuid_str>", "post_id": "<hex>"}. Send the directed
+ * encrypted reaction to the author and accrue our (reactor) half. */
+static bool handle_app_react_post(const process_t *proc, directory_t *queues,
+                                  generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *j_auth = json_object_get(payload, "author");
+    json_t *j_pid = json_object_get(payload, "post_id");
+    if (!json_is_string(j_auth) || !json_is_string(j_pid)) {
+        json_decref(payload);
+        log_warn(proc->logger, "Identity: app react_post malformed, refusing\n");
+        return true;
+    }
+    uuid_t author_uuid;
+    int rc = uuid_parse(json_string_value(j_auth), author_uuid);
+    char post_id[AT_POST_ID_LEN + 1];
+    snprintf(post_id, sizeof(post_id), "%s", json_string_value(j_pid));
+    json_decref(payload);
+    if (rc != 0) {
+        log_warn(proc->logger, "Identity: app react_post: bad author uuid\n");
+        return true;
+    }
+    public_identity_t author;
+    if (!_find_peer_pub_by_uuid(proc, author_uuid, &author)) {
+        log_warn(proc->logger, "Identity: app react_post: unknown author\n");
+        return true;
+    }
+    const identity_t *self = _partition_self_identity(proc);
+    if (self == NULL) {
+        log_debug(proc->logger,
+                  "Identity: app react_post but self identity unresolved\n");
+        return true;
+    }
+    pthread_mutex_lock(&id_state.lock);
+    int64_t seq = freshness_stamp(&id_state.freshness, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (seq <= 0) {
+        log_warn(proc->logger, "Identity: no freshness sequence; not reacting\n");
+        return true;
+    }
+    double ts = (double)time(NULL);
+    _send_reaction(proc, &author, post_id, seq, ts);
+    _social_accrue_reaction(proc, self->uuid, author_uuid, post_id);
+    return true;
+}
+
+/* Handler: an inbound reaction to one of OUR posts — {post_id, seq, ts}.
+ * Freshness-checked (per-sender replay guard), surfaced to the app, and accrued
+ * (author side). The reactor is the authenticated envelope's from_whom. */
+static bool handle_reaction(const process_t *proc, directory_t *queues,
+                            generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *j_pid = json_object_get(payload, "post_id");
+    json_t *j_seq = json_object_get(payload, "seq");
+    json_t *j_ts = json_object_get(payload, "ts");
+    if (!json_is_string(j_pid) || !json_is_integer(j_seq)) {
+        json_decref(payload);
+        log_warn(proc->logger, "Identity: peer_reaction malformed, refusing\n");
+        return true;
+    }
+    char post_id[AT_POST_ID_LEN + 1];
+    snprintf(post_id, sizeof(post_id), "%s", json_string_value(j_pid));
+    int64_t seq = (int64_t)json_integer_value(j_seq);
+    double ts = json_is_number(j_ts) ? json_number_value(j_ts) : 0.0;
+    json_decref(payload);
+
+    char sender[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, sender);
+    pthread_mutex_lock(&id_state.lock);
+    bool fresh = freshness_accept(&id_state.freshness, sender, ID_REACTION, seq,
+                                  proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (!fresh) {
+        log_debug(proc->logger, "Identity: peer_reaction from %s refused (replay)\n",
+                  sender);
+        return true;
+    }
+
+    identity_emit_reaction(nmsg->from_whom.uuid, post_id, seq, ts);
+    log_debug(proc->logger, "Identity: reaction received from peer %s\n", sender);
+    const identity_t *self = _partition_self_identity(proc);
+    if (self != NULL)
+        _social_accrue_reaction(proc, self->uuid, nmsg->from_whom.uuid, post_id);
+    return true;
+}
+
+/* App -> AT verb (AT_APP_BLOCK): locally block a peer. Payload {"peer":
+ * "<uuid_str>"}. Purely local — records the peer in social_blocks so
+ * identity_get_peer_tier clamps it to 0; no wire traffic, no reputation tx. */
+static bool handle_app_block(const process_t *proc, directory_t *queues,
+                             generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *j_peer = json_object_get(payload, "peer");
+    if (!json_is_string(j_peer)) { json_decref(payload); return true; }
+    char peer_str[UUID_STRING_LEN + 1];
+    snprintf(peer_str, sizeof(peer_str), "%s", json_string_value(j_peer));
+    json_decref(payload);
+
+    data_t *one = integer_data(1);
+    if (one != NULL) {
+        pthread_mutex_lock(&id_state.lock);
+        map_set(&id_state.social_blocks, (map_key_t)peer_str, one);
+        pthread_mutex_unlock(&id_state.lock);
+    }
+    log_info(proc->logger, "Identity: peer %s locally blocked\n", peer_str);
+    return true;
+}
+
+/****************************
+ * Feed posts (Increment 7, the "post to the feed" surface).
+ *
+ * A post is a signed, content-addressed feed item distributed by encrypted GROUP
+ * MULTICAST (net_proc RECIPIENT_GROUP + group_encrypt + NET_CHAN_GROUP) and
+ * gossip-forwarded a bounded number of hops. UNLIKE a DM, whose crypto_box
+ * envelope authenticates the sender, a post is relayed by peers other than its
+ * author, so authorship comes from a DETACHED Ed25519 SIGNATURE over the
+ * canonical (author, seq, ts, required_tier, body) form (identity/post.c), not
+ * from the wire envelope. Inbound posts are signature-verified, TIER-GATED (drop
+ * unless this node's view of the author's tier meets required_tier), content-id
+ * DEDUPED in the app-content store, then emitted and gossip-forwarded (hops+1)
+ * up to POST_MAX_HOPS. Confidentiality is the group key; non-repudiation is the
+ * signature; replay is foreclosed by the content-id dedup (a replay carries an
+ * already-seen id, and a new id cannot be minted without the author's key).
+ ****************************/
+
+/* AT -> app: surface one accepted post as PEER_POST_OBSERVED. @p author_uuid is
+ * the signature-bound author. Mirrors identity_emit_dm. */
+static int identity_emit_post(const uuid_t author_uuid, const char *post_id,
+                              int64_t seq, double ts, int required_tier,
+                              const char *body)
+{
+    generic_msg_t msg = {0};
+    msg.type = PEER_POST_OBSERVED;
+    msg.size = sizeof(peer_post_msg_t);
+    memcpy(msg.info.peer_post.peer_uuid, author_uuid, 16);
+    snprintf(msg.info.peer_post.post_id, sizeof(msg.info.peer_post.post_id),
+             "%s", post_id != NULL ? post_id : "");
+    msg.info.peer_post.seq = seq;
+    msg.info.peer_post.ts = ts;
+    msg.info.peer_post.required_tier = required_tier;
+    at_post_bound_body(body, msg.info.peer_post.body,
+                       sizeof(msg.info.peer_post.body));
+    return messaging_send(AT_MAIN_QUEUE, PEER_POST_OBSERVED, &msg, false);
+}
+
+/* App-content dedup: return true if @p id_hex was ALREADY recorded (caller
+ * drops), else record it in the bounded ring and return false. Own locking.
+ * This is the app store; net_proc's transport dedup ring is a different thing. */
+static bool _post_seen_or_record(const char *id_hex)
+{
+    bool seen = false;
+    pthread_mutex_lock(&id_state.lock);
+    for (size_t i = 0; i < id_state.seen_post_count; i++) {
+        if (strncmp(id_state.seen_post_ids[i], id_hex, AT_POST_ID_HEX_LEN) == 0) {
+            seen = true;
+            break;
+        }
+    }
+    if (!seen) {
+        snprintf(id_state.seen_post_ids[id_state.seen_post_next],
+                 AT_POST_ID_HEX_LEN + 1, "%s", id_hex);
+        id_state.seen_post_next =
+            (id_state.seen_post_next + 1) % POST_DEDUP_CAP;
+        if (id_state.seen_post_count < POST_DEDUP_CAP)
+            id_state.seen_post_count++;
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return seen;
+}
+
+/* Record the most-recent post from @p author_str for the conformance/
+ * observability seam (identity_get_last_post). NOT roster state. Own locking. */
+static void _last_post_store(const char *author_str, const char *post_id,
+                            int64_t seq, double ts, int required_tier,
+                            const char *body)
+{
+    char bounded[AT_POST_BODY_MAX + 1];
+    at_post_bound_body(body, bounded, sizeof(bounded));
+    json_t *env = json_object();
+    if (env == NULL) return;
+    if (json_object_set_new(env, "post_id", json_string(post_id)) != 0
+        || json_object_set_new(env, "seq", json_integer((json_int_t)seq)) != 0
+        || json_object_set_new(env, "ts", json_real(ts)) != 0
+        || json_object_set_new(env, "tier", json_integer(required_tier)) != 0
+        || json_object_set_new(env, "body", json_string(bounded)) != 0) {
+        json_decref(env);
+        return;
+    }
+    char *compact = json_dumps(env, JSON_COMPACT);
+    json_decref(env);
+    if (compact == NULL) return;
+    size_t len = strlen(compact);
+    char *dup = smrt_create(len + 1);
+    if (dup == NULL) { free(compact); return; }
+    memcpy(dup, compact, len + 1);
+    free(compact);
+    data_t *dat = string_data(dup, len + 1);
+    if (dat == NULL) { smrt_deref(dup); return; }
+    pthread_mutex_lock(&id_state.lock);
+    map_set(&id_state.last_post_map, (map_key_t)author_str, dat);
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+/* Encrypted group multicast of one signed post. Builds the wire JSON payload and
+ * hands it to network with group_multicast=true (RECIPIENT_GROUP). encrypt=false:
+ * the group path does its own group_encrypt; the crypto_box peer path is not
+ * used. Used for BOTH the initial publish (hops=0) and a gossip re-forward. */
+static int _multicast_post(const process_t *proc, const uuid_t author_uuid,
+                           const char *author_pk_hex, int64_t seq, double ts,
+                           uint8_t required_tier, const char *body,
+                           const char *sig_hex, int hops)
+{
+    generic_msg_t out = {0};
+    out.type = NET_MESSAGE;
+    strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
+    out.info.net_msg.function = ID_POST;
+    out.info.net_msg.encrypt = false;
+    out.info.net_msg.group_multicast = true;
+    strncpy(out.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    json_t *env = at_post_to_json(author_uuid, author_pk_hex, seq, ts,
+                                  required_tier, body, sig_hex, hops);
+    if (env == NULL) return -1;
+    net_msg_pack_json(&out.info.net_msg, env);
+    json_decref(env);
+    messaging_send("network", NET_MESSAGE, &out, false);
+    return 0;
+}
+
+/* App -> AT verb (AT_APP_PUBLISH_POST): the operator publishes a feed post.
+ * Payload {"body": "<body>", "tier": <int 0..4>}. Stamp our own post seq, set
+ * ts=now, sign the canonical form with our identity key, record the content id in
+ * the dedup store (so a loopback copy is dropped), and group-multicast it. The
+ * core does NOT echo the post back — the app echoes it locally. */
+static bool handle_app_publish_post(const process_t *proc, directory_t *queues,
+                                    generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *j_body = json_object_get(payload, "body");
+    json_t *j_tier = json_object_get(payload, "tier");
+    char body[AT_POST_BODY_MAX + 1];
+    at_post_bound_body(json_is_string(j_body) ? json_string_value(j_body) : "",
+                       body, sizeof(body));
+    int required_tier = json_is_integer(j_tier)
+                            ? (int)json_integer_value(j_tier) : 0;
+    json_decref(payload);
+    if (required_tier < AT_POST_TIER_MIN) required_tier = AT_POST_TIER_MIN;
+    if (required_tier > AT_POST_TIER_MAX) required_tier = AT_POST_TIER_MAX;
+
+    const identity_t *self = _partition_self_identity(proc);
+    if (self == NULL) {
+        log_debug(proc->logger,
+                  "Identity: publish_post but self identity unresolved; skipping\n");
+        return true;
+    }
+
+    pthread_mutex_lock(&id_state.lock);
+    int64_t seq = ++id_state.post_seq;
+    pthread_mutex_unlock(&id_state.lock);
+    double ts = (double)time(NULL);
+
+    char sig_hex[AT_POST_SIG_HEX_LEN + 1];
+    if (at_post_sign(self->signature.private, self->uuid, seq, ts,
+                     (uint8_t)required_tier, body, sig_hex) != 0) {
+        log_warn(proc->logger, "Identity: publish_post: signing failed\n");
+        return true;
+    }
+    char pk_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1];
+    sodium_bin2hex(pk_hex, sizeof(pk_hex), self->signature.public,
+                   crypto_sign_PUBLICKEYBYTES);
+    char id_hex[AT_POST_ID_HEX_LEN + 1];
+    if (at_post_content_id(self->uuid, seq, ts, (uint8_t)required_tier, body,
+                           id_hex) != 0)
+        return true;
+    /* Record BEFORE sending so a loopback copy of our own multicast is deduped
+     * rather than re-emitted. */
+    (void)_post_seen_or_record(id_hex);
+
+    _multicast_post(proc, self->uuid, pk_hex, seq, ts, (uint8_t)required_tier,
+                    body, sig_hex, 0);
+    char self_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(self->uuid, self_str);
+    log_info(proc->logger, "Identity: published post seq=%lld tier=%d (%s)\n",
+             (long long)seq, required_tier, id_hex);
+    return true;
+}
+
+/* Handler: an inbound group-multicast post. Verify the author's signature (bound
+ * to the author's key: for a KNOWN peer the stored signing key MUST match the
+ * carried author_pk — an impersonation guard; an unknown author is accepted
+ * best-effort against the carried key, which is how a post reaches one hop beyond
+ * the author's cohort). Then TIER-GATE, content-id DEDUP, emit, and gossip-
+ * forward (hops+1) while under POST_MAX_HOPS. */
+static bool handle_post(const process_t *proc, directory_t *queues,
+                        generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    uuid_t author;
+    char author_pk[AT_POST_SIG_HEX_LEN + 1];
+    char sig_hex[AT_POST_SIG_HEX_LEN + 1];
+    char body[AT_POST_BODY_MAX + 1];
+    int64_t seq = 0;
+    double ts = 0.0;
+    uint8_t tier = 0;
+    int hops = 0;
+    if (at_post_from_json(payload, author, author_pk, &seq, &ts, &tier,
+                          body, sizeof(body), sig_hex, &hops) != 0) {
+        json_decref(payload);
+        log_warn(proc->logger, "Identity: peer_post malformed, refusing\n");
+        return true;
+    }
+    json_decref(payload);
+
+    char author_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(author, author_str);
+
+    /* Resolve the key to verify against, binding uuid <-> key where we can. */
+    unsigned char verify_pk[crypto_sign_PUBLICKEYBYTES];
+    public_identity_t known;
+    bool have_known = _find_peer_pub_by_uuid(proc, author, &known);
+    if (have_known) {
+        char known_pk_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1];
+        sodium_bin2hex(known_pk_hex, sizeof(known_pk_hex),
+                       known.signature.public, crypto_sign_PUBLICKEYBYTES);
+        if (strncmp(known_pk_hex, author_pk, crypto_sign_PUBLICKEYBYTES * 2) != 0) {
+            log_warn(proc->logger,
+                     "Identity: peer_post from %s: author_pk != known key, "
+                     "dropping (impersonation)\n", author_str);
+            return true;
+        }
+        memcpy(verify_pk, known.signature.public, sizeof(verify_pk));
+    } else {
+        size_t bin_len = 0;
+        if (sodium_hex2bin(verify_pk, sizeof(verify_pk), author_pk,
+                           strlen(author_pk), NULL, &bin_len, NULL) != 0
+            || bin_len != sizeof(verify_pk)) {
+            log_warn(proc->logger,
+                     "Identity: peer_post from %s: bad author_pk, dropping\n",
+                     author_str);
+            return true;
+        }
+    }
+
+    if (!at_post_verify(verify_pk, author, seq, ts, tier, body, sig_hex)) {
+        log_warn(proc->logger,
+                 "Identity: peer_post from %s: BAD SIGNATURE, dropping\n",
+                 author_str);
+        return true;
+    }
+
+    /* Tier-gate: deliver only if this node's view of the author's tier meets the
+     * post's required audience floor. An unknown author reads as tier 0, so only
+     * their public posts pass. */
+    int author_tier = identity_get_peer_tier(author);
+    if (author_tier < (int)tier) {
+        log_debug(proc->logger,
+                  "Identity: peer_post from %s tier-gated (need %d, have %d)\n",
+                  author_str, (int)tier, author_tier);
+        return true;
+    }
+
+    /* Content-id dedup (the app-content store): compute the id from the verified
+     * canonical and drop a repeat before emitting or re-forwarding. */
+    char id_hex[AT_POST_ID_HEX_LEN + 1];
+    if (at_post_content_id(author, seq, ts, tier, body, id_hex) != 0)
+        return true;
+    if (_post_seen_or_record(id_hex)) {
+        log_debug(proc->logger, "Identity: peer_post %s already seen, dropping\n",
+                  id_hex);
+        return true;
+    }
+
+    _last_post_store(author_str, id_hex, seq, ts, (int)tier, body);
+    identity_emit_post(author, id_hex, seq, ts, (int)tier, body);
+    log_debug(proc->logger, "Identity: post %s from %s accepted (hops=%d)\n",
+              id_hex, author_str, hops);
+
+    /* Gossip forward: relay one more hop while under the reach bound. The dedup
+     * ring above guarantees we forward a given post at most once. */
+    if (hops < POST_MAX_HOPS)
+        _multicast_post(proc, author, author_pk, seq, ts, tier, body, sig_hex,
+                        hops + 1);
+    return true;
+}
+
+/* Conformance/observability twin of identity_get_last_dm: the most-recent post
+ * this node accepted from @p uuid_str (the AUTHOR). Returns true and fills the
+ * outputs if present. Mirrors Python get_last_post. */
+bool identity_get_last_post(const char *uuid_str, char *post_id_buf,
+                           size_t post_id_sz, char *body_buf, size_t body_sz,
+                           int64_t *seq_out, int *tier_out)
+{
+    if (!id_state.initialized || uuid_str == NULL) return false;
+    bool found = false;
+    pthread_mutex_lock(&id_state.lock);
+    data_t *dat = NULL;
+    if (map_get(&id_state.last_post_map, (map_key_t)uuid_str, &dat) == 0
+        && dat != NULL) {
+        char *js = NULL;
+        if (data_string_ptr(dat, &js) == 0 && js != NULL) {
+            json_error_t jerr;
+            json_t *obj = json_loads(js, 0, &jerr);
+            if (obj != NULL) {
+                json_t *j_id   = json_object_get(obj, "post_id");
+                json_t *j_seq  = json_object_get(obj, "seq");
+                json_t *j_tier = json_object_get(obj, "tier");
+                json_t *j_body = json_object_get(obj, "body");
+                if (post_id_buf != NULL && post_id_sz > 0)
+                    snprintf(post_id_buf, post_id_sz, "%s",
+                             json_is_string(j_id) ? json_string_value(j_id) : "");
+                if (body_buf != NULL && body_sz > 0)
+                    snprintf(body_buf, body_sz, "%s",
+                             json_is_string(j_body) ? json_string_value(j_body) : "");
+                if (seq_out != NULL)
+                    *seq_out = json_is_integer(j_seq)
+                                   ? (int64_t)json_integer_value(j_seq) : 0;
+                if (tier_out != NULL)
+                    *tier_out = json_is_integer(j_tier)
+                                    ? (int)json_integer_value(j_tier) : 0;
+                json_decref(obj);
+                found = true;
+            }
+        }
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return found;
+}
+#endif /* AT_SOCIAL_ENABLED */
 
 /****************************
  * Handler: tier_update
@@ -4888,6 +5718,13 @@ int identity_get_peer_tier(const uuid_t uuid)
     data_t *dat = NULL;
     if (map_get(&id_state.peer_tiers, uuid_str, &dat) == 0 && dat != NULL)
         data_integer(dat, &tier);
+#ifdef AT_SOCIAL_ENABLED
+    /* A locally blocked peer (Increment 8) is clamped to tier 0 for our own
+     * tier-gates. Purely local: nothing on the wire, no reputation transaction. */
+    data_t *bdat = NULL;
+    if (map_get(&id_state.social_blocks, uuid_str, &bdat) == 0 && bdat != NULL)
+        tier = 0;
+#endif /* AT_SOCIAL_ENABLED */
     pthread_mutex_unlock(&id_state.lock);
     return tier;
 }
@@ -6080,6 +6917,7 @@ void identity_periodic_caps_resync(const process_t *proc)
                   cnt);
     }
 
+#ifdef AT_SOCIAL_ENABLED
     /* Position resync (Increment 2): re-query admitted peers we hold no stored
      * position for. Opted-out peers answer nothing and are simply re-asked next
      * sweep; a peer that opts in later is picked up here. Same lock order as
@@ -6129,6 +6967,7 @@ void identity_periodic_caps_resync(const process_t *proc)
     peers_read_unlock(proc);
     for (size_t i = 0; i < fcnt; i++)
         _send_profile_query(proc, &profless[i]);
+#endif /* AT_SOCIAL_ENABLED */
 }
 
 /****************************
@@ -8562,12 +9401,17 @@ static bool handle_peer_roster_request(const process_t *proc,
     (void)queues;
     (void)msg;
     int n = identity_emit_all_peers(proc);
+#ifdef AT_SOCIAL_ENABLED
     int p = identity_emit_all_positions(proc);
     int f = identity_emit_all_profiles(proc);
     int c = identity_emit_all_connections(proc);
     log_debug(proc->logger,
               "Identity: peer roster request -> %d observation(s), %d position(s), "
               "%d profile(s), %d connection(s)\n", n, p, f, c);
+#else
+    log_debug(proc->logger,
+              "Identity: peer roster request -> %d observation(s)\n", n);
+#endif /* AT_SOCIAL_ENABLED */
     return true;
 }
 
@@ -8677,6 +9521,7 @@ int identity_register_handlers(process_t *proc)
     process_register_handler(proc, ID_UPDATE,   (handler_ptr_t)handle_group_update);
     process_register_handler(proc, ID_CAPS_QUERY,    (handler_ptr_t)handle_caps_query);
     process_register_handler(proc, ID_CAPS_RESPONSE, (handler_ptr_t)handle_caps_response);
+#ifdef AT_SOCIAL_ENABLED
     process_register_handler(proc, ID_POSITION_QUERY,    (handler_ptr_t)handle_position_query);
     process_register_handler(proc, ID_POSITION_RESPONSE, (handler_ptr_t)handle_position_response);
     process_register_handler(proc, ID_APP_SET_POSITION,  (handler_ptr_t)handle_set_position);
@@ -8689,6 +9534,12 @@ int identity_register_handlers(process_t *proc)
     process_register_handler(proc, ID_APP_CONNECT_RESPOND, (handler_ptr_t)handle_app_connect_respond);
     process_register_handler(proc, ID_DM,          (handler_ptr_t)handle_dm);
     process_register_handler(proc, ID_APP_SEND_DM, (handler_ptr_t)handle_app_send_dm);
+    process_register_handler(proc, ID_POST,             (handler_ptr_t)handle_post);
+    process_register_handler(proc, ID_APP_PUBLISH_POST, (handler_ptr_t)handle_app_publish_post);
+    process_register_handler(proc, ID_REACTION,         (handler_ptr_t)handle_reaction);
+    process_register_handler(proc, ID_APP_REACT_POST,   (handler_ptr_t)handle_app_react_post);
+    process_register_handler(proc, ID_APP_BLOCK,        (handler_ptr_t)handle_app_block);
+#endif /* AT_SOCIAL_ENABLED */
     process_register_handler(proc, ID_IDENTITY_QUERY,
                              (handler_ptr_t)handle_identity_query);
     process_register_handler(proc, ID_IDENTITY_RESPONSE,
