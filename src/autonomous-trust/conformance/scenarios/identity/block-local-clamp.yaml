@@ -1,0 +1,105 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: block-local-clamp
+byte_pinning: false
+description: |
+    A LOCAL block clamps a peer's trust tier to 0 for our own tier-gates
+    (Increment 8). Blocking is an app action (AT_APP_BLOCK), not a wire verb:
+    nothing is signed, nothing is broadcast, no reputation transaction is
+    staged. It records the peer locally so identity_get_peer_tier returns 0 for
+    it, no matter what tier reputation last wrote — which is exactly why it
+    needs pinning, since the two runtimes disagreeing would let a capability be
+    granted on one node and refused on the other for the same blocked peer.
+
+    The block is peer-specific, not a global mute, so the scenario scores TWO
+    peers to tier 3 and blocks only one: a correct clamp drops the blocked peer
+    to 0 and leaves the other untouched. An implementation that clamped globally
+    (or not at all) fails one of the two assertions.
+
+    Steps 1-4 backfill alice and bob through the identity-resync path (the same
+    exchange tier-update-applied and identity-resync-backfill pin) so a tier can
+    land on a real local record. Steps 5-6 elevate both to tier 3 over the local
+    tier_update IPC. Step 7 blocks alice via the trigger_block pseudo-step (block
+    has no inbound message to dispatch, so the adapter drives the production
+    block call directly, as C mirrors with identity_block_peer).
+
+participants:
+  - id: node
+    role: border_guard
+  - id: alice
+    role: group_member
+  - id: bob
+    role: group_member
+
+fixtures:
+  # PINNED, not adapter-minted: the identity-resync query is gated on the
+  # asker's group uuid matching the responder's, so without a shared pin each
+  # runtime mints its own per-participant group and the backfill silently
+  # produces no peer (see tier-update-applied).
+  shared_group:
+    uuid: "0c000000-0000-4000-8000-00000000000b"
+
+steps:
+  - id: 1
+    from: node
+    to: alice
+    function: peer_identity_query
+    payload:
+      have: []
+    description: Setup. node asks alice for her published identity.
+  - id: 2
+    from: alice
+    to: node
+    function: peer_identity_response
+    in_response_to: 1
+    payload: {}
+    description: Setup. node backfills alice into its peer list.
+  - id: 3
+    from: node
+    to: bob
+    function: peer_identity_query
+    payload:
+      have: []
+    description: Setup. node asks bob for his published identity.
+  - id: 4
+    from: bob
+    to: node
+    function: peer_identity_response
+    in_response_to: 3
+    payload: {}
+    description: Setup. node backfills bob into its peer list.
+  - id: 5
+    from: node
+    to: node
+    function: tier_update
+    payload:
+      peer: alice
+      tier: 3
+    description: |
+        The reputation process publishes alice at tier 3. Local IPC, so from
+        and to are the same node.
+  - id: 6
+    from: node
+    to: node
+    function: tier_update
+    payload:
+      peer: bob
+      tier: 3
+    description: The reputation process publishes bob at tier 3.
+  - id: 7
+    from: node
+    to: node
+    function: trigger_block
+    payload:
+      peer: alice
+    description: |
+        node locally blocks alice. Purely local: no wire traffic, no reputation
+        transaction. alice's local tier is now clamped to 0; bob is untouched.
+
+expected_state:
+  node:
+    peer_count: 2
+    peer_tier:
+      alice: 0    # blocked -> clamped
+      bob: 3      # unblocked -> reputation tier stands
