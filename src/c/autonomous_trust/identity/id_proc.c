@@ -88,6 +88,13 @@ static zta_gate_t _zta_admit(const process_t *proc, const zta_policy_t *policy,
 /* Defined with the partition-recovery helpers far below, but the ZTA gate needs
  * it to reach this node's own identity for the replay check. */
 static const identity_t *_partition_self_identity(const process_t *proc);
+static bool _group_has_address(group_t *group, const char *addr);
+#ifdef AT_SOCIAL_ENABLED
+static bool _peer_shares_our_group(const process_t *proc, const char *peer_uuid_str);
+static void _record_peer_group_uuid(const process_t *proc,
+                                    const char *peer_uuid_str,
+                                    const char *group_uuid_str);
+#endif /* AT_SOCIAL_ENABLED */
 
 DEFINE_ERROR(EID_NOQ, "Required process queue missing");
 
@@ -392,6 +399,14 @@ static struct {
      * reputation. Filled by handle_connection_request/response and the app
      * connect verbs; conformance surface via identity_get_connection_state. */
     map_t connection_edges;
+    /* Last group uuid each peer ADVERTISED to us (handle_group_update), keyed by
+     * lowercased peer uuid string, value string_data(group uuid string). The
+     * "in your group" app indicator is true only when this equals OUR current
+     * group uuid — i.e. we and the peer actually converged on the same group.
+     * A peer's address landing in our address_map (the mesh merge) happens well
+     * before key convergence (the split-brain window), so address membership is
+     * NOT a sound co-membership signal; the advertised-uuid match is. */
+    map_t peer_group_uuids;
     /* Most-recent DM received per sender (Increment 6), keyed by lowercased
      * sender uuid string; values are string_data(compact JSON {"text","seq",
      * "ts"}). A DM is a LIVE STREAM delivered to the app on arrival, so this is
@@ -571,6 +586,7 @@ static void _ensure_id_init(void)
         }
         map_init(&id_state.peer_profile_map);
         map_init(&id_state.connection_edges);
+        map_init(&id_state.peer_group_uuids);
         map_init(&id_state.last_dm_map);
         map_init(&id_state.last_post_map);
         id_state.post_seq = 0;
@@ -1121,6 +1137,18 @@ static bool _rotate_group_key(process_t *proc, directory_t *queues)
              "Identity: rotated group key to epoch %lld (%zu member(s))\n",
              (long long)epoch, proc->protocol.num_peers);
     _update_group(proc, queues);
+    /* Hand the freshly rotated key to our OWN sibling processes (network,
+     * reputation) so their protocol.group copy (processes.c GROUP handler:
+     * `proc->protocol.group = msg->info.group`) gets the new encryptor. Without
+     * this, _update_group only tells PEERS over the wire (ID_UPDATE) and the
+     * identity process itself — the network process keeps its pre-rotation
+     * encryptor, so every group multicast (Increment-7 feed posts) fails
+     * group_encrypt on a stale/zero key. Mirrors the adopt path's
+     * _remember_activity(GROUP). */
+    generic_msg_t group_msg = {0};
+    group_msg.type = GROUP;
+    memcpy(&group_msg.info.group, &proc->protocol.group, sizeof(group_t));
+    _remember_activity(proc, queues, &group_msg);
     return true;
 }
 
@@ -1165,6 +1193,16 @@ static void _confirm_group_membership(process_t *proc, directory_t *queues,
 static int _add_peer(process_t *proc, directory_t *queues,
                      const public_identity_t *new_peer, bool confirmed)
 {
+    /* Never list ourselves as a peer. A `peer_accepted` broadcast that names
+     * THIS node (a welcomer confirming us to the cohort) reaches us too; without
+     * this guard we would confirm+add our own identity as a peer and even open a
+     * self-connection to it. Self is never a member of peers[]. This is the sole
+     * chokepoint for every add path (handle_confirm_peer and the two internal
+     * callers); the history/resync backfills already self-check independently. */
+    const identity_t *self = _partition_self_identity(proc);
+    if (self != NULL &&
+        uuid_compare(new_peer->uuid, self->uuid) == 0)
+        return 0;
     peers_write_lock(proc);
     /* Idempotency: an amnesia path may revisit a peer already in the list
      * (Python's _peer_accepted threads an explicit amnesia flag to skip
@@ -2454,17 +2492,60 @@ static int _merge_to_mesh(process_t *proc, directory_t *queues)
      * proc->protocol.peers in the existing code). Mirrors Python's
      * `self.group = accepted_group` in idprocess.py:420. */
     if (have_group) {
-        char gid_str[UUID_STRING_LEN + 1];
-        uuid_unparse_lower(adopted_group.uuid, gid_str);
+        /* Deterministic convergence. Two nodes that self-bootstrap at the same
+         * time each receive the OTHER's group in a full_history and, adopting it
+         * unconditionally, SWAP groups — they stay split (different uuids + keys),
+         * so the first post can't decrypt until partition recovery breaks the tie
+         * much later. Instead pick ONE winner with the SAME rule handle_group_update
+         * uses (older `created` wins; uuid breaks the tie), which both nodes compute
+         * identically over the same two groups — so they converge on one group, with
+         * its key, at merge time. Keep ours when it wins; free the rejected candidate. */
+        char cand_u[UUID_STRING_LEN + 1], mine_u[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(adopted_group.uuid, cand_u);
         peers_write_lock(proc);
-        memcpy(&proc->protocol.group, &adopted_group, sizeof(group_t));
-        peers_write_unlock(proc);
-        log_info(proc->logger,
-                 "Identity: adopted mesh group %s during merge\n", gid_str);
+        uuid_unparse_lower(proc->protocol.group.uuid, mine_u);
+        double cand_created = adopted_group.created;
+        double mine_created = proc->protocol.group.created;
+        bool both_aged = (cand_created > 0.0 && mine_created > 0.0);
+        bool adopt_cand;
+        if (both_aged && cand_created < mine_created)
+            adopt_cand = true;                          /* candidate older -> absorbs us */
+        else if (both_aged && cand_created > mine_created)
+            adopt_cand = false;                         /* candidate younger -> keep ours */
+        else
+            adopt_cand = (strcmp(cand_u, mine_u) < 0);  /* equal/unknown age -> uuid tiebreak */
+        if (adopt_cand) {
+            memcpy(&proc->protocol.group, &adopted_group, sizeof(group_t));
+            peers_write_unlock(proc);
+            log_info(proc->logger,
+                     "Identity: adopted mesh group %s during merge\n", cand_u);
+        } else {
+            peers_write_unlock(proc);
+            /* Not adopting: release the parsed candidate's address_map (the
+             * adopt path transfers ownership via the memcpy; the reject path
+             * must not leak it). */
+            if (adopted_group.address_map.items != NULL)
+                map_free(&adopted_group.address_map);
+            log_info(proc->logger,
+                     "Identity: kept our group %s over merge candidate %s "
+                     "(deterministic tiebreak)\n", mine_u, cand_u);
+        }
     }
 
     _populate_peers_from_history(proc, queues, peer_bundle, bundle_n);
     free(peer_bundle);
+
+    /* Re-advertise our settled group to every peer. The merge path historically
+     * only re-announced our identity, so peers learned our post-merge group only
+     * via a later, sparse group_key_update — or never: the merge WINNER never
+     * adopts again, so a peer could be left holding only our PRE-merge
+     * advertisement (its "in your group" indicator then never lit, and a late
+     * joiner could stay on the wrong group). One fanout here converges both
+     * sides promptly; a receiver already on this group records it and no-ops
+     * (handle_group_update's same-group path returns before re-echoing), so
+     * there is no ID_UPDATE ping-pong. Mirrors handle_group_update's tail. */
+    if (have_group)
+        _update_group(proc, queues);
 
     int rc = _announce_identity(proc, queues);
 
@@ -2925,6 +3006,8 @@ void identity_reset_state(void)
     map_init(&id_state.peer_profile_map);
     map_free(&id_state.connection_edges);
     map_init(&id_state.connection_edges);
+    map_free(&id_state.peer_group_uuids);
+    map_init(&id_state.peer_group_uuids);
     map_free(&id_state.last_dm_map);
     map_init(&id_state.last_dm_map);
     map_free(&id_state.last_post_map);
@@ -3191,6 +3274,19 @@ static bool handle_confirm_peer(process_t *proc, directory_t *queues, generic_ms
         log_warn(proc->logger, "Identity: handle_confirm_peer: malformed peer identity\n");
         return true;
     }
+
+    /* A confirm that names THIS node is the cohort accepting US, not a new peer
+     * to admit. Skip it entirely: we must not add self to peers[] (belt to the
+     * _add_peer guard) nor fire the self-directed caps/position/profile queries
+     * below. In a 2-node bootstrap the welcomer's `peer_accepted` for us is
+     * broadcast and so echoes back here. */
+    const identity_t *confirm_self = _partition_self_identity(proc);
+    if (confirm_self != NULL &&
+        uuid_compare(new_peer.uuid, confirm_self->uuid) == 0)
+    {
+        json_decref(payload);
+        return true;
+    }
     json_decref(payload);
 
     /* Freshness per confirmer, credited to the AUTHENTICATED sender rather
@@ -3427,6 +3523,20 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
     log_info(proc->logger,
              "Identity: parsed incoming group update (uuid %s, addresses %zu)\n",
              theirs_uuid_str ? theirs_uuid_str : "?", theirs_size);
+
+#ifdef AT_SOCIAL_ENABLED
+    /* Remember which group this peer advertised, keyed by the authenticated
+     * sender. The app's "in your group" indicator lights only once this equals
+     * OUR group uuid (real convergence), not merely when addresses overlap. */
+    if (theirs_uuid_valid && nmsg->from_whom.nickname[0] != '\0') {
+        char from_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(nmsg->from_whom.uuid, from_str);
+        /* proc->protocol.group.uuid here is our PRE-adopt uuid (the adopt for
+         * this update happens further below), which is exactly the "ours at
+         * record time" the swap-robust check needs. */
+        _record_peer_group_uuid(proc, from_str, theirs_uuid_str);
+    }
+#endif /* AT_SOCIAL_ENABLED */
 
     /* Mine: snapshot uuid + address_map size. */
     size_t mine_size = map_size(&((process_t *)proc)->protocol.group.address_map);
@@ -4442,6 +4552,67 @@ static int identity_emit_connection(message_type_t type, const uuid_t peer_uuid,
     return messaging_send(AT_MAIN_QUEUE, type, &msg, false);
 }
 
+#ifdef AT_SOCIAL_ENABLED
+/* Record that peer @p peer_uuid_str advertised group @p group_uuid_str, stored
+ * as "<their group>|<OUR group at record time>" (handle_group_update, BEFORE any
+ * adopt this same update triggers). Capturing our own uuid is what makes the
+ * signal robust to the symmetric-swap split-brain: when we later adopt a group
+ * (our uuid changes), the second field no longer matches our current uuid, so
+ * the stale record stops counting as co-membership until the peer re-advertises.
+ * Own locking. See id_state.peer_group_uuids. */
+static void _record_peer_group_uuid(const process_t *proc,
+                                    const char *peer_uuid_str,
+                                    const char *group_uuid_str)
+{
+    if (proc == NULL || peer_uuid_str == NULL || group_uuid_str == NULL) return;
+    char ours[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(proc->protocol.group.uuid, ours);
+    char buf[2 * UUID_STRING_LEN + 2];
+    int len = snprintf(buf, sizeof(buf), "%s|%s", group_uuid_str, ours);
+    if (len <= 0 || (size_t)len >= sizeof(buf)) return;
+    char *dup = smrt_create((size_t)len + 1);
+    if (dup == NULL) return;
+    memcpy(dup, buf, (size_t)len + 1);
+    data_t *dat = string_data(dup, (size_t)len + 1);
+    if (dat == NULL) { smrt_deref(dup); return; }
+    pthread_mutex_lock(&id_state.lock);
+    map_set(&id_state.peer_group_uuids, (map_key_t)peer_uuid_str, dat);
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+/* True iff peer @p peer_uuid_str last advertised the SAME group uuid this node
+ * currently holds AND we have not changed our own group since (both halves of
+ * the stored "their|ours-at-record" must equal our current uuid). This is the
+ * sound "in your group" signal: address membership is true from the mesh merge
+ * on, and a bare their==ours match is fooled by the mutual-adopt swap (each side
+ * records the other's PRE-swap uuid, which equals its own POST-adopt uuid). */
+static bool _peer_shares_our_group(const process_t *proc, const char *peer_uuid_str)
+{
+    if (proc == NULL || peer_uuid_str == NULL) return false;
+    char current[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(proc->protocol.group.uuid, current);
+    bool same = false;
+    pthread_mutex_lock(&id_state.lock);
+    data_t *dat = NULL;
+    if (map_get(&id_state.peer_group_uuids, (map_key_t)peer_uuid_str, &dat) == 0
+        && dat != NULL) {
+        char *s = NULL;
+        if (data_string_ptr(dat, &s) == 0 && s != NULL) {
+            const char *bar = strchr(s, '|');
+            if (bar != NULL) {
+                size_t their_len = (size_t)(bar - s);
+                const char *our_rec = bar + 1;
+                same = (their_len == strlen(current)
+                        && strncmp(s, current, their_len) == 0
+                        && strcmp(our_rec, current) == 0);
+            }
+        }
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return same;
+}
+#endif /* AT_SOCIAL_ENABLED */
+
 /* Record our edge state toward peer @p uuid_str as compact JSON
  * {"state","seq","ts"} (string_data, like peer_profile_map). Own locking.
  * Returns 0 on success. */
@@ -4551,6 +4722,21 @@ bool identity_get_last_social_tx(const char *uuid_str, char *task_out,
     }
     pthread_mutex_unlock(&id_state.lock);
     return found;
+}
+
+/* Conformance/test seam: locally block @p uuid_str (lowercased peer uuid),
+ * writing the same social_blocks record handle_app_block does but callable
+ * without assembling an app message. identity_get_peer_tier then clamps this
+ * peer to 0. Purely local — no wire traffic, no reputation transaction. Twin of
+ * Python IdentityProcess.block_peer. */
+void identity_block_peer(const char *uuid_str)
+{
+    if (uuid_str == NULL) return;
+    data_t *one = integer_data(1);
+    if (one == NULL) return;
+    pthread_mutex_lock(&id_state.lock);
+    map_set(&id_state.social_blocks, (map_key_t)uuid_str, one);
+    pthread_mutex_unlock(&id_state.lock);
 }
 
 /* Read the per-edge accrual record for @p uuid_str; absent => all zeros. Caller
@@ -5619,6 +5805,25 @@ static bool handle_post(const process_t *proc, directory_t *queues,
                  author_str);
         return true;
     }
+
+#ifdef AT_SOCIAL_ENABLED
+    /* Ground-truth co-membership for the "in your group" indicator: this post
+     * arrived over the group channel and DECRYPTED with our group key, and its
+     * author signature verified — so the author shares our group right now
+     * (posts flow), whether or not we hold a fresh group_key_update advertising
+     * our uuid from them. Those advertisements are sparse and timing-dependent:
+     * the winner of a merge tiebreak can be left holding only the loser's STALE
+     * pre-adoption advertisement, so its badge for that peer never lit even
+     * though posts arrive. Record our own current group as "theirs" so the
+     * swap-robust check (both halves == our current uuid) passes. Recorded
+     * BEFORE the tier-gate/dedup: decrypt + signature already prove membership,
+     * independent of whether we ultimately surface this particular post. */
+    {
+        char ours_now[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(proc->protocol.group.uuid, ours_now);
+        _record_peer_group_uuid(proc, author_str, ours_now);
+    }
+#endif /* AT_SOCIAL_ENABLED */
 
     /* Tier-gate: deliver only if this node's view of the author's tier meets the
      * post's required audience floor. An unknown author reads as tier 0, so only
@@ -9443,6 +9648,15 @@ int identity_emit_peer_observed(const process_t *proc,
     if (peer->operator_bound)
         memcpy(msg.info.peer_observed.operator_pubkey, peer->operator_pubkey,
                crypto_sign_PUBLICKEYBYTES);
+#ifdef AT_SOCIAL_ENABLED
+    /* Group co-membership: true only when this peer last advertised the SAME
+     * group uuid we currently hold — i.e. we actually converged on one group,
+     * so group multicast (feed posts) works. Address membership alone is true
+     * from the mesh merge onward, well before key convergence (the split-brain
+     * window), so it is NOT sound here — it would light the "in your group"
+     * indicator while posts still cannot flow. */
+    msg.info.peer_observed.in_group = _peer_shares_our_group(proc, pu);
+#endif /* AT_SOCIAL_ENABLED */
     return messaging_send(AT_MAIN_QUEUE, PEER_OBSERVED, &msg, false);
 }
 

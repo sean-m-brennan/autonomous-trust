@@ -266,6 +266,13 @@ typedef struct {
      *  Zeroed whenever @c operator_bound is false, for the same reason the
      *  stamp is. */
     uint8_t  operator_pubkey[crypto_sign_PUBLICKEYBYTES];
+#ifdef AT_SOCIAL_ENABLED
+    /** True iff this peer's address is a current member of OUR group's
+     *  address_map — i.e. we and the peer are in the same group. The social app
+     *  surfaces it as an "in your group" indicator, distinct from an explicit
+     *  connection edge. Appended LAST; social builds only. */
+    bool     in_group;
+#endif /* AT_SOCIAL_ENABLED */
 } peer_observed_msg_t;
 
 /**

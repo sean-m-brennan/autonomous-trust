@@ -1312,7 +1312,8 @@ static int _build_inbound(sce_run_ctx_t *ctx,
      * which likewise leaves the payload in place for this one pseudo-function while
      * blanking it for the others. */
     if ((strcmp(function, "trigger_cohort_join") == 0
-         || strcmp(function, "trigger_first_contact_initiate") == 0)
+         || strcmp(function, "trigger_first_contact_initiate") == 0
+         || strcmp(function, "trigger_block") == 0)
         && json_is_object(payload)) {
         json_t *body = json_deep_copy(payload);
         if (body != NULL) {
@@ -2279,6 +2280,34 @@ static int _dispatch(sce_run_ctx_t *ctx,
         at_first_contact_reset();
         return 0;
     }
+#ifdef AT_SOCIAL_ENABLED
+    if (inbound->type == NET_MESSAGE
+        && inbound->info.net_msg.function != NULL
+        && strcmp(inbound->info.net_msg.function, "trigger_block") == 0) {
+        /* Pseudo-function: locally block the peer the step names ({"peer":
+         * <pid>}). Block is an app verb, not a wire message, so there is nothing
+         * to dispatch — call the identity_block_peer seam directly;
+         * identity_get_peer_tier then clamps this peer to 0. Purely local — no
+         * wire traffic, no reputation transaction. Mirrors the Python adapter's
+         * _TRIGGER_BLOCK. */
+        json_t *jp = NULL;
+        if (net_msg_unpack_json(&inbound->info.net_msg, &jp) == 0
+            && jp != NULL) {
+            const char *peer_pid =
+                json_string_value(json_object_get(jp, "peer"));
+            sce_participant_t *tp = peer_pid != NULL
+                ? sce_find_participant(ctx, peer_pid) : NULL;
+            if (tp != NULL) {
+                char uuid_str[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(((ic_impl_t *)tp->impl)->pub->uuid,
+                                   uuid_str);
+                identity_block_peer(uuid_str);
+            }
+            json_decref(jp);
+        }
+        return 0;
+    }
+#endif /* AT_SOCIAL_ENABLED */
     if (inbound->type == NET_MESSAGE
         && inbound->info.net_msg.function != NULL
         && strcmp(inbound->info.net_msg.function, "trigger_caps_resync") == 0) {
@@ -3840,7 +3869,8 @@ void at_identity_run(const at_case_t *c, at_case_result_t *out) {
                      strncmp(fn, "peer_connection", 15) == 0 ||
                      strncmp(fn, "peer_dm", 7) == 0 ||
                      strncmp(fn, "peer_post", 9) == 0 ||
-                     strncmp(fn, "peer_reaction", 13) == 0)) {
+                     strncmp(fn, "peer_reaction", 13) == 0 ||
+                     strncmp(fn, "trigger_block", 13) == 0)) {
                     at_case_result_set_skip(
                         out, "agora scenario skipped: C built without AT_SOCIAL "
                              "(build -DAT_SOCIAL=ON to run it symmetrically)");

@@ -128,6 +128,16 @@ DEFINE_TEST(test_group_proto_roundtrip)
     /* doc/architecture/identity-protocol.md: the group age round-trips */
     ck_assert_double_eq_tol(grp2.created, 1700000000.5, 1e-6);
 
+    /* The shared group key round-trips through the SAME-NODE inter-process
+     * codec. group_create mints an owned key, so the raw private must survive
+     * and the public/public_hex must be reconstructed from it -- otherwise a
+     * sibling process (network) receives a keyless group and cannot crypto_box
+     * group multicast (Increment-7 feed posts). Regression guard for that bug. */
+    ck_assert_int_eq(sodium_is_zero(grp->encryptor.private, crypto_box_SECRETKEYBYTES), 0);
+    ck_assert_mem_eq(grp2.encryptor.private, grp->encryptor.private, crypto_box_SECRETKEYBYTES);
+    ck_assert_mem_eq(grp2.encryptor.public, grp->encryptor.public, crypto_box_PUBLICKEYBYTES);
+    ck_assert_str_eq((char *)grp2.encryptor.public_hex, (char *)grp->encryptor.public_hex);
+
     free(data);
     group_free(grp);
     /* grp2 is a stack struct (not smrt-allocated); free only its map to avoid

@@ -143,12 +143,38 @@ static int udp_open_common(net_transport_ctx_t **out_ctx,
     log_info(params->logger, "Bound peer recv to %s:%d (UDP)\n",
              address ? address : "*", port);
 
-    /* Group recv socket — likewise exclusive. */
-    if (net_transport_ip_bind(&ctx->cfg, address, grp_port, false, false,
-                              &ctx->recv_grp, params->logger) != 0)
-        goto fail;
-    log_info(params->logger, "Bound group recv to %s:%d (UDP)\n",
-             address ? address : "*", grp_port);
+    /* Group recv socket. The group channel (Increment 7 encrypted multicast —
+     * feed posts) rides the SAME delivery mode as discovery, just on the group
+     * port (base+1). In broadcast mode (use_mcast==false) that means binding the
+     * segment BROADCAST address with SO_REUSEADDR, exactly like recv_cast below:
+     * a socket bound to our own unicast address never sees a broadcast frame, so
+     * the old unicast bind here silently dropped every group multicast (the send
+     * side compounded it by targeting mcast4_addr). Under use_mcast it joins the
+     * cohort's multicast group on the group port instead. */
+    if (use_mcast) {
+        const char *gmcast = ipv6 ? params->net_cfg->mcast6_addr
+                                  : params->net_cfg->mcast4_addr;
+        if (net_transport_ip_bind(&ctx->cfg, gmcast, grp_port, false, true,
+                                  &ctx->recv_grp, params->logger) != 0)
+            goto fail;
+        if (net_transport_ip_join_mcast(ctx->recv_grp, ipv6, gmcast, grp_port,
+                                        params->logger) != 0)
+            goto fail;
+        log_info(params->logger, "Bound group recv to %s:%d (UDP mcast)\n",
+                 gmcast, grp_port);
+    } else {
+        if (ipv6) {
+            log_error(params->logger, "IPv6 group anycast not implemented\n");
+            goto fail;
+        }
+        char gbcast_address[IPV4_ADDR_LEN];
+        cidr4_to_broadcast((char *)params->net_cfg->ip4_cidr, gbcast_address);
+        if (net_transport_ip_bind(&ctx->cfg, gbcast_address, grp_port, false, true,
+                                  &ctx->recv_grp, params->logger) != 0)
+            goto fail;
+        log_info(params->logger, "Bound group recv to %s:%d (UDP bcast)\n",
+                 gbcast_address, grp_port);
+    }
 
     /* Broadcast / mcast recv socket. SO_REUSEADDR here IS load-bearing:
      * several listeners sharing one group addr:port is the whole point, and
@@ -238,11 +264,29 @@ static int udp_send_broadcast(net_transport_ctx_t *ctx, net_channel_t channel,
             target = bcast_buf;
         }
     } else { /* NET_CHAN_GROUP */
-        target = ctx->ipv6 ? ctx->net_cfg->mcast6_addr
-                           : ctx->net_cfg->mcast4_addr;
+        if (use_mcast) {
+            target = ctx->ipv6 ? ctx->net_cfg->mcast6_addr
+                               : ctx->net_cfg->mcast4_addr;
+        } else {
+            /* Broadcast-mode transport: the group channel rides the segment
+             * broadcast just like discovery, matching recv_grp's broadcast bind
+             * in udp_open_common. Targeting mcast4_addr here (the old behavior)
+             * was undeliverable on a plain broadcast segment — an L2 bridge with
+             * no multicast router/querier drops it — so Increment-7 group
+             * multicast (feed posts) never left the node. */
+            if (ctx->ipv6)
+                return -1;  /* no IPv6 broadcast */
+            cidr4_to_broadcast((char *)ctx->net_cfg->ip4_cidr, bcast_buf);
+            target = bcast_buf;
+        }
     }
     if (target == NULL || target[0] == '\0')
         return -1;
+
+    /* The group channel listens on the group port (base+1); the caller passes the
+     * base port for every channel, so bump it here for NET_CHAN_GROUP to reach the
+     * peers' recv_grp sockets. */
+    int send_port = (channel == NET_CHAN_GROUP) ? port + 1 : port;
 
     int sock = socket(ctx->cfg.domain, SOCK_DGRAM, IPPROTO_UDP);
     if (sock == -1)
@@ -254,7 +298,7 @@ static int udp_send_broadcast(net_transport_ctx_t *ctx, net_channel_t channel,
      * broadcast on the cast socket. */
     (void)net_transport_ip_bind_source(sock, ctx->local_addr, ctx->cfg.domain,
                                        false, ctx->logger);
-    int ret = udp_send(sock, wire, wire_len, target, port, ctx->ipv6, ctx->logger);
+    int ret = udp_send(sock, wire, wire_len, target, send_port, ctx->ipv6, ctx->logger);
     close(sock);
     return ret;
 }
