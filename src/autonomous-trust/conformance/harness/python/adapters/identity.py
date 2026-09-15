@@ -133,6 +133,14 @@ _TRIGGER_FC_RESTART = 'trigger_first_contact_restart'
 # the same string. See first-contact-initiate-reaches-the-hint.
 _TRIGGER_FC_INITIATE = 'trigger_first_contact_initiate'
 
+# Pseudo-function: locally block the peer named in the step payload
+# (`{"peer": <pid>}`). Block is an APP verb (AT_APP_BLOCK), not a wire message,
+# so there is no inbound to dispatch -- the step drives the production
+# block_peer() call, which records the peer so get_peer_tier clamps it to 0.
+# Purely local (no emit, no reputation tx). The C adapter recognizes the same
+# string and calls identity_block_peer. See block-local-clamp.
+_TRIGGER_BLOCK = 'trigger_block'
+
 
 @dataclass
 class _Participant:
@@ -750,12 +758,18 @@ class _Participant:
                     peer_uuid = self._uuid_for_pid(pid)
                     actual = None
                     if str(self.identity.uuid) == str(peer_uuid):
+                        # A node never blocks itself; read its own tier directly.
                         actual = int(getattr(self.identity, '_tier', 0) or 0)
                     else:
-                        for peer in self.process.peers.all:
-                            if str(getattr(peer, 'uuid', '')) == str(peer_uuid):
-                                actual = int(getattr(peer, '_tier', 0) or 0)
-                                break
+                        # Confirm the peer is known here (else the assertion is
+                        # vacuous), then read the tier THROUGH get_peer_tier so a
+                        # locally blocked peer is clamped to 0 -- exactly as C's
+                        # peer_tier observable reads identity_get_peer_tier.
+                        known = any(
+                            str(getattr(peer, 'uuid', '')) == str(peer_uuid)
+                            for peer in self.process.peers.all)
+                        if known:
+                            actual = int(self.process.get_peer_tier(peer_uuid))
                     if actual is None:
                         raise AssertionError(
                             f'{self.id}: peer_tier names {pid}, which is not '
@@ -1808,6 +1822,16 @@ class IdentityAdapter:
             # dispatch). The emitted caps_query messages are captured in
             # emit_tally; caps_query_emitted asserts the per-sweep cap.
             participant.process._periodic_caps_resync(participant.queues)
+            return participant.drain_outbox()
+        if inbound.function == _TRIGGER_BLOCK:
+            # Pseudo-function: locally block the peer the step names. Block is an
+            # app verb, not a wire message, so there is nothing to dispatch -- run
+            # the production block_peer() call; the clamp is observed via
+            # peer_tier. Mirrors the C adapter's trigger_block ->
+            # identity_block_peer.
+            spec = from_json_string(inbound.obj) if inbound.obj else {}
+            peer_uuid = participant._uuid_for_pid(str(spec.get('peer', '')))
+            participant.process.block_peer(str(peer_uuid))
             return participant.drain_outbox()
         if inbound.function in (_TRIGGER_ATTEST_PULL, _TRIGGER_ATTEST_REPLAY):
             # `participant` is the pull TARGET; from_whom is the puller.
