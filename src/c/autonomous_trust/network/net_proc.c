@@ -1423,6 +1423,8 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
         int enc = group_encrypt(grp, &plain, grp, nonce, cipher);
         free(wire);
         if (enc != 0) {
+            log_error(logger, "Network: group_encrypt failed (%d) for %s\n",
+                      enc, grp->address);
             free(cipher);
             return enc;
         }

@@ -115,6 +115,9 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
                 memcpy(ev->data.peer.operator_pubkey,
                        msg.info.peer_observed.operator_pubkey,
                        AT_APP_SIGNING_KEY_LEN);
+#ifdef AT_SOCIAL_ENABLED
+            ev->data.peer.in_group = msg.info.peer_observed.in_group;
+#endif /* AT_SOCIAL_ENABLED */
             break;
         }
         case PEER_REPUTATION:

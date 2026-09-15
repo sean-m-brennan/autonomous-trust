@@ -445,8 +445,28 @@ int group_sync_out(group_t *group, AutonomousTrust__Core__Protobuf__Identity__Gr
     proto->encryptor = malloc(sizeof(AutonomousTrust__Core__Protobuf__Identity__Encryptor));
     AutonomousTrust__Core__Protobuf__Identity__Encryptor tmp_e = AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__ENCRYPTOR__INIT;
     memcpy(proto->encryptor, &tmp_e, sizeof(tmp_e));
-    proto->encryptor->hex_seed.data = group->encryptor.public_hex;
-    proto->encryptor->hex_seed.len = crypto_box_PUBLICKEYBYTES * 2;
+    /* group_to_proto/proto_to_group is the SAME-NODE inter-process codec
+     * (msg_types.c only — never the wire; the wire uses group_to_json). The
+     * OLD code emitted only public_hex here, and group_sync_in reconstructed
+     * nothing usable — so a group propagated to a sibling process (network,
+     * reputation) arrived with a zero encryptor and could neither ENCRYPT nor
+     * DECRYPT group multicast (Increment-7 feed posts). Carry the full key: when
+     * we own the shared private, hand siblings the RAW 32-byte private (they
+     * derive the public); a public-only view sends the 64-char public hex. The
+     * length (SECRETKEYBYTES vs PUBLICKEYBYTES*2) disambiguates on read. The
+     * private stays on-node because this codec never leaves the node. Both
+     * pointers are SHARED with the group (like the old public_hex), so
+     * group_proto_free still frees neither. */
+    if (!sodium_is_zero(group->encryptor.private, crypto_box_SECRETKEYBYTES))
+    {
+        proto->encryptor->hex_seed.data = group->encryptor.private;
+        proto->encryptor->hex_seed.len = crypto_box_SECRETKEYBYTES;
+    }
+    else
+    {
+        proto->encryptor->hex_seed.data = group->encryptor.public_hex;
+        proto->encryptor->hex_seed.len = crypto_box_PUBLICKEYBYTES * 2;
+    }
     return 0;
 }
 
@@ -472,7 +492,26 @@ int group_sync_in(AutonomousTrust__Core__Protobuf__Identity__Group *proto, group
         if (entry != NULL && entry->key != NULL && entry->value != NULL)
             group_add_address(group, entry->key, entry->value);
     }
-    memcpy(group->encryptor.public_hex, proto->encryptor->hex_seed.data, crypto_box_PUBLICKEYBYTES * 2);
+    /* Mirror of group_sync_out: hex_seed carries EITHER the raw shared private
+     * (owned view, SECRETKEYBYTES bytes) OR the public-key hex (public-only
+     * view, PUBLICKEYBYTES*2 chars); the length disambiguates. Reconstruct via
+     * the same canonical helpers group_from_json uses, so the network process
+     * gets a fully usable encryptor (private + public + public_hex) and can
+     * crypto_box group multicast (Increment-7 feed posts). */
+    if (proto->encryptor->hex_seed.len == crypto_box_SECRETKEYBYTES)
+    {
+        /* Raw shared private -> canonical private-key path (crypto_scalarmult_base). */
+        char priv_hex[crypto_box_SECRETKEYBYTES * 2 + 1];
+        sodium_bin2hex(priv_hex, sizeof(priv_hex),
+                       proto->encryptor->hex_seed.data, crypto_box_SECRETKEYBYTES);
+        if (encryptor_init_from_private(&group->encryptor,
+                                        (const unsigned char *)priv_hex,
+                                        crypto_box_SECRETKEYBYTES * 2) != 0)
+            return -1;
+    }
+    else if (public_encryptor_init(&group->encryptor, proto->encryptor->hex_seed.data,
+                                   proto->encryptor->hex_seed.len) != 0)
+        return -1;
     return 0;
 }
 

@@ -52,6 +52,7 @@
 #include "config/configuration.h"
 #include "structures/data.h"
 #include "structures/map.h"
+#include "structures/array.h"
 #include "processes/processes.h"
 #include "utilities/message.h"
 #include "utilities/msg_types.h"
@@ -62,6 +63,8 @@
  * can't be assigned directly. */
 static char ID_QUERY_FN[]    = "peer_identity_query";
 static char ID_RESPONSE_FN[] = "peer_identity_response";
+static char ID_CONFIRM_FN[]  = "peer_accepted";
+static char ID_UPDATE_FN[]   = "group_key_update";
 
 /* ------------------------------------------------------------------ */
 /* Capture of resync emissions via the messaging test hook.            */
@@ -71,11 +74,21 @@ static size_t g_query_count;
 static size_t g_response_count;
 static char   g_last_query_group[UUID_STRING_LEN + 1];
 static json_t *g_last_query_have;   /* owned; freed in _end */
+#ifdef AT_SOCIAL_ENABLED
+/* Last PEER_OBSERVED emission's group-membership flag: -1 none yet, else 0/1. */
+static int g_last_peer_observed_in_group;
+#endif
 
 static int _capture_hook(const char *key, const message_type_t type,
                          generic_msg_t *msg, bool blocking)
 {
     (void)key; (void)blocking;
+#ifdef AT_SOCIAL_ENABLED
+    if (type == PEER_OBSERVED) {
+        g_last_peer_observed_in_group = msg->info.peer_observed.in_group ? 1 : 0;
+        return 0;
+    }
+#endif
     if (type != NET_MESSAGE || msg->info.net_msg.function == NULL)
         return 0;
     const char *fn = msg->info.net_msg.function;
@@ -249,6 +262,9 @@ static void _begin(void)
     g_response_count = 0;
     g_last_query_group[0] = '\0';
     g_last_query_have = NULL;
+#ifdef AT_SOCIAL_ENABLED
+    g_last_peer_observed_in_group = -1;
+#endif
     messaging_set_test_hook(_capture_hook);
 }
 
@@ -420,6 +436,166 @@ DEFINE_TEST(test_response_rejects_non_member)
 }
 END_TEST_DEFINITION()
 
+/* Craft + dispatch a peer_accepted (ID_CONFIRM) naming @p who. Envelope is
+ * {"peer": <canonical identity>, "seq": 1}, matching handle_confirm_peer. */
+static void _dispatch_confirm(process_t *proc, identity_t *who)
+{
+    public_identity_t *pub = NULL;
+    ck_assert_ret_ok(identity_publish(who, &pub));
+    json_t *ident_json = NULL;
+    ck_assert_ret_ok(public_identity_to_json(pub, &ident_json));
+    smrt_deref(pub);
+
+    json_t *payload = json_object();
+    json_object_set_new(payload, "peer", ident_json);
+    json_object_set_new(payload, "seq", json_integer(1));
+
+    generic_msg_t msg = {0};
+    msg.type = NET_MESSAGE;
+    strncpy(msg.info.net_msg.process, "identity", PROC_NAME_LEN);
+    msg.info.net_msg.function = ID_CONFIRM_FN;
+    ck_assert_ret_ok(net_msg_pack_json(&msg.info.net_msg, payload));
+    json_decref(payload);
+
+    /* A confirm that admits a real peer reaches _add_peer -> _remember_activity,
+     * which iterates the queues array (array_size derefs it) — so pass a real
+     * empty directory, not NULL. Empty means the sibling-broadcast loop is a
+     * no-op, which is all this unit needs. */
+    directory_t *queues = NULL;
+    ck_assert_ret_ok(array_create(&queues));
+    run_message_handlers(proc, queues, NET_MESSAGE, &msg);
+    array_free(queues);
+}
+
+/* Regression: a `peer_accepted` that NAMES THIS NODE (the cohort confirming us
+ * — broadcast, so it echoes back) must never add our own identity as a peer.
+ * Before the _add_peer / handle_confirm_peer self-guard this self-added,
+ * surfacing the node itself as a phantom peer + a self-connection. */
+DEFINE_TEST(test_confirm_does_not_add_self)
+{
+    _begin();
+    identity_t *me = _mk_identity("coord", "10.0.0.1");
+    process_t *proc = _mk_process(me);
+
+    _dispatch_confirm(proc, me);
+
+    ck_assert_int_eq(proc->protocol.num_peers, 0);
+    ck_assert(!_peers_contain(proc, me->uuid));
+    _end();
+}
+
+/* Positive control: a confirm naming a real OTHER identity still admits it, so
+ * the self-guard did not over-reject. */
+DEFINE_TEST(test_confirm_adds_real_peer)
+{
+    _begin();
+    identity_t *me = _mk_identity("coord", "10.0.0.1");
+    identity_t *alice = _mk_identity("alice", "10.0.0.2");
+    process_t *proc = _mk_process(me);
+
+    _dispatch_confirm(proc, alice);
+
+    ck_assert(_peers_contain(proc, alice->uuid));
+    _end();
+}
+
+/* Dispatch a group_key_update from @p member advertising group @p group_uuid_str,
+ * so handle_group_update records the peer's advertised group. from_whom is the
+ * authenticated sender = member. */
+static void _dispatch_group_update(process_t *proc, identity_t *member,
+                                   const char *group_uuid_str)
+{
+    char mu[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(member->uuid, mu);
+    json_t *addr_map = json_object();
+    json_object_set_new(addr_map, mu, json_string(member->address));
+
+    json_t *payload = json_object();
+    json_object_set_new(payload, "uuid", json_string(group_uuid_str));
+    json_object_set_new(payload, "address_map", addr_map);
+    json_object_set_new(payload, "created", json_real(0.0));
+
+    generic_msg_t msg = {0};
+    msg.type = NET_MESSAGE;
+    strncpy(msg.info.net_msg.process, "identity", PROC_NAME_LEN);
+    msg.info.net_msg.function = ID_UPDATE_FN;
+    uuid_copy(msg.info.net_msg.from_whom.uuid, member->uuid);
+    strncpy(msg.info.net_msg.from_whom.nickname, member->nickname,
+            sizeof(msg.info.net_msg.from_whom.nickname) - 1);
+    ck_assert_ret_ok(net_msg_pack_json(&msg.info.net_msg, payload));
+    json_decref(payload);
+
+    directory_t *queues = NULL;
+    ck_assert_ret_ok(array_create(&queues));
+    run_message_handlers(proc, queues, NET_MESSAGE, &msg);
+    array_free(queues);
+}
+
+/* Part B: the "in your group" flag reflects real convergence — the peer having
+ * advertised OUR group uuid — NOT mere address overlap (which is true from the
+ * mesh merge onward, during the pre-convergence split-brain). Regression for
+ * the badge lighting up before posts can flow. Non-social builds lack the flag;
+ * the emit must still run. */
+DEFINE_TEST(test_emit_peer_observed_in_group)
+{
+    _begin();
+    identity_t *me = _mk_identity("coord", "10.0.0.1");
+    identity_t *member = _mk_identity("alice", "10.0.0.2");
+    identity_t *stranger = _mk_identity("mallory", "10.9.9.9");
+    process_t *proc = _mk_process(me);
+
+    char ours[UUID_STRING_LEN + 1];
+    _group_uuid_str(proc, ours);
+
+    public_identity_t *mpub = NULL;
+    ck_assert_ret_ok(identity_publish(member, &mpub));
+
+    /* Address is in our map (mesh merge) but the peer has not advertised our
+     * group yet -> NOT in group (the split-brain false-positive we fixed). */
+    _add_group_member_addr(proc, member);
+    identity_emit_peer_observed(proc, mpub);
+#ifdef AT_SOCIAL_ENABLED
+    ck_assert_int_eq(g_last_peer_observed_in_group, 0);
+#endif
+
+    /* Peer advertises OUR group uuid -> converged -> in group. */
+    _dispatch_group_update(proc, member, ours);
+    identity_emit_peer_observed(proc, mpub);
+#ifdef AT_SOCIAL_ENABLED
+    ck_assert_int_eq(g_last_peer_observed_in_group, 1);
+#endif
+
+    /* Swap-robustness: if WE then adopt a different group (our uuid changes),
+     * the earlier record ("ours|ours") is stale — it must NOT keep counting as
+     * co-membership, even though the peer once advertised our-then-uuid. This is
+     * the mutual-adopt-swap case that a bare their==ours check gets wrong. */
+    uuid_generate(proc->protocol.group.uuid);
+    identity_emit_peer_observed(proc, mpub);
+#ifdef AT_SOCIAL_ENABLED
+    ck_assert_int_eq(g_last_peer_observed_in_group, 0);
+#endif
+
+    /* Once the peer re-advertises our NEW group uuid, co-membership holds again. */
+    char ours2[UUID_STRING_LEN + 1];
+    _group_uuid_str(proc, ours2);
+    _dispatch_group_update(proc, member, ours2);
+    identity_emit_peer_observed(proc, mpub);
+#ifdef AT_SOCIAL_ENABLED
+    ck_assert_int_eq(g_last_peer_observed_in_group, 1);
+#endif
+    smrt_deref(mpub);
+
+    /* A peer that never advertised our group stays out. */
+    public_identity_t *spub = NULL;
+    ck_assert_ret_ok(identity_publish(stranger, &spub));
+    identity_emit_peer_observed(proc, spub);
+#ifdef AT_SOCIAL_ENABLED
+    ck_assert_int_eq(g_last_peer_observed_in_group, 0);
+#endif
+    smrt_deref(spub);
+    _end();
+}
+
 RUN_TESTS(IdentityResync,
           test_query_when_sparse,
           test_no_query_when_complete,
@@ -428,4 +604,7 @@ RUN_TESTS(IdentityResync,
           test_responder_silent_when_asker_has_us,
           test_responder_silent_for_other_group,
           test_response_backfills_member,
-          test_response_rejects_non_member)
+          test_response_rejects_non_member,
+          test_confirm_does_not_add_self,
+          test_confirm_adds_real_peer,
+          test_emit_peer_observed_in_group)

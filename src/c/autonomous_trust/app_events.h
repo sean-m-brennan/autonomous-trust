@@ -168,6 +168,13 @@ typedef struct {
      *  is: a guardian identity on a node with no verified human is a
      *  contradiction. */
     uint8_t operator_pubkey[AT_APP_SIGNING_KEY_LEN];
+#ifdef AT_SOCIAL_ENABLED
+    /** True iff this peer shares OUR group (its address is in our group's
+     *  address_map). The app surfaces it as an "in your group" indicator,
+     *  distinct from an explicit connection edge. Appended LAST; social builds
+     *  only, so a non-social consumer's field offsets are unchanged. */
+    bool    in_group;
+#endif /* AT_SOCIAL_ENABLED */
 } at_app_peer_t;
 
 /** One peer's earned reputation. Mirrors `peer_reputation_msg_t`. */

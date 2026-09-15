@@ -154,6 +154,13 @@ bool identity_get_last_post(const char *uuid_str, char *post_id_buf,
  *  `social_tx_last` expected_state key. */
 bool identity_get_last_social_tx(const char *uuid_str, char *task_out,
                                  double *score_out);
+
+/** Conformance/test seam: locally block @p uuid_str (lowercased peer uuid), the
+ *  same record handle_app_block writes, callable without assembling an app
+ *  message so a conformance step can drive the clamp. identity_get_peer_tier
+ *  then returns 0 for this peer. Purely local — no wire, no reputation tx. Twin
+ *  of Python IdentityProcess.block_peer. */
+void identity_block_peer(const char *uuid_str);
 #endif /* AT_SOCIAL_ENABLED */
 
 /** Copy the size-bounded capability descriptor recorded for @p cap_name (from

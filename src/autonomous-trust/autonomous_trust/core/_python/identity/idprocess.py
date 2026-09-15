@@ -2106,8 +2106,35 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 with self.lock:
                     self.merging = False
                 return
-            self.group, hist = accepted
-            self.logger.info('Merging self-bootstrap into mesh group %s', getattr(self.group, 'nickname', '?'))
+            # Deterministic convergence: two nodes that self-bootstrap at the same
+            # time each receive the OTHER's group here and, adopting it blindly,
+            # SWAP groups — they stay split (different uuids + keys) until partition
+            # recovery breaks the tie much later, so the first post can't decrypt.
+            # Pick ONE winner with the same rule handle_group_update uses (older
+            # `created` wins; uuid breaks the tie), computed identically on both
+            # nodes over the same two groups, so they converge — with its key — now.
+            cand_group, cand_hist = accepted
+            mine = self.group
+            cand_created = getattr(cand_group, 'created', 0.0) or 0.0
+            mine_created = (getattr(mine, 'created', 0.0) or 0.0) if mine is not None else 0.0
+            both_aged = cand_created > 0.0 and mine_created > 0.0
+            if mine is None:
+                adopt_cand = True
+            elif both_aged and cand_created < mine_created:
+                adopt_cand = True  # candidate older -> absorbs us
+            elif both_aged and cand_created > mine_created:
+                adopt_cand = False  # candidate younger -> keep ours
+            else:
+                adopt_cand = str(cand_group.uuid) < str(mine.uuid)  # uuid tiebreak
+            if adopt_cand:
+                self.group, hist = cand_group, cand_hist
+                self.logger.info('Merging self-bootstrap into mesh group %s',
+                                 getattr(self.group, 'nickname', '?'))
+            else:
+                hist = cand_hist
+                self.logger.info('Kept our group %s over merge candidate %s '
+                                 '(deterministic tiebreak)',
+                                 str(mine.uuid), str(cand_group.uuid))
             self._record_group(queues)
             # Partition-recovery cleanup: this is the typical exit path for a successful
             # partition-recovery probe → request_access → full_history round-trip (see
@@ -2115,6 +2142,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             self._partition_recovery_in_progress = None
             self._partition_probe_cooldown.clear()
             self._populate_peers_from_history(queues, list(unioned_peers.values()))
+            # Re-advertise our settled group to every peer so they record our
+            # post-merge group promptly (parity with C _merge_to_mesh). The merge
+            # WINNER never adopts again, so without this a peer could be left
+            # holding only our PRE-merge advertisement. A receiver already on this
+            # group records it and no-ops (no ID_UPDATE ping-pong).
+            if self.group is not None:
+                self._update_group(queues, self.group, self.peers.mid_level)
             # We were not a member of the new group; do NOT send a
             # history_diff here. Re-announce on the open channel so a BG
             # admits us through welcoming_committee. The subsequent
@@ -4036,6 +4070,28 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         with self.lock:
             return dict(self.social_tx_last.get(str(uuid_str), {}))
 
+    def block_peer(self, uuid_str):
+        """Locally block a peer (Increment 8): record it so ``get_peer_tier``
+        clamps its tier to 0 for our own tier-gates. App-driven and PURELY LOCAL
+        — nothing on the wire, no reputation transaction. Twin of C
+        ``handle_app_block`` / ``identity_block_peer`` (id_proc.c)."""
+        with self.lock:
+            self.social_blocks.add(str(uuid_str))
+
+    def get_peer_tier(self, uuid):
+        """This node's local-view trust tier for peer ``uuid``, CLAMPED to 0 if
+        the peer is locally blocked (Increment 8). Unknown peer => 0. Twin of C
+        ``identity_get_peer_tier``: the tier-gate reads run through here so a
+        block clamps the same way on both runtimes."""
+        key = str(uuid)
+        with self.lock:
+            if key in self.social_blocks:
+                return 0
+            for peer in self.peers.all:
+                if str(getattr(peer, 'uuid', '')) == key:
+                    return int(getattr(peer, '_tier', 0) or 0)
+        return 0
+
     def handle_reaction(self, queues, message):
         """An inbound reaction to one of OUR posts — {post_id, seq, ts}:
         freshness-checked (per-sender replay guard), then accrued (author side).
@@ -4140,7 +4196,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 return True
             # Tier-gate: deliver only if this node's view of the author's tier
             # meets the post's required audience floor (unknown author => tier 0).
-            author_tier = (getattr(peer, '_tier', 0) or 0) if peer is not None else 0
+            # Read THROUGH get_peer_tier so a locally blocked author is clamped to
+            # 0 here exactly as C's post handler reads identity_get_peer_tier.
+            author_tier = self.get_peer_tier(author) if peer is not None else 0
             if author_tier < int(tier):
                 self.logger.debug(
                     'peer_post from %s tier-gated (need %d, have %d)',
