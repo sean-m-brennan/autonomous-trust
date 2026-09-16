@@ -58,6 +58,7 @@
 #include "utilities/msg_types.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/allocation.h"
+#include "utilities/util.h"
 
 /* Mutable storage: net_msg_t.function is `char *`, so a const string literal
  * can't be assigned directly. */
@@ -520,8 +521,8 @@ static void _dispatch_group_update(process_t *proc, identity_t *member,
     strncpy(msg.info.net_msg.process, "identity", PROC_NAME_LEN);
     msg.info.net_msg.function = ID_UPDATE_FN;
     uuid_copy(msg.info.net_msg.from_whom.uuid, member->uuid);
-    strncpy(msg.info.net_msg.from_whom.nickname, member->nickname,
-            sizeof(msg.info.net_msg.from_whom.nickname) - 1);
+    at_strlcpy(msg.info.net_msg.from_whom.nickname, member->nickname,
+               sizeof(msg.info.net_msg.from_whom.nickname));
     ck_assert_ret_ok(net_msg_pack_json(&msg.info.net_msg, payload));
     json_decref(payload);
 

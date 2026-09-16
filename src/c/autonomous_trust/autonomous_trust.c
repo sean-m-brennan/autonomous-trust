@@ -168,6 +168,21 @@ int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
                 log_exception(logger);
             return 0;
         }
+        if (fn != NULL && (strcmp(fn, AT_APP_REQUEST_ATTEND) == 0
+                           || strcmp(fn, AT_APP_SET_EXACT_POSITION) == 0
+                           || strcmp(fn, AT_APP_REQUEST_PROXIMITY) == 0))
+        {
+            /* Phase 2: presence pull (request_attend → nonce-fresh attest query),
+             * opt-in LOCAL-ONLY exact position (set_exact_position), and the
+             * pairwise private-proximity probe (request_proximity). All forwarded
+             * ONLY to identity, which owns the attest/position/proximity paths. */
+            generic_msg_t fwd = *msg;
+            snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
+                     "%s", "identity");
+            if (messaging_send("identity", NET_MESSAGE, &fwd, false) != 0)
+                log_exception(logger);
+            return 0;
+        }
 #endif /* AT_SOCIAL_ENABLED */
         log_warn(logger, "AutonomousTrust: refused extern net_msg '%s'\n",
                  fn == NULL ? "(none)" : fn);
@@ -254,13 +269,15 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
              * too, or the identity process emits it to AT_MAIN_QUEUE and it is
              * silently dropped at this drain instead of reaching the app queue:
              * connection edges (Increment 5 — the inbound-request ASK and every
-             * edge-state change), DMs (Increment 6), feed posts (Increment 7), and
-             * post reactions (Increment 8). */
+             * edge-state change), DMs (Increment 6), feed posts (Increment 7),
+             * post reactions (Increment 8), and the private-proximity band
+             * (Phase 2). */
             case PEER_CONNECTION_REQUEST_OBSERVED:
             case PEER_CONNECTION_STATE_OBSERVED:
             case PEER_DM_OBSERVED:
             case PEER_POST_OBSERVED:
             case PEER_REACTION_OBSERVED:
+            case PEER_PROXIMITY_OBSERVED:
 #endif /* AT_SOCIAL_ENABLED */
                 if (q_out == NULL)
                     break;   /* no app attached; nothing to do */
