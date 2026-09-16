@@ -60,6 +60,7 @@ typedef enum {
     PEER_DM_OBSERVED,        /**< Identity → app: a directed text message received from a peer (Increment 6, @ref peer_dm_msg_t). Local IPC only. Live stream — delivered on arrival, never roster state. */
     PEER_POST_OBSERVED,      /**< Identity → app: a signed feed post received over the group channel (Increment 7, @ref peer_post_msg_t). Local IPC only. Signature-verified, tier-gated and content-id-deduped before emit. */
     PEER_REACTION_OBSERVED,  /**< Identity → app: a peer reacted to one of our posts (Increment 8, @ref peer_reaction_msg_t). Local IPC only. Live stream — delivered on arrival. */
+    PEER_PROXIMITY_OBSERVED, /**< Identity → app: the coarse distance BAND to a CONNECTED peer, learned by a private-proximity probe (Phase 2, @ref peer_proximity_msg_t). Local IPC only. No coordinates — only the band. */
 #endif /* AT_SOCIAL_ENABLED */
 #ifdef AT_ZTA_ENABLED
     ZTA_REVOCATION_ALERT,    /**< Peer credential revocation notice. */
@@ -317,6 +318,18 @@ typedef struct {
     char   geohash[AT_GEOHASH_MAX_LEN + 1];
 } peer_position_msg_t;
 
+/*
+ * A private-proximity result (Phase 2): the coarse distance BAND to one
+ * CONNECTED peer, learned by exchanging pairwise-keyed grid tags. Carries NO
+ * coordinates — only the band (see at_prox_band_t: 0 unknown, 1 near, 2 mid,
+ * 3 far). Local IPC only; the on-wire exchange is the directed encrypted
+ * peer_proximity_probe/reply, not this message.
+ */
+typedef struct {
+    uuid_t peer_uuid;
+    int    band; /**< at_prox_band_t */
+} peer_proximity_msg_t;
+
 /* Max bytes of the compact profile JSON carried across the AT->app boundary
  * (the sanitized field object; the signature stays in the core). MUST match
  * AT_PROFILE_JSON_MAX in identity/profile.h and AT_APP_PROFILE_JSON_LEN in
@@ -523,6 +536,7 @@ typedef struct
         peer_dm_msg_t peer_dm;
         peer_post_msg_t peer_post;
         peer_reaction_msg_t peer_reaction;
+        peer_proximity_msg_t peer_proximity;
 #endif /* AT_SOCIAL_ENABLED */
 #ifdef AT_ZTA_ENABLED
         zta_event_msg_t zta_event;

@@ -135,7 +135,13 @@ typedef enum {
      *  authenticated the reactor, so @c reaction.peer_uuid is trustworthy. It is
      *  the return signal a fire-and-forget post lacks, and it accrues reputation
      *  for both peers. Delivered on arrival — a live stream. */
-    AT_APP_EVENT_REACTION = 10
+    AT_APP_EVENT_REACTION = 10,
+
+    /** The coarse distance BAND to a CONNECTED peer (@c proximity; Phase 2),
+     *  learned by a private-proximity probe. Carries only the band (near / mid /
+     *  far), never coordinates — the exact position never crosses this boundary.
+     *  Emitted for both sides of a probe once tags are exchanged. */
+    AT_APP_EVENT_PROXIMITY = 11
 #endif /* AT_SOCIAL_ENABLED */
 } at_app_event_kind_t;
 
@@ -207,6 +213,15 @@ typedef struct {
      *  its own opted-in bucket. */
     char    geohash[AT_APP_GEOHASH_LEN + 1];
 } at_app_position_t;
+
+/** The coarse distance BAND to a CONNECTED peer (Phase 2). Mirrors
+ *  `peer_proximity_msg_t`. No coordinates — only the band. */
+typedef struct {
+    uint8_t peer_uuid[AT_APP_UUID_LEN];
+    /** 0 = unknown (a side had no exact position), 1 = near (~1 km), 2 = mid
+     *  (~5 km), 3 = far. Matches at_prox_band_t. */
+    int32_t band;
+} at_app_proximity_t;
 
 /** One peer's shared agora.profile. Mirrors `peer_profile_msg_t`. */
 typedef struct {
@@ -288,6 +303,7 @@ typedef struct {
         at_app_dm_t         dm;
         at_app_post_t       post;
         at_app_reaction_t   reaction;
+        at_app_proximity_t  proximity;
 #endif /* AT_SOCIAL_ENABLED */
     } data;
 } at_app_event_t;
@@ -432,6 +448,52 @@ int at_app_events_connect_request(at_app_events_t *handle, const char *q_out,
 int at_app_events_connect_respond(at_app_events_t *handle, const char *q_out,
                                   const uint8_t peer_uuid[AT_APP_UUID_LEN],
                                   bool accept);
+
+/**
+ * @brief Pull a fresh operator-attendance attestation from a peer NOW (Phase 2,
+ *        presence).
+ *
+ * Sends the app→AT `AT_APP_REQUEST_ATTEND` verb on @p q_out. @p peer_uuid is the
+ * peer to probe. The identity process issues a nonce-fresh operator_attest_query
+ * to that peer and, on the response, updates the peer's operator_attested_at and
+ * re-emits an AT_APP_EVENT_PEER_OBSERVED so the app's presence indicator
+ * refreshes. Fire-and-forget: no direct return event, the refresh rides the
+ * next peer-observed.
+ *
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound yet,
+ *         -1 on any other failure.
+ */
+int at_app_events_request_attend(at_app_events_t *handle, const char *q_out,
+                                 const uint8_t peer_uuid[AT_APP_UUID_LEN]);
+
+/**
+ * @brief Set or clear THIS node's opt-in EXACT position (Phase 2, private
+ *        proximity).
+ *
+ * Sends the app→AT `AT_APP_SET_EXACT_POSITION` verb on @p q_out. When @p opt_in
+ * is true the (@p lat, @p lon) degrees are stored; when false the exact position
+ * is cleared (opt out). The identity process keeps it LOCAL-ONLY and never
+ * advertises it — it feeds only the pairwise proximity probe.
+ *
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound yet,
+ *         -1 on any other failure.
+ */
+int at_app_events_set_exact_position(at_app_events_t *handle, const char *q_out,
+                                     bool opt_in, double lat, double lon);
+
+/**
+ * @brief Run a private-proximity probe against a CONNECTED peer (Phase 2).
+ *
+ * Sends the app→AT `AT_APP_REQUEST_PROXIMITY` verb on @p q_out. @p peer_uuid is
+ * the connected peer. The identity process exchanges pairwise-keyed grid tags so
+ * both sides learn only a coarse distance BAND (an AT_APP_EVENT_PROXIMITY),
+ * never coordinates. Fire-and-forget: the band rides a later proximity event.
+ *
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound yet,
+ *         -1 on any other failure.
+ */
+int at_app_events_request_proximity(at_app_events_t *handle, const char *q_out,
+                                    const uint8_t peer_uuid[AT_APP_UUID_LEN]);
 
 /**
  * @brief Send a directed text message to a peer (Increment 6).

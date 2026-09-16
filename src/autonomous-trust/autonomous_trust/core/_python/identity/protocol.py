@@ -128,6 +128,16 @@ class IdentityProtocol(Protocol):
     # reputation score for the same post-derived task, so the engagement accrues.
     # Encrypted, so NOT in UNENCRYPTED_VERBS.
     reaction = 'peer_reaction'  # msg.obj <- json {post_id, seq, ts}
+    # Private-proximity probe/reply (Phase 2): two CONNECTED peers exchange
+    # multi-resolution grid tags keyed by the pairwise box secret (proximity.py)
+    # so each learns only a coarse distance BAND (near/mid/far), never
+    # coordinates. Directed + ENCRYPTED (the tags are already opaque without the
+    # key, but the directed leg is encrypted like a DM), so NOT in
+    # UNENCRYPTED_VERBS. proximity_trigger is a LOCAL-ONLY IPC verb (like
+    # attest_trigger): a consumer asks us to probe one connected peer.
+    proximity_probe = 'peer_proximity_probe'      # msg.obj <- json {'salt','tags'}
+    proximity_reply = 'peer_proximity_reply'      # msg.obj <- json {'salt','tags'}
+    proximity_trigger = 'peer_proximity_trigger'  # local IPC: {'target': uuid_str}
     # Identity backfill for a node that holds a group member's address (in
     # group.addresses) but never received its full Identity — the cold/late
     # joiner case (e.g. the dod_mission coordinator: group.addresses grows via

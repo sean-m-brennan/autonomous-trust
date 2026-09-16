@@ -141,6 +141,18 @@ _TRIGGER_FC_INITIATE = 'trigger_first_contact_initiate'
 # string and calls identity_block_peer. See block-local-clamp.
 _TRIGGER_BLOCK = 'trigger_block'
 
+# Pseudo-function: drive one private-proximity probe (Phase 2) from the step's
+# `to` participant (the INITIATOR) against the peer named in the payload
+# (`{"target": <pid>}`), end to end — the local trigger emits an encrypted
+# probe, the target computes its distance BAND and replies, the initiator
+# computes the same band from the reply. A pseudo-step rather than two wire
+# steps because the probe/reply payloads are handler-COMPUTED keyed tags: the
+# salt and the tag set do not exist until the real handler runs, so no YAML
+# step could name them (contrast position, whose bucket is a fixture). The C
+# adapter recognizes the same string and drives identity_request_proximity +
+# the two directed handlers. See proximity-band-near / proximity-absent-is-normal.
+_TRIGGER_PROXIMITY_PROBE = 'trigger_proximity_probe'
+
 
 @dataclass
 class _Participant:
@@ -440,6 +452,22 @@ class _Participant:
                         raise AssertionError(
                             f'{self.id}: peer_profile[{peer_id!r}]={actual!r}, '
                             f'expected {want_obj!r}')
+            elif key == 'peer_proximity':
+                # {peer_id: <int band>} (Phase 2) -- the coarse distance BAND
+                # this participant last learned toward another CONNECTED peer,
+                # via get_peer_proximity: unknown=0, near=1, mid=2, far=3. 0 is
+                # the ordinary default (never probed, opted out, or the probe
+                # was refused). No coordinates cross; the corpus pins the band
+                # the keyed-tag intersection yields. C mirrors this via the band
+                # recorded by identity_emit_peer_proximity, keyed by the same
+                # uuid.
+                for peer_id, want in expected.items():
+                    peer_uuid = self._uuid_for_pid(peer_id)
+                    actual = self.process.get_peer_proximity(peer_uuid)
+                    if int(actual) != int(want):
+                        raise AssertionError(
+                            f'{self.id}: peer_proximity[{peer_id!r}]={int(actual)}, '
+                            f'expected {int(want)}')
             elif key == 'connection_state':
                 # {peer_id: <int>} (Increment 5) -- the connection edge state
                 # this participant holds toward another, via
@@ -608,6 +636,31 @@ class _Participant:
                 if actual != expected:
                     raise AssertionError(
                         f'{self.id}: profile_responses_emitted={actual}, '
+                        f'expected {expected}'
+                    )
+            elif key == 'proximity_probes_emitted':
+                # peer_proximity_probe emissions by this participant (Phase 2).
+                # The initiator's opt-in guard observable: an opted-OUT initiator
+                # emits 0 (proximity-absent-is-normal), an opted-IN one emits 1
+                # per trigger. This is what makes the opt-out case non-vacuous —
+                # dropping the guard would emit a probe with no own position. C
+                # mirrors by scanning captured[] for (from==self, proximity_probe).
+                actual = self.emit_tally.get(IdentityProtocol.proximity_probe, 0)
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: proximity_probes_emitted={actual}, '
+                        f'expected {expected}'
+                    )
+            elif key == 'proximity_replies_emitted':
+                # peer_proximity_reply emissions by this participant (Phase 2) --
+                # the RESPONDER's opt-in observable: a probed node that opted out
+                # emits 0 (it surfaces UNKNOWN and sends nothing back), an opted-in
+                # one emits 1 per probe answered. C mirrors by scanning captured[]
+                # for (from==self, proximity_reply).
+                actual = self.emit_tally.get(IdentityProtocol.proximity_reply, 0)
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: proximity_replies_emitted={actual}, '
                         f'expected {expected}'
                     )
             elif key == 'propose_emitted':
@@ -1430,6 +1483,33 @@ class IdentityAdapter:
                 from autonomous_trust.core.capabilities import sanitize_profile
                 raw = prof_fix[pid] if isinstance(prof_fix[pid], dict) else {}
                 participant.process.own_profile = sanitize_profile(raw)
+            # Install own opt-in EXACT position from fixtures.exact_positions
+            # (Phase 2, private proximity), as {pid: [lat, lon]}; mirrors the C
+            # adapter's `identity_set_exact_position` seam. LOCAL-ONLY — it never
+            # advertises, and feeds only the pairwise distance-band probe. Absent
+            # (the default) leaves own_exact None: opted OUT, no probe, no band.
+            exact_fix: dict[str, Any] = fixtures.get('exact_positions', {}) or {}
+            if pid in exact_fix:
+                coord = exact_fix[pid]
+                if (isinstance(coord, (list, tuple)) and len(coord) == 2):
+                    participant.process.own_exact = (float(coord[0]),
+                                                     float(coord[1]))
+            # Pre-seed CONNECTED edges from fixtures.connections, as
+            # {pid: [other_pid, ...]}: sets connection_edges[other]=CONNECTED
+            # directly, standing in for a completed request/accept exchange so a
+            # scenario that only exercises a DOWNSTREAM feature (proximity, which
+            # is connected-peers-only) need not re-run the connection handshake.
+            # Mirrors the C adapter's identity_set_connection_state seam.
+            conn_fix: dict[str, list] = fixtures.get('connections', {}) or {}
+            if pid in conn_fix:
+                from autonomous_trust.core.capabilities import CONN_CONNECTED
+                for other_pid in conn_fix[pid]:
+                    if other_pid not in identities:
+                        raise AssertionError(
+                            f'fixtures.connections names unknown participant '
+                            f'{other_pid!r}')
+                    other_uuid = str(identities[other_pid].uuid)
+                    participant.process.connection_edges[other_uuid] = CONN_CONNECTED
             # Inject N synthetic cap-less peers (fixtures.capless_peers[pid])
             # directly into this participant's roster: present in self.peers but
             # absent from peer_capabilities -- exactly the state the periodic
@@ -1813,6 +1893,52 @@ class IdentityAdapter:
         if sample is not None:
             puller.attest_clock_samples[target.id] = sample
 
+    def _run_proximity_probe(self, initiator: _Participant,
+                             target: _Participant) -> None:
+        """One private-proximity probe (Phase 2), end to end, inside the harness.
+
+        The band is not a value a step can supply: each side derives keyed grid
+        tags from its own opt-in exact position and the pairwise box secret, and
+        the two only learn a band by INTERSECTING tag sets. So the harness drives
+        the real chain of three handlers rather than pre-baking a payload:
+
+          1. a local proximity_trigger on the initiator -> emits an encrypted
+             probe ({salt, tags}) addressed to the target;
+          2. the target's handle_proximity_probe records its band and, if it too
+             opted in, replies with its own tags under the same salt;
+          3. the initiator's handle_proximity_reply records the same band.
+
+        Either side opting out short-circuits: an opted-out initiator emits no
+        probe (nothing to compare), an opted-out target records UNKNOWN and sends
+        no reply. The emit tallies (proximity_probes/replies_emitted) and the
+        recorded bands (peer_proximity) are what the scenario asserts. C reaches
+        the identical outcome through identity_request_proximity + its two
+        directed handlers.
+        """
+        # Local IPC trigger on the initiator, naming the target by uuid exactly
+        # as the app's AT_APP_REQUEST_PROXIMITY would.
+        trig = Message(CfgIds.identity, IdentityProtocol.proximity_trigger,
+                       to_json_string({'target': str(target.identity.uuid)}),
+                       from_whom=initiator.identity)
+        initiator.process.protocol.run_message_handlers(initiator.queues, trig)
+        probes = [c for c in initiator.drain_outbox()
+                  if c.function == IdentityProtocol.proximity_probe]
+        if not probes:
+            return  # initiator opted out: no probe, no band on either side
+        # Deliver the encrypted probe to the target: it computes and records its
+        # band, and replies with its own tags if it opted in too.
+        target.process.protocol.run_message_handlers(target.queues,
+                                                      probes[0].raw)
+        replies = [c for c in target.drain_outbox()
+                   if c.function == IdentityProtocol.proximity_reply]
+        if not replies:
+            return  # target opted out: it surfaced UNKNOWN and sent nothing back
+        # Deliver the reply to the initiator: it recomputes under the echoed salt
+        # and records the same band.
+        initiator.process.protocol.run_message_handlers(initiator.queues,
+                                                        replies[0].raw)
+        initiator.drain_outbox()
+
     def _dispatch(self, participant: _Participant, inbound: Any) -> list[CapturedMessage]:
         if not isinstance(inbound, Message):
             raise AssertionError(f'expected a Message, got {type(inbound).__name__}')
@@ -1832,6 +1958,17 @@ class IdentityAdapter:
             spec = from_json_string(inbound.obj) if inbound.obj else {}
             peer_uuid = participant._uuid_for_pid(str(spec.get('peer', '')))
             participant.process.block_peer(str(peer_uuid))
+            return participant.drain_outbox()
+        if inbound.function == _TRIGGER_PROXIMITY_PROBE:
+            # `participant` is the probe TARGET; from_whom is the INITIATOR (the
+            # step's `from`). Run the whole probe/reply round trip through the
+            # real handlers, so the band both sides record is the one the
+            # keyed-tag intersection actually yields — the payloads are computed,
+            # not harness-supplied. Mirrors the trigger_attest_pull shape.
+            initiator = self._roster_by_uuid.get(str(inbound.from_whom.uuid))
+            if initiator is None:
+                raise AssertionError('proximity probe: unknown initiator')
+            self._run_proximity_probe(initiator, participant)
             return participant.drain_outbox()
         if inbound.function in (_TRIGGER_ATTEST_PULL, _TRIGGER_ATTEST_REPLAY):
             # `participant` is the pull TARGET; from_whom is the puller.
