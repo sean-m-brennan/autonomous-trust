@@ -32,6 +32,7 @@ from nacl.exceptions import BadSignatureError
 from nacl.signing import SignedMessage
 
 from . import Peers
+from . import proximity
 from .identity import Identity, public_identity_to_canonical, public_identity_from_canonical
 from .operator_binding import (OPERATOR_BINDING_MAX, OPERATOR_PUBKEY_LEN,
                                verify_operator_binding)
@@ -383,6 +384,23 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         _own_geo = os.environ.get('AT_OWN_GEOHASH', '')
         self.own_geohash = _own_geo if self._geohash_valid(_own_geo) else ''
         self.peer_positions: dict = {}
+        # Opt-in EXACT position (Phase 2, private proximity): (lat, lon) degrees,
+        # or None = opted out (the default). LOCAL-ONLY — never advertised; it
+        # feeds only the pairwise distance-band probe with connected peers. Seeded
+        # from $AT_OWN_EXACT ("lat,lon") for headless/conformance parity with C
+        # (the app IPC set-path is C-only, like own_geohash). peer_proximity maps
+        # a peer uuid string -> the last band learned (int; see proximity.ProxBand),
+        # the conformance surface (get_peer_proximity), twin of the C emit.
+        self.own_exact = None
+        _own_exact_raw = os.environ.get('AT_OWN_EXACT', '')
+        if _own_exact_raw:
+            try:
+                _la, _lo = (float(v) for v in _own_exact_raw.split(',', 1))
+                if -90.0 <= _la <= 90.0 and -180.0 <= _lo <= 180.0:
+                    self.own_exact = (_la, _lo)
+            except (ValueError, TypeError):
+                self.own_exact = None
+        self.peer_proximity: dict = {}
         # Opt-in agora.profile (Increment 3): own_profile is THIS node's shared,
         # signed profile fields; empty = opted OUT (the default). Seeded from
         # $AT_OWN_PROFILE (a JSON object) for headless/conformance parity with C
@@ -448,6 +466,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.caps_response, self.handle_caps_response)
         self.protocol.register_handler(IdentityProtocol.position_query, self.handle_position_query)
         self.protocol.register_handler(IdentityProtocol.position_response, self.handle_position_response)
+        self.protocol.register_handler(IdentityProtocol.proximity_trigger, self.handle_proximity_trigger)
+        self.protocol.register_handler(IdentityProtocol.proximity_probe, self.handle_proximity_probe)
+        self.protocol.register_handler(IdentityProtocol.proximity_reply, self.handle_proximity_reply)
         self.protocol.register_handler(IdentityProtocol.profile_query, self.handle_profile_query)
         self.protocol.register_handler(IdentityProtocol.profile_response, self.handle_profile_response)
         self.protocol.register_handler(IdentityProtocol.connection_request, self.handle_connection_request)
@@ -3694,6 +3715,209 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         Conformance/assertion surface; twin of C ``identity_get_peer_position``."""
         with self.lock:
             return self.peer_positions.get(str(uuid_str), '')
+
+    # ------------------------------------------------------------------
+    # Private proximity (Phase 2): two CONNECTED peers learn a coarse distance
+    # BAND (near / mid / far) without revealing coordinates. Twin of the C block
+    # in id_proc.c (handle_request_proximity / handle_proximity_probe /
+    # handle_proximity_reply). The tag math lives in proximity.py and is a
+    # byte-identical cross-language contract with proximity.c.
+    #
+    # STRICTLY OPT-IN and LOCAL-ONLY: own_exact (set via $AT_OWN_EXACT here, the
+    # app IPC set-path being C-only) never leaves this node — it feeds only the
+    # pairwise keyed tags. Unlike the position/profile exchange there is NO
+    # freshness/seq: the per-probe random salt is the anti-replay, so a captured
+    # {salt, tags} reveals nothing and re-injecting it recomputes the same band.
+    # As with position, the app-facing PEER_PROXIMITY_OBSERVED emit is the C
+    # runtime's job; a Python node maintains peer_proximity (the conformance
+    # surface, get_peer_proximity, twin of the C emit's recorded band).
+    # proximity_trigger is a LOCAL-ONLY IPC verb (twin of attest_trigger): a
+    # consumer asks us to probe one connected peer.
+    # ------------------------------------------------------------------
+
+    def _proximity_peer_connected(self, uuid_str):
+        """True iff we hold a CONNECTED edge toward the peer (Increment 5).
+        Proximity only ever runs against a peer both sides consented to
+        connect with; twin of C ``_proximity_peer_connected``."""
+        from ..capabilities import CONN_CONNECTED
+        return self.get_connection_state(uuid_str) == CONN_CONNECTED
+
+    def _proximity_own_tags(self, peer, salt):
+        """This node's proximity tag set toward ``peer`` under ``salt``, from our
+        opt-in exact position and the pairwise box secret (beforenm over our
+        X25519 secret and the peer's public key). Returns the tag list, or None
+        if we opted out (no exact position) or key/tag derivation fails. The
+        exact position never leaves here. Twin of C ``_proximity_own_tags``."""
+        with self.lock:
+            own = self.own_exact
+        if own is None:
+            return None
+        lat, lon = own
+        try:
+            key = proximity.derive_key(peer.encryptor.public,
+                                       self.identity.encryptor.private)
+            return proximity.compute_tags(lat, lon, key, salt)
+        except Exception as err:
+            self.report_exception(err, '_proximity_own_tags')
+            return None
+
+    def _send_proximity_msg(self, queues, peer, verb, salt, tags):
+        """Send a directed, ENCRYPTED proximity message ({salt, tags}) to ``peer``
+        under ``verb`` (proximity_probe or proximity_reply). Twin of C
+        ``_send_proximity_msg``."""
+        try:
+            payload = to_json_string({'salt': salt.hex(),
+                                      'tags': proximity.tags_to_hex(tags)})
+            out = Message(self.name, verb, payload,
+                          to_whom=peer, from_whom=self.identity, encrypt=True)
+            queues[CfgIds.network].put(out, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('_send_proximity_msg: Network queue full')
+        except Exception as err:
+            self.report_exception(err, '_send_proximity_msg')
+
+    def _proximity_parse(self, message):
+        """Parse {salt, tags} from a probe/reply body. Returns (salt_bytes,
+        their_tags) on a well-formed message, else (None, None). Twin of C
+        ``_proximity_parse``."""
+        try:
+            body = from_json_string(message.obj)
+        except Exception:
+            return None, None
+        if not isinstance(body, dict):
+            return None, None
+        salt_hex = body.get('salt')
+        if not isinstance(salt_hex, str):
+            return None, None
+        try:
+            salt = bytes.fromhex(salt_hex)
+        except (ValueError, TypeError):
+            return None, None
+        if len(salt) != proximity.SALT_LEN:
+            return None, None
+        their_tags = proximity.tags_from_hex(body.get('tags'))
+        if their_tags is None:
+            return None, None
+        return salt, their_tags
+
+    def handle_proximity_trigger(self, queues, message):
+        """A consumer asked us to run a private-proximity probe against one
+        CONNECTED peer. Local-only verb (never leaves this node); twin of C
+        ``handle_request_proximity``. Payload {'target': '<uuid_str>'}."""
+        if message.function != IdentityProtocol.proximity_trigger:
+            return False
+        try:
+            payload = message.obj
+            if isinstance(payload, str):
+                payload = from_json_string(payload)
+            if not isinstance(payload, dict):
+                return True
+            target_uuid = payload.get('target')
+            if not target_uuid:
+                return True
+            if not self._proximity_peer_connected(target_uuid):
+                self.logger.warning(
+                    'proximity_trigger: %s not connected; refusing',
+                    str(target_uuid)[:8])
+                return True
+            peer = None
+            try:
+                peer = self.peers.find_by_uuid(str(target_uuid)) if self.peers else None
+            except Exception:
+                peer = None
+            if peer is None:
+                return True
+            salt = os.urandom(proximity.SALT_LEN)
+            tags = self._proximity_own_tags(peer, salt)
+            if tags is None:
+                self.logger.info(
+                    'proximity_trigger: no own exact position; opted out')
+                return True
+            self._send_proximity_msg(queues, peer,
+                                     IdentityProtocol.proximity_probe, salt, tags)
+            self.logger.debug('sent proximity probe to %s',
+                              str(target_uuid)[:8])
+        except Exception as err:
+            self.report_exception(err, 'handle_proximity_trigger')
+        return True
+
+    def handle_proximity_probe(self, queues, message):
+        """Responder: a connected peer's proximity probe. Compute our band from
+        our tags + theirs under the probe's salt, record it, and reply with our
+        tags so the initiator learns the same band. Twin of C
+        ``handle_proximity_probe``."""
+        if message.function != IdentityProtocol.proximity_probe:
+            return False
+        sender = getattr(message, 'from_whom', None)
+        if sender is None:
+            return True
+        key = str(getattr(sender, 'uuid', None))
+        if not self._proximity_peer_connected(key):
+            self.logger.debug(
+                'proximity_probe from non-connected %s; ignoring', key[:8])
+            return True
+        try:
+            salt, their_tags = self._proximity_parse(message)
+            if salt is None:
+                self.logger.warning('malformed proximity_probe from %s', key[:8])
+                return True
+            our_tags = self._proximity_own_tags(sender, salt)
+            if our_tags is None:
+                # Opted out of exact position: cannot compute a band. Record
+                # unknown for our side; do not reply (nothing to compare).
+                with self.lock:
+                    self.peer_proximity[key] = int(proximity.ProxBand.UNKNOWN)
+                return True
+            band = proximity.band(our_tags, their_tags)
+            with self.lock:
+                self.peer_proximity[key] = int(band)
+            self._send_proximity_msg(queues, sender,
+                                     IdentityProtocol.proximity_reply,
+                                     salt, our_tags)
+            self.logger.debug('proximity band %d with %s (probe)',
+                              int(band), key[:8])
+        except Exception as err:
+            self.report_exception(err, 'handle_proximity_probe')
+        return True
+
+    def handle_proximity_reply(self, queues, message):
+        """Initiator: the reply to our probe. Recompute our tags under the
+        (echoed) salt, compare with theirs, record the band. Twin of C
+        ``handle_proximity_reply``."""
+        if message.function != IdentityProtocol.proximity_reply:
+            return False
+        sender = getattr(message, 'from_whom', None)
+        if sender is None:
+            return True
+        key = str(getattr(sender, 'uuid', None))
+        if not self._proximity_peer_connected(key):
+            return True
+        try:
+            salt, their_tags = self._proximity_parse(message)
+            if salt is None:
+                self.logger.warning('malformed proximity_reply from %s', key[:8])
+                return True
+            our_tags = self._proximity_own_tags(sender, salt)
+            if our_tags is None:
+                with self.lock:
+                    self.peer_proximity[key] = int(proximity.ProxBand.UNKNOWN)
+                return True
+            band = proximity.band(our_tags, their_tags)
+            with self.lock:
+                self.peer_proximity[key] = int(band)
+            self.logger.debug('proximity band %d with %s (reply)',
+                              int(band), key[:8])
+        except Exception as err:
+            self.report_exception(err, 'handle_proximity_reply')
+        return True
+
+    def get_peer_proximity(self, uuid_str):
+        """The last coarse distance band learned for a peer uuid, or UNKNOWN (0)
+        if none. Conformance/assertion surface; twin of the C emit's recorded
+        band (identity_emit_peer_proximity)."""
+        with self.lock:
+            return self.peer_proximity.get(str(uuid_str),
+                                           int(proximity.ProxBand.UNKNOWN))
 
     # ------------------------------------------------------------------
     # Opt-in agora.profile (Increment 3): SIGNED directed exchange.

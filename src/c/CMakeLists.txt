@@ -557,6 +557,7 @@ if(AT_SOCIAL)
         autonomous_trust/identity/dm.c
         autonomous_trust/identity/post.c
         autonomous_trust/identity/social_tx.c
+        autonomous_trust/identity/proximity.c
     )
 endif()
 
@@ -1118,6 +1119,10 @@ if(AT_SOCIAL)
     add_executable(social_tx_test test/social_tx_test.c)
     set_source_files_properties(test/social_tx_test.c PROPERTIES COMPILE_FLAGS "-Wall")
     target_link_libraries(social_tx_test PRIVATE ${AT_TEST_LIBS})
+
+    add_executable(proximity_test test/proximity_test.c)
+    set_source_files_properties(test/proximity_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(proximity_test PRIVATE ${AT_TEST_LIBS})
 endif() # AT_SOCIAL
 
 add_executable(identity_resync_test test/identity_resync_test.c)
@@ -1259,6 +1264,7 @@ if(AT_SOCIAL)
     add_test(NAME connection_test COMMAND $<TARGET_FILE:connection_test>)
     add_test(NAME dm_test COMMAND $<TARGET_FILE:dm_test>)
     add_test(NAME post_test COMMAND $<TARGET_FILE:post_test>)
+    add_test(NAME proximity_test COMMAND $<TARGET_FILE:proximity_test>)
     add_test(NAME post_multicast_test COMMAND $<TARGET_FILE:post_multicast_test>)
     add_test(NAME social_tx_test COMMAND $<TARGET_FILE:social_tx_test>)
 endif() # AT_SOCIAL

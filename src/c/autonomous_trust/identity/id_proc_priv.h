@@ -124,6 +124,28 @@ bool identity_get_peer_profile(const char *uuid_str, char *buf, size_t buflen);
  *  Python IdentityProcess.get_connection_state. */
 int identity_get_connection_state(const char *uuid_str);
 
+/** Pre-seed THIS node's connection edge-state toward peer @p uuid_str (lowercased
+ *  uuid string) as an at_conn_state_t int, standing in for a completed
+ *  request/accept exchange. Conformance installs bilateral CONNECTED edges from
+ *  `fixtures.connections` so a proximity scenario (connected-peers-only) need not
+ *  re-run the handshake. Twin of the Python adapter setting connection_edges. */
+void identity_set_connection_state(const char *uuid_str, int state);
+
+/** Set (or clear) THIS node's opt-in EXACT position (Phase 2, private proximity)
+ *  in the singleton id_state. @p set false clears it (opts out, the default);
+ *  true with in-range lat/lon opts in. LOCAL-ONLY — never advertised; feeds only
+ *  the pairwise distance-band probe. The harness analog of the app's
+ *  AT_APP_SET_EXACT_POSITION IPC verb; conformance installs it from
+ *  `fixtures.exact_positions`. Twin of setting Python own_exact. */
+void identity_set_exact_position(bool set, double lat, double lon);
+
+/** The coarse distance BAND this node last learned toward peer @p uuid_str
+ *  (lowercased uuid string), as an at_prox_band_t int (Phase 2): unknown=0,
+ *  near=1, mid=2, far=3. 0 if none recorded. The map is filled by the proximity
+ *  handlers alongside the app emit; conformance asserts via the `peer_proximity`
+ *  expected_state key. Twin of Python IdentityProcess.get_peer_proximity. */
+int identity_get_peer_proximity(const char *uuid_str);
+
 /** The most-recent DM this node received from peer @p uuid_str (Increment 6).
  *  Copies the body into @p text_buf (always NUL-terminated) and, when non-NULL,
  *  the sender's freshness seq into @p seq_out. Returns true iff a DM is recorded

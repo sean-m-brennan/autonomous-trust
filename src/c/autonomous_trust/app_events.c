@@ -158,6 +158,16 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
             ev->data.position.geohash[AT_APP_GEOHASH_LEN] = '\0';
             break;
         }
+        case PEER_PROXIMITY_OBSERVED:
+        {
+            at_app_event_t *ev = &out[n++];
+            memset(ev, 0, sizeof(*ev));
+            ev->kind = AT_APP_EVENT_PROXIMITY;
+            memcpy(ev->data.proximity.peer_uuid,
+                   msg.info.peer_proximity.peer_uuid, AT_APP_UUID_LEN);
+            ev->data.proximity.band = (int32_t)msg.info.peer_proximity.band;
+            break;
+        }
         case PEER_PROFILE_OBSERVED:
         {
             at_app_event_t *ev = &out[n++];
@@ -379,6 +389,54 @@ int at_app_events_connect_respond(at_app_events_t *handle, const char *q_out,
 {
     return connect_send(handle, q_out, AT_APP_CONNECT_RESPOND, peer_uuid,
                         true, accept);
+}
+
+int at_app_events_request_attend(at_app_events_t *handle, const char *q_out,
+                                 const uint8_t peer_uuid[AT_APP_UUID_LEN])
+{
+    /* Same {"peer": "<uuid>"} shape as a connect request; identity issues a
+     * nonce-fresh operator_attest_query to the peer (Phase 2, presence). */
+    return connect_send(handle, q_out, AT_APP_REQUEST_ATTEND, peer_uuid,
+                        false, false);
+}
+
+int at_app_events_request_proximity(at_app_events_t *handle, const char *q_out,
+                                    const uint8_t peer_uuid[AT_APP_UUID_LEN])
+{
+    /* {"peer": "<uuid>"}; identity runs the pairwise distance-band probe with
+     * this CONNECTED peer (Phase 2, private proximity). */
+    return connect_send(handle, q_out, AT_APP_REQUEST_PROXIMITY, peer_uuid,
+                        false, false);
+}
+
+int at_app_events_set_exact_position(at_app_events_t *handle, const char *q_out,
+                                     bool opt_in, double lat, double lon)
+{
+    if (handle == NULL || !name_survives(q_out))
+        return -1;
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
+    /* {"lat","lon"} to opt in; an empty object to opt out (clear). The exact
+     * position is stored LOCAL-ONLY by identity and never advertised. */
+    json_t *env = json_object();
+    if (env == NULL)
+        return -1;
+    if (opt_in) {
+        json_object_set_new(env, "lat", json_real(lat));
+        json_object_set_new(env, "lon", json_real(lon));
+    }
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),
+             "identity");
+    req.info.net_msg.function = (char *)AT_APP_SET_EXACT_POSITION;
+    req.info.net_msg.encrypt = false;
+    if (net_msg_pack_json(&req.info.net_msg, env) != 0) {
+        json_decref(env);
+        return -1;
+    }
+    json_decref(env);
+    return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
 }
 
 int at_app_events_send_dm(at_app_events_t *handle, const char *q_out,

@@ -59,11 +59,15 @@ class TestIdentityProtocol:
         - directed encrypted direct messages, Increment 6 (dm)
         - signed, content-addressed feed posts, Increment 7 (post)
         - directed encrypted post reactions, Increment 8 (reaction)
+        - opt-in private proximity: two connected peers swap
+          key-derived grid tags to learn only a coarse distance
+          band (proximity_probe, proximity_reply, and its
+          local-only trigger proximity_trigger)
         Asserting the exact count here pins the wire contract — a
         new verb without intent will fail this and force a deliberate
         update. Update the expected count alongside any new addition
         to ``IdentityProtocol``.
         """
         values = list(IdentityProtocol)
-        assert len(values) == 37
+        assert len(values) == 40
         assert 'announce' in values

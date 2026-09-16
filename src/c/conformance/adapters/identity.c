@@ -123,11 +123,40 @@ typedef struct {
      * the invitation's rendezvous hint over the inviter's advertised address.
      * Mirrors the Python adapter's _Participant.fc_hello_endpoint. */
     char fc_hello_endpoint[ADDR_LEN + 1];
+    /* This participant's opt-in EXACT position (Phase 2, private proximity),
+     * from fixtures.exact_positions. id_state.own_exact is a SINGLETON, but a
+     * proximity round trip needs BOTH sides' positions, so the fixture parks
+     * each here and _ic_run_proximity_probe swaps id_state.own_exact to the
+     * active side before running that side's handler (via
+     * identity_set_exact_position). prox_exact_set=false means opted out.
+     * Mirrors the Python adapter storing own_exact per participant. */
+    bool prox_exact_set;
+    double prox_exact_lat;
+    double prox_exact_lon;
 } ic_impl_t;
 
 /* The engine ctx is global because the messaging-hook signature has no
  * void* context; one scenario runs at a time. */
 static sce_run_ctx_t *g_active_ctx = NULL;
+
+/* A private-proximity probe/reply payload the send hook grabbed for the current
+ * round trip. ctx->captured records only (from, to, function), but the round
+ * trip must RE-DELIVER the exact {salt, tags} the handler computed. While
+ * g_prox_capture is on, _send_hook deep-copies the outbound proximity payload
+ * here; _ic_run_proximity_probe consumes and frees it. Only one is ever live at
+ * a time (the trip is strictly sequential), so a single slot suffices. */
+static bool     g_prox_capture = false;
+static bool     g_prox_have = false;
+static uint8_t *g_prox_obj = NULL;   /* heap copy of net_msg.obj */
+static size_t   g_prox_len = 0;
+static char     g_prox_fn[PROC_NAME_LEN + 1] = {0};
+
+static void _prox_capture_reset(void) {
+    if (g_prox_obj != NULL) { free(g_prox_obj); g_prox_obj = NULL; }
+    g_prox_len = 0;
+    g_prox_fn[0] = '\0';
+    g_prox_have = false;
+}
 
 /* Scan ctx->participants for a uuid match — the messaging hook gets a
  * net_msg.to_whom (public_identity_t) and needs to map back to a
@@ -191,6 +220,25 @@ static int _send_hook(const char *key,
                            msg->info.net_msg.to_whom.address,
                            sizeof(emitter->fc_hello_endpoint));
             break;
+        }
+    }
+    /* During a proximity round trip, grab the computed {salt, tags} payload so
+     * it can be re-delivered to the other side — captured (from,to,function)
+     * alone cannot carry it (see g_prox_capture). Keep only the LATEST proximity
+     * emission; the trip consumes each before the next is produced. */
+    if (g_prox_capture && type == NET_MESSAGE
+        && (strcmp(function, "peer_proximity_probe") == 0
+            || strcmp(function, "peer_proximity_reply") == 0)) {
+        _prox_capture_reset();
+        size_t n = msg->info.net_msg.len;
+        if (msg->info.net_msg.obj != NULL && n > 0) {
+            g_prox_obj = malloc(n);
+            if (g_prox_obj != NULL) {
+                memcpy(g_prox_obj, msg->info.net_msg.obj, n);
+                g_prox_len = n;
+                at_strlcpy(g_prox_fn, function, sizeof(g_prox_fn));
+                g_prox_have = true;
+            }
         }
     }
     sce_capture(g_active_ctx, to_id, function);
@@ -414,6 +462,151 @@ static int _ic_run_attest_pull(sce_run_ctx_t *ctx, ic_impl_t *puller,
     json_decref(answer);
     return 0;
 }
+
+#ifdef AT_SOCIAL_ENABLED
+/* One private-proximity probe (Phase 2), end to end, inside the harness.
+ *
+ * The band is not a value a step can supply: each side derives keyed grid tags
+ * from its OWN opt-in exact position and the pairwise box secret, and the two
+ * only learn a band by intersecting tag sets. So the harness drives the real
+ * chain of three handlers rather than pre-baking a payload:
+ *   1. an app-verb request on the initiator (AT_APP_REQUEST_PROXIMITY) -> emits
+ *      an encrypted probe {salt, tags} to the target;
+ *   2. the target's handle_proximity_probe records its band and, if it opted in
+ *      too, replies with its own tags under the same salt;
+ *   3. the initiator's handle_proximity_reply records the same band.
+ *
+ * id_state.own_exact is a SINGLETON, so before running each side's handler we
+ * swap it to that side's fixtures.exact_positions value; the CONNECTED edges and
+ * the recorded bands are keyed by peer uuid, so both participants' entries
+ * coexist in the shared maps. current_dispatcher is set per hop so the probe
+ * emission is attributed to the initiator and the reply to the target
+ * (proximity_probes/replies_emitted). ctx->captured drops payloads, so the
+ * computed {salt, tags} is grabbed by _send_hook into g_prox_* and re-delivered
+ * here (own copy, freed after). Mirrors the Python adapter's
+ * _run_proximity_probe. Either side opting out short-circuits.
+ */
+static int _ic_run_proximity_probe(sce_run_ctx_t *ctx, ic_impl_t *initiator,
+                                   ic_impl_t *target) {
+    char targ_uuid[UUID_STRING_LEN + 1];
+    _ic_uuid_str(target, targ_uuid);
+
+    /* handle_request_proximity resolves the target's pubkey from the
+     * initiator's peer list (_find_peer_pub_by_uuid). The Python adapter
+     * cross-populates every participant's roster by default; the C adapter does
+     * not (only the amnesia case), so ensure the target is present here or the
+     * probe is never emitted. Idempotent. */
+    {
+        process_t *p = initiator->proc;
+        bool have = false;
+        peers_read_lock(p);
+        for (size_t i = 0; i < p->protocol.num_peers; i++) {
+            if (uuid_compare(p->protocol.peers[i].uuid, target->pub->uuid) == 0) {
+                have = true;
+                break;
+            }
+        }
+        peers_read_unlock(p);
+        if (!have) {
+            peers_write_lock(p);
+            if (p->protocol.num_peers < DEFAULT_MAX_PEERS) {
+                memcpy(&p->protocol.peers[p->protocol.num_peers],
+                       target->pub, sizeof(public_identity_t));
+                p->protocol.num_peers++;
+            }
+            peers_write_unlock(p);
+        }
+    }
+
+    g_prox_capture = true;
+    _prox_capture_reset();
+
+    /* 1. Trigger the initiator's probe. own_exact = initiator's; the emitted
+     *    probe is attributed to the initiator. */
+    identity_set_exact_position(initiator->prox_exact_set,
+                                initiator->prox_exact_lat,
+                                initiator->prox_exact_lon);
+    at_strlcpy(ctx->current_dispatcher, initiator->id,
+               sizeof(ctx->current_dispatcher));
+    {
+        json_t *p = json_object();
+        json_object_set_new(p, "peer", json_string(targ_uuid));
+        generic_msg_t m = {0};
+        m.type = NET_MESSAGE;
+        strncpy(m.info.net_msg.process, "identity", PROC_NAME_LEN);
+        m.info.net_msg.function = (char *)AT_APP_REQUEST_PROXIMITY;
+        net_msg_pack_json(&m.info.net_msg, p);
+        json_decref(p);
+        run_message_handlers(initiator->proc, NULL, NET_MESSAGE, &m);
+        if (m.info.net_msg.obj != NULL) smrt_deref(m.info.net_msg.obj);
+    }
+    if (!g_prox_have) {          /* initiator opted out: no probe, no band */
+        g_prox_capture = false;
+        _prox_capture_reset();
+        return 0;
+    }
+
+    /* 2. Deliver the captured probe to the target. own_exact = target's; the
+     *    reply it emits is attributed to the target. */
+    {
+        uint8_t *probe_obj = g_prox_obj;    /* detach so the reply capture below
+                                             * does not clobber it */
+        size_t probe_len = g_prox_len;
+        g_prox_obj = NULL; g_prox_len = 0; g_prox_have = false;
+
+        identity_set_exact_position(target->prox_exact_set,
+                                    target->prox_exact_lat,
+                                    target->prox_exact_lon);
+        at_strlcpy(ctx->current_dispatcher, target->id,
+                   sizeof(ctx->current_dispatcher));
+        generic_msg_t m = {0};
+        m.type = NET_MESSAGE;
+        strncpy(m.info.net_msg.process, "identity", PROC_NAME_LEN);
+        m.info.net_msg.function = (char *)"peer_proximity_probe";
+        memcpy(&m.info.net_msg.from_whom, initiator->pub,
+               sizeof(public_identity_t));
+        memcpy(&m.info.net_msg.to_whom, target->pub, sizeof(public_identity_t));
+        m.info.net_msg.obj = probe_obj;
+        m.info.net_msg.len = probe_len;
+        run_message_handlers(target->proc, NULL, NET_MESSAGE, &m);
+        free(probe_obj);
+    }
+    if (!g_prox_have) {          /* target opted out: recorded UNKNOWN, no reply */
+        g_prox_capture = false;
+        _prox_capture_reset();
+        return 0;
+    }
+
+    /* 3. Deliver the captured reply to the initiator. own_exact = initiator's. */
+    {
+        uint8_t *reply_obj = g_prox_obj;
+        size_t reply_len = g_prox_len;
+        g_prox_obj = NULL; g_prox_len = 0; g_prox_have = false;
+
+        identity_set_exact_position(initiator->prox_exact_set,
+                                    initiator->prox_exact_lat,
+                                    initiator->prox_exact_lon);
+        at_strlcpy(ctx->current_dispatcher, initiator->id,
+                   sizeof(ctx->current_dispatcher));
+        generic_msg_t m = {0};
+        m.type = NET_MESSAGE;
+        strncpy(m.info.net_msg.process, "identity", PROC_NAME_LEN);
+        m.info.net_msg.function = (char *)"peer_proximity_reply";
+        memcpy(&m.info.net_msg.from_whom, target->pub,
+               sizeof(public_identity_t));
+        memcpy(&m.info.net_msg.to_whom, initiator->pub,
+               sizeof(public_identity_t));
+        m.info.net_msg.obj = reply_obj;
+        m.info.net_msg.len = reply_len;
+        run_message_handlers(initiator->proc, NULL, NET_MESSAGE, &m);
+        free(reply_obj);
+    }
+
+    g_prox_capture = false;
+    _prox_capture_reset();
+    return 0;
+}
+#endif /* AT_SOCIAL_ENABLED */
 
 #ifdef AT_ZTA_ENABLED
 /* Mint a scenario participant's (operator_pubkey, operator_key_binding) pair,
@@ -884,6 +1077,60 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
             if (impl == NULL || impl->proc == NULL) continue;
             char *pj = json_dumps(fval, JSON_COMPACT);
             if (pj != NULL) { identity_set_own_profile(pj); free(pj); }
+        }
+    }
+
+    /* exact_positions: { "<participant>": [lat, lon], ... } (Phase 2, private
+     * proximity) — park each named participant's opt-in EXACT position in its
+     * impl. Unlike positions above this is NOT pushed into the singleton
+     * id_state here: a proximity round trip needs BOTH sides' positions, so
+     * _ic_run_proximity_probe swaps id_state.own_exact per side at dispatch.
+     * Unlisted => opted OUT (the default). Mirrors the Python adapter storing
+     * own_exact per participant. */
+    json_t *exacts = json_object_get(fixtures, "exact_positions");
+    if (json_is_object(exacts))
+    {
+        const char *epid;
+        json_t *eval;
+        json_object_foreach(exacts, epid, eval) {
+            sce_participant_t *part = sce_find_participant(ctx, epid);
+            if (part == NULL) continue;
+            ic_impl_t *impl = (ic_impl_t *)part->impl;
+            if (impl == NULL || impl->proc == NULL) continue;
+            if (!json_is_array(eval) || json_array_size(eval) != 2) continue;
+            json_t *jla = json_array_get(eval, 0);
+            json_t *jlo = json_array_get(eval, 1);
+            if (!json_is_number(jla) || !json_is_number(jlo)) continue;
+            impl->prox_exact_lat = json_number_value(jla);
+            impl->prox_exact_lon = json_number_value(jlo);
+            impl->prox_exact_set = true;
+        }
+    }
+
+    /* connections: { "<participant>": ["<other>", ...], ... } (Increment 5) —
+     * pre-seed CONNECTED edges directly, standing in for a completed request/
+     * accept exchange so a scenario exercising a DOWNSTREAM connected-peers-only
+     * feature (proximity) need not re-run the handshake. connection_edges is a
+     * singleton map keyed by peer uuid, so both directions coexist. Mirrors the
+     * Python adapter's fixtures.connections. */
+    json_t *conns = json_object_get(fixtures, "connections");
+    if (json_is_object(conns))
+    {
+        const char *cpid;
+        json_t *cval;
+        json_object_foreach(conns, cpid, cval) {
+            if (!json_is_array(cval)) continue;
+            size_t ci;
+            json_t *other;
+            json_array_foreach(cval, ci, other) {
+                const char *other_pid = json_string_value(other);
+                if (other_pid == NULL) continue;
+                sce_participant_t *op = sce_find_participant(ctx, other_pid);
+                if (op == NULL) continue;
+                char other_uuid[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(((ic_impl_t *)op->impl)->pub->uuid, other_uuid);
+                identity_set_connection_state(other_uuid, AT_CONN_CONNECTED);
+            }
         }
     }
 #endif /* AT_SOCIAL_ENABLED */
@@ -2283,6 +2530,24 @@ static int _dispatch(sce_run_ctx_t *ctx,
 #ifdef AT_SOCIAL_ENABLED
     if (inbound->type == NET_MESSAGE
         && inbound->info.net_msg.function != NULL
+        && strcmp(inbound->info.net_msg.function,
+                  "trigger_proximity_probe") == 0) {
+        /* Pseudo-function: one private-proximity probe, end to end. `impl` is
+         * the probe TARGET; from_whom is the INITIATOR (the step's `from`). The
+         * probe/reply payloads are handler-COMPUTED keyed tags, so the whole
+         * round trip runs through the real handlers. Mirrors the Python
+         * adapter's _TRIGGER_PROXIMITY_PROBE. */
+        ic_impl_t *initiator =
+            _ic_impl_for_uuid(ctx, inbound->info.net_msg.from_whom.uuid);
+        if (initiator == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "proximity probe: unknown initiator");
+            return -1;
+        }
+        return _ic_run_proximity_probe(ctx, initiator, impl);
+    }
+    if (inbound->type == NET_MESSAGE
+        && inbound->info.net_msg.function != NULL
         && strcmp(inbound->info.net_msg.function, "trigger_block") == 0) {
         /* Pseudo-function: locally block the peer the step names ({"peer":
          * <pid>}). Block is an app verb, not a wire message, so there is nothing
@@ -2700,6 +2965,35 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                         snprintf(ctx->err, sizeof(ctx->err),
                                  "%s: connection_state[%s]=%d, expected %d",
                                  pid, cs_pid, got, want);
+                        return -1;
+                    }
+                }
+            } else if (strcmp(key, "peer_proximity") == 0) {
+                /* {peer_id: <int band>} (Phase 2) — the coarse distance BAND
+                 * this participant last learned toward another CONNECTED peer,
+                 * via identity_get_peer_proximity: unknown=0, near=1, mid=2,
+                 * far=3. 0 is the ordinary default (never probed, opted out, or
+                 * refused). Mirrors the Python adapter's peer_proximity check. */
+                const char *px_pid;
+                json_t *px_want;
+                json_object_foreach(val, px_pid, px_want) {
+                    sce_participant_t *other = sce_find_participant(ctx, px_pid);
+                    if (other == NULL) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: peer_proximity names unknown participant %s",
+                                 pid, px_pid);
+                        return -1;
+                    }
+                    const public_identity_t *want_id =
+                        ((ic_impl_t *)other->impl)->pub;
+                    char want_uuid[UUID_STR_LEN + 1];
+                    uuid_unparse_lower(want_id->uuid, want_uuid);
+                    int got = identity_get_peer_proximity(want_uuid);
+                    int want = (int)json_integer_value(px_want);
+                    if (got != want) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: peer_proximity[%s]=%d, expected %d",
+                                 pid, px_pid, got, want);
                         return -1;
                     }
                 }
@@ -3421,6 +3715,27 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: profile_responses_emitted=%d, expected %d",
                              pid, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "proximity_probes_emitted") == 0
+                       || strcmp(key, "proximity_replies_emitted") == 0) {
+                /* peer_proximity_probe/reply emissions attributed to this
+                 * participant (Phase 2). The initiator's probe count is the
+                 * opt-in guard's observable (0 opted out / not connected, 1 per
+                 * trigger); the responder's reply count is its own opt-in
+                 * observable. Mirrors the Python emit_tally check. */
+                const char *want_fn = (strcmp(key, "proximity_probes_emitted") == 0)
+                    ? "peer_proximity_probe" : "peer_proximity_reply";
+                int want = (int)json_integer_value(val);
+                int got = 0;
+                for (size_t i = 0; i < ctx->captured_count; i++) {
+                    if (strcmp(ctx->captured[i].from, pid) == 0
+                        && strcmp(ctx->captured[i].function, want_fn) == 0)
+                        got++;
+                }
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: %s=%d, expected %d", pid, key, got, want);
                     return -1;
                 }
             } else if (strcmp(key, "propose_emitted") == 0) {

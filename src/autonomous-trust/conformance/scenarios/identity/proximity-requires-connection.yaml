@@ -1,0 +1,56 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: proximity-requires-connection
+byte_pinning: false
+description: |
+    The security gate for private proximity (Phase 2): a proximity probe only
+    ever runs against a peer both sides consented to CONNECT with. Here both
+    newcomer and bg have opted in to an exact position, but there is NO
+    connection edge between them (no fixtures.connections). newcomer's
+    handle_proximity_trigger refuses at the connection gate and emits nothing;
+    even a hand-delivered probe would be dropped by bg's handle_proximity_probe,
+    which gates on the same edge. So no position information — not even a coarse
+    band — is exchanged with a non-connected peer, and neither side records a
+    band.
+
+    NON-VACUITY: newcomer.proximity_probes_emitted = 0 is load-bearing. Both
+    peers being opted in rules out the opt-out path as the reason nothing
+    happens; only the connection gate can suppress the probe here, so a mutation
+    that drops the gate (probing any known peer) emits one and fails.
+
+    Step 1: newcomer -> bg trigger_proximity_probe (pseudo-step).
+      - Both runtimes: handle_proximity_trigger, finding no CONNECTED edge to bg,
+        refuses and emits no probe.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  # No `connections` fixture: the peers are NOT connected.
+  exact_positions:
+    newcomer: [37.7749, -122.4194]
+    bg: [37.7749, -122.4194]
+
+steps:
+  - id: 1
+    from: newcomer
+    to: bg
+    function: trigger_proximity_probe
+    payload: {}
+    description: |
+        newcomer's probe is triggered against a peer it is not connected to; the
+        connection gate refuses it, so nothing is sent and no band is recorded.
+
+expected_state:
+  newcomer:
+    proximity_probes_emitted: 0
+    peer_proximity:
+      bg: 0          # UNKNOWN — the gate refused the probe
+  bg:
+    proximity_replies_emitted: 0
+    peer_proximity:
+      newcomer: 0    # UNKNOWN — no probe arrived
