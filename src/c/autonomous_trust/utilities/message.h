@@ -114,6 +114,28 @@
  * (unlike a decline). Forwarded only to the identity process. Ninth verb on the
  * app→AT allowlist. */
 #define AT_APP_BLOCK "app_block"
+
+/* App→AT: pull a FRESH operator-attendance attestation from a peer NOW (Phase 2,
+ * presence). The payload is {"peer": "<uuid_str>"}; identity issues a
+ * nonce-fresh operator_attest_query to that peer and, on the response, updates
+ * the peer's operator_attested_at and re-emits peer_observed. Forwarded only to
+ * the identity process. Tenth verb on the app→AT allowlist. */
+#define AT_APP_REQUEST_ATTEND "app_request_attend"
+
+/* App→AT: set (or clear) THIS node's opt-in EXACT position (Phase 2, private
+ * proximity). The payload is {"lat": <deg>, "lon": <deg>} or empty to opt out.
+ * STORED LOCAL-ONLY and NEVER advertised — it feeds only the pairwise, encrypted
+ * distance-band probe with CONNECTED peers (it is never read by any query
+ * handler). Forwarded only to the identity process. Eleventh verb on the
+ * app→AT allowlist. */
+#define AT_APP_SET_EXACT_POSITION "app_set_exact_position"
+
+/* App→AT: run a private-proximity probe against a CONNECTED peer (Phase 2). The
+ * payload is {"peer": "<uuid_str>"}; identity derives multi-resolution grid tags
+ * keyed by the pairwise box secret and exchanges them so both sides learn only a
+ * coarse distance BAND (near/mid/far), never coordinates. Forwarded only to the
+ * identity process. Twelfth verb on the app→AT allowlist. */
+#define AT_APP_REQUEST_PROXIMITY "app_request_proximity"
 #endif /* AT_SOCIAL_ENABLED */
 
 #define DEFAULT_MAX_MSG_SIZE 1024

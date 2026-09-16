@@ -1,0 +1,52 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: proximity-band-far
+byte_pinning: false
+description: |
+    Private proximity, the distance-discrimination case (Phase 2). The same
+    opted-in, CONNECTED exchange as proximity-band-near, but the two peers sit
+    ~55 km apart — far beyond the coarsest (~5 km) grid cell — so NO tag at any
+    resolution or offset grid intersects and both record FAR (3). This is the
+    load-bearing proof that the band is COMPUTED from the geometry, not a
+    constant: a mutation that always returned NEAR passes proximity-band-near
+    and fails here. Still no coordinate crosses the wire; only the (non-matching)
+    keyed tag sets do, and a reply is sent regardless of the band.
+
+    Step 1: newcomer -> bg trigger_proximity_probe (pseudo-step).
+      - newcomer emits one probe (proximity_probes_emitted=1); bg answers with
+        its tags (proximity_replies_emitted=1); the tag sets do not intersect,
+        so both record FAR.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  connections:
+    newcomer: [bg]
+    bg: [newcomer]
+  exact_positions:
+    newcomer: [37.7749, -122.4194]
+    bg: [38.2749, -122.4194]     # ~55 km north of newcomer
+
+steps:
+  - id: 1
+    from: newcomer
+    to: bg
+    function: trigger_proximity_probe
+    payload: {}
+    description: |
+        newcomer probes bg; the two are far apart, so both sides record FAR.
+
+expected_state:
+  newcomer:
+    proximity_probes_emitted: 1
+    peer_proximity:
+      bg: 3          # FAR
+  bg:
+    proximity_replies_emitted: 1
+    peer_proximity:
+      newcomer: 3    # FAR

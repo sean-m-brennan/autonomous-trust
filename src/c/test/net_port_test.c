@@ -30,8 +30,10 @@
  * binds to the identical addr:port and delivers every datagram to the LAST
  * binder (measured). A plain socket therefore reports occupancy truthfully
  * where a reuse socket would report nothing at all. The transport's UNICAST
- * recv sockets now make the same choice for the same reason — see
- * test_same_base_same_address_bind_is_loud.
+ * peer recv socket now makes the same choice for the same reason — see
+ * test_same_base_same_address_bind_is_loud. The group recv socket is a
+ * different animal: it binds the segment broadcast address on base+1, so its
+ * occupancy is asked there — see group_port_is_taken.
  */
 
 #define DEBUG_TESTS 1
@@ -88,6 +90,22 @@ static bool port_is_taken(const char *addr, int port)
     if (s < 0) return true;
     close(s);
     return false;
+}
+
+/* Occupancy of the GROUP recv socket. It does not sit on the node's unicast
+ * address: the group channel rides the same delivery mode as discovery, so in
+ * broadcast mode the transport binds the segment BROADCAST address on base+1
+ * (net_transport_udp.c, "Group recv socket") — a unicast bind there would never
+ * see a broadcast frame. Probing 127.0.0.1:base+1 therefore reports a free port
+ * and proves nothing; ask where the transport actually bound. The socket does
+ * carry SO_REUSEADDR, but a plain probe still reports it taken (measured), so
+ * port_is_taken answers truthfully here too. */
+static bool group_port_is_taken(const char *cidr, int base)
+{
+    char bcast[IPV4_ADDR_LEN];
+    /* cidr_split strdups, so a literal argument is safe. */
+    if (cidr4_to_broadcast((char *)cidr, bcast) != 0) return false;
+    return port_is_taken(bcast, base + 1);
 }
 
 static void set_env_port(const char *val)
@@ -251,7 +269,7 @@ DEFINE_TEST(test_non_default_port_reaches_every_socket)
      * leaves the default pair alone. */
     const int base = 31500;
     ck_assert(!port_is_taken("127.0.0.1", base));
-    ck_assert(!port_is_taken("127.0.0.1", base + 1));
+    ck_assert(!group_port_is_taken("127.0.0.1/8", base));
 
     network_config_t net_cfg;
     net_transport_ctx_t *ctx = NULL;
@@ -259,10 +277,10 @@ DEFINE_TEST(test_non_default_port_reaches_every_socket)
     ck_assert(t != NULL);
 
     ck_assert(port_is_taken("127.0.0.1", base));
-    ck_assert(port_is_taken("127.0.0.1", base + 1));
+    ck_assert(group_port_is_taken("127.0.0.1/8", base));
     /* And nothing landed on the compile-time default. */
     ck_assert(!port_is_taken("127.0.0.1", COMM_PORT));
-    ck_assert(!port_is_taken("127.0.0.1", COMM_PORT + 1));
+    ck_assert(!group_port_is_taken("127.0.0.1/8", COMM_PORT));
 
     t->close(ctx);
 }
@@ -279,7 +297,7 @@ DEFINE_TEST(test_env_port_reaches_every_socket_when_config_silent)
     const net_transport_t *t = open_udp(&ctx, &net_cfg, "127.0.0.1/8", 0);
     ck_assert(t != NULL);
     ck_assert(port_is_taken("127.0.0.1", base));
-    ck_assert(port_is_taken("127.0.0.1", base + 1));
+    ck_assert(group_port_is_taken("127.0.0.1/8", base));
     ck_assert(!port_is_taken("127.0.0.1", COMM_PORT));
 
     t->close(ctx);
@@ -304,9 +322,9 @@ DEFINE_TEST(test_two_nodes_different_bases_coexist)
 
     /* Each holds its own pair, and the two pairs do not overlap. */
     ck_assert(port_is_taken("127.0.0.1", 31700));
-    ck_assert(port_is_taken("127.0.0.1", 31701));
+    ck_assert(group_port_is_taken("127.0.0.1/8", 31700));
     ck_assert(port_is_taken("127.0.0.1", 31800));
-    ck_assert(port_is_taken("127.0.0.1", 31801));
+    ck_assert(group_port_is_taken("127.0.0.1/8", 31800));
 
     tb->close(ctx_b);
     ta->close(ctx_a);
@@ -342,9 +360,11 @@ DEFINE_TEST(test_same_base_same_address_bind_is_loud)
      * bind, and with the option on both sockets this kernel permits the
      * duplicate and delivers every datagram to the LAST binder — so the first
      * node went deaf with no error anywhere. The fix is per-socket, because
-     * the option is load-bearing for the broadcast/multicast socket: the
-     * unicast recv sockets (peer, group) now bind WITHOUT it and the second
-     * node fails EADDRINUSE at open, which is what this asserts.
+     * the option is load-bearing for the shared broadcast/multicast sockets:
+     * the PEER recv socket now binds WITHOUT it and the second node fails
+     * EADDRINUSE at open, which is what this asserts. (The group recv socket
+     * moved to the segment broadcast address and keeps SO_REUSEADDR, so it is
+     * no longer the one that refuses the duplicate — see group_port_is_taken.)
      *
      * Co-location itself still works — that is what the rest of this file
      * covers — provided the operator gives each node a distinct base. */
@@ -364,7 +384,7 @@ DEFINE_TEST(test_same_base_same_address_bind_is_loud)
     /* And the first node still holds its ports — the failed open must not have
      * closed anything out from under it. */
     ck_assert(port_is_taken("127.0.0.1", 32000));
-    ck_assert(port_is_taken("127.0.0.1", 32001));
+    ck_assert(group_port_is_taken("127.0.0.1/8", 32000));
 
     ta->close(ctx_a);
 

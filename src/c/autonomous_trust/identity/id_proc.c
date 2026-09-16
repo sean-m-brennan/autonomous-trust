@@ -45,6 +45,7 @@
 #include "dm.h"
 #include "post.h"
 #include "social_tx.h"
+#include "proximity.h"
 #endif /* AT_SOCIAL_ENABLED */
 #include "first_contact.h"
 #include "utilities/b64.h"
@@ -94,6 +95,10 @@ static bool _peer_shares_our_group(const process_t *proc, const char *peer_uuid_
 static void _record_peer_group_uuid(const process_t *proc,
                                     const char *peer_uuid_str,
                                     const char *group_uuid_str);
+/* Defined with the connection handlers below; the proximity handlers (earlier in
+ * the file) need it to resolve a connected peer's public identity. */
+static bool _find_peer_pub_by_uuid(const process_t *proc, const uuid_t uuid,
+                                   public_identity_t *out);
 #endif /* AT_SOCIAL_ENABLED */
 
 DEFINE_ERROR(EID_NOQ, "Required process queue missing");
@@ -119,6 +124,13 @@ static char ID_POSITION_QUERY[]    = "peer_position_query";
 static char ID_POSITION_RESPONSE[] = "peer_position_response";
 static char ID_PROFILE_QUERY[]     = "peer_profile_query";
 static char ID_PROFILE_RESPONSE[]  = "peer_profile_response";
+/* Private-proximity probe/reply (Phase 2). Directed + ENCRYPTED (never on the
+ * plaintext allowlist): each carries {salt, tags} where tags are multi-
+ * resolution grid tags keyed by the pairwise box secret (identity/proximity.c).
+ * The two CONNECTED peers each learn only a coarse distance BAND; neither the
+ * exact position nor the cell is revealed, and a third party sees opaque tags. */
+static char ID_PROXIMITY_PROBE[]   = "peer_proximity_probe";
+static char ID_PROXIMITY_REPLY[]   = "peer_proximity_reply";
 /* Explicit connection edge-state (Increment 5). Directed + ENCRYPTED (never on
  * the plaintext allowlist): the request is a bare ask, the response carries a
  * detached Ed25519 signature over the canonical (requester, accepter, decision,
@@ -164,6 +176,9 @@ static char ID_APP_SEND_DM[] = AT_APP_SEND_DM;
 static char ID_APP_PUBLISH_POST[] = AT_APP_PUBLISH_POST;
 static char ID_APP_REACT_POST[] = AT_APP_REACT_POST;
 static char ID_APP_BLOCK[] = AT_APP_BLOCK;
+static char ID_APP_REQUEST_ATTEND[] = AT_APP_REQUEST_ATTEND;
+static char ID_APP_SET_EXACT_POSITION[] = AT_APP_SET_EXACT_POSITION;
+static char ID_APP_REQUEST_PROXIMITY[] = AT_APP_REQUEST_PROXIMITY;
 #endif /* AT_SOCIAL_ENABLED */
 
 /* Feed gossip bounds (Increment 7, SOCIAL_APP_PLAN §7 Q2 "active network + one
@@ -375,10 +390,27 @@ static struct {
      * nothing and no position is ever advertised. Set/cleared at runtime via the
      * AT_APP_SET_POSITION app verb. mutex-guarded by id_state.lock. */
     char own_geohash[AT_GEOHASH_MAX_LEN + 1];
+    /* This node's OWN opt-in EXACT position (Phase 2, private proximity). Stored
+     * LOCAL-ONLY and NEVER advertised — no query handler reads it; it feeds ONLY
+     * the pairwise, encrypted distance-band probe with CONNECTED peers
+     * (handle_request_proximity / handle_proximity_probe). own_exact_set gates
+     * it; while false the node runs no proximity probe. Set/cleared via the
+     * AT_APP_SET_EXACT_POSITION app verb. mutex-guarded by id_state.lock. */
+    bool own_exact_set;
+    double own_exact_lat;
+    double own_exact_lon;
     /* Peer positions recorded by handle_position_response. Keyed by lowercased
      * uuid string; values are string_data(geohash). Mirrors peer_caps_map.
      * Conformance/assertion surface via identity_get_peer_position. */
     map_t peer_position_map;
+    /* Coarse distance BAND last learned per CONNECTED peer (Phase 2, private
+     * proximity), keyed by lowercased peer uuid string; values are
+     * string_data(a decimal at_prox_band_t). Written by the proximity handlers
+     * alongside identity_emit_peer_proximity — the band is a LIVE app emit, so
+     * this map exists purely as the conformance/observability surface for
+     * identity_get_peer_proximity, the twin of Python get_peer_proximity (like
+     * last_dm_map, never roster-replayed). Guarded by id_state.lock. */
+    map_t peer_proximity_map;
     /* This node's OWN opt-in agora.profile (Increment 3): operator-set, bounded
      * fields shared only with admitted peers that ask, over the SIGNED
      * peer_profile_query/response exchange. Empty (at_profile_is_empty) = opted
@@ -575,6 +607,7 @@ static void _ensure_id_init(void)
         map_init(&id_state.peer_caps_map);
 #ifdef AT_SOCIAL_ENABLED
         map_init(&id_state.peer_position_map);
+        map_init(&id_state.peer_proximity_map);
         /* Opt-in own position: seed from $AT_OWN_GEOHASH for headless/testing
          * (the Flutter UI sets it at runtime via AT_APP_SET_POSITION instead).
          * Empty/invalid/unset => opted out, the default. */
@@ -828,6 +861,46 @@ bool identity_get_peer_position(const char *uuid_str, char *buf, size_t buflen)
     return found;
 }
 
+/* Conformance seam: the coarse distance BAND this node last learned toward peer
+ * @p uuid_str (lowercased uuid string), as an at_prox_band_t int; AT_PROX_UNKNOWN
+ * (0) if none recorded. The map is filled by the proximity handlers alongside
+ * identity_emit_peer_proximity; scenarios assert via the `peer_proximity`
+ * expected_state key. Twin of Python IdentityProcess.get_peer_proximity. */
+int identity_get_peer_proximity(const char *uuid_str)
+{
+    if (uuid_str == NULL) return AT_PROX_UNKNOWN;
+    _ensure_id_init();
+    int band = AT_PROX_UNKNOWN;
+    pthread_mutex_lock(&id_state.lock);
+    data_t *dat = NULL;
+    if (map_get(&id_state.peer_proximity_map, (map_key_t)uuid_str, &dat) == 0
+        && dat != NULL)
+    {
+        char *s = NULL;
+        if (data_string_ptr(dat, &s) == 0 && s != NULL)
+            band = atoi(s);
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return band;
+}
+
+/* Conformance seam: set (or clear) THIS node's opt-in EXACT position (Phase 2,
+ * private proximity). @p set false clears it (opts out, the default); @p set
+ * true with in-range lat/lon opts in. LOCAL-ONLY — it feeds only the pairwise
+ * distance-band probe and is never advertised. The harness analog of the app's
+ * AT_APP_SET_EXACT_POSITION IPC verb; conformance installs it from
+ * `fixtures.exact_positions`. Twin of setting Python own_exact. */
+void identity_set_exact_position(bool set, double lat, double lon)
+{
+    _ensure_id_init();
+    bool ok = set && lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0;
+    pthread_mutex_lock(&id_state.lock);
+    id_state.own_exact_set = ok;
+    id_state.own_exact_lat = ok ? lat : 0.0;
+    id_state.own_exact_lon = ok ? lon : 0.0;
+    pthread_mutex_unlock(&id_state.lock);
+}
+
 /* Conformance seam: set (or clear) THIS node's opt-in agora.profile from a JSON
  * object string (Increment 3). Empty/invalid/empty-object opts out. The harness
  * analog of the AT_APP_SET_PROFILE IPC verb; scenarios install it from
@@ -904,6 +977,34 @@ int identity_get_connection_state(const char *uuid_str)
     }
     pthread_mutex_unlock(&id_state.lock);
     return state;
+}
+
+/* Conformance seam: pre-seed the edge state this node holds toward peer
+ * @p uuid_str (lowercased uuid string) as an at_conn_state_t int, standing in
+ * for a completed request/accept exchange so a scenario exercising a DOWNSTREAM
+ * connected-peers-only feature (proximity) need not re-run the handshake. Writes
+ * the same {"state","seq","ts"} compact JSON as _connection_store, so
+ * identity_get_connection_state reads it back. Self-contained (does not depend on
+ * the AT_SOCIAL-gated handlers) so it links in any build; conformance installs
+ * it from `fixtures.connections`. Twin of the Python adapter setting
+ * connection_edges directly. */
+void identity_set_connection_state(const char *uuid_str, int state)
+{
+    if (uuid_str == NULL) return;
+    _ensure_id_init();
+    char buf[96];
+    int len = snprintf(buf, sizeof(buf),
+                       "{\"state\":%d,\"seq\":%llu,\"ts\":%lld}",
+                       state, 0ULL, (long long)time(NULL));
+    if (len <= 0 || (size_t)len >= sizeof(buf)) return;
+    char *dup = smrt_create((size_t)len + 1);
+    if (dup == NULL) return;
+    memcpy(dup, buf, (size_t)len + 1);
+    data_t *dat = string_data(dup, (size_t)len + 1);
+    if (dat == NULL) { smrt_deref(dup); return; }
+    pthread_mutex_lock(&id_state.lock);
+    map_set(&id_state.connection_edges, (map_key_t)uuid_str, dat);
+    pthread_mutex_unlock(&id_state.lock);
 }
 
 /* Conformance seam: the most-recent DM this node received from peer @p uuid_str
@@ -3001,6 +3102,11 @@ void identity_reset_state(void)
 #ifdef AT_SOCIAL_ENABLED
     map_free(&id_state.peer_position_map);
     map_init(&id_state.peer_position_map);
+    map_free(&id_state.peer_proximity_map);
+    map_init(&id_state.peer_proximity_map);
+    id_state.own_exact_set = false;
+    id_state.own_exact_lat = 0.0;
+    id_state.own_exact_lon = 0.0;
     id_state.own_geohash[0] = '\0';
     map_free(&id_state.peer_profile_map);
     map_init(&id_state.peer_profile_map);
@@ -4262,6 +4368,291 @@ static int _send_position_query(const process_t *proc, const public_identity_t *
     return 0;
 }
 
+/* ---- Private proximity (Phase 2, identity/proximity.c) ------------------- */
+
+/* AT -> app: surface the coarse distance BAND to one CONNECTED peer as
+ * PEER_PROXIMITY_OBSERVED (no coordinates — only the band). */
+static int identity_emit_peer_proximity(const uuid_t peer_uuid, int band)
+{
+    generic_msg_t msg = {0};
+    msg.type = PEER_PROXIMITY_OBSERVED;
+    msg.size = sizeof(peer_proximity_msg_t);
+    memcpy(msg.info.peer_proximity.peer_uuid, peer_uuid, 16);
+    msg.info.peer_proximity.band = band;
+    return messaging_send(AT_MAIN_QUEUE, PEER_PROXIMITY_OBSERVED, &msg, false);
+}
+
+/* Record the coarse @p band learned toward peer @p uuid_str (lowercased uuid
+ * string) into peer_proximity_map as a decimal string. Purely the
+ * conformance/observability surface for identity_get_peer_proximity; the LIVE
+ * signal is the app emit. Own locking, mirrors _connection_store. */
+static void _proximity_store(const char *uuid_str, int band)
+{
+    char buf[16];
+    int len = snprintf(buf, sizeof(buf), "%d", band);
+    if (len <= 0 || (size_t)len >= sizeof(buf)) return;
+    char *dup = smrt_create((size_t)len + 1);
+    if (dup == NULL) return;
+    memcpy(dup, buf, (size_t)len + 1);
+    data_t *dat = string_data(dup, (size_t)len + 1);
+    if (dat == NULL) { smrt_deref(dup); return; }
+    pthread_mutex_lock(&id_state.lock);
+    map_set(&id_state.peer_proximity_map, (map_key_t)uuid_str, dat);
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+/* True iff we hold a CONNECTED edge toward @p uuid_str (Increment 5). Proximity
+ * is only ever run against a peer both sides consented to connect with. */
+static bool _proximity_peer_connected(const char *uuid_str)
+{
+    return identity_get_connection_state(uuid_str) == AT_CONN_CONNECTED;
+}
+
+/* Compute this node's proximity tag set toward @p peer under @p salt, from our
+ * opt-in exact position and the pairwise box secret (beforenm over our X25519
+ * secret and the peer's public key). Returns false if we opted out (no exact
+ * position) or key/tag derivation fails. The exact position never leaves here. */
+static bool _proximity_own_tags(const process_t *proc,
+                                const public_identity_t *peer,
+                                const unsigned char salt[AT_PROX_SALT_LEN],
+                                uint8_t tags[AT_PROX_NTAGS][AT_PROX_TAG_LEN])
+{
+    double lat, lon;
+    bool have;
+    pthread_mutex_lock(&id_state.lock);
+    have = id_state.own_exact_set;
+    lat = id_state.own_exact_lat;
+    lon = id_state.own_exact_lon;
+    pthread_mutex_unlock(&id_state.lock);
+    if (!have)
+        return false;
+    const identity_t *self = _partition_self_identity(proc);
+    if (self == NULL)
+        return false;
+    log_debug(proc->logger,
+              "Identity: proximity tags from own position lat=%.5f lon=%.5f\n",
+              lat, lon);
+    unsigned char key[crypto_box_BEFORENMBYTES];
+    if (!proximity_derive_key(peer->encryptor.public, self->encryptor.private,
+                              key))
+        return false;
+    bool ok = proximity_compute_tags(lat, lon, key, salt, tags);
+    sodium_memzero(key, sizeof(key));
+    return ok;
+}
+
+/* Send a directed, ENCRYPTED proximity message ({salt, tags}) to @p peer under
+ * @p verb (ID_PROXIMITY_PROBE or ID_PROXIMITY_REPLY). */
+static int _send_proximity_msg(const public_identity_t *peer, char *verb,
+                               const unsigned char salt[AT_PROX_SALT_LEN],
+                               const uint8_t tags[AT_PROX_NTAGS][AT_PROX_TAG_LEN])
+{
+    json_t *env = json_object();
+    if (env == NULL)
+        return -1;
+    char salt_hex[AT_PROX_SALT_LEN * 2 + 1];
+    sodium_bin2hex(salt_hex, sizeof(salt_hex), salt, AT_PROX_SALT_LEN);
+    json_object_set_new(env, "salt", json_string(salt_hex));
+    json_t *tarr = proximity_tags_to_json(tags);
+    if (tarr == NULL) {
+        json_decref(env);
+        return -1;
+    }
+    json_object_set_new(env, "tags", tarr);
+
+    generic_msg_t m = {0};
+    m.type = NET_MESSAGE;
+    strncpy(m.info.net_msg.process, "identity", PROC_NAME_LEN);
+    m.info.net_msg.function = verb;
+    m.info.net_msg.encrypt = true;
+    memcpy(&m.info.net_msg.to_whom, peer, sizeof(public_identity_t));
+    strncpy(m.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    net_msg_pack_json(&m.info.net_msg, env);
+    json_decref(env);
+    messaging_send("network", NET_MESSAGE, &m, false);
+    return 0;
+}
+
+/* Parse {salt, tags} from a probe/reply payload. Returns true on a well-formed
+ * message, filling @p salt and @p their_tags. */
+static bool _proximity_parse(const json_t *payload,
+                             unsigned char salt[AT_PROX_SALT_LEN],
+                             uint8_t their_tags[AT_PROX_NTAGS][AT_PROX_TAG_LEN])
+{
+    json_t *j_salt = json_object_get(payload, "salt");
+    json_t *j_tags = json_object_get(payload, "tags");
+    if (!json_is_string(j_salt))
+        return false;
+    const char *hex = json_string_value(j_salt);
+    size_t sl = 0;
+    if (sodium_hex2bin(salt, AT_PROX_SALT_LEN, hex, strlen(hex), NULL, &sl,
+                       NULL) != 0 || sl != AT_PROX_SALT_LEN)
+        return false;
+    return proximity_tags_from_json(j_tags, their_tags);
+}
+
+/* App -> AT verb (AT_APP_SET_EXACT_POSITION): set or clear THIS node's opt-in
+ * EXACT position. Payload {"lat": <deg>, "lon": <deg>}; empty/missing/invalid
+ * clears it (opt out). Stored LOCAL-ONLY — nothing reads it but the proximity
+ * probe, and nothing advertises it. */
+static bool handle_set_exact_position(const process_t *proc,
+                                      directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    json_t *payload = NULL;
+    bool set = false;
+    double lat = 0, lon = 0;
+    if (net_msg_unpack_json(nmsg, &payload) == 0 && payload != NULL) {
+        json_t *jlat = json_object_get(payload, "lat");
+        json_t *jlon = json_object_get(payload, "lon");
+        if (json_is_number(jlat) && json_is_number(jlon)) {
+            lat = json_number_value(jlat);
+            lon = json_number_value(jlon);
+            if (lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0)
+                set = true;
+        }
+        json_decref(payload);
+    }
+    pthread_mutex_lock(&id_state.lock);
+    id_state.own_exact_set = set;
+    id_state.own_exact_lat = set ? lat : 0.0;
+    id_state.own_exact_lon = set ? lon : 0.0;
+    pthread_mutex_unlock(&id_state.lock);
+    if (set)
+        log_info(proc->logger,
+                 "Identity: own exact position set (opted in, local-only): "
+                 "lat=%.5f lon=%.5f\n", lat, lon);
+    else
+        log_info(proc->logger,
+                 "Identity: own exact position cleared (opted out)\n");
+    return true;
+}
+
+/* App -> AT verb (AT_APP_REQUEST_PROXIMITY): run a private-proximity probe
+ * against a CONNECTED peer. Payload {"peer": "<uuid_str>"}. Derive our tags and
+ * send an encrypted probe; the reply drives the band emit on both sides. */
+static bool handle_request_proximity(const process_t *proc, directory_t *queues,
+                                     generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *j_peer = json_object_get(payload, "peer");
+    if (!json_is_string(j_peer)) { json_decref(payload); return true; }
+    uuid_t peer_uuid;
+    int rc = uuid_parse(json_string_value(j_peer), peer_uuid);
+    json_decref(payload);
+    if (rc != 0)
+        return true;
+    char peer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, peer_str);
+    if (!_proximity_peer_connected(peer_str)) {
+        log_warn(proc->logger,
+                 "Identity: request_proximity: %s not connected; refusing\n",
+                 peer_str);
+        return true;
+    }
+    public_identity_t peer;
+    if (!_find_peer_pub_by_uuid(proc, peer_uuid, &peer))
+        return true;
+    unsigned char salt[AT_PROX_SALT_LEN];
+    randombytes_buf(salt, sizeof(salt));
+    uint8_t tags[AT_PROX_NTAGS][AT_PROX_TAG_LEN];
+    if (!_proximity_own_tags(proc, &peer, salt, tags)) {
+        log_info(proc->logger,
+                 "Identity: request_proximity: no own exact position; opted out\n");
+        return true;
+    }
+    _send_proximity_msg(&peer, ID_PROXIMITY_PROBE, salt, tags);
+    log_debug(proc->logger, "Identity: sent proximity probe to %s\n", peer_str);
+    return true;
+}
+
+/* Handler (responder): a connected peer's proximity probe. Compute our band
+ * from our tags + theirs under the probe's salt, emit it locally, and reply
+ * with our tags so the initiator learns the same band. */
+static bool handle_proximity_probe(const process_t *proc, directory_t *queues,
+                                   generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    char sender[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, sender);
+    if (!_proximity_peer_connected(sender)) {
+        log_debug(proc->logger,
+                  "Identity: proximity_probe from non-connected %s; ignoring\n",
+                  sender);
+        return true;
+    }
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    unsigned char salt[AT_PROX_SALT_LEN];
+    uint8_t their_tags[AT_PROX_NTAGS][AT_PROX_TAG_LEN];
+    bool ok = _proximity_parse(payload, salt, their_tags);
+    json_decref(payload);
+    if (!ok) {
+        log_warn(proc->logger, "Identity: malformed proximity_probe from %s\n",
+                 sender);
+        return true;
+    }
+    uint8_t our_tags[AT_PROX_NTAGS][AT_PROX_TAG_LEN];
+    if (!_proximity_own_tags(proc, &nmsg->from_whom, salt, our_tags)) {
+        /* We opted out of exact position — we cannot compute a band. Surface
+         * unknown for our side; do not reply (nothing to compare against). */
+        _proximity_store(sender, AT_PROX_UNKNOWN);
+        identity_emit_peer_proximity(nmsg->from_whom.uuid, AT_PROX_UNKNOWN);
+        return true;
+    }
+    at_prox_band_t band = proximity_band(our_tags, their_tags);
+    _proximity_store(sender, (int)band);
+    identity_emit_peer_proximity(nmsg->from_whom.uuid, (int)band);
+    _send_proximity_msg(&nmsg->from_whom, ID_PROXIMITY_REPLY, salt, our_tags);
+    log_debug(proc->logger, "Identity: proximity band %d with %s (probe)\n",
+              (int)band, sender);
+    return true;
+}
+
+/* Handler (initiator): the reply to our probe. Recompute our tags under the
+ * (echoed) salt, compare with theirs, emit the band. */
+static bool handle_proximity_reply(const process_t *proc, directory_t *queues,
+                                   generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    char sender[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, sender);
+    if (!_proximity_peer_connected(sender))
+        return true;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    unsigned char salt[AT_PROX_SALT_LEN];
+    uint8_t their_tags[AT_PROX_NTAGS][AT_PROX_TAG_LEN];
+    bool ok = _proximity_parse(payload, salt, their_tags);
+    json_decref(payload);
+    if (!ok) {
+        log_warn(proc->logger, "Identity: malformed proximity_reply from %s\n",
+                 sender);
+        return true;
+    }
+    uint8_t our_tags[AT_PROX_NTAGS][AT_PROX_TAG_LEN];
+    if (!_proximity_own_tags(proc, &nmsg->from_whom, salt, our_tags)) {
+        _proximity_store(sender, AT_PROX_UNKNOWN);
+        identity_emit_peer_proximity(nmsg->from_whom.uuid, AT_PROX_UNKNOWN);
+        return true;
+    }
+    at_prox_band_t band = proximity_band(our_tags, their_tags);
+    _proximity_store(sender, (int)band);
+    identity_emit_peer_proximity(nmsg->from_whom.uuid, (int)band);
+    log_debug(proc->logger, "Identity: proximity band %d with %s (reply)\n",
+              (int)band, sender);
+    return true;
+}
+
 /* Emit the stored position for every known peer — the roster-pull answer for
  * the position half. Snapshot peer uuids under peers_read_lock, look each up in
  * peer_position_map, emit outside the peers lock. Returns count emitted. */
@@ -5133,6 +5524,42 @@ static bool handle_app_connect_request(const process_t *proc, directory_t *queue
     identity_emit_connection(PEER_CONNECTION_STATE_OBSERVED, peer_uuid,
                              AT_CONN_PENDING_OUT);
     log_info(proc->logger, "Identity: connection requested to %s\n", peer_str);
+    return true;
+}
+
+/* App -> AT verb (AT_APP_REQUEST_ATTEND): the operator asks for a FRESH
+ * operator-attendance attestation from a peer NOW (Phase 2, presence). Payload
+ * {"peer": "<uuid_str>"}. Issue a nonce-fresh operator_attest_query to that
+ * peer; handle_attest_response updates the peer's operator_attested_at and
+ * re-emits peer_observed, so the app's presence dot refreshes. Non-const proc:
+ * identity_request_attestation records the outstanding nonce in id_state. */
+static bool handle_request_attend(process_t *proc, directory_t *queues,
+                                  generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *j_peer = json_object_get(payload, "peer");
+    if (!json_is_string(j_peer)) { json_decref(payload); return true; }
+    uuid_t peer_uuid;
+    int rc = uuid_parse(json_string_value(j_peer), peer_uuid);
+    json_decref(payload);
+    if (rc != 0) {
+        log_warn(proc->logger, "Identity: app request_attend: bad peer uuid\n");
+        return true;
+    }
+    public_identity_t peer;
+    if (!_find_peer_pub_by_uuid(proc, peer_uuid, &peer)) {
+        log_warn(proc->logger, "Identity: app request_attend: unknown peer\n");
+        return true;
+    }
+    (void)identity_request_attestation(proc, &peer, NULL, 0);
+    char peer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, peer_str);
+    log_info(proc->logger, "Identity: attendance pull requested from %s\n",
+             peer_str);
     return true;
 }
 
@@ -9829,6 +10256,11 @@ int identity_register_handlers(process_t *proc)
     process_register_handler(proc, ID_REACTION,         (handler_ptr_t)handle_reaction);
     process_register_handler(proc, ID_APP_REACT_POST,   (handler_ptr_t)handle_app_react_post);
     process_register_handler(proc, ID_APP_BLOCK,        (handler_ptr_t)handle_app_block);
+    process_register_handler(proc, ID_APP_REQUEST_ATTEND, (handler_ptr_t)handle_request_attend);
+    process_register_handler(proc, ID_APP_SET_EXACT_POSITION, (handler_ptr_t)handle_set_exact_position);
+    process_register_handler(proc, ID_APP_REQUEST_PROXIMITY, (handler_ptr_t)handle_request_proximity);
+    process_register_handler(proc, ID_PROXIMITY_PROBE, (handler_ptr_t)handle_proximity_probe);
+    process_register_handler(proc, ID_PROXIMITY_REPLY, (handler_ptr_t)handle_proximity_reply);
 #endif /* AT_SOCIAL_ENABLED */
     process_register_handler(proc, ID_IDENTITY_QUERY,
                              (handler_ptr_t)handle_identity_query);
