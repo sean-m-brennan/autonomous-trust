@@ -62,6 +62,8 @@ typedef enum {
     PEER_REACTION_OBSERVED,  /**< Identity → app: a peer reacted to one of our posts (Increment 8, @ref peer_reaction_msg_t). Local IPC only. Live stream — delivered on arrival. */
     PEER_PROXIMITY_OBSERVED, /**< Identity → app: the coarse distance BAND to a CONNECTED peer, learned by a private-proximity probe (Phase 2, @ref peer_proximity_msg_t). Local IPC only. No coordinates — only the band. */
     PEER_BUSINESS_AD_OBSERVED, /**< Identity → app: a signed business ad — one opaque Ethne page bundle plus the advertiser's satisfaction (Phase 3 P3.2, @ref peer_business_ad_msg_t). Local IPC only. Signature-verified and content-id-deduped before emit; the BUNDLE is verified app-side, never by the core. */
+    PEER_COSIGN_REQUEST_OBSERVED, /**< Identity → app: a peer asks this node to co-sign a staff-roll or guardianship record (Phase 3 P3.3, @ref peer_cosign_request_msg_t). Local IPC only. The core shape-checks the ask and carries the exported bytes; it holds no Ethne, so it verifies nothing about WHAT is being signed — and it never carries the wording, which the signer's own node derives from the bytes. */
+    PEER_COSIGN_SIG_OBSERVED, /**< Identity → app: a signer returns their detached signature over an exchange this node is authoring (Phase 3 P3.3, @ref peer_cosign_sig_msg_t). Local IPC only. The signature is checked against the payload by the ASSEMBLING node, not by the core. */
 #endif /* AT_SOCIAL_ENABLED */
 #ifdef AT_ZTA_ENABLED
     ZTA_REVOCATION_ALERT,    /**< Peer credential revocation notice. */
@@ -492,6 +494,97 @@ typedef struct {
     /** NUL-terminated opaque Ethne bundle, bound-truncated to AT_BUSINESS_BUNDLE_LEN. */
     char    bundle[AT_BUSINESS_BUNDLE_LEN + 1];
 } peer_business_ad_msg_t;
+
+/* Max hex characters of a detached exchange's exported canonical bytes (Phase 3
+ * P3.3). MUST match AT_COSIGN_BYTES_MAX in identity/cosign.h,
+ * AT_APP_COSIGN_BYTES_LEN in app_events.h, COSIGN_BYTES_HEX_MAX in the agora
+ * ethne_ffi crate, and AGORA_COSIGN_BYTES_MAX in the shim / cohort ctypes. */
+#define AT_COSIGN_BYTES_LEN 6144
+/* Max bytes of a polity DID, or of a signer's did:key. MUST match
+ * AT_COSIGN_DID_MAX in identity/cosign.h, AT_APP_COSIGN_DID_LEN in
+ * app_events.h, and AGORA_COSIGN_DID_MAX in the shim / cohort ctypes. */
+#define AT_COSIGN_DID_LEN 95
+/* Exchange content id as Ethne prints it: "b3:" + 64 lowercase hex. MUST match
+ * AT_COSIGN_CID_MAX in identity/cosign.h, AT_APP_COSIGN_CID_LEN in
+ * app_events.h, and AGORA_COSIGN_CID_MAX in the shim / cohort ctypes. */
+#define AT_COSIGN_CID_LEN 67
+/* An Ed25519 signature as lowercase hex (64 bytes -> 128 chars). MUST match
+ * AT_COSIGN_SIG_MAX in identity/cosign.h, AT_APP_COSIGN_SIG_LEN in
+ * app_events.h, and AGORA_COSIGN_SIG_MAX in the shim / cohort ctypes. */
+#define AT_COSIGN_SIG_LEN 128
+/* A record-class or op token ("membership", "guardian", "designate", …). MUST
+ * match AT_COSIGN_TOKEN_MAX in identity/cosign.h, AT_APP_COSIGN_TOKEN_LEN in
+ * app_events.h, and AGORA_COSIGN_TOKEN_MAX in the shim / cohort ctypes. */
+#define AT_COSIGN_TOKEN_LEN 15
+
+/**
+ * @brief AT → app: a peer asks this node to co-sign one record (Phase 3 P3.3).
+ *
+ * A staff roll act is decided by several people who are not at the same
+ * keyboard, and their KEYS DO NOT TRAVEL. The record does: one node exports its
+ * canonical bytes, each required signer signs those exact bytes on their own
+ * node, and the authoring node reassembles the signatures.
+ *
+ * @c peer_uuid is the REQUESTER, bound by crypto_box on the directed encrypted
+ * envelope — nobody can put an ask in somebody else's mouth. @c record is
+ * "membership" or "guardian" and @c op the act within it; @c polity the Ethne
+ * DID; @c cid the exchange's content address; @c bytes the exported canonical
+ * CBOR as lowercase hex.
+ *
+ * **The core verifies nothing about what is being signed**, exactly as it
+ * verifies nothing about a business page bundle: it holds no Ethne. It bounds
+ * and shape-checks the fields (known op, even-length lowercase hex) so a
+ * malformed ask is refused rather than carried.
+ *
+ * **No description travels.** What the record commits to, in words, is derived
+ * on the SIGNER's node from these bytes. Carrying the wording would let the
+ * asking node choose both what you sign and what you are told you are signing.
+ *
+ * Local IPC only; the on-wire form is the directed encrypted peer_cosign_request
+ * verb, not this message.
+ */
+typedef struct {
+    uuid_t  peer_uuid;   /**< The REQUESTER's uuid (crypto_box-authenticated). */
+    /** NUL-terminated record class: "membership" or "guardian". */
+    char    record[AT_COSIGN_TOKEN_LEN + 1];
+    /** NUL-terminated op: admit/expel, or designate/rotate/release. */
+    char    op[AT_COSIGN_TOKEN_LEN + 1];
+    /** NUL-terminated polity DID this record belongs to. */
+    char    polity[AT_COSIGN_DID_LEN + 1];
+    /** NUL-terminated exchange content id ("b3:<hex>"), NOT recomputed here. */
+    char    cid[AT_COSIGN_CID_LEN + 1];
+    int64_t seq;         /**< The requester's freshness sequence. */
+    double  ts;          /**< The requester's send time (epoch seconds). */
+    /** NUL-terminated exported canonical bytes, lowercase hex. Opaque. */
+    char    bytes[AT_COSIGN_BYTES_LEN + 1];
+} peer_cosign_request_msg_t;
+
+/**
+ * @brief AT → app: a signer returns their detached signature (Phase 3 P3.3).
+ *
+ * @c peer_uuid is the returning peer (crypto_box-authenticated). @c cid names
+ * the exchange, @c signer the signing did:key — which EMBEDS its public key, so
+ * the assembling node needs no registry to check the signature — and @c sig the
+ * detached Ed25519 signature over the exported bytes, as lowercase hex.
+ *
+ * The core does not check the signature, and could not: it does not hold the
+ * payload. Verification happens where it belongs, on the ASSEMBLING node, which
+ * refuses a wrong key or a tampered payload before anything is appended.
+ *
+ * Local IPC only; the on-wire form is the directed encrypted peer_cosign_sig
+ * verb, not this message.
+ */
+typedef struct {
+    uuid_t  peer_uuid;   /**< The SIGNER's uuid (crypto_box-authenticated). */
+    /** NUL-terminated exchange content id this signature is for. */
+    char    cid[AT_COSIGN_CID_LEN + 1];
+    /** NUL-terminated signer did:key (embeds the public key). */
+    char    signer[AT_COSIGN_DID_LEN + 1];
+    /** NUL-terminated detached Ed25519 signature, lowercase hex. */
+    char    sig[AT_COSIGN_SIG_LEN + 1];
+    int64_t seq;         /**< The signer's freshness sequence. */
+    double  ts;          /**< The signer's send time (epoch seconds). */
+} peer_cosign_sig_msg_t;
 #endif /* AT_SOCIAL_ENABLED */
 
 #define SIGNAL_LEN 32
@@ -587,6 +680,8 @@ typedef struct
         peer_reaction_msg_t peer_reaction;
         peer_proximity_msg_t peer_proximity;
         peer_business_ad_msg_t peer_business_ad;
+        peer_cosign_request_msg_t peer_cosign_request;
+        peer_cosign_sig_msg_t peer_cosign_sig;
 #endif /* AT_SOCIAL_ENABLED */
 #ifdef AT_ZTA_ENABLED
         zta_event_msg_t zta_event;

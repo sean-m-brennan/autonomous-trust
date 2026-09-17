@@ -98,6 +98,32 @@ extern "C" {
 /** A business advertising its OWN page, rather than a customer rating it. MUST
  *  match AT_BUSINESS_SAT_SELF in identity/business_ad.h. */
 #define AT_APP_BUSINESS_SAT_SELF 0xFF
+
+/** Max hex characters of a detached exchange's exported canonical bytes (Phase 3
+ *  P3.3), so half this many bytes of CBOR. MUST match AT_COSIGN_BYTES_MAX in
+ *  identity/cosign.h, AT_COSIGN_BYTES_LEN in msg_types.h, COSIGN_BYTES_HEX_MAX
+ *  in the agora ethne_ffi crate, and AGORA_COSIGN_BYTES_MAX in the shim / cohort
+ *  ctypes.
+ *
+ *  MEASURED against real exchanges: a membership admission is 666 hex, a
+ *  guardian designation carrying an observation 2142 for a small polity and 4192
+ *  for a majority of thirty staff with a long rationale. The evidence is what
+ *  grows it — roughly 372 hex per extra reading — so an exchange cites an
+ *  observation scoped to the member concerned, and the authoring side refuses an
+ *  oversized one outright rather than letting it truncate. */
+#define AT_APP_COSIGN_BYTES_LEN 6144
+/** Max bytes of a polity DID or a signer's did:key. MUST match AT_COSIGN_DID_MAX
+ *  (identity/cosign.h), AT_COSIGN_DID_LEN (msg_types.h) and AGORA_COSIGN_DID_MAX. */
+#define AT_APP_COSIGN_DID_LEN 95
+/** Exchange content id, "b3:" + 64 lowercase hex. MUST match AT_COSIGN_CID_MAX
+ *  (identity/cosign.h), AT_COSIGN_CID_LEN (msg_types.h) and AGORA_COSIGN_CID_MAX. */
+#define AT_APP_COSIGN_CID_LEN 67
+/** An Ed25519 signature as lowercase hex. MUST match AT_COSIGN_SIG_MAX
+ *  (identity/cosign.h), AT_COSIGN_SIG_LEN (msg_types.h) and AGORA_COSIGN_SIG_MAX. */
+#define AT_APP_COSIGN_SIG_LEN 128
+/** A record-class or op token. MUST match AT_COSIGN_TOKEN_MAX
+ *  (identity/cosign.h), AT_COSIGN_TOKEN_LEN (msg_types.h) and AGORA_COSIGN_TOKEN_MAX. */
+#define AT_APP_COSIGN_TOKEN_LEN 15
 #endif /* AT_SOCIAL_ENABLED */
 
 /** Returned instead of -1 when the daemon exists but has not bound its queue
@@ -167,7 +193,18 @@ typedef enum {
      *  one of its CUSTOMERS re-advertising from cache in the first person;
      *  nobody else carries a page, so what reaches you came through people who
      *  actually patronize the place. */
-    AT_APP_EVENT_BUSINESS_AD = 12
+    AT_APP_EVENT_BUSINESS_AD = 12,
+
+    /** A peer asks THIS node to co-sign one staff-roll or guardianship record
+     *  (Phase 3 P3.3, @ref at_app_cosign_request_t). The keys never travel; the
+     *  record does. What it commits to, in words, is NOT carried — derive it on
+     *  this node from @c bytes, which is what will actually be signed. */
+    AT_APP_EVENT_COSIGN_REQUEST = 13,
+
+    /** A signer returns their detached signature over an exchange THIS node is
+     *  authoring (Phase 3 P3.3, @ref at_app_cosign_sig_t). Check it against the
+     *  payload before appending — the core neither did nor could. */
+    AT_APP_EVENT_COSIGN_SIGNATURE = 14
 #endif /* AT_SOCIAL_ENABLED */
 } at_app_event_kind_t;
 
@@ -340,6 +377,63 @@ typedef struct {
     double  ts;
     char    bundle[AT_APP_BUSINESS_BUNDLE_LEN + 1];
 } at_app_business_ad_t;
+
+/** One peer's ask that this node co-sign a record (Phase 3 P3.3).
+ *
+ *  A staff roll act — admitting, expelling, designating a machine, moving or
+ *  releasing its guardian — is decided by several people who are not at the same
+ *  keyboard. Their PRIVATE KEYS DO NOT TRAVEL: the record's canonical bytes do,
+ *  each signer signs them where their key already lives, and the authoring node
+ *  reassembles the signatures.
+ *
+ *  @c requester_uuid is crypto_box-authenticated, so an ask cannot be put in
+ *  somebody else's mouth. @c record is "membership" or "guardian", @c op the act
+ *  within it, @c polity the Ethne DID, @c cid the exchange's content address,
+ *  and @c bytes the exported canonical CBOR as lowercase hex.
+ *
+ *  @c bytes is OPAQUE and NOT verified by the core — it holds no Ethne, exactly
+ *  as it holds no verifier for a page bundle. What the core did check is the
+ *  shape: a known op, and an even-length lowercase-hex payload within bounds.
+ *
+ *  **No description is carried, deliberately.** Derive what these bytes commit
+ *  to on THIS node (`ethne_describe`) and show the operator that. If the asking
+ *  node supplied the wording too, it would choose both what you sign and what
+ *  you are told you are signing — a friendly sentence over hostile bytes, with a
+ *  real signature on the end. Recompute @c cid from @c bytes while you are
+ *  there; it is carried for reference, never as proof.
+ *
+ *  Carried by AT_APP_EVENT_COSIGN_REQUEST. A live stream — delivered on
+ *  arrival, not roster state. */
+typedef struct {
+    uint8_t requester_uuid[AT_APP_UUID_LEN];
+    char    record[AT_APP_COSIGN_TOKEN_LEN + 1];
+    char    op[AT_APP_COSIGN_TOKEN_LEN + 1];
+    char    polity[AT_APP_COSIGN_DID_LEN + 1];
+    char    cid[AT_APP_COSIGN_CID_LEN + 1];
+    int64_t seq;
+    double  ts;
+    char    bytes[AT_APP_COSIGN_BYTES_LEN + 1];
+} at_app_cosign_request_t;
+
+/** One signer's detached signature, returned to the authoring node (Phase 3
+ *  P3.3). @c signer_uuid is crypto_box-authenticated; @c cid names the exchange;
+ *  @c signer_did is the signing did:key, which EMBEDS its public key, so no
+ *  registry is needed to check the signature; @c sig is the detached Ed25519
+ *  signature over the exported bytes, as lowercase hex.
+ *
+ *  The core did not verify @c sig and could not — it does not hold the payload.
+ *  Verification belongs to the assembling node, which refuses a wrong key or a
+ *  tampered payload before anything is appended.
+ *
+ *  Carried by AT_APP_EVENT_COSIGN_SIGNATURE. A live stream. */
+typedef struct {
+    uint8_t signer_uuid[AT_APP_UUID_LEN];
+    char    cid[AT_APP_COSIGN_CID_LEN + 1];
+    char    signer_did[AT_APP_COSIGN_DID_LEN + 1];
+    char    sig[AT_APP_COSIGN_SIG_LEN + 1];
+    int64_t seq;
+    double  ts;
+} at_app_cosign_sig_t;
 #endif /* AT_SOCIAL_ENABLED */
 
 /** A decoded app-facing event. */
@@ -358,6 +452,8 @@ typedef struct {
         at_app_reaction_t   reaction;
         at_app_proximity_t  proximity;
         at_app_business_ad_t business_ad;
+        at_app_cosign_request_t cosign_request;
+        at_app_cosign_sig_t cosign_sig;
 #endif /* AT_SOCIAL_ENABLED */
     } data;
 } at_app_event_t;
@@ -645,6 +741,55 @@ int at_app_events_react_post(at_app_events_t *handle, const char *q_out,
  */
 int at_app_events_block(at_app_events_t *handle, const char *q_out,
                         const uint8_t peer_uuid[AT_APP_UUID_LEN]);
+
+/**
+ * @brief Ask named peers to co-sign one record (Phase 3 P3.3).
+ *
+ * Sends the app→AT `AT_APP_REQUEST_COSIGN` verb on @p q_out with
+ * {"peers", "record", "op", "polity", "cid", "bytes"}; identity sends each named
+ * peer a directed ENCRYPTED `peer_cosign_request`, and each of them answers with
+ * @ref at_app_events_return_cosign. No private key moves: that is the whole
+ * point of exporting the bytes rather than gathering the keys.
+ *
+ * @p bytes is the exchange's canonical CBOR as lowercase hex, and it must be
+ * reproduced EXACTLY — the signatures are over these bytes, so anything that
+ * truncates or re-encodes them produces signatures over nothing. An oversized
+ * exchange is refused rather than shortened; keep the cited observation scoped
+ * to the member concerned (see @ref AT_APP_COSIGN_BYTES_LEN).
+ *
+ * The core carries the payload and verifies nothing about it, and it carries NO
+ * description: each signer's own node derives what the bytes commit to. Do not
+ * add one here — a wording chosen by the asking node is how a human comes to
+ * sign something other than what they were shown.
+ *
+ * @param[in] peer_uuids  @p n_peers × 16-byte identities to ask.
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound, -1 on
+ *         any other failure (including a malformed op or non-hex @p bytes).
+ */
+int at_app_events_request_cosign(at_app_events_t *handle, const char *q_out,
+                                 const uint8_t *peer_uuids, size_t n_peers,
+                                 const char *record, const char *op,
+                                 const char *polity_did, const char *cid,
+                                 const char *bytes);
+
+/**
+ * @brief Return this node's detached signature to the authoring peer (Phase 3
+ * P3.3).
+ *
+ * Sends the app→AT `AT_APP_RETURN_COSIGN` verb on @p q_out with
+ * {"peer", "cid", "signer", "sig"}; identity sends the requester a directed
+ * ENCRYPTED `peer_cosign_sig`. @p signer_did is this signer's did:key (it embeds
+ * the public key, so the assembling node needs no registry) and @p sig_hex the
+ * detached Ed25519 signature over the exported bytes.
+ *
+ * Sign only after deriving, on this node, what those bytes actually commit to.
+ *
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound, -1 otherwise.
+ */
+int at_app_events_return_cosign(at_app_events_t *handle, const char *q_out,
+                                const uint8_t peer_uuid[AT_APP_UUID_LEN],
+                                const char *cid, const char *signer_did,
+                                const char *sig_hex);
 #endif /* AT_SOCIAL_ENABLED */
 
 /** @brief Close the queue and release the handle. NULL-safe. */

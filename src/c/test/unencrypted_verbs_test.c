@@ -89,6 +89,15 @@ static const char *const REFUSED[] = {
     "peer_connection_response", /* signed accept/decline: encrypted directed (Increment 5) */
     "peer_dm",             /* direct message: encrypted directed (Increment 6) */
     "peer_post",           /* feed post: group-encrypted multicast (Increment 7) */
+    "peer_reaction",       /* post reaction: encrypted directed (Increment 8) */
+    "peer_business_ad",    /* business ad: group-encrypted multicast (P3.2) */
+    /* Co-signing (P3.3) carries the canonical bytes of a governance record and
+     * the signatures over them. Both are encrypted directed, like a DM. The
+     * allowlist is positive, so they are already refused — pinned here because
+     * the day somebody widens that list, THIS is the pair that must not be in
+     * it: an ask crossing in plaintext is an ask anyone can forge or rewrite. */
+    "peer_cosign_request",
+    "peer_cosign_sig",
 #endif /* AT_SOCIAL_ENABLED */
     "tier_update",         /* local IPC; never legitimate off the wire */
     "subtree_roster_query",

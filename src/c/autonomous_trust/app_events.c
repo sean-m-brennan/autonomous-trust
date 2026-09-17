@@ -24,6 +24,9 @@
 #include "utilities/message.h"
 #include "utilities/msg_types.h"
 #include "utilities/msg_types_priv.h"   /* net_msg_pack_json */
+#ifdef AT_SOCIAL_ENABLED
+#include "identity/cosign.h"             /* at_cosign_op_ok / at_cosign_bytes_ok */
+#endif
 
 struct at_app_events_s {
     queue_t queue;
@@ -180,6 +183,54 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
             memcpy(ev->data.business_ad.bundle, msg.info.peer_business_ad.bundle,
                    AT_APP_BUSINESS_BUNDLE_LEN);
             ev->data.business_ad.bundle[AT_APP_BUSINESS_BUNDLE_LEN] = '\0';
+            break;
+        }
+        case PEER_COSIGN_REQUEST_OBSERVED:
+        {
+            at_app_event_t *ev = &out[n++];
+            memset(ev, 0, sizeof(*ev));
+            ev->kind = AT_APP_EVENT_COSIGN_REQUEST;
+            memcpy(ev->data.cosign_request.requester_uuid,
+                   msg.info.peer_cosign_request.peer_uuid, AT_APP_UUID_LEN);
+            /* The emitter NUL-caps every string; the event was memset, so a
+             * short string stays terminated after the bounded copy. */
+            memcpy(ev->data.cosign_request.record,
+                   msg.info.peer_cosign_request.record, AT_APP_COSIGN_TOKEN_LEN);
+            ev->data.cosign_request.record[AT_APP_COSIGN_TOKEN_LEN] = '\0';
+            memcpy(ev->data.cosign_request.op,
+                   msg.info.peer_cosign_request.op, AT_APP_COSIGN_TOKEN_LEN);
+            ev->data.cosign_request.op[AT_APP_COSIGN_TOKEN_LEN] = '\0';
+            memcpy(ev->data.cosign_request.polity,
+                   msg.info.peer_cosign_request.polity, AT_APP_COSIGN_DID_LEN);
+            ev->data.cosign_request.polity[AT_APP_COSIGN_DID_LEN] = '\0';
+            memcpy(ev->data.cosign_request.cid,
+                   msg.info.peer_cosign_request.cid, AT_APP_COSIGN_CID_LEN);
+            ev->data.cosign_request.cid[AT_APP_COSIGN_CID_LEN] = '\0';
+            ev->data.cosign_request.seq = msg.info.peer_cosign_request.seq;
+            ev->data.cosign_request.ts = msg.info.peer_cosign_request.ts;
+            memcpy(ev->data.cosign_request.bytes,
+                   msg.info.peer_cosign_request.bytes, AT_APP_COSIGN_BYTES_LEN);
+            ev->data.cosign_request.bytes[AT_APP_COSIGN_BYTES_LEN] = '\0';
+            break;
+        }
+        case PEER_COSIGN_SIG_OBSERVED:
+        {
+            at_app_event_t *ev = &out[n++];
+            memset(ev, 0, sizeof(*ev));
+            ev->kind = AT_APP_EVENT_COSIGN_SIGNATURE;
+            memcpy(ev->data.cosign_sig.signer_uuid,
+                   msg.info.peer_cosign_sig.peer_uuid, AT_APP_UUID_LEN);
+            memcpy(ev->data.cosign_sig.cid, msg.info.peer_cosign_sig.cid,
+                   AT_APP_COSIGN_CID_LEN);
+            ev->data.cosign_sig.cid[AT_APP_COSIGN_CID_LEN] = '\0';
+            memcpy(ev->data.cosign_sig.signer_did,
+                   msg.info.peer_cosign_sig.signer, AT_APP_COSIGN_DID_LEN);
+            ev->data.cosign_sig.signer_did[AT_APP_COSIGN_DID_LEN] = '\0';
+            memcpy(ev->data.cosign_sig.sig, msg.info.peer_cosign_sig.sig,
+                   AT_APP_COSIGN_SIG_LEN);
+            ev->data.cosign_sig.sig[AT_APP_COSIGN_SIG_LEN] = '\0';
+            ev->data.cosign_sig.seq = msg.info.peer_cosign_sig.seq;
+            ev->data.cosign_sig.ts = msg.info.peer_cosign_sig.ts;
             break;
         }
         case PEER_PROXIMITY_OBSERVED:
@@ -642,6 +693,101 @@ int at_app_events_block(at_app_events_t *handle, const char *q_out,
     snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),
              "identity");
     req.info.net_msg.function = (char *)AT_APP_BLOCK;
+    req.info.net_msg.encrypt = false;
+    if (net_msg_pack_json(&req.info.net_msg, env) != 0) {
+        json_decref(env);
+        return -1;
+    }
+    json_decref(env);
+    return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
+}
+
+int at_app_events_request_cosign(at_app_events_t *handle, const char *q_out,
+                                 const uint8_t *peer_uuids, size_t n_peers,
+                                 const char *record, const char *op,
+                                 const char *polity_did, const char *cid,
+                                 const char *bytes)
+{
+    if (handle == NULL || !name_survives(q_out) || peer_uuids == NULL
+        || n_peers == 0 || polity_did == NULL || cid == NULL
+        || polity_did[0] == '\0' || cid[0] == '\0')
+        return -1;
+    /* Refuse an unknown act or a payload that never came from an exporter,
+     * HERE, where the caller still has it. A malformed ask that reached the
+     * signers would only be refused after somebody had been interrupted to look
+     * at it. */
+    if (!at_cosign_op_ok(record, op) || !at_cosign_bytes_ok(bytes))
+        return -1;
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
+    json_t *peers = json_array();
+    if (peers == NULL)
+        return -1;
+    for (size_t i = 0; i < n_peers; i++) {
+        char uuid_str[37];
+        uuid_unparse_lower((const unsigned char *)(peer_uuids + i * AT_APP_UUID_LEN),
+                           uuid_str);
+        if (json_array_append_new(peers, json_string(uuid_str)) != 0) {
+            json_decref(peers);
+            return -1;
+        }
+    }
+    /* {"peers": [...], "record", "op", "polity", "cid", "bytes"}; identity sends
+     * each named peer a directed encrypted peer_cosign_request. NO description:
+     * every signer's own node derives what the bytes commit to. */
+    json_t *env = json_object();
+    if (env == NULL) {
+        json_decref(peers);
+        return -1;
+    }
+    json_object_set_new(env, "peers", peers);
+    json_object_set_new(env, "record", json_string(record));
+    json_object_set_new(env, "op", json_string(op));
+    json_object_set_new(env, "polity", json_string(polity_did));
+    json_object_set_new(env, "cid", json_string(cid));
+    json_object_set_new(env, "bytes", json_string(bytes));
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),
+             "identity");
+    req.info.net_msg.function = (char *)AT_APP_REQUEST_COSIGN;
+    req.info.net_msg.encrypt = false;
+    if (net_msg_pack_json(&req.info.net_msg, env) != 0) {
+        json_decref(env);
+        return -1;
+    }
+    json_decref(env);
+    return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
+}
+
+int at_app_events_return_cosign(at_app_events_t *handle, const char *q_out,
+                                const uint8_t peer_uuid[AT_APP_UUID_LEN],
+                                const char *cid, const char *signer_did,
+                                const char *sig_hex)
+{
+    if (handle == NULL || !name_survives(q_out) || peer_uuid == NULL
+        || cid == NULL || signer_did == NULL || sig_hex == NULL
+        || cid[0] == '\0' || signer_did[0] == '\0' || sig_hex[0] == '\0')
+        return -1;
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
+    char uuid_str[37];
+    uuid_unparse_lower((const unsigned char *)peer_uuid, uuid_str);
+    /* {"peer", "cid", "signer", "sig"}; identity sends the requester a directed
+     * encrypted peer_cosign_sig. The signature is checked against the payload by
+     * the assembling node — the only one that holds it. */
+    json_t *env = json_object();
+    if (env == NULL)
+        return -1;
+    json_object_set_new(env, "peer", json_string(uuid_str));
+    json_object_set_new(env, "cid", json_string(cid));
+    json_object_set_new(env, "signer", json_string(signer_did));
+    json_object_set_new(env, "sig", json_string(sig_hex));
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),
+             "identity");
+    req.info.net_msg.function = (char *)AT_APP_RETURN_COSIGN;
     req.info.net_msg.encrypt = false;
     if (net_msg_pack_json(&req.info.net_msg, env) != 0) {
         json_decref(env);
