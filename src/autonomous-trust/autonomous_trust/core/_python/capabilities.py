@@ -371,6 +371,130 @@ def post_content_id(author_uuid, seq: int, ts: float, required_tier: int,
         digest_size=32).hexdigest()
 
 
+# --- business ads (Phase 3 P3.2, "businesses near me") ---------------------- #
+# A business ad carries one business page — an opaque, SELF-VERIFYING Ethne
+# bundle — together with the signed statement of the node advertising it.
+#
+# THE STRUCTURAL DIFFERENCE FROM A POST: a post is relayed by any peer and so
+# carries a hop count. A business ad is NEVER relayed. Only a CUSTOMER carries a
+# business's page, and a customer does not forward someone else's ad — it
+# RE-ADVERTISES from its own cache, in the first person, with its own key and its
+# own satisfaction. A business's reach is therefore exactly the sum of its
+# customers' voices, and distribution and reputation are the same fact.
+#
+# TWO TRUST LAYERS meet and must not be confused: this canonical is the AT layer
+# (who vouched, how happy, for which exact page bytes). The Ethne layer — the
+# bundle proving polity-root -> envoy -> page — is OPAQUE to the runtime and is
+# verified by the app. MUST stay byte-identical to C identity/business_ad.c
+# (at_business_ad_canonical / at_business_ad_content_id).
+
+# Opaque Ethne page-bundle bound (bytes). MUST match C AT_BUSINESS_BUNDLE_MAX /
+# AT_BUSINESS_BUNDLE_LEN / AT_APP_BUSINESS_BUNDLE_LEN.
+BUSINESS_BUNDLE_MAX = 3072
+# Polity DID bound (bytes). MUST match C AT_BUSINESS_DID_MAX / AT_BUSINESS_DID_LEN.
+BUSINESS_DID_MAX = 95
+# Ad content id length (blake2b-256 lowercase hex). MUST match C
+# AT_BUSINESS_AD_ID_HEX_LEN / AT_BUSINESS_AD_ID_LEN.
+BUSINESS_AD_ID_HEX_LEN = 64
+# Declarable customer satisfaction range.
+BUSINESS_SAT_MIN = 0
+BUSINESS_SAT_MAX = 4
+# A business advertising its OWN page rather than a customer rating it. Excluded
+# from the vouch term app-side, because self-vouching is free.
+BUSINESS_SAT_SELF = 0xFF
+
+
+def bound_business_bundle(text: str) -> str:
+    """Truncate an Ethne page bundle to BUSINESS_BUNDLE_MAX UTF-8 bytes. Twin of
+    C at_business_bound_bundle."""
+    if not isinstance(text, str):
+        return ''
+    return _clamp_bytes(text, BUSINESS_BUNDLE_MAX)
+
+
+def bound_business_did(text: str) -> str:
+    """Truncate a polity DID to BUSINESS_DID_MAX UTF-8 bytes. Twin of C
+    at_business_bound_did."""
+    if not isinstance(text, str):
+        return ''
+    return _clamp_bytes(text, BUSINESS_DID_MAX)
+
+
+def business_sat_valid(sat: int) -> bool:
+    """True iff sat is a declarable customer satisfaction (0..4) or the
+    business's own BUSINESS_SAT_SELF marker. Twin of C at_business_sat_valid."""
+    try:
+        sat = int(sat)
+    except (ValueError, TypeError):
+        return False
+    return sat == BUSINESS_SAT_SELF or BUSINESS_SAT_MIN <= sat <= BUSINESS_SAT_MAX
+
+
+def business_ad_canonical(advertiser_uuid, polity_did: str, satisfaction: int,
+                          page_seq: int, ts: float, bundle: str) -> bytes:
+    """THE cross-language signing/hash contract (see C identity/business_ad.h):
+      advertiser_uuid[16] || u32le(did_len) || did || u8(satisfaction)
+      || u64le(page_seq) || f64le(ts) || u32le(bundle_len) || utf8_bundle
+    where ts is the raw IEEE-754 little-endian double (struct '<d'). The did and
+    bundle are bound-truncated first, so the canonical matches what crosses the
+    wire. Because the bundle BYTES are inside the canonical, an endorsement
+    cannot be lifted off one page and re-attached to another. MUST stay
+    byte-identical to C at_business_ad_canonical."""
+    out = bytearray(_uuid16(advertiser_uuid))
+    d = bound_business_did(polity_did).encode('utf-8')
+    out += _u32le(len(d))
+    out += d
+    out += bytes((int(satisfaction) & 0xFF,))
+    out += int(page_seq).to_bytes(8, 'little')
+    out += _struct.pack('<d', float(ts))
+    b = bound_business_bundle(bundle).encode('utf-8')
+    out += _u32le(len(b))
+    out += b
+    return bytes(out)
+
+
+def business_ad_id(advertiser_uuid, polity_did: str, satisfaction: int,
+                   page_seq: int, ts: float, bundle: str) -> str:
+    """blake2b-256 of the canonical bytes, lowercase hex
+    (BUSINESS_AD_ID_HEX_LEN chars) — the dedup/merge key, and what forecloses
+    replay. Twin of C at_business_ad_content_id."""
+    import hashlib
+    return hashlib.blake2b(
+        business_ad_canonical(advertiser_uuid, polity_did, satisfaction,
+                              page_seq, ts, bundle),
+        digest_size=32).hexdigest()
+
+
+def business_ad_sign(signing_key: '_SigningKey', advertiser_uuid,
+                     polity_did: str, satisfaction: int, page_seq: int,
+                     ts: float, bundle: str) -> str:
+    """Detached Ed25519 signature over business_ad_canonical, lowercase hex."""
+    sig = signing_key.sign(
+        business_ad_canonical(advertiser_uuid, polity_did, satisfaction,
+                              page_seq, ts, bundle)).signature
+    return sig.hex()
+
+
+def business_ad_verify(verify_key: '_VerifyKey', advertiser_uuid,
+                       polity_did: str, satisfaction: int, page_seq: int,
+                       ts: float, bundle: str, sig_hex: str) -> bool:
+    """Verify a detached signature (lowercase hex) over business_ad_canonical."""
+    try:
+        sig = bytes.fromhex(sig_hex)
+    except (ValueError, TypeError):
+        return False
+    if len(sig) != 64:
+        return False
+    from nacl.exceptions import BadSignatureError
+    try:
+        verify_key.verify(
+            business_ad_canonical(advertiser_uuid, polity_did, satisfaction,
+                                  page_seq, ts, bundle), sig)
+        return True
+    except BadSignatureError:
+        return False
+
+
 # Increment 8: social-interaction reputation accrual. Both peers of an
 # interaction derive the SAME task id independently and must agree byte-for-byte,
 # or their two scores never pair into one bilateral transaction. MUST stay in

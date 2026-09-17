@@ -88,6 +88,8 @@ size_t message_size(message_type_t type)
         return sizeof(peer_reaction_msg_t);
     case PEER_PROXIMITY_OBSERVED:
         return sizeof(peer_proximity_msg_t);
+    case PEER_BUSINESS_AD_OBSERVED:
+        return sizeof(peer_business_ad_msg_t);
 #endif /* AT_SOCIAL_ENABLED */
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:
@@ -161,6 +163,8 @@ char *message_type_to_string(message_type_t type)
         return (char*)"PEER_REACTION_OBSERVED";
     case PEER_PROXIMITY_OBSERVED:
         return (char*)"PEER_PROXIMITY_OBSERVED";
+    case PEER_BUSINESS_AD_OBSERVED:
+        return (char*)"PEER_BUSINESS_AD_OBSERVED";
 #endif /* AT_SOCIAL_ENABLED */
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:
@@ -236,6 +240,8 @@ message_type_t string_to_message_type(const char *str)
         return PEER_REACTION_OBSERVED;
     if (strcmp(str, "PEER_PROXIMITY_OBSERVED") == 0)
         return PEER_PROXIMITY_OBSERVED;
+    if (strcmp(str, "PEER_BUSINESS_AD_OBSERVED") == 0)
+        return PEER_BUSINESS_AD_OBSERVED;
 #endif /* AT_SOCIAL_ENABLED */
 #ifdef AT_ZTA_ENABLED
     if (strcmp(str, "ZTA_STANDING") == 0)
@@ -539,6 +545,14 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         memcpy(subdata, &msg->info.peer_proximity, subdata_len);
         break;
     }
+    case PEER_BUSINESS_AD_OBSERVED:
+    {
+        subdata_len = sizeof(peer_business_ad_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.peer_business_ad, subdata_len);
+        break;
+    }
     case PEER_REACTION_OBSERVED:
     {
         subdata_len = sizeof(peer_reaction_msg_t);
@@ -832,6 +846,9 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
         break;
     case PEER_PROXIMITY_OBSERVED:
         COPY_FIXED_PAYLOAD(peer_proximity, peer_proximity_msg_t);
+        break;
+    case PEER_BUSINESS_AD_OBSERVED:
+        COPY_FIXED_PAYLOAD(peer_business_ad, peer_business_ad_msg_t);
         break;
 #endif /* AT_SOCIAL_ENABLED */
     case PEER_REPUTATION:

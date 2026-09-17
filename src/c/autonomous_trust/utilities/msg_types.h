@@ -61,6 +61,7 @@ typedef enum {
     PEER_POST_OBSERVED,      /**< Identity → app: a signed feed post received over the group channel (Increment 7, @ref peer_post_msg_t). Local IPC only. Signature-verified, tier-gated and content-id-deduped before emit. */
     PEER_REACTION_OBSERVED,  /**< Identity → app: a peer reacted to one of our posts (Increment 8, @ref peer_reaction_msg_t). Local IPC only. Live stream — delivered on arrival. */
     PEER_PROXIMITY_OBSERVED, /**< Identity → app: the coarse distance BAND to a CONNECTED peer, learned by a private-proximity probe (Phase 2, @ref peer_proximity_msg_t). Local IPC only. No coordinates — only the band. */
+    PEER_BUSINESS_AD_OBSERVED, /**< Identity → app: a signed business ad — one opaque Ethne page bundle plus the advertiser's satisfaction (Phase 3 P3.2, @ref peer_business_ad_msg_t). Local IPC only. Signature-verified and content-id-deduped before emit; the BUNDLE is verified app-side, never by the core. */
 #endif /* AT_SOCIAL_ENABLED */
 #ifdef AT_ZTA_ENABLED
     ZTA_REVOCATION_ALERT,    /**< Peer credential revocation notice. */
@@ -443,6 +444,54 @@ typedef struct {
     int64_t seq;         /**< The reactor's freshness sequence. */
     double  ts;          /**< The reactor's send time (epoch seconds). */
 } peer_reaction_msg_t;
+
+/* Max bytes of the opaque Ethne page bundle carried across the AT->app boundary
+ * (Phase 3 P3.2). MUST match AT_BUSINESS_BUNDLE_MAX in identity/business_ad.h,
+ * AT_APP_BUSINESS_BUNDLE_LEN in app_events.h, and AGORA_BUSINESS_BUNDLE_MAX in
+ * the shim / cohort ctypes. */
+#define AT_BUSINESS_BUNDLE_LEN 3072
+/* Max bytes of a polity DID. MUST match AT_BUSINESS_DID_MAX in
+ * identity/business_ad.h, AT_APP_BUSINESS_DID_LEN in app_events.h, and
+ * AGORA_BUSINESS_DID_MAX in the shim / cohort ctypes. */
+#define AT_BUSINESS_DID_LEN 95
+/* Ad content id: blake2b-256 digest as lowercase hex (32 bytes -> 64 chars).
+ * MUST match AT_BUSINESS_AD_ID_HEX_LEN in identity/business_ad.h,
+ * AT_APP_BUSINESS_AD_ID_LEN in app_events.h, and AGORA_BUSINESS_AD_ID_MAX in the
+ * shim / cohort ctypes. */
+#define AT_BUSINESS_AD_ID_LEN 64
+
+/**
+ * @brief AT → app: one signed business ad received over the group channel
+ * (Phase 3 P3.2, "businesses near me").
+ *
+ * @c peer_uuid is the ADVERTISER — bound by the Ed25519 signature the core
+ * verified before emitting, NOT by the wire envelope — and is either the
+ * business's own node or a CUSTOMER re-advertising from its cache in the first
+ * person. There is no relay and no hop count: only customers carry a page, and
+ * they always speak for themselves (see identity/business_ad.h).
+ *
+ * @c polity is the business's Ethne DID (the page store's key), @c satisfaction
+ * the advertiser's declared 0..4 rating or @ref AT_BUSINESS_SAT_SELF for the
+ * business's own ad, @c seq the page version, @c ts the advertiser's send time.
+ * @c ad_id is the blake2b content-address of the canonical form — the dedup key.
+ *
+ * @c bundle is the OPAQUE, self-verifying Ethne page artifact ({page,delegation}
+ * proving polity-root → envoy → page). The core never parses it; the APP
+ * verifies it. Local IPC only; the on-wire form is the group-encrypted
+ * peer_business_ad verb, not this message.
+ */
+typedef struct {
+    uuid_t  peer_uuid;   /**< The ADVERTISER's uuid (signature-bound). */
+    /** NUL-terminated polity DID — the business this ad is for. */
+    char    polity[AT_BUSINESS_DID_LEN + 1];
+    /** NUL-terminated blake2b ad content id (lowercase hex). */
+    char    ad_id[AT_BUSINESS_AD_ID_LEN + 1];
+    int32_t satisfaction; /**< 0..4, or AT_BUSINESS_SAT_SELF (255) for the business's own ad. */
+    int64_t seq;         /**< The page version the advertiser is carrying. */
+    double  ts;          /**< The advertiser's send time (epoch seconds). */
+    /** NUL-terminated opaque Ethne bundle, bound-truncated to AT_BUSINESS_BUNDLE_LEN. */
+    char    bundle[AT_BUSINESS_BUNDLE_LEN + 1];
+} peer_business_ad_msg_t;
 #endif /* AT_SOCIAL_ENABLED */
 
 #define SIGNAL_LEN 32
@@ -537,6 +586,7 @@ typedef struct
         peer_post_msg_t peer_post;
         peer_reaction_msg_t peer_reaction;
         peer_proximity_msg_t peer_proximity;
+        peer_business_ad_msg_t peer_business_ad;
 #endif /* AT_SOCIAL_ENABLED */
 #ifdef AT_ZTA_ENABLED
         zta_event_msg_t zta_event;

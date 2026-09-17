@@ -48,8 +48,11 @@ typedef struct
      * Group.key_epoch and rides group_to_json as "key_epoch". The key used to be permanent, so admitting a member also
      * handed it the ability to decrypt cohort traffic recorded BEFORE it
      * joined; admission now rotates, and this is what makes a rotation safe to
-     * accept — a receiver adopts a new key only with a strictly HIGHER epoch,
-     * so a captured older key cannot be replayed back over a newer one.
+     * accept — a receiver never adopts a LOWER epoch, and never re-adopts a key
+     * it has already retired, so a captured older key cannot be replayed back
+     * over a newer one. An EQUAL epoch is settled by a deterministic key
+     * tiebreak (see group_accept_rotation) so that two members rotating at the
+     * same instant converge instead of forking the cohort permanently.
      * 0 = never rotated, which is every group minted before this existed. */
     int64_t key_epoch;
     /* Superseded keys, newest first, with the time each was retired. Kept only
@@ -183,9 +186,11 @@ int group_decrypt(const group_t *ident, const msg_str_t *cipher, const group_t *
  * not hold the current private key. Mirrors Python Group.rotate_key. */
 int64_t group_rotate_key(group_t *group);
 
-/** Adopt @p other's key if it supersedes ours: same group, strictly higher
- *  epoch, and @p other must hold the private key. Returns whether it was
- *  adopted. Mirrors Python Group.accept_rotation. */
+/** Adopt @p other's key if it supersedes ours: same group, not a lower epoch,
+ *  not a key we already retired, and @p other must hold the private key. On an
+ *  EQUAL epoch the lower public key wins a deterministic tiebreak, so two
+ *  members that rotated simultaneously converge rather than forking forever.
+ *  Returns whether it was adopted. Mirrors Python Group.accept_rotation. */
 bool group_accept_rotation(group_t *group, const group_t *other);
 
 

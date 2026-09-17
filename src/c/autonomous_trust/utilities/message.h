@@ -136,6 +136,26 @@
  * coarse distance BAND (near/mid/far), never coordinates. Forwarded only to the
  * identity process. Twelfth verb on the app→AT allowlist. */
 #define AT_APP_REQUEST_PROXIMITY "app_request_proximity"
+
+/* App→AT: publish (or re-publish) THIS node's OWN business page (Phase 3 P3.2).
+ * The payload is {"polity": "<did>", "bundle": "<opaque ethne json>", "seq": <int>};
+ * identity signs the canonical ad with this node's Ed25519 key, marks it as the
+ * business's own (satisfaction AT_BUSINESS_SAT_SELF), group-encrypts it and
+ * multicasts it. The bundle is opaque to the core — it is the app that proves
+ * polity-root → envoy → page. Forwarded only to the identity process.
+ * Thirteenth verb on the app→AT allowlist. */
+#define AT_APP_ADVERTISE_BUSINESS "app_advertise_business"
+
+/* App→AT: declare, update or clear THIS node's CUSTOMER edge to a business
+ * (Phase 3 P3.2). The payload is {"polity": "<did>", "satisfaction": <0..4>,
+ * "bundle": "<opaque ethne json>", "seq": <int>}, or {"polity": "<did>",
+ * "satisfaction": -1} to clear it. A customer edge is what authorizes this node
+ * to CARRY the page: on set, identity caches the bundle and advertises it in the
+ * FIRST PERSON (signed by us, with our satisfaction); on clear, this node simply
+ * goes quiet about that business — an unhappy customer publishes nothing
+ * negative, so silence is the only negative signal. Forwarded only to the
+ * identity process. Fourteenth verb on the app→AT allowlist. */
+#define AT_APP_SET_CUSTOMER "app_set_customer"
 #endif /* AT_SOCIAL_ENABLED */
 
 #define DEFAULT_MAX_MSG_SIZE 1024

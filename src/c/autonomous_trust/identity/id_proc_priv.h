@@ -167,6 +167,31 @@ bool identity_get_last_post(const char *uuid_str, char *post_id_buf,
                             size_t post_id_sz, char *body_buf, size_t body_sz,
                             int64_t *seq_out, int *tier_out);
 
+/* Conformance/observability seam (Phase 3 P3.2): what this node knows about
+ * business @p did — the page bundle it holds, that page's version, and how many
+ * CUSTOMERS have vouched for it (the business's own ad is not an endorsement).
+ * Returns true and fills the outputs if a page is held. Mirrors Python
+ * get_business_page. */
+bool identity_get_business_page(const char *did, char *bundle_buf,
+                                size_t bundle_sz, int64_t *seq_out,
+                                int *endorsers_out);
+
+/* Conformance/test seam (Phase 3 P3.2): install or clear THIS node's CUSTOMER
+ * edge to business @p did WITHOUT putting an ad on the wire — the app's
+ * AT_APP_SET_CUSTOMER verb minus its advertising half. A negative @p
+ * satisfaction clears the edge. Conformance installs edges from
+ * `fixtures.customers` so a scenario can separate a node that WILL carry a page
+ * from one that will not, without the setup counting as an emission. Twin of
+ * the Python adapter calling set_customer() with no queues. */
+void identity_set_customer(const char *did, int satisfaction,
+                           const char *bundle, int64_t seq);
+
+/* Conformance/observability seam (Phase 3 P3.2): this node's OWN customer
+ * satisfaction toward @p did (0..4), or -1 when it holds no customer edge — and
+ * therefore carries nothing for that business. Mirrors Python
+ * get_customer_satisfaction. */
+int identity_get_customer_satisfaction(const char *did);
+
 /** The last interaction score this node STAGED about subject peer @p uuid_str
  *  (Increment 8) — the deterministic accrual observable, recorded at submit time
  *  independent of the Paxos round. Copies the task_uuid hex into @p task_out
@@ -204,6 +229,17 @@ size_t identity_provisional_count(const process_t *proc);
  *  Mirrors how handle_caps_response populates the map. Used by the
  *  late-joiner cap-resync unit test to set up cap-less vs cap-bearing
  *  peers. Strings are copied. */
+/** Test seam: arm a pending admission (potential + vote tally + deadline) as
+ *  the access handshake would, so identity_periodic_vote_collection can be
+ *  driven directly. @p deadline_offset_sec is relative to now; negative means
+ *  the grace period has already expired. */
+void identity_arm_pending_vote(const public_identity_t *peer, int votes,
+                               double deadline_offset_sec);
+
+/** Test seam: whether an admission for @p uuid is still awaiting its grace
+ *  period (i.e. has not yet been decided or disarmed). */
+bool identity_pending_vote_armed(const uuid_t uuid);
+
 void identity_install_peer_caps(const uuid_t uuid,
                                 const char *const *caps, size_t n_caps);
 
@@ -219,6 +255,18 @@ void identity_install_peer_caps(const uuid_t uuid,
  *  test can drive it directly. Self-limiting and bounded
  *  (CAPS_RESYNC_MAX_PER_SWEEP). See memory feedback_late_joiner_caps. */
 void identity_periodic_caps_resync(const process_t *proc);
+
+/** Decide any pending admission whose grace period for other members' votes
+ *  has expired, on the votes in hand. C's stand-in for Python's per-proposal
+ *  _vote_collection thread (which sleeps vote_timeout, then finalizes).
+ *
+ *  Without it a vote count was only ever compared to the majority when an
+ *  inbound vote message arrived, so a node whose fellow members were gone
+ *  could never admit anyone: its own self-vote was already a majority and
+ *  nothing ever looked at it. Invoked from identity_run's main loop each
+ *  cadence tick; exposed here so a unit test can drive it directly.
+ *  One shot per proposal and bounded (ID_VOTE_SWEEP_MAX). */
+void identity_periodic_vote_collection(process_t *proc, directory_t *queues);
 
 /** Periodic backstop for the cold/late-joiner identity-loss case: a node
  *  that adopted a group via the merge/partition path holds the members'

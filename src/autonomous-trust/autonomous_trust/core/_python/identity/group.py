@@ -52,8 +52,11 @@ class Group(InitializableConfig):
         # used to be permanent, which meant admitting a member handed it the ability to
         # decrypt any cohort traffic it had recorded BEFORE it joined. Admission now
         # rotates, and `key_epoch` is what makes a rotation safe to accept: a receiver
-        # adopts a new key only when it comes with a HIGHER epoch, so a captured older
-        # key cannot be replayed back over a newer one.
+        # never adopts a LOWER epoch, and never re-adopts a key it has already
+        # retired, so a captured older key cannot be replayed back over a newer one.
+        # An EQUAL epoch is settled by a deterministic key tiebreak (see
+        # `accept_rotation`) so two members rotating at the same instant converge
+        # instead of forking the cohort permanently.
         # 0 = never rotated, which is every group minted before this existed.
         self._key_epoch = int(_key_epoch or 0)
         # Superseded keys, newest first, as (Encryptor, retired_at). Kept only
@@ -176,29 +179,82 @@ class Group(InitializableConfig):
         self._key_epoch = self.key_epoch + 1
         return self._key_epoch
 
+    def _key_is_retired(self, encryptor) -> bool:
+        """True when ``encryptor`` is one this group has already rotated away
+        from. Such a key must never come back -- that is what rotation is FOR,
+        and it is the property the epoch was introduced to protect.
+
+        The window is only ``PREVIOUS_KEY_MAX`` deep, which covers the case that
+        matters: a replay is only dangerous while it names an epoch we have not
+        yet passed, and those keys are exactly the recent ones. Anything older
+        is refused by the epoch comparison before it gets here."""
+        mine = bytes(encryptor.public)
+        for old_key, _retired_at in list(getattr(self, '_previous_keys', []) or []):
+            if bytes(old_key.public) == mine:
+                return True
+        return False
+
     def accept_rotation(self, other, now_ts=None) -> bool:
         """Adopt ``other``'s shared key if it supersedes ours.
 
-        Three conditions, and each is load-bearing:
+        The conditions, each load-bearing:
 
         * **same group** -- a key for another cohort is not a rotation of this
           one;
-        * **a strictly higher epoch** -- equal or lower is a replay, and
-          accepting one would let a captured old key be reinstated over a
-          newer one, which is precisely the attack rotation is meant to
-          foreclose;
+        * **not a lower epoch** -- a lower epoch is a replay, and accepting one
+          would let a captured old key be reinstated over a newer one, which is
+          precisely the attack rotation is meant to foreclose;
+        * **not a key we already retired** -- the same attack by another route,
+          refused at ANY epoch (see :meth:`_key_is_retired`);
         * **the sender actually holds the private key** -- a public-only view
           carries nothing to adopt, and taking it would leave us unable to
           decrypt our own cohort.
 
+        An **equal** epoch is settled by a deterministic tiebreak rather than
+        refused outright, because two members can legitimately rotate at the
+        same moment and a flat refusal makes that fork PERMANENT. It happens
+        whenever two nodes admit each other simultaneously -- ordinary mesh
+        discovery: each runs ``_peer_accepted``, each mints its own epoch N+1,
+        and each then refuses the other's. Same group, same epoch number,
+        different keys, and no further admission to carry anyone to N+2, so
+        every group multicast fails its MAC forever. Observed live 2026-09-17
+        (the agora business-ad cohort, the first live group multicast the
+        project had ever sent, so nothing caught it earlier).
+
+        The tiebreak is the lower public key, which both sides compute
+        identically from what is already on the wire, so they converge on ONE
+        key with no extra round trip -- the same deterministic-order idiom the
+        group MERGE tiebreak already uses. It does not reopen the replay hole:
+        a retired key is refused outright, so the captured-old-key attack still
+        cannot land. What an equal epoch may now do is replace a live key with a
+        DIFFERENT live key of the same generation, which is the fork being
+        resolved. Byte-for-byte the same rule as C group_accept_rotation.
+
         Authenticating WHO may rotate is the caller's job (a verified message
-        from a member); this only decides whether the key on offer is newer."""
+        from a member); this only decides whether the key on offer supersedes
+        ours."""
         if other is None or str(other.uuid) != str(self.uuid):
             return False
-        if other.key_epoch <= self.key_epoch:
+        if other.key_epoch < self.key_epoch:
             return False
         if not other.owns_private_key:
             return False
+        # Never reinstate a key we rotated away from, whatever epoch it claims.
+        if self._key_is_retired(other.encryptor):
+            return False
+        if other.key_epoch == self.key_epoch:
+            theirs = bytes(other.encryptor.public)
+            ours = bytes(self.encryptor.public)
+            if theirs == ours:
+                return False    # already the same key -- nothing to adopt
+            # A real key always beats NO key at the same epoch. Holding a
+            # public-only view means we cannot read the cohort at all, so there
+            # is nothing to defend by winning a byte comparison, and a tiebreak
+            # that refused here would strand us unable to decrypt anything. (The
+            # caller only reaches an equal-epoch adoption from a VERIFIED
+            # update, so this is not a way to hand a node a chosen key.)
+            if self.owns_private_key and theirs > ours:
+                return False    # ours wins the tiebreak; they will adopt it
         stamp = time.time() if now_ts is None else float(now_ts)
         prev = getattr(self, '_previous_keys', None)
         if prev is None:

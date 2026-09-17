@@ -80,6 +80,24 @@ extern "C" {
  *  AT_POST_ID_LEN (msg_types.h), AT_POST_ID_HEX_LEN (identity/post.h), and
  *  AGORA_POST_ID_MAX in the shim / cohort ctypes. */
 #define AT_APP_POST_ID_LEN 64
+
+/** Max bytes of the opaque Ethne page bundle carried on a business ad (Phase 3
+ *  P3.2). MUST match AT_BUSINESS_BUNDLE_MAX in identity/business_ad.h,
+ *  AT_BUSINESS_BUNDLE_LEN in msg_types.h, and AGORA_BUSINESS_BUNDLE_MAX in the
+ *  shim / cohort ctypes. */
+#define AT_APP_BUSINESS_BUNDLE_LEN 3072
+
+/** Max bytes of a polity DID. MUST match AT_BUSINESS_DID_MAX / AT_BUSINESS_DID_LEN
+ *  and AGORA_BUSINESS_DID_MAX. */
+#define AT_APP_BUSINESS_DID_LEN 95
+
+/** Ad content id: blake2b-256 as lowercase hex. MUST match
+ *  AT_BUSINESS_AD_ID_HEX_LEN / AT_BUSINESS_AD_ID_LEN and AGORA_BUSINESS_AD_ID_MAX. */
+#define AT_APP_BUSINESS_AD_ID_LEN 64
+
+/** A business advertising its OWN page, rather than a customer rating it. MUST
+ *  match AT_BUSINESS_SAT_SELF in identity/business_ad.h. */
+#define AT_APP_BUSINESS_SAT_SELF 0xFF
 #endif /* AT_SOCIAL_ENABLED */
 
 /** Returned instead of -1 when the daemon exists but has not bound its queue
@@ -141,7 +159,15 @@ typedef enum {
      *  learned by a private-proximity probe. Carries only the band (near / mid /
      *  far), never coordinates — the exact position never crosses this boundary.
      *  Emitted for both sides of a probe once tags are exchanged. */
-    AT_APP_EVENT_PROXIMITY = 11
+    AT_APP_EVENT_PROXIMITY = 11,
+
+    /** A signed business ad — one opaque, self-verifying Ethne page bundle plus
+     *  the advertiser's declared satisfaction (Phase 3 P3.2, @ref
+     *  at_app_business_ad_t). The advertiser is either the business itself or
+     *  one of its CUSTOMERS re-advertising from cache in the first person;
+     *  nobody else carries a page, so what reaches you came through people who
+     *  actually patronize the place. */
+    AT_APP_EVENT_BUSINESS_AD = 12
 #endif /* AT_SOCIAL_ENABLED */
 } at_app_event_kind_t;
 
@@ -287,6 +313,33 @@ typedef struct {
     int64_t seq;
     double  ts;
 } at_app_reaction_t;
+
+/** One signed business ad (Phase 3 P3.2). @c advertiser_uuid is the
+ *  SIGNATURE-BOUND advertiser — the business's own node, or a CUSTOMER speaking
+ *  for it in the first person (an ad is never relayed, only re-advertised, so
+ *  this is always someone vouching with their own key). @c polity is the
+ *  business's Ethne DID; @c ad_id the blake2b content-address (the dedup key);
+ *  @c satisfaction the advertiser's 0..4 rating, or @ref AT_APP_BUSINESS_SAT_SELF
+ *  when the business is advertising itself; @c seq the page version; @c ts the
+ *  advertiser's send time (epoch seconds).
+ *
+ *  @c bundle is the OPAQUE Ethne page artifact. The core did NOT verify it — it
+ *  cannot, it holds no Ethne — so the APP must, via the self-contained bundle
+ *  verifier (polity root -> envoy -> page) before showing or trusting the page.
+ *  What the core DID verify is the ad's Ed25519 signature: that this advertiser
+ *  really vouched for these exact page bytes at this satisfaction.
+ *
+ *  Carried by AT_APP_EVENT_BUSINESS_AD. A live stream — delivered on arrival,
+ *  not roster state. */
+typedef struct {
+    uint8_t advertiser_uuid[AT_APP_UUID_LEN];
+    char    polity[AT_APP_BUSINESS_DID_LEN + 1];
+    char    ad_id[AT_APP_BUSINESS_AD_ID_LEN + 1];
+    int32_t satisfaction;
+    int64_t seq;
+    double  ts;
+    char    bundle[AT_APP_BUSINESS_BUNDLE_LEN + 1];
+} at_app_business_ad_t;
 #endif /* AT_SOCIAL_ENABLED */
 
 /** A decoded app-facing event. */
@@ -304,6 +357,7 @@ typedef struct {
         at_app_post_t       post;
         at_app_reaction_t   reaction;
         at_app_proximity_t  proximity;
+        at_app_business_ad_t business_ad;
 #endif /* AT_SOCIAL_ENABLED */
     } data;
 } at_app_event_t;
@@ -528,6 +582,50 @@ int at_app_events_send_dm(at_app_events_t *handle, const char *q_out,
  */
 int at_app_events_publish_post(at_app_events_t *handle, const char *q_out,
                                const char *body, int required_tier);
+
+/**
+ * @brief Publish THIS node's own business page (Phase 3 P3.2).
+ *
+ * Sends the app→AT `AT_APP_ADVERTISE_BUSINESS` verb on @p q_out with
+ * {"polity", "bundle", "seq"}; identity signs the canonical ad with this node's
+ * Ed25519 key, marks it as the business's own (@ref AT_APP_BUSINESS_SAT_SELF),
+ * and group-multicasts it. @p bundle is the OPAQUE, self-verifying Ethne page
+ * artifact the app built through Ethne — the core never parses it.
+ *
+ * Reach comes from customers, not from this call: the business's own ad travels
+ * one group, and it is each CUSTOMER's re-advertisement (see
+ * @ref at_app_events_set_customer) that carries the page further.
+ *
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound, -1 otherwise.
+ */
+int at_app_events_advertise_business(at_app_events_t *handle, const char *q_out,
+                                     const char *polity_did, const char *bundle,
+                                     int64_t seq);
+
+/**
+ * @brief Declare, update or clear THIS node's CUSTOMER edge to a business
+ * (Phase 3 P3.2).
+ *
+ * Sends the app→AT `AT_APP_SET_CUSTOMER` verb on @p q_out with
+ * {"polity", "satisfaction", "bundle", "seq"}. A customer edge is what
+ * authorizes this node to CARRY a business's page: on set, identity caches the
+ * bundle and immediately advertises it in the FIRST PERSON — signed with this
+ * node's key, carrying this node's satisfaction — and does so again whenever a
+ * fresh ad for that business arrives. Nobody else relays a page, so a business's
+ * reach is exactly the sum of its customers' voices.
+ *
+ * @param satisfaction 0..4, or NEGATIVE to clear the edge. Clearing is how an
+ *        unhappy customer withdraws: this node simply goes quiet about the
+ *        business. No negative is ever published, so there is nothing to
+ *        brigade with.
+ * @param bundle The page to carry, or NULL/"" to carry the page this node has
+ *        already learned (so a person can become a customer straight from a page
+ *        that reached them through someone else).
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound, -1 otherwise.
+ */
+int at_app_events_set_customer(at_app_events_t *handle, const char *q_out,
+                               const char *polity_did, int satisfaction,
+                               const char *bundle, int64_t seq);
 
 /**
  * @brief React to a peer's post (Increment 8). Sends AT_APP_REACT_POST with

@@ -1420,6 +1420,20 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
             free(wire);
             return SYS_EXCEPTION();
         }
+        /* Which key are we actually multicasting under? A group forked by uuid,
+         * epoch or ownership is invisible in every other log line — the send
+         * "succeeds" and the cohort simply never hears it — so name the key
+         * here. has_private=0 means we hold only a PUBLIC view and are about to
+         * encrypt with a zero secret, which nobody can open. */
+        {
+            char kfp[17] = {0};
+            sodium_bin2hex(kfp, sizeof(kfp), grp->encryptor.public, 8);
+            log_info(logger,
+                     "Network: group multicast under key %s… epoch %lld has_private=%d\n",
+                     kfp, (long long)grp->key_epoch,
+                     sodium_is_zero(grp->encryptor.private,
+                                    crypto_box_SECRETKEYBYTES) ? 0 : 1);
+        }
         int enc = group_encrypt(grp, &plain, grp, nonce, cipher);
         free(wire);
         if (enc != 0) {
@@ -2193,8 +2207,17 @@ void handle_inbound_group(net_thread_ctx_t *ctx,
             net_wire_msg_free(&wmsg);
         }
     } else {
-        log_error(ctx->logger, "Network: group decrypt failed (%d) from %s\n",
-                  dec, from_addr);
+        /* Name the key we tried, so a fork is legible at a glance instead of
+         * looking like ordinary packet loss: compare this fingerprint/epoch with
+         * the sender's "group multicast under key" line. */
+        char kfp[17] = {0};
+        sodium_bin2hex(kfp, sizeof(kfp), grp->encryptor.public, 8);
+        log_error(ctx->logger,
+                  "Network: group decrypt failed (%d) from %s "
+                  "(our key %s… epoch %lld has_private=%d)\n",
+                  dec, from_addr, kfp, (long long)grp->key_epoch,
+                  sodium_is_zero(grp->encryptor.private,
+                                 crypto_box_SECRETKEYBYTES) ? 0 : 1);
         /* Forward a partition-recovery signal to IdentityProcess. The
          * decrypt failure is the C analog of Python's
          * `from_addr not in self.group.addresses`: in both cases we've
