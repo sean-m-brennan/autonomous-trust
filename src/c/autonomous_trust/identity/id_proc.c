@@ -45,6 +45,7 @@
 #include "dm.h"
 #include "post.h"
 #include "business_ad.h"
+#include "cosign.h"
 #include "social_tx.h"
 #include "proximity.h"
 #endif /* AT_SOCIAL_ENABLED */
@@ -182,6 +183,19 @@ static char ID_REACTION[]    = "peer_reaction";
  * person. There is no hop count: ads are re-advertised by customers, never
  * relayed (identity/business_ad.h). */
 static char ID_BUSINESS_AD[] = "peer_business_ad";
+/* Detached co-signing (Phase 3 P3.3). Both directed + ENCRYPTED (never on the
+ * plaintext allowlist), exactly like a DM: crypto_box authenticates the sender,
+ * so neither message carries a signature of its own. The request carries the
+ * exported canonical bytes of a record somebody is being asked to sign; the
+ * reply carries that signer's detached Ed25519 signature over those bytes.
+ *
+ * The core is a courier here and nothing more. It holds no Ethne, so it cannot
+ * tell what the bytes mean, and it does not hold the payload the signature is
+ * over, so it cannot check the signature either. Both judgments belong to the
+ * nodes at the ends — which is also why no DESCRIPTION travels: the wording of
+ * what a record commits to is derived by the signer, from the bytes. */
+static char ID_COSIGN_REQUEST[] = "peer_cosign_request";
+static char ID_COSIGN_SIG[]     = "peer_cosign_sig";
 #endif /* AT_SOCIAL_ENABLED */
 /* Identity backfill for a cold/late joiner that holds a group member's
  * address but never received its full Identity (merge/partition path fills
@@ -210,6 +224,8 @@ static char ID_APP_SET_EXACT_POSITION[] = AT_APP_SET_EXACT_POSITION;
 static char ID_APP_REQUEST_PROXIMITY[] = AT_APP_REQUEST_PROXIMITY;
 static char ID_APP_ADVERTISE_BUSINESS[] = AT_APP_ADVERTISE_BUSINESS;
 static char ID_APP_SET_CUSTOMER[] = AT_APP_SET_CUSTOMER;
+static char ID_APP_REQUEST_COSIGN[] = AT_APP_REQUEST_COSIGN;
+static char ID_APP_RETURN_COSIGN[] = AT_APP_RETURN_COSIGN;
 #endif /* AT_SOCIAL_ENABLED */
 
 /* Feed gossip bounds (Increment 7, SOCIAL_APP_PLAN §7 Q2 "active network + one
@@ -6118,6 +6134,316 @@ static bool handle_dm(const process_t *proc, directory_t *queues,
 }
 
 /****************************
+ * Detached co-signing (Phase 3 P3.3): a roll act decided by people who are not
+ * at the same keyboard. Their PRIVATE KEYS DO NOT TRAVEL — the record's exported
+ * bytes do, each signer signs them where their key already lives, and the
+ * authoring node reassembles the signatures onto the payload.
+ *
+ * Both messages are directed and ENCRYPTED, like a DM: crypto_box authenticates
+ * each end, so neither carries a signature of its own. The core is a courier. It
+ * holds no Ethne and cannot tell what the bytes mean; it does not hold the
+ * payload and cannot check the returned signature. It bounds and shape-checks,
+ * and it carries no description — see cosign.h for why that last one matters.
+ ****************************/
+
+/* AT -> app: surface an inbound co-signing ask. @p requester_uuid is the
+ * authenticated envelope's from_whom. */
+static int identity_emit_cosign_request(const uuid_t requester_uuid,
+                                        const char *record, const char *op,
+                                        const char *polity, const char *cid,
+                                        int64_t seq, double ts,
+                                        const char *bytes)
+{
+    generic_msg_t msg = {0};
+    msg.type = PEER_COSIGN_REQUEST_OBSERVED;
+    msg.size = sizeof(peer_cosign_request_msg_t);
+    memcpy(msg.info.peer_cosign_request.peer_uuid, requester_uuid, 16);
+    at_cosign_bound(record, msg.info.peer_cosign_request.record,
+                    sizeof(msg.info.peer_cosign_request.record), AT_COSIGN_TOKEN_MAX);
+    at_cosign_bound(op, msg.info.peer_cosign_request.op,
+                    sizeof(msg.info.peer_cosign_request.op), AT_COSIGN_TOKEN_MAX);
+    at_cosign_bound(polity, msg.info.peer_cosign_request.polity,
+                    sizeof(msg.info.peer_cosign_request.polity), AT_COSIGN_DID_MAX);
+    at_cosign_bound(cid, msg.info.peer_cosign_request.cid,
+                    sizeof(msg.info.peer_cosign_request.cid), AT_COSIGN_CID_MAX);
+    msg.info.peer_cosign_request.seq = seq;
+    msg.info.peer_cosign_request.ts = ts;
+    at_cosign_bound(bytes, msg.info.peer_cosign_request.bytes,
+                    sizeof(msg.info.peer_cosign_request.bytes), AT_COSIGN_BYTES_MAX);
+    return messaging_send(AT_MAIN_QUEUE, PEER_COSIGN_REQUEST_OBSERVED, &msg, false);
+}
+
+/* AT -> app: surface a returned signature to the node authoring the exchange. */
+static int identity_emit_cosign_sig(const uuid_t signer_uuid, const char *cid,
+                                    const char *signer, const char *sig,
+                                    int64_t seq, double ts)
+{
+    generic_msg_t msg = {0};
+    msg.type = PEER_COSIGN_SIG_OBSERVED;
+    msg.size = sizeof(peer_cosign_sig_msg_t);
+    memcpy(msg.info.peer_cosign_sig.peer_uuid, signer_uuid, 16);
+    at_cosign_bound(cid, msg.info.peer_cosign_sig.cid,
+                    sizeof(msg.info.peer_cosign_sig.cid), AT_COSIGN_CID_MAX);
+    at_cosign_bound(signer, msg.info.peer_cosign_sig.signer,
+                    sizeof(msg.info.peer_cosign_sig.signer), AT_COSIGN_DID_MAX);
+    at_cosign_bound(sig, msg.info.peer_cosign_sig.sig,
+                    sizeof(msg.info.peer_cosign_sig.sig), AT_COSIGN_SIG_MAX);
+    msg.info.peer_cosign_sig.seq = seq;
+    msg.info.peer_cosign_sig.ts = ts;
+    return messaging_send(AT_MAIN_QUEUE, PEER_COSIGN_SIG_OBSERVED, &msg, false);
+}
+
+/* Directed, encrypted co-signing ask to one admitted peer. */
+static int _send_cosign_request(const process_t *proc, const public_identity_t *peer,
+                                const char *record, const char *op,
+                                const char *polity, const char *cid,
+                                const char *bytes, int64_t seq, double ts)
+{
+    (void)proc;
+    generic_msg_t out = {0};
+    out.type = NET_MESSAGE;
+    strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
+    out.info.net_msg.function = ID_COSIGN_REQUEST;
+    out.info.net_msg.encrypt = true;
+    memcpy(&out.info.net_msg.to_whom, peer, sizeof(public_identity_t));
+    strncpy(out.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    json_t *env = at_cosign_request_to_json(record, op, polity, cid, bytes, seq, ts);
+    if (env == NULL) return -1;
+    net_msg_pack_json(&out.info.net_msg, env);
+    json_decref(env);
+    messaging_send("network", NET_MESSAGE, &out, false);
+    return 0;
+}
+
+/* Directed, encrypted signature return to the peer authoring the exchange. */
+static int _send_cosign_sig(const process_t *proc, const public_identity_t *peer,
+                            const char *cid, const char *signer, const char *sig,
+                            int64_t seq, double ts)
+{
+    (void)proc;
+    generic_msg_t out = {0};
+    out.type = NET_MESSAGE;
+    strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
+    out.info.net_msg.function = ID_COSIGN_SIG;
+    out.info.net_msg.encrypt = true;
+    memcpy(&out.info.net_msg.to_whom, peer, sizeof(public_identity_t));
+    strncpy(out.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    json_t *env = at_cosign_sig_to_json(cid, signer, sig, seq, ts);
+    if (env == NULL) return -1;
+    net_msg_pack_json(&out.info.net_msg, env);
+    json_decref(env);
+    messaging_send("network", NET_MESSAGE, &out, false);
+    return 0;
+}
+
+/* App -> AT verb (AT_APP_REQUEST_COSIGN): ask each named peer to co-sign one
+ * record. Payload {"peers":[uuid…],"record","op","polity","cid","bytes"}. One
+ * freshness stamp covers the whole ask, so every copy of it is the same ask. */
+static bool handle_app_request_cosign(const process_t *proc, directory_t *queues,
+                                      generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *j_peers  = json_object_get(payload, "peers");
+    json_t *j_record = json_object_get(payload, "record");
+    json_t *j_op     = json_object_get(payload, "op");
+    json_t *j_polity = json_object_get(payload, "polity");
+    json_t *j_cid    = json_object_get(payload, "cid");
+    json_t *j_bytes  = json_object_get(payload, "bytes");
+    if (!json_is_array(j_peers) || !json_is_string(j_record)
+        || !json_is_string(j_op) || !json_is_string(j_polity)
+        || !json_is_string(j_cid) || !json_is_string(j_bytes)) {
+        json_decref(payload);
+        log_warn(proc->logger, "Identity: app request_cosign: malformed\n");
+        return true;
+    }
+    char record[AT_COSIGN_TOKEN_MAX + 1], op[AT_COSIGN_TOKEN_MAX + 1];
+    char polity[AT_COSIGN_DID_MAX + 1], cid[AT_COSIGN_CID_MAX + 1];
+    at_cosign_bound(json_string_value(j_record), record, sizeof(record), AT_COSIGN_TOKEN_MAX);
+    at_cosign_bound(json_string_value(j_op), op, sizeof(op), AT_COSIGN_TOKEN_MAX);
+    at_cosign_bound(json_string_value(j_polity), polity, sizeof(polity), AT_COSIGN_DID_MAX);
+    at_cosign_bound(json_string_value(j_cid), cid, sizeof(cid), AT_COSIGN_CID_MAX);
+    const char *bytes = json_string_value(j_bytes);
+    /* Refuse an unknown act or a payload no exporter produced, before anybody is
+     * interrupted to look at it. */
+    if (!at_cosign_op_ok(record, op) || !at_cosign_bytes_ok(bytes) || cid[0] == '\0') {
+        json_decref(payload);
+        log_warn(proc->logger, "Identity: app request_cosign: unknown op or bad payload\n");
+        return true;
+    }
+    pthread_mutex_lock(&id_state.lock);
+    int64_t seq = freshness_stamp(&id_state.freshness, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (seq <= 0) {
+        json_decref(payload);
+        log_warn(proc->logger, "Identity: no freshness sequence; not asking to co-sign\n");
+        return true;
+    }
+    double ts = (double)time(NULL);
+    size_t sent = 0;
+    size_t n = json_array_size(j_peers);
+    for (size_t i = 0; i < n; i++) {
+        json_t *j_peer = json_array_get(j_peers, i);
+        if (!json_is_string(j_peer)) continue;
+        uuid_t peer_uuid;
+        if (uuid_parse(json_string_value(j_peer), peer_uuid) != 0) {
+            log_warn(proc->logger, "Identity: app request_cosign: bad peer uuid\n");
+            continue;
+        }
+        public_identity_t peer;
+        if (!_find_peer_pub_by_uuid(proc, peer_uuid, &peer)) {
+            log_warn(proc->logger, "Identity: app request_cosign: unknown peer\n");
+            continue;
+        }
+        if (_send_cosign_request(proc, &peer, record, op, polity, cid, bytes,
+                                 seq, ts) == 0)
+            sent++;
+    }
+    json_decref(payload);
+    log_info(proc->logger, "Identity: co-signing ask (%s/%s) sent to %zu of %zu\n",
+             record, op, sent, n);
+    return true;
+}
+
+/* App -> AT verb (AT_APP_RETURN_COSIGN): return this node's signature to the
+ * peer authoring the exchange. Payload {"peer","cid","signer","sig"}. */
+static bool handle_app_return_cosign(const process_t *proc, directory_t *queues,
+                                     generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *j_peer   = json_object_get(payload, "peer");
+    json_t *j_cid    = json_object_get(payload, "cid");
+    json_t *j_signer = json_object_get(payload, "signer");
+    json_t *j_sig    = json_object_get(payload, "sig");
+    if (!json_is_string(j_peer) || !json_is_string(j_cid)
+        || !json_is_string(j_signer) || !json_is_string(j_sig)) {
+        json_decref(payload);
+        log_warn(proc->logger, "Identity: app return_cosign: malformed\n");
+        return true;
+    }
+    uuid_t peer_uuid;
+    int rc = uuid_parse(json_string_value(j_peer), peer_uuid);
+    char cid[AT_COSIGN_CID_MAX + 1], signer[AT_COSIGN_DID_MAX + 1];
+    char sig[AT_COSIGN_SIG_MAX + 1];
+    at_cosign_bound(json_string_value(j_cid), cid, sizeof(cid), AT_COSIGN_CID_MAX);
+    at_cosign_bound(json_string_value(j_signer), signer, sizeof(signer), AT_COSIGN_DID_MAX);
+    at_cosign_bound(json_string_value(j_sig), sig, sizeof(sig), AT_COSIGN_SIG_MAX);
+    json_decref(payload);
+    if (rc != 0) {
+        log_warn(proc->logger, "Identity: app return_cosign: bad peer uuid\n");
+        return true;
+    }
+    if (cid[0] == '\0' || signer[0] == '\0' || sig[0] == '\0') {
+        log_warn(proc->logger, "Identity: app return_cosign: empty field\n");
+        return true;
+    }
+    public_identity_t peer;
+    if (!_find_peer_pub_by_uuid(proc, peer_uuid, &peer)) {
+        log_warn(proc->logger, "Identity: app return_cosign: unknown peer\n");
+        return true;
+    }
+    pthread_mutex_lock(&id_state.lock);
+    int64_t seq = freshness_stamp(&id_state.freshness, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (seq <= 0) {
+        log_warn(proc->logger, "Identity: no freshness sequence; not returning signature\n");
+        return true;
+    }
+    _send_cosign_sig(proc, &peer, cid, signer, sig, seq, (double)time(NULL));
+    return true;
+}
+
+/* Handler: an inbound co-signing ask. Freshness-checked (per-sender replay
+ * guard), shape-checked, then surfaced. The core does not judge the request:
+ * whether this node is even a required signer is Ethne's question, answered on
+ * the app side against the payload itself. */
+static bool handle_cosign_request(const process_t *proc, directory_t *queues,
+                                  generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    char record[AT_COSIGN_TOKEN_MAX + 1], op[AT_COSIGN_TOKEN_MAX + 1];
+    char polity[AT_COSIGN_DID_MAX + 1], cid[AT_COSIGN_CID_MAX + 1];
+    char bytes[AT_COSIGN_BYTES_MAX + 1];
+    int64_t seq = 0;
+    double ts = 0.0;
+    int prc = at_cosign_request_from_json(payload, record, sizeof(record),
+                                          op, sizeof(op), polity, sizeof(polity),
+                                          cid, sizeof(cid), bytes, sizeof(bytes),
+                                          &seq, &ts);
+    json_decref(payload);
+    if (prc != 0) {
+        log_warn(proc->logger,
+                 "Identity: peer_cosign_request malformed/unknown op, refusing\n");
+        return true;
+    }
+    char sender[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, sender);
+    pthread_mutex_lock(&id_state.lock);
+    bool fresh = freshness_accept(&id_state.freshness, sender, ID_COSIGN_REQUEST,
+                                  seq, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (!fresh) {
+        log_debug(proc->logger,
+                  "Identity: peer_cosign_request from %s refused (replay)\n", sender);
+        return true;
+    }
+    identity_emit_cosign_request(nmsg->from_whom.uuid, record, op, polity, cid,
+                                 seq, ts, bytes);
+    log_debug(proc->logger, "Identity: co-signing ask (%s/%s) from peer %s\n",
+              record, op, sender);
+    return true;
+}
+
+/* Handler: a returned signature. Freshness-checked, then surfaced. The core does
+ * NOT verify it: it does not hold the payload the signature is over. The
+ * assembling node does, and refuses a wrong key or a tampered payload there. */
+static bool handle_cosign_sig(const process_t *proc, directory_t *queues,
+                              generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    char cid[AT_COSIGN_CID_MAX + 1], signer[AT_COSIGN_DID_MAX + 1];
+    char sig[AT_COSIGN_SIG_MAX + 1];
+    int64_t seq = 0;
+    double ts = 0.0;
+    int prc = at_cosign_sig_from_json(payload, cid, sizeof(cid), signer,
+                                      sizeof(signer), sig, sizeof(sig), &seq, &ts);
+    json_decref(payload);
+    if (prc != 0) {
+        log_warn(proc->logger, "Identity: peer_cosign_sig malformed, refusing\n");
+        return true;
+    }
+    char sender[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, sender);
+    pthread_mutex_lock(&id_state.lock);
+    bool fresh = freshness_accept(&id_state.freshness, sender, ID_COSIGN_SIG,
+                                  seq, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (!fresh) {
+        log_debug(proc->logger,
+                  "Identity: peer_cosign_sig from %s refused (replay)\n", sender);
+        return true;
+    }
+    identity_emit_cosign_sig(nmsg->from_whom.uuid, cid, signer, sig, seq, ts);
+    log_debug(proc->logger, "Identity: co-signature returned by peer %s\n", sender);
+    return true;
+}
+
+/****************************
  * Post reactions (Increment 8): the return signal a fire-and-forget post lacks.
  * A reaction is a directed, ENCRYPTED reactor→author message {post_id, seq, ts},
  * exactly like a DM (crypto_box authenticates the reactor). Both peers submit a
@@ -11138,6 +11464,14 @@ int identity_register_handlers(process_t *proc)
                              (handler_ptr_t)handle_app_advertise_business);
     process_register_handler(proc, ID_APP_SET_CUSTOMER,
                              (handler_ptr_t)handle_app_set_customer);
+    process_register_handler(proc, ID_COSIGN_REQUEST,
+                             (handler_ptr_t)handle_cosign_request);
+    process_register_handler(proc, ID_COSIGN_SIG,
+                             (handler_ptr_t)handle_cosign_sig);
+    process_register_handler(proc, ID_APP_REQUEST_COSIGN,
+                             (handler_ptr_t)handle_app_request_cosign);
+    process_register_handler(proc, ID_APP_RETURN_COSIGN,
+                             (handler_ptr_t)handle_app_return_cosign);
 #endif /* AT_SOCIAL_ENABLED */
     process_register_handler(proc, ID_IDENTITY_QUERY,
                              (handler_ptr_t)handle_identity_query);

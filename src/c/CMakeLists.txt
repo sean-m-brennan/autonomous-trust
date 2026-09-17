@@ -559,6 +559,7 @@ if(AT_SOCIAL)
         autonomous_trust/identity/social_tx.c
         autonomous_trust/identity/proximity.c
         autonomous_trust/identity/business_ad.c
+        autonomous_trust/identity/cosign.c
     )
 endif()
 
@@ -1109,6 +1110,10 @@ if(AT_SOCIAL)
     set_source_files_properties(test/dm_test.c PROPERTIES COMPILE_FLAGS "-Wall")
     target_link_libraries(dm_test PRIVATE ${AT_TEST_LIBS})
 
+    add_executable(cosign_test test/cosign_test.c)
+    set_source_files_properties(test/cosign_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(cosign_test PRIVATE ${AT_TEST_LIBS})
+
     add_executable(post_test test/post_test.c)
     set_source_files_properties(test/post_test.c PROPERTIES COMPILE_FLAGS "-Wall")
     target_link_libraries(post_test PRIVATE ${AT_TEST_LIBS})
@@ -1264,6 +1269,7 @@ if(AT_SOCIAL)
     add_test(NAME profile_test COMMAND $<TARGET_FILE:profile_test>)
     add_test(NAME connection_test COMMAND $<TARGET_FILE:connection_test>)
     add_test(NAME dm_test COMMAND $<TARGET_FILE:dm_test>)
+    add_test(NAME cosign_test COMMAND $<TARGET_FILE:cosign_test>)
     add_test(NAME post_test COMMAND $<TARGET_FILE:post_test>)
     add_test(NAME proximity_test COMMAND $<TARGET_FILE:proximity_test>)
     add_test(NAME post_multicast_test COMMAND $<TARGET_FILE:post_multicast_test>)
