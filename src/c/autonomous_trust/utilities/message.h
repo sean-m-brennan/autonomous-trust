@@ -156,6 +156,31 @@
  * negative, so silence is the only negative signal. Forwarded only to the
  * identity process. Fourteenth verb on the app→AT allowlist. */
 #define AT_APP_SET_CUSTOMER "app_set_customer"
+
+/* App→AT: ask named peers to co-sign one staff-roll or guardianship record
+ * (Phase 3 P3.3). The payload is {"peers": ["<uuid_str>", …], "record":
+ * "membership"|"guardian", "op": "<act>", "polity": "<did>", "cid": "<b3:hex>",
+ * "bytes": "<canonical cbor as hex>"}; identity sends each named peer a directed
+ * ENCRYPTED peer_cosign_request. The KEYS NEVER TRAVEL — the record does, and
+ * each signer signs it where their key already lives.
+ *
+ * The core carries the bytes and verifies nothing about them: it holds no Ethne,
+ * just as it holds no verifier for a page bundle. It does bound and shape-check
+ * the ask, and it deliberately carries NO description — what the record commits
+ * to is derived on the signer's own node from these bytes, so the asking node
+ * cannot choose both what you sign and what you are told you are signing.
+ * Forwarded only to the identity process. Fifteenth verb on the app→AT
+ * allowlist. */
+#define AT_APP_REQUEST_COSIGN "app_request_cosign"
+
+/* App→AT: return this node's detached signature over an exchange a peer is
+ * authoring (Phase 3 P3.3). The payload is {"peer": "<uuid_str>", "cid":
+ * "<b3:hex>", "signer": "<did:key>", "sig": "<hex>"}; identity sends the
+ * requester a directed ENCRYPTED peer_cosign_sig. The signature is checked
+ * against the payload by the ASSEMBLING node, which is the only one holding it.
+ * Forwarded only to the identity process. Sixteenth verb on the app→AT
+ * allowlist. */
+#define AT_APP_RETURN_COSIGN "app_return_cosign"
 #endif /* AT_SOCIAL_ENABLED */
 
 #define DEFAULT_MAX_MSG_SIZE 1024
