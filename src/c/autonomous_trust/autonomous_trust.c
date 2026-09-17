@@ -168,6 +168,21 @@ int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
                 log_exception(logger);
             return 0;
         }
+        if (fn != NULL && (strcmp(fn, AT_APP_ADVERTISE_BUSINESS) == 0
+                           || strcmp(fn, AT_APP_SET_CUSTOMER) == 0))
+        {
+            /* Phase 3 P3.2: a business publishing its own page, and a person
+             * declaring/clearing a CUSTOMER edge (which is what authorizes this
+             * node to carry that page and re-advertise it in the first person).
+             * Forwarded ONLY to identity, which owns the ad signing/multicast
+             * and the customer store. */
+            generic_msg_t fwd = *msg;
+            snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
+                     "%s", "identity");
+            if (messaging_send("identity", NET_MESSAGE, &fwd, false) != 0)
+                log_exception(logger);
+            return 0;
+        }
         if (fn != NULL && (strcmp(fn, AT_APP_REQUEST_ATTEND) == 0
                            || strcmp(fn, AT_APP_SET_EXACT_POSITION) == 0
                            || strcmp(fn, AT_APP_REQUEST_PROXIMITY) == 0))
@@ -270,14 +285,15 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
              * silently dropped at this drain instead of reaching the app queue:
              * connection edges (Increment 5 — the inbound-request ASK and every
              * edge-state change), DMs (Increment 6), feed posts (Increment 7),
-             * post reactions (Increment 8), and the private-proximity band
-             * (Phase 2). */
+             * post reactions (Increment 8), the private-proximity band
+             * (Phase 2), and business ads (Phase 3 P3.2). */
             case PEER_CONNECTION_REQUEST_OBSERVED:
             case PEER_CONNECTION_STATE_OBSERVED:
             case PEER_DM_OBSERVED:
             case PEER_POST_OBSERVED:
             case PEER_REACTION_OBSERVED:
             case PEER_PROXIMITY_OBSERVED:
+            case PEER_BUSINESS_AD_OBSERVED:
 #endif /* AT_SOCIAL_ENABLED */
                 if (q_out == NULL)
                     break;   /* no app attached; nothing to do */

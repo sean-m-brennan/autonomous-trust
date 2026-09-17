@@ -1,0 +1,67 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: business-ad-bad-signature-rejected
+byte_pinning: false
+description: |
+        The AT trust layer (Phase 3 P3.2). Two verifications guard a business ad and
+        they are separate: the Ethne bundle is self-verifying (polity root -> envoy
+        -> page) and the APP checks it; what the RUNTIME checks is the detached
+        Ed25519 signature binding WHO advertised, HOW satisfied they are, and WHICH
+        page bytes they meant. Because the bundle bytes are inside the signed
+        canonical, an endorsement cannot be lifted off one page and re-attached to
+        another.
+
+        Here the ad carries a syntactically well-formed but WRONG signature.
+        Verification fails, so the ad is dropped before the content id is computed,
+        before the page is stored, and before the customer gate is reached.
+
+        NON-VACUITY: newcomer is a CUSTOMER (satisfaction 3), so it is a node that
+        would certainly have spoken had the ad been accepted — yet it holds no page
+        and emits nothing. A mutation that skips signature verification stores the
+        page and emits 1.
+
+        Step 1: bg -> newcomer peer_business_ad with `sig` overridden to 64 zero
+        bytes.
+          - Both runtimes: BAD SIGNATURE, dropped. No page, no emission.
+
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  # newcomer is a CUSTOMER of the cafe — the edge that authorizes it to carry
+  # the page. Declared at satisfaction 3 with the page it already holds at
+  # seq 0, so the inbound seq-1 ad is a page UPDATE it picks up and carries.
+  customers:
+    newcomer:
+      "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ":
+        sat: 3
+        seq: 0
+        bundle: '{"page":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ","name":"Corner Cafe","locality":"9q8yyk8y"},"sig":"stub"},"delegation":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"},"sig":"stub"}}'
+
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_business_ad
+    payload:
+      polity: "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"
+      sat: 255
+      seq: 1
+      ts: 0
+      bundle: '{"page":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ","name":"Corner Cafe","locality":"9q8yyk8y"},"sig":"stub"},"delegation":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"},"sig":"stub"}}'
+      sig: "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    description: |
+        A well-formed ad carrying a signature that is not over its canonical.
+
+expected_state:
+  newcomer:
+    business_page:
+      "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ": {}          # nothing stored — the ad never got past verify
+    customer_satisfaction:
+      "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ": 3             # the pre-existing edge is untouched
+    business_ads_emitted: 0

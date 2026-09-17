@@ -63,11 +63,16 @@ class TestIdentityProtocol:
           key-derived grid tags to learn only a coarse distance
           band (proximity_probe, proximity_reply, and its
           local-only trigger proximity_trigger)
+        - business pages carried by their own customers, Phase 3
+          (business_ad) — every ad on the wire is first-person, so
+          one verb covers the business advertising itself and a
+          happy customer re-advertising what it learned
         Asserting the exact count here pins the wire contract — a
         new verb without intent will fail this and force a deliberate
         update. Update the expected count alongside any new addition
         to ``IdentityProtocol``.
         """
         values = list(IdentityProtocol)
-        assert len(values) == 40
+        assert len(values) == 41
         assert 'announce' in values
+        assert 'business_ad' in values
