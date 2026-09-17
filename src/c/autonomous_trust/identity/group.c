@@ -133,22 +133,80 @@ int64_t group_rotate_key(group_t *group)
     return group->key_epoch;
 }
 
-/* Adopt @p other's shared key if it supersedes ours. Same group, strictly
- * higher epoch, and the sender must actually hold the private key — an equal
- * or lower epoch is a replay, and accepting one would let a captured old key be
+/* True when @p key is one this group has already retired. A key we rotated AWAY
+ * from must never come back — that is the whole point of rotation, and it is the
+ * property the epoch was introduced to protect. Checked by public half: the
+ * public key identifies the keypair, and a retired key is not a secret.
+ *
+ * The window is only GROUP_PREVIOUS_KEY_MAX deep, which is enough for the case
+ * that matters: a replay that is dangerous must name an epoch we have not yet
+ * passed, and those keys are exactly the recent ones. Anything older is refused
+ * by the epoch comparison long before it gets here. */
+static bool _group_key_is_retired(const group_t *group, const encryptor_t *key)
+{
+    size_t held = group->num_previous_keys;
+    if (held > GROUP_PREVIOUS_KEY_MAX)
+        held = GROUP_PREVIOUS_KEY_MAX;
+    for (size_t i = 0; i < held; i++)
+        if (memcmp(group->previous_keys[i].public, key->public,
+                   crypto_box_PUBLICKEYBYTES) == 0)
+            return true;
+    return false;
+}
+
+/* Adopt @p other's shared key if it supersedes ours. Same group, and the sender
+ * must actually hold the private key. Authenticating WHO may rotate is the
+ * caller's job. Mirrors Python Group.accept_rotation.
+ *
+ * A LOWER epoch is a replay: accepting one would let a captured old key be
  * reinstated over a newer one, which is precisely what rotation forecloses.
- * Authenticating WHO may rotate is the caller's job. Mirrors Python
- * Group.accept_rotation. */
+ *
+ * An EQUAL epoch needs a deterministic tiebreak rather than a flat refusal,
+ * because two members can legitimately rotate at the same moment and a flat
+ * refusal makes that fork PERMANENT. It happens whenever two nodes admit each
+ * other simultaneously — ordinary mesh discovery: each runs _peer_accepted,
+ * each mints its own epoch N+1, and each then refuses the other's. Same group
+ * uuid, same epoch number, different keys, and no further admission to carry
+ * anyone to epoch N+2, so every group multicast fails its MAC forever. Observed
+ * live 2026-09-17 (agora business-ad cohort: the first live group multicast the
+ * project had ever sent, so nothing caught it earlier).
+ *
+ * The tiebreak is the lower public key, which both sides compute identically
+ * from what is already on the wire, so they converge on ONE key without another
+ * round trip — the same deterministic-order idiom the group MERGE tiebreak
+ * already uses. It does not reopen the replay hole: a key we have already
+ * retired is refused outright, at ANY epoch, so the captured-old-key attack
+ * the epoch exists to stop still cannot land. What an equal epoch may now do
+ * is replace a live key with a DIFFERENT live key of the same generation, which
+ * is the fork we are resolving. */
 bool group_accept_rotation(group_t *group, const group_t *other)
 {
     if (group == NULL || other == NULL)
         return false;
     if (uuid_compare(group->uuid, other->uuid) != 0)
         return false;
-    if (other->key_epoch <= group->key_epoch)
+    if (other->key_epoch < group->key_epoch)
         return false;
     if (!_group_owns_private(other))
         return false;
+    /* Never reinstate a key we rotated away from, whatever epoch it claims. */
+    if (_group_key_is_retired(group, &other->encryptor))
+        return false;
+    if (other->key_epoch == group->key_epoch)
+    {
+        int order = memcmp(other->encryptor.public, group->encryptor.public,
+                           crypto_box_PUBLICKEYBYTES);
+        if (order == 0)
+            return false;   /* already the same key — nothing to adopt */
+        /* A real key always beats NO key at the same epoch. Holding a
+         * public-only view means we cannot read the cohort at all, so there is
+         * nothing to defend by winning a byte comparison, and a tiebreak that
+         * refused here would strand us unable to decrypt anything. (The caller
+         * only reaches an equal-epoch adoption from a VERIFIED update, so this
+         * is not a way to hand a node a key of the attacker's choosing.) */
+        if (_group_owns_private(group) && order > 0)
+            return false;   /* ours wins the tiebreak; they will adopt it */
+    }
     if (_group_owns_private(group))
     {
         size_t keep = group->num_previous_keys;

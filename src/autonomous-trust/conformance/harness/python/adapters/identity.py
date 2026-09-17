@@ -153,6 +153,14 @@ _TRIGGER_BLOCK = 'trigger_block'
 # the two directed handlers. See proximity-band-near / proximity-absent-is-normal.
 _TRIGGER_PROXIMITY_PROBE = 'trigger_proximity_probe'
 
+# Pseudo-function: the business named in the step's payload publishes its own
+# page (Phase 3 P3.2). Advertising is an APP verb, not a wire message, so there
+# is nothing to dispatch — the step drives the production advertise_business()
+# and the resulting peer_business_ad emission is what travels. The C adapter
+# recognizes the same string and calls identity_advertise_business.
+# See business-ad-shared / business-ad-customer-relays.
+_TRIGGER_ADVERTISE_BUSINESS = 'trigger_advertise_business'
+
 
 @dataclass
 class _Participant:
@@ -468,6 +476,64 @@ class _Participant:
                         raise AssertionError(
                             f'{self.id}: peer_proximity[{peer_id!r}]={int(actual)}, '
                             f'expected {int(want)}')
+            elif key == 'business_page':
+                # {polity_did: {seq, endorsers}} (Phase 3 P3.2) -- what this
+                # participant LEARNED about a business, via get_business_page.
+                # `seq` is the page version it holds; `endorsers` the number of
+                # CUSTOMERS that have vouched for it (a business's own ad is not
+                # an endorsement, so a page nobody patronizes has 0). {} means no
+                # page held at all -- which, for a non-customer that never
+                # received an ad, is the correct silent outcome. C mirrors via
+                # identity_get_business_page keyed by the same did.
+                for did, want in expected.items():
+                    actual = self.process.get_business_page(did)
+                    if not isinstance(want, dict) or not want:
+                        if actual:
+                            raise AssertionError(
+                                f'{self.id}: business_page[{did!r}]={actual!r}, '
+                                f'expected none')
+                        continue
+                    if not actual:
+                        raise AssertionError(
+                            f'{self.id}: business_page[{did!r}] missing, '
+                            f'expected {want!r}')
+                    if 'seq' in want and int(actual.get('seq', -1)) != int(want['seq']):
+                        raise AssertionError(
+                            f'{self.id}: business_page[{did!r}].seq='
+                            f'{actual.get("seq")}, expected {want["seq"]}')
+                    if 'endorsers' in want:
+                        got_n = len(actual.get('endorsers', {}))
+                        if got_n != int(want['endorsers']):
+                            raise AssertionError(
+                                f'{self.id}: business_page[{did!r}].endorsers='
+                                f'{got_n}, expected {want["endorsers"]}')
+                    if 'bundle' in want and actual.get('bundle') != want['bundle']:
+                        raise AssertionError(
+                            f'{self.id}: business_page[{did!r}].bundle='
+                            f'{actual.get("bundle")!r}, expected '
+                            f'{want["bundle"]!r}')
+            elif key == 'customer_satisfaction':
+                # {polity_did: <int>} (Phase 3 P3.2) -- this participant's OWN
+                # customer edge, via get_customer_satisfaction: 0..4, or -1 when
+                # it holds none and therefore CARRIES NOTHING for that business.
+                # C mirrors via identity_get_customer_satisfaction.
+                for did, want in expected.items():
+                    actual = self.process.get_customer_satisfaction(did)
+                    if int(actual) != int(want):
+                        raise AssertionError(
+                            f'{self.id}: customer_satisfaction[{did!r}]='
+                            f'{int(actual)}, expected {int(want)}')
+            elif key == 'business_ads_emitted':
+                # peer_business_ad emissions by this participant (Phase 3 P3.2).
+                # THE GATE ASSERTION: a CUSTOMER that receives an ad re-advertises
+                # (>=1), a non-customer stays SILENT (0). This is what makes the
+                # page travel only through people who actually patronize the
+                # business. C mirrors by counting the same emission.
+                actual = self.emit_tally.get(IdentityProtocol.business_ad, 0)
+                if actual != int(expected):
+                    raise AssertionError(
+                        f'{self.id}: business_ads_emitted={actual}, '
+                        f'expected {int(expected)}')
             elif key == 'connection_state':
                 # {peer_id: <int>} (Increment 5) -- the connection edge state
                 # this participant holds toward another, via
@@ -1510,6 +1576,21 @@ class IdentityAdapter:
                             f'{other_pid!r}')
                     other_uuid = str(identities[other_pid].uuid)
                     participant.process.connection_edges[other_uuid] = CONN_CONNECTED
+            # Install CUSTOMER edges from fixtures.customers (Phase 3 P3.2), as
+            # {pid: {polity_did: {'sat': int, 'bundle': str, 'seq': int}}}. The
+            # customer edge is the RELAY GATE: only a node holding one carries a
+            # business's page, so this fixture is what separates a relaying
+            # customer from a silent bystander in the scenarios. Mirrors the C
+            # adapter's identity_set_customer seam. Absent (the default) leaves
+            # the node with no edges — it will hold pages but never re-advertise.
+            cust_fix: dict[str, dict] = fixtures.get('customers', {}) or {}
+            if pid in cust_fix:
+                for did, spec in (cust_fix[pid] or {}).items():
+                    spec = spec if isinstance(spec, dict) else {}
+                    participant.process.set_customer(
+                        did, int(spec.get('sat', 0)),
+                        bundle=str(spec.get('bundle', '')),
+                        seq=int(spec.get('seq', 0)))
             # Inject N synthetic cap-less peers (fixtures.capless_peers[pid])
             # directly into this participant's roster: present in self.peers but
             # absent from peer_capabilities -- exactly the state the periodic
@@ -1970,6 +2051,17 @@ class IdentityAdapter:
                 raise AssertionError('proximity probe: unknown initiator')
             self._run_proximity_probe(initiator, participant)
             return participant.drain_outbox()
+        if inbound.function == _TRIGGER_ADVERTISE_BUSINESS:
+            # Pseudo-function: `participant` is the BUSINESS; the step's payload
+            # names its polity and page. Advertising is an app verb, not a wire
+            # message, so run the production advertise_business() and let the
+            # emitted peer_business_ad be delivered by the engine. Mirrors the C
+            # adapter's trigger_advertise_business.
+            spec = from_json_string(inbound.obj) if inbound.obj else {}
+            participant.process.advertise_business(
+                participant.queues, str(spec.get('polity', '')),
+                str(spec.get('bundle', '')), int(spec.get('seq', 0)))
+            return participant.drain_outbox()
         if inbound.function in (_TRIGGER_ATTEST_PULL, _TRIGGER_ATTEST_REPLAY):
             # `participant` is the pull TARGET; from_whom is the puller.
             puller = self._roster_by_uuid.get(str(inbound.from_whom.uuid))
@@ -2419,6 +2511,41 @@ class IdentityAdapter:
             obj = to_json_string({'author': author_str, 'author_pk': author_pk,
                                   'seq': seq, 'ts': ts, 'tier': tier,
                                   'body': text, 'sig': sig, 'hops': hops})
+        elif function == IdentityProtocol.business_ad:
+            # handle_business_ad parses {advertiser, advertiser_pk, polity, sat,
+            # seq, ts, bundle, sig}. The ad is SIGNED with the SENDER's key over
+            # the canonical (advertiser, polity, sat, seq, ts, bundle) form,
+            # exactly as _business_advertise would — the sender is always
+            # speaking for ITSELF, since an ad is never relayed. A scenario may
+            # override `sig` (bad-signature drop) and `advertiser_pk`
+            # (impersonation). Mirrors the C peer_business_ad builder.
+            from autonomous_trust.core.capabilities import (business_ad_sign,
+                                                            BUSINESS_SAT_SELF)
+            payload = payload if isinstance(payload, dict) else {}
+            did = payload.get('polity', '')
+            did = did if isinstance(did, str) else ''
+            bundle = payload.get('bundle', '')
+            bundle = bundle if isinstance(bundle, str) else ''
+            sat = payload.get('sat', BUSINESS_SAT_SELF)
+            sat = int(sat) if isinstance(sat, int) else BUSINESS_SAT_SELF
+            seq = payload.get('seq', 0)
+            seq = int(seq) if isinstance(seq, int) else 0
+            ts = payload.get('ts', 0.0)
+            ts = float(ts) if isinstance(ts, (int, float)) else 0.0
+            adv_uuid = sender.process.identity.uuid
+            if isinstance(payload.get('advertiser_pk'), str):
+                adv_pk = payload['advertiser_pk']
+            else:
+                adv_pk = bytes(sender.process.identity.signature.public).hex()
+            if isinstance(payload.get('sig'), str):
+                sig = payload['sig']
+            else:
+                sig = business_ad_sign(sender.process.identity.signature.private,
+                                       adv_uuid, did, sat, seq, ts, bundle)
+            obj = to_json_string({'advertiser': str(adv_uuid),
+                                  'advertiser_pk': adv_pk, 'polity': did,
+                                  'sat': sat, 'seq': seq, 'ts': ts,
+                                  'bundle': bundle, 'sig': sig})
         elif function == IdentityProtocol.reaction:
             # handle_reaction parses {post_id, seq, ts} (Increment 8). A reaction
             # carries NO signature (crypto_box authenticates the reactor on the

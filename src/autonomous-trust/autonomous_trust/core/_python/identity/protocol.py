@@ -135,6 +135,17 @@ class IdentityProtocol(Protocol):
     # key, but the directed leg is encrypted like a DM), so NOT in
     # UNENCRYPTED_VERBS. proximity_trigger is a LOCAL-ONLY IPC verb (like
     # attest_trigger): a consumer asks us to probe one connected peer.
+    # Business ad (Phase 3 P3.2): one business page — an opaque, SELF-VERIFYING
+    # Ethne bundle — plus the signed statement of the node advertising it.
+    # Group-encrypted like a post, so NOT in UNENCRYPTED_VERBS. UNLIKE a post it
+    # is NEVER relayed and carries no hop count: only a CUSTOMER carries a
+    # business's page, and a customer re-advertises from its own cache in the
+    # FIRST PERSON (own key, own satisfaction) rather than forwarding someone
+    # else's ad. A business's reach is therefore exactly the sum of its
+    # customers' voices. The bundle is opaque to the runtime — the app verifies
+    # polity-root -> envoy -> page; what the runtime verifies is the detached
+    # Ed25519 signature binding who vouched, how happy, for which page bytes.
+    business_ad = 'peer_business_ad'  # msg.obj <- json {advertiser,advertiser_pk,polity,sat,seq,ts,bundle,sig}
     proximity_probe = 'peer_proximity_probe'      # msg.obj <- json {'salt','tags'}
     proximity_reply = 'peer_proximity_reply'      # msg.obj <- json {'salt','tags'}
     proximity_trigger = 'peer_proximity_trigger'  # local IPC: {'target': uuid_str}
