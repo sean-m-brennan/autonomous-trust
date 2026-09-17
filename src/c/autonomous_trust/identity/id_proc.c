@@ -44,6 +44,7 @@
 #include "connection.h"
 #include "dm.h"
 #include "post.h"
+#include "business_ad.h"
 #include "social_tx.h"
 #include "proximity.h"
 #endif /* AT_SOCIAL_ENABLED */
@@ -104,6 +105,27 @@ static bool _find_peer_pub_by_uuid(const process_t *proc, const uuid_t uuid,
 DEFINE_ERROR(EID_NOQ, "Required process queue missing");
 
 #define MAJORITY(n) (((n) / 2) + 1)
+/* How long we wait for other members' votes on a peer we just proposed before
+ * deciding on the votes in hand. Mirrors Python IdentityProcess.vote_timeout
+ * (idprocess.py:154). Short by design: it is a grace period for votes already
+ * in flight, not a consensus round. */
+#define ID_VOTE_TIMEOUT_SEC 0.5
+/* Admissions decided per sweep. A bound keeps the sweep's scratch arrays on the
+ * stack and off the lock for long; anything beyond it is simply decided on the
+ * next tick (~0.5s later), and a real cohort never has this many proposals
+ * pending at once. */
+#define ID_VOTE_SWEEP_MAX 16
+
+/* Monotonic seconds, for vote deadlines. CLOCK_MONOTONIC so a wall-clock step
+ * (NTP, a container's first time sync) cannot push a pending admission either
+ * into the past or years into the future. */
+static double _vote_now_sec(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0.0;
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
 
 /****************************
  * Protocol function names (must match Python IdentityProtocol)
@@ -153,6 +175,13 @@ static char ID_POST[]        = "peer_post";
  * is needed. It is the return signal a fire-and-forget post lacks, letting the
  * engagement accrue reputation for both peers. */
 static char ID_REACTION[]    = "peer_reaction";
+/* Business ad (Phase 3 P3.2). Encrypted GROUP MULTICAST like a post (never on
+ * the plaintext allowlist), carrying {advertiser, advertiser_pk, polity, sat,
+ * seq, ts, bundle, sig}. The detached Ed25519 signature authenticates the
+ * ADVERTISER — the business itself or one of its customers speaking in the first
+ * person. There is no hop count: ads are re-advertised by customers, never
+ * relayed (identity/business_ad.h). */
+static char ID_BUSINESS_AD[] = "peer_business_ad";
 #endif /* AT_SOCIAL_ENABLED */
 /* Identity backfill for a cold/late joiner that holds a group member's
  * address but never received its full Identity (merge/partition path fills
@@ -179,6 +208,8 @@ static char ID_APP_BLOCK[] = AT_APP_BLOCK;
 static char ID_APP_REQUEST_ATTEND[] = AT_APP_REQUEST_ATTEND;
 static char ID_APP_SET_EXACT_POSITION[] = AT_APP_SET_EXACT_POSITION;
 static char ID_APP_REQUEST_PROXIMITY[] = AT_APP_REQUEST_PROXIMITY;
+static char ID_APP_ADVERTISE_BUSINESS[] = AT_APP_ADVERTISE_BUSINESS;
+static char ID_APP_SET_CUSTOMER[] = AT_APP_SET_CUSTOMER;
 #endif /* AT_SOCIAL_ENABLED */
 
 /* Feed gossip bounds (Increment 7, SOCIAL_APP_PLAN §7 Q2 "active network + one
@@ -189,6 +220,17 @@ static char ID_APP_REQUEST_PROXIMITY[] = AT_APP_REQUEST_PROXIMITY;
 #ifdef AT_SOCIAL_ENABLED
 #define POST_MAX_HOPS 1
 #define POST_DEDUP_CAP 256
+
+/* Business-ad bounds (Phase 3 P3.2). There is deliberately NO max-hops twin of
+ * POST_MAX_HOPS: a business ad is never relayed. Only a CUSTOMER carries a
+ * business's page, and a customer re-advertises it in the FIRST PERSON (its own
+ * key, its own satisfaction) rather than forwarding someone else's ad — so reach
+ * is bounded by the customer base itself, not by a hop count, and distribution
+ * and reputation are the same fact. BUSINESS_AD_DEDUP_CAP bounds the ad-content
+ * dedup ring; BUSINESS_PAGE_CAP bounds how many distinct businesses this node
+ * will hold pages for (a memory bound on unsolicited ads). */
+#define BUSINESS_AD_DEDUP_CAP 256
+#define BUSINESS_PAGE_CAP 128
 
 /* Forward decls: defined below beside the position handlers, but used earlier
  * (the query from the admission path, the validator from state init). */
@@ -355,6 +397,16 @@ static struct {
     array_t histories;
     map_t peer_potentials;
     map_t vote_collection;
+    /* Pending vote finalizations: proposed-peer uuid -> the wall-clock time at
+     * which we stop waiting for other members' votes and decide on what we
+     * have. Mirrors Python's per-proposal _vote_collection thread, which sleeps
+     * vote_timeout and then finalizes; C has no thread per proposal, so the
+     * identity loop sweeps this map instead (identity_periodic_vote_collection).
+     * Without it C only ever counts votes when an inbound vote message arrives,
+     * so a cohort whose other members are gone can never admit anybody — its
+     * own self-vote, already recorded and already a majority, is never looked
+     * at. See id_proc.c's vote path and doc/architecture/identity-protocol.md. */
+    map_t vote_deadlines;
     bool choosing_group;
     /* Group-merge tracking — mirrors Python's self.self_bootstrapped
      * and self.merging in idprocess.py:126-127. Set when choose_group's
@@ -461,6 +513,22 @@ static struct {
     size_t  seen_post_next;
     size_t  seen_post_count;
     map_t   last_post_map;
+    /* Businesses (Phase 3 P3.2). business_customers is THIS node's own customer
+     * edges, keyed by polity did; values are string_data of {"sat","since",
+     * "bundle","seq"}. It is the RELAY GATE and the only thing that authorizes
+     * this node to carry a page: no entry, no ad — a non-customer is silent, and
+     * an unhappy customer clears its entry rather than publishing anything
+     * negative. business_pages is what we have LEARNED about businesses, keyed by
+     * polity did; values are string_data of {"bundle","seq","ts","endorsers":
+     * {uuid: sat}} — newest page wins by seq, endorsers merge. seen_business_ads
+     * is the bounded ad-content-id dedup ring (the twin of seen_post_ids). The
+     * bundles held here are OPAQUE: the core never parses Ethne, the app does.
+     * All guarded by id_state.lock. */
+    map_t   business_customers;
+    map_t   business_pages;
+    char    seen_business_ads[BUSINESS_AD_DEDUP_CAP][AT_BUSINESS_AD_ID_HEX_LEN + 1];
+    size_t  seen_business_ad_next;
+    size_t  seen_business_ad_count;
     /* Per-edge social-interaction accrual bookkeeping (Increment 8), keyed by
      * lowercased peer uuid string; values are string_data(compact JSON
      * {"count","last_out","last_in","day","day_count"}). count drives the
@@ -603,6 +671,7 @@ static void _ensure_id_init(void)
         array_init(&id_state.histories);
         map_init(&id_state.peer_potentials);
         map_init(&id_state.vote_collection);
+        map_init(&id_state.vote_deadlines);
         map_init(&id_state.own_caps_by_proc);
         map_init(&id_state.peer_caps_map);
 #ifdef AT_SOCIAL_ENABLED
@@ -625,6 +694,10 @@ static void _ensure_id_init(void)
         id_state.post_seq = 0;
         id_state.seen_post_next = 0;
         id_state.seen_post_count = 0;
+        map_init(&id_state.business_customers);
+        map_init(&id_state.business_pages);
+        id_state.seen_business_ad_next = 0;
+        id_state.seen_business_ad_count = 0;
         map_init(&id_state.social_edges);
         map_init(&id_state.social_tx_observed);
         id_state.social_day = 0;
@@ -1095,6 +1168,48 @@ int identity_get_peer_cap_descriptor(const char *cap_name, char *buf, size_t buf
     return rc;
 }
 
+/* Test seam: arm a pending admission exactly as handle_receive_access_request
+ * does — the proposed peer in potentials, a vote tally, and a deadline — so a
+ * unit test can drive identity_periodic_vote_collection without standing up the
+ * whole access handshake. @p deadline_offset_sec is relative to now, so a
+ * NEGATIVE value means the grace period has already expired. */
+void identity_arm_pending_vote(const public_identity_t *peer, int votes,
+                               double deadline_offset_sec)
+{
+    _ensure_id_init();
+    if (peer == NULL)
+        return;
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer->uuid, uuid_str);
+
+    public_identity_t *potential = smrt_create(sizeof(public_identity_t));
+    if (potential == NULL)
+        return;
+    memcpy(potential, peer, sizeof(public_identity_t));
+    data_t *pot_dat = object_ptr_data(potential, sizeof(public_identity_t));
+    data_t *vote_dat = integer_data(votes);
+    data_t *deadline = floating_pt_dbl_data(_vote_now_sec() + deadline_offset_sec);
+
+    pthread_mutex_lock(&id_state.lock);
+    map_set(&id_state.peer_potentials, uuid_str, pot_dat);
+    map_set(&id_state.vote_collection, uuid_str, vote_dat);
+    map_set(&id_state.vote_deadlines, uuid_str, deadline);
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+/* Test seam: is an admission still waiting on its grace period? */
+bool identity_pending_vote_armed(const uuid_t uuid)
+{
+    _ensure_id_init();
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(uuid, uuid_str);
+    pthread_mutex_lock(&id_state.lock);
+    data_t *value = NULL;
+    bool armed = (map_get(&id_state.vote_deadlines, uuid_str, &value) == 0);
+    pthread_mutex_unlock(&id_state.lock);
+    return armed;
+}
+
 void identity_install_peer_caps(const uuid_t uuid,
                                 const char *const *caps, size_t n_caps)
 {
@@ -1484,6 +1599,30 @@ static json_t *_confirm_envelope(const process_t *proc,
     return env;
 }
 
+/* True when @p who is ALREADY a member of our group, i.e. its uuid is already in
+ * our address_map — which means it already holds the shared key.
+ *
+ * Used to decide whether admitting it should rotate. Rotation exists so a JOINER
+ * cannot decrypt cohort ciphertext recorded before it was admitted; a node that
+ * is already a member has had the key all along, so rotating "away from" it
+ * hides nothing and costs a great deal. Two nodes that discover each other in
+ * the ordinary mesh way merge groups first and THEN each run the access
+ * handshake, so without this gate both admit a peer that is already a member and
+ * both mint the same epoch — the permanent group-key fork diagnosed on
+ * 2026-09-17 (see group_accept_rotation, which resolves the fork when it does
+ * happen; this is what keeps it from happening at all). */
+static bool _group_already_member(process_t *proc, const public_identity_t *who)
+{
+    if (proc == NULL || who == NULL)
+        return false;
+    if (proc->protocol.group.address_map.items == NULL)
+        return false;
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(who->uuid, uuid_str);
+    data_t *value = NULL;
+    return map_get(&proc->protocol.group.address_map, uuid_str, &value) == 0;
+}
+
 static int _peer_accepted(process_t *proc, directory_t *queues,
                           const public_identity_t *new_peer, int rank,
                           bool amnesia)
@@ -1596,8 +1735,19 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
      * recorded before being admitted stays closed to it. Existing members are handed
      * the new key by the _update_group inside, and keep decrypting old-key traffic
      * through GROUP_PREVIOUS_KEY_GRACE while that propagates — a rotation is not
-     * synchronous across a cohort. Mirrors Python _peer_accepted. */
-    _rotate_group_key(proc, queues);
+     * synchronous across a cohort. Mirrors Python _peer_accepted.
+     *
+     * ONLY for an actual joiner, though: see _group_already_member. Admitting a
+     * node that is already in our group rotates away from nothing (it holds the
+     * key already) and, when both sides do it at once, forks the cohort's key
+     * permanently. */
+    if (_group_already_member(proc, new_peer))
+        log_info(proc->logger,
+                 "Identity: %s is already a group member; not rotating "
+                 "(nothing to withhold, and a simultaneous rotation forks the key)\n",
+                 new_peer->nickname);
+    else
+        _rotate_group_key(proc, queues);
 
     json_t *hist_arr = json_array();
     if (hist_arr != NULL)
@@ -1996,6 +2146,12 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
     /* Proposer self-vote: count as 1 */
     data_t *self_vote = integer_data(1);
     map_set(&id_state.vote_collection, uuid_str, self_vote);
+    /* ...and arm the finalize. Votes from other members may arrive and decide
+     * this earlier (handle_count_vote); if none do, the identity loop decides
+     * on what we have once the grace period is up, which is what Python's
+     * per-proposal thread does after vote_timeout. */
+    data_t *deadline = floating_pt_dbl_data(_vote_now_sec() + ID_VOTE_TIMEOUT_SEC);
+    map_set(&id_state.vote_deadlines, uuid_str, deadline);
     pthread_mutex_unlock(&id_state.lock);
 
     /* Propose this peer to existing group members for voting.
@@ -2645,8 +2801,34 @@ static int _merge_to_mesh(process_t *proc, directory_t *queues)
      * sides promptly; a receiver already on this group records it and no-ops
      * (handle_group_update's same-group path returns before re-echoing), so
      * there is no ID_UPDATE ping-pong. Mirrors handle_group_update's tail. */
-    if (have_group)
+    if (have_group) {
+        /* Tell our OWN sibling processes first. _update_group only informs
+         * PEERS over the wire and the identity process itself; without this the
+         * NETWORK process keeps whatever group it was last handed — after a
+         * merge, its pre-merge group — and since net_proc is what actually
+         * encrypts a group multicast (net_proc.c, RECIPIENT_GROUP), every
+         * multicast goes out under the key the cohort just abandoned. Nothing
+         * reports it: group_encrypt succeeds, the send succeeds, and only the
+         * RECEIVER notices, as an undiagnosable "group decrypt failed".
+         *
+         * That is precisely how it failed: two nodes merged to one group in
+         * their identity processes while both network processes stayed on their
+         * own self-bootstrapped epoch-0 keys, so the first live group multicast
+         * the project ever sent (agora business ad, 2026-09-17) was encrypted
+         * under a key no peer held. Pairing the local GROUP broadcast with the
+         * peer fanout is what _confirm_group_membership and _rotate_group_key
+         * already do; the merge path was the one that only did half.
+         *
+         * Sent on the KEEP path too, not just the adopt: a rotation performed
+         * during self-bootstrap can have been broadcast before the sibling
+         * queues were live, so the winner's net_proc can be stale as well. The
+         * message is idempotent — processes.c just assigns protocol.group. */
+        generic_msg_t group_msg = {0};
+        group_msg.type = GROUP;
+        memcpy(&group_msg.info.group, &proc->protocol.group, sizeof(group_t));
+        _remember_activity(proc, queues, &group_msg);
         _update_group(proc, queues);
+    }
 
     int rc = _announce_identity(proc, queues);
 
@@ -3095,6 +3277,8 @@ void identity_reset_state(void)
     map_init(&id_state.peer_potentials);
     map_free(&id_state.vote_collection);
     map_init(&id_state.vote_collection);
+    map_free(&id_state.vote_deadlines);
+    map_init(&id_state.vote_deadlines);
     map_free(&id_state.own_caps_by_proc);
     map_init(&id_state.own_caps_by_proc);
     map_free(&id_state.peer_caps_map);
@@ -3121,6 +3305,12 @@ void identity_reset_state(void)
     id_state.post_seq = 0;
     id_state.seen_post_next = 0;
     id_state.seen_post_count = 0;
+    map_free(&id_state.business_customers);
+    map_init(&id_state.business_customers);
+    map_free(&id_state.business_pages);
+    map_init(&id_state.business_pages);
+    id_state.seen_business_ad_next = 0;
+    id_state.seen_business_ad_count = 0;
     map_free(&id_state.social_edges);
     map_init(&id_state.social_edges);
     map_free(&id_state.social_tx_observed);
@@ -3165,6 +3355,119 @@ void identity_reset_state(void)
     freshness_reset(&id_state.freshness);
     id_state.probe_seq = 0;
     pthread_mutex_unlock(&id_state.lock);
+}
+
+/* Accept the proposed peer @p uuid_key if @p count meets the majority of
+ * @p num_peers. Shared by the two things that can decide an admission: an
+ * inbound vote (handle_count_vote) and the expiry of our own grace period
+ * (identity_periodic_vote_collection). Returns whether the peer was accepted.
+ *
+ * Kept in one place because the two callers must agree exactly on what a
+ * majority is; when only the vote-message path existed, the self-vote we had
+ * already recorded was never compared against it at all. */
+static bool _finalize_vote_if_majority(process_t *proc, directory_t *queues,
+                                       const char *uuid_key, int count,
+                                       size_t num_peers)
+{
+    if (count < MAJORITY(num_peers))
+        return false;
+
+    /* Find the proposed peer in peer_potentials */
+    pthread_mutex_lock(&id_state.lock);
+    data_t *peer_dat = NULL;
+    map_get(&id_state.peer_potentials, (map_key_t)uuid_key, &peer_dat);
+    public_identity_t *new_peer = NULL;
+    if (peer_dat != NULL)
+        data_object_ptr(peer_dat, (void **)&new_peer);
+    pthread_mutex_unlock(&id_state.lock);
+
+    if (new_peer == NULL)
+    {
+        log_warn(proc->logger,
+                 "Identity: majority reached but peer %s not in potentials\n",
+                 uuid_key);
+        return false;
+    }
+    log_info(proc->logger,
+             "Identity: majority vote reached for %s, accepting peer\n",
+             uuid_key);
+    /* Rank was captured at the potential-store (handle_welcoming_committee);
+     * pass 0 so _peer_accepted's non-zero gate leaves it. */
+    _peer_accepted(proc, queues, new_peer, 0, false);
+    return true;
+}
+
+/****************************
+ * Periodic: identity_periodic_vote_collection
+ *
+ * Decide any admission whose grace period for other members' votes has run
+ * out, using the votes in hand. This is C's stand-in for Python's per-proposal
+ * _vote_collection thread (idprocess.py:2227), which sleeps vote_timeout and
+ * then finalizes; the identity loop sweeps instead of spawning a thread per
+ * proposal.
+ *
+ * Why it must exist at all: a vote count was only ever COMPARED to the majority
+ * when an inbound vote message arrived. A proposer's own self-vote is recorded
+ * immediately and, in a cohort whose other members are unreachable, is already
+ * a majority — but nothing looked. So a node that had lost its peers could
+ * never admit anybody: it proposed, logged "proposed peer X for voting", and
+ * waited forever for a vote that no living member was left to send. Found
+ * 2026-09-17 when a late joiner could not enter a cohort whose only other
+ * member had been stopped.
+ *
+ * One shot per proposal, like Python's: the entry is dropped whether or not the
+ * majority was met. A peer that still wants in re-sends request_access (every
+ * ~5s), which re-proposes and re-arms.
+ ****************************/
+void identity_periodic_vote_collection(process_t *proc, directory_t *queues)
+{
+    if (proc == NULL)
+        return;
+
+    /* Collect what is due under the lock, then act outside it: _peer_accepted
+     * sends messages and takes the peers lock, and holding id_state.lock across
+     * that is the shape of a deadlock. */
+    char due_keys[ID_VOTE_SWEEP_MAX][UUID_STRING_LEN + 2];
+    int due_counts[ID_VOTE_SWEEP_MAX];
+    size_t n_due = 0;
+    double now = _vote_now_sec();
+
+    pthread_mutex_lock(&id_state.lock);
+    map_key_t key;
+    data_t *value;
+    map_entries_for_each(&id_state.vote_deadlines, key, value)
+        if (n_due >= ID_VOTE_SWEEP_MAX)
+            break;
+        double deadline = 0.0;
+        if (data_floating_pt_dbl(value, &deadline) != 0 || now < deadline)
+            continue;
+        int count = 0;
+        data_t *count_dat = NULL;
+        if (map_get(&id_state.vote_collection, key, &count_dat) == 0
+            && count_dat != NULL)
+            (void)data_integer(count_dat, &count);
+        snprintf(due_keys[n_due], sizeof(due_keys[0]), "%s", key);
+        due_counts[n_due] = count;
+        n_due++;
+    map_end_for_each
+    /* Disarm every key we are about to decide, so a sweep that overlaps the
+     * next cadence tick cannot decide the same proposal twice. */
+    for (size_t i = 0; i < n_due; i++)
+        map_remove(&id_state.vote_deadlines, due_keys[i]);
+    pthread_mutex_unlock(&id_state.lock);
+
+    peers_read_lock(proc);
+    size_t num_peers = proc->protocol.num_peers;
+    peers_read_unlock(proc);
+
+    for (size_t i = 0; i < n_due; i++)
+    {
+        log_debug(proc->logger,
+                  "Identity: vote grace period up for %s: %d vote(s) (need %d)\n",
+                  due_keys[i], due_counts[i], MAJORITY(num_peers));
+        _finalize_vote_if_majority(proc, queues, due_keys[i], due_counts[i],
+                                   num_peers);
+    }
 }
 
 /****************************
@@ -3233,32 +3536,7 @@ static bool handle_count_vote(process_t *proc, directory_t *queues, generic_msg_
     log_debug(proc->logger, "Identity: vote count for %s: %d (need %d)\n",
               uuid_key, count, MAJORITY(num_peers));
 
-    /* If majority reached, accept the peer */
-    if (count >= MAJORITY(num_peers))
-    {
-        /* Find the proposed peer in peer_potentials */
-        pthread_mutex_lock(&id_state.lock);
-        data_t *peer_dat = NULL;
-        map_get(&id_state.peer_potentials, uuid_key, &peer_dat);
-        public_identity_t *new_peer = NULL;
-        if (peer_dat != NULL)
-            data_object_ptr(peer_dat, (void **)&new_peer);
-        pthread_mutex_unlock(&id_state.lock);
-
-        if (new_peer != NULL)
-        {
-            log_info(proc->logger, "Identity: majority vote reached for %s, accepting peer\n",
-                     uuid_key);
-            /* Rank was captured at the potential-store (handle_welcoming_
-             * committee); pass 0 so _peer_accepted's non-zero gate leaves it. */
-            _peer_accepted(proc, queues, new_peer, 0, false);
-        }
-        else
-        {
-            log_warn(proc->logger, "Identity: majority reached but peer %s not in potentials\n",
-                     uuid_key);
-        }
-    }
+    _finalize_vote_if_majority(proc, queues, uuid_key, count, num_peers);
 
     return true;
 }
@@ -3666,34 +3944,60 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
         json_t *j_epoch = json_object_get(payload, "key_epoch");
         int64_t theirs_epoch = (j_epoch != NULL && json_is_integer(j_epoch))
                                ? json_integer_value(j_epoch) : 0;
-        if (theirs_epoch > proc->protocol.group.key_epoch)
+        /* Parsed BEFORE the epoch gate: whether the update carries a private
+         * seed is what makes it a rotation at all, and the EQUAL-epoch case
+         * needs to tell a rotation from an ordinary membership update. */
+        json_t *j_encr = json_object_get(payload, "encryptor");
+        json_t *j_po = j_encr ? json_object_get(j_encr, "public_only") : NULL;
+        const char *seed_hex = j_encr
+            ? json_string_value(json_object_get(j_encr, "hex_seed")) : NULL;
+        bool theirs_public = (j_po == NULL) ? true : json_boolean_value(j_po);
+        bool carries_key = (!theirs_public && seed_hex != NULL);
+        /* An EQUAL epoch is a rotation candidate, not a no-op: when two members
+         * rotate at the same instant they both mint THIS epoch, and
+         * group_accept_rotation settles which key the cohort keeps by a
+         * deterministic tiebreak. Refusing equality here would strand that fork
+         * no matter what group.c decides — the update would never reach it. An
+         * equal-epoch update that carries no key is an ordinary membership
+         * update and still falls through to the address-map logic below. */
+        bool same_epoch_tiebreak =
+            (theirs_epoch == proc->protocol.group.key_epoch) && carries_key;
+        /* A HIGHER epoch claims to supersede us, so an unverified one is
+         * refused AND the message is dropped: that claim is the attack surface,
+         * and letting the rest of such a message through would be trusting an
+         * envelope we just called a forgery. Unchanged behavior.
+         *
+         * An equal epoch makes no such claim, so it must NOT be dropped here —
+         * it is an ordinary membership update that happens to carry a key, and
+         * dropping it would lose the address-map convergence below. (It did,
+         * briefly: widening this drop to cover the tiebreak stalled the merge
+         * in the 2026-09-17 cohort.) The tiebreak simply does not fire unless
+         * the update is verified. */
+        if (theirs_epoch > proc->protocol.group.key_epoch && !nmsg->verified)
         {
-            if (!nmsg->verified)
-            {
-                log_warn(proc->logger,
-                         "Identity: rejecting unverified group key rotation "
-                         "from %s\n", nmsg->from_whom.nickname);
-                json_decref(payload);
-                return true;
-            }
+            log_warn(proc->logger,
+                     "Identity: rejecting unverified group key rotation "
+                     "from %s\n", nmsg->from_whom.nickname);
+            json_decref(payload);
+            return true;
+        }
+        if ((theirs_epoch > proc->protocol.group.key_epoch || same_epoch_tiebreak)
+            && nmsg->verified)
+        {
             /* Only the fields group_accept_rotation reads, on the stack, so no
              * address_map is allocated to free here. */
             group_t theirs = {0};
             memcpy(theirs.uuid, proc->protocol.group.uuid, sizeof(uuid_t));
             theirs.key_epoch = theirs_epoch;
-            json_t *j_encr = json_object_get(payload, "encryptor");
-            json_t *j_po = j_encr ? json_object_get(j_encr, "public_only") : NULL;
-            const char *seed_hex = j_encr
-                ? json_string_value(json_object_get(j_encr, "hex_seed")) : NULL;
-            bool theirs_public = (j_po == NULL) ? true : json_boolean_value(j_po);
-            if (!theirs_public && seed_hex != NULL
+            if (carries_key
                 && encryptor_init_from_private(&theirs.encryptor,
                        (const unsigned char *)seed_hex, strlen(seed_hex)) == 0
                 && group_accept_rotation(&((process_t *)proc)->protocol.group,
                                          &theirs))
                 log_info(proc->logger,
-                         "Identity: adopted rotated group key, epoch %lld\n",
-                         (long long)proc->protocol.group.key_epoch);
+                         "Identity: adopted rotated group key, epoch %lld%s\n",
+                         (long long)proc->protocol.group.key_epoch,
+                         same_epoch_tiebreak ? " (same-epoch tiebreak)" : "");
         }
     }
 
@@ -6328,6 +6632,574 @@ bool identity_get_last_post(const char *uuid_str, char *post_id_buf,
     }
     pthread_mutex_unlock(&id_state.lock);
     return found;
+}
+
+/****************************
+ * Businesses (Phase 3 P3.2, the "businesses near me" surface).
+ *
+ * A business is an Ethne polity; its PAGE is an opaque, self-verifying Ethne
+ * bundle ({page, delegation} proving polity-root -> envoy -> page). The core
+ * NEVER parses that bundle — it carries it as bytes and the app verifies it.
+ * What the core does own is the AT layer: a detached Ed25519 signature binding
+ * WHO advertised, HOW satisfied they are, and WHICH page bytes they meant.
+ *
+ * THE CUSTOMER GATE is the whole mechanism. A business ad is never relayed the
+ * way a post is. Only a CUSTOMER carries a business's page, and a customer does
+ * not forward someone else's ad — it re-advertises from its own cache in the
+ * FIRST PERSON, signed with its own key and its own satisfaction. So:
+ *   - a business's reach is exactly the sum of its customers' voices;
+ *   - distribution and reputation are the same fact;
+ *   - an unhappy customer simply clears its edge and goes quiet. Silence is the
+ *     only negative signal, so there is nothing to brigade with.
+ *
+ * The reader ranks what arrives by its OWN tie strength to each advertiser
+ * (app-side), which is why a stranger's enthusiasm is worth almost nothing and a
+ * friend's counts — the trust path and the delivery path are the same edge.
+ ****************************/
+
+/* Ad-content dedup: return true if @p id_hex was ALREADY recorded (caller
+ * drops), else record it in the bounded ring and return false. Own locking.
+ * The twin of _post_seen_or_record; also what forecloses replay. */
+static bool _business_ad_seen_or_record(const char *id_hex)
+{
+    bool seen = false;
+    pthread_mutex_lock(&id_state.lock);
+    for (size_t i = 0; i < id_state.seen_business_ad_count; i++) {
+        if (strncmp(id_state.seen_business_ads[i], id_hex,
+                    AT_BUSINESS_AD_ID_HEX_LEN) == 0) {
+            seen = true;
+            break;
+        }
+    }
+    if (!seen) {
+        snprintf(id_state.seen_business_ads[id_state.seen_business_ad_next],
+                 AT_BUSINESS_AD_ID_HEX_LEN + 1, "%s", id_hex);
+        id_state.seen_business_ad_next =
+            (id_state.seen_business_ad_next + 1) % BUSINESS_AD_DEDUP_CAP;
+        if (id_state.seen_business_ad_count < BUSINESS_AD_DEDUP_CAP)
+            id_state.seen_business_ad_count++;
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return seen;
+}
+
+/* Store @p obj (a NEW reference, consumed) as compact JSON under @p key in
+ * @p map. Caller holds no lock; this takes id_state.lock itself. Shared by the
+ * customer and page stores, which both keep small JSON records. */
+static void _business_map_store_json(map_t *map, const char *key, json_t *obj)
+{
+    if (obj == NULL) return;
+    char *compact = json_dumps(obj, JSON_COMPACT);
+    json_decref(obj);
+    if (compact == NULL) return;
+    size_t len = strlen(compact);
+    char *dup = smrt_create(len + 1);
+    if (dup == NULL) { free(compact); return; }
+    memcpy(dup, compact, len + 1);
+    free(compact);
+    data_t *dat = string_data(dup, len + 1);
+    if (dat == NULL) { smrt_deref(dup); return; }
+    pthread_mutex_lock(&id_state.lock);
+    map_set(map, (map_key_t)key, dat);
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+/* Load the JSON record stored under @p key in @p map, or NULL. Caller decrefs.
+ * Takes id_state.lock itself. */
+static json_t *_business_map_load_json(map_t *map, const char *key)
+{
+    json_t *obj = NULL;
+    pthread_mutex_lock(&id_state.lock);
+    data_t *dat = NULL;
+    if (map_get(map, (map_key_t)key, &dat) == 0 && dat != NULL) {
+        char *js = NULL;
+        if (data_string_ptr(dat, &js) == 0 && js != NULL) {
+            json_error_t jerr;
+            obj = json_loads(js, 0, &jerr);
+        }
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return obj;
+}
+
+/* THE GATE: is this node a customer of @p did? Fills the cached bundle/seq/sat
+ * when it is. A node with no customer edge for a business never carries its
+ * page — that is the entire relay policy. */
+static bool _business_is_customer(const char *did, int *sat_out,
+                                  char *bundle_out, size_t bundle_sz,
+                                  int64_t *seq_out)
+{
+    json_t *obj = _business_map_load_json(&id_state.business_customers, did);
+    if (obj == NULL) return false;
+    json_t *j_sat    = json_object_get(obj, "sat");
+    json_t *j_seq    = json_object_get(obj, "seq");
+    json_t *j_bundle = json_object_get(obj, "bundle");
+    if (sat_out != NULL)
+        *sat_out = json_is_integer(j_sat) ? (int)json_integer_value(j_sat) : 0;
+    if (seq_out != NULL)
+        *seq_out = json_is_integer(j_seq) ? (int64_t)json_integer_value(j_seq) : 0;
+    if (bundle_out != NULL && bundle_sz > 0)
+        at_business_bound_bundle(json_is_string(j_bundle)
+                                     ? json_string_value(j_bundle) : "",
+                                 bundle_out, bundle_sz);
+    json_decref(obj);
+    return true;
+}
+
+/* Merge one accepted ad into the learned page store. The NEWEST page wins by
+ * seq, but the endorser is recorded either way: a customer still vouches even
+ * when it is carrying a page version we have already bettered. Own locking (via
+ * the load/store helpers). */
+static void _business_page_store(const char *did, const char *bundle,
+                                 int64_t seq, double ts,
+                                 const char *advertiser_str, int sat)
+{
+    json_t *rec = _business_map_load_json(&id_state.business_pages, did);
+    if (rec == NULL) {
+        /* Bound the number of distinct businesses we will hold pages for, so
+         * unsolicited ads cannot grow this map without limit. */
+        pthread_mutex_lock(&id_state.lock);
+        size_t held = map_size(&id_state.business_pages);
+        pthread_mutex_unlock(&id_state.lock);
+        if (held >= BUSINESS_PAGE_CAP) return;
+        rec = json_object();
+        if (rec == NULL) return;
+        if (json_object_set_new(rec, "endorsers", json_object()) != 0) {
+            json_decref(rec);
+            return;
+        }
+        if (json_object_set_new(rec, "seq", json_integer(-1)) != 0) {
+            json_decref(rec);
+            return;
+        }
+    }
+
+    json_t *j_seq = json_object_get(rec, "seq");
+    int64_t held_seq = json_is_integer(j_seq) ? (int64_t)json_integer_value(j_seq) : -1;
+    if (seq >= held_seq) {
+        char bnd[AT_BUSINESS_BUNDLE_MAX + 1];
+        at_business_bound_bundle(bundle, bnd, sizeof(bnd));
+        if (json_object_set_new(rec, "bundle", json_string(bnd)) != 0
+            || json_object_set_new(rec, "seq", json_integer((json_int_t)seq)) != 0
+            || json_object_set_new(rec, "ts", json_real(ts)) != 0) {
+            json_decref(rec);
+            return;
+        }
+    }
+
+    /* The advertiser's standing vouch. A business's own ad (SAT_SELF) is NOT an
+     * endorsement — self-vouching is free, and recording it would let a business
+     * manufacture its own social proof. */
+    if (sat != AT_BUSINESS_SAT_SELF && advertiser_str != NULL) {
+        json_t *endorsers = json_object_get(rec, "endorsers");
+        if (!json_is_object(endorsers)) {
+            endorsers = json_object();
+            if (json_object_set_new(rec, "endorsers", endorsers) != 0) {
+                json_decref(rec);
+                return;
+            }
+        }
+        json_object_set_new(endorsers, advertiser_str, json_integer(sat));
+    }
+
+    _business_map_store_json(&id_state.business_pages, did, rec);
+}
+
+/* AT -> app: surface one accepted business ad as PEER_BUSINESS_AD_OBSERVED.
+ * @p advertiser_uuid is the signature-bound advertiser. Mirrors
+ * identity_emit_post. */
+static int identity_emit_business_ad(const uuid_t advertiser_uuid,
+                                     const char *did, const char *ad_id,
+                                     int satisfaction, int64_t seq, double ts,
+                                     const char *bundle)
+{
+    generic_msg_t msg = {0};
+    msg.type = PEER_BUSINESS_AD_OBSERVED;
+    msg.size = sizeof(peer_business_ad_msg_t);
+    memcpy(msg.info.peer_business_ad.peer_uuid, advertiser_uuid, 16);
+    at_business_bound_did(did, msg.info.peer_business_ad.polity,
+                          sizeof(msg.info.peer_business_ad.polity));
+    snprintf(msg.info.peer_business_ad.ad_id,
+             sizeof(msg.info.peer_business_ad.ad_id), "%s",
+             ad_id != NULL ? ad_id : "");
+    msg.info.peer_business_ad.satisfaction = satisfaction;
+    msg.info.peer_business_ad.seq = seq;
+    msg.info.peer_business_ad.ts = ts;
+    at_business_bound_bundle(bundle, msg.info.peer_business_ad.bundle,
+                             sizeof(msg.info.peer_business_ad.bundle));
+    return messaging_send(AT_MAIN_QUEUE, PEER_BUSINESS_AD_OBSERVED, &msg, false);
+}
+
+/* Encrypted group multicast of one signed business ad. Same shape as
+ * _multicast_post (RECIPIENT_GROUP + group_encrypt), minus the hop count: every
+ * ad is first-person, so there is nothing to forward and nothing to count. */
+static int _multicast_business_ad(const process_t *proc,
+                                  const uuid_t advertiser_uuid,
+                                  const char *advertiser_pk_hex,
+                                  const char *did, uint8_t satisfaction,
+                                  int64_t seq, double ts, const char *bundle,
+                                  const char *sig_hex)
+{
+    (void)proc;
+    generic_msg_t out = {0};
+    out.type = NET_MESSAGE;
+    strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
+    out.info.net_msg.function = ID_BUSINESS_AD;
+    out.info.net_msg.encrypt = false;
+    out.info.net_msg.group_multicast = true;
+    strncpy(out.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    json_t *env = at_business_ad_to_json(advertiser_uuid, advertiser_pk_hex, did,
+                                         satisfaction, seq, ts, bundle, sig_hex);
+    if (env == NULL) return -1;
+    net_msg_pack_json(&out.info.net_msg, env);
+    json_decref(env);
+    messaging_send("network", NET_MESSAGE, &out, false);
+    return 0;
+}
+
+/* Speak for a business IN THE FIRST PERSON: sign the canonical ad with THIS
+ * node's key and group-multicast it. @p satisfaction is our own 0..4 rating as a
+ * customer, or AT_BUSINESS_SAT_SELF when this node IS the business. Shared by
+ * the advertise verb, the set-customer verb, and the customer-gated
+ * re-advertisement on the inbound path — which is why there is no "relay": all
+ * three are this same act. Returns 0 on success. */
+static int _business_advertise(const process_t *proc, const char *did,
+                               uint8_t satisfaction, int64_t seq,
+                               const char *bundle)
+{
+    const identity_t *self = _partition_self_identity(proc);
+    if (self == NULL) {
+        log_debug(proc->logger,
+                  "Identity: business advertise but self identity unresolved; skipping\n");
+        return -1;
+    }
+    double ts = (double)time(NULL);
+    char sig_hex[AT_BUSINESS_AD_SIG_HEX_LEN + 1];
+    if (at_business_ad_sign(self->signature.private, self->uuid, did,
+                            satisfaction, seq, ts, bundle, sig_hex) != 0) {
+        log_warn(proc->logger, "Identity: business ad signing failed\n");
+        return -1;
+    }
+    char pk_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1];
+    sodium_bin2hex(pk_hex, sizeof(pk_hex), self->signature.public,
+                   crypto_sign_PUBLICKEYBYTES);
+    char id_hex[AT_BUSINESS_AD_ID_HEX_LEN + 1];
+    if (at_business_ad_content_id(self->uuid, did, satisfaction, seq, ts, bundle,
+                                  id_hex) != 0)
+        return -1;
+    /* Record BEFORE sending so a loopback copy of our own multicast is deduped
+     * rather than re-emitted (and, crucially, not re-advertised in a loop). */
+    (void)_business_ad_seen_or_record(id_hex);
+
+    _multicast_business_ad(proc, self->uuid, pk_hex, did, satisfaction, seq, ts,
+                           bundle, sig_hex);
+    log_info(proc->logger,
+             "Identity: advertised business %s seq=%lld sat=%u (%s)\n", did,
+             (long long)seq, (unsigned)satisfaction, id_hex);
+    return 0;
+}
+
+/* Write (or overwrite) THIS node's customer edge to @p did: the record that
+ * authorizes this node to CARRY the business's page. Pure state — it does NOT
+ * advertise, which is what lets the conformance fixture install an edge without
+ * putting an ad on the wire. Returns false only on allocation failure. */
+static bool _business_customer_record(const char *did, int sat,
+                                      const char *bundle, int64_t seq)
+{
+    json_t *rec = json_object();
+    if (rec == NULL) return false;
+    if (json_object_set_new(rec, "sat", json_integer(sat)) != 0
+        || json_object_set_new(rec, "since", json_real((double)time(NULL))) != 0
+        || json_object_set_new(rec, "bundle", json_string(bundle)) != 0
+        || json_object_set_new(rec, "seq", json_integer((json_int_t)seq)) != 0) {
+        json_decref(rec);
+        return false;
+    }
+    _business_map_store_json(&id_state.business_customers, did, rec);
+    return true;
+}
+
+/* App -> AT verb (AT_APP_ADVERTISE_BUSINESS): the envoy operator publishes THIS
+ * node's own business page. Payload {"polity":"<did>","bundle":"<json>",
+ * "seq":<int>}. The bundle is opaque here — the app already built and signed it
+ * through Ethne, and any reader verifies it the same way. */
+static bool handle_app_advertise_business(const process_t *proc,
+                                          directory_t *queues,
+                                          generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *j_did    = json_object_get(payload, "polity");
+    json_t *j_bundle = json_object_get(payload, "bundle");
+    json_t *j_seq    = json_object_get(payload, "seq");
+    char did[AT_BUSINESS_DID_MAX + 1];
+    at_business_bound_did(json_is_string(j_did) ? json_string_value(j_did) : "",
+                          did, sizeof(did));
+    char bundle[AT_BUSINESS_BUNDLE_MAX + 1];
+    at_business_bound_bundle(json_is_string(j_bundle)
+                                 ? json_string_value(j_bundle) : "",
+                             bundle, sizeof(bundle));
+    int64_t seq = json_is_integer(j_seq) ? (int64_t)json_integer_value(j_seq) : 0;
+    json_decref(payload);
+
+    if (did[0] == '\0' || bundle[0] == '\0') {
+        log_warn(proc->logger,
+                 "Identity: advertise_business without polity/bundle, refusing\n");
+        return true;
+    }
+    (void)_business_advertise(proc, did, AT_BUSINESS_SAT_SELF, seq, bundle);
+    return true;
+}
+
+/* App -> AT verb (AT_APP_SET_CUSTOMER): declare, update or clear this node's
+ * customer edge to a business. Payload {"polity":"<did>","satisfaction":<0..4>,
+ * "bundle":"<json>","seq":<int>}, or satisfaction < 0 to clear.
+ *
+ * Declaring a customer edge is what authorizes this node to CARRY the page: on
+ * set we cache the bundle and immediately advertise it in the first person. On
+ * clear we remove the edge and say nothing further — an unhappy customer
+ * publishes no negative, it just stops speaking for the business. */
+static bool handle_app_set_customer(const process_t *proc, directory_t *queues,
+                                    generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *j_did    = json_object_get(payload, "polity");
+    json_t *j_sat    = json_object_get(payload, "satisfaction");
+    json_t *j_bundle = json_object_get(payload, "bundle");
+    json_t *j_seq    = json_object_get(payload, "seq");
+    char did[AT_BUSINESS_DID_MAX + 1];
+    at_business_bound_did(json_is_string(j_did) ? json_string_value(j_did) : "",
+                          did, sizeof(did));
+    int sat = json_is_integer(j_sat) ? (int)json_integer_value(j_sat) : -1;
+    char bundle[AT_BUSINESS_BUNDLE_MAX + 1];
+    at_business_bound_bundle(json_is_string(j_bundle)
+                                 ? json_string_value(j_bundle) : "",
+                             bundle, sizeof(bundle));
+    int64_t seq = json_is_integer(j_seq) ? (int64_t)json_integer_value(j_seq) : 0;
+    json_decref(payload);
+
+    if (did[0] == '\0') {
+        log_warn(proc->logger, "Identity: set_customer without polity, refusing\n");
+        return true;
+    }
+
+    if (sat < 0) {
+        pthread_mutex_lock(&id_state.lock);
+        map_remove(&id_state.business_customers, (map_key_t)did);
+        pthread_mutex_unlock(&id_state.lock);
+        log_info(proc->logger,
+                 "Identity: cleared customer edge to %s (going quiet)\n", did);
+        return true;
+    }
+    if (sat > AT_BUSINESS_SAT_MAX) sat = AT_BUSINESS_SAT_MAX;
+
+    /* No bundle supplied? Fall back to the page we already learned, so a person
+     * can declare "I'm a customer here" straight from a page that reached them
+     * through someone else. */
+    if (bundle[0] == '\0') {
+        json_t *rec = _business_map_load_json(&id_state.business_pages, did);
+        if (rec != NULL) {
+            json_t *j_b = json_object_get(rec, "bundle");
+            json_t *j_s = json_object_get(rec, "seq");
+            at_business_bound_bundle(json_is_string(j_b) ? json_string_value(j_b) : "",
+                                     bundle, sizeof(bundle));
+            if (json_is_integer(j_s)) seq = (int64_t)json_integer_value(j_s);
+            json_decref(rec);
+        }
+    }
+    if (bundle[0] == '\0') {
+        log_warn(proc->logger,
+                 "Identity: set_customer for %s but no page known, refusing\n", did);
+        return true;
+    }
+
+    if (!_business_customer_record(did, sat, bundle, seq)) return true;
+    log_info(proc->logger, "Identity: customer of %s at satisfaction %d\n", did, sat);
+
+    /* Speak for them now, in the first person. */
+    (void)_business_advertise(proc, did, (uint8_t)sat, seq, bundle);
+    return true;
+}
+
+/* Handler: an inbound group-multicast business ad. Verify the advertiser's
+ * signature (bound to their key exactly as handle_post does — a known peer's
+ * stored key MUST match the carried one, an unknown advertiser is accepted
+ * best-effort against the carried key so a page can reach beyond the business's
+ * own cohort). Then content-id DEDUP, store, emit — and finally the CUSTOMER
+ * GATE: if we are a customer of this business, we re-advertise it ourselves.
+ *
+ * Note what is deliberately absent: no tier-gate (a business page is public by
+ * construction — the gate is patronage, not audience), and no hop count (we
+ * never forward someone else's ad, we speak for ourselves or not at all). */
+static bool handle_business_ad(const process_t *proc, directory_t *queues,
+                               generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    uuid_t advertiser;
+    char adv_pk[AT_BUSINESS_AD_SIG_HEX_LEN + 1];
+    char sig_hex[AT_BUSINESS_AD_SIG_HEX_LEN + 1];
+    char did[AT_BUSINESS_DID_MAX + 1];
+    char bundle[AT_BUSINESS_BUNDLE_MAX + 1];
+    uint8_t sat = 0;
+    int64_t seq = 0;
+    double ts = 0.0;
+    if (at_business_ad_from_json(payload, advertiser, adv_pk, did, sizeof(did),
+                                 &sat, &seq, &ts, bundle, sizeof(bundle),
+                                 sig_hex) != 0) {
+        json_decref(payload);
+        log_warn(proc->logger, "Identity: peer_business_ad malformed, refusing\n");
+        return true;
+    }
+    json_decref(payload);
+
+    char adv_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(advertiser, adv_str);
+
+    /* Resolve the key to verify against, binding uuid <-> key where we can. */
+    unsigned char verify_pk[crypto_sign_PUBLICKEYBYTES];
+    public_identity_t known;
+    bool have_known = _find_peer_pub_by_uuid(proc, advertiser, &known);
+    if (have_known) {
+        char known_pk_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1];
+        sodium_bin2hex(known_pk_hex, sizeof(known_pk_hex),
+                       known.signature.public, crypto_sign_PUBLICKEYBYTES);
+        if (strncmp(known_pk_hex, adv_pk, crypto_sign_PUBLICKEYBYTES * 2) != 0) {
+            log_warn(proc->logger,
+                     "Identity: peer_business_ad from %s: advertiser_pk != known "
+                     "key, dropping (impersonation)\n", adv_str);
+            return true;
+        }
+        memcpy(verify_pk, known.signature.public, sizeof(verify_pk));
+    } else {
+        size_t bin_len = 0;
+        if (sodium_hex2bin(verify_pk, sizeof(verify_pk), adv_pk, strlen(adv_pk),
+                           NULL, &bin_len, NULL) != 0
+            || bin_len != sizeof(verify_pk)) {
+            log_warn(proc->logger,
+                     "Identity: peer_business_ad from %s: bad advertiser_pk, "
+                     "dropping\n", adv_str);
+            return true;
+        }
+    }
+
+    if (!at_business_ad_verify(verify_pk, advertiser, did, sat, seq, ts, bundle,
+                               sig_hex)) {
+        log_warn(proc->logger,
+                 "Identity: peer_business_ad from %s: BAD SIGNATURE, dropping\n",
+                 adv_str);
+        return true;
+    }
+
+    /* Content-id dedup: compute the id from the VERIFIED canonical and drop a
+     * repeat before storing, emitting or re-advertising. */
+    char id_hex[AT_BUSINESS_AD_ID_HEX_LEN + 1];
+    if (at_business_ad_content_id(advertiser, did, sat, seq, ts, bundle,
+                                  id_hex) != 0)
+        return true;
+    if (_business_ad_seen_or_record(id_hex)) {
+        log_debug(proc->logger,
+                  "Identity: peer_business_ad %s already seen, dropping\n", id_hex);
+        return true;
+    }
+
+    _business_page_store(did, bundle, seq, ts, adv_str, (int)sat);
+    identity_emit_business_ad(advertiser, did, id_hex, (int)sat, seq, ts, bundle);
+    log_debug(proc->logger,
+              "Identity: business ad %s for %s from %s accepted (sat=%u)\n",
+              id_hex, did, adv_str, (unsigned)sat);
+
+    /* THE CUSTOMER GATE. A non-customer stops here — it has the page, it can
+     * show it to its operator, but it does not carry it onward. A customer
+     * speaks up with its OWN satisfaction, over the page version it holds (or
+     * this fresher one). */
+    int own_sat = 0;
+    char own_bundle[AT_BUSINESS_BUNDLE_MAX + 1];
+    int64_t own_seq = 0;
+    if (_business_is_customer(did, &own_sat, own_bundle, sizeof(own_bundle),
+                              &own_seq)) {
+        const char *carry = own_bundle;
+        int64_t carry_seq = own_seq;
+        if (seq > own_seq) {   /* the business updated its page; carry the new one */
+            carry = bundle;
+            carry_seq = seq;
+        }
+        (void)_business_advertise(proc, did, (uint8_t)own_sat, carry_seq, carry);
+    }
+    return true;
+}
+
+/* Conformance/observability seam: what this node knows about business @p did —
+ * the page version it holds and how many customers have vouched for it. Returns
+ * true and fills the outputs if a page is held. Mirrors Python
+ * get_business_page. */
+bool identity_get_business_page(const char *did, char *bundle_buf,
+                                size_t bundle_sz, int64_t *seq_out,
+                                int *endorsers_out)
+{
+    if (!id_state.initialized || did == NULL) return false;
+    json_t *rec = _business_map_load_json(&id_state.business_pages, did);
+    if (rec == NULL) return false;
+    json_t *j_bundle    = json_object_get(rec, "bundle");
+    json_t *j_seq       = json_object_get(rec, "seq");
+    json_t *j_endorsers = json_object_get(rec, "endorsers");
+    if (bundle_buf != NULL && bundle_sz > 0)
+        snprintf(bundle_buf, bundle_sz, "%s",
+                 json_is_string(j_bundle) ? json_string_value(j_bundle) : "");
+    if (seq_out != NULL)
+        *seq_out = json_is_integer(j_seq) ? (int64_t)json_integer_value(j_seq) : 0;
+    if (endorsers_out != NULL)
+        *endorsers_out = json_is_object(j_endorsers)
+                             ? (int)json_object_size(j_endorsers) : 0;
+    json_decref(rec);
+    return true;
+}
+
+/* Conformance/test seam (Phase 3 P3.2): install or clear THIS node's CUSTOMER
+ * edge to @p did WITHOUT advertising — the harness analog of the app's
+ * AT_APP_SET_CUSTOMER verb minus its wire half, so `fixtures.customers` can set
+ * up a node that is authorized to carry a page without that setup itself
+ * counting as an emission. @p satisfaction < 0 clears the edge. Twin of the
+ * Python adapter calling set_customer() with no queues. */
+void identity_set_customer(const char *did, int satisfaction,
+                           const char *bundle, int64_t seq)
+{
+    if (!id_state.initialized || did == NULL || did[0] == '\0') return;
+    char bdid[AT_BUSINESS_DID_MAX + 1];
+    at_business_bound_did(did, bdid, sizeof(bdid));
+    if (bdid[0] == '\0') return;
+    if (satisfaction < 0) {
+        pthread_mutex_lock(&id_state.lock);
+        map_remove(&id_state.business_customers, (map_key_t)bdid);
+        pthread_mutex_unlock(&id_state.lock);
+        return;
+    }
+    if (satisfaction > AT_BUSINESS_SAT_MAX) satisfaction = AT_BUSINESS_SAT_MAX;
+    char bbundle[AT_BUSINESS_BUNDLE_MAX + 1];
+    at_business_bound_bundle(bundle == NULL ? "" : bundle, bbundle,
+                             sizeof(bbundle));
+    (void)_business_customer_record(bdid, satisfaction, bbundle, seq);
+}
+
+/* Conformance/observability seam: this node's OWN customer satisfaction toward
+ * @p did, or -1 when it holds no customer edge (and so carries nothing). */
+int identity_get_customer_satisfaction(const char *did)
+{
+    if (!id_state.initialized || did == NULL) return -1;
+    int sat = -1;
+    if (!_business_is_customer(did, &sat, NULL, 0, NULL)) return -1;
+    return sat;
 }
 #endif /* AT_SOCIAL_ENABLED */
 
@@ -10261,6 +11133,11 @@ int identity_register_handlers(process_t *proc)
     process_register_handler(proc, ID_APP_REQUEST_PROXIMITY, (handler_ptr_t)handle_request_proximity);
     process_register_handler(proc, ID_PROXIMITY_PROBE, (handler_ptr_t)handle_proximity_probe);
     process_register_handler(proc, ID_PROXIMITY_REPLY, (handler_ptr_t)handle_proximity_reply);
+    process_register_handler(proc, ID_BUSINESS_AD,     (handler_ptr_t)handle_business_ad);
+    process_register_handler(proc, ID_APP_ADVERTISE_BUSINESS,
+                             (handler_ptr_t)handle_app_advertise_business);
+    process_register_handler(proc, ID_APP_SET_CUSTOMER,
+                             (handler_ptr_t)handle_app_set_customer);
 #endif /* AT_SOCIAL_ENABLED */
     process_register_handler(proc, ID_IDENTITY_QUERY,
                              (handler_ptr_t)handle_identity_query);
@@ -10554,6 +11431,12 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
             messaging_send("network", NET_MESSAGE, &announce_buf, false);
             log_debug(logger, "Identity: re-announcing (no peers yet)\n");
         }
+
+        /* Decide admissions whose vote grace period is up. Swept every tick
+         * (~0.5s, matching Python's vote_timeout) because the wait is short by
+         * design and a pending admission is somebody sitting at the door. A
+         * converged cohort has an empty map, so this is a no-op. */
+        identity_periodic_vote_collection(proc, queues);
 
         /* Periodic late-joiner cap-loss backstop (interval-gated so the
          * fast loop doesn't sweep every iteration; a converged group

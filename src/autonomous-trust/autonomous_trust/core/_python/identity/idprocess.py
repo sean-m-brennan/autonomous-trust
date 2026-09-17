@@ -441,6 +441,18 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # observability surface; a post is a live stream, never roster-replayed.
         self.last_post: dict = {}
         self._seen_post_ids: list = []
+        # Businesses (Phase 3 P3.2). business_customers is THIS node's own
+        # customer edges (polity did -> {'sat','since','bundle','seq'}); it is
+        # the RELAY GATE and the only thing that authorizes this node to carry a
+        # page — no entry, no ad. business_pages is what we have LEARNED (polity
+        # did -> {'bundle','seq','ts','endorsers'}); newest page wins by seq,
+        # endorsers merge. _seen_business_ad_ids is the bounded ad-content-id
+        # dedup ring. The bundles held here are OPAQUE: this runtime never parses
+        # Ethne, the app does. Twins of C id_state.business_customers /
+        # business_pages / seen_business_ads.
+        self.business_customers: dict = {}
+        self.business_pages: dict = {}
+        self._seen_business_ad_ids: list = []
         # Social-interaction reputation accrual (Increment 8). Per-edge bookkeeping
         # (peer uuid str -> {'count','last_out','last_in','day','day_count'}) drives
         # the diminishing S_pos(count) and the bilateral_recent + daily-cap gate,
@@ -466,6 +478,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.caps_response, self.handle_caps_response)
         self.protocol.register_handler(IdentityProtocol.position_query, self.handle_position_query)
         self.protocol.register_handler(IdentityProtocol.position_response, self.handle_position_response)
+        self.protocol.register_handler(IdentityProtocol.business_ad, self.handle_business_ad)
         self.protocol.register_handler(IdentityProtocol.proximity_trigger, self.handle_proximity_trigger)
         self.protocol.register_handler(IdentityProtocol.proximity_probe, self.handle_proximity_probe)
         self.protocol.register_handler(IdentityProtocol.proximity_reply, self.handle_proximity_reply)
@@ -2291,7 +2304,21 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # it. Existing members are handed the new key by the _update_group below, and
         # keep decrypting old-key traffic through Group.PREVIOUS_KEY_GRACE while that
         # propagates -- a rotation is not synchronous across a cohort.
-        self._rotate_group_key(queues)
+        #
+        # ONLY for an actual joiner: admitting a node that is ALREADY in our
+        # group rotates away from nothing (it has held the key all along), and
+        # when both sides do it at once it forks the cohort's key permanently --
+        # two nodes that meet in the ordinary mesh way merge groups first and
+        # THEN each run the access handshake. Mirrors the C gate
+        # (_group_already_member in id_proc.c); accept_rotation resolves such a
+        # fork when it does happen, this keeps it from happening at all.
+        if self._group_already_member(blob.identity):
+            self.logger.info(
+                '%s is already a group member; not rotating (nothing to '
+                'withhold, and a simultaneous rotation forks the key)',
+                blob.identity.nickname)
+        else:
+            self._rotate_group_key(queues)
         peers_payload = [public_identity_to_canonical(p) for p in self.peers.all]
         # Group slot travels as the DRY canonical flat dict (shared byte-shape
         # with C's group_to_json) so a C peer can parse it and recover the
@@ -2903,6 +2930,21 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 self.logger.error('welcoming_committee: Network queue full')
             return True
         return False
+
+    def _group_already_member(self, peer) -> bool:
+        """True when ``peer`` is ALREADY a member of our group, i.e. its uuid is
+        already in the address map -- which means it already holds the shared
+        key.
+
+        Used to decide whether admitting it should rotate. Rotation exists so a
+        JOINER cannot decrypt cohort ciphertext recorded before it was admitted;
+        a node that is already a member has had the key all along, so rotating
+        "away from" it hides nothing and costs a great deal. Mirrors C
+        _group_already_member. See [[project_group_key_sync]]."""
+        if peer is None or self.group is None:
+            return False
+        addr_map = getattr(self.group, '_address_map', None) or {}
+        return str(peer.uuid) in {str(k) for k in addr_map}
 
     def _rotate_group_key(self, queues):
         """Mint a new shared key for our own group and hand it to every
@@ -4457,6 +4499,288 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         with self.lock:
             return dict(self.last_post.get(str(uuid_str), {}))
 
+    # ------------------------------------------------------------------
+    # Businesses (Phase 3 P3.2, "businesses near me").
+    #
+    # A business is an Ethne polity; its PAGE is an opaque, self-verifying Ethne
+    # bundle. This runtime NEVER parses that bundle — it carries it as bytes and
+    # the app verifies it (polity-root -> envoy -> page). What this runtime owns
+    # is the AT layer: a detached Ed25519 signature binding WHO advertised, HOW
+    # satisfied they are, and WHICH page bytes they meant.
+    #
+    # THE CUSTOMER GATE is the whole mechanism. A business ad is never relayed
+    # the way a post is. Only a CUSTOMER carries a business's page, and a
+    # customer does not forward someone else's ad — it re-advertises from its own
+    # cache in the FIRST PERSON, with its own key and its own satisfaction. So a
+    # business's reach is exactly the sum of its customers' voices, distribution
+    # and reputation are the same fact, and an unhappy customer simply clears its
+    # edge and goes quiet (silence is the only negative signal — nothing to
+    # brigade with). Twin of the C block in id_proc.c (handle_business_ad,
+    # _business_advertise, _business_is_customer).
+    # ------------------------------------------------------------------
+
+    def _business_ad_seen_or_record(self, ad_id):
+        """True if ``ad_id`` was ALREADY recorded (caller drops), else record it
+        in the bounded ring and return False. Twin of C
+        ``_business_ad_seen_or_record``; also what forecloses replay."""
+        with self.lock:
+            if ad_id in self._seen_business_ad_ids:
+                return True
+            self._seen_business_ad_ids.append(ad_id)
+            if len(self._seen_business_ad_ids) > 256:
+                self._seen_business_ad_ids.pop(0)
+        return False
+
+    def _business_is_customer(self, did):
+        """THE GATE: this node's customer record for ``did``, or None. A node
+        with no customer edge never carries that business's page. Twin of C
+        ``_business_is_customer``."""
+        with self.lock:
+            rec = self.business_customers.get(str(did))
+            return dict(rec) if rec else None
+
+    def _business_page_store(self, did, bundle, seq, ts, advertiser_str, sat):
+        """Merge one accepted ad into the learned page store. The NEWEST page
+        wins by seq, but the endorser is recorded either way — a customer still
+        vouches when carrying a page version we have already bettered. A
+        business's OWN ad is not an endorsement (self-vouching is free). Twin of
+        C ``_business_page_store``."""
+        from ..capabilities import (bound_business_bundle, BUSINESS_SAT_SELF)
+        key = str(did)
+        with self.lock:
+            rec = self.business_pages.get(key)
+            if rec is None:
+                if len(self.business_pages) >= 128:  # twin of C BUSINESS_PAGE_CAP
+                    return
+                rec = {'bundle': '', 'seq': -1, 'ts': 0.0, 'endorsers': {}}
+                self.business_pages[key] = rec
+            if int(seq) >= int(rec.get('seq', -1)):
+                rec['bundle'] = bound_business_bundle(bundle)
+                rec['seq'] = int(seq)
+                rec['ts'] = float(ts)
+            if int(sat) != BUSINESS_SAT_SELF and advertiser_str:
+                rec.setdefault('endorsers', {})[str(advertiser_str)] = int(sat)
+
+    def _business_advertise(self, queues, did, satisfaction, seq, bundle):
+        """Speak for a business IN THE FIRST PERSON: sign the canonical ad with
+        THIS node's key and group-multicast it. ``satisfaction`` is our own 0..4
+        rating as a customer, or BUSINESS_SAT_SELF when this node IS the
+        business. Shared by advertise_business, set_customer, and the
+        customer-gated re-advertisement on the inbound path — which is why there
+        is no "relay": all three are this same act. Twin of C
+        ``_business_advertise``."""
+        from ..capabilities import business_ad_sign, business_ad_id
+        try:
+            ts = float(time.time())
+            sig = business_ad_sign(self.identity.signature.private,
+                                   self.identity.uuid, str(did),
+                                   int(satisfaction), int(seq), ts, bundle)
+            pk_hex = bytes(self.identity.signature.public).hex()
+            ad_id = business_ad_id(self.identity.uuid, str(did),
+                                   int(satisfaction), int(seq), ts, bundle)
+            # Record BEFORE sending so a loopback copy of our own multicast is
+            # deduped rather than re-emitted (and not re-advertised in a loop).
+            self._business_ad_seen_or_record(ad_id)
+            payload = to_json_string({
+                'advertiser': str(self.identity.uuid),
+                'advertiser_pk': pk_hex,
+                'polity': str(did),
+                'sat': int(satisfaction),
+                'seq': int(seq),
+                'ts': ts,
+                'bundle': bundle,
+                'sig': sig,
+            })
+            out = Message(self.name, IdentityProtocol.business_ad, payload,
+                          to_whom=self.group, from_whom=self.identity)
+            queues[CfgIds.network].put(out, block=True, timeout=self.q_cadence)
+            self.logger.debug('advertised business %s seq=%d sat=%d (%s)',
+                              str(did)[:16], int(seq), int(satisfaction), ad_id)
+            return ad_id
+        except Full:
+            self.logger.error('_business_advertise: Network queue full')
+        except Exception as err:
+            self.report_exception(err, '_business_advertise')
+        return None
+
+    def advertise_business(self, queues, did, bundle, seq=0):
+        """Publish THIS node's OWN business page (twin of C
+        ``handle_app_advertise_business``). The bundle is opaque here — the app
+        built and signed it through Ethne, and any reader verifies it the same
+        way. Reach comes from customers re-advertising, not from this call."""
+        from ..capabilities import BUSINESS_SAT_SELF
+        if not did or not bundle:
+            self.logger.warning(
+                'advertise_business without polity/bundle, refusing')
+            return None
+        return self._business_advertise(queues, did, BUSINESS_SAT_SELF, seq,
+                                        bundle)
+
+    def set_customer(self, did, satisfaction, bundle='', seq=0, queues=None):
+        """Declare, update or clear this node's CUSTOMER edge to a business (twin
+        of C ``handle_app_set_customer``).
+
+        Declaring the edge is what authorizes this node to CARRY the page: the
+        bundle is cached and, when ``queues`` is given, advertised immediately in
+        the first person. A NEGATIVE ``satisfaction`` clears the edge, after
+        which this node simply goes quiet about the business — it never publishes
+        anything negative. An empty ``bundle`` falls back to the page already
+        learned, so a person can become a customer straight from a page that
+        reached them through someone else."""
+        from ..capabilities import (bound_business_bundle, BUSINESS_SAT_MAX)
+        key = str(did)
+        if not key:
+            self.logger.warning('set_customer without polity, refusing')
+            return False
+        if int(satisfaction) < 0:
+            with self.lock:
+                self.business_customers.pop(key, None)
+            self.logger.info('cleared customer edge to %s (going quiet)',
+                             key[:16])
+            return True
+        sat = min(int(satisfaction), BUSINESS_SAT_MAX)
+        bundle = bound_business_bundle(bundle)
+        if not bundle:
+            with self.lock:
+                known = self.business_pages.get(key)
+                if known:
+                    bundle = known.get('bundle', '')
+                    seq = known.get('seq', seq)
+        if not bundle:
+            self.logger.warning(
+                'set_customer for %s but no page known, refusing', key[:16])
+            return False
+        with self.lock:
+            self.business_customers[key] = {
+                'sat': sat,
+                'since': float(time.time()),
+                'bundle': bundle,
+                'seq': int(seq),
+            }
+        self.logger.info('customer of %s at satisfaction %d', key[:16], sat)
+        if queues is not None:
+            self._business_advertise(queues, key, sat, int(seq), bundle)
+        return True
+
+    def handle_business_ad(self, queues, message):
+        """An inbound group-multicast business ad. Verify the advertiser's
+        Ed25519 signature (for a KNOWN peer the carried advertiser_pk MUST match
+        the stored signing key — impersonation guard; an unknown advertiser is
+        verified against the carried key, so a page can reach beyond the
+        business's own cohort), content-id dedup, store, then apply THE CUSTOMER
+        GATE: if we are a customer of this business we re-advertise it ourselves,
+        with OUR satisfaction. A non-customer stops here — it has the page and
+        can show it to its operator, but it does not carry it onward.
+
+        Note what is deliberately absent: no tier-gate (a business page is public
+        by construction — the gate is patronage, not audience) and no hop count
+        (we never forward someone else's ad). Twin of the C
+        ``handle_business_ad``."""
+        if message.function != IdentityProtocol.business_ad:
+            return False
+        try:
+            body = from_json_string(message.obj)
+            if not isinstance(body, dict):
+                return True
+            advertiser = body.get('advertiser')
+            adv_pk = body.get('advertiser_pk')
+            did = body.get('polity')
+            sat = body.get('sat')
+            seq = body.get('seq')
+            ts = body.get('ts')
+            bundle = body.get('bundle')
+            sig = body.get('sig')
+            if not (isinstance(advertiser, str) and isinstance(adv_pk, str)
+                    and isinstance(did, str) and isinstance(sat, int)
+                    and isinstance(seq, int) and isinstance(ts, (int, float))
+                    and isinstance(bundle, str) and isinstance(sig, str)):
+                self.logger.warning('peer_business_ad malformed, refusing')
+                return True
+            from ..capabilities import (business_ad_verify, business_ad_id,
+                                        business_sat_valid, bound_business_did,
+                                        bound_business_bundle)
+            if not did:
+                self.logger.warning(
+                    'peer_business_ad without polity, refusing')
+                return True
+            if not business_sat_valid(sat):
+                self.logger.warning(
+                    'peer_business_ad bad satisfaction %r, refusing', sat)
+                return True
+            did = bound_business_did(did)
+            bundle = bound_business_bundle(bundle)
+            from nacl.signing import VerifyKey
+            # Resolve the verify key, binding uuid <-> key where we can.
+            peer = self.peers.find_by_uuid(advertiser) if self.peers else None
+            if peer is not None:
+                known_pk_hex = bytes(peer.signature.public).hex()
+                if known_pk_hex != adv_pk:
+                    self.logger.warning(
+                        'peer_business_ad from %s: advertiser_pk != known key, '
+                        'dropping (impersonation)', str(advertiser)[:8])
+                    return True
+                vk = peer.signature.public
+            else:
+                try:
+                    vk = VerifyKey(bytes.fromhex(adv_pk))
+                except (ValueError, TypeError):
+                    self.logger.warning(
+                        'peer_business_ad from %s: bad advertiser_pk, dropping',
+                        str(advertiser)[:8])
+                    return True
+            if not business_ad_verify(vk, advertiser, did, int(sat), int(seq),
+                                      float(ts), bundle, sig):
+                self.logger.warning(
+                    'peer_business_ad from %s: BAD SIGNATURE, dropping',
+                    str(advertiser)[:8])
+                return True
+            # Content-id dedup: compute from the VERIFIED canonical, drop repeats
+            # before storing or re-advertising.
+            ad_id = business_ad_id(advertiser, did, int(sat), int(seq),
+                                   float(ts), bundle)
+            if self._business_ad_seen_or_record(ad_id):
+                self.logger.debug('peer_business_ad %s already seen, dropping',
+                                  ad_id)
+                return True
+            self._business_page_store(did, bundle, int(seq), float(ts),
+                                      str(advertiser), int(sat))
+            self.logger.debug(
+                'business ad %s for %s from %s accepted (sat=%d)',
+                ad_id, did[:16], str(advertiser)[:8], int(sat))
+            # THE CUSTOMER GATE.
+            own = self._business_is_customer(did)
+            if own is not None:
+                carry, carry_seq = own.get('bundle', ''), int(own.get('seq', 0))
+                if int(seq) > carry_seq:   # the business updated its page
+                    carry, carry_seq = bundle, int(seq)
+                self._business_advertise(queues, did, int(own.get('sat', 0)),
+                                         carry_seq, carry)
+        except Exception as err:
+            self.report_exception(err, 'handle_business_ad')
+        return True
+
+    def get_business_page(self, did):
+        """What this node knows about business ``did``, as
+        {'bundle','seq','ts','endorsers'}, or {} if none. The endorsers map is
+        {advertiser uuid str: satisfaction} and counts CUSTOMERS only — a
+        business's own ad is not an endorsement. Conformance/assertion surface;
+        twin of C ``identity_get_business_page``."""
+        with self.lock:
+            rec = self.business_pages.get(str(did))
+            if not rec:
+                return {}
+            out = dict(rec)
+            out['endorsers'] = dict(rec.get('endorsers', {}))
+            return out
+
+    def get_customer_satisfaction(self, did):
+        """This node's OWN customer satisfaction toward ``did`` (0..4), or -1
+        when it holds no customer edge — and therefore carries nothing for that
+        business. Conformance/assertion surface; twin of C
+        ``identity_get_customer_satisfaction``."""
+        rec = self._business_is_customer(did)
+        return int(rec.get('sat', -1)) if rec else -1
+
     # How often the cap-resync sweep runs, and the max queries it emits per
     # sweep (so a large degraded group can't burst the network queue). The
     # interval is long relative to the q_cadence loop so steady-state cost is
@@ -5363,14 +5687,40 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 # is newer, not whether its sender had any business rotating,
                 # and an unauthenticated update naming a higher epoch would be
                 # a way to hand a cohort a key of the attacker's choosing.
-                if theirs.key_epoch > mine.key_epoch:
-                    if not getattr(message, 'verified', False):
-                        self.logger.warning(
-                            'Rejecting unverified group key rotation from %s', message.from_whom)
-                        return True
+                #
+                # An EQUAL epoch is a rotation candidate too, not a no-op: when
+                # two members rotate at the same instant they both mint THIS
+                # epoch, and accept_rotation settles which key the cohort keeps
+                # by a deterministic tiebreak. Refusing equality here would
+                # strand that fork no matter what accept_rotation decides --
+                # the update would never reach it. An equal-epoch update that
+                # carries no private key is an ordinary membership update and
+                # still falls through to the address-map logic below. Mirrors
+                # the C gate in handle_group_update (id_proc.c).
+                carries_key = bool(getattr(theirs, 'owns_private_key', False))
+                same_epoch_tiebreak = (theirs.key_epoch == mine.key_epoch
+                                       and carries_key)
+                verified = bool(getattr(message, 'verified', False))
+                # A HIGHER epoch claims to supersede us, so an unverified one is
+                # refused AND the message dropped: that claim is the attack
+                # surface, and letting the rest through would be trusting an
+                # envelope we just called a forgery. Unchanged behavior.
+                #
+                # An equal epoch makes no such claim, so it must NOT be dropped
+                # here -- it is an ordinary membership update that happens to
+                # carry a key, and dropping it would lose the address-map
+                # convergence below. (It did, briefly: widening this drop to
+                # cover the tiebreak stalled the merge in the 2026-09-17
+                # cohort.) The tiebreak simply does not fire unless verified.
+                if theirs.key_epoch > mine.key_epoch and not verified:
+                    self.logger.warning(
+                        'Rejecting unverified group key rotation from %s', message.from_whom)
+                    return True
+                if (theirs.key_epoch > mine.key_epoch or same_epoch_tiebreak) and verified:
                     if mine.accept_rotation(theirs):
                         self.logger.info(
-                            'Adopted rotated group key, epoch %d', mine.key_epoch)
+                            'Adopted rotated group key, epoch %d%s', mine.key_epoch,
+                            ' (same-epoch tiebreak)' if same_epoch_tiebreak else '')
                         _probes.counter('id.group', 'key_adopted',
                                         str(mine.key_epoch))
                 # Same group: adopt strictly larger membership, otherwise no-op.

@@ -1,0 +1,69 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: business-ad-customer-relays
+byte_pinning: false
+description: |
+        THE MECHANISM (Phase 3 P3.2): a business's page travels through the people
+        who actually patronize it. newcomer holds a CUSTOMER edge to the cafe, so
+        when bg's ad arrives newcomer does not "forward" it — there is no relay and
+        no hop count. It re-advertises IN THE FIRST PERSON: a fresh ad signed with
+        newcomer's own key, carrying newcomer's own satisfaction (3), for the page
+        bytes it now holds. A business's reach is exactly the sum of its customers'
+        voices.
+
+        newcomer.business_ads_emitted = 1 is the load-bearing assertion, and its
+        control is business-ad-noncustomer-silent, which is this scenario with the
+        customer fixture removed and emits 0. A mutation that drops the customer
+        gate passes one and fails the other.
+
+        newcomer.business_page.endorsers stays 0 here: the only ad newcomer has
+        RECEIVED is the business's own, and self-vouching is not an endorsement.
+        newcomer's own voucher lives in its customer edge, which it broadcasts
+        rather than counts for itself.
+
+        Step 1: bg -> newcomer peer_business_ad {sat: 255 (SAT_SELF), seq: 1}.
+          - Both runtimes: verify, record at seq 1, then the customer gate opens
+            and newcomer emits its own ad at sat 3, seq 1.
+
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+fixtures:
+  # newcomer is a CUSTOMER of the cafe — the edge that authorizes it to carry
+  # the page. Declared at satisfaction 3 with the page it already holds at
+  # seq 0, so the inbound seq-1 ad is a page UPDATE it picks up and carries.
+  customers:
+    newcomer:
+      "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ":
+        sat: 3
+        seq: 0
+        bundle: '{"page":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ","name":"Corner Cafe","locality":"9q8yyk8y"},"sig":"stub"},"delegation":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"},"sig":"stub"}}'
+
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_business_ad
+    payload:
+      polity: "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"
+      sat: 255
+      seq: 1
+      ts: 0
+      bundle: '{"page":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ","name":"Corner Cafe","locality":"9q8yyk8y"},"sig":"stub"},"delegation":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"},"sig":"stub"}}'
+    description: |
+        bg's signed ad for its own page.
+
+expected_state:
+  newcomer:
+    business_page:
+      "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ":
+        seq: 1
+        endorsers: 0
+    customer_satisfaction:
+      "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ": 3
+    business_ads_emitted: 1

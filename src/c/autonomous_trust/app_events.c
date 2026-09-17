@@ -158,6 +158,30 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
             ev->data.position.geohash[AT_APP_GEOHASH_LEN] = '\0';
             break;
         }
+        case PEER_BUSINESS_AD_OBSERVED:
+        {
+            at_app_event_t *ev = &out[n++];
+            memset(ev, 0, sizeof(*ev));
+            ev->kind = AT_APP_EVENT_BUSINESS_AD;
+            memcpy(ev->data.business_ad.advertiser_uuid,
+                   msg.info.peer_business_ad.peer_uuid, AT_APP_UUID_LEN);
+            /* The emitter NUL-caps every string; the event was memset, so a
+             * short string stays terminated after the bounded copy. */
+            memcpy(ev->data.business_ad.polity, msg.info.peer_business_ad.polity,
+                   AT_APP_BUSINESS_DID_LEN);
+            ev->data.business_ad.polity[AT_APP_BUSINESS_DID_LEN] = '\0';
+            memcpy(ev->data.business_ad.ad_id, msg.info.peer_business_ad.ad_id,
+                   AT_APP_BUSINESS_AD_ID_LEN);
+            ev->data.business_ad.ad_id[AT_APP_BUSINESS_AD_ID_LEN] = '\0';
+            ev->data.business_ad.satisfaction =
+                msg.info.peer_business_ad.satisfaction;
+            ev->data.business_ad.seq = msg.info.peer_business_ad.seq;
+            ev->data.business_ad.ts = msg.info.peer_business_ad.ts;
+            memcpy(ev->data.business_ad.bundle, msg.info.peer_business_ad.bundle,
+                   AT_APP_BUSINESS_BUNDLE_LEN);
+            ev->data.business_ad.bundle[AT_APP_BUSINESS_BUNDLE_LEN] = '\0';
+            break;
+        }
         case PEER_PROXIMITY_OBSERVED:
         {
             at_app_event_t *ev = &out[n++];
@@ -491,6 +515,73 @@ int at_app_events_publish_post(at_app_events_t *handle, const char *q_out,
     snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),
              "identity");
     req.info.net_msg.function = (char *)AT_APP_PUBLISH_POST;
+    req.info.net_msg.encrypt = false;
+    if (net_msg_pack_json(&req.info.net_msg, env) != 0) {
+        json_decref(env);
+        return -1;
+    }
+    json_decref(env);
+    return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
+}
+
+int at_app_events_advertise_business(at_app_events_t *handle, const char *q_out,
+                                     const char *polity_did, const char *bundle,
+                                     int64_t seq)
+{
+    if (handle == NULL || !name_survives(q_out) || polity_did == NULL
+        || bundle == NULL || polity_did[0] == '\0' || bundle[0] == '\0')
+        return -1;
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
+    /* {"polity": "<did>", "bundle": "<opaque ethne json>", "seq": <int>};
+     * identity signs the ad with THIS node's key and group-multicasts it. */
+    json_t *env = json_object();
+    if (env == NULL)
+        return -1;
+    json_object_set_new(env, "polity", json_string(polity_did));
+    json_object_set_new(env, "bundle", json_string(bundle));
+    json_object_set_new(env, "seq", json_integer((json_int_t)seq));
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),
+             "identity");
+    req.info.net_msg.function = (char *)AT_APP_ADVERTISE_BUSINESS;
+    req.info.net_msg.encrypt = false;
+    if (net_msg_pack_json(&req.info.net_msg, env) != 0) {
+        json_decref(env);
+        return -1;
+    }
+    json_decref(env);
+    return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
+}
+
+int at_app_events_set_customer(at_app_events_t *handle, const char *q_out,
+                               const char *polity_did, int satisfaction,
+                               const char *bundle, int64_t seq)
+{
+    if (handle == NULL || !name_survives(q_out) || polity_did == NULL
+        || polity_did[0] == '\0')
+        return -1;
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
+    if (satisfaction > 4) satisfaction = 4;
+    /* {"polity": "<did>", "satisfaction": <0..4 | -1 to clear>,
+     *  "bundle": "<opaque ethne json>", "seq": <int>}. A negative satisfaction
+     * clears the customer edge, after which this node simply goes quiet about
+     * the business — it never publishes a negative. */
+    json_t *env = json_object();
+    if (env == NULL)
+        return -1;
+    json_object_set_new(env, "polity", json_string(polity_did));
+    json_object_set_new(env, "satisfaction", json_integer(satisfaction));
+    json_object_set_new(env, "bundle",
+                        json_string(bundle != NULL ? bundle : ""));
+    json_object_set_new(env, "seq", json_integer((json_int_t)seq));
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),
+             "identity");
+    req.info.net_msg.function = (char *)AT_APP_SET_CUSTOMER;
     req.info.net_msg.encrypt = false;
     if (net_msg_pack_json(&req.info.net_msg, env) != 0) {
         json_decref(env);

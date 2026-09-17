@@ -558,6 +558,7 @@ if(AT_SOCIAL)
         autonomous_trust/identity/post.c
         autonomous_trust/identity/social_tx.c
         autonomous_trust/identity/proximity.c
+        autonomous_trust/identity/business_ad.c
     )
 endif()
 
@@ -1518,6 +1519,10 @@ add_executable(group2_test test/group2_test.c)
 set_source_files_properties(test/group2_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(group2_test PRIVATE ${AT_TEST_LIBS})
 
+add_executable(vote_collection_test test/vote_collection_test.c)
+set_source_files_properties(test/vote_collection_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(vote_collection_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(map3_test test/map3_test.c)
 set_source_files_properties(test/map3_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(map3_test PRIVATE ${AT_TEST_LIBS})
@@ -1542,6 +1547,7 @@ add_test(NAME util3_test COMMAND $<TARGET_FILE:util3_test>)
 add_test(NAME capabilities2_test COMMAND $<TARGET_FILE:capabilities2_test>)
 add_test(NAME identity2_test COMMAND $<TARGET_FILE:identity2_test>)
 add_test(NAME group2_test COMMAND $<TARGET_FILE:group2_test>)
+add_test(NAME vote_collection_test COMMAND $<TARGET_FILE:vote_collection_test>)
 add_test(NAME map3_test COMMAND $<TARGET_FILE:map3_test>)
 add_test(NAME data_proto_test COMMAND $<TARGET_FILE:data_proto_test>)
 add_test(NAME array3_test COMMAND $<TARGET_FILE:array3_test>)

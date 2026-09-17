@@ -283,6 +283,84 @@ class TestRotation:
         assert not mine.accept_rotation(stale)
         assert mine.key_epoch == 1
 
+    def test_equal_epoch_converges_by_tiebreak(self):
+        """Two members that rotate at the SAME INSTANT both mint the same epoch
+        with different keys. That is not a replay, it is a fork -- and refusing
+        it flatly (as a strict `>` gate does) makes the fork PERMANENT: same
+        group, same epoch number, different keys, and every group multicast
+        fails its MAC from then on. Ordinary mesh discovery produces it whenever
+        two nodes admit each other at once, and it took down the first live
+        group multicast the project ever sent (agora business-ad cohort,
+        2026-09-17).
+
+        The resolution is a deterministic tiebreak on the key itself, so both
+        sides reach the same answer from what is already on the wire."""
+        a = _group('cohort')
+        b = Group.from_canonical(a.to_canonical())
+        assert a.key_epoch == b.key_epoch == 0
+        a.rotate_key()
+        b.rotate_key()
+        assert bytes(a.encryptor.public) != bytes(b.encryptor.public)
+
+        # Each judges the other's update as it went on the wire, i.e. from a
+        # snapshot taken BEFORE either adopted anything.
+        a_wire = Group.from_canonical(a.to_canonical())
+        b_wire = Group.from_canonical(b.to_canonical())
+        a_adopts = a.accept_rotation(b_wire)
+        b_adopts = b.accept_rotation(a_wire)
+
+        # Exactly one adopts -- that IS convergence. Both adopting swaps the
+        # fork for another fork; neither adopting is the deadlock.
+        assert a_adopts != b_adopts
+        assert a.key_epoch == b.key_epoch == 1
+        assert a.encryptor.publish() == b.encryptor.publish()
+        # The lower public key survives: the rule both sides can compute.
+        assert bytes(a.encryptor.public) == min(bytes(a_wire.encryptor.public),
+                                                bytes(b_wire.encryptor.public))
+        # And it is STABLE, so the two cannot oscillate.
+        assert not a.accept_rotation(a_wire)
+        assert not a.accept_rotation(b_wire)
+
+    def test_a_public_only_view_takes_a_real_key_at_the_same_epoch(self):
+        """A node holding only a PUBLIC view cannot read the cohort at all, so
+        at an equal epoch it must take a real key rather than win a byte
+        comparison and stay deaf -- the state a merge adopter can land in."""
+        mine = _group('cohort')
+        theirs = Group.from_canonical(mine.to_canonical())
+        theirs.rotate_key()
+        theirs._key_epoch = mine.key_epoch        # same epoch, different key
+        # We hold a public-only view.
+        mine._encryptor = Encryptor(mine.encryptor.publish(), public_only=True)
+        mine._public_only = True
+        assert not mine.owns_private_key
+
+        assert mine.accept_rotation(theirs)
+        assert mine.owns_private_key, 'we must end up able to decrypt'
+        assert mine.encryptor.publish() == theirs.encryptor.publish()
+        # Nothing was retired: we had no key to retire.
+        assert not getattr(mine, '_previous_keys', [])
+
+    def test_a_retired_key_is_never_reinstated(self):
+        """The property the epoch exists for, now enforced by key identity and
+        not by the epoch number alone: a key we rotated AWAY from must never
+        come back, whatever epoch the offer claims. Without this, admitting an
+        equal epoch would have handed the replay a second door."""
+        grp = _group('cohort')
+        captured = grp.encryptor          # what an attacker recorded
+        grp.rotate_key()
+
+        replay = Group.from_canonical(grp.to_canonical())
+        replay._encryptor = captured
+        replay._public_only = False
+
+        # Offered back at the SAME epoch (the tiebreak door)...
+        assert not grp.accept_rotation(replay)
+        # ...and at a FORGED higher epoch (the original door).
+        replay._key_epoch = 99
+        assert not grp.accept_rotation(replay)
+        assert grp.key_epoch == 1
+        assert grp.encryptor.publish() != captured.publish()
+
     def test_rotation_from_another_group_is_not_a_rotation(self):
         mine = _group('cohort')
         other = _group('elsewhere')

@@ -48,6 +48,7 @@
 #include "identity/connection.h"      /* at_connection_* for the connection builder */
 #include "identity/dm.h"              /* AT_DM_TEXT_MAX for the dm_last check */
 #include "identity/post.h"            /* at_post_* for the peer_post builder */
+#include "identity/business_ad.h"   /* at_business_ad_* for the peer_business_ad builder */
 #endif /* AT_SOCIAL_ENABLED */
 #include "identity/id_proc_priv.h"
 #include "utilities/util.h"
@@ -1133,6 +1134,38 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
             }
         }
     }
+
+    /* customers: { "<participant>": { "<polity did>": {sat, bundle, seq} } }
+     * (Phase 3 P3.2) — install CUSTOMER edges directly. The customer edge is the
+     * RELAY GATE: only a node holding one carries a business's page, so this
+     * fixture is what separates a re-advertising customer from a silent
+     * bystander. identity_set_customer writes the edge WITHOUT advertising, so
+     * the setup itself is not an emission. business_customers is a singleton map
+     * keyed by did, matching the Python adapter's per-process set_customer()
+     * with no queues. Mirrors the Python adapter's fixtures.customers. */
+    json_t *custs = json_object_get(fixtures, "customers");
+    if (json_is_object(custs))
+    {
+        const char *cust_pid;
+        json_t *cust_val;
+        json_object_foreach(custs, cust_pid, cust_val) {
+            if (!json_is_object(cust_val)) continue;
+            if (sce_find_participant(ctx, cust_pid) == NULL) continue;
+            const char *cdid;
+            json_t *cspec;
+            json_object_foreach(cust_val, cdid, cspec) {
+                if (!json_is_object(cspec)) continue;
+                json_t *j_sat = json_object_get(cspec, "sat");
+                json_t *j_bun = json_object_get(cspec, "bundle");
+                json_t *j_seq = json_object_get(cspec, "seq");
+                identity_set_customer(
+                    cdid,
+                    json_is_integer(j_sat) ? (int)json_integer_value(j_sat) : 0,
+                    json_is_string(j_bun) ? json_string_value(j_bun) : "",
+                    json_is_integer(j_seq) ? (int64_t)json_integer_value(j_seq) : 0);
+            }
+        }
+    }
 #endif /* AT_SOCIAL_ENABLED */
 
     /* admission_quorum: { "<participant>": <int>, ... } — two-phase admission
@@ -1775,6 +1808,65 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_object_set_new(env, "body", json_string(body_str));
         json_object_set_new(env, "sig", json_string(sig));
         json_object_set_new(env, "hops", json_integer(hops));
+        net_msg_pack_json(&out->info.net_msg, env);
+        json_decref(env);
+        return 0;
+    }
+
+    /* peer_business_ad — pack the group-multicast business ad {advertiser,
+     * advertiser_pk, polity, sat, seq, ts, bundle, sig} (Phase 3 P3.2). The ad
+     * is SIGNED with the SENDER's key over the canonical (advertiser, polity,
+     * sat, seq, ts, bundle) form, exactly as _business_advertise would — the
+     * sender always speaks for ITSELF, since an ad is never relayed, only
+     * re-advertised in the first person. Note there is no `hops`. A scenario may
+     * override `sig` (bad-signature drop) and `advertiser_pk` (impersonation).
+     * Mirrors the Python peer_business_ad builder. */
+    if (strcmp(function, "peer_business_ad") == 0 && json_is_object(payload)) {
+        json_t *jdid = json_object_get(payload, "polity");
+        const char *did_str = json_is_string(jdid) ? json_string_value(jdid) : "";
+        json_t *jbundle = json_object_get(payload, "bundle");
+        const char *bundle_str =
+            json_is_string(jbundle) ? json_string_value(jbundle) : "";
+        json_t *jsat = json_object_get(payload, "sat");
+        unsigned sat = json_is_integer(jsat) ? (unsigned)json_integer_value(jsat)
+                                             : AT_BUSINESS_SAT_SELF;
+        /* `seq` here is the PAGE VERSION, not a freshness seq, so it is read
+         * straight from the payload rather than through _ic_step_seq. */
+        json_t *jseq = json_object_get(payload, "seq");
+        int64_t seq = json_is_integer(jseq) ? (int64_t)json_integer_value(jseq) : 0;
+        json_t *jts = json_object_get(payload, "ts");
+        double ts = json_is_number(jts) ? json_number_value(jts) : 0.0;
+
+        /* advertiser_pk: the sender's ed25519 signing pubkey hex, unless overridden. */
+        char pk_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1] = {0};
+        json_t *jpk = json_object_get(payload, "advertiser_pk");
+        if (json_is_string(jpk))
+            snprintf(pk_hex, sizeof(pk_hex), "%s", json_string_value(jpk));
+        else if (sender_impl != NULL && sender_impl->full != NULL)
+            sodium_bin2hex(pk_hex, sizeof(pk_hex),
+                           sender_impl->full->signature.public,
+                           crypto_sign_PUBLICKEYBYTES);
+
+        /* sig over the canonical form with the sender's key, unless overridden. */
+        char sig[AT_BUSINESS_AD_SIG_HEX_LEN + 1] = {0};
+        json_t *jsig = json_object_get(payload, "sig");
+        if (json_is_string(jsig))
+            snprintf(sig, sizeof(sig), "%s", json_string_value(jsig));
+        else if (sender_impl != NULL && sender_impl->full != NULL)
+            at_business_ad_sign(sender_impl->full->signature.private,
+                                sender_impl->full->uuid, did_str, (uint8_t)sat,
+                                seq, ts, bundle_str, sig);
+
+        json_t *env = NULL;
+        if (sender_impl != NULL && sender_impl->full != NULL) {
+            env = at_business_ad_to_json(sender_impl->full->uuid, pk_hex, did_str,
+                                         (uint8_t)sat, seq, ts, bundle_str, sig);
+        }
+        if (env == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "peer_business_ad: could not build the ad envelope");
+            return -1;
+        }
         net_msg_pack_json(&out->info.net_msg, env);
         json_decref(env);
         return 0;
@@ -2548,6 +2640,33 @@ static int _dispatch(sce_run_ctx_t *ctx,
     }
     if (inbound->type == NET_MESSAGE
         && inbound->info.net_msg.function != NULL
+        && strcmp(inbound->info.net_msg.function,
+                  "trigger_advertise_business") == 0) {
+        /* Pseudo-function: `impl` is the BUSINESS; the step's payload names its
+         * polity and page ({"polity","bundle","seq"}). Advertising is an app
+         * verb, not a wire message, so drive the real AT_APP_ADVERTISE_BUSINESS
+         * handler and let the emitted peer_business_ad travel. The engine has
+         * already set current_dispatcher to this participant, so the emission is
+         * attributed to the business. Mirrors the Python adapter's
+         * _TRIGGER_ADVERTISE_BUSINESS. */
+        json_t *jp = NULL;
+        if (net_msg_unpack_json(&inbound->info.net_msg, &jp) != 0 || jp == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "trigger_advertise_business: no payload");
+            return -1;
+        }
+        generic_msg_t m = {0};
+        m.type = NET_MESSAGE;
+        strncpy(m.info.net_msg.process, "identity", PROC_NAME_LEN);
+        m.info.net_msg.function = (char *)AT_APP_ADVERTISE_BUSINESS;
+        net_msg_pack_json(&m.info.net_msg, jp);
+        json_decref(jp);
+        run_message_handlers(impl->proc, NULL, NET_MESSAGE, &m);
+        if (m.info.net_msg.obj != NULL) smrt_deref(m.info.net_msg.obj);
+        return 0;
+    }
+    if (inbound->type == NET_MESSAGE
+        && inbound->info.net_msg.function != NULL
         && strcmp(inbound->info.net_msg.function, "trigger_block") == 0) {
         /* Pseudo-function: locally block the peer the step names ({"peer":
          * <pid>}). Block is an app verb, not a wire message, so there is nothing
@@ -2996,6 +3115,103 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                                  pid, px_pid, got, want);
                         return -1;
                     }
+                }
+            } else if (strcmp(key, "business_page") == 0) {
+                /* {polity_did: {seq, endorsers}} (Phase 3 P3.2) — what this
+                 * participant LEARNED about a business, via
+                 * identity_get_business_page. `seq` is the page version it
+                 * holds; `endorsers` the number of CUSTOMERS that have vouched
+                 * for it (a business's own ad is not an endorsement, so a page
+                 * nobody patronizes has 0). {} means no page held at all —
+                 * which, for a node whose ad never verified, is the correct
+                 * outcome. Mirrors the Python adapter's business_page check. */
+                const char *bp_did;
+                json_t *bp_want;
+                json_object_foreach(val, bp_did, bp_want) {
+                    char bundle[AT_BUSINESS_BUNDLE_MAX + 1] = {0};
+                    int64_t got_seq = 0;
+                    int got_endorsers = 0;
+                    bool held = identity_get_business_page(
+                        bp_did, bundle, sizeof(bundle), &got_seq, &got_endorsers);
+                    if (!json_is_object(bp_want) || json_object_size(bp_want) == 0) {
+                        if (held) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: business_page[%s] present at seq %lld, "
+                                     "expected none", pid, bp_did,
+                                     (long long)got_seq);
+                            return -1;
+                        }
+                        continue;
+                    }
+                    if (!held) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: business_page[%s] missing", pid, bp_did);
+                        return -1;
+                    }
+                    json_t *w_seq = json_object_get(bp_want, "seq");
+                    if (json_is_integer(w_seq)
+                        && got_seq != (int64_t)json_integer_value(w_seq)) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: business_page[%s].seq=%lld, expected %lld",
+                                 pid, bp_did, (long long)got_seq,
+                                 (long long)json_integer_value(w_seq));
+                        return -1;
+                    }
+                    json_t *w_end = json_object_get(bp_want, "endorsers");
+                    if (json_is_integer(w_end)
+                        && got_endorsers != (int)json_integer_value(w_end)) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: business_page[%s].endorsers=%d, expected %d",
+                                 pid, bp_did, got_endorsers,
+                                 (int)json_integer_value(w_end));
+                        return -1;
+                    }
+                    json_t *w_bun = json_object_get(bp_want, "bundle");
+                    if (json_is_string(w_bun)
+                        && strcmp(bundle, json_string_value(w_bun)) != 0) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: business_page[%s].bundle mismatch",
+                                 pid, bp_did);
+                        return -1;
+                    }
+                }
+            } else if (strcmp(key, "customer_satisfaction") == 0) {
+                /* {polity_did: <int>} (Phase 3 P3.2) — this participant's OWN
+                 * customer edge, via identity_get_customer_satisfaction: 0..4,
+                 * or -1 when it holds none and therefore carries nothing for
+                 * that business. Mirrors the Python adapter's check. */
+                const char *cs_did;
+                json_t *cs_want;
+                json_object_foreach(val, cs_did, cs_want) {
+                    int got = identity_get_customer_satisfaction(cs_did);
+                    int want = (int)json_integer_value(cs_want);
+                    if (got != want) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: customer_satisfaction[%s]=%d, expected %d",
+                                 pid, cs_did, got, want);
+                        return -1;
+                    }
+                }
+            } else if (strcmp(key, "business_ads_emitted") == 0) {
+                /* peer_business_ad emissions attributed to this participant
+                 * (Phase 3 P3.2). THE GATE ASSERTION: a CUSTOMER that receives
+                 * an ad re-advertises (>=1), a non-customer stays SILENT (0).
+                 * This is what makes a page travel only through people who
+                 * actually patronize the business. Mirrors the Python emit_tally
+                 * check. */
+                int want = (int)json_integer_value(val);
+                int got = 0;
+                for (size_t i = 0; i < ctx->captured_count; i++) {
+                    if (strcmp(ctx->captured[i].from, pid) == 0
+                        && strcmp(ctx->captured[i].function,
+                                  "peer_business_ad") == 0)
+                        got++;
+                }
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: business_ads_emitted=%d, expected %d",
+                             pid, got, want);
+                    return -1;
                 }
             } else if (strcmp(key, "dm_last") == 0) {
                 /* {peer_id: {seq, text}} (Increment 6) — the most-recent DM this
@@ -4185,6 +4401,8 @@ void at_identity_run(const at_case_t *c, at_case_result_t *out) {
                      strncmp(fn, "peer_dm", 7) == 0 ||
                      strncmp(fn, "peer_post", 9) == 0 ||
                      strncmp(fn, "peer_reaction", 13) == 0 ||
+                     strncmp(fn, "peer_business_ad", 16) == 0 ||
+                     strncmp(fn, "trigger_advertise_business", 26) == 0 ||
                      strncmp(fn, "trigger_block", 13) == 0)) {
                     at_case_result_set_skip(
                         out, "agora scenario skipped: C built without AT_SOCIAL "

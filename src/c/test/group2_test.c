@@ -219,10 +219,9 @@ DEFINE_TEST(test_group_rotate_key_refused_without_private)
     group_free(grp);
 }
 
-/* accept_rotation's three conditions, each of which is load-bearing. The
- * epoch one is the security-relevant half: without it a captured OLD key could
- * be replayed back over a newer one, which is exactly what rotation exists to
- * foreclose. */
+/* accept_rotation's conditions, each of which is load-bearing. The epoch is the
+ * security-relevant half: without it a captured OLD key could be replayed back
+ * over a newer one, which is exactly what rotation exists to foreclose. */
 DEFINE_TEST(test_group_accept_rotation_requires_higher_epoch_and_key)
 {
     ck_assert(sodium_init() >= 0);
@@ -235,8 +234,14 @@ DEFINE_TEST(test_group_accept_rotation_requires_higher_epoch_and_key)
     ck_assert_ret_ok(group_create(&uuid, addr, &theirs));
     memcpy(theirs->uuid, mine->uuid, sizeof(uuid_t));
 
-    /* Equal epoch: not newer, so not adopted (this is the replay case). */
-    ck_assert(!group_accept_rotation(mine, theirs));
+    /* Equal epoch offering the key we ALREADY hold: nothing to adopt. (An equal
+     * epoch offering a DIFFERENT live key is the simultaneous-rotation fork,
+     * settled by a deterministic tiebreak — see
+     * test_group_accept_rotation_equal_epoch_converges.) */
+    group_t same = *theirs;
+    same.encryptor = mine->encryptor;
+    ck_assert(!group_accept_rotation(mine, &same));
+    ck_assert(mine->key_epoch == 0);
 
     /* Strictly higher epoch + a real private key: adopted. */
     theirs->key_epoch = 1;
@@ -321,6 +326,139 @@ DEFINE_TEST(test_group_decrypt_falls_back_to_retired_key)
     group_free(sender);
 }
 
+/* Two members that rotate at the SAME INSTANT both mint the same epoch with
+ * different keys. That is not a replay, it is a fork — and refusing it flatly
+ * (as a strict `>` epoch gate does) makes the fork PERMANENT: same group uuid,
+ * same epoch number, different keys, and every group multicast fails its MAC
+ * from then on. It is exactly what ordinary mesh discovery produces when two
+ * nodes admit each other at once, and it took down the first live group
+ * multicast the project ever sent (agora business-ad cohort, 2026-09-17).
+ *
+ * The resolution is a deterministic tiebreak on the key itself, so both sides
+ * reach the SAME answer from what is already on the wire, with no extra round
+ * trip: exactly one of them adopts, and the cohort converges. */
+DEFINE_TEST(test_group_accept_rotation_equal_epoch_converges)
+{
+    ck_assert(sodium_init() >= 0);
+
+    uuid_t uuid;
+    uuid_generate(uuid);
+    char addr[] = "10.0.0.5";
+    group_t *a = NULL, *b = NULL;
+    ck_assert_ret_ok(group_create(&uuid, addr, &a));
+    ck_assert_ret_ok(group_create(&uuid, addr, &b));
+    memcpy(b->uuid, a->uuid, sizeof(uuid_t));
+    /* Both hold the same key, as cohort members do... */
+    memcpy(&b->encryptor, &a->encryptor, sizeof(encryptor_t));
+    /* ...and then both rotate, each unaware of the other. THE FORK. */
+    ck_assert(group_rotate_key(a) == 1);
+    ck_assert(group_rotate_key(b) == 1);
+    ck_assert(memcmp(a->encryptor.public, b->encryptor.public,
+                     crypto_box_PUBLICKEYBYTES) != 0);
+
+    /* Each side judges the other's update as it went on the wire, i.e. from a
+     * snapshot taken BEFORE either of them adopted anything. accept_rotation
+     * reads only uuid/epoch/encryptor, which is why id_proc.c can hand it a
+     * stack group_t too. */
+    group_t a_wire = *a;
+    group_t b_wire = *b;
+
+    bool a_adopts = group_accept_rotation(a, &b_wire);
+    bool b_adopts = group_accept_rotation(b, &a_wire);
+
+    /* Exactly one adopts — that IS convergence. Both adopting would swap the
+     * fork for a different fork; neither adopting is the deadlock. */
+    ck_assert(a_adopts != b_adopts);
+    ck_assert(a->key_epoch == 1);
+    ck_assert(b->key_epoch == 1);
+    ck_assert_mem_eq(a->encryptor.private, b->encryptor.private,
+                     crypto_box_SECRETKEYBYTES);
+
+    /* The lower public key is the survivor: the rule both sides can compute. */
+    const unsigned char *winner =
+        (memcmp(a_wire.encryptor.public, b_wire.encryptor.public,
+                crypto_box_PUBLICKEYBYTES) < 0)
+        ? a_wire.encryptor.public : b_wire.encryptor.public;
+    ck_assert_mem_eq(a->encryptor.public, winner, crypto_box_PUBLICKEYBYTES);
+
+    /* And it is STABLE: re-offering the key that lost does not unseat it, so
+     * the two nodes cannot oscillate. */
+    ck_assert(!group_accept_rotation(a, &a_wire));
+    ck_assert(!group_accept_rotation(a, &b_wire));
+
+    group_free(b);
+    group_free(a);
+}
+
+/* A node holding only a PUBLIC view of the group cannot read the cohort at all.
+ * At an equal epoch it must therefore take a real key rather than win a byte
+ * comparison and stay deaf — the state a merge adopter can land in. */
+DEFINE_TEST(test_group_accept_rotation_public_only_takes_a_real_key)
+{
+    ck_assert(sodium_init() >= 0);
+
+    uuid_t uuid;
+    uuid_generate(uuid);
+    char addr[] = "10.0.0.7";
+    group_t *mine = NULL, *theirs = NULL;
+    ck_assert_ret_ok(group_create(&uuid, addr, &mine));
+    ck_assert_ret_ok(group_create(&uuid, addr, &theirs));
+    memcpy(theirs->uuid, mine->uuid, sizeof(uuid_t));
+
+    /* We hold a public-only view: same epoch, no private half. */
+    sodium_memzero(mine->encryptor.private, crypto_box_SECRETKEYBYTES);
+    ck_assert(mine->key_epoch == theirs->key_epoch);
+
+    /* Adopted regardless of which way the tiebreak would have gone, and we are
+     * left actually able to decrypt. */
+    ck_assert(group_accept_rotation(mine, theirs));
+    ck_assert_mem_eq(mine->encryptor.private, theirs->encryptor.private,
+                     crypto_box_SECRETKEYBYTES);
+    ck_assert(!sodium_is_zero(mine->encryptor.private,
+                              crypto_box_SECRETKEYBYTES));
+    /* Nothing was retired: we had no key to retire. */
+    ck_assert(mine->num_previous_keys == 0);
+
+    group_free(theirs);
+    group_free(mine);
+}
+
+/* The property the epoch was introduced for, now enforced by key identity
+ * rather than by the epoch number alone: a key we have rotated AWAY from must
+ * never come back, no matter what epoch the offer claims. Without this, letting
+ * an equal epoch through (above) would have handed the replay a second door. */
+DEFINE_TEST(test_group_accept_rotation_never_reinstates_a_retired_key)
+{
+    ck_assert(sodium_init() >= 0);
+
+    uuid_t uuid;
+    uuid_generate(uuid);
+    char addr[] = "10.0.0.6";
+    group_t *mine = NULL;
+    ck_assert_ret_ok(group_create(&uuid, addr, &mine));
+
+    encryptor_t captured = mine->encryptor;   /* what an attacker recorded */
+    ck_assert(group_rotate_key(mine) == 1);
+    ck_assert(mine->num_previous_keys == 1);
+
+    /* Offered back at the SAME epoch (the tiebreak door)... */
+    group_t replay = {0};
+    memcpy(replay.uuid, mine->uuid, sizeof(uuid_t));
+    replay.key_epoch = 1;
+    replay.encryptor = captured;
+    ck_assert(!group_accept_rotation(mine, &replay));
+
+    /* ...and at a FORGED higher epoch (the original door). Refused either way,
+     * and our live key is untouched. */
+    replay.key_epoch = 99;
+    ck_assert(!group_accept_rotation(mine, &replay));
+    ck_assert(mine->key_epoch == 1);
+    ck_assert(memcmp(mine->encryptor.public, captured.public,
+                     crypto_box_PUBLICKEYBYTES) != 0);
+
+    group_free(mine);
+}
+
 RUN_TESTS(Group2, test_group_json_roundtrip,
           test_group_json_roundtrip_preserves_keypair, test_group_free_null,
           test_group_publish_null,
@@ -328,4 +466,7 @@ RUN_TESTS(Group2, test_group_json_roundtrip,
           test_group_rotate_key_mints_new_key_and_bumps_epoch,
           test_group_rotate_key_refused_without_private,
           test_group_accept_rotation_requires_higher_epoch_and_key,
+          test_group_accept_rotation_equal_epoch_converges,
+          test_group_accept_rotation_never_reinstates_a_retired_key,
+          test_group_accept_rotation_public_only_takes_a_real_key,
           test_group_decrypt_falls_back_to_retired_key)
