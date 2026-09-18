@@ -543,6 +543,16 @@ ffi.cdef("""
     typedef struct {
         int fd;
         char key[65];            /* MSG_KEY_LEN(64) + 1 */
+        /* WHICH socket file this queue bound, so qclose removes its own entry
+           and not the one a newer process just bound under the same name.
+           dev_t and ino_t are spelled uint64_t because CFFI knows neither, and
+           this is ABI mode: Python ALLOCATES queue_t (processes.py NativeQueue),
+           so a cdef short of C's 88 bytes means messaging_init writes these two
+           fields off the end of Python's buffer. Both are 8-byte unsigned on
+           every LP64 Linux glibc; tests/a_unit/test_audit_ffi_drift.py is the
+           gate that caught the omission. */
+        uint64_t bound_dev;      /* dev_t */
+        uint64_t bound_ino;      /* ino_t */
     } queue_t;
 
     int  messaging_init(const char *id, queue_t *queue);
