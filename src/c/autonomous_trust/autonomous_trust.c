@@ -603,28 +603,54 @@ int run_autonomous_trust(char *q_in, char *q_out,
             break;
         }
 
-        // check for extern messages
-        generic_msg_t task_msg = {0};
-        ret = messaging_recv_on(&extern_q, &task_msg, NULL, false);
-        if (ret == -1)
-            log_exception(&logger);
-        else if (ret == 0)
-            at_route_extern_msg(&task_msg, &logger);
+        /* BOTH QUEUES ARE DRAINED, not sipped one message per tick. This loop
+         * is the app's only door in either direction — extern_q carries every
+         * app verb inward (request_cosign among them) and the internal queue
+         * carries every app event outward — and both are AF_UNIX SOCK_DGRAM
+         * queues that hold 10 (net.unix.max_dgram_qlen) with non-blocking
+         * senders. Taking one per tick means a burst larger than the queue is
+         * not delayed, it is DROPPED at the sender, which sees only an EAGAIN.
+         * Same fault the process loops had; see PROC_DRAIN_MAX. */
 
-        // get results from internal procs
-        generic_msg_t result_msg = {0};
-        ret = messaging_recv(&result_msg);
-        if (ret == -1)
-            log_exception(&logger);
-        else if (ret == 0)
+        // check for extern messages
+        for (int taken = 0; taken < PROC_DRAIN_MAX; taken++)
         {
-            /* Queued by reference; the drain below consumes it in this same
-             * iteration, before result_msg is reused. */
-            if (at_route_queue_msg(&unhandled_msgs, &result_msg) != 0)
+            generic_msg_t task_msg = {0};
+            ret = messaging_recv_on(&extern_q, &task_msg, NULL, false);
+            if (ret == -1)
+            {
                 log_exception(&logger);
+                break;
+            }
+            if (ret != 0)
+                break;   /* nothing waiting */
+            at_route_extern_msg(&task_msg, &logger);
         }
 
-        // Drain: process every pending message in FIFO order, removing as we go.
+        // get results from internal procs
+        for (int taken = 0; taken < PROC_DRAIN_MAX; taken++)
+        {
+            generic_msg_t result_msg = {0};
+            ret = messaging_recv(&result_msg);
+            if (ret == -1)
+            {
+                log_exception(&logger);
+                break;
+            }
+            if (ret != 0)
+                break;   /* nothing waiting */
+            /* Queued by REFERENCE — at_route_queue_msg stores this stack
+             * struct's address and copies nothing — so it must be routed
+             * before the next iteration reuses the storage. Hence the route
+             * call inside the loop rather than one batch after it; the drain
+             * empties the array every time. */
+            if (at_route_queue_msg(&unhandled_msgs, &result_msg) != 0)
+                log_exception(&logger);
+            at_route_internal_msgs(&unhandled_msgs, q_out, &logger);
+        }
+
+        /* Anything a previous pass could not route (a read error abandons the
+         * drain mid-array) leaves the queue here, in FIFO order. */
         at_route_internal_msgs(&unhandled_msgs, q_out, &logger);
 
         if (usleep(cadence) == -1)

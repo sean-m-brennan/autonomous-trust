@@ -23,6 +23,7 @@
 
 #include <stdbool.h>
 #include <sys/socket.h>
+#include <sys/stat.h>   /* dev_t / ino_t: the bound socket's identity */
 
 #include "structures/map.h"
 #include "msg_types.h"
@@ -203,6 +204,17 @@ typedef struct
 {
     int fd;
     char key[MSG_KEY_LEN+1];
+    /* WHICH socket file this queue actually bound, so that closing it can
+     * remove ITS OWN entry and no one else's. messaging_init unlinks before it
+     * binds — that is how a queue survives the crash of whoever held the name
+     * last — but it also means a LIVE holder can have the name taken out from
+     * under it. When that holder then closed, the old unconditional
+     * unlink(key) deleted the path the NEW owner was listening on: the new
+     * process kept polling a socket with no name while every sender got
+     * ENOENT, with nothing bound anywhere. Zero when the post-bind stat
+     * failed, in which case close falls back to the unconditional unlink. */
+    dev_t bound_dev;
+    ino_t bound_ino;
 } queue_t;
 
 /**
