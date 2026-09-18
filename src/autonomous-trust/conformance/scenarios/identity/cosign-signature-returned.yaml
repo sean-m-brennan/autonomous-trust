@@ -1,0 +1,53 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: cosign-signature-returned
+byte_pinning: false
+description: |
+    The return leg of a detached co-signing exchange (Phase 3 P3.3). newcomer has
+    signed the exported bytes on its own node and sends bg — the node authoring
+    the exchange — its half: the content id of the exchange, its did:key, and the
+    detached signature.
+
+    WHAT TRAVELS AND WHAT DOES NOT. No private key moves; that is the whole reason
+    the exchange is detached. The signer is named by its did:key, which EMBEDS its
+    public key, so the assembling node needs no registry to check the signature
+    and this runtime needs none to carry it.
+
+    The runtime does NOT verify what it carries here, and cannot: it does not hold
+    the payload the signature is over. The assembling node does, and refuses a
+    wrong key or a tampered payload there — pinned on the Ethne side by
+    ethne_ffi's a_wrong_signature_fails_at_assembly_not_later. What is pinned HERE
+    is carriage and the replay gate.
+
+    Step 1: newcomer -> bg peer_cosign_sig {cid, signer, sig, seq: 1}.
+      - Both runtimes: shape-checked (no empty field), freshness accepted,
+        recorded under newcomer's uuid and surfaced to the app.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: newcomer
+    to: bg
+    function: peer_cosign_sig
+    payload:
+      cid: "b3:7d3f1c9a2b4e6f80112233445566778899aabbccddeeff00123456789abcdef0"
+      signer: "did:key:z6MkfNewcomerSignerKeyForTheStaffRollExchange00"
+      sig: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a089f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+      seq: 1
+      ts: 0
+    description: |
+        newcomer's half of the exchange, made where its key already lives.
+
+expected_state:
+  bg:
+    cosign_sig_last:
+      newcomer:
+        cid: "b3:7d3f1c9a2b4e6f80112233445566778899aabbccddeeff00123456789abcdef0"
+        signer: "did:key:z6MkfNewcomerSignerKeyForTheStaffRollExchange00"
+        seq: 1

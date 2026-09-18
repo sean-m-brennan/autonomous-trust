@@ -1,0 +1,62 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: cosign-signature-replay-rejected
+byte_pinning: false
+description: |
+    The control for cosign-signature-returned (Phase 3 P3.3). A returned signature
+    carries a freshness `seq`; a captured one replayed with a stale seq must be
+    REFUSED. Since the runtime cannot verify the signature itself — it does not
+    hold the payload — the freshness gate is the ONLY thing standing between an
+    eavesdropper's capture and the assembling node's pending exchange.
+
+    Step 1: newcomer -> bg peer_cosign_sig {cid A, seq: 2}.
+      - Both runtimes: accepted, recorded as newcomer's returned signature.
+    Step 2: newcomer -> bg peer_cosign_sig {cid B, seq: 1}.
+      - Both runtimes: seq 1 is not above the mark; refused. The recorded
+        signature stays the one for exchange A, so a capture cannot be re-aimed
+        at a different exchange.
+
+    Assertions: bg.cosign_sig_last[newcomer] still names cid A, and
+    freshness_refusals[peer_cosign_sig]=1.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: newcomer
+    to: bg
+    function: peer_cosign_sig
+    payload:
+      cid: "b3:7d3f1c9a2b4e6f80112233445566778899aabbccddeeff00123456789abcdef0"
+      signer: "did:key:z6MkfNewcomerSignerKeyForTheStaffRollExchange00"
+      sig: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a089f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+      seq: 2
+      ts: 0
+    description: newcomer's genuine returned signature.
+  - id: 2
+    from: newcomer
+    to: bg
+    function: peer_cosign_sig
+    payload:
+      cid: "b3:00ff1c9a2b4e6f80112233445566778899aabbccddeeff00123456789abcdef0"
+      signer: "did:key:z6MkfNewcomerSignerKeyForTheStaffRollExchange00"
+      sig: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a089f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+      seq: 1
+      ts: 0
+    description: |
+        The same signature replayed at a stale seq, aimed at a DIFFERENT exchange.
+        Refused by freshness; the recorded signature must not move to cid B.
+
+expected_state:
+  bg:
+    cosign_sig_last:
+      newcomer:
+        cid: "b3:7d3f1c9a2b4e6f80112233445566778899aabbccddeeff00123456789abcdef0"
+        seq: 2
+    freshness_refusals:
+      peer_cosign_sig: 1
