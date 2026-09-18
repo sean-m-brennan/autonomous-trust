@@ -138,6 +138,24 @@ static inline void peers_write_unlock(process_t *proc)
 
 #define SIG_NAME_LEN PROC_NAME_LEN + 2
 
+/* How many queued messages one pass of a process loop may take before it goes
+ * back to its per-tick work.
+ *
+ * A process loop that takes ONE message per cadence tick drains at ~2/s while
+ * every sender writes into an AF_UNIX SOCK_DGRAM queue holding 10
+ * (net.unix.max_dgram_qlen) with MSG_DONTWAIT — so a burst of more than ten
+ * inside a tick is simply lost, and the sender's only sign of it is an EAGAIN
+ * most callers drop. That is not a theoretical backlog: in the P3.3 staff
+ * cohort it lost an admitted PEER handoff (leaving the network process unable
+ * to place a peer whose every frame it then deferred) and, once that was
+ * fixed, showed up again as dozens of inbound frames refused by the identity,
+ * negotiation and reputation queues in a single run.
+ *
+ * The bound keeps a flooded queue from starving a loop's periodic work, and
+ * sits far above the kernel's queue depth so that in practice a tick empties
+ * what is waiting. */
+#define PROC_DRAIN_MAX 64
+
 /*@
   requires name != \null && \valid_read(name);
   requires \valid(sig + (0 .. SIG_NAME_LEN));

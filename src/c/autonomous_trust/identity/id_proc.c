@@ -1366,6 +1366,12 @@ void identity_install_peer_caps(const uuid_t uuid,
 /* Frama-C: skipped — [solver-timeout] logging/map preconditions */
 static int _remember_activity(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
+    /* A harness may drive a handler with no queue directory at all (several
+     * unit tests do). There is then nobody to tell, which is not an error —
+     * but walking a NULL array is a crash, and this is now reached from the
+     * peer-learning paths a test exercises directly. */
+    if (proc == NULL || queues == NULL || msg == NULL)
+        return 0;
     /* Update proc configs with latest data; broadcast to all other processes */
     size_t qsize = array_size(queues);
     for (size_t i = 0; i < qsize; i++)
@@ -1378,7 +1384,43 @@ static int _remember_activity(const process_t *proc, directory_t *queues, generi
             continue;
         if (strcmp(qname, proc->name) == 0)
             continue;
-        messaging_send(qname, msg->type, msg, false);
+        /* THE RESULT USED TO BE DISCARDED, and for a PEER message that is not a
+         * dropped notification — it is a peer the network process will never
+         * know about. net_proc's peers[] is filled ONLY from here; without the
+         * entry, find_peer_by_address cannot place that peer's address and
+         * every encrypted frame it sends is deferred as an unknown peer,
+         * forever. Nothing retries, because nothing knew anything was lost.
+         *
+         * This is exactly what a cohort bootstrap does to it: all three nodes
+         * admit each other inside the same second, the AF_UNIX queues hold 10
+         * datagrams (net.unix.max_dgram_qlen), and the sends that lose the race
+         * vanish. In the P3.3 staff cohort EVERY node ended up knowing exactly
+         * ONE peer, at the same instant — the keeper heard ada and never bob,
+         * so bob's co-signature was deferred on arrival and the exchange came
+         * back 1-of-2.
+         *
+         * Bounded retry, then say so. Mirrors _announce_identity_for's
+         * retry-until-the-network-socket-is-ready loop, but shorter: this runs
+         * inside a message handler, not at startup. */
+        int ret = -1;
+        for (int attempt = 0; attempt < 10; attempt++)
+        {
+            ret = messaging_send(qname, msg->type, msg, false);
+            if (ret == 0)
+                break;
+            usleep(20000); /* 20ms */
+        }
+        if (ret != 0)
+            /* EAGAIN says the receiver's queue stayed full for the whole
+             * 200ms — saturation. Anything else is a hard transport fault
+             * (no socket bound at that key, most likely). They call for
+             * different answers from whoever reads this, so name which. */
+            log_warn(proc->logger,
+                     "Identity: could not hand %s a %s update after 10 tries"
+                     " (%s) — that process's view is now STALE and nothing"
+                     " retries it\n",
+                     qname, message_type_to_string(msg->type),
+                     ret == EAGAIN ? "queue still full" : "send failed");
     }
     return 0;
 }
@@ -2607,7 +2649,12 @@ static int _populate_peers_from_history(process_t *proc,
     }
 
     /* Append new peers. peers_write_lock guards the array; the
-     * uniqueness check is similar to _add_peer's idempotent guard. */
+     * uniqueness check is similar to _add_peer's idempotent guard.
+     *
+     * The ones actually appended are recorded so the NETWORK process can be
+     * told about each after the lock is dropped — see the _remember_activity
+     * fan-out below, and the comment there for why it is not optional. */
+    public_identity_t *fresh = calloc(n, sizeof(public_identity_t));
     size_t added = 0;
     peers_write_lock(proc);
     for (size_t i = 0; i < n; i++) {
@@ -2629,6 +2676,8 @@ static int _populate_peers_from_history(process_t *proc,
         memcpy(&proc->protocol.peers[proc->protocol.num_peers],
                p, sizeof(public_identity_t));
         proc->protocol.num_peers++;
+        if (fresh != NULL)
+            memcpy(&fresh[added], p, sizeof(public_identity_t));
         added++;
     }
     peers_write_unlock(proc);
@@ -2646,9 +2695,30 @@ static int _populate_peers_from_history(process_t *proc,
          * already takes. Outside the peers lock. */
         identity_emit_all_peers(proc);
 
+        /* AND TELL THE SIBLING PROCESSES — the NETWORK process above all.
+         * net_proc keeps its OWN peer array and populates it only from a PEER
+         * message (net_proc.c "added peer"); find_peer_by_address consults that
+         * array, and a frame from an address missing from it is deferred as
+         * "no peer known at that address yet" and never delivered. Telling only
+         * the app left a peer VISIBLE IN THE ROSTER THAT WE COULD SEND TO BUT
+         * NEVER RECEIVE FROM — the two directions run off different tables.
+         *
+         * This is the path a node joining an established mesh learns most of
+         * the cohort through, so the gap is not an edge case: in a 3-node
+         * cohort it silently decided which single peer each node could hear.
+         * _add_peer and handle_acceptance always did this; these two paths did
+         * not. Outside the peers lock — messaging_send is a syscall. */
+        for (size_t i = 0; fresh != NULL && i < added; i++) {
+            generic_msg_t peer_msg = {0};
+            peer_msg.type = PEER;
+            memcpy(&peer_msg.info.peer, &fresh[i], sizeof(public_identity_t));
+            _remember_activity(proc, queues, &peer_msg);
+        }
+
         /* Bundled peers don't know about us yet — fix the asymmetry. */
         _announce_self_to_bundled_peers(proc, queues, peer_idents, n);
     }
+    free(fresh);
     return 0;
 }
 
@@ -6507,8 +6577,15 @@ static bool handle_cosign_request(const process_t *proc, directory_t *queues,
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
     json_t *payload = NULL;
-    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL) {
+        /* Was a silent `return true`. An ask that dies here leaves NO trace on
+         * the signer and the asking node cannot tell this from a lost frame —
+         * which is exactly how a routing gap read as a network fault. */
+        log_warn(proc->logger,
+                 "Identity: peer_cosign_request from %s could not be unpacked,"
+                 " dropping\n", nmsg->from_whom.nickname);
         return true;
+    }
     char record[AT_COSIGN_TOKEN_MAX + 1], op[AT_COSIGN_TOKEN_MAX + 1];
     char polity[AT_COSIGN_DID_MAX + 1], cid[AT_COSIGN_CID_MAX + 1];
     char bytes[AT_COSIGN_BYTES_MAX + 1];
@@ -6539,10 +6616,21 @@ static bool handle_cosign_request(const process_t *proc, directory_t *queues,
                                                 seq, ts);
     _last_cosign_store(&id_state.last_cosign_request_map, sender, rec_env);
     json_decref(rec_env);
-    identity_emit_cosign_request(nmsg->from_whom.uuid, record, op, polity, cid,
-                                 seq, ts, bytes);
-    log_debug(proc->logger, "Identity: co-signing ask (%s/%s) from peer %s\n",
-              record, op, sender);
+    /* The emit result was DISCARDED. It is the last hop before the app queue,
+     * so a failure here is the whole exchange failing with nothing said. */
+    if (identity_emit_cosign_request(nmsg->from_whom.uuid, record, op, polity,
+                                     cid, seq, ts, bytes) != 0) {
+        log_warn(proc->logger,
+                 "Identity: co-signing ask (%s/%s) from %s accepted but COULD NOT"
+                 " BE EMITTED to the app queue\n", record, op, sender);
+        return true;
+    }
+    /* INFO, not debug: a co-signing ask is rare and is the pivot of the whole
+     * exchange. At debug it is invisible in a cohort run, which leaves "the
+     * signer never saw it" and "the signer saw it and said nothing"
+     * indistinguishable in the logs. */
+    log_info(proc->logger, "Identity: co-signing ask (%s/%s) from peer %s\n",
+             record, op, sender);
     return true;
 }
 
@@ -6555,8 +6643,12 @@ static bool handle_cosign_sig(const process_t *proc, directory_t *queues,
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
     json_t *payload = NULL;
-    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL) {
+        log_warn(proc->logger,
+                 "Identity: peer_cosign_sig from %s could not be unpacked,"
+                 " dropping\n", nmsg->from_whom.nickname);
         return true;
+    }
     char cid[AT_COSIGN_CID_MAX + 1], signer[AT_COSIGN_DID_MAX + 1];
     char sig[AT_COSIGN_SIG_MAX + 1];
     int64_t seq = 0;
@@ -6582,8 +6674,14 @@ static bool handle_cosign_sig(const process_t *proc, directory_t *queues,
     json_t *sig_env = at_cosign_sig_to_json(cid, signer, sig, seq, ts);
     _last_cosign_store(&id_state.last_cosign_sig_map, sender, sig_env);
     json_decref(sig_env);
-    identity_emit_cosign_sig(nmsg->from_whom.uuid, cid, signer, sig, seq, ts);
-    log_debug(proc->logger, "Identity: co-signature returned by peer %s\n", sender);
+    if (identity_emit_cosign_sig(nmsg->from_whom.uuid, cid, signer, sig, seq,
+                                 ts) != 0) {
+        log_warn(proc->logger,
+                 "Identity: co-signature from %s accepted but COULD NOT BE"
+                 " EMITTED to the app queue\n", sender);
+        return true;
+    }
+    log_info(proc->logger, "Identity: co-signature returned by peer %s\n", sender);
     return true;
 }
 
@@ -9221,7 +9319,6 @@ static bool handle_identity_query(const process_t *proc, directory_t *queues, ge
 /* Frama-C: skipped — JSON parsing + peers mutation. */
 static bool handle_identity_response(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
-    (void)queues;
     if (proc == NULL || msg == NULL) return true;
     net_msg_t *nmsg = &msg->info.net_msg;
     if (proc->protocol.group.uuid[0] == 0
@@ -9299,6 +9396,14 @@ static bool handle_identity_response(const process_t *proc, directory_t *queues,
          * not a distinction a consumer of the feed should have to make.
          * Outside the peers lock. */
         identity_emit_peer_observed(proc, &parsed);
+        /* And the sibling processes, for the same reason as the history
+         * bundle: without the PEER message the network process cannot place
+         * this peer's address, so every encrypted frame from it is deferred
+         * as "no peer known at that address yet". */
+        generic_msg_t peer_msg = {0};
+        peer_msg.type = PEER;
+        memcpy(&peer_msg.info.peer, &parsed, sizeof(public_identity_t));
+        _remember_activity(proc, queues, &peer_msg);
     } else {
         probes_counter("peer.set", "identity_response_redundant", "1");
     }
@@ -11937,13 +12042,23 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
             identity_refresh_hierarchy(proc);
         }
 
-        generic_msg_t buf = {0};
-        err = messaging_recv(&buf);
-        if (err == -1 || err == ENOMSG)
-            continue;
-        if (!run_message_handlers(proc, queues, buf.type, &buf))
+        /* TAKE EVERYTHING WAITING, not one per tick. The periodic work above
+         * still runs exactly once per cadence tick; only the number of
+         * messages consumed after it changes. net_proc hands this process
+         * every inbound identity frame, and at one-per-tick its queue
+         * overflowed during a cohort's admission burst — 'Failed to route
+         * message to process identity' on the network side, and a co-signing
+         * ask or signature simply gone on this one. See PROC_DRAIN_MAX. */
+        for (int taken = 0; taken < PROC_DRAIN_MAX; taken++)
         {
-            log_debug(logger, "Identity: unhandled message type %ld\n", buf.type);
+            generic_msg_t buf = {0};
+            err = messaging_recv(&buf);
+            if (err == -1 || err == ENOMSG)
+                break;
+            if (!run_message_handlers(proc, queues, buf.type, &buf))
+            {
+                log_debug(logger, "Identity: unhandled message type %ld\n", buf.type);
+            }
         }
     }
 

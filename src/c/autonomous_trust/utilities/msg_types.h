@@ -701,6 +701,17 @@ typedef struct
 */
 size_t message_size(message_type_t type);
 
+/**
+ * @brief Return a static, human-readable name for @p type.
+ *
+ * For logging only. Returns the empty string for types outside the enum.
+ */
+/*@
+  assigns \nothing;
+  ensures \result != \null;
+*/
+char *message_type_to_string(message_type_t type);
+
 
 
 /** @} */ /* end of internal_utilities */
