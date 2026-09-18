@@ -1861,7 +1861,24 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
                 }
             } else {
                 /* Decrypted successfully but the inner wire is malformed —
-                 * still annoy-worthy from a known peer. */
+                 * still annoy-worthy from a known peer.
+                 *
+                 * THIS WAS SILENT, and net_message.h's own note on
+                 * ENET_WIRE_FORMAT says why that is the worst possible place
+                 * for silence: "a cohort misprovisioned into two formats
+                 * presents as one peer having gone silent, and only a counter
+                 * that says 'foreign format' rather than 'bad message' explains
+                 * it." The frame authenticated — it IS this peer — so this is
+                 * never ordinary noise. Name the format and the length: a
+                 * format disagreement and a truncated payload are different
+                 * faults and were previously indistinguishable, both presenting
+                 * as a verb that vanishes between two healthy nodes. */
+                log_warn(ctx->logger,
+                         "Network: frame from %s decrypted but did not parse as"
+                         " %s (%zu bytes, errnum %d) — DROPPED\n",
+                         from_addr,
+                         fmt == NET_WIRE_PROTO ? "protobuf" : "JSON",
+                         plain_len, _exception.errnum);
                 pest_track_annoy(from_addr);
             }
             free(plain);
@@ -1898,8 +1915,16 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
              * NOT from_addr — the latter is the gateway's address under a
              * forwarded frame, and the future peer IPC arrives carrying
              * the original sender's own address, not the gateway's. */
-            log_debug(ctx->logger, "Deferred encrypted message from unknown peer %s\n",
-                      from_addr);
+            /* INFO, not debug: with the envelope layer off this is the LAST
+             * silent path a datagram can take on the receive side, and at
+             * debug it is invisible in a cohort run — which leaves "the frame
+             * never arrived" and "it arrived from an address we could not place"
+             * looking identical from the logs. Bounded by MAX_DEFERRED, so it
+             * cannot flood. */
+            log_info(ctx->logger,
+                     "Network: deferring encrypted frame (%zu bytes) from %s —"
+                     " no peer known at that address yet\n",
+                     inner_len, from_addr);
 #ifdef AT_NET_ENVELOPE
             defer_message(inner_buf, inner_len, from_addr, env.src_uuid);
 #else
@@ -2435,12 +2460,36 @@ static int network_run(const net_transport_t *transport,
 
     while (keep_running(proc, &pctx.sig_q, logger))
     {
-        sleep_until(proc, cadence);
-
+        /* RECEIVE FIRST, SLEEP ONLY WHEN THERE IS NOTHING TO TAKE. This loop
+         * used to sleep a cadence tick and then take exactly ONE message, so
+         * the network process drained its queue at one datagram per ~0.5s
+         * while every sender writes into an AF_UNIX SOCK_DGRAM queue that
+         * holds 10 (net.unix.max_dgram_qlen). A cohort bootstrap bursts far
+         * more than 10 through here in well under a second, and messaging_send
+         * is non-blocking: everything past the tenth was returned EAGAIN to a
+         * caller that mostly discarded it.
+         *
+         * That is not a fairness detail — it is where the P3.3 staff cohort
+         * lost a co-signature. The identity process hands this process each
+         * admitted PEER, and peers[] is filled ONLY from those messages. The
+         * keeper's queue was full when bob's PEER arrived, so net_proc never
+         * learned bob's address, every frame bob sent was deferred as an
+         * unknown peer, and the admission came back 1-of-2 with nothing in any
+         * log to say why. The keeper had already ACCEPTED bob by then; only
+         * the handoff was lost.
+         *
+         * Draining as fast as messages arrive is also what id_proc's
+         * choose_group pump already does (recv, and sleep only on an empty
+         * queue). Nothing in this loop is periodic, so there is no work here
+         * to starve by looping: when the queue empties we sleep exactly as
+         * before. */
         generic_msg_t buf = {0};
         int err = messaging_recv(&buf);
         if (err == -1 || err == ENOMSG)
+        {
+            sleep_until(proc, cadence);
             continue;
+        }
 
         if (buf.type == NET_MESSAGE) {
             net_msg_t *nmsg = &buf.info.net_msg;

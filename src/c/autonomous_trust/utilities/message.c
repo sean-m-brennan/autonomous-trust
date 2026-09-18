@@ -170,6 +170,10 @@ bool messaging_bound(const char *key)
 int messaging_init(const char *id, queue_t *queue)
 {
     strncpy(queue->key, id, MSG_KEY_LEN - 1);
+    /* Cleared up front: callers hand us stack queues, and an early return
+     * below must not leave close() comparing against garbage. */
+    queue->bound_dev = 0;
+    queue->bound_ino = 0;
 
     queue->fd = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (queue->fd < 0)
@@ -203,6 +207,21 @@ int messaging_init(const char *id, queue_t *queue)
     {
         log_error(NULL, "Bind address %s\n", local.sun_path);
         return SYS_EXCEPTION();
+    }
+    /* Remember WHICH file this bind created, so messaging_qclose removes ours
+     * and not a successor's. fstat on the socket fd would report the socket
+     * inode, not this directory entry, so the path is what must be stat'd —
+     * and it must be stat'd HERE, while the entry is certainly still ours. */
+    struct stat st;
+    if (stat(local.sun_path, &st) == 0)
+    {
+        queue->bound_dev = st.st_dev;
+        queue->bound_ino = st.st_ino;
+    }
+    else
+    {
+        queue->bound_dev = 0;
+        queue->bound_ino = 0;
     }
     return 0;
 }
@@ -387,8 +406,28 @@ void messaging_qclose(queue_t *queue)
         return;
     close(queue->fd);
     struct sockaddr_un local;
-    if (unix_addr(queue->key, &local) == 0)
-        unlink(local.sun_path);
+    if (unix_addr(queue->key, &local) != 0)
+        return;
+    /* UNLINK OUR OWN SOCKET, NOT WHATEVER NOW ANSWERS TO THAT NAME. Queue
+     * names are fixed strings ("at_to_extern" and friends), messaging_init
+     * unlinks before binding, and short-lived clients come and go on the same
+     * name: a departing process that unlinks by name alone can delete the
+     * entry a newly-started one just bound. That leaves the newcomer polling a
+     * nameless socket forever while every sender to that name gets ENOENT —
+     * which is how the P3.3 cohort's expulsion ask vanished between a node
+     * that logged receiving it and a driver that logged waiting for it.
+     *
+     * If the post-bind stat failed we have nothing to compare, so fall back to
+     * the old behavior rather than leaking the entry. */
+    if (queue->bound_ino != 0)
+    {
+        struct stat st;
+        if (stat(local.sun_path, &st) != 0)
+            return;                     /* already gone, or replaced and removed */
+        if (st.st_dev != queue->bound_dev || st.st_ino != queue->bound_ino)
+            return;                     /* somebody else's socket now — leave it */
+    }
+    unlink(local.sun_path);
 }
 
 void messaging_close()
