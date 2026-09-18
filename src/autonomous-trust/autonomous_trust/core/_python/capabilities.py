@@ -495,6 +495,183 @@ def business_ad_verify(verify_key: '_VerifyKey', advertiser_uuid,
         return False
 
 
+# --- detached co-signing (Phase 3 P3.3) ------------------------------------- #
+# A staff roll act — admitting, expelling, designating a machine, moving or
+# releasing its guardian — is decided by several people who are not at the same
+# keyboard. The record travels; the KEYS DO NOT. One node exports the canonical
+# bytes, every required signer signs those bytes on its own node, and the
+# authoring node reassembles the signatures onto the payload.
+#
+# Both messages are directed and ENCRYPTED, like a DM: crypto_box authenticates
+# each end, so neither carries a signature of its own and neither has a canonical
+# byte form. There is therefore NO signing contract here — only the bounds and
+# the shape checks, which MUST stay identical to C identity/cosign.c
+# (at_cosign_bound / at_cosign_bytes_ok / at_cosign_op_ok / the two
+# to_json/from_json pairs), because a message one runtime builds is parsed by the
+# other.
+#
+# `bytes` is opaque Ethne canonical CBOR carried as hex. This runtime holds no
+# Ethne and cannot tell what it means, exactly as it cannot read a business page
+# bundle. What it does is bound and shape-check, so a malformed ask is refused
+# here rather than surfacing as a payload that reproduces to nothing.
+#
+# WHAT DELIBERATELY DOES NOT CROSS: THE DESCRIPTION. The wording of what a record
+# commits to is derived on the SIGNER's node from the bytes it is about to sign.
+# If the asking node supplied the sentence as well as the payload it would choose
+# both what you sign and what you are told you are signing — a friendly wording
+# over hostile bytes, with a real signature on the end. That is the exact failure
+# the detached seam exists to prevent, moved one layer up, so it is never carried
+# and there is no field for it.
+
+# Max hex characters of the exported canonical bytes. MUST match C
+# AT_COSIGN_BYTES_MAX (identity/cosign.h), AT_COSIGN_BYTES_LEN (msg_types.h),
+# AT_APP_COSIGN_BYTES_LEN (app_events.h), COSIGN_BYTES_HEX_MAX in the agora
+# ethne_ffi crate and AGORA_COSIGN_BYTES_MAX in the shim / cohort ctypes.
+COSIGN_BYTES_MAX = 6144
+# Polity DID / signer did:key bound (bytes). MUST match C AT_COSIGN_DID_MAX.
+COSIGN_DID_MAX = 95
+# Exchange content id as Ethne prints it: "b3:" + 64 lowercase hex.
+COSIGN_CID_MAX = 67
+# An Ed25519 signature as lowercase hex (64 bytes -> 128 chars).
+COSIGN_SIG_MAX = 128
+# A record-class or op token ("membership", "guardian", "designate", ...).
+COSIGN_TOKEN_MAX = 15
+
+# The exchanges this build understands. A voluntary departure is self-signed by
+# the one person leaving, so it is never exchanged and is deliberately absent.
+COSIGN_OPS = {
+    'membership': ('admit', 'expel'),
+    'guardian': ('designate', 'rotate', 'release'),
+}
+
+_COSIGN_HEX = frozenset('0123456789abcdef')
+
+
+def cosign_bound(value, bound: int) -> str:
+    """Truncate one co-signing field to ``bound`` UTF-8 bytes. Twin of C
+    ``at_cosign_bound`` (the app-boundary buffer clamp); a non-string — the C
+    NULL case — yields ''."""
+    if not isinstance(value, str):
+        return ''
+    return _clamp_bytes(value, bound)
+
+
+def cosign_bytes_ok(value) -> bool:
+    """Whether ``value`` is a plausible exported payload: non-empty, at most
+    COSIGN_BYTES_MAX characters, an EVEN number of them, and all lowercase hex.
+    An odd or non-hex string never came from an exporter, and a truncated one
+    reproduces to nothing, so both are refused rather than carried. Twin of C
+    ``at_cosign_bytes_ok``."""
+    if not isinstance(value, str):
+        return False
+    n = len(value)
+    if n == 0 or n > COSIGN_BYTES_MAX or (n % 2) != 0:
+        return False
+    return all(c in _COSIGN_HEX for c in value)
+
+
+def cosign_op_ok(record, op) -> bool:
+    """Whether (``record``, ``op``) name an exchange this build understands.
+    Twin of C ``at_cosign_op_ok``."""
+    if not isinstance(record, str) or not isinstance(op, str):
+        return False
+    return op in COSIGN_OPS.get(record, ())
+
+
+def cosign_request_to_json(record, op, polity, cid, bytes_hex, seq: int,
+                           ts: float):
+    """The peer_cosign_request body {record, op, polity, cid, bytes, seq, ts},
+    each field bound-truncated, or None when the op is unknown, the payload is
+    not well formed, or the cid is empty. Twin of C
+    ``at_cosign_request_to_json``."""
+    r = cosign_bound(record, COSIGN_TOKEN_MAX)
+    o = cosign_bound(op, COSIGN_TOKEN_MAX)
+    p = cosign_bound(polity, COSIGN_DID_MAX)
+    c = cosign_bound(cid, COSIGN_CID_MAX)
+    if not cosign_op_ok(r, o) or not cosign_bytes_ok(bytes_hex) or not c:
+        return None
+    return {'record': r, 'op': o, 'polity': p, 'cid': c, 'bytes': bytes_hex,
+            'seq': int(seq), 'ts': float(ts)}
+
+
+def cosign_request_from_json(body):
+    """Parse a peer_cosign_request body. Returns the same dict shape as
+    ``cosign_request_to_json`` (fields bound-truncated) or None on a malformed
+    payload: a missing or mistyped field, an unknown (record, op), bytes no
+    exporter produced, or an empty cid. Unknown keys are ignored. Twin of C
+    ``at_cosign_request_from_json``."""
+    if not isinstance(body, dict):
+        return None
+    record = body.get('record')
+    op = body.get('op')
+    polity = body.get('polity')
+    cid = body.get('cid')
+    bytes_hex = body.get('bytes')
+    seq = body.get('seq')
+    ts = body.get('ts')
+    if not isinstance(record, str) or not isinstance(op, str) \
+            or not isinstance(polity, str) or not isinstance(cid, str) \
+            or not isinstance(bytes_hex, str):
+        return None
+    # bool is an int subclass in Python; C's json_is_integer would refuse the
+    # JSON `true` that produces it, so refuse it here too.
+    if not isinstance(seq, int) or isinstance(seq, bool):
+        return None
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return None
+    # Shape-checked here rather than only app-side: an unknown op or a payload
+    # that is not even hex cannot become a record anywhere downstream, and the
+    # app should not have to distinguish a hostile ask from a truncated one.
+    if not cosign_op_ok(record, op) or not cosign_bytes_ok(bytes_hex) or not cid:
+        return None
+    return {'record': cosign_bound(record, COSIGN_TOKEN_MAX),
+            'op': cosign_bound(op, COSIGN_TOKEN_MAX),
+            'polity': cosign_bound(polity, COSIGN_DID_MAX),
+            'cid': cosign_bound(cid, COSIGN_CID_MAX),
+            'bytes': cosign_bound(bytes_hex, COSIGN_BYTES_MAX),
+            'seq': int(seq), 'ts': float(ts)}
+
+
+def cosign_sig_to_json(cid, signer, sig, seq: int, ts: float):
+    """The peer_cosign_sig body {cid, signer, sig, seq, ts}, or None when any of
+    the three strings is empty. ``signer`` is the signer's did:key, which EMBEDS
+    its public key — so the assembling node needs no registry to check the
+    signature, and this runtime needs none to carry it. Twin of C
+    ``at_cosign_sig_to_json``."""
+    c = cosign_bound(cid, COSIGN_CID_MAX)
+    d = cosign_bound(signer, COSIGN_DID_MAX)
+    s = cosign_bound(sig, COSIGN_SIG_MAX)
+    if not c or not d or not s:
+        return None
+    return {'cid': c, 'signer': d, 'sig': s, 'seq': int(seq), 'ts': float(ts)}
+
+
+def cosign_sig_from_json(body):
+    """Parse a peer_cosign_sig body {cid, signer, sig, seq, ts}. Returns the
+    bound-truncated dict or None on a malformed payload. Twin of C
+    ``at_cosign_sig_from_json``."""
+    if not isinstance(body, dict):
+        return None
+    cid = body.get('cid')
+    signer = body.get('signer')
+    sig = body.get('sig')
+    seq = body.get('seq')
+    ts = body.get('ts')
+    if not isinstance(cid, str) or not isinstance(signer, str) \
+            or not isinstance(sig, str):
+        return None
+    if not isinstance(seq, int) or isinstance(seq, bool):
+        return None
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return None
+    if not cid or not signer or not sig:
+        return None
+    return {'cid': cosign_bound(cid, COSIGN_CID_MAX),
+            'signer': cosign_bound(signer, COSIGN_DID_MAX),
+            'sig': cosign_bound(sig, COSIGN_SIG_MAX),
+            'seq': int(seq), 'ts': float(ts)}
+
+
 # Increment 8: social-interaction reputation accrual. Both peers of an
 # interaction derive the SAME task id independently and must agree byte-for-byte,
 # or their two scores never pair into one bilateral transaction. MUST stay in

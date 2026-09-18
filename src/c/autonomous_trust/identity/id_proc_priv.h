@@ -155,6 +155,33 @@ int identity_get_peer_proximity(const char *uuid_str);
 bool identity_get_last_dm(const char *uuid_str, char *text_buf, size_t text_sz,
                           int64_t *seq_out);
 
+/** The most-recent co-signing ask this node received from peer @p uuid_str
+ *  (Phase 3 P3.3). Copies the exchange's fields into the caller's buffers (all
+ *  always NUL-terminated) and, when non-NULL, the requester's freshness seq into
+ *  @p seq_out. Returns true iff an ask is recorded for that peer. Filled by
+ *  handle_cosign_request after the shape gate and the freshness gate
+ *  (observability only — an exchange is a live stream, never roster-replayed);
+ *  conformance asserts via the `cosign_request_last` expected_state key. Twin of
+ *  Python IdentityProcess.get_last_cosign_request. Note there is no description
+ *  field to read: the wording of what is being signed never crosses the wire —
+ *  the signer's own node derives it from the bytes (see identity/cosign.h). */
+bool identity_get_last_cosign_request(const char *uuid_str, char *record_buf,
+                                      size_t record_sz, char *op_buf,
+                                      size_t op_sz, char *polity_buf,
+                                      size_t polity_sz, char *cid_buf,
+                                      size_t cid_sz, char *bytes_buf,
+                                      size_t bytes_sz, int64_t *seq_out);
+
+/** The most-recent co-signature peer @p uuid_str returned to this node (Phase 3
+ *  P3.3). Returns true iff a signature is recorded for that peer. The core does
+ *  NOT verify it — it does not hold the payload the signature is over, and the
+ *  assembling node does; conformance asserts via the `cosign_sig_last`
+ *  expected_state key. Twin of Python IdentityProcess.get_last_cosign_sig. */
+bool identity_get_last_cosign_sig(const char *uuid_str, char *cid_buf,
+                                  size_t cid_sz, char *signer_buf,
+                                  size_t signer_sz, char *sig_buf,
+                                  size_t sig_sz, int64_t *seq_out);
+
 /** The most-recent feed post this node accepted from AUTHOR @p uuid_str
  *  (Increment 7). Copies the content id into @p post_id_buf and the body into
  *  @p body_buf (both always NUL-terminated) and, when non-NULL, the author's

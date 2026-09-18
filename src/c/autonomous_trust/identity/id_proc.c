@@ -545,6 +545,18 @@ static struct {
     char    seen_business_ads[BUSINESS_AD_DEDUP_CAP][AT_BUSINESS_AD_ID_HEX_LEN + 1];
     size_t  seen_business_ad_next;
     size_t  seen_business_ad_count;
+    /* Detached co-signing (Phase 3 P3.3). The most-recent ask received per
+     * requester and the most-recent signature returned per signer, keyed by
+     * lowercased peer uuid; values are string_data of the compact wire JSON.
+     * Like last_dm_map these are LIVE STREAMS surfaced to the app on arrival,
+     * never roster-replayed — they exist as the conformance/observability
+     * surface for identity_get_last_cosign_request / _sig, twins of Python
+     * IdentityProcess.get_last_cosign_request / get_last_cosign_sig. Nothing
+     * here is judged: the payload is opaque Ethne bytes the core cannot read,
+     * and the app answers both "am I a required signer" and "is this signature
+     * good". Guarded by id_state.lock. */
+    map_t   last_cosign_request_map;
+    map_t   last_cosign_sig_map;
     /* Per-edge social-interaction accrual bookkeeping (Increment 8), keyed by
      * lowercased peer uuid string; values are string_data(compact JSON
      * {"count","last_out","last_in","day","day_count"}). count drives the
@@ -714,6 +726,8 @@ static void _ensure_id_init(void)
         map_init(&id_state.business_pages);
         id_state.seen_business_ad_next = 0;
         id_state.seen_business_ad_count = 0;
+        map_init(&id_state.last_cosign_request_map);
+        map_init(&id_state.last_cosign_sig_map);
         map_init(&id_state.social_edges);
         map_init(&id_state.social_tx_observed);
         id_state.social_day = 0;
@@ -1124,6 +1138,104 @@ bool identity_get_last_dm(const char *uuid_str, char *text_buf, size_t text_sz,
                 json_t *js = json_object_get(o, "seq");
                 if (json_is_string(jt) && text_buf != NULL && text_sz > 0)
                     snprintf(text_buf, text_sz, "%s", json_string_value(jt));
+                if (json_is_integer(js) && seq_out != NULL)
+                    *seq_out = (int64_t)json_integer_value(js);
+                json_decref(o);
+                found = true;
+            }
+        }
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return found;
+}
+
+/* Read one string field of a recorded co-signing exchange into @p buf. */
+static void _cosign_field(const json_t *o, const char *key, char *buf,
+                          size_t buf_sz)
+{
+    if (buf == NULL || buf_sz == 0) return;
+    buf[0] = '\0';
+    const json_t *v = json_object_get((json_t*)o, key);
+    if (json_is_string(v)) snprintf(buf, buf_sz, "%s", json_string_value(v));
+}
+
+/* The most-recent co-signing ask this node received from peer @p uuid_str
+ * (Phase 3 P3.3). Conformance/observability seam, twin of Python
+ * get_last_cosign_request; filled by handle_cosign_request after the shape gate
+ * and the freshness gate. Returns true iff an ask is recorded for that peer. */
+bool identity_get_last_cosign_request(const char *uuid_str, char *record_buf,
+                                      size_t record_sz, char *op_buf,
+                                      size_t op_sz, char *polity_buf,
+                                      size_t polity_sz, char *cid_buf,
+                                      size_t cid_sz, char *bytes_buf,
+                                      size_t bytes_sz, int64_t *seq_out)
+{
+    if (record_buf != NULL && record_sz > 0) record_buf[0] = '\0';
+    if (op_buf != NULL && op_sz > 0) op_buf[0] = '\0';
+    if (polity_buf != NULL && polity_sz > 0) polity_buf[0] = '\0';
+    if (cid_buf != NULL && cid_sz > 0) cid_buf[0] = '\0';
+    if (bytes_buf != NULL && bytes_sz > 0) bytes_buf[0] = '\0';
+    if (seq_out != NULL) *seq_out = 0;
+    if (uuid_str == NULL) return false;
+    _ensure_id_init();
+    bool found = false;
+    pthread_mutex_lock(&id_state.lock);
+    data_t *dat = NULL;
+    if (map_get(&id_state.last_cosign_request_map, (map_key_t)uuid_str, &dat) == 0
+        && dat != NULL)
+    {
+        char *s = NULL;
+        if (data_string_ptr(dat, &s) == 0 && s != NULL) {
+            json_error_t jerr;
+            json_t *o = json_loads(s, 0, &jerr);
+            if (o != NULL) {
+                _cosign_field(o, "record", record_buf, record_sz);
+                _cosign_field(o, "op", op_buf, op_sz);
+                _cosign_field(o, "polity", polity_buf, polity_sz);
+                _cosign_field(o, "cid", cid_buf, cid_sz);
+                _cosign_field(o, "bytes", bytes_buf, bytes_sz);
+                json_t *js = json_object_get(o, "seq");
+                if (json_is_integer(js) && seq_out != NULL)
+                    *seq_out = (int64_t)json_integer_value(js);
+                json_decref(o);
+                found = true;
+            }
+        }
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return found;
+}
+
+/* The most-recent co-signature peer @p uuid_str returned to this node (Phase 3
+ * P3.3). Conformance/observability seam, twin of Python get_last_cosign_sig.
+ * The core does NOT verify what it records here — it does not hold the payload
+ * the signature is over; the assembling node does. */
+bool identity_get_last_cosign_sig(const char *uuid_str, char *cid_buf,
+                                  size_t cid_sz, char *signer_buf,
+                                  size_t signer_sz, char *sig_buf,
+                                  size_t sig_sz, int64_t *seq_out)
+{
+    if (cid_buf != NULL && cid_sz > 0) cid_buf[0] = '\0';
+    if (signer_buf != NULL && signer_sz > 0) signer_buf[0] = '\0';
+    if (sig_buf != NULL && sig_sz > 0) sig_buf[0] = '\0';
+    if (seq_out != NULL) *seq_out = 0;
+    if (uuid_str == NULL) return false;
+    _ensure_id_init();
+    bool found = false;
+    pthread_mutex_lock(&id_state.lock);
+    data_t *dat = NULL;
+    if (map_get(&id_state.last_cosign_sig_map, (map_key_t)uuid_str, &dat) == 0
+        && dat != NULL)
+    {
+        char *s = NULL;
+        if (data_string_ptr(dat, &s) == 0 && s != NULL) {
+            json_error_t jerr;
+            json_t *o = json_loads(s, 0, &jerr);
+            if (o != NULL) {
+                _cosign_field(o, "cid", cid_buf, cid_sz);
+                _cosign_field(o, "signer", signer_buf, signer_sz);
+                _cosign_field(o, "sig", sig_buf, sig_sz);
+                json_t *js = json_object_get(o, "seq");
                 if (json_is_integer(js) && seq_out != NULL)
                     *seq_out = (int64_t)json_integer_value(js);
                 json_decref(o);
@@ -3327,6 +3439,10 @@ void identity_reset_state(void)
     map_init(&id_state.business_pages);
     id_state.seen_business_ad_next = 0;
     id_state.seen_business_ad_count = 0;
+    map_free(&id_state.last_cosign_request_map);
+    map_init(&id_state.last_cosign_request_map);
+    map_free(&id_state.last_cosign_sig_map);
+    map_init(&id_state.last_cosign_sig_map);
     map_free(&id_state.social_edges);
     map_init(&id_state.social_edges);
     map_free(&id_state.social_tx_observed);
@@ -6146,6 +6262,27 @@ static bool handle_dm(const process_t *proc, directory_t *queues,
  * and it carries no description — see cosign.h for why that last one matters.
  ****************************/
 
+/* Record one co-signing exchange for the conformance/observability seams
+ * (identity_get_last_cosign_request / _sig). Like a DM this is a LIVE STREAM,
+ * not roster state: it is never replayed, and nothing here is judged. Own
+ * locking; takes ownership of nothing. */
+static void _last_cosign_store(map_t *m, const char *peer_str, json_t *env)
+{
+    if (env == NULL) return;
+    char *compact = json_dumps(env, JSON_COMPACT);
+    if (compact == NULL) return;
+    size_t len = strlen(compact);
+    char *dup = smrt_create(len + 1);
+    if (dup == NULL) { free(compact); return; }
+    memcpy(dup, compact, len + 1);
+    free(compact);
+    data_t *dat = string_data(dup, len + 1);
+    if (dat == NULL) { smrt_deref(dup); return; }
+    pthread_mutex_lock(&id_state.lock);
+    map_set(m, (map_key_t)peer_str, dat);
+    pthread_mutex_unlock(&id_state.lock);
+}
+
 /* AT -> app: surface an inbound co-signing ask. @p requester_uuid is the
  * authenticated envelope's from_whom. */
 static int identity_emit_cosign_request(const uuid_t requester_uuid,
@@ -6398,6 +6535,10 @@ static bool handle_cosign_request(const process_t *proc, directory_t *queues,
                   "Identity: peer_cosign_request from %s refused (replay)\n", sender);
         return true;
     }
+    json_t *rec_env = at_cosign_request_to_json(record, op, polity, cid, bytes,
+                                                seq, ts);
+    _last_cosign_store(&id_state.last_cosign_request_map, sender, rec_env);
+    json_decref(rec_env);
     identity_emit_cosign_request(nmsg->from_whom.uuid, record, op, polity, cid,
                                  seq, ts, bytes);
     log_debug(proc->logger, "Identity: co-signing ask (%s/%s) from peer %s\n",
@@ -6438,6 +6579,9 @@ static bool handle_cosign_sig(const process_t *proc, directory_t *queues,
                   "Identity: peer_cosign_sig from %s refused (replay)\n", sender);
         return true;
     }
+    json_t *sig_env = at_cosign_sig_to_json(cid, signer, sig, seq, ts);
+    _last_cosign_store(&id_state.last_cosign_sig_map, sender, sig_env);
+    json_decref(sig_env);
     identity_emit_cosign_sig(nmsg->from_whom.uuid, cid, signer, sig, seq, ts);
     log_debug(proc->logger, "Identity: co-signature returned by peer %s\n", sender);
     return true;

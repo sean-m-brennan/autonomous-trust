@@ -1,0 +1,62 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: cosign-ask-delivered
+byte_pinning: false
+description: |
+    Detached co-signing, the happy path (Phase 3 P3.3). A staff roll act — here
+    admitting a member — is decided by several people who are not at the same
+    keyboard. The record's canonical bytes travel; their PRIVATE KEYS DO NOT. bg
+    exports the bytes once and asks newcomer to co-sign them, newcomer signs where
+    its key already lives, and bg reassembles the signatures onto the payload.
+
+    What the RUNTIME does here is carriage, and only carriage. It holds no Ethne,
+    so it cannot know what `bytes` means — the payload is opaque canonical CBOR
+    carried as hex, exactly as a business page bundle is opaque. It bounds and
+    shape-checks the ask, freshness-gates it, and surfaces it. Whether this node
+    is even a REQUIRED signer is Ethne's question, answered on the app side
+    against the payload itself.
+
+    Step 1: bg -> newcomer peer_cosign_request {record: membership, op: admit,
+    seq: 1}.
+      - Both runtimes: the shape gate accepts (known act, even-length lowercase
+        hex payload, non-empty cid), freshness accepts the first stamp, and the
+        ask is recorded under bg's uuid and surfaced to the app.
+
+    Its controls are cosign-ask-unknown-act-refused and
+    cosign-ask-payload-not-reproducible-refused, which are this scenario with one
+    field spoiled and record NOTHING. A mutation that drops the shape gate passes
+    this and fails both.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_cosign_request
+    payload:
+      record: membership
+      op: admit
+      polity: "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"
+      cid: "b3:7d3f1c9a2b4e6f80112233445566778899aabbccddeeff00123456789abcdef0"
+      bytes: "a3011a0066"
+      seq: 1
+      ts: 0
+    description: |
+        bg's co-signing ask, carrying the exported canonical bytes of the
+        admission newcomer is being asked to sign.
+
+expected_state:
+  newcomer:
+    cosign_request_last:
+      bg:
+        record: membership
+        op: admit
+        cid: "b3:7d3f1c9a2b4e6f80112233445566778899aabbccddeeff00123456789abcdef0"
+        bytes: "a3011a0066"
+        seq: 1

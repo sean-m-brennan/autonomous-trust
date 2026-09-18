@@ -453,6 +453,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.business_customers: dict = {}
         self.business_pages: dict = {}
         self._seen_business_ad_ids: list = []
+        # Detached co-signing (Phase 3 P3.3). The most recent ask received from
+        # each peer, and the most recent signature each peer returned — a live
+        # stream, never roster-replayed, exactly like a DM. Nothing here is
+        # judged or verified: the payload is opaque Ethne bytes and the app
+        # answers both "am I a required signer" and "is this signature good".
+        self.last_cosign_request: dict = {}
+        self.last_cosign_sig: dict = {}
         # Social-interaction reputation accrual (Increment 8). Per-edge bookkeeping
         # (peer uuid str -> {'count','last_out','last_in','day','day_count'}) drives
         # the diminishing S_pos(count) and the bilateral_recent + daily-cap gate,
@@ -479,6 +486,9 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.position_query, self.handle_position_query)
         self.protocol.register_handler(IdentityProtocol.position_response, self.handle_position_response)
         self.protocol.register_handler(IdentityProtocol.business_ad, self.handle_business_ad)
+        self.protocol.register_handler(IdentityProtocol.cosign_request,
+                                       self.handle_cosign_request)
+        self.protocol.register_handler(IdentityProtocol.cosign_sig, self.handle_cosign_sig)
         self.protocol.register_handler(IdentityProtocol.proximity_trigger, self.handle_proximity_trigger)
         self.protocol.register_handler(IdentityProtocol.proximity_probe, self.handle_proximity_probe)
         self.protocol.register_handler(IdentityProtocol.proximity_reply, self.handle_proximity_reply)
@@ -4780,6 +4790,189 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         ``identity_get_customer_satisfaction``."""
         rec = self._business_is_customer(did)
         return int(rec.get('sat', -1)) if rec else -1
+
+    # ------------------------------------------------------------------
+    # Detached co-signing (Phase 3 P3.3): a staff roll act decided by people who
+    # are not at the same keyboard. Their PRIVATE KEYS DO NOT TRAVEL — the
+    # record's exported bytes do, each signer signs them where its key already
+    # lives, and the authoring node reassembles the signatures onto the payload.
+    #
+    # Both messages are directed and ENCRYPTED, like a DM: crypto_box
+    # authenticates each end, so neither carries a signature of its own. This
+    # runtime is a COURIER. It holds no Ethne and cannot tell what the bytes
+    # mean; it does not hold the payload and cannot check the returned signature.
+    # It bounds and shape-checks, and it carries no description — see
+    # capabilities.py's cosign section for why that last one matters.
+    #
+    # Twin of the C block in id_proc.c (handle_cosign_request, handle_cosign_sig,
+    # _send_cosign_request, _send_cosign_sig). The app-event emissions are
+    # C-only; a Python node records the most recent exchange per sender
+    # (get_last_cosign_request / get_last_cosign_sig) as the conformance
+    # observable, exactly as it does for a DM.
+    # ------------------------------------------------------------------
+
+    def request_cosign(self, queues, peers, record, op, polity, cid, bytes_hex):
+        """Ask each named peer to co-sign one record (twin of C
+        ``handle_app_request_cosign``). ``peers`` are peer uuid strings; an
+        unknown act or a payload no exporter produced is refused before anybody
+        is interrupted to look at it. ONE freshness stamp covers the whole ask,
+        so every copy of it is the same ask. Returns the number of peers the ask
+        reached."""
+        from ..capabilities import cosign_request_to_json
+        env = cosign_request_to_json(record, op, polity, cid, bytes_hex, 0, 0.0)
+        if env is None:
+            self.logger.warning(
+                'request_cosign: unknown op or bad payload, refusing')
+            return 0
+        seq = self.freshness.stamp()
+        if not seq or int(seq) <= 0:
+            self.logger.warning(
+                'no freshness sequence; not asking to co-sign')
+            return 0
+        env['seq'] = int(seq)
+        env['ts'] = float(int(time.time()))
+        sent = 0
+        total = 0
+        for peer_uuid in (peers or []):
+            total += 1
+            peer = self.peers.find_by_uuid(str(peer_uuid)) if self.peers else None
+            if peer is None:
+                self.logger.warning('request_cosign: unknown peer %s',
+                                    str(peer_uuid)[:8])
+                continue
+            try:
+                out = Message(self.name, IdentityProtocol.cosign_request,
+                              to_json_string(env), to_whom=peer,
+                              from_whom=self.identity, encrypt=True)
+                queues[CfgIds.network].put(out, block=True,
+                                           timeout=self.q_cadence)
+                sent += 1
+            except Full:
+                self.logger.error('request_cosign: Network queue full')
+            except Exception as err:
+                self.report_exception(err, 'request_cosign')
+        self.logger.info('co-signing ask (%s/%s) sent to %d of %d',
+                         env['record'], env['op'], sent, total)
+        return sent
+
+    def return_cosign(self, queues, peer_uuid, cid, signer, sig):
+        """Return THIS node's signature to the peer authoring the exchange (twin
+        of C ``handle_app_return_cosign``). The private key never moved: the
+        signature was made where it lives, and only its hex travels."""
+        from ..capabilities import cosign_sig_to_json
+        env = cosign_sig_to_json(cid, signer, sig, 0, 0.0)
+        if env is None:
+            self.logger.warning('return_cosign: empty field, refusing')
+            return False
+        peer = self.peers.find_by_uuid(str(peer_uuid)) if self.peers else None
+        if peer is None:
+            self.logger.warning('return_cosign: unknown peer %s',
+                                str(peer_uuid)[:8])
+            return False
+        seq = self.freshness.stamp()
+        if not seq or int(seq) <= 0:
+            self.logger.warning(
+                'no freshness sequence; not returning signature')
+            return False
+        env['seq'] = int(seq)
+        env['ts'] = float(int(time.time()))
+        try:
+            out = Message(self.name, IdentityProtocol.cosign_sig,
+                          to_json_string(env), to_whom=peer,
+                          from_whom=self.identity, encrypt=True)
+            queues[CfgIds.network].put(out, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('return_cosign: Network queue full')
+            return False
+        except Exception as err:
+            self.report_exception(err, 'return_cosign')
+            return False
+        self.logger.debug('co-signature returned to peer %s',
+                          str(peer_uuid)[:8])
+        return True
+
+    def handle_cosign_request(self, queues, message):
+        """An inbound co-signing ask — {record, op, polity, cid, bytes, seq, ts}:
+        shape-checked, freshness-checked (per-sender replay guard), then recorded
+        as the most recent ask from that sender. This runtime does NOT judge the
+        request: whether this node is even a required signer is Ethne's question,
+        answered on the app side against the payload itself. No app emission here
+        (C runtime's job). Twin of C ``handle_cosign_request``."""
+        if message.function != IdentityProtocol.cosign_request:
+            return False
+        sender = getattr(message, 'from_whom', None)
+        if sender is None:
+            return True
+        try:
+            from ..capabilities import cosign_request_from_json
+            env = cosign_request_from_json(from_json_string(message.obj))
+            if env is None:
+                self.logger.warning(
+                    'peer_cosign_request malformed/unknown op, refusing')
+                return True
+            if not self.freshness.accept(str(getattr(sender, 'uuid', None)),
+                                         IdentityProtocol.cosign_request,
+                                         env['seq']):
+                self.logger.debug(
+                    'peer_cosign_request from %s refused (replay/unstamped)',
+                    str(getattr(sender, 'uuid', ''))[:8])
+                return True
+            with self.lock:
+                self.last_cosign_request[str(sender.uuid)] = dict(env)
+            self.logger.debug('co-signing ask (%s/%s) from peer %s',
+                              env['record'], env['op'],
+                              str(sender.uuid)[:8])
+        except Exception as err:
+            self.report_exception(err, 'handle_cosign_request')
+        return True
+
+    def handle_cosign_sig(self, queues, message):
+        """A returned signature — {cid, signer, sig, seq, ts}: shape-checked,
+        freshness-checked, then recorded. This runtime does NOT verify it: it
+        does not hold the payload the signature is over. The assembling node
+        does, and refuses a wrong key or a tampered payload there. Twin of C
+        ``handle_cosign_sig``."""
+        if message.function != IdentityProtocol.cosign_sig:
+            return False
+        sender = getattr(message, 'from_whom', None)
+        if sender is None:
+            return True
+        try:
+            from ..capabilities import cosign_sig_from_json
+            env = cosign_sig_from_json(from_json_string(message.obj))
+            if env is None:
+                self.logger.warning('peer_cosign_sig malformed, refusing')
+                return True
+            if not self.freshness.accept(str(getattr(sender, 'uuid', None)),
+                                         IdentityProtocol.cosign_sig,
+                                         env['seq']):
+                self.logger.debug(
+                    'peer_cosign_sig from %s refused (replay/unstamped)',
+                    str(getattr(sender, 'uuid', ''))[:8])
+                return True
+            with self.lock:
+                self.last_cosign_sig[str(sender.uuid)] = dict(env)
+            self.logger.debug('co-signature returned by peer %s',
+                              str(sender.uuid)[:8])
+        except Exception as err:
+            self.report_exception(err, 'handle_cosign_sig')
+        return True
+
+    def get_last_cosign_request(self, uuid_str):
+        """The most-recent co-signing ask received from a peer uuid, as
+        {'record','op','polity','cid','bytes','seq','ts'}, or {} if none.
+        Conformance/assertion surface; twin of C
+        ``identity_get_last_cosign_request``."""
+        with self.lock:
+            return dict(self.last_cosign_request.get(str(uuid_str), {}))
+
+    def get_last_cosign_sig(self, uuid_str):
+        """The most-recent co-signature returned by a peer uuid, as
+        {'cid','signer','sig','seq','ts'}, or {} if none.
+        Conformance/assertion surface; twin of C
+        ``identity_get_last_cosign_sig``."""
+        with self.lock:
+            return dict(self.last_cosign_sig.get(str(uuid_str), {}))
 
     # How often the cap-resync sweep runs, and the max queries it emits per
     # sweep (so a large degraded group can't burst the network queue). The

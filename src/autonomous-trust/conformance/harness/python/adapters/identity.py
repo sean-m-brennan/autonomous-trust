@@ -590,6 +590,62 @@ class _Participant:
                             raise AssertionError(
                                 f'{self.id}: post_last[{author_id!r}].{fk}='
                                 f'{actual.get(fk)!r}, expected {fv!r}')
+            elif key == 'cosign_request_last':
+                # {requester_id: {record, op, cid, bytes, seq} | {absent: true}}
+                # (Phase 3 P3.3) -- the most-recent co-signing ask this
+                # participant received from another, via
+                # get_last_cosign_request. An ask refused by the shape gate
+                # (unknown act, a payload no exporter produced) or by the replay
+                # gate is ABSENT; `absent: true` asserts that, and it is what
+                # makes the refusal scenarios load-bearing rather than merely
+                # non-crashing. C mirrors via identity_get_last_cosign_request
+                # keyed by the same uuid.
+                for peer_id, want in expected.items():
+                    peer_uuid = self._uuid_for_pid(peer_id)
+                    actual = self.process.get_last_cosign_request(peer_uuid)
+                    want_obj = want if isinstance(want, dict) else {}
+                    if want_obj.get('absent'):
+                        if actual:
+                            raise AssertionError(
+                                f'{self.id}: cosign_request_last[{peer_id!r}] '
+                                f'present ({actual.get("record")}/'
+                                f'{actual.get("op")}), expected ABSENT')
+                        continue
+                    if not actual:
+                        raise AssertionError(
+                            f'{self.id}: cosign_request_last[{peer_id!r}] '
+                            f'absent, expected an ask')
+                    for fk, fv in want_obj.items():
+                        if actual.get(fk) != fv:
+                            raise AssertionError(
+                                f'{self.id}: cosign_request_last[{peer_id!r}]'
+                                f'.{fk}={actual.get(fk)!r}, expected {fv!r}')
+            elif key == 'cosign_sig_last':
+                # {signer_id: {cid, signer, sig, seq} | {absent: true}} (Phase 3
+                # P3.3) -- the most-recent co-signature this participant received
+                # back, via get_last_cosign_sig. The runtime does NOT verify it
+                # (it does not hold the payload the signature is over), so what is
+                # pinned here is carriage and the replay gate, not validity. C
+                # mirrors via identity_get_last_cosign_sig.
+                for peer_id, want in expected.items():
+                    peer_uuid = self._uuid_for_pid(peer_id)
+                    actual = self.process.get_last_cosign_sig(peer_uuid)
+                    want_obj = want if isinstance(want, dict) else {}
+                    if want_obj.get('absent'):
+                        if actual:
+                            raise AssertionError(
+                                f'{self.id}: cosign_sig_last[{peer_id!r}] present '
+                                f'(cid={actual.get("cid")!r}), expected ABSENT')
+                        continue
+                    if not actual:
+                        raise AssertionError(
+                            f'{self.id}: cosign_sig_last[{peer_id!r}] absent, '
+                            f'expected a signature')
+                    for fk, fv in want_obj.items():
+                        if actual.get(fk) != fv:
+                            raise AssertionError(
+                                f'{self.id}: cosign_sig_last[{peer_id!r}].{fk}='
+                                f'{actual.get(fk)!r}, expected {fv!r}')
             elif key == 'social_tx_last':
                 # {subject_id: {score} | {absent: true}} (Increment 8) -- the last
                 # interaction reputation score this participant STAGED about another
@@ -2559,6 +2615,54 @@ class IdentityAdapter:
             if not (isinstance(payload, dict) and payload.get('unstamped')):
                 body['seq'] = int(payload.get('seq', 1)) \
                     if isinstance(payload, dict) else 1
+            obj = to_json_string(body)
+        elif function == IdentityProtocol.cosign_request:
+            # handle_cosign_request parses {record, op, polity, cid, bytes, seq,
+            # ts} (Phase 3 P3.3). A co-signing ask carries NO signature: it is
+            # directed and encrypted, so crypto_box authenticates the asker (in
+            # the harness the from_whom identity stands in).
+            #
+            # EVERY FIELD IS PASSED THROUGH VERBATIM, deliberately. Building it
+            # with cosign_request_to_json would let the BUILDER refuse a
+            # malformed ask, and then the refusal scenarios would prove nothing
+            # about the handler — which is the side a hostile peer actually
+            # reaches. `unstamped: true` drops the seq. Mirrors the C
+            # peer_cosign_request builder.
+            #
+            # There is no `description` field to build, and that is the point:
+            # the wording of what is being signed is derived on the SIGNER's node
+            # from the bytes. A scenario may smuggle one in to prove it is
+            # ignored.
+            payload = payload if isinstance(payload, dict) else {}
+            body = {}
+            for fk in ('record', 'op', 'polity', 'cid', 'bytes'):
+                fv = payload.get(fk, '')
+                body[fk] = fv if isinstance(fv, str) else ''
+            ts = payload.get('ts', 0.0)
+            body['ts'] = float(ts) if isinstance(ts, (int, float)) else 0.0
+            if isinstance(payload.get('description'), str):
+                body['description'] = payload['description']
+            if not payload.get('unstamped'):
+                body['seq'] = int(payload.get('seq', 1)) \
+                    if isinstance(payload.get('seq', 1), int) else 1
+            obj = to_json_string(body)
+        elif function == IdentityProtocol.cosign_sig:
+            # handle_cosign_sig parses {cid, signer, sig, seq, ts} (Phase 3
+            # P3.3): the signer's half coming back to the node authoring the
+            # exchange. Passed through verbatim for the same reason as the ask.
+            # This runtime does NOT verify the signature and cannot — it does not
+            # hold the payload the signature is over. Mirrors the C
+            # peer_cosign_sig builder.
+            payload = payload if isinstance(payload, dict) else {}
+            body = {}
+            for fk in ('cid', 'signer', 'sig'):
+                fv = payload.get(fk, '')
+                body[fk] = fv if isinstance(fv, str) else ''
+            ts = payload.get('ts', 0.0)
+            body['ts'] = float(ts) if isinstance(ts, (int, float)) else 0.0
+            if not payload.get('unstamped'):
+                body['seq'] = int(payload.get('seq', 1)) \
+                    if isinstance(payload.get('seq', 1), int) else 1
             obj = to_json_string(body)
         elif function == IdentityProtocol.id_query:
             # Identity-resync query (layer 3): {group_uuid, have:[uuids]}.
