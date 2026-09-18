@@ -49,6 +49,7 @@
 #include "identity/dm.h"              /* AT_DM_TEXT_MAX for the dm_last check */
 #include "identity/post.h"            /* at_post_* for the peer_post builder */
 #include "identity/business_ad.h"   /* at_business_ad_* for the peer_business_ad builder */
+#include "identity/cosign.h"        /* AT_COSIGN_* bounds for the cosign_*_last checks */
 #endif /* AT_SOCIAL_ENABLED */
 #include "identity/id_proc_priv.h"
 #include "utilities/util.h"
@@ -1892,6 +1893,69 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_decref(body);
         return 0;
     }
+
+    /* peer_cosign_request — pack {record, op, polity, cid, bytes, seq, ts}
+     * (Phase 3 P3.3). A co-signing ask carries NO signature: it is directed and
+     * encrypted, so crypto_box authenticates the asker (in the harness the
+     * from_whom identity stands in).
+     *
+     * EVERY FIELD IS PASSED THROUGH VERBATIM, deliberately. Building it with
+     * at_cosign_request_to_json would let the BUILDER refuse a malformed ask, and
+     * then the refusal scenarios would prove nothing about the handler — which is
+     * the side a hostile peer actually reaches. A hand-built message from a peer
+     * is exactly what the parser exists for. `seq` is honored via _ic_set_seq so
+     * `unstamped: true` drops it. Mirrors the Python peer_cosign_request builder.
+     *
+     * There is no `description` field to build, and that is the point: the
+     * wording of what is being signed is derived on the SIGNER's node from the
+     * bytes (see identity/cosign.h). */
+    if (strcmp(function, "peer_cosign_request") == 0 && json_is_object(payload)) {
+        static const char *keys[] = {"record", "op", "polity", "cid", "bytes"};
+        json_t *body = json_object();
+        for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+            json_t *v = json_object_get(payload, keys[k]);
+            json_object_set_new(body, keys[k],
+                                json_string(json_is_string(v)
+                                            ? json_string_value(v) : ""));
+        }
+        json_t *jts = json_object_get(payload, "ts");
+        json_object_set_new(body, "ts",
+                            json_real(json_is_number(jts)
+                                      ? json_number_value(jts) : 0.0));
+        /* A scenario may smuggle a description in to prove it is ignored. */
+        json_t *jdesc = json_object_get(payload, "description");
+        if (json_is_string(jdesc))
+            json_object_set_new(body, "description",
+                                json_string(json_string_value(jdesc)));
+        _ic_set_seq(body, payload);
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+        return 0;
+    }
+
+    /* peer_cosign_sig — pack {cid, signer, sig, seq, ts} (Phase 3 P3.3): the
+     * signer's half coming back to the node authoring the exchange. Passed
+     * through verbatim for the same reason as the ask. The core does NOT verify
+     * the signature here and cannot — it does not hold the payload the signature
+     * is over. Mirrors the Python peer_cosign_sig builder. */
+    if (strcmp(function, "peer_cosign_sig") == 0 && json_is_object(payload)) {
+        static const char *keys[] = {"cid", "signer", "sig"};
+        json_t *body = json_object();
+        for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+            json_t *v = json_object_get(payload, keys[k]);
+            json_object_set_new(body, keys[k],
+                                json_string(json_is_string(v)
+                                            ? json_string_value(v) : ""));
+        }
+        json_t *jts = json_object_get(payload, "ts");
+        json_object_set_new(body, "ts",
+                            json_real(json_is_number(jts)
+                                      ? json_number_value(jts) : 0.0));
+        _ic_set_seq(body, payload);
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+        return 0;
+    }
 #endif /* AT_SOCIAL_ENABLED */
 
     /* vote_on_peer is the only identity function whose C handler
@@ -3334,6 +3398,154 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                         return -1;
                     }
                 }
+            } else if (strcmp(key, "cosign_request_last") == 0) {
+                /* {requester_id: {record, op, cid, bytes, seq} | {absent: true}}
+                 * (Phase 3 P3.3) — the most-recent co-signing ask this
+                 * participant received from another, via
+                 * identity_get_last_cosign_request. An ask that was refused by
+                 * the shape gate (unknown act, a payload no exporter produced) or
+                 * by the replay gate is ABSENT; `absent: true` asserts that, and
+                 * it is what makes the refusal scenarios load-bearing rather than
+                 * merely non-crashing. Mirrors the Python adapter's
+                 * cosign_request_last, keyed by the same lowercased uuid. */
+                const char *cr_pid;
+                json_t *cr_want;
+                json_object_foreach(val, cr_pid, cr_want) {
+                    sce_participant_t *other = sce_find_participant(ctx, cr_pid);
+                    if (other == NULL) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: cosign_request_last names unknown "
+                                 "participant %s", pid, cr_pid);
+                        return -1;
+                    }
+                    const public_identity_t *want_id =
+                        ((ic_impl_t *)other->impl)->pub;
+                    char want_uuid[UUID_STR_LEN + 1];
+                    uuid_unparse_lower(want_id->uuid, want_uuid);
+                    char got_record[AT_COSIGN_TOKEN_MAX + 1];
+                    char got_op[AT_COSIGN_TOKEN_MAX + 1];
+                    char got_polity[AT_COSIGN_DID_MAX + 1];
+                    char got_cid[AT_COSIGN_CID_MAX + 1];
+                    static char got_bytes[AT_COSIGN_BYTES_MAX + 1];
+                    int64_t got_seq = 0;
+                    bool have = identity_get_last_cosign_request(
+                        want_uuid, got_record, sizeof(got_record), got_op,
+                        sizeof(got_op), got_polity, sizeof(got_polity), got_cid,
+                        sizeof(got_cid), got_bytes, sizeof(got_bytes), &got_seq);
+                    bool want_absent =
+                        json_is_true(json_object_get(cr_want, "absent"));
+                    if (want_absent) {
+                        if (have) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: cosign_request_last[%s] present "
+                                     "(%s/%s), expected ABSENT", pid, cr_pid,
+                                     got_record, got_op);
+                            return -1;
+                        }
+                        continue;
+                    }
+                    if (!have) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: cosign_request_last[%s] absent, expected "
+                                 "an ask", pid, cr_pid);
+                        return -1;
+                    }
+                    static const struct { const char *k; const char *v; }
+                        cr_fields[] = {{"record", NULL}, {"op", NULL},
+                                       {"polity", NULL}, {"cid", NULL},
+                                       {"bytes", NULL}};
+                    const char *cr_got[] = {got_record, got_op, got_polity,
+                                            got_cid, got_bytes};
+                    for (size_t f = 0; f < sizeof(cr_fields) / sizeof(cr_fields[0]); f++) {
+                        json_t *jw = json_object_get(cr_want, cr_fields[f].k);
+                        if (json_is_string(jw)
+                            && strcmp(cr_got[f], json_string_value(jw)) != 0) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: cosign_request_last[%s].%s=%.80s, "
+                                     "expected %.80s", pid, cr_pid,
+                                     cr_fields[f].k, cr_got[f],
+                                     json_string_value(jw));
+                            return -1;
+                        }
+                    }
+                    json_t *jcs = json_object_get(cr_want, "seq");
+                    if (json_is_integer(jcs)
+                        && got_seq != (int64_t)json_integer_value(jcs)) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: cosign_request_last[%s].seq=%lld, expected "
+                                 "%lld", pid, cr_pid, (long long)got_seq,
+                                 (long long)json_integer_value(jcs));
+                        return -1;
+                    }
+                }
+            } else if (strcmp(key, "cosign_sig_last") == 0) {
+                /* {signer_id: {cid, signer, sig, seq} | {absent: true}} (Phase 3
+                 * P3.3) — the most-recent co-signature this participant received
+                 * back, via identity_get_last_cosign_sig. The core does NOT
+                 * verify it (it does not hold the payload the signature is over),
+                 * so what is pinned here is carriage and the replay gate, not
+                 * validity. Mirrors the Python adapter's cosign_sig_last. */
+                const char *cs_pid;
+                json_t *cs_want;
+                json_object_foreach(val, cs_pid, cs_want) {
+                    sce_participant_t *other = sce_find_participant(ctx, cs_pid);
+                    if (other == NULL) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: cosign_sig_last names unknown participant "
+                                 "%s", pid, cs_pid);
+                        return -1;
+                    }
+                    const public_identity_t *want_id =
+                        ((ic_impl_t *)other->impl)->pub;
+                    char want_uuid[UUID_STR_LEN + 1];
+                    uuid_unparse_lower(want_id->uuid, want_uuid);
+                    char got_cid[AT_COSIGN_CID_MAX + 1];
+                    char got_signer[AT_COSIGN_DID_MAX + 1];
+                    char got_sig[AT_COSIGN_SIG_MAX + 1];
+                    int64_t got_seq = 0;
+                    bool have = identity_get_last_cosign_sig(
+                        want_uuid, got_cid, sizeof(got_cid), got_signer,
+                        sizeof(got_signer), got_sig, sizeof(got_sig), &got_seq);
+                    bool want_absent =
+                        json_is_true(json_object_get(cs_want, "absent"));
+                    if (want_absent) {
+                        if (have) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: cosign_sig_last[%s] present (cid=%.20s), "
+                                     "expected ABSENT", pid, cs_pid, got_cid);
+                            return -1;
+                        }
+                        continue;
+                    }
+                    if (!have) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: cosign_sig_last[%s] absent, expected a "
+                                 "signature", pid, cs_pid);
+                        return -1;
+                    }
+                    static const char *cs_keys[] = {"cid", "signer", "sig"};
+                    const char *cs_got[] = {got_cid, got_signer, got_sig};
+                    for (size_t f = 0; f < sizeof(cs_keys) / sizeof(cs_keys[0]); f++) {
+                        json_t *jw = json_object_get(cs_want, cs_keys[f]);
+                        if (json_is_string(jw)
+                            && strcmp(cs_got[f], json_string_value(jw)) != 0) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: cosign_sig_last[%s].%s=%.80s, expected "
+                                     "%.80s", pid, cs_pid, cs_keys[f], cs_got[f],
+                                     json_string_value(jw));
+                            return -1;
+                        }
+                    }
+                    json_t *jss = json_object_get(cs_want, "seq");
+                    if (json_is_integer(jss)
+                        && got_seq != (int64_t)json_integer_value(jss)) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: cosign_sig_last[%s].seq=%lld, expected %lld",
+                                 pid, cs_pid, (long long)got_seq,
+                                 (long long)json_integer_value(jss));
+                        return -1;
+                    }
+                }
             } else if (strcmp(key, "social_tx_last") == 0) {
                 /* {subject_id: {score} | {absent: true}} (Increment 8) — the last
                  * interaction reputation score this participant STAGED about
@@ -4402,6 +4614,8 @@ void at_identity_run(const at_case_t *c, at_case_result_t *out) {
                      strncmp(fn, "peer_post", 9) == 0 ||
                      strncmp(fn, "peer_reaction", 13) == 0 ||
                      strncmp(fn, "peer_business_ad", 16) == 0 ||
+                     strncmp(fn, "peer_cosign_request", 19) == 0 ||
+                     strncmp(fn, "peer_cosign_sig", 15) == 0 ||
                      strncmp(fn, "trigger_advertise_business", 26) == 0 ||
                      strncmp(fn, "trigger_block", 13) == 0)) {
                     at_case_result_set_skip(

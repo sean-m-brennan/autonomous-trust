@@ -67,12 +67,21 @@ class TestIdentityProtocol:
           (business_ad) — every ad on the wire is first-person, so
           one verb covers the business advertising itself and a
           happy customer re-advertising what it learned
+        - detached co-signing of staff roll acts, Phase 3 P3.3
+          (cosign_request, cosign_sig) — the record's bytes travel
+          and the signers' private keys do not, so it takes two
+          verbs: the ask carrying the exported payload, and the
+          signature coming back. The human-legible description of
+          what is being signed is deliberately NOT a field on
+          either: the signer's own node derives it from the bytes.
         Asserting the exact count here pins the wire contract — a
         new verb without intent will fail this and force a deliberate
         update. Update the expected count alongside any new addition
         to ``IdentityProtocol``.
         """
         values = list(IdentityProtocol)
-        assert len(values) == 41
+        assert len(values) == 43
         assert 'announce' in values
         assert 'business_ad' in values
+        assert 'cosign_request' in values
+        assert 'cosign_sig' in values

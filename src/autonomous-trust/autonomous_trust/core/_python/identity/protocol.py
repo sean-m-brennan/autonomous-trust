@@ -146,6 +146,30 @@ class IdentityProtocol(Protocol):
     # polity-root -> envoy -> page; what the runtime verifies is the detached
     # Ed25519 signature binding who vouched, how happy, for which page bytes.
     business_ad = 'peer_business_ad'  # msg.obj <- json {advertiser,advertiser_pk,polity,sat,seq,ts,bundle,sig}
+    # Detached co-signing (Phase 3 P3.3): a staff roll act — admitting,
+    # expelling, designating a machine, moving or releasing its guardian —
+    # decided by several people who are not at the same keyboard. The record
+    # travels; their PRIVATE KEYS DO NOT. One node exports the record's
+    # canonical bytes, each required signer signs those bytes where its key
+    # already lives, and the authoring node reassembles the signatures onto the
+    # payload. Both verbs are directed and ENCRYPTED, like a DM (crypto_box
+    # authenticates each end), so neither carries a signature of its own and
+    # neither is in UNENCRYPTED_VERBS. `seq` is a per-sender freshness/replay
+    # guard.
+    #
+    # This runtime is a COURIER here and nothing more: it holds no Ethne, so it
+    # cannot know what `bytes` means, and it does not hold the payload, so it
+    # cannot check a returned signature. It bounds and shape-checks
+    # (capabilities.cosign_*), and the app answers whether this node is even a
+    # required signer.
+    #
+    # WHAT DELIBERATELY DOES NOT CROSS: the human-legible DESCRIPTION of what is
+    # being signed. The signer's own node derives it from the bytes. Carrying it
+    # would let the ASKING node choose both what you sign and what you are told
+    # you are signing — a friendly sentence over hostile bytes, with a real
+    # signature on the end.
+    cosign_request = 'peer_cosign_request'  # msg.obj <- json {record,op,polity,cid,bytes,seq,ts}
+    cosign_sig = 'peer_cosign_sig'  # msg.obj <- json {cid,signer,sig,seq,ts}
     proximity_probe = 'peer_proximity_probe'      # msg.obj <- json {'salt','tags'}
     proximity_reply = 'peer_proximity_reply'      # msg.obj <- json {'salt','tags'}
     proximity_trigger = 'peer_proximity_trigger'  # local IPC: {'target': uuid_str}
