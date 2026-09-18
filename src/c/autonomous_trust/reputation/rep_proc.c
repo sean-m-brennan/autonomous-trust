@@ -6978,33 +6978,42 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
         if (proc->protocol.child_groups != NULL)
             _restore_child_evidence(proc, have_self ? self_str : NULL);
 
-        generic_msg_t buf = {0};
-        int rerr = messaging_recv(&buf);
-        if (rerr == -1 || rerr == ENOMSG)
-            continue;
+        /* Drain what is queued rather than one per tick: the per-pass work
+         * above keeps its cadence, but a reputation burst (every peer's
+         * transaction traffic arrives at once during a cohort bootstrap)
+         * otherwise overflows this queue and is dropped at the sender, which
+         * logs 'Failed to route message to process reputation' on the network
+         * side and nothing at all here. See PROC_DRAIN_MAX. */
+        for (int taken = 0; taken < PROC_DRAIN_MAX; taken++)
+        {
+            generic_msg_t buf = {0};
+            int rerr = messaging_recv(&buf);
+            if (rerr == -1 || rerr == ENOMSG)
+                break;
 
 #ifdef AT_ZTA_ENABLED
-        if (buf.type == ZTA_STANDING)
-        {
-            /* Identity's finding about a peer's credential (doc/architecture/zta-integration.md). Handled
-             * here rather than via run_message_handlers for the same reason
-             * TRANSACTION_SCORE is: that dispatcher routes net_msg payloads by
-             * function name, and this is a local struct. */
-            _handle_zta_standing(proc, &buf.info.zta_standing);
-        }
-        else
+            if (buf.type == ZTA_STANDING)
+            {
+                /* Identity's finding about a peer's credential (doc/architecture/zta-integration.md). Handled
+                 * here rather than via run_message_handlers for the same reason
+                 * TRANSACTION_SCORE is: that dispatcher routes net_msg payloads by
+                 * function name, and this is a local struct. */
+                _handle_zta_standing(proc, &buf.info.zta_standing);
+            }
+            else
 #endif
-        if (buf.type == TRANSACTION_SCORE)
-        {
-            /* Self identity may not have been loaded at startup; resolve
-             * lazily on first use so an early submission isn't lost. */
-            if (!have_self)
-                have_self = _resolve_self_uuid(proc, self_uuid);
-            _handle_local_tx_score(proc, &buf, self_uuid, have_self);
-        }
-        else
-        {
-            run_message_handlers(proc, queues, buf.type, &buf);
+            if (buf.type == TRANSACTION_SCORE)
+            {
+                /* Self identity may not have been loaded at startup; resolve
+                 * lazily on first use so an early submission isn't lost. */
+                if (!have_self)
+                    have_self = _resolve_self_uuid(proc, self_uuid);
+                _handle_local_tx_score(proc, &buf, self_uuid, have_self);
+            }
+            else
+            {
+                run_message_handlers(proc, queues, buf.type, &buf);
+            }
         }
     }
 

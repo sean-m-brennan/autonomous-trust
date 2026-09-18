@@ -3437,10 +3437,18 @@ int negotiation_run(process_t *proc, directory_t *queues, queue_id_t signal, log
     {
         sleep_until(proc, cadence);
 
-        generic_msg_t buf = {0};
-        int rerr = messaging_recv(&buf);
-        if (rerr != -1 && rerr != ENOMSG)
+        /* Drain, don't sip: one message per cadence tick is slower than a
+         * cohort bootstrap fills this queue, and the surplus is dropped at the
+         * sender (MSG_DONTWAIT / EAGAIN), not buffered. The two hooks below
+         * still run once per tick, exactly as before. See PROC_DRAIN_MAX. */
+        for (int taken = 0; taken < PROC_DRAIN_MAX; taken++)
+        {
+            generic_msg_t buf = {0};
+            int rerr = messaging_recv(&buf);
+            if (rerr == -1 || rerr == ENOMSG)
+                break;
             run_message_handlers(proc, queues, buf.type, &buf);
+        }
 
         _drain_task_stack(proc);
         _bootstrap_tick(proc);
