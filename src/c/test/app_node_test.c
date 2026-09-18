@@ -512,6 +512,65 @@ DEFINE_TEST(test_a_roster_pull_says_not_ready_rather_than_just_failing)
 }
 END_TEST_DEFINITION()
 
+/* The OTHER half of the same switch, and the one with no coverage at all until
+ * P3.3's live cohort found it empty: at_route_extern_msg allowlists the app->AT
+ * verbs, and a verb missing from it is refused outright ("refused extern net_msg
+ * '<verb>'") — the app's call returns 0, having been accepted at the app-event
+ * boundary, and the daemon then drops it. That is how AT_APP_REQUEST_COSIGN and
+ * AT_APP_RETURN_COSIGN shipped: every layer beneath them existed (id_proc
+ * handlers registered, emitters wired) and nothing but this allowlist was
+ * missing, so it read as a network fault four hops away.
+ *
+ * Routed is 0, refused is -1 — and it is 0 even when the onward send fails, so
+ * this needs no live sibling process, only a bound sender queue. */
+DEFINE_TEST(test_every_app_verb_is_allowlisted_for_routing)
+{
+    queue_t sender_q;
+    ck_assert_ret_ok(messaging_init("_route_verb_q", &sender_q));
+    messaging_assign(&sender_q);
+
+    static const char *const app_verbs[] = {
+        AT_APP_ROSTER_REQUEST,
+#ifdef AT_SOCIAL_ENABLED
+        AT_APP_SET_POSITION, AT_APP_SET_PROFILE,
+        AT_APP_CONNECT_REQUEST, AT_APP_CONNECT_RESPOND,
+        AT_APP_SEND_DM, AT_APP_PUBLISH_POST, AT_APP_REACT_POST, AT_APP_BLOCK,
+        AT_APP_REQUEST_ATTEND, AT_APP_SET_EXACT_POSITION,
+        AT_APP_REQUEST_PROXIMITY,
+        AT_APP_ADVERTISE_BUSINESS, AT_APP_SET_CUSTOMER,
+        AT_APP_REQUEST_COSIGN, AT_APP_RETURN_COSIGN,
+#endif
+    };
+
+    for (size_t i = 0; i < sizeof(app_verbs) / sizeof(app_verbs[0]); i++) {
+        generic_msg_t msg = {0};
+        msg.type = NET_MESSAGE;
+        msg.size = message_size(NET_MESSAGE);
+        msg.info.net_msg.function = (char *)app_verbs[i];
+        snprintf(msg.info.net_msg.process, sizeof(msg.info.net_msg.process),
+                 "%s", "identity");
+        /* Names the verb in the failure, so a miss says WHICH one. */
+        _test_count++;
+        if (at_route_extern_msg(&msg, NULL) != 0)
+            _ck_fail("app verb '%s' is not allowlisted in at_route_extern_msg"
+                     " -- the daemon refuses it and the app never learns",
+                     app_verbs[i]);
+    }
+
+    /* The allowlist is a list, not a rubber stamp: an unknown verb is refused. */
+    generic_msg_t bogus = {0};
+    bogus.type = NET_MESSAGE;
+    bogus.size = message_size(NET_MESSAGE);
+    bogus.info.net_msg.function = (char *)"app_not_a_verb";
+    snprintf(bogus.info.net_msg.process, sizeof(bogus.info.net_msg.process),
+             "%s", "identity");
+    ck_assert_int_eq(at_route_extern_msg(&bogus, NULL), -1);
+
+    messaging_assign(NULL);
+    messaging_qclose(&sender_q);
+}
+END_TEST_DEFINITION()
+
 /* The daemon forwards process->app events by an explicit type switch in
  * at_route_internal_msgs; a social increment that adds a PEER_*_OBSERVED type but
  * forgets that switch silently drops the event on the way to the app/GUI. That
@@ -519,7 +578,13 @@ END_TEST_DEFINITION()
  * (Inc 8) at once, invisibly — the Dart tests drive ingestEvents directly and the
  * integration round-trip only exercised PROFILE (which was on the list). This pins
  * every app-facing observed type to actually forward, so the next one added here
- * (and to the at_app_events_poll decode) fails loudly if this switch is missed. */
+ * (and to the at_app_events_poll decode) fails loudly if this switch is missed.
+ *
+ * IT ONLY FIRES IF THE TYPE IS ADDED TO app_types[] BELOW. Phase 2's proximity
+ * band, P3.2's business ads and P3.3's two co-signing types were all added to
+ * the enum and to id_proc's emitters WITHOUT being added here, and the cosign
+ * pair really was missing from the switch — found by a live cohort rather than
+ * by this test. Adding a PEER_*_OBSERVED enumerator means adding it here. */
 DEFINE_TEST(test_every_app_event_type_forwards_to_the_app_queue)
 {
     queue_t app_q, sender_q;
@@ -533,38 +598,65 @@ DEFINE_TEST(test_every_app_event_type_forwards_to_the_app_queue)
         PEER_POSITION_OBSERVED, PEER_PROFILE_OBSERVED,
         PEER_CONNECTION_REQUEST_OBSERVED, PEER_CONNECTION_STATE_OBSERVED,
         PEER_DM_OBSERVED, PEER_POST_OBSERVED, PEER_REACTION_OBSERVED,
+        PEER_PROXIMITY_OBSERVED, PEER_BUSINESS_AD_OBSERVED,
+        PEER_COSIGN_REQUEST_OBSERVED, PEER_COSIGN_SIG_OBSERVED,
 #endif
     };
     const size_t n = sizeof(app_types) / sizeof(app_types[0]);
 
-    generic_msg_t msgs[16] = {0};   /* fixed (no VLA); must outlive the drain */
-    ck_assert(n <= 16);
-    array_t unhandled;
-    ck_assert_ret_ok(array_init(&unhandled));
+    /* ONE AT A TIME, receiving between sends. These are AF_UNIX SOCK_DGRAM
+     * queues and net.unix.max_dgram_qlen is 10 on a stock kernel, so queueing
+     * every type before reading any caps the batch at the queue depth, NOT at
+     * the switch: this test used to send exactly 10 and sat one datagram from
+     * failing. Adding Phase 2 / P3.3's types made it fail at 11 of 14 — which
+     * reads exactly like three missing switch cases and is not. Draining as we
+     * go makes the assertion mean what it says at any number of types. */
     for (size_t i = 0; i < n; i++) {
-        msgs[i].type = app_types[i];
-        msgs[i].size = message_size(app_types[i]);
-        ck_assert_ret_ok(at_route_queue_msg(&unhandled, &msgs[i]));
+        generic_msg_t msg = {0};   /* must outlive the drain below */
+        msg.type = app_types[i];
+        msg.size = message_size(app_types[i]);
+        array_t unhandled;
+        ck_assert_ret_ok(array_init(&unhandled));
+        ck_assert_ret_ok(at_route_queue_msg(&unhandled, &msg));
+
+        /* Forwarded (sent == 1) or fallen through the switch (sent == 0). The
+         * array is emptied either way. */
+        int sent = at_route_internal_msgs(&unhandled, "_route_app_q", NULL);
+        _test_count++;
+        if (sent != 1)
+            _ck_fail("app event type %d is not forwarded by at_route_internal_msgs"
+                     " -- it is dropped on the way to the app queue",
+                     (int)app_types[i]);
+        ck_assert_int_eq((int)array_size(&unhandled), 0);
+        array_free(&unhandled);
+
+        /* It lands on the app queue with its type intact. Only read what was
+         * actually sent, so a dropped case fails above rather than blocking. */
+        if (sent == 1) {
+            generic_msg_t got = {0};
+            ck_assert_ret_ok(messaging_recv_on(&app_q, &got, NULL, true));
+            ck_assert_int_eq((int)got.type, (int)app_types[i]);
+        }
     }
 
-    /* Every queued app event must be forwarded (sent == n): a type that falls
-     * through the switch is NOT sent and drops sent below n. The array is drained
-     * either way. */
-    int sent = at_route_internal_msgs(&unhandled, "_route_app_q", NULL);
-    ck_assert_int_eq(sent, (int)n);
-    ck_assert_int_eq((int)array_size(&unhandled), 0);
-
-    /* Drain exactly what was forwarded (never more than `sent`), so a dropped case
-     * fails the sent==n check above rather than blocking here; each lands on the
-     * app queue with its type intact, in FIFO order. */
-    for (int i = 0; i < sent; i++) {
+    /* FIFO across messages, pinned separately and well inside the queue depth:
+     * the drain sends as it walks, and batching them into a second array is what
+     * once dropped every message but the last. */
+    generic_msg_t fifo[3] = {0};
+    array_t batch;
+    ck_assert_ret_ok(array_init(&batch));
+    for (size_t i = 0; i < 3; i++) {
+        fifo[i].type = app_types[i];
+        fifo[i].size = message_size(app_types[i]);
+        ck_assert_ret_ok(at_route_queue_msg(&batch, &fifo[i]));
+    }
+    ck_assert_int_eq(at_route_internal_msgs(&batch, "_route_app_q", NULL), 3);
+    for (size_t i = 0; i < 3; i++) {
         generic_msg_t got = {0};
         ck_assert_ret_ok(messaging_recv_on(&app_q, &got, NULL, true));
-        if (i < (int)n)
-            ck_assert_int_eq((int)got.type, (int)app_types[i]);
+        ck_assert_int_eq((int)got.type, (int)app_types[i]);
     }
-
-    array_free(&unhandled);
+    array_free(&batch);
     messaging_assign(NULL);
     messaging_qclose(&app_q);
     messaging_qclose(&sender_q);
@@ -587,4 +679,5 @@ RUN_TESTS(App_Node,
           test_readiness_is_about_a_bound_queue_not_a_live_process,
           test_wait_ready_does_not_wait_out_the_timeout_for_nothing,
           test_a_roster_pull_says_not_ready_rather_than_just_failing,
+          test_every_app_verb_is_allowlisted_for_routing,
           test_every_app_event_type_forwards_to_the_app_queue)

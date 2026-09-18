@@ -1,0 +1,1219 @@
+<!doctype html>
+<html lang="en" data-resolution="landscape">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1920, height=1080" />
+    <title>AutonomousTrust — Brag (narrated)</title>
+    <script src="assets/vendor/gsap.min.js"></script>
+    <script src="assets/audio-data.js"></script>
+    <style>
+      /* Design tokens lifted verbatim from the project's dashboard theme:
+         src/autonomous-trust-inspector/autonomous_trust/inspector/
+           dash_components/assets/demo.css */
+      :root {
+        --demo-bg: #0b0f1a;
+        --demo-surface: #121a2e;
+        --demo-surface-2: #1e2940;
+        --demo-border: #1f2a44;
+        --demo-border-muted: #334155;
+        --demo-text: #e2e8f0;
+        /* demo.css ships #94a3b8 / #64748b. Both fail WCAG AA at this type size
+           over the panel surfaces, so they are lifted here far enough to pass
+           the contrast audit while keeping text > muted > dim intact. */
+        --demo-text-muted: #c3cddb;
+        --demo-text-dim: #a9b6c8;
+        --agency-noaa: #1f77b4;
+        --agency-usgs: #8c564b;
+        --agency-fema: #d62728;
+        --agency-epa: #2ca02c;
+        --demo-ok: #4ade80;
+        --demo-warn: #fbbf24;
+        --demo-alert: #ef4444;
+        --demo-info: #60a5fa;
+        --demo-radius: 8px;
+        /* Type stacks are generic on purpose: the dashboard asks for Inter and
+           JetBrains Mono, neither of which ships with this composition, and a
+           named family without an @font-face is a lint error. */
+        --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        --mono: ui-monospace, Menlo, Consolas, monospace;
+      }
+
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        background: var(--demo-bg);
+      }
+
+      #root {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: var(--demo-bg);
+        color: var(--demo-text);
+        font-family: var(--sans);
+      }
+
+      .clip {
+        position: absolute;
+        inset: 0;
+      }
+
+      /* ---- Scene 1: hook ------------------------------------------------ */
+      #hook {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 40px;
+      }
+
+      #hook-slug {
+        font-family: var(--mono);
+        font-size: 22px;
+        letter-spacing: 0.34em;
+        color: var(--demo-text-dim);
+        text-transform: uppercase;
+      }
+
+      #hook-line {
+        font-size: 96px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        color: var(--demo-text);
+      }
+
+      /* ---- Dashboard shell ---------------------------------------------- */
+      #dash {
+        display: block;
+      }
+
+      #dash-inner {
+        position: absolute;
+        inset: 0;
+      }
+
+      .topbar {
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: 0;
+        height: 72px;
+        display: flex;
+        align-items: center;
+        gap: 24px;
+        padding: 0 28px;
+        background: linear-gradient(180deg, #0f172a 0%, #0b0f1a 100%);
+        border-bottom: 1px solid var(--demo-border);
+      }
+
+      .brand {
+        font-weight: 700;
+        font-size: 22px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .tagline {
+        color: var(--demo-text-muted);
+        font-size: 15px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+
+      .clock {
+        font-family: var(--mono);
+        font-size: 20px;
+        padding: 6px 14px;
+        background: var(--demo-surface);
+        border: 1px solid var(--demo-border);
+        border-radius: var(--demo-radius);
+      }
+
+      .phase {
+        color: var(--demo-text-muted);
+        font-size: 15px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+
+      .keystats {
+        margin-left: auto;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .chip {
+        display: inline-flex;
+        align-items: baseline;
+        gap: 10px;
+        padding: 6px 14px;
+        border-radius: var(--demo-radius);
+        background: var(--demo-surface);
+        border: 1px solid var(--demo-border);
+      }
+
+      .chip-label {
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--demo-text-dim);
+        font-size: 13px;
+      }
+
+      .chip-value {
+        font-family: var(--mono);
+        font-size: 17px;
+        font-weight: 600;
+      }
+
+      .panel {
+        position: absolute;
+        background: var(--demo-surface);
+        border: 1px solid var(--demo-border);
+        border-radius: var(--demo-radius);
+        overflow: hidden;
+      }
+
+      .panel-header {
+        height: 44px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 0 18px;
+        border-bottom: 1px solid var(--demo-border);
+        color: var(--demo-text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        font-size: 16px;
+        font-weight: 600;
+      }
+
+      .panel-sub {
+        color: var(--demo-text-dim);
+        font-size: 14px;
+        font-weight: 400;
+        letter-spacing: 0.04em;
+      }
+
+      #graph-panel {
+        left: 28px;
+        top: 96px;
+        width: 1180px;
+        height: 620px;
+      }
+
+      #log-panel {
+        left: 1232px;
+        top: 96px;
+        width: 660px;
+        height: 620px;
+      }
+
+      #strip-panel {
+        left: 28px;
+        top: 736px;
+        width: 1864px;
+        height: 316px;
+      }
+
+      /* ---- Trust graph --------------------------------------------------- */
+      #graph-body {
+        position: absolute;
+        left: 0;
+        top: 44px;
+        width: 1180px;
+        height: 576px;
+      }
+
+      #graph-svg {
+        position: absolute;
+        left: 0;
+        top: 0;
+      }
+
+      .edge {
+        stroke: var(--demo-border-muted);
+        stroke-width: 1.6;
+        fill: none;
+      }
+
+      .node-dot {
+        stroke: #0b0f1a;
+        stroke-width: 2;
+      }
+
+      .node-label {
+        font-family: var(--mono);
+        font-size: 16px;
+        fill: var(--demo-text-muted);
+        text-anchor: middle;
+      }
+
+      /* Reputation readout that tracks the compromised peer. */
+      #rep-card {
+        position: absolute;
+        left: 445px;
+        top: 436px;
+        width: 268px;
+        padding: 14px 16px;
+        background: var(--demo-surface-2);
+        border: 1px solid var(--demo-border-muted);
+        border-radius: var(--demo-radius);
+      }
+
+      #rep-peer {
+        font-family: var(--mono);
+        font-size: 15px;
+        color: var(--demo-text-muted);
+      }
+
+      #rep-value {
+        font-family: var(--mono);
+        font-size: 52px;
+        font-weight: 700;
+        line-height: 1.1;
+        color: var(--demo-ok);
+      }
+
+      #rep-threshold {
+        font-family: var(--mono);
+        font-size: 13px;
+        color: var(--demo-text-dim);
+        letter-spacing: 0.04em;
+      }
+
+      /* ---- Event log ----------------------------------------------------- */
+      #log-body {
+        position: absolute;
+        left: 0;
+        top: 44px;
+        width: 660px;
+        padding: 14px;
+      }
+
+      .event {
+        padding: 10px 12px;
+        margin-bottom: 8px;
+        border-left: 3px solid var(--demo-border-muted);
+        background: rgba(30, 41, 59, 0.35);
+        border-radius: 0 4px 4px 0;
+        font-size: 18px;
+        line-height: 1.35;
+        color: var(--demo-text);
+      }
+
+      .event-time {
+        color: var(--demo-text-dim);
+        font-family: var(--mono);
+        font-size: 14px;
+        margin-right: 10px;
+        letter-spacing: 0.04em;
+      }
+
+      .event-info {
+        border-left-color: var(--demo-info);
+      }
+      .event-data {
+        border-left-color: var(--demo-text-muted);
+      }
+      .event-warning {
+        border-left-color: var(--demo-warn);
+        background: rgba(251, 191, 36, 0.06);
+      }
+      .event-threat {
+        border-left-color: var(--demo-alert);
+        background: rgba(239, 68, 68, 0.08);
+      }
+      .event-success {
+        border-left-color: var(--demo-ok);
+        background: rgba(74, 222, 128, 0.06);
+      }
+
+      /* ---- Bottom strip -------------------------------------------------- */
+      #chart-holder,
+      #tiers-holder {
+        position: absolute;
+        left: 0;
+        top: 44px;
+        width: 1864px;
+        height: 272px;
+      }
+
+      #chart-svg {
+        position: absolute;
+        left: 24px;
+        top: 12px;
+      }
+
+      .trace {
+        fill: none;
+        stroke-width: 3;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      .gridline {
+        stroke: var(--demo-border);
+        stroke-width: 1;
+      }
+
+      .chart-legend {
+        position: absolute;
+        right: 32px;
+        top: 18px;
+        display: flex;
+        gap: 26px;
+        font-family: var(--mono);
+        font-size: 16px;
+        color: var(--demo-text-muted);
+      }
+
+      .legend-swatch {
+        display: inline-block;
+        width: 14px;
+        height: 3px;
+        margin-right: 8px;
+        vertical-align: middle;
+      }
+
+      /* Tier cards */
+      #tiers-holder {
+        display: flex;
+        align-items: center;
+        gap: 22px;
+        padding: 0 28px;
+      }
+
+      .tier {
+        flex: 1;
+        height: 196px;
+        border-radius: var(--demo-radius);
+        border: 1px solid var(--demo-border);
+        background: var(--demo-surface-2);
+        padding: 24px 26px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+      }
+
+      .tier-num {
+        font-family: var(--mono);
+        font-size: 16px;
+        color: var(--demo-text-dim);
+        letter-spacing: 0.1em;
+      }
+
+      .tier-label {
+        font-size: 34px;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+        text-transform: uppercase;
+      }
+
+      .tier-note {
+        font-size: 17px;
+        color: var(--demo-text-muted);
+      }
+
+      /* ---- Narration captions -------------------------------------------
+         Restored from the silent cut and anchored to the measured word onsets
+         of the clips that carry the same idea (whisper base.en word timings):
+           cap-mesh   10.27s  "No policy server to call. No certificate ..."
+           cap-human  26.31s  "No operator approved that."
+           cap-tiers  34.83s  "It is a dial re-earned continuously."
+         Each one clears before the next element claims its space: the sensor
+         strip returns at 14.20, scene 5 at 28.40, the lockup dim at 37.64. */
+      .caption {
+        position: absolute;
+        left: 60px;
+        top: 800px;
+        font-size: 54px;
+        font-weight: 700;
+        letter-spacing: -0.01em;
+        color: var(--demo-text);
+        text-shadow: 0 4px 30px rgba(11, 15, 26, 0.95);
+      }
+
+      #cap-tiers {
+        position: absolute;
+        left: 60px;
+        top: 632px;
+        font-size: 38px;
+        font-weight: 600;
+        color: var(--demo-text-muted);
+        letter-spacing: 0.04em;
+      }
+
+      /* ---- Scene 7: lockup ------------------------------------------------ */
+      #lockup {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 26px;
+      }
+
+      #wordmark {
+        font-size: 104px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+      }
+
+      #wordmark-sub {
+        font-size: 32px;
+        color: var(--demo-text-muted);
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      /* CC BY 4.0 obliges us to carry the attribution with the video itself,
+         not only in the post copy — see CREDITS.md. Positioned absolutely so
+         the centred wordmark column above it is unaffected. */
+      #music-credit {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 16px;
+        text-align: center;
+        font-size: 20px;
+        color: var(--demo-text-dim);
+        letter-spacing: 0.02em;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- Narrated cut. Total length is set by the seven measured Kokoro clips
+         (37.61s of speech + ~0.65s of breathing room between lines), not by the
+         default 15-25s law — see composition-brief.md for the carve-out. -->
+    <div
+      id="root"
+      data-composition-id="main"
+      data-start="0"
+      data-duration="44"
+      data-width="1920"
+      data-height="1080"
+    >
+      <!-- Scene 1 — Hook -->
+      <section id="hook" class="clip" data-start="0" data-duration="7.5" data-track-index="0">
+        <div id="hook-slug">Multi-agency · Hurricane Helene · Wilmington NC</div>
+        <h1 id="hook-line">One of these sensors is lying.</h1>
+      </section>
+
+      <!-- Scenes 2-6 — the live dashboard, continuous -->
+      <section id="dash" class="clip" data-start="7.3" data-duration="36.7" data-track-index="1">
+        <div id="dash-inner">
+          <div class="topbar">
+            <span class="brand">AutonomousTrust</span>
+            <span class="tagline">Multi-agency data sharing</span>
+            <span class="clock" id="clock">T+0:00</span>
+            <span class="phase" id="phase">Formation</span>
+            <span class="keystats">
+              <span class="chip"
+                ><span class="chip-label">Peers</span
+                ><span class="chip-value" id="stat-peers">0</span></span
+              >
+              <span class="chip"
+                ><span class="chip-label">Mean trust</span
+                ><span class="chip-value" id="stat-trust">0.00</span></span
+              >
+            </span>
+          </div>
+
+          <div class="panel" id="graph-panel">
+            <div class="panel-header">
+              Trust graph <span class="panel-sub">— reputation-weighted</span>
+            </div>
+            <div id="graph-body">
+              <svg id="graph-svg" width="1180" height="576"></svg>
+              <div id="rep-card" data-layout-allow-overlap data-layout-allow-occlusion>
+                <div id="rep-peer" data-layout-allow-overlap>noaa-sensor-3</div>
+                <div id="rep-value" data-layout-allow-overlap>0.82</div>
+                <div id="rep-threshold" data-layout-allow-overlap>Threshold 0.35</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel" id="log-panel">
+            <div class="panel-header">Event log</div>
+            <div id="log-body"></div>
+          </div>
+
+          <div class="panel" id="strip-panel">
+            <div class="panel-header" id="strip-header">
+              Sensor comparison <span class="panel-sub">— temperature °C</span>
+            </div>
+            <div id="chart-holder">
+              <svg id="chart-svg" width="1816" height="248"></svg>
+              <div class="chart-legend">
+                <span
+                  ><i class="legend-swatch" style="background: #1f77b4"></i>noaa-sensor-1</span
+                >
+                <span
+                  ><i class="legend-swatch" style="background: #5fa8d3"></i>noaa-sensor-2</span
+                >
+                <span
+                  ><i class="legend-swatch" style="background: #93c5e8"></i>noaa-sensor-3</span
+                >
+              </div>
+            </div>
+            <div id="tiers-holder">
+              <div class="tier" id="tier-1">
+                <span class="tier-num">Tier 1</span>
+                <span class="tier-label">Refuse traffic</span>
+                <span class="tier-note">Save bandwidth</span>
+              </div>
+              <div class="tier" id="tier-2">
+                <span class="tier-num">Tier 2</span>
+                <span class="tier-label">Refuse compute</span>
+                <span class="tier-note">Protect CPU</span>
+              </div>
+              <div class="tier" id="tier-3">
+                <span class="tier-num">Tier 3</span>
+                <span class="tier-label">Withhold data</span>
+                <span class="tier-note">Protect data</span>
+              </div>
+              <div class="tier" id="tier-4">
+                <span class="tier-num">Tier 4</span>
+                <span class="tier-label">Share data</span>
+                <span class="tier-note">Well-trusted peers</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- The silent cut's three captions, restored and timed to the word
+               onsets in the narration that carries the same idea. -->
+          <div class="caption" id="cap-mesh" data-layout-allow-overlap>No central authority. No round-trip.</div>
+          <div class="caption" id="cap-human" data-layout-allow-overlap>No human in the loop.</div>
+          <div id="cap-tiers" data-layout-allow-overlap>Trust is metered, not granted.</div>
+        </div>
+      </section>
+
+      <!-- Scene 7 — Lockup -->
+      <section id="lockup" class="clip" data-start="37.6" data-duration="6.4" data-track-index="2">
+        <div id="wordmark">AutonomousTrust</div>
+        <div id="wordmark-sub">Trust as a live value</div>
+        <div id="music-credit">
+          Music: “Beauty Flow” by Kevin MacLeod (incompetech.com) · CC BY 4.0
+        </div>
+      </section>
+
+      <!-- Audio -------------------------------------------------------------
+           Music bed. Level is carried entirely by timeline tweens: it enters
+           very low under the hook, opens to 0.30 in the gaps between narration
+           lines, ducks to 0.13 for every voice span, drops hardest through the
+           exclusion, and fades out under the closing line. -->
+      <audio
+        id="bgm"
+        src="assets/music/beauty-flow-by-kevin-macleod.mp3"
+        data-start="0"
+        data-duration="44"
+        data-track-index="10"
+        data-volume="1"
+      ></audio>
+
+      <!-- Narration. Seven Kokoro clips (am_michael @ 0.96), own tracks, gain 1.
+           Every scene boundary below is derived from these measured durations. -->
+      <audio id="vo-1" src="assets/voice/vo-1-hook.wav" data-start="1.00" data-duration="5.715" data-track-index="20" data-volume="1"></audio>
+      <audio id="vo-2" src="assets/voice/vo-2-mesh.wav" data-start="7.64" data-duration="6.604" data-track-index="21" data-volume="1"></audio>
+      <audio id="vo-3" src="assets/voice/vo-3-divergence.wav" data-start="14.92" data-duration="6.370" data-track-index="22" data-volume="1"></audio>
+      <audio id="vo-4" src="assets/voice/vo-4-exclusion.wav" data-start="21.95" data-duration="5.905" data-track-index="23" data-volume="1"></audio>
+      <audio id="vo-5" src="assets/voice/vo-5-rejoin.wav" data-start="28.50" data-duration="3.284" data-track-index="24" data-volume="1"></audio>
+      <audio id="vo-6" src="assets/voice/vo-6-gradient.wav" data-start="32.40" data-duration="4.780" data-track-index="25" data-volume="1"></audio>
+      <audio id="vo-7" src="assets/voice/vo-7-lockup.wav" data-start="37.90" data-duration="4.956" data-track-index="26" data-volume="1"></audio>
+
+      <!-- Peer arrivals, one per beat (beat grid at 107.67 BPM). Quieter than
+           the silent cut: these sit underneath narration. -->
+      <audio id="sfx-node-1" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="8.19" data-track-index="11" data-volume="0.22"></audio>
+      <audio id="sfx-node-2" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="8.74" data-track-index="11" data-volume="0.22"></audio>
+      <audio id="sfx-node-3" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="9.29" data-track-index="11" data-volume="0.22"></audio>
+      <audio id="sfx-node-4" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="9.83" data-track-index="11" data-volume="0.22"></audio>
+      <audio id="sfx-node-5" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="10.37" data-track-index="11" data-volume="0.22"></audio>
+      <audio id="sfx-node-6" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="10.93" data-track-index="11" data-volume="0.22"></audio>
+      <audio id="sfx-node-7" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="11.46" data-track-index="11" data-volume="0.22"></audio>
+      <audio id="sfx-node-8" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="12.02" data-track-index="11" data-volume="0.22"></audio>
+
+      <!-- Event-log row clicks are dropped for the narrated cut: under speech
+           they read as clutter. Nothing fires on the divergence either. -->
+
+      <!-- The exclusion: one dry impact, nothing else. -->
+      <audio id="sfx-exclude" src="assets/sfx/impactSoft_heavy_002.ogg" data-duration="0.57" data-start="25.65" data-track-index="13" data-volume="0.45"></audio>
+      <audio id="sfx-epa" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="29.47" data-track-index="11" data-volume="0.22"></audio>
+
+      <!-- Tier cards on alternating beats. -->
+      <audio id="sfx-tier-1" src="assets/sfx/bong_001.ogg" data-duration="0.12" data-start="32.74" data-track-index="14" data-volume="0.20"></audio>
+      <audio id="sfx-tier-2" src="assets/sfx/bong_001.ogg" data-duration="0.12" data-start="33.83" data-track-index="14" data-volume="0.20"></audio>
+      <audio id="sfx-tier-3" src="assets/sfx/bong_001.ogg" data-duration="0.12" data-start="34.92" data-track-index="14" data-volume="0.20"></audio>
+      <audio id="sfx-tier-4" src="assets/sfx/bong_001.ogg" data-duration="0.12" data-start="36.01" data-track-index="14" data-volume="0.20"></audio>
+
+      <audio id="sfx-lockup" src="assets/sfx/impactSoft_medium_001.ogg" data-duration="0.18" data-start="38.20" data-track-index="15" data-volume="0.28"></audio>
+    </div>
+
+    <script>
+      /* ------------------------------------------------------------------
+         Layout constants. Everything spatial is precomputed here so no tween
+         ever measures the DOM.
+         ------------------------------------------------------------------ */
+      var SVG_NS = "http://www.w3.org/2000/svg";
+
+      var AGENCY = {
+        noaa: "#1f77b4",
+        usgs: "#8c564b",
+        fema: "#d62728",
+        epa: "#2ca02c",
+      };
+
+      /* Peer roster and coordinates, from examples/multi_agency/README.md. */
+      var PEERS = [
+        { id: "noaa-sensor-1", agency: "noaa", x: 230, y: 150 },
+        { id: "noaa-sensor-2", agency: "noaa", x: 160, y: 360 },
+        { id: "noaa-sensor-3", agency: "noaa", x: 350, y: 480 },
+        { id: "usgs-monitor-1", agency: "usgs", x: 500, y: 110 },
+        { id: "usgs-monitor-2", agency: "usgs", x: 590, y: 320 },
+        { id: "fema-field-1", agency: "fema", x: 820, y: 160 },
+        { id: "fema-field-2", agency: "fema", x: 780, y: 470 },
+        { id: "fema-fusion", agency: "fema", x: 1010, y: 330 },
+        { id: "epa-monitor-1", agency: "epa", x: 935, y: 520 },
+      ];
+
+      var COMPROMISED = 2; /* noaa-sensor-3 */
+      var EPA = 8;
+
+      var BASE_EDGES = [
+        [0, 1],
+        [0, 2],
+        [0, 3],
+        [1, 2],
+        [1, 4],
+        [2, 4],
+        [2, 6],
+        [3, 4],
+        [3, 5],
+        [4, 5],
+        [4, 6],
+        [4, 7],
+        [5, 7],
+        [6, 7],
+      ];
+      var EPA_EDGES = [
+        [8, 1],
+        [8, 4],
+        [8, 6],
+      ];
+
+      /* ------------------------------------------------------------------
+         Narration clock. These are the measured Kokoro clip lengths; every
+         scene boundary in the timeline is derived from them, and the music
+         ducking below is generated from this table rather than hand-written.
+         ------------------------------------------------------------------ */
+      var VO = [
+        { id: "#vo-1", start: 1.0, dur: 5.715, gapAfter: 0.3 },
+        { id: "#vo-2", start: 7.64, dur: 6.604, gapAfter: 0.3 },
+        { id: "#vo-3", start: 14.92, dur: 6.37, gapAfter: 0.28 },
+        { id: "#vo-4", start: 21.95, dur: 5.905, gapAfter: 0.22 },
+        { id: "#vo-5", start: 28.5, dur: 3.284, gapAfter: 0.3 },
+        { id: "#vo-6", start: 32.4, dur: 4.78, gapAfter: 0.3 },
+        { id: "#vo-7", start: 37.9, dur: 4.956, gapAfter: 0.0 },
+      ];
+
+      /* Beat grid at 107.67 BPM, from the track's cue preset (regenerate with
+         scripts/analyze_music_cues.py when the music changes). Narration wins
+         any conflict — these are only used where a beat already sits inside a
+         natural gap or under a word the visual is meeting anyway, so each value
+         below is the grid point nearest the narration moment, never the other
+         way round. */
+      var ARRIVE = [8.36, 8.92, 9.47, 10.03, 10.59, 11.15, 11.69, 12.25]; // beat-grid
+      var T_DIVERGE = 17.53; // beat-locked: strong cue 17.53s (intensity 0.97)
+      var T_REP_START = 22.8; // beat-grid; the hit it feeds is T_CROSS, not this
+      var T_REP_DUR = 2.05; /* tuned so power2.in crosses 0.35 exactly on 24.47 */
+      var T_CROSS = 24.47; // beat-locked: strong cue 24.47s (intensity 1.00)
+      var T_VANISH = 25.59; // beat-grid (no strong cue lands on the word)
+      var T_EPA = 29.47;
+      var T_TIER = [32.81, 33.91, 35.04, 36.14]; // beat-grid, alternating beats
+      var T_WORDMARK = 38.36; // beat-grid (nearest strong cue falls before vo-7)
+      var T_WORDSUB = 40.59; // beat-grid
+      var T_CREDIT = 41.7; // beat-grid; music attribution, holds to T_END
+      var T_END = 44.0;
+
+      var svg = document.getElementById("graph-svg");
+      var edgeEls = [];
+      var nodeEls = [];
+
+      /* Edges first so nodes paint over them. */
+      function makeEdge(pair) {
+        var a = PEERS[pair[0]];
+        var b = PEERS[pair[1]];
+        var line = document.createElementNS(SVG_NS, "line");
+        line.setAttribute("x1", a.x);
+        line.setAttribute("y1", a.y);
+        line.setAttribute("x2", b.x);
+        line.setAttribute("y2", b.y);
+        line.setAttribute("class", "edge");
+        svg.appendChild(line);
+        return { el: line, a: pair[0], b: pair[1] };
+      }
+
+      for (var e = 0; e < BASE_EDGES.length; e++) {
+        edgeEls.push(makeEdge(BASE_EDGES[e]));
+      }
+      for (var e2 = 0; e2 < EPA_EDGES.length; e2++) {
+        edgeEls.push(makeEdge(EPA_EDGES[e2]));
+      }
+
+      /* Nodes: a group per peer so dot and label move together. */
+      for (var p = 0; p < PEERS.length; p++) {
+        var peer = PEERS[p];
+        var g = document.createElementNS(SVG_NS, "g");
+
+        var dot = document.createElementNS(SVG_NS, "circle");
+        dot.setAttribute("cx", peer.x);
+        dot.setAttribute("cy", peer.y);
+        dot.setAttribute("r", 15);
+        dot.setAttribute("class", "node-dot");
+        dot.setAttribute("fill", AGENCY[peer.agency]);
+        g.appendChild(dot);
+
+        var label = document.createElementNS(SVG_NS, "text");
+        label.setAttribute("x", peer.x);
+        label.setAttribute("y", peer.y + 40);
+        label.setAttribute("class", "node-label");
+        label.textContent = peer.id;
+        g.appendChild(label);
+
+        svg.appendChild(g);
+        nodeEls.push({ g: g, dot: dot, label: label });
+      }
+
+      /* Edges that die with the compromised peer. epa-monitor-1 has not joined
+         at exclusion time (it arrives at T_EPA), so its edges belong to neither
+         set — the scene-4 dim and restore below must not touch them, or they
+         fade onto the graph ahead of the peer they connect. */
+      var doomedEdges = [];
+      var survivingEdges = [];
+      for (var d = 0; d < edgeEls.length; d++) {
+        if (edgeEls[d].a === EPA || edgeEls[d].b === EPA) continue;
+        if (edgeEls[d].a === COMPROMISED || edgeEls[d].b === COMPROMISED) {
+          doomedEdges.push(edgeEls[d].el);
+        } else {
+          survivingEdges.push(edgeEls[d].el);
+        }
+      }
+
+      /* An edge appears when its later endpoint has arrived. */
+      function edgeAppearTime(edge) {
+        if (edge.a === EPA || edge.b === EPA) return T_EPA;
+        return Math.max(ARRIVE[edge.a], ARRIVE[edge.b]) + 0.06;
+      }
+
+      /* ------------------------------------------------------------------
+         Event log rows — strings taken verbatim from
+         examples/multi_agency/scenario.py where quoted. Rows are spaced at
+         least 2.1s apart so each one outlasts its own reading time under
+         narration.
+         ------------------------------------------------------------------ */
+      var EVENTS = [
+        { t: 8.74, time: "T+0:00", kind: "info", text: "NOAA, USGS and FEMA peers discover each other" },
+        { t: 10.93, time: "T+1:00", kind: "data", text: "Trust graph stabilizes — reputation reaches 0.7+" },
+        { t: 13.11, time: "T+2:30", kind: "data", text: "Weather and seismic data streams activated" },
+        { t: 15.84, time: "T+4:00", kind: "warning", text: "noaa-sensor-3 begins sending falsified readings" },
+        { t: 19.1, time: "T+4:30", kind: "warning", text: "Anomaly detected: noaa-sensor-3 temperature diverges" },
+        { t: T_VANISH, time: "T+5:00", kind: "threat", text: "noaa-sensor-3 excluded: reputation collapsed below threshold" },
+        { t: T_EPA, time: "T+6:00", kind: "success", text: "epa-monitor-1 joins the network" },
+      ];
+
+      var logBody = document.getElementById("log-body");
+      var eventEls = [];
+      for (var v = 0; v < EVENTS.length; v++) {
+        var row = document.createElement("div");
+        row.className = "event event-" + EVENTS[v].kind;
+        var stamp = document.createElement("span");
+        stamp.className = "event-time";
+        stamp.textContent = EVENTS[v].time;
+        row.appendChild(stamp);
+        row.appendChild(document.createTextNode(EVENTS[v].text));
+        logBody.appendChild(row);
+        eventEls.push(row);
+      }
+
+      /* ------------------------------------------------------------------
+         Sensor comparison chart. Three traces, split into a shared first leg
+         and a second leg where noaa-sensor-3 peels away. Deterministic — the
+         wobble is a fixed sine, never Math.random.
+         ------------------------------------------------------------------ */
+      var chart = document.getElementById("chart-svg");
+      var CW = 1816;
+      var CH = 248;
+      var CX0 = 40;
+      var CX1 = 1600;
+      var CY_MID = 128;
+      var SPLIT = 0.56;
+
+      for (var gl = 0; gl < 4; gl++) {
+        var grid = document.createElementNS(SVG_NS, "line");
+        var gy = 40 + gl * 56;
+        grid.setAttribute("x1", CX0);
+        grid.setAttribute("y1", gy);
+        grid.setAttribute("x2", CX1);
+        grid.setAttribute("y2", gy);
+        grid.setAttribute("class", "gridline");
+        chart.appendChild(grid);
+      }
+
+      var TRACE_COLORS = ["#1f77b4", "#5fa8d3", "#93c5e8"];
+      var TRACE_PHASE = [0, 0.8, 1.7];
+      var TRACE_OFFSET = [0, 14, 28];
+
+      function tracePoints(i, from, to, diverge) {
+        var pts = [];
+        var steps = 44;
+        for (var s = 0; s <= steps; s++) {
+          var u = from + ((to - from) * s) / steps;
+          var x = CX0 + (CX1 - CX0) * u;
+          var wob = Math.sin(u * 11 + TRACE_PHASE[i]) * 9 + Math.sin(u * 27 + TRACE_PHASE[i]) * 4;
+          var y = CY_MID + TRACE_OFFSET[i] + wob;
+          if (diverge) {
+            /* Falsified readings climb away from the other two. */
+            var k = (u - SPLIT) / (1 - SPLIT);
+            y -= k * k * 152;
+          }
+          pts.push(x.toFixed(1) + "," + y.toFixed(1));
+        }
+        return pts.join(" ");
+      }
+
+      var legA = [];
+      var legB = [];
+      for (var i = 0; i < 3; i++) {
+        var a = document.createElementNS(SVG_NS, "polyline");
+        a.setAttribute("points", tracePoints(i, 0, SPLIT, false));
+        a.setAttribute("class", "trace");
+        a.setAttribute("stroke", TRACE_COLORS[i]);
+        a.setAttribute("pathLength", "1");
+        chart.appendChild(a);
+        legA.push(a);
+
+        var b = document.createElementNS(SVG_NS, "polyline");
+        b.setAttribute("points", tracePoints(i, SPLIT, 1, i === 2));
+        b.setAttribute("class", "trace");
+        b.setAttribute("stroke", i === 2 ? "#ef4444" : TRACE_COLORS[i]);
+        b.setAttribute("pathLength", "1");
+        chart.appendChild(b);
+        legB.push(b);
+      }
+
+      /* ------------------------------------------------------------------
+         Timeline.
+         ------------------------------------------------------------------ */
+      var tl = gsap.timeline({ paused: true });
+
+      /* --- Scene 1: hook — holds through VO 1 (1.00 → 6.72) --- */
+      tl.fromTo("#hook-slug", { opacity: 0, y: 14 }, { opacity: 1, y: 0, duration: 0.5, ease: "power2.out" }, 0.4);
+      tl.fromTo("#hook-line", { opacity: 0, y: 28 }, { opacity: 1, y: 0, duration: 0.42, ease: "power3.out" }, 1.55);
+      tl.to("#hook-slug", { opacity: 0, duration: 0.35 }, 6.95);
+      tl.to("#hook-line", { opacity: 0, duration: 0.35 }, 6.95);
+
+      /* --- Scene 2: the dashboard assembles, under VO 2 (7.64 → 14.24) --- */
+      tl.fromTo("#dash-inner", { opacity: 0 }, { opacity: 1, duration: 0.45, ease: "power2.out" }, 7.3);
+      tl.fromTo(
+        ["#graph-panel", "#log-panel"],
+        { opacity: 0, y: 22 },
+        { opacity: 1, y: 0, duration: 0.5, stagger: 0.08, ease: "power2.out" },
+        7.4,
+      );
+
+      /* Everything in the graph starts hidden; nothing here is a .clip. */
+      tl.set(nodeEls.map(function (n) { return n.g; }), { opacity: 0 }, 0);
+      tl.set(edgeEls.map(function (x) { return x.el; }), { opacity: 0 }, 0);
+      tl.set("#rep-card", { opacity: 0 }, 0);
+      tl.set("#strip-panel", { opacity: 0 }, 0);
+      tl.set("#chart-holder", { opacity: 0 }, 0);
+      tl.set("#tiers-holder", { opacity: 0 }, 0);
+      tl.set(eventEls, { opacity: 0, x: 18 }, 0);
+      tl.set("#cap-mesh", { opacity: 0 }, 0);
+      tl.set("#cap-human", { opacity: 0 }, 0);
+      tl.set("#cap-tiers", { opacity: 0 }, 0);
+
+      /* Peers arrive, one per beat. */ // beat-grid: 8.36, 8.92, 9.47, 10.03, 10.59, 11.15, 11.69, 12.25
+      for (var n = 0; n < 8; n++) {
+        tl.fromTo(
+          nodeEls[n].g,
+          { opacity: 0, scale: 0.4, svgOrigin: PEERS[n].x + " " + PEERS[n].y },
+          { opacity: 1, scale: 1, duration: 0.34, ease: "back.out(2)" },
+          ARRIVE[n],
+        );
+      }
+      for (var ed = 0; ed < edgeEls.length; ed++) {
+        if (edgeEls[ed].a === EPA || edgeEls[ed].b === EPA) continue;
+        tl.fromTo(edgeEls[ed].el, { opacity: 0 }, { opacity: 1, duration: 0.4, ease: "power1.out" }, edgeAppearTime(edgeEls[ed]));
+      }
+
+      /* Topbar readouts. */
+      var clockObj = { v: 0 };
+      var peersObj = { v: 0 };
+      var trustObj = { v: 0 };
+      var clockEl = document.getElementById("clock");
+      var peersEl = document.getElementById("stat-peers");
+      var trustEl = document.getElementById("stat-trust");
+
+      function writeClock() {
+        var mins = Math.floor(clockObj.v);
+        var secs = Math.floor((clockObj.v - mins) * 60);
+        clockEl.textContent = "T+" + mins + ":" + (secs < 10 ? "0" : "") + secs;
+      }
+      function writePeers() {
+        peersEl.textContent = String(Math.round(peersObj.v));
+      }
+      function writeTrust() {
+        trustEl.textContent = trustObj.v.toFixed(2);
+      }
+
+      tl.to(clockObj, { v: 7, duration: 22.5, ease: "none", onUpdate: writeClock }, 7.5);
+      tl.to(peersObj, { v: 8, duration: 3.83, ease: "none", onUpdate: writePeers }, ARRIVE[0]);
+      tl.to(trustObj, { v: 0.78, duration: 3.4, ease: "power1.out", onUpdate: writeTrust }, 8.4);
+
+      var phaseEl = document.getElementById("phase");
+      function setPhase(label) {
+        return function () {
+          phaseEl.textContent = label;
+        };
+      }
+      tl.call(setPhase("Formation"), [], 7.5);
+      tl.call(setPhase("Bootstrap"), [], 10.93);
+      tl.call(setPhase("Data sharing"), [], 13.11);
+      tl.call(setPhase("Compromise"), [], 15.84);
+      tl.call(setPhase("Detection"), [], 19.1);
+      tl.call(setPhase("Exclusion"), [], T_REP_START);
+      tl.call(setPhase("Integration"), [], T_EPA);
+
+      /* Event rows. */
+      for (var ev = 0; ev < EVENTS.length; ev++) {
+        tl.fromTo(eventEls[ev], { opacity: 0, x: 18 }, { opacity: 1, x: 0, duration: 0.34, ease: "power2.out" }, EVENTS[ev].t);
+      }
+
+      /* --- Scene 3: the divergence, under VO 3 (14.92 → 21.29) --- */
+      /* Caption on the VO-2 word onset "No policy server to call." (10.27s),
+         clear by 14.15 so the sensor strip comes up into empty space. */
+      tl.fromTo("#cap-mesh", { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.4, ease: "power2.out" }, 10.27);
+      tl.to("#cap-mesh", { opacity: 0, duration: 0.3 }, 13.85);
+
+      tl.fromTo("#strip-panel", { opacity: 0, y: 26 }, { opacity: 1, y: 0, duration: 0.42, ease: "power2.out" }, 14.2);
+      tl.fromTo("#chart-holder", { opacity: 0 }, { opacity: 1, duration: 0.25 }, 14.3);
+      tl.fromTo(legA, { strokeDasharray: 1, strokeDashoffset: 1 }, { strokeDashoffset: 0, duration: 1.3, ease: "none" }, 14.45);
+      /* beat-locked: strong cue 17.53s — the falsified trace peels away, landing
+         on "temperatures that don't match its neighbors". */
+      tl.fromTo(legB, { strokeDasharray: 1, strokeDashoffset: 1 }, { strokeDashoffset: 0, duration: 1.2, ease: "none" }, T_DIVERGE);
+      tl.fromTo(legB[2], { strokeWidth: 3 }, { strokeWidth: 4.5, duration: 0.5, ease: "power2.out" }, T_DIVERGE + 0.7);
+
+      /* --- Scene 4: the exclusion, under VO 4 (21.95 → 27.86) --- */
+      tl.to("#chart-holder", { opacity: 0, duration: 0.3, ease: "power1.in" }, 21.3);
+      tl.to("#strip-panel", { opacity: 0, duration: 0.35, ease: "power1.in" }, 21.4);
+
+      /* Spotlight the compromised peer: everything else on the graph recedes, it
+         does not. epa-monitor-1 is skipped for the same reason as its edges — it
+         is still unarrived, and dimming it to 0.3 (then restoring it to 1 at
+         26.2) would put it on screen from 21.84 until its own entrance. */
+      var otherNodes = [];
+      for (var on = 0; on < nodeEls.length; on++) {
+        if (on !== COMPROMISED && on !== EPA) otherNodes.push(nodeEls[on].g);
+      }
+      tl.to(otherNodes, { opacity: 0.3, duration: 0.7, ease: "power2.inOut" }, 21.84);
+      tl.to(survivingEdges, { opacity: 0.22, duration: 0.7, ease: "power2.inOut" }, 21.84);
+      tl.to(
+        nodeEls[COMPROMISED].g,
+        { scale: 1.3, svgOrigin: "350 480", duration: 0.9, ease: "power2.out" },
+        21.84,
+      );
+
+      tl.fromTo("#rep-card", { opacity: 0, y: 14 }, { opacity: 1, y: 0, duration: 0.35, ease: "power2.out" }, 22.37);
+
+      /* The count is tuned so power2.in carries 0.82 past Threshold 0.35 exactly
+         on the strong cue at 24.56 — which is also where the voice says
+         "falls through the threshold". */
+      var repObj = { v: 0.82 };
+      var repEl = document.getElementById("rep-value");
+      tl.to(
+        repObj,
+        {
+          v: 0.11,
+          duration: T_REP_DUR,
+          ease: "power2.in",
+          onUpdate: function () {
+            repEl.textContent = repObj.v.toFixed(2);
+          },
+        },
+        T_REP_START,
+      );
+      tl.to("#rep-value", { color: "#fbbf24", duration: 0.3 }, 23.7);
+      /* beat-locked: strong cue 24.47s — threshold crossed, edges go hostile */
+      tl.to("#rep-value", { color: "#ef4444", duration: 0.3 }, T_CROSS);
+      tl.to(doomedEdges, { stroke: "#ef4444", strokeWidth: 3, duration: 0.35, ease: "power2.out" }, T_CROSS);
+      tl.to(nodeEls[COMPROMISED].dot, { attr: { fill: "#ef4444", stroke: "#fca5a5", "stroke-width": 4 }, duration: 0.35 }, T_CROSS);
+      tl.to(nodeEls[COMPROMISED].label, { attr: { fill: "#fca5a5" }, duration: 0.35 }, T_CROSS);
+
+      /* Gone. */
+      /* beat-grid 25.59s — lands on "the network drops it" */
+      tl.to(doomedEdges, { opacity: 0, duration: 0.35, ease: "power2.in" }, T_VANISH);
+      tl.to(nodeEls[COMPROMISED].g, { opacity: 0, scale: 0.55, svgOrigin: "350 480", duration: 0.4, ease: "power2.in" }, T_VANISH);
+      tl.to("#rep-card", { opacity: 0, duration: 0.3 }, T_VANISH);
+      tl.to(peersObj, { v: 7, duration: 0.3, ease: "none", onUpdate: writePeers }, T_VANISH);
+      tl.to(trustObj, { v: 0.86, duration: 0.9, ease: "power1.out", onUpdate: writeTrust }, T_VANISH + 0.15);
+
+      /* Mesh comes back up while the voice finishes "That is the whole claim." */
+      tl.to(otherNodes, { opacity: 1, duration: 0.9, ease: "power2.inOut" }, 26.2);
+      tl.to(survivingEdges, { opacity: 1, duration: 0.9, ease: "power2.inOut" }, 26.2);
+
+      /* --- Scene 5: the re-entry, under VO 5 (28.50 → 31.78) --- */
+      tl.fromTo(
+        nodeEls[EPA].g,
+        { opacity: 0, scale: 0.4, svgOrigin: PEERS[EPA].x + " " + PEERS[EPA].y },
+        { opacity: 1, scale: 1, duration: 0.36, ease: "back.out(2)" },
+        T_EPA,
+      );
+      for (var ee = 0; ee < edgeEls.length; ee++) {
+        if (edgeEls[ee].a !== EPA && edgeEls[ee].b !== EPA) continue;
+        tl.fromTo(edgeEls[ee].el, { opacity: 0 }, { opacity: 1, duration: 0.4 }, T_EPA + 0.18);
+      }
+      tl.to(peersObj, { v: 8, duration: 0.3, ease: "none", onUpdate: writePeers }, T_EPA);
+      /* Mean trust dips: the new peer starts at zero, like everyone else — which
+         is exactly what the voice is saying over this beat. */
+      tl.to(trustObj, { v: 0.79, duration: 0.6, ease: "power1.out", onUpdate: writeTrust }, T_EPA + 0.1);
+
+      /* --- Scene 6: the access gradient, under VO 6 (32.40 → 37.18) --- */
+      tl.call(function () {
+        document.getElementById("strip-header").innerHTML =
+          'Access gradient <span class="panel-sub">— capability by trust tier</span>';
+      }, [], 32.05);
+      tl.fromTo("#strip-panel", { opacity: 0, y: 26 }, { opacity: 1, y: 0, duration: 0.4, ease: "power2.out" }, 32.19);
+      tl.to(["#graph-panel", "#log-panel"], { opacity: 0.35, duration: 0.6, ease: "power2.inOut" }, 32.19);
+      tl.fromTo("#tiers-holder", { opacity: 0 }, { opacity: 1, duration: 0.2 }, 32.3);
+
+      var TIER_TINT = ["#1e2940", "#22303f", "#24413a", "#1f4a35"];
+      var TIER_EDGE = ["#334155", "#3f5163", "#2f6b4d", "#2ca02c"];
+      for (var t = 0; t < 4; t++) {
+        /* beat-grid: tier cards on alternating beats, ~1.09s apart — over the
+           ~0.8s reading floor for a two-word label. */
+        tl.fromTo(
+          "#tier-" + (t + 1),
+          { opacity: 0, y: 26 },
+          { opacity: 1, y: 0, duration: 0.38, ease: "power2.out" },
+          T_TIER[t],
+        );
+        tl.fromTo(
+          "#tier-" + (t + 1),
+          { backgroundColor: "#1e2940", borderColor: "#1f2a44" },
+          { backgroundColor: TIER_TINT[t], borderColor: TIER_EDGE[t], duration: 0.5, ease: "power1.out" },
+          T_TIER[t] + 0.1,
+        );
+      }
+
+      /* Caption on the VO-4 word onset "No operator approved that." (26.31s),
+         clear by 28.35, just inside scene 4. */
+      tl.fromTo("#cap-human", { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.4, ease: "power2.out" }, 26.31);
+      tl.to("#cap-human", { opacity: 0, duration: 0.3 }, 28.05);
+
+      /* Caption on the VO-6 word onset "It is a dial re-earned continuously."
+         (34.83s), clear by 37.55 before the dashboard dims for the lockup. */
+      tl.fromTo("#cap-tiers", { opacity: 0, y: 14 }, { opacity: 1, y: 0, duration: 0.35, ease: "power2.out" }, 34.83);
+      tl.to("#cap-tiers", { opacity: 0, duration: 0.3 }, 37.25);
+
+      /* --- Scene 7: lockup, under VO 7 (37.90 → 42.86) --- */
+      tl.to("#dash-inner", { opacity: 0.22, duration: 0.55, ease: "power2.inOut" }, 37.64);
+      /* beat-grid 38.36s */
+      tl.fromTo("#wordmark", { opacity: 0, y: 26 }, { opacity: 1, y: 0, duration: 0.45, ease: "power3.out" }, T_WORDMARK);
+      /* beat-grid 40.59s — the tagline the voice deliberately never says */
+      tl.fromTo("#wordmark-sub", { opacity: 0, y: 16 }, { opacity: 1, y: 0, duration: 0.4, ease: "power2.out" }, T_WORDSUB);
+      /* beat-grid 41.70s — attribution settles last and stays up to T_END. */
+      tl.fromTo("#music-credit", { opacity: 0 }, { opacity: 1, duration: 0.5, ease: "power2.out" }, T_CREDIT);
+
+      /* ------------------------------------------------------------------
+         Music: narration-led ducking, generated from the VO table above so the
+         bed can never drift out of sync with the measured clips.
+
+         0.30 in the gaps · 0.13 under every voice span · 0.10 through the
+         exclusion, recovering only to 0.22 afterward · fade out under the last
+         line. Nothing here editorializes: no risers, no swells.
+         ------------------------------------------------------------------ */
+      var BED_OPEN = 0.3;
+      var BED_DUCK = 0.13;
+      var LEAD = 0.2; /* duck slightly ahead of the word */
+
+      /* Bed enters very low under the hook so the voice is the first thing you
+         notice, and never lifts before VO 1 is done. */
+      tl.fromTo("#bgm", { volume: 0.1 }, { volume: BED_DUCK, duration: 1.0, ease: "power1.inOut" }, 0);
+
+      for (var vi = 0; vi < VO.length; vi++) {
+        var cur = VO[vi];
+        var ends = cur.start + cur.dur;
+        var isExclusion = cur.id === "#vo-4";
+        var isLast = vi === VO.length - 1;
+
+        /* Duck into the line. VO 1 is already ducked by the entry tween. */
+        if (vi > 0) {
+          tl.to("#bgm", { volume: isExclusion ? 0.1 : BED_DUCK, duration: 0.35, ease: "power1.inOut" }, cur.start - LEAD);
+        }
+
+        /* Open back up in the gap — except after the last line, which fades. */
+        if (!isLast) {
+          /* After the exclusion the bed recovers only part-way: the network just
+             dropped a peer, and nothing about that is a celebration. */
+          var back = isExclusion ? 0.22 : BED_OPEN;
+          tl.to("#bgm", { volume: back, duration: 0.45, ease: "power1.inOut" }, ends + cur.gapAfter);
+        }
+      }
+
+      tl.to("#bgm", { volume: 0, duration: 1.1, ease: "power1.in" }, T_END - 1.1);
+
+      /* ------------------------------------------------------------------
+         Audio-reactive layer. Deliberately small, and smaller here than in the
+         silent cut: bass energy breathes the mesh's edge presence and the node
+         halo. No bars, no spectrum, no pulsing type — nothing that competes
+         with speech.
+         ------------------------------------------------------------------ */
+      var AD = window.AUDIO_DATA;
+      if (AD && AD.frames && AD.frames.length) {
+        var edgeNodes = edgeEls.map(function (x) {
+          return x.el;
+        });
+        var dotNodes = nodeEls.map(function (x) {
+          return x.dot;
+        });
+
+        var applyBands = function (bands) {
+          var bass = bands[0];
+          var low = bands[1];
+          var halo = 2 + bass * 4;
+          for (var q = 0; q < edgeNodes.length; q++) {
+            edgeNodes[q].style.strokeOpacity = String(0.6 + low * 0.28);
+          }
+          for (var r = 0; r < dotNodes.length; r++) {
+            dotNodes[r].style.filter = "drop-shadow(0 0 " + halo.toFixed(1) + "px rgba(96,165,250,0.45))";
+          }
+        };
+
+        var maxFrame = Math.min(AD.frames.length, Math.ceil(T_END * AD.fps));
+        for (var f = 0; f < maxFrame; f++) {
+          tl.call(
+            (function (bands) {
+              return function () {
+                applyBands(bands);
+              };
+            })(AD.frames[f].bands),
+            [],
+            f / AD.fps,
+          );
+        }
+      }
+
+      window.__timelines["main"] = tl;
+      tl.seek(0);
+    </script>
+  </body>
+</html>
