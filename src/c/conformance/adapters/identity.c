@@ -3182,6 +3182,39 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                         return -1;
                     }
                 }
+            } else if (strcmp(key, "peer_proximity") == 0) {
+                /* {peer_id: <int band>} (Phase 2) — the coarse distance BAND
+                 * this participant last learned toward another CONNECTED
+                 * peer, via identity_get_peer_proximity: unknown=0, near=1,
+                 * mid=2, far=3. 0 is the ordinary default (never probed,
+                 * opted out, or the probe refused). No coordinates cross the
+                 * wire; the corpus pins the band the keyed-tag intersection
+                 * yields. Mirrors the Python adapter's peer_proximity check,
+                 * which is what id_proc_priv.h's comment on the getter has
+                 * always promised. */
+                const char *px_pid;
+                json_t *px_want;
+                json_object_foreach(val, px_pid, px_want) {
+                    sce_participant_t *other = sce_find_participant(ctx, px_pid);
+                    if (other == NULL) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: peer_proximity names unknown participant %s",
+                                 pid, px_pid);
+                        return -1;
+                    }
+                    const public_identity_t *want_id =
+                        ((ic_impl_t *)other->impl)->pub;
+                    char want_uuid[UUID_STR_LEN + 1];
+                    uuid_unparse_lower(want_id->uuid, want_uuid);
+                    int got_band = identity_get_peer_proximity(want_uuid);
+                    int want_band = (int)json_integer_value(px_want);
+                    if (got_band != want_band) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: peer_proximity[%s]=%d, expected %d",
+                                 pid, px_pid, got_band, want_band);
+                        return -1;
+                    }
+                }
             } else if (strcmp(key, "connection_state") == 0) {
                 /* {peer_id: <int>} (Increment 5) — the connection edge state
                  * this participant holds toward another, via

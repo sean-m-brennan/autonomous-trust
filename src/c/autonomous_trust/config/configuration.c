@@ -422,7 +422,14 @@ int load_all_configs(char *cfg_dir, map_t *configs, logger_t *logger)
         config_t *config;
         char cfg_name[CFG_NAME_SIZE + 1] = {0};
         if (load_config(filepath, &config, cfg_name, logger) < 0)
+        {
+            /* An unknown section is skipped, exactly as Python's lenient
+             * load_configs does (see the note below); a PARSE failure is
+             * still fatal, because that file was ours and it is broken. */
+            if (_exception.errnum == ECFG_NOIMPL)
+                continue;
             return -1;
+        }
 
         for (int j = 0; j < num_req_cfgs; j++)
         {
@@ -504,8 +511,24 @@ int load_config(char *filepath, config_t **config_ptr, char *cfg_name, logger_t 
     config_t *config = *config_ptr;
     if (config == NULL)
     {
-        log_error(logger, "No config for %s\n", cfg_name);
-        return -1;
+        /* Nothing registered under this name. That is not necessarily an
+         * error: a file in the config directory may belong to a subsystem
+         * that keeps its own state OUTSIDE the registry — reputation.cfg.json
+         * is exactly that (rep_proc.c reads and writes it directly, carrying
+         * Python's __type__ tag so either runtime can resume from it), and so
+         * are the freshness-*.cfg.json files.
+         *
+         * Reported as ECFG_NOIMPL rather than a bare -1 so load_all_configs
+         * can tell "I do not know this section" from "this file is broken".
+         * Before 2026-09-21 it could not, and the consequence was severe: the
+         * FIRST thing the reputation process does on shutdown is write its
+         * snapshot, so every node that had ever run reputation refused to
+         * start again — "No config for reputation", and the daemon exited
+         * 17 ms in. No cohort ever caught it because a cohort makes fresh
+         * nodes and never restarts one. */
+        log_warn(logger, "No registered config section for %s; "
+                         "leaving the file to whoever owns it\n", cfg_name);
+        return EXCEPTION(ECFG_NOIMPL);
     }
     config->data_struct = smrt_create(config->data_len);
     if (config->data_struct == NULL)

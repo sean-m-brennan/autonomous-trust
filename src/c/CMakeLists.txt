@@ -1140,6 +1140,14 @@ add_executable(rep_quorum_test test/rep_quorum_test.c)
 set_source_files_properties(test/rep_quorum_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(rep_quorum_test PRIVATE ${AT_TEST_LIBS})
 
+add_executable(rep_paxos_round_test test/rep_paxos_round_test.c)
+set_source_files_properties(test/rep_paxos_round_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_paxos_round_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(social_send_test test/social_send_test.c)
+set_source_files_properties(test/social_send_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(social_send_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(rep_resp_shape_test test/rep_resp_shape_test.c)
 set_source_files_properties(test/rep_resp_shape_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(rep_resp_shape_test PRIVATE ${AT_TEST_LIBS})
@@ -1278,6 +1286,8 @@ if(AT_SOCIAL)
 endif() # AT_SOCIAL
 add_test(NAME identity_resync_test COMMAND $<TARGET_FILE:identity_resync_test>)
 add_test(NAME rep_quorum_test COMMAND $<TARGET_FILE:rep_quorum_test>)
+add_test(NAME rep_paxos_round_test COMMAND $<TARGET_FILE:rep_paxos_round_test>)
+add_test(NAME social_send_test COMMAND $<TARGET_FILE:social_send_test>)
 add_test(NAME rep_resp_shape_test COMMAND $<TARGET_FILE:rep_resp_shape_test>)
 add_test(NAME rep_warmstart_test COMMAND $<TARGET_FILE:rep_warmstart_test>)
 add_test(NAME rep_resolve_test COMMAND $<TARGET_FILE:rep_resolve_test>)
