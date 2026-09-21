@@ -1,0 +1,72 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: business-post-dedup
+byte_pinning: false
+description: |
+    CONTENT-ID DEDUP (Phase 3 P3.4) — what makes gossip converge instead of
+    echoing. A post is relayed, so the same post reaches a node by more than
+    one path as a matter of course; the blake2b content address of the
+    canonical form is the merge key, and the second copy is dropped before it
+    is recorded or relayed again.
+
+    The two posts here are byte-identical, so they share a content id. The
+    assertion is business_posts_emitted: 1 — newcomer relays the FIRST and says
+    nothing about the second. Without the dedup ring, two copies in would mean
+    two copies out, and a three-node group would talk forever.
+
+    Steps 1-2: the ad, then the post.
+    Step 3: the SAME post again.
+      - Both runtimes: the repeat is dropped; exactly one relay leaves.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_business_ad
+    payload:
+      polity: "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"
+      sat: 255
+      seq: 1
+      ts: 0
+      bundle: '{"page":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ","name":"Corner Cafe","locality":"9q8yyk8y"},"sig":"stub"},"delegation":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"},"sig":"stub"}}'
+    description: |
+        The ad that teaches newcomer the page.
+  - id: 2
+    from: bg
+    to: newcomer
+    function: peer_business_post
+    payload:
+      polity: "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"
+      seq: 1
+      ts: 0
+      hops: 0
+      bundle: '{"post":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ","body":"Fresh croissants at seven.","seq":1},"sig":"stub"},"delegation":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"},"sig":"stub"}}'
+    description: |
+        The post; accepted and relayed once.
+  - id: 3
+    from: bg
+    to: newcomer
+    function: peer_business_post
+    payload:
+      polity: "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"
+      seq: 1
+      ts: 0
+      hops: 0
+      bundle: '{"post":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ","body":"Fresh croissants at seven.","seq":1},"sig":"stub"},"delegation":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"},"sig":"stub"}}'
+    description: |
+        The identical post again — same canonical, same content id, dropped.
+
+expected_state:
+  newcomer:
+    business_post_last:
+      "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ":
+        seq: 1
+        hops: 0
+    business_posts_emitted: 1

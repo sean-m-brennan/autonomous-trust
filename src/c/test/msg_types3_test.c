@@ -205,7 +205,58 @@ DEFINE_TEST(test_repeated_unpack_does_not_grow_without_bound)
     free(buf);
 }
 
+/* THE SIGNATURE VERDICT MUST SURVIVE THE IPC HOP.
+ *
+ * net_proc verifies a frame's Ed25519 signature and writes the answer into
+ * net_msg_t; every handler that ACTS on it — the group-key rotation gate, the
+ * hierarchy gate — runs in another process, on the far side of this
+ * serializer. It did not carry `verified` or `has_signature`, so those
+ * handlers read false for every message ever sent, and the gates could never
+ * open. Measured cost before this test existed: 107 group-key rotations minted
+ * across 25 live-cohort runs, zero adopted, and cohorts that forked
+ * permanently the moment two members rotated at once.
+ *
+ * Asserted in BOTH states. Only checking `true` would pass against a
+ * serializer that hardcoded it, which would be a worse bug than the one this
+ * replaces — an unsigned frame would arrive looking verified. */
+DEFINE_TEST(test_net_msg_proto_carries_the_signature_verdict)
+{
+    ck_assert(sodium_init() >= 0);
+
+    for (int verdict = 0; verdict <= 1; verdict++) {
+        net_msg_t original = {0};
+        strncpy(original.process, "identity", PROC_NAME_LEN);
+        original.function = (char *)"group_key_update";
+        original.encrypt = true;
+        original.verified = (verdict == 1);
+        original.has_signature = (verdict == 1);
+        uuid_generate(original.from_whom.uuid);
+        strncpy(original.from_whom.nickname, "Alice", NAME_LEN);
+
+        json_t *payload = json_object();
+        json_object_set_new(payload, "key_epoch", json_integer(2));
+        ck_assert_ret_ok(net_msg_pack_json(&original, payload));
+        json_decref(payload);
+
+        void *data = NULL;
+        size_t data_len = 0;
+        ck_assert_ret_ok(net_msg_to_proto(&original, &data, &data_len));
+
+        net_msg_t restored = {0};
+        ck_assert_ret_ok(proto_to_net_msg(data, data_len, &restored));
+        ck_assert_int_eq((int)restored.verified, verdict);
+        ck_assert_int_eq((int)restored.has_signature, verdict);
+
+        smrt_deref(data);
+        smrt_deref(original.obj);
+        if (restored.function)
+            smrt_deref(restored.function);
+        smrt_deref(restored.obj);
+    }
+}
+
 RUN_TESTS(MsgTypes3, test_net_msg_pack_unpack_json, test_net_msg_pack_null_json,
+          test_net_msg_proto_carries_the_signature_verdict,
           test_net_msg_proto_roundtrip, test_net_msg_proto_no_payload,
           test_short_fixed_payload_is_rejected,
           test_empty_fixed_payload_is_rejected,
