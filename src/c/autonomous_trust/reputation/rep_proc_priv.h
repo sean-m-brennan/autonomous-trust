@@ -36,6 +36,35 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
  *  reputation_run still calls this internally on entry. */
 int reputation_register_handlers(process_t *proc);
 
+/** Start a Paxos round for one locally-observed score: file the pending
+ *  round in my_requests and broadcast Phase 1a ("ask permission") to every
+ *  peer. THE production proposer path — reputation_run's loop calls it for
+ *  every TRANSACTION_SCORE that arrives over IPC.
+ *
+ *  Declared here so a test can drive the real proposer rather than staging
+ *  my_requests by hand. That distinction is not academic: every existing
+ *  test staged the pending round through reputation_install_my_request, so
+ *  the key this function files under and the key handle_grant looks up by
+ *  were free to disagree — and did, from the time the round key was
+ *  introduced until 2026-09-21, which meant no live round ever committed.
+ *
+ *  @p peer_uuid is the PROPOSER (us), echoed on the wire as "peer_uuid";
+ *  @p subject_uuid is who the score is about, and may be zeroed for a
+ *  fan-out that names no single peer. */
+void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
+                          const uuid_t peer_uuid, double score,
+                          const char *capability_name, const char *channel,
+                          const uuid_t subject_uuid, double competence);
+
+/** Re-propose every round of ours whose nack backoff expired at or before
+ *  @p present. Called once per pass from reputation_run's loop; @p present is
+ *  a parameter rather than a time(NULL) inside so a test can advance the
+ *  clock instead of sleeping out a real backoff.
+ *
+ *  Exposed for that reason alone. Production has exactly one caller. */
+void _retry_nacked_rounds(const process_t *proc, double present,
+                          const uuid_t self_uuid, bool have_self);
+
 /** Toggle synchronous-dispatch mode for the conformance harness.
  *  When enabled, handle_nack emits a retry "ask permission" inline to
  *  broadcast (Python parity — Python's _try_again thread is inlined

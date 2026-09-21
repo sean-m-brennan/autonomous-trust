@@ -231,4 +231,11 @@ int negotiation_payload_roundtrip(const char *verb, const char *in_json,
 #define ENEG_NOPEERS 243
 DECLARE_ERROR(ENEG_NOPEERS, "No capable peers available");
 
+
+/** Seconds since the epoch for a task's datetime_t, honouring its recorded
+ *  offset. Exposed for testing: the conversion MUST NOT go through mktime,
+ *  which applies the host's timezone to what is a UTC struct. See
+ *  test_task_start_epoch_ignores_the_host_timezone. */
+time_t negotiation_dt_epoch(const datetime_t *dt);
+
 #endif  /* NEG_PROC_PRIV_H */
