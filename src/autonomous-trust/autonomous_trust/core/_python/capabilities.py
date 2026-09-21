@@ -495,6 +495,114 @@ def business_ad_verify(verify_key: '_VerifyKey', advertiser_uuid,
         return False
 
 
+# --- business posts (Phase 3 P3.4, "the polity speaking, in the feed") ------ #
+# A page is what the business IS; a post is what it SAYS. The post carries an
+# opaque, SELF-VERIFYING Ethne {post,delegation} bundle — the ENVOY's signature
+# over the body, plus the polity-root-signed delegation that proves the signer
+# is the envoy — together with the signed statement of whoever put those bytes
+# on the wire.
+#
+# THE STRUCTURAL DIFFERENCE FROM AN AD: a post IS relayed, and so carries a hop
+# count, because its authority comes from inside the bundle rather than from who
+# passed it along. Nobody can launder a post by relaying it, and nobody can
+# alter a word of one without breaking two signatures at once. An ad, being a
+# first-person recommendation, is re-advertised instead and has no hops.
+#
+# HOPS ARE NOT IN THE CANONICAL, exactly as for a feed post: a relay increments
+# them, and signing over them would invalidate the signature at the first
+# forward. MUST stay byte-identical to C identity/business_post.c
+# (at_business_post_canonical / at_business_post_content_id).
+
+# Opaque Ethne {post,delegation} bundle bound (bytes). LARGER than the page
+# bundle's 3072 because the body rides inside it; MEASURED worst case 3550 (see
+# ethne_ffi's the_worst_case_post_bundle_fits_the_wire_bound). MUST match C
+# AT_BUSINESS_POST_BUNDLE_MAX / AT_BUSINESS_POST_BUNDLE_LEN /
+# AT_APP_BUSINESS_POST_BUNDLE_LEN.
+BUSINESS_POST_BUNDLE_MAX = 4096
+# Post content id length (blake2b-256 lowercase hex). MUST match C
+# AT_BUSINESS_POST_ID_HEX_LEN / AT_BUSINESS_POST_ID_LEN.
+BUSINESS_POST_ID_HEX_LEN = 64
+# Relay bound. A business post travels the same "active network + one hop" the
+# feed does — how far anything travels on this channel is not a statement about
+# who said it. MUST match C POST_MAX_HOPS.
+BUSINESS_POST_MAX_HOPS = POST_MAX_HOPS
+
+
+def bound_business_post_bundle(text: str) -> str:
+    """Truncate an Ethne post bundle to BUSINESS_POST_BUNDLE_MAX UTF-8 bytes.
+    Twin of C at_business_post_bound_bundle."""
+    if not isinstance(text, str):
+        return ''
+    return _clamp_bytes(text, BUSINESS_POST_BUNDLE_MAX)
+
+
+def business_post_canonical(author_uuid, polity_did: str, seq: int, ts: float,
+                            bundle: str) -> bytes:
+    """THE cross-language signing/hash contract (see C identity/business_post.h):
+      author_uuid[16] || u32le(did_len) || did || u64le(seq) || f64le(ts)
+      || u32le(bundle_len) || utf8_bundle
+    where ts is the raw IEEE-754 little-endian double (struct '<d'). NO HOP
+    BYTE — see the section note. The did and bundle are bound-truncated first,
+    so the canonical matches what crosses the wire. MUST stay byte-identical to
+    C at_business_post_canonical."""
+    out = bytearray(_uuid16(author_uuid))
+    d = bound_business_did(polity_did).encode('utf-8')
+    out += _u32le(len(d))
+    out += d
+    out += int(seq).to_bytes(8, 'little')
+    out += _struct.pack('<d', float(ts))
+    b = bound_business_post_bundle(bundle).encode('utf-8')
+    out += _u32le(len(b))
+    out += b
+    return bytes(out)
+
+
+def business_post_id(author_uuid, polity_did: str, seq: int, ts: float,
+                     bundle: str) -> str:
+    """blake2b-256 of the canonical bytes, lowercase hex
+    (BUSINESS_POST_ID_HEX_LEN chars) — the dedup key that makes gossip converge
+    instead of echoing, and what forecloses replay. Twin of C
+    at_business_post_content_id."""
+    import hashlib
+    return hashlib.blake2b(
+        business_post_canonical(author_uuid, polity_did, seq, ts, bundle),
+        digest_size=32).hexdigest()
+
+
+def business_post_sign(signing_key: '_SigningKey', author_uuid,
+                       polity_did: str, seq: int, ts: float,
+                       bundle: str) -> str:
+    """Detached Ed25519 signature over business_post_canonical, lowercase hex.
+    This signs WHO SENT THIS COPY, not who may speak for the business — a relay
+    re-signs what it forwards, and the envoy signature inside the bundle is
+    untouched by either of them."""
+    sig = signing_key.sign(
+        business_post_canonical(author_uuid, polity_did, seq, ts,
+                                bundle)).signature
+    return sig.hex()
+
+
+def business_post_verify(verify_key: '_VerifyKey', author_uuid,
+                         polity_did: str, seq: int, ts: float, bundle: str,
+                         sig_hex: str) -> bool:
+    """Verify a detached signature (lowercase hex) over
+    business_post_canonical."""
+    try:
+        sig = bytes.fromhex(sig_hex)
+    except (ValueError, TypeError):
+        return False
+    if len(sig) != 64:
+        return False
+    from nacl.exceptions import BadSignatureError
+    try:
+        verify_key.verify(
+            business_post_canonical(author_uuid, polity_did, seq, ts, bundle),
+            sig)
+        return True
+    except BadSignatureError:
+        return False
+
+
 # --- detached co-signing (Phase 3 P3.3) ------------------------------------- #
 # A staff roll act — admitting, expelling, designating a machine, moving or
 # releasing its guardian — is decided by several people who are not at the same

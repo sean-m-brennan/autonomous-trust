@@ -64,6 +64,7 @@ typedef enum {
     PEER_BUSINESS_AD_OBSERVED, /**< Identity → app: a signed business ad — one opaque Ethne page bundle plus the advertiser's satisfaction (Phase 3 P3.2, @ref peer_business_ad_msg_t). Local IPC only. Signature-verified and content-id-deduped before emit; the BUNDLE is verified app-side, never by the core. */
     PEER_COSIGN_REQUEST_OBSERVED, /**< Identity → app: a peer asks this node to co-sign a staff-roll or guardianship record (Phase 3 P3.3, @ref peer_cosign_request_msg_t). Local IPC only. The core shape-checks the ask and carries the exported bytes; it holds no Ethne, so it verifies nothing about WHAT is being signed — and it never carries the wording, which the signer's own node derives from the bytes. */
     PEER_COSIGN_SIG_OBSERVED, /**< Identity → app: a signer returns their detached signature over an exchange this node is authoring (Phase 3 P3.3, @ref peer_cosign_sig_msg_t). Local IPC only. The signature is checked against the payload by the ASSEMBLING node, not by the core. */
+    PEER_BUSINESS_POST_OBSERVED, /**< Identity → app: a signed business post — one opaque Ethne {post,delegation} bundle the ENVOY signed — received over the group channel (Phase 3 P3.4, @ref peer_business_post_msg_t). Local IPC only. Signature-verified, GATED on this node holding the polity's page, and content-id-deduped before emit; the BUNDLE is verified app-side, never by the core. APPENDED HERE, not filed beside PEER_BUSINESS_AD_OBSERVED, because these values are serialized: inserting one renumbers every type after it. */
 #endif /* AT_SOCIAL_ENABLED */
 #ifdef AT_ZTA_ENABLED
     ZTA_REVOCATION_ALERT,    /**< Peer credential revocation notice. */
@@ -495,6 +496,56 @@ typedef struct {
     char    bundle[AT_BUSINESS_BUNDLE_LEN + 1];
 } peer_business_ad_msg_t;
 
+/* Max bytes of the opaque Ethne {post,delegation} bundle carried across the
+ * AT->app boundary (Phase 3 P3.4). LARGER than the page bundle's 3072 because
+ * the body rides inside it: the measured worst case is 3550 bytes (see
+ * identity/business_post.h). Still under AT_COSIGN_BYTES_LEN, so the
+ * generic_msg_t and at_app_event_t unions do not widen. MUST match
+ * AT_BUSINESS_POST_BUNDLE_MAX in identity/business_post.h,
+ * AT_APP_BUSINESS_POST_BUNDLE_LEN in app_events.h, and
+ * AGORA_BUSINESS_POST_BUNDLE_MAX in the shim / cohort ctypes. */
+#define AT_BUSINESS_POST_BUNDLE_LEN 4096
+/* Post content id: blake2b-256 digest as lowercase hex (32 bytes -> 64 chars).
+ * MUST match AT_BUSINESS_POST_ID_HEX_LEN in identity/business_post.h,
+ * AT_APP_BUSINESS_POST_ID_LEN in app_events.h, and AGORA_BUSINESS_POST_ID_MAX
+ * in the shim / cohort ctypes. */
+#define AT_BUSINESS_POST_ID_LEN 64
+
+/**
+ * @brief AT → app: one signed business post received over the group channel
+ * (Phase 3 P3.4, "business posts in the feed").
+ *
+ * @c peer_uuid is the node that PUBLISHED these bytes — bound by the Ed25519
+ * signature the core verified before emitting, and always the original, since
+ * a relay forwards the envelope untouched and changes only @c hops. It is NOT
+ * the authority behind the post: that is the envoy signature inside @c bundle,
+ * and only the app can check it. Nobody can alter a word without breaking both
+ * signatures at once.
+ *
+ * @c polity is the business's Ethne DID (and the key the page-cache gate was
+ * answered with), @c seq the business's own post sequence, @c ts the sender's
+ * time, @c hops how far this copy has travelled. @c post_id is the blake2b
+ * content-address of the canonical form — the dedup key that makes gossip
+ * converge.
+ *
+ * @c bundle is the OPAQUE, self-verifying Ethne post artifact
+ * ({post,delegation} proving polity-root → envoy → post). The core never parses
+ * it; the APP verifies it. Local IPC only; the on-wire form is the
+ * group-encrypted peer_business_post verb, not this message.
+ */
+typedef struct {
+    uuid_t  peer_uuid;   /**< The PUBLISHER (signature-bound), not the authority, and never a relay. */
+    /** NUL-terminated polity DID — the business whose words these are. */
+    char    polity[AT_BUSINESS_DID_LEN + 1];
+    /** NUL-terminated blake2b post content id (lowercase hex). */
+    char    post_id[AT_BUSINESS_POST_ID_LEN + 1];
+    int64_t seq;         /**< The business's own post sequence. */
+    double  ts;          /**< The sender's time (epoch seconds). */
+    int32_t hops;        /**< How far this copy has travelled (0 = from the business). */
+    /** NUL-terminated opaque Ethne bundle, bound-truncated to AT_BUSINESS_POST_BUNDLE_LEN. */
+    char    bundle[AT_BUSINESS_POST_BUNDLE_LEN + 1];
+} peer_business_post_msg_t;
+
 /* Max hex characters of a detached exchange's exported canonical bytes (Phase 3
  * P3.3). MUST match AT_COSIGN_BYTES_MAX in identity/cosign.h,
  * AT_APP_COSIGN_BYTES_LEN in app_events.h, COSIGN_BYTES_HEX_MAX in the agora
@@ -682,6 +733,7 @@ typedef struct
         peer_business_ad_msg_t peer_business_ad;
         peer_cosign_request_msg_t peer_cosign_request;
         peer_cosign_sig_msg_t peer_cosign_sig;
+        peer_business_post_msg_t peer_business_post;
 #endif /* AT_SOCIAL_ENABLED */
 #ifdef AT_ZTA_ENABLED
         zta_event_msg_t zta_event;

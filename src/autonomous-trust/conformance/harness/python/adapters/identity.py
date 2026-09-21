@@ -534,6 +534,51 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: business_ads_emitted={actual}, '
                         f'expected {int(expected)}')
+            elif key == 'business_post_last':
+                # {polity_did: {seq, hops, bundle}} (Phase 3 P3.4) -- the most
+                # recent business post this participant ACCEPTED for that
+                # polity, via get_last_business_post. Filled only AFTER the
+                # signature check, THE PAGE GATE and dedup, so an expected {}
+                # is the assertion that one of those three refused it. Keyed by
+                # the POLITY, never the sender: the post is the business's and
+                # the carrier is incidental. C mirrors via
+                # identity_get_last_business_post keyed by the same did.
+                for did, want in expected.items():
+                    actual = self.process.get_last_business_post(did)
+                    if not want:
+                        if actual:
+                            raise AssertionError(
+                                f'{self.id}: business_post_last[{did!r}]='
+                                f'{actual!r}, expected none')
+                        continue
+                    if not actual:
+                        raise AssertionError(
+                            f'{self.id}: business_post_last[{did!r}] missing, '
+                            f'expected {want!r}')
+                    if 'seq' in want and int(actual.get('seq', -1)) != int(want['seq']):
+                        raise AssertionError(
+                            f'{self.id}: business_post_last[{did!r}].seq='
+                            f'{actual.get("seq")}, expected {want["seq"]}')
+                    if 'hops' in want and int(actual.get('hops', -1)) != int(want['hops']):
+                        raise AssertionError(
+                            f'{self.id}: business_post_last[{did!r}].hops='
+                            f'{actual.get("hops")}, expected {want["hops"]}')
+                    if 'bundle' in want and actual.get('bundle') != want['bundle']:
+                        raise AssertionError(
+                            f'{self.id}: business_post_last[{did!r}].bundle='
+                            f'{actual.get("bundle")!r}, expected '
+                            f'{want["bundle"]!r}')
+            elif key == 'business_posts_emitted':
+                # peer_business_post emissions by this participant (Phase 3
+                # P3.4). THE RELAY ASSERTION, twin of business_ads_emitted: a
+                # node that HOLDS THE PAGE relays once (1), a node that does not
+                # stays silent (0) -- the audience gate made observable rather
+                # than argued for. C mirrors by counting the same emission.
+                actual = self.emit_tally.get(IdentityProtocol.business_post, 0)
+                if actual != int(expected):
+                    raise AssertionError(
+                        f'{self.id}: business_posts_emitted={actual}, '
+                        f'expected {int(expected)}')
             elif key == 'connection_state':
                 # {peer_id: <int>} (Increment 5) -- the connection edge state
                 # this participant holds toward another, via
@@ -2602,6 +2647,42 @@ class IdentityAdapter:
                                   'advertiser_pk': adv_pk, 'polity': did,
                                   'sat': sat, 'seq': seq, 'ts': ts,
                                   'bundle': bundle, 'sig': sig})
+        elif function == IdentityProtocol.business_post:
+            # handle_business_post parses {author, author_pk, polity, seq, ts,
+            # bundle, sig, hops}. The post is SIGNED with the SENDER's key over
+            # the canonical (author, polity, seq, ts, bundle) form -- which is
+            # what a RELAY does too, since the signature says only who sent this
+            # copy. HOPS IS OUTSIDE THE SIGNATURE, so a scenario can set it to
+            # drive the relay bound without breaking anything. A scenario may
+            # override `sig` (bad-signature drop) and `author_pk`
+            # (impersonation). Mirrors the C peer_business_post builder.
+            from autonomous_trust.core.capabilities import business_post_sign
+            payload = payload if isinstance(payload, dict) else {}
+            did = payload.get('polity', '')
+            did = did if isinstance(did, str) else ''
+            bundle = payload.get('bundle', '')
+            bundle = bundle if isinstance(bundle, str) else ''
+            seq = payload.get('seq', 0)
+            seq = int(seq) if isinstance(seq, int) else 0
+            ts = payload.get('ts', 0.0)
+            ts = float(ts) if isinstance(ts, (int, float)) else 0.0
+            hops = payload.get('hops', 0)
+            hops = int(hops) if isinstance(hops, int) else 0
+            author_uuid = sender.process.identity.uuid
+            if isinstance(payload.get('author_pk'), str):
+                author_pk = payload['author_pk']
+            else:
+                author_pk = bytes(sender.process.identity.signature.public).hex()
+            if isinstance(payload.get('sig'), str):
+                sig = payload['sig']
+            else:
+                sig = business_post_sign(
+                    sender.process.identity.signature.private, author_uuid, did,
+                    seq, ts, bundle)
+            obj = to_json_string({'author': str(author_uuid),
+                                  'author_pk': author_pk, 'polity': did,
+                                  'seq': seq, 'ts': ts, 'bundle': bundle,
+                                  'sig': sig, 'hops': hops})
         elif function == IdentityProtocol.reaction:
             # handle_reaction parses {post_id, seq, ts} (Increment 8). A reaction
             # carries NO signature (crypto_box authenticates the reactor on the

@@ -559,6 +559,7 @@ if(AT_SOCIAL)
         autonomous_trust/identity/social_tx.c
         autonomous_trust/identity/proximity.c
         autonomous_trust/identity/business_ad.c
+        autonomous_trust/identity/business_post.c
         autonomous_trust/identity/cosign.c
     )
 endif()

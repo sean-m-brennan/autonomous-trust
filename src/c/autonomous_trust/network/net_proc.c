@@ -1356,6 +1356,12 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
     /* `fmt` comes from the ADDRESSED group (doc/architecture/network-wire-format.md),
      * resolved by the caller -- this function encrypts and sends, it does not decide
      * policy. */
+    if (myself == NULL)
+        /* Nothing serialized here can ever be verified by anyone: the wire
+         * writer attaches a signature only when it is given a signer. Every
+         * verified-gated handler on the far side will silently ignore it. */
+        log_warn(logger, "Network: sending '%s' WITHOUT A SIGNER — the receiver "
+                 "cannot verify it\n", msg->function ? msg->function : "(none)");
     if (net_message_to_wire_fmt(msg, myself, fmt, &wire, &wire_len) != 0)
         return -1;
 
@@ -1784,6 +1790,12 @@ static bool try_unencrypted_from_known_peer(net_thread_ctx_t *ctx,
     net_wire_msg_t wmsg;
     if (net_message_from_wire_fmt(buf, len, NULL, fmt, &wmsg) != 0)
         return false;
+    if (!wmsg.verified && wmsg.function != NULL
+        && strcmp(wmsg.function, "group_key_update") == 0)
+        log_warn(ctx->logger,
+                 "Network: group_key_update arrived UNVERIFIED via %s "
+                 "(has_signature=%d) — the rotation will be ignored\n",
+                 "plaintext-from-known-peer", (int)wmsg.has_signature);
     if (wmsg.encrypt || !identity_verb_is_unencrypted(wmsg.function)) {
         if (!wmsg.encrypt && wmsg.function != NULL)
             log_warn(ctx->logger, "Refusing plaintext %s from known peer %s: "
@@ -1847,6 +1859,37 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
             net_wire_format_t fmt =
                 wire_format_for_address(&ctx->proc->protocol.group, peer->address);
             if (net_message_from_wire_fmt(plain, plain_len, peer, fmt, &wmsg) == 0) {
+                /* A frame that DECRYPTED (so the peer's encryption key is the
+                 * one we hold) but whose signature does not check out against
+                 * the SAME peer entry's signing key. Those two keys arrive
+                 * together in a PEER message, so a mismatch here means one of
+                 * them is stale — and every handler gated on `verified`
+                 * silently does nothing, which is how 107 group-key rotations
+                 * were minted across 25 cohort runs and not one was ever
+                 * adopted. Warned once per frame, naming the verb, because the
+                 * damage is per-verb and invisible at the transport. */
+                if (!wmsg.verified) {
+                    /* Name WHICH of the two failures this is. They need
+                     * different fixes and are indistinguishable from outside:
+                     * an unsigned frame means the sender never signed it, a
+                     * failed check means our peer entry's signing key is not
+                     * the key it signed with, and an all-zero key means the
+                     * entry never carried one at all. */
+                    char sigkey[17] = {0};
+                    sodium_bin2hex(sigkey, sizeof(sigkey),
+                                   peer->signature.public, 8);
+                    bool no_key = sodium_is_zero(peer->signature.public,
+                                                 crypto_sign_PUBLICKEYBYTES);
+                    log_warn(ctx->logger,
+                             "Network: frame '%s' from %s DECRYPTED but is "
+                             "UNVERIFIED (%s; peer signing key %s) — every "
+                             "verified-gated handler will silently ignore it\n",
+                             wmsg.function != NULL ? wmsg.function : "(none)",
+                             peer->address,
+                             !wmsg.has_signature ? "carries no signature"
+                                                 : "signature did not check out",
+                             no_key ? "ABSENT (all zero)" : sigkey);
+                }
                 /* Gateway boundary, invariant B. False on a leaf node and for
                  * a peer in our own group, so this is a gateway-only gate. */
                 if (identity_verb_is_bootstrap(wmsg.function) &&
@@ -1907,6 +1950,12 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
                                       NET_WIRE_JSON, &wmsg) == 0) {
             snprintf(wmsg.from_whom.address, sizeof(wmsg.from_whom.address),
                      "%s", from_addr);
+            if (!wmsg.verified && wmsg.function != NULL
+                && strcmp(wmsg.function, "group_key_update") == 0)
+                log_warn(ctx->logger,
+                         "Network: group_key_update arrived UNVERIFIED via "
+                         "unknown-sender-plaintext (has_signature=%d) — the rotation will be "
+                         "ignored\\n", (int)wmsg.has_signature);
             route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
             net_wire_msg_free(&wmsg);
         } else {
@@ -2006,9 +2055,16 @@ void handle_inbound_broadcast(net_thread_ctx_t *ctx,
         if ((env.flags & NET_ENV_FLAG_FORWARDED) != 0)
             preserve_self_reported = true;
 #endif
-        if (!preserve_self_reported)
+        if (!preserve_self_reported) {
             snprintf(wmsg.from_whom.address, sizeof(wmsg.from_whom.address),
                      "%s", from_addr);
+        }
+        if (!wmsg.verified && wmsg.function != NULL
+            && strcmp(wmsg.function, "group_key_update") == 0)
+            log_warn(ctx->logger,
+                     "Network: group_key_update arrived UNVERIFIED via "
+                     "broadcast-channel (has_signature=%d) — the rotation "
+                     "will be ignored\n", (int)wmsg.has_signature);
         route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
         net_wire_msg_free(&wmsg);
     } else {
@@ -2216,6 +2272,12 @@ void handle_inbound_group(net_thread_ctx_t *ctx,
                                       grp->wire_format, &wmsg) == 0) {
             snprintf(wmsg.from_whom.address, sizeof(wmsg.from_whom.address),
                      "%s", from_addr);
+            if (!wmsg.verified && wmsg.function != NULL
+                && strcmp(wmsg.function, "group_key_update") == 0)
+                log_warn(ctx->logger,
+                         "Network: group_key_update arrived UNVERIFIED via "
+                         "group-channel (has_signature=%d) — the rotation will be "
+                         "ignored\\n", (int)wmsg.has_signature);
             /* Gateway boundary, invariant B: the pre-admission handshake is
              * never a group message -- announce is broadcast, accept and
              * history are point-to-point to an unplaced identity -- so a

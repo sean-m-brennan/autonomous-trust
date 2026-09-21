@@ -183,6 +183,20 @@ int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
                 log_exception(logger);
             return 0;
         }
+        if (fn != NULL && strcmp(fn, AT_APP_PUBLISH_BUSINESS_POST) == 0)
+        {
+            /* Phase 3 P3.4: the business speaking. Forwarded ONLY to identity,
+             * which owns the post signing/multicast. The envoy signature that
+             * makes it the business's word is sealed inside the opaque bundle,
+             * so nothing here — and nothing in identity — adjudicates who may
+             * say it; every receiver checks that for itself. */
+            generic_msg_t fwd = *msg;
+            snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
+                     "%s", "identity");
+            if (messaging_send("identity", NET_MESSAGE, &fwd, false) != 0)
+                log_exception(logger);
+            return 0;
+        }
         if (fn != NULL && (strcmp(fn, AT_APP_REQUEST_COSIGN) == 0
                            || strcmp(fn, AT_APP_RETURN_COSIGN) == 0))
         {
@@ -302,8 +316,9 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
              * connection edges (Increment 5 — the inbound-request ASK and every
              * edge-state change), DMs (Increment 6), feed posts (Increment 7),
              * post reactions (Increment 8), the private-proximity band
-             * (Phase 2), business ads (Phase 3 P3.2), and both halves of a
-             * co-signature exchange (Phase 3 P3.3). */
+             * (Phase 2), business ads (Phase 3 P3.2), both halves of a
+             * co-signature exchange (Phase 3 P3.3), and business posts
+             * (Phase 3 P3.4). */
             case PEER_CONNECTION_REQUEST_OBSERVED:
             case PEER_CONNECTION_STATE_OBSERVED:
             case PEER_DM_OBSERVED:
@@ -313,6 +328,7 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
             case PEER_BUSINESS_AD_OBSERVED:
             case PEER_COSIGN_REQUEST_OBSERVED:
             case PEER_COSIGN_SIG_OBSERVED:
+            case PEER_BUSINESS_POST_OBSERVED:
 #endif /* AT_SOCIAL_ENABLED */
                 if (q_out == NULL)
                     break;   /* no app attached; nothing to do */

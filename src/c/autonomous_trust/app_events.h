@@ -99,6 +99,19 @@ extern "C" {
  *  match AT_BUSINESS_SAT_SELF in identity/business_ad.h. */
 #define AT_APP_BUSINESS_SAT_SELF 0xFF
 
+/** Max bytes of the opaque Ethne {post,delegation} bundle carried on a business
+ *  post (Phase 3 P3.4). LARGER than the page bundle's 3072 because the body
+ *  rides inside it; the measured worst case is 3550. MUST match
+ *  AT_BUSINESS_POST_BUNDLE_MAX in identity/business_post.h,
+ *  AT_BUSINESS_POST_BUNDLE_LEN in msg_types.h, and
+ *  AGORA_BUSINESS_POST_BUNDLE_MAX in the shim / cohort ctypes. */
+#define AT_APP_BUSINESS_POST_BUNDLE_LEN 4096
+
+/** Post content id: blake2b-256 as lowercase hex. MUST match
+ *  AT_BUSINESS_POST_ID_HEX_LEN / AT_BUSINESS_POST_ID_LEN and
+ *  AGORA_BUSINESS_POST_ID_MAX. */
+#define AT_APP_BUSINESS_POST_ID_LEN 64
+
 /** Max hex characters of a detached exchange's exported canonical bytes (Phase 3
  *  P3.3), so half this many bytes of CBOR. MUST match AT_COSIGN_BYTES_MAX in
  *  identity/cosign.h, AT_COSIGN_BYTES_LEN in msg_types.h, COSIGN_BYTES_HEX_MAX
@@ -204,7 +217,16 @@ typedef enum {
     /** A signer returns their detached signature over an exchange THIS node is
      *  authoring (Phase 3 P3.3, @ref at_app_cosign_sig_t). Check it against the
      *  payload before appending — the core neither did nor could. */
-    AT_APP_EVENT_COSIGN_SIGNATURE = 14
+    AT_APP_EVENT_COSIGN_SIGNATURE = 14,
+
+    /** A signed business post — one opaque, self-verifying Ethne
+     *  {post,delegation} bundle the business's ENVOY signed (Phase 3 P3.4,
+     *  @ref at_app_business_post_t). Unlike an ad, it is GOSSIP-RELAYED, so the
+     *  peer it arrives from is a carrier and not the authority; the authority is
+     *  the envoy signature inside the bundle, which only the app can check. It
+     *  reaches you at all only because this node already holds the business's
+     *  page — the core drops a post from a polity it knows nothing about. */
+    AT_APP_EVENT_BUSINESS_POST = 15
 #endif /* AT_SOCIAL_ENABLED */
 } at_app_event_kind_t;
 
@@ -434,6 +456,35 @@ typedef struct {
     int64_t seq;
     double  ts;
 } at_app_cosign_sig_t;
+
+/** One signed business post received over the group channel (Phase 3 P3.4).
+ *
+ *  @c publisher_uuid is the node that PUBLISHED these bytes — always the
+ *  original, never a relay, because a relay forwards the envelope untouched
+ *  and changes only @c hops. It is bound by the Ed25519 signature the core
+ *  verified before emitting, and IT IS NOT THE AUTHORITY: being on a
+ *  business's roll, or publishing on its behalf, does not let anyone speak for
+ *  it. Only the envoy signature inside @c bundle does, and only the app can
+ *  check that (`ethne_business_post_verify_bundle`, which needs no charter
+ *  log, or `_verify_full` where the log is held). Render nothing under the
+ *  business's name until it verifies.
+ *
+ *  @c polity is the business's Ethne DID, @c seq the business's own post
+ *  sequence, @c ts the publisher's time, @c hops how far THIS COPY travelled
+ *  (0 = straight from the business, 1 = through one relay). @c post_id is the blake2b content-address
+ *  of the canonical form — the dedup key that makes gossip converge.
+ *
+ *  Carried by AT_APP_EVENT_BUSINESS_POST. A live stream — delivered on arrival,
+ *  not roster state. */
+typedef struct {
+    uint8_t publisher_uuid[AT_APP_UUID_LEN];
+    char    polity[AT_APP_BUSINESS_DID_LEN + 1];
+    char    post_id[AT_APP_BUSINESS_POST_ID_LEN + 1];
+    int64_t seq;
+    double  ts;
+    int32_t hops;
+    char    bundle[AT_APP_BUSINESS_POST_BUNDLE_LEN + 1];
+} at_app_business_post_t;
 #endif /* AT_SOCIAL_ENABLED */
 
 /** A decoded app-facing event. */
@@ -454,6 +505,7 @@ typedef struct {
         at_app_business_ad_t business_ad;
         at_app_cosign_request_t cosign_request;
         at_app_cosign_sig_t cosign_sig;
+        at_app_business_post_t business_post;
 #endif /* AT_SOCIAL_ENABLED */
     } data;
 } at_app_event_t;
@@ -722,6 +774,34 @@ int at_app_events_advertise_business(at_app_events_t *handle, const char *q_out,
 int at_app_events_set_customer(at_app_events_t *handle, const char *q_out,
                                const char *polity_did, int satisfaction,
                                const char *bundle, int64_t seq);
+
+/**
+ * @brief Publish a business post — the polity speaking — to the local group
+ * (Phase 3 P3.4).
+ *
+ * Sends the app→AT `AT_APP_PUBLISH_BUSINESS_POST` verb on @p q_out with
+ * {"polity", "bundle", "seq"}. Identity signs the canonical post with this
+ * node's Ed25519 key and group-multicasts it; inbound copies are verified,
+ * GATED on the receiver holding this polity's page, content-id-deduped and
+ * gossip-forwarded a bounded number of hops. The core does NOT echo the
+ * outgoing post back — the app echoes it locally.
+ *
+ * @p bundle is the OPAQUE, self-verifying Ethne {post,delegation} artifact the
+ * app built through Ethne (`ethne_business_post_sign` paired with
+ * `ethne_envoy_delegation`). The core never parses it and cannot tell an envoy
+ * from anyone else: THIS CALL DOES NOT CONFER AUTHORITY. A node that signs a
+ * bundle it has no envoy delegation for will put a post on the wire that every
+ * receiver refuses.
+ *
+ * Unlike a business AD, a post relays: its authority comes from inside the
+ * bundle rather than from who passed it along, so any reader who holds the page
+ * may carry it further.
+ *
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound, -1 otherwise.
+ */
+int at_app_events_publish_business_post(at_app_events_t *handle, const char *q_out,
+                                        const char *polity_did, const char *bundle,
+                                        int64_t seq);
 
 /**
  * @brief React to a peer's post (Increment 8). Sends AT_APP_REACT_POST with

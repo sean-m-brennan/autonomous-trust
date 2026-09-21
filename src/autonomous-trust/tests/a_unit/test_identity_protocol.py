@@ -74,14 +74,22 @@ class TestIdentityProtocol:
           signature coming back. The human-legible description of
           what is being signed is deliberately NOT a field on
           either: the signer's own node derives it from the bytes.
+        - business POSTS, Phase 3 P3.4 (business_post) — the polity
+          speaking, where the page is what it is. One verb, not two:
+          unlike an ad it IS relayed, and a relay forwards the
+          publisher's own envelope untouched and bumps only the hop
+          count, so a carried post is the same message rather than a
+          second one. Its authority is the envoy signature sealed in
+          the opaque bundle, which this tier never opens.
         Asserting the exact count here pins the wire contract — a
         new verb without intent will fail this and force a deliberate
         update. Update the expected count alongside any new addition
         to ``IdentityProtocol``.
         """
         values = list(IdentityProtocol)
-        assert len(values) == 43
+        assert len(values) == 44
         assert 'announce' in values
         assert 'business_ad' in values
+        assert 'business_post' in values
         assert 'cosign_request' in values
         assert 'cosign_sig' in values
