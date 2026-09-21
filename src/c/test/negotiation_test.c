@@ -23,6 +23,7 @@
 
 #include "negotiation/task_priv.h"
 #include "negotiation/negotiation.h"
+#include "negotiation/neg_proc_priv.h"
 
 DEFINE_TEST(test_job_queue_basic)
 {
@@ -135,6 +136,47 @@ DEFINE_TEST(test_task_proto_unstamped_reads_zero)
 }
 END_TEST_DEFINITION()
 
-RUN_TESTS(Negotiation, test_job_queue_basic, test_task_tracker_basic,
+/* A task's start time must not depend on the HOST's timezone.
+ *
+ * `task.when` is UTC — the requester builds it with gmtime — and the accepted
+ * job's start_time used to go through mktime, which applies the local zone.
+ * On a UTC host that is a no-op, so every docker-backed cohort ran its jobs
+ * and nobody noticed. On a host in EDT it put every job FIVE HOURS in the
+ * future, `_drain_task_stack` never found one due, no task ever completed,
+ * and no task_outcome reputation transaction was ever submitted: zero jobs
+ * across every netns cohort run ever recorded, against 18 in the docker runs.
+ *
+ * Forces a non-UTC zone on purpose. Run in UTC (most CI), a test that did not
+ * set TZ would pass against the broken conversion too. */
+DEFINE_TEST(test_task_start_epoch_ignores_the_host_timezone)
+{
+    char *saved = getenv("TZ");
+    char keep[64] = {0};
+    if (saved != NULL) snprintf(keep, sizeof(keep), "%s", saved);
+
+    setenv("TZ", "America/New_York", 1);
+    tzset();
+
+    time_t now = time(NULL);
+    datetime_t when;
+    memset(&when, 0, sizeof(when));
+    /* utc=true: exactly what the requester puts on the wire. */
+    ck_assert_int_eq(datetime_from_time(now, 0, false, &when), 0);
+
+    time_t got = negotiation_dt_epoch(&when);
+    if (got != now)
+        _ck_fail("start epoch %ld != %ld (off by %ld s) — the conversion is "
+                 "applying the host timezone to a UTC struct, so every "
+                 "accepted job is scheduled into the future and never runs",
+                 (long)got, (long)now, (long)(got - now));
+    _test_count++;
+
+    if (keep[0] != '\0') setenv("TZ", keep, 1); else unsetenv("TZ");
+    tzset();
+}
+
+
+RUN_TESTS(Negotiation,
+          test_task_start_epoch_ignores_the_host_timezone, test_job_queue_basic, test_task_tracker_basic,
           test_task_proto_roundtrip_carries_seq,
           test_task_proto_unstamped_reads_zero)

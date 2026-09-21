@@ -722,6 +722,79 @@ the exact key set, and the routed envelope for all three verbs;
 `tests/a_unit/test_rep_resp_interop.py` asserts the consumer reads the tagged
 form, the legacy C form, and refuses the rest.
 
+## What only a live cohort could show
+
+Consensus here was "passing" for as long as it had existed, in both runtimes and
+across the whole conformance corpus, and it had never once worked between real
+processes. Thirty preserved cohort runs record rounds starting constantly and
+`Reputation: Transaction committed` appearing exactly nowhere. Five separate
+defects stood between a proposal and a commit, and the reason none of them was
+caught is the same in every case: the thing that was wrong lived in the gap
+between two components, and every test held one side of that gap fixed.
+
+**The verdict did not survive the hop inward.** `net_msg_to_proto` carried
+neither `verified` nor `has_signature` across the network-to-sibling IPC hop, so
+all thirteen handlers gated on a verified signature rejected everything in live
+operation. The conformance adapter sets the flag by hand and dispatches
+in-process, which is precisely the hop that was broken.
+
+**The pending round was filed under a key nobody looked up.** The proposer
+stored it by task identifier; the grant handler looked it up by peer identifier.
+Every grant fell into the already-completed-or-unknown branch. Python keys both
+sides by the ballot `(id1, id2)`. Every test in either runtime *stages* the
+pending round and then dispatches a grant — staging writes the key the reader
+expects, so the writer's key was never on trial. A test that never runs the
+proposer cannot watch the proposer disagree with anybody.
+
+**A refused round was abandoned rather than retried.** The nack handler computed
+a backoff nothing ever read. Python sleeps that backoff and re-proposes. With
+one proposer the difference is invisible; with three, every member proposes on
+the same probe in the same millisecond and most requests are refused, so most
+rounds simply vanished.
+
+**The ballot index drifted from the chain.** The index came from a private
+counter advanced only on a round this node proposed and won, while every node's
+chain grows on every commit it *learns of*. Python takes the number from the
+chain on both sides. The counters scatter within seconds of a second proposer
+appearing, ballots stop matching, and the group falls into a catch-up loop that
+never settles. The conformance fixture for this staged the counter — the cache
+the production code overwrites — which is exactly how the drift stayed
+invisible; it now stages the chain, as Python's does.
+
+**A user's action was scored though it never left the node.** Sends are
+non-blocking into a queue that holds ten datagrams, and a transaction burst
+fills it. The directed application senders discarded the result, so a reaction
+reported success, accrued the reactor's half of a *bilateral* score, and never
+reached the wire — leaving a transaction that could never complete and a score
+claimed for an interaction the other party never had. The same trap has bitten
+twice before in other shapes — receive loops that took one message per tick, and
+a queue close that unlinked by name — and the reasoning for each sits at its fix
+site, in `processes/processes.h` and `utilities/message.c`.
+
+The pattern worth remembering is not any one of these. It is that a
+single-process conformance harness, however complete, is structurally blind to
+disagreements between processes, and that a fixture which installs internal
+state replaces exactly the code whose agreement with the reader is in question.
+Both blind spots are cheap to close once named: drive the real originator, and
+put two processes on a real wire.
+
+### What the injected phase does and does not prove
+
+Two flows — slashing and deep resolution, five gates between them — have **no
+production originator**. Nothing outside the conformance corpus and
+`rep_quorum_test.c` has ever sent those verbs. Deciding when a node should
+accuse a peer is a design question that remains open, so rather than invent an
+answer, the cohort injects the messages through a test-only tool that hands them
+to a node's own network process by queue name. The node signs them with its own
+identity and encrypts them to the target, so the receiver sees a genuine
+signature from a peer it knows.
+
+That proves the gate opens, the handler runs, and the round-trip works across
+two real processes on a real wire. It proves **nothing** about whether a
+deployment would ever send such a message, because today none would. The
+synthetic traffic is labelled as such in the cohort's own output, and the gap it
+stands over is documented rather than papered over.
+
 ## Pinned scenarios
 
 | Behavior | Scenario |

@@ -497,8 +497,15 @@ static int _py_uuid_read(const json_t *j, uuid_t out)
 
 /* Seconds since the epoch for a datetime_t, honouring its recorded offset.
  * timegm rather than mktime: the struct is UTC unless it says otherwise, and
- * mktime would apply the HOST's zone to it. */
-static time_t _dt_epoch(const datetime_t *dt)
+ * mktime would apply the HOST's zone to it.
+ *
+ * NON-STATIC so a test can hold it to that. The rule was written here and
+ * then broken sixty lines into handle_invite, where an accepted job's start
+ * time went through mktime instead — invisible on a UTC host (every docker
+ * cohort) and five hours into the future on a host in EDT, which is why no
+ * netns run has ever executed a single task. A rule stated only in a comment
+ * is one nobody can fail. */
+time_t negotiation_dt_epoch(const datetime_t *dt)
 {
     struct tm tm_copy;
     memcpy(&tm_copy, dt, sizeof(struct tm));
@@ -515,7 +522,7 @@ static time_t _dt_epoch(const datetime_t *dt)
  * through here, so the offset is always the same one. */
 static void _dt_to_utc(const datetime_t *in, datetime_t *out)
 {
-    if (datetime_from_time(_dt_epoch(in), (long)in->tm_nsec, false, out) != 0)
+    if (datetime_from_time(negotiation_dt_epoch(in), (long)in->tm_nsec, false, out) != 0)
         memcpy(out, in, sizeof(datetime_t));
 }
 
@@ -1458,9 +1465,17 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
             memset(&job, 0, sizeof(job));
             memcpy(&job.task, &task, sizeof(task_t));
 
-            struct tm tm_copy;
-            memcpy(&tm_copy, &task.when, sizeof(struct tm));
-            job.start_time = mktime(&tm_copy);
+            /* _dt_epoch, NOT mktime. task.when is UTC (the requester builds
+             * it with gmtime, neg_proc.c:1440) and mktime applies the HOST's
+             * timezone to it — the very mistake _dt_epoch's own comment warns
+             * about. On a UTC host the two agree, which is why this survived:
+             * every docker-backed cohort ran its jobs fine. On a host in, say,
+             * EDT it scheduled every accepted job FOUR HOURS into the future,
+             * so _drain_task_stack never found one due, no task ever completed,
+             * and no task_outcome transaction was ever submitted. Measured: 18
+             * jobs across the 2026-09-17 docker runs, ZERO across every netns
+             * run since. */
+            job.start_time = negotiation_dt_epoch(&task.when);
             job.end_time   = job.start_time + duration_secs;
 
             job_queue_push(&neg_state.task_stack, &job);

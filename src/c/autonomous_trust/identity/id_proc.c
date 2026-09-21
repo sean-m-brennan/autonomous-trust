@@ -5922,6 +5922,45 @@ static bool _find_peer_pub_by_uuid(const process_t *proc, const uuid_t uuid,
 /* Directed connection request to one admitted peer (a bare ask; mirrors
  * _send_profile_query but with no query payload). Encrypt=true: NOT on the
  * plaintext allowlist. */
+/* Hand net_proc a frame a PERSON asked for, and refuse to lose it quietly.
+ *
+ * messaging_send is non-blocking here, and an AF_UNIX datagram queue holds
+ * net.unix.max_dgram_qlen (10) frames. During a transaction burst — which in
+ * a cohort is most of the time, since every probe result forwards a score —
+ * a send loses the race and returns EAGAIN. The result was DISCARDED at every
+ * one of these call sites, so the frame vanished and the caller reported
+ * success to the operator.
+ *
+ * That is not a dropped notification: these are one-shot user actions. The
+ * 2026-09-21 reputation cohort caught it on the reaction path — bob's
+ * `react` returned rc=0, bob accrued his half of the bilateral score, and
+ * `peer_reaction` never reached the wire at all, so alice never submitted
+ * hers and the transaction could never go bilateral. An earlier run of the
+ * same script had worked, which is what a lost race looks like.
+ *
+ * Bounded retry, then say so, distinguishing saturation from a hard transport
+ * fault because they call for different answers. Mirrors the PEER-update loop
+ * at the top of this file, which fixed the same hazard for a different
+ * message in P3.3. */
+static int _send_to_network(const process_t *proc, generic_msg_t *out,
+                            const char *what, const char *whom)
+{
+    int ret = -1;
+    for (int attempt = 0; attempt < 10; attempt++)
+    {
+        ret = messaging_send("network", out->type, out, false);
+        if (ret == 0)
+            return 0;
+        usleep(20000); /* 20ms */
+    }
+    log_warn(proc->logger,
+             "Identity: could not send %s to %s after 10 tries (%s) — the"
+             " action DID NOT HAPPEN and nothing retries it\n",
+             what, whom == NULL ? "peer" : whom,
+             ret == EAGAIN ? "network queue still full" : "send failed");
+    return ret;
+}
+
 static int _send_connection_request(const process_t *proc,
                                     const public_identity_t *peer)
 {
@@ -5932,10 +5971,12 @@ static int _send_connection_request(const process_t *proc,
     query.info.net_msg.encrypt = true;
     memcpy(&query.info.net_msg.to_whom, peer, sizeof(public_identity_t));
     strncpy(query.info.net_msg.return_to, "identity", PROC_NAME_LEN);
-    messaging_send("network", NET_MESSAGE, &query, false);
-    log_debug(proc->logger, "Identity: sent connection_request to %s\n",
-              peer->nickname);
-    return 0;
+    int rc = _send_to_network(proc, &query, "a connection request",
+                              peer->nickname);
+    if (rc == 0)
+        log_debug(proc->logger, "Identity: sent connection_request to %s\n",
+                  peer->nickname);
+    return rc;
 }
 
 /* Directed, signed connection response to one admitted peer: {decision,sig,seq}.
@@ -5960,8 +6001,8 @@ static int _send_connection_response(const process_t *proc,
     json_object_set_new(env, "seq", json_integer((json_int_t)seq));
     net_msg_pack_json(&response.info.net_msg, env);
     json_decref(env);
-    messaging_send("network", NET_MESSAGE, &response, false);
-    return 0;
+    return _send_to_network(proc, &response, "a connection response",
+                            peer->nickname);
 }
 
 /* Handler: a peer asks to connect. Set our edge to pending_in (idempotent; an
@@ -6302,8 +6343,7 @@ static int _send_dm(const process_t *proc, const public_identity_t *peer,
     if (env == NULL) return -1;
     net_msg_pack_json(&out.info.net_msg, env);
     json_decref(env);
-    messaging_send("network", NET_MESSAGE, &out, false);
-    return 0;
+    return _send_to_network(proc, &out, "a direct message", peer->nickname);
 }
 
 /* App -> AT verb (AT_APP_SEND_DM): the operator sends a text message to a peer.
@@ -6801,9 +6841,7 @@ static int _send_reaction(const process_t *proc, const public_identity_t *author
     json_object_set_new(env, "ts", json_real(ts));
     net_msg_pack_json(&out.info.net_msg, env);
     json_decref(env);
-    messaging_send("network", NET_MESSAGE, &out, false);
-    (void)proc;
-    return 0;
+    return _send_to_network(proc, &out, "a post reaction", author->nickname);
 }
 
 /* App -> AT verb (AT_APP_REACT_POST): the operator reacts to a peer's post.
@@ -6852,7 +6890,20 @@ static bool handle_app_react_post(const process_t *proc, directory_t *queues,
         return true;
     }
     double ts = (double)time(NULL);
-    _send_reaction(proc, &author, post_id, seq, ts);
+    /* ACCRUE ONLY IF IT ACTUALLY WENT. A reaction scores BILATERALLY: we
+     * submit on send and the author submits on receipt, both against a task
+     * uuid neither side sends. If our frame never leaves, our half sits in
+     * the chain as a transaction that can never complete — a permanent
+     * half-entry, and a score claimed for an interaction the other party
+     * never had. Silently accruing anyway is what the 2026-09-21 cohort
+     * caught: bob's half was submitted, alice never heard of the reaction,
+     * and nothing could reconcile them. */
+    if (_send_reaction(proc, &author, post_id, seq, ts) != 0) {
+        log_warn(proc->logger,
+                 "Identity: react_post to %s was not sent; not scoring it\n",
+                 author.nickname);
+        return true;
+    }
     _social_accrue_reaction(proc, self->uuid, author_uuid, post_id);
     return true;
 }
