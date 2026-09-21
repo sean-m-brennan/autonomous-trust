@@ -45,6 +45,7 @@
 #include "dm.h"
 #include "post.h"
 #include "business_ad.h"
+#include "business_post.h"
 #include "cosign.h"
 #include "social_tx.h"
 #include "proximity.h"
@@ -183,6 +184,12 @@ static char ID_REACTION[]    = "peer_reaction";
  * person. There is no hop count: ads are re-advertised by customers, never
  * relayed (identity/business_ad.h). */
 static char ID_BUSINESS_AD[] = "peer_business_ad";
+/* Business posts (Phase 3 P3.4). Group multicast on the plaintext allowlist,
+ * carrying {author, author_pk, polity, seq, ts, bundle, sig, hops}. UNLIKE an
+ * ad, a post IS relayed: its authority is the envoy signature sealed inside the
+ * opaque bundle, so passing it along cannot launder it. The detached Ed25519
+ * signature here authenticates only WHO SENT THIS COPY. */
+static char ID_BUSINESS_POST[] = "peer_business_post";
 /* Detached co-signing (Phase 3 P3.3). Both directed + ENCRYPTED (never on the
  * plaintext allowlist), exactly like a DM: crypto_box authenticates the sender,
  * so neither message carries a signature of its own. The request carries the
@@ -226,6 +233,7 @@ static char ID_APP_ADVERTISE_BUSINESS[] = AT_APP_ADVERTISE_BUSINESS;
 static char ID_APP_SET_CUSTOMER[] = AT_APP_SET_CUSTOMER;
 static char ID_APP_REQUEST_COSIGN[] = AT_APP_REQUEST_COSIGN;
 static char ID_APP_RETURN_COSIGN[] = AT_APP_RETURN_COSIGN;
+static char ID_APP_PUBLISH_BUSINESS_POST[] = AT_APP_PUBLISH_BUSINESS_POST;
 #endif /* AT_SOCIAL_ENABLED */
 
 /* Feed gossip bounds (Increment 7, SOCIAL_APP_PLAN §7 Q2 "active network + one
@@ -247,6 +255,13 @@ static char ID_APP_RETURN_COSIGN[] = AT_APP_RETURN_COSIGN;
  * will hold pages for (a memory bound on unsolicited ads). */
 #define BUSINESS_AD_DEDUP_CAP 256
 #define BUSINESS_PAGE_CAP 128
+
+/* Business-post bounds (Phase 3 P3.4). A post DOES relay, so it reuses
+ * POST_MAX_HOPS rather than inventing a second bound: "active network + one
+ * hop" is a statement about how far anything travels on this channel, not
+ * about who said it. BUSINESS_POST_DEDUP_CAP bounds the post-content dedup
+ * ring — the thing that makes gossip converge instead of echoing. */
+#define BUSINESS_POST_DEDUP_CAP 256
 
 /* Forward decls: defined below beside the position handlers, but used earlier
  * (the query from the admission path, the validator from state init). */
@@ -545,6 +560,20 @@ static struct {
     char    seen_business_ads[BUSINESS_AD_DEDUP_CAP][AT_BUSINESS_AD_ID_HEX_LEN + 1];
     size_t  seen_business_ad_next;
     size_t  seen_business_ad_count;
+    /* Business posts (Phase 3 P3.4). seen_business_posts is the post-content
+     * dedup ring (the twin of seen_post_ids, and what stops a relayed post
+     * echoing round the group); business_post_seq is THIS node's own publish
+     * counter; last_business_post_map is the conformance/observability surface
+     * for identity_get_last_business_post, keyed by POLITY DID rather than by
+     * sender — a post belongs to the business, not to whoever relayed it —
+     * with string_data of {"post_id","seq","ts","hops","bundle"}. Like the
+     * other live streams it is never roster-replayed. Guarded by
+     * id_state.lock. */
+    char    seen_business_posts[BUSINESS_POST_DEDUP_CAP][AT_BUSINESS_POST_ID_HEX_LEN + 1];
+    size_t  seen_business_post_next;
+    size_t  seen_business_post_count;
+    int64_t business_post_seq;
+    map_t   last_business_post_map;
     /* Detached co-signing (Phase 3 P3.3). The most-recent ask received per
      * requester and the most-recent signature returned per signer, keyed by
      * lowercased peer uuid; values are string_data of the compact wire JSON.
@@ -726,6 +755,10 @@ static void _ensure_id_init(void)
         map_init(&id_state.business_pages);
         id_state.seen_business_ad_next = 0;
         id_state.seen_business_ad_count = 0;
+        id_state.seen_business_post_next = 0;
+        id_state.seen_business_post_count = 0;
+        id_state.business_post_seq = 0;
+        map_init(&id_state.last_business_post_map);
         map_init(&id_state.last_cosign_request_map);
         map_init(&id_state.last_cosign_sig_map);
         map_init(&id_state.social_edges);
@@ -3509,6 +3542,11 @@ void identity_reset_state(void)
     map_init(&id_state.business_pages);
     id_state.seen_business_ad_next = 0;
     id_state.seen_business_ad_count = 0;
+    id_state.seen_business_post_next = 0;
+    id_state.seen_business_post_count = 0;
+    id_state.business_post_seq = 0;
+    map_free(&id_state.last_business_post_map);
+    map_init(&id_state.last_business_post_map);
     map_free(&id_state.last_cosign_request_map);
     map_init(&id_state.last_cosign_request_map);
     map_free(&id_state.last_cosign_sig_map);
@@ -4200,6 +4238,42 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
                          "Identity: adopted rotated group key, epoch %lld%s\n",
                          (long long)proc->protocol.group.key_epoch,
                          same_epoch_tiebreak ? " (same-epoch tiebreak)" : "");
+            else
+                /* The tiebreak ran and declined, which is normal for the
+                 * WINNER of a simultaneous rotation — it keeps its own key and
+                 * the loser adopts. Logged anyway: "who won" is otherwise
+                 * invisible, and a cohort where BOTH sides log this line is
+                 * forked. */
+                log_info(proc->logger,
+                         "Identity: rotation from %s not adopted (theirs epoch "
+                         "%lld, ours %lld, carries_key=%d) — ours stands\n",
+                         nmsg->from_whom.nickname, (long long)theirs_epoch,
+                         (long long)proc->protocol.group.key_epoch,
+                         (int)carries_key);
+        }
+        else if (carries_key
+                 && theirs_epoch >= proc->protocol.group.key_epoch
+                 && !nmsg->verified)
+        {
+            /* THE SILENT BRANCH, and the one that matters. An equal-epoch
+             * update carrying a key is a simultaneous-rotation fork waiting to
+             * be settled, and the tiebreak above only runs on a VERIFIED
+             * message — so an unverified one leaves the cohort split with
+             * nothing said. The higher-epoch case has warned since it was
+             * written; this one never did, and 25 preserved cohort runs show
+             * 107 rotations minted and NOT ONE adopted.
+             *
+             * has_signature distinguishes the two ways to be unverified: no
+             * signature at all (the sender never signed) versus a signature
+             * that did not check out against the key we hold for that peer
+             * (our peer table is stale, or it signed with another key). */
+            log_warn(proc->logger,
+                     "Identity: group key from %s NOT adopted — message "
+                     "unverified (has_signature=%d, theirs epoch %lld, ours "
+                     "%lld). The cohort stays FORKED until this verifies.\n",
+                     nmsg->from_whom.nickname, (int)nmsg->has_signature,
+                     (long long)theirs_epoch,
+                     (long long)proc->protocol.group.key_epoch);
         }
     }
 
@@ -7768,6 +7842,383 @@ int identity_get_customer_satisfaction(const char *did)
     int sat = -1;
     if (!_business_is_customer(did, &sat, NULL, 0, NULL)) return -1;
     return sat;
+}
+
+/* ======================================================================
+ * Business posts (Phase 3 P3.4) — the polity speaking, in the feed.
+ *
+ * An ad says "this place exists and I liked it"; a post is the business's own
+ * words. So the two differ in exactly two ways, and both follow from where the
+ * authority lives:
+ *   - A post RELAYS (POST_MAX_HOPS), because its authority is the envoy
+ *     signature sealed inside the opaque bundle and no carrier can launder it.
+ *     A relay forwards the ORIGINAL envelope and changes only the hop count,
+ *     so every copy of a post keeps one content id and gossip converges. An ad
+ *     is first-person and therefore never forwarded at all.
+ *   - A post is GATED ON THE PAGE, not on patronage: a node that holds no page
+ *     for the polity drops it AND DOES NOT RELAY IT, so posts travel only
+ *     through the part of the network that already knows the business. First
+ *     contact is still an ad's job.
+ * What the core verifies is the sender's Ed25519 signature over the canonical
+ * bytes — that this copy arrived unaltered. WHO MAY SPEAK FOR THE BUSINESS is
+ * not a question the core can answer; the app answers it against the bundle.
+ * ====================================================================== */
+
+/* Bounded content-id dedup for business posts — the twin of
+ * _post_seen_or_record, and what stops a relayed post echoing round the group.
+ * Returns true if @p id_hex was already seen; records it otherwise. */
+static bool _business_post_seen_or_record(const char *id_hex)
+{
+    bool seen = false;
+    pthread_mutex_lock(&id_state.lock);
+    for (size_t i = 0; i < id_state.seen_business_post_count; i++) {
+        if (strncmp(id_state.seen_business_posts[i], id_hex,
+                    AT_BUSINESS_POST_ID_HEX_LEN) == 0) {
+            seen = true;
+            break;
+        }
+    }
+    if (!seen) {
+        snprintf(id_state.seen_business_posts[id_state.seen_business_post_next],
+                 AT_BUSINESS_POST_ID_HEX_LEN + 1, "%s", id_hex);
+        id_state.seen_business_post_next =
+            (id_state.seen_business_post_next + 1) % BUSINESS_POST_DEDUP_CAP;
+        if (id_state.seen_business_post_count < BUSINESS_POST_DEDUP_CAP)
+            id_state.seen_business_post_count++;
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return seen;
+}
+
+/* THE AUDIENCE GATE: does this node hold a page for @p did? A post from a
+ * business we know nothing about is dropped unread and unrelayed — the reader
+ * cannot verify it (it has no page to compare against and no reason to care),
+ * and forwarding content nobody here is allowed to read is how a gossip channel
+ * becomes an amplifier. */
+static bool _business_page_held(const char *did)
+{
+    json_t *rec = _business_map_load_json(&id_state.business_pages, did);
+    if (rec == NULL) return false;
+    json_decref(rec);
+    return true;
+}
+
+/* Conformance/observability surface, keyed by POLITY DID: a post belongs to the
+ * business, not to whoever relayed it. NOT roster state. Own locking. */
+static void _last_business_post_store(const char *did, const char *post_id,
+                                      int64_t seq, double ts, int hops,
+                                      const char *bundle)
+{
+    char bounded[AT_BUSINESS_POST_BUNDLE_MAX + 1];
+    at_business_post_bound_bundle(bundle, bounded, sizeof(bounded));
+    json_t *env = json_object();
+    if (env == NULL) return;
+    if (json_object_set_new(env, "post_id", json_string(post_id)) != 0
+        || json_object_set_new(env, "seq", json_integer((json_int_t)seq)) != 0
+        || json_object_set_new(env, "ts", json_real(ts)) != 0
+        || json_object_set_new(env, "hops", json_integer(hops)) != 0
+        || json_object_set_new(env, "bundle", json_string(bounded)) != 0) {
+        json_decref(env);
+        return;
+    }
+    _business_map_store_json(&id_state.last_business_post_map, did, env);
+}
+
+/* Conformance/observability twin of identity_get_last_post: the most-recent
+ * business post this node accepted for polity @p did. Returns true and fills
+ * the outputs if present. Mirrors Python get_last_business_post. */
+bool identity_get_last_business_post(const char *did, char *post_id_buf,
+                                     size_t post_id_sz, char *bundle_buf,
+                                     size_t bundle_sz, int64_t *seq_out,
+                                     int *hops_out)
+{
+    if (!id_state.initialized || did == NULL) return false;
+    json_t *obj = _business_map_load_json(&id_state.last_business_post_map, did);
+    if (obj == NULL) return false;
+    json_t *j_id     = json_object_get(obj, "post_id");
+    json_t *j_seq    = json_object_get(obj, "seq");
+    json_t *j_hops   = json_object_get(obj, "hops");
+    json_t *j_bundle = json_object_get(obj, "bundle");
+    if (post_id_buf != NULL && post_id_sz > 0)
+        snprintf(post_id_buf, post_id_sz, "%s",
+                 json_is_string(j_id) ? json_string_value(j_id) : "");
+    if (bundle_buf != NULL && bundle_sz > 0)
+        snprintf(bundle_buf, bundle_sz, "%s",
+                 json_is_string(j_bundle) ? json_string_value(j_bundle) : "");
+    if (seq_out != NULL)
+        *seq_out = json_is_integer(j_seq) ? (int64_t)json_integer_value(j_seq) : 0;
+    if (hops_out != NULL)
+        *hops_out = json_is_integer(j_hops) ? (int)json_integer_value(j_hops) : 0;
+    json_decref(obj);
+    return true;
+}
+
+/* Identity -> app: one accepted business post. */
+static int identity_emit_business_post(const uuid_t sender_uuid, const char *did,
+                                       const char *post_id, int64_t seq,
+                                       double ts, int hops, const char *bundle)
+{
+    generic_msg_t msg = {0};
+    msg.type = PEER_BUSINESS_POST_OBSERVED;
+    msg.size = sizeof(peer_business_post_msg_t);
+    memcpy(msg.info.peer_business_post.peer_uuid, sender_uuid, 16);
+    at_business_post_bound_did(did, msg.info.peer_business_post.polity,
+                               sizeof(msg.info.peer_business_post.polity));
+    snprintf(msg.info.peer_business_post.post_id,
+             sizeof(msg.info.peer_business_post.post_id), "%s",
+             post_id != NULL ? post_id : "");
+    msg.info.peer_business_post.seq = seq;
+    msg.info.peer_business_post.ts = ts;
+    msg.info.peer_business_post.hops = hops;
+    at_business_post_bound_bundle(bundle, msg.info.peer_business_post.bundle,
+                                  sizeof(msg.info.peer_business_post.bundle));
+    return messaging_send(AT_MAIN_QUEUE, PEER_BUSINESS_POST_OBSERVED, &msg, false);
+}
+
+/* Encrypted group multicast of one signed business post. Same shape as
+ * _multicast_post (RECIPIENT_GROUP + group_encrypt, hop count carried OUTSIDE
+ * the signature); used for both the initial publish (hops=0) and a relay. */
+static int _multicast_business_post(const process_t *proc,
+                                    const uuid_t author_uuid,
+                                    const char *author_pk_hex, const char *did,
+                                    int64_t seq, double ts, const char *bundle,
+                                    const char *sig_hex, int hops)
+{
+    (void)proc;
+    generic_msg_t out = {0};
+    out.type = NET_MESSAGE;
+    strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
+    out.info.net_msg.function = ID_BUSINESS_POST;
+    out.info.net_msg.encrypt = false;
+    out.info.net_msg.group_multicast = true;
+    strncpy(out.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    json_t *env = at_business_post_to_json(author_uuid, author_pk_hex, did, seq,
+                                           ts, bundle, sig_hex, hops);
+    if (env == NULL) return -1;
+    net_msg_pack_json(&out.info.net_msg, env);
+    json_decref(env);
+    messaging_send("network", NET_MESSAGE, &out, false);
+    return 0;
+}
+
+/* PUBLISH a business post: sign the canonical form with THIS node's key and
+ * group-multicast it at hops 0. Only the publishing node does this — a relay
+ * forwards the original envelope instead (see handle_business_post), because
+ * re-signing would change the content id and break the dedup that makes gossip
+ * converge. Returns 0 on success. */
+static int _business_post_publish(const process_t *proc, const char *did,
+                                  int64_t seq, const char *bundle)
+{
+    const identity_t *self = _partition_self_identity(proc);
+    if (self == NULL) {
+        log_debug(proc->logger,
+                  "Identity: business post but self identity unresolved; skipping\n");
+        return -1;
+    }
+    double ts = (double)time(NULL);
+    char sig_hex[AT_BUSINESS_POST_SIG_HEX_LEN + 1];
+    if (at_business_post_sign(self->signature.private, self->uuid, did, seq, ts,
+                              bundle, sig_hex) != 0) {
+        log_warn(proc->logger, "Identity: business post signing failed\n");
+        return -1;
+    }
+    char pk_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1];
+    sodium_bin2hex(pk_hex, sizeof(pk_hex), self->signature.public,
+                   crypto_sign_PUBLICKEYBYTES);
+    char id_hex[AT_BUSINESS_POST_ID_HEX_LEN + 1];
+    if (at_business_post_content_id(self->uuid, did, seq, ts, bundle,
+                                    id_hex) != 0)
+        return -1;
+    /* Record BEFORE sending so a loopback copy of our own multicast is deduped
+     * rather than re-emitted and relayed back into the group. */
+    (void)_business_post_seen_or_record(id_hex);
+
+    _multicast_business_post(proc, self->uuid, pk_hex, did, seq, ts, bundle,
+                             sig_hex, 0);
+    log_info(proc->logger, "Identity: published business post %s for %s seq=%lld\n",
+             id_hex, did, (long long)seq);
+    return 0;
+}
+
+/* App -> AT verb (AT_APP_PUBLISH_BUSINESS_POST): the envoy operator publishes
+ * the business's words. Payload {"polity":"<did>","bundle":"<json>",
+ * "seq":<int>}. The bundle is opaque here — the app built and ENVOY-signed it
+ * through Ethne, and every reader checks that signature itself. This verb
+ * confers nothing: a node with no delegation can run it and will simply have
+ * its post refused everywhere. */
+static bool handle_app_publish_business_post(const process_t *proc,
+                                             directory_t *queues,
+                                             generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *j_did    = json_object_get(payload, "polity");
+    json_t *j_bundle = json_object_get(payload, "bundle");
+    json_t *j_seq    = json_object_get(payload, "seq");
+    char did[AT_BUSINESS_POST_DID_MAX + 1];
+    at_business_post_bound_did(json_is_string(j_did) ? json_string_value(j_did) : "",
+                               did, sizeof(did));
+    char bundle[AT_BUSINESS_POST_BUNDLE_MAX + 1];
+    at_business_post_bound_bundle(json_is_string(j_bundle)
+                                      ? json_string_value(j_bundle) : "",
+                                  bundle, sizeof(bundle));
+    bool have_seq = json_is_integer(j_seq);
+    int64_t seq = have_seq ? (int64_t)json_integer_value(j_seq) : 0;
+    json_decref(payload);
+
+    if (did[0] == '\0' || bundle[0] == '\0') {
+        log_warn(proc->logger,
+                 "Identity: publish_business_post without polity/bundle, refusing\n");
+        return true;
+    }
+    if (!have_seq) {
+        /* No seq offered: keep a monotonic one of our own, so two posts with
+         * identical text do not collapse to one content id. */
+        pthread_mutex_lock(&id_state.lock);
+        seq = ++id_state.business_post_seq;
+        pthread_mutex_unlock(&id_state.lock);
+    } else {
+        pthread_mutex_lock(&id_state.lock);
+        if (seq > id_state.business_post_seq) id_state.business_post_seq = seq;
+        pthread_mutex_unlock(&id_state.lock);
+    }
+    /* The business holds its own page by construction — it just wrote the post
+     * — so record it before publishing. Without this the publisher's own relay
+     * gate would refuse a copy of its own post coming back round. */
+    _business_page_store(did, bundle, seq, (double)time(NULL), "", AT_BUSINESS_SAT_SELF);
+    (void)_business_post_publish(proc, did, seq, bundle);
+    return true;
+}
+
+/****************************
+ * Handler: business_post (peer_business_post)
+ * Inbound group multicast. Verify the sender's signature over the canonical
+ * bytes, GATE on holding this polity's page, dedup by content id, emit, and
+ * relay one more hop.
+ *
+ * ORDER MATTERS. The gate sits AFTER the signature check (so a forgery is
+ * refused as a forgery, not as an unknown business) and BEFORE the emit and the
+ * relay (so an ungated node neither shows nor spreads it).
+ *
+ * The core does NOT and CANNOT check that the publisher may speak for the
+ * business: that lives in the envoy signature inside the opaque bundle, which
+ * only the app can verify. The AT signature binds the PUBLISHING NODE and is
+ * forwarded untouched by relays, so peer_uuid names whoever first put these
+ * bytes on the wire — which is still not an authority, just a witness that the
+ * bytes have not changed since.
+ ****************************/
+static bool handle_business_post(const process_t *proc, directory_t *queues,
+                                 generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    uuid_t author;
+    char auth_pk[AT_BUSINESS_POST_SIG_HEX_LEN + 1];
+    char sig_hex[AT_BUSINESS_POST_SIG_HEX_LEN + 1];
+    char did[AT_BUSINESS_POST_DID_MAX + 1];
+    char bundle[AT_BUSINESS_POST_BUNDLE_MAX + 1];
+    int64_t seq = 0;
+    double ts = 0.0;
+    int hops = 0;
+    if (at_business_post_from_json(payload, author, auth_pk, did, sizeof(did),
+                                   &seq, &ts, bundle, sizeof(bundle), sig_hex,
+                                   &hops) != 0) {
+        json_decref(payload);
+        log_warn(proc->logger,
+                 "Identity: peer_business_post malformed, refusing\n");
+        return true;
+    }
+    json_decref(payload);
+
+    char auth_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(author, auth_str);
+
+    /* Resolve the key to verify against, binding uuid <-> key where we can. */
+    unsigned char verify_pk[crypto_sign_PUBLICKEYBYTES];
+    public_identity_t known;
+    bool have_known = _find_peer_pub_by_uuid(proc, author, &known);
+    if (have_known) {
+        char known_pk_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1];
+        sodium_bin2hex(known_pk_hex, sizeof(known_pk_hex),
+                       known.signature.public, crypto_sign_PUBLICKEYBYTES);
+        if (strncmp(known_pk_hex, auth_pk, crypto_sign_PUBLICKEYBYTES * 2) != 0) {
+            log_warn(proc->logger,
+                     "Identity: peer_business_post from %s: author_pk != known "
+                     "key, dropping (impersonation)\n", auth_str);
+            return true;
+        }
+        memcpy(verify_pk, known.signature.public, sizeof(verify_pk));
+    } else {
+        size_t bin_len = 0;
+        if (sodium_hex2bin(verify_pk, sizeof(verify_pk), auth_pk, strlen(auth_pk),
+                           NULL, &bin_len, NULL) != 0
+            || bin_len != sizeof(verify_pk)) {
+            log_warn(proc->logger,
+                     "Identity: peer_business_post from %s: bad author_pk, "
+                     "dropping\n", auth_str);
+            return true;
+        }
+    }
+
+    if (!at_business_post_verify(verify_pk, author, did, seq, ts, bundle,
+                                 sig_hex)) {
+        log_warn(proc->logger,
+                 "Identity: peer_business_post from %s: BAD SIGNATURE, dropping\n",
+                 auth_str);
+        return true;
+    }
+
+    /* THE AUDIENCE GATE (P3.4, user-locked): no page for this polity, no post.
+     * Dropped here means not shown AND not relayed — a node that does not know
+     * the business does not carry its words. */
+    if (!_business_page_held(did)) {
+        log_debug(proc->logger,
+                  "Identity: business post for %s dropped — no page held for "
+                  "that polity (not a customer, not advertised to)\n", did);
+        return true;
+    }
+
+    /* Content-id dedup: compute the id from the VERIFIED canonical and drop a
+     * repeat before emitting or relaying. */
+    char id_hex[AT_BUSINESS_POST_ID_HEX_LEN + 1];
+    if (at_business_post_content_id(author, did, seq, ts, bundle, id_hex) != 0)
+        return true;
+    if (_business_post_seen_or_record(id_hex)) {
+        log_debug(proc->logger,
+                  "Identity: peer_business_post %s already seen, dropping\n",
+                  id_hex);
+        return true;
+    }
+
+    _last_business_post_store(did, id_hex, seq, ts, hops, bundle);
+    identity_emit_business_post(author, did, id_hex, seq, ts, hops, bundle);
+    log_info(proc->logger,
+             "Identity: business post %s for %s from %s accepted (hops=%d)\n",
+             id_hex, did, auth_str, hops);
+
+    /* Gossip one more hop, under the same bound as a feed post — FORWARDING
+     * THE ORIGINAL ENVELOPE, exactly as handle_post does. Everything but the
+     * hop count is passed through untouched: the publisher's uuid, key,
+     * signature, seq and ts, and the bundle.
+     *
+     * A RELAY MUST NOT RE-SIGN. Signing as ourselves would change the
+     * canonical bytes and therefore the content id, so the relayed copy would
+     * dedup against nothing and every receiver would hold one copy per relay
+     * of the same words. The content address is what makes gossip CONVERGE;
+     * re-signing quietly destroys that. It is also why the hop count lives
+     * outside the signature — so the one field a relay may change is the one
+     * field the signature does not cover. */
+    if (hops < POST_MAX_HOPS)
+        (void)_multicast_business_post(proc, author, auth_pk, did, seq, ts,
+                                       bundle, sig_hex, hops + 1);
+    return true;
 }
 #endif /* AT_SOCIAL_ENABLED */
 
@@ -11721,6 +12172,10 @@ int identity_register_handlers(process_t *proc)
                              (handler_ptr_t)handle_app_request_cosign);
     process_register_handler(proc, ID_APP_RETURN_COSIGN,
                              (handler_ptr_t)handle_app_return_cosign);
+    process_register_handler(proc, ID_BUSINESS_POST,
+                             (handler_ptr_t)handle_business_post);
+    process_register_handler(proc, ID_APP_PUBLISH_BUSINESS_POST,
+                             (handler_ptr_t)handle_app_publish_business_post);
 #endif /* AT_SOCIAL_ENABLED */
     process_register_handler(proc, ID_IDENTITY_QUERY,
                              (handler_ptr_t)handle_identity_query);

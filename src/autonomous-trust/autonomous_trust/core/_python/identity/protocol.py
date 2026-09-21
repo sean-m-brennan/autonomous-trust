@@ -146,6 +146,15 @@ class IdentityProtocol(Protocol):
     # polity-root -> envoy -> page; what the runtime verifies is the detached
     # Ed25519 signature binding who vouched, how happy, for which page bytes.
     business_ad = 'peer_business_ad'  # msg.obj <- json {advertiser,advertiser_pk,polity,sat,seq,ts,bundle,sig}
+
+    # Business post (Phase 3 P3.4): the polity SPEAKING, where the page is what
+    # it IS. Group multicast, and UNLIKE an ad it is RELAYED a bounded number of
+    # hops — its authority is the ENVOY signature sealed inside the opaque
+    # {post,delegation} bundle, so passing it along cannot launder it and
+    # altering a word breaks two signatures at once. The signature here
+    # authenticates only WHO SENT THIS COPY. A receiver drops a post from a
+    # polity it holds no page for, and does not relay it.
+    business_post = 'peer_business_post'  # msg.obj <- json {author,author_pk,polity,seq,ts,bundle,sig,hops}
     # Detached co-signing (Phase 3 P3.3): a staff roll act — admitting,
     # expelling, designating a machine, moving or releasing its guardian —
     # decided by several people who are not at the same keyboard. The record

@@ -203,6 +203,21 @@ bool identity_get_business_page(const char *did, char *bundle_buf,
                                 size_t bundle_sz, int64_t *seq_out,
                                 int *endorsers_out);
 
+/* Conformance/observability seam (Phase 3 P3.4): the most-recent business post
+ * this node ACCEPTED for polity @p did — keyed by the polity, not by whoever
+ * relayed it, because the post is the business's and the carrier is incidental.
+ * Copies the content id into @p post_id_buf and the opaque Ethne bundle into
+ * @p bundle_buf (both always NUL-terminated) and, when non-NULL, the post's seq
+ * into @p seq_out and the hop count it arrived at into @p hops_out. Returns
+ * true iff a post is recorded. Filled by handle_business_post AFTER the
+ * signature check, the page gate and dedup — so a scenario asserting on it is
+ * asserting that all three passed. Twin of Python
+ * IdentityProcess.get_last_business_post. */
+bool identity_get_last_business_post(const char *did, char *post_id_buf,
+                                     size_t post_id_sz, char *bundle_buf,
+                                     size_t bundle_sz, int64_t *seq_out,
+                                     int *hops_out);
+
 /* Conformance/test seam (Phase 3 P3.2): install or clear THIS node's CUSTOMER
  * edge to business @p did WITHOUT putting an ad on the wire — the app's
  * AT_APP_SET_CUSTOMER verb minus its advertising half. A negative @p

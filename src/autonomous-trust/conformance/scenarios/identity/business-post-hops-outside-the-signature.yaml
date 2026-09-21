@@ -1,0 +1,76 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: business-post-hops-outside-the-signature
+byte_pinning: false
+description: |
+    WHY A RELAY CAN FORWARD WITHOUT RE-SIGNING (Phase 3 P3.4). The hop count is
+    the one field the signature does not cover, which is what lets a relay pass
+    a post on untouched and change only how far it has travelled.
+
+    That is not a convenience — it is what makes gossip CONVERGE. A relay that
+    re-signed as itself would change the canonical bytes and therefore the
+    content id, so its copy would dedup against nothing and every reader would
+    end up holding one copy of the same words per relay that carried them.
+
+    This pins the property from the receiving end. Step 3 is byte-identical to
+    step 2 except for hops: 1 — which is exactly what a faithful relay of step
+    2 looks like on the wire, since it carries the publisher's own author, key
+    and signature. It must DEDUP: one record, at the hops it first arrived,
+    and one relay emitted in total.
+
+    Steps 1-2: the ad, then the post at hops 0 (accepted, relayed once).
+    Step 3: the same post at hops 1 — a faithful relay coming back round.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_business_ad
+    payload:
+      polity: "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"
+      sat: 255
+      seq: 1
+      ts: 0
+      bundle: '{"page":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ","name":"Corner Cafe","locality":"9q8yyk8y"},"sig":"stub"},"delegation":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"},"sig":"stub"}}'
+    description: |
+        The ad that teaches newcomer the page.
+  - id: 2
+    from: bg
+    to: newcomer
+    function: peer_business_post
+    payload:
+      polity: "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"
+      seq: 1
+      ts: 0
+      hops: 0
+      bundle: '{"post":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ","body":"Fresh croissants at seven.","seq":1},"sig":"stub"},"delegation":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"},"sig":"stub"}}'
+    description: |
+        The post, direct from the business.
+  - id: 3
+    from: bg
+    to: newcomer
+    function: peer_business_post
+    payload:
+      polity: "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"
+      seq: 1
+      ts: 0
+      hops: 1
+      bundle: '{"post":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ","body":"Fresh croissants at seven.","seq":1},"sig":"stub"},"delegation":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"},"sig":"stub"}}'
+    description: |
+        The same post, one hop along — identical bytes, identical signature,
+        identical content id. Dropped as a repeat.
+
+expected_state:
+  newcomer:
+    business_post_last:
+      "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ":
+        seq: 1
+        hops: 0
+    business_posts_emitted: 1

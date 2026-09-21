@@ -49,6 +49,7 @@
 #include "identity/dm.h"              /* AT_DM_TEXT_MAX for the dm_last check */
 #include "identity/post.h"            /* at_post_* for the peer_post builder */
 #include "identity/business_ad.h"   /* at_business_ad_* for the peer_business_ad builder */
+#include "identity/business_post.h" /* at_business_post_* for the peer_business_post builder */
 #include "identity/cosign.h"        /* AT_COSIGN_* bounds for the cosign_*_last checks */
 #endif /* AT_SOCIAL_ENABLED */
 #include "identity/id_proc_priv.h"
@@ -1873,6 +1874,65 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         return 0;
     }
 
+    /* peer_business_post — pack the group-multicast business post {author,
+     * author_pk, polity, seq, ts, bundle, sig, hops} (Phase 3 P3.4). The post
+     * is SIGNED with the SENDER's key over the canonical (author, polity, seq,
+     * ts, bundle) form — which is what a RELAY does too, since the signature
+     * says only who sent this copy. HOPS IS OUTSIDE THE SIGNATURE, so a
+     * scenario can set it to drive the relay bound without breaking anything.
+     * A scenario may override `sig` (bad-signature drop) and `author_pk`
+     * (impersonation). Mirrors the Python peer_business_post builder. */
+    if (strcmp(function, "peer_business_post") == 0 && json_is_object(payload)) {
+        json_t *jdid = json_object_get(payload, "polity");
+        const char *did_str = json_is_string(jdid) ? json_string_value(jdid) : "";
+        json_t *jbundle = json_object_get(payload, "bundle");
+        const char *bundle_str =
+            json_is_string(jbundle) ? json_string_value(jbundle) : "";
+        /* `seq` is the BUSINESS's post counter, not a freshness seq, so it is
+         * read straight from the payload rather than through _ic_step_seq. */
+        json_t *jseq = json_object_get(payload, "seq");
+        int64_t seq = json_is_integer(jseq) ? (int64_t)json_integer_value(jseq) : 0;
+        json_t *jts = json_object_get(payload, "ts");
+        double ts = json_is_number(jts) ? json_number_value(jts) : 0.0;
+        json_t *jhops = json_object_get(payload, "hops");
+        int hops = json_is_integer(jhops) ? (int)json_integer_value(jhops) : 0;
+
+        /* author_pk: the sender's ed25519 signing pubkey hex, unless overridden. */
+        char pk_hex[crypto_sign_PUBLICKEYBYTES * 2 + 1] = {0};
+        json_t *jpk = json_object_get(payload, "author_pk");
+        if (json_is_string(jpk))
+            snprintf(pk_hex, sizeof(pk_hex), "%s", json_string_value(jpk));
+        else if (sender_impl != NULL && sender_impl->full != NULL)
+            sodium_bin2hex(pk_hex, sizeof(pk_hex),
+                           sender_impl->full->signature.public,
+                           crypto_sign_PUBLICKEYBYTES);
+
+        /* sig over the canonical form with the sender's key, unless overridden. */
+        char sig[AT_BUSINESS_POST_SIG_HEX_LEN + 1] = {0};
+        json_t *jsig = json_object_get(payload, "sig");
+        if (json_is_string(jsig))
+            snprintf(sig, sizeof(sig), "%s", json_string_value(jsig));
+        else if (sender_impl != NULL && sender_impl->full != NULL)
+            at_business_post_sign(sender_impl->full->signature.private,
+                                  sender_impl->full->uuid, did_str, seq, ts,
+                                  bundle_str, sig);
+
+        json_t *env = NULL;
+        if (sender_impl != NULL && sender_impl->full != NULL) {
+            env = at_business_post_to_json(sender_impl->full->uuid, pk_hex,
+                                           did_str, seq, ts, bundle_str, sig,
+                                           hops);
+        }
+        if (env == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "peer_business_post: could not build the post envelope");
+            return -1;
+        }
+        net_msg_pack_json(&out->info.net_msg, env);
+        json_decref(env);
+        return 0;
+    }
+
     /* peer_reaction — pack {post_id, seq, ts} (Increment 8). A reaction carries no
      * signature (crypto_box authenticates the reactor on the wire; in the harness
      * the from_whom identity stands in). `post_id` and `ts` come from the scenario;
@@ -3277,6 +3337,90 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                              pid, got, want);
                     return -1;
                 }
+            } else if (strcmp(key, "business_post_last") == 0) {
+                /* {polity_did: {seq, hops, present}} (Phase 3 P3.4) — the most
+                 * recent business post this participant ACCEPTED for that
+                 * polity, via identity_get_last_business_post. Filled only
+                 * AFTER the signature check, THE PAGE GATE and dedup, so an
+                 * expected `{}` is the assertion that one of those three
+                 * refused it. Keyed by the POLITY, never by the sender: the
+                 * post is the business's and the carrier is incidental.
+                 * Mirrors the Python adapter's business_post_last. */
+                const char *bpl_did;
+                json_t *bpl_want;
+                json_object_foreach(val, bpl_did, bpl_want) {
+                    char post_id[AT_BUSINESS_POST_ID_HEX_LEN + 1] = {0};
+                    char bundle[AT_BUSINESS_POST_BUNDLE_MAX + 1] = {0};
+                    int64_t got_seq = 0;
+                    int got_hops = 0;
+                    bool held = identity_get_last_business_post(
+                        bpl_did, post_id, sizeof(post_id), bundle,
+                        sizeof(bundle), &got_seq, &got_hops);
+                    if (!json_is_object(bpl_want)
+                        || json_object_size(bpl_want) == 0) {
+                        if (held) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: business_post_last[%s] present at "
+                                     "seq %lld, expected none", pid, bpl_did,
+                                     (long long)got_seq);
+                            return -1;
+                        }
+                        continue;
+                    }
+                    if (!held) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: business_post_last[%s] missing", pid,
+                                 bpl_did);
+                        return -1;
+                    }
+                    json_t *w_seq = json_object_get(bpl_want, "seq");
+                    if (json_is_integer(w_seq)
+                        && got_seq != (int64_t)json_integer_value(w_seq)) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: business_post_last[%s].seq=%lld, "
+                                 "expected %lld", pid, bpl_did,
+                                 (long long)got_seq,
+                                 (long long)json_integer_value(w_seq));
+                        return -1;
+                    }
+                    json_t *w_hops = json_object_get(bpl_want, "hops");
+                    if (json_is_integer(w_hops)
+                        && got_hops != (int)json_integer_value(w_hops)) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: business_post_last[%s].hops=%d, "
+                                 "expected %d", pid, bpl_did, got_hops,
+                                 (int)json_integer_value(w_hops));
+                        return -1;
+                    }
+                    json_t *w_bundle = json_object_get(bpl_want, "bundle");
+                    if (json_is_string(w_bundle)
+                        && strcmp(bundle, json_string_value(w_bundle)) != 0) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: business_post_last[%s].bundle mismatch",
+                                 pid, bpl_did);
+                        return -1;
+                    }
+                }
+            } else if (strcmp(key, "business_posts_emitted") == 0) {
+                /* peer_business_post emissions attributed to this participant
+                 * (Phase 3 P3.4). THE RELAY ASSERTION, and the twin of
+                 * business_ads_emitted: a node that HOLDS THE PAGE relays once
+                 * (1), a node that does not stays silent (0) — which is the
+                 * audience gate made observable rather than argued for. */
+                int want = (int)json_integer_value(val);
+                int got = 0;
+                for (size_t i = 0; i < ctx->captured_count; i++) {
+                    if (strcmp(ctx->captured[i].from, pid) == 0
+                        && strcmp(ctx->captured[i].function,
+                                  "peer_business_post") == 0)
+                        got++;
+                }
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: business_posts_emitted=%d, expected %d",
+                             pid, got, want);
+                    return -1;
+                }
             } else if (strcmp(key, "dm_last") == 0) {
                 /* {peer_id: {seq, text}} (Increment 6) — the most-recent DM this
                  * participant received from another, via identity_get_last_dm.
@@ -4614,6 +4758,7 @@ void at_identity_run(const at_case_t *c, at_case_result_t *out) {
                      strncmp(fn, "peer_post", 9) == 0 ||
                      strncmp(fn, "peer_reaction", 13) == 0 ||
                      strncmp(fn, "peer_business_ad", 16) == 0 ||
+                     strncmp(fn, "peer_business_post", 18) == 0 ||
                      strncmp(fn, "peer_cosign_request", 19) == 0 ||
                      strncmp(fn, "peer_cosign_sig", 15) == 0 ||
                      strncmp(fn, "trigger_advertise_business", 26) == 0 ||
