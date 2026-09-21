@@ -453,6 +453,16 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.business_customers: dict = {}
         self.business_pages: dict = {}
         self._seen_business_ad_ids: list = []
+        # Business posts (Phase 3 P3.4). _seen_business_post_ids is the
+        # post-content dedup ring (what stops a relayed post echoing round the
+        # group); _business_post_seq is THIS node's own publish counter;
+        # last_business_post is the assertion surface, keyed by POLITY DID —
+        # a post belongs to the business, not to whoever relayed it. Twins of C
+        # id_state.seen_business_posts / business_post_seq /
+        # last_business_post_map.
+        self._seen_business_post_ids: list = []
+        self._business_post_seq: int = 0
+        self.last_business_post: dict = {}
         # Detached co-signing (Phase 3 P3.3). The most recent ask received from
         # each peer, and the most recent signature each peer returned — a live
         # stream, never roster-replayed, exactly like a DM. Nothing here is
@@ -486,6 +496,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.position_query, self.handle_position_query)
         self.protocol.register_handler(IdentityProtocol.position_response, self.handle_position_response)
         self.protocol.register_handler(IdentityProtocol.business_ad, self.handle_business_ad)
+        self.protocol.register_handler(IdentityProtocol.business_post, self.handle_business_post)
         self.protocol.register_handler(IdentityProtocol.cosign_request,
                                        self.handle_cosign_request)
         self.protocol.register_handler(IdentityProtocol.cosign_sig, self.handle_cosign_sig)
@@ -4790,6 +4801,246 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         ``identity_get_customer_satisfaction``."""
         rec = self._business_is_customer(did)
         return int(rec.get('sat', -1)) if rec else -1
+
+    # ------------------------------------------------------------------
+    # Business posts (Phase 3 P3.4, "the polity speaking, in the feed").
+    #
+    # A page is what the business IS; a post is what it SAYS. Two differences
+    # from an ad, both following from where the authority lives:
+    #   - A post RELAYS (POST_MAX_HOPS), because its authority is the ENVOY
+    #     signature sealed inside the opaque bundle and no carrier can launder
+    #     it. A relay forwards the ORIGINAL envelope and changes only the hop
+    #     count, so a post keeps ONE content id however many paths it travels.
+    #     An ad is first-person and is therefore never forwarded at all.
+    #   - A post is GATED ON THE PAGE, not on patronage: a node holding no page
+    #     for the polity drops it AND DOES NOT RELAY IT, so posts travel only
+    #     through the part of the network that already knows the business.
+    # What this runtime verifies is the sender's Ed25519 signature over the
+    # canonical bytes — that this copy arrived unaltered. WHO MAY SPEAK FOR THE
+    # BUSINESS is not a question it can answer; the app answers it against the
+    # bundle. Twin of the C block in id_proc.c (handle_business_post,
+    # _business_post_send, _business_page_held).
+    # ------------------------------------------------------------------
+
+    def _business_post_seen_or_record(self, post_id):
+        """Bounded content-id dedup for business posts — what stops a relayed
+        post echoing round the group. Twin of C
+        ``_business_post_seen_or_record``."""
+        with self.lock:
+            if post_id in self._seen_business_post_ids:
+                return True
+            self._seen_business_post_ids.append(post_id)
+            if len(self._seen_business_post_ids) > 256:
+                self._seen_business_post_ids.pop(0)
+            return False
+
+    def _business_page_held(self, did):
+        """THE AUDIENCE GATE: does this node hold a page for ``did``? A post
+        from a business we know nothing about is dropped unread and unrelayed.
+        Twin of C ``_business_page_held``."""
+        with self.lock:
+            return str(did) in self.business_pages
+
+    def _business_post_publish(self, queues, did, seq, bundle):
+        """PUBLISH a business post: sign the canonical form with THIS node's key
+        and group-multicast it at hops 0. Only the publishing node does this — a
+        relay forwards the original envelope instead (see
+        ``_business_post_forward``), because re-signing would change the content
+        id and break the dedup that makes gossip converge. Twin of C
+        ``_business_post_publish``."""
+        from ..capabilities import business_post_sign, business_post_id
+        try:
+            ts = float(time.time())
+            sig = business_post_sign(self.identity.signature.private,
+                                     self.identity.uuid, str(did), int(seq), ts,
+                                     bundle)
+            pk_hex = bytes(self.identity.signature.public).hex()
+            post_id = business_post_id(self.identity.uuid, str(did), int(seq),
+                                       ts, bundle)
+            # Record BEFORE sending so a loopback copy of our own multicast is
+            # deduped rather than re-emitted and relayed back into the group.
+            self._business_post_seen_or_record(post_id)
+            payload = to_json_string({
+                'author': str(self.identity.uuid),
+                'author_pk': pk_hex,
+                'polity': str(did),
+                'seq': int(seq),
+                'ts': ts,
+                'bundle': bundle,
+                'sig': sig,
+                'hops': int(hops),
+            })
+            out = Message(self.name, IdentityProtocol.business_post, payload,
+                          to_whom=self.group, from_whom=self.identity)
+            queues[CfgIds.network].put(out, block=True, timeout=self.q_cadence)
+            self.logger.info('published business post %s for %s seq=%d',
+                             post_id, str(did)[:16], int(seq))
+            return post_id
+        except Full:
+            self.logger.error('_business_post_publish: Network queue full')
+        except Exception as err:
+            self.report_exception(err, '_business_post_publish')
+        return None
+
+    def _business_post_forward(self, queues, body, hops):
+        """RELAY a business post: re-emit the ORIGINAL envelope with the hop
+        count bumped and everything else — publisher, key, signature, seq, ts,
+        bundle — passed through untouched.
+
+        A RELAY MUST NOT RE-SIGN. Signing as ourselves would change the
+        canonical bytes and therefore the content id, so the relayed copy would
+        dedup against nothing and every receiver would hold one copy per relay
+        of the same words. The content address is what makes gossip CONVERGE.
+        It is also why the hop count lives outside the signature. Twin of the C
+        relay branch in ``handle_business_post``."""
+        try:
+            fwd = dict(body)
+            fwd['hops'] = int(hops)
+            out = Message(self.name, IdentityProtocol.business_post,
+                          to_json_string(fwd), to_whom=self.group,
+                          from_whom=self.identity)
+            queues[CfgIds.network].put(out, block=True, timeout=self.q_cadence)
+            self.logger.debug('relayed business post for %s at hops=%d',
+                              str(body.get('polity'))[:16], int(hops))
+            return True
+        except Full:
+            self.logger.error('_business_post_forward: Network queue full')
+        except Exception as err:
+            self.report_exception(err, '_business_post_forward')
+        return False
+
+    def publish_business_post(self, queues, did, bundle, seq=None):
+        """Publish the business's words (twin of C
+        ``handle_app_publish_business_post``). The bundle is opaque here — the
+        app built and ENVOY-signed it through Ethne, and every reader checks
+        that signature itself. THIS CONFERS NOTHING: a node with no delegation
+        can call it and will simply have its post refused everywhere."""
+        from ..capabilities import BUSINESS_SAT_SELF
+        if not did or not bundle:
+            self.logger.warning(
+                'publish_business_post without polity/bundle, refusing')
+            return None
+        if seq is None:
+            # Keep a monotonic seq of our own, so two posts with identical text
+            # do not collapse to one content id.
+            with self.lock:
+                self._business_post_seq += 1
+                seq = self._business_post_seq
+        else:
+            with self.lock:
+                self._business_post_seq = max(self._business_post_seq, int(seq))
+        # The business holds its own page by construction — it just wrote the
+        # post — so record it before publishing. Without this the publisher's
+        # own page gate would refuse a copy of its own post coming back round.
+        self._business_page_store(did, bundle, int(seq), float(time.time()), '',
+                                  BUSINESS_SAT_SELF)
+        return self._business_post_publish(queues, did, int(seq), bundle)
+
+    def handle_business_post(self, queues, message):
+        """An inbound group-multicast business post. Verify the sender's
+        signature over the canonical bytes, GATE on holding this polity's page,
+        dedup by content id, record, then relay one more hop.
+
+        ORDER MATTERS: the gate sits AFTER the signature check (so a forgery is
+        refused as a forgery, not as an unknown business) and BEFORE the record
+        and the relay (so an ungated node neither shows nor spreads it). Twin of
+        the C ``handle_business_post``."""
+        if message.function != IdentityProtocol.business_post:
+            return False
+        try:
+            body = from_json_string(message.obj)
+            if not isinstance(body, dict):
+                return True
+            author = body.get('author')
+            auth_pk = body.get('author_pk')
+            did = body.get('polity')
+            seq = body.get('seq')
+            ts = body.get('ts')
+            bundle = body.get('bundle')
+            sig = body.get('sig')
+            hops = body.get('hops')
+            if not (isinstance(author, str) and isinstance(auth_pk, str)
+                    and isinstance(did, str) and isinstance(seq, int)
+                    and isinstance(ts, (int, float)) and isinstance(bundle, str)
+                    and isinstance(sig, str) and isinstance(hops, int)):
+                self.logger.warning('peer_business_post malformed, refusing')
+                return True
+            from ..capabilities import (business_post_verify, business_post_id,
+                                        bound_business_did,
+                                        bound_business_post_bundle,
+                                        BUSINESS_POST_MAX_HOPS)
+            if not did:
+                self.logger.warning(
+                    'peer_business_post without polity, refusing')
+                return True
+            if hops < 0:
+                self.logger.warning(
+                    'peer_business_post with negative hops, refusing')
+                return True
+            did = bound_business_did(did)
+            bundle = bound_business_post_bundle(bundle)
+            from nacl.signing import VerifyKey
+            # Resolve the verify key, binding uuid <-> key where we can.
+            peer = self.peers.find_by_uuid(author) if self.peers else None
+            if peer is not None:
+                known_pk_hex = bytes(peer.signature.public).hex()
+                if known_pk_hex != auth_pk:
+                    self.logger.warning(
+                        'peer_business_post from %s: author_pk != known key, '
+                        'dropping (impersonation)', str(author)[:8])
+                    return True
+                vk = peer.signature.public
+            else:
+                try:
+                    vk = VerifyKey(bytes.fromhex(auth_pk))
+                except (ValueError, TypeError):
+                    self.logger.warning(
+                        'peer_business_post from %s: bad author_pk, dropping',
+                        str(author)[:8])
+                    return True
+            if not business_post_verify(vk, author, did, int(seq), float(ts),
+                                        bundle, sig):
+                self.logger.warning(
+                    'peer_business_post from %s: BAD SIGNATURE, dropping',
+                    str(author)[:8])
+                return True
+            # THE AUDIENCE GATE: no page for this polity, no post. Dropped here
+            # means not shown AND not relayed.
+            if not self._business_page_held(did):
+                self.logger.debug(
+                    'business post for %s dropped - no page held for that '
+                    'polity', did[:16])
+                return True
+            post_id = business_post_id(author, did, int(seq), float(ts), bundle)
+            if self._business_post_seen_or_record(post_id):
+                self.logger.debug(
+                    'peer_business_post %s already seen, dropping', post_id)
+                return True
+            with self.lock:
+                self.last_business_post[str(did)] = {
+                    'post_id': post_id, 'seq': int(seq), 'ts': float(ts),
+                    'hops': int(hops), 'bundle': bundle,
+                }
+            self.logger.info(
+                'business post %s for %s from %s accepted (hops=%d)', post_id,
+                did[:16], str(author)[:8], int(hops))
+            # Gossip one more hop, under the same bound as a feed post,
+            # FORWARDING THE ORIGINAL ENVELOPE — see _business_post_forward for
+            # why a relay must not re-sign.
+            if int(hops) < BUSINESS_POST_MAX_HOPS:
+                self._business_post_forward(queues, body, int(hops) + 1)
+        except Exception as err:
+            self.report_exception(err, 'handle_business_post')
+        return True
+
+    def get_last_business_post(self, did):
+        """The most-recent business post this node ACCEPTED for polity ``did``,
+        as {'post_id','seq','ts','hops','bundle'}, or {} if none. Keyed by the
+        polity, not by whoever relayed it. Conformance/assertion surface; twin
+        of C ``identity_get_last_business_post``."""
+        with self.lock:
+            rec = self.last_business_post.get(str(did))
+            return dict(rec) if rec else {}
 
     # ------------------------------------------------------------------
     # Detached co-signing (Phase 3 P3.3): a staff roll act decided by people who

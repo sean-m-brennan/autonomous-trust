@@ -182,6 +182,19 @@
  * Forwarded only to the identity process. Sixteenth verb on the app→AT
  * allowlist. */
 #define AT_APP_RETURN_COSIGN "app_return_cosign"
+
+/* App→AT: publish a business POST — the polity speaking (Phase 3 P3.4). The
+ * payload is {"polity": "<did>", "bundle": "<opaque ethne {post,delegation}>",
+ * "seq": <int>}; identity signs the canonical post with this node's Ed25519
+ * key, group-encrypts it and multicasts it, and inbound copies are relayed a
+ * bounded number of hops.
+ *
+ * The bundle is opaque to the core, exactly as a page bundle is: the ENVOY
+ * signature inside it is what makes these the business's words, and only the
+ * app can check it. Being on the roll — or running this verb at all — confers
+ * nothing. Forwarded only to the identity process. Seventeenth verb on the
+ * app→AT allowlist. */
+#define AT_APP_PUBLISH_BUSINESS_POST "app_publish_business_post"
 #endif /* AT_SOCIAL_ENABLED */
 
 #define DEFAULT_MAX_MSG_SIZE 1024

@@ -1,0 +1,72 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: business-post-shared
+byte_pinning: false
+description: |
+    A business post, the happy path (Phase 3 P3.4). A page is what a business
+    IS; a post is what it SAYS. The post carries an opaque, self-verifying
+    Ethne {post,delegation} bundle — the ENVOY's signature over the body — and
+    the runtime never parses it. What the runtime verifies is the AT layer: a
+    detached Ed25519 signature binding WHO SENT THIS COPY and WHICH exact
+    bundle bytes they sent.
+
+    TWO STEPS, because the audience gate makes them inseparable. newcomer must
+    already hold the cafe's PAGE before a post from the cafe means anything to
+    it, so step 1 is the ad that teaches it (P3.2) and step 2 is the post.
+    Reverse that order and the post is refused — which is the point, and is
+    what business-post-unknown-polity-dropped pins.
+
+    newcomer relays: holding the page is exactly what authorizes carrying the
+    words, so business_posts_emitted is 1 at hops 0 in, hops 1 out.
+
+    Step 1: bg -> newcomer peer_business_ad {sat: 255 (SAT_SELF), seq: 1}.
+    Step 2: bg -> newcomer peer_business_post {seq: 1, hops: 0}.
+      - Both runtimes: verify bg's signature, find the page, record the post,
+        relay it once.
+
+participants:
+  - id: bg
+    role: border_guard
+  - id: newcomer
+    role: new_node
+
+steps:
+  - id: 1
+    from: bg
+    to: newcomer
+    function: peer_business_ad
+    payload:
+      polity: "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"
+      sat: 255
+      seq: 1
+      ts: 0
+      bundle: '{"page":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ","name":"Corner Cafe","locality":"9q8yyk8y"},"sig":"stub"},"delegation":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"},"sig":"stub"}}'
+    description: |
+        bg's signed ad for its own page — how newcomer comes to know the cafe
+        at all. Without it there is no audience for a post.
+  - id: 2
+    from: bg
+    to: newcomer
+    function: peer_business_post
+    payload:
+      polity: "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"
+      seq: 1
+      ts: 0
+      hops: 0
+      bundle: '{"post":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ","body":"Fresh croissants at seven.","seq":1},"sig":"stub"},"delegation":{"payload":{"polity":"did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ"},"sig":"stub"}}'
+    description: |
+        The cafe speaking. newcomer holds the page, so it accepts, records and
+        relays.
+
+expected_state:
+  newcomer:
+    business_page:
+      "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ":
+        seq: 1
+        endorsers: 0
+    business_post_last:
+      "did:key:z6MkvZr75pe3PnPy11ixErx25xJ83E6MkqQQc4JpRogj3ytJ":
+        seq: 1
+        hops: 0
+    business_posts_emitted: 1

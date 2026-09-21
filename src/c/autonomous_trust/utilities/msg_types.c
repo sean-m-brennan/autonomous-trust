@@ -94,6 +94,8 @@ size_t message_size(message_type_t type)
         return sizeof(peer_cosign_request_msg_t);
     case PEER_COSIGN_SIG_OBSERVED:
         return sizeof(peer_cosign_sig_msg_t);
+    case PEER_BUSINESS_POST_OBSERVED:
+        return sizeof(peer_business_post_msg_t);
 #endif /* AT_SOCIAL_ENABLED */
 #ifdef AT_ZTA_ENABLED
     case ZTA_REVOCATION_ALERT:
@@ -169,6 +171,8 @@ char *message_type_to_string(message_type_t type)
         return (char*)"PEER_PROXIMITY_OBSERVED";
     case PEER_BUSINESS_AD_OBSERVED:
         return (char*)"PEER_BUSINESS_AD_OBSERVED";
+    case PEER_BUSINESS_POST_OBSERVED:
+        return (char*)"PEER_BUSINESS_POST_OBSERVED";
     case PEER_COSIGN_REQUEST_OBSERVED:
         return (char*)"PEER_COSIGN_REQUEST_OBSERVED";
     case PEER_COSIGN_SIG_OBSERVED:
@@ -250,6 +254,8 @@ message_type_t string_to_message_type(const char *str)
         return PEER_PROXIMITY_OBSERVED;
     if (strcmp(str, "PEER_BUSINESS_AD_OBSERVED") == 0)
         return PEER_BUSINESS_AD_OBSERVED;
+    if (strcmp(str, "PEER_BUSINESS_POST_OBSERVED") == 0)
+        return PEER_BUSINESS_POST_OBSERVED;
     if (strcmp(str, "PEER_COSIGN_REQUEST_OBSERVED") == 0)
         return PEER_COSIGN_REQUEST_OBSERVED;
     if (strcmp(str, "PEER_COSIGN_SIG_OBSERVED") == 0)
@@ -328,6 +334,27 @@ int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr
         json_object_set_new(root, "group_multicast", json_boolean(true));
 #endif /* AT_SOCIAL_ENABLED */
     json_object_set_new(root, "return_to", json_string(msg->return_to));
+    /* THE SIGNATURE VERDICT, and why it must cross this hop.
+     *
+     * net_proc verifies a frame's Ed25519 signature at parse time and records
+     * the answer in net_msg_t. Everything that ACTS on that answer — the group
+     * key rotation gate, the hierarchy gate — lives in the identity process,
+     * on the far side of this AF_UNIX hop. These two fields were never
+     * serialized, so the receiving process read them as false for EVERY
+     * message it has ever handled: a verdict computed correctly and then
+     * thrown away one queue short of the code that needed it.
+     *
+     * Cost, measured: across 25 preserved live-cohort runs, 107 group-key
+     * rotations were minted and NOT ONE was ever adopted, because
+     * handle_group_update's `nmsg->verified` could not be true. A cohort whose
+     * members rotate simultaneously then stays forked forever.
+     *
+     * This is LOCAL IPC between our own processes on one node, so carrying the
+     * verdict is not a trust extension — the alternative is not "safer", it is
+     * a gate that can never open. Omitted-on-read defaults to false, so an
+     * older peer of this serializer stays compatible. */
+    json_object_set_new(root, "verified", json_boolean(msg->verified));
+    json_object_set_new(root, "has_signature", json_boolean(msg->has_signature));
 
     char uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(msg->from_whom.uuid, uuid_str);
@@ -565,6 +592,14 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         memcpy(subdata, &msg->info.peer_business_ad, subdata_len);
         break;
     }
+    case PEER_BUSINESS_POST_OBSERVED:
+    {
+        subdata_len = sizeof(peer_business_post_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.peer_business_post, subdata_len);
+        break;
+    }
     case PEER_COSIGN_REQUEST_OBSERVED:
     {
         subdata_len = sizeof(peer_cosign_request_msg_t);
@@ -709,6 +744,13 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
     net_msg->group_multicast =
         json_boolean_value(json_object_get(root, "group_multicast"));
 #endif /* AT_SOCIAL_ENABLED */
+
+    /* See net_msg_to_proto: the wire-parse signature verdict, absent here for
+     * as long as this serializer has existed. Defaults false when the field is
+     * missing, so a message from an older sender behaves exactly as before. */
+    net_msg->verified = json_boolean_value(json_object_get(root, "verified"));
+    net_msg->has_signature =
+        json_boolean_value(json_object_get(root, "has_signature"));
 
     const char *ret = json_string_value(json_object_get(root, "return_to"));
     if (ret)
@@ -877,6 +919,9 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
         break;
     case PEER_BUSINESS_AD_OBSERVED:
         COPY_FIXED_PAYLOAD(peer_business_ad, peer_business_ad_msg_t);
+        break;
+    case PEER_BUSINESS_POST_OBSERVED:
+        COPY_FIXED_PAYLOAD(peer_business_post, peer_business_post_msg_t);
         break;
     case PEER_COSIGN_REQUEST_OBSERVED:
         COPY_FIXED_PAYLOAD(peer_cosign_request, peer_cosign_request_msg_t);

@@ -539,6 +539,7 @@ DEFINE_TEST(test_every_app_verb_is_allowlisted_for_routing)
         AT_APP_REQUEST_PROXIMITY,
         AT_APP_ADVERTISE_BUSINESS, AT_APP_SET_CUSTOMER,
         AT_APP_REQUEST_COSIGN, AT_APP_RETURN_COSIGN,
+        AT_APP_PUBLISH_BUSINESS_POST,
 #endif
     };
 
@@ -584,7 +585,9 @@ END_TEST_DEFINITION()
  * band, P3.2's business ads and P3.3's two co-signing types were all added to
  * the enum and to id_proc's emitters WITHOUT being added here, and the cosign
  * pair really was missing from the switch — found by a live cohort rather than
- * by this test. Adding a PEER_*_OBSERVED enumerator means adding it here. */
+ * by this test. Adding a PEER_*_OBSERVED enumerator means adding it here.
+ * (P3.4's business post was added here in the same commit as the enum, which is
+ * what this comment is for.) */
 DEFINE_TEST(test_every_app_event_type_forwards_to_the_app_queue)
 {
     queue_t app_q, sender_q;
@@ -600,6 +603,7 @@ DEFINE_TEST(test_every_app_event_type_forwards_to_the_app_queue)
         PEER_DM_OBSERVED, PEER_POST_OBSERVED, PEER_REACTION_OBSERVED,
         PEER_PROXIMITY_OBSERVED, PEER_BUSINESS_AD_OBSERVED,
         PEER_COSIGN_REQUEST_OBSERVED, PEER_COSIGN_SIG_OBSERVED,
+        PEER_BUSINESS_POST_OBSERVED,
 #endif
     };
     const size_t n = sizeof(app_types) / sizeof(app_types[0]);
