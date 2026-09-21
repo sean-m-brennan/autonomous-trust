@@ -287,7 +287,14 @@ static struct {
      * or refused, with the reason kept beside the verdict. */
     map_t resolved_reps;
     reputations_t reputations;
-    map_t my_requests;     /* uuid_str -> tx_score_t* (pending Paxos requests) */
+    map_t my_requests;     /* paxos_id_index -> tx_score_t* (pending Paxos rounds) */
+    /* paxos_id_index -> integer_data(epoch seconds): when a NACKed round of
+     * OURS becomes eligible to be re-proposed. The C twin of Python's
+     * _try_again thread (repprocess.py:877), which sleeps backoff[idx] and
+     * re-runs _start_paxos with the same score. Without it a NACKed round is
+     * simply abandoned — and in a live cohort most rounds ARE nacked, because
+     * every member proposes on the same probe at the same instant. */
+    map_t retry_due;
     map_t updates;         /* uuid_str -> json_t* (pending chain updates) */
     array_t requested_reps; /* array of pending reputation responses */
     paxos_instance_t paxos;
@@ -484,6 +491,7 @@ static void _ensure_init(void)
         map_init(&rep_state.resolved_reps);
         reputations_init(&rep_state.reputations);
         map_init(&rep_state.my_requests);
+        map_init(&rep_state.retry_due);
         map_init(&rep_state.updates);
         array_init(&rep_state.requested_reps);
         map_init(&rep_state.peer_tiers);
@@ -1394,6 +1402,41 @@ static void _publish_exclusion(const process_t *proc,
              excluded ? "excluded" : "readmitted", address);
 }
 
+/* Bring the Paxos chain INDEX into line with the chain itself.
+ *
+ * Python takes the index straight from the chain on both sides of the round —
+ * `id2 = len(self.history) + 1` when proposing (repprocess.py:990) and
+ * `len(self.history) + 1 == id2` when deciding (repprocess.py:761). C instead
+ * kept a private counter, paxos.chain_len, which `paxos_advance_chain`
+ * advances ONLY on a round this node proposed and won.
+ *
+ * Those two quantities agree only while a single node ever proposes. With
+ * three, each node's counter counts its OWN wins while every node's HISTORY
+ * grows on every commit it learns of (handle_committed), so the counters
+ * scatter within seconds. id2 then misses `chain_len + 1` on the acceptors,
+ * every request answers PAXOS_BACKDATE, and the group falls into the
+ * "out of date" -> "update needed" -> "latest update" loop that never
+ * settles — plainly visible in the 2026-09-21 cohort, where the churn ran for
+ * the whole ninety seconds and one of the three nodes committed nothing at
+ * all. Nothing caught it because the conformance harness resets state between
+ * steps, so no scenario has two proposers and a shared chain.
+ *
+ * The chain is the authority; the counter is a cache of it. Syncing here, at
+ * both decision points, is what the Python adapter's own comment already
+ * assumes of us: "The C twin reads tx_history rather than its paxos.chain_len
+ * ballot counter" (harness/python/adapters/reputation.py:130).
+ *
+ * Caller must NOT hold rep_state.lock. */
+static void _sync_chain_index(void)
+{
+    pthread_mutex_lock(&rep_state.lock);
+    int len = tx_history_len(&rep_state.history);
+    pthread_mutex_unlock(&rep_state.lock);
+    pthread_mutex_lock(&rep_state.paxos.lock);
+    rep_state.paxos.chain_len = len;
+    pthread_mutex_unlock(&rep_state.paxos.lock);
+}
+
 /****************************
  * Handler: handle_request (ask permission) — Paxos Phase 1a
  * Validate peer, check id1 > last_id AND chain index matches → grant/nack/backdate
@@ -1447,6 +1490,7 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
 
     int64_t out_last_id = 0;
     int out_chain_len = 0;
+    _sync_chain_index();
     paxos_response_t result = paxos_handle_request(&rep_state.paxos, id1, id2,
                                                    &out_last_id, &out_chain_len);
 
@@ -1573,12 +1617,18 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
 
     pthread_mutex_lock(&rep_state.lock);
 
-    /* Look up this request in my_requests (keyed by peer_uuid) */
-    char peer_uuid_key[UUID_STRING_LEN + 2];
-    strncpy(peer_uuid_key, peer_uuid_str, sizeof(peer_uuid_key) - 1);
-    peer_uuid_key[sizeof(peer_uuid_key) - 1] = '\0';
+    /* Look up this request in my_requests, keyed by the ROUND — the C twin of
+     * Python's `idx = self._paxos_id_index(id1, id2)` (repprocess.py:831).
+     * The key is what the proposer filed under in _forward_transaction, and
+     * the two MUST agree: they did not until 2026-09-21, which is why no live
+     * round ever reached a transaction (see the note there). A uuid key is
+     * wrong in both directions anyway — one proposer runs many concurrent
+     * rounds, so a per-node key collapses them, and the subject uuid is not
+     * even echoed on the grant. */
+    char round_key[PAXOS_KEY_LEN];
+    paxos_id_index(round_key, sizeof(round_key), id1, id2);
     data_t *tx_dat = NULL;
-    if (map_get(&rep_state.my_requests, peer_uuid_key, &tx_dat) != 0)
+    if (map_get(&rep_state.my_requests, round_key, &tx_dat) != 0)
     {
         /* Grant not for one of our requests */
         pthread_mutex_unlock(&rep_state.lock);
@@ -1632,7 +1682,7 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
     if (send_tx)
     {
         /* Remove from my_requests */
-        map_remove(&rep_state.my_requests, peer_uuid_key);
+        map_remove(&rep_state.my_requests, round_key);
         /* Bind the round to OUR primary group, the C twin of Python's
          * _start_paxos(round_group). The tag then travels on the commit
          * broadcast, and each receiver maps it through its own view: a sibling
@@ -1640,8 +1690,6 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
          * groups and routes the entry to that subtree's chain (doc/architecture/gateway-reputation-tree.md). */
         char own_group[UUID_STRING_LEN + 1];
         uuid_unparse_lower(proc->protocol.group.uuid, own_group);
-        char round_key[PAXOS_KEY_LEN];
-        paxos_id_index(round_key, sizeof(round_key), id1, id2);
         _set_round_group_locked(round_key, own_group);
     }
 
@@ -1728,7 +1776,40 @@ static bool handle_nack(const process_t *proc, directory_t *queues, generic_msg_
     int wait_sec = paxos_record_nack(&rep_state.paxos, id1, id2);
 
     log_debug(proc->logger, "Reputation: nack backoff %d seconds\n", wait_sec);
-    (void)wait_sec;
+
+    /* Arm the re-proposal. Python's handle_nack drops a nack for a round it
+     * does not own and otherwise starts a _try_again thread; the C twin can
+     * not sleep in a handler, so it records WHEN the round becomes eligible
+     * and _retry_nacked_rounds re-proposes it from the process loop.
+     *
+     * This side was missing entirely until 2026-09-21 — outside the
+     * conformance-only sync-dispatch branch below, a nack recorded a backoff
+     * nobody ever read and the round was abandoned. That is invisible with
+     * one proposer and fatal with three: in the live cohorts every member
+     * proposes on the same probe in the same millisecond, so ~90% of all
+     * requests are nacked and, unretried, those rounds simply vanish. */
+    if (!rep_state.synchronous_dispatch)
+    {
+        char round_key[PAXOS_KEY_LEN];
+        paxos_id_index(round_key, sizeof(round_key), id1, id2);
+        pthread_mutex_lock(&rep_state.lock);
+        data_t *pending = NULL;
+        if (map_get(&rep_state.my_requests, round_key, &pending) == 0)
+        {
+            data_t *due = integer_data((int)(time(NULL) + wait_sec));
+            map_set(&rep_state.retry_due, round_key, due);
+            pthread_mutex_unlock(&rep_state.lock);
+            log_debug(proc->logger,
+                      "Reputation: round %s nacked; retrying in %d s\n",
+                      round_key, wait_sec);
+        }
+        else
+        {
+            /* Not ours, or already carried to quorum: Python drops these
+             * too (repprocess.py:866). */
+            pthread_mutex_unlock(&rep_state.lock);
+        }
+    }
 
     /* Synchronous-dispatch retry: Python's _try_again thread sleeps for
      * backoff[idx] then re-emits an "ask permission" to self.group.
@@ -2147,7 +2228,14 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
         /* Reset this peer's idle clock: the staleness sweep must leave an
          * actively-transacting peer alone (doc/architecture/reputation.md). */
         _note_interaction(peer_uuid);
-        log_info(proc->logger, "Reputation: Transaction committed\n");
+        /* Name the task. A bare "committed" cannot be tied to the thing that
+         * caused it — which is exactly what stopped the 2026-09-21 cohort
+         * from asserting that an APP-driven round (a post reaction) reached
+         * the chain, as opposed to one of AT's own background probes. The
+         * task uuid is the only identifier both sides of a bilateral
+         * interaction share, so it is the one worth printing. */
+        log_info(proc->logger, "Reputation: Transaction committed (task %s)\n",
+                 have_task_uuid ? task_uuid_str : "-");
 
         /* Phase 3 — broadcast committed (task_id, peer_id, score) to
          * the group so acceptors can write the same entry to their
@@ -3059,13 +3147,32 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
     uuid_unparse_lower(task_uuid, task_str);
     /* The channel is logged AND acted on (R+D.md §12.8): "score 0.30 via
      * certificate" says a proof failed where "score 0.30" alone does not, and
-     * because this is our OWN evidence it also weights the EMA below and, on
-     * a hard channel, proposes a slash at the end of this function. */
+     * because this is our OWN evidence it also weights the EMA below.
+     *
+     * IT DOES NOT PROPOSE A SLASH. This comment used to claim that a hard
+     * channel "proposes a slash at the end of this function"; it never has.
+     * This function ends at the Phase-1a REP_PROTO_REQUEST broadcast, and
+     * REP_PROTO_SLASH_PROPOSE is sent by NOTHING in production code — it is
+     * declared here, registered as a handler, and originated only by
+     * conformance/adapters/reputation.c and test/rep_quorum_test.c. So the
+     * whole slash flow (propose -> sign -> final) is unreachable in a running
+     * system today. Deciding when a node should accuse a peer is a design
+     * question, deliberately left open rather than invented; until it is
+     * answered, treat those three handlers as receive-only. */
     const char *chan = tx_channel_or_default(channel);
     log_info(proc->logger, "Reputation: forwarding transaction for task %s, score %.2f (cap %s, via %s)\n",
              task_str, score,
              (capability_name && capability_name[0]) ? capability_name : "-",
              chan);
+
+    /* Mint the round's ids FIRST: the pending entry below is filed under the
+     * round, so the id has to exist before the entry does. (Python mints in
+     * _start_paxos and keys my_requests with the same idx, repprocess.py:991.) */
+    int64_t id1, id2;
+    _sync_chain_index();
+    paxos_next_ids(&rep_state.paxos, &id1, &id2);
+    char round_key[PAXOS_KEY_LEN];
+    paxos_id_index(round_key, sizeof(round_key), id1, id2);
 
     pthread_mutex_lock(&rep_state.lock);
 
@@ -3090,7 +3197,16 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
          * re-records the SAME weight this round was started with. */
         tx->competence = competence;
         data_t *tx_dat = object_ptr_data(tx, sizeof(tx_score_t));
-        map_set(&rep_state.my_requests, task_str, tx_dat);
+        /* KEYED BY THE ROUND, not by the task and not by a uuid. handle_grant
+         * has only (id1, id2) to go on when a grant comes back, and until
+         * 2026-09-21 this line filed under `task_str` while that lookup used
+         * the peer uuid — so every grant in every live run fell into the
+         * "already-completed or unknown request" branch and NO round ever
+         * reached a transaction. Nothing caught it: the conformance adapter
+         * and rep_quorum_test.c both stage my_requests through
+         * reputation_install_my_request instead of going through this
+         * function, so the two keys never had to agree. */
+        map_set(&rep_state.my_requests, round_key, tx_dat);
     }
 
     /* Cache the weight for this task so _pure_reputation can aggregate it
@@ -3102,10 +3218,6 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
     _record_task_tier_locked(task_str, _resolve_tx_tier(capability_name));
 
     pthread_mutex_unlock(&rep_state.lock);
-
-    /* Compute Paxos IDs via shared engine */
-    int64_t id1, id2;
-    paxos_next_ids(&rep_state.paxos, &id1, &id2);
 
     /* Get identity UUID for the request */
     char identity_uuid[UUID_STRING_LEN + 1];
@@ -3676,6 +3788,12 @@ static bool handle_slash_propose(const process_t *proc, directory_t *queues, gen
     net_msg_pack_json(&sign.info.net_msg, sign_json);
     json_decref(sign_json);
     messaging_send("network", NET_MESSAGE, &sign, false);
+    /* THE SUCCESS SIDE. Every other outcome of this handler says something;
+     * agreeing said nothing, so a round that worked was indistinguishable
+     * from one that never started. A slash only lands once a quorum co-signs. */
+    log_info(proc->logger,
+             "Reputation: co-signed slash_propose from %s\n",
+             nmsg->from_whom.nickname);
     return true;
 }
 
@@ -3683,8 +3801,17 @@ static bool handle_slash_sign(const process_t *proc, directory_t *queues, generi
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
-    if (!nmsg->verified)
+    if (!nmsg->verified) {
+        /* WAS SILENT. Every sibling gate in this file logs its refusal; this
+         * one and handle_checkpoint_sign returned bare, so a co-signature
+         * dropped here is indistinguishable from one that never arrived —
+         * the quorum simply never completes and no line says why. That is the
+         * shape of failure that cost four host runs in P3.3. */
+        log_warn(proc->logger,
+                 "Reputation: rejecting unverified slash_sign from %s\n",
+                 nmsg->from_whom.nickname);
         return true;
+    }
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
         return false;
@@ -4092,6 +4219,12 @@ static bool handle_checkpoint_propose(const process_t *proc, directory_t *queues
     net_msg_pack_json(&sign.info.net_msg, sign_json);
     json_decref(sign_json);
     messaging_send("network", NET_MESSAGE, &sign, false);
+    /* THE SUCCESS SIDE. Every other outcome of this handler says something;
+     * agreeing said nothing, so a round that worked was indistinguishable
+     * from one that never started. A checkpoint only anchors evidence once a quorum co-signs. */
+    log_info(proc->logger,
+             "Reputation: co-signed checkpoint_propose from %s\n",
+             nmsg->from_whom.nickname);
     return true;
 }
 
@@ -4099,8 +4232,15 @@ static bool handle_checkpoint_sign(const process_t *proc, directory_t *queues, g
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
-    if (!nmsg->verified)
+    if (!nmsg->verified) {
+        /* WAS SILENT — see the note in handle_slash_sign. A checkpoint that
+         * never reaches quorum because its acks were dropped here looks
+         * exactly like a checkpoint nobody answered. */
+        log_warn(proc->logger,
+                 "Reputation: rejecting unverified checkpoint_sign from %s\n",
+                 nmsg->from_whom.nickname);
         return true;
+    }
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
         return false;
@@ -6261,6 +6401,97 @@ void reputation_force_checkpoint(const process_t *proc,
                           chain_key == NULL ? "" : chain_key);
 }
 
+/* How many nacked rounds one pass may re-propose. A cohort bootstrap nacks in
+ * bursts, and re-broadcasting every one of them in the same tick would
+ * recreate the collision that nacked them in the first place. */
+#define REP_RETRY_PER_PASS 4
+
+/* Re-propose our rounds whose backoff has expired: same task, same score,
+ * FRESH ballot ids. The C twin of Python's _try_again thread
+ * (repprocess.py:877), moved into the process loop because a handler cannot
+ * sleep.
+ *
+ * Collect-then-act: _forward_transaction takes rep_state.lock itself, so the
+ * due rounds are copied out and the lock released before any of them is
+ * re-proposed. */
+void _retry_nacked_rounds(const process_t *proc, double present,
+                          const uuid_t self_uuid, bool have_self)
+{
+    if (!have_self)
+        return;   /* no identity to name as the proposer yet */
+
+    struct {
+        bool   resend;      /* false == the alarm is stale, just clear it */
+        uuid_t task;
+        double score;
+        char   cap[CAP_NAMELEN + 1];
+        char   channel[TX_CHANNEL_NAMELEN + 1];
+        double competence;
+    } due[REP_RETRY_PER_PASS] = {0};
+    char due_keys[REP_RETRY_PER_PASS][PAXOS_KEY_LEN];
+    size_t n_due = 0;
+
+    pthread_mutex_lock(&rep_state.lock);
+    map_key_t key = NULL;
+    data_t *value = NULL;
+    map_entries_for_each(&rep_state.retry_due, key, value)
+    {
+        if (n_due >= REP_RETRY_PER_PASS)
+            break;
+        int when = 0;
+        if (data_integer(value, &when) != 0 || (double)when > present)
+            continue;
+        strncpy(due_keys[n_due], key, PAXOS_KEY_LEN - 1);
+        due_keys[n_due][PAXOS_KEY_LEN - 1] = '\0';
+
+        data_t *tx_dat = NULL;
+        tx_score_t *tx = NULL;
+        if (map_get(&rep_state.my_requests, key, &tx_dat) == 0)
+            data_object_ptr(tx_dat, (void **)&tx);
+        if (tx != NULL)
+        {
+            due[n_due].resend = true;
+            uuid_copy(due[n_due].task, tx->task_uuid);
+            due[n_due].score = tx->score;
+            memcpy(due[n_due].cap, tx->capability_name,
+                   sizeof(due[n_due].cap));
+            due[n_due].cap[CAP_NAMELEN] = '\0';
+            memcpy(due[n_due].channel, tx->channel,
+                   sizeof(due[n_due].channel));
+            due[n_due].channel[TX_CHANNEL_NAMELEN] = '\0';
+            due[n_due].competence = tx->competence;
+        }
+        /* else: the round reached quorum while it was waiting, so there is
+         * nothing to re-propose — only the alarm to clear. */
+        n_due++;
+    }
+    map_end_for_each;
+
+    /* Retire both the alarm and the old pending entry: the re-proposal files
+     * a new one under its new ballot id, and leaving the old behind would
+     * make a late grant for the dead round look live. */
+    for (size_t i = 0; i < n_due; i++)
+    {
+        map_remove(&rep_state.retry_due, due_keys[i]);
+        map_remove(&rep_state.my_requests, due_keys[i]);
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+
+    uuid_t no_subject;
+    uuid_clear(no_subject);
+    for (size_t i = 0; i < n_due; i++)
+    {
+        if (!due[i].resend)
+            continue;
+        log_debug(proc->logger, "Reputation: re-proposing round %s\n",
+                  due_keys[i]);
+        _forward_transaction(proc, due[i].task, self_uuid, due[i].score,
+                             due[i].cap[0] != '\0' ? due[i].cap : NULL,
+                             due[i].channel[0] != '\0' ? due[i].channel : NULL,
+                             no_subject, due[i].competence);
+    }
+}
+
 /* Originate a checkpoint on the interval, when the window has actually moved.
  *
  * Two guards, both about not spending the group's bandwidth for nothing. An
@@ -6385,6 +6616,8 @@ void reputation_reset_state(int num_peers)
     /* Clear my_requests; entries are smrt_ptr-backed tx_score_t. */
     map_free(&rep_state.my_requests);
     map_init(&rep_state.my_requests);
+    map_free(&rep_state.retry_due);
+    map_init(&rep_state.retry_due);
     map_free(&rep_state.updates);
     map_init(&rep_state.updates);
     array_free(&rep_state.requested_reps);
@@ -6515,8 +6748,32 @@ void reputation_install_task_weight(const uuid_t task_uuid, int weight)
 void reputation_set_chain_len(int len)
 {
     _ensure_init();
+    /* Stage the CHAIN, not the counter — the counter is derived from it now
+     * (see _sync_chain_index). Python's history_len fixture does exactly
+     * this: "append N zero-Transaction stubs so len(history) returns the
+     * expected value" (harness/python/adapters/reputation.py:526). Setting
+     * paxos.chain_len directly would be staging a cache the production code
+     * overwrites, which is how the two drifted apart unnoticed. */
     pthread_mutex_lock(&rep_state.lock);
-    rep_state.paxos.chain_len = len;
+    uuid_t stub_task, p1, p2;
+    uuid_clear(p1);
+    uuid_clear(p2);
+    p1[15] = 1;
+    p2[15] = 2;
+    /* BOTH sides per stub: tx_history_len counts only BILATERAL entries
+     * (reputation.c:856 — a unilateral tx sitting in chain[] is deliberately
+     * not counted), so a one-sided stub would leave the length at zero and
+     * the fixture would quietly stage nothing. */
+    for (int i = tx_history_len(&rep_state.history); i < len; i++)
+    {
+        uuid_clear(stub_task);
+        /* A distinct task per stub, so each appends instead of merging. */
+        stub_task[0] = (unsigned char)((i + 1) & 0xFF);
+        stub_task[1] = (unsigned char)(((i + 1) >> 8) & 0xFF);
+        tx_history_update(&rep_state.history, stub_task, p1, 0.0, NULL);
+        tx_history_update(&rep_state.history, stub_task, p2, 0.0, NULL);
+    }
+    rep_state.paxos.chain_len = tx_history_len(&rep_state.history);
     pthread_mutex_unlock(&rep_state.lock);
 }
 
@@ -6542,11 +6799,14 @@ void reputation_install_my_request(int64_t id1, int64_t id2,
                                    const uuid_t task_uuid)
 {
     _ensure_init();
-    /* Stage rep_state.my_requests[proposer_uuid_str] = tx_score_t{score, task_uuid}.
-     * handle_grant looks this up by proposer uuid string to find the
-     * pending round and broadcast a transaction on majority. */
-    char proposer_str[UUID_STRING_LEN + 1];
-    uuid_unparse_lower(proposer_uuid, proposer_str);
+    /* Stage rep_state.my_requests[paxos_id_index(id1, id2)] = tx_score_t{score,
+     * task_uuid}: the SAME key _forward_transaction files under, so a staged
+     * round and a real one are indistinguishable to handle_grant. The
+     * proposer uuid is deliberately unused now — staging by it is what let
+     * the production key drift out of agreement unnoticed. */
+    (void)proposer_uuid;
+    char round_key[PAXOS_KEY_LEN];
+    paxos_id_index(round_key, sizeof(round_key), id1, id2);
 
     tx_score_t *tx = smrt_create(sizeof(tx_score_t));
     if (tx == NULL) return;
@@ -6557,7 +6817,7 @@ void reputation_install_my_request(int64_t id1, int64_t id2,
 
     pthread_mutex_lock(&rep_state.lock);
     data_t *tx_dat = object_ptr_data(tx, sizeof(tx_score_t));
-    map_set(&rep_state.my_requests, proposer_str, tx_dat);
+    map_set(&rep_state.my_requests, round_key, tx_dat);
 
     /* Also stage paxos.proposals[id1:id2] = {score} so handle_accepted's
      * score lookup succeeds. paxos_record_grant does the right thing. */
@@ -6909,6 +7169,19 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
 {
     _ensure_init();
 
+    /* NOTE, unresolved and deliberately left alone (2026-09-21): this reads
+     * the peer count ONCE, before discovery has found anybody, so in
+     * production it is 0 for the life of the process and
+     * PAXOS_MAJORITY(0) == 1. One grant therefore carries a round.
+     *
+     * That happens to be what Python does for a small group — its
+     * _quorum_for_group is len(peers.all) // 2, which is also 1 for two or
+     * three peers — so live behaviour matches the reference today. It stops
+     * matching as the group grows: Python's threshold rises and this one does
+     * not, and merely refreshing num_peers here would NOT fix it, because the
+     * two formulas differ (n/2 + 1 against n // 2). Aligning them changes how
+     * many grants a commit needs, which is a protocol decision and not a
+     * cleanup. */
     peers_read_lock(proc);
     rep_state.num_peers = (int)proc->protocol.num_peers;
     peers_read_unlock(proc);
@@ -6972,6 +7245,10 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
                 uuid_unparse_lower(self_uuid, self_str);
         }
         _maybe_checkpoint(proc, present, have_self ? self_str : NULL);
+        /* Rounds of ours that were nacked and have waited out their backoff.
+         * Without this a nacked round is lost, and in a three-node cohort
+         * most rounds are nacked. */
+        _retry_nacked_rounds(proc, present, self_uuid, have_self);
         /* A gateway's child groups arrive over IPC (CHILD_GROUP) after this
          * process was constructed, so their persisted evidence is restored
          * here rather than at boot. Idempotent per group. */

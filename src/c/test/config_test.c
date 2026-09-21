@@ -23,9 +23,13 @@
 
 #include "autonomous_trust/config/configuration.h"
 #include "autonomous_trust/processes/process_tracker.h"
+#include "autonomous_trust/structures/map.h"
+#include "autonomous_trust/utilities/exception.h"
 #include "autonomous_trust/utilities/logger.h"
 
 extern int config_absolute_path(const char *path_in, char *path_out);
+extern int load_all_configs(char *cfg_dir, map_t *configs, logger_t *logger);
+
 extern int load_config(char *filepath, config_t **config_ptr,
                        char *cfg_name, logger_t *logger);
 
@@ -281,6 +285,98 @@ DEFINE_TEST(test_tracker_config_respects_its_destlen)
 }
 END_TEST_DEFINITION()
 
+/* A config directory holds files the registry does not own. reputation.cfg.json
+ * is the standing example: rep_proc.c writes it on shutdown and reads it back
+ * itself, deliberately outside the registry and carrying Python's __type__ so
+ * either runtime can resume from it.
+ *
+ * Until 2026-09-21 load_all_configs aborted the whole scan on any name it did
+ * not recognize, and the daemon died with it. Since the reputation process
+ * writes that file the first time it shuts down, EVERY node that had run
+ * reputation refused to start again — proven on a live node here: "No config
+ * for reputation", exit 17 ms in. No cohort saw it, because a cohort makes
+ * fresh nodes and never restarts one.
+ *
+ * Python's load_configs is lenient by documented intent (discover.py:35-44).
+ * These two pin the C side to the same rule, and to the distinction that makes
+ * it safe: unknown is skipped, MALFORMED is still fatal. */
+
+static int _write_file(const char *path, const char *body)
+{
+    FILE *f = fopen(path, "w");
+    if (f == NULL) return -1;
+    fputs(body, f);
+    fclose(f);
+    return 0;
+}
+
+DEFINE_TEST(test_an_unregistered_config_section_is_skipped_not_fatal)
+{
+    char root[] = "/tmp/at_cfg_lenient_XXXXXX";
+    ck_assert_ptr_nonnull(mkdtemp(root));
+    char cfg_dir[256];
+    snprintf(cfg_dir, sizeof(cfg_dir), "%s/etc/at", root);
+    char mk[512];
+    snprintf(mk, sizeof(mk), "mkdir -p %s", cfg_dir);
+    ck_assert_int_eq(system(mk), 0);
+    setenv("AUTONOMOUS_TRUST_ROOT", root, 1);
+
+    /* One file the registry owns, and one it does not — the reputation
+     * snapshot, verbatim in the shape rep_proc.c writes. */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/identity.cfg.json", cfg_dir);
+    ck_assert_int_eq(_write_file(path,
+        "{\"typename\": \"identity\", \"uuid\": "
+        "\"11111111-1111-1111-1111-111111111111\", "
+        "\"address\": \"10.0.0.1\", \"fullname\": \"n\", "
+        "\"nickname\": \"n\"}"), 0);
+    snprintf(path, sizeof(path), "%s/reputation.cfg.json", cfg_dir);
+    ck_assert_int_eq(_write_file(path,
+        "{\"__type__\": "
+        "\"autonomous_trust.core._python.reputation.reputation.Reputations\", "
+        "\"current\": {}}"), 0);
+
+    map_t *configs = NULL;
+    ck_assert_ret_ok(map_create(&configs));
+    int rc = load_all_configs(cfg_dir, configs, &_m2_test_logger);
+
+    /* Not fatal. Before the fix this returned -1 and the node exited. */
+    ck_assert(rc >= 0);
+    _test_count++;
+    /* And the file the registry DOES own was still loaded — proving the scan
+     * continued rather than merely failing quietly. */
+    data_t *found = NULL;
+    ck_assert_ret_ok(map_get(configs, (map_key_t)"identity", &found));
+
+    unsetenv("AUTONOMOUS_TRUST_ROOT");
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_a_malformed_known_config_is_still_fatal)
+{
+    /* The other half: leniency must not swallow a broken file that IS ours.
+     * A section we own that cannot be parsed still stops the scan. */
+    char root[] = "/tmp/at_cfg_broken_XXXXXX";
+    ck_assert_ptr_nonnull(mkdtemp(root));
+    char cfg_dir[256];
+    snprintf(cfg_dir, sizeof(cfg_dir), "%s/etc/at", root);
+    char mk[512];
+    snprintf(mk, sizeof(mk), "mkdir -p %s", cfg_dir);
+    ck_assert_int_eq(system(mk), 0);
+    setenv("AUTONOMOUS_TRUST_ROOT", root, 1);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/identity.cfg.json", cfg_dir);
+    ck_assert_int_eq(_write_file(path, "{ this is not json"), 0);
+
+    map_t *configs = NULL;
+    ck_assert_ret_ok(map_create(&configs));
+    ck_assert_int_eq(load_all_configs(cfg_dir, configs, &_m2_test_logger), -1);
+
+    unsetenv("AUTONOMOUS_TRUST_ROOT");
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(Config, test_get_cfg_dir, test_get_data_dir,
           test_get_dirs_empty_root, test_find_configuration_missing,
           test_find_configuration_exists, test_config_absolute_path,
@@ -288,4 +384,6 @@ RUN_TESTS(Config, test_get_cfg_dir, test_get_data_dir,
           test_load_config_cfg_name_bounded,
           test_get_dirs_respect_the_destlen_they_are_given,
           test_get_dirs_refuse_a_root_too_long_for_the_buffer,
-          test_tracker_config_respects_its_destlen)
+          test_tracker_config_respects_its_destlen,
+          test_an_unregistered_config_section_is_skipped_not_fatal,
+          test_a_malformed_known_config_is_still_fatal)
