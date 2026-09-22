@@ -223,6 +223,18 @@ void reputation_install_tx_single(const uuid_t task_uuid,
  *  reputation (consumed by _compute_reputation's coop-mode latch). */
 void reputation_install_peer_reputation(const uuid_t peer_uuid, double score);
 
+/** Run the rescore sweep now, as the process loop does (Phase 4 P4.1): score
+ *  every peer whose chain advanced since it was last scored plus every
+ *  admitted peer never scored, and publish each tier and app event.
+ *  Throttled to AT_REP_RESCORE_SEC; @p self_uuid (may be NULL) is skipped.
+ *  Returns the number of peers scored. */
+int reputation_rescore_sweep(const process_t *proc, double present,
+                             const uuid_t self_uuid);
+
+/** What every commit does to its peer (the idle clock, and marking it due for
+ *  the next rescore sweep), without driving a Paxos round. Test hook. */
+void reputation_note_interaction(const uuid_t peer_uuid);
+
 /** Pre-install the coop-mode latch entry for @p peer_uuid. When @p
  *  in_coop is true, the next compute uses COOP_EXIT (0.45) as the
  *  pure-vs-CTFT gate; when false, COOP_ENTER (0.55). Mirrors Python's

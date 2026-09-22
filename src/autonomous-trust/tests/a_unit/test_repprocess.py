@@ -818,6 +818,32 @@ class TestHandleNackDeeper:
         assert result is True
         assert idx in rp.backoff
 
+    def test_backdate_starts_retry(self):
+        """A backdate used to request the chain and abandon the round, so one
+        every acceptor backdated never committed (moderation_cohort.sh's
+        report). It now arms the same retry a nack does. Mirrors C's
+        test_a_backdated_round_is_re_proposed_and_can_commit."""
+        rp = _make_rep_process()
+        peer = _make_mock_peer()
+        idx = rp._paxos_id_index(100, 1)
+        rp.my_requests[idx] = TxCount(TransactionScore(uuid4(), 0.15), 0)
+        rp._request_update = MagicMock()
+        msg = Message(CfgIds.reputation, ReputationProtocol.backdate,
+                      to_yaml_string((100, 1, peer.uuid)), from_whom=peer)
+        assert rp.handle_backdate({CfgIds.network: queue.Queue()}, msg) is True
+        rp._request_update.assert_called_once()
+        assert idx in rp.backoff
+
+    def test_backdate_unknown_request_arms_nothing(self):
+        rp = _make_rep_process()
+        peer = _make_mock_peer()
+        idx = rp._paxos_id_index(100, 1)
+        rp._request_update = MagicMock()
+        msg = Message(CfgIds.reputation, ReputationProtocol.backdate,
+                      to_yaml_string((100, 1, peer.uuid)), from_whom=peer)
+        assert rp.handle_backdate({CfgIds.network: queue.Queue()}, msg) is True
+        assert idx not in rp.backoff
+
     def test_nack_unknown_request_dropped(self):
         """A nack for an idx not in my_requests is dropped without retry."""
         rp = _make_rep_process()
