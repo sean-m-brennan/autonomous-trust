@@ -1,0 +1,96 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: report-capped-per-day
+byte_pinning: false
+description: |
+    One report per target per day, enforced on BOTH sides (Agora Phase 4 P4.1).
+
+    One report is one account; a second the same day adds no information and
+    would only compound the first. So SOCIAL_REPORT_DAILY_CAP is 1, and a report
+    ALSO spends the shared per-edge and global accrual budget — report-spam
+    costs the spammer their own ability to accrue.
+
+    Reporter side (steps 1-3). node reports alice twice: the second is refused
+    BEFORE anything is sent, so alice pairs exactly one (`n: 1` on both sides).
+    Refused-but-sent would be worse than useless — alice would stage a half node
+    never matches. node then reports bob, and that one goes through: the cap is
+    per TARGET, not per day overall.
+
+    Reported side (steps 4-5). carol sends node two reports with fresh seqs —
+    the replay guard is not what refuses the second. node pairs one. This is the
+    bound that holds against a FORKED reporter, whose own caps are whatever it
+    says they are. It is deliberately not charged to node's shared budget:
+    otherwise a node that had spent its budget on ordinary interactions would be
+    unreportable for the rest of the day.
+
+    Requires CONFORMANCE_SOCIAL=1, or the C side skips and diff_results scores
+    a one-side skip as a match.
+
+participants:
+  - id: node
+    role: border_guard
+  - id: alice
+    role: group_member
+  - id: bob
+    role: group_member
+  - id: carol
+    role: group_member
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: trigger_report
+    payload:
+      peer: alice
+    description: node reports alice. Sent, staged, paired.
+  - id: 2
+    from: node
+    to: node
+    function: trigger_report
+    payload:
+      peer: alice
+    description: |
+        node reports alice again the same day. Refused before the send:
+        nothing is staged on either side.
+  - id: 3
+    from: node
+    to: node
+    function: trigger_report
+    payload:
+      peer: bob
+    description: The cap is per target — bob is still reportable today.
+  - id: 4
+    from: carol
+    to: node
+    function: peer_report
+    payload:
+      seq: 1
+    description: carol reports node. node pairs it.
+  - id: 5
+    from: carol
+    to: node
+    function: peer_report
+    payload:
+      seq: 2
+    description: |
+        A second report from carol with a FRESH seq. The inbound cap refuses
+        it; n stays 1.
+
+expected_state:
+  node:
+    social_tx_last:
+      alice:
+        score: 0.15
+        n: 1
+      bob:
+        score: 0.15
+        n: 1
+      carol:
+        score: 0.65
+        n: 1
+  alice:
+    social_tx_last:
+      node:
+        n: 1

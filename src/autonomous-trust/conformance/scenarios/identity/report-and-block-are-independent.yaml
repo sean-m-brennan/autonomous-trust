@@ -1,0 +1,84 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: report-and-block-are-independent
+byte_pinning: false
+description: |
+    A block does not stop OUR report, and does stop us pairing THEIRS
+    (Agora Phase 4 P4.1).
+
+    Block and report are two verbs, and the app's "Block · Both" sends both in
+    whatever order it likes. So blocking alice and then reporting her must
+    still stage the report: the block gate on positive accrual exists because a
+    blocked peer has been told nothing and would never stage the other half —
+    but a report tells them. (A report does not imply a block either; that
+    direction needs no scenario, because the report verb has no block path.)
+
+    The other direction is the block's ordinary rule: directed traffic from a
+    blocked peer is DROPPED, after the freshness window advances. node blocks
+    bob, bob reports node, and node stages nothing — bob's report never pairs.
+    That is a consequence of node's block, and bob cannot observe it.
+
+    carol is the control for the drop: not blocked, her report to node pairs in
+    the same run.
+
+    Requires CONFORMANCE_SOCIAL=1, or the C side skips and diff_results scores
+    a one-side skip as a match.
+
+participants:
+  - id: node
+    role: border_guard
+  - id: alice
+    role: group_member
+  - id: bob
+    role: group_member
+  - id: carol
+    role: group_member
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: trigger_block
+    payload:
+      peer: alice
+    description: node blocks alice.
+  - id: 2
+    from: node
+    to: node
+    function: trigger_report
+    payload:
+      peer: alice
+    description: node reports alice anyway. The report still goes and stages.
+  - id: 3
+    from: node
+    to: node
+    function: trigger_block
+    payload:
+      peer: bob
+    description: node blocks bob.
+  - id: 4
+    from: bob
+    to: node
+    function: peer_report
+    payload:
+      seq: 1
+    description: bob reports node. Dropped — node blocked him.
+  - id: 5
+    from: carol
+    to: node
+    function: peer_report
+    payload:
+      seq: 1
+    description: The control. carol is not blocked; her report pairs.
+
+expected_state:
+  node:
+    social_tx_last:
+      alice:
+        score: 0.15
+        channel: first_person
+      bob:
+        absent: true
+      carol:
+        score: 0.65

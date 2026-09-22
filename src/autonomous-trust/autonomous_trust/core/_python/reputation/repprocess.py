@@ -37,7 +37,7 @@ from ..identity.protocol import IdentityProtocol
 from ..identity.identity import (public_identity_to_canonical,
                                  public_identity_from_canonical)
 from ..identity.zta.zta_policy import ZtaPolicy
-from ..identity.zta_standing import STANDING_PROVED, STANDING_FAILED
+from ..identity.peer_standing import STANDING_PROVED, STANDING_FAILED
 from .protocol import ReputationProtocol
 from .reputation import (TransactionHistory, Reputation, Reputations,
                          TransactionScore, SlashAttestation, SignedSlash,
@@ -500,12 +500,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self._slashed: dict[str, tuple] = {}
         # ZTA hardening (doc/architecture/zta-integration.md). Volatile, like _slashed:
         # a restart re-derives standing from the admission gate rather than trusting a
-        # file for it. _zta_proved_index: peer -> chain index at its last PROVED
+        # file for it. _peer_proved_index: peer -> chain index at its last PROVED
         #     verification; the point a later failure unwinds back TO.
-        #   _zta_acted:        peer -> the standing already acted on, so the
+        #   _peer_acted:        peer -> the standing already acted on, so the
         #     hourly re-verification of an unchanged verdict is a no-op.
-        self._zta_proved_index: dict[str, int] = {}
-        self._zta_acted: dict[str, tuple] = {}
+        self._peer_proved_index: dict[str, int] = {}
+        self._peer_acted: dict[str, tuple] = {}
         # Proposer-side co-signature accumulation: slash-key -> {voter-uuid-str:
         # detached hex signature over the attestation's designation}. Seeded
         # with the slasher's OWN signature on initiation. Signatures, not bare
@@ -2112,7 +2112,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # doc/architecture/zta-integration.md: child-group evidence can restore standing, but not
                 # past what ZTA proved about the peer holding it. Evidence that
                 # a peer behaved well is not evidence it is who it claims.
-                lift = self._apply_zta_ceiling(peer_uuid, lift)
+                lift = self._apply_standing_ceiling(peer_uuid, lift)
                 if lift <= current:
                     continue
                 self.reputations.current[peer_uuid] = lift
@@ -3086,7 +3086,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 highest = idx
         return highest + 1
 
-    def _zta_unwind_ceiling(self, peer_uuid, anchor_index):
+    def _standing_unwind_ceiling(self, peer_uuid, anchor_index):
         """What the peer's standing may be, judged ONLY on evidence that
         predates its last proved verification (doc/architecture/zta-integration.md).
 
@@ -3119,8 +3119,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             return floor_tier
         return self._evidence_ceilings(window).get(str(peer_uuid), floor_tier)
 
-    def _apply_zta_standings(self, queues):
-        """Act on ZTA findings that have landed since the last sweep.
+    def _apply_peer_standings(self, queues):
+        """Act on authority findings that have landed since the last sweep.
 
         Idempotent by design: it runs every process iteration (like
         ``_restore_child_evidence``) and acts only on a standing it has not
@@ -3128,25 +3128,50 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         periodic re-verification produces by the hour -- must not re-unwind a
         peer that was already unwound.
         """
-        standing = getattr(self.protocol, 'zta_standing', None)
+        standing = getattr(self.protocol, 'peer_standing', None)
         if not standing:
             return
         for key, found in list(standing.items()):
             mark = (found.status, found.ceiling, found.verified_at, found.reason)
-            if self._zta_acted.get(key) == mark:
+            if self._peer_acted.get(key) == mark:
                 continue
-            self._zta_acted[key] = mark
+            self._peer_acted[key] = mark
             if found.status == STANDING_PROVED:
                 # Advance the anchor: everything committed up to now was
                 # observed while this peer's credential verified.
-                self._zta_proved_index[key] = self._current_chain_index()
+                self._peer_proved_index[key] = self._current_chain_index()
                 self.logger.info(
-                    'ZTA: %s proved; unwind anchor set at chain index %d',
-                    key[:8], self._zta_proved_index[key])
+                    'Standing[%s]: %s proved; unwind anchor set at chain '
+                    'index %d', found.source, found.peer_uuid[:8],
+                    self._peer_proved_index[key])
             elif found.status == STANDING_FAILED:
-                self._unwind_zta_failure(queues, key, found)
+                self._unwind_standing_failure(queues, key, found)
+                continue
+            self._publish_standing_tier(queues, found)
 
-    def _unwind_zta_failure(self, queues, key, found):
+    def _publish_standing_tier(self, queues, found):
+        """Republish the tier a new (or lifted) bound allows. Mirrors C's
+        `_publish_standing_change`.
+
+        Identity's tier-gates read the tier last published, so without this a
+        ceiling that had just landed gated nothing until the peer's score next
+        happened to be recomputed. The STORED score is left alone -- a ceiling
+        bounds, it does not itself drive a peer downward -- and
+        `_publish_tier_change` dedups, so a repeated finding is a no-op.
+        """
+        for candidate in self.reputations.current:
+            if str(candidate) == found.peer_uuid:
+                score = self.reputations.current.get(candidate)
+                if score is not None:
+                    # _standing_ceiling, not _apply_standing_ceiling: the latter
+                    # logs and counts a CAP OF A WRITTEN score, and none happens.
+                    ceiling = self._standing_ceiling(candidate)
+                    if ceiling is not None and score > ceiling:
+                        score = ceiling
+                    self._publish_tier_change(queues, candidate, score)
+                return
+
+    def _unwind_standing_failure(self, queues, key, found):
         """A peer that operated unproved has now affirmatively FAILED: unwind
         its standing to what pre-anchor evidence supports, and let the tier
         machinery demote it (doc/architecture/zta-integration.md).
@@ -3159,25 +3184,29 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         and exclusion below the cut-off, follow from the score the tier
         machinery already reacts to.
         """
-        anchor = self._zta_proved_index.get(key)
+        anchor = self._peer_proved_index.get(key)
+        # Resolve the peer from the FINDING, never from `key` -- the key is
+        # "<peer>|<source>" now and would match no uuid at all.
         peer_uuid = None
         for candidate in self.reputations.current:
-            if str(candidate) == key:
+            if str(candidate) == found.peer_uuid:
                 peer_uuid = candidate
                 break
         if peer_uuid is None:
             # Nothing scored for this peer yet; record the ceiling so the first
             # score it does earn is bounded, and leave it at that.
-            self.logger.info('ZTA: %s failed (%s); no score to unwind',
-                             key[:8], found.reason)
+            self.logger.info(
+                'Standing[%s]: %s failed (%s); no score to unwind',
+                found.source, found.peer_uuid[:8], found.reason)
             return
         current = self.reputations.current.get(peer_uuid)
-        unwound = self._zta_unwind_ceiling(peer_uuid, anchor)
+        unwound = self._standing_unwind_ceiling(peer_uuid, anchor)
         if current is not None and current <= unwound:
             self.logger.info(
-                'ZTA: %s failed (%s); score %.3f already at or below what '
-                'pre-verification evidence supports (%.3f)',
-                key[:8], found.reason, current, unwound)
+                'Standing[%s]: %s failed (%s); score %.3f already at or below '
+                'what pre-verification evidence supports (%.3f)',
+                found.source, found.peer_uuid[:8], found.reason, current,
+                unwound)
             return
         self.reputations.update(peer_uuid, unwound)
         # Force CTFT so a peer whose credential is later repaired re-earns
@@ -3185,11 +3214,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # cooperation -- the same reasoning as the slash override.
         self._coop_mode[peer_uuid] = False
         self.logger.warning(
-            'ZTA: %s FAILED (%s); unwound %.3f -> %.3f (anchor %s)',
-            key[:8], found.reason,
+            'Standing[%s]: %s FAILED (%s); unwound %.3f -> %.3f (anchor %s)',
+            found.source, found.peer_uuid[:8], found.reason,
             -1.0 if current is None else current, unwound,
             'none — never proved' if anchor is None else 'chain index %d' % anchor)
-        _probes.counter('rep.compute', 'zta_unwound')
+        _probes.counter('rep.compute', 'standing_unwound')
         try:
             self._persist_reputations()
         except (OSError, IOError) as e:
@@ -3197,7 +3226,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self._publish_tier_change(queues, peer_uuid, unwound)
         self._publish_reputation_change(queues, peer_uuid, unwound)
 
-    def _zta_ceiling(self, peer_uuid):
+    def _standing_ceiling(self, peer_uuid):
         """Highest reputation this peer may hold given what ZTA actually proved
         (doc/architecture/zta-integration.md), or None for "no bound".
 
@@ -3206,17 +3235,26 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         not spoken about this peer at all. A deployment that has not turned ZTA
         on is not bounded by it, which is the no-change-in-behavior setting.
 
-        Read off `protocol.zta_standing`, which is this node's OWN finding
+        Read off `protocol.peer_standing`, which is this node's OWN finding
         delivered over IPC -- never anything the peer asserted about itself, so
         a peer cannot raise its own ceiling.
         """
-        standing = getattr(self.protocol, 'zta_standing', None)
+        standing = getattr(self.protocol, 'peer_standing', None)
         if not standing:
             return None
-        found = standing.get(str(peer_uuid))
-        return None if found is None else found.ceiling
+        # MINIMUM over authorities: a peer is bounded by the strictest finding
+        # against it, and an authority that has said nothing withholds nothing.
+        # Mirrors C's _standing_ceiling_of.
+        want = str(peer_uuid)
+        lowest = None
+        for found in standing.values():
+            if found.peer_uuid != want or found.ceiling is None:
+                continue
+            if lowest is None or found.ceiling < lowest:
+                lowest = found.ceiling
+        return lowest
 
-    def _apply_zta_ceiling(self, peer_uuid, score):
+    def _apply_standing_ceiling(self, peer_uuid, score):
         """Bound `score` by the peer's ZTA ceiling, if it has one.
 
         The bound is applied where the score is WRITTEN rather than where it is
@@ -3225,13 +3263,13 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         ceiling enforced only at read time would leave the stored score above
         it and leak the unbounded value the moment some other path reported it.
         """
-        ceiling = self._zta_ceiling(peer_uuid)
+        ceiling = self._standing_ceiling(peer_uuid)
         if ceiling is None or score is None or score <= ceiling:
             return score
         self.logger.info(
-            'ZTA: %s capped %.3f -> %.3f (credential not proved)',
+            'Standing: %s capped %.3f -> %.3f (bounded by an authority)',
             str(peer_uuid)[:8], score, ceiling)
-        _probes.counter('rep.compute', 'zta_capped')
+        _probes.counter('rep.compute', 'standing_capped')
         return ceiling
 
     def _compute_reputation(self, peer, req_proc, requestor):
@@ -3296,7 +3334,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 rep_score = self._contrite_tit_for_tat(peer)
             # doc/architecture/zta-integration.md: an unproved credential bounds how far this peer may rise,
             # whichever regime produced the score above.
-            rep_score = self._apply_zta_ceiling(peer_uuid, rep_score)
+            rep_score = self._apply_standing_ceiling(peer_uuid, rep_score)
             self.reputations.update(peer_uuid, rep_score)
             try:
                 self._persist_reputations()
@@ -4345,7 +4383,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     self._restore_child_evidence(queues)
                 # ZTA findings arrive over IPC from IdentityProcess; act on any
                 # that are new (doc/architecture/zta-integration.md). Idempotent, so it is safe every pass.
-                self._apply_zta_standings(queues)
+                self._apply_peer_standings(queues)
                 # A contact verified since boot (the identity process rewrites
                 # contacts.cfg.json on every handshake and verification) gets
                 # its seed here. Guarded by mtime, so the usual pass is one

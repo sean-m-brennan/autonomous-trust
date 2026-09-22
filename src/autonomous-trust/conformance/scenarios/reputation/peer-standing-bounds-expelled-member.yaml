@@ -1,0 +1,82 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: peer-standing-bounds-expelled-member
+byte_pinning: false
+description: |
+    An Ethne expulsion bounds a former member's reputation — and does not sever
+    them (Phase 4 P4.1, SOCIAL_APP_PLAN.md:481, "revocation as a reputation
+    event, not a hard cut").
+
+    This pins the NUMBER and the SOURCE together, cross-language. The expulsion
+    is delivered as an `ethne` standing at AT_ETHNE_EXPEL_CEILING (0.20), and
+    both runtimes must land the peer on exactly that value.
+
+    Why 0.20 and not 0.0: the ceiling sits BELOW the tier-1 floor (0.50), so
+    every tier-gated capability and every tier-gated feed closes; and ABOVE
+    COMM_CUTOFF (0.10), so the peer is NOT cut off at the network layer. They
+    can still be spoken to, and they can still re-earn once the community lifts
+    the bound. A zero would be a hard cut wearing a ceiling's clothes.
+
+    Why a ceiling and not a score, once more, because it is the whole design:
+    AT's scale is [0, 1] with no negatives, so a "penalty" has no
+    representation on it at all. The predecessor of this mechanism tried to send
+    one as `score = -0.8` on a TRANSACTION_SCORE and it was discarded at the
+    boundary twice over, costing a revoked peer exactly nothing. Bounding the
+    value and republishing the tier is the action.
+
+    The prior reputation is set ABOVE the ceiling on purpose. An assertion
+    against a scenario that scores under the bound anyway would pass whether or
+    not the bound exists — a control that cannot fail, which this corpus
+    refuses.
+
+    HOW THE FINDING REACHES THE CORE IN PRODUCTION is not what this pins. An
+    expulsion is decided in the app (the core holds no Ethne and cannot parse a
+    charter record) and arrives over the local app queue as
+    `app_peer_standing`; identity validates its SHAPE, never its truth, and
+    republishes it here. That hand-off and its four guards are pinned by the C
+    `peer_standing_verb_test` and the Python `test_peer_standing` twin, because
+    the guards live in the identity process while the thing they feed lives
+    here — the same division the zta-* scenarios already follow.
+
+    Runs in EVERY build, with no AT_ZTA and no CONFORMANCE_SOCIAL: peer standing
+    is substrate-level, which is the deliverable.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: oracle
+  - id: rogue
+    role: subject
+
+fixtures:
+  # bob thought well of rogue, well above the bound an expulsion will impose.
+  reputations:
+    bob:
+      rogue: 0.9
+  # The polity expelled rogue. Not a scalar penalty — a bound.
+  peer_standing:
+    bob:
+      rogue:
+        source: ethne
+        status: failed
+        ceiling: 0.20
+        reason: expelled from the polity
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: request reputation
+    payload:
+      target: rogue
+      proc: negotiation
+    description: |
+        alice asks bob for rogue's reputation. bob scores it by the ordinary
+        algebra and then bounds the result by the community's finding.
+
+expected_state:
+  bob:
+    reputation_of:
+      rogue: 0.20

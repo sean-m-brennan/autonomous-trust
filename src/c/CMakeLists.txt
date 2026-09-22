@@ -557,6 +557,7 @@ if(AT_SOCIAL)
         autonomous_trust/identity/dm.c
         autonomous_trust/identity/post.c
         autonomous_trust/identity/social_tx.c
+        autonomous_trust/identity/social_store.c
         autonomous_trust/identity/proximity.c
         autonomous_trust/identity/business_ad.c
         autonomous_trust/identity/business_post.c
@@ -1130,6 +1131,25 @@ if(AT_SOCIAL)
     add_executable(proximity_test test/proximity_test.c)
     set_source_files_properties(test/proximity_test.c PROPERTIES COMPILE_FLAGS "-Wall")
     target_link_libraries(proximity_test PRIVATE ${AT_TEST_LIBS})
+
+    add_executable(social_send_test test/social_send_test.c)
+    set_source_files_properties(test/social_send_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(social_send_test PRIVATE ${AT_TEST_LIBS})
+
+    # Filed with the social tests because its observable is the block's tier
+    # clamp, which only exists under AT_SOCIAL. The GUARD it exercises is not
+    # social-specific -- app verbs are local-only in every build.
+    add_executable(social_store_test test/social_store_test.c)
+    set_source_files_properties(test/social_store_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(social_store_test PRIVATE ${AT_TEST_LIBS})
+
+    add_executable(report_test test/report_test.c)
+    set_source_files_properties(test/report_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(report_test PRIVATE ${AT_TEST_LIBS})
+
+    add_executable(app_verb_origin_test test/app_verb_origin_test.c)
+    set_source_files_properties(test/app_verb_origin_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+    target_link_libraries(app_verb_origin_test PRIVATE ${AT_TEST_LIBS})
 endif() # AT_SOCIAL
 
 add_executable(identity_resync_test test/identity_resync_test.c)
@@ -1143,10 +1163,6 @@ target_link_libraries(rep_quorum_test PRIVATE ${AT_TEST_LIBS})
 add_executable(rep_paxos_round_test test/rep_paxos_round_test.c)
 set_source_files_properties(test/rep_paxos_round_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(rep_paxos_round_test PRIVATE ${AT_TEST_LIBS})
-
-add_executable(social_send_test test/social_send_test.c)
-set_source_files_properties(test/social_send_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(social_send_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(rep_resp_shape_test test/rep_resp_shape_test.c)
 set_source_files_properties(test/rep_resp_shape_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1283,11 +1299,14 @@ if(AT_SOCIAL)
     add_test(NAME proximity_test COMMAND $<TARGET_FILE:proximity_test>)
     add_test(NAME post_multicast_test COMMAND $<TARGET_FILE:post_multicast_test>)
     add_test(NAME social_tx_test COMMAND $<TARGET_FILE:social_tx_test>)
+    add_test(NAME social_send_test COMMAND $<TARGET_FILE:social_send_test>)
+    add_test(NAME app_verb_origin_test COMMAND $<TARGET_FILE:app_verb_origin_test>)
+    add_test(NAME report_test COMMAND $<TARGET_FILE:report_test>)
+    add_test(NAME social_store_test COMMAND $<TARGET_FILE:social_store_test>)
 endif() # AT_SOCIAL
 add_test(NAME identity_resync_test COMMAND $<TARGET_FILE:identity_resync_test>)
 add_test(NAME rep_quorum_test COMMAND $<TARGET_FILE:rep_quorum_test>)
 add_test(NAME rep_paxos_round_test COMMAND $<TARGET_FILE:rep_paxos_round_test>)
-add_test(NAME social_send_test COMMAND $<TARGET_FILE:social_send_test>)
 add_test(NAME rep_resp_shape_test COMMAND $<TARGET_FILE:rep_resp_shape_test>)
 add_test(NAME rep_warmstart_test COMMAND $<TARGET_FILE:rep_warmstart_test>)
 add_test(NAME rep_resolve_test COMMAND $<TARGET_FILE:rep_resolve_test>)
@@ -1659,15 +1678,23 @@ set_source_files_properties(test/zta_binding_test.c PROPERTIES COMPILE_FLAGS "-W
 target_link_libraries(zta_binding_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME zta_binding_test COMMAND $<TARGET_FILE:zta_binding_test>)
 
-# ISSUES.md §10.5. Guarded by AT_ZTA (unlike zta_binding_test, which builds
-# either way): this one drives zta_standing_msg_t, which only exists when ZTA
-# is compiled in.
-if(AT_ZTA)
-    add_executable(zta_standing_test test/zta_standing_test.c)
-    set_source_files_properties(test/zta_standing_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(zta_standing_test PRIVATE ${AT_TEST_LIBS} m)
-    add_test(NAME zta_standing_test COMMAND $<TARGET_FILE:zta_standing_test>)
-endif()
+# ISSUES.md §10.5. NO LONGER GUARDED BY AT_ZTA (Phase 4 P4.1). It used to be,
+# because it drives peer_standing_msg_t, which only existed when ZTA was
+# compiled in — which meant the ceiling machinery went untested in exactly the
+# configuration that ships it to an app (apps/agora builds with AT_ZTA OFF).
+# The standing mechanism is substrate-level now, so this builds and runs
+# everywhere.
+add_executable(peer_standing_test test/peer_standing_test.c)
+set_source_files_properties(test/peer_standing_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(peer_standing_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME peer_standing_test COMMAND $<TARGET_FILE:peer_standing_test>)
+
+# Phase 4 P4.1. NOT under AT_SOCIAL: app_peer_standing is always compiled,
+# because a governance tier bounding a peer is not an Agora-specific idea.
+add_executable(peer_standing_verb_test test/peer_standing_verb_test.c)
+set_source_files_properties(test/peer_standing_verb_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(peer_standing_verb_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME peer_standing_verb_test COMMAND $<TARGET_FILE:peer_standing_verb_test>)
 
 add_executable(app_node_test test/app_node_test.c)
 set_source_files_properties(test/app_node_test.c PROPERTIES COMPILE_FLAGS "-Wall")

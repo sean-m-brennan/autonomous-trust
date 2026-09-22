@@ -126,6 +126,25 @@ TX_CHANNEL_SWARM_DISAGREEMENT = 'swarm_disagreement'
 #: VERIFIER authored and already knows the answer to.
 TX_CHANNEL_PROBE = 'probe'
 
+#: One node's own, first-person account of an interaction it was party to
+#: (Phase 4 P4.1). The person operating this node says the exchange went badly,
+#: and that is the entire warrant — no oracle, no replication, no
+#: verifier-authored question, no second witness.
+#:
+#: NAMED FOR ITS EPISTEMOLOGY, like every other spelling here, and deliberately
+#: not `report`. That name would invite the thing this channel must never
+#: become: an accusation several nodes co-sign into a verdict. There is no
+#: adjudicator for this channel and none is planned, for the same reason
+#: :data:`TX_CHANNEL_SWARM_DISAGREEMENT` has none.
+#:
+#: The WEAKEST evidence in the set, weight 1. A first-person account is one
+#: peer's reading of one event, with the added problem that the peer is an
+#: interested party — so the bound on it is the ACCRUAL CAP, not the weight: a
+#: reporter spends their own daily budget, and report-spam costs the spammer
+#: their own ability to accrue. Distinct from swarm_disagreement, which is an
+#: aggregate over peers; this is one party to one exchange.
+TX_CHANNEL_FIRST_PERSON = 'first_person'
+
 #: The closed set, in the build order of doc/verification_oracle.md. Mirrors
 #: TX_CHANNEL_ALL in the C twin. Ordered (not a set literal) so error messages
 #: list the vocabulary the same way on both sides of the wire.
@@ -136,7 +155,8 @@ TX_CHANNELS = (TX_CHANNEL_TASK_OUTCOME,
                TX_CHANNEL_SELF_CONSISTENCY,
                TX_CHANNEL_REPLICATION,
                TX_CHANNEL_SWARM_DISAGREEMENT,
-               TX_CHANNEL_PROBE)
+               TX_CHANNEL_PROBE,
+               TX_CHANNEL_FIRST_PERSON)
 
 #: What an absent channel resolves to. Absence means "a peer or an app that
 #: predates channels," which is a task outcome by construction — every
@@ -239,6 +259,11 @@ TX_CHANNEL_WEIGHTS = {
     TX_CHANNEL_PHYSICAL: 3,
     TX_CHANNEL_CERTIFICATE: 3,
     TX_CHANNEL_SELF_CONSISTENCY: 3,
+    # Written EXPLICITLY, unlike C. There the weight falls out of
+    # tx_channel_weight's `return 1` fall-through, so adding the channel was
+    # enough; here the table is a dict and silence would be a divergence the
+    # moment someone tightened the lookup.
+    TX_CHANNEL_FIRST_PERSON: 1,
 }
 
 def tx_channel_weight(channel) -> int:

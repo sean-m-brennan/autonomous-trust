@@ -139,19 +139,26 @@ static void _publish_tier_change(const process_t *proc,
  * ReputationProcess._publish_exclusion. */
 static void _publish_exclusion(const process_t *proc,
                                const uuid_t peer_uuid, bool excluded);
-#ifdef AT_ZTA_ENABLED
-/* ZTA standing as an authority finding (doc/architecture/zta-integration.md).
- * Bound @p score by what ZTA proved about @p peer_uuid, and
- * act on an arriving standing. Mirrors Python's _apply_zta_ceiling /
- * _apply_zta_standings / _unwind_zta_failure in repprocess.py. */
-static double _zta_apply_ceiling(const uuid_t peer_uuid, double score);
-static void _handle_zta_standing(const process_t *proc,
-                                 const zta_standing_msg_t *st);
-/* Both defined further down, beside the code that owns them; the ZTA block
+/* A standing as an authority finding (doc/architecture/zta-integration.md).
+ * Bound @p score by what some authority proved about @p peer_uuid, and
+ * act on an arriving standing. Mirrors Python's _apply_standing_ceiling /
+ * _apply_peer_standings / _unwind_standing_failure in repprocess.py.
+ *
+ * ALWAYS COMPILED (Phase 4 P4.1). ZTA was the first authority to need a
+ * ceiling; an Ethne expulsion is the second, and it arrives on a build with
+ * AT_ZTA off. */
+static double _standing_apply_ceiling(const uuid_t peer_uuid, double score);
+static void _handle_peer_standing(const process_t *proc,
+                                  const peer_standing_msg_t *st);
+/* Defined with the app-facing carrier below; declared here because the
+ * standing handler sits above it and must tell the app when a ceiling moves. */
+static void _publish_reputation_change(const uuid_t peer_uuid, double score);
+static void _publish_standing_change(const process_t *proc,
+                                     const uuid_t peer_uuid);
+/* Both defined further down, beside the code that owns them; this block
  * sits above both because it belongs with _publish_tier_change, which it
  * calls. */
 static void _persist_reputations(const process_t *proc);
-#endif
 /* Forward declarations — the slash replay marks are written from
  * _apply_slash_locked and the rehabilitation path, both of which sit well
  * above the persistence block that owns the file. */
@@ -453,21 +460,20 @@ static struct {
      * inventing it. */
     map_t   child_evidence_tried;
     map_t   restore_clamped;
-#ifdef AT_ZTA_ENABLED
-    /* ZTA hardening (doc/architecture/zta-integration.md). Volatile, like the slash floor: a
-     * restart re-derives standing from the admission gate rather than trusting
-     * a file for it. Mirrors Python's _zta_* dicts in repprocess.py.
-     *   zta_ceilings:    peer uuid-str -> highest reputation an UNPROVED peer
-     *                    may hold. Absent == no bound.
-     *   zta_proved_index: peer uuid-str -> chain index at its last PROVED
-     *                    verification; the point a later failure unwinds to.
-     *   zta_acted:       peer uuid-str -> the standing already acted on, so the
-     *                    hourly re-verification of an unchanged verdict is a
-     *                    no-op instead of a second unwind. */
-    map_t   zta_ceilings;
-    map_t   zta_proved_index;
-    map_t   zta_acted;
-#endif
+    /* Authority standings (doc/architecture/zta-integration.md). Volatile, like
+     * the slash floor: a restart re-derives standing from the admission gate
+     * rather than trusting a file for it. Mirrors Python's dicts in
+     * repprocess.py.
+     *   peer_ceilings:    peer uuid-str -> highest reputation an UNPROVED peer
+     *                     may hold. Absent == no bound.
+     *   peer_proved_index: peer uuid-str -> chain index at its last PROVED
+     *                     verification; the point a later failure unwinds to.
+     *   peer_acted:       peer uuid-str -> the standing already acted on, so the
+     *                     hourly re-verification of an unchanged verdict is a
+     *                     no-op instead of a second unwind. */
+    map_t   peer_ceilings;
+    map_t   peer_proved_index;
+    map_t   peer_acted;
     /* Catch-up quorum: handle_update fires the chain merge once this many
      * peers have reported. Production default is 3 (mirrors Python's
      * self.num_updates); a conformance fixture may lower it to 1 so a
@@ -528,11 +534,9 @@ static void _ensure_init(void)
         rep_state.decay_swept = false;
         map_init(&rep_state.child_evidence_tried);
         map_init(&rep_state.restore_clamped);
-#ifdef AT_ZTA_ENABLED
-        map_init(&rep_state.zta_ceilings);
-        map_init(&rep_state.zta_proved_index);
-        map_init(&rep_state.zta_acted);
-#endif
+        map_init(&rep_state.peer_ceilings);
+        map_init(&rep_state.peer_proved_index);
+        map_init(&rep_state.peer_acted);
         rep_state.num_updates = 3;  /* catch-up quorum; mirrors Python default */
         /* paxos_init is called in reputation_run after num_peers is known */
         rep_state.num_peers = 0;
@@ -1070,37 +1074,77 @@ static void _publish_tier_change(const process_t *proc,
     json_decref(arr);
 }
 
-#ifdef AT_ZTA_ENABLED
 /****************************
- * ZTA standing: the DDIL cap, and the unwind on an affirmative failure
- * (doc/architecture/zta-integration.md). Mirrors Python repprocess._apply_zta_ceiling /
- * _apply_zta_standings / _unwind_zta_failure.
+ * Peer standing: the DDIL cap, and the unwind on an affirmative failure
+ * (doc/architecture/zta-integration.md). Mirrors Python
+ * repprocess._apply_standing_ceiling / _apply_peer_standings /
+ * _unwind_standing_failure.
+ *
+ * ALWAYS COMPILED (Phase 4 P4.1). This machinery was written for ZTA and was
+ * gated on AT_ZTA_ENABLED, which meant a build with ZTA off — Agora's, see
+ * apps/agora/native/CMakeLists.txt — had no way to bound a peer at all. ZTA is
+ * now one PRODUCER of a standing and stays behind its flag; an Ethne expulsion
+ * is another, and arrives through the app. The mechanism is the substrate's.
  ****************************/
 
-/** Highest reputation @p peer_uuid may hold given what ZTA proved, or a
- *  negative sentinel for "no bound". Caller must hold rep_state.lock. */
-static double _zta_ceiling_of(const uuid_t peer_uuid)
+/** Room for "<uuid>|<source>" plus its terminator. */
+#define STANDING_KEY_LEN (UUID_STRING_LEN + 1 + PEER_STANDING_SOURCE_LEN + 1)
+
+/** The key under which ONE authority's finding about ONE peer is filed.
+ *
+ *  Standings are kept per (peer, source) — ceiling, unwind anchor and
+ *  idempotence mark alike — because two authorities may bound the same peer
+ *  for unrelated reasons and neither may clear the other's finding. Keying on
+ *  the peer alone would let whichever authority spoke last overwrite the
+ *  other's bound, and would make a ZTA re-verification silently lift an
+ *  expulsion. Caller must hold rep_state.lock for any map this keys. */
+static void _standing_key(char *out, size_t out_len, const char *uuid_str,
+                          const char *source)
 {
-    char key[UUID_STRING_LEN + 1];
-    uuid_unparse_lower(peer_uuid, key);
-    data_t *d = NULL;
-    if (map_get(&rep_state.zta_ceilings, (map_key_t)key, &d) != 0 || d == NULL)
-        return ZTA_NO_CEILING;
-    double ceiling = ZTA_NO_CEILING;
-    if (data_floating_pt_dbl(d, &ceiling) != 0)
-        return ZTA_NO_CEILING;
-    return ceiling;
+    snprintf(out, out_len, "%s|%s", uuid_str,
+             peer_standing_source_or_default(source));
 }
 
-/* Bound a score by the peer's ZTA ceiling. Applied where the score is WRITTEN
+/** Highest reputation @p peer_uuid may hold given what EVERY authority has
+ *  said, or a negative sentinel for "no bound".
+ *
+ *  The reduction is MINIMUM over sources: a peer is bounded by the strictest
+ *  finding against it, and an authority that has said nothing withholds
+ *  nothing. Iterating the closed source set rather than scanning the map keeps
+ *  this O(sources) and needs no prefix iteration. Caller must hold
+ *  rep_state.lock. */
+static double _standing_ceiling_of(const uuid_t peer_uuid)
+{
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, uuid_str);
+    static const char *const all[] = { PEER_STANDING_SOURCE_ALL };
+    double lowest = PEER_NO_CEILING;
+    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
+    {
+        char key[STANDING_KEY_LEN];
+        _standing_key(key, sizeof(key), uuid_str, all[i]);
+        data_t *d = NULL;
+        if (map_get(&rep_state.peer_ceilings, (map_key_t)key, &d) != 0 ||
+            d == NULL)
+            continue;
+        double ceiling = PEER_NO_CEILING;
+        if (data_floating_pt_dbl(d, &ceiling) != 0 || ceiling < 0.0)
+            continue;
+        if (lowest < 0.0 || ceiling < lowest)
+            lowest = ceiling;
+    }
+    return lowest;
+}
+
+/* Bound a score by the peer's standing ceiling. Applied where the score is WRITTEN
  * rather than where it is read, so every consumer -- the tier computation,
  * persistence, the app-facing carrier, a peer answering a rep_req -- sees one
  * consistent number. A ceiling enforced only at read time would leave the
  * stored score above it and leak the unbounded value the moment some other
  * path reported it. Caller must hold rep_state.lock. */
-static double _zta_apply_ceiling(const uuid_t peer_uuid, double score)
+static double _standing_apply_ceiling(const uuid_t peer_uuid, double score)
 {
-    double ceiling = _zta_ceiling_of(peer_uuid);
+    double ceiling = _standing_ceiling_of(peer_uuid);
     if (ceiling < 0.0 || score <= ceiling)
         return score;
     return ceiling;
@@ -1119,7 +1163,7 @@ static double _zta_apply_ceiling(const uuid_t peer_uuid, double score)
  * it.
  *
  * Caller must hold rep_state.lock. */
-static double _zta_unwind_ceiling(const uuid_t self_uuid,
+static double _standing_unwind_ceiling(const uuid_t self_uuid,
                                   const uuid_t peer_uuid, int anchor,
                                   bool have_anchor)
 {
@@ -1175,23 +1219,42 @@ static double _zta_unwind_ceiling(const uuid_t self_uuid,
  * at the boundary and cost a revoked peer exactly nothing. Bounding the value
  * and republishing the tier is the action; demotion, and exclusion below the
  * cut-off, follow from the score _publish_tier_change already reacts to. */
-static void _handle_zta_standing(const process_t *proc,
-                                 const zta_standing_msg_t *st)
+static void _handle_peer_standing(const process_t *proc,
+                                 const peer_standing_msg_t *st)
 {
     if (st == NULL)
         return;
     char key[UUID_STRING_LEN + 1];
     uuid_unparse_lower(st->peer_uuid, key);
+    /* An unrecognized authority is refused outright rather than filed under a
+     * key nothing reduces over: _standing_ceiling_of iterates the CLOSED set,
+     * so a ceiling stored under "peer|nonsense" would bound nobody while
+     * looking, in the map, exactly like one that did. Absence is a different
+     * question and normalizes to ZTA — see peer_standing_source_or_default. */
+    const char *source = peer_standing_source_or_default(st->source);
+    if (!peer_standing_source_valid(source))
+    {
+        log_warn(proc->logger,
+                 "Standing: refusing a finding about %s from unknown "
+                 "authority '%s'\n", key, source);
+        return;
+    }
+    /* The three standing maps are keyed per (peer, source); coop_mode and the
+     * reputations store are NOT — those are about the peer itself. */
+    char skey[STANDING_KEY_LEN];
+    _standing_key(skey, sizeof(skey), key, source);
 
     /* Idempotence: periodic re-verification restates an unchanged verdict by
      * the hour, and acting on each restatement would ratchet a peer down for a
-     * single offence. */
+     * single offence. Per (peer, source), or a ZTA restatement and an Ethne
+     * expulsion would each keep invalidating the other's mark and re-unwind
+     * the peer between them. */
     char mark[128];
     snprintf(mark, sizeof(mark), "%d|%.17g|%s", (int)st->standing,
              st->ceiling, st->reason);
     pthread_mutex_lock(&rep_state.lock);
     data_t *prev = NULL;
-    if (map_get(&rep_state.zta_acted, (map_key_t)key, &prev) == 0 &&
+    if (map_get(&rep_state.peer_acted, (map_key_t)skey, &prev) == 0 &&
         prev != NULL)
     {
         char *prev_str = NULL;
@@ -1202,35 +1265,40 @@ static void _handle_zta_standing(const process_t *proc,
             return;
         }
     }
-    map_set(&rep_state.zta_acted, (map_key_t)key, string_data(mark, strlen(mark)));
+    map_set(&rep_state.peer_acted, (map_key_t)skey, string_data(mark, strlen(mark)));
 
-    if (st->standing == ZTA_STANDING_PROVED)
+    if (st->standing == PEER_STANDING_PROVED)
     {
-        /* Everything committed up to now was observed while this peer's
-         * credential verified: that is the point a later failure unwinds to. */
-        map_remove(&rep_state.zta_ceilings, (map_key_t)key);
-        map_set(&rep_state.zta_proved_index, (map_key_t)key,
+        /* Everything committed up to now was observed while THIS authority was
+         * satisfied: that is the point a later failure BY THIS AUTHORITY
+         * unwinds to. Only this source's ceiling lifts — from the app this is
+         * a reinstatement, and reinstating an expelled member says nothing
+         * about their credential. */
+        map_remove(&rep_state.peer_ceilings, (map_key_t)skey);
+        map_set(&rep_state.peer_proved_index, (map_key_t)skey,
                 integer_data(rep_state.history.next_index));
         pthread_mutex_unlock(&rep_state.lock);
         log_info(proc->logger,
-                 "ZTA: %s proved; unwind anchor set at chain index %d\n",
-                 key, rep_state.history.next_index);
+                 "Standing[%s]: %s proved; unwind anchor set at chain index %d\n",
+                 source, key, rep_state.history.next_index);
+        _publish_standing_change(proc, st->peer_uuid);
         return;
     }
 
     if (st->ceiling >= 0.0)
-        map_set(&rep_state.zta_ceilings, (map_key_t)key,
+        map_set(&rep_state.peer_ceilings, (map_key_t)skey,
                 floating_pt_dbl_data(st->ceiling));
 
-    if (st->standing != ZTA_STANDING_FAILED)
+    if (st->standing != PEER_STANDING_FAILED)
     {
         /* CAPPED: a bound going forward, and nothing more. A ceiling must not
          * itself drive a peer downward -- only an affirmative failure justifies
          * that -- or every disconnected DDIL deployment would be punished for
          * being disconnected. */
         pthread_mutex_unlock(&rep_state.lock);
-        log_info(proc->logger, "ZTA: %s capped at %.3f (%s)\n", key,
-                 st->ceiling, st->reason);
+        log_info(proc->logger, "Standing[%s]: %s capped at %.3f (%s)\n",
+                 source, key, st->ceiling, st->reason);
+        _publish_standing_change(proc, st->peer_uuid);
         return;
     }
 
@@ -1239,8 +1307,10 @@ static void _handle_zta_standing(const process_t *proc,
         /* Nothing scored yet; the ceiling recorded above bounds the first score
          * it does earn, and there is nothing to unwind. */
         pthread_mutex_unlock(&rep_state.lock);
-        log_info(proc->logger, "ZTA: %s failed (%s); no score to unwind\n",
-                 key, st->reason);
+        log_info(proc->logger,
+                 "Standing[%s]: %s failed (%s); no score to unwind\n",
+                 source, key, st->reason);
+        _publish_standing_change(proc, st->peer_uuid);
         return;
     }
 
@@ -1249,19 +1319,20 @@ static void _handle_zta_standing(const process_t *proc,
     data_t *idx_dat = NULL;
     int anchor = 0;
     bool have_anchor =
-        (map_get(&rep_state.zta_proved_index, (map_key_t)key, &idx_dat) == 0 &&
+        (map_get(&rep_state.peer_proved_index, (map_key_t)skey, &idx_dat) == 0 &&
          idx_dat != NULL && data_integer(idx_dat, &anchor) == 0);
     double current = 0.0;
     reputations_get(&rep_state.reputations, st->peer_uuid, &current);
-    double unwound = _zta_unwind_ceiling(have_self ? self_uuid : st->peer_uuid,
+    double unwound = _standing_unwind_ceiling(have_self ? self_uuid : st->peer_uuid,
                                          st->peer_uuid, anchor, have_anchor);
     if (current <= unwound)
     {
         pthread_mutex_unlock(&rep_state.lock);
         log_info(proc->logger,
-                 "ZTA: %s failed (%s); score %.3f already at or below what "
-                 "pre-verification evidence supports (%.3f)\n",
-                 key, st->reason, current, unwound);
+                 "Standing[%s]: %s failed (%s); score %.3f already at or below "
+                 "what pre-verification evidence supports (%.3f)\n",
+                 source, key, st->reason, current, unwound);
+        _publish_standing_change(proc, st->peer_uuid);
         return;
     }
     reputations_update(&rep_state.reputations, st->peer_uuid, unwound);
@@ -1272,13 +1343,13 @@ static void _handle_zta_standing(const process_t *proc,
     pthread_mutex_unlock(&rep_state.lock);
 
     log_warn(proc->logger,
-             "ZTA: %s FAILED (%s); unwound %.3f -> %.3f (anchor %s)\n",
-             key, st->reason, current, unwound,
+             "Standing[%s]: %s FAILED (%s); unwound %.3f -> %.3f (anchor %s)\n",
+             source, key, st->reason, current, unwound,
              have_anchor ? "recorded" : "none - never proved");
     _publish_tier_change(proc, st->peer_uuid, unwound);
+    _publish_reputation_change(st->peer_uuid, unwound);
     _persist_reputations(proc);
 }
-#endif /* AT_ZTA_ENABLED */
 
 
 /****************************
@@ -1306,6 +1377,30 @@ static int _publish_reputation(const uuid_t peer_uuid, double score, bool rated)
     uuid_copy(msg.info.peer_reputation.peer_uuid, peer_uuid);
     msg.info.peer_reputation.score = rated ? score : 0.0;
     msg.info.peer_reputation.rated = rated;
+    /* The tier and the bound behind it (Phase 4 P4.1). A consumer can derive a
+     * tier from the score — the app does — but it CANNOT derive a ceiling,
+     * because a ceiling is not a function of the score. Carrying both is what
+     * makes a bounded peer legible: an expelled member reads as an ordinary
+     * score with a tier that does not follow from it.
+     *
+     * Every caller releases rep_state.lock before publishing (checked at all
+     * six sites), so this takes it itself.
+     *
+     * The ceiling is written on EVERY path including the unbounded one: the
+     * message was zero-initialized, and an unwritten 0.0 would say "floored at
+     * zero" rather than "no bound". */
+    pthread_mutex_lock(&rep_state.lock);
+    double ceiling = _standing_ceiling_of(peer_uuid);
+    pthread_mutex_unlock(&rep_state.lock);
+    msg.info.peer_reputation.standing_ceiling =
+        ceiling < 0.0 ? PEER_NO_CEILING : ceiling;
+    /* The tier reputation ITSELF acts on. A score is bounded where it is
+     * WRITTEN, but a ceiling that has just landed has not met a write yet —
+     * _publish_standing_change restates the stored, unbounded score — so the
+     * bound is applied here too, or a freshly capped peer would be reported
+     * at the tier the cap exists to deny. An unrated peer has no tier. */
+    double bounded = (ceiling >= 0.0 && score > ceiling) ? ceiling : score;
+    msg.info.peer_reputation.effective_tier = rated ? _trust_tier(bounded) : 0;
     return messaging_send(AT_MAIN_QUEUE, PEER_REPUTATION, &msg, false);
 }
 
@@ -1313,6 +1408,41 @@ static int _publish_reputation(const uuid_t peer_uuid, double score, bool rated)
 static void _publish_reputation_change(const uuid_t peer_uuid, double score)
 {
     _publish_reputation(peer_uuid, score, true);
+}
+
+/* Re-state a peer's reputation because its STANDING changed, not its score
+ * (Phase 4 P4.1), and republish the tier the new bound allows.
+ *
+ * A ceiling arriving or lifting moves no score at all — a cap bounds what a
+ * peer may rise to later, and a lift merely removes that bound. So nothing on
+ * the ordinary change path fires, and without this the app would never learn
+ * that a peer had been bounded by an authority: it would go on showing an
+ * expelled member exactly as before. The score is restated unchanged; what is
+ * new on the wire is standing_ceiling and the tier beside it.
+ *
+ * THE TIER GOES TO IDENTITY TOO, or the ceiling gates nothing. Identity's
+ * tier-gates read the tier reputation last published, and until this
+ * republished it a cap that had just landed left that tier where it was: the
+ * capped peer's content kept arriving at its old tier until its score next
+ * happened to be recomputed, which on a quiet link may be never. The STORED
+ * score is left alone — a ceiling bounds, it does not itself drive a peer
+ * downward — and _publish_tier_change's dedup makes a repeated identical
+ * finding a no-op. The next score write applies the same bound anyway.
+ *
+ * Caller must NOT hold rep_state.lock. */
+static void _publish_standing_change(const process_t *proc,
+                                     const uuid_t peer_uuid)
+{
+    double score = 0.0;
+    pthread_mutex_lock(&rep_state.lock);
+    bool rated = reputations_contains(&rep_state.reputations, peer_uuid)
+                 && reputations_get(&rep_state.reputations, peer_uuid,
+                                    &score) == 0;
+    double bounded = rated ? _standing_apply_ceiling(peer_uuid, score) : 0.0;
+    pthread_mutex_unlock(&rep_state.lock);
+    if (rated)
+        _publish_tier_change(proc, peer_uuid, bounded);
+    _publish_reputation(peer_uuid, score, rated);
 }
 
 int reputation_emit_all(const process_t *proc)
@@ -2984,11 +3114,10 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
                                             &rep_state.reputations,
                                             self_uuid, peer_uuid);
         }
-#ifdef AT_ZTA_ENABLED
-        /* doc/architecture/zta-integration.md: an unproved credential bounds how far this peer may rise,
-         * whichever regime produced the score above. */
-        score = _zta_apply_ceiling(peer_uuid, score);
-#endif
+        /* doc/architecture/zta-integration.md: an authority's finding bounds how far this peer may
+         * rise, whichever regime produced the score above. Applied where the
+         * score is WRITTEN, so every consumer sees one consistent number. */
+        score = _standing_apply_ceiling(peer_uuid, score);
         reputations_update(&rep_state.reputations, peer_uuid, score);
         pthread_mutex_unlock(&rep_state.lock);
     }
@@ -6668,18 +6797,16 @@ void reputation_reset_state(int num_peers)
     map_init(&rep_state.peer_tiers);
     map_free(&rep_state.committed_paxos_rounds);
     map_init(&rep_state.committed_paxos_rounds);
-#ifdef AT_ZTA_ENABLED
     /* doc/architecture/zta-integration.md. Must reset with the rest: the conformance harness resets rep_state
      * between steps, so a ceiling left behind here would bound a peer in a
      * later scenario that never capped it -- and an unwind anchor left behind
      * would silently change how far a later failure reaches back. */
-    map_free(&rep_state.zta_ceilings);
-    map_init(&rep_state.zta_ceilings);
-    map_free(&rep_state.zta_proved_index);
-    map_init(&rep_state.zta_proved_index);
-    map_free(&rep_state.zta_acted);
-    map_init(&rep_state.zta_acted);
-#endif
+    map_free(&rep_state.peer_ceilings);
+    map_init(&rep_state.peer_ceilings);
+    map_free(&rep_state.peer_proved_index);
+    map_init(&rep_state.peer_proved_index);
+    map_free(&rep_state.peer_acted);
+    map_init(&rep_state.peer_acted);
     rep_state.committed_paxos_ring_head = 0;
     rep_state.committed_paxos_ring_len = 0;
     map_free(&rep_state.coop_mode);
@@ -6952,31 +7079,29 @@ int reputation_get_evidence_ceiling(const uuid_t self_uuid,
     return err;
 }
 
-#ifdef AT_ZTA_ENABLED
-int reputation_apply_zta_standing(const process_t *proc,
-                                  const zta_standing_msg_t *standing)
+int reputation_apply_peer_standing(const process_t *proc,
+                                   const peer_standing_msg_t *standing)
 {
     if (!rep_state.initialized || proc == NULL || standing == NULL) return -1;
-    _handle_zta_standing(proc, standing);
+    _handle_peer_standing(proc, standing);
     return 0;
 }
 
-double reputation_zta_unverified_ceiling(void)
+double reputation_unverified_ceiling(void)
 {
     return _tier_ceiling(REP_UNVERIFIED_RESTORE_TIER);
 }
 
-int reputation_get_zta_ceiling(const uuid_t peer_uuid, double *out)
+int reputation_get_peer_ceiling(const uuid_t peer_uuid, double *out)
 {
     if (!rep_state.initialized || out == NULL) return -1;
     pthread_mutex_lock(&rep_state.lock);
-    double ceiling = _zta_ceiling_of(peer_uuid);
+    double ceiling = _standing_ceiling_of(peer_uuid);
     pthread_mutex_unlock(&rep_state.lock);
     if (ceiling < 0.0) return -1;
     *out = ceiling;
     return 0;
 }
-#endif
 
 int reputation_get_request_count(void)
 {
@@ -7268,18 +7393,15 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
             if (rerr == -1 || rerr == ENOMSG)
                 break;
 
-#ifdef AT_ZTA_ENABLED
-            if (buf.type == ZTA_STANDING)
+            if (buf.type == PEER_STANDING)
             {
-                /* Identity's finding about a peer's credential (doc/architecture/zta-integration.md). Handled
+                /* An authority's finding about a peer (doc/architecture/zta-integration.md). Handled
                  * here rather than via run_message_handlers for the same reason
                  * TRANSACTION_SCORE is: that dispatcher routes net_msg payloads by
                  * function name, and this is a local struct. */
-                _handle_zta_standing(proc, &buf.info.zta_standing);
+                _handle_peer_standing(proc, &buf.info.peer_standing);
             }
-            else
-#endif
-            if (buf.type == TRANSACTION_SCORE)
+            else if (buf.type == TRANSACTION_SCORE)
             {
                 /* Self identity may not have been loaded at startup; resolve
                  * lazily on first use so an early submission isn't lost. */

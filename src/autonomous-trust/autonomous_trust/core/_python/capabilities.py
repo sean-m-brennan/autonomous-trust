@@ -787,10 +787,26 @@ def cosign_sig_from_json(body):
 SOCIAL_DOMAIN_CONN = b'agora-conn'
 SOCIAL_DOMAIN_DM = b'agora-dm'
 SOCIAL_DOMAIN_POST = b'agora-post'
+# First-person report (Phase 4 P4.1). Tail is reporter_uuid[16] || seq u64le --
+# the reporter IS in the tail, unlike a decline's bare seq, so ada reporting bob
+# and bob reporting ada at equal seqs derive two tasks, not one. Twin of C
+# AT_SOCIAL_DOMAIN_REPORT.
+SOCIAL_DOMAIN_REPORT = b'agora-report'
 
 SOCIAL_POS_BASELINE = 0.65
 SOCIAL_POS_DELTA = 0.25
 SOCIAL_NEG_SCORE = 0.30
+# A report (Phase 4 P4.1): the reporter's half, on the first_person channel.
+# Worse than a decline, still above COMM_CUTOFF; never 0.0, because a zero is an
+# authority finding and those are ceilings. Twin of C AT_SOCIAL_REPORT_SCORE.
+SOCIAL_REPORT_SCORE = 0.15
+# The REPORTED node's half, about the reporter: the social baseline, so a report
+# neither punishes nor rewards the person who makes it. Default channel. Twin of
+# C AT_SOCIAL_REPORTER_SCORE.
+SOCIAL_REPORTER_SCORE = SOCIAL_POS_BASELINE
+# One report per target per day, enforced on BOTH sides (the reported side's is
+# what bounds a forked reporter). Twin of C AT_SOCIAL_REPORT_DAILY_CAP.
+SOCIAL_REPORT_DAILY_CAP = 1
 SOCIAL_RECENCY_WINDOW = 604800.0
 SOCIAL_PER_EDGE_DAILY_CAP = 3
 SOCIAL_GLOBAL_DAILY_CAP = 20

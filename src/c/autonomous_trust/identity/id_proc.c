@@ -48,6 +48,7 @@
 #include "business_post.h"
 #include "cosign.h"
 #include "social_tx.h"
+#include "social_store.h"
 #include "proximity.h"
 #endif /* AT_SOCIAL_ENABLED */
 #include "first_contact.h"
@@ -100,9 +101,75 @@ static void _record_peer_group_uuid(const process_t *proc,
                                     const char *group_uuid_str);
 /* Defined with the connection handlers below; the proximity handlers (earlier in
  * the file) need it to resolve a connected peer's public identity. */
-static bool _find_peer_pub_by_uuid(const process_t *proc, const uuid_t uuid,
-                                   public_identity_t *out);
 #endif /* AT_SOCIAL_ENABLED */
+
+/* Look one admitted peer up by uuid. Nothing social about it — it reads only
+ * proc->protocol.peers — but it lived inside AT_SOCIAL_ENABLED until Phase 4
+ * P4.1 gave an always-compiled handler (app_peer_standing) a reason to ask
+ * whether a peer is admitted at all. */
+static bool _find_peer_pub_by_uuid(const process_t *proc, const uuid_t uuid,
+                                   public_identity_t *out)
+{
+    bool found = false;
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+        if (uuid_compare(proc->protocol.peers[i].uuid, uuid) == 0) {
+            memcpy(out, &proc->protocol.peers[i], sizeof(public_identity_t));
+            found = true;
+            break;
+        }
+    }
+    peers_read_unlock(proc);
+    return found;
+}
+
+/* True iff this NET_MESSAGE came from THIS node's own app over the local
+ * queue, rather than from a peer over the wire (Phase 4 P4.1).
+ *
+ * WHY THIS IS NEEDED AT ALL. An app verb and a peer's message are the same
+ * kind of object: both are NET_MESSAGEs dispatched on `net_msg.function` by
+ * run_message_handlers, and route_to_process (net_proc.c) forwards to the
+ * named process by name with NO function allowlist. The plaintext receive
+ * policy (ID_UNENCRYPTED_VERBS, enforced at net_proc.c:1799) refuses an
+ * app_* verb in the clear, so this is not open to a stranger — but an
+ * ADMITTED peer's frame decrypts and routes like any other, and would land in
+ * an app handler. Admitted peers are exactly who the tier and reputation
+ * machinery exists to constrain, so "already admitted" is not a trust
+ * argument.
+ *
+ * THE TEST. The app builds its request as `generic_msg_t req = {0}` and never
+ * populates from_whom (see at_app_events_block in app_events.c), so a local
+ * app verb carries a NULL uuid. Anything off the wire carries the sender's
+ * identity, copied whole by route_to_process. Self is accepted too, for the
+ * handful of paths that loop a verb back through this node's own queue.
+ *
+ * Applied to the verbs that CHANGE MODERATION STATE. The other app verbs are
+ * unguarded, which is a pre-existing gap recorded in ISSUES.md — not one this
+ * increment created, and not one to close silently in passing. */
+static bool _is_local_app_verb(const process_t *proc, const net_msg_t *nmsg)
+{
+    if (nmsg == NULL)
+        return false;
+    if (uuid_is_null(nmsg->from_whom.uuid))
+        return true;
+    const identity_t *self = _partition_self_identity(proc);
+    if (self != NULL && uuid_compare(self->uuid, nmsg->from_whom.uuid) == 0)
+        return true;
+    return false;
+}
+
+/* Log and refuse an app verb that arrived from the wire. Shared by every
+ * moderation verb so the refusal reads identically in an operator's log. */
+static bool _refuse_remote_app_verb(const process_t *proc,
+                                    const net_msg_t *nmsg, const char *verb)
+{
+    char who[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, who);
+    log_warn(proc->logger,
+             "Identity: refusing %s from the wire (peer %s) — app verbs are "
+             "local-only\n", verb, who);
+    return true;
+}
 
 DEFINE_ERROR(EID_NOQ, "Required process queue missing");
 
@@ -177,6 +244,12 @@ static char ID_POST[]        = "peer_post";
  * is needed. It is the return signal a fire-and-forget post lacks, letting the
  * engagement accrue reputation for both peers. */
 static char ID_REACTION[]    = "peer_reaction";
+/* First-person report (Phase 4 P4.1). Directed + ENCRYPTED (never on the
+ * plaintext allowlist), exactly like a reaction: {seq, ts} and NOTHING ELSE.
+ * crypto_box authenticates the reporter, and no reason text travels — on the
+ * wire a reason would make a score a published accusation. The reported node
+ * stages its half of the bilateral transaction and tells its app nothing. */
+static char ID_REPORT[]      = "peer_report";
 /* Business ad (Phase 3 P3.2). Encrypted GROUP MULTICAST like a post (never on
  * the plaintext allowlist), carrying {advertiser, advertiser_pk, polity, sat,
  * seq, ts, bundle, sig}. The detached Ed25519 signature authenticates the
@@ -214,6 +287,9 @@ static char ID_IDENTITY_RESPONSE[] = "peer_identity_response";
  * 2-element JSON array `[peer_uuid_str, new_tier_int]`. Mirrors
  * Python IdentityProtocol.tier_update. */
 static char ID_TIER[]        = "tier_update";
+/* Phase 4 P4.1. Always compiled: a governance tier bounding a peer is not
+ * an Agora-specific idea. */
+static char ID_APP_PEER_STANDING[] = AT_APP_PEER_STANDING;
 /* Local-only IPC from the app (via the daemon main loop): re-emit the peer
  * view on the app-facing carrier. See doc/architecture/app-peer-carrier.md. */
 static char ID_APP_ROSTER[]  = AT_APP_ROSTER_REQUEST;
@@ -226,6 +302,8 @@ static char ID_APP_SEND_DM[] = AT_APP_SEND_DM;
 static char ID_APP_PUBLISH_POST[] = AT_APP_PUBLISH_POST;
 static char ID_APP_REACT_POST[] = AT_APP_REACT_POST;
 static char ID_APP_BLOCK[] = AT_APP_BLOCK;
+static char ID_APP_UNBLOCK[] = AT_APP_UNBLOCK;
+static char ID_APP_REPORT_PEER[] = AT_APP_REPORT_PEER;
 static char ID_APP_REQUEST_ATTEND[] = AT_APP_REQUEST_ATTEND;
 static char ID_APP_SET_EXACT_POSITION[] = AT_APP_SET_EXACT_POSITION;
 static char ID_APP_REQUEST_PROXIMITY[] = AT_APP_REQUEST_PROXIMITY;
@@ -597,7 +675,9 @@ static struct {
     map_t social_edges;
     /* Conformance/observability surface (Increment 8): the last interaction score
      * WE staged about each subject peer, keyed by lowercased subject uuid string;
-     * values are string_data(compact JSON {"task","score"}). Written by
+     * values are string_data(compact JSON {"task","score","channel","n"}), where
+     * n counts every score staged about that subject (so a scenario can tell a
+     * capped second attempt from a first). Written by
      * _submit_interaction_score at the moment we would move the peer's reputation,
      * so a scenario can assert the deterministic staged score without running the
      * Paxos round. Surface via identity_get_last_social_tx; twin of Python
@@ -607,6 +687,13 @@ static struct {
      * the global daily cap against a Sybil fan-out. Rolls over with social_day. */
     int   social_day;
     int   social_day_count;
+    /* First-person reports (Phase 4 P4.1), keyed by lowercased peer uuid string;
+     * values are string_data(compact JSON {"day","out","in"}): how many reports
+     * WE made about that peer today, and how many FROM that peer we paired.
+     * Its own map, not fields on social_edges, because the edge record is a
+     * fixed-format positive-accrual ledger that every positive path rewrites.
+     * Guarded by id_state.lock. */
+    map_t social_reports;
     /* Locally blocked peers (Increment 8): lowercased uuid string -> integer_data(1).
      * A block is PURELY LOCAL — it clamps identity_get_peer_tier to 0 for this peer
      * (so our own tier-gates deny it) and emits/gossips nothing. No reputation
@@ -721,6 +808,51 @@ static struct {
     int64_t probe_seq;
 } id_state;
 
+/* THE one place that reads social_blocks (Phase 4 P4.1). Caller must hold
+ * id_state.lock.
+ *
+ * Until P4.1 the block was read in exactly one place — the clamp inside
+ * identity_get_peer_tier — and that was mistaken for the whole of what a block
+ * does. It is not: a block is a REFUSAL, and a tier is a MEASUREMENT. The
+ * clamp expresses the refusal only where a tier floor happens to be above
+ * zero, which is why a blocked peer's PUBLIC posts (floor 0), DMs (no floor at
+ * all) and reactions all sailed through. Every inbound path now asks this
+ * question directly instead of inferring it from a number. */
+static bool _is_blocked_locked(const char *uuid_str)
+{
+#ifdef AT_SOCIAL_ENABLED
+    if (uuid_str == NULL)
+        return false;
+    data_t *bdat = NULL;
+    return map_get(&id_state.social_blocks, (map_key_t)uuid_str, &bdat) == 0
+           && bdat != NULL;
+#else
+    (void)uuid_str;
+    return false;
+#endif /* AT_SOCIAL_ENABLED */
+}
+
+#ifdef AT_SOCIAL_ENABLED
+/* Lock-taking wrapper for the inbound handlers, which hold nothing.
+ *
+ * Guarded, unlike _is_blocked_locked: every call site is a social handler
+ * (DM, reaction, post, connection, cosign, business ad/post), so without
+ * AT_SOCIAL this has no callers at all and -Werror=unused-function is right
+ * to say so. _is_blocked_locked stays unguarded because
+ * identity_get_peer_tier — which is always compiled — reads it. */
+static bool _is_blocked(const uuid_t uuid)
+{
+    if (!id_state.initialized)
+        return false;
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(uuid, uuid_str);
+    pthread_mutex_lock(&id_state.lock);
+    bool blocked = _is_blocked_locked(uuid_str);
+    pthread_mutex_unlock(&id_state.lock);
+    return blocked;
+}
+#endif /* AT_SOCIAL_ENABLED */
+
 static void _ensure_id_init(void)
 {
     if (!id_state.initialized)
@@ -763,6 +895,7 @@ static void _ensure_id_init(void)
         map_init(&id_state.last_cosign_sig_map);
         map_init(&id_state.social_edges);
         map_init(&id_state.social_tx_observed);
+        map_init(&id_state.social_reports);
         id_state.social_day = 0;
         id_state.social_day_count = 0;
         map_init(&id_state.social_blocks);
@@ -3555,6 +3688,8 @@ void identity_reset_state(void)
     map_init(&id_state.social_edges);
     map_free(&id_state.social_tx_observed);
     map_init(&id_state.social_tx_observed);
+    map_free(&id_state.social_reports);
+    map_init(&id_state.social_reports);
     id_state.social_day = 0;
     id_state.social_day_count = 0;
     map_free(&id_state.social_blocks);
@@ -5615,12 +5750,13 @@ static int _connection_store(const char *uuid_str, int state, uint64_t seq)
 
 /* Stage OUR half of a bilateral social transaction: send a TRANSACTION_SCORE to
  * the reputation process for @p task_uuid, about subject @p subject (the peer this
- * score concerns). Channel is left absent so the reputation process normalizes it
- * to TX_CHANNEL_TASK_OUTCOME; competence 0 means the authored weight verbatim.
- * Mirrors negotiation/neg_proc.c:_submit_tx_score. */
+ * score concerns). @p channel is one of TX_CHANNEL_*, or NULL for absent, which
+ * the reputation process normalizes to TX_CHANNEL_TASK_OUTCOME; competence 0
+ * means the authored weight verbatim. Mirrors
+ * negotiation/neg_proc.c:_submit_tx_score. */
 static void _submit_interaction_score(const process_t *proc,
                                       const uuid_t task_uuid, double score,
-                                      const uuid_t subject)
+                                      const uuid_t subject, const char *channel)
 {
     generic_msg_t msg = {0};
     msg.type = TRANSACTION_SCORE;
@@ -5629,8 +5765,12 @@ static void _submit_interaction_score(const process_t *proc,
     if (subject != NULL)
         uuid_copy(msg.info.tx_score.peer_uuid, subject);
     msg.info.tx_score.score = score;
-    /* channel[] and competence stay zeroed: absent channel -> task_outcome,
-     * absent competence -> weight 1.0, both resolved in the reputation process. */
+    /* competence stays zeroed -> weight 1.0, resolved in the reputation
+     * process. The channel is copied only when given; zeroed is how "absent"
+     * is spelled on this struct. */
+    if (channel != NULL)
+        at_strlcpy(msg.info.tx_score.channel, channel,
+                   sizeof(msg.info.tx_score.channel));
     if (messaging_send("reputation", TRANSACTION_SCORE, &msg, false) != 0)
         log_warn(proc->logger,
                  "Identity: could not submit social score %.3f\n", score);
@@ -5639,26 +5779,44 @@ static void _submit_interaction_score(const process_t *proc,
      * deterministic thing a scenario asserts, independent of the Paxos round. */
     if (subject != NULL) {
         char subj[UUID_STRING_LEN + 1];
-        char task_hex[33];
+        char task_hex[UUID_STRING_LEN + 1];
         uuid_unparse_lower(subject, subj);
         uuid_unparse_lower(task_uuid, task_hex);
-        char buf[96];
-        int len = snprintf(buf, sizeof(buf), "{\"task\":\"%s\",\"score\":%.6f}",
-                           task_hex, score);
+        pthread_mutex_lock(&id_state.lock);
+        int n = 0;
+        data_t *prev = NULL;
+        if (map_get(&id_state.social_tx_observed, (map_key_t)subj, &prev) == 0
+            && prev != NULL) {
+            char *ps = NULL;
+            if (data_string_ptr(prev, &ps) == 0 && ps != NULL) {
+                json_error_t jerr;
+                json_t *po = json_loads(ps, 0, &jerr);
+                if (po != NULL) {
+                    json_t *jn = json_object_get(po, "n");
+                    if (json_is_integer(jn))
+                        n = (int)json_integer_value(jn);
+                    json_decref(po);
+                }
+            }
+        }
+        char buf[192];
+        int len = snprintf(buf, sizeof(buf),
+                           "{\"task\":\"%s\",\"score\":%.6f,\"channel\":\"%s\","
+                           "\"n\":%d}",
+                           task_hex, score,
+                           channel != NULL ? channel : TX_CHANNEL_DEFAULT, n + 1);
         if (len > 0 && (size_t)len < sizeof(buf)) {
             char *dup = smrt_create((size_t)len + 1);
             if (dup != NULL) {
                 memcpy(dup, buf, (size_t)len + 1);
                 data_t *dat = string_data(dup, (size_t)len + 1);
-                if (dat != NULL) {
-                    pthread_mutex_lock(&id_state.lock);
+                if (dat != NULL)
                     map_set(&id_state.social_tx_observed, (map_key_t)subj, dat);
-                    pthread_mutex_unlock(&id_state.lock);
-                } else {
+                else
                     smrt_deref(dup);
-                }
             }
         }
+        pthread_mutex_unlock(&id_state.lock);
     }
 }
 
@@ -5695,19 +5853,129 @@ bool identity_get_last_social_tx(const char *uuid_str, char *task_out,
     return found;
 }
 
+bool identity_get_social_tx_detail(const char *uuid_str, char *channel_out,
+                                   size_t channel_len, int *n_out)
+{
+    if (uuid_str == NULL) return false;
+    bool found = false;
+    pthread_mutex_lock(&id_state.lock);
+    data_t *dat = NULL;
+    if (map_get(&id_state.social_tx_observed, (map_key_t)uuid_str, &dat) == 0
+        && dat != NULL) {
+        char *s = NULL;
+        if (data_string_ptr(dat, &s) == 0 && s != NULL) {
+            json_error_t jerr;
+            json_t *o = json_loads(s, 0, &jerr);
+            if (o != NULL) {
+                json_t *jc = json_object_get(o, "channel");
+                json_t *jn = json_object_get(o, "n");
+                if (channel_out != NULL && channel_len > 0)
+                    snprintf(channel_out, channel_len, "%s",
+                             json_is_string(jc) ? json_string_value(jc) : "");
+                if (n_out != NULL)
+                    *n_out = json_is_integer(jn) ? (int)json_integer_value(jn) : 0;
+                found = true;
+                json_decref(o);
+            }
+        }
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return found;
+}
+
 /* Conformance/test seam: locally block @p uuid_str (lowercased peer uuid),
  * writing the same social_blocks record handle_app_block does but callable
  * without assembling an app message. identity_get_peer_tier then clamps this
  * peer to 0. Purely local — no wire traffic, no reputation transaction. Twin of
  * Python IdentityProcess.block_peer. */
+/* Write the block set to etc/at/social.cfg.json (Phase 4 P4.1).
+ *
+ * ON EVERY MUTATION, not at shutdown: the C identity process has no
+ * tail-of-loop flush (the Python SIGTERM path persistent-cohort.md describes
+ * has no C twin), and a block that survives only a graceful stop is not much of
+ * a block. Failure is logged, never fatal — losing durability must not take
+ * moderation itself down, and the operator needs to know the file is not being
+ * written rather than discovering it after a restart. */
+static void _persist_social_blocks(void)
+{
+    char cfg_dir[CFG_PATH_LEN + 1];
+    if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) <= 0)
+        return;
+    pthread_mutex_lock(&id_state.lock);
+    int rc = social_store_save(&id_state.social_blocks, cfg_dir);
+    pthread_mutex_unlock(&id_state.lock);
+    if (rc != 0)
+        log_warn(NULL, "Identity: could not persist social blocks to %s/%s\n",
+                 cfg_dir, AT_SOCIAL_FILENAME);
+}
+
 void identity_block_peer(const char *uuid_str)
 {
     if (uuid_str == NULL) return;
-    data_t *one = integer_data(1);
-    if (one == NULL) return;
+    /* The value is WHEN, not a flag: "blocked" is the presence of the key, so
+     * the value is free to carry something the store can write back. A double
+     * rather than an int so the epoch does not meet 2038. */
+    data_t *when = floating_pt_dbl_data((double)time(NULL));
+    if (when == NULL) return;
     pthread_mutex_lock(&id_state.lock);
-    map_set(&id_state.social_blocks, (map_key_t)uuid_str, one);
+    map_set(&id_state.social_blocks, (map_key_t)uuid_str, when);
     pthread_mutex_unlock(&id_state.lock);
+    _persist_social_blocks();
+}
+
+/* Lift a local block (Phase 4 P4.1). A DELETE, not a second flag: "blocked"
+ * is the presence of the key, so there is no way for the record and the
+ * predicate to disagree, and re-blocking is idempotent.
+ *
+ * The peer is told nothing, exactly as they were told nothing about the block.
+ * What they sent while blocked is gone — the inbound gates dropped it rather
+ * than queueing it — so an unblock restores reach going forward and does not
+ * replay the silence. */
+void identity_unblock_peer(const char *uuid_str)
+{
+    if (uuid_str == NULL) return;
+    pthread_mutex_lock(&id_state.lock);
+    map_remove(&id_state.social_blocks, (map_key_t)uuid_str);
+    pthread_mutex_unlock(&id_state.lock);
+    _persist_social_blocks();
+}
+
+/* Conformance/test seam: save the block set and load it back, which is the
+ * round trip a restart performs — without needing one.
+ *
+ * A restart is the thing that must not lose a block, but a conformance step
+ * cannot restart a process, and a test that only checked the in-memory map
+ * would pass with no file written at all. This drives the real writer and the
+ * real reader. */
+void identity_reload_social_blocks(const char *cfg_dir)
+{
+    char resolved[CFG_PATH_LEN + 1];
+    if (cfg_dir == NULL) {
+        if (get_cfg_dir(resolved, sizeof(resolved)) <= 0)
+            return;
+        cfg_dir = resolved;
+    }
+    pthread_mutex_lock(&id_state.lock);
+    /* IF THE SAVE FAILED, DO NOT LOAD. social_store_load REPLACES the map, so
+     * a failed write followed by a read of the file that is not there would
+     * empty the block set — turning an unwritable config directory into a
+     * silent mass unblock. Found by this seam wiping state in the conformance
+     * harness, where the default root is /etc/at and nothing may be written;
+     * the same shape would bite a real node with a read-only config mount. */
+    int rc = social_store_save(&id_state.social_blocks, cfg_dir);
+    if (rc == 0)
+        (void)social_store_load(cfg_dir, &id_state.social_blocks);
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+/* Conformance/observability read-back: is @p uuid_str locally blocked? */
+bool identity_is_blocked(const char *uuid_str)
+{
+    if (!id_state.initialized || uuid_str == NULL) return false;
+    pthread_mutex_lock(&id_state.lock);
+    bool blocked = _is_blocked_locked(uuid_str);
+    pthread_mutex_unlock(&id_state.lock);
+    return blocked;
 }
 
 /* Read the per-edge accrual record for @p uuid_str; absent => all zeros. Caller
@@ -5788,6 +6056,20 @@ static bool _social_accrue(const char *uuid_str, long now,
 {
     bool ok = false;
     pthread_mutex_lock(&id_state.lock);
+    /* A blocked peer accrues nothing with us (Phase 4 P4.1). Gated HERE rather
+     * than at each caller because every positive path funnels through this
+     * function, so one gate covers DMs, reactions and connections at once.
+     *
+     * Not merely tidiness: reputation here is BILATERAL, and our half can only
+     * complete if the other side submits its own. We have told them nothing —
+     * a block is purely local — so they have no reason to, and our submission
+     * would sit in the chain as a permanent half-entry. That is the same
+     * defect the 2026-09-21 cohort caught on the reaction path, arrived at
+     * from the other direction. */
+    if (_is_blocked_locked(uuid_str)) {
+        pthread_mutex_unlock(&id_state.lock);
+        return false;
+    }
     int count, day, dc; long lo, li;
     _social_edge_get_locked(uuid_str, &count, &lo, &li, &day, &dc);
 
@@ -5825,6 +6107,13 @@ static void _social_accrue_connection(const process_t *proc,
                                       const uuid_t peer_uuid,
                                       uint64_t seq, bool connected)
 {
+    /* Gated separately from _social_accrue because the DECLINE branch below
+     * bypasses it entirely and submits AT_SOCIAL_NEG_SCORE unconditionally.
+     * Without this, blocking someone and then declining them would still cost
+     * them 0.30 — a block must not become a way to grind a peer down, and the
+     * submission could never pair anyway. */
+    if (_is_blocked(peer_uuid))
+        return;
     uuid_t task;
     uint8_t tail[8];
     for (int i = 0; i < 8; i++) tail[i] = (uint8_t)((seq >> (8 * i)) & 0xFF);
@@ -5838,9 +6127,9 @@ static void _social_accrue_connection(const process_t *proc,
         uuid_unparse_lower(peer_uuid, peer_str);
         if (_social_accrue(peer_str, now, false, &count))
             _submit_interaction_score(proc, task, at_social_pos_score(count),
-                                      peer_uuid);
+                                      peer_uuid, NULL);
     } else {
-        _submit_interaction_score(proc, task, AT_SOCIAL_NEG_SCORE, peer_uuid);
+        _submit_interaction_score(proc, task, AT_SOCIAL_NEG_SCORE, peer_uuid, NULL);
     }
 }
 
@@ -5869,7 +6158,7 @@ static void _social_accrue_dm(const process_t *proc, const uuid_t peer_uuid,
     int count = 0;
     if (_social_accrue(peer_str, now, true, &count))
         _submit_interaction_score(proc, task, at_social_pos_score(count),
-                                  peer_uuid);
+                                  peer_uuid, NULL);
 }
 
 /* Accrue for a post reaction between @p self_uuid and the counterparty
@@ -5898,26 +6187,11 @@ static void _social_accrue_reaction(const process_t *proc, const uuid_t self_uui
     uuid_unparse_lower(peer_uuid, peer_str);
     if (_social_accrue(peer_str, now, false, &count))
         _submit_interaction_score(proc, task, at_social_pos_score(count),
-                                  peer_uuid);
+                                  peer_uuid, NULL);
 }
 
 /* Copy the current public_identity_t of the admitted peer with @p uuid into
  * @p out (under peers_read_lock). Returns true iff found. */
-static bool _find_peer_pub_by_uuid(const process_t *proc, const uuid_t uuid,
-                                   public_identity_t *out)
-{
-    bool found = false;
-    peers_read_lock(proc);
-    for (size_t i = 0; i < proc->protocol.num_peers; i++) {
-        if (uuid_compare(proc->protocol.peers[i].uuid, uuid) == 0) {
-            memcpy(out, &proc->protocol.peers[i], sizeof(public_identity_t));
-            found = true;
-            break;
-        }
-    }
-    peers_read_unlock(proc);
-    return found;
-}
 
 /* Directed connection request to one admitted peer (a bare ask; mirrors
  * _send_profile_query but with no query payload). Encrypt=true: NOT on the
@@ -6016,6 +6290,18 @@ static bool handle_connection_request(const process_t *proc, directory_t *queues
     net_msg_t *nmsg = &msg->info.net_msg;
     char requester[UUID_STRING_LEN + 1];
     uuid_unparse_lower(nmsg->from_whom.uuid, requester);
+    /* A blocked peer cannot ask (Phase 4 P4.1). DROPPED at the top: the ask
+     * is directed, and letting it through would move our edge to pending_in
+     * and put a notification in front of the person who blocked them —
+     * exactly the reach a block exists to remove. Note AT_CONN_DECLINED is
+     * re-askable by design, so without this a blocked peer could ask again
+     * indefinitely. */
+    if (_is_blocked(nmsg->from_whom.uuid)) {
+        log_debug(proc->logger,
+                  "Identity: connection_request from %s dropped (locally "
+                  "blocked)\n", requester);
+        return true;
+    }
     if (identity_get_connection_state(requester) == AT_CONN_CONNECTED) {
         log_debug(proc->logger,
                   "Identity: connection_request from %s; already connected\n",
@@ -6376,6 +6662,17 @@ static bool handle_app_send_dm(const process_t *proc, directory_t *queues,
         log_warn(proc->logger, "Identity: app send_dm: unknown peer\n");
         return true;
     }
+    /* We do not write to someone we blocked (Phase 4 P4.1). REFUSED before any
+     * wire traffic: a block is mutual in effect, and a DM they can answer but
+     * whose answer we would drop is worse than no DM at all. */
+    if (_is_blocked(peer_uuid)) {
+        char blocked_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(peer_uuid, blocked_str);
+        log_info(proc->logger,
+                 "Identity: app send_dm refused: %s is locally blocked\n",
+                 blocked_str);
+        return true;
+    }
     pthread_mutex_lock(&id_state.lock);
     int64_t seq = freshness_stamp(&id_state.freshness, proc->logger);
     pthread_mutex_unlock(&id_state.lock);
@@ -6422,6 +6719,20 @@ static bool handle_dm(const process_t *proc, directory_t *queues,
     pthread_mutex_unlock(&id_state.lock);
     if (!fresh) {
         log_debug(proc->logger, "Identity: peer_dm from %s refused (replay)\n",
+                  sender);
+        return true;
+    }
+
+    /* A blocked peer cannot reach us (Phase 4 P4.1). DROPPED, not hidden:
+     * a DM has no third party whose interest is served by our keeping it, and
+     * nothing is stored, emitted or accrued.
+     *
+     * AFTER freshness_accept, never before. The replay window must still
+     * advance, or every DM sent during a block replays the moment it is
+     * lifted. */
+    if (_is_blocked(nmsg->from_whom.uuid)) {
+        log_debug(proc->logger,
+                  "Identity: peer_dm from %s dropped (locally blocked)\n",
                   sender);
         return true;
     }
@@ -6690,6 +7001,18 @@ static bool handle_cosign_request(const process_t *proc, directory_t *queues,
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+    /* A blocked peer cannot ask us to co-sign (Phase 4 P4.1). DROPPED at the
+     * top: a co-sign ask is directed and lands in front of a person as a
+     * decision to make. Blocking is not a governance act — the roll is Ethne's
+     * business, and this says nothing about whether the record is valid or
+     * whether this node is a required signer. It says only that THIS person
+     * will not be asked by THAT one. */
+    if (_is_blocked(nmsg->from_whom.uuid)) {
+        log_debug(proc->logger,
+                  "Identity: peer_cosign_request from %s dropped (locally "
+                  "blocked)\n", nmsg->from_whom.nickname);
+        return true;
+    }
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL) {
         /* Was a silent `return true`. An ask that dies here leaves NO trace on
@@ -6876,6 +7199,13 @@ static bool handle_app_react_post(const process_t *proc, directory_t *queues,
         log_warn(proc->logger, "Identity: app react_post: unknown author\n");
         return true;
     }
+    /* We do not react to someone we blocked (Phase 4 P4.1). Refused before any
+     * wire traffic — see app send_dm. */
+    if (_is_blocked(author_uuid)) {
+        log_info(proc->logger,
+                 "Identity: app react_post refused: author is locally blocked\n");
+        return true;
+    }
     const identity_t *self = _partition_self_identity(proc);
     if (self == NULL) {
         log_debug(proc->logger,
@@ -6945,12 +7275,339 @@ static bool handle_reaction(const process_t *proc, directory_t *queues,
         return true;
     }
 
+    /* A blocked peer cannot reach us (Phase 4 P4.1). DROPPED after the
+     * freshness window advances, for the reason handle_dm gives. Note this
+     * path ACCRUED REPUTATION for a blocked peer before P4.1 — it is one of
+     * the two the accrual gate closes, and the drop makes it moot. */
+    if (_is_blocked(nmsg->from_whom.uuid)) {
+        log_debug(proc->logger,
+                  "Identity: peer_reaction from %s dropped (locally blocked)\n",
+                  sender);
+        return true;
+    }
+
     identity_emit_reaction(nmsg->from_whom.uuid, post_id, seq, ts);
     log_debug(proc->logger, "Identity: reaction received from peer %s\n", sender);
     const identity_t *self = _partition_self_identity(proc);
     if (self != NULL)
         _social_accrue_reaction(proc, self->uuid, nmsg->from_whom.uuid, post_id);
     return true;
+}
+
+/****************************
+ * First-person reports (Phase 4 P4.1). A report is an INTERACTION OUTCOME — one
+ * party's own account that an exchange went badly — so it is a low scalar through
+ * the ordinary bilateral transaction, on the `first_person` channel. Not an
+ * authority finding: those are ceilings (PEER_STANDING), never scores.
+ *
+ * The reporter sends a directed encrypted peer_report {seq, ts}; both sides
+ * derive the same task from (reporter, reported, seq) and stage their halves:
+ * the reporter AT_SOCIAL_REPORT_SCORE about the reported peer, the reported
+ * node AT_SOCIAL_REPORTER_SCORE about the reporter. Nothing reaches the reported
+ * node's app — the node learns, the person is not told, which is the whole
+ * defence against retaliation.
+ *
+ * Refusable, and documented as such: a forked reported node need simply not
+ * stage its half, and the report never commits.
+ ****************************/
+
+/* Read the report ledger for @p uuid_str, rolled over to @p today (a record from
+ * an earlier day reads as zeros). Caller MUST hold id_state.lock. */
+static void _social_report_get_locked(const char *uuid_str, int today,
+                                      int *out_n, int *in_n)
+{
+    *out_n = 0; *in_n = 0;
+    data_t *dat = NULL;
+    if (map_get(&id_state.social_reports, (map_key_t)uuid_str, &dat) != 0
+        || dat == NULL)
+        return;
+    char *s = NULL;
+    if (data_string_ptr(dat, &s) != 0 || s == NULL)
+        return;
+    json_error_t jerr;
+    json_t *o = json_loads(s, 0, &jerr);
+    if (o == NULL)
+        return;
+    json_t *jd = json_object_get(o, "day");
+    if (json_is_integer(jd) && (int)json_integer_value(jd) == today) {
+        json_t *j;
+        if ((j = json_object_get(o, "out")) && json_is_integer(j))
+            *out_n = (int)json_integer_value(j);
+        if ((j = json_object_get(o, "in")) && json_is_integer(j))
+            *in_n = (int)json_integer_value(j);
+    }
+    json_decref(o);
+}
+
+/* Write the report ledger. Caller MUST hold id_state.lock. */
+static void _social_report_put_locked(const char *uuid_str, int today,
+                                      int out_n, int in_n)
+{
+    char buf[64];
+    int len = snprintf(buf, sizeof(buf), "{\"day\":%d,\"out\":%d,\"in\":%d}",
+                       today, out_n, in_n);
+    if (len <= 0 || (size_t)len >= sizeof(buf)) return;
+    char *dup = smrt_create((size_t)len + 1);
+    if (dup == NULL) return;
+    memcpy(dup, buf, (size_t)len + 1);
+    data_t *dat = string_data(dup, (size_t)len + 1);
+    if (dat == NULL) { smrt_deref(dup); return; }
+    map_set(&id_state.social_reports, (map_key_t)uuid_str, dat);
+}
+
+/* May we report @p uuid_str now — and, when @p spend, record that we did?
+ *
+ * Checked BEFORE the frame goes and spent only AFTER it went, so a refused
+ * report never reaches the wire (the reported node would otherwise stage a half
+ * we will never match) and an unsent one costs nothing.
+ *
+ * Three bounds, all of which must hold:
+ *   - AT_SOCIAL_REPORT_DAILY_CAP about this peer today;
+ *   - the SHARED per-edge budget (AT_SOCIAL_PER_EDGE_DAILY_CAP) and
+ *   - the SHARED global budget (AT_SOCIAL_GLOBAL_DAILY_CAP).
+ * Two consequences of sharing, both accepted: a report SPENDS budget a positive
+ * interaction would have used — that is the anti-abuse property, since
+ * report-spam costs the spammer their own ability to accrue — and it bumps the
+ * per-edge count, so the next positive with this peer scores slightly lower.
+ *
+ * NOT gated by the block, unlike _social_accrue. A block governs what we see;
+ * whether we also report is a separate decision, and "Block · Both" must work in
+ * either order. The block gate exists in _social_accrue because a blocked peer
+ * has no reason to stage the other half — here they do, because we tell them. */
+static bool _social_report_outbound(const char *uuid_str, long now, bool spend)
+{
+    int today = (int)(now / AT_SOCIAL_DAY_SECONDS);
+    bool ok = false;
+    pthread_mutex_lock(&id_state.lock);
+    int out_n, in_n;
+    _social_report_get_locked(uuid_str, today, &out_n, &in_n);
+    int count, day, dc; long lo, li;
+    _social_edge_get_locked(uuid_str, &count, &lo, &li, &day, &dc);
+    if (day != today) { day = today; dc = 0; }
+    int global = (id_state.social_day == today) ? id_state.social_day_count : 0;
+    if (out_n < AT_SOCIAL_REPORT_DAILY_CAP
+        && dc < AT_SOCIAL_PER_EDGE_DAILY_CAP
+        && global < AT_SOCIAL_GLOBAL_DAILY_CAP) {
+        ok = true;
+        if (spend) {
+            _social_report_put_locked(uuid_str, today, out_n + 1, in_n);
+            _social_edge_put_locked(uuid_str, count + 1, lo, li, day, dc + 1);
+            id_state.social_day = today;
+            id_state.social_day_count = global + 1;
+        }
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return ok;
+}
+
+/* Pair at most AT_SOCIAL_REPORT_DAILY_CAP reports from @p uuid_str per day,
+ * recording this one when it fits. This is the only bound on a FORKED reporter,
+ * whose own caps are whatever it claims.
+ *
+ * Deliberately NOT charged to our shared budget: if pairing a report cost the
+ * reported node its own accrual budget, a node that had spent its budget on
+ * ordinary interactions would be unreportable for the rest of the day. */
+static bool _social_report_inbound(const char *uuid_str, long now)
+{
+    int today = (int)(now / AT_SOCIAL_DAY_SECONDS);
+    bool ok = false;
+    pthread_mutex_lock(&id_state.lock);
+    int out_n, in_n;
+    _social_report_get_locked(uuid_str, today, &out_n, &in_n);
+    if (in_n < AT_SOCIAL_REPORT_DAILY_CAP) {
+        _social_report_put_locked(uuid_str, today, out_n, in_n + 1);
+        ok = true;
+    }
+    pthread_mutex_unlock(&id_state.lock);
+    return ok;
+}
+
+/* The shared report task: domain "agora-report", the two uuids in canonical
+ * order, and reporter_uuid[16] || seq u64le as the tail. See
+ * AT_SOCIAL_DOMAIN_REPORT for why the reporter is in the tail. */
+static int _social_report_task(const uuid_t reporter, const uuid_t reported,
+                               uint64_t seq, uuid_t task)
+{
+    uint8_t tail[16 + 8];
+    memcpy(tail, reporter, 16);
+    for (int i = 0; i < 8; i++)
+        tail[16 + i] = (uint8_t)((seq >> (8 * i)) & 0xFF);
+    return at_social_task_uuid(AT_SOCIAL_DOMAIN_REPORT, reporter, reported,
+                               tail, sizeof(tail), task);
+}
+
+/* Directed, encrypted report to @p target: {seq, ts}. Encrypt=true. */
+static int _send_report(const process_t *proc, const public_identity_t *target,
+                        int64_t seq, double ts)
+{
+    generic_msg_t out = {0};
+    out.type = NET_MESSAGE;
+    strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
+    out.info.net_msg.function = ID_REPORT;
+    out.info.net_msg.encrypt = true;
+    memcpy(&out.info.net_msg.to_whom, target, sizeof(public_identity_t));
+    strncpy(out.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    json_t *env = json_object();
+    if (env == NULL) return -1;
+    json_object_set_new(env, "seq", json_integer(seq));
+    json_object_set_new(env, "ts", json_real(ts));
+    net_msg_pack_json(&out.info.net_msg, env);
+    json_decref(env);
+    return _send_to_network(proc, &out, "a report", target->nickname);
+}
+
+/* App -> AT verb (AT_APP_REPORT_PEER): the operator reports a peer. Payload
+ * {"peer": "<uuid_str>"}; any other key is ignored — a reason in particular,
+ * which stays in the app. */
+static bool handle_app_report_peer(const process_t *proc, directory_t *queues,
+                                   generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    /* A verb that lowers a peer's reputation must come from THIS device's app.
+     * Unguarded, any admitted peer could report on our behalf. */
+    if (!_is_local_app_verb(proc, nmsg))
+        return _refuse_remote_app_verb(proc, nmsg, AT_APP_REPORT_PEER);
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *j_peer = json_object_get(payload, "peer");
+    uuid_t peer_uuid;
+    int rc = json_is_string(j_peer)
+        ? uuid_parse(json_string_value(j_peer), peer_uuid) : -1;
+    json_decref(payload);
+    if (rc != 0) {
+        log_warn(proc->logger, "Identity: app report_peer malformed, refusing\n");
+        return true;
+    }
+    public_identity_t target;
+    if (!_find_peer_pub_by_uuid(proc, peer_uuid, &target)) {
+        log_warn(proc->logger, "Identity: app report_peer: unknown peer\n");
+        return true;
+    }
+    const identity_t *self = _partition_self_identity(proc);
+    if (self == NULL) {
+        log_debug(proc->logger,
+                  "Identity: app report_peer but self identity unresolved\n");
+        return true;
+    }
+    char peer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, peer_str);
+    long now = (long)time(NULL);
+    if (!_social_report_outbound(peer_str, now, false)) {
+        log_info(proc->logger,
+                 "Identity: report of %s refused: daily report or accrual cap "
+                 "reached\n", peer_str);
+        return true;
+    }
+    pthread_mutex_lock(&id_state.lock);
+    int64_t seq = freshness_stamp(&id_state.freshness, proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (seq <= 0) {
+        log_warn(proc->logger, "Identity: no freshness sequence; not reporting\n");
+        return true;
+    }
+    uuid_t task;
+    if (_social_report_task(self->uuid, peer_uuid, (uint64_t)seq, task) != 0)
+        return true;
+    /* STAGE ONLY IF IT WENT — the reaction path's rule, for its reason: an
+     * unsent report would leave our half in the chain for good. */
+    if (_send_report(proc, &target, seq, (double)time(NULL)) != 0) {
+        log_warn(proc->logger,
+                 "Identity: report of %s was not sent; not scoring it\n",
+                 target.nickname);
+        return true;
+    }
+    _social_report_outbound(peer_str, now, true);
+    _submit_interaction_score(proc, task, AT_SOCIAL_REPORT_SCORE, peer_uuid,
+                              TX_CHANNEL_FIRST_PERSON);
+    log_info(proc->logger, "Identity: reported peer %s\n", peer_str);
+    return true;
+}
+
+/* Handler: a peer reported US — {seq, ts}. Freshness-checked, dropped if we
+ * blocked the reporter, capped per reporter per day, then our half is staged so
+ * the report can commit. The reporter is the authenticated envelope's from_whom.
+ *
+ * NOTHING IS EMITTED TO THE APP. The person being reported is not told, by
+ * whom or at all; their node stages a transaction like any other. */
+static bool handle_peer_report(const process_t *proc, directory_t *queues,
+                               generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *j_seq = json_object_get(payload, "seq");
+    if (!json_is_integer(j_seq)) {
+        json_decref(payload);
+        log_warn(proc->logger, "Identity: peer_report malformed, refusing\n");
+        return true;
+    }
+    int64_t seq = (int64_t)json_integer_value(j_seq);
+    json_decref(payload);
+
+    char sender[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, sender);
+    pthread_mutex_lock(&id_state.lock);
+    bool fresh = freshness_accept(&id_state.freshness, sender, ID_REPORT, seq,
+                                  proc->logger);
+    pthread_mutex_unlock(&id_state.lock);
+    if (!fresh) {
+        log_debug(proc->logger, "Identity: peer_report from %s refused (replay)\n",
+                  sender);
+        return true;
+    }
+    /* Directed traffic from a blocked peer is DROPPED (after the freshness
+     * window advances, for the reason handle_dm gives). Their report then never
+     * pairs — a consequence of our block, and one they cannot observe. */
+    if (_is_blocked(nmsg->from_whom.uuid)) {
+        log_debug(proc->logger,
+                  "Identity: peer_report from %s dropped (locally blocked)\n",
+                  sender);
+        return true;
+    }
+    if (!_social_report_inbound(sender, (long)time(NULL))) {
+        log_info(proc->logger,
+                 "Identity: peer_report from %s refused: daily report cap\n",
+                 sender);
+        return true;
+    }
+    const identity_t *self = _partition_self_identity(proc);
+    if (self == NULL)
+        return true;
+    uuid_t task;
+    if (_social_report_task(nmsg->from_whom.uuid, self->uuid, (uint64_t)seq,
+                            task) != 0)
+        return true;
+    _submit_interaction_score(proc, task, AT_SOCIAL_REPORTER_SCORE,
+                              nmsg->from_whom.uuid, NULL);
+    /* INFO, not debug: the reported side is the only place the pairing can be
+     * seen from outside, and moderation_cohort.sh asserts on this line. */
+    log_info(proc->logger, "Identity: report from peer %s staged\n", sender);
+    return true;
+}
+
+/* Re-emit one peer_observed after its block state changed, so the app learns
+ * (Phase 4 P4.1).
+ *
+ * THIS IS WHAT MADE A BLOCK VISIBLE AT ALL. handle_app_block wrote the record
+ * and emitted nothing, and the app derives a peer's tier from its SCORE, which
+ * a block does not touch — so a blocked peer went on rendering exactly as
+ * before. The record was right and the UI was blind.
+ *
+ * Silent when the peer is unknown: a block may legitimately name a uuid this
+ * node has never admitted, and there is nothing to re-emit for one. */
+static void _reemit_peer_after_block(const process_t *proc,
+                                     const char *peer_str)
+{
+    uuid_t peer_uuid;
+    if (uuid_parse(peer_str, peer_uuid) != 0)
+        return;
+    public_identity_t pub;
+    if (_find_peer_pub_by_uuid(proc, peer_uuid, &pub))
+        identity_emit_peer_observed(proc, &pub);
 }
 
 /* App -> AT verb (AT_APP_BLOCK): locally block a peer. Payload {"peer":
@@ -6961,6 +7618,8 @@ static bool handle_app_block(const process_t *proc, directory_t *queues,
 {
     (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
+    if (!_is_local_app_verb(proc, nmsg))
+        return _refuse_remote_app_verb(proc, nmsg, AT_APP_BLOCK);
     json_t *payload = NULL;
     if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
         return true;
@@ -6970,13 +7629,38 @@ static bool handle_app_block(const process_t *proc, directory_t *queues,
     snprintf(peer_str, sizeof(peer_str), "%s", json_string_value(j_peer));
     json_decref(payload);
 
-    data_t *one = integer_data(1);
-    if (one != NULL) {
-        pthread_mutex_lock(&id_state.lock);
-        map_set(&id_state.social_blocks, (map_key_t)peer_str, one);
-        pthread_mutex_unlock(&id_state.lock);
-    }
+    /* Through the seam rather than writing the map here, so the handler and
+     * the conformance path cannot diverge — and so persistence happens once,
+     * in one place. */
+    identity_block_peer(peer_str);
     log_info(proc->logger, "Identity: peer %s locally blocked\n", peer_str);
+    _reemit_peer_after_block(proc, peer_str);
+    return true;
+}
+
+/* App -> AT verb (AT_APP_UNBLOCK): lift a local block. Payload {"peer":
+ * "<uuid_str>"}. Removes the record and re-emits peer_observed. Purely local —
+ * the peer is told nothing, exactly as they were told nothing about the
+ * block. */
+static bool handle_app_unblock(const process_t *proc, directory_t *queues,
+                               generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    if (!_is_local_app_verb(proc, nmsg))
+        return _refuse_remote_app_verb(proc, nmsg, AT_APP_UNBLOCK);
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return true;
+    json_t *j_peer = json_object_get(payload, "peer");
+    if (!json_is_string(j_peer)) { json_decref(payload); return true; }
+    char peer_str[UUID_STRING_LEN + 1];
+    snprintf(peer_str, sizeof(peer_str), "%s", json_string_value(j_peer));
+    json_decref(payload);
+
+    identity_unblock_peer(peer_str);
+    log_info(proc->logger, "Identity: peer %s unblocked\n", peer_str);
+    _reemit_peer_after_block(proc, peer_str);
     return true;
 }
 
@@ -7268,6 +7952,36 @@ static bool handle_post(const process_t *proc, directory_t *queues,
     if (_post_seen_or_record(id_hex)) {
         log_debug(proc->logger, "Identity: peer_post %s already seen, dropping\n",
                   id_hex);
+        return true;
+    }
+
+    /* A blocked author's post is HIDDEN, not dropped (Phase 4 P4.1), and the
+     * relay below still runs.
+     *
+     * THE TIER-GATE ABOVE CANNOT DO THIS, which is the defect this increment
+     * is named for: a PUBLIC post declares tier 0, a blocked peer clamps to
+     * tier 0, and `0 < 0` is false — so every public post from a blocked peer
+     * arrived. The comparison is right; it answers "does this author clear the
+     * audience floor", and tier 0 is a floor everyone clears. A block is a
+     * REFUSAL, not a low measurement, so it is asked as its own question.
+     *
+     * HIDE rather than DROP, and KEEP THE RELAY, because a post is GOSSIPED: a
+     * personal block governs what WE see, not what our neighbours may see.
+     * Withholding a community's feed traffic because one member muted the
+     * author is community content POLICY — SOCIAL_APP_PLAN.md's box 5, which is
+     * out of scope here and must stay open. Continuing to relay also means a
+     * blocked peer cannot detect the block by watching propagation.
+     *
+     * Placed AFTER the dedup ring records the id, so a hidden post is not
+     * re-considered on a second copy and the forward still happens at most
+     * once. */
+    if (_is_blocked(author)) {
+        log_debug(proc->logger,
+                  "Identity: peer_post %s from %s hidden (locally blocked); "
+                  "still relaying\n", id_hex, author_str);
+        if (hops < POST_MAX_HOPS)
+            _multicast_post(proc, author, author_pk, seq, ts, tier, body,
+                            sig_hex, hops + 1);
         return true;
     }
 
@@ -7808,7 +8522,23 @@ static bool handle_business_ad(const process_t *proc, directory_t *queues,
     }
 
     _business_page_store(did, bundle, seq, ts, adv_str, (int)sat);
-    identity_emit_business_ad(advertiser, did, id_hex, (int)sat, seq, ts, bundle);
+    /* A blocked ADVERTISER's voice is hidden from us (Phase 4 P4.1): we do not
+     * surface their endorsement to the app. The page itself is still stored
+     * above, and the customer-carry gate below still runs.
+     *
+     * THE SENDER IS CHECKED, NEVER THE POLITY. A block is keyed by peer uuid;
+     * a polity is a DID, and blocking a BUSINESS is an app-level question the
+     * app can answer for itself because it holds the DID. The core must not
+     * grow an opinion about the opaque bundle — it cannot parse Ethne, and
+     * that is deliberate. */
+    if (_is_blocked(advertiser)) {
+        log_debug(proc->logger,
+                  "Identity: business ad %s from %s hidden (advertiser locally "
+                  "blocked)\n", id_hex, adv_str);
+    } else {
+        identity_emit_business_ad(advertiser, did, id_hex, (int)sat, seq, ts,
+                                  bundle);
+    }
     log_debug(proc->logger,
               "Identity: business ad %s for %s from %s accepted (sat=%u)\n",
               id_hex, did, adv_str, (unsigned)sat);
@@ -8249,7 +8979,17 @@ static bool handle_business_post(const process_t *proc, directory_t *queues,
     }
 
     _last_business_post_store(did, id_hex, seq, ts, hops, bundle);
-    identity_emit_business_post(author, did, id_hex, seq, ts, hops, bundle);
+    /* A blocked PUBLISHER's copy is hidden from us (Phase 4 P4.1) — the sender
+     * of this envelope, not the polity, for the reason handle_business_ad
+     * gives. The hop relay below still runs, as it does for a feed post: a
+     * personal block is not community content policy. */
+    if (_is_blocked(author)) {
+        log_debug(proc->logger,
+                  "Identity: business post %s from %s hidden (publisher "
+                  "locally blocked)\n", id_hex, auth_str);
+    } else {
+        identity_emit_business_post(author, did, id_hex, seq, ts, hops, bundle);
+    }
     log_info(proc->logger,
              "Identity: business post %s for %s from %s accepted (hops=%d)\n",
              id_hex, did, auth_str, hops);
@@ -8272,6 +9012,141 @@ static bool handle_business_post(const process_t *proc, directory_t *queues,
     return true;
 }
 #endif /* AT_SOCIAL_ENABLED */
+
+/****************************
+ * Handler: app_peer_standing (Phase 4 P4.1)
+ *
+ * An AUTHORITY FINDING the app decided — an Ethne expulsion, or a
+ * reinstatement — republished to reputation as a PEER_STANDING. Payload:
+ *   {"peer": "<uuid_str>", "standing": "proved"|"capped"|"failed",
+ *    "ceiling": <0..1, negative for none>, "source": "ethne",
+ *    "reason": "<=63 chars>"}
+ *
+ * A CEILING, NEVER A SCORE — see AT_APP_PEER_STANDING in utilities/message.h
+ * and the note at rep_proc.c's _handle_peer_standing.
+ *
+ * THE CORE VERIFIES NOTHING ABOUT THE FINDING ITSELF. An Ethne expulsion is
+ * proved by co-signatures inside a record this process cannot parse, exactly
+ * as a business page bundle is (handle_app_advertise_business takes the same
+ * stance). What is trusted is the CHANNEL, which is what the origin guard
+ * below establishes; and what is checked is the SHAPE.
+ ****************************/
+static bool handle_app_peer_standing(const process_t *proc,
+                                     directory_t *queues, generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+
+    /* GUARD 1 — origin. Without this the verb is a remote reputation-floor
+     * primitive: route_to_process forwards by process name with no function
+     * allowlist, so an admitted peer's encrypted frame would land here. */
+    if (!_is_local_app_verb(proc, nmsg))
+        return _refuse_remote_app_verb(proc, nmsg, AT_APP_PEER_STANDING);
+
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL) {
+        log_warn(proc->logger,
+                 "Identity: app_peer_standing: no JSON payload\n");
+        return true;
+    }
+    const char *peer_str = json_string_value(json_object_get(payload, "peer"));
+    const char *standing_str =
+        json_string_value(json_object_get(payload, "standing"));
+    const char *source_str =
+        json_string_value(json_object_get(payload, "source"));
+    const char *reason_str =
+        json_string_value(json_object_get(payload, "reason"));
+    json_t *j_ceiling = json_object_get(payload, "ceiling");
+
+    uuid_t peer_uuid;
+    if (peer_str == NULL || uuid_parse(peer_str, peer_uuid) != 0) {
+        log_warn(proc->logger,
+                 "Identity: app_peer_standing: bad or missing peer uuid\n");
+        json_decref(payload);
+        return true;
+    }
+
+    /* GUARD 2 — the authority must be one we know, and the app may NOT speak
+     * as ZTA. Otherwise an app forges a `proved` from the credential authority
+     * and clears a real certificate ceiling it knows nothing about. */
+    const char *source = peer_standing_source_or_default(source_str);
+    if (!peer_standing_source_valid(source)
+        || strcmp(source, PEER_STANDING_SOURCE_ZTA) == 0) {
+        log_warn(proc->logger,
+                 "Identity: app_peer_standing for %s refused: '%s' is not an "
+                 "authority the app may speak for\n", peer_str, source);
+        json_decref(payload);
+        return true;
+    }
+
+    int32_t standing = (int32_t)PEER_STANDING_CAPPED;
+    if (standing_str != NULL && strcmp(standing_str, "proved") == 0)
+        standing = (int32_t)PEER_STANDING_PROVED;
+    else if (standing_str != NULL && strcmp(standing_str, "failed") == 0)
+        standing = (int32_t)PEER_STANDING_FAILED;
+    else if (standing_str == NULL || strcmp(standing_str, "capped") != 0) {
+        log_warn(proc->logger,
+                 "Identity: app_peer_standing for %s refused: unknown standing "
+                 "'%s'\n", peer_str, standing_str ? standing_str : "(none)");
+        json_decref(payload);
+        return true;
+    }
+
+    /* GUARD 3 — a ceiling outside [0, 1] is not a bound on this scale. An
+     * absent ceiling means "no bound", which is what a reinstatement carries. */
+    double ceiling = PEER_NO_CEILING;
+    if (json_is_number(j_ceiling)) {
+        ceiling = json_number_value(j_ceiling);
+        if (ceiling < 0.0) {
+            ceiling = PEER_NO_CEILING;
+        } else if (ceiling > 1.0) {
+            log_warn(proc->logger,
+                     "Identity: app_peer_standing for %s refused: ceiling %.3f "
+                     "is off the [0, 1] scale\n", peer_str, ceiling);
+            json_decref(payload);
+            return true;
+        }
+    }
+
+    /* GUARD 4 — a finding about somebody this node has never admitted bounds
+     * nothing and is far more likely a mistake than a decision. */
+    public_identity_t known;
+    if (!_find_peer_pub_by_uuid(proc, peer_uuid, &known)) {
+        log_warn(proc->logger,
+                 "Identity: app_peer_standing for %s refused: not an admitted "
+                 "peer\n", peer_str);
+        json_decref(payload);
+        return true;
+    }
+
+    generic_msg_t out;
+    memset(&out, 0, sizeof(out));
+    out.type = PEER_STANDING;
+    out.size = sizeof(peer_standing_msg_t);
+    memcpy(out.info.peer_standing.peer_uuid, peer_uuid, sizeof(uuid_t));
+    out.info.peer_standing.standing = standing;
+    out.info.peer_standing.ceiling = ceiling;
+    at_strlcpy(out.info.peer_standing.reason, reason_str ? reason_str : "",
+               sizeof(out.info.peer_standing.reason));
+    at_strlcpy(out.info.peer_standing.source, source,
+               sizeof(out.info.peer_standing.source));
+    json_decref(payload);
+
+    if (messaging_send("reputation", PEER_STANDING, &out, false) != 0) {
+        log_warn(proc->logger,
+                 "Identity: could not propagate %s standing for %s "
+                 "(ceiling %.2f)\n", source, peer_str, ceiling);
+        return true;
+    }
+    log_info(proc->logger,
+             "Identity: %s standing for %s -> %s (ceiling %.2f): %s\n",
+             source, peer_str,
+             standing == (int32_t)PEER_STANDING_PROVED   ? "proved"
+             : standing == (int32_t)PEER_STANDING_FAILED ? "failed"
+                                                         : "capped",
+             ceiling, reason_str ? reason_str : "");
+    return true;
+}
 
 /****************************
  * Handler: tier_update
@@ -8368,13 +9243,18 @@ int identity_get_peer_tier(const uuid_t uuid)
     data_t *dat = NULL;
     if (map_get(&id_state.peer_tiers, uuid_str, &dat) == 0 && dat != NULL)
         data_integer(dat, &tier);
-#ifdef AT_SOCIAL_ENABLED
-    /* A locally blocked peer (Increment 8) is clamped to tier 0 for our own
-     * tier-gates. Purely local: nothing on the wire, no reputation transaction. */
-    data_t *bdat = NULL;
-    if (map_get(&id_state.social_blocks, uuid_str, &bdat) == 0 && bdat != NULL)
+    /* A locally blocked peer is clamped to tier 0 for our own tier-gates.
+     * Purely local: nothing on the wire, no reputation transaction.
+     *
+     * KEPT, but no longer the whole story (Phase 4 P4.1). This clamp is a
+     * SECOND line of defence for the one other production consumer of this
+     * function — negotiation's capability gate (neg_proc.c), whose floors are
+     * always >= 1 so the clamp genuinely bites there. The inbound content
+     * paths now ask _is_blocked directly, because a floor of 0 makes a clamp
+     * to 0 a no-op and that is precisely how a blocked peer's public posts
+     * kept arriving. */
+    if (_is_blocked_locked(uuid_str))
         tier = 0;
-#endif /* AT_SOCIAL_ENABLED */
     pthread_mutex_unlock(&id_state.lock);
     return tier;
 }
@@ -8897,31 +9777,34 @@ static void _publish_zta_standing(const process_t *proc,
         return;
     generic_msg_t msg;
     memset(&msg, 0, sizeof(msg));
-    msg.type = ZTA_STANDING;
-    msg.size = sizeof(zta_standing_msg_t);
-    memcpy(msg.info.zta_standing.peer_uuid, peer->uuid, sizeof(uuid_t));
+    msg.type = PEER_STANDING;
+    msg.size = sizeof(peer_standing_msg_t);
+    memcpy(msg.info.peer_standing.peer_uuid, peer->uuid, sizeof(uuid_t));
+    /* Name the authority — see zta_process.c's _send_zta_standing. */
+    at_strlcpy(msg.info.peer_standing.source, PEER_STANDING_SOURCE_ZTA,
+               sizeof(msg.info.peer_standing.source));
     if (decision == ZTA_GATE_ADMIT_CAPPED) {
-        msg.info.zta_standing.standing = (int32_t)ZTA_STANDING_CAPPED;
-        msg.info.zta_standing.ceiling = policy->ddil_fallback_reputation_cap;
-        at_strlcpy(msg.info.zta_standing.reason,
+        msg.info.peer_standing.standing = (int32_t)PEER_STANDING_CAPPED;
+        msg.info.peer_standing.ceiling = policy->ddil_fallback_reputation_cap;
+        at_strlcpy(msg.info.peer_standing.reason,
                    "admitted unproved (DDIL fallback or unbound credential)",
-                   sizeof(msg.info.zta_standing.reason));
+                   sizeof(msg.info.peer_standing.reason));
     } else {
         /* Proved: a credential verified against a configured anchor AND is
          * bound to this identity. The only path that anchors the doc/architecture/zta-integration.md
          * unwind -- everything earned after this moment is standing a later
          * failure calls into question. */
-        msg.info.zta_standing.standing = (int32_t)ZTA_STANDING_PROVED;
-        msg.info.zta_standing.ceiling = ZTA_NO_CEILING;
-        at_strlcpy(msg.info.zta_standing.reason, "verified at admission",
-                   sizeof(msg.info.zta_standing.reason));
+        msg.info.peer_standing.standing = (int32_t)PEER_STANDING_PROVED;
+        msg.info.peer_standing.ceiling = PEER_NO_CEILING;
+        at_strlcpy(msg.info.peer_standing.reason, "verified at admission",
+                   sizeof(msg.info.peer_standing.reason));
     }
-    if (messaging_send("reputation", ZTA_STANDING, &msg, false) != 0) {
+    if (messaging_send("reputation", PEER_STANDING, &msg, false) != 0) {
         char uuid_str[UUID_STRING_LEN + 1];
         uuid_unparse_lower(peer->uuid, uuid_str);
         log_warn(proc->logger,
                  "Identity: could not propagate ZTA standing for %s "
-                 "(ceiling %.2f)\n", uuid_str, msg.info.zta_standing.ceiling);
+                 "(ceiling %.2f)\n", uuid_str, msg.info.peer_standing.ceiling);
     }
 }
 
@@ -12032,6 +12915,10 @@ int identity_emit_peer_observed(const process_t *proc,
      * window), so it is NOT sound here — it would light the "in your group"
      * indicator while posts still cannot flow. */
     msg.info.peer_observed.in_group = _peer_shares_our_group(proc, pu);
+    /* Whether WE have blocked them (Phase 4 P4.1). Identity's own state, and
+     * the only way a block becomes visible to the app at all — before P4.1 a
+     * block emitted nothing, so the UI could not show one. */
+    msg.info.peer_observed.blocked = _is_blocked(peer->uuid);
 #endif /* AT_SOCIAL_ENABLED */
     return messaging_send(AT_MAIN_QUEUE, PEER_OBSERVED, &msg, false);
 }
@@ -12205,6 +13092,9 @@ int identity_register_handlers(process_t *proc)
     process_register_handler(proc, ID_REACTION,         (handler_ptr_t)handle_reaction);
     process_register_handler(proc, ID_APP_REACT_POST,   (handler_ptr_t)handle_app_react_post);
     process_register_handler(proc, ID_APP_BLOCK,        (handler_ptr_t)handle_app_block);
+    process_register_handler(proc, ID_APP_UNBLOCK,      (handler_ptr_t)handle_app_unblock);
+    process_register_handler(proc, ID_REPORT,           (handler_ptr_t)handle_peer_report);
+    process_register_handler(proc, ID_APP_REPORT_PEER,  (handler_ptr_t)handle_app_report_peer);
     process_register_handler(proc, ID_APP_REQUEST_ATTEND, (handler_ptr_t)handle_request_attend);
     process_register_handler(proc, ID_APP_SET_EXACT_POSITION, (handler_ptr_t)handle_set_exact_position);
     process_register_handler(proc, ID_APP_REQUEST_PROXIMITY, (handler_ptr_t)handle_request_proximity);
@@ -12233,6 +13123,8 @@ int identity_register_handlers(process_t *proc)
     process_register_handler(proc, ID_IDENTITY_RESPONSE,
                              (handler_ptr_t)handle_identity_response);
     process_register_handler(proc, ID_TIER,          (handler_ptr_t)handle_tier_update);
+    process_register_handler(proc, ID_APP_PEER_STANDING,
+                             (handler_ptr_t)handle_app_peer_standing);
     process_register_handler(proc, ID_APP_ROSTER,
                              (handler_ptr_t)handle_peer_roster_request);
     process_register_handler(proc, ID_PARTITION_SIGNAL,
@@ -12282,6 +13174,31 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
     /* Seed-assisted dual membership: adopt any group_child_*.cfg.json cohorts
      * this gateway holds (C twin of Python's _load_child_groups). A leaf with
      * no such files is unchanged. See gateway-reputation-tree.md. */
+#ifdef AT_SOCIAL_ENABLED
+    /* Local moderation state (Phase 4 P4.1). Loaded BEFORE the node starts
+     * taking traffic: a block that only takes effect once the app has
+     * reconnected and replayed it would leave a window in which the blocked
+     * peer's DMs and posts land, and agorad is a standalone daemon the GUI
+     * spawns, so that window is real. */
+    {
+        char cfg_dir[CFG_PATH_LEN + 1];
+        if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) > 0) {
+            pthread_mutex_lock(&id_state.lock);
+            int rc = social_store_load(cfg_dir, &id_state.social_blocks);
+            size_t n = map_size(&id_state.social_blocks);
+            pthread_mutex_unlock(&id_state.lock);
+            if (rc != 0)
+                log_warn(proc->logger,
+                         "Identity: %s/%s is unreadable — starting with NO "
+                         "blocks; the operator's moderation state is gone, not "
+                         "partially applied\n", cfg_dir, AT_SOCIAL_FILENAME);
+            else if (n > 0)
+                log_info(proc->logger,
+                         "Identity: restored %zu local block(s)\n", n);
+        }
+    }
+#endif /* AT_SOCIAL_ENABLED */
+
     {
         char cfg_dir[CFG_PATH_LEN + 1];
         if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) > 0) {
