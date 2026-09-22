@@ -1689,6 +1689,16 @@ set_source_files_properties(test/peer_standing_test.c PROPERTIES COMPILE_FLAGS "
 target_link_libraries(peer_standing_test PRIVATE ${AT_TEST_LIBS} m)
 add_test(NAME peer_standing_test COMMAND $<TARGET_FILE:peer_standing_test>)
 
+add_executable(group_adopt_test test/group_adopt_test.c)
+set_source_files_properties(test/group_adopt_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(group_adopt_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME group_adopt_test COMMAND $<TARGET_FILE:group_adopt_test>)
+
+add_executable(rescore_sweep_test test/rescore_sweep_test.c)
+set_source_files_properties(test/rescore_sweep_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rescore_sweep_test PRIVATE ${AT_TEST_LIBS} m)
+add_test(NAME rescore_sweep_test COMMAND $<TARGET_FILE:rescore_sweep_test>)
+
 # Phase 4 P4.1. NOT under AT_SOCIAL: app_peer_standing is always compiled,
 # because a governance tier bounding a peer is not an Agora-specific idea.
 add_executable(peer_standing_verb_test test/peer_standing_verb_test.c)

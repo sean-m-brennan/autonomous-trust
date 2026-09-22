@@ -121,6 +121,11 @@ static double _tier_ceiling(int tier)
  * mechanism above would have been unreachable in practice. Mirrors Python
  * CHECKPOINT_INTERVAL / AT_REP_CHECKPOINT_SEC. */
 #define REP_CHECKPOINT_INTERVAL_DEFAULT 300.0
+/* Seconds between rescore sweeps (_rescore_peers). Mirrors Python
+ * RESCORE_INTERVAL / AT_REP_RESCORE_SEC. */
+#define REP_RESCORE_INTERVAL_DEFAULT 60.0
+#define REP_RESCORE_INTERVAL \
+    (reputation_env_double("AT_REP_RESCORE_SEC", REP_RESCORE_INTERVAL_DEFAULT))
 #define REP_CHECKPOINT_INTERVAL \
     (reputation_env_double("AT_REP_CHECKPOINT_SEC", \
                            REP_CHECKPOINT_INTERVAL_DEFAULT))
@@ -183,6 +188,8 @@ static void _store_checkpoint(const process_t *proc, const char *proposer,
  * staleness sweep leaves an actively-interacting peer alone. Takes
  * rep_state.lock itself, so callers must NOT hold it. */
 static void _note_interaction(const uuid_t peer_uuid);
+static int _rescore_peers(const process_t *proc, double present,
+                          const uuid_t self_uuid);
 
 /* Slash "reason" that lifts (rather than floors) a target: releases the
  * slash floor, restores the score to PREREP_NEUTRAL, and re-admits it.
@@ -454,6 +461,12 @@ static struct {
     map_t   last_interaction;
     double  last_decay_sweep;
     bool    decay_swept;
+    /* Peers whose chain advanced since they were last scored: uuid-str ->
+     * integer_data(1), used as a set. Filled by _note_interaction on every
+     * commit and emptied by _rescore_peers. Mirrors Python _rescore_due. */
+    map_t   rescore_due;
+    double  last_rescore_sweep;
+    bool    rescore_swept;
     /* Child-group chains already attempted by _restore_child_evidence, and the
      * persisted score each clamped peer was clamped away FROM -- the upper
      * bound on any later lift, so late evidence restores standing instead of
@@ -532,6 +545,9 @@ static void _ensure_init(void)
         map_init(&rep_state.last_interaction);
         rep_state.last_decay_sweep = 0.0;
         rep_state.decay_swept = false;
+        map_init(&rep_state.rescore_due);
+        rep_state.last_rescore_sweep = 0.0;
+        rep_state.rescore_swept = false;
         map_init(&rep_state.child_evidence_tried);
         map_init(&rep_state.restore_clamped);
         map_init(&rep_state.peer_ceilings);
@@ -1875,6 +1891,31 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
     return true;
 }
 
+/* Arm a re-proposal of OUR round (id1, id2) in @p wait_sec seconds;
+ * _retry_nacked_rounds carries it out from the process loop. A round that is
+ * not ours, or already carried to quorum, is dropped, as Python drops it
+ * (repprocess.py handle_nack). Shared by the nack and backdate handlers. */
+static void _arm_round_retry(const process_t *proc, int64_t id1, int64_t id2,
+                             int wait_sec, const char *why)
+{
+    char round_key[PAXOS_KEY_LEN];
+    paxos_id_index(round_key, sizeof(round_key), id1, id2);
+    pthread_mutex_lock(&rep_state.lock);
+    data_t *pending = NULL;
+    if (map_get(&rep_state.my_requests, round_key, &pending) == 0)
+    {
+        data_t *due = integer_data((int)(time(NULL) + wait_sec));
+        map_set(&rep_state.retry_due, round_key, due);
+        pthread_mutex_unlock(&rep_state.lock);
+        log_debug(proc->logger, "Reputation: round %s %s; retrying in %d s\n",
+                  round_key, why, wait_sec);
+    }
+    else
+    {
+        pthread_mutex_unlock(&rep_state.lock);
+    }
+}
+
 /****************************
  * Handler: handle_nack (try again) — exponential backoff retry
  ****************************/
@@ -1919,27 +1960,7 @@ static bool handle_nack(const process_t *proc, directory_t *queues, generic_msg_
      * proposes on the same probe in the same millisecond, so ~90% of all
      * requests are nacked and, unretried, those rounds simply vanish. */
     if (!rep_state.synchronous_dispatch)
-    {
-        char round_key[PAXOS_KEY_LEN];
-        paxos_id_index(round_key, sizeof(round_key), id1, id2);
-        pthread_mutex_lock(&rep_state.lock);
-        data_t *pending = NULL;
-        if (map_get(&rep_state.my_requests, round_key, &pending) == 0)
-        {
-            data_t *due = integer_data((int)(time(NULL) + wait_sec));
-            map_set(&rep_state.retry_due, round_key, due);
-            pthread_mutex_unlock(&rep_state.lock);
-            log_debug(proc->logger,
-                      "Reputation: round %s nacked; retrying in %d s\n",
-                      round_key, wait_sec);
-        }
-        else
-        {
-            /* Not ours, or already carried to quorum: Python drops these
-             * too (repprocess.py:866). */
-            pthread_mutex_unlock(&rep_state.lock);
-        }
-    }
+        _arm_round_retry(proc, id1, id2, wait_sec, "nacked");
 
     /* Synchronous-dispatch retry: Python's _try_again thread sleeps for
      * backoff[idx] then re-emits an "ask permission" to self.group.
@@ -2016,6 +2037,30 @@ static bool handle_backdate(const process_t *proc, directory_t *queues, generic_
     strncpy(update_req.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
 
     messaging_send("network", NET_MESSAGE, &update_req, false);
+
+    /* ...AND RETRY OUR ROUND, or it is simply lost. A backdate answers a
+     * request whose chain index was one commit behind, which with three live
+     * proposers is the ordinary case, and until now only a nack armed a
+     * re-proposal. A round that every acceptor backdated (no nack among the
+     * replies) vanished: moderation_cohort.sh's report paired on both sides,
+     * was backdated by bob and carol, and never committed anywhere. The
+     * re-proposal is minted after the chain update this handler just asked
+     * for, so its index is current. Same backoff as a nack. */
+    json_t *payload = NULL;
+    if (!rep_state.synchronous_dispatch
+        && net_msg_unpack_json(nmsg, &payload) == 0 && payload != NULL)
+    {
+        json_t *j_id1 = json_object_get(payload, "id1");
+        json_t *j_id2 = json_object_get(payload, "id2");
+        if (json_is_integer(j_id1) && json_is_integer(j_id2))
+        {
+            int64_t id1 = json_integer_value(j_id1);
+            int64_t id2 = json_integer_value(j_id2);
+            int wait_sec = paxos_record_nack(&rep_state.paxos, id1, id2);
+            _arm_round_retry(proc, id1, id2, wait_sec, "backdated");
+        }
+        json_decref(payload);
+    }
     return true;
 }
 
@@ -3036,6 +3081,60 @@ static bool handle_consensus_rep_batch_request(const process_t *proc, directory_
   requires \valid(msg);
   requires proc->logger == \null || \valid(proc->logger);
 */
+/* Score @p peer_uuid by the ordinary algebra, bound it by any standing, and
+ * STORE it. The one place a score is computed: handle_rep_request answers with
+ * it and _rescore_peers publishes it, so the two cannot drift apart. Returns
+ * the stored score. Caller must hold rep_state.lock. */
+static double _score_peer_locked(const uuid_t peer_uuid)
+{
+    double score = 0.0;
+    /* Use a dummy self uuid (zero) for now — process doesn't carry self identity */
+    uuid_t self_uuid;
+    uuid_clear(self_uuid);
+
+    /* Hysteresis: switch to pure mode only after the previous score
+     * crosses COOP_ENTER; fall back to CTFT only after it drops
+     * below COOP_EXIT. Mirrors Python's self._coop_mode latch in
+     * repprocess.py. A single 0.5 gate caused peers hovering near
+     * 0.5 to flip scoring functions every tick (CTFT's 0.51 →
+     * pure_reputation's 0.4 → CTFT's 0.51 → …). reputation_compute
+     * remains a single-gate pure function (used by unit tests);
+     * the hysteresis lives here, at the protocol boundary, where
+     * the per-peer state is available. */
+    double current_score = 0.0;
+    reputations_get(&rep_state.reputations, peer_uuid, &current_score);
+
+    char coop_key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, coop_key);
+    int in_coop = 0;
+    data_t *mode_dat = NULL;
+    if (map_get(&rep_state.coop_mode, coop_key, &mode_dat) == 0 &&
+        mode_dat != NULL) {
+        data_integer(mode_dat, &in_coop);
+    }
+    bool use_pure = in_coop
+        ? (current_score > COOP_EXIT)
+        : (current_score > COOP_ENTER);
+    map_set(&rep_state.coop_mode, coop_key,
+            integer_data(use_pure ? 1 : 0));
+
+    if (use_pure) {
+        score = reputation_pure(&rep_state.history,
+                                &rep_state.reputations, peer_uuid,
+                                &rep_state.task_weights);
+    } else {
+        score = reputation_contrite_tft(&rep_state.history,
+                                        &rep_state.reputations,
+                                        self_uuid, peer_uuid);
+    }
+    /* doc/architecture/zta-integration.md: an authority's finding bounds how far this peer may
+     * rise, whichever regime produced the score above. Applied where the
+     * score is WRITTEN, so every consumer sees one consistent number. */
+    score = _standing_apply_ceiling(peer_uuid, score);
+    reputations_update(&rep_state.reputations, peer_uuid, score);
+    return score;
+}
+
 static bool handle_rep_request(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -3075,50 +3174,7 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
     {
         have_uuid = true;
         pthread_mutex_lock(&rep_state.lock);
-        /* Use a dummy self uuid (zero) for now — process doesn't carry self identity */
-        uuid_t self_uuid;
-        uuid_clear(self_uuid);
-
-        /* Hysteresis: switch to pure mode only after the previous score
-         * crosses COOP_ENTER; fall back to CTFT only after it drops
-         * below COOP_EXIT. Mirrors Python's self._coop_mode latch in
-         * repprocess.py. A single 0.5 gate caused peers hovering near
-         * 0.5 to flip scoring functions every tick (CTFT's 0.51 →
-         * pure_reputation's 0.4 → CTFT's 0.51 → …). reputation_compute
-         * remains a single-gate pure function (used by unit tests);
-         * the hysteresis lives here, at the protocol boundary, where
-         * the per-peer state is available. */
-        double current_score = 0.0;
-        reputations_get(&rep_state.reputations, peer_uuid, &current_score);
-
-        char coop_key[UUID_STRING_LEN + 1];
-        uuid_unparse_lower(peer_uuid, coop_key);
-        int in_coop = 0;
-        data_t *mode_dat = NULL;
-        if (map_get(&rep_state.coop_mode, coop_key, &mode_dat) == 0 &&
-            mode_dat != NULL) {
-            data_integer(mode_dat, &in_coop);
-        }
-        bool use_pure = in_coop
-            ? (current_score > COOP_EXIT)
-            : (current_score > COOP_ENTER);
-        map_set(&rep_state.coop_mode, coop_key,
-                integer_data(use_pure ? 1 : 0));
-
-        if (use_pure) {
-            score = reputation_pure(&rep_state.history,
-                                    &rep_state.reputations, peer_uuid,
-                                    &rep_state.task_weights);
-        } else {
-            score = reputation_contrite_tft(&rep_state.history,
-                                            &rep_state.reputations,
-                                            self_uuid, peer_uuid);
-        }
-        /* doc/architecture/zta-integration.md: an authority's finding bounds how far this peer may
-         * rise, whichever regime produced the score above. Applied where the
-         * score is WRITTEN, so every consumer sees one consistent number. */
-        score = _standing_apply_ceiling(peer_uuid, score);
-        reputations_update(&rep_state.reputations, peer_uuid, score);
+        score = _score_peer_locked(peer_uuid);
         pthread_mutex_unlock(&rep_state.lock);
     }
 
@@ -6061,7 +6117,125 @@ static void _note_interaction(const uuid_t peer_uuid)
     pthread_mutex_lock(&rep_state.lock);
     map_set(&rep_state.last_interaction, (map_key_t)key,
             floating_pt_dbl_data((double)time(NULL)));
+    map_set(&rep_state.rescore_due, (map_key_t)key, integer_data(1));
     pthread_mutex_unlock(&rep_state.lock);
+}
+
+/* Rescore every peer whose chain advanced since it was last scored, and every
+ * admitted peer that has never been scored, then publish the tier and the
+ * app event for each. Throttled to REP_RESCORE_INTERVAL. Mirrors Python
+ * _rescore_sweep.
+ *
+ * WITHOUT THIS NO LIVE NODE EVER RATED ANYONE. handle_rep_request was the only
+ * place a score was computed and stored, and nothing in a running node sends
+ * "request reputation" (the one sender is Python's task automation). A commit
+ * only appended to the chain. So every peer stayed unrated, no tier was ever
+ * published, every tier-gate above 0 closed for good, and a committed report
+ * could never lower anyone's score. Found by moderation_cohort.sh, whose peers
+ * were still unrated after eleven commits.
+ *
+ * An admitted peer is also included when identity has not been told its tier
+ * in this process's lifetime: an unscored one, so it gets its prior (the
+ * prereputation prior with no history) instead of staying unrated until it
+ * happens to commit something; and one restored from the snapshot, whose
+ * score survived a restart that identity's in-memory tiers did not. @p self_uuid, when known, is skipped: a node
+ * holds no reputation of itself. Returns the number of peers scored. */
+static int _rescore_peers(const process_t *proc, double present,
+                          const uuid_t self_uuid)
+{
+    pthread_mutex_lock(&rep_state.lock);
+    if (rep_state.rescore_swept
+        && present - rep_state.last_rescore_sweep < REP_RESCORE_INTERVAL)
+    {
+        pthread_mutex_unlock(&rep_state.lock);
+        return 0;
+    }
+    rep_state.last_rescore_sweep = present;
+    rep_state.rescore_swept = true;
+    pthread_mutex_unlock(&rep_state.lock);
+
+    /* The admitted roster, copied before rep_state.lock is taken: the peers
+     * read-lock and rep_state.lock are never held together here. */
+    uuid_t roster[DEFAULT_MAX_PEERS];
+    size_t n_roster = 0;
+    peers_read_lock(proc);
+    n_roster = proc->protocol.num_peers;
+    if (n_roster > DEFAULT_MAX_PEERS)
+        n_roster = DEFAULT_MAX_PEERS;
+    for (size_t i = 0; i < n_roster; i++)
+        uuid_copy(roster[i], proc->protocol.peers[i].uuid);
+    peers_read_unlock(proc);
+
+    uuid_t due[DEFAULT_MAX_PEERS];
+    double scores[DEFAULT_MAX_PEERS];
+    int n_due = 0;
+    pthread_mutex_lock(&rep_state.lock);
+    map_key_t key;
+    data_t *val;
+    map_entries_for_each(&rep_state.rescore_due, key, val)
+    {
+        (void)val;
+        uuid_t u;
+        if (n_due < DEFAULT_MAX_PEERS && uuid_parse(key, u) == 0)
+            uuid_copy(due[n_due++], u);
+    }
+    map_end_for_each
+    map_free(&rep_state.rescore_due);
+    map_init(&rep_state.rescore_due);
+    for (size_t i = 0; i < n_roster && n_due < DEFAULT_MAX_PEERS; i++)
+    {
+        /* Rated AND already told to identity this run: nothing to do. A peer
+         * restored from the snapshot is rated but NOT told — identity's tiers
+         * live in memory and start empty — so it must be included, or a
+         * restarted node gates every such peer at tier 0 until its tier next
+         * happens to change (moderation_cohort.sh phase 6, after a restart). */
+        char rkey[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(roster[i], rkey);
+        data_t *told = NULL;
+        if (reputations_contains(&rep_state.reputations, roster[i])
+            && map_get(&rep_state.peer_tiers, rkey, &told) == 0)
+            continue;
+        bool listed = false;
+        for (int j = 0; j < n_due && !listed; j++)
+            listed = (uuid_compare(due[j], roster[i]) == 0);
+        if (!listed)
+            uuid_copy(due[n_due++], roster[i]);
+    }
+    int kept = 0;
+    for (int i = 0; i < n_due; i++)
+    {
+        if (self_uuid != NULL && uuid_compare(due[i], self_uuid) == 0)
+            continue;
+        if (!uuid_is_null(due[i]))
+        {
+            uuid_copy(due[kept], due[i]);
+            scores[kept] = _score_peer_locked(due[i]);
+            kept++;
+        }
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+
+    for (int i = 0; i < kept; i++)
+    {
+        _publish_tier_change(proc, due[i], scores[i]);
+        _publish_reputation_change(due[i], scores[i]);
+    }
+    if (kept > 0)
+        log_debug(proc->logger, "Reputation: rescored %d peer(s)\n", kept);
+    return kept;
+}
+
+int reputation_rescore_sweep(const process_t *proc, double present,
+                             const uuid_t self_uuid)
+{
+    _ensure_init();
+    return _rescore_peers(proc, present, self_uuid);
+}
+
+void reputation_note_interaction(const uuid_t peer_uuid)
+{
+    _ensure_init();
+    _note_interaction(peer_uuid);
 }
 
 /* At start-up, re-establish the committed history from the persisted evidence
@@ -6851,6 +7025,10 @@ void reputation_reset_state(int num_peers)
     map_init(&rep_state.last_interaction);
     rep_state.last_decay_sweep = 0.0;
     rep_state.decay_swept = false;
+    map_free(&rep_state.rescore_due);
+    map_init(&rep_state.rescore_due);
+    rep_state.last_rescore_sweep = 0.0;
+    rep_state.rescore_swept = false;
     map_free(&rep_state.child_evidence_tried);
     map_init(&rep_state.child_evidence_tried);
     map_free(&rep_state.restore_clamped);
@@ -7369,6 +7547,9 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
             if (have_self)
                 uuid_unparse_lower(self_uuid, self_str);
         }
+        /* Score whoever the chain moved for; see _rescore_peers for why this
+         * is the only thing that rates a peer in a running node. */
+        _rescore_peers(proc, present, have_self ? self_uuid : NULL);
         _maybe_checkpoint(proc, present, have_self ? self_str : NULL);
         /* Rounds of ours that were nacked and have waited out their backoff.
          * Without this a nacked round is lost, and in a three-node cohort
