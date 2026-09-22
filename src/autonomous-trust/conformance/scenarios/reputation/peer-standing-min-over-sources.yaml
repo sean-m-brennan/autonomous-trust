@@ -1,0 +1,77 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: peer-standing-min-over-sources
+byte_pinning: false
+description: |
+    Two authorities may bound the same peer, and the STRICTEST bound wins
+    (Phase 4 P4.1).
+
+    This is half of the case that justifies keying standings per (peer, source)
+    instead of per peer. Before P4.1 a ceiling was a single value filed under
+    the peer, so whichever authority spoke last silently overwrote the other.
+    That is not a tie-break, it is a loss: a ZTA re-verification proving a
+    certificate says nothing whatever about whether a community expelled the
+    person holding it, and an expulsion says nothing about their credential.
+
+    So the reduction is MINIMUM over sources.
+
+    The two ceilings are deliberately DIFFERENT, and the stricter one belongs to
+    the source installed FIRST. An implementation that kept the last write lands
+    on 0.20 and fails; one that reduces by minimum lands on 0.15. Equal ceilings
+    would pass under either rule and would pin nothing -- the same reason
+    zta-cap-bounds-unproved-peer sets its ceiling below what the scenario scores
+    anyway.
+
+    The companion case peer-standing-source-scoped-clear pins the other half:
+    that one authority's `proved` does not lift another's ceiling.
+
+    Runs in EVERY build, with no AT_ZTA and no CONFORMANCE_SOCIAL: peer standing
+    is substrate-level, which is the deliverable. `source: zta` here is just
+    data -- a string naming an authority -- not a compiled-in subsystem.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: oracle
+  - id: rogue
+    role: subject
+
+fixtures:
+  # bob's prior view of rogue, high enough that the scoring path has something
+  # to bring forward and both ceilings bite.
+  reputations:
+    bob:
+      rogue: 0.9
+  # Two authorities, two unrelated findings, installed in this order.
+  peer_standing:
+    bob:
+      rogue:
+        - source: zta
+          status: capped
+          ceiling: 0.15
+          reason: DDIL fallback
+        - source: ethne
+          status: failed
+          ceiling: 0.20
+          reason: expelled from the polity
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: request reputation
+    payload:
+      target: rogue
+      proc: negotiation
+    description: |
+        alice asks bob for rogue's reputation. bob scores it by the ordinary
+        algebra and bounds the result by the strictest finding against rogue,
+        which is ZTA's 0.15 -- not Ethne's 0.20, and not whichever was recorded
+        most recently.
+
+expected_state:
+  bob:
+    reputation_of:
+      rogue: 0.15

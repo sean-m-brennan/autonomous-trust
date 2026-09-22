@@ -128,6 +128,11 @@ class IdentityProtocol(Protocol):
     # reputation score for the same post-derived task, so the engagement accrues.
     # Encrypted, so NOT in UNENCRYPTED_VERBS.
     reaction = 'peer_reaction'  # msg.obj <- json {post_id, seq, ts}
+    # First-person report (Phase 4 P4.1). Directed + ENCRYPTED like a reaction,
+    # carrying {seq, ts} and NOTHING ELSE -- a reason on the wire would make a
+    # score a published accusation. The reported node stages its half of the
+    # bilateral transaction and tells its app nothing. NOT in UNENCRYPTED_VERBS.
+    report = 'peer_report'  # msg.obj <- json {seq, ts}
     # Private-proximity probe/reply (Phase 2): two CONNECTED peers exchange
     # multi-resolution grid tags keyed by the pairwise box secret (proximity.py)
     # so each learns only a coarse distance BAND (near/mid/far), never

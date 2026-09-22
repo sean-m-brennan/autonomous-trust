@@ -244,12 +244,42 @@ int identity_get_customer_satisfaction(const char *did);
 bool identity_get_last_social_tx(const char *uuid_str, char *task_out,
                                  double *score_out);
 
+/** The rest of the staged record identity_get_last_social_tx reads (Phase 4
+ *  P4.1): the evidence channel the score was staged on (copied into
+ *  @p channel_out, @p channel_len bytes, when non-NULL) and @p n_out, how many
+ *  scores this node has staged about the subject in total. The channel is what
+ *  tells a first-person report from every other staged score; the count is what
+ *  tells a capped second attempt from none at all. Returns true iff a record
+ *  exists. Conformance asserts via `social_tx_last`'s `channel` and `n`. */
+bool identity_get_social_tx_detail(const char *uuid_str, char *channel_out,
+                                   size_t channel_len, int *n_out);
+
 /** Conformance/test seam: locally block @p uuid_str (lowercased peer uuid), the
  *  same record handle_app_block writes, callable without assembling an app
  *  message so a conformance step can drive the clamp. identity_get_peer_tier
  *  then returns 0 for this peer. Purely local — no wire, no reputation tx. Twin
  *  of Python IdentityProcess.block_peer. */
 void identity_block_peer(const char *uuid_str);
+
+/** Conformance/test seam: lift the block on @p uuid_str, the same record
+ *  handle_app_unblock removes. A DELETE, not a second flag — "blocked" IS the
+ *  presence of the key, so nothing can disagree with it and re-blocking is
+ *  idempotent. Twin of Python IdentityProcess.unblock_peer. */
+void identity_unblock_peer(const char *uuid_str);
+
+/** Conformance/observability read-back: true iff @p uuid_str is locally
+ *  blocked. Twin of Python IdentityProcess.is_blocked. */
+bool identity_is_blocked(const char *uuid_str);
+
+/** Conformance/test seam: save the block set and load it back — the round trip
+ *  a restart performs, without needing one. A test that checked only the
+ *  in-memory map would pass with no file written at all. @p cfg_dir is where
+ *  to write; NULL means the process's own config directory. A conformance step
+ *  passes a writable temp dir, because the harness's default root is /etc/at
+ *  and nothing may be written there — without which this seam would prove
+ *  nothing while appearing to pass. Twin of Python
+ *  IdentityProcess.reload_social_blocks. */
+void identity_reload_social_blocks(const char *cfg_dir);
 #endif /* AT_SOCIAL_ENABLED */
 
 /** Copy the size-bounded capability descriptor recorded for @p cap_name (from

@@ -1,0 +1,72 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: block-no-reaction-accrual
+byte_pinning: false
+description: |
+    A blocked peer's reaction neither reaches us nor earns them anything
+    (Phase 4 P4.1).
+
+    Before this, a blocked peer reacting to one of our posts ACCRUED
+    REPUTATION WITH US — reaction-accrues pins the 0.90 an ordinary reaction
+    stages, and a block did nothing to stop it. Someone you had blocked could
+    keep raising their standing by touching your posts.
+
+    Two gates now close it, and both are load-bearing. The handler drops the
+    reaction outright, so nothing is surfaced; and _social_accrue refuses a
+    blocked peer at the root, so every positive path — DMs, reactions,
+    connections — is covered by one check rather than three.
+
+    The accrual gate is not merely tidiness. Reputation here is BILATERAL: our
+    half only commits if the other side submits its own. A block is purely
+    local, so they have no reason to, and our submission would sit in the chain
+    as a permanent half-entry — the same defect the 2026-09-21 cohort caught on
+    this exact path, arrived at from the other direction.
+
+    bob is the control, reacting in the same run: his 0.90 must still stage, or
+    a change that simply stopped accruing would pass.
+
+    Requires CONFORMANCE_SOCIAL=1.
+
+participants:
+  - id: node
+    role: border_guard
+  - id: alice
+    role: group_member
+  - id: bob
+    role: group_member
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: trigger_block
+    payload:
+      peer: alice
+    description: node locally blocks alice.
+  - id: 2
+    from: alice
+    to: node
+    function: peer_reaction
+    payload:
+      post_id: "abababababababababababababababababababababababababababababababab"
+      seq: 1
+    description: |
+        alice reacts to one of node's posts. Before P4.1 this staged 0.90 about
+        alice on both runtimes.
+  - id: 3
+    from: bob
+    to: node
+    function: peer_reaction
+    payload:
+      post_id: "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+      seq: 1
+    description: The control. bob is not blocked, so his reaction still accrues.
+
+expected_state:
+  node:
+    social_tx_last:
+      alice:
+        absent: true
+      bob:
+        score: 0.9

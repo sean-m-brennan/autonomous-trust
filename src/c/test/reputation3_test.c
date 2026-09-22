@@ -496,6 +496,7 @@ DEFINE_TEST(test_tx_channel_accepts_the_closed_set)
     ck_assert(tx_channel_valid(TX_CHANNEL_REPLICATION));
     ck_assert(tx_channel_valid(TX_CHANNEL_SWARM_DISAGREEMENT));
     ck_assert(tx_channel_valid(TX_CHANNEL_PROBE));
+    ck_assert(tx_channel_valid(TX_CHANNEL_FIRST_PERSON));   /* Phase 4 P4.1 */
 }
 END_TEST_DEFINITION()
 
@@ -512,6 +513,10 @@ DEFINE_TEST(test_tx_channel_refuses_unknown_spellings)
      * not closed. */
     ck_assert(tx_channel_valid("Physical") == false);
     ck_assert(tx_channel_valid("PHYSICAL") == false);
+    /* And the newest spelling is held to the same rule — a channel added later
+     * must not arrive with looser matching than the ones it joined. */
+    ck_assert(tx_channel_valid("First_Person") == false);
+    ck_assert(tx_channel_valid("first-person") == false);
 }
 END_TEST_DEFINITION()
 
@@ -548,6 +553,7 @@ DEFINE_TEST(test_tx_channel_spellings_match_the_python_twin)
     ck_assert_str_eq(TX_CHANNEL_REPLICATION, "replication");
     ck_assert_str_eq(TX_CHANNEL_SWARM_DISAGREEMENT, "swarm_disagreement");
     ck_assert_str_eq(TX_CHANNEL_PROBE, "probe");
+    ck_assert_str_eq(TX_CHANNEL_FIRST_PERSON, "first_person");
 }
 END_TEST_DEFINITION()
 
@@ -591,6 +597,13 @@ DEFINE_TEST(test_tx_channel_weights_match_the_python_twin)
     ck_assert_int_eq(tx_channel_weight(TX_CHANNEL_PHYSICAL), 3);
     ck_assert_int_eq(tx_channel_weight(TX_CHANNEL_CERTIFICATE), 3);
     ck_assert_int_eq(tx_channel_weight(TX_CHANNEL_SELF_CONSISTENCY), 3);
+    /* first_person is the WEAKEST evidence in the set and weighs 1 (Phase 4
+     * P4.1). It reaches that value through the fall-through below rather than
+     * an entry of its own, which is exactly why it is asserted here: Python's
+     * weights are a DICT, so the same channel gets its 1 from a written entry
+     * there and from silence here. A divergence would be invisible in either
+     * file read alone. */
+    ck_assert_int_eq(tx_channel_weight(TX_CHANNEL_FIRST_PERSON), 1);
     /* Absent -> the default channel's weight, and an unknown spelling weighs
      * 1: an unrecognized channel must never weigh MORE than a recognized one,
      * or adding a channel on one side of the wire would silently amplify it

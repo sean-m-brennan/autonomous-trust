@@ -265,6 +265,16 @@ typedef struct {
      *  distinct from an explicit connection edge. Appended LAST; social builds
      *  only, so a non-social consumer's field offsets are unchanged. */
     bool    in_group;
+    /** True iff this peer is LOCALLY BLOCKED on this node (Phase 4 P4.1).
+     *
+     *  Identity's own state, reported by identity. Compose it with
+     *  @ref at_app_reputation_t::effective_tier exactly as the core does: a
+     *  blocked peer's effective tier is 0 whatever they have earned.
+     *
+     *  Before P4.1 a block emitted nothing at all, so the app could not see
+     *  one — it re-derives tier from the score, and a block leaves the score
+     *  untouched. Appended LAST; social builds only. */
+    bool    blocked;
 #endif /* AT_SOCIAL_ENABLED */
 } at_app_peer_t;
 
@@ -277,6 +287,24 @@ typedef struct {
      *  information. An unrated peer would otherwise be indistinguishable
      *  from one genuinely rated at AT's neutral prior. */
     bool    rated;
+    /** The trust tier this score yields AFTER any standing ceiling, 0..4
+     *  (Phase 4 P4.1).
+     *
+     *  This header has said since Increment 3 that the app derives tier from
+     *  reputation, and it still may — but only reputation knows about a
+     *  CEILING, and a ceiling is not a function of the score. A peer bounded
+     *  by an authority reads as an ordinary score with a tier the app cannot
+     *  compute, so the tier reputation actually used crosses here. */
+    int32_t effective_tier;
+    /** The ceiling in force on this peer, or a NEGATIVE sentinel for none.
+     *
+     *  Lets the app tell "low because they have earned little" from "bounded
+     *  by a community decision" — different things to show a person.
+     *
+     *  @warning A consumer that memsets its event and forgets to write this
+     *  reports 0.0, which reads as "floored at zero". It must be written
+     *  explicitly on every path. */
+    double  standing_ceiling;
 } at_app_reputation_t;
 
 /** One peer's latest round-trip time. Mirrors `peer_rtt_update_msg_t`. */
@@ -823,6 +851,29 @@ int at_app_events_block(at_app_events_t *handle, const char *q_out,
                         const uint8_t peer_uuid[AT_APP_UUID_LEN]);
 
 /**
+ * @brief Lift a local block (Phase 4 P4.1). Sends AT_APP_UNBLOCK with {"peer"};
+ * identity removes the record and re-emits the peer, whose `blocked` flag then
+ * reads 0. The peer is told nothing, as they were told nothing of the block.
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound, -1 otherwise.
+ */
+int at_app_events_unblock(at_app_events_t *handle, const char *q_out,
+                          const uint8_t peer_uuid[AT_APP_UUID_LEN]);
+
+/**
+ * @brief Report a peer (Phase 4 P4.1). Sends AT_APP_REPORT_PEER with {"peer"};
+ * identity sends the peer a directed encrypted peer_report and, if it went,
+ * stages a low first-person score about them. No reason travels.
+ *
+ * Fire-and-forget like every verb here: a 0 means the ask was queued, NOT that
+ * the report was accepted. The daily caps are applied in the core, after this
+ * returns, and a capped report is refused there with a log line.
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound, -1 otherwise.
+ */
+int at_app_events_report_peer(at_app_events_t *handle, const char *q_out,
+                              const uint8_t peer_uuid[AT_APP_UUID_LEN]);
+
+
+/**
  * @brief Ask named peers to co-sign one record (Phase 3 P3.3).
  *
  * Sends the app→AT `AT_APP_REQUEST_COSIGN` verb on @p q_out with
@@ -871,6 +922,37 @@ int at_app_events_return_cosign(at_app_events_t *handle, const char *q_out,
                                 const char *cid, const char *signer_did,
                                 const char *sig_hex);
 #endif /* AT_SOCIAL_ENABLED */
+
+/**
+ * @brief Hand the core an AUTHORITY FINDING about a peer's standing (P4.1).
+ *
+ * Sends @ref AT_APP_PEER_STANDING with {"peer", "standing", "ceiling",
+ * "source", "reason"}; identity validates it and republishes it to reputation
+ * as a @ref PEER_STANDING, which BOUNDS what that peer may hold.
+ *
+ * A ceiling, never a score. The caller has decided something AT's [0, 1] scale
+ * cannot express — a community expelled this member — and a scalar penalty has
+ * no representation on that scale; the predecessor of this mechanism tried one
+ * and it was discarded at the boundary. @ref AT_ETHNE_EXPEL_CEILING is the
+ * bound an expulsion carries.
+ *
+ * @p standing is "proved", "capped" or "failed". "proved" means REINSTATED and
+ * lifts only THIS source's ceiling — one authority never clears another's.
+ * @p ceiling is in [0, 1], or negative for "no bound". @p source names the
+ * authority and may not be @ref PEER_STANDING_SOURCE_ZTA: an app cannot know
+ * what a credential authority proved, so claiming to speak as one is refused.
+ *
+ * The core verifies NOTHING about the finding itself — an Ethne expulsion is
+ * proved by co-signatures inside a record it cannot parse. What it trusts is
+ * that this arrived on the local app queue.
+ *
+ * @return 0 on success, @ref AT_APP_NOT_READY if @p q_out is not bound, -1 on
+ *         a bad argument (including an off-scale ceiling or a ZTA source).
+ */
+int at_app_events_peer_standing(at_app_events_t *handle, const char *q_out,
+                                const uint8_t peer_uuid[AT_APP_UUID_LEN],
+                                const char *standing, double ceiling,
+                                const char *source, const char *reason);
 
 /** @brief Close the queue and release the handle. NULL-safe. */
 void at_app_events_close(at_app_events_t *handle);

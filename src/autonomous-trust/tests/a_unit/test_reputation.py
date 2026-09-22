@@ -126,7 +126,10 @@ class TestTransactionScoreChannel:
             assert ts.channel == channel
 
     @pytest.mark.parametrize('channel', ['nonsense', 'physicall',
-                                         'task-outcome', 'Physical', 'PHYSICAL'])
+                                         'task-outcome', 'Physical', 'PHYSICAL',
+                                         # A channel added later is held to the
+                                         # same rule as the ones it joined.
+                                         'First_Person', 'first-person'])
     def test_unknown_is_refused_not_coerced(self, channel):
         """Refused rather than passed through OR silently defaulted. Passing it
         through makes the channel "some string a peer sent"; defaulting it turns
@@ -187,7 +190,8 @@ class TestTransactionScoreChannel:
         from autonomous_trust.core.reputation.reputation import TX_CHANNELS
         assert TX_CHANNELS == ('task_outcome', 'physical', 'certificate',
                                'calibration', 'self_consistency',
-                               'replication', 'swarm_disagreement', 'probe')
+                               'replication', 'swarm_disagreement', 'probe',
+                               'first_person')
 
     def test_the_channel_does_not_reach_the_chain_entry_hash(self):
         """The channel rides on the TS and stops at the chain boundary: a
@@ -300,6 +304,27 @@ class TestChannelResponses:
         on the other."""
         from autonomous_trust.core.reputation.reputation import tx_channel_weight
         assert tx_channel_weight('a_channel_from_the_future') == 1
+
+    def test_first_person_is_the_weakest_evidence(self):
+        """Phase 4 P4.1. A first-person account is one peer's reading of one
+        event, with the added problem that the peer is an interested party, so
+        it weighs 1 — the floor of the ranking.
+
+        Asserted on BOTH sides (C: reputation3_test's
+        test_tx_channel_weights_match_the_python_twin) because the two reach
+        that 1 by different routes: a written entry in this dict, and the
+        fall-through in C's tx_channel_weight. A divergence would be invisible
+        in either file read alone.
+
+        The bound on a report is the ACCRUAL CAP, not this weight — a reporter
+        spends their own daily budget, so report-spam costs the spammer.
+        """
+        from autonomous_trust.core.reputation.reputation import (
+            TX_CHANNEL_FIRST_PERSON, TX_CHANNEL_WEIGHTS, tx_channel_weight)
+        assert tx_channel_weight(TX_CHANNEL_FIRST_PERSON) == 1
+        # Written explicitly, not merely defaulted: silence here would become a
+        # divergence the moment someone tightened the lookup.
+        assert TX_CHANNEL_WEIGHTS[TX_CHANNEL_FIRST_PERSON] == 1
 
     # --- durability: the channel is part of the committed fact -----------
 

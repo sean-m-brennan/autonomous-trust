@@ -41,8 +41,8 @@
  *             || tail_bytes
  *
  * The blake2b-256 hash of the canonical bytes, first 16 bytes, is the task_uuid.
- * The domain tag (@ref AT_SOCIAL_DOMAIN_CONN etc.) keeps the three interaction
- * kinds from colliding. The uuid_min/uuid_max ordering makes the id independent
+ * The domain tag (@ref AT_SOCIAL_DOMAIN_CONN etc.) keeps the interaction kinds
+ * from colliding. The uuid_min/uuid_max ordering makes the id independent
  * of which peer computes it.
  */
 
@@ -58,6 +58,12 @@
 #define AT_SOCIAL_DOMAIN_CONN "agora-conn"
 #define AT_SOCIAL_DOMAIN_DM   "agora-dm"
 #define AT_SOCIAL_DOMAIN_POST "agora-post"
+/* A first-person report (Phase 4 P4.1). Tail is reporter_uuid[16] || seq u64le:
+ * the reporter's uuid is IN the tail, unlike a decline's bare seq, because the
+ * two directions of a report are two different acts. With a bare seq, ada
+ * reporting bob at her seq 42 and bob reporting ada at his seq 42 would derive
+ * ONE task, and the second report would land in the first one's slots. */
+#define AT_SOCIAL_DOMAIN_REPORT "agora-report"
 
 /* Diminishing-returns positive accrual (user-locked, Increment 8):
  *   S_pos(count) = baseline + delta/count
@@ -72,6 +78,35 @@
 /* In-model bilateral negative for an explicit connection DECLINE. Above the
  * COMM_CUTOFF (0.10) so a single decline is a clear demerit but not an exile. */
 #define AT_SOCIAL_NEG_SCORE 0.30
+
+/* A REPORT (Phase 4 P4.1): the reporter's first-person account that an exchange
+ * went badly, staged on the `first_person` channel. Worse than a decline — "this
+ * went badly" is stronger than "no thank you" — and still above COMM_CUTOFF
+ * (0.10), so one report is a serious demerit and not an exile. Deliberately not
+ * 0.0: a zero is an authority finding wearing a scalar's clothes, and authority
+ * findings are ceilings (PEER_STANDING), never scores.
+ *
+ * Its safety comes from BILATERAL PAIRING and the accrual caps, not from any
+ * quorum: Paxos here commits on one grant (ISSUES.md §2.13), so nothing may be
+ * built on the quorum size. */
+#define AT_SOCIAL_REPORT_SCORE 0.15
+
+/* What the REPORTED node stages about the reporter, so the report can pair.
+ * A bilateral transaction moves each party by the other's score, so the
+ * reported node's half is unavoidably a score ABOUT THE REPORTER. The social
+ * baseline: reporting neither punishes the reporter (a mirrored 0.15 would make
+ * every report mutual damage, and deter the people who most need to report) nor
+ * rewards them (so a report is no way to farm standing). Staged on the default
+ * channel — it is not the reported node's first-person account of anything. */
+#define AT_SOCIAL_REPORTER_SCORE AT_SOCIAL_POS_BASELINE
+
+/* One report per target per day, on BOTH sides: the reporter makes at most one
+ * about each peer, and the reported node pairs at most one from each reporter.
+ * One report is one account; a second the same day adds no information. The
+ * reported side's cap is what bounds a FORKED reporter, whose own caps are
+ * whatever it says they are. On the reporter's side a report ALSO spends the
+ * shared per-edge and global budget below. */
+#define AT_SOCIAL_REPORT_DAILY_CAP 1
 
 /* "Recently interacted" window for the bilateral_recent gate (seconds, 7 days):
  * longer than REP_DECAY_ONSET (3600s) yet well inside REP_DECAY_HALF_LIFE
