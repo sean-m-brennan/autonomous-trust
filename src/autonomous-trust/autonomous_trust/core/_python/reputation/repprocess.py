@@ -165,6 +165,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # restart can attest: entries committed after the last checkpoint are
     # persisted but unattested, so they restore clamped.
     CHECKPOINT_INTERVAL = _env_float('AT_REP_CHECKPOINT_SEC', 300.0)
+    # Seconds between rescore sweeps (_rescore_sweep). Mirrors C
+    # REP_RESCORE_INTERVAL. Override: AT_REP_RESCORE_SEC.
+    RESCORE_INTERVAL = _env_float('AT_REP_RESCORE_SEC', 60.0)
 
     # Hysteresis band for the CTFT ↔ pure-reputation dispatch in
     # _compute_reputation. A single 0.5 threshold made peers hovering
@@ -393,6 +396,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # snapshot's mtime and applies the offline-gap decay at start-up.
         self._last_interaction: dict[str, float] = {}
         self._last_decay_sweep = 0.0
+        # Peers whose chain advanced since they were last scored; filled by
+        # _note_interaction, emptied by _rescore_sweep. Mirrors C rescore_due.
+        self._rescore_due = set()
+        self._last_rescore_sweep = None
         # Debug instrument (AT_REP_DUMP_SEC): throttle clock for the
         # per-node reputation-view dump emitted from process(). See
         # _dump_reputation_trace. 0 == last dump not yet taken.
@@ -859,22 +866,28 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         except Full:
             self.logger.error('try_again: Network queue full')
 
+    def _arm_round_retry(self, queues, obj):
+        """Re-propose OUR round named by a nack/backdate payload, after the
+        round's backoff. A round not ours, or already carried to quorum, is
+        dropped. Shared by handle_nack and handle_backdate; mirrors C's
+        _arm_round_retry."""
+        id1, id2, _ = from_json_string(obj)
+        idx = self._paxos_id_index(id1, id2)
+        if idx not in self.my_requests:
+            # Already completed (grant succeeded, removed from my_requests)
+            # or never issued (foreign id). Drop without retrying.
+            self.logger.debug('Nack/backdate for unknown or completed request')
+            return
+        if idx not in self.backoff:
+            self.backoff[idx] = 1
+        if self.backoff[idx] < self.backoff_max:
+            self.backoff[idx] *= self.backoff_mult
+        self._spawn(self._try_again,
+                    args=(self.backoff[idx], queues, self.my_requests[idx].score))
+
     def handle_nack(self, queues, message):
         if message.function == ReputationProtocol.nack:
-            id1, id2, _ = from_json_string(message.obj)
-            idx = self._paxos_id_index(id1, id2)
-            if idx not in self.my_requests:
-                # Nack for an already-completed (grant succeeded, removed
-                # from my_requests) or never-issued (foreign id) request.
-                # Drop without retrying.
-                self.logger.debug('Nack for unknown or completed request')
-                return True
-            if idx not in self.backoff:
-                self.backoff[idx] = 1
-            if self.backoff[idx] < self.backoff_max:
-                self.backoff[idx] *= self.backoff_mult
-            self._spawn(self._try_again,
-                        args=(self.backoff[idx], queues, self.my_requests[idx].score))
+            self._arm_round_retry(queues, message.obj)
             return True
         return False
 
@@ -892,6 +905,13 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 self._request_update(queues)
             except Full:
                 self.logger.error('request_update: Network queue full')
+            # ...AND retry our round, or it is lost: until now only a nack
+            # armed a re-proposal, so a round every acceptor backdated
+            # vanished (moderation_cohort.sh's report). Mirrors C.
+            try:
+                self._arm_round_retry(queues, message.obj)
+            except (TypeError, ValueError):
+                self.logger.debug('backdate without a round id; not retrying')
             return True
         return False
 
@@ -2729,6 +2749,43 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         if key == str(self.identity.uuid):
             return
         self._last_interaction[key] = now().timestamp()
+        self._rescore_due.add(key)
+
+    def _rescore_sweep(self, present):
+        """Rescore every peer whose chain advanced since it was last scored,
+        and every admitted peer never scored; the process loop's pending_tiers
+        drain then publishes each tier and app event. Throttled to
+        RESCORE_INTERVAL. Returns the number scored. Mirrors C _rescore_peers.
+
+        WITHOUT THIS NO LIVE NODE EVER RATED ANYONE: a rep_req was the only
+        thing that computed and stored a score, a running node sends none
+        outside task automation, and a commit only appended to the chain.
+        Found by moderation_cohort.sh.
+        """
+        if (self._last_rescore_sweep is not None
+                and present - self._last_rescore_sweep < self.RESCORE_INTERVAL):
+            return 0
+        self._last_rescore_sweep = present
+        due = set(self._rescore_due)
+        self._rescore_due.clear()
+        current = self.reputations.current
+        for peer in list(getattr(self.peers, 'all', None) or []):
+            key = str(getattr(peer, 'uuid', peer))
+            try:
+                as_uuid = UUID(key)
+            except ValueError:
+                continue
+            # self.reputations tolerates str and UUID keys; either means rated.
+            # Rated AND already told to identity this run is the only skip: a
+            # peer restored from the snapshot is rated but untold, and a
+            # restarted node would gate it at tier 0 until its tier changed.
+            rated = key in current or as_uuid in current
+            if not rated or key not in self.peer_tiers:
+                due.add(key)
+        due.discard(str(self.identity.uuid))
+        for key in sorted(due):
+            self._compute_reputation(key, None, None, respond=False)
+        return len(due)
 
     @classmethod
     def _decayed_score(cls, score, idle_seconds):
@@ -3272,7 +3329,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         _probes.counter('rep.compute', 'standing_capped')
         return ceiling
 
-    def _compute_reputation(self, peer, req_proc, requestor):
+    def _compute_reputation(self, peer, req_proc, requestor, respond=True):
+        """Score, bound and store `peer`, and queue its tier. `respond=False`
+        is the rescore sweep: nobody asked, so no rep_resp is queued."""
         _probes.counter('rep.compute', 'enter')
         try:
             # peer may be a Peer/Identity object (production), a UUID,
@@ -3296,8 +3355,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 except (OSError, IOError) as e:
                     self.logger.warning('Could not persist reputations: %s', e)
                 self.pending_tiers.append((peer_uuid, rep_score))
-                self.requested_reps.append(
-                    (Reputation(peer_uuid, rep_score), req_proc, requestor))
+                if respond:
+                    self.requested_reps.append(
+                        (Reputation(peer_uuid, rep_score), req_proc, requestor))
                 _probes.counter('rep.compute', 'slashed')
                 return
             previous = self.PREREP_NEUTRAL
@@ -3345,7 +3405,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             # _compute_reputation thread doesn't have access to queues
             # so it can't put directly.
             self.pending_tiers.append((peer_uuid, rep_score))
-            self.requested_reps.append((Reputation(peer_uuid, rep_score), req_proc, requestor))
+            if respond:
+                self.requested_reps.append((Reputation(peer_uuid, rep_score), req_proc, requestor))
             _probes.counter('rep.compute', 'queued')
         except Exception as e:
             _probes.counter('rep.compute', 'exception', type(e).__name__)
@@ -4421,6 +4482,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                                     self.logger.error('Unhandled message of type %s', message.__class__.__name__)  # noqa
                 _probes.counter('proc.reputation', 'iter_drained', str(drained))
                 self.forward_reputation(queues)
+                # Score whoever the chain moved for (see _rescore_sweep), so
+                # the drain below publishes them this same iteration.
+                self._rescore_sweep(now().timestamp())
                 # Drain tier updates queued by _compute_reputation.
                 while self.pending_tiers:
                     peer_uuid, rep_score = self.pending_tiers.pop(0)

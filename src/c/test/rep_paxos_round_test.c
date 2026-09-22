@@ -248,6 +248,18 @@ static void _nack(process_t *proc, identity_t *voter)
     json_decref(p);
 }
 
+/* Answer the round the proposer opened with "out of date", as
+ * handle_request's BACKDATE branch would: same {id1, id2} payload. */
+static char BACKDATE_FN[] = "out of date";
+static void _backdate(process_t *proc, identity_t *voter)
+{
+    json_t *p = json_object();
+    json_object_set_new(p, "id1", json_integer(g_req_id1));
+    json_object_set_new(p, "id2", json_integer(g_req_id2));
+    _dispatch(proc, voter, BACKDATE_FN, p);
+    json_decref(p);
+}
+
 static void _begin(int num_peers)
 {
     reputation_reset_state(num_peers);
@@ -448,6 +460,48 @@ DEFINE_TEST(test_a_nacked_round_is_re_proposed_and_can_commit)
 }
 END_TEST_DEFINITION()
 
+DEFINE_TEST(test_a_backdated_round_is_re_proposed_and_can_commit)
+{
+    /* A backdate used to ask for the chain and abandon the round. With three
+     * live proposers the chain moves constantly, so a round EVERY acceptor
+     * backdated, with no nack among the replies to arm a retry, simply
+     * vanished. moderation_cohort.sh's report: paired on both sides,
+     * backdated by bob and carol, never committed. */
+    _begin(2);
+    identity_t *me = _mk_identity("me", "10.0.0.1");
+    identity_t *alice = _mk_identity("alice", "10.0.0.2");
+    identity_t *bob = _mk_identity("bob", "10.0.0.3");
+    process_t *proc = _mk_process(me);
+    _add_peer(proc, alice);
+    _add_peer(proc, bob);
+
+    uuid_t task;
+    uuid_generate(task);
+    char task_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(task, task_str);
+    uuid_t subject;
+    uuid_clear(subject);
+
+    _forward_transaction(proc, task, me->uuid, 0.15, NULL, "first_person",
+                         subject, 0.0);
+    int64_t first_id1 = g_req_id1;
+    _backdate(proc, alice);
+    _backdate(proc, bob);
+
+    double now = (double)time(NULL);
+    g_request_count = 0;
+    _retry_nacked_rounds(proc, now + 600.0, me->uuid, true);
+    ck_assert_uint_eq(g_request_count, 2);     /* re-proposed to both */
+    ck_assert(g_req_id1 > first_id1);
+
+    _grant(proc, alice);
+    _grant(proc, bob);
+    ck_assert_uint_eq(g_tx_count, 2);
+    ck_assert_str_eq(g_tx_task_uuid, task_str);
+    _end();
+}
+END_TEST_DEFINITION()
+
 DEFINE_TEST(test_a_nack_for_someone_elses_round_arms_nothing)
 {
     /* A nack names a ballot; a ballot we never opened is not ours to retry.
@@ -586,6 +640,7 @@ RUN_TESTS(RepPaxosRound,
           test_concurrent_rounds_do_not_collide,
           test_a_grant_for_an_unknown_round_is_ignored,
           test_a_nacked_round_is_re_proposed_and_can_commit,
+          test_a_backdated_round_is_re_proposed_and_can_commit,
           test_a_nack_for_someone_elses_round_arms_nothing,
           test_the_ballot_index_follows_the_chain_not_our_own_wins,
           test_a_request_is_judged_against_the_chain_we_actually_hold)

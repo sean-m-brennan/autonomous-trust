@@ -13159,6 +13159,100 @@ int identity_register_handlers(process_t *proc)
     return 0;
 }
 
+/* Adopt the mesh group (and its shared key) from the stashed full_histories:
+ * the entry with the most steps wins, else the first seeds adoption. Returns
+ * true when a group was adopted. Called by choose_group when histories arrived
+ * during its wait. */
+static bool _adopt_group_from_histories(process_t *proc,
+                                        directory_t *queues, logger_t *logger)
+{
+    /* Parse + adopt the shared group key from the welcomer's
+     * full_history (slot 0 = the DRY canonical group). Mirrors the
+     * selection in _merge_to_mesh: the entry with the most steps wins
+     * (most complete view), else the first entry seeds adoption.
+     * Without this the C node kept its own self-seeded group and never
+     * obtained the mesh key — full_history that arrives DURING the
+     * choose_group wait (the common case once box-decrypt works) hit a
+     * stub that only logged. Python's choose_group adopts here too
+     * (idprocess.py:248+). See [[project_group_key_sync]]. */
+    group_t adopted_group = {0};
+    bool have_group = false;
+    size_t best_steps_len = 0;
+    pthread_mutex_lock(&id_state.lock);
+    size_t n_hist = array_size(&id_state.histories);
+    for (size_t i = 0; i < n_hist; i++) {
+        data_t *h_dat = NULL;
+        if (array_get(&id_state.histories, (int)i, &h_dat) != 0 || h_dat == NULL)
+            continue;
+        ptr_t hptr = NULL;
+        if (data_object_ptr(h_dat, &hptr) != 0 || hptr == NULL)
+            continue;
+        json_t *root = (json_t *)hptr;
+        if (!json_is_array(root) || json_array_size(root) < 2)
+            continue;
+        json_t *s_json = json_array_get(root, 1);
+        size_t this_steps_len =
+            (s_json && json_is_array(s_json)) ? json_array_size(s_json) : 0;
+        bool pick = (!have_group && this_steps_len == 0)
+                    || (this_steps_len > best_steps_len);
+        if (!pick)
+            continue;
+        json_t *g_json = json_array_get(root, 0);
+        if (g_json && json_is_object(g_json)) {
+            group_t parsed = {0};
+            if (group_from_json(g_json, &parsed) == 0) {
+                adopted_group = parsed;
+                have_group = true;
+                best_steps_len = this_steps_len;
+            }
+        }
+    }
+    pthread_mutex_unlock(&id_state.lock);
+
+    if (have_group) {
+        char gid_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(adopted_group.uuid, gid_str);
+        peers_write_lock(proc);
+        proc->protocol.group = adopted_group;
+        peers_write_unlock(proc);
+        log_info(logger,
+                 "Identity: adopted mesh group %s during merge\n", gid_str);
+        /* TELL THE SIBLINGS, or the key never reaches the wire. net_proc holds
+         * its own protocol.group and decrypts with THAT; only a GROUP message
+         * updates it (processes.c assigns it). This path adopted into
+         * identity's copy alone, so a member rejoining after a restart
+         * (the one node that takes it: histories arrive during the choose
+         * wait) kept a network group with no mesh key and silently dropped
+         * every group frame. Nobody resends: to the others it is "already a
+         * group member", and their one key update landed before phase 3,
+         * where handle_group_update refuses it. Found by
+         * moderation_cohort.sh's restart phase. _merge_to_mesh already does
+         * this; Python's choose_group does it via _record_group. */
+        generic_msg_t group_msg = {0};
+        group_msg.type = GROUP;
+        group_msg.info.group = adopted_group;
+        _remember_activity(proc, queues, &group_msg);
+    } else {
+        log_warn(logger, "Identity: choose_group: histories present but "
+                 "no parseable group; keeping self-seeded group\n");
+    }
+    return have_group;
+}
+
+/* Test hooks for the above (id_proc_priv.h). */
+void identity_stash_history(json_t *history)
+{
+    pthread_mutex_lock(&id_state.lock);
+    array_append(&id_state.histories, object_ptr_data(history, sizeof(json_t)));
+    pthread_mutex_unlock(&id_state.lock);
+}
+
+bool identity_adopt_group_from_histories(process_t *proc,
+                                         directory_t *queues)
+{
+    return _adopt_group_from_histories(proc, queues, proc->logger);
+}
+
 int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     _ensure_id_init();
@@ -13299,61 +13393,7 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
                      "selecting mesh group\n",
                      final_hcount, final_hcount == 1 ? "y" : "ies");
 
-            /* Parse + adopt the shared group key from the welcomer's
-             * full_history (slot 0 = the DRY canonical group). Mirrors the
-             * selection in _merge_to_mesh: the entry with the most steps wins
-             * (most complete view), else the first entry seeds adoption.
-             * Without this the C node kept its own self-seeded group and never
-             * obtained the mesh key — full_history that arrives DURING the
-             * choose_group wait (the common case once box-decrypt works) hit a
-             * stub that only logged. Python's choose_group adopts here too
-             * (idprocess.py:248+). See [[project_group_key_sync]]. */
-            group_t adopted_group = {0};
-            bool have_group = false;
-            size_t best_steps_len = 0;
-            pthread_mutex_lock(&id_state.lock);
-            size_t n_hist = array_size(&id_state.histories);
-            for (size_t i = 0; i < n_hist; i++) {
-                data_t *h_dat = NULL;
-                if (array_get(&id_state.histories, (int)i, &h_dat) != 0 || h_dat == NULL)
-                    continue;
-                ptr_t hptr = NULL;
-                if (data_object_ptr(h_dat, &hptr) != 0 || hptr == NULL)
-                    continue;
-                json_t *root = (json_t *)hptr;
-                if (!json_is_array(root) || json_array_size(root) < 2)
-                    continue;
-                json_t *s_json = json_array_get(root, 1);
-                size_t this_steps_len =
-                    (s_json && json_is_array(s_json)) ? json_array_size(s_json) : 0;
-                bool pick = (!have_group && this_steps_len == 0)
-                            || (this_steps_len > best_steps_len);
-                if (!pick)
-                    continue;
-                json_t *g_json = json_array_get(root, 0);
-                if (g_json && json_is_object(g_json)) {
-                    group_t parsed = {0};
-                    if (group_from_json(g_json, &parsed) == 0) {
-                        adopted_group = parsed;
-                        have_group = true;
-                        best_steps_len = this_steps_len;
-                    }
-                }
-            }
-            pthread_mutex_unlock(&id_state.lock);
-
-            if (have_group) {
-                char gid_str[UUID_STRING_LEN + 1];
-                uuid_unparse_lower(adopted_group.uuid, gid_str);
-                peers_write_lock(proc);
-                memcpy(&proc->protocol.group, &adopted_group, sizeof(group_t));
-                peers_write_unlock(proc);
-                log_info(logger,
-                         "Identity: adopted mesh group %s during merge\n", gid_str);
-            } else {
-                log_warn(logger, "Identity: choose_group: histories present but "
-                         "no parseable group; keeping self-seeded group\n");
-            }
+            (void)_adopt_group_from_histories(proc, queues, logger);
         }
         else
         {
