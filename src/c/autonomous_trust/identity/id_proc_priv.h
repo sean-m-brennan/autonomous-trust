@@ -661,4 +661,14 @@ int identity_emit_all_peers(const process_t *proc);
 #define EID_NOQ 215
 DECLARE_ERROR(EID_NOQ, "Required process queue missing");
 
+/** Stash one full_history payload as handle_receive_history does. The array
+ *  takes ownership of @p history. Test hook. */
+void identity_stash_history(json_t *history);
+
+/** Run choose_group's history adoption over the stashed histories: adopt the
+ *  mesh group and its key, and push it to the sibling processes as a GROUP
+ *  message. Returns true when a group was adopted. Test hook. */
+bool identity_adopt_group_from_histories(process_t *proc,
+                                         directory_t *queues);
+
 #endif  // ID_PROC_PRIV_H
