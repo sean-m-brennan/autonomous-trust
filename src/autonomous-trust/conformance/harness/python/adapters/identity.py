@@ -140,6 +140,16 @@ _TRIGGER_FC_INITIATE = 'trigger_first_contact_initiate'
 # Purely local (no emit, no reputation tx). The C adapter recognizes the same
 # string and calls identity_block_peer. See block-local-clamp.
 _TRIGGER_BLOCK = 'trigger_block'
+_TRIGGER_UNBLOCK = 'trigger_unblock'
+_TRIGGER_SOCIAL_RELOAD = 'trigger_social_reload'
+# Pseudo-function: the step's `to` participant REPORTS the peer named in the
+# payload (`{"peer": <pid>}`, Phase 4 P4.1), end to end. Report is an app verb,
+# so the step drives the production report_peer(); the emitted peer_report
+# (whose seq the reporter's own freshness counter chose, so no YAML step could
+# name it) is then delivered to the reported participant's real handler, which
+# stages its half. Mirrors the C adapter's trigger_report. See
+# report-pairs-bilaterally.
+_TRIGGER_REPORT = 'trigger_report'
 
 # Pseudo-function: drive one private-proximity probe (Phase 2) from the step's
 # `to` participant (the INITIATOR) against the peer named in the payload
@@ -206,6 +216,10 @@ class _Participant:
     # participant id -> uuid string, for every participant in the scenario.
     # Filled by the adapter at setup; see _uuid_for_pid.
     pid_to_uuid: dict = field(default_factory=dict)
+    # participant id -> _Participant, for the few expected_state keys that read
+    # ANOTHER participant's state (social_tx_last's same_task_as). Filled with
+    # pid_to_uuid.
+    peers_by_pid: dict = field(default_factory=dict)
     # Where trigger_first_contact_initiate actually addressed its hello: the
     # host on the outbound to_whom. Read by the
     # first_contact_hello_endpoint check, which pins that `initiate` prefers
@@ -593,13 +607,22 @@ class _Participant:
                             f'{self.id}: connection_state[{peer_id!r}]={actual!r}, '
                             f'expected {want!r}')
             elif key == 'dm_last':
-                # {peer_id: {seq, text}} (Increment 6) -- the most-recent DM this
-                # participant received from another, via get_last_dm. An absent DM
-                # (never delivered, or dropped by the replay gate) fails. C mirrors
-                # this via identity_get_last_dm keyed by the same uuid.
+                # {peer_id: {seq, text} | {absent: true}} (Increment 6) -- the
+                # most-recent DM this participant received from another, via
+                # get_last_dm. `absent: true` asserts that NO DM is held, which
+                # a DM dropped at the block gate produces (Phase 4 P4.1); an
+                # unexpectedly absent DM still fails. C mirrors this via
+                # identity_get_last_dm keyed by the same uuid.
                 for peer_id, want in expected.items():
                     peer_uuid = self._uuid_for_pid(peer_id)
                     actual = self.process.get_last_dm(peer_uuid)
+                    want_obj0 = want if isinstance(want, dict) else {}
+                    if want_obj0.get('absent'):
+                        if actual:
+                            raise AssertionError(
+                                f'{self.id}: dm_last[{peer_id!r}] present '
+                                f'(text={actual.get("text")!r}), expected ABSENT')
+                        continue
                     if not actual:
                         raise AssertionError(
                             f'{self.id}: dm_last[{peer_id!r}] absent, expected a DM')
@@ -718,6 +741,28 @@ class _Participant:
                             f'expected a staged score')
                     for fk, fv in want_obj.items():
                         av = actual.get(fk)
+                        if fk == 'same_task_as':
+                            # {participant, subject} (Phase 4 P4.1): the task we
+                            # staged must be THE SAME task that participant
+                            # staged about that subject -- the two halves of one
+                            # bilateral transaction. The seq in the task is
+                            # chosen at run time, so equality is the only pin.
+                            other = self.peers_by_pid.get(str(fv.get('participant')))
+                            if other is None:
+                                raise AssertionError(
+                                    f'{self.id}: same_task_as names unknown '
+                                    f'participant {fv.get("participant")!r}')
+                            theirs = other.process.get_last_social_tx(
+                                other._uuid_for_pid(str(fv.get('subject'))))
+                            if not theirs or theirs.get('task') != actual.get('task'):
+                                raise AssertionError(
+                                    f'{self.id}: social_tx_last[{subject_id!r}].task='
+                                    f'{actual.get("task")!r}, but '
+                                    f'{fv.get("participant")} staged '
+                                    f'{theirs.get("task") if theirs else None!r} '
+                                    f'about {fv.get("subject")} -- the halves '
+                                    f'would not pair')
+                            continue
                         if fk == 'score' and isinstance(av, (int, float)) \
                                 and isinstance(fv, (int, float)):
                             if abs(float(av) - float(fv)) > 1e-6:
@@ -1729,6 +1774,9 @@ class IdentityAdapter:
                        for pid, h in handles.items()}
         for h in handles.values():
             h.impl.pid_to_uuid = dict(pid_to_uuid)
+        peers_by_pid = {pid: h.impl for pid, h in handles.items()}
+        for h in handles.values():
+            h.impl.peers_by_pid = peers_by_pid
         # ranks fixture: {pid: int} — the topology rank each participant HAS,
         # applied both to its own identity and to every other node's view of it.
         # Rank is what the hierarchy derivation reads (protocol step 7), so a
@@ -2130,6 +2178,50 @@ class IdentityAdapter:
             # dispatch). The emitted caps_query messages are captured in
             # emit_tally; caps_query_emitted asserts the per-sweep cap.
             participant.process._periodic_caps_resync(participant.queues)
+            return participant.drain_outbox()
+        if inbound.function == _TRIGGER_SOCIAL_RELOAD:
+            # Pseudo-function: save the block set and load it back -- the round
+            # trip a restart performs, without needing one. A conformance step
+            # cannot restart a process, and asserting on the in-memory dict
+            # alone would pass with no file written at all. Mirrors the C
+            # adapter's trigger_social_reload -> identity_reload_social_blocks.
+            # A WRITABLE dir, explicitly. The harness's default config root
+            # may not be writable (C's is /etc/at), and a reload that could not
+            # write would be a no-op that PASSED — proving nothing while
+            # looking green. Same temp dir shape as the C adapter.
+            import tempfile
+            reload_dir = tempfile.mkdtemp(prefix='at-conf-social-')
+            participant.process.reload_social_blocks(reload_dir)
+            return participant.drain_outbox()
+        if inbound.function == _TRIGGER_REPORT:
+            # `participant` is the REPORTER. Run the production report_peer(),
+            # then hand every peer_report it emitted to the reported
+            # participant's real handler. A refused report emits nothing, so
+            # nothing is delivered -- which is what the cap scenario relies on.
+            spec = from_json_string(inbound.obj) if inbound.obj else {}
+            target_pid = str(spec.get('peer', ''))
+            target = participant.peers_by_pid.get(target_pid)
+            if target is None:
+                raise AssertionError(f'trigger_report: unknown peer {target_pid!r}')
+            participant.process.report_peer(participant.queues,
+                                            str(target.identity.uuid))
+            rest = []
+            for c in participant.drain_outbox():
+                if c.function == IdentityProtocol.report:
+                    target.process.protocol.run_message_handlers(target.queues,
+                                                                 c.raw)
+                    target.drain_outbox()
+                else:
+                    rest.append(c)
+            return rest
+        if inbound.function == _TRIGGER_UNBLOCK:
+            # Pseudo-function: lift the block on the peer the step names.
+            # Unblock is an app verb, not a wire message, so there is nothing to
+            # dispatch -- run the production unblock_peer() call. Mirrors the C
+            # adapter's trigger_unblock -> identity_unblock_peer.
+            spec = from_json_string(inbound.obj) if inbound.obj else {}
+            peer_uuid = participant._uuid_for_pid(str(spec.get('peer', '')))
+            participant.process.unblock_peer(str(peer_uuid))
             return participant.drain_outbox()
         if inbound.function == _TRIGGER_BLOCK:
             # Pseudo-function: locally block the peer the step names. Block is an
@@ -2696,6 +2788,17 @@ class IdentityAdapter:
             if not (isinstance(payload, dict) and payload.get('unstamped')):
                 body['seq'] = int(payload.get('seq', 1)) \
                     if isinstance(payload, dict) else 1
+            obj = to_json_string(body)
+        elif function == IdentityProtocol.report:
+            # handle_peer_report parses {seq, ts} (Phase 4 P4.1) and nothing
+            # else. No signature: crypto_box authenticates the reporter (in the
+            # harness the from_whom identity stands in). `unstamped: true` drops
+            # the seq. Mirrors the C peer_report builder.
+            payload = payload if isinstance(payload, dict) else {}
+            ts = payload.get('ts', 0.0)
+            body = {'ts': float(ts) if isinstance(ts, (int, float)) else 0.0}
+            if not payload.get('unstamped'):
+                body['seq'] = int(payload.get('seq', 1))
             obj = to_json_string(body)
         elif function == IdentityProtocol.cosign_request:
             # handle_cosign_request parses {record, op, polity, cid, bytes, seq,

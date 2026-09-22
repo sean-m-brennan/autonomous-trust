@@ -1,0 +1,92 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: block-public-post-still-blocked
+byte_pinning: false
+description: |
+    A blocked peer's PUBLIC post does not reach us (Phase 4 P4.1).
+
+    THIS IS THE DEFECT THE MODERATION INCREMENT IS NAMED FOR, and it was
+    identical on both runtimes. A block clamps a peer's effective tier to 0
+    (block-local-clamp pins that). The feed gate asks `author_tier < tier`. A
+    PUBLIC post declares tier 0. And `0 < 0` is false — so every public post
+    from a blocked peer arrived, was stored, and was handed to the app, on C
+    and on Python alike. Blocking someone stopped their audience-restricted
+    posts and none of their public ones, which is close to the opposite of what
+    a person blocking someone expects.
+
+    The comparison was never wrong. It answers "does this author clear the
+    post's audience floor", and tier 0 is a floor everyone clears — that is
+    what makes a public post public. The mistake was expressing a REFUSAL as a
+    low MEASUREMENT. A block is now asked as its own question, at every inbound
+    path, instead of being inferred from a number.
+
+    Note how this case relates to feed-post-tier-gated, which pins the OTHER
+    direction: there, an unblocked author is refused because the post's floor is
+    above the reader's view of them. Together they say the two mechanisms are
+    independent — audience is about the post, a block is about the person.
+
+    THE CONTROL MATTERS AS MUCH AS THE ASSERTION. bob, who is not blocked,
+    publishes at the SAME tier in the same run, and his post must arrive. A
+    change that simply stopped accepting public posts — or stopped accepting
+    posts at all — would satisfy the first assertion and fail the second. The
+    only difference between the two posts is the block.
+
+    Requires CONFORMANCE_SOCIAL=1, or the C side skips every identity social
+    case and diff_results scores a one-side skip as a MATCH — the corpus reads
+    green while pinning nothing.
+
+participants:
+  - id: node
+    role: border_guard
+  - id: alice
+    role: group_member
+  - id: bob
+    role: group_member
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: trigger_block
+    payload:
+      peer: alice
+    description: |
+        node locally blocks alice. Purely local: no wire traffic, no reputation
+        transaction, and alice is told nothing.
+  - id: 2
+    from: alice
+    to: node
+    function: peer_post
+    payload:
+      body: a public post from a blocked peer
+      seq: 1
+      ts: 0
+      tier: 0
+    description: |
+        alice publishes at tier 0 — PUBLIC, the floor everyone clears. Her
+        signature verifies and the audience gate passes her, exactly as before.
+        Before P4.1 this arrived on both runtimes. It must not now.
+  - id: 3
+    from: bob
+    to: node
+    function: peer_post
+    payload:
+      body: a public post from an unblocked peer
+      seq: 1
+      ts: 0
+      tier: 0
+    description: |
+        The control, at the SAME tier. bob is not blocked, so his post must
+        arrive — otherwise the assertion above would be satisfied by an
+        implementation that had simply stopped accepting public posts.
+
+expected_state:
+  node:
+    post_last:
+      alice:
+        absent: true
+      bob:
+        seq: 1
+        tier: 0
+        body: a public post from an unblocked peer

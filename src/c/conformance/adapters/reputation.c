@@ -547,15 +547,21 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
         }
     }
 
-#ifdef AT_ZTA_ENABLED
-    /* zta_standing: { "<pid>": { "<other_pid>": {status, ceiling}, ... } } —
-     * pre-stage what ZTA proved about a peer (doc/architecture/zta-integration.md).
-     * Installed directly
-     * rather than driven through an admission step: the verdict is produced by
-     * the IDENTITY process and this protocol's harness stands up only the
-     * reputation one, so what is pinned cross-language is what reputation DOES
-     * with a standing. Mirrors the Python adapter's preset_zta_standing. */
-    json_t *zs = json_object_get(g_fixtures, "zta_standing");
+    /* peer_standing: { "<pid>": { "<other_pid>": <spec> | [<spec>, ...] } },
+     * where <spec> is {status, ceiling, source?, reason?} — pre-stage what an
+     * authority has found about a peer (doc/architecture/zta-integration.md).
+     * Installed directly rather than driven through an admission step: the
+     * verdict is produced by the IDENTITY process and this protocol's harness
+     * stands up only the reputation one, so what is pinned cross-language is
+     * what reputation DOES with a standing. Mirrors the Python adapter's
+     * preset_peer_standing.
+     *
+     * A LIST lets two authorities speak about the same peer, which is the only
+     * way to pin the minimum-over-sources reduction. NO LONGER UNDER
+     * #ifdef AT_ZTA_ENABLED (Phase 4 P4.1): this installer being ZTA-gated is
+     * why a standing fixture did nothing in a default build, and it is the
+     * deeper half of the skip that used to sit further down. */
+    json_t *zs = json_object_get(g_fixtures, "peer_standing");
     if (json_is_object(zs))
     {
         json_t *table = json_object_get(zs, target_id);
@@ -566,35 +572,57 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
             json_object_foreach(table, other_id, spec)
             {
                 const uuid_t *u = _uuid_of(ctx, other_id);
-                if (u == NULL || !json_is_object(spec))
+                if (u == NULL)
                     continue;
-                const char *status = json_string_value(
-                    json_object_get(spec, "status"));
-                json_t *ceil_j = json_object_get(spec, "ceiling");
-                zta_standing_msg_t st;
-                memset(&st, 0, sizeof(st));
-                memcpy(st.peer_uuid, *u, sizeof(uuid_t));
-                st.standing = (int32_t)ZTA_STANDING_CAPPED;
-                if (status != NULL && strcmp(status, "proved") == 0)
-                    st.standing = (int32_t)ZTA_STANDING_PROVED;
-                else if (status != NULL && strcmp(status, "failed") == 0)
-                    st.standing = (int32_t)ZTA_STANDING_FAILED;
-                st.ceiling = json_is_number(ceil_j)
-                                 ? json_number_value(ceil_j)
-                                 : ZTA_NO_CEILING;
-                const char *reason = json_string_value(
-                    json_object_get(spec, "reason"));
-                at_strlcpy(st.reason, reason ? reason : "", sizeof(st.reason));
-                /* The standing is applied against the TARGET's process --
-                 * the node whose state this call is installing. */
-                sce_participant_t *self_p = sce_find_participant(ctx, target_id);
-                if (self_p != NULL && self_p->impl != NULL)
-                    reputation_apply_zta_standing(
-                        ((rp_impl_t *)self_p->impl)->proc, &st);
+                /* One spec or several, in order: a bare object is the common
+                 * single-authority case, a list pins two authorities against
+                 * the same peer. */
+                size_t n_specs = json_is_array(spec) ? json_array_size(spec)
+                                                     : 1;
+                for (size_t si = 0; si < n_specs; si++)
+                {
+                    json_t *one = json_is_array(spec)
+                                      ? json_array_get(spec, si)
+                                      : spec;
+                    if (!json_is_object(one))
+                        continue;
+                    const char *status = json_string_value(
+                        json_object_get(one, "status"));
+                    json_t *ceil_j = json_object_get(one, "ceiling");
+                    peer_standing_msg_t st;
+                    memset(&st, 0, sizeof(st));
+                    memcpy(st.peer_uuid, *u, sizeof(uuid_t));
+                    st.standing = (int32_t)PEER_STANDING_CAPPED;
+                    if (status != NULL && strcmp(status, "proved") == 0)
+                        st.standing = (int32_t)PEER_STANDING_PROVED;
+                    else if (status != NULL && strcmp(status, "failed") == 0)
+                        st.standing = (int32_t)PEER_STANDING_FAILED;
+                    st.ceiling = json_is_number(ceil_j)
+                                     ? json_number_value(ceil_j)
+                                     : PEER_NO_CEILING;
+                    const char *reason = json_string_value(
+                        json_object_get(one, "reason"));
+                    at_strlcpy(st.reason, reason ? reason : "",
+                               sizeof(st.reason));
+                    /* Absent source normalizes to zta, matching the runtime's
+                     * own default, so a scenario written before sources existed
+                     * still means what it meant. */
+                    const char *src = json_string_value(
+                        json_object_get(one, "source"));
+                    at_strlcpy(st.source,
+                               peer_standing_source_or_default(src),
+                               sizeof(st.source));
+                    /* The standing is applied against the TARGET's process --
+                     * the node whose state this call is installing. */
+                    sce_participant_t *self_p =
+                        sce_find_participant(ctx, target_id);
+                    if (self_p != NULL && self_p->impl != NULL)
+                        reputation_apply_peer_standing(
+                            ((rp_impl_t *)self_p->impl)->proc, &st);
+                }
             }
         }
     }
-#endif
 
     /* checkpoint: { "<pid>": {root: <hex>, epoch: N} } — pre-seed a finalized
      * Phase 2 checkpoint so an evidence-bearing slash can verify against it in
@@ -1786,26 +1814,12 @@ void at_reputation_run(const at_case_t *c, at_case_result_t *out)
         return;
     }
 
-    /* Scenarios that pre-stage a ZTA standing (fixtures.zta_standing) need the
-     * ceiling machinery, which is compiled in only under AT_ZTA — and AT_ZTA is
-     * OFF by default. Skip rather than run: without the gate the fixture is
-     * silently ignored, the scenario scores as though nothing were capped, and
-     * the miss surfaces as a plain value mismatch that reads exactly like a
-     * cross-language divergence. A skip on one side is not asymmetric
-     * (diff_results), and the Python adapter still pins the case. Mirrors the
-     * identity adapter's fixtures.zta_policy skip. */
-#ifndef AT_ZTA_ENABLED
-    {
-        json_t *fx = json_object_get(c->data, "fixtures");
-        if (json_is_object(fx) && json_object_get(fx, "zta_standing") != NULL)
-        {
-            at_case_result_set_skip(
-                out, "ZTA scenario skipped: C built without AT_ZTA "
-                     "(build -DAT_ZTA=ON to run it symmetrically)");
-            return;
-        }
-    }
-#endif
+    /* NO AT_ZTA SKIP HERE ANY MORE (Phase 4 P4.1). A standing fixture used to be
+     * skipped in a default build because the ceiling machinery was compiled in
+     * only under AT_ZTA, so the case pinned nothing on the C side. The ceiling
+     * is now substrate-level and always compiled, and this scenario runs
+     * symmetrically in every build — which is the visible proof the
+     * generalization landed. Do not reinstate a skip here. */
 
     char err[256] = {0};
     struct timespec t0, t1;

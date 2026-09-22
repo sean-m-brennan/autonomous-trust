@@ -29,7 +29,7 @@ which is why the comparison is the test.
 
 Measured when this was written: 11 names were reachable under python and not
 under native -- `config.atomic_write` (which a project convention *requires*
-every `.cfg.json` writer to use), `identity.ZtaStanding`,
+every `.cfg.json` writer to use), `identity.PeerStanding`,
 `identity.ChildGroupSet`, the five `network.clock` names, and the reputation
 channel-weight pair -- plus every `_python.identity` submodule
 (`protocol`, `history`, `idprocess`, `zta`, `first_contact`).

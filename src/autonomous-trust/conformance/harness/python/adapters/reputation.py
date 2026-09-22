@@ -54,8 +54,8 @@ from autonomous_trust.core.reputation.reputation import (
     TransactionScore, SlashAttestation, SignedSlash,
     Checkpoint, SignedCheckpoint, evidence_to_dict)
 from autonomous_trust.core.system import CfgIds, PackageHash
-from autonomous_trust.core._python.identity.zta_standing import (
-    ZtaStanding, STANDING_CAPPED)
+from autonomous_trust.core._python.identity.peer_standing import (
+    PeerStanding, STANDING_CAPPED)
 
 from ...common.scenario_loader import Case
 from ..scenario_engine import (
@@ -459,13 +459,17 @@ class ReputationAdapter:
         # Hysteresis latch read by _compute_reputation; combined with `reputations`,
         # pins which branch (pure vs. CTFT) runs.
         preset_coop_mode: dict[str, dict[str, bool]] = fixtures.get('coop_mode', {}) or {}
-        # zta_standing pre-sets what ZTA proved about a peer (doc/architecture/zta-integration.md):
-        # { pid -> { other_pid -> {status, ceiling} } }. Installed directly
-        # rather than driven through an admission step because the verdict is
-        # produced by the IDENTITY process and this protocol's harness stands up
-        # only the reputation one -- the cross-language claim being pinned is
-        # what reputation DOES with a standing, not how identity reaches it.
-        preset_zta_standing: dict[str, dict[str, Any]] = fixtures.get('zta_standing', {}) or {}
+        # peer_standing pre-sets what an authority has found about a peer
+        # (doc/architecture/zta-integration.md):
+        # { pid -> { other_pid -> <spec> | [<spec>, ...] } }, where <spec> is
+        # {status, ceiling, source?, reason?}. Installed directly rather than
+        # driven through an admission step because the verdict is produced by
+        # the IDENTITY process and this protocol's harness stands up only the
+        # reputation one -- the cross-language claim being pinned is what
+        # reputation DOES with a standing, not how identity reaches it.
+        # A LIST lets two authorities speak about the same peer, which is the
+        # only way to pin the minimum-over-sources reduction.
+        preset_peer_standing: dict[str, dict[str, Any]] = fixtures.get('peer_standing', {}) or {}
         # checkpoint pre-seeds a finalized Phase 2 checkpoint root.
         # { pid -> {root: <hex>, epoch: int} }. Lets a single-step scenario
         # verify an evidence-bearing slash against a checkpoint (Phase 3); the
@@ -622,24 +626,28 @@ class ReputationAdapter:
                     identities[other_pid].uuid
                 ] = bool(in_coop)
 
-            for other_pid, standing in preset_zta_standing.get(pid, {}).items():
+            for other_pid, spec in preset_peer_standing.get(pid, {}).items():
                 if other_pid not in identities:
                     continue
-                ceiling = standing.get('ceiling')
-                participant.process.protocol.zta_standing[
-                    str(identities[other_pid].uuid)
-                ] = ZtaStanding(identities[other_pid].uuid,
-                                standing.get('status', STANDING_CAPPED),
-                                None if ceiling is None else float(ceiling),
-                                standing.get('verified_at'),
-                                standing.get('reason', ''))
-            if preset_zta_standing.get(pid):
+                specs = spec if isinstance(spec, list) else [spec]
+                for one in specs:
+                    ceiling = one.get('ceiling')
+                    found = PeerStanding(identities[other_pid].uuid,
+                                         one.get('status', STANDING_CAPPED),
+                                         None if ceiling is None else float(ceiling),
+                                         one.get('verified_at'),
+                                         one.get('reason', ''),
+                                         one.get('source'))
+                    # Keyed by the finding's own (peer, source) key, exactly as
+                    # Protocol.run_message_handlers would file it.
+                    participant.process.protocol.peer_standing[found.key] = found
+            if preset_peer_standing.get(pid):
                 # ACT on them, not merely record them: the C adapter's
-                # reputation_apply_zta_standing does the unwind at install time,
+                # reputation_apply_peer_standing does the unwind at install time,
                 # and in production the reputation process loop does it every
                 # pass. Recording only would leave Python a step behind C and
                 # report an asymmetry that is the harness's, not the runtime's.
-                participant.process._apply_zta_standings({})
+                participant.process._apply_peer_standings({})
 
             handles[pid] = ParticipantHandle(
                 id=pid, role=role, impl=participant,

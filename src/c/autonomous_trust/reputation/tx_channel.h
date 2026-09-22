@@ -109,8 +109,31 @@
  *  probe from real work. */
 #define TX_CHANNEL_PROBE              "probe"
 
+/** One node's own, first-person account of an interaction it was party to
+ *  (Phase 4 P4.1). The person operating this node says the exchange went
+ *  badly, and that is the entire warrant — no oracle, no replication, no
+ *  verifier-authored question, no second witness.
+ *
+ *  NAMED FOR ITS EPISTEMOLOGY, like every other spelling here, and
+ *  deliberately not `report`. That name would invite the thing this channel
+ *  must never become: an accusation several nodes co-sign into a verdict.
+ *  There is no adjudicator for this channel and none is planned, for the same
+ *  reason `swarm_disagreement` has none — see the note above on why no channel
+ *  levies one.
+ *
+ *  It is the WEAKEST evidence in the set and weighs accordingly (1, via the
+ *  fall-through in @ref tx_channel_weight — no entry is added there, and that
+ *  is deliberate). A first-person account is one peer's reading of one event,
+ *  with the added problem that the peer is an interested party. The bound on
+ *  it is therefore the ACCRUAL CAP, not the weight: a reporter spends their
+ *  own daily budget, so report-spam costs the spammer their ability to accrue.
+ *
+ *  Distinct from `swarm_disagreement`, which is an aggregate over peers: this
+ *  is one party to one exchange, and nothing about it is a majority. */
+#define TX_CHANNEL_FIRST_PERSON       "first_person"
+
 /** Storage bound for a channel name, sized past the longest spelling above
- *  ("swarm_disagreement", 18) with room for a future one. Fields are
+ *  ("swarm_disagreement", 18; "first_person" is 12) with room for another. Fields are
  *  `[TX_CHANNEL_NAMELEN + 1]` for the terminator, matching CAP_NAMELEN's
  *  convention next door. */
 #define TX_CHANNEL_NAMELEN 31
@@ -125,7 +148,8 @@
     TX_CHANNEL_SELF_CONSISTENCY, \
     TX_CHANNEL_REPLICATION, \
     TX_CHANNEL_SWARM_DISAGREEMENT, \
-    TX_CHANNEL_PROBE
+    TX_CHANNEL_PROBE, \
+    TX_CHANNEL_FIRST_PERSON
 
 /** True iff @p channel is exactly one of the closed set's spellings.
  *

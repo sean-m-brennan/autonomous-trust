@@ -21,7 +21,8 @@ import icontract
 
 from .system import CfgIds, QueueType
 from .util import ClassEnumMeta
-from .identity import Group, ChildGroupSet, Peers, ZtaStanding
+from .identity import Group, ChildGroupSet, Peers, PeerStanding
+from .identity.peer_standing import standing_source_valid
 from .network import Message
 from .capabilities import Capabilities, PeerCapabilities
 
@@ -38,11 +39,11 @@ class Protocol(object, metaclass=ClassEnumMeta):
         # Empty on leaf nodes; kept separate from self.group so the
         # primary/parent group slot is never clobbered.
         self.child_groups = {}
-        # peer-uuid-str -> ZtaStanding, propagated from IdentityProcess
+        # "<peer-uuid>|<source>" -> PeerStanding, propagated from IdentityProcess
         # (doc/architecture/zta-integration.md). This node's OWN findings about its peers, never
         # anything a peer asserted about itself; reputation reads it to bound
         # a peer whose credential ZTA has not actually proved.
-        self.zta_standing = {}
+        self.peer_standing = {}
         if configurations is not None:
             if CfgIds.peers in configurations:
                 self.peers = configurations[CfgIds.peers]
@@ -65,11 +66,18 @@ class Protocol(object, metaclass=ClassEnumMeta):
         if isinstance(message, ChildGroupSet):
             self.child_groups = message.groups
             return True
-        if isinstance(message, ZtaStanding):
-            # Last writer wins, deliberately: IdentityProcess is the single
-            # source of ZTA findings and sends these in the order it learns
-            # them, so the newest verdict is the current one (doc/architecture/zta-integration.md).
-            self.zta_standing[message.peer_uuid] = message
+        if isinstance(message, PeerStanding):
+            # Last writer wins WITHIN ONE AUTHORITY, deliberately: findings
+            # arrive in the order they are learned, so the newest verdict from
+            # a given source is the current one (doc/architecture/zta-integration.md).
+            # Keyed per (peer, source) -- a ZTA re-verification must not lift a
+            # bound some other authority placed on the same peer.
+            if not standing_source_valid(message.source):
+                self.logger.warning(
+                    'refusing a standing about %s from unknown authority %r',
+                    message.peer_uuid[:8], message.source)
+                return True
+            self.peer_standing[message.key] = message
             return True
         if isinstance(message, Peers):
             self.peers = message

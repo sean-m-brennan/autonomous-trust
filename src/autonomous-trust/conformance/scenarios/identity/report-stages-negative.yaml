@@ -1,0 +1,52 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: report-stages-negative
+byte_pinning: false
+description: |
+    A report stages the reporter's half: a low first-person score about the
+    reported peer (Agora Phase 4 P4.1).
+
+    A report is an INTERACTION OUTCOME — the operator's own account that an
+    exchange went badly — so it travels as an ordinary low scalar through the
+    bilateral transaction, never as an authority finding (those are ceilings,
+    PEER_STANDING). The reporter stages SOCIAL_REPORT_SCORE (0.15): worse than a
+    decline's 0.30, still above COMM_CUTOFF, and never 0.0. It is staged on the
+    `first_person` channel, the weakest evidence in the set, which is what makes
+    it legible downstream as one party's reading of one event.
+
+    bob is the control: in the same run he is not reported, and nothing may be
+    staged about him. The two peers differ by the report alone.
+
+    Requires CONFORMANCE_SOCIAL=1, or the C side skips and diff_results scores
+    a one-side skip as a match.
+
+participants:
+  - id: node
+    role: border_guard
+  - id: alice
+    role: group_member
+  - id: bob
+    role: group_member
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: trigger_report
+    payload:
+      peer: alice
+    description: |
+        node's operator reports alice. The production report verb runs; the
+        peer_report it sends is delivered to alice, who stages her half
+        (pinned by report-pairs-bilaterally).
+
+expected_state:
+  node:
+    social_tx_last:
+      alice:
+        score: 0.15
+        channel: first_person
+        n: 1
+      bob:
+        absent: true

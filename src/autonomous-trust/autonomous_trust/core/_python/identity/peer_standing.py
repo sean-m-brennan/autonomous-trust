@@ -56,8 +56,46 @@ STANDING_FAILED = 'failed'
 #: should be handed the distinction it needs, not a wider enum it must re-derive.
 STANDINGS = (STANDING_PROVED, STANDING_CAPPED, STANDING_FAILED)
 
+#: A credential authority: ZTA proved, could not prove, or disproved an
+#: identity (doc/architecture/zta-integration.md).
+STANDING_SOURCE_ZTA = 'zta'
 
-class ZtaStanding(object):
+#: A governance authority: an Ethne polity expelled a member, or reinstated one
+#: (Phase 4 P4.1). Decided in the app -- the core holds no Ethne and verifies
+#: nothing about the finding -- and handed to the core over the local queue.
+STANDING_SOURCE_ETHNE = 'ethne'
+
+#: The closed set, mirrored by C's PEER_STANDING_SOURCE_ALL. Ceilings are kept
+#: PER SOURCE and reduced by MINIMUM: two authorities may bound the same peer
+#: for unrelated reasons and neither may clear the other's finding, since a ZTA
+#: re-verification proving a certificate says nothing about whether a community
+#: expelled the person holding it.
+STANDING_SOURCES = (STANDING_SOURCE_ZTA, STANDING_SOURCE_ETHNE)
+
+
+def standing_source_or_default(source: Optional[str]) -> str:
+    """`source` if set at all, else the default.
+
+    Absence normalizes to ZTA because ZTA was the only producer before there
+    was a source at all, so an unset source is by construction a ZTA finding
+    from a caller that predates Phase 4 P4.1. Mirrors C's
+    ``peer_standing_source_or_default``.
+    """
+    return source if source else STANDING_SOURCE_ZTA
+
+
+def standing_source_valid(source: Optional[str]) -> bool:
+    """True iff `source` is exactly one of :data:`STANDING_SOURCES`.
+
+    None and '' are NOT valid -- they are *absent*, a different question from
+    *invalid*; normalize with :func:`standing_source_or_default` first. Matching
+    is byte-exact and case-sensitive, for the reason ``tx_channel_valid`` gives:
+    a set that quietly accepts near-misses stops being closed.
+    """
+    return bool(source) and source in STANDING_SOURCES
+
+
+class PeerStanding(object):
     """One peer's ZTA standing, as IdentityProcess currently understands it.
 
     Plain picklable object (no protobuf) -- like ``ChildGroupSet`` it only ever
@@ -79,14 +117,26 @@ class ZtaStanding(object):
     """
 
     def __init__(self, peer_uuid, status: str, ceiling: Optional[float] = None,
-                 verified_at: Optional[float] = None, reason: str = ''):
+                 verified_at: Optional[float] = None, reason: str = '',
+                 source: Optional[str] = None):
         self.peer_uuid = str(peer_uuid)
         self.status = str(status)
         self.ceiling = None if ceiling is None else float(ceiling)
         self.verified_at = None if verified_at is None else float(verified_at)
         self.reason = str(reason or '')
+        self.source = standing_source_or_default(source)
+
+    @property
+    def key(self) -> str:
+        """The key this finding is filed under: ``<peer_uuid>|<source>``.
+
+        Per (peer, source), so one authority's verdict never overwrites
+        another's -- see :data:`STANDING_SOURCES`. Mirrors C's
+        ``_standing_key``.
+        """
+        return '%s|%s' % (self.peer_uuid, self.source)
 
     def __repr__(self):
-        return ('ZtaStanding(%s, %s, ceiling=%s, verified_at=%s)'
+        return ('PeerStanding(%s, %s, ceiling=%s, verified_at=%s, source=%s)'
                 % (self.peer_uuid[:8], self.status, self.ceiling,
-                   self.verified_at))
+                   self.verified_at, self.source))

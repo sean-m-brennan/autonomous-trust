@@ -27,6 +27,13 @@ description: |
     store, and the next consumer to read it -- persistence, the app-facing
     carrier, a peer answering its own rep_req -- leaks what the cap withheld.
 
+    KEPT UNDER ITS ZTA NAME on purpose: this is a ZTA case, and `source: zta`
+    says so. What changed at Phase 4 P4.1 is that it now runs SYMMETRICALLY in
+    every build. The ceiling machinery used to be compiled only under AT_ZTA, so
+    on a default C build the fixture installer was compiled out, the case was
+    skipped, and `diff_results` scored a one-side skip as a match -- the case
+    read green while pinning nothing on the C side.
+
     The standing is installed as a fixture rather than driven through an
     admission step because the verdict is produced by the IDENTITY process,
     while the thing it bounds lives here. What is pinned cross-language is what
@@ -48,9 +55,10 @@ fixtures:
     bob:
       rogue: 0.9
   # ...but ZTA never proved rogue's credential, so bob holds it under a ceiling.
-  zta_standing:
+  peer_standing:
     bob:
       rogue:
+        source: zta
         status: capped
         ceiling: 0.15
         reason: DDIL fallback

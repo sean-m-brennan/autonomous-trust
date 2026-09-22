@@ -69,8 +69,8 @@ typedef enum {
 #ifdef AT_ZTA_ENABLED
     ZTA_REVOCATION_ALERT,    /**< Peer credential revocation notice. */
     ZTA_VERIFICATION_RESULT, /**< Outcome of a deferred ZTA verification. */
-    ZTA_STANDING             /**< Identity → reputation: what ZTA proved about a peer (@ref zta_standing_msg_t). Local IPC only. Mirrors Python's ZtaStanding (doc/architecture/zta-integration.md). */
 #endif
+    PEER_STANDING            /**< An authority → reputation: a BOUND on what a peer may hold, not an interaction outcome (@ref peer_standing_msg_t). Local IPC only. Was ZTA_STANDING, and ZTA is still a producer — but so is an Ethne expulsion reaching the core through the app (Phase 4 P4.1), so the mechanism outlives the one authority that first needed it. PLACED AFTER THE #endif, not filed with the unconditional types above, BECAUSE these values are serialized: here it inherits ZTA_STANDING's exact ordinal in a ZTA build and renumbers nothing in any build combination, where filing it beside PEER_RTT_OBSERVED would renumber all twelve AT_SOCIAL types and both remaining ZTA ones. */
 } message_type_t;
 
 /**
@@ -277,6 +277,19 @@ typedef struct {
      *  surfaces it as an "in your group" indicator, distinct from an explicit
      *  connection edge. Appended LAST; social builds only. */
     bool     in_group;
+    /** True iff this peer is LOCALLY BLOCKED on this node (Phase 4 P4.1).
+     *
+     *  Identity's own state, reported by identity — which is why it rides here
+     *  and not on @ref peer_reputation_msg_t. The app composes the two exactly
+     *  as identity_get_peer_tier does: an effective tier is the reputation
+     *  tier unless the peer is blocked, in which case it is 0.
+     *
+     *  Without this the block is INVISIBLE to the app. handle_app_block emitted
+     *  nothing at all before P4.1, and the app re-derives tier from the score
+     *  (tie_strength.dart mirrors the floors), so a core-side block left the
+     *  score unchanged, the derived tier unchanged, and the peer ranked exactly
+     *  as before. Appended LAST; social builds only. */
+    bool     blocked;
 #endif /* AT_SOCIAL_ENABLED */
 } peer_observed_msg_t;
 
@@ -299,6 +312,25 @@ typedef struct {
     double score;
     /** True iff AT holds an actual rating for this peer. */
     bool   rated;
+    /** The trust tier this score yields AFTER any standing ceiling, 0..4
+     *  (Phase 4 P4.1).
+     *
+     *  app_events.h has said since Increment 3 that the app derives tier from
+     *  reputation, and it still may — but only reputation knows about a
+     *  CEILING, which is not a function of the score at all. A peer bounded by
+     *  an authority reads as a perfectly ordinary score with a tier the app
+     *  cannot compute. So the tier reputation actually used crosses here, and
+     *  the app's own floors become a fallback for a core that predates P4.1. */
+    int32_t effective_tier;
+    /** The ceiling in force on this peer, or a negative sentinel for none.
+     *
+     *  Carried beside the tier so the app can distinguish "low because they
+     *  have earned little" from "bounded by a community decision", which are
+     *  different things to show a person. @ref PEER_NO_CEILING is the
+     *  sentinel — and it MUST be written explicitly, because every consumer
+     *  memsets its event before filling it and an unwritten 0.0 would read as
+     *  "floored at zero". */
+    double standing_ceiling;
 } peer_reputation_msg_t;
 
 #ifdef AT_SOCIAL_ENABLED
@@ -654,47 +686,136 @@ typedef struct {
     int status;                     /* zta_status_t cast to int */
     char reason[64];
 } zta_event_msg_t;
+#endif
 
 /**
- * @brief What ZTA proved (or failed to prove) about a peer.
+ * @brief What an authority proved (or failed to prove) about a peer.
  *
- * Mirrors Python's `STANDING_*` in `identity/zta_standing.py`; the three
+ * Mirrors Python's `STANDING_*` in `identity/peer_standing.py`; the three
  * values are the distinctions the reputation process can act on, deliberately
- * NOT the six-valued @ref zta_status_t (the verifier's own status rides along
+ * NOT the six-valued @ref zta_status_t (a verifier's own status rides along
  * in `reason` for the operator log). doc/architecture/zta-integration.md.
+ *
+ * ALWAYS COMPILED, unlike the ZTA machinery that first needed it: an Ethne
+ * expulsion is the second authority to reach this, and it arrives through the
+ * app on a build with AT_ZTA off (Phase 4 P4.1). The values are explicit and
+ * start at 0 so lifting them out of `#ifdef AT_ZTA_ENABLED` renumbered nothing.
  */
 typedef enum {
-    ZTA_STANDING_PROVED = 0, /**< Verified against a configured anchor AND bound to this identity. No ceiling; anchors the unwind. */
-    ZTA_STANDING_CAPPED,     /**< Admitted but unproved (DDIL/deferred, or a chained-but-unbound credential under `binding_mode: prefer`). Carries the ceiling. */
-    ZTA_STANDING_FAILED      /**< Affirmative post-admission failure: REVOKED / EXPIRED / REJECTED at re-verification. Unwinds and demotes. */
-} zta_standing_t;
+    PEER_STANDING_PROVED = 0, /**< Verified against a configured anchor AND bound to this identity. No ceiling; anchors the unwind. From the app, this means REINSTATED. */
+    PEER_STANDING_CAPPED,     /**< Admitted but unproved (DDIL/deferred, or a chained-but-unbound credential under `binding_mode: prefer`). Carries the ceiling. */
+    PEER_STANDING_FAILED      /**< Affirmative post-admission failure: REVOKED / EXPIRED / REJECTED at re-verification, or an expulsion. Unwinds and demotes. */
+} peer_standing_t;
 
 /**
- * @brief Identity → reputation: one peer's ZTA standing. Local IPC only.
+ * @brief An authority → reputation: one peer's standing. Local IPC only.
  *
- * The verdict is discovered by the identity process (it owns admission and the
- * verifier) but the thing it must bound, reputation, lives in another process;
- * this is that hand-off. Nothing here is peer-supplied — it is this node's own
- * finding — so a peer cannot forge itself a ceiling of 1.0 by claiming one.
+ * The verdict is discovered by the identity process (it owns admission, the
+ * verifier, and the app boundary) but the thing it must bound, reputation,
+ * lives in another process; this is that hand-off. Nothing here is
+ * peer-supplied — it is this node's own finding, or one its operator's app
+ * handed it over the local queue — so a peer cannot forge itself a ceiling of
+ * 1.0 by claiming one.
  *
- * Why a ceiling and not a score: a ZTA verdict is an authority finding about
- * whether an identity is who it claims, not the outcome of an interaction with
- * it, and AT's [0, 1] scale (doc/architecture/reputation.md) has no representation for a penalty. The
- * predecessor of this message tried to send one as `score = -0.8` on a
- * TRANSACTION_SCORE and was discarded at the boundary twice over — once for
- * the zero task_uuid sentinel, once for being off-scale — so a revoked
- * credential cost a peer exactly nothing.
+ * Why a ceiling and not a score: an authority finding is about whether an
+ * identity is who or what it claims, not the outcome of an interaction with
+ * it, and AT's [0, 1] scale (doc/architecture/reputation.md) has no
+ * representation for a penalty. The predecessor of this message tried to send
+ * one as `score = -0.8` on a TRANSACTION_SCORE and was discarded at the
+ * boundary twice over — once for the zero task_uuid sentinel, once for being
+ * off-scale — so a revoked credential cost a peer exactly nothing.
  */
+/** @brief Storage bound for a standing source name, sized past the longest
+ *  spelling below with room for another. Fields are `[PEER_STANDING_SOURCE_LEN
+ *  + 1]` for the terminator, matching TX_CHANNEL_NAMELEN's convention. */
+#define PEER_STANDING_SOURCE_LEN 15
+
+/** A credential authority: ZTA proved, could not prove, or disproved an
+ *  identity (doc/architecture/zta-integration.md). */
+#define PEER_STANDING_SOURCE_ZTA   "zta"
+
+/** A governance authority: an Ethne polity expelled a member, or reinstated
+ *  one (Phase 4 P4.1). The finding is decided in the app — the core holds no
+ *  Ethne and verifies nothing about it — and arrives over the local app queue. */
+#define PEER_STANDING_SOURCE_ETHNE "ethne"
+
+/** The full closed set, iterated by @ref peer_standing_source_valid and by the
+ *  effective-ceiling reduction in rep_proc.c. Mirrored by Python's
+ *  STANDING_SOURCES. */
+#define PEER_STANDING_SOURCE_ALL \
+    PEER_STANDING_SOURCE_ZTA, \
+    PEER_STANDING_SOURCE_ETHNE
+
+/** True iff @p source is exactly one of the closed set's spellings.
+ *
+ *  NULL and "" are NOT valid here — they are *absent*, which is a different
+ *  question from *invalid*; normalize absence with
+ *  @ref peer_standing_source_or_default first. Byte-exact and case-sensitive,
+ *  for the reason @ref tx_channel_valid gives: a set that quietly accepts
+ *  near-misses stops being closed. */
+static inline bool peer_standing_source_valid(const char *source)
+{
+    if (source == NULL || source[0] == '\0')
+        return false;
+    static const char *const all[] = { PEER_STANDING_SOURCE_ALL };
+    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
+        if (strcmp(source, all[i]) == 0)
+            return true;
+    return false;
+}
+
+/** @p source if it is set at all, else the default.
+ *
+ *  Absence normalizes to ZTA because ZTA was the only producer before there
+ *  was a source field at all, so an unset source is by construction a ZTA
+ *  finding from a caller that predates Phase 4 P4.1. */
+static inline const char *peer_standing_source_or_default(const char *source)
+{
+    return (source != NULL && source[0] != '\0') ? source
+                                                 : PEER_STANDING_SOURCE_ZTA;
+}
+
 typedef struct {
     uuid_t peer_uuid;
-    int32_t standing;    /**< @ref zta_standing_t cast to int. */
+    int32_t standing;    /**< @ref peer_standing_t cast to int. */
     double ceiling;      /**< Highest reputation this peer may hold while unproved; < 0 means "no bound". */
     char reason[64];
-} zta_standing_msg_t;
+    /** Which authority is speaking — one of @ref PEER_STANDING_SOURCE_ALL.
+     *
+     *  Ceilings are kept PER SOURCE and reduced by MINIMUM, because two
+     *  authorities may bound the same peer for unrelated reasons and neither
+     *  may clear the other's finding: a ZTA re-verification proving a
+     *  certificate says nothing about whether a community expelled the person
+     *  holding it. A single-valued ceiling would let whichever authority spoke
+     *  last silently overwrite the other. */
+    char source[PEER_STANDING_SOURCE_LEN + 1];
+} peer_standing_msg_t;
 
-/** @brief Sentinel for @ref zta_standing_msg_t::ceiling meaning "no bound". */
-#define ZTA_NO_CEILING (-1.0)
-#endif
+/** @brief Sentinel for @ref peer_standing_msg_t::ceiling meaning "no bound". */
+#define PEER_NO_CEILING (-1.0)
+
+/** @brief The bound an Ethne expulsion places on a former member (Phase 4 P4.1).
+ *
+ *  BELOW the tier-1 floor (0.50), so every tier-gated capability and every
+ *  tier-gated feed closes; ABOVE `COMM_CUTOFF` (0.10), so the peer is NOT cut
+ *  off at the network layer — "revocation as a reputation event, not a hard
+ *  cut" (SOCIAL_APP_PLAN.md:481). They can still be spoken to, and they can
+ *  still re-earn once the community lifts the bound.
+ *
+ *  The same number ZTA's default revocation already lands on: `zta_policy`'s
+ *  `revocation_reputation_penalty` defaults to 0.8 and zta_process.c turns that
+ *  into `ceiling = 1.0 - penalty`. Two authority findings, one bound, which is
+ *  the point of there being one standing mechanism.
+ *
+ *  NOT comparable to `AT_SOCIAL_NEG_SCORE` (0.30), despite the numbers looking
+ *  alike: that is one DATUM folded into a slow EMA, which good behaviour
+ *  outweighs over time. This is a hard BOUND that no amount of good behaviour
+ *  lifts.
+ *
+ *  Filed here rather than in identity/social_tx.h, where the other social
+ *  constants live, because that header is included only under
+ *  AT_SOCIAL_ENABLED while this verb is always compiled. */
+#define AT_ETHNE_EXPEL_CEILING 0.20
 
 /**
  * @brief Tagged union carrying any message the IPC layer understands.
@@ -737,8 +858,8 @@ typedef struct
 #endif /* AT_SOCIAL_ENABLED */
 #ifdef AT_ZTA_ENABLED
         zta_event_msg_t zta_event;
-        zta_standing_msg_t zta_standing;
 #endif
+        peer_standing_msg_t peer_standing;
     } info;         /**< Discriminated-union payload keyed by @c type. */
 } generic_msg_t;
 
