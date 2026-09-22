@@ -540,7 +540,9 @@ DEFINE_TEST(test_every_app_verb_is_allowlisted_for_routing)
         AT_APP_ADVERTISE_BUSINESS, AT_APP_SET_CUSTOMER,
         AT_APP_REQUEST_COSIGN, AT_APP_RETURN_COSIGN,
         AT_APP_PUBLISH_BUSINESS_POST,
+        AT_APP_UNBLOCK, AT_APP_REPORT_PEER,     /* Phase 4 P4.1 */
 #endif
+        AT_APP_PEER_STANDING,                   /* Phase 4 P4.1, always compiled */
     };
 
     for (size_t i = 0; i < sizeof(app_verbs) / sizeof(app_verbs[0]); i++) {

@@ -37,7 +37,10 @@ from .identity import Identity, public_identity_to_canonical, public_identity_fr
 from .operator_binding import (OPERATOR_BINDING_MAX, OPERATOR_PUBKEY_LEN,
                                verify_operator_binding)
 from .group import Group, ChildGroupSet
-from .zta_standing import (ZtaStanding, STANDING_PROVED, STANDING_CAPPED,
+from .social_store import social_store_load, social_store_save
+from .peer_standing import (PeerStanding, STANDING_PROVED, STANDING_CAPPED,
+                            STANDINGS, STANDING_SOURCE_ZTA,
+                            standing_source_or_default, standing_source_valid,
                            STANDING_FAILED)
 from .history.history import IdentityHistory
 from ..algorithms.agreement import AgreementProof
@@ -474,13 +477,22 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # (peer uuid str -> {'count','last_out','last_in','day','day_count'}) drives
         # the diminishing S_pos(count) and the bilateral_recent + daily-cap gate,
         # exactly as C id_state.social_edges. social_tx_last (subject uuid str ->
-        # {'task','score'}) is the deterministic accrual observable, recorded at the
+        # {'task','score','channel','n'}) is the deterministic accrual observable,
+        # where n counts every score staged about the subject; recorded at the
         # moment we would move a peer's reputation (twin of C
         # identity_get_last_social_tx; conformance asserts via social_tx_last).
         # social_blocks clamps a peer's local tier to 0 (twin of C social_blocks).
         self.social_edges: dict = {}
         self.social_tx_last: dict = {}
-        self.social_blocks: set = set()
+        # First-person reports (Phase 4 P4.1): peer uuid str -> {'day','out','in'},
+        # how many reports WE made about that peer today and how many FROM it we
+        # paired. Separate from social_edges, exactly as C id_state.social_reports.
+        self.social_reports: dict = {}
+        # {uuid_str: at_epoch_float}. A DICT, not a set, since Phase 4 P4.1:
+        # "blocked" is still membership, but the value carries WHEN so the
+        # durable store has something to write back. Mirrors the C map, whose
+        # value is likewise the timestamp rather than a flag.
+        self.social_blocks: dict = {}
         self._social_day: int = 0
         self._social_day_count: int = 0
         self.protocol.register_handler(IdentityProtocol.announce, self.welcoming_committee)
@@ -510,6 +522,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.protocol.register_handler(IdentityProtocol.dm, self.handle_dm)
         self.protocol.register_handler(IdentityProtocol.post, self.handle_post)
         self.protocol.register_handler(IdentityProtocol.reaction, self.handle_reaction)
+        self.protocol.register_handler(IdentityProtocol.report, self.handle_peer_report)
         self.protocol.register_handler(IdentityProtocol.id_query, self.handle_identity_query)
         self.protocol.register_handler(IdentityProtocol.id_response, self.handle_identity_response)
         self.protocol.register_handler(IdentityProtocol.roster_req, self.handle_roster_request)
@@ -653,7 +666,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         keeps an unbounded score.
         """
         try:
-            self.update(ZtaStanding(peer_uuid, status, ceiling, verified_at,
+            self.update(PeerStanding(peer_uuid, status, ceiling, verified_at,
                                     reason), queues)
         except Exception as err:
             self.logger.warning(
@@ -4116,6 +4129,16 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         from ..capabilities import CONN_CONNECTED, CONN_PENDING_IN
         key = str(getattr(sender, 'uuid', None))
         with self.lock:
+            # A blocked peer cannot ask (Phase 4 P4.1). DROPPED: letting it
+            # through would move our edge to pending_in and put a decision in
+            # front of the person who blocked them. CONN_DECLINED is re-askable
+            # by design, so without this a blocked peer could ask forever.
+            # The LOCKED predicate: self.lock is held here. Twin of C.
+            if self._is_blocked_locked(key):
+                self.logger.debug(
+                    'connection_request from %s dropped (locally blocked)',
+                    key[:8])
+                return True
             if self.connection_edges.get(key) == CONN_CONNECTED:
                 return True
             self.connection_edges[key] = CONN_PENDING_IN
@@ -4218,6 +4241,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     'peer_dm from %s refused (replay/unstamped)',
                     str(getattr(sender, 'uuid', ''))[:8])
                 return True
+            # A blocked peer cannot reach us (Phase 4 P4.1). DROPPED, not
+            # hidden: a DM has no third party whose interest is served by our
+            # keeping it. AFTER the freshness check, never before, or every DM
+            # sent during a block replays the moment it is lifted. Twin of C
+            # handle_dm's gate.
+            if self._is_blocked(sender.uuid):
+                self.logger.debug('peer_dm from %s dropped (locally blocked)',
+                                  str(sender.uuid)[:8])
+                return True
             from ..capabilities import bound_dm_text
             with self.lock:
                 self.last_dm[str(sender.uuid)] = {
@@ -4274,6 +4306,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         from ..capabilities import (SOCIAL_RECENCY_WINDOW, SOCIAL_DAY_SECONDS,
                                     SOCIAL_PER_EDGE_DAILY_CAP,
                                     SOCIAL_GLOBAL_DAILY_CAP)
+        # A blocked peer accrues nothing with us (Phase 4 P4.1). Gated HERE
+        # because every positive path funnels through this function, so one
+        # gate covers DMs, reactions and connections at once. Reputation is
+        # BILATERAL and we have told them nothing -- a block is purely local --
+        # so our half could never pair and would sit in the chain forever.
+        # Twin of C _social_accrue's gate. The LOCKED form: this runs with
+        # self.lock already held.
+        if self._is_blocked_locked(key):
+            return None
         e = dict(self._social_edge(key))
         if require_bilateral:
             w = SOCIAL_RECENCY_WINDOW
@@ -4297,8 +4338,16 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         self.social_edges[key] = e
         return e['count']
 
-    def _social_record_tx(self, task, subject_key, score):
-        self.social_tx_last[subject_key] = {'task': str(task), 'score': float(score)}
+    def _social_record_tx(self, task, subject_key, score, channel=None):
+        """Record a staged score as the observable. ``channel`` None is absent,
+        which resolves to the default channel -- as C records it. Twin of the
+        observed-record half of C ``_submit_interaction_score``."""
+        from ..reputation.reputation import TX_CHANNEL_DEFAULT
+        prev = self.social_tx_last.get(subject_key, {})
+        self.social_tx_last[subject_key] = {
+            'task': str(task), 'score': float(score),
+            'channel': channel if channel is not None else TX_CHANNEL_DEFAULT,
+            'n': int(prev.get('n', 0)) + 1}
 
     def _social_accrue_connection(self, self_uuid, peer_uuid, seq, connected):
         """Connected => diminishing positive (structurally bilateral, caps only);
@@ -4309,6 +4358,14 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         task = social_task_uuid(SOCIAL_DOMAIN_CONN, self_uuid, peer_uuid,
                                 int(seq).to_bytes(8, 'little'))
         key = str(peer_uuid)
+        # Gated separately from _social_accrue because the DECLINE branch below
+        # bypasses it entirely and records SOCIAL_NEG_SCORE unconditionally.
+        # Blocking someone and then declining them must not still cost them
+        # 0.30: a block is not a way to grind a peer down, and the submission
+        # could never pair anyway. Twin of C _social_accrue_connection's gate.
+        # The LOCKED form: this runs with self.lock already held.
+        if self._is_blocked_locked(key):
+            return
         if connected:
             count = self._social_accrue(key, self._now(), False)
             if count is not None:
@@ -4350,6 +4407,164 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         if count is not None:
             self._social_record_tx(task, key, social_pos_score(count))
 
+    # ------------------------------------------------------------------
+    # First-person reports (Phase 4 P4.1). Twin of the C block in id_proc.c: a
+    # report is an INTERACTION OUTCOME, so a low scalar through the ordinary
+    # bilateral transaction on the first_person channel -- never an authority
+    # finding, which is a ceiling. The reporter stages SOCIAL_REPORT_SCORE, the
+    # reported node SOCIAL_REPORTER_SCORE about the reporter, on one task both
+    # derive. Refusable by construction: a forked reported node need not stage.
+    # ------------------------------------------------------------------
+
+    def _social_report_ledger(self, key, today):
+        """(out, in) for ``key`` today; an earlier day reads as zeros. Caller
+        holds self.lock. Twin of C ``_social_report_get_locked``."""
+        r = self.social_reports.get(key)
+        if not r or r.get('day') != today:
+            return 0, 0
+        return int(r.get('out', 0)), int(r.get('in', 0))
+
+    def _social_report_outbound(self, key, now, spend):
+        """May we report ``key`` now, and (``spend``) record that we did? The
+        report cap, then the SHARED per-edge and global budget, which a report
+        spends. NOT gated by the block. Caller holds self.lock. Twin of C
+        ``_social_report_outbound`` -- see there for why each bound is shaped
+        as it is."""
+        from ..capabilities import (SOCIAL_DAY_SECONDS, SOCIAL_PER_EDGE_DAILY_CAP,
+                                    SOCIAL_GLOBAL_DAILY_CAP,
+                                    SOCIAL_REPORT_DAILY_CAP)
+        today = int(now // SOCIAL_DAY_SECONDS)
+        out_n, in_n = self._social_report_ledger(key, today)
+        e = dict(self._social_edge(key))
+        if e['day'] != today:
+            e['day'] = today
+            e['day_count'] = 0
+        glob = self._social_day_count if self._social_day == today else 0
+        if (out_n >= SOCIAL_REPORT_DAILY_CAP
+                or e['day_count'] >= SOCIAL_PER_EDGE_DAILY_CAP
+                or glob >= SOCIAL_GLOBAL_DAILY_CAP):
+            return False
+        if spend:
+            self.social_reports[key] = {'day': today, 'out': out_n + 1,
+                                        'in': in_n}
+            e['count'] += 1
+            e['day_count'] += 1
+            self.social_edges[key] = e
+            self._social_day = today
+            self._social_day_count = glob + 1
+        return True
+
+    def _social_report_inbound(self, key, now):
+        """Pair at most SOCIAL_REPORT_DAILY_CAP reports from ``key`` per day,
+        recording this one when it fits. NOT charged to our shared budget, or a
+        busy node would be unreportable. Caller holds self.lock. Twin of C
+        ``_social_report_inbound``."""
+        from ..capabilities import SOCIAL_DAY_SECONDS, SOCIAL_REPORT_DAILY_CAP
+        today = int(now // SOCIAL_DAY_SECONDS)
+        out_n, in_n = self._social_report_ledger(key, today)
+        if in_n >= SOCIAL_REPORT_DAILY_CAP:
+            return False
+        self.social_reports[key] = {'day': today, 'out': out_n, 'in': in_n + 1}
+        return True
+
+    @staticmethod
+    def _social_report_task(reporter_uuid, reported_uuid, seq):
+        """The shared report task: reporter_uuid[16] || seq u64le as the tail.
+        Twin of C ``_social_report_task``."""
+        from ..capabilities import (social_task_uuid, SOCIAL_DOMAIN_REPORT,
+                                    _uuid16)
+        tail = _uuid16(reporter_uuid) + int(seq).to_bytes(8, 'little')
+        return social_task_uuid(SOCIAL_DOMAIN_REPORT, reporter_uuid,
+                                reported_uuid, tail)
+
+    def report_peer(self, queues, peer_uuid):
+        """The operator reports a peer: send a directed encrypted peer_report
+        {seq, ts} and, ONLY IF IT WENT, stage SOCIAL_REPORT_SCORE about them on
+        the first_person channel. Twin of C ``handle_app_report_peer``. No
+        reason is accepted, so none can travel.
+
+        Returns True when the report was sent and staged, False when it was
+        refused (unknown peer, cap reached) or could not be sent.
+        """
+        from ..capabilities import SOCIAL_REPORT_SCORE
+        from ..reputation.reputation import TX_CHANNEL_FIRST_PERSON
+        key = str(peer_uuid)
+        peer = None
+        try:
+            peer = self.peers.find_by_uuid(key) if self.peers else None
+        except Exception:
+            peer = None
+        if peer is None:
+            self.logger.warning('report_peer: unknown peer %s', key[:8])
+            return False
+        now = self._now()
+        # Checked BEFORE the frame goes and spent only AFTER it went: a refused
+        # report must never reach the wire, or the reported node stages a half
+        # we will never match.
+        with self.lock:
+            if not self._social_report_outbound(key, now, False):
+                self.logger.info('report of %s refused: daily report or '
+                                 'accrual cap reached', key[:8])
+                return False
+        seq = self.freshness.stamp()
+        try:
+            out = Message(self.name, IdentityProtocol.report,
+                          to_json_string({'seq': int(seq),
+                                          'ts': float(time.time())}),
+                          to_whom=peer, from_whom=self.identity, encrypt=True)
+            queues[CfgIds.network].put(out, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.warning('report of %s was not sent; not scoring it',
+                                key[:8])
+            return False
+        task = self._social_report_task(self.identity.uuid, peer_uuid, seq)
+        with self.lock:
+            self._social_report_outbound(key, now, True)
+            self._social_record_tx(task, key, SOCIAL_REPORT_SCORE,
+                                   TX_CHANNEL_FIRST_PERSON)
+        self.logger.info('reported peer %s', key[:8])
+        return True
+
+    def handle_peer_report(self, queues, message):
+        """A peer reported US -- {seq, ts}. Freshness-checked, dropped if we
+        blocked the reporter, capped per reporter per day, then our half is
+        staged so the report can commit. NOTHING reaches the app: the person
+        reported is not told. Twin of C ``handle_peer_report``."""
+        if message.function != IdentityProtocol.report:
+            return False
+        sender = getattr(message, 'from_whom', None)
+        if sender is None:
+            return True
+        try:
+            from ..capabilities import SOCIAL_REPORTER_SCORE
+            body = from_json_string(message.obj)
+            seq = body.get('seq') if isinstance(body, dict) else None
+            if not isinstance(seq, int) or isinstance(seq, bool):
+                self.logger.warning('peer_report unstamped/malformed, refusing')
+                return True
+            key = str(getattr(sender, 'uuid', ''))
+            if not self.freshness.accept(key, IdentityProtocol.report, seq):
+                self.logger.debug('peer_report from %s refused (replay)',
+                                  key[:8])
+                return True
+            # Directed traffic from a blocked peer is DROPPED, after the
+            # freshness window advances. Their report then never pairs.
+            if self._is_blocked(sender.uuid):
+                self.logger.debug('peer_report from %s dropped (locally '
+                                  'blocked)', key[:8])
+                return True
+            task = self._social_report_task(sender.uuid, self.identity.uuid, seq)
+            with self.lock:
+                if not self._social_report_inbound(key, self._now()):
+                    self.logger.info('peer_report from %s refused: daily '
+                                     'report cap', key[:8])
+                    return True
+                self._social_record_tx(task, key, SOCIAL_REPORTER_SCORE)
+            self.logger.debug('report from peer %s staged', key[:8])
+        except Exception as err:
+            self.report_exception(err, 'handle_peer_report')
+        return True
+
     def get_last_social_tx(self, uuid_str):
         """The last interaction score this node STAGED about subject ``uuid_str``
         (Increment 8), as {'task','score'}, or {} if none. The deterministic
@@ -4363,7 +4578,182 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         — nothing on the wire, no reputation transaction. Twin of C
         ``handle_app_block`` / ``identity_block_peer`` (id_proc.c)."""
         with self.lock:
-            self.social_blocks.add(str(uuid_str))
+            self.social_blocks[str(uuid_str)] = float(int(time.time()))
+        self._persist_social_blocks()
+
+    def apply_peer_standing(self, queues, peer_uuid, standing,
+                            ceiling=None, source=None, reason=''):
+        """Take an AUTHORITY FINDING from the app and publish it as a standing.
+
+        Twin of C ``handle_app_peer_standing`` (id_proc.c), Phase 4 P4.1. An
+        Ethne expulsion is decided in the app -- this process holds no Ethne
+        and cannot parse a charter record -- so the finding arrives over the
+        local app queue and is republished to reputation, where it becomes a
+        CEILING.
+
+        A ceiling, never a score. AT's [0, 1] scale has no representation for a
+        penalty, and the predecessor of this mechanism tried to send one as
+        ``score = -0.8``; it was discarded at the boundary and a revoked peer
+        paid nothing. :data:`AT_ETHNE_EXPEL_CEILING` is what an expulsion
+        carries.
+
+        NOTHING ABOUT THE FINDING ITSELF IS VERIFIED -- an expulsion is proved
+        by co-signatures inside a record this process cannot read, exactly as a
+        business page bundle is. What is trusted is the CHANNEL (the local app
+        queue); what is checked is the SHAPE. The C twin additionally guards the
+        channel with ``_is_local_app_verb``; Python has no equivalent yet
+        because it has no app-verb dispatch path at all (see ISSUES.md 2.17).
+
+        Returns True when a standing was published, False when the finding was
+        refused -- so a caller, and the conformance adapter, can tell the two
+        apart. The refusals mirror C's guards 2-4 in the same order.
+        """
+        key = str(peer_uuid)
+        # GUARD: the authority must be known, and the app may NOT speak as the
+        # credential authority -- it cannot know what ZTA proved, and per-source
+        # ceilings would let a forged `proved` clear a real certificate bound.
+        src = standing_source_or_default(source)
+        if not standing_source_valid(src) or src == STANDING_SOURCE_ZTA:
+            self.logger.warning(
+                'peer standing for %s refused: %r is not an authority the app '
+                'may speak for', key[:8], src)
+            return False
+        if standing not in STANDINGS:
+            self.logger.warning(
+                'peer standing for %s refused: unknown standing %r',
+                key[:8], standing)
+            return False
+        # GUARD: a ceiling outside [0, 1] is not a bound on this scale. None,
+        # and any negative, mean "no bound" -- what a reinstatement carries.
+        if ceiling is not None:
+            ceiling = float(ceiling)
+            if ceiling < 0.0:
+                ceiling = None
+            elif ceiling > 1.0:
+                self.logger.warning(
+                    'peer standing for %s refused: ceiling %.3f is off the '
+                    '[0, 1] scale', key[:8], ceiling)
+                return False
+        # GUARD: a bound on somebody never admitted bounds nothing.
+        if not any(str(getattr(p, 'uuid', '')) == key for p in self.peers.all):
+            self.logger.warning(
+                'peer standing for %s refused: not an admitted peer', key[:8])
+            return False
+        try:
+            self.update(PeerStanding(peer_uuid, standing, ceiling, None,
+                                     reason, src), queues)
+        except Exception as err:
+            self.logger.warning(
+                'Could not propagate %s standing for %s (ceiling %s): %s',
+                src, key[:8], ceiling, err)
+            return False
+        self.logger.info('%s standing for %s -> %s (ceiling %s): %s',
+                         src, key[:8], standing, ceiling, reason)
+        return True
+
+    def _persist_social_blocks(self, cfg_dir=None):
+        """Write the block set to ``etc/at/social.cfg.json`` (Phase 4 P4.1).
+
+        On every mutation, not at shutdown, matching C: a block that survives
+        only a graceful stop is not much of a block. Failure is logged, never
+        raised -- losing durability must not take moderation itself down, and
+        the operator needs to know the file is not being written rather than
+        discovering it after a restart.
+        """
+        try:
+            from ..config.configuration import Configuration
+            social_store_save(
+                dict(self.social_blocks),
+                cfg_dir if cfg_dir is not None else Configuration.get_cfg_dir())
+            return True
+        except (OSError, IOError, ValueError) as err:
+            self.logger.warning('Could not persist social blocks: %s', err)
+            return False
+
+    def load_social_blocks(self, cfg_dir=None):
+        """Restore the block set from disk. Twin of the C load at identity
+        start-up, which runs BEFORE the node takes traffic: a block that only
+        took effect once the app reconnected would leave a window in which the
+        blocked peer's messages land."""
+        try:
+            from ..config.configuration import Configuration
+            restored = social_store_load(
+                cfg_dir if cfg_dir is not None else Configuration.get_cfg_dir())
+        except (OSError, IOError, ValueError) as err:
+            self.logger.warning(
+                'social blocks unreadable (%s) — starting with NO blocks; the '
+                'operator\'s moderation state is gone, not partially applied',
+                err)
+            return 0
+        with self.lock:
+            self.social_blocks = dict(restored)
+            return len(self.social_blocks)
+
+    def reload_social_blocks(self, cfg_dir=None):
+        """Save the block set and load it back -- the round trip a restart
+        performs, without needing one. Twin of C
+        ``identity_reload_social_blocks``. A test that checked only the
+        in-memory dict would pass with no file written at all.
+
+        `cfg_dir` is where to write; None means the process's own config
+        directory. A conformance step passes a writable temp dir, because the
+        harness's default root may not be writable -- without which this seam
+        would prove nothing while appearing to pass.
+
+        IF THE SAVE FAILED, DO NOT LOAD. `social_store_load` REPLACES the set,
+        so a failed write followed by a read of the file that is not there would
+        empty it -- turning an unwritable config directory into a silent mass
+        unblock.
+        """
+        if not self._persist_social_blocks(cfg_dir):
+            return len(self.social_blocks)
+        return self.load_social_blocks(cfg_dir)
+
+    def unblock_peer(self, uuid_str):
+        """Lift a local block (Phase 4 P4.1). Twin of C ``identity_unblock_peer``
+        / ``handle_app_unblock``.
+
+        A DISCARD, not a second flag: "blocked" IS membership of the set, so
+        the record and the predicate cannot disagree and re-blocking is
+        idempotent. The peer is told nothing, exactly as they were told nothing
+        about the block. What they sent while blocked is gone — the inbound
+        gates dropped it rather than queueing it — so an unblock restores reach
+        going forward and does not replay the silence.
+        """
+        with self.lock:
+            self.social_blocks.pop(str(uuid_str), None)
+        self._persist_social_blocks()
+
+    def is_blocked(self, uuid_str):
+        """Conformance/observability read-back. Twin of C
+        ``identity_is_blocked``."""
+        with self.lock:
+            return self._is_blocked_locked(uuid_str)
+
+    def _is_blocked_locked(self, uuid_str):
+        """THE one place that reads social_blocks (Phase 4 P4.1). THE CALLER
+        MUST HOLD ``self.lock``. Twin of C ``_is_blocked_locked``.
+
+        Until P4.1 the block was read only by ``get_peer_tier``, and that clamp
+        was mistaken for the whole of what a block does. It is not: a block is
+        a REFUSAL and a tier is a MEASUREMENT, and the clamp expresses the
+        refusal only where a tier floor happens to be above zero -- which is
+        why a blocked peer's PUBLIC posts (floor 0), DMs (no floor at all) and
+        reactions all sailed through on both runtimes.
+        """
+        return str(uuid_str) in self.social_blocks
+
+    def _is_blocked(self, uuid_str):
+        """Lock-taking wrapper, for handlers that hold nothing.
+
+        The split is not decoration: ``self.lock`` is a plain
+        ``threading.Lock``, NOT an RLock, and the accrual helpers run with it
+        already held (see the section comment above ``_social_edge``). Calling
+        the wrapper from there would deadlock the identity process outright.
+        Mirrors the same split in C.
+        """
+        with self.lock:
+            return self._is_blocked_locked(uuid_str)
 
     def get_peer_tier(self, uuid):
         """This node's local-view trust tier for peer ``uuid``, CLAMPED to 0 if
@@ -4372,7 +4762,7 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         block clamps the same way on both runtimes."""
         key = str(uuid)
         with self.lock:
-            if key in self.social_blocks:
+            if self._is_blocked_locked(key):
                 return 0
             for peer in self.peers.all:
                 if str(getattr(peer, 'uuid', '')) == key:
@@ -4401,6 +4791,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                                          IdentityProtocol.reaction, seq):
                 self.logger.debug('peer_reaction from %s refused (replay)',
                                   str(getattr(sender, 'uuid', ''))[:8])
+                return True
+            # A blocked peer cannot reach us (Phase 4 P4.1). DROPPED after the
+            # freshness window advances, for the reason handle_dm gives. This
+            # path ACCRUED REPUTATION for a blocked peer before P4.1. Twin of C
+            # handle_reaction's gate.
+            if self._is_blocked(sender.uuid):
+                self.logger.debug(
+                    'peer_reaction from %s dropped (locally blocked)',
+                    str(sender.uuid)[:8])
                 return True
             with self.lock:
                 self._social_accrue_reaction(self.identity.uuid, sender.uuid,
@@ -4500,6 +4899,24 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 self._seen_post_ids.append(pid)
                 if len(self._seen_post_ids) > 256:
                     self._seen_post_ids.pop(0)
+                # A blocked author's post is HIDDEN (Phase 4 P4.1): recorded in
+                # the dedup ring above, but never stored for the app.
+                #
+                # THE TIER-GATE ABOVE CANNOT DO THIS, which is the defect this
+                # increment is named for: a PUBLIC post declares tier 0, a
+                # blocked peer clamps to tier 0, and 0 < 0 is false -- so every
+                # public post from a blocked peer arrived, on both runtimes.
+                # A block is a REFUSAL, not a low measurement.
+                #
+                # The LOCKED predicate: self.lock is held here. Twin of C
+                # handle_post's gate. (C additionally keeps relaying the post;
+                # Python does not gossip-forward at all, so there is nothing
+                # here to keep.)
+                if self._is_blocked_locked(str(author)):
+                    self.logger.debug(
+                        'peer_post %s from %s hidden (locally blocked)',
+                        pid, str(author)[:8])
+                    return True
                 self.last_post[str(author)] = {
                     'post_id': pid,
                     'seq': int(seq),
@@ -5153,6 +5570,16 @@ class IdentityProcess(Process, metaclass=ProcMeta,
             return False
         sender = getattr(message, 'from_whom', None)
         if sender is None:
+            return True
+        # A blocked peer cannot ask us to co-sign (Phase 4 P4.1). DROPPED at the
+        # top: the ask lands in front of a person as a decision to make.
+        # Blocking is not a governance act -- this says nothing about whether
+        # the record is valid or whether this node is a required signer, only
+        # that THIS person will not be asked by THAT one. Twin of C.
+        if self._is_blocked(getattr(sender, 'uuid', None)):
+            self.logger.debug(
+                'peer_cosign_request from %s dropped (locally blocked)',
+                str(getattr(sender, 'uuid', ''))[:8])
             return True
         try:
             from ..capabilities import cosign_request_from_json

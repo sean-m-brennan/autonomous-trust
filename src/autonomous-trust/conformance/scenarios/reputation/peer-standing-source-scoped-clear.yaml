@@ -1,0 +1,80 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: peer-standing-source-scoped-clear
+byte_pinning: false
+description: |
+    One authority reinstating a peer does NOT lift another authority's ceiling
+    (Phase 4 P4.1).
+
+    The other half of peer-standing-min-over-sources, and the more dangerous
+    half: a design that clears ceilings by peer rather than by (peer, source)
+    does not merely report a wrong number, it quietly restores an unbounded
+    score to someone two authorities had bounded. That is the failure mode worth
+    a scenario of its own.
+
+    Three findings are installed in order:
+
+      1. `zta` caps rogue at 0.15 -- its credential was never proved.
+      2. `ethne` fails rogue at 0.20 -- the polity expelled it.
+      3. `ethne` proves rogue -- the polity readmitted it.
+
+    After (3) the polity has no complaint, so Ethne's bound lifts. ZTA's does
+    not: a community readmitting someone says nothing about their credential.
+    The effective ceiling is therefore still 0.15.
+
+    An implementation that keys ceilings by peer alone clears everything at step
+    (3) and reports rogue's full 0.9 here. That is the assertion's whole point,
+    so the expected value is deliberately the ZTA ceiling and not the score the
+    ordinary algebra would produce.
+
+    `proved` is also how an app-driven reinstatement arrives, which is what
+    makes "revocation as a reputation event, not a hard cut"
+    (SOCIAL_APP_PLAN.md:481) true in both directions: the same authority that
+    levied a bound can lift it, and lifts only its own.
+
+    Runs in EVERY build, with no AT_ZTA and no CONFORMANCE_SOCIAL.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: oracle
+  - id: rogue
+    role: subject
+
+fixtures:
+  reputations:
+    bob:
+      rogue: 0.9
+  peer_standing:
+    bob:
+      rogue:
+        - source: zta
+          status: capped
+          ceiling: 0.15
+          reason: DDIL fallback
+        - source: ethne
+          status: failed
+          ceiling: 0.20
+          reason: expelled from the polity
+        - source: ethne
+          status: proved
+          reason: readmitted to the polity
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: request reputation
+    payload:
+      target: rogue
+      proc: negotiation
+    description: |
+        alice asks bob for rogue's reputation after the polity has readmitted
+        it. Ethne's bound is gone; ZTA's remains, so bob still answers 0.15.
+
+expected_state:
+  bob:
+    reputation_of:
+      rogue: 0.15

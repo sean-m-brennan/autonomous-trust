@@ -1,0 +1,86 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: first-person-channel-carried
+byte_pinning: false
+description: |
+    The `first_person` channel (Agora Phase 4 P4.1) rides the Paxos round-2
+    wire and is in the closed set on BOTH runtimes.
+
+    `first_person` is one node's own account of an interaction it was party
+    to: the person operating the node says the exchange went badly, and that
+    is the whole warrant. It is the weakest evidence in the set (weight 1)
+    and it is what a moderation report will carry once S9 gives it a
+    producer. Before that producer exists, the thing worth pinning across
+    languages is the spelling: a channel one twin accepts and the other
+    drops is a report that commits on one side of the wire and silently
+    vanishes on the other.
+
+    A copy of `transaction-channel-carried` with the spelling changed and
+    nothing else, so any divergence it reports is attributable to the new
+    channel. Everything that scenario says about why a channel arriving
+    FROM A PEER changes nothing on the receiving side holds here unchanged.
+
+    The score is 0.15 — AT_SOCIAL_REPORT_SCORE, the value a report will
+    carry — so the vector exercises the range a real `first_person` score
+    lives in, not a passing score.
+
+    Unit-pinned on both sides rather than here, for the reasons the sibling
+    scenario gives (both negative runners implement only `flip_byte`):
+      - The REFUSAL of near-miss spellings `First_Person` and
+        `first-person` — `tests/a_unit/test_reputation.py`
+        (`test_unknown_is_refused_not_coerced`) and
+        `src/c/test/reputation3_test.c`
+        (`test_tx_channel_refuses_unknown_spellings`).
+      - The weight of 1 — `test_first_person_is_the_weakest_evidence` and
+        `test_tx_channel_weights_match_the_python_twin`. C reaches it by the
+        fall-through in `tx_channel_weight`, Python by a written dict entry.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+
+fixtures:
+  requests:
+    bob:
+      - [1000, 1]
+  my_requests:
+    alice:
+      - id1: 1000
+        id2: 1
+        task_id: t-1
+        score: 0.15
+        channel: first_person
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: transaction
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+      task_id: t-1
+      score: 0.15
+      channel: first_person
+    description: |
+        alice proposes a low score tagged as her own first-person account.
+        bob must accept the proposal: the spelling is in the closed set on
+        both runtimes, and on the receiving side a channel is carried, not
+        acted on.
+
+  - id: 2
+    from: bob
+    to: alice
+    function: tx accepted
+    in_response_to: 1
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+    description: |
+        Round commits unchanged, exactly as for `physical` in
+        `transaction-channel-carried`.

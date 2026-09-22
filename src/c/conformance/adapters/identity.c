@@ -229,9 +229,13 @@ static int _send_hook(const char *key,
      * it can be re-delivered to the other side — captured (from,to,function)
      * alone cannot carry it (see g_prox_capture). Keep only the LATEST proximity
      * emission; the trip consumes each before the next is produced. */
+    /* The same capture carries a report's {seq, ts} to the reported side
+     * (trigger_report): its seq is the reporter's freshness stamp, chosen at
+     * run time, so it too cannot come from the scenario. */
     if (g_prox_capture && type == NET_MESSAGE
         && (strcmp(function, "peer_proximity_probe") == 0
-            || strcmp(function, "peer_proximity_reply") == 0)) {
+            || strcmp(function, "peer_proximity_reply") == 0
+            || strcmp(function, "peer_report") == 0)) {
         _prox_capture_reset();
         size_t n = msg->info.net_msg.len;
         if (msg->info.net_msg.obj != NULL && n > 0) {
@@ -606,6 +610,88 @@ static int _ic_run_proximity_probe(sce_run_ctx_t *ctx, ic_impl_t *initiator,
     }
 
     g_prox_capture = false;
+    _prox_capture_reset();
+    return 0;
+}
+
+/* One report (Phase 4 P4.1), end to end: drive the REAL AT_APP_REPORT_PEER
+ * handler on the reporter, then hand the peer_report it emitted to the reported
+ * side's real handle_peer_report. The frame's seq is the reporter's freshness
+ * stamp, chosen at run time, so the payload is grabbed by _send_hook (the
+ * proximity capture) rather than built from the scenario.
+ *
+ * id_state is a SINGLETON here, so both participants' staged records land in
+ * one map — keyed by SUBJECT uuid, which is what keeps the reporter's record
+ * (about the target) and the target's (about the reporter) apart. The report
+ * ledger is keyed the same way. A refused report emits nothing, so nothing is
+ * delivered. Mirrors the Python adapter's _TRIGGER_REPORT. */
+static int _ic_run_report(sce_run_ctx_t *ctx, ic_impl_t *reporter,
+                          ic_impl_t *target) {
+    /* handle_app_report_peer resolves the target from the reporter's peer
+     * list; the C adapter does not cross-populate rosters (see
+     * _ic_run_proximity_probe), so make sure it is there. Idempotent. */
+    {
+        process_t *p = reporter->proc;
+        bool have = false;
+        peers_read_lock(p);
+        for (size_t i = 0; i < p->protocol.num_peers; i++) {
+            if (uuid_compare(p->protocol.peers[i].uuid, target->pub->uuid) == 0) {
+                have = true;
+                break;
+            }
+        }
+        peers_read_unlock(p);
+        if (!have) {
+            peers_write_lock(p);
+            if (p->protocol.num_peers < DEFAULT_MAX_PEERS) {
+                memcpy(&p->protocol.peers[p->protocol.num_peers],
+                       target->pub, sizeof(public_identity_t));
+                p->protocol.num_peers++;
+            }
+            peers_write_unlock(p);
+        }
+    }
+    char targ_uuid[UUID_STRING_LEN + 1];
+    _ic_uuid_str(target, targ_uuid);
+
+    g_prox_capture = true;
+    _prox_capture_reset();
+    at_strlcpy(ctx->current_dispatcher, reporter->id,
+               sizeof(ctx->current_dispatcher));
+    {
+        json_t *p = json_object();
+        json_object_set_new(p, "peer", json_string(targ_uuid));
+        generic_msg_t m = {0};
+        m.type = NET_MESSAGE;
+        strncpy(m.info.net_msg.process, "identity", PROC_NAME_LEN);
+        m.info.net_msg.function = (char *)AT_APP_REPORT_PEER;
+        net_msg_pack_json(&m.info.net_msg, p);
+        json_decref(p);
+        run_message_handlers(reporter->proc, NULL, NET_MESSAGE, &m);
+        if (m.info.net_msg.obj != NULL) smrt_deref(m.info.net_msg.obj);
+    }
+    if (!g_prox_have || strcmp(g_prox_fn, "peer_report") != 0) {
+        g_prox_capture = false;      /* refused: nothing went, nothing to pair */
+        _prox_capture_reset();
+        return 0;
+    }
+    uint8_t *obj = g_prox_obj;
+    size_t len = g_prox_len;
+    g_prox_obj = NULL; g_prox_len = 0; g_prox_have = false;
+    g_prox_capture = false;
+
+    at_strlcpy(ctx->current_dispatcher, target->id,
+               sizeof(ctx->current_dispatcher));
+    generic_msg_t m = {0};
+    m.type = NET_MESSAGE;
+    strncpy(m.info.net_msg.process, "identity", PROC_NAME_LEN);
+    m.info.net_msg.function = (char *)"peer_report";
+    memcpy(&m.info.net_msg.from_whom, reporter->pub, sizeof(public_identity_t));
+    memcpy(&m.info.net_msg.to_whom, target->pub, sizeof(public_identity_t));
+    m.info.net_msg.obj = obj;
+    m.info.net_msg.len = len;
+    run_message_handlers(target->proc, NULL, NET_MESSAGE, &m);
+    free(obj);
     _prox_capture_reset();
     return 0;
 }
@@ -1595,7 +1681,9 @@ static int _build_inbound(sce_run_ctx_t *ctx,
      * blanking it for the others. */
     if ((strcmp(function, "trigger_cohort_join") == 0
          || strcmp(function, "trigger_first_contact_initiate") == 0
-         || strcmp(function, "trigger_block") == 0)
+         || strcmp(function, "trigger_block") == 0
+         || strcmp(function, "trigger_unblock") == 0
+         || strcmp(function, "trigger_report") == 0)
         && json_is_object(payload)) {
         json_t *body = json_deep_copy(payload);
         if (body != NULL) {
@@ -1945,6 +2033,22 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_object_set_new(body, "post_id",
                             json_string(json_is_string(jpid)
                                         ? json_string_value(jpid) : ""));
+        json_object_set_new(body, "ts",
+                            json_real(json_is_number(jts)
+                                      ? json_number_value(jts) : 0.0));
+        _ic_set_seq(body, payload);
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+        return 0;
+    }
+
+    /* peer_report — pack {seq, ts} and nothing else (Phase 4 P4.1). No
+     * signature: crypto_box authenticates the reporter on the wire (in the
+     * harness the from_whom identity stands in). `unstamped: true` drops the
+     * seq via _ic_set_seq. Mirrors the Python peer_report builder. */
+    if (strcmp(function, "peer_report") == 0 && json_is_object(payload)) {
+        json_t *body = json_object();
+        json_t *jts = json_object_get(payload, "ts");
         json_object_set_new(body, "ts",
                             json_real(json_is_number(jts)
                                       ? json_number_value(jts) : 0.0));
@@ -2791,6 +2895,28 @@ static int _dispatch(sce_run_ctx_t *ctx,
     }
     if (inbound->type == NET_MESSAGE
         && inbound->info.net_msg.function != NULL
+        && strcmp(inbound->info.net_msg.function, "trigger_report") == 0) {
+        /* Pseudo-function: `impl` is the REPORTER; the payload names the
+         * reported participant ({"peer": <pid>}). Mirrors the Python adapter's
+         * _TRIGGER_REPORT — see _ic_run_report. */
+        json_t *jp = NULL;
+        const char *peer_pid = NULL;
+        sce_participant_t *tp = NULL;
+        if (net_msg_unpack_json(&inbound->info.net_msg, &jp) == 0 && jp != NULL) {
+            peer_pid = json_string_value(json_object_get(jp, "peer"));
+            tp = peer_pid != NULL ? sce_find_participant(ctx, peer_pid) : NULL;
+        }
+        if (tp == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err), "trigger_report: unknown peer %s",
+                     peer_pid != NULL ? peer_pid : "(none)");
+            if (jp != NULL) json_decref(jp);
+            return -1;
+        }
+        json_decref(jp);
+        return _ic_run_report(ctx, impl, (ic_impl_t *)tp->impl);
+    }
+    if (inbound->type == NET_MESSAGE
+        && inbound->info.net_msg.function != NULL
         && strcmp(inbound->info.net_msg.function, "trigger_block") == 0) {
         /* Pseudo-function: locally block the peer the step names ({"peer":
          * <pid>}). Block is an app verb, not a wire message, so there is nothing
@@ -2810,6 +2936,49 @@ static int _dispatch(sce_run_ctx_t *ctx,
                 uuid_unparse_lower(((ic_impl_t *)tp->impl)->pub->uuid,
                                    uuid_str);
                 identity_block_peer(uuid_str);
+            }
+            json_decref(jp);
+        }
+        return 0;
+    }
+    if (inbound->type == NET_MESSAGE
+        && inbound->info.net_msg.function != NULL
+        && strcmp(inbound->info.net_msg.function,
+                  "trigger_social_reload") == 0) {
+        /* Pseudo-function: save the block set and load it back — the round trip
+         * a restart performs, without needing one. A conformance step cannot
+         * restart a process, and asserting on the in-memory map alone would
+         * pass with no file written at all. Mirrors the Python adapter's
+         * _TRIGGER_SOCIAL_RELOAD. */
+        /* A WRITABLE dir, explicitly. This harness's default config root is
+         * /etc/at and nothing may be written there (the same reason the
+         * reputation snapshot warns on every run), so a reload that could not
+         * write would be a no-op that PASSED — proving nothing while looking
+         * green. Same shape as the Python adapter's tempfile.mkdtemp. */
+        char reload_dir[] = "/tmp/at-conf-social-XXXXXX";
+        if (mkdtemp(reload_dir) != NULL)
+            identity_reload_social_blocks(reload_dir);
+        return 0;
+    }
+    if (inbound->type == NET_MESSAGE
+        && inbound->info.net_msg.function != NULL
+        && strcmp(inbound->info.net_msg.function, "trigger_unblock") == 0) {
+        /* Pseudo-function: lift the block on the peer the step names ({"peer":
+         * <pid>}). Unblock is an app verb, not a wire message, so there is
+         * nothing to dispatch — call the identity_unblock_peer seam directly.
+         * Mirrors the Python adapter's _TRIGGER_UNBLOCK. */
+        json_t *jp = NULL;
+        if (net_msg_unpack_json(&inbound->info.net_msg, &jp) == 0
+            && jp != NULL) {
+            const char *peer_pid =
+                json_string_value(json_object_get(jp, "peer"));
+            sce_participant_t *tp = peer_pid != NULL
+                ? sce_find_participant(ctx, peer_pid) : NULL;
+            if (tp != NULL) {
+                char uuid_str[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(((ic_impl_t *)tp->impl)->pub->uuid,
+                                   uuid_str);
+                identity_unblock_peer(uuid_str);
             }
             json_decref(jp);
         }
@@ -3455,11 +3624,12 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                     return -1;
                 }
             } else if (strcmp(key, "dm_last") == 0) {
-                /* {peer_id: {seq, text}} (Increment 6) — the most-recent DM this
-                 * participant received from another, via identity_get_last_dm.
-                 * An absent DM (never delivered, or dropped by the replay gate)
-                 * fails the presence check. Mirrors the Python adapter's dm_last,
-                 * keyed by the same lowercased uuid. */
+                /* {peer_id: {seq, text} | {absent: true}} (Increment 6) — the
+                 * most-recent DM this participant received from another, via
+                 * identity_get_last_dm. `absent: true` asserts that NO DM is
+                 * held, which a DM dropped at the block gate produces (Phase 4
+                 * P4.1); an unexpectedly absent DM still fails. Mirrors the
+                 * Python adapter's dm_last, keyed by the same lowercased uuid. */
                 const char *dm_pid;
                 json_t *dm_want;
                 json_object_foreach(val, dm_pid, dm_want) {
@@ -3478,6 +3648,16 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                     int64_t got_seq = 0;
                     bool have = identity_get_last_dm(want_uuid, got_text,
                                                      sizeof(got_text), &got_seq);
+                    json_t *j_absent = json_object_get(dm_want, "absent");
+                    if (json_is_true(j_absent)) {
+                        if (have) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: dm_last[%s] present (text=%.60s), "
+                                     "expected ABSENT", pid, dm_pid, got_text);
+                            return -1;
+                        }
+                        continue;
+                    }
                     if (!have) {
                         snprintf(ctx->err, sizeof(ctx->err),
                                  "%s: dm_last[%s] absent, expected a DM", pid,
@@ -3774,6 +3954,66 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                             snprintf(ctx->err, sizeof(ctx->err),
                                      "%s: social_tx_last[%s].score=%.6f, expected "
                                      "%.6f", pid, stx_pid, got_score, want_score);
+                            return -1;
+                        }
+                    }
+                    /* channel / n (Phase 4 P4.1): which evidence channel the
+                     * score was staged on, and how many were staged about this
+                     * subject in all — what tells a capped second report from a
+                     * first. Mirrors the Python adapter's generic field check. */
+                    char got_ch[TX_CHANNEL_NAMELEN + 1] = {0};
+                    int got_n = 0;
+                    identity_get_social_tx_detail(want_uuid, got_ch,
+                                                  sizeof(got_ch), &got_n);
+                    json_t *jch = json_object_get(stx_want, "channel");
+                    if (json_is_string(jch)
+                        && strcmp(got_ch, json_string_value(jch)) != 0) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: social_tx_last[%s].channel=%s, expected %s",
+                                 pid, stx_pid, got_ch, json_string_value(jch));
+                        return -1;
+                    }
+                    json_t *jn = json_object_get(stx_want, "n");
+                    if (json_is_integer(jn) && got_n != (int)json_integer_value(jn)) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: social_tx_last[%s].n=%d, expected %lld",
+                                 pid, stx_pid, got_n,
+                                 (long long)json_integer_value(jn));
+                        return -1;
+                    }
+                    /* same_task_as {participant, subject}: our task must be the
+                     * one that participant staged about that subject — the two
+                     * halves of one transaction. id_state is shared, so the
+                     * other participant's record is read by its SUBJECT uuid;
+                     * the participant name is resolved only to fail loudly on a
+                     * typo. */
+                    json_t *jst = json_object_get(stx_want, "same_task_as");
+                    if (json_is_object(jst)) {
+                        const char *op = json_string_value(
+                            json_object_get(jst, "participant"));
+                        const char *os = json_string_value(
+                            json_object_get(jst, "subject"));
+                        sce_participant_t *opp = op != NULL
+                            ? sce_find_participant(ctx, op) : NULL;
+                        sce_participant_t *osp = os != NULL
+                            ? sce_find_participant(ctx, os) : NULL;
+                        if (opp == NULL || osp == NULL) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: same_task_as names an unknown participant",
+                                     pid);
+                            return -1;
+                        }
+                        char os_uuid[UUID_STR_LEN + 1];
+                        uuid_unparse_lower(((ic_impl_t *)osp->impl)->pub->uuid,
+                                           os_uuid);
+                        char their_task[UUID_STR_LEN + 1] = {0};
+                        if (!identity_get_last_social_tx(os_uuid, their_task, NULL)
+                            || strcmp(their_task, got_task) != 0) {
+                            snprintf(ctx->err, sizeof(ctx->err),
+                                     "%s: social_tx_last[%s].task=%s, but %s staged"
+                                     " %s about %s -- the halves would not pair",
+                                     pid, stx_pid, got_task, op,
+                                     their_task[0] ? their_task : "(none)", os);
                             return -1;
                         }
                     }
@@ -4790,12 +5030,16 @@ void at_identity_run(const at_case_t *c, at_case_result_t *out) {
                      strncmp(fn, "peer_dm", 7) == 0 ||
                      strncmp(fn, "peer_post", 9) == 0 ||
                      strncmp(fn, "peer_reaction", 13) == 0 ||
+                     strncmp(fn, "peer_report", 11) == 0 ||
+                     strncmp(fn, "trigger_report", 14) == 0 ||
                      strncmp(fn, "peer_business_ad", 16) == 0 ||
                      strncmp(fn, "peer_business_post", 18) == 0 ||
                      strncmp(fn, "peer_cosign_request", 19) == 0 ||
                      strncmp(fn, "peer_cosign_sig", 15) == 0 ||
                      strncmp(fn, "trigger_advertise_business", 26) == 0 ||
-                     strncmp(fn, "trigger_block", 13) == 0)) {
+                     strncmp(fn, "trigger_block", 13) == 0 ||
+                     strncmp(fn, "trigger_unblock", 15) == 0 ||
+                     strncmp(fn, "trigger_social_reload", 21) == 0)) {
                     at_case_result_set_skip(
                         out, "agora scenario skipped: C built without AT_SOCIAL "
                              "(build -DAT_SOCIAL=ON to run it symmetrically)");

@@ -268,6 +268,9 @@ class StubProc:
         self.last_cosign_request = {}
         self.last_cosign_sig = {}
         self.exceptions = []
+        # Phase 4 P4.1: the co-sign handler now asks whether the asker is
+        # blocked, so the stub needs the state that question reads.
+        self.social_blocks = set()
 
     def report_exception(self, err, where):
         self.exceptions.append((where, err))
@@ -278,6 +281,29 @@ class StubProc:
     handle_cosign_sig = IdentityProcess.handle_cosign_sig
     get_last_cosign_request = IdentityProcess.get_last_cosign_request
     get_last_cosign_sig = IdentityProcess.get_last_cosign_sig
+    _is_blocked = IdentityProcess._is_blocked
+    _is_blocked_locked = IdentityProcess._is_blocked_locked
+
+
+def test_a_blocked_peer_cannot_ask_us_to_cosign(alice, bob):
+    """Phase 4 P4.1. A co-sign ask is directed and lands in front of a person
+    as a decision to make, so a blocked peer must not be able to place one.
+
+    This says nothing about whether the record is valid or whether this node is
+    a required signer -- both remain Ethne's questions, answered app-side. It
+    says only that THIS person will not be asked by THAT one."""
+    asker = StubProc(bob, [alice])
+    q = _queues()
+    asker.request_cosign(q, [str(alice.uuid)], 'membership', 'admit', DID, CID,
+                         BYTES_HEX)
+    raw = q[CfgIds.network].get_nowait().obj
+
+    signer = StubProc(alice, [bob])
+    signer.social_blocks.add(str(bob.uuid))
+    msg = _inbound(bob, raw, IdentityProtocol.cosign_request)
+    assert signer.handle_cosign_request({}, msg) is True
+    # Nothing recorded: the ask never reached the signer's surface.
+    assert signer.get_last_cosign_request(str(bob.uuid)) == {}
 
 
 @pytest.fixture

@@ -234,28 +234,30 @@ void reputation_install_coop_mode(const uuid_t peer_uuid, bool in_coop);
  *  -1 if uninitialized or @p peer_uuid is absent. */
 int reputation_get_peer_reputation(const uuid_t peer_uuid, double *out);
 
-#ifdef AT_ZTA_ENABLED
-/** Deliver one ZTA standing exactly as the process loop would
+/** Deliver one peer standing exactly as the process loop would
  * (doc/architecture/zta-integration.md), so a test or conformance step can exercise the
  * DDIL cap and the retroactive unwind without standing up the identity process.
  *
  * Worth reaching for deliberately: the defect this whole entry exists to fix was a
  * ZTA→reputation path that no test could see, so the seam is exposed rather than left
  * to an integration run nobody performs. Returns 0 when the standing was applied, -1 if
- * uninitialized. */
-int reputation_apply_zta_standing(const process_t *proc,
-                                  const zta_standing_msg_t *standing);
+ * uninitialized.
+ *
+ * NO LONGER UNDER #ifdef AT_ZTA_ENABLED (Phase 4 P4.1). ZTA was the first
+ * authority to need a ceiling, not the only one — an Ethne expulsion reaches
+ * this same seam on a build with ZTA off. */
+int reputation_apply_peer_standing(const process_t *proc,
+                                   const peer_standing_msg_t *standing);
 
 /** Read the ceiling currently bounding @p peer_uuid, for expected_state
  *  assertions. Returns 0 and writes @p out when one is set, -1 when the peer
  *  is unbounded (proved, or never spoken about). */
-int reputation_get_zta_ceiling(const uuid_t peer_uuid, double *out);
+int reputation_get_peer_ceiling(const uuid_t peer_uuid, double *out);
 
 /** The score a peer is unwound to when NO pre-verification evidence supports
  *  it — the unverified-restore tier's ceiling. Exposed so a test names the
  *  runtime's own bound instead of duplicating the tier arithmetic beside it. */
-double reputation_zta_unverified_ceiling(void);
-#endif
+double reputation_unverified_ceiling(void);
 
 /** Re-emit every peer's reputation on the app-facing carrier (PEER_REPUTATION
  *  via AT_MAIN_QUEUE) — the reputation half of the app's roster pull. Peers

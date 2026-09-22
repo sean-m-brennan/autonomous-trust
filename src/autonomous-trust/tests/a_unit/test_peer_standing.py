@@ -46,8 +46,9 @@ from autonomous_trust.core.reputation.reputation import TransactionHistory
 from autonomous_trust.core._python.identity.identity import Identity
 from autonomous_trust.core._python.identity.sign import Signature
 from autonomous_trust.core._python.identity.encrypt import Encryptor
-from autonomous_trust.core._python.identity.zta_standing import (
-    ZtaStanding, STANDING_PROVED, STANDING_CAPPED, STANDING_FAILED)
+from autonomous_trust.core._python.identity.peer_standing import (
+    PeerStanding, STANDING_PROVED, STANDING_CAPPED, STANDING_FAILED,
+    STANDING_SOURCE_ZTA, STANDING_SOURCE_ETHNE)
 from autonomous_trust.core.processes import ProcessTracker
 from autonomous_trust.core.system import CfgIds
 from autonomous_trust.core._python.identity.idprocess import IdentityProcess
@@ -96,13 +97,14 @@ def _make_rep_process(identity=None):
     return rp
 
 
-def _stand(rp, peer_uuid, status, ceiling=None, verified_at=None, reason='t'):
-    """Deliver one ZTA finding the way IdentityProcess does -- through
+def _stand(rp, peer_uuid, status, ceiling=None, verified_at=None, reason='t',
+           source=None):
+    """Deliver one authority finding the way IdentityProcess does -- through
     Protocol, not by poking reputation's private state, so the IPC hand-off is
-    part of what these tests cover."""
+    part of what these tests cover. `source` defaults to zta."""
     rp.protocol.run_message_handlers(
         {CfgIds.reputation: queue.Queue()},
-        ZtaStanding(peer_uuid, status, ceiling, verified_at, reason))
+        PeerStanding(peer_uuid, status, ceiling, verified_at, reason, source))
 
 
 def _supported(n, score=TX_SCORE):
@@ -121,18 +123,46 @@ class TestCarrier:
         """It crosses a process boundary, so this is a hard requirement, not a
         nicety -- an unpicklable carrier drops the ceiling silently."""
         import pickle
-        original = ZtaStanding(uuid4(), STANDING_CAPPED, 0.5, 1234.0, 'DDIL')
+        original = PeerStanding(uuid4(), STANDING_CAPPED, 0.5, 1234.0, 'DDIL')
         back = pickle.loads(pickle.dumps(original))
         assert (back.peer_uuid, back.status, back.ceiling, back.verified_at) \
             == (original.peer_uuid, STANDING_CAPPED, 0.5, 1234.0)
 
-    def test_protocol_records_it_per_peer(self):
+    def test_protocol_records_it_per_peer_and_source(self):
+        """Filed under "<peer>|<source>", not under the peer alone (P4.1).
+
+        Two authorities may bound the same peer for unrelated reasons, so a
+        single slot per peer would let whichever spoke last erase the other.
+        """
         rp = _make_rep_process()
         a, b = uuid4(), uuid4()
         _stand(rp, a, STANDING_CAPPED, CAP)
         _stand(rp, b, STANDING_PROVED, None, 10.0)
-        assert rp.protocol.zta_standing[str(a)].ceiling == CAP
-        assert rp.protocol.zta_standing[str(b)].ceiling is None
+        assert rp.protocol.peer_standing['%s|zta' % a].ceiling == CAP
+        assert rp.protocol.peer_standing['%s|zta' % b].ceiling is None
+        assert str(a) not in rp.protocol.peer_standing
+
+    def test_two_authorities_both_bind_and_the_strictest_wins(self):
+        """The reduction is MINIMUM over sources, and neither authority may
+        clear the other's finding -- a ZTA re-verification says nothing about
+        whether a community expelled the person holding the credential."""
+        rp = _make_rep_process()
+        peer = uuid4()
+        _stand(rp, peer, STANDING_CAPPED, 0.15)
+        _stand(rp, peer, STANDING_CAPPED, 0.20, source=STANDING_SOURCE_ETHNE)
+        # Different ceilings, stricter one first: last-write-wins would give 0.20.
+        assert rp._standing_ceiling(peer) == 0.15
+        # The polity readmits. ZTA's bound survives.
+        _stand(rp, peer, STANDING_PROVED, None, source=STANDING_SOURCE_ETHNE)
+        assert rp._standing_ceiling(peer) == 0.15
+
+    def test_an_unknown_authority_is_refused(self):
+        """A ceiling filed under a source nothing reduces over would bound
+        nobody while looking, in the map, exactly like one that did."""
+        rp = _make_rep_process()
+        peer = uuid4()
+        _stand(rp, peer, STANDING_CAPPED, 0.15, source='nonsense')
+        assert rp._standing_ceiling(peer) is None
 
     def test_a_later_verdict_replaces_an_earlier_one(self):
         """Re-verification must be able to lift a cap, or a peer that repairs
@@ -140,9 +170,9 @@ class TestCarrier:
         rp = _make_rep_process()
         peer = uuid4()
         _stand(rp, peer, STANDING_CAPPED, CAP)
-        assert rp._zta_ceiling(peer) == CAP
+        assert rp._standing_ceiling(peer) == CAP
         _stand(rp, peer, STANDING_PROVED, None, 10.0)
-        assert rp._zta_ceiling(peer) is None
+        assert rp._standing_ceiling(peer) is None
 
 
 # --- the cap actually binds -------------------------------------------------
@@ -152,7 +182,7 @@ class TestCeilingIsEnforced:
         rp = _make_rep_process()
         peer = uuid4()
         _stand(rp, peer, STANDING_CAPPED, CAP)
-        assert rp._apply_zta_ceiling(peer, 0.95) == CAP
+        assert rp._apply_standing_ceiling(peer, 0.95) == CAP
 
     def test_a_score_already_below_the_cap_is_untouched(self):
         """The cap is a ceiling, not an assignment: it must never RAISE a peer
@@ -160,13 +190,13 @@ class TestCeilingIsEnforced:
         rp = _make_rep_process()
         peer = uuid4()
         _stand(rp, peer, STANDING_CAPPED, CAP)
-        assert rp._apply_zta_ceiling(peer, 0.11) == 0.11
+        assert rp._apply_standing_ceiling(peer, 0.11) == 0.11
 
     def test_a_proved_peer_is_unbounded(self):
         rp = _make_rep_process()
         peer = uuid4()
         _stand(rp, peer, STANDING_PROVED, None, 10.0)
-        assert rp._apply_zta_ceiling(peer, 0.95) == 0.95
+        assert rp._apply_standing_ceiling(peer, 0.95) == 0.95
 
     def test_silence_does_not_bound_anyone(self):
         """A deployment that has not enabled ZTA is not bounded by it. This is
@@ -174,7 +204,7 @@ class TestCeilingIsEnforced:
         nothing at all when the policy is disabled rather than sending
         'proved'."""
         rp = _make_rep_process()
-        assert rp._apply_zta_ceiling(uuid4(), 0.95) == 0.95
+        assert rp._apply_standing_ceiling(uuid4(), 0.95) == 0.95
 
     def test_the_bound_lands_on_the_stored_score_not_just_the_report(self):
         """Enforced where the score is WRITTEN. A ceiling applied only at read
@@ -191,6 +221,26 @@ class TestCeilingIsEnforced:
         assert rp.reputations.current[peer] == CAP
 
 
+    def test_a_cap_republishes_the_tier_it_allows(self):
+        """A cap gates THE MOMENT IT LANDS (Phase 4 P4.1, found writing
+        moderation_cohort.sh). Identity's tier-gates read the tier reputation
+        last published; a capped standing used to publish nothing, so a tier-2
+        peer capped into tier 1 kept clearing tier-2 gates until its score next
+        happened to be recomputed. The stored score is left alone. Mirrors the
+        C twin's test_a_cap_republishes_the_tier_it_allows."""
+        rp = _make_rep_process()
+        peer = uuid4()
+        rp.reputations.update(peer, 0.70)                     # tier 2
+        rp._publish_tier_change = MagicMock()
+        _stand(rp, peer, STANDING_CAPPED, 0.55, source=STANDING_SOURCE_ETHNE)
+        rp._apply_peer_standings({})
+        rp._publish_tier_change.assert_called_once()
+        assert rp._publish_tier_change.call_args[0][2] == 0.55  # tier 1
+        assert rp.reputations.current[peer] == 0.70
+        rp._apply_peer_standings({})                           # restated: no-op
+        assert rp._publish_tier_change.call_count == 1
+
+
 # --- the unwind -------------------------------------------------------------
 
 class TestUnwind:
@@ -204,8 +254,8 @@ class TestUnwind:
             rp.history.update(tid, me, TX_SCORE)
             rp.history.update(tid, peer, TX_SCORE)
         _stand(rp, peer, STANDING_PROVED, None, 10.0)
-        rp._apply_zta_standings({})
-        anchor = rp._zta_proved_index[str(peer)]
+        rp._apply_peer_standings({})
+        anchor = rp._peer_proved_index['%s|zta' % peer]
         for i in range(n_after):
             tid = UUID(int=1000 + i)
             rp.history.update(tid, me, TX_SCORE)
@@ -229,7 +279,7 @@ class TestUnwind:
         peer = uuid4()
         anchor = self._with_history(rp, peer, n_before=2, n_after=8)
         # Judged on 2 transactions, not the 10 the chain now holds.
-        assert rp._zta_unwind_ceiling(peer, anchor) == pytest.approx(_supported(2))
+        assert rp._standing_unwind_ceiling(peer, anchor) == pytest.approx(_supported(2))
 
     def test_a_failure_unwinds_the_live_score(self):
         rp = _make_rep_process()
@@ -240,7 +290,7 @@ class TestUnwind:
         rp._publish_tier_change = MagicMock()
         rp._publish_reputation_change = MagicMock()
         _stand(rp, peer, STANDING_FAILED, reason='REVOKED')
-        rp._apply_zta_standings({})
+        rp._apply_peer_standings({})
         assert rp.reputations.current[peer] == pytest.approx(_supported(2))
         assert rp.reputations.current[peer] < 0.95
         # Demotion is the action -- the tier machinery is what reacts to it.
@@ -257,7 +307,7 @@ class TestUnwind:
         rp._publish_tier_change = MagicMock()
         rp._publish_reputation_change = MagicMock()
         _stand(rp, peer, STANDING_FAILED, reason='REVOKED')
-        rp._apply_zta_standings({})
+        rp._apply_peer_standings({})
         floor = rp._tier_ceiling(rp.UNVERIFIED_RESTORE_TIER)
         assert rp.reputations.current[peer] == floor
 
@@ -271,7 +321,7 @@ class TestUnwind:
         rp._persist_reputations = MagicMock()
         rp._publish_tier_change = MagicMock()
         _stand(rp, peer, STANDING_FAILED, reason='REVOKED')
-        rp._apply_zta_standings({})
+        rp._apply_peer_standings({})
         assert rp.reputations.current[peer] == 0.02
         assert not rp._publish_tier_change.called
 
@@ -287,10 +337,10 @@ class TestUnwind:
         rp._publish_tier_change = MagicMock()
         rp._publish_reputation_change = MagicMock()
         _stand(rp, peer, STANDING_FAILED, reason='REVOKED')
-        rp._apply_zta_standings({})
+        rp._apply_peer_standings({})
         first = rp.reputations.current[peer]
-        rp._apply_zta_standings({})
-        rp._apply_zta_standings({})
+        rp._apply_peer_standings({})
+        rp._apply_peer_standings({})
         assert rp.reputations.current[peer] == first
         assert rp._publish_tier_change.call_count == 1
 
@@ -303,7 +353,7 @@ class TestUnwind:
         peer = uuid4()
         rp.reputations.update(peer, 0.30)
         _stand(rp, peer, STANDING_CAPPED, CAP)
-        rp._apply_zta_standings({})
+        rp._apply_peer_standings({})
         assert rp.reputations.current[peer] == 0.30
 
     def test_a_failure_also_leaves_the_peer_bounded_going_forward(self):
@@ -318,8 +368,100 @@ class TestUnwind:
         rp._publish_tier_change = MagicMock()
         rp._publish_reputation_change = MagicMock()
         _stand(rp, peer, STANDING_FAILED, ceiling=CAP, reason='REVOKED')
-        rp._apply_zta_standings({})
-        assert rp._apply_zta_ceiling(peer, 0.95) == CAP
+        rp._apply_peer_standings({})
+        assert rp._apply_standing_ceiling(peer, 0.95) == CAP
+
+
+# --- the app hands the core an authority finding (Phase 4 P4.1) -------------
+
+class _StandingProc:
+    """Enough of IdentityProcess for apply_peer_standing: a peer roster, a
+    logger, and a capturing update(). Bound the same way _GateProc is, so the
+    REAL method runs rather than a reimplementation of it."""
+
+    def __init__(self, admitted=()):
+        self.sent = []
+        self.logger = MagicMock()
+        self.peers = SimpleNamespace(all=[SimpleNamespace(uuid=u)
+                                          for u in admitted])
+        self.update = lambda obj, queues: self.sent.append(obj)
+        self.apply_peer_standing = \
+            IdentityProcess.apply_peer_standing.__get__(self)
+
+
+class TestTheAppHandsUsAFinding:
+    """Twin of C peer_standing_verb_test.c. An Ethne expulsion is decided in
+    the app -- this process holds no Ethne -- so what is checked here is the
+    SHAPE of a finding, never its truth. Every refusal has a matching case in
+    the C suite, in the same order, because a fleet is only as strict as its
+    weaker runtime."""
+
+    def test_an_expulsion_becomes_a_ceiling(self):
+        """The control. A method that refused everything would satisfy all
+        four refusals below."""
+        peer = uuid4()
+        proc = _StandingProc([peer])
+        assert proc.apply_peer_standing({}, peer, STANDING_FAILED,
+                                        ceiling=0.20,
+                                        source=STANDING_SOURCE_ETHNE,
+                                        reason='expelled') is True
+        assert len(proc.sent) == 1
+        assert proc.sent[0].status == STANDING_FAILED
+        assert proc.sent[0].ceiling == 0.20
+        assert proc.sent[0].source == STANDING_SOURCE_ETHNE
+
+    def test_a_reinstatement_lifts_the_bound(self):
+        """'Not a hard cut' has to be true in both directions."""
+        peer = uuid4()
+        proc = _StandingProc([peer])
+        assert proc.apply_peer_standing({}, peer, STANDING_PROVED,
+                                        source=STANDING_SOURCE_ETHNE) is True
+        assert proc.sent[0].status == STANDING_PROVED
+        # None, not 0.0 -- a zero would floor the peer instead of freeing it.
+        assert proc.sent[0].ceiling is None
+
+    def test_the_app_may_not_speak_as_the_credential_authority(self):
+        """An app cannot know what ZTA proved, so letting it claim a ZTA
+        standing would let it forge a `proved` and clear a real certificate
+        ceiling. Per-source keying makes that a total bypass."""
+        peer = uuid4()
+        proc = _StandingProc([peer])
+        assert proc.apply_peer_standing({}, peer, STANDING_PROVED,
+                                        source=STANDING_SOURCE_ZTA) is False
+        assert proc.apply_peer_standing({}, peer, STANDING_FAILED,
+                                        ceiling=0.2,
+                                        source='nonsense') is False
+        assert proc.sent == []
+
+    def test_an_off_scale_ceiling_is_refused(self):
+        """Above 1.0 is not a bound on this scale. BELOW zero is not an error
+        -- it is 'no bound' -- so only the high side is refused."""
+        peer = uuid4()
+        proc = _StandingProc([peer])
+        assert proc.apply_peer_standing({}, peer, STANDING_FAILED,
+                                        ceiling=1.5,
+                                        source=STANDING_SOURCE_ETHNE) is False
+        assert proc.sent == []
+        assert proc.apply_peer_standing({}, peer, STANDING_FAILED,
+                                        ceiling=-1.0,
+                                        source=STANDING_SOURCE_ETHNE) is True
+        assert proc.sent[0].ceiling is None
+
+    def test_a_finding_about_a_stranger_is_refused(self):
+        """A bound on somebody never admitted bounds nothing, and is far
+        likelier a mistake than a decision."""
+        proc = _StandingProc([])          # nobody admitted
+        assert proc.apply_peer_standing({}, uuid4(), STANDING_FAILED,
+                                        ceiling=0.20,
+                                        source=STANDING_SOURCE_ETHNE) is False
+        assert proc.sent == []
+
+    def test_an_unknown_standing_is_refused(self):
+        peer = uuid4()
+        proc = _StandingProc([peer])
+        assert proc.apply_peer_standing({}, peer, 'banished', ceiling=0.2,
+                                        source=STANDING_SOURCE_ETHNE) is False
+        assert proc.sent == []
 
 
 # --- what IdentityProcess actually publishes --------------------------------

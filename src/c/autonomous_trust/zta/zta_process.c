@@ -128,21 +128,26 @@ static struct {
  */
 /* Frama-C: skipped — [solver-timeout] logging/network preconditions */
 static void _send_zta_standing(process_t *proc, const uuid_t peer_uuid,
-                               zta_standing_t standing, double ceiling,
+                               peer_standing_t standing, double ceiling,
                                const char *reason, logger_t *logger)
 {
     (void)proc;
     generic_msg_t msg;
     memset(&msg, 0, sizeof(msg));
-    msg.type = ZTA_STANDING;
-    msg.size = sizeof(zta_standing_msg_t);
-    memcpy(msg.info.zta_standing.peer_uuid, peer_uuid, sizeof(uuid_t));
-    msg.info.zta_standing.standing = (int32_t)standing;
-    msg.info.zta_standing.ceiling = ceiling;
-    at_strlcpy(msg.info.zta_standing.reason, reason ? reason : "",
-               sizeof(msg.info.zta_standing.reason));
+    msg.type = PEER_STANDING;
+    msg.size = sizeof(peer_standing_msg_t);
+    memcpy(msg.info.peer_standing.peer_uuid, peer_uuid, sizeof(uuid_t));
+    msg.info.peer_standing.standing = (int32_t)standing;
+    msg.info.peer_standing.ceiling = ceiling;
+    at_strlcpy(msg.info.peer_standing.reason, reason ? reason : "",
+               sizeof(msg.info.peer_standing.reason));
+    /* Name the authority. Ceilings are kept per (peer, source) and reduced by
+     * minimum, so a ZTA verdict bounds a peer WITHOUT lifting a bound some
+     * other authority placed on the same peer. */
+    at_strlcpy(msg.info.peer_standing.source, PEER_STANDING_SOURCE_ZTA,
+               sizeof(msg.info.peer_standing.source));
 
-    messaging_send("reputation", ZTA_STANDING, &msg, false);
+    messaging_send("reputation", PEER_STANDING, &msg, false);
 
     char uuid_str[37];
     uuid_unparse_lower(peer_uuid, uuid_str);
@@ -164,7 +169,7 @@ static void _send_reputation_penalty(process_t *proc, const uuid_t peer_uuid,
     double ceiling = 1.0 - penalty;
     if (ceiling < 0.0) ceiling = 0.0;
     if (ceiling > 1.0) ceiling = 1.0;
-    _send_zta_standing(proc, peer_uuid, ZTA_STANDING_FAILED, ceiling,
+    _send_zta_standing(proc, peer_uuid, PEER_STANDING_FAILED, ceiling,
                        "credential verification failed", logger);
 }
 
@@ -588,8 +593,8 @@ static void _reverify_peers(process_t *proc, logger_t *logger)
              * not reach back past this point. Also lifts any ceiling the peer
              * was under, which is what lets a DDIL admission recover once the
              * infrastructure returns. Mirrors the Python sweep. */
-            _send_zta_standing(proc, peer->uuid, ZTA_STANDING_PROVED,
-                               ZTA_NO_CEILING, "re-verified", logger);
+            _send_zta_standing(proc, peer->uuid, PEER_STANDING_PROVED,
+                               PEER_NO_CEILING, "re-verified", logger);
             /* Share result so DDIL peers can use it for delegated verification */
             _broadcast_verification(proc, peer->uuid, &result, logger);
             break;
@@ -668,8 +673,8 @@ static void _resolve_deferred(process_t *proc, logger_t *logger)
              * admitted under and anchor the unwind here (doc/architecture/zta-integration.md). Until the cap
              * was actually enforced there was nothing for this branch to lift,
              * which is why it only logged. */
-            _send_zta_standing(proc, entry.peer_uuid, ZTA_STANDING_PROVED,
-                               ZTA_NO_CEILING, "deferred verification resolved",
+            _send_zta_standing(proc, entry.peer_uuid, PEER_STANDING_PROVED,
+                               PEER_NO_CEILING, "deferred verification resolved",
                                logger);
         } else {
             log_warn(logger, "ZTA: deferred verification resolved for peer %s: %s - %s\n",

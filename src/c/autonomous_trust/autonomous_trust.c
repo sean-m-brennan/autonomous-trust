@@ -156,11 +156,14 @@ int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
             return 0;
         }
         if (fn != NULL && (strcmp(fn, AT_APP_REACT_POST) == 0
-                           || strcmp(fn, AT_APP_BLOCK) == 0))
+                           || strcmp(fn, AT_APP_BLOCK) == 0
+                           || strcmp(fn, AT_APP_UNBLOCK) == 0
+                           || strcmp(fn, AT_APP_REPORT_PEER) == 0))
         {
-            /* Reaction / local block (Increment 8): forwarded ONLY to identity,
-             * which sends the directed reaction to the author (react) or clamps
-             * the peer's local tier (block, no wire traffic). */
+            /* Reaction / local block / unblock / report: forwarded ONLY to
+             * identity, which sends the directed reaction to the author
+             * (react), records/removes the local block (no wire traffic either
+             * way), or sends the directed report and stages its half (report). */
             generic_msg_t fwd = *msg;
             snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
                      "%s", "identity");
@@ -229,6 +232,27 @@ int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
             return 0;
         }
 #endif /* AT_SOCIAL_ENABLED */
+        if (fn != NULL && strcmp(fn, AT_APP_PEER_STANDING) == 0)
+        {
+            /* Phase 4 P4.1: an authority finding the APP decided — an Ethne
+             * expulsion or a reinstatement — bounding what a peer may hold.
+             * Forwarded ONLY to identity, which validates it and republishes
+             * it to reputation as a PEER_STANDING.
+             *
+             * Through identity rather than straight to reputation because
+             * identity is already the standing producer (_publish_zta_standing)
+             * and is the only process that can resolve the uuid against the
+             * admitted-peer table.
+             *
+             * OUTSIDE the AT_SOCIAL block on purpose: a governance tier
+             * bounding a peer is not an Agora-specific idea. */
+            generic_msg_t fwd = *msg;
+            snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
+                     "%s", "identity");
+            if (messaging_send("identity", NET_MESSAGE, &fwd, false) != 0)
+                log_exception(logger);
+            return 0;
+        }
         log_warn(logger, "AutonomousTrust: refused extern net_msg '%s'\n",
                  fn == NULL ? "(none)" : fn);
         return -1;

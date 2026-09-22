@@ -90,6 +90,7 @@ static const char *const REFUSED[] = {
     "peer_dm",             /* direct message: encrypted directed (Increment 6) */
     "peer_post",           /* feed post: group-encrypted multicast (Increment 7) */
     "peer_reaction",       /* post reaction: encrypted directed (Increment 8) */
+    "peer_report",         /* first-person report: encrypted directed (P4.1) */
     "peer_business_ad",    /* business ad: group-encrypted multicast (P3.2) */
     /* Co-signing (P3.3) carries the canonical bytes of a governance record and
      * the signatures over them. Both are encrypted directed, like a DM. The

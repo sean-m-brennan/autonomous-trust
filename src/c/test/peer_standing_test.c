@@ -14,8 +14,16 @@
  *   limitations under the License.
  *******************/
 
-/** @file ZTA hardening: the DDIL cap binds, and a failure unwinds
+/** @file Peer standing: the DDIL cap binds, and a failure unwinds
  * (doc/architecture/zta-integration.md).
+ *
+ *  BUILT IN EVERY CONFIGURATION since Phase 4 P4.1. It was `zta_standing_test`
+ *  and was guarded by `if(AT_ZTA)`, because the message it drives only existed
+ *  under that flag — so the ceiling machinery went untested in precisely the
+ *  build that ships it to an application (apps/agora sets AT_ZTA OFF and says
+ *  so in its CMakeLists). The mechanism is substrate-level now: ZTA is one
+ *  producer of a standing, an Ethne expulsion is another, and this test holds
+ *  the shared floor for both.
  *
  *  Two things were broken here in the FIELDED runtime, both invisible because
  *  nothing tested the ZTA→reputation path at all.
@@ -108,16 +116,27 @@ static int _sink_hook(const char *key, const message_type_t type,
     return 0;
 }
 
-static void _standing(const process_t *proc, const uuid_t peer,
-                      zta_standing_t which, double ceiling, const char *reason)
+/* A finding from a named authority. An empty source normalizes to zta, which
+ * is what every caller predating Phase 4 P4.1 means. */
+static void _standing_from(const process_t *proc, const uuid_t peer,
+                           const char *source, peer_standing_t which,
+                           double ceiling, const char *reason)
 {
-    zta_standing_msg_t st;
+    peer_standing_msg_t st;
     memset(&st, 0, sizeof(st));
     memcpy(st.peer_uuid, peer, sizeof(uuid_t));
     st.standing = (int32_t)which;
     st.ceiling = ceiling;
     strncpy(st.reason, reason, sizeof(st.reason) - 1);
-    ck_assert_ret_ok(reputation_apply_zta_standing(proc, &st));
+    if (source != NULL)
+        strncpy(st.source, source, sizeof(st.source) - 1);
+    ck_assert_ret_ok(reputation_apply_peer_standing(proc, &st));
+}
+
+static void _standing(const process_t *proc, const uuid_t peer,
+                      peer_standing_t which, double ceiling, const char *reason)
+{
+    _standing_from(proc, peer, PEER_STANDING_SOURCE_ZTA, which, ceiling, reason);
 }
 
 /* `n` bilateral transactions between self and peer, committed into the
@@ -170,10 +189,10 @@ DEFINE_TEST(test_a_capped_peer_is_bounded)
 
     uuid_t peer;
     uuid_generate(peer);
-    _standing(proc, peer, ZTA_STANDING_CAPPED, CAP, "DDIL");
+    _standing(proc, peer, PEER_STANDING_CAPPED, CAP, "DDIL");
 
     double ceiling = 0.0;
-    ck_assert_ret_ok(reputation_get_zta_ceiling(peer, &ceiling));
+    ck_assert_ret_ok(reputation_get_peer_ceiling(peer, &ceiling));
     ck_assert_double_eq_tol(ceiling, CAP, 1e-9);
     messaging_set_test_hook(NULL);
 }
@@ -191,11 +210,11 @@ DEFINE_TEST(test_a_proved_peer_is_unbounded)
     /* Capped first, so this also pins that a later verdict LIFTS the cap --
      * without which a peer that repairs its credential stays bounded for
      * ever. */
-    _standing(proc, peer, ZTA_STANDING_CAPPED, CAP, "DDIL");
-    _standing(proc, peer, ZTA_STANDING_PROVED, ZTA_NO_CEILING, "verified");
+    _standing(proc, peer, PEER_STANDING_CAPPED, CAP, "DDIL");
+    _standing(proc, peer, PEER_STANDING_PROVED, PEER_NO_CEILING, "verified");
 
     double ceiling = 0.0;
-    ck_assert_int_eq(reputation_get_zta_ceiling(peer, &ceiling), -1);
+    ck_assert_int_eq(reputation_get_peer_ceiling(peer, &ceiling), -1);
     messaging_set_test_hook(NULL);
 }
 END_TEST_DEFINITION()
@@ -210,7 +229,7 @@ DEFINE_TEST(test_silence_bounds_nobody)
     uuid_generate(peer);
     double ceiling = 0.0;
     /* A deployment that has not enabled ZTA is not bounded by it. */
-    ck_assert_int_eq(reputation_get_zta_ceiling(peer, &ceiling), -1);
+    ck_assert_int_eq(reputation_get_peer_ceiling(peer, &ceiling), -1);
 }
 END_TEST_DEFINITION()
 
@@ -227,11 +246,11 @@ DEFINE_TEST(test_a_failure_unwinds_to_pre_verification_evidence)
     /* Two transactions while proved, then the proof point, then eight more
      * earned while nobody could confirm the peer. */
     _transact(me->uuid, peer, 2, 1);
-    _standing(proc, peer, ZTA_STANDING_PROVED, ZTA_NO_CEILING, "verified");
+    _standing(proc, peer, PEER_STANDING_PROVED, PEER_NO_CEILING, "verified");
     _transact(me->uuid, peer, 8, 100);
     reputation_install_peer_reputation(peer, 0.95);
 
-    _standing(proc, peer, ZTA_STANDING_FAILED, 0.2, "REVOKED");
+    _standing(proc, peer, PEER_STANDING_FAILED, 0.2, "REVOKED");
 
     double after = 0.0;
     ck_assert_ret_ok(reputation_get_peer_reputation(peer, &after));
@@ -258,11 +277,11 @@ DEFINE_TEST(test_a_peer_never_proved_keeps_nothing)
 
     /* No PROVED standing ever arrived: nothing this peer holds rests on a
      * credential anyone confirmed. */
-    _standing(proc, peer, ZTA_STANDING_FAILED, 0.2, "REVOKED");
+    _standing(proc, peer, PEER_STANDING_FAILED, 0.2, "REVOKED");
 
     double after = 0.0;
     ck_assert_ret_ok(reputation_get_peer_reputation(peer, &after));
-    ck_assert_double_eq_tol(after, reputation_zta_unverified_ceiling(), SCORE_TOL);
+    ck_assert_double_eq_tol(after, reputation_unverified_ceiling(), SCORE_TOL);
     messaging_set_test_hook(NULL);
 }
 END_TEST_DEFINITION()
@@ -277,10 +296,10 @@ DEFINE_TEST(test_the_unwind_never_raises_a_peer)
     uuid_t peer;
     uuid_generate(peer);
     _transact(me->uuid, peer, 5, 1);
-    _standing(proc, peer, ZTA_STANDING_PROVED, ZTA_NO_CEILING, "verified");
+    _standing(proc, peer, PEER_STANDING_PROVED, PEER_NO_CEILING, "verified");
     reputation_install_peer_reputation(peer, 0.02);
 
-    _standing(proc, peer, ZTA_STANDING_FAILED, 0.2, "REVOKED");
+    _standing(proc, peer, PEER_STANDING_FAILED, 0.2, "REVOKED");
 
     double after = 0.0;
     ck_assert_ret_ok(reputation_get_peer_reputation(peer, &after));
@@ -301,17 +320,17 @@ DEFINE_TEST(test_a_repeated_verdict_unwinds_once)
     uuid_t peer;
     uuid_generate(peer);
     _transact(me->uuid, peer, 2, 1);
-    _standing(proc, peer, ZTA_STANDING_PROVED, ZTA_NO_CEILING, "verified");
+    _standing(proc, peer, PEER_STANDING_PROVED, PEER_NO_CEILING, "verified");
     _transact(me->uuid, peer, 8, 100);
     reputation_install_peer_reputation(peer, 0.95);
 
     /* Periodic re-verification restates an unchanged verdict by the hour;
      * acting on each restatement would ratchet a peer down for one offence. */
-    _standing(proc, peer, ZTA_STANDING_FAILED, 0.2, "REVOKED");
+    _standing(proc, peer, PEER_STANDING_FAILED, 0.2, "REVOKED");
     double first = 0.0;
     ck_assert_ret_ok(reputation_get_peer_reputation(peer, &first));
-    _standing(proc, peer, ZTA_STANDING_FAILED, 0.2, "REVOKED");
-    _standing(proc, peer, ZTA_STANDING_FAILED, 0.2, "REVOKED");
+    _standing(proc, peer, PEER_STANDING_FAILED, 0.2, "REVOKED");
+    _standing(proc, peer, PEER_STANDING_FAILED, 0.2, "REVOKED");
     double again = 0.0;
     ck_assert_ret_ok(reputation_get_peer_reputation(peer, &again));
     ck_assert_double_eq_tol(again, first, SCORE_TOL);
@@ -329,7 +348,7 @@ DEFINE_TEST(test_a_cap_alone_does_not_lower_a_peer)
     uuid_t peer;
     uuid_generate(peer);
     reputation_install_peer_reputation(peer, 0.30);
-    _standing(proc, peer, ZTA_STANDING_CAPPED, CAP, "DDIL");
+    _standing(proc, peer, PEER_STANDING_CAPPED, CAP, "DDIL");
 
     /* A ceiling bounds what a peer may RISE to. Driving it down is what the
      * unwind is for, and only an affirmative failure justifies that --
@@ -338,6 +357,69 @@ DEFINE_TEST(test_a_cap_alone_does_not_lower_a_peer)
     double after = 0.0;
     ck_assert_ret_ok(reputation_get_peer_reputation(peer, &after));
     ck_assert_double_eq_tol(after, 0.30, SCORE_TOL);
+    messaging_set_test_hook(NULL);
+}
+END_TEST_DEFINITION()
+
+/* What a freshly landed ceiling SAYS, to identity and to the app. Recorded by
+ * _tier_hook: the last tier_update sent to identity, and the last
+ * PEER_REPUTATION sent to the main loop. */
+static int g_tier_sent;
+static int g_last_tier;
+static int g_rep_sent;
+static peer_reputation_msg_t g_last_rep;
+
+static int _tier_hook(const char *key, const message_type_t type,
+                      generic_msg_t *msg, bool blocking)
+{
+    (void)blocking;
+    if (type == NET_MESSAGE && key != NULL && strcmp(key, "identity") == 0 &&
+        msg->info.net_msg.function != NULL &&
+        strcmp(msg->info.net_msg.function, "tier_update") == 0) {
+        json_t *arr = NULL;
+        if (net_msg_unpack_json(&msg->info.net_msg, &arr) == 0 && arr != NULL) {
+            g_last_tier = (int)json_integer_value(json_array_get(arr, 1));
+            g_tier_sent++;
+            json_decref(arr);
+        }
+    } else if (type == PEER_REPUTATION) {
+        g_last_rep = msg->info.peer_reputation;
+        g_rep_sent++;
+    }
+    return 0;
+}
+
+/* A CAP GATES THE MOMENT IT LANDS (Phase 4 P4.1, found writing
+ * moderation_cohort.sh). Identity's tier-gates read the tier reputation last
+ * published. A capped standing used to restate the stored score to the app
+ * with effective_tier = the tier of that UNBOUNDED score, and to tell identity
+ * nothing, so a tier-2 peer capped into tier 1 went on clearing tier-2 gates
+ * until its score next happened to be recomputed. */
+DEFINE_TEST(test_a_cap_republishes_the_tier_it_allows)
+{
+    identity_t *me = _mk_identity("10.0.0.1", "self");
+    process_t *proc = _mk_process(me);
+    reputation_reset_state(3);
+    g_tier_sent = 0; g_rep_sent = 0; g_last_tier = -1;
+    memset(&g_last_rep, 0, sizeof(g_last_rep));
+    messaging_set_test_hook(_tier_hook);
+
+    uuid_t peer;
+    uuid_generate(peer);
+    reputation_install_peer_reputation(peer, 0.70);          /* tier 2 */
+    _standing_from(proc, peer, PEER_STANDING_SOURCE_ETHNE,
+                   PEER_STANDING_CAPPED, 0.55, "cohort");     /* tier-1 bound */
+
+    ck_assert(g_tier_sent >= 1);
+    ck_assert_int_eq(g_last_tier, 1);
+    ck_assert(g_rep_sent >= 1);
+    ck_assert_int_eq(g_last_rep.effective_tier, 1);
+    ck_assert_double_eq_tol(g_last_rep.standing_ceiling, 0.55, 1e-9);
+    /* ...and the stored score is left alone: a ceiling bounds, it does not
+     * itself drive a peer downward (test_a_cap_alone_does_not_lower_a_peer). */
+    double after = 0.0;
+    ck_assert_ret_ok(reputation_get_peer_reputation(peer, &after));
+    ck_assert_double_eq_tol(after, 0.70, SCORE_TOL);
     messaging_set_test_hook(NULL);
 }
 END_TEST_DEFINITION()
@@ -377,7 +459,7 @@ DEFINE_TEST(test_the_cap_binds_the_score_the_scoring_path_writes)
     _transact(me->uuid, them->uuid, 6, 1);
     reputation_install_peer_reputation(them->uuid, 0.95);
     reputation_install_coop_mode(them->uuid, true);
-    _standing(proc, them->uuid, ZTA_STANDING_CAPPED, cap, "DDIL");
+    _standing(proc, them->uuid, PEER_STANDING_CAPPED, cap, "DDIL");
     _dispatch(proc, them, REP_REQ_FN, payload);
 
     /* The bound lands on the STORED score, not merely on what this request
@@ -394,7 +476,120 @@ DEFINE_TEST(test_the_cap_binds_the_score_the_scoring_path_writes)
 }
 END_TEST_DEFINITION()
 
-RUN_TESTS(ZtaStanding,
+/****************************
+ * Per-source standings (Phase 4 P4.1). Two authorities may bound the same peer
+ * for unrelated reasons, and neither may clear the other's finding.
+ ****************************/
+
+DEFINE_TEST(test_the_strictest_authority_binds)
+{
+    identity_t *me = _mk_identity("10.0.0.1", "self");
+    process_t *proc = _mk_process(me);
+    reputation_reset_state(3);
+    messaging_set_test_hook(_sink_hook);
+
+    uuid_t peer;
+    uuid_generate(peer);
+    /* Deliberately DIFFERENT ceilings, with the stricter one FIRST: an
+     * implementation that kept the last write would land on 0.20, and equal
+     * ceilings would pass under either rule and pin nothing. */
+    _standing_from(proc, peer, PEER_STANDING_SOURCE_ZTA,
+                   PEER_STANDING_CAPPED, 0.15, "DDIL");
+    _standing_from(proc, peer, PEER_STANDING_SOURCE_ETHNE,
+                   PEER_STANDING_CAPPED, 0.20, "expelled");
+
+    double ceiling = 0.0;
+    ck_assert_ret_ok(reputation_get_peer_ceiling(peer, &ceiling));
+    ck_assert_double_eq_tol(ceiling, 0.15, SCORE_TOL);
+    messaging_set_test_hook(NULL);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_one_authority_does_not_lift_another)
+{
+    identity_t *me = _mk_identity("10.0.0.1", "self");
+    process_t *proc = _mk_process(me);
+    reputation_reset_state(3);
+    messaging_set_test_hook(_sink_hook);
+
+    uuid_t peer;
+    uuid_generate(peer);
+    _standing_from(proc, peer, PEER_STANDING_SOURCE_ZTA,
+                   PEER_STANDING_CAPPED, 0.15, "DDIL");
+    _standing_from(proc, peer, PEER_STANDING_SOURCE_ETHNE,
+                   PEER_STANDING_CAPPED, 0.20, "expelled");
+    /* The polity readmits the member. That says nothing whatever about its
+     * credential, so ZTA's bound must survive. Keying ceilings by peer alone
+     * clears both here and hands an expelled-then-readmitted peer an
+     * unbounded score. */
+    _standing_from(proc, peer, PEER_STANDING_SOURCE_ETHNE,
+                   PEER_STANDING_PROVED, PEER_NO_CEILING, "readmitted");
+
+    double ceiling = 0.0;
+    ck_assert_ret_ok(reputation_get_peer_ceiling(peer, &ceiling));
+    ck_assert_double_eq_tol(ceiling, 0.15, SCORE_TOL);
+    messaging_set_test_hook(NULL);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_an_unknown_authority_is_refused)
+{
+    identity_t *me = _mk_identity("10.0.0.1", "self");
+    process_t *proc = _mk_process(me);
+    reputation_reset_state(3);
+    messaging_set_test_hook(_sink_hook);
+
+    uuid_t peer;
+    uuid_generate(peer);
+    /* Filed under a key the closed-set reduction never visits, a ceiling from
+     * an unrecognized authority would bound nobody while looking, in the map,
+     * exactly like one that did. So it is refused outright. */
+    _standing_from(proc, peer, "nonsense", PEER_STANDING_CAPPED, 0.15, "spoof");
+
+    double ceiling = 0.0;
+    ck_assert_int_eq(reputation_get_peer_ceiling(peer, &ceiling), -1);
+    messaging_set_test_hook(NULL);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_another_authority_does_not_rearm_a_spent_verdict)
+{
+    identity_t *me = _mk_identity("10.0.0.1", "self");
+    process_t *proc = _mk_process(me);
+    reputation_reset_state(3);
+    messaging_set_test_hook(_sink_hook);
+
+    uuid_t peer;
+    uuid_generate(peer);
+    _transact(me->uuid, peer, 2, 1);
+    _standing(proc, peer, PEER_STANDING_PROVED, PEER_NO_CEILING, "verified");
+    _transact(me->uuid, peer, 8, 100);
+    reputation_install_peer_reputation(peer, 0.95);
+
+    _standing_from(proc, peer, PEER_STANDING_SOURCE_ZTA,
+                   PEER_STANDING_FAILED, 0.2, "REVOKED");
+    double unwound = 0.0;
+    ck_assert_ret_ok(reputation_get_peer_reputation(peer, &unwound));
+    ck_assert_double_lt(unwound, 0.95);
+
+    /* Raise the score again, so a SECOND unwind would be visible. */
+    reputation_install_peer_reputation(peer, 0.95);
+    /* A different authority speaks. If the idempotence mark were kept per
+     * peer instead of per (peer, source), this would overwrite ZTA's mark and
+     * re-arm the identical verdict below. */
+    _standing_from(proc, peer, PEER_STANDING_SOURCE_ETHNE,
+                   PEER_STANDING_CAPPED, 0.9, "expelled");
+    _standing_from(proc, peer, PEER_STANDING_SOURCE_ZTA,
+                   PEER_STANDING_FAILED, 0.2, "REVOKED");
+
+    double after = 0.0;
+    ck_assert_ret_ok(reputation_get_peer_reputation(peer, &after));
+    ck_assert_double_eq_tol(after, 0.95, SCORE_TOL);
+    messaging_set_test_hook(NULL);
+}
+END_TEST_DEFINITION()
+
+RUN_TESTS(PeerStanding,
           test_a_capped_peer_is_bounded,
           test_a_proved_peer_is_unbounded,
           test_silence_bounds_nobody,
@@ -403,4 +598,9 @@ RUN_TESTS(ZtaStanding,
           test_the_unwind_never_raises_a_peer,
           test_a_repeated_verdict_unwinds_once,
           test_a_cap_alone_does_not_lower_a_peer,
-          test_the_cap_binds_the_score_the_scoring_path_writes)
+          test_a_cap_republishes_the_tier_it_allows,
+          test_the_cap_binds_the_score_the_scoring_path_writes,
+          test_the_strictest_authority_binds,
+          test_one_authority_does_not_lift_another,
+          test_an_unknown_authority_is_refused,
+          test_another_authority_does_not_rearm_a_spent_verdict)

@@ -21,8 +21,8 @@ decay](reputation.md).
 
 ## 1. What gets persisted
 
-Every AT node already writes five files under `$AUTONOMOUS_TRUST_ROOT/etc/at/`
-on each relevant state change:
+Every AT node writes these files under `$AUTONOMOUS_TRUST_ROOT/etc/at/` on each
+relevant state change:
 
 | File | Owning process | When it's written | What it carries |
 |---|---|---|---|
@@ -31,6 +31,21 @@ on each relevant state change:
 | `peers.cfg.json` | `IdentityProcess._record_peers` | On peer-table mutation | Peer hierarchy (3 levels) + valuation tiers (10 levels), each holding `Identity` objects |
 | `peer-capabilities.cfg.json` | `IdentityProcess._record_peers` | On capability announcement | `{capability_name: [peer_uuids]}` |
 | `reputation.cfg.json` | `ReputationProcess._persist_reputations` | After every `_compute_reputation()` call | `{peer_uuid: float}` |
+| `contacts.cfg.json` | `contacts_save` / `Contacts` | On contact-store mutation | The UUID-keyed address book (petnames, invitations) |
+| `social.cfg.json` | `IdentityProcess` block/unblock (Phase 4 P4.1) | On every block or unblock | `{"version": 1, "blocks": {peer_uuid: {at, reason}}}` — this node's local moderation state |
+
+This table said "five files" until 2026-09-22 and listed only the first five;
+`contacts.cfg.json` had been missing from it, and the freshness state
+(`.freshness-identity.cfg.json`, written by `utilities/freshness.c`) is still
+deliberately absent because it is a replay guard rather than cohort state.
+
+`social.cfg.json` is written CORE-SIDE rather than by the app for three
+reasons: every enforcement point for a block is inside the core, so an app-side
+store would leave a window between `agorad` starting and the app's first replay
+during which a blocked peer's traffic lands; `agorad` must work headless; and
+the conformance harness runs the core with no app at all, which would make an
+app-side store unpinnable. A block is a core enforcement *input*, not an
+app-domain value like a tie weight.
 
 JSON is pretty-printed with an indent of two, which makes it diff-friendly and
 hand-editable for debugging.

@@ -81,13 +81,17 @@ class TestIdentityProtocol:
           count, so a carried post is the same message rather than a
           second one. Its authority is the envoy signature sealed in
           the opaque bundle, which this tier never opens.
+        - first-person reports, Phase 4 P4.1 (report) — directed and
+          encrypted like a reaction, {seq, ts} only. No reason travels:
+          on the wire it would make a score a published accusation.
         Asserting the exact count here pins the wire contract — a
         new verb without intent will fail this and force a deliberate
         update. Update the expected count alongside any new addition
         to ``IdentityProtocol``.
         """
         values = list(IdentityProtocol)
-        assert len(values) == 44
+        assert len(values) == 45
+        assert 'report' in values
         assert 'announce' in values
         assert 'business_ad' in values
         assert 'business_post' in values

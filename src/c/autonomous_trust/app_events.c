@@ -120,6 +120,7 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
                        AT_APP_SIGNING_KEY_LEN);
 #ifdef AT_SOCIAL_ENABLED
             ev->data.peer.in_group = msg.info.peer_observed.in_group;
+            ev->data.peer.blocked = msg.info.peer_observed.blocked;
 #endif /* AT_SOCIAL_ENABLED */
             break;
         }
@@ -134,6 +135,15 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
             ev->data.reputation.score =
                 msg.info.peer_reputation.rated
                     ? msg.info.peer_reputation.score : 0.0;
+            ev->data.reputation.effective_tier =
+                msg.info.peer_reputation.effective_tier;
+            /* Written on EVERY path, including the no-ceiling one: the event
+             * was memset above, and an unwritten 0.0 would read as "floored at
+             * zero" rather than "unbounded". */
+            ev->data.reputation.standing_ceiling =
+                msg.info.peer_reputation.standing_ceiling < 0.0
+                    ? PEER_NO_CEILING
+                    : msg.info.peer_reputation.standing_ceiling;
             break;
         }
         case PEER_RTT_OBSERVED:
@@ -761,6 +771,64 @@ int at_app_events_block(at_app_events_t *handle, const char *q_out,
     return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
 }
 
+int at_app_events_unblock(at_app_events_t *handle, const char *q_out,
+                          const uint8_t peer_uuid[AT_APP_UUID_LEN])
+{
+    if (handle == NULL || !name_survives(q_out) || peer_uuid == NULL)
+        return -1;
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
+    char uuid_str[37];
+    uuid_unparse_lower((const unsigned char *)peer_uuid, uuid_str);
+    /* {"peer": "<uuid_str>"}; identity removes the block and re-emits
+     * peer_observed so the app sees it land. */
+    json_t *env = json_object();
+    if (env == NULL)
+        return -1;
+    json_object_set_new(env, "peer", json_string(uuid_str));
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),
+             "identity");
+    req.info.net_msg.function = (char *)AT_APP_UNBLOCK;
+    req.info.net_msg.encrypt = false;
+    if (net_msg_pack_json(&req.info.net_msg, env) != 0) {
+        json_decref(env);
+        return -1;
+    }
+    json_decref(env);
+    return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
+}
+
+int at_app_events_report_peer(at_app_events_t *handle, const char *q_out,
+                              const uint8_t peer_uuid[AT_APP_UUID_LEN])
+{
+    if (handle == NULL || !name_survives(q_out) || peer_uuid == NULL)
+        return -1;
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
+    char uuid_str[37];
+    uuid_unparse_lower((const unsigned char *)peer_uuid, uuid_str);
+    /* {"peer": "<uuid_str>"} and nothing else: the reason the operator chose
+     * never leaves the app (see AT_APP_REPORT_PEER). */
+    json_t *env = json_object();
+    if (env == NULL)
+        return -1;
+    json_object_set_new(env, "peer", json_string(uuid_str));
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),
+             "identity");
+    req.info.net_msg.function = (char *)AT_APP_REPORT_PEER;
+    req.info.net_msg.encrypt = false;
+    if (net_msg_pack_json(&req.info.net_msg, env) != 0) {
+        json_decref(env);
+        return -1;
+    }
+    json_decref(env);
+    return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
+}
+
 int at_app_events_request_cosign(at_app_events_t *handle, const char *q_out,
                                  const uint8_t *peer_uuids, size_t n_peers,
                                  const char *record, const char *op,
@@ -856,6 +924,50 @@ int at_app_events_return_cosign(at_app_events_t *handle, const char *q_out,
     return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
 }
 #endif /* AT_SOCIAL_ENABLED */
+
+int at_app_events_peer_standing(at_app_events_t *handle, const char *q_out,
+                                const uint8_t peer_uuid[AT_APP_UUID_LEN],
+                                const char *standing, double ceiling,
+                                const char *source, const char *reason)
+{
+    if (handle == NULL || !name_survives(q_out) || peer_uuid == NULL
+        || standing == NULL || source == NULL)
+        return -1;
+    /* Refuse the two shapes the core would only refuse later, HERE, where the
+     * caller still has the context to say what it meant. An off-scale ceiling
+     * is not a bound on AT's [0, 1] scale at all, and a caller claiming to
+     * speak as ZTA is either confused or forging: an app cannot know what a
+     * credential authority proved. Both are refused again in the handler,
+     * because this library is not the only way to reach it. */
+    if (ceiling > 1.0)
+        return -1;
+    if (strcmp(source, PEER_STANDING_SOURCE_ZTA) == 0)
+        return -1;
+    if (!messaging_bound(q_out))
+        return AT_APP_NOT_READY;
+    char uuid_str[37];
+    uuid_unparse_lower((const unsigned char *)peer_uuid, uuid_str);
+    json_t *env = json_object();
+    if (env == NULL)
+        return -1;
+    json_object_set_new(env, "peer", json_string(uuid_str));
+    json_object_set_new(env, "standing", json_string(standing));
+    json_object_set_new(env, "ceiling", json_real(ceiling));
+    json_object_set_new(env, "source", json_string(source));
+    json_object_set_new(env, "reason", json_string(reason ? reason : ""));
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    snprintf(req.info.net_msg.process, sizeof(req.info.net_msg.process),
+             "identity");
+    req.info.net_msg.function = (char *)AT_APP_PEER_STANDING;
+    req.info.net_msg.encrypt = false;
+    if (net_msg_pack_json(&req.info.net_msg, env) != 0) {
+        json_decref(env);
+        return -1;
+    }
+    json_decref(env);
+    return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
+}
 
 void at_app_events_close(at_app_events_t *handle)
 {

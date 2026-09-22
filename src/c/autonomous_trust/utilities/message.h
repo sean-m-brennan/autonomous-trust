@@ -116,6 +116,20 @@
  * app→AT allowlist. */
 #define AT_APP_BLOCK "app_block"
 
+/* App→AT: lift a local block (Phase 4 P4.1). The payload is {"peer":
+ * "<uuid_str>"}; identity removes the record and re-emits peer_observed so the
+ * app sees the change land.
+ *
+ * A SEPARATE VERB rather than a flag on AT_APP_BLOCK, matching the
+ * CONNECT_REQUEST / CONNECT_RESPOND pair: moderation is a surface where "what
+ * did the operator actually ask for" should be answerable from one grep of the
+ * log, and an overloaded verb with a boolean loses that.
+ *
+ * The blocked peer is told nothing, exactly as they were told nothing about
+ * the block. Forwarded only to the identity process. Nineteenth verb on the
+ * app→AT allowlist. */
+#define AT_APP_UNBLOCK "app_unblock"
+
 /* App→AT: pull a FRESH operator-attendance attestation from a peer NOW (Phase 2,
  * presence). The payload is {"peer": "<uuid_str>"}; identity issues a
  * nonce-fresh operator_attest_query to that peer and, on the response, updates
@@ -195,7 +209,55 @@
  * nothing. Forwarded only to the identity process. Seventeenth verb on the
  * app→AT allowlist. */
 #define AT_APP_PUBLISH_BUSINESS_POST "app_publish_business_post"
+
+/* App→AT: report a peer (Phase 4 P4.1). The payload is {"peer": "<uuid_str>"};
+ * identity sends that peer a directed ENCRYPTED peer_report {seq, ts} and, only
+ * if the frame went, stages AT_SOCIAL_REPORT_SCORE about them on the
+ * `first_person` channel.
+ *
+ * NO REASON TRAVELS, and none is accepted here. The reason the operator picked
+ * stays in the app; on the wire it would turn a score into a published
+ * accusation.
+ *
+ * A REPORT IS REFUSABLE. Reputation is bilateral, so it commits only when the
+ * reported node stages its own half — which a node running forked code need
+ * not do. That is the standing bargain of the model, not a hole in this verb,
+ * and it is why an authority finding is a ceiling (AT_APP_PEER_STANDING) instead.
+ *
+ * A report does NOT imply a block, and a block does not stop a report: they are
+ * two verbs, and "Block · Report · Both" is the app sending both. Forwarded
+ * only to the identity process. Twentieth verb on the app→AT allowlist. */
+#define AT_APP_REPORT_PEER "app_report_peer"
 #endif /* AT_SOCIAL_ENABLED */
+
+/* App→AT: hand the core an AUTHORITY FINDING about a peer's standing
+ * (Phase 4 P4.1). The payload is
+ *   {"peer": "<uuid_str>", "standing": "proved"|"capped"|"failed",
+ *    "ceiling": <0..1, or negative for none>, "source": "ethne",
+ *    "reason": "<=63 chars>"}
+ * and identity republishes it to reputation as a @ref PEER_STANDING.
+ *
+ * A CEILING, NEVER A SCORE. The app has just decided something AT's [0, 1]
+ * scale cannot express, and the answer is the one ZTA already arrived at:
+ * bound the value and let the tier machinery demote. rep_proc.c records why —
+ * the predecessor of that mechanism sent `score = -0.8` on a TRANSACTION_SCORE
+ * and was discarded at the boundary, so a revoked peer paid nothing.
+ *
+ * THE CORE VERIFIES NOTHING ABOUT THE FINDING. An Ethne expulsion is proved by
+ * co-signatures inside a record the core cannot parse, exactly as a business
+ * page bundle is. What the core trusts is the CHANNEL: that this arrived on
+ * the local app queue from the app on this device. Nothing peer-supplied may
+ * reach the handler — see _is_local_app_verb.
+ *
+ * `standing: "proved"` from the app means REINSTATED: it removes this source's
+ * ceiling and nothing else. That is what makes "revocation as a reputation
+ * event, not a hard cut" true in both directions.
+ *
+ * NOT under AT_SOCIAL_ENABLED: a governance tier bounding a peer is not an
+ * Agora-specific idea, and a deployment with some other authority is a
+ * legitimate consumer. Forwarded only to the identity process. Eighteenth verb
+ * on the app→AT allowlist. */
+#define AT_APP_PEER_STANDING "app_peer_standing"
 
 #define DEFAULT_MAX_MSG_SIZE 1024
 /* MAX_MSG_SIZE is configurable at runtime via messaging_set_max_size() */
