@@ -208,6 +208,17 @@ static int _rescore_peers(const process_t *proc, double present,
  * `-Wwrite-strings`.
  ****************************/
 
+/* Catch-up quorum, both runtimes (repprocess.py REP_CATCHUP_QUORUM). It was 3,
+ * counted as updates stored ONE PER SENDER, so a node with two peers could
+ * never reach it: nothing was ever merged, chain lengths drifted apart, and
+ * since a grant needs id2 == chain_len + 1, Paxos stopped granting anything
+ * (moderation cohort run 7, 2026-09-23; very likely all of ISSUES.md §2.15).
+ * One is safe here because the merge verifies the segment's hash links and
+ * only appends past our own next index, so a peer cannot rewrite what we
+ * hold. A commit already lands on one member's word (§2.16), so this does
+ * not lower the chain's effective threshold. */
+#define REP_CATCHUP_QUORUM 1
+
 char REP_PROTO_REQUEST[]     = "ask permission";
 char REP_PROTO_GRANT[]       = "permission granted";
 char REP_PROTO_NACK[]        = "try again";
@@ -487,12 +498,11 @@ static struct {
     map_t   peer_ceilings;
     map_t   peer_proved_index;
     map_t   peer_acted;
-    /* Catch-up quorum: handle_update fires the chain merge once this many
-     * peers have reported. Production default is 3 (mirrors Python's
-     * self.num_updates); a conformance fixture may lower it to 1 so a
-     * single-step scenario can exercise the verifiable catch-up path
-     * (the harness resets state per step, so cross-step accumulation
-     * isn't portable). */
+    /* Catch-up quorum: how many peers' matching chain reports handle_update
+     * waits for before merging. Default REP_CATCHUP_QUORUM (1): apply the
+     * hash-link-verified segment from the peer that answered us. Above 1,
+     * the older majority vote runs instead (mirrors Python's
+     * self.num_updates). */
     int num_updates;
 } rep_state;
 
@@ -553,7 +563,7 @@ static void _ensure_init(void)
         map_init(&rep_state.peer_ceilings);
         map_init(&rep_state.peer_proved_index);
         map_init(&rep_state.peer_acted);
-        rep_state.num_updates = 3;  /* catch-up quorum; mirrors Python default */
+        rep_state.num_updates = REP_CATCHUP_QUORUM;
         /* paxos_init is called in reputation_run after num_peers is known */
         rep_state.num_peers = 0;
         pthread_mutex_init(&rep_state.lock, NULL);
@@ -2660,6 +2670,29 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
     uuid_unparse_lower(nmsg->from_whom.uuid, sender_uuid);
 
     pthread_mutex_lock(&rep_state.lock);
+
+    /* Quorum of one: apply this peer's verified segment directly. It is not
+     * stored, because a stored report from another peer would then out-vote
+     * the current one in the majority path below. */
+    if (rep_state.num_updates <= 1)
+    {
+        int before = tx_history_len(&rep_state.history);
+        int rc = json_is_array(chain_json)
+                     ? tx_history_era_from_json(&rep_state.history, chain_json)
+                     : -1;
+        int after = tx_history_len(&rep_state.history);
+        pthread_mutex_unlock(&rep_state.lock);
+        json_decref(chain_json);
+        if (after > before)
+            log_info(proc->logger,
+                     "Reputation: caught up from %s: chain %d -> %d\n",
+                     nmsg->from_whom.nickname, before, after);
+        else
+            log_debug(proc->logger,
+                      "Reputation: chain update from %s added nothing (rc=%d)\n",
+                      nmsg->from_whom.nickname, rc);
+        return true;
+    }
 
     /* Store in rep_state.updates keyed by sender UUID */
     data_t *chain_dat = object_ptr_data(chain_json, sizeof(json_t));
@@ -7033,7 +7066,7 @@ void reputation_reset_state(int num_peers)
     map_init(&rep_state.child_evidence_tried);
     map_free(&rep_state.restore_clamped);
     map_init(&rep_state.restore_clamped);
-    rep_state.num_updates = 3;  /* default; a fixture may lower it per step */
+    rep_state.num_updates = REP_CATCHUP_QUORUM;
     rep_state.num_peers = num_peers;
     paxos_init(&rep_state.paxos, num_peers, NULL);
     rep_state.synchronous_dispatch = was_sync;

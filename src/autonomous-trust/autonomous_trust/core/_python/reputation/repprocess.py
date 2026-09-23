@@ -91,6 +91,14 @@ REPUTATION_PERSIST_THRESHOLD = _env_float('AT_REP_PERSIST_THRESHOLD', 0.5)
 # as AT_MAX_REP_BATCH_SUBJECTS.
 MAX_REP_BATCH_SUBJECTS = 256
 
+# Catch-up quorum, both runtimes (rep_proc.c REP_CATCHUP_QUORUM). It was 3,
+# counted as updates stored one per sender, so a node with two peers never
+# reached it, nothing was merged, chain lengths drifted, and Paxos stopped
+# granting (moderation cohort run 7, 2026-09-23; very likely ISSUES.md §2.15).
+# One is safe because catchup verifies the segment's hash links and appends
+# only past _next_index; a commit already lands on one member's word (§2.16).
+REP_CATCHUP_QUORUM = 1
+
 
 @dataclass
 class TxCount(object):
@@ -445,7 +453,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self._consensus_folded_idx: dict[str, int] = {}
         self.requested_reps = []
         self.updates = {}
-        self.num_updates = 3
+        self.num_updates = REP_CATCHUP_QUORUM
         # Last published trust tier per peer uuid-string. Suppresses
         # redundant tier_update IPC when the tier hasn't changed.
         self.peer_tiers: dict[str, int] = {}
@@ -891,8 +899,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             return True
         return False
 
-    def _request_update(self, queues, n=3):
-        self.num_updates = n
+    def _request_update(self, queues, n=3, quorum=None):
+        # Only the no-majority path widens the vote. A backdate used to reset
+        # the quorum to 3 here as a side effect, which is what kept a node
+        # with two peers from ever catching up.
+        if quorum is not None:
+            self.num_updates = quorum
         for peer in self.peers.find_top_n(n):
             msg = Message(self.name, ReputationProtocol.outdated,
                           str(len(self.history)), peer,
@@ -2534,6 +2546,18 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def handle_update(self, queues, message):
         if message.function == ReputationProtocol.update:
+            if self.num_updates <= 1:
+                # Quorum of one: apply this peer's verified segment directly,
+                # without storing it, so no stale report can out-vote it.
+                before = len(self.history)
+                chain = from_json_string(message.obj)
+                if isinstance(chain, list):
+                    self.history.catchup(chain)
+                after = len(self.history)
+                if after > before:
+                    self.logger.info('caught up from %s: chain %d -> %d',
+                                     message.from_whom.nickname, before, after)
+                return True
             self.updates[message.from_whom.uuid] = from_json_string(message.obj)
             up_count = len(self.updates)
             if up_count >= self.num_updates:
@@ -2559,7 +2583,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     self.logger.debug('Updated')
                 else:
                     self.logger.error('Closest %d peers unable to agree on history', self.num_updates)
-                    self._request_update(queues, len(self.peers.all))
+                    self._request_update(queues, len(self.peers.all),
+                                         quorum=len(self.peers.all))
             return True
         return False
 

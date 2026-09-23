@@ -64,6 +64,7 @@
 #include "utilities/allocation.h"
 
 static char REACT_FN[] = AT_APP_REACT_POST;
+static char PUBLISH_FN[] = AT_APP_PUBLISH_POST;
 
 /* A 64-hex content id; only the first 32 chars are read (the task binding). */
 static const char POST_ID[] =
@@ -75,6 +76,7 @@ static const char POST_ID[] =
 /* ------------------------------------------------------------------ */
 
 static size_t g_reaction_sent;
+static size_t g_post_sent;
 static bool   g_network_full;
 
 static int _hook(const char *key, const message_type_t type,
@@ -86,6 +88,10 @@ static int _hook(const char *key, const message_type_t type,
     if (type == NET_MESSAGE && msg->info.net_msg.function != NULL
         && strcmp(msg->info.net_msg.function, "peer_reaction") == 0)
         g_reaction_sent++;
+    if (type == NET_MESSAGE && msg->info.net_msg.function != NULL
+        && strcmp(msg->info.net_msg.function, "peer_post") == 0
+        && msg->info.net_msg.group_multicast)
+        g_post_sent++;
     return 0;
 }
 
@@ -162,6 +168,23 @@ static void _react(process_t *proc, const identity_t *author)
     run_message_handlers(proc, NULL, NET_MESSAGE, &msg);
 }
 
+/* Publish a public feed post exactly as the shim does. */
+static void _publish(process_t *proc, const char *body)
+{
+    json_t *p = json_object();
+    json_object_set_new(p, "body", json_string(body));
+    json_object_set_new(p, "tier", json_integer(0));
+
+    generic_msg_t msg = {0};
+    msg.type = NET_MESSAGE;
+    strncpy(msg.info.net_msg.process, "identity", PROC_NAME_LEN);
+    msg.info.net_msg.function = PUBLISH_FN;
+    msg.info.net_msg.verified = true;
+    ck_assert_ret_ok(net_msg_pack_json(&msg.info.net_msg, p));
+    json_decref(p);
+    run_message_handlers(proc, NULL, NET_MESSAGE, &msg);
+}
+
 static bool _scored(const identity_t *author)
 {
     char author_str[UUID_STRING_LEN + 1];
@@ -173,6 +196,7 @@ static void _begin(bool network_full)
 {
     identity_reset_state();
     g_reaction_sent = 0;
+    g_post_sent = 0;
     g_network_full = network_full;
     messaging_set_test_hook(_hook);
 }
@@ -257,7 +281,46 @@ DEFINE_TEST(test_a_transient_refusal_is_retried_rather_than_dropped)
 }
 END_TEST_DEFINITION()
 
+DEFINE_TEST(test_a_published_post_is_multicast)
+{
+    /* Baseline for the case below: with the queue open, one publish is one
+     * group multicast. */
+    _begin(false);
+    identity_t *me = _mk_identity("me", "10.0.0.1");
+    process_t *proc = _mk_process(me);
+
+    _publish(proc, "baseline");
+
+    ck_assert_uint_eq(g_post_sent, 1);
+    _end();
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_a_post_behind_a_burst_still_goes_out)
+{
+    /* The 2026-09-22 moderation cohort (run 6): bob logged "published post",
+     * his network process never multicast it, and neither peer saw it. The
+     * post was queued in the same instant as a burst of Paxos asks and the
+     * multicast sender discarded the EAGAIN, as the reaction sender above
+     * once did. A feed post is a one-shot user action too. */
+    _begin(true);
+    identity_t *me = _mk_identity("me", "10.0.0.1");
+    process_t *proc = _mk_process(me);
+
+    pthread_t drainer;
+    pthread_create(&drainer, NULL, _relent, NULL);
+
+    _publish(proc, "behind a burst");
+    pthread_join(drainer, NULL);
+
+    ck_assert_uint_eq(g_post_sent, 1);
+    _end();
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(SocialSend,
           test_a_reaction_that_goes_out_is_scored,
           test_a_reaction_the_network_queue_refused_is_not_scored,
-          test_a_transient_refusal_is_retried_rather_than_dropped)
+          test_a_transient_refusal_is_retried_rather_than_dropped,
+          test_a_published_post_is_multicast,
+          test_a_post_behind_a_burst_still_goes_out)

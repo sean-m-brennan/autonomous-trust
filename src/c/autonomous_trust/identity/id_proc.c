@@ -5771,9 +5771,24 @@ static void _submit_interaction_score(const process_t *proc,
     if (channel != NULL)
         at_strlcpy(msg.info.tx_score.channel, channel,
                    sizeof(msg.info.tx_score.channel));
-    if (messaging_send("reputation", TRANSACTION_SCORE, &msg, false) != 0)
+    /* Bounded retry, as _send_to_network does for the wire. The moderation
+     * cohort (run 8, 2026-09-23) lost ada's half of a report here: her
+     * reputation queue was full of catch-up traffic, one EAGAIN dropped the
+     * score, and the report went out anyway, so bob staged a half that could
+     * never pair. */
+    int ret = -1;
+    for (int attempt = 0; attempt < 10; attempt++)
+    {
+        ret = messaging_send("reputation", TRANSACTION_SCORE, &msg, false);
+        if (ret == 0)
+            break;
+        usleep(20000); /* 20ms */
+    }
+    if (ret != 0)
         log_warn(proc->logger,
-                 "Identity: could not submit social score %.3f\n", score);
+                 "Identity: could not submit social score %.3f after 10 tries"
+                 " (%s) — this half is lost and nothing retries it\n", score,
+                 ret == EAGAIN ? "reputation queue still full" : "send failed");
 
     /* Record the staged score as the conformance/observability surface — the
      * deterministic thing a scenario asserts, independent of the Paxos round. */
@@ -7780,8 +7795,11 @@ static int _multicast_post(const process_t *proc, const uuid_t author_uuid,
     if (env == NULL) return -1;
     net_msg_pack_json(&out.info.net_msg, env);
     json_decref(env);
-    messaging_send("network", NET_MESSAGE, &out, false);
-    return 0;
+    /* Bounded retry, not a bare messaging_send: a multicast queued behind a
+     * Paxos burst used to vanish on EAGAIN while the caller logged it as sent
+     * (moderation cohort run 6: "published post" on the author, no group
+     * multicast on its network process, nothing on either peer). */
+    return _send_to_network(proc, &out, "a feed post", "the group");
 }
 
 /* App -> AT verb (AT_APP_PUBLISH_POST): the operator publishes a feed post.
@@ -7837,8 +7855,9 @@ static bool handle_app_publish_post(const process_t *proc, directory_t *queues,
      * rather than re-emitted. */
     (void)_post_seen_or_record(id_hex);
 
-    _multicast_post(proc, self->uuid, pk_hex, seq, ts, (uint8_t)required_tier,
-                    body, sig_hex, 0);
+    if (_multicast_post(proc, self->uuid, pk_hex, seq, ts,
+                        (uint8_t)required_tier, body, sig_hex, 0) != 0)
+        return true; /* _send_to_network already said the post did not go */
     char self_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(self->uuid, self_str);
     log_info(proc->logger, "Identity: published post seq=%lld tier=%d (%s)\n",
@@ -8247,7 +8266,6 @@ static int _multicast_business_ad(const process_t *proc,
                                   int64_t seq, double ts, const char *bundle,
                                   const char *sig_hex)
 {
-    (void)proc;
     generic_msg_t out = {0};
     out.type = NET_MESSAGE;
     strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
@@ -8260,8 +8278,11 @@ static int _multicast_business_ad(const process_t *proc,
     if (env == NULL) return -1;
     net_msg_pack_json(&out.info.net_msg, env);
     json_decref(env);
-    messaging_send("network", NET_MESSAGE, &out, false);
-    return 0;
+    /* Bounded retry, not a bare messaging_send: a multicast queued behind a
+     * Paxos burst used to vanish on EAGAIN while the caller logged it as sent
+     * (moderation cohort run 6: "published post" on the author, no group
+     * multicast on its network process, nothing on either peer). */
+    return _send_to_network(proc, &out, "a business ad", "the group");
 }
 
 /* Speak for a business IN THE FIRST PERSON: sign the canonical ad with THIS
@@ -8765,7 +8786,6 @@ static int _multicast_business_post(const process_t *proc,
                                     int64_t seq, double ts, const char *bundle,
                                     const char *sig_hex, int hops)
 {
-    (void)proc;
     generic_msg_t out = {0};
     out.type = NET_MESSAGE;
     strncpy(out.info.net_msg.process, "identity", PROC_NAME_LEN);
@@ -8778,8 +8798,11 @@ static int _multicast_business_post(const process_t *proc,
     if (env == NULL) return -1;
     net_msg_pack_json(&out.info.net_msg, env);
     json_decref(env);
-    messaging_send("network", NET_MESSAGE, &out, false);
-    return 0;
+    /* Bounded retry, not a bare messaging_send: a multicast queued behind a
+     * Paxos burst used to vanish on EAGAIN while the caller logged it as sent
+     * (moderation cohort run 6: "published post" on the author, no group
+     * multicast on its network process, nothing on either peer). */
+    return _send_to_network(proc, &out, "a business post", "the group");
 }
 
 /* PUBLISH a business post: sign the canonical form with THIS node's key and
