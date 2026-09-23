@@ -738,3 +738,22 @@ class TestBackgroundReverification:
         assert proc.published[0].status == STANDING_FAILED
         assert proc.published[0].ceiling == pytest.approx(
             1.0 - ZtaPolicy().revocation_reputation_penalty * 0.5)
+
+
+def test_a_lifted_ceiling_is_rescored_when_it_lifts():
+    """Moderation cohort mod-2518340 (2026-09-23): after a lift the stored
+    score stayed at the capped value, because nothing made a steady peer due;
+    mod-2531555 then read it in the seconds before the next sweep. A lift
+    rescores at once. Mirrors C test_a_lifted_ceiling_is_rescored_when_it_lifts."""
+    rp = _make_rep_process()
+    peer = str(uuid4())
+    rp.reputations.update(peer, 0.3)                 # the capped score, stored
+    _stand(rp, peer, STANDING_CAPPED, ceiling=0.3, source=STANDING_SOURCE_ETHNE)
+    rp._apply_peer_standings({})
+    scored = []
+    real = rp._compute_reputation
+    rp._compute_reputation = lambda p, *a, **k: (scored.append(str(p)),
+                                                  real(p, *a, **k))[1]
+    _stand(rp, peer, STANDING_PROVED, source=STANDING_SOURCE_ETHNE)
+    rp._apply_peer_standings({})
+    assert scored == [peer]

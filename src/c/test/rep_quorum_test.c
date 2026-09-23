@@ -74,6 +74,7 @@ static char SLASH_FINAL_FN[]       = "slash final";
 static char CHECKPOINT_FINAL_FN[]  = "checkpoint final";
 static char CHECKPOINT_SIGN_FN[]   = "checkpoint sign";
 static char CHECKPOINT_PROPOSE_FN[] = "checkpoint propose";
+static char LATEST_UPDATE_FN[]      = "latest update";
 
 #define SIG_HEX_LEN (crypto_sign_BYTES * 2)
 
@@ -92,6 +93,12 @@ static size_t g_ckpt_sign_count;
 static char   g_last_ckpt_sig[SIG_HEX_LEN + 1];
 static char   g_last_ckpt_group[UUID_STRING_LEN + 1];
 static bool   g_last_ckpt_had_group;
+/* The last checkpoint_final this node emitted, verbatim, so a test can hand
+   it to a receiver exactly as the wire would. */
+static char   g_last_ckpt_final[4096];
+/* "update needed" requests this node sent, and to whom the last went. */
+static size_t g_outdated_count;
+static uuid_t g_outdated_to;
 
 static int _capture_hook(const char *key, const message_type_t type,
                          generic_msg_t *msg, bool blocking)
@@ -102,8 +109,16 @@ static int _capture_hook(const char *key, const message_type_t type,
     const char *fn = msg->info.net_msg.function;
     if (strcmp(fn, SLASH_FINAL_FN) == 0)
         g_slash_final_count++;
-    else if (strcmp(fn, CHECKPOINT_FINAL_FN) == 0)
+    else if (strcmp(fn, CHECKPOINT_FINAL_FN) == 0) {
         g_ckpt_final_count++;
+        if (msg->info.net_msg.obj != NULL)
+            snprintf(g_last_ckpt_final, sizeof(g_last_ckpt_final), "%s",
+                     (const char *)msg->info.net_msg.obj);
+    }
+    else if (strcmp(fn, "update needed") == 0) {
+        g_outdated_count++;
+        memcpy(g_outdated_to, msg->info.net_msg.to_whom.uuid, sizeof(uuid_t));
+    }
     else if (strcmp(fn, CHECKPOINT_SIGN_FN) == 0) {
         g_ckpt_sign_count++;
         if (msg->info.net_msg.obj != NULL) {
@@ -276,6 +291,9 @@ static void _begin(int num_peers)
     g_slash_final_count = 0;
     g_slash_sign_count = 0;
     g_ckpt_final_count = 0;
+    g_last_ckpt_final[0] = '\0';
+    g_outdated_count = 0;
+    uuid_clear(g_outdated_to);
     g_ckpt_sign_count = 0;
     g_last_ckpt_sig[0] = '\0';
     g_last_ckpt_group[0] = '\0';
@@ -874,6 +892,263 @@ DEFINE_TEST(test_cosign_of_a_child_group_round_uses_the_proposers_chain_name)
 }
 END_TEST_DEFINITION()
 
+
+DEFINE_TEST(test_a_proposers_emitted_final_is_accepted_by_a_member)
+{
+    /* Live cohorts never once logged "checkpoint stored": every member
+     * rejected every final with "0 verified co-signature(s)". The two tests
+     * above each cover one half (a hand-built signature map is accepted; a
+     * proposer emits a final) and neither hands the EMITTED final to a
+     * receiver. This does. */
+    _begin(3);
+    identity_t *me = _mk_identity("dave", "10.0.0.4");
+    identity_t *bob = _mk_identity("bob", "10.0.0.2");
+    identity_t *carol = _mk_identity("carol", "10.0.0.3");
+    process_t *proc = _mk_process(me);
+    _add_peer(proc, bob);
+    _add_peer(proc, carol);
+
+    uuid_t task;
+    uuid_generate(task);
+    reputation_install_tx_pair(task, me->uuid, 0.8, bob->uuid, 0.8);
+    char me_u[UUID_STRING_LEN + 1], bob_u[UUID_STRING_LEN + 1];
+    _uuid_str(me->uuid, me_u);
+    _uuid_str(bob->uuid, bob_u);
+    char root[TX_HASH_HEX_LEN + 1] = {0};
+    reputation_get_window_root(root);
+    int count = reputation_get_committed_tx_count();
+
+    reputation_force_checkpoint(proc, me_u, "");
+    uint8_t desig[512];
+    size_t dlen = _ckpt_desig(me_u, root, 1, 0, count, desig, sizeof(desig));
+    char b_sig[SIG_HEX_LEN + 1];
+    _sign_hex(bob, desig, dlen, b_sig);
+    json_t *p = json_object();
+    json_object_set_new(p, "proposer_uuid", json_string(me_u));
+    json_object_set_new(p, "epoch", json_integer(1));
+    json_object_set_new(p, "signer_uuid", json_string(bob_u));
+    json_object_set_new(p, "signature", json_string(b_sig));
+    _dispatch(proc, bob, CHECKPOINT_SIGN_FN, p);
+    json_decref(p);
+    ck_assert(g_ckpt_final_count > 0);
+
+    /* carol receives it. Her roster is dave and bob. */
+    json_error_t err;
+    json_t *final = json_loads(g_last_ckpt_final, 0, &err);
+    ck_assert_ptr_nonnull(final);
+    reputation_reset_state(3);
+    process_t *cproc = _mk_process(carol);
+    _add_peer(cproc, me);
+    _add_peer(cproc, bob);
+    _dispatch(cproc, me, CHECKPOINT_FINAL_FN, final);
+    json_decref(final);
+
+    char stored[TX_HASH_HEX_LEN + 1] = {0};
+    reputation_get_checkpoint_root(stored);
+    ck_assert_str_eq(stored, root);
+    _end();
+}
+END_TEST_DEFINITION()
+
+
+/* ---- Finality means a quorum attested it (ISSUES.md §2.15) ----
+ *
+ * Moderation cohort runs mod-2481048 and mod-2483539 (2026-09-23): every node
+ * refused every reconciliation with "forks at index f, inside our finalized
+ * checkpoint", because a proposer stores its own proposal at once, holding only
+ * its own signature, and the guard read that slot. Each node had proposed over
+ * its own forked chain, so each pinned its own fork for good. */
+static uuid_t g_ft[8];
+static void _fork_tasks(void) { for (int i = 0; i < 8; i++) uuid_generate(g_ft[i]); }
+
+static void _stage_local(const identity_t *p1, const identity_t *p2, const char *letters)
+{
+    for (const char *c = letters; *c; c++)
+        reputation_install_tx_pair(g_ft[*c - 'a'], p1->uuid, 0.3 + 0.02 * (*c - 'a'),
+                                   p2->uuid, 0.9 - 0.02 * (*c - 'a'));
+}
+
+static json_t *_peer_chain(const identity_t *p1, const identity_t *p2, const char *letters)
+{
+    tx_history_t h;
+    ck_assert_ret_ok(tx_history_init(&h));
+    for (const char *c = letters; *c; c++)
+    {
+        ck_assert_ret_ok(tx_history_update(&h, g_ft[*c - 'a'], p1->uuid,
+                                           0.3 + 0.02 * (*c - 'a'), NULL));
+        ck_assert_ret_ok(tx_history_update(&h, g_ft[*c - 'a'], p2->uuid,
+                                           0.9 - 0.02 * (*c - 'a'), NULL));
+    }
+    json_t *arr = NULL;
+    ck_assert_ret_ok(tx_history_era_to_json(&h, 0, tx_history_len(&h), &arr));
+    tx_history_free(&h);
+    return arr;
+}
+
+DEFINE_TEST(test_our_own_unsigned_proposal_does_not_block_adoption)
+{
+    _begin(3);
+    _fork_tasks();
+    identity_t *me = _mk_identity("dave", "10.0.0.4");
+    identity_t *bob = _mk_identity("bob", "10.0.0.2");
+    identity_t *carol = _mk_identity("carol", "10.0.0.3");
+    process_t *proc = _mk_process(me);
+    _add_peer(proc, bob);
+    _add_peer(proc, carol);
+    char me_u[UUID_STRING_LEN + 1];
+    _uuid_str(me->uuid, me_u);
+
+    _stage_local(me, bob, "abx");
+    reputation_force_checkpoint(proc, me_u, "");   /* stored, one signature */
+    ck_assert(g_ckpt_final_count == 0);
+
+    json_t *theirs = _peer_chain(me, bob, "abcd");
+    _dispatch(proc, bob, LATEST_UPDATE_FN, theirs);
+    json_decref(theirs);
+    ck_assert_int_eq(reputation_get_committed_tx_count(), 4);
+    _end();
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_a_quorate_checkpoint_over_our_chain_blocks_adoption)
+{
+    _begin(3);
+    _fork_tasks();
+    identity_t *me = _mk_identity("dave", "10.0.0.4");
+    identity_t *bob = _mk_identity("bob", "10.0.0.2");
+    identity_t *carol = _mk_identity("carol", "10.0.0.3");
+    process_t *proc = _mk_process(me);
+    _add_peer(proc, bob);
+    _add_peer(proc, carol);
+    char me_u[UUID_STRING_LEN + 1], bob_u[UUID_STRING_LEN + 1];
+    _uuid_str(me->uuid, me_u);
+    _uuid_str(bob->uuid, bob_u);
+
+    _stage_local(me, bob, "abx");
+    char root[TX_HASH_HEX_LEN + 1] = {0};
+    reputation_get_window_root(root);
+    reputation_force_checkpoint(proc, me_u, "");
+    uint8_t desig[512];
+    size_t dlen = _ckpt_desig(me_u, root, 1, 0, 3, desig, sizeof(desig));
+    char b_sig[SIG_HEX_LEN + 1];
+    _sign_hex(bob, desig, dlen, b_sig);
+    json_t *p = json_object();
+    json_object_set_new(p, "proposer_uuid", json_string(me_u));
+    json_object_set_new(p, "epoch", json_integer(1));
+    json_object_set_new(p, "signer_uuid", json_string(bob_u));
+    json_object_set_new(p, "signature", json_string(b_sig));
+    _dispatch(proc, bob, CHECKPOINT_SIGN_FN, p);
+    json_decref(p);
+    ck_assert(g_ckpt_final_count > 0);             /* quorum: now final */
+
+    json_t *theirs = _peer_chain(me, bob, "abcd");
+    _dispatch(proc, carol, LATEST_UPDATE_FN, theirs);
+    json_decref(theirs);
+    ck_assert_int_eq(reputation_get_committed_tx_count(), 3);
+    char after[TX_HASH_HEX_LEN + 1] = {0};
+    reputation_get_window_root(after);
+    ck_assert_str_eq(after, root);
+    _end();
+}
+END_TEST_DEFINITION()
+
+
+/* A quorate final over bob's chain, signed by bob and carol. */
+static json_t *_final_over(const identity_t *proposer, const identity_t *cosigner,
+                           const char *root, int count)
+{
+    char p_u[UUID_STRING_LEN + 1], c_u[UUID_STRING_LEN + 1];
+    _uuid_str(proposer->uuid, p_u);
+    _uuid_str(cosigner->uuid, c_u);
+    uint8_t desig[512];
+    size_t dlen = _ckpt_desig(p_u, root, 1, 0, count, desig, sizeof(desig));
+    char ps[SIG_HEX_LEN + 1], cs[SIG_HEX_LEN + 1];
+    _sign_hex(proposer, desig, dlen, ps);
+    _sign_hex(cosigner, desig, dlen, cs);
+    json_t *sigs = json_object();
+    json_object_set_new(sigs, p_u, json_string(ps));
+    json_object_set_new(sigs, c_u, json_string(cs));
+    json_t *p = json_object();
+    json_object_set_new(p, "proposer_uuid", json_string(p_u));
+    json_object_set_new(p, "root", json_string(root));
+    json_object_set_new(p, "epoch", json_integer(1));
+    json_object_set_new(p, "first_index", json_integer(0));
+    json_object_set_new(p, "count", json_integer(count));
+    json_object_set_new(p, "sigs", sigs);
+    return p;
+}
+
+/* Moderation cohort mod-2537396 and mod-2538837 (2026-09-23): carol's order
+ * fork at EQUAL length never reconciled. Catch-up ran only when a grant found
+ * the lengths differed, and on a tie the lower head hash wins, which can be the
+ * side the quorum outvoted. Now a quorate checkpoint our chain does not
+ * reproduce asks its finalizer for the chain, and that chain wins. */
+DEFINE_TEST(test_an_outvoted_node_requests_and_adopts_the_quorum_chain)
+{
+    _begin(3);
+    _fork_tasks();
+    identity_t *me = _mk_identity("dave", "10.0.0.4");
+    identity_t *bob = _mk_identity("bob", "10.0.0.2");
+    identity_t *carol = _mk_identity("carol", "10.0.0.3");
+    process_t *proc = _mk_process(me);
+    _add_peer(proc, bob);
+    _add_peer(proc, carol);
+
+    /* Arrange that dave's own chain WINS a plain tiebreak, so only the new
+     * rule can make him adopt. */
+    const char *mine = "abx", *theirs = "abc";
+    for (int orient = 0; orient < 2; orient++)
+    {
+        /* Plain reconcile (no attestation) must KEEP ours; else swap. */
+        tx_history_t h;
+        tx_history_init(&h);
+        json_t *jm = _peer_chain(me, bob, mine), *jt = _peer_chain(me, bob, theirs);
+        tx_history_era_from_json(&h, jm);
+        tx_reconcile_result_t r;
+        tx_history_reconcile(&h, jt, -1, &r);
+        json_decref(jm); json_decref(jt);
+        tx_history_free(&h);
+        if (r.status == TX_RECONCILE_KEPT)
+            break;
+        ck_assert(orient == 0);
+        mine = "abc"; theirs = "abx";
+    }
+    _stage_local(me, bob, mine);
+    json_t *chain = _peer_chain(me, bob, theirs);
+    char their_root[TX_HASH_HEX_LEN + 1];
+    {
+        tx_history_t h;
+        tx_history_init(&h);
+        tx_history_era_from_json(&h, chain);
+        transaction_window_root(&h, their_root);
+        tx_history_free(&h);
+    }
+
+    /* A final over OUR chain asks nothing. */
+    char our_root[TX_HASH_HEX_LEN + 1] = {0};
+    reputation_get_window_root(our_root);
+    json_t *f = _final_over(bob, carol, our_root, 3);
+    _dispatch(proc, bob, CHECKPOINT_FINAL_FN, f);
+    json_decref(f);
+    ck_assert(g_outdated_count == 0);
+
+    /* A final over bob's chain asks bob for it... */
+    f = _final_over(bob, carol, their_root, 3);
+    _dispatch(proc, bob, CHECKPOINT_FINAL_FN, f);
+    json_decref(f);
+    ck_assert(g_outdated_count == 1);
+    ck_assert_int_eq(uuid_compare(g_outdated_to, bob->uuid), 0);
+
+    /* ...and the answer is adopted though our head wins the tiebreak. */
+    _dispatch(proc, bob, LATEST_UPDATE_FN, chain);
+    json_decref(chain);
+    char after[TX_HASH_HEX_LEN + 1] = {0};
+    reputation_get_window_root(after);
+    ck_assert_str_eq(after, their_root);
+    _end();
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(RepQuorum,
           test_slash_designation_bytes_pinned,
           test_checkpoint_designation_bytes_pinned,
@@ -886,5 +1161,9 @@ RUN_TESTS(RepQuorum,
           test_slash_final_forged_signature_map_refused,
           test_checkpoint_final_unattested_root_refused,
           test_checkpoint_final_with_quorum_stores_root,
+          test_a_proposers_emitted_final_is_accepted_by_a_member,
+          test_our_own_unsigned_proposal_does_not_block_adoption,
+          test_a_quorate_checkpoint_over_our_chain_blocks_adoption,
+          test_an_outvoted_node_requests_and_adopts_the_quorum_chain,
           test_originated_round_tallies_a_peer_ack_to_quorum,
           test_cosign_of_a_child_group_round_uses_the_proposers_chain_name)
