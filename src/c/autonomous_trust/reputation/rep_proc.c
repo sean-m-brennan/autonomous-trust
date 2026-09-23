@@ -158,6 +158,7 @@ static void _handle_peer_standing(const process_t *proc,
 /* Defined with the app-facing carrier below; declared here because the
  * standing handler sits above it and must tell the app when a ceiling moves. */
 static void _publish_reputation_change(const uuid_t peer_uuid, double score);
+static double _score_peer_locked(const uuid_t peer_uuid);
 static void _publish_standing_change(const process_t *proc,
                                      const uuid_t peer_uuid);
 /* Both defined further down, beside the code that owns them; this block
@@ -188,6 +189,9 @@ static void _store_checkpoint(const process_t *proc, const char *proposer,
  * staleness sweep leaves an actively-interacting peer alone. Takes
  * rep_state.lock itself, so callers must NOT hold it. */
 static void _note_interaction(const uuid_t peer_uuid);
+static bool _is_bilateral_locked(const tx_history_t *chain,
+                                 const uuid_t task_uuid, int *index);
+static uuid_t *_chain_peers_locked(size_t *n_out);
 static int _rescore_peers(const process_t *proc, double present,
                           const uuid_t self_uuid);
 
@@ -452,6 +456,15 @@ static struct {
     int   checkpoint_first_index;
     int   checkpoint_count;
     char  checkpoint_proposer[UUID_STRING_LEN + 1];
+    /* The latest PRIMARY checkpoint a quorum attested, kept apart from the
+     * slot above because the slot also holds our own proposals, stored with
+     * only our signature before anyone has co-signed. Reconciliation treats
+     * this window as final, and only while our own entries over it still hash
+     * to its root (ISSUES.md §2.15). */
+    bool  final_set;
+    char  final_root[TX_HASH_HEX_LEN + 1];
+    int   final_first;
+    int   final_count;
     map_t checkpoint_sigs_final;   /* voter uuid-str -> string_data(hex sig) */
     /* Monotonic epoch for checkpoints THIS node originates (distinct from
      * checkpoint_epoch, which is whatever epoch we last stored — possibly
@@ -547,6 +560,7 @@ static void _ensure_init(void)
         map_init(&rep_state.checkpoint_sigs_final);
         rep_state.checkpoint_first_index = 0;
         rep_state.checkpoint_count = 0;
+        rep_state.final_set = false;
         rep_state.checkpoint_proposer[0] = '\0';
         rep_state.checkpoint_own_epoch = 0;
         rep_state.next_checkpoint_at = 0.0;
@@ -809,6 +823,52 @@ static void _mirror_primary_ckpt_locked(void)
     rep_state.checkpoint_first_index = slot->first_index;
     rep_state.checkpoint_count = slot->count;
     rep_state.checkpoint_set = slot->set;
+}
+
+/* Record a primary checkpoint as FINAL: a quorum attested it. Caller holds the
+ * lock. */
+static void _note_final_locked(const char *root, int first_index, int count)
+{
+    if (root == NULL || root[0] == '\0' || count <= 0)
+        return;
+    snprintf(rep_state.final_root, sizeof(rep_state.final_root), "%s", root);
+    rep_state.final_first = first_index;
+    rep_state.final_count = count;
+    rep_state.final_set = true;
+}
+
+/* One past the last index reconciliation must not rewrite, or -1. A window is
+ * final only if a quorum attested it AND our own entries over it hash to the
+ * attested root: a node whose chain the quorum outvoted holds nothing final
+ * there, so guarding it would pin the losing side of a fork. Caller holds the
+ * lock. */
+static int _final_end_locked(void)
+{
+    if (!rep_state.final_set)
+        return -1;
+    char mine[TX_HASH_HEX_LEN + 1];
+    if (tx_history_range_root(&rep_state.history, rep_state.final_first,
+                              rep_state.final_count, mine) != 0
+        || strcmp(mine, rep_state.final_root) != 0)
+        return -1;
+    return rep_state.final_first + rep_state.final_count;
+}
+
+/* The latest quorate primary checkpoint, iff our own entries do NOT reproduce
+ * it: the group finalized a chain ours lost to. Caller holds the lock. */
+static bool _outvoted_locked(tx_attested_t *out)
+{
+    if (!rep_state.final_set)
+        return false;
+    char mine[TX_HASH_HEX_LEN + 1];
+    if (tx_history_range_root(&rep_state.history, rep_state.final_first,
+                              rep_state.final_count, mine) == 0
+        && strcmp(mine, rep_state.final_root) == 0)
+        return false;
+    snprintf(out->root, sizeof(out->root), "%s", rep_state.final_root);
+    out->first_index = rep_state.final_first;
+    out->count = rep_state.final_count;
+    return true;
 }
 
 /* Look up the transaction_weight for a capability by name. Mirrors
@@ -1079,8 +1139,39 @@ static void _publish_tier_change(const process_t *proc,
     net_msg_pack_json(&ipc.info.net_msg, arr);
 
     /* messaging_send keys by process name; "identity" routes to the
-     * IdentityProcess queue directly, bypassing the network process. */
-    messaging_send("identity", NET_MESSAGE, &ipc, false);
+     * IdentityProcess queue directly, bypassing the network process.
+     *
+     * Bounded retry, and on failure UNDO the publication record above. The
+     * record is what suppresses a repeat, so a send lost to a full identity
+     * queue used to leave identity on the old tier until the score crossed
+     * another boundary, which for a steady peer is never. Identity's gates
+     * read that tier: after ada restarted in moderation cohort mod-2505620
+     * (2026-09-23) her app read bob at tier 1 while her post gate still held
+     * him at 0 and dropped his tier-1 post. Undone, the next rescore sweep
+     * publishes it again. */
+    int sent = -1;
+    for (int attempt = 0; attempt < 10; attempt++) {
+        sent = messaging_send("identity", NET_MESSAGE, &ipc, false);
+        if (sent == 0)
+            break;
+        usleep(20000); /* 20ms */
+    }
+    if (sent != 0) {
+        pthread_mutex_lock(&rep_state.lock);
+        if (prior >= 0)
+            map_set(&rep_state.peer_tiers, uuid_str, integer_data(prior));
+        else
+            map_remove(&rep_state.peer_tiers, uuid_str);
+        /* Due again, so the sweep republishes it even when a steady score
+         * gives it no other reason to. */
+        map_set(&rep_state.rescore_due, uuid_str, integer_data(1));
+        pthread_mutex_unlock(&rep_state.lock);
+        log_warn(proc->logger,
+                 "Reputation: tier_update %s -> %d not delivered after 10 "
+                 "tries (%s); will republish on the next rescore\n",
+                 uuid_str, new_tier,
+                 sent == EAGAIN ? "identity queue still full" : "send failed");
+    }
 
     /* On demotion, also publish tier_lost to negotiation. The
      * payload is identical (uuid_str, new_tier); the receiver is
@@ -1303,11 +1394,25 @@ static void _handle_peer_standing(const process_t *proc,
         map_remove(&rep_state.peer_ceilings, (map_key_t)skey);
         map_set(&rep_state.peer_proved_index, (map_key_t)skey,
                 integer_data(rep_state.history.next_index));
+        /* Rescore NOW, without the ceiling. The stored score is the CAPPED
+         * one, and nothing else makes a steady peer due: moderation cohort
+         * mod-2518340 read bob at the lifted cap of 0.300 long after the
+         * lift. Marking him due for the next sweep was not enough either:
+         * mod-2531555 read the cap again in the seconds before that sweep ran.
+         * A lift takes effect the moment it lands, as a cap does. */
+        bool rated = reputations_contains(&rep_state.reputations, st->peer_uuid);
+        double rescored = rated ? _score_peer_locked(st->peer_uuid) : 0.0;
         pthread_mutex_unlock(&rep_state.lock);
         log_info(proc->logger,
                  "Standing[%s]: %s proved; unwind anchor set at chain index %d\n",
                  source, key, rep_state.history.next_index);
-        _publish_standing_change(proc, st->peer_uuid);
+        if (rated)
+        {
+            _publish_tier_change(proc, st->peer_uuid, rescored);
+            _publish_reputation_change(st->peer_uuid, rescored);
+        }
+        else
+            _publish_standing_change(proc, st->peer_uuid);
         return;
     }
 
@@ -1320,7 +1425,8 @@ static void _handle_peer_standing(const process_t *proc,
         /* CAPPED: a bound going forward, and nothing more. A ceiling must not
          * itself drive a peer downward -- only an affirmative failure justifies
          * that -- or every disconnected DDIL deployment would be punished for
-         * being disconnected. */
+         * being disconnected. Due, so the bound applies at the next sweep. */
+        map_set(&rep_state.rescore_due, (map_key_t)key, integer_data(1));
         pthread_mutex_unlock(&rep_state.lock);
         log_info(proc->logger, "Standing[%s]: %s capped at %.3f (%s)\n",
                  source, key, st->ceiling, st->reason);
@@ -2400,10 +2506,14 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
             if (stashed != NULL)
                 at_strlcpy(commit_channel, stashed, sizeof(commit_channel));
         }
+        bool was_bilateral = false, now_bilateral = false;
+        int entry_index = -1;
         if (have_task_uuid)
         {
+            was_bilateral = _is_bilateral_locked(chain, task_uuid, NULL);
             tx_history_update(chain, task_uuid, peer_uuid, score,
                               commit_channel);
+            now_bilateral = _is_bilateral_locked(chain, task_uuid, &entry_index);
         }
         else
         {
@@ -2421,6 +2531,10 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
          * interaction share, so it is the one worth printing. */
         log_info(proc->logger, "Reputation: Transaction committed (task %s)\n",
                  have_task_uuid ? task_uuid_str : "-");
+        if (now_bilateral && !was_bilateral)
+            log_info(proc->logger,
+                     "Reputation: task %s is bilateral (index %d)\n",
+                     task_uuid_str, entry_index);
 
         /* Phase 3 — broadcast committed (task_id, peer_id, score) to
          * the group so acceptors can write the same entry to their
@@ -2576,9 +2690,13 @@ static bool handle_committed(const process_t *proc, directory_t *queues, generic
                                                              "group_uuid"));
     pthread_mutex_lock(&rep_state.lock);
     tx_history_t *chain = _chain_for_group_locked(proc, group_str);
+    bool was_bilateral = false, now_bilateral = false;
+    int entry_index = -1;
     if (task_uuid_str && uuid_parse(task_uuid_str, task_uuid) == 0)
     {
+        was_bilateral = _is_bilateral_locked(chain, task_uuid, NULL);
         tx_history_update(chain, task_uuid, peer_uuid, score, chan_borrowed);
+        now_bilateral = _is_bilateral_locked(chain, task_uuid, &entry_index);
     }
     else
     {
@@ -2587,6 +2705,9 @@ static bool handle_committed(const process_t *proc, directory_t *queues, generic
         tx_history_update(chain, peer_uuid, peer_uuid, score, chan_borrowed);
     }
     pthread_mutex_unlock(&rep_state.lock);
+    if (now_bilateral && !was_bilateral)
+        log_info(proc->logger, "Reputation: task %s is bilateral (index %d)\n",
+                 task_uuid_str, entry_index);
     _note_interaction(peer_uuid);   /* idle clock; see doc/architecture/reputation.md decay */
     log_debug(proc->logger, "Reputation: Recorded committed tx from %s via %s\n",
               peer_uuid_str, tx_channel_or_default(chan_borrowed));
@@ -2677,20 +2798,58 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
     if (rep_state.num_updates <= 1)
     {
         int before = tx_history_len(&rep_state.history);
-        int rc = json_is_array(chain_json)
-                     ? tx_history_era_from_json(&rep_state.history, chain_json)
-                     : -1;
+        /* Never rewrite inside our finalized checkpoint (user decision,
+         * ISSUES.md §2.15). */
+        int final_end = _final_end_locked();
+        /* Outvoted: a chain reproducing the quorum's checkpoint wins even an
+         * equal-length tiebreak (ISSUES.md §2.15, mod-2538837). */
+        tx_attested_t att;
+        bool outvoted = _outvoted_locked(&att);
+        /* Peers named before and after: an adoption can drop entries as well
+         * as add them, and both move scores. */
+        size_t n_before = 0;
+        uuid_t *peers_before = _chain_peers_locked(&n_before);
+        tx_reconcile_result_t res = { TX_RECONCILE_NONE, -1, 0, 0 };
+        if (json_is_array(chain_json))
+            tx_history_reconcile_attested(&rep_state.history, chain_json,
+                                          final_end, outvoted ? &att : NULL,
+                                          &res);
         int after = tx_history_len(&rep_state.history);
+        size_t n_after = 0;
+        uuid_t *peers_after = _chain_peers_locked(&n_after);
         pthread_mutex_unlock(&rep_state.lock);
         json_decref(chain_json);
-        if (after > before)
+
+        if (res.status == TX_RECONCILE_ADOPTED)
+            log_info(proc->logger,
+                     "Reputation: adopted chain from %s at index %d: dropped "
+                     "%d, added %d (ours %d -> theirs %d)\n",
+                     nmsg->from_whom.nickname, res.fork, res.dropped,
+                     res.added, before, after);
+        else if (res.status == TX_RECONCILE_EXTENDED)
             log_info(proc->logger,
                      "Reputation: caught up from %s: chain %d -> %d\n",
                      nmsg->from_whom.nickname, before, after);
+        else if (res.status == TX_RECONCILE_REFUSED_FINAL)
+            log_warn(proc->logger,
+                     "Reputation: chain from %s forks at index %d, inside our "
+                     "finalized checkpoint (ends %d); keeping ours\n",
+                     nmsg->from_whom.nickname, res.fork, final_end);
         else
             log_debug(proc->logger,
-                      "Reputation: chain update from %s added nothing (rc=%d)\n",
-                      nmsg->from_whom.nickname, rc);
+                      "Reputation: chain update from %s: status %d\n",
+                      nmsg->from_whom.nickname, (int)res.status);
+
+        if (res.status == TX_RECONCILE_ADOPTED
+            || res.status == TX_RECONCILE_EXTENDED)
+        {
+            for (size_t k = 0; k < n_before; k++)
+                _note_interaction(peers_before[k]);
+            for (size_t k = 0; k < n_after; k++)
+                _note_interaction(peers_after[k]);
+        }
+        free(peers_before);
+        free(peers_after);
         return true;
     }
 
@@ -4097,15 +4256,21 @@ static bool handle_slash_sign(const process_t *proc, directory_t *queues, generi
     size_t quorum = proc->protocol.num_peers / 2;
     peers_read_unlock(proc);
     bool finalize = count > quorum;
-    json_decref(pending);
-    json_decref(payload);
 
+    /* payload and pending stay alive until the end: the strings read from
+     * them above (the round's identity) are pointers INTO them. Freed here,
+     * as they were, the final went out built from freed memory; live, the
+     * checkpoint final lost its proposer_uuid, every member re-derived an
+     * empty designation and counted "0 verified co-signature(s)", and no
+     * member stored a checkpoint in any cohort run. */
     if (finalize)
     {
         json_t *final_json = json_object();
         if (final_json == NULL)
         {
             json_decref(sigs);
+            json_decref(pending);
+            json_decref(payload);
             return true;
         }
         json_object_set_new(final_json, "target_uuid",
@@ -4137,6 +4302,8 @@ static bool handle_slash_sign(const process_t *proc, directory_t *queues, generi
         peers_read_unlock(proc);
     }
     json_decref(sigs);
+    json_decref(pending);
+    json_decref(payload);
     return true;
 }
 
@@ -4547,15 +4714,21 @@ static bool handle_checkpoint_sign(const process_t *proc, directory_t *queues, g
     size_t quorum = proc->protocol.num_peers / 2;
     peers_read_unlock(proc);
     bool finalize = count > quorum;
-    json_decref(pending);
-    json_decref(payload);
 
+    /* payload and pending stay alive until the end: the strings read from
+     * them above (the round's identity) are pointers INTO them. Freed here,
+     * as they were, the final went out built from freed memory; live, the
+     * checkpoint final lost its proposer_uuid, every member re-derived an
+     * empty designation and counted "0 verified co-signature(s)", and no
+     * member stored a checkpoint in any cohort run. */
     if (finalize)
     {
         json_t *final_json = json_object();
         if (final_json == NULL)
         {
             json_decref(sigs);
+            json_decref(pending);
+            json_decref(payload);
             return true;
         }
         json_object_set_new(final_json, "proposer_uuid",
@@ -4594,6 +4767,8 @@ static bool handle_checkpoint_sign(const process_t *proc, directory_t *queues, g
         peers_read_unlock(proc);
     }
     json_decref(sigs);
+    json_decref(pending);
+    json_decref(payload);
     return true;
 }
 
@@ -5504,6 +5679,44 @@ static bool handle_checkpoint_final(const process_t *proc, directory_t *queues, 
                       json_object_get(payload, "sigs"));
     log_info(proc->logger, "Reputation: checkpoint stored epoch=%lld root=%.12s\n",
              (long long)epoch, root);
+
+    /* Outvoted: the group finalized a window our own entries do not
+     * reproduce. Ask the finalizer for its chain from the window's start, and
+     * handle_update adopts it (see _outvoted_locked). Without this an order
+     * fork at EQUAL length never reconciles at all: catch-up runs only when a
+     * Paxos grant finds the lengths differ, and here they never do, so the
+     * fork persists silently (moderation cohort mod-2537396 and mod-2538837,
+     * 2026-09-23: carol forked at index 20-22 for the rest of both runs). */
+    bool outvoted = false;
+    if (final_chain[0] == '\0')
+    {
+        tx_attested_t att;
+        pthread_mutex_lock(&rep_state.lock);
+        outvoted = _outvoted_locked(&att);
+        pthread_mutex_unlock(&rep_state.lock);
+    }
+    if (outvoted)
+    {
+        generic_msg_t req = {0};
+        req.type = NET_MESSAGE;
+        strncpy(req.info.net_msg.process, "reputation", PROC_NAME_LEN);
+        req.info.net_msg.function = REP_PROTO_OUTDATED;
+        req.info.net_msg.encrypt = true;
+        memcpy(&req.info.net_msg.to_whom, &nmsg->from_whom,
+               sizeof(public_identity_t));
+        strncpy(req.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+        /* The index to send from: a Python peer answers with era(index). */
+        json_t *from = json_integer(first_index);
+        net_msg_pack_json(&req.info.net_msg, from);
+        json_decref(from);
+        log_info(proc->logger,
+                 "Reputation: our chain does not reproduce checkpoint epoch=%lld "
+                 "(indices %lld-%lld); requesting %s's chain\n",
+                 (long long)epoch, (long long)first_index,
+                 (long long)(first_index + count_covered - 1),
+                 nmsg->from_whom.nickname);
+        messaging_send("network", NET_MESSAGE, &req, false);
+    }
     json_decref(payload);
     return true;
 }
@@ -5866,6 +6079,16 @@ static void _store_checkpoint(const process_t *proc, const char *proposer,
     if (proposer == NULL || root == NULL)
         return;
     size_t incoming = json_is_object(sigs) ? json_object_size(sigs) : 0;
+    bool primary = (chain_key == NULL || chain_key[0] == '\0');
+    /* Every caller has verified the signatures it passes (our own proposal
+     * carries one, ours), so their number is what attests the checkpoint. */
+    size_t quorum = 0;
+    if (proc != NULL)
+    {
+        peers_read_lock(proc);
+        quorum = _quorum_for_group(proc, primary ? NULL : chain_key);
+        peers_read_unlock(proc);
+    }
     bool write = false;
     pthread_mutex_lock(&rep_state.lock);
     rep_chain_ckpt_t *slot = _ckpt_slot_locked(chain_key);
@@ -5902,6 +6125,8 @@ static void _store_checkpoint(const process_t *proc, const char *proposer,
             _mirror_primary_ckpt_locked();
         write = true;
     }
+    if (primary && incoming > quorum)
+        _note_final_locked(root, first_index, count);
     pthread_mutex_unlock(&rep_state.lock);
     if (write)
         _persist_history(proc, chain_key);
@@ -6139,6 +6364,44 @@ static void _decay_reputations(const process_t *proc, double present)
         _publish_tier_change(proc, u, changed_score[i]);
         _publish_reputation_change(u, changed_score[i]);
     }
+}
+
+/* Every peer the primary chain names, COPIED out (map_keys returns the map's
+ * own key array, which the reconcile's map rebuild frees). Caller holds
+ * rep_state.lock and frees the result. */
+static uuid_t *_chain_peers_locked(size_t *n_out)
+{
+    *n_out = 0;
+    size_t cap = map_size(&rep_state.history.peer_map);
+    uuid_t *out = calloc(cap > 0 ? cap : 1, sizeof(uuid_t));
+    if (out == NULL)
+        return NULL;
+    map_key_t key;
+    data_t *val;
+    map_entries_for_each(&rep_state.history.peer_map, key, val)
+    {
+        (void)val;
+        if (*n_out < cap && uuid_parse(key, out[*n_out]) == 0)
+            (*n_out)++;
+    }
+    map_end_for_each
+    return out;
+}
+
+/* Whether @p chain holds @p task_uuid as a COMMITTED (both halves) entry.
+ * "Transaction committed" names one side's Paxos round, and a report exists
+ * only once the other side's half is in too; the cohort needs to tell the two
+ * apart (moderation cohort run 9 passed the first and still moved no score).
+ * Caller holds rep_state.lock. */
+static bool _is_bilateral_locked(const tx_history_t *chain,
+                                 const uuid_t task_uuid, int *index)
+{
+    transaction_t tx;
+    if (tx_history_by_task(chain, task_uuid, &tx) != 0)
+        return false;
+    if (index != NULL)
+        *index = tx.index;
+    return tx.p1_set && tx.p2_set;
 }
 
 /* Stamp "we just transacted with this peer" — resets its idle clock so the
@@ -6437,7 +6700,11 @@ static bool _rebuild_one_chain(const process_t *proc, const char *chain_key,
                     slot->own_epoch = ckpt.epoch;
             }
             if (chain_key == NULL || chain_key[0] == '\0')
+            {
                 _mirror_primary_ckpt_locked();
+                /* The rebuild verified this checkpoint's quorum. */
+                _note_final_locked(ckpt.root, ckpt.first_index, ckpt.count);
+            }
             int adopted = dest->committed_count;
             pthread_mutex_unlock(&rep_state.lock);
             log_info(proc->logger,
@@ -7049,6 +7316,7 @@ void reputation_reset_state(int num_peers)
     map_init(&rep_state.checkpoint_sigs_final);
     rep_state.checkpoint_first_index = 0;
     rep_state.checkpoint_count = 0;
+    rep_state.final_set = false;
     rep_state.checkpoint_proposer[0] = '\0';
     rep_state.checkpoint_own_epoch = 0;
     rep_state.next_checkpoint_at = 0.0;
@@ -7376,6 +7644,14 @@ void reputation_install_coop_mode(const uuid_t peer_uuid, bool in_coop)
 
 void reputation_install_checkpoint(const char *root, int64_t epoch)
 {
+    reputation_install_checkpoint_window(root, epoch, 0, 0);
+}
+
+/* As reputation_install_checkpoint, with the window it covers: the finality
+ * line chain reconciliation must not cross (ISSUES.md §2.15). */
+void reputation_install_checkpoint_window(const char *root, int64_t epoch,
+                                          int first_index, int count)
+{
     _ensure_init();
     pthread_mutex_lock(&rep_state.lock);
     if (root != NULL && root[0] != '\0')
@@ -7389,9 +7665,13 @@ void reputation_install_checkpoint(const char *root, int64_t epoch)
         {
             snprintf(slot->root, sizeof(slot->root), "%s", root);
             slot->epoch = epoch;
+            slot->first_index = first_index;
+            slot->count = count;
             slot->set = true;
         }
         _mirror_primary_ckpt_locked();
+        /* A fixture checkpoint stands for a finalized one. */
+        _note_final_locked(root, first_index, count);
     }
     pthread_mutex_unlock(&rep_state.lock);
 }

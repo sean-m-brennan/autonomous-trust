@@ -19,7 +19,7 @@ from uuid import uuid4
 
 from autonomous_trust.core.reputation.reputation import (
     TransactionScore, Transaction, TransactionHistory,
-    Reputation, Reputations, PeerReputation,
+    Reputation, Reputations, PeerReputation, ReconcileResult,
 )
 from autonomous_trust.core.reputation.repprocess import ReputationProcess
 
@@ -801,6 +801,173 @@ class TestTransactionHistory:
                 th.window_root()) is True
 
 
+class TestChainForkReconcile:
+    """LONGEST VERIFIED CHAIN (ISSUES.md §2.15). Mirrors C's
+    reputation_fork_test.c case for case.
+
+    Tasks are named by letter and share ids and peers across histories, so two
+    histories built from the same prefix hold hash-identical entries up to the
+    point where their letters differ: that is where they fork."""
+
+    @pytest.fixture(autouse=True)
+    def _ids(self):
+        self.tasks = {c: uuid4() for c in 'abcdefghijklmnopqrstuvwxyz'}
+        self.p1, self.p2 = uuid4(), uuid4()
+
+    def _chain(self, letters):
+        th = TransactionHistory()
+        for c in letters:
+            t = ord(c) - ord('a')
+            th.update(self.tasks[c], self.p1, 0.3 + 0.02 * t)
+            th.update(self.tasks[c], self.p2, 0.9 - 0.02 * t)
+        return th
+
+    @staticmethod
+    def _wire(th):
+        # Through the wire, as a peer's report arrives: no shared objects.
+        from autonomous_trust.core.config import (
+            to_json_string, from_json_string)
+        return from_json_string(to_json_string(list(th)))
+
+    def test_adopts_the_longer_chain(self):
+        ours, theirs = self._chain('abx'), self._chain('abcd')
+        res = ours.reconcile(self._wire(theirs))
+        assert res.status == ReconcileResult.ADOPTED
+        assert res.fork == 2
+        assert [t.task_id for t in res.dropped] == [self.tasks['x']]
+        assert len(res.added) == 2
+        assert len(ours) == 4 and ours._next_index == 4
+        assert ours.verify_links()
+        assert ours.window_root() == theirs.window_root()  # verbatim
+        assert self.tasks['x'] not in ours._task_mapping
+        assert ours[self.tasks['d']].index == 3
+        assert len(ours.by_peer(self.p2)) == 4
+        # Agreeing now, the same report again changes nothing.
+        assert ours.reconcile(self._wire(theirs)).status == ReconcileResult.NONE
+
+    def test_keeps_our_chain_when_the_peer_is_shorter(self):
+        ours, theirs = self._chain('abxy'), self._chain('abc')
+        before = ours.window_root()
+        res = ours.reconcile(self._wire(theirs))
+        assert res.status == ReconcileResult.KEPT
+        assert res.fork == 2
+        assert len(ours) == 4 and ours.window_root() == before
+
+    def test_tiebreak_is_symmetric(self):
+        # Equal tips: the LOWER head hash wins, whichever side reconciles.
+        a, b = self._chain('abx'), self._chain('abc')
+        a_lower = a._head_hash < b._head_hash
+        a2, b2 = self._chain('abx'), self._chain('abc')
+        ra = a2.reconcile(self._wire(b))
+        rb = b2.reconcile(self._wire(a))
+        adopted, kept = ReconcileResult.ADOPTED, ReconcileResult.KEPT
+        assert ra.status == (kept if a_lower else adopted)
+        assert rb.status == (adopted if a_lower else kept)
+        assert a2.window_root() == b2.window_root()
+
+    def test_the_quorum_chain_wins_an_equal_length_tiebreak(self):
+        """mod-2538837: an equal-length order fork goes to the lower head hash,
+        which can be the side the quorum outvoted. A segment reproducing the
+        attested window wins instead. Mirrors C."""
+        mine, theirs = 'abx', 'abc'
+        probe = self._chain(mine)
+        if probe.reconcile(self._wire(self._chain(theirs))).status \
+                != ReconcileResult.KEPT:
+            mine, theirs = theirs, mine
+        keeper, other = self._chain(mine), self._chain(theirs)
+        attested = (other.window_root(), 0, 3)
+        res = keeper.reconcile(self._wire(other), attested=attested)
+        assert res.status == ReconcileResult.ADOPTED
+        assert keeper.window_root() == other.window_root()
+        # An attestation the segment does not reproduce changes nothing.
+        k2 = self._chain(mine)
+        res = k2.reconcile(self._wire(other), attested=(b'0' * 64, 0, 3))
+        assert res.status == ReconcileResult.KEPT
+
+    def test_refused_inside_the_finalized_checkpoint(self):
+        ours, theirs = self._chain('abx'), self._chain('abcd')
+        before = ours.window_root()
+        res = ours.reconcile(self._wire(theirs), final_end=3)
+        assert res.status == ReconcileResult.REFUSED_FINAL
+        assert res.fork == 2 and ours.window_root() == before
+        # The fork past the checkpoint is adopted.
+        res = ours.reconcile(self._wire(theirs), final_end=2)
+        assert res.status == ReconcileResult.ADOPTED
+        assert ours.window_root() == theirs.window_root()
+
+    def test_adoption_keeps_pending_work(self):
+        ours, theirs = self._chain('abx'), self._chain('abcd')
+        z, d = self.tasks['z'], self.tasks['d']
+        ours.update(z, self.p1, 0.4)
+        ours.update(d, self.p1, 0.3 + 0.02 * 3)
+        res = ours.reconcile(self._wire(theirs))
+        assert res.status == ReconcileResult.ADOPTED
+        assert len(ours) == 4
+        assert ours.window_root() == theirs.window_root()
+        assert len(ours[d]) == 2 and len(ours[z]) == 1
+        ours.update(z, self.p2, 0.6)
+        assert len(ours) == 5 and ours[z].index == 4
+        assert ours.verify_links()
+
+
+class TestFinalityNeedsQuorum:
+    """Finality means a quorum attested the window and our own entries over it
+    still hash to the attested root (ISSUES.md §2.15). Moderation cohort runs
+    mod-2481048 and mod-2483539 (2026-09-23) refused every reconciliation
+    because a proposer's own proposal, stored with only its own signature,
+    counted as final. Mirrors rep_quorum_test.c."""
+
+    def _proc(self, letters):
+        tasks = {c: uuid4() for c in 'abcdefghijklmnopqrstuvwxyz'}
+        p1, p2 = uuid4(), uuid4()
+        th = TransactionHistory()
+        for c in letters:
+            t = ord(c) - ord('a')
+            th.update(tasks[c], p1, 0.3 + 0.02 * t)
+            th.update(tasks[c], p2, 0.9 - 0.02 * t)
+        stub = SimpleNamespace(history=th, _finalized=None,
+                               _quorum_for_group=lambda g: 1)
+        return stub
+
+    @staticmethod
+    def _ckpt(root, count):
+        from autonomous_trust.core._python.reputation.reputation import Checkpoint
+        return Checkpoint(proposer_uuid=uuid4(), root=root, epoch=1,
+                          first_index=0, count=count)
+
+    def test_our_own_proposal_alone_is_not_final(self):
+        stub = self._proc('abx')
+        ckpt = self._ckpt(stub.history.window_root(), 3)
+        ReputationProcess._note_final(stub, ckpt, {'me': 'sig'}, '')
+        assert stub._finalized is None
+        assert ReputationProcess._final_end(stub) is None
+
+    def test_a_quorate_checkpoint_over_our_chain_is_final(self):
+        stub = self._proc('abx')
+        ckpt = self._ckpt(stub.history.window_root(), 3)
+        ReputationProcess._note_final(stub, ckpt, {'me': 's', 'bob': 's'}, '')
+        assert ReputationProcess._final_end(stub) == 3
+
+    def test_a_quorate_checkpoint_our_chain_lost_is_not_final(self):
+        stub = self._proc('abx')
+        ckpt = self._ckpt(b'0' * 64, 3)
+        ReputationProcess._note_final(stub, ckpt, {'bob': 's', 'carol': 's'}, '')
+        assert stub._finalized is ckpt
+        assert ReputationProcess._final_end(stub) is None
+
+    def test_a_child_chain_checkpoint_is_not_primary_finality(self):
+        stub = self._proc('abx')
+        ckpt = self._ckpt(stub.history.window_root(), 3)
+        ReputationProcess._note_final(stub, ckpt, {'a': 's', 'b': 's'}, 'grp')
+        assert stub._finalized is None
+
+    def test_range_root_matches_window_root_and_refuses_gaps(self):
+        th = self._proc('abx').history
+        assert th.range_root(0, 3) == th.window_root()
+        assert th.range_root(0, 4) is None
+        assert th.range_root(1, 2) is not None
+
+
 class TestReputation:
     def test_init(self):
         pid = uuid4()
@@ -1021,8 +1188,58 @@ class TestPureReputation:
         stub.history.update(t, self_id, 0.7)   # self is p2 (counterparty)
         score = ReputationProcess._pure_reputation(
             stub, SimpleNamespace(uuid=peer_id))
-        # counterparty_score = 0.7, cp_rep = 0.8 → 0.56.
-        assert score == pytest.approx(0.56, abs=0.001)
+        # One entry: the average is its score, whatever the weight (0.56
+        # before 2026-09-23, when the divisor left the reputation out).
+        assert score == pytest.approx(0.7, abs=0.001)
+
+    def test_reporters_are_weighted_by_their_reputation(self):
+        """sum(score * rep) / sum(rep): a trusted reporter's 0.9 outweighs an
+        untrusted one's 0.3. A plain average gives 0.6; the old divisor,
+        sum(w) alone, gave 0.39 and so decayed well-behaved peers."""
+        self_id, peer_id, a, b = uuid4(), uuid4(), uuid4(), uuid4()
+        reps = Reputations()
+        reps.update(a, 0.8)
+        reps.update(b, 0.2)
+        stub = _stub_proc(self_id, reputations=reps)
+        for reporter, s in ((a, 0.9), (b, 0.3)):
+            t = uuid4()
+            stub.history.update(t, peer_id, 0.5)
+            stub.history.update(t, reporter, s)
+        score = ReputationProcess._pure_reputation(
+            stub, SimpleNamespace(uuid=peer_id))
+        assert score == pytest.approx((0.9 * 0.8 + 0.3 * 0.2) / 1.0, abs=1e-6)
+
+    def test_well_behaved_peers_do_not_decay_under_rescoring(self):
+        """Fed back through repeated rescoring, peers whose every transaction
+        scores 0.9 stay at 0.9. The old divisor drove them toward zero."""
+        self_id, p, q = uuid4(), uuid4(), uuid4()
+        reps = Reputations()
+        reps.update(p, 0.7)
+        reps.update(q, 0.7)
+        stub = _stub_proc(self_id, reputations=reps)
+        for _ in range(4):
+            t = uuid4()
+            stub.history.update(t, p, 0.9)
+            stub.history.update(t, q, 0.9)
+        for _ in range(20):
+            sp = ReputationProcess._pure_reputation(stub, SimpleNamespace(uuid=p))
+            sq = ReputationProcess._pure_reputation(stub, SimpleNamespace(uuid=q))
+            reps.update(p, sp)
+            reps.update(q, sq)
+        assert sp == pytest.approx(0.9, abs=1e-6)
+        assert sq == pytest.approx(0.9, abs=1e-6)
+
+    def test_reporters_without_reputation_leave_the_prior(self):
+        self_id, peer_id, a = uuid4(), uuid4(), uuid4()
+        reps = Reputations()
+        reps.update(a, 0.0)
+        stub = _stub_proc(self_id, reputations=reps)
+        t = uuid4()
+        stub.history.update(t, peer_id, 0.5)
+        stub.history.update(t, a, 0.9)
+        score = ReputationProcess._pure_reputation(
+            stub, SimpleNamespace(uuid=peer_id))
+        assert score == pytest.approx(stub.PREREP_NEUTRAL)
 
     def test_unknown_counterparty_uses_default_neutral(self):
         """Counterparty missing from self.reputations falls back to
@@ -1035,8 +1252,8 @@ class TestPureReputation:
         stub.history.update(t, self_id, 0.6)
         score = ReputationProcess._pure_reputation(
             stub, SimpleNamespace(uuid=peer_id))
-        # counterparty_score = 0.6, cp_rep = 0.2 → 0.12.
-        assert score == pytest.approx(0.12, abs=0.001)
+        # Counted, at the fallback weight: one entry, so its score.
+        assert score == pytest.approx(0.6, abs=0.001)
 
 
 class TestProposerHistoryBilateral:

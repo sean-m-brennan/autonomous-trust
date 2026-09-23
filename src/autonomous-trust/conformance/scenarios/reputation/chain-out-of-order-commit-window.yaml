@@ -1,0 +1,68 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: chain-out-of-order-commit-window
+byte_pinning: false
+description: |
+    Two tasks that commit in the opposite order to the one they started in.
+    The committed window must follow COMMIT order in both runtimes.
+
+    With several proposers this is the ordinary case: task t-a's first half
+    arrives, then task t-b arrives and commits whole, and only then does
+    t-a's second half land. t-b takes index 0 and t-a index 1, and t-a's
+    prev_hash links to t-b.
+
+    Python's chain holds only committed entries, appended as they commit, so
+    it always had this right. C kept every entry, pending ones included, at
+    the slot where its FIRST half arrived, and walked that array as the
+    committed sequence. Its window read [t-a, t-b], its hash links failed,
+    and every peer rejected its catch-up segment whole. That surfaced in the
+    live moderation cohort (run 8, 2026-09-23) as a persisted chain whose
+    indices read [3, 0, 2, 1]. C now moves an entry to the end of the array
+    when it commits.
+
+    The pin is bob's window_root, the ordered RFC 6962 Merkle root over his
+    committed window. A window in arrival order gives a different root on one
+    side only. committed_tx_count shows both entries committed, so a run that
+    dropped the completing commit cannot pass on the root alone.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: proposer
+
+fixtures:
+  # Staged through the real writer (tx_history_update / history.update), in
+  # arrival order: t-a's first half, then t-b whole. The C harness resets
+  # state between steps, so only the step that completes t-a can be asserted
+  # on (see committed-channel-in-the-entry-hash).
+  tx_history:
+    bob:
+      - task_id: t-a
+        p1: carol
+        p1_score: 0.9
+      - task_id: t-b
+        p1: carol
+        p1_score: 0.8
+        p2: alice
+        p2_score: 0.7
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: tx committed
+    payload:
+      task_id: t-a
+      score: 0.5
+    description: |
+        t-a's second half lands after t-b has already committed. t-a takes
+        index 1 and links to t-b.
+
+expected_state:
+  bob:
+    committed_tx_count: 2
+    window_root: "91aa8a1470400528645118f36cc6dc57bf046fd638f01867985c2bc025633685"

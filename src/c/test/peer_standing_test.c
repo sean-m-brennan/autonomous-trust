@@ -589,7 +589,42 @@ DEFINE_TEST(test_another_authority_does_not_rearm_a_spent_verdict)
 }
 END_TEST_DEFINITION()
 
+
+/* Moderation cohort mod-2518340 (2026-09-23): after ethne lifted bob's
+ * ceiling, ada still read him at the capped 0.300 long after, and phase 7
+ * measured a report's effect against that residue. The stored score is the
+ * capped one, and a lift made nobody due for a rescore. */
+DEFINE_TEST(test_a_lifted_ceiling_is_rescored_when_it_lifts)
+{
+    identity_t *me = _mk_identity("10.0.0.1", "self");
+    identity_t *them = _mk_identity("10.0.0.2", "peer");
+    process_t *proc = _mk_process(me);
+    reputation_reset_state(3);
+    messaging_set_test_hook(_sink_hook);
+    _transact(me->uuid, them->uuid, 6, 1);
+    reputation_install_peer_reputation(them->uuid, 0.95);
+    reputation_install_coop_mode(them->uuid, true);
+
+    _standing_from(proc, them->uuid, PEER_STANDING_SOURCE_ETHNE,
+                   PEER_STANDING_CAPPED, 0.3, "moderation");
+    ck_assert_int_eq(reputation_rescore_sweep(proc, 1000000.0, me->uuid), 1);
+    double capped = 0.0;
+    ck_assert_ret_ok(reputation_get_peer_reputation(them->uuid, &capped));
+    ck_assert_double_eq_tol(capped, 0.3, SCORE_TOL);
+
+    /* The lift rescores at once, not at the next sweep: mod-2531555 read the
+     * cap in the seconds before that sweep ran. No sweep here. */
+    _standing_from(proc, them->uuid, PEER_STANDING_SOURCE_ETHNE,
+                   PEER_STANDING_PROVED, -1.0, "reinstated");
+    double lifted = 0.0;
+    ck_assert_ret_ok(reputation_get_peer_reputation(them->uuid, &lifted));
+    ck_assert(lifted > 0.3 + SCORE_TOL);
+    messaging_set_test_hook(NULL);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(PeerStanding,
+          test_a_lifted_ceiling_is_rescored_when_it_lifts,
           test_a_capped_peer_is_bounded,
           test_a_proved_peer_is_unbounded,
           test_silence_bounds_nobody,

@@ -447,6 +447,11 @@ class ReputationAdapter:
         # UUIDv5(rep:<pid>). Required by reputation_pure / _contrite_tft
         # to score against committed bilateral txs.
         preset_tx_history: dict[str, list[dict[str, Any]]] = fixtures.get('tx_history', {}) or {}
+        # local_chain: { pid -> [{task, p1, p2}] } -- the participant's OWN
+        # committed chain, built through history.update() with the SAME uuid
+        # derivation as the `latest update` payload builder, so it hash-matches
+        # a reported chain up to wherever the two fork. Mirrors C.
+        preset_local_chain: dict[str, list[dict[str, Any]]] = fixtures.get('local_chain', {}) or {}
         # reputations pre-stages self.process.reputations. { pid -> { other_pid -> float } }.
         # Used to pin the counterparty's reputation (consumed by reputation_pure)
         # and the subject peer's `previous` value (consumed by _compute_reputation's
@@ -583,6 +588,13 @@ class ReputationAdapter:
             # two history.update calls (matching how handle_committed
             # builds bilateral history in production). p1/p2 reference
             # participant ids; missing ids on either side are skipped.
+            for entry in preset_local_chain.get(pid, []):
+                tk = uuid5(_NS, f"chain:{entry['task']}")
+                participant.process.history.update(
+                    tk, uuid5(_NS, f"chainp1:{entry['task']}"), float(entry['p1']))
+                participant.process.history.update(
+                    tk, uuid5(_NS, f"chainp2:{entry['task']}"), float(entry['p2']))
+
             for entry in preset_tx_history.get(pid, []):
                 slug = entry.get('task_id')
                 p1_id = entry.get('p1')

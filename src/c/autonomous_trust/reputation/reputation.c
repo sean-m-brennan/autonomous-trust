@@ -257,6 +257,29 @@ static int collect_window_leaves(const tx_history_t *hist,
     return n;
 }
 
+int tx_history_range_root(const tx_history_t *hist, int first, int count,
+                          char out[TX_HASH_HEX_LEN + 1])
+{
+    if (hist == NULL || count <= 0 || count > MAX_CHAIN_LEN)
+        return -1;
+    char leaves[MAX_CHAIN_LEN][TX_HASH_HEX_LEN + 1];
+    int n = 0;
+    for (int i = 0; i < hist->chain_len && n < count; i++)
+    {
+        const transaction_t *t = &hist->chain[i];
+        if (t->index < first || t->index >= first + count)
+            continue;
+        if (t->index != first + n)
+            return -1;
+        transaction_entry_hash(t, leaves[n]);
+        n++;
+    }
+    if (n != count)
+        return -1;
+    mth_range(leaves, 0, n, out);
+    return 0;
+}
+
 void transaction_window_root(const tx_history_t *hist, char out[TX_HASH_HEX_LEN + 1])
 {
     char leaves[MAX_CHAIN_LEN][TX_HASH_HEX_LEN + 1];
@@ -1042,258 +1065,334 @@ int tx_history_era_to_json(const tx_history_t *hist, int start_idx, int end_idx,
 }
 
 /* Frama-C: skipped — [serialization] jansson JSON deserialization */
-static int _era_from_json_ordered(tx_history_t *hist, const json_t *arr);
-
-static json_int_t _entry_index(const json_t *obj)
+/* Parse one wire entry into @p tx. Returns false for an entry with no task
+ * or parties (skipped, as the loader always has). */
+static bool _tx_from_json(const json_t *obj, transaction_t *tx)
 {
-    json_t *j = json_object_get((json_t *)obj, "index");
-    return json_is_integer(j) ? json_integer_value(j) : -1;
+    const char *task_str = json_string_value(json_object_get((json_t *)obj, "task"));
+    const char *p1_str = json_string_value(json_object_get((json_t *)obj, "p1"));
+    const char *p2_str = json_string_value(json_object_get((json_t *)obj, "p2"));
+    if (task_str == NULL || p1_str == NULL || p2_str == NULL)
+        return false;
+    memset(tx, 0, sizeof(*tx));
+    uuid_parse(task_str, tx->task_uuid);
+    uuid_parse(p1_str, tx->p1_uuid);
+    tx->p1_score = json_number_value(json_object_get((json_t *)obj, "p1_score"));
+    tx->p1_set = json_boolean_value(json_object_get((json_t *)obj, "p1_set"));
+    uuid_parse(p2_str, tx->p2_uuid);
+    tx->p2_score = json_number_value(json_object_get((json_t *)obj, "p2_score"));
+    tx->p2_set = json_boolean_value(json_object_get((json_t *)obj, "p2_set"));
+    json_t *j_index = json_object_get((json_t *)obj, "index");
+    tx->index = json_is_integer(j_index) ? (int)json_integer_value(j_index) : -1;
+    /* Channels feed the entry hash, so the link check needs them too. An
+     * unknown spelling is dropped rather than refused: the hash then
+     * mismatches and the segment is rejected as a broken link. */
+    _tx_channels_from_json(obj, tx);
+    const char *ph = json_string_value(json_object_get((json_t *)obj, "prev_hash"));
+    tx->prev_hash[0] = '\0';
+    if (ph != NULL)
+    {
+        strncpy(tx->prev_hash, ph, TX_HASH_HEX_LEN);
+        tx->prev_hash[TX_HASH_HEX_LEN] = '\0';
+    }
+    return true;
 }
 
-/* A segment is verified and loaded in INDEX order, whatever order it came in.
- * A peer on a build from before _move_to_commit_position, or a snapshot it
- * persisted, lists committed entries in arrival order, and read that way a
- * sound chain fails its own link check. Stable insertion sort: the segment
- * holds at most MAX_CHAIN_LEN entries. */
+/* Our COMMITTED entry at absolute @p index, or NULL. chain[] holds committed
+ * entries in index order (see _move_to_commit_position), pending ones
+ * interleaved; N <= MAX_CHAIN_LEN, so a scan is fine. */
+static const transaction_t *_committed_at(const tx_history_t *hist, int index)
+{
+    for (int i = 0; i < hist->chain_len; i++)
+    {
+        const transaction_t *t = &hist->chain[i];
+        if (t->p1_set && t->p2_set && t->index == index)
+            return t;
+    }
+    return NULL;
+}
+
+static int _slot_of_task(const tx_history_t *hist, const uuid_t task)
+{
+    char key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(task, key);
+    data_t *d = NULL;
+    int slot = -1;
+    if (map_get((map_t *)&hist->task_map, key, &d) == 0 && d != NULL)
+        data_integer(d, &slot);
+    return (slot >= 0 && slot < hist->chain_len) ? slot : -1;
+}
+
 int tx_history_era_from_json(tx_history_t *hist, const json_t *arr)
 {
-    if (!json_is_array(arr))
-        return -1;
-    size_t n = json_array_size(arr);
-    json_t **items = calloc(n > 0 ? n : 1, sizeof(json_t *));
-    if (items == NULL)
-        return EXCEPTION(ENOMEM);
-    for (size_t i = 0; i < n; i++)
-    {
-        json_t *cur = json_array_get(arr, i);
-        size_t j = i;
-        while (j > 0 && _entry_index(items[j - 1]) > _entry_index(cur))
-        {
-            items[j] = items[j - 1];
-            j--;
-        }
-        items[j] = cur;
-    }
-    json_t *sorted = json_array();
-    if (sorted == NULL)
-    {
-        free(items);
-        return EXCEPTION(ENOMEM);
-    }
-    for (size_t i = 0; i < n; i++)
-        json_array_append(sorted, items[i]);
-    free(items);
-    int rc = _era_from_json_ordered(hist, sorted);
-    json_decref(sorted);
-    return rc;
+    return tx_history_reconcile(hist, arr, -1, NULL);
 }
 
-static int _era_from_json_ordered(tx_history_t *hist, const json_t *arr)
+/* LONGEST VERIFIED CHAIN (ISSUES.md §2.15; user decision 2026-09-23). Mirrors
+ * Python's TransactionHistory.reconcile step for step.
+ *
+ * Chains forked by ORDER: each node numbers an entry when its second half
+ * lands, and catch-up used to append only past our own next_index, so two
+ * nodes holding different tasks at one index never came back together, and
+ * since a grant needs equal chain lengths, Paxos stalled for good (moderation
+ * cohort run 12: chains of 9/10/11, carol sharing no prefix with anyone).
+ *
+ *  1. the segment's links must verify (tampering rejects it whole);
+ *  2. the fork point f is the first index where the two differ by entry
+ *     hash, or where only the peer has an entry (a pure extension has
+ *     f == next_index);
+ *  3. on a real divergence the peer wins only with the higher tip: last
+ *     index + 1, then the LOWER head hash on a tie, which every node orders
+ *     the same way, so they converge and cannot flap;
+ *  4. nothing below @p final_end (our finalized checkpoint) is rewritten;
+ *  5. adopting drops our committed entries from f on (both halves of what
+ *     only we held there are lost: the price of the rule) and loads the
+ *     peer's VERBATIM, completing a task we held pending in place. Verbatim,
+ *     so that two nodes that agree become byte-identical and compute the same
+ *     window root. */
+int tx_history_reconcile(tx_history_t *hist, const json_t *arr,
+                         int final_end, tx_reconcile_result_t *out)
 {
+    return tx_history_reconcile_attested(hist, arr, final_end, NULL, out);
+}
+
+/* True iff the verified, index-sorted segment holds every index of the
+ * attested window, in order, and they hash to its root. */
+static bool _segment_reproduces(const transaction_t *seg, int n,
+                                const tx_attested_t *att)
+{
+    if (att == NULL || att->count <= 0 || att->count > MAX_CHAIN_LEN)
+        return false;
+    char leaves[MAX_CHAIN_LEN][TX_HASH_HEX_LEN + 1];
+    int k = 0;
+    for (int i = 0; i < n && k < att->count; i++)
+    {
+        if (seg[i].index < att->first_index)
+            continue;
+        if (seg[i].index != att->first_index + k)
+            return false;
+        transaction_entry_hash(&seg[i], leaves[k]);
+        k++;
+    }
+    if (k != att->count)
+        return false;
+    char root[TX_HASH_HEX_LEN + 1];
+    mth_range(leaves, 0, k, root);
+    return strcmp(root, att->root) == 0;
+}
+
+int tx_history_reconcile_attested(tx_history_t *hist, const json_t *arr,
+                                  int final_end,
+                                  const tx_attested_t *attested,
+                                  tx_reconcile_result_t *out)
+{
+    tx_reconcile_result_t res = { TX_RECONCILE_NONE, -1, 0, 0 };
     if (!json_is_array(arr))
         return -1;
-
-    size_t idx;
-    json_t *obj;
-    int max_loaded_index = -1;
-
-    /* Phase 1: verify the incoming segment's hash-linkage before loading
-     * any of it. A peer (or a corrupted transfer) cannot slip an altered
-     * committed entry past us — the "verifiable instead of social" sync win
-     * (reputation-vs-blockchain-analysis.md §2.1). Mirrors Python
-     * TransactionHistory.catchup's wholesale reject. We stream-verify with
-     * just the previous committed entry so an over-long array needs no temp
-     * buffer. */
+    size_t n_all = json_array_size(arr);
+    transaction_t *seg = calloc(n_all > 0 ? n_all : 1, sizeof(transaction_t));
+    if (seg == NULL)
+        return EXCEPTION(ENOMEM);
+    int n = 0;
+    for (size_t i = 0; i < n_all; i++)
     {
-        transaction_t prev;
-        bool have_prev = false;
-        json_array_foreach(arr, idx, obj)
+        transaction_t cur;
+        if (!_tx_from_json(json_array_get(arr, i), &cur) || cur.index < 0
+            || !cur.p1_set || !cur.p2_set)
+            continue;
+        /* Index order, stable insertion: a peer on an older build lists its
+         * entries in arrival order. */
+        int j = n;
+        while (j > 0 && seg[j - 1].index > cur.index)
         {
-            const char *task_str = json_string_value(json_object_get(obj, "task"));
-            const char *p1_str = json_string_value(json_object_get(obj, "p1"));
-            const char *p2_str = json_string_value(json_object_get(obj, "p2"));
-            if (task_str == NULL || p1_str == NULL || p2_str == NULL)
+            seg[j] = seg[j - 1];
+            j--;
+        }
+        seg[j] = cur;
+        n++;
+    }
+    if (n == 0)
+        goto done;
+    if (!tx_verify_chain_links(seg, n))
+    {
+        res.status = TX_RECONCILE_REJECTED;
+        goto done;
+    }
+
+    int f = -1;
+    if (hist->committed_count == 0)
+    {
+        f = seg[0].index;
+    }
+    else
+    {
+        if (seg[0].index > hist->next_index)
+        {
+            res.status = TX_RECONCILE_REJECTED;   /* a gap: nothing to link to */
+            goto done;
+        }
+        char ho[TX_HASH_HEX_LEN + 1], hs[TX_HASH_HEX_LEN + 1];
+        for (int i = 0; i < n; i++)
+        {
+            if (seg[i].index < hist->first_index)
                 continue;
-            transaction_t cur;
-            memset(&cur, 0, sizeof(cur));
-            uuid_parse(task_str, cur.task_uuid);
-            uuid_parse(p1_str, cur.p1_uuid);
-            cur.p1_score = json_number_value(json_object_get(obj, "p1_score"));
-            cur.p1_set = json_boolean_value(json_object_get(obj, "p1_set"));
-            uuid_parse(p2_str, cur.p2_uuid);
-            cur.p2_score = json_number_value(json_object_get(obj, "p2_score"));
-            cur.p2_set = json_boolean_value(json_object_get(obj, "p2_set"));
-            cur.index = (int)json_integer_value(json_object_get(obj, "index"));
-            /* Channels feed the entry hash, so the link-verification pass
-             * needs them too -- verifying without them would compute a
-             * different digest than the sender did and reject a sound
-             * segment. Unknown spellings are dropped rather than refused
-             * here: the resulting hash then mismatches and the segment is
-             * rejected as a broken link, which is the same outcome by the
-             * path this pass already has for tampering. */
-            _tx_channels_from_json(obj, &cur);
-            const char *ph = json_string_value(json_object_get(obj, "prev_hash"));
-            cur.prev_hash[0] = '\0';
-            if (ph != NULL)
+            const transaction_t *o = _committed_at(hist, seg[i].index);
+            if (o == NULL)
             {
-                strncpy(cur.prev_hash, ph, TX_HASH_HEX_LEN);
-                cur.prev_hash[TX_HASH_HEX_LEN] = '\0';
+                f = seg[i].index;
+                break;
             }
-            if (cur.index < 0)
-                continue;  /* pending entry — not part of the committed link */
-            if (have_prev)
+            transaction_entry_hash(o, ho);
+            transaction_entry_hash(&seg[i], hs);
+            if (strcmp(ho, hs) != 0)
             {
-                char expect[TX_HASH_HEX_LEN + 1];
-                transaction_entry_hash(&prev, expect);
-                if (strncmp(cur.prev_hash, expect, TX_HASH_HEX_LEN + 1) != 0)
-                    return 0;  /* broken link — reject the whole segment */
+                f = seg[i].index;
+                break;
             }
-            prev = cur;
-            have_prev = true;
+        }
+        if (f < 0)
+            goto done;                              /* we already hold all of it */
+        /* The peer's entry at f must continue OUR prefix. */
+        const transaction_t *s_at_f = NULL;
+        for (int i = 0; i < n; i++)
+            if (seg[i].index == f) { s_at_f = &seg[i]; break; }
+        const transaction_t *pred = _committed_at(hist, f - 1);
+        const transaction_t *o_at_f = _committed_at(hist, f);
+        if (pred != NULL)
+        {
+            transaction_entry_hash(pred, ho);
+            if (strcmp(s_at_f->prev_hash, ho) != 0)
+            {
+                res.status = TX_RECONCILE_REJECTED;
+                goto done;
+            }
+        }
+        else if (o_at_f != NULL && strcmp(s_at_f->prev_hash, o_at_f->prev_hash) != 0)
+        {
+            res.status = TX_RECONCILE_REJECTED;
+            goto done;
+        }
+    }
+    res.fork = f;
+
+    if (hist->committed_count > 0 && f < hist->next_index)
+    {
+        int s_tip = seg[n - 1].index + 1;
+        int o_tip = hist->next_index;
+        char s_head[TX_HASH_HEX_LEN + 1];
+        transaction_entry_hash(&seg[n - 1], s_head);
+        /* A chain the quorum finalized beats one it outvoted, whatever the
+         * tips: an order fork at equal length would otherwise go to the lower
+         * head hash, which can be the losing side, and never converge. */
+        bool quorum_chain = _segment_reproduces(seg, n, attested);
+        if (!quorum_chain
+            && (s_tip < o_tip
+                || (s_tip == o_tip && strcmp(s_head, hist->head_hash) >= 0)))
+        {
+            res.status = TX_RECONCILE_KEPT;
+            goto done;
+        }
+        if (final_end >= 0 && f < final_end)
+        {
+            res.status = TX_RECONCILE_REFUSED_FINAL;
+            goto done;
         }
     }
 
-    json_array_foreach(arr, idx, obj)
+    /* A task we hold COMMITTED below the fork cannot appear again above it. */
+    for (int i = 0; i < n; i++)
     {
-        const char *task_str = json_string_value(json_object_get(obj, "task"));
-        const char *p1_str = json_string_value(json_object_get(obj, "p1"));
-        const char *p2_str = json_string_value(json_object_get(obj, "p2"));
-        if (task_str == NULL || p1_str == NULL || p2_str == NULL)
+        if (seg[i].index < f)
             continue;
-        /* Load only what we do not already hold, as Python's catchup does
-         * (`if link.index >= self._next_index`). A peer answers "update
-         * needed" with its WHOLE history (handle_outdated sends era 0..len),
-         * so without this every catch-up appended our own committed entries a
-         * second time. Nothing noticed while the catch-up quorum of 3 kept any
-         * merge from running in a 3-node cohort. */
-        json_t *j_index = json_object_get(obj, "index");
-        if (json_is_integer(j_index)
-            && json_integer_value(j_index) >= 0
-            && json_integer_value(j_index) < hist->next_index)
-            continue;
-
-        /* A task we already hold must not get a second slot. Committed: we
-         * have it (possibly at another index, from before we converged), so
-         * skip it. Pending (our own half is in, the other is still in
-         * flight): the peer's committed copy COMPLETES that slot, the way
-         * Python's catchup completes it through update(). Appending instead
-         * left two entries for one task once our half later committed too:
-         * bob's chain in moderation cohort run 9 (2026-09-23) held two tasks
-         * twice, was two entries longer than both peers', and was backdated
-         * by everyone from then on. */
-        char held_key[UUID_STRING_LEN + 1];
-        snprintf(held_key, sizeof(held_key), "%s", task_str);
-        for (char *c = held_key; *c; c++)
-            if (*c >= 'A' && *c <= 'F') *c = (char)(*c - 'A' + 'a');
-        data_t *held = NULL;
-        if (map_get(&hist->evicted_set, held_key, &held) == 0)
-            continue;
-        int pending_slot = -1;
-        if (map_get(&hist->task_map, held_key, &held) == 0 && held != NULL)
+        int slot = _slot_of_task(hist, seg[i].task_uuid);
+        if (slot >= 0)
         {
-            int slot = -1;
-            data_integer(held, &slot);
-            if (slot >= 0 && slot < hist->chain_len)
+            const transaction_t *h = &hist->chain[slot];
+            if (h->p1_set && h->p2_set && h->index < f)
             {
-                if (hist->chain[slot].p1_set && hist->chain[slot].p2_set)
-                    continue;
-                pending_slot = slot;
+                res.status = TX_RECONCILE_REJECTED;
+                goto done;
             }
         }
+    }
 
-        if (pending_slot < 0 && hist->chain_len >= MAX_CHAIN_LEN)
-            tx_history_evict_oldest(hist);
-
-        int slot_now = pending_slot >= 0 ? pending_slot : hist->chain_len;
-        transaction_t *tx = &hist->chain[slot_now];
-        memset(tx, 0, sizeof(transaction_t));
-        uuid_parse(task_str, tx->task_uuid);
-        uuid_parse(p1_str, tx->p1_uuid);
-        tx->p1_score = json_number_value(json_object_get(obj, "p1_score"));
-        tx->p1_set = json_boolean_value(json_object_get(obj, "p1_set"));
-        uuid_parse(p2_str, tx->p2_uuid);
-        tx->p2_score = json_number_value(json_object_get(obj, "p2_score"));
-        tx->p2_set = json_boolean_value(json_object_get(obj, "p2_set"));
-        tx->index = (int)json_integer_value(json_object_get(obj, "index"));
-        _tx_channels_from_json(obj, tx);
-        /* Preserve the wire prev_hash (consistent with preserving the wire
-         * index above); the verified segment is self-consistent, so the
-         * loaded chain's links hold. */
-        const char *ph = json_string_value(json_object_get(obj, "prev_hash"));
-        tx->prev_hash[0] = '\0';
-        if (ph != NULL)
+    /* Drop our committed entries from f on; pending entries stay. */
+    int w = 0;
+    for (int i = 0; i < hist->chain_len; i++)
+    {
+        const transaction_t *t = &hist->chain[i];
+        if (t->p1_set && t->p2_set && t->index >= f)
         {
-            strncpy(tx->prev_hash, ph, TX_HASH_HEX_LEN);
-            tx->prev_hash[TX_HASH_HEX_LEN] = '\0';
+            res.dropped++;
+            continue;
         }
+        if (w != i)
+            hist->chain[w] = hist->chain[i];
+        w++;
+    }
+    hist->chain_len = w;
+    hist->committed_count -= res.dropped;
+    if (res.dropped > 0)
+        _rebuild_slot_maps(hist);
 
-        if (pending_slot >= 0)
+    int last_loaded = -1;
+    for (int i = 0; i < n; i++)
+    {
+        if (seg[i].index < f)
+            continue;
+        char key[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(seg[i].task_uuid, key);
+        map_remove(&hist->evicted_set, key);
+        int slot = _slot_of_task(hist, seg[i].task_uuid);
+        if (slot >= 0)
         {
-            /* Completed in place: count it, then move it to commit position
-             * (which rebuilds both slot maps). */
-            if (tx->p1_set && tx->p2_set)
-            {
-                if (hist->committed_count == 0 ||
-                    tx->index < hist->first_index)
-                    hist->first_index = tx->index;
-                hist->committed_count++;
-                if (tx->index > max_loaded_index)
-                    max_loaded_index = tx->index;
-            }
-            if (_move_to_commit_position(hist, pending_slot) == pending_slot)
+            /* Pending here: the peer's committed copy completes it in place,
+             * then it moves to commit position (which rebuilds the maps). */
+            hist->chain[slot] = seg[i];
+            if (_move_to_commit_position(hist, slot) == slot)
                 _rebuild_slot_maps(hist);
-            continue;
         }
-
-        /* Update maps */
-        char task_key[UUID_STRING_LEN + 1];
-        uuid_unparse_lower(tx->task_uuid, task_key);
-        data_t *idx_d = integer_data(hist->chain_len);
-        map_set(&hist->task_map, task_key, idx_d);
-        /* ...including peer_map, which this loader used to skip. Every scoring
-         * function reaches its transactions through tx_history_by_peer, and
-         * that reads peer_map only — so a caught-up chain was resident but
-         * invisible to reputation_pure / _contrite_tft / _consensus. */
-        if (tx->p1_set)
-            _index_peer_slot(hist, tx->p1_uuid, hist->chain_len);
-        if (tx->p2_set && uuid_compare(tx->p1_uuid, tx->p2_uuid) != 0)
-            _index_peer_slot(hist, tx->p2_uuid, hist->chain_len);
-
-        /* Loaded entries from era_to_json are always bilateral
-         * (era_to_json filters unilateral out), but tolerate
-         * malformed input that drops the *_set flags. Only
-         * bilateral entries increment committed_count and feed
-         * next_index. Matches Python catch-up flow where era()
-         * + update() pair only commits whole pairs. */
-        if (tx->p1_set && tx->p2_set)
+        else
         {
-            if (hist->committed_count == 0 ||
-                tx->index < hist->first_index)
-                hist->first_index = tx->index;
-            hist->committed_count++;
-            if (tx->index > max_loaded_index)
-                max_loaded_index = tx->index;
+            if (hist->chain_len >= MAX_CHAIN_LEN)
+                tx_history_evict_oldest(hist);
+            int at = hist->chain_len;
+            hist->chain[at] = seg[i];
+            map_set(&hist->task_map, key, integer_data(at));
+            _index_peer_slot(hist, seg[i].p1_uuid, at);
+            if (uuid_compare(seg[i].p1_uuid, seg[i].p2_uuid) != 0)
+                _index_peer_slot(hist, seg[i].p2_uuid, at);
+            hist->chain_len++;
         }
-
-        hist->chain_len++;
+        hist->committed_count++;
+        res.added++;
+        last_loaded = seg[i].index;
     }
-    /* Seed next_index past the largest absolute index just loaded
-     * so subsequent local commits don't collide. Mirrors Python's
-     * `max_existing + 1` seed in TransactionHistory.__init__
-     * (reputation.py:130-133). */
-    if (max_loaded_index + 1 > hist->next_index)
-        hist->next_index = max_loaded_index + 1;
-    /* Phase 1: resume the link from the loaded tail so subsequent local
-     * commits chain cleanly. The last committed slot is the head. */
+    if (last_loaded + 1 > f)
+        hist->next_index = last_loaded + 1;
+    else
+        hist->next_index = f;
+
+    /* first_index and head follow the committed entries as they now stand. */
     hist->head_hash[0] = '\0';
-    for (int i = hist->chain_len - 1; i >= 0; i--)
+    bool have_first = false;
+    for (int i = 0; i < hist->chain_len; i++)
     {
-        if (hist->chain[i].p1_set && hist->chain[i].p2_set)
-        {
-            transaction_entry_hash(&hist->chain[i], hist->head_hash);
-            break;
-        }
+        const transaction_t *t = &hist->chain[i];
+        if (!(t->p1_set && t->p2_set))
+            continue;
+        if (!have_first) { hist->first_index = t->index; have_first = true; }
+        transaction_entry_hash(t, hist->head_hash);
     }
+    if (!have_first)
+        hist->first_index = hist->next_index;
+    res.status = res.dropped > 0 ? TX_RECONCILE_ADOPTED
+               : res.added > 0   ? TX_RECONCILE_EXTENDED
+                                 : TX_RECONCILE_NONE;
+done:
+    free(seg);
+    if (out != NULL)
+        *out = res;
     return 0;
 }
 
@@ -1781,10 +1880,18 @@ double reputation_env_double(const char *name, double dflt)
  ****************************/
 
 /**
- * Pure socially-weighted average:
- *   For each transaction involving peer, find the counterparty.
- *   Sum = counterparty_score_in_tx * reputation[counterparty]
- *   Return sum / count
+ * Pure socially-weighted average (doc/architecture/trust-tiers.md §5):
+ *   For each transaction involving peer, the counterparty's score for it,
+ *   weighted by the counterparty's reputation and the task's weight.
+ *   Return sum(score * rep * w) / sum(rep * w).
+ *
+ * The divisor carries the reputation too. It used to be sum(w) alone, which
+ * multiplied every score by its reporter's reputation instead of averaging:
+ * fed back through the rescore sweep, a group of well-behaved peers decayed
+ * toward a fixed point below tier 1 once they shared each other's evidence
+ * (moderation cohort mod-2520518, 2026-09-23: 0.90 transactions, scores
+ * settling at 0.43). Reporters with no reputation contribute nothing; if none
+ * has any, the peer is at the neutral prior.
  */
 double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
                        const uuid_t peer_uuid,
@@ -1798,7 +1905,7 @@ double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
         return PREREP_NEUTRAL;  /* Default neutral reputation */
 
     double sum = 0.0;
-    int total_weight = 0;
+    double total_weight = 0.0;
 
     for (int i = 0; i < count; i++)
     {
@@ -1843,13 +1950,13 @@ double reputation_pure(const tx_history_t *hist, const reputations_t *reps,
         }
 
         sum += counterparty_score * cp_rep * (double)w;
-        total_weight += w;
+        total_weight += cp_rep * (double)w;
     }
 
-    if (total_weight == 0)
+    if (total_weight <= 0.0)
         return PREREP_NEUTRAL;
 
-    return sum / (double)total_weight;
+    return sum / total_weight;
 }
 
 /**
