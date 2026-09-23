@@ -517,6 +517,23 @@ class Transaction(Configuration):
                                else validate_tx_channel(channel, 'Transaction'))
 
 
+class ReconcileResult:
+    """What ``TransactionHistory.reconcile`` did. Mirrors C's
+    ``tx_reconcile_result_t``."""
+    NONE = 'none'                # nothing new: we hold all of it
+    EXTENDED = 'extended'        # the peer's chain continued ours
+    ADOPTED = 'adopted'          # forked; the peer's tip won, ours from `fork` dropped
+    KEPT = 'kept'                # forked; our tip won
+    REFUSED_FINAL = 'refused_final'  # forked inside our finalized checkpoint
+    REJECTED = 'rejected'        # links, a gap, or an impossible duplicate
+
+    def __init__(self):
+        self.status = self.NONE
+        self.fork = None
+        self.dropped: 'list[Transaction]' = []
+        self.added: 'list[Transaction]' = []
+
+
 class TransactionHistory(Mapping):
     """Bounded commit log of bilateral Transactions.
 
@@ -733,26 +750,150 @@ class TransactionHistory(Mapping):
         return self.verify_chain_links(self._chain)
 
     def catchup(self, chain: list[Transaction]):
-        # Reject a chain whose internal hash-linkage doesn't hold: a peer
-        # (or a corrupted transfer) cannot slip an altered committed entry
-        # past us. This is the "verifiable instead of social" sync win
-        # (reputation-vs-blockchain-analysis.md §2.1) — the received segment
-        # must be self-consistent before any of it is replayed.
-        if not self.verify_chain_links(chain):
-            return
-        for link in chain:
-            if link.index is None:
+        """Merge a peer's reported chain. See ``reconcile``."""
+        self.reconcile(chain)
+
+    def reconcile(self, chain: 'list[Transaction]',
+                  final_end: 'int | None' = None,
+                  attested: 'tuple | None' = None) -> 'ReconcileResult':
+        """Reconcile our committed chain with a peer's verified segment by the
+        LONGEST VERIFIED CHAIN rule (ISSUES.md §2.15). Mirrors C's
+        ``tx_history_reconcile`` step for step.
+
+        Entries are taken VERBATIM (index, prev_hash, scores, channels) so that
+        two nodes that agree end up byte-identical and compute the same window
+        root. Replaying through ``update()`` would renumber them locally, which
+        is how chains forked by order in the first place.
+
+        1. The segment's links must verify (tampering rejects it whole).
+        2. The fork point ``f`` is the first index where the two differ by
+           entry hash, or where only the peer has an entry. A peer that merely
+           extends us has ``f == _next_index``.
+        3. On a real divergence, the peer wins only if its tip is higher:
+           (last index + 1), then the LOWER head hash on a tie. Every node
+           orders tips the same way, so they converge and cannot flap.
+        4. Nothing inside our finalized checkpoint window (``index <
+           final_end``) is ever rewritten.
+        4a. ``attested`` is ``(root, first_index, count)`` of a quorum-attested
+           window our own entries do NOT reproduce. A segment that reproduces
+           it wins whatever the tips say: an order fork at EQUAL length would
+           otherwise go to the lower head hash, which can be the side the
+           quorum outvoted, and never converge (moderation cohort mod-2538837,
+           2026-09-23). Mirrors C's ``tx_history_reconcile_attested``.
+        5. Adopting drops our committed entries from ``f`` on (both halves of
+           anything only we held there are lost; that is the price of the
+           rule) and loads the peer's, completing a task we held pending.
+        """
+        res = ReconcileResult()
+        seg = sorted((t for t in chain if t.index is not None),
+                     key=lambda t: t.index)
+        if not seg:
+            return res
+        if not self.verify_chain_links(seg):
+            res.status = ReconcileResult.REJECTED
+            return res
+        ours = {t.index: t for t in self._chain}
+        by_index = {t.index: t for t in seg}
+        if not self._chain:
+            f = seg[0].index
+        else:
+            if seg[0].index > self._next_index:
+                res.status = ReconcileResult.REJECTED   # a gap: nothing to link to
+                return res
+            f = None
+            for t in seg:
+                if t.index < self._first_index:
+                    continue
+                o = ours.get(t.index)
+                if o is None or o.entry_hash() != t.entry_hash():
+                    f = t.index
+                    break
+            if f is None:
+                return res                              # we already hold all of it
+            # The peer's entry at f must continue OUR prefix.
+            pred = ours.get(f - 1)
+            if pred is not None:
+                if by_index[f].prev_hash != pred.entry_hash():
+                    res.status = ReconcileResult.REJECTED
+                    return res
+            elif f in ours and by_index[f].prev_hash != ours[f].prev_hash:
+                res.status = ReconcileResult.REJECTED
+                return res
+        res.fork = f
+        if self._chain and f < self._next_index:
+            s_tip, o_tip = seg[-1].index + 1, self._next_index
+            s_head = seg[-1].entry_hash()
+            quorum_chain = self._segment_reproduces(seg, attested)
+            if not quorum_chain and (
+                    s_tip < o_tip
+                    or (s_tip == o_tip and s_head >= self._head_hash)):
+                res.status = ReconcileResult.KEPT
+                return res
+            if final_end is not None and f < final_end:
+                res.status = ReconcileResult.REFUSED_FINAL
+                return res
+        incoming = [t for t in seg if t.index >= f]
+        # A task we hold COMMITTED below the fork cannot appear again above it.
+        for t in incoming:
+            held = self._task_mapping.get(t.task_id)
+            if held is not None and len(held) == 2 and held.index is not None \
+                    and held.index < f:
+                res.status = ReconcileResult.REJECTED
+                return res
+        dropped = [t for t in self._chain if t.index >= f]
+        if dropped:
+            self._chain = [t for t in self._chain if t.index < f]
+            for t in dropped:
+                if self._task_mapping.get(t.task_id) is t:
+                    del self._task_mapping[t.task_id]
+                self._unmap_peers(t)
+        for t in incoming:
+            pending = self._task_mapping.get(t.task_id)
+            if pending is not None:
+                self._unmap_peers(pending)      # completed in place by the peer's copy
+            self._evicted_task_ids.pop(t.task_id, None)
+            self._chain.append(t)
+            self._task_mapping[t.task_id] = t
+            self._map_peers(t)
+        self._next_index = max(f, incoming[-1].index + 1)
+        while len(self._chain) > self.max_chain_len:
+            self._evict_oldest()
+        if self._chain:
+            self._first_index = self._chain[0].index
+            self._head_hash = self._chain[-1].entry_hash()
+        res.status = (ReconcileResult.ADOPTED if dropped
+                      else ReconcileResult.EXTENDED)
+        res.dropped = dropped
+        res.added = incoming
+        return res
+
+    @classmethod
+    def _segment_reproduces(cls, seg, attested) -> bool:
+        """True iff ``seg`` (verified, index-sorted) holds every index of the
+        attested window in order and they hash to its root."""
+        if not attested:
+            return False
+        root, first, count = attested
+        if count <= 0:
+            return False
+        window = [t for t in seg if first <= t.index < first + count]
+        if [t.index for t in window] != list(range(first, first + count)):
+            return False
+        mine = cls._mth([t.entry_hash() for t in window])
+        if isinstance(mine, bytes):
+            mine = mine.decode('ascii')
+        if isinstance(root, bytes):
+            root = root.decode('ascii')
+        return mine == root
+
+    def _unmap_peers(self, tx: Transaction):
+        for peer_id in {tx.p1_id, tx.p2_id} - {None}:
+            lst = self._peer_mapping.get(peer_id)
+            if not lst:
                 continue
-            if link.index >= self._next_index:
-                # Channels replay with their scores: dropping them here would
-                # cost the reason a synced entry was poor AND recompute the
-                # entry hash without it, so this node's window root could
-                # never match the peer it synced from and no checkpoint over
-                # the window would reach quorum.
-                self.update(link.task_id, link.p1_id, link.p1_score,
-                            link.p1_channel)
-                self.update(link.task_id, link.p2_id, link.p2_score,
-                            link.p2_channel)
+            lst[:] = [t for t in lst if t is not tx]
+            if not lst:
+                del self._peer_mapping[peer_id]
 
     # ----- Phase 2: ordered Merkle root over the resident window ----------
     # The prev_hash chain (Phase 1) makes the window tamper-EVIDENT in
@@ -805,6 +946,19 @@ class TransactionHistory(Mapping):
     def _indexed_window(self) -> 'list[Transaction]':
         """Resident committed (bilateral, indexed) entries in chain order."""
         return [tx for tx in self._chain if tx.index is not None]
+
+    def range_root(self, first: int, count: int) -> 'bytes | None':
+        """Merkle root over our committed entries at indices [first,
+        first + count), the value a checkpoint over that window attests. None
+        unless every index in the range is resident, in order. Mirrors C's
+        ``tx_history_range_root``."""
+        if count <= 0:
+            return None
+        entries = [tx for tx in self._chain
+                   if tx.index is not None and first <= tx.index < first + count]
+        if [tx.index for tx in entries] != list(range(first, first + count)):
+            return None
+        return self._mth([tx.entry_hash() for tx in entries])
 
     def window_root(self) -> bytes:
         """Merkle root committing to every committed entry resident in the

@@ -1,0 +1,64 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: chain-fork-refused-inside-checkpoint
+byte_pinning: false
+description: |
+    The chains fork by ORDER (ISSUES.md §2.15): each node numbers an entry
+    when its second half lands, so two nodes can hold different tasks at the same
+    index, and a grant needs equal chain lengths, so Paxos stalls once they differ.
+    Reconciliation follows the LONGEST VERIFIED CHAIN rule (user decision
+    2026-09-23): find the first index where the two differ by entry hash; the peer
+    wins only with the higher tip (last index + 1, then the LOWER head hash on a
+    tie); nothing inside our finalized checkpoint is rewritten; adopted entries are
+    taken verbatim, so agreeing nodes become byte-identical.
+    
+    dave's own chain is staged through the real writer by the `local_chain`
+    fixture, with the payload builder's uuid derivation, so it hash-matches
+    alice's report up to the fork.
+    
+    As chain-fork-adopts-longer, but dave holds a finalized checkpoint covering
+    indices 0 to 2, and his own entries there hash to its root. The fork at
+    index 2 falls inside it, so dave refuses and keeps his chain (the user's
+    finality decision). Without the guard he would adopt alice's longer chain.
+    chain-fork-adopts-when-outvoted-by-checkpoint is the same fork with a root
+    dave's chain does not match.
+
+participants:
+  - id: alice
+    role: provider
+  - id: dave
+    role: consumer
+
+fixtures:
+  local_chain:
+    dave:
+      - {task: a, p1: 0.7, p2: 0.5}
+      - {task: b, p1: 0.9, p2: 0.3}
+      - {task: x, p1: 0.2, p2: 0.2}
+
+  checkpoint:
+    dave:
+      root: "0cdcc480c416f2c27184e5659aa0b1c1f4a3cafd36079d2561092092bea8cb60"
+      epoch: 1
+      first_index: 0
+      count: 3
+
+steps:
+  - id: 1
+    from: alice
+    to: dave
+    function: latest update
+    payload:
+      chain:
+        - {task: a, p1: 0.7, p2: 0.5}
+        - {task: b, p1: 0.9, p2: 0.3}
+        - {task: c, p1: 0.6, p2: 0.4}
+        - {task: d, p1: 0.8, p2: 0.8}
+    description: |
+        alice's longer chain forks inside dave's finalized checkpoint.
+
+expected_state:
+  dave:
+    committed_tx_count: 3
+    window_root: "0cdcc480c416f2c27184e5659aa0b1c1f4a3cafd36079d2561092092bea8cb60"

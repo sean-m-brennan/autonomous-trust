@@ -1,0 +1,56 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: chain-fork-equal-length-tiebreak
+byte_pinning: false
+description: |
+    The chains fork by ORDER (ISSUES.md §2.15): each node numbers an entry
+    when its second half lands, so two nodes can hold different tasks at the same
+    index, and a grant needs equal chain lengths, so Paxos stalls once they differ.
+    Reconciliation follows the LONGEST VERIFIED CHAIN rule (user decision
+    2026-09-23): find the first index where the two differ by entry hash; the peer
+    wins only with the higher tip (last index + 1, then the LOWER head hash on a
+    tie); nothing inside our finalized checkpoint is rewritten; adopted entries are
+    taken verbatim, so agreeing nodes become byte-identical.
+    
+    dave's own chain is staged through the real writer by the `local_chain`
+    fixture, with the payload builder's uuid derivation, so it hash-matches
+    alice's report up to the fork.
+    
+    Equal tips: the LOWER head hash wins. dave holds c at index 2 and alice
+    reports x there; x's entry hashes lower, so dave must ADOPT alice's chain.
+    (Arranged that way round on purpose: had dave's own head been the lower
+    one, a rule that never adopts on a tie would pass too.) The unit tests check the rule is
+    symmetric (A to B and B to A pick the same winner), which is what makes the
+    group converge instead of flapping.
+
+participants:
+  - id: alice
+    role: provider
+  - id: dave
+    role: consumer
+
+fixtures:
+  local_chain:
+    dave:
+      - {task: a, p1: 0.7, p2: 0.5}
+      - {task: b, p1: 0.9, p2: 0.3}
+      - {task: c, p1: 0.6, p2: 0.4}
+
+steps:
+  - id: 1
+    from: alice
+    to: dave
+    function: latest update
+    payload:
+      chain:
+        - {task: a, p1: 0.7, p2: 0.5}
+        - {task: b, p1: 0.9, p2: 0.3}
+        - {task: x, p1: 0.2, p2: 0.2}
+    description: |
+        alice and dave fork at index 2 with equal tips.
+
+expected_state:
+  dave:
+    committed_tx_count: 3
+    window_root: "0cdcc480c416f2c27184e5659aa0b1c1f4a3cafd36079d2561092092bea8cb60"

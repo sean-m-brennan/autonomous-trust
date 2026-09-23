@@ -163,6 +163,8 @@ int reputation_get_evidence_ceiling(const uuid_t self_uuid,
  *  single conformance step. Mirrors setting Python's
  *  ReputationProcess._checkpoint. */
 void reputation_install_checkpoint(const char *root, int64_t epoch);
+void reputation_install_checkpoint_window(const char *root, int64_t epoch,
+                                          int first_index, int count);
 
 /** Originate a checkpoint over @p chain_key's committed window right now, as
  *  the periodic path does ("" is the primary chain). Test hook only: the

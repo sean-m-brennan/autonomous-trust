@@ -161,10 +161,21 @@ def _pure_reputation(self, peer):
         peer_score = tx.p1_score if tx.p1_id == peer.uuid else tx.p2_score
         w = self._tx_weight(tx)  # transaction_weight from cached capability
         total += reporter_score * peer_score * w
-        total_w += w
+        total_w += reporter_score * w
     if total_w == 0: return 0.2  # PREREP_NEUTRAL
     return total / total_w
 ```
+
+Here `reporter_score` is the reporter's reputation and `peer_score` is what
+the reporter scored the peer. The divisor carries the reputation as well as the
+weight, which is what makes this an average. Until 2026-09-23 it carried the
+weight alone, so every score was multiplied by its reporter's reputation rather
+than weighted by it. Fed back through the rescore sweep, that decayed a group of
+well-behaved peers toward a fixed point below tier 1 once their chains
+converged and each held the others' evidence: in moderation cohort mod-2520518,
+peers whose transactions all scored 0.90 settled at 0.43. The corrected form
+holds them at 0.90. A reporter with no reputation contributes nothing, and if
+no reporter has any, the peer is at the neutral prior.
 
 The weight function returns the transaction weight of the capability named on
 the originating score. When the capability is unknown locally, the weight falls

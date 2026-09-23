@@ -39,7 +39,7 @@ from ..identity.identity import (public_identity_to_canonical,
 from ..identity.zta.zta_policy import ZtaPolicy
 from ..identity.peer_standing import STANDING_PROVED, STANDING_FAILED
 from .protocol import ReputationProtocol
-from .reputation import (TransactionHistory, Reputation, Reputations,
+from .reputation import (TransactionHistory, ReconcileResult, Reputation, Reputations,
                          TransactionScore, SlashAttestation, SignedSlash,
                          Checkpoint, SignedCheckpoint, validate_tx_score,
                          validate_tx_channel,
@@ -587,6 +587,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # quorum a live receiver does, and a root with no signatures beside it
         # is a number anyone with write access to the file could have chosen.
         self._checkpoints: dict[str, Checkpoint] = {}
+        # The latest PRIMARY checkpoint a quorum attested, kept apart from
+        # _checkpoints because that also holds our own proposals, stored with
+        # only our signature before anyone has co-signed. Reconciliation treats
+        # this window as final, and only while our own entries over it still
+        # hash to its root (ISSUES.md §2.15). Mirrors C's rep_state.final_*.
+        self._finalized: 'Checkpoint | None' = None
         self._checkpoint_sigs_final: dict[str, dict] = {}
         self._checkpoint_epochs: dict[str, int] = {}
         # Dedup for finalized checkpoints (FIFO bounded) so a re-broadcast
@@ -668,6 +674,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             self._checkpoints.pop('', None)
         else:
             self._checkpoints[''] = ckpt
+        # A fixture checkpoint stands for a finalized one.
+        self._finalized = ckpt
 
     def _chain_key(self, group_uuid) -> str:
         """The per-chain bookkeeping key for a group-uuid: '' for the primary
@@ -1903,13 +1911,25 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             if sigs and len(sigs) > len(held):
                 self._checkpoint_sigs_final[chain_key] = dict(sigs)
                 self._persist_history(chain_key)
+            self._note_final(ckpt, sigs, chain_key)
             return
         self._checkpoints[chain_key] = ckpt
         self._checkpoint_sigs_final[chain_key] = dict(sigs or {})
         self._checkpoint_seen[key] = None
         while len(self._checkpoint_seen) > self.COMMITTED_ROUNDS_CAP:
             self._checkpoint_seen.popitem(last=False)
+        self._note_final(ckpt, sigs, chain_key)
         self._persist_history(chain_key)
+
+    def _note_final(self, ckpt, sigs, chain_key):
+        """Record a primary checkpoint as FINAL once a quorum attests it.
+        Every caller of _store_checkpoint has verified the signatures it
+        passes (our own proposal carries one, ours), so their number is what
+        attests it. Mirrors C's _store_checkpoint."""
+        if chain_key or not ckpt.count:
+            return
+        if len(sigs or {}) > self._quorum_for_group(None):
+            self._finalized = ckpt
 
     def _slash_marks_path(self):
         """The file holding the per-(target, slasher) slash high-water marks."""
@@ -2204,6 +2224,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self._checkpoints[chain_key] = ckpt
         self._checkpoint_sigs_final[chain_key] = dict(signed.sigs or {})
         self._checkpoint_seen[ckpt.key()] = None
+        if not chain_key:
+            self._finalized = ckpt    # the rebuild verified its quorum
         # Resume our own epoch counter past the persisted checkpoint. Peers
         # dedup on (proposer, epoch, chain) and their rings are NOT reset by
         # our restart, so a restarted proposer that began again at epoch 1
@@ -2491,7 +2513,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             return True
         return False
 
-    def handle_checkpoint_final(self, _, message):
+    def handle_checkpoint_final(self, queues, message):
         if message.function == ReputationProtocol.checkpoint_final:
             if not message.verified:
                 self.logger.warning(
@@ -2524,6 +2546,25 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     len(self._verified_cosigners(ckpt.designation, sigs)))
                 return True
             self._store_checkpoint(ckpt, sigs)
+            # Outvoted: ask the finalizer for its chain from the window's
+            # start, which handle_update then adopts. Without this an order
+            # fork at EQUAL length never reconciles: catch-up runs only when a
+            # grant finds the lengths differ (moderation cohort mod-2537396,
+            # mod-2538837). Mirrors C.
+            if not group and self._outvoted() is not None:
+                self.logger.info(
+                    'Our chain does not reproduce checkpoint epoch=%s; '
+                    'requesting the finalizer\'s chain', str(ckpt.epoch))
+                try:
+                    queues[CfgIds.network].put(
+                        Message(self.name, ReputationProtocol.outdated,
+                                str(int(ckpt.first_index)),
+                                message.from_whom, from_whom=self.identity),
+                        block=True, timeout=self.q_cadence)
+                except Full:
+                    self.logger.error(
+                        'handle_checkpoint_final: network queue full; the '
+                        'next checkpoint will ask again')
             return True
         return False
 
@@ -2551,12 +2592,31 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # without storing it, so no stale report can out-vote it.
                 before = len(self.history)
                 chain = from_json_string(message.obj)
-                if isinstance(chain, list):
-                    self.history.catchup(chain)
+                if not isinstance(chain, list):
+                    return True
+                # Outvoted: a chain reproducing the quorum's checkpoint wins
+                # even an equal-length tiebreak (ISSUES.md §2.15). Mirrors C.
+                res = self.history.reconcile(chain, self._final_end(),
+                                             self._outvoted())
                 after = len(self.history)
-                if after > before:
+                who = message.from_whom.nickname
+                if res.status == ReconcileResult.ADOPTED:
+                    self.logger.info(
+                        'adopted chain from %s at index %d: dropped %d, added '
+                        '%d (ours %d -> theirs %d)', who, res.fork,
+                        len(res.dropped), len(res.added), before, after)
+                elif res.status == ReconcileResult.EXTENDED:
                     self.logger.info('caught up from %s: chain %d -> %d',
-                                     message.from_whom.nickname, before, after)
+                                     who, before, after)
+                elif res.status == ReconcileResult.REFUSED_FINAL:
+                    self.logger.warning(
+                        'chain from %s forks at index %d, inside our finalized '
+                        'checkpoint (ends %d); keeping ours', who, res.fork,
+                        self._final_end())
+                for tx in res.added + res.dropped:
+                    for peer in (tx.p1_id, tx.p2_id):
+                        if peer is not None:
+                            self._note_interaction(peer)
                 return True
             self.updates[message.from_whom.uuid] = from_json_string(message.obj)
             up_count = len(self.updates)
@@ -2605,8 +2665,13 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             txs = list(self.history.by_peer(peer_uuid))
         except KeyError:
             return self.PREREP_NEUTRAL
+        # A true weighted average: the divisor carries the reputation too.
+        # Dividing by the task weights alone multiplied every score by its
+        # reporter's reputation, and the rescore sweep then decayed a group of
+        # well-behaved peers below tier 1 (moderation cohort, 2026-09-23).
+        # Mirrors C reputation_pure.
         total = 0.0
-        total_weight = 0
+        total_weight = 0.0
         for tx in txs:
             if tx.p1_id is None or tx.p2_id is None:
                 continue
@@ -2622,8 +2687,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 if counterparty_id in self.reputations else self.PREREP_NEUTRAL
             w = self.task_weights.get(str(tx.task_id), 1)
             total += counterparty_score * cp_rep * w
-            total_weight += w
-        if total_weight == 0:
+            total_weight += cp_rep * w
+        if total_weight <= 0:
             return self.PREREP_NEUTRAL
         return total / total_weight
 
@@ -2765,6 +2830,48 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         to/for it, LAN/one-hop nodes ignore it). Recovery is
         explicit-only (REASON_REHABILITATE)."""
         return score is not None and score < cls.COMM_CUTOFF
+
+    def _final_end(self):
+        """One past the last index our finalized PRIMARY checkpoint covers, or
+        None. Reconciliation never rewrites below it (the user's finality
+        decision for ISSUES.md §2.15). Finalized means a quorum attested it,
+        never our own proposal alone."""
+        ckpt = self._finalized
+        if ckpt is None or not getattr(ckpt, 'count', 0):
+            return None
+        # Final only if our own entries over the window hash to the attested
+        # root: a node the quorum outvoted holds nothing final there, and
+        # guarding it would pin the losing side of a fork (moderation cohort,
+        # 2026-09-23). Mirrors C's _final_end_locked.
+        first, count = int(ckpt.first_index), int(ckpt.count)
+        mine = self.history.range_root(first, count)
+        theirs = ckpt.root
+        if isinstance(mine, bytes):
+            mine = mine.decode('ascii')
+        if isinstance(theirs, bytes):
+            theirs = theirs.decode('ascii')
+        if mine is None or mine != theirs:
+            return None
+        return first + count
+
+    def _outvoted(self):
+        """``(root, first_index, count)`` of the latest quorate primary
+        checkpoint iff our own entries do NOT reproduce it: the group
+        finalized a chain ours lost to. None otherwise. Mirrors C's
+        ``_outvoted_locked``."""
+        ckpt = self._finalized
+        if ckpt is None or not getattr(ckpt, 'count', 0):
+            return None
+        first, count = int(ckpt.first_index), int(ckpt.count)
+        root = ckpt.root
+        if isinstance(root, bytes):
+            root = root.decode('ascii')
+        mine = self.history.range_root(first, count)
+        if isinstance(mine, bytes):
+            mine = mine.decode('ascii')
+        if mine is not None and mine == root:
+            return None
+        return (root, first, count)
 
     def _note_interaction(self, peer_uuid):
         """Stamp 'we just transacted with peer_uuid' — resets its idle
@@ -3093,7 +3200,23 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             # IdentityProcess reading its own queue; no network egress).
             msg = Message(CfgIds.identity, IdentityProtocol.tier_update,
                           payload, to_whom=None, from_whom=self.identity)
-            queues[CfgIds.identity].put(msg, block=True, timeout=self.q_cadence)
+            try:
+                queues[CfgIds.identity].put(msg, block=True,
+                                            timeout=self.q_cadence)
+            except Full:
+                # Undo the publication record, which is what suppresses a
+                # repeat: kept, a lost update left identity on the old tier
+                # until the score crossed another boundary. Mirrors C.
+                if old_tier is None:
+                    self.peer_tiers.pop(key, None)
+                else:
+                    self.peer_tiers[key] = old_tier
+                self._rescore_due.add(key)   # republish on the next sweep
+                self.logger.warning(
+                    '_publish_tier_change: identity queue full; tier_update '
+                    '%s -> %d will republish on the next rescore',
+                    key, new_tier)
+                return
             self.logger.debug('Published tier_update for %s: %d (score=%.3f)', key, new_tier, score)
             if is_demotion:
                 lost_msg = Message(CfgIds.negotiation, IdentityProtocol.tier_lost,
@@ -3229,6 +3352,20 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             elif found.status == STANDING_FAILED:
                 self._unwind_standing_failure(queues, key, found)
                 continue
+            # Proved or capped: rescore under the bound as it now stands. The
+            # stored score is the capped one, and nothing else makes a steady
+            # peer due (moderation cohort mod-2518340 read the lifted cap long
+            # after the lift). A lift is rescored NOW, not at the next sweep
+            # (mod-2531555 read the cap in the seconds before it ran), so it
+            # takes effect the moment it lands, as a cap does. Mirrors C.
+            key_peer = str(found.peer_uuid)
+            current = self.reputations.current
+            rated = key_peer in current or any(
+                str(c) == key_peer for c in current)
+            if found.status == STANDING_PROVED and rated:
+                self._compute_reputation(key_peer, None, None, respond=False)
+            else:
+                self._rescore_due.add(key_peer)
             self._publish_standing_tier(queues, found)
 
     def _publish_standing_tier(self, queues, found):

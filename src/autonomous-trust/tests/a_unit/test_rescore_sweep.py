@@ -107,3 +107,28 @@ def test_a_standing_bounds_what_the_sweep_writes():
     _stand(rp, str(peer), STANDING_CAPPED, 0.10, source=STANDING_SOURCE_ETHNE)
     assert rp._rescore_sweep(T0) == 1
     assert abs(rp.reputations.current[str(peer)] - 0.10) < 1e-9
+
+
+def test_a_tier_update_lost_to_a_full_queue_is_published_again():
+    """Moderation cohort mod-2505620 (2026-09-23): the publication record was
+    written before the send, so a tier_update lost to a full identity queue
+    was never repeated and identity's gate held a stale tier. Mirrors the C
+    twin."""
+    from queue import Full
+    from autonomous_trust.core._python.system import CfgIds
+
+    class _FullQueue:
+        def put(self, *a, **k):
+            raise Full
+
+    rp = _make_rep_process()
+    peer = uuid4()
+    _with_peer(rp, peer)
+    rp.reputations.update(str(peer), 0.7)       # the warm start
+    assert rp._rescore_sweep(T0) == 1
+    for u, sc in list(rp.pending_tiers):
+        rp._publish_tier_change({CfgIds.identity: _FullQueue()}, u, sc)
+    rp.pending_tiers.clear()
+    assert str(peer) not in rp.peer_tiers       # not recorded as told
+    assert rp._rescore_sweep(T0 + 3600) == 1    # so the next sweep retries
+    assert _published(rp) == [str(peer)]

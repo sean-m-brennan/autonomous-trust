@@ -480,6 +480,33 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
         }
     }
 
+    /* local_chain: { "<pid>": [ {task, p1, p2}, ... ] } — this participant's
+     * OWN committed chain, built through the real writer with the SAME uuid
+     * derivation the `latest update` payload builder uses ("chain:",
+     * "chainp1:", "chainp2:"), so its entries hash-match a reported chain up
+     * to wherever the two are meant to fork. Mirrors the Python adapter. */
+    json_t *lc = json_object_get(g_fixtures, "local_chain");
+    if (json_is_object(lc))
+    {
+        json_t *entries = json_object_get(lc, target_id);
+        size_t lc_i;
+        json_t *lc_e;
+        if (json_is_array(entries))
+            json_array_foreach(entries, lc_i, lc_e)
+            {
+                const char *task = json_string_value(json_object_get(lc_e, "task"));
+                if (task == NULL)
+                    continue;
+                uuid_t tk, p1u, p2u;
+                _uuid5("chain:", task, tk);
+                _uuid5("chainp1:", task, p1u);
+                _uuid5("chainp2:", task, p2u);
+                reputation_install_tx_pair(tk,
+                    p1u, json_number_value(json_object_get(lc_e, "p1")),
+                    p2u, json_number_value(json_object_get(lc_e, "p2")));
+            }
+    }
+
     /* reputations: { "<pid>": { "<other_pid>": float, ... } } — pre-stage
      * rep_state.reputations so _compute_reputation's coop-mode latch sees
      * the right `previous` value and reputation_pure's counterparty
@@ -635,8 +662,11 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
         {
             const char *root = json_string_value(json_object_get(spec, "root"));
             int64_t epoch = json_integer_value(json_object_get(spec, "epoch"));
+            int ck_first = (int)json_integer_value(json_object_get(spec, "first_index"));
+            int ck_count = (int)json_integer_value(json_object_get(spec, "count"));
             if (root != NULL)
-                reputation_install_checkpoint(root, epoch);
+                reputation_install_checkpoint_window(root, epoch, ck_first,
+                                                     ck_count);
         }
     }
 }

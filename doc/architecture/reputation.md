@@ -778,6 +778,144 @@ state replaces exactly the code whose agreement with the reader is in question.
 Both blind spots are cheap to close once named: drive the real originator, and
 put two processes on a real wire.
 
+### Why the chains would not converge
+
+Once rounds committed, a second cohort found the chains drifting apart and never
+settling, and that drift, not any single refused round, was what kept a report
+from ever moving a score. Four defects sat behind it, found one per run in the
+Agora moderation cohort on 2026-09-23. Each hid behind the one before it, which
+is why a test for any single one could not have found the rest.
+
+**Catch-up could never apply.** A node that fell behind asked its peers for
+their chain and merged the answer only once it held three matching reports,
+stored one per sender. A node in a three-member group has two peers, so the
+threshold was unreachable and no chain was ever merged. The miss was silent:
+the "unable to agree" error sits behind the same threshold. Since a grant needs
+the proposer's next slot to match the acceptor's, drifting lengths meant that
+after a restart nobody granted anybody. The quorum is now one, in both
+runtimes. That is safe because the merge verifies the segment's hash links
+before loading any of it and appends only past what the node already holds, so
+one peer cannot rewrite another's history. A commit already lands on one
+member's word (ISSUES.md §2.16), so this does not lower the chain's effective
+threshold.
+
+**C appended what it already had.** A peer answers "update needed" with its
+whole history. Python's catch-up loads only entries past its own next index;
+C's loaded every one, so the first merge that ever ran would have doubled the
+chain.
+
+**C kept committed entries in arrival order.** C's chain array holds pending
+entries at the slot where their first half arrived, but a transaction takes its
+index and hash link when its second half lands. Two interleaved tasks therefore
+committed out of array order, and everything that walks the array as "the
+committed sequence" (the catch-up wire, the checkpoint window, the evidence
+export, the link check) read a sequence whose links failed. One node's persisted
+chain read its indices as `[3, 0, 2, 1]`, and every peer rejected its catch-up
+whole. Python's chain only ever holds committed entries, appended as they
+commit, so it never had this. C now moves an entry to the end of the array when
+it commits, and sorts an incoming segment by index before checking it.
+
+**C made a second copy of a task it was waiting on.** When a catch-up arrived
+for a task whose other half this node was still waiting for, C appended the
+peer's committed copy in a new slot. When the local half committed later, the
+task existed twice, and that node's chain was two entries longer than anyone
+else's for the rest of the run. Python completes the pending entry in place;
+C now does too.
+
+With all four fixed, the cohort passed end to end, and a report committed on
+both sides and moved the reporter's view of the reported peer. Chains now carry
+no duplicates and are always in index order. They still did not converge,
+though, and the fifth cause is structural rather than a defect in either
+runtime.
+
+**Chains forked by order.** Each node numbers an entry when its second half
+lands, so two nodes can commit different tasks at the same index. Catch-up
+appended only past a node's own next index, so once that happened nothing
+reconciled them. In run 11 the three chains ended at 10, 13 and 15 entries,
+sharing a prefix of three; in run 12 carol shared no prefix with either peer.
+Since a grant needs the proposer's next slot to match the acceptor's chain
+length, Paxos then stalled for good, and a report filed after the fork could not
+commit. The catch-up churn it caused (ada answered 718 update requests in about
+160 s) is also what kept filling the reputation queues.
+
+Both runtimes now reconcile by the **longest verified chain**
+(`tx_history_reconcile` in C, `TransactionHistory.reconcile` in Python, step for
+step):
+
+1. The peer's segment must verify its own hash links, or it is rejected whole.
+2. The fork point is the first index where the two chains differ by entry hash,
+   or where only the peer has an entry. The peer's entry there must link to our
+   entry before it, so its suffix really continues our prefix.
+3. With no divergence, the peer's entries past ours are appended.
+4. On a divergence, the peer wins only with the higher tip: last index plus one,
+   then the lower head entry hash on a tie. Every node orders tips the same way,
+   so a group converges on one chain and cannot flap between two. One
+   exception outranks the tip: when a quorum finalized a window this node's own
+   entries do not reproduce, a peer segment that holds every index of that
+   window and hashes to its root wins, whatever the tips
+   (`tx_history_reconcile_attested` in C, `reconcile(attested=...)` in Python).
+   The quorum already chose that side; the tiebreak is only for forks it has
+   not ruled on.
+5. Nothing inside this node's finalized checkpoint window is rewritten. A fork
+   there is refused, with a warning naming the peer, the fork index and where
+   the window ends. Finalized means two things. A quorum attested the window:
+   a node's own proposal is stored the moment it is made, holding only its own
+   signature, and that does not count. And this node's own entries over the
+   window still hash to the attested root: a node the quorum outvoted holds
+   nothing final there, so it reconciles like any other.
+6. Adopting drops our committed entries from the fork on and loads the peer's
+   verbatim (index, previous hash, scores, channels), completing in place any
+   task we held pending. Verbatim, so two nodes that agree become byte-identical
+   and compute the same window root. Python's catch-up used to replay entries
+   through `update()`, which renumbers them locally; it now loads them as C
+   does.
+
+The price is stated rather than hidden. Where a node loses, the entries only it
+held past the fork are gone, both halves of each. They are not tombstoned, so a
+later catch-up from a peer that holds them brings them back. Pending halves are
+never dropped, and they commit on top of the adopted chain. The process layer
+logs every adoption (`adopted chain from X at index f: dropped d, added a`) and
+marks the peers of every added and dropped entry for rescoring.
+
+The first host runs with the rule in place (mod-2481048 and mod-2483539,
+2026-09-23) failed on the finality guard alone, and for two reasons. Every
+node treated its own unsigned proposal as final, so each pinned its own fork.
+And no member had ever stored a checkpoint: C's `handle_checkpoint_sign` freed
+the ack's payload before building the final from strings that pointed into it,
+so the final left without its `proposer_uuid`, and every member re-derived an
+empty designation and logged "0 verified co-signature(s)". The logs of every
+earlier moderation run show the same rejection and no stored checkpoint. The
+slash final had the same use-after-free. The tests that should have caught it
+each held half the path (a hand-built signature map is accepted; a proposer
+emits a final), and `rep_quorum_test.c` now hands a member the final a
+proposer really emitted.
+
+The outvoted node also has to hear the winning chain. Catch-up ran only when a
+Paxos grant found the chain lengths differ, so an order fork at EQUAL length
+never reconciled at all: in moderation runs mod-2537396 and mod-2538837
+(2026-09-23) carol held a different order at indices 20 to 22 for the rest of
+both runs, and the lower head hash could as well have kept the side the quorum
+outvoted. Now a stored quorate checkpoint our own chain does not reproduce
+sends the finalizer a chain request from the window's first index, and the
+reply is reconciled against that attestation. A checkpoint our chain matches
+sends nothing.
+
+Unit tests in both runtimes (`src/c/test/reputation_fork_test.c`,
+`TestChainForkReconcile`, `TestFinalityNeedsQuorum`, and the finality cases in
+`rep_quorum_test.c`) cover each branch, including that the tiebreak is
+symmetric: A hearing B and B hearing A pick the same winner. Twelve mutations
+fail them: always or never adopting on a tie, no finality guard, Python
+replaying through `update()`, a guard that reads the checkpoint slot, a
+proposal counting as final on its own signature, no root match, freeing
+the ack before building the final, each in the runtimes it applies to, and,
+for the outvoted case, removing the quorum-chain rule or the chain request in
+either runtime.
+
+The same runs tightened three neighbouring hand-offs that dropped data when a
+queue was full: the group multicast of a post, identity's hand-off of a social
+score to reputation, and its hand-off of an app-decided standing. Both now retry for a bounded time, like the directed
+senders before them (ISSUES.md §2.14).
+
 ### What the injected phase does and does not prove
 
 Two flows — slashing and deep resolution, five gates between them — have **no
@@ -808,6 +946,14 @@ stands over is documented rather than papered over.
 | A refutation from a peer accuses nobody | [`remote-refutation-cannot-accuse.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/remote-refutation-cannot-accuse.yaml) |
 | Sync, outdated notification | [`chain-outdated-notification.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/chain-outdated-notification.yaml) |
 | Sync, replay of an update | [`chain-replay-update.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/chain-replay-update.yaml) |
+| Catch-up at the production quorum, from one peer | [`chain-catchup-default-quorum.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/chain-catchup-default-quorum.yaml) |
+| Out-of-order commits keep the window in commit order | [`chain-out-of-order-commit-window.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/chain-out-of-order-commit-window.yaml) |
+| A fork adopts the peer's longer chain verbatim | [`chain-fork-adopts-longer.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/chain-fork-adopts-longer.yaml) |
+| A fork keeps our chain when the peer's is shorter | [`chain-fork-keeps-own-when-peer-shorter.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/chain-fork-keeps-own-when-peer-shorter.yaml) |
+| A fork at equal length goes to the lower head hash | [`chain-fork-equal-length-tiebreak.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/chain-fork-equal-length-tiebreak.yaml) |
+| A fork inside the finalized checkpoint is refused | [`chain-fork-refused-inside-checkpoint.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/chain-fork-refused-inside-checkpoint.yaml) |
+| An equal-length fork goes to the chain the quorum attested | [`chain-fork-quorum-chain-wins-tiebreak.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/chain-fork-quorum-chain-wins-tiebreak.yaml) |
+| A finalized checkpoint our chain lost does not guard it | [`chain-fork-adopts-when-outvoted-by-checkpoint.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/chain-fork-adopts-when-outvoted-by-checkpoint.yaml) |
 | Replay of a ballot refused | [`ask-permission-replay-rejected.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/ask-permission-replay-rejected.yaml) |
 | Lower ballot identifier refused | [`ask-permission-lower-id-rejected.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/ask-permission-lower-id-rejected.yaml) |
 | Evidence document and ceilings | [`warmstart-evidence-document.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/warmstart-evidence-document.yaml) |

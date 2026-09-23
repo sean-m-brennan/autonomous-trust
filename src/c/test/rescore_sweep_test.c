@@ -37,6 +37,7 @@
 #include <stdlib.h>
 
 #include <jansson.h>
+#include <errno.h>
 #include <uuid/uuid.h>
 
 #include "identity/identity.h"
@@ -99,6 +100,7 @@ static void _admit(process_t *proc, identity_t *peer)
 /* What the sweep SENT: tier_updates to identity and PEER_REPUTATIONs to the
  * main loop, counted, with the last of each kept. */
 static int g_tiers, g_reps, g_last_tier;
+static bool g_identity_full;
 static peer_reputation_msg_t g_last_rep;
 
 static int _hook(const char *key, const message_type_t type,
@@ -108,6 +110,8 @@ static int _hook(const char *key, const message_type_t type,
     if (type == NET_MESSAGE && key != NULL && strcmp(key, "identity") == 0 &&
         msg->info.net_msg.function != NULL &&
         strcmp(msg->info.net_msg.function, "tier_update") == 0) {
+        if (g_identity_full)
+            return EAGAIN;
         json_t *arr = NULL;
         if (net_msg_unpack_json(&msg->info.net_msg, &arr) == 0 && arr != NULL) {
             g_last_tier = (int)json_integer_value(json_array_get(arr, 1));
@@ -125,6 +129,7 @@ static void _begin(void)
 {
     reputation_reset_state(3);
     g_tiers = 0; g_reps = 0; g_last_tier = -1;
+    g_identity_full = false;
     memset(&g_last_rep, 0, sizeof(g_last_rep));
     messaging_set_test_hook(_hook);
 }
@@ -261,10 +266,39 @@ DEFINE_TEST(test_a_standing_bounds_what_the_sweep_writes)
 }
 END_TEST_DEFINITION()
 
+
+/* Moderation cohort mod-2505620 (2026-09-23): after ada restarted, her app
+ * read bob at tier 1 while her post gate still held him at 0, and his tier-1
+ * post never reached her. The publication record was written BEFORE the send
+ * and the send's result discarded, so a tier_update lost to a full identity
+ * queue was never repeated. */
+DEFINE_TEST(test_a_tier_update_lost_to_a_full_queue_is_published_again)
+{
+    identity_t *me = _mk_identity("10.0.0.1", "self");
+    identity_t *bob = _mk_identity("10.0.0.2", "bob");
+    process_t *proc = _mk_process(me);
+    _begin();
+    _admit(proc, bob);
+    reputation_install_peer_reputation(bob->uuid, 0.7);   /* the warm start */
+
+    g_identity_full = true;
+    ck_assert_int_eq(reputation_rescore_sweep(proc, T0, me->uuid), 1);
+    ck_assert_int_eq(g_tiers, 0);                          /* lost */
+
+    g_identity_full = false;
+    ck_assert_int_eq(reputation_rescore_sweep(proc, T0 + 3600.0, me->uuid), 1);
+    ck_assert_int_eq(g_tiers, 1);                          /* told after all */
+    /* ...and once told, left alone. */
+    ck_assert_int_eq(reputation_rescore_sweep(proc, T0 + 7200.0, me->uuid), 0);
+    _end();
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(RescoreSweep,
           test_an_unscored_peer_is_rated_at_its_prior_and_published,
           test_a_rated_peer_is_rescored_only_when_its_chain_moved,
           test_a_restored_peer_is_told_to_identity_once,
+          test_a_tier_update_lost_to_a_full_queue_is_published_again,
           test_the_sweep_is_throttled,
           test_a_node_never_scores_itself,
           test_a_standing_bounds_what_the_sweep_writes)
