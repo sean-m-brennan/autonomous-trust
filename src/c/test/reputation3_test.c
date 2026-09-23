@@ -719,7 +719,189 @@ DEFINE_TEST(test_committed_channel_survives_the_catchup_wire)
 }
 END_TEST_DEFINITION()
 
-RUN_TESTS(Reputation3, test_tx_history_json_roundtrip, test_tx_two_peer_transaction,
+DEFINE_TEST(test_tx_catchup_skips_entries_already_held)
+{
+    /* A peer answers "update needed" with its WHOLE history, so the loader
+     * must append only what we do not hold, as Python's catchup does. Before
+     * 2026-09-23 it appended everything, and a node that caught up from a
+     * peer it already agreed with doubled its chain. Never seen live only
+     * because the catch-up quorum of 3 kept any merge from running. */
+    tx_history_t src;
+    ck_assert_ret_ok(tx_history_init(&src));
+    uuid_t task1, task2, peer1, peer2;
+    uuid_generate(task1);
+    uuid_generate(task2);
+    uuid_generate(peer1);
+    uuid_generate(peer2);
+    ck_assert_ret_ok(tx_history_update(&src, task1, peer1, 0.8, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, task1, peer2, 0.6, NULL));
+
+    /* dst holds the first entry already, the way a node one commit behind
+     * does. */
+    json_t *first = NULL;
+    ck_assert_ret_ok(tx_history_era_to_json(&src, 0, tx_history_len(&src), &first));
+    tx_history_t dst;
+    ck_assert_ret_ok(tx_history_init(&dst));
+    ck_assert_ret_ok(tx_history_era_from_json(&dst, first));
+    ck_assert_int_eq(tx_history_len(&dst), 1);
+    json_decref(first);
+
+    ck_assert_ret_ok(tx_history_update(&src, task2, peer1, 0.9, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, task2, peer2, 0.5, NULL));
+    json_t *full = NULL;
+    ck_assert_ret_ok(tx_history_era_to_json(&src, 0, tx_history_len(&src), &full));
+    ck_assert_int_eq((int)json_array_size(full), 2);
+
+    /* The whole history arrives: only the missing entry is appended... */
+    ck_assert_ret_ok(tx_history_era_from_json(&dst, full));
+    ck_assert_int_eq(tx_history_len(&dst), 2);
+    /* ...and the same update arriving again adds nothing. */
+    ck_assert_ret_ok(tx_history_era_from_json(&dst, full));
+    ck_assert_int_eq(tx_history_len(&dst), 2);
+
+    json_decref(full);
+    tx_history_free(&src);
+    tx_history_free(&dst);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_tx_out_of_order_commits_still_link)
+{
+    /* Two tasks start A then B, and commit B then A: the ordinary case with
+     * several proposers. chain[] used to keep each entry where its FIRST
+     * half arrived, so the committed sequence read [A(1), B(0)], its hash
+     * links failed, and a peer's catch-up of it was rejected whole. The
+     * moderation cohort (run 8, 2026-09-23) found carol's chain in index
+     * order [3, 0, 2, 1]. */
+    tx_history_t src;
+    ck_assert_ret_ok(tx_history_init(&src));
+    uuid_t a, b, p1, p2;
+    uuid_generate(a);
+    uuid_generate(b);
+    uuid_generate(p1);
+    uuid_generate(p2);
+    ck_assert_ret_ok(tx_history_update(&src, a, p1, 0.8, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, b, p1, 0.7, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, b, p2, 0.6, NULL));   /* B commits first */
+    ck_assert_ret_ok(tx_history_update(&src, a, p2, 0.5, NULL));   /* then A */
+    ck_assert_int_eq(tx_history_len(&src), 2);
+    ck_assert(tx_history_verify_links(&src));
+
+    /* Lookups survive the move. */
+    transaction_t out;
+    ck_assert_ret_ok(tx_history_by_task(&src, a, &out));
+    ck_assert_int_eq(out.index, 1);
+    ck_assert_double_eq_tol(out.p2_score, 0.5, 0.001);
+    ck_assert_ret_ok(tx_history_by_task(&src, b, &out));
+    ck_assert_int_eq(out.index, 0);
+    transaction_t by_peer[4];
+    int n = 0;
+    ck_assert_ret_ok(tx_history_by_peer(&src, p2, by_peer, &n, 4));
+    ck_assert_int_eq(n, 2);
+
+    /* And a peer can catch up from it. */
+    json_t *wire = NULL;
+    ck_assert_ret_ok(tx_history_era_to_json(&src, 0, tx_history_len(&src), &wire));
+    tx_history_t dst;
+    ck_assert_ret_ok(tx_history_init(&dst));
+    ck_assert_ret_ok(tx_history_era_from_json(&dst, wire));
+    ck_assert_int_eq(tx_history_len(&dst), 2);
+    json_decref(wire);
+
+    tx_history_free(&src);
+    tx_history_free(&dst);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_tx_catchup_accepts_a_segment_in_arrival_order)
+{
+    /* A peer still on the old build sends its committed entries in arrival
+     * order. Reordered by index before the link check, the sound chain loads. */
+    tx_history_t src;
+    ck_assert_ret_ok(tx_history_init(&src));
+    uuid_t a, b, p1, p2;
+    uuid_generate(a);
+    uuid_generate(b);
+    uuid_generate(p1);
+    uuid_generate(p2);
+    ck_assert_ret_ok(tx_history_update(&src, a, p1, 0.8, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, a, p2, 0.6, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, b, p1, 0.9, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, b, p2, 0.5, NULL));
+    json_t *wire = NULL;
+    ck_assert_ret_ok(tx_history_era_to_json(&src, 0, 2, &wire));
+    json_t *reversed = json_array();
+    json_array_append(reversed, json_array_get(wire, 1));
+    json_array_append(reversed, json_array_get(wire, 0));
+
+    tx_history_t dst;
+    ck_assert_ret_ok(tx_history_init(&dst));
+    ck_assert_ret_ok(tx_history_era_from_json(&dst, reversed));
+    ck_assert_int_eq(tx_history_len(&dst), 2);
+    ck_assert(tx_history_verify_links(&dst));
+
+    json_decref(reversed);
+    json_decref(wire);
+    tx_history_free(&src);
+    tx_history_free(&dst);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_tx_catchup_completes_a_pending_task_in_place)
+{
+    /* Moderation cohort run 9 (2026-09-23): bob held his own half of task X
+     * as pending when a peer's segment arrived with X committed. The loader
+     * appended X in a SECOND slot, bob's own half later committed the first,
+     * and his chain carried X twice: two entries longer than both peers',
+     * backdated by everyone for the rest of the run. */
+    uuid_t x, p1, p2;
+    uuid_generate(x);
+    uuid_generate(p1);
+    uuid_generate(p2);
+
+    tx_history_t src;
+    ck_assert_ret_ok(tx_history_init(&src));
+    ck_assert_ret_ok(tx_history_update(&src, x, p1, 0.8, NULL));
+    ck_assert_ret_ok(tx_history_update(&src, x, p2, 0.6, NULL));
+    json_t *wire = NULL;
+    ck_assert_ret_ok(tx_history_era_to_json(&src, 0, tx_history_len(&src), &wire));
+
+    tx_history_t dst;
+    ck_assert_ret_ok(tx_history_init(&dst));
+    ck_assert_ret_ok(tx_history_update(&dst, x, p2, 0.6, NULL));   /* our half, pending */
+    ck_assert_int_eq(tx_history_len(&dst), 0);
+
+    ck_assert_ret_ok(tx_history_era_from_json(&dst, wire));
+    ck_assert_int_eq(tx_history_len(&dst), 1);
+    ck_assert_int_eq(dst.chain_len, 1);          /* one slot, not two */
+    transaction_t out;
+    ck_assert_ret_ok(tx_history_by_task(&dst, x, &out));
+    ck_assert(out.p1_set && out.p2_set);
+    transaction_t by_peer[4];
+    int n = 0;
+    ck_assert_ret_ok(tx_history_by_peer(&dst, p1, by_peer, &n, 4));
+    ck_assert_int_eq(n, 1);
+
+    /* Our other half committing late changes nothing. */
+    ck_assert_ret_ok(tx_history_update(&dst, x, p1, 0.8, NULL));
+    ck_assert_int_eq(tx_history_len(&dst), 1);
+    ck_assert_int_eq(dst.chain_len, 1);
+
+    /* Nor does the same segment arriving again. */
+    ck_assert_ret_ok(tx_history_era_from_json(&dst, wire));
+    ck_assert_int_eq(dst.chain_len, 1);
+
+    json_decref(wire);
+    tx_history_free(&src);
+    tx_history_free(&dst);
+}
+END_TEST_DEFINITION()
+
+RUN_TESTS(Reputation3, test_tx_history_json_roundtrip,
+          test_tx_catchup_completes_a_pending_task_in_place,
+          test_tx_out_of_order_commits_still_link,
+          test_tx_catchup_accepts_a_segment_in_arrival_order,
+          test_tx_catchup_skips_entries_already_held, test_tx_two_peer_transaction,
           test_reputation_contrite_tft,
           test_reputation_contrite_tft_cooperative_self_p2,
           test_reputation_contrite_tft_retaliation,

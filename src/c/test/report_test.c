@@ -41,6 +41,7 @@
 
 #include <pthread.h>
 #include <string.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <errno.h>
 
@@ -72,6 +73,8 @@ static size_t  g_reports_sent;
 static int64_t g_last_seq;
 static bool    g_last_had_extra_keys;
 static bool    g_network_full;
+static bool    g_reputation_full;
+static size_t  g_scores_submitted;
 
 static int _hook(const char *key, const message_type_t type,
                  generic_msg_t *msg, bool blocking)
@@ -79,6 +82,12 @@ static int _hook(const char *key, const message_type_t type,
     (void)blocking;
     if (g_network_full && key != NULL && strcmp(key, "network") == 0)
         return EAGAIN;
+    if (key != NULL && strcmp(key, "reputation") == 0
+        && type == TRANSACTION_SCORE) {
+        if (g_reputation_full)
+            return EAGAIN;
+        g_scores_submitted++;
+    }
     if (type == NET_MESSAGE && msg->info.net_msg.function != NULL
         && strcmp(msg->info.net_msg.function, PEER_REPORT_FN) == 0) {
         g_reports_sent++;
@@ -248,6 +257,8 @@ static void _begin(void)
     g_last_seq = 0;
     g_last_had_extra_keys = false;
     g_network_full = false;
+    g_reputation_full = false;
+    g_scores_submitted = 0;
     messaging_set_test_hook(_hook);
 }
 
@@ -459,6 +470,39 @@ DEFINE_TEST(test_a_report_from_a_peer_we_blocked_is_dropped)
 }
 END_TEST_DEFINITION()
 
+/* Let the reputation "queue" drain partway through the bounded retry. */
+static void *_relent_reputation(void *unused)
+{
+    (void)unused;
+    usleep(60000);
+    g_reputation_full = false;
+    return NULL;
+}
+
+DEFINE_TEST(test_our_half_survives_a_briefly_full_reputation_queue)
+{
+    /* The moderation cohort (run 8, 2026-09-23): ada's reputation queue was
+     * full of catch-up traffic, the single send of her 0.15 half failed, and
+     * the report still went out, so bob staged a half that could never pair.
+     * A queue that drains within the retry window must not lose the half. */
+    _begin();
+    identity_t *me = _mk_identity("self", "10.0.0.1");
+    identity_t *bob = _mk_identity("bob", "10.0.0.2");
+    process_t *proc = _mk_process(me);
+    _add_peer(proc, bob);
+
+    g_reputation_full = true;
+    pthread_t drainer;
+    pthread_create(&drainer, NULL, _relent_reputation, NULL);
+    _report(proc, bob, NULL);
+    pthread_join(drainer, NULL);
+
+    ck_assert_int_eq(g_reports_sent, 1);
+    ck_assert_int_eq(g_scores_submitted, 1);
+    _end();
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(Report,
           test_a_report_goes_out_and_stages_a_first_person_score,
           test_a_second_report_the_same_day_never_reaches_the_wire,
@@ -468,4 +512,5 @@ RUN_TESTS(Report,
           test_the_reported_node_stages_the_neutral_half,
           test_the_reported_side_pairs_one_report_per_reporter_per_day,
           test_a_replayed_report_is_refused_by_freshness,
-          test_a_report_from_a_peer_we_blocked_is_dropped)
+          test_a_report_from_a_peer_we_blocked_is_dropped,
+          test_our_half_survives_a_briefly_full_reputation_queue)

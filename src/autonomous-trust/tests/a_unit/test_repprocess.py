@@ -1278,6 +1278,51 @@ class TestHandleUpdateFullPaths:
         assert len(rp.updates) == 3
 
 
+class TestCatchupAtTheDefaultQuorum:
+    """The catch-up quorum was 3, counted per sender, so a node with two peers
+    never merged a chain and Paxos stalled once chain lengths drifted
+    (moderation cohort run 7, 2026-09-23). Mirrors C's
+    chain-catchup-default-quorum and test_tx_catchup_skips_entries_already_held."""
+
+    @staticmethod
+    def _chain(n):
+        from autonomous_trust.core.config import to_json_string
+        hist = TransactionHistory()
+        p1, p2 = uuid4(), uuid4()
+        for _ in range(n):
+            tid = uuid4()
+            hist.update(tid, p1, 0.8)
+            hist.update(tid, p2, 0.6)
+        return to_json_string(hist.era(0))
+
+    def _update(self, rp, chain, peer):
+        msg = Message(CfgIds.reputation, ReputationProtocol.update, chain,
+                      from_whom=peer)
+        return rp.handle_update({CfgIds.network: queue.Queue()}, msg)
+
+    def test_one_peer_report_catches_up(self):
+        rp = _make_rep_process()
+        assert self._update(rp, self._chain(2), _make_mock_peer()) is True
+        assert len(rp.history) == 2
+        assert rp.updates == {}
+
+    def test_a_repeated_report_adds_nothing(self):
+        rp = _make_rep_process()
+        chain = self._chain(2)
+        self._update(rp, chain, _make_mock_peer(nickname='p1'))
+        self._update(rp, chain, _make_mock_peer(nickname='p2'))
+        assert len(rp.history) == 2
+
+    def test_a_backdate_leaves_the_quorum_alone(self):
+        rp = _make_rep_process()
+        rp.protocol.peers.find_top_n = MagicMock(return_value=[])
+        peer = _make_mock_peer()
+        msg = Message(CfgIds.reputation, ReputationProtocol.backdate,
+                      to_yaml_string((100, 1, peer.uuid)), from_whom=peer)
+        rp.handle_backdate({CfgIds.network: queue.Queue()}, msg)
+        assert rp.num_updates == 1
+
+
 class TestPureReputationBranches:
     """Cover _pure_reputation p1/p2 branches (lines 300-302)."""
 

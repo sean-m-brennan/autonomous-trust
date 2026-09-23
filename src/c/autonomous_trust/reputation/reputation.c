@@ -378,6 +378,63 @@ static int _index_peer_slot(tx_history_t *hist, const uuid_t peer_uuid, int slot
     return 0;
 }
 
+/* Rebuild task_map and peer_map from chain[] as it now stands. Used after
+ * an entry is moved within the array; both maps store SLOT POSITIONS, so a
+ * move invalidates them. O(chain_len); chain_len <= MAX_CHAIN_LEN. */
+static void _rebuild_slot_maps(tx_history_t *hist)
+{
+    map_key_t key = NULL;
+    data_t *val = NULL;
+    map_entries_for_each(&hist->peer_map, key, val)
+    {
+        void *arr_ptr = NULL;
+        if (data_object_ptr(val, &arr_ptr) == 0 && arr_ptr != NULL)
+            array_free((array_t *)arr_ptr);   /* releases the array_t too */
+    }
+    map_end_for_each
+    map_free(&hist->peer_map);
+    map_init(&hist->peer_map);
+    map_free(&hist->task_map);
+    map_init(&hist->task_map);
+
+    for (int slot = 0; slot < hist->chain_len; slot++)
+    {
+        const transaction_t *tx = &hist->chain[slot];
+        char task_key[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(tx->task_uuid, task_key);
+        map_set(&hist->task_map, (map_key_t)task_key, integer_data(slot));
+        if (tx->p1_set)
+            _index_peer_slot(hist, tx->p1_uuid, slot);
+        if (tx->p2_set && uuid_compare(tx->p1_uuid, tx->p2_uuid) != 0)
+            _index_peer_slot(hist, tx->p2_uuid, slot);
+    }
+}
+
+/* Keep chain[]'s committed entries in COMMIT order: move the entry at @p idx,
+ * which has just gone bilateral, to the end of the array.
+ *
+ * chain[] holds pending entries too, at the slot where their FIRST half
+ * arrived, while index and prev_hash are assigned when the SECOND half lands.
+ * Two interleaved tasks therefore commit out of array order, and every
+ * reader that walks chain[] as the committed sequence (the catch-up wire,
+ * era, the checkpoint window leaves, the evidence export, the link check) saw
+ * a sequence whose hash links did not hold. The moderation cohort (run 8,
+ * 2026-09-23) found carol's persisted chain in index order [3, 0, 2, 1],
+ * failing verification, so every peer rejected her catch-up. Python never had
+ * this: its _chain holds only committed entries, appended as they commit. */
+static int _move_to_commit_position(tx_history_t *hist, int idx)
+{
+    int last = hist->chain_len - 1;
+    if (idx < 0 || idx >= last)
+        return idx;   /* already at the end */
+    transaction_t moved = hist->chain[idx];
+    memmove(&hist->chain[idx], &hist->chain[idx + 1],
+            (size_t)(last - idx) * sizeof(transaction_t));
+    hist->chain[last] = moved;
+    _rebuild_slot_maps(hist);
+    return last;
+}
+
 /* Load one already-committed entry verbatim — index, prev_hash and scores as
  * they were persisted — and wire up the maps and counters around it.
  *
@@ -765,6 +822,13 @@ int tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
              * self._head_hash = tx.entry_hash()`. */
             memcpy(tx->prev_hash, hist->head_hash, TX_HASH_HEX_LEN + 1);
             transaction_entry_hash(tx, hist->head_hash);
+            if (idx != hist->chain_len - 1)
+            {
+                /* The rebuild indexes both parties at the new slot, so the
+                 * append below would count this peer twice. */
+                _move_to_commit_position(hist, idx);
+                return 0;
+            }
         }
     }
 
@@ -978,7 +1042,53 @@ int tx_history_era_to_json(const tx_history_t *hist, int start_idx, int end_idx,
 }
 
 /* Frama-C: skipped — [serialization] jansson JSON deserialization */
+static int _era_from_json_ordered(tx_history_t *hist, const json_t *arr);
+
+static json_int_t _entry_index(const json_t *obj)
+{
+    json_t *j = json_object_get((json_t *)obj, "index");
+    return json_is_integer(j) ? json_integer_value(j) : -1;
+}
+
+/* A segment is verified and loaded in INDEX order, whatever order it came in.
+ * A peer on a build from before _move_to_commit_position, or a snapshot it
+ * persisted, lists committed entries in arrival order, and read that way a
+ * sound chain fails its own link check. Stable insertion sort: the segment
+ * holds at most MAX_CHAIN_LEN entries. */
 int tx_history_era_from_json(tx_history_t *hist, const json_t *arr)
+{
+    if (!json_is_array(arr))
+        return -1;
+    size_t n = json_array_size(arr);
+    json_t **items = calloc(n > 0 ? n : 1, sizeof(json_t *));
+    if (items == NULL)
+        return EXCEPTION(ENOMEM);
+    for (size_t i = 0; i < n; i++)
+    {
+        json_t *cur = json_array_get(arr, i);
+        size_t j = i;
+        while (j > 0 && _entry_index(items[j - 1]) > _entry_index(cur))
+        {
+            items[j] = items[j - 1];
+            j--;
+        }
+        items[j] = cur;
+    }
+    json_t *sorted = json_array();
+    if (sorted == NULL)
+    {
+        free(items);
+        return EXCEPTION(ENOMEM);
+    }
+    for (size_t i = 0; i < n; i++)
+        json_array_append(sorted, items[i]);
+    free(items);
+    int rc = _era_from_json_ordered(hist, sorted);
+    json_decref(sorted);
+    return rc;
+}
+
+static int _era_from_json_ordered(tx_history_t *hist, const json_t *arr)
 {
     if (!json_is_array(arr))
         return -1;
@@ -1050,11 +1160,52 @@ int tx_history_era_from_json(tx_history_t *hist, const json_t *arr)
         const char *p2_str = json_string_value(json_object_get(obj, "p2"));
         if (task_str == NULL || p1_str == NULL || p2_str == NULL)
             continue;
+        /* Load only what we do not already hold, as Python's catchup does
+         * (`if link.index >= self._next_index`). A peer answers "update
+         * needed" with its WHOLE history (handle_outdated sends era 0..len),
+         * so without this every catch-up appended our own committed entries a
+         * second time. Nothing noticed while the catch-up quorum of 3 kept any
+         * merge from running in a 3-node cohort. */
+        json_t *j_index = json_object_get(obj, "index");
+        if (json_is_integer(j_index)
+            && json_integer_value(j_index) >= 0
+            && json_integer_value(j_index) < hist->next_index)
+            continue;
 
-        if (hist->chain_len >= MAX_CHAIN_LEN)
+        /* A task we already hold must not get a second slot. Committed: we
+         * have it (possibly at another index, from before we converged), so
+         * skip it. Pending (our own half is in, the other is still in
+         * flight): the peer's committed copy COMPLETES that slot, the way
+         * Python's catchup completes it through update(). Appending instead
+         * left two entries for one task once our half later committed too:
+         * bob's chain in moderation cohort run 9 (2026-09-23) held two tasks
+         * twice, was two entries longer than both peers', and was backdated
+         * by everyone from then on. */
+        char held_key[UUID_STRING_LEN + 1];
+        snprintf(held_key, sizeof(held_key), "%s", task_str);
+        for (char *c = held_key; *c; c++)
+            if (*c >= 'A' && *c <= 'F') *c = (char)(*c - 'A' + 'a');
+        data_t *held = NULL;
+        if (map_get(&hist->evicted_set, held_key, &held) == 0)
+            continue;
+        int pending_slot = -1;
+        if (map_get(&hist->task_map, held_key, &held) == 0 && held != NULL)
+        {
+            int slot = -1;
+            data_integer(held, &slot);
+            if (slot >= 0 && slot < hist->chain_len)
+            {
+                if (hist->chain[slot].p1_set && hist->chain[slot].p2_set)
+                    continue;
+                pending_slot = slot;
+            }
+        }
+
+        if (pending_slot < 0 && hist->chain_len >= MAX_CHAIN_LEN)
             tx_history_evict_oldest(hist);
 
-        transaction_t *tx = &hist->chain[hist->chain_len];
+        int slot_now = pending_slot >= 0 ? pending_slot : hist->chain_len;
+        transaction_t *tx = &hist->chain[slot_now];
         memset(tx, 0, sizeof(transaction_t));
         uuid_parse(task_str, tx->task_uuid);
         uuid_parse(p1_str, tx->p1_uuid);
@@ -1074,6 +1225,24 @@ int tx_history_era_from_json(tx_history_t *hist, const json_t *arr)
         {
             strncpy(tx->prev_hash, ph, TX_HASH_HEX_LEN);
             tx->prev_hash[TX_HASH_HEX_LEN] = '\0';
+        }
+
+        if (pending_slot >= 0)
+        {
+            /* Completed in place: count it, then move it to commit position
+             * (which rebuilds both slot maps). */
+            if (tx->p1_set && tx->p2_set)
+            {
+                if (hist->committed_count == 0 ||
+                    tx->index < hist->first_index)
+                    hist->first_index = tx->index;
+                hist->committed_count++;
+                if (tx->index > max_loaded_index)
+                    max_loaded_index = tx->index;
+            }
+            if (_move_to_commit_position(hist, pending_slot) == pending_slot)
+                _rebuild_slot_maps(hist);
+            continue;
         }
 
         /* Update maps */
@@ -1344,6 +1513,21 @@ int reputation_evidence_from_json(const json_t *doc, tx_history_t *hist_out,
             tx->prev_hash[TX_HASH_HEX_LEN] = '\0';
         }
         staged_n++;
+    }
+
+    /* Index order first: a snapshot written before _move_to_commit_position
+     * lists committed entries in arrival order, which fails the link check
+     * below for a chain that is sound. Stable insertion sort, n is bounded. */
+    for (int i = 1; i < staged_n; i++)
+    {
+        transaction_t cur = staged[i];
+        int j = i;
+        while (j > 0 && staged[j - 1].index > cur.index)
+        {
+            staged[j] = staged[j - 1];
+            j--;
+        }
+        staged[j] = cur;
     }
 
     /* Hash-linkage before anything is adopted. A broken link means the file
