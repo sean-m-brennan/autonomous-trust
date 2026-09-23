@@ -1413,6 +1413,9 @@ target_link_libraries(map2_test PRIVATE ${AT_TEST_LIBS})
 add_executable(reputation3_test test/reputation3_test.c)
 set_source_files_properties(test/reputation3_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(reputation3_test PRIVATE ${AT_TEST_LIBS})
+add_executable(reputation_fork_test test/reputation_fork_test.c)
+set_source_files_properties(test/reputation_fork_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(reputation_fork_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(trust_ladder_test test/trust_ladder_test.c)
 set_source_files_properties(test/trust_ladder_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1437,6 +1440,7 @@ target_link_libraries(msg_types2_test PRIVATE ${AT_TEST_LIBS})
 
 add_test(NAME map2_test COMMAND $<TARGET_FILE:map2_test>)
 add_test(NAME reputation3_test COMMAND $<TARGET_FILE:reputation3_test>)
+add_test(NAME reputation_fork_test COMMAND $<TARGET_FILE:reputation_fork_test>)
 add_test(NAME trust_ladder_test COMMAND $<TARGET_FILE:trust_ladder_test>)
 set_tests_properties(trust_ladder_test PROPERTIES
     ENVIRONMENT "AT_REPO_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/../..")

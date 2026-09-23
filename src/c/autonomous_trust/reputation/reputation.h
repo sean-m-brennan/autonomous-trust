@@ -513,6 +513,56 @@ int  tx_history_era_to_json(const tx_history_t *hist, int start_idx, int end_idx
                             json_t **out);
 int  tx_history_era_from_json(tx_history_t *hist, const json_t *arr);
 
+/** What tx_history_reconcile did. Mirrors Python's ReconcileResult. */
+typedef enum {
+    TX_RECONCILE_NONE = 0,       /**< nothing new: we hold all of it */
+    TX_RECONCILE_EXTENDED,       /**< the peer's chain continued ours */
+    TX_RECONCILE_ADOPTED,        /**< forked; the peer's tip won, ours from `fork` dropped */
+    TX_RECONCILE_KEPT,           /**< forked; our tip won */
+    TX_RECONCILE_REFUSED_FINAL,  /**< forked inside our finalized checkpoint */
+    TX_RECONCILE_REJECTED,       /**< links, a gap, or an impossible duplicate */
+} tx_reconcile_status_t;
+
+typedef struct {
+    tx_reconcile_status_t status;
+    int fork;      /**< fork index, or -1 */
+    int dropped;   /**< our committed entries removed */
+    int added;     /**< peer entries loaded */
+} tx_reconcile_result_t;
+
+/** Reconcile @p hist with a peer's reported chain @p arr by the LONGEST
+ *  VERIFIED CHAIN rule (ISSUES.md §2.15). Entries are taken verbatim. Nothing
+ *  at an index below @p final_end (one past our finalized checkpoint window,
+ *  or -1 for none) is ever rewritten. Returns 0, or an error for a non-array
+ *  or allocation failure; @p out (may be NULL) says what happened. */
+int  tx_history_reconcile(tx_history_t *hist, const json_t *arr,
+                          int final_end, tx_reconcile_result_t *out);
+
+/** A quorum-attested window this node's own entries do NOT reproduce: the
+ *  group finalized a chain ours lost to. */
+typedef struct {
+    char root[TX_HASH_HEX_LEN + 1];
+    int  first_index;
+    int  count;
+} tx_attested_t;
+
+/** tx_history_reconcile, plus: when @p attested is non-NULL and the peer's
+ *  segment reproduces attested->root over its window, the peer wins whatever
+ *  the tips say. An order fork at EQUAL length otherwise goes to the lower
+ *  head hash, which can be the side the quorum outvoted, and it then never
+ *  converges (moderation cohort mod-2538837, 2026-09-23). */
+int  tx_history_reconcile_attested(tx_history_t *hist, const json_t *arr,
+                                   int final_end,
+                                   const tx_attested_t *attested,
+                                   tx_reconcile_result_t *out);
+
+/** Merkle root over our committed entries at indices [first, first + count),
+ *  the value a checkpoint over that window attests. Returns -1 unless every
+ *  index in the range is resident, in order. Mirrors Python's
+ *  TransactionHistory.range_root. */
+int  tx_history_range_root(const tx_history_t *hist, int first, int count,
+                           char out[TX_HASH_HEX_LEN + 1]);
+
 /****************************
  * Reputations map
  ****************************/

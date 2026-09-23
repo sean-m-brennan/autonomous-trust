@@ -46,6 +46,8 @@
 
 #include <pthread.h>
 #include <string.h>
+#include <errno.h>
+#include <unistd.h>
 #include <stdlib.h>
 
 #include <jansson.h>
@@ -69,6 +71,7 @@ static char STANDING_FN[] = AT_APP_PEER_STANDING;
 /* What crossed to the reputation process, captured by the send hook. */
 static int   g_sent;
 static peer_standing_msg_t g_last;
+static bool  g_reputation_full;
 
 static int _hook(const char *key, const message_type_t type,
                  generic_msg_t *msg, bool blocking)
@@ -76,6 +79,8 @@ static int _hook(const char *key, const message_type_t type,
     (void)blocking;
     if (key != NULL && strcmp(key, "reputation") == 0
         && type == PEER_STANDING && msg != NULL) {
+        if (g_reputation_full)
+            return EAGAIN;
         g_sent++;
         memcpy(&g_last, &msg->info.peer_standing, sizeof(g_last));
     }
@@ -171,6 +176,7 @@ static void _begin(void)
 {
     identity_reset_state();
     g_sent = 0;
+    g_reputation_full = false;
     memset(&g_last, 0, sizeof(g_last));
     messaging_set_test_hook(_hook);
 }
@@ -351,6 +357,44 @@ DEFINE_TEST(test_a_malformed_finding_is_refused)
 }
 END_TEST_DEFINITION()
 
+static void *_relent(void *unused)
+{
+    (void)unused;
+    usleep(60000);
+    g_reputation_full = false;
+    return NULL;
+}
+
+DEFINE_TEST(test_a_reinstatement_survives_a_briefly_full_reputation_queue)
+{
+    /* Moderation cohort run 11 (2026-09-23): the reinstatement met a
+     * reputation queue full of catch-up traffic, one send failed, and the cap
+     * it was meant to lift stayed in force. The reason and source crossed
+     * intact too: the log lines used to read them after the payload was
+     * freed. */
+    _begin();
+    identity_t *me = _mk_identity("10.0.0.1", "self");
+    process_t *proc = _mk_process(me);
+    identity_t *member = _mk_identity("10.0.0.2", "member");
+    _admit(proc, member);
+    char member_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(member->uuid, member_str);
+
+    g_reputation_full = true;
+    pthread_t drainer;
+    pthread_create(&drainer, NULL, _relent, NULL);
+    _standing(proc, member_str, "proved", json_real(-1.0),
+              PEER_STANDING_SOURCE_ETHNE, NULL);
+    pthread_join(drainer, NULL);
+
+    ck_assert_int_eq(g_sent, 1);
+    ck_assert_int_eq(g_last.standing, (int32_t)PEER_STANDING_PROVED);
+    ck_assert_str_eq(g_last.source, PEER_STANDING_SOURCE_ETHNE);
+    ck_assert_str_eq(g_last.reason, "expelled from the polity");
+    _end();
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(PeerStandingVerb,
           test_an_expulsion_becomes_a_ceiling,
           test_the_expulsion_ceiling_closes_tiers_without_cutting_the_peer_off,
@@ -359,4 +403,5 @@ RUN_TESTS(PeerStandingVerb,
           test_the_app_may_not_speak_as_the_credential_authority,
           test_an_off_scale_ceiling_is_refused,
           test_a_finding_about_a_stranger_is_refused,
-          test_a_malformed_finding_is_refused)
+          test_a_malformed_finding_is_refused,
+          test_a_reinstatement_survives_a_briefly_full_reputation_queue)

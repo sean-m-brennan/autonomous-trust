@@ -283,9 +283,63 @@ DEFINE_TEST(test_reputation_pure_with_counterparty)
     ck_assert_ret_ok(reputations_update(&reps, peer1, 0.8));
     ck_assert_ret_ok(reputations_update(&reps, peer2, 0.6));
 
-    /* Pure reputation for peer1: counterparty is peer2, score = 0.7 * 0.6 = 0.42 */
+    /* Pure reputation for peer1: one entry, so its counterparty's score, 0.7,
+     * whatever peer2's reputation. sum(score * rep) / sum(rep) since
+     * 2026-09-23; the divisor used to leave the reputation out (0.42 here),
+     * which decayed well-behaved peers under rescoring. */
     double score = reputation_pure(&hist, &reps, peer1, NULL);
-    ck_assert_double_eq_tol(score, 0.42, 0.001);
+    ck_assert_double_eq_tol(score, 0.7, 0.001);
+
+    /* Two reporters: the trusted one's 0.9 outweighs the untrusted one's 0.3.
+     * (0.9*0.8 + 0.3*0.2) / (0.8 + 0.2) = 0.78; a plain average is 0.6 and
+     * the old divisor gave 0.39. */
+    {
+        tx_history_t h2;
+        reputations_t r2;
+        ck_assert_ret_ok(tx_history_init(&h2));
+        ck_assert_ret_ok(reputations_init(&r2));
+        uuid_t p, a, b, t1, t2;
+        uuid_generate(p); uuid_generate(a); uuid_generate(b);
+        uuid_generate(t1); uuid_generate(t2);
+        ck_assert_ret_ok(tx_history_update(&h2, t1, p, 0.5, NULL));
+        ck_assert_ret_ok(tx_history_update(&h2, t1, a, 0.9, NULL));
+        ck_assert_ret_ok(tx_history_update(&h2, t2, p, 0.5, NULL));
+        ck_assert_ret_ok(tx_history_update(&h2, t2, b, 0.3, NULL));
+        ck_assert_ret_ok(reputations_update(&r2, a, 0.8));
+        ck_assert_ret_ok(reputations_update(&r2, b, 0.2));
+        ck_assert_double_eq_tol(reputation_pure(&h2, &r2, p, NULL), 0.78, 0.001);
+
+        /* Fed back through rescoring, peers whose every entry scores 0.9 stay
+         * at 0.9. The old divisor drove them toward zero. */
+        tx_history_free(&h2);
+        reputations_free(&r2);
+        ck_assert_ret_ok(tx_history_init(&h2));
+        ck_assert_ret_ok(reputations_init(&r2));
+        for (int i = 0; i < 4; i++)
+        {
+            uuid_t t;
+            uuid_generate(t);
+            ck_assert_ret_ok(tx_history_update(&h2, t, a, 0.9, NULL));
+            ck_assert_ret_ok(tx_history_update(&h2, t, b, 0.9, NULL));
+        }
+        double sa = 0.7, sb = 0.7;
+        for (int it = 0; it < 20; it++)
+        {
+            ck_assert_ret_ok(reputations_update(&r2, a, sa));
+            ck_assert_ret_ok(reputations_update(&r2, b, sb));
+            sa = reputation_pure(&h2, &r2, a, NULL);
+            sb = reputation_pure(&h2, &r2, b, NULL);
+        }
+        ck_assert_double_eq_tol(sa, 0.9, 0.001);
+        ck_assert_double_eq_tol(sb, 0.9, 0.001);
+
+        /* Reporters with no reputation leave the prior. */
+        ck_assert_ret_ok(reputations_update(&r2, a, 0.0));
+        ck_assert_double_eq_tol(reputation_pure(&h2, &r2, b, NULL),
+                                PREREP_NEUTRAL, 0.001);
+        tx_history_free(&h2);
+        reputations_free(&r2);
+    }
 
     /* No transactions: default to PREREP_NEUTRAL (0.2) */
     uuid_t unknown;
@@ -319,8 +373,8 @@ DEFINE_TEST(test_reputation_pure_unknown_counterparty_default_0_5)
     /* No reputations set — counterparty fallback is PREREP_NEUTRAL (0.2). */
 
     double score = reputation_pure(&hist, &reps, peer_id, NULL);
-    /* counterparty_score = 0.6, cp_rep = PREREP_NEUTRAL (0.2) → 0.12. */
-    ck_assert_double_eq_tol(score, 0.12, 0.001);
+    /* Counted at the fallback weight, not skipped: one entry, so its 0.6. */
+    ck_assert_double_eq_tol(score, 0.6, 0.001);
 
     tx_history_free(&hist);
     reputations_free(&reps);

@@ -9153,21 +9153,39 @@ static bool handle_app_peer_standing(const process_t *proc,
                sizeof(out.info.peer_standing.reason));
     at_strlcpy(out.info.peer_standing.source, source,
                sizeof(out.info.peer_standing.source));
+    /* Everything logged below comes from these copies. peer_str, source and
+     * reason_str borrow from `payload`, and the log lines used to read them
+     * AFTER this decref (the moderation cohort's run 11 log printed garbage
+     * for all three). */
+    char peer_buf[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, peer_buf);
     json_decref(payload);
 
-    if (messaging_send("reputation", PEER_STANDING, &out, false) != 0) {
+    /* Bounded retry, as for the social score: run 11 lost the reinstatement
+     * here on a reputation queue full of catch-up traffic, and the cap it was
+     * meant to lift stayed in force. */
+    int ret = -1;
+    for (int attempt = 0; attempt < 10; attempt++) {
+        ret = messaging_send("reputation", PEER_STANDING, &out, false);
+        if (ret == 0)
+            break;
+        usleep(20000); /* 20ms */
+    }
+    if (ret != 0) {
         log_warn(proc->logger,
                  "Identity: could not propagate %s standing for %s "
-                 "(ceiling %.2f)\n", source, peer_str, ceiling);
+                 "(ceiling %.2f) after 10 tries (%s) — it DID NOT take "
+                 "effect\n", out.info.peer_standing.source, peer_buf, ceiling,
+                 ret == EAGAIN ? "reputation queue still full" : "send failed");
         return true;
     }
     log_info(proc->logger,
              "Identity: %s standing for %s -> %s (ceiling %.2f): %s\n",
-             source, peer_str,
+             out.info.peer_standing.source, peer_buf,
              standing == (int32_t)PEER_STANDING_PROVED   ? "proved"
              : standing == (int32_t)PEER_STANDING_FAILED ? "failed"
                                                          : "capped",
-             ceiling, reason_str ? reason_str : "");
+             ceiling, out.info.peer_standing.reason);
     return true;
 }
 

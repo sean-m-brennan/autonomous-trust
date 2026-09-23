@@ -1339,8 +1339,8 @@ class TestPureReputationBranches:
         rp.history.update(tid, other.uuid, 0.8)
         result = rp._pure_reputation(peer)
         assert isinstance(result, float)
-        # p2_score=0.8 * reputations[other.uuid]=0.9 / 1 entry
-        assert abs(result - 0.8 * 0.9) < 1e-9
+        # One entry: the weighted average is p2_score itself (trust-tiers.md §5)
+        assert abs(result - 0.8) < 1e-9
 
     def test_pure_rep_p2_is_peer(self):
         """When tx.p2_id == peer.uuid and tx.p1_id has reputation, uses p1_score."""
@@ -1355,8 +1355,8 @@ class TestPureReputationBranches:
         rp.history.update(tid, peer.uuid, 0.7)
         result = rp._pure_reputation(peer)
         assert isinstance(result, float)
-        # p1_score=0.6 * reputations[other.uuid]=0.8 / 1 entry
-        assert abs(result - 0.6 * 0.8) < 1e-9
+        # One entry: the weighted average is p1_score itself (trust-tiers.md §5)
+        assert abs(result - 0.6) < 1e-9
 
 
 class TestContriteTitForTatBranches2:

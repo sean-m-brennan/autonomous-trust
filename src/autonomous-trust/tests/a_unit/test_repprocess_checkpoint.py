@@ -30,7 +30,7 @@ import pytest
 
 from autonomous_trust.core.reputation.repprocess import ReputationProcess
 from autonomous_trust.core.reputation.reputation import (
-    Checkpoint, SignedCheckpoint,
+    Checkpoint, SignedCheckpoint, TransactionHistory,
 )
 from autonomous_trust.core.reputation.protocol import ReputationProtocol
 from autonomous_trust.core._python.identity.identity import Identity
@@ -252,3 +252,64 @@ class TestCheckpointFlow:
         msg.verified = False
         assert rp.handle_checkpoint_propose({CfgIds.network: net_q}, msg) is True
         assert net_q.empty()  # no co-sign emitted
+
+
+class TestOutvotedRequestsTheQuorumChain:
+    """mod-2537396 and mod-2538837 (2026-09-23): an order fork at EQUAL length
+    never reconciled, because catch-up runs only when a grant finds the lengths
+    differ. A quorate checkpoint our chain does not reproduce now asks its
+    finalizer for its chain. Mirrors C
+    test_an_outvoted_node_requests_and_adopts_the_quorum_chain."""
+
+    def _setup(self):
+        proposer = _identity('proposer')
+        rp = _make_rep_process()
+        rp.protocol.peers.all = [proposer]
+        tasks = {c: uuid4() for c in 'abcx'}
+        ours, theirs = rp.history, TransactionHistory()
+        for hist, letters in ((ours, 'abx'), (theirs, 'abc')):
+            for c in letters:
+                hist.update(tasks[c], rp.identity.uuid, 0.7)
+                hist.update(tasks[c], proposer.uuid, 0.6)
+        return proposer, rp, theirs
+
+    @staticmethod
+    def _final(rp, proposer, root):
+        ck = Checkpoint(proposer_uuid=proposer.uuid, root=root, epoch=2,
+                        first_index=0, count=3)
+        signed = SignedCheckpoint(
+            checkpoint=ck, sigs={str(proposer.uuid): _cosign(proposer, ck)})
+        final = Message(CfgIds.reputation, ReputationProtocol.checkpoint_final,
+                        to_json_string(signed), rp.group, from_whom=proposer)
+        final.verified = True
+        return final
+
+    @staticmethod
+    def _requests(q):
+        out = []
+        while not q.empty():
+            m = q.get_nowait()
+            if m.function == ReputationProtocol.outdated:
+                out.append(m)
+        return out
+
+    def test_a_final_over_our_chain_asks_nothing(self):
+        proposer, rp, _ = self._setup()
+        net_q = queue.Queue()
+        rp.handle_checkpoint_final({CfgIds.network: net_q},
+                                   self._final(rp, proposer,
+                                               rp.history.window_root()))
+        assert self._requests(net_q) == []
+
+    def test_a_final_over_another_chain_asks_its_finalizer(self):
+        proposer, rp, theirs = self._setup()
+        net_q = queue.Queue()
+        rp.handle_checkpoint_final({CfgIds.network: net_q},
+                                   self._final(rp, proposer,
+                                               theirs.window_root()))
+        reqs = self._requests(net_q)
+        assert len(reqs) == 1
+        to = reqs[0].to_whom
+        to = to[0] if isinstance(to, list) else to
+        assert str(to.uuid) == str(proposer.uuid)
+        assert str(reqs[0].obj) == '0'

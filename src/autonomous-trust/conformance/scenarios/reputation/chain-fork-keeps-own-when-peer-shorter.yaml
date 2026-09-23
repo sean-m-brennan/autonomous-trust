@@ -1,0 +1,53 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: chain-fork-keeps-own-when-peer-shorter
+byte_pinning: false
+description: |
+    The chains fork by ORDER (ISSUES.md §2.15): each node numbers an entry
+    when its second half lands, so two nodes can hold different tasks at the same
+    index, and a grant needs equal chain lengths, so Paxos stalls once they differ.
+    Reconciliation follows the LONGEST VERIFIED CHAIN rule (user decision
+    2026-09-23): find the first index where the two differ by entry hash; the peer
+    wins only with the higher tip (last index + 1, then the LOWER head hash on a
+    tie); nothing inside our finalized checkpoint is rewritten; adopted entries are
+    taken verbatim, so agreeing nodes become byte-identical.
+    
+    dave's own chain is staged through the real writer by the `local_chain`
+    fixture, with the payload builder's uuid derivation, so it hash-matches
+    alice's report up to the fork.
+    
+    The peer's chain is SHORTER past the fork, so dave keeps his own. A rule
+    that adopted on any divergence would drop x and y for a shorter history.
+
+participants:
+  - id: alice
+    role: provider
+  - id: dave
+    role: consumer
+
+fixtures:
+  local_chain:
+    dave:
+      - {task: a, p1: 0.7, p2: 0.5}
+      - {task: b, p1: 0.9, p2: 0.3}
+      - {task: x, p1: 0.2, p2: 0.2}
+      - {task: y, p1: 0.1, p2: 0.9}
+
+steps:
+  - id: 1
+    from: alice
+    to: dave
+    function: latest update
+    payload:
+      chain:
+        - {task: a, p1: 0.7, p2: 0.5}
+        - {task: b, p1: 0.9, p2: 0.3}
+        - {task: c, p1: 0.6, p2: 0.4}
+    description: |
+        alice forks from dave at index 2 with a lower tip.
+
+expected_state:
+  dave:
+    committed_tx_count: 4
+    window_root: "24e14a12156eb8f186aaed215c2f88d847c787aa1d0b02d9eb178da6408db13c"

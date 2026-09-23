@@ -1,0 +1,66 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: chain-fork-quorum-chain-wins-tiebreak
+byte_pinning: false
+description: |
+    The chains fork by ORDER (ISSUES.md §2.15): each node numbers an entry
+    when its second half lands, so two nodes can hold different tasks at the same
+    index, and a grant needs equal chain lengths, so Paxos stalls once they differ.
+    Reconciliation follows the LONGEST VERIFIED CHAIN rule (user decision
+    2026-09-23): find the first index where the two differ by entry hash; the peer
+    wins only with the higher tip (last index + 1, then the LOWER head hash on a
+    tie); nothing inside our finalized checkpoint is rewritten; adopted entries are
+    taken verbatim, so agreeing nodes become byte-identical.
+    
+    dave's own chain is staged through the real writer by the `local_chain`
+    fixture, with the payload builder's uuid derivation, so it hash-matches
+    alice's report up to the fork.
+    
+    Equal tips, but a quorum attested the OTHER side. dave holds x at index 2
+    and alice reports c there; x hashes lower, so under the plain tiebreak dave
+    keeps his own chain (chain-fork-equal-length-tiebreak is the mirror). His
+    finalized checkpoint, though, attests indices 0 to 2 with the root of
+    [a, b, c]: the quorum outvoted him. A segment that reproduces the attested
+    window wins the tie, so he ADOPTS alice's chain. Without that rule the lower
+    head hash settles an equal-length order fork for good, even when it is the
+    side the quorum outvoted, which is what moderation cohort runs mod-2537396
+    and mod-2538837 (2026-09-23) showed.
+
+participants:
+  - id: alice
+    role: provider
+  - id: dave
+    role: consumer
+
+fixtures:
+  local_chain:
+    dave:
+      - {task: a, p1: 0.7, p2: 0.5}
+      - {task: b, p1: 0.9, p2: 0.3}
+      - {task: x, p1: 0.2, p2: 0.2}
+
+  checkpoint:
+    dave:
+      root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+      epoch: 1
+      first_index: 0
+      count: 3
+
+steps:
+  - id: 1
+    from: alice
+    to: dave
+    function: latest update
+    payload:
+      chain:
+        - {task: a, p1: 0.7, p2: 0.5}
+        - {task: b, p1: 0.9, p2: 0.3}
+        - {task: c, p1: 0.6, p2: 0.4}
+    description: |
+        alice's equal-length chain reproduces the window the quorum attested.
+
+expected_state:
+  dave:
+    committed_tx_count: 3
+    window_root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
