@@ -5,7 +5,7 @@
  Licensed under the Apache License, Version 2.0.
 -->
 
-# TCP Connection Pooling
+# TCP connection pooling
 
 The TCP transport reuses one connection per peer for many messages instead of
 opening a fresh connection for each one. Pooling is **on by default** since

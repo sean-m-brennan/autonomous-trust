@@ -1,6 +1,6 @@
 *Previous: [Integration testing](integration-testing.md)*
 
-# Adversarial Testing
+# Adversarial testing
 
 The adversarial testing framework validates the security claims of the
 AutonomousTrust protocol stack through five automated attack scenarios. Each

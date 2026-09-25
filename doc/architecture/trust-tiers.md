@@ -12,18 +12,18 @@ up to tier 4 meaning fully trusted, each unlocking a class of capability. Tier 0
 is network presence. The bands above it are communication, services, reading
 shared data, and writing it.
 
-Three mechanisms make the ladder work, and each answers a failure the framework
-actually exhibited. Transactions are *weighted*, so a mission-critical exchange
-moves reputation faster than a heartbeat does, because equal weighting made
-every score contribute identically and reputations sat flat. A *bootstrap
-corpus* of small built-in exchanges gives a freshly admitted peer something
-harmless to be scored on, because otherwise the only scoring flow was the
-consequential operation itself, and there was no separation between building
-trust and acting on it. And *tier gating* runs in both directions symmetrically,
-so demotion cancels work in flight rather than letting an authorization outlive
-the standing that granted it.
+Three mechanisms make the ladder work, and each one answers a failure we
+actually watched the framework exhibit. Transactions are *weighted*, so a
+mission-critical exchange moves reputation faster than a heartbeat does, because
+equal weighting made every score contribute identically and reputations sat
+flat. A *bootstrap corpus* of small built-in exchanges gives a freshly admitted
+peer something harmless to be scored on, because otherwise the only scoring flow
+was the consequential operation itself, and there was no separation between
+building trust and acting on it. And *tier gating* runs in both directions
+symmetrically, so demotion cancels work in flight rather than letting an
+authorization outlive the standing that granted it.
 
-Section numbering below is retained because other documents cite these sections
+We keep the section numbering below because other documents cite these sections
 by number.
 
 ## 1. Rank is not trust tier
@@ -40,7 +40,7 @@ otherwise unreachable rank-1 nodes. A gateway is by definition a more capable
 node, having better connectivity, more compute, longer uptime, and more
 available bandwidth, so rank reflects what a peer can do at the network layer.
 
-*Trust tier* reflects how much its behavior is believed.
+*Trust tier* reflects how far we believe its behavior.
 
 | Axis | Source | What it gates | Algorithm class |
 |---|---|---|---|
@@ -58,7 +58,7 @@ configuration at startup and stays static for the life of the process unless a
 deployment-side change re-issues the identity. Readers of rank, being the
 partition-leader selector and the authority-agreement vote counter, are
 unaffected. Deriving rank dynamically from observed topology is a separate
-design and out of scope here.
+design, and out of scope here.
 
 ## 2. The problem this closed
 
@@ -87,16 +87,16 @@ mechanism to honor them.
 
 ## 3. What this does and does not do
 
-The goals were to define an extensible corpus of low-stakes exchanges every peer
-can engage in immediately after admission, to make transactions weighted by
-their consequence, to provide a deterministic mechanism for promotion and for
-symmetric revocation on demotion, to let each domain declare its own
-tier-to-capability mapping without forking the core, and to reach parity between
-the two runtimes from the start rather than leaving trust arithmetic skewed on
-one side. The consensus and tit-for-tat semantics are untouched, and the
-bilateral pairing invariant in the transaction history stays as it was.
+We wanted five things. An extensible corpus of low-stakes exchanges every peer
+can engage in immediately after admission. Transactions weighted by their
+consequence. A deterministic mechanism for promotion and for symmetric
+revocation on demotion. A way for each domain to declare its own
+tier-to-capability mapping without forking the core. And parity between the two
+runtimes from the start, rather than trust arithmetic left skewed on one side.
+The consensus and tit-for-tat semantics are untouched, and the bilateral pairing
+invariant in the transaction history stays as it was.
 
-Four things are deliberately not addressed. Redefining rank or deriving it from
+Four things we deliberately leave alone. Redefining rank or deriving it from
 observed topology is a separate design. Cross-domain tier portability, meaning a
 peer in two trust ladders at once, is undefined in this version. Zero-knowledge
 strength proof of execution for the bootstrap corpus is a follow-up, since the
@@ -136,11 +136,11 @@ for tier 3, and 0.90 for tier 4. Tier 0 corresponds to admitted only, and tiers
 1 through 4 map to communication, services, reading shared data, and writing it.
 
 *Transaction score linkage.* Weighting a score requires knowing which capability
-produced it, and a bare score carries no such handle. Three options were
-available: adding a capability name to the score, looking the capability up by
-task identifier through the negotiation tracker, or caching the weight itself on
-the score. The first was chosen. It costs one optional string on the wire, where
-the second creates a tight coupling between reputation and negotiation plus a
+produced it, and a bare score carries no such handle. We had three options. Add
+a capability name to the score, look the capability up by task identifier
+through the negotiation tracker, or cache the weight itself on the score. We
+took the first. It costs one optional string on the wire, where the second
+creates a tight coupling between reputation and negotiation plus a
 synchronization hazard when the tracker has not yet recorded the task on the
 scoring node, and the third loses the capability identity that future auditing
 and per-capability aggregation would want.
@@ -166,16 +166,16 @@ def _pure_reputation(self, peer):
     return total / total_w
 ```
 
-Here `reporter_score` is the reporter's reputation and `peer_score` is what
-the reporter scored the peer. The divisor carries the reputation as well as the
+Here `reporter_score` is the reporter's reputation and `peer_score` is what the
+reporter scored the peer. The divisor carries the reputation as well as the
 weight, which is what makes this an average. Until 2026-09-23 it carried the
 weight alone, so every score was multiplied by its reporter's reputation rather
 than weighted by it. Fed back through the rescore sweep, that decayed a group of
-well-behaved peers toward a fixed point below tier 1 once their chains
-converged and each held the others' evidence: in moderation cohort mod-2520518,
-peers whose transactions all scored 0.90 settled at 0.43. The corrected form
-holds them at 0.90. A reporter with no reputation contributes nothing, and if
-no reporter has any, the peer is at the neutral prior.
+well-behaved peers toward a fixed point below tier 1 once their chains converged
+and each held the others' evidence: in moderation cohort mod-2520518, peers
+whose transactions all scored 0.90 settled at 0.43. The corrected form holds
+them at 0.90. A reporter with no reputation contributes nothing, and if no
+reporter has any, the peer is at the neutral prior.
 
 The weight function returns the transaction weight of the capability named on
 the originating score. When the capability is unknown locally, the weight falls
@@ -262,8 +262,8 @@ name reads downstream as "not a probe", which falls back to ordinary scoring.
 
 Probe scores carry the `probe` evidence channel, which keeps "failed a
 known-answer challenge" distinguishable from "scored badly on a task" even
-though both may be the same number. See
-[Reputation](reputation.md), "Where a score came from".
+though both may be the same number. See [Reputation](reputation.md), "Where a
+score came from".
 
 *The worker.* A core worker, registered by default, opens a window of roughly
 thirty seconds of random pairwise interactions across all admitted peers on
@@ -320,8 +320,8 @@ rather than the selection sequence, so the two runtimes need not produce
 identical orderings to be held to the same contract; the probe allocation is
 deterministic in both, so its pin asserts probe and peer counts directly.
 
-That bound on C parity is now closed, and how it was closed is worth stating
-because it did not simply mirror the Python arrangement. Until it was, the C
+That bound on C parity is now closed, and how we closed it is worth stating,
+because it does not simply mirror the Python arrangement. Until it was, the C
 corpus was a tested library rather than a running subsystem: nothing in
 production C supplied the worker's invitation sink, and the C negotiation
 process had no task-result-to-reputation path at all, so no C node scored a
@@ -364,8 +364,8 @@ which is why the conformance corpus pins the *rules* — a scenario feeds a tabl
 of replies through each runtime's own scorer and asserts the score and the
 channel for each.
 
-One thing did not survive the mirroring and is recorded rather than papered
-over: the two runtimes still disagree on when a fan-out is complete. Python
+One thing did not survive the mirroring, and we record it rather than paper over
+it. The two runtimes still disagree on when a fan-out is complete. Python
 forwards on the first reply; C waits for every peer it invited. For a probe,
 which is addressed to exactly one peer, the two agree. See ISSUES.md.
 
@@ -397,10 +397,10 @@ tracker entry so later results for that task are rejected. The event is recorded
 for the dashboard and event log, appearing alongside the anomaly markers that
 triggered the tier loss in the first place.
 
-Symmetry here is what matters. Although the two directions look like separate
-features, the same tier mutation opens capability access on the way up and
-closes it on the way down, in one code path and one process, so no asymmetric
-surface exists where stale cached access survives.
+Symmetry here is what matters. The two directions look like separate features,
+but the same tier mutation opens capability access on the way up and closes it
+on the way down, in one code path and one process, so no asymmetric surface
+exists where stale cached access survives.
 
 *Hysteresis.* The cooperation-mode band already prevents scoring-mode flapping,
 and tier transitions need the same protection or a peer hovering near a boundary
@@ -499,9 +499,9 @@ probing does not stop when the window closes, that probes spread across peers
 rather than piling onto one, and that every capability keeps being exercised.
 Unlike the window's pin, which is deliberately agnostic to each runtime's
 pseudorandom generator, probe allocation is deterministic in both, so this one
-asserts counts directly. It does not cover whether an answer is *checked* —
-that is requestor-side scoring rather than worker behavior, exists only in
-Python, and is pinned by unit tests on both sides
+asserts counts directly. It does not cover whether an answer is *checked* — that
+is requestor-side scoring rather than worker behavior, exists only in Python,
+and is pinned by unit tests on both sides
 (`tests/a_unit/test_probe_verification.py`,
 `src/c/test/bootstrap_capabilities_test.c`).
 
@@ -509,8 +509,8 @@ Existing scenarios survive unchanged where the observable behavior is the same.
 The old low-reputation refusal still holds, because tier 0 still refuses any
 required tier above zero. The whole authority-agreement family is unaffected.
 
-Scenarios that asserted specific rank fields or rank-update messages in their
-traces were renamed to the tier equivalents, which is mechanical.
+We renamed the scenarios that asserted specific rank fields or rank-update
+messages in their traces to the tier equivalents, which is mechanical.
 
 ## 12. Open and out of scope
 
@@ -519,7 +519,7 @@ corpus evolve without breaking older peers. Recommended, and the current names
 ship without a version suffix, so the migration is a follow-up.
 
 *Stronger echo challenge.* The current construction uses signed nonces, which is
-sufficient for this version and does not preclude all forms of collusion.
+enough for this version and does not rule out every form of collusion.
 
 *Cross-domain tier portability.* A peer participating in two ladders at once,
 with a different file per group, is undefined behavior.

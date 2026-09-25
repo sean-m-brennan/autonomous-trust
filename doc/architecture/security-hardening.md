@@ -1,6 +1,6 @@
 *Previous: [The security model](../security.md)*
 
-# Security Hardening
+# Security hardening
 
 AutonomousTrust operates in adversarial network environments where peers are not inherently trusted. The framework applies defense-in-depth across its C cryptographic core, Python services layer, inspector tooling, and simulator. This document describes the security design principles and the architectural decisions that enforce them.
 
@@ -126,8 +126,8 @@ task. Ordering the gate that way would have turned a replay into a way of
 evicting a worker from work it had already accepted. Ahead of the counter, the
 counter goes back to counting what it was built for: distinct, freshly stamped
 invitations for one task, which is a requestor misbehaving rather than an
-attacker echoing. The same reasoning as the vote dedup above — a defence that
-can be aimed at the honest party is not yet a defence.
+attacker echoing. The same reasoning as the vote dedup above — a defense that
+can be aimed at the honest party is not yet a defense.
 
 One stamp covers a whole announcement rather than one per invited peer. The
 invitation is a single act fanned out to every capable peer, and each receiver
