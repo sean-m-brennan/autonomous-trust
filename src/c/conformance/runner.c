@@ -41,12 +41,25 @@
 #include "adapters/negotiation.h"
 #include "adapters/reputation.h"
 #include "adapters/bootstrap.h"
+/* The verification layers' adapters exist only when their extension library
+ * is built (conformance/CMakeLists.txt). */
+#ifdef AT_CONF_ORACLE_PHYSICS
 #include "adapters/physics.h"
+#endif
+#ifdef AT_CONF_ORACLE_CALIBRATION
 #include "adapters/calibration.h"
+#endif
+#ifdef AT_CONF_ORACLE_PREQUENTIAL
 #include "adapters/prequential.h"
+#endif
+#ifdef AT_CONF_ORACLE_CERTIFICATES
 #include "adapters/certificate.h"
+#endif
+#ifdef AT_CONF_ORACLE_REPLICATION
 #include "adapters/replication.h"
+#endif
 #include "adapters/contacts.h"
+#include "conformance_registry.h"
 
 /* Adapters that handle kind:negative need the JSON corpus root to resolve
  * `based_on` references; one runner invocation processes one root, so a
@@ -69,19 +82,36 @@ static void dispatch(const at_case_t *c, at_case_result_t *out) {
         at_reputation_run(c, out);
     } else if (strcmp(c->protocol, "bootstrap") == 0) {
         at_bootstrap_run(c, out);
+#ifdef AT_CONF_ORACLE_PHYSICS
     } else if (strcmp(c->protocol, "physics") == 0) {
         at_physics_run(c, out);
+#endif
+#ifdef AT_CONF_ORACLE_CERTIFICATES
     } else if (strcmp(c->protocol, "certificate") == 0) {
         at_certificate_run(c, out);
+#endif
+#ifdef AT_CONF_ORACLE_CALIBRATION
     } else if (strcmp(c->protocol, "calibration") == 0) {
         at_calibration_run(c, out);
+#endif
+#ifdef AT_CONF_ORACLE_PREQUENTIAL
     } else if (strcmp(c->protocol, "prequential") == 0) {
         at_prequential_conformance_run(c, out);
+#endif
+#ifdef AT_CONF_ORACLE_REPLICATION
     } else if (strcmp(c->protocol, "replication") == 0) {
         at_replication_conformance_run(c, out);
+#endif
     } else if (strcmp(c->protocol, "contacts") == 0) {
         at_contacts_run(c, out);
     } else {
+        /* An extension's own protocol (conformance_registry.h). */
+        for (const at_conf_adapter_t *a = at_conf_ext_adapters; a->protocol; a++) {
+            if (strcmp(c->protocol, a->protocol) == 0) {
+                a->run(c, out);
+                return;
+            }
+        }
         char detail[160];
         snprintf(detail, sizeof(detail),
                  "no C adapter for protocol %s (kind=%s)",

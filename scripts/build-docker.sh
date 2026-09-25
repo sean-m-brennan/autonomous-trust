@@ -259,16 +259,6 @@ run_builder() {
         info "--force: wiping $conda_repo"
         rm -rf "$conda_repo"
     fi
-    if [[ -d "$conda_repo" ]] && [[ -n "$(ls -A "$conda_repo" 2>/dev/null)" ]]; then
-        info "package-builder output exists at $conda_repo (skip); pass --force to rebuild"
-        return 0
-    fi
-    if ! docker image inspect package-builder >/dev/null 2>&1; then
-        info "package-builder image missing; building it first"
-        build_builder
-    fi
-    mkdir -p "$conda_repo"
-
     # Source packages with a top-level meta.yaml. Discover dynamically.
     # Then pin `autonomous-trust` to the front of the list: the other
     # subpackages list it in their `run:` requirements, so it must exist
@@ -284,6 +274,35 @@ run_builder() {
         warn "no meta.yaml files under $SRC_DIR; nothing to build"
         return 0
     fi
+
+    # Skip only when EVERY package has an artifact in the channel. "The
+    # channel is non-empty" was the old test, and it let a package added
+    # since the last build (autonomous-trust-oracle) never be built: the
+    # images then failed at `conda install` with PackagesNotFoundError. A
+    # missing one rebuilds the whole channel rather than just that package,
+    # because the ones already there predate it and may not match the tree.
+    # Changed SOURCES of a package already present are still not detected;
+    # that is what --force is for.
+    if [[ -d "$conda_repo" ]] && [[ -n "$(ls -A "$conda_repo" 2>/dev/null)" ]]; then
+        local missing=()
+        local sp_chk
+        for sp_chk in "${subpkgs[@]}"; do
+            local pkg_chk="${sp_chk//-/_}"
+            [[ -n "$(find "$conda_repo" \( -name "${pkg_chk}-*.conda" -o -name "${pkg_chk}-*.tar.bz2" \) 2>/dev/null | head -1)" ]] \
+                || missing+=("$pkg_chk")
+        done
+        if [[ ${#missing[@]} -eq 0 ]]; then
+            info "package-builder output exists at $conda_repo (skip); pass --force to rebuild"
+            return 0
+        fi
+        warn "conda channel $conda_repo lacks: ${missing[*]}; rebuilding it"
+        rm -rf "$conda_repo"
+    fi
+    if ! docker image inspect package-builder >/dev/null 2>&1; then
+        info "package-builder image missing; building it first"
+        build_builder
+    fi
+    mkdir -p "$conda_repo"
     # Reorder: autonomous-trust first, everything else after.
     local ordered=()
     local sp

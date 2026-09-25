@@ -83,7 +83,7 @@ generate_worker_config(cfg_dir, DataProcess.name, DataConfig, True)
 
 Private keys are written under the node root and never travel the wire. Reusing
 the same root across restarts gives the node a persistent identity and warm
-reputation state (see [Persistent Cohort](architecture/persistent-cohort.md)).
+reputation state (see [Persistent cohort](architecture/persistent-cohort.md)).
 
 ## First contact: finding and adding a specific person
 
@@ -227,7 +227,7 @@ required_tier=0, transaction_weight=1, description="", kind="",
 arg_schema=None)`. `required_tier` gates access: a peer must have earned at
 least that trust tier to invoke the capability (0 means any admitted peer).
 `transaction_weight` sets how much a single use counts toward reputation. See
-[Trust Tiers](architecture/trust-tiers.md).
+[Trust tiers](architecture/trust-tiers.md).
 
 The node auto-registers a small bootstrap corpus (`at.handshake`,
 `at.time-attest`, `at.echo-challenge`) so new peers have low-stakes interactions

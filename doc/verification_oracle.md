@@ -671,25 +671,25 @@ Disclosure and aggregation limits
 
 ## See also
 
-- [Reputation Consensus](architecture/reputation.md): the trust algebra this
+- [Reputation consensus](architecture/reputation.md): the trust algebra this
  oracle feeds.
-- [Trust Tiers](architecture/trust-tiers.md): capability weighting, the
+- [Trust tiers](architecture/trust-tiers.md): capability weighting, the
  bootstrap corpus, and the `trust_ladder.yaml` the oracle is meant to
  generalize.
 - [Concept](concept.md): why behavioral evaluation rather than authored policy.
-- [Physical Consistency](architecture/physical-consistency.md): step 1 as built
+- [Physical consistency](architecture/physical-consistency.md): step 1 as built
  -- the checks, the diagnosis, and the declaration format.
-- [Certificate-Carrying Interfaces](architecture/certificate-interfaces.md):
+- [Certificate-carrying interfaces](architecture/certificate-interfaces.md):
  step 2 as built -- the eight checkers, the three declared states, and the
  inventory.
-- [Calibration Audit](architecture/calibration-audit.md): step 3 as built -- the
+- [Calibration audit](architecture/calibration-audit.md): step 3 as built -- the
  exact test, the two resolution paths, and why a passing audit earns nothing.
-- [Prequential Competence](architecture/prequential-competence.md): step 4 as
+- [Prequential competence](architecture/prequential-competence.md): step 4 as
  built -- the interval score, the bounded weight band, and the one layer here
  that renders no verdict.
-- [Adversarial Testing](architecture/adversarial-testing.md): the attack side of
+- [Adversarial testing](architecture/adversarial-testing.md): the attack side of
  the same problem.
 
 ---
 
-*Next: [Testing approach](testing.md)*
+*Next: [Physical consistency](architecture/physical-consistency.md)*

@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import math
 import os
 from collections import OrderedDict
 from collections.abc import Mapping
@@ -287,6 +288,22 @@ def tx_channel_weight(channel) -> int:
     existing local-view divergence rather than introducing one.
     """
     return int(TX_CHANNEL_WEIGHTS.get(channel, 1))
+
+
+def weight_round(value: float) -> int:
+    """``floor(value + 0.5)``, clamped to at least 1.
+
+    The EMA applies a weight by folding the score in that many times
+    (``consensus_score_from_window``), so the composed weight has to be a
+    positive integer. 1 is therefore the floor, which is why a capability
+    authored at ``transaction_weight: 1`` cannot be demoted by competence --
+    see doc/architecture/prequential-competence.md, which records that as a
+    limitation rather than working around it.
+    """
+    if not math.isfinite(value):
+        return 1
+    rounded = int(math.floor(value + 0.5))
+    return rounded if rounded > 1 else 1
 
 
 class TransactionScore(Configuration):

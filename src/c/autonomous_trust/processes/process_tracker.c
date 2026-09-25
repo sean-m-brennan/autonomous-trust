@@ -15,6 +15,8 @@
  *******************/
 
 #include <errno.h>
+#include <stdio.h>
+#include <string.h>
 
 #include <jansson.h>
 
@@ -44,6 +46,34 @@ handler_ptr_t find_process(const char *name)
             return entry->runner;
     }
     return NULL;
+}
+
+int process_table_append(const char *type, const char *name, handler_ptr_t runner)
+{
+    const size_t cap = sizeof(process_table) / sizeof(process_table[0]);
+    if (name == NULL || name[0] == '\0' || runner == NULL)
+    {
+        fprintf(stderr, "process_table_append: refusing an unnamed or runnerless process\n");
+        return -1;
+    }
+    for (size_t i = 0; i < process_table_size; i++)
+        if (strcmp(process_table[i].name, name) == 0)
+        {
+            fprintf(stderr, "process_table_append: refusing %s: already in the table\n",
+                    name);
+            return -1;
+        }
+    if (process_table_size >= cap)
+    {
+        fprintf(stderr, "process_table_append: refusing %s: table full (%zu)\n",
+                name, cap);
+        return -1;
+    }
+    process_table[process_table_size].type = type;
+    process_table[process_table_size].name = name;
+    process_table[process_table_size].runner = runner;
+    process_table_size++;
+    return 0;
 }
 
 /* Frama-C: skipped —

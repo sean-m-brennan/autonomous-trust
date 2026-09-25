@@ -1,3 +1,5 @@
+*Previous: [Certificate-carrying interfaces](certificate-interfaces.md)*
+
 # Calibration audit
 
 *Build-order step 3 of the [verification oracle](../verification_oracle.md);
@@ -29,9 +31,9 @@ realized coverage with finite-sample validity and no distributional assumption.
 | `absent` | 0.3 | `calibration` | Declared predictive, attached nothing usable |
 | `none` | — | — | Undeclared, too little evidence, or nothing to say |
 
-Like the physics layer ([Physical Consistency](physical-consistency.md)) and
+Like the physics layer ([Physical consistency](physical-consistency.md)) and
 unlike the certificate layer
-([Certificate-Carrying Interfaces](certificate-interfaces.md)), a *passing*
+([Certificate-carrying interfaces](certificate-interfaces.md)), a *passing*
 audit earns nothing. There is no score for "has not yet been caught
 over-claiming". Certificates remain the one oracle layer entitled to say
 something good, because only a verified witness proves an answer right.
@@ -307,13 +309,17 @@ natural home for the competence half this layer deliberately does not score.
 
 ## See also
 
-* [Physical Consistency](physical-consistency.md) — step 1, and the source of
+* [Physical consistency](physical-consistency.md) — step 1, and the source of
   the `quantity` declarations this layer resolves against
-* [Certificate-Carrying Interfaces](certificate-interfaces.md) — step 2, and
+* [Certificate-carrying interfaces](certificate-interfaces.md) — step 2, and
   the only layer that can return a good score
-* [Prequential Competence](prequential-competence.md) — step 4, which scores
+* [Prequential competence](prequential-competence.md) — step 4, which scores
   the *tightness* of the same `prediction` box this layer audits the *honesty*
   of, and so completes the one-sidedness this layer is deliberately limited to
-* [Task Negotiation](negotiation.md) — the task lifecycle the prediction rides on
-* [Reputation Consensus](reputation.md) — where the verdict lands
-* [The Verification Oracle](../verification_oracle.md) — the full research framing
+* [Task negotiation](negotiation.md) — the task lifecycle the prediction rides on
+* [Reputation consensus](reputation.md) — where the verdict lands
+* [The verification oracle](../verification_oracle.md) — the full research framing
+
+---
+
+*Next: [Prequential competence](prequential-competence.md)*

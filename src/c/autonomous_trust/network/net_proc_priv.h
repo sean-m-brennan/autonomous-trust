@@ -37,7 +37,8 @@ int network_tcp_ip4_run(process_t *proc, directory_t *queues, queue_id_t signal,
 int network_tcp_ip6_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 
 /* Shared runner selected by transport name; used by per-transport process
- * declarations (including the dtn_bp entry when AT_NET_DTN is enabled). */
+ * declarations, and by extension transports' DEFINE_PROCESS runners (DTN,
+ * src/c/extensions/dtn/). */
 int network_run_by_name(const char *impl_name, process_t *proc,
                         directory_t *queues, queue_id_t signal,
                         logger_t *logger);
@@ -61,8 +62,8 @@ typedef struct {
 
     /** Optional pointer to the transport's extra-config struct (e.g.
      *  hybrid_config_t for hybrid_net). NULL for transports that don't
-     *  use one, or when the matching config entry is absent. Consumed by
-     *  the AT_NET_GROUP_FORWARD path in handle_inbound_group to reach
+     *  use one, or when the matching config entry is absent. Read by the
+     *  gateway's group forward (libat_gateway) to reach
      *  hybrid_config_t::group_routes. */
     const void            *transport_cfg;
 } net_thread_ctx_t;
@@ -93,6 +94,15 @@ void handle_inbound_broadcast(net_thread_ctx_t *ctx,
 void handle_inbound_group(net_thread_ctx_t *ctx,
                           uint8_t *buf, size_t nbytes,
                           const char *from_addr);
+
+/**
+ * @brief The registered peer whose identity uuid is @p uuid, or NULL.
+ *
+ * For a frame whose originator is named in the frame (the routing envelope)
+ * rather than by the transport address, which may be a gateway's. The
+ * pointer stays valid: peers[] is append-only and never reallocated.
+ */
+const public_identity_t *net_find_peer_by_uuid(const process_t *proc, const uuid_t uuid);
 
 /* ---- Test-only hooks for the deferred-message retry path ----
  * These let tests observe and reset the module-local `deferred_messages`

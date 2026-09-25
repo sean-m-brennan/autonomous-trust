@@ -31,6 +31,7 @@ from nacl.exceptions import BadSignatureError
 
 from ..network import Message, Network
 from ..processes import Process, ProcMeta
+from ..extensions import load_extensions, run_post_fork
 from ..config import (Configuration, atomic_write, from_json_string,
                       to_json_string)
 from ..identity.protocol import IdentityProtocol
@@ -48,13 +49,12 @@ from .reputation import (TransactionHistory, ReconcileResult, Reputation, Reputa
                          evidence_from_dict, RESOLVE_TTL_DEFAULT,
                          resolve_query_to_dict, resolve_query_from_dict,
                          resolved_to_dict, resolved_from_dict, verify_resolved,
-                         consensus_score_from_window, tx_channel_weight)
-# The one shared rounding rule for a composed EMA weight (R+D.md §12.5). Taken
-# from the prequential package rather than redefined here so there is exactly
-# one `floor(x + 0.5)` in the runtime, matching the C twin's; that package
-# imports nothing from reputation, so this direction is the acyclic one.
+                         consensus_score_from_window, tx_channel_weight,
+                         # The one shared rounding rule for a composed EMA
+                         # weight (R+D.md §12.5), `floor(x + 0.5)` as the C
+                         # twin's at_tx_weight_round.
+                         weight_round)
 from ..contacts import Contacts
-from ..prequential import weight_round
 from ..system import CfgIds, now, encoding, proc_idle_floor
 from .. import _probes
 
@@ -365,6 +365,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             ReputationProtocol.rep_resolve, self.handle_resolve)
         self.protocol.register_handler(
             ReputationProtocol.rep_resolved, self.handle_resolved)
+        load_extensions(self, self.name)
         self.history = TransactionHistory()
         # Gateway reputation tree: one child chain per child group this node gateways
         # (keyed by group-uuid string). Empty on rank-1 leaf nodes — every code path
@@ -4583,6 +4584,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             self.logger.error('reputation dump failed: %s', err)
 
     def process(self, queues, signal):
+        run_post_fork(self)
         # Drain budget per iter. Each handle_reputation_request spawns
         # a short-lived thread, so processing many per iter is cheap
         # and lets us stay ahead of inbound rep_req volume. The hard

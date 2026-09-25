@@ -53,13 +53,24 @@ extern size_t process_table_size;
 
 #define DECLARE_PROCESS(type, proc_name, run_func)
 
+/** Free process-table slots beyond the generated entries, for processes an
+ *  extension library adds with @ref DEFINE_PROCESS. */
+#define AT_PROCESS_EXT_MAX 8
+
+/**
+ * @brief Add a process at load time (what @ref DEFINE_PROCESS expands to).
+ *
+ * Refuses (-1, with a line on stderr) a NULL name or runner, a name already
+ * in the table, and a full table. Not locked: constructors run before main().
+ */
+int process_table_append(const char *type, const char *name, handler_ptr_t runner);
+
+/** Register a process from outside the generated table -- an extension
+ *  library, whose sources the generator does not scan. */
 #define DEFINE_PROCESS(t, n, r)                                                \
-    void __attribute__((constructor)) CONCAT(register_process_, __COUNTER__)() \
+    static void __attribute__((constructor)) CONCAT(register_process_, __COUNTER__)(void) \
     {                                                                          \
-        process_table[process_table_size].type = QUOTE(t);                     \
-        process_table[process_table_size].name = QUOTE(n);                     \
-        process_table[process_table_size].runner = r;                          \
-        process_table_size++;                                                  \
+        (void)process_table_append(QUOTE(t), QUOTE(n), (r));                   \
     }
 
 /**

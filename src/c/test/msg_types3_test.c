@@ -22,7 +22,15 @@
 
 #include "google/protobuf/any.pb-c.h"
 #include "autonomous_trust/utilities/msg_types.h"
+#include "autonomous_trust/utilities/message.h"
 #include "autonomous_trust/utilities/msg_types_priv.h"
+#include "autonomous_trust/identity/group.h"
+#include "autonomous_trust/network/net_message.h"
+#ifdef AT_ZTA_ENABLED
+#include "autonomous_trust/zta/zta_msg_types.h"
+#endif
+
+extern message_type_t string_to_message_type(const char *str);
 
 DEFINE_TEST(test_net_msg_pack_unpack_json)
 {
@@ -255,10 +263,244 @@ DEFINE_TEST(test_net_msg_proto_carries_the_signature_verdict)
     }
 }
 
+/* THE GROUP-MULTICAST FLAG IS CORE, AND ABSENT FROM THE IPC JSON WHEN FALSE.
+ *
+ * `group_multicast` was AT_SOCIAL-only until FEATURE_SPLIT_PLAN Phase 5, when
+ * social moved to libat_social: the library sets the flag, and the core's
+ * network process must honour it, so the field and RECIPIENT_GROUP are in
+ * every build. The key is still written only when true, so a message that
+ * does not multicast serializes byte-for-byte as it did before. */
+DEFINE_TEST(test_group_multicast_is_core_and_omitted_when_false)
+{
+    for (int multicast = 0; multicast <= 1; multicast++) {
+        net_msg_t original = {0};
+        strncpy(original.process, "identity", PROC_NAME_LEN);
+        original.function = (char *)"peer_post";
+        original.group_multicast = (multicast == 1);
+        uuid_generate(original.from_whom.uuid);
+
+        json_t *payload = json_object();
+        ck_assert_ret_ok(net_msg_pack_json(&original, payload));
+        json_decref(payload);
+
+        /* The IPC encoding is a NUL-terminated JSON text. */
+        void *data = NULL;
+        size_t data_len = 0;
+        ck_assert_ret_ok(net_msg_to_proto(&original, &data, &data_len));
+        ck_assert_int_eq(strstr((const char *)data, "group_multicast") != NULL,
+                         multicast);
+
+        net_msg_t restored = {0};
+        ck_assert_ret_ok(proto_to_net_msg(data, data_len, &restored));
+        ck_assert_int_eq((int)restored.group_multicast, multicast);
+
+        smrt_deref(data);
+        smrt_deref(original.obj);
+        if (restored.function)
+            smrt_deref(restored.function);
+        smrt_deref(restored.obj);
+    }
+    ck_assert_int_eq(RECIPIENT_GROUP, 2);
+}
+
+/* EVERY TYPE'S NAME MUST DECODE BACK TO THE TYPE.
+ *
+ * The IPC wire carries the type as `Any.type_url` -- the string from
+ * message_type_to_string -- and the receiver maps it back with
+ * string_to_message_type. Those were two hand-kept lists, and three types
+ * (CHILD_GROUP, ZTA_REVOCATION_ALERT, ZTA_VERIFICATION_RESULT) were encoded
+ * but never decoded, so they were dropped at every real IPC hop. The
+ * conformance harness's messaging hook bypasses serialization and could not
+ * see it. Walks the whole enum, so a type added to one list only fails here. */
+DEFINE_TEST(test_every_type_name_round_trips)
+{
+    ck_assert(sodium_init() >= 0);
+    for (long t = SIGNAL; t <= PEER_STANDING; t++)
+    {
+        const char *name = message_type_to_string((message_type_t)t);
+        ck_assert(name[0] != '\0');
+        ck_assert_int_eq((long)string_to_message_type(name), t);
+    }
+    for (size_t i = 0; i < at_msg_type_count(); i++)
+    {
+        long t = at_msg_type_id_at(i);
+        const char *name = message_type_to_string((message_type_t)t);
+        ck_assert(name[0] != '\0');
+        ck_assert_int_eq((long)string_to_message_type(name), t);
+        ck_assert(message_size((message_type_t)t) <= AT_MSG_PAYLOAD_MAX);
+    }
+}
+END_TEST_DEFINITION()
+
+/* message_size is how many bytes processes.c copies OUT of a generic_msg_t's
+ * payload for an unhandled message, so it must never exceed the payload. It
+ * used to return 3.4 MB for PEER_CAPABILITIES. */
+DEFINE_TEST(test_every_type_size_fits_the_message)
+{
+    generic_msg_t msg;
+    for (long t = SIGNAL; t <= PEER_STANDING; t++)
+        ck_assert(message_size((message_type_t)t) <= sizeof(msg.info));
+}
+END_TEST_DEFINITION()
+
+/* The end-to-end shape of the CHILD_GROUP drop: through the real serializer,
+ * not the hook. */
+DEFINE_TEST(test_child_group_survives_the_ipc_serializer)
+{
+    ck_assert(sodium_init() >= 0);
+
+    uuid_t uuid;
+    uuid_generate(uuid);
+    group_t *grp = NULL;
+    ck_assert_ret_ok(group_create(&uuid, (char *)"172.16.0.9", &grp));
+    grp->created = 1700000000.5;
+
+    generic_msg_t out;
+    memset(&out, 0, sizeof(out));
+    out.type = CHILD_GROUP;
+    out.size = message_size(CHILD_GROUP);
+    out.info.group = *grp;
+
+    void *data = NULL;
+    size_t data_len = 0;
+    ck_assert_ret_ok(generic_msg_to_proto(&out, &data, &data_len));
+
+    generic_msg_t in;
+    memset(&in, 0, sizeof(in));
+    ck_assert_ret_ok(proto_to_generic_msg(data, data_len, &in));
+    ck_assert_int_eq((int)in.type, (int)CHILD_GROUP);
+    ck_assert_mem_eq(in.info.group.uuid, uuid, sizeof(uuid_t));
+    ck_assert_double_eq_tol(in.info.group.created, 1700000000.5, 1e-6);
+
+    smrt_deref(data);
+    group_free(grp);
+}
+END_TEST_DEFINITION()
+
+/* --- The registry (msg_registry.h): a feature's type crosses the same
+ * serializer as a core type, through the opaque payload arm. The test type
+ * sits in the fleet range, which nothing registers yet. --- */
+
+typedef struct {
+    uuid_t who;
+    int32_t n;
+    char note[40];
+} test_ext_msg_t;
+AT_MSG_ASSERT_FITS(test_ext_msg_t);
+
+#define TEST_EXT_TYPE (AT_MSG_TYPE_FLEET_MIN + 7)
+static const at_msg_vtable_t test_ext_vt = {
+    .name = "TEST_EXT_OBSERVED",
+    .size = sizeof(test_ext_msg_t),
+};
+
+DEFINE_TEST(test_registry_refuses_bad_registrations)
+{
+    static const at_msg_vtable_t core_name = { .name = "PEER_STANDING", .size = 8 };
+    static const at_msg_vtable_t too_big = { .name = "TEST_TOO_BIG", .size = AT_MSG_PAYLOAD_MAX + 1 };
+    static const at_msg_vtable_t unnamed = { .name = "", .size = 8 };
+    static const at_msg_vtable_t fine = { .name = "TEST_OK", .size = 8 };
+
+    /* A core id is never registrable: it would shadow a named arm. */
+    ck_assert_int_eq(at_msg_type_register(PEER_STANDING, &fine), -1);
+    ck_assert_int_eq(at_msg_type_register(AT_MSG_TYPE_EXT_MAX + 1, &fine), -1);
+    ck_assert_int_eq(at_msg_type_register(AT_MSG_TYPE_FLEET_MIN + 1, &core_name), -1);
+    ck_assert_int_eq(at_msg_type_register(AT_MSG_TYPE_FLEET_MIN + 2, &too_big), -1);
+    ck_assert_int_eq(at_msg_type_register(AT_MSG_TYPE_FLEET_MIN + 3, &unnamed), -1);
+    ck_assert_int_eq(at_msg_type_register(AT_MSG_TYPE_FLEET_MIN + 4, NULL), -1);
+    ck_assert_ptr_null(at_msg_type_lookup(AT_MSG_TYPE_FLEET_MIN + 1));
+
+    ck_assert_int_eq(at_msg_type_register(AT_MSG_TYPE_FLEET_MIN + 5, &fine), 0);
+    /* Neither the id nor the name may be taken twice. */
+    ck_assert_int_eq(at_msg_type_register(AT_MSG_TYPE_FLEET_MIN + 5, &test_ext_vt), -1);
+    ck_assert_int_eq(at_msg_type_register(AT_MSG_TYPE_FLEET_MIN + 6, &fine), -1);
+    ck_assert_int_eq(at_msg_type_by_name("TEST_OK"), AT_MSG_TYPE_FLEET_MIN + 5);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_registered_type_survives_the_ipc_serializer)
+{
+    ck_assert(sodium_init() >= 0);
+    if (at_msg_type_lookup(TEST_EXT_TYPE) == NULL)
+        ck_assert_ret_ok(at_msg_type_register(TEST_EXT_TYPE, &test_ext_vt));
+
+    ck_assert_int_eq((long)message_size((message_type_t)TEST_EXT_TYPE),
+                     (long)sizeof(test_ext_msg_t));
+    ck_assert_str_eq(message_type_to_string((message_type_t)TEST_EXT_TYPE),
+                     "TEST_EXT_OBSERVED");
+
+    generic_msg_t out;
+    memset(&out, 0, sizeof(out));
+    out.type = TEST_EXT_TYPE;
+    out.size = message_size((message_type_t)TEST_EXT_TYPE);
+    test_ext_msg_t *p = AT_MSG_EXT(&out, test_ext_msg_t);
+    uuid_generate(p->who);
+    p->n = 42;
+    strncpy(p->note, "through the registry", sizeof(p->note) - 1);
+
+    void *data = NULL;
+    size_t data_len = 0;
+    ck_assert_ret_ok(generic_msg_to_proto(&out, &data, &data_len));
+
+    generic_msg_t in;
+    memset(&in, 0, sizeof(in));
+    ck_assert_ret_ok(proto_to_generic_msg(data, data_len, &in));
+    ck_assert_int_eq(in.type, TEST_EXT_TYPE);
+    const test_ext_msg_t *q = AT_MSG_EXT_CONST(&in, test_ext_msg_t);
+    ck_assert_mem_eq(q->who, p->who, sizeof(uuid_t));
+    ck_assert_int_eq(q->n, 42);
+    ck_assert_str_eq(q->note, "through the registry");
+    smrt_deref(data);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_short_registered_payload_is_rejected)
+{
+    if (at_msg_type_lookup(TEST_EXT_TYPE) == NULL)
+        ck_assert_ret_ok(at_msg_type_register(TEST_EXT_TYPE, &test_ext_vt));
+    size_t len = 0;
+    uint8_t *buf = _any_with_payload("TEST_EXT_OBSERVED", 4, &len);
+    generic_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    ck_assert_int_eq(proto_to_generic_msg(buf, len, &msg), -1);
+    free(buf);
+}
+END_TEST_DEFINITION()
+
+/* A FEATURE'S TYPES MUST ACTUALLY BE REGISTERED IN ITS BUILD.
+ *
+ * Registration is a constructor, and a static link keeps a constructor only
+ * if its object is pulled in -- this test links the static archive and
+ * references nothing social but the link anchor, which is exactly the case
+ * that would drop them. A dropped registration is silent at run time: the
+ * types just fail to serialize. So pin the names, the ranges and app_bound. */
+DEFINE_TEST(test_feature_types_are_registered)
+{
+#ifdef AT_ZTA_ENABLED
+    at_zta_msg_types_link();
+    ck_assert_ptr_nonnull(at_msg_type_lookup(ZTA_REVOCATION_ALERT));
+    ck_assert_ptr_nonnull(at_msg_type_lookup(ZTA_VERIFICATION_RESULT));
+    ck_assert_str_eq(message_type_to_string((message_type_t)ZTA_REVOCATION_ALERT), "ZTA_REVOCATION_ALERT");
+    ck_assert_str_eq(message_type_to_string((message_type_t)ZTA_VERIFICATION_RESULT), "ZTA_VERIFICATION_RESULT");
+    ck_assert(!at_msg_type_lookup(ZTA_VERIFICATION_RESULT)->app_bound);
+#endif
+    /* An app verb nobody registered stays refused. */
+    ck_assert_ptr_null(at_app_verb_target("app_not_a_verb"));
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(MsgTypes3, test_net_msg_pack_unpack_json, test_net_msg_pack_null_json,
           test_net_msg_proto_carries_the_signature_verdict,
           test_net_msg_proto_roundtrip, test_net_msg_proto_no_payload,
           test_short_fixed_payload_is_rejected,
           test_empty_fixed_payload_is_rejected,
           test_full_length_fixed_payload_is_accepted,
-          test_repeated_unpack_does_not_grow_without_bound)
+          test_repeated_unpack_does_not_grow_without_bound,
+          test_every_type_name_round_trips,
+          test_every_type_size_fits_the_message,
+          test_child_group_survives_the_ipc_serializer,
+          test_registry_refuses_bad_registrations,
+          test_registered_type_survives_the_ipc_serializer,
+          test_short_registered_payload_is_rejected,
+          test_feature_types_are_registered,
+          test_group_multicast_is_core_and_omitted_when_false)

@@ -21,6 +21,7 @@
  *  @{
  */
 
+#include <math.h>
 #include <stdbool.h>
 #include <string.h>
 
@@ -253,6 +254,28 @@ static inline int tx_channel_weight(const char *channel)
         || strcmp(ch, TX_CHANNEL_PROBE) == 0)
         return 2;
     return 1;
+}
+
+/**
+ * @brief How a competence multiplier scales an authored transaction weight:
+ * `floor(value + 0.5)`, floored at 1 (1 for a non-finite value).
+ *
+ * The EMA applies a weight by folding a score in that many times, so the
+ * composed weight is a positive integer and 1 is the floor -- which is why a
+ * capability authored at transaction_weight 1 cannot be demoted by
+ * competence. floor(x + 0.5), NOT lround: lround is half-away-from-zero and
+ * Python's round is banker's, and they disagree at exactly 0.5, which is
+ * where a band-mapped multiplier lands most often. The one rounding rule:
+ * reputation applies it, and libat_prequential's at_preq_weight_round is it.
+ */
+static inline int at_tx_weight_round(double value)
+{
+    if (!isfinite(value))
+        return 1;
+    double rounded = floor(value + 0.5);
+    if (rounded < 1.0)
+        return 1;
+    return (int)rounded;
 }
 
 /** @} */ /* end of internal_reputation */

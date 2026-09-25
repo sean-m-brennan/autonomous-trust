@@ -68,6 +68,22 @@ except (ImportError, importlib.metadata.PackageNotFoundError):
 
 _BACKEND = os.environ.get('AUTONOMOUS_TRUST_BACKEND', 'auto')
 _CORE_PREFIX = 'autonomous_trust.core.'
+#: Package prefixes the redirector serves, the core's first. A feature package
+#: laid out as ``<pkg>._python`` / ``<pkg>._native`` adds its own with
+#: :func:`register_backend_prefix` (FEATURE_SPLIT_PLAN.md D2).
+_backend_prefixes: list[str] = [_CORE_PREFIX]
+
+
+def register_backend_prefix(prefix: str) -> None:
+    """Redirect ``<prefix>X`` to ``<prefix><backend>.X`` as the core is.
+
+    For a feature package that ships both backends beside the core. Idempotent;
+    the longest matching prefix wins, so a feature nested under the core
+    (``autonomous_trust.core.agora.``) is served by its own entry."""
+    if not prefix.endswith('.'):
+        prefix += '.'
+    if prefix not in _backend_prefixes:
+        _backend_prefixes.append(prefix)
 
 
 class _AliasLoader(importlib.abc.Loader):
@@ -117,9 +133,11 @@ class _BackendRedirector(importlib.abc.MetaPathFinder):
         # Prevent re-entrancy when we call find_spec for the real module
         if fullname in self._resolving:
             return None
-        if not fullname.startswith(_CORE_PREFIX):
+        prefix = max((p for p in _backend_prefixes if fullname.startswith(p)),
+                     key=len, default=None)
+        if prefix is None:
             return None
-        suffix = fullname[len(_CORE_PREFIX):]
+        suffix = fullname[len(prefix):]
         # Don't intercept _python or _native themselves
         if suffix.startswith('_'):
             return None
@@ -133,7 +151,7 @@ class _BackendRedirector(importlib.abc.MetaPathFinder):
         self._resolving.add(fullname)
         try:
             # Try the selected backend first
-            real_name = f'{_CORE_PREFIX}{self._backend}.{suffix}'
+            real_name = f'{prefix}{self._backend}.{suffix}'
             try:
                 real_spec = importlib.util.find_spec(real_name)
             except (ModuleNotFoundError, ValueError):
@@ -141,7 +159,7 @@ class _BackendRedirector(importlib.abc.MetaPathFinder):
 
             # Fall back to _python if not found in native backend
             if real_spec is None and self._backend != '_python':
-                real_name = f'{_CORE_PREFIX}_python.{suffix}'
+                real_name = f'{prefix}_python.{suffix}'
                 try:
                     real_spec = importlib.util.find_spec(real_name)
                 except (ModuleNotFoundError, ValueError):

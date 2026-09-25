@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 
 #include "processes/processes.h"
+#include "processes/extension.h"
 #include "processes/capabilities.h"
 #include "reputation/reputation.h"
 #include "algorithms/paxos.h"
@@ -40,7 +41,6 @@
 #include "config/discover.h"        /* CFG_FILE_EXT */
 #include "contacts/contacts.h"     /* the first-contact address book (trust seeds) */
 #include "reputation/rep_proc_priv.h"
-#include "prequential/scoring.h"   /* at_preq_weight_round, the rounding rule both runtimes share */
 
 #define EREP_PAXOS 253
 DEFINE_ERROR(EREP_PAXOS, "Paxos consensus error");
@@ -906,7 +906,7 @@ static int _resolve_tx_weight_local(const char *cap_name, const char *channel,
      *
      * Non-positive is absence (a zeroed struct, or a producer predating the
      * field), which means the authored weight verbatim. Rounded by
-     * at_preq_weight_round -- floor(x + 0.5), the one rule both runtimes share
+     * at_tx_weight_round (tx_channel.h) -- floor(x + 0.5), the one rule both runtimes share
      * -- because C's lround and Python's round disagree at exactly 0.5, and a
      * weight is how many times the EMA folds the score in. Floored at 1 by the
      * return below: a capability authored at weight 1 therefore cannot be
@@ -914,7 +914,7 @@ static int _resolve_tx_weight_local(const char *cap_name, const char *channel,
      * doc/architecture/prequential-competence.md records as a limitation of
      * the integer fold rather than working around. */
     if (competence > 0.0)
-        w = at_preq_weight_round((double)w * competence);
+        w = at_tx_weight_round((double)w * competence);
     w *= tx_channel_weight(channel);
     return w > 0 ? w : 1;
 }
@@ -7194,6 +7194,7 @@ int reputation_register_handlers(process_t *proc)
     process_register_handler(proc, REP_PROTO_CHECKPOINT_FINAL,   (handler_ptr_t)handle_checkpoint_final);
     process_register_handler(proc, REP_PROTO_REP_RESOLVE,        (handler_ptr_t)handle_resolve);
     process_register_handler(proc, REP_PROTO_REP_RESOLVED,       (handler_ptr_t)handle_resolved);
+    at_extensions_register_handlers(proc, "reputation");
     return 0;
 }
 

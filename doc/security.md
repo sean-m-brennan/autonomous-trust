@@ -109,16 +109,16 @@ against a realistic attack base rate.
 
 Implementation surface. Memory safety in the C core, deserialization of network
 data, and the web-based inspector tooling are ongoing concerns addressed by the
-mitigations tracked in [Security Hardening](architecture/security-hardening.md).
+mitigations tracked in [Security hardening](architecture/security-hardening.md).
 Those measures are the first line of defense and are validated against attack
-scenarios in [Adversarial Testing](architecture/adversarial-testing.md).
+scenarios in [Adversarial testing](architecture/adversarial-testing.md).
 
 ## See also
 
 - [Concept](concept.md): the adversarial assumption and inverted access model behind these properties.
-- [Security Hardening](architecture/security-hardening.md): implementation-level mitigations across the C core, Python services, and tooling.
-- [ZTA Integration](architecture/zta-integration.md): credential gating, DDIL fallback, and the audit trail.
-- [Adversarial Testing](architecture/adversarial-testing.md): attack scenarios and how the model is validated.
+- [Security hardening](architecture/security-hardening.md): implementation-level mitigations across the C core, Python services, and tooling.
+- [ZTA integration](architecture/zta-integration.md): credential gating, DDIL fallback, and the audit trail.
+- [Adversarial testing](architecture/adversarial-testing.md): attack scenarios and how the model is validated.
 
 ---
 

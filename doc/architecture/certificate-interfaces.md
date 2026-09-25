@@ -1,3 +1,5 @@
+*Previous: [Physical consistency](physical-consistency.md)*
+
 # Certificate-carrying task interfaces
 
 *Build-order step 2 of the [verification oracle](../verification_oracle.md);
@@ -16,7 +18,7 @@ peer work.
 ## The one layer that can say something good
 
 Every other evidence layer in AT is negative or neutral. The physics layer
-([Physical Consistency](physical-consistency.md)) *only* refutes — surviving a
+([Physical consistency](physical-consistency.md)) *only* refutes — surviving a
 feasibility test means "not refuted", never "correct". Completion scoring says a
 task came back. Probes say a known answer was matched, but only for the handful
 of capabilities whose answers are known in advance.
@@ -120,7 +122,7 @@ claim is checked against the schedule rather than believed.
 ## The declaration
 
 `certificates.json`, canonical JSON, one file read by both runtimes — the
-arrangement [Trust Tiers](trust-tiers.md) §8 settled for the trust ladder and
+arrangement [Trust tiers](trust-tiers.md) §8 settled for the trust ladder and
 `physics.json` reused for §12.2. `AT_CERTIFICATES` names it;
 `config/cfg/certificates.example.json` is the shared example. Unset means an
 empty model and an inert layer. The layer is its own library,
@@ -243,13 +245,17 @@ second true.
 
 ## See also
 
-- [The Verification Oracle](../verification_oracle.md) — the whole program, and
+- [The verification oracle](../verification_oracle.md) — the whole program, and
   why certificates are step 2.
-- [Physical Consistency](physical-consistency.md) — step 1, the layer above this
+- [Physical consistency](physical-consistency.md) — step 1, the layer above this
   one in the scorer.
-- [Calibration Audit](calibration-audit.md) — step 3, whose verdict arm sits
+- [Calibration audit](calibration-audit.md) — step 3, whose verdict arm sits
   just below this one, because an exact check of *this* answer outranks a
   statistical claim about a hundred of them.
-- [Prequential Competence](prequential-competence.md) — step 4, which renders no
+- [Prequential competence](prequential-competence.md) — step 4, which renders no
   verdict at all and so sits outside this arm order entirely.
-- [Reputation Consensus](reputation.md) — the algebra these verdicts feed.
+- [Reputation consensus](reputation.md) — the algebra these verdicts feed.
+
+---
+
+*Next: [Calibration audit](calibration-audit.md)*

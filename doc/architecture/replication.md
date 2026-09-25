@@ -1,3 +1,5 @@
+*Previous: [Prequential competence](prequential-competence.md)*
+
 # Sampled replication with bisection dispute resolution
 
 *Build-order step 6 of the [verification oracle](../verification_oracle.md);
@@ -164,3 +166,7 @@ not shared error.
 * Conformance: `scenarios/replication/{sampling,adjudication,bisection}.yaml`,
   adapters `conformance/harness/python/adapters/replication.py` and
   `src/c/conformance/adapters/replication.c`.
+
+---
+
+*Next: [Testing approach](../testing.md)*

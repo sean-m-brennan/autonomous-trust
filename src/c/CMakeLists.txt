@@ -150,47 +150,39 @@ option(AT_STATIC "Link at_demo fully statically (no shared library dependencies)
 # Zero Trust Architecture integration (requires OpenSSL)
 option(AT_ZTA "Enable Zero Trust Architecture credential integration" OFF)
 
-# Agora social app features (position/profile/connection/DM/feed) built over the
-# generic app-events carrier. A pure machine-to-machine node does not need them,
-# so they are OFF by default; the Agora native build forces this ON.
-option(AT_SOCIAL "Enable Agora social app features (position/profile/connection/DM/feed) over the app-events carrier" OFF)
+# Extension libraries that live OUTSIDE this tree (e.g. Agora's libat_social):
+# a list of directories, each holding an extension's CMakeLists.txt. Each is
+# added inside this project's scope, after the in-tree extensions, so it builds
+# exactly as an in-tree one does (at_extension_library, the core's flags and
+# include dirs); its binary dir is extensions/<basename>. See
+# doc/architecture/extensions.md, "External extensions".
+set(AT_EXTERNAL_EXTENSIONS "" CACHE STRING
+    "Directories of extension libraries outside the AT tree (;-separated)")
 
-# DTN / Bundle Protocol transport (see at-over-dtn.md). Adds the "dtn_bp"
-# network transport and compiles a DTN-specific receiver path.
-option(AT_NET_DTN "Enable DTN/Bundle-Protocol network transport" OFF)
-# Which BP backend to link — currently only "stub" (no external deps);
-# add ION / uD3TN backends by implementing dtn_backend.h and selecting here.
-set(AT_NET_DTN_BACKEND "stub" CACHE STRING "BP library backend: stub | ion | ud3tn")
-set_property(CACHE AT_NET_DTN_BACKEND PROPERTY STRINGS stub ion ud3tn)
+# DTN / Bundle Protocol transport (see at-over-dtn.md): builds the libat_dtn
+# extension library (extensions/dtn/), which adds the "dtn_bp" transport to
+# whatever links it. The backend choice, AT_NET_DTN_BACKEND, lives there.
+option(AT_NET_DTN "Build the DTN/Bundle-Protocol transport library (libat_dtn)" OFF)
 
-# Plaintext forwarding envelope (see at-over-dtn.md §4.3, net_envelope.h).
-# When ON, peer-to-peer wire frames carry a 36-byte plaintext routing header
-# so gateway nodes can bridge transports without decrypting the inner payload.
-# Default OFF so traffic on non-gateway deployments stays byte-for-byte
-# compatible with pre-2b builds until net_proc.c opts into wrapping.
-option(AT_NET_ENVELOPE "Enable plaintext forwarding envelope for gateway relay" OFF)
+# Gateway relay (routing envelope, broadcast relay, cross-leg group forward,
+# cross-cluster discovery): builds the libat_gateway extension library
+# (extensions/gateway/). ON by default because building it turns nothing on:
+# a node uses it only when its network config sets "envelope": true, and the
+# core refuses such a config when the library is absent.
+option(AT_NET_GATEWAY "Build the gateway relay library (libat_gateway)" ON)
 
-# Group UUID -> gateway leg routing for cross-group bridging
-# (at-over-dtn.md §4.3 stage F). Gateway receives a GROUP-addressed envelope
-# for a remote group UUID, looks up a configured leg, and re-emits via that
-# leg. Requires AT_NET_ENVELOPE since envelope-less wire frames carry no
-# destination UUID for the routing lookup.
-option(AT_NET_GROUP_FORWARD "Enable group UUID -> gateway routing for cross-leg bridging" OFF)
-
-# Cross-cluster peer discovery (at-over-dtn.md §4.3 stage E). When ON,
-# gateway-forwarded ID_ANNOUNCE broadcasts carrying NET_ENV_FLAG_FORWARDED
-# register the originating peer as a remote peer whose address is left as-is
-# so the hybrid CIDR matcher routes replies back via the gateway. Requires
-# AT_NET_ENVELOPE since the forwarding trust signal comes from the envelope
-# flag byte.
-option(AT_DISCOVERY_CROSS_CLUSTER "Enable cross-cluster peer discovery via gateway forwarding" OFF)
-
-if(AT_NET_GROUP_FORWARD AND NOT AT_NET_ENVELOPE)
-    message(FATAL_ERROR "AT_NET_GROUP_FORWARD=ON requires AT_NET_ENVELOPE=ON")
-endif()
-
-if(AT_DISCOVERY_CROSS_CLUSTER AND NOT AT_NET_ENVELOPE)
-    message(FATAL_ERROR "AT_DISCOVERY_CROSS_CLUSTER=ON requires AT_NET_ENVELOPE=ON")
+# The verification layers of R+D.md §12, each its own extension library
+# (extensions/<layer>/, FEATURE_SPLIT_PLAN Phase 3). ON by default, as they were
+# always compiled into the core: each speaks only when its declaration
+# ($AT_PHYSICS, $AT_CALIBRATION, $AT_PREQUENTIAL, $AT_CERTIFICATES) names a
+# model, and a node declaring a layer its build lacks refuses to start.
+option(AT_ORACLE_PHYSICS      "Build the physical-consistency layer (libat_physics)" ON)
+option(AT_ORACLE_CALIBRATION  "Build the coverage-audit layer (libat_calibration)" ON)
+option(AT_ORACLE_CERTIFICATES "Build the certificate layer (libat_certificates)" ON)
+option(AT_ORACLE_PREQUENTIAL  "Build the prequential-competence layer (libat_prequential)" ON)
+option(AT_ORACLE_REPLICATION  "Build the replicated-execution layer (libat_replication)" ON)
+if(AT_ORACLE_REPLICATION AND NOT AT_ORACLE_CERTIFICATES)
+    message(FATAL_ERROR "AT_ORACLE_REPLICATION=ON requires AT_ORACLE_CERTIFICATES=ON (SplitMix64)")
 endif()
 
 if(AT_STATIC)
@@ -455,6 +447,7 @@ set(libsrc
     autonomous_trust/identity/history.c
     autonomous_trust/identity/identity.c
     autonomous_trust/identity/id_proc.c
+    autonomous_trust/identity/id_ext.c
     autonomous_trust/identity/first_contact.c
     autonomous_trust/identity/peers.c
     autonomous_trust/identity/signature.c
@@ -464,6 +457,8 @@ set(libsrc
     autonomous_trust/negotiation/task.c
     autonomous_trust/negotiation/negotiation.c
     autonomous_trust/negotiation/neg_proc.c
+    autonomous_trust/negotiation/neg_oracle.c
+    autonomous_trust/negotiation/neg_certified.c
     autonomous_trust/reputation/reputation.c
     autonomous_trust/reputation/rep_proc.c
     autonomous_trust/config/generate.c
@@ -474,27 +469,15 @@ set(libsrc
     autonomous_trust/network/net_transport_tcp.c
     autonomous_trust/network/net_transport_hybrid.c
     autonomous_trust/network/net_transport_registry.c
+    autonomous_trust/network/net_filter.c
     autonomous_trust/network/network.c
     autonomous_trust/bootstrap/bootstrap_capabilities.c
     autonomous_trust/bootstrap/bootstrap_worker.c
-    autonomous_trust/certificates/certificates.c
-    autonomous_trust/certificates/checkers.c
-    autonomous_trust/certificates/drat.c
-    autonomous_trust/certificates/rng.c
-    autonomous_trust/calibration/calibration.c
-    autonomous_trust/calibration/conformal.c
-    autonomous_trust/physics/physics.c
-    autonomous_trust/physics/units.c
-    autonomous_trust/prequential/prequential.c
-    autonomous_trust/prequential/scoring.c
-    autonomous_trust/replication/replication.c
-    autonomous_trust/replication/sampling.c
-    autonomous_trust/replication/adjudication.c
-    autonomous_trust/replication/bisection.c
     autonomous_trust/processes/capabilities.c
     autonomous_trust/processes/daemonize.c
     autonomous_trust/processes/process_tracker.c
     autonomous_trust/processes/processes.c
+    autonomous_trust/processes/extension.c
     autonomous_trust/structures/array.c
     autonomous_trust/structures/dag.c
     autonomous_trust/structures/data.c
@@ -512,6 +495,7 @@ set(libsrc
     autonomous_trust/utilities/logger.c
     autonomous_trust/utilities/message.c
     autonomous_trust/utilities/msg_types.c
+    autonomous_trust/utilities/msg_registry.c
     autonomous_trust/utilities/probes.c
     autonomous_trust/utilities/protobuf_shutdown.cpp
     autonomous_trust/utilities/queue_pool.c
@@ -544,171 +528,10 @@ if(AT_ZTA)
         autonomous_trust/zta/zta_audit.c
         autonomous_trust/zta/zta_process.c
         autonomous_trust/zta/zta_binding.c
+        autonomous_trust/zta/zta_msg_types.c
     )
 endif()
 
-# Agora social sources (only compiled when AT_SOCIAL is enabled). The base
-# app-events carrier (app_events.c/app_node.c) and id_proc.c stay unconditional;
-# their social portions are guarded in-source with #ifdef AT_SOCIAL_ENABLED.
-if(AT_SOCIAL)
-    list(APPEND libsrc
-        autonomous_trust/identity/profile.c
-        autonomous_trust/identity/connection.c
-        autonomous_trust/identity/dm.c
-        autonomous_trust/identity/post.c
-        autonomous_trust/identity/social_tx.c
-        autonomous_trust/identity/social_store.c
-        autonomous_trust/identity/proximity.c
-        autonomous_trust/identity/business_ad.c
-        autonomous_trust/identity/business_post.c
-        autonomous_trust/identity/cosign.c
-    )
-endif()
-
-# DTN sources (only compiled when AT_NET_DTN is enabled). Files live in
-# a `dtn/` subdirectory so the process-table preprocessor can exclude them
-# cleanly when AT_NET_DTN is off (see `_exclude_args` in preprocess()).
-if(AT_NET_DTN)
-    list(APPEND libsrc
-        autonomous_trust/network/dtn/dtn_eid.c
-        autonomous_trust/network/dtn/net_transport_dtn.c
-    )
-    if(AT_NET_DTN_BACKEND STREQUAL "stub")
-        list(APPEND libsrc autonomous_trust/network/dtn/dtn_backend_stub.c)
-    elseif(AT_NET_DTN_BACKEND STREQUAL "ion")
-        # NASA ION bp_* API. Two modes:
-        #   (a) Submodule present at ./third_party/ION-DTN — we build it
-        #       via autotools into a build-local prefix. No sudo required.
-        #   (b) Submodule absent — fall back to system-installed ION (or
-        #       paths supplied explicitly via -DION_* cache vars).
-        # The node's local EID must be pre-provisioned via bpadmin before
-        # the transport is used at runtime.
-        set(ION_SUBMODULE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ION-DTN)
-        set(ION_PREFIX    ${CMAKE_BINARY_DIR}/ion-install)
-
-        if(EXISTS ${ION_SUBMODULE}/configure.ac)
-            message("-- ION: building from submodule into ${ION_PREFIX}")
-
-            # Surface autotools-missing failures at CMake-configure time
-            # with a useful message, rather than a cryptic build-time error.
-            find_program(AUTORECONF_EXEC autoreconf)
-            find_program(AUTOMAKE_EXEC   automake)
-            find_program(LIBTOOLIZE_EXEC NAMES libtoolize glibtoolize)
-            if(NOT AUTORECONF_EXEC OR NOT AUTOMAKE_EXEC OR NOT LIBTOOLIZE_EXEC)
-                message(FATAL_ERROR
-                    "AT_NET_DTN_BACKEND=ion needs autotools to build the submodule. "
-                    "Install: sudo apt-get install -y autoconf automake libtool pkg-config libexpat1-dev")
-            endif()
-
-            include(ExternalProject)
-            include(ProcessorCount)
-            ProcessorCount(ION_PARALLEL)
-            if(ION_PARALLEL EQUAL 0)
-                set(ION_PARALLEL 1)
-            endif()
-
-            # BUILD_IN_SOURCE because ION's autotools setup does not cleanly
-            # support out-of-tree builds. Artifacts land inside the submodule
-            # checkout under third_party/ION-DTN (its own .gitignore covers them).
-            ExternalProject_Add(ion_external
-                SOURCE_DIR        ${ION_SUBMODULE}
-                BUILD_IN_SOURCE   1
-                CONFIGURE_COMMAND
-                    sh -c "cd <SOURCE_DIR> && (make distclean 2>/dev/null || true) && rm -f *.la libtool config.status && autoreconf -fi && ./configure --prefix=${ION_PREFIX} --enable-shared --disable-static"
-                BUILD_COMMAND
-                    make -C <SOURCE_DIR> -j${ION_PARALLEL}
-                INSTALL_COMMAND
-                    make -C <SOURCE_DIR> install
-                BUILD_BYPRODUCTS
-                    ${ION_PREFIX}/lib/libbp${CMAKE_SHARED_LIBRARY_SUFFIX}
-                    ${ION_PREFIX}/lib/libici${CMAKE_SHARED_LIBRARY_SUFFIX}
-                LOG_CONFIGURE 1
-                LOG_BUILD     1
-                LOG_INSTALL   1
-            )
-            # Pre-create the include dir so include_directories() below has
-            # something to add even before the first build runs.
-            file(MAKE_DIRECTORY ${ION_PREFIX}/include)
-            set(ION_INCLUDE_DIR ${ION_PREFIX}/include)
-            set(ION_BP_LIB  ${ION_PREFIX}/lib/libbp${CMAKE_SHARED_LIBRARY_SUFFIX})
-            set(ION_ICI_LIB ${ION_PREFIX}/lib/libici${CMAKE_SHARED_LIBRARY_SUFFIX})
-            set(ION_EXTERNAL_TARGET ion_external)
-            # Propagate RPATH so AT executables can find the in-build ION
-            # shared libs at runtime without LD_LIBRARY_PATH.
-            list(APPEND CMAKE_BUILD_RPATH   ${ION_PREFIX}/lib)
-            list(APPEND CMAKE_INSTALL_RPATH ${ION_PREFIX}/lib)
-        else()
-            find_path(ION_INCLUDE_DIR bp.h PATH_SUFFIXES ion)
-            find_library(ION_BP_LIB  NAMES bp)
-            find_library(ION_ICI_LIB NAMES ici)
-            if(NOT ION_INCLUDE_DIR OR NOT ION_BP_LIB OR NOT ION_ICI_LIB)
-                message(FATAL_ERROR
-                    "AT_NET_DTN_BACKEND=ion selected but the ION-DTN submodule is missing "
-                    "AND no system install was found. Fix one of:\n"
-                    "  git submodule update --init src/c/third_party/ION-DTN\n"
-                    "  sudo make install (in a cloned ION-DTN)\n"
-                    "  cmake ... -DION_INCLUDE_DIR=... -DION_BP_LIB=... -DION_ICI_LIB=...")
-            endif()
-            message("-- Found ION bp at ${ION_BP_LIB}, ici at ${ION_ICI_LIB}")
-            set(ION_EXTERNAL_TARGET "")
-        endif()
-
-        list(APPEND libsrc autonomous_trust/network/dtn/dtn_backend_ion.c)
-        include_directories(${ION_INCLUDE_DIR})
-        list(APPEND DEPENDENCIES      ${ION_BP_LIB} ${ION_ICI_LIB})
-        list(APPEND TEST_DEPENDENCIES ${ION_BP_LIB} ${ION_ICI_LIB})
-    elseif(AT_NET_DTN_BACKEND STREQUAL "ud3tn")
-        # uD3TN legacy AAP v1 binary protocol over Unix-socket or TCP — no
-        # external library needed; the daemon must be reachable at runtime via
-        # AT_DTN_UD3TN_SOCKET (e.g. "unix:./ud3tn.aap.socket" or "tcp:host:port").
-        list(APPEND libsrc autonomous_trust/network/dtn/dtn_backend_ud3tn.c)
-    elseif(AT_NET_DTN_BACKEND STREQUAL "ud3tnv2")
-        # uD3TN AAP 2.0: protobuf-delimited framing. Schema lives at
-        # autonomous_trust/network/dtn/proto/aap2.proto, vendored verbatim
-        # from https://gitlab.com/d3tn/ud3tn/-/raw/master/components/aap2/aap2.proto
-        # Currently symlinked to submodule location in ./third_party/ud3tn/
-        #
-        # Codegen is a standalone protoc-c run — we don't reuse the main
-        # `protos` list because aap2.proto lives under the DTN tree, not the
-        # AT protobuf/ root. Generated sources land in the build tree.
-        set(AAP2_PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust/network/dtn/proto)
-        set(AAP2_GEN_DIR   ${CMAKE_CURRENT_BINARY_DIR}/autonomous_trust/network/dtn/proto)
-        add_custom_command(
-            OUTPUT ${AAP2_GEN_DIR}/aap2.pb-c.c ${AAP2_GEN_DIR}/aap2.pb-c.h
-            COMMAND ${CMAKE_COMMAND} -E make_directory ${AAP2_GEN_DIR}
-            COMMAND ${Protobuf_PROTOC_EXECUTABLE}
-                --c_out=${AAP2_GEN_DIR}
-                -I${AAP2_PROTO_DIR}
-                ${AAP2_PROTO_DIR}/aap2.proto
-            COMMENT "Generating protobuf-c sources for aap2.proto"
-            DEPENDS ${AAP2_PROTO_DIR}/aap2.proto
-            VERBATIM
-        )
-        list(APPEND libsrc
-            autonomous_trust/network/dtn/dtn_backend_ud3tnv2.c
-            ${AAP2_GEN_DIR}/aap2.pb-c.c
-        )
-        include_directories(${AAP2_GEN_DIR})
-    else()
-        message(FATAL_ERROR "Unknown AT_NET_DTN_BACKEND: ${AT_NET_DTN_BACKEND}")
-    endif()
-    add_compile_definitions(AT_NET_DTN)
-endif()
-
-# Forwarding envelope (see at-over-dtn.md §4.3). Codec only — consumers of
-# the header are wired in net_proc.c in slice 2b.2.
-if(AT_NET_ENVELOPE)
-    list(APPEND libsrc autonomous_trust/network/net_envelope.c)
-    add_compile_definitions(AT_NET_ENVELOPE)
-endif()
-
-if(AT_NET_GROUP_FORWARD)
-    add_compile_definitions(AT_NET_GROUP_FORWARD)
-endif()
-
-if(AT_DISCOVERY_CROSS_CLUSTER)
-    add_compile_definitions(AT_DISCOVERY_CROSS_CLUSTER)
-endif()
 
 set(libhdr
     autonomous_trust.h
@@ -743,6 +566,8 @@ set(libhdr
     autonomous_trust/utilities/logger.h
     autonomous_trust/utilities/message.h
     autonomous_trust/utilities/msg_types.h
+    autonomous_trust/utilities/msg_registry.h
+    autonomous_trust/processes/extension.h
     autonomous_trust/utilities/queue_pool.h
     autonomous_trust/utilities/sighandler.h
     autonomous_trust/negotiation/negotiation.h
@@ -755,6 +580,7 @@ set(libhdr
     autonomous_trust/fleet/update_proc.h
     autonomous_trust/fleet/config_proc.h
 )
+
 
 if(AT_ZTA)
     list(APPEND libhdr
@@ -829,9 +655,6 @@ function(preprocess _file_in)
     set(_exclude_args)                                                                                      
     if(NOT AT_ZTA)
         list(APPEND _exclude_args --exclude zta)
-    endif()
-    if(NOT AT_NET_DTN)
-        list(APPEND _exclude_args --exclude dtn)
     endif()
     add_custom_command(
         OUTPUT ${_header_file}
@@ -917,13 +740,6 @@ if(AT_ZTA)
     include_directories(${OPENSSL_INCLUDE_DIR})
 endif()
 
-# When AT_SOCIAL is enabled, ALL targets must see AT_SOCIAL_ENABLED because it
-# changes the size of generic_msg_t and at_app_event_t (adds the social payload
-# union members / structs). A struct size mismatch between the library and
-# consumers causes crashes — same reasoning as AT_ZTA above.
-if(AT_SOCIAL)
-    add_compile_definitions(AT_SOCIAL_ENABLED)
-endif()
 
 # Ryu (shortest-decimal d2s) for JCS number formatting.  Pulled in as a
 # git submodule under third_party/ryu/; the upstream repo's C sources live
@@ -959,14 +775,6 @@ target_sources(autonomous_trust PUBLIC ${libsrc}
     PUBLIC FILE_SET HEADERS
     BASE_DIRS ${CMAKE_CURRENT_BINARY_DIR} FILES ${genhdr}
     )
-
-# If ION is being built from the in-tree submodule, force the ExternalProject
-# to complete (install libs + headers) before either AT library starts
-# compiling — otherwise dtn_backend_ion.c would fail on #include <bp.h>.
-if(DEFINED ION_EXTERNAL_TARGET AND ION_EXTERNAL_TARGET)
-    add_dependencies(autonomous_trust        ${ION_EXTERNAL_TARGET})
-    add_dependencies(autonomous_trust_static ${ION_EXTERNAL_TARGET})
-endif()
 
 
 ####################
@@ -1034,26 +842,6 @@ add_executable(bootstrap_worker_test test/bootstrap_worker_test.c)
 set_source_files_properties(test/bootstrap_worker_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(bootstrap_worker_test PRIVATE ${AT_TEST_LIBS})
 
-add_executable(physics_test test/physics_test.c)
-set_source_files_properties(test/physics_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(physics_test PRIVATE ${AT_TEST_LIBS})
-
-add_executable(calibration_test test/calibration_test.c)
-set_source_files_properties(test/calibration_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(calibration_test PRIVATE ${AT_TEST_LIBS})
-
-add_executable(prequential_test test/prequential_test.c)
-set_source_files_properties(test/prequential_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(prequential_test PRIVATE ${AT_TEST_LIBS})
-
-add_executable(replication_test test/replication_test.c)
-set_source_files_properties(test/replication_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(replication_test PRIVATE ${AT_TEST_LIBS})
-
-add_executable(certificates_test test/certificates_test.c)
-set_source_files_properties(test/certificates_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(certificates_test PRIVATE ${AT_TEST_LIBS})
-
 add_executable(net_message_test test/net_message_test.c)
 set_source_files_properties(test/net_message_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(net_message_test PRIVATE ${AT_TEST_LIBS})
@@ -1098,59 +886,6 @@ add_executable(late_joiner_caps_resync_test test/late_joiner_caps_resync_test.c)
 set_source_files_properties(test/late_joiner_caps_resync_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(late_joiner_caps_resync_test PRIVATE ${AT_TEST_LIBS})
 
-# Agora social tests (only when AT_SOCIAL is enabled)
-if(AT_SOCIAL)
-    add_executable(profile_test test/profile_test.c)
-    set_source_files_properties(test/profile_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(profile_test PRIVATE ${AT_TEST_LIBS})
-
-    add_executable(connection_test test/connection_test.c)
-    set_source_files_properties(test/connection_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(connection_test PRIVATE ${AT_TEST_LIBS})
-
-    add_executable(dm_test test/dm_test.c)
-    set_source_files_properties(test/dm_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(dm_test PRIVATE ${AT_TEST_LIBS})
-
-    add_executable(cosign_test test/cosign_test.c)
-    set_source_files_properties(test/cosign_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(cosign_test PRIVATE ${AT_TEST_LIBS})
-
-    add_executable(post_test test/post_test.c)
-    set_source_files_properties(test/post_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(post_test PRIVATE ${AT_TEST_LIBS})
-
-    add_executable(post_multicast_test test/post_multicast_test.c)
-    set_source_files_properties(test/post_multicast_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(post_multicast_test PRIVATE ${AT_TEST_LIBS})
-
-    add_executable(social_tx_test test/social_tx_test.c)
-    set_source_files_properties(test/social_tx_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(social_tx_test PRIVATE ${AT_TEST_LIBS})
-
-    add_executable(proximity_test test/proximity_test.c)
-    set_source_files_properties(test/proximity_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(proximity_test PRIVATE ${AT_TEST_LIBS})
-
-    add_executable(social_send_test test/social_send_test.c)
-    set_source_files_properties(test/social_send_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(social_send_test PRIVATE ${AT_TEST_LIBS})
-
-    # Filed with the social tests because its observable is the block's tier
-    # clamp, which only exists under AT_SOCIAL. The GUARD it exercises is not
-    # social-specific -- app verbs are local-only in every build.
-    add_executable(social_store_test test/social_store_test.c)
-    set_source_files_properties(test/social_store_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(social_store_test PRIVATE ${AT_TEST_LIBS})
-
-    add_executable(report_test test/report_test.c)
-    set_source_files_properties(test/report_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(report_test PRIVATE ${AT_TEST_LIBS})
-
-    add_executable(app_verb_origin_test test/app_verb_origin_test.c)
-    set_source_files_properties(test/app_verb_origin_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(app_verb_origin_test PRIVATE ${AT_TEST_LIBS})
-endif() # AT_SOCIAL
 
 add_executable(identity_resync_test test/identity_resync_test.c)
 set_source_files_properties(test/identity_resync_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1274,11 +1009,6 @@ add_test(NAME dag_test COMMAND $<TARGET_FILE:dag_test>)
 add_test(NAME agreement_test COMMAND $<TARGET_FILE:agreement_test>)
 add_test(NAME bootstrap_capabilities_test COMMAND $<TARGET_FILE:bootstrap_capabilities_test>)
 add_test(NAME bootstrap_worker_test COMMAND $<TARGET_FILE:bootstrap_worker_test>)
-add_test(NAME physics_test COMMAND $<TARGET_FILE:physics_test>)
-add_test(NAME calibration_test COMMAND $<TARGET_FILE:calibration_test>)
-add_test(NAME prequential_test COMMAND $<TARGET_FILE:prequential_test>)
-add_test(NAME replication_test COMMAND $<TARGET_FILE:replication_test>)
-add_test(NAME certificates_test COMMAND $<TARGET_FILE:certificates_test>)
 add_test(NAME net_message_test COMMAND $<TARGET_FILE:net_message_test>)
 add_test(NAME socket_helpers_test COMMAND $<TARGET_FILE:socket_helpers_test>)
 add_test(NAME at_jansson_test COMMAND $<TARGET_FILE:at_jansson_test>)
@@ -1290,20 +1020,6 @@ add_test(NAME network_test COMMAND $<TARGET_FILE:network_test>)
 add_test(NAME identity_test COMMAND $<TARGET_FILE:identity_test>)
 add_test(NAME partition_recovery_test COMMAND $<TARGET_FILE:partition_recovery_test>)
 add_test(NAME late_joiner_caps_resync_test COMMAND $<TARGET_FILE:late_joiner_caps_resync_test>)
-if(AT_SOCIAL)
-    add_test(NAME profile_test COMMAND $<TARGET_FILE:profile_test>)
-    add_test(NAME connection_test COMMAND $<TARGET_FILE:connection_test>)
-    add_test(NAME dm_test COMMAND $<TARGET_FILE:dm_test>)
-    add_test(NAME cosign_test COMMAND $<TARGET_FILE:cosign_test>)
-    add_test(NAME post_test COMMAND $<TARGET_FILE:post_test>)
-    add_test(NAME proximity_test COMMAND $<TARGET_FILE:proximity_test>)
-    add_test(NAME post_multicast_test COMMAND $<TARGET_FILE:post_multicast_test>)
-    add_test(NAME social_tx_test COMMAND $<TARGET_FILE:social_tx_test>)
-    add_test(NAME social_send_test COMMAND $<TARGET_FILE:social_send_test>)
-    add_test(NAME app_verb_origin_test COMMAND $<TARGET_FILE:app_verb_origin_test>)
-    add_test(NAME report_test COMMAND $<TARGET_FILE:report_test>)
-    add_test(NAME social_store_test COMMAND $<TARGET_FILE:social_store_test>)
-endif() # AT_SOCIAL
 add_test(NAME identity_resync_test COMMAND $<TARGET_FILE:identity_resync_test>)
 add_test(NAME rep_quorum_test COMMAND $<TARGET_FILE:rep_quorum_test>)
 add_test(NAME rep_paxos_round_test COMMAND $<TARGET_FILE:rep_paxos_round_test>)
@@ -1654,14 +1370,28 @@ set_source_files_properties(test/peer_rtt_update_test.c PROPERTIES COMPILE_FLAGS
 target_link_libraries(peer_rtt_update_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME peer_rtt_update_test COMMAND $<TARGET_FILE:peer_rtt_update_test>)
 
-# app_events_test exercises the social app-event kinds (position/profile/
-# connection/DM/post), so it is only built when AT_SOCIAL is enabled.
-if(AT_SOCIAL)
-    add_executable(app_events_test test/app_events_test.c)
-    set_source_files_properties(test/app_events_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(app_events_test PRIVATE ${AT_TEST_LIBS})
-    add_test(NAME app_events_test COMMAND $<TARGET_FILE:app_events_test>)
-endif() # AT_SOCIAL
+add_executable(neg_oracle_test test/neg_oracle_test.c)
+set_source_files_properties(test/neg_oracle_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(neg_oracle_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME neg_oracle_test COMMAND $<TARGET_FILE:neg_oracle_test>)
+
+add_executable(net_filter_test test/net_filter_test.c)
+set_source_files_properties(test/net_filter_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_filter_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME net_filter_test COMMAND $<TARGET_FILE:net_filter_test>)
+
+add_executable(extension_test test/extension_test.c)
+set_source_files_properties(test/extension_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(extension_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME extension_test COMMAND $<TARGET_FILE:extension_test>)
+
+# app_abi_test pins the flat app-event layout, which must be identical in
+# every build -- so, unlike app_events_test, it is built in every config.
+add_executable(app_abi_test test/app_abi_test.c)
+set_source_files_properties(test/app_abi_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(app_abi_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME app_abi_test COMMAND $<TARGET_FILE:app_abi_test>)
+
 
 # The flat lifecycle ABI (app_node.h) and the non-forking half of
 # at_node_start. Creates and binds under its own AUTONOMOUS_TRUST_ROOT.
@@ -1703,7 +1433,7 @@ set_source_files_properties(test/rescore_sweep_test.c PROPERTIES COMPILE_FLAGS "
 target_link_libraries(rescore_sweep_test PRIVATE ${AT_TEST_LIBS} m)
 add_test(NAME rescore_sweep_test COMMAND $<TARGET_FILE:rescore_sweep_test>)
 
-# Phase 4 P4.1. NOT under AT_SOCIAL: app_peer_standing is always compiled,
+# Phase 4 P4.1. Core, not an extension's: app_peer_standing is always compiled,
 # because a governance tier bounding a peer is not an Agora-specific idea.
 add_executable(peer_standing_verb_test test/peer_standing_verb_test.c)
 set_source_files_properties(test/peer_standing_verb_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1714,97 +1444,37 @@ add_executable(app_node_test test/app_node_test.c)
 set_source_files_properties(test/app_node_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(app_node_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME app_node_test COMMAND $<TARGET_FILE:app_node_test>)
-
-# Envelope codec unit tests — gated by AT_NET_ENVELOPE since the codec TU
-# itself is only compiled when that option is ON.
-if(AT_NET_ENVELOPE)
-    add_executable(net_envelope_test test/net_envelope_test.c)
-    set_source_files_properties(test/net_envelope_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(net_envelope_test PRIVATE ${AT_TEST_LIBS})
-    add_test(NAME net_envelope_test COMMAND $<TARGET_FILE:net_envelope_test>)
-
-    # Multi-hop relay test — exercises the envelope forwarding protocol
-    # end-to-end across simulated A -> G [-> G2] -> B paths without
-    # bringing up real transports or threads.
-    add_executable(envelope_relay_test test/envelope_relay_test.c)
-    set_source_files_properties(test/envelope_relay_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(envelope_relay_test PRIVATE ${AT_TEST_LIBS})
-    add_test(NAME envelope_relay_test COMMAND $<TARGET_FILE:envelope_relay_test>)
-
-    # Cross-leg broadcast forwarding gate + dedup fingerprint. Split from
-    # envelope_relay_test to stay under the 9-test RUN_TESTS cap.
-    add_executable(envelope_bcast_test test/envelope_bcast_test.c)
-    set_source_files_properties(test/envelope_bcast_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(envelope_bcast_test PRIVATE ${AT_TEST_LIBS})
-    add_test(NAME envelope_bcast_test COMMAND $<TARGET_FILE:envelope_bcast_test>)
-
-    # Integration-ish test: drives the real net_proc handle_inbound_peer()
-    # through a mock transport, asserting forward/drop/local behavior
-    # end-to-end without bringing up daemonize()'d processes or sockets.
-    add_executable(net_proc_relay_test test/net_proc_relay_test.c)
-    set_source_files_properties(test/net_proc_relay_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(net_proc_relay_test PRIVATE ${AT_TEST_LIBS})
-    add_test(NAME net_proc_relay_test COMMAND $<TARGET_FILE:net_proc_relay_test>)
-
-    # Deferred-message uuid-keyed retry (stage G). Verifies that under
-    # envelope mode the deferred-message ring keys by envelope src_uuid,
-    # not the gateway's transport from_addr.
-    add_executable(net_proc_defer_test test/net_proc_defer_test.c)
-    set_source_files_properties(test/net_proc_defer_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(net_proc_defer_test PRIVATE ${AT_TEST_LIBS})
-    add_test(NAME net_proc_defer_test COMMAND $<TARGET_FILE:net_proc_defer_test>)
-
-    # Cross-group forward path (stage F) — gated on AT_NET_GROUP_FORWARD
-    # because it drives the code in handle_inbound_group that only exists
-    # under that option. Envelope is still needed for envelope pack/unpack.
-    if(AT_NET_GROUP_FORWARD)
-        add_executable(envelope_group_forward_test test/envelope_group_forward_test.c)
-        set_source_files_properties(test/envelope_group_forward_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-        target_link_libraries(envelope_group_forward_test PRIVATE ${AT_TEST_LIBS})
-        add_test(NAME envelope_group_forward_test COMMAND $<TARGET_FILE:envelope_group_forward_test>)
-    endif()
-
-    # Cross-cluster peer discovery (stage E) — verifies that forwarded
-    # ID_ANNOUNCE broadcasts preserve the announcer's self-reported
-    # address (so replies route back through the gateway).
-    if(AT_DISCOVERY_CROSS_CLUSTER)
-        add_executable(discovery_cross_cluster_test test/discovery_cross_cluster_test.c)
-        set_source_files_properties(test/discovery_cross_cluster_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-        target_link_libraries(discovery_cross_cluster_test PRIVATE ${AT_TEST_LIBS})
-        add_test(NAME discovery_cross_cluster_test COMMAND $<TARGET_FILE:discovery_cross_cluster_test>)
-    endif()
-
-    # Per-leg broadcast exclusion (stage D-followup). Verifies
-    # handle_inbound_broadcast uses send_broadcast_except_leg when the
-    # transport reports a known last_recv_leg, and falls back to
-    # send_broadcast otherwise. Compiled whenever envelope mode is on —
-    # the refinement is zero-cost when irrelevant, so no separate option.
-    add_executable(broadcast_except_leg_test test/broadcast_except_leg_test.c)
-    set_source_files_properties(test/broadcast_except_leg_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(broadcast_except_leg_test PRIVATE ${AT_TEST_LIBS})
-    add_test(NAME broadcast_except_leg_test COMMAND $<TARGET_FILE:broadcast_except_leg_test>)
-endif()
-
-# DTN tests (only when AT_NET_DTN is enabled). dtn_eid_test is pure string
-# math so it runs against any backend. dtn_transport_test exercises the
-# transport's send/recv paths through the backend vtable; it assumes the
-# no-op stub (send returns 0, recv returns ENOMSG) and would misbehave
-# against a real daemon, so it is gated to the stub backend only.
-if(AT_NET_DTN)
-    add_executable(dtn_eid_test test/dtn_eid_test.c)
-    set_source_files_properties(test/dtn_eid_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(dtn_eid_test PRIVATE ${AT_TEST_LIBS})
-    add_test(NAME dtn_eid_test COMMAND $<TARGET_FILE:dtn_eid_test>)
-
-    if(AT_NET_DTN_BACKEND STREQUAL "stub")
-        add_executable(dtn_transport_test test/dtn_transport_test.c)
-        set_source_files_properties(test/dtn_transport_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-        target_link_libraries(dtn_transport_test PRIVATE ${AT_TEST_LIBS})
-        add_test(NAME dtn_transport_test COMMAND $<TARGET_FILE:dtn_transport_test>)
-    endif()
-endif()
+# An external libat_social (Agora) has social_app_routing_test on the same queue
+# names; never run the two at once.
+set_tests_properties(app_node_test PROPERTIES RESOURCE_LOCK app_node)
 
 endif() # LIBCHECK_LIBRARY
+
+# Extension libraries (src/c/extensions/): built by this project, after the
+# core targets and AT_TEST_LIBS, because they use the core's private headers
+# and flags. See doc/architecture/extensions.md.
+if(AT_NET_DTN)
+    add_subdirectory(extensions/dtn)
+endif()
+if(AT_NET_GATEWAY)
+    add_subdirectory(extensions/gateway)
+endif()
+include(extensions/at_extension.cmake)
+# Certificates before replication, which links it.
+foreach(_layer PHYSICS CALIBRATION CERTIFICATES PREQUENTIAL REPLICATION)
+    if(AT_ORACLE_${_layer})
+        string(TOLOWER ${_layer} _dir)
+        add_subdirectory(extensions/${_dir})
+    endif()
+endforeach()
+foreach(_ext_dir ${AT_EXTERNAL_EXTENSIONS})
+    get_filename_component(_ext_dir "${_ext_dir}" ABSOLUTE)
+    get_filename_component(_ext_name "${_ext_dir}" NAME)
+    if(NOT EXISTS "${_ext_dir}/CMakeLists.txt")
+        message(FATAL_ERROR "AT_EXTERNAL_EXTENSIONS: no CMakeLists.txt in ${_ext_dir}")
+    endif()
+    add_subdirectory("${_ext_dir}" extensions/${_ext_name})
+endforeach()
 
 ####################
 # Conformance harness (cross-language test corpus runner)

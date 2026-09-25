@@ -129,6 +129,32 @@ results/               per-run JSON output (gitignored)
 
 ## Notes on the harness
 
+- A protocol that belongs to a separately built feature has an adapter only
+  where the feature is. `physics`, `certificate`, `calibration`, `prequential`
+  and `replication` need the oracle layers. Without the feature, that
+  protocol's cases skip ("no adapter"), and a skip on one side is not an
+  asymmetry.
+- **Plug-ins.** A protocol can live outside this repository and join the run:
+  - **Python:** `$AT_CONFORMANCE_PLUGINS` is an os.pathsep list of plug-in
+    directories. Each holds `scenarios/<protocol>/*.yaml` and a
+    `conformance_plugin.py` that sets `SYS_PATH` (directories relative to the
+    plug-in, prepended to `sys.path`) and defines `adapters()`, which returns
+    `{protocol: AdapterClass}`. The schema stays AT's, and a case id that
+    duplicates one already loaded is refused.
+  - **C:** the plug-in's C adapter is compiled into the runner by the extension
+    that owns it, through `at_conformance_adapter(PROTOCOL RUN SOURCES LIBS
+    CORPUS)` (`src/c/extensions/at_extension.cmake`). That extension is named in
+    `AT_EXTERNAL_EXTENSIONS`. `corpus_to_json.py` merges each registered corpus
+    through a repeated `--in`, and `runner.c` falls back to the generated
+    `conformance_registry.c` before "no C adapter".
+  - **Both:** `scripts/test-conformance.sh` forwards both variables. Agora's
+    `social` protocol is the one plug-in. It rides the identity process, so its
+    adapters are the identity adapters plus the published hooks: Python
+    `IdentityAdapter`'s `FIXTURE_HOOKS`/`TRIGGERS`/`INBOUND_BUILDERS`/`STATE_CHECKS`,
+    C `ic_ext_t` / `at_identity_run_ext` (`src/c/conformance/adapters/identity_priv.h`).
+    Agora runs it with `apps/agora/at-social/test-conformance.sh`.
+- `tools/corpus_to_json.py` deletes a JSON mirror whose YAML is gone, so a
+  reused C build directory does not run a moved scenario twice.
 - The scenario engine schema gained `no_propagate: true` for assertion
   steps that verify a captured outbound exists in the parent step's
   outbox without delivering it. Used by replay and emission-pin cases.

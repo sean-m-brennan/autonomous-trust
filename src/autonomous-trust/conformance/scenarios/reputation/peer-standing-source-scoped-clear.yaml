@@ -33,7 +33,7 @@ description: |
     (SOCIAL_APP_PLAN.md:481) true in both directions: the same authority that
     levied a bound can lift it, and lifts only its own.
 
-    Runs in EVERY build, with no AT_ZTA and no CONFORMANCE_SOCIAL.
+    Runs in EVERY build, with no AT_ZTA and no social plug-in.
 
 participants:
   - id: alice

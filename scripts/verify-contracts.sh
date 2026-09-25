@@ -26,13 +26,16 @@ set -euo pipefail
 
 PROJ_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 C_SRC="$PROJ_ROOT/src/c/autonomous_trust"
+# Extension libraries (FEATURE_SPLIT_PLAN): a module not under $C_SRC is
+# looked up here, e.g. dtn -> src/c/extensions/dtn. Their test/ dirs are skipped.
+EXT_SRC="$PROJ_ROOT/src/c/extensions"
 STUBS_DIR="$PROJ_ROOT/src/c/frama-c/stubs"
 BUILD_DIR="$PROJ_ROOT/src/c/build"
 PROTO_SRC="$BUILD_DIR/protobuf"
 # Optional build-tree roots — only present when the corresponding CMake
 # option was selected and the project was built. Added to the cpp -I path
 # below iff the directory exists.
-AAP2_GEN_DIR="$BUILD_DIR/autonomous_trust/network/dtn/proto"  # AT_NET_DTN_BACKEND=ud3tnv2
+AAP2_GEN_DIR="$BUILD_DIR/extensions/dtn/proto"                # AT_NET_DTN_BACKEND=ud3tnv2
 ION_INCLUDE_DIR="$BUILD_DIR/ion-install/include"              # AT_NET_DTN_BACKEND=ion
 
 VALID_MODULES=(
@@ -47,7 +50,27 @@ VALID_MODULES=(
     fleet
     zta
     utilities
+    dtn
+    gateway
 )
+
+# The verification layers (FEATURE_SPLIT_PLAN Phase 3, src/c/extensions/<layer>/).
+# Accepted by --module, but NOT in the default all-modules run: they were never
+# in it (under src/c/autonomous_trust/ they were outside VALID_MODULES), so a
+# full run keeps covering what it always has until each has been brought up to
+# the contract bar on its own.
+OPT_IN_MODULES=(
+    physics
+    calibration
+    certificates
+    prequential
+    replication
+)
+
+# Source directory of module $1: the core's, else an extension library's.
+module_dir() {
+    if [[ -d "$C_SRC/$1" ]]; then echo "$C_SRC/$1"; else echo "$EXT_SRC/$1"; fi
+}
 
 ####################
 # Defaults
@@ -75,6 +98,8 @@ in the AutonomousTrust project.
 Options:
   --module <name>     Verify only one module. Valid modules:
                         $(printf '%s, ' "${VALID_MODULES[@]}" | sed 's/, $//')
+                      Opt-in (never in the default run):
+                        $(printf '%s, ' "${OPT_IN_MODULES[@]}" | sed 's/, $//')
   --file <path>       Verify a single .c file (relative to repo root or absolute)
   --timeout <seconds> Per-goal SMT solver timeout (default: $timeout)
   --prover <name>     SMT solver backend (default: $prover)
@@ -159,7 +184,7 @@ done
 
 if [[ -n "$module" ]]; then
     valid=0
-    for m in "${VALID_MODULES[@]}"; do
+    for m in "${VALID_MODULES[@]}" "${OPT_IN_MODULES[@]}"; do
         if [[ "$m" == "$module" ]]; then
             valid=1
             break
@@ -167,7 +192,7 @@ if [[ -n "$module" ]]; then
     done
     if [[ $valid -eq 0 ]]; then
         echo "ERROR: Unknown module '$module'."
-        echo "Valid modules: $(printf '%s, ' "${VALID_MODULES[@]}" | sed 's/, $//')"
+        echo "Valid modules: $(printf '%s, ' "${VALID_MODULES[@]}" "${OPT_IN_MODULES[@]}" | sed 's/, $//')"
         exit 1
     fi
 fi
@@ -235,22 +260,22 @@ if [[ -n "$single_file" ]]; then
     fi
     files+=("$single_file")
 elif [[ -n "$module" ]]; then
-    mod_dir="$C_SRC/$module"
+    mod_dir=$(module_dir "$module")
     if [[ ! -d "$mod_dir" ]]; then
         echo "ERROR: Module directory not found: $mod_dir"
         exit 1
     fi
     while IFS= read -r -d '' f; do
         files+=("$f")
-    done < <(find "$mod_dir" -name '*.c' -type f -print0 | sort -z)
+    done < <(find "$mod_dir" -name '*.c' -type f -not -path '*/test/*' -print0 | sort -z)
 else
     # All modules
     for m in "${VALID_MODULES[@]}"; do
-        mod_dir="$C_SRC/$m"
+        mod_dir=$(module_dir "$m")
         if [[ -d "$mod_dir" ]]; then
             while IFS= read -r -d '' f; do
                 files+=("$f")
-            done < <(find "$mod_dir" -name '*.c' -type f -print0 | sort -z)
+            done < <(find "$mod_dir" -name '*.c' -type f -not -path '*/test/*' -print0 | sort -z)
         fi
     done
 fi
@@ -303,7 +328,7 @@ if [[ -d "$ION_INCLUDE_DIR" ]]; then
 fi
 
 INCLUDE_FLAGS=(
-    -cpp-extra-args="-fms-extensions -DAT_ZTA_ENABLED -include $STUBS_DIR/fc_stdio_spec.h -include $STUBS_DIR/fc_stdlib_spec.h -include $STUBS_DIR/fc_string_spec.h -include $STUBS_DIR/fc_net_spec.h -I $C_SRC -I $STUBS_DIR -I $PROJ_ROOT/src/c -I $BUILD_DIR -I $PROTO_SRC $PROTO_INCLUDES$OPTIONAL_INCLUDES -I $CONDA_PREFIX/include"
+    -cpp-extra-args="-fms-extensions -DAT_ZTA_ENABLED -include $STUBS_DIR/fc_stdio_spec.h -include $STUBS_DIR/fc_stdlib_spec.h -include $STUBS_DIR/fc_string_spec.h -include $STUBS_DIR/fc_net_spec.h -I $C_SRC -I $EXT_SRC -I $STUBS_DIR -I $PROJ_ROOT/src/c -I $BUILD_DIR -I $PROTO_SRC $PROTO_INCLUDES$OPTIONAL_INCLUDES -I $CONDA_PREFIX/include"
 )
 
 ####################

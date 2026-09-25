@@ -52,6 +52,9 @@ COPY src/autonomous-trust/requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt && pip install protobuf
 
 COPY src/autonomous-trust/autonomous_trust autonomous_trust
+# The verification layers (autonomous-trust-oracle), beside the core in the
+# autonomous_trust namespace, where the core finds them (FEATURE_SPLIT_PLAN Phase 3).
+COPY src/autonomous-trust-oracle/autonomous_trust/oracle autonomous_trust/oracle
 RUN rm -rf autonomous_trust/etc autonomous_trust/var
 
 COPY src/autonomous-trust/pyproject.toml pyproject.toml

@@ -159,4 +159,9 @@ bool at_first_contact_nonce_spent(const char *nonce);
  *  restart, and keeps one scenario's nonces out of the next one. */
 void at_first_contact_reset(void);
 
+/** Keeps first contact's extension registration (processes/extension.h) in a
+ *  static link: it is a constructor in first_contact.c, which a static link
+ *  drops unless something references the object. No-op at run time. */
+void at_first_contact_link(void);
+
 #endif /* AUTONOMOUS_TRUST_IDENTITY_FIRST_CONTACT_H */

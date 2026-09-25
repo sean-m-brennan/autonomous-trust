@@ -20,6 +20,7 @@
 #include <unistd.h>   /* close, for the custom run loop */
 
 #include "processes/processes.h"
+#include "processes/extension.h"
 #include "negotiation/negotiation.h"
 #include "structures/map.h"
 #include "structures/data.h"
@@ -35,10 +36,8 @@
 #include "utilities/util.h"       /* at_strlcpy */
 #include "bootstrap/bootstrap_capabilities.h"  /* known-answer probe verifiers */
 #include "bootstrap/bootstrap_worker.h"        /* probe allocation + window */
-#include "physics/physics.h"                   /* §12.2 falsification layer */
-#include "calibration/calibration.h"           /* §12.4 coverage audit */
-#include "prequential/prequential.h"         /* §12.5 competence weight */
-#include "certificates/certificates.h"         /* §12.3 witness checking */
+#include "negotiation/neg_oracle.h"            /* §12 verification layers */
+#include "negotiation/neg_certified.h"         /* §12.3 witness wire format */
 #include "config/configuration.h"             /* config_t, for our own identity */
 #include "reputation/tx_channel.h"             /* evidence channels */
 
@@ -126,39 +125,6 @@ static struct {
      * process, which is the one that owns the announce path the worker needs.
      * See _bootstrap_tick. */
     bootstrap_worker_t bootstrap;
-    /* The physical-consistency checker and its observation window (R+D.md
-     * §12.2). It lives here for the same reason the prober does: this is the
-     * process that retained what the requestor ASKED for, so it is the only
-     * one that can say which quantity a returned result is a claim about. The
-     * window is what the multi-peer intersection and the parity residuals are
-     * computed over -- a checker rebuilt per result would see no history and
-     * could only ever perform the single-claim checks.
-     *
-     * `physics_loaded` is separate from "the model is empty": an unconfigured
-     * $AT_PHYSICS is a legitimate empty model, and re-reading the file on
-     * every result to rediscover that would be a syscall per task. */
-    at_physics_checker_t physics;
-    bool physics_loaded;
-    /* §12.4 coverage audit. Held here for the same reason the physics checker
-     * is, only more so: the verdict IS the accumulated record of resolved
-     * predictions, so an auditor built per result would have nothing to audit
-     * and would be permanently silent. */
-    at_calibration_auditor_t calibration;
-    bool calibration_loaded;
-    /* §12.5 prequential competence. Held here for the same reason the auditor
-     * above it is, and rather more so: the competence multiplier IS the
-     * accumulated record of resolved forecasts, so an estimator built per
-     * result would weight every peer at exactly 1.0 forever -- which is
-     * indistinguishable from the layer being switched off. */
-    at_prequential_estimator_t prequential;
-    bool prequential_loaded;
-    /* The certificate declaration (R+D.md §12.3). Stateless apart from the
-     * model -- a witness is self-contained by construction, so unlike the
-     * physics checker there is no observation window to carry -- but held here
-     * so the file is read and the inventory reported ONCE rather than per
-     * task result. */
-    at_cert_model_t certificates;
-    bool certificates_loaded;
 } neg_state;
 
 static void _ensure_init(void)
@@ -379,6 +345,9 @@ void negotiation_reset_state(void)
      * scenario's first invitation as a replay. */
     freshness_reset(&neg_state.freshness);
     pthread_mutex_unlock(&neg_state.lock);
+    /* And the verification layers' records (observation windows, prediction
+     * and forecast rings), which a scenario must not inherit either. */
+    neg_oracles_reset();
 }
 
 /****************************
@@ -2164,97 +2133,6 @@ static double _now_sec(void)
         : (double)time(NULL);
 }
 
-/* The process-wide physical-consistency checker (R+D.md §12.2), built from
- * $AT_PHYSICS on first call and empty when that is unset. File-static: the
- * only caller is the scorer below, and the conformance adapter deliberately
- * builds its OWN checker so each scenario starts with an empty observation
- * window rather than inheriting the previous one's. */
-static at_physics_checker_t *_physics_checker(void)
-{
-    _ensure_init();
-    if (!neg_state.physics_loaded)
-    {
-        /* Built once, from $AT_PHYSICS. A malformed declaration is fatal at
-         * load (physics.c says why) but must not take down the scoring path on
-         * every subsequent result: the failure is recorded once and the layer
-         * stays OFF, which is the same end state as never having configured
-         * it. Mirrors Python automate.physics_checker(). */
-        at_physics_model_t model;
-        char err[AT_PHYS_ERR_LEN] = {0};
-        if (!at_physics_model_load(NULL, &model, err, sizeof(err)))
-        {
-            log_error(NULL, "physics: declaration rejected, layer stays OFF: %s\n",
-                      err);
-            at_physics_model_parse(NULL, &model, NULL, 0);
-        }
-        at_physics_checker_init(&neg_state.physics, &model);
-        neg_state.physics_loaded = true;
-    }
-    return &neg_state.physics;
-}
-
-/* The process-wide coverage auditor (R+D.md §12.4). Mirrors Python
- * automate.calibration_auditor(): a malformed declaration is fatal at load but
- * must not take down the scoring path on every subsequent result, so the
- * failure is logged once and the layer stays off. */
-static at_calibration_auditor_t *_calibration_auditor(void)
-{
-    if (!neg_state.calibration_loaded)
-    {
-        at_calibration_model_t model;
-        char err[AT_CAL_ERR_LEN] = {0};
-        if (!at_calibration_model_load(NULL, &model, err, sizeof(err)))
-        {
-            log_error(NULL, "calibration: declaration rejected, layer stays "
-                            "OFF: %s\n", err);
-            at_calibration_model_parse(NULL, &model, NULL, 0);
-        }
-        at_calibration_auditor_init(&neg_state.calibration, &model);
-        neg_state.calibration_loaded = true;
-    }
-    return &neg_state.calibration;
-}
-
-/* The §12.5 estimator, built on first use. Same load policy as the two layers
- * above (mirrors Python automate.prequential_estimator): a rejected
- * declaration is logged and the layer stays OFF rather than taking the scoring
- * path down with it, because a node that cannot learn a weighting must still
- * be able to score a task. */
-static at_prequential_estimator_t *_prequential_estimator(void)
-{
-    if (!neg_state.prequential_loaded)
-    {
-        at_prequential_model_t model;
-        char err[AT_PREQ_ERR_LEN] = {0};
-        if (!at_prequential_model_load(NULL, &model, err, sizeof(err)))
-        {
-            log_error(NULL, "prequential: declaration rejected, layer stays "
-                            "OFF: %s\n", err);
-            at_prequential_model_parse(NULL, &model, NULL, 0);
-        }
-        at_prequential_estimator_init(&neg_state.prequential, &model);
-        neg_state.prequential_loaded = true;
-    }
-    return &neg_state.prequential;
-}
-
-/* The declared quantity a capability REPORTS, or NULL. Walks the physics model
- * rather than asking the calibration one: the link lives in physics.json (each
- * quantity names its reporting capability), and keeping the lookup here is what
- * lets the calibration module stay independent of the physics one -- a node can
- * run the audit with no physics declaration at all and resolve predictions
- * through at_calibration_settle instead. */
-static const char *_reported_quantity(const char *capability)
-{
-    if (capability == NULL || capability[0] == '\0')
-        return NULL;
-    const at_physics_checker_t *physics = _physics_checker();
-    for (int i = 0; i < physics->model.n_quantities; i++)
-        if (strcmp(physics->model.quantities[i].capability, capability) == 0)
-            return physics->model.quantities[i].name;
-    return NULL;
-}
-
 /* Score one returned result and name the evidence channel it came from.
  * Exported (declared in negotiation.h) so tests and the conformance adapter
  * pin the same function production uses, rather than a copy of its rules.
@@ -2278,47 +2156,6 @@ static const char *_reported_quantity(const char *capability)
  * reports `swarm_disagreement` (0.3). That layer only ever refutes -- passing
  * it earns nothing -- so a claim it has nothing to say about falls through to
  * the completion arm below, unchanged. */
-/* The process-wide certificate declaration, built from $AT_CERTIFICATES on
- * first call and empty when that is unset. A malformed declaration is fatal at
- * load (certificates.c says why) but must not take down the scoring path on
- * every subsequent result: the failure is recorded once and the layer stays
- * OFF, which is the same end state as never having configured it.
- *
- * Emits the inventory once, here. That report is the other half of what
- * R+D.md §12.3 asks for: a node that silently falls through to completion
- * scoring for everything it cannot check looks, from outside, exactly like a
- * node checking everything, and the expensive case is only "recognized" if
- * somebody can see it. Mirrors Python automate.certificate_verifier(). */
-static const at_cert_model_t *_certificate_model(void)
-{
-    _ensure_init();
-    if (!neg_state.certificates_loaded)
-    {
-        char err[AT_CERT_ERR_LEN] = {0};
-        if (!at_cert_model_load(NULL, &neg_state.certificates, err, sizeof(err)))
-        {
-            log_error(NULL,
-                      "certificates: declaration rejected, layer stays OFF: %s\n",
-                      err);
-            at_cert_model_parse(NULL, &neg_state.certificates, NULL, 0);
-        }
-        neg_state.certificates_loaded = true;
-        if (at_cert_model_enabled(&neg_state.certificates))
-        {
-            at_cert_inv_row_t rows[AT_CERT_MAX_CAPABILITIES];
-            int n = at_cert_inventory(&neg_state.certificates, NULL, 0,
-                                      rows, AT_CERT_MAX_CAPABILITIES);
-            if (n > 0)
-            {
-                char report[4096];
-                at_cert_inventory_format(rows, n, report, sizeof(report));
-                log_info(NULL, "%s\n", report);
-            }
-        }
-    }
-    return &neg_state.certificates;
-}
-
 double negotiation_score_task_result(const char *cap_name,
                                     const char *kwargs_json,
                                     const char *result_str, size_t result_len,
@@ -2363,182 +2200,23 @@ double negotiation_score_task_result(const char *cap_name,
         }
     }
 
-    /* Physical consistency (R+D.md §12.2), after the known-answer probe and
-     * before every other arm. A probe holds the exact right answer, which
-     * strictly subsumes asking whether the answer is possible; everything
-     * BELOW this point is a judgment about completion, which is what
-     * doc/verification_oracle.md means by running the claim against physics
-     * first. It speaks only to refute -- a claim that merely survives the
-     * check earns nothing here -- so a NONE verdict falls through to the
-     * completion arm unchanged. */
+    /* The verification layers (R+D.md §12), in their registered order
+     * (negotiation/neg_oracle.h): physics, the coverage audit's settle, the
+     * prequential record, certificates, the coverage audit's verdict. Each is
+     * its own library and speaks only when its declaration names a model; the
+     * first to render a verdict ends scoring. Everything they do not decide
+     * falls through to the completion arm unchanged. */
     {
-        at_physics_checker_t *physics = _physics_checker();
-        if (at_physics_checker_enabled(physics))
-        {
-            double phys_score = 0.0;
-            char reason[AT_PHYS_ERR_LEN] = {0};
-            at_physics_verdict_t verdict = at_physics_check(
-                physics, cap_name, result_str, subject, now, &phys_score,
-                reason, sizeof(reason));
-            if (verdict == AT_PHYSICS_REFUTED)
-            {
-                log_warn(NULL, "physics: REFUTED (%s)\n", reason);
-                *channel_out = TX_CHANNEL_PHYSICAL;
-                return phys_score;
-            }
-            if (verdict == AT_PHYSICS_IMPLICATED)
-            {
-                log_info(NULL, "physics: %s\n", reason);
-                *channel_out = TX_CHANNEL_SWARM_DISAGREEMENT;
-                return phys_score;
-            }
-        }
-    }
-
-    /* Coverage audit, half one (R+D.md §12.4): let this result RESOLVE
-     * predictions other peers made about the quantity it reports.
-     *
-     * Here, and not with the verdict arm below, because the two halves answer
-     * different questions. This one asks "is this result evidence about the
-     * world", and the answer stops being yes the moment physics refutes it --
-     * settling an honest forecaster's prediction against a refuted observation
-     * would let a lying reporter convict it. Everything past the physics arm
-     * is un-refuted and usable, including a result whose own certificate arm
-     * is about to score it: a wrong answer to THIS task is still a
-     * measurement. Mirrors Python automate.score_task_result. */
-    {
-        at_calibration_auditor_t *auditor = _calibration_auditor();
-        if (at_calibration_enabled(auditor))
-        {
-            const char *quantity = _reported_quantity(cap_name);
-            if (quantity != NULL)
-            {
-                int settled = at_calibration_settle_result(
-                    auditor, quantity, result_str, subject, now);
-                if (settled > 0)
-                    log_debug(NULL, "calibration: resolved %d outstanding "
-                                    "prediction(s) about %s\n",
-                              settled, quantity);
-            }
-        }
-    }
-
-    /* Prequential competence (R+D.md §12.5), both halves, here and not lower
-     * down. This layer renders NO verdict -- it produces the weight
-     * multiplier `negotiation_competence_weight` reads when the score is
-     * submitted -- so it has no place in the arm ORDER below, and putting it
-     * there would make the record depend on which other layer happened to
-     * speak first: a forecast attached to a reply whose certificate arm is
-     * about to score it still has to be recorded.
-     *
-     * After physics for the same reason the coverage audit's settle is: a
-     * refuted observation must not resolve an honest forecaster's forecast,
-     * and a refuted result records no forecast of its own either, since a
-     * claim physics has refuted is not evidence in either direction.
-     *
-     * Settle before observe, so a peer forecasting the same quantity it just
-     * reported is weighted against a record including everything this result
-     * settled. Mirrors Python automate.score_task_result. */
-    {
-        at_prequential_estimator_t *est = _prequential_estimator();
-        if (at_prequential_enabled(est))
-        {
-            const char *quantity = _reported_quantity(cap_name);
-            if (quantity != NULL)
-            {
-                int resolved = at_prequential_settle_result(
-                    est, quantity, result_str, subject, now);
-                if (resolved > 0)
-                    log_debug(NULL, "prequential: resolved %d outstanding "
-                                    "forecast(s) about %s\n",
-                              resolved, quantity);
-            }
-            json_t *pred = NULL;
-            if (prediction_json != NULL && prediction_json[0] != '\0')
-            {
-                json_error_t perr;
-                pred = json_loads(prediction_json, 0, &perr);
-            }
-            at_prequential_observe(est, cap_name, pred, subject, now);
-            if (pred != NULL)
-                json_decref(pred);
-        }
-    }
-
-    /* Certificate-carrying interfaces (R+D.md §12.3), after physics and before
-     * the completion arm. After physics because a witness proves the answer
-     * satisfies the problem AS STATED, which says nothing about whether the
-     * statement was physically coherent.
-     *
-     * This is the one layer that can return a GOOD score, and that is not an
-     * inconsistency with the physics layer above it. Surviving a feasibility
-     * test means "not refuted"; a witness that checks out means "proved
-     * right", and declining to say so would discard the strongest positive
-     * evidence this node can obtain. */
-    {
-        const at_cert_model_t *certs = _certificate_model();
-        if (at_cert_model_enabled(certs))
-        {
-            char why[AT_CERT_ERR_LEN] = {0};
-            at_cert_verdict_t verdict = at_cert_evaluate(
-                certs, cap_name, result_str, certificate_json, kwargs_json,
-                seed, why, sizeof(why));
-            if (verdict == AT_CERT_VALID || verdict == AT_CERT_INVALID ||
-                verdict == AT_CERT_ABSENT)
-            {
-                if (verdict == AT_CERT_VALID)
-                    log_info(NULL, "certificates: %s verified (%s)\n",
-                             cap_name ? cap_name : "-",
-                             at_cert_verdict_name(verdict));
-                else
-                    log_warn(NULL, "certificates: %s %s: %s\n",
-                             cap_name ? cap_name : "-",
-                             at_cert_verdict_name(verdict), why);
-                *channel_out = TX_CHANNEL_CERTIFICATE;
-                return at_cert_score(verdict);
-            }
-            /* INDETERMINATE is OUR record failing, never the peer's fault, so
-             * it falls through unscored. */
-        }
-    }
-
-    /* Coverage audit, half two (R+D.md §12.4): judge the peer's CLAIM about
-     * how often answers of this kind land inside the set it quotes.
-     *
-     * After the certificate arm because an exact check of THIS answer outranks
-     * a statistical claim about a hundred of them: where a capability is both
-     * certified and predictive, the witness settles what happened here, and
-     * `calibration` carries the baseline weight against `certificate`'s 3.
-     * Before the completion arm for the same reason physics is -- "it came
-     * back" says nothing about whether the peer's account of its own
-     * reliability is true.
-     *
-     * Falsification only: a peer that has not been caught over-claiming earns
-     * nothing here, so a NONE verdict falls through to the completion arm. */
-    {
-        at_calibration_auditor_t *auditor = _calibration_auditor();
-        if (at_calibration_enabled(auditor))
-        {
-            json_t *pred = NULL;
-            if (prediction_json != NULL && prediction_json[0] != '\0')
-            {
-                json_error_t perr;
-                pred = json_loads(prediction_json, 0, &perr);
-            }
-            double cal_score = 0.0;
-            char why[AT_CAL_ERR_LEN] = {0};
-            at_cal_verdict_t verdict = at_calibration_assess(
-                auditor, cap_name, pred, subject, now, &cal_score,
-                why, sizeof(why));
-            if (pred != NULL)
-                json_decref(pred);
-            if (verdict != AT_CAL_NONE)
-            {
-                log_warn(NULL, "calibration: %s\n", why);
-                *channel_out = TX_CHANNEL_CALIBRATION;
-                return cal_score;
-            }
-        }
+        const neg_score_input_t in = {
+            .cap = cap_name, .kwargs_json = kwargs_json,
+            .result_str = result_str, .result_len = result_len,
+            .certificate_json = certificate_json,
+            .prediction_json = prediction_json,
+            .subject = subject, .now = now, .seed = seed,
+        };
+        double score = 0.0;
+        if (neg_oracles_score(&in, &score, channel_out))
+            return score;
     }
 
     *channel_out = TX_CHANNEL_TASK_OUTCOME;
@@ -2547,10 +2225,7 @@ double negotiation_score_task_result(const char *cap_name,
 
 double negotiation_competence_weight(const char *cap_name, const char *subject)
 {
-    at_prequential_estimator_t *est = _prequential_estimator();
-    if (!at_prequential_enabled(est))
-        return AT_PREQ_NEUTRAL_COMPETENCE;
-    return at_prequential_competence(est, subject, cap_name);
+    return neg_oracle_competence(cap_name, subject);
 }
 
 /* Submit a requestor-side score to the reputation process, which resolves our
@@ -2644,7 +2319,7 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
         json_t *j_cert = json_object_get(j, "certificate");
         if (json_is_object(j_cert))
         {
-            static _Thread_local char cert_buf[AT_CERT_ERR_LEN * 16];
+            static _Thread_local char cert_buf[NEG_CERT_JSON_MAX];
             char *dumped = json_dumps(j_cert, JSON_COMPACT);
             if (dumped != NULL)
             {
@@ -2671,7 +2346,7 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
         json_t *j_pred = json_object_get(j, "prediction");
         if (json_is_object(j_pred))
         {
-            static _Thread_local char pred_buf[AT_CAL_ERR_LEN * 8];
+            static _Thread_local char pred_buf[NEG_PRED_JSON_MAX];
             char *dumped = json_dumps(j_pred, JSON_COMPACT);
             if (dumped != NULL)
             {
@@ -3005,7 +2680,7 @@ static void _drain_task_stack(const process_t *proc)
          * completion. Neutral == the authored transaction_weight verbatim. */
         _submit_tx_score(proc, job.task.uuid, 0.9, job.task.capability.name,
                          TX_CHANNEL_TASK_OUTCOME, NULL,
-                         AT_PREQ_NEUTRAL_COMPETENCE);
+                         NEG_NEUTRAL_COMPETENCE);
     }
 }
 
@@ -3427,6 +3102,7 @@ int negotiation_register_handlers(process_t *proc)
      * protocol message but registered the same way so the protocol
      * dispatch table routes it. */
     process_register_handler(proc, ID_TIER_LOST,      (handler_ptr_t)handle_tier_lost);
+    at_extensions_register_handlers(proc, "negotiation");
     return 0;
 }
 
@@ -3434,6 +3110,10 @@ int negotiation_run(process_t *proc, directory_t *queues, queue_id_t signal, log
 {
     _ensure_init();
     negotiation_register_handlers(proc);
+    /* A declared verification layer this binary lacks is a check that would
+     * silently not happen; refuse instead (neg_oracle.h). */
+    if (neg_oracles_check_env(logger) != 0)
+        return -1;
     proc->protocol.phase = 1;
 
     /* Custom loop = process_loop plus the two periodic duties this process

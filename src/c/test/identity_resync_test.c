@@ -75,21 +75,20 @@ static size_t g_query_count;
 static size_t g_response_count;
 static char   g_last_query_group[UUID_STRING_LEN + 1];
 static json_t *g_last_query_have;   /* owned; freed in _end */
-#ifdef AT_SOCIAL_ENABLED
 /* Last PEER_OBSERVED emission's group-membership flag: -1 none yet, else 0/1. */
 static int g_last_peer_observed_in_group;
-#endif
+/* in_group is an identity extension's answer (identity/id_ext.h); in a
+ * core-only build nothing answers, so it is always 0 (absent means off). The
+ * social half lives with libat_social (Agora, social_in_group_test.c). */
 
 static int _capture_hook(const char *key, const message_type_t type,
                          generic_msg_t *msg, bool blocking)
 {
     (void)key; (void)blocking;
-#ifdef AT_SOCIAL_ENABLED
     if (type == PEER_OBSERVED) {
         g_last_peer_observed_in_group = msg->info.peer_observed.in_group ? 1 : 0;
         return 0;
     }
-#endif
     if (type != NET_MESSAGE || msg->info.net_msg.function == NULL)
         return 0;
     const char *fn = msg->info.net_msg.function;
@@ -263,9 +262,7 @@ static void _begin(void)
     g_response_count = 0;
     g_last_query_group[0] = '\0';
     g_last_query_have = NULL;
-#ifdef AT_SOCIAL_ENABLED
     g_last_peer_observed_in_group = -1;
-#endif
     messaging_set_test_hook(_capture_hook);
 }
 
@@ -535,8 +532,8 @@ static void _dispatch_group_update(process_t *proc, identity_t *member,
 /* Part B: the "in your group" flag reflects real convergence — the peer having
  * advertised OUR group uuid — NOT mere address overlap (which is true from the
  * mesh merge onward, during the pre-convergence split-brain). Regression for
- * the badge lighting up before posts can flow. Non-social builds lack the flag;
- * the emit must still run. */
+ * the badge lighting up before posts can flow. Here, with no extension
+ * answering, the flag stays 0 through every step; the emit must still run. */
 DEFINE_TEST(test_emit_peer_observed_in_group)
 {
     _begin();
@@ -555,16 +552,12 @@ DEFINE_TEST(test_emit_peer_observed_in_group)
      * group yet -> NOT in group (the split-brain false-positive we fixed). */
     _add_group_member_addr(proc, member);
     identity_emit_peer_observed(proc, mpub);
-#ifdef AT_SOCIAL_ENABLED
     ck_assert_int_eq(g_last_peer_observed_in_group, 0);
-#endif
 
     /* Peer advertises OUR group uuid -> converged -> in group. */
     _dispatch_group_update(proc, member, ours);
     identity_emit_peer_observed(proc, mpub);
-#ifdef AT_SOCIAL_ENABLED
-    ck_assert_int_eq(g_last_peer_observed_in_group, 1);
-#endif
+    ck_assert_int_eq(g_last_peer_observed_in_group, 0);
 
     /* Swap-robustness: if WE then adopt a different group (our uuid changes),
      * the earlier record ("ours|ours") is stale — it must NOT keep counting as
@@ -572,27 +565,21 @@ DEFINE_TEST(test_emit_peer_observed_in_group)
      * the mutual-adopt-swap case that a bare their==ours check gets wrong. */
     uuid_generate(proc->protocol.group.uuid);
     identity_emit_peer_observed(proc, mpub);
-#ifdef AT_SOCIAL_ENABLED
     ck_assert_int_eq(g_last_peer_observed_in_group, 0);
-#endif
 
     /* Once the peer re-advertises our NEW group uuid, co-membership holds again. */
     char ours2[UUID_STRING_LEN + 1];
     _group_uuid_str(proc, ours2);
     _dispatch_group_update(proc, member, ours2);
     identity_emit_peer_observed(proc, mpub);
-#ifdef AT_SOCIAL_ENABLED
-    ck_assert_int_eq(g_last_peer_observed_in_group, 1);
-#endif
+    ck_assert_int_eq(g_last_peer_observed_in_group, 0);
     smrt_deref(mpub);
 
     /* A peer that never advertised our group stays out. */
     public_identity_t *spub = NULL;
     ck_assert_ret_ok(identity_publish(stranger, &spub));
     identity_emit_peer_observed(proc, spub);
-#ifdef AT_SOCIAL_ENABLED
     ck_assert_int_eq(g_last_peer_observed_in_group, 0);
-#endif
     smrt_deref(spub);
     _end();
 }

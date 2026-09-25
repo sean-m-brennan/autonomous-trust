@@ -133,44 +133,6 @@ _TRIGGER_FC_RESTART = 'trigger_first_contact_restart'
 # the same string. See first-contact-initiate-reaches-the-hint.
 _TRIGGER_FC_INITIATE = 'trigger_first_contact_initiate'
 
-# Pseudo-function: locally block the peer named in the step payload
-# (`{"peer": <pid>}`). Block is an APP verb (AT_APP_BLOCK), not a wire message,
-# so there is no inbound to dispatch -- the step drives the production
-# block_peer() call, which records the peer so get_peer_tier clamps it to 0.
-# Purely local (no emit, no reputation tx). The C adapter recognizes the same
-# string and calls identity_block_peer. See block-local-clamp.
-_TRIGGER_BLOCK = 'trigger_block'
-_TRIGGER_UNBLOCK = 'trigger_unblock'
-_TRIGGER_SOCIAL_RELOAD = 'trigger_social_reload'
-# Pseudo-function: the step's `to` participant REPORTS the peer named in the
-# payload (`{"peer": <pid>}`, Phase 4 P4.1), end to end. Report is an app verb,
-# so the step drives the production report_peer(); the emitted peer_report
-# (whose seq the reporter's own freshness counter chose, so no YAML step could
-# name it) is then delivered to the reported participant's real handler, which
-# stages its half. Mirrors the C adapter's trigger_report. See
-# report-pairs-bilaterally.
-_TRIGGER_REPORT = 'trigger_report'
-
-# Pseudo-function: drive one private-proximity probe (Phase 2) from the step's
-# `to` participant (the INITIATOR) against the peer named in the payload
-# (`{"target": <pid>}`), end to end — the local trigger emits an encrypted
-# probe, the target computes its distance BAND and replies, the initiator
-# computes the same band from the reply. A pseudo-step rather than two wire
-# steps because the probe/reply payloads are handler-COMPUTED keyed tags: the
-# salt and the tag set do not exist until the real handler runs, so no YAML
-# step could name them (contrast position, whose bucket is a fixture). The C
-# adapter recognizes the same string and drives identity_request_proximity +
-# the two directed handlers. See proximity-band-near / proximity-absent-is-normal.
-_TRIGGER_PROXIMITY_PROBE = 'trigger_proximity_probe'
-
-# Pseudo-function: the business named in the step's payload publishes its own
-# page (Phase 3 P3.2). Advertising is an APP verb, not a wire message, so there
-# is nothing to dispatch — the step drives the production advertise_business()
-# and the resulting peer_business_ad emission is what travels. The C adapter
-# recognizes the same string and calls identity_advertise_business.
-# See business-ad-shared / business-ad-customer-relays.
-_TRIGGER_ADVERTISE_BUSINESS = 'trigger_advertise_business'
-
 
 @dataclass
 class _Participant:
@@ -225,6 +187,9 @@ class _Participant:
     # first_contact_hello_endpoint check, which pins that `initiate` prefers
     # the invitation's rendezvous hint over the inviter's advertised address.
     fc_hello_endpoint: str = ''
+    # A feature adapter's expected_state keys (IdentityAdapter.STATE_CHECKS):
+    # key -> fn(participant, key, expected). Set by the adapter at setup.
+    state_checks: dict = field(default_factory=dict)
 
     def _uuid_for_pid(self, pid: str) -> str:
         """Resolve a scenario participant id to its uuid string.
@@ -254,6 +219,10 @@ class _Participant:
     def _check_expected_state(self, asserts: dict[str, Any]) -> None:
         """Implements the engine's optional per-participant state check."""
         for key, expected in asserts.items():
+            check = self.state_checks.get(key)
+            if check is not None:   # a feature's key (IdentityAdapter.STATE_CHECKS)
+                check(self, key, expected)
+                continue
             if key == 'phase':
                 actual = self.process.phase
                 if actual != expected:
@@ -447,332 +416,6 @@ class _Participant:
                             raise AssertionError(
                                 f'{self.id}: descriptor[{cap_name!r}][{fk!r}]='
                                 f'{stored.get(fk)!r}, expected {fv!r}')
-            elif key == 'peer_position':
-                # {peer_id: geohash} -- the coarse position this participant
-                # recorded for another peer, via get_peer_position. '' means
-                # "none recorded" (the peer opted out, or the response was
-                # dropped/refused) -- the ordinary default. C mirrors via
-                # identity_get_peer_position keyed by the same uuid.
-                for peer_id, want in expected.items():
-                    peer_uuid = self._uuid_for_pid(peer_id)
-                    actual = self.process.get_peer_position(peer_uuid)
-                    if actual != want:
-                        raise AssertionError(
-                            f'{self.id}: peer_position[{peer_id!r}]={actual!r}, '
-                            f'expected {want!r}')
-            elif key == 'peer_profile':
-                # {peer_id: {profile fields}} (Increment 3) -- the profile this
-                # participant recorded for another, via get_peer_profile (a dict),
-                # compared structurally. {} means none recorded (opted out, or
-                # dropped on bad signature / over-bound field / replay). C mirrors
-                # via identity_get_peer_profile keyed by the same uuid.
-                for peer_id, want in expected.items():
-                    peer_uuid = self._uuid_for_pid(peer_id)
-                    actual = self.process.get_peer_profile(peer_uuid)
-                    want_obj = want if isinstance(want, dict) else {}
-                    if actual != want_obj:
-                        raise AssertionError(
-                            f'{self.id}: peer_profile[{peer_id!r}]={actual!r}, '
-                            f'expected {want_obj!r}')
-            elif key == 'peer_proximity':
-                # {peer_id: <int band>} (Phase 2) -- the coarse distance BAND
-                # this participant last learned toward another CONNECTED peer,
-                # via get_peer_proximity: unknown=0, near=1, mid=2, far=3. 0 is
-                # the ordinary default (never probed, opted out, or the probe
-                # was refused). No coordinates cross; the corpus pins the band
-                # the keyed-tag intersection yields. C mirrors this via the band
-                # recorded by identity_emit_peer_proximity, keyed by the same
-                # uuid.
-                for peer_id, want in expected.items():
-                    peer_uuid = self._uuid_for_pid(peer_id)
-                    actual = self.process.get_peer_proximity(peer_uuid)
-                    if int(actual) != int(want):
-                        raise AssertionError(
-                            f'{self.id}: peer_proximity[{peer_id!r}]={int(actual)}, '
-                            f'expected {int(want)}')
-            elif key == 'business_page':
-                # {polity_did: {seq, endorsers}} (Phase 3 P3.2) -- what this
-                # participant LEARNED about a business, via get_business_page.
-                # `seq` is the page version it holds; `endorsers` the number of
-                # CUSTOMERS that have vouched for it (a business's own ad is not
-                # an endorsement, so a page nobody patronizes has 0). {} means no
-                # page held at all -- which, for a non-customer that never
-                # received an ad, is the correct silent outcome. C mirrors via
-                # identity_get_business_page keyed by the same did.
-                for did, want in expected.items():
-                    actual = self.process.get_business_page(did)
-                    if not isinstance(want, dict) or not want:
-                        if actual:
-                            raise AssertionError(
-                                f'{self.id}: business_page[{did!r}]={actual!r}, '
-                                f'expected none')
-                        continue
-                    if not actual:
-                        raise AssertionError(
-                            f'{self.id}: business_page[{did!r}] missing, '
-                            f'expected {want!r}')
-                    if 'seq' in want and int(actual.get('seq', -1)) != int(want['seq']):
-                        raise AssertionError(
-                            f'{self.id}: business_page[{did!r}].seq='
-                            f'{actual.get("seq")}, expected {want["seq"]}')
-                    if 'endorsers' in want:
-                        got_n = len(actual.get('endorsers', {}))
-                        if got_n != int(want['endorsers']):
-                            raise AssertionError(
-                                f'{self.id}: business_page[{did!r}].endorsers='
-                                f'{got_n}, expected {want["endorsers"]}')
-                    if 'bundle' in want and actual.get('bundle') != want['bundle']:
-                        raise AssertionError(
-                            f'{self.id}: business_page[{did!r}].bundle='
-                            f'{actual.get("bundle")!r}, expected '
-                            f'{want["bundle"]!r}')
-            elif key == 'customer_satisfaction':
-                # {polity_did: <int>} (Phase 3 P3.2) -- this participant's OWN
-                # customer edge, via get_customer_satisfaction: 0..4, or -1 when
-                # it holds none and therefore CARRIES NOTHING for that business.
-                # C mirrors via identity_get_customer_satisfaction.
-                for did, want in expected.items():
-                    actual = self.process.get_customer_satisfaction(did)
-                    if int(actual) != int(want):
-                        raise AssertionError(
-                            f'{self.id}: customer_satisfaction[{did!r}]='
-                            f'{int(actual)}, expected {int(want)}')
-            elif key == 'business_ads_emitted':
-                # peer_business_ad emissions by this participant (Phase 3 P3.2).
-                # THE GATE ASSERTION: a CUSTOMER that receives an ad re-advertises
-                # (>=1), a non-customer stays SILENT (0). This is what makes the
-                # page travel only through people who actually patronize the
-                # business. C mirrors by counting the same emission.
-                actual = self.emit_tally.get(IdentityProtocol.business_ad, 0)
-                if actual != int(expected):
-                    raise AssertionError(
-                        f'{self.id}: business_ads_emitted={actual}, '
-                        f'expected {int(expected)}')
-            elif key == 'business_post_last':
-                # {polity_did: {seq, hops, bundle}} (Phase 3 P3.4) -- the most
-                # recent business post this participant ACCEPTED for that
-                # polity, via get_last_business_post. Filled only AFTER the
-                # signature check, THE PAGE GATE and dedup, so an expected {}
-                # is the assertion that one of those three refused it. Keyed by
-                # the POLITY, never the sender: the post is the business's and
-                # the carrier is incidental. C mirrors via
-                # identity_get_last_business_post keyed by the same did.
-                for did, want in expected.items():
-                    actual = self.process.get_last_business_post(did)
-                    if not want:
-                        if actual:
-                            raise AssertionError(
-                                f'{self.id}: business_post_last[{did!r}]='
-                                f'{actual!r}, expected none')
-                        continue
-                    if not actual:
-                        raise AssertionError(
-                            f'{self.id}: business_post_last[{did!r}] missing, '
-                            f'expected {want!r}')
-                    if 'seq' in want and int(actual.get('seq', -1)) != int(want['seq']):
-                        raise AssertionError(
-                            f'{self.id}: business_post_last[{did!r}].seq='
-                            f'{actual.get("seq")}, expected {want["seq"]}')
-                    if 'hops' in want and int(actual.get('hops', -1)) != int(want['hops']):
-                        raise AssertionError(
-                            f'{self.id}: business_post_last[{did!r}].hops='
-                            f'{actual.get("hops")}, expected {want["hops"]}')
-                    if 'bundle' in want and actual.get('bundle') != want['bundle']:
-                        raise AssertionError(
-                            f'{self.id}: business_post_last[{did!r}].bundle='
-                            f'{actual.get("bundle")!r}, expected '
-                            f'{want["bundle"]!r}')
-            elif key == 'business_posts_emitted':
-                # peer_business_post emissions by this participant (Phase 3
-                # P3.4). THE RELAY ASSERTION, twin of business_ads_emitted: a
-                # node that HOLDS THE PAGE relays once (1), a node that does not
-                # stays silent (0) -- the audience gate made observable rather
-                # than argued for. C mirrors by counting the same emission.
-                actual = self.emit_tally.get(IdentityProtocol.business_post, 0)
-                if actual != int(expected):
-                    raise AssertionError(
-                        f'{self.id}: business_posts_emitted={actual}, '
-                        f'expected {int(expected)}')
-            elif key == 'connection_state':
-                # {peer_id: <int>} (Increment 5) -- the connection edge state
-                # this participant holds toward another, via
-                # get_connection_state: none=0, pending_out=1, pending_in=2,
-                # connected=3, declined=4. C mirrors via
-                # identity_get_connection_state keyed by the same uuid.
-                for peer_id, want in expected.items():
-                    peer_uuid = self._uuid_for_pid(peer_id)
-                    actual = self.process.get_connection_state(peer_uuid)
-                    if actual != want:
-                        raise AssertionError(
-                            f'{self.id}: connection_state[{peer_id!r}]={actual!r}, '
-                            f'expected {want!r}')
-            elif key == 'dm_last':
-                # {peer_id: {seq, text} | {absent: true}} (Increment 6) -- the
-                # most-recent DM this participant received from another, via
-                # get_last_dm. `absent: true` asserts that NO DM is held, which
-                # a DM dropped at the block gate produces (Phase 4 P4.1); an
-                # unexpectedly absent DM still fails. C mirrors this via
-                # identity_get_last_dm keyed by the same uuid.
-                for peer_id, want in expected.items():
-                    peer_uuid = self._uuid_for_pid(peer_id)
-                    actual = self.process.get_last_dm(peer_uuid)
-                    want_obj0 = want if isinstance(want, dict) else {}
-                    if want_obj0.get('absent'):
-                        if actual:
-                            raise AssertionError(
-                                f'{self.id}: dm_last[{peer_id!r}] present '
-                                f'(text={actual.get("text")!r}), expected ABSENT')
-                        continue
-                    if not actual:
-                        raise AssertionError(
-                            f'{self.id}: dm_last[{peer_id!r}] absent, expected a DM')
-                    want_obj = want if isinstance(want, dict) else {}
-                    for fk, fv in want_obj.items():
-                        if actual.get(fk) != fv:
-                            raise AssertionError(
-                                f'{self.id}: dm_last[{peer_id!r}].{fk}='
-                                f'{actual.get(fk)!r}, expected {fv!r}')
-            elif key == 'post_last':
-                # {author_id: {seq, tier, body} | {absent: true}} (Increment 7) --
-                # the most-recent feed post this participant accepted from another
-                # AUTHOR, via get_last_post. A post that never arrived, was dropped
-                # by the signature/tier-gate, or was deduped away is ABSENT;
-                # `absent: true` asserts that. C mirrors this via
-                # identity_get_last_post keyed by the same author uuid.
-                for author_id, want in expected.items():
-                    author_uuid = self._uuid_for_pid(author_id)
-                    actual = self.process.get_last_post(author_uuid)
-                    want_obj = want if isinstance(want, dict) else {}
-                    if want_obj.get('absent'):
-                        if actual:
-                            raise AssertionError(
-                                f'{self.id}: post_last[{author_id!r}] present '
-                                f'(body={actual.get("body")!r}), expected ABSENT')
-                        continue
-                    if not actual:
-                        raise AssertionError(
-                            f'{self.id}: post_last[{author_id!r}] absent, '
-                            f'expected a post')
-                    for fk, fv in want_obj.items():
-                        if actual.get(fk) != fv:
-                            raise AssertionError(
-                                f'{self.id}: post_last[{author_id!r}].{fk}='
-                                f'{actual.get(fk)!r}, expected {fv!r}')
-            elif key == 'cosign_request_last':
-                # {requester_id: {record, op, cid, bytes, seq} | {absent: true}}
-                # (Phase 3 P3.3) -- the most-recent co-signing ask this
-                # participant received from another, via
-                # get_last_cosign_request. An ask refused by the shape gate
-                # (unknown act, a payload no exporter produced) or by the replay
-                # gate is ABSENT; `absent: true` asserts that, and it is what
-                # makes the refusal scenarios load-bearing rather than merely
-                # non-crashing. C mirrors via identity_get_last_cosign_request
-                # keyed by the same uuid.
-                for peer_id, want in expected.items():
-                    peer_uuid = self._uuid_for_pid(peer_id)
-                    actual = self.process.get_last_cosign_request(peer_uuid)
-                    want_obj = want if isinstance(want, dict) else {}
-                    if want_obj.get('absent'):
-                        if actual:
-                            raise AssertionError(
-                                f'{self.id}: cosign_request_last[{peer_id!r}] '
-                                f'present ({actual.get("record")}/'
-                                f'{actual.get("op")}), expected ABSENT')
-                        continue
-                    if not actual:
-                        raise AssertionError(
-                            f'{self.id}: cosign_request_last[{peer_id!r}] '
-                            f'absent, expected an ask')
-                    for fk, fv in want_obj.items():
-                        if actual.get(fk) != fv:
-                            raise AssertionError(
-                                f'{self.id}: cosign_request_last[{peer_id!r}]'
-                                f'.{fk}={actual.get(fk)!r}, expected {fv!r}')
-            elif key == 'cosign_sig_last':
-                # {signer_id: {cid, signer, sig, seq} | {absent: true}} (Phase 3
-                # P3.3) -- the most-recent co-signature this participant received
-                # back, via get_last_cosign_sig. The runtime does NOT verify it
-                # (it does not hold the payload the signature is over), so what is
-                # pinned here is carriage and the replay gate, not validity. C
-                # mirrors via identity_get_last_cosign_sig.
-                for peer_id, want in expected.items():
-                    peer_uuid = self._uuid_for_pid(peer_id)
-                    actual = self.process.get_last_cosign_sig(peer_uuid)
-                    want_obj = want if isinstance(want, dict) else {}
-                    if want_obj.get('absent'):
-                        if actual:
-                            raise AssertionError(
-                                f'{self.id}: cosign_sig_last[{peer_id!r}] present '
-                                f'(cid={actual.get("cid")!r}), expected ABSENT')
-                        continue
-                    if not actual:
-                        raise AssertionError(
-                            f'{self.id}: cosign_sig_last[{peer_id!r}] absent, '
-                            f'expected a signature')
-                    for fk, fv in want_obj.items():
-                        if actual.get(fk) != fv:
-                            raise AssertionError(
-                                f'{self.id}: cosign_sig_last[{peer_id!r}].{fk}='
-                                f'{actual.get(fk)!r}, expected {fv!r}')
-            elif key == 'social_tx_last':
-                # {subject_id: {score} | {absent: true}} (Increment 8) -- the last
-                # interaction reputation score this participant STAGED about another
-                # peer, via get_last_social_tx. A one-way interaction (bilateral gate
-                # unmet) or a capped one stages NOTHING -> ABSENT; `absent: true`
-                # asserts that. The score is the deterministic accrual observable,
-                # independent of the Paxos round. C mirrors this via
-                # identity_get_last_social_tx keyed by the same subject uuid. The
-                # `task` id is also comparable (both runtimes derive it identically),
-                # but the score alone pins the gating/diminishing behavior the
-                # scenarios exercise.
-                for subject_id, want in expected.items():
-                    subject_uuid = self._uuid_for_pid(subject_id)
-                    actual = self.process.get_last_social_tx(subject_uuid)
-                    want_obj = want if isinstance(want, dict) else {}
-                    if want_obj.get('absent'):
-                        if actual:
-                            raise AssertionError(
-                                f'{self.id}: social_tx_last[{subject_id!r}] present '
-                                f'(score={actual.get("score")}), expected ABSENT')
-                        continue
-                    if not actual:
-                        raise AssertionError(
-                            f'{self.id}: social_tx_last[{subject_id!r}] absent, '
-                            f'expected a staged score')
-                    for fk, fv in want_obj.items():
-                        av = actual.get(fk)
-                        if fk == 'same_task_as':
-                            # {participant, subject} (Phase 4 P4.1): the task we
-                            # staged must be THE SAME task that participant
-                            # staged about that subject -- the two halves of one
-                            # bilateral transaction. The seq in the task is
-                            # chosen at run time, so equality is the only pin.
-                            other = self.peers_by_pid.get(str(fv.get('participant')))
-                            if other is None:
-                                raise AssertionError(
-                                    f'{self.id}: same_task_as names unknown '
-                                    f'participant {fv.get("participant")!r}')
-                            theirs = other.process.get_last_social_tx(
-                                other._uuid_for_pid(str(fv.get('subject'))))
-                            if not theirs or theirs.get('task') != actual.get('task'):
-                                raise AssertionError(
-                                    f'{self.id}: social_tx_last[{subject_id!r}].task='
-                                    f'{actual.get("task")!r}, but '
-                                    f'{fv.get("participant")} staged '
-                                    f'{theirs.get("task") if theirs else None!r} '
-                                    f'about {fv.get("subject")} -- the halves '
-                                    f'would not pair')
-                            continue
-                        if fk == 'score' and isinstance(av, (int, float)) \
-                                and isinstance(fv, (int, float)):
-                            if abs(float(av) - float(fv)) > 1e-6:
-                                raise AssertionError(
-                                    f'{self.id}: social_tx_last[{subject_id!r}].score='
-                                    f'{av}, expected {fv}')
-                        elif av != fv:
-                            raise AssertionError(
-                                f'{self.id}: social_tx_last[{subject_id!r}].{fk}='
-                                f'{av!r}, expected {fv!r}')
             elif key == 'partition_probes_emitted':
                 # Number of group_partition_probe messages this participant
                 # emitted over the whole scenario. The signal-cooldown
@@ -823,56 +466,6 @@ class _Participant:
                 if actual != expected:
                     raise AssertionError(
                         f'{self.id}: caps_query_emitted={actual}, '
-                        f'expected {expected}'
-                    )
-            elif key == 'position_responses_emitted':
-                # Number of peer_position_response messages this participant
-                # emitted (Increment 2). The observable for the opt-in guard:
-                # an opted-OUT node emits 0 (position-absent-is-normal), an
-                # opted-IN one emits 1 per query answered. This is what makes
-                # the opt-out case non-vacuous — dropping the guard would emit a
-                # response even with no own position. C mirrors by scanning
-                # captured[] for (from==self, peer_position_response).
-                actual = self.emit_tally.get(IdentityProtocol.position_response, 0)
-                if actual != expected:
-                    raise AssertionError(
-                        f'{self.id}: position_responses_emitted={actual}, '
-                        f'expected {expected}'
-                    )
-            elif key == 'profile_responses_emitted':
-                # peer_profile_response emissions by this participant (Increment
-                # 3) -- same opt-in-guard observable as position: 0 when opted
-                # out, 1 per answered query when opted in. C mirrors by scanning
-                # captured[] for (from==self, peer_profile_response).
-                actual = self.emit_tally.get(IdentityProtocol.profile_response, 0)
-                if actual != expected:
-                    raise AssertionError(
-                        f'{self.id}: profile_responses_emitted={actual}, '
-                        f'expected {expected}'
-                    )
-            elif key == 'proximity_probes_emitted':
-                # peer_proximity_probe emissions by this participant (Phase 2).
-                # The initiator's opt-in guard observable: an opted-OUT initiator
-                # emits 0 (proximity-absent-is-normal), an opted-IN one emits 1
-                # per trigger. This is what makes the opt-out case non-vacuous —
-                # dropping the guard would emit a probe with no own position. C
-                # mirrors by scanning captured[] for (from==self, proximity_probe).
-                actual = self.emit_tally.get(IdentityProtocol.proximity_probe, 0)
-                if actual != expected:
-                    raise AssertionError(
-                        f'{self.id}: proximity_probes_emitted={actual}, '
-                        f'expected {expected}'
-                    )
-            elif key == 'proximity_replies_emitted':
-                # peer_proximity_reply emissions by this participant (Phase 2) --
-                # the RESPONDER's opt-in observable: a probed node that opted out
-                # emits 0 (it surfaces UNKNOWN and sends nothing back), an opted-in
-                # one emits 1 per probe answered. C mirrors by scanning captured[]
-                # for (from==self, proximity_reply).
-                actual = self.emit_tally.get(IdentityProtocol.proximity_reply, 0)
-                if actual != expected:
-                    raise AssertionError(
-                        f'{self.id}: proximity_replies_emitted={actual}, '
                         f'expected {expected}'
                     )
             elif key == 'propose_emitted':
@@ -1344,6 +937,19 @@ class _CapturingQueue:
 class IdentityAdapter:
     """Phase C scenario adapter for the identity protocol."""
 
+    # Extension points for a feature adapter that rides the identity process
+    # (FEATURE_SPLIT_PLAN Phase 5; loaded as a conformance plug-in, as Agora's
+    # social_adapter.py is). FIXTURE_HOOKS run per
+    # participant as fn(adapter, participant, pid, fixtures, identities);
+    # TRIGGERS map a pseudo-function to fn(adapter, participant, inbound) ->
+    # captured; INBOUND_BUILDERS map a function to fn(adapter, participants,
+    # sender, sender_identity, *, from_id, to_id, function, payload) -> obj;
+    # STATE_CHECKS map an expected_state key to fn(participant, key, expected).
+    FIXTURE_HOOKS: tuple = ()
+    TRIGGERS: dict = {}
+    INBOUND_BUILDERS: dict = {}
+    STATE_CHECKS: dict = {}
+
     def __init__(self, corpus_root: Path) -> None:
         self.corpus_root = corpus_root
         # Each scenario gets its own scratch dir for any on-disk side effects
@@ -1678,65 +1284,11 @@ class IdentityAdapter:
             for cap_name in cap_fix.get(pid, []):
                 participant.process.protocol.capabilities.register_ability(
                     cap_name, None, [], {})
-            # Install own coarse position from fixtures.positions (Increment 2,
-            # the "with-distance" feature); mirrors the C adapter's
-            # `identity_set_own_geohash` seam. An opted-in participant's
-            # handle_position_query answers with this geohash; absent or empty,
-            # the participant is opted OUT (the default) and answers nothing.
-            pos_fix: dict[str, str] = fixtures.get('positions', {}) or {}
-            if pid in pos_fix:
-                participant.process.own_geohash = str(pos_fix[pid] or '')
-            # Install own agora.profile from fixtures.profiles (Increment 3);
-            # mirrors the C adapter's `identity_set_own_profile` seam. An opted-in
-            # participant's handle_profile_query answers with this (sanitized,
-            # signed) profile; absent/empty, it is opted OUT (the default).
-            prof_fix: dict[str, dict] = fixtures.get('profiles', {}) or {}
-            if pid in prof_fix:
-                from autonomous_trust.core.capabilities import sanitize_profile
-                raw = prof_fix[pid] if isinstance(prof_fix[pid], dict) else {}
-                participant.process.own_profile = sanitize_profile(raw)
-            # Install own opt-in EXACT position from fixtures.exact_positions
-            # (Phase 2, private proximity), as {pid: [lat, lon]}; mirrors the C
-            # adapter's `identity_set_exact_position` seam. LOCAL-ONLY — it never
-            # advertises, and feeds only the pairwise distance-band probe. Absent
-            # (the default) leaves own_exact None: opted OUT, no probe, no band.
-            exact_fix: dict[str, Any] = fixtures.get('exact_positions', {}) or {}
-            if pid in exact_fix:
-                coord = exact_fix[pid]
-                if (isinstance(coord, (list, tuple)) and len(coord) == 2):
-                    participant.process.own_exact = (float(coord[0]),
-                                                     float(coord[1]))
-            # Pre-seed CONNECTED edges from fixtures.connections, as
-            # {pid: [other_pid, ...]}: sets connection_edges[other]=CONNECTED
-            # directly, standing in for a completed request/accept exchange so a
-            # scenario that only exercises a DOWNSTREAM feature (proximity, which
-            # is connected-peers-only) need not re-run the connection handshake.
-            # Mirrors the C adapter's identity_set_connection_state seam.
-            conn_fix: dict[str, list] = fixtures.get('connections', {}) or {}
-            if pid in conn_fix:
-                from autonomous_trust.core.capabilities import CONN_CONNECTED
-                for other_pid in conn_fix[pid]:
-                    if other_pid not in identities:
-                        raise AssertionError(
-                            f'fixtures.connections names unknown participant '
-                            f'{other_pid!r}')
-                    other_uuid = str(identities[other_pid].uuid)
-                    participant.process.connection_edges[other_uuid] = CONN_CONNECTED
-            # Install CUSTOMER edges from fixtures.customers (Phase 3 P3.2), as
-            # {pid: {polity_did: {'sat': int, 'bundle': str, 'seq': int}}}. The
-            # customer edge is the RELAY GATE: only a node holding one carries a
-            # business's page, so this fixture is what separates a relaying
-            # customer from a silent bystander in the scenarios. Mirrors the C
-            # adapter's identity_set_customer seam. Absent (the default) leaves
-            # the node with no edges — it will hold pages but never re-advertise.
-            cust_fix: dict[str, dict] = fixtures.get('customers', {}) or {}
-            if pid in cust_fix:
-                for did, spec in (cust_fix[pid] or {}).items():
-                    spec = spec if isinstance(spec, dict) else {}
-                    participant.process.set_customer(
-                        did, int(spec.get('sat', 0)),
-                        bundle=str(spec.get('bundle', '')),
-                        seq=int(spec.get('seq', 0)))
+            # Features' own fixtures (the social adapter's positions,
+            # profiles, connections, customers, ...): FIXTURE_HOOKS.
+            participant.state_checks = self.STATE_CHECKS
+            for hook in self.FIXTURE_HOOKS:
+                hook(self, participant, pid, fixtures, identities)
             # Inject N synthetic cap-less peers (fixtures.capless_peers[pid])
             # directly into this participant's roster: present in self.peers but
             # absent from peer_capabilities -- exactly the state the periodic
@@ -2123,137 +1675,18 @@ class IdentityAdapter:
         if sample is not None:
             puller.attest_clock_samples[target.id] = sample
 
-    def _run_proximity_probe(self, initiator: _Participant,
-                             target: _Participant) -> None:
-        """One private-proximity probe (Phase 2), end to end, inside the harness.
-
-        The band is not a value a step can supply: each side derives keyed grid
-        tags from its own opt-in exact position and the pairwise box secret, and
-        the two only learn a band by INTERSECTING tag sets. So the harness drives
-        the real chain of three handlers rather than pre-baking a payload:
-
-          1. a local proximity_trigger on the initiator -> emits an encrypted
-             probe ({salt, tags}) addressed to the target;
-          2. the target's handle_proximity_probe records its band and, if it too
-             opted in, replies with its own tags under the same salt;
-          3. the initiator's handle_proximity_reply records the same band.
-
-        Either side opting out short-circuits: an opted-out initiator emits no
-        probe (nothing to compare), an opted-out target records UNKNOWN and sends
-        no reply. The emit tallies (proximity_probes/replies_emitted) and the
-        recorded bands (peer_proximity) are what the scenario asserts. C reaches
-        the identical outcome through identity_request_proximity + its two
-        directed handlers.
-        """
-        # Local IPC trigger on the initiator, naming the target by uuid exactly
-        # as the app's AT_APP_REQUEST_PROXIMITY would.
-        trig = Message(CfgIds.identity, IdentityProtocol.proximity_trigger,
-                       to_json_string({'target': str(target.identity.uuid)}),
-                       from_whom=initiator.identity)
-        initiator.process.protocol.run_message_handlers(initiator.queues, trig)
-        probes = [c for c in initiator.drain_outbox()
-                  if c.function == IdentityProtocol.proximity_probe]
-        if not probes:
-            return  # initiator opted out: no probe, no band on either side
-        # Deliver the encrypted probe to the target: it computes and records its
-        # band, and replies with its own tags if it opted in too.
-        target.process.protocol.run_message_handlers(target.queues,
-                                                      probes[0].raw)
-        replies = [c for c in target.drain_outbox()
-                   if c.function == IdentityProtocol.proximity_reply]
-        if not replies:
-            return  # target opted out: it surfaced UNKNOWN and sent nothing back
-        # Deliver the reply to the initiator: it recomputes under the echoed salt
-        # and records the same band.
-        initiator.process.protocol.run_message_handlers(initiator.queues,
-                                                        replies[0].raw)
-        initiator.drain_outbox()
-
     def _dispatch(self, participant: _Participant, inbound: Any) -> list[CapturedMessage]:
         if not isinstance(inbound, Message):
             raise AssertionError(f'expected a Message, got {type(inbound).__name__}')
+        trigger = self.TRIGGERS.get(inbound.function)
+        if trigger is not None:   # a feature's pseudo-function
+            return trigger(self, participant, inbound)
         if inbound.function == _TRIGGER_CAPS_RESYNC:
             # Pseudo-function: invoke the periodic caps-resync sweep directly
             # (it is timer-gated in production, so there is no wire message to
             # dispatch). The emitted caps_query messages are captured in
             # emit_tally; caps_query_emitted asserts the per-sweep cap.
             participant.process._periodic_caps_resync(participant.queues)
-            return participant.drain_outbox()
-        if inbound.function == _TRIGGER_SOCIAL_RELOAD:
-            # Pseudo-function: save the block set and load it back -- the round
-            # trip a restart performs, without needing one. A conformance step
-            # cannot restart a process, and asserting on the in-memory dict
-            # alone would pass with no file written at all. Mirrors the C
-            # adapter's trigger_social_reload -> identity_reload_social_blocks.
-            # A WRITABLE dir, explicitly. The harness's default config root
-            # may not be writable (C's is /etc/at), and a reload that could not
-            # write would be a no-op that PASSED — proving nothing while
-            # looking green. Same temp dir shape as the C adapter.
-            import tempfile
-            reload_dir = tempfile.mkdtemp(prefix='at-conf-social-')
-            participant.process.reload_social_blocks(reload_dir)
-            return participant.drain_outbox()
-        if inbound.function == _TRIGGER_REPORT:
-            # `participant` is the REPORTER. Run the production report_peer(),
-            # then hand every peer_report it emitted to the reported
-            # participant's real handler. A refused report emits nothing, so
-            # nothing is delivered -- which is what the cap scenario relies on.
-            spec = from_json_string(inbound.obj) if inbound.obj else {}
-            target_pid = str(spec.get('peer', ''))
-            target = participant.peers_by_pid.get(target_pid)
-            if target is None:
-                raise AssertionError(f'trigger_report: unknown peer {target_pid!r}')
-            participant.process.report_peer(participant.queues,
-                                            str(target.identity.uuid))
-            rest = []
-            for c in participant.drain_outbox():
-                if c.function == IdentityProtocol.report:
-                    target.process.protocol.run_message_handlers(target.queues,
-                                                                 c.raw)
-                    target.drain_outbox()
-                else:
-                    rest.append(c)
-            return rest
-        if inbound.function == _TRIGGER_UNBLOCK:
-            # Pseudo-function: lift the block on the peer the step names.
-            # Unblock is an app verb, not a wire message, so there is nothing to
-            # dispatch -- run the production unblock_peer() call. Mirrors the C
-            # adapter's trigger_unblock -> identity_unblock_peer.
-            spec = from_json_string(inbound.obj) if inbound.obj else {}
-            peer_uuid = participant._uuid_for_pid(str(spec.get('peer', '')))
-            participant.process.unblock_peer(str(peer_uuid))
-            return participant.drain_outbox()
-        if inbound.function == _TRIGGER_BLOCK:
-            # Pseudo-function: locally block the peer the step names. Block is an
-            # app verb, not a wire message, so there is nothing to dispatch -- run
-            # the production block_peer() call; the clamp is observed via
-            # peer_tier. Mirrors the C adapter's trigger_block ->
-            # identity_block_peer.
-            spec = from_json_string(inbound.obj) if inbound.obj else {}
-            peer_uuid = participant._uuid_for_pid(str(spec.get('peer', '')))
-            participant.process.block_peer(str(peer_uuid))
-            return participant.drain_outbox()
-        if inbound.function == _TRIGGER_PROXIMITY_PROBE:
-            # `participant` is the probe TARGET; from_whom is the INITIATOR (the
-            # step's `from`). Run the whole probe/reply round trip through the
-            # real handlers, so the band both sides record is the one the
-            # keyed-tag intersection actually yields — the payloads are computed,
-            # not harness-supplied. Mirrors the trigger_attest_pull shape.
-            initiator = self._roster_by_uuid.get(str(inbound.from_whom.uuid))
-            if initiator is None:
-                raise AssertionError('proximity probe: unknown initiator')
-            self._run_proximity_probe(initiator, participant)
-            return participant.drain_outbox()
-        if inbound.function == _TRIGGER_ADVERTISE_BUSINESS:
-            # Pseudo-function: `participant` is the BUSINESS; the step's payload
-            # names its polity and page. Advertising is an app verb, not a wire
-            # message, so run the production advertise_business() and let the
-            # emitted peer_business_ad be delivered by the engine. Mirrors the C
-            # adapter's trigger_advertise_business.
-            spec = from_json_string(inbound.obj) if inbound.obj else {}
-            participant.process.advertise_business(
-                participant.queues, str(spec.get('polity', '')),
-                str(spec.get('bundle', '')), int(spec.get('seq', 0)))
             return participant.drain_outbox()
         if inbound.function in (_TRIGGER_ATTEST_PULL, _TRIGGER_ATTEST_REPLAY):
             # `participant` is the pull TARGET; from_whom is the puller.
@@ -2398,8 +1831,14 @@ class IdentityAdapter:
         sender_identity = sender.identity
 
         # Translate the high-level YAML payload into the form the protocol
-        # expects on the wire. Each function gets its own constructor.
-        if function == IdentityProtocol.announce:
+        # expects on the wire. Each function gets its own constructor; a
+        # feature's functions are its INBOUND_BUILDERS.
+        builder = self.INBOUND_BUILDERS.get(function)
+        if builder is not None:
+            obj = builder(self, participants, sender, sender_identity,
+                          from_id=from_id, to_id=to_id, function=function,
+                          payload=payload)
+        elif function == IdentityProtocol.announce:
             # DRY request_access contract: identity rides the envelope from_*
             # fields (set via from_whom on the Message below — the canonical
             # cross-runtime sender representation); the payload carries only
@@ -2588,265 +2027,6 @@ class IdentityAdapter:
             if not (isinstance(payload, dict) and payload.get('unstamped')):
                 seq = int(payload.get('seq', 1)) if isinstance(payload, dict) else 1
                 body['seq'] = seq
-            obj = to_json_string(body)
-        elif function == IdentityProtocol.position_query:
-            # handle_position_query reads no payload -- it answers with our own
-            # coarse position IFF opted in (own_geohash set, via
-            # fixtures.positions), else nothing. Empty obj, parseable but unused
-            # (mirrors caps_query). C's builder likewise takes the generic path.
-            obj = ''
-        elif function == IdentityProtocol.position_response:
-            # handle_position_response parses {pos: geohash, seq: N}. `seq` is
-            # the responder's freshness sequence; `unstamped: true` omits it,
-            # modelling a stripped field, which must be refused rather than
-            # stored. Mirrors the C peer_position_response builder.
-            body = {'pos': payload.get('pos', '') if isinstance(payload, dict) else ''}
-            if not (isinstance(payload, dict) and payload.get('unstamped')):
-                body['seq'] = int(payload.get('seq', 1)) if isinstance(payload, dict) else 1
-            obj = to_json_string(body)
-        elif function == IdentityProtocol.profile_query:
-            # handle_profile_query reads no payload -- answers with our own
-            # profile IFF opted in (own_profile set, via fixtures.profiles).
-            obj = ''
-        elif function == IdentityProtocol.profile_response:
-            # handle_profile_response parses {profile, sig, seq}. The signature
-            # is computed over the SENDER's canonical form with the sender's key
-            # -- exactly as handle_profile_query would -- so a Python or C
-            # receiver verifies it. A scenario may override `sig` (bad-signature
-            # drop) or set `unstamped: true` (replay/unstamped refusal). Mirrors
-            # the C peer_profile_response builder.
-            from autonomous_trust.core.capabilities import profile_sign
-            profile = payload.get('profile', {}) if isinstance(payload, dict) else {}
-            if not isinstance(profile, dict):
-                profile = {}
-            if isinstance(payload, dict) and isinstance(payload.get('sig'), str):
-                sig = payload['sig']
-            else:
-                sig = profile_sign(sender.process.identity.signature.private,
-                                   sender.process.identity.uuid, profile)
-            body = {'profile': profile, 'sig': sig}
-            if not (isinstance(payload, dict) and payload.get('unstamped')):
-                body['seq'] = int(payload.get('seq', 1)) if isinstance(payload, dict) else 1
-            obj = to_json_string(body)
-        elif function == IdentityProtocol.connection_request:
-            # handle_connection_request reads no payload -- it sets pending_in
-            # from from_whom. Empty obj, generic path (mirrors the C builder).
-            obj = ''
-        elif function == IdentityProtocol.connection_response:
-            # handle_connection_response parses {decision, sig, seq}. The
-            # signature is over the canonical (requester=recipient,
-            # accepter=sender, decision, seq) with the sender's key -- exactly as
-            # handle_app_connect_respond would -- so a Python or C receiver
-            # verifies it. A scenario may override `sig` (bad-signature drop) or
-            # set `unstamped: true` (replay/unstamped refusal); `accept` (bool)
-            # selects the decision. Mirrors the C peer_connection_response builder.
-            from autonomous_trust.core.capabilities import connection_sign
-            decision = 1 if (isinstance(payload, dict) and payload.get('accept')) else 0
-            recipient = participants[to_id].impl.identity
-            seq = int(payload.get('seq', 1)) if isinstance(payload, dict) else 1
-            if isinstance(payload, dict) and isinstance(payload.get('sig'), str):
-                sig = payload['sig']
-            else:
-                sig = connection_sign(sender.process.identity.signature.private,
-                                      recipient.uuid,
-                                      sender.process.identity.uuid,
-                                      decision, seq)
-            body = {'decision': decision, 'sig': sig}
-            if not (isinstance(payload, dict) and payload.get('unstamped')):
-                body['seq'] = seq
-            obj = to_json_string(body)
-        elif function == IdentityProtocol.dm:
-            # handle_dm parses {text, seq, ts}. A DM carries NO signature
-            # (crypto_box authenticates the sender on the wire; in the harness the
-            # from_whom identity stands in). `unstamped: true` drops the seq,
-            # modelling a stripped field which must be refused. Mirrors the C
-            # peer_dm builder.
-            text = payload.get('text', '') if isinstance(payload, dict) else ''
-            ts = payload.get('ts', 0.0) if isinstance(payload, dict) else 0.0
-            body = {'text': text if isinstance(text, str) else '',
-                    'ts': float(ts) if isinstance(ts, (int, float)) else 0.0}
-            if not (isinstance(payload, dict) and payload.get('unstamped')):
-                body['seq'] = int(payload.get('seq', 1)) \
-                    if isinstance(payload, dict) else 1
-            obj = to_json_string(body)
-        elif function == IdentityProtocol.post:
-            # handle_post parses {author, author_pk, seq, ts, tier, body, sig,
-            # hops}. The post is SIGNED with the SENDER's (author's) key over the
-            # canonical (author, seq, ts, tier, body) form, exactly as
-            # handle_app_publish_post would; author/author_pk name the sender. A
-            # scenario may override `sig` (bad-signature drop) and `author_pk`
-            # (impersonation); `unstamped: true` drops the seq. Mirrors the C
-            # peer_post builder.
-            from autonomous_trust.core.capabilities import post_sign
-            text = payload.get('body') if isinstance(payload, dict) else ''
-            if not isinstance(text, str):
-                text = payload.get('text', '') if isinstance(payload, dict) else ''
-            if not isinstance(text, str):
-                text = ''
-            ts = payload.get('ts', 0.0) if isinstance(payload, dict) else 0.0
-            ts = float(ts) if isinstance(ts, (int, float)) else 0.0
-            tier = payload.get('tier', 0) if isinstance(payload, dict) else 0
-            tier = int(tier) if isinstance(tier, int) else 0
-            hops = payload.get('hops', 0) if isinstance(payload, dict) else 0
-            hops = int(hops) if isinstance(hops, int) else 0
-            seq = int(payload.get('seq', 1)) if isinstance(payload, dict) else 1
-            author_uuid = sender.process.identity.uuid
-            author_str = str(author_uuid)
-            if isinstance(payload, dict) and isinstance(payload.get('author_pk'), str):
-                author_pk = payload['author_pk']
-            else:
-                author_pk = bytes(sender.process.identity.signature.public).hex()
-            if isinstance(payload, dict) and isinstance(payload.get('sig'), str):
-                sig = payload['sig']
-            else:
-                sig = post_sign(sender.process.identity.signature.private,
-                                author_uuid, seq, ts, tier, text)
-            obj = to_json_string({'author': author_str, 'author_pk': author_pk,
-                                  'seq': seq, 'ts': ts, 'tier': tier,
-                                  'body': text, 'sig': sig, 'hops': hops})
-        elif function == IdentityProtocol.business_ad:
-            # handle_business_ad parses {advertiser, advertiser_pk, polity, sat,
-            # seq, ts, bundle, sig}. The ad is SIGNED with the SENDER's key over
-            # the canonical (advertiser, polity, sat, seq, ts, bundle) form,
-            # exactly as _business_advertise would — the sender is always
-            # speaking for ITSELF, since an ad is never relayed. A scenario may
-            # override `sig` (bad-signature drop) and `advertiser_pk`
-            # (impersonation). Mirrors the C peer_business_ad builder.
-            from autonomous_trust.core.capabilities import (business_ad_sign,
-                                                            BUSINESS_SAT_SELF)
-            payload = payload if isinstance(payload, dict) else {}
-            did = payload.get('polity', '')
-            did = did if isinstance(did, str) else ''
-            bundle = payload.get('bundle', '')
-            bundle = bundle if isinstance(bundle, str) else ''
-            sat = payload.get('sat', BUSINESS_SAT_SELF)
-            sat = int(sat) if isinstance(sat, int) else BUSINESS_SAT_SELF
-            seq = payload.get('seq', 0)
-            seq = int(seq) if isinstance(seq, int) else 0
-            ts = payload.get('ts', 0.0)
-            ts = float(ts) if isinstance(ts, (int, float)) else 0.0
-            adv_uuid = sender.process.identity.uuid
-            if isinstance(payload.get('advertiser_pk'), str):
-                adv_pk = payload['advertiser_pk']
-            else:
-                adv_pk = bytes(sender.process.identity.signature.public).hex()
-            if isinstance(payload.get('sig'), str):
-                sig = payload['sig']
-            else:
-                sig = business_ad_sign(sender.process.identity.signature.private,
-                                       adv_uuid, did, sat, seq, ts, bundle)
-            obj = to_json_string({'advertiser': str(adv_uuid),
-                                  'advertiser_pk': adv_pk, 'polity': did,
-                                  'sat': sat, 'seq': seq, 'ts': ts,
-                                  'bundle': bundle, 'sig': sig})
-        elif function == IdentityProtocol.business_post:
-            # handle_business_post parses {author, author_pk, polity, seq, ts,
-            # bundle, sig, hops}. The post is SIGNED with the SENDER's key over
-            # the canonical (author, polity, seq, ts, bundle) form -- which is
-            # what a RELAY does too, since the signature says only who sent this
-            # copy. HOPS IS OUTSIDE THE SIGNATURE, so a scenario can set it to
-            # drive the relay bound without breaking anything. A scenario may
-            # override `sig` (bad-signature drop) and `author_pk`
-            # (impersonation). Mirrors the C peer_business_post builder.
-            from autonomous_trust.core.capabilities import business_post_sign
-            payload = payload if isinstance(payload, dict) else {}
-            did = payload.get('polity', '')
-            did = did if isinstance(did, str) else ''
-            bundle = payload.get('bundle', '')
-            bundle = bundle if isinstance(bundle, str) else ''
-            seq = payload.get('seq', 0)
-            seq = int(seq) if isinstance(seq, int) else 0
-            ts = payload.get('ts', 0.0)
-            ts = float(ts) if isinstance(ts, (int, float)) else 0.0
-            hops = payload.get('hops', 0)
-            hops = int(hops) if isinstance(hops, int) else 0
-            author_uuid = sender.process.identity.uuid
-            if isinstance(payload.get('author_pk'), str):
-                author_pk = payload['author_pk']
-            else:
-                author_pk = bytes(sender.process.identity.signature.public).hex()
-            if isinstance(payload.get('sig'), str):
-                sig = payload['sig']
-            else:
-                sig = business_post_sign(
-                    sender.process.identity.signature.private, author_uuid, did,
-                    seq, ts, bundle)
-            obj = to_json_string({'author': str(author_uuid),
-                                  'author_pk': author_pk, 'polity': did,
-                                  'seq': seq, 'ts': ts, 'bundle': bundle,
-                                  'sig': sig, 'hops': hops})
-        elif function == IdentityProtocol.reaction:
-            # handle_reaction parses {post_id, seq, ts} (Increment 8). A reaction
-            # carries NO signature (crypto_box authenticates the reactor on the
-            # wire; in the harness the from_whom identity stands in). The reactor is
-            # the sender, the post's author is the recipient. `unstamped: true`
-            # drops the seq. Mirrors the C peer_reaction builder.
-            post_id = payload.get('post_id', '') if isinstance(payload, dict) else ''
-            ts = payload.get('ts', 0.0) if isinstance(payload, dict) else 0.0
-            body = {'post_id': post_id if isinstance(post_id, str) else '',
-                    'ts': float(ts) if isinstance(ts, (int, float)) else 0.0}
-            if not (isinstance(payload, dict) and payload.get('unstamped')):
-                body['seq'] = int(payload.get('seq', 1)) \
-                    if isinstance(payload, dict) else 1
-            obj = to_json_string(body)
-        elif function == IdentityProtocol.report:
-            # handle_peer_report parses {seq, ts} (Phase 4 P4.1) and nothing
-            # else. No signature: crypto_box authenticates the reporter (in the
-            # harness the from_whom identity stands in). `unstamped: true` drops
-            # the seq. Mirrors the C peer_report builder.
-            payload = payload if isinstance(payload, dict) else {}
-            ts = payload.get('ts', 0.0)
-            body = {'ts': float(ts) if isinstance(ts, (int, float)) else 0.0}
-            if not payload.get('unstamped'):
-                body['seq'] = int(payload.get('seq', 1))
-            obj = to_json_string(body)
-        elif function == IdentityProtocol.cosign_request:
-            # handle_cosign_request parses {record, op, polity, cid, bytes, seq,
-            # ts} (Phase 3 P3.3). A co-signing ask carries NO signature: it is
-            # directed and encrypted, so crypto_box authenticates the asker (in
-            # the harness the from_whom identity stands in).
-            #
-            # EVERY FIELD IS PASSED THROUGH VERBATIM, deliberately. Building it
-            # with cosign_request_to_json would let the BUILDER refuse a
-            # malformed ask, and then the refusal scenarios would prove nothing
-            # about the handler — which is the side a hostile peer actually
-            # reaches. `unstamped: true` drops the seq. Mirrors the C
-            # peer_cosign_request builder.
-            #
-            # There is no `description` field to build, and that is the point:
-            # the wording of what is being signed is derived on the SIGNER's node
-            # from the bytes. A scenario may smuggle one in to prove it is
-            # ignored.
-            payload = payload if isinstance(payload, dict) else {}
-            body = {}
-            for fk in ('record', 'op', 'polity', 'cid', 'bytes'):
-                fv = payload.get(fk, '')
-                body[fk] = fv if isinstance(fv, str) else ''
-            ts = payload.get('ts', 0.0)
-            body['ts'] = float(ts) if isinstance(ts, (int, float)) else 0.0
-            if isinstance(payload.get('description'), str):
-                body['description'] = payload['description']
-            if not payload.get('unstamped'):
-                body['seq'] = int(payload.get('seq', 1)) \
-                    if isinstance(payload.get('seq', 1), int) else 1
-            obj = to_json_string(body)
-        elif function == IdentityProtocol.cosign_sig:
-            # handle_cosign_sig parses {cid, signer, sig, seq, ts} (Phase 3
-            # P3.3): the signer's half coming back to the node authoring the
-            # exchange. Passed through verbatim for the same reason as the ask.
-            # This runtime does NOT verify the signature and cannot — it does not
-            # hold the payload the signature is over. Mirrors the C
-            # peer_cosign_sig builder.
-            payload = payload if isinstance(payload, dict) else {}
-            body = {}
-            for fk in ('cid', 'signer', 'sig'):
-                fv = payload.get(fk, '')
-                body[fk] = fv if isinstance(fv, str) else ''
-            ts = payload.get('ts', 0.0)
-            body['ts'] = float(ts) if isinstance(ts, (int, float)) else 0.0
-            if not payload.get('unstamped'):
-                body['seq'] = int(payload.get('seq', 1)) \
-                    if isinstance(payload.get('seq', 1), int) else 1
             obj = to_json_string(body)
         elif function == IdentityProtocol.id_query:
             # Identity-resync query (layer 3): {group_uuid, have:[uuids]}.

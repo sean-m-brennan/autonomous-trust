@@ -25,6 +25,7 @@ from ..freshness import Freshness
 from ..identity.protocol import IdentityProtocol
 from ..network import Message
 from ..processes import Process, ProcMeta
+from ..extensions import load_extensions, run_post_fork
 from .protocol import NegotiationProtocol
 from .negotiation import Job, JobQueue, Task, TaskStatus, TaskTracker, TaskCounter, TaskResult, Status
 from ..system import CfgIds, max_concurrency, now, proc_idle_floor
@@ -76,6 +77,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
         # longer authorised for. Local IPC from ReputationProcess; see
         # doc/architecture/trust-tiers.md §7.2.
         self.protocol.register_handler(IdentityProtocol.tier_lost, self.handle_tier_lost)
+        load_extensions(self, self.name)
 
     @property
     def peers(self):
@@ -652,6 +654,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
         return True
 
     def process(self, queues, signal):
+        run_post_fork(self)
         # Drain budget per iter — same shape as repprocess.py. The
         # periodic local-jobs / status-pending sweeps below run after
         # the drain, so they fire roughly every q_cadence-ish (when

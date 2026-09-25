@@ -215,6 +215,15 @@ int network_to_json(const void *data_struct, json_t **obj_ptr)
     json_object_set_new(obj, "mcast4_addr", json_string((char *)net->mcast4_addr));
     json_object_set_new(obj, "mcast6_addr", json_string((char *)net->mcast6_addr));
     json_object_set_new(obj, "mac_addr", json_string((char *)net->mac_address));
+    /* Gateway relay switches: written only when set, for the reason the port
+     * is -- a config states only what was chosen, and a default node's file
+     * stays byte-identical. A missing key reads back false. */
+    if (net->envelope)
+        json_object_set_new(obj, "envelope", json_true());
+    if (net->group_forward)
+        json_object_set_new(obj, "group_forward", json_true());
+    if (net->cross_cluster)
+        json_object_set_new(obj, "cross_cluster", json_true());
     return 0;
 }
 
@@ -228,6 +237,9 @@ int network_from_json(const json_t *obj, void *data_struct)
     AT_JSON_STRING(obj, "mcast4_addr", net->mcast4_addr);
     AT_JSON_STRING(obj, "mcast6_addr", net->mcast6_addr);
     AT_JSON_STRING(obj, "mac_addr",    net->mac_address);
+    net->envelope      = json_is_true(json_object_get(obj, "envelope"));
+    net->group_forward = json_is_true(json_object_get(obj, "group_forward"));
+    net->cross_cluster = json_is_true(json_object_get(obj, "cross_cluster"));
     return 0;
 }
 

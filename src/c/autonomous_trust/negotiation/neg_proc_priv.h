@@ -152,8 +152,11 @@ int negotiation_get_task_flood_count(const uuid_t uuid);
  *  @p kwargs_json -- OUR record, never the peer's account of it -- to give
  *  `certificate` at 0.9 (proved right), 0.1 (proved wrong) or 0.3 (declared to
  *  certify and did not). @p seed is this verifier's challenge for the one
- *  probabilistic checker and must not be derivable from the problem; see
- *  certificates/rng.h.
+ *  probabilistic checker and must not be derivable from the problem
+ *  (::at_cert_verifier_seed draws one).
+ *
+ *  The layers are separate libraries reached through negotiation/neg_oracle.h;
+ *  one that is not linked contributes nothing, exactly as if undeclared.
  *
  *  Exported so tests and the conformance adapter exercise the same function
  *  production does. @p channel_out may be NULL. */
@@ -177,8 +180,8 @@ double negotiation_score_task_result(const char *cap_name,
  *  channel weight in the reputation process.
  *
  *  Confined to the declared band around 1.0, and exactly
- *  ::AT_PREQ_NEUTRAL_COMPETENCE (1.0, the authored weight verbatim) with the
- *  layer off, the capability undeclared, @p subject unknown or NULL, or the
+ *  ::NEG_NEUTRAL_COMPETENCE (1.0, the authored weight verbatim) with the
+ *  layer off or its library absent, the capability undeclared, @p subject unknown or NULL, or the
  *  peer's record shorter than `min_samples`. @p subject is a peer uuid string,
  *  the same key ::negotiation_score_task_result files observations under.
  *
