@@ -1,6 +1,6 @@
 *Previous: [Infrastructure independence](../../../../doc/decentralization_momentum_alt.md)*
 
-# Process Architecture
+# Process architecture
 
 ## Orchestrator
 

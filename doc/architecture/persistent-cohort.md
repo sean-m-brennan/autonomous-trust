@@ -1,6 +1,6 @@
 *Previous: [Cohort clock skew](cohort-clock-skew.md)*
 
-# Persistent Cohort State
+# Persistent cohort state
 
 How the identity of a node, peer table, and reputation survive a restart, and
 how the DoD mission demo pre-seeds the squad / microdrone / jet cohort with
@@ -190,7 +190,7 @@ persistence, swap `emptyDir: {}` for a PVC reference in the volume spec
 (`generate_k8s.py`). The compose path bind-mounts a host directory so it
 survives `docker compose down/up`.
 
-The current scope is the requested behaviour. A node that reboots no longer
+The current scope is the requested behavior. A node that reboots no longer
 starts from scratch, within the lifetime of a pod. PVCs are the upgrade path for
 cluster-wide persistence.
 

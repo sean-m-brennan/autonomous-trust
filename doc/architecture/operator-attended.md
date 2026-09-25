@@ -13,7 +13,7 @@ place responsibility anywhere at all. The tier above AutonomousTrust needs a
 guardian edge for every machine member, meaning a named human answerable for it,
 and that edge has to be fed by something the machines can actually observe.
 
-AutonomousTrust supplies two signals, and keeping them apart is the whole
+AutonomousTrust supplies two signals, and keeping them apart is the whole of the
 design.
 
 | Signal | Question | Lifetime |
@@ -27,8 +27,8 @@ rather than an error. What a guardian edge must never do is read the first as if
 it were the second. One is a fact about the node, the other a fact about the
 minute, and conflating them puts responsibility in the wrong place.
 
-Neither signal is taken on the word of a peer. Both are derived by the receiver
-from verifying the actual credential of the operator against a distinct operator
+Neither signal is taken on the word of a peer. The receiver derives both of them
+by verifying the actual credential of the operator against a distinct operator
 trust anchor. A node that simply asserts it is operator-bound and cannot produce
 a credential chaining to that anchor is recorded as false, and the
 neutralization is pinned by its own conformance scenario.
@@ -36,16 +36,16 @@ neutralization is pinned by its own conformance scenario.
 ## Two structural failures the live half had
 
 The durable signal worked from the start. The live one did not, for two reasons
-that were structural rather than accidental, and neither showed up in unit
-tests.
+that were structural rather than accidental, and neither of them showed up in a
+unit test.
 
 *The stamp was always zero on a real node.* Attendance is derived from a live
 operator session, which the console application builds in its own process. The
 identity process, which assembles every outgoing attestation, runs in a separate
 subprocess and cannot see that object. A setter existed, and on a real
 multiprocess node nothing could ever call it with the real session, so the stamp
-was structurally pinned at zero forever. Worse, a reader could not distinguish
-that from an honest report that nobody was attending.
+sat pinned at zero forever. Worse, a reader could not tell that apart from an
+honest report that nobody was attending.
 
 *Nothing ever refreshed the stamp of a peer.* An attestation crossed to a peer
 exactly once, inside the admission payload, and after admission it was never
@@ -61,18 +61,19 @@ pattern in the local-only messages that never reach the wire.
 ## Five decisions
 
 Firstly, *consumer-pull rather than keepalive*. Freshness is established when
-somebody asks, not by re-announcing on a cadence. A periodic re-announce was
-considered and rejected, because it puts constant attestation traffic on an idle
-network to answer a question nobody asked, and it still serves a stamp that is
-up to one interval stale. Pull inverts that. An idle network carries no
-attestation traffic at all, and staleness is bounded by a round trip taken at
-the moment of asking.
+somebody asks rather than by re-announcing on a cadence. We considered a
+periodic re-announce and rejected it, because it puts constant attestation
+traffic on an idle network to answer a question nobody asked, and it still
+serves a stamp that is up to one interval stale. Pull inverts that. An idle
+network carries no attestation traffic at all, and staleness is bounded by a
+round trip taken at the moment of asking.
 
 Second, *no cached session mirror*. The identity process stores no copy of the
-session state. It could, and that would make answering a pull instant, and a
-cached mirror is precisely a thing that can be stale, which is what this signal
-exists not to be. The cost is a local round trip per pull and a pending-pull
-state machine. The benefit is that there is no stale state to serve.
+session state. It could, and answering a pull would then be instant, but a
+cached mirror is precisely a thing that can go stale, and staleness is what this
+signal exists to rule out. The cost is a local round trip per pull and a
+pending-pull state machine. What we get for it is that there is no stale state
+to serve.
 
 Third, *the nonce is load-bearing*. Each pull mints a nonce, the answer echoes
 it, and the requestor retires it on receipt. Without that, a signed attestation
@@ -99,15 +100,16 @@ outcome.
 The two signals above answer whether a human stands behind a node and when one
 was last there. Neither says which human, and for a long time nothing did, since
 the operator credential is an X.509 certificate holding no key of the kind an
-identity would need. That mattered more than a missing field usually would,
-because the chartered node-to-guardian edge one tier up requires a guardian to
-co-sign, and a guardian who cannot sign is unusable, so a chartered rule was
-running with no live source at all.
+identity would need. That mattered more than a missing field usually would. The
+chartered node-to-guardian edge one tier up requires a guardian to co-sign, and
+a guardian who cannot sign is unusable, so a chartered rule was running with no
+live source at all.
 
 A node may now advertise a guardian public key together with a binding, being a
 signature by the private key of that operator over
 
-    "at-operator-binding-v1" || uuid (16) || node signing key (32) || operator key (32)
+"at-operator-binding-v1" || uuid (16) || node signing key (32) || operator key
+(32)
 
 verified at admission against the public key of the credential itself, which is
 the same credential the gate has already classified as operator-class against
@@ -129,11 +131,11 @@ across every node that human guards, because per-node keys would let one person
 present as several guardians, which is the sockpuppet problem moved down a
 layer. Although stability is what makes the count meaningful, a stable key is
 also a persistent pseudonym, so anyone watching two cohorts can link the nodes
-of an operator to each other. That is a real cost paid by a real person, so it
-is theirs to choose. Off by default is the mitigation, and the choice is made on
-the command line at activation rather than on the recurring unlock screen,
-because a decision that de-anonymizes a whole fleet does not belong on a daily
-login prompt.
+of an operator to each other. That is a real cost paid by a real person, so the
+choice is theirs. Off by default is the mitigation, and we put the choice on the
+command line at activation rather than on the recurring unlock screen, because a
+decision that de-anonymizes a whole fleet does not belong on a daily login
+prompt.
 
 The pre-image names the node deliberately. Without the identifier and the
 signing key inside the signed bytes, a key and binding pair lifted from the
@@ -209,7 +211,7 @@ attendance by polling the live session through the local round trip to the main
 loop, and the C side answers from a single seam in one hop.
 
 The asymmetry is confined to where the attended state comes from. The verb
-shape, the payload, the always-present zero, the nonce state machine, and all
+shape, the payload, the always-present zero, the nonce state machine and all
 three verification checks are identical. The single definition of attended on
 the Python side lives in one function shared by both the in-process seam and the
 main loop, so the two cannot drift.
@@ -235,15 +237,15 @@ Cross-language conformance scenarios live under the identity protocol:
 | `operator-key-bound-to-another-identity-rejected` | a perfect signature naming a different node is refused |
 | `operator-key-absent-is-normal` | the opt-out, being bound and attended with no guardian and no penalty |
 
-The four bindings are signed at scenario time by both adapters from a committed
-test key rather than pinned as recorded blobs. That is deliberate. A pinned
+Both adapters sign the four bindings at scenario time from a committed test key
+rather than pinning them as recorded blobs, and that is deliberate. A pinned
 signature would hold the two implementations to one of them having saved its own
 output, where signing live holds them to the same pre-image and the same scheme.
 The signature algorithm is deterministic, so they agree byte for byte or the
 scenario fails. The private key of the test leaf is committed for exactly this
 reason, being a test anchor with standing nowhere.
 
-The clock is pinned in these scenarios and never read from the wall, since a
+We pin the clock in these scenarios and never read it from the wall, since a
 live stamp could not match across two runs, let alone across two languages.
 
 ## Consuming the signal

@@ -76,7 +76,7 @@ whether a *host* is reachable. A host can answer ICMP with no AT process running
 at all, and an AT node can be present while ICMP is filtered, so the two answer
 different questions. The name says which one this is. PingAT is
 non-load-bearing: a missed reply costs a latency sample and changes no AT
-behaviour.
+behavior.
 
 There is no NTP port. AT carries no NTP implementation on either side; a stock
 daemon on the host disciplines the clock and AT only reads what it achieved (see

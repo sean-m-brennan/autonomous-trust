@@ -1,6 +1,6 @@
 *Previous: [Reputation against blockchain](reputation-vs-blockchain-analysis.md)*
 
-# Operator Access (PIV + MFA)
+# Operator access (PIV + MFA)
 
 How a **human operator** authenticates to an AutonomousTrust fleet with a
 PIV/CAC smartcard plus a second factor, activates a local node, discovers what

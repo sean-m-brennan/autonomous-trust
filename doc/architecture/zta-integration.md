@@ -1,6 +1,6 @@
 *Previous: [The dual implementation](native-ffi-dual-implementation.md)*
 
-# Zero Trust Architecture Integration
+# Zero Trust architecture integration
 
 ## 1. Why certificate management is not enough
 
@@ -424,7 +424,7 @@ Both implementations match here: Python `idprocess._zta_admit` and C
 `VERIFIED` chain result, and the CRL serial match itself is at parity
 (`X509Verifier.check_revocation` ↔ `x509_check_revocation`). Pinned
 cross-language by conformance `zta-x509-reject-revoked-credential`. The
-human-operator analogue of this gate is described in [Operator
+human-operator analog of this gate is described in [Operator
 Access](operator-access.md).
 
 ---

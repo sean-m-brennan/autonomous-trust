@@ -9,7 +9,7 @@ makes it visible.
 > Stretch Goal 2 is complete; it has no tracker entry (it was never a defect or a
 > deferral, and ISSUES.md carries neither). This walkthrough is its reference.
 > Status memory: [`project-stretch-goal-2-pivot`](../../.claude/memory/project_stretch_goal_2_pivot.md)
-> Code locations summarised at the end of this doc.
+> Code locations summarized at the end of this doc.
 
 ---
 
@@ -46,7 +46,7 @@ $ python -m tools.detection_prep              # 17 thumbnails + JSON
 Outputs land under `examples/dod_mission/assets/`:
 
 * `video/naip_huntsville.jpg`: 4096×4096 px, 1 m/px, USDA-public
- domain aerial imagery of Huntsville, AL, centred on
+ domain aerial imagery of Huntsville, AL, centered on
  `(34.724448°N, -86.639802°W)` (the RQ-86 orbit centre + true target).
 * `detections/catalogue.json`: 17 entries: the 6 hand-authored
  scenario-overlay objects (`compound-alpha`, `compound-bravo` decoy
@@ -185,7 +185,7 @@ Live interactive version (requires a browser):
 | `DetectionSource` (per-peer emitter) | `examples/dod_mission/generators/detection.py` | new file |
 | `CompromisedDetectionSource` (MQ-800 swap) | `examples/dod_mission/compromise/contradictory_isr.py` | new section |
 | `world_uid` bucketing in validator | `examples/multi_agency/tasks/validation.py` | `submit()` body |
-| Per-(peer, uid) cache + serialisation | `examples/dod_mission/coordinator.py` | `_cache_detection_reading`, `_pick_primary_detection_per_peer`, `_push_dashboard_update` |
+| Per-(peer, uid) cache + serialization | `examples/dod_mission/coordinator.py` | `_cache_detection_reading`, `_pick_primary_detection_per_peer`, `_push_dashboard_update` |
 | `DetectionSummary` field on `PeerDetailState` + SVG bbox renderer | `src/autonomous-trust-inspector/autonomous_trust/inspector/dashboard/peer_detail.py` | new dataclass + `_detection()` |
 | `AgencyMap` detection markers + sightlines | `src/autonomous-trust-inspector/autonomous_trust/inspector/dashboard/disaster_response_map.py` | `_add_detection_markers()`, `set_peer_detection()` |
 | Drawer dropdown + Iframe slot | `examples/dod_mission/dashboard/live_server.py` | `make_app`, `_render_peer_drawer` |

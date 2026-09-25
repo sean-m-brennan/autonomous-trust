@@ -1,4 +1,4 @@
-# Prequential Competence
+# Prequential competence
 
 *Build-order step 4 of the [verification oracle](../verification_oracle.md);
 tracked as R+D.md §12.5.*
@@ -104,7 +104,7 @@ It is exactly the decomposition this layer needs: the first term is
 score well by being vague (wide interval, first term large) *or* by being
 overconfident (narrow interval that misses, second term large). A degenerate
 "cover everything" interval, which §12.4 is required to forgive, is penalised
-here — which is precisely the division of labour between the two layers.
+here — which is precisely the division of labor between the two layers.
 
 For a vector box the score is the **mean over components**, so a 3-vector
 forecast is not three times worse than a scalar one.
@@ -274,7 +274,10 @@ answer if the two runtimes are to agree to the last bit.
 `prequential.json`, canonical JSON read directly by both runtimes — the
 arrangement `physics.json`, `certificates.json` and `calibration.json` use.
 `AT_PREQUENTIAL` names it; `config/cfg/prequential.example.json` is the shared
-example.
+example. The layer is its own library, `libat_prequential` in C and
+`autonomous_trust.oracle` in Python (see [Extensions](extensions.md), "Oracle
+layers"). A node whose environment sets the variable without the layer installed
+refuses to start.
 
 ```json
 {
@@ -309,7 +312,7 @@ who could redefine the loss could weight any peer by declaration.
 ### Opt-in, inert, and fatal on malformed
 
 With `AT_PREQUENTIAL` unset the model is empty, every multiplier is 1.0 and
-nothing that has not opted in changes behaviour. A malformed declaration is
+nothing that has not opted in changes behavior. A malformed declaration is
 fatal at load and never degraded to "learn the capabilities that parsed".
 Three consistency rules are enforced there rather than discovered at runtime:
 
