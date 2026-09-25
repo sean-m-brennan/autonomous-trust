@@ -109,7 +109,7 @@ static process_t *_mk_process(identity_t *self)
     uuid_unparse_lower(self->uuid, self_uuid);
     group_add_address(&proc->protocol.group, self_uuid, self->address);
 
-    /* configs["identity"] so _partition_self_identity resolves self. */
+    /* configs["identity"] so identity_self_identity resolves self. */
     config_t *id_cfg = calloc(1, sizeof(config_t));
     ck_assert_ptr_nonnull(id_cfg);
     id_cfg->name = "identity";

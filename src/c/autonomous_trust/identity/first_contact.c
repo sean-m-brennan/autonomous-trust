@@ -40,6 +40,7 @@
 #include "identity/identity.h"
 #include "first_contact.h"
 #include "id_proc_priv.h"
+#include "processes/extension.h"
 
 bool at_first_contact_enabled(void)
 {
@@ -278,6 +279,30 @@ int at_first_contact_register(process_t *proc)
                              (handler_ptr_t)handle_first_contact_hello_ack);
     return 0;
 }
+
+/* First contact as an extension (processes/extension.h): identity's handlers
+ * only, behind AT_FIRST_CONTACT, which the registry re-reads on every
+ * registration so a harness can flip it between scenarios. */
+static int _fc_extension_register(process_t *proc, const char *proc_name)
+{
+    if (strcmp(proc_name, "identity") != 0)
+        return 0;
+    int rc = at_first_contact_register(proc);
+    if (rc == 0)
+        log_info(proc->logger,
+                 "Identity: first contact (1:1 introduction) enabled\n");
+    return rc;
+}
+
+static const at_extension_t first_contact_extension = {
+    .name = "first_contact",
+    .enabled = at_first_contact_enabled,
+    .register_handlers = _fc_extension_register,
+    .reset = at_first_contact_reset,
+};
+AT_EXTENSION_REGISTER(first_contact, &first_contact_extension)
+
+void at_first_contact_link(void) {}
 
 /* An envelope with no sender identity carries nothing to admit. Python's
  * `isinstance(sender, Identity)` guard; here an all-zero uuid is the tell. */

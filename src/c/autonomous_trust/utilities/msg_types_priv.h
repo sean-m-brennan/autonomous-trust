@@ -25,6 +25,10 @@
 #include "utilities/msg_types.h"
 
 int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len);
+
+/** The core half of string_to_message_type: (message_type_t)-1 for any name that is not a
+ *  core type, including every registered extension type. */
+message_type_t message_type_core_by_name(const char *str);
 int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg);
 
 int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr);

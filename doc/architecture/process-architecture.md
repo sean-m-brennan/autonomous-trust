@@ -1,4 +1,4 @@
-*Previous: [Infrastructure independence](../../../../doc/decentralization_momentum_alt.md)*
+*Previous: [Infrastructure independence](../../../../doc/decentralization_momentum.md)*
 
 # Process architecture
 
@@ -13,7 +13,7 @@ thread, configurable), communicating via `multiprocessing.Queue`.
 > functions are called *within* these Python subsystem processes via CFFI, not
 > by a C-driven process tree. The standalone C daemon (`run_autonomous_trust()`,
 > wrapped by `NativeAutonomousTrust`) is a separate runtime used by the embedded
-> build. See [Native / FFI Dual Implementation](native-ffi-dual-implementation.md).
+> build. See [Native / FFI dual implementation](native-ffi-dual-implementation.md).
 
 The orchestrator itself extends `Protocol`, giving it message-handling
 capabilities for task results, reputation responses, and external control
@@ -42,7 +42,7 @@ Additional worker processes can be added at runtime via
 `AutonomousTrust.add_worker()`. One such worker is the **`BootstrapWorker`**
 (`core/_python/bootstrap_worker.py`), auto-registered to run the
 bootstrap-capability corpus that lets freshly-admitted peers accumulate a
-baby-steps transaction history. See [Trust Tiers §6](trust-tiers.md) and [Node
+baby-steps transaction history. See [Trust tiers §6](trust-tiers.md) and [Node
 Lifecycle](node-lifecycle.md).
 
 ## IPC and queue routing
@@ -55,9 +55,10 @@ by process name:
 - **Inbound (from network).** `NetworkProcess` parses incoming wire data into `Message` objects and routes them to the appropriate process queue based on `message.process`.
 - **Inter-process.** Processes can place objects directly on another process's queue (e.g., `TransactionScore` to the reputation queue, `PeerCapabilities` to negotiation).
 
-The orchestrator's main loop (`autonomous_loop`) cycles through: monitoring
-subprocess health, handling messages from its own queue, collecting task
-results, and running user-defined tasking logic.
+The orchestrator's main loop (`autonomous_loop`) cycles through four duties on
+every tick. It monitors subprocess health, handles messages from its own queue,
+collects task results, and runs whatever tasking logic the application
+supplied.
 
 ## Process relationships
 
@@ -107,9 +108,10 @@ Pinned by `src/c/test/process_child_exit_test.c`.
 
 ## Collaborators travel as one context
 
-The recurring `{procs, procs_lock, queues, logger}` collaborators are bundled
-into a single `proc_context_t` (`processes.h`) rather than threaded individually:
-`restart_process` takes 3 parameters instead of 6, `start_process` 5 instead of 8.
+The recurring `{procs, procs_lock, queues, logger}` collaborators travel as one
+`proc_context_t` (`processes.h`) rather than threaded through individually, so
+`restart_process` takes 3 parameters instead of 6 and `start_process` 5 instead
+of 8.
 
 ---
 

@@ -55,6 +55,56 @@ class TestCorpusToJson:
             b = (out_b / sub).read_text(encoding='utf-8')
             assert a == b, sub
 
+    @staticmethod
+    def _extra_root(tmp_path, name='plugin', scenario='amnesia-readmission'):
+        """A second corpus root holding a copy of one AT scenario under a new
+        protocol directory and name, as an extension's plug-in would."""
+        root = tmp_path / name
+        (root / 'scenarios' / 'identity').mkdir(parents=True)
+        src = (_CORPUS / 'scenarios' / 'identity' / f'{scenario}.yaml').read_text(encoding='utf-8')
+        src = src.replace(f'name: {scenario}', f'name: {scenario}-{name}', 1)
+        (root / 'scenarios' / 'identity' / f'{scenario}-{name}.yaml').write_text(src, encoding='utf-8')
+        return root
+
+    def test_a_mirror_without_a_source_is_deleted(self, tmp_path):
+        """A scenario that moved or left (an extension's plug-in no longer
+        passed) must not leave its old JSON behind in a reused build dir,
+        where the index would list it and the C harness run it twice."""
+        out = tmp_path / 'out'
+        extra = self._extra_root(tmp_path)
+        corpus_to_json.convert(_CORPUS, out, (extra,))
+        moved = out / 'scenarios' / 'identity' / 'amnesia-readmission-plugin.json'
+        assert moved.is_file()
+        gone_dir = out / 'scenarios' / 'retired'
+        gone_dir.mkdir()
+        (gone_dir / 'x.json').write_text('{}', encoding='utf-8')
+        corpus_to_json.convert(_CORPUS, out)          # plug-in not passed
+        assert not moved.exists()
+        assert not gone_dir.exists()
+        index = json.loads((out / 'index.json').read_text(encoding='utf-8'))
+        assert 'scenarios/identity/amnesia-readmission-plugin.json' not in index
+        assert 'scenarios/identity/amnesia-readmission.json' in index
+
+    def test_extra_roots_merge_into_one_index(self, tmp_path):
+        out = tmp_path / 'out'
+        n_core = corpus_to_json.convert(_CORPUS, tmp_path / 'core')
+        n = corpus_to_json.convert(_CORPUS, out, (self._extra_root(tmp_path),))
+        assert n == n_core + 1
+        index = json.loads((out / 'index.json').read_text(encoding='utf-8'))
+        assert len(index) == n
+        payload = json.loads((out / 'scenarios' / 'identity' /
+                              'amnesia-readmission-plugin.json').read_text(encoding='utf-8'))
+        assert payload['source_path'] == 'scenarios/identity/amnesia-readmission-plugin.yaml'
+
+    def test_two_roots_supplying_one_case_are_refused(self, tmp_path):
+        a = self._extra_root(tmp_path, 'a')
+        b = tmp_path / 'b'
+        (b / 'scenarios' / 'identity').mkdir(parents=True)
+        f = a / 'scenarios' / 'identity' / 'amnesia-readmission-a.yaml'
+        (b / 'scenarios' / 'identity' / f.name).write_bytes(f.read_bytes())
+        with pytest.raises(corpus_to_json.CorpusMergeError):
+            corpus_to_json.convert(_CORPUS, tmp_path / 'out', (a, b))
+
     def test_each_json_carries_required_fields(self, tmp_path):
         out = tmp_path / 'out'
         corpus_to_json.convert(_CORPUS, out)

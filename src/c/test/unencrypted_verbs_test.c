@@ -80,7 +80,8 @@ static const char *const REFUSED[] = {
     "history_diff",
     "peer_caps_query",
     "peer_caps_response",
-#ifdef AT_SOCIAL_ENABLED
+    /* The social verbs (libat_social): string literals, so pinned in every
+     * build -- the allowlist is core, and must never admit them. */
     "peer_position_query", /* opt-in position: encrypted directed, never plaintext */
     "peer_position_response",
     "peer_profile_query",  /* opt-in signed profile: encrypted directed (Increment 3) */
@@ -99,7 +100,6 @@ static const char *const REFUSED[] = {
      * it: an ask crossing in plaintext is an ask anyone can forge or rewrite. */
     "peer_cosign_request",
     "peer_cosign_sig",
-#endif /* AT_SOCIAL_ENABLED */
     "tier_update",         /* local IPC; never legitimate off the wire */
     "subtree_roster_query",
     "request reputation",

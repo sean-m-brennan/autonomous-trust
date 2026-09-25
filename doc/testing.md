@@ -1,4 +1,4 @@
-*Previous: [The verification oracle](verification_oracle.md)*
+*Previous: [Sampled replication](architecture/replication.md)*
 
 Testing approach
 ================

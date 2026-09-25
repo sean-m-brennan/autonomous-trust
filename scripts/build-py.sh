@@ -94,6 +94,7 @@ if [[ "$*" != *"proto-only"* ]]; then
   mkdir -p dist
   dist_dir=$(cd dist; pwd)
   poetry build --format sdist -C src/autonomous-trust -o $dist_dir
+  poetry build --format sdist -C src/autonomous-trust-oracle -o $dist_dir
   poetry build --format sdist -C src/autonomous-trust-inspector -o $dist_dir
   poetry build --format sdist -C src/autonomous-trust-services -o $dist_dir
   poetry build --format sdist -C src/autonomous-trust-simulator -o $dist_dir

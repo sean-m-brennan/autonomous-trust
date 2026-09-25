@@ -298,6 +298,11 @@ _PROTOCOL_CLASSES = {
     # agreement and network do not have a class-attribute message vocabulary.
 }
 
+# A protocol whose scenarios ride another's process, and so may use its verbs
+# too, maps to that process's protocol. Empty in AT itself: Agora's `social`
+# plug-in (identity) was the one entry until it left the repo (Phase 5b).
+_PROTOCOL_BASES: dict[str, str] = {}
+
 # Process modules that register handlers against the protocol classes above.
 # Used to filter "orphan" enum entries — Protocol class attributes that have
 # no `register_handler` call pointing at them.
@@ -318,18 +323,24 @@ def _handler_keyed_attrs(protocol: str, attr_names: set[str]) -> set[str]:
     on the wire but ignored by the receiver), and should not count as
     "registered functions" for drift-check purposes.
     """
-    qual = _PROCESS_SOURCES.get(protocol)
-    if qual is None:
+    quals = _PROCESS_SOURCES.get(protocol)
+    if quals is None:
         # No process module mapped → fall back to "everything is wired".
         return set(attr_names)
-    try:
-        module = importlib.import_module(qual)
-    except ImportError:
+    if isinstance(quals, str):
+        quals = (quals,)
+    texts = []
+    for qual in quals:
+        try:
+            module = importlib.import_module(qual)
+        except ImportError:
+            continue   # an extension this install does not have
+        source_path = Path(getattr(module, '__file__', '') or '')
+        if source_path.is_file():
+            texts.append(source_path.read_text(encoding='utf-8'))
+    if not texts:
         return set(attr_names)
-    source_path = Path(getattr(module, '__file__', '') or '')
-    if not source_path.is_file():
-        return set(attr_names)
-    text = source_path.read_text(encoding='utf-8')
+    text = '\n'.join(texts)
     proto_cls = _PROTOCOL_CLASSES[protocol].rsplit('.', 1)[1]
     pat = re.compile(
         rf'\bregister_handler\s*\(\s*{re.escape(proto_cls)}\.(\w+)\b'
@@ -352,7 +363,10 @@ def _registered_functions(protocol: str) -> set[str]:
     if qual is None:
         return set()
     module_name, class_name = qual.rsplit('.', 1)
-    module = importlib.import_module(module_name)
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError:
+        return set()   # a feature distribution this install does not have
     cls = getattr(module, class_name)
     candidate_attrs: dict[str, str] = {}
     for name, value in vars(cls).items():
@@ -384,7 +398,12 @@ def check(scenario_path: Path) -> CheckReport:
     registered = _registered_functions(protocol)
 
     used_in_scenario = {step['function'] for step in data.get('steps', [])}
-    unrecognized = sorted(used_in_scenario - registered) if registered else []
+    # Recognized: this protocol's verbs and its base's (unexercised, below,
+    # stays this protocol's own).
+    known = set(registered)
+    if registered and protocol in _PROTOCOL_BASES:
+        known |= _registered_functions(_PROTOCOL_BASES[protocol])
+    unrecognized = sorted(used_in_scenario - known) if registered else []
 
     # Unexercised: registered functions never used by any scenario for this
     # protocol. Walk every scenario in the directory to compute the union.

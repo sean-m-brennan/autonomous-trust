@@ -144,6 +144,14 @@ typedef struct
     char mcast4_addr[IPV4_ADDR_LEN + 1];
     char ip6_cidr[CIDR6_LEN + 1];
     char mcast6_addr[IPV6_ADDR_LEN + 1];
+    /* Gateway relay (libat_gateway; see network/net_filter.h). All false by
+     * default and written to JSON only when true. The envelope changes the
+     * wire format, so every node of a cohort must agree on it; the other two
+     * need it. A node asking for the envelope without the library refuses
+     * to start. */
+    bool envelope;       /**< Wrap every frame in the plaintext routing envelope. */
+    bool group_forward;  /**< As a gateway, forward group frames across legs. */
+    bool cross_cluster;  /**< Keep a forwarded broadcast's self-reported address. */
 } network_config_t;
 
 /** Which layer supplied the base port a node is running on. */

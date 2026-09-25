@@ -58,6 +58,9 @@ RUN pip install --no-cache-dir \
 # (e.g. ProcessLogger varargs, automate.py logfile makedirs) would be
 # stale without this. The C library at /usr/local/lib is preserved.
 COPY src/autonomous-trust/autonomous_trust/core /app/autonomous_trust/core
+# The verification layers (autonomous-trust-oracle), beside the core in the
+# autonomous_trust namespace, where the core finds them (FEATURE_SPLIT_PLAN Phase 3).
+COPY src/autonomous-trust-oracle/autonomous_trust/oracle /app/autonomous_trust/oracle
 
 # Layer the sibling packages via separate PYTHONPATH roots so Python's
 # namespace-package mechanism merges autonomous_trust.{core,evaluation,

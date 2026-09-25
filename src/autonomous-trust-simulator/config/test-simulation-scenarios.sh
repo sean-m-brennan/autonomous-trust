@@ -36,7 +36,7 @@ AT_SRC="$AT_ROOT/src"
 
 # All four AT namespace packages must be importable
 COVENANT_SRC="$(cd "$AT_ROOT/../kith-covenant/src/python" 2>/dev/null && pwd || echo "")"
-export PYTHONPATH="${AT_SRC}/autonomous-trust:${AT_SRC}/autonomous-trust-services:${AT_SRC}/autonomous-trust-inspector:${AT_SRC}/autonomous-trust-simulator${COVENANT_SRC:+:$COVENANT_SRC}${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="${AT_SRC}/autonomous-trust:${AT_SRC}/autonomous-trust-oracle:${AT_SRC}/autonomous-trust-services:${AT_SRC}/autonomous-trust-inspector:${AT_SRC}/autonomous-trust-simulator${COVENANT_SRC:+:$COVENANT_SRC}${PYTHONPATH:+:$PYTHONPATH}"
 WORK_DIR=$(mktemp -d "${AT_ROOT}/.tmp-sim.XXXXXX")
 
 cleanup() {

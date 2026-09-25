@@ -33,6 +33,7 @@ WORKDIR /app
 USER user
 
 COPY --chown=user:user src/autonomous-trust/autonomous_trust/core autonomous_trust/core
+COPY --chown=user:user src/autonomous-trust-oracle/autonomous_trust/oracle autonomous_trust/oracle
 COPY --chown=user:user src/autonomous-trust-inspector/autonomous_trust/inspector autonomous_trust/inspector
 COPY --chown=user:user src/autonomous-trust-services/autonomous_trust/services autonomous_trust/services
 COPY --chown=user:user src/autonomous-trust-simulator/autonomous_trust/simulator autonomous_trust/simulator

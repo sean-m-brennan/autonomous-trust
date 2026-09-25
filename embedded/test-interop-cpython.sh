@@ -148,6 +148,9 @@ if ! $SKIP_BUILD; then
   rm -rf "$WORK"; mkdir -p "$WORK/libs"
   cp "$REPO/examples/build-gcc/at_demo_cur" "$WORK/at_demo"
   cp "$REPO/examples/build-gcc/lib/libautonomous_trust.so" "$WORK/libs/"
+  # Its extension libraries (libat_<layer> verification layers, libat_gateway)
+  # beside it. at_demo itself links them statically; this keeps libs/ whole.
+  cp "$REPO"/examples/build-gcc/lib/extensions/*/libat_*.so "$WORK/libs/" 2>/dev/null || true
   # Bundle at_demo's full shared-lib closure. ldd has already resolved the whole
   # transitive set (via the conda/$ORIGIN rpaths), so copy every dep that lives
   # under the conda prefix -- these are exactly the libs absent from the base

@@ -32,20 +32,22 @@ relevant state change:
 | `peer-capabilities.cfg.json` | `IdentityProcess._record_peers` | On capability announcement | `{capability_name: [peer_uuids]}` |
 | `reputation.cfg.json` | `ReputationProcess._persist_reputations` | After every `_compute_reputation()` call | `{peer_uuid: float}` |
 | `contacts.cfg.json` | `contacts_save` / `Contacts` | On contact-store mutation | The UUID-keyed address book (petnames, invitations) |
-| `social.cfg.json` | `IdentityProcess` block/unblock (Phase 4 P4.1) | On every block or unblock | `{"version": 1, "blocks": {peer_uuid: {at, reason}}}` — this node's local moderation state |
+| `social.cfg.json` | the social extension's block/unblock, in the identity process (Phase 4 P4.1; `libat_social`, Agora's `at-social/`) | On every block or unblock | `{"version": 1, "blocks": {peer_uuid: {at, reason}}}` — this node's local moderation state |
 
 This table said "five files" until 2026-09-22 and listed only the first five;
 `contacts.cfg.json` had been missing from it, and the freshness state
 (`.freshness-identity.cfg.json`, written by `utilities/freshness.c`) is still
 deliberately absent because it is a replay guard rather than cohort state.
 
-`social.cfg.json` is written CORE-SIDE rather than by the app for three
-reasons: every enforcement point for a block is inside the core, so an app-side
+`social.cfg.json` is written NODE-SIDE, by the social extension inside the
+identity process, rather than by the app, for three reasons. Every enforcement
+point for a block is inside the node, so an app-side
 store would leave a window between `agorad` starting and the app's first replay
 during which a blocked peer's traffic lands; `agorad` must work headless; and
 the conformance harness runs the core with no app at all, which would make an
-app-side store unpinnable. A block is a core enforcement *input*, not an
-app-domain value like a tie weight.
+app-side store unpinnable. A block is a node enforcement *input*, not an
+app-domain value like a tie weight. Only a node that loads social writes
+the file.
 
 JSON is pretty-printed with an indent of two, which makes it diff-friendly and
 hand-editable for debugging.
@@ -63,7 +65,7 @@ Self is always included regardless of score.
 Tier 1 corresponds to score ≥ 0.50 per `ReputationProcess.TIER_FLOORS`, so the
 on-disk snapshots agree on which peers count as "trusted".
 
-The in-memory peer table is *not* filtered: only the saved snapshot is. A peer
+The in-memory peer table is *not* filtered, and only the saved snapshot is. A peer
 that drifts below 0.5 mid-session is still tracked + scored in the live process;
 it just doesn't survive a restart.
 

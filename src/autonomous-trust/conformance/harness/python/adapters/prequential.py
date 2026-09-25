@@ -42,10 +42,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from autonomous_trust.core.physics import parse_physics
-from autonomous_trust.core.prequential import (NEUTRAL_COMPETENCE,
-                                               PrequentialEstimator,
-                                               parse_prequential, weight_round)
+from autonomous_trust.oracle.physics import parse_physics
+from autonomous_trust.oracle.prequential import (NEUTRAL_COMPETENCE,
+                                                 PrequentialEstimator,
+                                                 parse_prequential, weight_round)
 
 from ...common.scenario_loader import Case
 

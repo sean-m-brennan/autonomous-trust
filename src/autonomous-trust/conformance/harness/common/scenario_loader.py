@@ -122,24 +122,36 @@ def load_case(path: Path, schemas: dict[str, dict[str, Any]]) -> Case:
     )
 
 
-def discover(corpus_root: Path) -> list[Case]:
+def discover(corpus_root: Path, extra_roots=()) -> list[Case]:
     """Walk `scenarios/` and `vectors/` under `corpus_root`, return validated cases.
 
-    Order is stable: alphabetical by relative path. Hidden files and files
-    starting with `_` are skipped (the latter by convention is for in-progress
-    or test-only fixtures).
+    Order is stable: alphabetical by relative path, AT's own root first.
+    Hidden files and files starting with `_` are skipped (the latter by
+    convention is for in-progress or test-only fixtures).
+
+    `extra_roots` are conformance plug-ins' corpus roots (an extension's own
+    protocol; doc/architecture/extensions.md, "External extensions"),
+    validated against `corpus_root`'s schemas. A case id two files share is
+    refused: the two reports are compared by id.
     """
     corpus_root = corpus_root.resolve()
     schemas = _load_schemas(corpus_root / 'schema')
     cases: list[Case] = []
-    for sub in ('scenarios', 'vectors'):
-        root = corpus_root / sub
-        if not root.is_dir():
-            continue
-        for path in sorted(root.rglob('*.yaml')):
-            if path.name.startswith(('.', '_')):
+    seen: dict[str, Path] = {}
+    for croot in [corpus_root] + [Path(r).resolve() for r in extra_roots]:
+        for sub in ('scenarios', 'vectors'):
+            root = croot / sub
+            if not root.is_dir():
                 continue
-            cases.append(load_case(path, schemas))
+            for path in sorted(root.rglob('*.yaml')):
+                if path.name.startswith(('.', '_')):
+                    continue
+                case = load_case(path, schemas)
+                if case.case_id in seen:
+                    raise CorpusLoadError(
+                        f'{case.case_id}: in {seen[case.case_id]} and {path}')
+                seen[case.case_id] = path
+                cases.append(case)
     return cases
 
 

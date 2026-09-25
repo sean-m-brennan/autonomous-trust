@@ -261,7 +261,7 @@ static int count_fn(const char *fn)
  * Three things the handlers require and a zeroed process_t does not have: a
  * registered handler map (they are static, so dispatch is the only way in),
  * its own identity under the "identity" key of proc->configs (where
- * _partition_self_identity looks — without it the handlers treat the node as
+ * identity_self_identity looks — without it the handlers treat the node as
  * mid-bootstrap and silently emit nothing), and a group whose address_map
  * size is the "our size" every adoption comparison reads. */
 static void make_receiver(process_t *proc, identity_t **self_out,

@@ -531,17 +531,6 @@ DEFINE_TEST(test_every_app_verb_is_allowlisted_for_routing)
 
     static const char *const app_verbs[] = {
         AT_APP_ROSTER_REQUEST,
-#ifdef AT_SOCIAL_ENABLED
-        AT_APP_SET_POSITION, AT_APP_SET_PROFILE,
-        AT_APP_CONNECT_REQUEST, AT_APP_CONNECT_RESPOND,
-        AT_APP_SEND_DM, AT_APP_PUBLISH_POST, AT_APP_REACT_POST, AT_APP_BLOCK,
-        AT_APP_REQUEST_ATTEND, AT_APP_SET_EXACT_POSITION,
-        AT_APP_REQUEST_PROXIMITY,
-        AT_APP_ADVERTISE_BUSINESS, AT_APP_SET_CUSTOMER,
-        AT_APP_REQUEST_COSIGN, AT_APP_RETURN_COSIGN,
-        AT_APP_PUBLISH_BUSINESS_POST,
-        AT_APP_UNBLOCK, AT_APP_REPORT_PEER,     /* Phase 4 P4.1 */
-#endif
         AT_APP_PEER_STANDING,                   /* Phase 4 P4.1, always compiled */
     };
 
@@ -599,14 +588,6 @@ DEFINE_TEST(test_every_app_event_type_forwards_to_the_app_queue)
 
     static const message_type_t app_types[] = {
         PEER_OBSERVED, PEER_REPUTATION, PEER_RTT_OBSERVED,
-#ifdef AT_SOCIAL_ENABLED
-        PEER_POSITION_OBSERVED, PEER_PROFILE_OBSERVED,
-        PEER_CONNECTION_REQUEST_OBSERVED, PEER_CONNECTION_STATE_OBSERVED,
-        PEER_DM_OBSERVED, PEER_POST_OBSERVED, PEER_REACTION_OBSERVED,
-        PEER_PROXIMITY_OBSERVED, PEER_BUSINESS_AD_OBSERVED,
-        PEER_COSIGN_REQUEST_OBSERVED, PEER_COSIGN_SIG_OBSERVED,
-        PEER_BUSINESS_POST_OBSERVED,
-#endif
     };
     const size_t n = sizeof(app_types) / sizeof(app_types[0]);
 
@@ -645,60 +626,6 @@ DEFINE_TEST(test_every_app_event_type_forwards_to_the_app_queue)
         }
     }
 
-#ifdef AT_SOCIAL_ENABLED
-    /* THE TYPE ARRIVING IS NOT THE PAYLOAD ARRIVING. The hop serializes through
-     * protobuf (generic_msg_to_proto) and rides one datagram, so a type whose
-     * payload the serializer does not carry — or carries truncated — still
-     * reads back with the right type and an empty body. P3.3's co-signing ask is
-     * the largest of them (its opaque hex bytes alone bound at 6 KB), so pin the
-     * round trip on that one, byte for byte. */
-    {
-        generic_msg_t out = {0};
-        out.type = PEER_COSIGN_REQUEST_OBSERVED;
-        out.size = message_size(PEER_COSIGN_REQUEST_OBSERVED);
-        memset(out.info.peer_cosign_request.peer_uuid, 0xA5, 16);
-        snprintf(out.info.peer_cosign_request.record,
-                 sizeof(out.info.peer_cosign_request.record), "%s", "membership");
-        snprintf(out.info.peer_cosign_request.op,
-                 sizeof(out.info.peer_cosign_request.op), "%s", "admit");
-        snprintf(out.info.peer_cosign_request.polity,
-                 sizeof(out.info.peer_cosign_request.polity), "%s",
-                 "did:key:z6MkiQ5Nq4QCVnW5pSg5iuX5WyjXi2qD1rFKV4n8gAsXKH8A");
-        snprintf(out.info.peer_cosign_request.cid,
-                 sizeof(out.info.peer_cosign_request.cid), "%s",
-                 "b3:bba6b3b8dc0e26358a1b4996d722a922297ff988b421f72bd64a012de03665bc");
-        out.info.peer_cosign_request.seq = 4242;
-        out.info.peer_cosign_request.ts  = 1.5;
-        /* A realistic exchange, not a token: 770 hex chars is what the live
-         * cohort's admission actually exports. */
-        for (size_t k = 0; k < 770; k++)
-            out.info.peer_cosign_request.bytes[k] = "0123456789abcdef"[k % 16];
-        out.info.peer_cosign_request.bytes[770] = '\0';
-
-        array_t one;
-        ck_assert_ret_ok(array_init(&one));
-        ck_assert_ret_ok(at_route_queue_msg(&one, &out));
-        ck_assert_int_eq(at_route_internal_msgs(&one, "_route_app_q", NULL), 1);
-        array_free(&one);
-
-        generic_msg_t got = {0};
-        ck_assert_ret_ok(messaging_recv_on(&app_q, &got, NULL, true));
-        ck_assert_int_eq((int)got.type, (int)PEER_COSIGN_REQUEST_OBSERVED);
-        ck_assert_str_eq(got.info.peer_cosign_request.record, "membership");
-        ck_assert_str_eq(got.info.peer_cosign_request.op, "admit");
-        ck_assert_str_eq(got.info.peer_cosign_request.polity,
-                         out.info.peer_cosign_request.polity);
-        ck_assert_str_eq(got.info.peer_cosign_request.cid,
-                         out.info.peer_cosign_request.cid);
-        ck_assert_int_eq((int)got.info.peer_cosign_request.seq, 4242);
-        ck_assert_mem_eq(got.info.peer_cosign_request.peer_uuid,
-                         out.info.peer_cosign_request.peer_uuid, 16);
-        /* The whole opaque payload, not a prefix: a truncating hop reproduces
-         * to nothing on the signer's node. */
-        ck_assert_str_eq(got.info.peer_cosign_request.bytes,
-                         out.info.peer_cosign_request.bytes);
-    }
-#endif /* AT_SOCIAL_ENABLED */
 
     /* FIFO across messages, pinned separately and well inside the queue depth:
      * the drain sends as it walks, and batching them into a second array is what

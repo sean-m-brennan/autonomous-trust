@@ -42,12 +42,14 @@ identity history — a contact is not a group member. The contact stays
 ``unverified`` until the out-of-band safety-number compare
 (:func:`..contacts.verify_contact`).
 """
+import functools
 import json
 import logging
 import os
 import time
 
 from ..system import CfgIds
+from ..extensions import Extension
 from ..network.message import Message
 from ..config.configuration import to_json_string, atomic_write, Configuration
 from .identity import Identity
@@ -141,10 +143,25 @@ def register(proc) -> None:
     :func:`enabled` — a default node registers nothing here."""
     # Durable single-use replay guard (survives restart). See SpentNonces.
     proc._first_contact_nonces = SpentNonces()
+    # partial, not lambdas: multiproc mode pickles the process, and a lambda
+    # does not pickle.
     proc.protocol.register_handler(IdentityProtocol.hello,
-                                   lambda q, m: handle_hello(proc, q, m))
+                                   functools.partial(handle_hello, proc))
     proc.protocol.register_handler(IdentityProtocol.hello_ack,
-                                   lambda q, m: handle_hello_ack(proc, q, m))
+                                   functools.partial(handle_hello_ack, proc))
+
+
+def _register_extension(proc, proc_name: str) -> None:
+    if proc_name != 'identity':
+        return
+    register(proc)
+    proc.logger.info('First contact (1:1 introduction) enabled')
+
+
+#: First contact as an optional feature (``..extensions``): identity only,
+#: gated on ``AT_FIRST_CONTACT``.
+EXTENSION = Extension(name='first_contact', enabled=enabled,
+                      register_handlers=_register_extension)
 
 
 def _admit_direct_peer(proc, queues, identity) -> bool:

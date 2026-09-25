@@ -28,7 +28,9 @@
         .runner = run_func,                             \
     },
 
-proc_map_t process_table[] = {
+/* The generated entries, plus AT_PROCESS_EXT_MAX free slots an extension
+ * library fills at load time with DEFINE_PROCESS (process_tracker.h). */
+proc_map_t process_table[LIST_COUNT__DECLARE_PROCESS + AT_PROCESS_EXT_MAX] = {
     LIST__DECLARE_PROCESS};
 
 #endif // PROCESS_TABLE_H

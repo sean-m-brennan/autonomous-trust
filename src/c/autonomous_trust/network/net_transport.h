@@ -27,8 +27,10 @@
  * the tracker config selected — without knowing anything about sockets
  * or bundles.
  *
- * Transport implementations live in `net_transport_<kind>.c` and are
- * statically linked in based on CMake options (AT_NET_DTN, etc.).
+ * The core transports live in `net_transport_<kind>.c` in a static table.
+ * A transport built as an extension library (DTN, src/c/extensions/dtn/)
+ * adds itself at load time with @ref NET_TRANSPORT_REGISTER, so the core
+ * names none of them.
  */
 
 #include <stdbool.h>
@@ -260,9 +262,29 @@ typedef struct net_transport_s {
 
 /**
  * @brief Look up a transport by name (matches the impl_name field in the
- * per-transport process-declaration macro in net_proc.c).
+ * per-transport process-declaration macro in net_proc.c): the core
+ * transports first, then any an extension registered.
  * Returns NULL if not registered.
  */
 const net_transport_t *net_transport_find(const char *name);
+
+/** Most transports an extension library may add beside the core ones. */
+#define NET_TRANSPORT_EXT_MAX 8
+
+/**
+ * @brief Add a transport from outside the core. Call from a constructor
+ * (@ref NET_TRANSPORT_REGISTER), before main(): the table is not locked.
+ * Refuses (-1, with a line on stderr) a NULL or unnamed transport, a name
+ * already taken -- core or registered -- and a full table.
+ */
+int net_transport_register(const net_transport_t *t);
+
+/** Register @p t (a `const net_transport_t *`) at load time; @p tag makes
+ *  the constructor's name unique in its translation unit. */
+#define NET_TRANSPORT_REGISTER(tag, t)                                         \
+    static void __attribute__((constructor)) net_transport_register_##tag(void)\
+    {                                                                          \
+        (void)net_transport_register(t);                                       \
+    }
 
 #endif /* NET_TRANSPORT_H */

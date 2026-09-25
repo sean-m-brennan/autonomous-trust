@@ -23,6 +23,7 @@ AUTOLINK_SUPPORT       = YES
 # Top-level API header + subtree + grouping definitions.
 INPUT                  = autonomous_trust.h \
                          autonomous_trust \
+                         extensions \
                          doxygen_groups.dox
 FILE_PATTERNS          = *.h *.c *.dox
 RECURSIVE              = YES
@@ -32,6 +33,7 @@ EXCLUDE                = build \
                          frama-c \
                          test
 EXCLUDE_PATTERNS       = */*_priv.h \
+                         */extensions/*/test/* \
                          */*_priv.h.in \
                          */version.h.in \
                          */*.pb-c.* \

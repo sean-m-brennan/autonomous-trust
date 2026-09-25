@@ -1,3 +1,5 @@
+*Previous: [The verification oracle](../verification_oracle.md)*
+
 # Physical consistency
 
 *Build-order step 1 of the [verification oracle](../verification_oracle.md);
@@ -79,7 +81,7 @@ says how much a capability counts and who may run it, this says what its answer
 
 Canonical form is JSON, and **one file feeds both runtimes**: this loader and
 the C twin's jansson parser, with no conversion step and nothing to drift. That
-is the same decision the trust ladder made (see [Trust Tiers](trust-tiers.md)
+is the same decision the trust ladder made (see [Trust tiers](trust-tiers.md)
 §8). `config/cfg/physics.example.json` is the shared example both suites read.
 Set `AT_PHYSICS` to a path to turn the layer on. The layer is its own library,
 `libat_physics` in C and `autonomous_trust.oracle` in Python (see
@@ -278,16 +280,20 @@ follows.
 
 ## See also
 
-- [The Verification Oracle](../verification_oracle.md) — the whole program, and
+- [The verification oracle](../verification_oracle.md) — the whole program, and
   why physics is step 1.
-- [Certificate-Carrying Interfaces](certificate-interfaces.md) — step 2, and the
+- [Certificate-carrying interfaces](certificate-interfaces.md) — step 2, and the
   layer below this one in the scorer.
-- [Calibration Audit](calibration-audit.md) — step 3, which resolves its
+- [Calibration audit](calibration-audit.md) — step 3, which resolves its
   predictions through this layer's `quantity` declarations, and which must not
   settle one against an observation this layer has refuted.
-- [Prequential Competence](prequential-competence.md) — step 4, which resolves
+- [Prequential competence](prequential-competence.md) — step 4, which resolves
   forecasts through the same declarations and for the same reason sits after
   this layer's arm.
-- [Reputation Consensus](reputation.md) — the algebra these verdicts feed.
-- [Trust Tiers](trust-tiers.md) — capability weighting, and the declaration file
+- [Reputation consensus](reputation.md) — the algebra these verdicts feed.
+- [Trust tiers](trust-tiers.md) — capability weighting, and the declaration file
   this one is modelled on.
+
+---
+
+*Next: [Certificate-carrying interfaces](certificate-interfaces.md)*

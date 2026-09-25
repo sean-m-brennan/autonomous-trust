@@ -1,0 +1,24 @@
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "autonomous_trust_oracle"
+version = "0.2.1"
+description = "AutonomousTrust verification layers (R+D.md §12): physical consistency, calibration, certificates, prequential competence, replicated execution"
+authors = ["Sean M Brennan <sean.brennan@tekfive.com>"]
+readme = "README.md"
+packages = [{include = "autonomous_trust"}]
+exclude = ["**/__pycache__"]
+
+[project]
+name = "autonomous_trust_oracle"
+version = "0.2.1"
+
+# How an installed core finds the layers (autonomous_trust.core.extensions).
+[project.entry-points."autonomous_trust.extensions"]
+oracle = "autonomous_trust.oracle._at_extension:EXTENSION"
+
+[tool.poetry.dependencies]
+python = "^3.13"
+autonomous-trust = ">=0.2.1"
