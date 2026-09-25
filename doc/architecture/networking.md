@@ -2,16 +2,16 @@
 
 # Networking
 
-The network layer handles all wire communication between nodes. It provides
-three logical channels with different security properties, runs receiver threads
-for concurrent I/O, and routes messages between the network and internal process
-queues.
+The network layer carries every piece of wire communication between nodes. It
+supplies three logical channels with different security properties, runs
+receiver threads for concurrent I/O, and routes messages between the wire and
+the internal process queues.
 
 > This describes the Python `NetworkProcess`. The C implementation
 > (`src/c/autonomous_trust/network/`) implements the **same wire protocol**, and
 > C and Python nodes interoperate on the same network: provided both sides use
 > the DRY canonical JSON wire form for identity/group payloads (see
-> [Native / FFI Dual Implementation](native-ffi-dual-implementation.md) §6).
+> [Native / FFI dual implementation](native-ffi-dual-implementation.md) §6).
 
 ## Communication channels
 
@@ -80,13 +80,13 @@ behavior.
 
 There is no NTP port. AT carries no NTP implementation on either side; a stock
 daemon on the host disciplines the clock and AT only reads what it achieved (see
-[Node Lifecycle](node-lifecycle.md#clock-discipline)).
+[Node lifecycle](node-lifecycle.md#clock-discipline)).
 
 The `TCPNetworkProcess` extends this by replacing peer and group UDP with TCP
 (using `listen`/`accept`), while keeping UDP for broadcast/multicast. TCP uses
 `[length]\|[data]` framing for reliable delivery. By default it opens one
 connection per message; it can optionally reuse one connection per peer for many
-messages, described in [TCP Connection Pooling](network-connection-pooling.md).
+messages, described in [TCP connection pooling](network-connection-pooling.md).
 
 ## Wire message format
 

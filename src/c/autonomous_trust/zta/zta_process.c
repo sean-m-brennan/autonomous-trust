@@ -34,6 +34,7 @@
 #include "zta_verifier.h"
 #include "zta_audit.h"
 #include "zta_protocol.h"
+#include "zta_msg_types.h"
 
 /* Protocol-string definitions (declared `extern char[]` in
  * zta_protocol.h). Writable arrays so they're directly assignable to
@@ -183,13 +184,14 @@ static void _broadcast_revocation_alert(process_t *proc, const uuid_t peer_uuid,
     generic_msg_t msg;
     memset(&msg, 0, sizeof(msg));
     msg.type = ZTA_REVOCATION_ALERT;
+    zta_event_msg_t *ext = AT_MSG_EXT(&msg, zta_event_msg_t);
     msg.size = sizeof(zta_event_msg_t);
 
-    memcpy(msg.info.zta_event.peer_uuid, peer_uuid, sizeof(uuid_t));
-    memcpy(msg.info.zta_event.voucher_uuid, zta_state.self_uuid, sizeof(uuid_t));
-    memcpy(msg.info.zta_event.credential_hash, cred_hash, ZTA_HASH_LEN);
-    msg.info.zta_event.status = (int)ZTA_REVOKED;
-    snprintf(msg.info.zta_event.reason, sizeof(msg.info.zta_event.reason),
+    memcpy(ext->peer_uuid, peer_uuid, sizeof(uuid_t));
+    memcpy(ext->voucher_uuid, zta_state.self_uuid, sizeof(uuid_t));
+    memcpy(ext->credential_hash, cred_hash, ZTA_HASH_LEN);
+    ext->status = (int)ZTA_REVOKED;
+    snprintf(ext->reason, sizeof(ext->reason),
              "credential revoked");
 
     messaging_send("network", NET_MESSAGE, &msg, false);
@@ -391,19 +393,20 @@ static void _broadcast_verification(process_t *proc, const uuid_t peer_uuid,
     generic_msg_t msg;
     memset(&msg, 0, sizeof(msg));
     msg.type = ZTA_VERIFICATION_RESULT;
+    zta_event_msg_t *ext = AT_MSG_EXT(&msg, zta_event_msg_t);
     msg.size = sizeof(zta_event_msg_t);
 
-    _Static_assert(sizeof(msg.info.zta_event.credential_hash) == ZTA_HASH_LEN,
+    _Static_assert(sizeof(ext->credential_hash) == ZTA_HASH_LEN,
                    "zta_event credential_hash size must equal ZTA_HASH_LEN");
-    memcpy(msg.info.zta_event.peer_uuid, peer_uuid, sizeof(uuid_t));
-    memcpy(msg.info.zta_event.voucher_uuid, zta_state.self_uuid, sizeof(uuid_t));
-    memcpy(msg.info.zta_event.credential_hash, result->credential_hash, ZTA_HASH_LEN);
-    msg.info.zta_event.status = (int)result->status;
+    memcpy(ext->peer_uuid, peer_uuid, sizeof(uuid_t));
+    memcpy(ext->voucher_uuid, zta_state.self_uuid, sizeof(uuid_t));
+    memcpy(ext->credential_hash, result->credential_hash, ZTA_HASH_LEN);
+    ext->status = (int)result->status;
     /* reason[ZTA_REASON_LEN=256] -> the narrower wire field; bound the
      * conversion width to the destination so the (intentional) truncation is
      * explicit and -Wformat-truncation is satisfied. */
-    snprintf(msg.info.zta_event.reason, sizeof(msg.info.zta_event.reason),
-             "%.*s", (int)(sizeof(msg.info.zta_event.reason) - 1),
+    snprintf(ext->reason, sizeof(ext->reason),
+             "%.*s", (int)(sizeof(ext->reason) - 1),
              result->reason);
 
     messaging_send("network", NET_MESSAGE, &msg, false);
@@ -787,6 +790,7 @@ static bool _handle_rep_response(const process_t *proc, directory_t *queues,
 int zta_process_run(process_t *proc, directory_t *queues,
                     queue_id_t signal, logger_t *logger)
 {
+    at_zta_msg_types_link();
     /* Look up ZTA policy from configs. Values are object_ptr_data(config_t)
      * (load_all_configs), so unwrap data_t -> config_t -> data_struct rather
      * than casting the data_t wrapper directly to the policy struct. */
@@ -875,8 +879,8 @@ int zta_process_run(process_t *proc, directory_t *queues,
         if (err == 0) {
             if (buf.type == ZTA_VERIFICATION_RESULT) {
                 /* Delegated verification from another peer */
-                _handle_delegated_verification(proc, &buf.info.zta_event,
-                                               buf.info.zta_event.voucher_uuid,
+                const zta_event_msg_t *event = AT_MSG_EXT_CONST(&buf, zta_event_msg_t);
+                _handle_delegated_verification(proc, event, event->voucher_uuid,
                                                logger);
             }
             run_message_handlers(proc, queues, buf.type, &buf);

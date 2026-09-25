@@ -23,6 +23,7 @@
 #include <jansson.h>
 
 #include "msg_types_priv.h"
+#include "msg_registry.h"
 #include "logger.h"
 
 #include "fleet/update_proposal.h"
@@ -48,7 +49,10 @@ size_t message_size(message_type_t type)
     case PEER:
         return sizeof(public_identity_t);
     case PEER_CAPABILITIES:
-        return sizeof(capability_t) * DEFAULT_MAX_PEERS * MAX_CAPABILITIES;
+        /* The union arm, not the matrix it describes: this size is what
+         * processes.c copies out of a generic_msg_t, and the matrix is a map
+         * handle. The old product (3.4 MB) overran the 1.7-6.4 KB message. */
+        return sizeof(peer_capabilities_matrix_t);
     case NET_MESSAGE:
         return sizeof(net_msg_t);
     case TASK:
@@ -72,40 +76,13 @@ size_t message_size(message_type_t type)
         return sizeof(peer_observed_msg_t);
     case PEER_REPUTATION:
         return sizeof(peer_reputation_msg_t);
-#ifdef AT_SOCIAL_ENABLED
-    case PEER_POSITION_OBSERVED:
-        return sizeof(peer_position_msg_t);
-    case PEER_PROFILE_OBSERVED:
-        return sizeof(peer_profile_msg_t);
-    case PEER_CONNECTION_REQUEST_OBSERVED:
-    case PEER_CONNECTION_STATE_OBSERVED:
-        return sizeof(peer_connection_msg_t);
-    case PEER_DM_OBSERVED:
-        return sizeof(peer_dm_msg_t);
-    case PEER_POST_OBSERVED:
-        return sizeof(peer_post_msg_t);
-    case PEER_REACTION_OBSERVED:
-        return sizeof(peer_reaction_msg_t);
-    case PEER_PROXIMITY_OBSERVED:
-        return sizeof(peer_proximity_msg_t);
-    case PEER_BUSINESS_AD_OBSERVED:
-        return sizeof(peer_business_ad_msg_t);
-    case PEER_COSIGN_REQUEST_OBSERVED:
-        return sizeof(peer_cosign_request_msg_t);
-    case PEER_COSIGN_SIG_OBSERVED:
-        return sizeof(peer_cosign_sig_msg_t);
-    case PEER_BUSINESS_POST_OBSERVED:
-        return sizeof(peer_business_post_msg_t);
-#endif /* AT_SOCIAL_ENABLED */
-#ifdef AT_ZTA_ENABLED
-    case ZTA_REVOCATION_ALERT:
-    case ZTA_VERIFICATION_RESULT:
-        return sizeof(zta_event_msg_t);
-#endif
     case PEER_STANDING:
         return sizeof(peer_standing_msg_t);
     default:
-        return 0;
+    {
+        const at_msg_vtable_t *vt = at_msg_type_lookup((long)type);
+        return vt != NULL ? vt->size : 0;
+    }
     }
 }
 
@@ -152,44 +129,15 @@ char *message_type_to_string(message_type_t type)
         return (char*)"PEER_OBSERVED";
     case PEER_REPUTATION:
         return (char*)"PEER_REPUTATION";
-#ifdef AT_SOCIAL_ENABLED
-    case PEER_POSITION_OBSERVED:
-        return (char*)"PEER_POSITION_OBSERVED";
-    case PEER_PROFILE_OBSERVED:
-        return (char*)"PEER_PROFILE_OBSERVED";
-    case PEER_CONNECTION_REQUEST_OBSERVED:
-        return (char*)"PEER_CONNECTION_REQUEST_OBSERVED";
-    case PEER_CONNECTION_STATE_OBSERVED:
-        return (char*)"PEER_CONNECTION_STATE_OBSERVED";
-    case PEER_DM_OBSERVED:
-        return (char*)"PEER_DM_OBSERVED";
-    case PEER_POST_OBSERVED:
-        return (char*)"PEER_POST_OBSERVED";
-    case PEER_REACTION_OBSERVED:
-        return (char*)"PEER_REACTION_OBSERVED";
-    case PEER_PROXIMITY_OBSERVED:
-        return (char*)"PEER_PROXIMITY_OBSERVED";
-    case PEER_BUSINESS_AD_OBSERVED:
-        return (char*)"PEER_BUSINESS_AD_OBSERVED";
-    case PEER_BUSINESS_POST_OBSERVED:
-        return (char*)"PEER_BUSINESS_POST_OBSERVED";
-    case PEER_COSIGN_REQUEST_OBSERVED:
-        return (char*)"PEER_COSIGN_REQUEST_OBSERVED";
-    case PEER_COSIGN_SIG_OBSERVED:
-        return (char*)"PEER_COSIGN_SIG_OBSERVED";
-#endif /* AT_SOCIAL_ENABLED */
-#ifdef AT_ZTA_ENABLED
-    case ZTA_REVOCATION_ALERT:
-        return (char*)"ZTA_REVOCATION_ALERT";
-    case ZTA_VERIFICATION_RESULT:
-        return (char*)"ZTA_VERIFICATION_RESULT";
-#endif
-    /* Paired with the message_type_from_name() arm below — the two are a
+    /* Paired with the string_to_message_type() arm below — the two are a
      * round trip, and renaming one without the other breaks it silently. */
     case PEER_STANDING:
         return (char*)"PEER_STANDING";
     default:
-        return (char*)"";
+    {
+        const at_msg_vtable_t *vt = at_msg_type_lookup((long)type);
+        return (char*)(vt != NULL ? vt->name : "");
+    }
     }
 }
 
@@ -203,7 +151,7 @@ char *message_type_to_string(message_type_t type)
   requires str != \null && \valid_read(str);
   assigns \nothing;
 */
-message_type_t string_to_message_type(const char *str)
+message_type_t message_type_core_by_name(const char *str)
 {
     if (strcmp(str, "SIGNAL") == 0)
         return SIGNAL;
@@ -237,35 +185,26 @@ message_type_t string_to_message_type(const char *str)
         return PEER_OBSERVED;
     if (strcmp(str, "PEER_REPUTATION") == 0)
         return PEER_REPUTATION;
-#ifdef AT_SOCIAL_ENABLED
-    if (strcmp(str, "PEER_POSITION_OBSERVED") == 0)
-        return PEER_POSITION_OBSERVED;
-    if (strcmp(str, "PEER_PROFILE_OBSERVED") == 0)
-        return PEER_PROFILE_OBSERVED;
-    if (strcmp(str, "PEER_CONNECTION_REQUEST_OBSERVED") == 0)
-        return PEER_CONNECTION_REQUEST_OBSERVED;
-    if (strcmp(str, "PEER_CONNECTION_STATE_OBSERVED") == 0)
-        return PEER_CONNECTION_STATE_OBSERVED;
-    if (strcmp(str, "PEER_DM_OBSERVED") == 0)
-        return PEER_DM_OBSERVED;
-    if (strcmp(str, "PEER_POST_OBSERVED") == 0)
-        return PEER_POST_OBSERVED;
-    if (strcmp(str, "PEER_REACTION_OBSERVED") == 0)
-        return PEER_REACTION_OBSERVED;
-    if (strcmp(str, "PEER_PROXIMITY_OBSERVED") == 0)
-        return PEER_PROXIMITY_OBSERVED;
-    if (strcmp(str, "PEER_BUSINESS_AD_OBSERVED") == 0)
-        return PEER_BUSINESS_AD_OBSERVED;
-    if (strcmp(str, "PEER_BUSINESS_POST_OBSERVED") == 0)
-        return PEER_BUSINESS_POST_OBSERVED;
-    if (strcmp(str, "PEER_COSIGN_REQUEST_OBSERVED") == 0)
-        return PEER_COSIGN_REQUEST_OBSERVED;
-    if (strcmp(str, "PEER_COSIGN_SIG_OBSERVED") == 0)
-        return PEER_COSIGN_SIG_OBSERVED;
-#endif /* AT_SOCIAL_ENABLED */
+    /* CHILD_GROUP was encoded by message_type_to_string but had no arm here,
+     * so over real IPC it decoded to -1 and was dropped: gateway child-group
+     * chains never reached their process (the two ZTA types had the same
+     * defect before they moved to the registry). The conformance hook
+     * bypasses serialization, which is why no scenario saw it. */
+    if (strcmp(str, "CHILD_GROUP") == 0)
+        return CHILD_GROUP;
     if (strcmp(str, "PEER_STANDING") == 0)
         return PEER_STANDING;
     return -1;  // No matching message type found (all valid types are > 0)
+}
+
+/* The inverse of message_type_to_string over BOTH halves of the name space:
+ * the core chain above, then whatever features registered. */
+message_type_t string_to_message_type(const char *str)
+{
+    message_type_t t = message_type_core_by_name(str);
+    if (t != (message_type_t)-1)
+        return t;
+    return (message_type_t)at_msg_type_by_name(str);
 }
 
 int signal_to_proto(const signal_t *msg, void **data_ptr, size_t *data_len_ptr)
@@ -329,10 +268,8 @@ int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr
     json_object_set_new(root, "encrypt", json_boolean(msg->encrypt));
     /* Group-multicast routing flag (Increment 7). Omitted-on-read defaults to
      * false, so a peer predating this field stays byte-compatible. */
-#ifdef AT_SOCIAL_ENABLED
     if (msg->group_multicast)
         json_object_set_new(root, "group_multicast", json_boolean(true));
-#endif /* AT_SOCIAL_ENABLED */
     json_object_set_new(root, "return_to", json_string(msg->return_to));
     /* THE SIGNATURE VERDICT, and why it must cross this hop.
      *
@@ -534,108 +471,6 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         memcpy(subdata, &msg->info.peer_reputation, subdata_len);
         break;
     }
-#ifdef AT_SOCIAL_ENABLED
-    case PEER_POSITION_OBSERVED:
-    {
-        subdata_len = sizeof(peer_position_msg_t);
-        subdata = smrt_create(subdata_len);
-        if (subdata == NULL) return EXCEPTION(ENOMEM);
-        memcpy(subdata, &msg->info.peer_position, subdata_len);
-        break;
-    }
-    case PEER_PROFILE_OBSERVED:
-    {
-        subdata_len = sizeof(peer_profile_msg_t);
-        subdata = smrt_create(subdata_len);
-        if (subdata == NULL) return EXCEPTION(ENOMEM);
-        memcpy(subdata, &msg->info.peer_profile, subdata_len);
-        break;
-    }
-    case PEER_CONNECTION_REQUEST_OBSERVED:
-    case PEER_CONNECTION_STATE_OBSERVED:
-    {
-        subdata_len = sizeof(peer_connection_msg_t);
-        subdata = smrt_create(subdata_len);
-        if (subdata == NULL) return EXCEPTION(ENOMEM);
-        memcpy(subdata, &msg->info.peer_connection, subdata_len);
-        break;
-    }
-    case PEER_DM_OBSERVED:
-    {
-        subdata_len = sizeof(peer_dm_msg_t);
-        subdata = smrt_create(subdata_len);
-        if (subdata == NULL) return EXCEPTION(ENOMEM);
-        memcpy(subdata, &msg->info.peer_dm, subdata_len);
-        break;
-    }
-    case PEER_POST_OBSERVED:
-    {
-        subdata_len = sizeof(peer_post_msg_t);
-        subdata = smrt_create(subdata_len);
-        if (subdata == NULL) return EXCEPTION(ENOMEM);
-        memcpy(subdata, &msg->info.peer_post, subdata_len);
-        break;
-    }
-    case PEER_PROXIMITY_OBSERVED:
-    {
-        subdata_len = sizeof(peer_proximity_msg_t);
-        subdata = smrt_create(subdata_len);
-        if (subdata == NULL) return EXCEPTION(ENOMEM);
-        memcpy(subdata, &msg->info.peer_proximity, subdata_len);
-        break;
-    }
-    case PEER_BUSINESS_AD_OBSERVED:
-    {
-        subdata_len = sizeof(peer_business_ad_msg_t);
-        subdata = smrt_create(subdata_len);
-        if (subdata == NULL) return EXCEPTION(ENOMEM);
-        memcpy(subdata, &msg->info.peer_business_ad, subdata_len);
-        break;
-    }
-    case PEER_BUSINESS_POST_OBSERVED:
-    {
-        subdata_len = sizeof(peer_business_post_msg_t);
-        subdata = smrt_create(subdata_len);
-        if (subdata == NULL) return EXCEPTION(ENOMEM);
-        memcpy(subdata, &msg->info.peer_business_post, subdata_len);
-        break;
-    }
-    case PEER_COSIGN_REQUEST_OBSERVED:
-    {
-        subdata_len = sizeof(peer_cosign_request_msg_t);
-        subdata = smrt_create(subdata_len);
-        if (subdata == NULL) return EXCEPTION(ENOMEM);
-        memcpy(subdata, &msg->info.peer_cosign_request, subdata_len);
-        break;
-    }
-    case PEER_COSIGN_SIG_OBSERVED:
-    {
-        subdata_len = sizeof(peer_cosign_sig_msg_t);
-        subdata = smrt_create(subdata_len);
-        if (subdata == NULL) return EXCEPTION(ENOMEM);
-        memcpy(subdata, &msg->info.peer_cosign_sig, subdata_len);
-        break;
-    }
-    case PEER_REACTION_OBSERVED:
-    {
-        subdata_len = sizeof(peer_reaction_msg_t);
-        subdata = smrt_create(subdata_len);
-        if (subdata == NULL) return EXCEPTION(ENOMEM);
-        memcpy(subdata, &msg->info.peer_reaction, subdata_len);
-        break;
-    }
-#endif /* AT_SOCIAL_ENABLED */
-#ifdef AT_ZTA_ENABLED
-    case ZTA_REVOCATION_ALERT:
-    case ZTA_VERIFICATION_RESULT:
-    {
-        subdata_len = sizeof(zta_event_msg_t);
-        subdata = smrt_create(subdata_len);
-        if (subdata == NULL) return EXCEPTION(ENOMEM);
-        memcpy(subdata, &msg->info.zta_event, subdata_len);
-        break;
-    }
-#endif
     case PEER_STANDING:
     {
         subdata_len = sizeof(peer_standing_msg_t);
@@ -648,7 +483,23 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         /* UPDATE_PROPOSAL uses its own JSON serialization, not proto */
         return -1;
     default:
-        return -1;
+    {
+        /* A feature's type: its payload rides the opaque arm. */
+        const at_msg_vtable_t *vt = at_msg_type_lookup(msg->type);
+        if (vt == NULL)
+            return -1;
+        if (vt->to_proto != NULL)
+        {
+            if (vt->to_proto(msg->info.payload, &subdata, &subdata_len) != 0)
+                return -1;
+            break;
+        }
+        subdata_len = vt->size;
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, msg->info.payload, subdata_len);
+        break;
+    }
     }
     return wrap_in_any(msg->type, subdata, subdata_len, data, data_len);
 }
@@ -740,10 +591,8 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
 
     net_msg->encrypt = json_boolean_value(json_object_get(root, "encrypt"));
     /* Group-multicast routing flag (Increment 7); absent -> false. */
-#ifdef AT_SOCIAL_ENABLED
     net_msg->group_multicast =
         json_boolean_value(json_object_get(root, "group_multicast"));
-#endif /* AT_SOCIAL_ENABLED */
 
     /* See net_msg_to_proto: the wire-parse signature verdict, absent here for
      * as long as this serializer has existed. Defaults false when the field is
@@ -894,51 +743,9 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
     case PEER_OBSERVED:
         COPY_FIXED_PAYLOAD(peer_observed, peer_observed_msg_t);
         break;
-#ifdef AT_SOCIAL_ENABLED
-    case PEER_POSITION_OBSERVED:
-        COPY_FIXED_PAYLOAD(peer_position, peer_position_msg_t);
-        break;
-    case PEER_PROFILE_OBSERVED:
-        COPY_FIXED_PAYLOAD(peer_profile, peer_profile_msg_t);
-        break;
-    case PEER_CONNECTION_REQUEST_OBSERVED:
-    case PEER_CONNECTION_STATE_OBSERVED:
-        COPY_FIXED_PAYLOAD(peer_connection, peer_connection_msg_t);
-        break;
-    case PEER_DM_OBSERVED:
-        COPY_FIXED_PAYLOAD(peer_dm, peer_dm_msg_t);
-        break;
-    case PEER_POST_OBSERVED:
-        COPY_FIXED_PAYLOAD(peer_post, peer_post_msg_t);
-        break;
-    case PEER_REACTION_OBSERVED:
-        COPY_FIXED_PAYLOAD(peer_reaction, peer_reaction_msg_t);
-        break;
-    case PEER_PROXIMITY_OBSERVED:
-        COPY_FIXED_PAYLOAD(peer_proximity, peer_proximity_msg_t);
-        break;
-    case PEER_BUSINESS_AD_OBSERVED:
-        COPY_FIXED_PAYLOAD(peer_business_ad, peer_business_ad_msg_t);
-        break;
-    case PEER_BUSINESS_POST_OBSERVED:
-        COPY_FIXED_PAYLOAD(peer_business_post, peer_business_post_msg_t);
-        break;
-    case PEER_COSIGN_REQUEST_OBSERVED:
-        COPY_FIXED_PAYLOAD(peer_cosign_request, peer_cosign_request_msg_t);
-        break;
-    case PEER_COSIGN_SIG_OBSERVED:
-        COPY_FIXED_PAYLOAD(peer_cosign_sig, peer_cosign_sig_msg_t);
-        break;
-#endif /* AT_SOCIAL_ENABLED */
     case PEER_REPUTATION:
         COPY_FIXED_PAYLOAD(peer_reputation, peer_reputation_msg_t);
         break;
-#ifdef AT_ZTA_ENABLED
-    case ZTA_REVOCATION_ALERT:
-    case ZTA_VERIFICATION_RESULT:
-        COPY_FIXED_PAYLOAD(zta_event, zta_event_msg_t);
-        break;
-#endif
     case PEER_STANDING:
         COPY_FIXED_PAYLOAD(peer_standing, peer_standing_msg_t);
         break;
@@ -947,8 +754,34 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
         ret = -1;
         break;
     default:
-        ret = -1;
+    {
+        const at_msg_vtable_t *vt = at_msg_type_lookup(msg->type);
+        if (vt == NULL)
+        {
+            ret = -1;
+            break;
+        }
+        if (vt->from_proto != NULL)
+        {
+            ret = vt->from_proto(pb_msg->value.data, pb_msg->value.len,
+                                 msg->info.payload) != 0 ? -1 : 0;
+            break;
+        }
+        /* The same length check COPY_FIXED_PAYLOAD makes, for the same reason:
+         * the sender picks type_url, so it would otherwise pick how far past
+         * the end of value.data this reads. */
+        if (pb_msg->value.len < vt->size)
+        {
+            log_error(NULL, "proto_to_generic_msg: %s payload is %zu bytes, "
+                      "needs %zu; dropping\n", vt->name, pb_msg->value.len,
+                      vt->size);
+            ret = -1;
+            break;
+        }
+        memcpy(msg->info.payload, pb_msg->value.data, vt->size);
+        ret = 0;
         break;
+    }
     }
     google__protobuf__any__free_unpacked(pb_msg, NULL);
     return ret;

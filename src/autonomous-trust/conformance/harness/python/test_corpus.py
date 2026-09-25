@@ -24,17 +24,17 @@ from __future__ import annotations
 
 import pytest
 
-from ..common.scenario_loader import Case, discover
+from ..common.scenario_loader import Case
 from .runner import (
-    CORPUS_ROOT,
     Report,
     _adapters,
+    discover_all,
     run_case,
     write_report,
 )
 
 
-_CASES: list[Case] = discover(CORPUS_ROOT)
+_CASES: list[Case] = discover_all()
 _ADAPTERS = _adapters()
 _REPORT = Report()
 

@@ -365,6 +365,13 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
         // pproc->peer_capabilities = message
         return true;
     default: {
+        /* Only a NET_MESSAGE carries a net_msg. Anything else reaching here --
+         * a registered feature type, or a core type this process has no arm
+         * for -- used to be read as one anyway, comparing payload bytes
+         * against the process name and, on a chance match, calling through
+         * whatever sat where net_msg.function would be. */
+        if (msgtype != NET_MESSAGE)
+            return false;
         net_msg_t *nmsg = &msg->info.net_msg;
         if (strcmp(nmsg->process, proc->name) == 0)
         {

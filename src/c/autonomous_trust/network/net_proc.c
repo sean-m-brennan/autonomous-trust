@@ -36,6 +36,7 @@
 #include <pthread.h>
 
 #include "processes/processes.h"
+#include "processes/extension.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
@@ -45,12 +46,7 @@
 #include "network/net_message.h"
 #include "network/net_transport.h"
 #include "network/net_proc_priv.h"
-#ifdef AT_NET_ENVELOPE
-#include "network/net_envelope.h"
-#endif
-#ifdef AT_NET_GROUP_FORWARD
-#include "network/net_transport_hybrid.h"
-#endif
+#include "network/net_filter.h"
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
 #include "structures/map.h"
@@ -846,7 +842,7 @@ size_t net_proc_test_sweep_stale(void)
 /* Capture of the most recent from_whom.address handed to route_to_process,
  * so cross-cluster discovery tests can observe whether the envelope-based
  * overwrite suppression preserved the wire payload's self-reported
- * address (AT_DISCOVERY_CROSS_CLUSTER). Empty string after reset. */
+ * address (the gateway's cross_cluster switch). Empty string after reset. */
 static char          _test_last_routed_from_addr[ADDR_LEN + 1] = {0};
 static pthread_mutex_t _test_last_routed_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -923,7 +919,6 @@ static void track_recv(const char *address, size_t bytes)
  * Peer lookup
  ****************************/
 
-#ifndef AT_NET_ENVELOPE
 static const public_identity_t *find_peer_by_address(const process_t *proc, const char *addr)
 {
     /* peers[] is append-only; the underlying array is inline (never reallocated),
@@ -939,10 +934,8 @@ static const public_identity_t *find_peer_by_address(const process_t *proc, cons
     peers_read_unlock(proc);
     return match;
 }
-#endif
 
-#ifdef AT_NET_ENVELOPE
-static const public_identity_t *find_peer_by_uuid(const process_t *proc, const uuid_t uuid)
+const public_identity_t *net_find_peer_by_uuid(const process_t *proc, const uuid_t uuid)
 {
     peers_read_lock(proc);
     const public_identity_t *match = NULL;
@@ -955,7 +948,6 @@ static const public_identity_t *find_peer_by_uuid(const process_t *proc, const u
     peers_read_unlock(proc);
     return match;
 }
-#endif
 
 /****************************
  * Decrypt helper (peer-to-peer messages)
@@ -1046,176 +1038,25 @@ static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
     return 0;
 }
 
-#ifdef AT_NET_ENVELOPE
-/****************************
- * Envelope helpers (gateway forwarding — at-over-dtn.md §4.3)
- ****************************/
-
-/* Wrap an inner payload in the plaintext forwarding envelope. Caller owns
- * @p *out_frame and must free(). @p payload is copied; caller retains its
- * own ownership. @p dst_uuid may be NULL for NET_ENV_TYPE_BROADCAST (NIL dst). */
-static int envelope_wrap(net_env_type_t type,
-                         const uuid_t src_uuid, const uuid_t dst_uuid,
-                         const uint8_t *payload, size_t payload_len,
-                         uint8_t **out_frame, size_t *out_frame_len)
+/* Run the network filter chain (net_filter.h) over one outbound frame. On
+ * success *out is @p in when no filter changed it, else a buffer the caller
+ * frees. */
+static int filter_outbound(net_channel_t ch, const identity_t *myself,
+                           const unsigned char *dst_uuid,
+                           const uint8_t *in, size_t in_len,
+                           const uint8_t **out, size_t *out_len)
 {
-    net_envelope_t env = {
-        .version   = NET_ENV_VERSION,
-        .type      = type,
-        .flags     = 0,
-        .hop_count = 0,
+    net_send_info_t info = {
+        .channel  = ch,
+        .src_uuid = myself != NULL ? myself->uuid : NULL,
+        .dst_uuid = dst_uuid,
     };
-    memcpy(env.src_uuid, src_uuid, 16);
-    if (dst_uuid != NULL) memcpy(env.dst_uuid, dst_uuid, 16);
-    else                  memset(env.dst_uuid, 0, 16);
-
-    size_t cap = NET_ENV_HEADER_LEN + payload_len;
-    uint8_t *frame = malloc(cap);
-    if (frame == NULL) return SYS_EXCEPTION();
-
-    if (net_envelope_pack(&env, payload, payload_len, frame, cap, out_frame_len) != 0) {
-        free(frame);
+    uint8_t *o = NULL;
+    if (net_filters_outbound(&info, in, in_len, &o, out_len) != 0)
         return -1;
-    }
-    *out_frame = frame;
+    *out = o;
     return 0;
 }
-
-/* Inbound envelope classification. Internal alias of net_env_disposition_t
- * so the existing call sites keep reading with intention-revealing names. */
-typedef enum {
-    ENV_DELIVER_LOCAL = NET_ENV_DISPOSITION_LOCAL,
-    ENV_DROP          = NET_ENV_DISPOSITION_DROP,
-    ENV_FORWARD       = NET_ENV_DISPOSITION_FORWARD,
-} env_decision_t;
-
-static env_decision_t classify_envelope(const net_envelope_t *env,
-                                        const identity_t *myself,
-                                        const group_t *grp,
-                                        bool gateway)
-{
-    static const uuid_t NIL_UUID = {0};
-    return (env_decision_t)net_envelope_disposition(
-        env,
-        myself != NULL ? myself->uuid : NIL_UUID,
-        grp != NULL ? grp->uuid : NIL_UUID,
-        gateway);
-}
-
-/* ---- Broadcast-relay dedup + rate limit (cross-leg forwarding) -----
- *
- * A gateway re-broadcasts each inbound BROADCAST onto its other legs so
- * discovery announcements bridge clusters (at-over-dtn.md §4.3 item D).
- * Three controls keep that safe:
- *   1. Hop count cap (enforced by net_envelope_should_forward_broadcast).
- *   2. Fingerprint dedup ring — we don't re-forward the same broadcast
- *      twice within BCAST_DEDUP_WINDOW_MS, so mutual gateways can't
- *      infinite-loop.
- *   3. Rate-limit token bucket — cap forwards-per-second as a simple DoS
- *      gate against a rogue sender flooding new broadcasts.
- *
- * Known limitation (not handled here; documented for the reader):
- * hybrid->send_broadcast fans out to ALL inners, so nodes on the
- * originating leg see a re-forwarded copy. Discovery payloads are
- * idempotent at the upper layer, so this is acceptable; a future slice
- * could add per-leg source tracking to the transport API. */
-#define BCAST_DEDUP_CAP       128
-#define BCAST_DEDUP_WINDOW_MS 5000
-#define BCAST_RATE_PER_SEC    64
-
-typedef struct {
-    uint64_t fingerprint;
-    uint64_t ts_ms;
-} bcast_dedup_entry_t;
-
-static bcast_dedup_entry_t bcast_dedup[BCAST_DEDUP_CAP];
-static size_t bcast_dedup_next = 0;  /* next write slot (ring) */
-static size_t bcast_tokens = BCAST_RATE_PER_SEC;
-static uint64_t bcast_tokens_ts_ms = 0;
-static pthread_mutex_t bcast_fwd_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static uint64_t now_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000L);
-}
-
-/* Returns true iff this fingerprint has NOT been seen recently AND a
- * forwarding token is available. On true, the entry is recorded and a
- * token consumed — the caller must proceed to forward (or accept the
- * double-bookkeeping of a recorded-but-skipped entry; we tolerate that
- * because the window self-heals in BCAST_DEDUP_WINDOW_MS). */
-static bool bcast_may_forward(uint64_t fp)
-{
-    uint64_t now = now_ms();
-    pthread_mutex_lock(&bcast_fwd_lock);
-
-    /* Dedup: linear scan is fine for 128 entries. */
-    for (size_t i = 0; i < BCAST_DEDUP_CAP; i++) {
-        if (bcast_dedup[i].fingerprint == fp &&
-            bcast_dedup[i].ts_ms != 0 &&
-            (now - bcast_dedup[i].ts_ms) < BCAST_DEDUP_WINDOW_MS) {
-            pthread_mutex_unlock(&bcast_fwd_lock);
-            return false;
-        }
-    }
-
-    /* Rate limit: refill proportionally to elapsed time (cap at max). */
-    if (bcast_tokens_ts_ms == 0) {
-        bcast_tokens_ts_ms = now;
-    } else {
-        uint64_t elapsed = now - bcast_tokens_ts_ms;
-        if (elapsed >= 1000) {
-            size_t add = (size_t)((elapsed / 1000) * BCAST_RATE_PER_SEC);
-            if (add > BCAST_RATE_PER_SEC) add = BCAST_RATE_PER_SEC;
-            if (bcast_tokens + add > BCAST_RATE_PER_SEC)
-                bcast_tokens = BCAST_RATE_PER_SEC;
-            else
-                bcast_tokens += add;
-            bcast_tokens_ts_ms = now;
-        }
-    }
-    if (bcast_tokens == 0) {
-        pthread_mutex_unlock(&bcast_fwd_lock);
-        return false;
-    }
-    bcast_tokens--;
-
-    /* Record. */
-    bcast_dedup[bcast_dedup_next].fingerprint = fp;
-    bcast_dedup[bcast_dedup_next].ts_ms       = now;
-    bcast_dedup_next = (bcast_dedup_next + 1) % BCAST_DEDUP_CAP;
-
-    pthread_mutex_unlock(&bcast_fwd_lock);
-    return true;
-}
-
-/* Relay a PEER envelope frame out the same transport. The frame buffer is
- * mutated (hop_count bumped, FORWARDED flag set) before send. Looks up the
- * destination address by dst_uuid in the local peer registry — on a hybrid
- * transport, the inner-selection matcher then steers the send to whichever
- * inner transport serves that peer. */
-static int envelope_forward(const net_envelope_t *env_in,
-                            uint8_t *frame, size_t frame_len,
-                            const process_t *proc,
-                            const net_transport_t *transport,
-                            net_transport_ctx_t *ctx,
-                            int port, logger_t *logger)
-{
-    const public_identity_t *dst = find_peer_by_uuid(proc, env_in->dst_uuid);
-    if (dst == NULL) {
-        log_debug(logger, "Envelope: no peer registered for dst uuid; dropping\n");
-        return -1;
-    }
-    net_envelope_t next = *env_in;
-    next.hop_count = (uint8_t)(next.hop_count + 1);
-    next.flags     = (uint8_t)(next.flags | NET_ENV_FLAG_FORWARDED);
-    if (net_envelope_rewrite_header(&next, frame, frame_len) != 0)
-        return -1;
-    return transport->send_unicast(ctx, frame, frame_len, dst->address, port);
-}
-#endif /* AT_NET_ENVELOPE */
 
 /* Forward declaration; defined immediately below this section. */
 static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
@@ -1370,17 +1211,11 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
     if (msg->to_whom.type == RECIPIENT_BROADCAST) {
         const uint8_t *send_buf = wire;
         size_t         send_len = wire_len;
-#ifdef AT_NET_ENVELOPE
-        uint8_t *env_frame = NULL;
-        size_t   env_frame_len = 0;
-        if (envelope_wrap(NET_ENV_TYPE_BROADCAST, myself->uuid, NULL,
-                          wire, wire_len, &env_frame, &env_frame_len) != 0) {
+        if (filter_outbound(NET_CHAN_BROADCAST, myself, NULL,
+                            wire, wire_len, &send_buf, &send_len) != 0) {
             free(wire);
             return SYS_EXCEPTION();
         }
-        send_buf = env_frame;
-        send_len = env_frame_len;
-#endif
         int ret = transport->send_broadcast(ctx, NET_CHAN_BROADCAST,
                                             send_buf, send_len, port);
         if (ret == 0) {
@@ -1391,9 +1226,8 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
         } else {
             track_send_error(msg->to_whom.target.peer.address);
         }
-#ifdef AT_NET_ENVELOPE
-        free(env_frame);
-#endif
+        if (send_buf != wire)
+            free((void *)send_buf);
         free(wire);
         return ret;
     }
@@ -1403,7 +1237,6 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
      * broadcast branch's transport shape and the encrypted-peer branch's
      * nonce|ciphertext framing, but keyed to the group instead of one peer. The
      * receive side is handle_inbound_group (group_decrypt + route_to_process). */
-#ifdef AT_SOCIAL_ENABLED
     if (msg->to_whom.type == RECIPIENT_GROUP) {
         if (grp == NULL || grp->address[0] == '\0') {
             /* No group key held (not admitted / public-only view): a multicast
@@ -1460,28 +1293,20 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
 
         const uint8_t *send_buf = frame;
         size_t         send_len = frame_len;
-#ifdef AT_NET_ENVELOPE
-        uint8_t *env_frame = NULL;
-        size_t   env_frame_len = 0;
-        if (envelope_wrap(NET_ENV_TYPE_GROUP, myself->uuid, grp->uuid,
-                          frame, frame_len, &env_frame, &env_frame_len) != 0) {
+        if (filter_outbound(NET_CHAN_GROUP, myself, grp->uuid,
+                            frame, frame_len, &send_buf, &send_len) != 0) {
             free(frame);
             return SYS_EXCEPTION();
         }
-        send_buf = env_frame;
-        send_len = env_frame_len;
-#endif
         int ret = transport->send_broadcast(ctx, NET_CHAN_GROUP,
                                             send_buf, send_len, port);
         if (ret == -1)
             log_debug(logger, "Network: transport lacks group multicast; skipping\n");
-#ifdef AT_NET_ENVELOPE
-        free(env_frame);
-#endif
+        if (send_buf != frame)
+            free((void *)send_buf);
         free(frame);
         return ret;
     }
-#endif /* AT_SOCIAL_ENABLED */
 
     /* Encrypted peer: wrap wire bytes in nonce|ciphertext. */
     if (msg->encrypt && msg->to_whom.type == RECIPIENT_PEER) {
@@ -1521,25 +1346,17 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
 
         const uint8_t *send_buf = frame;
         size_t         send_len = frame_len;
-#ifdef AT_NET_ENVELOPE
-        uint8_t *env_frame = NULL;
-        size_t   env_frame_len = 0;
-        if (envelope_wrap(NET_ENV_TYPE_PEER, myself->uuid,
-                          msg->to_whom.target.peer.uuid,
-                          frame, frame_len, &env_frame, &env_frame_len) != 0) {
+        if (filter_outbound(NET_CHAN_PEER, myself, msg->to_whom.target.peer.uuid,
+                            frame, frame_len, &send_buf, &send_len) != 0) {
             free(frame);
             return SYS_EXCEPTION();
         }
-        send_buf = env_frame;
-        send_len = env_frame_len;
-#endif
         const char *host = msg->to_whom.target.peer.address;
         int ret = transport->send_unicast(ctx, send_buf, send_len, host, port);
         if (ret == 0) track_send(host, send_len);
         else          track_send_error(host);
-#ifdef AT_NET_ENVELOPE
-        free(env_frame);
-#endif
+        if (send_buf != frame)
+            free((void *)send_buf);
         free(frame);
         return ret;
     }
@@ -1547,25 +1364,17 @@ static int net_encrypt_and_send(const identity_t *myself, const group_t *grp,
     /* Unencrypted peer send */
     const uint8_t *send_buf = wire;
     size_t         send_len = wire_len;
-#ifdef AT_NET_ENVELOPE
-    uint8_t *env_frame = NULL;
-    size_t   env_frame_len = 0;
-    if (envelope_wrap(NET_ENV_TYPE_PEER, myself->uuid,
-                      msg->to_whom.target.peer.uuid,
-                      wire, wire_len, &env_frame, &env_frame_len) != 0) {
+    if (filter_outbound(NET_CHAN_PEER, myself, msg->to_whom.target.peer.uuid,
+                        wire, wire_len, &send_buf, &send_len) != 0) {
         free(wire);
         return SYS_EXCEPTION();
     }
-    send_buf = env_frame;
-    send_len = env_frame_len;
-#endif
     const char *host = msg->to_whom.target.peer.address;
     int ret = transport->send_unicast(ctx, send_buf, send_len, host, port);
     if (ret == 0) track_send(host, send_len);
     else          track_send_error(host);
-#ifdef AT_NET_ENVELOPE
-    free(env_frame);
-#endif
+    if (send_buf != wire)
+        free((void *)send_buf);
     free(wire);
     return ret;
 }
@@ -1655,10 +1464,11 @@ static net_wire_format_t wire_format_for_address(const group_t *grp,
  * is local bootstrap, so the format is JSON by rule. Relax either one and
  * detection is back on the table.
  *
- * NOTE the one build that can violate G: AT_NET_GROUP_FORWARD (OFF by default)
- * relays opaque group ciphertext across transport legs by operator-configured
- * route, which by construction carries a group past a gateway that is not in
- * it. See handle_inbound_group and doc/architecture/network-wire-format.md.
+ * NOTE the one configuration that can violate G: the gateway's group_forward
+ * (libat_gateway, off unless the network config sets it) relays opaque group
+ * ciphertext across transport legs by operator-configured route, which by
+ * construction carries a group past a gateway that is not in it. See
+ * extensions/gateway/gateway.c and doc/architecture/network-wire-format.md.
  */
 
 /* Whether `address` is listed by a group, by walking its address_map values.
@@ -1822,29 +1632,18 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
     size_t         inner_len = nbytes;
     const public_identity_t *peer = NULL;
 
-#ifdef AT_NET_ENVELOPE
-    net_envelope_t env;
-    if (net_envelope_unpack(buf, nbytes, &env, &inner_buf, &inner_len) != 0) {
-        log_debug(ctx->logger, "Network: dropping malformed envelope from %s\n", from_addr);
+    /* Filters first (net_filter.h): they may drop or consume the frame, and
+     * narrow what is decoded below. */
+    net_inbound_meta_t meta;
+    if (net_filters_inbound(ctx, NET_CHAN_PEER, buf, nbytes, from_addr, &meta)
+        != NET_FILTER_CONTINUE)
         return;
-    }
-    bool gw = (ctx->transport->is_gateway != NULL &&
-               ctx->transport->is_gateway(ctx->ctx));
-    env_decision_t d = classify_envelope(&env, ctx->myself, NULL, gw);
-    if (d == ENV_DROP)
-        return;
-    if (d == ENV_FORWARD) {
-        envelope_forward(&env, buf, nbytes, ctx->proc,
-                         ctx->transport, ctx->ctx,
-                         ctx->net_cfg->port, ctx->logger);
-        return;
-    }
-    /* Local delivery: identify the ORIGINAL sender by envelope src_uuid,
-     * not by from_addr (which may be a gateway, not the originator). */
-    peer = find_peer_by_uuid(ctx->proc, env.src_uuid);
-#else
-    peer = find_peer_by_address(ctx->proc, from_addr);
-#endif
+    inner_buf = meta.inner;
+    inner_len = meta.inner_len;
+    /* A filter that knows the ORIGINAL sender (the routing envelope) names
+     * it; from_addr may be a gateway, not the originator. */
+    peer = meta.has_src_uuid ? net_find_peer_by_uuid(ctx->proc, meta.src_uuid)
+                             : find_peer_by_address(ctx->proc, from_addr);
 
     if (peer != NULL) {
         uint8_t *plain = NULL;
@@ -1960,7 +1759,7 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
             net_wire_msg_free(&wmsg);
         } else {
             /* Encrypted message from unknown peer — defer for retry. In
-             * envelope mode the retry key is env.src_uuid (the originator),
+             * envelope mode the retry key is the originator's uuid (meta.src_uuid),
              * NOT from_addr — the latter is the gateway's address under a
              * forwarded frame, and the future peer IPC arrives carrying
              * the original sender's own address, not the gateway's. */
@@ -1974,11 +1773,8 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
                      "Network: deferring encrypted frame (%zu bytes) from %s —"
                      " no peer known at that address yet\n",
                      inner_len, from_addr);
-#ifdef AT_NET_ENVELOPE
-            defer_message(inner_buf, inner_len, from_addr, env.src_uuid);
-#else
-            defer_message(inner_buf, inner_len, from_addr, NULL);
-#endif
+            defer_message(inner_buf, inner_len, from_addr,
+                          meta.has_src_uuid ? meta.src_uuid : NULL);
         }
     }
 }
@@ -2025,17 +1821,12 @@ void handle_inbound_broadcast(net_thread_ctx_t *ctx,
     const uint8_t *inner_buf = buf;
     size_t         inner_len = nbytes;
 
-#ifdef AT_NET_ENVELOPE
-    net_envelope_t env;
-    if (net_envelope_unpack(buf, nbytes, &env, &inner_buf, &inner_len) != 0) {
-        log_debug(ctx->logger, "Network: dropping malformed envelope from %s\n", from_addr);
+    net_inbound_meta_t meta;
+    if (net_filters_inbound(ctx, NET_CHAN_BROADCAST, buf, nbytes, from_addr, &meta)
+        != NET_FILTER_CONTINUE)
         return;
-    }
-    /* BROADCAST envelopes always classify local; non-broadcast types
-     * should not arrive on the BCAST channel — drop defensively. */
-    if (env.type != NET_ENV_TYPE_BROADCAST)
-        return;
-#endif
+    inner_buf = meta.inner;
+    inner_len = meta.inner_len;
 
     /* Broadcast messages are unencrypted -- and JSON unconditionally: the
      * broadcast channel IS discovery, so there is no group to consult and the
@@ -2044,18 +1835,10 @@ void handle_inbound_broadcast(net_thread_ctx_t *ctx,
     net_wire_msg_t wmsg;
     if (net_message_from_wire_fmt(inner_buf, inner_len, NULL,
                                   NET_WIRE_JSON, &wmsg) == 0) {
-        bool preserve_self_reported = false;
-#ifdef AT_DISCOVERY_CROSS_CLUSTER
-        /* Cross-cluster discovery: when the envelope was forwarded by a
-         * gateway, from_addr is the gateway — NOT the original announcer.
-         * Preserve the announcer's self-reported address from the wire
-         * payload so replies (ID_ACCEPT, etc.) route back through the
-         * same gateway via the hybrid CIDR matcher rather than landing
-         * at the gateway itself. */
-        if ((env.flags & NET_ENV_FLAG_FORWARDED) != 0)
-            preserve_self_reported = true;
-#endif
-        if (!preserve_self_reported) {
+        /* A filter may ask to keep the announcer's self-reported address:
+         * cross-cluster discovery does, for a frame a gateway forwarded, where
+         * from_addr is the gateway and not the announcer. */
+        if (!meta.keep_reported_addr) {
             snprintf(wmsg.from_whom.address, sizeof(wmsg.from_whom.address),
                      "%s", from_addr);
         }
@@ -2072,45 +1855,9 @@ void handle_inbound_broadcast(net_thread_ctx_t *ctx,
                   from_addr);
     }
 
-#ifdef AT_NET_ENVELOPE
-    /* Gateway cross-leg relay: deliver-and-forward. The frame buffer is
-     * mutated (hop++ + FORWARDED flag) before we re-emit via the same
-     * transport. On a hybrid transport, send_broadcast_except_leg fans
-     * out to every leg except the one that delivered this frame — so
-     * nodes on the origin leg don't receive a duplicate of the broadcast
-     * they sent (D-followup). Single-leg transports leave the
-     * except_leg method NULL and fall back to send_broadcast. */
-    bool gw = (ctx->transport->is_gateway != NULL &&
-               ctx->transport->is_gateway(ctx->ctx));
-    if (!net_envelope_should_forward_broadcast(&env, gw))
-        return;
-
-    uint64_t fp = net_envelope_broadcast_fingerprint(&env, inner_buf, inner_len);
-    if (!bcast_may_forward(fp))
-        return;
-
-    net_envelope_t next = env;
-    next.hop_count = (uint8_t)(next.hop_count + 1);
-    next.flags     = (uint8_t)(next.flags | NET_ENV_FLAG_FORWARDED);
-    if (net_envelope_rewrite_header(&next, buf, nbytes) != 0)
-        return;
-
-    int origin_leg = -1;
-    if (ctx->transport->last_recv_leg != NULL)
-        origin_leg = ctx->transport->last_recv_leg(ctx->ctx, NET_CHAN_BROADCAST);
-
-    int rc;
-    if (origin_leg >= 0 && ctx->transport->send_broadcast_except_leg != NULL) {
-        rc = ctx->transport->send_broadcast_except_leg(
-            ctx->ctx, NET_CHAN_BROADCAST, buf, nbytes,
-            ctx->net_cfg->port, (size_t)origin_leg);
-    } else {
-        rc = ctx->transport->send_broadcast(ctx->ctx, NET_CHAN_BROADCAST,
-                                            buf, nbytes, ctx->net_cfg->port);
-    }
-    if (rc != 0 && rc != -1)
-        log_debug(ctx->logger, "Network: broadcast relay send returned %d\n", rc);
-#endif
+    /* Deliver-and-forward: a filter may re-emit the frame once the core has
+     * handled it (the gateway's broadcast relay). */
+    net_filters_after_deliver(ctx, NET_CHAN_BROADCAST, &meta);
 }
 
 static void *broadcast_receiver_thread(void *arg)
@@ -2196,50 +1943,14 @@ void handle_inbound_group(net_thread_ctx_t *ctx,
     const uint8_t *inner_buf = buf;
     size_t         inner_len = nbytes;
 
-#ifdef AT_NET_ENVELOPE
-    net_envelope_t env;
-    if (net_envelope_unpack(buf, nbytes, &env, &inner_buf, &inner_len) != 0) {
-        log_debug(ctx->logger, "Network: dropping malformed group envelope from %s\n", from_addr);
+    /* Filters first: a frame for another group is theirs to drop or, on a
+     * gateway, forward across legs (the gateway's group forward). */
+    net_inbound_meta_t meta;
+    if (net_filters_inbound(ctx, NET_CHAN_GROUP, buf, nbytes, from_addr, &meta)
+        != NET_FILTER_CONTINUE)
         return;
-    }
-    bool am_gateway = (ctx->transport->is_gateway != NULL &&
-                       ctx->transport->is_gateway(ctx->ctx));
-    env_decision_t d = classify_envelope(&env, ctx->myself, grp, am_gateway);
-    if (d != ENV_DELIVER_LOCAL) {
-#ifdef AT_NET_GROUP_FORWARD
-        /* Cross-group bridging: if we're a gateway and the operator has
-         * configured a route for this dst_uuid, forward via the target
-         * leg. Dedup ring is shared with broadcast relay — fingerprints
-         * occupy disjoint 2^64 spaces in practice, and the "recently
-         * forwarded" semantic is identical. */
-        if (am_gateway &&
-            net_envelope_should_forward_group(&env, am_gateway) &&
-            ctx->transport->send_on_leg != NULL &&
-            ctx->transport_cfg != NULL) {
-            const hybrid_config_t *hcfg = ctx->transport_cfg;
-            size_t leg_index = 0;
-            if (hybrid_group_route_lookup(hcfg, env.dst_uuid, &leg_index) == 0) {
-                uint64_t fp = net_envelope_group_fingerprint(&env, inner_buf, inner_len);
-                if (bcast_may_forward(fp)) {
-                    net_envelope_t next = env;
-                    next.hop_count = (uint8_t)(next.hop_count + 1);
-                    next.flags     = (uint8_t)(next.flags | NET_ENV_FLAG_FORWARDED);
-                    if (net_envelope_rewrite_header(&next, buf, nbytes) == 0) {
-                        int rc = ctx->transport->send_on_leg(
-                            ctx->ctx, leg_index, NET_CHAN_GROUP,
-                            buf, nbytes, ctx->net_cfg->port);
-                        if (rc != 0 && rc != -1)
-                            log_debug(ctx->logger,
-                                      "Network: group forward send returned %d\n", rc);
-                    }
-                }
-            }
-        }
-#endif
-        /* Not our group and either not a gateway or no route matches. */
-        return;
-    }
-#endif
+    inner_buf = meta.inner;
+    inner_len = meta.inner_len;
 
     /* Local-delivery path requires group membership (need the group key
      * to decrypt). A gateway forwarding without being in the group takes
@@ -2510,6 +2221,19 @@ static int network_run(const net_transport_t *transport,
         .transport_cfg = transport_specific,
     };
 
+    /* Network has no handler table of its own to register; an extension may
+     * still want one here, and must have it before the receivers start. */
+    at_extensions_register_handlers(proc, "network");
+
+    /* The filters are in place now; refuse a config they cannot honour (the
+     * envelope with libat_gateway absent) rather than join a cohort speaking
+     * a different wire format. */
+    if (net_filters_check_config(net_cfg, logger) != 0) {
+        transport->close(tctx);
+        if (my_public != NULL) smrt_deref(my_public);
+        return -1;
+    }
+
     pthread_t peer_thread, bcast_thread, grp_thread;
     pthread_create(&peer_thread,  NULL, peer_receiver_thread,      &thread_ctx);
     pthread_create(&bcast_thread, NULL, broadcast_receiver_thread, &thread_ctx);
@@ -2674,20 +2398,13 @@ static int network_run(const net_transport_t *transport,
              * nmsg->group_multicast (there is no per-peer to_whom). Checked
              * BEFORE is_broadcast because a group message also carries an empty
              * to_whom.address. */
-            bool is_group = false;
-#ifdef AT_SOCIAL_ENABLED
-            is_group = nmsg->group_multicast;
-#endif /* AT_SOCIAL_ENABLED */
+            bool is_group = nmsg->group_multicast;
             bool is_broadcast = (!is_group && nmsg->to_whom.address[0] == '\0');
-#ifdef AT_SOCIAL_ENABLED
             if (is_group) {
                 wmsg.to_whom.type = RECIPIENT_GROUP;
                 log_debug(logger, "Network: group-multicasting %s.%s\n",
                           nmsg->process, nmsg->function);
             } else if (is_broadcast) {
-#else
-            if (is_broadcast) {
-#endif /* AT_SOCIAL_ENABLED */
                 wmsg.to_whom.type = RECIPIENT_BROADCAST;
                 snprintf(wmsg.to_whom.target.peer.address,
                          sizeof(wmsg.to_whom.target.peer.address),
@@ -2814,7 +2531,7 @@ static int network_run(const net_transport_t *transport,
 
                 /* Retry deferred encrypted messages with the new peer. Match
                  * by envelope src_uuid when the entry has one (gateway-
-                 * forwarded traffic under AT_NET_ENVELOPE); otherwise by
+                 * forwarded traffic under the routing envelope); otherwise by
                  * the transport-reported from_addr (legacy / non-envelope).
                  *
                  * Slots are owning heap pointers (post-2026-05-28). On
@@ -2932,6 +2649,5 @@ int network_tcp_ip6_run(process_t *proc, directory_t *queues, queue_id_t signal,
 { return network_run_by_name("tcp_net_6", proc, queues, signal, logger); }
 DECLARE_PROCESS(network, tcp_net_6, network_tcp_ip6_run);
 
-/* DTN runner + its process declaration live in network/dtn/net_transport_dtn.c
- * so the table generator excludes them when AT_NET_DTN is off; the dtn/
- * subdirectory is excluded from preprocess.py in that case. */
+/* DTN is an extension library (src/c/extensions/dtn/, libat_dtn): its runner
+ * and transport register themselves when the library loads. */

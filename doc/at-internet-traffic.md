@@ -59,7 +59,7 @@ dynamic trust model replacing static relay selection.
 
 AT messages are datagrams up to 1 MB. Two encapsulation strategies:
 
-**a) Packet-level tunneling (L3)**
+**a) Packet-level tunneling (L3):**
 
 Each IP packet becomes an AT message payload:
 
@@ -73,7 +73,7 @@ AT Message:
 Simple, preserves IP semantics. But small packets (TCP ACKs, DNS queries) waste
 overhead in the AT framing.
 
-**b) Stream-level proxying (L4/L7)**
+**b) Stream-level proxying (L4/L7):**
 
 The entry node terminates TCP, buffers application data, and sends larger AT
 messages:

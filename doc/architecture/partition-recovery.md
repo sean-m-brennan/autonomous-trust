@@ -49,7 +49,7 @@ is the right instinct but solves the wrong case. When the partitioned peer is in
 a size-1 group (the dod_mission coordinator), there are no other group members
 to query. The fix has to probe across the partition.
 
-## 2. Goals & non-goals
+## 2. Goals and non-goals
 
 **Goals.**
 
@@ -447,7 +447,7 @@ corpus-state decision).
  round-tripped and decoded, and this is the first conformance case that does
  so.
 
-## 10. Sequencing & owner notes
+## 10. Sequencing and owner notes
 
 Implementation order runs in six steps, one commit chain across multiple
 sessions.

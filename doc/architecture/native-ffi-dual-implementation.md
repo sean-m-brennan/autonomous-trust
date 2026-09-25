@@ -16,14 +16,14 @@ document describes how the two are organized, how a backend is selected, the FFI
 boundary and its drift guard, and the embedded/microdrone runtime.
 
 > **Which runs where, today.** The dod_mission demo containers run **pure
-> Python** (see [Gateway Reputation Tree](gateway-reputation-tree.md), "Runtime
+> Python** (see [The gateway reputation tree](gateway-reputation-tree.md), "Runtime
 > path / C-twin"). The C path is exercised (a) per-subsystem via CFFI when the
 > native backend is selected, and (b) as the standalone `at_demo` daemon for
 > embedded ARM microdrones, which interoperate on the wire with the Python
 > nodes. Feature-wise the native C code currently leads Python in some areas
-> (e.g. The ZTA background process, see [ZTA Python Parity](zta-python-parity.md))
+> (e.g. the ZTA background process, see [ZTA Python parity](zta-python-parity.md))
 > and Python leads C in others (e.g. recursive subtree reputation, see
-> [Gateway Reputation Tree](gateway-reputation-tree.md), whose phase 3 is the
+> [The gateway reputation tree](gateway-reputation-tree.md), whose phase 3 is the
 > C-parity half).
 
 ## 1. Backend selection
@@ -128,7 +128,7 @@ honor is the **DRY canonical wire form**: a flat-dict JSON shape that is
 byte-parseable by C (Python's default `ConfigJSONEncoder` form, with
 `__type__`/`_uuid` markers and a base64-wrapped hex seed, is *not* parseable by
 C). Identity and `Group` objects expose `to_canonical()`/`from_canonical()` for
-this; see [Identity Protocol](identity-protocol.md) and [Node
+this; see [Identity protocol](identity-protocol.md) and [Node
 Lifecycle](node-lifecycle.md).
 
 The live interop test is `embedded/test-interop-cpython.sh`, which brings up one

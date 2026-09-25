@@ -83,6 +83,9 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
 # Copy built artifacts from builder
 COPY --from=builder /build/install/usr/local/bin/at_demo /opt/autonomous-trust/bin/at_demo
 COPY --from=builder /build/install/usr/local/lib/libautonomous_trust.so /opt/autonomous-trust/lib/libautonomous_trust.so
+# The extension libraries (the verification layers libat_<layer>, libat_gateway)
+# ship beside the core, as every shared-library consumer needs them.
+COPY --from=builder /build/install/usr/local/lib/libat_*.so /opt/autonomous-trust/lib/
 RUN echo "/opt/autonomous-trust/lib" > /etc/ld.so.conf.d/autonomous-trust.conf && ldconfig
 ENV PATH="/opt/autonomous-trust/bin:$PATH"
 

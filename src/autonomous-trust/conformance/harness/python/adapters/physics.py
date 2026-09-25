@@ -40,8 +40,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from autonomous_trust.core.physics import (IMPLICATED_SCORE, REFUTED_SCORE,
-                                           PhysicsChecker, parse_physics)
+from autonomous_trust.oracle.physics import (IMPLICATED_SCORE, REFUTED_SCORE,
+                                             PhysicsChecker, parse_physics)
 from autonomous_trust.core.reputation import (TX_CHANNEL_PHYSICAL,
                                               TX_CHANNEL_SWARM_DISAGREEMENT)
 

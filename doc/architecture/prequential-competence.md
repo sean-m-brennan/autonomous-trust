@@ -1,3 +1,5 @@
+*Previous: [Calibration audit](calibration-audit.md)*
+
 # Prequential competence
 
 *Build-order step 4 of the [verification oracle](../verification_oracle.md);
@@ -352,11 +354,15 @@ regret bound per row.
 
 ## See also
 
-* [Calibration Audit](calibration-audit.md) — step 3, the other half of the
+* [Calibration audit](calibration-audit.md) — step 3, the other half of the
   same `prediction` artifact, and the layer whose one-sidedness this completes
-* [Physical Consistency](physical-consistency.md) — step 1, and the source of
+* [Physical consistency](physical-consistency.md) — step 1, and the source of
   the `quantity` declarations both layers resolve against
-* [Trust Tiers](trust-tiers.md) — §8, where the authored `transaction_weight`
+* [Trust tiers](trust-tiers.md) — §8, where the authored `transaction_weight`
   this multiplier is anchored to is declared
-* [Reputation Consensus](reputation.md) — where the weighted score lands
-* [The Verification Oracle](../verification_oracle.md) — the full research framing
+* [Reputation consensus](reputation.md) — where the weighted score lands
+* [The verification oracle](../verification_oracle.md) — the full research framing
+
+---
+
+*Next: [Sampled replication](replication.md)*

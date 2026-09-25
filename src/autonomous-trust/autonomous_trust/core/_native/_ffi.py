@@ -24,7 +24,9 @@ native wrapper classes.  The C library is loaded once at import time via
 
 import ctypes
 import ctypes.util
+import glob
 import os
+import warnings
 
 from cffi import FFI
 
@@ -350,6 +352,9 @@ ffi.cdef("""
         char mcast4_addr[17];    /* IPV4_ADDR_LEN(16) + 1 */
         char ip6_cidr[51];       /* CIDR6_LEN(50) + 1 */
         char mcast6_addr[47];    /* IPV6_ADDR_LEN(46) + 1 */
+        bool envelope;           /* gateway relay (libat_gateway) */
+        bool group_forward;
+        bool cross_cluster;
     } network_config_t;
 
     int network_to_json(const void *data_struct, void **obj_ptr);
@@ -483,6 +488,9 @@ ffi.cdef("""
            offset, which is the same defect with a tidier diff. */
         int from_rank;
         bool encrypt;
+        /* Present in every build since FEATURE_SPLIT_PLAN Phase 5 (it was
+           AT_SOCIAL-only, so this mirror matched only a non-social core). */
+        bool group_multicast;
         char return_to[65];
         char trace_id[33];      /* 32-char hex + NUL; NET_TRACE_ID_LEN */
         bool verified;
@@ -758,5 +766,31 @@ def _preload_deps():
                 pass
 
 
+def _load_extensions(core_path: str) -> list:
+    """dlopen every extension library (``libat_<feature>.so``) beside the core.
+
+    An extension (src/c/extensions/<feature>/, e.g. libat_dtn) adds itself to
+    the core from load-time constructors -- a transport, a process runner, its
+    handlers -- so loading it is all it takes. Searched beside the core .so
+    (an install) and under ``extensions/*/`` there (a build tree). A no-op
+    when there are none; one that fails to load is reported and skipped."""
+    if not os.path.isfile(core_path):  # a bare soname from the system search
+        return []
+    base = os.path.dirname(os.path.abspath(core_path))
+    found = sorted(set(glob.glob(os.path.join(base, 'libat_*.so')) +
+                       glob.glob(os.path.join(base, 'extensions', '*',
+                                              'libat_*.so'))))
+    handles = []
+    for path in found:
+        try:
+            handles.append(ctypes.CDLL(path))
+        except OSError as err:
+            warnings.warn(f'AutonomousTrust extension {path} not loaded: {err}')
+    return handles
+
+
 _preload_deps()
-lib = ffi.dlopen(_find_library())
+_core_path = _find_library()
+lib = ffi.dlopen(_core_path)
+# Held for the life of the process: a collected handle would dlclose it.
+_extension_libs = _load_extensions(_core_path)

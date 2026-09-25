@@ -19,7 +19,7 @@ The implementation plan is `doc/NV059/work/PIV_MFA_OPERATOR_ACCESS_PLAN.md`
 ## 1. Why a separate access path
 
 A peer proves it is a legitimate node by presenting a credential the border
-guard can chain to a trusted CA (see [ZTA Integration §11](zta-integration.md)).
+guard can chain to a trusted CA (see [ZTA integration §11](zta-integration.md)).
 A human operator needs more.
 
 1. **Possession + knowledge.** A certificate on a card proves the card exists.
@@ -72,7 +72,7 @@ DTO-shaped objects off `external_feedback` and pushes `Task` DTOs onto
 This keeps the (synchronous, Textual) UI decoupled from the message loop and
 makes every screen testable headless.
 
-Two distributions carry it.
+Two distributions carry it:
 
 - **`core/_python/operator/`.** The node-side core (activation, session, DDIL
  posture, resource directory, `OperatorNode`). Imports as
@@ -126,7 +126,8 @@ rotating the second factor is not a new identity). See [ZTA Integration
 
 ## 4. MFA chain
 
-`identity/zta/mfa.py` provides `MfaChain(Verifier)` with `CombinePolicy.AND`.
+`identity/zta/mfa.py` supplies `MfaChain(Verifier)` with `CombinePolicy.AND`,
+and the chain is what an operator actually authenticates against.
 
 - **AND semantics.** All factors must be `VERIFIED`, the first
  `REJECTED`/`EXPIRED`/`REVOKED` short-circuits, and any `DEFERRED`/`UNAVAILABLE`
@@ -259,7 +260,7 @@ resource, coerces inputs to the declared types, and gates **submit** on
 `my_reach` (tier-locked resources are visible but non-submittable) and on the
 session.
 
-`app.submit_request` runs the session authorization.
+`app.submit_request` runs the session authorization, and branches three ways:
 
 - `ALLOW` → build a `Task` DTO (injectable `task_builder`) and put it on
  `external_control`.
@@ -361,12 +362,12 @@ conformance `zta-x509-reject-revoked-credential`. See [ZTA Integration
 ## References
 
 - `doc/NV059/work/PIV_MFA_OPERATOR_ACCESS_PLAN.md`: implementation plan (P0-P6).
-- [ZTA Integration](zta-integration.md): peer admission, verifier interface,
+- [ZTA integration](zta-integration.md): peer admission, verifier interface,
  policy, the admission gate.
-- [ZTA Python Parity](zta-python-parity.md): the Python↔C parity discipline the
+- [ZTA Python parity](zta-python-parity.md): the Python↔C parity discipline the
  verifier and descriptor work follow.
-- [Identity Protocol](identity-protocol.md): Phase 3 border-guard admission.
-- [Trust Tiers](trust-tiers.md): the tier gradient that gates resource reach.
+- [Identity protocol](identity-protocol.md): Phase 3 border-guard admission.
+- [Trust tiers](trust-tiers.md): the tier gradient that gates resource reach.
 - NIST SP 800-73 (PIV), RFC 6238 (TOTP), NIST SP 800-207 (ZTA).
 
 ---

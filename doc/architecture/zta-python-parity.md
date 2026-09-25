@@ -18,7 +18,7 @@ behavior symmetrically.
 
 ## 1. Module layout
 
-The new package is
+Everything new lives in one package,
 `src/autonomous-trust/autonomous_trust/core/_python/identity/zta/`.
 
 | File | Mirrors (C) | Contents |

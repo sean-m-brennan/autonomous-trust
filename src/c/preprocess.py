@@ -198,6 +198,10 @@ def preprocess(target_filepath: str, output_file: str, directory: str, rel_path:
                         o_file.write(line[index + len(delimiter):])
                     post_list = True
                 elif line not in def_lines:
+                    # LIST_COUNT__<macro> is the number of generated entries,
+                    # for a table that sizes itself beyond them.
+                    line = line.replace('LIST_COUNT__' + delimiter,
+                                        str(len(substitutions)))
                     if post_list:
                         if ';' in line:
                             o_file.write(line)

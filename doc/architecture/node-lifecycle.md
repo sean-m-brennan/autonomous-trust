@@ -11,7 +11,7 @@ deterministic startup sequence before entering its active state.
 
 1. **Configure.** Load configuration files from `$AUTONOMOUS_TRUST_ROOT/etc/at/`. Required configs: network, identity, peers, capabilities. The `ProcessTracker` reads `subsystems.cfg.json` to determine which process classes to instantiate.
 
-2. **Spawn processes.** The orchestrator creates a process pool and starts each subsystem process (`NetworkProcess`, `IdentityProcess`, `NegotiationProcess`, `ReputationProcess`) as an async worker, each with access to the shared queue dict. An additional worker, `BootstrapWorker`, is also registered (see [Process Architecture](process-architecture.md)) to run the bootstrap-capability corpus once peers begin to join.
+2. **Spawn processes.** The orchestrator creates a process pool and starts each subsystem process (`NetworkProcess`, `IdentityProcess`, `NegotiationProcess`, `ReputationProcess`) as an async worker, each with access to the shared queue dict. An additional worker, `BootstrapWorker`, is also registered (see [Process architecture](process-architecture.md)) to run the bootstrap-capability corpus once peers begin to join.
 
 3. **Network bind.** `NetworkProcess` binds its sockets (peer on port N, group on port N+1, broadcast) and starts four receiver threads.
 
@@ -130,8 +130,8 @@ In the active state, four activities run concurrently:
 
 Two further mechanisms run as backstops in the active state:
 
-- **Bootstrap corpus** (`BootstrapWorker`): drives the bilateral bootstrap-capability exchanges that warm up a freshly-admitted peer's transaction history. See [Trust Tiers §6](trust-tiers.md).
-- **Resync sweeps** (Identity): periodic caps-resync and identity-resync queries that backfill state lost to dropped UDP, capabilities for admitted-but-capless peers, and Identities for group addresses with no known peer object. See [Partition Recovery §12](partition-recovery.md).
+- **Bootstrap corpus** (`BootstrapWorker`): drives the bilateral bootstrap-capability exchanges that warm up a freshly-admitted peer's transaction history. See [Trust tiers §6](trust-tiers.md).
+- **Resync sweeps** (Identity): periodic caps-resync and identity-resync queries that backfill state lost to dropped UDP, capabilities for admitted-but-capless peers, and Identities for group addresses with no known peer object. See [Partition recovery §12](partition-recovery.md).
 
 ## Post-admission recovery
 

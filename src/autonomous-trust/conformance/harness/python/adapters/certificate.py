@@ -39,10 +39,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from autonomous_trust.core.certificates import (ABSENT_SCORE, INVALID_SCORE,
-                                                VALID_SCORE,
-                                                CertificateVerifier,
-                                                parse_certificates)
+from autonomous_trust.oracle.certificates import (ABSENT_SCORE, INVALID_SCORE,
+                                                  VALID_SCORE,
+                                                  CertificateVerifier,
+                                                  parse_certificates)
 
 from ...common.scenario_loader import Case
 

@@ -87,7 +87,9 @@ RUN ( curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 "completion-based)." ; \
     rm -rf /app/zkp-rust /app/zkp-wheels "$HOME/.cargo" "$HOME/.rustup"
 
-# Build C library. CMake expects protobuf as a sibling of c-src:
+# Build C library, with its extension libraries (the verification layers
+# libat_<layer>, AT_ORACLE_*, ON by default; libat_gateway) installed beside it.
+# CMake expects protobuf as a sibling of c-src:
 # ${CMAKE_CURRENT_SOURCE_DIR}/../protobuf
 ARG GIT_VERSION="unknown"
 COPY src/c /app/c-src
@@ -95,12 +97,15 @@ COPY src/protobuf /app/protobuf
 RUN rm -rf /app/c-src/build && mkdir -p /app/c-src/build && cd /app/c-src/build && \
     CC=clang CXX=clang++ cmake .. -DCMAKE_BUILD_TYPE=Release -DREVISION="$GIT_VERSION" && \
     make -j$(nproc) && \
-    cp libautonomous_trust.so /usr/local/lib/ && \
+    cp libautonomous_trust.so extensions/*/libat_*.so /usr/local/lib/ && \
     ldconfig && \
     cd /app && rm -rf /app/c-src
 
 # Copy Python package
 COPY src/autonomous-trust/autonomous_trust autonomous_trust
+# The verification layers (autonomous-trust-oracle), beside the core in the
+# autonomous_trust namespace, where the core finds them (FEATURE_SPLIT_PLAN Phase 3).
+COPY src/autonomous-trust-oracle/autonomous_trust/oracle autonomous_trust/oracle
 RUN rm -rf autonomous_trust/etc autonomous_trust/var
 
 COPY src/autonomous-trust/pyproject.toml pyproject.toml

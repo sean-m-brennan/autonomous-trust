@@ -96,142 +96,22 @@ int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
             }
             return 0;
         }
-#ifdef AT_SOCIAL_ENABLED
-        if (fn != NULL && strcmp(fn, AT_APP_SET_POSITION) == 0)
         {
-            /* Opt-in own-position: forwarded ONLY to identity, which owns the
-             * position store and answers peers' directed position queries. */
-            generic_msg_t fwd = *msg;
-            snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
-                     "%s", "identity");
-            if (messaging_send("identity", NET_MESSAGE, &fwd, false) != 0)
-                log_exception(logger);
-            return 0;
+            /* A feature's app verbs (msg_registry.h). Each is forwarded ONLY
+             * to the one process it registered -- the same allowlist the
+             * social verbs used to be hand-listed into here, so an app still
+             * reaches no verb that nobody registered. */
+            const char *target = fn != NULL ? at_app_verb_target(fn) : NULL;
+            if (target != NULL)
+            {
+                generic_msg_t fwd = *msg;
+                snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
+                         "%s", target);
+                if (messaging_send(target, NET_MESSAGE, &fwd, false) != 0)
+                    log_exception(logger);
+                return 0;
+            }
         }
-        if (fn != NULL && strcmp(fn, AT_APP_SET_PROFILE) == 0)
-        {
-            /* Opt-in own-profile (Increment 3): forwarded ONLY to identity,
-             * which owns the profile store and signs/answers peers' directed
-             * profile queries. */
-            generic_msg_t fwd = *msg;
-            snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
-                     "%s", "identity");
-            if (messaging_send("identity", NET_MESSAGE, &fwd, false) != 0)
-                log_exception(logger);
-            return 0;
-        }
-        if (fn != NULL && (strcmp(fn, AT_APP_CONNECT_REQUEST) == 0
-                           || strcmp(fn, AT_APP_CONNECT_RESPOND) == 0))
-        {
-            /* Explicit connection verbs (Increment 5): forwarded ONLY to
-             * identity, which owns the connection edge store and sends the
-             * directed request / signed response. */
-            generic_msg_t fwd = *msg;
-            snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
-                     "%s", "identity");
-            if (messaging_send("identity", NET_MESSAGE, &fwd, false) != 0)
-                log_exception(logger);
-            return 0;
-        }
-        if (fn != NULL && strcmp(fn, AT_APP_SEND_DM) == 0)
-        {
-            /* Direct message (Increment 6): forwarded ONLY to identity, which
-             * sends the directed encrypted peer_dm to the target peer. */
-            generic_msg_t fwd = *msg;
-            snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
-                     "%s", "identity");
-            if (messaging_send("identity", NET_MESSAGE, &fwd, false) != 0)
-                log_exception(logger);
-            return 0;
-        }
-        if (fn != NULL && strcmp(fn, AT_APP_PUBLISH_POST) == 0)
-        {
-            /* Feed post (Increment 7): forwarded ONLY to identity, which signs
-             * the post and group-multicasts it on the encrypted group channel. */
-            generic_msg_t fwd = *msg;
-            snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
-                     "%s", "identity");
-            if (messaging_send("identity", NET_MESSAGE, &fwd, false) != 0)
-                log_exception(logger);
-            return 0;
-        }
-        if (fn != NULL && (strcmp(fn, AT_APP_REACT_POST) == 0
-                           || strcmp(fn, AT_APP_BLOCK) == 0
-                           || strcmp(fn, AT_APP_UNBLOCK) == 0
-                           || strcmp(fn, AT_APP_REPORT_PEER) == 0))
-        {
-            /* Reaction / local block / unblock / report: forwarded ONLY to
-             * identity, which sends the directed reaction to the author
-             * (react), records/removes the local block (no wire traffic either
-             * way), or sends the directed report and stages its half (report). */
-            generic_msg_t fwd = *msg;
-            snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
-                     "%s", "identity");
-            if (messaging_send("identity", NET_MESSAGE, &fwd, false) != 0)
-                log_exception(logger);
-            return 0;
-        }
-        if (fn != NULL && (strcmp(fn, AT_APP_ADVERTISE_BUSINESS) == 0
-                           || strcmp(fn, AT_APP_SET_CUSTOMER) == 0))
-        {
-            /* Phase 3 P3.2: a business publishing its own page, and a person
-             * declaring/clearing a CUSTOMER edge (which is what authorizes this
-             * node to carry that page and re-advertise it in the first person).
-             * Forwarded ONLY to identity, which owns the ad signing/multicast
-             * and the customer store. */
-            generic_msg_t fwd = *msg;
-            snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
-                     "%s", "identity");
-            if (messaging_send("identity", NET_MESSAGE, &fwd, false) != 0)
-                log_exception(logger);
-            return 0;
-        }
-        if (fn != NULL && strcmp(fn, AT_APP_PUBLISH_BUSINESS_POST) == 0)
-        {
-            /* Phase 3 P3.4: the business speaking. Forwarded ONLY to identity,
-             * which owns the post signing/multicast. The envoy signature that
-             * makes it the business's word is sealed inside the opaque bundle,
-             * so nothing here — and nothing in identity — adjudicates who may
-             * say it; every receiver checks that for itself. */
-            generic_msg_t fwd = *msg;
-            snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
-                     "%s", "identity");
-            if (messaging_send("identity", NET_MESSAGE, &fwd, false) != 0)
-                log_exception(logger);
-            return 0;
-        }
-        if (fn != NULL && (strcmp(fn, AT_APP_REQUEST_COSIGN) == 0
-                           || strcmp(fn, AT_APP_RETURN_COSIGN) == 0))
-        {
-            /* Phase 3 P3.3: the two halves of a detached co-signature exchange —
-             * an authoring node asking named peers to sign an exported record,
-             * and a signer returning its detached signature to the one node
-             * assembling it. Forwarded ONLY to identity, which owns the directed
-             * encrypted sends; the core shape-checks the ask and holds no Ethne,
-             * so it never learns what is being signed. */
-            generic_msg_t fwd = *msg;
-            snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
-                     "%s", "identity");
-            if (messaging_send("identity", NET_MESSAGE, &fwd, false) != 0)
-                log_exception(logger);
-            return 0;
-        }
-        if (fn != NULL && (strcmp(fn, AT_APP_REQUEST_ATTEND) == 0
-                           || strcmp(fn, AT_APP_SET_EXACT_POSITION) == 0
-                           || strcmp(fn, AT_APP_REQUEST_PROXIMITY) == 0))
-        {
-            /* Phase 2: presence pull (request_attend → nonce-fresh attest query),
-             * opt-in LOCAL-ONLY exact position (set_exact_position), and the
-             * pairwise private-proximity probe (request_proximity). All forwarded
-             * ONLY to identity, which owns the attest/position/proximity paths. */
-            generic_msg_t fwd = *msg;
-            snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
-                     "%s", "identity");
-            if (messaging_send("identity", NET_MESSAGE, &fwd, false) != 0)
-                log_exception(logger);
-            return 0;
-        }
-#endif /* AT_SOCIAL_ENABLED */
         if (fn != NULL && strcmp(fn, AT_APP_PEER_STANDING) == 0)
         {
             /* Phase 4 P4.1: an authority finding the APP decided — an Ethne
@@ -244,8 +124,8 @@ int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
              * and is the only process that can resolve the uuid against the
              * admitted-peer table.
              *
-             * OUTSIDE the AT_SOCIAL block on purpose: a governance tier
-             * bounding a peer is not an Agora-specific idea. */
+             * A core verb, not a registered one, on purpose: a governance
+             * tier bounding a peer is not an Agora-specific idea. */
             generic_msg_t fwd = *msg;
             snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
                      "%s", "identity");
@@ -331,29 +211,6 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
             case PEER_OBSERVED:
             case PEER_REPUTATION:
             case PEER_RTT_OBSERVED:
-#ifdef AT_SOCIAL_ENABLED
-            case PEER_POSITION_OBSERVED:
-            case PEER_PROFILE_OBSERVED:
-            /* Every social app-event added after Increment 3 must be listed here
-             * too, or the identity process emits it to AT_MAIN_QUEUE and it is
-             * silently dropped at this drain instead of reaching the app queue:
-             * connection edges (Increment 5 — the inbound-request ASK and every
-             * edge-state change), DMs (Increment 6), feed posts (Increment 7),
-             * post reactions (Increment 8), the private-proximity band
-             * (Phase 2), business ads (Phase 3 P3.2), both halves of a
-             * co-signature exchange (Phase 3 P3.3), and business posts
-             * (Phase 3 P3.4). */
-            case PEER_CONNECTION_REQUEST_OBSERVED:
-            case PEER_CONNECTION_STATE_OBSERVED:
-            case PEER_DM_OBSERVED:
-            case PEER_POST_OBSERVED:
-            case PEER_REACTION_OBSERVED:
-            case PEER_PROXIMITY_OBSERVED:
-            case PEER_BUSINESS_AD_OBSERVED:
-            case PEER_COSIGN_REQUEST_OBSERVED:
-            case PEER_COSIGN_SIG_OBSERVED:
-            case PEER_BUSINESS_POST_OBSERVED:
-#endif /* AT_SOCIAL_ENABLED */
                 if (q_out == NULL)
                     break;   /* no app attached; nothing to do */
                 if (messaging_send(q_out, (message_type_t)inner->type, inner, false) != 0)
@@ -362,7 +219,19 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
                     sent++;
                 break;
             default:
+            {
+                /* A feature's type is app-bound iff it registered as such
+                 * (msg_registry.h) -- the registry replaces hand-listing each
+                 * one above, which is how app events used to go missing. */
+                const at_msg_vtable_t *vt = at_msg_type_lookup(inner->type);
+                if (vt == NULL || !vt->app_bound || q_out == NULL)
+                    break;
+                if (messaging_send(q_out, (message_type_t)inner->type, inner, false) != 0)
+                    log_exception(logger);
+                else
+                    sent++;
                 break;
+            }
             }
         }
         if (array_remove(unhandled, msg_dat) != 0) {

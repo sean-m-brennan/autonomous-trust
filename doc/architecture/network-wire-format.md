@@ -1,4 +1,4 @@
-*Previous: [TCP Connection Pooling](network-connection-pooling.md)*
+*Previous: [TCP connection pooling](network-connection-pooling.md)*
 
 <!--
  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
@@ -94,9 +94,10 @@ to consult, and its receivers include nodes holding no group at all. That is wha
 keeps a proto cohort joinable by any node — and what makes this shippable without
 a flag day.
 
-Python: `NetworkProcess._wire_format_for_addr` / `_wire_format_for_group`.
-C: `wire_format_for_address` in `net_proc.c`. Both are group lookups. Neither
-looks at the arriving bytes.
+The lookup is `NetworkProcess._wire_format_for_addr` and
+`_wire_format_for_group` in Python, `wire_format_for_address` in `net_proc.c` on
+the C side. Both are group lookups, and neither of them looks at the arriving
+bytes.
 
 ## Receiving is strict
 
