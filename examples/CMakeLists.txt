@@ -58,8 +58,25 @@ set(AT_INCLUDE_DIRS
 function(add_at_example target source)
     add_executable(${target} ${source})
     target_include_directories(${target} PRIVATE ${AT_INCLUDE_DIRS})
+    # Extension libraries (AT_NET_DTN builds libat_dtn, AT_NET_GATEWAY
+    # libat_gateway, AT_ORACLE_* the libat_<layer> verification layers) link
+    # whole too, ahead of the core, so their
+    # registration constructors are in the binary.
+    set(_at_ext_libs)
+    if(TARGET at_dtn_static)
+        list(APPEND _at_ext_libs at_dtn_static)
+    endif()
+    if(TARGET at_gateway_static)
+        list(APPEND _at_ext_libs at_gateway_static)
+    endif()
+    # The verification layers (AT_ORACLE_*, libat_<layer>).
+    foreach(_layer physics calibration certificates prequential replication)
+        if(TARGET at_${_layer}_static)
+            list(APPEND _at_ext_libs at_${_layer}_static)
+        endif()
+    endforeach()
     target_link_libraries(${target} PRIVATE
-        -Wl,--whole-archive autonomous_trust_static -Wl,--no-whole-archive
+        -Wl,--whole-archive ${_at_ext_libs} autonomous_trust_static -Wl,--no-whole-archive
         ${DEPENDENCIES}
     )
     # -fms-extensions is REQUIRED, not cosmetic: the library headers embed

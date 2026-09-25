@@ -59,13 +59,16 @@ Environment:
                              keeps the cross-language diff consistent.
   CONFORMANCE_NO_CLEAN=1     Same as --no-clean.
   CONFORMANCE_SKIP_TOX=1     Run pytest directly in the active env, no tox.
-  CONFORMANCE_SOCIAL=1       Build the C harness with -DAT_SOCIAL=ON so the agora
-                             social scenarios (position/profile/connection/DM/post/
-                             reaction/accrual/block-local-clamp) RUN on the C side
-                             and are cross-checked, instead of skipping. Off by
-                             default (matches the M2M AT_SOCIAL-off production
-                             build); without it the gate is green but never
-                             verifies any agora case against C.
+  AT_EXTERNAL_EXTENSIONS     ':'-separated directories of extension libraries
+                             outside this tree (passed to CMake as
+                             -DAT_EXTERNAL_EXTENSIONS). An extension that owns a
+                             conformance protocol registers its C adapter and its
+                             corpus there (at_conformance_adapter).
+  AT_CONFORMANCE_PLUGINS     ':'-separated conformance plug-in directories for the
+                             Python harness (scenarios/ + conformance_plugin.py).
+                             Set both, or the protocol runs on one side only and
+                             the diff reports its cases as one-sided. Agora's
+                             at-social/test-conformance.sh sets both for `social`.
 
 Why the C build dir is wiped by default: on this VM's virtiofs-backed repo mount,
 gcc intermittently writes objects whose ELF is structurally valid but whose symbol
@@ -216,18 +219,14 @@ run_c_harness() {
          "(zta-x509-* scenarios will skip on the C side)." >&2
   fi
 
-  # AT_SOCIAL: the agora social scenarios (position/profile/connection/DM/post/
-  # reaction/accrual/block-local-clamp) only RUN on the C side when the harness is
-  # built with -DAT_SOCIAL=ON. Without it they SKIP on C -- and diff_results treats
-  # a one-side skip as a match (it is not asymmetric), so the gate reads green
-  # WITHOUT actually cross-checking any agora case. Off by default here to match the
-  # M2M production default (AT_SOCIAL OFF); set CONFORMANCE_SOCIAL=1 to compile the
-  # social handlers in and verify the agora corpus symmetrically against Python.
-  local cmake_social_arg=""
-  if [[ -n "${CONFORMANCE_SOCIAL:-}" ]]; then
-    cmake_social_arg="-DAT_SOCIAL=ON"
-    echo "CONFORMANCE_SOCIAL set; building C conformance with -DAT_SOCIAL=ON " \
-         "(agora scenarios run symmetrically instead of skipping on C)." >&2
+  # External extensions (e.g. Agora's libat_social): built inside this project
+  # and, when one registers a conformance adapter, run by the C harness over its
+  # own corpus. The Python side reads AT_CONFORMANCE_PLUGINS from the environment.
+  # Always passed (empty clears a reused cache's value).
+  local _ext_list="${AT_EXTERNAL_EXTENSIONS:-}"
+  local cmake_ext_arg="-DAT_EXTERNAL_EXTENSIONS=${_ext_list//:/;}"
+  if [[ -n "${AT_EXTERNAL_EXTENSIONS:-}" ]]; then
+    echo "AT_EXTERNAL_EXTENSIONS set; building C conformance with ${AT_EXTERNAL_EXTENSIONS}" >&2
   fi
 
   # AT_CONFORMANCE_BUILD_DIR relocates the build, most usefully OFF the
@@ -302,11 +301,11 @@ run_c_harness() {
     # -S/-B rather than `cd $build_dir && cmake ..`: with
     # AT_CONFORMANCE_BUILD_DIR pointing outside the source tree, ".." is not the
     # source dir and cmake would configure whatever happens to be there.
-    cmake -S "$c_dir" -B "$build_dir" $cmake_zta_arg $cmake_social_arg
+    cmake -S "$c_dir" -B "$build_dir" $cmake_zta_arg "$cmake_ext_arg"
   else
     # Reused dir (--no-clean): refresh the cmake config in case CMake files
-    # changed since last run, and to apply/keep -DAT_ZTA / -DAT_SOCIAL.
-    cmake -S "$c_dir" -B "$build_dir" $cmake_zta_arg $cmake_social_arg >/dev/null
+    # changed since last run, and to apply/keep -DAT_ZTA / -DAT_EXTERNAL_EXTENSIONS.
+    cmake -S "$c_dir" -B "$build_dir" $cmake_zta_arg "$cmake_ext_arg" >/dev/null
   fi
 
   echo "Building + running C conformance harness ..."

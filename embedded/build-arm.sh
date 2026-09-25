@@ -132,7 +132,9 @@ extract_artifacts() {
     fi
     docker cp "$container_name:$bin_src" "$staging/opt/autonomous-trust/bin/"
     if ! $STATIC; then
-        docker cp "$container_name:/opt/autonomous-trust/lib/libautonomous_trust.so" "$staging/opt/autonomous-trust/lib/"
+        # The whole lib/ dir: libautonomous_trust.so and its extension
+        # libraries (libat_<layer> verification layers, libat_gateway).
+        docker cp "$container_name:/opt/autonomous-trust/lib/." "$staging/opt/autonomous-trust/lib/"
     fi
     docker rm -f "$container_name"
     trap - EXIT

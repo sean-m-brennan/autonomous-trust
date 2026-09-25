@@ -60,14 +60,8 @@ from .reputation import (TransactionScore, ReputationProtocol, PeerReputation,
                          TX_CHANNEL_CERTIFICATE, TX_CHANNEL_TASK_OUTCOME,
                          TX_CHANNEL_PHYSICAL, TX_CHANNEL_PROBE)
 from .reputation.reputation import Reputation
-from .physics import PhysicsChecker, PhysicsDeclarationError
-from .prequential import (NEUTRAL_COMPETENCE, PrequentialDeclarationError,
-                          PrequentialEstimator)
-from .calibration import (CalibrationAuditor, CalibrationDeclarationError,
-                          OVERCONFIDENT_SCORE)
-from .certificates import (CertificateDeclarationError, CertificateVerifier,
-                          build_inventory, default_seed,
-                          format_inventory, split_certified)
+from . import oracles
+from .negotiation.certified import split_certified
 from .queue_pool import QueuePool
 from .._zkp import ZKP_AVAILABLE
 from . import _probes
@@ -108,157 +102,26 @@ def _subject_key(executor_uuid) -> 'str | None':
     return None if executor_uuid is None else str(executor_uuid)
 
 
-#: Process-wide physical-consistency checker (R+D.md §12.2), built lazily from
-#: ``$AT_PHYSICS`` on first use. One per process, because it carries the
-#: observation window that the multi-peer intersection and the parity residuals
-#: are computed over; a fresh checker per result would see no history and could
-#: only ever perform the single-claim checks.
-_PHYSICS: 'PhysicsChecker | None' = None
-
-
-def physics_checker() -> PhysicsChecker:
-    """The process-wide checker, built on first call.
-
-    A malformed declaration is fatal at load (see ``physics.model``), but it
-    must not take down the scoring path on every subsequent result: the
-    failure is logged once and the layer stays off, which is the same
-    end state as never having configured it.
-    """
-    global _PHYSICS
-    if _PHYSICS is None:
-        try:
-            _PHYSICS = PhysicsChecker.from_env()
-        except PhysicsDeclarationError:
-            logging.getLogger(__name__).error(
-                'physics: declaration rejected, layer stays OFF: %s',
-                traceback.format_exc())
-            _PHYSICS = PhysicsChecker()
-    return _PHYSICS
-
-
-#: Process-wide certificate verifier (R+D.md §12.3), built lazily from
-#: ``$AT_CERTIFICATES``. Stateless apart from the declaration -- a certificate
-#: is self-contained, so unlike the physics checker there is no window to carry
-#: -- but built once anyway so the declaration is read and the inventory
-#: reported a single time rather than per task result.
-_CERTIFICATES: 'CertificateVerifier | None' = None
-
-
-def certificate_verifier(registered=None) -> CertificateVerifier:
-    """The process-wide verifier, built on first call.
-
-    Emits the certificate inventory once, at build time. That report is the
-    other half of what R+D.md §12.3 asks for: a node that silently falls
-    through to completion scoring for everything it cannot check looks, from
-    outside, exactly like a node that is checking everything, and the expensive
-    case is only "recognized" if somebody can see it.
-    """
-    global _CERTIFICATES
-    if _CERTIFICATES is None:
-        log = logging.getLogger(__name__)
-        try:
-            _CERTIFICATES = CertificateVerifier.from_env()
-        except CertificateDeclarationError:
-            log.error('certificates: declaration rejected, layer stays OFF: %s',
-                      traceback.format_exc())
-            _CERTIFICATES = CertificateVerifier()
-        if _CERTIFICATES.enabled:
-            log.info('%s', format_inventory(
-                build_inventory(_CERTIFICATES.model, registered)))
-    return _CERTIFICATES
-
-
-#: Process-wide coverage auditor (R+D.md §12.4), built lazily from
-#: ``$AT_CALIBRATION``. Emphatically process-wide and not per-result: the
-#: verdict IS the accumulated record of resolved predictions, so a fresh
-#: auditor per result would have nothing to audit and would be permanently
-#: silent -- the same reason the physics checker is a singleton, only more so.
-#:
-#: It is handed the physics model because that is what maps a reporting
-#: capability to the quantity it reports, which is how a later result resolves
-#: an earlier prediction with no application involvement.
-_CALIBRATION: 'CalibrationAuditor | None' = None
-
-
-def calibration_auditor() -> CalibrationAuditor:
-    """The process-wide auditor, built on first call."""
-    global _CALIBRATION
-    if _CALIBRATION is None:
-        try:
-            _CALIBRATION = CalibrationAuditor.from_env(
-                physics_model=physics_checker().model)
-        except CalibrationDeclarationError:
-            logging.getLogger(__name__).error(
-                'calibration: declaration rejected, layer stays OFF: %s',
-                traceback.format_exc())
-            _CALIBRATION = CalibrationAuditor()
-    return _CALIBRATION
-
-
-#: Process-wide prequential estimator (R+D.md §12.5), built lazily from
-#: ``$AT_PREQUENTIAL``. A singleton for the same reason the coverage auditor
-#: is, and rather more so: the competence multiplier IS the accumulated record
-#: of resolved forecasts, so a fresh estimator per result would weight every
-#: peer at exactly 1.0 forever.
-#:
-#: Handed the physics model because that is what maps a reporting capability to
-#: the quantity it reports, which is how a later result resolves an earlier
-#: forecast with no application involvement -- the same link the coverage audit
-#: uses, and the same declaration.
-_PREQUENTIAL: 'PrequentialEstimator | None' = None
-
-
-def prequential_estimator() -> PrequentialEstimator:
-    """The process-wide estimator, built on first call.
-
-    This is also the access point for the aggregation half: an in-process
-    application asks ``prequential_estimator().combine(quantity, now)`` for the
-    mesh's aggregate forecast, and ``.regret(quantity)`` for the realized
-    regret and Hedge's bound on it. Nothing in AT core consumes either.
-    """
-    global _PREQUENTIAL
-    if _PREQUENTIAL is None:
-        try:
-            _PREQUENTIAL = PrequentialEstimator.from_env(
-                physics_model=physics_checker().model)
-        except PrequentialDeclarationError:
-            logging.getLogger(__name__).error(
-                'prequential: declaration rejected, layer stays OFF: %s',
-                traceback.format_exc())
-            _PREQUENTIAL = PrequentialEstimator()
-    return _PREQUENTIAL
-
-
-def competence_weight(capability_name, subject_uuid,
-                      prequential: 'PrequentialEstimator | None' = None
-                      ) -> float:
+def competence_weight(capability_name, subject_uuid) -> float:
     """The learned EMA weight multiplier for this peer on this capability.
 
     Read where the ``TransactionScore`` is BUILT rather than inside
-    :func:`score_task_result`, because this layer contributes no score and no
-    channel: it changes how much a peer's evidence counts, not what the
-    evidence says (R+D.md §12.5, doc/architecture/prequential-competence.md).
-    Keeping it out of the scoring function also keeps that function's arms
-    exactly the set of things that can *speak*.
+    :func:`score_task_result`, because the layer that learns it contributes no
+    score and no channel: it changes how much a peer's evidence counts, not
+    what the evidence says (R+D.md §12.5,
+    doc/architecture/prequential-competence.md). Keeping it out of the scoring
+    function also keeps that function's arms exactly the set of things that can
+    *speak*.
 
-    :data:`~.prequential.NEUTRAL_COMPETENCE` -- 1.0, the authored
-    ``transaction_weight`` verbatim -- whenever the layer is off, the
-    capability is undeclared, or the record is too short to say anything.
+    :data:`~.oracles.NEUTRAL_COMPETENCE` -- 1.0, the authored
+    ``transaction_weight`` verbatim -- with no competence provider, and whenever
+    the provider has nothing to say.
     """
-    estimator = (prequential if prequential is not None
-                 else prequential_estimator())
-    if not estimator.enabled:
-        return NEUTRAL_COMPETENCE
-    return estimator.competence(_subject_key(subject_uuid), capability_name)
+    return oracles.competence(capability_name, _subject_key(subject_uuid))
 
 
 def score_task_result(task, logger=None, name: str = '',
-                      physics: 'PhysicsChecker | None' = None,
-                      now_sec: float = None,
-                      certificates: 'CertificateVerifier | None' = None,
-                      seed: int = None,
-                      calibration: 'CalibrationAuditor | None' = None,
-                      prequential: 'PrequentialEstimator | None' = None
+                      now_sec: float = None, seed: int = None
                       ) -> tuple[float, str]:
     """Score a returned :class:`TaskResult` and name its evidence channel.
 
@@ -311,129 +174,19 @@ def score_task_result(task, logger=None, name: str = '',
                         name, cap_name, probe_score, task.uuid)
         return probe_score, TX_CHANNEL_PROBE
 
-    # Physical consistency (R+D.md §12.2), before every statistical arm and
-    # before the certificate arms: a proof attests that a computation was
-    # performed, not that its answer is physically coherent, so a valid proof
-    # over a refuted claim is still a refuted claim. It returns None -- the
-    # common case -- for anything it has no declaration for, and a claim that
-    # merely survives the check earns nothing here; falsification is the only
-    # thing this layer is entitled to say.
-    checker = physics if physics is not None else physics_checker()
-    if checker.enabled:
-        verdict = checker.check(
-            cap_name, task.result,
-            subject=_subject_key(getattr(task, 'executor_uuid', None)),
-            now=now_sec if now_sec is not None else time.monotonic())
-        if verdict is not None:
-            score, channel = verdict
-            if logger is not None:
-                # Name which verdict this was, not just the number: "refuted"
-                # and "implicated" warrant different attention from an
-                # operator, and the channel is the only thing that
-                # distinguishes them downstream.
-                logger.warning(
-                    '%s: task %s %s by physical consistency, scored %.2f on '
-                    'the %s channel', name, task.uuid,
-                    'REFUTED' if channel == TX_CHANNEL_PHYSICAL
-                    else 'implicated', score, channel)
-            return verdict
-
-    # Coverage audit, half one (R+D.md §12.4): let this result RESOLVE
-    # predictions other peers made about the quantity it reports.
-    #
-    # Here, and not down with the verdict arm, because the two halves answer
-    # different questions. This one asks "is this result evidence about the
-    # world", and the answer stops being yes the moment physics refutes it --
-    # settling an honest forecaster's prediction against a refuted observation
-    # would let a lying reporter convict it. Everything past the physics arm is
-    # un-refuted and usable, including a result whose own certificate arm is
-    # about to score it: a wrong answer to THIS task is still a measurement.
-    auditor = calibration if calibration is not None else calibration_auditor()
-    subject = _subject_key(getattr(task, 'executor_uuid', None))
-    audit_now = now_sec if now_sec is not None else time.monotonic()
-    if auditor.enabled:
-        settled = auditor.settle(cap_name, task.result, subject, audit_now)
-        if settled and logger is not None:
-            logger.debug('%s: task %s resolved %d outstanding prediction(s)',
-                         name, task.uuid, settled)
-
-    # Prequential competence (R+D.md §12.5), both halves, here and not lower
-    # down. This layer renders NO verdict -- it produces the weight multiplier
-    # `competence_weight` reads when the score is built -- so it has no place
-    # in the arm order below, and putting it there would make the record
-    # depend on which other layer happened to speak first: a forecast on a
-    # reply whose certificate arm is about to score it still has to be
-    # recorded. After physics for the same reason the audit's settle is: a
-    # refuted observation must not resolve an honest forecaster's forecast,
-    # and a refuted result records no forecast of its own either, since a
-    # refuted claim is not evidence in either direction.
-    #
-    # Settle before observe, so a peer forecasting the same quantity it just
-    # reported is weighted against a record including everything this result
-    # settled.
-    estimator = (prequential if prequential is not None
-                 else prequential_estimator())
-    if estimator.enabled:
-        resolved = estimator.settle(cap_name, task.result, subject, audit_now)
-        if resolved and logger is not None:
-            logger.debug('%s: task %s resolved %d outstanding forecast(s)',
-                         name, task.uuid, resolved)
-        estimator.observe(cap_name, getattr(task, 'prediction', None), subject,
-                          audit_now)
-
-    # Certificate-carrying interfaces (R+D.md §12.3), after physics and before
-    # the ZKP arms. After physics because a witness proves the answer satisfies
-    # the problem AS STATED, which says nothing about whether the statement was
-    # physically coherent. Before the ZKP arms because those ask only whether
-    # the bytes were altered -- an exact check of the ANSWER outranks an
-    # attestation about its transport.
-    #
-    # This is the one layer that can return a GOOD score, and that is not an
-    # inconsistency with the physics layer above it. Surviving a feasibility
-    # test means "not refuted"; a witness that checks out means "proved right",
-    # and declining to say so would discard the strongest positive evidence
-    # this node can obtain.
-    verifier = (certificates if certificates is not None
-                else certificate_verifier())
-    if verifier.enabled:
-        verdict = verifier.verify(
-            cap_name, task.result, getattr(task, 'certificate', None),
-            getattr(task, 'requested_kwargs', None),
-            seed if seed is not None else default_seed())
-        if verdict is not None:
-            score, channel = verdict
-            if logger is not None:
-                logger.info('%s: task %s scored %.2f on the %s channel by its '
-                            '%s witness', name, task.uuid, score, channel,
-                            cap_name)
-            return verdict
-
-    # Coverage audit, half two (R+D.md §12.4): judge the peer's CLAIM about how
-    # often answers of this kind land inside the set it quotes.
-    #
-    # After the certificate arm because an exact check of this answer outranks
-    # a statistical claim about a hundred of them: where a capability is both
-    # certified and predictive, the witness settles what happened here, and
-    # `calibration` carries the baseline weight against `certificate`'s 3.
-    # Before the ZKP arms for the same reason physics is -- an attestation that
-    # bytes were not altered says nothing about whether the peer's account of
-    # its own reliability is true.
-    #
-    # Falsification only: a peer that has not been caught over-claiming earns
-    # nothing here, so a silent audit falls through to the arms below.
-    if auditor.enabled:
-        verdict = auditor.assess(cap_name, getattr(task, 'prediction', None),
-                                 subject, audit_now)
-        if verdict is not None:
-            score, channel = verdict
-            if logger is not None:
-                logger.warning(
-                    '%s: task %s scored %.2f on the %s channel -- %s',
-                    name, task.uuid, score, channel,
-                    'coverage claim rejected by the audit'
-                    if score == OVERCONFIDENT_SCORE
-                    else 'declared predictive and produced no usable set')
-            return verdict
+    # The verification layers (R+D.md §12.2-12.5), as the arms they registered
+    # (see ``oracles``): physics check, calibration settle, prequential
+    # settle + observe, certificate check, calibration assess, in that order.
+    # All of them sit before the ZKP arms: a proof attests that a computation
+    # was performed and its bytes not altered, not that its answer is coherent,
+    # proved right, or honestly calibrated. The first verdict ends scoring.
+    verdict = oracles.score(oracles.ScoreInput(
+        task=task, cap=cap_name,
+        subject=_subject_key(getattr(task, 'executor_uuid', None)),
+        now=now_sec if now_sec is not None else time.monotonic(),
+        seed=seed, logger=logger, name=name))
+    if verdict is not None:
+        return verdict
 
     zkp_valid = task.verify_proof()
     if zkp_valid is True:
@@ -546,6 +299,21 @@ class AutonomousTrust(Protocol):
             syslog_handler = SysLogHandler(address='/dev/log')
             self._logger.addHandler(syslog_handler)
         super().__init__(CfgIds.main, self._logger, None)
+        # Load the verification layers this install has (the separate
+        # autonomous-trust-oracle distribution, found by extensions), then
+        # refuse a node whose environment declares one it lacks ($AT_PHYSICS,
+        # ...), before anything starts: a node declared to test physics that
+        # silently did not would accept results physics refutes. Raises
+        # oracles.OracleMissingError after an ERROR per missing layer (the C
+        # twin refuses in negotiation_run).
+        oracles.load()
+        oracles.check_env(self._logger)
+        # Features' own declarations ($AT_OWN_* for social) get the same
+        # treatment, and the node says which features it has.
+        from .extensions import all_extensions, check_env as extensions_check_env
+        extensions_check_env(self._logger)
+        self._logger.info('Extensions: %s',
+                          ', '.join(ext.name for ext in all_extensions()) or 'none')
         self.identity = None  # of type Identity (can't import)
 
         self.process_names: list[str] = []

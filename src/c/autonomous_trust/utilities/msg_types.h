@@ -21,6 +21,7 @@
  *  @{
  */
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "identity/identity.h"
@@ -30,6 +31,7 @@
 #include "reputation/tx_channel.h"
 #include "negotiation/task.h"
 #include "utilities/util.h"
+#include "utilities/msg_registry.h"
 
 /**
  * @brief Tags discriminating the payload carried by @ref generic_msg_t.
@@ -52,25 +54,13 @@ typedef enum {
     PEER_REPUTATION,         /**< Reputation → app: one peer's earned score (@ref peer_reputation_msg_t). Local IPC only. */
     CHILD_GROUP,             /**< Identity → sibling processes: one cohort this node GATEWAYS, beyond its primary group. Local IPC only. Carries a @ref group_t like @ref GROUP, but must never land in `protocol.group` — the reputation process keeps a separate chain per child group, and clobbering the primary slot would merge a subtree into it. Mirrors Python's ChildGroupSet (see gateway-reputation-tree.md, doc/architecture/gateway-reputation-tree.md). */
     PEER_RTT_OBSERVED,       /**< Net-proc → app: one peer's latest RTT (ms). Local IPC only. Reuses @ref peer_rtt_update_msg_t; distinct from @ref PEER_RTT_UPDATE (which stays net-proc → sibling processes). */
-#ifdef AT_SOCIAL_ENABLED
-    PEER_POSITION_OBSERVED,  /**< Identity → app: one peer's shared coarse position (opt-in geohash, @ref peer_position_msg_t). Local IPC only. */
-    PEER_PROFILE_OBSERVED,   /**< Identity → app: one peer's shared agora.profile (opt-in, signature-verified, @ref peer_profile_msg_t). Local IPC only. */
-    PEER_CONNECTION_REQUEST_OBSERVED, /**< Identity → app: an inbound connection ASK from a peer (Increment 5, @ref peer_connection_msg_t). Local IPC only. */
-    PEER_CONNECTION_STATE_OBSERVED,   /**< Identity → app: our connection edge-state toward a peer changed (Increment 5, @ref peer_connection_msg_t). Local IPC only. */
-    PEER_DM_OBSERVED,        /**< Identity → app: a directed text message received from a peer (Increment 6, @ref peer_dm_msg_t). Local IPC only. Live stream — delivered on arrival, never roster state. */
-    PEER_POST_OBSERVED,      /**< Identity → app: a signed feed post received over the group channel (Increment 7, @ref peer_post_msg_t). Local IPC only. Signature-verified, tier-gated and content-id-deduped before emit. */
-    PEER_REACTION_OBSERVED,  /**< Identity → app: a peer reacted to one of our posts (Increment 8, @ref peer_reaction_msg_t). Local IPC only. Live stream — delivered on arrival. */
-    PEER_PROXIMITY_OBSERVED, /**< Identity → app: the coarse distance BAND to a CONNECTED peer, learned by a private-proximity probe (Phase 2, @ref peer_proximity_msg_t). Local IPC only. No coordinates — only the band. */
-    PEER_BUSINESS_AD_OBSERVED, /**< Identity → app: a signed business ad — one opaque Ethne page bundle plus the advertiser's satisfaction (Phase 3 P3.2, @ref peer_business_ad_msg_t). Local IPC only. Signature-verified and content-id-deduped before emit; the BUNDLE is verified app-side, never by the core. */
-    PEER_COSIGN_REQUEST_OBSERVED, /**< Identity → app: a peer asks this node to co-sign a staff-roll or guardianship record (Phase 3 P3.3, @ref peer_cosign_request_msg_t). Local IPC only. The core shape-checks the ask and carries the exported bytes; it holds no Ethne, so it verifies nothing about WHAT is being signed — and it never carries the wording, which the signer's own node derives from the bytes. */
-    PEER_COSIGN_SIG_OBSERVED, /**< Identity → app: a signer returns their detached signature over an exchange this node is authoring (Phase 3 P3.3, @ref peer_cosign_sig_msg_t). Local IPC only. The signature is checked against the payload by the ASSEMBLING node, not by the core. */
-    PEER_BUSINESS_POST_OBSERVED, /**< Identity → app: a signed business post — one opaque Ethne {post,delegation} bundle the ENVOY signed — received over the group channel (Phase 3 P3.4, @ref peer_business_post_msg_t). Local IPC only. Signature-verified, GATED on this node holding the polity's page, and content-id-deduped before emit; the BUNDLE is verified app-side, never by the core. APPENDED HERE, not filed beside PEER_BUSINESS_AD_OBSERVED, because these values are serialized: inserting one renumbers every type after it. */
-#endif /* AT_SOCIAL_ENABLED */
-#ifdef AT_ZTA_ENABLED
-    ZTA_REVOCATION_ALERT,    /**< Peer credential revocation notice. */
-    ZTA_VERIFICATION_RESULT, /**< Outcome of a deferred ZTA verification. */
-#endif
-    PEER_STANDING            /**< An authority → reputation: a BOUND on what a peer may hold, not an interaction outcome (@ref peer_standing_msg_t). Local IPC only. Was ZTA_STANDING, and ZTA is still a producer — but so is an Ethne expulsion reaching the core through the app (Phase 4 P4.1), so the mechanism outlives the one authority that first needed it. PLACED AFTER THE #endif, not filed with the unconditional types above, BECAUSE these values are serialized: here it inherits ZTA_STANDING's exact ordinal in a ZTA build and renumbers nothing in any build combination, where filing it beside PEER_RTT_OBSERVED would renumber all twelve AT_SOCIAL types and both remaining ZTA ones. */
+    PEER_STANDING            /**< An authority → reputation: a BOUND on what a peer may hold, not an interaction outcome (@ref peer_standing_msg_t). Local IPC only. Was ZTA_STANDING, and ZTA is still a producer — but so is an Ethne expulsion reaching the core through the app (Phase 4 P4.1), so the mechanism outlives the one authority that first needed it. */
+    /* Core ids stop below AT_MSG_TYPE_EXT_MIN (msg_registry.h). A FEATURE's
+     * types -- social (Agora's libat_social), ZTA
+     * (zta/zta_msg_types.h) -- are registered at load in their own reserved
+     * range. None of these numbers is on any wire: IPC carries the NAME
+     * (message_type_to_string), so appending here renumbers nothing a peer,
+     * an app, or the Python twin can see. */
 } message_type_t;
 
 /**
@@ -105,9 +95,7 @@ typedef struct
      * RECIPIENT_GROUP. Serialized across the IPC hop by net_msg_to_proto /
      * proto_to_net_msg (absent/false on the wire = the historical peer/broadcast
      * behavior). */
-#ifdef AT_SOCIAL_ENABLED
     bool group_multicast;
-#endif /* AT_SOCIAL_ENABLED */
     char return_to[PROC_NAME_LEN+1];
     /* 32-char hex (UUID4 without dashes) + NUL — must match
      * NET_TRACE_ID_LEN in network/net_message.h. Carried across the IPC
@@ -271,11 +259,11 @@ typedef struct {
      *  Zeroed whenever @c operator_bound is false, for the same reason the
      *  stamp is. */
     uint8_t  operator_pubkey[crypto_sign_PUBLICKEYBYTES];
-#ifdef AT_SOCIAL_ENABLED
     /** True iff this peer's address is a current member of OUR group's
      *  address_map — i.e. we and the peer are in the same group. The social app
      *  surfaces it as an "in your group" indicator, distinct from an explicit
-     *  connection edge. Appended LAST; social builds only. */
+     *  connection edge. Appended LAST. Always present so the struct is one size in
+     *  every build; false without libat_social. */
     bool     in_group;
     /** True iff this peer is LOCALLY BLOCKED on this node (Phase 4 P4.1).
      *
@@ -288,9 +276,9 @@ typedef struct {
      *  nothing at all before P4.1, and the app re-derives tier from the score
      *  (tie_strength.dart mirrors the floors), so a core-side block left the
      *  score unchanged, the derived tier unchanged, and the peer ranked exactly
-     *  as before. Appended LAST; social builds only. */
+     *  as before. Appended LAST. Always present (see @c in_group); false
+     *  without libat_social. */
     bool     blocked;
-#endif /* AT_SOCIAL_ENABLED */
 } peer_observed_msg_t;
 
 /**
@@ -333,342 +321,6 @@ typedef struct {
     double standing_ceiling;
 } peer_reputation_msg_t;
 
-#ifdef AT_SOCIAL_ENABLED
-/* Max geohash length carried across the AT->app boundary. The app shares a
- * ~5-char geohash (the ~5km "neighborhood" bucket); the buffer allows finer
- * precision later without an ABI change. MUST match AT_APP_GEOHASH_LEN in
- * app_events.h. */
-#define AT_GEOHASH_MAX_LEN 12
-
-/**
- * @brief AT → app: one peer's shared coarse position, as an opt-in geohash
- * bucket. Half of the geographic-distance feature (Increment 2); the app
- * computes distance from its own opted-in bucket. An empty @c geohash means the
- * peer shared none (opted out) — the ordinary, default case. Treat the geohash
- * as opaque and untrusted peer input. Local IPC only — the on-wire exchange is
- * the directed peer_position_query/response, not this message.
- */
-typedef struct {
-    uuid_t peer_uuid;
-    /** NUL-terminated geohash; "" = none / opted out. */
-    char   geohash[AT_GEOHASH_MAX_LEN + 1];
-} peer_position_msg_t;
-
-/*
- * A private-proximity result (Phase 2): the coarse distance BAND to one
- * CONNECTED peer, learned by exchanging pairwise-keyed grid tags. Carries NO
- * coordinates — only the band (see at_prox_band_t: 0 unknown, 1 near, 2 mid,
- * 3 far). Local IPC only; the on-wire exchange is the directed encrypted
- * peer_proximity_probe/reply, not this message.
- */
-typedef struct {
-    uuid_t peer_uuid;
-    int    band; /**< at_prox_band_t */
-} peer_proximity_msg_t;
-
-/* Max bytes of the compact profile JSON carried across the AT->app boundary
- * (the sanitized field object; the signature stays in the core). MUST match
- * AT_PROFILE_JSON_MAX in identity/profile.h and AT_APP_PROFILE_JSON_LEN in
- * app_events.h. */
-#define AT_PROFILE_JSON_LEN 2560
-
-/**
- * @brief AT → app: one peer's shared agora.profile, as compact field JSON
- * (Increment 3). Emitted only AFTER the core has bound-validated the fields and
- * verified the peer's Ed25519 signature, so the app receives already-trusted
- * data; the signature itself does not cross. An empty @c profile_json means the
- * peer shared none (opted out). Local IPC only — the on-wire exchange is the
- * directed, signed peer_profile_query/response, not this message.
- */
-typedef struct {
-    uuid_t peer_uuid;
-    /** NUL-terminated compact JSON object of profile fields; "" = none. */
-    char   profile_json[AT_PROFILE_JSON_LEN + 1];
-} peer_profile_msg_t;
-
-/**
- * @brief AT → app: a connection edge event toward one peer (Increment 5).
- *
- * Carries the peer's uuid and this node's local edge state toward it
- * (@ref at_conn_state_t cast to int): none=0, pending_out=1, pending_in=2,
- * connected=3, declined=4. Used for BOTH @ref PEER_CONNECTION_REQUEST_OBSERVED
- * (an inbound ask; @c state is pending_in) and @ref PEER_CONNECTION_STATE_OBSERVED
- * (any edge transition). A connection is EXPLICIT and separate from reputation.
- * Local IPC only — the on-wire exchange is the directed peer_connection_request
- * / signed peer_connection_response, not this message.
- */
-typedef struct {
-    uuid_t  peer_uuid;
-    int32_t state;   /**< @ref at_conn_state_t cast to int. */
-} peer_connection_msg_t;
-
-/* Max bytes of a DM body carried across the AT->app boundary (Increment 6).
- * MUST match AT_DM_TEXT_MAX in identity/dm.h, AT_APP_DM_TEXT_LEN in app_events.h,
- * and AGORA_DM_TEXT_MAX in the shim / cohort ctypes. */
-#define AT_DM_TEXT_LEN 1024
-
-/**
- * @brief AT → app: one directed text message received from a peer (Increment 6).
- *
- * A DM is a single directed, ENCRYPTED peer→peer message; crypto_box already
- * authenticates the sender, so no extra signature is needed and the sender uuid
- * is trustworthy. @c seq is the sender's freshness sequence (a replayed/stale
- * seq is dropped before this is emitted); @c ts is the sender's send time (epoch
- * seconds). @c text is bound-truncated to @ref AT_DM_TEXT_LEN bytes. Local IPC
- * only, and a LIVE STREAM — delivered on arrival, never replayed as roster
- * state. The on-wire form is the directed encrypted peer_dm verb, not this
- * message.
- */
-typedef struct {
-    uuid_t  peer_uuid;   /**< The SENDER's uuid. */
-    int64_t seq;         /**< The sender's freshness sequence. */
-    double  ts;          /**< The sender's send time (epoch seconds). */
-    /** NUL-terminated message body, bound-truncated to AT_DM_TEXT_LEN bytes. */
-    char    text[AT_DM_TEXT_LEN + 1];
-} peer_dm_msg_t;
-
-/* Max bytes of a post body carried across the AT->app boundary (Increment 7).
- * MUST match AT_POST_BODY_MAX in identity/post.h, AT_APP_POST_BODY_LEN in
- * app_events.h, and AGORA_POST_BODY_MAX in the shim / cohort ctypes. */
-#define AT_POST_BODY_LEN 4096
-/* Content id: blake2b-256 digest as lowercase hex (32 bytes -> 64 chars). MUST
- * match AT_POST_ID_HEX_LEN in identity/post.h, AT_APP_POST_ID_LEN in
- * app_events.h, and AGORA_POST_ID_MAX in the shim / cohort ctypes. */
-#define AT_POST_ID_LEN 64
-
-/**
- * @brief AT → app: one signed feed post received over the group channel
- * (Increment 7).
- *
- * A post is a signed, content-addressed feed item distributed by encrypted group
- * multicast and gossip-forwarded a bounded number of hops. @c peer_uuid is the
- * AUTHOR (bound by the Ed25519 signature the core verified before emitting, NOT
- * by the wire envelope). @c post_id is the blake2b content-address of the
- * canonical form — the dedup/merge key. @c seq is the author's post sequence,
- * @c ts the author's post time (epoch seconds), @c required_tier the audience
- * floor (0..4). @c body is bound-truncated to @ref AT_POST_BODY_LEN bytes. Local
- * IPC only; the on-wire form is the group-encrypted peer_post verb, not this
- * message.
- */
-typedef struct {
-    uuid_t  peer_uuid;   /**< The AUTHOR's uuid (signature-bound). */
-    /** NUL-terminated blake2b content id (lowercase hex). */
-    char    post_id[AT_POST_ID_LEN + 1];
-    int64_t seq;         /**< The author's post sequence. */
-    double  ts;          /**< The author's post time (epoch seconds). */
-    int32_t required_tier; /**< Audience floor 0..4. */
-    /** NUL-terminated post body, bound-truncated to AT_POST_BODY_LEN bytes. */
-    char    body[AT_POST_BODY_LEN + 1];
-} peer_post_msg_t;
-
-/**
- * @brief AT → app: one reaction to one of OUR posts, received from a peer
- * (Increment 8).
- *
- * A reaction is a single directed, ENCRYPTED reactor→author message; crypto_box
- * authenticates the reactor, so no extra signature is needed and @c peer_uuid (the
- * REACTOR) is trustworthy. @c post_id is the content-id of the post reacted to.
- * @c seq is the reactor's freshness sequence (a stale/replayed seq is dropped
- * before this is emitted); @c ts is the reactor's send time. Local IPC only; the
- * on-wire form is the directed encrypted peer_reaction verb, not this message.
- */
-typedef struct {
-    uuid_t  peer_uuid;   /**< The REACTOR's uuid. */
-    /** NUL-terminated content id of the post reacted to (lowercase hex). */
-    char    post_id[AT_POST_ID_LEN + 1];
-    int64_t seq;         /**< The reactor's freshness sequence. */
-    double  ts;          /**< The reactor's send time (epoch seconds). */
-} peer_reaction_msg_t;
-
-/* Max bytes of the opaque Ethne page bundle carried across the AT->app boundary
- * (Phase 3 P3.2). MUST match AT_BUSINESS_BUNDLE_MAX in identity/business_ad.h,
- * AT_APP_BUSINESS_BUNDLE_LEN in app_events.h, and AGORA_BUSINESS_BUNDLE_MAX in
- * the shim / cohort ctypes. */
-#define AT_BUSINESS_BUNDLE_LEN 3072
-/* Max bytes of a polity DID. MUST match AT_BUSINESS_DID_MAX in
- * identity/business_ad.h, AT_APP_BUSINESS_DID_LEN in app_events.h, and
- * AGORA_BUSINESS_DID_MAX in the shim / cohort ctypes. */
-#define AT_BUSINESS_DID_LEN 95
-/* Ad content id: blake2b-256 digest as lowercase hex (32 bytes -> 64 chars).
- * MUST match AT_BUSINESS_AD_ID_HEX_LEN in identity/business_ad.h,
- * AT_APP_BUSINESS_AD_ID_LEN in app_events.h, and AGORA_BUSINESS_AD_ID_MAX in the
- * shim / cohort ctypes. */
-#define AT_BUSINESS_AD_ID_LEN 64
-
-/**
- * @brief AT → app: one signed business ad received over the group channel
- * (Phase 3 P3.2, "businesses near me").
- *
- * @c peer_uuid is the ADVERTISER — bound by the Ed25519 signature the core
- * verified before emitting, NOT by the wire envelope — and is either the
- * business's own node or a CUSTOMER re-advertising from its cache in the first
- * person. There is no relay and no hop count: only customers carry a page, and
- * they always speak for themselves (see identity/business_ad.h).
- *
- * @c polity is the business's Ethne DID (the page store's key), @c satisfaction
- * the advertiser's declared 0..4 rating or @ref AT_BUSINESS_SAT_SELF for the
- * business's own ad, @c seq the page version, @c ts the advertiser's send time.
- * @c ad_id is the blake2b content-address of the canonical form — the dedup key.
- *
- * @c bundle is the OPAQUE, self-verifying Ethne page artifact ({page,delegation}
- * proving polity-root → envoy → page). The core never parses it; the APP
- * verifies it. Local IPC only; the on-wire form is the group-encrypted
- * peer_business_ad verb, not this message.
- */
-typedef struct {
-    uuid_t  peer_uuid;   /**< The ADVERTISER's uuid (signature-bound). */
-    /** NUL-terminated polity DID — the business this ad is for. */
-    char    polity[AT_BUSINESS_DID_LEN + 1];
-    /** NUL-terminated blake2b ad content id (lowercase hex). */
-    char    ad_id[AT_BUSINESS_AD_ID_LEN + 1];
-    int32_t satisfaction; /**< 0..4, or AT_BUSINESS_SAT_SELF (255) for the business's own ad. */
-    int64_t seq;         /**< The page version the advertiser is carrying. */
-    double  ts;          /**< The advertiser's send time (epoch seconds). */
-    /** NUL-terminated opaque Ethne bundle, bound-truncated to AT_BUSINESS_BUNDLE_LEN. */
-    char    bundle[AT_BUSINESS_BUNDLE_LEN + 1];
-} peer_business_ad_msg_t;
-
-/* Max bytes of the opaque Ethne {post,delegation} bundle carried across the
- * AT->app boundary (Phase 3 P3.4). LARGER than the page bundle's 3072 because
- * the body rides inside it: the measured worst case is 3550 bytes (see
- * identity/business_post.h). Still under AT_COSIGN_BYTES_LEN, so the
- * generic_msg_t and at_app_event_t unions do not widen. MUST match
- * AT_BUSINESS_POST_BUNDLE_MAX in identity/business_post.h,
- * AT_APP_BUSINESS_POST_BUNDLE_LEN in app_events.h, and
- * AGORA_BUSINESS_POST_BUNDLE_MAX in the shim / cohort ctypes. */
-#define AT_BUSINESS_POST_BUNDLE_LEN 4096
-/* Post content id: blake2b-256 digest as lowercase hex (32 bytes -> 64 chars).
- * MUST match AT_BUSINESS_POST_ID_HEX_LEN in identity/business_post.h,
- * AT_APP_BUSINESS_POST_ID_LEN in app_events.h, and AGORA_BUSINESS_POST_ID_MAX
- * in the shim / cohort ctypes. */
-#define AT_BUSINESS_POST_ID_LEN 64
-
-/**
- * @brief AT → app: one signed business post received over the group channel
- * (Phase 3 P3.4, "business posts in the feed").
- *
- * @c peer_uuid is the node that PUBLISHED these bytes — bound by the Ed25519
- * signature the core verified before emitting, and always the original, since
- * a relay forwards the envelope untouched and changes only @c hops. It is NOT
- * the authority behind the post: that is the envoy signature inside @c bundle,
- * and only the app can check it. Nobody can alter a word without breaking both
- * signatures at once.
- *
- * @c polity is the business's Ethne DID (and the key the page-cache gate was
- * answered with), @c seq the business's own post sequence, @c ts the sender's
- * time, @c hops how far this copy has travelled. @c post_id is the blake2b
- * content-address of the canonical form — the dedup key that makes gossip
- * converge.
- *
- * @c bundle is the OPAQUE, self-verifying Ethne post artifact
- * ({post,delegation} proving polity-root → envoy → post). The core never parses
- * it; the APP verifies it. Local IPC only; the on-wire form is the
- * group-encrypted peer_business_post verb, not this message.
- */
-typedef struct {
-    uuid_t  peer_uuid;   /**< The PUBLISHER (signature-bound), not the authority, and never a relay. */
-    /** NUL-terminated polity DID — the business whose words these are. */
-    char    polity[AT_BUSINESS_DID_LEN + 1];
-    /** NUL-terminated blake2b post content id (lowercase hex). */
-    char    post_id[AT_BUSINESS_POST_ID_LEN + 1];
-    int64_t seq;         /**< The business's own post sequence. */
-    double  ts;          /**< The sender's time (epoch seconds). */
-    int32_t hops;        /**< How far this copy has travelled (0 = from the business). */
-    /** NUL-terminated opaque Ethne bundle, bound-truncated to AT_BUSINESS_POST_BUNDLE_LEN. */
-    char    bundle[AT_BUSINESS_POST_BUNDLE_LEN + 1];
-} peer_business_post_msg_t;
-
-/* Max hex characters of a detached exchange's exported canonical bytes (Phase 3
- * P3.3). MUST match AT_COSIGN_BYTES_MAX in identity/cosign.h,
- * AT_APP_COSIGN_BYTES_LEN in app_events.h, COSIGN_BYTES_HEX_MAX in the agora
- * ethne_ffi crate, and AGORA_COSIGN_BYTES_MAX in the shim / cohort ctypes. */
-#define AT_COSIGN_BYTES_LEN 6144
-/* Max bytes of a polity DID, or of a signer's did:key. MUST match
- * AT_COSIGN_DID_MAX in identity/cosign.h, AT_APP_COSIGN_DID_LEN in
- * app_events.h, and AGORA_COSIGN_DID_MAX in the shim / cohort ctypes. */
-#define AT_COSIGN_DID_LEN 95
-/* Exchange content id as Ethne prints it: "b3:" + 64 lowercase hex. MUST match
- * AT_COSIGN_CID_MAX in identity/cosign.h, AT_APP_COSIGN_CID_LEN in
- * app_events.h, and AGORA_COSIGN_CID_MAX in the shim / cohort ctypes. */
-#define AT_COSIGN_CID_LEN 67
-/* An Ed25519 signature as lowercase hex (64 bytes -> 128 chars). MUST match
- * AT_COSIGN_SIG_MAX in identity/cosign.h, AT_APP_COSIGN_SIG_LEN in
- * app_events.h, and AGORA_COSIGN_SIG_MAX in the shim / cohort ctypes. */
-#define AT_COSIGN_SIG_LEN 128
-/* A record-class or op token ("membership", "guardian", "designate", …). MUST
- * match AT_COSIGN_TOKEN_MAX in identity/cosign.h, AT_APP_COSIGN_TOKEN_LEN in
- * app_events.h, and AGORA_COSIGN_TOKEN_MAX in the shim / cohort ctypes. */
-#define AT_COSIGN_TOKEN_LEN 15
-
-/**
- * @brief AT → app: a peer asks this node to co-sign one record (Phase 3 P3.3).
- *
- * A staff roll act is decided by several people who are not at the same
- * keyboard, and their KEYS DO NOT TRAVEL. The record does: one node exports its
- * canonical bytes, each required signer signs those exact bytes on their own
- * node, and the authoring node reassembles the signatures.
- *
- * @c peer_uuid is the REQUESTER, bound by crypto_box on the directed encrypted
- * envelope — nobody can put an ask in somebody else's mouth. @c record is
- * "membership" or "guardian" and @c op the act within it; @c polity the Ethne
- * DID; @c cid the exchange's content address; @c bytes the exported canonical
- * CBOR as lowercase hex.
- *
- * **The core verifies nothing about what is being signed**, exactly as it
- * verifies nothing about a business page bundle: it holds no Ethne. It bounds
- * and shape-checks the fields (known op, even-length lowercase hex) so a
- * malformed ask is refused rather than carried.
- *
- * **No description travels.** What the record commits to, in words, is derived
- * on the SIGNER's node from these bytes. Carrying the wording would let the
- * asking node choose both what you sign and what you are told you are signing.
- *
- * Local IPC only; the on-wire form is the directed encrypted peer_cosign_request
- * verb, not this message.
- */
-typedef struct {
-    uuid_t  peer_uuid;   /**< The REQUESTER's uuid (crypto_box-authenticated). */
-    /** NUL-terminated record class: "membership" or "guardian". */
-    char    record[AT_COSIGN_TOKEN_LEN + 1];
-    /** NUL-terminated op: admit/expel, or designate/rotate/release. */
-    char    op[AT_COSIGN_TOKEN_LEN + 1];
-    /** NUL-terminated polity DID this record belongs to. */
-    char    polity[AT_COSIGN_DID_LEN + 1];
-    /** NUL-terminated exchange content id ("b3:<hex>"), NOT recomputed here. */
-    char    cid[AT_COSIGN_CID_LEN + 1];
-    int64_t seq;         /**< The requester's freshness sequence. */
-    double  ts;          /**< The requester's send time (epoch seconds). */
-    /** NUL-terminated exported canonical bytes, lowercase hex. Opaque. */
-    char    bytes[AT_COSIGN_BYTES_LEN + 1];
-} peer_cosign_request_msg_t;
-
-/**
- * @brief AT → app: a signer returns their detached signature (Phase 3 P3.3).
- *
- * @c peer_uuid is the returning peer (crypto_box-authenticated). @c cid names
- * the exchange, @c signer the signing did:key — which EMBEDS its public key, so
- * the assembling node needs no registry to check the signature — and @c sig the
- * detached Ed25519 signature over the exported bytes, as lowercase hex.
- *
- * The core does not check the signature, and could not: it does not hold the
- * payload. Verification happens where it belongs, on the ASSEMBLING node, which
- * refuses a wrong key or a tampered payload before anything is appended.
- *
- * Local IPC only; the on-wire form is the directed encrypted peer_cosign_sig
- * verb, not this message.
- */
-typedef struct {
-    uuid_t  peer_uuid;   /**< The SIGNER's uuid (crypto_box-authenticated). */
-    /** NUL-terminated exchange content id this signature is for. */
-    char    cid[AT_COSIGN_CID_LEN + 1];
-    /** NUL-terminated signer did:key (embeds the public key). */
-    char    signer[AT_COSIGN_DID_LEN + 1];
-    /** NUL-terminated detached Ed25519 signature, lowercase hex. */
-    char    sig[AT_COSIGN_SIG_LEN + 1];
-    int64_t seq;         /**< The signer's freshness sequence. */
-    double  ts;          /**< The signer's send time (epoch seconds). */
-} peer_cosign_sig_msg_t;
-#endif /* AT_SOCIAL_ENABLED */
 
 #define SIGNAL_LEN 32
 
@@ -678,15 +330,6 @@ typedef struct
     int sig;
 } signal_t;
 
-#ifdef AT_ZTA_ENABLED
-typedef struct {
-    uuid_t peer_uuid;
-    uuid_t voucher_uuid;            /* Identity of the peer that performed verification */
-    uint8_t credential_hash[32];
-    int status;                     /* zta_status_t cast to int */
-    char reason[64];
-} zta_event_msg_t;
-#endif
 
 /**
  * @brief What an authority proved (or failed to prove) about a peer.
@@ -812,17 +455,21 @@ typedef struct {
  *  outweighs over time. This is a hard BOUND that no amount of good behaviour
  *  lifts.
  *
- *  Filed here rather than in identity/social_tx.h, where the other social
- *  constants live, because that header is included only under
- *  AT_SOCIAL_ENABLED while this verb is always compiled. */
+ *  Filed here rather than in libat_social's social_tx.h (Agora), where the
+ *  other social constants live, because this verb is core and always
+ *  compiled. */
 #define AT_ETHNE_EXPEL_CEILING 0.20
 
 /**
  * @brief Tagged union carrying any message the IPC layer understands.
  *
- * The @c type field (a @ref message_type_t cast to @c long for ABI stability
- * with the message queue) selects which member of @c info is live. Use
- * @ref message_size to learn the serialized size for a given @c type.
+ * The @c type field selects which member of @c info is live: a core
+ * @ref message_type_t names its arm; a type a feature registered
+ * (msg_registry.h) lives in @c payload and is read with @ref AT_MSG_EXT. Use
+ * @ref message_size to learn the payload size for a given @c type.
+ *
+ * `info` is exactly @ref AT_MSG_PAYLOAD_MAX bytes in every build, so the
+ * struct's size no longer depends on which features are compiled in.
  */
 typedef struct
 {
@@ -843,25 +490,14 @@ typedef struct
         peer_rtt_update_msg_t peer_rtt_update;
         peer_observed_msg_t peer_observed;
         peer_reputation_msg_t peer_reputation;
-#ifdef AT_SOCIAL_ENABLED
-        peer_position_msg_t peer_position;
-        peer_profile_msg_t peer_profile;
-        peer_connection_msg_t peer_connection;
-        peer_dm_msg_t peer_dm;
-        peer_post_msg_t peer_post;
-        peer_reaction_msg_t peer_reaction;
-        peer_proximity_msg_t peer_proximity;
-        peer_business_ad_msg_t peer_business_ad;
-        peer_cosign_request_msg_t peer_cosign_request;
-        peer_cosign_sig_msg_t peer_cosign_sig;
-        peer_business_post_msg_t peer_business_post;
-#endif /* AT_SOCIAL_ENABLED */
-#ifdef AT_ZTA_ENABLED
-        zta_event_msg_t zta_event;
-#endif
         peer_standing_msg_t peer_standing;
+        /** A registered (extension) type's payload -- see msg_registry.h. */
+        _Alignas(max_align_t) uint8_t payload[AT_MSG_PAYLOAD_MAX];
     } info;         /**< Discriminated-union payload keyed by @c type. */
 } generic_msg_t;
+
+_Static_assert(sizeof(((generic_msg_t *)0)->info) == AT_MSG_PAYLOAD_MAX,
+               "a core arm of generic_msg_t.info outgrew AT_MSG_PAYLOAD_MAX");
 
 /**
  * @brief Return the @c sizeof the struct associated with @p type.

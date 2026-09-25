@@ -34,6 +34,9 @@ WORKDIR /app
 # inspector image: any post-build core fixes (ProcessLogger, automate.py
 # logfile makedirs) would otherwise be stale here too.
 COPY src/autonomous-trust/autonomous_trust/core /app/autonomous_trust/core
+# The verification layers (autonomous-trust-oracle), beside the core in the
+# autonomous_trust namespace, where the core finds them (FEATURE_SPLIT_PLAN Phase 3).
+COPY src/autonomous-trust-oracle/autonomous_trust/oracle /app/autonomous_trust/oracle
 
 # Layer the evaluation + services packages via separate PYTHONPATH roots.
 # Python's namespace-package mechanism merges autonomous_trust.{core,

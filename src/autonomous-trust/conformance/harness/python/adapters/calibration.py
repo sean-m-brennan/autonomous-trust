@@ -43,11 +43,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from autonomous_trust.core.calibration import (ABSENT_SCORE,
-                                               OVERCONFIDENT_SCORE,
-                                               CalibrationAuditor,
-                                               parse_calibration)
-from autonomous_trust.core.physics import parse_physics
+from autonomous_trust.oracle.calibration import (ABSENT_SCORE,
+                                                 OVERCONFIDENT_SCORE,
+                                                 CalibrationAuditor,
+                                                 parse_calibration)
+from autonomous_trust.oracle.physics import parse_physics
 from autonomous_trust.core.reputation import TX_CHANNEL_CALIBRATION
 
 from ...common.scenario_loader import Case

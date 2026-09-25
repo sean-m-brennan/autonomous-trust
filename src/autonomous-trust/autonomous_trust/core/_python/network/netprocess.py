@@ -31,6 +31,7 @@ from ..protocol import Protocol
 from ..identity import Identity
 from ..identity.protocol import IdentityProtocol, UNENCRYPTED_VERBS, BOOTSTRAP_VERBS
 from ..processes import Process, ProcMeta
+from ..extensions import load_extensions, run_post_fork
 from .. import _probes
 from ..identity import Group
 from ..system import (CfgIds, PortSource, comm_port, net_cadence, resolve_comm_port,
@@ -157,6 +158,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         # the inbound-drop / outbound-forward gates below.
         self.protocol.register_handler(Network.exclude, self.handle_exclude)
         self.protocol.register_handler(Network.readmit, self.handle_readmit)
+        load_extensions(self, self.name)
         self.stop = False
         self.statistics = {}
         self._rejected_addresses: set[str] = set()
@@ -932,6 +934,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         :param signal: IPC queue for signalling halt
         :return:
         """
+        run_post_fork(self)
         # Re-establish receiver-socket timeouts here, in the worker
         # subprocess. The sockets are created in __init__ (which runs
         # in the parent) and transferred via fd-passing during the

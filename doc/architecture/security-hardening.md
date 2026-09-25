@@ -246,7 +246,7 @@ limits are worth stating: one secret for every viewer, no revocation short of a
 restart with a new value, and no notion of *which* human is connected. It is here
 because it needs no provisioning. The check sits behind an `Authenticator`
 interface so the stronger mechanisms this tree already has — an `OperatorSession`
-from the PIV+MFA flow ([Operator Access](operator-access.md)), or an mTLS client
+from the PIV+MFA flow ([Operator access](operator-access.md)), or an mTLS client
 certificate chaining to the configured ZTA anchors ([ZTA
 Integration](zta-integration.md)) — can replace it without touching a connection
 handler. Whether a credential may be embedded in a served page is asked of the

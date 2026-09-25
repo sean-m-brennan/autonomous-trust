@@ -32,9 +32,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from autonomous_trust.core.replication import (adjudicate, bisect_adjudicate,
-                                               commit_root, parse_replication,
-                                               should_replicate, verify)
+from autonomous_trust.oracle.replication import (adjudicate, bisect_adjudicate,
+                                                 commit_root, parse_replication,
+                                                 should_replicate, verify)
 
 from ...common.scenario_loader import Case
 

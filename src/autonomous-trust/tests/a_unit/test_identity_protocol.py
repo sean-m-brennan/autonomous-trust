@@ -50,50 +50,19 @@ class TestIdentityProtocol:
         - runtime hierarchy roots (hierarchy, hierarchy_req)
         - the OPTIONAL 1:1 first-contact handshake (hello, hello_ack;
           opt-in via AT_FIRST_CONTACT, see first-contact.md)
-        - opt-in coarse position, the "with-distance" feature
-          (position_query, position_response)
-        - opt-in signed agora.profile, Increment 3
-          (profile_query, profile_response)
-        - explicit, revocable connection edges, Increment 5
-          (connection_request, connection_response)
-        - directed encrypted direct messages, Increment 6 (dm)
-        - signed, content-addressed feed posts, Increment 7 (post)
-        - directed encrypted post reactions, Increment 8 (reaction)
-        - opt-in private proximity: two connected peers swap
-          key-derived grid tags to learn only a coarse distance
-          band (proximity_probe, proximity_reply, and its
-          local-only trigger proximity_trigger)
-        - business pages carried by their own customers, Phase 3
-          (business_ad) — every ad on the wire is first-person, so
-          one verb covers the business advertising itself and a
-          happy customer re-advertising what it learned
-        - detached co-signing of staff roll acts, Phase 3 P3.3
-          (cosign_request, cosign_sig) — the record's bytes travel
-          and the signers' private keys do not, so it takes two
-          verbs: the ask carrying the exported payload, and the
-          signature coming back. The human-legible description of
-          what is being signed is deliberately NOT a field on
-          either: the signer's own node derives it from the bytes.
-        - business POSTS, Phase 3 P3.4 (business_post) — the polity
-          speaking, where the page is what it is. One verb, not two:
-          unlike an ad it IS relayed, and a relay forwards the
-          publisher's own envelope untouched and bumps only the hop
-          count, so a carried post is the same message rather than a
-          second one. Its authority is the envoy signature sealed in
-          the opaque bundle, which this tier never opens.
-        - first-person reports, Phase 4 P4.1 (report) — directed and
-          encrypted like a reaction, {seq, ts} only. No reason travels:
-          on the wire it would make a score a published accusation.
+        The social verbs (position, profile, connections, DMs, posts,
+        reactions, proximity, business ads and posts, cosign, reports)
+        left with social (FEATURE_SPLIT_PLAN Phase 5): they are
+        ``SocialProtocol`` in Agora's at-social/python, pinned by its
+        test_social_protocol.py.
         Asserting the exact count here pins the wire contract — a
         new verb without intent will fail this and force a deliberate
         update. Update the expected count alongside any new addition
         to ``IdentityProtocol``.
         """
         values = list(IdentityProtocol)
-        assert len(values) == 45
-        assert 'report' in values
+        assert len(values) == 28
         assert 'announce' in values
-        assert 'business_ad' in values
-        assert 'business_post' in values
-        assert 'cosign_request' in values
-        assert 'cosign_sig' in values
+        assert 'hello' in values
+        assert 'report' not in values
+        assert 'business_ad' not in values

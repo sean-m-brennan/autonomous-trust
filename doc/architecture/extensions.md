@@ -14,10 +14,11 @@ structs changed size with the build flags: `at_app_event_t` was 104 B in a core
 build and several KB in a social one, so a foreign mirror of it (the ethne
 `en-at` crate) was correct for exactly one build.
 
-Both are replaced by runtime registries. A feature reaches the IPC layer and
-the app ABI only through registration, so moving it into its own library is a
-code move, not an ABI change. Social made that move in Phase 5 (see "Social");
-ZTA still lives in the core tree and compiles under its flag.
+Runtime registries replace both. A feature reaches the IPC layer and the app ABI
+only through registration, so moving it into its own library is a code move
+rather than an ABI change. Social made that move in Phase 5, and in Phase 5b
+left this repository for Agora (see "External extensions and conformance
+plug-ins"); ZTA still lives in the core tree and compiles under its flag.
 
 ## Ordinals are not on any wire
 
@@ -67,7 +68,7 @@ and reads or writes the payload through `AT_MSG_EXT(msg, T)`.
 | Range | Owner |
 |---|---|
 | 1–999 | core (`message_type_t`); never registrable |
-| 1000–1999 | social (`extensions/social/social_msg_types.h`, 1000–1011 used) |
+| 1000–1999 | social (Agora's `at-social/c/social/social_msg_types.h`, 1000–1011 used) |
 | 2000–2099 | ZTA (`zta/zta_msg_types.h`, 2000–2001 used) |
 | 2100–2199 | fleet (reserved) |
 
@@ -131,7 +132,7 @@ four build configs. Those are the numbers the foreign mirrors assert.
 | 100–199 | future core kinds |
 | 1000– | further features, one block each |
 
-A feature's public header (`at_agora.h`, installed only by a social build)
+A feature's public header (`at_agora.h`, installed only by a build with social)
 carries its kinds, flat payload structs and **kind-checked accessors**:
 
 ```c
@@ -387,40 +388,17 @@ Each layer's `oracle.py` registers when its package is imported.
 node refuses as the C one does. The layers score in the main process, where
 `score_task_result` runs; the extension attaches no process handlers.
 
-## Social (`extensions/social/`, `autonomous_trust.social`)
+## Identity hooks (`identity/id_ext.h`, `IdentityHooks`)
 
-Social is the Agora feature set: opt-in position and private proximity, signed
-profiles, explicit connections, direct messages, feed posts and reactions,
-first-person reports and local blocks, business ads and posts, and detached
-co-signing. Since FEATURE_SPLIT_PLAN Phase 5 it is an extension in both
-runtimes, and **present means on**: a node that links `libat_social`, or has
-the `autonomous_trust.social` distribution on its path, has social; one that
-does not carries none of it. There is no runtime switch. `AT_SOCIAL` is only
-the CMake option that builds the library (default OFF).
+A feature that follows the identity process, as Agora's social does, attaches
+through hooks rather than being named by the process. `identity_ext_t`
+(`identity/id_ext.h`, at most `IDENTITY_EXT_MAX` = 4, registered by
+`IDENTITY_EXT_REGISTER`) is the C half. Every member may be NULL, and with
+nothing registered every dispatcher is a no-op and every query false, which is
+exactly a node without the feature. `id_proc.c` calls each through its
+dispatcher:
 
-**C.** `src/c/extensions/social/` builds `libat_social` (`at_social`,
-`at_social_static`, through `at_extension_library`). Linking it registers,
-from load-time constructors:
-
-- the identity hooks (`identity/id_ext.h`, below);
-- its 34 identity verbs, 16 from the wire and 18 from the app, through
-  `processes/extension.h` on "identity" only;
-- its 12 message types and 18 `AT_APP_*` verbs (`social/social_msg_types.h`);
-- the app-event decoders behind `at_agora.h`.
-
-The app-facing API kept its names: `at_agora.h`, `at_app_events_*`,
-`at_agora_event_*` and event kinds 4–15. The Agora shim and the Dart bindings
-changed only their link and include lines. The anchor is `at_social_link()`
-(`social/at_social.h`).
-
-**The identity hooks.** `identity_ext_t` (`identity/id_ext.h`, at most
-`IDENTITY_EXT_MAX` = 4, registered by `IDENTITY_EXT_REGISTER`) is how a feature
-follows the identity process without the process naming it. Every member may
-be NULL, and with nothing registered every dispatcher is a no-op and every
-query false, which is exactly a node without the feature. `id_proc.c` calls
-each through its dispatcher:
-
-| Hook | Called from (`id_proc.c`) | Social uses it for |
+| Hook | Called from (`id_proc.c`) | Agora's social uses it for |
 |---|---|---|
 | `init` | identity's own init | its state; seeds `$AT_OWN_*` |
 | `reset` | `identity_reset_state`, after the final unlock | dropping all state |
@@ -432,19 +410,20 @@ each through its dispatcher:
 | `peer_in_group` | `identity_emit_peer_observed` | PEER_OBSERVED's `in_group` |
 | `peer_blocked` | `identity_emit_peer_observed`; `identity_get_peer_tier` | `blocked`, and a blocked peer's tier reads 0 |
 
-**The C lock rule.** Social keeps its state behind its own leaf lock
-(`social_state.lock`). The order is peers rwlock → identity lock → social
-lock. The core dispatches every hook **with no lock held**, not the identity
-lock and not a peers lock, so a hook may call back into exported identity
-functions. The converse binds social: while it holds its own lock it calls
-only map, string, `social_store_*` and log functions, never anything that
-locks or dispatches. `identity_get_peer_tier` reads the tier under the identity
-lock, unlocks, and only then asks `peer_blocked`, so a tier and a block are two
-snapshots rather than one. What social needs from identity it calls through
-exports in `identity/id_proc_priv.h`: `identity_state_ensure_init`, the
-freshness pair, `identity_find_peer_pub`, `identity_send_to_network`,
-`identity_emit_peer_observed`, `identity_request_attestation`,
-`identity_is_local_app_verb` and `identity_refuse_remote_app_verb`.
+**The C lock rule.** A feature keeps its state behind its own leaf lock
+(social's is `social_state.lock`). The order is peers rwlock → identity lock →
+feature lock. The core dispatches every hook **with no lock held**, not the
+identity lock and not a peers lock, so a hook may call back into exported
+identity functions. The converse binds the feature: while it holds its own lock
+it calls only map, string, its own store's and log functions, never anything
+that locks or dispatches. `identity_get_peer_tier` reads the tier under the
+identity lock, unlocks, and only then asks `peer_blocked`, so a tier and a block
+are two snapshots rather than one. What a feature needs from identity it calls
+through exports in `identity/id_proc_priv.h`; social's are
+`identity_state_ensure_init`, the freshness pair, `identity_find_peer_pub`,
+`identity_send_to_network`, `identity_emit_peer_observed`,
+`identity_request_attestation`, `identity_is_local_app_verb` and
+`identity_refuse_remote_app_verb`.
 
 **What stayed in the core.** Peer standing and the tier read are identity's:
 a governance standing is not an Agora idea, and `get_peer_tier` asks the
@@ -460,23 +439,10 @@ extension named "social" is registered (`identity_ext_check_env`). A node told
 to publish its position that silently published nothing would look healthy
 while failing its operator.
 
-**Python.** The distribution is `src/autonomous-trust-social/`
-(`autonomous_trust.social`, `_python` beside an empty `_native`, redirector
-prefix `autonomous_trust.social.`), found by its entry point or its
-`_at_extension.py` marker. The modules are:
-
-- `protocol` holds `SocialProtocol`, the 17 verbs moved off `IdentityProtocol`
-  with their strings unchanged;
-- `extension` is the `Extension`;
-- `handlers` holds the handlers and senders, as module functions `f(proc, …)`;
-- `state` holds `SocialState`, on `proc.social`;
-- `codec`, `proximity` and `social_store` are the canonical forms, grid tags
-  and durable store.
-
-Handlers register as `functools.partial(fn, proc)`, so the process still
-pickles. The core's identity process calls the extension through
-`IdentityHooks` on `Extension.identity`, fewer than C has, because Python has
-no app-event carrier:
+**Python.** A Python feature's handlers register as `functools.partial(fn,
+proc)`, so the process still pickles. The core's identity process calls the
+feature through `IdentityHooks` on `Extension.identity`, fewer hooks than C
+has, because Python has no app-event carrier:
 
 | Hook | Called from (`idprocess.py`) | Lock |
 |---|---|---|
@@ -484,38 +450,76 @@ no app-event carrier:
 | `periodic_resync(proc, queues)` | `_periodic_caps_resync`, inside its `try` | not held |
 | `is_blocked_locked(proc, uuid_str)` | `get_peer_tier` | **held**: must not take `proc.lock` |
 
-`Extension.post_fork` is Python's `run_start`. It restores the blocks before
-the process takes traffic. `load_extensions` records a loaded name on every
-process it runs for, so the hook acts only where `proc.social` exists (the
-identity process). **Python keeps the single `proc.lock`**, where C has a
-second lock: accrual runs under it, and a second lock would buy Python nothing
-it can use. `AutonomousTrust.__init__` calls `extensions.check_env` after
+`Extension.post_fork` is Python's `run_start`; social's restores its blocks
+before the process takes traffic. `load_extensions` records a loaded name on
+every process it runs for, so a hook must act only where its state exists
+(social's checks `proc.social`, which only the identity process has). **Python
+keeps the single `proc.lock`**, where C has a second lock: social's accrual runs
+under it, and a second lock would buy Python nothing it can use.
+`AutonomousTrust.__init__` calls `extensions.check_env` after
 `oracles.check_env` and raises `ExtensionMissingError` when any
 `$AT_OWN_GEOHASH`/`$AT_OWN_EXACT`/`$AT_OWN_PROFILE` is set without social. It
 logs the loaded extensions at INFO.
 
-**Conformance.** Social is its own protocol, `social` (56 scenarios under
-`scenarios/social/`). Social rides the identity process, so each harness's
-social adapter is its identity adapter plus hooks:
+## External extensions and conformance plug-ins
 
-- Python: `adapters/social.py`, `SocialAdapter(IdentityAdapter)`, through
-  `FIXTURE_HOOKS`, `TRIGGERS`, `INBOUND_BUILDERS` and `STATE_CHECKS`.
-- C: `adapters/social.c`, an `ic_ext_t` (`adapters/identity_priv.h`: fixtures,
-  inbound, dispatch, check_key, on_send, impl_free) run by
-  `at_identity_run_ext`.
+An extension need not live in this repository. Agora's social
+(`apps/agora/at-social/` in muudd) is one: it was in-tree until FEATURE_SPLIT_PLAN
+Phase 5b and left because Agora is its only consumer. Five seams let an outside
+directory build, register and test as an in-tree extension does, and AT names
+none of what plugs into them.
 
-Each is registered only where the feature is: Python's runner only when
-`autonomous_trust.social` imports, C's runner only under `AT_CONF_SOCIAL`
-(the library is built). Otherwise the protocol reads as "no adapter" and
-skips on that side. The identity adapters name nothing social.
-`tools/at_diagram.py` lets a social scenario use identity's verbs
-(`_PROTOCOL_BASES`).
+1. **C build.** `AT_EXTERNAL_EXTENSIONS` (`src/c/CMakeLists.txt`) is a cache
+   list of directories, each holding an extension's `CMakeLists.txt`. Each is
+   `add_subdirectory`'d inside AT's scope, after the in-tree extensions, with
+   binary dir `extensions/<basename>`. It therefore sees what an in-tree
+   extension does: `lib_compile_flags`, `AT_EXT_DIR`, `AT_TEST_LIBS`, the
+   directory-scoped include dirs and `test/test_setup.h`.
+   `at_extension_library` adds the parent of the calling directory as a PUBLIC
+   include root, so `"social/x.h"` resolves wherever the extension lives. A
+   consumer that adds AT as a subdirectory (Agora's `native/CMakeLists.txt`)
+   sets the list before it does.
+2. **C conformance adapter.** `at_conformance_adapter(PROTOCOL <p> RUN <fn>
+   SOURCES … LIBS … CORPUS <dir>)` (`extensions/at_extension.cmake`) records
+   its arguments as global properties. `src/c/conformance/CMakeLists.txt`,
+   added after the extensions, compiles the sources, links the libraries
+   whole-archive and generates `conformance_registry.c`, a `{protocol,
+   run_fn}` table. `runner.c`'s dispatch falls through to it before "no C
+   adapter".
+3. **Corpus.** `tools/corpus_to_json.py` takes `--in` more than once. The first
+   root supplies `schema/`; the rest add `scenarios/`, `vectors/` and
+   `testdata/`. One `index.json` is written, pruning covers every root, and a
+   duplicate case id, mirror path or testdata file is an error.
+4. **Python harness.** `$AT_CONFORMANCE_PLUGINS` is an os.pathsep list of
+   plug-in directories, each with `scenarios/<protocol>/` and a
+   `conformance_plugin.py` (`SYS_PATH`, `adapters()`). The runner loads each by
+   path; `scenario_loader.discover` takes the extra roots and refuses a
+   duplicate case id.
+5. **Script.** `scripts/test-conformance.sh` turns `AT_EXTERNAL_EXTENSIONS`
+   (':'-separated) into `-DAT_EXTERNAL_EXTENSIONS=…` for its C build and
+   exports `AT_CONFORMANCE_PLUGINS` to the Python run. Results land in AT's
+   `results/` as before, so the freshness check and the diff are unchanged.
+
+What an identity-riding adapter builds on is the identity adapters' published
+hooks: C `ic_ext_t` / `at_identity_run_ext`
+(`src/c/conformance/adapters/identity_priv.h`: fixtures, inbound, dispatch,
+check_key, on_send, impl_free), and Python `IdentityAdapter`'s
+`FIXTURE_HOOKS`, `TRIGGERS`, `INBOUND_BUILDERS` and `STATE_CHECKS`.
+
+An external extension builds in AT's scope, so it can include every
+`*_priv.h`, as an in-tree one could. The ones it may rely on are the extension
+headers named in this document, `identity/id_ext.h`,
+`identity/id_proc_priv.h` (the exports listed under "Identity hooks") and, for
+an adapter, `adapters/identity_priv.h`. Anything else can change without
+notice. Two-repo skew is the normal submodule pin: the seams add no ABI of
+their own.
 
 ## Python: `load_extensions` (`core/_python/extensions.py`)
 
 The Python processes do the same thing with an `Extension` dataclass
 (`name, enabled, register_handlers, post_fork=None, reset=None,
-identity=None`; `identity` is the feature's `IdentityHooks`, see "Social"). Each of
+identity=None`; `identity` is the feature's `IdentityHooks`, see "Identity
+hooks"). Each of
 `IdentityProcess`, `NetworkProcess`, `ReputationProcess` and
 `NegotiationProcess` ends its handler block with `load_extensions(self,
 self.name)`, and each `process()` starts with `run_post_fork(self)`, which runs
@@ -527,13 +531,13 @@ Extensions come from three places:
    own entry points, because the package usually runs from a source tree where
    its `pyproject.toml` entry points are invisible;
 2. the `autonomous_trust.extensions` entry-point group, for an installed
-   distribution (`autonomous-trust-oracle` declares `oracle`,
+   distribution (`autonomous-trust-oracle` declares `oracle`; Agora's
    `autonomous-trust-social` declares `social`);
 3. for a source tree, a marker scan. Every subpackage of the `autonomous_trust`
    namespace that holds `_at_extension.py` is found by a filesystem check, and
    only that module is imported, so a heavy sibling without one
    (`-services`, `-simulator`) is never imported. Putting
-   `src/autonomous-trust-oracle` and `src/autonomous-trust-social` on
+   `src/autonomous-trust-oracle` (or Agora's `at-social/python`) on
    `PYTHONPATH` beside `src/autonomous-trust` is all a checkout needs.
 
 The same extension found by both the entry point and the scan counts once.
@@ -562,7 +566,7 @@ depends on the feature calls it:
 
 | Anchor | Called from |
 |---|---|
-| `at_social_link()` | nothing in the core: the Agora shim (`agora_events_open`), `agorad`'s `main` and en-at's `EmbeddedAtNode` call it. It calls `at_agora_link()`, which calls `at_social_msg_types_link()` |
+| `at_social_link()` (Agora's `libat_social`) | nothing in the core: the Agora shim (`agora_events_open`), `agorad`'s `main` and en-at's `EmbeddedAtNode` call it. It calls `at_agora_link()`, which calls `at_social_msg_types_link()` |
 | `at_zta_msg_types_link()` | `zta_process_run` |
 | `at_first_contact_link()` | `identity_register_handlers` |
 | `at_dtn_link()` | nothing in the core: DTN's consumers own its link |
@@ -595,10 +599,8 @@ whether it built.
 - `test/msg_types3_test.c`: every core and registered type's name round-trips
   and its size fits; a registered type round-trips through the real serializer
   (not the conformance hook); short payloads are refused; bad registrations are
-  refused; the social and ZTA types and verbs are registered in their builds.
+  refused; the ZTA types are registered in a ZTA build.
 - `test/app_abi_test.c`: the event layout, identical in every config.
-- `extensions/social/test/app_events_test.c`: a social event crosses drain → real socket → poll →
-  accessor, and a social verb routes to identity only.
 - `test/extension_test.c`: extension registration refusals; `enabled()` is
   re-read and dispatch is per process; first contact registers exactly when
   enabled; transport and process registration and their refusals. It links
@@ -630,17 +632,14 @@ whether it built.
   returns -1 with its ERROR.
 - `tests/a_unit/test_extensions.py`: the Python half, including pickling and a
   second redirector prefix.
-- `extensions/social/test/social_link_test.c`: with `at_social_static` linked,
-  the 34 verbs register, the hooks fire, and a block reads as tier 0.
-  `extension_test` pins the core-only half: no social verb, and the `$AT_OWN_*`
-  declarations refused. `b-social-off` builds with no social symbol in
-  `libautonomous_trust.so`, and `libat_social.so` needs only the core and libc.
-- `tests/a_unit/test_identity_without_social.py`: a core-only Python node has
-  none of the 17 verb strings, no `proc.social` and no block hook, and refuses
-  each `$AT_OWN_*`. `autonomous-trust-social`'s `test_social_registration.py`:
-  discovery finds it once, the 17 verbs register on identity only, the process
-  pickles, the tier clamp asks the block hook, and `post_fork` restores the
-  blocks (dropping the `post_fork` fails three of those tests).
+- `test/extension_test.c` also pins the core-only half of social: no social
+  verb, and the `$AT_OWN_*` declarations refused; `b-core` has no social symbol
+  in `libautonomous_trust.so`. `tests/a_unit/test_identity_without_social.py`
+  is the Python half: a core-only node has none of the 17 verb strings, no
+  `proc.social` and no block hook, and refuses each `$AT_OWN_*`. Social's own
+  tests (the 17 ctest in `at-social/c/social/test/`, `social_link_test` among
+  them, and the Python distribution's) are Agora's; `at-social/README.md` runs
+  them.
 - `tests/a_unit/test_oracles.py`: the Python registry, as `neg_oracle_test`, and
   a node that declares a layer it lacks refusing to start.
   `autonomous-trust-oracle`'s `test_oracle_registration.py`: discovery finds the
@@ -652,17 +651,24 @@ whether it built.
   earlier `identity/` result, in both runtimes and in all six C configs:
   identical, except that the four `proximity-*` cases now skip instead of
   fail in a C build without social.
+  After Phase 5b moved social to Agora, AT alone runs 250 cases in each config,
+  identical to the same 250 before the move (by name: three `peer-standing-*`
+  descriptions were reworded, which changes their ids), and the 306 through
+  `at-social/test-conformance.sh` match the pre-move run the same way, with 0
+  asymmetric.
 - Downstream: the Agora shim builds and `test/abi_lockstep_test.dart` passes
   (`agora_event_t` is unchanged at 22,168 B, so Dart and the cohort ctypes are
   untouched). `en-at` passes `cargo test --features at-ffi` against both a core
-  and a social+ZTA `libautonomous_trust.so`.
+  and a social+ZTA `libautonomous_trust.so`; since Phase 5b the Agora native
+  build links `libat_social` from `at-social/c/social` through
+  `AT_EXTERNAL_EXTENSIONS`.
 
 ## Honest limits
 
 - The anchors mean the core still references its in-tree features by name
   (ZTA, first contact). That is the price of keeping the static archive correct
   until the features are separate libraries. DTN, the gateway, the five oracle
-  layers and social are the ones that are not referenced.
+  layers and Agora's social are the ones that are not referenced.
 - Social's locking differs between the runtimes: C has a leaf lock of its own,
   and Python keeps the one `proc.lock`. In C a tier and a block are therefore
   two snapshots. Conformance is deterministic and cannot show a timing
@@ -670,6 +676,11 @@ whether it built.
   development sandbox.
 - Most `app_*` social verbs still accept an admitted peer's frame (ISSUES.md
   §2.17). The move carried that behavior as it was.
+- `src/c/conformance/CMakeLists.txt` finds the Python tree as
+  `CMAKE_SOURCE_DIR/../autonomous-trust`, which is wrong when AT is not the
+  top-level project. Agora's build never enables AT's conformance, and
+  `at-social/test-conformance.sh` runs AT top-level, so it is recorded rather
+  than fixed.
 - `find_process` matches by prefix (`strncmp` over the query's length), so a
   query that is a prefix of another entry's name returns that entry. No current
   name collides, `dtn_bp` included, so it is left as is.
