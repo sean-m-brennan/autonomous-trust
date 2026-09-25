@@ -1,6 +1,6 @@
 *Previous: [Testing approach](../testing.md)*
 
-# Integration Testing Architecture
+# Integration testing architecture
 
 The simulator's integration testing framework runs real AutonomousTrust
 processes over terrain-aware simulated networks and measures protocol

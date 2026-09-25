@@ -13,8 +13,8 @@ the signature verifies, the identity is exactly who it claims to be, and the
 thing behind it is now working for somebody else. Nothing in the model is
 looking at behavior, so nothing in the model notices.
 
-AutonomousTrust is built for that case and for one other: the case where the
-authority that issues credentials cannot be reached. On a mesh network under
+We built AutonomousTrust for that case and for one other, being the case where
+the authority that issues credentials cannot be reached. On a mesh network under
 jamming, in a habitat behind twenty minutes of light-lag, or in a valley whose
 gateway just went down, a system that must consult a central policy service has
 two options and both are bad. Fail open, and the compromise walks in. Fail
@@ -27,27 +27,27 @@ happened. It loses reach when its behavior changes, within seconds, without
 anybody filing anything. And every part of that judgement is made locally, so it
 keeps working when the node is cut off from everything.
 
-This chapter is why the framework is built that way. The chapters after it are
-how.
+This chapter is why we built the framework that way, and the chapters after it
+are how.
 
 ## The adversarial assumption
 
-AutonomousTrust assumes the environment is hostile at all times, and it assumes
-this permanently rather than during an incident.
+We assume the environment is hostile at all times, and we assume this
+permanently rather than during an incident.
 
 Networked systems live in a continuous arms race. A secure perimeter is a claim
 about yesterday, a valid credential is a claim about the issuer rather than the
 holder, and a peer that behaved well an hour ago is evidence about an hour ago.
-None of the three is evidence that the next message is safe, so the framework
-treats none of them that way. Every peer is a potential adversary until its
-behavior earns otherwise, and a peer that has earned trust can lose it the
-moment its behavior changes.
+None of the three is evidence that the next message is safe, so we treat none of
+them that way. Every peer is a potential adversary until its behavior earns
+otherwise, and a peer that has earned trust can lose it the moment its behavior
+changes.
 
 This inverts the usual posture, in which authentication grants standing trust
-and the system assumes good faith until something visibly breaks. Although that
-posture is comfortable, and although it is nearly universal, it is precisely
-wrong for the threat that matters most, since the credentialed-but-compromised
-peer is the one case it cannot represent at all.
+and the system assumes good faith until something visibly breaks. That posture
+is comfortable and nearly universal, and it is precisely wrong for the threat
+that matters most, since the credentialed-but-compromised peer is the one case
+it cannot represent at all.
 
 ## Access as a gradient, not a gate
 
@@ -55,12 +55,12 @@ Traditional access control defaults to access. A subject who authenticates is
 let in, and administrators write policy to carve out what that subject may *not*
 do. The default is yes and the exceptions are written by hand.
 
-AutonomousTrust inverts this too. The default is no access. A peer starts every
-relationship at zero trust and gains reach only as it demonstrates trustworthy
-behavior, along a gradient rather than through a single yes-or-no gate.
+We invert this too. The default is no access. A peer starts every relationship
+at zero trust and gains reach only as it demonstrates trustworthy behavior,
+along a gradient rather than through a single yes-or-no gate.
 
 Because trust is a live value rather than a one-time check, a node meters access
-in stages within one application, and the stages are chosen so that each one
+in stages within one application, and we chose the stages so that each one
 protects a different scarce resource. An agent using this framework can
 adaptively: 1) refuse communications from severely untrusted peers, conserving
 bandwidth; 2) communicate with but refuse computation services to faintly
@@ -76,45 +76,45 @@ permission at the moment it matters.
 
 ## The machine as an active participant
 
-In AutonomousTrust the machine is responsible for its own safety. It is not a
-passive tool waiting for a person to make each security decision.
+In AutonomousTrust the machine is responsible for its own safety, rather than
+being a passive tool waiting for a person to make each security decision.
 
 The primary mode is machine-to-machine. The peers are non-person entities that
 discover one another, form groups, negotiate work, and decide whom to trust with
-no user present. This is not an efficiency measure. A population of machines
-large enough to be useful is a population too large for a person to adjudicate,
-and a network that only works while somebody is watching it is a network that
-fails overnight.
+no user present. This is not an efficiency measure but a necessity, since a
+population of machines large enough to be useful is a population too large for a
+person to adjudicate, and a network that only works while somebody is watching
+it is a network that fails overnight.
 
 A human operator is a special and largely degenerate case. When a person is
-involved, they authenticate once through the operator console with a hardware
-credential and a second factor, and from then on they are represented on the
-mesh by a machine identity like any other peer. The user interface is therefore
-one participant among many rather than the seat of control.
+involved, he authenticates once through the operator console with a hardware
+credential and a second factor, and from then on he is represented on the mesh
+by a machine identity like any other peer. The user interface is therefore one
+participant among many rather than the seat of control.
 
 That framing has a consequence the upper tiers depend on heavily. Because a
 human is present on the mesh only through a machine that stands for him, the
 question of which machines have a person behind them, and whether that person
-was there recently, becomes a first-class thing the network tracks rather than
-an assumption it makes. That signal is the subject of a later chapter, and it is
+was there recently, becomes a first-class thing we track rather than an
+assumption we make. That signal is the subject of a later chapter, and it is
 what the polity tier reads when it asks which human answers for which machine.
 
 ## Task-specific access
 
-AutonomousTrust processes are always scoped to a specific task. There is no
+AutonomousTrust processes are always scoped to a specific task, and there is no
 general-purpose standing grant of resources.
 
-A peer requests the capabilities that a particular piece of work actually needs.
+A peer requests the capabilities a particular piece of work actually needs.
 Those capabilities are gated by the current trust tier of that peer. Access is
-allocated for the duration of the task and released when the task ends. Nothing
-accumulates, and no grant outlives the reason it was made.
+allocated for the duration of the task and released when the task ends, so
+nothing accumulates and no grant outlives the reason it was made.
 
 This keeps the blast radius of any single compromised peer small. A captured
 peer can reach only what its task and its earned trust allow, rather than the
 whole system, so containment holds even before any anomaly is detected.
 Constraint does more work here than detection does, which is the correct
-division of labor: detection is a race against an adversary, and constraint is
-not.
+division of labor, since detection is a race against an adversary and constraint
+is not.
 
 ## Two familiar analogies
 
@@ -133,9 +133,9 @@ attest about it, weighted by the standing those peers themselves hold, rather
 than assigned by a single central rater. That recursion is what makes the score
 costly for any one peer, or any small colluding group, to dictate. The
 difference is that the graph here is a graph of observed conduct rather than of
-citations, and that it is recomputed continuously rather than crawled.
+citations, and that we recompute it continuously rather than crawling it.
 
-## Where this sits in the stack
+## Its place in the stack
 
 AutonomousTrust answers exactly one question, which is who may cooperate, and it
 answers it among machines inside a single trust boundary. Two things follow, and

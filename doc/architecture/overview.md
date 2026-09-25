@@ -9,14 +9,13 @@ other, and communicate only by placing messages on each other's queues. An
 orchestrator above them spawns the four, watches them, and runs whatever the
 hosting application actually wanted done.
 
-That decomposition is the whole architecture, and it is deliberately boring. The
-interesting properties of the framework are not in any of the four processes.
-The interesting properties come from the fact that each of them makes its
-decisions locally, from what it has observed, without consulting anything
-outside the node.
+That decomposition is the whole architecture, and we made it deliberately
+boring. The interesting properties of the framework are not in any of the four
+processes but in the fact that each of them makes its decisions locally, from
+what it has observed, without consulting anything outside the node.
 
 This chapter covers the shape of a node from the outside in: the four design
-principles that constrain everything else, the cryptography underneath, the four
+principles constraining everything else, the cryptography underneath, the four
 processes and how they talk, the two interoperable implementations of the same
 runtime, and the deterministic sequence a node runs through between power-on and
 useful work.
@@ -45,13 +44,13 @@ key.
 Lastly, *decentralization without exception*. There is no central authority.
 Groups form organically, reputation is maintained by leaderless Byzantine
 Multi-Paxos, and tasks are negotiated directly between peers. Nothing in the
-system has a privileged view, which is the property that makes the whole thing
+system has a privileged view, which is the property making the whole thing
 survive a partition.
 
 ## The cryptographic floor
 
-All cryptographic operations use NaCl and libsodium primitives, chosen for
-having few knobs and no bad configurations.
+All cryptographic operations use NaCl and libsodium primitives, which we chose
+for having few knobs and no bad configurations.
 
 | Operation | Algorithm | Purpose |
 |-----------|-----------|---------|
@@ -118,11 +117,11 @@ flowchart TB
     Main -- "transaction scores" --> Rep
 ```
 
-The main loop of the orchestrator cycles through four duties on every tick:
+The main loop of the orchestrator cycles through four duties on every tick,
 monitoring the health of the subprocesses, handling messages from its own queue,
 collecting task results, and running whatever tasking logic the application
 supplied. If a subprocess terminates unexpectedly, the exception is logged and
-the process is recorded as stopped so the failure is reported once rather than
+the process is recorded as stopped, so the failure is reported once rather than
 every tick.
 
 ## Two implementations of one runtime
@@ -136,8 +135,8 @@ cohort are indistinguishable to each other.
 The process model above is retained under both. C functions are called from
 inside the Python subsystem processes through the bridge rather than by a
 C-driven process tree, which keeps one orchestration story rather than two. The
-embedded target is the exception: a standalone C daemon runs on devices with no
-Python at all, which is what makes a microdrone-class node possible.
+embedded target is the exception, where a standalone C daemon runs on devices
+with no Python at all, which is what makes a microdrone-class node possible.
 
 Having two implementations of one protocol is expensive, and it buys two things
 that are hard to get otherwise. The C core is amenable to formal verification in
@@ -163,12 +162,12 @@ later chapters refer back to particular stages of it.
 Firstly, the *clock gate*. The node reads what the host clock discipline has
 achieved and declines to run on a clock nothing is steering. Timestamps order
 events across a cohort, so a node with an undisciplined clock corrupts every
-comparison it takes part in. The framework carries no time daemon of its own and
-deliberately does not try to be one: a stock daemon on the host does the
-steering, and the node reads the result through an unprivileged system call that
-is honest inside a container. The gate is enforcing in shipped images and
-advisory otherwise, and the log line always names which mode applied, so a start
-that proceeded is never ambiguous about whether the clock was checked.
+comparison it takes part in. We carry no time daemon of our own and deliberately
+do not try to be one, so a stock daemon on the host does the steering and the
+node reads the result through an unprivileged system call that is honest inside
+a container. The gate is enforcing in shipped images and advisory otherwise, and
+the log line always names which mode applied, so a start that proceeded is never
+ambiguous about whether the clock was checked.
 
 Second, *configuration*. Configuration files load from the framework root, and
 the process tracker reads the subsystem list to decide what to instantiate.
@@ -197,11 +196,11 @@ negotiation process handles task invitations, the job queue, and results. The
 reputation process runs consensus rounds and answers score queries. And the
 application layer runs whatever autonomous tasking it was written to run.
 
-Two backstops run alongside them, both of which exist because admission over
-unreliable transport is not assumed to be lossless. The bootstrap worker drives
-the small bilateral exchanges that warm up the transaction history of a newly
+Two backstops run alongside them, both of which exist because we do not assume
+admission over unreliable transport is lossless. The bootstrap worker drives the
+small bilateral exchanges that warm up the transaction history of a newly
 admitted peer. And periodic resync sweeps in the identity process backfill
-capabilities for peers admitted without them and identities for group addresses
+capabilities for peers admitted without them, and identities for group addresses
 whose peer object never arrived.
 
 ## Further reading

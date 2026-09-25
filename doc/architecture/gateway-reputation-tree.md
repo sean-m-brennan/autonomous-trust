@@ -74,7 +74,7 @@ on whether the gateway holds the key of the destination group.
 | A member-group that **spans two segments** | yes | **both**, decrypt locally *and* relay onward |
 
 - *Participate* is **net-new** work (Python identity, network, and reputation).
-- *Relay* lives only in the **C** layer (`net_proc.c` `AT_NET_GROUP_FORWARD`) and is **preserved by
+- *Relay* lives only in the **C** layer (libat_gateway's `group_forward`, `src/c/extensions/gateway/gateway.c`) and is **preserved by
  not touching it**. The pure-Python demo runs all peers on one shared broadcast channel, so relay
  is not exercised there. What a node sees is decided purely by which group key it holds.
 
@@ -361,7 +361,7 @@ identity payload. The JSON wire envelope carries a **`from_rank`** field
 (`net_message.c` pack/unpack ⟂ Python `Message.__bytes__` /
 `_identity_from_wire`), sourced from the rank of the sending node, in C stamped
 by the network process from the local `identity_t` (`net_proc.c`), and in Python
-read from `from_whom._rank`. This mirrors long-standing behaviour in Python,
+read from `from_whom._rank`. This mirrors long-standing behavior in Python,
 where rank has always ridden the envelope and `_identity_from_wire` now
 reconstructs it. `from_rank` sits outside the signed pre-image
 (`process|function|data`) and outside the ciphertext, so it affects neither

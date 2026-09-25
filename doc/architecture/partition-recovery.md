@@ -1,6 +1,6 @@
 *Previous: [Network wire format](network-wire-format.md)*
 
-# Group Partition Recovery
+# Group partition recovery
 
 This design answers the dod_mission demo split-brain
 (`project_dod_demo_status.md`, where the coordinator forms a size-1 group and
@@ -495,7 +495,7 @@ Approximate effort, subject to revision once we start.
  re-evaluate if Sybil resistance becomes a priority.**
 
 - How does this interact with the cross-group gateway forwarding
- in `net_proc.c:1237-1265` (`AT_NET_GROUP_FORWARD`)? A gateway is
+ in libat_gateway (`group_forward`, `src/c/extensions/gateway/gateway.c`)? A gateway is
  intentionally in *zero* groups but forwards between configured legs.
  Should gateways respond to `partition_probe`? **Tentative answer:
  no, gateways skip the probe/response handlers entirely. The

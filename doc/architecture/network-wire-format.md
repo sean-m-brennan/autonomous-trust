@@ -5,7 +5,7 @@
  Licensed under the Apache License, Version 2.0.
 -->
 
-# Network Wire Format
+# Network wire format
 
 **Status (2026-08-18): BUILT in both runtimes. Gateway boundary enforced
 2026-09-03.** This document is the reference for the wire format; source
@@ -228,13 +228,15 @@ two sets that matters: they overlap on the two verbs that run before a key
 exists, but `full_history` is bootstrap and must **never** be accepted in
 plaintext, because it hands over the group key.
 
-### The one build that can violate G
+### The one configuration that can violate G
 
 Tracked as `ISSUES.md` §2.12, which carries the four candidate resolutions.
 
-`AT_NET_GROUP_FORWARD` (CMake option, **OFF** by default) lets a gateway relay
+`group_forward` (a network-config switch of libat_gateway, **off** unless the
+node's network config sets it alongside `"envelope": true`) lets a gateway relay
 opaque group ciphertext across transport legs by operator-configured
-`dst_uuid → leg` route (`handle_inbound_group`, at-over-dtn stage F). It forwards
+`dst_uuid → leg` route (the gateway's group-channel filter,
+`src/c/extensions/gateway/gateway.c`, at-over-dtn stage F). It forwards
 precisely *because* it is not in the group, which is a group spanning a gateway
 by construction — and with it a foreign-format frame can reach internal nodes,
 putting every §2.5 question back on the table. Enabling it is therefore not a
