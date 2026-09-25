@@ -1,4 +1,4 @@
-# Physical Consistency
+# Physical consistency
 
 *Build-order step 1 of the [verification oracle](../verification_oracle.md);
 tracked as R+D.md §12.2.*
@@ -21,7 +21,7 @@ Three properties are easy to lose and expensive to get back.
 
 **It never says a peer is good.** Passing physics earns nothing. A claim outside
 the feasible set is refuted; a claim inside it is merely not-refuted. Returning a
-favourable score for surviving the check would turn a falsification layer into a
+favorable score for surviving the check would turn a falsification layer into a
 plausibility grade, and the scorer would then be rewarding peers for being
 unremarkable. The checker returns a verdict or it returns silence, and silence is
 the common case.
@@ -62,14 +62,13 @@ physics *first*.
 
 ## The two files, and why they are two
 
-`units` is **code**. The SI base quantities, the symbol table, the grammar: these
-are the axioms, and they live in
-`src/autonomous-trust/autonomous_trust/core/_python/physics/units.py` and
-`src/c/autonomous_trust/physics/units.c`. An operator who could redefine what a
-newton is could refute any peer by declaration, which is precisely the failure
-mode the layer exists to avoid. This is the sense in which the axiom set is
-"small, closed and uncontested" — it is closed because nothing outside the source
-tree can open it.
+`units` is **code**. The SI base quantities, the symbol table, the grammar:
+these are the axioms, and they live in `autonomous_trust.oracle.physics.units`
+(src/autonomous-trust-oracle/) and `src/c/extensions/physics/units.c`. An
+operator who could redefine what a newton is could refute any peer by
+declaration, which is precisely the failure mode the layer exists to avoid. This
+is the sense in which the axiom set is "small, closed and uncontested" — it is
+closed because nothing outside the source tree can open it.
 
 `physics.json` is **declaration**. It says which capability reports which
 physical quantity, what range and rate that quantity is capable of, and which
@@ -78,11 +77,14 @@ from `trust_ladder.json` because the two answer different questions — the ladd
 says how much a capability counts and who may run it, this says what its answer
 *means* — and a scenario may well want one without the other.
 
-Canonical form is JSON, and **one file feeds both runtimes**: this loader and the
-C twin's jansson parser, with no conversion step and nothing to drift. That is
-the same decision the trust ladder made (see [Trust Tiers](trust-tiers.md) §8).
-`config/cfg/physics.example.json` is the shared example both suites read. Set
-`AT_PHYSICS` to a path to turn the layer on.
+Canonical form is JSON, and **one file feeds both runtimes**: this loader and
+the C twin's jansson parser, with no conversion step and nothing to drift. That
+is the same decision the trust ladder made (see [Trust Tiers](trust-tiers.md)
+§8). `config/cfg/physics.example.json` is the shared example both suites read.
+Set `AT_PHYSICS` to a path to turn the layer on. The layer is its own library,
+`libat_physics` in C and `autonomous_trust.oracle` in Python (see
+[Extensions](extensions.md), "Oracle layers"). A node whose environment sets the
+variable without the layer installed refuses to start.
 
 A malformed declaration is an **operator error** and is fatal at load. It is
 never degraded to "check the parts that parsed": a physics layer that quietly
@@ -276,7 +278,7 @@ follows.
 
 ## See also
 
-- [The Verification Oracle](../verification_oracle.md) — the whole programme, and
+- [The Verification Oracle](../verification_oracle.md) — the whole program, and
   why physics is step 1.
 - [Certificate-Carrying Interfaces](certificate-interfaces.md) — step 2, and the
   layer below this one in the scorer.

@@ -1,4 +1,4 @@
-# Sampled Replication with Bisection Dispute Resolution
+# Sampled replication with bisection dispute resolution
 
 *Build-order step 6 of the [verification oracle](../verification_oracle.md);
 tracked as R+D.md §12.6.*
@@ -157,9 +157,9 @@ not shared error.
 
 ## Where the code is
 
-* Python: `autonomous_trust.core.replication` — `sampling`, `adjudication`,
+* Python: `autonomous_trust.oracle.replication` — `sampling`, `adjudication`,
   `bisection`, `model`.
-* C twin: `src/c/autonomous_trust/replication/` — `sampling`, `adjudication`,
+* C twin: `src/c/extensions/replication/` — `sampling`, `adjudication`,
   `bisection`, `replication` (the declaration).
 * Conformance: `scenarios/replication/{sampling,adjudication,bisection}.yaml`,
   adapters `conformance/harness/python/adapters/replication.py` and

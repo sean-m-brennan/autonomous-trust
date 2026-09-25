@@ -5,7 +5,7 @@
  Licensed under the Apache License, Version 2.0.
 -->
 
-# Cohort Clock Skew and Peer Reference Clocks
+# Cohort clock skew and peer reference clocks
 
 **Status (2026-08-12): Stage 0 BUILT in both runtimes. Stages 1-3 recorded and
 deliberately not chosen.** This document is the design behind ISSUES.md §2.4.5.
@@ -69,7 +69,7 @@ delay  = (t4 - t1) - (t3 - t2)            # round trip, peer's own work removed
 to the responder (request received, response sent). **`t2` and `t3` must be
 separate readings.** Their difference is processing time at the responder, and
 subtracting it is what keeps a slow peer from being reported as a skewed one.
-That is not a micro-optimisation here, the Python responder cannot answer inline
+That is not a micro-optimization here, the Python responder cannot answer inline
 at all, since
 its identity process must ask the main loop for the console session, so the gap
 is routinely milliseconds.

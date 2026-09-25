@@ -1,6 +1,6 @@
 *Previous: [The gateway reputation tree](gateway-reputation-tree.md)*
 
-# Identity & Reputation vs. Typical Blockchain: Architecture
+# Identity and reputation vs. typical blockchain: architecture
 
 > Status: Implemented. Describes the **current** state of the code, grounded in
 > `src/autonomous-trust/autonomous_trust/core/_python/{identity,reputation,structures}`

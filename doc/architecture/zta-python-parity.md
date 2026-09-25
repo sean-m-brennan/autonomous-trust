@@ -1,6 +1,6 @@
 *Previous: [Zero Trust integration](zta-integration.md)*
 
-# ZTA: Python Parity
+# ZTA: Python parity
 
 The canonical design and contract live in [Zero Trust
 integration](zta-integration.md). That document specifies the verifier interface

@@ -1,6 +1,6 @@
-*Previous: [The app-facing peer carrier](app-peer-carrier.md)*
+*Previous: [Extensions](extensions.md)*
 
-# Native / FFI Dual Implementation
+# Native / FFI dual implementation
 
 AutonomousTrust ships **two interoperable implementations of the core**:
 

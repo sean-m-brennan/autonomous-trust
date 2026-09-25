@@ -1,4 +1,4 @@
-# Calibration Audit
+# Calibration audit
 
 *Build-order step 3 of the [verification oracle](../verification_oracle.md);
 tracked as R+D.md §12.4.*
@@ -162,7 +162,10 @@ result settled.
 conversion step — the arrangement `physics.json` and `certificates.json` use,
 which in turn is the one `trust-tiers.md` §8 settled for the trust ladder.
 `AT_CALIBRATION` names it; `config/cfg/calibration.example.json` is the shared
-example.
+example. The layer is its own library, `libat_calibration` in C and
+`autonomous_trust.oracle` in Python (see [Extensions](extensions.md), "Oracle
+layers"). A node whose environment sets the variable without the layer installed
+refuses to start.
 
 ```json
 {
@@ -208,7 +211,7 @@ which the test would reject on the first miss forever after.
 ### Opt-in and inert by default
 
 With `AT_CALIBRATION` unset the model is empty and every call returns no
-verdict, so nothing that has not opted in changes behaviour. A malformed
+verdict, so nothing that has not opted in changes behavior. A malformed
 declaration is **fatal at load** — never degraded to "audit the capabilities
 that parsed", because an operator who configured the layer believes the claims
 are being checked. At the scoring path a rejected declaration is recorded once

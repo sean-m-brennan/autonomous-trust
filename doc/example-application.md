@@ -3,13 +3,12 @@
 # A worked scenario
 
 Everything in Part II has been mechanism. This chapter is the mechanism running,
-in one scenario that can be started on an ordinary machine and watched from a
-browser.
+in one scenario you can start on an ordinary machine and watch from a browser.
 
 A hurricane is making landfall. Ten sensor nodes belonging to four federal
 agencies need to share environmental readings in real time, and one of them has
 been compromised and is reporting falsified data. The agencies share no central
-trust authority, and even if they did, the link to it cannot be assumed during a
+trust authority, and even if they did, nobody can count on reaching it during a
 storm. So the sensors have to work out among themselves who is worth believing,
 and they have to keep working it out as conditions change.
 
@@ -73,10 +72,10 @@ part of the runtime.
 The minute to watch is from T+4:00 to T+5:00. The temperature readings from the
 compromised sensor diverge from the two other NOAA sensors covering the same
 area. The comparison chart shows the divergence, the trust-dynamics timeline
-shows its reputation falling, and by T+5:00 its edge in the trust graph turns red
-and then disappears. The compromise mode is configurable between a gradual drift
-and an abrupt jump, and the gradual case is the more instructive of the two,
-since it is the one a threshold alarm would miss.
+shows its reputation falling, and by T+5:00 its edge in the trust graph turns
+red and then disappears. The compromise mode is configurable between a gradual
+drift and an abrupt jump, and the gradual case is the more instructive of the
+two, since it is the one a threshold alarm would miss.
 
 ## Each phase is a subsystem
 
@@ -96,30 +95,30 @@ capabilities they will provide to whom, and where the tier gate first bites.
 
 *Detection and exclusion* are the reputation subsystem. A sustained anomaly
 drives the score of the peer down through the running consensus, and a
-quorum-co-signed slash floors it, which triggers tier-gated removal. The decision
-is deterministic and backed by signed evidence any peer can re-verify, which is
-the whole point of the attestation machinery: no peer has to take the exclusion
-on anybody's word.
+quorum-co-signed slash floors it, which triggers tier-gated removal. The
+decision is deterministic and backed by signed evidence any peer can re-verify,
+which is the whole point of the attestation machinery, since no peer has to take
+the exclusion on anybody's word.
 
 *The late join* exercises admission after the cohort is already running, where
-the credential overlay gates entry and the degraded-connectivity fallback applies
-when verification infrastructure is unreachable.
+the credential overlay gates entry and the degraded-connectivity fallback
+applies when verification infrastructure is unreachable.
 
-Although a person is watching the dashboard throughout, nothing in the loop waits
-on that person, and nothing waits on a central authority either. That is the
-claim Part II has been making, and this is it running.
+A person watches the dashboard throughout, and nothing in the loop waits on him,
+nor on a central authority either. That is the claim Part II has been making,
+and this is it running.
 
 ## Where Part II ends
 
 What the scenario produces, by T+7:00, is nine machines that reliably cooperate
-and one that does not, with the difference established from observed conduct and
+and one that does not, with the difference drawn from observed conduct and
 recorded in a form anybody can check.
 
 What it does not produce is a community. There is no boundary anyone agreed to,
-no record of a decision anybody made, no office anyone holds, and no way for this
-cohort to persist as its members are replaced. The nine peers cannot sign an
-agreement with anybody, because there is no party there to sign it. Nine machines
-that trust each other are a fact about a graph.
+no record of a decision anybody made, no office anyone holds, and no way for
+this cohort to persist as its members are replaced. The nine peers cannot sign
+an agreement with anybody, because there is no party there to sign it. Nine
+machines that trust each other are a fact about a graph.
 
 Turning that fact into a body that can act is the subject of Part III.
 

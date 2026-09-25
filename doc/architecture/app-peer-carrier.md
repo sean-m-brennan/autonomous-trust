@@ -35,7 +35,7 @@ addressed to the daemon.
 **3. The drain built a batch and threw it away.** The loop appended each
 app-bound message to a local `extern_msgs` array, then never sent or freed it,
 sending instead the *last message the loop happened to receive*. With at most
-one message in flight per iteration that coincided with correct behaviour, which
+one message in flight per iteration that coincided with correct behavior, which
 is why it survived. The bug was invisible exactly as long as the traffic was too
 sparse to expose it. Two messages in one iteration meant one delivery.
 
@@ -110,6 +110,16 @@ and four functions. A consumer outside C should not reproduce `generic_msg_t`.
 It is a tagged union whose size and offsets depend on `public_identity_t`,
 `group_t`, `net_msg_t` and the ZTA build flag, so a hand-written mirror would
 corrupt silently the first time any of those changed.
+
+**The flat ABI is one layout in every build (app ABI v2, 2026-09-24).** Until
+then `at_app_event_t` itself swung with `AT_SOCIAL`: 104 B in a core build,
+several KB in a social one, because the social payloads were arms of its
+union. The ethne `en-at` mirror was correct only for the core build. The event is
+now a fixed 8200 B (`int32_t kind`, then `data` at offset 8 with an 8 KiB
+payload arm), `at_app_peer_t.in_group`/`.blocked` are always present, and the
+social kinds, structs, accessors and senders live in `at_agora.h`.
+`at_app_abi_version()` lets a consumer refuse a layout it was not built for.
+See [Extensions](extensions.md).
 
 ## Protocol
 
@@ -521,4 +531,4 @@ in `libhdr` now.
 
 ---
 
-*Next: [The dual implementation](native-ffi-dual-implementation.md)*
+*Next: [Extensions](extensions.md)*

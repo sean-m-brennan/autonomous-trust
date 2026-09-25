@@ -1,11 +1,11 @@
-# Certificate-Carrying Task Interfaces
+# Certificate-carrying task interfaces
 
 *Build-order step 2 of the [verification oracle](../verification_oracle.md);
 tracked as R+D.md §12.3.*
 
 For a large fraction of computational work, **checking is asymptotically
 cheaper than producing**. Requiring every answer to arrive with a witness
-converts peer judgement into running a checker, and the oracle stops being
+converts peer judgment into running a checker, and the oracle stops being
 statistical: a verified witness means the answer is *right*, and a failed one
 means it is *wrong*. Neither is an inference about the peer's character.
 
@@ -123,14 +123,17 @@ claim is checked against the schedule rather than believed.
 arrangement [Trust Tiers](trust-tiers.md) §8 settled for the trust ladder and
 `physics.json` reused for §12.2. `AT_CERTIFICATES` names it;
 `config/cfg/certificates.example.json` is the shared example. Unset means an
-empty model and an inert layer.
+empty model and an inert layer. The layer is its own library,
+`libat_certificates` in C and `autonomous_trust.oracle` in Python (see
+[Extensions](extensions.md), "Oracle layers"). A node whose environment sets the
+variable without the layer installed refuses to start.
 
 Three declared states, and the distinction between the second and third is the
 point:
 
 ```json
 "demo.route":  {"checker": "path", "required": true}
-"demo.assess": {"checker": null, "note": "a human judgement call"}
+"demo.assess": {"checker": null, "note": "a human judgment call"}
 ```
 
 - **A checker named** — answers carry a witness of that kind.
@@ -156,13 +159,13 @@ Recognition is not automatic: a node that silently falls through to completion
 scoring for everything it cannot check looks, from outside, exactly like a node
 that is checking everything.
 
-So each runtime emits an inventory once, when the layer initialises:
+So each runtime emits an inventory once, when the layer initializes:
 
 ```
 certificate inventory: 8 exactly checkable, 1 optional,
                        1 acknowledged uncertifiable, 2 never examined
   unexamined     at.handshake -- not mentioned in the declaration
-  uncertifiable  demo.assess -- a human judgement call; no witness exists
+  uncertifiable  demo.assess -- a human judgment call; no witness exists
   optional       demo.migrating via linear_solve
   certified      demo.route via path
 ```
@@ -240,7 +243,7 @@ second true.
 
 ## See also
 
-- [The Verification Oracle](../verification_oracle.md) — the whole programme, and
+- [The Verification Oracle](../verification_oracle.md) — the whole program, and
   why certificates are step 2.
 - [Physical Consistency](physical-consistency.md) — step 1, the layer above this
   one in the scorer.

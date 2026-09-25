@@ -1,6 +1,6 @@
 *Previous: [Process architecture](process-architecture.md)*
 
-# Node Lifecycle
+# Node lifecycle
 
 ## Startup sequence
 
@@ -47,7 +47,7 @@ run a stock NTP daemon; the same applies to a Compose or Tilt host.
 The gate has two modes, and the log line always names which one applied, so a
 start that proceeded is never ambiguous about whether the clock was checked:
 
-| `AT_REQUIRE_SYNCED_CLOCK` | Behaviour |
+| `AT_REQUIRE_SYNCED_CLOCK` | Behavior |
 |---------------------------|-----------|
 | set (`1`/`true`/`yes`/`on`) | Enforcing: refuse to start, naming what was seen. AT container images set this. |
 | unset or falsy | Advisory: one warning, then proceed. A developer machine is often unsteered, and a gate that refused there would block every local run. |

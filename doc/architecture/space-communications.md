@@ -1,6 +1,6 @@
 *Previous: [A compromise, detected](sg2-detection-walkthrough.md)*
 
-# Space Communications
+# Space communications
 
 The space communications layer extends the terrestrial simulator to model
 inter-habitat mesh networking at asteroid-belt scale. It introduces
@@ -113,7 +113,7 @@ AT protocol stack. Identity challenge-response, negotiation haggle rounds, and
 reputation voting rounds all assume sub-second RTT. Adapting these protocols
 requires parameterizing timeouts as a function of expected RTT and, for
 intermittent connectivity windows, a store-and-forward DTN bundle layer wrapping
-the Network process. These adaptations are catalogued in [protocol timeouts at
+the Network process. These adaptations are cataloged in [protocol timeouts at
 deep-space latency](../../../../docs/space-protocol-timeouts.md), and are future
 work.
 
