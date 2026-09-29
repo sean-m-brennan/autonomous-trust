@@ -110,4 +110,26 @@ const char *net_relay_seeds_release_key(void);
  *  test key; NULL restores AT_RELAY_SEEDS_RELEASE_KEY. */
 void net_relay_seeds_set_release_key(const char *release_key_hex);
 
+/* ---- Shared with net_relay_rosters.c --------------------------------------
+ * A community relay roster is the same kind of file as the seed list, signed by
+ * a different key under a different domain, so its verifier is this one. Not a
+ * public API. */
+struct json_t;
+/** Split a `{"body","sig"}` file: the parsed body (new reference, or NULL when
+ *  malformed), the parsed wire object in @p wire_out (new reference; decref
+ *  both), and borrowed body / sig strings. */
+struct json_t *net_relay_signed_split(const char *text, struct json_t **wire_out,
+                                      const char **body_str, const char **sig_hex);
+/** 0 iff @p sig_hex is @p key_hex's ed25519 signature over @p domain + @p body_str. */
+int net_relay_signed_check(const char *key_hex, const char *domain, const char *body_str,
+                           const char *sig_hex);
+/** Parse the hint list @p field of @p body (missing = empty). 0, or -1 when it
+ *  is not a list of at most AT_RELAY_SEEDS_MAX hints. */
+int net_relay_signed_hints(const struct json_t *body, const char *field,
+                           net_relay_seed_list_t *out);
+/** A file's whole text (malloc'd, NUL-terminated), or NULL. */
+char *net_relay_signed_read(const char *path);
+/** <data_dir>/@p name into @p out. 0 or -1. */
+int net_relay_signed_data_path(const char *name, char *out, size_t out_len);
+
 #endif /* AUTONOMOUS_TRUST_NETWORK_NET_RELAY_SEEDS_H */

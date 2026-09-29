@@ -287,6 +287,7 @@ class NetworkAdapter:
             'nacl_box_open':      self._nacl_box_open,
             'nacl_secretbox':     self._nacl_secretbox,
             'nacl_secretbox_open': self._nacl_secretbox_open,
+            'relay_roster_verify': self._relay_roster_verify,
         }.get(primitive)
         if handler is None:
             raise AssertionError(f'unknown crypto primitive: {primitive!r}')
@@ -318,6 +319,26 @@ class NetworkAdapter:
             verified = False
         assert verified == should_verify, \
             f'ed25519_verify: got valid={verified}, expected valid={should_verify}'
+
+    @staticmethod
+    def _relay_roster_verify(inp: dict[str, Any], exp: dict[str, Any]) -> None:
+        """A community relay roster (FIRST_CONTACT_PLAN §4.2 / §4.5) against the
+        pinned issuers: accepted or refused, and when accepted the seq and the
+        relays as ``uuid:fp@host:port``. The file check only; the seq floor is
+        node state."""
+        from autonomous_trust.core._python.network import relay_rosters
+        should = bool(exp.get('valid', True))
+        try:
+            _issuer, seq, relays = relay_rosters.verify_roster(
+                inp['roster'], [k.lower() for k in inp.get('issuers', [])])
+            valid = True
+        except relay_rosters.InvalidRoster:
+            valid = False
+        assert valid == should, f'relay_roster_verify: got valid={valid}, expected valid={should}'
+        if valid:
+            got = ['%s:%s@%s:%d' % (pin[0], pin[1], ep[0], ep[1]) for ep, pin in relays]
+            assert seq == exp['seq'], f'relay_roster_verify: seq {seq}, expected {exp["seq"]}'
+            assert got == exp['relays'], f'relay_roster_verify: relays {got}, expected {exp["relays"]}'
 
     @staticmethod
     def _nacl_box(inp: dict[str, Any], exp: dict[str, Any]) -> None:
