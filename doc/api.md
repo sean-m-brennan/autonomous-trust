@@ -279,6 +279,13 @@ operator's own additions and removals in `<data_dir>/relay_seeds_local.cfg.json`
 them and `show` prints the relays the node will use. An explicit `AT_USE_RELAY`
 always wins, and with first contact off the list is never read.
 
+Ahead of the seed list come the relays of any **community** the operator pinned:
+signed rosters in `<cfg_dir>/relay_rosters/` from the issuers in
+`$AT_RELAY_ROSTER_ISSUERS` or `<cfg_dir>/relay_roster_issuers.cfg.json`. An Ethne
+polity publishes one for the relays it runs (`en_uplift::rendezvous_roster`); any
+other community signs one with `tools/relay_rosters.py`, which also pins, installs
+and shows them. A newer roster from an issuer replaces its older one whole.
+
 What admission means here is narrower than joining a group, and worth being
 explicit about if you are building on it: each side gains the other as a
 **direct peer** — reachable, attributable on the encrypted point-to-point

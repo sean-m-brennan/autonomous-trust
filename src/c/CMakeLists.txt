@@ -470,6 +470,7 @@ set(libsrc
     autonomous_trust/network/net_proc.c
     autonomous_trust/network/net_relay.c
     autonomous_trust/network/net_relay_seeds.c
+    autonomous_trust/network/net_relay_rosters.c
     autonomous_trust/network/net_registry.c
     autonomous_trust/network/net_transport_ip.c
     autonomous_trust/network/net_transport_udp.c
@@ -1115,6 +1116,9 @@ target_link_libraries(net_registry_test PRIVATE ${AT_TEST_LIBS})
 add_executable(net_relay_seeds_test test/net_relay_seeds_test.c)
 set_source_files_properties(test/net_relay_seeds_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(net_relay_seeds_test PRIVATE ${AT_TEST_LIBS})
+add_executable(net_relay_rosters_test test/net_relay_rosters_test.c)
+set_source_files_properties(test/net_relay_rosters_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_relay_rosters_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(first_contact_live_test test/first_contact_live_test.c)
 set_source_files_properties(test/first_contact_live_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1152,6 +1156,7 @@ add_test(NAME directory_contact_test COMMAND $<TARGET_FILE:directory_contact_tes
 add_test(NAME directory_test COMMAND $<TARGET_FILE:directory_test>)
 add_test(NAME net_registry_test COMMAND $<TARGET_FILE:net_registry_test>)
 add_test(NAME net_relay_seeds_test COMMAND $<TARGET_FILE:net_relay_seeds_test>)
+add_test(NAME net_relay_rosters_test COMMAND $<TARGET_FILE:net_relay_rosters_test>)
 # Two real daemons on 127.0.0.1/.2 (~10 s). Labelled so a quick run can skip
 # it: `ctest -LE live`.
 add_test(NAME first_contact_live_test COMMAND $<TARGET_FILE:first_contact_live_test>)

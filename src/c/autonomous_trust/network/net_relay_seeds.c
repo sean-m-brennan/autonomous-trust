@@ -341,3 +341,30 @@ const char *net_relay_seeds_release_key(void)
 {
     return g_release_key;
 }
+
+json_t *net_relay_signed_split(const char *text, json_t **wire_out, const char **body_str,
+                               const char **sig_hex)
+{
+    return _split(text, wire_out, body_str, sig_hex);
+}
+
+int net_relay_signed_check(const char *key_hex, const char *domain, const char *body_str,
+                           const char *sig_hex)
+{
+    return _check_sig(key_hex, domain, body_str, sig_hex);
+}
+
+int net_relay_signed_hints(const json_t *body, const char *field, net_relay_seed_list_t *out)
+{
+    return _hints(body, field, out);
+}
+
+char *net_relay_signed_read(const char *path)
+{
+    return _read(path);
+}
+
+int net_relay_signed_data_path(const char *name, char *out, size_t out_len)
+{
+    return _data_path(name, out, out_len);
+}
