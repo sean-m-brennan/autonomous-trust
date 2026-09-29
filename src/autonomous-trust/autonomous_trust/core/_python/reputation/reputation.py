@@ -652,10 +652,8 @@ class TransactionHistory(Mapping):
     def _evict_oldest(self):
         """Drop chain[0] and scrub it from the task and peer maps.
 
-        Identity-compares on removal because ``_map_peers`` may have
-        appended the same tx twice to the same peer's list (it fires
-        on both the p1-only and completed states), so a single
-        ``list.remove`` would leave a stale reference behind.
+        Identity-compares on removal, so every reference to this tx goes
+        (a single ``list.remove`` would drop only the first).
         """
         oldest = self._chain.pop(0)
         self._task_mapping.pop(oldest.task_id, None)
@@ -704,7 +702,12 @@ class TransactionHistory(Mapping):
             # and skew downstream peer-tx counts).
             return
         tx.add(peer_id, score, channel)
-        self._map_peers(tx)
+        # Index only the side just added. `_map_peers` indexes BOTH sides, so
+        # calling it on each half listed every tx twice under its p1 and
+        # double-counted those in every by_peer() consumer (CTFT, pure, the
+        # prior). Mirrors C, which indexes each tx once per peer.
+        if peer_id is not None:
+            self._peer_mapping.setdefault(peer_id, []).append(tx)
         if len(tx) > 1:
             tx.index = self._next_index
             self._next_index += 1
@@ -766,9 +769,9 @@ class TransactionHistory(Mapping):
         been evicted, so checking starts at the second resident entry."""
         return self.verify_chain_links(self._chain)
 
-    def catchup(self, chain: list[Transaction]):
+    def catchup(self, chain: list[Transaction]) -> 'ReconcileResult':
         """Merge a peer's reported chain. See ``reconcile``."""
-        self.reconcile(chain)
+        return self.reconcile(chain)
 
     def reconcile(self, chain: 'list[Transaction]',
                   final_end: 'int | None' = None,

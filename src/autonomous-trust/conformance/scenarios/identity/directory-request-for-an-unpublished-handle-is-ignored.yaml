@@ -1,0 +1,43 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: directory-request-for-an-unpublished-handle-is-ignored
+byte_pinning: false
+description: |
+    Alice publishes nothing, yet Bob's request names a handle for her key.
+    Being findable is opt-in: a node that published no handle takes no
+    requests by handle, whatever the request claims.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  # Strangers, each alone in a cohort: nobody here is a peer of anybody.
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000d0400"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000d0401"
+      size: 1
+
+steps:
+  - id: 1
+    from: bob
+    to: alice
+    function: first_contact_request
+    payload:
+      handle: alice@example.org
+      nonce: 04c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0
+    description: |
+        Bob found Alice's entry and asks, signed by his own key. Plaintext: neither
+        is a peer of the other yet.
+
+expected_state:
+  alice:
+    directory_requests_held: 0

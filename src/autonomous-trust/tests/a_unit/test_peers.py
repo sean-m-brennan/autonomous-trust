@@ -311,3 +311,20 @@ class TestPromoteNotInValuation:
         p.promote(peer)
         # Should add to valuation[-1]
         assert peer.nickname in p.valuation[-1]
+
+
+class TestFindByUuidTypes:
+    """A peer's uuid is a str or a UUID depending on where its Identity was
+    built; the same peer must be found either way."""
+
+    @pytest.mark.parametrize('stored_as_str', [True, False])
+    def test_found_by_str_or_uuid(self, stored_as_str):
+        u = uuid4()
+        peers = Peers()
+        peer = _mock_peer(uuid=str(u) if stored_as_str else u)
+        peers.add(peer, peers.mid_level)
+        assert peers.find_by_uuid(u) is peer
+        assert peers.find_by_uuid(str(u)) is peer
+        assert peers.find_by_uuid(str(u).upper()) is peer
+        assert peers.find_by_uuid(uuid4()) is None
+        assert peers.find_by_uuid(None) is None

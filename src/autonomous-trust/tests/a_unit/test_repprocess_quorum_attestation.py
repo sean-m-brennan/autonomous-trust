@@ -436,7 +436,9 @@ class TestCheckpointFinalQuorum:
         members = [_identity('m%d' % i) for i in range(3)]
         rp = _rep_process(members)
         ck = _ckpt(members[0].uuid, epoch=1)
-        sigs = {str(m.uuid): _sig(m, ck.designation) for m in members[:2]}
+        # Three of a four-member group (this node plus three): a majority of
+        # the WHOLE group. Two, half of it, used to be enough (ISSUES.md §2.22).
+        sigs = {str(m.uuid): _sig(m, ck.designation) for m in members[:3]}
         msg = _final(rp, ReputationProtocol.checkpoint_final,
                      SignedCheckpoint(checkpoint=ck, sigs=sigs), members[0])
         assert rp.handle_checkpoint_final({CfgIds.network: queue.Queue()},

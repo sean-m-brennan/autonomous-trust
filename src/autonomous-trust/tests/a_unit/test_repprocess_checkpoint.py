@@ -211,13 +211,17 @@ class TestCheckpointFlow:
         assert key not in rp._checkpoint_pending
 
     def test_final_stores_checkpoint_on_receiver(self):
-        proposer = _identity('proposer')
+        # Two signers of a three-member group: a majority of the WHOLE group,
+        # this node included. The proposer alone in a two-member group used to
+        # finalize (ISSUES.md §2.22).
+        proposer, other = _identity('proposer'), _identity('other')
         rp = _make_rep_process()
-        rp.protocol.peers.all = [proposer]
+        rp.protocol.peers.all = [proposer, other]
         ck = Checkpoint(proposer_uuid=proposer.uuid, root=b'c' * 64, epoch=2,
                         first_index=0, count=1)
         signed = SignedCheckpoint(
-            checkpoint=ck, sigs={str(proposer.uuid): _cosign(proposer, ck)})
+            checkpoint=ck, sigs={str(proposer.uuid): _cosign(proposer, ck),
+                                 str(other.uuid): _cosign(other, ck)})
         final = Message(CfgIds.reputation, ReputationProtocol.checkpoint_final,
                         to_json_string(signed), rp.group,
                         from_whom=proposer)
@@ -264,7 +268,10 @@ class TestOutvotedRequestsTheQuorumChain:
     def _setup(self):
         proposer = _identity('proposer')
         rp = _make_rep_process()
-        rp.protocol.peers.all = [proposer]
+        # A third member co-signs the final: a majority of the whole group
+        # (ISSUES.md §2.22) that this node did not join.
+        self.other = _identity('other')
+        rp.protocol.peers.all = [proposer, self.other]
         tasks = {c: uuid4() for c in 'abcx'}
         ours, theirs = rp.history, TransactionHistory()
         for hist, letters in ((ours, 'abx'), (theirs, 'abc')):
@@ -277,8 +284,10 @@ class TestOutvotedRequestsTheQuorumChain:
     def _final(rp, proposer, root):
         ck = Checkpoint(proposer_uuid=proposer.uuid, root=root, epoch=2,
                         first_index=0, count=3)
+        other = next(p for p in rp.protocol.peers.all if p is not proposer)
         signed = SignedCheckpoint(
-            checkpoint=ck, sigs={str(proposer.uuid): _cosign(proposer, ck)})
+            checkpoint=ck, sigs={str(proposer.uuid): _cosign(proposer, ck),
+                                 str(other.uuid): _cosign(other, ck)})
         final = Message(CfgIds.reputation, ReputationProtocol.checkpoint_final,
                         to_json_string(signed), rp.group, from_whom=proposer)
         final.verified = True

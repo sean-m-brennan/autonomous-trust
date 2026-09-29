@@ -117,6 +117,23 @@ extern char NET_FN_PING_AT[];
  * Network.exclude / Network.readmit in network.py). */
 extern char NET_FN_EXCLUDE[];
 extern char NET_FN_READMIT[];
+/* Local IPC from identity: reach peer {uuid} through relay {relay}
+ * ("host:port"), learned from a first-contact invitation's hint. Mirrors
+ * Python Network.relay_route. See net_relay.h. */
+extern char NET_FN_RELAY_ROUTE[];
+/** network -> identity, local IPC: an own relay proved who it is. */
+extern char NET_FN_RELAY_IDENTITY[];
+/** identity -> network, local IPC: our own reachability record to publish. */
+extern char NET_FN_REACH_PUBLISH[];
+/** identity -> network, local IPC: the directory. Mirror: Python Network.dir_*. */
+extern char NET_FN_DIR_PUBLISH[];
+extern char NET_FN_DIR_WITHDRAW[];
+extern char NET_FN_DIR_LOOKUP[];
+/** network -> identity, local IPC: a lookup's outcome, and a registry's answer
+ *  to our publish or withdraw. Mirror: Python IdentityProtocol.dir_result /
+ *  dir_status. */
+extern char NET_ID_DIR_RESULT[];
+extern char NET_ID_DIR_STATUS[];
 
 /* Python's INBOUND_BUDGET=32 per-channel drain cap (netprocess.py:581).
  * C's receive path is thread-per-channel, so OS scheduling provides the

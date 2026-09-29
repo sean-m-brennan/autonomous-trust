@@ -1,0 +1,57 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-membership-update-stale-epoch-keeps-key
+byte_pinning: false
+description: |
+    A membership update for OUR group never changes our key, even when it
+    carries a private key (ISSUES §2.31).
+
+    A same-group key change is a rotation, and the rotation branch of
+    handle_group_update already takes every newer or tiebreak-winning key.
+    What reaches the membership branch is a membership update, and the key
+    riding on it is whatever the sender held when it built the frame. Under
+    load that can be an epoch behind. In partition cohort part-3637905
+    (2026-09-29) ben held epoch 4 and took ada's stale epoch-3 update because it
+    listed five members to his four. Both runtimes installed the sender's key
+    on that path (Python by replacing the group wholesale, C by swapping the
+    encryptor while keeping its epoch), and no frame from the cohort decrypted
+    for ben again.
+
+    peer_a holds group G at key epoch 4, with one member. peer_b holds the same
+    group at key epoch 3, with a different private key and three members.
+    peer_a takes the larger membership and keeps its own key and epoch.
+
+participants:
+  - id: peer_a
+    role: group_member
+  - id: peer_b
+    role: group_member
+
+fixtures:
+  groups:
+    peer_a:
+      uuid: "0a000000-0000-4000-8000-0000000002f1"
+      size: 1
+      key_epoch: 4
+    peer_b:
+      uuid: "0a000000-0000-4000-8000-0000000002f1"
+      size: 3
+      key_epoch: 3
+
+steps:
+  - id: 1
+    from: peer_b
+    to: peer_a
+    function: group_key_update
+    payload: {}
+    description: |
+        peer_b's stale epoch-3 view of G, carrying its private key, reaches
+        peer_a at epoch 4.
+
+expected_state:
+  peer_a:
+    group_size: 3
+    group_key_epoch: 4
+    group_owns_private_key: true
+    group_key_kept: true

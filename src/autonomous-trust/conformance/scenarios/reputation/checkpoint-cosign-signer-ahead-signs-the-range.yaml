@@ -1,0 +1,66 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: checkpoint-cosign-signer-ahead-signs-the-range
+byte_pinning: false
+description: |
+    A member co-signs the proposed RANGE, not its whole window (ISSUES §2.29).
+
+    The chain grows every second or two in a busy group and each member
+    proposes on its own phase, so a proposal routinely lands on a member that
+    has committed one entry more than the proposer had. Comparing whole windows
+    declined every such honest proposal: partition cohort part-3592107
+    (2026-09-29) had all four nodes of island A propose epoch 12 over the SAME
+    root, and not one proposal collected the four co-signatures it needed.
+
+    bob holds entries a, b, c and one more, d. alice proposes over indices 0 to
+    2 with the root of a, b, c (the window chain-catchup-verifies-links pins).
+    bob's own entries at those indices hash to that root, so he signs, and
+    parks nothing.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: member
+
+fixtures:
+  local_chain:
+    bob:
+      - {task: a, p1: 0.7, p2: 0.5}
+      - {task: b, p1: 0.9, p2: 0.3}
+      - {task: c, p1: 0.6, p2: 0.4}
+      - {task: d, p1: 0.8, p2: 0.8}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: checkpoint propose
+    payload:
+      root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+      epoch: 7
+      first_index: 0
+      count: 3
+    description: |
+        alice proposes a checkpoint over a, b, c. bob is one entry past it.
+
+  - id: 2
+    from: bob
+    to: alice
+    function: checkpoint sign
+    in_response_to: 1
+    no_propagate: true
+    payload:
+      root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+      epoch: 7
+      first_index: 0
+      count: 3
+    description: |
+        bob's co-signature. Its bytes are per-implementation, so only that it
+        was sent, and to whom, is matched.
+
+expected_state:
+  bob:
+    committed_tx_count: 4
+    checkpoint_cosigns_parked: 0

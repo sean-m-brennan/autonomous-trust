@@ -88,6 +88,13 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
         return self.protocol.group
 
     @property
+    def child_groups(self):
+        # The cohorts this node gateways (ChildGroupSet from identity). The
+        # first-contact tier cap reads it to tell a child-group member from a
+        # stranger; without it every child member was capped as one.
+        return self.protocol.child_groups
+
+    @property
     def capabilities(self):
         return self.protocol.capabilities
 
@@ -248,6 +255,13 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                         sender = self.peers.find_by_uuid(
                             getattr(message.from_whom, 'uuid', None))
                     sender_tier = getattr(sender, '_tier', 0) if sender is not None else 0
+                    # §10.3: an unverified first-contact peer may message, and
+                    # no more, until verified (doc/architecture/first-contact.md).
+                    if message.from_whom is not None:
+                        from ..identity import first_contact
+                        sender_tier = first_contact.capped_tier(
+                            self, getattr(message.from_whom, 'uuid', None),
+                            sender_tier)
                     # Capabilities is keyed by name; the task carries a
                     # serialized Capability whose required_tier may have
                     # been built with defaults (e.g. by a remote peer or

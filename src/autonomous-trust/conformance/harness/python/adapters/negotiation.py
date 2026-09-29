@@ -314,6 +314,8 @@ class NegotiationAdapter:
             os.makedirs(os.path.join(self._scratch.name, 'etc/at'), exist_ok=True)
 
             participants = self._build_participants(case)
+            self._apply_groups(case, participants)
+            fc_env = self._apply_first_contact(case)
             ctx = ScenarioContext(
                 case=case,
                 participants=participants,
@@ -322,8 +324,69 @@ class NegotiationAdapter:
             )
             run_scenario(ctx)
         finally:
+            if 'fc_env' in locals() and fc_env:
+                os.environ.pop('AT_FIRST_CONTACT', None)
             self._scratch.cleanup()
             self._scratch = None
+
+    @staticmethod
+    def _apply_first_contact(case: Case) -> bool:
+        """``first_contact: {enabled: true}``, ``verified_contacts`` and
+        ``unverified_contacts`` (each ``{<holder>: [<pid>, ...]}``): turn the
+        optional feature on -- which brings its §10.3 tier cap into
+        negotiation's gate -- and write the listed contact records into this
+        scenario's scratch root. Participants belong to no group unless
+        ``group_members`` / ``child_group_members`` put them in one (see
+        _apply_groups). Returns True if the environment was changed. Mirrors
+        the C adapter's _apply_first_contact."""
+        fixtures = case.data.get('fixtures', {}) or {}
+        if not (fixtures.get('first_contact') or {}).get('enabled'):
+            return False
+        os.environ['AT_FIRST_CONTACT'] = '1'
+        from autonomous_trust.core.contacts import Contact, Contacts, Provenance
+        store = Contacts()
+        for key, verified in (('verified_contacts', True),
+                              ('unverified_contacts', False)):
+            for _holder, pids in (fixtures.get(key) or {}).items():
+                for pid in pids or []:
+                    ident = _PARTICIPANT_IDENTITIES.get(pid)
+                    if ident is None:
+                        continue
+                    contact = Contact(ident.publish(), petname=pid,
+                                      provenance=Provenance.in_person if verified
+                                      else Provenance.token)
+                    if verified:
+                        contact.mark_verified()
+                    store.add(contact)
+        store.save()
+        return True
+
+    @staticmethod
+    def _apply_groups(case: Case, handles) -> None:
+        """``group_members: {<holder>: [<pid>, ...]}`` puts the listed
+        participants in the holder's OWN group; ``child_group_members`` in a
+        child group the holder gateways. What the tier cap reads to tell a
+        cohort member from a stranger. Mirrors the C adapter's _apply_groups."""
+        fixtures = case.data.get('fixtures', {}) or {}
+        for key in ('group_members', 'child_group_members'):
+            for holder, pids in (fixtures.get(key) or {}).items():
+                handle = handles.get(holder)
+                if handle is None:
+                    continue
+                members = {}
+                for pid in pids or []:
+                    ident = _PARTICIPANT_IDENTITIES.get(pid)
+                    if ident is not None:
+                        members[str(ident.uuid)] = ident.address
+                gid = uuid5(_NS, 'neg:%s:%s' % (key, holder))
+                seed = hashlib.sha256(b'neg:grp:' + str(gid).encode()).hexdigest()
+                grp = Group(gid, members, '%s-%s' % (holder, key),
+                            Encryptor(seed.encode('ascii'), public_only=False))
+                proto = handle.impl.process.protocol
+                if key == 'group_members':
+                    proto.group = grp
+                else:
+                    proto.child_groups = {str(gid): grp}
 
     def run_wire_vector(self, case: Case) -> None:  # noqa: ARG002
         raise NotImplementedError('negotiation wire_vector kind not implemented (Phase E: scenarios only)')

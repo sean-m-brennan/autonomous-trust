@@ -263,9 +263,52 @@ DEFINE_TEST(test_tx_fork_the_quorum_chain_wins_an_equal_length_tiebreak)
 }
 END_TEST_DEFINITION()
 
+DEFINE_TEST(test_tx_fork_hands_back_what_it_dropped)
+{
+    /* Agora Phase 4 DDIL: the caller re-proposes its own half of each dropped
+     * entry, so the result must carry them, whole and in chain order, and own
+     * nothing when nothing was dropped. */
+    _fork_setup();
+    tx_history_t ours, theirs;
+    _fork_chain(&ours, "abxy");
+    _fork_chain(&theirs, "abcde");
+
+    tx_reconcile_result_t res = _reconcile_from(&ours, &theirs, -1);
+    ck_assert_int_eq(res.status, TX_RECONCILE_ADOPTED);
+    ck_assert_int_eq(res.dropped, 2);
+    ck_assert(res.dropped_entries != NULL);
+    ck_assert(uuid_compare(res.dropped_entries[0].task_uuid, g_tasks['x' - 'a']) == 0);
+    ck_assert(uuid_compare(res.dropped_entries[1].task_uuid, g_tasks['y' - 'a']) == 0);
+    ck_assert(res.dropped_entries[0].p1_set && res.dropped_entries[0].p2_set);
+    ck_assert(uuid_compare(res.dropped_entries[0].p1_uuid, g_fp1) == 0);
+    ck_assert_double_eq_tol(res.dropped_entries[0].p1_score, 0.3 + 0.02 * ('x' - 'a'), 1e-12);
+    ck_assert_int_eq(res.dropped_entries[0].index, 2);
+    tx_reconcile_result_free(&res);
+    ck_assert(res.dropped_entries == NULL);
+    tx_reconcile_result_free(&res);   /* idempotent */
+
+    /* Agreeing now: nothing dropped, nothing owned. */
+    res = _reconcile_from(&ours, &theirs, -1);
+    ck_assert_int_eq(res.status, TX_RECONCILE_NONE);
+    ck_assert(res.dropped_entries == NULL);
+
+    /* A pure extension drops nothing either. */
+    tx_history_t short_h;
+    _fork_chain(&short_h, "ab");
+    res = _reconcile_from(&short_h, &theirs, -1);
+    ck_assert_int_eq(res.status, TX_RECONCILE_EXTENDED);
+    ck_assert(res.dropped_entries == NULL);
+
+    tx_history_free(&short_h);
+    tx_history_free(&ours);
+    tx_history_free(&theirs);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(ReputationFork, test_tx_fork_adopts_the_longer_chain,
           test_tx_fork_keeps_our_chain_when_the_peer_is_shorter,
           test_tx_fork_tiebreak_is_symmetric,
           test_tx_fork_refused_inside_the_finalized_checkpoint,
           test_tx_fork_adoption_keeps_pending_work,
-          test_tx_fork_the_quorum_chain_wins_an_equal_length_tiebreak)
+          test_tx_fork_the_quorum_chain_wins_an_equal_length_tiebreak,
+          test_tx_fork_hands_back_what_it_dropped)

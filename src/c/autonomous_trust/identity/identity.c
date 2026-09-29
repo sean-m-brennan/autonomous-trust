@@ -55,6 +55,14 @@ void peers_set_max_count(size_t count)
  * any global identifier. Nothing may depend on a peer's petname matching its
  * roster/online name; peer matching keys off the online nickname. Mirrors
  * Python Identity.derive_local_petname. */
+static void derive_local_petname(const char *nickname, char *out, size_t outlen);
+
+void public_identity_derive_petname(const char *nickname, char *out,
+                                    size_t outlen)
+{
+    derive_local_petname(nickname, out, outlen);
+}
+
 static void derive_local_petname(const char *nickname, char *out, size_t outlen)
 {
     char local[NAME_LEN + 1] = {0};

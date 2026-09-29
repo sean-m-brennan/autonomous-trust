@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import json
 import os
 import queue
 import tempfile
@@ -132,6 +133,55 @@ _TRIGGER_FC_RESTART = 'trigger_first_contact_restart'
 # an inbound message -- there is nothing to dispatch. The C adapter recognizes
 # the same string. See first-contact-initiate-reaches-the-hint.
 _TRIGGER_FC_INITIATE = 'trigger_first_contact_initiate'
+
+# Pseudo-function: the participant's APP removes a contact ({peer: <pid>}),
+# through the production app verb. A pseudo-step because the scenario cannot
+# spell a peer's uuid -- the runtimes derive them differently -- so the adapter
+# resolves the participant id. The C adapter recognizes the same string. See
+# first-contact-remove-drops-the-direct-peer.
+_TRIGGER_FC_REMOVE = 'trigger_first_contact_remove'
+
+# Pseudo-functions for finding someone by handle (identity/directory_contact.py),
+# each through the production app verb or handler, because the entry, request
+# and invitation are signed by per-run keys the scenario cannot spell:
+#   trigger_directory_publish {handle}         -- our app publishes the handle,
+#       attested by the harness issuer (_DIR_ISSUER_SEED);
+#   trigger_directory_request {holder, handle} -- a lookup finds the holder's
+#       entry (a local dir_result) and our app asks to become a contact;
+#   trigger_directory_accept / _decline {ref}  -- our app answers a held request
+#       (its ref is the request's nonce).
+# The C adapter recognizes the same strings. See identity/directory-*.yaml.
+_TRIGGER_DIR_PUBLISH = 'trigger_directory_publish'
+_TRIGGER_DIR_REQUEST = 'trigger_directory_request'
+_TRIGGER_DIR_ACCEPT = 'trigger_directory_accept'
+_TRIGGER_DIR_DECLINE = 'trigger_directory_decline'
+# The harness's handle issuer. Nothing checks the issuer on these paths (only a
+# registry does), but a fixed one keeps both runtimes minting the same bytes.
+_DIR_ISSUER_SEED = bytes([0x44]) * 32
+
+
+def _dir_entry_for(identity, handle, seq=1):
+    """The holder's issuer-attested directory entry for ``handle``, and the
+    attestation it embeds."""
+    import time
+    from nacl.signing import SigningKey
+    from autonomous_trust.core._python.contacts import directory as _dir
+    key = _dir._public_hex(_dir._signing_key(identity))
+    att = _dir.attest(SigningKey(_DIR_ISSUER_SEED), handle, key, int(time.time()) + 3600)
+    return att, _dir.create_entry(identity, att, seq)
+
+
+def _app_verb(function, body):
+    """A request from this node's own app: no sender on the envelope."""
+    return Message(CfgIds.identity, function, to_json_string(body),
+                   to_whom=None, from_whom=None, encrypt=False)
+
+
+# The group public key each participant's `fixtures.groups` entry gave it,
+# keyed by participant id, for the `group_key_kept` check (ISSUES §2.31). Held
+# outside the Group because the failure it catches is the Group being replaced
+# wholesale. Reset on every scenario build.
+_FIXTURE_GROUP_PUB: dict[str, bytes] = {}
 
 
 @dataclass
@@ -332,6 +382,14 @@ class _Participant:
                             # order.
                             actual = len(contact.rendezvous)
                             value = int(value)
+                        elif field == 'reach_seq':
+                            actual = int(contact.reach_seq)
+                            value = int(value)
+                        elif field == 'rendezvous_head':
+                            # The newest hint: nameable when the scenario
+                            # supplied it (a reachability record's relay).
+                            actual = contact.rendezvous[0] if contact.rendezvous else ''
+                            value = str(value)
                         elif field == 'rendezvous_tail':
                             # Everything after the newest hint: fixture-supplied
                             # values, so this is nameable. Pins that a refresh
@@ -370,6 +428,23 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: first_contact_acks_emitted={actual}, '
                         f'expected {int(expected)}')
+            elif key in ('directory_requests_held', 'directory_accepts_emitted',
+                         'first_contact_hellos_emitted'):
+                # Requests held for our app to decide; and how many
+                # first_contact_accept / first_contact_hello messages this
+                # participant emitted over the whole scenario. A request that
+                # fails a gate is dropped silently, so what is held -- and what
+                # an answer puts on the wire -- are the only observables. C
+                # holds requests process-wide (at_dir_contact_held_count), so
+                # the cases asserting it have one holder.
+                if key == 'directory_requests_held':
+                    actual = len(getattr(self.process, '_dir_in', {}) or {})
+                else:
+                    actual = self.emit_tally.get(
+                        IdentityProtocol.contact_accept if key == 'directory_accepts_emitted'
+                        else IdentityProtocol.hello, 0)
+                if actual != int(expected):
+                    raise AssertionError(f'{self.id}: {key}={actual}, expected {int(expected)}')
             elif key == 'first_contact_nonce_spent':
                 # The durable single-use guard itself, as {nonce: bool}. Read
                 # after a trigger_first_contact_restart, this is the only place
@@ -503,6 +578,21 @@ class _Participant:
                 if actual != bool(expected):
                     raise AssertionError(
                         f'{self.id}: group_owns_private_key={actual}, '
+                        f'expected {bool(expected)}'
+                    )
+            elif key == 'group_key_kept':
+                # True iff this participant still holds the group key its
+                # `fixtures.groups` entry gave it. Pins that a membership update
+                # never changes the key of our own group (ISSUES §2.31), which
+                # group_key_epoch alone cannot: C keeps the epoch while
+                # swapping the key. C mirrors via ic_impl_t.fixture_group_pub.
+                grp = self.process.group
+                want_pub = _FIXTURE_GROUP_PUB.get(self.id)
+                actual = bool(grp is not None and want_pub is not None
+                              and grp._encryptor.publish() == want_pub)
+                if actual != bool(expected):
+                    raise AssertionError(
+                        f'{self.id}: group_key_kept={actual}, '
                         f'expected {bool(expected)}'
                     )
             elif key == 'group_size':
@@ -991,7 +1081,8 @@ class IdentityAdapter:
             contact = Contact(identity, petname=spec.get('petname', ''),
                               rendezvous=list(spec.get('rendezvous') or []),
                               provenance=provenance,
-                              nonce=spec.get('nonce', ''))
+                              nonce=spec.get('nonce', ''),
+                              reach_seq=int(spec.get('reach_seq', 0) or 0))
             if spec.get('verified'):
                 contact.mark_verified(float(spec['trust_seed'])
                                       if 'trust_seed' in spec
@@ -1187,6 +1278,7 @@ class IdentityAdapter:
         groups_fix: dict[str, Any] = fixtures.get('groups', {}) or {}
         distinct_groups = bool(groups_fix)
         group_by_pid: dict[str, Group] = {}
+        _FIXTURE_GROUP_PUB.clear()
         if distinct_groups:
             for gi, (pid, spec_g) in enumerate(groups_fix.items()):
                 group_by_pid[pid] = self._build_group_from_fixture(
@@ -1467,8 +1559,13 @@ class IdentityAdapter:
         enc = Encryptor.generate()
         if public_only:
             enc = Encryptor(enc.publish(), public_only=True)
+        # `key_epoch` pins how many rotations this participant's group key has
+        # been through, so a scenario can hand a member an update from a
+        # sender an epoch behind it (ISSUES §2.31).
         grp = Group(group_uuid, {identity.uuid: identity.address},
-                    f'grp-{pid}', enc, public_only)
+                    f'grp-{pid}', enc, public_only,
+                    _key_epoch=int(spec.get('key_epoch', 0)))
+        _FIXTURE_GROUP_PUB[pid] = enc.publish()
         ns = UUID('00000000-0000-0000-0000-000000000aaa')
         for k in range(max(0, size - 1)):
             # str() the filler uuid: address-map keys must be strings (matches
@@ -1737,13 +1834,52 @@ class IdentityAdapter:
                     participant.fc_hello_endpoint = str(
                         getattr(target, 'address', '') or '')
             return emitted
+        if inbound.function == _TRIGGER_FC_REMOVE:
+            from autonomous_trust.core.identity import first_contact as _fc
+            spec = from_json_string(inbound.obj) if inbound.obj else {}
+            peer_uuid = participant._uuid_for_pid(str(spec.get('peer')))
+            request = Message(CfgIds.identity, _fc.APP_REMOVE,
+                              to_json_string({'ref': '', 'peer': str(peer_uuid)}),
+                              to_whom=None, from_whom=None, encrypt=False)
+            _fc.handle_app_remove(participant.process, participant.queues, request)
+            return participant.drain_outbox()
+        if inbound.function in (_TRIGGER_DIR_PUBLISH, _TRIGGER_DIR_REQUEST,
+                                _TRIGGER_DIR_ACCEPT, _TRIGGER_DIR_DECLINE):
+            from autonomous_trust.core._python.identity import directory_contact as _dc
+            spec = from_json_string(inbound.obj) if inbound.obj else {}
+            proc, queues = participant.process, participant.queues
+            if inbound.function == _TRIGGER_DIR_PUBLISH:
+                att, _entry = _dir_entry_for(proc.identity, str(spec.get('handle')))
+                _dc.handle_app_dir_publish(proc, queues, _app_verb(
+                    _dc.APP_DIR_PUBLISH, {'ref': 'pub', 'attestation': att.to_wire()}))
+            elif inbound.function == _TRIGGER_DIR_REQUEST:
+                holder_uuid = participant._uuid_for_pid(str(spec.get('holder')))
+                holder = self._roster_by_uuid[str(holder_uuid)].process.identity
+                handle = str(spec.get('handle'))
+                _att, entry = _dir_entry_for(holder, handle)
+                _dc.handle_dir_result(proc, queues, _app_verb(
+                    IdentityProtocol.dir_result,
+                    {'handle': handle, 'entry': entry.to_wire(), 'relay': '',
+                     'limited': False}))
+                _dc.handle_app_request(proc, queues, _app_verb(
+                    _dc.APP_REQUEST, {'ref': 'ask', 'handle': handle}))
+            else:
+                answer = (_dc.handle_app_accept if inbound.function == _TRIGGER_DIR_ACCEPT
+                          else _dc.handle_app_decline)
+                answer(proc, queues, _app_verb(
+                    _dc.APP_ACCEPT if inbound.function == _TRIGGER_DIR_ACCEPT
+                    else _dc.APP_DECLINE, {'ref': str(spec.get('ref', ''))}))
+            return participant.drain_outbox()
         if inbound.function == _TRIGGER_FC_RESTART:
             # Forget the in-memory spent-nonce guard, keep the file: a fresh
             # SpentNonces re-reads <data_dir>/first_contact_nonces.cfg.json,
-            # which is exactly what a restarted node does. C mirrors with
-            # at_first_contact_reset().
+            # which is exactly what a restarted node does. Pending hellos and
+            # minted refs live only in memory, so a restart forgets them too.
+            # C mirrors with at_first_contact_reset().
             from autonomous_trust.core.identity import first_contact as _fc
             participant.process._first_contact_nonces = _fc.SpentNonces()
+            participant.process._first_contact_pending = {}
+            participant.process._first_contact_minted = {}
             return participant.drain_outbox()
         if inbound.function == _TRIGGER_SUBTREE_ROSTER:
             # Pseudo-function: run the requestor-side subtree-roster walk on
@@ -1949,6 +2085,58 @@ class IdentityAdapter:
                 ttl_seconds=0,
                 nonce=str(payload.get('nonce', '')),
             ).encode()
+        elif function == IdentityProtocol.contact_request:
+            # A finder's signed request (contacts/directory.py), minted here
+            # from the SIGNER's identity (default the sender) for the entry of
+            # the participant it is addressed `to` (default the recipient) --
+            # a signer or `to` other than those is the forgery under test. The
+            # nonce is spelled out so the app's accept can name it as its ref.
+            from autonomous_trust.core._python.contacts import directory as _dir
+            signer = participants[payload.get('signer') or from_id].impl.process.identity
+            holder = participants[payload.get('to') or to_id].impl.process.identity
+            _att, entry = _dir_entry_for(holder, str(payload.get('handle')))
+            obj = _dir.create_request(signer, entry,
+                                      nonce=str(payload.get('nonce', '')) or None).to_json()
+        elif function == IdentityProtocol.contact_accept:
+            # The holder's answer: the nonce of the request it answers (default
+            # the one the recipient has outstanding to the sender) and a
+            # single-use invitation minted by `minted_by` (default the sender).
+            # `expired` backdates the invitation.
+            import time
+            from autonomous_trust.core.contacts import create_invitation
+            nonce = payload.get('nonce')
+            if nonce is None:
+                holder_uuid = str(sender.process.identity.uuid).lower()
+                out = participants[to_id].impl.process._dir_out.get(holder_uuid)
+                nonce = out.nonce if out is not None else ''
+            minter = participants[payload.get('minted_by') or from_id].impl.identity
+            expired = bool(payload.get('expired'))
+            invitation = create_invitation(
+                minter, expiry=int(time.time()) - 60 if expired else None,
+                ttl_seconds=0 if expired else 600, nonce='dir-accept-invitation')
+            obj = to_json_string({'nonce': str(nonce), 'invitation': invitation.encode()})
+        elif function == IdentityProtocol.reach_record:
+            # A signed reachability record (contacts/reach.py), minted here
+            # from the SIGNER's own identity (keys are generated per run).
+            # `claim` names whose uuid the body carries -- default the signer;
+            # a different one is the "right uuid, wrong key" forgery.
+            from autonomous_trust.core._python.contacts import reach as _reach
+            signer = participants[payload.get('signer') or from_id].impl.process.identity
+            claim_pid = payload.get('claim')
+            expiry = int(payload.get('expiry', 0) or 0)
+            record = _reach.create_record(
+                signer, int(payload.get('seq', 1)),
+                [str(h) for h in payload.get('relays') or []],
+                [str(h) for h in payload.get('endpoints') or []],
+                expiry=expiry)
+            if claim_pid:
+                body = dict(record.body)
+                body['uuid'] = str(participants[claim_pid].impl.process.identity.uuid).lower()
+                body_str = json.dumps(body, sort_keys=True, separators=(',', ':'),
+                                      ensure_ascii=True)
+                sig = signer.sign((_reach.REACH_DOMAIN + body_str).encode('utf-8'))
+                record = _reach.ReachRecord(body, body_str, sig.signature.decode('ascii'))
+            obj = record.to_json()
         elif function == IdentityProtocol.hello_ack:
             # The accept. The echoed nonce is informational -- what makes the
             # ack trustworthy is that the initiator already holds the
@@ -2144,6 +2332,10 @@ class IdentityAdapter:
                       from_whom=sender_identity,
                       to_whom=Network.broadcast if to_id == 'broadcast' else None,
                       encrypt=(function != IdentityProtocol.announce))
+        if function == IdentityProtocol.reach_record and payload.get('local'):
+            # As the network process hands on a relay lookup's answer: no
+            # sender on the envelope.
+            msg.from_whom = None
         return msg
 
 

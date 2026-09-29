@@ -1,0 +1,55 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: registry-distrusted-holder-hidden
+description: A holder this node distrusts is answered with the same null as a handle nobody filed.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: registry
+    issuers:
+    - d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48
+    now: 1790000000
+    clients:
+      alice:
+        uuid: aaaaaaaa-0000-4000-8000-0000000000a1
+        key: c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242
+      bob:
+        uuid: bbbbbbbb-0000-4000-8000-0000000000b2
+        key: 88df556413538b002015e9619b01bdb5cc48c7215645792563f5460f7307a763
+      eve:
+        uuid: eeeeeeee-0000-4000-8000-0000000000e5
+        key: c84069fa2216c6edc1d52ca83aa11c267dd5440afa526090ca43ebd0ca86a9cf
+    calls:
+    - as: alice
+      call: publish
+      entry:
+        body: '{"v":1,"typename":"at-dir-entry","handle":"alice@example.org","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","key":"c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242","visibility":"anyone","seq":1,"expiry":4102444800,"identity":{"typename":"identity","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","address":"","nickname":"alice","signature":{"hex_seed":"c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242"},"encryptor":{"hex_seed":"7777777777777777777777777777777777777777777777777777777777777777"}},"attestation":{"body":"{\"v\":1,\"typename\":\"at-dir-attest\",\"handle\":\"alice@example.org\",\"key\":\"c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242\",\"issuer\":\"d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48\",\"expiry\":4102444800}","sig":"a41a0c2032f8e101cc170d50b656d7f4e02a13ca4e7a4a74fdbc30e0344bfe258fd342b4a32bc735d12e345cacae820940d1b58dc42bcd16e7a8ae205b81350a"}}'
+        sig: b84f58f8aaf615b1ad3b2b29de96b60b908e937c9e3c6b148e10bdbc8cc5d7d5533bff6b6c50014e3cd7e223b55c4d49af36e3c6302a42cffabdc7ee379dfa01
+    - as: bob
+      call: lookup
+      handle: alice@example.org
+    distrusted:
+    - aaaaaaaa-0000-4000-8000-0000000000a1
+steps:
+- id: 1
+  from: host
+  to: host
+  function: registry
+  description: 'trigger: registry'
+expected_state:
+  host:
+    replies:
+    - op: dir_published
+      handle: alice@example.org
+      seq: 1
+    - op: dir_entry
+      handle: alice@example.org
+      found: false

@@ -49,7 +49,10 @@ class TestIdentityProtocol:
           (operator_state_req, operator_state_resp)
         - runtime hierarchy roots (hierarchy, hierarchy_req)
         - the OPTIONAL 1:1 first-contact handshake (hello, hello_ack;
-          opt-in via AT_FIRST_CONTACT, see first-contact.md)
+          opt-in via AT_FIRST_CONTACT, see first-contact.md), its
+          reachability record (reach_record), and the directory contact
+          (contact_request, contact_accept on the wire; dir_result,
+          dir_status local IPC from the network process)
         The social verbs (position, profile, connections, DMs, posts,
         reactions, proximity, business ads and posts, cosign, reports)
         left with social (FEATURE_SPLIT_PLAN Phase 5): they are
@@ -61,7 +64,7 @@ class TestIdentityProtocol:
         to ``IdentityProtocol``.
         """
         values = list(IdentityProtocol)
-        assert len(values) == 28
+        assert len(values) == 33
         assert 'announce' in values
         assert 'hello' in values
         assert 'report' not in values

@@ -200,6 +200,10 @@ int contact_to_json(const contact_t *c, json_t **obj_out)
     json_object_set_new(o, "nonce", json_string(c->nonce));
     json_object_set_new(o, "added_at", json_real(c->added_at));
     json_object_set_new(o, "verified_at", json_real(c->verified_at));
+    /* Only once set, as Python does, so a store with no record applied is the
+     * same file either runtime wrote before records existed. */
+    if (c->reach_seq > 0)
+        json_object_set_new(o, "reach_seq", json_integer((json_int_t)c->reach_seq));
     *obj_out = o;
     return 0;
 }
@@ -246,6 +250,8 @@ int contact_from_json(const json_t *obj, contact_t *out)
         at_strlcpy(out->nonce, nonce, sizeof(out->nonce));
     out->added_at = _real(obj, "added_at");
     out->verified_at = _real(obj, "verified_at");
+    json_t *rs = json_object_get((json_t *)obj, "reach_seq");
+    out->reach_seq = json_is_integer(rs) ? (int64_t)json_integer_value(rs) : 0;
 
     json_t *rv = json_object_get((json_t *)obj, "rendezvous");
     if (json_is_array(rv) && json_array_size(rv) > 0) {

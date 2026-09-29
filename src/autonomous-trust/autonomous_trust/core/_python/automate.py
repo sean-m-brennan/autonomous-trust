@@ -63,6 +63,7 @@ from .reputation.reputation import Reputation
 from . import oracles
 from .negotiation.certified import split_certified
 from .queue_pool import QueuePool
+from .app_verbs import AppRequest, AppEvent, app_verb_target
 from .._zkp import ZKP_AVAILABLE
 from . import _probes
 
@@ -232,6 +233,9 @@ class AutonomousTrust(Protocol):
                  logfile: str = None, log_classes: list[str] = None, syslog: bool = False,
                  context: str = Ctx.DEFAULT, testing: bool = False, silent: bool = False):
         self._stopped_procs: list[str] = []
+        # Set once a quit has been sent to the subprocesses; their returns
+        # after that are the shutdown, not a fault.
+        self._quitting = False
         if multiproc:
             # Multiprocessing
             self._pool_type = ProcessPool
@@ -455,15 +459,16 @@ class AutonomousTrust(Protocol):
                     self.peer_count = len(self.peers.all)  # noqa
                     self._random_task(queues)
                     # check reputation for all known peers on first sighting
-                    for peer in list(self.peers.all) + [self.identity]:
+                    # (never self: a node does not score itself)
+                    for peer in list(self.peers.all):
                         query = Message(CfgIds.reputation, ReputationProtocol.rep_req,
                                         to_json_string((peer, self.proc_name)), self.identity,
                                         from_whom=self.identity)
                         queues[CfgIds.reputation].put(query, block=True, timeout=queue_cadence)
                 elif self.tasking_tick(0):
                     self._random_task(queues)
-                    # check reputation for all known peers (including self)
-                    for peer in list(self.peers.all) + [self.identity]:
+                    # check reputation for all known peers
+                    for peer in list(self.peers.all):
                         query = Message(CfgIds.reputation, ReputationProtocol.rep_req,
                                         to_json_string((peer, self.proc_name)), self.identity,
                                         from_whom=self.identity)
@@ -779,9 +784,13 @@ class AutonomousTrust(Protocol):
                     if not self._handle_messages(queues, pool, results):
                         break
                     self._handle_results(queues, results)
+                    if self._quitting and all(name in self._stopped_procs
+                                              for name in self.process_names):
+                        break  # every subprocess has answered the quit
                     self.autonomous_tasking(queues)
                     time.sleep(Process.cadence)
                 except KeyboardInterrupt:
+                    self._quitting = True
                     for sig in signals.values():
                         sig.put_nowait(Process.sig_quit)
                     break
@@ -851,6 +860,7 @@ class AutonomousTrust(Protocol):
                     self.logger.info('%s:  SIGTERM received, propagating quit to subprocesses', self.name)
                 except Exception:
                     pass
+                self._quitting = True
                 for sig in signals.values():
                     try:
                         sig.put_nowait(Process.sig_quit)
@@ -1032,6 +1042,28 @@ class AutonomousTrust(Protocol):
                     break
         return True
 
+    def _route_app_request(self, queues: dict[str, QueueType], request: AppRequest):
+        """Forward an app's request to the one process that declared its verb.
+
+        The allowlist is every enabled extension's ``app_verbs``
+        (:mod:`.app_verbs`), as C's is ``at_app_verb_target``. The forwarded
+        Message is rebuilt here with no ``from_whom`` and no ``to_whom``: the
+        app is not a peer, and the empty sender is what the handler's
+        ``is_local_app_verb`` guard reads as "local"."""
+        target = app_verb_target(request.function)
+        if target is None or target not in queues:
+            self.logger.warning('%s: refused app request %r (no enabled '
+                                'extension declares it)', self.name,
+                                request.function)
+            return
+        forward = Message(target, request.function, request.payload,
+                          to_whom=None, from_whom=None, encrypt=False)
+        try:
+            queues[target].put(forward, block=True, timeout=queue_cadence)
+        except queue.Full:
+            self.logger.error('%s: %s queue full; app request %r dropped',
+                              self.name, target, request.function)
+
     def _failed_task_cb(self, task: Task):
         def report_error(err: Exception):
             self.logger.error('Task %s failed: %s', task.capability.name, '\n'.join(traceback.format_exception(type(err), err)))
@@ -1058,6 +1090,8 @@ class AutonomousTrust(Protocol):
                                     to_whom=None, from_whom=self.identity)
                     queues[CfgIds.reputation].put(query, block=True,
                                                   timeout=queue_cadence)
+                elif isinstance(cmd, AppRequest):
+                    self._route_app_request(queues, cmd)
                 elif cmd == Process.sig_quit:
                     self.logger.debug('%s: External signal to quit', self.name)
                     return False
@@ -1119,7 +1153,7 @@ class AutonomousTrust(Protocol):
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
                     if self.external_feedback in queues:
                         queues[self.external_feedback].put(task, block=True, timeout=queue_cadence)
-                elif isinstance(message, PeerReputation):
+                elif isinstance(message, (PeerReputation, AppEvent)):
                     # AT -> app: the outward hop the reputation process cannot
                     # make itself, mirroring the C daemon's forward off
                     # AT_MAIN_QUEUE. `rated` rides along; see PeerReputation.
@@ -1225,7 +1259,10 @@ class AutonomousTrust(Protocol):
                     # _monitor_processes runs earlier in the same iteration, so
                     # any exception traceback is already on the record; a clean
                     # return leaves no traceback and only this line.
-                    self.logger.error('unexpected termination of process %s', key)
+                    if self._quitting:
+                        self.logger.debug('process %s stopped', key)
+                    else:
+                        self.logger.error('unexpected termination of process %s', key)
                     if key not in self._stopped_procs:
                         self._stopped_procs.append(key)
                     del results[key]

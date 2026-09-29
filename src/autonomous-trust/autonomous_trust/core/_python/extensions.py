@@ -68,6 +68,8 @@ class IdentityHooks:
     Phase 5): the Python half of identity/id_ext.h, with the hooks Python has a
     use for. Every member may be None.
 
+    ``on_start(proc, queues)`` runs once, as the identity process starts taking
+    traffic: restore persisted state here (C's ``run_start``).
     ``on_peer_confirmed(proc, queues, peer)`` runs after a peer is confirmed
     into the group and ``periodic_resync(proc, queues)`` inside the caps-resync
     sweep's ``try``; neither holds ``proc.lock``. ``is_blocked_locked(proc,
@@ -75,6 +77,7 @@ class IdentityHooks:
     must not take it. C's ``group_update_seen``, ``peer_in_group`` and
     ``roster_replay`` feed its app-event carrier, which Python does not have,
     so they have no Python slot."""
+    on_start: Optional[Callable[[Any, Any], None]] = None
     on_peer_confirmed: Optional[Callable[[Any, Any, Any], None]] = None
     periodic_resync: Optional[Callable[[Any, Any], None]] = None
     is_blocked_locked: Optional[Callable[[Any, str], bool]] = None
@@ -89,13 +92,18 @@ class Extension:
     where it belongs. Handlers it stores on ``proc`` must pickle -- a bound
     method or ``functools.partial`` of a module function, never a lambda.
     ``post_fork(proc)`` runs at the top of the process's ``process()``, in the
-    child. ``reset()`` drops process-global state between test scenarios."""
+    child. ``reset()`` drops process-global state between test scenarios.
+    ``app_verbs`` is ``((verb, process_name), ...)``: the verbs an application
+    may send this feature (:mod:`.app_verbs`), each forwarded only to the one
+    process named -- the Python half of ``AT_APP_VERB_REGISTER``. Honored only
+    while ``enabled()``."""
     name: str
     enabled: Callable[[], bool]
     register_handlers: Callable[[Any, str], None]
     post_fork: Optional[Callable[[Any], None]] = None
     reset: Optional[Callable[[], None]] = None
     identity: Optional[IdentityHooks] = None
+    app_verbs: tuple = ()
 
 
 def _builtin() -> list[Extension]:

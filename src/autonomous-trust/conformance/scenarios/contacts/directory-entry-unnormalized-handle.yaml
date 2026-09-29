@@ -1,0 +1,32 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: directory-entry-unnormalized-handle
+description: A handle in the body that is not already folded to lower case is malformed.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: dir_verify
+    what: entry
+    now: 1790000000
+    wire:
+      body: '{"v":1,"typename":"at-dir-entry","handle":"Alice@example.org","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","key":"c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242","visibility":"anyone","seq":1,"expiry":4102444800,"identity":{"typename":"identity","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","address":"","nickname":"alice","signature":{"hex_seed":"c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242"},"encryptor":{"hex_seed":"7777777777777777777777777777777777777777777777777777777777777777"}},"attestation":{"body":"{\"v\":1,\"typename\":\"at-dir-attest\",\"handle\":\"alice@example.org\",\"key\":\"c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242\",\"issuer\":\"d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48\",\"expiry\":4102444800}","sig":"a41a0c2032f8e101cc170d50b656d7f4e02a13ca4e7a4a74fdbc30e0344bfe258fd342b4a32bc735d12e345cacae820940d1b58dc42bcd16e7a8ae205b81350a"}}'
+      sig: 657fc02fd1a7e77051c34f10b3c4556c6e1173593dbae2f4d29be8478acecb84bbdeb98879a70e249088e0b9e3d925f76dab25cffc845515f7a8d09035517102
+    trusted:
+    - d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48
+steps:
+- id: 1
+  from: host
+  to: host
+  function: dir_verify
+  description: 'trigger: dir_verify'
+expected_state:
+  host:
+    dir_status: malformed

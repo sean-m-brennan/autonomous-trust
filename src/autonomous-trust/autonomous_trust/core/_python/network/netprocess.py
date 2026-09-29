@@ -16,6 +16,8 @@
 
 import concurrent.futures
 import errno
+import json
+import uuid as _uuid_mod
 import socket
 import threading
 import time
@@ -41,6 +43,8 @@ from ..config import NetWireFormat
 from .network import Network
 from .message import Message, WireFormatMismatch
 from .ping_at import PingATServer, ping_at
+from . import relay as _relay
+from . import registry as _registry
 
 
 class NetworkProtocol(Enum):
@@ -158,6 +162,53 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         # the inbound-drop / outbound-forward gates below.
         self.protocol.register_handler(Network.exclude, self.handle_exclude)
         self.protocol.register_handler(Network.readmit, self.handle_readmit)
+        self.protocol.register_handler(Network.relay_route, self.handle_relay_route)
+        self.protocol.register_handler(Network.reach_publish, self.handle_reach_publish)
+        self.protocol.register_handler(Network.dir_publish, self.handle_dir_publish)
+        self.protocol.register_handler(Network.dir_withdraw, self.handle_dir_withdraw)
+        self.protocol.register_handler(Network.dir_lookup, self.handle_dir_lookup)
+        # Rendezvous relays (network/relay.py). Built in process(), in the
+        # child: sockets and threads do not survive the fork.
+        self.relay_messages = deque()   # (frame, from_uuid, endpoint)
+        self.relay_unreachable = deque()  # (endpoint, to_uuid) a relay refused
+        # peer uuid (str) -> [(host, port), ...]: its relays in preference
+        # order, the ACTIVE one first. One relay carries a peer's traffic at a
+        # time; a failure rotates the next to the front.
+        self._relay_routes = {}
+        # peer uuid (str) -> (frame, relays tried): the last frame sent to the
+        # peer by relay, kept to resend it through the next relay when the
+        # active one says it cannot reach the peer (a relay acknowledges
+        # nothing, so the refusal is the only signal, and it comes later).
+        self._relay_last = {}
+        # peer uuid (str) -> (monotonic due time, rounds so far): a frame every
+        # relay refused, to walk the route again -- the peer may register a few
+        # seconds later (a relay restarting, or it minted its link before its
+        # own registration finished).
+        self._relay_retry = {}
+        self._relay_clients = {}        # (host, port) -> RelayClient
+        self._relay_connecting = set()  # endpoints a background connect is on
+        self._relay_last_try = {}       # endpoint -> monotonic time of last try
+        self._relay_live = {}           # peer uuid -> relay its traffic last came by
+        # endpoint -> (uuid, fp): which relay a link or our config says answers
+        # there. A client for that endpoint refuses anything else.
+        self._relay_pins = {}
+        # Who reputation has cut off, by uuid and by signing key (hex), so a
+        # distrusted relay or client gains nothing by claiming a new uuid.
+        self._excluded_uuids = set()
+        self._excluded_keys = set()
+        self._relay_queues = None       # set in process(), for relay_identity
+        self._own_record = None         # our reachability record (wire dict)
+        self.relay_records = deque()    # (record id, wire) answers to lookups
+        self._reach_asked = {}          # peer uuid -> monotonic time of last lookup
+        self._relay_server = None
+        # The directory (network/registry.py): our own entries (handle ->
+        # wire), refiled at every registration with our relays; registry
+        # answers as they arrive ((endpoint, frame)); and lookups in flight
+        # (handle -> _DirLookup), answered to identity once, when the first
+        # relay finds the handle or every relay asked has answered.
+        self._own_entries = {}
+        self.relay_dir = deque()
+        self._dir_lookups = {}
         load_extensions(self, self.name)
         self.stop = False
         self.statistics = {}
@@ -501,24 +552,623 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         """Add an address to the rejection list."""
         self._rejected_addresses.add(self._norm_addr(address))
 
+    @staticmethod
+    def _exclusion_spec(message):
+        """``(address, uuid)`` from an exclude/readmit: ``{address, uuid}``,
+        or a bare address (the older form)."""
+        obj = getattr(message, 'obj', None)
+        if isinstance(obj, str) and obj.lstrip().startswith('{'):
+            try:
+                obj = json.loads(obj)
+            except ValueError:
+                pass
+        if isinstance(obj, dict):
+            uuid = obj.get('uuid')
+            return obj.get('address') or None, str(uuid).lower() if uuid else None
+        return obj, None
+
+    def _peer_key(self, uuid):
+        """The signing key (hex) this node holds for peer ``uuid``, or None."""
+        peer = self.peers.find_by_uuid(uuid) if self.peers is not None else None
+        if peer is None:
+            return None
+        try:
+            return _relay._signing_hex(peer).lower()
+        except Exception:
+            return None
+
+    def _is_distrusted(self, uuid, pubkey_hex):
+        """The relay gate, both directions: reputation cut ``uuid`` off, or
+        the proven key belongs to someone it cut off, or ``uuid`` is a peer we
+        know under a DIFFERENT key (an impostor). Unknown and neutral pass."""
+        uuid = str(uuid).lower()
+        key = str(pubkey_hex or '').lower()
+        if uuid in self._excluded_uuids or (key and key in self._excluded_keys):
+            return True
+        known = self._peer_key(uuid)
+        return known is not None and key != '' and known != key
+
     def handle_exclude(self, queues, message):
-        """Exclude a peer's address (reputation cut-off): its inbound
-        frames are dropped and it is filtered out of outbound targets.
-        Fed by ReputationProcess._publish_exclusion. Local IPC only."""
-        addr = self._norm_addr(getattr(message, 'obj', None))
+        """Exclude a peer (reputation cut-off): its address's inbound frames
+        are dropped and it is filtered out of outbound targets; by uuid and
+        key it is refused as a relay client and as a relay. Fed by
+        ReputationProcess._publish_exclusion. Local IPC only."""
+        if getattr(message, 'from_whom', None) is not None and \
+                str(getattr(message.from_whom, 'uuid', '')) != str(getattr(self.myself, 'uuid', '')):
+            self.logger.warning('Refusing exclude from the wire')
+            return True
+        address, uuid = self._exclusion_spec(message)
+        addr = self._norm_addr(address) if address else None
         if addr:
             self._rejected_addresses.add(addr)
             _probes.counter('net.exclude', 'add')
             self.logger.info('Reputation cut-off: excluding %s', addr)
+        if uuid:
+            self._excluded_uuids.add(uuid)
+            key = self._peer_key(uuid)
+            if key:
+                self._excluded_keys.add(key)
+            self._drop_distrusted_relays()
         return True
+
+    def _drop_distrusted_relays(self):
+        """Act on a new exclusion at once: evict a distrusted client from the
+        relay we serve, and hang up on a relay we distrust (its peers' routes
+        then fail over)."""
+        if self._relay_server is not None:
+            for uuid in list(self._relay_server.registered()):
+                if uuid in self._excluded_uuids:
+                    self._relay_server.evict(uuid)
+        for endpoint, client in list(self._relay_clients.items()):
+            if client.relay_uuid is not None and client.connected \
+                    and self._is_distrusted(client.relay_uuid, client.relay_key):
+                self.logger.warning('Relay: %s:%d (%s) is now distrusted; '
+                                    'disconnecting', endpoint[0], endpoint[1],
+                                    client.relay_uuid[:8])
+                client.close()
+
+    def _relay_client(self, endpoint):
+        client = self._relay_clients.get(endpoint)
+        if client is None:
+            client = _relay.RelayClient(
+                endpoint, self.myself,
+                lambda frm, frame, ep=endpoint:
+                    self.relay_messages.append((frame, frm, ep)),
+                logger=self.logger,
+                on_unreachable=lambda to, ep=endpoint:
+                    self.relay_unreachable.append((ep, to)),
+                on_record=lambda rid, wire:
+                    self.relay_records.append((rid, wire)),
+                on_dir=lambda frame, ep=endpoint:
+                    self.relay_dir.append((ep, frame)),
+                pin=self._relay_pins.get(endpoint),
+                distrusted=self._is_distrusted)
+            self._relay_clients[endpoint] = client
+        return client
+
+    def _pin_relay(self, endpoint, pin):
+        """Remember that ``pin`` answers at ``endpoint``. A second, DIFFERENT
+        pin for the same endpoint is refused (logged): two links disagreeing
+        on who a relay is means one of them is wrong, and the first wins."""
+        if pin is None:
+            return
+        known = self._relay_pins.get(endpoint)
+        if known is not None and known != pin:
+            self.logger.warning('Relay: %s:%d is pinned to %s already; ignoring a '
+                                'pin to %s', endpoint[0], endpoint[1],
+                                known[0][:8], pin[0][:8])
+            return
+        self._relay_pins[endpoint] = pin
+        client = self._relay_clients.get(endpoint)
+        if client is not None and client.pin != pin:
+            client.pin = pin
+            proven = client.proven_pin
+            if client.connected and proven != pin:
+                self.logger.warning('Relay: %s:%d is not the pinned relay; '
+                                    'disconnecting', endpoint[0], endpoint[1])
+                client.close()
+
+    def _announce_own_relay(self, endpoint):
+        """Tell identity that one of our own relays proved who it is, so the
+        links it mints pin that relay, and file our reachability record there
+        (a relay holds records in memory, so every registration refills it).
+        Local IPC."""
+        client = self._relay_clients.get(endpoint)
+        if client is not None and self._own_record is not None \
+                and endpoint in _relay.own_relays():
+            try:
+                client.publish(self._own_record)
+            except (OSError, ConnectionError) as err:
+                self.logger.debug('Relay: could not file our record at %s:%d (%s)',
+                                  endpoint[0], endpoint[1], err)
+        if client is not None and endpoint in _relay.own_relays():
+            for wire in list(self._own_entries.values()):
+                try:
+                    client.dir_publish(wire)
+                except (OSError, ConnectionError):
+                    pass            # filed again at the next registration
+        pin = client.proven_pin if client is not None else None
+        queues = self._relay_queues
+        if pin is None or queues is None or CfgIds.identity not in queues \
+                or endpoint not in _relay.own_relays():
+            return
+        msg = Message(CfgIds.identity, Network.relay_identity,
+                      json.dumps({'relay': '%s:%d' % endpoint,
+                                  'uuid': pin[0], 'fp': pin[1]}),
+                      to_whom=None, from_whom=None)
+        try:
+            queues[CfgIds.identity].put(msg, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.warning('Relay: identity queue full; own relay pin not sent')
+
+    def _start_relays(self):
+        """Serve as a relay (AT_RELAY) and register with our own relays
+        (AT_USE_RELAY). Registration runs in the background and a failure is
+        retried by :meth:`_maintain_relays`."""
+        for endpoint, pin in _relay.own_relay_hints():
+            self._pin_relay(endpoint, pin)
+        if _relay.relay_enabled() and self._relay_server is None:
+            try:
+                registry = None
+                if _registry.registry_enabled():
+                    registry = _registry.Registry(_registry.load_issuers(),
+                                                  distrusted=self._is_distrusted,
+                                                  logger=self.logger)
+                    self.logger.info('Registry: serving the directory (%d trusted '
+                                     'issuer(s))', len(registry.issuers))
+                self._relay_server = _relay.RelayServer(
+                    self.myself.address or '0.0.0.0', _relay.relay_port(),
+                    self.logger, identity=self.myself,
+                    distrusted=self._is_distrusted, registry=registry)
+            except OSError as err:
+                self.logger.error('Relay: cannot serve on port %d (%s)',
+                                  _relay.relay_port(), err)
+        self._maintain_relays()
+
+    #: Seconds between attempts to (re)register with one relay.
+    RELAY_RETRY_SEC = 5.0
+
+    def _relays_to_hold(self):
+        """Every relay we stay registered with: our own, and each one a peer's
+        route names -- a peer can reach us only through a relay we are
+        registered at, and it may fail over to any on its list."""
+        held = list(_relay.own_relays())
+        for route in self._relay_routes.values():
+            for endpoint in route:
+                if endpoint not in held:
+                    held.append(endpoint)
+        return held
+
+    def _maintain_relays(self):
+        """Keep our registrations alive. Without them no one can reach us
+        through a relay, and a node that only listens never sends -- so
+        "retry on the next send" would never come. Each attempt runs on its own
+        thread: a dead relay costs a connect timeout, which the network loop
+        must not wait out."""
+        now = time.monotonic()
+        for endpoint in self._relays_to_hold():
+            client = self._relay_client(endpoint)
+            if client.connected or endpoint in self._relay_connecting:
+                continue
+            if now - self._relay_last_try.get(endpoint, float('-inf')) < self.RELAY_RETRY_SEC:
+                continue
+            self._relay_last_try[endpoint] = now
+            self._relay_connecting.add(endpoint)
+            threading.Thread(target=self._connect_relay, args=(endpoint,),
+                             daemon=True, name='relay-connect').start()
+
+    def _connect_relay(self, endpoint):
+        client = self._relay_client(endpoint)
+        try:
+            client.connect()
+            self._announce_own_relay(endpoint)
+        except (OSError, ConnectionError) as err:
+            if client.refused:
+                self.logger.warning('Relay: %s:%d refused: %s', endpoint[0],
+                                    endpoint[1], client.refused)
+            else:
+                self.logger.debug('Relay: %s:%d not reachable yet (%s)',
+                                  endpoint[0], endpoint[1], err)
+        finally:
+            self._relay_connecting.discard(endpoint)
+
+    def _relay_send(self, uuid, frame):
+        """Send ``frame`` to peer ``uuid`` through its active relay, failing
+        over down its route when a relay cannot be reached. Raises
+        ConnectionError when none can."""
+        key = str(uuid).lower()
+        route = self._relay_routes.get(key) or []
+        last_err = None
+        for _ in range(len(route)):
+            endpoint = route[0]
+            try:
+                self._relay_client(endpoint).send(key, frame)
+            except (OSError, ConnectionError) as err:
+                last_err = err
+                self.logger.info('Relay: %s:%d unusable for %s (%s); trying the '
+                                 'next', endpoint[0], endpoint[1], key[:8], err)
+                route.append(route.pop(0))
+                continue
+            self._relay_last[key] = (frame, {endpoint})
+            self._relay_retry.pop(key, None)    # a new frame: the old one is moot
+            return
+        self._lookup_reach(key)
+        raise ConnectionError('no relay reaches %s (%s)' % (key[:8], last_err))
+
+    def _drain_relay_unreachable(self):
+        """A relay said it cannot reach a peer: fail over to the peer's next
+        relay and resend the frame the refusal answers. Each frame is tried at
+        most once per relay, so a peer registered nowhere ends the walk."""
+        while self.relay_unreachable:
+            endpoint, to = self.relay_unreachable.popleft()
+            route = self._relay_routes.get(to)
+            if not route or route[0] != endpoint:
+                continue            # stale: already failed over
+            route.append(route.pop(0))
+            frame, tried = self._relay_last.get(to, (None, set()))
+            if frame is None:
+                continue
+            while route[0] not in tried:
+                endpoint = route[0]
+                tried.add(endpoint)
+                try:
+                    self._relay_client(endpoint).send(to, frame)
+                    self.logger.info('Relay: %s now reached through %s:%d',
+                                     to[:8], endpoint[0], endpoint[1])
+                    break
+                except (OSError, ConnectionError):
+                    route.append(route.pop(0))
+            else:
+                rounds = self._relay_retry.get(to, (0.0, 0))[1]
+                self._lookup_reach(to)
+                if rounds < self.RELAY_RETRY_ROUNDS:
+                    self._relay_retry[to] = (time.monotonic() + self.RELAY_RETRY_SEC,
+                                             rounds + 1)
+                    self.logger.info('Relay: none of %d relay(s) reaches %s yet; '
+                                     'retrying in %.0f s', len(route), to[:8],
+                                     self.RELAY_RETRY_SEC)
+                else:
+                    self._relay_retry.pop(to, None)
+                    self.logger.warning('Relay: none of %d relay(s) reaches %s',
+                                        len(route), to[:8])
+
+    #: How many times a frame every relay refused is walked again.
+    RELAY_RETRY_ROUNDS = 3
+
+    def _retry_refused_relayed(self):
+        """Resend each frame every relay refused, once its retry is due, as a
+        fresh walk down the peer's route."""
+        now = time.monotonic()
+        for to, (due, _rounds) in list(self._relay_retry.items()):
+            if now < due:
+                continue
+            frame, _tried = self._relay_last.get(to, (None, None))
+            route = self._relay_routes.get(to)
+            if frame is None or not route:
+                self._relay_retry.pop(to, None)
+                continue
+            # Parked, not dropped, until the walk it starts ends one way or the
+            # other (a refusal re-arms it; a delivery says nothing).
+            self._relay_retry[to] = (float('inf'), _rounds)
+            endpoint = route[0]
+            try:
+                self._relay_client(endpoint).send(to, frame)
+                self._relay_last[to] = (frame, {endpoint})
+            except (OSError, ConnectionError):
+                self._relay_last[to] = (frame, {endpoint})
+                self.relay_unreachable.append((endpoint, to))
+
+    def handle_relay_route(self, queues, message):
+        """Identity says: reach peer ``uuid`` through ``relays`` (a list, in
+        preference order; ``relay``, one, is also accepted). They go ahead of
+        any the route already names. Local IPC only -- a peer must not be able
+        to reroute this node's traffic, so anything carrying a sender is
+        refused."""
+        if getattr(message, 'from_whom', None) is not None:
+            self.logger.warning('Refusing relay_route from the wire')
+            return True
+        try:
+            spec = json.loads(message.obj) if isinstance(message.obj, str) else message.obj
+            uuid = str(spec['uuid']).lower()
+            given = spec.get('relays')
+            if given is None:
+                given = [spec['relay']]
+            if not isinstance(given, list):
+                raise TypeError('relays must be a list')
+        except (KeyError, TypeError, ValueError, AttributeError):
+            self.logger.warning('relay_route: unusable request %r', message.obj)
+            return True
+        endpoints = []
+        for item in given:
+            endpoint, pin = _relay.parse_hint(str(item))
+            if endpoint is None:
+                self.logger.warning('relay_route: %r is not [uuid:fp@]host:port', item)
+            else:
+                self._pin_relay(endpoint, pin)
+                endpoints.append(endpoint)
+        if not endpoints:
+            return True
+        route = _relay.merge_endpoints(endpoints, self._relay_routes.get(uuid, []))
+        self._relay_routes[uuid] = route
+        # Register with the first now: the hello that follows goes through it.
+        # The rest are registered in the background by _maintain_relays.
+        try:
+            self._relay_client(route[0]).connect()
+            self._announce_own_relay(route[0])
+        except (OSError, ConnectionError) as err:
+            self.logger.warning('Relay: cannot register with %s:%d (%s)',
+                                route[0][0], route[0][1], err)
+        self._maintain_relays()
+        return True
+
+    def handle_reach_publish(self, queues, message):
+        """Identity hands us our own current reachability record: file it at
+        each of our relays now (and at every later registration). Local only."""
+        if getattr(message, 'from_whom', None) is not None:
+            self.logger.warning('Refusing reach_publish from the wire')
+            return True
+        try:
+            wire = json.loads(message.obj) if isinstance(message.obj, str) else message.obj
+            if not isinstance(wire, dict) or 'body' not in wire or 'sig' not in wire:
+                raise ValueError(wire)
+        except (ValueError, TypeError):
+            self.logger.warning('reach_publish: unusable record')
+            return True
+        self._own_record = wire
+        for endpoint in _relay.own_relays():
+            client = self._relay_clients.get(endpoint)
+            if client is not None and client.connected:
+                try:
+                    client.publish(wire)
+                except (OSError, ConnectionError):
+                    pass            # filed again at the next registration
+        return True
+
+    # -- the directory (network/registry.py) -------------------------------
+    #: Seconds a lookup waits for its relays before answering "not found".
+    DIR_LOOKUP_TIMEOUT = 10.0
+
+    def _local_only(self, message, verb):
+        if getattr(message, 'from_whom', None) is not None:
+            self.logger.warning('Refusing %s from the wire', verb)
+            return False
+        return True
+
+    @staticmethod
+    def _payload(message):
+        try:
+            obj = json.loads(message.obj) if isinstance(message.obj, str) else message.obj
+        except (ValueError, TypeError):
+            return {}
+        return obj if isinstance(obj, dict) else {}
+
+    def _own_registry_clients(self):
+        return [(ep, self._relay_clients[ep]) for ep in _relay.own_relays()
+                if ep in self._relay_clients and self._relay_clients[ep].connected]
+
+    def handle_dir_publish(self, queues, message):
+        """Identity hands us our own directory entry: file it at each of our
+        relays now, and at every later registration. Local only."""
+        if not self._local_only(message, Network.dir_publish):
+            return True
+        wire = self._payload(message).get('entry')
+        try:
+            from ..contacts.directory import DirectoryEntry
+            handle = DirectoryEntry.from_wire(wire).handle
+        except ValueError:
+            self.logger.warning('dir_publish: unusable entry')
+            return True
+        self._own_entries[handle] = wire
+        for _ep, client in self._own_registry_clients():
+            try:
+                client.dir_publish(wire)
+            except (OSError, ConnectionError):
+                pass
+        return True
+
+    def handle_dir_withdraw(self, queues, message):
+        if not self._local_only(message, Network.dir_withdraw):
+            return True
+        handle = str(self._payload(message).get('handle', ''))
+        self._own_entries.pop(handle, None)
+        for _ep, client in self._own_registry_clients():
+            try:
+                client.dir_withdraw(handle)
+            except (OSError, ConnectionError):
+                pass
+        return True
+
+    def handle_dir_lookup(self, queues, message):
+        """Ask every relay we are registered at for ``handle``. Local only."""
+        if not self._local_only(message, Network.dir_lookup):
+            return True
+        from ..contacts.directory import normalize_handle
+        handle = normalize_handle(self._payload(message).get('handle'))
+        if handle is None:
+            self._dir_answer(queues, str(self._payload(message).get('handle', '')),
+                             None, None, False)
+            return True
+        asked = set()
+        for endpoint, client in list(self._relay_clients.items()):
+            if client.connected:
+                try:
+                    client.dir_lookup(handle)
+                    asked.add(endpoint)
+                except (OSError, ConnectionError):
+                    pass
+        if not asked:
+            self._dir_answer(queues, handle, None, None, False)
+            return True
+        self._dir_lookups[handle] = {'asked': asked, 'answered': set(),
+                                     'limited': False, 'since': time.monotonic()}
+        return True
+
+    def _dir_answer(self, queues, handle, entry, endpoint, limited):
+        if CfgIds.identity not in queues:
+            return
+        body = {'handle': handle, 'entry': entry, 'limited': bool(limited),
+                'relay': '%s:%d' % endpoint if endpoint else ''}
+        msg = Message(CfgIds.identity, IdentityProtocol.dir_result, json.dumps(body),
+                      to_whom=None, from_whom=None)
+        try:
+            queues[CfgIds.identity].put(msg, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.warning('Registry: identity queue full; answer for %s dropped',
+                                handle)
+
+    def _drain_relay_dir(self, queues):
+        """Registry answers -> identity: a lookup's one outcome, and the
+        registry's word on our publish or withdraw."""
+        while self.relay_dir:
+            endpoint, frame = self.relay_dir.popleft()
+            op = frame.get('op')
+            handle = str(frame.get('handle', ''))
+            if op in ('dir_entry', 'dir_limited') or (
+                    op == 'dir_refused' and handle in self._dir_lookups
+                    and frame.get('reason') == 'not_registry'):
+                pending = self._dir_lookups.get(handle)
+                if pending is None or endpoint not in pending['asked']:
+                    continue
+                if op == 'dir_entry' and isinstance(frame.get('entry'), dict):
+                    del self._dir_lookups[handle]
+                    self._dir_answer(queues, handle, frame['entry'], endpoint, False)
+                    continue
+                pending['answered'].add(endpoint)
+                pending['limited'] |= op == 'dir_limited'
+                if pending['answered'] >= pending['asked']:
+                    del self._dir_lookups[handle]
+                    self._dir_answer(queues, handle, None, None, pending['limited'])
+                continue
+            if op in ('dir_published', 'dir_refused', 'dir_withdrawn') \
+                    and CfgIds.identity in queues:
+                body = {'op': op, 'handle': handle, 'relay': '%s:%d' % endpoint,
+                        'reason': str(frame.get('reason', '') or ''),
+                        'seq': frame.get('seq', 0) if isinstance(frame.get('seq'), int) else 0}
+                msg = Message(CfgIds.identity, IdentityProtocol.dir_status,
+                              json.dumps(body), to_whom=None, from_whom=None)
+                try:
+                    queues[CfgIds.identity].put(msg, block=True, timeout=self.q_cadence)
+                except Full:
+                    pass
+        now = time.monotonic()
+        for handle in [h for h, p in self._dir_lookups.items()
+                       if now - p['since'] > self.DIR_LOOKUP_TIMEOUT]:
+            pending = self._dir_lookups.pop(handle)
+            self._dir_answer(queues, handle, None, None, pending['limited'])
+
+    #: Seconds between lookups of one peer's reachability record.
+    REACH_LOOKUP_INTERVAL = 60.0
+
+    def _lookup_reach(self, uuid):
+        """We have lost ``uuid`` through every relay we know: ask each relay we
+        are registered at for its reachability record (filed under its key's
+        fingerprint). Answers go to identity, which verifies them."""
+        key = self._peer_key(uuid)
+        if not key:
+            return
+        now = time.monotonic()
+        if now - self._reach_asked.get(uuid, float('-inf')) < self.REACH_LOOKUP_INTERVAL:
+            return
+        self._reach_asked[uuid] = now
+        rid = _relay.key_fingerprint(key)
+        asked = 0
+        for client in list(self._relay_clients.values()):
+            if client.connected:
+                try:
+                    client.lookup(rid)
+                    asked += 1
+                except (OSError, ConnectionError):
+                    pass
+        if asked:
+            self.logger.info('Relay: looking up where %s is now (%d relay(s))',
+                             str(uuid)[:8], asked)
+
+    def _drain_relay_records(self, queues):
+        """Hand lookup answers to identity (the single writer of contacts),
+        which verifies each against the contact's key before using it."""
+        while self.relay_records:
+            rid, wire = self.relay_records.popleft()
+            if not isinstance(wire, dict) or CfgIds.identity not in queues:
+                continue
+            msg = Message(CfgIds.identity, IdentityProtocol.reach_record,
+                          json.dumps(wire), to_whom=None, from_whom=None)
+            try:
+                queues[CfgIds.identity].put(msg, block=True, timeout=self.q_cadence)
+            except Full:
+                self.logger.warning('Relay: identity queue full; record %s dropped',
+                                    rid[:8])
+
+    def _drain_relayed(self, queues, budget):
+        """Hand relayed frames to the same parse-and-route paths UDP uses,
+        attributing each by the uuid the RELAY stamped, not by an address."""
+        drained = 0
+        while drained < budget and self.relay_messages:
+            frame, frm, endpoint = self.relay_messages.popleft()
+            drained += 1
+            # Replies go back the way this came: that relay becomes the
+            # active one, ahead of the rest of the route.
+            self._relay_routes[frm] = _relay.merge_endpoints(
+                [endpoint], self._relay_routes.get(frm, []))
+            try:
+                peer = self.peers.find_by_uuid(_uuid_mod.UUID(frm))
+            except ValueError:
+                continue
+            if peer is not None:
+                fmt = self._wire_format_for_addr(peer.address)
+                try:
+                    plain = self.myself.decrypt(frame, peer)
+                except Exception:
+                    if not self._accept_unencrypted(frame, peer, queues,
+                                                    wire_format=fmt):
+                        self.logger.error('Relay: frame from %s neither decrypts '
+                                          'nor is an unencrypted verb', frm[:8])
+                    continue
+                if self._relay_live.get(frm) != endpoint:
+                    # Once per change, so an operator can see which relay
+                    # carries a peer, and when it failed over.
+                    self._relay_live[frm] = endpoint
+                    self.logger.info('Relay: %s is talking to us through %s:%d',
+                                     frm[:8], endpoint[0], endpoint[1])
+                self._msg_to_queue(plain, peer, queues, 'relay', wire_format=fmt)
+                continue
+            # A sender we do not know yet: only plaintext can be read (the
+            # first-contact hello). The envelope must name the sender the relay
+            # vouched for -- the relay cannot forge `from`, so neither may the
+            # frame.
+            try:
+                probe = Message.parse(frame, None, validate=False)
+                claimed = str(getattr(probe.from_whom, 'uuid', '')).lower()
+            except Exception:
+                self.logger.debug('Relay: unreadable frame from unknown %s', frm[:8])
+                continue
+            if claimed != frm:
+                self.logger.warning('Relay: frame from %s claims to be %s; '
+                                    'dropped', frm[:8], claimed[:8])
+                continue
+            try:
+                self._msg_to_queue(frame, 'relay:' + frm, queues, 'relay',
+                                   validate=False, opaque=True)
+            except (UnicodeDecodeError, WireFormatMismatch):
+                self.logger.debug('Relay: undecodable frame from unknown %s', frm[:8])
+        return drained
 
     def handle_readmit(self, queues, message):
         """Reverse an exclusion (explicit rehabilitation). Local IPC."""
-        addr = self._norm_addr(getattr(message, 'obj', None))
+        if getattr(message, 'from_whom', None) is not None and \
+                str(getattr(message.from_whom, 'uuid', '')) != str(getattr(self.myself, 'uuid', '')):
+            self.logger.warning('Refusing readmit from the wire')
+            return True
+        address, uuid = self._exclusion_spec(message)
+        addr = self._norm_addr(address) if address else None
         if addr:
             self._rejected_addresses.discard(addr)
             _probes.counter('net.exclude', 'remove')
             self.logger.info('Reputation readmit: %s', addr)
+        if uuid:
+            self._excluded_uuids.discard(uuid)
+            key = self._peer_key(uuid)
+            if key:
+                self._excluded_keys.discard(key)
         return True
 
     _PARTITION_SIGNAL_COOLDOWN = 5.0  # seconds, per from_addr
@@ -950,11 +1600,18 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 pass
         self._init_transport()
         self.start_receivers(queues)
+        self._relay_queues = queues
+        self._start_relays()
         threading.Thread(target=self.unknown_receiver, daemon=True).start()
         threading.Thread(target=self.mystery_handler, args=(queues,), daemon=True).start()
         while self.keep_running(signal):
             try:
                 self.reap_idle_conns()
+                self._maintain_relays()
+                self._drain_relay_unreachable()
+                self._retry_refused_relayed()
+                self._drain_relay_records(queues)
+                self._drain_relay_dir(queues)
                 if self.diplomat:
                     if self.ping_at_server is None:
                         self.ping_at_server = PingATServer(self.net_cfg.ip4, self.logger)
@@ -1115,11 +1772,24 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                         msg = self.myself.encrypt(wire, who)
                                     else:
                                         msg = wire
+                                    route = self._relay_routes.get(str(who.uuid).lower())
                                     try:
-                                        self.send_peer(msg, address)
+                                        if route:
+                                            # Behind a relay: the frame is
+                                            # already sealed for `who`.
+                                            self._relay_send(who.uuid, msg)
+                                        else:
+                                            self.send_peer(msg, address)
                                         self.track_send_stats(who.uuid, len(msg))
                                     except TransmissionError as err:
                                         self.logger.error('Network: %s', err)
+                                        self.track_send_error(who.uuid)
+                                    except (OSError, ConnectionError) as err:
+                                        # Only a relayed send is caught here; a
+                                        # direct one raises as it always has.
+                                        if not route:
+                                            raise
+                                        self.logger.error('Network: relay: %s', err)
                                         self.track_send_error(who.uuid)
                         except BrokenPipeError as err:
                             self.logger.error('Network: %s', err)
@@ -1229,6 +1899,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                             # clock step cannot age the queue out at once.
                             self.encrypted_messages.append((raw_msg, from_addr, time.monotonic()))
                 total_inbound += drained_ptp
+                total_inbound += self._drain_relayed(queues, INBOUND_BUDGET)
 
                 # async recv group messages
                 drained_grp = 0

@@ -39,6 +39,7 @@
 #include "identity/identity.h"
 #include "identity/group.h"
 #include "identity/id_proc_priv.h"
+#include "identity/identity_priv.h"
 #include "structures/array.h"
 #include "structures/data.h"
 #include "structures/map.h"
@@ -81,9 +82,12 @@ static process_t *_mk_process(identity_t *self)
     return proc;
 }
 
-/* Every GROUP message sent to the network queue, the last one kept. */
+/* Every GROUP message sent to the network queue, the last one kept, and the
+ * uuids of every PEER message sent there. */
 static int g_group_to_net;
 static group_t g_last_group;
+static int g_peers_to_net;
+static uuid_t g_peer_uuids[8];
 
 static int _hook(const char *key, const message_type_t type,
                  generic_msg_t *msg, bool blocking)
@@ -93,7 +97,37 @@ static int _hook(const char *key, const message_type_t type,
         g_last_group = msg->info.group;
         g_group_to_net++;
     }
+    if (type == PEER && key != NULL && strcmp(key, "network") == 0
+        && g_peers_to_net < 8)
+        uuid_copy(g_peer_uuids[g_peers_to_net++], msg->info.peer.uuid);
     return 0;
+}
+
+static bool _told_network(const public_identity_t *p)
+{
+    for (int i = 0; i < g_peers_to_net; i++)
+        if (uuid_compare(g_peer_uuids[i], p->uuid) == 0)
+            return true;
+    return false;
+}
+
+/* [group, steps, peers], a full_history as the welcomer sends it. */
+static json_t *_history(const group_t *mesh, const public_identity_t *const *peers,
+                        size_t n)
+{
+    json_t *g_json = NULL;
+    ck_assert_ret_ok(group_to_json(mesh, &g_json));
+    json_t *arr = json_array();
+    for (size_t i = 0; i < n; i++) {
+        json_t *pj = NULL;
+        ck_assert_ret_ok(public_identity_to_json(peers[i], &pj));
+        json_array_append_new(arr, pj);
+    }
+    json_t *hist = json_array();
+    json_array_append_new(hist, g_json);
+    json_array_append_new(hist, json_array());
+    json_array_append_new(hist, arr);
+    return hist;
 }
 
 DEFINE_TEST(test_a_group_adopted_from_history_reaches_the_network)
@@ -139,5 +173,52 @@ DEFINE_TEST(test_a_group_adopted_from_history_reaches_the_network)
 }
 END_TEST_DEFINITION()
 
+DEFINE_TEST(test_a_joiner_learns_every_member_from_every_history)
+{
+    /* ISSUES.md §2.23: a joiner took the group from its histories and never the
+     * members, so it knew only the members that had sent it a history. Here ada
+     * welcomed it listing bob, and bob welcomed it listing ada; amy, who learned
+     * of the admission by a confirm, sent nothing. Both histories name amy, so
+     * the joiner must learn all three, and tell the NETWORK about each: that
+     * PEER message is what lets net_proc place a member's address, without which
+     * every encrypted frame from it is deferred forever. */
+    identity_t *me = _mk_identity("10.0.0.9", "ben");
+    process_t *proc = _mk_process(me);
+    identity_reset_state();
+    g_group_to_net = 0;
+    g_peers_to_net = 0;
+
+    identity_t *ada = _mk_identity("10.0.0.1", "ada");
+    identity_t *amy = _mk_identity("10.0.0.2", "amy");
+    identity_t *bob = _mk_identity("10.0.0.3", "bob");
+    public_identity_t *p_ada = NULL, *p_amy = NULL, *p_bob = NULL;
+    ck_assert_ret_ok(identity_publish(ada, &p_ada));
+    ck_assert_ret_ok(identity_publish(amy, &p_amy));
+    ck_assert_ret_ok(identity_publish(bob, &p_bob));
+
+    group_t mesh = {0};
+    ck_assert_ret_ok(group_init(NULL, (char *)"10.0.0.1", &mesh));
+    const public_identity_t *from_ada[] = { p_amy, p_bob };
+    const public_identity_t *from_bob[] = { p_ada, p_amy };
+    identity_stash_history(_history(&mesh, from_ada, 2));
+    identity_stash_history(_history(&mesh, from_bob, 2));
+
+    directory_t queues;
+    ck_assert_ret_ok(array_init(&queues));
+    ck_assert_ret_ok(array_append(&queues, string_data(strdup("identity"), 8)));
+    ck_assert_ret_ok(array_append(&queues, string_data(strdup("network"), 7)));
+    messaging_set_test_hook(_hook);
+
+    ck_assert(identity_adopt_group_from_histories(proc, &queues));
+
+    ck_assert_int_eq((int)proc->protocol.num_peers, 3);
+    ck_assert(_told_network(p_ada));
+    ck_assert(_told_network(p_amy));
+    ck_assert(_told_network(p_bob));
+    messaging_set_test_hook(NULL);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(GroupAdopt,
-          test_a_group_adopted_from_history_reaches_the_network)
+          test_a_group_adopted_from_history_reaches_the_network,
+          test_a_joiner_learns_every_member_from_every_history)

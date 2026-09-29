@@ -528,7 +528,18 @@ typedef struct {
     int fork;      /**< fork index, or -1 */
     int dropped;   /**< our committed entries removed */
     int added;     /**< peer entries loaded */
+    /** Copies of the @ref dropped entries, in chain order, or NULL when none
+     *  were dropped. Owned by the result: release it with
+     *  tx_reconcile_result_free. What an adoption drops is what this node's
+     *  caller re-proposes (its own half of each), so a partition's losing
+     *  island keeps the reputation it earned (Agora Phase 4 DDIL). Mirrors
+     *  Python's ReconcileResult.dropped. */
+    transaction_t *dropped_entries;
 } tx_reconcile_result_t;
+
+/** Free what a reconcile result owns (its dropped_entries). Safe on a result
+ *  that owns nothing, and idempotent. */
+void tx_reconcile_result_free(tx_reconcile_result_t *res);
 
 /** Reconcile @p hist with a peer's reported chain @p arr by the LONGEST
  *  VERIFIED CHAIN rule (ISSUES.md §2.15). Entries are taken verbatim. Nothing

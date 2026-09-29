@@ -81,7 +81,7 @@ class Contact(Configuration):
 
     def __init__(self, identity, petname='', rendezvous=None, verified=False,
                  provenance=Provenance.token, trust_seed=0.0,
-                 added_at=0.0, verified_at=0.0, nonce=''):
+                 added_at=0.0, verified_at=0.0, nonce='', reach_seq=0):
         super().__init__()
         # The trust root. Force public-only so we can never persist private
         # key material by accident (publish() is idempotent on a public copy).
@@ -107,6 +107,9 @@ class Contact(Configuration):
         self.verified_at = float(verified_at)
         # The originating invitation nonce, kept for audit / replay-correlation.
         self.nonce = nonce
+        # The highest reachability-record sequence applied (contacts/reach.py):
+        # a record at or below it is a replay and is refused.
+        self.reach_seq = int(reach_seq or 0)
 
     @property
     def uuid(self):
@@ -135,7 +138,7 @@ class Contact(Configuration):
     # config __type__ encoder, which C cannot parse). This is what makes a
     # contacts.cfg.json written by either runtime loadable by the other.
     def to_canonical(self):
-        return {
+        d = {
             'identity': public_identity_to_canonical(self.identity),
             'petname': self.petname,
             'verified': bool(self.verified),
@@ -146,6 +149,11 @@ class Contact(Configuration):
             'added_at': float(self.added_at),
             'verified_at': float(self.verified_at),
         }
+        # Only once set, so a store with no records applied is byte-identical
+        # to one written before records existed.
+        if self.reach_seq:
+            d['reach_seq'] = int(self.reach_seq)
+        return d
 
     @classmethod
     def from_canonical(cls, d):
@@ -169,7 +177,8 @@ class Contact(Configuration):
                    trust_seed=float(d.get('trust_seed', 0.0) or 0.0),
                    added_at=float(d.get('added_at', 0.0) or 0.0),
                    verified_at=float(d.get('verified_at', 0.0) or 0.0),
-                   nonce=d.get('nonce', '') or '')
+                   nonce=d.get('nonce', '') or '',
+                   reach_seq=int(d.get('reach_seq', 0) or 0))
 
     def __repr__(self):
         state = 'verified' if self.verified else 'UNVERIFIED'

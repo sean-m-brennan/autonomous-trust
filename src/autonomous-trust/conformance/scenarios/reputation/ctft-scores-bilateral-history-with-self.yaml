@@ -1,0 +1,71 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: ctft-scores-bilateral-history-with-self
+byte_pinning: false
+description: |
+    Pins contrite tit-for-tat against the scorer's OWN bilateral history.
+
+    Contrite TFT reads only the transactions between the scoring node and the
+    peer, so it needs the scorer's own uuid. C passed an all-zero uuid for
+    it, so no transaction ever matched and every peer scored as having no
+    history (the prereputation prior). The whole corpus passed anyway: no
+    scenario seeded a transaction with the scorer as a party while in CTFT
+    mode.
+
+    bob's history holds two transactions between bob and subject:
+
+        t-b1: subject is p1 (scored 0.8), bob is p2 (scored 0.9)
+        t-b2: bob is p1 (scored 0.9), subject is p2 (scored 0.7)
+
+    subject's side: [0.8, 0.7], last 0.7 >= 0.5 (cooperated), so
+    score = max(0.51, (0.8 + 0.7) / 2) = 0.75. With the scorer's uuid lost,
+    neither transaction is bilateral and the prior answers instead.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: oracle
+  - id: subject
+    role: subject
+
+fixtures:
+  tx_history:
+    bob:
+      - task_id: t-b1
+        p1: subject
+        p1_score: 0.8
+        p2: bob
+        p2_score: 0.9
+      - task_id: t-b2
+        p1: bob
+        p1_score: 0.9
+        p2: subject
+        p2_score: 0.7
+
+  reputations:
+    bob:
+      # Below COOP_ENTER (0.55): the CTFT branch.
+      subject: 0.2
+
+  coop_mode:
+    bob:
+      subject: false
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: request reputation
+    payload:
+      target: subject
+      proc: negotiation
+    description: |
+        alice asks bob for subject's reputation; bob scores it by CTFT over
+        the two transactions it took part in.
+
+expected_state:
+  bob:
+    reputation_of:
+      subject: 0.75

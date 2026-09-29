@@ -65,6 +65,28 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
 void _retry_nacked_rounds(const process_t *proc, double present,
                           const uuid_t self_uuid, bool have_self);
 
+/** Re-propose every half of OURS still not in the chain REP_COMMIT_TIMEOUT
+ *  (AT_REP_COMMIT_TIMEOUT_SEC, default 15 s) after it was last proposed, up to
+ *  REP_COMMIT_RETRIES times, then give it up with a warning (ISSUES §2.24). A
+ *  granted round whose transaction never commits, and a round nobody answers,
+ *  are otherwise lost for good. Called once per pass from reputation_run's
+ *  loop; @p present is a parameter so a test can advance the clock. */
+void _retry_uncommitted_halves(const process_t *proc, double present);
+
+/** Test seam: how many of our halves are waiting to reach the chain. */
+size_t reputation_awaiting_commit_count(void);
+
+/** Co-sign every parked checkpoint proposal whose range our chain now holds
+ *  with the proposed root, and drop those parked longer than one checkpoint
+ *  interval (ISSUES §2.29). A proposal is parked when it arrives before our
+ *  chain has caught up to the proposer's. Called once per pass from
+ *  reputation_run's loop; @p present is a parameter so a test can advance the
+ *  clock. Returns how many were co-signed. */
+size_t _recheck_parked_cosigns(const process_t *proc, double present);
+
+/** Test seam: how many checkpoint proposals are parked for a later co-sign. */
+size_t reputation_parked_cosign_count(void);
+
 /** Toggle synchronous-dispatch mode for the conformance harness.
  *  When enabled, handle_nack emits a retry "ask permission" inline to
  *  broadcast (Python parity — Python's _try_again thread is inlined
@@ -180,6 +202,13 @@ void reputation_force_checkpoint(const process_t *proc,
 /** Read the count of granted Paxos rounds for the
  *  `requests_count` expected_state assertion. */
 int reputation_get_request_count(void);
+
+/** This node's own rounds under way (rep_state.my_requests): each one's task
+ *  and score, at most @p cap of them, for the `proposed_tasks` expected_state
+ *  assertion (the re-proposal an adoption makes, Agora Phase 4 DDIL). Returns
+ *  how many were written, or -1 if state is uninitialized. Mirrors the Python
+ *  adapter reading process.my_requests. */
+int reputation_get_my_request_tasks(uuid_t *tasks, double *scores, int cap);
 
 /** Read the current Paxos `last_id` for the `last_id_set`
  *  expected_state assertion. Returns 0 if state is uninitialized OR

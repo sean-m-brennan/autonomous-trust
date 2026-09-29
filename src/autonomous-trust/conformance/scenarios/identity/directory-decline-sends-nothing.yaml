@@ -1,0 +1,60 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: directory-decline-sends-nothing
+byte_pinning: false
+description: |
+    Alice's app declines. Nothing goes back: a refusal Bob could see would tell
+    him more than silence does. The request is no longer held.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  # Strangers, each alone in a cohort: nobody here is a peer of anybody.
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000d0700"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000d0701"
+      size: 1
+
+steps:
+  - id: 1
+    from: alice
+    to: alice
+    function: trigger_directory_publish
+    payload:
+      handle: alice@example.org
+    description: |
+        Pseudo-step: Alice's app publishes her handle through the production
+        app_directory_publish, with an attestation from the harness issuer.
+  - id: 2
+    from: bob
+    to: alice
+    function: first_contact_request
+    payload:
+      handle: alice@example.org
+      nonce: 07c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0
+    description: |
+        Bob found Alice's entry and asks, signed by his own key. Plaintext: neither
+        is a peer of the other yet.
+  - id: 3
+    from: alice
+    to: alice
+    function: trigger_directory_decline
+    payload:
+      ref: 07c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0
+    description: |
+        Pseudo-step: Alice's app declines.
+
+expected_state:
+  alice:
+    directory_requests_held: 0
+    directory_accepts_emitted: 0

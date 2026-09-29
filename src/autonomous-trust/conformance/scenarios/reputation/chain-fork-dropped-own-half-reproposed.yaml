@@ -1,0 +1,48 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: chain-fork-dropped-own-half-reproposed
+byte_pinning: false
+description: |
+    An adoption drops our committed entries from the fork on, both halves of
+    each (the LONGEST VERIFIED CHAIN rule, ISSUES.md §2.15). Across a partition
+    that is every transaction the smaller island committed while split, lost at
+    the heal. So the node re-proposes ITS OWN half of each dropped entry through
+    the normal round, and the counterpart does the same with its half (Agora
+    Phase 4 DDIL, 2026-09-25).
+
+    dave's entry x is his own (he is p1, score 0.2). alice's longer chain wins
+    and x is dropped; dave now has exactly one round of his own under way, for x,
+    carrying the score he gave.
+
+participants:
+  - id: alice
+    role: provider
+  - id: dave
+    role: consumer
+
+fixtures:
+  local_chain:
+    dave:
+      - {task: a, p1: 0.7, p2: 0.5}
+      - {task: b, p1: 0.9, p2: 0.3}
+      - {task: x, p1_id: dave, p1: 0.2, p2: 0.4}
+
+steps:
+  - id: 1
+    from: alice
+    to: dave
+    function: latest update
+    payload:
+      chain:
+        - {task: a, p1: 0.7, p2: 0.5}
+        - {task: b, p1: 0.9, p2: 0.3}
+        - {task: c, p1: 0.6, p2: 0.4}
+        - {task: d, p1: 0.8, p2: 0.8}
+    description: |
+        alice forks from dave at index 2 and is one entry longer.
+
+expected_state:
+  dave:
+    committed_tx_count: 4
+    proposed_tasks: {x: 0.2}

@@ -159,13 +159,84 @@ def test_hello_rejects_malformed(alice, bob):
 
 
 # -- handle_hello_ack (initiator side) --------------------------------------
+def _pending_hello(proc, inviter, nonce='n1', **kw):
+    """Have ``proc`` send a hello to ``inviter``, as an ack must answer one."""
+    invite = create_invitation(inviter, ttl_seconds=3600, nonce=nonce)
+    q = {CfgIds.network: queue.Queue()}
+    fc.initiate(proc, q, invite.encode(), **kw)
+    q[CfgIds.network].get_nowait()          # the hello itself
+    return q
+
+
 def test_ack_admits_direct_peer(alice, bob):
     proc = StubProc(bob)   # Bob's node
-    q = {CfgIds.network: queue.Queue()}
-    from autonomous_trust.core.config.configuration import to_json_string
+    q = _pending_hello(proc, alice, nonce='x')
     assert fc.handle_hello_ack(proc, q, _inbound(alice, to_json_string({'nonce': 'x'}))) is True
     assert proc.peers.find_by_uuid(alice.uuid) is not None
     assert proc.record_peers_calls == 1
+
+
+# -- the ack gate: only an answer to a hello WE sent ------------------------
+def test_an_unsolicited_ack_admits_nobody(alice, bob):
+    """The gap this gate closes: a plaintext ack from a stranger reaches the
+    handler (the unknown-sender path has no verb filter), and used to make the
+    stranger a direct peer with no ticket at all."""
+    proc = StubProc(bob)
+    q = {CfgIds.network: queue.Queue()}
+    fc.handle_hello_ack(proc, q, _inbound(alice, to_json_string({'nonce': 'x'})))
+    assert proc.peers.find_by_uuid(alice.uuid) is None
+    assert proc.record_peers_calls == 0
+    assert _stored(alice.uuid) is None
+
+
+def test_an_ack_from_someone_else_admits_nobody(alice, bob):
+    mallory = _identity('mallory@ex', '10.0.0.66')
+    proc = StubProc(bob)
+    q = _pending_hello(proc, alice, nonce='x')
+    fc.handle_hello_ack(proc, q, _inbound(mallory, to_json_string({'nonce': 'x'})))
+    assert proc.peers.find_by_uuid(mallory.uuid) is None
+
+
+def test_an_ack_under_the_inviters_uuid_but_another_key_admits_nobody(alice, bob):
+    """The envelope is verified against the identity it carries, so a forger
+    can name Alice's uuid and still sign correctly -- with its own key."""
+    proc = StubProc(bob)
+    q = _pending_hello(proc, alice, nonce='x')
+    from autonomous_trust.core.identity import Signature, Encryptor
+    forged = Identity(alice.uuid, '10.0.0.66', 'alice@ex', Signature.generate(),
+                      Encryptor.generate(), 'alice@ex', False).publish()
+    fc.handle_hello_ack(proc, q, types.SimpleNamespace(
+        from_whom=forged, obj=to_json_string({'nonce': 'x'})))
+    assert proc.peers.find_by_uuid(alice.uuid) is None
+    # ...and the real ack still lands afterwards: a forgery does not burn it.
+    fc.handle_hello_ack(proc, q, _inbound(alice, to_json_string({'nonce': 'x'})))
+    assert proc.peers.find_by_uuid(alice.uuid) is not None
+
+
+def test_an_ack_with_the_wrong_nonce_admits_nobody(alice, bob):
+    proc = StubProc(bob)
+    q = _pending_hello(proc, alice, nonce='x')
+    fc.handle_hello_ack(proc, q, _inbound(alice, to_json_string({'nonce': 'y'})))
+    assert proc.peers.find_by_uuid(alice.uuid) is None
+
+
+def test_a_late_ack_admits_nobody(alice, bob, monkeypatch):
+    proc = StubProc(bob)
+    q = _pending_hello(proc, alice, nonce='x')
+    real = fc.time.time
+    monkeypatch.setattr(fc.time, 'time',
+                        lambda: real() + fc.PENDING_TTL_SECONDS + 1)
+    fc.handle_hello_ack(proc, q, _inbound(alice, to_json_string({'nonce': 'x'})))
+    assert proc.peers.find_by_uuid(alice.uuid) is None
+
+
+def test_an_ack_is_honored_once(alice, bob):
+    proc = StubProc(bob)
+    q = _pending_hello(proc, alice, nonce='x')
+    fc.handle_hello_ack(proc, q, _inbound(alice, to_json_string({'nonce': 'x'})))
+    assert proc.record_peers_calls == 1
+    fc.handle_hello_ack(proc, q, _inbound(alice, to_json_string({'nonce': 'x'})))
+    assert proc.record_peers_calls == 1     # the pending entry was consumed
 
 
 # -- endpoint resolution ----------------------------------------------------
@@ -342,7 +413,7 @@ def test_hello_records_an_unverified_contact(alice, bob):
 
 def test_ack_records_the_inviter(alice, bob):
     proc = StubProc(bob)
-    q = {CfgIds.network: queue.Queue()}
+    q = _pending_hello(proc, alice, nonce='n1')
 
     fc.handle_hello_ack(proc, q, _inbound(alice, to_json_string({'nonce': 'n1'})))
 

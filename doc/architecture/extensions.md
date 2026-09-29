@@ -71,6 +71,7 @@ and reads or writes the payload through `AT_MSG_EXT(msg, T)`.
 | 1000–1999 | social (Agora's `at-social/c/social/social_msg_types.h`, 1000–1011 used) |
 | 2000–2099 | ZTA (`zta/zta_msg_types.h`, 2000–2001 used) |
 | 2100–2199 | fleet (reserved) |
+| 2200–2219 | first contact (`identity/first_contact.h`, 2200–2201 used: `FIRST_CONTACT_EVENT`, `FIRST_CONTACT_CONTACT_EVENT`) |
 
 Registration refuses an id outside the extension ranges, a duplicate id, a
 duplicate name, a name the core already uses, a zero or oversized payload, and
@@ -97,7 +98,23 @@ What the registry drives:
 `at_route_extern_msg` forwards a `NET_MESSAGE` only when its `function` is a
 known verb, each to one fixed process. The core's own verbs are hard-wired
 there. A feature adds its verbs with `AT_APP_VERB_REGISTER(tag, verb, target)`.
-The social feature registers its 18 verbs, all to `identity`.
+The social feature registers its 18 verbs, all to `identity`; first contact
+registers seven (`app_first_contact_invite`, `_initiate`, and the address book's
+`_safety_number`, `_verify`, `_list`, `_rename`, `_remove`), also to `identity`. A registered verb reaches its process, but that says nothing about
+who sent it. An app verb and a peer's message are both `NET_MESSAGE`s
+dispatched by name, so each handler must still refuse a frame from the wire
+with `identity_is_local_app_verb`, or an admitted peer could make this node act
+on its behalf.
+
+Python has the same allowlist in `app_verbs.py`. An app puts an `AppRequest`
+on the node's control queue; the main loop forwards it only when an ENABLED
+extension lists its verb in `Extension.app_verbs`, and only to the process
+named there, rebuilt with no `from_whom` so the handler's `is_local_app_verb`
+reads it as local. The other direction is `AppEvent`: any instance a process
+puts on `CfgIds.main` is forwarded to the app's feedback queue, the Python
+counterpart of registering a type `app_bound`. The core's
+`app_roster_request` predates both and stays hard-wired, because it fans out to
+more than one process.
 
 ## App events (`app_events.h`, `at_agora.h`, `app_events_registry.h`)
 
@@ -130,7 +147,8 @@ four build configs. Those are the numbers the foreign mirrors assert.
 | 0–3 | core |
 | 4–15 | Agora (`at_agora.h`), grandfathered; Agora appends into 16–99 |
 | 100–199 | future core kinds |
-| 1000– | further features, one block each |
+| 1000–1099 | first contact (`at_first_contact.h`, 1000–1008 used) |
+| 1100– | further features, one block each |
 
 A feature's public header (`at_agora.h`, installed only by a build with social)
 carries its kinds, flat payload structs and **kind-checked accessors**:

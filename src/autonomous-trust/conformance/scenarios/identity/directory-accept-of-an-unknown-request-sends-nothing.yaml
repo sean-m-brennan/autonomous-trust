@@ -1,0 +1,60 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: directory-accept-of-an-unknown-request-sends-nothing
+byte_pinning: false
+description: |
+    Alice's app accepts a ref that names no held request. Nothing is sent, and
+    the request that IS held stays held for the app.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  # Strangers, each alone in a cohort: nobody here is a peer of anybody.
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000d0800"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000d0801"
+      size: 1
+
+steps:
+  - id: 1
+    from: alice
+    to: alice
+    function: trigger_directory_publish
+    payload:
+      handle: alice@example.org
+    description: |
+        Pseudo-step: Alice's app publishes her handle through the production
+        app_directory_publish, with an attestation from the harness issuer.
+  - id: 2
+    from: bob
+    to: alice
+    function: first_contact_request
+    payload:
+      handle: alice@example.org
+      nonce: 08c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0
+    description: |
+        Bob found Alice's entry and asks, signed by his own key. Plaintext: neither
+        is a peer of the other yet.
+  - id: 3
+    from: alice
+    to: alice
+    function: trigger_directory_accept
+    payload:
+      ref: 88c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0
+    description: |
+        Pseudo-step: an accept naming a request nobody made.
+
+expected_state:
+  alice:
+    directory_requests_held: 1
+    directory_accepts_emitted: 0

@@ -43,7 +43,7 @@ the picture and the narration are saying two different things at once.
 
 ## Outro / punchline
 
-Wordmark **AutonomousTrust** over the settled mesh, and *Trust as a live value.*
+Wordmark **AutonomousTrust** over the settled mesh, and *For dynamically cooperative machines.*
 
 ## User flow worth showing
 
@@ -152,7 +152,7 @@ for what the voice actually carries. Transcribed from the WAVs
 1. *"Four federal agencies. One hurricane. And a live data feed nobody has time to verify."*
 2. *"They find each other and build a trust graph. No policy server to call. No certificate authority to ask."* — loses "Every decision happens at the node."
 3. *"Then one of them starts reporting temperatures that don't match its neighbors. Cross-source validation notices."* — loses "Nobody flags it."
-4. *"Its reputation falls through the threshold, and the network drops it. No operator approved that."* — loses "That is the whole claim."
+4. *"Its reputation falls through the threshold, and the network drops it. No operator necessary."* — loses "That is the whole claim."
 5. *"A new peer joins moments later and starts at zero."*
 6. *"Trust here is not a yes or a no. It is a dial re-earned continuously."*
 7. *"AutonomousTrust. Cooperative computing for machines that cannot phone home."*
@@ -225,15 +225,15 @@ scene lengths above.
 **Final duration: 44.0s.** Seven Kokoro clips (`am_michael`, speed 0.96) totalling
 37.61s of speech, plus ~0.65s of breathing room between each line.
 
-| Clip | Measured | Starts at | Ends |
-|---|---|---|---|
-| `vo-1-hook` | 5.715s | 1.00 | 6.72 |
-| `vo-2-mesh` | 6.604s | 7.64 | 14.24 |
-| `vo-3-divergence` | 6.370s | 14.92 | 21.29 |
-| `vo-4-exclusion` | 5.905s | 21.95 | 27.86 |
-| `vo-5-rejoin` | 3.284s | 28.50 | 31.78 |
-| `vo-6-gradient` | 4.780s | 32.40 | 37.18 |
-| `vo-7-lockup` | 4.956s | 37.90 | 42.86 |
+| Clip              | Measured | Starts at | Ends  |
+| ----------------- | -------- | --------- | ----- |
+| `vo-1-hook`       | 5.715s   | 1.00      | 6.72  |
+| `vo-2-mesh`       | 6.604s   | 7.64      | 14.24 |
+| `vo-3-divergence` | 6.370s   | 14.92     | 21.29 |
+| `vo-4-exclusion`  | 5.905s   | 21.95     | 27.86 |
+| `vo-5-rejoin`     | 3.284s   | 28.50     | 31.78 |
+| `vo-6-gradient`   | 4.780s   | 32.40     | 37.18 |
+| `vo-7-lockup`     | 4.956s   | 37.90     | 42.86 |
 
 Scene spans that follow from those clips: hook 0–7.3 · mesh 7.3–14.2 ·
 divergence 14.2–21.3 · exclusion 21.3–28.4 · re-entry 28.4–32.1 ·
@@ -270,8 +270,10 @@ and the closing tagline remain on screen and the voice says neither.
 ### Deliverables
 
 - `brag.mp4` — 1920x1080, 44.0s, h264 + AAC, 3.5 MB
-- `brag.jpg` — poster pulled at 20.3s (the settled divergence frame), baked as
-  frame 0 of the MP4 so every platform's thumbnail grabber picks it up
+- `brag.jpg` — poster pulled at 20.3s (the settled divergence frame) and
+  attached to the MP4 as cover art (an `attached_pic` mjpeg stream), so every
+  platform's thumbnail grabber picks it up. `build.sh` does this on a stream
+  copy, so it costs no re-encode
 - `composition-brief.md`, `share-copy.txt`, `composition/`
 
 `hyperframes check`: **0 errors**, 137/137 text checks pass WCAG AA. The one

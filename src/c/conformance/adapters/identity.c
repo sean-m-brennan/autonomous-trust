@@ -58,6 +58,7 @@
 # (doc/architecture/zta-integration.md) */
 #endif
 #include "network/net_message.h"
+#include "contacts/reach.h"
 #include "processes/processes.h"
 #include "structures/array.h"
 #include "structures/map.h"
@@ -67,6 +68,10 @@
 #include <math.h>
 #include "contacts/contacts.h"
 #include "identity/first_contact.h"
+#include "identity/directory_contact.h"
+#include "network/network.h"            /* NET_ID_DIR_RESULT */
+#include "contacts/directory.h"
+#include "at_first_contact.h"
 
 #include "../negative_runner.h"
 #include "../scenario_engine.h"
@@ -120,6 +125,49 @@ static const char *_resolve_to_id(const generic_msg_t *msg) {
         }
     }
     return "unknown";
+}
+
+
+/* -- finding someone by handle (identity/directory_contact.h) --------------- */
+
+/* The holder's issuer-attested directory entry for @p handle, from the
+ * harness issuer (seed 0x44..., Python _DIR_ISSUER_SEED). Nothing checks the
+ * issuer on these paths (only a registry does). @p att_wire (may be NULL)
+ * receives the attestation's wire form. */
+static int _ic_dir_entry(const identity_t *holder, const char *handle,
+                         at_dir_signed_t *entry, json_t **att_wire)
+{
+    unsigned char seed[32], pk[crypto_sign_PUBLICKEYBYTES];
+    unsigned char sk[crypto_sign_SECRETKEYBYTES];
+    memset(seed, 0x44, sizeof(seed));
+    crypto_sign_seed_keypair(pk, sk, seed);
+    char key[2 * crypto_sign_PUBLICKEYBYTES + 1];
+    sodium_bin2hex(key, sizeof(key), holder->signature.public, crypto_sign_PUBLICKEYBYTES);
+    at_dir_signed_t att;
+    int rc = at_dir_attest(sk, handle != NULL ? handle : "", key,
+                           (long)time(NULL) + 3600, &att);
+    sodium_memzero(sk, sizeof(sk));
+    if (rc != AT_DIR_OK)
+        return rc;
+    rc = at_dir_create_entry(holder, &att, 1, AT_DIR_VISIBILITY_ANYONE, 0,
+                             (double)time(NULL), entry);
+    if (rc == AT_DIR_OK && att_wire != NULL)
+        *att_wire = at_dir_to_wire(&att);
+    at_dir_free(&att);
+    return rc;
+}
+
+/* A request from this node's own app (no sender), handed to @p fn. Steals @p body. */
+static void _ic_app_verb(const process_t *proc, const char *function, json_t *body,
+                         bool (*fn)(const process_t *, directory_t *, generic_msg_t *))
+{
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    strncpy(req.info.net_msg.process, "identity", PROC_NAME_LEN);
+    req.info.net_msg.function = (char *)function;
+    net_msg_pack_json(&req.info.net_msg, body);
+    json_decref(body);
+    fn(proc, NULL, &req);
 }
 
 int _send_hook(const char *key,
@@ -889,6 +937,16 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
                         group_add_address(&impl->proc->protocol.group,
                                           fuuid, faddr);
                     }
+                    /* key_epoch: how many rotations this group key has been
+                     * through (ISSUES §2.31). Mirrors the Python fixture. */
+                    json_t *gke = json_object_get(gspec, "key_epoch");
+                    if (json_is_integer(gke))
+                        impl->proc->protocol.group.key_epoch =
+                            json_integer_value(gke);
+                    memcpy(impl->fixture_group_pub,
+                           impl->proc->protocol.group.encryptor.public,
+                           sizeof(impl->fixture_group_pub));
+                    impl->has_fixture_group_pub = true;
                     /* Strip the private key so group_to_json emits
                      * public_only=true (it gates on sodium_is_zero(private)). */
                     if (gpublic_only)
@@ -1244,7 +1302,9 @@ static int _build_inbound(sce_run_ctx_t *ctx,
      * which likewise leaves the payload in place for this one pseudo-function while
      * blanking it for the others. */
     if ((strcmp(function, "trigger_cohort_join") == 0
-         || strcmp(function, "trigger_first_contact_initiate") == 0)
+         || strcmp(function, "trigger_first_contact_initiate") == 0
+         || strcmp(function, "trigger_first_contact_remove") == 0
+         || strncmp(function, "trigger_directory_", 18) == 0)
         && json_is_object(payload)) {
         json_t *body = json_deep_copy(payload);
         if (body != NULL) {
@@ -1396,6 +1456,152 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_t *body = json_string(from_addr);
         net_msg_pack_json(&out->info.net_msg, body);
         json_decref(body);
+    }
+
+    /* first_contact_request -- a finder's signed request, minted here from the
+     * SIGNER's identity (default the sender) for the entry of the participant
+     * it is addressed `to` (default the recipient); a signer or `to` other
+     * than those is the forgery under test. Mirrors the Python adapter's
+     * IdentityProtocol.contact_request branch. */
+    if (strcmp(function, ID_FC_REQUEST) == 0) {
+        const char *spid = json_string_value(json_object_get(payload, "signer"));
+        const char *tpid = json_string_value(json_object_get(payload, "to"));
+        const char *handle = json_string_value(json_object_get(payload, "handle"));
+        const char *nonce = json_string_value(json_object_get(payload, "nonce"));
+        sce_participant_t *signer = sce_find_participant(ctx, spid != NULL ? spid : from_id);
+        sce_participant_t *holder = sce_find_participant(ctx, tpid != NULL ? tpid : to_id);
+        at_dir_signed_t entry, req;
+        if (signer == NULL || holder == NULL
+            || _ic_dir_entry(((ic_impl_t *)holder->impl)->full, handle, &entry, NULL) != AT_DIR_OK) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "build_inbound: first_contact_request: bad spec");
+            return -1;
+        }
+        int rrc = at_dir_request_create(((ic_impl_t *)signer->impl)->full, &entry, NULL, 0,
+                                        nonce != NULL && nonce[0] != '\0' ? nonce : NULL,
+                                        0, (double)time(NULL), &req);
+        at_dir_free(&entry);
+        if (rrc != AT_DIR_OK) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "build_inbound: could not sign a contact request");
+            return -1;
+        }
+        json_t *wire = at_dir_to_wire(&req);
+        at_dir_free(&req);
+        net_msg_pack_json(&out->info.net_msg, wire);
+        json_decref(wire);
+        return 0;
+    }
+
+    /* first_contact_accept -- the holder's answer: the nonce of the request it
+     * answers (default the one the recipient has outstanding to the sender)
+     * and a single-use invitation minted by `minted_by` (default the sender);
+     * `expired` backdates it. Mirrors the Python adapter's contact_accept. */
+    if (strcmp(function, ID_FC_ACCEPT) == 0) {
+        const char *mpid = json_string_value(json_object_get(payload, "minted_by"));
+        json_t *jn = json_object_get(payload, "nonce");
+        sce_participant_t *minter = sce_find_participant(ctx, mpid != NULL ? mpid : from_id);
+        sce_participant_t *from = sce_find_participant(ctx, from_id);
+        if (minter == NULL || from == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "build_inbound: first_contact_accept names an unknown participant");
+            return -1;
+        }
+        char nonce[AT_DIR_NONCE_HEX + 1] = {0};
+        if (json_is_string(jn)) {
+            at_strlcpy(nonce, json_string_value(jn), sizeof(nonce));
+        } else {
+            char hu[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(((ic_impl_t *)from->impl)->pub->uuid, hu);
+            at_dir_contact_outstanding_nonce(hu, nonce, sizeof(nonce));
+        }
+        long now = (long)time(NULL);
+        long expiry = json_is_true(json_object_get(payload, "expired")) ? now - 60 : now + 600;
+        char *blob = NULL;
+        if (at_create_invitation(((ic_impl_t *)minter->impl)->full, NULL, 0, expiry,
+                                 "dir-accept-invitation", &blob) != 0 || blob == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "build_inbound: could not mint an invitation");
+            return -1;
+        }
+        json_t *body = json_pack("{s:s, s:s}", "nonce", nonce, "invitation", blob);
+        free(blob);
+        net_msg_pack_json(&out->info.net_msg, body);
+        json_decref(body);
+        return 0;
+    }
+
+    /* reach_record — a signed reachability record (contacts/reach.h), minted
+     * here from the SIGNER's own identity (keys are generated per run).
+     * `claim` names whose uuid the body carries -- default the signer; a
+     * different one is the "right uuid, wrong key" forgery -- and `local`
+     * delivers it with no sender, as the network process hands on a relay
+     * lookup's answer. Mirrors the Python adapter's reach_record branch. */
+    if (strcmp(function, "reach_record") == 0) {
+        const char *signer_pid = from_id, *claim_pid = NULL;
+        json_t *jr = json_object_get(payload, "relays");
+        json_t *je = json_object_get(payload, "endpoints");
+        json_t *js = json_object_get(payload, "signer");
+        json_t *jc = json_object_get(payload, "claim");
+        if (json_is_string(js)) signer_pid = json_string_value(js);
+        if (json_is_string(jc)) claim_pid = json_string_value(jc);
+        int64_t seq = json_is_integer(json_object_get(payload, "seq"))
+            ? (int64_t)json_integer_value(json_object_get(payload, "seq")) : 1;
+        long expiry = json_is_integer(json_object_get(payload, "expiry"))
+            ? (long)json_integer_value(json_object_get(payload, "expiry")) : 0;
+        sce_participant_t *signer = sce_find_participant(ctx, signer_pid);
+        sce_participant_t *claim = claim_pid != NULL
+                                 ? sce_find_participant(ctx, claim_pid) : NULL;
+        if (signer == NULL || (claim_pid != NULL && claim == NULL)) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "build_inbound: reach_record names an unknown participant");
+            return -1;
+        }
+        const char *relays[8], *eps[8];
+        size_t nr = 0, ne = 0;
+        for (size_t i = 0; json_is_array(jr) && i < json_array_size(jr) && nr < 8; i++)
+            if (json_string_value(json_array_get(jr, i)) != NULL)
+                relays[nr++] = json_string_value(json_array_get(jr, i));
+        for (size_t i = 0; json_is_array(je) && i < json_array_size(je) && ne < 8; i++)
+            if (json_string_value(json_array_get(je, i)) != NULL)
+                eps[ne++] = json_string_value(json_array_get(je, i));
+        const identity_t *sid = ((ic_impl_t *)signer->impl)->full;
+        at_reach_record_t rec;
+        if (at_reach_create(sid, seq, relays, nr, eps, ne, expiry, &rec) != AT_REACH_OK) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "build_inbound: could not sign a reachability record");
+            return -1;
+        }
+        if (claim != NULL) {
+            char cu[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(((ic_impl_t *)claim->impl)->pub->uuid, cu);
+            json_object_set_new(rec.body, "uuid", json_string(cu));
+            char *body_str = json_dumps(rec.body, JSON_COMPACT | JSON_SORT_KEYS
+                                                  | JSON_ENSURE_ASCII);
+            size_t dl = strlen(AT_REACH_DOMAIN), bl = body_str != NULL ? strlen(body_str) : 0;
+            unsigned char *m = malloc(dl + bl + 1), sig[crypto_sign_BYTES];
+            if (body_str == NULL || m == NULL) {
+                free(body_str);
+                free(m);
+                at_reach_free(&rec);
+                return -1;
+            }
+            memcpy(m, AT_REACH_DOMAIN, dl);
+            memcpy(m + dl, body_str, bl);
+            crypto_sign_detached(sig, NULL, m, dl + bl, sid->signature.private);
+            free(m);
+            free(rec.body_str);
+            rec.body_str = body_str;
+            sodium_bin2hex(rec.sig_hex, sizeof(rec.sig_hex), sig, sizeof(sig));
+        }
+        json_t *wire = at_reach_to_wire(&rec);
+        at_reach_free(&rec);
+        net_msg_pack_json(&out->info.net_msg, wire);
+        json_decref(wire);
+        out->info.net_msg.encrypt = true;
+        if (json_is_true(json_object_get(payload, "local")))
+            memset(&out->info.net_msg.from_whom, 0, sizeof(public_identity_t));
+        return 0;
     }
 
     /* first_contact_hello — the OPTIONAL 1:1 handshake's ticket. The scenario
@@ -2007,6 +2213,103 @@ static int _dispatch(sce_run_ctx_t *ctx,
         return 0;
     }
 
+    /* trigger_first_contact_remove — the participant's APP removes a contact
+     * ({peer: <pid>}) through the production app verb. The scenario names the
+     * participant, not its uuid, which the runtimes derive differently.
+     * Mirrors the Python adapter's _TRIGGER_FC_REMOVE. */
+    if (inbound->type == NET_MESSAGE && inbound->info.net_msg.function != NULL
+        && strcmp(inbound->info.net_msg.function,
+                  "trigger_first_contact_remove") == 0) {
+        json_t *spec = NULL;
+        const char *pid = NULL;
+        if (net_msg_unpack_json(&inbound->info.net_msg, &spec) == 0
+            && json_is_object(spec))
+            pid = json_string_value(json_object_get(spec, "peer"));
+        sce_participant_t *gone = pid != NULL ? sce_find_participant(ctx, pid)
+                                              : NULL;
+        if (gone == NULL) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "trigger_first_contact_remove: unknown peer %s",
+                     pid != NULL ? pid : "(null)");
+            if (spec != NULL) json_decref(spec);
+            return -1;
+        }
+        char u[UUID_STR_LEN + 1];
+        uuid_unparse_lower(((ic_impl_t *)gone->impl)->pub->uuid, u);
+        json_decref(spec);
+        json_t *body = json_object();
+        json_object_set_new(body, "ref", json_string(""));
+        json_object_set_new(body, "peer", json_string(u));
+        generic_msg_t req = {0};
+        req.type = NET_MESSAGE;
+        strncpy(req.info.net_msg.process, "identity", PROC_NAME_LEN);
+        req.info.net_msg.function = (char *)AT_APP_FC_REMOVE;
+        net_msg_pack_json(&req.info.net_msg, body);
+        json_decref(body);
+        handle_first_contact_app_remove(impl->proc, NULL, &req);
+        return 0;
+    }
+
+    /* trigger_directory_publish / _request / _accept / _decline -- finding
+     * someone by handle, each through the production app verb or handler,
+     * because the entry, request and invitation are signed by per-run keys.
+     * Mirrors the Python adapter's _TRIGGER_DIR_* branch. */
+    if (inbound->type == NET_MESSAGE
+        && inbound->info.net_msg.function != NULL
+        && strncmp(inbound->info.net_msg.function, "trigger_directory_", 18) == 0) {
+        const char *what = inbound->info.net_msg.function + 18;
+        json_t *spec = NULL;
+        if (net_msg_unpack_json(&inbound->info.net_msg, &spec) != 0 || !json_is_object(spec)) {
+            if (spec != NULL) json_decref(spec);
+            spec = json_object();
+        }
+        const char *handle = json_string_value(json_object_get(spec, "handle"));
+        const char *ref = json_string_value(json_object_get(spec, "ref"));
+        int trc = 0;
+        if (strcmp(what, "publish") == 0) {
+            at_dir_signed_t entry;
+            json_t *att = NULL;
+            if (_ic_dir_entry(impl->full, handle, &entry, &att) != AT_DIR_OK) {
+                trc = -1;
+            } else {
+                at_dir_free(&entry);
+                _ic_app_verb(impl->proc, AT_APP_DIR_PUBLISH,
+                             json_pack("{s:s, s:o}", "ref", "pub", "attestation", att),
+                             handle_dir_app_publish);
+            }
+        } else if (strcmp(what, "request") == 0) {
+            const char *hpid = json_string_value(json_object_get(spec, "holder"));
+            sce_participant_t *holder = hpid != NULL ? sce_find_participant(ctx, hpid) : NULL;
+            at_dir_signed_t entry;
+            if (holder == NULL
+                || _ic_dir_entry(((ic_impl_t *)holder->impl)->full, handle, &entry, NULL) != AT_DIR_OK) {
+                trc = -1;
+            } else {
+                _ic_app_verb(impl->proc, NET_ID_DIR_RESULT,
+                             json_pack("{s:s, s:o, s:s, s:b}", "handle", handle,
+                                       "entry", at_dir_to_wire(&entry), "relay", "",
+                                       "limited", 0),
+                             handle_dir_result);
+                at_dir_free(&entry);
+                _ic_app_verb(impl->proc, AT_APP_FC_REQUEST,
+                             json_pack("{s:s, s:s}", "ref", "ask", "handle", handle),
+                             handle_dir_app_request);
+            }
+        } else if (strcmp(what, "accept") == 0 || strcmp(what, "decline") == 0) {
+            bool accept = what[0] == 'a';
+            _ic_app_verb(impl->proc, accept ? AT_APP_FC_ACCEPT : AT_APP_FC_DECLINE,
+                         json_pack("{s:s}", "ref", ref != NULL ? ref : ""),
+                         accept ? handle_dir_app_accept : handle_dir_app_decline);
+        } else {
+            trc = -1;
+        }
+        if (trc != 0)
+            snprintf(ctx->err, sizeof(ctx->err), "%s: bad spec or unknown participant",
+                     inbound->info.net_msg.function);
+        json_decref(spec);
+        return trc;
+    }
+
     /* trigger_first_contact_restart — drop the OPTIONAL 1:1 handshake's
      * in-memory spent-nonce guard WITHOUT touching the file it persists to:
      * the closest a single-process harness gets to restarting the node.
@@ -2463,6 +2766,26 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                                          (int)have->rendezvous_count, want_c);
                                 crc = -1;
                             }
+                        } else if (strcmp(field, "reach_seq") == 0) {
+                            long long want_s = (long long)json_integer_value(fval);
+                            if ((long long)have->reach_seq != want_s) {
+                                snprintf(ctx->err, sizeof(ctx->err),
+                                         "%s: contact[%s].reach_seq=%lld, "
+                                         "expected %lld", pid, cpid,
+                                         (long long)have->reach_seq, want_s);
+                                crc = -1;
+                            }
+                        } else if (strcmp(field, "rendezvous_head") == 0) {
+                            const char *want_h = json_string_value(fval);
+                            const char *got_h = have->rendezvous_count > 0
+                                              ? have->rendezvous[0] : "";
+                            if (want_h == NULL || strcmp(got_h, want_h) != 0) {
+                                snprintf(ctx->err, sizeof(ctx->err),
+                                         "%s: contact[%s].rendezvous_head=%s, "
+                                         "expected %s", pid, cpid, got_h,
+                                         want_h != NULL ? want_h : "(null)");
+                                crc = -1;
+                            }
                         } else if (strcmp(field, "rendezvous_tail") == 0) {
                             /* Everything after the newest hint: fixture
                              * values, so nameable. Pins that a refresh
@@ -2529,6 +2852,32 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: first_contact_acks_emitted=%d, expected %d",
                              pid, got, want);
+                    return -1;
+                }
+            } else if (strcmp(key, "directory_requests_held") == 0
+                       || strcmp(key, "directory_accepts_emitted") == 0
+                       || strcmp(key, "first_contact_hellos_emitted") == 0) {
+                /* Requests held for the app to decide (process-wide here, so
+                 * the cases asserting it have one holder); and how many
+                 * first_contact_accept / first_contact_hello messages this
+                 * participant emitted. A request failing a gate is dropped
+                 * silently, so these are the only observables. Mirrors the
+                 * Python adapter. */
+                int want = (int)json_integer_value(val);
+                int got = 0;
+                if (strcmp(key, "directory_requests_held") == 0) {
+                    got = (int)at_dir_contact_held_count();
+                } else {
+                    const char *fn = strcmp(key, "directory_accepts_emitted") == 0
+                                   ? ID_FC_ACCEPT : ID_FC_HELLO;
+                    for (size_t i = 0; i < ctx->captured_count; i++)
+                        if (strcmp(ctx->captured[i].from, pid) == 0
+                            && strcmp(ctx->captured[i].function, fn) == 0)
+                            got++;
+                }
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err), "%s: %s=%d, expected %d",
+                             pid, key, got, want);
                     return -1;
                 }
             } else if (strcmp(key, "first_contact_nonce_spent") == 0) {
@@ -2888,6 +3237,21 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                              "%s: group_size=%d, expected %d", pid, got, want);
                     return -1;
                 }
+            } else if (strcmp(key, "group_key_kept") == 0) {
+                /* Still the group key fixtures.groups gave us: a membership
+                 * update never changes our own group's key (ISSUES §2.31).
+                 * Mirrors the Python adapter's group_key_kept. */
+                bool want = json_is_true(val);
+                bool got = impl->has_fixture_group_pub
+                    && memcmp(impl->fixture_group_pub,
+                              proc->protocol.group.encryptor.public,
+                              sizeof(impl->fixture_group_pub)) == 0;
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: group_key_kept=%d, expected %d",
+                             pid, (int)got, (int)want);
+                    return -1;
+                }
             } else if (strcmp(key, "group_key_epoch") == 0) {
                 /* How many times this participant's group key has been rotated.
                  * Admission rotates (doc/architecture/gateway-reputation-tree.md), so a
@@ -3196,6 +3560,8 @@ static void _install_contacts(sce_run_ctx_t *ctx)
         if (nonce != NULL)
             at_strlcpy(c.nonce, nonce, sizeof(c.nonce));
         c.added_at = (double)time(NULL);
+        json_t *rs = json_object_get(spec, "reach_seq");
+        c.reach_seq = json_is_integer(rs) ? (int64_t)json_integer_value(rs) : 0;
         json_t *rv = json_object_get(spec, "rendezvous");
         if (json_is_array(rv) && json_array_size(rv) > 0) {
             size_t cnt = json_array_size(rv);
@@ -3368,6 +3734,7 @@ void at_identity_run_ext(const at_case_t *c, at_case_result_t *out,
      * the scenario never asked for them), so neither leaks into the next case. */
     if (fc_enabled) {
         at_first_contact_reset();
+        at_dir_contact_reset();
         if (fc_had_flag) setenv(AT_FIRST_CONTACT_ENV, fc_saved_flag, 1);
         else unsetenv(AT_FIRST_CONTACT_ENV);
         if (fc_had_root) setenv("AUTONOMOUS_TRUST_ROOT", fc_saved_root, 1);
@@ -3399,6 +3766,7 @@ fail:
      * the scenario never asked for them), so neither leaks into the next case. */
     if (fc_enabled) {
         at_first_contact_reset();
+        at_dir_contact_reset();
         if (fc_had_flag) setenv(AT_FIRST_CONTACT_ENV, fc_saved_flag, 1);
         else unsetenv(AT_FIRST_CONTACT_ENV);
         if (fc_had_root) setenv("AUTONOMOUS_TRUST_ROOT", fc_saved_root, 1);
