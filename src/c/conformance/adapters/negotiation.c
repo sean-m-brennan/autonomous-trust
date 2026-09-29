@@ -54,6 +54,8 @@
 #include "../scenario_engine.h"
 #include "../scenario_loader.h"  /* at_byte_pin_json, at_load_testdata_bytes */
 #include "identity/identity_priv.h"  /* public_identity_from_json */
+#include "contacts/contacts.h"
+#include "config/configuration.h"
 
 /* ------------------------------------------------------------------------- */
 /* Per-participant impl carries a process_t plus the identity used to        */
@@ -174,6 +176,131 @@ static void _free_participant_impl(np_impl_t *impl)
 }
 
 /* Apply scenario fixtures: capabilities map + peer_levels map. */
+/* first_contact: {enabled: true} and verified_contacts: {<holder>: [<pid>..]}.
+ *
+ * Turns the OPTIONAL first-contact feature on for this scenario -- which
+ * brings its §10.3 tier cap into negotiation's gate -- in a scratch root of
+ * its own, so a contacts file written here cannot leak into the next case.
+ * Participants here belong to no group, so every sender is a direct peer:
+ * unverified unless listed. All holders share the one root, and so the one
+ * contacts file, as the Python adapter's scratch root does. Returns true if
+ * it changed the environment (the caller restores it). Mirrors the Python
+ * adapter's _apply_first_contact. */
+static char g_fc_prev_root[1024];
+static bool g_fc_had_root;
+
+static bool _apply_first_contact(sce_run_ctx_t *ctx)
+{
+    json_t *fixtures = json_object_get(ctx->case_data, "fixtures");
+    json_t *fc = json_object_get(fixtures, "first_contact");
+    if (!json_is_true(json_object_get(fc, "enabled")))
+        return false;
+    const char *prev = getenv("AUTONOMOUS_TRUST_ROOT");
+    g_fc_had_root = prev != NULL;
+    snprintf(g_fc_prev_root, sizeof(g_fc_prev_root), "%s", prev ? prev : "");
+    static char root[64];
+    snprintf(root, sizeof(root), "/tmp/at-conformance-neg-fc.XXXXXX");
+    if (mkdtemp(root) == NULL)
+        return false;
+    setenv("AUTONOMOUS_TRUST_ROOT", root, 1);
+    setenv("AT_FIRST_CONTACT", "1", 1);
+
+    char dir[CFG_PATH_LEN + 1] = {0};
+    if (get_data_dir(dir, sizeof(dir)) <= 0)
+        return true;
+    contacts_t store;
+    contacts_init(&store);
+    /* verified_contacts and unverified_contacts: {<holder>: [<pid>, ...]}. */
+    const char *keys[2] = { "verified_contacts", "unverified_contacts" };
+    for (int k = 0; k < 2; k++) {
+        json_t *vc = json_object_get(fixtures, keys[k]);
+        if (!json_is_object(vc))
+            continue;
+        bool verified = k == 0;
+        const char *holder;
+        json_t *pids;
+        json_object_foreach(vc, holder, pids) {
+            for (size_t i = 0; json_is_array(pids) && i < json_array_size(pids); i++) {
+                const char *pid = json_string_value(json_array_get(pids, i));
+                sce_participant_t *who = pid != NULL ? sce_find_participant(ctx, pid) : NULL;
+                if (who == NULL || ((np_impl_t *)who->impl)->pub == NULL)
+                    continue;
+                contact_t c;
+                memset(&c, 0, sizeof(c));
+                c.identity = *((np_impl_t *)who->impl)->pub;
+                snprintf(c.petname, sizeof(c.petname), "%s", pid);
+                c.provenance = verified ? AT_PROV_IN_PERSON : AT_PROV_TOKEN;
+                if (verified)
+                    contact_mark_verified(&c, AT_FIRST_CONTACT_VERIFIED_SEED);
+                (void)contacts_add(&store, &c);
+            }
+        }
+    }
+    (void)contacts_save(&store, dir);
+    contacts_free(&store);
+    return true;
+}
+
+/* group_members: {<holder>: [<pid>, ...]} puts the listed participants in the
+ * holder's OWN group; child_group_members in a child group the holder
+ * gateways. What the tier cap reads to tell a cohort member from a stranger.
+ * Mirrors the Python adapter's _apply_groups. */
+static void _apply_groups(sce_run_ctx_t *ctx)
+{
+    json_t *fixtures = json_object_get(ctx->case_data, "fixtures");
+    const char *keys[2] = { "group_members", "child_group_members" };
+    for (int k = 0; k < 2; k++) {
+        json_t *spec = json_object_get(fixtures, keys[k]);
+        if (!json_is_object(spec))
+            continue;
+        const char *holder;
+        json_t *pids;
+        json_object_foreach(spec, holder, pids) {
+            sce_participant_t *h = sce_find_participant(ctx, holder);
+            np_impl_t *hi = h != NULL ? (np_impl_t *)h->impl : NULL;
+            if (hi == NULL || hi->proc == NULL)
+                continue;
+            group_t *grp = k == 0 ? &hi->proc->protocol.group
+                                  : calloc(1, sizeof(group_t));
+            if (grp == NULL)
+                continue;
+            uuid_t gid;
+            uuid_generate(gid);
+            group_init(&gid, (char *)"10.0.50.254", grp);
+            for (size_t i = 0; json_is_array(pids) && i < json_array_size(pids); i++) {
+                const char *pid = json_string_value(json_array_get(pids, i));
+                sce_participant_t *who = pid != NULL ? sce_find_participant(ctx, pid) : NULL;
+                np_impl_t *wi = who != NULL ? (np_impl_t *)who->impl : NULL;
+                if (wi == NULL || wi->pub == NULL)
+                    continue;
+                char u[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(wi->pub->uuid, u);
+                group_add_address(grp, u, wi->pub->address);
+            }
+            if (k == 1) {
+                char gs[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(gid, gs);
+                if (hi->proc->protocol.child_groups == NULL
+                    && map_create(&hi->proc->protocol.child_groups) != 0) {
+                    free(grp);
+                    continue;
+                }
+                map_set(hi->proc->protocol.child_groups, (map_key_t)gs,
+                        object_ptr_data(grp, sizeof(group_t)));
+            }
+        }
+    }
+}
+
+static void _restore_first_contact(void)
+{
+    if (g_fc_had_root)
+        setenv("AUTONOMOUS_TRUST_ROOT", g_fc_prev_root, 1);
+    else
+        unsetenv("AUTONOMOUS_TRUST_ROOT");
+    unsetenv("AT_FIRST_CONTACT");
+}
+
 static void _apply_fixtures(sce_run_ctx_t *ctx)
 {
     json_t *fixtures = json_object_get(ctx->case_data, "fixtures");
@@ -863,6 +990,8 @@ void at_negotiation_run(const at_case_t *c, at_case_result_t *out)
     }
 
     _apply_fixtures(&ctx);
+    _apply_groups(&ctx);
+    bool fc_env = _apply_first_contact(&ctx);
 
     g_active_ctx = &ctx;
     messaging_set_test_hook(_send_hook);
@@ -872,6 +1001,8 @@ void at_negotiation_run(const at_case_t *c, at_case_result_t *out)
 
     messaging_set_test_hook(NULL);
     g_active_ctx = NULL;
+    if (fc_env)
+        _restore_first_contact();
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     int duration_ms = (int)((t1.tv_sec - t0.tv_sec) * 1000

@@ -526,7 +526,10 @@ class TestTransactionHistory:
         p1, p2 = uuid4(), uuid4()
         th.update(tid, p1, 0.8)
         th.update(tid, p2, 0.9)
-        assert len(th.by_peer(p1)) >= 1
+        # Exactly once per side: indexing p1 again when p2 completed the tx
+        # double-counted it in every by_peer() consumer.
+        assert th.by_peer(p1) == [th[tid]]
+        assert th.by_peer(p2) == [th[tid]]
 
     def test_era(self):
         th = TransactionHistory()
@@ -845,6 +848,25 @@ class TestChainForkReconcile:
         # Agreeing now, the same report again changes nothing.
         assert ours.reconcile(self._wire(theirs)).status == ReconcileResult.NONE
 
+    def test_hands_back_what_it_dropped(self):
+        # Agora Phase 4 DDIL: the process re-proposes its own half of each
+        # dropped entry, so the result carries them whole and in chain order,
+        # and catchup (the majority path) returns the same result. Mirrors C's
+        # test_tx_fork_hands_back_what_it_dropped.
+        ours, theirs = self._chain('abxy'), self._chain('abcde')
+        res = ours.catchup(self._wire(theirs))
+        assert res.status == ReconcileResult.ADOPTED
+        assert [t.task_id for t in res.dropped] == [self.tasks['x'],
+                                                     self.tasks['y']]
+        x = res.dropped[0]
+        assert x.p1_id == self.p1 and x.p2_id == self.p2
+        assert x.p1_score == pytest.approx(0.3 + 0.02 * (ord('x') - ord('a')))
+        assert x.index == 2
+        assert ours.catchup(self._wire(theirs)).dropped == []
+        short = self._chain('ab')
+        res = short.catchup(self._wire(theirs))
+        assert res.status == ReconcileResult.EXTENDED and res.dropped == []
+
     def test_keeps_our_chain_when_the_peer_is_shorter(self):
         ours, theirs = self._chain('abxy'), self._chain('abc')
         before = ours.window_root()
@@ -926,7 +948,8 @@ class TestFinalityNeedsQuorum:
             th.update(tasks[c], p1, 0.3 + 0.02 * t)
             th.update(tasks[c], p2, 0.9 - 0.02 * t)
         stub = SimpleNamespace(history=th, _finalized=None,
-                               _quorum_for_group=lambda g: 1)
+                               _quorum_for_group=lambda g: 1,
+                               _checkpoint_quorum=lambda g: 1)
         return stub
 
     @staticmethod

@@ -1,0 +1,40 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: request-reputation-of-self-not-scored
+byte_pinning: false
+description: |
+    A node never scores itself. Its own history holds no bilateral evidence
+    about it, and a stored self-score would feed its own tier.
+
+    The rescore sweep already skipped self in both runtimes; a rep_req naming
+    the answering node did not. The test-mode main loop asked for "every known
+    peer (including self)" on each tick, so every node logged and stored a
+    tit-for-tat score for its own uuid. The request is now dropped, and nothing
+    is stored.
+
+    `unrated` asserts the ABSENCE of a stored score, which `reputation_of`
+    (presence at a value) cannot express. A self-score of zero history would
+    still be a stored entry, so this bites whatever value scoring would have
+    produced.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: oracle
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: request reputation
+    payload:
+      target: bob
+      proc: negotiation
+    description: |
+        alice asks bob for bob's own reputation. bob drops the request.
+
+expected_state:
+  bob:
+    unrated: [bob]

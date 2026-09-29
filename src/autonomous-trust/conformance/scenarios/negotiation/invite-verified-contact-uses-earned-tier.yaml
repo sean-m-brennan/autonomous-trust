@@ -1,0 +1,47 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: invite-verified-contact-uses-earned-tier
+byte_pinning: false
+description: |
+    The other half of invite-unverified-contact-held-at-communication: once
+    Bob has VERIFIED Alice (here, a contact record marked verified, as an
+    in-person exchange or a matching safety number leaves it), the tier cap
+    lifts and she is served what she has earned. Same capability, same earned
+    tier 4, and the tier-2 invitation is accepted this time. Without this case
+    a gate that capped EVERY direct peer, verified or not, would pass the
+    other one.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  first_contact:
+    enabled: true
+  verified_contacts:
+    bob: [alice]
+  capabilities:
+    bob: [file_share]
+  capability_tiers:
+    file_share: 2
+  peer_tiers:
+    alice: 4
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: file_share
+      task_id: t-fc-verified-share
+  - id: 2
+    from: bob
+    to: alice
+    function: ack
+    in_response_to: 1
+    payload:
+      task_id: t-fc-verified-share

@@ -1,0 +1,32 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: directory-entry-expired
+description: An entry checked at or after its expiry is refused as expired.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: dir_verify
+    what: entry
+    now: 1790000000
+    wire:
+      body: '{"v":1,"typename":"at-dir-entry","handle":"alice@example.org","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","key":"c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242","visibility":"anyone","seq":1,"expiry":1790000000,"identity":{"typename":"identity","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","address":"","nickname":"alice","signature":{"hex_seed":"c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242"},"encryptor":{"hex_seed":"7777777777777777777777777777777777777777777777777777777777777777"}},"attestation":{"body":"{\"v\":1,\"typename\":\"at-dir-attest\",\"handle\":\"alice@example.org\",\"key\":\"c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242\",\"issuer\":\"d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48\",\"expiry\":4102444800}","sig":"a41a0c2032f8e101cc170d50b656d7f4e02a13ca4e7a4a74fdbc30e0344bfe258fd342b4a32bc735d12e345cacae820940d1b58dc42bcd16e7a8ae205b81350a"}}'
+      sig: 478d3343717825f733d010f236035457d47c65e262a252284234e3743b993efcd3519abcc5788cbc5ec0679ee9515b1534e6ce97249e01e2ca7930273f61c501
+    trusted:
+    - d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48
+steps:
+- id: 1
+  from: host
+  to: host
+  function: dir_verify
+  description: 'trigger: dir_verify'
+expected_state:
+  host:
+    dir_status: expired

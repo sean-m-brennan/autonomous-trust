@@ -1,0 +1,44 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: directory-handle-normalization
+description: Handles fold to lower case; anything outside ASCII [a-z0-9._@+-], empty, or over 128 bytes is not a handle (null).
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: dir_normalize
+    handles:
+    - Alice@Example.ORG
+    - '+15551234567'
+    - xn--bcher-kva.example
+    - ''
+    - "b\xFCcher"
+    - a b
+    - a/b
+    - xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    - xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+steps:
+- id: 1
+  from: host
+  to: host
+  function: dir_normalize
+  description: 'trigger: dir_normalize'
+expected_state:
+  host:
+    folded:
+    - alice@example.org
+    - '+15551234567'
+    - xn--bcher-kva.example
+    - null
+    - null
+    - null
+    - null
+    - xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    - null

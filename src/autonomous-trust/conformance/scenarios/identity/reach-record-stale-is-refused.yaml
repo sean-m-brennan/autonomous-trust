@@ -1,0 +1,53 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: reach-record-stale-is-refused
+byte_pinning: false
+description: |
+    Bob has already applied Alice's record 5. Another record 5 -- a replay, or a
+    different record under the same number -- is refused: only a HIGHER sequence
+    replaces what Bob knows, so an old record can never be played back over a
+    newer one.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000000a2"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000000b2"
+      size: 1
+  contacts:
+    alice:
+      rendezvous:
+        - relay://198.51.100.1:27790
+      reach_seq: 5
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: reach_record
+    payload:
+      seq: 5
+      relays:
+        - relay://203.0.113.7:27790
+
+    description: |
+        A record that is not newer than the one applied.
+
+expected_state:
+  bob:
+    contacts:
+      alice:
+        reach_seq: 5
+        rendezvous_head: relay://198.51.100.1:27790
+

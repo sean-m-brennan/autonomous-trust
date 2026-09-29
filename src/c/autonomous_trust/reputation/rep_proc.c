@@ -129,6 +129,16 @@ static double _tier_ceiling(int tier)
 #define REP_CHECKPOINT_INTERVAL \
     (reputation_env_double("AT_REP_CHECKPOINT_SEC", \
                            REP_CHECKPOINT_INTERVAL_DEFAULT))
+/* How long OUR half of a task may go uncommitted before it is proposed again,
+ * and how many times (ISSUES §2.24). A granted round leaves my_requests when
+ * its transaction goes out, and a round that is never answered never gets a
+ * nack. Either way nothing else would ever look at it again. Mirrors Python
+ * COMMIT_TIMEOUT / AT_REP_COMMIT_TIMEOUT_SEC and COMMIT_RETRIES. */
+#define REP_COMMIT_TIMEOUT_DEFAULT 15.0
+#define REP_COMMIT_TIMEOUT \
+    (reputation_env_double("AT_REP_COMMIT_TIMEOUT_SEC", \
+                           REP_COMMIT_TIMEOUT_DEFAULT))
+#define REP_COMMIT_RETRIES 5
 
 /* Forward declaration — definition follows _ensure_init/state struct.
  * Emits a local-IPC tier_update to the identity process queue iff the
@@ -158,7 +168,7 @@ static void _handle_peer_standing(const process_t *proc,
 /* Defined with the app-facing carrier below; declared here because the
  * standing handler sits above it and must tell the app when a ceiling moves. */
 static void _publish_reputation_change(const uuid_t peer_uuid, double score);
-static double _score_peer_locked(const uuid_t peer_uuid);
+static double _score_peer_locked(const process_t *proc, const uuid_t peer_uuid);
 static void _publish_standing_change(const process_t *proc,
                                      const uuid_t peer_uuid);
 /* Both defined further down, beside the code that owns them; this block
@@ -192,6 +202,8 @@ static void _note_interaction(const uuid_t peer_uuid);
 static bool _is_bilateral_locked(const tx_history_t *chain,
                                  const uuid_t task_uuid, int *index);
 static uuid_t *_chain_peers_locked(size_t *n_out);
+static int _repropose_dropped(const process_t *proc,
+                              const tx_reconcile_result_t *res);
 static int _rescore_peers(const process_t *proc, double present,
                           const uuid_t self_uuid);
 
@@ -279,6 +291,36 @@ static char NET_READMIT_FUNC[] = "readmit";
 
 #define STALE_TIMEOUT    300  /* seconds */
 
+/* One of our halves waiting to reach the chain (awaiting_commit). Everything a
+ * re-proposal needs, plus when to give up waiting and how often we have. */
+typedef struct {
+    smrt_ptr_t;
+    uuid_t task_uuid;
+    uuid_t proposer;     /* us: the uuid our half commits under */
+    double score;
+    char   capability_name[CAP_NAMELEN + 1];
+    char   channel[TX_CHANNEL_NAMELEN + 1];
+    double competence;
+    double deadline;
+    int    attempts;     /* re-proposals so far */
+} rep_awaiting_t;
+
+/* A checkpoint proposal parked for a later co-sign (ISSUES §2.29). Everything
+ * the co-signature covers is kept, plus who to send it to: the designation is
+ * rebuilt from these fields, exactly as the proposer built it. */
+#define REP_PARKED_COSIGN_MAX 16
+typedef struct {
+    bool used;
+    char proposer[UUID_STRING_LEN + 1];
+    char group[UUID_STRING_LEN + 1];   /* the chain as the PROPOSER named it */
+    char root[TX_HASH_HEX_LEN + 1];
+    int64_t epoch;
+    int64_t first_index;
+    int64_t count;
+    double parked_at;
+    public_identity_t to;
+} rep_parked_cosign_t;
+
 static struct {
     tx_history_t history;
     /* Gateway reputation tree: one chain per child group this node gateways,
@@ -317,6 +359,10 @@ static struct {
     map_t resolved_reps;
     reputations_t reputations;
     map_t my_requests;     /* paxos_id_index -> tx_score_t* (pending Paxos rounds) */
+    /* task uuid-str -> rep_awaiting_t*: OUR halves proposed and not yet in the
+     * chain, keyed by TASK rather than round because the round is exactly
+     * what gets lost (ISSUES §2.24). _retry_uncommitted_halves reads it. */
+    map_t awaiting_commit;
     /* paxos_id_index -> integer_data(epoch seconds): when a NACKed round of
      * OURS becomes eligible to be re-proposed. The C twin of Python's
      * _try_again thread (repprocess.py:877), which sleeps backoff[idx] and
@@ -443,6 +489,11 @@ static struct {
     /* "proposer:epoch" -> string_data(JSON {root, first_index, count}) -- the
      * window bounds travel because the designation covers them. */
     map_t checkpoint_pending;
+    /* Proposals we could not co-sign when they arrived because our chain did
+     * not yet hold the proposed range (ISSUES §2.29). One slot per proposer
+     * and chain -- a newer epoch replaces an older one -- re-checked every pass
+     * by _recheck_parked_cosigns and dropped after one checkpoint interval. */
+    rep_parked_cosign_t parked_cosigns[REP_PARKED_COSIGN_MAX];
     char  checkpoint_root[TX_HASH_HEX_LEN + 1];  /* latest finalized root */
     int64_t checkpoint_epoch;  /* epoch of the latest finalized checkpoint */
     bool  checkpoint_set;      /* a checkpoint has been finalized/stored */
@@ -519,6 +570,70 @@ static struct {
     int num_updates;
 } rep_state;
 
+/* Is @p fn a frame that nothing re-sends if it is lost (ISSUES §2.28)?
+ *
+ * These carry STATE: a committed half, the transaction and its acceptance, a
+ * chain answer, a checkpoint or slash round, an exclusion. Lose one and the
+ * other side is simply wrong, as bob's commit broadcast was in part-3518232.
+ *
+ * Everything else rep sends is Paxos control chatter -- ask, grant, try again,
+ * out of date, update needed -- plus request/response pairs whose asker times
+ * out and asks again. The protocol re-sends all of it, and it is most of the
+ * traffic: about 90% of what ada's network process sent in part-3614473. Giving
+ * chatter the retry too kept net_proc's queue full for seconds, stalled this
+ * process 200 ms per lost frame, and made identity lose the race for the queue
+ * (a dropped full_history there forked the group), so chatter gets one try. */
+static bool _rep_frame_is_state(const char *fn)
+{
+    if (fn == NULL)
+        return false;
+    static const char *const state[] = {
+        REP_PROTO_TX, REP_PROTO_ACCEPTED, REP_PROTO_COMMITTED, REP_PROTO_UPDATE,
+        REP_PROTO_CHECKPOINT_PROPOSE, REP_PROTO_CHECKPOINT_SIGN,
+        REP_PROTO_CHECKPOINT_FINAL, REP_PROTO_SLASH_PROPOSE,
+        REP_PROTO_SLASH_SIGN, REP_PROTO_SLASH_FINAL,
+        NET_EXCLUDE_FUNC, NET_READMIT_FUNC,
+    };
+    for (size_t i = 0; i < sizeof(state) / sizeof(state[0]); i++)
+        if (strcmp(fn, state[i]) == 0)
+            return true;
+    return false;
+}
+
+/* Hand net_proc a frame for the wire (ISSUES §2.28).
+ *
+ * messaging_send is non-blocking, and the network process's AF_UNIX datagram
+ * queue holds net.unix.max_dgram_qlen frames -- 10 in every fresh network
+ * namespace, whatever the host is tuned to. A frame that carries state
+ * (_rep_frame_is_state) gets a bounded retry and, if that fails, a warning
+ * naming the verb, as identity_send_to_network does. Chatter gets one try and
+ * a debug line: the protocol will send it again. */
+static int _rep_send_to_network(const process_t *proc, generic_msg_t *out)
+{
+    const char *fn = out->info.net_msg.function;
+    bool state = _rep_frame_is_state(fn);
+    int tries = state ? 10 : 1;
+    int ret = -1;
+    for (int attempt = 0; attempt < tries; attempt++)
+    {
+        if (attempt > 0)
+            usleep(20000); /* 20ms */
+        ret = messaging_send("network", NET_MESSAGE, out, false);
+        if (ret == 0)
+            return 0;
+    }
+    if (state)
+        log_warn(proc->logger,
+                 "Reputation: could not hand %s to the network process after "
+                 "%d tries (%s); the frame is lost\n", fn, tries,
+                 ret == EAGAIN ? "network queue still full" : "send failed");
+    else
+        log_debug(proc->logger,
+                  "Reputation: dropped %s at a full network queue; the "
+                  "protocol re-sends it\n", fn != NULL ? fn : "?");
+    return ret;
+}
+
 static void _ensure_init(void)
 {
     if (!rep_state.initialized)
@@ -533,6 +648,7 @@ static void _ensure_init(void)
         map_init(&rep_state.resolved_reps);
         reputations_init(&rep_state.reputations);
         map_init(&rep_state.my_requests);
+        map_init(&rep_state.awaiting_commit);
         map_init(&rep_state.retry_due);
         map_init(&rep_state.updates);
         array_init(&rep_state.requested_reps);
@@ -760,6 +876,32 @@ static size_t _quorum_for_group(const process_t *proc, const char *group_uuid)
         || group_uuid == NULL || group_uuid[0] == '\0')
         return proc->protocol.num_peers / 2;
     return _members_of_group(proc, group_uuid) / 2;
+}
+
+/* CHECKPOINT finality threshold for `group_uuid`: more than this many
+ * co-signers, the proposer's own included, finalize a window. A MAJORITY OF
+ * THE WHOLE GROUP, THIS NODE INCLUDED: floor(members / 2) where members is the
+ * roster plus one.
+ *
+ * It used to be _quorum_for_group's num_peers / 2, which counts the roster
+ * WITHOUT this node, and for an even-sized group that is one signature short:
+ * two of a four-member group, and the proposer alone in a two-member one, met
+ * it. So both halves of an even split finalized their own windows, each then
+ * refused to rewrite inside its finality at the heal (tx_history_reconcile),
+ * and the chains could never converge (Agora Phase 4 DDIL, 2026-09-25). Odd
+ * sizes are unchanged. Deliberately NOT applied to Paxos grants or slashing:
+ * the grant formula is the open ISSUES.md §2.13 decision. Mirrors Python's
+ * _checkpoint_quorum. */
+static size_t _ckpt_quorum_for_group(const process_t *proc, const char *group_uuid)
+{
+    if (proc == NULL)
+        return 0;
+    size_t roster = (proc->protocol.child_groups == NULL
+                     || map_size(proc->protocol.child_groups) == 0
+                     || group_uuid == NULL || group_uuid[0] == '\0')
+        ? proc->protocol.num_peers
+        : _members_of_group(proc, group_uuid);
+    return (roster + 1) / 2;
 }
 
 /* Per-chain finalized-checkpoint state. A gateway checkpoints each of its
@@ -1401,7 +1543,7 @@ static void _handle_peer_standing(const process_t *proc,
          * mod-2531555 read the cap again in the seconds before that sweep ran.
          * A lift takes effect the moment it lands, as a cap does. */
         bool rated = reputations_contains(&rep_state.reputations, st->peer_uuid);
-        double rescored = rated ? _score_peer_locked(st->peer_uuid) : 0.0;
+        double rescored = rated ? _score_peer_locked(proc, st->peer_uuid) : 0.0;
         pthread_mutex_unlock(&rep_state.lock);
         log_info(proc->logger,
                  "Standing[%s]: %s proved; unwind anchor set at chain index %d\n",
@@ -1640,28 +1782,28 @@ static void _publish_exclusion(const process_t *proc,
         }
     }
     peers_read_unlock(proc);
-    if (address[0] == '\0') {
-        char uuid_str[UUID_STRING_LEN + 1];
-        uuid_unparse_lower(peer_uuid, uuid_str);
-        log_debug(proc->logger,
-                  "Reputation: exclusion %s for %s: no address, gate skipped\n",
-                  excluded ? "add" : "remove", uuid_str);
-        return;
-    }
+    /* Sent even with no address: the uuid alone gates the peer as a relay
+     * client and as a relay (net_relay_note_exclusion). Payload {address,
+     * uuid}, the form Python _publish_exclusion sends. */
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, uuid_str);
     generic_msg_t ipc = {0};
     ipc.type = NET_MESSAGE;
     strncpy(ipc.info.net_msg.process, "network", PROC_NAME_LEN);
     ipc.info.net_msg.function = excluded ? NET_EXCLUDE_FUNC : NET_READMIT_FUNC;
     ipc.info.net_msg.encrypt = false;  /* local IPC, no wire egress */
     strncpy(ipc.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
-    json_t *body = json_string(address);
+    json_t *body = json_object();
     if (body == NULL)
         return;
+    json_object_set_new(body, "address", json_string(address));
+    json_object_set_new(body, "uuid", json_string(uuid_str));
     net_msg_pack_json(&ipc.info.net_msg, body);
-    messaging_send("network", NET_MESSAGE, &ipc, false);
+    _rep_send_to_network(proc, &ipc);
     json_decref(body);
-    log_info(proc->logger, "Reputation: %s %s at the network layer\n",
-             excluded ? "excluded" : "readmitted", address);
+    log_info(proc->logger, "Reputation: %s %.8s (%s) at the network layer\n",
+             excluded ? "excluded" : "readmitted", uuid_str,
+             address[0] != '\0' ? address : "no address");
 }
 
 /* Bring the Paxos chain INDEX into line with the chain itself.
@@ -1783,7 +1925,7 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
         json_decref(grant_json);
 
         log_debug(proc->logger, "Reputation: Request granted\n");
-        messaging_send("network", NET_MESSAGE, &grant, false);
+        _rep_send_to_network(proc, &grant);
     }
     else if (result == PAXOS_BACKDATE)
     {
@@ -1807,7 +1949,7 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
         json_decref(bd_json);
 
         log_debug(proc->logger, "Reputation: Request backdated\n");
-        messaging_send("network", NET_MESSAGE, &backdate, false);
+        _rep_send_to_network(proc, &backdate);
     }
     else
     {
@@ -1831,7 +1973,7 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
         json_decref(nack_json);
 
         log_debug(proc->logger, "Reputation: Request refused\n");
-        messaging_send("network", NET_MESSAGE, &nack, false);
+        _rep_send_to_network(proc, &nack);
     }
 
     return true;
@@ -1997,7 +2139,7 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
             memcpy(&tx_msg.info.net_msg.to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
             strncpy(tx_msg.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
             net_msg_pack_json(&tx_msg.info.net_msg, tx_json);
-            messaging_send("network", NET_MESSAGE, &tx_msg, false);
+            _rep_send_to_network(proc, &tx_msg);
         }
         peers_read_unlock(proc);
         json_decref(tx_json);
@@ -2118,7 +2260,7 @@ static bool handle_nack(const process_t *proc, directory_t *queues, generic_msg_
              * assert `to: broadcast` on the retry. */
             net_msg_pack_json(&retry.info.net_msg, retry_json);
             json_decref(retry_json);
-            messaging_send("network", NET_MESSAGE, &retry, false);
+            _rep_send_to_network(proc, &retry);
         }
     }
 
@@ -2152,7 +2294,7 @@ static bool handle_backdate(const process_t *proc, directory_t *queues, generic_
     memcpy(&update_req.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
     strncpy(update_req.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
 
-    messaging_send("network", NET_MESSAGE, &update_req, false);
+    _rep_send_to_network(proc, &update_req);
 
     /* ...AND RETRY OUR ROUND, or it is simply lost. A backdate answers a
      * request whose chain index was one commit behind, which with three live
@@ -2349,7 +2491,7 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
     net_msg_pack_json(&accepted.info.net_msg, acc_json);
     json_decref(acc_json);
 
-    messaging_send("network", NET_MESSAGE, &accepted, false);
+    _rep_send_to_network(proc, &accepted);
     return true;
 }
 
@@ -2520,6 +2662,13 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
             tx_history_update(chain, peer_uuid, peer_uuid, score, NULL);
         }
         paxos_advance_chain(&rep_state.paxos);
+        /* Our half is in: stop watching it (ISSUES §2.24). */
+        if (have_task_uuid)
+        {
+            pthread_mutex_lock(&rep_state.lock);
+            map_remove(&rep_state.awaiting_commit, (map_key_t)task_uuid_str);
+            pthread_mutex_unlock(&rep_state.lock);
+        }
         /* Reset this peer's idle clock: the staleness sweep must leave an
          * actively-transacting peer alone (doc/architecture/reputation.md). */
         _note_interaction(peer_uuid);
@@ -2586,7 +2735,7 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
                 memcpy(&per.info.net_msg.to_whom,
                        &proc->protocol.peers[i],
                        sizeof(public_identity_t));
-                messaging_send("network", NET_MESSAGE, &per, false);
+                _rep_send_to_network(proc, &per);
             }
             peers_read_unlock(proc);
         }
@@ -2758,7 +2907,7 @@ static bool handle_outdated(const process_t *proc, directory_t *queues, generic_
     }
 
     log_debug(proc->logger, "Reputation: Sent update\n");
-    messaging_send("network", NET_MESSAGE, &update, false);
+    _rep_send_to_network(proc, &update);
     return true;
 }
 
@@ -2809,7 +2958,7 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
          * as add them, and both move scores. */
         size_t n_before = 0;
         uuid_t *peers_before = _chain_peers_locked(&n_before);
-        tx_reconcile_result_t res = { TX_RECONCILE_NONE, -1, 0, 0 };
+        tx_reconcile_result_t res = { TX_RECONCILE_NONE, -1, 0, 0, NULL };
         if (json_is_array(chain_json))
             tx_history_reconcile_attested(&rep_state.history, chain_json,
                                           final_end, outvoted ? &att : NULL,
@@ -2850,6 +2999,11 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
         }
         free(peers_before);
         free(peers_after);
+        /* After the unlock: a re-proposal starts a Paxos round, which takes
+         * the lock itself. */
+        if (res.status == TX_RECONCILE_ADOPTED)
+            _repropose_dropped(proc, &res);
+        tx_reconcile_result_free(&res);
         return true;
     }
 
@@ -2858,6 +3012,7 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
     map_set(&rep_state.updates, sender_uuid, chain_dat);
 
     size_t up_count = map_size(&rep_state.updates);
+    tx_reconcile_result_t maj_res = { TX_RECONCILE_NONE, -1, 0, 0, NULL };
 
     if (up_count >= (size_t)rep_state.num_updates)
     {
@@ -2909,7 +3064,8 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
 
             if (best_json != NULL && best_count > (int)(up_count / 2))
             {
-                tx_history_era_from_json(&rep_state.history, best_json);
+                tx_history_reconcile(&rep_state.history, best_json, -1,
+                                     &maj_res);
                 log_debug(proc->logger, "Reputation: Updated\n");
             }
             else
@@ -2933,6 +3089,14 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
     }
 
     pthread_mutex_unlock(&rep_state.lock);
+    if (maj_res.status == TX_RECONCILE_ADOPTED)
+    {
+        log_info(proc->logger,
+                 "Reputation: adopted the majority chain at index %d: dropped "
+                 "%d, added %d\n", maj_res.fork, maj_res.dropped, maj_res.added);
+        _repropose_dropped(proc, &maj_res);
+    }
+    tx_reconcile_result_free(&maj_res);
     return true;
 }
 
@@ -2983,11 +3147,12 @@ static json_t *_reputation_json(const char *peer_uuid_str, double score)
  ****************************/
 
 /*@
+  requires \valid(proc);
   requires \valid(req);
   requires body != \null;
 */
-static void _send_rep_response(const net_msg_t *req, const char *req_proc,
-                               json_t *body)
+static void _send_rep_response(const process_t *proc, const net_msg_t *req,
+                               const char *req_proc, json_t *body)
 {
     generic_msg_t resp = {0};
     resp.type = NET_MESSAGE;
@@ -3002,7 +3167,7 @@ static void _send_rep_response(const net_msg_t *req, const char *req_proc,
     at_strlcpy(resp.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
     net_msg_pack_json(&resp.info.net_msg, body);
     json_decref(body);
-    messaging_send("network", NET_MESSAGE, &resp, false);
+    _rep_send_to_network(proc, &resp);
 }
 
 /****************************
@@ -3109,7 +3274,7 @@ static bool handle_consensus_rep_request(const process_t *proc, directory_t *que
     char req_proc[PROC_NAME_LEN] = {0};
     at_strlcpy(req_proc, req_proc_str, PROC_NAME_LEN);
     json_decref(payload);
-    _send_rep_response(nmsg, req_proc, resp_json);
+    _send_rep_response(proc, nmsg, req_proc, resp_json);
     return true;
 }
 
@@ -3258,7 +3423,7 @@ static bool handle_consensus_rep_batch_request(const process_t *proc, directory_
     }
     probes_counter("rep.consensus_batch", "queued", NULL);
 
-    _send_rep_response(nmsg, req_proc, roster);
+    _send_rep_response(proc, nmsg, req_proc, roster);
     return true;
 }
 
@@ -3277,12 +3442,16 @@ static bool handle_consensus_rep_batch_request(const process_t *proc, directory_
  * STORE it. The one place a score is computed: handle_rep_request answers with
  * it and _rescore_peers publishes it, so the two cannot drift apart. Returns
  * the stored score. Caller must hold rep_state.lock. */
-static double _score_peer_locked(const uuid_t peer_uuid)
+static double _score_peer_locked(const process_t *proc, const uuid_t peer_uuid)
 {
     double score = 0.0;
-    /* Use a dummy self uuid (zero) for now — process doesn't carry self identity */
+    /* This node's own uuid: contrite TFT scores only the transactions between
+     * it and the peer, so without it no bilateral transaction ever matches and
+     * every peer reads as having no history (the prereputation prior). Left
+     * null only if the identity config is missing, the same fallback. */
     uuid_t self_uuid;
     uuid_clear(self_uuid);
+    (void)_resolve_self_uuid(proc, self_uuid);
 
     /* Hysteresis: switch to pure mode only after the previous score
      * crosses COOP_ENTER; fall back to CTFT only after it drops
@@ -3364,9 +3533,20 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
     bool have_uuid = false;
     if (uuid_parse(peer_uuid_str, peer_uuid) == 0)
     {
+        /* A node never scores itself: its own history holds no bilateral
+         * evidence about it, and a stored self-score would feed its own tier.
+         * Dropped, not answered -- _rescore_peers already skips self; this
+         * closes the rep_req path. Mirrors Python _compute_reputation. */
+        uuid_t self_uuid;
+        if (_resolve_self_uuid(proc, self_uuid) &&
+            uuid_compare(peer_uuid, self_uuid) == 0) {
+            probes_counter("rep.compute", "self_skipped", NULL);
+            json_decref(payload);
+            return true;
+        }
         have_uuid = true;
         pthread_mutex_lock(&rep_state.lock);
-        score = _score_peer_locked(peer_uuid);
+        score = _score_peer_locked(proc, peer_uuid);
         pthread_mutex_unlock(&rep_state.lock);
     }
 
@@ -3393,7 +3573,7 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
     char req_proc[PROC_NAME_LEN] = {0};
     at_strlcpy(req_proc, req_proc_str, PROC_NAME_LEN);
     json_decref(payload);
-    _send_rep_response(nmsg, req_proc, resp_json);
+    _send_rep_response(proc, nmsg, req_proc, resp_json);
     return true;
 }
 
@@ -3515,6 +3695,101 @@ static bool handle_local_rep_query(const process_t *proc, directory_t *queues, g
   requires proc->logger == \null || \valid(proc->logger);
   requires rep_state.paxos.initialized == \true;
 */
+/* OUR HALF, UNTIL IT IS IN THE CHAIN (ISSUES §2.24).
+ *
+ * A round can be lost in two ways that nothing noticed. A GRANTED round leaves
+ * my_requests the moment its transaction goes out (handle_grant), so if the
+ * acceptors never commit it, because another round took the slot, it is simply
+ * gone. A round nobody ANSWERS gets neither a grant nor a nack, so it
+ * waits in my_requests forever. The nack retry covers neither case. Partition
+ * cohort part-3490610: island B's app reaction, forwarded by both sides,
+ * collided with one of AT's probe rounds for the same slot, and was never
+ * heard of again.
+ *
+ * So the task is followed rather than the round. Every proposal of ours files
+ * (or refreshes) an entry here. A commit of our half clears it, and
+ * _retry_uncommitted_halves re-proposes any whose deadline passed without one.
+ * Caller holds rep_state.lock. */
+static void _await_commit_locked(const tx_score_t *tx, const uuid_t proposer)
+{
+    if (tx == NULL)
+        return;
+    char task_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(tx->task_uuid, task_str);
+    double deadline = (double)time(NULL) + REP_COMMIT_TIMEOUT;
+    data_t *dat = NULL;
+    rep_awaiting_t *w = NULL;
+    if (map_get(&rep_state.awaiting_commit, task_str, &dat) == 0)
+        data_object_ptr(dat, (void **)&w);
+    if (w != NULL) {
+        /* A re-proposal (ours, a nack retry, or a DDIL one): same task, so
+         * the attempt count carries on and only the clock restarts. */
+        w->deadline = deadline;
+        return;
+    }
+    w = smrt_create(sizeof(rep_awaiting_t));
+    if (w == NULL)
+        return;
+    uuid_copy(w->task_uuid, tx->task_uuid);
+    uuid_copy(w->proposer, proposer);
+    w->score = tx->score;
+    at_strlcpy(w->capability_name, tx->capability_name,
+               sizeof(w->capability_name));
+    at_strlcpy(w->channel, tx->channel, sizeof(w->channel));
+    w->competence = tx->competence;
+    w->deadline = deadline;
+    w->attempts = 0;
+    data_t *wd = object_ptr_data(w, sizeof(rep_awaiting_t));
+    if (wd == NULL || map_set(&rep_state.awaiting_commit, task_str, wd) != 0)
+        smrt_deref(w);
+}
+
+/* Does @p chain hold @p proposer's half of @p task_uuid (bilateral or not)? */
+static bool _half_in_chain_locked(const tx_history_t *chain,
+                                  const uuid_t task_uuid, const uuid_t proposer)
+{
+    char task_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(task_uuid, task_str);
+    data_t *slot = NULL;
+    if (map_get((map_t *)&chain->task_map, task_str, &slot) != 0)
+        return false;
+    int idx = -1;
+    if (data_integer(slot, &idx) != 0 || idx < 0 || idx >= chain->chain_len)
+        return false;
+    const transaction_t *t = &chain->chain[idx];
+    return (t->p1_set && uuid_compare(t->p1_uuid, proposer) == 0)
+        || (t->p2_set && uuid_compare(t->p2_uuid, proposer) == 0);
+}
+
+/* The primary chain, or any child chain a gateway keeps. */
+static bool _own_half_recorded_locked(const uuid_t task_uuid,
+                                      const uuid_t proposer)
+{
+    if (_half_in_chain_locked(&rep_state.history, task_uuid, proposer))
+        return true;
+    bool found = false;
+    map_key_t ck = NULL;
+    data_t *cv = NULL;
+    map_entries_for_each(&rep_state.child_hist, ck, cv)
+    {
+        void *hp = NULL;
+        if (!found && data_object_ptr(cv, &hp) == 0 && hp != NULL
+            && _half_in_chain_locked((const tx_history_t *)hp, task_uuid,
+                                     proposer))
+            found = true;
+    }
+    map_end_for_each;
+    return found;
+}
+
+size_t reputation_awaiting_commit_count(void)
+{
+    pthread_mutex_lock(&rep_state.lock);
+    size_t n = map_size(&rep_state.awaiting_commit);
+    pthread_mutex_unlock(&rep_state.lock);
+    return n;
+}
+
 void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
                           const uuid_t peer_uuid, double score,
                           const char *capability_name, const char *channel,
@@ -3584,6 +3859,7 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
          * reputation_install_my_request instead of going through this
          * function, so the two keys never had to agree. */
         map_set(&rep_state.my_requests, round_key, tx_dat);
+        _await_commit_locked(tx, peer_uuid);
     }
 
     /* Cache the weight for this task so _pure_reputation can aggregate it
@@ -3624,7 +3900,7 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
         net_msg_pack_json(&req.info.net_msg, req_json);
         json_decref(req_json);
 
-        messaging_send("network", NET_MESSAGE, &req, false);
+        _rep_send_to_network(proc, &req);
     }
     peers_read_unlock(proc);
 
@@ -3643,10 +3919,10 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
  * _apply_slash. A finalized slash floors the target's reputation
  * immediately, bypassing the consensus EMA. Wire payloads are plain
  * JSON objects (per-implementation shape; byte_pinning:false conformance
- * checks state equivalence, not injected-message bytes). C has no direct
- * self-identity here (see handle_rep_request), so there is no self-skip
- * — handle_committed documents the same: the broadcast loop excludes
- * self, and applying an idempotent floor twice is harmless.
+ * checks state equivalence, not injected-message bytes). There is no
+ * self-skip, and none is needed -- handle_committed documents the same: the
+ * broadcast loop excludes self, and applying an idempotent floor twice is
+ * harmless.
  ****************************/
 
 /* Advance the per-(target, slasher) high-water mark, or refuse.
@@ -4000,6 +4276,19 @@ static bool _quorum_met(const process_t *proc, json_t *sigs,
     return _quorum_met_for(proc, sigs, desig, dlen, NULL);
 }
 
+/* _quorum_met_for with the CHECKPOINT threshold (_ckpt_quorum_for_group). */
+static bool _ckpt_quorum_met_for(const process_t *proc, json_t *sigs,
+                                 const uint8_t *desig, size_t dlen,
+                                 const char *group_uuid)
+{
+    if (proc == NULL)
+        return false;
+    peers_read_lock(proc);
+    size_t quorum = _ckpt_quorum_for_group(proc, group_uuid);
+    peers_read_unlock(proc);
+    return _verified_cosigners(proc, sigs, desig, dlen) > quorum;
+}
+
 /* Record one verified co-signature for a round. The map is keyed
  * "<round>:<voter>" so a voter re-sending its ack overwrites rather than
  * increments: one voter, one vote. */
@@ -4164,7 +4453,7 @@ static bool handle_slash_propose(const process_t *proc, directory_t *queues, gen
     strncpy(sign.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
     net_msg_pack_json(&sign.info.net_msg, sign_json);
     json_decref(sign_json);
-    messaging_send("network", NET_MESSAGE, &sign, false);
+    _rep_send_to_network(proc, &sign);
     /* THE SUCCESS SIDE. Every other outcome of this handler says something;
      * agreeing said nothing, so a round that worked was indistinguishable
      * from one that never started. A slash only lands once a quorum co-signs. */
@@ -4297,7 +4586,7 @@ static bool handle_slash_sign(const process_t *proc, directory_t *queues, generi
             generic_msg_t per = bcast;
             memcpy(&per.info.net_msg.to_whom, &proc->protocol.peers[i],
                    sizeof(public_identity_t));
-            messaging_send("network", NET_MESSAGE, &per, false);
+            _rep_send_to_network(proc, &per);
         }
         peers_read_unlock(proc);
     }
@@ -4448,6 +4737,194 @@ static bool handle_slash_final(const process_t *proc, directory_t *queues, gener
     return true;
 }
 
+/* Do the entries we hold at the proposed indices hash to @p root?
+ *
+ * The range, not our whole window (ISSUES §2.29). The chain grows every second
+ * or two in a busy group and each member proposes on its own phase, so by the
+ * time a proposal lands the receiver has often committed one entry more (or
+ * one fewer). Comparing whole windows declined every such honest proposal:
+ * partition cohort part-3592107 (2026-09-29) had all four island-A nodes
+ * propose epoch 12 over the SAME root, and not one proposal collected the four
+ * signatures it needed. A signer that holds the range attests exactly what the
+ * proposer signed, however far past it the chain has since run.
+ *
+ * An empty range (count 0) has no indices to look up, so it keeps the old
+ * whole-window rule: it matches only an empty window. Caller holds
+ * rep_state.lock. */
+static bool _range_matches_locked(const char *chain_key, const char *root,
+                                  int64_t first_index, int64_t count)
+{
+    char mine[TX_HASH_HEX_LEN + 1] = {0};
+    tx_history_t *chain = _chain_for_key_locked(chain_key);
+    if (count > 0)
+    {
+        if (first_index < 0 || first_index > INT32_MAX || count > INT32_MAX
+            || tx_history_range_root(chain, (int)first_index, (int)count,
+                                     mine) != 0)
+            return false;   /* we do not hold every index in the range */
+    }
+    else
+    {
+        transaction_window_root(chain, mine);
+    }
+    return strncmp(mine, root, TX_HASH_HEX_LEN + 1) == 0;
+}
+
+/* Keep a proposal we could not co-sign on arrival, so a signer that was BEHIND
+ * signs once it catches up (ISSUES §2.29). One slot per proposer and chain: a
+ * proposer's newer epoch replaces its older one, which bounds the table by the
+ * group's size. When every slot holds a different proposer the oldest goes.
+ * Caller holds rep_state.lock. */
+static void _park_cosign_locked(const char *proposer, const char *group_raw,
+                                const char *root, int64_t epoch,
+                                int64_t first_index, int64_t count,
+                                const public_identity_t *to, double present)
+{
+    int slot = -1, oldest = 0;
+    for (int i = 0; i < REP_PARKED_COSIGN_MAX; i++)
+    {
+        rep_parked_cosign_t *p = &rep_state.parked_cosigns[i];
+        if (p->used && strcmp(p->proposer, proposer) == 0
+            && strcmp(p->group, group_raw) == 0)
+        {
+            if (p->epoch > epoch)
+                return;   /* a late copy of an older round */
+            slot = i;
+            break;
+        }
+        if (!p->used && slot < 0)
+            slot = i;
+        if (rep_state.parked_cosigns[oldest].used
+            && (!p->used || p->parked_at < rep_state.parked_cosigns[oldest].parked_at))
+            oldest = i;
+    }
+    if (slot < 0)
+        slot = oldest;
+    rep_parked_cosign_t *p = &rep_state.parked_cosigns[slot];
+    memset(p, 0, sizeof(*p));
+    p->used = true;
+    at_strlcpy(p->proposer, proposer, sizeof(p->proposer));
+    at_strlcpy(p->group, group_raw, sizeof(p->group));
+    at_strlcpy(p->root, root, sizeof(p->root));
+    p->epoch = epoch;
+    p->first_index = first_index;
+    p->count = count;
+    p->parked_at = present;
+    memcpy(&p->to, to, sizeof(public_identity_t));
+}
+
+/* Co-sign a checkpoint designation with our own key and send checkpoint_sign
+ * to the proposer, naming ourselves. Shared by the propose handler and the
+ * parked re-check, which must produce byte-identical acks. */
+static bool _cosign_checkpoint(const process_t *proc,
+                               const public_identity_t *to,
+                               const char *proposer_str, const char *root,
+                               int64_t epoch, int64_t first_index,
+                               int64_t count_covered, const char *group_raw)
+{
+    const identity_t *self = _resolve_self_identity(proc);
+    uint8_t desig[REP_DESIG_MAX];
+    /* Signed over the chain name the PROPOSER used (group_raw), never our
+     * locally resolved chain_key -- the proposer verifies this signature
+     * against its own designation, and for a member of a child group the two
+     * spellings differ. */
+    size_t dlen = rep_checkpoint_designation(proposer_str, root, epoch,
+                                            first_index, count_covered,
+                                            group_raw, desig, sizeof(desig));
+    char sig_hex[REP_SIG_HEX_LEN + 1] = {0};
+    if (self == NULL || dlen == 0
+        || _cosign_hex(proc, desig, dlen, sig_hex, sizeof(sig_hex)) != 0)
+    {
+        log_warn(proc->logger,
+                 "Reputation: cannot sign checkpoint_propose; declining to co-sign\n");
+        return false;
+    }
+    char self_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(self->uuid, self_str);
+    json_t *sign_json = json_object();
+    if (sign_json == NULL)
+        return false;
+    json_object_set_new(sign_json, "proposer_uuid", json_string(proposer_str));
+    json_object_set_new(sign_json, "epoch", json_integer(epoch));
+    json_object_set_new(sign_json, "signer_uuid", json_string(self_str));
+    json_object_set_new(sign_json, "signature", json_string(sig_hex));
+    /* The ack names the chain too — the proposer needs it to find the right
+     * pending round, and it is inside the bytes just signed. Mirrors Python's
+     * 5-element ack tuple; the far side treats an absent field as the primary
+     * chain, so an older peer that omits it still resolves. */
+    if (group_raw[0] != '\0')
+        json_object_set_new(sign_json, "group_uuid", json_string(group_raw));
+
+    generic_msg_t sign = {0};
+    sign.type = NET_MESSAGE;
+    strncpy(sign.info.net_msg.process, "reputation", PROC_NAME_LEN);
+    sign.info.net_msg.function = REP_PROTO_CHECKPOINT_SIGN;
+    sign.info.net_msg.encrypt = true;
+    memcpy(&sign.info.net_msg.to_whom, to, sizeof(public_identity_t));
+    strncpy(sign.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+    net_msg_pack_json(&sign.info.net_msg, sign_json);
+    json_decref(sign_json);
+    _rep_send_to_network(proc, &sign);
+    /* THE SUCCESS SIDE. Every other outcome of this handler says something;
+     * agreeing said nothing, so a round that worked was indistinguishable
+     * from one that never started. A checkpoint only anchors evidence once a quorum co-signs. */
+    log_info(proc->logger,
+             "Reputation: co-signed checkpoint_propose from %s\n",
+             to->nickname);
+    return true;
+}
+
+size_t _recheck_parked_cosigns(const process_t *proc, double present)
+{
+    rep_parked_cosign_t due[REP_PARKED_COSIGN_MAX];
+    size_t n_due = 0;
+    double ttl = REP_CHECKPOINT_INTERVAL;
+    pthread_mutex_lock(&rep_state.lock);
+    for (int i = 0; i < REP_PARKED_COSIGN_MAX; i++)
+    {
+        rep_parked_cosign_t *p = &rep_state.parked_cosigns[i];
+        if (!p->used)
+            continue;
+        /* By the next interval the proposer has moved on to a new epoch. */
+        if (present - p->parked_at > ttl)
+        {
+            p->used = false;
+            continue;
+        }
+        char chain_key[UUID_STRING_LEN + 1];
+        _chain_key(proc, p->group, chain_key, sizeof(chain_key));
+        if (_range_matches_locked(chain_key, p->root, p->first_index, p->count))
+        {
+            due[n_due++] = *p;
+            p->used = false;
+        }
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    /* Signed and sent outside the lock, as the propose handler does. */
+    for (size_t i = 0; i < n_due; i++)
+    {
+        rep_parked_cosign_t *p = &due[i];
+        log_info(proc->logger,
+                 "Reputation: caught up to %s's checkpoint epoch %lld after "
+                 "%.1f s; co-signing it now\n",
+                 p->to.nickname, (long long)p->epoch, present - p->parked_at);
+        _cosign_checkpoint(proc, &p->to, p->proposer, p->root, p->epoch,
+                           p->first_index, p->count, p->group);
+    }
+    return n_due;
+}
+
+size_t reputation_parked_cosign_count(void)
+{
+    size_t n = 0;
+    pthread_mutex_lock(&rep_state.lock);
+    for (int i = 0; i < REP_PARKED_COSIGN_MAX; i++)
+        if (rep_state.parked_cosigns[i].used)
+            n++;
+    pthread_mutex_unlock(&rep_state.lock);
+    return n;
+}
+
 /****************************
  * Phase 2: quorum-signed Merkle checkpoints
  *
@@ -4518,12 +4995,11 @@ static bool handle_checkpoint_propose(const process_t *proc, directory_t *queues
     snprintf(key, sizeof(key), "%s:%lld:%.*s", proposer_str, (long long)epoch,
              (int)UUID_STRING_LEN, group_raw);
 
-    /* Consensus check: co-sign ONLY if our own committed window produces the
-     * same Merkle root. Record the proposed round as pending either way so the
-     * sign handler (driven by other nodes' co-signs in conformance) can
-     * finalize the agreed value. The record carries the window bounds as well
-     * as the root because the designation covers them. */
-    char mine[TX_HASH_HEX_LEN + 1];
+    /* Consensus check: co-sign ONLY if the entries WE hold at the proposed
+     * indices produce the same Merkle root. Record the proposed round as
+     * pending either way so the sign handler (driven by other nodes' co-signs
+     * in conformance) can finalize the agreed value. The record carries the
+     * window bounds as well as the root because the designation covers them. */
     json_t *pending_rec = json_object();
     if (pending_rec != NULL)
     {
@@ -4538,78 +5014,30 @@ static bool handle_checkpoint_propose(const process_t *proc, directory_t *queues
                                json_string(group_raw));
     }
     pthread_mutex_lock(&rep_state.lock);
-    transaction_window_root(_chain_for_key_locked(chain_key), mine);
+    bool matches = _range_matches_locked(chain_key, root, first_index,
+                                         count_covered);
     _store_pending_locked(&rep_state.checkpoint_pending, key, pending_rec);
+    if (!matches)
+        _park_cosign_locked(proposer_str, group_raw, root, epoch, first_index,
+                            count_covered, &nmsg->from_whom, (double)time(NULL));
     pthread_mutex_unlock(&rep_state.lock);
     json_decref(pending_rec);
-    bool matches = (strncmp(mine, root, TX_HASH_HEX_LEN + 1) == 0);
     if (!matches)
     {
+        /* Not a refusal yet: our chain may simply not have caught up to the
+         * proposer's, or be about to adopt it. Parked and re-checked every
+         * pass (ISSUES §2.29). */
         log_debug(proc->logger,
-                  "Reputation: checkpoint_propose window_root mismatch on "
-                  "chain %s, declining\n",
+                  "Reputation: checkpoint_propose range [%lld, +%lld) does not "
+                  "match our chain %s yet; parked\n",
+                  (long long)first_index, (long long)count_covered,
                   chain_key[0] ? chain_key : "primary");
         json_decref(payload);
         return true;
     }
-
-    /* Co-sign: sign the checkpoint designation with our own key and emit
-     * checkpoint_sign back to the proposer, naming ourselves. */
-    const identity_t *self = _resolve_self_identity(proc);
-    uint8_t desig[REP_DESIG_MAX];
-    /* Signed over the chain name the PROPOSER used (group_raw), never our
-     * locally resolved chain_key -- the proposer verifies this signature
-     * against its own designation, and for a member of a child group the two
-     * spellings differ. */
-    size_t dlen = rep_checkpoint_designation(proposer_str, root, epoch,
-                                            first_index, count_covered,
-                                            group_raw, desig, sizeof(desig));
-    char sig_hex[REP_SIG_HEX_LEN + 1] = {0};
-    if (self == NULL || dlen == 0
-        || _cosign_hex(proc, desig, dlen, sig_hex, sizeof(sig_hex)) != 0)
-    {
-        log_warn(proc->logger,
-                 "Reputation: cannot sign checkpoint_propose; declining to co-sign\n");
-        json_decref(payload);
-        return true;
-    }
-    char self_str[UUID_STRING_LEN + 1];
-    uuid_unparse_lower(self->uuid, self_str);
-    json_t *sign_json = json_object();
-    if (sign_json == NULL)
-    {
-        json_decref(payload);
-        return true;
-    }
-    json_object_set_new(sign_json, "proposer_uuid", json_string(proposer_str));
-    json_object_set_new(sign_json, "epoch", json_integer(epoch));
-    json_object_set_new(sign_json, "signer_uuid", json_string(self_str));
-    json_object_set_new(sign_json, "signature", json_string(sig_hex));
-    /* The ack names the chain too — the proposer needs it to find the right
-     * pending round, and it is inside the bytes just signed. Mirrors Python's
-     * 5-element ack tuple; the far side treats an absent field as the primary
-     * chain, so an older peer that omits it still resolves. */
-    if (group_raw[0] != '\0')
-        json_object_set_new(sign_json, "group_uuid", json_string(group_raw));
+    _cosign_checkpoint(proc, &nmsg->from_whom, proposer_str, root, epoch,
+                       first_index, count_covered, group_raw);
     json_decref(payload);
-
-    generic_msg_t sign = {0};
-    sign.type = NET_MESSAGE;
-    strncpy(sign.info.net_msg.process, "reputation", PROC_NAME_LEN);
-    sign.info.net_msg.function = REP_PROTO_CHECKPOINT_SIGN;
-    sign.info.net_msg.encrypt = true;
-    memcpy(&sign.info.net_msg.to_whom, &nmsg->from_whom,
-           sizeof(public_identity_t));
-    strncpy(sign.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
-    net_msg_pack_json(&sign.info.net_msg, sign_json);
-    json_decref(sign_json);
-    messaging_send("network", NET_MESSAGE, &sign, false);
-    /* THE SUCCESS SIDE. Every other outcome of this handler says something;
-     * agreeing said nothing, so a round that worked was indistinguishable
-     * from one that never started. A checkpoint only anchors evidence once a quorum co-signs. */
-    log_info(proc->logger,
-             "Reputation: co-signed checkpoint_propose from %s\n",
-             nmsg->from_whom.nickname);
     return true;
 }
 
@@ -4711,7 +5139,7 @@ static bool handle_checkpoint_sign(const process_t *proc, directory_t *queues, g
     json_t *sigs = _cosigs_json_locked(&rep_state.checkpoint_sigs, key, &count);
     pthread_mutex_unlock(&rep_state.lock);
     peers_read_lock(proc);
-    size_t quorum = proc->protocol.num_peers / 2;
+    size_t quorum = _ckpt_quorum_for_group(proc, NULL);
     peers_read_unlock(proc);
     bool finalize = count > quorum;
 
@@ -4762,7 +5190,7 @@ static bool handle_checkpoint_sign(const process_t *proc, directory_t *queues, g
             generic_msg_t per = bcast;
             memcpy(&per.info.net_msg.to_whom, &proc->protocol.peers[i],
                    sizeof(public_identity_t));
-            messaging_send("network", NET_MESSAGE, &per, false);
+            _rep_send_to_network(proc, &per);
         }
         peers_read_unlock(proc);
     }
@@ -5020,7 +5448,7 @@ static void _send_resolved(const process_t *proc,
     out.info.net_msg.encrypt = true;
     memcpy(&out.info.net_msg.to_whom, to_whom, sizeof(public_identity_t));
     net_msg_pack_json(&out.info.net_msg, answer);
-    messaging_send("network", NET_MESSAGE, &out, false);
+    _rep_send_to_network(proc, &out);
 }
 
 /* Send a query one level DOWN, to every child group we gateway, with the TTL
@@ -5068,7 +5496,7 @@ static size_t _forward_resolve(const process_t *proc, json_t *query)
             memcpy(&per.info.net_msg.to_whom, &proc->protocol.peers[i],
                    sizeof(public_identity_t));
             net_msg_pack_json(&per.info.net_msg, onward);
-            messaging_send("network", NET_MESSAGE, &per, false);
+            _rep_send_to_network(proc, &per);
             sent++;
         }
         peers_read_unlock(proc);
@@ -5659,7 +6087,7 @@ static bool handle_checkpoint_final(const process_t *proc, directory_t *queues, 
                                          sizeof(desig))
             : 0;
         json_t *sigs = json_object_get(payload, "sigs");
-        if (dlen == 0 || !_quorum_met_for(proc, sigs, desig, dlen, final_chain))
+        if (dlen == 0 || !_ckpt_quorum_met_for(proc, sigs, desig, dlen, final_chain))
         {
             log_warn(proc->logger,
                      "Reputation: rejecting checkpoint_final epoch=%lld: %zu "
@@ -5715,7 +6143,7 @@ static bool handle_checkpoint_final(const process_t *proc, directory_t *queues, 
                  (long long)epoch, (long long)first_index,
                  (long long)(first_index + count_covered - 1),
                  nmsg->from_whom.nickname);
-        messaging_send("network", NET_MESSAGE, &req, false);
+        _rep_send_to_network(proc, &req);
     }
     json_decref(payload);
     return true;
@@ -6086,7 +6514,7 @@ static void _store_checkpoint(const process_t *proc, const char *proposer,
     if (proc != NULL)
     {
         peers_read_lock(proc);
-        quorum = _quorum_for_group(proc, primary ? NULL : chain_key);
+        quorum = _ckpt_quorum_for_group(proc, primary ? NULL : chain_key);
         peers_read_unlock(proc);
     }
     bool write = false;
@@ -6505,7 +6933,7 @@ static int _rescore_peers(const process_t *proc, double present,
         if (!uuid_is_null(due[i]))
         {
             uuid_copy(due[kept], due[i]);
-            scores[kept] = _score_peer_locked(due[i]);
+            scores[kept] = _score_peer_locked(proc, due[i]);
             kept++;
         }
     }
@@ -6637,7 +7065,7 @@ static bool _rebuild_one_chain(const process_t *proc, const char *chain_key,
                 }
                 map_end_for_each
                 if (dlen == 0
-                    || !_quorum_met_for(proc, sigs, desig, dlen, chain_key))
+                    || !_ckpt_quorum_met_for(proc, sigs, desig, dlen, chain_key))
                 {
                     log_warn(proc->logger,
                              "Reputation: warm-start evidence epoch=%lld has "
@@ -6985,7 +7413,7 @@ static void _originate_checkpoint(const process_t *proc,
             generic_msg_t per = bcast;
             memcpy(&per.info.net_msg.to_whom, &proc->protocol.peers[i],
                    sizeof(public_identity_t));
-            messaging_send("network", NET_MESSAGE, &per, false);
+            _rep_send_to_network(proc, &per);
         }
         peers_read_unlock(proc);
     }
@@ -7093,6 +7521,180 @@ void _retry_nacked_rounds(const process_t *proc, double present,
                              due[i].channel[0] != '\0' ? due[i].channel : NULL,
                              no_subject, due[i].competence);
     }
+}
+
+/* Re-propose OUR halves that have waited out REP_COMMIT_TIMEOUT without
+ * reaching the chain (ISSUES §2.24; see _await_commit_locked). A half now in
+ * the chain, by our commit or inside a chain we adopted, is simply forgotten.
+ * Any round still filed for the task is retired first, so a late grant for
+ * the stale ballot cannot race the fresh one. After REP_COMMIT_RETRIES the
+ * half is given up, and that is said out loud. Collect-then-act, like
+ * _retry_nacked_rounds: _forward_transaction takes the lock itself. */
+#define REP_COMMIT_RETRY_PER_PASS 4
+void _retry_uncommitted_halves(const process_t *proc, double present)
+{
+    rep_awaiting_t due[REP_COMMIT_RETRY_PER_PASS];
+    size_t n_due = 0;
+    char gone[REP_COMMIT_RETRY_PER_PASS * 2][UUID_STRING_LEN + 1];
+    size_t n_gone = 0;
+
+    pthread_mutex_lock(&rep_state.lock);
+    map_key_t key = NULL;
+    data_t *value = NULL;
+    map_entries_for_each(&rep_state.awaiting_commit, key, value)
+    {
+        rep_awaiting_t *w = NULL;
+        if (data_object_ptr(value, (void **)&w) != 0 || w == NULL)
+            continue;
+        if (_own_half_recorded_locked(w->task_uuid, w->proposer)) {
+            if (n_gone < sizeof(gone) / sizeof(gone[0]))
+                at_strlcpy(gone[n_gone++], key, sizeof(gone[0]));
+            continue;
+        }
+        if (w->deadline > present || n_due >= REP_COMMIT_RETRY_PER_PASS)
+            continue;
+        due[n_due++] = *w;
+        w->attempts++;
+    }
+    map_end_for_each;
+    for (size_t i = 0; i < n_gone; i++)
+        map_remove(&rep_state.awaiting_commit, gone[i]);
+
+    /* Retire every round still filed for a due task, and the entries of the
+     * halves being given up. */
+    for (size_t i = 0; i < n_due; i++)
+    {
+        char task_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(due[i].task_uuid, task_str);
+        char stale[16][PAXOS_KEY_LEN];
+        size_t n_stale = 0;
+        map_entries_for_each(&rep_state.my_requests, key, value)
+        {
+            tx_score_t *tx = NULL;
+            if (n_stale < 16 && data_object_ptr(value, (void **)&tx) == 0
+                && tx != NULL && uuid_compare(tx->task_uuid, due[i].task_uuid) == 0)
+                at_strlcpy(stale[n_stale++], key, PAXOS_KEY_LEN);
+        }
+        map_end_for_each;
+        for (size_t j = 0; j < n_stale; j++) {
+            map_remove(&rep_state.my_requests, stale[j]);
+            map_remove(&rep_state.retry_due, stale[j]);
+        }
+        if (due[i].attempts >= REP_COMMIT_RETRIES)
+            map_remove(&rep_state.awaiting_commit, task_str);
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+
+    uuid_t no_subject;
+    uuid_clear(no_subject);
+    for (size_t i = 0; i < n_due; i++)
+    {
+        char task_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(due[i].task_uuid, task_str);
+        if (due[i].attempts >= REP_COMMIT_RETRIES) {
+            log_warn(proc->logger,
+                     "Reputation: our half of task %s never committed after "
+                     "%d re-proposal(s); giving up on it\n",
+                     task_str, due[i].attempts);
+            continue;
+        }
+        log_info(proc->logger,
+                 "Reputation: our half of task %s is not in the chain after "
+                 "%.0f s; re-proposing it (attempt %d of %d)\n",
+                 task_str, REP_COMMIT_TIMEOUT, due[i].attempts + 1,
+                 REP_COMMIT_RETRIES);
+        _forward_transaction(proc, due[i].task_uuid, due[i].proposer,
+                             due[i].score,
+                             due[i].capability_name[0] != '\0'
+                                 ? due[i].capability_name : NULL,
+                             due[i].channel[0] != '\0' ? due[i].channel : NULL,
+                             no_subject, due[i].competence);
+    }
+}
+
+/* RE-PROPOSE WHAT AN ADOPTION DROPPED (Agora Phase 4 DDIL, 2026-09-25).
+ *
+ * An adoption drops our committed entries from the fork on, both halves of
+ * each (tx_history_reconcile). Across a partition that is every transaction
+ * the smaller island committed while split: its members adopt the larger
+ * island's chain at the heal, and the reputation they earned apart was gone.
+ *
+ * Each node re-submits ITS OWN half of each dropped entry through the normal
+ * round (_forward_transaction), as _retry_nacked_rounds does for a nacked one.
+ * The counterpart, who dropped the same entry, re-submits its half, so the
+ * pair re-forms bilaterally on top of the adopted chain. Nothing new is
+ * trusted: a node vouches only for the score it gave.
+ *
+ * Skipped: an entry that is not ours (we are neither p1 nor p2), a task the
+ * adopted chain already holds (committed or pending, so the peer's chain
+ * carried it after all), and a task we already have a round under way for.
+ * The capability name and the learned weight are not on the entry, so the
+ * re-proposal carries the authored default weight; the channel is on the
+ * entry and is kept. Returns how many were re-proposed. Mirrors Python's
+ * ReputationProcess._repropose_dropped. */
+static int _repropose_dropped(const process_t *proc,
+                              const tx_reconcile_result_t *res)
+{
+    if (res == NULL || res->dropped_entries == NULL || res->dropped <= 0)
+        return 0;
+    uuid_t self_uuid;
+    if (!_resolve_self_uuid(proc, self_uuid))
+        return 0;
+
+    struct {
+        uuid_t task;
+        double score;
+        char   channel[TX_CHANNEL_NAMELEN + 1];
+    } *due = calloc((size_t)res->dropped, sizeof(*due));
+    if (due == NULL)
+        return 0;
+    int n_due = 0;
+
+    pthread_mutex_lock(&rep_state.lock);
+    for (int i = 0; i < res->dropped; i++)
+    {
+        const transaction_t *t = &res->dropped_entries[i];
+        bool mine1 = t->p1_set && uuid_compare(t->p1_uuid, self_uuid) == 0;
+        bool mine2 = t->p2_set && uuid_compare(t->p2_uuid, self_uuid) == 0;
+        if (!mine1 && !mine2)
+            continue;
+        char task_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(t->task_uuid, task_str);
+        data_t *slot = NULL;
+        if (map_get(&rep_state.history.task_map, task_str, &slot) == 0)
+            continue;   /* the adopted chain holds it */
+        bool pending = false;
+        map_key_t key = NULL;
+        data_t *value = NULL;
+        map_entries_for_each(&rep_state.my_requests, key, value)
+        {
+            tx_score_t *tx = NULL;
+            if (data_object_ptr(value, (void **)&tx) == 0 && tx != NULL
+                && uuid_compare(tx->task_uuid, t->task_uuid) == 0)
+                pending = true;
+        }
+        map_end_for_each;
+        if (pending)
+            continue;
+        uuid_copy(due[n_due].task, t->task_uuid);
+        due[n_due].score = mine1 ? t->p1_score : t->p2_score;
+        at_strlcpy(due[n_due].channel, mine1 ? t->p1_channel : t->p2_channel,
+                   sizeof(due[n_due].channel));
+        n_due++;
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+
+    if (n_due > 0)
+        log_info(proc->logger,
+                 "Reputation: re-proposing %d dropped transaction(s)\n", n_due);
+    uuid_t no_subject;
+    uuid_clear(no_subject);
+    for (int i = 0; i < n_due; i++)
+        _forward_transaction(proc, due[i].task, self_uuid, due[i].score, NULL,
+                             due[i].channel[0] != '\0' ? due[i].channel : NULL,
+                             no_subject, 0.0);
+    free(due);
+    return n_due;
 }
 
 /* Originate a checkpoint on the interval, when the window has actually moved.
@@ -7220,6 +7822,8 @@ void reputation_reset_state(int num_peers)
     /* Clear my_requests; entries are smrt_ptr-backed tx_score_t. */
     map_free(&rep_state.my_requests);
     map_init(&rep_state.my_requests);
+    map_free(&rep_state.awaiting_commit);
+    map_init(&rep_state.awaiting_commit);
     map_free(&rep_state.retry_due);
     map_init(&rep_state.retry_due);
     map_free(&rep_state.updates);
@@ -7335,6 +7939,7 @@ void reputation_reset_state(int num_peers)
     map_init(&rep_state.child_evidence_tried);
     map_free(&rep_state.restore_clamped);
     map_init(&rep_state.restore_clamped);
+    memset(rep_state.parked_cosigns, 0, sizeof(rep_state.parked_cosigns));
     rep_state.num_updates = REP_CATCHUP_QUORUM;
     rep_state.num_peers = num_peers;
     paxos_init(&rep_state.paxos, num_peers, NULL);
@@ -7590,6 +8195,29 @@ int reputation_get_request_count(void)
     int count = (int)array_size(&rep_state.paxos.granted_ids);
     pthread_mutex_unlock(&rep_state.lock);
     return count;
+}
+
+int reputation_get_my_request_tasks(uuid_t *tasks, double *scores, int cap)
+{
+    if (!rep_state.initialized || tasks == NULL || scores == NULL || cap <= 0)
+        return -1;
+    int n = 0;
+    pthread_mutex_lock(&rep_state.lock);
+    map_key_t key = NULL;
+    data_t *value = NULL;
+    map_entries_for_each(&rep_state.my_requests, key, value)
+    {
+        tx_score_t *tx = NULL;
+        if (n < cap && data_object_ptr(value, (void **)&tx) == 0 && tx != NULL)
+        {
+            uuid_copy(tasks[n], tx->task_uuid);
+            scores[n] = tx->score;
+            n++;
+        }
+    }
+    map_end_for_each;
+    pthread_mutex_unlock(&rep_state.lock);
+    return n;
 }
 
 int64_t reputation_get_last_id(void)
@@ -7869,6 +8497,11 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
          * Without this a nacked round is lost, and in a three-node cohort
          * most rounds are nacked. */
         _retry_nacked_rounds(proc, present, self_uuid, have_self);
+        /* Our halves that went out and never came back (ISSUES §2.24). */
+        _retry_uncommitted_halves(proc, present);
+        /* Checkpoint proposals that arrived before our chain held their
+         * range (ISSUES §2.29). */
+        _recheck_parked_cosigns(proc, present);
         /* A gateway's child groups arrive over IPC (CHILD_GROUP) after this
          * process was constructed, so their persisted evidence is restored
          * here rather than at boot. Idempotent per group. */

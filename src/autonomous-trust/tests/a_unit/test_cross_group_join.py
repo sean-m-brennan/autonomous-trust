@@ -402,6 +402,9 @@ class TestRotationOnTheWire:
         peers = [_identity('m1'), _identity('m2')]
         grp = _group('cohort', members=peers)
         node = _node(group=grp, peers=peers)
+        # Recording writes config files and re-derives the hierarchy, neither
+        # of which this stand-in wires; what matters here is THAT it happens.
+        node._record_group = MagicMock()
         return node, grp, peers
 
     def test_admission_rotates_and_tells_every_member(self):
@@ -444,6 +447,7 @@ class TestRotationOnTheWire:
         node.handle_group_update(_queues(), msg)
         assert grp.key_epoch == 1
         assert grp.encryptor.publish() == rotated.encryptor.publish()
+        node._record_group.assert_called()   # the network process must hear it (§2.25)
 
 
 class TestRotationSurvivesAConfigReload:

@@ -1,0 +1,32 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: directory-entry-untrusted-issuer
+description: An attestation from an issuer outside the trusted set refuses the entry as untrusted, though every signature holds.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: dir_verify
+    what: entry
+    now: 1790000000
+    wire:
+      body: '{"v":1,"typename":"at-dir-entry","handle":"alice@example.org","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","key":"c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242","visibility":"anyone","seq":1,"expiry":4102444800,"identity":{"typename":"identity","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","address":"","nickname":"alice","signature":{"hex_seed":"c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242"},"encryptor":{"hex_seed":"7777777777777777777777777777777777777777777777777777777777777777"}},"attestation":{"body":"{\"v\":1,\"typename\":\"at-dir-attest\",\"handle\":\"alice@example.org\",\"key\":\"c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242\",\"issuer\":\"34b4d9043156cb6dcf0beb0a2949b7559c940d2bcb6dbe8c53a9b30278e3a746\",\"expiry\":4102444800}","sig":"10470b37a825df93dfd1e99daccb59521ae54958e2884addbea11369e540e2d576eba7f8085cd833c157f4847691bb9f0b65b07cee18f15700b0b1780b74130c"}}'
+      sig: 9edc0397f6295f2eb2c3b1a3137d73a377a0f8a33664971d0252d3f45a75b5c3e0f0411edad33035ee0b80ae16cd72df78ea104a8239c67296e9bc66d1194703
+    trusted:
+    - d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48
+steps:
+- id: 1
+  from: host
+  to: host
+  function: dir_verify
+  description: 'trigger: dir_verify'
+expected_state:
+  host:
+    dir_status: untrusted

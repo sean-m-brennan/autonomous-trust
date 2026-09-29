@@ -427,6 +427,7 @@ set(table_headers_in
 set(libsrc
     autonomous_trust/autonomous_trust.c
     autonomous_trust/app_events.c
+    autonomous_trust/first_contact_app.c
     # The daemon's side of the app-facing wire, in flat form, so a foreign
     # consumer's tests can play daemon. Nothing in AT calls it; it is here for
     # the same reason messaging_set_test_hook is in message.h.
@@ -449,10 +450,13 @@ set(libsrc
     autonomous_trust/identity/id_proc.c
     autonomous_trust/identity/id_ext.c
     autonomous_trust/identity/first_contact.c
+    autonomous_trust/identity/directory_contact.c
     autonomous_trust/identity/peers.c
     autonomous_trust/identity/signature.c
     autonomous_trust/contacts/contact.c
+    autonomous_trust/contacts/directory.c
     autonomous_trust/contacts/invitation.c
+    autonomous_trust/contacts/reach.c
     autonomous_trust/contacts/store.c
     autonomous_trust/negotiation/task.c
     autonomous_trust/negotiation/negotiation.c
@@ -464,6 +468,9 @@ set(libsrc
     autonomous_trust/config/generate.c
     autonomous_trust/network/net_message.c
     autonomous_trust/network/net_proc.c
+    autonomous_trust/network/net_relay.c
+    autonomous_trust/network/net_relay_seeds.c
+    autonomous_trust/network/net_registry.c
     autonomous_trust/network/net_transport_ip.c
     autonomous_trust/network/net_transport_udp.c
     autonomous_trust/network/net_transport_tcp.c
@@ -541,6 +548,7 @@ set(libhdr
     # source tree until now.
     autonomous_trust/app_events.h
     autonomous_trust/app_events_test_support.h
+    autonomous_trust/at_first_contact.h
     autonomous_trust/app_node.h
     autonomous_trust/node.h
     autonomous_trust/algorithms/agreement.h
@@ -890,6 +898,21 @@ target_link_libraries(late_joiner_caps_resync_test PRIVATE ${AT_TEST_LIBS})
 add_executable(identity_resync_test test/identity_resync_test.c)
 set_source_files_properties(test/identity_resync_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(identity_resync_test PRIVATE ${AT_TEST_LIBS})
+add_executable(group_rotation_sibling_test test/group_rotation_sibling_test.c)
+set_source_files_properties(test/group_rotation_sibling_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(group_rotation_sibling_test PRIVATE ${AT_TEST_LIBS})
+add_executable(handoff_retry_test test/handoff_retry_test.c)
+set_source_files_properties(test/handoff_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(handoff_retry_test PRIVATE ${AT_TEST_LIBS})
+add_executable(rep_commit_retry_test test/rep_commit_retry_test.c)
+set_source_files_properties(test/rep_commit_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_commit_retry_test PRIVATE ${AT_TEST_LIBS})
+add_executable(rep_cosign_test test/rep_cosign_test.c)
+set_source_files_properties(test/rep_cosign_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_cosign_test PRIVATE ${AT_TEST_LIBS})
+add_executable(admission_send_test test/admission_send_test.c)
+set_source_files_properties(test/admission_send_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(admission_send_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(rep_quorum_test test/rep_quorum_test.c)
 set_source_files_properties(test/rep_quorum_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1021,6 +1044,11 @@ add_test(NAME identity_test COMMAND $<TARGET_FILE:identity_test>)
 add_test(NAME partition_recovery_test COMMAND $<TARGET_FILE:partition_recovery_test>)
 add_test(NAME late_joiner_caps_resync_test COMMAND $<TARGET_FILE:late_joiner_caps_resync_test>)
 add_test(NAME identity_resync_test COMMAND $<TARGET_FILE:identity_resync_test>)
+add_test(NAME group_rotation_sibling_test COMMAND $<TARGET_FILE:group_rotation_sibling_test>)
+add_test(NAME handoff_retry_test COMMAND $<TARGET_FILE:handoff_retry_test>)
+add_test(NAME rep_commit_retry_test COMMAND $<TARGET_FILE:rep_commit_retry_test>)
+add_test(NAME rep_cosign_test COMMAND $<TARGET_FILE:rep_cosign_test>)
+add_test(NAME admission_send_test COMMAND $<TARGET_FILE:admission_send_test>)
 add_test(NAME rep_quorum_test COMMAND $<TARGET_FILE:rep_quorum_test>)
 add_test(NAME rep_paxos_round_test COMMAND $<TARGET_FILE:rep_paxos_round_test>)
 add_test(NAME rep_resp_shape_test COMMAND $<TARGET_FILE:rep_resp_shape_test>)
@@ -1068,6 +1096,30 @@ add_executable(first_contact_endpoint_test test/first_contact_endpoint_test.c)
 set_source_files_properties(test/first_contact_endpoint_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(first_contact_endpoint_test PRIVATE ${AT_TEST_LIBS})
 
+add_executable(first_contact_app_test test/first_contact_app_test.c)
+set_source_files_properties(test/first_contact_app_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(first_contact_app_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(net_relay_test test/net_relay_test.c)
+set_source_files_properties(test/net_relay_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_relay_test PRIVATE ${AT_TEST_LIBS})
+add_executable(directory_contact_test test/directory_contact_test.c)
+set_source_files_properties(test/directory_contact_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(directory_contact_test PRIVATE ${AT_TEST_LIBS})
+add_executable(directory_test test/directory_test.c)
+set_source_files_properties(test/directory_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(directory_test PRIVATE ${AT_TEST_LIBS})
+add_executable(net_registry_test test/net_registry_test.c)
+set_source_files_properties(test/net_registry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_registry_test PRIVATE ${AT_TEST_LIBS})
+add_executable(net_relay_seeds_test test/net_relay_seeds_test.c)
+set_source_files_properties(test/net_relay_seeds_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_relay_seeds_test PRIVATE ${AT_TEST_LIBS})
+
+add_executable(first_contact_live_test test/first_contact_live_test.c)
+set_source_files_properties(test/first_contact_live_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(first_contact_live_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(net_source_bind_test test/net_source_bind_test.c)
 set_source_files_properties(test/net_source_bind_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(net_source_bind_test PRIVATE ${AT_TEST_LIBS})
@@ -1094,6 +1146,16 @@ add_test(NAME net_port_test COMMAND $<TARGET_FILE:net_port_test>)
 add_test(NAME cidr_split_test COMMAND $<TARGET_FILE:cidr_split_test>)
 add_test(NAME unencrypted_verbs_test COMMAND $<TARGET_FILE:unencrypted_verbs_test>)
 add_test(NAME first_contact_endpoint_test COMMAND $<TARGET_FILE:first_contact_endpoint_test>)
+add_test(NAME first_contact_app_test COMMAND $<TARGET_FILE:first_contact_app_test>)
+add_test(NAME net_relay_test COMMAND $<TARGET_FILE:net_relay_test>)
+add_test(NAME directory_contact_test COMMAND $<TARGET_FILE:directory_contact_test>)
+add_test(NAME directory_test COMMAND $<TARGET_FILE:directory_test>)
+add_test(NAME net_registry_test COMMAND $<TARGET_FILE:net_registry_test>)
+add_test(NAME net_relay_seeds_test COMMAND $<TARGET_FILE:net_relay_seeds_test>)
+# Two real daemons on 127.0.0.1/.2 (~10 s). Labelled so a quick run can skip
+# it: `ctest -LE live`.
+add_test(NAME first_contact_live_test COMMAND $<TARGET_FILE:first_contact_live_test>)
+set_tests_properties(first_contact_live_test PROPERTIES TIMEOUT 240 LABELS live)
 add_test(NAME net_source_bind_test COMMAND $<TARGET_FILE:net_source_bind_test>)
 add_test(NAME net_tcp_multiframe_test COMMAND $<TARGET_FILE:net_tcp_multiframe_test>)
 add_test(NAME proc_tracker2_test COMMAND $<TARGET_FILE:proc_tracker2_test>)

@@ -122,7 +122,10 @@ class TestCutoffCrossing:
         assert str(peer) in rp._excluded
         msg = q[CfgIds.network].get_nowait()
         assert msg.function == Network.exclude
-        assert msg.obj == '10.0.0.9'
+        # The uuid rides with the address: it gates the peer as a relay
+        # client and as a relay (network/relay.py).
+        assert __import__('json').loads(msg.obj) == {'address': '10.0.0.9',
+                                                     'uuid': str(peer)}
 
     def test_reverse_crossing_publishes_readmit(self):
         rp = self._rp_with_addr('10.0.0.9')
@@ -134,7 +137,20 @@ class TestCutoffCrossing:
         assert str(peer) not in rp._excluded
         msg = q[CfgIds.network].get_nowait()
         assert msg.function == Network.readmit
-        assert msg.obj == '10.0.0.9'
+        assert __import__('json').loads(msg.obj) == {'address': '10.0.0.9',
+                                                     'uuid': str(peer)}
+
+    def test_a_peer_with_no_address_is_still_excluded_by_uuid(self):
+        rp = self._rp_with_addr(None)
+        peer = uuid4()
+        q = _ipc_queues()
+        rp._publish_tier_change(q, peer, 0.3)
+        _drain(q[CfgIds.network])
+        rp._publish_tier_change(q, peer, 0.05)
+        msg = q[CfgIds.network].get_nowait()
+        assert msg.function == Network.exclude
+        assert __import__('json').loads(msg.obj) == {'address': '',
+                                                     'uuid': str(peer)}
 
     def test_no_publish_when_staying_below_cutoff(self):
         # 0.08 -> 0.04 is a tier-0 -> tier-0, excluded -> excluded no-op:

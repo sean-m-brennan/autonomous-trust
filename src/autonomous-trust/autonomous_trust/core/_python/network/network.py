@@ -49,9 +49,27 @@ class Network(InitializableConfig):
     # network). A peer whose reputation falls below the cut-off is
     # EXCLUDED: the network process ignores its inbound frames and does
     # not forward to/for it. `readmit` reverses it (explicit
-    # rehabilitation only). Payload is the peer's address string.
+    # rehabilitation only). Payload is {address, uuid} (JSON; either may be
+    # empty) -- the uuid also gates the peer as a relay client and as a relay
+    # -- or, in the older form, the bare address string.
     exclude = 'exclude'
     readmit = 'readmit'
+    #: Local IPC from identity: reach peer {uuid} through relay {relay}
+    #: ("host:port"), learned from a first-contact invitation's hint.
+    relay_route = 'relay_route'
+    #: network -> identity, local IPC: one of our OWN relays proved who it is
+    #: ({relay: host:port, uuid, fp}), so the links identity mints can pin it.
+    relay_identity = 'relay_identity'
+    #: identity -> network, local IPC: our own current reachability record
+    #: ({body, sig}), to publish at each of our relays.
+    reach_publish = 'reach_publish'
+    #: identity -> network, local IPC: the directory (network/registry.py).
+    #: dir_publish {entry: {body, sig}} files our entry at each of our relays
+    #: (and again at every registration); dir_withdraw {handle} takes it back;
+    #: dir_lookup {handle} asks every relay we are registered at.
+    dir_publish = 'dir_publish'
+    dir_withdraw = 'dir_withdraw'
+    dir_lookup = 'dir_lookup'
     # Parser-level wire-bytes size cap. Matches the C transport's
     # NET_MSG_MAX_DATA (net_message.h:31). Enforced at envelope-parse
     # time as defense-in-depth: the TCP transport already caps inbound

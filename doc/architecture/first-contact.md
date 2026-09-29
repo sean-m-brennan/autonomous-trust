@@ -151,6 +151,32 @@ Alice's side applies three gates, and each closes a distinct hole:
   refused as expired anyway, and an expiry of zero is kept forever, because
   single use is then the only thing bounding replay.
 
+Bob's side applies a gate of its own, and it is the one that was missing at
+first. An ack is plaintext for the same reason the hello is, and a plaintext
+frame from an unknown sender is parsed and routed with no verb filter, since
+that is how bootstrap traffic gets in at all. The envelope is verified only
+against the identity it carries. So nothing upstream stops a stranger's ack
+from reaching the handler, and a handler that admitted whoever the envelope
+named made any stranger on the LAN Bob's direct peer, with no ticket at all.
+
+`initiate` therefore records the hello as **pending**, and an ack is honored
+only when it answers one:
+
+- **From an inviter Bob sent a hello to.** An ack out of nowhere admits nobody.
+- **Signed by the key the invitation carried.** The uuid alone is not enough: a
+  forger can name the inviter's uuid and still sign its envelope correctly,
+  with its own key. The invitation is where Bob learned the real key, so it is
+  what the ack is compared against.
+- **Echoing the nonce of the ticket presented.** Otherwise one outstanding hello
+  would be a blank cheque for any ack under the inviter's name.
+- **Within the handshake window**, 120 seconds (`PENDING_TTL_SECONDS` /
+  `AT_FC_PENDING_TTL_SECONDS`).
+
+The entry is consumed by the ack that matches it, so an ack is honored once, and
+a refused one does not burn it, so a forgery arriving first cannot block the real
+answer. Pending hellos live in memory only. A restart forgets them, and the user
+redeems the link again.
+
 ### Direct peer, not group member
 
 Admission here adds the peer to `Peers`, so the encrypted point-to-point channel
@@ -173,6 +199,34 @@ A contact admitted this way is still **unverified**, since the handshake proves
 reachability and possession of the ticket rather than that the human on the
 other end is who Bob thinks. Only the out-of-band safety-number comparison flips
 that.
+
+### What an unverified contact may do
+
+A direct peer is put to work at once. Negotiation sends it bootstrap probe tasks
+the moment it is admitted, each success raises its reputation, and it is asked
+for its capabilities straight away (as confirming a cohort member does, rather
+than waiting for the periodic caps sweep). Left alone, that means anyone holding
+one forwarded invitation link climbs to full trust in minutes, verified or not.
+
+So negotiation holds an **unverified contact at tier 1**, communication, when
+it asks this node to run a capability, whatever it has earned: it may message,
+and services, reading shared data and writing it wait for verification
+(FIRST_CONTACT_PLAN §10.3). Reputation still records what it earns, so verifying
+it later unlocks that at once. Who counts as unverified:
+
+- **Own-group members are never capped**: this node's group voted them in.
+- **A child-group member is capped while it is on record as an unverified
+  contact.** The child group's vote does not vouch for what first contact
+  introduced. A child member with no contact record at all never went through
+  first contact, so it is not capped.
+- **Any other peer is capped unless it is a *verified* contact.** Here a
+  missing record counts as unverified, so losing `contacts.cfg.json` cannot
+  lift the cap.
+
+Nothing is capped while first contact is off. The
+rule is one function in each runtime, Python `first_contact.capped_tier` and C
+`at_first_contact_capped_tier`, and the only caller is negotiation's acceptance
+gate.
 
 ### What the handshake records
 
@@ -218,6 +272,66 @@ the store is plain JSON in the user's data dir and honoring a hand-written
 `trust_seed` on an unverified record would turn one editable float into a
 reputation prior.
 
+### Adding a friend from an application
+
+An application reaches the handshake through two **app verbs**, sent on the local
+app queue and answered with events. The app holds no private key, so it cannot
+sign an invitation, and it is not the identity process, so it cannot call
+`initiate`. The node does both on the app's behalf:
+
+- `app_first_contact_invite` asks the node to mint an invitation. The answer is
+  an `invitation` event carrying the `at+contact:` link to share.
+- `app_first_contact_initiate` hands the node a friend's link. The node records
+  the contact, verified at once if the app says the link came in person, sends
+  the hello, and answers `hello_sent`. `established` follows when the ack lands.
+
+Every event echoes the `ref` the app put on its request. A refused request says
+why (`malformed`, `bad_signature`, `expired`, `bad_request`, and so on), because
+"it didn't work" is not something a person can act on.
+
+Two things the app is deliberately **not** told. A refused hello is not reported
+to the initiator, because the inviter sends nothing back, so a probe learns
+nothing from a bad ticket. The initiator sees `hello_sent` and then either
+`established` or silence, and silence past the handshake window means refused or
+unreachable, on purpose indistinguishable. And the inviter's app hears about a
+refusal only when the ticket is provably its own, one it minted that came back
+expired or already used. A stranger's garbage stays in the log, because
+reporting it would let anyone on the LAN flood the app with events.
+
+Both verbs are **local-only**. An app verb and a peer's message are the same
+kind of object, both dispatched by name, so a verb that did not check would let
+an admitted peer make this node mint links or say hello on its behalf. Each
+handler refuses a request that carries a sender other than itself. The main
+loop, for its part, forwards only the verbs an enabled feature declared, each to
+the one process that declared it: C through `AT_APP_VERB_REGISTER`, Python
+through `Extension.app_verbs` (`app_verbs.py`), which is also the first general
+app-verb dispatch Python has had.
+
+The address book goes through the node too, once it is running:
+`app_first_contact_safety_number`, `_verify`, `_list`, `_rename` and `_remove`.
+That makes the identity process the only writer of `contacts.cfg.json`, where an
+app editing the file itself would race the handshake's own writes. Verifying
+takes one of two honest forms: `presented`, the digits typed from the *other*
+screen, which the node compares, or `confirmed`, the user's word that the two
+screens matched, trusted as `in_person` is. A list always ends with
+`contacts_done` and a count, so an empty address book is an answer rather than
+a silence.
+
+**Removing a contact drops the direct peer at once**, not just the record, so the
+node stops attributing and encrypting to it. That needed a way out of the peer
+list, which neither runtime had: C's `peers[]` was filled from `PEER` messages
+and nothing ever took an entry out, so removal added `processes_remove_peer` and
+a `PEER_REMOVED` broadcast that every sibling process applies; Python's
+`Peers.delete` cleared the nickname slots but left the address listing lookups
+read, so removal added `Peers.remove`. A contact who is also a cohort member is
+the exception, keeping its peer entry, because that place belongs to the group
+the vote admitted it to.
+
+The events cross the flat app ABI as kinds 1000–1008
+([`at_first_contact.h`](../../src/c/autonomous_trust/at_first_contact.h)) and
+reach a Python app as `FirstContactEvent` objects on `external_feedback`. See
+[the API](../api.md#going-live-the-11-handshake-opt-in) for the calls.
+
 ### Resolving the endpoint
 
 `initiate` reduces the invitation's rendezvous hint to a bare host, preferring
@@ -249,22 +363,238 @@ only for what genuinely does not fit, being a scoped literal (`fe80::1%eth0`,
 which the transport's `inet_pton` rejects regardless) or a DNS name, neither of
 which this field is meant to hold.
 
+## Reaching a contact behind NAT
+
+A friend's node behind a home router cannot be reached at its address at all:
+the router forwards nothing it did not see go out. So an invitation can name a
+**rendezvous relay**, any AT node that opted in with `AT_RELAY=1`, which both
+sides reach by holding one outbound TCP connection to it, the one kind of flow
+a NAT keeps open. Alice's node registers with its own relays (`AT_USE_RELAY=
+host:port[,host:port...]`, up to four, in order of preference) and puts every
+one in each link it mints as a `relay://host:port` hint. Bob's node, seeing
+those hints, sends its hello through the first, and the ack comes back the same
+way. From then on each network process routes that peer through its relays, a
+per-peer route beside the ordinary transport, so nothing else about the two
+nodes' traffic changes.
+
+### Several relays, one at a time
+
+A peer's route is an ordered list, and one relay on it carries the peer's
+traffic at a time. A relay that cannot be reached is skipped at once, and the
+next takes over. A relay that is up but does not have the peer registered
+answers "unreachable" (the only thing a relay ever says about delivery: it
+acknowledges nothing), and the sender resends that frame through the next
+relay. Each frame is tried at most once per relay. If every relay refuses it,
+the frame is walked down the route again every few seconds, three times, since
+the peer may register moments later; a newer frame to the same peer cancels
+that. A frame arriving through a relay makes that relay the active one, so
+replies go back the way traffic came. A node stays registered with every relay
+it might be reached through: its own and each one its peers' routes name.
+
+### Who a relay is, and whom it serves
+
+A relay proves who it is in the same exchange that proves the client: the
+client's hello carries a fresh nonce, and the relay signs its challenge over
+that nonce, its own, and both uuids with its AT key. A uuid alone is only a
+label, so a link names a relay by uuid AND key: `relay://<uuid>:<fp>@host:port`,
+where `fp` is the first 16 bytes of SHA-256 over the relay's signing key. A
+node that has registered with its own relay learns who it is and pins it in
+every link it mints from then on. A client holding a pinned hint refuses
+anything else that answers at that address, and refuses a relay that offers no
+proof at all; an unpinned `relay://host:port` hint still works, unauthenticated.
+
+Reputation gates both ends. A relay refuses to register a client its node
+distrusts, and drops one the moment it becomes distrusted; a client refuses a
+relay it distrusts, and hangs up on one that becomes distrusted, so that peer's
+traffic fails over to its next relay. "Distrusted" means below the reputation
+cut-off -- the same cut-off that already drops a peer's traffic -- matched by
+uuid and by key: the uuid is excluded, or the proven key belongs to an identity
+that is, or the uuid is a peer this node knows under a different key. Unknown
+and neutral pass, because meeting strangers is what first contact is for, and
+relaying itself earns or costs nothing: the gate reads the relay's ordinary AT
+reputation.
+
+### Where a contact is now: signed reachability records
+
+A link names the relays its minter used that day. Relays change, so each node
+also keeps a **reachability record**: its own signed statement of how to reach
+it now -- its relays (pinned hints) and its direct address -- with a sequence
+number and an expiry (a week), signed by its identity key over
+`at-reach-v1|` plus the exact body bytes transmitted (Python
+`contacts/reach.py`, C `contacts/reach.{h,c}`). A node issues a new record
+whenever what it states changes, and at half its life; the sequence is
+persisted, so it only ever rises.
+
+A record travels two ways. It is **pushed** to every contact that is a peer
+at the time, over the sealed channel, and to a new contact the moment the
+handshake completes (which is how the inviter learns the initiator's own
+relays -- the hello carries none). And it is **filed at each of the node's
+relays** under the fingerprint of its key: a relay files only its registrant's
+own record (the key must be the one it registered with) and only a newer one.
+When a node has lost a contact through every relay it knows, it asks each relay
+it is registered at for that contact's record; the answer goes to identity like
+a pushed one.
+
+Whichever way it arrives, a record is applied only if it verifies, is
+unexpired, carries a sequence above the one last applied (`reach_seq` on the
+contact, so a replay loses), and -- the part a uuid cannot provide -- is signed
+by the key already on record for that contact. Pushed on the wire, it must also
+come from the contact itself. A record for someone who is not a contact is
+ignored: it updates an address book, never creates one. Applied, its relays and
+endpoints go to the head of the contact's hints, and the network process is
+told the new route.
+
+A relay can read the records it holds (they list relay addresses and
+endpoints), but it files them under key fingerprints, so it cannot list whose
+they are without already knowing the keys.
+
+### Where a fresh install finds relays: the seed list
+
+A node learns relays from an invitation first. A node whose operator named none
+(`AT_USE_RELAY` unset) and that has first contact on falls back on a **seed
+list**: the community-run relays a fresh install registers with (Python
+`network/relay_seeds.py`, C `network/net_relay_seeds.{h,c}`). It is a default
+mirror list, not a root of trust. A seed relay still proves itself and is still
+gated by reputation like any other, so all the signature decides is who chose
+the defaults. An explicit `AT_USE_RELAY` always wins, and with first contact off
+the list is never read.
+
+The list ships with the build as `<cfg_dir>/relay_seeds.cfg.json`
+(`$AT_RELAY_SEEDS` names another path), signed by the project's **release key**
+over `at-seeds-v1|` plus the exact body bytes, which carry a version, a sequence
+number and the relay hints (pinned or not). It changes only with a new build;
+nothing is fetched at runtime. The node remembers the highest sequence it has
+accepted (`<data_dir>/relay_seeds_seen.cfg.json`) and refuses a lower one, so
+reinstalling an older build's list cannot roll the defaults back.
+
+The operator edits the list locally in `<data_dir>/relay_seeds_local.cfg.json`,
+signed by the node's own identity key over `at-seeds-local-v1|` plus the body:
+additions come first (the operator's choice beats the default), and removals
+drop a shipped entry by address. `tools/relay_seeds.py` writes both files
+(`keygen`, `sign`, `verify` for the release signer; `local add|remove|clear`
+and `show` on the node). A file that fails its check is ignored with a warning,
+never half-applied; one unparseable entry refuses the whole file, since that is
+a signing mistake rather than a relay to skip. The release public key is a
+constant in both runtimes (`RELEASE_KEY`, `AT_RELAY_SEEDS_RELEASE_KEY`) and is
+empty until the release keypair is minted. Until then no shipped list is
+trusted, and only the local additions apply.
+
+### Reconnecting after a restart
+
+`Peers` is rebuilt every session and keeps no direct peer, so a restarted node
+would otherwise forget everyone it met through first contact. At startup it
+re-admits every contact in its address book as a direct peer (an unverified one
+still under the tier cap) and routes each through the relays its record names,
+then through its own. The initiator's record keeps the relays the link named;
+the inviter reaches its contacts through its own relays, where they registered
+in order to reach it. Each side also learns the other's own relays from the
+reachability record pushed at the handshake, and later ones keep that current.
+
+The relay is deliberately powerless. It forwards frames that are the ordinary
+AT envelope, sealed end to end between the two peers (bar the plaintext hello
+and ack, exactly as on UDP), so it cannot read them. It cannot forge who sent
+one either: a node registers by signing the relay's challenge with its own key,
+so nobody can register someone else's uuid and receive their traffic, and the
+relay stamps each delivery's sender from that registration rather than from the
+frame. A receiving node goes one step further and drops a relayed frame whose
+envelope names anyone but the sender the relay vouched for.
+
+Both runtimes implement it (Python `network/relay.py`, C
+`network/net_relay.{h,c}`) and each relays for the other. It is tested
+in-sandbox with nodes that have no direct path (different addresses and ports,
+so a direct hello lands where nobody listens), with controls proving they never
+meet without the relay and never reconnect without the address book;
+[`tools/relay_nat/run.sh`](../../tools/relay_nat/run.sh) builds two real
+masquerading NATs with network namespaces for the same check on a Linux host,
+and has passed there.
+
+## Finding someone by handle: the directory
+
+An invitation has to reach the other person before anything else can happen.
+The directory is for the case where all you know is a handle, such as an email
+address or phone number. This is the layer where centralization, squatting and
+contact harvesting live, so everything about it is opt-in and bounded, and it
+grants no trust.
+
+**Who may be found.** Only someone who publishes. An entry
+(`contacts/directory.py`, C `contacts/directory.{h,c}`) is the holder's own
+signed statement: this handle, this uuid, this key, found by whom, a sequence
+number and an expiry. It carries the holder's public identity with the address
+left blank, since whoever finds it reaches the holder through the registry's
+relay. It must also carry an **issuer's attestation**, an issuer's signature
+binding the handle to the holder's KEY. That makes it useless on anyone else's
+entry. An issuer is whoever checked that the person controls the handle, such
+as an email or SMS verification service or an organization's own records. A
+handle is ASCII `[a-z0-9._@+-]`, 1 to 128 bytes, folded to lower case. Unicode
+folding is left out because the two runtimes could not agree on it byte for
+byte.
+
+**Where entries live.** A registry is a relay that also sets `AT_REGISTRY=1`
+(Python `network/registry.py`, C `network/net_registry.{h,c}`), serving the
+directory over the same TCP link. The relay's two-way signed registration
+already proves who each client is, so a registry files an entry only from the
+registered holder of its key. It also needs an attestation from an issuer this
+registry trusts (`registry_issuers.cfg.json`), an unexpired one, and a higher
+sequence than any it holds. A handle already held under another key is
+`taken` until that entry expires. Entries live in memory; a node refiles its
+own at every registration, and after a restart from its saved state
+(`directory.cfg.json`, which also keeps the sequence rising).
+
+**Who may look.** A lookup names one handle, never a list, and costs one token
+from a bucket each client uuid has at each registry (`AT_REGISTRY_RATE` a
+minute, default 10). Past it the answer is `dir_limited`. An entry published
+with visibility `published` is shown only to a client that has an entry at
+that registry itself. For anyone else, and for a holder the registry's node
+has come to distrust, the answer is the same `null` a handle nobody filed
+gets. A node asks every relay it is registered at and takes the first entry
+found. It checks that entry itself (the holder's signature, the attestation,
+that it answers the handle asked) and never takes the registry's word.
+
+**Finding is not adding.** Bob sends Alice a signed **contact request**
+(`first_contact_request`, plaintext for the same reason a hello is). It names
+her uuid, so it cannot be replayed at anyone else, and it names the handle he
+found her by, which must be one she publishes. It also lists his relays, so she
+can answer. Alice's node checks that it is signed by the sender the envelope
+names, addressed to her, and for one of her handles. It then holds the
+request, at most 32 at a time and one per sender, and shows it to **her app**.
+Nothing else happens until the app accepts. A decline, or silence, sends
+nothing back, so Bob learns no more than he would from an unreachable node.
+
+On accept, Alice's node mints an ordinary single-use invitation and sends it
+to Bob in a `first_contact_accept` that echoes his request's nonce. Bob's node
+takes it only for a request it has outstanding to that uuid, and only if the
+invitation is signed by the key the entry named. Then it runs the ordinary
+hello, so every guarantee above (the single-use ticket, the ack gate, the
+direct-peer admission) applies unchanged. Both sides record an **unverified**
+contact with provenance `directory`, capped at tier 1 until the safety numbers
+match. The directory is how you found the person; the safety number is still
+what verifies them.
+
+It is tested with three real nodes: a registry, a publisher and a finder that
+share no direct path. A control shows that without the publisher's accept the
+two never become peers.
+
 ## What is built, and what is not
 
 This chapter describes the primitive as it stands, covering the contact record,
 the signed invitation in its QR and invite-link encodings, safety-number
-verification, the durable store, and the opt-in live handshake, which together
-are the no-directory, no-relay path. It is complete on both runtimes and pinned
-by conformance. Two roles the invitation names are still ahead:
+verification, the durable store, the opt-in live handshake, and the app verbs
+that let an application drive it, which together are the no-directory, no-relay
+path. It is complete on both runtimes and pinned
+by conformance, and a node behind NAT is reachable through a relay the
+invitation names. Two roles still have loose ends:
 
-- **Rendezvous relays**, reaching a contact across NAT and changing networks via
-  content-blind, signed reachability records addressed by identity-hash. The
-  invitation already carries a rendezvous hint, and the handshake will use it as
-  a direct endpoint on the shared comm port, and the relay layer that resolves a
-  hint into a route across NAT, and across ports, is not yet built.
-- **An optional, opt-in directory**, the "type a handle to find a friend"
-  convenience, tightly bounded against squatting and harvesting. The strongest
-  and most private paths need no directory at all, which is why it is last.
+- **Rendezvous relays, beyond what is built.** Relays are built (see
+  *Reaching a contact behind NAT*, above): several relays per node, named in
+  the invitation, with failover and reconnection after a restart, and a
+  signed seed list a fresh install falls back on. Still ahead is the release
+  keypair that signs the shipped list, and an Ethne `rendezvous` polity option.
+- **The directory, beyond what is built.** Finding someone by handle is built
+  (see *Finding someone by handle*, above): opt-in entries backed by an
+  issuer's attestation, registries on relays, one-handle, rate-limited lookups,
+  and a contact request the holder's app must accept. The issuer services
+  themselves (the email or SMS check behind an attestation) are outside AT;
+  `tools/directory_issuer.py` is only the signing half.
 
 First contact is an **AT** primitive, so it must complete without the compact
 tier present. Its rendezvous and directory *roles* may optionally be served by
@@ -297,7 +627,42 @@ asymmetry.
 | IPv4/port, bare IPv6 and bracketed IPv6 hints all resolve | [`first-contact-initiate-endpoint-forms.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-initiate-endpoint-forms.yaml) |
 | A handshake records an unverified contact | [`first-contact-hello-records-a-contact.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-hello-records-a-contact.yaml) |
 | A re-handshake never downgrades a verified one | [`first-contact-rehandshake-preserves-verification.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-rehandshake-preserves-verification.yaml) |
+| An ack nobody asked for admits nobody | [`first-contact-unsolicited-ack-ignored.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-unsolicited-ack-ignored.yaml) |
+| An ack for a different ticket admits nobody | [`first-contact-ack-wrong-nonce-ignored.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-ack-wrong-nonce-ignored.yaml) |
+| Removing a contact drops the direct peer | [`first-contact-remove-drops-the-direct-peer.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-remove-drops-the-direct-peer.yaml) |
+| An unverified contact is held at tier 1 | [`invite-unverified-contact-held-at-communication.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-unverified-contact-held-at-communication.yaml) |
+| A verified contact uses what it earned | [`invite-verified-contact-uses-earned-tier.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-verified-contact-uses-earned-tier.yaml) |
+| A child-group member with no contact record uses what it earned | [`invite-child-group-member-uses-earned-tier.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-child-group-member-uses-earned-tier.yaml) |
+| A child-group member who is an unverified contact is held at tier 1 | [`invite-child-group-unverified-contact-held-at-communication.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-child-group-unverified-contact-held-at-communication.yaml) |
+| A child-group member who is a verified contact uses what it earned | [`invite-child-group-verified-contact-uses-earned-tier.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-child-group-verified-contact-uses-earned-tier.yaml) |
+| An own-group member is never capped, even as an unverified contact | [`invite-group-member-unverified-contact-uses-earned-tier.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-group-member-unverified-contact-uses-earned-tier.yaml) |
+| A contact's newer reachability record updates its hints | [`reach-record-updates-the-contact.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/reach-record-updates-the-contact.yaml) |
+| A record not newer than the one applied is refused | [`reach-record-stale-is-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/reach-record-stale-is-refused.yaml) |
+| A record for a contact signed by another key is refused | [`reach-record-wrong-key-is-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/reach-record-wrong-key-is-refused.yaml) |
+| A contact's record pushed by someone else is refused | [`reach-record-pushed-by-someone-else-is-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/reach-record-pushed-by-someone-else-is-refused.yaml) |
+| A relay lookup's answer (no sender) is applied on its merits | [`reach-record-from-a-relay-lookup-is-applied.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/reach-record-from-a-relay-lookup-is-applied.yaml) |
+| An expired record is refused | [`reach-record-expired-is-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/reach-record-expired-is-refused.yaml) |
+| A record from a non-contact is ignored | [`reach-record-from-a-stranger-is-ignored.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/reach-record-from-a-stranger-is-ignored.yaml) |
 | Both handshake verbs are plaintext-allowlisted, neither is bootstrap | [`unencrypted-verbs.yaml`](../../src/autonomous-trust/conformance/scenarios/network/unencrypted-verbs.yaml) |
+
+The ack's signing-key check and the app verbs are local behavior a corpus
+fixture cannot express (a fixture cannot mint a second key for a participant's
+uuid, and app verbs have no wire form), so they are pinned by unit tests on each
+runtime instead: `test_first_contact_handshake.py` and
+`test_first_contact_app_verbs.py` in Python,
+[`first_contact_app_test.c`](../../src/c/test/first_contact_app_test.c) in C.
+
+One level up,
+[`test_first_contact_two_node.py`](../../src/autonomous-trust/tests/b_integration/test_first_contact_two_node.py)
+runs two real Python nodes on separate loopback addresses that cannot discover
+each other, and has their apps add each other: the request crosses the main
+loop, the hello and ack arrive on the network process's unknown-sender path,
+and the events come back out to both apps.
+[`first_contact_live_test.c`](../../src/c/test/first_contact_live_test.c) is the
+same test for two real C daemons, each started through `at_app_node_start` and
+driven only through the flat app ABI, so it is what a foreign consumer sees;
+it also lists and removes, checking the removal inside a running daemon. Skip
+both live tests in a quick C run with `ctest -LE live`.
 
 ## Further reading
 

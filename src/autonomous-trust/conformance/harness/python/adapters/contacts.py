@@ -33,6 +33,8 @@ from autonomous_trust.core.identity.identity import public_identity_from_canonic
 from autonomous_trust.core.contacts import (redeem_invitation, safety_number,
                                             verify_contact, InvalidInvitation,
                                             SafetyNumberMismatch, Contacts)
+from autonomous_trust.core._python.contacts import directory as _dir
+from autonomous_trust.core._python.network import registry as _registry
 
 _TOL = 1e-9
 
@@ -77,6 +79,12 @@ class ContactsAdapter:
             self._verify_contact(fx, expected)
         elif op == 'store_roundtrip':
             self._store_roundtrip(fx, expected)
+        elif op == 'dir_verify':
+            self._dir_verify(fx, expected)
+        elif op == 'dir_normalize':
+            self._dir_normalize(fx, expected)
+        elif op == 'registry':
+            self._registry(fx, expected)
         else:
             raise AssertionError('unknown contacts op %r' % op)
 
@@ -137,3 +145,62 @@ class ContactsAdapter:
         # internal round-trip stability: to_canonical -> from_canonical preserves count
         store2 = Contacts.from_canonical(store.to_canonical())
         assert len(store2) == len(store), len(store2)
+
+    # -- the directory (FIRST_CONTACT_PLAN Phase 3) ----------------------------
+    def _dir_verify(self, fx, expected):
+        """Verify one signed object (``what``: entry | attestation | request)
+        at a fixed ``now``, optionally against ``trusted`` issuers. Pins the
+        exact status ('ok' or the refusal reason) and, when ok, its fields."""
+        what, now = fx['what'], float(fx['now'])
+        trusted = set(fx['trusted']) if 'trusted' in fx else None
+        cls = {'entry': _dir.DirectoryEntry, 'attestation': _dir.Attestation,
+               'request': _dir.ContactRequest}[what]
+        status, obj = 'ok', None
+        try:
+            obj = cls.from_wire(fx['wire'])
+            if what == 'request':
+                obj.verify(now)
+            else:
+                obj.verify(trusted, now)
+        except _dir.InvalidEntry as exc:
+            status = exc.reason
+        assert status == expected['dir_status'], (status, expected['dir_status'])
+        if status == 'ok':
+            for field in ('handle', 'seq', 'uuid', 'key'):
+                if field in expected:
+                    got = getattr(obj, 'sender' if (what == 'request' and field == 'uuid')
+                                  else field)
+                    assert got == expected[field], (field, got, expected[field])
+
+    def _dir_normalize(self, fx, expected):
+        got = [_dir.normalize_handle(h) for h in fx['handles']]
+        assert got == expected['folded'], (got, expected['folded'])
+
+    def _registry(self, fx, expected):
+        """Run ``calls`` against one registry on a fixed clock and pin each
+        reply's op (plus reason / seq / whether an entry came back)."""
+        clock = {'mono': 0.0}
+        bad = set(fx.get('distrusted', []))
+        reg = _registry.Registry(set(fx['issuers']), rate=int(fx.get('rate', 10)),
+                                 distrusted=lambda uuid, key: uuid in bad,
+                                 clock=lambda: clock['mono'],
+                                 wallclock=lambda: float(fx['now']))
+        replies = []
+        for call in fx['calls']:
+            clock['mono'] += float(call.get('advance', 0.0))
+            who = fx['clients'][call['as']]
+            if call['call'] == 'publish':
+                r = reg.publish(who['uuid'], who['key'], call['entry'])
+            elif call['call'] == 'withdraw':
+                r = reg.withdraw(who['uuid'], who['key'], call['handle'])
+            else:
+                r = reg.lookup(who['uuid'], call['handle'])
+            got = {'op': r['op'], 'handle': r.get('handle', '')}
+            if 'reason' in r:
+                got['reason'] = r['reason']
+            if 'seq' in r:
+                got['seq'] = r['seq']
+            if r['op'] == 'dir_entry':
+                got['found'] = r['entry'] is not None
+            replies.append(got)
+        assert replies == expected['replies'], (replies, expected['replies'])
