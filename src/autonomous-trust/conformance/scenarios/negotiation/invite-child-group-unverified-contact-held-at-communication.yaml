@@ -1,0 +1,63 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: invite-child-group-unverified-contact-held-at-communication
+byte_pinning: false
+description: |
+    A child-group member who is ALSO on record as an unverified contact is held
+    at tier 1, like any unverified contact: the child group's vote does not vouch
+    for what first contact introduced (the user's call, 2026-09-28). Tier 1 is
+    served, tier 2 refused. With the child group alone (the case above) the same
+    invitation is accepted, so this case bites only on the contact record.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  first_contact:
+    enabled: true
+  child_group_members:
+    bob: [alice]
+  unverified_contacts:
+    bob: [alice]
+  capabilities:
+    bob: [chat, file_share]
+  capability_tiers:
+    chat: 1
+    file_share: 2
+  peer_tiers:
+    alice: 4
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: chat
+      task_id: t-cgu-chat
+  - id: 2
+    from: bob
+    to: alice
+    function: ack
+    in_response_to: 1
+    payload:
+      task_id: t-cgu-chat
+  - id: 3
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: file_share
+      task_id: t-cgu-share
+      seq: 2          # a fresh invitation from the same sender, not a replay
+  - id: 4
+    from: bob
+    to: alice
+    function: nack
+    in_response_to: 3
+    payload:
+      task_id: t-cgu-share

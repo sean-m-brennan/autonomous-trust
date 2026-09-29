@@ -1,0 +1,48 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: checkpoint-cosign-signer-behind-parks-the-proposal
+byte_pinning: false
+description: |
+    A member that is BEHIND a proposal parks it rather than dropping it
+    (ISSUES §2.29).
+
+    bob holds only a and b; alice proposes over a, b, c. bob cannot sign what
+    he does not hold, and used to decline for good, even though he would hold
+    c a second later. Now the proposal is parked and re-checked on every pass,
+    and signed once bob's entries over the range hash to its root; it expires
+    after one checkpoint interval. The re-check itself runs on the process
+    tick, which this harness does not drive across steps (the C harness resets
+    state per step), so it is pinned by the unit tests of both runtimes
+    (test/rep_cosign_test.c, tests/a_unit/test_repprocess_cosign.py). What is
+    pinned here is the arrival: nothing signed, one proposal parked.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: member
+
+fixtures:
+  local_chain:
+    bob:
+      - {task: a, p1: 0.7, p2: 0.5}
+      - {task: b, p1: 0.9, p2: 0.3}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: checkpoint propose
+    payload:
+      root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+      epoch: 7
+      first_index: 0
+      count: 3
+    description: |
+        alice proposes over a, b, c; bob has not committed c yet.
+
+expected_state:
+  bob:
+    committed_tx_count: 2
+    checkpoint_cosigns_parked: 1

@@ -193,6 +193,20 @@ class IdentityProtocol(Protocol):
     # over no group key, so the gateway boundary need not refuse them.
     hello = 'first_contact_hello'          # msg.obj <- invitation blob (the ticket); from_whom = sender identity
     hello_ack = 'first_contact_hello_ack'  # msg.obj <- json {'nonce': hex}; from_whom = accepter identity
+    # A contact's signed reachability record (contacts/reach.py): pushed by its
+    # holder over the sealed channel, or handed on locally by the network
+    # process from a relay lookup. msg.obj <- json {body, sig}.
+    reach_record = 'reach_record'
+    # Directory contact (FIRST_CONTACT_PLAN Phase 3, identity/directory_contact.py).
+    # A finder's signed request, and the holder's answer once its app accepted
+    # it. Plaintext for hello's reason: neither side is a peer of the other yet.
+    contact_request = 'first_contact_request'  # msg.obj <- json {body, sig}; from_whom = requester
+    contact_accept = 'first_contact_accept'    # msg.obj <- json {nonce, invitation}; from_whom = holder
+    # network -> identity, local IPC: a directory lookup's outcome
+    # ({handle, entry | null, relay, limited}) and a registry's answer to our
+    # publish or withdraw ({op, handle, relay, reason, seq}).
+    dir_result = 'dir_result'
+    dir_status = 'dir_status'
 
 
 # Verbs this implementation legitimately puts on the wire in PLAINTEXT
@@ -248,6 +262,8 @@ UNENCRYPTED_VERBS = frozenset({
     IdentityProtocol.partition_response, # spans a group-key boundary
     IdentityProtocol.hello,              # first-contact 1:1 handshake (opt-in)
     IdentityProtocol.hello_ack,          # first-contact accept, before the peer is known
+    IdentityProtocol.contact_request,    # directory contact: found by handle, not yet a peer
+    IdentityProtocol.contact_accept,     # and the holder's answer, before either is a peer
 })
 
 

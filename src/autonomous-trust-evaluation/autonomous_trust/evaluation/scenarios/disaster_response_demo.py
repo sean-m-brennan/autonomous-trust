@@ -554,10 +554,11 @@ class DisasterResponseDemoAT(AutonomousTrust):
 
     def _query_peer_reputations(self, queues) -> None:
         """Ask our own reputation process for its view of every known peer
-        (and ourself), populating latest_reputation for the local panels.
-        Mirrors the base test-mode sweep; reputation is *read* here, not
-        built (that is what _demo_random_task drives)."""
-        for peer in list(self.peers.all) + [self.identity]:
+        (never ourself: a node does not score itself), populating
+        latest_reputation for the local panels. Mirrors the base test-mode
+        sweep; reputation is *read* here, not built (that is what
+        _demo_random_task drives)."""
+        for peer in list(self.peers.all):
             try:
                 query = Message(
                     CfgIds.reputation, ReputationProtocol.rep_req,

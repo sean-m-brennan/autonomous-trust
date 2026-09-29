@@ -150,7 +150,7 @@ class TestAllowlistMatchesTheSendSites:
                 os.path.abspath(__file__)))),
             'autonomous_trust', 'core', '_python', 'identity')
         found = {}
-        for fname in ('idprocess.py', 'first_contact.py'):
+        for fname in ('idprocess.py', 'first_contact.py', 'directory_contact.py'):
             tree = ast.parse(open(os.path.join(id_dir, fname)).read())
             self._scan_sends(tree, found)
         return found

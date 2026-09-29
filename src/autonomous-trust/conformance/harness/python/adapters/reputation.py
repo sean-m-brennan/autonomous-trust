@@ -162,6 +162,15 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: checkpoint_root={actual}, expected {expected}'
                     )
+            elif key == 'checkpoint_cosigns_parked':
+                # A proposal this node could not co-sign on arrival, kept for
+                # a later one (ISSUES §2.29). Mirrors C reputation_parked_cosign_count.
+                actual = len(getattr(self.process, '_cosigns_parked', {}))
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: checkpoint_cosigns_parked={actual}, '
+                        f'expected {expected}'
+                    )
             elif key == 'evidence_doc':
                 # Verifiable warm start (doc/architecture/reputation.md). The persisted-evidence
                 # document is the ONE artifact both runtimes read, so its shape
@@ -319,6 +328,22 @@ class _Participant:
                         f'{self.id}: app_roster={actual}, '
                         f'expected {sorted(expected)}'
                     )
+            elif key == 'proposed_tasks':
+                # { "<task slug>": score } -- exactly this node's own rounds
+                # under way, by task, with the score each carries (the
+                # re-proposal an adoption makes, Agora Phase 4 DDIL).
+                got = {}
+                for tc in self.process.my_requests.values():
+                    ts = getattr(tc, 'score', None)
+                    if ts is not None:
+                        got[str(ts.task_id)] = float(ts.score)
+                want = {str(uuid5(_NS, f'chain:{slug}')): float(v)
+                        for slug, v in expected.items()}
+                if set(got) != set(want) or any(
+                        abs(got[k] - want[k]) > 1e-9 for k in want):
+                    raise AssertionError(
+                        f'{self.id}: proposed_tasks={got}, expected {want} '
+                        f'(from {expected})')
             elif key == 'requests_count':
                 actual = len(self.process.requests)
                 if actual != expected:
@@ -354,8 +379,45 @@ class _Participant:
                             f'{self.id}.reputation_of[{other_pid}]={got:.4f}, '
                             f'expected {float(want):.4f}'
                         )
+            elif key == 'unrated':
+                # `expected` is [ "<pid>", ... ] -- participants this one
+                # holds NO stored score for (the negation reputation_of cannot
+                # express). C twin reads the same snapshot slot.
+                if not isinstance(expected, list):
+                    raise AssertionError(
+                        f'{self.id}: unrated must be a list, got '
+                        f'{type(expected).__name__}'
+                    )
+                for other_pid in expected:
+                    other = participants.get(other_pid)
+                    if other is None:
+                        raise AssertionError(
+                            f'{self.id}.unrated: unknown participant '
+                            f'{other_pid!r}'
+                        )
+                    other_uuid = other.identity.uuid
+                    if other_uuid in self.process.reputations:
+                        raise AssertionError(
+                            f'{self.id}.unrated[{other_pid}]: scored '
+                            f'{self.process.reputations[other_uuid]:.4f}'
+                        )
             else:
                 raise AssertionError(f'{self.id}: unsupported expected_state key {key!r}')
+
+
+def _chain_half(entry: dict, half: int, task: str, uuid_of) -> UUID:
+    """The uuid of one half of a `local_chain` / `latest update` chain entry:
+    the participant named by its `p1_id` / `p2_id` when there is one (so a
+    scenario can make an entry this node's OWN half, Agora Phase 4 DDIL), else
+    the synthetic ``chainp1:<task>`` / ``chainp2:<task>`` derivation. Both
+    builders go through here so the chains hash-match up to the fork. Mirrors
+    the C adapter's _chain_half_uuid."""
+    pid = entry.get('p1_id' if half == 1 else 'p2_id')
+    if pid is not None:
+        u = uuid_of(pid)
+        if u is not None:
+            return u
+    return uuid5(_NS, f"chainp{half}:{task}")
 
 
 def _to_captured(msg: Any, emitter_id: str) -> CapturedMessage:
@@ -588,12 +650,16 @@ class ReputationAdapter:
             # two history.update calls (matching how handle_committed
             # builds bilateral history in production). p1/p2 reference
             # participant ids; missing ids on either side are skipped.
+            def _ident_uuid(other):
+                return identities[other].uuid if other in identities else None
             for entry in preset_local_chain.get(pid, []):
                 tk = uuid5(_NS, f"chain:{entry['task']}")
                 participant.process.history.update(
-                    tk, uuid5(_NS, f"chainp1:{entry['task']}"), float(entry['p1']))
+                    tk, _chain_half(entry, 1, entry['task'], _ident_uuid),
+                    float(entry['p1']))
                 participant.process.history.update(
-                    tk, uuid5(_NS, f"chainp2:{entry['task']}"), float(entry['p2']))
+                    tk, _chain_half(entry, 2, entry['task'], _ident_uuid),
+                    float(entry['p2']))
 
             for entry in preset_tx_history.get(pid, []):
                 slug = entry.get('task_id')
@@ -945,10 +1011,13 @@ class ReputationAdapter:
                 from autonomous_trust.core.reputation.reputation import (
                     TransactionHistory)
                 tmp = TransactionHistory(max_chain_len=max(len(spec) + 1, 2))
+                def _part_uuid(other):
+                    return (participants[other].impl.identity.uuid
+                            if other in participants else None)
                 for entry in spec:
                     tk = uuid5(_NS, f"chain:{entry['task']}")
-                    p1 = uuid5(_NS, f"chainp1:{entry['task']}")
-                    p2 = uuid5(_NS, f"chainp2:{entry['task']}")
+                    p1 = _chain_half(entry, 1, entry['task'], _part_uuid)
+                    p2 = _chain_half(entry, 2, entry['task'], _part_uuid)
                     tmp.update(tk, p1, float(entry['p1']))
                     tmp.update(tk, p2, float(entry['p2']))
                 built = list(tmp)

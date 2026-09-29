@@ -83,8 +83,15 @@ typedef struct {
     int committed_tx_count;
     char window_root[TX_HASH_HEX_LEN + 1];
     char checkpoint_root[TX_HASH_HEX_LEN + 1];
+    /* Checkpoint proposals parked for a later co-sign (ISSUES §2.29). */
+    int cosigns_parked;
     int request_count;
     int64_t last_id;
+    /* This node's own rounds under way at the end of the step (task, score):
+     * what an adoption re-proposed (Agora Phase 4 DDIL). */
+    int    n_proposed;
+    uuid_t proposed_tasks[SCE_MAX_PARTICIPANTS * 8];
+    double proposed_scores[SCE_MAX_PARTICIPANTS * 8];
     rp_peer_rep_t peer_reps[SCE_MAX_PARTICIPANTS];
     /* Verifiable warm start (doc/architecture/reputation.md). The evidence document is the one
      * artifact BOTH runtimes read, so its shape is worth pinning here; the
@@ -322,6 +329,23 @@ static const uuid_t *_uuid_of(sce_run_ctx_t *ctx, const char *pid)
     return (impl && impl->pub) ? (const uuid_t *)&impl->pub->uuid : NULL;
 }
 
+/* The uuid of one half of a `local_chain` / `latest update` chain entry: the
+ * participant named by its `p1_id` / `p2_id` when there is one (so a scenario
+ * can make an entry this node's OWN half), else the synthetic
+ * "chainp1:<task>" / "chainp2:<task>" derivation. The two builders must agree
+ * so the chains hash-match up to the fork. Mirrors the Python adapter. */
+static void _chain_half_uuid(sce_run_ctx_t *ctx, json_t *entry, int half,
+                             const char *task, uuid_t out)
+{
+    const char *pid = json_string_value(
+        json_object_get(entry, half == 1 ? "p1_id" : "p2_id"));
+    const uuid_t *u = (pid != NULL) ? _uuid_of(ctx, pid) : NULL;
+    if (u != NULL)
+        uuid_copy(out, *u);
+    else
+        _uuid5(half == 1 ? "chainp1:" : "chainp2:", task, out);
+}
+
 /* Reset rep_state and re-install the per-participant fixtures relevant
  * to the dispatcher (target). Run BEFORE every handler dispatch so each
  * step sees the right slice of state. */
@@ -499,8 +523,8 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
                     continue;
                 uuid_t tk, p1u, p2u;
                 _uuid5("chain:", task, tk);
-                _uuid5("chainp1:", task, p1u);
-                _uuid5("chainp2:", task, p2u);
+                _chain_half_uuid(ctx, lc_e, 1, task, p1u);
+                _chain_half_uuid(ctx, lc_e, 2, task, p2u);
                 reputation_install_tx_pair(tk,
                     p1u, json_number_value(json_object_get(lc_e, "p1")),
                     p2u, json_number_value(json_object_get(lc_e, "p2")));
@@ -960,8 +984,8 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                 double p2s = json_number_value(json_object_get(ce, "p2"));
                 uuid_t tk, p1u, p2u;
                 _uuid5("chain:", task, tk);
-                _uuid5("chainp1:", task, p1u);
-                _uuid5("chainp2:", task, p2u);
+                _chain_half_uuid(ctx, ce, 1, task, p1u);
+                _chain_half_uuid(ctx, ce, 2, task, p2u);
                 tx_history_update(&tmp, tk, p1u, p1s, NULL);
                 tx_history_update(&tmp, tk, p2u, p2s, NULL);
             }
@@ -1388,7 +1412,11 @@ static int _dispatch(sce_run_ctx_t *ctx,
         s->committed_tx_count = reputation_get_committed_tx_count();
         reputation_get_window_root(s->window_root);
         reputation_get_checkpoint_root(s->checkpoint_root);
+        s->cosigns_parked = (int)reputation_parked_cosign_count();
         s->request_count = reputation_get_request_count();
+        s->n_proposed = reputation_get_my_request_tasks(
+            s->proposed_tasks, s->proposed_scores,
+            (int)(sizeof(s->proposed_tasks) / sizeof(s->proposed_tasks[0])));
         s->last_id       = reputation_get_last_id();
         /* Record this dispatcher's view of every other participant's
          * reputation, so `expected_state[pid].reputation_of[other]`
@@ -1518,6 +1546,20 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: checkpoint_root=%s, expected %s",
                              pid, snap->checkpoint_root, want ? want : "(null)");
+                    return -1;
+                }
+            }
+            else if (strcmp(key, "checkpoint_cosigns_parked") == 0)
+            {
+                /* A proposal this node could not co-sign on arrival, kept for
+                 * a later one (ISSUES §2.29). Pins that a range it does not
+                 * hold is parked, and one it holds is signed and not parked. */
+                int want = (int)json_integer_value(val);
+                if (!json_is_integer(val) || snap->cosigns_parked != want)
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: checkpoint_cosigns_parked=%d, expected %d",
+                             pid, snap->cosigns_parked, want);
                     return -1;
                 }
             }
@@ -1668,6 +1710,45 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
                     }
                 }
             }
+            else if (strcmp(key, "proposed_tasks") == 0)
+            {
+                /* { "<task slug>": score } — exactly this node's own rounds
+                 * under way, by task, with the score each carries. */
+                if (!json_is_object(val))
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: proposed_tasks must be an object", pid);
+                    return -1;
+                }
+                int got = snap->n_proposed < 0 ? 0 : snap->n_proposed;
+                if ((size_t)got != json_object_size(val))
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: proposed_tasks has %d round(s), expected %zu",
+                             pid, got, json_object_size(val));
+                    return -1;
+                }
+                const char *slug;
+                json_t *want_v;
+                json_object_foreach(val, slug, want_v)
+                {
+                    uuid_t tk;
+                    _uuid5("chain:", slug, tk);
+                    int hit = -1;
+                    for (int k = 0; k < got; k++)
+                        if (uuid_compare(snap->proposed_tasks[k], tk) == 0)
+                            hit = k;
+                    double want = json_number_value(want_v);
+                    if (hit < 0 || fabs(snap->proposed_scores[hit] - want) > 1e-9)
+                    {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: proposed_tasks[%s] %s (expected score %.4f)",
+                                 pid, slug, hit < 0 ? "missing" : "has the wrong score",
+                                 want);
+                        return -1;
+                    }
+                }
+            }
             else if (strcmp(key, "requests_count") == 0)
             {
                 int want = (int)json_integer_value(val);
@@ -1803,6 +1884,46 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
                         snprintf(ctx->err, sizeof(ctx->err),
                                  "%s.reputation_of[%s]=%.4f, expected %.4f",
                                  pid, other, pr->value, want);
+                        return -1;
+                    }
+                }
+            }
+            else if (strcmp(key, "unrated") == 0)
+            {
+                /* unrated: [ "<pid>", ... ] -- participants this one holds
+                 * NO stored score for (the negation reputation_of cannot
+                 * express). Mirrors the Python adapter. */
+                if (!json_is_array(val))
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: unrated must be a list", pid);
+                    return -1;
+                }
+                size_t idx;
+                json_t *other_j;
+                json_array_foreach(val, idx, other_j)
+                {
+                    const char *other = json_string_value(other_j);
+                    if (other == NULL) continue;
+                    rp_peer_rep_t *pr = NULL;
+                    for (size_t i = 0; i < SCE_MAX_PARTICIPANTS; i++)
+                        if (snap->peer_reps[i].id[0] != '\0' &&
+                            strcmp(snap->peer_reps[i].id, other) == 0)
+                        {
+                            pr = &snap->peer_reps[i];
+                            break;
+                        }
+                    if (pr == NULL)
+                    {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s.unrated: unknown participant %s", pid, other);
+                        return -1;
+                    }
+                    if (pr->has_value)
+                    {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s.unrated[%s]: scored %.4f",
+                                 pid, other, pr->value);
                         return -1;
                     }
                 }

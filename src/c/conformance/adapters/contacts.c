@@ -28,13 +28,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 #include <jansson.h>
 #include <uuid/uuid.h>
 
 #include "contacts/contacts.h"
+#include "contacts/directory.h"
 #include "identity/identity_priv.h"   /* public_identity_from_json */
+#include "network/net_registry.h"
 
 #define FAILF(...)                                                        \
     do {                                                                  \
@@ -210,6 +213,169 @@ static void _op_verify_contact(json_t *fx, json_t *exp, at_case_result_t *out)
     at_case_result_set_pass(out, 0);
 }
 
+
+/* -- the directory (FIRST_CONTACT_PLAN Phase 3) ---------------------------- */
+static const char *const _DIR_REASONS[] = {"ok", "malformed", "bad_signature", "expired",
+                                           "untrusted", "mismatch"};
+
+/* Mirrors Python ContactsAdapter._dir_verify. */
+static void _op_dir_verify(json_t *fx, json_t *exp, at_case_result_t *out)
+{
+    const char *what = _sfield(fx, "what");
+    double now = _dfield(fx, "now", 0.0);
+    json_t *tr = json_object_get(fx, "trusted");
+    const char *trusted[16];
+    size_t n_trusted = 0;
+    for (size_t i = 0; json_is_array(tr) && i < json_array_size(tr) && i < 16; i++)
+        trusted[n_trusted++] = json_string_value(json_array_get(tr, i));
+    const char *const *tp = json_is_array(tr) ? trusted : NULL;
+    if (what == NULL)
+        FAILF("dir_verify: no what");
+    at_dir_signed_t obj;
+    int rc = at_dir_from_wire(json_object_get(fx, "wire"), &obj);
+    if (rc == AT_DIR_OK) {
+        if (strcmp(what, "entry") == 0)
+            rc = at_dir_entry_verify(&obj, tp, n_trusted, now);
+        else if (strcmp(what, "attestation") == 0)
+            rc = at_dir_attest_verify(&obj, tp, n_trusted, now);
+        else if (strcmp(what, "request") == 0)
+            rc = at_dir_request_verify(&obj, now);
+        else {
+            at_dir_free(&obj);
+            FAILF("dir_verify: unknown what %s", what);
+        }
+    }
+    const char *status = rc <= 0 && rc >= AT_DIR_MISMATCH ? _DIR_REASONS[-rc] : "?";
+    const char *want = _sfield(exp, "dir_status");
+    if (want == NULL || strcmp(status, want) != 0) {
+        at_dir_free(&obj);
+        FAILF("dir_verify: got %s want %s", status, want ? want : "(none)");
+    }
+    if (rc == AT_DIR_OK) {
+        const char *h = _sfield(exp, "handle");
+        if (h != NULL && (at_dir_handle(&obj) == NULL || strcmp(at_dir_handle(&obj), h) != 0)) {
+            at_dir_free(&obj);
+            FAILF("dir_verify: handle mismatch");
+        }
+        json_t *seq = json_object_get(exp, "seq");
+        if (json_is_integer(seq) && at_dir_seq(&obj) != (int64_t)json_integer_value(seq)) {
+            at_dir_free(&obj);
+            FAILF("dir_verify: seq %lld want %lld", (long long)at_dir_seq(&obj),
+                  (long long)json_integer_value(seq));
+        }
+        const char *u = _sfield(exp, "uuid");
+        const char *got_u = strcmp(what, "request") == 0 ? at_dir_request_from(&obj)
+                                                         : at_dir_uuid(&obj);
+        if (u != NULL && (got_u == NULL || strcasecmp(got_u, u) != 0)) {
+            at_dir_free(&obj);
+            FAILF("dir_verify: uuid mismatch");
+        }
+    }
+    at_dir_free(&obj);
+    at_case_result_set_pass(out, 0);
+}
+
+/* Mirrors Python ContactsAdapter._dir_normalize. */
+static void _op_dir_normalize(json_t *fx, json_t *exp, at_case_result_t *out)
+{
+    json_t *in = json_object_get(fx, "handles");
+    json_t *want = json_object_get(exp, "folded");
+    if (!json_is_array(in) || !json_is_array(want) || json_array_size(in) != json_array_size(want))
+        FAILF("dir_normalize: handles/folded missing or of different lengths");
+    for (size_t i = 0; i < json_array_size(in); i++) {
+        char folded[AT_DIR_HANDLE_MAX + 1];
+        const char *h = json_string_value(json_array_get(in, i));
+        bool ok = h != NULL && at_dir_normalize_handle(h, folded, sizeof(folded)) == 0;
+        json_t *w = json_array_get(want, i);
+        if (json_is_null(w) ? ok : (!ok || strcmp(folded, json_string_value(w)) != 0))
+            FAILF("dir_normalize: #%zu got %s", i, ok ? folded : "null");
+    }
+    at_case_result_set_pass(out, 0);
+}
+
+static double g_reg_mono, g_reg_now;
+static double _reg_mono(void) { return g_reg_mono; }
+static double _reg_now(void) { return g_reg_now; }
+
+static json_t *g_reg_distrusted;
+static bool _reg_distrust(void *arg, const char *uuid, const char *key)
+{
+    (void)arg;
+    (void)key;
+    for (size_t i = 0; json_is_array(g_reg_distrusted) && i < json_array_size(g_reg_distrusted); i++) {
+        const char *d = json_string_value(json_array_get(g_reg_distrusted, i));
+        if (d != NULL && strcasecmp(d, uuid) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Mirrors Python ContactsAdapter._registry. */
+static void _op_registry(json_t *fx, json_t *exp, at_case_result_t *out)
+{
+    json_t *iss = json_object_get(fx, "issuers");
+    const char *issuers[16];
+    size_t n = 0;
+    for (size_t i = 0; json_is_array(iss) && i < json_array_size(iss) && i < 16; i++)
+        issuers[n++] = json_string_value(json_array_get(iss, i));
+    json_t *rate = json_object_get(fx, "rate");
+    net_registry_t *reg = net_registry_new(issuers, n,
+                                           json_is_integer(rate) ? (int)json_integer_value(rate) : 10);
+    if (reg == NULL)
+        FAILF("registry: could not create");
+    g_reg_mono = 0.0;
+    g_reg_now = _dfield(fx, "now", 0.0);
+    g_reg_distrusted = json_object_get(fx, "distrusted");
+    net_registry_set_clocks(reg, _reg_mono, _reg_now);
+    net_registry_set_distrust(reg, _reg_distrust, NULL);
+    json_t *clients = json_object_get(fx, "clients");
+    json_t *calls = json_object_get(fx, "calls");
+    json_t *replies = json_array();
+    size_t i;
+    json_t *call;
+    json_array_foreach(calls, i, call) {
+        g_reg_mono += _dfield(call, "advance", 0.0);
+        json_t *who = json_object_get(clients, _sfield(call, "as"));
+        const char *uu = _sfield(who, "uuid"), *key = _sfield(who, "key");
+        const char *kind = _sfield(call, "call");
+        json_t *r = NULL;
+        if (uu == NULL || key == NULL || kind == NULL)
+            r = json_pack("{s:s}", "op", "bad_call");
+        else if (strcmp(kind, "publish") == 0)
+            r = net_registry_publish(reg, uu, key, json_object_get(call, "entry"));
+        else if (strcmp(kind, "withdraw") == 0)
+            r = net_registry_withdraw(reg, uu, key, _sfield(call, "handle"));
+        else
+            r = net_registry_lookup(reg, uu, _sfield(call, "handle"));
+        json_t *got = json_object();
+        json_object_set(got, "op", json_object_get(r, "op"));
+        json_object_set_new(got, "handle", json_string(_sfield(r, "handle") ? _sfield(r, "handle") : ""));
+        if (json_object_get(r, "reason") != NULL)
+            json_object_set(got, "reason", json_object_get(r, "reason"));
+        if (json_object_get(r, "seq") != NULL)
+            json_object_set(got, "seq", json_object_get(r, "seq"));
+        const char *op = _sfield(r, "op");
+        if (op != NULL && strcmp(op, "dir_entry") == 0)
+            json_object_set_new(got, "found", json_boolean(json_is_object(json_object_get(r, "entry"))));
+        json_array_append_new(replies, got);
+        json_decref(r);
+    }
+    net_registry_free(reg);
+    json_t *want = json_object_get(exp, "replies");
+    bool same = json_equal(replies, want);
+    if (!same) {
+        char *g = json_dumps(replies, JSON_COMPACT);
+        char detail[256];
+        snprintf(detail, sizeof(detail), "registry: replies %.200s", g ? g : "?");
+        free(g);
+        json_decref(replies);
+        at_case_result_set_fail(out, 0, "AssertionError", detail);
+        return;
+    }
+    json_decref(replies);
+    at_case_result_set_pass(out, 0);
+}
+
 static void _op_store_roundtrip(json_t *fx, json_t *exp, at_case_result_t *out)
 {
     json_t *store_j = json_object_get(fx, "store");
@@ -321,6 +487,12 @@ void at_contacts_run(const at_case_t *c, at_case_result_t *out)
         _op_verify_contact(fx, exp, out);
     else if (strcmp(op, "store_roundtrip") == 0)
         _op_store_roundtrip(fx, exp, out);
+    else if (strcmp(op, "dir_verify") == 0)
+        _op_dir_verify(fx, exp, out);
+    else if (strcmp(op, "dir_normalize") == 0)
+        _op_dir_normalize(fx, exp, out);
+    else if (strcmp(op, "registry") == 0)
+        _op_registry(fx, exp, out);
     else {
         char detail[160];
         snprintf(detail, sizeof(detail), "unknown contacts op %s", op);

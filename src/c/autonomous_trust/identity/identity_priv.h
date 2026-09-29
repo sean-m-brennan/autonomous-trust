@@ -59,6 +59,14 @@ int public_identity_to_json(const public_identity_t *p, json_t **obj_ptr);
  *  caller-owned @p p (which is zeroed first). Returns 0 on success. */
 int public_identity_from_json(const json_t *obj, public_identity_t *p);
 
+/** Mint a local petname for a received identity whose @p nickname is known
+ *  but whose petname is not -- the case of a sender reconstructed from an
+ *  envelope's flat from_* fields, which carry no petname (none ever crosses
+ *  the wire). Same derivation the decoders use; mirrors Python
+ *  derive_local_petname. */
+void public_identity_derive_petname(const char *nickname, char *out,
+                                    size_t outlen);
+
 int group_to_json(const void *data_struct, json_t **obj_ptr);
 
 int group_from_json(const json_t *obj, void *data_struct);

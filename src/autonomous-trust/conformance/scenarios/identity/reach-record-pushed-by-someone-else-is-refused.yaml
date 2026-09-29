@@ -1,0 +1,58 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: reach-record-pushed-by-someone-else-is-refused
+byte_pinning: false
+description: |
+    Alice's own valid record, but pushed by Mallory. On the wire a record is
+    accepted only from its holder: the sender on the envelope must be the uuid the
+    record is for. (A relay lookup's answer has no sender at all -- see
+    reach-record-from-a-relay-lookup-is-applied.)
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+  - id: mallory
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000000a4"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000000b4"
+      size: 1
+    mallory:
+      uuid: "fc000000-0000-4000-8000-0000000000c4"
+      size: 1
+  contacts:
+    alice:
+      rendezvous:
+        - relay://198.51.100.1:27790
+
+steps:
+  - id: 1
+    from: mallory
+    to: bob
+    function: reach_record
+    payload:
+      signer: alice
+      seq: 9
+      relays:
+        - relay://203.0.113.7:27790
+
+    description: |
+        Alice's record, relayed by Mallory over his own sealed channel.
+
+expected_state:
+  bob:
+    contacts:
+      alice:
+        reach_seq: 0
+        rendezvous_head: relay://198.51.100.1:27790
+

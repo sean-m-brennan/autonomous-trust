@@ -1,0 +1,55 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: reach-record-updates-the-contact
+byte_pinning: false
+description: |
+    A contact's signed reachability record, pushed by the contact itself over the
+    sealed channel, updates where Bob reaches her: the record's relay goes to the
+    head of her hints, and its sequence becomes the mark any later record must
+    beat (contacts/reach.py; C contacts/reach.h). The record is minted per run
+    from Alice's own key, so what both runtimes are compared on is the DECISION.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000000a1"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000000b1"
+      size: 1
+  contacts:
+    alice:
+      rendezvous:
+        - relay://198.51.100.1:27790
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: reach_record
+    payload:
+      seq: 3
+      relays:
+        - relay://203.0.113.7:27790
+      endpoints:
+        - 10.0.0.9
+
+    description: |
+        Alice tells Bob she is reachable through a new relay (seq 3).
+
+expected_state:
+  bob:
+    contacts:
+      alice:
+        reach_seq: 3
+        rendezvous_head: relay://203.0.113.7:27790
+

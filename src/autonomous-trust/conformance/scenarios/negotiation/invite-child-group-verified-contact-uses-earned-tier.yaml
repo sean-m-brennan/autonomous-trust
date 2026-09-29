@@ -1,0 +1,47 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: invite-child-group-verified-contact-uses-earned-tier
+byte_pinning: false
+description: |
+    A child-group member on record as a VERIFIED contact uses what it earned:
+    verifying lifts the cap here as it does for a direct peer. Without this case,
+    a gate that capped every child member with any contact record would pass the
+    unverified one.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  first_contact:
+    enabled: true
+  child_group_members:
+    bob: [alice]
+  verified_contacts:
+    bob: [alice]
+  capabilities:
+    bob: [chat, file_share]
+  capability_tiers:
+    chat: 1
+    file_share: 2
+  peer_tiers:
+    alice: 4
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: invitation
+    payload:
+      capability: file_share
+      task_id: t-cgv-share
+  - id: 2
+    from: bob
+    to: alice
+    function: ack
+    in_response_to: 1
+    payload:
+      task_id: t-cgv-share

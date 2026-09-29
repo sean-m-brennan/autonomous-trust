@@ -1,0 +1,50 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: reach-record-from-a-stranger-is-ignored
+byte_pinning: false
+description: |
+    A valid record from someone who is not a contact is ignored: a record updates
+    a contact Bob already has, and never creates one.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+  - id: mallory
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000000a7"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000000b7"
+      size: 1
+    mallory:
+      uuid: "fc000000-0000-4000-8000-0000000000c7"
+      size: 1
+
+steps:
+  - id: 1
+    from: mallory
+    to: bob
+    function: reach_record
+    payload:
+      signer: mallory
+      seq: 2
+      relays:
+        - relay://203.0.113.7:27790
+
+    description: |
+        Mallory's own, valid record; Mallory is no contact of Bob's.
+
+expected_state:
+  bob:
+    contacts:
+      mallory: false
+
