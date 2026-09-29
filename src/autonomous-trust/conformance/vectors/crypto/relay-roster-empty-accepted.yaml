@@ -1,0 +1,17 @@
+schema_version: "1"
+kind: crypto_vector
+protocol: network
+name: relay-roster-empty-accepted
+description: |
+    An empty roster is valid: it is how a community says it runs no relays now,
+    and, with a higher seq, it replaces the previous roster.
+    FIRST_CONTACT_PLAN §4.2 / §4.5 (community relay rosters).
+primitive: relay_roster_verify
+input:
+  roster: "{\"body\":\"{\\\"v\\\":1,\\\"typename\\\":\\\"at-relay-roster\\\",\\\"issuer\\\":\\\"48075a597e721a156e2e0799de5cc0c5324dc6e7eaf1cdd46250868ec53215dd\\\",\\\"seq\\\":2,\\\"relays\\\":[]}\",\"sig\":\"a311d6b2d1207aa33b52d7e591551a779629076a28cac9870e7f64041c89fb5b828e633e107c2a58de424d39396992438b8440ce0c2b6971908cd6a7a5ea540e\"}"
+  issuers:
+    - "48075A597E721A156E2E0799DE5CC0C5324DC6E7EAF1CDD46250868EC53215DD"
+expected:
+  valid: true
+  seq: 2
+  relays: []

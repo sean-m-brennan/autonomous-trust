@@ -1,0 +1,16 @@
+schema_version: "1"
+kind: crypto_vector
+protocol: network
+name: relay-roster-seed-domain-refused
+description: |
+    A roster body signed under the seed list's domain (at-seeds-v1|) rather than
+    the roster's: refused, so a signature made for one kind of list never verifies
+    as the other.
+    FIRST_CONTACT_PLAN §4.2 / §4.5 (community relay rosters).
+primitive: relay_roster_verify
+input:
+  roster: "{\"body\":\"{\\\"v\\\":1,\\\"typename\\\":\\\"at-relay-roster\\\",\\\"issuer\\\":\\\"48075a597e721a156e2e0799de5cc0c5324dc6e7eaf1cdd46250868ec53215dd\\\",\\\"seq\\\":1,\\\"relays\\\":[\\\"relay://00000000-0000-4000-8000-000000000001:abababababababababababababababab@198.51.100.1:27790\\\"]}\",\"sig\":\"90eb46654c9d01fa92929ac5a8b00d856bbcc5ef526a0840857863f8f391a5529ba8cd42635ea20aae5aa62aa000897250a5100c70fb22ad005904093a936e09\"}"
+  issuers:
+    - "48075a597e721a156e2e0799de5cc0c5324dc6e7eaf1cdd46250868ec53215dd"
+expected:
+  valid: false
