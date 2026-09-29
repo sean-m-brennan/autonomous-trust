@@ -129,11 +129,14 @@ def own_relay_hints():
     repeats are skipped (and logged); at most :data:`MAX_RELAYS` are kept.
 
     With ``AT_USE_RELAY`` unset or empty and first contact on
-    (``AT_FIRST_CONTACT``), the signed seed list stands in (relay_seeds.py):
-    an operator's explicit choice always wins, and off means off."""
+    (``AT_FIRST_CONTACT``), the relays of the communities this node pinned
+    (relay_rosters.py) stand in, followed by the signed seed list
+    (relay_seeds.py): an operator's explicit choice always wins, a community
+    the operator chose to trust comes before the project default, and off
+    means off."""
     env = os.environ.get('AT_USE_RELAY', '')
     if not env.strip():
-        return _seed_hints()
+        return _merge_hints(_roster_hints(), _seed_hints())
     found = []
     for item in env.split(','):
         if not item.strip():
@@ -151,13 +154,48 @@ def own_relay_hints():
 
 
 _seed_cache = {'key': None, 'hints': []}
+_roster_cache = {'key': None, 'hints': []}
+
+
+def _merge_hints(first, then):
+    """``first`` then whatever of ``then`` it lacks, one per endpoint, at most
+    :data:`MAX_RELAYS`."""
+    out = []
+    for endpoint, pin in list(first) + list(then):
+        if endpoint not in [ep for ep, _pin in out]:
+            out.append((endpoint, pin))
+    return out[:MAX_RELAYS]
+
+
+def _first_contact_on():
+    return os.environ.get('AT_FIRST_CONTACT', '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _roster_hints():
+    """The pinned communities' roster relays when first contact is on, else
+    []. Re-read only when a roster file, the issuer list or the seen seqs
+    change, as the seed list is."""
+    if not _first_contact_on():
+        return []
+    from . import relay_rosters as _rosters
+    from ..config.configuration import Configuration
+    def paths():
+        return tuple([_rosters.rosters_dir(), _rosters.issuers_path(),
+                      os.path.join(Configuration.get_data_dir(), _rosters.SEEN_FILE)]
+                     + _rosters.roster_files())
+    env = os.environ.get(_rosters.ISSUERS_ENV, '')
+    if _roster_cache['key'] != _stamp(paths(), env):
+        _roster_cache['hints'] = _rosters.load()
+        # Stamped AFTER the load: raising a seq floor rewrites a stamped file.
+        _roster_cache['key'] = _stamp(paths(), env)
+    return list(_roster_cache['hints'])
 
 
 def _seed_hints():
     """The seed list's relays when first contact is on, else []. Re-read only
     when one of its files (or the release key) changes, so a refused file is
     logged once, not on every route lookup."""
-    if os.environ.get('AT_FIRST_CONTACT', '').strip().lower() not in ('1', 'true', 'yes', 'on'):
+    if not _first_contact_on():
         return []
     from . import relay_seeds as _seeds
     from ..config.configuration import Configuration

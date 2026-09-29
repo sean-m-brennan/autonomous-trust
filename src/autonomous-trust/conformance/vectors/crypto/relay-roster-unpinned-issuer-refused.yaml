@@ -1,0 +1,15 @@
+schema_version: "1"
+kind: crypto_vector
+protocol: network
+name: relay-roster-unpinned-issuer-refused
+description: |
+    The same roster from an issuer this node did not pin: refused. A community's
+    roster counts only on a node whose operator chose to trust that community.
+    FIRST_CONTACT_PLAN §4.2 / §4.5 (community relay rosters).
+primitive: relay_roster_verify
+input:
+  roster: "{\"body\":\"{\\\"v\\\":1,\\\"typename\\\":\\\"at-relay-roster\\\",\\\"issuer\\\":\\\"ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c\\\",\\\"seq\\\":5,\\\"relays\\\":[\\\"relay://0f1e2d3c-4b5a-4968-8776-655443322110:7300c0ae1429cd153252736a781b78f4@relay.example.org:27790\\\",\\\"relay://1a2b3c4d-5e6f-4071-8293-a4b5c6d7e8f9:d7e1e084be213b01e506852af8198b99@[2001:db8::7]:27791\\\"]}\",\"sig\":\"491f75ed4f7472d3c07f204df7de22354eb8a2ba23632af27507822fb94790ebe6b20ac55e69de391b274e6ba850ed148970d7a384c2e8ffe63b578416cd620f\"}"
+  issuers:
+    - "48075a597e721a156e2e0799de5cc0c5324dc6e7eaf1cdd46250868ec53215dd"
+expected:
+  valid: false

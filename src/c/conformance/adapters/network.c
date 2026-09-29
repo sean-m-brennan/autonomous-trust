@@ -31,6 +31,7 @@
 #include "identity/identity_priv.h"
 #include "network/network.h"
 #include "network/net_message.h"
+#include "network/net_relay_rosters.h"
 
 #include "../negative_runner.h"
 #include "../jcs.h"
@@ -121,6 +122,75 @@ cleanup:
     free(seed);
     free(msg);
     free(expected_sig);
+    return rc;
+}
+
+/* A community relay roster against the pinned issuers: accepted or refused, and
+ * when accepted the seq and the relays as uuid:fp@host:port. The file check
+ * only; the seq floor is node state. Mirrors the Python adapter's
+ * _relay_roster_verify. */
+static int run_relay_roster_verify(json_t *input, json_t *expected,
+                                   char *err, size_t err_len) {
+    const char *text = json_string_value(json_object_get(input, "roster"));
+    json_t *keys = json_object_get(input, "issuers");
+    if (text == NULL || !json_is_array(keys)) {
+        snprintf(err, err_len, "relay_roster_verify: needs roster and issuers");
+        return -1;
+    }
+    net_relay_roster_issuers_t issuers = {0};
+    size_t i;
+    json_t *k;
+    json_array_foreach(keys, i, k) {
+        const char *s = json_string_value(k);
+        if (s == NULL || issuers.n >= AT_RELAY_ROSTER_ISSUERS_MAX)
+            continue;
+        size_t j = 0;
+        for (; s[j] != '\0' && j < AT_RELAY_ROSTER_KEY_HEX; j++)
+            issuers.keys[issuers.n][j] =
+                (char)(s[j] >= 'A' && s[j] <= 'Z' ? s[j] + 32 : s[j]);
+        issuers.keys[issuers.n][j] = '\0';
+        issuers.n++;
+    }
+    net_relay_seed_list_t *l = calloc(1, sizeof(*l));
+    if (l == NULL) {
+        snprintf(err, err_len, "relay_roster_verify: out of memory");
+        return -1;
+    }
+    long long seq = 0;
+    bool valid = net_relay_roster_verify(text, &issuers, NULL, &seq, l) == 0;
+    bool should = json_is_true(json_object_get(expected, "valid"));
+    int rc = -1;
+    if (valid != should) {
+        snprintf(err, err_len, "relay_roster_verify: got valid=%d, expected valid=%d",
+                 valid ? 1 : 0, should ? 1 : 0);
+        goto done;
+    }
+    if (valid) {
+        json_t *want = json_object_get(expected, "relays");
+        if (seq != (long long)json_integer_value(json_object_get(expected, "seq"))) {
+            snprintf(err, err_len, "relay_roster_verify: seq %lld is not the expected one", seq);
+            goto done;
+        }
+        if (!json_is_array(want) || json_array_size(want) != l->n) {
+            snprintf(err, err_len, "relay_roster_verify: %zu relays, expected %zu",
+                     l->n, json_array_size(want));
+            goto done;
+        }
+        for (size_t r = 0; r < l->n; r++) {
+            char got[AT_RELAY_HOST_LEN + 96];
+            snprintf(got, sizeof(got), "%s:%s@%s:%d", l->pins[r].uuid, l->pins[r].fp,
+                     l->eps[r].host, l->eps[r].port);
+            const char *w = json_string_value(json_array_get(want, r));
+            if (w == NULL || strcmp(got, w) != 0) {
+                snprintf(err, err_len, "relay_roster_verify: relay %zu is %s, expected %s",
+                         r, got, w != NULL ? w : "(none)");
+                goto done;
+            }
+        }
+    }
+    rc = 0;
+done:
+    free(l);
     return rc;
 }
 
@@ -415,6 +485,9 @@ static int run_crypto_vector(const at_case_t *c,
     }
     if (strcmp(primitive, "nacl_box_open") == 0) {
         return run_box_open(input, expected, err, err_len);
+    }
+    if (strcmp(primitive, "relay_roster_verify") == 0) {
+        return run_relay_roster_verify(input, expected, err, err_len);
     }
     snprintf(err, err_len, "unsupported primitive: %s", primitive);
     return -1;

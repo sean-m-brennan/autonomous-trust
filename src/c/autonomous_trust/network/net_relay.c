@@ -36,6 +36,7 @@
 
 #include "net_relay.h"
 #include "net_relay_seeds.h"
+#include "net_relay_rosters.h"
 #include "net_registry.h"
 #include "config/configuration.h"
 #include "contacts/reach.h"
@@ -198,7 +199,7 @@ size_t net_relay_own_list(net_relay_ep_t *out, size_t max)
  * only when one of them changes. Mirrors Python relay._seed_hints. */
 #define AT_RELAY_SEED_STAMPS 4
 typedef struct {
-    char path[CFG_PATH_LEN + 64];
+    char path[CFG_PATH_LEN + 64 + 256];   /* a roster dir plus a file name */
     bool exists;
     struct timespec mtime;
     off_t size;
@@ -278,6 +279,95 @@ static size_t _seed_hints(net_relay_ep_t *out, net_relay_pin_t *pins, size_t max
     return n;
 }
 
+/* The pinned communities' roster files, stamped as the seed list's are.
+ * Mirrors Python relay._roster_hints. */
+#define AT_RELAY_ROSTER_STAMPS (AT_RELAY_ROSTER_FILES_MAX + 3)
+static struct {
+    pthread_mutex_t lock;
+    bool valid;
+    _seed_stamp_t stamp[AT_RELAY_ROSTER_STAMPS];
+    char issuers_env[AT_RELAY_ROSTER_ISSUERS_MAX * (AT_RELAY_ROSTER_KEY_HEX + 2) + 1];
+    size_t n;
+    net_relay_ep_t eps[AT_RELAY_MAX];
+    net_relay_pin_t pins[AT_RELAY_MAX];
+} g_roster_cache = { .lock = PTHREAD_MUTEX_INITIALIZER };
+
+static void _roster_stamp(_seed_stamp_t *st)
+{
+    char data_dir[CFG_PATH_LEN + 1] = {0}, dir[CFG_PATH_LEN + 64] = {0};
+    memset(st, 0, AT_RELAY_ROSTER_STAMPS * sizeof(*st));
+    (void)get_data_dir(data_dir, sizeof(data_dir));
+    (void)net_relay_rosters_dir(dir, sizeof(dir));
+    snprintf(st[0].path, sizeof(st[0].path), "%s", dir);
+    (void)net_relay_rosters_issuers_path(st[1].path, sizeof(st[1].path));
+    snprintf(st[2].path, sizeof(st[2].path), "%s/%s", data_dir, AT_RELAY_ROSTERS_SEEN_FILE);
+    char (*names)[256] = calloc(AT_RELAY_ROSTER_FILES_MAX, sizeof(*names));
+    size_t nf = names != NULL ? net_relay_rosters_files(names, AT_RELAY_ROSTER_FILES_MAX) : 0;
+    for (size_t i = 0; i < nf; i++)
+        snprintf(st[3 + i].path, sizeof(st[3 + i].path), "%s/%s", dir, names[i]);
+    free(names);
+    for (int i = 0; i < AT_RELAY_ROSTER_STAMPS; i++) {
+        struct stat sb;
+        if (st[i].path[0] != '\0' && stat(st[i].path, &sb) == 0) {
+            st[i].exists = true;
+            st[i].mtime = sb.st_mtim;
+            st[i].size = sb.st_size;
+        }
+    }
+}
+
+/* With AT_USE_RELAY unset or empty and first contact on, the relays of the
+ * communities this node pinned stand in ahead of the seed list. */
+static size_t _roster_hints(net_relay_ep_t *out, net_relay_pin_t *pins, size_t max)
+{
+    if (!_seed_flag_on())
+        return 0;
+    _seed_stamp_t *now = calloc(AT_RELAY_ROSTER_STAMPS, sizeof(*now));
+    if (now == NULL)
+        return 0;
+    const char *env = getenv(AT_RELAY_ROSTER_ISSUERS_ENV);
+    char env_now[sizeof(g_roster_cache.issuers_env)];
+    snprintf(env_now, sizeof(env_now), "%s", env != NULL ? env : "");
+    pthread_mutex_lock(&g_roster_cache.lock);
+    _roster_stamp(now);
+    if (!g_roster_cache.valid || strcmp(g_roster_cache.issuers_env, env_now) != 0
+        || memcmp(now, g_roster_cache.stamp, AT_RELAY_ROSTER_STAMPS * sizeof(*now)) != 0) {
+        g_roster_cache.n = net_relay_rosters_load(g_roster_cache.eps, g_roster_cache.pins,
+                                                  AT_RELAY_MAX);
+        /* Stamped AFTER the load: raising a seq floor rewrites a stamped file. */
+        _roster_stamp(g_roster_cache.stamp);
+        snprintf(g_roster_cache.issuers_env, sizeof(g_roster_cache.issuers_env), "%s", env_now);
+        g_roster_cache.valid = true;
+    }
+    size_t n = g_roster_cache.n < max ? g_roster_cache.n : max;
+    memcpy(out, g_roster_cache.eps, n * sizeof(*out));
+    if (pins != NULL)
+        memcpy(pins, g_roster_cache.pins, n * sizeof(*pins));
+    pthread_mutex_unlock(&g_roster_cache.lock);
+    free(now);
+    return n;
+}
+
+/* Rosters first, then the seed entries they lack, one per endpoint. */
+static size_t _community_hints(net_relay_ep_t *out, net_relay_pin_t *pins, size_t max)
+{
+    size_t n = _roster_hints(out, pins, max);
+    net_relay_ep_t seeds[AT_RELAY_MAX];
+    net_relay_pin_t seed_pins[AT_RELAY_MAX];
+    size_t ns = _seed_hints(seeds, seed_pins, AT_RELAY_MAX);
+    for (size_t i = 0; i < ns && n < max; i++) {
+        bool dup = false;
+        for (size_t k = 0; k < n && !dup; k++)
+            dup = out[k].port == seeds[i].port && strcmp(out[k].host, seeds[i].host) == 0;
+        if (dup)
+            continue;
+        if (pins != NULL)
+            pins[n] = seed_pins[i];
+        out[n++] = seeds[i];
+    }
+    return n;
+}
+
 size_t net_relay_own_hints(net_relay_ep_t *out, net_relay_pin_t *pins, size_t max)
 {
     const char *env = getenv("AT_USE_RELAY");
@@ -289,7 +379,7 @@ size_t net_relay_own_hints(net_relay_ep_t *out, net_relay_pin_t *pins, size_t ma
     for (const char *c = env; c != NULL && *c != '\0' && blank; c++)
         blank = *c == ' ' || *c == '\t' || *c == '\n' || *c == '\r';
     if (blank)
-        return _seed_hints(out, pins, max);
+        return _community_hints(out, pins, max);
     size_t n = 0;
     const char *p = env;
     while (*p != '\0' && n < max) {

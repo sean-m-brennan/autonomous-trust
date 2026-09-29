@@ -479,6 +479,45 @@ constant in both runtimes (`RELEASE_KEY`, `AT_RELAY_SEEDS_RELEASE_KEY`) and is
 empty until the release keypair is minted. Until then no shipped list is
 trusted, and only the local additions apply.
 
+### Relays a community stands behind: rosters
+
+Between the operator's explicit choice and the project's defaults sits a third
+source: the relays a **community** the operator trusts has published (Python
+`network/relay_rosters.py`, C `network/net_relay_rosters.{h,c}`). The case it was
+built for is an Ethne polity running rendezvous relays as a governed service,
+which confers an office on each operator and publishes the result
+(`en_uplift::rendezvous_roster`, Ethne design D36). Nothing here knows what a polity
+is: any community with a key can publish a roster, and `tools/relay_rosters.py`
+signs one for a community that is not a polity.
+
+A roster is the same kind of file as the seed list, verified by the same code:
+`{"body", "sig"}`, signed by the community's key over `at-relay-roster-v1|` plus the
+exact body, which names that key as its `issuer` and carries a version, a
+sequence number and the relays. Rosters live in `<cfg_dir>/relay_rosters/`
+(`$AT_RELAY_ROSTERS` names another directory), and a roster counts only when its
+issuer is **pinned**, in `$AT_RELAY_ROSTER_ISSUERS` (comma-separated keys) or in
+`<cfg_dir>/relay_roster_issuers.cfg.json`. `tools/relay_rosters.py pin`, `install`
+and `show` manage both. Three rules differ from the seed list's:
+
+- **Every entry is pinned.** A community vouches for a relay by its key, so an
+  entry without `<uuid>:<fp>@` refuses the whole roster.
+- **A higher sequence replaces the issuer's previous roster whole.** That is how a
+  community retires a relay, by publishing without it, and an empty roster is how
+  it says it runs none. The node keeps the highest sequence it has accepted per
+  issuer (`<data_dir>/relay_rosters_seen.cfg.json`) and refuses a lower one; of two
+  files from one issuer, the higher sequence wins.
+- **The issuer list is plain configuration**, like the rest of `<cfg_dir>`, which
+  already holds the node's own key.
+
+The order is fixed: `AT_USE_RELAY` if set, otherwise the pinned communities'
+relays in pin order, then the seed list's entries they lack, at most four. With
+first contact off, neither rosters nor seeds are read. A roster relay proves
+itself and is gated by reputation exactly as any other, so a roster decides where
+a node looks, never whom it trusts. The format is pinned across three
+implementations: AT's own signer, fed Ethne's inputs, reproduces the roster
+Ethne emits byte for byte, and both runtimes accept that file and refuse the
+same five variations (conformance `network/relay-roster-*`).
+
 ### Reconnecting after a restart
 
 `Peers` is rebuilt every session and keeps no direct peer, so a restarted node
@@ -587,8 +626,10 @@ invitation names. Two roles still have loose ends:
 - **Rendezvous relays, beyond what is built.** Relays are built (see
   *Reaching a contact behind NAT*, above): several relays per node, named in
   the invitation, with failover and reconnection after a restart, and a
-  signed seed list a fresh install falls back on. Still ahead is the release
-  keypair that signs the shipped list, and an Ethne `rendezvous` polity option.
+  signed seed list a fresh install falls back on, and the rosters of the
+  communities an operator pins, which is how an Ethne polity offers
+  rendezvous as a service. Still ahead is the release keypair that signs the
+  shipped list.
 - **The directory, beyond what is built.** Finding someone by handle is built
   (see *Finding someone by handle*, above): opt-in entries backed by an
   issuer's attestation, registries on relays, one-handle, rate-limited lookups,
