@@ -227,3 +227,40 @@ class TestSimultaneousRotationConverges:
         assert _key_of(a.group) == before, (
             'an unverified key-carrying update was adopted — that is the '
             'attack surface the gate exists for')
+
+
+class TestAdoptedKeyReachesSiblings:
+    """The adopted key must reach the NETWORK process, not only identity.
+
+    Partition cohort part-3310971 (2026-09-28): four nodes each logged the
+    adoption of the same rotated key, then multicast under three different
+    keys and could open none of each other's frames. A rotation changes no
+    membership, so the update that carries it is equal-or-smaller than ours,
+    and handle_group_update's quiet no-op return was the only exit: the key
+    changed in identity and never went out to the siblings.
+    """
+
+    def test_an_equal_size_rotation_is_recorded(self):
+        a_id = _new_identity('a', '10.0.0.1')
+        b_id = _new_identity('b', '10.0.0.2')
+        a_grp, b_grp = _shared_group(a_id, b_id)
+        a = _build_process(a_id, a_grp)
+        b_grp.rotate_key()   # b supersedes: higher epoch, same membership
+
+        a.handle_group_update(_queues(), _update_from(b_grp))
+
+        assert _key_of(a.group) == _key_of(b_grp), 'precondition: adopted'
+        a._record_group.assert_called()
+
+    def test_a_declined_rotation_records_nothing(self):
+        """Control: when our key stands, siblings already hold it."""
+        a_id = _new_identity('a', '10.0.0.1')
+        b_id = _new_identity('b', '10.0.0.2')
+        a_grp, b_grp = _shared_group(a_id, b_id)
+        a = _build_process(a_id, a_grp)
+        a.group.rotate_key()
+        a.group.rotate_key()   # ours is two epochs ahead; b's is stale
+
+        a.handle_group_update(_queues(), _update_from(b_grp))
+
+        a._record_group.assert_not_called()

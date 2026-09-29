@@ -152,6 +152,16 @@ void identity_periodic_caps_resync(const process_t *proc);
  *  One shot per proposal and bounded (ID_VOTE_SWEEP_MAX). */
 void identity_periodic_vote_collection(process_t *proc, directory_t *queues);
 
+/** Retry, once each, the GROUP / PEER / PEER_REMOVED hand-offs to sibling
+ *  processes that a full queue refused (ISSUES §2.27). Each is rebuilt from
+ *  identity's CURRENT view, so the latest group wins and a peer removed in the
+ *  meantime is not re-added. Invoked from identity_run's main loop each
+ *  cadence tick; exposed for unit tests. */
+void identity_retry_sibling_handoffs(process_t *proc);
+
+/** Test seam: how many sibling hand-offs are waiting to be retried. */
+size_t identity_pending_sibling_handoffs(void);
+
 /** Periodic backstop for the cold/late-joiner identity-loss case: a node
  *  that adopted a group via the merge/partition path holds the members'
  *  addresses (group.address_map) but not their full Identities (peers[]
@@ -233,6 +243,13 @@ int64_t identity_freshness_refusals(const char *verb);
  *  NULL before configuration -- which callers treat as bootstrap-incomplete
  *  and skip, as Python's `self.identity is None` guard does. */
 const identity_t *identity_self_identity(const process_t *proc);
+
+/** Drop the DIRECT peer @p uuid from peers[] here and in every sibling
+ *  process (PEER_REMOVED). @return 0 when it was dropped, 1 when it is a
+ *  cohort MEMBER and was kept, 2 when it was not a peer at all, -1 on a bad
+ *  argument. */
+int identity_remove_direct_peer(process_t *proc, directory_t *queues,
+                                const unsigned char *uuid);
 
 /** Copy the admitted peer @p uuid into @p out. False if no such peer. Takes
  *  the peers read lock. */

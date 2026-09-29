@@ -37,6 +37,7 @@
 #define AUTONOMOUS_TRUST_CONTACTS_H
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <stddef.h>
 
 #include <jansson.h>
@@ -82,6 +83,9 @@ typedef struct {
     size_t rendezvous_count;
     double added_at;              /* epoch seconds */
     double verified_at;           /* epoch seconds, 0 until verified */
+    /* The highest reachability-record seq applied (contacts/reach.h): a record
+     * at or below it is a replay and is refused. Stored only once set. */
+    int64_t reach_seq;
 } contact_t;
 
 /* Flip to verified, stamp verified_at, and seed the trust edge (idempotent). */

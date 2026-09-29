@@ -2868,7 +2868,8 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         except Exception as err:
             self.logger.warning('Could not rotate group key: %s', err)
             return False
-        self.logger.info('Rotated group key to epoch %d (%d member(s))', epoch, len(self.peers.all))
+        self.logger.info('Rotated group key to epoch %d (%d member(s)), key %s…', epoch,
+                         len(self.peers.all), group.encryptor.publish()[:16].decode())
         _probes.counter('id.group', 'key_rotated', str(epoch))
         try:
             grp_msg = to_json_string(group.to_canonical())
@@ -4506,10 +4507,20 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 if (theirs.key_epoch > mine.key_epoch or same_epoch_tiebreak) and verified:
                     if mine.accept_rotation(theirs):
                         self.logger.info(
-                            'Adopted rotated group key, epoch %d%s', mine.key_epoch,
-                            ' (same-epoch tiebreak)' if same_epoch_tiebreak else '')
+                            'Adopted rotated group key, epoch %d%s, key %s…', mine.key_epoch,
+                            ' (same-epoch tiebreak)' if same_epoch_tiebreak else '',
+                            mine.encryptor.publish()[:16].decode())
                         _probes.counter('id.group', 'key_adopted',
                                         str(mine.key_epoch))
+                        # Hand the adopted key to our sibling processes NOW:
+                        # the membership comparison below returns quietly on
+                        # an equal-or-smaller address list, the usual shape of
+                        # a rotation, and that return used to be the only exit
+                        # -- identity held the new key while the network
+                        # process kept multicasting under the old one. Mirrors
+                        # C handle_group_update (partition cohort
+                        # part-3310971, 2026-09-28).
+                        self._record_group(queues)
                 # Same group: adopt strictly larger membership, otherwise no-op.
                 if len(theirs.addresses) > len(mine.addresses):
                     adopt = True
@@ -4539,7 +4550,19 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     else:
                         adopt = str(theirs.uuid) < str(mine.uuid)
             if adopt:
-                if theirs.owns_private_key or not mine.owns_private_key:
+                if mine.uuid == theirs.uuid and mine.owns_private_key:
+                    # OUR OWN group while we hold its key: a membership update
+                    # grows the membership and NEVER changes the key (ISSUES
+                    # §2.31). A same-group key change is a rotation, and the
+                    # rotation branch above already took every newer or
+                    # tiebreak-winning key; the key riding a membership update
+                    # is whatever the sender held when it built it, possibly an
+                    # epoch behind. Taking it wholesale is how partition cohort
+                    # part-3637905 (2026-09-29) downgraded ben from epoch 4 to a
+                    # stale epoch 3. Mirrors C handle_group_update.
+                    self.logger.debug('Adopt %s membership; keep our group key', theirs.nickname)
+                    self.group.adopt_membership(theirs)
+                elif theirs.owns_private_key or not mine.owns_private_key:
                     # Normal adopt: `theirs` carries the shared private key, or
                     # we hold no key to lose — take it wholesale.
                     self.logger.debug('Replace %s group with %s group', mine.nickname, theirs.nickname)
@@ -4595,6 +4618,13 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # cohort(s) from group_child_*.cfg.json before grouping. No-op
         # on leaf nodes. See doc/architecture/gateway-reputation-tree.md.
         self._load_child_groups(queues)
+        # Features restore what they persisted (IdentityHooks.on_start).
+        for hook in identity_hooks(self):
+            if hook.on_start is not None:
+                try:
+                    hook.on_start(self, queues)
+                except Exception as err:
+                    self.report_exception(err, 'identity on_start hook')
         if not self.choosing:
             # initial run, may be called again
             self._spawn(self.choose_group, args=(queues,))

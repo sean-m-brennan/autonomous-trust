@@ -1,0 +1,43 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: checkpoint-cosign-diverged-range-not-signed
+byte_pinning: false
+description: |
+    The range rule is not a looser rule (ISSUES §2.29). bob holds indices 0
+    to 2, but the third is x, not c: his entries over the proposed range hash
+    to a different root, so he does not sign. The proposal is parked, not
+    dropped, because the chains fork by order (ISSUES §2.15) and an adoption can
+    still rewrite those entries to alice's; it expires after one checkpoint
+    interval if that never happens.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: member
+
+fixtures:
+  local_chain:
+    bob:
+      - {task: a, p1: 0.7, p2: 0.5}
+      - {task: b, p1: 0.9, p2: 0.3}
+      - {task: x, p1: 0.2, p2: 0.2}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: checkpoint propose
+    payload:
+      root: "044ff20acbca5c0d93e083ddc7f5cefbe404271250de10d0a15dd8e50d847556"
+      epoch: 7
+      first_index: 0
+      count: 3
+    description: |
+        alice proposes over a, b, c; bob's third entry is x.
+
+expected_state:
+  bob:
+    committed_tx_count: 3
+    checkpoint_cosigns_parked: 1

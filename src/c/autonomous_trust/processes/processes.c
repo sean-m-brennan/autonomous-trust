@@ -305,6 +305,31 @@ int process_apply_handler_config(const process_t *proc)
     return 0;
 }
 
+bool processes_remove_peer(process_t *proc, const unsigned char *uuid)
+{
+    if (proc == NULL || uuid == NULL)
+        return false;
+    bool removed = false;
+    peers_write_lock(proc);
+    size_t n = proc->protocol.num_peers;
+    for (size_t i = 0; i < n; i++) {
+        if (memcmp(proc->protocol.peers[i].uuid, uuid, sizeof(uuid_t)) != 0)
+            continue;
+        size_t tail = n - i - 1;
+        memmove(&proc->protocol.peers[i], &proc->protocol.peers[i + 1],
+                tail * sizeof(proc->protocol.peers[0]));
+        memmove(&proc->protocol.peer_rtt_ms[i], &proc->protocol.peer_rtt_ms[i + 1],
+                tail * sizeof(proc->protocol.peer_rtt_ms[0]));
+        memset(&proc->protocol.peers[n - 1], 0, sizeof(proc->protocol.peers[0]));
+        proc->protocol.peer_rtt_ms[n - 1] = 0;
+        proc->protocol.num_peers = n - 1;
+        removed = true;
+        break;
+    }
+    peers_write_unlock(proc);
+    return removed;
+}
+
 /* Frama-C: skipped — [func-ptr] msg_handler_t callback dispatch */
 bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, generic_msg_t *msg)
 {
@@ -339,6 +364,9 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
             proc->protocol.num_peers++;
         }
         peers_write_unlock(proc);
+        return true;
+    case PEER_REMOVED:
+        (void)processes_remove_peer(proc, msg->info.peer_removed.peer_uuid);
         return true;
     case PEER_RTT_UPDATE: {
         /* Net-proc → us: the authoritative RTT estimate for a peer. Look

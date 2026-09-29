@@ -147,26 +147,137 @@ the two nodes have not spoken. The handshake makes the pair live. It is **off by
 default**: set `AT_FIRST_CONTACT=1` on both nodes, and a node that has not opted
 in registers no handlers for it.
 
-```python
-from autonomous_trust.core.identity import first_contact
+Your application drives it through two requests on the node's control queue,
+the `q_in` you passed to `run_forever`, and reads the answers from `q_out`. The
+app holds no private key, so the node mints the invitation for it:
 
-# Runs INSIDE the identity process: `proc` is the IdentityProcess, which is what
-# owns the identity, the network queue, and the handlers for the reply.
-inviter = first_contact.initiate(proc, queues, link)   # sends the hello
+```python
+import json
+from autonomous_trust.core.app_verbs import AppRequest
+from autonomous_trust.core.identity.first_contact import (
+    APP_INVITE, APP_INITIATE, FirstContactEvent)
+
+# Alice's app: ask her node for a link to share.
+control_queue.put(AppRequest(APP_INVITE, json.dumps({
+    'ref': 'for-bob',            # echoed on the answer
+    'ttl_seconds': 24 * 3600,    # 0 = never expires; omit for a week
+})))
+
+# Bob's app, holding the link Alice sent him:
+control_queue.put(AppRequest(APP_INITIATE, json.dumps({
+    'ref': 'add-alice',
+    'invitation': link,
+    'in_person': False,          # True ONLY for a QR scanned face to face
+    'petname': 'Alice',
+})))
+
+# Either app, reading answers from q_out:
+event = feedback_queue.get()
+if isinstance(event, FirstContactEvent):
+    if event.kind == 'invitation':
+        share(event.blob)                    # an at+contact: link
+    elif event.kind == 'established':
+        print(event.nickname, 'is now a contact', event.role)
+    elif event.kind == 'refused':
+        print('could not add:', event.reason)
 ```
 
-**Not yet reachable from an application hook.** `initiate` takes the identity
-process, not your `AutonomousTrust` subclass, and there is no local IPC verb yet
-by which an app asks the identity process to open a handshake (the way
-`AT_APP_ROSTER_REQUEST` asks it to re-emit the peer view). Until that trigger
-exists this call is reachable from inside the identity process and from tests;
-an integration that needs it today has to add the trigger.
+| Event `kind` | Means | Fields worth reading |
+|---|---|---|
+| `invitation` | the node minted your link | `blob`, `expiry` |
+| `hello_sent` | your node said hello to the inviter | `peer_uuid`, `nickname` |
+| `established` | both nodes now hold each other | `peer_uuid`, `nickname`, `role` |
+| `refused` | a request, or a hello to one of *your* links, failed | `reason` |
+
+Every event carries the `ref` of the request it answers. Two silences are by
+design. The initiator is never told a hello was refused, because the inviter
+sends nothing back (a probe learns nothing from a bad ticket), so `hello_sent`
+followed by nothing for two minutes means refused or unreachable. The inviter is
+told about a refusal only for a link it minted, one that came back expired or
+already used, never about strangers' garbage.
+
+The requests are honored only from the local app, never from the wire, and only
+while `AT_FIRST_CONTACT` is on. From C, the same two requests and four events are
+[`at_first_contact.h`](../src/c/autonomous_trust/at_first_contact.h):
+`at_app_first_contact_invite` / `at_app_first_contact_initiate`, and
+`at_first_contact_event()` on a polled `at_app_event_t`.
+
+#### The address book, through the node
+
+Once a node is running, let it own `contacts.cfg.json`: ask it rather than
+editing the file from the app, or the app and the node race to rewrite it.
+Every request names the contact by uuid (`peer`), echoes `ref`, and answers with
+a `ContactEvent` (or a `FirstContactEvent` of kind `refused`):
+
+| Request (`APP_...`) | Payload | Answer |
+|---|---|---|
+| `SAFETY_NUMBER` | `{ref, peer}` | `safety_number` event: the 60 digits to show |
+| `VERIFY` | `{ref, peer, presented}` or `{ref, peer, confirmed: true}` | `verified` (`method` says which), or `refused` / `mismatch` |
+| `LIST` | `{ref}` | one `contact` per record, oldest first, then `contacts_done` with `count` |
+| `RENAME` | `{ref, peer, petname}` | `contact` with the new name |
+| `REMOVE` | `{ref, peer}` | `removed`; `peer_dropped` says whether a direct peer was let go |
+
+Verifying has two honest forms. `presented` is the number as the user typed it
+from the *other* person's screen, and the node compares it. `confirmed` is the
+user saying they compared the two screens by eye, the usual flow, and the node
+takes their word for it as it does for `in_person`. Echoing back the number the
+node itself handed out would compare it with itself, so there is no third form.
+
+Removing a contact deletes the record and drops the direct peer at once, so
+the node stops attributing and encrypting to it; adding them back takes a fresh
+invitation. A contact who is also in your cohort keeps its place there, because
+that place belongs to the group, and `peer_dropped` is `False`.
+
+The C calls are `at_app_first_contact_safety_number` / `_verify` / `_list` /
+`_rename` / `_remove`, answered by events read with
+`at_first_contact_contact_event()`.
+
+Inside the identity process, the call underneath is:
+
+```python
+from autonomous_trust.core.identity import first_contact
+inviter = first_contact.initiate(proc, queues, link, ref='add-alice')
+```
 
 Alice's node validates the ticket — her signature, not expired, nonce not
 already spent (an invitation is **single-use**, and the spent nonce survives a
 restart) — admits Bob, and acknowledges; Bob's node admits Alice on the ack.
 Both messages ride the open channel by necessity: the first hello arrives before
-either side is a known peer.
+either side is a known peer. Bob's node honors only the ack it is waiting for:
+from the inviter it said hello to, signed by the key the invitation carried,
+echoing the ticket's nonce, within two minutes. An ack out of nowhere admits
+nobody.
+
+Until a contact is verified, this node serves it at most **tier 1**
+(communication) when it asks for a capability, however much reputation it has
+earned: a tier-2 or higher capability is refused. Verifying lifts that at once.
+Members of your cohort are not affected.
+
+**Behind NAT.** A node a friend cannot reach directly can use a rendezvous
+relay: set `AT_USE_RELAY=host:port` (or several, comma-separated, in order of
+preference, up to 4) and every link it mints names them, so the friend's node
+says hello through them and the two stay reachable that way. When a relay is
+down, or cannot reach the friend, traffic moves to the next one. Saved contacts
+reconnect on their own after a restart: the node re-admits everyone in its
+address book and routes each through its recorded relays, then its own. Any
+node can serve as a relay with `AT_RELAY=1` (TCP port `AT_RELAY_PORT`, default
+27790). A relay forwards sealed frames and can neither read nor forge them. It
+proves who it is when a node registers, and once it has, the links that node
+mints pin it (`relay://<uuid>:<fp>@host:port`, uuid plus a fingerprint of its
+key), so nothing else answering at that address is accepted. A node never uses a
+relay whose reputation has fallen below the cut-off, and a relay never serves
+such a node; unknown and neutral nodes are served. A node keeps its contacts
+told where it is: whenever its relays or address change it signs a new
+reachability record, pushes it to its contacts and files it at its relays, and a
+contact that has lost it looks the record up there.
+
+With no `AT_USE_RELAY` set, a node with first contact on falls back on the
+**signed seed list**: `<cfg_dir>/relay_seeds.cfg.json` (or `$AT_RELAY_SEEDS`),
+shipped with the build and signed by the project's release key, plus the
+operator's own additions and removals in `<data_dir>/relay_seeds_local.cfg.json`
+(signed by the node's key). `tools/relay_seeds.py local add|remove|clear` edits
+them and `show` prints the relays the node will use. An explicit `AT_USE_RELAY`
+always wins, and with first contact off the list is never read.
 
 What admission means here is narrower than joining a group, and worth being
 explicit about if you are building on it: each side gains the other as a
@@ -178,8 +289,82 @@ comparison above; the handshake proves reachability, not identity.
 
 The C twin is `at_first_contact_initiate` /
 `handle_first_contact_hello` (`identity/first_contact.h`), gated on the same
-`AT_FIRST_CONTACT` flag, with the same three gates and the same durable
-single-use guard.
+`AT_FIRST_CONTACT` flag, with the same three gates, the same durable single-use
+guard, and the same pending-hello gate on the ack.
+
+#### Finding someone by handle (opt-in directory)
+
+A link is the strongest way to add someone, but it has to travel between the
+two people first. The directory is the alternative for someone you know only by
+a handle, such as an email address or phone number. It is opt-in on both ends:
+Alice is findable only if she publishes, and a registry lists her only on an
+issuer's word that the handle is hers. Finding her does not add her. Bob asks,
+and **Alice's app has to accept** before the two nodes meet.
+
+A registry is a relay that also sets `AT_REGISTRY=1`, and it trusts the issuers
+listed in `<cfg_dir>/registry_issuers.cfg.json` (`{"issuers": ["<hex key>"]}`).
+An issuer is whoever checked that Alice controls the handle (an email round
+trip, an SMS code, an organization's own records) and signed an attestation
+binding the handle to her node's key (`tools/directory_issuer.py attest`). Alice
+and Bob each register with the registry as their relay (`AT_USE_RELAY`).
+
+```python
+from autonomous_trust.core._python.identity.directory_contact import (
+    APP_DIR_PUBLISH, APP_DIR_LOOKUP, APP_REQUEST, APP_ACCEPT, APP_DECLINE,
+    DirectoryEvent)
+
+# Alice's app: publish the handle an issuer attested.
+control_queue.put(AppRequest(APP_DIR_PUBLISH, json.dumps({
+    'ref': 'pub', 'attestation': attestation,   # {body, sig} from the issuer
+    'visibility': 'anyone',                      # or 'published': only findable
+})))                                             # by others who publish too
+
+# Bob's app: look her up, then ask.
+control_queue.put(AppRequest(APP_DIR_LOOKUP, json.dumps(
+    {'ref': 'look', 'handle': 'alice@example.org'})))
+# ... a DirectoryEvent 'found' arrives, then:
+control_queue.put(AppRequest(APP_REQUEST, json.dumps(
+    {'ref': 'ask', 'handle': 'alice@example.org'})))
+
+# Alice's app, on a DirectoryEvent 'contact_request':
+control_queue.put(AppRequest(APP_ACCEPT, json.dumps({'ref': event.ref})))
+# (or APP_DECLINE; either way nothing is said to Bob unless she accepts)
+```
+
+| `DirectoryEvent` kind | Means | Fields worth reading |
+|---|---|---|
+| `published` / `withdrawn` | a registry filed (or dropped) your entry | `handle`, `relay`, `seq` |
+| `found` | a lookup found the handle | `peer_uuid`, `nickname`, `relay` |
+| `not_found` | it did not | `reason`: `''`, `limited` (asked too often), `invalid` |
+| `request_sent` | your request left for the holder | `peer_uuid` |
+| `contact_request` | someone asks to become your contact | `ref` (answer with it), `peer_uuid`, `nickname`, `handle` |
+| `accepted` / `declined` | your app answered a request | `peer_uuid` |
+| `refused` | a request failed | `reason` |
+
+After an accept, the ordinary handshake runs and each app sees a
+`FirstContactEvent` `established`, under the `ref` of its request. Both sides
+record an **unverified** contact with provenance `directory`, capped at tier 1
+until the safety numbers match. The directory helps you find the person;
+verification is still what makes them trusted. `APP_DIR_WITHDRAW` (`{ref,
+handle}`) takes an entry back.
+
+What bounds harvesting is that a lookup names one handle, and each registry
+allows each client a limited number a minute (`AT_REGISTRY_RATE`, default 10).
+An entry with visibility `published` is shown only to clients that publish
+themselves. The answer for a handle nobody filed is the same as for one you may
+not see. Bob's node checks every entry itself (the holder's signature, the
+issuer's attestation, the handle it asked for) rather than take the registry's
+word.
+
+From C, the requests are in
+[`at_first_contact.h`](../src/c/autonomous_trust/at_first_contact.h):
+`at_app_directory_publish` / `_withdraw` / `_lookup`, then
+`at_app_first_contact_request` and, on the holder's side,
+`at_app_first_contact_accept` / `_decline` with the request's `ref`. The events
+are the `AT_APP_EVENT_DIR_*` kinds, read with `at_first_contact_directory_event()`;
+the `established` that follows an accept is an ordinary
+`AT_APP_EVENT_FC_ESTABLISHED`. A C registry is a relay with `AT_REGISTRY=1`,
+reading the same `registry_issuers.cfg.json`.
 
 ## Override hooks
 

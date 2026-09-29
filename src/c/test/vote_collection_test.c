@@ -173,19 +173,17 @@ static void _end(void)
 /* Tests                                                               */
 /* ------------------------------------------------------------------ */
 
-/* THE REGRESSION. One live peer that is gone, so no vote will ever arrive: the
- * proposer's own self-vote is already the majority of 1, and once the grace
- * period is up the admission must go through on it alone. Before the sweep
- * existed this waited forever. */
+/* THE REGRESSION. No vote will ever arrive: for a lone node the proposer's own
+ * self-vote is already the whole group's majority, and once the grace period
+ * is up the admission must go through on it alone. Before the sweep existed
+ * this waited forever. */
 DEFINE_TEST(test_self_vote_alone_admits_once_the_grace_period_is_up)
 {
     _begin();
     identity_t *me = _mk_identity("ada", "10.0.0.1");
-    identity_t *gone = _mk_identity("biz", "10.0.0.2");
     identity_t *joiner = _mk_identity("bob", "10.0.0.3");
     process_t *proc = _mk_process(me);
     directory_t *queues = _mk_queues();
-    _add_peer(proc, gone);          /* a member that has stopped answering */
 
     public_identity_t *pub = _publish(joiner);
     identity_arm_pending_vote(pub, 1, -1.0);   /* deadline already passed */
@@ -196,6 +194,64 @@ DEFINE_TEST(test_self_vote_alone_admits_once_the_grace_period_is_up)
     ck_assert(_was_admitted(joiner->uuid));
     /* Disarmed, so a later tick cannot admit the same peer twice. */
     ck_assert(!identity_pending_vote_armed(joiner->uuid));
+
+    smrt_deref(pub);
+    array_free(queues);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* ISSUES §2.26. The tally counts our own vote, so the bar is a majority of the
+ * whole group, roster plus this node. Two of a four-member group is half, not
+ * a majority. Under the old MAJORITY(num_peers) it admitted, and both halves
+ * of a 2+2 partition could each admit their own newcomers. */
+DEFINE_TEST(test_half_of_an_even_group_does_not_admit)
+{
+    _begin();
+    identity_t *me = _mk_identity("ada", "10.0.0.1");
+    identity_t *p1 = _mk_identity("amy", "10.0.0.2");
+    identity_t *p2 = _mk_identity("bob", "10.0.0.4");
+    identity_t *p3 = _mk_identity("ben", "10.0.0.5");
+    identity_t *joiner = _mk_identity("cal", "10.0.0.6");
+    process_t *proc = _mk_process(me);
+    directory_t *queues = _mk_queues();
+    _add_peer(proc, p1);
+    _add_peer(proc, p2);
+    _add_peer(proc, p3);
+
+    public_identity_t *pub = _publish(joiner);
+    identity_arm_pending_vote(pub, 2, -1.0);   /* ada + amy: one island */
+    identity_periodic_vote_collection(proc, queues);
+    ck_assert_int_eq(g_confirm_count, 0);
+
+    identity_arm_pending_vote(pub, 3, -1.0);   /* three of four: a majority */
+    identity_periodic_vote_collection(proc, queues);
+    ck_assert(_was_admitted(joiner->uuid));
+
+    smrt_deref(pub);
+    array_free(queues);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* The price, stated so it stays deliberate: a two-member group whose other
+ * member has stopped answering cannot admit on its own vote any more, the
+ * one-and-one split of the case above. */
+DEFINE_TEST(test_one_of_two_does_not_admit)
+{
+    _begin();
+    identity_t *me = _mk_identity("ada", "10.0.0.1");
+    identity_t *gone = _mk_identity("biz", "10.0.0.2");
+    identity_t *joiner = _mk_identity("bob", "10.0.0.3");
+    process_t *proc = _mk_process(me);
+    directory_t *queues = _mk_queues();
+    _add_peer(proc, gone);
+
+    public_identity_t *pub = _publish(joiner);
+    identity_arm_pending_vote(pub, 1, -1.0);
+    identity_periodic_vote_collection(proc, queues);
+
+    ck_assert_int_eq(g_confirm_count, 0);
 
     smrt_deref(pub);
     array_free(queues);
@@ -227,8 +283,8 @@ DEFINE_TEST(test_admission_waits_while_the_grace_period_runs)
 }
 END_TEST_DEFINITION()
 
-/* An expired grace period is not a rubber stamp. With four members a single
- * self-vote is short of MAJORITY(4)=3, so the peer is NOT admitted — the
+/* An expired grace period is not a rubber stamp. With five members (four
+ * peers and us) a single self-vote is short of the three a majority needs, so the peer is NOT admitted — the
  * timeout decides on the votes in hand, it does not lower the bar. */
 DEFINE_TEST(test_expired_grace_period_still_needs_the_majority)
 {
@@ -317,6 +373,8 @@ END_TEST_DEFINITION()
 
 RUN_TESTS(VoteCollection,
           test_self_vote_alone_admits_once_the_grace_period_is_up,
+          test_half_of_an_even_group_does_not_admit,
+          test_one_of_two_does_not_admit,
           test_admission_waits_while_the_grace_period_runs,
           test_expired_grace_period_still_needs_the_majority,
           test_sweep_is_a_no_op_with_nothing_pending,

@@ -84,6 +84,11 @@ typedef struct {
      * adapter keeps each side's opt-in exact position here), freed by its
      * impl_free. NULL for a core-only scenario. */
     void *ext;
+    /* The group public key `fixtures.groups` gave this participant, for the
+     * group_key_kept check (ISSUES §2.31). Mirrors the Python adapter's
+     * _FIXTURE_GROUP_PUB. */
+    unsigned char fixture_group_pub[32];
+    bool has_fixture_group_pub;
 } ic_impl_t;
 
 /* One feature's hooks. Every member may be NULL. Return conventions: 1 means

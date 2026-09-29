@@ -1,0 +1,30 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: directory-request-bad-nonce
+description: A request nonce that is not 32 lower-case hex digits is malformed.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: dir_verify
+    what: request
+    now: 1790000000
+    wire:
+      body: '{"v":1,"typename":"at-contact-request","from":"bbbbbbbb-0000-4000-8000-0000000000b2","key":"88df556413538b002015e9619b01bdb5cc48c7215645792563f5460f7307a763","to":"aaaaaaaa-0000-4000-8000-0000000000a1","handle":"alice@example.org","nonce":"0123456789ABCDEF0123456789ABCDEF","expiry":4102444800,"relays":["relay://203.0.113.7:27790"]}'
+      sig: f5dabbd0bd51a3364236fdc257ad5221e0268b55f5180b9f887f54d3ef040e498e809fac7cc4279468eb9e0061696aabfa06e09cbbb524c30bf3b8b537906f0a
+steps:
+- id: 1
+  from: host
+  to: host
+  function: dir_verify
+  description: 'trigger: dir_verify'
+expected_state:
+  host:
+    dir_status: malformed

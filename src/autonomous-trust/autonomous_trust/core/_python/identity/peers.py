@@ -76,9 +76,17 @@ class Peers(Configuration):
             return self.hierarchy[idx][index]
 
     def find_by_uuid(self, uuid):
-        ids = {p.uuid: p for p in self.listing.values()}
-        if uuid in ids:
-            return ids[uuid]
+        # Compared as lower-case strings: a peer's uuid is a str or a UUID
+        # depending on where its Identity was built (an envelope, a config, a
+        # contact record), and the same peer must be found either way -- a
+        # type-strict match lost every contact restored at startup to the
+        # relayed-frame lookup, which asks with a UUID.
+        if uuid is None:
+            return None
+        key = str(uuid).lower()
+        for p in self.listing.values():
+            if str(p.uuid).lower() == key:
+                return p
         return None
 
     def find_by_address(self, address):
@@ -159,6 +167,30 @@ class Peers(Configuration):
             del self.hierarchy[idx][index]
         if v_idx is not None:
             del self.valuation[v_idx][index]
+
+    def remove(self, who):
+        """Forget ``who`` entirely: the nickname slots AND the address
+        listing and ``all`` list the lookups actually read.
+
+        ``delete`` clears only the slots -- it is the half ``add`` needs when
+        it evicts a prior holder, and ``add`` clears the other two itself. A
+        caller letting a peer go for good needs all four, or ``find_by_uuid``
+        and the network's address attribution keep finding it. The C twin is
+        processes_remove_peer. Returns True if anything was removed."""
+        found = False
+        for peer in [p for p in self.all if p is who or p.uuid == who.uuid]:
+            self.all.remove(peer)
+            found = True
+        for addr in [a for a, p in self.listing.items()
+                     if p is who or p.uuid == who.uuid]:
+            del self.listing[addr]
+            found = True
+        index = self._index_by(who)
+        slot = self.find_by_index(index)
+        if slot is not None and (slot is who or slot.uuid == who.uuid):
+            self.delete(slot)
+            found = True
+        return found
 
     def move(self, who, level):
         if who in self.all:

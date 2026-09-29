@@ -1,0 +1,67 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: registry-published-visibility
+description: A 'published' entry is hidden from Bob until Bob has an entry of his own at the registry.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: registry
+    issuers:
+    - d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48
+    now: 1790000000
+    clients:
+      alice:
+        uuid: aaaaaaaa-0000-4000-8000-0000000000a1
+        key: c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242
+      bob:
+        uuid: bbbbbbbb-0000-4000-8000-0000000000b2
+        key: 88df556413538b002015e9619b01bdb5cc48c7215645792563f5460f7307a763
+      eve:
+        uuid: eeeeeeee-0000-4000-8000-0000000000e5
+        key: c84069fa2216c6edc1d52ca83aa11c267dd5440afa526090ca43ebd0ca86a9cf
+    calls:
+    - as: alice
+      call: publish
+      entry:
+        body: '{"v":1,"typename":"at-dir-entry","handle":"alice@example.org","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","key":"c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242","visibility":"published","seq":1,"expiry":4102444800,"identity":{"typename":"identity","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","address":"","nickname":"alice","signature":{"hex_seed":"c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242"},"encryptor":{"hex_seed":"7777777777777777777777777777777777777777777777777777777777777777"}},"attestation":{"body":"{\"v\":1,\"typename\":\"at-dir-attest\",\"handle\":\"alice@example.org\",\"key\":\"c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242\",\"issuer\":\"d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48\",\"expiry\":4102444800}","sig":"a41a0c2032f8e101cc170d50b656d7f4e02a13ca4e7a4a74fdbc30e0344bfe258fd342b4a32bc735d12e345cacae820940d1b58dc42bcd16e7a8ae205b81350a"}}'
+        sig: a2f4927f7dd39ace3098a0fbf1a31d87bd6101048e28ed4e509804848b6fbcf0349ce7766318583cac8eedeb75cad71d867a17f8ae7df0504cdb993df6e30d0a
+    - as: bob
+      call: lookup
+      handle: alice@example.org
+    - as: bob
+      call: publish
+      entry:
+        body: '{"v":1,"typename":"at-dir-entry","handle":"bob@example.org","uuid":"bbbbbbbb-0000-4000-8000-0000000000b2","key":"88df556413538b002015e9619b01bdb5cc48c7215645792563f5460f7307a763","visibility":"anyone","seq":1,"expiry":4102444800,"identity":{"typename":"identity","uuid":"bbbbbbbb-0000-4000-8000-0000000000b2","address":"","nickname":"bob","signature":{"hex_seed":"88df556413538b002015e9619b01bdb5cc48c7215645792563f5460f7307a763"},"encryptor":{"hex_seed":"7777777777777777777777777777777777777777777777777777777777777777"}},"attestation":{"body":"{\"v\":1,\"typename\":\"at-dir-attest\",\"handle\":\"bob@example.org\",\"key\":\"88df556413538b002015e9619b01bdb5cc48c7215645792563f5460f7307a763\",\"issuer\":\"d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48\",\"expiry\":4102444800}","sig":"4e776603582bd6d8c1faa0532cee16498d65fd1fdf9b36667afdc9b4a142641aa08cede58501f08d28706c192499de15afb91cfe679f8e0206c2ba0652592409"}}'
+        sig: 6f74833ec3cab8fed1db5d7b1a6caddbabd0cb71afccfb3d94166e392d21aa967ab7c01ffa33a0689e0b5939aee7f9c5817a2cd8522663d193a6b1ab6d591401
+    - as: bob
+      call: lookup
+      handle: alice@example.org
+steps:
+- id: 1
+  from: host
+  to: host
+  function: registry
+  description: 'trigger: registry'
+expected_state:
+  host:
+    replies:
+    - op: dir_published
+      handle: alice@example.org
+      seq: 1
+    - op: dir_entry
+      handle: alice@example.org
+      found: false
+    - op: dir_published
+      handle: bob@example.org
+      seq: 1
+    - op: dir_entry
+      handle: alice@example.org
+      found: true

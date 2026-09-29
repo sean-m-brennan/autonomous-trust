@@ -54,7 +54,8 @@ typedef enum {
     PEER_REPUTATION,         /**< Reputation → app: one peer's earned score (@ref peer_reputation_msg_t). Local IPC only. */
     CHILD_GROUP,             /**< Identity → sibling processes: one cohort this node GATEWAYS, beyond its primary group. Local IPC only. Carries a @ref group_t like @ref GROUP, but must never land in `protocol.group` — the reputation process keeps a separate chain per child group, and clobbering the primary slot would merge a subtree into it. Mirrors Python's ChildGroupSet (see gateway-reputation-tree.md, doc/architecture/gateway-reputation-tree.md). */
     PEER_RTT_OBSERVED,       /**< Net-proc → app: one peer's latest RTT (ms). Local IPC only. Reuses @ref peer_rtt_update_msg_t; distinct from @ref PEER_RTT_UPDATE (which stays net-proc → sibling processes). */
-    PEER_STANDING            /**< An authority → reputation: a BOUND on what a peer may hold, not an interaction outcome (@ref peer_standing_msg_t). Local IPC only. Was ZTA_STANDING, and ZTA is still a producer — but so is an Ethne expulsion reaching the core through the app (Phase 4 P4.1), so the mechanism outlives the one authority that first needed it. */
+    PEER_STANDING,           /**< An authority → reputation: a BOUND on what a peer may hold, not an interaction outcome (@ref peer_standing_msg_t). Local IPC only. Was ZTA_STANDING, and ZTA is still a producer — but so is an Ethne expulsion reaching the core through the app (Phase 4 P4.1), so the mechanism outlives the one authority that first needed it. */
+    PEER_REMOVED             /**< Identity → sibling processes: drop one peer from peers[] (@ref peer_removed_msg_t). The inverse of @ref PEER, which only ever appended. Local IPC only. Sent when the user removes a first-contact (direct) peer; a cohort member is never removed this way. */
     /* Core ids stop below AT_MSG_TYPE_EXT_MIN (msg_registry.h). A FEATURE's
      * types -- social (Agora's libat_social), ZTA
      * (zta/zta_msg_types.h) -- are registered at load in their own reserved
@@ -434,6 +435,11 @@ typedef struct {
     char source[PEER_STANDING_SOURCE_LEN + 1];
 } peer_standing_msg_t;
 
+/** @brief Payload of @ref PEER_REMOVED: which peer every process forgets. */
+typedef struct {
+    uuid_t peer_uuid;
+} peer_removed_msg_t;
+
 /** @brief Sentinel for @ref peer_standing_msg_t::ceiling meaning "no bound". */
 #define PEER_NO_CEILING (-1.0)
 
@@ -491,6 +497,7 @@ typedef struct
         peer_observed_msg_t peer_observed;
         peer_reputation_msg_t peer_reputation;
         peer_standing_msg_t peer_standing;
+        peer_removed_msg_t peer_removed;
         /** A registered (extension) type's payload -- see msg_registry.h. */
         _Alignas(max_align_t) uint8_t payload[AT_MSG_PAYLOAD_MAX];
     } info;         /**< Discriminated-union payload keyed by @c type. */

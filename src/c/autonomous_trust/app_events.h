@@ -85,7 +85,8 @@ typedef enum {
      * payloads and accessors. Reserved so nobody collides with them:
      *   0..99      core, and Agora's 4..15 grandfathered (Agora appends 16..99)
      *   100..199   future core kinds
-     *   1000..     further features, one block each (doc/architecture/extensions.md)
+     *   1000..1099 first contact (at_first_contact.h; 1000..1008 used)
+     *   1100..     further features, one block each (doc/architecture/extensions.md)
      * Values are frozen across ALL of these: only ever append. */
 } at_app_event_kind_t;
 

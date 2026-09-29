@@ -1,0 +1,49 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: chain-fork-peer-half-not-reproposed
+byte_pinning: false
+description: |
+    A node re-proposes only the half of a dropped entry that it gave (Agora
+    Phase 4 DDIL): each side vouches for its own score and nothing else, so the
+    pair re-forms from its two authors and no node speaks for another.
+
+    Of dave's two dropped entries, x has dave as p2 (score 0.6, alice's half is
+    0.3) and y is between alice and carol. dave re-proposes x alone, with his own
+    0.6, and nothing for y.
+
+participants:
+  - id: alice
+    role: provider
+  - id: carol
+    role: provider
+  - id: dave
+    role: consumer
+
+fixtures:
+  local_chain:
+    dave:
+      - {task: a, p1: 0.7, p2: 0.5}
+      - {task: b, p1: 0.9, p2: 0.3}
+      - {task: x, p1_id: alice, p1: 0.3, p2_id: dave, p2: 0.6}
+      - {task: y, p1_id: alice, p1: 0.5, p2_id: carol, p2: 0.5}
+
+steps:
+  - id: 1
+    from: alice
+    to: dave
+    function: latest update
+    payload:
+      chain:
+        - {task: a, p1: 0.7, p2: 0.5}
+        - {task: b, p1: 0.9, p2: 0.3}
+        - {task: c, p1: 0.6, p2: 0.4}
+        - {task: d, p1: 0.8, p2: 0.8}
+        - {task: e, p1: 0.4, p2: 0.6}
+    description: |
+        alice forks at index 2 and her tip (5) beats dave's (4).
+
+expected_state:
+  dave:
+    committed_tx_count: 5
+    proposed_tasks: {x: 0.6}

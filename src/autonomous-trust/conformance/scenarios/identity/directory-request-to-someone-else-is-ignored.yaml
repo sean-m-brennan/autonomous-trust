@@ -1,0 +1,58 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: directory-request-to-someone-else-is-ignored
+byte_pinning: false
+description: |
+    Bob's request is for Carol's entry -- her uuid -- but delivered to Alice.
+    A request names the holder it was minted for; one addressed to someone
+    else is not Alice's to decide (it could only have been replayed or
+    misrouted), so it is dropped.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+  - id: carol
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  # Strangers, each alone in a cohort: nobody here is a peer of anybody.
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000d0300"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000d0301"
+      size: 1
+    carol:
+      uuid: "fc000000-0000-4000-8000-0000000d0302"
+      size: 1
+
+steps:
+  - id: 1
+    from: alice
+    to: alice
+    function: trigger_directory_publish
+    payload:
+      handle: alice@example.org
+    description: |
+        Pseudo-step: Alice's app publishes her handle through the production
+        app_directory_publish, with an attestation from the harness issuer.
+  - id: 2
+    from: bob
+    to: alice
+    function: first_contact_request
+    payload:
+      handle: alice@example.org
+      nonce: 03c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0
+      to: carol
+    description: |
+        A request minted for Carol's entry, delivered to Alice.
+
+expected_state:
+  alice:
+    directory_requests_held: 0

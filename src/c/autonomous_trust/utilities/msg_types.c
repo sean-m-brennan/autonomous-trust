@@ -78,6 +78,8 @@ size_t message_size(message_type_t type)
         return sizeof(peer_reputation_msg_t);
     case PEER_STANDING:
         return sizeof(peer_standing_msg_t);
+    case PEER_REMOVED:
+        return sizeof(peer_removed_msg_t);
     default:
     {
         const at_msg_vtable_t *vt = at_msg_type_lookup((long)type);
@@ -133,6 +135,8 @@ char *message_type_to_string(message_type_t type)
      * round trip, and renaming one without the other breaks it silently. */
     case PEER_STANDING:
         return (char*)"PEER_STANDING";
+    case PEER_REMOVED:
+        return (char*)"PEER_REMOVED";
     default:
     {
         const at_msg_vtable_t *vt = at_msg_type_lookup((long)type);
@@ -194,6 +198,8 @@ message_type_t message_type_core_by_name(const char *str)
         return CHILD_GROUP;
     if (strcmp(str, "PEER_STANDING") == 0)
         return PEER_STANDING;
+    if (strcmp(str, "PEER_REMOVED") == 0)
+        return PEER_REMOVED;
     return -1;  // No matching message type found (all valid types are > 0)
 }
 
@@ -479,6 +485,14 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         memcpy(subdata, &msg->info.peer_standing, subdata_len);
         break;
     }
+    case PEER_REMOVED:
+    {
+        subdata_len = sizeof(peer_removed_msg_t);
+        subdata = smrt_create(subdata_len);
+        if (subdata == NULL) return EXCEPTION(ENOMEM);
+        memcpy(subdata, &msg->info.peer_removed, subdata_len);
+        break;
+    }
     case UPDATE_PROPOSAL:
         /* UPDATE_PROPOSAL uses its own JSON serialization, not proto */
         return -1;
@@ -748,6 +762,9 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
         break;
     case PEER_STANDING:
         COPY_FIXED_PAYLOAD(peer_standing, peer_standing_msg_t);
+        break;
+    case PEER_REMOVED:
+        COPY_FIXED_PAYLOAD(peer_removed, peer_removed_msg_t);
         break;
     case UPDATE_PROPOSAL:
         /* UPDATE_PROPOSAL uses its own JSON serialization, not proto */

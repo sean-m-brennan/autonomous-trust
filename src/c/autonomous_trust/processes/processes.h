@@ -339,6 +339,22 @@ void sleep_until(const process_t *proc, long how_long);
 bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, generic_msg_t *msg);
 
 /**
+ * @brief Forget the peer @p uuid: remove it from peers[] and its slot in the
+ * parallel peer_rtt_ms[], keeping the others in order.
+ *
+ * The inverse of what a PEER message does, and the only way out of peers[],
+ * which used to be append-only. Takes the peers write lock. Safe because no
+ * process keeps a peers[] INDEX across an unlock -- every per-peer array
+ * outside this struct is a stack snapshot taken under the read lock.
+ *
+ * The removed entry's operator_key_binding is not freed: entries are
+ * memcpy'd between messages and processes, so no one copy owns that pointer.
+ *
+ * @return true if a peer was removed, false if none matched.
+ */
+bool processes_remove_peer(process_t *proc, const unsigned char *uuid);
+
+/**
  * @brief Context for split process setup/loop lifecycle
  */
 typedef struct

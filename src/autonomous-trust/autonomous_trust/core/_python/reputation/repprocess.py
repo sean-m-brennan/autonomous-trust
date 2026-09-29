@@ -176,6 +176,14 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # Seconds between rescore sweeps (_rescore_sweep). Mirrors C
     # REP_RESCORE_INTERVAL. Override: AT_REP_RESCORE_SEC.
     RESCORE_INTERVAL = _env_float('AT_REP_RESCORE_SEC', 60.0)
+    # How long OUR half of a task may go uncommitted before it is proposed
+    # again, and how many times (ISSUES §2.24). A granted round leaves
+    # my_requests when its transaction goes out, and a round nobody answers
+    # gets no nack, so either was otherwise lost for good. Mirrors C
+    # REP_COMMIT_TIMEOUT / REP_COMMIT_RETRIES. Override:
+    # AT_REP_COMMIT_TIMEOUT_SEC.
+    COMMIT_TIMEOUT = _env_float('AT_REP_COMMIT_TIMEOUT_SEC', 15.0)
+    COMMIT_RETRIES = 5
 
     # Hysteresis band for the CTFT ↔ pure-reputation dispatch in
     # _compute_reputation. A single 0.5 threshold made peers hovering
@@ -380,6 +388,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # the round's own group rather than the conflated self.peers.all.
         self.round_group: dict[tuple, str] = {}
         self.my_requests: dict[tuple[int, int], TxCount] = {}
+        # task-id str -> [score, deadline, attempts]: OUR halves proposed and
+        # not yet in the chain, followed by task because the round is what gets
+        # lost (ISSUES §2.24). _retry_uncommitted_halves reads it.
+        self.awaiting_commit: dict[str, list] = {}
         self.requests: list[tuple[int, int]] = []
         self.proposals: dict[tuple[int, int], TransactionScore] = {}
         self.acceptances: dict[UUID, list[TransactionScore]] = {}
@@ -575,6 +587,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self._checkpoint_sigs: dict[tuple, dict] = {}
         # Proposer-side pending checkpoints awaiting quorum: key -> Checkpoint.
         self._checkpoint_pending: dict[tuple, Checkpoint] = {}
+        # Signer-side: proposals that arrived before our chain held their
+        # range, re-checked every pass (ISSUES §2.29).
+        # (proposer-str, group-str) -> (Checkpoint, proposer identity, parked-at).
+        # One per proposer and chain, so a newer epoch replaces an older one.
+        self._cosigns_parked: dict[tuple, tuple] = {}
         # --- Per-chain finalized checkpoint state -------------------------
         # A gateway keeps one chain per child group beside its primary one, and
         # each chain gets its own checkpoints: its own epoch counter, its own
@@ -1032,6 +1049,14 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         idx = self._paxos_id_index(id1, id2)
         pax_id = (id1, id2, self.identity.uuid)
         self.my_requests[idx] = TxCount(score, 0)
+        # Follow our half until it is in the chain. A re-proposal of the same
+        # task keeps its attempt count and only restarts the clock.
+        deadline = now().timestamp() + self.COMMIT_TIMEOUT
+        waiting = self.awaiting_commit.get(str(score.task_id))
+        if waiting is None:
+            self.awaiting_commit[str(score.task_id)] = [score, deadline, 0]
+        else:
+            waiting[1] = deadline
         # Bind this round to its group so quorum + commit routing use
         # the round's own group, not the conflated self.peers.all.
         # Defaults to the primary group (the gateway's own/parent
@@ -1156,6 +1181,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # — primary for leaf nodes, a child chain on a gateway.
                 self._chain_for_group(round_group_uuid).update(
                     score.task_id, peer_id, score.score, score.channel)
+                # Our half is in: stop watching it (ISSUES §2.24).
+                self.awaiting_commit.pop(str(score.task_id), None)
                 # Fold-on-commit: keep the dashboard running consensus EMA
                 # current the moment a tx completes (primary chain only).
                 self._fold_committed_tx(
@@ -1807,9 +1834,28 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     #                           latest agreed commitment to the committed window.
 
     def _checkpoint_quorum(self, group_uuid=None):
-        """Co-signers required to finalize a checkpoint; reuses Paxos majority
-        sizing. '> quorum' matching signers (including the proposer) finalize."""
-        return self._quorum_for_group(group_uuid)
+        """Co-signers required to finalize a checkpoint: '> quorum' matching
+        signers (the proposer's own included) finalize. A MAJORITY OF THE WHOLE
+        GROUP, THIS NODE INCLUDED: (roster + 1) // 2.
+
+        It used to reuse the Paxos sizing, len(peers) // 2, which counts the
+        roster WITHOUT this node and is one signature short for an even-sized
+        group, so both halves of an even split finalized their own windows and
+        could never reconcile after the heal (Agora Phase 4 DDIL, 2026-09-25).
+        Odd sizes are unchanged; Paxos grants and slashing are untouched (the
+        grant formula is ISSUES.md §2.13). Mirrors C _ckpt_quorum_for_group."""
+        if not self.child_groups:
+            roster = len(self.peers.all)
+        else:
+            grp = self._group_by_uuid(group_uuid)
+            roster = (len(self.peers.all) if grp is None
+                      else len(self._members_of_group(grp)))
+        return (roster + 1) // 2
+
+    def _checkpoint_quorum_met(self, designation, sigs, group_uuid=None) -> bool:
+        """``_quorum_met`` with the checkpoint threshold."""
+        return len(self._verified_cosigners(designation, sigs)) > \
+            self._checkpoint_quorum(group_uuid)
 
     def forward_checkpoint(self, queues, message):
         """Entry point for a locally-originated checkpoint: putting a
@@ -1929,7 +1975,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         attests it. Mirrors C's _store_checkpoint."""
         if chain_key or not ckpt.count:
             return
-        if len(sigs or {}) > self._quorum_for_group(None):
+        if len(sigs or {}) > self._checkpoint_quorum(None):
             self._finalized = ckpt
 
     def _slash_marks_path(self):
@@ -2288,7 +2334,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # live path, so whoever wrote the file cannot also set the bar it has
         # to clear. A roster we have not yet loaded resolves no co-signers,
         # which fails closed: the warm start is capped, not forged.
-        if not self._quorum_met(ckpt.designation, signed.sigs):
+        if not self._checkpoint_quorum_met(ckpt.designation, signed.sigs):
             self.logger.warning(
                 'Reputation evidence checkpoint epoch=%s has %d verified '
                 'co-signature(s), short of quorum; restoring at tier %d',
@@ -2403,6 +2449,91 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 ', '.join('%s %.3f->%.3f' % (k[:8], s, c)
                           for k, s, c in clamped[:8]))
 
+    COSIGNS_PARKED_MAX = 16
+
+    def _range_matches(self, chain_key, proposed, first_index, count) -> bool:
+        """Do the entries we hold at [first_index, first_index + count) hash to
+        ``proposed``? The range, not our whole window (ISSUES §2.29): the chain
+        grows every second or two and each member proposes on its own phase,
+        so on arrival a signer has often committed one entry more or fewer.
+        An empty range keeps the whole-window rule. Mirrors C
+        _range_matches_locked."""
+        chain = self._chain_for_key(chain_key)
+        if count > 0:
+            mine = chain.range_root(int(first_index), int(count))
+            return mine is not None and mine == proposed
+        return chain.window_root() == proposed
+
+    def _park_cosign(self, ckpt, proposer, present) -> None:
+        """Keep a proposal we could not co-sign on arrival. One slot per
+        proposer and chain; a late copy of an older epoch is ignored; when
+        every slot holds a different proposer the oldest goes. Mirrors C
+        _park_cosign_locked."""
+        slot = (str(ckpt.proposer_uuid), str(getattr(ckpt, 'group_uuid', '') or ''))
+        held = self._cosigns_parked.get(slot)
+        if held is not None and held[0].epoch > ckpt.epoch:
+            return
+        if held is None and len(self._cosigns_parked) >= self.COSIGNS_PARKED_MAX:
+            oldest = min(self._cosigns_parked,
+                         key=lambda k: self._cosigns_parked[k][2])
+            del self._cosigns_parked[oldest]
+        self._cosigns_parked[slot] = (ckpt, proposer, present)
+
+    def _send_cosign(self, queues, ckpt, proposer) -> bool:
+        """Sign ``ckpt``'s designation and send checkpoint_sign to the
+        proposer. Shared by the propose handler and the parked re-check, which
+        must produce identical acks."""
+        try:
+            sig = self._detached_sig(self.identity, ckpt.designation)
+        except Exception:
+            self.logger.error(
+                'handle_checkpoint_propose: cannot sign; '
+                'declining to co-sign')
+            return False
+        key_proposer, epoch, group = ckpt.key()
+        # The ack carries the chain too: the proposer needs it to find the
+        # right pending round, and it is inside the bytes we just signed.
+        # Length-tolerant on the far side, so a 4-tuple from an older peer
+        # still resolves to the primary chain.
+        ack = (key_proposer, epoch, str(self.identity.uuid), sig, group)
+        try:
+            msg = Message(self.name, ReputationProtocol.checkpoint_sign,
+                          to_json_string(ack), proposer,
+                          from_whom=self.identity)
+            queues[CfgIds.network].put(
+                msg, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('handle_checkpoint_propose: queue full')
+            return False
+        return True
+
+    def _recheck_parked_cosigns(self, queues, present) -> int:
+        """Co-sign every parked proposal whose range our chain now holds with
+        the proposed root; drop those parked longer than one checkpoint
+        interval, by which time the proposer has moved to a new epoch
+        (ISSUES §2.29). Returns how many were co-signed. Mirrors C
+        _recheck_parked_cosigns."""
+        signed = 0
+        for slot, (ckpt, proposer, parked_at) in list(self._cosigns_parked.items()):
+            if present - parked_at > self.CHECKPOINT_INTERVAL:
+                del self._cosigns_parked[slot]
+                continue
+            proposed = ckpt.root
+            if isinstance(proposed, str):
+                proposed = proposed.encode()
+            chain_key = self._chain_key(getattr(ckpt, 'group_uuid', ''))
+            if not self._range_matches(chain_key, proposed, ckpt.first_index,
+                                       ckpt.count):
+                continue
+            del self._cosigns_parked[slot]
+            self.logger.info(
+                'caught up to %s checkpoint epoch %d after %.1f s; '
+                'co-signing it now', str(ckpt.proposer_uuid)[:8], ckpt.epoch,
+                present - parked_at)
+            if self._send_cosign(queues, ckpt, proposer):
+                signed += 1
+        return signed
+
     def handle_checkpoint_propose(self, queues, message):
         if message.function == ReputationProtocol.checkpoint_propose:
             if not message.verified:
@@ -2415,10 +2546,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             # Don't co-sign our own bounce-back.
             if str(ckpt.proposer_uuid) == str(self.identity.uuid):
                 return True
-            # Consensus check: co-sign ONLY if our own committed window
-            # produces the SAME Merkle root. A divergent window declines
-            # silently (no signature), so a checkpoint finalizes only when a
-            # quorum genuinely observed the same committed history.
+            # Consensus check: co-sign ONLY if the entries WE hold at the
+            # proposed indices produce the SAME Merkle root. A signer that is
+            # ahead of the proposer still holds that range; one that is behind
+            # parks the proposal and signs once it catches up (ISSUES §2.29).
+            # A divergent range never signs, so a checkpoint finalizes only
+            # when a quorum genuinely observed the same committed history.
             proposed = ckpt.root
             if isinstance(proposed, str):
                 proposed = proposed.encode()
@@ -2428,33 +2561,15 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             # the degenerate case where two chains share a root, accept one
             # that says nothing about the chain it claims to cover).
             chain_key = self._chain_key(getattr(ckpt, 'group_uuid', ''))
-            mine = self._chain_for_key(chain_key).window_root()
-            if mine != proposed:
+            if not self._range_matches(chain_key, proposed, ckpt.first_index,
+                                       ckpt.count):
                 self.logger.debug(
-                    'checkpoint_propose: window_root mismatch on chain %s, '
-                    'declining', chain_key[:8] or 'primary')
+                    'checkpoint_propose: range [%d, +%d) does not match our '
+                    'chain %s yet; parked', ckpt.first_index, ckpt.count,
+                    chain_key[:8] or 'primary')
+                self._park_cosign(ckpt, message.from_whom, now().timestamp())
                 return True
-            try:
-                sig = self._detached_sig(self.identity, ckpt.designation)
-            except Exception:
-                self.logger.error(
-                    'handle_checkpoint_propose: cannot sign; '
-                    'declining to co-sign')
-                return True
-            proposer, epoch, group = ckpt.key()
-            # The ack carries the chain too: the proposer needs it to find the
-            # right pending round, and it is inside the bytes we just signed.
-            # Length-tolerant on the far side, so a 4-tuple from an older peer
-            # still resolves to the primary chain.
-            ack = (proposer, epoch, str(self.identity.uuid), sig, group)
-            try:
-                msg = Message(self.name, ReputationProtocol.checkpoint_sign,
-                              to_json_string(ack), message.from_whom,
-                              from_whom=self.identity)
-                queues[CfgIds.network].put(
-                    msg, block=True, timeout=self.q_cadence)
-            except Full:
-                self.logger.error('handle_checkpoint_propose: queue full')
+            self._send_cosign(queues, ckpt, message.from_whom)
             return True
         return False
 
@@ -2538,7 +2653,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             # Sized against the group whose chain this covers, for the same
             # reason the propose handler compares that chain's own root.
             group = self._chain_key(getattr(ckpt, 'group_uuid', ''))
-            if not self._quorum_met(ckpt.designation, sigs, group or None):
+            if not self._checkpoint_quorum_met(ckpt.designation, sigs,
+                                               group or None):
                 self.logger.warning(
                     'Rejecting checkpoint_final chain=%s epoch=%s from %s: %d '
                     'verified co-signature(s) do not meet quorum',
@@ -2618,6 +2734,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     for peer in (tx.p1_id, tx.p2_id):
                         if peer is not None:
                             self._note_interaction(peer)
+                if res.status == ReconcileResult.ADOPTED:
+                    self._repropose_dropped(queues, res)
                 return True
             self.updates[message.from_whom.uuid] = from_json_string(message.obj)
             up_count = len(self.updates)
@@ -2640,14 +2758,106 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 self.logger.debug(grouping)
                 if len(best) > up_count // 2:
                     chain = best[0]  # all entries in the bucket are identical
-                    self.history.catchup(chain)
+                    res = self.history.catchup(chain)
                     self.logger.debug('Updated')
+                    if res.status == ReconcileResult.ADOPTED:
+                        self.logger.info(
+                            'adopted the majority chain at index %d: dropped '
+                            '%d, added %d', res.fork, len(res.dropped),
+                            len(res.added))
+                        self._repropose_dropped(queues, res)
                 else:
                     self.logger.error('Closest %d peers unable to agree on history', self.num_updates)
                     self._request_update(queues, len(self.peers.all),
                                          quorum=len(self.peers.all))
             return True
         return False
+
+    def _own_half_recorded(self, task_id) -> bool:
+        """Does any chain we keep hold OUR half of `task_id`, bilateral or not?"""
+        me = str(self.identity.uuid)
+        for chain in [self.history] + list(self.child_histories.values()):
+            tx = chain._task_mapping.get(task_id)
+            if tx is not None and me in (str(tx.p1_id), str(tx.p2_id)):
+                return True
+        return False
+
+    def _retry_uncommitted_halves(self, queues, present) -> int:
+        """Re-propose OUR halves that waited out COMMIT_TIMEOUT without reaching
+        the chain (ISSUES §2.24). A half now in the chain, by our commit or in
+        a chain we adopted, is forgotten. Rounds still filed for the task are
+        retired first, so a late grant for the stale ballot cannot race the
+        fresh one. After COMMIT_RETRIES the half is given up, with a warning.
+        Mirrors C _retry_uncommitted_halves. Returns how many were
+        re-proposed."""
+        resent = 0
+        for key, waiting in list(self.awaiting_commit.items()):
+            score, deadline, attempts = waiting
+            if self._own_half_recorded(score.task_id):
+                del self.awaiting_commit[key]
+                continue
+            if deadline > present:
+                continue
+            for idx in [i for i, tc in self.my_requests.items()
+                        if str(tc.score.task_id) == key]:
+                del self.my_requests[idx]
+                self.backoff.pop(idx, None)
+            if attempts >= self.COMMIT_RETRIES:
+                self.logger.warning(
+                    'our half of task %s never committed after %d '
+                    're-proposal(s); giving up on it', key, attempts)
+                del self.awaiting_commit[key]
+                continue
+            waiting[2] = attempts + 1
+            self.logger.info(
+                'our half of task %s is not in the chain after %.0f s; '
+                're-proposing it (attempt %d of %d)', key, self.COMMIT_TIMEOUT,
+                attempts + 1, self.COMMIT_RETRIES)
+            try:
+                self._start_paxos(queues, score)
+                resent += 1
+            except Full:
+                self.logger.error('retry_uncommitted: Network queue full')
+        return resent
+
+    def _repropose_dropped(self, queues, res: 'ReconcileResult') -> int:
+        """RE-PROPOSE WHAT AN ADOPTION DROPPED (Agora Phase 4 DDIL,
+        2026-09-25). Mirrors C's ``_repropose_dropped`` step for step.
+
+        An adoption drops our committed entries from the fork on, both halves
+        of each. Across a partition that is every transaction the smaller
+        island committed while split: its members adopt the larger island's
+        chain at the heal, and the reputation they earned apart was gone.
+
+        Each node re-submits ITS OWN half of each dropped entry through the
+        normal round, and the counterpart re-submits its half, so the pair
+        re-forms bilaterally on top of the adopted chain. Nothing new is
+        trusted: a node vouches only for the score it gave.
+
+        Skipped: an entry that is not ours, a task the adopted chain already
+        holds (committed or pending), and a task we already have a round under
+        way for. The capability name and learned weight are not on the entry,
+        so the re-proposal carries the authored default weight; the channel is
+        kept. Returns how many were re-proposed."""
+        me = str(self.identity.uuid)
+        pending = {str(tc.score.task_id) for tc in self.my_requests.values()
+                   if getattr(tc, 'score', None) is not None}
+        due = []
+        for tx in res.dropped:
+            if str(tx.p1_id) == me:
+                score, channel = tx.p1_score, tx.p1_channel
+            elif str(tx.p2_id) == me:
+                score, channel = tx.p2_score, tx.p2_channel
+            else:
+                continue
+            if tx.task_id in self.history or str(tx.task_id) in pending:
+                continue
+            due.append(TransactionScore(tx.task_id, score, channel=channel))
+        if due:
+            self.logger.info('re-proposing %d dropped transaction(s)', len(due))
+        for ts in due:
+            self._start_paxos(queues, ts)
+        return len(due)
 
     def _pure_reputation(self, peer):
         # Counterparty's-score weighted by counterparty's-reputation AND by the
@@ -3242,8 +3452,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         peer's address from the live roster and sends a local-IPC
         Network.exclude / Network.readmit control message; the network
         process then drops the peer's inbound frames and filters it out
-        of outbound targets. No-op if the address is unknown (nothing to
-        key the network-layer gate on)."""
+        of outbound targets, and refuses it as a relay client or relay by
+        uuid. The address may be unknown; the uuid gate still applies."""
         try:
             # Peer uuids are strings in this codebase, but callers may hand
             # us a UUID (pending_tiers) or a Peer/Identity object; resolve
@@ -3254,14 +3464,13 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                         or self.peers.find_by_uuid(str(peer_uuid)))
             else:
                 peer = peer_uuid  # already a Peer/Identity
-            address = getattr(peer, 'address', None)
-            if not address:
-                self.logger.debug(
-                    'Exclusion %s for %s: no address, network gate skipped',
-                    'add' if excluded else 'remove', str(peer_uuid)[:8])
-                return
+            address = getattr(peer, 'address', None) or ''
+            uuid = str(getattr(peer, 'uuid', None) or peer_uuid)
+            # Sent even with no address: the uuid alone gates the peer as a
+            # relay client and as a relay (network/relay.py).
             func = Network.exclude if excluded else Network.readmit
-            msg = Message(CfgIds.network, func, address,
+            msg = Message(CfgIds.network, func,
+                          json.dumps({'address': address, 'uuid': uuid}),
                           to_whom=None, from_whom=self.identity)
             queues[CfgIds.network].put(
                 msg, block=True, timeout=self.q_cadence)
@@ -3503,6 +3712,13 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             # below also returns a string — `peer_uuid` is the same
             # type as the keys in self.reputations / self._coop_mode.
             peer_uuid = peer if isinstance(peer, (UUID, str)) else peer.uuid
+            # A node never scores itself: its own history holds no bilateral
+            # evidence about it, and a stored self-score would feed its own
+            # tier. Dropped, not answered -- the sweep already skips self;
+            # this closes the rep_req path. Mirrors C handle_rep_request.
+            if str(peer_uuid) == str(self.identity.uuid):
+                _probes.counter('rep.compute', 'self_skipped')
+                return
             # Slash override (fast-penalty path): a finalized slash floors
             # the score immediately, bypassing the CTFT/pure EMA dispatch.
             # Force CTFT mode so that if the slash is later lifted the peer
@@ -4673,6 +4889,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # evidence carries a quorum-signed root (verifiable warm
                 # start). Throttled internally to CHECKPOINT_INTERVAL.
                 self._maybe_checkpoint(queues, present)
+                # Our halves that went out and never came back (§2.24).
+                self._retry_uncommitted_halves(queues, present)
+                # Checkpoint proposals that arrived before our chain held
+                # their range (§2.29).
+                self._recheck_parked_cosigns(queues, present)
                 # Debug instrument: emit this node's own reputation view for
                 # a host-side log harvester (opt-in, throttled internally).
                 self._dump_reputation_trace(present)

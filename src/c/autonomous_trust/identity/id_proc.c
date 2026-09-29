@@ -192,6 +192,13 @@ bool identity_refuse_remote_app_verb(const process_t *proc,
 DEFINE_ERROR(EID_NOQ, "Required process queue missing");
 
 #define MAJORITY(n) (((n) / 2) + 1)
+/* Votes an admission needs: a majority of the WHOLE group. The tally counts
+ * the proposer's own vote, but num_peers is the roster WITHOUT this node, so
+ * MAJORITY(num_peers) let two of a four-member group admit a newcomer and
+ * both halves of an even partition admit independently (ISSUES §2.26, the
+ * arithmetic §2.22 corrected for checkpoint finality). Odd-sized groups are
+ * unchanged; a lone node still admits on its own vote. */
+#define ADMISSION_QUORUM(num_peers) MAJORITY((num_peers) + 1)
 /* How long we wait for other members' votes on a peer we just proposed before
  * deciding on the votes in hand. Mirrors Python IdentityProcess.vote_timeout
  * (idprocess.py:154). Short by design: it is a grace period for votes already
@@ -316,6 +323,11 @@ static char ID_HIERARCHY_QUERY[] = "hierarchy_query";
  * .hello_ack. */
 char ID_FC_HELLO[]     = "first_contact_hello";
 char ID_FC_HELLO_ACK[] = "first_contact_hello_ack";
+/* Directory contact (FIRST_CONTACT_PLAN Phase 3): the finder's request and
+ * the holder's accept. Mirrors Python IdentityProtocol.contact_request /
+ * .contact_accept. */
+char ID_FC_REQUEST[]   = "first_contact_request";
+char ID_FC_ACCEPT[]    = "first_contact_accept";
 
 /* Verbs this protocol legitimately puts on the wire in PLAINTEXT
  * (Message encrypt=false), and the only ones a receiver accepts unencrypted
@@ -342,6 +354,8 @@ static char *const ID_UNENCRYPTED_VERBS[] = {
     ID_PARTITION_RESPONSE,  /* group_partition_response */
     ID_FC_HELLO,            /* first_contact_hello -- arrives before the peer is known */
     ID_FC_HELLO_ACK,        /* first_contact_hello_ack -- and so does the answer */
+    ID_FC_REQUEST,          /* first_contact_request -- found by handle, not yet a peer */
+    ID_FC_ACCEPT,           /* first_contact_accept -- the holder's answer */
 };
 
 size_t identity_unencrypted_verb_count(void)
@@ -880,6 +894,170 @@ void identity_install_peer_caps(const uuid_t uuid,
  ****************************/
 
 /* Frama-C: skipped — [solver-timeout] logging/map preconditions */
+/* Sibling hand-offs that failed, kept for the identity tick to retry.
+ *
+ * GROUP, PEER and PEER_REMOVED are STATE, not events: a sibling that misses
+ * one holds a stale view forever, and a PEER it never got is a peer whose every
+ * frame it defers (partition cohort part-3473787, 2026-09-29: ada's network
+ * process never learned ben after a five-founder admission burst kept its
+ * queue full past the 200 ms inline retry). An EAGAIN from a datagram send
+ * means the message was NOT queued, so trying again cannot duplicate it.
+ *
+ * An entry records WHICH state to resend, never a copy of it: public_identity_t
+ * carries heap pointers, and by the time a retry runs the state may have moved
+ * on. The retry rebuilds the message from identity's current view, so the
+ * latest group wins and a peer removed meanwhile is not re-added. One entry per
+ * (queue, type, peer); GROUP entries have no peer and so coalesce per queue.
+ * Guarded by its own mutex: _remember_activity is reached with other locks
+ * held. ISSUES §2.27. */
+#define ID_HANDOFF_PENDING_MAX 64
+typedef struct {
+    char   queue[PROC_NAME_LEN + 1];
+    long   type;
+    uuid_t uuid;        /* zero for GROUP */
+    int    retries;
+} id_handoff_t;
+static id_handoff_t g_handoffs[ID_HANDOFF_PENDING_MAX];
+static size_t g_num_handoffs;
+static pthread_mutex_t g_handoffs_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static bool _handoff_retryable(long type)
+{
+    return type == GROUP || type == PEER || type == PEER_REMOVED;
+}
+
+static const unsigned char *_handoff_uuid(const generic_msg_t *msg)
+{
+    if (msg->type == PEER)
+        return msg->info.peer.uuid;
+    if (msg->type == PEER_REMOVED)
+        return msg->info.peer_removed.peer_uuid;
+    return NULL;
+}
+
+/* Record (or refresh) a failed hand-off. Returns false when the table is full. */
+static bool _handoff_defer(const char *queue, const generic_msg_t *msg)
+{
+    uuid_t key = {0};
+    const unsigned char *u = _handoff_uuid(msg);
+    if (u != NULL)
+        memcpy(key, u, sizeof(uuid_t));
+    bool ok = true;
+    pthread_mutex_lock(&g_handoffs_lock);
+    size_t i;
+    for (i = 0; i < g_num_handoffs; i++) {
+        id_handoff_t *h = &g_handoffs[i];
+        /* A PEER and a PEER_REMOVED for the same peer are one question, "does
+         * the sibling know this peer": the later one supersedes. */
+        bool same_kind = (h->type == msg->type)
+            || (h->type != GROUP && msg->type != GROUP);
+        if (strcmp(h->queue, queue) == 0 && same_kind
+            && uuid_compare(h->uuid, key) == 0) {
+            h->type = msg->type;
+            break;
+        }
+    }
+    if (i == g_num_handoffs) {
+        if (g_num_handoffs < ID_HANDOFF_PENDING_MAX) {
+            id_handoff_t *h = &g_handoffs[g_num_handoffs++];
+            memset(h, 0, sizeof(*h));
+            snprintf(h->queue, sizeof(h->queue), "%s", queue);
+            h->type = msg->type;
+            memcpy(h->uuid, key, sizeof(uuid_t));
+        } else {
+            ok = false;
+        }
+    }
+    pthread_mutex_unlock(&g_handoffs_lock);
+    return ok;
+}
+
+/* Rebuild the message a pending entry stands for, from identity's view now.
+ * Returns false when there is nothing left to say (the peer is gone, or came
+ * back before its removal could be told). */
+static bool _handoff_rebuild(process_t *proc, const id_handoff_t *h,
+                             generic_msg_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->type = h->type;
+    if (h->type == GROUP) {
+        memcpy(&out->info.group, &proc->protocol.group, sizeof(group_t));
+        return true;
+    }
+    bool present = false;
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+        if (uuid_compare(proc->protocol.peers[i].uuid, h->uuid) == 0) {
+            present = true;
+            if (h->type == PEER)
+                memcpy(&out->info.peer, &proc->protocol.peers[i],
+                       sizeof(public_identity_t));
+            break;
+        }
+    }
+    peers_read_unlock(proc);
+    if (h->type == PEER)
+        return present;
+    memcpy(out->info.peer_removed.peer_uuid, h->uuid, sizeof(uuid_t));
+    return !present;
+}
+
+void identity_retry_sibling_handoffs(process_t *proc)
+{
+    if (proc == NULL)
+        return;
+    id_handoff_t work[ID_HANDOFF_PENDING_MAX];
+    pthread_mutex_lock(&g_handoffs_lock);
+    size_t n = g_num_handoffs;
+    memcpy(work, g_handoffs, n * sizeof(id_handoff_t));
+    g_num_handoffs = 0;
+    pthread_mutex_unlock(&g_handoffs_lock);
+
+    for (size_t i = 0; i < n; i++) {
+        id_handoff_t *h = &work[i];
+        generic_msg_t msg;
+        if (!_handoff_rebuild(proc, h, &msg))
+            continue;   /* superseded: nothing left to tell */
+        /* One try per tick: the tick is the retry loop. */
+        int ret = messaging_send(h->queue, msg.type, &msg, false);
+        if (ret == 0) {
+            log_info(proc->logger,
+                     "Identity: handed %s the %s update it missed (%d retr%s)\n",
+                     h->queue, message_type_to_string(msg.type),
+                     h->retries + 1, h->retries == 0 ? "y" : "ies");
+            continue;
+        }
+        h->retries++;
+        pthread_mutex_lock(&g_handoffs_lock);
+        /* Put it back unless a newer failure for the same thing arrived
+         * meanwhile (that one already stands for it). */
+        bool superseded = false;
+        for (size_t j = 0; j < g_num_handoffs; j++)
+            if (strcmp(g_handoffs[j].queue, h->queue) == 0
+                && uuid_compare(g_handoffs[j].uuid, h->uuid) == 0
+                && ((g_handoffs[j].type == GROUP) == (h->type == GROUP)))
+                superseded = true;
+        if (!superseded && g_num_handoffs < ID_HANDOFF_PENDING_MAX)
+            g_handoffs[g_num_handoffs++] = *h;
+        pthread_mutex_unlock(&g_handoffs_lock);
+    }
+}
+
+size_t identity_pending_sibling_handoffs(void)
+{
+    pthread_mutex_lock(&g_handoffs_lock);
+    size_t n = g_num_handoffs;
+    pthread_mutex_unlock(&g_handoffs_lock);
+    return n;
+}
+
+static void _handoffs_reset(void)
+{
+    pthread_mutex_lock(&g_handoffs_lock);
+    g_num_handoffs = 0;
+    pthread_mutex_unlock(&g_handoffs_lock);
+}
+
 static int _remember_activity(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     /* A harness may drive a handler with no queue directory at all (several
@@ -926,7 +1104,16 @@ static int _remember_activity(const process_t *proc, directory_t *queues, generi
                 break;
             usleep(20000); /* 20ms */
         }
-        if (ret != 0)
+        if (ret == EAGAIN && _handoff_retryable(msg->type)
+            && _handoff_defer(qname, msg))
+            /* Saturation, for state a sibling must not miss: the identity
+             * tick tries again until it lands (identity_retry_sibling_handoffs). */
+            log_warn(proc->logger,
+                     "Identity: could not hand %s a %s update after 10 tries"
+                     " (queue still full) — deferred; the identity tick"
+                     " retries it\n",
+                     qname, message_type_to_string(msg->type));
+        else if (ret != 0)
             /* EAGAIN says the receiver's queue stayed full for the whole
              * 200ms — saturation. Anything else is a hard transport fault
              * (no socket bound at that key, most likely). They call for
@@ -1004,7 +1191,13 @@ static int _update_group(const process_t *proc, directory_t *queues)
         }
         net_msg_pack_json(&update.info.net_msg, grp_json);
         json_decref(grp_json);
-        messaging_send("network", NET_MESSAGE, &update, false);
+        /* Bounded retry per member, not a bare send (ISSUES §2.31). This is
+         * how a rotation reaches each member, and a member that misses it
+         * holds the old key until the next rotation, which may never come:
+         * in part-3637905 dee's epoch-4 update reached ada and amy and not
+         * bob, and bob could not read the cohort for the rest of the run. */
+        identity_send_to_network(proc, &update, "group_key_update",
+                                 proc->protocol.peers[i].nickname);
     }
     peers_read_unlock(proc);
     return 0;
@@ -1023,10 +1216,11 @@ static int _update_group(const process_t *proc, directory_t *queues)
  * when we own it, and the message is encrypted to that member). What makes it
  * safe to ADOPT on the far side is the epoch: see group_accept_rotation.
  *
- * Best-effort by design. A rotation that fails to reach a member costs that
- * member the grace window, not correctness — and refusing to admit a peer
- * because a key update could not be sent would be a worse trade. Mirrors Python
- * _rotate_group_key. */
+ * Each member's update gets a bounded retry (_update_group). A rotation that
+ * still fails to reach a member does NOT cost only the grace window, as this
+ * comment used to say: nothing re-sends it, so that member holds the old key
+ * until the next rotation (ISSUES §2.31, part-3637905). Refusing the admission
+ * over it would still be the worse trade. Mirrors Python _rotate_group_key. */
 /* Frama-C: skipped — [solver-timeout] libsodium/JSON/messaging preconditions */
 static bool _rotate_group_key(process_t *proc, directory_t *queues)
 {
@@ -1035,9 +1229,11 @@ static bool _rotate_group_key(process_t *proc, directory_t *queues)
     int64_t epoch = group_rotate_key(&proc->protocol.group);
     if (epoch < 0)
         return false;   /* public-only view: not ours to rotate */
+    char kfp[17] = {0};
+    sodium_bin2hex(kfp, sizeof(kfp), proc->protocol.group.encryptor.public, 8);
     log_info(proc->logger,
-             "Identity: rotated group key to epoch %lld (%zu member(s))\n",
-             (long long)epoch, proc->protocol.num_peers);
+             "Identity: rotated group key to epoch %lld (%zu member(s)), key %s…\n",
+             (long long)epoch, proc->protocol.num_peers, kfp);
     _update_group(proc, queues);
     /* Hand the freshly rotated key to our OWN sibling processes (network,
      * reputation) so their protocol.group copy (processes.c GROUP handler:
@@ -1157,11 +1353,50 @@ static int _add_peer(process_t *proc, directory_t *queues,
  * Mirrors Python first_contact._admit_direct_peer, which calls peers.add at
  * mid_level plus _record_peers. C's peers[] is a flat array with no levels, so
  * there is no level to pass -- the asymmetry is structural and predates this. */
+static int _send_caps_query(const process_t *proc, const public_identity_t *peer);
+
 int identity_admit_direct_peer(process_t *proc, directory_t *queues,
                                const public_identity_t *who)
 {
     if (proc == NULL || who == NULL) return -1;
-    return _add_peer(proc, queues, who, false);
+    bool known = false;
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers && !known; i++)
+        known = uuid_compare(proc->protocol.peers[i].uuid, who->uuid) == 0;
+    peers_read_unlock(proc);
+    int rc = _add_peer(proc, queues, who, false);
+    /* Ask what it can do now, as confirming a cohort member does
+     * (handle_confirm_peer), rather than leave it to the periodic caps sweep. */
+    if (rc == 0 && !known)
+        _send_caps_query(proc, who);
+    return rc;
+}
+
+/* The inverse of identity_admit_direct_peer, for a user removing a contact.
+ *
+ * A cohort MEMBER is never dropped this way: its place in peers[] belongs to
+ * the group the vote admitted it to, and pulling it out would leave the group
+ * key's holders and this node's peer list disagreeing. Only a direct peer -- in
+ * peers[] and absent from the group address map -- goes. The siblings forget it
+ * through a PEER_REMOVED broadcast, the inverse of the PEER one _add_peer sends,
+ * so the network process stops attributing its frames and every process's
+ * peers[] agrees. Reputation keeps whatever the peer earned. */
+int identity_remove_direct_peer(process_t *proc, directory_t *queues,
+                                const unsigned char *uuid)
+{
+    if (proc == NULL || uuid == NULL) return -1;
+    char key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(uuid, key);
+    data_t *member = NULL;
+    if (map_get(&proc->protocol.group.address_map, key, &member) == 0)
+        return 1;
+    if (!processes_remove_peer(proc, uuid))
+        return 2;
+    generic_msg_t gone = {0};
+    gone.type = PEER_REMOVED;
+    memcpy(gone.info.peer_removed.peer_uuid, uuid, sizeof(uuid_t));
+    _remember_activity(proc, queues, &gone);
+    return 0;
 }
 
 /****************************
@@ -1398,7 +1633,9 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
     }
     net_msg_pack_json(&accept.info.net_msg, accept_body);
     json_decref(accept_body);
-    messaging_send("network", NET_MESSAGE, &accept, false);
+    /* Bounded retry, not a bare send (ISSUES §2.14, §2.30): the admission is
+     * one-shot, and nothing re-sends it. */
+    identity_send_to_network(proc, &accept, "access_granted", new_peer->nickname);
 
     /* Send ID_HISTORY to the new peer so they can decrypt subsequent
      * group-encrypted traffic AND populate their peer list with our
@@ -1514,7 +1751,13 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
         net_msg_pack_json(&hist.info.net_msg, hist_arr);
         json_decref(hist_arr);
     }
-    messaging_send("network", NET_MESSAGE, &hist, false);
+    /* THE frame a joiner cannot do without, and it leaves in the burst the
+     * rotation above just queued. It went out as a bare non-blocking send, so
+     * in partition cohort part-3616429 (2026-09-29) amy's access_granted
+     * reached bob and her history did not: bob waited out choose_group, found
+     * "no histories received", and bootstrapped a group of his own. Bounded
+     * retry, then a warning that names the joiner (ISSUES §2.30). */
+    identity_send_to_network(proc, &hist, "full_history", new_peer->nickname);
 
     /* Skip _add_peer in the amnesia case — the peer is already in our
      * list and re-adding would emit a redundant group update. */
@@ -1918,7 +2161,7 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
      * scenarios that need >1 voter pre-stage extra peers). Mirrors what
      * Python's _vote_collection thread does after the timeout. */
     if (id_state.synchronous_dispatch
-        && 1 >= MAJORITY(snapshot_num_peers))
+        && 1 >= ADMISSION_QUORUM(snapshot_num_peers))
     {
         log_info(proc->logger,
                  "Identity: synchronous_dispatch — self-vote majority for %s\n",
@@ -3031,12 +3274,13 @@ void identity_reset_state(void)
     freshness_reset(&id_state.freshness);
     id_state.probe_seq = 0;
     pthread_mutex_unlock(&id_state.lock);
+    _handoffs_reset();
     /* After the unlock: a feature resets its own state under its own lock. */
     identity_ext_reset();
 }
 
-/* Accept the proposed peer @p uuid_key if @p count meets the majority of
- * @p num_peers. Shared by the two things that can decide an admission: an
+/* Accept the proposed peer @p uuid_key if @p count (our own vote included)
+ * is a majority of the whole group, @p num_peers plus this node. Shared by the two things that can decide an admission: an
  * inbound vote (handle_count_vote) and the expiry of our own grace period
  * (identity_periodic_vote_collection). Returns whether the peer was accepted.
  *
@@ -3047,7 +3291,7 @@ static bool _finalize_vote_if_majority(process_t *proc, directory_t *queues,
                                        const char *uuid_key, int count,
                                        size_t num_peers)
 {
-    if (count < MAJORITY(num_peers))
+    if (count < ADMISSION_QUORUM(num_peers))
         return false;
 
     /* Find the proposed peer in peer_potentials */
@@ -3142,7 +3386,7 @@ void identity_periodic_vote_collection(process_t *proc, directory_t *queues)
     {
         log_debug(proc->logger,
                   "Identity: vote grace period up for %s: %d vote(s) (need %d)\n",
-                  due_keys[i], due_counts[i], MAJORITY(num_peers));
+                  due_keys[i], due_counts[i], ADMISSION_QUORUM(num_peers));
         _finalize_vote_if_majority(proc, queues, due_keys[i], due_counts[i],
                                    num_peers);
     }
@@ -3212,7 +3456,7 @@ static bool handle_count_vote(process_t *proc, directory_t *queues, generic_msg_
     peers_read_unlock(proc);
 
     log_debug(proc->logger, "Identity: vote count for %s: %d (need %d)\n",
-              uuid_key, count, MAJORITY(num_peers));
+              uuid_key, count, ADMISSION_QUORUM(num_peers));
 
     _finalize_vote_if_majority(proc, queues, uuid_key, count, num_peers);
 
@@ -3659,10 +3903,32 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
                        (const unsigned char *)seed_hex, strlen(seed_hex)) == 0
                 && group_accept_rotation(&((process_t *)proc)->protocol.group,
                                          &theirs))
+            {
+                char kfp[17] = {0};
+                sodium_bin2hex(kfp, sizeof(kfp),
+                               proc->protocol.group.encryptor.public, 8);
                 log_info(proc->logger,
-                         "Identity: adopted rotated group key, epoch %lld%s\n",
+                         "Identity: adopted rotated group key, epoch %lld%s, key %s…\n",
                          (long long)proc->protocol.group.key_epoch,
-                         same_epoch_tiebreak ? " (same-epoch tiebreak)" : "");
+                         same_epoch_tiebreak ? " (same-epoch tiebreak)" : "",
+                         kfp);
+                /* Hand the adopted key to our sibling processes NOW. The
+                 * membership comparison below returns silently on an
+                 * equal-or-smaller address map — the usual shape of a
+                 * rotation, which changes no membership — and that return
+                 * used to be the only exit, so identity held the new key
+                 * while the network process kept multicasting under the old
+                 * one and could not open the cohort's frames. Every member
+                 * then read every other as noise, permanently (partition
+                 * cohort part-3310971, 2026-09-28: three net-layer keys among
+                 * four nodes that all logged the same adoption). Mirrors the
+                 * minting path in _rotate_group_key. */
+                generic_msg_t group_msg = {0};
+                group_msg.type = GROUP;
+                memcpy(&group_msg.info.group, &proc->protocol.group,
+                       sizeof(group_t));
+                _remember_activity(proc, queues, &group_msg);
+            }
             else
                 /* The tiebreak ran and declined, which is normal for the
                  * WINNER of a simultaneous rotation — it keeps its own key and
@@ -3823,7 +4089,19 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
          * key) falls through and KEEPS our encryptor — Python's
          * adopt_membership. Mirrors group_from_json's encryptor reconstruction
          * (group.c:204-225). See [[dod-microdrone-targets-live-vs-playback]]. */
-        if (!theirs_public_only || !mine_owns_private)
+        /* NEVER from this path for OUR OWN group while we hold its key
+         * (ISSUES §2.31). A same-group key change is a rotation, and the
+         * rotation branch above already took every newer or tiebreak-winning
+         * key. What reaches here is a membership update, and its key is
+         * whatever the sender held when it built the frame, which can be an
+         * epoch behind: in partition cohort part-3637905 (2026-09-29) ben held
+         * epoch 4 and took ada's stale epoch-3 update because it listed five
+         * members to his four, installing the old key, and no frame from the
+         * cohort decrypted for him again. So a membership update grows the
+         * membership and never lowers the key. */
+        bool install_theirs = !mine_owns_private
+                              || (!same_group && !theirs_public_only);
+        if (install_theirs)
         {
             json_t *encr_obj = json_object_get(payload, "encryptor");
             const char *seed_hex = encr_obj
@@ -8073,9 +8351,27 @@ int identity_emit_all_peers(const process_t *proc)
     peers_read_unlock(proc);
 
     int emitted = 0;
-    for (size_t i = 0; i < n; i++)
-        if (identity_emit_peer_observed(proc, &snapshot[i]) == 0)
+    char refused[256] = {0};
+    size_t rlen = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (identity_emit_peer_observed(proc, &snapshot[i]) == 0) {
             emitted++;
+        } else if (rlen < sizeof(refused) - 1) {
+            int w = snprintf(refused + rlen, sizeof(refused) - rlen, "%s%s",
+                             rlen ? ", " : "", snapshot[i].nickname);
+            if (w > 0)
+                rlen += (size_t)w;
+        }
+    }
+    /* Said out loud: the app's view of who is here is built from these, and
+     * a replay refused by a full supervisor queue is otherwise silent. The
+     * order is fixed, so the same tail peer can lose every time (a suspect in
+     * partition cohort part-3486847, 2026-09-29, where one founder's app never
+     * saw all four others in 120 s of asking). */
+    if ((size_t)emitted < n)
+        log_warn(proc->logger,
+                 "Identity: peer roster replay reached the app for %d of %zu "
+                 "peer(s); refused: %s\n", emitted, n, refused);
     return emitted;
 }
 
@@ -8260,7 +8556,20 @@ static bool _adopt_group_from_histories(process_t *proc,
     group_t adopted_group = {0};
     bool have_group = false;
     size_t best_steps_len = 0;
+    /* The members, UNIONED ACROSS EVERY history, not just the welcomer whose
+     * group wins (ISSUES.md §2.23, 2026-09-25). This path adopted the group and
+     * never the peers, so a joiner's identity and network processes learned
+     * only the members that happened to send it a history themselves: a member
+     * that learned of the admission by a confirm instead (a timing race) was in
+     * the joiner's address map but not its peer list, and every encrypted
+     * frame from it was deferred as "no peer known at that address yet" for the
+     * rest of the run (Agora partition cohort, part-3273140: ben never added
+     * amy). _merge_to_mesh always did this; Python's choose_group unions
+     * `unioned_peers` the same way (idprocess.py choose_group). */
+    public_identity_t *peer_bundle = NULL;
+    size_t bundle_n = 0;
     pthread_mutex_lock(&id_state.lock);
+    _union_peers_from_histories(&peer_bundle, &bundle_n);
     size_t n_hist = array_size(&id_state.histories);
     for (size_t i = 0; i < n_hist; i++) {
         data_t *h_dat = NULL;
@@ -8314,10 +8623,15 @@ static bool _adopt_group_from_histories(process_t *proc,
         group_msg.type = GROUP;
         group_msg.info.group = adopted_group;
         _remember_activity(proc, queues, &group_msg);
+        /* Then every member from every history, told to the siblings (the
+         * network process above all) and announced to, as _merge_to_mesh
+         * does. Outside id_state.lock: it takes its own locks. */
+        _populate_peers_from_history(proc, queues, peer_bundle, bundle_n);
     } else {
         log_warn(logger, "Identity: choose_group: histories present but "
                  "no parseable group; keeping self-seeded group\n");
     }
+    free(peer_bundle);
     return have_group;
 }
 
@@ -8549,6 +8863,11 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
          * design and a pending admission is somebody sitting at the door. A
          * converged cohort has an empty map, so this is a no-op. */
         identity_periodic_vote_collection(proc, queues);
+
+        /* Sibling hand-offs a full queue refused (GROUP / PEER / PEER_REMOVED):
+         * one try each per tick until they land. Empty, and free, once the
+         * cohort settles. */
+        identity_retry_sibling_handoffs(proc);
 
         /* Periodic late-joiner cap-loss backstop (interval-gated so the
          * fast loop doesn't sweep every iteration; a converged group

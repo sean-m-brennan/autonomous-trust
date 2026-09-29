@@ -65,7 +65,9 @@
 #define AT_MSG_TYPE_ZTA_MAX      2099
 #define AT_MSG_TYPE_FLEET_MIN    2100
 #define AT_MSG_TYPE_FLEET_MAX    2199
-#define AT_MSG_TYPE_EXT_MAX      2199
+#define AT_MSG_TYPE_FC_MIN       2200
+#define AT_MSG_TYPE_FC_MAX       2219
+#define AT_MSG_TYPE_EXT_MAX      2219
 /** @} */
 
 /** @brief Ceiling on registered types across all features. */

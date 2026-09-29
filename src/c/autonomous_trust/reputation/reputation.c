@@ -1186,7 +1186,9 @@ int tx_history_reconcile_attested(tx_history_t *hist, const json_t *arr,
                                   const tx_attested_t *attested,
                                   tx_reconcile_result_t *out)
 {
-    tx_reconcile_result_t res = { TX_RECONCILE_NONE, -1, 0, 0 };
+    tx_reconcile_result_t res = { TX_RECONCILE_NONE, -1, 0, 0, NULL };
+    if (out != NULL)
+        out->dropped_entries = NULL;   /* never a stale pointer, whatever happens */
     if (!json_is_array(arr))
         return -1;
     size_t n_all = json_array_size(arr);
@@ -1316,13 +1318,25 @@ int tx_history_reconcile_attested(tx_history_t *hist, const json_t *arr,
         }
     }
 
-    /* Drop our committed entries from f on; pending entries stay. */
+    /* Drop our committed entries from f on; pending entries stay. Copies go
+     * back to the caller, who re-proposes its own half of each. */
+    if (out != NULL && hist->chain_len > 0)
+    {
+        res.dropped_entries = calloc((size_t)hist->chain_len, sizeof(transaction_t));
+        if (res.dropped_entries == NULL)
+        {
+            free(seg);
+            return EXCEPTION(ENOMEM);   /* before anything is rewritten */
+        }
+    }
     int w = 0;
     for (int i = 0; i < hist->chain_len; i++)
     {
         const transaction_t *t = &hist->chain[i];
         if (t->p1_set && t->p2_set && t->index >= f)
         {
+            if (res.dropped_entries != NULL)
+                res.dropped_entries[res.dropped] = *t;
             res.dropped++;
             continue;
         }
@@ -1391,9 +1405,24 @@ int tx_history_reconcile_attested(tx_history_t *hist, const json_t *arr,
                                  : TX_RECONCILE_NONE;
 done:
     free(seg);
+    if (res.dropped == 0)
+    {
+        free(res.dropped_entries);
+        res.dropped_entries = NULL;
+    }
     if (out != NULL)
         *out = res;
+    else
+        free(res.dropped_entries);
     return 0;
+}
+
+void tx_reconcile_result_free(tx_reconcile_result_t *res)
+{
+    if (res == NULL)
+        return;
+    free(res->dropped_entries);
+    res->dropped_entries = NULL;
 }
 
 /****************************  *

@@ -871,12 +871,74 @@ step):
    through `update()`, which renumbers them locally; it now loads them as C
    does.
 
-The price is stated rather than hidden. Where a node loses, the entries only it
-held past the fork are gone, both halves of each. They are not tombstoned, so a
-later catch-up from a peer that holds them brings them back. Pending halves are
-never dropped, and they commit on top of the adopted chain. The process layer
-logs every adoption (`adopted chain from X at index f: dropped d, added a`) and
-marks the peers of every added and dropped entry for rescoring.
+Where a node loses, the entries only it held past the fork are dropped, both
+halves of each. They are not tombstoned, so a later catch-up from a peer that
+holds them brings them back. Pending halves are never dropped, and they commit
+on top of the adopted chain. The process layer logs every adoption (`adopted
+chain from X at index f: dropped d, added a`) and marks the peers of every added
+and dropped entry for rescoring.
+
+**What an adoption drops is re-proposed** (2026-09-25, Agora Phase 4 DDIL).
+Across a partition, the entries only the losing side held are every transaction
+the smaller island committed while it was split, and nobody else holds them, so
+no catch-up would bring them back: the island's reputation from the split was
+simply gone. Now the result of a reconcile carries the dropped entries
+(`tx_reconcile_result_t.dropped_entries`, `ReconcileResult.dropped`), and at
+both adoption sites each node re-submits ITS OWN half of each through the
+normal round (`_repropose_dropped`, logged as `re-proposing N dropped
+transaction(s)`), as `_retry_nacked_rounds` does for a nacked round. The
+counterpart, which dropped the same entry, re-submits its half, so the pair
+re-forms bilaterally on top of the adopted chain. Nothing new is trusted: a node
+vouches only for the score it gave. Skipped are entries that are not ours, tasks
+the adopted chain already holds (committed or pending), and tasks we already
+have a round under way for. The entry does not carry the capability name or the
+learned weight, so a re-proposal carries the authored default weight; the
+channel is kept. Pinned by `chain-fork-dropped-own-half-reproposed`,
+`chain-fork-dropped-task-already-adopted-not-reproposed` and
+`chain-fork-peer-half-not-reproposed`.
+
+**A half that never reaches the chain is proposed again** (2026-09-29, ISSUES
+§2.24). A round can vanish in two ways that neither the nack retry nor the DDIL
+re-proposal sees. A granted round leaves `my_requests` when its transaction goes
+out, so if the acceptors never commit it, because another round took the slot,
+it is gone. A round nobody answers gets no nack, so no retry is ever armed. Each
+node now follows its own halves by task (`awaiting_commit`) from proposal until
+the chain holds them. Every proposal files or refreshes an entry, and committing
+our half clears it. The process loop's `_retry_uncommitted_halves` re-proposes
+any half not in the chain `AT_REP_COMMIT_TIMEOUT_SEC` (default 15 s) after its
+last proposal. It first retires any round still filed for the task, so a late
+grant cannot race the fresh ballot, and logs `our half of task T is not in the
+chain after N s; re-proposing it (attempt k of 5)`. After five re-proposals it
+warns and gives up. A half found in any chain, including one adopted, is
+forgotten without a re-proposal. Pinned by `rep_commit_retry_test` and
+`test_repprocess_commit_retry.py`.
+
+**A member co-signs the proposed range, and signs late rather than never**
+(2026-09-29, ISSUES.md §2.29). A member co-signs when its entries at the
+proposal's `[first_index, first_index + count)` hash to the proposed root. It no
+longer requires its whole window to match. A chain that grows every second or
+two, with members proposing on their own phases, means a proposal usually lands
+on members one entry ahead or behind. A proposal that cannot be matched on
+arrival is parked, one per proposer and chain, and re-checked every pass. It is
+co-signed once the member's chain holds the range with that root, and dropped
+after one checkpoint interval. A range the member holds but that hashes
+differently is never signed. Together with the whole-group majority below, this
+is what lets a four-of-six island finalize at all: every member has to sign the
+same proposal.
+
+**Checkpoint finality needs a majority of the WHOLE group** (2026-09-25). The
+threshold was `num_peers / 2`, the Paxos sizing, which counts the roster without
+this node, so an even-sized group finalized one signature short of a majority.
+Two of a four-member group qualified, and so did the proposer alone in a
+two-member one. Both halves of an even partition could therefore finalize their
+own windows, and at the heal each refused to rewrite inside its finality (step
+5), so the chains could never converge. The checkpoint threshold is now
+`(num_peers + 1) / 2`, with more than that many required
+(`_ckpt_quorum_for_group` in C, `_checkpoint_quorum` in Python), at the
+proposer, the receiver of a final, the store and the warm-start rebuild. Odd
+sizes are unchanged, and Paxos grants and slashing are not touched (the grant
+formula is ISSUES.md §2.13). Pinned by `checkpoint-final-even-group-half-refused`
+and `checkpoint-final-even-group-majority-stored`.
 
 The first host runs with the rule in place (mod-2481048 and mod-2483539,
 2026-09-23) failed on the finality guard alone, and for two reasons. Every node
