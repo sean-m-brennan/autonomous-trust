@@ -27,6 +27,7 @@
 #include <jansson.h>
 #include <uuid/uuid.h>
 
+#include "contacts/contacts.h"
 #include "identity/identity.h"
 #include "network/net_relay.h"
 #include "processes/processes.h"
@@ -49,6 +50,12 @@ void at_fc_emit_hello_sent(const process_t *proc, const char *ref,
                            const public_identity_t *peer);
 /** Our own relays as hints, pinned to who they proved to be. @return how many. */
 size_t at_fc_own_hints(char out[][AT_RELAY_HOST_LEN + 96], size_t max);
+/** Push our reachability record, sealed, to @p only (NULL: every contact
+ *  that is a peer now). */
+void at_fc_push_own_record(const process_t *proc, const public_identity_t *only);
+/** The DEVICE_LINKED contact event: @p device filed under @p c. */
+void at_fc_emit_device_linked(const process_t *proc, const contact_t *c,
+                              const uuid_t device);
 /** Tell the network to reach @p uuid through @p hints (relay:// hints). */
 void at_fc_send_route_hints(const uuid_t uuid, const char *const *hints, size_t n);
 

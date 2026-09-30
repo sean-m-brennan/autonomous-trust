@@ -328,6 +328,12 @@ char ID_FC_HELLO_ACK[] = "first_contact_hello_ack";
  * .contact_accept. */
 char ID_FC_REQUEST[]   = "first_contact_request";
 char ID_FC_ACCEPT[]    = "first_contact_accept";
+/* One human, several devices (FIRST_CONTACT_PLAN Phase 4): our device cert,
+ * sealed, to a contact; and a new device telling a contact it is one of
+ * theirs, plaintext. Mirrors Python IdentityProtocol.device_cert /
+ * .device_announce. */
+char ID_FC_DEVICE_CERT[]     = "device_cert";
+char ID_FC_DEVICE_ANNOUNCE[] = "device_announce";
 
 /* Verbs this protocol legitimately puts on the wire in PLAINTEXT
  * (Message encrypt=false), and the only ones a receiver accepts unencrypted
@@ -356,6 +362,7 @@ static char *const ID_UNENCRYPTED_VERBS[] = {
     ID_FC_HELLO_ACK,        /* first_contact_hello_ack -- and so does the answer */
     ID_FC_REQUEST,          /* first_contact_request -- found by handle, not yet a peer */
     ID_FC_ACCEPT,           /* first_contact_accept -- the holder's answer */
+    ID_FC_DEVICE_ANNOUNCE,  /* device_announce -- a contact's new device, not yet a peer */
 };
 
 size_t identity_unencrypted_verb_count(void)

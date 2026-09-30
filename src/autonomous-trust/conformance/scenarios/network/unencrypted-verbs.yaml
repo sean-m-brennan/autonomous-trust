@@ -73,6 +73,7 @@ fixtures:
     - first_contact_hello_ack    # and the answer, before the peer knows us
     - first_contact_request      # directory contact, found by handle, not yet a peer
     - first_contact_accept       # and the holder's answer, before either is a peer
+    - device_announce            # a contact's new device, not yet a peer here
   encrypted_only_verbs:
     - full_history               # HANDS OVER THE GROUP KEY -- never plaintext
     - group_key_update
@@ -109,8 +110,8 @@ expected_state:
     all_unencrypted_verbs_recognized: true
     # And nothing else is -- the downgrade half.
     no_other_verb_is_unencrypted: true
-    # Eleven verbs, exactly. A change is a protocol change, made on both sides.
-    unencrypted_verb_count_is_thirteen: true
+    # Fourteen verbs, exactly. A change is a protocol change, made on both sides.
+    unencrypted_verb_count_is_fourteen: true
     # NULL/empty is safe and is not on the allowlist.
     empty_verb_is_not_unencrypted: true
     # The two sets overlap where a key does not yet exist ...

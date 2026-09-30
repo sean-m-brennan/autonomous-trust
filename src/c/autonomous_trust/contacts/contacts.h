@@ -71,6 +71,22 @@ typedef enum {
 
 const char *at_provenance_str(at_provenance_t p);
 
+/* --- Devices (Phase 4, contacts/device.h) ------------------------------- */
+/** Most devices one contact lists besides its first. Same as Python's
+ *  device.DEVICES_MAX. */
+#define AT_CONTACT_DEVICES_MAX 8
+#define AT_OPERATOR_KEY_HEX_LEN 64
+
+/** One more device of a contact, each its own node. Kept in the canonical
+ *  JSON forms it is stored in, so copying is a reference and nothing can
+ *  drift from what is on disk. */
+typedef struct {
+    char uuid[UUID_STRING_LEN + 1];   /* lower case */
+    json_t *identity;                 /* canonical public identity (owned) */
+    json_t *cert;                     /* its device cert, {body, sig} (owned) */
+    double added_at;
+} at_contact_device_t;
+
 /* --- Contact ------------------------------------------------------------- */
 typedef struct {
     public_identity_t identity;   /* the trust root, public-only */
@@ -86,6 +102,12 @@ typedef struct {
     /* The highest reachability-record seq applied (contacts/reach.h): a record
      * at or below it is a replay and is refused. Stored only once set. */
     int64_t reach_seq;
+    /* Phase 4: the human's operator key (hex, "" until learned from a device
+     * cert the first device presented) and the further devices it vouched for.
+     * Both stored only once set, as Python does. */
+    char operator_key[AT_OPERATOR_KEY_HEX_LEN + 1];
+    at_contact_device_t *devices;     /* owned; devices_count of them */
+    size_t devices_count;
 } contact_t;
 
 /* Flip to verified, stamp verified_at, and seed the trust edge (idempotent). */
@@ -169,7 +191,10 @@ size_t contacts_count(const contacts_t *store);
 /* Add or replace, keyed by identity uuid. Deep-copies `c` into the store; the
  * caller keeps ownership of its own copy. */
 int contacts_add(contacts_t *store, const contact_t *c);
+/** The contact @p uuid belongs to: its first device, or any further one. */
 contact_t *contacts_get(contacts_t *store, const char *uuid);
+/** The contact whose operator key @p operator_key is, or NULL. */
+contact_t *contacts_by_operator(contacts_t *store, const char *operator_key);
 contact_t *contacts_by_petname(contacts_t *store, const char *petname);
 bool contacts_remove(contacts_t *store, const char *uuid);
 

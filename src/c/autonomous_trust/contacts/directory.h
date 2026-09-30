@@ -99,6 +99,16 @@ int at_dir_create_entry(const identity_t *self, const at_dir_signed_t *att,
                         int64_t seq, const char *visibility, long expiry,
                         double now, at_dir_signed_t *out);
 
+/** Sign @p body (stolen, even on failure) with the 64-byte secret key @p sk
+ *  over @p domain + its compact JSON; the {body, sig} into @p out. Shared by
+ *  every {body, sig} record in contacts/ (the directory's, device certs). */
+int at_dir_sign(const unsigned char *sk, const char *domain, json_t *body,
+                at_dir_signed_t *out);
+/** AT_DIR_OK iff @p obj's sig is @p key_hex's over @p domain + its exact body. */
+int at_dir_check_sig(const char *key_hex, const char *domain, const at_dir_signed_t *obj);
+/** 64 lower-case hex digits: an ed25519 public key as the records carry it. */
+bool at_dir_is_hex_key(const char *key);
+
 /* -- the contact request a finder sends ------------------------------------ */
 #define AT_DIR_REQUEST_DOMAIN "at-contact-request-v1|"
 #define AT_DIR_REQUEST_TYPENAME "at-contact-request"

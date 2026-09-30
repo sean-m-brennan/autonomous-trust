@@ -31,6 +31,8 @@ from .store import Contacts
 from .invitation import (Invitation, create_invitation, redeem_invitation,
                         safety_number, verify_contact,
                         InvalidInvitation, SafetyNumberMismatch)
+from .device import (Device, DeviceCert, InvalidDevice, create_device_cert,
+                     adopt_operator, link_device)
 
 __all__ = [
     'Contact', 'Provenance', 'FIRST_CONTACT_VERIFIED_SEED',
@@ -38,4 +40,6 @@ __all__ = [
     'Invitation', 'create_invitation', 'redeem_invitation',
     'safety_number', 'verify_contact',
     'InvalidInvitation', 'SafetyNumberMismatch',
+    'Device', 'DeviceCert', 'InvalidDevice', 'create_device_cert',
+    'adopt_operator', 'link_device',
 ]

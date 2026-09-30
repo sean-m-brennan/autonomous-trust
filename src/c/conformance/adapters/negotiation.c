@@ -38,6 +38,7 @@
 #include <time.h>
 
 #include <jansson.h>
+#include <sodium.h>
 #include <uuid/uuid.h>
 
 #include "identity/identity.h"
@@ -55,6 +56,7 @@
 #include "../scenario_loader.h"  /* at_byte_pin_json, at_load_testdata_bytes */
 #include "identity/identity_priv.h"  /* public_identity_from_json */
 #include "contacts/contacts.h"
+#include "contacts/device.h"
 #include "config/configuration.h"
 
 /* ------------------------------------------------------------------------- */
@@ -233,6 +235,43 @@ static bool _apply_first_contact(sce_run_ctx_t *ctx)
                 if (verified)
                     contact_mark_verified(&c, AT_FIRST_CONTACT_VERIFIED_SEED);
                 (void)contacts_add(&store, &c);
+            }
+        }
+    }
+    /* contact_devices: {<first device pid>: [<further device pid>, ...]}
+     * (Phase 4). Certified under the fixed harness operator key (0x33 * 32,
+     * as the Python adapter) and filed by the production at_adopt_operator /
+     * at_link_device, so a refused link shows up as a capped device. */
+    json_t *cd = json_object_get(fixtures, "contact_devices");
+    if (json_is_object(cd)) {
+        unsigned char seed[32], pk[crypto_sign_PUBLICKEYBYTES], sk[crypto_sign_SECRETKEYBYTES];
+        memset(seed, 0x33, sizeof(seed));
+        crypto_sign_seed_keypair(pk, sk, seed);
+        const char *first;
+        json_t *others;
+        json_object_foreach(cd, first, others) {
+            sce_participant_t *who = sce_find_participant(ctx, first);
+            if (who == NULL || ((np_impl_t *)who->impl)->pub == NULL)
+                continue;
+            const public_identity_t *fid = ((np_impl_t *)who->impl)->pub;
+            char fu[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(fid->uuid, fu);
+            contact_t *c = contacts_get(&store, fu);
+            at_dir_signed_t cert;
+            if (c == NULL || at_device_cert_create(sk, fid, (long long)time(NULL), &cert) != 0)
+                continue;
+            (void)at_adopt_operator(c, &cert, &store);
+            at_dir_free(&cert);
+            for (size_t i = 0; json_is_array(others) && i < json_array_size(others); i++) {
+                const char *pid = json_string_value(json_array_get(others, i));
+                sce_participant_t *d = pid != NULL ? sce_find_participant(ctx, pid) : NULL;
+                if (d == NULL || ((np_impl_t *)d->impl)->pub == NULL)
+                    continue;
+                const public_identity_t *did = ((np_impl_t *)d->impl)->pub;
+                if (at_device_cert_create(sk, did, (long long)time(NULL), &cert) != 0)
+                    continue;
+                (void)at_link_device(&store, did, &cert, NULL);
+                at_dir_free(&cert);
             }
         }
     }

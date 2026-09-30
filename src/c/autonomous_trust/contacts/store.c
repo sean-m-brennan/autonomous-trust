@@ -22,12 +22,15 @@
  *  store. */
 
 #include "contacts/contacts.h"
+#include "contacts/device.h"
+#include "contacts/directory.h"
 #include "identity/identity_priv.h"   /* public_identity_to_json / _from_json */
 #include "utilities/util.h"           /* makedirs */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include <jansson.h>
@@ -114,6 +117,19 @@ static int _deep_copy(contact_t *dst, const contact_t *src)
         for (size_t i = 0; i < src->rendezvous_count; i++)
             dst->rendezvous[dst->rendezvous_count++] = strdup(src->rendezvous[i]);
     }
+    dst->devices = NULL;
+    dst->devices_count = 0;
+    if (src->devices_count > 0) {
+        dst->devices = calloc(src->devices_count, sizeof(at_contact_device_t));
+        if (dst->devices == NULL)
+            return -1;
+        for (size_t i = 0; i < src->devices_count; i++) {
+            dst->devices[i] = src->devices[i];
+            json_incref(dst->devices[i].identity);
+            json_incref(dst->devices[i].cert);
+        }
+        dst->devices_count = src->devices_count;
+    }
     if (src->identity.operator_key_binding != NULL &&
         src->identity.operator_key_binding_len > 0) {
         dst->identity.operator_key_binding =
@@ -143,7 +159,22 @@ contact_t *contacts_get(contacts_t *store, const char *uuid)
 {
     if (store == NULL || uuid == NULL)
         return NULL;
-    return _find(store, uuid);
+    contact_t *c = _find(store, uuid);
+    for (size_t i = 0; i < store->count && c == NULL; i++)
+        for (size_t d = 0; d < store->items[i].devices_count && c == NULL; d++)
+            if (strcasecmp(store->items[i].devices[d].uuid, uuid) == 0)
+                c = &store->items[i];
+    return c;
+}
+
+contact_t *contacts_by_operator(contacts_t *store, const char *operator_key)
+{
+    if (store == NULL || operator_key == NULL || operator_key[0] == '\0')
+        return NULL;
+    for (size_t i = 0; i < store->count; i++)
+        if (strcmp(store->items[i].operator_key, operator_key) == 0)
+            return &store->items[i];
+    return NULL;
 }
 
 contact_t *contacts_by_petname(contacts_t *store, const char *petname)
@@ -204,6 +235,18 @@ int contact_to_json(const contact_t *c, json_t **obj_out)
      * same file either runtime wrote before records existed. */
     if (c->reach_seq > 0)
         json_object_set_new(o, "reach_seq", json_integer((json_int_t)c->reach_seq));
+    /* Likewise only once there is something to say (Phase 4). */
+    if (c->operator_key[0] != '\0')
+        json_object_set_new(o, "operator_key", json_string(c->operator_key));
+    if (c->devices_count > 0) {
+        json_t *ds = json_array();
+        for (size_t i = 0; i < c->devices_count; i++)
+            json_array_append_new(ds, json_pack("{s:O, s:O, s:f}",
+                                                "identity", c->devices[i].identity,
+                                                "cert", c->devices[i].cert,
+                                                "added_at", c->devices[i].added_at));
+        json_object_set_new(o, "devices", ds);
+    }
     *obj_out = o;
     return 0;
 }
@@ -252,6 +295,11 @@ int contact_from_json(const json_t *obj, contact_t *out)
     out->verified_at = _real(obj, "verified_at");
     json_t *rs = json_object_get((json_t *)obj, "reach_seq");
     out->reach_seq = json_is_integer(rs) ? (int64_t)json_integer_value(rs) : 0;
+
+    const char *op = json_string_value(json_object_get((json_t *)obj, "operator_key"));
+    if (op != NULL && at_dir_is_hex_key(op))
+        at_strlcpy(out->operator_key, op, sizeof(out->operator_key));
+    at_contact_load_devices(out, json_object_get((json_t *)obj, "devices"));
 
     json_t *rv = json_object_get((json_t *)obj, "rendezvous");
     if (json_is_array(rv) && json_array_size(rv) > 0) {

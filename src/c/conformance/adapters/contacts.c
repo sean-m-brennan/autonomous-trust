@@ -35,6 +35,7 @@
 #include <uuid/uuid.h>
 
 #include "contacts/contacts.h"
+#include "contacts/device.h"
 #include "contacts/directory.h"
 #include "identity/identity_priv.h"   /* public_identity_from_json */
 #include "network/net_registry.h"
@@ -213,6 +214,133 @@ static void _op_verify_contact(json_t *fx, json_t *exp, at_case_result_t *out)
     at_case_result_set_pass(out, 0);
 }
 
+
+/* -- several devices, one human (FIRST_CONTACT_PLAN Phase 4) --------------- */
+static const char *_device_status(int rc)
+{
+    return rc == AT_DEVICE_OK ? "ok" : at_device_reason(rc);
+}
+
+/* devices_of {contact uuid: [device uuids]} and resolves {uuid: contact uuid
+ * | null} against @p store; a failure message into @p err, else "". */
+static void _device_state(contacts_t *store, json_t *exp, char *err, size_t n)
+{
+    err[0] = '\0';
+    const char *key;
+    json_t *want;
+    json_object_foreach(json_object_get(exp, "devices_of"), key, want) {
+        contact_t *c = contacts_get(store, key);
+        if (c == NULL) {
+            snprintf(err, n, "no contact %s", key);
+            return;
+        }
+        if (json_array_size(want) != c->devices_count) {
+            snprintf(err, n, "%s: %zu devices, want %zu", key, c->devices_count,
+                     json_array_size(want));
+            return;
+        }
+        for (size_t i = 0; i < c->devices_count; i++)
+            if (strcasecmp(c->devices[i].uuid, json_string_value(json_array_get(want, i))) != 0) {
+                snprintf(err, n, "%s: device #%zu is %s", key, i, c->devices[i].uuid);
+                return;
+            }
+    }
+    json_object_foreach(json_object_get(exp, "resolves"), key, want) {
+        contact_t *c = contacts_get(store, key);
+        char got[UUID_STRING_LEN + 1] = "";
+        if (c != NULL)
+            uuid_unparse_lower(c->identity.uuid, got);
+        bool ok = json_is_null(want) ? c == NULL
+                                     : c != NULL && strcasecmp(got, json_string_value(want)) == 0;
+        if (!ok) {
+            snprintf(err, n, "%s resolves to %s", key, c != NULL ? got : "nothing");
+            return;
+        }
+    }
+}
+
+/* Mirrors Python ContactsAdapter._device. */
+static void _op_device(json_t *fx, json_t *exp, at_case_result_t *out)
+{
+    const char *mode = _sfield(fx, "mode");
+    if (mode == NULL)
+        FAILF("device: no mode");
+    char err[256] = "";
+    const char *status = "ok";
+    contacts_t store;
+    contacts_init(&store);
+    bool have_store = false;
+    at_dir_signed_t cert;
+    memset(&cert, 0, sizeof(cert));
+    json_t *cw = json_object_get(fx, "cert");
+    int crc = cw != NULL ? at_dir_from_wire(cw, &cert) : AT_DIR_MALFORMED;
+    public_identity_t ident;
+    memset(&ident, 0, sizeof(ident));
+    json_t *ij = json_object_get(fx, "identity");
+    bool have_ident = ij != NULL && public_identity_from_json(ij, &ident) == 0;
+
+    if (strcmp(mode, "verify") == 0) {
+        int rc = crc == AT_DIR_OK ? at_device_cert_verify(&cert) : AT_DEVICE_MALFORMED;
+        status = _device_status(rc);
+        const char *op = _sfield(exp, "operator");
+        if (rc == AT_DEVICE_OK && op != NULL && strcmp(at_device_cert_operator(&cert), op) != 0)
+            snprintf(err, sizeof(err), "operator %s", at_device_cert_operator(&cert));
+        json_t *names = json_object_get(exp, "names");
+        if (rc == AT_DEVICE_OK && names != NULL
+            && (!have_ident || at_device_cert_names(&cert, &ident) != json_is_true(names)))
+            snprintf(err, sizeof(err), "names");
+    } else if (strcmp(mode, "adopt") == 0) {
+        contact_t c;
+        if (contact_from_json(json_object_get(fx, "contact"), &c) != 0) {
+            snprintf(err, sizeof(err), "contact did not parse");
+        } else {
+            if (json_object_get(fx, "store") != NULL)
+                have_store = contacts_from_json(json_object_get(fx, "store"), &store) == 0;
+            int rc = crc == AT_DIR_OK ? at_adopt_operator(&c, &cert, have_store ? &store : NULL)
+                                      : AT_DEVICE_MALFORMED;
+            status = _device_status(rc);
+            const char *want = _sfield(exp, "operator_key");
+            if (want != NULL && strcmp(c.operator_key, want) != 0)
+                snprintf(err, sizeof(err), "operator_key %s", c.operator_key);
+            contact_free(&c);
+        }
+    } else if (strcmp(mode, "link") == 0 || strcmp(mode, "load") == 0) {
+        have_store = contacts_from_json(json_object_get(fx, "store"), &store) == 0;
+        if (!have_store)
+            snprintf(err, sizeof(err), "store did not parse");
+        else if (mode[1] == 'i') {
+            int rc = !have_ident ? AT_DEVICE_MALFORMED
+                   : crc == AT_DIR_OK ? at_link_device(&store, &ident, &cert, NULL)
+                                      : AT_DEVICE_MALFORMED;
+            status = _device_status(rc);
+        }
+    } else {
+        snprintf(err, sizeof(err), "unknown device mode %s", mode);
+    }
+    const char *want = _sfield(exp, "device_status");
+    if (err[0] == '\0' && want != NULL && strcmp(status, want) != 0)
+        snprintf(err, sizeof(err), "device_status: got %s want %s", status, want);
+    if (err[0] == '\0' && have_store)
+        _device_state(&store, exp, err, sizeof(err));
+    if (err[0] == '\0' && have_store && mode[0] == 'l') {
+        /* The file form survives a round trip unchanged. */
+        json_t *a = NULL, *b = NULL;
+        contacts_t again;
+        contacts_init(&again);
+        if (contacts_to_json(&store, &a) != 0 || contacts_from_json(a, &again) != 0
+            || contacts_to_json(&again, &b) != 0 || !json_equal(a, b))
+            snprintf(err, sizeof(err), "store round trip");
+        json_decref(a);
+        json_decref(b);
+        contacts_free(&again);
+    }
+    at_dir_free(&cert);
+    free(ident.operator_key_binding);
+    contacts_free(&store);
+    if (err[0] != '\0')
+        FAILF("device: %s", err);
+    at_case_result_set_pass(out, 0);
+}
 
 /* -- the directory (FIRST_CONTACT_PLAN Phase 3) ---------------------------- */
 static const char *const _DIR_REASONS[] = {"ok", "malformed", "bad_signature", "expired",
@@ -493,6 +621,8 @@ void at_contacts_run(const at_case_t *c, at_case_result_t *out)
         _op_dir_normalize(fx, exp, out);
     else if (strcmp(op, "registry") == 0)
         _op_registry(fx, exp, out);
+    else if (strcmp(op, "device") == 0)
+        _op_device(fx, exp, out);
     else {
         char detail[160];
         snprintf(detail, sizeof(detail), "unknown contacts op %s", op);

@@ -1,0 +1,46 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: invite-unlinked-device-held-at-communication
+byte_pinning: false
+description: |
+    The other half of invite-verified-contacts-linked-device-uses-earned-tier:
+    the same laptop, the same verified phone, but no device cert links them, so
+    to Bob the laptop is a stranger and is held at the communication tier. The
+    tier-2 invitation is refused.
+
+participants:
+  - id: alice
+    role: bystander
+  - id: laptop
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  first_contact:
+    enabled: true
+  verified_contacts:
+    bob: [alice]
+  capabilities:
+    bob: [file_share]
+  capability_tiers:
+    file_share: 2
+  peer_tiers:
+    laptop: 4
+
+steps:
+  - id: 1
+    from: laptop
+    to: bob
+    function: invitation
+    payload:
+      capability: file_share
+      task_id: t-fc-unlinked-share
+  - id: 2
+    from: bob
+    to: laptop
+    function: nack
+    in_response_to: 1
+    payload:
+      task_id: t-fc-unlinked-share

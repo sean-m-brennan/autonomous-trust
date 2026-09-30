@@ -32,7 +32,7 @@ from ...common.scenario_loader import Case
 from autonomous_trust.core.identity.identity import public_identity_from_canonical
 from autonomous_trust.core.contacts import (redeem_invitation, safety_number,
                                             verify_contact, InvalidInvitation,
-                                            SafetyNumberMismatch, Contacts)
+                                            SafetyNumberMismatch, Contacts, Contact)
 from autonomous_trust.core._python.contacts import directory as _dir
 from autonomous_trust.core._python.network import registry as _registry
 
@@ -85,6 +85,8 @@ class ContactsAdapter:
             self._dir_normalize(fx, expected)
         elif op == 'registry':
             self._registry(fx, expected)
+        elif op == 'device':
+            self._device(fx, expected)
         else:
             raise AssertionError('unknown contacts op %r' % op)
 
@@ -145,6 +147,57 @@ class ContactsAdapter:
         # internal round-trip stability: to_canonical -> from_canonical preserves count
         store2 = Contacts.from_canonical(store.to_canonical())
         assert len(store2) == len(store), len(store2)
+
+    # -- several devices, one human (FIRST_CONTACT_PLAN Phase 4) ---------------
+    def _device(self, fx, expected):
+        """``mode``: verify a cert (and whether it names ``identity``), adopt
+        a contact's operator key from ``cert``, link ``identity`` into
+        ``store``, or just load ``store``. Pins the status ('ok' or the
+        refusal reason), then ``devices_of`` {contact uuid: [device uuids]}
+        and ``resolves`` {uuid: contact uuid | None} against the store."""
+        from autonomous_trust.core._python.contacts import device as _dev
+        mode, status, store = fx['mode'], 'ok', None
+        if mode == 'verify':
+            try:
+                cert = _dev.DeviceCert.from_wire(fx['cert']).verify()
+            except _dev.InvalidDevice as exc:
+                cert, status = None, exc.reason
+            if cert is not None and 'operator' in expected:
+                assert cert.operator == expected['operator'], cert.operator
+            if cert is not None and 'names' in expected:
+                ident = public_identity_from_canonical(fx['identity'])
+                assert cert.names(ident) is bool(expected['names']), 'names'
+        elif mode == 'adopt':
+            contact = Contact.from_canonical(fx['contact'])
+            assert contact is not None, 'contact did not parse'
+            store = Contacts.from_canonical(fx['store']) if 'store' in fx else None
+            status = _dev.adopt_operator(contact, fx['cert'], store) or 'ok'
+            if 'operator_key' in expected:
+                assert contact.operator_key == expected['operator_key'], contact.operator_key
+        elif mode == 'link':
+            store = Contacts.from_canonical(fx['store'])
+            ident = public_identity_from_canonical(fx['identity'])
+            assert ident is not None, 'identity did not parse'
+            _contact, reason = _dev.link_device(store, ident, fx['cert'])
+            status = reason or 'ok'
+        elif mode == 'load':
+            store = Contacts.from_canonical(fx['store'])
+        else:
+            raise AssertionError('unknown device mode %r' % mode)
+        if 'device_status' in expected:
+            assert status == expected['device_status'], (status, expected['device_status'])
+        for uuid, want in (expected.get('devices_of') or {}).items():
+            c = store.get(uuid)
+            assert c is not None, 'no contact %s' % uuid
+            assert c.device_uuids() == list(want), c.device_uuids()
+        for uuid, want in (expected.get('resolves') or {}).items():
+            c = store.get(uuid)
+            got = None if c is None else c.uuid
+            assert got == want, (uuid, got, want)
+        if store is not None and mode in ('link', 'load'):
+            # The file form survives a round trip unchanged.
+            again = Contacts.from_canonical(store.to_canonical())
+            assert again.to_canonical() == store.to_canonical(), 'store round trip'
 
     # -- the directory (FIRST_CONTACT_PLAN Phase 3) ----------------------------
     def _dir_verify(self, fx, expected):
