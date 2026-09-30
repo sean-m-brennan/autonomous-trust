@@ -614,6 +614,64 @@ It is tested with three real nodes: a registry, a publisher and a finder that
 share no direct path. A control shows that without the publisher's accept the
 two never become peers.
 
+## Finding people nearby: area hubs
+
+A handle is for someone you already know of. An area hub is for someone near you
+whom you do not know yet, which is harder to do well: the directory's own
+lesson, that finding is where harvesting lives, applies with more force when the
+key is a place. So a hub knows only what people tell it about themselves, shows
+it only to people in the same position, and still grants no trust.
+
+**Who may be found.** Only someone who lists themself. A listing is an **area
+card** (`contacts/area_card.py`, C `contacts/area_card.{h,c}`), the holder's own
+signed statement over `at-area-card-v1|`: this uuid and key, this area (a
+geohash prefix of 2 to 5 characters, which is what a hub serves), a bucket inside
+it of at most five characters (about 5 km, as fine as a card gets), an optional
+name, a sequence number, and an expiry, an hour by default. It carries the
+holder's public identity, with the address left blank, so a finder can address a
+contact request to it. Nearness is not attestable, so there is no issuer. The
+card is only its holder's word, and what bounds it is the hub.
+
+**Where cards live.** A hub is a relay that also sets `AT_HUB=1`
+(`network/hub.py`, C `network/net_hub.{h,c}`) and serves the areas in
+`AT_HUB_AREAS`, over the same TCP link as the relay's other ops (`hub_publish`,
+`hub_withdraw`, `hub_lookup`). It files a card only from the registered holder
+of its key, only for an area it serves, only over a lower sequence, never for
+longer than a day, and one per holder per area. Cards live in memory; a listed
+node refiles its own at every registration and issues a fresh one while its
+current card is past half its life, from `area.cfg.json`, which also keeps the
+sequence rising.
+
+**Who may look.** A lookup names one area and is **reciprocal**: only a client
+with a live card in that area is shown the area's cards. Anyone else gets the
+same empty list a quiet area gets, so a hub cannot be read from outside the area
+it serves. An answer holds at most 32 cards, the freshest first, never the
+asker's own and never a holder this node has come to distrust, and each lookup
+costs one token of a per-client bucket (`AT_HUB_RATE` a minute, default 6). A
+node asks every relay it is registered at, and checks every card itself
+(signature, holder, the area asked) rather than taking the hub's word.
+
+**Finding is not adding.** A card leads to the directory's own contact request,
+unchanged except that it names the **area** in place of a handle, exactly one of
+the two. The holder's node shows it to its app only for an area it is listed in
+now, and from there the flow is the directory's: the app accepts or declines,
+an accept is an ordinary single-use invitation, and both sides record an
+unverified contact, of provenance `area`, capped at tier 1 until the safety
+numbers match.
+
+**Which hubs.** A community's relay roster may name which of its relays are hubs,
+in an optional `areas` object keyed by each hub's own entry. It is left out
+when a roster names no hub, so every roster keeps its bytes, and a roster whose
+`areas` names a relay it does not list, or anything that is not an area, is
+refused whole. A node registers first with a hub whose area holds one of its own
+listed buckets. An app may install a roster it trusts (`app_relay_roster_install`,
+which pins the roster's issuer) and remove it again; Agora does so for the
+communities its reader follows, whose policy carries the roster.
+
+It is tested with three real nodes, a hub and two people with no direct path
+between them. A control shows that someone who is not listed in the area finds
+nobody, though both of the others are listed.
+
 ## One person, several devices
 
 A person's phone and laptop are two nodes, each with its own uuid and keys,
@@ -647,10 +705,92 @@ a contact lists at most eight further devices. The store is plain JSON in the
 user's data dir, so on load a device survives only if its cert still
 verifies, names it, and is under the contact's own operator key.
 
-This is the offline half. How a new device reaches a contact (the invitation
-carrying the inviter's cert, and a message from the new device), live pairing
-between one's own devices, and an encrypted backup for a lost phone are the
-next slices of Phase 4.
+A node gets its own cert from `tools/device_cert.py`, run where the operator
+keystore is, and keeps it in `<cfg_dir>/device_cert.cfg.json`; on load the cert
+must name that very node. The invitation format does not change. After a
+handshake each side pushes its cert to the other, sealed, as `device_cert`,
+which is how Bob's record of Alice learns her operator key. A new device then
+sends a plaintext `device_announce` to every contact when it starts. Bob files
+it under Alice's record if the rules above allow, and his app gets a
+`device_linked` event; a refusal is silent, and nothing is sent back.
+
+### Your own devices, one address book
+
+The devices that carry certs under **your** operator key are your
+**siblings**. They are kept in `<data_dir>/siblings.cfg.json`, apart from the
+address book, so they never show up as contacts:
+
+```
+{ typename: "siblings", version: 1, operator: <hex>,
+  devices: [ { identity, cert, added_at } ] }
+```
+
+A node pairs with a sibling only if its own cert verifies and both certs name
+the same operator key. A node is not its own sibling, there are at most eight,
+and a node re-certified under a new operator key starts the list over. As
+with contact devices, a sibling in the file loads only if its cert still
+verifies, names it, and is under the stored key.
+
+Siblings keep one address book between them by swapping a sync payload:
+
+```
+{ v: 1, typename: "at-contacts-sync",
+  contacts:   { uuid: <contact record> },
+  tombstones: { uuid: removed_at } }
+```
+
+Each side folds what it receives into its own store one contact at a time,
+and the newer edit wins. A record's version is the latest of when it was
+added, when it was verified, and `updated_at`, which only renames and device
+or operator links set. Reachability refreshes do not count as edits, because
+each device hears those from the contact itself. On a merge the higher
+`reach_seq` is kept and both hint lists are merged.
+
+A removal leaves a **tombstone** that is kept for good, so a sibling that was
+away for months cannot bring the contact back. A tombstone beats any record
+of that uuid that is no newer than it, ties included. Adding the contact
+again later is newer, and wins. A time from a sibling more than five minutes
+ahead of ours is taken as now, so a fast clock cannot pin its edits as the
+winner. When two versions are equal, the tie goes to the larger of (verified,
+trust seed, petname, operator key, device uuids, nonce), which both runtimes
+compare the same way, so siblings converge whichever copy each saw first.
+
+Nothing ever unverifies a contact, unlinks a device, or unlearns an operator
+key, so none of those is lost to a newer edit. The losing copy's
+verification, operator key and devices are folded into the winner, and a
+rename on one phone cannot undo a verification the other made in the
+meantime. A contact new on this device arrives with provenance `sibling` and
+its verification intact, since the device that verified it belongs to the
+same operator. A contact already here keeps its own provenance. A record
+that would file a device or an operator key twice, or that names this node
+or a sibling, is refused.
+
+**Pairing** is how two of your devices become siblings. The old device mints
+an ordinary invitation whose signed body also carries `purpose: "pair"`, usually
+shown as a QR code, and the new device redeems it. The two run the ordinary
+hello and ack, but neither records a contact. Each pushes its device cert,
+sealed, and on receiving the other's checks the rule above. A match writes both
+sibling files. Anything else (a device with no cert, another operator's device,
+or no cert within two minutes) drops the direct peer and refuses with
+`not_sibling`, so a pairing link can never become a contact.
+
+Siblings then keep the book in step with sealed `contacts_sync` messages, each
+carrying a sync payload. Right after pairing, each sends the other its whole
+book. After each local edit, a node sends every sibling the contacts that
+changed. At startup, a node sends each sibling its whole book with `reply:
+true`, and the sibling answers once with its own, so both converge and nothing
+loops. A node takes a payload only from a sibling under the key it holds, and a
+synced change has the effect the same local edit would. A contact added this
+way is admitted as a direct peer, routed, and told this device is one of ours,
+so it links it. A removed contact's peers are dropped. The app hears `contact` or
+`removed` with origin `sibling`.
+
+Siblings are reached like contacts: re-admitted and routed at startup from the
+hints in their file, sent our reachability record, and moved when theirs
+changes. They are never tier-capped. Unpairing (`app_sibling_remove`) is not
+synced, because each device decides whom it syncs with.
+
+Still ahead is an encrypted backup for a lost phone.
 
 ## What is built, and what is not
 
@@ -676,10 +816,10 @@ invitation names. Two roles still have loose ends:
   themselves (the email or SMS check behind an attestation) are outside AT;
   `tools/directory_issuer.py` is only the signing half.
 - **Several devices, beyond what is built.** The device cert, the contact
-  record that lists devices, and the rules that link them are built (see *One
-  person, several devices*, above). The wire half is not yet built: nothing
-  yet carries a cert to a contact, and pairing and the encrypted backup are
-  still ahead.
+  record that lists devices, the rules that link them, and the messages that
+  carry a cert to a contact are built. So are pairing and keeping siblings'
+  address books in step (see *One person, several devices*, above). Still
+  ahead is the encrypted backup.
 
 First contact is an **AT** primitive, so it must complete without the compact
 tier present. Its rendezvous and directory *roles* may optionally be served by
@@ -709,6 +849,12 @@ asymmetry.
 | An unverified contact gains no devices | [`device-link-unverified-contact.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/device-link-unverified-contact.yaml) |
 | A cert lifted onto another node links nothing | [`device-link-lifted-cert.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/device-link-lifted-cert.yaml) |
 | A hand-added device does not load | [`device-store-drops-hand-added.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/device-store-drops-hand-added.yaml) |
+| A contact synced from a sibling arrives verified, as `sibling` | [`sync-new-contact-arrives-as-sibling.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/sync-new-contact-arrives-as-sibling.yaml) |
+| A rename elsewhere does not undo a verification | [`sync-rename-does-not-undo-verification.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/sync-rename-does-not-undo-verification.yaml) |
+| Equal versions converge on the larger tie key | [`sync-tie-goes-to-the-larger-key.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/sync-tie-goes-to-the-larger-key.yaml) |
+| A removed contact does not come back | [`sync-removed-contact-does-not-come-back.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/sync-removed-contact-does-not-come-back.yaml) |
+| A sibling's clock running ahead is taken as now | [`sync-future-time-taken-as-now.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/sync-future-time-taken-as-now.yaml) |
+| Only a device under our own operator is a sibling | [`siblings-another-operators-device.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/siblings-another-operators-device.yaml) |
 | A linked device is not tier-capped; an unlinked one is | [`invite-verified-contacts-linked-device-uses-earned-tier.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-verified-contacts-linked-device-uses-earned-tier.yaml) |
 | Handshake admits a DIRECT peer, not a group member | [`first-contact-hello-admits-direct-peer.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-hello-admits-direct-peer.yaml) |
 | An invitation is single-use | [`first-contact-invitation-single-use.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-invitation-single-use.yaml) |

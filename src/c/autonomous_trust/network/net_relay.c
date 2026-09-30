@@ -38,6 +38,8 @@
 #include "net_relay_seeds.h"
 #include "net_relay_rosters.h"
 #include "net_registry.h"
+#include "net_hub.h"
+#include "contacts/area_card.h"
 #include "config/configuration.h"
 #include "contacts/reach.h"
 #include "identity/identity_priv.h"
@@ -281,7 +283,7 @@ static size_t _seed_hints(net_relay_ep_t *out, net_relay_pin_t *pins, size_t max
 
 /* The pinned communities' roster files, stamped as the seed list's are.
  * Mirrors Python relay._roster_hints. */
-#define AT_RELAY_ROSTER_STAMPS (AT_RELAY_ROSTER_FILES_MAX + 3)
+#define AT_RELAY_ROSTER_STAMPS (AT_RELAY_ROSTER_FILES_MAX + 4)
 static struct {
     pthread_mutex_t lock;
     bool valid;
@@ -301,10 +303,12 @@ static void _roster_stamp(_seed_stamp_t *st)
     snprintf(st[0].path, sizeof(st[0].path), "%s", dir);
     (void)net_relay_rosters_issuers_path(st[1].path, sizeof(st[1].path));
     snprintf(st[2].path, sizeof(st[2].path), "%s/%s", data_dir, AT_RELAY_ROSTERS_SEEN_FILE);
+    /* Our own listings: a hub for one of their buckets is registered first. */
+    snprintf(st[3].path, sizeof(st[3].path), "%s/%s", data_dir, AT_AREA_STATE_FILENAME);
     char (*names)[256] = calloc(AT_RELAY_ROSTER_FILES_MAX, sizeof(*names));
     size_t nf = names != NULL ? net_relay_rosters_files(names, AT_RELAY_ROSTER_FILES_MAX) : 0;
     for (size_t i = 0; i < nf; i++)
-        snprintf(st[3 + i].path, sizeof(st[3 + i].path), "%s/%s", dir, names[i]);
+        snprintf(st[4 + i].path, sizeof(st[4 + i].path), "%s/%s", dir, names[i]);
     free(names);
     for (int i = 0; i < AT_RELAY_ROSTER_STAMPS; i++) {
         struct stat sb;
@@ -574,6 +578,8 @@ struct net_relay_server_s {
     size_t n_records;
     /* A directory registry (net_registry.h), or NULL: dir_* ops refused. */
     net_registry_t *registry;
+    /* An area hub (net_hub.h), or NULL: hub_* ops refused. */
+    net_hub_t *hub;
 };
 
 typedef struct relay_record_s {
@@ -858,6 +864,30 @@ static json_t *_server_directory(net_relay_server_t *srv, const char *uuid,
                      "reason", reason);
 }
 
+/* A hub op from registrant @p uuid. The reply (new reference). Mirrors
+ * Python RelayServer._area_hub. */
+static json_t *_server_hub(net_relay_server_t *srv, const char *uuid, const char *pub,
+                           const char *op, const json_t *req)
+{
+    const char *a = json_string_value(json_object_get(req, "area"));
+    const char *area = a != NULL ? a : "";
+    pthread_mutex_lock(&srv->lock);
+    net_hub_t *hub = srv->hub;
+    pthread_mutex_unlock(&srv->lock);
+    const char *reason = NULL;
+    if (hub == NULL)
+        reason = "not_hub";
+    else if (strcmp(op, "hub_publish") == 0)
+        return net_hub_publish(hub, uuid, pub, json_object_get(req, "card"));
+    else if (strcmp(op, "hub_withdraw") == 0)
+        return net_hub_withdraw(hub, uuid, pub, area);
+    else if (strcmp(op, "hub_lookup") == 0)
+        return net_hub_lookup(hub, uuid, area);
+    else
+        reason = "unknown_op";
+    return json_pack("{s:s, s:s, s:s}", "op", "hub_refused", "area", area, "reason", reason);
+}
+
 static void *_server_conn(void *arg)
 {
     relay_conn_arg_t a = *(relay_conn_arg_t *)arg;
@@ -927,6 +957,11 @@ static void *_server_conn(void *arg)
         }
         if (op != NULL && strncmp(op, "dir_", 4) == 0) {
             _server_write(srv, fd, _server_directory(srv, uuid, pub, op, req));
+            json_decref(req);
+            continue;
+        }
+        if (op != NULL && strncmp(op, "hub_", 4) == 0) {
+            _server_write(srv, fd, _server_hub(srv, uuid, pub, op, req));
             json_decref(req);
             continue;
         }
@@ -1074,6 +1109,15 @@ void net_relay_server_set_registry(net_relay_server_t *srv, net_registry_t *reg)
     pthread_mutex_unlock(&srv->lock);
 }
 
+void net_relay_server_set_hub(net_relay_server_t *srv, net_hub_t *hub)
+{
+    if (srv == NULL)
+        return;
+    pthread_mutex_lock(&srv->lock);
+    srv->hub = hub;
+    pthread_mutex_unlock(&srv->lock);
+}
+
 void net_relay_server_set_distrust(net_relay_server_t *srv,
                                    net_relay_distrust_fn fn, void *arg)
 {
@@ -1167,6 +1211,8 @@ struct net_relay_client_s {
     void *record_arg;
     net_relay_dir_fn on_dir;
     void *dir_arg;
+    net_relay_hub_fn on_hub;
+    void *hub_arg;
     net_relay_pin_t proven;         /* who answered at the last connect */
     char proven_key[crypto_sign_PUBLICKEYBYTES * 2 + 1];
     char refused[160];
@@ -1332,6 +1378,40 @@ int net_relay_client_dir_lookup(net_relay_client_t *c, const char *handle)
                                         "handle", handle));
 }
 
+void net_relay_client_on_hub(net_relay_client_t *c, net_relay_hub_fn fn, void *arg)
+{
+    if (c == NULL)
+        return;
+    pthread_mutex_lock(&c->lock);
+    c->on_hub = fn;
+    c->hub_arg = arg;
+    pthread_mutex_unlock(&c->lock);
+}
+
+int net_relay_client_hub_publish(net_relay_client_t *c, const json_t *card)
+{
+    if (card == NULL)
+        return -1;
+    json_t *req = json_object();
+    json_object_set_new(req, "op", json_string("hub_publish"));
+    json_object_set(req, "card", (json_t *)card);
+    return _client_request(c, req);
+}
+
+int net_relay_client_hub_withdraw(net_relay_client_t *c, const char *area)
+{
+    if (area == NULL)
+        return -1;
+    return _client_request(c, json_pack("{s:s, s:s}", "op", "hub_withdraw", "area", area));
+}
+
+int net_relay_client_hub_lookup(net_relay_client_t *c, const char *area)
+{
+    if (area == NULL)
+        return -1;
+    return _client_request(c, json_pack("{s:s, s:s}", "op", "hub_lookup", "area", area));
+}
+
 int net_relay_client_lookup(net_relay_client_t *c, const char *rid)
 {
     if (rid == NULL)
@@ -1488,6 +1568,17 @@ static void *_client_reader(void *arg)
             pthread_mutex_lock(&c->lock);
             net_relay_dir_fn fn = c->on_dir;
             void *fn_arg = c->dir_arg;
+            pthread_mutex_unlock(&c->lock);
+            if (fn != NULL)
+                fn(fn_arg, msg, c->host, c->port);
+        } else if (op != NULL && strncmp(op, "hub_", 4) == 0) {
+            const char *why = json_string_value(json_object_get(msg, "reason"));
+            if (strcmp(op, "hub_refused") == 0 && (why == NULL || strcmp(why, "not_hub") != 0))
+                log_warn(c->logger, "Relay %s:%d refused area card %s: %s\n", c->host,
+                         c->port, json_string_value(json_object_get(msg, "area")), why);
+            pthread_mutex_lock(&c->lock);
+            net_relay_hub_fn fn = c->on_hub;
+            void *fn_arg = c->hub_arg;
             pthread_mutex_unlock(&c->lock);
             if (fn != NULL)
                 fn(fn_arg, msg, c->host, c->port);

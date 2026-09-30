@@ -374,6 +374,7 @@ static void emit_readings(const process_t *proc)
         snprintf(o->return_to, sizeof(o->return_to), "%s", DATA_SOURCE_PROC_NAME);
         net_msg_pack_json(o, arr);
         messaging_send("network", NET_MESSAGE, &out, false);
+        net_msg_free_obj(o);
     }
 
     /* Gated on n>0 (we returned early otherwise): mirror participant.py's
@@ -510,16 +511,18 @@ int data_source_run(process_t *proc, directory_t *queues, queue_id_t signal,
 
     log_info(logger, "data-source: ready (cadence %ld us)\n", cadence);
 
+    generic_msg_t buf = {0};
     while (keep_running(proc, &ctx.sig_q, logger)) {
         sleep_until(proc, cadence);
 
-        generic_msg_t buf = {0};
+        messaging_recv_release(&buf);   /* the previous pass's */
         int rerr = messaging_recv(&buf);
         if (rerr != -1 && rerr != ENOMSG)
             run_message_handlers(proc, queues, buf.type, &buf);
 
         emit_readings(proc);
     }
+    messaging_recv_release(&buf);
 
     /* Stop the feeder: accept()/read() are cancellation points, so cancel
      * unblocks it; join so the socket is closed/unlinked before we return. */

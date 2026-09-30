@@ -1,0 +1,44 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: identity
+name: area-accept-answering-our-request-sends-the-hello
+byte_pinning: false
+description: Bob asked someone an area lookup found; her accept answers the request he has outstanding, and his node redeems it with the ordinary hello -- exactly one.
+participants:
+- id: alice
+  role: border_guard
+- id: bob
+  role: new_node
+fixtures:
+  first_contact:
+    enabled: true
+  groups:
+    alice:
+      uuid: fc000000-0000-4000-8000-0000000e0500
+      size: 1
+    bob:
+      uuid: fc000000-0000-4000-8000-0000000e0501
+      size: 1
+steps:
+- id: 1
+  from: bob
+  to: bob
+  function: trigger_area_request
+  payload:
+    holder: alice
+    area: u4pr
+  description: 'Pseudo-step: a lookup finds Alice''s card (a local hub_result) and Bob''s app asks her through the production app_first_contact_request, naming the area.'
+- id: 2
+  from: alice
+  to: bob
+  function: first_contact_accept
+  payload:
+    minted_by: alice
+  description: Alice's answer, with the nonce of Bob's outstanding request and her own invitation.
+expected_state:
+  bob:
+    first_contact_hellos_emitted: 1

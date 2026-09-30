@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <jansson.h>
@@ -53,6 +54,7 @@ void contacts_free(contacts_t *store)
     for (size_t i = 0; i < store->count; i++)
         contact_free(&store->items[i]);
     free(store->items);
+    free(store->tombstones);
     memset(store, 0, sizeof(*store));
 }
 
@@ -85,6 +87,71 @@ static contact_t *_find(contacts_t *s, const char *uuid)
     return NULL;
 }
 
+/* ------------------------------------------------------------------------- */
+/* Tombstones (Phase 4, contacts/sync.h)                                      */
+/* ------------------------------------------------------------------------- */
+
+bool at_is_lower_uuid(const char *v)
+{
+    if (v == NULL || strlen(v) != UUID_STRING_LEN)
+        return false;
+    for (const char *p = v; *p; p++)
+        if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || *p == '-'))
+            return false;
+    return true;
+}
+
+static at_tombstone_t *_tomb(const contacts_t *s, const char *uuid)
+{
+    for (size_t i = 0; i < s->tombstones_count; i++)
+        if (strcmp(s->tombstones[i].uuid, uuid) == 0)
+            return &s->tombstones[i];
+    return NULL;
+}
+
+double contacts_tombstone(const contacts_t *store, const char *uuid)
+{
+    if (store == NULL || uuid == NULL)
+        return -1.0;
+    at_tombstone_t *t = _tomb(store, uuid);
+    return t != NULL ? t->at : -1.0;
+}
+
+int contacts_set_tombstone(contacts_t *store, const char *uuid, double at)
+{
+    if (store == NULL || !at_is_lower_uuid(uuid))
+        return -1;
+    at_tombstone_t *t = _tomb(store, uuid);
+    if (t != NULL) {
+        if (at > t->at)
+            t->at = at;
+        return 0;
+    }
+    if (store->tombstones_count == store->tombstones_cap) {
+        size_t ncap = store->tombstones_cap ? store->tombstones_cap * 2 : 4;
+        at_tombstone_t *nt = realloc(store->tombstones, ncap * sizeof(*nt));
+        if (nt == NULL)
+            return -1;
+        store->tombstones = nt;
+        store->tombstones_cap = ncap;
+    }
+    t = &store->tombstones[store->tombstones_count++];
+    at_strlcpy(t->uuid, uuid, sizeof(t->uuid));
+    t->at = at;
+    return 0;
+}
+
+static void _drop_tombstone(contacts_t *s, const char *uuid)
+{
+    at_tombstone_t *t = _tomb(s, uuid);
+    if (t == NULL)
+        return;
+    size_t i = (size_t)(t - s->tombstones);
+    memmove(&s->tombstones[i], &s->tombstones[i + 1],
+            (s->tombstones_count - i - 1) * sizeof(*t));
+    s->tombstones_count--;
+}
+
 /* Move an already-owned contact into the store (replace-by-uuid or append).
  * Takes ownership of *c (its heap fields). */
 static int _place_move(contacts_t *s, contact_t *c)
@@ -92,6 +159,7 @@ static int _place_move(contacts_t *s, contact_t *c)
     char uuid_s[UUID_STRING_LEN + 1];
     uuid_unparse(c->identity.uuid, uuid_s);
     contact_t *existing = _find(s, uuid_s);
+    _drop_tombstone(s, uuid_s);
     if (existing != NULL) {
         contact_free(existing);
         *existing = *c;
@@ -155,6 +223,13 @@ int contacts_add(contacts_t *store, const contact_t *c)
     return _place_move(store, &copy);
 }
 
+contact_t *contacts_get_first(contacts_t *store, const char *uuid)
+{
+    if (store == NULL || uuid == NULL)
+        return NULL;
+    return _find(store, uuid);
+}
+
 contact_t *contacts_get(contacts_t *store, const char *uuid)
 {
     if (store == NULL || uuid == NULL)
@@ -189,12 +264,22 @@ contact_t *contacts_by_petname(contacts_t *store, const char *petname)
 
 bool contacts_remove(contacts_t *store, const char *uuid)
 {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return contacts_remove_at(store, uuid,
+                              (double)ts.tv_sec + (double)ts.tv_nsec / 1e9);
+}
+
+bool contacts_remove_at(contacts_t *store, const char *uuid, double at)
+{
     if (store == NULL || uuid == NULL)
         return false;
     char u[UUID_STRING_LEN + 1];
     for (size_t i = 0; i < store->count; i++) {
         uuid_unparse(store->items[i].identity.uuid, u);
         if (strcmp(u, uuid) == 0) {
+            double v = contact_version(&store->items[i]);
+            contacts_set_tombstone(store, u, at > v ? at : v);
             contact_free(&store->items[i]);
             /* compact: move the tail down one */
             memmove(&store->items[i], &store->items[i + 1],
@@ -247,6 +332,8 @@ int contact_to_json(const contact_t *c, json_t **obj_out)
                                                 "added_at", c->devices[i].added_at));
         json_object_set_new(o, "devices", ds);
     }
+    if (c->updated_at > 0.0)
+        json_object_set_new(o, "updated_at", json_real(c->updated_at));
     *obj_out = o;
     return 0;
 }
@@ -257,6 +344,10 @@ static at_provenance_t _provenance_from_str(const char *s)
         return AT_PROV_IN_PERSON;
     if (s != NULL && strcmp(s, "directory") == 0)
         return AT_PROV_DIRECTORY;
+    if (s != NULL && strcmp(s, "sibling") == 0)
+        return AT_PROV_SIBLING;
+    if (s != NULL && strcmp(s, "area") == 0)
+        return AT_PROV_AREA;
     return AT_PROV_TOKEN;
 }
 
@@ -293,6 +384,9 @@ int contact_from_json(const json_t *obj, contact_t *out)
         at_strlcpy(out->nonce, nonce, sizeof(out->nonce));
     out->added_at = _real(obj, "added_at");
     out->verified_at = _real(obj, "verified_at");
+    out->updated_at = _real(obj, "updated_at");
+    if (!(out->updated_at >= 0.0))
+        out->updated_at = 0.0;
     json_t *rs = json_object_get((json_t *)obj, "reach_seq");
     out->reach_seq = json_is_integer(rs) ? (int64_t)json_integer_value(rs) : 0;
 
@@ -336,6 +430,15 @@ int contacts_to_json(const contacts_t *store, json_t **obj_out)
         json_object_set_new(cs, uuid_s, cj);
     }
     json_object_set_new(root, "contacts", cs);
+    /* Only once something was removed, so an older store stays
+     * byte-identical. */
+    if (store->tombstones_count > 0) {
+        json_t *ts = json_object();
+        for (size_t i = 0; i < store->tombstones_count; i++)
+            json_object_set_new(ts, store->tombstones[i].uuid,
+                                json_real(store->tombstones[i].at));
+        json_object_set_new(root, "tombstones", ts);
+    }
     *obj_out = root;
     return 0;
 }
@@ -355,6 +458,18 @@ int contacts_from_json(const json_t *obj, contacts_t *store)
         contact_t c;
         if (contact_from_json(val, &c) == 0)
             _place_move(store, &c);
+    }
+    /* Only well-formed tombstones, and none for a contact that is here. */
+    json_t *ts = json_object_get((json_t *)obj, "tombstones");
+    if (json_is_object(ts)) {
+        json_object_foreach(ts, key, val) {
+            if (!(json_is_real(val) || json_is_integer(val)))
+                continue;
+            double at = json_is_real(val) ? json_real_value(val)
+                                          : (double)json_integer_value(val);
+            if (at >= 0.0 && at_is_lower_uuid(key) && _find(store, key) == NULL)
+                contacts_set_tombstone(store, key, at);
+        }
     }
     return 0;
 }

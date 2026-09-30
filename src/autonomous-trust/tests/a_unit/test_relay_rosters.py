@@ -223,3 +223,88 @@ def test_a_refused_roster_is_logged_once(monkeypatch, caplog):
     for _ in range(3):
         assert relay.own_relays() == []
     assert sum('refused' in r.getMessage() for r in caplog.records) == 1
+
+
+# -- area hubs in a roster --------------------------------------------------------
+def test_a_roster_without_hubs_keeps_its_bytes():
+    """``areas`` is left out when no relay serves one: the Ethne vector still
+    verifies, and still reproduces byte for byte."""
+    assert '"areas"' not in json.loads(ethne_vector())['body']
+    assert rosters.verify_roster_areas(ethne_vector(), [ETHNE_ISSUER])[3] == {}
+
+
+def ethne_hub_vector():
+    """D38: the Ethne polity's hub roster (en_uplift PINNED_HUB_VECTOR), pinned in the C test."""
+    src = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'c', 'test',
+                       'net_relay_rosters_test.c')
+    with open(src) as f:
+        m = re.search(r'#define ETHNE_HUB_VECTOR (".*")\n', f.read())
+    return json.loads(m.group(1))
+
+
+def test_an_ethne_emitted_hub_roster_names_its_areas():
+    issuer, seq, relays, areas = rosters.verify_roster_areas(ethne_hub_vector(), [ETHNE_ISSUER])
+    assert seq == 6 and areas == {('2001:db8::7', 27791): ['u4pr', 'gcpv']}
+    assert rosters.sign_roster('07' * 32, 6, ETHNE_RELAYS,
+                               areas={ETHNE_RELAYS[1]: ['u4pr', 'gcpv']}) == ethne_hub_vector()
+
+
+def test_a_roster_names_its_hubs_and_their_areas():
+    text = rosters.sign_roster(A_SEED, 1, [hint(1), hint(2)], areas={hint(2): ['u4pr', 'gcpv']})
+    issuer, seq, relays, areas = rosters.verify_roster_areas(text, [A_KEY])
+    assert areas == {('198.51.100.2', 27790): ['u4pr', 'gcpv']}
+    assert rosters.verify_roster(text, [A_KEY])[2] == relays
+
+
+@pytest.mark.parametrize('areas', [
+    {'relay://00000000-0000-4000-8000-000000000009:' + 'ab' * 16 + '@198.51.100.9:1': ['u4pr']},
+    {hint(1): []},
+    {hint(1): ['u4pa']},
+    {hint(1): ['u4pr'] * (rosters.MAX_AREAS + 1)},
+    ['u4pr'],
+])
+def test_bad_areas_refuse_the_whole_roster(areas):
+    body = json.dumps({'v': 1, 'typename': rosters.ROSTER_TYPENAME, 'issuer': A_KEY, 'seq': 1,
+                       'relays': [hint(1)], 'areas': areas}, separators=(',', ':'))
+    sig = A.sign((rosters.ROSTER_DOMAIN + body).encode()).signature
+    with pytest.raises(rosters.InvalidRoster):
+        rosters.verify_roster(json.dumps({'body': body, 'sig': sig.hex()}), [A_KEY])
+
+
+def test_a_hub_for_our_own_bucket_is_registered_first(monkeypatch):
+    monkeypatch.setenv(rosters.ISSUERS_ENV, A_KEY)
+    hints = [hint(i) for i in range(1, 7)]
+    _publish('a.cfg.json', A_SEED, 1, hints)
+    with open(os.path.join(rosters.rosters_dir(), 'a.cfg.json'), 'w') as f:
+        f.write(rosters.sign_roster(A_SEED, 1, hints, areas={hint(6): ['u4pr'],
+                                                              hint(5): ['gcpv']}))
+    assert [ep[1] for ep, _p in relay.own_relay_hints()] == [27790] * 4
+    assert [ep[0] for ep, _p in relay.own_relay_hints()][0] == '198.51.100.1'
+    # Listed under u4pru: the u4pr hub moves to the front, inside the cap.
+    with open(os.path.join(Configuration.get_data_dir(), 'area.cfg.json'), 'w') as f:
+        json.dump({'u4pr': {'seq': 1, 'bucket': 'u4pru', 'name': '', 'card': {}}}, f)
+    assert [ep[0] for ep, _p in relay.own_relay_hints()] == [
+        '198.51.100.6', '198.51.100.1', '198.51.100.2', '198.51.100.3']
+
+
+def test_install_pins_the_issuer_and_remove_unpins_it():
+    text = rosters.sign_roster(A_SEED, 3, [hint(1)], areas={hint(1): ['u4pr']})
+    assert rosters.install(text) == A_KEY
+    assert rosters.pinned_issuers() == [A_KEY]
+    assert [ep for ep, _p in relay.own_relay_hints()] == [('198.51.100.1', 27790)]
+    relay.own_relay_hints()                         # raises the seq floor to 3
+    with pytest.raises(rosters.InvalidRoster, match='older'):
+        rosters.install(rosters.sign_roster(A_SEED, 2, [hint(2)]))
+    assert rosters.install(rosters.sign_roster(A_SEED, 4, [hint(2)])) == A_KEY
+    assert rosters.pinned_issuers() == [A_KEY]      # pinned once
+    assert rosters.remove(A_KEY) is True
+    assert rosters.pinned_issuers() == [] and relay.own_relay_hints() == []
+    assert rosters.remove(A_KEY) is False
+
+
+def test_install_refuses_a_roster_that_does_not_verify_under_its_own_issuer():
+    text = json.loads(rosters.sign_roster(A_SEED, 1, [hint(1)]))
+    text['body'] = text['body'].replace(A_KEY, B_KEY)
+    with pytest.raises(rosters.InvalidRoster):
+        rosters.install(json.dumps(text))
+    assert rosters.pinned_issuers() == []

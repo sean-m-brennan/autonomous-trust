@@ -229,6 +229,14 @@ int messaging_recv_from(generic_msg_t *data, struct sockaddr_storage *their_addr
  */
 #define messaging_recv(data) messaging_recv_from(data, NULL, false)
 
+/** The other half of a successful receive: free what it allocated in @p msg
+ *  (a NET_MESSAGE's function and obj) and zero the struct, ready to receive
+ *  into again. NULL-safe, and safe on a zeroed or already-released struct, so
+ *  a loop may release unconditionally at the top of each pass. Never call it
+ *  on a message this code built to send -- its function is usually a static
+ *  string. */
+void messaging_recv_release(generic_msg_t *msg);
+
 /*@
   requires \valid(q);
   requires q->fd > 0;

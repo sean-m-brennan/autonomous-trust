@@ -157,7 +157,13 @@ static int run_relay_roster_verify(json_t *input, json_t *expected,
         return -1;
     }
     long long seq = 0;
-    bool valid = net_relay_roster_verify(text, &issuers, NULL, &seq, l) == 0;
+    net_relay_roster_areas_t *areas = calloc(1, sizeof(*areas));
+    if (areas == NULL) {
+        free(l);
+        snprintf(err, err_len, "relay_roster_verify: out of memory");
+        return -1;
+    }
+    bool valid = net_relay_roster_verify_areas(text, &issuers, NULL, &seq, l, areas) == 0;
     bool should = json_is_true(json_object_get(expected, "valid"));
     int rc = -1;
     if (valid != should) {
@@ -187,9 +193,32 @@ static int run_relay_roster_verify(json_t *input, json_t *expected,
                 goto done;
             }
         }
+        /* The hubs' areas, keyed by the relay's uuid:fp@host:port. */
+        json_t *want_areas = json_object_get(expected, "areas");
+        if (want_areas != NULL) {
+            json_t *got_areas = json_object();
+            for (size_t r = 0; r < l->n; r++) {
+                if (areas->n[r] == 0)
+                    continue;
+                char key[AT_RELAY_HOST_LEN + 96];
+                snprintf(key, sizeof(key), "%s:%s@%s:%d", l->pins[r].uuid, l->pins[r].fp,
+                         l->eps[r].host, l->eps[r].port);
+                json_t *list = json_array();
+                for (size_t a = 0; a < areas->n[r]; a++)
+                    json_array_append_new(list, json_string(areas->areas[r][a]));
+                json_object_set_new(got_areas, key, list);
+            }
+            bool same = json_equal(got_areas, want_areas);
+            json_decref(got_areas);
+            if (!same) {
+                snprintf(err, err_len, "relay_roster_verify: areas are not the expected ones");
+                goto done;
+            }
+        }
     }
     rc = 0;
 done:
+    free(areas);
     free(l);
     return rc;
 }

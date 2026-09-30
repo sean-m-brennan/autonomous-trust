@@ -181,14 +181,34 @@ def _roster_hints():
     from ..config.configuration import Configuration
     def paths():
         return tuple([_rosters.rosters_dir(), _rosters.issuers_path(),
-                      os.path.join(Configuration.get_data_dir(), _rosters.SEEN_FILE)]
+                      os.path.join(Configuration.get_data_dir(), _rosters.SEEN_FILE),
+                      _area_state_path()]
                      + _rosters.roster_files())
     env = os.environ.get(_rosters.ISSUERS_ENV, '')
     if _roster_cache['key'] != _stamp(paths(), env):
-        _roster_cache['hints'] = _rosters.load()
+        _roster_cache['hints'] = _rosters.load(_listed_buckets())
         # Stamped AFTER the load: raising a seq floor rewrites a stamped file.
         _roster_cache['key'] = _stamp(paths(), env)
     return list(_roster_cache['hints'])
+
+
+def _area_state_path():
+    from ..config.configuration import Configuration
+    from ..contacts.area_card import STATE_FILENAME
+    return os.path.join(Configuration.get_data_dir(), STATE_FILENAME)
+
+
+def _listed_buckets():
+    """The buckets this node is listed at hubs under (identity's
+    area.cfg.json), so a roster hub for one of them is registered first."""
+    try:
+        with open(_area_state_path()) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return []
+    return sorted(str(held.get('bucket', '')) for held in state.values()
+                  if isinstance(held, dict) and held.get('card') is not None
+                  and held.get('bucket')) if isinstance(state, dict) else []
 
 
 def _seed_hints():
@@ -373,16 +393,19 @@ class RelayServer:
     closed."""
 
     def __init__(self, host, port, logger=None, identity=None, distrusted=None,
-                 registry=None):
+                 registry=None, hub=None):
         """``identity`` (this node's) signs each challenge, proving the relay;
         ``distrusted(uuid, pubkey_hex) -> bool`` refuses a client to register
         (the key is proven, so a distrusted node gains nothing by a new uuid);
         ``registry`` (a registry.Registry) makes this relay a directory
-        registry too -- without one, every ``dir_*`` op is refused."""
+        registry too -- without one, every ``dir_*`` op is refused; ``hub``
+        (a hub.Hub) makes it an area hub -- without one, every ``hub_*`` op is
+        refused."""
         self.logger = logger or _logger
         self.identity = identity
         self.distrusted = distrusted
         self.registry = registry
+        self.hub = hub
         self._records = {}          # record id -> ReachRecord
         self._clients = {}          # uuid -> socket
         self._send_locks = {}       # socket -> Lock (writes are not atomic)
@@ -546,6 +569,19 @@ class RelayServer:
             return self.registry.lookup(uuid, handle)
         return {'op': 'dir_refused', 'handle': handle, 'reason': 'unknown_op'}
 
+    def _area_hub(self, uuid, pubkey, op, req):
+        """A hub op from registrant ``uuid``. Returns the reply frame."""
+        area = str(req.get('area', '') or '')
+        if self.hub is None:
+            return {'op': 'hub_refused', 'area': area, 'reason': 'not_hub'}
+        if op == 'hub_publish':
+            return self.hub.publish(uuid, pubkey, req.get('card'))
+        if op == 'hub_withdraw':
+            return self.hub.withdraw(uuid, pubkey, area)
+        if op == 'hub_lookup':
+            return self.hub.lookup(uuid, area)
+        return {'op': 'hub_refused', 'area': area, 'reason': 'unknown_op'}
+
     def _serve(self, conn):
         uuid = None
         try:
@@ -579,6 +615,9 @@ class RelayServer:
                     continue
                 if isinstance(op, str) and op.startswith('dir_'):
                     self._write(conn, self._directory(uuid, pubkey, op, req))
+                    continue
+                if isinstance(op, str) and op.startswith('hub_'):
+                    self._write(conn, self._area_hub(uuid, pubkey, op, req))
                     continue
                 if op != 'send':
                     continue
@@ -619,7 +658,7 @@ class RelayClient:
 
     def __init__(self, endpoint, identity, on_deliver, logger=None, timeout=5.0,
                  on_unreachable=None, pin=None, distrusted=None, on_record=None,
-                 on_dir=None):
+                 on_dir=None, on_hub=None):
         """``pin`` = ``(uuid, fp)`` names which relay must answer (refused
         otherwise, and refused if it cannot prove itself at all);
         ``distrusted(uuid, pubkey_hex) -> bool`` refuses a relay that proved
@@ -632,6 +671,8 @@ class RelayClient:
         self.on_record = on_record
         # on_dir(frame): every dir_* answer (a registry's), on the reader.
         self.on_dir = on_dir
+        # on_hub(frame): every hub_* answer (an area hub's), on the reader.
+        self.on_hub = on_hub
         self.pin = (pin[0].lower(), pin[1].lower()) if pin else None
         self.distrusted = distrusted
         self.relay_uuid = None      # proven by the relay's signed challenge
@@ -777,6 +818,18 @@ class RelayClient:
         """Ask this registry for ``handle``; on_dir gets the answer."""
         self._request({'op': 'dir_lookup', 'handle': str(handle)})
 
+    def hub_publish(self, card) -> None:
+        """File our area card (an AreaCard or its wire dict) here."""
+        wire = card.to_wire() if hasattr(card, 'to_wire') else card
+        self._request({'op': 'hub_publish', 'card': wire})
+
+    def hub_withdraw(self, area) -> None:
+        self._request({'op': 'hub_withdraw', 'area': str(area)})
+
+    def hub_lookup(self, area) -> None:
+        """Ask this hub who is listed in ``area``; on_hub gets the answer."""
+        self._request({'op': 'hub_lookup', 'area': str(area)})
+
     def close(self):
         with self._lock:
             sock, self._sock = self._sock, None
@@ -821,6 +874,13 @@ class RelayClient:
                                             msg.get('reason'))
                     if self.on_dir is not None:
                         self.on_dir(msg)
+                elif isinstance(op, str) and op.startswith('hub_'):
+                    if op == 'hub_refused' and msg.get('reason') != 'not_hub':
+                        self.logger.warning('Relay %s:%d refused area card %s: %s',
+                                            *self.endpoint, msg.get('area'),
+                                            msg.get('reason'))
+                    if self.on_hub is not None:
+                        self.on_hub(msg)
                 elif op == 'unreachable':
                     to = str(msg.get('to', '')).lower()
                     self.unreachable.add(to)

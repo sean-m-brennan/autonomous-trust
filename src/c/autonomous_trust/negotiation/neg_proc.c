@@ -1145,6 +1145,7 @@ static void _announce_task_locked(const process_t *proc, task_t *task,
             net_msg_pack_json(&invite.info.net_msg, invite_json);
 
         messaging_send("network", NET_MESSAGE, &invite, false);
+        net_msg_free_obj(&invite.info.net_msg);
         invited++;
     }
     peers_read_unlock(proc);
@@ -1340,6 +1341,7 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
                 json_decref(rj);
             }
             messaging_send("network", NET_MESSAGE, &refuse, false);
+            net_msg_free_obj(&refuse.info.net_msg);
             pthread_mutex_unlock(&neg_state.lock);
             return true;
         }
@@ -1395,6 +1397,7 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
         json_t *rj = _task_to_json(proc, &task);
         if (rj) { net_msg_pack_json(&refuse.info.net_msg, rj); json_decref(rj); }
         messaging_send("network", NET_MESSAGE, &refuse, false);
+        net_msg_free_obj(&refuse.info.net_msg);
         pthread_mutex_unlock(&neg_state.lock);
         return true;
     }
@@ -1433,6 +1436,7 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
                 json_decref(hj);
             }
             messaging_send("network", NET_MESSAGE, &haggle, false);
+            net_msg_free_obj(&haggle.info.net_msg);
         }
         else
         {
@@ -1465,6 +1469,7 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
                 json_decref(aj);
             }
             messaging_send("network", NET_MESSAGE, &accept, false);
+            net_msg_free_obj(&accept.info.net_msg);
         }
     }
     else
@@ -1483,6 +1488,7 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
             json_decref(rj);
         }
         messaging_send("network", NET_MESSAGE, &refuse, false);
+        net_msg_free_obj(&refuse.info.net_msg);
     }
 
     pthread_mutex_unlock(&neg_state.lock);
@@ -1554,6 +1560,7 @@ static bool handle_haggle(const process_t *proc, directory_t *queues, generic_ms
             json_decref(rj);
         }
         messaging_send("network", NET_MESSAGE, &announce, false);
+        net_msg_free_obj(&announce.info.net_msg);
     }
     else
     {
@@ -1575,6 +1582,7 @@ static bool handle_haggle(const process_t *proc, directory_t *queues, generic_ms
             json_decref(rj);
         }
         messaging_send("network", NET_MESSAGE, &refuse, false);
+        net_msg_free_obj(&refuse.info.net_msg);
     }
 
     return true;
@@ -1882,6 +1890,7 @@ static bool handle_stat_req(const process_t *proc, directory_t *queues, generic_
     }
 
     messaging_send("network", NET_MESSAGE, &resp, false);
+    net_msg_free_obj(&resp.info.net_msg);
     return true;
 }
 
@@ -2585,6 +2594,7 @@ static void _report_result(const process_t *proc, const task_t *task,
     json_decref(j);
 
     messaging_send("network", NET_MESSAGE, &out, false);
+    net_msg_free_obj(&out.info.net_msg);
 }
 
 /* Execute every job whose start time has arrived, report each answer, and
@@ -3143,14 +3153,16 @@ int negotiation_run(process_t *proc, directory_t *queues, queue_id_t signal, log
          * cohort bootstrap fills this queue, and the surplus is dropped at the
          * sender (MSG_DONTWAIT / EAGAIN), not buffered. The two hooks below
          * still run once per tick, exactly as before. See PROC_DRAIN_MAX. */
+        generic_msg_t buf = {0};
         for (int taken = 0; taken < PROC_DRAIN_MAX; taken++)
         {
-            generic_msg_t buf = {0};
+            messaging_recv_release(&buf);   /* the previous pass's */
             int rerr = messaging_recv(&buf);
             if (rerr == -1 || rerr == ENOMSG)
                 break;
             run_message_handlers(proc, queues, buf.type, &buf);
         }
+        messaging_recv_release(&buf);
 
         _drain_task_stack(proc);
         _bootstrap_tick(proc);

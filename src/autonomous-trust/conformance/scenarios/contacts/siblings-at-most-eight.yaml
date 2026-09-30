@@ -1,0 +1,159 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: siblings-at-most-eight
+description: At most eight siblings.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    mode: add
+    siblings:
+      typename: siblings
+      version: 1
+      operator: af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d
+      devices:
+      - identity:
+          typename: identity
+          uuid: eeeeeeee-0000-4000-8000-000000000014
+          address: ''
+          nickname: dev0
+          signature:
+            hex_seed: 58936604abda112bc94933569c82f8d0cc0ddf92a3f8329f2f448f7f484a594c
+          encryptor:
+            hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+        cert:
+          body: '{"v":1,"typename":"at-device-cert","operator":"af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d","uuid":"eeeeeeee-0000-4000-8000-000000000014","key":"58936604abda112bc94933569c82f8d0cc0ddf92a3f8329f2f448f7f484a594c","issued_at":1790000000}'
+          sig: f53f69a25a3633bca2bf2d1a0e9b2f301eb0d34c916736d9e81d470f94f8817445ee2efb57ca6e10b81c95c3aaa0c59d0503b9add9f5ad873281fc59047d9c0e
+        added_at: 5.0
+      - identity:
+          typename: identity
+          uuid: eeeeeeee-0000-4000-8000-000000000015
+          address: ''
+          nickname: dev1
+          signature:
+            hex_seed: bed7d2ab668da3efad613998f06f7abf7875f3a6b7677a9f3ce947d77d7760a6
+          encryptor:
+            hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+        cert:
+          body: '{"v":1,"typename":"at-device-cert","operator":"af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d","uuid":"eeeeeeee-0000-4000-8000-000000000015","key":"bed7d2ab668da3efad613998f06f7abf7875f3a6b7677a9f3ce947d77d7760a6","issued_at":1790000000}'
+          sig: 0db47bed93f899e0934bcc5b5a3e7771c4aa06169d4a1e9d1a2aca07f3b4e6090657f5213fe0b40a60445986f171bf11bc736dc0c7ae64ac4db61194de55f605
+        added_at: 5.0
+      - identity:
+          typename: identity
+          uuid: eeeeeeee-0000-4000-8000-000000000016
+          address: ''
+          nickname: dev2
+          signature:
+            hex_seed: 9109db55f79797a396462fb895c2adcea7e8683c2f3056c07a5475155537b73e
+          encryptor:
+            hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+        cert:
+          body: '{"v":1,"typename":"at-device-cert","operator":"af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d","uuid":"eeeeeeee-0000-4000-8000-000000000016","key":"9109db55f79797a396462fb895c2adcea7e8683c2f3056c07a5475155537b73e","issued_at":1790000000}'
+          sig: e59e5695d2de1b66a25723fe39ef44c60cc22801d76556796b434ced5e3a6eab8b18265c3ab1c62cb6583fefa78a80ee5759b9d883712264e9c919a8411af50f
+        added_at: 5.0
+      - identity:
+          typename: identity
+          uuid: eeeeeeee-0000-4000-8000-000000000017
+          address: ''
+          nickname: dev3
+          signature:
+            hex_seed: ee45ecb9aca01a0abd83ef56dd985c8c874e6e7f4aebcedf20bd8d88c2a0add7
+          encryptor:
+            hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+        cert:
+          body: '{"v":1,"typename":"at-device-cert","operator":"af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d","uuid":"eeeeeeee-0000-4000-8000-000000000017","key":"ee45ecb9aca01a0abd83ef56dd985c8c874e6e7f4aebcedf20bd8d88c2a0add7","issued_at":1790000000}'
+          sig: 6f6e56e9a40560e6f3d133e98ab35b29b3fd9c1b1788debcd23fc842ea28d42af53cb28458fd4d678fc9d8dd029d3407e2e8804f22e813e907c46f3eda7a8a04
+        added_at: 5.0
+      - identity:
+          typename: identity
+          uuid: eeeeeeee-0000-4000-8000-000000000018
+          address: ''
+          nickname: dev4
+          signature:
+            hex_seed: e92eb6054fe9bc682a1bcf3b759f65ab38a4cfbd81c4d1f3342e4cc9cded8b0b
+          encryptor:
+            hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+        cert:
+          body: '{"v":1,"typename":"at-device-cert","operator":"af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d","uuid":"eeeeeeee-0000-4000-8000-000000000018","key":"e92eb6054fe9bc682a1bcf3b759f65ab38a4cfbd81c4d1f3342e4cc9cded8b0b","issued_at":1790000000}'
+          sig: ad7d94facb86a9e019934ef002bb5d912029f44a1ac09999de27bef8dd2dbcfe7f6f7239d1fb9857cdc5ab09aeebc093ee08560344239f9ea3d5bb7357681b04
+        added_at: 5.0
+      - identity:
+          typename: identity
+          uuid: eeeeeeee-0000-4000-8000-000000000019
+          address: ''
+          nickname: dev5
+          signature:
+            hex_seed: fa4834147f6e690c3693eff61336046403cd8ae2a14f31b3c407358569239565
+          encryptor:
+            hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+        cert:
+          body: '{"v":1,"typename":"at-device-cert","operator":"af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d","uuid":"eeeeeeee-0000-4000-8000-000000000019","key":"fa4834147f6e690c3693eff61336046403cd8ae2a14f31b3c407358569239565","issued_at":1790000000}'
+          sig: ac5fcb1ce445112b5df760d586732f2e6dd1ae9bcf268cb82a3437d99eeafa8898e76d41ab537fc396646f5849e402834ee04ac7c1726bdd42acc3495660df09
+        added_at: 5.0
+      - identity:
+          typename: identity
+          uuid: eeeeeeee-0000-4000-8000-00000000001a
+          address: ''
+          nickname: dev6
+          signature:
+            hex_seed: 197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61
+          encryptor:
+            hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+        cert:
+          body: '{"v":1,"typename":"at-device-cert","operator":"af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d","uuid":"eeeeeeee-0000-4000-8000-00000000001a","key":"197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61","issued_at":1790000000}'
+          sig: 9f39e725ed6e5d40078b805b25eac4d8a7b5ec93cd8b295c66bbb4117538a54c2ed34a7e66c6979e7b3a151ad127b3dcc8762aa33572e460ac367d4d5dda4203
+        added_at: 5.0
+      - identity:
+          typename: identity
+          uuid: eeeeeeee-0000-4000-8000-00000000001b
+          address: ''
+          nickname: dev7
+          signature:
+            hex_seed: 4508a07aa941707f3eb2db94c8897a80b2c1197476b6de213ac273df7d86c4ff
+          encryptor:
+            hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+        cert:
+          body: '{"v":1,"typename":"at-device-cert","operator":"af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d","uuid":"eeeeeeee-0000-4000-8000-00000000001b","key":"4508a07aa941707f3eb2db94c8897a80b2c1197476b6de213ac273df7d86c4ff","issued_at":1790000000}'
+          sig: e6c3b72d3fac4597589112f6f77271d36ae6255f687ed25c4a5eb2d57e0633821b5cb1d9ad796d6d99102b57be82d8b33e73c73e060c69284c08cba2b57ac00d
+        added_at: 5.0
+    identity:
+      typename: identity
+      uuid: eeeeeeee-0000-4000-8000-000000000007
+      address: ''
+      nickname: other
+      signature:
+        hex_seed: 31debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc
+      encryptor:
+        hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+    cert:
+      body: '{"v":1,"typename":"at-device-cert","operator":"af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d","uuid":"eeeeeeee-0000-4000-8000-000000000007","key":"31debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc","issued_at":1790000000}'
+      sig: e9923667b06b911e9bb9ae2fa324291fde51ae21effbf94bbc09e6d2dc9b52eb52fb3b86703b36e9bbd14358b6317b2be9a816a7e264a32feac9cf861fdff50e
+    own_cert:
+      body: '{"v":1,"typename":"at-device-cert","operator":"af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d","uuid":"eeeeeeee-0000-4000-8000-000000000006","key":"511c34a1a2cb521df16bb246b8de8e7997ce235c7e76b22a3d7503a24819dd8a","issued_at":1790000000}'
+      sig: b5f5e4984de260086e939091ab0bd803c3f5c25cf1657d5a3756e5fc876be449046bbe1f892f95c73dd4964bb85a5939dedccb39c0d06745a77e0ee79b194d0a
+    op: siblings
+steps:
+- id: 1
+  from: host
+  to: host
+  function: siblings
+  description: 'trigger: siblings'
+expected_state:
+  host:
+    sibling_status: full
+    siblings:
+    - eeeeeeee-0000-4000-8000-000000000014
+    - eeeeeeee-0000-4000-8000-000000000015
+    - eeeeeeee-0000-4000-8000-000000000016
+    - eeeeeeee-0000-4000-8000-000000000017
+    - eeeeeeee-0000-4000-8000-000000000018
+    - eeeeeeee-0000-4000-8000-000000000019
+    - eeeeeeee-0000-4000-8000-00000000001a
+    - eeeeeeee-0000-4000-8000-00000000001b

@@ -236,7 +236,7 @@ int net_msg_pack_json(net_msg_t *msg, json_t *json)
     if (str == NULL)
         return -1;
     size_t slen = strlen(str);
-    msg->obj = smrt_create(slen + 1);
+    msg->obj = malloc(slen + 1);   /* plain buffer: see net_msg_t.obj */
     if (msg->obj == NULL)
     {
         free(str);
@@ -246,6 +246,15 @@ int net_msg_pack_json(net_msg_t *msg, json_t *json)
     msg->len = slen;
     free(str);
     return 0;
+}
+
+void net_msg_free_obj(net_msg_t *msg)
+{
+    if (msg == NULL)
+        return;
+    free(msg->obj);
+    msg->obj = NULL;
+    msg->len = 0;
 }
 
 int net_msg_unpack_json(const net_msg_t *msg, json_t **json)
@@ -598,7 +607,7 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
     {
         /* strcpy is bounded: the destination was just allocated for
          * strlen(func) + 1 bytes.  Not a missing-bounds-check site. */
-        net_msg->function = smrt_create(strlen(func) + 1);
+        net_msg->function = malloc(strlen(func) + 1);
         if (net_msg->function != NULL)
             strcpy(net_msg->function, func);
     }
@@ -659,7 +668,7 @@ int proto_to_net_msg(uint8_t *data, size_t len, net_msg_t *net_msg)
     json_int_t obj_len = json_integer_value(json_object_get(root, "obj_len"));
     if (obj_str && obj_len > 0)
     {
-        net_msg->obj = smrt_create((size_t)obj_len + 1);
+        net_msg->obj = malloc((size_t)obj_len + 1);
         if (net_msg->obj != NULL)
         {
             memcpy(net_msg->obj, obj_str, (size_t)obj_len);

@@ -155,6 +155,33 @@ typedef int (*net_relay_test_dir_fn)(const char *host, int port, const char *op,
                                      const char *handle, const json_t *entry);
 void net_relay_set_test_dir(net_relay_test_dir_fn fn);
 
+/** @brief Area hubs (net_hub.h), identity's local IPC: file our card ({card})
+ *  at our relays now and at each registration; withdraw it ({area}); ask every
+ *  relay we are registered at who is listed in an area ({area}). Each refused
+ *  from the wire. Mirror Python NetworkProcess.handle_hub_*. */
+int net_handle_hub_publish(net_msg_t *nmsg, logger_t *logger);
+int net_handle_hub_withdraw(net_msg_t *nmsg, logger_t *logger);
+int net_handle_hub_lookup(net_msg_t *nmsg, logger_t *logger);
+/** @brief A hub's answer, as a relay client's on_hub (the reader thread);
+ *  queued for @ref net_relay_drain_hub. Tests call it directly. */
+void net_relay_hub_answer(void *arg, const json_t *msg, const char *host, int port);
+/** @brief Hand hub answers to identity: a lookup's ONE outcome (every card
+ *  any relay asked held, once each has answered or 10 s passed) and a hub's
+ *  word on our publish or withdraw (a relay that is no hub is not reported).
+ *  Run by the loop. */
+void net_relay_drain_hub(void);
+/** @brief Tests: make every area lookup in flight @p seconds older. */
+void net_relay_hub_age_lookups(double seconds);
+/** @brief Stands in for the relay clients' hub_* requests (tests), as
+ *  net_relay_set_test_dir does for dir_*: op "hub_publish" | "hub_withdraw" |
+ *  "hub_lookup", @p area, and @p card for a publish. NULL restores. */
+typedef int (*net_relay_test_hub_fn)(const char *host, int port, const char *op,
+                                     const char *area, const json_t *card);
+void net_relay_set_test_hub(net_relay_test_hub_fn fn);
+/** Seconds an area lookup waits for its relays. Same as Python HUB_LOOKUP_TIMEOUT. */
+#define NET_HUB_LOOKUP_TIMEOUT_SEC 10.0
+#define NET_HUB_MAX_LOOKUPS 8
+
 /** Seconds a lookup waits for its relays. Same as Python DIR_LOOKUP_TIMEOUT. */
 #define NET_DIR_LOOKUP_TIMEOUT_SEC 10.0
 #define NET_DIR_MAX_LOOKUPS 32

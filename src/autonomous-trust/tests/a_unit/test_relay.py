@@ -487,8 +487,11 @@ def test_restore_contacts_runs_from_first_contacts_on_start_hook(monkeypatch):
                         lambda proc, q: calls.append('cert') or 0)
     monkeypatch.setattr(device_contact, 'announce',
                         lambda proc, q: calls.append('announce') or 0)
+    from autonomous_trust.core._python.identity import sibling_sync
+    monkeypatch.setattr(sibling_sync, 'restore',
+                        lambda proc, q: calls.append('siblings') or 0)
     fc.EXTENSION.identity.on_start(object(), {})
-    assert calls == ['contacts', 'entries', 'cert', 'announce']
+    assert calls == ['contacts', 'siblings', 'entries', 'cert', 'announce']
 
 
 def test_a_relayed_frame_must_claim_the_sender_the_relay_stamped():

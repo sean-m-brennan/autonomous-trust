@@ -70,6 +70,8 @@
 #include "identity/first_contact.h"
 #include "identity/directory_contact.h"
 #include "network/network.h"            /* NET_ID_DIR_RESULT */
+#include "contacts/area_card.h"
+#include "identity/area_contact.h"
 #include "contacts/directory.h"
 #include "at_first_contact.h"
 
@@ -1304,7 +1306,8 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     if ((strcmp(function, "trigger_cohort_join") == 0
          || strcmp(function, "trigger_first_contact_initiate") == 0
          || strcmp(function, "trigger_first_contact_remove") == 0
-         || strncmp(function, "trigger_directory_", 18) == 0)
+         || strncmp(function, "trigger_directory_", 18) == 0
+         || strncmp(function, "trigger_area_", 13) == 0)
         && json_is_object(payload)) {
         json_t *body = json_deep_copy(payload);
         if (body != NULL) {
@@ -1468,11 +1471,17 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         const char *tpid = json_string_value(json_object_get(payload, "to"));
         const char *handle = json_string_value(json_object_get(payload, "handle"));
         const char *nonce = json_string_value(json_object_get(payload, "nonce"));
+        const char *area = json_string_value(json_object_get(payload, "area"));
         sce_participant_t *signer = sce_find_participant(ctx, spid != NULL ? spid : from_id);
         sce_participant_t *holder = sce_find_participant(ctx, tpid != NULL ? tpid : to_id);
         at_dir_signed_t entry, req;
-        if (signer == NULL || holder == NULL
-            || _ic_dir_entry(((ic_impl_t *)holder->impl)->full, handle, &entry, NULL) != AT_DIR_OK) {
+        /* Found at an area hub: the holder's area card, not an entry. */
+        int erc = holder == NULL ? AT_DIR_MALFORMED
+            : area != NULL
+            ? at_area_card_create(((ic_impl_t *)holder->impl)->full, area, area, "", 1, 0,
+                                  (double)time(NULL), &entry)
+            : _ic_dir_entry(((ic_impl_t *)holder->impl)->full, handle, &entry, NULL);
+        if (signer == NULL || holder == NULL || erc != AT_DIR_OK) {
             snprintf(ctx->err, sizeof(ctx->err),
                      "build_inbound: first_contact_request: bad spec");
             return -1;
@@ -1654,7 +1663,7 @@ static int _build_inbound(sce_run_ctx_t *ctx,
             return -1;
         }
         size_t blen = strlen(blob);
-        out->info.net_msg.obj = smrt_create(blen + 1);
+        out->info.net_msg.obj = malloc(blen + 1);
         if (out->info.net_msg.obj == NULL) {
             free(blob);
             snprintf(ctx->err, sizeof(ctx->err),
@@ -2304,6 +2313,62 @@ static int _dispatch(sce_run_ctx_t *ctx,
             _ic_app_verb(impl->proc, accept ? AT_APP_FC_ACCEPT : AT_APP_FC_DECLINE,
                          json_pack("{s:s}", "ref", ref != NULL ? ref : ""),
                          accept ? handle_dir_app_accept : handle_dir_app_decline);
+        } else {
+            trc = -1;
+        }
+        if (trc != 0)
+            snprintf(ctx->err, sizeof(ctx->err), "%s: bad spec or unknown participant",
+                     inbound->info.net_msg.function);
+        json_decref(spec);
+        return trc;
+    }
+
+    /* trigger_area_publish / _withdraw / _request -- finding people nearby at
+     * an area hub, through the production app verbs and handlers. Mirrors the
+     * Python adapter's _TRIGGER_AREA_* branch. */
+    if (inbound->type == NET_MESSAGE
+        && inbound->info.net_msg.function != NULL
+        && strncmp(inbound->info.net_msg.function, "trigger_area_", 13) == 0) {
+        const char *what = inbound->info.net_msg.function + 13;
+        json_t *spec = NULL;
+        if (net_msg_unpack_json(&inbound->info.net_msg, &spec) != 0 || !json_is_object(spec)) {
+            if (spec != NULL) json_decref(spec);
+            spec = json_object();
+        }
+        const char *area = json_string_value(json_object_get(spec, "area"));
+        const char *bucket = json_string_value(json_object_get(spec, "bucket"));
+        int trc = area != NULL ? 0 : -1;
+        if (trc == 0 && strcmp(what, "publish") == 0) {
+            _ic_app_verb(impl->proc, AT_APP_AREA_PUBLISH,
+                         json_pack("{s:s, s:s, s:s}", "ref", "pub", "area", area,
+                                   "bucket", bucket != NULL ? bucket : area),
+                         handle_area_app_publish);
+        } else if (trc == 0 && strcmp(what, "withdraw") == 0) {
+            _ic_app_verb(impl->proc, AT_APP_AREA_WITHDRAW,
+                         json_pack("{s:s, s:s}", "ref", "pub", "area", area),
+                         handle_area_app_withdraw);
+        } else if (trc == 0 && strcmp(what, "request") == 0) {
+            const char *hpid = json_string_value(json_object_get(spec, "holder"));
+            sce_participant_t *holder = hpid != NULL ? sce_find_participant(ctx, hpid) : NULL;
+            at_dir_signed_t card;
+            if (holder == NULL
+                || at_area_card_create(((ic_impl_t *)holder->impl)->full, area, area, "", 1, 0,
+                                       (double)time(NULL), &card) != AT_DIR_OK) {
+                trc = -1;
+            } else {
+                char hu[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(((ic_impl_t *)holder->impl)->full->uuid, hu);
+                _ic_app_verb(impl->proc, NET_ID_HUB_RESULT,
+                             json_pack("{s:s, s:[{s:o, s:s}], s:b}", "area", area, "cards",
+                                       "card", at_dir_to_wire(&card), "relay", "",
+                                       "limited", 0),
+                             handle_area_hub_result);
+                at_dir_free(&card);
+                _ic_app_verb(impl->proc, AT_APP_FC_REQUEST,
+                             json_pack("{s:s, s:s, s:s}", "ref", "ask", "area", area,
+                                       "peer_uuid", hu),
+                             handle_dir_app_request);
+            }
         } else {
             trc = -1;
         }

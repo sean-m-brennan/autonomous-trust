@@ -115,6 +115,7 @@ class _OutRequest:
     key: str
     handle: str
     deadline: float
+    area: str = ''
 
 
 @dataclass
@@ -123,6 +124,7 @@ class _InRequest:
     handle: str
     relays: tuple
     expiry: float
+    area: str = ''
 
 
 def _now(proc) -> float:
@@ -374,25 +376,50 @@ def _own_hints(proc):
     return [fc._own_relay_hint(proc, ep, pin) for ep, pin in _relay.own_relay_hints()]
 
 
+def _area_label(area) -> str:
+    """How an area request is named in a DirectoryEvent's ``handle``: the one
+    string field the app already shows for "found by"."""
+    return 'area:' + area
+
+
 def handle_app_request(proc, queues, message) -> bool:
     """Ask the holder of a handle we looked up to become our contact.
-    Payload: ``handle``, ``ref``."""
+    Payload: ``handle``, ``ref``; or, for someone an area lookup found
+    (identity/area_contact.py), ``area``, ``peer_uuid``, ``ref``."""
     if not is_local_app_verb(proc, message):
         return refuse_remote_app_verb(proc, message, APP_REQUEST)
     fc = _fc()
     req = fc._app_payload(message)
     ref = fc._app_ref(req)
-    handle = _dir.normalize_handle(req.get('handle'))
-    if ref is None or handle is None:
-        _emit(proc, queues, DirectoryEvent(EVENT_REFUSED, ref=ref or '', reason='bad_request'))
-        return True
-    found = proc._dir_found.get(handle)
-    if found is None or _now(proc) - found[2] > FOUND_TTL_SECONDS \
-            or found[0].is_expired(_now(proc)):
-        _emit(proc, queues, DirectoryEvent(EVENT_REFUSED, ref=ref, handle=handle,
-                                           reason='unknown_handle'))
-        return True
-    entry, relay, _t = found
+    area = ''
+    if 'area' in req:
+        from ..contacts.area_card import normalize_area
+        from . import area_contact
+        area = normalize_area(req.get('area')) or ''
+        if ref is None or not area:
+            _emit(proc, queues, DirectoryEvent(EVENT_REFUSED, ref=ref or '',
+                                               reason='bad_request'))
+            return True
+        handle = _area_label(area)
+        found = area_contact.found_card(proc, req.get('peer_uuid', ''), area)
+        if found is None:
+            _emit(proc, queues, DirectoryEvent(EVENT_REFUSED, ref=ref, handle=handle,
+                                               reason='unknown_handle'))
+            return True
+        entry, relay = found
+    else:
+        handle = _dir.normalize_handle(req.get('handle'))
+        if ref is None or handle is None:
+            _emit(proc, queues, DirectoryEvent(EVENT_REFUSED, ref=ref or '',
+                                               reason='bad_request'))
+            return True
+        found = proc._dir_found.get(handle)
+        if found is None or _now(proc) - found[2] > FOUND_TTL_SECONDS \
+                or found[0].is_expired(_now(proc)):
+            _emit(proc, queues, DirectoryEvent(EVENT_REFUSED, ref=ref, handle=handle,
+                                               reason='unknown_handle'))
+            return True
+        entry, relay, _t = found
     if entry.uuid == str(proc.identity.uuid).lower():
         _emit(proc, queues, DirectoryEvent(EVENT_REFUSED, ref=ref, handle=handle,
                                            reason='bad_request'))
@@ -416,7 +443,8 @@ def handle_app_request(proc, queues, message) -> bool:
     request = _dir.create_request(proc.identity, entry, relays=hints[:_dir.REQUEST_MAX_RELAYS],
                                   now=_now(proc))
     proc._dir_out[entry.uuid] = _OutRequest(ref=ref, nonce=request.nonce, key=entry.key,
-                                            handle=handle, deadline=float(request.expiry))
+                                            handle=handle, deadline=float(request.expiry),
+                                            area=area)
     fc._send_relay_route(proc, queues, holder.uuid, hints[:1])
     msg = Message(proc.name, IdentityProtocol.contact_request, request.to_json(),
                   to_whom=holder, from_whom=proc.identity, encrypt=False)
@@ -448,10 +476,19 @@ def handle_contact_request(proc, queues, message) -> bool:
     if request.to != me or request.sender == me:
         proc.logger.warning('directory: contact request not addressed to us; ignoring')
         return True
-    if request.handle not in _published_handles(proc):
+    if request.area is not None:
+        from . import area_contact
+        if request.area not in area_contact.listed_areas(proc):
+            proc.logger.warning('directory: contact request via area %s, where we are '
+                                'not listed; ignoring', request.area)
+            return True
+        found_by = _area_label(request.area)
+    elif request.handle not in _published_handles(proc):
         proc.logger.warning('directory: contact request for %s, which we do not '
                             'publish; ignoring', request.handle)
         return True
+    else:
+        found_by = request.handle
     store = fc._contacts_store(proc)
     if str(sender.uuid) in store:
         proc.logger.info('directory: %s asked again, but is already a contact',
@@ -462,15 +499,16 @@ def handle_contact_request(proc, queues, message) -> bool:
     for nonce in [n for n, r in held.items()
                   if r.expiry <= now or str(r.sender.uuid) == str(sender.uuid)]:
         del held[nonce]
-    held[request.nonce] = _InRequest(sender=sender, handle=request.handle,
+    held[request.nonce] = _InRequest(sender=sender, handle=found_by,
                                      relays=tuple(request.relays),
-                                     expiry=float(request.expiry))
+                                     expiry=float(request.expiry),
+                                     area=request.area or '')
     while len(held) > REQUESTS_IN_MAX:
         del held[next(iter(held))]
     proc.logger.info('directory: %s asks to become a contact (via %s)',
-                     sender.nickname, request.handle)
+                     sender.nickname, found_by)
     _emit(proc, queues, DirectoryEvent(EVENT_CONTACT_REQUEST, ref=request.nonce,
-                                       handle=request.handle, peer_uuid=str(sender.uuid),
+                                       handle=found_by, peer_uuid=str(sender.uuid),
                                        nickname=sender.nickname))
     return True
 
@@ -506,7 +544,10 @@ def handle_app_accept(proc, queues, message) -> bool:
     # The hello this invitation brings back reports under the request's ref,
     # and records a directory-provenance contact.
     fc._remember_minted(proc, invitation.nonce, ref)
-    proc._dir_invites.add(invitation.nonce)
+    if held.area:
+        proc._area_invites.add(invitation.nonce)
+    else:
+        proc._dir_invites.add(invitation.nonce)
     fc._send_relay_route(proc, queues, held.sender.uuid, list(held.relays))
     msg = Message(proc.name, IdentityProtocol.contact_accept,
                   to_json_string({'nonce': ref, 'invitation': invitation.encode()}),
@@ -566,7 +607,8 @@ def handle_contact_accept(proc, queues, message) -> bool:
                             'not its own, or has expired; ignoring', uuid[:8])
         return True
     del proc._dir_out[uuid]
-    fc.initiate(proc, queues, blob, ref=out.ref, provenance=Provenance.directory)
+    fc.initiate(proc, queues, blob, ref=out.ref,
+                provenance=Provenance.area if out.area else Provenance.directory)
     fc._emit(proc, queues, fc.FirstContactEvent(
         fc.EVENT_HELLO_SENT, ref=out.ref, peer_uuid=str(inviter.uuid),
         nickname=inviter.nickname, role='initiator'))

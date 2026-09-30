@@ -139,6 +139,10 @@ def handle_device_cert(proc, queues, message) -> bool:
     sender = message.from_whom
     if not isinstance(sender, Identity):
         return True
+    from . import sibling_sync
+    if sibling_sync.on_device_cert(proc, queues,
+                                   sender, _fc()._app_payload(message) or message.obj):
+        return True     # it answered a pair handshake
     store = _fc()._contacts_store(proc)
     contact = store.get(str(sender.uuid))
     if contact is None or contact.uuid != str(sender.uuid):
@@ -162,6 +166,7 @@ def handle_device_cert(proc, queues, message) -> bool:
             proc.logger.warning('could not persist contact for %s (%s)',
                                 contact.petname, err)
         proc.logger.info('first contact: learned the operator key of %s', contact.petname)
+        sibling_sync.push_changes(proc, queues)
     return True
 
 
@@ -170,17 +175,18 @@ def _own_hints(proc):
     return [fc._own_relay_hint(proc, ep, pin) for ep, pin in _relay.own_relay_hints()]
 
 
-def announce(proc, queues) -> int:
-    """Tell every device of every contact in our store that this node is one
-    of our operator's devices. Plaintext: they may not know this node yet.
-    Returns how many were sent (0 with no cert installed)."""
+def announce(proc, queues, contacts=None) -> int:
+    """Tell every device of every contact in our store (or of ``contacts``)
+    that this node is one of our operator's devices. Plaintext: they may not
+    know this node yet. Returns how many were sent (0 with no cert
+    installed)."""
     cert = own_cert(proc)
     if cert is None or CfgIds.network not in queues:
         return 0
     body = json.dumps({'cert': cert.to_wire(), 'relays': _own_hints(proc)[:_relay.MAX_RELAYS]})
     me = str(proc.identity.uuid)
     sent = 0
-    for contact in _fc()._contacts_store(proc).all():
+    for contact in _fc()._contacts_store(proc).all() if contacts is None else contacts:
         for ident in contact.identities():
             if str(ident.uuid) == me:
                 continue
@@ -221,6 +227,8 @@ def handle_device_announce(proc, queues, message) -> bool:
         store.save()
     except OSError as err:
         proc.logger.warning('could not persist contact for %s (%s)', contact.petname, err)
+    from . import sibling_sync
+    sibling_sync.push_changes(proc, queues)
     fc._admit_direct_peer(proc, queues, sender)
     relays = [str(h) for h in payload.get('relays') or [] if isinstance(h, str)]
     hints = fc._relay_hints(relays)

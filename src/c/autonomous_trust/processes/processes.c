@@ -527,11 +527,12 @@ int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
 {
     array_t unprocessed;
     array_init(&unprocessed);
+    generic_msg_t buf = {0};
     while (keep_running(proc, &ctx->sig_q, logger))
     {
         sleep_until(proc, cadence);
 
-        generic_msg_t buf = {0};
+        messaging_recv_release(&buf);   /* the previous pass's */
         int err = messaging_recv(&buf);
         if (err == -1) {
             log_debug(proc->logger, "%s: message receive error\n", proc->name);
@@ -568,11 +569,18 @@ int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
                 continue;
             }
             memcpy(msg, &buf.info, size);
+            /* The stashed copy owns the payload now: keep the release at the
+             * top of the next pass from freeing it under the stash. */
+            if (buf.type == NET_MESSAGE) {
+                buf.info.net_msg.function = NULL;
+                buf.info.net_msg.obj = NULL;
+            }
             data_t *m_dat = object_ptr_data(msg, size);
             array_append(&unprocessed, m_dat);
         }
         // Hook point for sub-process specific post-message activity (e.g. periodic tasks)
     }
+    messaging_recv_release(&buf);
     array_free(&unprocessed);
     array_free(queues);
     if (ctx->fd1 > 0)

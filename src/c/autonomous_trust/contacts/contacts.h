@@ -48,6 +48,11 @@
 #define AT_INVITATION_VERSION 1
 #define AT_INVITATION_TYPENAME "at-invitation"
 #define AT_INVITATION_URI_SCHEME "at+contact"
+/* The `purpose` of an invitation one's own old device shows a new one: redeem
+ * it to become its sibling (contacts/siblings.h), not its contact. Signed
+ * with the rest of the body; an ordinary invitation carries none. Python
+ * invitation.PURPOSE_PAIR. */
+#define AT_INVITATION_PURPOSE_PAIR "pair"
 
 /* Reputation seed applied on the verified transition. One notch above the
  * cold-start neutral (0.2) and well below the ~0.5 near-trusted band -- see
@@ -67,6 +72,8 @@ typedef enum {
     AT_PROV_IN_PERSON = 0,   /* QR/blob exchanged face-to-face: no MITM possible */
     AT_PROV_TOKEN = 1,       /* signed invite link/code over a remote channel */
     AT_PROV_DIRECTORY = 2,   /* resolved via an opt-in directory (Phase 3) */
+    AT_PROV_SIBLING = 3,     /* copied from another of this user's own devices (Phase 4) */
+    AT_PROV_AREA = 4,        /* found at an (opt-in) area hub */
 } at_provenance_t;
 
 const char *at_provenance_str(at_provenance_t p);
@@ -108,7 +115,20 @@ typedef struct {
     char operator_key[AT_OPERATOR_KEY_HEX_LEN + 1];
     at_contact_device_t *devices;     /* owned; devices_count of them */
     size_t devices_count;
+    /* When the user last changed this record in a way their other devices
+     * should copy (a rename, a device or operator link; contacts/sync.h).
+     * Adding and verifying are dated by added_at/verified_at already, so 0
+     * until the first such edit, and stored only once set. */
+    double updated_at;
 } contact_t;
+
+/** When @p c last changed for sync purposes: the latest of added_at,
+ *  verified_at and updated_at. */
+double contact_version(const contact_t *c);
+
+/** Date an edit the user's other devices should copy, at @p now (epoch
+ *  seconds; negative = the wall clock). Never moves the version back. */
+void contact_touch(contact_t *c, double now);
 
 /* Flip to verified, stamp verified_at, and seed the trust edge (idempotent). */
 void contact_mark_verified(contact_t *c, double seed);
@@ -154,6 +174,14 @@ int at_redeem_invitation(const char *blob, bool in_person, double now,
 int at_create_invitation(const identity_t *self,
                          const char *const *rendezvous, size_t n_rv,
                          long expiry, const char *nonce, char **blob_out);
+/* at_create_invitation with a `purpose` (AT_INVITATION_PURPOSE_PAIR); NULL or
+ * "" writes none. */
+int at_create_invitation_purpose(const identity_t *self,
+                                 const char *const *rendezvous, size_t n_rv,
+                                 long expiry, const char *nonce,
+                                 const char *purpose, char **blob_out);
+/* The invitation's purpose, "" when it has none. Borrowed from @p inv. */
+const char *at_invitation_purpose(const at_invitation_t *inv);
 
 /* --- Safety number (§4.4) ------------------------------------------------ */
 /* Symmetric 12-group safety number for the pair. Writes into `out`
@@ -178,10 +206,21 @@ int at_verify_contact(contact_t *c, const char *presented,
 #define AT_CONTACTS_VERSION 1
 #define AT_CONTACTS_FILENAME "contacts.cfg.json"
 
+/** A removed contact (Phase 4, contacts/sync.h): the removal the user's other
+ *  devices copy. Kept for good -- dropping one would let a device that was
+ *  away long enough bring the contact back. */
+typedef struct {
+    char uuid[UUID_STRING_LEN + 1];   /* lower case */
+    double at;                        /* when it was removed, epoch seconds */
+} at_tombstone_t;
+
 typedef struct {
     contact_t *items;   /* owned; each fully owned (deep) */
     size_t count;
     size_t cap;
+    at_tombstone_t *tombstones;   /* owned; stored only once there is one */
+    size_t tombstones_count;
+    size_t tombstones_cap;
 } contacts_t;
 
 void contacts_init(contacts_t *store);
@@ -189,14 +228,30 @@ void contacts_free(contacts_t *store);
 size_t contacts_count(const contacts_t *store);
 
 /* Add or replace, keyed by identity uuid. Deep-copies `c` into the store; the
- * caller keeps ownership of its own copy. */
+ * caller keeps ownership of its own copy. Adding a contact again undoes an
+ * earlier removal of it (drops its tombstone). */
 int contacts_add(contacts_t *store, const contact_t *c);
 /** The contact @p uuid belongs to: its first device, or any further one. */
 contact_t *contacts_get(contacts_t *store, const char *uuid);
 /** The contact whose operator key @p operator_key is, or NULL. */
 contact_t *contacts_by_operator(contacts_t *store, const char *operator_key);
 contact_t *contacts_by_petname(contacts_t *store, const char *petname);
+/** Drop the contact filed under @p uuid (its first device), with every
+ *  device it lists, leaving a tombstone dated now. */
 bool contacts_remove(contacts_t *store, const char *uuid);
+/** contacts_remove, the tombstone dated @p at (never older than the version
+ *  of what it removed, or an earlier tombstone of the same uuid). */
+bool contacts_remove_at(contacts_t *store, const char *uuid, double at);
+/** The contact filed under @p uuid as its FIRST device, or NULL (unlike
+ *  contacts_get, a further device does not count). */
+contact_t *contacts_get_first(contacts_t *store, const char *uuid);
+/** When @p uuid was removed, or a negative value if it was not. */
+double contacts_tombstone(const contacts_t *store, const char *uuid);
+/** Record that @p uuid was removed at @p at, keeping the later of it and any
+ *  tombstone already there. No contact is touched. 0, or -1 (no memory). */
+int contacts_set_tombstone(contacts_t *store, const char *uuid, double at);
+/** Whether @p v is a uuid in canonical lowercase text form. */
+bool at_is_lower_uuid(const char *v);
 
 /* Canonical (cross-runtime) JSON <-> struct. */
 int contact_to_json(const contact_t *c, json_t **obj_out);

@@ -27,6 +27,7 @@
 #include <jansson.h>
 #include <uuid/uuid.h>
 
+#include "at_first_contact.h"
 #include "contacts/contacts.h"
 #include "identity/identity.h"
 #include "network/net_relay.h"
@@ -58,5 +59,17 @@ void at_fc_emit_device_linked(const process_t *proc, const contact_t *c,
                               const uuid_t device);
 /** Tell the network to reach @p uuid through @p hints (relay:// hints). */
 void at_fc_send_route_hints(const uuid_t uuid, const char *const *hints, size_t n);
+/** A first-contact event (at_app_first_contact_t payload). */
+void at_fc_emit_event(const process_t *proc, int32_t kind, const char *ref,
+                      const public_identity_t *peer, at_fc_reason_t reason,
+                      at_fc_role_t role);
+/** An address-book event for @p c, with @p origin (AT_FC_ORIGIN_*). */
+void at_fc_emit_contact(const process_t *proc, int32_t kind, const char *ref,
+                        const contact_t *c, bool dropped, int32_t origin);
+/** A sibling event (at_app_contact_t payload): @p uuid, @p nickname and
+ *  @p added_at may be NULL / 0. */
+void at_fc_emit_sibling(const process_t *proc, int32_t kind, const char *ref,
+                        const char *uuid, const char *nickname, double added_at,
+                        bool dropped, int32_t count);
 
 #endif /* AUTONOMOUS_TRUST_IDENTITY_FC_SHARED_H */

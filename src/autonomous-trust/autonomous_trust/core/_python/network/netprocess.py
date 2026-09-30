@@ -45,6 +45,7 @@ from .message import Message, WireFormatMismatch
 from .ping_at import PingATServer, ping_at
 from . import relay as _relay
 from . import registry as _registry
+from . import hub as _hub
 
 
 class NetworkProtocol(Enum):
@@ -167,6 +168,9 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self.protocol.register_handler(Network.dir_publish, self.handle_dir_publish)
         self.protocol.register_handler(Network.dir_withdraw, self.handle_dir_withdraw)
         self.protocol.register_handler(Network.dir_lookup, self.handle_dir_lookup)
+        self.protocol.register_handler(Network.hub_publish, self.handle_hub_publish)
+        self.protocol.register_handler(Network.hub_withdraw, self.handle_hub_withdraw)
+        self.protocol.register_handler(Network.hub_lookup, self.handle_hub_lookup)
         # Rendezvous relays (network/relay.py). Built in process(), in the
         # child: sockets and threads do not survive the fork.
         self.relay_messages = deque()   # (frame, from_uuid, endpoint)
@@ -209,6 +213,13 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         self._own_entries = {}
         self.relay_dir = deque()
         self._dir_lookups = {}
+        # Area hubs (network/hub.py), the same shape: our own cards (area ->
+        # wire), refiled at every registration; hub answers as they arrive;
+        # and lookups in flight (area -> pending), answered to identity once
+        # every relay asked has answered, with every card any of them held.
+        self._own_cards = {}
+        self.relay_hub = deque()
+        self._hub_lookups = {}
         load_extensions(self, self.name)
         self.stop = False
         self.statistics = {}
@@ -641,6 +652,8 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     self.relay_records.append((rid, wire)),
                 on_dir=lambda frame, ep=endpoint:
                     self.relay_dir.append((ep, frame)),
+                on_hub=lambda frame, ep=endpoint:
+                    self.relay_hub.append((ep, frame)),
                 pin=self._relay_pins.get(endpoint),
                 distrusted=self._is_distrusted)
             self._relay_clients[endpoint] = client
@@ -687,6 +700,11 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     client.dir_publish(wire)
                 except (OSError, ConnectionError):
                     pass            # filed again at the next registration
+            for wire in list(self._own_cards.values()):
+                try:
+                    client.hub_publish(wire)
+                except (OSError, ConnectionError):
+                    pass            # filed again at the next registration
         pin = client.proven_pin if client is not None else None
         queues = self._relay_queues
         if pin is None or queues is None or CfgIds.identity not in queues \
@@ -716,10 +734,16 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                                   logger=self.logger)
                     self.logger.info('Registry: serving the directory (%d trusted '
                                      'issuer(s))', len(registry.issuers))
+                hub = None
+                if _hub.hub_enabled():
+                    hub = _hub.Hub(_hub.hub_areas(), distrusted=self._is_distrusted,
+                                   logger=self.logger)
+                    self.logger.info('Hub: serving area(s) %s',
+                                     ', '.join(hub.areas) or '(none)')
                 self._relay_server = _relay.RelayServer(
                     self.myself.address or '0.0.0.0', _relay.relay_port(),
                     self.logger, identity=self.myself,
-                    distrusted=self._is_distrusted, registry=registry)
+                    distrusted=self._is_distrusted, registry=registry, hub=hub)
             except OSError as err:
                 self.logger.error('Relay: cannot serve on port %d (%s)',
                                   _relay.relay_port(), err)
@@ -1055,6 +1079,124 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                        if now - p['since'] > self.DIR_LOOKUP_TIMEOUT]:
             pending = self._dir_lookups.pop(handle)
             self._dir_answer(queues, handle, None, None, pending['limited'])
+
+    # -- area hubs (network/hub.py) ------------------------------------------
+    #: Seconds a lookup waits for its relays before answering with what came.
+    HUB_LOOKUP_TIMEOUT = 10.0
+
+    def handle_hub_publish(self, queues, message):
+        """Identity hands us our own area card: file it at each of our relays
+        now, and at every later registration. Local only."""
+        if not self._local_only(message, Network.hub_publish):
+            return True
+        wire = self._payload(message).get('card')
+        try:
+            from ..contacts.area_card import AreaCard
+            area = AreaCard.from_wire(wire).area
+        except ValueError:
+            self.logger.warning('hub_publish: unusable card')
+            return True
+        if not isinstance(area, str):
+            return True
+        self._own_cards[area] = wire
+        for _ep, client in self._own_registry_clients():
+            try:
+                client.hub_publish(wire)
+            except (OSError, ConnectionError):
+                pass
+        return True
+
+    def handle_hub_withdraw(self, queues, message):
+        if not self._local_only(message, Network.hub_withdraw):
+            return True
+        area = str(self._payload(message).get('area', ''))
+        self._own_cards.pop(area, None)
+        for _ep, client in self._own_registry_clients():
+            try:
+                client.hub_withdraw(area)
+            except (OSError, ConnectionError):
+                pass
+        return True
+
+    def handle_hub_lookup(self, queues, message):
+        """Ask every relay we are registered at who is listed in ``area``.
+        Local only."""
+        if not self._local_only(message, Network.hub_lookup):
+            return True
+        from ..contacts.area_card import normalize_area
+        area = normalize_area(self._payload(message).get('area'))
+        if area is None:
+            self._hub_answer(queues, str(self._payload(message).get('area', '')), [], False)
+            return True
+        if area in self._hub_lookups:
+            return True             # one in flight answers every asker
+        asked = set()
+        for endpoint, client in list(self._relay_clients.items()):
+            if client.connected:
+                try:
+                    client.hub_lookup(area)
+                    asked.add(endpoint)
+                except (OSError, ConnectionError):
+                    pass
+        if not asked:
+            self._hub_answer(queues, area, [], False)
+            return True
+        self._hub_lookups[area] = {'asked': asked, 'answered': set(), 'cards': [],
+                                   'limited': False, 'since': time.monotonic()}
+        return True
+
+    def _hub_answer(self, queues, area, cards, limited):
+        if CfgIds.identity not in queues:
+            return
+        body = {'area': area, 'cards': cards, 'limited': bool(limited)}
+        msg = Message(CfgIds.identity, IdentityProtocol.hub_result, json.dumps(body),
+                      to_whom=None, from_whom=None)
+        try:
+            queues[CfgIds.identity].put(msg, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.warning('Hub: identity queue full; answer for %s dropped', area)
+
+    def _drain_relay_hub(self, queues):
+        """Hub answers -> identity: a lookup's one outcome, and a hub's word
+        on our publish or withdraw. A relay that is no hub answers
+        ``not_hub``, which counts as an empty answer to a lookup and is not
+        reported for a publish."""
+        while self.relay_hub:
+            endpoint, frame = self.relay_hub.popleft()
+            op = frame.get('op')
+            area = str(frame.get('area', ''))
+            pending = self._hub_lookups.get(area)
+            if pending is not None and endpoint in pending['asked'] \
+                    and endpoint not in pending['answered'] \
+                    and (op in ('hub_cards', 'hub_limited') or (
+                        op == 'hub_refused' and frame.get('reason') == 'not_hub')):
+                pending['answered'].add(endpoint)
+                pending['limited'] |= op == 'hub_limited'
+                if op == 'hub_cards' and isinstance(frame.get('cards'), list):
+                    relay = '%s:%d' % endpoint
+                    pending['cards'].extend({'card': c, 'relay': relay}
+                                            for c in frame['cards'][:_hub.LOOKUP_MAX]
+                                            if isinstance(c, dict))
+                if pending['answered'] >= pending['asked']:
+                    del self._hub_lookups[area]
+                    self._hub_answer(queues, area, pending['cards'], pending['limited'])
+                continue
+            if op in ('hub_published', 'hub_refused', 'hub_withdrawn') \
+                    and frame.get('reason') != 'not_hub' and CfgIds.identity in queues:
+                body = {'op': op, 'area': area, 'relay': '%s:%d' % endpoint,
+                        'reason': str(frame.get('reason', '') or ''),
+                        'seq': frame.get('seq', 0) if isinstance(frame.get('seq'), int) else 0}
+                msg = Message(CfgIds.identity, IdentityProtocol.hub_status,
+                              json.dumps(body), to_whom=None, from_whom=None)
+                try:
+                    queues[CfgIds.identity].put(msg, block=True, timeout=self.q_cadence)
+                except Full:
+                    pass
+        now = time.monotonic()
+        for area in [a for a, p in self._hub_lookups.items()
+                     if now - p['since'] > self.HUB_LOOKUP_TIMEOUT]:
+            pending = self._hub_lookups.pop(area)
+            self._hub_answer(queues, area, pending['cards'], pending['limited'])
 
     #: Seconds between lookups of one peer's reachability record.
     REACH_LOOKUP_INTERVAL = 60.0
@@ -1612,6 +1754,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 self._retry_refused_relayed()
                 self._drain_relay_records(queues)
                 self._drain_relay_dir(queues)
+                self._drain_relay_hub(queues)
                 if self.diplomat:
                     if self.ping_at_server is None:
                         self.ping_at_server = PingATServer(self.net_cfg.ip4, self.logger)

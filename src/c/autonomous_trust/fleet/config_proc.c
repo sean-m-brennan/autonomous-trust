@@ -103,7 +103,9 @@ static int send_to_peer(const process_t *proc, const char *function,
     memcpy(&msg.info.net_msg.to_whom, peer, sizeof(public_identity_t));
     strncpy(msg.info.net_msg.return_to, "config", PROC_NAME_LEN);
     net_msg_pack_json(&msg.info.net_msg, payload);
-    return messaging_send("network", NET_MESSAGE, &msg, false);
+    int rc = messaging_send("network", NET_MESSAGE, &msg, false);
+    net_msg_free_obj(&msg.info.net_msg);
+    return rc;
 }
 
 /****************************
@@ -495,6 +497,7 @@ static bool handle_config_accepted(const process_t *proc, directory_t *queues, g
             net_msg_pack_json(anmsg, fetch_req);
             json_decref(fetch_req);
             messaging_send("network", NET_MESSAGE, &artifact_msg, false);
+            net_msg_free_obj(anmsg);
 
             log_info(proc->logger, "Config: triggered artifact fetch for %s\n", artifact_hash_hex);
         }
@@ -682,6 +685,7 @@ static bool handle_config_artifact_ready(const process_t *proc, directory_t *que
     json_decref(ready_json);
 
     messaging_send("update", NET_MESSAGE, &ready_msg, false);
+    net_msg_free_obj(rnmsg);
 
     log_info(proc->logger, "Config: sent CONFIG_READY for %s to update process\n", config_name);
 

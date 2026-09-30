@@ -154,6 +154,7 @@ int fleet_propose_update(const uint8_t *artifact_hash, const char *version,
     json_decref(prop_json);
 
     int rc = messaging_send("fleet", NET_MESSAGE, &msg, false);
+    net_msg_free_obj(nmsg);
     if (rc != 0)
     {
         if (logger)

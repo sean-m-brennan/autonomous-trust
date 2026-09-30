@@ -331,11 +331,7 @@ static void free_receiver(process_t *proc, identity_t *self)
 /* Release the payload net_msg_pack_json attached to a crafted message. */
 static void free_crafted(generic_msg_t *msg)
 {
-    if (msg->info.net_msg.obj != NULL) {
-        smrt_deref(msg->info.net_msg.obj);
-        msg->info.net_msg.obj = NULL;
-        msg->info.net_msg.len = 0;
-    }
+    net_msg_free_obj(&msg->info.net_msg);
 }
 
 /* A queue directory naming "network", which _announce_identity requires

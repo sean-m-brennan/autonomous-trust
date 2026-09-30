@@ -427,11 +427,11 @@
       /* ---- Narration captions -------------------------------------------
          Restored from the silent cut and anchored to the measured word onsets
          of the clips that carry the same idea (whisper base.en word timings):
-           cap-mesh   10.27s  "No policy server to call. No certificate ..."
-           cap-human  26.31s  "No operator approved that."
-           cap-tiers  34.83s  "It is a dial re-earned continuously."
+           cap-mesh   12.08s  "No policy server to call. No certificate ..."
+           cap-human  33.56s  "No operator necessary."
+           cap-tiers  44.84s  "It is a dial, and every peer's position ..."
          Each one clears before the next element claims its space: the sensor
-         strip returns at 14.20, scene 5 at 28.40, the lockup dim at 37.64. */
+         strip returns at 18.94, scene 5 at 36.01, the lockup dim at 50.16. */
       .caption {
         position: absolute;
         left: 60px;
@@ -492,24 +492,24 @@
   </head>
   <body>
     <!-- Narrated cut. Total length is set by the seven measured Kokoro clips
-         (37.61s of speech + ~0.65s of breathing room between lines), not by the
+         (50.33s of speech + ~0.65s of breathing room between lines), not by the
          default 15-25s law — see composition-brief.md for the carve-out. -->
     <div
       id="root"
       data-composition-id="main"
       data-start="0"
-      data-duration="44"
+      data-duration="56.7"
       data-width="1920"
       data-height="1080"
     >
       <!-- Scene 1 — Hook -->
-      <section id="hook" class="clip" data-start="0" data-duration="7.5" data-track-index="0">
+      <section id="hook" class="clip" data-start="0" data-duration="8.59" data-track-index="0">
         <div id="hook-slug">Multi-agency · Hurricane Helene · Wilmington NC</div>
         <h1 id="hook-line">One of these sensors is lying.</h1>
       </section>
 
       <!-- Scenes 2-6 — the live dashboard, continuous -->
-      <section id="dash" class="clip" data-start="7.3" data-duration="36.7" data-track-index="1">
+      <section id="dash" class="clip" data-start="8.39" data-duration="48.31" data-track-index="1">
         <div id="dash-inner">
           <div class="topbar">
             <span class="brand">AutonomousTrust</span>
@@ -598,9 +598,9 @@
       </section>
 
       <!-- Scene 7 — Lockup -->
-      <section id="lockup" class="clip" data-start="37.6" data-duration="6.4" data-track-index="2">
+      <section id="lockup" class="clip" data-start="50.12" data-duration="6.58" data-track-index="2">
         <div id="wordmark">AutonomousTrust</div>
-        <div id="wordmark-sub">Trust as a live value</div>
+        <div id="wordmark-sub">For dynamically cooperative machines.</div>
         <div id="music-credit">
           Music: “Beauty Flow” by Kevin MacLeod (incompetech.com) · CC BY 4.0
         </div>
@@ -615,46 +615,48 @@
         id="bgm"
         src="assets/music/beauty-flow-by-kevin-macleod.mp3"
         data-start="0"
-        data-duration="44"
+        data-duration="56.7"
         data-track-index="10"
         data-volume="1"
       ></audio>
 
       <!-- Narration. Seven Kokoro clips (am_michael @ 0.96), own tracks, gain 1.
            Every scene boundary below is derived from these measured durations. -->
-      <audio id="vo-1" src="assets/voice/vo-1-hook.wav" data-start="1.00" data-duration="5.715" data-track-index="20" data-volume="1"></audio>
-      <audio id="vo-2" src="assets/voice/vo-2-mesh.wav" data-start="7.64" data-duration="6.604" data-track-index="21" data-volume="1"></audio>
-      <audio id="vo-3" src="assets/voice/vo-3-divergence.wav" data-start="14.92" data-duration="6.370" data-track-index="22" data-volume="1"></audio>
-      <audio id="vo-4" src="assets/voice/vo-4-exclusion.wav" data-start="21.95" data-duration="5.905" data-track-index="23" data-volume="1"></audio>
-      <audio id="vo-5" src="assets/voice/vo-5-rejoin.wav" data-start="28.50" data-duration="3.284" data-track-index="24" data-volume="1"></audio>
-      <audio id="vo-6" src="assets/voice/vo-6-gradient.wav" data-start="32.40" data-duration="4.780" data-track-index="25" data-volume="1"></audio>
-      <audio id="vo-7" src="assets/voice/vo-7-lockup.wav" data-start="37.90" data-duration="4.956" data-track-index="26" data-volume="1"></audio>
+      <audio id="vo-1" src="assets/voice/vo-1-hook.wav" data-start="1.00" data-duration="6.805" data-track-index="20" data-volume="1"></audio>
+      <audio id="vo-2" src="assets/voice/vo-2-mesh.wav" data-start="8.73" data-duration="10.261" data-track-index="21" data-volume="1"></audio>
+      <audio id="vo-3" src="assets/voice/vo-3-divergence.wav" data-start="19.67" data-duration="8.661" data-track-index="22" data-volume="1"></audio>
+      <audio id="vo-4" src="assets/voice/vo-4-exclusion.wav" data-start="28.99" data-duration="6.379" data-track-index="23" data-volume="1"></audio>
+      <audio id="vo-5" src="assets/voice/vo-5-rejoin.wav" data-start="36.01" data-duration="5.035" data-track-index="24" data-volume="1"></audio>
+      <audio id="vo-6" src="assets/voice/vo-6-gradient.wav" data-start="41.66" data-duration="8.043" data-track-index="25" data-volume="1"></audio>
+      <audio id="vo-7" src="assets/voice/vo-7-lockup.wav" data-start="50.42" data-duration="5.141" data-track-index="26" data-volume="1"></audio>
 
       <!-- Peer arrivals, one per beat (beat grid at 107.67 BPM). Quieter than
-           the silent cut: these sit underneath narration. -->
-      <audio id="sfx-node-1" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="8.19" data-track-index="11" data-volume="0.22"></audio>
-      <audio id="sfx-node-2" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="8.74" data-track-index="11" data-volume="0.22"></audio>
-      <audio id="sfx-node-3" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="9.29" data-track-index="11" data-volume="0.22"></audio>
-      <audio id="sfx-node-4" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="9.83" data-track-index="11" data-volume="0.22"></audio>
-      <audio id="sfx-node-5" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="10.37" data-track-index="11" data-volume="0.22"></audio>
-      <audio id="sfx-node-6" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="10.93" data-track-index="11" data-volume="0.22"></audio>
-      <audio id="sfx-node-7" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="11.46" data-track-index="11" data-volume="0.22"></audio>
-      <audio id="sfx-node-8" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="12.02" data-track-index="11" data-volume="0.22"></audio>
+           the silent cut: these sit underneath narration. Every sfx start below
+           equals the timeline constant it accompanies (ARRIVE, T_VANISH, T_EPA,
+           T_TIER, T_WORDMARK); keep them in step if those move. -->
+      <audio id="sfx-node-1" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="9.47" data-track-index="11" data-volume="0.22"></audio>
+      <audio id="sfx-node-2" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="10.03" data-track-index="11" data-volume="0.22"></audio>
+      <audio id="sfx-node-3" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="10.58" data-track-index="11" data-volume="0.22"></audio>
+      <audio id="sfx-node-4" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="11.14" data-track-index="11" data-volume="0.22"></audio>
+      <audio id="sfx-node-5" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="11.70" data-track-index="11" data-volume="0.22"></audio>
+      <audio id="sfx-node-6" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="12.25" data-track-index="11" data-volume="0.22"></audio>
+      <audio id="sfx-node-7" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="12.81" data-track-index="11" data-volume="0.22"></audio>
+      <audio id="sfx-node-8" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="13.36" data-track-index="11" data-volume="0.22"></audio>
 
       <!-- Event-log row clicks are dropped for the narrated cut: under speech
            they read as clutter. Nothing fires on the divergence either. -->
 
       <!-- The exclusion: one dry impact, nothing else. -->
-      <audio id="sfx-exclude" src="assets/sfx/impactSoft_heavy_002.ogg" data-duration="0.57" data-start="25.65" data-track-index="13" data-volume="0.45"></audio>
-      <audio id="sfx-epa" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="29.47" data-track-index="11" data-volume="0.22"></audio>
+      <audio id="sfx-exclude" src="assets/sfx/impactSoft_heavy_002.ogg" data-duration="0.57" data-start="32.81" data-track-index="13" data-volume="0.45"></audio>
+      <audio id="sfx-epa" src="assets/sfx/rollover2.ogg" data-duration="0.06" data-start="37.25" data-track-index="11" data-volume="0.22"></audio>
 
       <!-- Tier cards on alternating beats. -->
-      <audio id="sfx-tier-1" src="assets/sfx/bong_001.ogg" data-duration="0.12" data-start="32.74" data-track-index="14" data-volume="0.20"></audio>
-      <audio id="sfx-tier-2" src="assets/sfx/bong_001.ogg" data-duration="0.12" data-start="33.83" data-track-index="14" data-volume="0.20"></audio>
-      <audio id="sfx-tier-3" src="assets/sfx/bong_001.ogg" data-duration="0.12" data-start="34.92" data-track-index="14" data-volume="0.20"></audio>
-      <audio id="sfx-tier-4" src="assets/sfx/bong_001.ogg" data-duration="0.12" data-start="36.01" data-track-index="14" data-volume="0.20"></audio>
+      <audio id="sfx-tier-1" src="assets/sfx/bong_001.ogg" data-duration="0.12" data-start="42.81" data-track-index="14" data-volume="0.20"></audio>
+      <audio id="sfx-tier-2" src="assets/sfx/bong_001.ogg" data-duration="0.12" data-start="43.92" data-track-index="14" data-volume="0.20"></audio>
+      <audio id="sfx-tier-3" src="assets/sfx/bong_001.ogg" data-duration="0.12" data-start="45.03" data-track-index="14" data-volume="0.20"></audio>
+      <audio id="sfx-tier-4" src="assets/sfx/bong_001.ogg" data-duration="0.12" data-start="46.14" data-track-index="14" data-volume="0.20"></audio>
 
-      <audio id="sfx-lockup" src="assets/sfx/impactSoft_medium_001.ogg" data-duration="0.18" data-start="38.20" data-track-index="15" data-volume="0.28"></audio>
+      <audio id="sfx-lockup" src="assets/sfx/impactSoft_medium_001.ogg" data-duration="0.18" data-start="51.14" data-track-index="15" data-volume="0.28"></audio>
     </div>
 
     <script>
@@ -715,13 +717,13 @@
          ducking below is generated from this table rather than hand-written.
          ------------------------------------------------------------------ */
       var VO = [
-        { id: "#vo-1", start: 1.0, dur: 5.715, gapAfter: 0.3 },
-        { id: "#vo-2", start: 7.64, dur: 6.604, gapAfter: 0.3 },
-        { id: "#vo-3", start: 14.92, dur: 6.37, gapAfter: 0.28 },
-        { id: "#vo-4", start: 21.95, dur: 5.905, gapAfter: 0.22 },
-        { id: "#vo-5", start: 28.5, dur: 3.284, gapAfter: 0.3 },
-        { id: "#vo-6", start: 32.4, dur: 4.78, gapAfter: 0.3 },
-        { id: "#vo-7", start: 37.9, dur: 4.956, gapAfter: 0.0 },
+        { id: "#vo-1", start: 1.0, dur: 6.805, gapAfter: 0.3 },
+        { id: "#vo-2", start: 8.73, dur: 10.261, gapAfter: 0.3 },
+        { id: "#vo-3", start: 19.67, dur: 8.661, gapAfter: 0.28 },
+        { id: "#vo-4", start: 28.99, dur: 6.379, gapAfter: 0.22 },
+        { id: "#vo-5", start: 36.01, dur: 5.035, gapAfter: 0.3 },
+        { id: "#vo-6", start: 41.66, dur: 8.043, gapAfter: 0.3 },
+        { id: "#vo-7", start: 50.42, dur: 5.141, gapAfter: 0.0 },
       ];
 
       /* Beat grid at 107.67 BPM, from the track's cue preset (regenerate with
@@ -730,18 +732,18 @@
          natural gap or under a word the visual is meeting anyway, so each value
          below is the grid point nearest the narration moment, never the other
          way round. */
-      var ARRIVE = [8.36, 8.92, 9.47, 10.03, 10.59, 11.15, 11.69, 12.25]; // beat-grid
-      var T_DIVERGE = 17.53; // beat-locked: strong cue 17.53s (intensity 0.97)
-      var T_REP_START = 22.8; // beat-grid; the hit it feeds is T_CROSS, not this
-      var T_REP_DUR = 2.05; /* tuned so power2.in crosses 0.35 exactly on 24.47 */
-      var T_CROSS = 24.47; // beat-locked: strong cue 24.47s (intensity 1.00)
-      var T_VANISH = 25.59; // beat-grid (no strong cue lands on the word)
-      var T_EPA = 29.47;
-      var T_TIER = [32.81, 33.91, 35.04, 36.14]; // beat-grid, alternating beats
-      var T_WORDMARK = 38.36; // beat-grid (nearest strong cue falls before vo-7)
-      var T_WORDSUB = 40.59; // beat-grid
-      var T_CREDIT = 41.7; // beat-grid; music attribution, holds to T_END
-      var T_END = 44.0;
+      var ARRIVE = [9.47, 10.03, 10.58, 11.14, 11.7, 12.25, 12.81, 13.36]; // beat-grid
+      var T_DIVERGE = 21.7; // beat-locked: strong cue 21.70s (intensity 0.88)
+      var T_REP_START = 30.03; // beat-grid; the hit it feeds is T_CROSS, not this
+      var T_REP_DUR = 2.384; /* tuned so power2.in crosses 0.35 exactly on 31.97 */
+      var T_CROSS = 31.97; // beat-locked: strong cue 31.97s (intensity 0.88)
+      var T_VANISH = 32.81; // beat-grid (no strong cue lands on the word)
+      var T_EPA = 37.25; // beat-grid
+      var T_TIER = [42.81, 43.92, 45.03, 46.14]; // beat-grid, alternating beats
+      var T_WORDMARK = 51.14; // beat-grid
+      var T_WORDSUB = 53.36; // beat-grid
+      var T_CREDIT = 54.47; // beat-grid; music attribution, holds to T_END
+      var T_END = 56.7;
 
       var svg = document.getElementById("graph-svg");
       var edgeEls = [];
@@ -820,11 +822,11 @@
          narration.
          ------------------------------------------------------------------ */
       var EVENTS = [
-        { t: 8.74, time: "T+0:00", kind: "info", text: "NOAA, USGS and FEMA peers discover each other" },
-        { t: 10.93, time: "T+1:00", kind: "data", text: "Trust graph stabilizes — reputation reaches 0.7+" },
-        { t: 13.11, time: "T+2:30", kind: "data", text: "Weather and seismic data streams activated" },
-        { t: 15.84, time: "T+4:00", kind: "warning", text: "noaa-sensor-3 begins sending falsified readings" },
-        { t: 19.1, time: "T+4:30", kind: "warning", text: "Anomaly detected: noaa-sensor-3 temperature diverges" },
+        { t: 10.12, time: "T+0:00", kind: "info", text: "NOAA, USGS and FEMA peers discover each other" },
+        { t: 12.78, time: "T+1:00", kind: "data", text: "Trust graph stabilizes — reputation reaches 0.7+" },
+        { t: 15.22, time: "T+2:30", kind: "data", text: "Weather and seismic data streams activated" },
+        { t: 20.59, time: "T+4:00", kind: "warning", text: "noaa-sensor-3 begins sending falsified readings" },
+        { t: 25.59, time: "T+4:30", kind: "warning", text: "Anomaly detected: noaa-sensor-3 temperature diverges" },
         { t: T_VANISH, time: "T+5:00", kind: "threat", text: "noaa-sensor-3 excluded: reputation collapsed below threshold" },
         { t: T_EPA, time: "T+6:00", kind: "success", text: "epa-monitor-1 joins the network" },
       ];
@@ -914,19 +916,19 @@
          ------------------------------------------------------------------ */
       var tl = gsap.timeline({ paused: true });
 
-      /* --- Scene 1: hook — holds through VO 1 (1.00 → 6.72) --- */
+      /* --- Scene 1: hook — holds through VO 1 (1.00 → 7.81) --- */
       tl.fromTo("#hook-slug", { opacity: 0, y: 14 }, { opacity: 1, y: 0, duration: 0.5, ease: "power2.out" }, 0.4);
       tl.fromTo("#hook-line", { opacity: 0, y: 28 }, { opacity: 1, y: 0, duration: 0.42, ease: "power3.out" }, 1.55);
-      tl.to("#hook-slug", { opacity: 0, duration: 0.35 }, 6.95);
-      tl.to("#hook-line", { opacity: 0, duration: 0.35 }, 6.95);
+      tl.to("#hook-slug", { opacity: 0, duration: 0.35 }, 8.04);
+      tl.to("#hook-line", { opacity: 0, duration: 0.35 }, 8.04);
 
-      /* --- Scene 2: the dashboard assembles, under VO 2 (7.64 → 14.24) --- */
-      tl.fromTo("#dash-inner", { opacity: 0 }, { opacity: 1, duration: 0.45, ease: "power2.out" }, 7.3);
+      /* --- Scene 2: the dashboard assembles, under VO 2 (8.73 → 18.99) --- */
+      tl.fromTo("#dash-inner", { opacity: 0 }, { opacity: 1, duration: 0.45, ease: "power2.out" }, 8.39);
       tl.fromTo(
         ["#graph-panel", "#log-panel"],
         { opacity: 0, y: 22 },
         { opacity: 1, y: 0, duration: 0.5, stagger: 0.08, ease: "power2.out" },
-        7.4,
+        8.49,
       );
 
       /* Everything in the graph starts hidden; nothing here is a .clip. */
@@ -941,7 +943,7 @@
       tl.set("#cap-human", { opacity: 0 }, 0);
       tl.set("#cap-tiers", { opacity: 0 }, 0);
 
-      /* Peers arrive, one per beat. */ // beat-grid: 8.36, 8.92, 9.47, 10.03, 10.59, 11.15, 11.69, 12.25
+      /* Peers arrive, one per beat. */ // beat-grid: 9.47, 10.03, 10.58, 11.14, 11.70, 12.25, 12.81, 13.36
       for (var n = 0; n < 8; n++) {
         tl.fromTo(
           nodeEls[n].g,
@@ -975,9 +977,9 @@
         trustEl.textContent = trustObj.v.toFixed(2);
       }
 
-      tl.to(clockObj, { v: 7, duration: 22.5, ease: "none", onUpdate: writeClock }, 7.5);
-      tl.to(peersObj, { v: 8, duration: 3.83, ease: "none", onUpdate: writePeers }, ARRIVE[0]);
-      tl.to(trustObj, { v: 0.78, duration: 3.4, ease: "power1.out", onUpdate: writeTrust }, 8.4);
+      tl.to(clockObj, { v: 7, duration: 29.19, ease: "none", onUpdate: writeClock }, 8.59);
+      tl.to(peersObj, { v: 8, duration: 3.89, ease: "none", onUpdate: writePeers }, ARRIVE[0]);
+      tl.to(trustObj, { v: 0.78, duration: 3.4, ease: "power1.out", onUpdate: writeTrust }, 9.51);
 
       var phaseEl = document.getElementById("phase");
       function setPhase(label) {
@@ -985,11 +987,11 @@
           phaseEl.textContent = label;
         };
       }
-      tl.call(setPhase("Formation"), [], 7.5);
-      tl.call(setPhase("Bootstrap"), [], 10.93);
-      tl.call(setPhase("Data sharing"), [], 13.11);
-      tl.call(setPhase("Compromise"), [], 15.84);
-      tl.call(setPhase("Detection"), [], 19.1);
+      tl.call(setPhase("Formation"), [], 8.59);
+      tl.call(setPhase("Bootstrap"), [], 12.78);
+      tl.call(setPhase("Data sharing"), [], 15.22);
+      tl.call(setPhase("Compromise"), [], 20.59);
+      tl.call(setPhase("Detection"), [], 25.59);
       tl.call(setPhase("Exclusion"), [], T_REP_START);
       tl.call(setPhase("Integration"), [], T_EPA);
 
@@ -998,44 +1000,44 @@
         tl.fromTo(eventEls[ev], { opacity: 0, x: 18 }, { opacity: 1, x: 0, duration: 0.34, ease: "power2.out" }, EVENTS[ev].t);
       }
 
-      /* --- Scene 3: the divergence, under VO 3 (14.92 → 21.29) --- */
-      /* Caption on the VO-2 word onset "No policy server to call." (10.27s),
-         clear by 14.15 so the sensor strip comes up into empty space. */
-      tl.fromTo("#cap-mesh", { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.4, ease: "power2.out" }, 10.27);
-      tl.to("#cap-mesh", { opacity: 0, duration: 0.3 }, 13.85);
+      /* --- Scene 3: the divergence, under VO 3 (19.67 → 28.33) --- */
+      /* Caption on the VO-2 word onset "No policy server to call." (12.08s),
+         clear by 18.89 so the sensor strip comes up into empty space. */
+      tl.fromTo("#cap-mesh", { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.4, ease: "power2.out" }, 12.08);
+      tl.to("#cap-mesh", { opacity: 0, duration: 0.3 }, 18.59);
 
-      tl.fromTo("#strip-panel", { opacity: 0, y: 26 }, { opacity: 1, y: 0, duration: 0.42, ease: "power2.out" }, 14.2);
-      tl.fromTo("#chart-holder", { opacity: 0 }, { opacity: 1, duration: 0.25 }, 14.3);
-      tl.fromTo(legA, { strokeDasharray: 1, strokeDashoffset: 1 }, { strokeDashoffset: 0, duration: 1.3, ease: "none" }, 14.45);
-      /* beat-locked: strong cue 17.53s — the falsified trace peels away, landing
+      tl.fromTo("#strip-panel", { opacity: 0, y: 26 }, { opacity: 1, y: 0, duration: 0.42, ease: "power2.out" }, 18.94);
+      tl.fromTo("#chart-holder", { opacity: 0 }, { opacity: 1, duration: 0.25 }, 19.04);
+      tl.fromTo(legA, { strokeDasharray: 1, strokeDashoffset: 1 }, { strokeDashoffset: 0, duration: 1.3, ease: "none" }, 19.19);
+      /* beat-locked: strong cue 21.70s — the falsified trace peels away, landing
          on "temperatures that don't match its neighbors". */
       tl.fromTo(legB, { strokeDasharray: 1, strokeDashoffset: 1 }, { strokeDashoffset: 0, duration: 1.2, ease: "none" }, T_DIVERGE);
       tl.fromTo(legB[2], { strokeWidth: 3 }, { strokeWidth: 4.5, duration: 0.5, ease: "power2.out" }, T_DIVERGE + 0.7);
 
-      /* --- Scene 4: the exclusion, under VO 4 (21.95 → 27.86) --- */
-      tl.to("#chart-holder", { opacity: 0, duration: 0.3, ease: "power1.in" }, 21.3);
-      tl.to("#strip-panel", { opacity: 0, duration: 0.35, ease: "power1.in" }, 21.4);
+      /* --- Scene 4: the exclusion, under VO 4 (28.99 → 35.37) --- */
+      tl.to("#chart-holder", { opacity: 0, duration: 0.3, ease: "power1.in" }, 28.34);
+      tl.to("#strip-panel", { opacity: 0, duration: 0.35, ease: "power1.in" }, 28.44);
 
       /* Spotlight the compromised peer: everything else on the graph recedes, it
          does not. epa-monitor-1 is skipped for the same reason as its edges — it
          is still unarrived, and dimming it to 0.3 (then restoring it to 1 at
-         26.2) would put it on screen from 21.84 until its own entrance. */
+         33.44) would put it on screen from 28.88 until its own entrance. */
       var otherNodes = [];
       for (var on = 0; on < nodeEls.length; on++) {
         if (on !== COMPROMISED && on !== EPA) otherNodes.push(nodeEls[on].g);
       }
-      tl.to(otherNodes, { opacity: 0.3, duration: 0.7, ease: "power2.inOut" }, 21.84);
-      tl.to(survivingEdges, { opacity: 0.22, duration: 0.7, ease: "power2.inOut" }, 21.84);
+      tl.to(otherNodes, { opacity: 0.3, duration: 0.7, ease: "power2.inOut" }, 28.88);
+      tl.to(survivingEdges, { opacity: 0.22, duration: 0.7, ease: "power2.inOut" }, 28.88);
       tl.to(
         nodeEls[COMPROMISED].g,
         { scale: 1.3, svgOrigin: "350 480", duration: 0.9, ease: "power2.out" },
-        21.84,
+        28.88,
       );
 
-      tl.fromTo("#rep-card", { opacity: 0, y: 14 }, { opacity: 1, y: 0, duration: 0.35, ease: "power2.out" }, 22.37);
+      tl.fromTo("#rep-card", { opacity: 0, y: 14 }, { opacity: 1, y: 0, duration: 0.35, ease: "power2.out" }, 29.41);
 
       /* The count is tuned so power2.in carries 0.82 past Threshold 0.35 exactly
-         on the strong cue at 24.56 — which is also where the voice says
+         on the strong cue at 31.97 — which is also where the voice finishes
          "falls through the threshold". */
       var repObj = { v: 0.82 };
       var repEl = document.getElementById("rep-value");
@@ -1051,26 +1053,26 @@
         },
         T_REP_START,
       );
-      tl.to("#rep-value", { color: "#fbbf24", duration: 0.3 }, 23.7);
-      /* beat-locked: strong cue 24.47s — threshold crossed, edges go hostile */
+      tl.to("#rep-value", { color: "#fbbf24", duration: 0.3 }, 31.2);
+      /* beat-locked: strong cue 31.97s — threshold crossed, edges go hostile */
       tl.to("#rep-value", { color: "#ef4444", duration: 0.3 }, T_CROSS);
       tl.to(doomedEdges, { stroke: "#ef4444", strokeWidth: 3, duration: 0.35, ease: "power2.out" }, T_CROSS);
       tl.to(nodeEls[COMPROMISED].dot, { attr: { fill: "#ef4444", stroke: "#fca5a5", "stroke-width": 4 }, duration: 0.35 }, T_CROSS);
       tl.to(nodeEls[COMPROMISED].label, { attr: { fill: "#fca5a5" }, duration: 0.35 }, T_CROSS);
 
       /* Gone. */
-      /* beat-grid 25.59s — lands on "the network drops it" */
+      /* beat-grid 32.81s — lands on "the network drops it" */
       tl.to(doomedEdges, { opacity: 0, duration: 0.35, ease: "power2.in" }, T_VANISH);
       tl.to(nodeEls[COMPROMISED].g, { opacity: 0, scale: 0.55, svgOrigin: "350 480", duration: 0.4, ease: "power2.in" }, T_VANISH);
       tl.to("#rep-card", { opacity: 0, duration: 0.3 }, T_VANISH);
       tl.to(peersObj, { v: 7, duration: 0.3, ease: "none", onUpdate: writePeers }, T_VANISH);
       tl.to(trustObj, { v: 0.86, duration: 0.9, ease: "power1.out", onUpdate: writeTrust }, T_VANISH + 0.15);
 
-      /* Mesh comes back up while the voice finishes "That is the whole claim." */
-      tl.to(otherNodes, { opacity: 1, duration: 0.9, ease: "power2.inOut" }, 26.2);
-      tl.to(survivingEdges, { opacity: 1, duration: 0.9, ease: "power2.inOut" }, 26.2);
+      /* Mesh comes back up while the voice says "No operator necessary." */
+      tl.to(otherNodes, { opacity: 1, duration: 0.9, ease: "power2.inOut" }, 33.44);
+      tl.to(survivingEdges, { opacity: 1, duration: 0.9, ease: "power2.inOut" }, 33.44);
 
-      /* --- Scene 5: the re-entry, under VO 5 (28.50 → 31.78) --- */
+      /* --- Scene 5: the re-entry, under VO 5 (36.01 → 41.05) --- */
       tl.fromTo(
         nodeEls[EPA].g,
         { opacity: 0, scale: 0.4, svgOrigin: PEERS[EPA].x + " " + PEERS[EPA].y },
@@ -1086,19 +1088,19 @@
          is exactly what the voice is saying over this beat. */
       tl.to(trustObj, { v: 0.79, duration: 0.6, ease: "power1.out", onUpdate: writeTrust }, T_EPA + 0.1);
 
-      /* --- Scene 6: the access gradient, under VO 6 (32.40 → 37.18) --- */
+      /* --- Scene 6: the access gradient, under VO 6 (41.66 → 49.70) --- */
       tl.call(function () {
         document.getElementById("strip-header").innerHTML =
           'Access gradient <span class="panel-sub">— capability by trust tier</span>';
-      }, [], 32.05);
-      tl.fromTo("#strip-panel", { opacity: 0, y: 26 }, { opacity: 1, y: 0, duration: 0.4, ease: "power2.out" }, 32.19);
-      tl.to(["#graph-panel", "#log-panel"], { opacity: 0.35, duration: 0.6, ease: "power2.inOut" }, 32.19);
-      tl.fromTo("#tiers-holder", { opacity: 0 }, { opacity: 1, duration: 0.2 }, 32.3);
+      }, [], 41.31);
+      tl.fromTo("#strip-panel", { opacity: 0, y: 26 }, { opacity: 1, y: 0, duration: 0.4, ease: "power2.out" }, 41.45);
+      tl.to(["#graph-panel", "#log-panel"], { opacity: 0.35, duration: 0.6, ease: "power2.inOut" }, 41.45);
+      tl.fromTo("#tiers-holder", { opacity: 0 }, { opacity: 1, duration: 0.2 }, 41.56);
 
       var TIER_TINT = ["#1e2940", "#22303f", "#24413a", "#1f4a35"];
       var TIER_EDGE = ["#334155", "#3f5163", "#2f6b4d", "#2ca02c"];
       for (var t = 0; t < 4; t++) {
-        /* beat-grid: tier cards on alternating beats, ~1.09s apart — over the
+        /* beat-grid: tier cards on alternating beats, ~1.11s apart — over the
            ~0.8s reading floor for a two-word label. */
         tl.fromTo(
           "#tier-" + (t + 1),
@@ -1114,23 +1116,24 @@
         );
       }
 
-      /* Caption on the VO-4 word onset "No operator approved that." (26.31s),
-         clear by 28.35, just inside scene 4. */
-      tl.fromTo("#cap-human", { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.4, ease: "power2.out" }, 26.31);
-      tl.to("#cap-human", { opacity: 0, duration: 0.3 }, 28.05);
+      /* Caption on the VO-4 word onset "No operator necessary." (33.56s),
+         clear by 35.86, just inside scene 4. */
+      tl.fromTo("#cap-human", { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.4, ease: "power2.out" }, 33.56);
+      tl.to("#cap-human", { opacity: 0, duration: 0.3 }, 35.56);
 
-      /* Caption on the VO-6 word onset "It is a dial re-earned continuously."
-         (34.83s), clear by 37.55 before the dashboard dims for the lockup. */
-      tl.fromTo("#cap-tiers", { opacity: 0, y: 14 }, { opacity: 1, y: 0, duration: 0.35, ease: "power2.out" }, 34.83);
-      tl.to("#cap-tiers", { opacity: 0, duration: 0.3 }, 37.25);
+      /* Caption on the VO-6 word onset "It is a dial, and every peer's position
+         on it is re-earned continuously." (44.84s), clear by 50.07 before the
+         dashboard dims for the lockup. */
+      tl.fromTo("#cap-tiers", { opacity: 0, y: 14 }, { opacity: 1, y: 0, duration: 0.35, ease: "power2.out" }, 44.84);
+      tl.to("#cap-tiers", { opacity: 0, duration: 0.3 }, 49.77);
 
-      /* --- Scene 7: lockup, under VO 7 (37.90 → 42.86) --- */
-      tl.to("#dash-inner", { opacity: 0.22, duration: 0.55, ease: "power2.inOut" }, 37.64);
-      /* beat-grid 38.36s */
+      /* --- Scene 7: lockup, under VO 7 (50.42 → 55.56) --- */
+      tl.to("#dash-inner", { opacity: 0.22, duration: 0.55, ease: "power2.inOut" }, 50.16);
+      /* beat-grid 51.14s */
       tl.fromTo("#wordmark", { opacity: 0, y: 26 }, { opacity: 1, y: 0, duration: 0.45, ease: "power3.out" }, T_WORDMARK);
-      /* beat-grid 40.59s — the tagline the voice deliberately never says */
+      /* beat-grid 53.36s — the tagline the voice deliberately never says */
       tl.fromTo("#wordmark-sub", { opacity: 0, y: 16 }, { opacity: 1, y: 0, duration: 0.4, ease: "power2.out" }, T_WORDSUB);
-      /* beat-grid 41.70s — attribution settles last and stays up to T_END. */
+      /* beat-grid 54.47s — attribution settles last and stays up to T_END. */
       tl.fromTo("#music-credit", { opacity: 0 }, { opacity: 1, duration: 0.5, ease: "power2.out" }, T_CREDIT);
 
       /* ------------------------------------------------------------------

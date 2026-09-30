@@ -29,7 +29,7 @@ SR = 22050
 FPS = 30
 BANDS = 16
 # Video length plus a little margin; the composition never reads past T_END.
-DEFAULT_SECONDS = 44.3
+DEFAULT_SECONDS = 57.0
 # Log-spaced band edges: index 0 is bass, 15 is treble.
 BAND_LO, BAND_HI = 30.0, 10000.0
 

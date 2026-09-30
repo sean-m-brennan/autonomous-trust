@@ -36,9 +36,13 @@
 
 #include "contacts/contacts.h"
 #include "contacts/device.h"
+#include "contacts/siblings.h"
+#include "contacts/sync.h"
 #include "contacts/directory.h"
 #include "identity/identity_priv.h"   /* public_identity_from_json */
 #include "network/net_registry.h"
+#include "network/net_hub.h"
+#include "contacts/area_card.h"
 
 #define FAILF(...)                                                        \
     do {                                                                  \
@@ -342,6 +346,216 @@ static void _op_device(json_t *fx, json_t *exp, at_case_result_t *out)
     at_case_result_set_pass(out, 0);
 }
 
+/* -- live pairing: one address book across devices (Phase 4) -------------- */
+
+/* Numbers equal by value (1 == 1.0, as in Python), arrays element-wise,
+ * anything else by json_equal. */
+static bool _same(json_t *a, json_t *b)
+{
+    if (json_is_number(a) && json_is_number(b))
+        return fabs(json_number_value(a) - json_number_value(b)) < 1e-9;
+    if (json_is_array(a) && json_is_array(b)) {
+        if (json_array_size(a) != json_array_size(b))
+            return false;
+        for (size_t i = 0; i < json_array_size(a); i++)
+            if (!_same(json_array_get(a, i), json_array_get(b, i)))
+                return false;
+        return true;
+    }
+    return json_equal(a, b);
+}
+
+static const char *const _SYNC_FIELDS[] = {
+    "petname", "verified", "verified_at", "provenance", "trust_seed",
+    "reach_seq", "rendezvous", "updated_at", "operator_key", NULL};
+
+static bool _sync_field(const char *k)
+{
+    for (int i = 0; _SYNC_FIELDS[i] != NULL; i++)
+        if (strcmp(_SYNC_FIELDS[i], k) == 0)
+            return true;
+    return false;
+}
+
+/* Mirrors Python ContactsAdapter._sync. */
+static void _op_sync(json_t *fx, json_t *exp, at_case_result_t *out)
+{
+    char err[256] = "";
+    contacts_t store;
+    json_t *sj = json_object_get(fx, "store");
+    if (sj != NULL)
+        contacts_from_json(sj, &store);
+    else
+        contacts_init(&store);
+    double now = _dfield(fx, "now", 0.0);
+    json_t *exj = json_object_get(fx, "exclude");
+    size_t n_ex = json_array_size(exj);
+    const char **ex = calloc(n_ex ? n_ex : 1, sizeof(char *));
+    for (size_t i = 0; i < n_ex; i++)
+        ex[i] = json_string_value(json_array_get(exj, i));
+    json_t *payloads = json_object_get(fx, "payloads");
+    json_t *one = NULL;
+    if (payloads == NULL) {
+        one = json_array();
+        json_array_append(one, json_object_get(fx, "payload"));
+        payloads = one;
+    }
+    const char *status = "ok";
+    json_t *changes = json_array();
+    for (size_t p = 0; p < json_array_size(payloads); p++) {
+        at_sync_change_t *ch = NULL;
+        size_t n = 0;
+        if (at_sync_merge(&store, json_array_get(payloads, p), now, ex, n_ex, &ch, &n) != 0) {
+            status = "invalid";
+            break;
+        }
+        for (size_t i = 0; i < n; i++)
+            json_array_append_new(changes, json_pack("[s, s]", ch[i].uuid,
+                                                     at_sync_action_str(ch[i].action)));
+        free(ch);
+    }
+    json_decref(one);
+    free(ex);
+
+    const char *want = _sfield(exp, "sync_status");
+    if (want != NULL && strcmp(status, want) != 0)
+        snprintf(err, sizeof(err), "sync_status: got %s want %s", status, want);
+    json_t *wc = json_object_get(exp, "changes");
+    if (err[0] == '\0' && wc != NULL && !json_equal(wc, changes)) {
+        char *got = json_dumps(changes, JSON_COMPACT);
+        snprintf(err, sizeof(err), "changes %s", got != NULL ? got : "?");
+        free(got);
+    }
+    json_decref(changes);
+    const char *key;
+    json_t *w;
+    json_object_foreach(json_object_get(exp, "contacts"), key, w) {
+        if (err[0] != '\0')
+            break;
+        contact_t *c = contacts_get_first(&store, key);
+        if (json_is_null(w)) {
+            if (c != NULL)
+                snprintf(err, sizeof(err), "contact %s still here", key);
+            continue;
+        }
+        if (c == NULL) {
+            snprintf(err, sizeof(err), "no contact %s", key);
+            continue;
+        }
+        json_t *got = NULL;
+        contact_to_json(c, &got);
+        if (json_object_get(got, "updated_at") == NULL)
+            json_object_set_new(got, "updated_at", json_real(0.0));
+        if (json_object_get(got, "reach_seq") == NULL)
+            json_object_set_new(got, "reach_seq", json_integer(0));
+        if (json_object_get(got, "operator_key") == NULL)
+            json_object_set_new(got, "operator_key", json_string(""));
+        const char *k;
+        json_t *v;
+        json_object_foreach(w, k, v) {
+            if (!_sync_field(k)) {
+                snprintf(err, sizeof(err), "unknown field %s", k);
+                break;
+            }
+            if (!_same(json_object_get(got, k), v)) {
+                snprintf(err, sizeof(err), "%s.%s differs", key, k);
+                break;
+            }
+        }
+        json_decref(got);
+    }
+    if (err[0] == '\0')
+        _device_state(&store, exp, err, sizeof(err));
+    json_t *wt = json_object_get(exp, "tombstones");
+    if (err[0] == '\0' && wt != NULL) {
+        bool ok = json_object_size(wt) == store.tombstones_count;
+        for (size_t i = 0; ok && i < store.tombstones_count; i++) {
+            json_t *at = json_object_get(wt, store.tombstones[i].uuid);
+            ok = at != NULL && json_is_number(at)
+                 && fabs(json_number_value(at) - store.tombstones[i].at) < 1e-9;
+        }
+        if (!ok)
+            snprintf(err, sizeof(err), "tombstones differ (%zu here)", store.tombstones_count);
+    }
+    if (err[0] == '\0') {
+        json_t *a = NULL, *b = NULL;
+        contacts_t again;
+        contacts_init(&again);
+        if (contacts_to_json(&store, &a) != 0 || contacts_from_json(a, &again) != 0
+            || contacts_to_json(&again, &b) != 0 || !json_equal(a, b))
+            snprintf(err, sizeof(err), "store round trip");
+        json_decref(a);
+        json_decref(b);
+        contacts_free(&again);
+    }
+    contacts_free(&store);
+    if (err[0] != '\0')
+        FAILF("sync: %s", err);
+    at_case_result_set_pass(out, 0);
+}
+
+/* Mirrors Python ContactsAdapter._siblings. */
+static void _op_siblings(json_t *fx, json_t *exp, at_case_result_t *out)
+{
+    char err[256] = "";
+    const char *mode = _sfield(fx, "mode");
+    at_siblings_t sib;
+    at_siblings_from_json(json_object_get(fx, "siblings"), &sib);
+    const char *status = "ok";
+    if (mode != NULL && strcmp(mode, "add") == 0) {
+        public_identity_t ident;
+        memset(&ident, 0, sizeof(ident));
+        if (public_identity_from_json(json_object_get(fx, "identity"), &ident) != 0) {
+            snprintf(err, sizeof(err), "identity did not parse");
+        } else {
+            at_dir_signed_t cert, own;
+            memset(&cert, 0, sizeof(cert));
+            memset(&own, 0, sizeof(own));
+            json_t *ow = json_object_get(fx, "own_cert");
+            bool have_own = ow != NULL && at_dir_from_wire(ow, &own) == AT_DIR_OK;
+            int rc = at_dir_from_wire(json_object_get(fx, "cert"), &cert) != AT_DIR_OK
+                         ? (have_own && at_device_cert_verify(&own) == AT_DEVICE_OK
+                                ? AT_DEVICE_MALFORMED : AT_DEVICE_UNKNOWN_OPERATOR)
+                         : at_siblings_add(&sib, &ident, &cert, have_own ? &own : NULL);
+            status = _device_status(rc);
+            at_dir_free(&cert);
+            at_dir_free(&own);
+        }
+        free(ident.operator_key_binding);
+    } else if (mode == NULL || strcmp(mode, "load") != 0) {
+        snprintf(err, sizeof(err), "unknown siblings mode %s", mode != NULL ? mode : "?");
+    }
+    const char *want = _sfield(exp, "sibling_status");
+    if (err[0] == '\0' && want != NULL && strcmp(status, want) != 0)
+        snprintf(err, sizeof(err), "sibling_status: got %s want %s", status, want);
+    json_t *ws = json_object_get(exp, "siblings");
+    if (err[0] == '\0' && ws != NULL) {
+        bool ok = json_array_size(ws) == sib.count;
+        for (size_t i = 0; ok && i < sib.count; i++)
+            ok = strcmp(sib.devices[i].uuid, json_string_value(json_array_get(ws, i))) == 0;
+        if (!ok)
+            snprintf(err, sizeof(err), "siblings differ (%zu here)", sib.count);
+    }
+    const char *wo = _sfield(exp, "operator");
+    if (err[0] == '\0' && wo != NULL && strcmp(sib.operator_key, wo) != 0)
+        snprintf(err, sizeof(err), "operator %s", sib.operator_key);
+    if (err[0] == '\0') {
+        json_t *a = at_siblings_to_json(&sib), *b = NULL;
+        at_siblings_t again;
+        at_siblings_from_json(a, &again);
+        b = at_siblings_to_json(&again);
+        if (!json_equal(a, b))
+            snprintf(err, sizeof(err), "siblings round trip");
+        json_decref(a);
+        json_decref(b);
+        at_siblings_free(&again);
+    }
+    at_siblings_free(&sib);
+    if (err[0] != '\0')
+        FAILF("siblings: %s", err);
+    at_case_result_set_pass(out, 0);
+}
+
 /* -- the directory (FIRST_CONTACT_PLAN Phase 3) ---------------------------- */
 static const char *const _DIR_REASONS[] = {"ok", "malformed", "bad_signature", "expired",
                                            "untrusted", "mismatch"};
@@ -368,6 +582,8 @@ static void _op_dir_verify(json_t *fx, json_t *exp, at_case_result_t *out)
             rc = at_dir_attest_verify(&obj, tp, n_trusted, now);
         else if (strcmp(what, "request") == 0)
             rc = at_dir_request_verify(&obj, now);
+        else if (strcmp(what, "area_card") == 0)
+            rc = at_area_card_verify(&obj, now);
         else {
             at_dir_free(&obj);
             FAILF("dir_verify: unknown what %s", what);
@@ -397,6 +613,15 @@ static void _op_dir_verify(json_t *fx, json_t *exp, at_case_result_t *out)
         if (u != NULL && (got_u == NULL || strcasecmp(got_u, u) != 0)) {
             at_dir_free(&obj);
             FAILF("dir_verify: uuid mismatch");
+        }
+        const char *fields[] = {"area", "bucket"};
+        for (size_t f = 0; f < 2; f++) {
+            const char *w = _sfield(exp, fields[f]);
+            const char *g = json_string_value(json_object_get(obj.body, fields[f]));
+            if (w != NULL && (g == NULL || strcmp(g, w) != 0)) {
+                at_dir_free(&obj);
+                FAILF("dir_verify: %s mismatch", fields[f]);
+            }
         }
     }
     at_dir_free(&obj);
@@ -495,6 +720,87 @@ static void _op_registry(json_t *fx, json_t *exp, at_case_result_t *out)
         char *g = json_dumps(replies, JSON_COMPACT);
         char detail[256];
         snprintf(detail, sizeof(detail), "registry: replies %.200s", g ? g : "?");
+        free(g);
+        json_decref(replies);
+        at_case_result_set_fail(out, 0, "AssertionError", detail);
+        return;
+    }
+    json_decref(replies);
+    at_case_result_set_pass(out, 0);
+}
+
+/* Mirrors Python ContactsAdapter._hub. */
+static void _op_hub(json_t *fx, json_t *exp, at_case_result_t *out)
+{
+    json_t *ja = json_object_get(fx, "areas");
+    const char *areas[AT_HUB_MAX_AREAS];
+    size_t n = 0;
+    for (size_t i = 0; json_is_array(ja) && i < json_array_size(ja) && n < AT_HUB_MAX_AREAS; i++)
+        areas[n++] = json_string_value(json_array_get(ja, i));
+    json_t *rate = json_object_get(fx, "rate");
+    net_hub_t *hub = net_hub_new(areas, n, json_is_integer(rate) ? (int)json_integer_value(rate) : 10);
+    if (hub == NULL)
+        FAILF("hub: could not create");
+    g_reg_mono = 0.0;
+    g_reg_now = _dfield(fx, "now", 0.0);
+    g_reg_distrusted = json_object_get(fx, "distrusted");
+    net_hub_set_clocks(hub, _reg_mono, _reg_now);
+    net_hub_set_distrust(hub, _reg_distrust, NULL);
+    json_t *clients = json_object_get(fx, "clients");
+    json_t *calls = json_object_get(fx, "calls");
+    json_t *replies = json_array();
+    size_t i;
+    json_t *call;
+    json_array_foreach(calls, i, call) {
+        g_reg_mono += _dfield(call, "advance", 0.0);
+        json_t *who = json_object_get(clients, _sfield(call, "as"));
+        const char *uu = _sfield(who, "uuid"), *key = _sfield(who, "key");
+        const char *kind = _sfield(call, "call");
+        json_t *r = NULL;
+        if (uu == NULL || key == NULL || kind == NULL)
+            r = json_pack("{s:s}", "op", "bad_call");
+        else if (strcmp(kind, "publish") == 0)
+            r = net_hub_publish(hub, uu, key, json_object_get(call, "card"));
+        else if (strcmp(kind, "withdraw") == 0)
+            r = net_hub_withdraw(hub, uu, key, _sfield(call, "area"));
+        else
+            r = net_hub_lookup(hub, uu, _sfield(call, "area"));
+        json_t *got = json_object();
+        json_object_set(got, "op", json_object_get(r, "op"));
+        json_object_set_new(got, "area", json_string(_sfield(r, "area") ? _sfield(r, "area") : ""));
+        if (json_object_get(r, "reason") != NULL)
+            json_object_set(got, "reason", json_object_get(r, "reason"));
+        if (json_object_get(r, "seq") != NULL)
+            json_object_set(got, "seq", json_object_get(r, "seq"));
+        const char *op = _sfield(r, "op");
+        if (op != NULL && strcmp(op, "hub_cards") == 0) {
+            json_t *uuids = json_array();
+            size_t k;
+            json_t *c;
+            json_array_foreach(json_object_get(r, "cards"), k, c) {
+                at_dir_signed_t card;
+                if (at_dir_from_wire(c, &card) == AT_DIR_OK) {
+                    char low[UUID_STR_LEN + 1];
+                    snprintf(low, sizeof(low), "%s", at_dir_uuid(&card) ? at_dir_uuid(&card) : "");
+                    for (char *ch = low; *ch != '\0'; ch++)
+                        if (*ch >= 'A' && *ch <= 'Z')
+                            *ch = (char)(*ch + 32);
+                    json_array_append_new(uuids, json_string(low));
+                    at_dir_free(&card);
+                }
+            }
+            json_object_set_new(got, "cards", uuids);
+        }
+        json_array_append_new(replies, got);
+        json_decref(r);
+    }
+    net_hub_free(hub);
+    json_t *want = json_object_get(exp, "replies");
+    bool same = json_equal(replies, want);
+    if (!same) {
+        char *g = json_dumps(replies, JSON_COMPACT);
+        char detail[256];
+        snprintf(detail, sizeof(detail), "hub: replies %.200s", g ? g : "?");
         free(g);
         json_decref(replies);
         at_case_result_set_fail(out, 0, "AssertionError", detail);
@@ -621,8 +927,14 @@ void at_contacts_run(const at_case_t *c, at_case_result_t *out)
         _op_dir_normalize(fx, exp, out);
     else if (strcmp(op, "registry") == 0)
         _op_registry(fx, exp, out);
+    else if (strcmp(op, "hub") == 0)
+        _op_hub(fx, exp, out);
     else if (strcmp(op, "device") == 0)
         _op_device(fx, exp, out);
+    else if (strcmp(op, "sync") == 0)
+        _op_sync(fx, exp, out);
+    else if (strcmp(op, "siblings") == 0)
+        _op_siblings(fx, exp, out);
     else {
         char detail[160];
         snprintf(detail, sizeof(detail), "unknown contacts op %s", op);

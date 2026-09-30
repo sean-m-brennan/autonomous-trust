@@ -99,6 +99,15 @@ typedef struct {
     at_app_directory_t data;
 } fc_directory_msg_t;
 
+/** The area answers, a fourth app-bound type (kinds AT_APP_EVENT_AREA_* and
+ *  AT_APP_EVENT_ROSTER_*). */
+#define FIRST_CONTACT_AREA_EVENT ((message_type_t)(AT_MSG_TYPE_FC_MIN + 3))
+
+typedef struct {
+    int32_t kind;
+    at_app_area_t data;
+} fc_area_msg_t;
+
 /** Environment flag naming. The feature is opt-in; absent/empty means OFF.
  *  Mirrors Python first_contact._FLAG. */
 #define AT_FIRST_CONTACT_ENV "AT_FIRST_CONTACT"

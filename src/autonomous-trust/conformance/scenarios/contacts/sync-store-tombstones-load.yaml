@@ -1,0 +1,57 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: sync-store-tombstones-load
+description: "contacts.cfg.json keeps well-formed tombstones only: not a live contact's, not an uppercase uuid, not a negative or non-numeric time."
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: sync
+    now: 1800000000.0
+    store:
+      typename: contacts
+      version: 1
+      contacts:
+        eeeeeeee-0000-4000-8000-000000000001:
+          identity:
+            typename: identity
+            uuid: eeeeeeee-0000-4000-8000-000000000001
+            address: ''
+            nickname: bob
+            signature:
+              hex_seed: d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737
+            encryptor:
+              hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+          petname: bob-pet
+          verified: false
+          provenance: token
+          trust_seed: 0.0
+          rendezvous: []
+          nonce: ''
+          added_at: 1000.0
+          verified_at: 0.0
+      tombstones:
+        eeeeeeee-0000-4000-8000-000000000001: 1.0
+        eeeeeeee-0000-4000-8000-000000000002: 1950.0
+        EEEEEEEE-0000-4000-8000-000000000003: 1.0
+        eeeeeeee-0000-4000-8000-000000000004: -1
+        eeeeeeee-0000-4000-8000-000000000005: x
+    payloads: []
+steps:
+- id: 1
+  from: host
+  to: host
+  function: sync
+  description: 'trigger: sync'
+expected_state:
+  host:
+    changes: []
+    tombstones:
+      eeeeeeee-0000-4000-8000-000000000002: 1950.0
