@@ -339,6 +339,17 @@ void messaging_set_test_hook(messaging_test_hook_t hook)
     g_messaging_test_hook = hook;
 }
 
+void messaging_recv_release(generic_msg_t *msg)
+{
+    if (msg == NULL)
+        return;
+    if (msg->type == NET_MESSAGE) {
+        free(msg->info.net_msg.function);
+        free(msg->info.net_msg.obj);
+    }
+    memset(msg, 0, sizeof(*msg));
+}
+
 /* Frama-C: skipped — [syscall] mq_send POSIX message queue */
 int messaging_send(const char *key, const message_type_t type, generic_msg_t *msg, bool blocking)
 {

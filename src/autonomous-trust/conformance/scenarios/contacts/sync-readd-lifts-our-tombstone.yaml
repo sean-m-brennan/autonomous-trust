@@ -1,0 +1,61 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: sync-readd-lifts-our-tombstone
+description: We removed it; the sibling added it again later. It comes back, as a sibling contact, and our tombstone goes.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: sync
+    now: 1800000000.0
+    store:
+      typename: contacts
+      version: 1
+      contacts: {}
+      tombstones:
+        eeeeeeee-0000-4000-8000-000000000001: 1950.0
+    payload:
+      v: 1
+      typename: at-contacts-sync
+      contacts:
+        eeeeeeee-0000-4000-8000-000000000001:
+          identity:
+            typename: identity
+            uuid: eeeeeeee-0000-4000-8000-000000000001
+            address: ''
+            nickname: bob
+            signature:
+              hex_seed: d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737
+            encryptor:
+              hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+          petname: bob-pet
+          verified: false
+          provenance: in_person
+          trust_seed: 0.0
+          rendezvous: []
+          nonce: ''
+          added_at: 1990.0
+          verified_at: 0.0
+      tombstones: {}
+steps:
+- id: 1
+  from: host
+  to: host
+  function: sync
+  description: 'trigger: sync'
+expected_state:
+  host:
+    changes:
+    - - eeeeeeee-0000-4000-8000-000000000001
+      - added
+    contacts:
+      eeeeeeee-0000-4000-8000-000000000001:
+        provenance: sibling
+    tombstones: {}

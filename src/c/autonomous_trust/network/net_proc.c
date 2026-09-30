@@ -133,6 +133,7 @@ static void _net_signal_partition(net_thread_ctx_t *ctx, const char *from_addr)
         net_msg_pack_json(&sig.info.net_msg, body);
         json_decref(body);
         int rc = messaging_send("identity", NET_MESSAGE, &sig, false);
+        net_msg_free_obj(&sig.info.net_msg);
         if (rc != 0) {
             log_debug(ctx->logger,
                       "Network: partition_signal: messaging_send failed (%d)\n",
@@ -145,6 +146,8 @@ static void _net_signal_partition(net_thread_ctx_t *ctx, const char *from_addr)
 #include "structures/array.h"
 #include "net_relay.h"
 #include "net_registry.h"
+#include "net_hub.h"
+#include "contacts/area_card.h"
 #include "contacts/directory.h"
 
 DEFINE_ERROR(ENET_SEND, "Network send failed");
@@ -179,6 +182,13 @@ char NET_FN_DIR_LOOKUP[] = "dir_lookup";
  * publish or withdraw. Mirror: Python IdentityProtocol.dir_result / dir_status. */
 char NET_ID_DIR_RESULT[] = "dir_result";
 char NET_ID_DIR_STATUS[] = "dir_status";
+/* Area hubs (net_hub.h), the same shape. Mirror: Python Network.hub_* and
+ * IdentityProtocol.hub_result / hub_status. */
+char NET_FN_HUB_PUBLISH[] = "hub_publish";
+char NET_FN_HUB_WITHDRAW[] = "hub_withdraw";
+char NET_FN_HUB_LOOKUP[] = "hub_lookup";
+char NET_ID_HUB_RESULT[] = "hub_result";
+char NET_ID_HUB_STATUS[] = "hub_status";
 
 
 /****************************
@@ -1316,6 +1326,28 @@ static struct {
     size_t n_dir_answers;
     net_dir_lookup_t lookups[NET_DIR_MAX_LOOKUPS];
     net_relay_test_dir_fn test_dir;
+    /* Area hubs, the same shape: our own cards (area -> wire), refiled at
+     * every registration; hub answers from the readers; and lookups in
+     * flight, answered to identity once with every card any hub held.
+     * Mirrors Python NetworkProcess._own_cards / relay_hub / _hub_lookups. */
+    json_t *own_cards;
+    net_hub_t *hub;
+    struct {
+        net_relay_ep_t ep;
+        char *text;
+    } hub_answers[NET_RELAY_RECORD_QUEUE];
+    size_t n_hub_answers;
+    struct {
+        bool used;
+        char area[AT_AREA_MAX + 1];
+        net_relay_ep_t asked[NET_DIR_MAX_ASKED];
+        bool answered[NET_DIR_MAX_ASKED];
+        size_t n_asked;
+        bool limited;
+        json_t *cards;              /* [{card, relay}, ...] */
+        double since;
+    } hub_lookups[NET_HUB_MAX_LOOKUPS];
+    net_relay_test_hub_fn test_hub;
 } net_relay = { .lock = PTHREAD_MUTEX_INITIALIZER, .retry_sec = NET_RELAY_RETRY_SEC };
 
 static bool _ep_eq(const net_relay_ep_t *a, const net_relay_ep_t *b)
@@ -1484,6 +1516,7 @@ void net_relay_drain_records(void)
         net_msg_pack_json(&msg.info.net_msg, wire);
         json_decref(wire);
         messaging_send("identity", NET_MESSAGE, &msg, false);
+        net_msg_free_obj(&msg.info.net_msg);
     }
 }
 
@@ -1555,6 +1588,7 @@ static net_relay_client_t *_relay_client(const net_relay_ep_t *ep)
             net_relay_client_set_distrust(c, _relay_distrust, NULL);
             net_relay_client_on_record(c, _relay_on_record, NULL);
             net_relay_client_on_dir(c, net_relay_dir_answer, NULL);
+            net_relay_client_on_hub(c, net_relay_hub_answer, NULL);
             for (size_t i = 0; i < net_relay.n_pins; i++)
                 if (_ep_eq(&net_relay.pins[i].ep, ep))
                     net_relay_client_set_pin(c, &net_relay.pins[i].pin);
@@ -1647,6 +1681,14 @@ static void _relay_announce_own(const net_relay_ep_t *ep, net_relay_client_t *c)
         json_object_foreach(entries, h, w)
             (void)net_relay_client_dir_publish(c, w);
         json_decref(entries);
+        /* And our area cards: a hub holds them in memory too. */
+        pthread_mutex_lock(&net_relay.lock);
+        json_t *cards = net_relay.own_cards != NULL
+                      ? json_deep_copy(net_relay.own_cards) : NULL;
+        pthread_mutex_unlock(&net_relay.lock);
+        json_object_foreach(cards, h, w)
+            (void)net_relay_client_hub_publish(c, w);
+        json_decref(cards);
     }
     net_relay_pin_t pin;
     if (!mine || c == NULL || !net_relay_client_proven(c, &pin, NULL, 0))
@@ -1665,7 +1707,9 @@ static void _relay_announce_own(const net_relay_ep_t *ep, net_relay_client_t *c)
     msg.info.net_msg.encrypt = false;
     net_msg_pack_json(&msg.info.net_msg, body);
     json_decref(body);
-    if (messaging_send("identity", NET_MESSAGE, &msg, false) == 0) {
+    int sent = messaging_send("identity", NET_MESSAGE, &msg, false);
+    net_msg_free_obj(&msg.info.net_msg);
+    if (sent == 0) {
         pthread_mutex_lock(&net_relay.lock);
         for (size_t i = 0; i < net_relay.n_clients; i++)
             if (_ep_eq(&net_relay.clients[i].ep, ep))
@@ -2866,6 +2910,7 @@ static void _to_identity(char *verb, json_t *body)
     net_msg_pack_json(&msg.info.net_msg, body);
     json_decref(body);
     messaging_send("identity", NET_MESSAGE, &msg, false);
+    net_msg_free_obj(&msg.info.net_msg);
 }
 
 /* "host:port", unbracketed, as Python's '%s:%d' % endpoint. */
@@ -3116,6 +3161,338 @@ void net_relay_drain_dir(void)
             break;
         _dir_answer(handle, NULL, NULL, limited);
     }
+}
+
+/****************************
+ * Area hubs (net_hub.h): identity's publish / withdraw / lookup, and the
+ * hubs' answers. Mirrors Python NetworkProcess.handle_hub_* and
+ * _drain_relay_hub.
+ ****************************/
+
+void net_relay_set_test_hub(net_relay_test_hub_fn fn)
+{
+    pthread_mutex_lock(&net_relay.lock);
+    net_relay.test_hub = fn;
+    pthread_mutex_unlock(&net_relay.lock);
+}
+
+/* The relays a hub op goes to: as _dir_targets, under the hub test stand-in. */
+static size_t _hub_targets(bool own_only, net_relay_ep_t *eps, net_relay_client_t **cs,
+                           size_t max)
+{
+    net_relay_ep_t own[AT_RELAY_MAX];
+    size_t n_own = net_relay_own_list(own, AT_RELAY_MAX);
+    size_t n = 0;
+    pthread_mutex_lock(&net_relay.lock);
+    if (net_relay.test_hub != NULL) {
+        for (size_t i = 0; i < n_own && n < max; i++) {
+            eps[n] = own[i];
+            cs[n++] = NULL;
+        }
+    } else {
+        for (size_t i = 0; i < net_relay.n_clients && n < max; i++) {
+            bool mine = !own_only;
+            for (size_t k = 0; k < n_own && !mine; k++)
+                mine = _ep_eq(&own[k], &net_relay.clients[i].ep);
+            if (mine && net_relay_client_connected(net_relay.clients[i].client)) {
+                eps[n] = net_relay.clients[i].ep;
+                cs[n++] = net_relay.clients[i].client;
+            }
+        }
+    }
+    pthread_mutex_unlock(&net_relay.lock);
+    return n;
+}
+
+static int _hub_ask(const net_relay_ep_t *ep, net_relay_client_t *c, const char *op,
+                    const char *area, const json_t *card)
+{
+    net_relay_test_hub_fn fn;
+    pthread_mutex_lock(&net_relay.lock);
+    fn = net_relay.test_hub;
+    pthread_mutex_unlock(&net_relay.lock);
+    if (fn != NULL)
+        return fn(ep->host, ep->port, op, area, card);
+    if (strcmp(op, "hub_publish") == 0)
+        return net_relay_client_hub_publish(c, card);
+    if (strcmp(op, "hub_withdraw") == 0)
+        return net_relay_client_hub_withdraw(c, area);
+    return net_relay_client_hub_lookup(c, area);
+}
+
+/* @p cards is borrowed. */
+static void _hub_answer(const char *area, json_t *cards, bool limited)
+{
+    json_t *body = json_pack("{s:s, s:O, s:b}", "area", area,
+                             "cards", cards != NULL ? cards : json_array(), "limited", limited);
+    if (cards == NULL && body != NULL) {
+        /* s:O increfed the fresh array; drop the extra reference. */
+        json_decref(json_object_get(body, "cards"));
+    }
+    if (body != NULL)
+        _to_identity(NET_ID_HUB_RESULT, body);
+}
+
+int net_handle_hub_publish(net_msg_t *nmsg, logger_t *logger)
+{
+    json_t *body = _local_payload(nmsg, NET_FN_HUB_PUBLISH, logger);
+    if (body == NULL)
+        return -1;
+    json_t *wire = json_object_get(body, "card");
+    at_dir_signed_t card;
+    const char *area = NULL;
+    if (at_dir_from_wire(wire, &card) == AT_DIR_OK)
+        area = at_area_card_area(&card);
+    if (area == NULL) {
+        if (card.body != NULL)
+            at_dir_free(&card);
+        log_warn(logger, "Network: hub_publish: unusable card\n");
+        json_decref(body);
+        return -1;
+    }
+    pthread_mutex_lock(&net_relay.lock);
+    if (net_relay.own_cards == NULL)
+        net_relay.own_cards = json_object();
+    json_object_set(net_relay.own_cards, area, wire);
+    pthread_mutex_unlock(&net_relay.lock);
+    at_dir_free(&card);
+    net_relay_ep_t eps[NET_RELAY_MAX_CLIENTS];
+    net_relay_client_t *cs[NET_RELAY_MAX_CLIENTS];
+    size_t n = _hub_targets(true, eps, cs, NET_RELAY_MAX_CLIENTS);
+    for (size_t i = 0; i < n; i++)
+        (void)_hub_ask(&eps[i], cs[i], "hub_publish", NULL, wire);
+    json_decref(body);
+    return 0;
+}
+
+int net_handle_hub_withdraw(net_msg_t *nmsg, logger_t *logger)
+{
+    json_t *body = _local_payload(nmsg, NET_FN_HUB_WITHDRAW, logger);
+    if (body == NULL)
+        return -1;
+    const char *a = json_string_value(json_object_get(body, "area"));
+    const char *area = a != NULL ? a : "";
+    pthread_mutex_lock(&net_relay.lock);
+    if (net_relay.own_cards != NULL)
+        json_object_del(net_relay.own_cards, area);
+    pthread_mutex_unlock(&net_relay.lock);
+    net_relay_ep_t eps[NET_RELAY_MAX_CLIENTS];
+    net_relay_client_t *cs[NET_RELAY_MAX_CLIENTS];
+    size_t n = _hub_targets(true, eps, cs, NET_RELAY_MAX_CLIENTS);
+    for (size_t i = 0; i < n; i++)
+        (void)_hub_ask(&eps[i], cs[i], "hub_withdraw", area, NULL);
+    json_decref(body);
+    return 0;
+}
+
+static int _hub_lookup_find_locked(const char *area)
+{
+    for (int i = 0; i < NET_HUB_MAX_LOOKUPS; i++)
+        if (net_relay.hub_lookups[i].used && strcmp(net_relay.hub_lookups[i].area, area) == 0)
+            return i;
+    return -1;
+}
+
+static void _hub_lookup_clear_locked(int i)
+{
+    json_decref(net_relay.hub_lookups[i].cards);
+    memset(&net_relay.hub_lookups[i], 0, sizeof(net_relay.hub_lookups[i]));
+}
+
+int net_handle_hub_lookup(net_msg_t *nmsg, logger_t *logger)
+{
+    json_t *body = _local_payload(nmsg, NET_FN_HUB_LOOKUP, logger);
+    if (body == NULL)
+        return -1;
+    const char *raw = json_string_value(json_object_get(body, "area"));
+    char area[AT_AREA_MAX + 1];
+    if (at_area_normalize(raw, area, sizeof(area), AT_AREA_MIN, AT_AREA_MAX) != 0) {
+        _hub_answer(raw != NULL ? raw : "", NULL, false);
+        json_decref(body);
+        return 0;
+    }
+    json_decref(body);
+    pthread_mutex_lock(&net_relay.lock);
+    bool in_flight = _hub_lookup_find_locked(area) >= 0;
+    pthread_mutex_unlock(&net_relay.lock);
+    if (in_flight)
+        return 0;                       /* one in flight answers every asker */
+    net_relay_ep_t eps[NET_RELAY_MAX_CLIENTS];
+    net_relay_client_t *cs[NET_RELAY_MAX_CLIENTS];
+    size_t n = _hub_targets(false, eps, cs, NET_RELAY_MAX_CLIENTS);
+    net_relay_ep_t asked[NET_DIR_MAX_ASKED];
+    size_t n_asked = 0;
+    for (size_t i = 0; i < n && n_asked < NET_DIR_MAX_ASKED; i++)
+        if (_hub_ask(&eps[i], cs[i], "hub_lookup", area, NULL) == 0)
+            asked[n_asked++] = eps[i];
+    if (n_asked == 0) {
+        _hub_answer(area, NULL, false);
+        return 0;
+    }
+    pthread_mutex_lock(&net_relay.lock);
+    int slot = -1;
+    for (int i = 0; i < NET_HUB_MAX_LOOKUPS && slot < 0; i++)
+        if (!net_relay.hub_lookups[i].used)
+            slot = i;
+    if (slot < 0) {                     /* full: replace the oldest */
+        slot = 0;
+        for (int i = 1; i < NET_HUB_MAX_LOOKUPS; i++)
+            if (net_relay.hub_lookups[i].since < net_relay.hub_lookups[slot].since)
+                slot = i;
+        _hub_lookup_clear_locked(slot);
+    }
+    net_relay.hub_lookups[slot].used = true;
+    at_strlcpy(net_relay.hub_lookups[slot].area, area, sizeof(net_relay.hub_lookups[slot].area));
+    memcpy(net_relay.hub_lookups[slot].asked, asked, n_asked * sizeof(asked[0]));
+    net_relay.hub_lookups[slot].n_asked = n_asked;
+    net_relay.hub_lookups[slot].cards = json_array();
+    net_relay.hub_lookups[slot].since = _mono();
+    pthread_mutex_unlock(&net_relay.lock);
+    return 0;
+}
+
+void net_relay_hub_answer(void *arg, const json_t *msg, const char *host, int port)
+{
+    (void)arg;
+    char *text = msg != NULL ? json_dumps(msg, JSON_COMPACT) : NULL;
+    if (text == NULL)
+        return;
+    pthread_mutex_lock(&net_relay.lock);
+    if (net_relay.n_hub_answers < NET_RELAY_RECORD_QUEUE) {
+        size_t i = net_relay.n_hub_answers++;
+        at_strlcpy(net_relay.hub_answers[i].ep.host, host,
+                   sizeof(net_relay.hub_answers[i].ep.host));
+        net_relay.hub_answers[i].ep.port = port;
+        net_relay.hub_answers[i].text = text;
+        text = NULL;
+    }
+    pthread_mutex_unlock(&net_relay.lock);
+    free(text);
+}
+
+void net_relay_drain_hub(void)
+{
+    for (;;) {
+        pthread_mutex_lock(&net_relay.lock);
+        char *text = NULL;
+        net_relay_ep_t ep;
+        if (net_relay.n_hub_answers > 0) {
+            text = net_relay.hub_answers[0].text;
+            ep = net_relay.hub_answers[0].ep;
+            memmove(&net_relay.hub_answers[0], &net_relay.hub_answers[1],
+                    (net_relay.n_hub_answers - 1) * sizeof(net_relay.hub_answers[0]));
+            net_relay.n_hub_answers--;
+        }
+        pthread_mutex_unlock(&net_relay.lock);
+        if (text == NULL)
+            break;
+        json_t *frame = json_loads(text, 0, NULL);
+        free(text);
+        if (frame == NULL)
+            continue;
+        const char *op = json_string_value(json_object_get(frame, "op"));
+        const char *a = json_string_value(json_object_get(frame, "area"));
+        const char *area = a != NULL ? a : "";
+        const char *reason = json_string_value(json_object_get(frame, "reason"));
+        bool not_hub = reason != NULL && strcmp(reason, "not_hub") == 0;
+        if (op == NULL) {
+            json_decref(frame);
+            continue;
+        }
+        pthread_mutex_lock(&net_relay.lock);
+        int li = _hub_lookup_find_locked(area);
+        size_t k = NET_DIR_MAX_ASKED;
+        for (size_t i = 0; li >= 0 && i < net_relay.hub_lookups[li].n_asked; i++)
+            if (_ep_eq(&net_relay.hub_lookups[li].asked[i], &ep)
+                && !net_relay.hub_lookups[li].answered[i])
+                k = i;
+        bool lookup_answer = li >= 0 && k < NET_DIR_MAX_ASKED
+            && (strcmp(op, "hub_cards") == 0 || strcmp(op, "hub_limited") == 0
+                || (strcmp(op, "hub_refused") == 0 && not_hub));
+        if (lookup_answer) {
+            typeof(net_relay.hub_lookups[0]) *l = &net_relay.hub_lookups[li];
+            l->answered[k] = true;
+            l->limited |= strcmp(op, "hub_limited") == 0;
+            json_t *cards = json_object_get(frame, "cards");
+            if (strcmp(op, "hub_cards") == 0 && json_is_array(cards)) {
+                char where[AT_RELAY_HOST_LEN + 16];
+                _ep_text(&ep, where, sizeof(where));
+                size_t i;
+                json_t *c;
+                json_array_foreach(cards, i, c) {
+                    if (i >= AT_HUB_LOOKUP_MAX)
+                        break;
+                    if (json_is_object(c))
+                        json_array_append_new(l->cards, json_pack("{s:O, s:s}", "card", c,
+                                                                  "relay", where));
+                }
+            }
+            bool all = true;
+            for (size_t i = 0; i < l->n_asked; i++)
+                all = all && l->answered[i];
+            json_t *done = NULL;
+            bool limited = l->limited;
+            char done_area[AT_AREA_MAX + 1] = "";
+            if (all) {
+                done = json_incref(l->cards);
+                at_strlcpy(done_area, l->area, sizeof(done_area));
+                _hub_lookup_clear_locked(li);
+            }
+            pthread_mutex_unlock(&net_relay.lock);
+            if (done != NULL) {
+                _hub_answer(done_area, done, limited);
+                json_decref(done);
+            }
+            json_decref(frame);
+            continue;
+        }
+        pthread_mutex_unlock(&net_relay.lock);
+        if ((strcmp(op, "hub_published") == 0 || strcmp(op, "hub_refused") == 0
+             || strcmp(op, "hub_withdrawn") == 0) && !not_hub) {
+            char where[AT_RELAY_HOST_LEN + 16];
+            _ep_text(&ep, where, sizeof(where));
+            json_t *seq = json_object_get(frame, "seq");
+            json_t *body = json_pack("{s:s, s:s, s:s, s:s, s:I}", "op", op,
+                                     "area", area, "relay", where,
+                                     "reason", reason != NULL ? reason : "",
+                                     "seq", json_is_integer(seq)
+                                            ? json_integer_value(seq) : (json_int_t)0);
+            if (body != NULL)
+                _to_identity(NET_ID_HUB_STATUS, body);
+        }
+        json_decref(frame);
+    }
+    /* Lookups nobody finished answering: answered with what came. */
+    double now = _mono();
+    for (;;) {
+        char area[AT_AREA_MAX + 1] = "";
+        bool limited = false;
+        json_t *cards = NULL;
+        pthread_mutex_lock(&net_relay.lock);
+        for (int i = 0; i < NET_HUB_MAX_LOOKUPS && area[0] == '\0'; i++) {
+            if (net_relay.hub_lookups[i].used
+                && now - net_relay.hub_lookups[i].since > NET_HUB_LOOKUP_TIMEOUT_SEC) {
+                at_strlcpy(area, net_relay.hub_lookups[i].area, sizeof(area));
+                limited = net_relay.hub_lookups[i].limited;
+                cards = json_incref(net_relay.hub_lookups[i].cards);
+                _hub_lookup_clear_locked(i);
+            }
+        }
+        pthread_mutex_unlock(&net_relay.lock);
+        if (area[0] == '\0')
+            break;
+        _hub_answer(area, cards, limited);
+        json_decref(cards);
+    }
+}
+
+void net_relay_hub_age_lookups(double seconds)
+{
+    pthread_mutex_lock(&net_relay.lock);
+    for (int i = 0; i < NET_HUB_MAX_LOOKUPS; i++)
+        if (net_relay.hub_lookups[i].used)
+            net_relay.hub_lookups[i].since -= seconds;
+    pthread_mutex_unlock(&net_relay.lock);
 }
 
 void net_relay_dir_age_lookups(double seconds)
@@ -3711,6 +4088,24 @@ static int network_run(const net_transport_t *transport,
                              "issuer(s))\n", n);
                 }
             }
+            if (net_hub_enabled() && net_relay.hub == NULL) {
+                char areas[AT_HUB_MAX_AREAS][AT_AREA_MAX + 1];
+                size_t n = net_hub_areas(areas, AT_HUB_MAX_AREAS);
+                const char *ptrs[AT_HUB_MAX_AREAS];
+                char listed[AT_HUB_MAX_AREAS * (AT_AREA_MAX + 2) + 1] = "";
+                for (size_t i = 0; i < n; i++) {
+                    ptrs[i] = areas[i];
+                    if (i > 0)
+                        strncat(listed, ", ", sizeof(listed) - strlen(listed) - 1);
+                    strncat(listed, areas[i], sizeof(listed) - strlen(listed) - 1);
+                }
+                net_relay.hub = net_hub_new(ptrs, n, net_hub_rate());
+                if (net_relay.hub != NULL) {
+                    net_hub_set_distrust(net_relay.hub, _relay_distrust, NULL);
+                    net_relay_server_set_hub(net_relay.server, net_relay.hub);
+                    log_info(logger, "Hub: serving area(s) %s\n", n > 0 ? listed : "(none)");
+                }
+            }
         }
     }
     _relay_maintain();
@@ -3725,6 +4120,7 @@ static int network_run(const net_transport_t *transport,
     log_info(logger, "Network: ready (transport=%s, broadcast=%s port=%d)\n",
              transport->name, bcast_addr, port_num);
 
+    generic_msg_t buf = {0};
     while (keep_running(proc, &pctx.sig_q, logger))
     {
         _relay_maintain();
@@ -3732,6 +4128,7 @@ static int network_run(const net_transport_t *transport,
         net_relay_retry_refused();
         net_relay_drain_records();
         net_relay_drain_dir();
+        net_relay_drain_hub();
         /* RECEIVE FIRST, SLEEP ONLY WHEN THERE IS NOTHING TO TAKE. This loop
          * used to sleep a cadence tick and then take exactly ONE message, so
          * the network process drained its queue at one datagram per ~0.5s
@@ -3755,7 +4152,7 @@ static int network_run(const net_transport_t *transport,
          * queue). Nothing in this loop is periodic, so there is no work here
          * to starve by looping: when the queue empties we sleep exactly as
          * before. */
-        generic_msg_t buf = {0};
+        messaging_recv_release(&buf);   /* the previous pass's */
         int err = messaging_recv(&buf);
         if (err == -1 || err == ENOMSG)
         {
@@ -3836,6 +4233,18 @@ static int network_run(const net_transport_t *transport,
                 }
                 if (strcmp(nmsg->function, NET_FN_DIR_LOOKUP) == 0) {
                     (void)net_handle_dir_lookup(nmsg, logger);
+                    continue;
+                }
+                if (strcmp(nmsg->function, NET_FN_HUB_PUBLISH) == 0) {
+                    (void)net_handle_hub_publish(nmsg, logger);
+                    continue;
+                }
+                if (strcmp(nmsg->function, NET_FN_HUB_WITHDRAW) == 0) {
+                    (void)net_handle_hub_withdraw(nmsg, logger);
+                    continue;
+                }
+                if (strcmp(nmsg->function, NET_FN_HUB_LOOKUP) == 0) {
+                    (void)net_handle_hub_lookup(nmsg, logger);
                     continue;
                 }
                 if ((strcmp(nmsg->function, NET_FN_EXCLUDE) == 0 ||
@@ -4142,6 +4551,7 @@ static int network_run(const net_transport_t *transport,
             run_message_handlers(proc, queues, buf.type, &buf);
         }
     }
+    messaging_recv_release(&buf);
 
     /* Cleanup */
     if (pctx.fd1 > 0) close(pctx.fd1);

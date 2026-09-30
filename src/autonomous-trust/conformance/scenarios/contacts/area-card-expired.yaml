@@ -1,0 +1,30 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: area-card-expired
+description: A card past its expiry is refused as expired, not as malformed.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: dir_verify
+    what: area_card
+    now: 1790000000
+    wire:
+      body: '{"v":1,"typename":"at-area-card","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","key":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5","area":"u4pr","bucket":"u4pru","name":"","seq":1,"expiry":1789999999,"identity":{"typename":"identity","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","address":"","nickname":"alice","signature":{"hex_seed":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5"},"encryptor":{"hex_seed":"7777777777777777777777777777777777777777777777777777777777777777"}}}'
+      sig: 5a7b494bdfd74845fddf14c41e1b5dd462393a95c0869d25b40109ef2206fd374b9c953cbdaff0cd8768cf9f9f68eb21ab42ab39a424ed177b9389468a737806
+steps:
+- id: 1
+  from: host
+  to: host
+  function: dir_verify
+  description: 'trigger: dir_verify'
+expected_state:
+  host:
+    dir_status: expired

@@ -27,7 +27,8 @@ and is still reputation-gated (relay.py).
              {"body": <exact signed JSON string>, "sig": <hex>}
              sig = issuer key over "at-relay-roster-v1|" + body
              body = {"v": 1, "typename": "at-relay-roster", "issuer": <hex key>,
-                     "seq": N, "relays": ["relay://<uuid>:<fp>@host:port", ...]}
+                     "seq": N, "relays": ["relay://<uuid>:<fp>@host:port", ...],
+                     "areas": {"<a relays entry>": ["u4pr", ...], ...}}   (optional)
     issuers  ``$AT_RELAY_ROSTER_ISSUERS`` (comma-separated hex keys), then
              <cfg_dir>/relay_roster_issuers.cfg.json = {"issuers": [hex, ...]}
     seen     <data_dir>/relay_rosters_seen.cfg.json = {<issuer hex>: seq}
@@ -43,10 +44,18 @@ Every rule the seed list has, plus three of a roster's own:
   removes a relay by publishing without it; an empty roster is valid. The
   highest seq accepted per issuer is kept, and a lower one is refused.
 
+``areas`` says which of the relays are area hubs (network/hub.py), and for
+which geohash areas. It is optional, and absent when no relay serves one, so a
+roster without hubs keeps the bytes it always had. Present, it must be an
+object whose every key is one of ``relays`` exactly and whose every value is a
+list of 1 to :data:`MAX_AREAS` areas; anything else refuses the whole roster,
+as an unpinned entry does.
+
 When two files carry the same issuer the highest seq wins. Relays come in the
 order the issuers were pinned, each roster in its own order, one per endpoint,
-at most :data:`relay.MAX_RELAYS`. Same formats, prefixes and rules as C's
-``network/net_relay_rosters.{h,c}``.
+except that a hub serving an area one of this node's own buckets lies in comes
+first; at most :data:`relay.MAX_RELAYS`. Same formats, prefixes and rules as
+C's ``network/net_relay_rosters.{h,c}``.
 """
 import json
 import logging
@@ -76,6 +85,8 @@ SEEN_FILE = 'relay_rosters_seen.cfg.json'
 MAX_ISSUERS = 16
 #: Most roster files read from the directory. Same as C's AT_RELAY_ROSTER_FILES_MAX.
 MAX_FILES = 32
+#: Most areas one roster relay is listed as serving. Same as C's.
+MAX_AREAS = 8
 
 
 class InvalidRoster(InvalidSeeds):
@@ -91,6 +102,33 @@ def verify_roster(text, issuers):
     """The roster ``text`` -> ``(issuer, seq, [(endpoint, pin), ...])``, or raise
     :class:`InvalidRoster`. ``issuers`` is the pinned issuer keys (hex). Does
     not apply the seq floor."""
+    issuer, seq, relays, _areas = verify_roster_areas(text, issuers)
+    return issuer, seq, relays
+
+
+def _areas(body):
+    """The roster's ``areas``, as ``{relays entry: [area, ...]}``; {} if absent."""
+    from ..contacts.area_card import normalize_area
+    if 'areas' not in body:
+        return {}
+    areas = body['areas']
+    hints = body.get('relays', [])
+    if not isinstance(areas, dict):
+        raise InvalidRoster('areas must be an object')
+    out = {}
+    for hint, listed in areas.items():
+        if hint not in hints:
+            raise InvalidRoster('areas names %r, which is not one of the relays' % hint)
+        if not isinstance(listed, list) or not 0 < len(listed) <= MAX_AREAS \
+                or any(normalize_area(a) != a for a in listed):
+            raise InvalidRoster('areas for %r must be 1 to %d geohash areas' % (hint, MAX_AREAS))
+        out[hint] = list(listed)
+    return out
+
+
+def verify_roster_areas(text, issuers):
+    """:func:`verify_roster`, plus the hubs' areas: ``(issuer, seq, relays,
+    {endpoint: [area, ...]})``."""
     try:
         body, body_str, sig_hex = _split(text)
     except InvalidSeeds as exc:
@@ -114,13 +152,18 @@ def verify_roster(text, issuers):
         raise InvalidRoster(str(exc)) from exc
     if any(pin is None for _endpoint, pin in relays):
         raise InvalidRoster('every roster entry must be pinned to its relay key')
-    return issuer, seq, relays
+    by_hint = _areas(body)
+    areas = {}
+    for hint, listed in by_hint.items():
+        areas[_relay.parse_hint(hint)[0]] = listed
+    return issuer, seq, relays, areas
 
 
-def sign_roster(issuer_seed_hex, seq, relays) -> str:
+def sign_roster(issuer_seed_hex, seq, relays, areas=None) -> str:
     """The roster file for ``relays`` (pinned hint strings), signed with the
-    issuer's private seed. For a community's own tooling; an Ethne polity emits
-    the same bytes from ``en_uplift::rendezvous_roster``."""
+    issuer's private seed; ``areas`` ({hint: [area, ...]}) names the hubs.
+    For a community's own tooling; an Ethne polity emits the same bytes from
+    ``en_uplift::rendezvous_roster``."""
     sk = SigningKey(HexEncoder.decode(issuer_seed_hex.encode('ascii')))
     for hint in relays:
         endpoint, pin = _relay.parse_hint(hint)
@@ -129,6 +172,9 @@ def sign_roster(issuer_seed_hex, seq, relays) -> str:
     body = {'v': ROSTER_VERSION, 'typename': ROSTER_TYPENAME,
             'issuer': sk.verify_key.encode(HexEncoder).decode('ascii'),
             'seq': int(seq), 'relays': list(relays)}
+    if areas:
+        body['areas'] = {hint: list(listed) for hint, listed in areas.items()}
+        _areas(body)
     body_str = json.dumps(body, separators=(',', ':'), ensure_ascii=True)
     sig = sk.sign((ROSTER_DOMAIN + body_str).encode('utf-8')).signature
     return json.dumps({'body': body_str, 'sig': HexEncoder.encode(sig).decode('ascii')},
@@ -197,10 +243,11 @@ def _save_seen(data_dir, seen):
         _logger.warning('Relay rosters: cannot record seqs in %s (%s)', data_dir, exc)
 
 
-def load():
+def load(buckets=()):
     """This node's roster relays, ``[(endpoint, pin), ...]``, from every pinned
-    issuer's newest acceptable roster. Every refusal is logged and leaves that
-    file out; nothing here raises."""
+    issuer's newest acceptable roster; a hub serving an area that one of
+    ``buckets`` (geohash buckets) lies in comes first. Every refusal is logged
+    and leaves that file out; nothing here raises."""
     issuers = pinned_issuers()
     if not issuers:
         return []
@@ -210,20 +257,21 @@ def load():
         if text is None:
             continue
         try:
-            issuer, seq, relays = verify_roster(text, issuers)
+            issuer, seq, relays, areas = verify_roster_areas(text, issuers)
         except InvalidRoster as exc:
             _logger.warning('Relay rosters: %s refused: %s', path, exc)
             continue
         if issuer not in best or seq > best[issuer][0]:
-            best[issuer] = (seq, relays, path)
+            best[issuer] = (seq, relays, path, areas)
     data_dir = Configuration.get_data_dir()
     seen = _seen(data_dir)
     raised = False
     out = []
+    served = {}
     for issuer in issuers:
         if issuer not in best:
             continue
-        seq, relays, path = best[issuer]
+        seq, relays, path, areas = best[issuer]
         floor = seen.get(issuer, 0)
         if seq < floor:
             _logger.warning('Relay rosters: %s is seq %d from issuer %s…, older than the '
@@ -236,6 +284,69 @@ def load():
         for endpoint, pin in relays:
             if endpoint not in [ep for ep, _pin in out]:
                 out.append((endpoint, pin))
+                served[endpoint] = areas.get(endpoint, [])
     if raised:
         _save_seen(data_dir, seen)
+
+    def near(endpoint):
+        return any(b.startswith(a) for a in served[endpoint] for b in buckets)
+    # Stable: hubs for our own buckets first, everything else in roster order.
+    out = [h for h in out if near(h[0])] + [h for h in out if not near(h[0])]
     return out[:_relay.MAX_RELAYS]
+
+
+def install(text):
+    """File the roster ``text`` and pin its issuer: the local app's choice to
+    trust a community (Agora: following it). The roster must verify under its
+    own issuer and be no older than one already accepted from it. Returns the
+    issuer; raises :class:`InvalidRoster`."""
+    try:
+        body, _s, _sig = _split(text)
+    except InvalidSeeds as exc:
+        raise InvalidRoster(str(exc)) from exc
+    issuer = body.get('issuer')
+    if not _is_key_hex(issuer):
+        raise InvalidRoster('no issuer key')
+    _issuer, seq, _relays, _areas = verify_roster_areas(text, [issuer])
+    if seq < _seen(Configuration.get_data_dir()).get(issuer, 0):
+        raise InvalidRoster('older than the roster already accepted from this issuer')
+    os.makedirs(rosters_dir(), exist_ok=True)
+    with atomic_write(os.path.join(rosters_dir(), issuer[:32] + Configuration.file_ext)) as f:
+        f.write(text if isinstance(text, str) else text.decode('utf-8'))
+    _set_issuer(issuer, True)
+    return issuer
+
+
+def remove(issuer):
+    """Unpin ``issuer`` and delete the roster installed for it. Returns True
+    if either was there."""
+    issuer = str(issuer).lower()
+    if not _is_key_hex(issuer):
+        return False
+    path = os.path.join(rosters_dir(), issuer[:32] + Configuration.file_ext)
+    had = os.path.exists(path)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return _set_issuer(issuer, False) or had
+
+
+def _set_issuer(issuer, pinned):
+    listed = []
+    text = _read(issuers_path())
+    if text is not None:
+        try:
+            listed = [str(k).lower() for k in json.loads(text).get('issuers', [])]
+        except (ValueError, AttributeError):
+            listed = []
+    changed = (issuer in listed) != pinned
+    if pinned and issuer not in listed:
+        listed.append(issuer)
+    if not pinned:
+        listed = [k for k in listed if k != issuer]
+    if changed:
+        os.makedirs(os.path.dirname(issuers_path()), exist_ok=True)
+        with atomic_write(issuers_path()) as f:
+            json.dump({'issuers': listed}, f)
+    return changed

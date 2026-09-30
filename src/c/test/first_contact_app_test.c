@@ -218,6 +218,7 @@ static void _app(process_t *proc, const char *verb, json_t *body)
         handle_first_contact_app_invite(proc, NULL, &msg);
     else
         handle_first_contact_app_initiate(proc, NULL, &msg);
+    net_msg_free_obj(&msg.info.net_msg);
 }
 
 /* An address-book request, local, with a queue directory naming `network`
@@ -241,6 +242,7 @@ static void _book(process_t *proc, const char *verb, json_t *body)
       : strcmp(verb, AT_APP_FC_RENAME) == 0 ? handle_first_contact_app_rename
       : handle_first_contact_app_remove;
     h(proc, dir, &msg);
+    net_msg_free_obj(&msg.info.net_msg);
     array_free(dir);
 }
 
@@ -300,6 +302,7 @@ static void _wire_app(process_t *proc, const char *verb, json_t *body,
         handle_first_contact_app_verify(proc, NULL, &msg);
     else
         handle_first_contact_app_initiate(proc, NULL, &msg);
+    net_msg_free_obj(&msg.info.net_msg);
     smrt_deref(pub);
 }
 
@@ -315,10 +318,11 @@ static void _hello(process_t *proc, const identity_t *from, const char *blob)
      * sender's identity arrives without one (net_message.c flat from_*). */
     msg.info.net_msg.from_whom.petname[0] = '\0';
     size_t len = strlen(blob);
-    msg.info.net_msg.obj = smrt_create(len + 1);
+    msg.info.net_msg.obj = malloc(len + 1);
     memcpy(msg.info.net_msg.obj, blob, len + 1);
     msg.info.net_msg.len = len;
     handle_first_contact_hello(proc, NULL, &msg);
+    net_msg_free_obj(&msg.info.net_msg);
     smrt_deref(pub);
 }
 
@@ -335,6 +339,7 @@ static void _ack(process_t *proc, const identity_t *from, const char *nonce)
     ck_assert_ret_ok(net_msg_pack_json(&msg.info.net_msg, body));
     json_decref(body);
     handle_first_contact_hello_ack(proc, NULL, &msg);
+    net_msg_free_obj(&msg.info.net_msg);
     smrt_deref(pub);
 }
 
@@ -1181,7 +1186,7 @@ static void _relay_identity(process_t *proc, const identity_t *from,
     if (from != NULL)
         uuid_copy(msg.info.net_msg.from_whom.uuid, from->uuid);
     handle_first_contact_relay_identity(proc, NULL, &msg);
-    smrt_deref(msg.info.net_msg.obj);
+    net_msg_free_obj(&msg.info.net_msg);
 }
 
 DEFINE_TEST(test_links_pin_our_relay_once_it_proves_itself)
@@ -1229,7 +1234,7 @@ static void _reach_msg(process_t *proc, const identity_t *sender, json_t *wire)
     if (sender != NULL)
         uuid_copy(msg.info.net_msg.from_whom.uuid, sender->uuid);
     handle_first_contact_reach_record(proc, NULL, &msg);
-    smrt_deref(msg.info.net_msg.obj);
+    net_msg_free_obj(&msg.info.net_msg);
 }
 
 static contact_t *_contact_of(contacts_t *store, const identity_t *who)

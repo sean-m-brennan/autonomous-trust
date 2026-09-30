@@ -1,0 +1,87 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: hub-listed-people-see-each-other
+description: Two people listed in one area see each other, never themselves; someone not listed there sees the empty list a quiet area gets, even when listed in another area.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: hub
+    areas:
+    - u4pr
+    - gcpv
+    rate: 10
+    now: 1790000000
+    clients:
+      alice:
+        uuid: aaaaaaaa-0000-4000-8000-0000000000a1
+        key: bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5
+      bob:
+        uuid: bbbbbbbb-0000-4000-8000-0000000000b2
+        key: 55154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207
+      eve:
+        uuid: eeeeeeee-0000-4000-8000-0000000000e5
+        key: 4e6008b01b74e49e38d8b11392bfaccc7b5bff86ca2048cbb0f783633a61e2dd
+      carol:
+        uuid: cccccccc-0000-4000-8000-0000000000c3
+        key: d404bc44565aedbb899150e5b0b3b32b9441bf0cb7884c33130da8dbc27dd2cf
+    calls:
+    - as: alice
+      call: publish
+      card:
+        body: '{"v":1,"typename":"at-area-card","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","key":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5","area":"u4pr","bucket":"u4pru","name":"","seq":1,"expiry":1790003600,"identity":{"typename":"identity","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","address":"","nickname":"alice","signature":{"hex_seed":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5"},"encryptor":{"hex_seed":"7777777777777777777777777777777777777777777777777777777777777777"}}}'
+        sig: 08bffc1bafb3051928865c3cd71dda4f75adc6daa3686295f855efa586eb72f649b00e4556510b790ab580259466304731faa85163966f910090937dfe6b760c
+    - as: eve
+      call: lookup
+      area: u4pr
+    - as: bob
+      call: publish
+      card:
+        body: '{"v":1,"typename":"at-area-card","uuid":"bbbbbbbb-0000-4000-8000-0000000000b2","key":"55154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207","area":"u4pr","bucket":"u4prv","name":"","seq":1,"expiry":1790003600,"identity":{"typename":"identity","uuid":"bbbbbbbb-0000-4000-8000-0000000000b2","address":"","nickname":"bob","signature":{"hex_seed":"55154f42065ea5a1bea05463826be2684eb92df92c100027aabaae57ca554207"},"encryptor":{"hex_seed":"7777777777777777777777777777777777777777777777777777777777777777"}}}'
+        sig: 84e5de5218b7cfcf7c3b3c45ee867042196deb658f8126b2373e77080424f983a45440c6e51819382149e99b78a7b7bd9379e2623be819ac72f95c06f6952d06
+    - as: bob
+      call: lookup
+      area: U4PR
+    - as: eve
+      call: publish
+      card:
+        body: '{"v":1,"typename":"at-area-card","uuid":"eeeeeeee-0000-4000-8000-0000000000e5","key":"4e6008b01b74e49e38d8b11392bfaccc7b5bff86ca2048cbb0f783633a61e2dd","area":"gcpv","bucket":"gcpvj","name":"","seq":1,"expiry":1790003600,"identity":{"typename":"identity","uuid":"eeeeeeee-0000-4000-8000-0000000000e5","address":"","nickname":"eve","signature":{"hex_seed":"4e6008b01b74e49e38d8b11392bfaccc7b5bff86ca2048cbb0f783633a61e2dd"},"encryptor":{"hex_seed":"7777777777777777777777777777777777777777777777777777777777777777"}}}'
+        sig: af8b6ff805b892d9a37e7e4f4c4402a03feb420c4be45bfdb2f474961748e3d0a7c8e9a12b6b4ffdd3001394b1c26d6bca99dd0f88252afe808397c83fc45f0a
+    - as: eve
+      call: lookup
+      area: u4pr
+steps:
+- id: 1
+  from: host
+  to: host
+  function: hub
+  description: 'trigger: hub'
+expected_state:
+  host:
+    replies:
+    - op: hub_published
+      area: u4pr
+      seq: 1
+    - op: hub_cards
+      area: u4pr
+      cards: []
+    - op: hub_published
+      area: u4pr
+      seq: 1
+    - op: hub_cards
+      area: u4pr
+      cards:
+      - aaaaaaaa-0000-4000-8000-0000000000a1
+    - op: hub_published
+      area: gcpv
+      seq: 1
+    - op: hub_cards
+      area: u4pr
+      cards: []

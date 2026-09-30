@@ -165,6 +165,9 @@ void net_relay_server_evict(net_relay_server_t *srv, const char *uuid);
 /** Serve directory ops with @p reg (not owned; NULL = refuse them). */
 struct net_registry_s;
 void net_relay_server_set_registry(net_relay_server_t *srv, struct net_registry_s *reg);
+/** Serve area hub ops with @p hub (net_hub.h; not owned; NULL = refuse them). */
+struct net_hub_s;
+void net_relay_server_set_hub(net_relay_server_t *srv, struct net_hub_s *hub);
 
 /* ---- a node's link to a relay ------------------------------------------- */
 
@@ -225,6 +228,15 @@ int net_relay_client_dir_publish(net_relay_client_t *c, const json_t *entry);
 int net_relay_client_dir_withdraw(net_relay_client_t *c, const char *handle);
 /** Ask this registry for @p handle; on_dir gets the answer. */
 int net_relay_client_dir_lookup(net_relay_client_t *c, const char *handle);
+/** Every hub_* answer from an area hub (net_hub.h), on the reader thread,
+ *  with the relay it came from. */
+typedef void (*net_relay_hub_fn)(void *arg, const json_t *msg, const char *host, int port);
+void net_relay_client_on_hub(net_relay_client_t *c, net_relay_hub_fn fn, void *arg);
+/** File our area card ({body, sig}) here. */
+int net_relay_client_hub_publish(net_relay_client_t *c, const json_t *card);
+int net_relay_client_hub_withdraw(net_relay_client_t *c, const char *area);
+/** Ask this hub who is listed in @p area; on_hub gets the answer. */
+int net_relay_client_hub_lookup(net_relay_client_t *c, const char *area);
 
 /** Ask for the record filed under @p rid; on_record gets the answer. */
 int net_relay_client_lookup(net_relay_client_t *c, const char *rid);

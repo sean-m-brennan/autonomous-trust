@@ -1,0 +1,75 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: sync-second-holder-of-an-operator-key-refused
+description: 'One operator key belongs to one contact: a second contact carrying it is refused.'
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: sync
+    now: 1800000000.0
+    store:
+      typename: contacts
+      version: 1
+      contacts:
+        eeeeeeee-0000-4000-8000-000000000002:
+          identity:
+            typename: identity
+            uuid: eeeeeeee-0000-4000-8000-000000000002
+            address: ''
+            nickname: carol
+            signature:
+              hex_seed: 204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21
+            encryptor:
+              hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+          petname: carol-pet
+          verified: true
+          provenance: token
+          trust_seed: 0.3
+          rendezvous: []
+          nonce: ''
+          added_at: 1000.0
+          verified_at: 1500.0
+          operator_key: af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d
+    payload:
+      v: 1
+      typename: at-contacts-sync
+      contacts:
+        eeeeeeee-0000-4000-8000-000000000005:
+          identity:
+            typename: identity
+            uuid: eeeeeeee-0000-4000-8000-000000000005
+            address: ''
+            nickname: frank
+            signature:
+              hex_seed: d54207da194977dcf46adbfec2bc2e75b52d5a8a42184fedfdc00024f0e3e8da
+            encryptor:
+              hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+          petname: frank-pet
+          verified: true
+          provenance: token
+          trust_seed: 0.3
+          rendezvous: []
+          nonce: ''
+          added_at: 1000.0
+          verified_at: 1500.0
+          operator_key: af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d
+      tombstones: {}
+steps:
+- id: 1
+  from: host
+  to: host
+  function: sync
+  description: 'trigger: sync'
+expected_state:
+  host:
+    changes: []
+    contacts:
+      eeeeeeee-0000-4000-8000-000000000005:

@@ -208,6 +208,12 @@ embedded/signing.pub
 /doc/brag/composition/snapshots/
 /doc/brag/composition/CLAUDE.md
 /doc/brag/composition/AGENTS.md
+# scripts/make_voice.py keeps one word-level transcript per clip in
+# voice-transcripts/*.json (tracked: the caption and cue timings are measured
+# from them). The CLI's default transcript.json beside the WAVs, and the stdout
+# logs an earlier version of the script wrote, are strays.
+/doc/brag/composition/assets/voice/transcript.json
+/doc/brag/voice-transcripts/*.txt
 
 # Earlier silent 23s cut of the same video, kept on disk but not tracked.
 /brag-output1/

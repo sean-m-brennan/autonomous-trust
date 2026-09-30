@@ -195,7 +195,9 @@ def adopt_operator(contact, cert, store=None) -> str:
         holder = store.by_operator(cert.operator)
         if holder is not None and holder.uuid != contact.uuid:
             return 'known'
-    contact.operator_key = cert.operator
+    if contact.operator_key != cert.operator:
+        contact.operator_key = cert.operator
+        contact.touch()
     return ''
 
 
@@ -234,5 +236,6 @@ def link_device(store, identity, cert):
     if len(contact.devices) >= DEVICES_MAX:
         return None, 'full'
     contact.devices.append(Device(identity, cert))
+    contact.touch()
     store.reindex()
     return contact, ''

@@ -1,0 +1,92 @@
+[
+  {
+    "text": "four",
+    "start": 0.14,
+    "end": 0.34,
+    "id": "w0"
+  },
+  {
+    "text": "federal",
+    "start": 0.38,
+    "end": 1.04,
+    "id": "w1"
+  },
+  {
+    "text": "agencies,",
+    "start": 1.04,
+    "end": 2,
+    "id": "w2"
+  },
+  {
+    "text": "one",
+    "start": 2.02,
+    "end": 2.27,
+    "id": "w3"
+  },
+  {
+    "text": "hurricane,",
+    "start": 2.34,
+    "end": 3.36,
+    "id": "w4"
+  },
+  {
+    "text": "and",
+    "start": 3.5,
+    "end": 3.62,
+    "id": "w5"
+  },
+  {
+    "text": "a",
+    "start": 3.62,
+    "end": 3.7,
+    "id": "w6"
+  },
+  {
+    "text": "live",
+    "start": 3.7,
+    "end": 4.05,
+    "id": "w7"
+  },
+  {
+    "text": "data",
+    "start": 4.05,
+    "end": 4.4,
+    "id": "w8"
+  },
+  {
+    "text": "feed",
+    "start": 4.4,
+    "end": 4.69,
+    "id": "w9"
+  },
+  {
+    "text": "nobody",
+    "start": 4.76,
+    "end": 4.94,
+    "id": "w10"
+  },
+  {
+    "text": "can",
+    "start": 5.37,
+    "end": 5.54,
+    "id": "w11"
+  },
+  {
+    "text": "verify",
+    "start": 5.54,
+    "end": 6.07,
+    "id": "w12"
+  },
+  {
+    "text": "by",
+    "start": 6.07,
+    "end": 6.21,
+    "id": "w13"
+  },
+  {
+    "text": "hand.",
+    "start": 6.23,
+    "end": 6.92,
+    "id": "w14"
+  }
+]

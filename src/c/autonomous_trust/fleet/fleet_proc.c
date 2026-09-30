@@ -161,6 +161,7 @@ static bool handle_update_proposal(const process_t *proc, directory_t *queues, g
         strncpy(req.info.net_msg.return_to, "fleet", PROC_NAME_LEN);
         net_msg_pack_json(&req.info.net_msg, req_json);
         messaging_send("network", NET_MESSAGE, &req, false);
+        net_msg_free_obj(&req.info.net_msg);
     }
     peers_read_unlock(proc);
     json_decref(req_json);
@@ -243,6 +244,7 @@ static bool handle_vote_request(const process_t *proc, directory_t *queues, gene
 
         log_debug(proc->logger, "Fleet: Vote granted\n");
         messaging_send("network", NET_MESSAGE, &grant, false);
+        net_msg_free_obj(&grant.info.net_msg);
     }
     else
     {
@@ -269,6 +271,7 @@ static bool handle_vote_request(const process_t *proc, directory_t *queues, gene
 
         log_debug(proc->logger, "Fleet: Vote nacked\n");
         messaging_send("network", NET_MESSAGE, &nack, false);
+        net_msg_free_obj(&nack.info.net_msg);
     }
 
     return true;
@@ -363,6 +366,7 @@ static bool handle_vote_grant(const process_t *proc, directory_t *queues, generi
             strncpy(acc_msg.info.net_msg.return_to, "fleet", PROC_NAME_LEN);
             net_msg_pack_json(&acc_msg.info.net_msg, acc_json);
             messaging_send("network", NET_MESSAGE, &acc_msg, false);
+            net_msg_free_obj(&acc_msg.info.net_msg);
         }
         peers_read_unlock(proc);
         json_decref(acc_json);
@@ -385,6 +389,7 @@ static bool handle_vote_grant(const process_t *proc, directory_t *queues, generi
         net_msg_pack_json(&self_acc.info.net_msg, self_json);
         json_decref(self_json);
         handle_update_accepted(proc, queues, &self_acc);
+        net_msg_free_obj(&self_acc.info.net_msg);
     }
     else
     {
@@ -534,6 +539,7 @@ static bool handle_update_accepted(const process_t *proc, directory_t *queues, g
             net_msg_pack_json(anmsg, fetch_req);
             json_decref(fetch_req);
             messaging_send("network", NET_MESSAGE, &artifact_msg, false);
+            net_msg_free_obj(anmsg);
 
             log_info(proc->logger, "Fleet: triggered artifact fetch for %s from %s\n",
                      artifact_hash_hex, nmsg->from_whom.address);

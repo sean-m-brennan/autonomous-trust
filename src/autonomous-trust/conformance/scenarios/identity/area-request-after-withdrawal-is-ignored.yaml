@@ -1,0 +1,52 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: identity
+name: area-request-after-withdrawal-is-ignored
+byte_pinning: false
+description: Once Alice withdraws her listing, a request via that area is no longer shown.
+participants:
+- id: alice
+  role: border_guard
+- id: bob
+  role: new_node
+fixtures:
+  first_contact:
+    enabled: true
+  groups:
+    alice:
+      uuid: fc000000-0000-4000-8000-0000000e0300
+      size: 1
+    bob:
+      uuid: fc000000-0000-4000-8000-0000000e0301
+      size: 1
+steps:
+- id: 1
+  from: alice
+  to: alice
+  function: trigger_area_publish
+  payload:
+    area: u4pr
+    bucket: u4pru
+  description: 'Pseudo-step: Alice''s app lists her in u4pr through the production app_area_publish.'
+- id: 2
+  from: alice
+  to: alice
+  function: trigger_area_withdraw
+  payload:
+    area: u4pr
+  description: 'Pseudo-step: Alice''s app withdraws the listing.'
+- id: 3
+  from: bob
+  to: alice
+  function: first_contact_request
+  payload:
+    area: u4pr
+    nonce: 0e03c0c0c0c0c0c0c0c0c0c0c0c0c0c0
+  description: 'Bob found Alice''s card at a hub and asks, signed by his own key, naming the area. Plaintext: neither is a peer of the other yet.'
+expected_state:
+  alice:
+    directory_requests_held: 0

@@ -1,6 +1,6 @@
 AutonomousTrust.
 Four federal agencies share sensor data through a hurricane. One of them is lying — and the network works out which, with no central authority to ask and nobody watching.
-Trust as a live value.
+For dynamically cooperative machines.
 
 ---
 Attribution (required when posting — the music is CC BY 4.0):

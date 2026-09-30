@@ -28,7 +28,8 @@
  *               {"body": <exact signed JSON string>, "sig": <hex>}
  *               issuer key over "at-relay-roster-v1|" + body
  *               body = {"v":1,"typename":"at-relay-roster","issuer":<hex key>,
- *                       "seq":N,"relays":["relay://<uuid>:<fp>@host:port",...]}
+ *                       "seq":N,"relays":["relay://<uuid>:<fp>@host:port",...],
+ *                       "areas":{"<a relays entry>":["u4pr",...],...}}   (optional)
  *      issuers  `$AT_RELAY_ROSTER_ISSUERS` (comma-separated hex keys), then
  *               <cfg_dir>/relay_roster_issuers.cfg.json = {"issuers":[hex,...]}
  *      seen     <data_dir>/relay_rosters_seen.cfg.json = {<issuer hex>: seq}
@@ -37,7 +38,11 @@
  *  roster is refused; a higher seq replaces that issuer's previous roster
  *  whole (an empty roster is valid) and a lower one is refused. Of two files
  *  from one issuer the higher seq wins. Relays come in issuer pin order, each
- *  roster in its own order, one per endpoint, at most AT_RELAY_MAX.
+ *  roster in its own order, one per endpoint, except that an area hub
+ *  (net_hub.h) serving an area one of this node's own listed buckets lies in
+ *  comes first; at most AT_RELAY_MAX. `areas`, when present, must key only
+ *  `relays` entries, each with 1..AT_RELAY_ROSTER_AREAS_MAX areas, or the
+ *  whole roster is refused; absent, the roster keeps the bytes it had.
  */
 #ifndef AUTONOMOUS_TRUST_NETWORK_NET_RELAY_ROSTERS_H
 #define AUTONOMOUS_TRUST_NETWORK_NET_RELAY_ROSTERS_H
@@ -60,6 +65,14 @@
 /** Most roster files read. Same as Python relay_rosters.MAX_FILES. */
 #define AT_RELAY_ROSTER_FILES_MAX 32
 #define AT_RELAY_ROSTER_KEY_HEX 64
+/** Most areas one roster relay serves. Same as Python relay_rosters.MAX_AREAS. */
+#define AT_RELAY_ROSTER_AREAS_MAX 8
+
+/** The areas each verified entry serves, by the entry's index in the list. */
+typedef struct {
+    size_t n[AT_RELAY_SEEDS_MAX];
+    char areas[AT_RELAY_SEEDS_MAX][AT_RELAY_ROSTER_AREAS_MAX][6];
+} net_relay_roster_areas_t;
 
 /** The issuer keys a node trusts rosters from, lowercase hex, in pin order. */
 typedef struct {
@@ -74,6 +87,11 @@ typedef struct {
  *  Python relay_rosters.verify_roster. */
 int net_relay_roster_verify(const char *text, const net_relay_roster_issuers_t *issuers,
                             char *issuer_out, long long *seq, net_relay_seed_list_t *out);
+/** net_relay_roster_verify, plus the hubs' areas into @p areas (may be NULL).
+ *  Mirrors Python relay_rosters.verify_roster_areas. */
+int net_relay_roster_verify_areas(const char *text, const net_relay_roster_issuers_t *issuers,
+                                  char *issuer_out, long long *seq, net_relay_seed_list_t *out,
+                                  net_relay_roster_areas_t *areas);
 
 /** The pinned issuers: `$AT_RELAY_ROSTER_ISSUERS` first, then the issuers file;
  *  a key that is not 32 bytes of hex is skipped (logged). @return how many.
@@ -95,5 +113,22 @@ size_t net_relay_rosters_files(char names[][256], size_t max);
  *  roster. Every refusal is logged and leaves that file out. @p pins may be
  *  NULL. @return how many. Mirrors relay_rosters.load. */
 size_t net_relay_rosters_load(net_relay_ep_t *out, net_relay_pin_t *pins, size_t max);
+/** net_relay_rosters_load, with hubs for one of @p buckets first. */
+size_t net_relay_rosters_load_near(net_relay_ep_t *out, net_relay_pin_t *pins, size_t max,
+                                   const char *const *buckets, size_t n_buckets);
+/** The buckets this node is listed at hubs under (<data_dir>/area.cfg.json,
+ *  identity's), into @p out. @return how many. */
+size_t net_relay_rosters_listed_buckets(char out[][8], size_t max);
+
+/** File the roster @p text and pin its issuer: the local app's choice to trust
+ *  a community. It must verify under its own issuer and be no older than the
+ *  seq already accepted from it. 0 (issuer into @p issuer_out), -1 when it
+ *  does not verify, -2 when it is older, -3 when it cannot be written. Mirrors
+ *  Python relay_rosters.install. */
+int net_relay_rosters_install(const char *text, char *issuer_out, long long *seq);
+/** Unpin @p issuer and delete the roster installed for it. 1 when either was
+ *  there, 0 when neither, -1 for a key that is not hex. Mirrors
+ *  relay_rosters.remove. */
+int net_relay_rosters_remove(const char *issuer);
 
 #endif /* AUTONOMOUS_TRUST_NETWORK_NET_RELAY_ROSTERS_H */

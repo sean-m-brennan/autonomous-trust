@@ -46,8 +46,9 @@ AT_MSG_TYPE_REGISTER(first_contact_event, FIRST_CONTACT_EVENT,
 
 static bool _is_fc_kind(int32_t kind)
 {
-    return kind >= AT_APP_EVENT_FC_INVITATION
-        && kind <= AT_APP_EVENT_FC_ESTABLISHED;
+    return (kind >= AT_APP_EVENT_FC_INVITATION
+            && kind <= AT_APP_EVENT_FC_ESTABLISHED)
+        || kind == AT_APP_EVENT_FC_SIBLING_PAIRED;
 }
 
 static int _decode_first_contact(const generic_msg_t *msg, at_app_event_t *ev)
@@ -74,7 +75,8 @@ AT_MSG_TYPE_REGISTER(first_contact_contact_event, FIRST_CONTACT_CONTACT_EVENT,
 static bool _is_contact_kind(int32_t kind)
 {
     return (kind >= AT_APP_EVENT_FC_CONTACT && kind <= AT_APP_EVENT_FC_REMOVED)
-        || kind == AT_APP_EVENT_FC_DEVICE_LINKED;
+        || kind == AT_APP_EVENT_FC_DEVICE_LINKED
+        || (kind >= AT_APP_EVENT_FC_SIBLING && kind <= AT_APP_EVENT_FC_SIBLING_REMOVED);
 }
 
 static int _decode_contact(const generic_msg_t *msg, at_app_event_t *ev)
@@ -121,6 +123,38 @@ const at_app_directory_t *at_first_contact_directory_event(const at_app_event_t 
     return (const at_app_directory_t *)(const void *)ev->data.payload;
 }
 
+AT_MSG_ASSERT_FITS(fc_area_msg_t);
+
+static const at_msg_vtable_t first_contact_area_event_vt = {
+    .name = "FIRST_CONTACT_AREA_EVENT", .size = sizeof(fc_area_msg_t),
+    .app_bound = true };
+AT_MSG_TYPE_REGISTER(first_contact_area_event, FIRST_CONTACT_AREA_EVENT,
+                     &first_contact_area_event_vt)
+
+static bool _is_area_kind(int32_t kind)
+{
+    return kind >= AT_APP_EVENT_AREA_PUBLISHED && kind <= AT_APP_EVENT_ROSTER_REMOVED;
+}
+
+static int _decode_area(const generic_msg_t *msg, at_app_event_t *ev)
+{
+    const fc_area_msg_t *m = AT_MSG_EXT_CONST(msg, fc_area_msg_t);
+    if (!_is_area_kind(m->kind))
+        return -1;
+    ev->kind = m->kind;
+    memcpy(AT_APP_EVENT_EXT(ev, at_app_area_t), &m->data, sizeof(m->data));
+    return 0;
+}
+AT_APP_EVENT_DECODER_REGISTER(first_contact_area_event, FIRST_CONTACT_AREA_EVENT,
+                              _decode_area)
+
+const at_app_area_t *at_first_contact_area_event(const at_app_event_t *ev)
+{
+    if (ev == NULL || !_is_area_kind(ev->kind))
+        return NULL;
+    return (const at_app_area_t *)(const void *)ev->data.payload;
+}
+
 void at_first_contact_app_link(void) {}
 
 const at_app_contact_t *at_first_contact_contact_event(const at_app_event_t *ev)
@@ -160,7 +194,9 @@ static int _send(const char *q_out, const char *verb, json_t *body)
     json_decref(body);
     if (rc != 0)
         return -1;
-    return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
+    rc = messaging_send(q_out, NET_MESSAGE, &req, false);
+    net_msg_free_obj(&req.info.net_msg);
+    return rc == 0 ? 0 : -1;
 }
 
 int at_app_first_contact_invite(at_app_events_t *handle, const char *q_out,
@@ -294,6 +330,33 @@ int at_app_first_contact_remove(at_app_events_t *handle, const char *q_out,
     return body == NULL ? -1 : _send(q_out, AT_APP_FC_REMOVE, body);
 }
 
+int at_app_first_contact_pair_invite(at_app_events_t *handle, const char *q_out,
+                                     const char *ref, long ttl_seconds)
+{
+    json_t *body = _book_body(handle, q_out, ref, NULL);
+    if (body == NULL)
+        return -1;
+    if (ttl_seconds >= 0)
+        json_object_set_new(body, "ttl_seconds", json_integer(ttl_seconds));
+    json_object_set_new(body, "pair", json_true());
+    return _send(q_out, AT_APP_FC_INVITE, body);
+}
+
+int at_app_sibling_list(at_app_events_t *handle, const char *q_out, const char *ref)
+{
+    json_t *body = _book_body(handle, q_out, ref, NULL);
+    return body == NULL ? -1 : _send(q_out, AT_APP_SIBLING_LIST, body);
+}
+
+int at_app_sibling_remove(at_app_events_t *handle, const char *q_out,
+                          const char *ref, const uint8_t peer[AT_APP_UUID_LEN])
+{
+    if (peer == NULL)
+        return -1;
+    json_t *body = _book_body(handle, q_out, ref, peer);
+    return body == NULL ? -1 : _send(q_out, AT_APP_SIBLING_REMOVE, body);
+}
+
 /* -- the directory ---------------------------------------------------------- */
 static json_t *_dir_body(at_app_events_t *handle, const char *q_out, const char *ref)
 {
@@ -349,6 +412,59 @@ int at_app_first_contact_request(at_app_events_t *handle, const char *q_out,
                                  const char *ref, const char *dir_handle)
 {
     return _dir_send(handle, q_out, ref, AT_APP_FC_REQUEST, "handle", dir_handle);
+}
+
+int at_app_area_publish(at_app_events_t *handle, const char *q_out, const char *ref,
+                        const char *area, const char *bucket, const char *name)
+{
+    if (area == NULL || bucket == NULL)
+        return -1;
+    json_t *body = _dir_body(handle, q_out, ref);
+    if (body == NULL)
+        return -1;
+    json_object_set_new(body, "area", json_string(area));
+    json_object_set_new(body, "bucket", json_string(bucket));
+    json_object_set_new(body, "name", json_string(name != NULL ? name : ""));
+    return _send(q_out, AT_APP_AREA_PUBLISH, body);
+}
+
+int at_app_area_withdraw(at_app_events_t *handle, const char *q_out, const char *ref,
+                         const char *area)
+{
+    return _dir_send(handle, q_out, ref, AT_APP_AREA_WITHDRAW, "area", area);
+}
+
+int at_app_area_lookup(at_app_events_t *handle, const char *q_out, const char *ref,
+                       const char *area)
+{
+    return _dir_send(handle, q_out, ref, AT_APP_AREA_LOOKUP, "area", area);
+}
+
+int at_app_area_request(at_app_events_t *handle, const char *q_out, const char *ref,
+                        const char *area, const uint8_t peer[AT_APP_UUID_LEN])
+{
+    if (area == NULL || peer == NULL)
+        return -1;
+    json_t *body = _dir_body(handle, q_out, ref);
+    if (body == NULL)
+        return -1;
+    char uu[37];
+    uuid_unparse_lower(peer, uu);
+    json_object_set_new(body, "area", json_string(area));
+    json_object_set_new(body, "peer_uuid", json_string(uu));
+    return _send(q_out, AT_APP_FC_REQUEST, body);
+}
+
+int at_app_relay_roster_install(at_app_events_t *handle, const char *q_out,
+                                const char *ref, const char *roster)
+{
+    return _dir_send(handle, q_out, ref, AT_APP_ROSTER_INSTALL, "roster", roster);
+}
+
+int at_app_relay_roster_remove(at_app_events_t *handle, const char *q_out,
+                               const char *ref, const char *issuer)
+{
+    return _dir_send(handle, q_out, ref, AT_APP_ROSTER_REMOVE, "issuer", issuer);
 }
 
 int at_app_first_contact_accept(at_app_events_t *handle, const char *q_out,

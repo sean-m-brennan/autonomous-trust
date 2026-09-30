@@ -194,6 +194,7 @@ static void broadcast_status(const process_t *proc,
         }
         json_decref(copy);
         messaging_send("network", NET_MESSAGE, &out, false);
+        net_msg_free_obj(nmsg);
     }
     peers_read_unlock(proc);
     json_decref(base);
@@ -378,7 +379,9 @@ static void run_health_check(const process_t *proc, update_state_t *state)
 
             if (net_msg_pack_json(nmsg, ping) == 0)
             {
-                if (messaging_send("network", NET_MESSAGE, &out, false) == 0)
+                int rc = messaging_send("network", NET_MESSAGE, &out, false);
+                net_msg_free_obj(nmsg);
+                if (rc == 0)
                 {
                     handshake_ok = true;
                     json_decref(ping);

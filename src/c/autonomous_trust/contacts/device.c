@@ -136,7 +136,10 @@ int at_adopt_operator(contact_t *c, const at_dir_signed_t *cert, contacts_t *sto
         if (holder != NULL && uuid_compare(holder->identity.uuid, c->identity.uuid) != 0)
             return AT_DEVICE_KNOWN;
     }
-    at_strlcpy(c->operator_key, op, sizeof(c->operator_key));
+    if (strcmp(c->operator_key, op) != 0) {
+        at_strlcpy(c->operator_key, op, sizeof(c->operator_key));
+        contact_touch(c, -1.0);
+    }
     return AT_DEVICE_OK;
 }
 
@@ -206,6 +209,7 @@ int at_link_device(contacts_t *store, const public_identity_t *id,
         json_decref(wire);
         return AT_DEVICE_MALFORMED;
     }
+    contact_touch(c, -1.0);
     if (out != NULL)
         *out = c;
     return AT_DEVICE_OK;

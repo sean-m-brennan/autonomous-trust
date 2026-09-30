@@ -30,6 +30,10 @@ const char *at_provenance_str(at_provenance_t p)
         return "token";
     case AT_PROV_DIRECTORY:
         return "directory";
+    case AT_PROV_SIBLING:
+        return "sibling";
+    case AT_PROV_AREA:
+        return "area";
     default:
         return "token";
     }
@@ -46,6 +50,31 @@ void contact_mark_verified(contact_t *c, double seed)
     if (c->verified_at <= 0.0)
         c->verified_at = (double)time(NULL);
     c->trust_seed = seed;
+}
+
+double contact_version(const contact_t *c)
+{
+    if (c == NULL)
+        return 0.0;
+    double v = c->added_at;
+    if (c->verified_at > v)
+        v = c->verified_at;
+    if (c->updated_at > v)
+        v = c->updated_at;
+    return v;
+}
+
+void contact_touch(contact_t *c, double now)
+{
+    if (c == NULL)
+        return;
+    if (now < 0.0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        now = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+    }
+    double v = contact_version(c);
+    c->updated_at = now > v ? now : v;
 }
 
 void contact_free(contact_t *c)
