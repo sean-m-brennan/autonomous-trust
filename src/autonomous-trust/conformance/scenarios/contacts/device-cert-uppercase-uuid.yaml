@@ -1,0 +1,29 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: device-cert-uppercase-uuid
+description: 'A cert whose uuid is not lower case is malformed even when properly signed: one spelling, so a string compare is an identity compare in both runtimes.'
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: device
+    mode: verify
+    cert:
+      body: '{"v":1,"typename":"at-device-cert","operator":"17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce","uuid":"DDDDDDDD-0000-4000-8000-000000000052","key":"2012cb90ca60e8e5d8daf66e2272d2233e0486d557e8c66141ed8920177d7eb7","issued_at":1790000000}'
+      sig: f67b286d1dcf9dfc017f01ca3103d9015b06217107d2e846b9201e2957edb15ad3b14fc73701767e826bb5953ad455af205f15d82433401e9ddd1dd7f6b14206
+steps:
+- id: 1
+  from: host
+  to: host
+  function: device
+  description: 'trigger: device verify'
+expected_state:
+  host:
+    device_status: malformed

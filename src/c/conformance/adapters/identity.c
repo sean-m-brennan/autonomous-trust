@@ -2250,7 +2250,7 @@ static int _dispatch(sce_run_ctx_t *ctx,
         return 0;
     }
 
-    /* trigger_directory_publish / _request / _accept / _decline -- finding
+    /* trigger_directory_publish / _request / _accept / _decline / _clock -- finding
      * someone by handle, each through the production app verb or handler,
      * because the entry, request and invitation are signed by per-run keys.
      * Mirrors the Python adapter's _TRIGGER_DIR_* branch. */
@@ -2295,6 +2295,10 @@ static int _dispatch(sce_run_ctx_t *ctx,
                              json_pack("{s:s, s:s}", "ref", "ask", "handle", handle),
                              handle_dir_app_request);
             }
+        } else if (strcmp(what, "clock") == 0) {
+            /* This node's directory clock moves `advance` seconds ahead. C keeps
+             * the directory state process-wide, so the one clock is shared. */
+            at_dir_contact_advance_clock(json_number_value(json_object_get(spec, "advance")));
         } else if (strcmp(what, "accept") == 0 || strcmp(what, "decline") == 0) {
             bool accept = what[0] == 'a';
             _ic_app_verb(impl->proc, accept ? AT_APP_FC_ACCEPT : AT_APP_FC_DECLINE,

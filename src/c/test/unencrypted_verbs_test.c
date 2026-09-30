@@ -66,6 +66,12 @@ static const char *const ALLOWED[] = {
      * Python's UNENCRYPTED_VERBS is not gated on the opt-in either. */
     "first_contact_hello",
     "first_contact_hello_ack",
+    /* Directory contact: found by handle, and the holder's answer -- neither
+     * side is a peer yet. */
+    "first_contact_request",
+    "first_contact_accept",
+    /* A contact's new device announcing itself (Phase 4): not a peer here yet. */
+    "device_announce",
 };
 
 /* Verbs that must NEVER be acceptable in plaintext from a known peer. Each is a
@@ -100,6 +106,7 @@ static const char *const REFUSED[] = {
      * it: an ask crossing in plaintext is an ask anyone can forge or rewrite. */
     "peer_cosign_request",
     "peer_cosign_sig",
+    "device_cert",         /* our operator's cert: sealed, to a peer (Phase 4) */
     "tier_update",         /* local IPC; never legitimate off the wire */
     "subtree_roster_query",
     "request reputation",
@@ -146,14 +153,16 @@ DEFINE_TEST(test_allowlist_size_is_deliberate)
 {
     /* Not a count for its own sake: it forces anyone widening the allowlist to
      * come here, read the cross-language contract note, and update Python too.
-     * Eleven verbs, matching UNENCRYPTED_VERBS. */
+     * Fourteen verbs, matching UNENCRYPTED_VERBS -- and the table here must be
+     * the WHOLE allowlist, or a verb could be added there and never pinned. */
     size_t n = sizeof(ALLOWED) / sizeof(ALLOWED[0]);
-    ck_assert_int_eq((int)n, 11);
+    ck_assert_int_eq((int)n, 14);
+    ck_assert_int_eq((int)identity_unencrypted_verb_count(), (int)n);
     size_t accepted = 0;
     for (size_t i = 0; i < n; i++)
         if (identity_verb_is_unencrypted(ALLOWED[i]))
             accepted++;
-    ck_assert_int_eq((int)accepted, 11);
+    ck_assert_int_eq((int)accepted, 14);
 }
 
 RUN_TESTS(UnencryptedVerbs,

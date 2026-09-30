@@ -105,6 +105,17 @@ static struct {
     size_t pubrefs_next;
 } g_dir = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
+/* Seconds added to this node's directory clock: a test seam, so a scenario can
+ * let an hour pass between a request and its accept. Set only by the harness
+ * between dispatches (at_dir_contact_advance_clock); 0 = wall clock. Cleared by
+ * at_dir_contact_reset. Python twin: IdentityProcess._dir_clock_advance. */
+static double g_dir_clock_advance = 0.0;
+
+static double _dir_now(void)
+{
+    return (double)time(NULL) + g_dir_clock_advance;
+}
+
 /* Mutable names: the handler table keys on them. */
 static char DIR_APP_PUBLISH[] = AT_APP_DIR_PUBLISH;
 static char DIR_APP_WITHDRAW[] = AT_APP_DIR_WITHDRAW;
@@ -131,6 +142,12 @@ void at_dir_contact_reset(void)
     g_dir.found_next = g_dir.in_order = 0;
     g_dir.invites_next = g_dir.pubrefs_next = 0;
     pthread_mutex_unlock(&g_dir.lock);
+    g_dir_clock_advance = 0.0;
+}
+
+void at_dir_contact_advance_clock(double seconds)
+{
+    g_dir_clock_advance += seconds;
 }
 
 size_t at_dir_contact_held_count(void)
@@ -311,7 +328,7 @@ int at_dir_contact_restore_entries(process_t *proc)
     if (proc == NULL || !at_first_contact_enabled())
         return 0;
     json_t *state = _load_state();
-    double now = (double)time(NULL);
+    double now = _dir_now();
     int n = 0;
     const char *handle;
     json_t *held;
@@ -334,7 +351,7 @@ static bool _is_published(const char *handle)
 {
     json_t *state = _load_state();
     at_dir_signed_t e;
-    bool yes = _held_entry(json_object_get(state, handle), (double)time(NULL), &e);
+    bool yes = _held_entry(json_object_get(state, handle), _dir_now(), &e);
     if (yes)
         at_dir_free(&e);
     json_decref(state);
@@ -390,7 +407,7 @@ bool handle_dir_app_publish(const process_t *proc, directory_t *queues, generic_
     at_dir_signed_t att;
     int rc = _signed_from(json_object_get(req, "attestation"), &att);
     if (rc == AT_DIR_OK) {
-        rc = at_dir_attest_verify(&att, NULL, 0, (double)time(NULL));
+        rc = at_dir_attest_verify(&att, NULL, 0, _dir_now());
         if (rc != AT_DIR_OK)
             at_dir_free(&att);
     }
@@ -419,7 +436,7 @@ bool handle_dir_app_publish(const process_t *proc, directory_t *queues, generic_
     at_dir_signed_t entry;
     const identity_t *self = identity_self_identity(proc);
     rc = self == NULL ? AT_DIR_MALFORMED
-       : at_dir_create_entry(self, &att, seq, visibility, 0, (double)time(NULL), &entry);
+       : at_dir_create_entry(self, &att, seq, visibility, 0, _dir_now(), &entry);
     at_dir_free(&att);
     json_decref(req);
     if (rc != AT_DIR_OK) {
@@ -586,7 +603,7 @@ bool handle_dir_result(const process_t *proc, directory_t *queues, generic_msg_t
          * answer the handle that was asked. */
         int rc = at_dir_from_wire(wire, &entry);
         if (rc == AT_DIR_OK) {
-            rc = at_dir_entry_verify(&entry, NULL, 0, (double)time(NULL));
+            rc = at_dir_entry_verify(&entry, NULL, 0, _dir_now());
             if (rc == AT_DIR_OK && strcmp(at_dir_handle(&entry), handle) != 0)
                 rc = AT_DIR_MISMATCH;
             if (rc != AT_DIR_OK)
@@ -629,7 +646,7 @@ bool handle_dir_result(const process_t *proc, directory_t *queues, generic_msg_t
     at_strlcpy(slot->handle, handle, sizeof(slot->handle));
     slot->entry = entry;            /* move */
     at_strlcpy(slot->relay, relay != NULL ? relay : "", sizeof(slot->relay));
-    slot->at = (double)time(NULL);
+    slot->at = _dir_now();
     pthread_mutex_unlock(&g_dir.lock);
     for (size_t i = 0; i < n_refs; i++)
         _emit(proc, AT_APP_EVENT_DIR_FOUND, refs[i], handle, uuid, nickname,
@@ -660,7 +677,7 @@ bool handle_dir_app_request(const process_t *proc, directory_t *queues, generic_
     at_dir_signed_t entry;
     char relay[AT_FC_RELAY_LEN] = "";
     bool have = false;
-    double now = (double)time(NULL);
+    double now = _dir_now();
     pthread_mutex_lock(&g_dir.lock);
     for (size_t i = 0; i < AT_DIR_FOUND_MAX && !have; i++) {
         dir_found_t *f = &g_dir.found[i];
@@ -776,7 +793,7 @@ bool handle_dir_contact_request(const process_t *proc, directory_t *queues, gene
     int rc = net_msg_unpack_json(nmsg, &payload) == 0
            ? _signed_from(payload, &request) : AT_DIR_MALFORMED;
     json_decref(payload);
-    double now = (double)time(NULL);
+    double now = _dir_now();
     if (rc == AT_DIR_OK) {
         rc = at_dir_request_verify(&request, now);
         if (rc != AT_DIR_OK)
@@ -891,7 +908,7 @@ static bool _take_in(const process_t *proc, net_msg_t *nmsg, char *ref, size_t r
             found = true;
         }
     pthread_mutex_unlock(&g_dir.lock);
-    if (!found || out->expiry <= (double)time(NULL)) {
+    if (!found || out->expiry <= _dir_now()) {
         if (found)
             at_fc_free_public(&out->sender);
         _refused(proc, ref, NULL, "unknown_request");
@@ -981,7 +998,7 @@ bool handle_dir_contact_accept(const process_t *proc, directory_t *queues, gener
     }
     char uuid[UUID_STRING_LEN + 1];
     uuid_unparse_lower(holder->uuid, uuid);
-    double now = (double)time(NULL);
+    double now = _dir_now();
     dir_out_t out;
     bool found = false;
     pthread_mutex_lock(&g_dir.lock);
@@ -1025,7 +1042,8 @@ bool handle_dir_contact_accept(const process_t *proc, directory_t *queues, gener
     }
     bool ok = uuid_compare(inviter.uuid, holder->uuid) == 0
         && strcasecmp((const char *)inviter.signature.public_hex, out.key) == 0
-        && !at_invitation_is_expired(&inv, now);
+        /* The invitation keeps its own (wall) clock, as Python's is_expired(). */
+        && !at_invitation_is_expired(&inv, (double)time(NULL));
     at_invitation_free(&inv);
     if (!ok) {
         log_warn(proc->logger, "Identity: directory: accept from %.8s carries an invitation "

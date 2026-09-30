@@ -451,10 +451,12 @@ set(libsrc
     autonomous_trust/identity/id_ext.c
     autonomous_trust/identity/first_contact.c
     autonomous_trust/identity/directory_contact.c
+    autonomous_trust/identity/device_contact.c
     autonomous_trust/identity/peers.c
     autonomous_trust/identity/signature.c
     autonomous_trust/contacts/contact.c
     autonomous_trust/contacts/directory.c
+    autonomous_trust/contacts/device.c
     autonomous_trust/contacts/invitation.c
     autonomous_trust/contacts/reach.c
     autonomous_trust/contacts/store.c
@@ -1113,6 +1115,12 @@ target_link_libraries(directory_test PRIVATE ${AT_TEST_LIBS})
 add_executable(net_registry_test test/net_registry_test.c)
 set_source_files_properties(test/net_registry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(net_registry_test PRIVATE ${AT_TEST_LIBS})
+add_executable(contacts_device_test test/contacts_device_test.c)
+set_source_files_properties(test/contacts_device_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(contacts_device_test PRIVATE ${AT_TEST_LIBS})
+add_executable(device_contact_test test/device_contact_test.c)
+set_source_files_properties(test/device_contact_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(device_contact_test PRIVATE ${AT_TEST_LIBS})
 add_executable(net_relay_seeds_test test/net_relay_seeds_test.c)
 set_source_files_properties(test/net_relay_seeds_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(net_relay_seeds_test PRIVATE ${AT_TEST_LIBS})
@@ -1155,6 +1163,8 @@ add_test(NAME net_relay_test COMMAND $<TARGET_FILE:net_relay_test>)
 add_test(NAME directory_contact_test COMMAND $<TARGET_FILE:directory_contact_test>)
 add_test(NAME directory_test COMMAND $<TARGET_FILE:directory_test>)
 add_test(NAME net_registry_test COMMAND $<TARGET_FILE:net_registry_test>)
+add_test(NAME contacts_device_test COMMAND $<TARGET_FILE:contacts_device_test>)
+add_test(NAME device_contact_test COMMAND $<TARGET_FILE:device_contact_test>)
 add_test(NAME net_relay_seeds_test COMMAND $<TARGET_FILE:net_relay_seeds_test>)
 add_test(NAME net_relay_rosters_test COMMAND $<TARGET_FILE:net_relay_rosters_test>)
 # Two real daemons on 127.0.0.1/.2 (~10 s). Labelled so a quick run can skip

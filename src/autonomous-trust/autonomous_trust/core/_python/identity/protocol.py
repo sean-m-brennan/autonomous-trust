@@ -207,6 +207,13 @@ class IdentityProtocol(Protocol):
     # publish or withdraw ({op, handle, relay, reason, seq}).
     dir_result = 'dir_result'
     dir_status = 'dir_status'
+    # One human, several devices (FIRST_CONTACT_PLAN Phase 4,
+    # identity/device_contact.py). Our own device cert, pushed over the sealed
+    # channel to a contact once we are peers; and a new device telling a
+    # contact it belongs to one of theirs -- plaintext, the contact does not
+    # know it yet. Neither is answered.
+    device_cert = 'device_cert'            # msg.obj <- json {body, sig}; from_whom = its node
+    device_announce = 'device_announce'    # msg.obj <- json {cert, relays}; from_whom = the new device
 
 
 # Verbs this implementation legitimately puts on the wire in PLAINTEXT
@@ -264,6 +271,7 @@ UNENCRYPTED_VERBS = frozenset({
     IdentityProtocol.hello_ack,          # first-contact accept, before the peer is known
     IdentityProtocol.contact_request,    # directory contact: found by handle, not yet a peer
     IdentityProtocol.contact_accept,     # and the holder's answer, before either is a peer
+    IdentityProtocol.device_announce,    # a contact's new device, not yet a peer here
 })
 
 

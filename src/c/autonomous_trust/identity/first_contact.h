@@ -68,6 +68,8 @@ extern char ID_FC_HELLO[];
 extern char ID_FC_HELLO_ACK[];
 extern char ID_FC_REQUEST[];
 extern char ID_FC_ACCEPT[];
+extern char ID_FC_DEVICE_CERT[];
+extern char ID_FC_DEVICE_ANNOUNCE[];
 
 /** The app-bound event: one message type carrying all four outcomes, its
  *  public kind beside the flat payload. Registered (app_bound) in

@@ -405,3 +405,23 @@ int at_dir_request_create(const identity_t *self, const at_dir_signed_t *entry,
     return body != NULL ? _sign(self->signature.private, AT_DIR_REQUEST_DOMAIN, body, out)
                         : AT_DIR_MALFORMED;
 }
+
+/* -- shared with contacts/device.c ------------------------------------------ */
+int at_dir_sign(const unsigned char *sk, const char *domain, json_t *body,
+                at_dir_signed_t *out)
+{
+    if (sk == NULL || domain == NULL || body == NULL || out == NULL) {
+        json_decref(body);
+        return AT_DIR_MALFORMED;
+    }
+    return _sign(sk, domain, body, out);
+}
+
+int at_dir_check_sig(const char *key_hex, const char *domain, const at_dir_signed_t *obj)
+{
+    if (key_hex == NULL || domain == NULL || obj == NULL || obj->body_str == NULL)
+        return AT_DIR_MALFORMED;
+    return _check_sig(key_hex, domain, obj);
+}
+
+bool at_dir_is_hex_key(const char *key) { return _is_hex_key(key); }

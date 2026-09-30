@@ -1,0 +1,168 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: device-link-full
+description: A contact lists at most 8 further devices.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: device
+    mode: link
+    store:
+      typename: contacts
+      version: 1
+      contacts:
+        dddddddd-0000-4000-8000-000000000051:
+          identity:
+            typename: identity
+            uuid: dddddddd-0000-4000-8000-000000000051
+            address: ''
+            nickname: alice-phone
+            signature:
+              hex_seed: c050c5637a44fa8629fff3cccce2300cb362a63d99d95fc54145266f4332445a
+            encryptor:
+              hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+          petname: alice-phone
+          verified: true
+          provenance: token
+          trust_seed: 0.3
+          rendezvous: []
+          nonce: ''
+          added_at: 1.0
+          verified_at: 2.0
+          operator_key: 17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce
+          devices:
+          - identity:
+              typename: identity
+              uuid: dddddddd-0000-4000-8000-000000000060
+              address: ''
+              nickname: dev0
+              signature:
+                hex_seed: 4a72e4035bb435d0aa42d43b8873d9f07cb9bf476fe2ade0aba49983eebd425e
+              encryptor:
+                hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+            cert:
+              body: '{"v":1,"typename":"at-device-cert","operator":"17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce","uuid":"dddddddd-0000-4000-8000-000000000060","key":"4a72e4035bb435d0aa42d43b8873d9f07cb9bf476fe2ade0aba49983eebd425e","issued_at":1790000000}'
+              sig: 51701126fee6b8d525a6e0047dfb0a0adb201485d36d3a05f238e8be9691d6a9d114376decd32ceecbe6c33f1fd2b1379355f56eded936bdc76079a41de71b05
+            added_at: 3.0
+          - identity:
+              typename: identity
+              uuid: dddddddd-0000-4000-8000-000000000061
+              address: ''
+              nickname: dev1
+              signature:
+                hex_seed: af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d
+              encryptor:
+                hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+            cert:
+              body: '{"v":1,"typename":"at-device-cert","operator":"17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce","uuid":"dddddddd-0000-4000-8000-000000000061","key":"af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d","issued_at":1790000000}'
+              sig: c6b4ebe10b6205fa4b93603e60a02245f00396e58aa353a62c74dea723067c3cb9605683890c7a283d6eb5d28d7fd19bc98b28ae0d7e0edc96ba4d966dbdef04
+            added_at: 3.0
+          - identity:
+              typename: identity
+              uuid: dddddddd-0000-4000-8000-000000000062
+              address: ''
+              nickname: dev2
+              signature:
+                hex_seed: 2df04125f0015afb47ce853aef8772094ff9498c14cb1b9e12973c2927da0fa6
+              encryptor:
+                hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+            cert:
+              body: '{"v":1,"typename":"at-device-cert","operator":"17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce","uuid":"dddddddd-0000-4000-8000-000000000062","key":"2df04125f0015afb47ce853aef8772094ff9498c14cb1b9e12973c2927da0fa6","issued_at":1790000000}'
+              sig: d545c4394f40ad101d03b85bcc9446ac11201872e16dc555acd437fcc5b1a9a2b1d61535e8128b8673980e7ff2dcd19937f1edc6f034158e8f8db6758c82da03
+            added_at: 3.0
+          - identity:
+              typename: identity
+              uuid: dddddddd-0000-4000-8000-000000000063
+              address: ''
+              nickname: dev3
+              signature:
+                hex_seed: a7f6dfaf8f38b89ba8ce649b594f91e4d01fdc57f9c9493df43b5e50a9987367
+              encryptor:
+                hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+            cert:
+              body: '{"v":1,"typename":"at-device-cert","operator":"17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce","uuid":"dddddddd-0000-4000-8000-000000000063","key":"a7f6dfaf8f38b89ba8ce649b594f91e4d01fdc57f9c9493df43b5e50a9987367","issued_at":1790000000}'
+              sig: 0f2704a70472e392e76db3bb541ab67a6378a9bd0b886e93937a73b848ebdc0df0be67078b28cd0a02d121ab1ec64d339564779488be1f4beb49a664fc327802
+            added_at: 3.0
+          - identity:
+              typename: identity
+              uuid: dddddddd-0000-4000-8000-000000000064
+              address: ''
+              nickname: dev4
+              signature:
+                hex_seed: 2bc2800b3316e009209ffd757dab19ccf0ae84bc7ae90654e1e81712d270f653
+              encryptor:
+                hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+            cert:
+              body: '{"v":1,"typename":"at-device-cert","operator":"17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce","uuid":"dddddddd-0000-4000-8000-000000000064","key":"2bc2800b3316e009209ffd757dab19ccf0ae84bc7ae90654e1e81712d270f653","issued_at":1790000000}'
+              sig: 0f3aa169a5fdea3560c033d6385370a34106c6a34bafa67e123560a238e35f6d7a6df931b2f295175cb9c6675ec903ecf90e91daf34111e2d38a8c3779942805
+            added_at: 3.0
+          - identity:
+              typename: identity
+              uuid: dddddddd-0000-4000-8000-000000000065
+              address: ''
+              nickname: dev5
+              signature:
+                hex_seed: d62f016a1efd1e4fdf793eb42cd84471e1ba9f0cf04d1287b5cc71f616287cb8
+              encryptor:
+                hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+            cert:
+              body: '{"v":1,"typename":"at-device-cert","operator":"17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce","uuid":"dddddddd-0000-4000-8000-000000000065","key":"d62f016a1efd1e4fdf793eb42cd84471e1ba9f0cf04d1287b5cc71f616287cb8","issued_at":1790000000}'
+              sig: ff8d93934a5505957b5ae6e52ac314c9b453f6d28b222bb72bbd23647c8cc6fb6eba358fd827b5e9aff68023724be1008cc57a513587056e5600df1a40ad0f09
+            added_at: 3.0
+          - identity:
+              typename: identity
+              uuid: dddddddd-0000-4000-8000-000000000066
+              address: ''
+              nickname: dev6
+              signature:
+                hex_seed: 34b4d9043156cb6dcf0beb0a2949b7559c940d2bcb6dbe8c53a9b30278e3a746
+              encryptor:
+                hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+            cert:
+              body: '{"v":1,"typename":"at-device-cert","operator":"17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce","uuid":"dddddddd-0000-4000-8000-000000000066","key":"34b4d9043156cb6dcf0beb0a2949b7559c940d2bcb6dbe8c53a9b30278e3a746","issued_at":1790000000}'
+              sig: 0148d3123476db6b7b9d09910056854687e8b45b9e0ef51fe41aac6d12089057710acad8472868486b33bd07394161170537216b49ae5c7d3a0c48845c1d360f
+            added_at: 3.0
+          - identity:
+              typename: identity
+              uuid: dddddddd-0000-4000-8000-000000000067
+              address: ''
+              nickname: dev7
+              signature:
+                hex_seed: 12a41592c8b7c17d4059e7b29b61e8ff96c7415f2f803348f2f017e05b9ea1da
+              encryptor:
+                hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+            cert:
+              body: '{"v":1,"typename":"at-device-cert","operator":"17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce","uuid":"dddddddd-0000-4000-8000-000000000067","key":"12a41592c8b7c17d4059e7b29b61e8ff96c7415f2f803348f2f017e05b9ea1da","issued_at":1790000000}'
+              sig: 3bd61e0fc14c88d23bf9b9afbccde2f13f83a7c6e7b386c6bfc8c057feb2a14b8b4251728c13855994caca45f544c448eacc94bffcfa34ab92b7804b4c866401
+            added_at: 3.0
+    identity:
+      typename: identity
+      uuid: dddddddd-0000-4000-8000-000000000068
+      address: ''
+      nickname: dev8
+      signature:
+        hex_seed: 54b0d81d0fa7d00e4a7d600dfaba6f2b22035b22fe335e17edf5f9aa5bb05074
+      encryptor:
+        hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+    cert:
+      body: '{"v":1,"typename":"at-device-cert","operator":"17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce","uuid":"dddddddd-0000-4000-8000-000000000068","key":"54b0d81d0fa7d00e4a7d600dfaba6f2b22035b22fe335e17edf5f9aa5bb05074","issued_at":1790000000}'
+      sig: 6684ee7f8040e1af389693fc022092bb38bfc9fb2be01eb0fc7d0c54fb8e7b52c0df1f300487fe5bdde1a0989bbfdc2bb2c003711555ffa7fa420bd7817ddd01
+steps:
+- id: 1
+  from: host
+  to: host
+  function: device
+  description: 'trigger: device link'
+expected_state:
+  host:
+    device_status: full
+    resolves:
+      dddddddd-0000-4000-8000-000000000068: null

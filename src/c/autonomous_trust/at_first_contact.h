@@ -105,6 +105,9 @@ extern "C" {
 #define AT_APP_EVENT_DIR_CONTACT_REQUEST 1015  /**< someone asks; answer with @c ref */
 #define AT_APP_EVENT_DIR_ACCEPTED        1016
 #define AT_APP_EVENT_DIR_DECLINED        1017
+/* One human, several devices (Phase 4): payload @ref at_app_contact_t, the
+ * contact, with @c device_uuid the further device filed under it. */
+#define AT_APP_EVENT_FC_DEVICE_LINKED    1018
 
 /** The directory app verbs. Local IPC only. Same strings as Python's
  *  directory_contact.APP_*. */
@@ -208,6 +211,8 @@ typedef struct {
     bool    peer_dropped;
     /** CONTACTS_DONE only: how many CONTACT events the list sent. */
     int32_t count;
+    /** DEVICE_LINKED only: the further device filed under this contact. */
+    uint8_t device_uuid[AT_APP_UUID_LEN];
 } at_app_contact_t;
 
 AT_APP_STATIC_ASSERT(sizeof(at_app_contact_t) <= AT_APP_EVENT_PAYLOAD_MAX,
