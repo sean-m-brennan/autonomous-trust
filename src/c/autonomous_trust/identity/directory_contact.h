@@ -60,6 +60,9 @@ int at_dir_contact_restore_entries(process_t *proc);
 bool at_dir_contact_is_invite(const char *nonce);
 /** Forget every request, lookup and found entry (a restart, or a test). */
 void at_dir_contact_reset(void);
+/** This node's directory clock: the wall clock plus the test advance below.
+ *  identity/area_contact.c reads it too, as Python's _now(proc). */
+double at_dir_contact_now(void);
 /** Move this node's directory clock @p seconds ahead (cumulative; reset by
  *  at_dir_contact_reset). A test seam: every directory deadline -- the finder's
  *  outstanding request, held requests, found entries -- reads this clock. The

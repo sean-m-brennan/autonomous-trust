@@ -179,10 +179,11 @@ static void _wire(node_t *n, const node_t *from, handler_t h, const char *verb,
     memcpy(&msg.info.net_msg.from_whom, pub, sizeof(*pub));
     msg.info.net_msg.from_whom.petname[0] = '\0';
     size_t len = strlen(text);
-    msg.info.net_msg.obj = smrt_create(len + 1);
+    msg.info.net_msg.obj = malloc(len + 1);
     memcpy(msg.info.net_msg.obj, text, len + 1);
     msg.info.net_msg.len = len;
     h(n->proc, NULL, &msg);
+    net_msg_free_obj(&msg.info.net_msg);
     smrt_deref(pub);
 }
 

@@ -1,0 +1,80 @@
+[
+  {
+    "text": "A",
+    "start": 0.09,
+    "end": 0.12,
+    "id": "w0"
+  },
+  {
+    "text": "new",
+    "start": 0.12,
+    "end": 0.36,
+    "id": "w1"
+  },
+  {
+    "text": "peer",
+    "start": 0.36,
+    "end": 0.73,
+    "id": "w2"
+  },
+  {
+    "text": "joins",
+    "start": 0.73,
+    "end": 1.18,
+    "id": "w3"
+  },
+  {
+    "text": "moments",
+    "start": 1.19,
+    "end": 1.83,
+    "id": "w4"
+  },
+  {
+    "text": "later",
+    "start": 1.83,
+    "end": 2.05,
+    "id": "w5"
+  },
+  {
+    "text": "and",
+    "start": 2.46,
+    "end": 2.61,
+    "id": "w6"
+  },
+  {
+    "text": "starts",
+    "start": 2.61,
+    "end": 3.2,
+    "id": "w7"
+  },
+  {
+    "text": "at",
+    "start": 3.2,
+    "end": 3.39,
+    "id": "w8"
+  },
+  {
+    "text": "zero",
+    "start": 3.39,
+    "end": 3.59,
+    "id": "w9"
+  },
+  {
+    "text": "like",
+    "start": 3.88,
+    "end": 4.15,
+    "id": "w10"
+  },
+  {
+    "text": "everyone",
+    "start": 4.15,
+    "end": 4.84,
+    "id": "w11"
+  },
+  {
+    "text": "else.",
+    "start": 4.84,
+    "end": 5.03,
+    "id": "w12"
+  }
+]

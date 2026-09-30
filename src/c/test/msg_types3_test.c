@@ -53,7 +53,7 @@ DEFINE_TEST(test_net_msg_pack_unpack_json)
 
     json_decref(obj);
     json_decref(result);
-    smrt_deref(msg.obj);
+    net_msg_free_obj(&msg);
 }
 END_TEST_DEFINITION()
 
@@ -107,10 +107,10 @@ DEFINE_TEST(test_net_msg_proto_roundtrip)
     json_decref(restored_payload);
 
     smrt_deref(data);
-    smrt_deref(original.obj);
+    net_msg_free_obj(&original);
     if (restored.function)
-        smrt_deref(restored.function);
-    smrt_deref(restored.obj);
+        free(restored.function);
+    net_msg_free_obj(&restored);
 }
 END_TEST_DEFINITION()
 
@@ -256,10 +256,10 @@ DEFINE_TEST(test_net_msg_proto_carries_the_signature_verdict)
         ck_assert_int_eq((int)restored.has_signature, verdict);
 
         smrt_deref(data);
-        smrt_deref(original.obj);
+        net_msg_free_obj(&original);
         if (restored.function)
-            smrt_deref(restored.function);
-        smrt_deref(restored.obj);
+            free(restored.function);
+        net_msg_free_obj(&restored);
     }
 }
 
@@ -295,10 +295,10 @@ DEFINE_TEST(test_group_multicast_is_core_and_omitted_when_false)
         ck_assert_int_eq((int)restored.group_multicast, multicast);
 
         smrt_deref(data);
-        smrt_deref(original.obj);
+        net_msg_free_obj(&original);
         if (restored.function)
-            smrt_deref(restored.function);
-        smrt_deref(restored.obj);
+            free(restored.function);
+        net_msg_free_obj(&restored);
     }
     ck_assert_int_eq(RECIPIENT_GROUP, 2);
 }
@@ -489,7 +489,55 @@ DEFINE_TEST(test_feature_types_are_registered)
 }
 END_TEST_DEFINITION()
 
+/* A received NET_MESSAGE owns plain malloc buffers for function and obj, and
+ * messaging_recv_release is what gives them back. Before it existed the obj
+ * came from smrt_create and had its smrt header overwritten by the payload,
+ * so nothing could release it and every message leaked (run under valgrind to
+ * see the difference). */
+DEFINE_TEST(test_recv_release_frees_a_received_net_message)
+{
+    generic_msg_t sent = {0};
+    sent.type = NET_MESSAGE;
+    strncpy(sent.info.net_msg.process, "identity", PROC_NAME_LEN);
+    sent.info.net_msg.function = (char *)"device_cert";
+    json_t *payload = json_pack("{s:s}", "body", "the payload sits at offset 0");
+    ck_assert_ret_ok(net_msg_pack_json(&sent.info.net_msg, payload));
+    json_decref(payload);
+    /* The bytes at the start of the buffer are the payload, not a header. */
+    ck_assert_int_eq(sent.info.net_msg.obj[0], '{');
+
+    void *wire = NULL;
+    size_t wire_len = 0;
+    ck_assert_ret_ok(generic_msg_to_proto(&sent, &wire, &wire_len));
+    net_msg_free_obj(&sent.info.net_msg);
+    ck_assert_ptr_null(sent.info.net_msg.obj);
+    ck_assert_uint_eq(sent.info.net_msg.len, 0);
+
+    generic_msg_t got = {0};
+    ck_assert_ret_ok(proto_to_generic_msg(wire, wire_len, &got));
+    smrt_deref(wire);
+    ck_assert_int_eq(got.type, NET_MESSAGE);
+    ck_assert_str_eq(got.info.net_msg.function, "device_cert");
+    ck_assert_ptr_nonnull(got.info.net_msg.obj);
+    json_t *back = NULL;
+    ck_assert_ret_ok(net_msg_unpack_json(&got.info.net_msg, &back));
+    ck_assert_str_eq(json_string_value(json_object_get(back, "body")),
+                     "the payload sits at offset 0");
+    json_decref(back);
+
+    messaging_recv_release(&got);
+    ck_assert_int_eq(got.type, 0);
+    ck_assert_ptr_null(got.info.net_msg.function);
+    ck_assert_ptr_null(got.info.net_msg.obj);
+    /* Safe again on the zeroed struct, and on NULL: loops release blindly. */
+    messaging_recv_release(&got);
+    messaging_recv_release(NULL);
+    net_msg_free_obj(NULL);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(MsgTypes3, test_net_msg_pack_unpack_json, test_net_msg_pack_null_json,
+          test_recv_release_frees_a_received_net_message,
           test_net_msg_proto_carries_the_signature_verdict,
           test_net_msg_proto_roundtrip, test_net_msg_proto_no_payload,
           test_short_fixed_payload_is_rejected,

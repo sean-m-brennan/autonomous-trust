@@ -40,6 +40,9 @@
  * test that they agree on the format. */
 #define ETHNE_VECTOR "{\"body\":\"{\\\"v\\\":1,\\\"typename\\\":\\\"at-relay-roster\\\",\\\"issuer\\\":\\\"ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c\\\",\\\"seq\\\":5,\\\"relays\\\":[\\\"relay://0f1e2d3c-4b5a-4968-8776-655443322110:7300c0ae1429cd153252736a781b78f4@relay.example.org:27790\\\",\\\"relay://1a2b3c4d-5e6f-4071-8293-a4b5c6d7e8f9:d7e1e084be213b01e506852af8198b99@[2001:db8::7]:27791\\\"]}\",\"sig\":\"491f75ed4f7472d3c07f204df7de22354eb8a2ba23632af27507822fb94790ebe6b20ac55e69de391b274e6ba850ed148970d7a384c2e8ffe63b578416cd620f\"}"
 #define ETHNE_ISSUER "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
+/* D38: the same polity, its second relay also an area hub for u4pr and gcpv
+ * (en_uplift::rendezvous_roster's PINNED_HUB_VECTOR). */
+#define ETHNE_HUB_VECTOR "{\"body\":\"{\\\"v\\\":1,\\\"typename\\\":\\\"at-relay-roster\\\",\\\"issuer\\\":\\\"ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c\\\",\\\"seq\\\":6,\\\"relays\\\":[\\\"relay://0f1e2d3c-4b5a-4968-8776-655443322110:7300c0ae1429cd153252736a781b78f4@relay.example.org:27790\\\",\\\"relay://1a2b3c4d-5e6f-4071-8293-a4b5c6d7e8f9:d7e1e084be213b01e506852af8198b99@[2001:db8::7]:27791\\\"],\\\"areas\\\":{\\\"relay://1a2b3c4d-5e6f-4071-8293-a4b5c6d7e8f9:d7e1e084be213b01e506852af8198b99@[2001:db8::7]:27791\\\":[\\\"u4pr\\\",\\\"gcpv\\\"]}}\",\"sig\":\"9b59c3c96b25f91136a418b13787adae452ca850afffb3531bf92655c487b1b02bdf755071623d7ce6c336b08eb6d02f1ef0cd0b6b9c90baf74f561e2b3fd40f\"}"
 
 static unsigned char g_seed_a[32], g_seed_b[32], g_release_seed[32];
 static char g_key_a[65], g_key_b[65], g_release_key[65], g_root[256];
@@ -404,6 +407,121 @@ DEFINE_TEST(test_the_merge_keeps_the_cap)
 }
 END_TEST_DEFINITION()
 
+/* -- area hubs in a roster ------------------------------------------------- */
+static char *_roster_areas(const unsigned char *seed, int seq, const char *relays_json,
+                           const char *areas_json)
+{
+    char key[65], body[4096];
+    _key_of(seed, key);
+    snprintf(body, sizeof(body),
+             "{\"v\":1,\"typename\":\"at-relay-roster\",\"issuer\":\"%s\",\"seq\":%d,"
+             "\"relays\":%s,\"areas\":%s}", key, seq, relays_json, areas_json);
+    return _signed(seed, AT_RELAY_ROSTER_DOMAIN, body);
+}
+
+DEFINE_TEST(test_a_roster_names_its_hubs_and_bad_areas_refuse_it_whole)
+{
+    _fresh_root();
+    net_relay_roster_issuers_t is = _issuers(g_key_a);
+    net_relay_seed_list_t list;
+    net_relay_roster_areas_t areas;
+    /* Absent: the Ethne vector still verifies, with no hubs. */
+    net_relay_roster_issuers_t ethne = _issuers(ETHNE_ISSUER);
+    ck_assert_int_eq(net_relay_roster_verify_areas(ETHNE_VECTOR, &ethne, NULL, NULL, &list,
+                                                   &areas), 0);
+    ck_assert_int_eq(areas.n[0] + areas.n[1], 0);
+    /* Present: the Ethne-emitted hub roster reads back its hub's areas. */
+    ck_assert_int_eq(net_relay_roster_verify_areas(ETHNE_HUB_VECTOR, &ethne, NULL, NULL, &list,
+                                                   &areas), 0);
+    ck_assert_int_eq(areas.n[0], 0);
+    ck_assert_int_eq(areas.n[1], 2);
+    ck_assert_str_eq(areas.areas[1][0], "u4pr");
+    char *t = _roster_areas(g_seed_a, 1, "[" HINT(1) "," HINT(2) "]",
+                            "{" HINT(2) ":[\"u4pr\",\"gcpv\"]}");
+    ck_assert_int_eq(net_relay_roster_verify_areas(t, &is, NULL, NULL, &list, &areas), 0);
+    ck_assert_int_eq(areas.n[0], 0);
+    ck_assert_int_eq(areas.n[1], 2);
+    ck_assert_str_eq(areas.areas[1][1], "gcpv");
+    free(t);
+    const char *bad[] = {
+        "{\"relay://00000000-0000-4000-8000-000000000009:abababababababababababababababab"
+        "@198.51.100.9:1\":[\"u4pr\"]}",
+        "{" HINT(1) ":[]}",
+        "{" HINT(1) ":[\"u4pa\"]}",
+        "{" HINT(1) ":[\"u4pr\",\"u4pr\",\"u4pr\",\"u4pr\",\"u4pr\",\"u4pr\",\"u4pr\",\"u4pr\","
+        "\"u4pr\"]}",
+        "[\"u4pr\"]",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        t = _roster_areas(g_seed_a, 1, "[" HINT(1) "]", bad[i]);
+        ck_assert_int_eq(net_relay_roster_verify(t, &is, NULL, NULL, &list), -1);
+        free(t);
+    }
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_a_hub_for_our_own_bucket_is_registered_first)
+{
+    _fresh_root();
+    setenv(AT_RELAY_ROSTER_ISSUERS_ENV, g_key_a, 1);
+    usleep(20000);
+    char *t = _roster_areas(g_seed_a, 1,
+                            "[" HINT(1) "," HINT(2) "," HINT(3) "," HINT(4) "," HINT(5) ","
+                            HINT(6) "]", "{" HINT(6) ":[\"u4pr\"]," HINT(5) ":[\"gcpv\"]}");
+    _write("etc/at/relay_rosters", "a.cfg.json", t);
+    free(t);
+    net_relay_ep_t eps[AT_RELAY_MAX];
+    ck_assert_uint_eq(_own(eps), AT_RELAY_MAX);
+    ck_assert_str_eq(eps[0].host, "198.51.100.1");
+    /* Listed under u4pru: the u4pr hub moves to the front, inside the cap. */
+    usleep(20000);
+    _write("var/at", "area.cfg.json",
+           "{\"u4pr\":{\"seq\":1,\"bucket\":\"u4pru\",\"name\":\"\",\"card\":{}}}");
+    ck_assert_uint_eq(_own(eps), AT_RELAY_MAX);
+    ck_assert_str_eq(eps[0].host, "198.51.100.6");
+    ck_assert_str_eq(eps[1].host, "198.51.100.1");
+    ck_assert_str_eq(eps[3].host, "198.51.100.3");
+    unsetenv(AT_RELAY_ROSTER_ISSUERS_ENV);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_install_pins_the_issuer_and_remove_unpins_it)
+{
+    _fresh_root();
+    net_relay_ep_t eps[AT_RELAY_MAX];
+    char issuer[65];
+    long long seq = 0;
+    char *t = _roster_areas(g_seed_a, 3, "[" HINT(1) "]", "{" HINT(1) ":[\"u4pr\"]}");
+    ck_assert_int_eq(net_relay_rosters_install(t, issuer, &seq), 0);
+    free(t);
+    ck_assert_str_eq(issuer, g_key_a);
+    ck_assert_int_eq(seq, 3);
+    net_relay_roster_issuers_t pinned;
+    ck_assert_uint_eq(net_relay_rosters_pinned(&pinned), 1);
+    ck_assert_uint_eq(_own(eps), 1);                /* raises the seq floor to 3 */
+    t = _roster(g_seed_a, 2, "[" HINT(2) "]");
+    ck_assert_int_eq(net_relay_rosters_install(t, NULL, NULL), -2);
+    free(t);
+    usleep(20000);
+    t = _roster(g_seed_a, 4, "[" HINT(2) "]");
+    ck_assert_int_eq(net_relay_rosters_install(t, NULL, NULL), 0);
+    free(t);
+    ck_assert_uint_eq(net_relay_rosters_pinned(&pinned), 1);    /* pinned once */
+    /* Not signed by the issuer its body names: refused, nothing pinned anew. */
+    char *forged = _roster(g_seed_b, 1, "[" HINT(3) "]");
+    char *at = strstr(forged, g_key_b);
+    ck_assert(at != NULL);
+    memcpy(at, g_key_a, 64);
+    ck_assert_int_eq(net_relay_rosters_install(forged, NULL, NULL), -1);
+    free(forged);
+    ck_assert_int_eq(net_relay_rosters_remove(g_key_a), 1);
+    ck_assert_uint_eq(net_relay_rosters_pinned(&pinned), 0);
+    usleep(20000);
+    ck_assert_uint_eq(_own(eps), 0);
+    ck_assert_int_eq(net_relay_rosters_remove(g_key_a), 0);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(NetRelayRosters,
           test_an_ethne_emitted_roster_verifies,
           test_an_issuer_nobody_pinned_is_refused,
@@ -419,4 +537,7 @@ RUN_TESTS(NetRelayRosters,
           test_issuers_count_in_pin_order_env_first,
           test_a_malformed_issuer_is_skipped,
           test_an_explicit_dir_overrides_the_cfg_dir,
-          test_the_merge_keeps_the_cap)
+          test_the_merge_keeps_the_cap,
+          test_a_roster_names_its_hubs_and_bad_areas_refuse_it_whole,
+          test_a_hub_for_our_own_bucket_is_registered_first,
+          test_install_pins_the_issuer_and_remove_unpins_it)

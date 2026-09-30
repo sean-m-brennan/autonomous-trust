@@ -329,7 +329,7 @@ class NetworkAdapter:
         from autonomous_trust.core._python.network import relay_rosters
         should = bool(exp.get('valid', True))
         try:
-            _issuer, seq, relays = relay_rosters.verify_roster(
+            _issuer, seq, relays, areas = relay_rosters.verify_roster_areas(
                 inp['roster'], [k.lower() for k in inp.get('issuers', [])])
             valid = True
         except relay_rosters.InvalidRoster:
@@ -339,6 +339,12 @@ class NetworkAdapter:
             got = ['%s:%s@%s:%d' % (pin[0], pin[1], ep[0], ep[1]) for ep, pin in relays]
             assert seq == exp['seq'], f'relay_roster_verify: seq {seq}, expected {exp["seq"]}'
             assert got == exp['relays'], f'relay_roster_verify: relays {got}, expected {exp["relays"]}'
+            if 'areas' in exp:
+                # The hubs' areas, keyed by the relay's uuid:fp@host:port.
+                got_areas = {'%s:%s@%s:%d' % (pin[0], pin[1], ep[0], ep[1]): areas[ep]
+                             for ep, pin in relays if ep in areas}
+                assert got_areas == exp['areas'], \
+                    f'relay_roster_verify: areas {got_areas}, expected {exp["areas"]}'
 
     @staticmethod
     def _nacl_box(inp: dict[str, Any], exp: dict[str, Any]) -> None:

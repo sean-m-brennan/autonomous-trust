@@ -1176,6 +1176,7 @@ static int _update_group(const process_t *proc, directory_t *queues)
         net_msg_pack_json(&update.info.net_msg, grp_json);
         json_decref(grp_json);
         messaging_send("network", NET_MESSAGE, &update, false);
+        net_msg_free_obj(&update.info.net_msg);
         return 0;
     }
 
@@ -1205,6 +1206,7 @@ static int _update_group(const process_t *proc, directory_t *queues)
          * bob, and bob could not read the cohort for the rest of the run. */
         identity_send_to_network(proc, &update, "group_key_update",
                                  proc->protocol.peers[i].nickname);
+        net_msg_free_obj(&update.info.net_msg);
     }
     peers_read_unlock(proc);
     return 0;
@@ -1596,6 +1598,7 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
         net_msg_pack_json(&confirm.info.net_msg, peer_json);
         json_decref(peer_json);
         messaging_send("network", NET_MESSAGE, &confirm, false);
+        net_msg_free_obj(&confirm.info.net_msg);
     }
     else
     {
@@ -1622,6 +1625,7 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
             net_msg_pack_json(&confirm.info.net_msg, peer_json);
             json_decref(peer_json);
             messaging_send("network", NET_MESSAGE, &confirm, false);
+            net_msg_free_obj(&confirm.info.net_msg);
         }
         peers_read_unlock(proc);
     }
@@ -1643,6 +1647,7 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
     /* Bounded retry, not a bare send (ISSUES §2.14, §2.30): the admission is
      * one-shot, and nothing re-sends it. */
     identity_send_to_network(proc, &accept, "access_granted", new_peer->nickname);
+    net_msg_free_obj(&accept.info.net_msg);
 
     /* Send ID_HISTORY to the new peer so they can decrypt subsequent
      * group-encrypted traffic AND populate their peer list with our
@@ -1765,6 +1770,7 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
      * "no histories received", and bootstrapped a group of his own. Bounded
      * retry, then a warning that names the joiner (ISSUES §2.30). */
     identity_send_to_network(proc, &hist, "full_history", new_peer->nickname);
+    net_msg_free_obj(&hist.info.net_msg);
 
     /* Skip _add_peer in the amnesia case — the peer is already in our
      * list and re-adding would emit a redundant group update. */
@@ -2138,6 +2144,7 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
         /* to_whom zeroed → broadcast */
         net_msg_pack_json(&propose_msg.info.net_msg, proposal_json);
         messaging_send("network", NET_MESSAGE, &propose_msg, false);
+        net_msg_free_obj(&propose_msg.info.net_msg);
     }
     else
     {
@@ -2153,6 +2160,7 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
                    sizeof(public_identity_t));
             net_msg_pack_json(&propose_msg.info.net_msg, proposal_json);
             messaging_send("network", NET_MESSAGE, &propose_msg, false);
+            net_msg_free_obj(&propose_msg.info.net_msg);
         }
         peers_read_unlock(proc);
     }
@@ -2367,6 +2375,7 @@ static int _announce_self_to_bundled_peers(const process_t *proc,
         } else {
             probes_counter("peer.set", "self_announce", "queue_full");
         }
+        net_msg_free_obj(&accept.info.net_msg);
     }
     if (sent > 0)
         log_debug(proc->logger,
@@ -2964,6 +2973,7 @@ static void _vote_on_peer_send(vote_on_peer_args_t *args)
     json_decref(vote_json);
 
     messaging_send("network", NET_MESSAGE, &vote_msg, false);
+    net_msg_free_obj(&vote_msg.info.net_msg);
     log_debug(args->logger, "Identity: sent approval vote for %s\n", args->proposed_uuid);
 }
 
@@ -4212,6 +4222,7 @@ static bool handle_caps_query(const process_t *proc, directory_t *queues, generi
     net_msg_pack_json(&response.info.net_msg, caps_env);
     json_decref(caps_env);
     messaging_send("network", NET_MESSAGE, &response, false);
+    net_msg_free_obj(&response.info.net_msg);
     return true;
 }
 
@@ -4825,9 +4836,10 @@ static int _acquire_capabilities(const process_t *proc, directory_t *queues)
      * exchange without tripping this deadline. See utilities/timeout.h. */
     int timeout_ms = at_timeout_scale_ms(10000, proc);
     int elapsed = 0;
+    generic_msg_t buf = {0};
     while (elapsed < timeout_ms)
     {
-        generic_msg_t buf = {0};
+        messaging_recv_release(&buf);   /* the previous pass's */
         int err = messaging_recv(&buf);
         if (err == 0)
             run_message_handlers((process_t *)proc, queues, buf.type, &buf);
@@ -4836,6 +4848,7 @@ static int _acquire_capabilities(const process_t *proc, directory_t *queues)
         usleep(100000);
         elapsed += 100;
     }
+    messaging_recv_release(&buf);
     return 0;
 }
 
@@ -5678,6 +5691,7 @@ static int _announce_identity_for(const process_t *proc, directory_t *queues,
         log_debug(proc->logger, "Identity: network not ready, retrying (%d)...\n", attempt);
         usleep(100000); /* 100ms */
     }
+    net_msg_free_obj(&buf.info.net_msg);
 
     if (ret != 0)
     {
@@ -6027,6 +6041,7 @@ void identity_periodic_identity_resync(const process_t *proc)
     net_msg_pack_json(&query.info.net_msg, payload);
     json_decref(payload);
     messaging_send("network", NET_MESSAGE, &query, false);
+    net_msg_free_obj(&query.info.net_msg);
 
     char miss_str[16];
     snprintf(miss_str, sizeof(miss_str), "%d", group_size - have_count);
@@ -6113,6 +6128,7 @@ static bool handle_identity_query(const process_t *proc, directory_t *queues, ge
     net_msg_pack_json(&reply.info.net_msg, out);
     json_decref(out);
     messaging_send("network", NET_MESSAGE, &reply, false);
+    net_msg_free_obj(&reply.info.net_msg);
     probes_counter("peer.set", "identity_response_sent", "1");
     log_debug(proc->logger,
               "Identity resync: replied to identity_query from %s\n",
@@ -6344,6 +6360,7 @@ static bool handle_partition_signal(const process_t *proc, directory_t *queues, 
     json_decref(probe_json);
 
     _partition_broadcast(proc, &out);
+    net_msg_free_obj(&out.info.net_msg);
     log_debug(proc->logger,
               "Identity: partition_probe broadcast (group=%s size=%d trigger=%s)\n",
               group_uuid_str, group_size, from_addr);
@@ -6542,6 +6559,7 @@ static bool handle_partition_probe(const process_t *proc, directory_t *queues, g
     json_decref(resp_json);
 
     _partition_broadcast(proc, &out);
+    net_msg_free_obj(&out.info.net_msg);
     log_debug(proc->logger,
               "Identity: partition_response broadcast (to=%s our_group=%s/%d)\n",
               sender_uuid_str, our_group_uuid_str, our_group_size);
@@ -7206,6 +7224,8 @@ static void _advertise_hierarchy(const process_t *proc, const public_identity_t 
             snprintf(id_state.last_hierarchy_claim,
                      sizeof(id_state.last_hierarchy_claim), "%s", rendered);
         }
+        /* `per` copies share msg's obj; free once after the last send */
+        net_msg_free_obj(&msg.info.net_msg);
     }
     free(rendered);
 }
@@ -7378,6 +7398,8 @@ void identity_request_hierarchy(const process_t *proc)
         messaging_send("network", NET_MESSAGE, &per, false);
     }
     peers_read_unlock(proc);
+    /* `per` copies share msg's obj; free once after the last send */
+    net_msg_free_obj(&msg.info.net_msg);
 }
 
 /* The peer that has ADVERTISED it gateways @p cg_uuid, or false.
@@ -7568,6 +7590,7 @@ bool handle_roster_request(const process_t *proc, directory_t *queues,
     net_msg_pack_json(&reply.info.net_msg, out);
     json_decref(out);
     messaging_send("network", NET_MESSAGE, &reply, false);
+    net_msg_free_obj(&reply.info.net_msg);
     return true;
 }
 
@@ -7796,6 +7819,7 @@ bool handle_attest_request(const process_t *proc, directory_t *queues,
     net_msg_pack_json(&reply.info.net_msg, out);
     json_decref(out);
     messaging_send("network", NET_MESSAGE, &reply, false);
+    net_msg_free_obj(&reply.info.net_msg);
     return true;
 }
 
@@ -7846,6 +7870,7 @@ int identity_request_attestation(process_t *proc, const public_identity_t *peer,
     net_msg_pack_json(&req.info.net_msg, body);
     json_decref(body);
     messaging_send("network", NET_MESSAGE, &req, false);
+    net_msg_free_obj(&req.info.net_msg);
 
     if (out_nonce != NULL && nonce_len > 0) {
         strncpy(out_nonce, nonce, nonce_len - 1);
@@ -8736,6 +8761,7 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
         id_state.choosing_group = true;
         pthread_mutex_unlock(&id_state.lock);
 
+        generic_msg_t pump = {0};
         while (keep_running(proc, &pctx.sig_q, logger))
         {
             gettimeofday(&now_tv, NULL);
@@ -8756,13 +8782,14 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
             }
 
             /* Pump inbound messages so handle_receive_history can run. */
-            generic_msg_t pump = {0};
+            messaging_recv_release(&pump);   /* the previous pass's */
             int rc = messaging_recv(&pump);
             if (rc == 0)
                 run_message_handlers(proc, queues, pump.type, &pump);
             else
                 sleep_until(proc, cadence);
         }
+        messaging_recv_release(&pump);
 
         /* Selection / self-bootstrap. The C history wire form is still a stub
          * (see _peer_accepted), so full history-parse + peer-union selection
@@ -8904,9 +8931,10 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
          * overflowed during a cohort's admission burst — 'Failed to route
          * message to process identity' on the network side, and a co-signing
          * ask or signature simply gone on this one. See PROC_DRAIN_MAX. */
+        generic_msg_t buf = {0};
         for (int taken = 0; taken < PROC_DRAIN_MAX; taken++)
         {
-            generic_msg_t buf = {0};
+            messaging_recv_release(&buf);   /* the previous pass's */
             err = messaging_recv(&buf);
             if (err == -1 || err == ENOMSG)
                 break;
@@ -8915,7 +8943,9 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
                 log_debug(logger, "Identity: unhandled message type %ld\n", buf.type);
             }
         }
+        messaging_recv_release(&buf);
     }
+    net_msg_free_obj(&announce_buf.info.net_msg);
 
     if (pctx.fd1 > 0)
         close(pctx.fd1);

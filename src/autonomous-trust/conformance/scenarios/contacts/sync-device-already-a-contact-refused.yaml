@@ -1,0 +1,90 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: sync-device-already-a-contact-refused
+description: Dave is a contact of his own here; a record listing him as one of Carol's devices would file him twice, and is refused.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: sync
+    now: 1800000000.0
+    store:
+      typename: contacts
+      version: 1
+      contacts:
+        eeeeeeee-0000-4000-8000-000000000003:
+          identity:
+            typename: identity
+            uuid: eeeeeeee-0000-4000-8000-000000000003
+            address: ''
+            nickname: dave
+            signature:
+              hex_seed: 66cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633
+            encryptor:
+              hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+          petname: dave-pet
+          verified: false
+          provenance: token
+          trust_seed: 0.0
+          rendezvous: []
+          nonce: ''
+          added_at: 1000.0
+          verified_at: 0.0
+    payload:
+      v: 1
+      typename: at-contacts-sync
+      contacts:
+        eeeeeeee-0000-4000-8000-000000000002:
+          identity:
+            typename: identity
+            uuid: eeeeeeee-0000-4000-8000-000000000002
+            address: ''
+            nickname: carol
+            signature:
+              hex_seed: 204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21
+            encryptor:
+              hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+          petname: carol-pet
+          verified: true
+          provenance: token
+          trust_seed: 0.3
+          rendezvous: []
+          nonce: ''
+          added_at: 1000.0
+          verified_at: 1500.0
+          operator_key: af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d
+          devices:
+          - identity:
+              typename: identity
+              uuid: eeeeeeee-0000-4000-8000-000000000003
+              address: ''
+              nickname: dave
+              signature:
+                hex_seed: 66cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633
+              encryptor:
+                hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+            cert:
+              body: '{"v":1,"typename":"at-device-cert","operator":"af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d","uuid":"eeeeeeee-0000-4000-8000-000000000003","key":"66cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633","issued_at":1790000000}'
+              sig: 1076e5af12a0fbe4048b982a22ffb8dbfe0605002aef04a34c506a0f0a4c792ad4220a6ce4f1d2e5989954fdefb737b78066b1ea086e6c45358ebebf67d9ea02
+            added_at: 5.0
+      tombstones: {}
+steps:
+- id: 1
+  from: host
+  to: host
+  function: sync
+  description: 'trigger: sync'
+expected_state:
+  host:
+    changes: []
+    contacts:
+      eeeeeeee-0000-4000-8000-000000000002:
+      eeeeeeee-0000-4000-8000-000000000003:
+        petname: dave-pet

@@ -31,6 +31,7 @@
 
 #include <stdbool.h>
 
+#include "contacts/contacts.h"
 #include "contacts/directory.h"
 #include "identity/identity.h"
 #include "processes/processes.h"
@@ -49,6 +50,9 @@ int at_device_push_own_cert(const process_t *proc, const public_identity_t *only
 /** Announce this node, plaintext, to every device of every contact in the
  *  store. @return how many were sent (0 without a cert). */
 int at_device_announce(const process_t *proc);
+/** Announce this node to every device of @p c only (a contact a sibling just
+ *  gave us). @return how many were sent. */
+int at_device_announce_contact(const process_t *proc, const contact_t *c);
 
 bool handle_device_cert(const process_t *proc, directory_t *queues, generic_msg_t *msg);
 bool handle_device_announce(const process_t *proc, directory_t *queues, generic_msg_t *msg);

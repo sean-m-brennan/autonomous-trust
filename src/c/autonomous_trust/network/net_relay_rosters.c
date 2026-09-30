@@ -23,6 +23,7 @@
 #include <jansson.h>
 
 #include "net_relay_rosters.h"
+#include "contacts/area_card.h"
 #include "config/configuration.h"
 #include "config/discover.h"
 #include "utilities/logger.h"
@@ -46,8 +47,56 @@ static bool _pinned(const net_relay_roster_issuers_t *issuers, const char *key)
     return false;
 }
 
+/* The roster's `areas` into @p out, aligned with @p list's entries (the
+ * body's `relays`, in order). 0, or -1 when present and not what a roster
+ * allows. Mirrors Python relay_rosters._areas. */
+static int _areas(const json_t *body, const net_relay_seed_list_t *list,
+                  net_relay_roster_areas_t *out)
+{
+    if (out != NULL)
+        memset(out, 0, sizeof(*out));
+    json_t *areas = json_object_get(body, "areas");
+    if (areas == NULL)
+        return 0;
+    if (!json_is_object(areas))
+        return -1;
+    json_t *relays = json_object_get(body, "relays");
+    const char *hint;
+    json_t *listed;
+    json_object_foreach(areas, hint, listed) {
+        size_t at = list->n;
+        for (size_t i = 0; i < json_array_size(relays) && i < list->n && at == list->n; i++) {
+            const char *r = json_string_value(json_array_get(relays, i));
+            if (r != NULL && strcmp(r, hint) == 0)
+                at = i;
+        }
+        if (at == list->n || !json_is_array(listed) || json_array_size(listed) == 0
+            || json_array_size(listed) > AT_RELAY_ROSTER_AREAS_MAX)
+            return -1;
+        size_t i;
+        json_t *a;
+        json_array_foreach(listed, i, a) {
+            if (!at_area_is_area(json_string_value(a)))
+                return -1;
+            if (out != NULL)
+                snprintf(out->areas[at][i], sizeof(out->areas[at][i]), "%s",
+                         json_string_value(a));
+        }
+        if (out != NULL)
+            out->n[at] = json_array_size(listed);
+    }
+    return 0;
+}
+
 int net_relay_roster_verify(const char *text, const net_relay_roster_issuers_t *issuers,
                             char *issuer_out, long long *seq, net_relay_seed_list_t *out)
+{
+    return net_relay_roster_verify_areas(text, issuers, issuer_out, seq, out, NULL);
+}
+
+int net_relay_roster_verify_areas(const char *text, const net_relay_roster_issuers_t *issuers,
+                                  char *issuer_out, long long *seq, net_relay_seed_list_t *out,
+                                  net_relay_roster_areas_t *areas)
 {
     if (out == NULL)
         return -1;
@@ -71,6 +120,8 @@ int net_relay_roster_verify(const char *text, const net_relay_roster_issuers_t *
         for (size_t i = 0; i < out->n; i++)
             if (!out->pins[i].set)
                 rc = -1;
+        if (rc == 0 && _areas(body, out, areas) != 0)
+            rc = -1;
         if (rc == 0) {
             if (issuer_out != NULL)
                 snprintf(issuer_out, AT_RELAY_ROSTER_KEY_HEX + 1, "%s", issuer);
@@ -226,6 +277,7 @@ typedef struct {
     long long seq;
     char path[CFG_PATH_LEN + 320];
     net_relay_seed_list_t list;
+    net_relay_roster_areas_t areas;
 } _best_t;
 
 static void _save_seen(json_t *seen)
@@ -241,7 +293,39 @@ static void _save_seen(json_t *seen)
         log_warn(NULL, "Relay rosters: cannot record seqs in %s\n", dir);
 }
 
+size_t net_relay_rosters_listed_buckets(char out[][8], size_t max)
+{
+    char dir[CFG_PATH_LEN + 1] = {0}, path[CFG_PATH_LEN + 64];
+    if (get_data_dir(dir, sizeof(dir)) <= 0)
+        return 0;
+    snprintf(path, sizeof(path), "%s/%s", dir, AT_AREA_STATE_FILENAME);
+    json_t *state = json_load_file(path, 0, NULL);
+    size_t n = 0;
+    const char *area;
+    json_t *held;
+    json_object_foreach(state, area, held) {
+        const char *b = json_string_value(json_object_get(held, "bucket"));
+        json_t *card = json_object_get(held, "card");
+        if (n < max && b != NULL && b[0] != '\0' && strlen(b) < 8 && card != NULL
+            && !json_is_null(card))
+            snprintf(out[n++], 8, "%s", b);
+    }
+    json_decref(state);
+    return n;
+}
+
 size_t net_relay_rosters_load(net_relay_ep_t *out, net_relay_pin_t *pins, size_t max)
+{
+    char buckets[16][8];
+    size_t nb = net_relay_rosters_listed_buckets(buckets, 16);
+    const char *ptrs[16];
+    for (size_t i = 0; i < nb; i++)
+        ptrs[i] = buckets[i];
+    return net_relay_rosters_load_near(out, pins, max, ptrs, nb);
+}
+
+size_t net_relay_rosters_load_near(net_relay_ep_t *out, net_relay_pin_t *pins, size_t max,
+                                   const char *const *buckets, size_t n_buckets)
 {
     if (out == NULL || max == 0)
         return 0;
@@ -270,7 +354,9 @@ size_t net_relay_rosters_load(net_relay_ep_t *out, net_relay_pin_t *pins, size_t
             continue;
         char issuer[AT_RELAY_ROSTER_KEY_HEX + 1] = {0};
         long long seq = 0;
-        if (net_relay_roster_verify(text, &issuers, issuer, &seq, list) != 0) {
+        net_relay_roster_areas_t *areas = calloc(1, sizeof(*areas));
+        if (areas == NULL || net_relay_roster_verify_areas(text, &issuers, issuer, &seq, list,
+                                                           areas) != 0) {
             log_warn(NULL, "Relay rosters: %s refused: not a validly signed roster "
                      "from a pinned issuer\n", path);
         } else {
@@ -282,9 +368,11 @@ size_t net_relay_rosters_load(net_relay_ep_t *out, net_relay_pin_t *pins, size_t
                     best[i].seq = seq;
                     snprintf(best[i].path, sizeof(best[i].path), "%s", path);
                     best[i].list = *list;
+                    best[i].areas = *areas;
                 }
             }
         }
+        free(areas);
         free(text);
     }
 
@@ -297,7 +385,14 @@ size_t net_relay_rosters_load(net_relay_ep_t *out, net_relay_pin_t *pins, size_t
         seen = json_object();
     }
     bool raised = false;
-    size_t n = 0;
+    /* Every relay first, one per endpoint, then hubs for our own buckets to
+     * the front (stable), THEN the cap: Python's order exactly. */
+    size_t cap = AT_RELAY_SEEDS_MAX, n = 0;
+    net_relay_ep_t *all = calloc(cap, sizeof(*all));
+    net_relay_pin_t *all_pins = calloc(cap, sizeof(*all_pins));
+    bool *near = calloc(cap, sizeof(*near));
+    if (all == NULL || all_pins == NULL || near == NULL)
+        cap = 0;
     for (size_t i = 0; i < issuers.n; i++) {
         if (!best[i].have)
             continue;
@@ -313,23 +408,166 @@ size_t net_relay_rosters_load(net_relay_ep_t *out, net_relay_pin_t *pins, size_t
             json_object_set_new(seen, issuers.keys[i], json_integer((json_int_t)best[i].seq));
             raised = true;
         }
-        for (size_t j = 0; j < best[i].list.n && n < max; j++) {
+        for (size_t j = 0; j < best[i].list.n && n < cap; j++) {
             bool dup = false;
             for (size_t k = 0; k < n && !dup; k++)
-                dup = out[k].port == best[i].list.eps[j].port
-                   && strcmp(out[k].host, best[i].list.eps[j].host) == 0;
+                dup = all[k].port == best[i].list.eps[j].port
+                   && strcmp(all[k].host, best[i].list.eps[j].host) == 0;
             if (dup)
                 continue;
-            if (pins != NULL)
-                pins[n] = best[i].list.pins[j];
-            out[n++] = best[i].list.eps[j];
+            bool is_near = false;
+            for (size_t a = 0; a < best[i].areas.n[j] && !is_near; a++)
+                for (size_t b = 0; b < n_buckets && !is_near; b++)
+                    is_near = buckets[b] != NULL
+                        && strncmp(buckets[b], best[i].areas.areas[j][a],
+                                   strlen(best[i].areas.areas[j][a])) == 0;
+            near[n] = is_near;
+            all_pins[n] = best[i].list.pins[j];
+            all[n++] = best[i].list.eps[j];
         }
     }
     if (raised)
         _save_seen(seen);
+    size_t kept = 0;
+    for (int pass = 0; pass < 2; pass++)
+        for (size_t k = 0; k < n && kept < max; k++)
+            if (near[k] == (pass == 0)) {
+                if (pins != NULL)
+                    pins[kept] = all_pins[k];
+                out[kept++] = all[k];
+            }
+    n = kept;
+    free(all);
+    free(all_pins);
+    free(near);
     json_decref(seen);
     free(best);
     free(list);
     free(names);
     return n;
+}
+
+/* The issuers file with @p issuer pinned or not. true when it changed. */
+static bool _set_issuer(const char *issuer, bool pinned)
+{
+    char path[CFG_PATH_LEN + 64];
+    if (net_relay_rosters_issuers_path(path, sizeof(path)) != 0)
+        return false;
+    char *text = net_relay_signed_read(path);
+    json_t *doc = text != NULL ? json_loads(text, 0, NULL) : NULL;
+    free(text);
+    json_t *old = json_object_get(doc, "issuers");
+    json_t *listed = json_array();
+    bool had = false;
+    size_t i;
+    json_t *item;
+    json_array_foreach(old, i, item) {
+        const char *k = json_string_value(item);
+        if (k == NULL)
+            continue;
+        char low[AT_RELAY_ROSTER_KEY_HEX + 1];
+        snprintf(low, sizeof(low), "%s", k);
+        for (char *c = low; *c != '\0'; c++)
+            if (*c >= 'A' && *c <= 'Z')
+                *c = (char)(*c + 32);
+        if (strcmp(low, issuer) == 0) {
+            had = true;
+            if (!pinned)
+                continue;
+        }
+        json_array_append_new(listed, json_string(low));
+    }
+    json_decref(doc);
+    if (pinned && !had)
+        json_array_append_new(listed, json_string(issuer));
+    bool changed = had != pinned;
+    if (changed) {
+        char dir[CFG_PATH_LEN + 1] = {0}, tmp[CFG_PATH_LEN + 80];
+        if (get_cfg_dir(dir, sizeof(dir)) > 0)
+            (void)makedirs(dir, 0755);
+        json_t *out = json_pack("{s:o}", "issuers", listed);
+        listed = NULL;
+        bool ok = out != NULL && (size_t)snprintf(tmp, sizeof(tmp), "%s.tmp", path) < sizeof(tmp)
+            && json_dump_file(out, tmp, JSON_COMPACT) == 0 && rename(tmp, path) == 0;
+        if (!ok)
+            log_warn(NULL, "Relay rosters: cannot write %s\n", path);
+        json_decref(out);
+    }
+    json_decref(listed);
+    return changed;
+}
+
+static int _installed_path(const char *issuer, char *out, size_t out_len)
+{
+    char dir[CFG_PATH_LEN + 64];
+    if (net_relay_rosters_dir(dir, sizeof(dir)) != 0)
+        return -1;
+    int n = snprintf(out, out_len, "%s/%.32s%s", dir, issuer, CFG_FILE_EXT);
+    return (n <= 0 || (size_t)n >= out_len) ? -1 : 0;
+}
+
+int net_relay_rosters_install(const char *text, char *issuer_out, long long *seq_out)
+{
+    json_t *wire = NULL;
+    const char *body_str = NULL, *sig_hex = NULL;
+    json_t *body = net_relay_signed_split(text, &wire, &body_str, &sig_hex);
+    const char *issuer = json_string_value(json_object_get(body, "issuer"));
+    net_relay_roster_issuers_t self = {0};
+    if (_is_key_hex(issuer)) {
+        self.n = 1;
+        snprintf(self.keys[0], sizeof(self.keys[0]), "%s", issuer);
+    }
+    net_relay_seed_list_t *list = calloc(1, sizeof(*list));
+    char key[AT_RELAY_ROSTER_KEY_HEX + 1] = {0};
+    long long seq = 0;
+    int rc = list != NULL && self.n == 1
+        && net_relay_roster_verify_areas(text, &self, key, &seq, list, NULL) == 0 ? 0 : -1;
+    free(list);
+    json_decref(body);
+    json_decref(wire);
+    if (rc != 0)
+        return -1;
+    char seen_path[CFG_PATH_LEN + 64];
+    json_t *seen = net_relay_signed_data_path(AT_RELAY_ROSTERS_SEEN_FILE, seen_path,
+                                              sizeof(seen_path)) == 0
+        ? json_load_file(seen_path, 0, NULL) : NULL;
+    json_t *f = json_object_get(seen, key);
+    long long floor = json_is_integer(f) ? (long long)json_integer_value(f) : 0;
+    json_decref(seen);
+    if (seq < floor)
+        return -2;
+    char dir[CFG_PATH_LEN + 64], path[CFG_PATH_LEN + 160], tmp[CFG_PATH_LEN + 176];
+    if (net_relay_rosters_dir(dir, sizeof(dir)) != 0 || _installed_path(key, path, sizeof(path)) != 0
+        || (size_t)snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= sizeof(tmp))
+        return -3;
+    (void)makedirs(dir, 0755);
+    FILE *fp = fopen(tmp, "w");
+    bool ok = fp != NULL && fputs(text, fp) >= 0;
+    if (fp != NULL && fclose(fp) != 0)
+        ok = false;
+    if (!ok || rename(tmp, path) != 0) {
+        remove(tmp);
+        return -3;
+    }
+    (void)_set_issuer(key, true);
+    if (issuer_out != NULL)
+        snprintf(issuer_out, AT_RELAY_ROSTER_KEY_HEX + 1, "%s", key);
+    if (seq_out != NULL)
+        *seq_out = seq;
+    return 0;
+}
+
+int net_relay_rosters_remove(const char *issuer)
+{
+    char key[AT_RELAY_ROSTER_KEY_HEX + 1];
+    if (issuer == NULL || strlen(issuer) != AT_RELAY_ROSTER_KEY_HEX)
+        return -1;
+    for (size_t i = 0; i <= AT_RELAY_ROSTER_KEY_HEX; i++)
+        key[i] = (char)(issuer[i] >= 'A' && issuer[i] <= 'Z' ? issuer[i] + 32 : issuer[i]);
+    if (!_is_key_hex(key))
+        return -1;
+    char path[CFG_PATH_LEN + 160];
+    bool had = _installed_path(key, path, sizeof(path)) == 0 && remove(path) == 0;
+    bool unpinned = _set_issuer(key, false);
+    return had || unpinned ? 1 : 0;
 }

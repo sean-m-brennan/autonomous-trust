@@ -316,12 +316,14 @@ _NONCE_HEX = 32
 class ContactRequest:
     """Bob, having found Alice by ``handle``, asks to become her contact.
 
-    body := {v, typename: "at-contact-request", from, key, to, handle, nonce,
-             expiry, relays: [relay hint, ...]}
+    body := {v, typename: "at-contact-request", from, key, to, handle | area,
+             nonce, expiry, relays: [relay hint, ...]}
 
     Signed by Bob's key (``key``) over ``at-contact-request-v1|`` + body. It
     names ``to`` (Alice's uuid), so it cannot be replayed at anyone else, and
-    the ``handle`` Bob found her by, which must be one Alice published."""
+    where Bob found her: the ``handle``, which must be one Alice published, or
+    the ``area`` of a hub, which must be one Alice is listed in. Exactly one
+    of the two."""
 
     def __init__(self, body, body_str, sig_hex):
         self.body, self.body_str, self.sig_hex = body, body_str, sig_hex
@@ -330,6 +332,7 @@ class ContactRequest:
     key = property(lambda self: self.body.get('key'))
     to = property(lambda self: str(self.body.get('to', '')).lower())
     handle = property(lambda self: self.body.get('handle'))
+    area = property(lambda self: self.body.get('area'))
     nonce = property(lambda self: self.body.get('nonce'))
     expiry = property(lambda self: self.body.get('expiry'))
     relays = property(lambda self: list(self.body.get('relays') or []))
@@ -351,15 +354,21 @@ class ContactRequest:
         for a handle we published, from the sender the envelope names, is the
         receiver's check."""
         from ..network import relay as _relay
+        from .area_card import normalize_area
         b = self.body
         nonce = b.get('nonce')
         relays = b.get('relays')
+        if ('handle' in b) == ('area' in b):
+            raise InvalidEntry('contact request names neither a handle nor an area, or both')
+        where = b.get('handle') if 'handle' in b else b.get('area')
+        where_ok = isinstance(where, str) and (
+            normalize_handle(where) == where if 'handle' in b else normalize_area(where) == where)
         if b.get('typename') != REQUEST_TYPENAME or not _is_int(b.get('v')) \
                 or b['v'] != VERSION:
             raise InvalidEntry('not a version-%d AT contact request' % VERSION)
         if not isinstance(b.get('from'), str) or not isinstance(b.get('to'), str) \
                 or not _is_hex_key(b.get('key')) \
-                or normalize_handle(b.get('handle')) != b.get('handle') \
+                or not where_ok \
                 or not isinstance(nonce, str) or len(nonce) != _NONCE_HEX \
                 or any(c not in '0123456789abcdef' for c in nonce) \
                 or not _is_int(b.get('expiry')) or b['expiry'] <= 0 \
@@ -375,15 +384,21 @@ class ContactRequest:
 
 def create_request(identity, entry, relays=(), expiry=None, nonce=None,
                    now=None) -> ContactRequest:
-    """Bob's request to the holder of ``entry`` (a verified DirectoryEntry)."""
+    """Bob's request to the holder of ``entry``: a verified DirectoryEntry
+    (the request names its handle) or AreaCard (the request names its area)."""
     import secrets
+    from .area_card import AreaCard
     signing = _signing_key(identity)
     now = now if now is not None else time.time()
-    wire = _sign(signing, REQUEST_DOMAIN,
-                 {'v': VERSION, 'typename': REQUEST_TYPENAME,
-                  'from': str(identity.uuid).lower(), 'key': _public_hex(signing),
-                  'to': entry.uuid, 'handle': entry.handle,
-                  'nonce': nonce or secrets.token_hex(_NONCE_HEX // 2),
-                  'expiry': int(expiry if expiry is not None else now + REQUEST_TTL_SECONDS),
-                  'relays': list(relays)[:REQUEST_MAX_RELAYS]})
+    body = {'v': VERSION, 'typename': REQUEST_TYPENAME,
+            'from': str(identity.uuid).lower(), 'key': _public_hex(signing),
+            'to': entry.uuid}
+    if isinstance(entry, AreaCard):
+        body['area'] = entry.area
+    else:
+        body['handle'] = entry.handle
+    body.update({'nonce': nonce or secrets.token_hex(_NONCE_HEX // 2),
+                 'expiry': int(expiry if expiry is not None else now + REQUEST_TTL_SECONDS),
+                 'relays': list(relays)[:REQUEST_MAX_RELAYS]})
+    wire = _sign(signing, REQUEST_DOMAIN, body)
     return ContactRequest.from_wire(wire)

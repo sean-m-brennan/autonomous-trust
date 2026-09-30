@@ -207,6 +207,11 @@ class IdentityProtocol(Protocol):
     # publish or withdraw ({op, handle, relay, reason, seq}).
     dir_result = 'dir_result'
     dir_status = 'dir_status'
+    # network -> identity, local IPC: an area lookup's outcome ({area,
+    # cards: [{card, relay}], limited}) and a hub's answer to our publish or
+    # withdraw ({op, area, relay, reason, seq}).
+    hub_result = 'hub_result'
+    hub_status = 'hub_status'
     # One human, several devices (FIRST_CONTACT_PLAN Phase 4,
     # identity/device_contact.py). Our own device cert, pushed over the sealed
     # channel to a contact once we are peers; and a new device telling a
@@ -214,6 +219,10 @@ class IdentityProtocol(Protocol):
     # know it yet. Neither is answered.
     device_cert = 'device_cert'            # msg.obj <- json {body, sig}; from_whom = its node
     device_announce = 'device_announce'    # msg.obj <- json {cert, relays}; from_whom = the new device
+    # Our own devices keeping one address book (identity/sibling_sync.py):
+    # a contacts/sync.py payload, sealed, to a sibling -- the whole book or
+    # what changed; answered once only when it carries ``reply: true``.
+    contacts_sync = 'contacts_sync'        # msg.obj <- json sync payload (+ reply)
 
 
 # Verbs this implementation legitimately puts on the wire in PLAINTEXT

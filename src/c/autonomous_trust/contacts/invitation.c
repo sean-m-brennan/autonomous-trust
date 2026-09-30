@@ -213,6 +213,22 @@ int at_create_invitation(const identity_t *self,
                          const char *const *rendezvous, size_t n_rv,
                          long expiry, const char *nonce, char **blob_out)
 {
+    return at_create_invitation_purpose(self, rendezvous, n_rv, expiry, nonce,
+                                        NULL, blob_out);
+}
+
+const char *at_invitation_purpose(const at_invitation_t *inv)
+{
+    const char *p = inv != NULL && inv->body != NULL
+        ? json_string_value(json_object_get(inv->body, "purpose")) : NULL;
+    return p != NULL ? p : "";
+}
+
+int at_create_invitation_purpose(const identity_t *self,
+                                 const char *const *rendezvous, size_t n_rv,
+                                 long expiry, const char *nonce,
+                                 const char *purpose, char **blob_out)
+{
     if (self == NULL || blob_out == NULL)
         return -1;
     *blob_out = NULL;
@@ -233,6 +249,10 @@ int at_create_invitation(const identity_t *self,
     json_object_set_new(body, "rendezvous", rv);
     json_object_set_new(body, "nonce", json_string(nonce != NULL ? nonce : ""));
     json_object_set_new(body, "expiry", json_integer(expiry));
+    /* Only when there is one, so an ordinary invitation's body is what it
+     * always was. */
+    if (purpose != NULL && purpose[0] != '\0')
+        json_object_set_new(body, "purpose", json_string(purpose));
 
     /* Sign the exact transmitted bytes: sorted-key, compact, ASCII-escaped --
      * byte-identical to Python json.dumps(body, sort_keys=True,

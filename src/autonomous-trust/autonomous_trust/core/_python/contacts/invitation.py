@@ -55,6 +55,10 @@ INVITATION_VERSION = 1
 INVITATION_TYPENAME = 'at-invitation'
 INVITATION_URI_SCHEME = 'at+contact'
 DEFAULT_TTL_SECONDS = 7 * 24 * 3600   # a week; 0 anywhere means "no expiry"
+#: ``purpose`` of an invitation one's own old device shows a new one: redeem it
+#: to become its sibling (contacts/siblings.py), not its contact. Signed with
+#: the rest of the body; an ordinary invitation carries no purpose at all.
+PURPOSE_PAIR = 'pair'
 
 # Iterated hashing of the (already high-entropy) public keys before truncating
 # to the displayed digits, so an attacker cannot cheaply grind a key whose
@@ -112,6 +116,12 @@ class Invitation:
     @property
     def expiry(self):
         return int(self.body.get('expiry', 0) or 0)
+
+    @property
+    def purpose(self):
+        """'' for an ordinary invitation, or :data:`PURPOSE_PAIR`."""
+        p = self.body.get('purpose', '')
+        return p if isinstance(p, str) else ''
 
     def is_expired(self, now=None):
         exp = self.expiry
@@ -190,7 +200,8 @@ class Invitation:
 # Mint / redeem
 # --------------------------------------------------------------------------
 def create_invitation(identity, rendezvous=None, expiry=None,
-                      ttl_seconds=DEFAULT_TTL_SECONDS, nonce=None) -> Invitation:
+                      ttl_seconds=DEFAULT_TTL_SECONDS, nonce=None,
+                      purpose='') -> Invitation:
     """Mint a signed invitation from *my* identity (§4.1).
 
     :param identity: this node's own (signable) Identity.
@@ -199,6 +210,8 @@ def create_invitation(identity, rendezvous=None, expiry=None,
         0/None with ``ttl_seconds=0`` means no expiry.
     :param ttl_seconds: convenience relative lifetime.
     :param nonce: override the random anti-replay nonce (tests).
+    :param purpose: :data:`PURPOSE_PAIR` for a pairing invitation; '' (the
+        default) writes no purpose, so the body is what it always was.
     """
     if getattr(identity, '_public_only', True):
         raise ValueError('create_invitation needs your own (signable) identity, '
@@ -215,6 +228,8 @@ def create_invitation(identity, rendezvous=None, expiry=None,
         'nonce': nonce if nonce is not None else base64.b16encode(_random_nonce()).decode('ascii'),
         'expiry': int(expiry),
     }
+    if purpose:
+        body['purpose'] = str(purpose)
     # Sign the EXACT bytes we transmit; sort_keys makes the source deterministic.
     body_str = json.dumps(body, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
     signed = identity.sign(body_str.encode('utf-8'))
