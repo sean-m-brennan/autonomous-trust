@@ -268,9 +268,9 @@ residual over 81 beats, and zero phase error against the audio's onsets in
 
 ### Audio outcome (measured off the render)
 
-Voice spans sit at ≈ −23 dB mean with peaks −3.6 to −7.9 dB; the gaps between
-lines drop to ≈ −31 to −33 dB (bed only), so speech clears the music by ~8 dB
-throughout. Final fade reaches −40 dB.
+Re-measured off the 56.7s render. Voice spans sit at ≈ −23.5 dB mean with peaks
+−2.0 to −5.1 dB; the two gaps long enough to measure clean of the duck ramps sit
+at ≈ −37 dB mean (bed only). The last 0.4s of the fade measure −48 dB mean.
 
 ### Captions dropped, as planned
 
@@ -280,14 +280,14 @@ and the closing tagline remain on screen and the voice says neither.
 
 ### Deliverables
 
-- `brag.mp4` — 1920x1080, 44.0s, h264 + AAC, 3.5 MB
-- `brag.jpg` — poster pulled at 20.3s (the settled divergence frame) and
+- `brag.mp4` — 1920x1080, 56.7s, h264 + AAC, 6.2 MB
+- `brag.jpg` — poster pulled at 26.8s (the settled divergence frame) and
   attached to the MP4 as cover art (an `attached_pic` mjpeg stream), so every
   platform's thumbnail grabber picks it up. `build.sh` does this on a stream
   copy, so it costs no re-encode
 - `composition-brief.md`, `share-copy.txt`, `composition/`
 
-`hyperframes check`: **0 errors**, 137/137 text checks pass WCAG AA. The one
-remaining warning is `composition_file_too_large` (702 lines), same as the silent
+`hyperframes check`: **0 errors**, 144/144 text checks pass WCAG AA. The one
+remaining warning is `composition_file_too_large` (740 lines), same as the silent
 cut — accepted rather than split, since the composition is a single continuous
 dashboard.
