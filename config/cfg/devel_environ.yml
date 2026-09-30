@@ -71,10 +71,21 @@ dependencies:
 
   # inspector (autonomous-trust-inspector): web dashboard e2e + async test tooling.
   - pytest-aiohttp
-  - nodejs
+  - nodejs>=22         # >=22 for doc/brag: the pinned hyperframes CLI refuses older Node
   - beautifulsoup4
   - playwright
   - pyee
+
+  # brag video (doc/brag): build.sh renders with the hyperframes CLI, fetched by
+  # npx at the version pinned in doc/brag/composition/package.json (Node, above);
+  # scripts/make_voice.py regenerates the narration. hyperframes finds TTS via
+  # `python3` on PATH, so inside this env HYPERFRAMES_PYTHON is not needed.
+  - ffmpeg             # build.sh poster + webm, make_audio_data.py, transcribe
+  - whisper.cpp        # `hyperframes transcribe` uses its whisper-cli instead of
+                       # cloning and building whisper.cpp under ~/.cache. The
+                       # solver takes the CUDA build only on a machine with a GPU.
+  - onnxruntime        # Kokoro TTS inference (kokoro-onnx, pip below)
+  - pysoundfile        # Kokoro TTS: writes the WAVs
 
   - pip
   - pip:
@@ -82,3 +93,10 @@ dependencies:
       - jcs  # conformance: JSON Canonicalization Scheme, used by
              # harness/common/canonical.py to compare and regenerate the
              # byte-pinned wire vectors. No conda-forge package (checked).
+      # brag video: Kokoro TTS for scripts/make_voice.py. None of the three is
+      # on conda-forge (checked). phonemizer is upstream's, which kokoro-onnx
+      # requires by name; conda-forge carries only phonemizer-fork, and pip
+      # would install upstream over it anyway.
+      - kokoro-onnx
+      - espeakng-loader
+      - phonemizer

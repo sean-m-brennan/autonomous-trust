@@ -16,35 +16,32 @@ Transcripts go to voice-transcripts/<clip>.json (word-level, whisper base.en,
 the model the original caption anchors were measured with), and each clip's
 heard text is printed beside the script line so a dropped phrase is obvious.
 
-One-time setup, all of it cached under ~/.cache/hyperframes:
+Dependencies come from config/cfg/devel_environ.yml (ffmpeg, whisper.cpp,
+onnxruntime, pysoundfile, and kokoro-onnx / espeakng-loader / phonemizer from
+pip). Run inside that env and hyperframes finds them through `python3` on PATH.
+Outside it, point HYPERFRAMES_PYTHON at a python that has them. Keep that
+python at a SHORT path: espeak-ng keeps its data path in a fixed buffer, and a
+long prefix (a sandbox scratchpad is ~200 chars) silently falls back to a
+compiled-in build-machine path that does not exist.
 
-- **TTS** runs Kokoro in Python. Make a venv at a SHORT path and export
-  HYPERFRAMES_PYTHON to its python. espeak-ng keeps its data path in a fixed
-  buffer, and a long venv path (a sandbox scratchpad is ~200 chars) silently
-  falls back to a compiled-in build-machine path that does not exist:
+Without whisper.cpp's `whisper-cli` on PATH, `hyperframes transcribe` clones
+and builds it under ~/.cache/hyperframes/whisper/ on first use (cmake and a C
+compiler).
 
-      uv venv --python 3.12 ~/.cache/hyperframes/kokoro-venv
-      uv pip install --python ~/.cache/hyperframes/kokoro-venv/bin/python \
-          kokoro-onnx soundfile
-      export HYPERFRAMES_PYTHON=~/.cache/hyperframes/kokoro-venv/bin/python
+Behind the sandbox proxy, Node's downloads ignore http(s)_proxy, so
+anything the CLI would fetch itself fails with ECONNREFUSED even for
+allow-listed hosts. Fetch those with curl into the cache first:
 
-- **Transcribe** needs ffmpeg on PATH, and builds whisper.cpp from source into
-  ~/.cache/hyperframes/whisper/ on first use (cmake and a C compiler).
+    B=https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0
+    curl -fLo ~/.cache/hyperframes/tts/models/kokoro-v1.0.onnx --create-dirs $B/kokoro-v1.0.onnx
+    curl -fLo ~/.cache/hyperframes/tts/voices/voices-v1.0.bin --create-dirs $B/voices-v1.0.bin
+    curl -fLo ~/.cache/hyperframes/whisper/models/ggml-base.en.bin --create-dirs \
+        https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
 
-- **Behind the sandbox proxy**, Node's downloads ignore http(s)_proxy, so
-  anything the CLI would fetch itself fails with ECONNREFUSED even for
-  allow-listed hosts. Fetch those with curl into the cache first:
-
-      B=https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0
-      curl -fLo ~/.cache/hyperframes/tts/models/kokoro-v1.0.onnx --create-dirs $B/kokoro-v1.0.onnx
-      curl -fLo ~/.cache/hyperframes/tts/voices/voices-v1.0.bin --create-dirs $B/voices-v1.0.bin
-      curl -fLo ~/.cache/hyperframes/whisper/models/ggml-base.en.bin --create-dirs \
-          https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
-
-  The npm install hits the same problem in onnxruntime-node's postinstall,
-  which fetches optional CUDA binaries from github.com. Kokoro runs on the CPU
-  binaries bundled in the package, so this script sets
-  ONNXRUNTIME_NODE_INSTALL_CUDA=skip.
+The npm install hits the same problem in onnxruntime-node's postinstall,
+which fetches optional CUDA binaries from github.com. Kokoro runs on the CPU
+binaries bundled in the package, so this script sets
+ONNXRUNTIME_NODE_INSTALL_CUDA=skip.
 
 build.sh sets npm_config_ignore_scripts=true to skip every postinstall, which is
 right for rendering and wrong here, so this script drops it from the child
