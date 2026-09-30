@@ -6660,15 +6660,23 @@ static void _apply_contact_seeds(const process_t *proc)
         const contact_t *c = &store.items[i];
         if (!c->verified || c->trust_seed <= 0.0)
             continue;
-        if (reputations_contains(&rep_state.reputations, c->identity.uuid))
-            continue;   /* already known here; earned beats seeded */
-        reputations_update(&rep_state.reputations, c->identity.uuid,
-                           c->trust_seed);
-        char uuid_s[UUID_STRING_LEN + 1] = {0};
-        uuid_unparse_lower(c->identity.uuid, uuid_s);
-        log_info(proc->logger,
-                 "Reputation: first contact: seeded verified contact %s at "
-                 "%.2f\n", uuid_s, c->trust_seed);
+        /* Every device of the contact is its own node, each seeded on its own
+         * (Phase 4): the human was verified, the standing is not shared. */
+        for (size_t d = 0; d <= c->devices_count; d++) {
+            uuid_t who;
+            if (d == 0)
+                uuid_copy(who, c->identity.uuid);
+            else if (uuid_parse(c->devices[d - 1].uuid, who) != 0)
+                continue;
+            if (reputations_contains(&rep_state.reputations, who))
+                continue;   /* already known here; earned beats seeded */
+            reputations_update(&rep_state.reputations, who, c->trust_seed);
+            char uuid_s[UUID_STRING_LEN + 1] = {0};
+            uuid_unparse_lower(who, uuid_s);
+            log_info(proc->logger,
+                     "Reputation: first contact: seeded verified contact %s at "
+                     "%.2f\n", uuid_s, c->trust_seed);
+        }
     }
     contacts_free(&store);
 }

@@ -81,7 +81,8 @@ class Contact(Configuration):
 
     def __init__(self, identity, petname='', rendezvous=None, verified=False,
                  provenance=Provenance.token, trust_seed=0.0,
-                 added_at=0.0, verified_at=0.0, nonce='', reach_seq=0):
+                 added_at=0.0, verified_at=0.0, nonce='', reach_seq=0,
+                 operator_key='', devices=None):
         super().__init__()
         # The trust root. Force public-only so we can never persist private
         # key material by accident (publish() is idempotent on a public copy).
@@ -110,10 +111,23 @@ class Contact(Configuration):
         # The highest reachability-record sequence applied (contacts/reach.py):
         # a record at or below it is a replay and is refused.
         self.reach_seq = int(reach_seq or 0)
+        # Phase 4: the human's operator key (hex), learned from a device cert
+        # this contact's first device presented (contacts/device.py), and the
+        # further devices that key has vouched for. Each device is its own node.
+        self.operator_key = operator_key or ''
+        self.devices = list(devices or [])
 
     @property
     def uuid(self):
         return str(self.identity.uuid)
+
+    def device_uuids(self):
+        """The uuids of this contact's further devices (not the first)."""
+        return [d.uuid for d in self.devices]
+
+    def identities(self):
+        """Every device's public identity, the first one first."""
+        return [self.identity] + [d.identity for d in self.devices]
 
     @property
     def nickname(self):
@@ -153,6 +167,11 @@ class Contact(Configuration):
         # to one written before records existed.
         if self.reach_seq:
             d['reach_seq'] = int(self.reach_seq)
+        # Likewise only once there is something to say (Phase 4).
+        if self.operator_key:
+            d['operator_key'] = self.operator_key
+        if self.devices:
+            d['devices'] = [dev.to_canonical() for dev in self.devices]
         return d
 
     @classmethod
@@ -178,9 +197,35 @@ class Contact(Configuration):
                    added_at=float(d.get('added_at', 0.0) or 0.0),
                    verified_at=float(d.get('verified_at', 0.0) or 0.0),
                    nonce=d.get('nonce', '') or '',
-                   reach_seq=int(d.get('reach_seq', 0) or 0))
+                   reach_seq=int(d.get('reach_seq', 0) or 0),
+                   operator_key=_operator_key(d.get('operator_key')),
+                   devices=_devices(d.get('devices'), identity,
+                                    _operator_key(d.get('operator_key'))))
 
     def __repr__(self):
         state = 'verified' if self.verified else 'UNVERIFIED'
         return 'Contact(%s [%s] %s via %s)' % (
             self.petname, self.nickname, state, self.provenance.value)
+
+
+def _operator_key(v):
+    """A stored operator key, or '' when it is not a hex ed25519 key."""
+    if isinstance(v, str) and len(v) == 64 and all(c in '0123456789abcdef' for c in v):
+        return v
+    return ''
+
+
+def _devices(v, first, operator_key):
+    """The stored further devices, keeping only those whose cert still verifies
+    for their own identity UNDER this contact's operator key, and never the
+    first device again or a duplicate. The store is plain JSON in the user's
+    data dir: a hand-added device must not come back as a verified one."""
+    from .device import Device, DEVICES_MAX
+    out, seen = [], {str(first.uuid)}
+    for d in v if isinstance(v, list) and operator_key else []:
+        dev = Device.from_canonical(d)
+        if dev is not None and dev.cert.operator == operator_key \
+                and dev.uuid not in seen and len(out) < DEVICES_MAX:
+            seen.add(dev.uuid)
+            out.append(dev)
+    return out

@@ -2695,7 +2695,7 @@ static int run_unencrypted_verbs(const at_case_t *c, char *err, size_t err_len) 
         }
     }
 
-    bool count_is_thirteen = (identity_unencrypted_verb_count() == 13);
+    bool count_is_fourteen = (identity_unencrypted_verb_count() == 14);
     bool empty_safe = (!identity_verb_is_unencrypted(NULL) &&
                        !identity_verb_is_unencrypted(""));
 
@@ -2723,7 +2723,7 @@ static int run_unencrypted_verbs(const at_case_t *c, char *err, size_t err_len) 
 
     if (expect_flag(c, "node", "all_unencrypted_verbs_recognized", all_recognized, err, err_len) != 0 ||
         expect_flag(c, "node", "no_other_verb_is_unencrypted", none_other, err, err_len) != 0 ||
-        expect_flag(c, "node", "unencrypted_verb_count_is_thirteen", count_is_thirteen, err, err_len) != 0 ||
+        expect_flag(c, "node", "unencrypted_verb_count_is_fourteen", count_is_fourteen, err, err_len) != 0 ||
         expect_flag(c, "node", "empty_verb_is_not_unencrypted", empty_safe, err, err_len) != 0 ||
         expect_flag(c, "node", "overlap_verbs_are_both", overlap_ok, err, err_len) != 0 ||
         expect_flag(c, "node", "full_history_is_bootstrap_but_not_unencrypted", boot_enc_ok, err, err_len) != 0)

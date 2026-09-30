@@ -73,7 +73,8 @@ AT_MSG_TYPE_REGISTER(first_contact_contact_event, FIRST_CONTACT_CONTACT_EVENT,
 
 static bool _is_contact_kind(int32_t kind)
 {
-    return kind >= AT_APP_EVENT_FC_CONTACT && kind <= AT_APP_EVENT_FC_REMOVED;
+    return (kind >= AT_APP_EVENT_FC_CONTACT && kind <= AT_APP_EVENT_FC_REMOVED)
+        || kind == AT_APP_EVENT_FC_DEVICE_LINKED;
 }
 
 static int _decode_contact(const generic_msg_t *msg, at_app_event_t *ev)

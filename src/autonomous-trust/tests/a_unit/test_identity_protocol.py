@@ -64,7 +64,7 @@ class TestIdentityProtocol:
         to ``IdentityProtocol``.
         """
         values = list(IdentityProtocol)
-        assert len(values) == 33
+        assert len(values) == 35
         assert 'announce' in values
         assert 'hello' in values
         assert 'report' not in values

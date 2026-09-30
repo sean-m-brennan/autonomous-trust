@@ -178,3 +178,29 @@ def test_no_contacts_file_is_not_an_error(cfg_root):
     rp = _make_rep_process()
     assert rp.reputations.current == {}
     rp._apply_contact_seeds()                      # must not raise
+
+
+def test_every_device_of_a_verified_contact_is_seeded(cfg_root):
+    """Phase 4: a further device linked to a verified contact is its own node
+    and gets its own prior; nothing earned by the first device moves over."""
+    from nacl.signing import SigningKey
+    from autonomous_trust.core.contacts import (adopt_operator, create_device_cert,
+                                                link_device)
+    operator = SigningKey.generate()
+    phone, laptop = _identity('alice-phone'), _identity('alice-laptop')
+    store = Contacts.load()
+    contact = Contact(phone.publish()).mark_verified()
+    assert adopt_operator(contact, create_device_cert(operator, phone), store) == ''
+    store.add(contact)
+    assert link_device(store, laptop.publish(), create_device_cert(operator, laptop))[1] == ''
+    store.save()
+    rp = _make_rep_process()
+    assert rp.reputations.current[UUID(str(phone.uuid))] == FIRST_CONTACT_VERIFIED_SEED
+    assert rp.reputations.current[UUID(str(laptop.uuid))] == FIRST_CONTACT_VERIFIED_SEED
+    # The laptop's standing is its own: what the phone earns stays with it.
+    rp.reputations.update(UUID(str(phone.uuid)), 0.85)
+    del rp.reputations.current[UUID(str(laptop.uuid))]
+    rp._contact_seed_mtime = None          # force the re-read
+    rp._apply_contact_seeds()
+    assert rp.reputations.current[UUID(str(phone.uuid))] == 0.85
+    assert rp.reputations.current[UUID(str(laptop.uuid))] == FIRST_CONTACT_VERIFIED_SEED
