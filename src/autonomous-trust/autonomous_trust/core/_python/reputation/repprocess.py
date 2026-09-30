@@ -3191,16 +3191,19 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             seed = float(getattr(contact, 'trust_seed', 0.0) or 0.0)
             if seed <= 0.0:
                 continue
-            try:
-                peer_uuid = UUID(str(contact.uuid))
-            except (ValueError, TypeError, AttributeError):
-                continue
-            current = self.reputations.current
-            if peer_uuid in current or str(peer_uuid) in current:
-                continue     # already known here; earned beats seeded
-            self.reputations.update(peer_uuid, seed)
-            self.logger.info('first contact: seeded verified contact %s at %.2f',
-                             str(peer_uuid)[:8], seed)
+            # Every device of the contact is its own node, each seeded on its
+            # own (Phase 4): the human was verified, the standing is not shared.
+            for ident in contact.identities():
+                try:
+                    peer_uuid = UUID(str(ident.uuid))
+                except (ValueError, TypeError, AttributeError):
+                    continue
+                current = self.reputations.current
+                if peer_uuid in current or str(peer_uuid) in current:
+                    continue     # already known here; earned beats seeded
+                self.reputations.update(peer_uuid, seed)
+                self.logger.info('first contact: seeded verified contact %s at %.2f',
+                                 str(peer_uuid)[:8], seed)
 
     def _seed_idle_from_snapshot(self):
         """At start-up, treat the persisted reputation snapshot's mtime as

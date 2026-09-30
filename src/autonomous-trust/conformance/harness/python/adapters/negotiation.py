@@ -63,6 +63,11 @@ from ..scenario_engine import (
 _NS = UUID('00000000-0000-0000-0000-000000000aaa')
 
 
+
+#: The operator key the contact_devices fixture certifies devices under. Same
+#: as the C adapter's.
+_HARNESS_OPERATOR_SEED = bytes([0x33]) * 32
+
 class _CapturingQueue:
     def __init__(self, sink: list[Any]) -> None:
         self._sink = sink
@@ -358,6 +363,26 @@ class NegotiationAdapter:
                     if verified:
                         contact.mark_verified()
                     store.add(contact)
+        # contact_devices: {<first device pid>: [<further device pid>, ...]}
+        # (Phase 4). Certified under a fixed harness operator key and filed by
+        # the production adopt_operator / link_device, so a refused link shows
+        # up as a capped device rather than as a fixture that lied.
+        devices = fixtures.get('contact_devices') or {}
+        if devices:
+            from nacl.signing import SigningKey
+            from autonomous_trust.core.contacts import (adopt_operator, create_device_cert,
+                                                        link_device)
+            operator = SigningKey(_HARNESS_OPERATOR_SEED)
+            for first, others in devices.items():
+                ident = _PARTICIPANT_IDENTITIES.get(first)
+                contact = store.get(str(ident.uuid)) if ident is not None else None
+                if contact is None:
+                    continue
+                adopt_operator(contact, create_device_cert(operator, ident), store)
+                for pid in others or []:
+                    dev = _PARTICIPANT_IDENTITIES.get(pid)
+                    if dev is not None:
+                        link_device(store, dev.publish(), create_device_cert(operator, dev))
         store.save()
         return True
 

@@ -125,6 +125,14 @@ class _InRequest:
     expiry: float
 
 
+def _now(proc) -> float:
+    """This node's directory clock: wall clock plus ``proc._dir_clock_advance``,
+    a test seam so a scenario can let an hour pass between a request and its
+    accept. Every directory deadline reads it; the invitation an accept carries
+    keeps its own clock. C twin: at_dir_contact_advance_clock."""
+    return time.time() + float(getattr(proc, '_dir_clock_advance', 0.0) or 0.0)
+
+
 def _fc():
     from . import first_contact
     return first_contact
@@ -139,6 +147,7 @@ def register(proc) -> None:
     proc._dir_out = {}              # holder uuid -> _OutRequest
     proc._dir_in = {}               # request nonce -> _InRequest
     proc._dir_invites = set()       # invitation nonces minted for an accept
+    proc._dir_clock_advance = 0.0   # test seam: seconds added to the directory clock
     for verb, handler in ((APP_DIR_PUBLISH, handle_app_dir_publish),
                           (APP_DIR_WITHDRAW, handle_app_dir_withdraw),
                           (APP_DIR_LOOKUP, handle_app_dir_lookup),
@@ -195,7 +204,7 @@ def restore_entries(proc, queues) -> int:
     """At startup: hand every unexpired entry of ours to the network process
     to refile (registries hold entries in memory). Returns how many."""
     n = 0
-    now = time.time()
+    now = _now(proc)
     for handle, held in _load_state().items():
         try:
             entry = _dir.DirectoryEntry.from_wire(held.get('entry'))
@@ -210,8 +219,8 @@ def restore_entries(proc, queues) -> int:
     return n
 
 
-def _published_handles():
-    now = time.time()
+def _published_handles(proc):
+    now = _now(proc)
     out = set()
     for handle, held in _load_state().items():
         try:
@@ -236,7 +245,7 @@ def handle_app_dir_publish(proc, queues, message) -> bool:
     visibility = req.get('visibility', _dir.VISIBILITY_ANYONE)
     try:
         att = _dir.Attestation.from_wire(req.get('attestation'))
-        att.verify()
+        att.verify(now=_now(proc))
     except _dir.InvalidEntry as err:
         proc.logger.warning('directory: app publish refused (%s)', err)
         _emit(proc, queues, DirectoryEvent(EVENT_REFUSED, ref=ref, reason=err.reason))
@@ -248,7 +257,7 @@ def handle_app_dir_publish(proc, queues, message) -> bool:
     state = _load_state()
     seq = int((state.get(att.handle) or {}).get('seq', 0) or 0) + 1
     try:
-        entry = _dir.create_entry(proc.identity, att, seq, visibility)
+        entry = _dir.create_entry(proc.identity, att, seq, visibility, now=_now(proc))
     except _dir.InvalidEntry as err:
         _emit(proc, queues, DirectoryEvent(EVENT_REFUSED, ref=ref, handle=att.handle,
                                            reason=err.reason))
@@ -336,7 +345,7 @@ def handle_dir_result(proc, queues, message) -> bool:
     entry, reason = None, 'limited' if body.get('limited') else ''
     if isinstance(wire, dict):
         try:
-            entry = _dir.DirectoryEntry.from_wire(wire).verify()
+            entry = _dir.DirectoryEntry.from_wire(wire).verify(now=_now(proc))
             if entry.handle != handle:
                 raise _dir.InvalidEntry('the registry answered another handle', 'mismatch')
         except _dir.InvalidEntry as err:
@@ -349,7 +358,7 @@ def handle_dir_result(proc, queues, message) -> bool:
         return True
     relay = str(body.get('relay', ''))
     found = proc._dir_found
-    found[handle] = (entry, relay, time.time())
+    found[handle] = (entry, relay, _now(proc))
     while len(found) > FOUND_MAX:
         del found[next(iter(found))]
     nickname = str((entry.identity_json or {}).get('nickname', '') or '')
@@ -378,8 +387,8 @@ def handle_app_request(proc, queues, message) -> bool:
         _emit(proc, queues, DirectoryEvent(EVENT_REFUSED, ref=ref or '', reason='bad_request'))
         return True
     found = proc._dir_found.get(handle)
-    if found is None or time.time() - found[2] > FOUND_TTL_SECONDS \
-            or found[0].is_expired():
+    if found is None or _now(proc) - found[2] > FOUND_TTL_SECONDS \
+            or found[0].is_expired(_now(proc)):
         _emit(proc, queues, DirectoryEvent(EVENT_REFUSED, ref=ref, handle=handle,
                                            reason='unknown_handle'))
         return True
@@ -404,7 +413,8 @@ def handle_app_request(proc, queues, message) -> bool:
         endpoint, _pin = _relay.parse_hint(hint)
         if endpoint is not None and endpoint not in [_relay.parse_hint(h)[0] for h in hints]:
             hints.append(hint)
-    request = _dir.create_request(proc.identity, entry, relays=hints[:_dir.REQUEST_MAX_RELAYS])
+    request = _dir.create_request(proc.identity, entry, relays=hints[:_dir.REQUEST_MAX_RELAYS],
+                                  now=_now(proc))
     proc._dir_out[entry.uuid] = _OutRequest(ref=ref, nonce=request.nonce, key=entry.key,
                                             handle=handle, deadline=float(request.expiry))
     fc._send_relay_route(proc, queues, holder.uuid, hints[:1])
@@ -427,7 +437,7 @@ def handle_contact_request(proc, queues, message) -> bool:
         proc.logger.warning('directory: contact request with no sender identity; ignoring')
         return True
     try:
-        request = _dir.ContactRequest.from_wire(message.obj).verify()
+        request = _dir.ContactRequest.from_wire(message.obj).verify(now=_now(proc))
     except _dir.InvalidEntry as err:
         proc.logger.warning('directory: contact request refused (%s)', err)
         return True
@@ -438,7 +448,7 @@ def handle_contact_request(proc, queues, message) -> bool:
     if request.to != me or request.sender == me:
         proc.logger.warning('directory: contact request not addressed to us; ignoring')
         return True
-    if request.handle not in _published_handles():
+    if request.handle not in _published_handles(proc):
         proc.logger.warning('directory: contact request for %s, which we do not '
                             'publish; ignoring', request.handle)
         return True
@@ -447,7 +457,7 @@ def handle_contact_request(proc, queues, message) -> bool:
         proc.logger.info('directory: %s asked again, but is already a contact',
                          sender.nickname)
         return True
-    now = time.time()
+    now = _now(proc)
     held = proc._dir_in
     for nonce in [n for n, r in held.items()
                   if r.expiry <= now or str(r.sender.uuid) == str(sender.uuid)]:
@@ -470,7 +480,7 @@ def _take_in_request(proc, queues, message, verb):
     req = fc._app_payload(message)
     ref = str(req.get('ref', '') or '')
     held = proc._dir_in.pop(ref, None)
-    if held is None or held.expiry <= time.time():
+    if held is None or held.expiry <= _now(proc):
         _emit(proc, queues, DirectoryEvent(EVENT_REFUSED, ref=ref[:fc.REF_MAX],
                                            reason='unknown_request'))
         return ref, None
@@ -533,7 +543,7 @@ def handle_contact_accept(proc, queues, message) -> bool:
         return True
     uuid = str(holder.uuid).lower()
     out = proc._dir_out.get(uuid)
-    if out is None or out.deadline <= time.time():
+    if out is None or out.deadline <= _now(proc):
         proc.logger.warning('directory: accept from %s, to whom no request is '
                             'outstanding; ignoring', uuid[:8])
         return True

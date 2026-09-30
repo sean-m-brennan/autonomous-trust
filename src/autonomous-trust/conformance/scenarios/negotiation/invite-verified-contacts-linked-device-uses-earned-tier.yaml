@@ -1,0 +1,50 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: invite-verified-contacts-linked-device-uses-earned-tier
+byte_pinning: false
+description: |
+    Phase 4: Alice's laptop is its own node, and Bob has only ever verified
+    her phone. The laptop carries a device cert from Alice's operator key, the
+    key Bob's contact record learned from her phone, so it is filed under that
+    verified contact and is served what it has earned: the tier-2 invitation
+    is accepted. The pair with invite-unlinked-device-held-at-communication
+    shows it is the link, not the laptop, that lifts the cap.
+
+participants:
+  - id: alice
+    role: bystander
+  - id: laptop
+    role: requestor
+  - id: bob
+    role: worker
+
+fixtures:
+  first_contact:
+    enabled: true
+  verified_contacts:
+    bob: [alice]
+  contact_devices:
+    alice: [laptop]
+  capabilities:
+    bob: [file_share]
+  capability_tiers:
+    file_share: 2
+  peer_tiers:
+    laptop: 4
+
+steps:
+  - id: 1
+    from: laptop
+    to: bob
+    function: invitation
+    payload:
+      capability: file_share
+      task_id: t-fc-linked-share
+  - id: 2
+    from: bob
+    to: laptop
+    function: ack
+    in_response_to: 1
+    payload:
+      task_id: t-fc-linked-share

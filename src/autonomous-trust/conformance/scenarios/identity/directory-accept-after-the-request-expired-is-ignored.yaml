@@ -1,0 +1,66 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: directory-accept-after-the-request-expired-is-ignored
+byte_pinning: false
+description: |
+    Bob's request stands for an hour and no longer. Alice's accept is valid in
+    every other way (her key, the request's nonce, a fresh invitation), but it
+    arrives an hour after he asked, so his node has dropped the request and
+    sends no hello. An answer that late is not an answer to anything Bob is
+    still waiting on.
+
+participants:
+  - id: alice
+    role: border_guard
+  - id: bob
+    role: new_node
+
+fixtures:
+  first_contact:
+    enabled: true
+  # Strangers, each alone in a cohort: nobody here is a peer of anybody.
+  groups:
+    alice:
+      uuid: "fc000000-0000-4000-8000-0000000d0f00"
+      size: 1
+    bob:
+      uuid: "fc000000-0000-4000-8000-0000000d0f01"
+      size: 1
+
+steps:
+  - id: 1
+    from: bob
+    to: bob
+    function: trigger_directory_request
+    payload:
+      holder: alice
+      handle: alice@example.org
+    description: |
+        Pseudo-step: a lookup finds Alice's entry (a local dir_result) and Bob's
+        app asks her, through the production app_first_contact_request. Bob now
+        has a request outstanding to her, under her entry's key, good for an
+        hour (REQUEST_TTL_SECONDS / AT_DIR_REQUEST_TTL_SECONDS).
+  - id: 2
+    from: bob
+    to: bob
+    function: trigger_directory_clock
+    payload:
+      advance: 3600
+    description: |
+        Pseudo-step: Bob's directory clock moves 3600 s ahead, to the request's
+        expiry.
+
+  - id: 3
+    from: alice
+    to: bob
+    function: first_contact_accept
+    payload:
+      minted_by: alice
+    description: |
+        Alice's answer, with the nonce of Bob's request and her own fresh,
+        unexpired invitation.
+
+expected_state:
+  bob:
+    first_contact_hellos_emitted: 0

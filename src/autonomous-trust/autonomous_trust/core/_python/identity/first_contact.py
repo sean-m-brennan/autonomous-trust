@@ -182,6 +182,8 @@ class ContactEvent(AppEvent):
     method: str = ''
     peer_dropped: bool = False
     count: int = 0
+    #: ``device_linked`` only: the further device filed under this contact.
+    device_uuid: str = ''
 
 
 def _emit(proc, queues, event) -> None:
@@ -316,6 +318,9 @@ def register(proc) -> None:
     # Finding someone by handle (FIRST_CONTACT_PLAN Phase 3).
     from . import directory_contact
     directory_contact.register(proc)
+    # One human, several devices (Phase 4).
+    from . import device_contact
+    device_contact.register(proc)
 
 
 def _register_extension(proc, proc_name: str) -> None:
@@ -427,7 +432,8 @@ def _push_own_record(proc, queues, peers=None, record=None):
         return
     if peers is None:
         store = _contacts_store(proc)
-        peers = [proc.peers.find_by_uuid(c.identity.uuid) for c in store.all()]
+        peers = [proc.peers.find_by_uuid(ident.uuid) for c in store.all()
+                 for ident in c.identities()]
     for peer in peers:
         if peer is None or str(peer.uuid) == str(proc.identity.uuid):
             continue
@@ -503,17 +509,20 @@ def restore_contacts(proc, queues) -> int:
     added = []
     restored = 0
     for contact in list(store.all()):
-        ident = contact.identity
-        if str(ident.uuid) == me:
-            continue
-        if proc.peers.find_by_uuid(ident.uuid) is None:
-            proc.peers.add(ident, proc.peers.mid_level)
-            added.append(ident)
         hints = _relay_hints(contact.rendezvous)
         have = {_relay.parse_endpoint(h) for h in hints}
         hints += [_own_relay_hint(proc, ep, pin) for ep, pin in own
                   if ep not in have]
-        _send_relay_route(proc, queues, ident.uuid, hints[:_relay.MAX_RELAYS])
+        # Every device of the contact (Phase 4). The record's hints came from
+        # its first device; each further device is routed the same way until
+        # per-device reach records exist.
+        for ident in contact.identities():
+            if str(ident.uuid) == me:
+                continue
+            if proc.peers.find_by_uuid(ident.uuid) is None:
+                proc.peers.add(ident, proc.peers.mid_level)
+                added.append(ident)
+            _send_relay_route(proc, queues, ident.uuid, hints[:_relay.MAX_RELAYS])
         restored += 1
     if added:
         proc._record_peers(queues)
@@ -531,9 +540,12 @@ def restore_contacts(proc, queues) -> int:
 #: gated on ``AT_FIRST_CONTACT``.
 def _on_start(proc, queues):
     """At startup: re-admit the address book, and refile our directory entries."""
-    from . import directory_contact
+    from . import directory_contact, device_contact
     restored = restore_contacts(proc, queues)
     directory_contact.restore_entries(proc, queues)
+    # Phase 4: our cert to every contact now a peer, and this device to all.
+    device_contact.push_own_cert(proc, queues)
+    device_contact.announce(proc, queues)
     return restored
 
 
@@ -582,8 +594,8 @@ def _contact_records():
     key = (path, mtime)
     if key not in _verified_cache:
         try:
-            records = {str(c.identity.uuid): bool(c.verified)
-                       for c in Contacts.load().all()}
+            records = {str(ident.uuid): bool(c.verified)
+                       for c in Contacts.load().all() for ident in c.identities()}
         except (OSError, ValueError, TypeError) as err:
             _logger.warning('contacts store unreadable (%s); treating every '
                             'direct peer as unverified', err)
@@ -837,6 +849,8 @@ def handle_hello(proc, queues, message) -> bool:
                     endpoint=getattr(sender, 'address', '') or '',
                     provenance=Provenance.directory if directory else Provenance.token)
     _push_own_record(proc, queues, [sender])
+    from . import device_contact
+    device_contact.push_own_cert(proc, queues, [sender])
     _emit(proc, queues, FirstContactEvent(
         EVENT_ESTABLISHED, ref=ref, peer_uuid=str(sender.uuid),
         nickname=sender.nickname, role='inviter'))
@@ -923,6 +937,8 @@ def handle_hello_ack(proc, queues, message) -> bool:
     proc.logger.info('first contact: %s accepted; direct peer established',
                      accepter.nickname)
     _push_own_record(proc, queues, [accepter])
+    from . import device_contact
+    device_contact.push_own_cert(proc, queues, [accepter])
     _emit(proc, queues, FirstContactEvent(
         EVENT_ESTABLISHED, ref=entry.ref, peer_uuid=str(accepter.uuid),
         nickname=accepter.nickname, role='initiator'))

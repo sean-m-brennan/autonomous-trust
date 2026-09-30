@@ -149,12 +149,16 @@ _TRIGGER_FC_REMOVE = 'trigger_first_contact_remove'
 #   trigger_directory_request {holder, handle} -- a lookup finds the holder's
 #       entry (a local dir_result) and our app asks to become a contact;
 #   trigger_directory_accept / _decline {ref}  -- our app answers a held request
-#       (its ref is the request's nonce).
+#       (its ref is the request's nonce);
+#   trigger_directory_clock {advance}          -- this node's directory clock
+#       moves `advance` seconds ahead (every directory deadline reads it; the
+#       invitation an accept carries keeps its own clock).
 # The C adapter recognizes the same strings. See identity/directory-*.yaml.
 _TRIGGER_DIR_PUBLISH = 'trigger_directory_publish'
 _TRIGGER_DIR_REQUEST = 'trigger_directory_request'
 _TRIGGER_DIR_ACCEPT = 'trigger_directory_accept'
 _TRIGGER_DIR_DECLINE = 'trigger_directory_decline'
+_TRIGGER_DIR_CLOCK = 'trigger_directory_clock'
 # The harness's handle issuer. Nothing checks the issuer on these paths (only a
 # registry does), but a fixed one keeps both runtimes minting the same bytes.
 _DIR_ISSUER_SEED = bytes([0x44]) * 32
@@ -1844,7 +1848,8 @@ class IdentityAdapter:
             _fc.handle_app_remove(participant.process, participant.queues, request)
             return participant.drain_outbox()
         if inbound.function in (_TRIGGER_DIR_PUBLISH, _TRIGGER_DIR_REQUEST,
-                                _TRIGGER_DIR_ACCEPT, _TRIGGER_DIR_DECLINE):
+                                _TRIGGER_DIR_ACCEPT, _TRIGGER_DIR_DECLINE,
+                                _TRIGGER_DIR_CLOCK):
             from autonomous_trust.core._python.identity import directory_contact as _dc
             spec = from_json_string(inbound.obj) if inbound.obj else {}
             proc, queues = participant.process, participant.queues
@@ -1852,6 +1857,8 @@ class IdentityAdapter:
                 att, _entry = _dir_entry_for(proc.identity, str(spec.get('handle')))
                 _dc.handle_app_dir_publish(proc, queues, _app_verb(
                     _dc.APP_DIR_PUBLISH, {'ref': 'pub', 'attestation': att.to_wire()}))
+            elif inbound.function == _TRIGGER_DIR_CLOCK:
+                proc._dir_clock_advance += float(spec.get('advance', 0) or 0)
             elif inbound.function == _TRIGGER_DIR_REQUEST:
                 holder_uuid = participant._uuid_for_pid(str(spec.get('holder')))
                 holder = self._roster_by_uuid[str(holder_uuid)].process.identity

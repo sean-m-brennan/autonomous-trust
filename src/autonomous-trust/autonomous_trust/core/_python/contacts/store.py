@@ -48,15 +48,43 @@ class Contacts(Configuration):
         # uuid_str -> Contact. dict(...) so a decoded mapping (config round-trip)
         # and a caller-supplied dict both work.
         self.contacts = dict(contacts or {})
+        self.reindex()
+
+    def reindex(self):
+        """Rebuild the device index: every further device's uuid -> the uuid
+        its contact is filed under (Phase 4, contacts/device.py). Call after
+        changing a contact's ``devices``."""
+        self._device_of = {dev.uuid: uuid for uuid, c in self.contacts.items()
+                           for dev in getattr(c, 'devices', [])}
+
+    def to_dict(self):
+        # The device index is derived state, rebuilt by __init__: keep it out
+        # of the cls(**to_dict()) config round-trip.
+        d = super().to_dict()
+        d.pop('_device_of', None)
+        return d
 
     # -- membership -------------------------------------------------------
     def add(self, contact: Contact) -> Contact:
         """Add or replace a contact (keyed by UUID). Returns the stored contact."""
         self.contacts[str(contact.uuid)] = contact
+        self.reindex()
         return contact
 
     def get(self, uuid) -> Contact:
-        return self.contacts.get(str(uuid))
+        """The contact ``uuid`` belongs to: its first device, or any further
+        one."""
+        uuid = str(uuid)
+        return self.contacts.get(uuid) or self.contacts.get(self._device_of.get(uuid))
+
+    def by_operator(self, operator_key: str) -> Contact:
+        """The contact whose operator key this is, or None."""
+        if not operator_key:
+            return None
+        for contact in self.contacts.values():
+            if getattr(contact, 'operator_key', '') == operator_key:
+                return contact
+        return None
 
     def by_petname(self, petname: str) -> Contact:
         for contact in self.contacts.values():
@@ -69,7 +97,11 @@ class Contacts(Configuration):
         return [c for c in self.contacts.values() if c.nickname == nickname]
 
     def remove(self, uuid) -> bool:
-        return self.contacts.pop(str(uuid), None) is not None
+        """Drop the contact filed under ``uuid`` (its first device), with every
+        device it lists."""
+        gone = self.contacts.pop(str(uuid), None) is not None
+        self.reindex()
+        return gone
 
     def all(self):
         return list(self.contacts.values())
@@ -84,7 +116,7 @@ class Contacts(Configuration):
         return iter(self.contacts.values())
 
     def __contains__(self, uuid):
-        return str(uuid) in self.contacts
+        return str(uuid) in self.contacts or str(uuid) in self._device_of
 
     # -- cross-runtime canonical form -------------------------------------
     # The on-disk shape is the DRY canonical form (flat, C-parseable), NOT the

@@ -602,9 +602,10 @@ nothing back, so Bob learns no more than he would from an unreachable node.
 On accept, Alice's node mints an ordinary single-use invitation and sends it
 to Bob in a `first_contact_accept` that echoes his request's nonce. Bob's node
 takes it only for a request it has outstanding to that uuid, and only if the
-invitation is signed by the key the entry named. Then it runs the ordinary
-hello, so every guarantee above (the single-use ticket, the ack gate, the
-direct-peer admission) applies unchanged. Both sides record an **unverified**
+invitation is signed by the key the entry named. A request stays outstanding
+until its own expiry, an hour by default, so Alice has that long to answer.
+Then Bob's node runs the ordinary hello, so every guarantee above (the
+single-use ticket, the ack gate, the direct-peer admission) applies unchanged. Both sides record an **unverified**
 contact with provenance `directory`, capped at tier 1 until the safety numbers
 match. The directory is how you found the person; the safety number is still
 what verifies them.
@@ -612,6 +613,44 @@ what verifies them.
 It is tested with three real nodes: a registry, a publisher and a finder that
 share no direct path. A control shows that without the publisher's accept the
 two never become peers.
+
+## One person, several devices
+
+A person's phone and laptop are two nodes, each with its own uuid and keys,
+and the keys never leave the device they were made on. What says the two
+belong to one person is that person's **operator key**, the ed25519 key in
+their operator keystore (never in a node's config), which signs a **device
+cert** for each of their devices:
+
+```
+DeviceCert := sign_Operator{ "at-device-v1|" + body }
+body       := { v, typename: "at-device-cert", operator, uuid, key, issued_at }
+```
+
+`key` is the device node's signing key, so a cert cannot be lifted onto
+another node. Checking one needs no PIV card, X.509 chain or CA; the operator
+key is trusted for one reason only. Bob's record of Alice learned it from a
+cert naming the device Bob **verified**, and learns it once: it never
+changes, and one operator key belongs to one contact. From then on, a further
+device with a cert under the same key is filed under that same contact as
+verified, because the safety number Bob compared vouched for Alice, and Alice
+vouches for the device. Its uuid resolves to her record, the tier cap treats
+it as her, and it gets the contact's trust seed as a cold-start prior of its
+own. **Earned reputation does not move**: each device is its own node and
+earns its own standing.
+
+Four refusals keep the link from being a way in. A cert must name the very
+node presenting it. An unverified contact gains no devices, since there is no
+verification to carry over. A device that is already a contact of its own is
+not folded into another, because merging two records is the user's call. And
+a contact lists at most eight further devices. The store is plain JSON in the
+user's data dir, so on load a device survives only if its cert still
+verifies, names it, and is under the contact's own operator key.
+
+This is the offline half. How a new device reaches a contact (the invitation
+carrying the inviter's cert, and a message from the new device), live pairing
+between one's own devices, and an encrypted backup for a lost phone are the
+next slices of Phase 4.
 
 ## What is built, and what is not
 
@@ -636,6 +675,11 @@ invitation names. Two roles still have loose ends:
   and a contact request the holder's app must accept. The issuer services
   themselves (the email or SMS check behind an attestation) are outside AT;
   `tools/directory_issuer.py` is only the signing half.
+- **Several devices, beyond what is built.** The device cert, the contact
+  record that lists devices, and the rules that link them are built (see *One
+  person, several devices*, above). The wire half is not yet built: nothing
+  yet carries a cert to a contact, and pairing and the encrypted backup are
+  still ahead.
 
 First contact is an **AT** primitive, so it must complete without the compact
 tier present. Its rendezvous and directory *roles* may optionally be served by
@@ -659,6 +703,13 @@ asymmetry.
 | Safety-number match promotes the contact | [`verify-contact-match.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/verify-contact-match.yaml) |
 | Safety-number mismatch leaves it unverified | [`verify-contact-mismatch.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/verify-contact-mismatch.yaml) |
 | Store round-trips across runtimes | [`store-roundtrip.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/store-roundtrip.yaml) |
+| A device cert verifies and names only its node | [`device-cert-verifies.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/device-cert-verifies.yaml) |
+| A contact learns its operator key only from its own cert | [`device-adopt-another-devices-cert.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/device-adopt-another-devices-cert.yaml) |
+| A further device joins a verified contact | [`device-link-verified-contact.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/device-link-verified-contact.yaml) |
+| An unverified contact gains no devices | [`device-link-unverified-contact.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/device-link-unverified-contact.yaml) |
+| A cert lifted onto another node links nothing | [`device-link-lifted-cert.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/device-link-lifted-cert.yaml) |
+| A hand-added device does not load | [`device-store-drops-hand-added.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/device-store-drops-hand-added.yaml) |
+| A linked device is not tier-capped; an unlinked one is | [`invite-verified-contacts-linked-device-uses-earned-tier.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-verified-contacts-linked-device-uses-earned-tier.yaml) |
 | Handshake admits a DIRECT peer, not a group member | [`first-contact-hello-admits-direct-peer.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-hello-admits-direct-peer.yaml) |
 | An invitation is single-use | [`first-contact-invitation-single-use.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-invitation-single-use.yaml) |
 | Single use survives a restart | [`first-contact-nonce-survives-restart.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-nonce-survives-restart.yaml) |

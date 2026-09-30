@@ -52,6 +52,13 @@ void contact_free(contact_t *c)
 {
     if (c == NULL)
         return;
+    for (size_t i = 0; i < c->devices_count; i++) {
+        json_decref(c->devices[i].identity);
+        json_decref(c->devices[i].cert);
+    }
+    free(c->devices);
+    c->devices = NULL;
+    c->devices_count = 0;
     if (c->rendezvous != NULL) {
         for (size_t i = 0; i < c->rendezvous_count; i++)
             free(c->rendezvous[i]);

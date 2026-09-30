@@ -39,6 +39,8 @@
 #include "utilities/allocation.h"
 #include "config/configuration.h"
 #include "contacts/contacts.h"
+#include "contacts/device.h"
+#include "identity/device_contact.h"
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
 #include "first_contact.h"
@@ -537,6 +539,8 @@ int at_first_contact_register(process_t *proc)
                              (handler_ptr_t)handle_first_contact_app_remove);
     /* Finding someone by handle (FIRST_CONTACT_PLAN Phase 3). */
     at_dir_contact_register(proc);
+    /* One human, several devices (Phase 4). */
+    at_device_contact_register(proc);
     return 0;
 }
 
@@ -618,6 +622,18 @@ int at_first_contact_restore_contacts(process_t *proc)
             }
         }
         _fc_send_relay_route(c->identity.uuid, eps, n);
+        /* Every further device of the contact (Phase 4), routed the same way
+         * until per-device reach records exist. */
+        for (size_t d = 0; d < c->devices_count; d++) {
+            public_identity_t dev;
+            if (at_contact_device_identity(&c->devices[d], &dev) != 0)
+                continue;
+            if (!(have_self && uuid_compare(dev.uuid, self.uuid) == 0)) {
+                (void)identity_admit_direct_peer(proc, NULL, &dev);
+                _fc_send_relay_route(dev.uuid, eps, n);
+            }
+            _free_public(&dev);
+        }
         restored++;
     }
     if (have_self)
@@ -696,6 +712,9 @@ static void _fc_run_start(process_t *proc)
 {
     (void)at_first_contact_restore_contacts(proc);
     (void)at_dir_contact_restore_entries(proc);
+    /* Phase 4: our cert to every contact now a peer, and this device to all. */
+    (void)at_device_push_own_cert(proc, NULL);
+    (void)at_device_announce(proc);
 }
 
 /* First contact follows identity's start (id_ext.h) to restore the address
@@ -1055,6 +1074,7 @@ bool handle_first_contact_hello(const process_t *proc, directory_t *queues,
                     NULL, 0, at_dir_contact_is_invite(nonce_copy) ? AT_PROV_DIRECTORY
                                                                    : AT_PROV_TOKEN);
     _fc_push_own_record(proc, &nmsg->from_whom);
+    (void)at_device_push_own_cert(proc, &nmsg->from_whom);
     _fc_emit(proc, AT_APP_EVENT_FC_ESTABLISHED, ref, &nmsg->from_whom,
              AT_FC_REASON_NONE, AT_FC_ROLE_INVITER, 0, NULL);
     return true;
@@ -1106,6 +1126,7 @@ bool handle_first_contact_hello_ack(const process_t *proc, directory_t *queues,
              "Identity: first contact: %s accepted; direct peer established\n",
              nmsg->from_whom.nickname);
     _fc_push_own_record(proc, &nmsg->from_whom);
+    (void)at_device_push_own_cert(proc, &nmsg->from_whom);
     _fc_emit(proc, AT_APP_EVENT_FC_ESTABLISHED, ref, &nmsg->from_whom,
              AT_FC_REASON_NONE, AT_FC_ROLE_INITIATOR, 0, NULL);
     return true;
@@ -2020,9 +2041,13 @@ static fc_contact_t _fc_contact_status(const char *key)
             contacts_t store;
             contacts_init(&store);
             (void)contacts_load(dir, &store);
-            if (store.count > 0) {
-                fc_records.uuids = calloc(store.count, sizeof(*fc_records.uuids));
-                fc_records.verified = calloc(store.count, sizeof(*fc_records.verified));
+            /* Every device of every contact (Phase 4). */
+            size_t total = store.count;
+            for (size_t i = 0; i < store.count; i++)
+                total += store.items[i].devices_count;
+            if (total > 0) {
+                fc_records.uuids = calloc(total, sizeof(*fc_records.uuids));
+                fc_records.verified = calloc(total, sizeof(*fc_records.verified));
                 if (fc_records.uuids == NULL || fc_records.verified == NULL) {
                     free(fc_records.uuids);
                     free(fc_records.verified);
@@ -2034,6 +2059,12 @@ static fc_contact_t _fc_contact_status(const char *key)
                 uuid_unparse_lower(store.items[i].identity.uuid,
                                    fc_records.uuids[fc_records.count]);
                 fc_records.verified[fc_records.count++] = store.items[i].verified;
+                for (size_t d = 0; d < store.items[i].devices_count; d++) {
+                    at_strlcpy(fc_records.uuids[fc_records.count],
+                               store.items[i].devices[d].uuid,
+                               sizeof(fc_records.uuids[0]));
+                    fc_records.verified[fc_records.count++] = store.items[i].verified;
+                }
             }
             contacts_free(&store);
         }
@@ -2158,12 +2189,20 @@ static void _fc_push_own_record(const process_t *proc, const public_identity_t *
             (void)contacts_load(dir, &store);
         peers_read_lock(proc);
         for (size_t i = 0; i < store.count && n < AT_FC_PENDING_MAX; i++)
-            for (size_t j = 0; j < proc->protocol.num_peers; j++)
-                if (uuid_compare(proc->protocol.peers[j].uuid,
-                                 store.items[i].identity.uuid) == 0) {
-                    targets[n++] = proc->protocol.peers[j];
-                    break;
-                }
+            for (size_t d = 0; d <= store.items[i].devices_count
+                               && n < AT_FC_PENDING_MAX; d++) {
+                /* Every device of the contact (Phase 4). */
+                uuid_t who;
+                if (d == 0)
+                    uuid_copy(who, store.items[i].identity.uuid);
+                else if (uuid_parse(store.items[i].devices[d - 1].uuid, who) != 0)
+                    continue;
+                for (size_t j = 0; j < proc->protocol.num_peers; j++)
+                    if (uuid_compare(proc->protocol.peers[j].uuid, who) == 0) {
+                        targets[n++] = proc->protocol.peers[j];
+                        break;
+                    }
+            }
         peers_read_unlock(proc);
         contacts_free(&store);
     }
@@ -2450,6 +2489,31 @@ size_t at_fc_own_hints(char out[][AT_RELAY_HOST_LEN + 96], size_t max)
             n++;
     }
     return n;
+}
+
+void at_fc_push_own_record(const process_t *proc, const public_identity_t *only)
+{
+    _fc_push_own_record(proc, only);
+}
+
+void at_fc_emit_device_linked(const process_t *proc, const contact_t *c,
+                              const uuid_t device)
+{
+    generic_msg_t msg = {0};
+    msg.type = FIRST_CONTACT_CONTACT_EVENT;
+    fc_contact_msg_t *m = AT_MSG_EXT(&msg, fc_contact_msg_t);
+    m->kind = AT_APP_EVENT_FC_DEVICE_LINKED;
+    memcpy(m->data.peer_uuid, c->identity.uuid, sizeof(m->data.peer_uuid));
+    at_strlcpy(m->data.nickname, c->identity.nickname, sizeof(m->data.nickname));
+    at_strlcpy(m->data.petname, c->petname, sizeof(m->data.petname));
+    m->data.verified = c->verified;
+    m->data.provenance = (int32_t)c->provenance;
+    m->data.added_at = c->added_at;
+    m->data.verified_at = c->verified_at;
+    memcpy(m->data.device_uuid, device, sizeof(m->data.device_uuid));
+    if (messaging_send(AT_MAIN_QUEUE, FIRST_CONTACT_CONTACT_EVENT, &msg, false) != 0)
+        log_debug(proc->logger,
+                  "Identity: first contact: no main queue for event %d\n", m->kind);
 }
 
 void at_fc_send_route_hints(const uuid_t uuid, const char *const *hints, size_t n)

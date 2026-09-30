@@ -60,6 +60,12 @@ int at_dir_contact_restore_entries(process_t *proc);
 bool at_dir_contact_is_invite(const char *nonce);
 /** Forget every request, lookup and found entry (a restart, or a test). */
 void at_dir_contact_reset(void);
+/** Move this node's directory clock @p seconds ahead (cumulative; reset by
+ *  at_dir_contact_reset). A test seam: every directory deadline -- the finder's
+ *  outstanding request, held requests, found entries -- reads this clock. The
+ *  invitation an accept carries keeps its own clock. Mirrors Python's
+ *  IdentityProcess._dir_clock_advance. */
+void at_dir_contact_advance_clock(double seconds);
 /** How many requests are held for the app now. Process-wide: a conformance
  *  observable (Python len(proc._dir_in)). */
 size_t at_dir_contact_held_count(void);
