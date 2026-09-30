@@ -1,0 +1,30 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: area-card-bucket-outside-its-area
+description: A bucket must lie inside the card's area; one outside it is malformed.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: dir_verify
+    what: area_card
+    now: 1790000000
+    wire:
+      body: '{"v":1,"typename":"at-area-card","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","key":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5","area":"u4pr","bucket":"u4ps","name":"","seq":1,"expiry":1790003600,"identity":{"typename":"identity","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","address":"","nickname":"alice","signature":{"hex_seed":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5"},"encryptor":{"hex_seed":"7777777777777777777777777777777777777777777777777777777777777777"}}}'
+      sig: cd838341427f6736c69787eabc8dc70c14000a77be5b0de37cb26fe6decc5df24fd68eef3f8c2a5563c09d2a3e72b2bbdbae18d84d5282c9363c0c623abb5b0a
+steps:
+- id: 1
+  from: host
+  to: host
+  function: dir_verify
+  description: 'trigger: dir_verify'
+expected_state:
+  host:
+    dir_status: malformed

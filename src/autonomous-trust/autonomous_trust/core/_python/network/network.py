@@ -70,6 +70,13 @@ class Network(InitializableConfig):
     dir_publish = 'dir_publish'
     dir_withdraw = 'dir_withdraw'
     dir_lookup = 'dir_lookup'
+    #: identity -> network, local IPC: area hubs (network/hub.py).
+    #: hub_publish {card: {body, sig}} files our card at each of our relays
+    #: (and again at every registration); hub_withdraw {area} takes it back;
+    #: hub_lookup {area} asks every relay we are registered at.
+    hub_publish = 'hub_publish'
+    hub_withdraw = 'hub_withdraw'
+    hub_lookup = 'hub_lookup'
     # Parser-level wire-bytes size cap. Matches the C transport's
     # NET_MSG_MAX_DATA (net_message.h:31). Enforced at envelope-parse
     # time as defense-in-depth: the TCP transport already caps inbound

@@ -1,0 +1,26 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: crypto_vector
+protocol: network
+name: relay-roster-areas-accepted
+description: 'A roster may say which of its relays are area hubs, and for which geohash areas.
+
+  The field is optional; the hubs'' areas read back keyed by relay.'
+primitive: relay_roster_verify
+input:
+  roster: '{"body":"{\"v\":1,\"typename\":\"at-relay-roster\",\"issuer\":\"48075a597e721a156e2e0799de5cc0c5324dc6e7eaf1cdd46250868ec53215dd\",\"seq\":4,\"relays\":[\"relay://00000000-0000-4000-8000-000000000001:abababababababababababababababab@198.51.100.1:27790\",\"relay://00000000-0000-4000-8000-000000000002:abababababababababababababababab@198.51.100.2:27790\"],\"areas\":{\"relay://00000000-0000-4000-8000-000000000002:abababababababababababababababab@198.51.100.2:27790\":[\"u4pr\",\"gcpv\"]}}","sig":"335741b90169bdf910c34404901c79dd9e57b457133591a8cdad7591fff64b36be2ac2adc6f31b281d28fe1733450f4f193140def14a724813e019a98c657907"}'
+  issuers:
+  - 48075a597e721a156e2e0799de5cc0c5324dc6e7eaf1cdd46250868ec53215dd
+expected:
+  valid: true
+  seq: 4
+  relays:
+  - 00000000-0000-4000-8000-000000000001:abababababababababababababababab@198.51.100.1:27790
+  - 00000000-0000-4000-8000-000000000002:abababababababababababababababab@198.51.100.2:27790
+  areas:
+    00000000-0000-4000-8000-000000000002:abababababababababababababababab@198.51.100.2:27790:
+    - u4pr
+    - gcpv

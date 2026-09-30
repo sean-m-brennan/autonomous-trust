@@ -373,6 +373,59 @@ the `established` that follows an accept is an ordinary
 `AT_APP_EVENT_FC_ESTABLISHED`. A C registry is a relay with `AT_REGISTRY=1`,
 reading the same `registry_issuers.cfg.json`.
 
+#### Your own devices: pairing and one address book
+
+Each of your devices is its own node, with its own keys. What ties them
+together is your **operator key**. Run `tools/device_cert.py issue` where your
+operator keystore is, once per device; it writes
+`<cfg_dir>/device_cert.cfg.json`, which must name that very node. A contact who
+has verified you then files your other devices under your record without you
+doing anything: a device with a cert tells your contacts about itself when it
+starts, and each contact's app gets a `ContactEvent` `device_linked`.
+
+To give a new device your address book, **pair** it with one you already have.
+On the old device, ask for a pairing link, and redeem it on the new one:
+
+```python
+from autonomous_trust.core._python.identity.sibling_sync import (
+    APP_SIBLING_LIST, APP_SIBLING_REMOVE)
+
+# Old device: a pairing link (needs a device cert; `refused` / not_sibling otherwise).
+control_queue.put(AppRequest(APP_INVITE, json.dumps({'ref': 'pair', 'pair': True})))
+# New device: redeem it, as any link.
+control_queue.put(AppRequest(APP_INITIATE, json.dumps(
+    {'ref': 'pair', 'invitation': link})))
+```
+
+The two nodes run the ordinary handshake, then each checks that the other's
+device cert names the same operator key. If it does, both apps see a
+`FirstContactEvent` `sibling_paired`, and neither records the other as a
+contact. If it does not (a device with no cert, another person's device, or no
+cert within two minutes), both see `refused` with reason `not_sibling`, and the
+direct peer is dropped. A pairing link never becomes a contact.
+
+Paired devices, **siblings**, keep one address book. The new device gets the
+whole book at once, verified contacts included, and each sibling then gets
+every rename, removal, verification or device link as it happens. At startup
+the books are swapped again. The app hears these changes as the usual
+`contact` and `removed` events with `origin == 'sibling'`. A contact that
+arrives this way is reached from this device too, and is told this device is
+yours. Siblings are never tier-capped. The newer edit wins, a removal
+propagates, and a verification made on one device is never undone by an edit
+made on another (see `first-contact.md`, *Your own devices, one address book*).
+
+| Request | Payload | Answer |
+|---|---|---|
+| `APP_SIBLING_LIST` | `{ref}` | one `ContactEvent` `sibling` per device (`peer_uuid`, `nickname`, `added_at`), then `siblings_done` with `count` |
+| `APP_SIBLING_REMOVE` | `{ref, peer}` | `sibling_removed` (`peer_dropped`); only on this device, as unpairing is not synced |
+
+From C: `at_app_first_contact_pair_invite`, then `at_app_first_contact_initiate`
+on the new device; `at_app_sibling_list` / `at_app_sibling_remove`. The events
+are `AT_APP_EVENT_FC_SIBLING_PAIRED` (read with `at_first_contact_event()`) and
+`AT_APP_EVENT_FC_SIBLING` / `_SIBLINGS_DONE` / `_SIBLING_REMOVED` (read with
+`at_first_contact_contact_event()`); a synced change carries
+`origin == AT_FC_ORIGIN_SIBLING`.
+
 ## Override hooks
 
 Your integration logic lives in methods you override on your subclass. Each

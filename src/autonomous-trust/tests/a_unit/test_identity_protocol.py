@@ -52,7 +52,10 @@ class TestIdentityProtocol:
           opt-in via AT_FIRST_CONTACT, see first-contact.md), its
           reachability record (reach_record), and the directory contact
           (contact_request, contact_accept on the wire; dir_result,
-          dir_status local IPC from the network process)
+          dir_status local IPC from the network process), and area hubs
+          (hub_result, hub_status, local IPC from the network process);
+          one human's several devices (device_cert, device_announce) and
+          their shared address book (contacts_sync)
         The social verbs (position, profile, connections, DMs, posts,
         reactions, proximity, business ads and posts, cosign, reports)
         left with social (FEATURE_SPLIT_PLAN Phase 5): they are
@@ -64,7 +67,7 @@ class TestIdentityProtocol:
         to ``IdentityProtocol``.
         """
         values = list(IdentityProtocol)
-        assert len(values) == 35
+        assert len(values) == 38
         assert 'announce' in values
         assert 'hello' in values
         assert 'report' not in values

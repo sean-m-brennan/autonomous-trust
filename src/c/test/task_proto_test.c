@@ -152,9 +152,10 @@ DEFINE_TEST(test_paxos_payload_roundtrip)
                      "550e8400-e29b-41d4-a716-446655440000");
 
     json_decref(result);
-    smrt_deref(msg.obj);
+    net_msg_free_obj(&msg);
     smrt_deref(wire);
-    smrt_deref(restored.obj);
+    net_msg_free_obj(&restored);
+    free(restored.function);
 }
 END_TEST_DEFINITION()
 
@@ -184,7 +185,7 @@ DEFINE_TEST(test_reputation_score_payload)
                      "negotiation");
 
     json_decref(result);
-    smrt_deref(msg.obj);
+    net_msg_free_obj(&msg);
 }
 END_TEST_DEFINITION()
 

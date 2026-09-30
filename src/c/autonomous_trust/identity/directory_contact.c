@@ -26,6 +26,7 @@
 #include <sodium.h>
 
 #include "identity/directory_contact.h"
+#include "identity/area_contact.h"
 #include "identity/fc_shared.h"
 #include "identity/first_contact.h"
 #include "identity/identity_priv.h"
@@ -34,6 +35,7 @@
 #include "config/configuration.h"
 #include "contacts/contacts.h"
 #include "contacts/directory.h"
+#include "contacts/area_card.h"
 #include "network/network.h"
 #include "network/net_relay.h"
 #include "utilities/allocation.h"
@@ -66,6 +68,7 @@ typedef struct {
     char key[65];
     char handle[AT_DIR_HANDLE_MAX + 1];
     double deadline;
+    bool by_area;                   /* found at an area hub, not by handle */
 } dir_out_t;
 
 typedef struct {
@@ -77,6 +80,7 @@ typedef struct {
     size_t n_relays;
     double expiry;
     unsigned long order;            /* insertion order: the oldest goes first */
+    bool by_area;                   /* asked via an area we are listed in */
 } dir_in_t;
 
 typedef struct {
@@ -116,6 +120,11 @@ static double _dir_now(void)
     return (double)time(NULL) + g_dir_clock_advance;
 }
 
+double at_dir_contact_now(void)
+{
+    return _dir_now();
+}
+
 /* Mutable names: the handler table keys on them. */
 static char DIR_APP_PUBLISH[] = AT_APP_DIR_PUBLISH;
 static char DIR_APP_WITHDRAW[] = AT_APP_DIR_WITHDRAW;
@@ -143,6 +152,8 @@ void at_dir_contact_reset(void)
     g_dir.invites_next = g_dir.pubrefs_next = 0;
     pthread_mutex_unlock(&g_dir.lock);
     g_dir_clock_advance = 0.0;
+    /* Its area half (identity/area_contact.c) goes with it. */
+    at_area_contact_reset();
 }
 
 void at_dir_contact_advance_clock(double seconds)
@@ -226,6 +237,7 @@ static void _to_network(char *verb, json_t *body)
     net_msg_pack_json(&m.info.net_msg, body);
     json_decref(body);
     messaging_send("network", NET_MESSAGE, &m, false);
+    net_msg_free_obj(&m.info.net_msg);
 }
 
 /* A plaintext identity message to @p whom (not yet a peer), from us. */
@@ -243,6 +255,7 @@ static void _to_wire(const process_t *proc, char *verb, const public_identity_t 
     net_msg_pack_json(&m.info.net_msg, body);
     json_decref(body);
     messaging_send("network", NET_MESSAGE, &m, false);
+    net_msg_free_obj(&m.info.net_msg);
     at_fc_free_public(&m.info.net_msg.from_whom);
 }
 
@@ -664,8 +677,23 @@ bool handle_dir_app_request(const process_t *proc, directory_t *queues, generic_
     json_t *req = at_fc_app_payload(nmsg);
     const char *r = at_fc_app_ref(req);
     char handle[AT_DIR_HANDLE_MAX + 1];
-    if (r == NULL || at_dir_normalize_handle(json_string_value(json_object_get(req, "handle")),
-                                             handle, sizeof(handle)) != 0) {
+    /* Someone an area lookup found (identity/area_contact.c): @c area and
+     * @c peer_uuid in place of a handle. Mirrors Python handle_app_request. */
+    bool by_area = json_object_get(req, "area") != NULL;
+    char area[AT_AREA_MAX + 1] = "", peer[UUID_STRING_LEN + 1] = "";
+    if (by_area) {
+        if (r == NULL || at_area_normalize(json_string_value(json_object_get(req, "area")),
+                                           area, sizeof(area), AT_AREA_MIN, AT_AREA_MAX) != 0) {
+            _refused(proc, r != NULL ? r : "", NULL, "bad_request");
+            json_decref(req);
+            return true;
+        }
+        snprintf(handle, sizeof(handle), "area:%s", area);
+        const char *p = json_string_value(json_object_get(req, "peer_uuid"));
+        at_strlcpy(peer, p != NULL ? p : "", sizeof(peer));
+    } else if (r == NULL
+               || at_dir_normalize_handle(json_string_value(json_object_get(req, "handle")),
+                                          handle, sizeof(handle)) != 0) {
         _refused(proc, r != NULL ? r : "", NULL, "bad_request");
         json_decref(req);
         return true;
@@ -678,8 +706,10 @@ bool handle_dir_app_request(const process_t *proc, directory_t *queues, generic_
     char relay[AT_FC_RELAY_LEN] = "";
     bool have = false;
     double now = _dir_now();
+    if (by_area)
+        have = at_area_contact_found(peer, area, &entry, relay, sizeof(relay));
     pthread_mutex_lock(&g_dir.lock);
-    for (size_t i = 0; i < AT_DIR_FOUND_MAX && !have; i++) {
+    for (size_t i = 0; i < AT_DIR_FOUND_MAX && !have && !by_area; i++) {
         dir_found_t *f = &g_dir.found[i];
         if (f->used && strcmp(f->handle, handle) == 0
             && now - f->at <= AT_DIR_FOUND_TTL_SECONDS
@@ -764,6 +794,7 @@ bool handle_dir_app_request(const process_t *proc, directory_t *queues, generic_
     at_strlcpy(o->key, at_dir_key(&entry), sizeof(o->key));
     at_strlcpy(o->handle, handle, sizeof(o->handle));
     o->deadline = (double)at_dir_expiry(&request);
+    o->by_area = by_area;
     pthread_mutex_unlock(&g_dir.lock);
     at_fc_send_route_hints(holder.uuid, hints, n_hints > 0 ? 1 : 0);
     _to_wire(proc, ID_FC_REQUEST, &holder, at_dir_to_wire(&request));
@@ -818,7 +849,10 @@ bool handle_dir_contact_request(const process_t *proc, directory_t *queues, gene
         why = "not signed by its sender";
     else if (strcmp(to, me) != 0 || strcmp(from, me) == 0)
         why = "not addressed to us";
-    else if (!_is_published(at_dir_handle(&request)))
+    else if (json_object_get(request.body, "area") != NULL) {
+        if (!at_area_contact_listed(json_string_value(json_object_get(request.body, "area"))))
+            why = "via an area where we are not listed";
+    } else if (!_is_published(at_dir_handle(&request)))
         why = "for a handle we do not publish";
     if (why != NULL) {
         log_warn(proc->logger, "Identity: directory: contact request %s; ignoring\n", why);
@@ -872,7 +906,12 @@ bool handle_dir_contact_request(const process_t *proc, directory_t *queues, gene
     slot->sender.zta_credential_len = 0;
     slot->sender.num_zta_credentials = 0;
 #endif
-    at_strlcpy(slot->handle, at_dir_handle(&request), sizeof(slot->handle));
+    const char *req_area = json_string_value(json_object_get(request.body, "area"));
+    slot->by_area = req_area != NULL;
+    if (slot->by_area)
+        snprintf(slot->handle, sizeof(slot->handle), "area:%s", req_area);
+    else
+        at_strlcpy(slot->handle, at_dir_handle(&request), sizeof(slot->handle));
     json_t *rv = json_object_get(request.body, "relays");
     for (size_t i = 0; i < json_array_size(rv) && slot->n_relays < AT_DIR_REQUEST_MAX_RELAYS; i++)
         at_strlcpy(slot->relays[slot->n_relays++], json_string_value(json_array_get(rv, i)),
@@ -948,10 +987,14 @@ bool handle_dir_app_accept(const process_t *proc, directory_t *queues, generic_m
     /* The hello this invitation brings back reports under the request's ref,
      * and records a directory-provenance contact. */
     at_fc_remember_minted(nonce, ref);
-    pthread_mutex_lock(&g_dir.lock);
-    at_strlcpy(g_dir.invites[g_dir.invites_next], nonce, sizeof(g_dir.invites[0]));
-    g_dir.invites_next = (g_dir.invites_next + 1) % DIR_INVITES_MAX;
-    pthread_mutex_unlock(&g_dir.lock);
+    if (held.by_area) {
+        at_area_contact_note_invite(nonce);
+    } else {
+        pthread_mutex_lock(&g_dir.lock);
+        at_strlcpy(g_dir.invites[g_dir.invites_next], nonce, sizeof(g_dir.invites[0]));
+        g_dir.invites_next = (g_dir.invites_next + 1) % DIR_INVITES_MAX;
+        pthread_mutex_unlock(&g_dir.lock);
+    }
     const char *rptrs[AT_DIR_REQUEST_MAX_RELAYS];
     for (size_t i = 0; i < held.n_relays; i++)
         rptrs[i] = held.relays[i];
@@ -1058,7 +1101,7 @@ bool handle_dir_contact_accept(const process_t *proc, directory_t *queues, gener
             memset(&g_dir.out[i], 0, sizeof(g_dir.out[i]));
     pthread_mutex_unlock(&g_dir.lock);
     (void)at_first_contact_initiate_prov(proc, queues, blob, NULL, out.ref,
-                                         AT_PROV_DIRECTORY, NULL);
+                                         out.by_area ? AT_PROV_AREA : AT_PROV_DIRECTORY, NULL);
     at_fc_emit_hello_sent(proc, out.ref, &inviter);
     at_fc_free_public(&inviter);
     free(blob);

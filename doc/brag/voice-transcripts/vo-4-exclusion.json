@@ -1,0 +1,86 @@
+[
+  {
+    "text": "Its",
+    "start": 0.11,
+    "end": 0.22,
+    "id": "w0"
+  },
+  {
+    "text": "reputation",
+    "start": 0.22,
+    "end": 0.97,
+    "id": "w1"
+  },
+  {
+    "text": "falls",
+    "start": 0.97,
+    "end": 1.34,
+    "id": "w2"
+  },
+  {
+    "text": "through",
+    "start": 1.34,
+    "end": 1.83,
+    "id": "w3"
+  },
+  {
+    "text": "the",
+    "start": 1.96,
+    "end": 2.08,
+    "id": "w4"
+  },
+  {
+    "text": "threshold,",
+    "start": 2.08,
+    "end": 2.87,
+    "id": "w5"
+  },
+  {
+    "text": "and",
+    "start": 2.91,
+    "end": 3,
+    "id": "w6"
+  },
+  {
+    "text": "the",
+    "start": 3,
+    "end": 3.15,
+    "id": "w7"
+  },
+  {
+    "text": "network",
+    "start": 3.15,
+    "end": 3.46,
+    "id": "w8"
+  },
+  {
+    "text": "drops",
+    "start": 3.57,
+    "end": 3.98,
+    "id": "w9"
+  },
+  {
+    "text": "it.",
+    "start": 3.98,
+    "end": 4.46,
+    "id": "w10"
+  },
+  {
+    "text": "No",
+    "start": 4.57,
+    "end": 4.67,
+    "id": "w11"
+  },
+  {
+    "text": "operator",
+    "start": 4.67,
+    "end": 5.48,
+    "id": "w12"
+  },
+  {
+    "text": "necessary.",
+    "start": 5.61,
+    "end": 6.46,
+    "id": "w13"
+  }
+]

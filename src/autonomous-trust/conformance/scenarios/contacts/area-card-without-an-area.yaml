@@ -1,0 +1,30 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: area-card-without-an-area
+description: A card with no area is malformed, never a crash.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: dir_verify
+    what: area_card
+    now: 1790000000
+    wire:
+      body: '{"v":1,"typename":"at-area-card","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","key":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5","bucket":"u4pru","name":"","seq":1,"expiry":1790003600,"identity":{"typename":"identity","uuid":"aaaaaaaa-0000-4000-8000-0000000000a1","address":"","nickname":"alice","signature":{"hex_seed":"bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5"},"encryptor":{"hex_seed":"7777777777777777777777777777777777777777777777777777777777777777"}}}'
+      sig: 591b0d6340e7cee19f12d4287f0823c2e3c9c1ef68af29f6866360847d7001136e1b66da1306a38e650f549c0918332a1f2b5b94ec472f4dcf23d26f9487150e
+steps:
+- id: 1
+  from: host
+  to: host
+  function: dir_verify
+  description: 'trigger: dir_verify'
+expected_state:
+  host:
+    dir_status: malformed

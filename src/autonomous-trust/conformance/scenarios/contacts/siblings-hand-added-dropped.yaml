@@ -1,0 +1,85 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: siblings-hand-added-dropped
+description: 'siblings.cfg.json is plain JSON: a device under another operator, and a cert moved onto another identity, do not load.'
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    mode: load
+    siblings:
+      typename: siblings
+      version: 1
+      operator: af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d
+      devices:
+      - identity:
+          typename: identity
+          uuid: eeeeeeee-0000-4000-8000-000000000007
+          address: ''
+          nickname: other
+          signature:
+            hex_seed: 31debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc
+          encryptor:
+            hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+        cert:
+          body: '{"v":1,"typename":"at-device-cert","operator":"af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d","uuid":"eeeeeeee-0000-4000-8000-000000000007","key":"31debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc","issued_at":1790000000}'
+          sig: e9923667b06b911e9bb9ae2fa324291fde51ae21effbf94bbc09e6d2dc9b52eb52fb3b86703b36e9bbd14358b6317b2be9a816a7e264a32feac9cf861fdff50e
+        added_at: 5.0
+      - identity:
+          typename: identity
+          uuid: eeeeeeee-0000-4000-8000-000000000003
+          address: ''
+          nickname: dave
+          signature:
+            hex_seed: 66cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633
+          encryptor:
+            hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+        cert:
+          body: '{"v":1,"typename":"at-device-cert","operator":"2df04125f0015afb47ce853aef8772094ff9498c14cb1b9e12973c2927da0fa6","uuid":"eeeeeeee-0000-4000-8000-000000000003","key":"66cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633","issued_at":1790000000}'
+          sig: 2fc581640296e305410f947ca9022a59deefac0825b769691e3e1a664ea0d5294fe016ccefe1c1f36450a0d387e34f6edae44c80dfeaa31fee6903a49950480a
+        added_at: 5.0
+      - identity:
+          typename: identity
+          uuid: eeeeeeee-0000-4000-8000-000000000004
+          address: ''
+          nickname: erin
+          signature:
+            hex_seed: 20828bf5c5bdcacb684863336c202fb5599da48be5596615742170705beca9f7
+          encryptor:
+            hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+        cert:
+          body: '{"v":1,"typename":"at-device-cert","operator":"af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d","uuid":"eeeeeeee-0000-4000-8000-000000000007","key":"31debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc","issued_at":1790000000}'
+          sig: e9923667b06b911e9bb9ae2fa324291fde51ae21effbf94bbc09e6d2dc9b52eb52fb3b86703b36e9bbd14358b6317b2be9a816a7e264a32feac9cf861fdff50e
+        added_at: 5.0
+      - identity:
+          typename: identity
+          uuid: eeeeeeee-0000-4000-8000-000000000007
+          address: ''
+          nickname: other
+          signature:
+            hex_seed: 31debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc
+          encryptor:
+            hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+        cert:
+          body: '{"v":1,"typename":"at-device-cert","operator":"af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d","uuid":"eeeeeeee-0000-4000-8000-000000000007","key":"31debe55d37c722768b137131caa6087080b2e0b60b94bd785d14575cfa498bc","issued_at":1790000000}'
+          sig: e9923667b06b911e9bb9ae2fa324291fde51ae21effbf94bbc09e6d2dc9b52eb52fb3b86703b36e9bbd14358b6317b2be9a816a7e264a32feac9cf861fdff50e
+        added_at: 5.0
+    op: siblings
+steps:
+- id: 1
+  from: host
+  to: host
+  function: siblings
+  description: 'trigger: siblings'
+expected_state:
+  host:
+    siblings:
+    - eeeeeeee-0000-4000-8000-000000000007
+    operator: af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d

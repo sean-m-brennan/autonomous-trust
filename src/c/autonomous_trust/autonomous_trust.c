@@ -522,9 +522,10 @@ int run_autonomous_trust(char *q_in, char *q_out,
          * Same fault the process loops had; see PROC_DRAIN_MAX. */
 
         // check for extern messages
+        generic_msg_t task_msg = {0};
         for (int taken = 0; taken < PROC_DRAIN_MAX; taken++)
         {
-            generic_msg_t task_msg = {0};
+            messaging_recv_release(&task_msg);   /* the previous pass's */
             ret = messaging_recv_on(&extern_q, &task_msg, NULL, false);
             if (ret == -1)
             {
@@ -535,11 +536,13 @@ int run_autonomous_trust(char *q_in, char *q_out,
                 break;   /* nothing waiting */
             at_route_extern_msg(&task_msg, &logger);
         }
+        messaging_recv_release(&task_msg);
 
         // get results from internal procs
+        generic_msg_t result_msg = {0};
         for (int taken = 0; taken < PROC_DRAIN_MAX; taken++)
         {
-            generic_msg_t result_msg = {0};
+            messaging_recv_release(&result_msg);   /* the previous pass's */
             ret = messaging_recv(&result_msg);
             if (ret == -1)
             {
@@ -561,6 +564,8 @@ int run_autonomous_trust(char *q_in, char *q_out,
         /* Anything a previous pass could not route (a read error abandons the
          * drain mid-array) leaves the queue here, in FIFO order. */
         at_route_internal_msgs(&unhandled_msgs, q_out, &logger);
+        /* Only now: the queue holds result_msg by reference. */
+        messaging_recv_release(&result_msg);
 
         if (usleep(cadence) == -1)
         {

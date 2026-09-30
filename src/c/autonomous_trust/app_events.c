@@ -79,9 +79,10 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
     if (handle == NULL || out == NULL)
         return -1;
     size_t n = 0;
+    generic_msg_t msg = {0};
     while (n < max)
     {
-        generic_msg_t msg = {0};
+        messaging_recv_release(&msg);   /* the previous pass's */
         /* Non-blocking: a poll reports what has arrived, it does not wait. */
         int ret = handle->owns_queue
                       ? messaging_recv_on(&handle->queue, &msg, NULL, false)
@@ -172,6 +173,7 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
         }
         }
     }
+    messaging_recv_release(&msg);
     return (int)n;
 }
 
@@ -234,7 +236,9 @@ int at_app_events_peer_standing(at_app_events_t *handle, const char *q_out,
         return -1;
     }
     json_decref(env);
-    return messaging_send(q_out, NET_MESSAGE, &req, false) == 0 ? 0 : -1;
+    int rc = messaging_send(q_out, NET_MESSAGE, &req, false);
+    net_msg_free_obj(&req.info.net_msg);
+    return rc == 0 ? 0 : -1;
 }
 
 uint32_t at_app_abi_version(void)

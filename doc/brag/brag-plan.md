@@ -120,42 +120,42 @@ and nobody watching.
 Seven clips, generated with `hyperframes tts --voice am_michael`. Each is written
 to complement what is on screen rather than read it.
 
-1. **hook** — "Four federal agencies. One hurricane. And a live data feed nobody has
-   time to verify by hand."
+1. **hook** — "Four federal agencies. One hurricane. And a live data feed nobody can verify by hand."
 2. **mesh** — "The peers find each other and build a trust graph. No policy server to
    call. No certificate authority to ask. Every decision happens at the node."
 3. **divergence** — "Then one of them starts reporting temperatures that don't match
    its neighbors. Nobody flags it. Cross-source validation just notices."
 4. **exclusion** — "Its reputation falls through the threshold, and the network drops
-   it. No operator approved that. That is the whole claim."
+   it. No operator necessary."
 5. **rejoin** — "A new peer joins moments later, and starts at zero, like everyone
    else."
 6. **gradient** — "Because trust here is not a yes or a no. It is a dial, and every
    peer's position on it is re-earned continuously."
-7. **lockup** — "AutonomousTrust. Cooperative computing for machines that cannot
-   phone home."
+7. **lockup** — "AutonomousTrust. Cooperative computing for machines that are out of reach."
 
 The silent cut's three captions — *No central authority. No round-trip.* / *No
 human in the loop.* / *Trust is metered, not granted.* — were removed here as
 duplication, then **restored on request** and timed to the word onset in the
-narration that carries the same idea (10.27s, 26.31s, 34.83s; see the table in
+narration that carries the same idea (12.08s, 33.56s, 44.84s; see the table in
 `composition-brief.md`). The hook line and the closing tagline stay on screen —
 the voice says neither.
 
 ### As synthesized
 
-The clips came back shorter than the script above: Kokoro dropped or compressed a
-sentence in most of them, so the delivered audio is the authority for timing and
-for what the voice actually carries. Transcribed from the WAVs
-(`hyperframes transcribe`, whisper `base.en`):
+The first synthesis came back shorter than the script: Kokoro dropped or
+compressed a sentence in most clips, and the 44.0s cut was timed to that audio.
+The clips were regenerated on 2026-09-30 with `scripts/make_voice.py`, which reads
+the list above, and this time every line was delivered whole. Transcribed from
+the WAVs (`hyperframes transcribe`, whisper `base.en`; word timings in
+`voice-transcripts/`):
 
-1. *"Four federal agencies. One hurricane. And a live data feed nobody has time to verify."*
-2. *"They find each other and build a trust graph. No policy server to call. No certificate authority to ask."* — loses "Every decision happens at the node."
-3. *"Then one of them starts reporting temperatures that don't match its neighbors. Cross-source validation notices."* — loses "Nobody flags it."
-4. *"Its reputation falls through the threshold, and the network drops it. No operator necessary."* — loses "That is the whole claim."
-5. *"A new peer joins moments later and starts at zero."*
-6. *"Trust here is not a yes or a no. It is a dial re-earned continuously."*
-7. *"AutonomousTrust. Cooperative computing for machines that cannot phone home."*
+1. *"Four federal agencies, one hurricane, and a live data feed nobody can verify by hand."*
+2. *"The peers find each other and build a trust graph. No policy server to call. No certificate authority to ask. Every decision happens at the node."*
+3. *"Then one of them starts reporting temperatures that don't match its neighbors. Nobody flags it. Cross-source validation just notices."*
+4. *"Its reputation falls through the threshold, and the network drops it. No operator necessary."*
+5. *"A new peer joins moments later and starts at zero like everyone else."*
+6. *"Because trust here is not a yes or a no. It is a dial and every peer's position on it is re-earned continuously."*
+7. *"Autonomous trust, cooperative computing for machines that are out of reach."*
 
 ## Storyboard
 
@@ -205,8 +205,8 @@ Audio intent: bed opens slightly in the gaps; light tick per card.
 Transition: clean → Scene 7
 
 ### Scene 7 — Lockup
-Dashboard recedes to 0.22. Wordmark **AutonomousTrust**, then *Trust as a live
-value.* Music fades out under the last line.
+Dashboard recedes to 0.22. Wordmark **AutonomousTrust**, then *For dynamically
+cooperative machines.* Music fades out under the last line.
 Audio intent: settle and release.
 
 **Music mood for this video:** cinematic — low, restrained, subordinate to speech.
@@ -222,38 +222,49 @@ exclusion, and fading out under the closing line.
 Written after the narration was generated and measured, replacing the placeholder
 scene lengths above.
 
-**Final duration: 44.0s.** Seven Kokoro clips (`am_michael`, speed 0.96) totalling
-37.61s of speech, plus ~0.65s of breathing room between each line.
+**Final duration: 56.7s** (retimed 2026-09-30 from 44.0s). Seven Kokoro clips
+(`am_michael`, speed 0.96) totalling 50.33s of speech, with the same breathing
+room between lines as the 44.0s cut (0.62–0.92s).
 
 | Clip              | Measured | Starts at | Ends  |
 | ----------------- | -------- | --------- | ----- |
-| `vo-1-hook`       | 5.715s   | 1.00      | 6.72  |
-| `vo-2-mesh`       | 6.604s   | 7.64      | 14.24 |
-| `vo-3-divergence` | 6.370s   | 14.92     | 21.29 |
-| `vo-4-exclusion`  | 5.905s   | 21.95     | 27.86 |
-| `vo-5-rejoin`     | 3.284s   | 28.50     | 31.78 |
-| `vo-6-gradient`   | 4.780s   | 32.40     | 37.18 |
-| `vo-7-lockup`     | 4.956s   | 37.90     | 42.86 |
+| `vo-1-hook`       | 6.805s   | 1.00      | 7.81  |
+| `vo-2-mesh`       | 10.261s  | 8.73      | 18.99 |
+| `vo-3-divergence` | 8.661s   | 19.67     | 28.33 |
+| `vo-4-exclusion`  | 6.379s   | 28.99     | 35.37 |
+| `vo-5-rejoin`     | 5.035s   | 36.01     | 41.05 |
+| `vo-6-gradient`   | 8.043s   | 41.66     | 49.70 |
+| `vo-7-lockup`     | 5.141s   | 50.42     | 55.56 |
 
-Scene spans that follow from those clips: hook 0–7.3 · mesh 7.3–14.2 ·
-divergence 14.2–21.3 · exclusion 21.3–28.4 · re-entry 28.4–32.1 ·
-gradient 32.1–37.6 · lockup 37.6–44.0.
+Scene spans that follow from those clips: hook 0–8.4 · mesh 8.4–18.9 ·
+divergence 18.9–28.3 · exclusion 28.3–35.9 · re-entry 35.9–41.3 ·
+gradient 41.3–50.1 · lockup 50.1–56.7.
+
+The retime carried every timeline constant through the word it was anchored to
+(old and new whisper transcripts aligned word by word), kept elements that sit
+in a gap at their offset from the neighbouring clip boundary, and re-snapped
+beat-locked moments to the 107.67 BPM grid. The cue preset's analysis window ends
+at 44.0s; beats past it are extrapolated from the fitted grid (0.009s maximum
+residual over 81 beats, and zero phase error against the audio's onsets in
+44–57s).
 
 ### Where the picture meets the word
 
-- Peer arrivals ride the beat grid under VO 2: 8.19 … 12.02, one per beat.
-- The falsified trace peels away on strong cue **17.47s**, landing under
+- Peer arrivals ride the beat grid under VO 2: 9.47 … 13.36, one per beat.
+- The falsified trace peels away on strong cue **21.70s**, landing under
   *"temperatures that don't match its neighbors."*
-- The reputation count is tuned (start 22.93, duration 2.0, `power2.in`) so 0.82
-  crosses `Threshold 0.35` **exactly** on strong cue **24.56s** — which is where
-  the voice says *"falls through the threshold."*
-- The node vanishes on strong cue **25.65s**, under *"the network drops it."*
+- The reputation count is tuned (start 30.03 on *"falls"*, duration 2.384,
+  `power2.in`) so 0.82 crosses `Threshold 0.35` **exactly** on strong cue
+  **31.97s** — which is where the voice finishes *"falls through the threshold."*
+- The node vanishes on beat **32.81s**, under *"the network drops it."*
   One dry impact, nothing else.
-- Mean trust dips 0.86 → 0.79 when `epa-monitor-1` arrives, because the new peer
-  starts at zero — which is what VO 5 is saying over that beat.
-- Tier cards on alternating beats 32.74 / 33.83 / 34.92 / 36.01 (opening and
-  closing cards are strong cues).
-- Wordmark on strong cue 38.20; tagline on strong cue 40.38.
+- Mean trust dips 0.86 → 0.79 when `epa-monitor-1` arrives (beat 37.25), because
+  the new peer starts at zero — which is what VO 5 is saying over that beat.
+- Tier cards on alternating beats 42.81 / 43.92 / 45.03 / 46.14.
+- Wordmark on beat 51.14; tagline on beat 53.36; music credit on beat 54.47.
+- Every sfx start equals the constant it accompanies. Before the retime the
+  arrival ticks, the exclusion impact, the tier ticks and the lockup hit still
+  sat on the previous music track's grid, up to 0.17s off their visuals.
 
 ### Audio outcome (measured off the render)
 

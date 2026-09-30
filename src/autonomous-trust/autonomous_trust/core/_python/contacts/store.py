@@ -23,7 +23,9 @@ prunes untrusted cohort members on every restart -- this store is authoritative
 personal state and is never pruned automatically.
 """
 import json
+import math
 import os
+import time
 
 from ..config.configuration import Configuration, atomic_write
 from .contact import Contact
@@ -43,11 +45,16 @@ class Contacts(Configuration):
 
     default_filename = 'contacts'
 
-    def __init__(self, contacts=None):
+    def __init__(self, contacts=None, tombstones=None):
         super().__init__()
         # uuid_str -> Contact. dict(...) so a decoded mapping (config round-trip)
         # and a caller-supplied dict both work.
         self.contacts = dict(contacts or {})
+        # uuid_str -> when the user removed that contact (Phase 4,
+        # contacts/sync.py): the removal the user's other devices copy. Kept
+        # for good -- one is a few dozen bytes, and dropping it would let a
+        # device that was away long enough bring the contact back.
+        self.tombstones = dict(tombstones or {})
         self.reindex()
 
     def reindex(self):
@@ -66,8 +73,10 @@ class Contacts(Configuration):
 
     # -- membership -------------------------------------------------------
     def add(self, contact: Contact) -> Contact:
-        """Add or replace a contact (keyed by UUID). Returns the stored contact."""
+        """Add or replace a contact (keyed by UUID). Returns the stored contact.
+        Adding a contact again undoes an earlier removal of it."""
         self.contacts[str(contact.uuid)] = contact
+        self.tombstones.pop(str(contact.uuid), None)
         self.reindex()
         return contact
 
@@ -96,12 +105,17 @@ class Contacts(Configuration):
         """All contacts asserting this ONLINE nickname (not unique, so a list)."""
         return [c for c in self.contacts.values() if c.nickname == nickname]
 
-    def remove(self, uuid) -> bool:
+    def remove(self, uuid, at=None) -> bool:
         """Drop the contact filed under ``uuid`` (its first device), with every
-        device it lists."""
-        gone = self.contacts.pop(str(uuid), None) is not None
+        device it lists, leaving a tombstone dated ``at`` (default now) so the
+        user's other devices drop it too."""
+        gone = self.contacts.pop(str(uuid), None)
+        if gone is not None:
+            at = float(at if at is not None else time.time())
+            self.tombstones[str(uuid)] = max(at, gone.version(),
+                                             self.tombstones.get(str(uuid), 0.0))
         self.reindex()
-        return gone
+        return gone is not None
 
     def all(self):
         return list(self.contacts.values())
@@ -123,12 +137,17 @@ class Contacts(Configuration):
     # default config __type__ encoder: a contacts.cfg.json written by the C twin
     # (contacts/store.c) must load here and vice versa. See Contact.to_canonical.
     def to_canonical(self) -> dict:
-        return {
+        d = {
             'typename': CONTACTS_TYPENAME,
             'version': CONTACTS_VERSION,
             'contacts': {uuid: c.to_canonical()
                          for uuid, c in self.contacts.items()},
         }
+        # Only once something was removed, so an older store stays
+        # byte-identical.
+        if self.tombstones:
+            d['tombstones'] = {u: float(t) for u, t in self.tombstones.items()}
+        return d
 
     @classmethod
     def from_canonical(cls, d: dict) -> 'Contacts':
@@ -139,7 +158,7 @@ class Contacts(Configuration):
                 # Key by the contact's own UUID, not the map key, so a crafted
                 # file cannot file a contact under the wrong identity.
                 contacts[str(contact.uuid)] = contact
-        return cls(contacts)
+        return cls(contacts, _tombstones(d.get('tombstones'), contacts))
 
     # -- persistence ------------------------------------------------------
     @classmethod
@@ -168,3 +187,20 @@ class Contacts(Configuration):
         with atomic_write(path) as fh:
             json.dump(self.to_canonical(), fh, indent=2, sort_keys=True)
         return path
+
+
+def is_uuid(v) -> bool:
+    """Whether ``v`` is a uuid in its canonical lowercase text form."""
+    return isinstance(v, str) and len(v) == 36 \
+        and all(c in '0123456789abcdef-' for c in v)
+
+
+def _tombstones(v, contacts):
+    """The stored tombstones that are well formed: a lowercase uuid key, a
+    non-negative time, and no live contact under the same uuid."""
+    out = {}
+    for uuid, at in (v.items() if isinstance(v, dict) else ()):
+        if is_uuid(uuid) and uuid not in contacts and not isinstance(at, bool) \
+                and isinstance(at, (int, float)) and math.isfinite(at) and at >= 0:
+            out[uuid] = float(at)
+    return out

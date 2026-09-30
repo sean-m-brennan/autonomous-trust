@@ -1,0 +1,88 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: sync-hand-added-device-in-a-payload-dropped
+description: 'A device under another operator key rides in a payload: the record arrives without it.'
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: sync
+    now: 1800000000.0
+    store:
+      typename: contacts
+      version: 1
+      contacts: {}
+    payload:
+      v: 1
+      typename: at-contacts-sync
+      contacts:
+        eeeeeeee-0000-4000-8000-000000000002:
+          identity:
+            typename: identity
+            uuid: eeeeeeee-0000-4000-8000-000000000002
+            address: ''
+            nickname: carol
+            signature:
+              hex_seed: 204040e364c10f2bec9c1fe500a1cd4c247c89d650a01ed7e82caba867877c21
+            encryptor:
+              hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+          petname: carol-pet
+          verified: true
+          provenance: token
+          trust_seed: 0.3
+          rendezvous: []
+          nonce: ''
+          added_at: 1000.0
+          verified_at: 1500.0
+          operator_key: af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d
+          devices:
+          - identity:
+              typename: identity
+              uuid: eeeeeeee-0000-4000-8000-000000000003
+              address: ''
+              nickname: dave
+              signature:
+                hex_seed: 66cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633
+              encryptor:
+                hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+            cert:
+              body: '{"v":1,"typename":"at-device-cert","operator":"af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d","uuid":"eeeeeeee-0000-4000-8000-000000000003","key":"66cd608b928b88e50e0efeaa33faf1c43cefe07294b0b87e9fe0aba6a3cf7633","issued_at":1790000000}'
+              sig: 1076e5af12a0fbe4048b982a22ffb8dbfe0605002aef04a34c506a0f0a4c792ad4220a6ce4f1d2e5989954fdefb737b78066b1ea086e6c45358ebebf67d9ea02
+            added_at: 5.0
+          - identity:
+              typename: identity
+              uuid: eeeeeeee-0000-4000-8000-000000000004
+              address: ''
+              nickname: erin
+              signature:
+                hex_seed: 20828bf5c5bdcacb684863336c202fb5599da48be5596615742170705beca9f7
+              encryptor:
+                hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+            cert:
+              body: '{"v":1,"typename":"at-device-cert","operator":"2df04125f0015afb47ce853aef8772094ff9498c14cb1b9e12973c2927da0fa6","uuid":"eeeeeeee-0000-4000-8000-000000000004","key":"20828bf5c5bdcacb684863336c202fb5599da48be5596615742170705beca9f7","issued_at":1790000000}'
+              sig: 38580a412cbec3fce25794dabe65bad6ac5bee8da55e25bb86e837de253ef0000971225bad1597271d6b4798a87e1128f465b8cb8d6074fb1196116533a49c0a
+            added_at: 5.0
+      tombstones: {}
+steps:
+- id: 1
+  from: host
+  to: host
+  function: sync
+  description: 'trigger: sync'
+expected_state:
+  host:
+    changes:
+    - - eeeeeeee-0000-4000-8000-000000000002
+      - added
+    devices_of:
+      eeeeeeee-0000-4000-8000-000000000002:
+      - eeeeeeee-0000-4000-8000-000000000003
+    contacts:
+      eeeeeeee-0000-4000-8000-000000000004:

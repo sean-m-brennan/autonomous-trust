@@ -58,6 +58,7 @@ from ..network.message import Message
 from ..network.network import Network
 from ..network import relay as _relay
 from ..contacts import reach as _reach
+from ..contacts.invitation import PURPOSE_PAIR
 from ..config.configuration import to_json_string, atomic_write, Configuration
 from .identity import Identity, public_identity_to_canonical
 from .protocol import IdentityProtocol
@@ -114,7 +115,8 @@ EVENT_ESTABLISHED = 'established'   # both sides hold each other; see ``role``
 
 #: FirstContactEvent.reason values. Index = C's at_fc_reason_t.
 REASONS = ('', 'malformed', 'bad_signature', 'expired', 'spent', 'endpoint',
-           'bad_request', 'mint_failed', 'mismatch', 'unknown_contact')
+           'bad_request', 'mint_failed', 'mismatch', 'unknown_contact',
+           'not_sibling')
 
 #: ContactEvent.kind values. C's AT_APP_EVENT_FC_CONTACT.. carry the same
 #: outcomes as numbers (at_first_contact.h).
@@ -184,6 +186,9 @@ class ContactEvent(AppEvent):
     count: int = 0
     #: ``device_linked`` only: the further device filed under this contact.
     device_uuid: str = ''
+    #: 'sibling' when the change came from another of our own devices
+    #: (identity/sibling_sync.py); '' for one made here.
+    origin: str = ''
 
 
 def _emit(proc, queues, event) -> None:
@@ -321,6 +326,11 @@ def register(proc) -> None:
     # One human, several devices (Phase 4).
     from . import device_contact
     device_contact.register(proc)
+    from . import sibling_sync
+    sibling_sync.register(proc)
+    # Finding people nearby at an area hub.
+    from . import area_contact
+    area_contact.register(proc)
 
 
 def _register_extension(proc, proc_name: str) -> None:
@@ -431,9 +441,12 @@ def _push_own_record(proc, queues, peers=None, record=None):
     if record is None or CfgIds.network not in queues:
         return
     if peers is None:
+        from . import sibling_sync
         store = _contacts_store(proc)
         peers = [proc.peers.find_by_uuid(ident.uuid) for c in store.all()
                  for ident in c.identities()]
+        peers += [proc.peers.find_by_uuid(u)
+                  for u in sibling_sync.siblings(proc).uuids()]
     for peer in peers:
         if peer is None or str(peer.uuid) == str(proc.identity.uuid):
             continue
@@ -468,8 +481,10 @@ def handle_reach_record(proc, queues, message) -> bool:
             if str(c.identity.uuid).lower() == record.uuid:
                 contact = c
     if contact is None:
-        proc.logger.debug('first contact: record for %s, not a contact; ignored',
-                          record.uuid[:8])
+        from . import sibling_sync
+        if not sibling_sync.apply_record(proc, queues, record):
+            proc.logger.debug('first contact: record for %s, not a contact; ignored',
+                              record.uuid[:8])
         return True
     if _relay._signing_hex(contact.identity).lower() != record.key:
         proc.logger.warning('first contact: record for %s is signed by another '
@@ -540,9 +555,12 @@ def restore_contacts(proc, queues) -> int:
 #: gated on ``AT_FIRST_CONTACT``.
 def _on_start(proc, queues):
     """At startup: re-admit the address book, and refile our directory entries."""
-    from . import directory_contact, device_contact
+    from . import directory_contact, device_contact, sibling_sync
     restored = restore_contacts(proc, queues)
+    sibling_sync.restore(proc, queues)
     directory_contact.restore_entries(proc, queues)
+    from . import area_contact
+    area_contact.refresh(proc, queues)
     # Phase 4: our cert to every contact now a peer, and this device to all.
     device_contact.push_own_cert(proc, queues)
     device_contact.announce(proc, queues)
@@ -551,13 +569,26 @@ def _on_start(proc, queues):
 
 def _app_verbs():
     from .directory_contact import APP_VERBS as dir_verbs
+    from .sibling_sync import APP_VERBS as sibling_verbs
+    from .area_contact import APP_VERBS as area_verbs
     return (APP_INVITE, APP_INITIATE, APP_SAFETY_NUMBER, APP_VERIFY, APP_LIST,
-            APP_RENAME, APP_REMOVE) + dir_verbs
+            APP_RENAME, APP_REMOVE) + dir_verbs + sibling_verbs + area_verbs
+
+
+def _periodic(proc, queues):
+    """With the caps-resync sweep: give up on pair handshakes whose cert never
+    came, push any address-book edit not pushed yet, and keep our area cards
+    fresh while we stay listed."""
+    from . import sibling_sync, area_contact
+    sibling_sync.expire(proc, queues)
+    sibling_sync.push_changes(proc, queues)
+    area_contact.refresh(proc, queues)
 
 
 EXTENSION = Extension(name='first_contact', enabled=enabled,
                       register_handlers=_register_extension,
-                      identity=IdentityHooks(on_start=_on_start),
+                      identity=IdentityHooks(on_start=_on_start,
+                                             periodic_resync=_periodic),
                       app_verbs=tuple((verb, CfgIds.identity) for verb in _app_verbs()))
 
 
@@ -619,6 +650,8 @@ def capped_tier(proc, peer_uuid, tier) -> int:
       contact (the child's vote does not vouch for what first contact
       introduced), and is not capped with no contact record at all -- an
       ordinary child member never went through first contact;
+    - one of our own devices (a sibling, identity/sibling_sync.py) is never
+      capped;
     - any other peer is capped. A missing record counts as unverified here:
       losing or deleting ``contacts.cfg.json`` must not lift the cap.
 
@@ -631,6 +664,9 @@ def capped_tier(proc, peer_uuid, tier) -> int:
     verified = _contact_records().get(str(peer_uuid))
     if verified:
         return tier
+    from .sibling_sync import sibling_uuids
+    if str(peer_uuid) in sibling_uuids():
+        return tier     # one of our own devices (Phase 4)
     if verified is None and _in_a_child_group(proc, peer_uuid):
         return tier
     return UNVERIFIED_TIER_CAP
@@ -835,6 +871,9 @@ def handle_hello(proc, queues, message) -> bool:
         return True
     spent.add(nonce, invitation.expiry)   # durable: survives a restart
 
+    if invitation.purpose == PURPOSE_PAIR:
+        return _hello_pair(proc, queues, sender, nonce, ref)
+
     _admit_direct_peer(proc, queues, sender)
     proc.logger.info('first contact: admitted %s as a direct peer', sender.nickname)
 
@@ -844,16 +883,43 @@ def handle_hello(proc, queues, message) -> bool:
     queues[CfgIds.network].put(ack, block=True, timeout=proc.q_cadence)
     # After the ack is on its way: the address book is durable state, not part
     # of the handshake's critical path.
-    directory = nonce in getattr(proc, '_dir_invites', ())
+    if nonce in getattr(proc, '_area_invites', ()):
+        provenance = Provenance.area
+    elif nonce in getattr(proc, '_dir_invites', ()):
+        provenance = Provenance.directory
+    else:
+        provenance = Provenance.token
     _record_contact(proc, sender, nonce=nonce,
                     endpoint=getattr(sender, 'address', '') or '',
-                    provenance=Provenance.directory if directory else Provenance.token)
+                    provenance=provenance)
     _push_own_record(proc, queues, [sender])
-    from . import device_contact
+    from . import device_contact, sibling_sync
     device_contact.push_own_cert(proc, queues, [sender])
+    sibling_sync.push_changes(proc, queues)
     _emit(proc, queues, FirstContactEvent(
         EVENT_ESTABLISHED, ref=ref, peer_uuid=str(sender.uuid),
         nickname=sender.nickname, role='inviter'))
+    return True
+
+
+def _hello_pair(proc, queues, sender, nonce, ref) -> bool:
+    """The hello redeems a pairing invitation of ours: admit and ack as
+    usual, record no contact, and wait for the sender's device cert
+    (identity/sibling_sync.py). Without a cert of our own there is no one to
+    pair under, and no ack."""
+    from . import sibling_sync
+    if not sibling_sync.can_pair(proc):
+        sibling_sync.refuse(proc, queues, sender, ref, 'inviter', drop=False)
+        return True
+    _admit_direct_peer(proc, queues, sender)
+    ack = Message(proc.name, IdentityProtocol.hello_ack,
+                  to_json_string({'nonce': nonce}),
+                  to_whom=sender, from_whom=proc.identity, encrypt=False)
+    queues[CfgIds.network].put(ack, block=True, timeout=proc.q_cadence)
+    address = getattr(sender, 'address', '') or ''
+    sibling_sync.begin(proc, queues, sender, ref, 'inviter',
+                       hints=[address] if address else [])
+    proc.logger.info('first contact: pairing with %s', sender.nickname)
     return True
 
 
@@ -866,6 +932,7 @@ class _Pending:
     deadline: float
     relays: tuple = ()      # the link's relay:// hints, for the contact
     provenance: Provenance = Provenance.token
+    pair: bool = False      # the link was a pairing invitation (Phase 4)
 
 
 def _take_pending(proc, accepter, nonce, now=None):
@@ -927,6 +994,13 @@ def handle_hello_ack(proc, queues, message) -> bool:
     if entry is None:
         return True
     _admit_direct_peer(proc, queues, accepter)
+    if entry.pair:
+        from . import sibling_sync
+        address = getattr(accepter, 'address', '') or ''
+        sibling_sync.begin(proc, queues, accepter, entry.ref, 'initiator',
+                           hints=list(entry.relays) + ([address] if address else []))
+        proc.logger.info('first contact: pairing with %s', accepter.nickname)
+        return True
     # Our own side of the address book. The redeemer usually already has a
     # Contact for this identity (redeem_invitation built one, possibly verified
     # in-person); the preserve rule in _record_contact keeps that posture and
@@ -937,8 +1011,9 @@ def handle_hello_ack(proc, queues, message) -> bool:
     proc.logger.info('first contact: %s accepted; direct peer established',
                      accepter.nickname)
     _push_own_record(proc, queues, [accepter])
-    from . import device_contact
+    from . import device_contact, sibling_sync
     device_contact.push_own_cert(proc, queues, [accepter])
+    sibling_sync.push_changes(proc, queues)
     _emit(proc, queues, FirstContactEvent(
         EVENT_ESTABLISHED, ref=entry.ref, peer_uuid=str(accepter.uuid),
         nickname=accepter.nickname, role='initiator'))
@@ -1038,7 +1113,8 @@ def initiate(proc, queues, invitation_blob, endpoint=None, ref='',
         ref=str(ref or ''), nonce=invitation.nonce,
         signing_key=_signing_key(inviter),
         deadline=time.time() + PENDING_TTL_SECONDS,
-        relays=tuple(relay_eps), provenance=provenance)
+        relays=tuple(relay_eps), provenance=provenance,
+        pair=invitation.purpose == PURPOSE_PAIR)
     queues[CfgIds.network].put(hello, block=True, timeout=proc.q_cadence)
     return inviter
 
@@ -1096,6 +1172,11 @@ def handle_app_invite(proc, queues, message) -> bool:
                 isinstance(h, str) for h in rendezvous):
             raise TypeError('rendezvous must be a list of strings')
         kwargs = {}
+        pair = req.get('pair', False)
+        if not isinstance(pair, bool):
+            raise TypeError('pair must be true or false')
+        if pair:
+            kwargs['purpose'] = PURPOSE_PAIR
         if 'expiry' in req:
             kwargs['expiry'] = int(req['expiry'])
         elif 'ttl_seconds' in req:
@@ -1105,6 +1186,14 @@ def handle_app_invite(proc, queues, message) -> bool:
         _emit(proc, queues, FirstContactEvent(EVENT_REFUSED, ref=ref,
                                               reason='bad_request'))
         return True
+    if kwargs.get('purpose') == PURPOSE_PAIR:
+        from . import sibling_sync
+        if not sibling_sync.can_pair(proc):
+            proc.logger.warning('first contact: no device cert installed; cannot '
+                                'mint a pairing invitation')
+            _emit(proc, queues, FirstContactEvent(EVENT_REFUSED, ref=ref,
+                                                  reason='not_sibling'))
+            return True
     # Behind relays, say so in the link: they are how a friend on another
     # network reaches us at all (network/relay.py). All of them, in our order
     # of preference, so the friend can fail over; none if the app named its
@@ -1215,6 +1304,17 @@ def handle_app_initiate(proc, queues, message) -> bool:
         return refuse('expired', inviter)
     if str(inviter.uuid) == str(proc.identity.uuid):
         return refuse('bad_request', inviter)     # our own link
+    if invitation.purpose == PURPOSE_PAIR:
+        # Another device of ours: no contact, only the handshake, then certs
+        # (identity/sibling_sync.py).
+        from . import sibling_sync
+        if not sibling_sync.can_pair(proc):
+            return refuse('not_sibling', inviter)
+        initiate(proc, queues, blob, endpoint=req.get('endpoint') or None, ref=ref)
+        _emit(proc, queues, FirstContactEvent(
+            EVENT_HELLO_SENT, ref=ref, peer_uuid=str(inviter.uuid),
+            nickname=inviter.nickname, role='initiator'))
+        return True
 
     contact = redeem_invitation(invitation, in_person=bool(req.get('in_person')),
                                 petname=str(req.get('petname', '') or ''))
@@ -1234,6 +1334,8 @@ def handle_app_initiate(proc, queues, message) -> bool:
         proc.logger.warning('could not persist contact for %s (%s)',
                             contact.petname, err)
 
+    from . import sibling_sync
+    sibling_sync.push_changes(proc, queues)
     endpoint = req.get('endpoint') or None
     initiate(proc, queues, blob, endpoint=endpoint, ref=ref)
     _emit(proc, queues, FirstContactEvent(
@@ -1284,11 +1386,16 @@ def _book_request(proc, queues, message, verb):
     return req, ref, contact, store
 
 
-def _save_book(proc, store) -> None:
+def _save_book(proc, store, queues=None) -> None:
+    """Persist the address book; with ``queues``, also push what changed to
+    our siblings (identity/sibling_sync.py)."""
     try:
         store.save()
     except OSError as err:
         proc.logger.warning('could not persist the contacts store (%s)', err)
+    if queues is not None:
+        from . import sibling_sync
+        sibling_sync.push_changes(proc, queues)
 
 
 def handle_app_safety_number(proc, queues, message) -> bool:
@@ -1340,7 +1447,7 @@ def handle_app_verify(proc, queues, message) -> bool:
         _emit(proc, queues, FirstContactEvent(EVENT_REFUSED, ref=ref,
                                               reason='bad_request'))
         return True
-    _save_book(proc, store)
+    _save_book(proc, store, queues)
     proc.logger.info('first contact: %s verified (%s)', contact.petname, method)
     _emit(proc, queues, _contact_event(EVENT_VERIFIED, contact, ref,
                                        method=method))
@@ -1381,7 +1488,8 @@ def handle_app_rename(proc, queues, message) -> bool:
                                               reason='bad_request'))
         return True
     contact.petname = petname
-    _save_book(proc, store)
+    contact.touch()
+    _save_book(proc, store, queues)
     _emit(proc, queues, _contact_event(EVENT_CONTACT, contact, ref))
     return True
 
@@ -1417,7 +1525,7 @@ def handle_app_remove(proc, queues, message) -> bool:
     _req, ref, contact, store = got
     uuid = str(contact.identity.uuid)
     store.remove(uuid)
-    _save_book(proc, store)
+    _save_book(proc, store, queues)
     dropped = _drop_direct_peer(proc, queues, uuid)
     proc.logger.info('first contact: removed %s%s', contact.petname,
                      ' and dropped the direct peer' if dropped else '')

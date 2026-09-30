@@ -159,6 +159,16 @@ _TRIGGER_DIR_REQUEST = 'trigger_directory_request'
 _TRIGGER_DIR_ACCEPT = 'trigger_directory_accept'
 _TRIGGER_DIR_DECLINE = 'trigger_directory_decline'
 _TRIGGER_DIR_CLOCK = 'trigger_directory_clock'
+# Pseudo-functions for finding people nearby at an area hub
+# (identity/area_contact.py), through the production app verbs and handlers:
+#   trigger_area_publish {area, bucket}  -- our app lists us in the area;
+#   trigger_area_withdraw {area}         -- ...and stops;
+#   trigger_area_request {holder, area}  -- a lookup finds the holder's card (a
+#       local hub_result) and our app asks to become a contact.
+# The C adapter recognizes the same strings. See identity/area-*.yaml.
+_TRIGGER_AREA_PUBLISH = 'trigger_area_publish'
+_TRIGGER_AREA_WITHDRAW = 'trigger_area_withdraw'
+_TRIGGER_AREA_REQUEST = 'trigger_area_request'
 # The harness's handle issuer. Nothing checks the issuer on these paths (only a
 # registry does), but a fixed one keeps both runtimes minting the same bytes.
 _DIR_ISSUER_SEED = bytes([0x44]) * 32
@@ -1877,6 +1887,33 @@ class IdentityAdapter:
                     _dc.APP_ACCEPT if inbound.function == _TRIGGER_DIR_ACCEPT
                     else _dc.APP_DECLINE, {'ref': str(spec.get('ref', ''))}))
             return participant.drain_outbox()
+        if inbound.function in (_TRIGGER_AREA_PUBLISH, _TRIGGER_AREA_WITHDRAW,
+                                _TRIGGER_AREA_REQUEST):
+            from autonomous_trust.core._python.identity import area_contact as _ac
+            from autonomous_trust.core._python.identity import directory_contact as _dc
+            from autonomous_trust.core._python.contacts import area_card as _card
+            spec = from_json_string(inbound.obj) if inbound.obj else {}
+            proc, queues = participant.process, participant.queues
+            area = str(spec.get('area'))
+            if inbound.function == _TRIGGER_AREA_PUBLISH:
+                _ac.handle_app_area_publish(proc, queues, _app_verb(
+                    _ac.APP_AREA_PUBLISH, {'ref': 'pub', 'area': area,
+                                           'bucket': str(spec.get('bucket') or area)}))
+            elif inbound.function == _TRIGGER_AREA_WITHDRAW:
+                _ac.handle_app_area_withdraw(proc, queues, _app_verb(
+                    _ac.APP_AREA_WITHDRAW, {'ref': 'pub', 'area': area}))
+            else:
+                holder_uuid = participant._uuid_for_pid(str(spec.get('holder')))
+                holder = self._roster_by_uuid[str(holder_uuid)].process.identity
+                card = _card.create_card(holder, area, area, '', 1)
+                _ac.handle_hub_result(proc, queues, _app_verb(
+                    IdentityProtocol.hub_result,
+                    {'area': area, 'cards': [{'card': card.to_wire(), 'relay': ''}],
+                     'limited': False}))
+                _dc.handle_app_request(proc, queues, _app_verb(
+                    _dc.APP_REQUEST, {'ref': 'ask', 'area': area,
+                                      'peer_uuid': str(holder_uuid).lower()}))
+            return participant.drain_outbox()
         if inbound.function == _TRIGGER_FC_RESTART:
             # Forget the in-memory spent-nonce guard, keep the file: a fresh
             # SpentNonces re-reads <data_dir>/first_contact_nonces.cfg.json,
@@ -2101,7 +2138,13 @@ class IdentityAdapter:
             from autonomous_trust.core._python.contacts import directory as _dir
             signer = participants[payload.get('signer') or from_id].impl.process.identity
             holder = participants[payload.get('to') or to_id].impl.process.identity
-            _att, entry = _dir_entry_for(holder, str(payload.get('handle')))
+            if 'area' in payload:
+                # Found at an area hub: the holder's area card, not an entry.
+                from autonomous_trust.core._python.contacts import area_card as _card
+                area = str(payload.get('area'))
+                entry = _card.create_card(holder, area, area, '', 1)
+            else:
+                _att, entry = _dir_entry_for(holder, str(payload.get('handle')))
             obj = _dir.create_request(signer, entry,
                                       nonce=str(payload.get('nonce', '')) or None).to_json()
         elif function == IdentityProtocol.contact_accept:

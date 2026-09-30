@@ -12,7 +12,7 @@ the pace.
 - Composition directory: `doc/brag/composition/` (run `2026-09-17-231904`)
 - Rendered video: `doc/brag/brag.mp4`
 - Format: landscape — 1920x1080
-- Duration: **44.0s**, set by the seven measured narration clips (37.61s of
+- Duration: **56.7s**, set by the seven measured narration clips (50.33s of
   speech plus ~0.65s of breathing room between lines). This exceeds the 15–25s
   creative law under the skill's explicit voiceover carve-out: *"Scene durations
   must flex to match the generated audio … Do not hardcode scene lengths when
@@ -28,7 +28,7 @@ the pace.
     — the dashboard's real design tokens
   - `README.md`, `FIRST_CONTACT_PLAN.md` — positioning and claims
 - Product name: AutonomousTrust
-- Tagline / strongest claim: *Trust as a live value* — cooperative computing among
+- Tagline / strongest claim: *For dynamically cooperative machines.* — cooperative computing among
   machines that do not fully trust each other and cannot reach a central authority.
 - Key UI to recreate: the live inspector dashboard — topbar (clock, phase chip,
   peer/mean-trust chips), trust-graph panel, event log, and the bottom strip that
@@ -40,7 +40,7 @@ the pace.
   - `noaa-sensor-3 excluded: reputation collapsed below threshold`
   - `epa-monitor-1 joins the network`
   - `Threshold 0.35`
-  - `Trust as a live value` (outro, on screen only — the voice never says it)
+  - `For dynamically cooperative machines.` (outro, on screen only — the voice never says it)
 
 ## Creative Direction
 
@@ -59,7 +59,7 @@ the pace.
   WILMINGTON NC`, then **One of these sensors is lying.** The voice says something
   different underneath it, so picture and narration carry two things at once.
 - Outro / punchline: wordmark **AutonomousTrust** over the settled mesh, then
-  *Trust as a live value.*
+  *For dynamically cooperative machines.*
 - Avoid:
   - Generic SaaS language
   - Abstract filler visuals
@@ -74,12 +74,12 @@ word-level timings over the delivered WAVs):
 
 | Caption | Anchored to | In | Out (fade start) |
 |---|---|---|---|
-| *No central authority. No round-trip.* | VO 2, "**No** policy server to call. No certificate authority to ask." | 10.27 | 13.85 |
-| *No human in the loop.* | VO 4, "**No** operator approved that." | 26.31 | 28.05 |
-| *Trust is metered, not granted.* | VO 6, "**It** is a dial re-earned continuously." | 34.83 | 37.25 |
+| *No central authority. No round-trip.* | VO 2, "**No** policy server to call. No certificate authority to ask." | 12.08 | 18.59 |
+| *No human in the loop.* | VO 4, "**No** operator necessary." | 33.56 | 35.56 |
+| *Trust is metered, not granted.* | VO 6, "**It** is a dial and every peer's position on it is re-earned continuously." | 44.84 | 49.77 |
 
 Each clears before the next element claims its space: the sensor strip returns at
-14.20, scene 5 at 28.40, the lockup dim at 37.64. They restate what the voice is
+18.94, scene 5 at 36.01, the lockup dim at 50.16. They restate what the voice is
 saying at that moment rather than carrying separate content, which is the
 duplication this brief originally removed — kept deliberately.
 
@@ -104,13 +104,13 @@ measured WAV durations, not guessed.
 
 | # | Scene | Span | VO clip (measured) | What must be seen |
 |---|---|---|---|---|
-| 1 | Hook | 0.0–7.3 | `vo-1-hook` 5.72s @ 1.00 | Slug, then `One of these sensors is lying.` No dashboard. |
-| 2 | Mesh forms | 7.3–14.2 | `vo-2-mesh` 6.60s @ 7.64 | 8 peers arrive on the beat grid with real IDs, edges drawing; live clock/phase/chips. |
-| 3 | Divergence | 14.2–21.3 | `vo-3-divergence` 6.37s @ 14.92 | `SENSOR COMPARISON`; three traces draw, `noaa-sensor-3` peels away red; two verbatim warning rows. |
-| 4 | Exclusion | 21.3–28.4 | `vo-4-exclusion` 5.90s @ 21.95 | Mesh dims, compromised peer scales up; reputation counts 0.82 → 0.11 past `Threshold 0.35`; edges flip red; node vanishes; threat row lands. |
-| 5 | Re-entry | 28.4–32.1 | `vo-5-rejoin` 3.28s @ 28.50 | `epa-monitor-1` arrives green at zero trust, edges follow, success row lands. |
-| 6 | Gradient | 32.1–37.6 | `vo-6-gradient` 4.78s @ 32.40 | Graph/log recede; four tier cards arrive on alternating beats, tinting toward green. |
-| 7 | Lockup | 37.6–44.0 | `vo-7-lockup` 4.96s @ 37.90 | Dashboard recedes to 0.22; wordmark, then *Trust as a live value*; music fades out. |
+| 1 | Hook | 0.0–8.4 | `vo-1-hook` 6.81s @ 1.00 | Slug, then `One of these sensors is lying.` No dashboard. |
+| 2 | Mesh forms | 8.4–18.9 | `vo-2-mesh` 10.26s @ 8.73 | 8 peers arrive on the beat grid with real IDs, edges drawing; live clock/phase/chips. |
+| 3 | Divergence | 18.9–28.3 | `vo-3-divergence` 8.66s @ 19.67 | `SENSOR COMPARISON`; three traces draw, `noaa-sensor-3` peels away red; two verbatim warning rows. |
+| 4 | Exclusion | 28.3–35.9 | `vo-4-exclusion` 6.38s @ 28.99 | Mesh dims, compromised peer scales up; reputation counts 0.82 → 0.11 past `Threshold 0.35`; edges flip red; node vanishes; threat row lands. |
+| 5 | Re-entry | 35.9–41.3 | `vo-5-rejoin` 5.04s @ 36.01 | `epa-monitor-1` arrives green at zero trust, edges follow, success row lands. |
+| 6 | Gradient | 41.3–50.1 | `vo-6-gradient` 8.04s @ 41.66 | Graph/log recede; four tier cards arrive on alternating beats, tinting toward green. |
+| 7 | Lockup | 50.1–56.7 | `vo-7-lockup` 5.14s @ 50.42 | Dashboard recedes to 0.22; wordmark, then *For dynamically cooperative machines.*; music fades out. |
 
 ## Audio
 
@@ -120,8 +120,8 @@ measured WAV durations, not guessed.
   of every voice clip; drops hardest (0.10) through the exclusion and recovers only
   part-way (0.22) afterward; fades to silence under the closing line.
 - Music: `assets/music/beauty-flow-by-kevin-macleod.mp3` (107.67 BPM) — "Beauty Flow"
-  by Kevin MacLeod (incompetech.com), licensed CC BY 4.0. Trimmed to 46s with a
-  stream copy; the video is 44.0s and the bed fades out at 42.9s.
+  by Kevin MacLeod (incompetech.com), licensed CC BY 4.0. Trimmed to 58.7s with a
+  stream copy; the video is 56.7s and the bed fades out at 55.6s.
 - Music treatment: see arc above. Fade out over the last ~1.1s.
 - Music cue guidance: preset at
   `assets/music/beauty-flow-by-kevin-macleod.music-cues.json`
@@ -132,7 +132,7 @@ measured WAV durations, not guessed.
   generated with `hyperframes tts --voice am_michael` (Kokoro) at speed 0.96 —
   measured, American, matching the NOAA/USGS/FEMA context. Not a trailer announcer.
 - Audio-reactive treatment: **subtle** — bass-linked edge stroke presence and a faint
-  node halo, re-extracted to cover the full 44s. Nothing that competes with speech.
+  node halo, re-extracted to cover the full 56.7s. Nothing that competes with speech.
   No waveform/equalizer visuals.
 - Audio-coupled moments:
   - Peer arrivals — beat-grid entrances, quiet tick each
@@ -165,7 +165,7 @@ Requirements:
   verbatim event-log strings.
 - Keep all text readable in the final render. Event-log rows are ≥2.1s apart; tier
   cards ≥1.09s apart; both are well over the reading-time floor.
-- Duration is set by the narration (44.0s) under the voiceover carve-out, not the
+- Duration is set by the narration (56.7s) under the voiceover carve-out, not the
   15–25s default.
 - Deterministic only — the trace wobble is a fixed sine, never `Math.random`; no
   `Date.now()`, no network fetches.

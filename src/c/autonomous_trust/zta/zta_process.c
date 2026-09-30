@@ -362,6 +362,7 @@ static void _request_reputation(process_t *proc, const uuid_t peer_uuid,
     json_decref(query);
 
     messaging_send("reputation", NET_MESSAGE, &msg, false);
+    net_msg_free_obj(&msg.info.net_msg);
 
     log_debug(logger, "ZTA: requested reputation for voucher %s\n", uuid_str);
 }
@@ -870,11 +871,12 @@ int zta_process_run(process_t *proc, directory_t *queues,
     if (zta_state.policy->reverify_interval_sec > 0 && cadence > 0)
         reverify_cycles = (zta_state.policy->reverify_interval_sec * 1000) / cadence;
 
+    generic_msg_t buf = {0};
     while (keep_running(proc, &pctx.sig_q, logger)) {
         sleep_until(proc, cadence);
 
         /* Handle incoming messages (revocation alerts, verification results) */
-        generic_msg_t buf = {0};
+        messaging_recv_release(&buf);   /* the previous pass's */
         int err = messaging_recv(&buf);
         if (err == 0) {
             if (buf.type == ZTA_VERIFICATION_RESULT) {
@@ -894,6 +896,7 @@ int zta_process_run(process_t *proc, directory_t *queues,
             _resolve_deferred(proc, logger);
         }
     }
+    messaging_recv_release(&buf);
 
     /* Cleanup */
     zta_audit_close(&zta_state.audit);

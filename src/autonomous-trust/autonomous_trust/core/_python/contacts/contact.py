@@ -28,6 +28,7 @@ keys + UUID + online nickname), never the human-memorable identifier that led to
 it (FIRST_CONTACT_PLAN.md §3). The ``petname`` is the local Zooko name, assigned
 by this node and never transmitted (see :func:`derive_local_petname`).
 """
+import math
 import os
 import time
 from enum import Enum
@@ -46,6 +47,8 @@ class Provenance(Enum):
     in_person = 'in_person'    # QR/blob exchanged face-to-face: no MITM possible
     token = 'token'            # signed invite link/code over a remote channel
     directory = 'directory'    # resolved via an (opt-in) directory -- Phase 3
+    sibling = 'sibling'        # copied from another of this user's own devices (Phase 4)
+    area = 'area'              # found at an (opt-in) area hub
 
 
 # The reputation edge a contact is seeded with the moment it becomes VERIFIED
@@ -82,7 +85,7 @@ class Contact(Configuration):
     def __init__(self, identity, petname='', rendezvous=None, verified=False,
                  provenance=Provenance.token, trust_seed=0.0,
                  added_at=0.0, verified_at=0.0, nonce='', reach_seq=0,
-                 operator_key='', devices=None):
+                 operator_key='', devices=None, updated_at=0.0):
         super().__init__()
         # The trust root. Force public-only so we can never persist private
         # key material by accident (publish() is idempotent on a public copy).
@@ -116,6 +119,11 @@ class Contact(Configuration):
         # further devices that key has vouched for. Each device is its own node.
         self.operator_key = operator_key or ''
         self.devices = list(devices or [])
+        # When the user last changed this record in a way their other devices
+        # should copy (a rename, a device or operator link; contacts/sync.py).
+        # Adding and verifying are already dated by added_at/verified_at, so
+        # 0.0 until the first such edit.
+        self.updated_at = float(updated_at or 0.0)
 
     @property
     def uuid(self):
@@ -128,6 +136,17 @@ class Contact(Configuration):
     def identities(self):
         """Every device's public identity, the first one first."""
         return [self.identity] + [d.identity for d in self.devices]
+
+    def version(self) -> float:
+        """When this record last changed for sync purposes: the latest of its
+        adding, its verifying and any later edit (contacts/sync.py)."""
+        return max(self.updated_at, self.added_at, self.verified_at)
+
+    def touch(self, now=None):
+        """Date an edit the user's other devices should copy."""
+        self.updated_at = max(float(now if now is not None else time.time()),
+                              self.version())
+        return self
 
     @property
     def nickname(self):
@@ -172,6 +191,8 @@ class Contact(Configuration):
             d['operator_key'] = self.operator_key
         if self.devices:
             d['devices'] = [dev.to_canonical() for dev in self.devices]
+        if self.updated_at:
+            d['updated_at'] = float(self.updated_at)
         return d
 
     @classmethod
@@ -200,12 +221,21 @@ class Contact(Configuration):
                    reach_seq=int(d.get('reach_seq', 0) or 0),
                    operator_key=_operator_key(d.get('operator_key')),
                    devices=_devices(d.get('devices'), identity,
-                                    _operator_key(d.get('operator_key'))))
+                                    _operator_key(d.get('operator_key'))),
+                   updated_at=_float(d.get('updated_at')))
 
     def __repr__(self):
         state = 'verified' if self.verified else 'UNVERIFIED'
         return 'Contact(%s [%s] %s via %s)' % (
             self.petname, self.nickname, state, self.provenance.value)
+
+
+def _float(v):
+    """A stored non-negative number, or 0.0."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) \
+            or not math.isfinite(v) or v < 0:
+        return 0.0
+    return float(v)
 
 
 def _operator_key(v):

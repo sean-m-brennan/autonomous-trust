@@ -22,6 +22,7 @@
 
 #include <sodium.h>
 
+#include "contacts/area_card.h"
 #include "identity/identity_priv.h"
 #include "network/net_relay.h"
 #include "utilities/util.h"
@@ -345,9 +346,15 @@ int at_dir_request_verify(const at_dir_signed_t *req, double now)
     const json_t *b = req->body;
     if (!_is_version(b, AT_DIR_REQUEST_TYPENAME))
         return AT_DIR_MALFORMED;
+    /* Where the sender found us: exactly one of a handle and an area. */
+    bool has_handle = json_object_get(b, "handle") != NULL;
+    bool has_area = json_object_get(b, "area") != NULL;
+    if (has_handle == has_area)
+        return AT_DIR_MALFORMED;
     json_t *relays = json_object_get(b, "relays");
     bool ok = _str(req, "from") != NULL && _str(req, "to") != NULL
-        && _is_hex_key(at_dir_key(req)) && _is_handle(at_dir_handle(req))
+        && _is_hex_key(at_dir_key(req))
+        && (has_handle ? _is_handle(at_dir_handle(req)) : at_area_is_area(_str(req, "area")))
         && _is_nonce(_str(req, "nonce")) && _positive_int(b, "expiry", 1)
         && json_is_array(relays) && json_array_size(relays) <= AT_DIR_REQUEST_MAX_RELAYS;
     size_t i;
@@ -376,8 +383,12 @@ int at_dir_request_create(const identity_t *self, const at_dir_signed_t *entry,
                           const char *nonce, long expiry, double now,
                           at_dir_signed_t *out)
 {
+    /* A directory entry names its handle; an area card, its area. */
+    const char *etype = _str(entry, "typename");
+    bool by_area = etype != NULL && strcmp(etype, AT_AREA_CARD_TYPENAME) == 0;
+    const char *where = by_area ? at_area_card_area(entry) : at_dir_handle(entry);
     if (self == NULL || entry == NULL || out == NULL || at_dir_uuid(entry) == NULL
-        || at_dir_handle(entry) == NULL)
+        || where == NULL)
         return AT_DIR_MALFORMED;
     char fresh[AT_DIR_NONCE_HEX + 1];
     if (nonce == NULL) {
@@ -397,11 +408,20 @@ int at_dir_request_create(const identity_t *self, const at_dir_signed_t *entry,
     json_t *rv = json_array();
     for (size_t i = 0; i < n_relays && i < AT_DIR_REQUEST_MAX_RELAYS; i++)
         json_array_append_new(rv, json_string(relays[i]));
-    json_t *body = json_pack("{s:i, s:s, s:s, s:s, s:s, s:s, s:s, s:I, s:o}",
+    /* Built in Python's key order: jansson keeps insertion order. */
+    json_t *body = json_pack("{s:i, s:s, s:s, s:s, s:s}",
                              "v", AT_DIR_VERSION, "typename", AT_DIR_REQUEST_TYPENAME,
                              "from", uu, "key", (const char *)self->signature.public_hex,
-                             "to", to, "handle", at_dir_handle(entry), "nonce", nonce,
-                             "expiry", (json_int_t)expiry, "relays", rv);
+                             "to", to);
+    if (body != NULL
+        && (json_object_set_new(body, by_area ? "area" : "handle", json_string(where)) != 0
+            || json_object_set_new(body, "nonce", json_string(nonce)) != 0
+            || json_object_set_new(body, "expiry", json_integer((json_int_t)expiry)) != 0
+            || json_object_set(body, "relays", rv) != 0)) {
+        json_decref(body);
+        body = NULL;
+    }
+    json_decref(rv);
     return body != NULL ? _sign(self->signature.private, AT_DIR_REQUEST_DOMAIN, body, out)
                         : AT_DIR_MALFORMED;
 }

@@ -108,7 +108,9 @@ static int send_to_peer(const process_t *proc, const char *function,
         return -1;
     }
     json_decref(payload);
-    return messaging_send("network", NET_MESSAGE, &out, false);
+    int rc = messaging_send("network", NET_MESSAGE, &out, false);
+    net_msg_free_obj(nmsg);
+    return rc;
 }
 
 
@@ -576,6 +578,7 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
         if (net_msg_pack_json(rnmsg, ready) == 0)
         {
             messaging_send(notify_target, NET_MESSAGE, &ready_msg, false);
+            net_msg_free_obj(rnmsg);
         }
         json_decref(ready);
 

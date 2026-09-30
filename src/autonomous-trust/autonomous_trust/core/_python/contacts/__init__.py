@@ -33,6 +33,8 @@ from .invitation import (Invitation, create_invitation, redeem_invitation,
                         InvalidInvitation, SafetyNumberMismatch)
 from .device import (Device, DeviceCert, InvalidDevice, create_device_cert,
                      adopt_operator, link_device)
+from .siblings import Siblings
+from . import sync
 
 __all__ = [
     'Contact', 'Provenance', 'FIRST_CONTACT_VERIFIED_SEED',
@@ -42,4 +44,5 @@ __all__ = [
     'InvalidInvitation', 'SafetyNumberMismatch',
     'Device', 'DeviceCert', 'InvalidDevice', 'create_device_cert',
     'adopt_operator', 'link_device',
+    'Siblings', 'sync',
 ]

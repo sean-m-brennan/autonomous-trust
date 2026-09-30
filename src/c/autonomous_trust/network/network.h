@@ -134,6 +134,15 @@ extern char NET_FN_DIR_LOOKUP[];
  *  dir_status. */
 extern char NET_ID_DIR_RESULT[];
 extern char NET_ID_DIR_STATUS[];
+/** identity -> network, local IPC: area hubs. Mirror: Python Network.hub_*. */
+extern char NET_FN_HUB_PUBLISH[];
+extern char NET_FN_HUB_WITHDRAW[];
+extern char NET_FN_HUB_LOOKUP[];
+/** network -> identity, local IPC: an area lookup's outcome, and a hub's answer
+ *  to our publish or withdraw. Mirror: Python IdentityProtocol.hub_result /
+ *  hub_status. */
+extern char NET_ID_HUB_RESULT[];
+extern char NET_ID_HUB_STATUS[];
 
 /* Python's INBOUND_BUDGET=32 per-channel drain cap (netprocess.py:581).
  * C's receive path is thread-per-channel, so OS scheduling provides the

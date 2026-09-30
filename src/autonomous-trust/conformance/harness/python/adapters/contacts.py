@@ -25,6 +25,7 @@ number, and the specific rejection reason for a tampered/expired invitation.
 Mirrors the C adapter (src/c/conformance/adapters/contacts.c); the two are
 diffed by case_id status, so both must assert the same values.
 """
+import json
 from pathlib import Path
 
 from ...common.scenario_loader import Case
@@ -85,8 +86,14 @@ class ContactsAdapter:
             self._dir_normalize(fx, expected)
         elif op == 'registry':
             self._registry(fx, expected)
+        elif op == 'hub':
+            self._hub(fx, expected)
         elif op == 'device':
             self._device(fx, expected)
+        elif op == 'sync':
+            self._sync(fx, expected)
+        elif op == 'siblings':
+            self._siblings(fx, expected)
         else:
             raise AssertionError('unknown contacts op %r' % op)
 
@@ -199,19 +206,94 @@ class ContactsAdapter:
             again = Contacts.from_canonical(store.to_canonical())
             assert again.to_canonical() == store.to_canonical(), 'store round trip'
 
+    # -- live pairing: one address book across devices (Phase 4) ---------------
+    #: The contact fields a sync scenario may pin.
+    _SYNC_FIELDS = ('petname', 'verified', 'verified_at', 'provenance',
+                    'trust_seed', 'reach_seq', 'rendezvous', 'updated_at',
+                    'operator_key')
+
+    def _sync(self, fx, expected):
+        """Fold ``payloads`` (or the one ``payload``) into ``store`` at
+        ``now``, never taking ``exclude`` as contacts. Pins ``sync_status``
+        ('ok' / 'invalid', the first refusal stopping the run), ``changes``
+        (every merge's, in order, as [uuid, action]), ``contacts`` {uuid:
+        {field: value} | None}, ``devices_of`` and ``tombstones`` (the whole
+        map)."""
+        from autonomous_trust.core._python.contacts import sync as _sync
+        store = Contacts.from_canonical(fx.get('store') or {})
+        payloads = fx['payloads'] if 'payloads' in fx else [fx['payload']]
+        status, changes = 'ok', []
+        for payload in payloads:
+            try:
+                changes += [[u, a] for u, a in _sync.merge(
+                    store, payload, now=float(fx['now']),
+                    exclude=fx.get('exclude') or ())]
+            except _sync.InvalidSync:
+                status = 'invalid'
+                break
+        if 'sync_status' in expected:
+            assert status == expected['sync_status'], status
+        if 'changes' in expected:
+            assert changes == expected['changes'], changes
+        for uuid, want in (expected.get('contacts') or {}).items():
+            c = store.contacts.get(uuid)
+            if want is None:
+                assert c is None, 'contact %s still here' % uuid
+                continue
+            assert c is not None, 'no contact %s' % uuid
+            got = c.to_canonical()
+            got.setdefault('updated_at', 0.0)
+            got.setdefault('reach_seq', 0)
+            got.setdefault('operator_key', '')
+            for k, v in want.items():
+                assert k in self._SYNC_FIELDS, 'unknown field %s' % k
+                assert got[k] == v, (uuid, k, got[k], v)
+        for uuid, want in (expected.get('devices_of') or {}).items():
+            c = store.get(uuid)
+            assert c is not None, 'no contact %s' % uuid
+            assert c.device_uuids() == list(want), c.device_uuids()
+        if 'tombstones' in expected:
+            assert store.tombstones == expected['tombstones'], store.tombstones
+        again = Contacts.from_canonical(store.to_canonical())
+        assert again.to_canonical() == store.to_canonical(), 'store round trip'
+
+    def _siblings(self, fx, expected):
+        """``mode`` add: pair ``identity`` (cert ``cert``) given this node's
+        ``own_cert`` (absent = none) into ``siblings``; load: just load
+        ``siblings``. Pins ``sibling_status``, ``siblings`` (uuids in order)
+        and ``operator``."""
+        from autonomous_trust.core._python.contacts.siblings import Siblings
+        sib = Siblings.from_canonical(fx.get('siblings') or {})
+        status = 'ok'
+        if fx['mode'] == 'add':
+            ident = public_identity_from_canonical(fx['identity'])
+            assert ident is not None, 'identity did not parse'
+            status = sib.add(ident, fx['cert'], fx.get('own_cert')) or 'ok'
+        elif fx['mode'] != 'load':
+            raise AssertionError('unknown siblings mode %r' % fx['mode'])
+        if 'sibling_status' in expected:
+            assert status == expected['sibling_status'], status
+        if 'siblings' in expected:
+            assert sib.uuids() == list(expected['siblings']), sib.uuids()
+        if 'operator' in expected:
+            assert sib.operator == expected['operator'], sib.operator
+        again = Siblings.from_canonical(sib.to_canonical())
+        assert again.to_canonical() == sib.to_canonical(), 'siblings round trip'
+
     # -- the directory (FIRST_CONTACT_PLAN Phase 3) ----------------------------
     def _dir_verify(self, fx, expected):
         """Verify one signed object (``what``: entry | attestation | request)
         at a fixed ``now``, optionally against ``trusted`` issuers. Pins the
         exact status ('ok' or the refusal reason) and, when ok, its fields."""
+        from autonomous_trust.core._python.contacts import area_card as _card
         what, now = fx['what'], float(fx['now'])
         trusted = set(fx['trusted']) if 'trusted' in fx else None
         cls = {'entry': _dir.DirectoryEntry, 'attestation': _dir.Attestation,
-               'request': _dir.ContactRequest}[what]
+               'request': _dir.ContactRequest, 'area_card': _card.AreaCard}[what]
         status, obj = 'ok', None
         try:
             obj = cls.from_wire(fx['wire'])
-            if what == 'request':
+            if what in ('request', 'area_card'):
                 obj.verify(now)
             else:
                 obj.verify(trusted, now)
@@ -219,7 +301,7 @@ class ContactsAdapter:
             status = exc.reason
         assert status == expected['dir_status'], (status, expected['dir_status'])
         if status == 'ok':
-            for field in ('handle', 'seq', 'uuid', 'key'):
+            for field in ('handle', 'seq', 'uuid', 'key', 'area', 'bucket'):
                 if field in expected:
                     got = getattr(obj, 'sender' if (what == 'request' and field == 'uuid')
                                   else field)
@@ -228,6 +310,37 @@ class ContactsAdapter:
     def _dir_normalize(self, fx, expected):
         got = [_dir.normalize_handle(h) for h in fx['handles']]
         assert got == expected['folded'], (got, expected['folded'])
+
+    def _hub(self, fx, expected):
+        """Run ``calls`` against one area hub on a fixed clock and pin each
+        reply's op, area, reason / seq, and for a lookup the uuids of the
+        cards it answered with, in order."""
+        from autonomous_trust.core._python.network import hub as _hub
+        clock = {'mono': 0.0}
+        bad = set(fx.get('distrusted', []))
+        hub = _hub.Hub(list(fx['areas']), rate=int(fx.get('rate', 10)),
+                       distrusted=lambda uuid, key: uuid in bad,
+                       clock=lambda: clock['mono'],
+                       wallclock=lambda: float(fx['now']))
+        replies = []
+        for call in fx['calls']:
+            clock['mono'] += float(call.get('advance', 0.0))
+            who = fx['clients'][call['as']]
+            if call['call'] == 'publish':
+                r = hub.publish(who['uuid'], who['key'], call['card'])
+            elif call['call'] == 'withdraw':
+                r = hub.withdraw(who['uuid'], who['key'], call['area'])
+            else:
+                r = hub.lookup(who['uuid'], call['area'])
+            got = {'op': r['op'], 'area': r.get('area', '')}
+            if 'reason' in r:
+                got['reason'] = r['reason']
+            if 'seq' in r:
+                got['seq'] = r['seq']
+            if r['op'] == 'hub_cards':
+                got['cards'] = [str(json.loads(c['body'])['uuid']).lower() for c in r['cards']]
+            replies.append(got)
+        assert replies == expected['replies'], (replies, expected['replies'])
 
     def _registry(self, fx, expected):
         """Run ``calls`` against one registry on a fixed clock and pin each

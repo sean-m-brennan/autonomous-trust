@@ -108,6 +108,40 @@ extern "C" {
 /* One human, several devices (Phase 4): payload @ref at_app_contact_t, the
  * contact, with @c device_uuid the further device filed under it. */
 #define AT_APP_EVENT_FC_DEVICE_LINKED    1018
+/* One's own devices, paired (Phase 4, live pairing). SIBLING_PAIRED's payload
+ * is @ref at_app_first_contact_t (@c ref, @c peer_uuid, @c nickname, @c
+ * role), read with @ref at_first_contact_event; the others' is @ref
+ * at_app_contact_t (@c peer_uuid, @c nickname, @c added_at; @c count on
+ * SIBLINGS_DONE; @c peer_dropped on SIBLING_REMOVED), read with
+ * @ref at_first_contact_contact_event. Python's sibling_sync.EVENT_*. */
+#define AT_APP_EVENT_FC_SIBLING_PAIRED   1019  /**< another device of ours, paired */
+#define AT_APP_EVENT_FC_SIBLING          1020  /**< one sibling (a list) */
+#define AT_APP_EVENT_FC_SIBLINGS_DONE    1021  /**< end of a list; see @c count */
+#define AT_APP_EVENT_FC_SIBLING_REMOVED  1022  /**< unpaired; see @c peer_dropped */
+/* Area hubs (finding people nearby): payload @ref at_app_area_t, read with
+ * @ref at_first_contact_area_event. Python's area_contact.EVENT_*. A contact
+ * request to someone an area lookup found is the directory's
+ * (AT_APP_EVENT_DIR_REQUEST_SENT .. DECLINED), with @c handle "area:<area>". */
+#define AT_APP_EVENT_AREA_PUBLISHED      1023  /**< a hub listed us; @c relay, @c seq */
+#define AT_APP_EVENT_AREA_REFUSED        1024  /**< see @c reason */
+#define AT_APP_EVENT_AREA_WITHDRAWN      1025
+#define AT_APP_EVENT_AREA_CARD           1026  /**< one person a lookup found */
+#define AT_APP_EVENT_AREA_DONE           1027  /**< end of a lookup; @c count, @c reason */
+#define AT_APP_EVENT_ROSTER_INSTALLED    1028  /**< @c issuer, @c seq */
+#define AT_APP_EVENT_ROSTER_REFUSED      1029  /**< @c reason: bad_request | invalid | stale */
+#define AT_APP_EVENT_ROSTER_REMOVED      1030  /**< @c issuer; @c count 1 if one was there */
+
+/** The area app verbs. Local IPC only. Same strings as Python's
+ *  area_contact.APP_*. */
+#define AT_APP_AREA_PUBLISH    "app_area_publish"
+#define AT_APP_AREA_WITHDRAW   "app_area_withdraw"
+#define AT_APP_AREA_LOOKUP     "app_area_lookup"
+#define AT_APP_ROSTER_INSTALL  "app_relay_roster_install"
+#define AT_APP_ROSTER_REMOVE   "app_relay_roster_remove"
+
+/** The sibling app verbs. Local IPC only. Python's sibling_sync.APP_*. */
+#define AT_APP_SIBLING_LIST   "app_sibling_list"
+#define AT_APP_SIBLING_REMOVE "app_sibling_remove"
 
 /** The directory app verbs. Local IPC only. Same strings as Python's
  *  directory_contact.APP_*. */
@@ -131,6 +165,7 @@ typedef enum {
     AT_FC_REASON_MINT_FAILED = 7,    /**< the node could not sign one */
     AT_FC_REASON_MISMATCH = 8,       /**< typed safety number did not match */
     AT_FC_REASON_UNKNOWN_CONTACT = 9,/**< no such contact in the address book */
+    AT_FC_REASON_NOT_SIBLING = 10,   /**< a pairing that did not make two siblings */
 } at_fc_reason_t;
 
 /** How a VERIFIED event was reached. */
@@ -197,7 +232,8 @@ typedef struct {
     /** Your local name for them; never leaves this node. */
     char    petname[AT_FC_NICKNAME_LEN];
     bool    verified;
-    /** 0 in person, 1 invite link (token), 2 directory. */
+    /** 0 in person, 1 invite link (token), 2 directory, 3 another of our
+     *  own devices (sibling). */
     int32_t provenance;
     double  added_at;       /**< epoch seconds */
     double  verified_at;    /**< epoch seconds; 0 until verified */
@@ -213,7 +249,13 @@ typedef struct {
     int32_t count;
     /** DEVICE_LINKED only: the further device filed under this contact. */
     uint8_t device_uuid[AT_APP_UUID_LEN];
+    /** CONTACT / REMOVED: @ref AT_FC_ORIGIN_SIBLING when the change came from
+     *  another of our own devices, else @ref AT_FC_ORIGIN_LOCAL. */
+    int32_t origin;
 } at_app_contact_t;
+
+#define AT_FC_ORIGIN_LOCAL   0
+#define AT_FC_ORIGIN_SIBLING 1
 
 AT_APP_STATIC_ASSERT(sizeof(at_app_contact_t) <= AT_APP_EVENT_PAYLOAD_MAX,
                      "at_app_contact_t fits the app event payload");
@@ -247,6 +289,67 @@ AT_APP_STATIC_ASSERT(sizeof(at_app_directory_t) <= AT_APP_EVENT_PAYLOAD_MAX,
 /** @brief The directory payload of @p ev, or NULL unless @p ev is one of the
  *  AT_APP_EVENT_DIR_* kinds. */
 const at_app_directory_t *at_first_contact_directory_event(const at_app_event_t *ev);
+
+/** @c area / @c bucket buffers: a geohash prefix of at most 5 and a NUL. */
+#define AT_FC_AREA_LEN 8
+/** @c name buffer: 64 bytes of UTF-8 (a card name's most) and a NUL. */
+#define AT_FC_AREA_NAME_LEN 65
+/** @c issuer buffer: a hex ed25519 key and a NUL. */
+#define AT_FC_ISSUER_LEN 65
+
+/** One area outcome (kinds AT_APP_EVENT_AREA_* and _ROSTER_*). Every field is
+ *  written on every event; those a kind does not use are zero. */
+typedef struct {
+    char    ref[AT_FC_REF_LEN];
+    char    area[AT_FC_AREA_LEN];
+    /** CARD: the person's own coarse bucket inside @c area. */
+    char    bucket[AT_FC_AREA_LEN];
+    /** CARD: who. Ask them with @ref at_app_area_request. */
+    uint8_t peer_uuid[AT_APP_UUID_LEN];
+    /** CARD: the name they list under (may be empty). */
+    char    name[AT_FC_AREA_NAME_LEN];
+    /** PUBLISHED / REFUSED / WITHDRAWN from a hub, and CARD: which relay. */
+    char    relay[AT_FC_RELAY_LEN];
+    char    reason[AT_FC_REASON_LEN];
+    /** ROSTER_*: the community key the roster is signed by. */
+    char    issuer[AT_FC_ISSUER_LEN];
+    /** PUBLISHED: the card's sequence number; CARD: theirs; ROSTER_INSTALLED:
+     *  the roster's. */
+    int64_t seq;
+    /** DONE: how many CARD events the lookup sent; ROSTER_REMOVED: 1 if one
+     *  was installed. */
+    int32_t count;
+} at_app_area_t;
+
+AT_APP_STATIC_ASSERT(sizeof(at_app_area_t) <= AT_APP_EVENT_PAYLOAD_MAX,
+                     "at_app_area_t fits the app event payload");
+
+/** @brief The area payload of @p ev, or NULL unless @p ev is one of the
+ *  AT_APP_EVENT_AREA_* / _ROSTER_* kinds. */
+const at_app_area_t *at_first_contact_area_event(const at_app_event_t *ev);
+
+/** @brief List us at the hubs serving @p area, under @p bucket (inside it)
+ *  and @p name (NULL = none). Refreshed while listed; answered per hub. */
+int at_app_area_publish(at_app_events_t *handle, const char *q_out, const char *ref,
+                        const char *area, const char *bucket, const char *name);
+/** @brief Stop listing us in @p area. */
+int at_app_area_withdraw(at_app_events_t *handle, const char *q_out, const char *ref,
+                         const char *area);
+/** @brief Who else is listed in @p area (only answered while we are): one
+ *  CARD per person, then DONE. */
+int at_app_area_lookup(at_app_events_t *handle, const char *q_out, const char *ref,
+                       const char *area);
+/** @brief Ask @p peer, found by an area lookup of @p area, to become a
+ *  contact. Answered as at_app_first_contact_request is. */
+int at_app_area_request(at_app_events_t *handle, const char *q_out, const char *ref,
+                        const char *area, const uint8_t peer[AT_APP_UUID_LEN]);
+/** @brief Trust a community's relay roster (@p roster, the file's {body, sig}
+ *  JSON): pin its issuer and file it. */
+int at_app_relay_roster_install(at_app_events_t *handle, const char *q_out,
+                                const char *ref, const char *roster);
+/** @brief Stop trusting @p issuer's roster (hex key). */
+int at_app_relay_roster_remove(at_app_events_t *handle, const char *q_out,
+                               const char *ref, const char *issuer);
 
 /** @brief Publish our handle: @p attestation is an issuer's {body, sig} JSON;
  *  @p visibility "anyone" or "published" (NULL = "anyone"). */
@@ -339,6 +442,20 @@ int at_app_first_contact_rename(at_app_events_t *handle, const char *q_out,
 int at_app_first_contact_remove(at_app_events_t *handle, const char *q_out,
                                 const char *ref,
                                 const uint8_t peer[AT_APP_UUID_LEN]);
+
+/**
+ * @brief Ask the node to mint a PAIRING invitation, for another device of
+ *        ours to redeem with @ref at_app_first_contact_initiate. Needs a device
+ *        cert on this node (refused AT_FC_REASON_NOT_SIBLING otherwise).
+ * @param ttl_seconds as at_app_first_contact_invite.
+ */
+int at_app_first_contact_pair_invite(at_app_events_t *handle, const char *q_out,
+                                     const char *ref, long ttl_seconds);
+/** @brief One AT_APP_EVENT_FC_SIBLING per paired device, then SIBLINGS_DONE. */
+int at_app_sibling_list(at_app_events_t *handle, const char *q_out, const char *ref);
+/** @brief Unpair @p peer here (not synced); answers SIBLING_REMOVED. */
+int at_app_sibling_remove(at_app_events_t *handle, const char *q_out,
+                          const char *ref, const uint8_t peer[AT_APP_UUID_LEN]);
 
 #ifdef __cplusplus
 }

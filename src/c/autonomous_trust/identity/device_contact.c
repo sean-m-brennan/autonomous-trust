@@ -33,6 +33,7 @@
 #include "identity/first_contact.h"
 #include "identity/id_proc_priv.h"
 #include "identity/identity_priv.h"
+#include "identity/sibling_sync.h"
 #include "network/net_relay.h"
 #include "utilities/logger.h"
 #include "utilities/message.h"
@@ -108,6 +109,7 @@ static void _send(const process_t *proc, char *verb, bool encrypt,
     at_strlcpy(msg.info.net_msg.return_to, "identity", sizeof(msg.info.net_msg.return_to));
     net_msg_pack_json(&msg.info.net_msg, body);
     messaging_send("network", NET_MESSAGE, &msg, false);
+    net_msg_free_obj(&msg.info.net_msg);
     (void)proc;
 }
 
@@ -164,11 +166,15 @@ int at_device_push_own_cert(const process_t *proc, const public_identity_t *only
 
 bool handle_device_cert(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
-    (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
     const public_identity_t *sender = &nmsg->from_whom;
     if (!at_fc_has_sender(sender))
         return true;
+    json_t *wire = at_fc_app_payload(nmsg);
+    bool paired = at_sibling_on_device_cert(proc, queues, sender, wire);
+    json_decref(wire);
+    if (paired)
+        return true;     /* it answered a pair handshake */
     char uu[UUID_STRING_LEN + 1];
     uuid_unparse_lower(sender->uuid, uu);
     char dir[CFG_PATH_LEN + 1] = {0};
@@ -209,12 +215,28 @@ bool handle_device_cert(const process_t *proc, directory_t *queues, generic_msg_
                      c->petname);
         log_info(proc->logger, "Identity: first contact: learned the operator key of %s\n",
                  c->petname);
+        contacts_free(&store);
+        (void)at_sibling_push_changes(proc);
+        return true;
     }
     contacts_free(&store);
     return true;
 }
 
+/* Announce to every device of @p only (NULL: of every contact in the store). */
+static int _announce(const process_t *proc, const contact_t *only);
+
 int at_device_announce(const process_t *proc)
+{
+    return _announce(proc, NULL);
+}
+
+int at_device_announce_contact(const process_t *proc, const contact_t *c)
+{
+    return c == NULL ? 0 : _announce(proc, c);
+}
+
+static int _announce(const process_t *proc, const contact_t *only)
 {
     if (proc == NULL)
         return 0;
@@ -238,10 +260,12 @@ int at_device_announce(const process_t *proc)
     contacts_t store;
     _load_store(&store, dir, sizeof(dir));
     int sent = 0;
-    for (size_t i = 0; i < store.count; i++)
-        for (size_t d = 0; d <= store.items[i].devices_count; d++) {
+    size_t n_items = only != NULL ? 1 : store.count;
+    for (size_t i = 0; i < n_items; i++) {
+        const contact_t *ci = only != NULL ? only : &store.items[i];
+        for (size_t d = 0; d <= ci->devices_count; d++) {
             public_identity_t who;
-            if (!_device_identity(&store.items[i], d, &who))
+            if (!_device_identity(ci, d, &who))
                 continue;
             if (uuid_compare(who.uuid, self.uuid) != 0) {
                 _send(proc, ID_FC_DEVICE_ANNOUNCE, false, &who, &self, body);
@@ -250,6 +274,7 @@ int at_device_announce(const process_t *proc)
             if (d > 0)
                 at_fc_free_public(&who);
         }
+    }
     contacts_free(&store);
     json_decref(body);
     at_fc_free_public(&self);
@@ -292,6 +317,7 @@ bool handle_device_announce(const process_t *proc, directory_t *queues, generic_
     }
     if (contacts_save(&store, dir) != 0)
         log_warn(proc->logger, "Identity: could not persist contact for %s\n", c->petname);
+    (void)at_sibling_push_changes(proc);
     (void)identity_admit_direct_peer((process_t *)proc, queues, sender);
     /* Its relays, then ours. */
     const char *route[2 * AT_RELAY_MAX];

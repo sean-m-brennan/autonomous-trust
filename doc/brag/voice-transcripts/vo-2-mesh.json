@@ -1,0 +1,158 @@
+[
+  {
+    "text": "The",
+    "start": 0.05,
+    "end": 0.21,
+    "id": "w0"
+  },
+  {
+    "text": "peers",
+    "start": 0.28,
+    "end": 0.56,
+    "id": "w1"
+  },
+  {
+    "text": "find",
+    "start": 0.56,
+    "end": 0.84,
+    "id": "w2"
+  },
+  {
+    "text": "each",
+    "start": 0.84,
+    "end": 1.12,
+    "id": "w3"
+  },
+  {
+    "text": "other",
+    "start": 1.12,
+    "end": 1.47,
+    "id": "w4"
+  },
+  {
+    "text": "and",
+    "start": 1.49,
+    "end": 1.76,
+    "id": "w5"
+  },
+  {
+    "text": "build",
+    "start": 1.76,
+    "end": 2.23,
+    "id": "w6"
+  },
+  {
+    "text": "a",
+    "start": 2.23,
+    "end": 2.3,
+    "id": "w7"
+  },
+  {
+    "text": "trust",
+    "start": 2.42,
+    "end": 2.63,
+    "id": "w8"
+  },
+  {
+    "text": "graph.",
+    "start": 2.79,
+    "end": 3.3,
+    "id": "w9"
+  },
+  {
+    "text": "No",
+    "start": 3.35,
+    "end": 3.42,
+    "id": "w10"
+  },
+  {
+    "text": "policy",
+    "start": 3.49,
+    "end": 4.06,
+    "id": "w11"
+  },
+  {
+    "text": "server",
+    "start": 4.06,
+    "end": 4.63,
+    "id": "w12"
+  },
+  {
+    "text": "to",
+    "start": 4.63,
+    "end": 4.82,
+    "id": "w13"
+  },
+  {
+    "text": "call.",
+    "start": 4.82,
+    "end": 5.5,
+    "id": "w14"
+  },
+  {
+    "text": "No",
+    "start": 5.55,
+    "end": 5.63,
+    "id": "w15"
+  },
+  {
+    "text": "certificate",
+    "start": 5.69,
+    "end": 6.56,
+    "id": "w16"
+  },
+  {
+    "text": "authority",
+    "start": 6.61,
+    "end": 7.36,
+    "id": "w17"
+  },
+  {
+    "text": "to",
+    "start": 7.36,
+    "end": 7.46,
+    "id": "w18"
+  },
+  {
+    "text": "ask.",
+    "start": 7.53,
+    "end": 8.06,
+    "id": "w19"
+  },
+  {
+    "text": "Every",
+    "start": 8.12,
+    "end": 8.42,
+    "id": "w20"
+  },
+  {
+    "text": "decision",
+    "start": 8.42,
+    "end": 9,
+    "id": "w21"
+  },
+  {
+    "text": "happens",
+    "start": 9,
+    "end": 9.51,
+    "id": "w22"
+  },
+  {
+    "text": "at",
+    "start": 9.51,
+    "end": 9.65,
+    "id": "w23"
+  },
+  {
+    "text": "the",
+    "start": 9.65,
+    "end": 9.86,
+    "id": "w24"
+  },
+  {
+    "text": "node.",
+    "start": 9.86,
+    "end": 10.36,
+    "id": "w25"
+  }
+]

@@ -52,6 +52,9 @@
 #include "contacts/reach.h"
 #include "identity/fc_shared.h"
 #include "identity/directory_contact.h"
+#include "identity/area_contact.h"
+#include "identity/sibling_sync.h"
+#include "contacts/siblings.h"
 
 bool at_first_contact_enabled(void)
 {
@@ -135,6 +138,8 @@ typedef struct {
     size_t n_relays;
     /* How the contact the ack records was found. */
     at_provenance_t provenance;
+    /* The link was a pairing invitation (Phase 4, identity/sibling_sync.h). */
+    bool pair;
 } fc_pending_t;
 
 typedef struct {
@@ -342,6 +347,7 @@ void at_first_contact_reset(void)
     memset(fc_app.own_pins, 0, sizeof(fc_app.own_pins));
     fc_app.n_own_pins = 0;
     pthread_mutex_unlock(&fc_app.lock);
+    at_sibling_sync_reset();
 }
 
 /* Record the hello we are about to send. Replaces an earlier one to the same
@@ -350,7 +356,7 @@ void at_first_contact_reset(void)
 static void _fc_pend(const public_identity_t *inviter, const char *nonce,
                      const char *ref, double now,
                      const fc_relay_t *relays, size_t n_relays,
-                     at_provenance_t provenance)
+                     at_provenance_t provenance, bool pair)
 {
     pthread_mutex_lock(&fc_app.lock);
     fc_pending_t *slot = NULL;
@@ -375,6 +381,7 @@ static void _fc_pend(const public_identity_t *inviter, const char *nonce,
     at_strlcpy(slot->ref, ref != NULL ? ref : "", sizeof(slot->ref));
     slot->deadline = now + AT_FC_PENDING_TTL_SECONDS;
     slot->provenance = provenance;
+    slot->pair = pair;
     for (size_t i = 0; i < n_relays && slot->n_relays < AT_RELAY_MAX; i++)
         if (net_relay_hint_for_pinned(relays[i].ep.host, relays[i].ep.port,
                                       &relays[i].pin,
@@ -392,7 +399,8 @@ static bool _fc_take_pending(const process_t *proc,
                              const char *nonce, double now, char *ref_out,
                              size_t ref_len,
                              char relays_out[][AT_RELAY_HOST_LEN + 96],
-                             size_t *n_relays_out, at_provenance_t *prov_out)
+                             size_t *n_relays_out, at_provenance_t *prov_out,
+                             bool *pair_out)
 {
     char who[UUID_STRING_LEN + 1];
     uuid_unparse_lower(accepter->uuid, who);
@@ -417,6 +425,7 @@ static bool _fc_take_pending(const process_t *proc,
         at_strlcpy(ref_out, entry->ref, ref_len);
         *n_relays_out = entry->n_relays;
         *prov_out = entry->provenance;
+        *pair_out = entry->pair;
         for (size_t i = 0; i < entry->n_relays; i++)
             at_strlcpy(relays_out[i], entry->relays[i], sizeof(entry->relays[i]));
         memset(entry, 0, sizeof(*entry));
@@ -541,6 +550,10 @@ int at_first_contact_register(process_t *proc)
     at_dir_contact_register(proc);
     /* One human, several devices (Phase 4). */
     at_device_contact_register(proc);
+    /* One's own devices, paired and in sync (Phase 4). */
+    at_sibling_sync_register(proc);
+    /* Finding people nearby at an area hub. */
+    at_area_contact_register(proc);
     return 0;
 }
 
@@ -711,7 +724,9 @@ bool handle_first_contact_relay_identity(const process_t *proc, directory_t *que
 static void _fc_run_start(process_t *proc)
 {
     (void)at_first_contact_restore_contacts(proc);
+    (void)at_sibling_restore(proc);
     (void)at_dir_contact_restore_entries(proc);
+    (void)at_area_contact_refresh(proc);
     /* Phase 4: our cert to every contact now a peer, and this device to all. */
     (void)at_device_push_own_cert(proc, NULL);
     (void)at_device_announce(proc);
@@ -719,9 +734,24 @@ static void _fc_run_start(process_t *proc)
 
 /* First contact follows identity's start (id_ext.h) to restore the address
  * book; the registry is not gated, so the hook checks AT_FIRST_CONTACT. */
+/* With the caps-resync sweep: give up on pair handshakes whose cert never
+ * came, push any address-book edit not pushed yet, and keep our area cards
+ * fresh while we stay listed. Python _periodic. */
+static void _fc_periodic(const process_t *proc)
+{
+    if (!at_first_contact_enabled())
+        return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    (void)at_sibling_expire(proc, NULL, (double)ts.tv_sec + (double)ts.tv_nsec / 1e9);
+    (void)at_sibling_push_changes(proc);
+    (void)at_area_contact_refresh(proc);
+}
+
 static const identity_ext_t first_contact_identity_ext = {
     .name = "first_contact",
     .run_start = _fc_run_start,
+    .periodic_resync = _fc_periodic,
 };
 IDENTITY_EXT_REGISTER(first_contact, &first_contact_identity_ext)
 
@@ -1038,8 +1068,17 @@ bool handle_first_contact_hello(const process_t *proc, directory_t *queues,
     }
     char nonce_copy[AT_CONTACT_NONCE_MAX + 1];
     at_strlcpy(nonce_copy, nonce, sizeof(nonce_copy));
+    bool pair = strcmp(at_invitation_purpose(&inv), AT_INVITATION_PURPOSE_PAIR) == 0;
     at_invitation_free(&inv);
     _fc_spend(proc->logger, nonce_copy, expiry, now);  /* durable: survives a restart */
+
+    /* A pairing invitation of ours: no contact; wait for the sender's cert
+     * (identity/sibling_sync.h). Without a cert of our own there is no one to
+     * pair under, and no ack. Python _hello_pair. */
+    if (pair && !at_sibling_can_pair(proc)) {
+        at_sibling_refuse(proc, queues, &nmsg->from_whom, ref, AT_FC_ROLE_INVITER, false);
+        return true;
+    }
 
     identity_admit_direct_peer((process_t *)proc, queues, &nmsg->from_whom);
     log_info(proc->logger,
@@ -1067,14 +1106,25 @@ bool handle_first_contact_hello(const process_t *proc, directory_t *queues,
     net_msg_pack_json(&ack.info.net_msg, body);
     json_decref(body);
     messaging_send("network", NET_MESSAGE, &ack, false);
+    net_msg_free_obj(&ack.info.net_msg);
     _free_public(&ack.info.net_msg.from_whom);
+    if (pair) {
+        const char *hints[1] = {nmsg->from_whom.address};
+        at_sibling_begin(proc, queues, &nmsg->from_whom, ref, AT_FC_ROLE_INVITER, hints,
+                         nmsg->from_whom.address[0] != '\0' ? 1 : 0);
+        log_info(proc->logger, "Identity: first contact: pairing with %s\n",
+                 nmsg->from_whom.nickname);
+        return true;
+    }
     /* After the ack is on its way: the address book is durable state, not part
      * of the handshake's critical path. */
     _record_contact(proc, &nmsg->from_whom, nonce_copy, nmsg->from_whom.address,
-                    NULL, 0, at_dir_contact_is_invite(nonce_copy) ? AT_PROV_DIRECTORY
-                                                                   : AT_PROV_TOKEN);
+                    NULL, 0, at_area_contact_is_invite(nonce_copy) ? AT_PROV_AREA
+                             : at_dir_contact_is_invite(nonce_copy) ? AT_PROV_DIRECTORY
+                                                                    : AT_PROV_TOKEN);
     _fc_push_own_record(proc, &nmsg->from_whom);
     (void)at_device_push_own_cert(proc, &nmsg->from_whom);
+    (void)at_sibling_push_changes(proc);
     _fc_emit(proc, AT_APP_EVENT_FC_ESTABLISHED, ref, &nmsg->from_whom,
              AT_FC_REASON_NONE, AT_FC_ROLE_INVITER, 0, NULL);
     return true;
@@ -1108,14 +1158,25 @@ bool handle_first_contact_hello_ack(const process_t *proc, directory_t *queues,
     char relays[AT_RELAY_MAX][AT_RELAY_HOST_LEN + 96];
     size_t n_relays = 0;
     at_provenance_t provenance = AT_PROV_TOKEN;
+    bool pair = false;
     if (!_fc_take_pending(proc, &nmsg->from_whom, ack_nonce,
                           (double)time(NULL), ref, sizeof(ref), relays, &n_relays,
-                          &provenance))
+                          &provenance, &pair))
         return true;
-    const char *relay_hints[AT_RELAY_MAX];
+    const char *relay_hints[AT_RELAY_MAX + 1];
     for (size_t i = 0; i < n_relays; i++)
         relay_hints[i] = relays[i];
     identity_admit_direct_peer((process_t *)proc, queues, &nmsg->from_whom);
+    if (pair) {
+        size_t n = n_relays;
+        if (nmsg->from_whom.address[0] != '\0')
+            relay_hints[n++] = nmsg->from_whom.address;
+        at_sibling_begin(proc, queues, &nmsg->from_whom, ref, AT_FC_ROLE_INITIATOR,
+                         relay_hints, n);
+        log_info(proc->logger, "Identity: first contact: pairing with %s\n",
+                 nmsg->from_whom.nickname);
+        return true;
+    }
     /* Our own side of the address book. The redeemer usually already has a
      * contact for this identity (at_redeem_invitation built one, possibly
      * verified in person); the preserve rule in _record_contact keeps that
@@ -1127,6 +1188,7 @@ bool handle_first_contact_hello_ack(const process_t *proc, directory_t *queues,
              nmsg->from_whom.nickname);
     _fc_push_own_record(proc, &nmsg->from_whom);
     (void)at_device_push_own_cert(proc, &nmsg->from_whom);
+    (void)at_sibling_push_changes(proc);
     _fc_emit(proc, AT_APP_EVENT_FC_ESTABLISHED, ref, &nmsg->from_whom,
              AT_FC_REASON_NONE, AT_FC_ROLE_INITIATOR, 0, NULL);
     return true;
@@ -1227,6 +1289,7 @@ static void _fc_send_relay_route(const uuid_t uuid, const fc_relay_t *eps,
     net_msg_pack_json(&route.info.net_msg, rb);
     json_decref(rb);
     messaging_send("network", NET_MESSAGE, &route, false);
+    net_msg_free_obj(&route.info.net_msg);
 }
 
 int at_first_contact_initiate(const process_t *proc, directory_t *queues,
@@ -1330,7 +1393,7 @@ int at_first_contact_initiate_prov(const process_t *proc, directory_t *queues,
      * bytes Python's initiate forwards, and the bytes the inviter's signature
      * covers. Not net_msg_pack_json: that would JSON-quote it. */
     size_t blen = strlen(blob);
-    hello.info.net_msg.obj = smrt_create(blen + 1);
+    hello.info.net_msg.obj = malloc(blen + 1);
     if (hello.info.net_msg.obj == NULL) {
         at_invitation_free(&inv);
         _free_public(&inviter);
@@ -1343,8 +1406,10 @@ int at_first_contact_initiate_prov(const process_t *proc, directory_t *queues,
     /* Pending BEFORE the send, so an ack that races back finds it. */
     _fc_pend(&inviter,
              json_string_value(json_object_get(inv.body, "nonce")), ref,
-             (double)time(NULL), relay_eps, n_relay, provenance);
+             (double)time(NULL), relay_eps, n_relay, provenance,
+             strcmp(at_invitation_purpose(&inv), AT_INVITATION_PURPOSE_PAIR) == 0);
     messaging_send("network", NET_MESSAGE, &hello, false);
+    net_msg_free_obj(&hello.info.net_msg);
     _free_public(&hello.info.net_msg.from_whom);
     at_invitation_free(&inv);
 
@@ -1449,6 +1514,11 @@ bool handle_first_contact_app_invite(const process_t *proc, directory_t *queues,
         expiry = v != 0 ? now + v : 0;
     }
 
+    /* `pair`: a pairing invitation (identity/sibling_sync.h); true or false. */
+    json_t *jpair = req != NULL ? json_object_get(req, "pair") : NULL;
+    bool pair = json_is_true(jpair);
+    if (jpair != NULL && !json_is_boolean(jpair))
+        ok = false;
     const char **hints = NULL;
     size_t n_hints = 0;
     json_t *jrv = req != NULL ? json_object_get(req, "rendezvous") : NULL;
@@ -1470,6 +1540,16 @@ bool handle_first_contact_app_invite(const process_t *proc, directory_t *queues,
                  "Identity: first contact: app invite with an unusable payload\n");
         _fc_emit(proc, AT_APP_EVENT_FC_REFUSED, ref_copy, NULL,
                  AT_FC_REASON_BAD_REQUEST, AT_FC_ROLE_NONE, 0, NULL);
+        free(hints);
+        json_decref(req);
+        return true;
+    }
+
+    if (pair && !at_sibling_can_pair(proc)) {
+        log_warn(proc->logger, "Identity: first contact: no device cert installed; "
+                 "cannot mint a pairing invitation\n");
+        _fc_emit(proc, AT_APP_EVENT_FC_REFUSED, ref_copy, NULL,
+                 AT_FC_REASON_NOT_SIBLING, AT_FC_ROLE_NONE, 0, NULL);
         free(hints);
         json_decref(req);
         return true;
@@ -1503,7 +1583,9 @@ bool handle_first_contact_app_invite(const process_t *proc, directory_t *queues,
     char *blob = NULL;
     const identity_t *self = identity_self_identity(proc);
     int rc = self == NULL ? -1
-           : at_create_invitation(self, hints, n_hints, expiry, nonce, &blob);
+           : at_create_invitation_purpose(self, hints, n_hints, expiry, nonce,
+                                          pair ? AT_INVITATION_PURPOSE_PAIR : NULL,
+                                          &blob);
     free(hints);            /* borrowed strings; req still owns them */
     json_decref(req);
 
@@ -1545,7 +1627,7 @@ static bool _fc_initiate_refused(const process_t *proc, const char *ref,
 {
     static const char *const names[] = {
         "", "malformed", "bad_signature", "expired", "spent", "endpoint",
-        "bad_request", "mint_failed" };
+        "bad_request", "mint_failed", "mismatch", "unknown_contact", "not_sibling" };
     log_warn(proc->logger,
              "Identity: first contact: app initiate refused (%s)\n",
              names[reason]);
@@ -1601,11 +1683,34 @@ bool handle_first_contact_app_initiate(const process_t *proc,
     if (bad == AT_FC_REASON_NONE && self != NULL
         && uuid_compare(self->uuid, inviter.uuid) == 0)
         bad = AT_FC_REASON_BAD_REQUEST;       /* our own link */
+    bool pair = strcmp(at_invitation_purpose(&inv), AT_INVITATION_PURPOSE_PAIR) == 0;
+    if (bad == AT_FC_REASON_NONE && pair && !at_sibling_can_pair(proc))
+        bad = AT_FC_REASON_NOT_SIBLING;
     at_invitation_free(&inv);
     if (bad != AT_FC_REASON_NONE) {
         _fc_initiate_refused(proc, ref_copy, bad, &inviter);
         _free_public(&inviter);
         json_decref(req);
+        return true;
+    }
+
+    /* Another device of ours: no contact, only the handshake, then certs
+     * (identity/sibling_sync.h). */
+    if (pair) {
+        const char *ep = json_string_value(json_object_get(req, "endpoint"));
+        public_identity_t sent;
+        memset(&sent, 0, sizeof(sent));
+        int prc = at_first_contact_initiate_ref(proc, queues, blob,
+                                                ep != NULL && ep[0] != '\0' ? ep : NULL,
+                                                ref_copy, &sent);
+        json_decref(req);
+        if (prc != 0)
+            _fc_initiate_refused(proc, ref_copy, AT_FC_REASON_ENDPOINT, &inviter);
+        else
+            _fc_emit(proc, AT_APP_EVENT_FC_HELLO_SENT, ref_copy, &inviter,
+                     AT_FC_REASON_NONE, AT_FC_ROLE_INITIATOR, 0, NULL);
+        _free_public(&sent);
+        _free_public(&inviter);
         return true;
     }
 
@@ -1641,6 +1746,7 @@ bool handle_first_contact_app_initiate(const process_t *proc,
                      "Identity: first contact: could not persist contact (%s)\n",
                      strerror(errno));
         contacts_free(&store);
+        (void)at_sibling_push_changes(proc);
     }
     contact_free(&fresh);
 
@@ -1670,10 +1776,24 @@ bool handle_first_contact_app_initiate(const process_t *proc,
  ****************************/
 
 /* One address-book answer, to the main loop and on to the app. */
+static void _fc_emit_contact_o(const process_t *proc, int32_t kind,
+                               const char *ref, const contact_t *c,
+                               const char *safety, at_fc_method_t method,
+                               bool dropped, int32_t count, int32_t origin);
+
 static void _fc_emit_contact(const process_t *proc, int32_t kind,
                              const char *ref, const contact_t *c,
                              const char *safety, at_fc_method_t method,
                              bool dropped, int32_t count)
+{
+    _fc_emit_contact_o(proc, kind, ref, c, safety, method, dropped, count,
+                       AT_FC_ORIGIN_LOCAL);
+}
+
+static void _fc_emit_contact_o(const process_t *proc, int32_t kind,
+                               const char *ref, const contact_t *c,
+                               const char *safety, at_fc_method_t method,
+                               bool dropped, int32_t count, int32_t origin)
 {
     generic_msg_t msg = {0};
     msg.type = FIRST_CONTACT_CONTACT_EVENT;
@@ -1695,6 +1815,7 @@ static void _fc_emit_contact(const process_t *proc, int32_t kind,
     m->data.method = (int32_t)method;
     m->data.peer_dropped = dropped;
     m->data.count = count;
+    m->data.origin = origin;
     if (messaging_send(AT_MAIN_QUEUE, FIRST_CONTACT_CONTACT_EVENT, &msg, false) != 0)
         log_debug(proc->logger,
                   "Identity: first contact: no main queue for event %d\n", kind);
@@ -1788,6 +1909,8 @@ static void _fc_book_save(const process_t *proc, fc_book_t *b)
         log_warn(proc->logger,
                  "Identity: first contact: could not persist contacts (%s)\n",
                  strerror(errno));
+    /* What the user just changed, to our other devices. */
+    (void)at_sibling_push_changes(proc);
 }
 
 bool handle_first_contact_app_safety_number(const process_t *proc,
@@ -1928,6 +2051,7 @@ bool handle_first_contact_app_rename(const process_t *proc, directory_t *queues,
             _fc_book_refused(proc, b.ref, b.peer, AT_FC_REASON_BAD_REQUEST);
         } else {
             at_strlcpy(b.contact->petname, name, sizeof(b.contact->petname));
+            contact_touch(b.contact, -1.0);
             _fc_book_save(proc, &b);
             _fc_emit_contact(proc, AT_APP_EVENT_FC_CONTACT, b.ref, b.contact,
                              NULL, AT_FC_METHOD_NONE, false, 0);
@@ -2093,6 +2217,9 @@ int at_first_contact_capped_tier(const process_t *proc, const unsigned char *pee
     fc_contact_t status = _fc_contact_status(key);
     if (status == FC_CONTACT_VERIFIED)
         return tier;
+    /* One of our own devices (identity/sibling_sync.h). */
+    if (at_sibling_is(key))
+        return tier;
     /* A child-group member is capped only while on record as an UNVERIFIED
      * contact: the child's vote does not vouch for what first contact
      * introduced, and an ordinary child member never went through it. */
@@ -2205,6 +2332,23 @@ static void _fc_push_own_record(const process_t *proc, const public_identity_t *
             }
         peers_read_unlock(proc);
         contacts_free(&store);
+        /* And our own devices (Phase 4). */
+        at_siblings_t sib;
+        at_siblings_init(&sib);
+        if (get_data_dir(dir, sizeof(dir)) > 0)
+            at_siblings_load(dir, &sib);
+        for (size_t i = 0; i < sib.count && n < AT_FC_PENDING_MAX; i++) {
+            uuid_t who;
+            public_identity_t pub;
+            if (uuid_parse(sib.devices[i].uuid, who) == 0
+                && identity_find_peer_pub(proc, who, &pub)) {
+                /* The binding is not needed to address it; drop it first so
+                 * the copy owns nothing. */
+                _free_public(&pub);
+                targets[n++] = pub;
+            }
+        }
+        at_siblings_free(&sib);
     }
     for (size_t i = 0; i < n; i++) {
         if (uuid_compare(targets[i].uuid, self.uuid) == 0)
@@ -2221,6 +2365,7 @@ static void _fc_push_own_record(const process_t *proc, const public_identity_t *
                    sizeof(msg.info.net_msg.return_to));
         net_msg_pack_json(&msg.info.net_msg, wire);
         messaging_send("network", NET_MESSAGE, &msg, false);
+        net_msg_free_obj(&msg.info.net_msg);
     }
     json_decref(wire);
     _free_public(&self);
@@ -2337,6 +2482,7 @@ void at_first_contact_refresh_own_record(const process_t *proc)
     net_msg_pack_json(&msg.info.net_msg, wire);
     json_decref(wire);
     messaging_send("network", NET_MESSAGE, &msg, false);
+    net_msg_free_obj(&msg.info.net_msg);
 }
 
 /* A contact's reachability record: pushed by the contact itself (from_whom =
@@ -2393,6 +2539,11 @@ bool handle_first_contact_reach_record(const process_t *proc, directory_t *queue
     char us[UUID_STRING_LEN + 1];
     uuid_unparse(ruu, us);
     contact_t *c = contacts_get(&store, us);
+    if (c == NULL && at_sibling_apply_record(proc, &rec)) {
+        contacts_free(&store);
+        at_reach_free(&rec);
+        return true;
+    }
     const char *why = NULL;
     if (c == NULL)
         why = "not a contact";
@@ -2514,6 +2665,41 @@ void at_fc_emit_device_linked(const process_t *proc, const contact_t *c,
     if (messaging_send(AT_MAIN_QUEUE, FIRST_CONTACT_CONTACT_EVENT, &msg, false) != 0)
         log_debug(proc->logger,
                   "Identity: first contact: no main queue for event %d\n", m->kind);
+}
+
+void at_fc_emit_event(const process_t *proc, int32_t kind, const char *ref,
+                      const public_identity_t *peer, at_fc_reason_t reason,
+                      at_fc_role_t role)
+{
+    _fc_emit(proc, kind, ref, peer, reason, role, 0, NULL);
+}
+
+void at_fc_emit_contact(const process_t *proc, int32_t kind, const char *ref,
+                        const contact_t *c, bool dropped, int32_t origin)
+{
+    _fc_emit_contact_o(proc, kind, ref, c, NULL, AT_FC_METHOD_NONE, dropped, 0, origin);
+}
+
+void at_fc_emit_sibling(const process_t *proc, int32_t kind, const char *ref,
+                        const char *uuid, const char *nickname, double added_at,
+                        bool dropped, int32_t count)
+{
+    generic_msg_t msg = {0};
+    msg.type = FIRST_CONTACT_CONTACT_EVENT;
+    fc_contact_msg_t *m = AT_MSG_EXT(&msg, fc_contact_msg_t);
+    m->kind = kind;
+    at_strlcpy(m->data.ref, ref != NULL ? ref : "", sizeof(m->data.ref));
+    uuid_t u;
+    if (uuid != NULL && uuid_parse(uuid, u) == 0)
+        memcpy(m->data.peer_uuid, u, sizeof(m->data.peer_uuid));
+    if (nickname != NULL)
+        at_strlcpy(m->data.nickname, nickname, sizeof(m->data.nickname));
+    m->data.added_at = added_at;
+    m->data.peer_dropped = dropped;
+    m->data.count = count;
+    if (messaging_send(AT_MAIN_QUEUE, FIRST_CONTACT_CONTACT_EVENT, &msg, false) != 0)
+        log_debug(proc->logger,
+                  "Identity: first contact: no main queue for event %d\n", kind);
 }
 
 void at_fc_send_route_hints(const uuid_t uuid, const char *const *hints, size_t n)

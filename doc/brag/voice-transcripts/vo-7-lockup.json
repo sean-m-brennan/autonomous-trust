@@ -1,0 +1,68 @@
+[
+  {
+    "text": "Autonomous",
+    "start": 0.11,
+    "end": 1.06,
+    "id": "w0"
+  },
+  {
+    "text": "trust,",
+    "start": 1.11,
+    "end": 1.81,
+    "id": "w1"
+  },
+  {
+    "text": "cooperative",
+    "start": 1.84,
+    "end": 2.48,
+    "id": "w2"
+  },
+  {
+    "text": "computing",
+    "start": 2.59,
+    "end": 3.12,
+    "id": "w3"
+  },
+  {
+    "text": "for",
+    "start": 3.12,
+    "end": 3.16,
+    "id": "w4"
+  },
+  {
+    "text": "machines",
+    "start": 3.25,
+    "end": 3.95,
+    "id": "w5"
+  },
+  {
+    "text": "that",
+    "start": 4.01,
+    "end": 4.18,
+    "id": "w6"
+  },
+  {
+    "text": "are",
+    "start": 4.18,
+    "end": 4.32,
+    "id": "w7"
+  },
+  {
+    "text": "out",
+    "start": 4.32,
+    "end": 4.46,
+    "id": "w8"
+  },
+  {
+    "text": "of",
+    "start": 4.46,
+    "end": 4.55,
+    "id": "w9"
+  },
+  {
+    "text": "reach.",
+    "start": 4.55,
+    "end": 5.06,
+    "id": "w10"
+  }
+]

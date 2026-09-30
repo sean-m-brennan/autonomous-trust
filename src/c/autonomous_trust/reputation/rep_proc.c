@@ -1314,6 +1314,7 @@ static void _publish_tier_change(const process_t *proc,
                  uuid_str, new_tier,
                  sent == EAGAIN ? "identity queue still full" : "send failed");
     }
+    net_msg_free_obj(&ipc.info.net_msg);
 
     /* On demotion, also publish tier_lost to negotiation. The
      * payload is identical (uuid_str, new_tier); the receiver is
@@ -1328,6 +1329,7 @@ static void _publish_tier_change(const process_t *proc,
         strncpy(ipc_neg.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
         net_msg_pack_json(&ipc_neg.info.net_msg, arr);
         messaging_send("negotiation", NET_MESSAGE, &ipc_neg, false);
+        net_msg_free_obj(&ipc_neg.info.net_msg);
     }
 
     json_decref(arr);
@@ -1800,6 +1802,7 @@ static void _publish_exclusion(const process_t *proc,
     json_object_set_new(body, "uuid", json_string(uuid_str));
     net_msg_pack_json(&ipc.info.net_msg, body);
     _rep_send_to_network(proc, &ipc);
+    net_msg_free_obj(&ipc.info.net_msg);
     json_decref(body);
     log_info(proc->logger, "Reputation: %s %.8s (%s) at the network layer\n",
              excluded ? "excluded" : "readmitted", uuid_str,
@@ -1926,6 +1929,7 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
 
         log_debug(proc->logger, "Reputation: Request granted\n");
         _rep_send_to_network(proc, &grant);
+        net_msg_free_obj(&grant.info.net_msg);
     }
     else if (result == PAXOS_BACKDATE)
     {
@@ -1950,6 +1954,7 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
 
         log_debug(proc->logger, "Reputation: Request backdated\n");
         _rep_send_to_network(proc, &backdate);
+        net_msg_free_obj(&backdate.info.net_msg);
     }
     else
     {
@@ -1974,6 +1979,7 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
 
         log_debug(proc->logger, "Reputation: Request refused\n");
         _rep_send_to_network(proc, &nack);
+        net_msg_free_obj(&nack.info.net_msg);
     }
 
     return true;
@@ -2140,6 +2146,7 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
             strncpy(tx_msg.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
             net_msg_pack_json(&tx_msg.info.net_msg, tx_json);
             _rep_send_to_network(proc, &tx_msg);
+            net_msg_free_obj(&tx_msg.info.net_msg);
         }
         peers_read_unlock(proc);
         json_decref(tx_json);
@@ -2261,6 +2268,7 @@ static bool handle_nack(const process_t *proc, directory_t *queues, generic_msg_
             net_msg_pack_json(&retry.info.net_msg, retry_json);
             json_decref(retry_json);
             _rep_send_to_network(proc, &retry);
+            net_msg_free_obj(&retry.info.net_msg);
         }
     }
 
@@ -2492,6 +2500,7 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
     json_decref(acc_json);
 
     _rep_send_to_network(proc, &accepted);
+    net_msg_free_obj(&accepted.info.net_msg);
     return true;
 }
 
@@ -2738,6 +2747,8 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
                 _rep_send_to_network(proc, &per);
             }
             peers_read_unlock(proc);
+            /* The per-peer copies share bcast's obj; free it once. */
+            net_msg_free_obj(&bcast.info.net_msg);
         }
     }
     else
@@ -2908,6 +2919,7 @@ static bool handle_outdated(const process_t *proc, directory_t *queues, generic_
 
     log_debug(proc->logger, "Reputation: Sent update\n");
     _rep_send_to_network(proc, &update);
+    net_msg_free_obj(&update.info.net_msg);
     return true;
 }
 
@@ -3168,6 +3180,7 @@ static void _send_rep_response(const process_t *proc, const net_msg_t *req,
     net_msg_pack_json(&resp.info.net_msg, body);
     json_decref(body);
     _rep_send_to_network(proc, &resp);
+    net_msg_free_obj(&resp.info.net_msg);
 }
 
 /****************************
@@ -3680,6 +3693,7 @@ static bool handle_local_rep_query(const process_t *proc, directory_t *queues, g
     json_decref(resp_json);
 
     messaging_send(return_proc, NET_MESSAGE, &resp, false);
+    net_msg_free_obj(&resp.info.net_msg);
     return true;
 }
 
@@ -3901,6 +3915,7 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
         json_decref(req_json);
 
         _rep_send_to_network(proc, &req);
+        net_msg_free_obj(&req.info.net_msg);
     }
     peers_read_unlock(proc);
 
@@ -4454,6 +4469,7 @@ static bool handle_slash_propose(const process_t *proc, directory_t *queues, gen
     net_msg_pack_json(&sign.info.net_msg, sign_json);
     json_decref(sign_json);
     _rep_send_to_network(proc, &sign);
+    net_msg_free_obj(&sign.info.net_msg);
     /* THE SUCCESS SIDE. Every other outcome of this handler says something;
      * agreeing said nothing, so a round that worked was indistinguishable
      * from one that never started. A slash only lands once a quorum co-signs. */
@@ -4589,6 +4605,7 @@ static bool handle_slash_sign(const process_t *proc, directory_t *queues, generi
             _rep_send_to_network(proc, &per);
         }
         peers_read_unlock(proc);
+        net_msg_free_obj(&bcast.info.net_msg);
     }
     json_decref(sigs);
     json_decref(pending);
@@ -4865,6 +4882,7 @@ static bool _cosign_checkpoint(const process_t *proc,
     net_msg_pack_json(&sign.info.net_msg, sign_json);
     json_decref(sign_json);
     _rep_send_to_network(proc, &sign);
+    net_msg_free_obj(&sign.info.net_msg);
     /* THE SUCCESS SIDE. Every other outcome of this handler says something;
      * agreeing said nothing, so a round that worked was indistinguishable
      * from one that never started. A checkpoint only anchors evidence once a quorum co-signs. */
@@ -5193,6 +5211,7 @@ static bool handle_checkpoint_sign(const process_t *proc, directory_t *queues, g
             _rep_send_to_network(proc, &per);
         }
         peers_read_unlock(proc);
+        net_msg_free_obj(&bcast.info.net_msg);
     }
     json_decref(sigs);
     json_decref(pending);
@@ -5449,6 +5468,7 @@ static void _send_resolved(const process_t *proc,
     memcpy(&out.info.net_msg.to_whom, to_whom, sizeof(public_identity_t));
     net_msg_pack_json(&out.info.net_msg, answer);
     _rep_send_to_network(proc, &out);
+    net_msg_free_obj(&out.info.net_msg);
 }
 
 /* Send a query one level DOWN, to every child group we gateway, with the TTL
@@ -5497,6 +5517,7 @@ static size_t _forward_resolve(const process_t *proc, json_t *query)
                    sizeof(public_identity_t));
             net_msg_pack_json(&per.info.net_msg, onward);
             _rep_send_to_network(proc, &per);
+            net_msg_free_obj(&per.info.net_msg);
             sent++;
         }
         peers_read_unlock(proc);
@@ -6144,6 +6165,7 @@ static bool handle_checkpoint_final(const process_t *proc, directory_t *queues, 
                  (long long)(first_index + count_covered - 1),
                  nmsg->from_whom.nickname);
         _rep_send_to_network(proc, &req);
+        net_msg_free_obj(&req.info.net_msg);
     }
     json_decref(payload);
     return true;
@@ -7424,6 +7446,7 @@ static void _originate_checkpoint(const process_t *proc,
             _rep_send_to_network(proc, &per);
         }
         peers_read_unlock(proc);
+        net_msg_free_obj(&bcast.info.net_msg);
     }
     json_decref(sigs);
     log_info(proc->logger,
@@ -8522,9 +8545,10 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
          * otherwise overflows this queue and is dropped at the sender, which
          * logs 'Failed to route message to process reputation' on the network
          * side and nothing at all here. See PROC_DRAIN_MAX. */
+        generic_msg_t buf = {0};
         for (int taken = 0; taken < PROC_DRAIN_MAX; taken++)
         {
-            generic_msg_t buf = {0};
+            messaging_recv_release(&buf);   /* the previous pass's */
             int rerr = messaging_recv(&buf);
             if (rerr == -1 || rerr == ENOMSG)
                 break;
@@ -8550,6 +8574,7 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
                 run_message_handlers(proc, queues, buf.type, &buf);
             }
         }
+        messaging_recv_release(&buf);
     }
 
     /* Final flush on the way out, so a clean shutdown leaves a snapshot the

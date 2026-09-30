@@ -77,7 +77,14 @@ typedef struct
     /* Heap-allocated payload + explicit length. Wire-side cap is
      * `NET_MSG_MAX_DATA = 1 MB` (see `net_message.h:31`); the
      * transport rejects oversized envelopes before they reach this
-     * struct, so callers can treat `len` as already-bounded. */
+     * struct, so callers can treat `len` as already-bounded.
+     *
+     * OWNERSHIP: a plain malloc buffer, NOT a smrt allocation -- never
+     * smrt_deref it (the payload bytes sit where a smrt header would, so the
+     * "refcount" is JSON text). Whoever filled it frees it: a sender with
+     * net_msg_free_obj() once its last messaging_send returns (the send
+     * serializes; it does not take the buffer), a receiver with
+     * messaging_recv_release(). */
     uint8_t *obj;
     size_t len;
     public_identity_t to_whom;
@@ -117,6 +124,11 @@ typedef struct
     bool verified;
     bool has_signature;
 } net_msg_t;
+
+/** Free @p msg's payload (see net_msg_t.obj) and clear obj/len. NULL-safe.
+ *  For a message this code packed and has finished sending; a received
+ *  message is released whole with messaging_recv_release(). */
+void net_msg_free_obj(net_msg_t *msg);
 
 typedef enum {
     TASK_STATUS_RUNNING = 1,

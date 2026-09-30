@@ -48,9 +48,9 @@ test -s "$here/brag.mp4"
 # not re-encoded, so it costs no quality and no render. (The alternative, baking
 # the poster over frame 0, needs a full libx264 pass for one frame.)
 ffmpeg -y -loglevel warning -ss "$POSTER_AT" -i "$here/brag.mp4" \
-    -frames:v 1 -q:v 2 "$here/brag.jpg"
+    -frames:v 1 -update 1 -q:v 2 "$here/brag.jpg"
 ffmpeg -y -loglevel warning -i "$here/brag.mp4" -i "$here/brag.jpg" \
-    -map 0:v:0 -map 0:a:0 -map 1 -c copy -c:v:1 mjpeg -disposition:v:1 attached_pic \
+    -map 0:v:0 -map 0:a:0 -map 1 -c:v:0 copy -c:a copy -c:v:1 mjpeg -disposition:v:1 attached_pic \
     "$here/brag.poster.mp4"
 mv "$here/brag.poster.mp4" "$here/brag.mp4"
 
