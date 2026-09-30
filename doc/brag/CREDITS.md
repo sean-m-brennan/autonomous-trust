@@ -11,9 +11,9 @@ wherever it is posted. The ready-to-paste block is at the bottom of
 `share-copy.txt`. If `brag.mp4` is ever distributed somewhere that carries no
 description field, the attribution needs to appear on screen instead.
 
-The file in `composition/assets/music/` is the first 46 seconds of the original,
-cut with a stream copy (no re-encode). The video runs 44.0s and the bed fades to
-silence at 42.9s.
+The file in `composition/assets/music/` is the first 58.7 seconds of the original,
+cut with a stream copy (no re-encode). The video runs 56.7s and the bed fades to
+silence at 55.6s.
 
 ## Sound effects
 

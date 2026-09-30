@@ -33,7 +33,7 @@ export npm_config_ignore_scripts=true
 # The poster: the settled divergence frame, which is the thesis image of the
 # piece -- two peers whose reputation lines have just parted. brag-plan.md picks
 # the moment; keep the two in step if either changes.
-POSTER_AT="${POSTER_AT:-20.3}"
+POSTER_AT="${POSTER_AT:-26.8}"
 
 if [[ "${SKIP_RENDER:-0}" != 1 ]]; then
     ( cd "$here/composition"
