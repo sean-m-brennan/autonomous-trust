@@ -62,7 +62,7 @@ don't hold keys to (preserved, not removed).
  an excluded subtree member falls out of the recursive roster the gateway
  reports. Recovery is explicit-only (`REASON_REHABILITATE` lifts to 0.2 and
  re-admits) and the excluded state survives a restart. See
- [Reputation § Communication cut-off enforcement](reputation.md#communication-cut-off-enforcement).
+ [Reputation § Exclusion, enforced rather than displayed](reputation.md#exclusion-enforced-rather-than-displayed).
 
 **Relay and participate are both supported, and they are orthogonal.** They key
 on whether the gateway holds the key of the destination group.

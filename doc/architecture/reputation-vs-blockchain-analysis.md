@@ -142,7 +142,7 @@ catch-up sub-protocol is *verifiable* rather than merely social.
  empty, so any single admitted member could install a root of its choosing, and
  since §2.3 anchors slash evidence on exactly that root, fabricated evidence then
  verified perfectly. See
- [Reputation › Quorum attestation](reputation.md#quorum-attestation-slash-and-checkpoint).
+ [Reputation › Quorum attestation](reputation.md#quorum-attestation).
 
  Note: the red-black `MerkleTree` (identity side) is intentionally **not** reused for
  the reputation window. Its root depends on insertion order and rotations, which is
@@ -176,7 +176,7 @@ verifies them before flooring anyone. It has to be, because a floor below
 `COMM_CUTOFF` is sticky network exclusion, so a `slash_final` that nobody checks
 is a permanent-exclusion primitive for any admitted member, which is what this
 was until then. See [Reputation › Quorum
-attestation](reputation.md#quorum-attestation-slash-and-checkpoint).
+attestation](reputation.md#quorum-attestation).
 
 ### 2.3 Evidence-gated slashing (Merkle proof verification)
 

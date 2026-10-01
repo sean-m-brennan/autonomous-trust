@@ -4,7 +4,7 @@
 
 AutonomousTrust assumes a hostile environment with no reachable central
 authority to vouch for anyone (see the [adversarial
-assumption](concept.md#adversarial-assumption)). This document states the
+assumption](concept.md#the-adversarial-assumption)). This document states the
 security properties AT aims to provide, how it contains a malicious or
 compromised peer, and the risks it raises the cost of without eliminating. For
 implementation-level hardening (memory safety, deserialization, allowlists,
