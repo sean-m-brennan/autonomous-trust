@@ -533,6 +533,8 @@ int at_first_contact_register(process_t *proc)
                              (handler_ptr_t)handle_first_contact_app_invite);
     process_register_handler(proc, NET_FN_RELAY_IDENTITY,
                              (handler_ptr_t)handle_first_contact_relay_identity);
+    process_register_handler(proc, NET_FN_RELAY_PEER,
+                             (handler_ptr_t)handle_first_contact_relay_peer);
     process_register_handler(proc, FC_REACH_RECORD,
                              (handler_ptr_t)handle_first_contact_reach_record);
     process_register_handler(proc, FC_APP_INITIATE,
@@ -665,6 +667,59 @@ int at_first_contact_restore_contacts(process_t *proc)
 /* The network process says one of our own relays proved who it is ({relay,
  * uuid, fp}). Local IPC only: a peer must not choose the pin our links carry.
  * Mirrors Python first_contact.handle_relay_identity. */
+bool handle_first_contact_relay_peer(const process_t *proc, directory_t *queues,
+                                     generic_msg_t *msg)
+{
+    (void)queues;
+    if (proc == NULL || msg == NULL)
+        return true;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    if (!uuid_is_null(nmsg->from_whom.uuid)) {
+        log_warn(proc->logger,
+                 "Identity: first contact: refusing relay_peer from the wire\n");
+        return true;
+    }
+    json_t *body = NULL;
+    char who[UUID_STRING_LEN + 1] = "";
+    if (net_msg_unpack_json(nmsg, &body) == 0 && body != NULL) {
+        const char *u = json_string_value(json_object_get(body, "uuid"));
+        if (u != NULL)
+            at_strlcpy(who, u, sizeof(who));
+        json_decref(body);
+    }
+    uuid_t uu;
+    if (who[0] == '\0' || uuid_parse(who, uu) != 0)
+        return true;
+    char lower[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(uu, lower);
+    /* A contact (any of its devices) or one of our own devices. */
+    char dir[CFG_PATH_LEN + 1] = {0};
+    bool ours = false;
+    if (get_data_dir(dir, sizeof(dir)) > 0) {
+        contacts_t store;
+        contacts_init(&store);
+        (void)contacts_load(dir, &store);
+        ours = contacts_get(&store, lower) != NULL;
+        contacts_free(&store);
+        if (!ours) {
+            at_siblings_t sib;
+            at_siblings_load(dir, &sib);
+            ours = at_siblings_contains(&sib, lower);
+            at_siblings_free(&sib);
+        }
+    }
+    if (!ours)
+        return true;
+    public_identity_t pub;
+    if (!identity_find_peer_pub(proc, uu, &pub))
+        return true;
+    _free_public(&pub);
+    _fc_push_own_record(proc, &pub);
+    log_debug(proc->logger, "Identity: first contact: sent our reachability record to "
+              "%.8s, which just reached us through a relay\n", lower);
+    return true;
+}
+
 bool handle_first_contact_relay_identity(const process_t *proc, directory_t *queues,
                                          generic_msg_t *msg)
 {
