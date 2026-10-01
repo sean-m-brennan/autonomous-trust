@@ -130,6 +130,17 @@ extern "C" {
 #define AT_APP_EVENT_ROSTER_INSTALLED    1028  /**< @c issuer, @c seq */
 #define AT_APP_EVENT_ROSTER_REFUSED      1029  /**< @c reason: bad_request | invalid | stale */
 #define AT_APP_EVENT_ROSTER_REMOVED      1030  /**< @c issuer; @c count 1 if one was there */
+/* The encrypted backup (Phase 4, recovery): payload @ref at_app_backup_t, read
+ * with @ref at_first_contact_backup_event. Python's backup_contact.EVENT_*. A
+ * restore also sends the CONTACT / REMOVED events of what changed, with
+ * @c origin AT_FC_ORIGIN_BACKUP. */
+#define AT_APP_EVENT_BACKUP_WRITTEN      1031  /**< @c path; @c passphrase if generated */
+#define AT_APP_EVENT_BACKUP_RESTORED     1032  /**< @c added, @c updated, @c removed, @c siblings */
+#define AT_APP_EVENT_BACKUP_REFUSED      1033  /**< see @c reason */
+
+/** The backup app verbs. Local IPC only. Python's backup_contact.APP_*. */
+#define AT_APP_BACKUP_EXPORT "app_backup_export"
+#define AT_APP_BACKUP_IMPORT "app_backup_import"
 
 /** The area app verbs. Local IPC only. Same strings as Python's
  *  area_contact.APP_*. */
@@ -233,7 +244,7 @@ typedef struct {
     char    petname[AT_FC_NICKNAME_LEN];
     bool    verified;
     /** 0 in person, 1 invite link (token), 2 directory, 3 another of our
-     *  own devices (sibling). */
+     *  own devices (sibling), 4 an area hub, 5 a restored backup. */
     int32_t provenance;
     double  added_at;       /**< epoch seconds */
     double  verified_at;    /**< epoch seconds; 0 until verified */
@@ -250,12 +261,14 @@ typedef struct {
     /** DEVICE_LINKED only: the further device filed under this contact. */
     uint8_t device_uuid[AT_APP_UUID_LEN];
     /** CONTACT / REMOVED: @ref AT_FC_ORIGIN_SIBLING when the change came from
-     *  another of our own devices, else @ref AT_FC_ORIGIN_LOCAL. */
+     *  another of our own devices, @ref AT_FC_ORIGIN_BACKUP from a restored
+     *  backup, else @ref AT_FC_ORIGIN_LOCAL. */
     int32_t origin;
 } at_app_contact_t;
 
 #define AT_FC_ORIGIN_LOCAL   0
 #define AT_FC_ORIGIN_SIBLING 1
+#define AT_FC_ORIGIN_BACKUP  2
 
 AT_APP_STATIC_ASSERT(sizeof(at_app_contact_t) <= AT_APP_EVENT_PAYLOAD_MAX,
                      "at_app_contact_t fits the app event payload");
@@ -327,6 +340,40 @@ AT_APP_STATIC_ASSERT(sizeof(at_app_area_t) <= AT_APP_EVENT_PAYLOAD_MAX,
 /** @brief The area payload of @p ev, or NULL unless @p ev is one of the
  *  AT_APP_EVENT_AREA_* / _ROSTER_* kinds. */
 const at_app_area_t *at_first_contact_area_event(const at_app_event_t *ev);
+
+/** @c path buffer: PATH_MAX. A longer path is refused, not cut. */
+#define AT_FC_PATH_LEN 4096
+/** @c passphrase buffer: a generated code (29 characters) and a NUL. */
+#define AT_FC_PASSPHRASE_LEN 32
+
+/** One backup outcome (kinds AT_APP_EVENT_BACKUP_*). Every field is written
+ *  on every event; those a kind does not use are zero. */
+typedef struct {
+    char    ref[AT_FC_REF_LEN];
+    /** The file written or read. */
+    char    path[AT_FC_PATH_LEN];
+    /** WRITTEN, when the app asked the node to make one: the code to show the
+     *  user once. Never stored. */
+    char    passphrase[AT_FC_PASSPHRASE_LEN];
+    /** REFUSED: "bad_request", "weak_passphrase", "bad_passphrase",
+     *  "malformed", "unsupported" or "io". */
+    char    reason[AT_FC_REASON_LEN];
+    /** WRITTEN: contacts in the backup; RESTORED: contacts now in the book. */
+    int32_t contacts;
+    /** WRITTEN: siblings in the backup; RESTORED: siblings added here. */
+    int32_t siblings;
+    /** RESTORED: what the merge changed. */
+    int32_t added;
+    int32_t updated;
+    int32_t removed;
+} at_app_backup_t;
+
+AT_APP_STATIC_ASSERT(sizeof(at_app_backup_t) <= AT_APP_EVENT_PAYLOAD_MAX,
+                     "at_app_backup_t fits the app event payload");
+
+/** @brief The backup payload of @p ev, or NULL unless @p ev is one of the
+ *  AT_APP_EVENT_BACKUP_* kinds. */
+const at_app_backup_t *at_first_contact_backup_event(const at_app_event_t *ev);
 
 /** @brief List us at the hubs serving @p area, under @p bucket (inside it)
  *  and @p name (NULL = none). Refreshed while listed; answered per hub. */
@@ -456,6 +503,25 @@ int at_app_sibling_list(at_app_events_t *handle, const char *q_out, const char *
 /** @brief Unpair @p peer here (not synced); answers SIBLING_REMOVED. */
 int at_app_sibling_remove(at_app_events_t *handle, const char *q_out,
                           const char *ref, const uint8_t peer[AT_APP_UUID_LEN]);
+
+/**
+ * @brief Seal the address book and the sibling list into the file @p path
+ *        (absolute; written atomically, mode 0600). Answers BACKUP_WRITTEN or
+ *        BACKUP_REFUSED. Where the file goes next is the app's choice.
+ * @param passphrase at least 12 characters; NULL asks the node to make one,
+ *        returned once in the WRITTEN event's @c passphrase.
+ */
+int at_app_backup_export(at_app_events_t *handle, const char *q_out, const char *ref,
+                         const char *path, const char *passphrase);
+/**
+ * @brief Open the backup at @p path and merge it into the address book: the
+ *        CONTACT / REMOVED events of what changed (origin BACKUP), then
+ *        BACKUP_RESTORED; or BACKUP_REFUSED. Siblings in it join this node's
+ *        list when its device cert names the same operator; pair again to sync
+ *        with them.
+ */
+int at_app_backup_import(at_app_events_t *handle, const char *q_out, const char *ref,
+                         const char *path, const char *passphrase);
 
 #ifdef __cplusplus
 }

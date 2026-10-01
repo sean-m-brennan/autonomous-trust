@@ -166,13 +166,16 @@ def _conflicts(store, contact, exclude) -> bool:
     return False
 
 
-def merge(store, payload, now=None, exclude=()):
+def merge(store, payload, now=None, exclude=(), provenance=Provenance.sibling):
     """Fold the sync ``payload`` into ``store``. Returns the changes as a list
     of ``(uuid, 'added' | 'updated' | 'removed' | 'tombstone')`` in uuid
     order, 'tombstone' being a removal of a contact this device never had,
-    kept to pass on; an empty list means there is nothing to save. ``exclude`` is this node's own uuid and
-    its siblings': never taken as contacts. Raises :class:`InvalidSync` on a
-    payload that is not one; a malformed record inside one is skipped.
+    kept to pass on; an empty list means there is nothing to save.
+    ``exclude`` is this node's own uuid and its siblings': never taken as
+    contacts. A contact new here gets ``provenance``: ``sibling`` for a sync,
+    ``backup`` for a restore (contacts/backup.py). Raises
+    :class:`InvalidSync` on a payload that is not one; a malformed record
+    inside one is skipped.
     """
     v = payload.get('v') if isinstance(payload, dict) else None
     if not isinstance(payload, dict) or payload.get('typename') != SYNC_TYPENAME \
@@ -213,7 +216,7 @@ def merge(store, payload, now=None, exclude=()):
             continue
         local = store.contacts.get(uuid)
         if local is None:
-            remote.provenance = Provenance.sibling
+            remote.provenance = provenance
             store.add(remote)
             changes[uuid] = 'added'
         elif _newer(remote, local):

@@ -34,6 +34,8 @@ const char *at_provenance_str(at_provenance_t p)
         return "sibling";
     case AT_PROV_AREA:
         return "area";
+    case AT_PROV_BACKUP:
+        return "backup";
     default:
         return "token";
     }

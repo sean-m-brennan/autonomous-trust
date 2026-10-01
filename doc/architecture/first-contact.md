@@ -790,7 +790,50 @@ hints in their file, sent our reachability record, and moved when theirs
 changes. They are never tier-capped. Unpairing (`app_sibling_remove`) is not
 synced, because each device decides whom it syncs with.
 
-Still ahead is an encrypted backup for a lost phone.
+### A lost device: the encrypted backup
+
+Pairing needs the old device. When it is gone, an encrypted backup brings the
+address book back. `app_backup_export` seals the whole book, tombstones
+included, together with the sibling list, into a file the app names. The
+node writes it atomically with mode 0600 and holds the passphrase only for
+the call. The file is plain JSON:
+
+    {typename: "at-backup", v: 1, kdf: "argon2id13", ops, mem, salt,
+     aead: "xchacha20poly1305-ietf", nonce, ct}
+
+The key is Argon2id over the passphrase and salt, at libsodium's moderate
+setting (3 passes, 256 MiB) when the backup is made. `ct` is XChaCha20-Poly1305
+of the contents, with every header field, in a fixed order, as the associated
+data. A changed parameter therefore fails the open just as a wrong passphrase
+does, and the two cannot be told apart. The parameters are stored so a later
+build can raise them. An open refuses anything past 10 passes or 1 GiB, so a
+crafted file cannot make a node spend a gigabyte. The passphrase is the
+user's, at least 12 characters, or one the node generates: 120 bits as 24
+base32 characters in groups of four. A passphrase in exactly that shape is
+upper-cased and its separators set to `-` before the key is derived, so a
+code can be typed in lower case or with spaces. Any other passphrase is taken
+as typed.
+
+`app_backup_import` is a merge, never a replace. The book goes through the
+same merge a sibling's sync does, so an edit made on the new device before
+the restore survives, a removal stays removed, and a verification is never
+lost. A contact new to this device keeps its verification and its original
+`verified_at`, with provenance `backup`. Each change then has the effect it
+would have from a sibling: a contact added is admitted, routed and told about
+this device. That is how a contact who verified you comes to file the
+replacement under your record, if its device cert is from your operator key.
+The siblings in the backup are added when this node's own cert names the
+same operator, but they have never met this device and ignore its syncs
+until the user pairs with each again.
+
+The **operator key** never goes into a backup a node makes, and a node never
+reads one out of a backup. A node that could read the key could impersonate its
+human on every device. The operator-side `tools/backup.py` is the only thing
+that adds the key to a backup (`export --with-operator-key`) or puts it back
+in the keystore (`restore-key`, which never overwrites a different key). After
+that, `tools/device_cert.py issue` mints the new device's cert. The format and
+its rules are the same in both runtimes (`contacts/backup` and
+`identity/backup_contact`), and a backup made by either one opens in the other.
 
 ## What is built, and what is not
 
@@ -817,9 +860,11 @@ invitation names. Two roles still have loose ends:
   `tools/directory_issuer.py` is only the signing half.
 - **Several devices, beyond what is built.** The device cert, the contact
   record that lists devices, the rules that link them, and the messages that
-  carry a cert to a contact are built. So are pairing and keeping siblings'
-  address books in step (see *One person, several devices*, above). Still
-  ahead is the encrypted backup.
+  carry a cert to a contact are built. So are pairing, keeping siblings'
+  address books in step, and the encrypted backup for a lost device (see
+  *One person, several devices*, above). One thing stays the user's: keeping
+  the operator key somewhere that outlives any one device, in a backup or
+  elsewhere.
 
 First contact is an **AT** primitive, so it must complete without the compact
 tier present. Its rendezvous and directory *roles* may optionally be served by
@@ -855,6 +900,13 @@ asymmetry.
 | A removed contact does not come back | [`sync-removed-contact-does-not-come-back.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/sync-removed-contact-does-not-come-back.yaml) |
 | A sibling's clock running ahead is taken as now | [`sync-future-time-taken-as-now.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/sync-future-time-taken-as-now.yaml) |
 | Only a device under our own operator is a sibling | [`siblings-another-operators-device.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/siblings-another-operators-device.yaml) |
+| A backup's ciphertext and associated data are pinned | [`backup-seal-vector-pinned.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/backup-seal-vector-pinned.yaml) |
+| A changed header field fails the open like a wrong passphrase | [`backup-open-changed-ops-fails.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/backup-open-changed-ops-fails.yaml) |
+| Argon2id settings past the ceiling are refused unopened | [`backup-open-refuses-too-much-memory.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/backup-open-refuses-too-much-memory.yaml) |
+| The passphrase floor counts characters, not bytes | [`backup-seal-floor-counts-characters-not-bytes.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/backup-seal-floor-counts-characters-not-bytes.yaml) |
+| A generated code typed in lower case opens the same | [`backup-seal-generated-code-typed-lower-with-spaces.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/backup-seal-generated-code-typed-lower-with-spaces.yaml) |
+| A restored contact arrives verified, as `backup` | [`backup-restore-new-contact-arrives-as-backup.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/backup-restore-new-contact-arrives-as-backup.yaml) |
+| A restore keeps a newer local edit and never loses a verification | [`backup-restore-a-verification-is-never-lost.yaml`](../../src/autonomous-trust/conformance/scenarios/contacts/backup-restore-a-verification-is-never-lost.yaml) |
 | A linked device is not tier-capped; an unlinked one is | [`invite-verified-contacts-linked-device-uses-earned-tier.yaml`](../../src/autonomous-trust/conformance/scenarios/negotiation/invite-verified-contacts-linked-device-uses-earned-tier.yaml) |
 | Handshake admits a DIRECT peer, not a group member | [`first-contact-hello-admits-direct-peer.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-hello-admits-direct-peer.yaml) |
 | An invitation is single-use | [`first-contact-invitation-single-use.yaml`](../../src/autonomous-trust/conformance/scenarios/identity/first-contact-invitation-single-use.yaml) |

@@ -365,6 +365,15 @@ int at_sync_merge(contacts_t *store, const json_t *payload, double now,
                   const char *const *exclude, size_t n_exclude,
                   at_sync_change_t **changes_out, size_t *n_changes)
 {
+    return at_sync_merge_as(store, payload, now, exclude, n_exclude, AT_PROV_SIBLING,
+                            changes_out, n_changes);
+}
+
+int at_sync_merge_as(contacts_t *store, const json_t *payload, double now,
+                     const char *const *exclude, size_t n_exclude,
+                     at_provenance_t provenance,
+                     at_sync_change_t **changes_out, size_t *n_changes)
+{
     if (changes_out != NULL)
         *changes_out = NULL;
     if (n_changes != NULL)
@@ -426,7 +435,7 @@ int at_sync_merge(contacts_t *store, const json_t *payload, double now,
             }
             contact_t *local = contacts_get_first(store, uuid);
             if (local == NULL) {
-                remote.provenance = AT_PROV_SIBLING;
+                remote.provenance = provenance;
                 if (contacts_add(store, &remote) == 0)
                     _note(&ch, uuid, AT_SYNC_ADDED);
             } else if (_newer(&remote, local)) {

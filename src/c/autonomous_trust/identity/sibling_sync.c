@@ -620,8 +620,9 @@ static bool _device_identity(const contact_t *c, size_t d, public_identity_t *ou
     return at_contact_device_identity(&c->devices[d - 1], out) == 0;
 }
 
-static void _apply(const process_t *proc, directory_t *queues, contacts_t *store,
-                   contacts_t *before, const at_sync_change_t *ch, size_t n)
+void at_sibling_apply_changes(const process_t *proc, directory_t *queues,
+                              contacts_t *store, contacts_t *before,
+                              const at_sync_change_t *ch, size_t n, int32_t origin)
 {
     public_identity_t self;
     memset(&self, 0, sizeof(self));
@@ -645,8 +646,7 @@ static void _apply(const process_t *proc, directory_t *queues, contacts_t *store
                 /* They know our sibling, not this device: say it is one of ours. */
                 (void)at_device_announce_contact(proc, c);
             }
-            at_fc_emit_contact(proc, AT_APP_EVENT_FC_CONTACT, "", c, false,
-                               AT_FC_ORIGIN_SIBLING);
+            at_fc_emit_contact(proc, AT_APP_EVENT_FC_CONTACT, "", c, false, origin);
         } else if (ch[k].action == AT_SYNC_REMOVED) {
             contact_t *gone = contacts_get_first(before, ch[k].uuid);
             if (gone == NULL)
@@ -661,8 +661,7 @@ static void _apply(const process_t *proc, directory_t *queues, contacts_t *store
                 if (d > 0)
                     at_fc_free_public(&who);
             }
-            at_fc_emit_contact(proc, AT_APP_EVENT_FC_REMOVED, "", gone, dropped,
-                               AT_FC_ORIGIN_SIBLING);
+            at_fc_emit_contact(proc, AT_APP_EVENT_FC_REMOVED, "", gone, dropped, origin);
         }
     }
     if (have_self)
@@ -710,7 +709,8 @@ bool handle_contacts_sync(const process_t *proc, directory_t *queues, generic_ms
         /* What we just took is not ours to push back. */
         if (_tracking(proc))
             _track(proc, &store, false);
-        _apply(proc, queues, &store, &before, ch, n);
+        at_sibling_apply_changes(proc, queues, &store, &before, ch, n,
+                                 AT_FC_ORIGIN_SIBLING);
         log_info(proc->logger, "Identity: first contact: %zu address-book change(s) "
                  "from %s\n", n, sender->nickname);
     }

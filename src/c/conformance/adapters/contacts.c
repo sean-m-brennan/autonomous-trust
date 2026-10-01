@@ -32,8 +32,10 @@
 #include <time.h>
 
 #include <jansson.h>
+#include <sodium.h>
 #include <uuid/uuid.h>
 
+#include "contacts/backup.h"
 #include "contacts/contacts.h"
 #include "contacts/device.h"
 #include "contacts/siblings.h"
@@ -377,6 +379,81 @@ static bool _sync_field(const char *k)
     return false;
 }
 
+/* The book pins a sync or a restore shares (Python _check_book): changes,
+ * contacts, devices_of, tombstones, and a clean round trip. Leaves @p err
+ * alone when it already says something. */
+static void _check_book(contacts_t *store, json_t *exp, json_t *changes, char *err,
+                        size_t n_err)
+{
+    json_t *wc = json_object_get(exp, "changes");
+    if (err[0] == '\0' && wc != NULL && !json_equal(wc, changes)) {
+        char *got = json_dumps(changes, JSON_COMPACT);
+        snprintf(err, n_err, "changes %s", got != NULL ? got : "?");
+        free(got);
+    }
+    const char *key;
+    json_t *w;
+    json_object_foreach(json_object_get(exp, "contacts"), key, w) {
+        if (err[0] != '\0')
+            break;
+        contact_t *c = contacts_get_first(store, key);
+        if (json_is_null(w)) {
+            if (c != NULL)
+                snprintf(err, n_err, "contact %s still here", key);
+            continue;
+        }
+        if (c == NULL) {
+            snprintf(err, n_err, "no contact %s", key);
+            continue;
+        }
+        json_t *got = NULL;
+        contact_to_json(c, &got);
+        if (json_object_get(got, "updated_at") == NULL)
+            json_object_set_new(got, "updated_at", json_real(0.0));
+        if (json_object_get(got, "reach_seq") == NULL)
+            json_object_set_new(got, "reach_seq", json_integer(0));
+        if (json_object_get(got, "operator_key") == NULL)
+            json_object_set_new(got, "operator_key", json_string(""));
+        const char *k;
+        json_t *v;
+        json_object_foreach(w, k, v) {
+            if (!_sync_field(k)) {
+                snprintf(err, n_err, "unknown field %s", k);
+                break;
+            }
+            if (!_same(json_object_get(got, k), v)) {
+                snprintf(err, n_err, "%s.%s differs", key, k);
+                break;
+            }
+        }
+        json_decref(got);
+    }
+    if (err[0] == '\0')
+        _device_state(store, exp, err, n_err);
+    json_t *wt = json_object_get(exp, "tombstones");
+    if (err[0] == '\0' && wt != NULL) {
+        bool ok = json_object_size(wt) == store->tombstones_count;
+        for (size_t i = 0; ok && i < store->tombstones_count; i++) {
+            json_t *at = json_object_get(wt, store->tombstones[i].uuid);
+            ok = at != NULL && json_is_number(at)
+                 && fabs(json_number_value(at) - store->tombstones[i].at) < 1e-9;
+        }
+        if (!ok)
+            snprintf(err, n_err, "tombstones differ (%zu here)", store->tombstones_count);
+    }
+    if (err[0] == '\0') {
+        json_t *a = NULL, *b = NULL;
+        contacts_t again;
+        contacts_init(&again);
+        if (contacts_to_json(store, &a) != 0 || contacts_from_json(a, &again) != 0
+            || contacts_to_json(&again, &b) != 0 || !json_equal(a, b))
+            snprintf(err, n_err, "store round trip");
+        json_decref(a);
+        json_decref(b);
+        contacts_free(&again);
+    }
+}
+
 /* Mirrors Python ContactsAdapter._sync. */
 static void _op_sync(json_t *fx, json_t *exp, at_case_result_t *out)
 {
@@ -420,77 +497,121 @@ static void _op_sync(json_t *fx, json_t *exp, at_case_result_t *out)
     const char *want = _sfield(exp, "sync_status");
     if (want != NULL && strcmp(status, want) != 0)
         snprintf(err, sizeof(err), "sync_status: got %s want %s", status, want);
-    json_t *wc = json_object_get(exp, "changes");
-    if (err[0] == '\0' && wc != NULL && !json_equal(wc, changes)) {
-        char *got = json_dumps(changes, JSON_COMPACT);
-        snprintf(err, sizeof(err), "changes %s", got != NULL ? got : "?");
-        free(got);
-    }
+    _check_book(&store, exp, changes, err, sizeof(err));
     json_decref(changes);
-    const char *key;
-    json_t *w;
-    json_object_foreach(json_object_get(exp, "contacts"), key, w) {
-        if (err[0] != '\0')
-            break;
-        contact_t *c = contacts_get_first(&store, key);
-        if (json_is_null(w)) {
-            if (c != NULL)
-                snprintf(err, sizeof(err), "contact %s still here", key);
-            continue;
-        }
-        if (c == NULL) {
-            snprintf(err, sizeof(err), "no contact %s", key);
-            continue;
-        }
-        json_t *got = NULL;
-        contact_to_json(c, &got);
-        if (json_object_get(got, "updated_at") == NULL)
-            json_object_set_new(got, "updated_at", json_real(0.0));
-        if (json_object_get(got, "reach_seq") == NULL)
-            json_object_set_new(got, "reach_seq", json_integer(0));
-        if (json_object_get(got, "operator_key") == NULL)
-            json_object_set_new(got, "operator_key", json_string(""));
-        const char *k;
-        json_t *v;
-        json_object_foreach(w, k, v) {
-            if (!_sync_field(k)) {
-                snprintf(err, sizeof(err), "unknown field %s", k);
-                break;
-            }
-            if (!_same(json_object_get(got, k), v)) {
-                snprintf(err, sizeof(err), "%s.%s differs", key, k);
-                break;
-            }
-        }
-        json_decref(got);
-    }
-    if (err[0] == '\0')
-        _device_state(&store, exp, err, sizeof(err));
-    json_t *wt = json_object_get(exp, "tombstones");
-    if (err[0] == '\0' && wt != NULL) {
-        bool ok = json_object_size(wt) == store.tombstones_count;
-        for (size_t i = 0; ok && i < store.tombstones_count; i++) {
-            json_t *at = json_object_get(wt, store.tombstones[i].uuid);
-            ok = at != NULL && json_is_number(at)
-                 && fabs(json_number_value(at) - store.tombstones[i].at) < 1e-9;
-        }
-        if (!ok)
-            snprintf(err, sizeof(err), "tombstones differ (%zu here)", store.tombstones_count);
-    }
-    if (err[0] == '\0') {
-        json_t *a = NULL, *b = NULL;
-        contacts_t again;
-        contacts_init(&again);
-        if (contacts_to_json(&store, &a) != 0 || contacts_from_json(a, &again) != 0
-            || contacts_to_json(&again, &b) != 0 || !json_equal(a, b))
-            snprintf(err, sizeof(err), "store round trip");
-        json_decref(a);
-        json_decref(b);
-        contacts_free(&again);
-    }
     contacts_free(&store);
     if (err[0] != '\0')
         FAILF("sync: %s", err);
+    at_case_result_set_pass(out, 0);
+}
+
+static const char *_backup_status(int rc)
+{
+    return rc == AT_BACKUP_OK ? "ok" : at_backup_reason_str(rc);
+}
+
+static bool _status_is(json_t *exp, const char *key, const char *got, char *err, size_t n)
+{
+    const char *want = _sfield(exp, key);
+    if (want == NULL)
+        want = "ok";
+    if (strcmp(got, want) != 0) {
+        snprintf(err, n, "%s: got %s want %s", key, got, want);
+        return false;
+    }
+    return true;
+}
+
+/* Mirrors Python ContactsAdapter._backup. */
+static void _op_backup(json_t *fx, json_t *exp, at_case_result_t *out)
+{
+    char err[256] = "";
+    const char *mode = _sfield(fx, "mode");
+    if (mode == NULL)
+        FAILF("backup: no mode");
+    if (strcmp(mode, "seal") == 0) {
+        uint8_t salt[AT_BACKUP_SALT_BYTES], nonce[AT_BACKUP_NONCE_BYTES];
+        size_t got = 0;
+        const char *sh = _sfield(fx, "salt"), *nh = _sfield(fx, "nonce");
+        if (sh == NULL || nh == NULL ||
+            sodium_hex2bin(salt, sizeof(salt), sh, strlen(sh), NULL, &got, NULL) != 0 ||
+            got != sizeof(salt) ||
+            sodium_hex2bin(nonce, sizeof(nonce), nh, strlen(nh), NULL, &got, NULL) != 0 ||
+            got != sizeof(nonce))
+            FAILF("backup seal: bad salt or nonce fixture");
+        const char *pt = _sfield(fx, "plaintext");
+        json_t *blob = NULL;
+        int rc = at_backup_seal_bytes((const uint8_t *)pt, pt != NULL ? strlen(pt) : 0,
+                                      _sfield(fx, "passphrase"),
+                                      (unsigned long long)_dfield(fx, "ops", 0),
+                                      (size_t)_dfield(fx, "mem", 0), salt, nonce, &blob);
+        if (_status_is(exp, "backup_status", _backup_status(rc), err, sizeof(err))) {
+            const char *ct = _sfield(exp, "ct");
+            if (ct != NULL && strcmp(ct, json_string_value(json_object_get(blob, "ct"))) != 0)
+                snprintf(err, sizeof(err), "ct differs");
+            const char *want_ad = _sfield(exp, "ad");
+            char ad[256];
+            if (err[0] == '\0' && want_ad != NULL &&
+                (at_backup_header_ad(
+                     (unsigned long long)json_integer_value(json_object_get(blob, "ops")),
+                     (size_t)json_integer_value(json_object_get(blob, "mem")),
+                     json_string_value(json_object_get(blob, "salt")),
+                     json_string_value(json_object_get(blob, "nonce")), ad, sizeof(ad)) < 0 ||
+                 strcmp(ad, want_ad) != 0))
+                snprintf(err, sizeof(err), "ad differs");
+        }
+        json_decref(blob);
+    } else if (strcmp(mode, "open") == 0) {
+        uint8_t *pt = NULL;
+        size_t n = 0;
+        const char *pass = _sfield(fx, "passphrase");
+        const char *text = _sfield(fx, "text");
+        int rc = text != NULL ? at_backup_open_text(text, pass != NULL ? pass : "", &pt, &n)
+                              : at_backup_open_bytes(json_object_get(fx, "blob"),
+                                                     pass != NULL ? pass : "", &pt, &n);
+        if (_status_is(exp, "backup_status", _backup_status(rc), err, sizeof(err))) {
+            const char *want = _sfield(exp, "plaintext");
+            if (want != NULL && (pt == NULL || strlen(want) != n || memcmp(pt, want, n) != 0))
+                snprintf(err, sizeof(err), "plaintext differs");
+        }
+        free(pt);
+    } else if (strcmp(mode, "passphrase") == 0) {
+        const char *pass = _sfield(fx, "passphrase");
+        if (_status_is(exp, "passphrase_status",
+                       _backup_status(at_backup_check_passphrase(pass)), err, sizeof(err))) {
+            const char *want = _sfield(exp, "normalized");
+            char norm[512];
+            at_backup_normalize_passphrase(pass, norm, sizeof(norm));
+            if (want != NULL && strcmp(norm, want) != 0)
+                snprintf(err, sizeof(err), "normalized: got %.200s", norm);
+        }
+    } else if (strcmp(mode, "restore") == 0) {
+        contacts_t store;
+        json_t *sj = json_object_get(fx, "store");
+        if (sj != NULL)
+            contacts_from_json(sj, &store);
+        else
+            contacts_init(&store);
+        at_sync_change_t *ch = NULL;
+        size_t n = 0;
+        const char *own = _sfield(fx, "own_uuid");
+        int rc = at_backup_restore(&store, NULL, json_object_get(fx, "contents"), NULL,
+                                   own != NULL ? own : "", _dfield(fx, "now", 0.0), &ch, &n,
+                                   NULL, NULL);
+        json_t *changes = json_array();
+        for (size_t i = 0; i < n; i++)
+            json_array_append_new(changes, json_pack("[s, s]", ch[i].uuid,
+                                                     at_sync_action_str(ch[i].action)));
+        free(ch);
+        if (_status_is(exp, "backup_status", _backup_status(rc), err, sizeof(err)))
+            _check_book(&store, exp, changes, err, sizeof(err));
+        json_decref(changes);
+        contacts_free(&store);
+    } else {
+        FAILF("unknown backup mode %s", mode);
+    }
+    if (err[0] != '\0')
+        FAILF("backup: %s", err);
     at_case_result_set_pass(out, 0);
 }
 
@@ -935,6 +1056,8 @@ void at_contacts_run(const at_case_t *c, at_case_result_t *out)
         _op_sync(fx, exp, out);
     else if (strcmp(op, "siblings") == 0)
         _op_siblings(fx, exp, out);
+    else if (strcmp(op, "backup") == 0)
+        _op_backup(fx, exp, out);
     else {
         char detail[160];
         snprintf(detail, sizeof(detail), "unknown contacts op %s", op);

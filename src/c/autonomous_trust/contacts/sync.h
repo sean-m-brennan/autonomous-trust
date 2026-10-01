@@ -82,4 +82,11 @@ int at_sync_merge(contacts_t *store, const json_t *payload, double now,
                   const char *const *exclude, size_t n_exclude,
                   at_sync_change_t **changes_out, size_t *n_changes);
 
+/** at_sync_merge, a contact new here getting @p provenance instead of
+ *  AT_PROV_SIBLING (AT_PROV_BACKUP for a restore, contacts/backup.h). */
+int at_sync_merge_as(contacts_t *store, const json_t *payload, double now,
+                     const char *const *exclude, size_t n_exclude,
+                     at_provenance_t provenance,
+                     at_sync_change_t **changes_out, size_t *n_changes);
+
 #endif /* AT_CONTACTS_SYNC_H */

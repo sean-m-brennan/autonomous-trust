@@ -352,8 +352,9 @@ def handle_contacts_sync(proc, queues, message) -> bool:
     return True
 
 
-def _apply(proc, queues, store, before, changes) -> None:
-    """Give each synced change the effect the same local edit has."""
+def _apply(proc, queues, store, before, changes, origin=ORIGIN_SIBLING) -> None:
+    """Give each synced (or restored, identity/backup_contact.py) change the
+    effect the same local edit has; the app's events carry ``origin``."""
     fc = _fc()
     me = str(proc.identity.uuid)
     for uuid, action in changes:
@@ -365,11 +366,11 @@ def _apply(proc, queues, store, before, changes) -> None:
             # They know our sibling, not this device: say it is one of ours.
             _dc().announce(proc, queues, [contact])
             fc._emit(proc, queues, fc._contact_event(fc.EVENT_CONTACT, contact,
-                                                     origin=ORIGIN_SIBLING))
+                                                     origin=origin))
         elif action == 'updated':
             fc._emit(proc, queues, fc._contact_event(fc.EVENT_CONTACT,
                                                      store.contacts[uuid],
-                                                     origin=ORIGIN_SIBLING))
+                                                     origin=origin))
         elif action == 'removed' and uuid in before:
             gone = before[uuid]
             dropped = False
@@ -377,7 +378,7 @@ def _apply(proc, queues, store, before, changes) -> None:
                 dropped = fc._drop_direct_peer(proc, queues, ident.uuid) or dropped
             fc._emit(proc, queues, fc._contact_event(fc.EVENT_REMOVED, gone,
                                                      peer_dropped=dropped,
-                                                     origin=ORIGIN_SIBLING))
+                                                     origin=origin))
 
 
 # -- startup, reachability ------------------------------------------------------

@@ -426,6 +426,74 @@ are `AT_APP_EVENT_FC_SIBLING_PAIRED` (read with `at_first_contact_event()`) and
 `at_first_contact_contact_event()`); a synced change carries
 `origin == AT_FC_ORIGIN_SIBLING`.
 
+#### A lost device: the encrypted backup
+
+Pairing needs the old device in your hand. For the day it is gone, have the
+node seal your address book and sibling list into a file, under a passphrase,
+and keep that file anywhere you like:
+
+```python
+from autonomous_trust.core._python.identity.backup_contact import (
+    APP_BACKUP_EXPORT, APP_BACKUP_IMPORT)
+
+# Your passphrase (12 characters or more), or `'generate': True` for the node to make one.
+control_queue.put(AppRequest(APP_BACKUP_EXPORT, json.dumps(
+    {'ref': 'b', 'path': '/home/alice/alice.atbackup', 'passphrase': passphrase})))
+# On the replacement device, once it has its own device cert:
+control_queue.put(AppRequest(APP_BACKUP_IMPORT, json.dumps(
+    {'ref': 'r', 'path': '/media/usb/alice.atbackup', 'passphrase': passphrase})))
+```
+
+The node writes the file atomically, readable only by you (mode 0600), and
+never keeps the passphrase. The key is Argon2id over the passphrase (256 MiB,
+so expect about a second), and the file is XChaCha20-Poly1305. A generated
+passphrase is 24 characters in groups of four, shown once in the
+`backup_written` event; it can be typed back in lower case or with spaces.
+
+An import merges into the address book on this device. It never replaces it.
+The rules are those of a sibling's sync: the newer edit wins, a removal stays
+removed, and a verified contact stays verified, filed with provenance `backup`.
+Every contact that arrives is reached from this device and told that the
+device is yours, so a contact who verified you files the new device under your
+record, as long as it has a cert from your operator key. The app hears the
+usual `contact` / `removed` events with `origin == 'backup'`, then
+`backup_restored`. The siblings in the backup join this device's list when its
+cert names the same operator key. They have never met this device, though, so
+pair again with each one to resume syncing.
+
+| Request | Payload | Answer |
+|---|---|---|
+| `APP_BACKUP_EXPORT` | `{ref, path, passphrase}` or `{ref, path, generate: true}` | `BackupEvent` `backup_written` (`path`, `contacts`, `siblings`; `passphrase` when generated) |
+| `APP_BACKUP_IMPORT` | `{ref, path, passphrase}` | `contact` / `removed` events, then `backup_restored` (`added`, `updated`, `removed`, `siblings`, `contacts`) |
+
+Either one can answer `backup_refused` with a `reason`. `bad_request` means no
+absolute `path`, or not exactly one of `passphrase` / `generate`.
+`weak_passphrase` means fewer than 12 characters. `bad_passphrase` means the
+open failed, either a wrong passphrase or a file changed since it was made,
+and the two cannot be told apart. `malformed` means not a backup.
+`unsupported` means another version, or Argon2id settings outside what an
+open accepts. `io` means the file could not be written or read.
+
+The node never puts your **operator key** in a backup. If that key lived on
+the lost phone, contacts cannot link a replacement, so keep a copy of the key
+with `tools/backup.py`, the operator-side tool and the only thing that reads
+or writes the key:
+
+```sh
+tools/backup.py export --out alice.atbackup --with-operator-key   # the book, siblings and key
+tools/backup.py restore-key alice.atbackup    # on the replacement: the key back in the keystore
+tools/device_cert.py issue                    # the new device's cert
+tools/backup.py import alice.atbackup         # or APP_BACKUP_IMPORT with the node running
+```
+
+`restore-key` never replaces a different key already in the keystore, and
+`inspect` shows what a backup holds.
+
+From C: `at_app_backup_export` (a NULL passphrase asks for a generated one) and
+`at_app_backup_import`. The events are `AT_APP_EVENT_BACKUP_WRITTEN` /
+`_RESTORED` / `_REFUSED`, read with `at_first_contact_backup_event()`, and a
+restored change carries `origin == AT_FC_ORIGIN_BACKUP`.
+
 ## Override hooks
 
 Your integration logic lives in methods you override on your subclass. Each
