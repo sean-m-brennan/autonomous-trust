@@ -1,0 +1,28 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: backup-passphrase-eleven-is-weak
+description: Eleven characters are refused for a new backup.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: backup
+    mode: passphrase
+    passphrase: aaaaaaaaaaa
+steps:
+- id: 1
+  from: host
+  to: host
+  function: backup
+  description: 'trigger: backup passphrase'
+expected_state:
+  host:
+    passphrase_status: weak_passphrase
+    normalized: aaaaaaaaaaa

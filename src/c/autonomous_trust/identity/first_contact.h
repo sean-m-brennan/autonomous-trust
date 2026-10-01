@@ -108,6 +108,14 @@ typedef struct {
     at_app_area_t data;
 } fc_area_msg_t;
 
+/** The backup answers, a fifth app-bound type (kinds AT_APP_EVENT_BACKUP_*). */
+#define FIRST_CONTACT_BACKUP_EVENT ((message_type_t)(AT_MSG_TYPE_FC_MIN + 4))
+
+typedef struct {
+    int32_t kind;
+    at_app_backup_t data;
+} fc_backup_msg_t;
+
 /** Environment flag naming. The feature is opt-in; absent/empty means OFF.
  *  Mirrors Python first_contact._FLAG. */
 #define AT_FIRST_CONTACT_ENV "AT_FIRST_CONTACT"
