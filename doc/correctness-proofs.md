@@ -9,7 +9,7 @@ goals it attempts** (4 262 / 4 262) but only **53.6 % function coverage** (351 /
 655 functions verified, 304 skipped). All skips are deliberate and each one
 carries an in-script comment naming the blocker category and a `/* Frama-C:
 skipped, [category] reason */` comment at the definition. The skips are
-deliberate, categorised, and commented.
+deliberate, categorized, and commented.
 
 The remaining 304 skipped functions are not uniformly hard. They cluster into a
 small number of categorical blockers. This document records *why* pushing

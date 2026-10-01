@@ -35,7 +35,7 @@ drawers show compound-alpha. The map's sightlines diverge visibly.
 
 ## 2. The data the demo runs on
 
-A one-off offline pass builds the detection catalogue:
+A one-off offline pass builds the detection catalog:
 
 ```text
 $ python -m tools.naip_fetch                  # ~10 MB NAIP panorama
@@ -47,7 +47,7 @@ Outputs land under `examples/dod_mission/assets/`:
 
 * `video/naip_huntsville.jpg`: 4096×4096 px, 1 m/px, USDA-public
  domain aerial imagery of Huntsville, AL, centered on
- `(34.724448°N, -86.639802°W)` (the RQ-86 orbit centre + true target).
+ `(34.724448°N, -86.639802°W)` (the RQ-86 orbit center + true target).
 * `detections/catalogue.json`: 17 entries: the 6 hand-authored
  scenario-overlay objects (`compound-alpha`, `compound-bravo` decoy
  ~141 m NE, three sensor sites along the squad approach, two hacked,
@@ -58,14 +58,14 @@ Outputs land under `examples/dod_mission/assets/`:
 * `detections/overlay.json`: the hand-authored input
  (committed; everything else is regenerated on first run).
 
-![catalogue overlay on Huntsville panorama](_generated/sg2/catalogue_overlay.jpg)
+![catalog overlay on Huntsville panorama](_generated/sg2/catalogue_overlay.jpg)
 
 The red ring is `compound-alpha` (the MQ-800's true target). The orange ring is
 `compound-bravo` (the decoy the compromised MQ-800 reports instead). Magenta
 rings are hacked leave-behind sensors; cyan is the clean one. Lime at the bottom
 is the squad insertion zone. Yellow rectangles are YOLOv8-OBB finds: mostly
 suburbia-class false positives (the DOTA model wasn't tuned for Huntsville),
-kept in the catalogue because `DetectionSource` keys off `world_uid` and the six
+kept in the catalog because `DetectionSource` keys off `world_uid` and the six
 named scenario-overlay objects drive the trust story.
 
 ---
@@ -180,7 +180,7 @@ Live interactive version (requires a browser):
 
 | What | Where | Lines |
 |---|---|---|
-| Catalogue prep tools | `tools/naip_fetch.py`, `tools/detection_prep.py` | new files |
+| Catalog prep tools | `tools/naip_fetch.py`, `tools/detection_prep.py` | new files |
 | Hand-authored scenario overlay | `examples/dod_mission/assets/detections/overlay.json` | new file |
 | `DetectionSource` (per-peer emitter) | `examples/dod_mission/generators/detection.py` | new file |
 | `CompromisedDetectionSource` (MQ-800 swap) | `examples/dod_mission/compromise/contradictory_isr.py` | new section |
