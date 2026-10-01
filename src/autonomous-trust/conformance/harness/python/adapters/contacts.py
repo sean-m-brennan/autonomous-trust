@@ -94,6 +94,8 @@ class ContactsAdapter:
             self._sync(fx, expected)
         elif op == 'siblings':
             self._siblings(fx, expected)
+        elif op == 'backup':
+            self._backup(fx, expected)
         else:
             raise AssertionError('unknown contacts op %r' % op)
 
@@ -233,6 +235,11 @@ class ContactsAdapter:
                 break
         if 'sync_status' in expected:
             assert status == expected['sync_status'], status
+        self._check_book(store, changes, expected)
+
+    def _check_book(self, store, changes, expected):
+        """The book pins a sync or a restore shares: ``changes``,
+        ``contacts``, ``devices_of``, ``tombstones``, and a clean round trip."""
         if 'changes' in expected:
             assert changes == expected['changes'], changes
         for uuid, want in (expected.get('contacts') or {}).items():
@@ -256,6 +263,63 @@ class ContactsAdapter:
             assert store.tombstones == expected['tombstones'], store.tombstones
         again = Contacts.from_canonical(store.to_canonical())
         assert again.to_canonical() == store.to_canonical(), 'store round trip'
+
+    # -- recovery: the encrypted backup (Phase 4) -------------------------------
+    def _backup(self, fx, expected):
+        """``mode`` seal (``plaintext`` under ``passphrase``, ``ops``, ``mem``,
+        hex ``salt`` / ``nonce``: pins ``ct`` and ``ad``), open (``blob``
+        object or ``text``: pins ``plaintext``), passphrase (pins
+        ``normalized`` and ``passphrase_status``) or restore (``contents``
+        into ``store`` at ``now``, never taking ``own_uuid``: the book pins
+        as sync's). ``backup_status`` is 'ok' or the reason."""
+        from autonomous_trust.core._python.contacts import backup as _bk
+        mode = fx['mode']
+        status = 'ok'
+        if mode == 'seal':
+            try:
+                blob = _bk.seal_bytes(fx['plaintext'].encode('utf-8'), fx['passphrase'],
+                                      ops=int(fx['ops']), mem=int(fx['mem']),
+                                      salt=bytes.fromhex(fx['salt']),
+                                      nonce=bytes.fromhex(fx['nonce']))
+            except _bk.BackupError as err:
+                status, blob = err.reason, None
+            assert status == expected.get('backup_status', 'ok'), status
+            if 'ct' in expected:
+                assert blob['ct'] == expected['ct'], blob['ct']
+            if 'ad' in expected:
+                assert _bk.header_ad(blob['ops'], blob['mem'], blob['salt'],
+                                     blob['nonce']).decode() == expected['ad']
+        elif mode == 'open':
+            src = fx['text'] if 'text' in fx else fx['blob']
+            try:
+                pt = _bk.open_bytes(src, fx.get('passphrase', ''))
+            except _bk.BackupError as err:
+                status, pt = err.reason, None
+            assert status == expected.get('backup_status', 'ok'), status
+            if 'plaintext' in expected:
+                assert pt.decode('utf-8') == expected['plaintext'], pt
+        elif mode == 'passphrase':
+            try:
+                _bk.check_passphrase(fx['passphrase'])
+            except _bk.BackupError as err:
+                status = err.reason
+            assert status == expected.get('passphrase_status', 'ok'), status
+            if 'normalized' in expected:
+                got = _bk.normalize_passphrase(fx['passphrase'])
+                assert got == expected['normalized'], got
+        elif mode == 'restore':
+            store = Contacts.from_canonical(fx.get('store') or {})
+            changes = []
+            try:
+                changes = [[u, a] for u, a in _bk.restore(
+                    store, None, fx['contents'], own_uuid=fx.get('own_uuid', ''),
+                    now=float(fx['now']))[0]]
+            except _bk.BackupError as err:
+                status = err.reason
+            assert status == expected.get('backup_status', 'ok'), status
+            self._check_book(store, changes, expected)
+        else:
+            raise AssertionError('unknown backup mode %r' % mode)
 
     def _siblings(self, fx, expected):
         """``mode`` add: pair ``identity`` (cert ``cert``) given this node's

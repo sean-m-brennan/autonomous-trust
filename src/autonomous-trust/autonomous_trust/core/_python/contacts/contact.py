@@ -49,6 +49,7 @@ class Provenance(Enum):
     directory = 'directory'    # resolved via an (opt-in) directory -- Phase 3
     sibling = 'sibling'        # copied from another of this user's own devices (Phase 4)
     area = 'area'              # found at an (opt-in) area hub
+    backup = 'backup'          # restored from an encrypted backup (Phase 4)
 
 
 # The reputation edge a contact is seeded with the moment it becomes VERIFIED

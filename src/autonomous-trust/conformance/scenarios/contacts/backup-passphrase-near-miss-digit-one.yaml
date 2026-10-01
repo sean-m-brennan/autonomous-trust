@@ -1,0 +1,28 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: backup-passphrase-near-miss-digit-one
+description: 1 is not a base32 character, so this is an ordinary passphrase, taken as typed.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: backup
+    mode: passphrase
+    passphrase: abc1-efgh-jklm-npqr-stuv-wxyz
+steps:
+- id: 1
+  from: host
+  to: host
+  function: backup
+  description: 'trigger: backup passphrase'
+expected_state:
+  host:
+    passphrase_status: ok
+    normalized: abc1-efgh-jklm-npqr-stuv-wxyz

@@ -54,6 +54,7 @@
 #include "identity/directory_contact.h"
 #include "identity/area_contact.h"
 #include "identity/sibling_sync.h"
+#include "identity/backup_contact.h"
 #include "contacts/siblings.h"
 
 bool at_first_contact_enabled(void)
@@ -552,6 +553,7 @@ int at_first_contact_register(process_t *proc)
     at_device_contact_register(proc);
     /* One's own devices, paired and in sync (Phase 4). */
     at_sibling_sync_register(proc);
+    at_backup_contact_register(proc);
     /* Finding people nearby at an area hub. */
     at_area_contact_register(proc);
     return 0;

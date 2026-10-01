@@ -187,7 +187,8 @@ class ContactEvent(AppEvent):
     #: ``device_linked`` only: the further device filed under this contact.
     device_uuid: str = ''
     #: 'sibling' when the change came from another of our own devices
-    #: (identity/sibling_sync.py); '' for one made here.
+    #: (identity/sibling_sync.py), 'backup' from a restored backup
+    #: (identity/backup_contact.py); '' for one made here.
     origin: str = ''
 
 
@@ -328,6 +329,9 @@ def register(proc) -> None:
     device_contact.register(proc)
     from . import sibling_sync
     sibling_sync.register(proc)
+    # An encrypted backup of the address book, for a lost device.
+    from . import backup_contact
+    backup_contact.register(proc)
     # Finding people nearby at an area hub.
     from . import area_contact
     area_contact.register(proc)
@@ -571,8 +575,10 @@ def _app_verbs():
     from .directory_contact import APP_VERBS as dir_verbs
     from .sibling_sync import APP_VERBS as sibling_verbs
     from .area_contact import APP_VERBS as area_verbs
+    from .backup_contact import APP_VERBS as backup_verbs
     return (APP_INVITE, APP_INITIATE, APP_SAFETY_NUMBER, APP_VERIFY, APP_LIST,
-            APP_RENAME, APP_REMOVE) + dir_verbs + sibling_verbs + area_verbs
+            APP_RENAME, APP_REMOVE) + dir_verbs + sibling_verbs + area_verbs \
+        + backup_verbs
 
 
 def _periodic(proc, queues):

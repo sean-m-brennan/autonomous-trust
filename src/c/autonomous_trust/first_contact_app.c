@@ -155,6 +155,38 @@ const at_app_area_t *at_first_contact_area_event(const at_app_event_t *ev)
     return (const at_app_area_t *)(const void *)ev->data.payload;
 }
 
+AT_MSG_ASSERT_FITS(fc_backup_msg_t);
+
+static const at_msg_vtable_t first_contact_backup_event_vt = {
+    .name = "FIRST_CONTACT_BACKUP_EVENT", .size = sizeof(fc_backup_msg_t),
+    .app_bound = true };
+AT_MSG_TYPE_REGISTER(first_contact_backup_event, FIRST_CONTACT_BACKUP_EVENT,
+                     &first_contact_backup_event_vt)
+
+static bool _is_backup_kind(int32_t kind)
+{
+    return kind >= AT_APP_EVENT_BACKUP_WRITTEN && kind <= AT_APP_EVENT_BACKUP_REFUSED;
+}
+
+static int _decode_backup(const generic_msg_t *msg, at_app_event_t *ev)
+{
+    const fc_backup_msg_t *m = AT_MSG_EXT_CONST(msg, fc_backup_msg_t);
+    if (!_is_backup_kind(m->kind))
+        return -1;
+    ev->kind = m->kind;
+    memcpy(AT_APP_EVENT_EXT(ev, at_app_backup_t), &m->data, sizeof(m->data));
+    return 0;
+}
+AT_APP_EVENT_DECODER_REGISTER(first_contact_backup_event, FIRST_CONTACT_BACKUP_EVENT,
+                              _decode_backup)
+
+const at_app_backup_t *at_first_contact_backup_event(const at_app_event_t *ev)
+{
+    if (ev == NULL || !_is_backup_kind(ev->kind))
+        return NULL;
+    return (const at_app_backup_t *)(const void *)ev->data.payload;
+}
+
 void at_first_contact_app_link(void) {}
 
 const at_app_contact_t *at_first_contact_contact_event(const at_app_event_t *ev)
@@ -355,6 +387,46 @@ int at_app_sibling_remove(at_app_events_t *handle, const char *q_out,
         return -1;
     json_t *body = _book_body(handle, q_out, ref, peer);
     return body == NULL ? -1 : _send(q_out, AT_APP_SIBLING_REMOVE, body);
+}
+
+/* -- the backup -------------------------------------------------------------- */
+static json_t *_backup_body(at_app_events_t *handle, const char *q_out, const char *ref,
+                            const char *path)
+{
+    if (handle == NULL || !at_app_name_survives(q_out) || !_ref_fits(ref)
+        || path == NULL || strlen(path) >= AT_FC_PATH_LEN)
+        return NULL;
+    json_t *body = json_object();
+    if (body == NULL)
+        return NULL;
+    json_object_set_new(body, "ref", json_string(ref != NULL ? ref : ""));
+    json_object_set_new(body, "path", json_string(path));
+    return body;
+}
+
+int at_app_backup_export(at_app_events_t *handle, const char *q_out, const char *ref,
+                         const char *path, const char *passphrase)
+{
+    json_t *body = _backup_body(handle, q_out, ref, path);
+    if (body == NULL)
+        return -1;
+    if (passphrase != NULL)
+        json_object_set_new(body, "passphrase", json_string(passphrase));
+    else
+        json_object_set_new(body, "generate", json_true());
+    return _send(q_out, AT_APP_BACKUP_EXPORT, body);
+}
+
+int at_app_backup_import(at_app_events_t *handle, const char *q_out, const char *ref,
+                         const char *path, const char *passphrase)
+{
+    if (passphrase == NULL)
+        return -1;
+    json_t *body = _backup_body(handle, q_out, ref, path);
+    if (body == NULL)
+        return -1;
+    json_object_set_new(body, "passphrase", json_string(passphrase));
+    return _send(q_out, AT_APP_BACKUP_IMPORT, body);
 }
 
 /* -- the directory ---------------------------------------------------------- */
