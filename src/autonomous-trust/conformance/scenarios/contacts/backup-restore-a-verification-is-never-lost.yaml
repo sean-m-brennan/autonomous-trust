@@ -1,0 +1,79 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: backup-restore-a-verification-is-never-lost
+description: 'A newer local rename wins, and the verification the backup carries is folded in: restoring
+  cannot unverify, and never loses one.'
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: backup
+    mode: restore
+    now: 1800000000.0
+    store:
+      typename: contacts
+      version: 1
+      contacts:
+        eeeeeeee-0000-4000-8000-000000000001:
+          identity: &id001
+            typename: identity
+            uuid: eeeeeeee-0000-4000-8000-000000000001
+            address: ''
+            nickname: bob
+            signature:
+              hex_seed: d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737
+            encryptor:
+              hex_seed: '7777777777777777777777777777777777777777777777777777777777777777'
+          petname: Bob (new)
+          verified: false
+          provenance: token
+          trust_seed: 0.0
+          rendezvous: []
+          nonce: ''
+          added_at: 1000.0
+          verified_at: 0.0
+          updated_at: 3000.0
+    contents:
+      typename: at-backup-contents
+      v: 1
+      created_at: 1700000000.0
+      contacts:
+        v: 1
+        typename: at-contacts-sync
+        contacts:
+          eeeeeeee-0000-4000-8000-000000000001:
+            identity: *id001
+            petname: bob-pet
+            verified: true
+            provenance: in_person
+            trust_seed: 0.3
+            rendezvous: []
+            nonce: ''
+            added_at: 1000.0
+            verified_at: 1500.0
+        tombstones: {}
+steps:
+- id: 1
+  from: host
+  to: host
+  function: backup
+  description: 'trigger: backup restore'
+expected_state:
+  host:
+    backup_status: ok
+    changes:
+    - - eeeeeeee-0000-4000-8000-000000000001
+      - updated
+    contacts:
+      eeeeeeee-0000-4000-8000-000000000001:
+        petname: Bob (new)
+        verified: true
+        verified_at: 1500.0
+        provenance: token

@@ -34,6 +34,7 @@ from .invitation import (Invitation, create_invitation, redeem_invitation,
 from .device import (Device, DeviceCert, InvalidDevice, create_device_cert,
                      adopt_operator, link_device)
 from .siblings import Siblings
+from . import backup
 from . import sync
 
 __all__ = [
@@ -44,5 +45,5 @@ __all__ = [
     'InvalidInvitation', 'SafetyNumberMismatch',
     'Device', 'DeviceCert', 'InvalidDevice', 'create_device_cert',
     'adopt_operator', 'link_device',
-    'Siblings', 'sync',
+    'Siblings', 'sync', 'backup',
 ]

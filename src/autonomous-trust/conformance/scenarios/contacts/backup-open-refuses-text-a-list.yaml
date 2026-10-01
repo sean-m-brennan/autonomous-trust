@@ -1,0 +1,28 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: backup-open-refuses-text-a-list
+description: A JSON list is not a backup.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: backup
+    mode: open
+    text: '[]'
+    passphrase: correct horse battery staple
+steps:
+- id: 1
+  from: host
+  to: host
+  function: backup
+  description: 'trigger: backup open'
+expected_state:
+  host:
+    backup_status: malformed

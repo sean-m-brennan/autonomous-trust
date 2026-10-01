@@ -74,6 +74,7 @@ typedef enum {
     AT_PROV_DIRECTORY = 2,   /* resolved via an opt-in directory (Phase 3) */
     AT_PROV_SIBLING = 3,     /* copied from another of this user's own devices (Phase 4) */
     AT_PROV_AREA = 4,        /* found at an (opt-in) area hub */
+    AT_PROV_BACKUP = 5,      /* restored from an encrypted backup (Phase 4) */
 } at_provenance_t;
 
 const char *at_provenance_str(at_provenance_t p);

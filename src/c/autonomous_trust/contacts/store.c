@@ -348,6 +348,8 @@ static at_provenance_t _provenance_from_str(const char *s)
         return AT_PROV_SIBLING;
     if (s != NULL && strcmp(s, "area") == 0)
         return AT_PROV_AREA;
+    if (s != NULL && strcmp(s, "backup") == 0)
+        return AT_PROV_BACKUP;
     return AT_PROV_TOKEN;
 }
 

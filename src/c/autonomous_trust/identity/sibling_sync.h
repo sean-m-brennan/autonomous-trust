@@ -44,6 +44,7 @@
 
 #include "at_first_contact.h"
 #include "contacts/reach.h"
+#include "contacts/sync.h"
 #include "identity/identity.h"
 #include "processes/processes.h"
 #include "utilities/msg_types.h"
@@ -95,6 +96,15 @@ bool at_sibling_apply_record(const process_t *proc, const at_reach_record_t *rec
 /** Whether @p uuid (lower case) is in siblings.cfg.json, re-read only when
  *  the file changes. For the tier cap. */
 bool at_sibling_is(const char *uuid);
+
+/** Give each change @p ch (from at_sync_merge on @p store; @p before is the
+ *  book as it was) the effect the same local edit has: an added contact is
+ *  admitted, routed and told about this device, a removed one's peers are
+ *  dropped, and the app hears CONTACT / REMOVED with @p origin
+ *  (AT_FC_ORIGIN_SIBLING, or AT_FC_ORIGIN_BACKUP for a restore). */
+void at_sibling_apply_changes(const process_t *proc, directory_t *queues,
+                              contacts_t *store, contacts_t *before,
+                              const at_sync_change_t *ch, size_t n, int32_t origin);
 
 bool handle_contacts_sync(const process_t *proc, directory_t *queues, generic_msg_t *msg);
 bool handle_app_sibling_list(const process_t *proc, directory_t *queues, generic_msg_t *msg);

@@ -1,0 +1,35 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: '1'
+kind: scenario
+protocol: contacts
+name: backup-seal-vector-pinned
+description: A fixed salt, nonce and passphrase give one ciphertext, and every header field is in the
+  associated data, in a fixed order.
+byte_pinning: false
+participants:
+- id: host
+  role: recipient
+fixtures:
+  contacts:
+    op: backup
+    mode: seal
+    plaintext: at backup vector
+    passphrase: correct horse battery staple
+    ops: 1
+    mem: 8192
+    salt: 000102030405060708090a0b0c0d0e0f
+    nonce: 101112131415161718191a1b1c1d1e1f2021222324252627
+steps:
+- id: 1
+  from: host
+  to: host
+  function: backup
+  description: 'trigger: backup seal'
+expected_state:
+  host:
+    backup_status: ok
+    ct: 4l6LixkmgAPxRgX5dYgekx/XCaGKa/K6vivH8Albd3g=
+    ad: at-backup-v1|argon2id13|1|8192|000102030405060708090a0b0c0d0e0f|xchacha20poly1305-ietf|101112131415161718191a1b1c1d1e1f2021222324252627
