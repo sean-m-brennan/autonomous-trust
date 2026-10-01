@@ -57,6 +57,9 @@ void at_fc_push_own_record(const process_t *proc, const public_identity_t *only)
 /** The DEVICE_LINKED contact event: @p device filed under @p c. */
 void at_fc_emit_device_linked(const process_t *proc, const contact_t *c,
                               const uuid_t device);
+/** The same, answering the app request tagged @p ref (an address-book list). */
+void at_fc_emit_device_linked_ref(const process_t *proc, const char *ref,
+                                  const contact_t *c, const uuid_t device);
 /** Tell the network to reach @p uuid through @p hints (relay:// hints). */
 void at_fc_send_route_hints(const uuid_t uuid, const char *const *hints, size_t n);
 /** A first-contact event (at_app_first_contact_t payload). */

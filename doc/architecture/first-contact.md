@@ -712,7 +712,11 @@ handshake each side pushes its cert to the other, sealed, as `device_cert`,
 which is how Bob's record of Alice learns her operator key. A new device then
 sends a plaintext `device_announce` to every contact when it starts. Bob files
 it under Alice's record if the rules above allow, and his app gets a
-`device_linked` event; a refusal is silent, and nothing is sent back.
+`device_linked` event; a refusal is silent, and nothing is sent back. A list
+repeats these: each record's `contact` event is followed by one
+`device_linked` per further device it lists, on the list's ref. That way an
+app can rebuild which devices are one person after a restart, a sibling sync
+or a restore. None of those three says so live.
 
 ### Your own devices, one address book
 

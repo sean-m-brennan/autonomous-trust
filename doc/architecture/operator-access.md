@@ -74,17 +74,22 @@ makes every screen testable headless.
 
 Two distributions carry it:
 
-- **`core/_python/operator/`.** The node-side core (activation, session, DDIL
- posture, resource directory, `OperatorNode`). Imports as
- `autonomous_trust.core.operator`. No UI dependency.
-- **`src/autonomous-trust-operator/`.** The Textual TUI (`autonomous_trust.
- operator`): app, screens, node bridge. Depends on the core but not vice-versa.
+- **`autonomous_trust.operator.node`.** The node-side core (activation,
+ session, DDIL posture, resource directory, `OperatorNode`). No UI dependency.
+- **`autonomous_trust.operator`.** The Textual TUI: app, screens, node bridge.
+
+Both are in `src/autonomous-trust-operator/`, with PIV (`autonomous_trust.
+operator.piv`), and the distribution depends on the core and on ZTA
+(`src/autonomous-trust-zta/`), never the reverse (FEATURE_SPLIT_PLAN Phase 6).
+The core keeps the operator keystore (`identity/operator_keystore.py`), which
+first contact's device certs use without PIV, and asks a live session whether
+it is attended through the session's own `is_attended()`.
 
 ---
 
 ## 3. PIV verifier and the challenge-response
 
-The `identity/zta/piv/` package holds two modules.
+The `autonomous_trust.operator.piv` package holds two modules.
 
 - **`pkcs11.py`.** `PivToken` ABC with two implementations, `PyKcs11Token`
  (lazy `PyKCS11`, PIV auth slot 9A, `CKA_ID` `0x01`, EC raw→DER signature
@@ -126,7 +131,7 @@ rotating the second factor is not a new identity). See [ZTA Integration
 
 ## 4. MFA chain
 
-`identity/zta/mfa.py` supplies `MfaChain(Verifier)` with `CombinePolicy.AND`,
+ZTA's `autonomous_trust.zta.mfa` supplies `MfaChain(Verifier)` with `CombinePolicy.AND`,
 and the chain is what an operator actually authenticates against.
 
 - **AND semantics.** All factors must be `VERIFIED`, the first
@@ -142,7 +147,7 @@ and the chain is what an operator actually authenticates against.
  **primary** (first) factor, so identity binding is stable regardless of
  second-factor rotation. `check_revocation` likewise delegates to the primary factor.
 
-The second factor is **TOTP** by default (`identity/zta/totp.py`, `pyotp`, RFC
+The second factor is **TOTP** by default (`autonomous_trust.zta.totp`, `pyotp`, RFC
 6238), which is DDIL-friendly (no IdP round-trip) and independent of the PIV
 IdP. OIDC and FIDO2 are configured alternatives and future work.
 
@@ -169,10 +174,10 @@ local node.
  `load_totp_secret` persist the TOTP secret in the TOTP factor of the policy.
 
 The CLI dev path is `--software-cert` / `--software-key`, which activate via
-`SoftwareToken` with no card. **Note.** `python -m
-autonomous_trust.core.operator` fails, because the loader in the backend
-redirector has no `get_code` for runpy. Use the concrete
-`autonomous_trust.core._python.operator` for `-m`.
+`SoftwareToken` with no card: `python -m autonomous_trust.operator.node`.
+The PIV factor reaches ZTA's MFA chain through ZTA's factor registry, which
+this distribution's `_at_extension.py` fills; a policy naming `piv` on a node
+without it refuses to load.
 
 ---
 

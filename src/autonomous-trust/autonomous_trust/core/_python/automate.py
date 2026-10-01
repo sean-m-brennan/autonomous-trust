@@ -314,8 +314,13 @@ class AutonomousTrust(Protocol):
         oracles.check_env(self._logger)
         # Features' own declarations ($AT_OWN_* for social) get the same
         # treatment, and the node says which features it has.
-        from .extensions import all_extensions, check_env as extensions_check_env
+        from .extensions import (all_extensions, check_env as extensions_check_env,
+                                 check_config as extensions_check_config)
         extensions_check_env(self._logger)
+        # And configuration only a feature acts on: a zta_policy that turns ZTA
+        # on with no ZTA extension, or one ZTA cannot honour (FEATURE_SPLIT_PLAN
+        # Phase 6). Both refuse the start rather than run with ZTA silently off.
+        extensions_check_config(logger=self._logger)
         self._logger.info('Extensions: %s',
                           ', '.join(ext.name for ext in all_extensions()) or 'none')
         self.identity = None  # of type Identity (can't import)
@@ -676,7 +681,8 @@ class AutonomousTrust(Protocol):
     def _operator_attended(self):
         """Current attended state as ``(attended, epoch, have_session)``.
 
-        Attended is decided by :func:`operator.session.is_attended` — the one
+        Attended is decided by the session's own ``is_attended()``
+        (autonomous_trust.operator.node.session) — the one
         definition, shared with IdentityProcess so the two processes cannot
         drift apart. No session (a drone, or a node with no console attached) is
         honestly reported as have_session=False, which the puller reads as
@@ -685,8 +691,8 @@ class AutonomousTrust(Protocol):
         if session is None:
             return False, 0.0, False
         try:
-            from .operator.session import is_attended  # operator pkg is optional
-            return bool(is_attended(session)), time.time(), True
+            # The session is the operator distribution's; it knows the rule.
+            return bool(session.is_attended()), time.time(), True
         except Exception:
             # Never let a session read break the loop; unknown reads as absent.
             self.logger.debug('operator session poll failed', exc_info=True)

@@ -45,6 +45,9 @@
  */
 
 #include <stdbool.h>
+#include <stdint.h>
+
+#include <sodium.h>
 
 #include "identity/identity.h"
 #include "processes/processes.h"
@@ -52,6 +55,15 @@
 
 /** Most identity extensions. */
 #define IDENTITY_EXT_MAX 4
+
+/** An admission gate's verdict. Ordered: the dispatcher returns the most
+ *  restrictive any extension gives. */
+typedef enum {
+    IDENTITY_EXT_ADMIT = 0,
+    /** Admitted, but unproved: the extension has published a ceiling. */
+    IDENTITY_EXT_ADMIT_CAPPED = 1,
+    IDENTITY_EXT_REJECT = 2,
+} identity_ext_gate_t;
 
 /** One feature's view of the identity process. */
 typedef struct {
@@ -90,6 +102,30 @@ typedef struct {
     /** Whether we blocked @p uuid_str (lower-case): PEER_OBSERVED's blocked,
      *  and a blocked peer's tier reads 0 (identity_get_peer_tier). */
     bool (*peer_blocked)(const char *uuid_str);
+
+    /* An admission authority (ZTA, FEATURE_SPLIT_PLAN Phase 6). Each is
+     * phrased so that NULL, and no extension at all, is a node with no such
+     * authority: everyone admitted, nothing refused, nothing proved. */
+
+    /** The welcoming committee is about to vote on @p peer, which claimed the
+     *  operator key @p claimed_key (zeroed on @p peer itself, to be re-earned
+     *  here). May write what it proves onto @p peer (anchors, a verified
+     *  operator key). Publishes any standing it decides itself. */
+    identity_ext_gate_t (*admission_gate)(const process_t *proc, public_identity_t *peer,
+                                          const uint8_t claimed_key[crypto_sign_PUBLICKEYBYTES]);
+    /** Whether a join request from @p new_id must be refused before the vote
+     *  (e.g. it proved no anchor we share). */
+    bool (*join_refused)(const process_t *proc, const public_identity_t *new_id);
+    /** Whether we must not federate through the member @p uuid_str
+     *  (lower-case): as a child gateway, a parent, or a hierarchy claimant. */
+    bool (*gateway_refused)(const process_t *proc, const char *uuid_str);
+    /** Whether @p claim carries an operator-class credential (an attestation
+     *  re-verify). */
+    bool (*operator_credential)(const process_t *proc, const public_identity_t *claim);
+    /** Whether the credential @p carried presents chains to an anchor we
+     *  accept. Asked by REPUTATION about a co-signer it has never admitted, so
+     *  @p proc is the reputation process. */
+    bool (*credential_anchored)(const process_t *proc, const public_identity_t *carried);
 } identity_ext_t;
 
 /** Register @p ext (static storage). @return 0; -1 NULL/unnamed/duplicate;
@@ -106,6 +142,14 @@ bool identity_ext_present(const char *name);
  *  ERROR naming the library. @return 0 or -1. */
 int identity_ext_check_env(logger_t *logger);
 
+/** Refuse a node whose configuration turns on a feature this binary lacks: a
+ *  zta_policy.cfg.json in @p cfg_dir (NULL: the node's cfg dir) with
+ *  "enabled": true and no "zta" extension (libat_zta). Without the library the
+ *  section is unregistered, so the file would be skipped as unknown and the
+ *  node would start enforcing nothing. Logs an ERROR naming the file and the
+ *  library. @return 0 or -1. */
+int identity_ext_check_config(const char *cfg_dir, logger_t *logger);
+
 /* Dispatchers, called by id_proc.c only, each with no lock held. */
 void identity_ext_init(void);
 void identity_ext_reset(void);
@@ -117,6 +161,14 @@ void identity_ext_periodic_resync(const process_t *proc);
 bool identity_ext_roster_replay(const process_t *proc, int n_observed);
 bool identity_ext_peer_in_group(const process_t *proc, const char *uuid_str);
 bool identity_ext_peer_blocked(const char *uuid_str);
+/* The admission-authority dispatchers (each with no lock held). A REJECT
+ * stops at the first extension that gives it. */
+identity_ext_gate_t identity_ext_admission_gate(const process_t *proc, public_identity_t *peer,
+                                                const uint8_t claimed_key[crypto_sign_PUBLICKEYBYTES]);
+bool identity_ext_join_refused(const process_t *proc, const public_identity_t *new_id);
+bool identity_ext_gateway_refused(const process_t *proc, const char *uuid_str);
+bool identity_ext_operator_credential(const process_t *proc, const public_identity_t *claim);
+bool identity_ext_credential_anchored(const process_t *proc, const public_identity_t *carried);
 
 /** Register @p ext at load time. */
 #define IDENTITY_EXT_REGISTER(tag, ext)                                        \

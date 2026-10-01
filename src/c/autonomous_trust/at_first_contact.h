@@ -474,7 +474,8 @@ int at_app_first_contact_verify(at_app_events_t *handle, const char *q_out,
                                 const char *presented, bool confirmed);
 
 /** @brief Ask for the whole address book: one CONTACT event per record, oldest
- *  first, then CONTACTS_DONE with the count (so an empty book still answers). */
+ *  first, each followed by one DEVICE_LINKED per further device it lists, then
+ *  CONTACTS_DONE with the count of records (so an empty book still answers). */
 int at_app_first_contact_list(at_app_events_t *handle, const char *q_out,
                               const char *ref);
 

@@ -51,8 +51,8 @@
 #include "autonomous_trust.h"
 
 #ifdef AT_ZTA_ENABLED
-#include "autonomous_trust/zta/zta_policy.h"
-#include "autonomous_trust/zta/zta_verifier.h"
+#include "zta/zta_policy.h"
+#include "zta/zta_verifier.h"
 #endif
 
 /* ------------------------------------------------------------------ */

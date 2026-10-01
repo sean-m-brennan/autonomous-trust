@@ -254,7 +254,6 @@ int zta_binding_preimage(const public_identity_t *ident,
     return 0;
 }
 
-#ifdef AT_ZTA_ENABLED
 void public_identity_zta_credentials_clear(public_identity_t *ident)
 {
     if (ident == NULL)
@@ -353,7 +352,6 @@ bool public_identity_has_zta_anchor(const public_identity_t *ident,
             return true;
     return false;
 }
-#endif /* AT_ZTA_ENABLED */
 
 int identity_sign(const identity_t *ident, const msg_str_t *in, msg_str_t *out)
 {
@@ -447,7 +445,6 @@ int public_identity_to_json(const public_identity_t *p, json_t **obj_ptr)
         json_object_set_new(obj, "operator_key_binding", json_string(bb64));
         free(bb64);
     }
-#ifdef AT_ZTA_ENABLED
     if (p->zta_issuer[0] != '\0')
         json_object_set_new(obj, "zta_issuer", json_string(p->zta_issuer));
     if (p->zta_credential_len > 0 && p->zta_credential != NULL) {
@@ -465,7 +462,6 @@ int public_identity_to_json(const public_identity_t *p, json_t **obj_ptr)
         json_object_set_new(obj, "zta_credential", json_string(cb64));
         free(cb64);
     }
-#endif
     return 0;
 }
 
@@ -530,7 +526,6 @@ int public_identity_from_json(const json_t *obj, public_identity_t *p)
             }
         }
     }
-#ifdef AT_ZTA_ENABLED
     const char *iss = json_string_value(json_object_get(obj, "zta_issuer"));
     if (iss != NULL)
         snprintf(p->zta_issuer, sizeof(p->zta_issuer), "%s", iss);
@@ -549,7 +544,6 @@ int public_identity_from_json(const json_t *obj, public_identity_t *p)
             }
         }
     }
-#endif
     return 0;
 }
 
@@ -719,7 +713,6 @@ int public_identity_sync_out(public_identity_t *identity, AutonomousTrust__Core_
         proto->operator_key_binding.len = identity->operator_key_binding_len;
     }
 
-#ifdef AT_ZTA_ENABLED
     if (identity->zta_credential_len > 0 && identity->zta_credential != NULL) {
         proto->zta_credential_hash.data = identity->zta_credential_hash;
         proto->zta_credential_hash.len = sizeof(identity->zta_credential_hash);
@@ -762,7 +755,6 @@ int public_identity_sync_out(public_identity_t *identity, AutonomousTrust__Core_
             }
         }
     }
-#endif
 
     return 0;
 }
@@ -814,7 +806,6 @@ int public_identity_sync_in(AutonomousTrust__Core__Protobuf__Identity__Identity 
         }
     }
 
-#ifdef AT_ZTA_ENABLED
     memset(identity->zta_credential_hash, 0, sizeof(identity->zta_credential_hash));
     identity->zta_issuer[0] = '\0';
     identity->zta_credential = NULL;
@@ -876,7 +867,6 @@ int public_identity_sync_in(AutonomousTrust__Core__Protobuf__Identity__Identity 
        a fresh deserialization has proved nothing yet. */
     memset(identity->zta_anchors, 0, sizeof(identity->zta_anchors));
     identity->num_zta_anchors = 0;
-#endif
 
     return 0;
 }
@@ -885,7 +875,6 @@ void public_identity_proto_free(AutonomousTrust__Core__Protobuf__Identity__Ident
 {
     free(proto->signature);
     free(proto->encryptor);
-#ifdef AT_ZTA_ENABLED
     /* Only the wrappers sync_out allocated; their `der`/`binding` point into the
        identity and are not ours to free. */
     for (size_t i = 0; i < proto->n_zta_credentials; i++)
@@ -893,7 +882,6 @@ void public_identity_proto_free(AutonomousTrust__Core__Protobuf__Identity__Ident
     free(proto->zta_credentials);
     proto->zta_credentials = NULL;
     proto->n_zta_credentials = 0;
-#endif
 }
 
 int peer_to_proto(public_identity_t *msg, void **data_ptr, size_t *data_len_ptr)

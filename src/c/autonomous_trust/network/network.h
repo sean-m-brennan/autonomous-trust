@@ -435,9 +435,9 @@ int network_from_json(const json_t *obj, void *data_struct);
 
 #include "utilities/exception.h"
 
-#define ENET_INVALID_MASK 220
+#define ENET_INVALID_MASK 234   /* was 220, which EDAG_INVALID_BRANCH holds */
 DECLARE_ERROR(ENET_INVALID_MASK, "CIDR prefix length exceeds maximum for address family");
-#define ENET_ADDR_TOO_LONG 221
+#define ENET_ADDR_TOO_LONG 235  /* was 221, which EDAG_BRANCH_EXISTS holds */
 DECLARE_ERROR(ENET_ADDR_TOO_LONG, "CIDR address or prefix does not fit the caller's buffer");
 
 

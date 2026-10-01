@@ -33,7 +33,7 @@ from autonomous_trust.core._python.config.configuration import Configuration, at
 from autonomous_trust.core._python.contacts import device as dv
 from autonomous_trust.core._python.identity import device_contact
 from autonomous_trust.core._python.network import relay_seeds
-from autonomous_trust.core._python.operator.activate import load_or_create_operator_key
+from autonomous_trust.core._python.identity.operator_keystore import load_or_create_operator_key
 
 
 def _this_node():

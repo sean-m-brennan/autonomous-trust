@@ -25,7 +25,7 @@ import tempfile
 
 from textual.widgets import Static, TabbedContent
 
-from autonomous_trust.core.identity.zta.piv.pkcs11 import TokenProbe
+from autonomous_trust.operator.piv.pkcs11 import TokenProbe
 from autonomous_trust.operator import __main__ as entry
 from autonomous_trust.operator.app import (ACTIVATION_SETUP_HINT,
                                            ACTIVATION_SETUP_SHORT, OperatorApp)
@@ -408,7 +408,7 @@ class TestActivationHint:
 class TestEntryPointWiring:
     def test_no_args_wires_live_probe(self, monkeypatch):
         # A card in the reader must read as present, driven by the live probe.
-        import autonomous_trust.core.identity.zta.piv.pkcs11 as pk
+        import autonomous_trust.operator.piv.pkcs11 as pk
         monkeypatch.setattr(
             pk, 'probe_token',
             lambda *a, **kw: TokenProbe(True, '/usr/lib/opensc-pkcs11.so', 'slot 0'))
@@ -416,7 +416,7 @@ class TestEntryPointWiring:
         assert app.token_status() == (True, 'slot 0')
 
     def test_no_args_reports_empty_reader(self, monkeypatch):
-        import autonomous_trust.core.identity.zta.piv.pkcs11 as pk
+        import autonomous_trust.operator.piv.pkcs11 as pk
         monkeypatch.setattr(
             pk, 'probe_token',
             lambda *a, **kw: TokenProbe(False, '/m.so', 'module loaded, no card'))
@@ -433,7 +433,7 @@ class TestEntryPointWiring:
     def test_probe_is_lazy_not_called_at_build(self, monkeypatch):
         # building the app must not touch PKCS#11 (headless/CI safety); the probe
         # runs when the view mounts
-        import autonomous_trust.core.identity.zta.piv.pkcs11 as pk
+        import autonomous_trust.operator.piv.pkcs11 as pk
         calls = []
 
         def counting(*a, **kw):

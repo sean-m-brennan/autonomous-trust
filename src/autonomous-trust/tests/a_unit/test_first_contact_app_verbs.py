@@ -463,6 +463,42 @@ def test_list_sends_every_record_oldest_first_then_the_count(alice, bob):
     assert events[2].count == 2
 
 
+def test_list_names_each_further_device_after_its_record(alice, bob):
+    """A record listing further devices is followed by one ``device_linked``
+    per device, on the list's ref, so an app can rebuild which devices are
+    one person after a restart, a sibling sync or a restore. The count stays
+    the number of records."""
+    from nacl.signing import SigningKey
+    from autonomous_trust.core.contacts import (create_device_cert,
+                                                adopt_operator, link_device)
+    from autonomous_trust.core.identity.device_contact import EVENT_DEVICE_LINKED
+    operator = SigningKey.generate()
+    laptop = Identity.initialize('bob-laptop@ex', 'bob-laptop@ex', '10.0.0.4')
+    tablet = Identity.initialize('bob-tablet@ex', 'bob-tablet@ex', '10.0.0.5')
+    carol = Identity.initialize('carol@ex', 'carol@ex', '10.0.0.3')
+    proc = StubProc(alice)
+    store = fc._contacts_store(proc)
+    rec = Contact(bob.publish(), petname='Bob', added_at=100.0).mark_verified()
+    assert adopt_operator(rec, create_device_cert(operator, bob), store) == ''
+    store.add(rec)
+    for dev in (laptop, tablet):
+        _c, why = link_device(store, dev.publish(),
+                              create_device_cert(operator, dev.publish()))
+        assert why == ''
+    store.add(Contact(carol.publish(), petname='Carol', added_at=200.0))
+    store.save()
+    _q, events = _book(proc, fc.APP_LIST, {'ref': 'l'})
+    assert [e.kind for e in events] == [fc.EVENT_CONTACT, EVENT_DEVICE_LINKED,
+                                        EVENT_DEVICE_LINKED, fc.EVENT_CONTACT,
+                                        fc.EVENT_CONTACTS_DONE]
+    assert [e.ref for e in events] == ['l'] * 5
+    assert [e.peer_uuid for e in events[:3]] == [str(bob.uuid)] * 3
+    assert [e.device_uuid for e in events[1:3]] == [str(laptop.uuid),
+                                                   str(tablet.uuid)]
+    assert events[1].verified is True and events[1].petname == 'Bob'
+    assert events[3].peer_uuid == str(carol.uuid)
+    assert events[4].count == 2
+
 def test_rename(alice, bob):
     proc = StubProc(alice)
     peer = _know(proc, bob)

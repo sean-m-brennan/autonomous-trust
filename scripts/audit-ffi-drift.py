@@ -34,7 +34,7 @@
 # (`uint32_t` -> `uint64_t` keeps every name), because it deliberately does not
 # compile anything. `--abi` does exactly that instead: it generates a probe from
 # the same struct list, compiles it against the real headers
-# (`-DAT_ZTA_ENABLED -fms-extensions`), and diffs `sizeof`/`offsetof` against
+# (`-fms-extensions`, no feature macros), and diffs `sizeof`/`offsetof` against
 # `ffi.sizeof`/`ffi.offsetof` -- localizing a size difference to the first field
 # whose offset disagrees. It needs a compiler, cffi and the generated
 # `*.pb-c.h`, so it stays opt-in and reports plainly when it cannot run rather
@@ -46,11 +46,12 @@
 #     -fms-extensions, see the header note in identity.h); the cdef flattens it
 #     to `bool alloc; size_t refs;`. Both sides are therefore flattened through
 #     the typedef map before comparison, so the spellings converge.
-#   * CONDITIONAL FIELDS. C wraps the ZTA fields in `#ifdef AT_ZTA_ENABLED`
-#     while the cdef lists them unconditionally -- correctly, since the native
-#     lib is built AT_ZTA=ON. Conditionals are resolved against DEFINED below
-#     rather than diffed as text, and any OTHER macro met inside a mirrored
-#     struct is reported as a warning instead of being silently assumed off.
+#   * CONDITIONAL FIELDS. A mirrored struct may not depend on a build flag.
+#     The ZTA fields of public_identity_t were the last ones that did, and have
+#     been unconditional since FEATURE_SPLIT_PLAN Phase 6 (D3). Conditionals are
+#     still resolved against DEFINED below (now empty) rather than diffed as
+#     text, so a macro that reappears inside a mirrored struct is reported as a
+#     warning instead of being silently assumed off.
 #
 # Authoritative source is the C *header* prototype (`...name(args);`); if a
 # name has no header prototype we fall back to its `.c` definition
@@ -153,11 +154,12 @@ def parse_cdef():
 # --- struct field-name mirroring (doc/architecture/native-ffi-dual-implementation.md)
 # ----------------------------
 
-#: Macros the native library IS built with, so fields they guard are part of the
-#: ABI the cdef must mirror. `build-native.sh` passes -DAT_ZTA=ON, which defines
-#: AT_ZTA_ENABLED. Anything NOT listed here is treated as undefined -- and, when
-#: it guards part of a mirrored struct, reported rather than assumed.
-DEFINED = ('AT_ZTA_ENABLED',)
+#: Macros whose guarded fields are part of the ABI the cdef must mirror. Empty:
+#: no mirrored struct depends on a build flag any more (the ZTA fields went
+#: unconditional in FEATURE_SPLIT_PLAN Phase 6, D3), so the cdef matches every
+#: build of the library. Anything met inside a mirrored struct is treated as
+#: undefined and reported rather than assumed.
+DEFINED = ()
 
 #: Field spellings that differ between C and the cdef ON PURPOSE, per struct, as
 #: {struct: {cdef_name: c_name}}. Both sides are ABI-identical here -- same type,
@@ -542,7 +544,9 @@ def measure_c(names, sources, fields=None, cc=None):
         src = os.path.join(tmp, "probe.c")
         exe = os.path.join(tmp, "probe")
         open(src, "w").write("\n".join(lines) + "\n")
-        cmd = [cc, "-fms-extensions", "-DAT_ZTA_ENABLED", "-w",
+        # No -DAT_ZTA_ENABLED: since D3 the layout must not need it, and probing
+        # without it is what proves that.
+        cmd = [cc, "-fms-extensions", "-w",
                "-I", os.path.join(REPO, "src/c"),
                "-I", os.path.join(REPO, "src/c/autonomous_trust"),
                "-I", os.path.join(REPO, pb_dir),

@@ -153,9 +153,7 @@ typedef struct
 #define ZTA_MAX_ANCHORS 8u
 #define ZTA_ANCHOR_NAME_LEN 64
 
-/* One credential a peer presents, mirroring proto `ZtaCredential`. Declared
- * unconditionally (a typedef costs nothing) even though only an AT_ZTA build has
- * a field of this type, so a header consumer sees one shape either way. */
+/* One credential a peer presents, mirroring proto `ZtaCredential`. */
 typedef struct
 {
     uint8_t *der;          /**< raw credential, heap-allocated; NULL = empty slot */
@@ -176,9 +174,9 @@ typedef struct
     signature_t signature;
     encryptor_t encryptor;
     /* Operator-attended signal (proto fields 12-13; parity with Python
-       Identity). Kept OUTSIDE the AT_ZTA_ENABLED guard so the fields always
-       exist and default false/0 even in non-ZTA builds (mirrors from_rank);
-       only the operator-class VERIFICATION is ZTA-gated. Advertises whether a
+       Identity). The fields always exist and default false/0 in a build
+       without ZTA (mirrors from_rank); only the operator-class VERIFICATION is
+       ZTA's. Advertises whether a
        node has a human behind it (ethne guardian edge, D8/Q9). operator_bound
        is durable ("has a human guardian", authoritative only after the receiver
        verifies the operator credential); operator_attended_at is a live
@@ -201,9 +199,9 @@ typedef struct
        identically, and serializes byte-for-byte as it does today (both fields
        are emitted only when non-default). Requiring one is a consumer's rule.
 
-       Outside the AT_ZTA_ENABLED guard, like operator_bound: the fields — and
-       therefore the app-facing carrier's ABI — must not depend on a build flag.
-       Only VERIFICATION is ZTA-gated.
+       Unconditional, like operator_bound: the fields — and therefore the
+       app-facing carrier's ABI — must not depend on a build flag. Only
+       VERIFICATION is ZTA's.
 
        There is deliberately NO `operator_key_verified` flag. On a STORED PEER a
        non-empty `operator_pubkey` *means* our receiver verified the binding: an
@@ -216,7 +214,10 @@ typedef struct
     uint8_t operator_pubkey[crypto_sign_PUBLICKEYBYTES];
     uint8_t *operator_key_binding;      /* heap-allocated, may be NULL */
     size_t operator_key_binding_len;
-#ifdef AT_ZTA_ENABLED
+    /* ZTA credentials (proto fields 6-8 and 16). Unconditional since
+       FEATURE_SPLIT_PLAN Phase 6 (D3), as the operator fields above are: a
+       build without ZTA carries and relays them, and only VERIFICATION (the
+       ZTA extension) gives them any meaning. */
     uint8_t zta_credential_hash[32];  /* SHA-256 of ZTA credential at admission */
     char zta_issuer[64];              /* Credential issuer identifier */
     uint8_t *zta_credential;          /* Raw credential bytes (heap-allocated) */
@@ -239,7 +240,6 @@ typedef struct
        our own view. */
     char zta_anchors[ZTA_MAX_ANCHORS][ZTA_ANCHOR_NAME_LEN];
     size_t num_zta_anchors;
-#endif
 } public_identity_t;
 
 #ifdef __FRAMAC__

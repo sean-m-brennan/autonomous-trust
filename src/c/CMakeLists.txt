@@ -147,8 +147,9 @@ add_link_options(-pthread ${sysroot_flag})
 # Static linking option for embedded/IoT builds
 option(AT_STATIC "Link at_demo fully statically (no shared library dependencies)" OFF)
 
-# Zero Trust Architecture integration (requires OpenSSL)
-option(AT_ZTA "Enable Zero Trust Architecture credential integration" OFF)
+# Zero Trust Architecture integration: builds libat_zta (src/c/extensions/zta,
+# which brings OpenSSL). The core itself needs neither (FEATURE_SPLIT_PLAN Phase 6).
+option(AT_ZTA "Build the Zero Trust credential integration library (libat_zta)" OFF)
 
 # Extension libraries that live OUTSIDE this tree (e.g. Agora's libat_social):
 # a list of directories, each holding an extension's CMakeLists.txt. Each is
@@ -351,16 +352,6 @@ if(NOT LIBSUBUNIT_LIBRARY)
     set(LIBSUBUNIT_LIBRARY "")
 endif()
 
-# OpenSSL (required only when AT_ZTA is ON)
-if(AT_ZTA)
-    find_package(OpenSSL REQUIRED)
-    if(OPENSSL_FOUND)
-        message("-- Found OpenSSL ${OPENSSL_VERSION} at ${OPENSSL_LIBRARIES}")
-    else()
-        message(FATAL_ERROR "AT_ZTA=ON requires OpenSSL. Install libssl-dev.")
-    endif()
-endif()
-
 set(DEPENDENCIES
     ${LIBUUID_LIBRARY}
     ${LIBSODIUM_LIBRARY}
@@ -371,10 +362,6 @@ set(DEPENDENCIES
     ${CMAKE_THREAD_LIBS_INIT}
     m
 )
-
-if(AT_ZTA)
-    list(APPEND DEPENDENCIES OpenSSL::SSL OpenSSL::Crypto)
-endif()
 
 # Expose DEPENDENCIES to parent scope so examples/ can link them — but only
 # when actually built via add_subdirectory(); a standalone build has no parent.
@@ -536,19 +523,6 @@ set(libsrc
     autonomous_trust/fleet/config_proc.c
 )
 
-# ZTA sources (only compiled when AT_ZTA is enabled)
-if(AT_ZTA)
-    list(APPEND libsrc
-        autonomous_trust/zta/zta_verifier.c
-        autonomous_trust/zta/x509_verifier.c
-        autonomous_trust/zta/oidc_verifier.c
-        autonomous_trust/zta/zta_policy.c
-        autonomous_trust/zta/zta_audit.c
-        autonomous_trust/zta/zta_process.c
-        autonomous_trust/zta/zta_binding.c
-        autonomous_trust/zta/zta_msg_types.c
-    )
-endif()
 
 
 set(libhdr
@@ -601,17 +575,6 @@ set(libhdr
 )
 
 
-if(AT_ZTA)
-    list(APPEND libhdr
-        autonomous_trust/zta/zta_verifier.h
-        autonomous_trust/zta/x509_verifier.h
-        autonomous_trust/zta/oidc_verifier.h
-        autonomous_trust/zta/zta_policy.h
-        autonomous_trust/zta/zta_audit.h
-        autonomous_trust/zta/zta_process.h
-        autonomous_trust/zta/zta_protocol.h
-    )
-endif()
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/autonomous_trust)
 
@@ -671,10 +634,7 @@ function(preprocess _file_in)
     set(_fullpath ${CMAKE_CURRENT_SOURCE_DIR}/${_file_in})
     set(_header_file ${CMAKE_CURRENT_BINARY_DIR}/${_base}.h)
     set(_src_dir ${CMAKE_CURRENT_SOURCE_DIR})
-    set(_exclude_args)                                                                                      
-    if(NOT AT_ZTA)
-        list(APPEND _exclude_args --exclude zta)
-    endif()
+    set(_exclude_args)
     add_custom_command(
         OUTPUT ${_header_file}
         COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/preprocess.py ${_fullpath} ${_header_file} ${_src_dir}/ autonomous_trust ${_exclude_args}
@@ -751,13 +711,6 @@ add_custom_target(proto_python DEPENDS ${proto_py_src})
 ####################
 # create libraries
 
-# When AT_ZTA is enabled, ALL targets must see AT_ZTA_ENABLED because it
-# changes the size of public_identity_t (adds ZTA credential fields).
-# A struct size mismatch between the library and consumers causes crashes.
-if(AT_ZTA)
-    add_compile_definitions(AT_ZTA_ENABLED)
-    include_directories(${OPENSSL_INCLUDE_DIR})
-endif()
 
 
 # Ryu (shortest-decimal d2s) for JCS number formatting.  Pulled in as a
@@ -805,10 +758,10 @@ target_sources(autonomous_trust PUBLIC ${libsrc}
 ####################
 # tests (only built when libcheck is available)
 #
-# Test executables link against the static library archive.  With AT_ZTA=ON
-# the msg_types.c object acquires new dependencies on ZTA + proto symbols.
-# A single-pass linker may fail to resolve them because it only scans the
-# archive once.  Wrapping in --start-group/--end-group allows multiple passes.
+# Test executables link against the static library archive. msg_types.c and
+# the protobuf-c generated objects pull in symbols defined later in the
+# archive, and a single-pass linker scans it once; --start-group/--end-group
+# allows multiple passes.
 set(AT_TEST_LIBS -Wl,--start-group autonomous_trust_static ${TEST_DEPENDENCIES} -Wl,--end-group)
 
 if(LIBCHECK_LIBRARY)
@@ -1411,36 +1364,6 @@ add_test(NAME array3_test COMMAND $<TARGET_FILE:array3_test>)
 add_test(NAME message2_test COMMAND $<TARGET_FILE:message2_test>)
 add_test(NAME capabilities3_test COMMAND $<TARGET_FILE:capabilities3_test>)
 
-# ZTA tests (only when AT_ZTA is enabled)
-if(AT_ZTA)
-    add_executable(zta_verifier_test test/zta_verifier_test.c)
-    set_source_files_properties(test/zta_verifier_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(zta_verifier_test PRIVATE ${AT_TEST_LIBS})
-
-    add_executable(zta_policy_test test/zta_policy_test.c)
-    set_source_files_properties(test/zta_policy_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(zta_policy_test PRIVATE ${AT_TEST_LIBS})
-
-    add_executable(zta_audit_test test/zta_audit_test.c)
-    set_source_files_properties(test/zta_audit_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(zta_audit_test PRIVATE ${AT_TEST_LIBS})
-
-    add_executable(zta_ocsp_test test/zta_ocsp_test.c)
-    set_source_files_properties(test/zta_ocsp_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_compile_definitions(zta_ocsp_test PRIVATE
-        GEN_CA_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/test/zta_test_ca/generate_test_ca.sh")
-    target_link_libraries(zta_ocsp_test PRIVATE ${AT_TEST_LIBS})
-
-    add_executable(zta_delegation_test test/zta_delegation_test.c)
-    set_source_files_properties(test/zta_delegation_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-    target_link_libraries(zta_delegation_test PRIVATE ${AT_TEST_LIBS})
-
-    add_test(NAME zta_verifier_test COMMAND $<TARGET_FILE:zta_verifier_test>)
-    add_test(NAME zta_policy_test COMMAND $<TARGET_FILE:zta_policy_test>)
-    add_test(NAME zta_audit_test COMMAND $<TARGET_FILE:zta_audit_test>)
-    add_test(NAME zta_ocsp_test COMMAND $<TARGET_FILE:zta_ocsp_test>)
-    add_test(NAME zta_delegation_test COMMAND $<TARGET_FILE:zta_delegation_test>)
-endif() # AT_ZTA
 
 # Hybrid-transport routing unit tests — always compiled; no backend needed,
 # this is a pure-math test of the matcher logic.
@@ -1568,6 +1491,22 @@ foreach(_layer PHYSICS CALIBRATION CERTIFICATES PREQUENTIAL REPLICATION)
         add_subdirectory(extensions/${_dir})
     endif()
 endforeach()
+if(AT_ZTA)
+    add_subdirectory(extensions/zta)
+    # Core tests with a ZTA half: built with it, and libat_zta linked whole, in
+    # an AT_ZTA build; the core half alone otherwise.
+    if(LIBCHECK_LIBRARY)
+        foreach(_t operator_attestation_test msg_types3_test operator_binding_test
+                   zta_binding_test peer_standing_test)
+            target_compile_definitions(${_t} PRIVATE AT_ZTA_ENABLED)
+            target_include_directories(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/extensions)
+            # The core group again after the library: it reaches back into the core.
+            target_link_libraries(${_t} PRIVATE
+                -Wl,--whole-archive at_zta_static -Wl,--no-whole-archive
+                ${AT_TEST_LIBS} OpenSSL::SSL OpenSSL::Crypto)
+        endforeach()
+    endif()
+endif()
 foreach(_ext_dir ${AT_EXTERNAL_EXTENSIONS})
     get_filename_component(_ext_dir "${_ext_dir}" ABSOLUTE)
     get_filename_component(_ext_name "${_ext_dir}" NAME)

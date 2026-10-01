@@ -59,6 +59,13 @@ foreach(_pair physics:physics calibration:calibration prequential:prequential
         list(APPEND AT_CONFORMANCE_DEFS AT_CONF_ORACLE_${_up})
     endif()
 endforeach()
+# ZTA (FEATURE_SPLIT_PLAN Phase 6): the identity and reputation adapters have a
+# ZTA half, compiled in -- and libat_zta linked whole -- only when the library
+# is built. Without it, a scenario with a zta_policy fixture skips.
+if(TARGET at_zta_static)
+    list(APPEND AT_CONFORMANCE_EXTENSIONS at_zta_static)
+    list(APPEND AT_CONFORMANCE_DEFS AT_ZTA_ENABLED)
+endif()
 # Adapters an extension registered with at_conformance_adapter()
 # (extensions/at_extension.cmake), e.g. an external extension's own protocol.
 # Their sources are compiled in, their libraries linked whole, and runner.c
@@ -169,6 +176,9 @@ set(AT_CONFORMANCE_LIBS
     at_ryu
 )
 target_link_libraries(conformance_runner PRIVATE ${AT_CONFORMANCE_LIBS})
+if(TARGET at_zta_static)
+    target_link_libraries(conformance_runner PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
 # A `make conformance_c` target: build, then run, writing results JSON.
 add_custom_target(conformance_c

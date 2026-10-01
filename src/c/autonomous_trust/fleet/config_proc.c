@@ -35,7 +35,7 @@
 #include "utilities/exception.h"
 #include "network/net_message.h"
 
-#define ECONFIG 290
+#define ECONFIG 301   /* fleet: 300s (290 is EX509_CALOAD) */
 DEFINE_ERROR(ECONFIG, "Config distribution error");
 
 /* Protocol-string definitions (declared `extern char[]` in
