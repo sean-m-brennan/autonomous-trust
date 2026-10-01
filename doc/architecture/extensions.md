@@ -479,6 +479,84 @@ under it, and a second lock would buy Python nothing it can use.
 `$AT_OWN_GEOHASH`/`$AT_OWN_EXACT`/`$AT_OWN_PROFILE` is set without social. It
 logs the loaded extensions at INFO.
 
+## ZTA (`libat_zta`, `autonomous_trust.zta`)
+
+Zero Trust credential integration left both cores in FEATURE_SPLIT_PLAN Phase
+6. What the core keeps is what every identity carries: the credential fields
+of `public_identity_t` / `Identity`, now unconditional in C as the operator
+fields already were (D3), their bounds, and the binding pre-image
+(`identity.c::zta_binding_preimage`, `core/_python/identity/zta_fields.py`). A
+node without ZTA carries and relays a peer's credentials and verifies none.
+The C struct no longer depends on a build flag, so the FFI auditor resolves
+conditionals against nothing and probes without `-DAT_ZTA_ENABLED`.
+
+**C.** `src/c/extensions/zta/` builds `libat_zta` when `AT_ZTA` is ON (still OFF
+by default) and takes OpenSSL with it; `libautonomous_trust` no longer links
+it. It registers, from constructors: the identity extension `"zta"`
+(`zta_identity.c`, the logic that used to sit under `#ifdef AT_ZTA_ENABLED` in
+`id_proc.c` and `rep_proc.c`, moved verbatim), the `zta_policy`
+configuration section (`DEFINE_CONFIGURATION`), the `zta_verify` process
+(`DEFINE_PROCESS`), its message types and its errors (`DEFINE_ERROR`). The
+configuration and error tables gained the bounds-checked appends the process
+table had (§3.3): `configuration_table_append` with `AT_CONFIG_EXT_MAX` free
+slots, and `error_table_append`, where the same error twice is one error and
+two errors on one number are refused. Turning that check on found four real
+collisions, now renumbered: `EGEN_NOIF` 226, `ENET_INVALID_MASK` 234,
+`ENET_ADDR_TOO_LONG` 235, `EUPDATE` 300, `ECONFIG` 301 (the DAG errors keep
+220/221, which their ACSL contracts pin).
+
+**The admission-authority hooks.** `identity_ext_t` gained five members, each
+phrased so that no extension at all is a node with no such authority:
+
+| Hook | Called from | Without an authority |
+|---|---|---|
+| `admission_gate` | the welcoming committee, before the vote | admit |
+| `join_refused` | `_join_authorized` (a targeted join) | not refused |
+| `gateway_refused` | child-gateway discovery, parent derivation, a hierarchy claim | not refused |
+| `operator_credential` | an attestation re-verify | not operator-class |
+| `credential_anchored` | reputation's check of an evidence co-signer it never admitted | not anchored |
+
+`admission_gate` answers the most restrictive verdict (`ADMIT`,
+`ADMIT_CAPPED`, `REJECT`); ZTA's publishes its standing to reputation before
+the vote, as the core did. Python's `IdentityHooks` has the same five plus
+`on_tick(proc, queues, tick)`, which carries the background re-verification
+off the identity loop (C has its own `zta_verify` process for that).
+
+**Python.** `src/autonomous-trust-zta/` (`autonomous_trust.zta`, D2's shape with
+an empty `_native`) holds the verifiers, `ZtaPolicy`, MFA and TOTP, binding
+verification and `admission.py`, the former `IdentityProcess._zta_*` methods as
+functions over the process. Their state keeps its old names on the process
+(`proc._zta_policy_cache`, `proc._zta_capped`, ...), set up when the extension
+registers on identity and reputation. The core's `pyproject.toml` no longer
+needs `cryptography`. Policy files written before the move name the class at
+its old path; `register_config_alias` lets them decode as the class they are
+now.
+
+**Present plus policy.** Linking or installing ZTA changes nothing until a
+node's `zta_policy.cfg.json` enables it. Three refusals keep that honest, in
+both runtimes. A node whose policy enables ZTA without the extension refuses to
+start (`identity_ext_check_config` in C, `extensions.check_config` in Python,
+names only, as the social one is). An enabled policy naming a `verifier_type`
+this runtime does not implement fails to load (C implements `x509`, `oidc`,
+`null`, and `mfa` as chain-only X.509 on the policy's anchors, which is what
+Python's MFA chain checks of a bare peer certificate). And an MFA factor type
+nothing provides fails it too. All three used to fall back to a verifier that
+admits everyone.
+
+**Operator.** PIV/CAC (`piv/`, PKCS#11) and the node-side operator package
+(`operator/node/`: activation, session, DDIL, the operator node) moved into the
+existing `autonomous-trust-operator` distribution, which depends on ZTA. Its
+`_at_extension.py` registers the `piv` MFA factor with ZTA's factor registry.
+The operator keystore (`identity/operator_keystore.py`) stayed in the core,
+because first contact's device certs and backups use it with no PIV involved.
+The core asks a live operator session whether it is attended through the
+session's own `is_attended()`, so it imports nothing from the distribution.
+
+**Corpus.** The ZTA scenarios stay in the `identity` and `reputation`
+protocols, gated on their `zta_policy` fixture: both adapters skip them without
+ZTA (C without `libat_zta`, Python without `autonomous_trust.zta`), and the two
+skip sets are the same 21 cases.
+
 ## External extensions and conformance plug-ins
 
 An extension need not live in this repository. Agora's social
@@ -585,7 +663,7 @@ depends on the feature calls it:
 | Anchor | Called from |
 |---|---|
 | `at_social_link()` (Agora's `libat_social`) | nothing in the core: the Agora shim (`agora_events_open`), `agorad`'s `main` and en-at's `EmbeddedAtNode` call it. It calls `at_agora_link()`, which calls `at_social_msg_types_link()` |
-| `at_zta_msg_types_link()` | `zta_process_run` |
+| `at_zta_link()` (`libat_zta`) | nothing in the core: ZTA's consumers own its link (the conformance runner and the tests with a ZTA half link it whole; `examples/` adds it to every demo). It keeps the identity extension, the process, the configuration section and the message types |
 | `at_first_contact_link()` | `identity_register_handlers` |
 | `at_dtn_link()` | nothing in the core: DTN's consumers own its link |
 | `at_gateway_link()` | nothing in the core: the gateway's consumers own its link |

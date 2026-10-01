@@ -41,6 +41,8 @@
 #include "app_events_registry.h"
 #include "config/configuration.h"
 #include "contacts/contacts.h"
+#include "contacts/device.h"
+#include <sodium.h>
 #include "identity/identity.h"
 #include "identity/first_contact.h"
 #include "identity/id_proc_priv.h"
@@ -934,6 +936,54 @@ DEFINE_TEST(test_list_answers_even_when_empty_and_in_order)
     ck_assert_int_eq(g_book[1].data.provenance, AT_PROV_TOKEN);
     ck_assert_int_eq(g_book[2].kind, AT_APP_EVENT_FC_CONTACTS_DONE);
     ck_assert_int_eq(g_book[2].data.count, 2);
+
+    /* A record listing a further device is followed by one DEVICE_LINKED per
+       device, on the list's ref; the count stays the number of records. (In
+       this test rather than its own: the suite is at RUN_TESTS' 28.) */
+    unsigned char seed[32], pk[crypto_sign_PUBLICKEYBYTES],
+                  sk[crypto_sign_SECRETKEYBYTES];
+    memset(seed, 0x33, sizeof(seed));
+    crypto_sign_seed_keypair(pk, sk, seed);
+    identity_t *laptop = _mk_identity("bob-laptop", "10.0.0.4");
+    char dir[CFG_PATH_LEN + 1], bu[UUID_STRING_LEN + 1];
+    ck_assert(get_data_dir(dir, sizeof(dir)) > 0);
+    uuid_unparse_lower(bob->uuid, bu);
+    contacts_t store;
+    contacts_init(&store);
+    contacts_load(dir, &store);
+    contact_t *rec = contacts_get(&store, bu);
+    ck_assert(rec != NULL);
+    contact_mark_verified(rec, 0.3);
+    public_identity_t *bpub = NULL, *lpub = NULL;
+    ck_assert_ret_ok(identity_publish(bob, &bpub));
+    ck_assert_ret_ok(identity_publish(laptop, &lpub));
+    at_dir_signed_t cert;
+    ck_assert_int_eq(at_device_cert_create(sk, bpub, 1000, &cert), AT_DEVICE_OK);
+    ck_assert_int_eq(at_adopt_operator(rec, &cert, &store), AT_DEVICE_OK);
+    at_dir_free(&cert);
+    ck_assert_int_eq(at_device_cert_create(sk, lpub, 1000, &cert), AT_DEVICE_OK);
+    ck_assert_int_eq(at_link_device(&store, lpub, &cert, NULL), AT_DEVICE_OK);
+    at_dir_free(&cert);
+    ck_assert_ret_ok(contacts_save(&store, dir));
+    contacts_free(&store);
+    smrt_deref(bpub);
+    smrt_deref(lpub);
+
+    g_n_book = 0;
+    b = json_object();
+    json_object_set_new(b, "ref", json_string("l"));
+    _book(proc, AT_APP_FC_LIST, b);
+    ck_assert_int_eq(g_n_book, 4);
+    ck_assert_int_eq(g_book[0].kind, AT_APP_EVENT_FC_CONTACT);
+    ck_assert_int_eq(g_book[1].kind, AT_APP_EVENT_FC_DEVICE_LINKED);
+    ck_assert_str_eq(g_book[1].data.ref, "l");
+    ck_assert(memcmp(g_book[1].data.peer_uuid, bob->uuid, 16) == 0);
+    ck_assert(memcmp(g_book[1].data.device_uuid, laptop->uuid, 16) == 0);
+    ck_assert(g_book[1].data.verified);
+    ck_assert_int_eq(g_book[2].kind, AT_APP_EVENT_FC_CONTACT);
+    ck_assert(memcmp(g_book[2].data.peer_uuid, carol->uuid, 16) == 0);
+    ck_assert_int_eq(g_book[3].kind, AT_APP_EVENT_FC_CONTACTS_DONE);
+    ck_assert_int_eq(g_book[3].data.count, 2);
     _end();
 }
 END_TEST_DEFINITION()

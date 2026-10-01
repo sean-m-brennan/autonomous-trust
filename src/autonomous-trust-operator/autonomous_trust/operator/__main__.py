@@ -51,7 +51,7 @@ def live_token_provider() -> Callable[[], Any]:
     unavailable, so the console still starts on a box without PKCS#11 support.
     """
     def probe():
-        from autonomous_trust.core.identity.zta.piv.pkcs11 import probe_token
+        from autonomous_trust.operator.piv.pkcs11 import probe_token
         return probe_token()
     return probe
 
@@ -59,7 +59,7 @@ def live_token_provider() -> Callable[[], Any]:
 def software_token_provider(token: Any) -> Callable[[], Any]:
     """Presence for the dev/demo software token -- labeled as such so the status
     line never implies a real card is in a reader."""
-    from autonomous_trust.core.identity.zta.piv.pkcs11 import TokenProbe
+    from autonomous_trust.operator.piv.pkcs11 import TokenProbe
 
     def probe():
         return TokenProbe(bool(token.is_present()), None, 'software token (dev)')
@@ -95,7 +95,7 @@ def live_card_activator(ca_bundle_path: str,
         for tests; defaults to `PyKcs11Token`.
     """
     def activate(pin: str, mfa: str):
-        from autonomous_trust.core.identity.zta.piv.pkcs11 import (
+        from autonomous_trust.operator.piv.pkcs11 import (
             PivTokenError, PyKcs11Token)
         factory = token_factory or PyKcs11Token
         try:
@@ -109,7 +109,7 @@ def live_card_activator(ca_bundle_path: str,
         except Exception as err:  # defensive: a middleware crash must not kill the UI
             return _TokenError('UNAVAILABLE', 'could not open PIV token: %s' % err)
         try:
-            from autonomous_trust.core.operator.activate import activate as core
+            from autonomous_trust.operator.node.activate import activate as core
             return core(token, ca_bundle_path, crl_path=crl_path,
                         totp_secret=totp_secret, totp_code=mfa or '')
         finally:

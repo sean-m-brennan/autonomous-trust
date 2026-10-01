@@ -111,7 +111,10 @@ def _node(uuid='me', primary=None, child_groups=None, child_gateways=None,
     proc.report_exception = MagicMock()
     # Gateway authority is doc/architecture/zta-integration.md's proved-shared-anchor gate; the tests that
     # care about it override this.
-    proc._gateway_authorized = (lambda u: True) if authorized is True else authorized
+    # The admission authority's verdict (ZTA's, an extension since
+    # FEATURE_SPLIT_PLAN Phase 6), through the core's own seam.
+    _ok = (lambda u: True) if authorized is True else authorized
+    proc._gateway_refused = lambda u: not _ok(u)
     return proc
 
 
@@ -265,7 +268,7 @@ class TestReceive:
         that could install itself there would receive queries for a cohort it
         has no standing in."""
         node, them = self._node_pair()
-        node._gateway_authorized = lambda u: False
+        node._gateway_refused = lambda u: True
         msg = self._claim_msg(them, {'node': str(them.uuid),
                                      'children': ['c1'], 'rank': 3})
         assert node.handle_hierarchy({}, msg) is True

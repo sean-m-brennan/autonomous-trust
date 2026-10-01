@@ -158,7 +158,7 @@ static void _to_network(char *verb, json_t *body)
     m.info.net_msg.encrypt = false;
     net_msg_pack_json(&m.info.net_msg, body);
     json_decref(body);
-    messaging_send("network", NET_MESSAGE, &m, false);
+    (void)identity_send_to_network(NULL, &m, "area hub op", NULL);
     net_msg_free_obj(&m.info.net_msg);
 }
 

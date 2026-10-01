@@ -23,7 +23,7 @@ from queue import Queue
 
 from textual.widgets import Button, DataTable, Input, Select, Static, TabbedContent
 
-from autonomous_trust.core.operator.resource_directory import (
+from autonomous_trust.operator.node.resource_directory import (
     build_directory, CapabilityDescriptor, PeerInfo)
 from autonomous_trust.operator.app import OperatorApp
 from autonomous_trust.operator.bridge import OperatorNodeBridge

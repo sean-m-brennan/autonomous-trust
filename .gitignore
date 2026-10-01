@@ -218,3 +218,4 @@ embedded/signing.pub
 # Earlier silent 23s cut of the same video, kept on disk but not tracked.
 /brag-output1/
 /doc/brag/brag.mp4
+/src/c/extensions/zta/test/zta_test_ca/output/

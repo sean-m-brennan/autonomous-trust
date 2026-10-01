@@ -110,11 +110,20 @@ class TestFieldNames:
         assert aud.struct_fields('loop_t', structs) is not None
 
 
+#: A macro the tests treat as defined. The auditor's own DEFINED is empty since
+#: FEATURE_SPLIT_PLAN Phase 6 (no mirrored struct depends on a flag), so the
+#: resolver is exercised with one passed in.
+_ON = ('AT_ZTA_ENABLED',)
+
+
 class TestConditionals:
+    def test_no_mirrored_struct_depends_on_a_build_flag(self):
+        assert aud.DEFINED == ()
+
     def test_a_defined_guard_keeps_its_fields(self):
         text = ('typedef struct { int a;\n#ifdef AT_ZTA_ENABLED\n'
                 'int zta;\n#endif\nint b; } s_t;')
-        resolved, unknown = aud.resolve_conditionals(text)
+        resolved, unknown = aud.resolve_conditionals(text, _ON)
         structs = aud.parse_structs(resolved)
         assert aud.struct_fields('s_t', structs) == ['a', 'zta', 'b']
         assert not unknown
@@ -129,19 +138,19 @@ class TestConditionals:
     def test_ifndef_is_inverted(self):
         text = ('typedef struct { int a;\n#ifndef AT_ZTA_ENABLED\nint nope;\n'
                 '#else\nint yes;\n#endif\n } s_t;')
-        resolved, _ = aud.resolve_conditionals(text)
+        resolved, _ = aud.resolve_conditionals(text, _ON)
         assert aud.struct_fields('s_t', aud.parse_structs(resolved)) == ['a', 'yes']
 
     def test_if_defined_expression(self):
         text = ('typedef struct { int a;\n#if defined(AT_ZTA_ENABLED)\nint z;\n'
                 '#endif\n } s_t;')
-        resolved, _ = aud.resolve_conditionals(text)
+        resolved, _ = aud.resolve_conditionals(text, _ON)
         assert aud.struct_fields('s_t', aud.parse_structs(resolved)) == ['a', 'z']
 
     def test_nested_guards(self):
         text = ('typedef struct { int a;\n#ifdef AT_ZTA_ENABLED\n'
                 '#ifdef AT_NOPE\nint no;\n#endif\nint yes;\n#endif\n } s_t;')
-        resolved, _ = aud.resolve_conditionals(text)
+        resolved, _ = aud.resolve_conditionals(text, _ON)
         assert aud.struct_fields('s_t', aud.parse_structs(resolved)) == ['a', 'yes']
 
     def test_cplusplus_guards_do_not_eat_the_declarations(self):

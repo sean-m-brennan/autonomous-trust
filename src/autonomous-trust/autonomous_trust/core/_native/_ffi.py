@@ -286,14 +286,15 @@ ffi.cdef("""
         uint8_t operator_pubkey[32];
         uint8_t *operator_key_binding;
         size_t operator_key_binding_len;
-        /* ZTA credential binding (identity.h, #ifdef AT_ZTA_ENABLED). The
-           native lib is built AT_ZTA=ON (build-native.sh -DAT_ZTA=ON), so these
-           are part of the ABI layout and must be present here to match. */
+        /* ZTA credential binding (identity.h). Unconditional in C since
+           FEATURE_SPLIT_PLAN Phase 6 (D3): the fields exist in every build and
+           only their VERIFICATION is ZTA's, so this layout no longer depends on
+           how the native lib was built. */
         uint8_t zta_credential_hash[32];
         char zta_issuer[64];
         uint8_t *zta_credential;
         size_t zta_credential_len;
-        /* Multi-credential set + proved anchors (identity.h, same AT_ZTA block;
+        /* Multi-credential set + proved anchors (identity.h, beside the above;
            landed with doc/architecture/zta-integration.md on 2026-08-06). MISSING here until 2026-08-10, and
            the cost was exactly what the comment above describes for the
            operator-key fields: the mirror ended at zta_credential_len, 840
@@ -306,7 +307,7 @@ ffi.cdef("""
            ZTA_MAX_CREDENTIALS 4, ZTA_MAX_ANCHORS 8, ZTA_ANCHOR_NAME_LEN 64.
            Verify a change here against the C ABI rather than by eye -- compile
            a probe that prints sizeof/offsetof from identity.h (with
-           -DAT_ZTA_ENABLED -fms-extensions) and compare to ffi.sizeof /
+           -fms-extensions) and compare to ffi.sizeof /
            ffi.offsetof. `scripts/audit-ffi-drift.py` compares function ARG
            COUNTS only and cannot see any of this
            (doc/architecture/native-ffi-dual-implementation.md). */

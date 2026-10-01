@@ -31,7 +31,9 @@
         .data_struct = NULL,                                    \
     },
 
-config_t configuration_table[] = {
+/* The generated entries, plus AT_CONFIG_EXT_MAX free slots an extension
+ * library fills at load time with DEFINE_CONFIGURATION (configuration.h). */
+config_t configuration_table[LIST_COUNT__DECLARE_CONFIGURATION + AT_CONFIG_EXT_MAX] = {
     LIST__DECLARE_CONFIGURATION
 };
 

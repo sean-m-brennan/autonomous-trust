@@ -18,6 +18,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <jansson.h>
+
+#include "config/configuration.h"
 #include "identity/id_ext.h"
 #include "identity/id_proc_priv.h"
 
@@ -78,6 +81,43 @@ int identity_ext_check_env(logger_t *logger)
         log_error(logger, "Identity: $%s is set, but %s is not loaded; refusing "
                           "to start rather than ignore it\n",
                   declarations[i].env, declarations[i].lib);
+        rc = -1;
+    }
+    return rc;
+}
+
+/* The configuration a node can carry that only an extension acts on: a
+ * section file, the key that turns it on, and the extension that must be
+ * present. Names only, as above. Without the extension the section is not even
+ * registered, so load_all_configs skips the file as unknown and the node would
+ * start enforcing nothing. */
+static const struct { const char *section; const char *key; const char *ext;
+                      const char *lib; } config_declarations[] = {
+    { "zta_policy", "enabled", "zta", "libat_zta" },
+};
+
+int identity_ext_check_config(const char *cfg_dir, logger_t *logger)
+{
+    char dir[CFG_PATH_LEN + 1] = {0};
+    if (cfg_dir == NULL) {
+        if (get_cfg_dir(dir, sizeof(dir)) <= 0)
+            return 0;
+        cfg_dir = dir;
+    }
+    int rc = 0;
+    for (size_t i = 0; i < sizeof(config_declarations) / sizeof(config_declarations[0]); i++) {
+        if (identity_ext_present(config_declarations[i].ext))
+            continue;
+        char path[CFG_PATH_LEN + 64];
+        snprintf(path, sizeof(path), "%s/%s.cfg.json", cfg_dir, config_declarations[i].section);
+        json_t *root = json_load_file(path, 0, NULL);
+        bool on = root != NULL && json_is_true(json_object_get(root, config_declarations[i].key));
+        json_decref(root);
+        if (!on)
+            continue;
+        log_error(logger, "Identity: %s enables %s, but %s is not loaded; refusing "
+                          "to start rather than ignore it\n",
+                  path, config_declarations[i].section, config_declarations[i].lib);
         rc = -1;
     }
     return rc;
@@ -147,6 +187,56 @@ bool identity_ext_peer_blocked(const char *uuid_str)
 {
     for (size_t i = 0; i < _exts_len; i++)
         if (_exts[i]->peer_blocked != NULL && _exts[i]->peer_blocked(uuid_str))
+            return true;
+    return false;
+}
+
+identity_ext_gate_t identity_ext_admission_gate(const process_t *proc, public_identity_t *peer,
+                                                const uint8_t claimed_key[crypto_sign_PUBLICKEYBYTES])
+{
+    identity_ext_gate_t worst = IDENTITY_EXT_ADMIT;
+    for (size_t i = 0; i < _exts_len; i++) {
+        if (_exts[i]->admission_gate == NULL)
+            continue;
+        identity_ext_gate_t g = _exts[i]->admission_gate(proc, peer, claimed_key);
+        if (g == IDENTITY_EXT_REJECT)
+            return g;
+        if (g > worst)
+            worst = g;
+    }
+    return worst;
+}
+
+bool identity_ext_join_refused(const process_t *proc, const public_identity_t *new_id)
+{
+    for (size_t i = 0; i < _exts_len; i++)
+        if (_exts[i]->join_refused != NULL && _exts[i]->join_refused(proc, new_id))
+            return true;
+    return false;
+}
+
+bool identity_ext_gateway_refused(const process_t *proc, const char *uuid_str)
+{
+    for (size_t i = 0; i < _exts_len; i++)
+        if (_exts[i]->gateway_refused != NULL && _exts[i]->gateway_refused(proc, uuid_str))
+            return true;
+    return false;
+}
+
+bool identity_ext_operator_credential(const process_t *proc, const public_identity_t *claim)
+{
+    for (size_t i = 0; i < _exts_len; i++)
+        if (_exts[i]->operator_credential != NULL
+            && _exts[i]->operator_credential(proc, claim))
+            return true;
+    return false;
+}
+
+bool identity_ext_credential_anchored(const process_t *proc, const public_identity_t *carried)
+{
+    for (size_t i = 0; i < _exts_len; i++)
+        if (_exts[i]->credential_anchored != NULL
+            && _exts[i]->credential_anchored(proc, carried))
             return true;
     return false;
 }
