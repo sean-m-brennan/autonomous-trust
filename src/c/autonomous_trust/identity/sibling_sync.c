@@ -228,7 +228,7 @@ static void _send(char *verb, const public_identity_t *to,
     memcpy(&msg.info.net_msg.from_whom, self, sizeof(public_identity_t));
     at_strlcpy(msg.info.net_msg.return_to, "identity", sizeof(msg.info.net_msg.return_to));
     net_msg_pack_json(&msg.info.net_msg, body);
-    messaging_send("network", NET_MESSAGE, &msg, false);
+    (void)identity_send_to_network(NULL, &msg, "contacts sync", NULL);
     net_msg_free_obj(&msg.info.net_msg);
 }
 

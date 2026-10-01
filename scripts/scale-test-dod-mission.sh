@@ -57,7 +57,7 @@ set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$here"
 
-AT_SRC_PATHS="$here/src/autonomous-trust:$here/src/autonomous-trust-oracle:$here/src/autonomous-trust-evaluation:$here/src/autonomous-trust-inspector:$here/src/autonomous-trust-services:$here/src/autonomous-trust-simulator"
+AT_SRC_PATHS="$here/src/autonomous-trust:$here/src/autonomous-trust-oracle:$here/src/autonomous-trust-zta:$here/src/autonomous-trust-evaluation:$here/src/autonomous-trust-inspector:$here/src/autonomous-trust-services:$here/src/autonomous-trust-simulator"
 export PYTHONPATH="${AT_SRC_PATHS}:${here}${PYTHONPATH:+:$PYTHONPATH}"
 
 # Project is conda-based; the canonical interpreter lives in the

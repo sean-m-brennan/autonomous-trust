@@ -35,8 +35,7 @@
 #include "utilities/probes.h"
 #include "network/net_message.h"
 #include "identity/identity_priv.h"   /* public_identity_to/from_json, unhexlify */
-#include "zta/zta_verifier.h"
-#include "zta/zta_policy.h"
+#include "identity/id_ext.h"   /* identity_ext_credential_anchored */
 #include "config/configuration.h"   /* get_cfg_dir, CFG_PATH_LEN */
 #include "config/discover.h"        /* CFG_FILE_EXT */
 #include "contacts/contacts.h"     /* the first-contact address book (trust seeds) */
@@ -5631,29 +5630,6 @@ static void _record_resolved(const char *peer_str, double score,
  * harder question of WHICH agency vouches for a peer, and answering the
  * narrower question with the broader machinery would put a second copy of that
  * decision here to drift. */
-#ifdef AT_ZTA_ENABLED
-static zta_verifier_t *_resolve_zta_verifier(const process_t *proc)
-{
-    static zta_verifier_t *cached = NULL;
-    static bool tried = false;
-    if (tried)
-        return cached;
-    tried = true;
-    if (proc == NULL || proc->configs == NULL)
-        return NULL;
-    data_t *zta_dat = NULL;
-    config_t *zta_cfg = NULL;
-    char zta_key[] = "zta_policy";
-    if (map_get(proc->configs, zta_key, &zta_dat) != 0 || zta_dat == NULL
-        || data_object_ptr(zta_dat, (void **)&zta_cfg) != 0
-        || zta_cfg == NULL || zta_cfg->data_struct == NULL)
-        return NULL;
-    zta_policy_t *policy = (zta_policy_t *)zta_cfg->data_struct;
-    if (zta_policy_create_verifier(policy, &cached) != 0)
-        cached = NULL;
-    return cached;
-}
-#endif  /* AT_ZTA_ENABLED */
 
 /* Whether a co-signer may count toward an answer's evidence: a peer we already
  * hold cleared admission, otherwise the carried identity must present a
@@ -5675,25 +5651,12 @@ static bool _resolve_trust_signer(const process_t *proc, const char *voter,
         }
     }
     peers_read_unlock(proc);
-#ifdef AT_ZTA_ENABLED
-    if (carried == NULL || carried->zta_credential_len == 0)
-        return false;
-    zta_verifier_t *verifier = _resolve_zta_verifier(proc);
-    if (verifier == NULL || verifier->verify_credential == NULL)
-        return false;
-    zta_result_t result = {0};
-    if (verifier->verify_credential(verifier, carried->zta_credential,
-                                    carried->zta_credential_len, &result) != 0)
-        return false;
-    return result.status == ZTA_VERIFIED;
-#else
-    /* Without ZTA compiled in there is no anchor to chain a stranger's
-     * credential to, so an unknown signer cannot be trusted at all. Refusing
-     * is the fail-safe direction: a build with no way to check credentials
-     * must not accept evidence from signers it has never admitted. */
-    (void)carried;
-    return false;
-#endif
+    /* An admission authority (ZTA: zta/zta_identity.c) may vouch for a
+     * stranger whose credential chains to an anchor we accept. Without one
+     * an unknown signer cannot be trusted at all: refusing is the fail-safe
+     * direction, so a build that cannot check credentials accepts no
+     * evidence from signers it never admitted. */
+    return identity_ext_credential_anchored(proc, carried);
 }
 
 /* Verify an answer to a query we made and record the result.

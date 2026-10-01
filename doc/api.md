@@ -213,7 +213,7 @@ a `ContactEvent` (or a `FirstContactEvent` of kind `refused`):
 |---|---|---|
 | `SAFETY_NUMBER` | `{ref, peer}` | `safety_number` event: the 60 digits to show |
 | `VERIFY` | `{ref, peer, presented}` or `{ref, peer, confirmed: true}` | `verified` (`method` says which), or `refused` / `mismatch` |
-| `LIST` | `{ref}` | one `contact` per record, oldest first, then `contacts_done` with `count` |
+| `LIST` | `{ref}` | one `contact` per record, oldest first, each followed by one `device_linked` per further device it lists (`device_uuid`), then `contacts_done` with `count` (records, not devices) |
 | `RENAME` | `{ref, peer, petname}` | `contact` with the new name |
 | `REMOVE` | `{ref, peer}` | `removed`; `peer_dropped` says whether a direct peer was let go |
 

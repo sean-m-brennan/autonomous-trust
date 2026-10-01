@@ -149,7 +149,7 @@ code paths are no-ops.
 
 ## 5. Pluggable verifier interface
 
-The `zta_verifier_t` struct (`src/c/autonomous_trust/zta/zta_verifier.h`)
+The `zta_verifier_t` struct (`src/c/extensions/zta/zta_verifier.h`)
 defines a vtable with five operations:
 
 | Operation | Purpose |
@@ -465,11 +465,11 @@ cmake .. -DAT_ZTA=ON
 make -j$(nproc)
 ```
 
-`AT_ZTA=ON` adds OpenSSL as a dependency and compiles the
-`src/c/autonomous_trust/zta/` sources. It also defines `AT_ZTA_ENABLED`
-globally, which extends `public_identity_t` and `generic_msg_t` with ZTA fields.
-All translation units must see the same definition to avoid struct size
-mismatches.
+`AT_ZTA=ON` builds `libat_zta` from `src/c/extensions/zta/`, which brings
+OpenSSL; the core library needs neither (FEATURE_SPLIT_PLAN Phase 6). The ZTA
+fields of `public_identity_t` are unconditional, so no struct depends on the
+flag. A node turns ZTA on with its `zta_policy.cfg.json`, and one whose policy
+enables it without the library refuses to start. See extensions.md, "ZTA".
 
 ### Running tests
 
@@ -496,13 +496,13 @@ Modified:
 - `src/c/CMakeLists.txt`, `AT_ZTA` option, conditional compilation, ZTA test targets
 
 New:
-- `src/c/autonomous_trust/zta/zta_verifier.h` / `.c` (pluggable verifier interface and null backend
-- `src/c/autonomous_trust/zta/x509_verifier.h` / `.c`) OpenSSL X.509 backend
-- `src/c/autonomous_trust/zta/oidc_verifier.h` / `.c` (OIDC stub backend
-- `src/c/autonomous_trust/zta/zta_policy.h` / `.c`) policy configuration and JSON serialization
-- `src/c/autonomous_trust/zta/zta_process.h` / `.c` (background re-verification process
-- `src/c/autonomous_trust/zta/zta_audit.h` / `.c`) compliance audit log
-- `src/c/autonomous_trust/zta/zta_protocol.h` (protocol message constants
+- `src/c/extensions/zta/zta_verifier.h` / `.c` (pluggable verifier interface and null backend
+- `src/c/extensions/zta/x509_verifier.h` / `.c`) OpenSSL X.509 backend
+- `src/c/extensions/zta/oidc_verifier.h` / `.c` (OIDC stub backend
+- `src/c/extensions/zta/zta_policy.h` / `.c`) policy configuration and JSON serialization
+- `src/c/extensions/zta/zta_process.h` / `.c` (background re-verification process
+- `src/c/extensions/zta/zta_audit.h` / `.c`) compliance audit log
+- `src/c/extensions/zta/zta_protocol.h` (protocol message constants
 - `src/c/test/zta_verifier_test.c`, `zta_policy_test.c`, `zta_audit_test.c`) unit tests
 - `config/cfg/zta_policy.cfg.json` (default policy configuration
 - `examples/zta/`) 4-peer Docker Compose demo with mock OCSP

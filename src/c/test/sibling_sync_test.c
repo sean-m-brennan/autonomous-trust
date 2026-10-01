@@ -27,6 +27,7 @@
 #include "test_setup.h"
 
 #include <pthread.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -94,6 +95,10 @@ static size_t g_n_sent;
 static ev_t g_ev[MAX_CAP];
 static size_t g_n_ev;
 static const node_t *g_cur;
+/* EAGAIN this many contacts_sync sends first: a network queue held full, as
+ * net.unix.max_dgram_qlen (10 in every fresh namespace) and a Paxos burst make
+ * it (device_cohort dev-4050177). */
+static size_t g_refuse_sync;
 
 static int _hook(const char *key, const message_type_t type, generic_msg_t *msg,
                  bool blocking)
@@ -115,6 +120,10 @@ static int _hook(const char *key, const message_type_t type, generic_msg_t *msg,
     } else if (type == NET_MESSAGE && msg->info.net_msg.function != NULL
                && g_n_sent < MAX_CAP) {
         const net_msg_t *n = &msg->info.net_msg;
+        if (g_refuse_sync > 0 && strcmp(n->function, "contacts_sync") == 0) {
+            g_refuse_sync--;
+            return EAGAIN;
+        }
         sent_t *s = &g_sent[g_n_sent++];
         s->from = g_cur;
         at_strlcpy(s->fn, n->function, sizeof(s->fn));
@@ -300,6 +309,7 @@ static void _begin(void)
     at_first_contact_reset();
     at_dir_contact_reset();
     _clear();
+    g_refuse_sync = 0;
     messaging_set_test_hook(_hook);
 }
 
@@ -564,6 +574,33 @@ DEFINE_TEST(test_the_new_device_gets_the_book_and_bob_links_it)
     ck_assert_ptr_nonnull(alice);
     ck_assert_uint_eq(alice->devices_count, 1);
     ck_assert_str_eq(alice->devices[0].uuid, g_laptop->uuid);
+    contacts_free(&store);
+    ck_assert_ptr_nonnull(_event(g_bob, AT_APP_EVENT_FC_DEVICE_LINKED));
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* THE REGRESSION (device_cohort dev-4050177): the old device's network queue
+ * was full when pairing completed, the full book was handed over once, the
+ * send returned EAGAIN unread, and the new device paired with an empty book.
+ * The book now goes through identity_send_to_network's bounded retry. */
+DEFINE_TEST(test_a_full_network_queue_does_not_lose_the_book)
+{
+    _begin();
+    _nodes();
+    _install_cert(g_phone, g_op);
+    _install_cert(g_laptop, g_op);
+    _befriend(g_phone, g_bob, NULL);
+    _befriend(g_bob, g_phone, g_op);
+    g_refuse_sync = 3;
+    _pair(g_phone, g_laptop, g_bob);
+    ck_assert_uint_eq(g_refuse_sync, 0);
+    char dir[CFG_PATH_LEN + 1];
+    contacts_t store;
+    _load(g_laptop, &store, dir);
+    contact_t *got = contacts_get(&store, g_bob->uuid);
+    ck_assert_ptr_nonnull(got);
+    ck_assert(got->verified);
     contacts_free(&store);
     ck_assert_ptr_nonnull(_event(g_bob, AT_APP_EVENT_FC_DEVICE_LINKED));
     _end();
@@ -882,6 +919,7 @@ RUN_TESTS(SiblingSync,
           test_no_cert_no_pair_link_and_pair_must_be_a_boolean,
           test_two_devices_under_one_operator_pair,
           test_the_new_device_gets_the_book_and_bob_links_it,
+          test_a_full_network_queue_does_not_lose_the_book,
           test_another_operators_device_is_refused,
           test_a_new_device_without_a_cert_sends_no_hello,
           test_an_old_device_that_lost_its_cert_does_not_ack,

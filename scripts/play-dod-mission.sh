@@ -59,6 +59,7 @@ err() { printf '[play-dod-mission] ERROR: %s\n' "$*" >&2; }
 export PYTHONPATH="\
 $here/src/autonomous-trust:\
 $here/src/autonomous-trust-oracle:\
+$here/src/autonomous-trust-zta:\
 $here/src/autonomous-trust-evaluation:\
 $here/src/autonomous-trust-inspector:\
 $here/src/autonomous-trust-services:\

@@ -29,7 +29,7 @@ from ..algorithms.agreement import AgreementVoter
 from .sign import Signature
 from .encrypt import Encryptor
 from .operator_binding import OPERATOR_BINDING_MAX, OPERATOR_PUBKEY_LEN
-from .zta_binding import ZTA_BINDING_MAX
+from .zta_fields import ZTA_BINDING_MAX
 
 from autonomous_trust.core.protobuf.identity import identity_pb2
 

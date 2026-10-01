@@ -66,7 +66,7 @@ cd "$here"
 # autonomous_trust.* without a pip install. Repo root last so example
 # entrypoints resolve via `python -m examples.<name>` AND
 # `python -m examples.<name>.deploy.<x>`.
-AT_SRC_PATHS="$here/src/autonomous-trust:$here/src/autonomous-trust-oracle:$here/src/autonomous-trust-evaluation:$here/src/autonomous-trust-inspector:$here/src/autonomous-trust-services:$here/src/autonomous-trust-simulator"
+AT_SRC_PATHS="$here/src/autonomous-trust:$here/src/autonomous-trust-oracle:$here/src/autonomous-trust-zta:$here/src/autonomous-trust-evaluation:$here/src/autonomous-trust-inspector:$here/src/autonomous-trust-services:$here/src/autonomous-trust-simulator"
 export PYTHONPATH="${AT_SRC_PATHS}:${here}${PYTHONPATH:+:$PYTHONPATH}"
 
 # Force native backend on the host so it matches peer containers; the

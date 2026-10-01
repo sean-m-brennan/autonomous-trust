@@ -40,7 +40,7 @@ _ResourceDirectory = None
 def _resource_directory_cls():
     global _ResourceDirectory
     if _ResourceDirectory is None:
-        from autonomous_trust.core.operator.resource_directory import (
+        from autonomous_trust.operator.node.resource_directory import (
             ResourceDirectory)
         _ResourceDirectory = ResourceDirectory
     return _ResourceDirectory
@@ -48,7 +48,7 @@ def _resource_directory_cls():
 
 def _default_node_factory():
     """Build a request-only OperatorNode. Lazy import keeps the UI decoupled."""
-    from autonomous_trust.core.operator import OperatorNode
+    from autonomous_trust.operator.node import OperatorNode
     return OperatorNode()
 
 

@@ -50,7 +50,12 @@ from autonomous_trust.core.identity.protocol import IdentityProtocol
 from autonomous_trust.core.identity.first_contact import _FLAG as FIRST_CONTACT_FLAG
 from autonomous_trust.core.contacts import FIRST_CONTACT_VERIFIED_SEED
 from autonomous_trust.core.identity.sign import Signature
-from autonomous_trust.core.identity.zta import ZtaPolicy
+try:
+    # ZTA is an extension (FEATURE_SPLIT_PLAN Phase 6): without it, a scenario
+    # with a zta_policy fixture skips, as the C adapter's does without libat_zta.
+    from autonomous_trust.zta import ZtaPolicy
+except ImportError:
+    ZtaPolicy = None
 from autonomous_trust.core.network.message import Message
 from autonomous_trust.core.network.network import Network
 from autonomous_trust.core.processes import ProcessTracker
@@ -946,7 +951,7 @@ def _scenario_zta_binding(corpus_root: Path, ident: Identity, cred: bytes,
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
 
-    from autonomous_trust.core.identity.zta_binding import zta_binding_preimage
+    from autonomous_trust.core.identity.zta_fields import zta_binding_preimage
 
     bind_to = ident
     if variant == 'other-identity':
@@ -1105,6 +1110,10 @@ class IdentityAdapter:
         store.save()
 
     def run_scenario(self, case: Case) -> None:
+        if ZtaPolicy is None and (case.data.get('fixtures', {}) or {}).get('zta_policy') is not None:
+            raise NotImplementedError('ZTA scenario skipped: autonomous-trust-zta is not '
+                                      'installed (put src/autonomous-trust-zta on the path '
+                                      'to run it symmetrically)')
         self._scratch = tempfile.TemporaryDirectory(prefix='at-conformance-id-')
         fc_fix = (case.data.get('fixtures', {}) or {}).get('first_contact') or {}
         fc_prior = os.environ.get(FIRST_CONTACT_FLAG)
@@ -1739,8 +1748,6 @@ class IdentityAdapter:
         On ``replay`` the previous answer is re-presented instead of a fresh
         pull: same nonce, already retired, and it must be refused.
         """
-        from autonomous_trust.core.operator.session import is_attended
-
         if replay:
             answer = dict(puller.attest_last_answer)
             if not answer:
@@ -1762,7 +1769,7 @@ class IdentityAdapter:
             # The target answers. Its own session state decides the stamp, and
             # its own clock supplies both of the readings it reports.
             session = getattr(target.process, '_operator_session', None)
-            attended = bool(session is not None and is_attended(session))
+            attended = bool(session is not None and session.is_attended())
             epoch = target.attest_clock if attended else 0.0
             answer = target.process._attest_payload(nonce, epoch,
                                                     target.attest_clock or 0.0)
@@ -1976,8 +1983,6 @@ class IdentityAdapter:
         fixture clock rather than `time.time()`: production stamps wall clock,
         and a scenario has to be reproducible.
         """
-        from autonomous_trust.core.operator.session import is_attended
-
         sink = participant.queues[CfgIds.main]._sink
         queries = [m for m in sink
                    if isinstance(m, Message)
@@ -1987,7 +1992,7 @@ class IdentityAdapter:
         for m in queries:
             sink.remove(m)
         session = getattr(participant.process, '_operator_session', None)
-        attended = bool(session is not None and is_attended(session))
+        attended = bool(session is not None and session.is_attended())
         # One answer serves every pull in flight -- they all asked the same
         # question of the same session -- which is exactly what the handler
         # assumes when it drains the whole pending table.
@@ -2400,14 +2405,18 @@ class _StubOperatorSession:
     """
 
     def __init__(self, active: bool):
-        from autonomous_trust.core.operator.session import SessionState
-        self.state = SessionState.ACTIVE if active else SessionState.LOCKED
+        self.active = active
 
     def poll(self):
-        return self.state
+        return self.active
 
     def needs_reverify(self) -> bool:
         return False
+
+    def is_attended(self) -> bool:
+        # What the core asks of a session (the real one, the operator
+        # distribution's, decides it from its state machine).
+        return self.active
 
 
 @dataclass

@@ -14,7 +14,6 @@
 #   limitations under the License.
 # ******************
 
-import base64
 import json
 import math
 import os
@@ -31,13 +30,12 @@ from nacl.exceptions import BadSignatureError
 
 from ..network import Message, Network
 from ..processes import Process, ProcMeta
-from ..extensions import load_extensions, run_post_fork
+from ..extensions import identity_hooks, load_extensions, run_post_fork
 from ..config import (Configuration, atomic_write, from_json_string,
                       to_json_string)
 from ..identity.protocol import IdentityProtocol
 from ..identity.identity import (public_identity_to_canonical,
                                  public_identity_from_canonical)
-from ..identity.zta.zta_policy import ZtaPolicy
 from ..identity.peer_standing import STANDING_PROVED, STANDING_FAILED
 from .protocol import ReputationProtocol
 from .reputation import (TransactionHistory, ReconcileResult, Reputation, Reputations,
@@ -651,8 +649,6 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # reading "unverified" needs to know which gate failed, and a caller
         # may knowingly accept a weaker answer (feedback_operator_diagnostics).
         self.resolved_reps: dict[str, tuple] = {}
-        self._zta_policy_cache = None
-        self._zta_anchor_cache = None
 
         # Slash replay marks, before any message can be handled. Also resumes
         # our own slash epoch, so this has to precede the first forward_slash.
@@ -4411,41 +4407,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             return True
         if not isinstance(signer, dict):
             return False
-        cred = signer.get('zta_credential')
-        if not cred:
-            return False
-        try:
-            der = base64.b64decode(cred)
-        except Exception:
-            return False
-        for _name, verifier, _is_op in self._resolve_anchor_verifiers():
-            try:
-                if verifier.verify(der):
-                    return True
-            except Exception:
-                continue
-        return False
-
-    def _resolve_anchor_verifiers(self):
-        """Anchor verifiers for evidence signers, built once per process from
-        the same ZTA policy the identity process admits peers with."""
-        if self._zta_anchor_cache is None:
-            if self._zta_policy_cache is None:
-                cfg = (self.configs.get(ZtaPolicy.CONFIG_KEY)
-                       if hasattr(self.configs, 'get') else None)
-                if isinstance(cfg, ZtaPolicy):
-                    self._zta_policy_cache = cfg
-                else:
-                    try:
-                        self._zta_policy_cache = ZtaPolicy.load()
-                    except Exception:
-                        self._zta_policy_cache = ZtaPolicy.defaults()
-            try:
-                self._zta_anchor_cache = \
-                    self._zta_policy_cache.create_anchor_verifiers()
-            except Exception:
-                self._zta_anchor_cache = []
-        return self._zta_anchor_cache
+        # An admission authority (ZTA) may vouch for a stranger whose credential
+        # chains to an anchor we accept. Without one an unknown signer cannot be
+        # trusted at all: refusing is the fail-safe direction.
+        return any(hook.credential_anchored(self, signer) for hook in identity_hooks(self)
+                   if hook.credential_anchored is not None)
 
     def _subtree_roster(self, gateway_uuid):
         """Reputation roster for a node and everything below it in the

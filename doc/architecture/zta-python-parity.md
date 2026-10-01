@@ -18,8 +18,10 @@ behavior symmetrically.
 
 ## 1. Module layout
 
-Everything new lives in one package,
-`src/autonomous-trust/autonomous_trust/core/_python/identity/zta/`.
+Everything new lives in one distribution, `src/autonomous-trust-zta/`
+(`autonomous_trust.zta`), since FEATURE_SPLIT_PLAN Phase 6 took it out of the
+core (it was `core/_python/identity/zta/`); PIV went to
+`autonomous-trust-operator`.
 
 | File | Mirrors (C) | Contents |
 |------|-------------|----------|
@@ -53,7 +55,7 @@ current cert, verifies the signature with
 accepts once it reaches an issuer that is itself in the store. The walk is
 depth-bounded. This admits leaf→intermediate(anchor) and leaf→intermediate→root
 chains and rejects unknown-issuer certs, verified against the existing test CA
-(`src/c/test/zta_test_ca/output/`) where `drone_alpha`→VERIFIED,
+(`src/c/extensions/zta/test/zta_test_ca/output/`) where `drone_alpha`→VERIFIED,
 `unknown_ca`→REJECTED, and `expired`→EXPIRED.
 
 `NullVerifier` always returns `VERIFIED` (the runtime-disabled path, per §5).
@@ -131,7 +133,7 @@ periodic re-verification is a documented follow-up, since there is no Python ZTA
 > **Naming collision, worth reading before §3.** "Identity binding" in this section
 > means *wire carriage*, the credential riding the announce/propose/confirm payloads.
 > It is **not** the credential→identity **binding gate** added 2026-08-06 (see §8 below,
-> `identity/zta_binding.py` / `zta/zta_binding.c`), which proves the announcing node is
+> `autonomous_trust.zta.zta_binding` / `extensions/zta/zta_binding.c`), which proves the announcing node is
 > entitled to present the credential. See §8.
 
 C serializes the ZTA fields into `identity.proto` fields 6-8
@@ -207,9 +209,9 @@ The gate is graded, anchored, and symmetric. `binding_mode: require` IS a
 fleet-wide guarantee, since a C `welcoming_committee` and a Python one make the
 same admission decision, pinned by 168/168 conformance cases with 0 asymmetric.
 
-Python lives in `identity/zta_binding.py` and `idprocess.py`, and C in
-`zta/zta_binding.{h,c}`, `identity.c`, `zta/zta_policy.{h,c}` and
-`identity/id_proc.c::_zta_admit`.
+Python lives in `autonomous_trust.zta.zta_binding` and `.admission`, and C in
+`extensions/zta/zta_binding.{h,c}`, `identity.c`, `extensions/zta/zta_policy.{h,c}` and
+`extensions/zta/zta_identity.c::_zta_admit`.
 
 - **The binding gate.** A chain-valid credential must additionally be *bound* to the
  announcing identity, by any one of three mechanisms, namely holder, CA, and

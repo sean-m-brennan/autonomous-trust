@@ -236,7 +236,7 @@ static void _to_network(char *verb, json_t *body)
     m.info.net_msg.encrypt = false;
     net_msg_pack_json(&m.info.net_msg, body);
     json_decref(body);
-    messaging_send("network", NET_MESSAGE, &m, false);
+    (void)identity_send_to_network(NULL, &m, "directory relay op", NULL);
     net_msg_free_obj(&m.info.net_msg);
 }
 
@@ -254,7 +254,7 @@ static void _to_wire(const process_t *proc, char *verb, const public_identity_t 
     at_strlcpy(m.info.net_msg.return_to, "identity", sizeof(m.info.net_msg.return_to));
     net_msg_pack_json(&m.info.net_msg, body);
     json_decref(body);
-    messaging_send("network", NET_MESSAGE, &m, false);
+    (void)identity_send_to_network(proc, &m, "directory request", NULL);
     net_msg_free_obj(&m.info.net_msg);
     at_fc_free_public(&m.info.net_msg.from_whom);
 }
@@ -900,12 +900,10 @@ bool handle_dir_contact_request(const process_t *proc, directory_t *queues, gene
     slot->sender = *sender;
     slot->sender.operator_key_binding = NULL;
     slot->sender.operator_key_binding_len = 0;
-#ifdef AT_ZTA_ENABLED
     /* Borrowed from the envelope: keep none of its heap. */
     slot->sender.zta_credential = NULL;
     slot->sender.zta_credential_len = 0;
     slot->sender.num_zta_credentials = 0;
-#endif
     const char *req_area = json_string_value(json_object_get(request.body, "area"));
     slot->by_area = req_area != NULL;
     if (slot->by_area)

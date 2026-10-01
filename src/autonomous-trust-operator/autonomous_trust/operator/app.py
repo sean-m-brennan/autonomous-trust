@@ -160,7 +160,7 @@ class OperatorApp(App):
     @property
     def session(self) -> Any:
         if self._session is None:
-            from autonomous_trust.core.operator.session import OperatorSession
+            from autonomous_trust.operator.node.session import OperatorSession
             self._session = OperatorSession()
         return self._session
 

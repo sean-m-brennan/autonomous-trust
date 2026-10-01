@@ -27,7 +27,7 @@
 #include "autonomous_trust/identity/group.h"
 #include "autonomous_trust/network/net_message.h"
 #ifdef AT_ZTA_ENABLED
-#include "autonomous_trust/zta/zta_msg_types.h"
+#include "zta/zta_msg_types.h"
 #endif
 
 extern message_type_t string_to_message_type(const char *str);

@@ -159,12 +159,17 @@ class TestSolicit:
 class TestJoinGate:
 
     def _cohort_node(self, own_rank=1, enforcing=True, own_anchors=('agency-a',)):
+        """A node whose admission authority (ZTA's, an extension since
+        FEATURE_SPLIT_PLAN Phase 6) answers with the shared-anchor rule. The rule
+        itself is pinned in autonomous-trust-zta's test_zta_admission.py
+        (join_refused); here it only has to be a refusal the core honours."""
         node = _node(group=_group('cohort'), rank=own_rank)
-        policy = MagicMock()
-        policy.enabled = enforcing
-        policy.require_at_admission = enforcing
-        node._zta_policy = lambda: policy
-        node._own_zta_anchors = lambda: set(own_anchors)
+
+        def refused(ident):
+            if not enforcing or not own_anchors:
+                return False
+            return not (set(getattr(ident, 'zta_anchors', ()) or ()) & set(own_anchors))
+        node._join_refused = refused
         return node
 
     def _requester(self, rank=5, anchors=('agency-a',)):

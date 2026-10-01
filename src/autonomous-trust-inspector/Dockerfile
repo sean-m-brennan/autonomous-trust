@@ -61,6 +61,7 @@ COPY src/autonomous-trust/autonomous_trust/core /app/autonomous_trust/core
 # The verification layers (autonomous-trust-oracle), beside the core in the
 # autonomous_trust namespace, where the core finds them (FEATURE_SPLIT_PLAN Phase 3).
 COPY src/autonomous-trust-oracle/autonomous_trust/oracle /app/autonomous_trust/oracle
+COPY src/autonomous-trust-zta/autonomous_trust/zta /app/autonomous_trust/zta
 
 # Layer the sibling packages via separate PYTHONPATH roots so Python's
 # namespace-package mechanism merges autonomous_trust.{core,evaluation,

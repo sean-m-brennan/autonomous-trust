@@ -25,7 +25,11 @@ distributions' own conftests do for the core. A conformance plug-in
 import os
 import sys
 
-_oracle = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..',
-                                       '..', '..', 'autonomous-trust-oracle'))
-if os.path.isdir(_oracle) and _oracle not in sys.path:
-    sys.path.insert(0, _oracle)
+# ZTA (src/autonomous-trust-zta, FEATURE_SPLIT_PLAN Phase 6) likewise: the
+# identity adapter's zta_policy scenarios run with it, as C's do with libat_zta,
+# and skip without it.
+for _dist in ('autonomous-trust-oracle', 'autonomous-trust-zta'):
+    _dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..',
+                                        '..', '..', _dist))
+    if os.path.isdir(_dir) and _dir not in sys.path:
+        sys.path.insert(0, _dir)

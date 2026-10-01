@@ -76,11 +76,34 @@ class IdentityHooks:
     uuid_str)`` is asked by ``get_peer_tier`` WITH ``proc.lock`` held, so it
     must not take it. C's ``group_update_seen``, ``peer_in_group`` and
     ``roster_replay`` feed its app-event carrier, which Python does not have,
-    so they have no Python slot."""
+    so they have no Python slot.
+
+    An admission authority (ZTA, FEATURE_SPLIT_PLAN Phase 6) uses the rest, each
+    phrased so that None -- and no extension at all -- is a node with no such
+    authority: everyone admitted, nothing refused, nothing proved. None of them
+    holds ``proc.lock``.
+
+    ``admission_gate(proc, queues, new_id)`` runs before the welcoming
+    committee votes on ``new_id`` and answers ``'admit'``, ``'admit_capped'`` or
+    ``'reject'``; it may write what it proves onto ``new_id`` and publishes any
+    standing it decides itself. ``join_refused(proc, new_id)`` and
+    ``gateway_refused(proc, uuid_str)`` say whether to refuse a join request,
+    or federation through a member. ``operator_credential(proc, claim, cred)``
+    says whether ``cred`` is operator-class (an attestation re-verify).
+    ``credential_anchored(proc, signer)`` is asked by REPUTATION about an
+    evidence co-signer it never admitted (``signer`` is the carried identity
+    dict). ``on_tick(proc, queues, tick)`` runs once per identity loop
+    iteration (C's zta_verify process has its own loop)."""
     on_start: Optional[Callable[[Any, Any], None]] = None
     on_peer_confirmed: Optional[Callable[[Any, Any, Any], None]] = None
     periodic_resync: Optional[Callable[[Any, Any], None]] = None
     is_blocked_locked: Optional[Callable[[Any, str], bool]] = None
+    admission_gate: Optional[Callable[[Any, Any, Any], str]] = None
+    join_refused: Optional[Callable[[Any, Any], bool]] = None
+    gateway_refused: Optional[Callable[[Any, str], bool]] = None
+    operator_credential: Optional[Callable[[Any, Any, bytes], bool]] = None
+    credential_anchored: Optional[Callable[[Any, dict], bool]] = None
+    on_tick: Optional[Callable[[Any, Any, Any], None]] = None
 
 
 @dataclass(frozen=True)
@@ -96,7 +119,12 @@ class Extension:
     ``app_verbs`` is ``((verb, process_name), ...)``: the verbs an application
     may send this feature (:mod:`.app_verbs`), each forwarded only to the one
     process named -- the Python half of ``AT_APP_VERB_REGISTER``. Honored only
-    while ``enabled()``."""
+    while ``enabled()``.
+
+    ``check_config(cfg_dir, logger)`` runs as the node starts
+    (:func:`check_config`) and raises to refuse a configuration the extension
+    cannot honour -- ZTA's loads its policy, so an enabled policy naming an
+    unknown verifier or factor stops the node instead of failing open."""
     name: str
     enabled: Callable[[], bool]
     register_handlers: Callable[[Any, str], None]
@@ -104,6 +132,7 @@ class Extension:
     reset: Optional[Callable[[], None]] = None
     identity: Optional[IdentityHooks] = None
     app_verbs: tuple = ()
+    check_config: Optional[Callable[[Optional[str], Any], None]] = None
 
 
 def _builtin() -> list[Extension]:
@@ -248,6 +277,48 @@ def check_env(logger=None) -> None:
     if missing:
         raise ExtensionMissingError(
             'declared but not loaded: ' + ', '.join(missing))
+
+
+#: Configuration a node can carry that only an extension acts on: (section,
+#: key that turns it on, extension, distribution). Names only, as above. Without
+#: the extension the section's class is not even importable, so the config
+#: loader skips the file and the node would start enforcing nothing.
+CONFIG_DECLARATIONS: tuple = (
+    ('zta_policy', 'enabled', 'zta', 'autonomous-trust-zta'),
+)
+
+
+def check_config(cfg_dir=None, logger=None) -> None:
+    """Refuse a node whose configuration turns on a feature it lacks
+    (:data:`CONFIG_DECLARATIONS`), then let every present extension check the
+    configuration it owns (``Extension.check_config``). Logs an ERROR and raises
+    :class:`ExtensionMissingError` (or the extension's own error)."""
+    import json
+    log = logger if logger is not None else _logger
+    if cfg_dir is None:
+        from .config import Configuration
+        cfg_dir = Configuration.get_cfg_dir()
+    present = {ext.name: ext for ext in all_extensions()}
+    missing = []
+    for section, key, name, dist in CONFIG_DECLARATIONS:
+        if name in present:
+            continue
+        path = os.path.join(cfg_dir, section + '.cfg.json')
+        try:
+            with open(path) as fh:
+                on = json.load(fh).get(key) is True
+        except (OSError, ValueError, AttributeError):
+            on = False
+        if on:
+            log.error('%s enables %s, but the %s extension (%s) is not loaded; '
+                      'refusing to start rather than ignore it', path, section,
+                      name, dist)
+            missing.append(section)
+    if missing:
+        raise ExtensionMissingError('enabled but not loaded: ' + ', '.join(missing))
+    for ext in present.values():
+        if ext.check_config is not None:
+            ext.check_config(cfg_dir, log)
 
 
 def reset_extensions() -> None:

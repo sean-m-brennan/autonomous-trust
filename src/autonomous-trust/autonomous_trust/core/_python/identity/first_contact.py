@@ -1462,8 +1462,12 @@ def handle_app_verify(proc, queues, message) -> bool:
 
 def handle_app_list(proc, queues, message) -> bool:
     """Send the address book (``APP_LIST``, payload ``{ref}``): one ``contact``
-    event per record, oldest first, then ``contacts_done`` with the count -- so
-    an empty book still answers, rather than looking like no answer."""
+    event per record, oldest first, each followed by one ``device_linked`` per
+    further device it lists (in the order they were filed), then
+    ``contacts_done`` with the count of records -- so an empty book still
+    answers, rather than looking like no answer. The ``device_linked`` events
+    let an app rebuild which devices are one person after a restart, a sibling
+    sync or a restore, none of which says so live."""
     if not is_local_app_verb(proc, message):
         return refuse_remote_app_verb(proc, message, APP_LIST)
     ref = _app_ref(_app_payload(message))
@@ -1473,8 +1477,12 @@ def handle_app_list(proc, queues, message) -> bool:
     records = sorted(_contacts_store(proc).all(),
                      key=lambda c: (float(c.added_at or 0.0),
                                     str(c.identity.uuid)))
+    from .device_contact import EVENT_DEVICE_LINKED
     for contact in records:
         _emit(proc, queues, _contact_event(EVENT_CONTACT, contact, ref))
+        for device in contact.device_uuids():
+            _emit(proc, queues, _contact_event(EVENT_DEVICE_LINKED, contact, ref,
+                                               device_uuid=str(device)))
     _emit(proc, queues, ContactEvent(EVENT_CONTACTS_DONE, ref=ref,
                                      count=len(records)))
     return True

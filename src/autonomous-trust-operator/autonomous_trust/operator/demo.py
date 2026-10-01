@@ -33,7 +33,7 @@ from typing import Any, Tuple
 
 def demo_directory() -> Any:
     """A small, self-describing ResourceDirectory for the no-node demo."""
-    from autonomous_trust.core.operator.resource_directory import (
+    from autonomous_trust.operator.node.resource_directory import (
         build_directory, CapabilityDescriptor, PeerInfo)
     descriptors = {
         'analyze': CapabilityDescriptor(
@@ -79,7 +79,7 @@ def mint_demo_pki(cfg_dir: str, common_name: str = 'operator',
     from cryptography.x509.oid import NameOID
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
-    from autonomous_trust.core.identity.zta.piv.pkcs11 import SoftwareToken
+    from autonomous_trust.operator.piv.pkcs11 import SoftwareToken
 
     not_before = datetime.now(timezone.utc) - timedelta(days=1)
     not_after = datetime.now(timezone.utc) + timedelta(days=365)
@@ -123,7 +123,7 @@ def software_activator(token: Any, ca_bundle_path: str, totp_secret: str = ''):
     token needs no PIN to unlock); ``mfa`` is the TOTP code, required only when
     ``totp_secret`` is set."""
     def activate(pin: str, mfa: str):  # noqa: ARG001
-        from autonomous_trust.core.operator.activate import activate as core
+        from autonomous_trust.operator.node.activate import activate as core
         return core(token, ca_bundle_path,
                     totp_secret=totp_secret, totp_code=mfa or '')
     # Exposed so the entry point can drive the console's token-present line off
@@ -136,7 +136,7 @@ def software_activator_from_files(cert_path: str, key_path: str,
                                   ca_bundle_path: str, totp_secret: str = ''):
     """Dev/CI activator from on-disk cert+key files (operator console
     ``--software-cert/-key/--ca-bundle``)."""
-    from autonomous_trust.core.identity.zta.piv.pkcs11 import SoftwareToken
+    from autonomous_trust.operator.piv.pkcs11 import SoftwareToken
     token = SoftwareToken.from_files(cert_path, key_path)
     return software_activator(token, ca_bundle_path, totp_secret=totp_secret)
 

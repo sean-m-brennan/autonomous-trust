@@ -23,7 +23,10 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
+#include "config/configuration.h"
 #include "processes/processes.h"
 #include "processes/extension.h"
 #include "structures/map.h"
@@ -31,6 +34,7 @@
 #include "identity/first_contact.h"
 #include "identity/id_ext.h"
 #include "network/net_transport.h"
+#include "utilities/exception.h"
 
 static int gate_reads = 0;
 static bool gate_open = false;
@@ -200,6 +204,97 @@ DEFINE_TEST(test_process_table_append)
 }
 END_TEST_DEFINITION()
 
+
+/* A cfg dir holding zta_policy.cfg.json with @p body; returns its path. */
+static const char *_zta_cfg_dir(const char *tag, const char *body)
+{
+    static char dir[128];
+    snprintf(dir, sizeof(dir), "/tmp/at_ext_cfg_%s_%d", tag, (int)getpid());
+    mkdir(dir, 0700);
+    char path[192];
+    snprintf(path, sizeof(path), "%s/zta_policy.cfg.json", dir);
+    FILE *fp = fopen(path, "w");
+    if (body != NULL && fp != NULL)
+        fputs(body, fp);
+    if (fp != NULL)
+        fclose(fp);
+    if (body == NULL)
+        unlink(path);
+    return dir;
+}
+
+/* A core-only binary has no ZTA: a policy that turns it on refuses the start,
+ * one that does not (or none) is fine (FEATURE_SPLIT_PLAN Phase 6). */
+DEFINE_TEST(test_core_only_refuses_an_enabled_zta_policy)
+{
+    ck_assert(!identity_ext_present("zta"));
+    ck_assert_int_eq(identity_ext_check_config(_zta_cfg_dir("on", "{\"enabled\": true}"), NULL), -1);
+    ck_assert_int_eq(identity_ext_check_config(_zta_cfg_dir("off", "{\"enabled\": false}"), NULL), 0);
+    ck_assert_int_eq(identity_ext_check_config(_zta_cfg_dir("none", NULL), NULL), 0);
+    ck_assert_int_eq(identity_ext_check_config(_zta_cfg_dir("junk", "not json"), NULL), 0);
+    /* The policy's loader is the library's: the section is not registered. */
+    ck_assert_ptr_null(find_configuration("zta_policy"));
+}
+END_TEST_DEFINITION()
+
+static int probe_from_json(const json_t *obj, void *data) { (void)obj; (void)data; return 0; }
+
+/* The configuration and error tables take an extension's entries the way the
+ * process table does: bounds-checked, never written past their end
+ * (FEATURE_SPLIT_PLAN §3.3, Phase 6). */
+DEFINE_TEST(test_configuration_and_error_table_append)
+{
+    const size_t before = configuration_table_size;
+    static int probe_struct;
+    ck_assert_int_eq(configuration_table_append("probe_section", NULL, probe_from_json,
+                                                sizeof(probe_struct), &probe_struct), 0);
+    ck_assert_int_eq((int)configuration_table_size, (int)before + 1);
+    config_t *found = find_configuration("probe_section");
+    ck_assert_ptr_nonnull(found);
+    ck_assert(found->from_json == probe_from_json);
+    ck_assert_int_eq((int)found->data_len, (int)sizeof(probe_struct));
+    ck_assert_int_eq(configuration_table_append("probe_section", NULL, probe_from_json,
+                                                0, NULL), -1);
+    ck_assert_int_eq(configuration_table_append(NULL, NULL, probe_from_json, 0, NULL), -1);
+    ck_assert_int_eq(configuration_table_append("", NULL, probe_from_json, 0, NULL), -1);
+    ck_assert_int_eq(configuration_table_append("no_parser", NULL, NULL, 0, NULL), -1);
+    ck_assert_int_eq(configuration_table_append("identity", NULL, probe_from_json, 0, NULL), -1);
+    static char names[AT_CONFIG_EXT_MAX + 1][24];
+    int accepted = 0, refused = 0;
+    for (int i = 0; i < AT_CONFIG_EXT_MAX + 1; i++)
+    {
+        snprintf(names[i], sizeof(names[i]), "fill_section_%d", i);
+        if (configuration_table_append(names[i], NULL, probe_from_json, 0, NULL) == 0)
+            accepted++;
+        else
+            refused++;
+    }
+    /* The table filled and refused the rest: never written past its end. */
+    ck_assert(refused >= 1);
+    ck_assert_int_eq((int)configuration_table_size, (int)before + 1 + accepted);
+
+    const size_t e_before = error_table_size;
+    ck_assert_int_eq(error_table_append(9001, "EPROBE", "a probe error"), 0);
+    ck_assert_int_eq((int)error_table_size, (int)e_before + 1);
+    ck_assert_int_eq(error_table_append(9001, "EPROBE_AGAIN", "same number"), -1);
+    /* The same error again is one error, not two. */
+    ck_assert_int_eq(error_table_append(9001, "EPROBE", "a probe error"), 0);
+    ck_assert_int_eq((int)error_table_size, (int)e_before + 1);
+    ck_assert_int_eq(error_table_append(9002, NULL, "unnamed"), -1);
+    int e_accepted = 0, e_refused = 0;
+    for (int i = 0; i < 200; i++)
+    {
+        if (error_table_append(9100 + i, "EFILL", "fill") == 0)
+            e_accepted++;
+        else
+            e_refused++;
+    }
+    ck_assert(e_refused >= 1);
+    ck_assert_int_eq((int)error_table_size, (int)e_before + 1 + e_accepted);
+    ck_assert(error_table_size <= 128);
+}
+END_TEST_DEFINITION()
+
 /* A core-only binary (this one links the core alone) has no social feature:
  * no identity extension named "social", none of its verbs on identity, and a
  * node told to publish a position or profile refuses to start rather than
@@ -243,4 +338,6 @@ RUN_TESTS(Extension, test_registration_refusals,
           test_first_contact_registers_exactly_when_enabled,
           test_transport_registration,
           test_process_table_append,
+          test_configuration_and_error_table_append,
+          test_core_only_refuses_an_enabled_zta_policy,
           test_core_only_has_no_social_and_refuses_its_declarations)

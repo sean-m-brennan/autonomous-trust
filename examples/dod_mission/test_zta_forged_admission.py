@@ -42,7 +42,7 @@ from tools.provision_zta_certs import (  # noqa: E402
     make_ca, make_leaf_cert, make_leaf_keypair, cert_der, ca_bundle_pem,
     forged_credential)
 from autonomous_trust.core.identity.idprocess import IdentityProcess  # noqa: E402
-from autonomous_trust.core.identity.zta import (  # noqa: E402
+from autonomous_trust.zta import (  # noqa: E402
     ZtaPolicy, BINDING_MODE_OFF, BINDING_MODE_REQUIRE)
 
 
@@ -130,7 +130,7 @@ def test_provision_roster_round_trips(tmp_path):
     # The CLI-level provisioner writes legit creds that verify and forged ones
     # that don't, under a realistic per-peer layout.
     from tools.provision_zta_certs import provision
-    from autonomous_trust.core.identity.zta import X509Verifier, ZtaStatus
+    from autonomous_trust.zta import X509Verifier, ZtaStatus
     peers = {"squad-captain": None, "sensor-1": "unsigned", "sensor-2": "self_signed"}
     provision(tmp_path, peers)
     bundle = tmp_path / "squad-captain" / "etc" / "at" / "zta-ca-bundle.pem"
@@ -158,7 +158,7 @@ def _real_identity(nick: str):
 def _bind(leaf_key, ident, cred: bytes) -> bytes:
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import ec
-    from autonomous_trust.core.identity.zta_binding import zta_binding_preimage
+    from autonomous_trust.zta.zta_binding import zta_binding_preimage
     return leaf_key.sign(zta_binding_preimage(ident, cred), ec.ECDSA(hashes.SHA256()))
 
 

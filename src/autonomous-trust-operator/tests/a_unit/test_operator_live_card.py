@@ -27,7 +27,7 @@ import tempfile
 import pytest
 from textual.widgets import Button, Input, Static
 
-from autonomous_trust.core.identity.zta.piv.pkcs11 import PivTokenError
+from autonomous_trust.operator.piv.pkcs11 import PivTokenError
 from autonomous_trust.operator import __main__ as entry
 from autonomous_trust.operator import demo as opdemo
 from autonomous_trust.operator.app import OperatorApp
@@ -183,7 +183,7 @@ class TestLiveCardActivator:
         assert _FakeCard.opened[-1]['module'] is None
 
     def test_totp_enforced_when_secret_set(self, pki):
-        from autonomous_trust.core.identity.zta.totp import (generate_totp_secret,
+        from autonomous_trust.zta.totp import (generate_totp_secret,
                                                              totp_now)
         secret = generate_totp_secret()
         act = entry.live_card_activator(pki['ca_bundle'], totp_secret=secret,
@@ -227,7 +227,7 @@ class TestEntryPointWiring:
         # --crl-path / --totp-secret must actually arrive at core activate(),
         # not just parse
         seen = {}
-        import autonomous_trust.core.operator.activate as core_act
+        import autonomous_trust.operator.node.activate as core_act
 
         def fake_activate(token, ca_bundle_path, **kw):
             seen.update({'bundle': ca_bundle_path, **kw})
@@ -240,7 +240,7 @@ class TestEntryPointWiring:
              '--totp-secret', 'ABCDEFGHIJKLMNOP']))
         # drive the wired activator with an injected card
         monkeypatch.setattr(
-            'autonomous_trust.core.identity.zta.piv.pkcs11.PyKcs11Token',
+            'autonomous_trust.operator.piv.pkcs11.PyKcs11Token',
             lambda module_path, pin, slot: _FakeCard(module_path, pin, slot,
                                                     pki['token']))
         app.activator('123456', '000000')
@@ -266,7 +266,7 @@ class TestResultRendering:
         return rendered['text']
 
     def test_zta_enum_status_renders_bare_and_green(self):
-        from autonomous_trust.core.identity.zta import ZtaStatus
+        from autonomous_trust.zta import ZtaStatus
 
         class _R:
             status, reason = ZtaStatus.VERIFIED, 'operator activated'
@@ -276,7 +276,7 @@ class TestResultRendering:
         assert 'operator activated' in shown
 
     def test_enum_reject_gets_red(self):
-        from autonomous_trust.core.identity.zta import ZtaStatus
+        from autonomous_trust.zta import ZtaStatus
 
         class _R:
             status, reason = ZtaStatus.REJECTED, 'chain error'
@@ -294,7 +294,7 @@ class TestResultRendering:
 
     def test_every_zta_status_maps_to_a_style(self):
         # no status may silently render unstyled (white) as VERIFIED did
-        from autonomous_trust.core.identity.zta import ZtaStatus
+        from autonomous_trust.zta import ZtaStatus
         from autonomous_trust.operator.screens.activate import _STATUS_STYLE
         for st in ZtaStatus:
             assert st.value in _STATUS_STYLE, st
@@ -303,7 +303,7 @@ class TestResultRendering:
 class TestConsoleFlow:
     def test_status_line_reads_token_present(self, pki):
         # with a live activator wired, a detected card is plainly ready
-        from autonomous_trust.core.identity.zta.piv.pkcs11 import TokenProbe
+        from autonomous_trust.operator.piv.pkcs11 import TokenProbe
         app = OperatorApp(auto_start=False, poll_interval=0.05,
                           activator=entry.live_card_activator(
                               pki['ca_bundle'], token_factory=_factory(pki)),
@@ -319,7 +319,7 @@ class TestConsoleFlow:
         _run(scenario)
 
     def test_pin_entry_activates_and_is_cleared(self, pki):
-        from autonomous_trust.core.identity.zta.piv.pkcs11 import TokenProbe
+        from autonomous_trust.operator.piv.pkcs11 import TokenProbe
         app = OperatorApp(auto_start=False, poll_interval=0.05,
                           activator=entry.live_card_activator(
                               pki['ca_bundle'], token_factory=_factory(pki)),
@@ -343,7 +343,7 @@ class TestConsoleFlow:
         _run(scenario)
 
     def test_bad_pin_shows_rejected(self, pki):
-        from autonomous_trust.core.identity.zta.piv.pkcs11 import TokenProbe
+        from autonomous_trust.operator.piv.pkcs11 import TokenProbe
         act = entry.live_card_activator(
             pki['ca_bundle'],
             token_factory=_factory(pki, raises=PivTokenError('PIN login failed')))

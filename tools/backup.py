@@ -43,7 +43,7 @@ from autonomous_trust.core._python.contacts import device as dv
 from autonomous_trust.core._python.contacts.siblings import Siblings
 from autonomous_trust.core._python.contacts.store import Contacts
 from autonomous_trust.core._python.identity import device_contact
-from autonomous_trust.core._python.operator.activate import (
+from autonomous_trust.core._python.identity.operator_keystore import (
     load_or_create_operator_key, operator_key_path)
 
 
