@@ -102,6 +102,42 @@ int get_data_dir(char *path, size_t destlen)
     return path_join(path, destlen, rootDir(), DATA_PATH);
 }
 
+int configuration_table_append(const char *name,
+                               int (*to)(const void *, json_t **),
+                               int (*from)(const json_t *, void *),
+                               size_t len, void *struct_ptr)
+{
+    const size_t cap = sizeof(configuration_table) / sizeof(configuration_table[0]);
+    if (name == NULL || name[0] == '\0' || from == NULL)
+    {
+        fprintf(stderr, "configuration_table_append: refusing an unnamed or "
+                        "unparseable section\n");
+        return -1;
+    }
+    for (size_t i = 0; i < configuration_table_size; i++)
+        if (strcmp(configuration_table[i].name, name) == 0)
+        {
+            fprintf(stderr, "configuration_table_append: refusing %s: already in "
+                            "the table\n", name);
+            return -1;
+        }
+    if (configuration_table_size >= cap)
+    {
+        fprintf(stderr, "configuration_table_append: refusing %s: table full (%zu)\n",
+                name, cap);
+        return -1;
+    }
+    config_t *entry = &configuration_table[configuration_table_size];
+    memset(entry, 0, sizeof(*entry));
+    entry->name = name;
+    entry->to_json = to;
+    entry->from_json = from;
+    entry->data_len = len;
+    entry->data_struct = struct_ptr;
+    configuration_table_size++;
+    return 0;
+}
+
 /* Frama-C: skipped — find_configuration: 3x assigns + ensures. */
 /*@
   requires name != \null && \valid_read(name);

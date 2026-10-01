@@ -23,10 +23,8 @@ project(autonomous_trust_examples C CXX)
 option(AT_ZTA "Enable Zero Trust Architecture credential integration" OFF)
 option(AT_STATIC "Link demos fully statically" OFF)
 
-# OpenSSL imported targets must be visible in this scope for linking
-if(AT_ZTA)
-    find_package(OpenSSL REQUIRED)
-endif()
+# OpenSSL comes with libat_zta (src/c/extensions/zta), which makes its
+# imported targets global.
 
 # Build the library as a subdirectory.
 # This makes autonomous_trust_static (and its include dirs, compile defs,
@@ -69,6 +67,13 @@ function(add_at_example target source)
     if(TARGET at_gateway_static)
         list(APPEND _at_ext_libs at_gateway_static)
     endif()
+    # ZTA (AT_ZTA builds libat_zta, which brings OpenSSL).
+    set(_at_ext_deps)
+    if(TARGET at_zta_static)
+        list(APPEND _at_ext_libs at_zta_static)
+        list(APPEND _at_ext_deps OpenSSL::SSL OpenSSL::Crypto)
+        target_include_directories(${target} PRIVATE ${AT_LIB_DIR}/extensions)
+    endif()
     # The verification layers (AT_ORACLE_*, libat_<layer>).
     foreach(_layer physics calibration certificates prequential replication)
         if(TARGET at_${_layer}_static)
@@ -77,7 +82,7 @@ function(add_at_example target source)
     endforeach()
     target_link_libraries(${target} PRIVATE
         -Wl,--whole-archive ${_at_ext_libs} autonomous_trust_static -Wl,--no-whole-archive
-        ${DEPENDENCIES}
+        ${DEPENDENCIES} ${_at_ext_deps}
     )
     # -fms-extensions is REQUIRED, not cosmetic: the library headers embed
     # smrt_ptr_t (and struct tm / thread_args_t / public_identity_t) as

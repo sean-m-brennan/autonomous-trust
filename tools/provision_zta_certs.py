@@ -239,7 +239,7 @@ def provision(out_root: Path, peers: dict) -> None:
                 format=serialization.PrivateFormat.PKCS8,
                 encryption_algorithm=serialization.NoEncryption()))
         policy = {
-            "__type__": "autonomous_trust.core._python.identity.zta.zta_policy.ZtaPolicy",
+            "__type__": "autonomous_trust.zta.zta_policy.ZtaPolicy",
             "enabled": True,
             "require_at_admission": True,
             "verifier_type": "x509",

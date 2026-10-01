@@ -52,7 +52,7 @@ typedef struct {
  ****************************/
 
 /** @brief Error: no suitable network interface was found. */
-#define EGEN_NOIF 220
+#define EGEN_NOIF 226   /* was 220, which EDAG_INVALID_BRANCH holds */
 DECLARE_ERROR(EGEN_NOIF, "No suitable network interface found");
 
 /****************************

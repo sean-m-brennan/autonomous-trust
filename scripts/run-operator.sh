@@ -99,7 +99,7 @@ src="$here/src"
 # Namespace-package roots the operator imports from (core + its verification
 # layers + services + operator); prepended so a working tree runs without an
 # editable install.
-export PYTHONPATH="$src/autonomous-trust:$src/autonomous-trust-oracle:$src/autonomous-trust-services:$src/autonomous-trust-operator${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$src/autonomous-trust:$src/autonomous-trust-oracle:$src/autonomous-trust-zta:$src/autonomous-trust-services:$src/autonomous-trust-operator${PYTHONPATH:+:$PYTHONPATH}"
 # Operator core (session/activate/resource_directory/operator_node) is python-only.
 export AUTONOMOUS_TRUST_BACKEND="${AUTONOMOUS_TRUST_BACKEND:-python}"
 

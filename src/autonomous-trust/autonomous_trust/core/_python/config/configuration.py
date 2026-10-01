@@ -80,6 +80,20 @@ def register_config_type(cls):
     _ALLOWED_CONFIG_TYPES.add(type_name)
 
 
+#: Former ``__type__`` names of configuration classes that moved, -> the class.
+#: A file written before the move still names the old path; decoding it as the
+#: class it now is beats refusing it (or, for a policy, silently disabling it).
+_CONFIG_TYPE_ALIASES: dict = {}
+
+
+def register_config_alias(old_type_name: str, cls) -> None:
+    """Let files whose ``__type__`` is ``old_type_name`` decode as ``cls``. For a
+    class an extension took out of the core (FEATURE_SPLIT_PLAN Phase 6's
+    ZtaPolicy): the extension registers its own old names, so the core names
+    none."""
+    _CONFIG_TYPE_ALIASES[str(old_type_name)] = cls
+
+
 def register_enum_type(cls):
     """Register an Enum type as allowed for deserialization."""
     type_name = cls.__module__ + '.' + cls.__qualname__
@@ -370,6 +384,9 @@ def config_json_decoder(dct):
             module = import_module(module_name)
         cls = getattr(module, class_name)
         return cls[dct['__value__']]
+    if type_name in _CONFIG_TYPE_ALIASES:
+        kwargs = {k: v for k, v in dct.items() if k != '__type__'}
+        return _CONFIG_TYPE_ALIASES[type_name](**kwargs)
     if '.' in type_name:
         if type_name not in _ALLOWED_CONFIG_TYPES:
             raise ValueError(f"Type '{type_name}' not in allowed configuration types")

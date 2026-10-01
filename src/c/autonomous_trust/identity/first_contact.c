@@ -1107,7 +1107,7 @@ bool handle_first_contact_hello(const process_t *proc, directory_t *queues,
                sizeof(ack.info.net_msg.return_to));
     net_msg_pack_json(&ack.info.net_msg, body);
     json_decref(body);
-    messaging_send("network", NET_MESSAGE, &ack, false);
+    (void)identity_send_to_network(proc, &ack, "first contact ack", NULL);
     net_msg_free_obj(&ack.info.net_msg);
     _free_public(&ack.info.net_msg.from_whom);
     if (pair) {
@@ -1290,7 +1290,7 @@ static void _fc_send_relay_route(const uuid_t uuid, const fc_relay_t *eps,
     route.info.net_msg.encrypt = false;
     net_msg_pack_json(&route.info.net_msg, rb);
     json_decref(rb);
-    messaging_send("network", NET_MESSAGE, &route, false);
+    (void)identity_send_to_network(NULL, &route, "first contact relay route", NULL);
     net_msg_free_obj(&route.info.net_msg);
 }
 
@@ -1410,7 +1410,7 @@ int at_first_contact_initiate_prov(const process_t *proc, directory_t *queues,
              json_string_value(json_object_get(inv.body, "nonce")), ref,
              (double)time(NULL), relay_eps, n_relay, provenance,
              strcmp(at_invitation_purpose(&inv), AT_INVITATION_PURPOSE_PAIR) == 0);
-    messaging_send("network", NET_MESSAGE, &hello, false);
+    (void)identity_send_to_network(proc, &hello, "first contact hello", NULL);
     net_msg_free_obj(&hello.info.net_msg);
     _free_public(&hello.info.net_msg.from_whom);
     at_invitation_free(&inv);
@@ -2024,9 +2024,18 @@ bool handle_first_contact_app_list(const process_t *proc, directory_t *queues,
             order[i] = &b.store.items[i];
         if (n > 1)
             qsort(order, n, sizeof(*order), _fc_by_added);
-        for (size_t i = 0; i < n; i++)
+        for (size_t i = 0; i < n; i++) {
             _fc_emit_contact(proc, AT_APP_EVENT_FC_CONTACT, b.ref, order[i],
                              NULL, AT_FC_METHOD_NONE, false, 0);
+            /* Each further device, in filing order, so an app can rebuild
+               which devices are one person after a restart, a sibling sync or
+               a restore -- none of which says so live. */
+            for (size_t d = 0; d < order[i]->devices_count; d++) {
+                uuid_t dev;
+                if (uuid_parse(order[i]->devices[d].uuid, dev) == 0)
+                    at_fc_emit_device_linked_ref(proc, b.ref, order[i], dev);
+            }
+        }
         /* Always, so an empty book is an answer and not a silence. */
         _fc_emit_contact(proc, AT_APP_EVENT_FC_CONTACTS_DONE, b.ref, NULL, NULL,
                          AT_FC_METHOD_NONE, false, (int32_t)n);
@@ -2366,7 +2375,7 @@ static void _fc_push_own_record(const process_t *proc, const public_identity_t *
         at_strlcpy(msg.info.net_msg.return_to, "identity",
                    sizeof(msg.info.net_msg.return_to));
         net_msg_pack_json(&msg.info.net_msg, wire);
-        messaging_send("network", NET_MESSAGE, &msg, false);
+        (void)identity_send_to_network(proc, &msg, "first contact reachability record", NULL);
         net_msg_free_obj(&msg.info.net_msg);
     }
     json_decref(wire);
@@ -2483,7 +2492,7 @@ void at_first_contact_refresh_own_record(const process_t *proc)
     msg.info.net_msg.encrypt = false;
     net_msg_pack_json(&msg.info.net_msg, wire);
     json_decref(wire);
-    messaging_send("network", NET_MESSAGE, &msg, false);
+    (void)identity_send_to_network(proc, &msg, "first contact relay registration", NULL);
     net_msg_free_obj(&msg.info.net_msg);
 }
 
@@ -2652,10 +2661,17 @@ void at_fc_push_own_record(const process_t *proc, const public_identity_t *only)
 void at_fc_emit_device_linked(const process_t *proc, const contact_t *c,
                               const uuid_t device)
 {
+    at_fc_emit_device_linked_ref(proc, "", c, device);
+}
+
+void at_fc_emit_device_linked_ref(const process_t *proc, const char *ref,
+                                  const contact_t *c, const uuid_t device)
+{
     generic_msg_t msg = {0};
     msg.type = FIRST_CONTACT_CONTACT_EVENT;
     fc_contact_msg_t *m = AT_MSG_EXT(&msg, fc_contact_msg_t);
     m->kind = AT_APP_EVENT_FC_DEVICE_LINKED;
+    at_strlcpy(m->data.ref, ref != NULL ? ref : "", sizeof(m->data.ref));
     memcpy(m->data.peer_uuid, c->identity.uuid, sizeof(m->data.peer_uuid));
     at_strlcpy(m->data.nickname, c->identity.nickname, sizeof(m->data.nickname));
     at_strlcpy(m->data.petname, c->petname, sizeof(m->data.petname));

@@ -36,7 +36,7 @@
 #include "utilities/exception.h"
 #include "network/net_message.h"
 
-#define EUPDATE 280
+#define EUPDATE 300   /* fleet: 300s (280 is EZTA_NOCRED) */
 DEFINE_ERROR(EUPDATE, "Update process error");
 
 /* Protocol-string definition (declared `extern char[]` in
