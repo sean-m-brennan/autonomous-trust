@@ -254,6 +254,32 @@ def test_our_record_is_issued_on_change_pushed_and_published(monkeypatch):
     assert fc.refresh_own_record(StubProc(me), q).seq == 2
 
 
+@pytest.mark.parametrize('case', ['contact', 'stranger', 'wire'])
+def test_a_contact_reaching_us_through_a_relay_is_sent_our_record(monkeypatch, case):
+    """A contact that registered at our relay after our startup push missed it;
+    its traffic arriving through the relay re-sends it. Strangers get nothing,
+    and the trigger is local IPC only."""
+    monkeypatch.setenv('AT_USE_RELAY', '203.0.113.7:27790')
+    me, alice, mallory = _ident('me@ex', '10.0.0.5'), _ident('alice@ex'), _ident('mallory@ex')
+    proc = _with_contact(me, alice)
+    proc.peers.add(alice.publish(), proc.peers.mid_level)
+    proc.peers.add(mallory.publish(), proc.peers.mid_level)
+    q = {CfgIds.network: queue.Queue()}
+    fc.refresh_own_record(proc, q)
+    while not q[CfgIds.network].empty():
+        q[CfgIds.network].get_nowait()
+    who = mallory if case == 'stranger' else alice
+    fc.handle_relay_peer(proc, q, types.SimpleNamespace(
+        from_whom=alice.publish() if case == 'wire' else None,
+        obj=json.dumps({'uuid': str(who.uuid)})))
+    pushed = []
+    while not q[CfgIds.network].empty():
+        m = q[CfgIds.network].get_nowait()
+        if m.function == IdentityProtocol.reach_record:
+            pushed.append(str(m.to_whom[0].uuid))
+    assert pushed == ([str(alice.uuid)] if case == 'contact' else [])
+
+
 # -- the network process looks a lost peer up ---------------------------------------
 def test_a_lost_peer_is_looked_up_at_every_relay_rate_limited():
     from autonomous_trust.core._python.network.netprocess import NetworkProcess

@@ -166,6 +166,7 @@ char NET_FN_RELAY_ROUTE[] = "relay_route";
  * ({relay: host:port, uuid, fp}), so the links identity mints can pin it.
  * Mirror: Python Network.relay_identity. */
 char NET_FN_RELAY_IDENTITY[] = "relay_identity";
+char NET_FN_RELAY_PEER[] = "relay_peer";
 /* identity -> network, local IPC: our own reachability record ({body, sig}) to
  * file at each of our relays. Mirror: Python Network.reach_publish. */
 char NET_FN_REACH_PUBLISH[] = "reach_publish";
@@ -1564,9 +1565,27 @@ static void _relay_deliver(void *arg, const char *from_uuid,
         pthread_mutex_unlock(&net_relay.lock);
         /* Once per change, so an operator can see which relay carries a peer,
          * and when it failed over. */
-        if (changed)
+        if (changed) {
             log_info(ctx->logger, "Relay: %.8s is talking to us through %s:%d\n",
                      from_uuid, host, port);
+            /* Tell identity: first contact answers a contact with our record
+             * (NET_FN_RELAY_PEER). */
+            json_t *body = json_pack("{s:s}", "uuid", from_uuid);
+            if (body != NULL) {
+                generic_msg_t msg = {0};
+                msg.type = NET_MESSAGE;
+                at_strlcpy(msg.info.net_msg.process, "identity",
+                           sizeof(msg.info.net_msg.process));
+                msg.info.net_msg.function = NET_FN_RELAY_PEER;
+                msg.info.net_msg.encrypt = false;
+                net_msg_pack_json(&msg.info.net_msg, body);
+                json_decref(body);
+                if (messaging_send("identity", NET_MESSAGE, &msg, false) != 0)
+                    log_debug(ctx->logger, "Relay: relay_peer for %.8s not sent\n",
+                              from_uuid);
+                net_msg_free_obj(&msg.info.net_msg);
+            }
+        }
     }
     handle_inbound_relayed(ctx, frame, len, from_uuid);
 }

@@ -1240,6 +1240,19 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                 self.logger.warning('Relay: identity queue full; record %s dropped',
                                     rid[:8])
 
+    def _tell_identity_relay_peer(self, queues, uuid):
+        """Local IPC: ``uuid`` reached us through a relay, first in this run or
+        through another one (Network.relay_peer)."""
+        if CfgIds.identity not in queues:
+            return
+        msg = Message(CfgIds.identity, Network.relay_peer, json.dumps({'uuid': uuid}),
+                      to_whom=None, from_whom=None)
+        try:
+            queues[CfgIds.identity].put(msg, block=False)
+        except Full:
+            self.logger.debug('Relay: identity queue full; relay_peer for %s dropped',
+                              uuid[:8])
+
     def _drain_relayed(self, queues, budget):
         """Hand relayed frames to the same parse-and-route paths UDP uses,
         attributing each by the uuid the RELAY stamped, not by an address."""
@@ -1271,6 +1284,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                     self._relay_live[frm] = endpoint
                     self.logger.info('Relay: %s is talking to us through %s:%d',
                                      frm[:8], endpoint[0], endpoint[1])
+                    self._tell_identity_relay_peer(queues, frm)
                 self._msg_to_queue(plain, peer, queues, 'relay', wire_format=fmt)
                 continue
             # A sender we do not know yet: only plaintext can be read (the

@@ -428,7 +428,13 @@ persisted, so it only ever rises.
 A record travels two ways. It is **pushed** to every contact that is a peer
 at the time, over the sealed channel, and to a new contact the moment the
 handshake completes (which is how the inviter learns the initiator's own
-relays -- the hello carries none). And it is **filed at each of the node's
+relays -- the hello carries none). It is pushed again to a contact (or one of
+the node's own devices) the first time in a run that the contact is seen
+talking to it through a relay, or through a different relay than before (the
+network process's `relay_peer`, local IPC only). A contact that restarted with
+the node and registered at its relay a moment after the startup push missed
+that push, and since it holds the node's old relay it cannot ask for the record. Its
+traffic arriving is the first sign that the path works. And it is **filed at each of the node's
 relays** under the fingerprint of its key: a relay files only its registrant's
 own record (the key must be the one it registered with) and only a newer one.
 When a node has lost a contact through every relay it knows, it asks each relay

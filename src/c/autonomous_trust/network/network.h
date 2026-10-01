@@ -123,6 +123,11 @@ extern char NET_FN_READMIT[];
 extern char NET_FN_RELAY_ROUTE[];
 /** network -> identity, local IPC: an own relay proved who it is. */
 extern char NET_FN_RELAY_IDENTITY[];
+/** network -> identity, local IPC: a known peer is talking to us through a
+ *  relay ({uuid}), first in this run or through another relay than before.
+ *  First contact answers a contact with our reachability record. Mirrors
+ *  Python Network.relay_peer. */
+extern char NET_FN_RELAY_PEER[];
 /** identity -> network, local IPC: our own reachability record to publish. */
 extern char NET_FN_REACH_PUBLISH[];
 /** identity -> network, local IPC: the directory. Mirror: Python Network.dir_*. */
