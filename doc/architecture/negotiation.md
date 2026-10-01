@@ -187,7 +187,7 @@ That check runs *before* the flood counter, and the order is the security
 property rather than an implementation detail. Behind the counter, replaying one
 captured invitation six times would trip the flood refusal, and a refusal is
 what the requester reads as the worker dropping out, which it acts on by
-cancelling that participant. A replay would then be a way to evict an honest
+canceling that participant. A replay would then be a way to evict an honest
 worker from work it had already accepted. Ahead of the counter, the counter
 counts what we built it to count: distinct invitations for one task, which is a
 requester misbehaving rather than an attacker echoing.

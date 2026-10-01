@@ -383,13 +383,13 @@ the real tier.
 *Demotion.* This is the more interesting direction because of tasks in flight.
 When the tier of a peer drops below the required tier of a capability that peer
 is currently executing for somebody else, or whose results somebody else is
-waiting on, that work has to be cancelled rather than allowed to complete and
+waiting on, that work has to be canceled rather than allowed to complete and
 silently exfiltrate data.
 
 The mechanism runs in four steps. The tier-change publisher detects that the new
 tier is lower than the old. It emits a tier-lost message onto the negotiation
 queue in addition to the ordinary update. The negotiation handler walks the
-tracked tasks and the job queue, cancelling every task where the affected peer
+tracked tasks and the job queue, canceling every task where the affected peer
 is a participant and the required tier now exceeds what the peer holds.
 Cancellation means removing the job from the queue, reporting the cancellation
 to the originator, sending a refusal to the other participants, and deleting the
@@ -491,7 +491,7 @@ for the other.
 ## 11. Conformance impact
 
 New scenarios cover the bootstrap corpus running on admission, refusal below a
-required tier, tier loss cancelling a running task, weighted pure reputation,
+required tier, tier loss canceling a running task, weighted pure reputation,
 and the trust-agreement threshold filter.
 
 `bootstrap/probes-continue-past-the-window` pins the continuous phase: that

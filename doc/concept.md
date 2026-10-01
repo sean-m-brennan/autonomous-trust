@@ -24,7 +24,7 @@ The alternative is to make trust a value that each node computes for itself,
 continuously, from what it has actually observed. A peer starts every
 relationship at zero. It earns reach by behaving well in dealings that really
 happened. It loses reach when its behavior changes, within seconds, without
-anybody filing anything. And every part of that judgement is made locally, so it
+anybody filing anything. And every part of that judgment is made locally, so it
 keeps working when the node is cut off from everything.
 
 This chapter is why we built the framework that way, and the chapters after it
