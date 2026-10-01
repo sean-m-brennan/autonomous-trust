@@ -152,6 +152,14 @@ int at_first_contact_restore_contacts(process_t *proc);
 bool handle_first_contact_relay_identity(const process_t *proc, directory_t *queues,
                                          generic_msg_t *msg);
 
+/** The network process's NET_FN_RELAY_PEER: a known peer is talking to us
+ *  through a relay, first in this run or through another relay. A contact or
+ *  one of our own devices is sent our reachability record: one that restarted
+ *  with us and registered a moment late missed the push at our startup, and
+ *  holds our OLD relay, so it could not ask. Local only. */
+bool handle_first_contact_relay_peer(const process_t *proc, directory_t *queues,
+                                     generic_msg_t *msg);
+
 /** A contact's signed reachability record (contacts/reach.h), pushed by the
  *  contact or handed on by our network process from a relay lookup. */
 bool handle_first_contact_reach_record(const process_t *proc, directory_t *queues,

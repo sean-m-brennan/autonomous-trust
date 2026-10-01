@@ -311,6 +311,8 @@ def register(proc) -> None:
     proc._own_relay_pins = {}
     proc.protocol.register_handler(Network.relay_identity,
                                    functools.partial(handle_relay_identity, proc))
+    proc.protocol.register_handler(Network.relay_peer,
+                                   functools.partial(handle_relay_peer, proc))
     proc.protocol.register_handler(IdentityProtocol.reach_record,
                                    functools.partial(handle_reach_record, proc))
     proc.protocol.register_handler(APP_INITIATE,
@@ -1264,6 +1266,38 @@ def handle_relay_identity(proc, queues, message) -> bool:
         proc.logger.info('first contact: our relay %s:%d is %s; links now pin it',
                          endpoint[0], endpoint[1], pin[0][:8])
         refresh_own_record(proc, queues)
+    return True
+
+
+def handle_relay_peer(proc, queues, message) -> bool:
+    """The network process says a known peer is talking to us through a relay
+    (``{uuid}``): first in this run, or through another relay. If it is a
+    contact or one of our own devices, send it our reachability record.
+
+    A record we issue is pushed once, to whoever is reachable at that moment.
+    A contact that restarts with us and registers at the relay a moment later
+    misses it, and could not reach us to ask -- it holds our OLD relay. Its
+    traffic arriving now is the first sign the path works, so answer it. Local
+    IPC only: a peer must not make us send it records on demand."""
+    if getattr(message, 'from_whom', None) is not None:
+        proc.logger.warning('first contact: refusing relay_peer from the wire')
+        return True
+    try:
+        spec = json.loads(message.obj) if isinstance(message.obj, str) else message.obj
+        uuid = str(spec['uuid']).lower()
+    except (KeyError, TypeError, ValueError, AttributeError):
+        proc.logger.debug('first contact: unusable relay_peer %r', message.obj)
+        return True
+    from . import sibling_sync
+    store = _contacts_store(proc)
+    if store.get(uuid) is None and uuid not in sibling_sync.siblings(proc):
+        return True
+    peer = proc.peers.find_by_uuid(uuid)
+    if peer is None:
+        return True
+    _push_own_record(proc, queues, [peer])
+    proc.logger.debug('first contact: sent our reachability record to %s, which '
+                      'just reached us through a relay', uuid[:8])
     return True
 
 

@@ -60,6 +60,12 @@ class Network(InitializableConfig):
     #: network -> identity, local IPC: one of our OWN relays proved who it is
     #: ({relay: host:port, uuid, fp}), so the links identity mints can pin it.
     relay_identity = 'relay_identity'
+    #: network -> identity, local IPC: a known peer is talking to us through a
+    #: relay ({uuid}), first in this run or through another relay than before.
+    #: First contact answers a contact with our reachability record, so one
+    #: that missed the push at our startup (it was not registered yet) learns
+    #: where we are now.
+    relay_peer = 'relay_peer'
     #: identity -> network, local IPC: our own current reachability record
     #: ({body, sig}), to publish at each of our relays.
     reach_publish = 'reach_publish'
