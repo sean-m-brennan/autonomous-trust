@@ -972,7 +972,7 @@ counting as final on its own signature, no root match, freeing the ack before
 building the final, each in the runtimes it applies to, and, for the outvoted
 case, removing the quorum-chain rule or the chain request in either runtime.
 
-The same runs tightened three neighbouring hand-offs that dropped data when a
+The same runs tightened three neighboring hand-offs that dropped data when a
 queue was full, being the group multicast of a post, identity's hand-off of a
 social score to reputation, and its hand-off of an app-decided standing. All
 three now retry for a bounded time, like the directed senders before them
@@ -992,7 +992,7 @@ genuine signature from a peer it knows.
 That proves the gate opens, the handler runs, and the round-trip works across
 two real processes on a real wire. It proves **nothing** about whether a
 deployment would ever send such a message, because today none would. The
-synthetic traffic is labelled as such in the cohort's own output, and the gap it
+synthetic traffic is labeled as such in the cohort's own output, and the gap it
 stands over is documented rather than papered over.
 
 ## Pinned scenarios

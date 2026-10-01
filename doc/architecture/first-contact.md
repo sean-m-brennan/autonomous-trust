@@ -168,7 +168,7 @@ only when it answers one:
   with its own key. The invitation is where Bob learned the real key, so it is
   what the ack is compared against.
 - **Echoing the nonce of the ticket presented.** Otherwise one outstanding hello
-  would be a blank cheque for any ack under the inviter's name.
+  would be a blank check for any ack under the inviter's name.
 - **Within the handshake window**, 120 seconds (`PENDING_TTL_SECONDS` /
   `AT_FC_PENDING_TTL_SECONDS`).
 
@@ -185,7 +185,7 @@ can attribute its frames and reputation can score it, and stops there. It does
 history. A first-contact peer is *directly reachable* rather than a member of
 the inviter's cohort.
 
-That distinction is the security property rather than a labelling nicety. Were
+That distinction is the security property rather than a labeling nicety. Were
 the group key to follow a direct peer in, one out-of-band invitation would
 become unilateral group admission: anybody Alice ever invited would hold the
 cohort's shared private key, and the majority vote the identity protocol exists
@@ -237,7 +237,7 @@ restart. Both handlers therefore write a Contact to the durable store, the
 accepter when it honors a ticket and the initiator when the ack lands.
 
 A NEW record is always `token` provenance and **unverified**, with no trust
-seed. The accepter cannot know how its own invitation travelled, because
+seed. The accepter cannot know how its own invitation traveled, because
 `create_invitation` carries no in-person flag, since in-person-ness is the
 *redeemer's* local knowledge. A key that arrived over the wire has had no
 out-of-band confirmation, and recording it as verified would hand

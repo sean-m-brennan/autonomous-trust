@@ -75,10 +75,10 @@ library for and that would have to be reimplemented and kept in step.
 ### One-sided on purpose
 
 An over-*cautious* peer, whose sets cover far more often than advertised, is
-not penalised here. Its sets are wide and therefore useless, and that shows up
+not penalized here. Its sets are wide and therefore useless, and that shows up
 as poor competence wherever competence is measured — but it is not dishonest
 about its own limits, and separating the two is the entire reason this layer
-exists. Penalising it would collapse the distinction the layer was built to
+exists. Penalizing it would collapse the distinction the layer was built to
 draw.
 
 ### Silence, not leniency

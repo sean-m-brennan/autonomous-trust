@@ -292,7 +292,7 @@ follows.
   this layer's arm.
 - [Reputation consensus](reputation.md) — the algebra these verdicts feed.
 - [Trust tiers](trust-tiers.md) — capability weighting, and the declaration file
-  this one is modelled on.
+  this one is modeled on.
 
 ---
 

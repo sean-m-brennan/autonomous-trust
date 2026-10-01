@@ -11,7 +11,7 @@ reputation conflates, and then deliberately scores only one of them:
 * **Honesty about one's own limits** — the sets cover as often as advertised.
   §12.4 audits this, and falsifies a peer that over-claims.
 * **Competence** — the sets are *tight*. §12.4 says explicitly that an
-  over-cautious peer is not penalised there: its sets are useless, but that is
+  over-cautious peer is not penalized there: its sets are useless, but that is
   a competence problem and not a dishonest one.
 
 This layer is where the competence half lands. It scores a peer only on its
@@ -60,7 +60,7 @@ EMA weight  =  transaction_weight        (authored, trust_ladder.json)
 
 The multiplier is confined to a declared band around 1.0 — `weight_band`, with
 `min ≤ 1 ≤ max` enforced at load. The authored `transaction_weight` stays the
-anchor and the operator's number remains the centre of the range: learned
+anchor and the operator's number remains the center of the range: learned
 competence can move a capability's weight within the band the operator allowed
 and can never leave it. A peer with an excellent record on a trivial region
 cannot thereby inflate its say on a heavy one.
@@ -105,7 +105,7 @@ It is exactly the decomposition this layer needs: the first term is
 **sharpness** and the other two are the **miss penalty**, so a peer cannot
 score well by being vague (wide interval, first term large) *or* by being
 overconfident (narrow interval that misses, second term large). A degenerate
-"cover everything" interval, which §12.4 is required to forgive, is penalised
+"cover everything" interval, which §12.4 is required to forgive, is penalized
 here — which is precisely the division of labor between the two layers.
 
 For a vector box the score is the **mean over components**, so a 3-vector
