@@ -167,8 +167,8 @@ predictive distribution, and what a reply actually carries is layer 3's
 `prediction` box -- a central interval at a level. The interval score is proper
 for exactly that object, and it decomposes into sharpness plus a miss penalty,
 so a peer scores badly for being vague *or* for being confidently wrong. That
-is the division of labour with layer 3, which is required to forgive the
-over-cautious peer: the useless-but-honest forecaster is penalised here and
+is the division of labor with layer 3, which is required to forgive the
+over-cautious peer: the useless-but-honest forecaster is penalized here and
 nowhere else. Nothing new went on the wire.
 
 It **modulates** the authored per-capability weight rather than replacing it.
@@ -214,7 +214,7 @@ nothing, since covering as advertised is the least a peer can do. The gradualism
 this section asks for -- a physical refutation should demote faster than a
 drifting calibration score -- is the channel WEIGHT rather than a softened
 number, `physical` at 3 against `calibration` at the baseline 1. The test is the
-exact binomial tail, one-sided, so an over-cautious peer is not penalised: its
+exact binomial tail, one-sided, so an over-cautious peer is not penalized: its
 sets are useless, which is a competence problem, not a dishonest one. Below
 `min_samples` resolutions it is silent rather than lenient. Predictions are
 resolved by ANOTHER peer's later report of the same declared quantity, through
@@ -254,7 +254,7 @@ program (McConnell, Mehlhorn, Naeher and Schweitzer, "Certifying algorithms,"
 Where a certificate exists, peer judgment reduces to running the checker, and
 the oracle becomes exact rather than statistical. Where one does not exist yet,
 redesigning the task interface to produce one is usually a better investment
-than any amount of reputation modelling.
+than any amount of reputation modeling.
 
 **Built, both runtimes, 2026-09-03.** All eight rows, checked exactly and pinned
 against each other by the `certificate` conformance protocol. This is the only
@@ -403,7 +403,7 @@ beating a majority without an external reference.
 
 The escape is a small trusted anchor. FLTrust (Cao et al., 2021) shows that a
 tiny root of verified data restores robustness well past where unanchored
-aggregation fails. The embodied analogue is the **honeypot probe**: occasionally
+aggregation fails. The embodied analog is the **honeypot probe**: occasionally
 assign a peer a task whose answer is already known or independently cheap to
 verify. The AT bootstrap corpus (`at.handshake`, `at.time-attest`,
 `at.echo-challenge`) is already this pattern applied at cold start; the
@@ -502,7 +502,7 @@ consensus average, composed with the per-capability weight, on both runtimes.
 verdict that needs no history at all (`physical`, `certificate`,
 `self_consistency`) counts triple; evidence corroborated by construction
 (`replication`, `probe`) counts double. It applies only to evidence the scoring
-node produced itself: the scorer picks its own tag, so honouring a remote peer's
+node produced itself: the scorer picks its own tag, so honoring a remote peer's
 channel would let any peer treble the weight of a score it fabricated against
 any other.
 

@@ -71,7 +71,7 @@ Due to the need for stealth, failure to locate the target within the allotted ti
 
 Pre-populated assets are unreliable, but may collectively contribute significantly to locating the target via SIGINT and HUMINT.
 
-Near overhead platforms will track all ground participants whenever possible, manoeuvring as needed. Maintaining line-of-sight is very important to facilitate minimally-radiative communications.
+Near overhead platforms will track all ground participants whenever possible, maneuvering as needed. Maintaining line-of-sight is very important to facilitate minimally-radiative communications.
 
 Likewise, ELEO assets should be scheduled, or scheduled around, to maximize availability for the duration of the mission (note: these sats have a very low period, and thus short engagement time). ELEO cubesat comms is necessarily noisy, so its use is discouraged.
 
@@ -139,4 +139,4 @@ Machine-debrief at base will consist of uploading all locally-streamed (single-h
    - laser data transfer
 
 #### ELEO cubesat
-   - low band emergency signalling  
+   - low band emergency signaling  

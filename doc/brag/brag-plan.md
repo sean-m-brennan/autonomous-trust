@@ -223,7 +223,7 @@ Written after the narration was generated and measured, replacing the placeholde
 scene lengths above.
 
 **Final duration: 56.7s** (retimed 2026-09-30 from 44.0s). Seven Kokoro clips
-(`am_michael`, speed 0.96) totalling 50.33s of speech, with the same breathing
+(`am_michael`, speed 0.96) totaling 50.33s of speech, with the same breathing
 room between lines as the 44.0s cut (0.62–0.92s).
 
 | Clip              | Measured | Starts at | Ends  |
@@ -242,7 +242,7 @@ gradient 41.3–50.1 · lockup 50.1–56.7.
 
 The retime carried every timeline constant through the word it was anchored to
 (old and new whisper transcripts aligned word by word), kept elements that sit
-in a gap at their offset from the neighbouring clip boundary, and re-snapped
+in a gap at their offset from the neighboring clip boundary, and re-snapped
 beat-locked moments to the 107.67 BPM grid. The cue preset's analysis window ends
 at 44.0s; beats past it are extrapolated from the fitted grid (0.009s maximum
 residual over 81 beats, and zero phase error against the audio's onsets in

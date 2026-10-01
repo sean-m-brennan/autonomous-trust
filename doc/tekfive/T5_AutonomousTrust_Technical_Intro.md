@@ -236,7 +236,7 @@ questions, and conflating them is a classic mistake.
 `spawn task` → `invitation` (fan-out to peers advertising the capability) → `ack` / `nack` / `haggle` (counter-offer) → `report results` (with zero-knowledge proof)
 
 - Tier-gated invites: a request is refused if the sender's tier is below the capability's `required_tier`. The *local* capability definition is authoritative.
-- Tier-loss cancellation: if a peer is demoted mid-task, work it's no longer authorized for is cancelled automatically.
+- Tier-loss cancellation: if a peer is demoted mid-task, work it's no longer authorized for is canceled automatically.
 - This is where trust composes: the requester verifies the result's ZKP, then submits a transaction score, which feeds Reputation.
 
 ---

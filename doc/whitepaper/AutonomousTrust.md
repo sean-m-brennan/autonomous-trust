@@ -349,7 +349,7 @@ below the capability's `required_tier`. The *local* capability definition is
 authoritative, so a peer cannot talk you into relaxing your own requirement.
 
 Tier loss cancels work in flight. If a peer is demoted mid-task, whatever it is
-no longer authorized for is cancelled automatically rather than being allowed to
+no longer authorized for is canceled automatically rather than being allowed to
 finish on the strength of a standing it no longer has.
 
 This is where trust composes. The requester verifies the result's zero-knowledge
