@@ -226,6 +226,31 @@ class TestAuditStructs:
         assert any('AT_FUTURE_FLAG' in w for w in warnings)
 
 
+class TestLibraries:
+    """`lib` is bound to the core .so only, so a cdef'd function defined only in
+    an extension library is uncallable through it."""
+
+    def test_files_belong_to_their_library(self):
+        assert aud.library_of(os.path.join(aud.CORE_ROOT, 'identity', 'peers.c')) == 'core'
+        assert aud.library_of(os.path.join(aud.EXT_ROOT, 'dtn', 'dtn_eid.c')) == 'libat_dtn'
+        # Tests and conformance adapters are linked into no library `lib` binds.
+        assert aud.library_of(os.path.join(aud.EXT_ROOT, 'dtn', 'test', 'x.c')) is None
+        assert aud.library_of(os.path.join(aud.EXT_ROOT, 'dtn', 'conformance', 'x.c')) is None
+        assert aud.library_of(os.path.join(aud.REPO, 'src', 'c', 'examples', 'x.c')) is None
+
+    def test_an_extension_function_called_from_python_is_dangerous(self):
+        dangerous, latent, unlocated = aud.audit_libraries(
+            {'dtn_peer_eid': 4, 'peers_find_by_address': 2, 'no_such_function': 1},
+            'eid = lib.dtn_peer_eid(t, m, out, n)')
+        assert dangerous == [('dtn_peer_eid', ['libat_dtn'])]
+        assert latent == []
+        assert unlocated == ['no_such_function']
+
+    def test_an_uncalled_extension_function_is_latent(self):
+        dangerous, latent, _ = aud.audit_libraries({'dtn_peer_eid': 4}, '')
+        assert dangerous == [] and latent == [('dtn_peer_eid', ['libat_dtn'])]
+
+
 class TestTheRealTree:
     """Run against the checked-in cdef and headers: this is the gate itself."""
 
@@ -240,6 +265,10 @@ class TestTheRealTree:
         assert latent == [], [
             (name, aud.describe_field_drift(mine, theirs))
             for name, mine, theirs, _ in latent]
+
+    def test_every_cdef_function_is_in_the_core_library(self):
+        dangerous, latent, _ = aud.audit_libraries(aud.parse_cdef(), aud.collect_py())
+        assert dangerous == [] and latent == [], dangerous + latent
 
     def test_the_structs_python_allocates_are_all_mirrored(self):
         """A struct Python allocates but the cdef does not mirror from C would be
