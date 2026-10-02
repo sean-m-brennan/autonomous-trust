@@ -560,9 +560,8 @@ def test_process_rebinds_receiver_socket_timeouts():
     nproc.group_receiver = lambda: None
     nproc.unknown_receiver = lambda: None
     nproc.mystery_handler = lambda *_: None
-    # Relay start-up (first contact's rendezvous) reads state __init__ sets,
-    # which __new__ skipped; it runs after the rebind, so stub it like the rest.
-    nproc._start_relays = lambda: None
+    # Relay start-up (rendezvous's on_start hook) sets up its own state, so
+    # the __new__-built process needs no stub for it.
 
     nproc.process({}, MagicMock())
 

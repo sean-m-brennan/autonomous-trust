@@ -31,7 +31,9 @@
 #include "processes/extension.h"
 #include "structures/map.h"
 #include "identity/id_proc_priv.h"
-#include "identity/first_contact.h"
+#ifdef AT_FIRST_CONTACT_ENABLED   /* linked with libat_first_contact */
+#include "first_contact/first_contact.h"
+#endif
 #include "identity/id_ext.h"
 #include "network/net_transport.h"
 #include "utilities/exception.h"
@@ -102,6 +104,7 @@ DEFINE_TEST(test_gate_is_reread_and_dispatch_is_per_process)
 }
 END_TEST_DEFINITION()
 
+#ifdef AT_FIRST_CONTACT_ENABLED
 DEFINE_TEST(test_first_contact_registers_exactly_when_enabled)
 {
     char root[] = "/tmp/at-extension-testXXXXXX";
@@ -123,12 +126,61 @@ DEFINE_TEST(test_first_contact_registers_exactly_when_enabled)
         ck_assert_int_eq(identity_register_handlers(&proc), 0);
         ck_assert_int_eq((int)has_handler(&proc, ID_FC_HELLO), on);
         ck_assert_int_eq((int)has_handler(&proc, ID_FC_HELLO_ACK), on);
+        /* Linked, so asking for it is honoured, not refused -- and so is a
+         * relay, since first contact brings rendezvous with it. */
+        ck_assert_int_eq(identity_ext_check_env(NULL), 0);
+        setenv("AT_USE_RELAY", "198.51.100.1:27790", 1);
+        ck_assert_int_eq(identity_ext_check_env(NULL), 0);
+        unsetenv("AT_USE_RELAY");
         pthread_rwlock_destroy(&proc.protocol.peers_rwlock);
     }
     unsetenv(AT_FIRST_CONTACT_ENV);
     at_extensions_reset();
 }
 END_TEST_DEFINITION()
+#else
+DEFINE_TEST(test_first_contact_registers_exactly_when_enabled)
+{
+    /* Without libat_first_contact the core carries no handshake: the run-time
+     * switch alone registers nothing... */
+    char root[] = "/tmp/at-extension-testXXXXXX";
+    ck_assert_ptr_nonnull(mkdtemp(root));
+    setenv("AUTONOMOUS_TRUST_ROOT", root, 1);
+    gate_open = false;
+    setenv("AT_FIRST_CONTACT", "1", 1);
+    at_extensions_reset();
+    process_t proc;
+    memset(&proc, 0, sizeof(proc));
+    snprintf(proc.name, sizeof(proc.name), "identity");
+    pthread_rwlock_init(&proc.protocol.peers_rwlock, NULL);
+    ck_assert_int_eq(map_create(&proc.protocol.handlers), 0);
+    ck_assert_int_eq(identity_register_handlers(&proc), 0);
+    ck_assert(!has_handler(&proc, (char *)"first_contact_hello"));
+    ck_assert(!has_handler(&proc, (char *)"first_contact_hello_ack"));
+    pthread_rwlock_destroy(&proc.protocol.peers_rwlock);
+    /* ...so a node asked for it refuses to start rather than run without it;
+     * switched off, it asks for nothing. */
+    ck_assert_int_eq(identity_ext_check_env(NULL), -1);
+    setenv("AT_FIRST_CONTACT", "0", 1);
+    ck_assert_int_eq(identity_ext_check_env(NULL), 0);
+    unsetenv("AT_FIRST_CONTACT");
+    /* Nor does this binary link rendezvous: a relay asked for is refused, and
+     * a switch set off declares nothing. */
+    setenv("AT_USE_RELAY", "198.51.100.1:27790", 1);
+    ck_assert_int_eq(identity_ext_check_env(NULL), -1);
+    unsetenv("AT_USE_RELAY");
+    setenv("AT_RELAY", "1", 1);
+    ck_assert_int_eq(identity_ext_check_env(NULL), -1);
+    setenv("AT_RELAY", "0", 1);
+    ck_assert_int_eq(identity_ext_check_env(NULL), 0);
+    unsetenv("AT_RELAY");
+    setenv("AT_RELAY_SEED_FALLBACK", "on", 1);
+    ck_assert_int_eq(identity_ext_check_env(NULL), -1);
+    unsetenv("AT_RELAY_SEED_FALLBACK");
+    at_extensions_reset();
+}
+END_TEST_DEFINITION()
+#endif
 
 /* Transports (network/net_transport.h): the core names none from an
  * extension, and a registered one is found beside the core's. This binary

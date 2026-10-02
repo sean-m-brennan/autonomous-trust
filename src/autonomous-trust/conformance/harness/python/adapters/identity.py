@@ -47,8 +47,26 @@ from autonomous_trust.core.identity import Group, Identity, Peers
 from autonomous_trust.core.identity.encrypt import Encryptor
 from autonomous_trust.core.identity.idprocess import IdentityProcess
 from autonomous_trust.core.identity.protocol import IdentityProtocol
-from autonomous_trust.core.identity.first_contact import _FLAG as FIRST_CONTACT_FLAG
-from autonomous_trust.core.contacts import FIRST_CONTACT_VERIFIED_SEED
+try:
+    # First contact is an extension (FEATURE_SPLIT_PLAN Phase 7): without it, a
+    # scenario with a first_contact or contacts fixture skips, as the C
+    # adapter's does without libat_first_contact.
+    from autonomous_trust.first_contact.fc_protocol import FirstContactProtocol
+    from autonomous_trust.first_contact.first_contact import _FLAG as FIRST_CONTACT_FLAG
+    from autonomous_trust.first_contact import FIRST_CONTACT_VERIFIED_SEED
+    FIRST_CONTACT_PRESENT = True
+except ImportError:
+    class _NoVerbs(type):
+        def __getattr__(cls, name):
+            return None
+
+    class FirstContactProtocol(metaclass=_NoVerbs):
+        """First contact is absent: no verb is its (each name is None, which
+        matches no function)."""
+
+    FIRST_CONTACT_PRESENT = False
+    FIRST_CONTACT_FLAG = 'AT_FIRST_CONTACT'
+    FIRST_CONTACT_VERIFIED_SEED = None
 from autonomous_trust.core.identity.sign import Signature
 try:
     # ZTA is an extension (FEATURE_SPLIT_PLAN Phase 6): without it, a scenario
@@ -146,7 +164,7 @@ _TRIGGER_FC_INITIATE = 'trigger_first_contact_initiate'
 # first-contact-remove-drops-the-direct-peer.
 _TRIGGER_FC_REMOVE = 'trigger_first_contact_remove'
 
-# Pseudo-functions for finding someone by handle (identity/directory_contact.py),
+# Pseudo-functions for finding someone by handle (first_contact/directory_contact.py),
 # each through the production app verb or handler, because the entry, request
 # and invitation are signed by per-run keys the scenario cannot spell:
 #   trigger_directory_publish {handle}         -- our app publishes the handle,
@@ -165,7 +183,7 @@ _TRIGGER_DIR_ACCEPT = 'trigger_directory_accept'
 _TRIGGER_DIR_DECLINE = 'trigger_directory_decline'
 _TRIGGER_DIR_CLOCK = 'trigger_directory_clock'
 # Pseudo-functions for finding people nearby at an area hub
-# (identity/area_contact.py), through the production app verbs and handlers:
+# (first_contact/area_contact.py), through the production app verbs and handlers:
 #   trigger_area_publish {area, bucket}  -- our app lists us in the area;
 #   trigger_area_withdraw {area}         -- ...and stops;
 #   trigger_area_request {holder, area}  -- a lookup finds the holder's card (a
@@ -184,7 +202,7 @@ def _dir_entry_for(identity, handle, seq=1):
     attestation it embeds."""
     import time
     from nacl.signing import SigningKey
-    from autonomous_trust.core._python.contacts import directory as _dir
+    from autonomous_trust.first_contact._python import directory as _dir
     key = _dir._public_hex(_dir._signing_key(identity))
     att = _dir.attest(SigningKey(_DIR_ISSUER_SEED), handle, key, int(time.time()) + 3600)
     return att, _dir.create_entry(identity, att, seq)
@@ -360,7 +378,7 @@ class _Participant:
                 # a scenario that passes on both proves they agree on its
                 # contents and not merely on their own in-memory shape.
                 # C mirrors via contacts_load + contacts_get.
-                from autonomous_trust.core.contacts import Contacts
+                from autonomous_trust.first_contact import Contacts
                 store = Contacts.load()
                 for pid, want in (expected or {}).items():
                     peer_uuid = str(self._uuid_for_pid(pid))
@@ -442,7 +460,7 @@ class _Participant:
                 # first redemption, so a replay that was honored twice differs
                 # ONLY in what went back out. C mirrors by scanning the
                 # engine's captured[] for the same function.
-                actual = self.emit_tally.get(IdentityProtocol.hello_ack, 0)
+                actual = self.emit_tally.get(FirstContactProtocol.hello_ack, 0)
                 if actual != int(expected):
                     raise AssertionError(
                         f'{self.id}: first_contact_acks_emitted={actual}, '
@@ -460,8 +478,8 @@ class _Participant:
                     actual = len(getattr(self.process, '_dir_in', {}) or {})
                 else:
                     actual = self.emit_tally.get(
-                        IdentityProtocol.contact_accept if key == 'directory_accepts_emitted'
-                        else IdentityProtocol.hello, 0)
+                        FirstContactProtocol.contact_accept if key == 'directory_accepts_emitted'
+                        else FirstContactProtocol.hello, 0)
                 if actual != int(expected):
                     raise AssertionError(f'{self.id}: {key}={actual}, expected {int(expected)}')
             elif key == 'first_contact_nonce_spent':
@@ -1087,7 +1105,7 @@ class IdentityAdapter:
         fixture = (case.data.get('fixtures', {}) or {}).get('contacts') or {}
         if not fixture:
             return
-        from autonomous_trust.core.contacts import Contact, Contacts, Provenance
+        from autonomous_trust.first_contact import Contact, Contacts, Provenance
         store = Contacts()
         for pid, spec in fixture.items():
             participant = participants.get(pid)
@@ -1114,6 +1132,9 @@ class IdentityAdapter:
             raise NotImplementedError('ZTA scenario skipped: autonomous-trust-zta is not '
                                       'installed (put src/autonomous-trust-zta on the path '
                                       'to run it symmetrically)')
+        fx = case.data.get('fixtures', {}) or {}
+        if not FIRST_CONTACT_PRESENT and ('first_contact' in fx or 'contacts' in fx):
+            raise NotImplementedError('first-contact scenario skipped: autonomous-trust-first-contact is not installed (put src/autonomous-trust-first-contact on the path to run it symmetrically)')
         self._scratch = tempfile.TemporaryDirectory(prefix='at-conformance-id-')
         fc_fix = (case.data.get('fixtures', {}) or {}).get('first_contact') or {}
         fc_prior = os.environ.get(FIRST_CONTACT_FLAG)
@@ -1833,8 +1854,8 @@ class IdentityAdapter:
             # participant the step names, then let the production call decide
             # what to send and where -- the point is the decision, not the
             # bytes the harness could have assembled itself.
-            from autonomous_trust.core.contacts import create_invitation
-            from autonomous_trust.core.identity import first_contact as _fc
+            from autonomous_trust.first_contact import create_invitation
+            from autonomous_trust.first_contact import first_contact as _fc
             spec = from_json_string(inbound.obj) if inbound.obj else {}
             minter_pid = str(spec.get('minted_by'))
             minter_uuid = participant._uuid_for_pid(minter_pid)
@@ -1849,14 +1870,14 @@ class IdentityAdapter:
             _fc.initiate(participant.process, participant.queues, blob)
             emitted = participant.drain_outbox()
             for cm in emitted:
-                if cm.function == IdentityProtocol.hello:
+                if cm.function == FirstContactProtocol.hello:
                     to_whom = cm.raw.to_whom
                     target = to_whom[0] if isinstance(to_whom, list) else to_whom
                     participant.fc_hello_endpoint = str(
                         getattr(target, 'address', '') or '')
             return emitted
         if inbound.function == _TRIGGER_FC_REMOVE:
-            from autonomous_trust.core.identity import first_contact as _fc
+            from autonomous_trust.first_contact import first_contact as _fc
             spec = from_json_string(inbound.obj) if inbound.obj else {}
             peer_uuid = participant._uuid_for_pid(str(spec.get('peer')))
             request = Message(CfgIds.identity, _fc.APP_REMOVE,
@@ -1867,7 +1888,7 @@ class IdentityAdapter:
         if inbound.function in (_TRIGGER_DIR_PUBLISH, _TRIGGER_DIR_REQUEST,
                                 _TRIGGER_DIR_ACCEPT, _TRIGGER_DIR_DECLINE,
                                 _TRIGGER_DIR_CLOCK):
-            from autonomous_trust.core._python.identity import directory_contact as _dc
+            from autonomous_trust.first_contact._python import directory_contact as _dc
             spec = from_json_string(inbound.obj) if inbound.obj else {}
             proc, queues = participant.process, participant.queues
             if inbound.function == _TRIGGER_DIR_PUBLISH:
@@ -1882,7 +1903,7 @@ class IdentityAdapter:
                 handle = str(spec.get('handle'))
                 _att, entry = _dir_entry_for(holder, handle)
                 _dc.handle_dir_result(proc, queues, _app_verb(
-                    IdentityProtocol.dir_result,
+                    FirstContactProtocol.dir_result,
                     {'handle': handle, 'entry': entry.to_wire(), 'relay': '',
                      'limited': False}))
                 _dc.handle_app_request(proc, queues, _app_verb(
@@ -1896,9 +1917,9 @@ class IdentityAdapter:
             return participant.drain_outbox()
         if inbound.function in (_TRIGGER_AREA_PUBLISH, _TRIGGER_AREA_WITHDRAW,
                                 _TRIGGER_AREA_REQUEST):
-            from autonomous_trust.core._python.identity import area_contact as _ac
-            from autonomous_trust.core._python.identity import directory_contact as _dc
-            from autonomous_trust.core._python.contacts import area_card as _card
+            from autonomous_trust.first_contact._python import area_contact as _ac
+            from autonomous_trust.first_contact._python import directory_contact as _dc
+            from autonomous_trust.first_contact._python import area_card as _card
             spec = from_json_string(inbound.obj) if inbound.obj else {}
             proc, queues = participant.process, participant.queues
             area = str(spec.get('area'))
@@ -1914,7 +1935,7 @@ class IdentityAdapter:
                 holder = self._roster_by_uuid[str(holder_uuid)].process.identity
                 card = _card.create_card(holder, area, area, '', 1)
                 _ac.handle_hub_result(proc, queues, _app_verb(
-                    IdentityProtocol.hub_result,
+                    FirstContactProtocol.hub_result,
                     {'area': area, 'cards': [{'card': card.to_wire(), 'relay': ''}],
                      'limited': False}))
                 _dc.handle_app_request(proc, queues, _app_verb(
@@ -1927,7 +1948,7 @@ class IdentityAdapter:
             # which is exactly what a restarted node does. Pending hellos and
             # minted refs live only in memory, so a restart forgets them too.
             # C mirrors with at_first_contact_reset().
-            from autonomous_trust.core.identity import first_contact as _fc
+            from autonomous_trust.first_contact import first_contact as _fc
             participant.process._first_contact_nonces = _fc.SpentNonces()
             participant.process._first_contact_pending = {}
             participant.process._first_contact_minted = {}
@@ -2112,7 +2133,7 @@ class IdentityAdapter:
             if not payload.get('unstamped'):
                 body['seq'] = int(payload.get('seq', 1))
             obj = to_json_string(body)
-        elif function == IdentityProtocol.hello:
+        elif function == FirstContactProtocol.hello:
             # The OPTIONAL 1:1 handshake's ticket. The scenario names WHO minted
             # the invitation (`minted_by`) plus the nonce and expiry, and the
             # adapter mints it here from that participant's own signable
@@ -2124,7 +2145,7 @@ class IdentityAdapter:
             # The obj is the raw base64url blob, exactly as production sends it
             # (first_contact.initiate forwards the link untouched, and the
             # signature covers those bytes).
-            from autonomous_trust.core.contacts import create_invitation
+            from autonomous_trust.first_contact import create_invitation
             minter_pid = payload.get('minted_by') or from_id
             minter = participants[minter_pid].impl.identity
             obj = create_invitation(
@@ -2134,31 +2155,31 @@ class IdentityAdapter:
                 ttl_seconds=0,
                 nonce=str(payload.get('nonce', '')),
             ).encode()
-        elif function == IdentityProtocol.contact_request:
-            # A finder's signed request (contacts/directory.py), minted here
+        elif function == FirstContactProtocol.contact_request:
+            # A finder's signed request (first_contact/directory.py), minted here
             # from the SIGNER's identity (default the sender) for the entry of
             # the participant it is addressed `to` (default the recipient) --
             # a signer or `to` other than those is the forgery under test. The
             # nonce is spelled out so the app's accept can name it as its ref.
-            from autonomous_trust.core._python.contacts import directory as _dir
+            from autonomous_trust.first_contact._python import directory as _dir
             signer = participants[payload.get('signer') or from_id].impl.process.identity
             holder = participants[payload.get('to') or to_id].impl.process.identity
             if 'area' in payload:
                 # Found at an area hub: the holder's area card, not an entry.
-                from autonomous_trust.core._python.contacts import area_card as _card
+                from autonomous_trust.first_contact._python import area_card as _card
                 area = str(payload.get('area'))
                 entry = _card.create_card(holder, area, area, '', 1)
             else:
                 _att, entry = _dir_entry_for(holder, str(payload.get('handle')))
             obj = _dir.create_request(signer, entry,
                                       nonce=str(payload.get('nonce', '')) or None).to_json()
-        elif function == IdentityProtocol.contact_accept:
+        elif function == FirstContactProtocol.contact_accept:
             # The holder's answer: the nonce of the request it answers (default
             # the one the recipient has outstanding to the sender) and a
             # single-use invitation minted by `minted_by` (default the sender).
             # `expired` backdates the invitation.
             import time
-            from autonomous_trust.core.contacts import create_invitation
+            from autonomous_trust.first_contact import create_invitation
             nonce = payload.get('nonce')
             if nonce is None:
                 holder_uuid = str(sender.process.identity.uuid).lower()
@@ -2170,12 +2191,12 @@ class IdentityAdapter:
                 minter, expiry=int(time.time()) - 60 if expired else None,
                 ttl_seconds=0 if expired else 600, nonce='dir-accept-invitation')
             obj = to_json_string({'nonce': str(nonce), 'invitation': invitation.encode()})
-        elif function == IdentityProtocol.reach_record:
-            # A signed reachability record (contacts/reach.py), minted here
+        elif function == FirstContactProtocol.reach_record:
+            # A signed reachability record (rendezvous/reach.py), minted here
             # from the SIGNER's own identity (keys are generated per run).
             # `claim` names whose uuid the body carries -- default the signer;
             # a different one is the "right uuid, wrong key" forgery.
-            from autonomous_trust.core._python.contacts import reach as _reach
+            from autonomous_trust.rendezvous._python import reach as _reach
             signer = participants[payload.get('signer') or from_id].impl.process.identity
             claim_pid = payload.get('claim')
             expiry = int(payload.get('expiry', 0) or 0)
@@ -2192,7 +2213,7 @@ class IdentityAdapter:
                 sig = signer.sign((_reach.REACH_DOMAIN + body_str).encode('utf-8'))
                 record = _reach.ReachRecord(body, body_str, sig.signature.decode('ascii'))
             obj = record.to_json()
-        elif function == IdentityProtocol.hello_ack:
+        elif function == FirstContactProtocol.hello_ack:
             # The accept. The echoed nonce is informational -- what makes the
             # ack trustworthy is that the initiator already holds the
             # accepter's key from the invitation it redeemed -- so the handler
@@ -2387,7 +2408,7 @@ class IdentityAdapter:
                       from_whom=sender_identity,
                       to_whom=Network.broadcast if to_id == 'broadcast' else None,
                       encrypt=(function != IdentityProtocol.announce))
-        if function == IdentityProtocol.reach_record and payload.get('local'):
+        if function == FirstContactProtocol.reach_record and payload.get('local'):
             # As the network process hands on a relay lookup's answer: no
             # sender on the envelope.
             msg.from_whom = None

@@ -16,8 +16,8 @@
 """The operator's software keystore: where the one ed25519 key per human lives,
 outside every node's config directory (FEATURE_SPLIT_PLAN Phase 6 kept it in
 the core when operator activation moved to the operator distribution, because
-first contact's device certs and backups use it with no PIV involved:
-tools/device_cert.py, tools/backup.py).
+first contact's device certs and backups use it with no PIV involved: the
+device_cert.py and backup.py tools in src/autonomous-trust-first-contact/tools).
 """
 import os
 

@@ -58,7 +58,9 @@
 # (doc/architecture/zta-integration.md) */
 #endif
 #include "network/net_message.h"
-#include "contacts/reach.h"
+#ifdef AT_RENDEZVOUS_ENABLED   /* libat_rendezvous is built */
+#include "rendezvous/reach.h"
+#endif
 #include "processes/processes.h"
 #include "structures/array.h"
 #include "structures/map.h"
@@ -66,14 +68,21 @@
 #include "utilities/msg_types_priv.h"
 #include "utilities/allocation.h"
 #include <math.h>
-#include "contacts/contacts.h"
-#include "identity/first_contact.h"
-#include "identity/directory_contact.h"
-#include "network/network.h"            /* NET_ID_DIR_RESULT */
-#include "contacts/area_card.h"
-#include "identity/area_contact.h"
-#include "contacts/directory.h"
-#include "at_first_contact.h"
+#include "network/network.h"
+/* First contact's half of this adapter is compiled only when its library is
+ * built (AT_FIRST_CONTACT_LIB); without it, its scenarios skip. */
+#ifdef AT_FIRST_CONTACT_ENABLED
+#include "first_contact/contacts.h"
+#include "first_contact/first_contact.h"
+#include "first_contact/directory_contact.h"
+#include "first_contact/fc_net.h"             /* NET_ID_DIR_RESULT */
+#include "first_contact/area_card.h"
+#include "first_contact/area_contact.h"
+#include "first_contact/directory.h"
+#include "first_contact/at_first_contact.h"
+#else
+#define AT_FIRST_CONTACT_ENV "AT_FIRST_CONTACT"   /* first_contact/first_contact.h */
+#endif
 
 #include "../negative_runner.h"
 #include "../scenario_engine.h"
@@ -130,7 +139,8 @@ static const char *_resolve_to_id(const generic_msg_t *msg) {
 }
 
 
-/* -- finding someone by handle (identity/directory_contact.h) --------------- */
+#ifdef AT_FIRST_CONTACT_ENABLED
+/* -- finding someone by handle (first_contact/directory_contact.h) --------------- */
 
 /* The holder's issuer-attested directory entry for @p handle, from the
  * harness issuer (seed 0x44..., Python _DIR_ISSUER_SEED). Nothing checks the
@@ -171,6 +181,7 @@ static void _ic_app_verb(const process_t *proc, const char *function, json_t *bo
     json_decref(body);
     fn(proc, NULL, &req);
 }
+#endif /* AT_FIRST_CONTACT_ENABLED */
 
 int _send_hook(const char *key,
                       const message_type_t type,
@@ -181,6 +192,7 @@ int _send_hook(const char *key,
     const char *to_id = _resolve_to_id(msg);
     const char *function = (type == NET_MESSAGE && msg->info.net_msg.function != NULL)
         ? msg->info.net_msg.function : "__internal__";
+#ifdef AT_FIRST_CONTACT_ENABLED
     /* A first-contact hello carries WHERE it was addressed, which the captured
      * (from, to, function) triple does not. Recorded against the emitter so
      * first_contact_hello_endpoint can pin the resolution order `initiate`
@@ -198,6 +210,7 @@ int _send_hook(const char *key,
             break;
         }
     }
+#endif /* AT_FIRST_CONTACT_ENABLED */
     /* A feature that needs an outbound payload, not just (from, to, function):
      * social's proximity round trip and report (ic_ext_t.on_send). */
     if (g_ic_ext != NULL && g_ic_ext->on_send != NULL)
@@ -1461,11 +1474,12 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_decref(body);
     }
 
+#ifdef AT_FIRST_CONTACT_ENABLED
     /* first_contact_request -- a finder's signed request, minted here from the
      * SIGNER's identity (default the sender) for the entry of the participant
      * it is addressed `to` (default the recipient); a signer or `to` other
      * than those is the forgery under test. Mirrors the Python adapter's
-     * IdentityProtocol.contact_request branch. */
+     * FirstContactProtocol.contact_request branch. */
     if (strcmp(function, ID_FC_REQUEST) == 0) {
         const char *spid = json_string_value(json_object_get(payload, "signer"));
         const char *tpid = json_string_value(json_object_get(payload, "to"));
@@ -1539,8 +1553,10 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_decref(body);
         return 0;
     }
+#endif /* AT_FIRST_CONTACT_ENABLED */
 
-    /* reach_record — a signed reachability record (contacts/reach.h), minted
+#ifdef AT_RENDEZVOUS_ENABLED
+    /* reach_record — a signed reachability record (rendezvous/reach.h), minted
      * here from the SIGNER's own identity (keys are generated per run).
      * `claim` names whose uuid the body carries -- default the signer; a
      * different one is the "right uuid, wrong key" forgery -- and `local`
@@ -1612,7 +1628,9 @@ static int _build_inbound(sce_run_ctx_t *ctx,
             memset(&out->info.net_msg.from_whom, 0, sizeof(public_identity_t));
         return 0;
     }
+#endif /* AT_RENDEZVOUS_ENABLED */
 
+#ifdef AT_FIRST_CONTACT_ENABLED
     /* first_contact_hello — the OPTIONAL 1:1 handshake's ticket. The scenario
      * names WHO minted the invitation (`minted_by`) plus the nonce and expiry,
      * and the adapter mints it here from that participant's own signable
@@ -1623,7 +1641,7 @@ static int _build_inbound(sce_run_ctx_t *ctx,
      * str(obj) straight on the wire (network/message.py _obj_str), and the
      * inviter's signature covers exactly those bytes. net_msg_pack_json would
      * JSON-quote it and the handler would (correctly) fail to decode it.
-     * Mirrors the Python adapter's IdentityProtocol.hello branch. */
+     * Mirrors the Python adapter's FirstContactProtocol.hello branch. */
     if (strcmp(function, ID_FC_HELLO) == 0) {
         const char *minter_pid = from_id;
         const char *nonce = "";
@@ -1694,6 +1712,7 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         }
         return 0;
     }
+#endif /* AT_FIRST_CONTACT_ENABLED */
 
     /* partition_probe — cross-group probe, signed JSON payload. */
     if (strcmp(function, "group_partition_probe") == 0
@@ -2165,6 +2184,7 @@ static int _dispatch(sce_run_ctx_t *ctx,
                      generic_msg_t *inbound) {
     (void)ctx;
     ic_impl_t *impl = (ic_impl_t *)target->impl;
+#ifdef AT_FIRST_CONTACT_ENABLED
     /* trigger_first_contact_initiate — drive the INITIATOR half through the
      * production call rather than handing the target a hello the harness
      * built. A pseudo-step because `initiate` is an API call, not an inbound
@@ -2391,6 +2411,8 @@ static int _dispatch(sce_run_ctx_t *ctx,
         at_first_contact_reset();
         return 0;
     }
+#endif /* AT_FIRST_CONTACT_ENABLED */
+
     /* A feature's pseudo-functions (ic_ext_t.dispatch). */
     if (g_ic_ext != NULL && g_ic_ext->dispatch != NULL) {
         int ext_rc = g_ic_ext->dispatch(ctx, target, inbound);
@@ -2719,6 +2741,7 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                              pid, impl->fc_hello_endpoint, want);
                     return -1;
                 }
+#ifdef AT_FIRST_CONTACT_ENABLED
             } else if (strcmp(key, "contacts") == 0) {
                 /* The durable address book the handshake leaves behind, as
                  * {participant_id: {field: value} | false}. Read from DISK,
@@ -2970,6 +2993,7 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                         return -1;
                     }
                 }
+#endif /* AT_FIRST_CONTACT_ENABLED */
             } else if (strcmp(key, "attested_now") == 0) {
                 /* The attended-now stamp this participant's last ACCEPTED pull
                  * yielded: the pinned epoch when a human is at the target's
@@ -3582,6 +3606,7 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
     return 0;
 }
 
+#ifdef AT_FIRST_CONTACT_ENABLED
 /* Pre-seed the durable address book from `fixtures.contacts`, the C twin of
  * the Python adapter's _install_contacts.
  *
@@ -3659,6 +3684,7 @@ static void _install_contacts(sce_run_ctx_t *ctx)
     (void)contacts_save(&store, data_dir);
     contacts_free(&store);
 }
+#endif /* AT_FIRST_CONTACT_ENABLED */
 
 void at_identity_run(const at_case_t *c, at_case_result_t *out) {
     at_identity_run_ext(c, out, NULL);
@@ -3691,6 +3717,20 @@ void at_identity_run_ext(const at_case_t *c, at_case_result_t *out,
             at_case_result_set_skip(
                 out, "ZTA scenario skipped: C built without AT_ZTA "
                      "(build -DAT_ZTA=ON to run it symmetrically)");
+            return;
+        }
+    }
+#endif
+    /* Likewise first contact's scenarios (fixtures.first_contact or
+     * fixtures.contacts), when its library is not built (AT_FIRST_CONTACT_LIB). */
+#ifndef AT_FIRST_CONTACT_ENABLED
+    {
+        json_t *fx = json_object_get(c->data, "fixtures");
+        if (json_is_object(fx) && (json_object_get(fx, "first_contact") != NULL
+                                   || json_object_get(fx, "contacts") != NULL)) {
+            at_case_result_set_skip(
+                out, "first-contact scenario skipped: C built without "
+                     "libat_first_contact (AT_FIRST_CONTACT_LIB=OFF)");
             return;
         }
     }
@@ -3785,7 +3825,9 @@ void at_identity_run_ext(const at_case_t *c, at_case_result_t *out,
     }
 
     _apply_fixtures(&ctx);
+#ifdef AT_FIRST_CONTACT_ENABLED
     _install_contacts(&ctx);
+#endif /* AT_FIRST_CONTACT_ENABLED */
 
     g_active_ctx = &ctx;
     messaging_set_test_hook(_send_hook);
@@ -3802,8 +3844,10 @@ void at_identity_run_ext(const at_case_t *c, at_case_result_t *out,
     /* Undo the first-contact opt-in and the redirected data root (no-ops when
      * the scenario never asked for them), so neither leaks into the next case. */
     if (fc_enabled) {
+#ifdef AT_FIRST_CONTACT_ENABLED
         at_first_contact_reset();
         at_dir_contact_reset();
+#endif
         if (fc_had_flag) setenv(AT_FIRST_CONTACT_ENV, fc_saved_flag, 1);
         else unsetenv(AT_FIRST_CONTACT_ENV);
         if (fc_had_root) setenv("AUTONOMOUS_TRUST_ROOT", fc_saved_root, 1);
@@ -3834,8 +3878,10 @@ fail:
     /* Undo the first-contact opt-in and the redirected data root (no-ops when
      * the scenario never asked for them), so neither leaks into the next case. */
     if (fc_enabled) {
+#ifdef AT_FIRST_CONTACT_ENABLED
         at_first_contact_reset();
         at_dir_contact_reset();
+#endif
         if (fc_had_flag) setenv(AT_FIRST_CONTACT_ENV, fc_saved_flag, 1);
         else unsetenv(AT_FIRST_CONTACT_ENV);
         if (fc_had_root) setenv("AUTONOMOUS_TRUST_ROOT", fc_saved_root, 1);

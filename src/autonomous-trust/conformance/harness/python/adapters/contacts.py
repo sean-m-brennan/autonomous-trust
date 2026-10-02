@@ -31,11 +31,11 @@ from pathlib import Path
 from ...common.scenario_loader import Case
 
 from autonomous_trust.core.identity.identity import public_identity_from_canonical
-from autonomous_trust.core.contacts import (redeem_invitation, safety_number,
+from autonomous_trust.first_contact import (redeem_invitation, safety_number,
                                             verify_contact, InvalidInvitation,
                                             SafetyNumberMismatch, Contacts, Contact)
-from autonomous_trust.core._python.contacts import directory as _dir
-from autonomous_trust.core._python.network import registry as _registry
+from autonomous_trust.first_contact._python import directory as _dir
+from autonomous_trust.first_contact._python import registry as _registry
 
 _TOL = 1e-9
 
@@ -164,7 +164,7 @@ class ContactsAdapter:
         ``store``, or just load ``store``. Pins the status ('ok' or the
         refusal reason), then ``devices_of`` {contact uuid: [device uuids]}
         and ``resolves`` {uuid: contact uuid | None} against the store."""
-        from autonomous_trust.core._python.contacts import device as _dev
+        from autonomous_trust.first_contact._python import device as _dev
         mode, status, store = fx['mode'], 'ok', None
         if mode == 'verify':
             try:
@@ -221,7 +221,7 @@ class ContactsAdapter:
         (every merge's, in order, as [uuid, action]), ``contacts`` {uuid:
         {field: value} | None}, ``devices_of`` and ``tombstones`` (the whole
         map)."""
-        from autonomous_trust.core._python.contacts import sync as _sync
+        from autonomous_trust.first_contact._python import sync as _sync
         store = Contacts.from_canonical(fx.get('store') or {})
         payloads = fx['payloads'] if 'payloads' in fx else [fx['payload']]
         status, changes = 'ok', []
@@ -272,7 +272,7 @@ class ContactsAdapter:
         ``normalized`` and ``passphrase_status``) or restore (``contents``
         into ``store`` at ``now``, never taking ``own_uuid``: the book pins
         as sync's). ``backup_status`` is 'ok' or the reason."""
-        from autonomous_trust.core._python.contacts import backup as _bk
+        from autonomous_trust.first_contact._python import backup as _bk
         mode = fx['mode']
         status = 'ok'
         if mode == 'seal':
@@ -326,7 +326,7 @@ class ContactsAdapter:
         ``own_cert`` (absent = none) into ``siblings``; load: just load
         ``siblings``. Pins ``sibling_status``, ``siblings`` (uuids in order)
         and ``operator``."""
-        from autonomous_trust.core._python.contacts.siblings import Siblings
+        from autonomous_trust.first_contact._python.siblings import Siblings
         sib = Siblings.from_canonical(fx.get('siblings') or {})
         status = 'ok'
         if fx['mode'] == 'add':
@@ -349,7 +349,7 @@ class ContactsAdapter:
         """Verify one signed object (``what``: entry | attestation | request)
         at a fixed ``now``, optionally against ``trusted`` issuers. Pins the
         exact status ('ok' or the refusal reason) and, when ok, its fields."""
-        from autonomous_trust.core._python.contacts import area_card as _card
+        from autonomous_trust.first_contact._python import area_card as _card
         what, now = fx['what'], float(fx['now'])
         trusted = set(fx['trusted']) if 'trusted' in fx else None
         cls = {'entry': _dir.DirectoryEntry, 'attestation': _dir.Attestation,
@@ -379,7 +379,7 @@ class ContactsAdapter:
         """Run ``calls`` against one area hub on a fixed clock and pin each
         reply's op, area, reason / seq, and for a lookup the uuids of the
         cards it answered with, in order."""
-        from autonomous_trust.core._python.network import hub as _hub
+        from autonomous_trust.first_contact._python import hub as _hub
         clock = {'mono': 0.0}
         bad = set(fx.get('distrusted', []))
         hub = _hub.Hub(list(fx['areas']), rate=int(fx.get('rate', 10)),

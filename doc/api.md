@@ -92,8 +92,10 @@ peer discovery is **LAN-only** — UDP broadcast/multicast finds peers on the sa
 local network — so it is *not* the answer for a friend across town, behind NAT, or
 not currently on your Wi-Fi. Adding that person is a separate, one-to-one
 primitive, distinct from the cohort vote that admits a newcomer to a group. It
-lives in `autonomous_trust.core.contacts`; the concept is in
-[First contact](architecture/first-contact.md).
+is an extension with its own distribution, `autonomous_trust.first_contact`
+(`src/autonomous-trust-first-contact`), and in C its own library,
+`libat_first_contact`, which an application links beside the core. The concept
+is in [First contact](architecture/first-contact.md).
 
 The trust root is always the cryptographic identity, never the identifier that
 led to it. The default path is an out-of-band **invitation** carrying the inviter's
@@ -112,8 +114,8 @@ Your first five minutes, end to end — Alice shares a link, Bob adds her. Each
 machines, shown together only to make the values explicit:
 
 ```python
-from autonomous_trust.core.contacts import (create_invitation, redeem_invitation,
-                                             safety_number, verify_contact, Contacts)
+from autonomous_trust.first_contact import (create_invitation, redeem_invitation,
+                                            safety_number, verify_contact, Contacts)
 
 # On Alice's node: mint an invitation from her own identity and share the link.
 invite = create_invitation(alice_identity, rendezvous=["relay-hint"], ttl_seconds=3600)
@@ -154,7 +156,7 @@ app holds no private key, so the node mints the invitation for it:
 ```python
 import json
 from autonomous_trust.core.app_verbs import AppRequest
-from autonomous_trust.core.identity.first_contact import (
+from autonomous_trust.first_contact.first_contact import (
     APP_INVITE, APP_INITIATE, FirstContactEvent)
 
 # Alice's app: ask her node for a link to share.
@@ -198,7 +200,7 @@ already used, never about strangers' garbage.
 
 The requests are honored only from the local app, never from the wire, and only
 while `AT_FIRST_CONTACT` is on. From C, the same two requests and four events are
-[`at_first_contact.h`](../src/c/autonomous_trust/at_first_contact.h):
+[`at_first_contact.h`](../src/c/extensions/first_contact/at_first_contact.h):
 `at_app_first_contact_invite` / `at_app_first_contact_initiate`, and
 `at_first_contact_event()` on a polled `at_app_event_t`.
 
@@ -269,22 +271,32 @@ relay whose reputation has fallen below the cut-off, and a relay never serves
 such a node; unknown and neutral nodes are served. A node keeps its contacts
 told where it is: whenever its relays or address change it signs a new
 reachability record, pushes it to its contacts and files it at its relays, and a
-contact that has lost it looks the record up there.
+contact that has lost it looks the record up there. All of this is the
+rendezvous extension (`autonomous_trust.rendezvous`, C `libat_rendezvous`; see
+[Rendezvous](architecture/rendezvous.md)), which first contact depends on. A
+node with `AT_USE_RELAY` or `AT_RELAY` set but without it refuses to start.
 
-With no `AT_USE_RELAY` set, a node with first contact on falls back on the
-**signed seed list**: `<cfg_dir>/relay_seeds.cfg.json` (or `$AT_RELAY_SEEDS`),
-shipped with the build and signed by the project's release key, plus the
-operator's own additions and removals in `<data_dir>/relay_seeds_local.cfg.json`
-(signed by the node's key). `tools/relay_seeds.py local add|remove|clear` edits
-them and `show` prints the relays the node will use. An explicit `AT_USE_RELAY`
-always wins, and with first contact off the list is never read.
+With no `AT_USE_RELAY` set, a node with `AT_RELAY_SEED_FALLBACK=1` falls back on
+the **signed seed list**: `<cfg_dir>/relay_seeds.cfg.json` (or
+`$AT_RELAY_SEEDS`), shipped with the build and signed by the project's release
+key, plus the operator's own additions and removals in
+`<data_dir>/relay_seeds_local.cfg.json` (signed by the node's key).
+`tools/relay_seeds.py local add|remove|clear` (in
+`src/autonomous-trust-rendezvous`) edits them and `show` prints the relays the
+node will use. An explicit `AT_USE_RELAY` always wins, and with the fallback off
+the list is never read. First contact being on no longer turns it on.
 
 Ahead of the seed list come the relays of any **community** the operator pinned:
 signed rosters in `<cfg_dir>/relay_rosters/` from the issuers in
 `$AT_RELAY_ROSTER_ISSUERS` or `<cfg_dir>/relay_roster_issuers.cfg.json`. An Ethne
 polity publishes one for the relays it runs (`en_uplift::rendezvous_roster`); any
 other community signs one with `tools/relay_rosters.py`, which also pins, installs
-and shows them. A newer roster from an issuer replaces its older one whole.
+and shows them. A newer roster from an issuer replaces its older one whole. An
+application installs or removes one through the node with the app verbs
+`app_relay_roster_install` and `app_relay_roster_remove`, answered by a
+`RosterEvent` (`autonomous_trust.rendezvous.roster`) or, from C,
+[`at_rendezvous.h`](../src/c/extensions/rendezvous/at_rendezvous.h)'s
+`at_app_relay_roster_install` / `_remove` and `at_rendezvous_roster_event()`.
 
 What admission means here is narrower than joining a group, and worth being
 explicit about if you are building on it: each side gains the other as a
@@ -312,11 +324,12 @@ A registry is a relay that also sets `AT_REGISTRY=1`, and it trusts the issuers
 listed in `<cfg_dir>/registry_issuers.cfg.json` (`{"issuers": ["<hex key>"]}`).
 An issuer is whoever checked that Alice controls the handle (an email round
 trip, an SMS code, an organization's own records) and signed an attestation
-binding the handle to her node's key (`tools/directory_issuer.py attest`). Alice
-and Bob each register with the registry as their relay (`AT_USE_RELAY`).
+binding the handle to her node's key (`tools/directory_issuer.py attest` in
+`src/autonomous-trust-first-contact`). Alice and Bob each register with the
+registry as their relay (`AT_USE_RELAY`).
 
 ```python
-from autonomous_trust.core._python.identity.directory_contact import (
+from autonomous_trust.first_contact.directory_contact import (
     APP_DIR_PUBLISH, APP_DIR_LOOKUP, APP_REQUEST, APP_ACCEPT, APP_DECLINE,
     DirectoryEvent)
 
@@ -364,7 +377,7 @@ issuer's attestation, the handle it asked for) rather than take the registry's
 word.
 
 From C, the requests are in
-[`at_first_contact.h`](../src/c/autonomous_trust/at_first_contact.h):
+[`at_first_contact.h`](../src/c/extensions/first_contact/at_first_contact.h):
 `at_app_directory_publish` / `_withdraw` / `_lookup`, then
 `at_app_first_contact_request` and, on the holder's side,
 `at_app_first_contact_accept` / `_decline` with the request's `ref`. The events
@@ -376,18 +389,19 @@ reading the same `registry_issuers.cfg.json`.
 #### Your own devices: pairing and one address book
 
 Each of your devices is its own node, with its own keys. What ties them
-together is your **operator key**. Run `tools/device_cert.py issue` where your
-operator keystore is, once per device; it writes
-`<cfg_dir>/device_cert.cfg.json`, which must name that very node. A contact who
-has verified you then files your other devices under your record without you
-doing anything: a device with a cert tells your contacts about itself when it
-starts, and each contact's app gets a `ContactEvent` `device_linked`.
+together is your **operator key**. Run `tools/device_cert.py issue` (in
+`src/autonomous-trust-first-contact`) where your operator keystore is, once per
+device; it writes `<cfg_dir>/device_cert.cfg.json`, which must name that very
+node. A contact who has verified you then files your other devices under your
+record without you doing anything: a device with a cert tells your contacts
+about itself when it starts, and each contact's app gets a `ContactEvent`
+`device_linked`.
 
 To give a new device your address book, **pair** it with one you already have.
 On the old device, ask for a pairing link, and redeem it on the new one:
 
 ```python
-from autonomous_trust.core._python.identity.sibling_sync import (
+from autonomous_trust.first_contact.sibling_sync import (
     APP_SIBLING_LIST, APP_SIBLING_REMOVE)
 
 # Old device: a pairing link (needs a device cert; `refused` / not_sibling otherwise).
@@ -433,7 +447,7 @@ node seal your address book and sibling list into a file, under a passphrase,
 and keep that file anywhere you like:
 
 ```python
-from autonomous_trust.core._python.identity.backup_contact import (
+from autonomous_trust.first_contact.backup_contact import (
     APP_BACKUP_EXPORT, APP_BACKUP_IMPORT)
 
 # Your passphrase (12 characters or more), or `'generate': True` for the node to make one.
@@ -476,14 +490,15 @@ open accepts. `io` means the file could not be written or read.
 
 The node never puts your **operator key** in a backup. If that key lived on
 the lost phone, contacts cannot link a replacement, so keep a copy of the key
-with `tools/backup.py`, the operator-side tool and the only thing that reads
-or writes the key:
+with `tools/backup.py` (in `src/autonomous-trust-first-contact`), the
+operator-side tool and the only thing that reads or writes the key:
 
 ```sh
-tools/backup.py export --out alice.atbackup --with-operator-key   # the book, siblings and key
-tools/backup.py restore-key alice.atbackup    # on the replacement: the key back in the keystore
-tools/device_cert.py issue                    # the new device's cert
-tools/backup.py import alice.atbackup         # or APP_BACKUP_IMPORT with the node running
+T=src/autonomous-trust-first-contact/tools
+$T/backup.py export --out alice.atbackup --with-operator-key   # the book, siblings and key
+$T/backup.py restore-key alice.atbackup    # on the replacement: the key back in the keystore
+$T/device_cert.py issue                    # the new device's cert
+$T/backup.py import alice.atbackup         # or APP_BACKUP_IMPORT with the node running
 ```
 
 `restore-key` never replaces a different key already in the keystore, and

@@ -16,7 +16,8 @@
 
 /**
  * @file unencrypted_verbs_test.c
- * @brief The plaintext-verb allowlist (identity_verb_is_unencrypted).
+ * @brief The plaintext-verb allowlist (identity_verb_is_unencrypted) and the
+ *        file that grants its optional half (processes/plaintext_verbs.h).
  *
  * The point-to-point receive path attributes a frame by source address and then
  * decrypts it, so once a peer is in the peer table every frame from it takes the
@@ -30,22 +31,26 @@
  * peer already in the table must not be able to send an arbitrary verb as
  * plaintext and have it honored. The refusal cases are the load-bearing half.
  *
- * This is a RECEIVE policy, so it must accept every verb a PEER may legitimately
- * send unencrypted -- including ones this implementation never originates. The
- * set is a cross-language contract with Python's
- * identity.protocol.UNENCRYPTED_VERBS; test_unencrypted_verbs.py pins the other
- * side, and the two lists must agree verb-for-verb.
+ * Two halves (FEATURE_SPLIT_PLAN D8): the core's nine verbs are compiled in; an
+ * extension's (first contact's five) are granted by unencrypted_verbs.cfg.json,
+ * and only verbs an enabled extension declares may be. The set is a
+ * cross-language contract with Python's identity.protocol.CORE_UNENCRYPTED_VERBS
+ * and plaintext_verbs.py; test_unencrypted_verbs.py and test_plaintext_verbs.py
+ * pin the other side.
  */
 
 #define DEBUG_TESTS 1
 #include "test_setup.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "identity/identity.h"
+#include "processes/plaintext_verbs.h"
 
-/* The eleven verbs, as WIRE STRINGS. Spelled literally rather than via the
+/* The core's nine, as WIRE STRINGS. Spelled literally rather than via the
  * ID_* symbols (which are file-static in id_proc.c) precisely so that renaming
  * a constant cannot silently change what this test asserts -- the wire string
  * is the contract with the Python side. */
@@ -59,11 +64,13 @@ static const char *const ALLOWED[] = {
     "subtree_roster_response",
     "group_partition_probe",
     "group_partition_response",
-    /* The OPTIONAL 1:1 first-contact handshake. Plaintext by necessity: the
-     * first hello arrives from somebody who is not a peer yet, so no shared
-     * key exists to encrypt it under. On the allowlist unconditionally --
-     * the handlers are opt-in per node, but this is a RECEIVE policy, and
-     * Python's UNENCRYPTED_VERBS is not gated on the opt-in either. */
+};
+
+/* The OPTIONAL 1:1 first-contact verbs. Plaintext by necessity: the first hello
+ * arrives from somebody who is not a peer yet, so no shared key exists to
+ * encrypt it under. Declared by the first_contact extension, granted only by
+ * the file. */
+static const char *const FIRST_CONTACT[] = {
     "first_contact_hello",
     "first_contact_hello_ack",
     /* Directory contact: found by handle, and the holder's answer -- neither
@@ -73,6 +80,11 @@ static const char *const ALLOWED[] = {
     /* A contact's new device announcing itself (Phase 4): not a peer here yet. */
     "device_announce",
 };
+#define N_FC (sizeof(FIRST_CONTACT) / sizeof(FIRST_CONTACT[0]))
+
+static const char *const FC_FILE =
+    "{\"verbs\": [\"first_contact_hello\", \"first_contact_hello_ack\", "
+    "\"first_contact_request\", \"first_contact_accept\", \"device_announce\"]}";
 
 /* Verbs that must NEVER be acceptable in plaintext from a known peer. Each is a
  * real selector this protocol uses, so a regression here is a genuine downgrade
@@ -149,26 +161,204 @@ DEFINE_TEST(test_matching_is_exact_not_prefix)
     ck_assert(!identity_verb_is_unencrypted(" access_granted"));
 }
 
+/* A scratch configuration directory holding @p text as the file (NULL: no
+ * file). Returns the directory; the caller removes it with _rmdir. */
+static char tmpl[64];
+static const char *_dir_with(const char *text)
+{
+    snprintf(tmpl, sizeof(tmpl), "/tmp/at_plaintext_XXXXXX");
+    ck_assert_ptr_nonnull(mkdtemp(tmpl));
+    if (text != NULL) {
+        char path[128];
+        snprintf(path, sizeof(path), "%s/%s", tmpl, PLAINTEXT_VERBS_FILENAME);
+        FILE *f = fopen(path, "w");
+        ck_assert_ptr_nonnull(f);
+        fputs(text, f);
+        fclose(f);
+    }
+    return tmpl;
+}
+
+static void _rmdir(const char *dir)
+{
+    char path[128];
+    snprintf(path, sizeof(path), "%s/%s", dir, PLAINTEXT_VERBS_FILENAME);
+    unlink(path);
+    rmdir(dir);
+}
+
+static int _configure(const char *text, bool first_contact)
+{
+    setenv("AT_FIRST_CONTACT", first_contact ? "1" : "0", 1);
+    const char *dir = _dir_with(text);
+    int rc = plaintext_verbs_configure(dir, NULL);
+    _rmdir(dir);
+    return rc;
+}
+
 DEFINE_TEST(test_allowlist_size_is_deliberate)
 {
     /* Not a count for its own sake: it forces anyone widening the allowlist to
      * come here, read the cross-language contract note, and update Python too.
-     * Fourteen verbs, matching UNENCRYPTED_VERBS -- and the table here must be
-     * the WHOLE allowlist, or a verb could be added there and never pinned. */
+     * Nine core verbs, matching CORE_UNENCRYPTED_VERBS -- and the table here
+     * must be the WHOLE core list, or a verb could be added there and never
+     * pinned. */
+    plaintext_verbs_reset();
     size_t n = sizeof(ALLOWED) / sizeof(ALLOWED[0]);
-    ck_assert_int_eq((int)n, 14);
+    ck_assert_int_eq((int)n, 9);
+    ck_assert_int_eq((int)identity_core_unencrypted_verb_count(), (int)n);
     ck_assert_int_eq((int)identity_unencrypted_verb_count(), (int)n);
     size_t accepted = 0;
     for (size_t i = 0; i < n; i++)
-        if (identity_verb_is_unencrypted(ALLOWED[i]))
+        if (identity_verb_is_core_unencrypted(ALLOWED[i]))
             accepted++;
-    ck_assert_int_eq((int)accepted, 14);
+    ck_assert_int_eq((int)accepted, 9);
 }
 
+DEFINE_TEST(test_no_file_is_the_core_only)
+{
+    plaintext_verbs_reset();
+    ck_assert_int_eq(_configure(NULL, false), 0);
+    ck_assert_int_eq((int)plaintext_verbs_granted_count(), 0);
+}
+
+DEFINE_TEST(test_a_malformed_file_refuses)
+{
+    static const char *const BAD[] = {
+        "not json",
+        "[]",
+        "{}",
+        "{\"verbs\": \"first_contact_hello\"}",
+        "{\"verbs\": [1]}",
+        "{\"verbs\": [\"\"]}",
+        "{\"verbs\": [], \"extra\": true}",
+        "{\"verb\": []}",
+        "{\"verbs\": [\"first_contact_hello\", \"first_contact_hello\"]}",
+    };
+    for (size_t i = 0; i < sizeof(BAD) / sizeof(BAD[0]); i++)
+        ck_assert_int_eq(_configure(BAD[i], true), -1);
+    /* Past the limits: 33 names, or one of 65 characters. */
+    char many[33 * 8 + 32] = "{\"verbs\": [";
+    for (int i = 0; i < 33; i++) {
+        char v[16];
+        snprintf(v, sizeof(v), "%s\"v%d\"", i ? ", " : "", i);
+        strcat(many, v);
+    }
+    strcat(many, "]}");
+    ck_assert_int_eq(_configure(many, false), -1);
+    char longv[128] = "{\"verbs\": [\"";
+    for (int i = 0; i < 65; i++)
+        strcat(longv, "v");
+    strcat(longv, "\"]}");
+    ck_assert_int_eq(_configure(longv, false), -1);
+}
+
+DEFINE_TEST(test_an_empty_list_is_valid)
+{
+    ck_assert_int_eq(_configure("{\"verbs\": []}", false), 0);
+}
+
+/* First contact declares its five verbs plaintext-eligible (D8e), so these
+ * need its library linked (AT_FIRST_CONTACT_LIB). */
+#ifdef AT_FIRST_CONTACT_ENABLED
+DEFINE_TEST(test_first_contact_verbs_need_the_file)
+{
+    plaintext_verbs_reset();
+    for (size_t i = 0; i < N_FC; i++) {
+        ck_assert(!identity_verb_is_unencrypted(FIRST_CONTACT[i]));
+        ck_assert(!identity_verb_is_core_unencrypted(FIRST_CONTACT[i]));
+    }
+    ck_assert_int_eq(_configure(FC_FILE, true), 0);
+    for (size_t i = 0; i < N_FC; i++)
+        ck_assert(identity_verb_is_unencrypted(FIRST_CONTACT[i]));
+    ck_assert_int_eq((int)identity_unencrypted_verb_count(), 14);
+    /* The grant never reaches a core encrypted verb. */
+    ck_assert(!identity_verb_is_unencrypted("group_key_update"));
+    plaintext_verbs_reset();
+    ck_assert(!identity_verb_is_unencrypted("first_contact_hello"));
+}
+
+DEFINE_TEST(test_no_file_with_first_contact_on_refuses)
+{
+    ck_assert_int_eq(_configure(NULL, true), -1);
+}
+
+DEFINE_TEST(test_a_missing_verb_refuses)
+{
+    ck_assert_int_eq(_configure("{\"verbs\": [\"first_contact_hello\", "
+                                "\"first_contact_hello_ack\", \"first_contact_request\", "
+                                "\"first_contact_accept\"]}", true), -1);
+}
+
+DEFINE_TEST(test_a_core_verb_refuses)
+{
+    /* The file can never downgrade the core, nor name a verb already core. */
+    ck_assert_int_eq(_configure("{\"verbs\": [\"first_contact_hello\", "
+                                "\"first_contact_hello_ack\", \"first_contact_request\", "
+                                "\"first_contact_accept\", \"device_announce\", "
+                                "\"group_key_update\"]}", true), -1);
+    ck_assert_int_eq(_configure("{\"verbs\": [\"first_contact_hello\", "
+                                "\"first_contact_hello_ack\", \"first_contact_request\", "
+                                "\"first_contact_accept\", \"device_announce\", "
+                                "\"request_access\"]}", true), -1);
+    ck_assert(!identity_verb_is_unencrypted("group_key_update"));
+}
+
+DEFINE_TEST(test_a_feature_verb_with_the_feature_off_refuses)
+{
+    ck_assert_int_eq(_configure(FC_FILE, false), -1);
+}
+
+DEFINE_TEST(test_a_refusal_keeps_the_previous_grant)
+{
+    plaintext_verbs_reset();
+    ck_assert_int_eq(_configure(FC_FILE, true), 0);
+    ck_assert_int_eq(_configure("broken", true), -1);
+    ck_assert(identity_verb_is_unencrypted("first_contact_hello"));
+    plaintext_verbs_reset();
+}
+#else
+DEFINE_TEST(test_first_contact_verbs_refuse_without_the_library)
+{
+    /* No loaded extension declares them, so naming them refuses the start,
+     * whatever $AT_FIRST_CONTACT says; and the switch alone asks for nothing. */
+    plaintext_verbs_reset();
+    ck_assert_int_eq(_configure(FC_FILE, true), -1);
+    ck_assert_int_eq(_configure(FC_FILE, false), -1);
+    ck_assert_int_eq((int)plaintext_verbs_granted_count(), 0);
+    for (size_t i = 0; i < N_FC; i++)
+        ck_assert(!identity_verb_is_unencrypted(FIRST_CONTACT[i]));
+    ck_assert_int_eq(_configure(NULL, true), 0);
+}
+#endif
+
+#ifdef AT_FIRST_CONTACT_ENABLED
 RUN_TESTS(UnencryptedVerbs,
           test_allowlisted_verbs_are_accepted,
           test_access_granted_specifically,
           test_sensitive_verbs_are_refused,
           test_null_and_empty_are_refused,
           test_matching_is_exact_not_prefix,
-          test_allowlist_size_is_deliberate)
+          test_allowlist_size_is_deliberate,
+          test_no_file_is_the_core_only,
+          test_a_malformed_file_refuses,
+          test_an_empty_list_is_valid,
+          test_first_contact_verbs_need_the_file,
+          test_no_file_with_first_contact_on_refuses,
+          test_a_missing_verb_refuses,
+          test_a_core_verb_refuses,
+          test_a_feature_verb_with_the_feature_off_refuses,
+          test_a_refusal_keeps_the_previous_grant)
+#else
+RUN_TESTS(UnencryptedVerbs,
+          test_allowlisted_verbs_are_accepted,
+          test_access_granted_specifically,
+          test_sensitive_verbs_are_refused,
+          test_null_and_empty_are_refused,
+          test_matching_is_exact_not_prefix,
+          test_allowlist_size_is_deliberate,
+          test_no_file_is_the_core_only,
+          test_a_malformed_file_refuses,
+          test_an_empty_list_is_valid,
+          test_first_contact_verbs_refuse_without_the_library)
+#endif
