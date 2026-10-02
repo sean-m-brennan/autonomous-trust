@@ -203,6 +203,12 @@ static bool _is_bilateral_locked(const tx_history_t *chain,
 static uuid_t *_chain_peers_locked(size_t *n_out);
 static int _repropose_dropped(const process_t *proc,
                               const tx_reconcile_result_t *res);
+/* Verifier-attested scores: defined with the rest of the round, below. */
+static bool _chain_json_certified(const process_t *proc, json_t *arr);
+static void _reappend_attested(const process_t *proc,
+                               const tx_reconcile_result_t *res);
+static void _forward_attestation(const process_t *proc, const tx_score_msg_t *ts,
+                                 const uuid_t self_uuid);
 static int _rescore_peers(const process_t *proc, double present,
                           const uuid_t self_uuid);
 
@@ -258,6 +264,11 @@ char REP_PROTO_APP_ROSTER[]  = AT_APP_ROSTER_REQUEST;
 char REP_PROTO_SLASH_PROPOSE[] = "slash propose";
 char REP_PROTO_SLASH_SIGN[]    = "slash sign";
 char REP_PROTO_SLASH_FINAL[]   = "slash final";
+/* Verifier-attested scores (doc/architecture/reputation.md); Python
+ * ReputationProtocol.attest_*. */
+char REP_PROTO_ATTEST_PROPOSE[] = "attest propose";
+char REP_PROTO_ATTEST_SIGN[]    = "attest sign";
+char REP_PROTO_ATTEST_FINAL[]   = "attest final";
 char REP_PROTO_CHECKPOINT_PROPOSE[] = "checkpoint propose";
 char REP_PROTO_CHECKPOINT_SIGN[]    = "checkpoint sign";
 char REP_PROTO_CHECKPOINT_FINAL[]   = "checkpoint final";
@@ -454,6 +465,11 @@ static struct {
      * The whole round, because a co-signer and the finalizer must both
      * reproduce the proposer's designation byte for byte. */
     map_t slash_pending;
+    /* Verifier-attested scores this node proposed: task uuid_str ->
+     * string_data(JSON of the attestation), and "task:voter" -> signature
+     * (the slash_sigs shape). */
+    map_t attest_pending;
+    map_t attest_sigs;
     int64_t slash_epoch;
     /* "target:slasher" -> integer_data(epoch): the highest slash epoch this
      * node has ever APPLIED for that pair. Never removed, unlike `slashed`
@@ -591,6 +607,7 @@ static bool _rep_frame_is_state(const char *fn)
         REP_PROTO_CHECKPOINT_PROPOSE, REP_PROTO_CHECKPOINT_SIGN,
         REP_PROTO_CHECKPOINT_FINAL, REP_PROTO_SLASH_PROPOSE,
         REP_PROTO_SLASH_SIGN, REP_PROTO_SLASH_FINAL,
+        REP_PROTO_ATTEST_PROPOSE, REP_PROTO_ATTEST_SIGN, REP_PROTO_ATTEST_FINAL,
         NET_EXCLUDE_FUNC, NET_READMIT_FUNC,
     };
     for (size_t i = 0; i < sizeof(state) / sizeof(state[0]); i++)
@@ -664,6 +681,8 @@ static void _ensure_init(void)
         map_init(&rep_state.slashed);
         map_init(&rep_state.slash_sigs);
         map_init(&rep_state.slash_pending);
+        map_init(&rep_state.attest_pending);
+        map_init(&rep_state.attest_sigs);
         rep_state.slash_epoch = 0;
         map_init(&rep_state.slash_hw);
         map_init(&rep_state.excluded);
@@ -2822,6 +2841,26 @@ static bool handle_committed(const process_t *proc, directory_t *queues, generic
         return false;
     }
 
+    /* ISSUES.md §2.16, shape 2: provenance. Unsigned, a commit is nobody's
+     * word; signed, it may write only its SENDER's own half -- the proposer
+     * commits the score it gave. Without this, any member wrote both halves of
+     * a fabricated entry about anybody. Mirrors Python handle_committed. */
+    if (!nmsg->verified)
+    {
+        json_decref(payload);
+        log_warn(proc->logger, "Reputation: rejecting unverified committed from %s\n",
+                 nmsg->from_whom.nickname);
+        return true;
+    }
+    if (uuid_compare(nmsg->from_whom.uuid, peer_uuid) != 0)
+    {
+        log_warn(proc->logger,
+                 "Reputation: rejecting committed from %s: it writes %.8s's half, "
+                 "not its own\n", nmsg->from_whom.nickname, peer_uuid_str);
+        json_decref(payload);
+        return true;
+    }
+
     /* Evidence channel of the committed score (R+D.md §12.8). Absent means a
      * pre-channel proposer, which is `task_outcome`. A spelling outside the
      * closed set drops the whole commit rather than being coerced away: the
@@ -2946,6 +2985,17 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
         return false;
     }
 
+    /* An attested entry must carry a certificate that meets OUR quorum, or
+     * catch-up would be a way around the round (doc/architecture/reputation.md). */
+    if (!_chain_json_certified(proc, chain_json))
+    {
+        log_warn(proc->logger,
+                 "Reputation: rejecting chain from %s: an attested entry carries "
+                 "no certificate meeting our quorum\n", nmsg->from_whom.nickname);
+        json_decref(chain_json);
+        return true;
+    }
+
     /* Key by sender UUID */
     char sender_uuid[UUID_STRING_LEN + 1];
     uuid_unparse_lower(nmsg->from_whom.uuid, sender_uuid);
@@ -3013,7 +3063,10 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
         /* After the unlock: a re-proposal starts a Paxos round, which takes
          * the lock itself. */
         if (res.status == TX_RECONCILE_ADOPTED)
+        {
             _repropose_dropped(proc, &res);
+            _reappend_attested(proc, &res);
+        }
         tx_reconcile_result_free(&res);
         return true;
     }
@@ -3106,6 +3159,7 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
                  "Reputation: adopted the majority chain at index %d: dropped "
                  "%d, added %d\n", maj_res.fork, maj_res.dropped, maj_res.added);
         _repropose_dropped(proc, &maj_res);
+        _reappend_attested(proc, &maj_res);
     }
     tx_reconcile_result_free(&maj_res);
     return true;
@@ -4353,6 +4407,648 @@ static json_t *_cosigs_json_locked(map_t *sigs, const char *round_key,
     return out;
 }
 
+/****************************
+ * Verifier-attested scores (doc/architecture/reputation.md, "Verifier-attested
+ * scores"). A fourth three-phase quorum, shaped like slash and checkpoint:
+ *
+ *   _forward_attestation : a local producer (an extension, e.g. Stele's) sends
+ *                          an attested TRANSACTION_SCORE; we sign it as its
+ *                          verifier and send attest propose to every peer.
+ *   handle_attest_propose: a member other than the subject co-signs iff the
+ *                          attestation is ADMISSIBLE in its own view. It vouches
+ *                          for nothing about the finding's truth.
+ *   handle_attest_sign   : the verifier tallies verified co-signatures; on a
+ *                          strict majority of the non-subject members it
+ *                          appends the entry and sends attest final.
+ *   handle_attest_final  : every node checks the quorum itself, against its own
+ *                          roster, and appends the entry.
+ *
+ * The subject's signature is never counted, so it cannot block the entry.
+ * Wire payloads are this runtime's own JSON shapes, as for slash (state
+ * equivalence is what conformance checks). Mirrors Python repprocess.py
+ * forward_attestation / handle_attest_*.
+ ****************************/
+
+/* A record of one attestation: everything its designation covers. */
+typedef struct {
+    char   verifier[UUID_STRING_LEN + 1];
+    char   subject[UUID_STRING_LEN + 1];
+    char   task[UUID_STRING_LEN + 1];
+    double score;
+    char   channel[TX_CHANNEL_NAMELEN + 1];
+    char   digest[TX_ATTEST_DIGEST_HEX_LEN + 1];
+    char   group[UUID_STRING_LEN + 1];
+} rep_attest_t;
+
+/* The shape every node checks before anything else -- two distinct parties, a
+ * score in [0, 1], an attestable channel, a valid digest -- and the derived
+ * task id, filled in. Normalizes the uuids to lowercase. */
+static bool _attest_well_formed(rep_attest_t *a)
+{
+    uuid_t v, s, t;
+    if (uuid_parse(a->verifier, v) != 0 || uuid_parse(a->subject, s) != 0
+        || uuid_compare(v, s) == 0)
+        return false;
+    if (!(a->score >= 0.0 && a->score <= 1.0))
+        return false;
+    if (!tx_channel_attestable(a->channel) || !tx_attest_digest_valid(a->digest))
+        return false;
+    uuid_unparse_lower(v, a->verifier);
+    uuid_unparse_lower(s, a->subject);
+    tx_attest_task_uuid(v, s, a->digest, t);
+    uuid_unparse_lower(t, a->task);
+    return true;
+}
+
+static bool _attest_from_json(const json_t *j, rep_attest_t *a)
+{
+    memset(a, 0, sizeof(*a));
+    if (!json_is_object(j))
+        return false;
+    const char *v = json_string_value(json_object_get((json_t *)j, "verifier_uuid"));
+    const char *s = json_string_value(json_object_get((json_t *)j, "subject_uuid"));
+    const char *c = json_string_value(json_object_get((json_t *)j, "channel"));
+    const char *d = json_string_value(json_object_get((json_t *)j, "evidence_digest"));
+    const char *g = json_string_value(json_object_get((json_t *)j, "group_uuid"));
+    json_t *sc = json_object_get((json_t *)j, "score");
+    if (v == NULL || s == NULL || c == NULL || d == NULL || !json_is_number(sc))
+        return false;
+    at_strlcpy(a->verifier, v, sizeof(a->verifier));
+    at_strlcpy(a->subject, s, sizeof(a->subject));
+    at_strlcpy(a->channel, c, sizeof(a->channel));
+    at_strlcpy(a->digest, d, sizeof(a->digest));
+    if (g != NULL)
+        at_strlcpy(a->group, g, sizeof(a->group));
+    a->score = json_number_value(sc);
+    return _attest_well_formed(a);
+}
+
+static json_t *_attest_to_json(const rep_attest_t *a)
+{
+    return json_pack("{s:s, s:s, s:f, s:s, s:s, s:s}",
+                     "verifier_uuid", a->verifier, "subject_uuid", a->subject,
+                     "score", a->score, "channel", a->channel,
+                     "evidence_digest", a->digest, "group_uuid", a->group);
+}
+
+/* Canonical bytes each co-signer signs. MUST stay byte-identical to Python
+ * AttestedScore.designation:
+ *   "AT-ATTEST\0" verifier "|" subject "|" task "|" %.17g score "|" channel
+ *   "|" digest [ "|" group ]
+ * Excludes index and prev_hash, which differ per node until reconcile. */
+static size_t _attest_designation(const rep_attest_t *a, uint8_t *out, size_t cap)
+{
+    static const char tag[] = "AT-ATTEST";
+    size_t tag_len = sizeof(tag);   /* includes the NUL separator */
+    if (a == NULL || out == NULL || cap <= tag_len)
+        return 0;
+    int n = snprintf((char *)out + tag_len, cap - tag_len, "%s|%s|%s|%.17g|%s|%s",
+                     a->verifier, a->subject, a->task, a->score, a->channel,
+                     a->digest);
+    if (n < 0 || (size_t)n >= cap - tag_len)
+        return 0;
+    if (a->group[0] != '\0')
+    {
+        int m = snprintf((char *)out + tag_len + n, cap - tag_len - (size_t)n,
+                         "|%s", a->group);
+        if (m < 0 || (size_t)m >= cap - tag_len - (size_t)n)
+            return 0;
+        n += m;
+    }
+    memcpy(out, tag, tag_len);
+    return tag_len + (size_t)n;
+}
+
+/* Self, or a peer on our roster. */
+static bool _is_member(const process_t *proc, const char *uuid_str)
+{
+    if (proc == NULL || uuid_str == NULL)
+        return false;
+    const identity_t *self = _resolve_self_identity(proc);
+    if (self != NULL)
+    {
+        char me[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(self->uuid, me);
+        if (strcmp(me, uuid_str) == 0)
+            return true;
+    }
+    bool found = false;
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers && !found; i++)
+    {
+        char p[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(proc->protocol.peers[i].uuid, p);
+        found = strcmp(p, uuid_str) == 0;
+    }
+    peers_read_unlock(proc);
+    return found;
+}
+
+static bool _is_self(const process_t *proc, const char *uuid_str)
+{
+    const identity_t *self = _resolve_self_identity(proc);
+    if (self == NULL || uuid_str == NULL)
+        return false;
+    char me[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(self->uuid, me);
+    return strcmp(me, uuid_str) == 0;
+}
+
+/* The verifier's own signature plus a strict majority of the members other
+ * than the subject, sized from OUR roster and counting only signatures that
+ * verify. The subject's is never counted. Caller must NOT hold the peers lock. */
+static bool _attest_quorum_met(const process_t *proc, const rep_attest_t *a,
+                               json_t *sigs)
+{
+    if (!json_is_object(sigs))
+        return false;
+    uint8_t desig[REP_DESIG_MAX];
+    size_t dlen = _attest_designation(a, desig, sizeof(desig));
+    if (dlen == 0)
+        return false;
+    size_t count = 0;
+    bool verifier_signed = false;
+    const char *voter = NULL;
+    json_t *val = NULL;
+    json_object_foreach(sigs, voter, val)
+    {
+        if (strcmp(voter, a->subject) == 0)
+            continue;
+        if (!_verify_cosignature(proc, voter, desig, dlen, json_string_value(val)))
+            continue;
+        count++;
+        if (strcmp(voter, a->verifier) == 0)
+            verifier_signed = true;
+    }
+    if (!verifier_signed)
+        return false;
+    peers_read_lock(proc);
+    size_t members = proc->protocol.num_peers + 1;
+    peers_read_unlock(proc);
+    size_t others = members - (_is_member(proc, a->subject) ? 1 : 0);
+    return count > others / 2;
+}
+
+/* Does @p chain hold an attested entry by @p verifier about @p subject? The
+ * rate cap: one per pair in the resident window, counted from the chain itself
+ * so every node reaches the same answer. Caller holds rep_state.lock. */
+static bool _attest_resident_locked(const tx_history_t *chain,
+                                    const char *verifier, const char *subject)
+{
+    uuid_t v, s;
+    if (uuid_parse(verifier, v) != 0 || uuid_parse(subject, s) != 0)
+        return false;
+    for (int i = 0; i < chain->chain_len; i++)
+    {
+        const transaction_t *t = &chain->chain[i];
+        if (t->attested && uuid_compare(t->p1_uuid, v) == 0
+            && uuid_compare(t->subject_uuid, s) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Has @p chain ever held @p task (resident or tombstoned)? Caller holds the lock. */
+static bool _task_ever_held_locked(tx_history_t *chain, const char *task)
+{
+    data_t *d = NULL;
+    return map_get(&chain->task_map, (map_key_t)task, &d) == 0
+        || map_get(&chain->evicted_set, (map_key_t)task, &d) == 0;
+}
+
+/* True when this node will vouch the attestation is admissible; otherwise
+ * false with the reason in @p why. Everything is checked in THIS node's own
+ * view; nothing is a judgement of the finding. */
+static bool _attest_admissible(const process_t *proc, const rep_attest_t *a,
+                               char *why, size_t why_cap)
+{
+    if (!_is_member(proc, a->verifier))
+    {
+        snprintf(why, why_cap, "verifier not a member");
+        return false;
+    }
+    if (!_is_member(proc, a->subject))
+    {
+        snprintf(why, why_cap, "subject not a member");
+        return false;
+    }
+    double min_rep = reputation_env_double("AT_ATTEST_MIN_REP", 0.5);
+    uuid_t vu;
+    uuid_parse(a->verifier, vu);
+    bool ok = true;
+    pthread_mutex_lock(&rep_state.lock);
+    data_t *d = NULL;
+    double rep = PREREP_NEUTRAL;
+    reputations_get(&rep_state.reputations, vu, &rep);
+    tx_history_t *chain = _chain_for_key_locked(a->group);
+    if (map_get(&rep_state.slashed, (map_key_t)a->verifier, &d) == 0)
+    {
+        snprintf(why, why_cap, "verifier slashed");
+        ok = false;
+    }
+    else if (rep < min_rep)
+    {
+        snprintf(why, why_cap, "verifier standing %.2f below %.2f", rep, min_rep);
+        ok = false;
+    }
+    else if (_task_ever_held_locked(chain, a->task))
+    {
+        snprintf(why, why_cap, "already held");
+        ok = false;
+    }
+    else if (_attest_resident_locked(chain, a->verifier, a->subject))
+    {
+        snprintf(why, why_cap, "rate cap: this verifier already attested this subject");
+        ok = false;
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    return ok;
+}
+
+/* Append a certified attestation to its chain. Returns true when it was new. */
+static bool _commit_attestation(const process_t *proc, const rep_attest_t *a,
+                                json_t *sigs)
+{
+    transaction_t tx;
+    memset(&tx, 0, sizeof(tx));
+    tx.attested = true;
+    tx.p1_set = true;
+    uuid_parse(a->verifier, tx.p1_uuid);
+    uuid_parse(a->subject, tx.subject_uuid);
+    uuid_parse(a->task, tx.task_uuid);
+    tx.p1_score = a->score;
+    at_strlcpy(tx.p1_channel, a->channel, sizeof(tx.p1_channel));
+    at_strlcpy(tx.evidence_digest, a->digest, sizeof(tx.evidence_digest));
+    tx.index = -1;
+    char *cert = json_dumps(sigs, JSON_COMPACT | JSON_SORT_KEYS);
+    pthread_mutex_lock(&rep_state.lock);
+    int rc = tx_history_append_attested(_chain_for_key_locked(a->group), &tx, cert);
+    pthread_mutex_unlock(&rep_state.lock);
+    free(cert);
+    if (rc != 0)
+        return false;
+    _note_interaction(tx.subject_uuid);
+    log_info(proc->logger,
+             "Reputation: attested score committed: verifier=%.8s subject=%.8s "
+             "score=%.2f channel=%s signers=%zu\n", a->verifier, a->subject,
+             a->score, a->channel, json_object_size(sigs));
+    return true;
+}
+
+/* Send @p payload as @p function to one peer (@p to) or, when NULL, to every
+ * peer on our roster, as the slash finalizer is sent. */
+static void _attest_send(const process_t *proc, char *function,
+                         const public_identity_t *to, json_t *payload)
+{
+    generic_msg_t out = {0};
+    out.type = NET_MESSAGE;
+    strncpy(out.info.net_msg.process, "reputation", PROC_NAME_LEN);
+    out.info.net_msg.function = function;
+    out.info.net_msg.encrypt = true;
+    strncpy(out.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+    net_msg_pack_json(&out.info.net_msg, payload);
+    if (to != NULL)
+    {
+        memcpy(&out.info.net_msg.to_whom, to, sizeof(public_identity_t));
+        _rep_send_to_network(proc, &out);
+    }
+    else
+    {
+        peers_read_lock(proc);
+        size_t n = proc->protocol.num_peers;
+        public_identity_t *roster = calloc(n > 0 ? n : 1, sizeof(public_identity_t));
+        if (roster != NULL)
+            memcpy(roster, proc->protocol.peers, n * sizeof(public_identity_t));
+        peers_read_unlock(proc);
+        for (size_t i = 0; roster != NULL && i < n; i++)
+        {
+            generic_msg_t per = out;
+            memcpy(&per.info.net_msg.to_whom, &roster[i], sizeof(public_identity_t));
+            _rep_send_to_network(proc, &per);
+        }
+        free(roster);
+    }
+    net_msg_free_obj(&out.info.net_msg);
+}
+
+/* A local producer's attested score: sign it as its verifier and ask the group
+ * to co-sign. Nothing is appended until a quorum certifies it. */
+static void _forward_attestation(const process_t *proc, const tx_score_msg_t *ts,
+                                 const uuid_t self_uuid)
+{
+    rep_attest_t a;
+    memset(&a, 0, sizeof(a));
+    uuid_unparse_lower(self_uuid, a.verifier);
+    uuid_unparse_lower(ts->peer_uuid, a.subject);
+    a.score = ts->score;
+    at_strlcpy(a.channel, ts->channel, sizeof(a.channel));
+    at_strlcpy(a.digest, ts->evidence_digest, sizeof(a.digest));
+    if (!_attest_well_formed(&a))
+    {
+        log_warn(proc->logger, "Reputation: attestation NOT proposed: malformed "
+                 "(subject %.8s, channel '%s')\n", a.subject, a.channel);
+        return;
+    }
+    if (!_is_member(proc, a.subject))
+    {
+        log_warn(proc->logger, "Reputation: attestation NOT proposed: subject "
+                 "%.8s is not a member\n", a.subject);
+        return;
+    }
+    pthread_mutex_lock(&rep_state.lock);
+    bool capped = _attest_resident_locked(_chain_for_key_locked(a.group),
+                                          a.verifier, a.subject);
+    pthread_mutex_unlock(&rep_state.lock);
+    if (capped)
+    {
+        log_warn(proc->logger, "Reputation: attestation NOT proposed: %.8s already "
+                 "attested in the window\n", a.subject);
+        return;
+    }
+    uint8_t desig[REP_DESIG_MAX];
+    size_t dlen = _attest_designation(&a, desig, sizeof(desig));
+    char sig_hex[REP_SIG_HEX_LEN + 1] = {0};
+    if (dlen == 0 || _cosign_hex(proc, desig, dlen, sig_hex, sizeof(sig_hex)) != 0)
+    {
+        log_error(proc->logger, "Reputation: cannot sign attestation; not proposed\n");
+        return;
+    }
+    json_t *rec = _attest_to_json(&a);
+    char *text = rec != NULL ? json_dumps(rec, JSON_COMPACT | JSON_SORT_KEYS) : NULL;
+    pthread_mutex_lock(&rep_state.lock);
+    if (text != NULL)
+        map_set(&rep_state.attest_pending, (map_key_t)a.task,
+                string_data(text, strlen(text) + 1));
+    _record_cosig_locked(&rep_state.attest_sigs, a.task, a.verifier, sig_hex);
+    pthread_mutex_unlock(&rep_state.lock);
+    free(text);
+    if (rec != NULL)
+        _attest_send(proc, REP_PROTO_ATTEST_PROPOSE, NULL, rec);
+    json_decref(rec);
+    log_info(proc->logger, "Reputation: proposed attested score: subject=%.8s "
+             "score=%.2f\n", a.subject, a.score);
+}
+
+static bool handle_attest_propose(const process_t *proc, directory_t *queues,
+                                  generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    if (!nmsg->verified)
+    {
+        log_warn(proc->logger, "Reputation: rejecting unverified attest_propose "
+                 "from %s\n", nmsg->from_whom.nickname);
+        return true;
+    }
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return false;
+    rep_attest_t a;
+    bool ok = _attest_from_json(payload, &a);
+    json_decref(payload);
+    if (!ok)
+    {
+        log_warn(proc->logger, "Reputation: declining attest_propose from %s: "
+                 "malformed\n", nmsg->from_whom.nickname);
+        return true;
+    }
+    if (_is_self(proc, a.verifier))
+        return true;   /* our own bounce-back */
+    /* The verifier is the AUTHENTICATED sender, never just a claim. */
+    char sender[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, sender);
+    if (strcmp(sender, a.verifier) != 0)
+    {
+        log_warn(proc->logger, "Reputation: attest_propose names verifier %.8s but "
+                 "was sent by %.8s; refused\n", a.verifier, sender);
+        return true;
+    }
+    if (_is_self(proc, a.subject))
+    {
+        log_info(proc->logger, "Reputation: not co-signing an attestation about "
+                 "ourselves from %s\n", nmsg->from_whom.nickname);
+        return true;
+    }
+    char why[128] = {0};
+    if (!_attest_admissible(proc, &a, why, sizeof(why)))
+    {
+        log_warn(proc->logger, "Reputation: declining attest_propose from %s: %s\n",
+                 nmsg->from_whom.nickname, why);
+        return true;
+    }
+    uint8_t desig[REP_DESIG_MAX];
+    size_t dlen = _attest_designation(&a, desig, sizeof(desig));
+    char sig_hex[REP_SIG_HEX_LEN + 1] = {0};
+    const identity_t *self = _resolve_self_identity(proc);
+    if (self == NULL || dlen == 0
+        || _cosign_hex(proc, desig, dlen, sig_hex, sizeof(sig_hex)) != 0)
+    {
+        log_warn(proc->logger, "Reputation: cannot sign attest_propose; declining\n");
+        return true;
+    }
+    char me[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(self->uuid, me);
+    json_t *ack = json_pack("{s:s, s:s, s:s}", "task", a.task,
+                            "signer_uuid", me, "signature", sig_hex);
+    if (ack != NULL)
+    {
+        _attest_send(proc, REP_PROTO_ATTEST_SIGN, &nmsg->from_whom, ack);
+        json_decref(ack);
+        log_info(proc->logger, "Reputation: co-signed attest_propose from %s\n",
+                 nmsg->from_whom.nickname);
+    }
+    return true;
+}
+
+static bool handle_attest_sign(const process_t *proc, directory_t *queues,
+                               generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    if (!nmsg->verified)
+    {
+        log_warn(proc->logger, "Reputation: rejecting unverified attest_sign from %s\n",
+                 nmsg->from_whom.nickname);
+        return true;
+    }
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return false;
+    const char *task = json_string_value(json_object_get(payload, "task"));
+    const char *claimed = json_string_value(json_object_get(payload, "signer_uuid"));
+    const char *sig = json_string_value(json_object_get(payload, "signature"));
+    char voter[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, voter);
+    if (task == NULL || sig == NULL
+        || (claimed != NULL && strcmp(claimed, voter) != 0))
+    {
+        json_decref(payload);
+        return true;
+    }
+    char rec_text[1024] = {0};
+    pthread_mutex_lock(&rep_state.lock);
+    data_t *d = NULL;
+    bool pending = map_get(&rep_state.attest_pending, (map_key_t)task, &d) == 0
+        && d != NULL && data_string(d, rec_text, sizeof(rec_text)) == 0;
+    pthread_mutex_unlock(&rep_state.lock);
+    if (!pending)
+    {
+        json_decref(payload);
+        return true;   /* not our round, or already final */
+    }
+    json_t *rec = json_loads(rec_text, 0, NULL);
+    rep_attest_t a;
+    bool ok = _attest_from_json(rec, &a);
+    json_decref(rec);
+    if (!ok || strcmp(voter, a.subject) == 0)
+    {
+        json_decref(payload);
+        return true;   /* the subject's signature is never counted */
+    }
+    uint8_t desig[REP_DESIG_MAX];
+    size_t dlen = _attest_designation(&a, desig, sizeof(desig));
+    if (dlen == 0 || !_verify_cosignature(proc, voter, desig, dlen, sig))
+    {
+        log_warn(proc->logger, "Reputation: attest_sign from %.8s failed "
+                 "verification; not counted\n", voter);
+        json_decref(payload);
+        return true;
+    }
+    pthread_mutex_lock(&rep_state.lock);
+    _record_cosig_locked(&rep_state.attest_sigs, a.task, voter, sig);
+    size_t count = 0;
+    json_t *sigs = _cosigs_json_locked(&rep_state.attest_sigs, a.task, &count);
+    pthread_mutex_unlock(&rep_state.lock);
+    json_decref(payload);
+    if (sigs == NULL || !_attest_quorum_met(proc, &a, sigs))
+    {
+        json_decref(sigs);
+        return true;
+    }
+    pthread_mutex_lock(&rep_state.lock);
+    map_remove(&rep_state.attest_pending, a.task);
+    pthread_mutex_unlock(&rep_state.lock);
+    _commit_attestation(proc, &a, sigs);
+    json_t *fin = _attest_to_json(&a);
+    if (fin != NULL)
+    {
+        json_object_set(fin, "sigs", sigs);
+        _attest_send(proc, REP_PROTO_ATTEST_FINAL, NULL, fin);
+        json_decref(fin);
+    }
+    json_decref(sigs);
+    return true;
+}
+
+static bool handle_attest_final(const process_t *proc, directory_t *queues,
+                                generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    if (!nmsg->verified)
+    {
+        log_warn(proc->logger, "Reputation: rejecting unverified attest_final from %s\n",
+                 nmsg->from_whom.nickname);
+        return true;
+    }
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || payload == NULL)
+        return false;
+    rep_attest_t a;
+    if (!_attest_from_json(payload, &a))
+    {
+        json_decref(payload);
+        return true;
+    }
+    pthread_mutex_lock(&rep_state.lock);
+    data_t *d = NULL;
+    bool held = map_get(&_chain_for_key_locked(a.group)->task_map,
+                        (map_key_t)a.task, &d) == 0;
+    pthread_mutex_unlock(&rep_state.lock);
+    if (held)
+    {
+        json_decref(payload);
+        return true;   /* already appended */
+    }
+    /* Quorum is verified HERE, against our own roster. Whether this node would
+     * itself have vouched is not the question: the certificate says a majority
+     * of the others did. */
+    json_t *sigs = json_object_get(payload, "sigs");
+    if (!_attest_quorum_met(proc, &a, sigs))
+    {
+        log_warn(proc->logger, "Reputation: rejecting attest_final about %.8s: its "
+                 "co-signatures do not meet quorum\n", a.subject);
+        json_decref(payload);
+        return true;
+    }
+    _commit_attestation(proc, &a, sigs);
+    json_decref(payload);
+    return true;
+}
+
+/* Catch-up refuses a segment carrying an attested entry whose certificate does
+ * not meet our quorum: otherwise catch-up would be a way around the round.
+ * Caller must NOT hold rep_state.lock or the peers lock. */
+static bool _chain_json_certified(const process_t *proc, json_t *arr)
+{
+    if (!json_is_array(arr))
+        return true;
+    size_t i;
+    json_t *e;
+    json_array_foreach(arr, i, e)
+    {
+        if (!json_is_true(json_object_get(e, "attested")))
+            continue;
+        rep_attest_t a;
+        memset(&a, 0, sizeof(a));
+        const char *v = json_string_value(json_object_get(e, "p1"));
+        const char *s = json_string_value(json_object_get(e, "subject"));
+        const char *c = json_string_value(json_object_get(e, "p1_channel"));
+        const char *dg = json_string_value(json_object_get(e, "evidence_digest"));
+        if (v == NULL || s == NULL || c == NULL || dg == NULL)
+            return false;
+        at_strlcpy(a.verifier, v, sizeof(a.verifier));
+        at_strlcpy(a.subject, s, sizeof(a.subject));
+        at_strlcpy(a.channel, c, sizeof(a.channel));
+        at_strlcpy(a.digest, dg, sizeof(a.digest));
+        a.score = json_number_value(json_object_get(e, "p1_score"));
+        if (!_attest_well_formed(&a)
+            || !_attest_quorum_met(proc, &a, json_object_get(e, "attest_sigs")))
+            return false;
+    }
+    return true;
+}
+
+/* An adopted chain that dropped a certified attested entry: re-append it. It
+ * verifies on its own and does not depend on its position, so a fork cannot
+ * take it away. Mirrors Python _reappend_attested. Caller must NOT hold
+ * rep_state.lock. */
+static void _reappend_attested(const process_t *proc, const tx_reconcile_result_t *res)
+{
+    for (int i = 0; res != NULL && i < res->dropped; i++)
+    {
+        const transaction_t *t = &res->dropped_entries[i];
+        if (!t->attested)
+            continue;
+        rep_attest_t a;
+        memset(&a, 0, sizeof(a));
+        uuid_unparse_lower(t->p1_uuid, a.verifier);
+        uuid_unparse_lower(t->subject_uuid, a.subject);
+        at_strlcpy(a.channel, t->p1_channel, sizeof(a.channel));
+        at_strlcpy(a.digest, t->evidence_digest, sizeof(a.digest));
+        a.score = t->p1_score;
+        if (!_attest_well_formed(&a))
+            continue;
+        pthread_mutex_lock(&rep_state.lock);
+        const char *cert = tx_history_attest_cert(&rep_state.history, t->task_uuid);
+        json_t *sigs = cert != NULL ? json_loads(cert, 0, NULL) : NULL;
+        pthread_mutex_unlock(&rep_state.lock);
+        if (sigs != NULL && _attest_quorum_met(proc, &a, sigs))
+            _commit_attestation(proc, &a, sigs);
+        json_decref(sigs);
+    }
+}
+
 static bool handle_slash_propose(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     (void)queues;
@@ -5392,11 +6088,12 @@ static bool _chain_holding_locked(const char *peer_str, char *out, size_t cap)
         for (int i = 0; i < chain->chain_len; i++)
         {
             const transaction_t *tx = &chain->chain[i];
-            if (tx->index < 0 || !tx->p1_set || !tx->p2_set)
+            if (tx->index < 0 || !tx_is_committed(tx))
                 continue;
             char p1[UUID_STRING_LEN + 1], p2[UUID_STRING_LEN + 1];
             uuid_unparse_lower(tx->p1_uuid, p1);
-            uuid_unparse_lower(tx->p2_uuid, p2);
+            /* An attested entry names its subject where p2 would be. */
+            uuid_unparse_lower(tx->attested ? tx->subject_uuid : tx->p2_uuid, p2);
             if (strcmp(p1, peer_str) == 0 || strcmp(p2, peer_str) == 0)
             {
                 snprintf(out, cap, "%s", chain_key);
@@ -7648,6 +8345,10 @@ static int _repropose_dropped(const process_t *proc,
     for (int i = 0; i < res->dropped; i++)
     {
         const transaction_t *t = &res->dropped_entries[i];
+        /* An attested entry is not a half to re-propose: it is re-appended
+         * whole from its certificate (doc/architecture/reputation.md). */
+        if (t->attested)
+            continue;
         bool mine1 = t->p1_set && uuid_compare(t->p1_uuid, self_uuid) == 0;
         bool mine2 = t->p2_set && uuid_compare(t->p2_uuid, self_uuid) == 0;
         if (!mine1 && !mine2)
@@ -7785,6 +8486,9 @@ int reputation_register_handlers(process_t *proc)
     process_register_handler(proc, REP_PROTO_SLASH_PROPOSE, (handler_ptr_t)handle_slash_propose);
     process_register_handler(proc, REP_PROTO_SLASH_SIGN,    (handler_ptr_t)handle_slash_sign);
     process_register_handler(proc, REP_PROTO_SLASH_FINAL,   (handler_ptr_t)handle_slash_final);
+    process_register_handler(proc, REP_PROTO_ATTEST_PROPOSE, (handler_ptr_t)handle_attest_propose);
+    process_register_handler(proc, REP_PROTO_ATTEST_SIGN,    (handler_ptr_t)handle_attest_sign);
+    process_register_handler(proc, REP_PROTO_ATTEST_FINAL,   (handler_ptr_t)handle_attest_final);
     process_register_handler(proc, REP_PROTO_CHECKPOINT_PROPOSE, (handler_ptr_t)handle_checkpoint_propose);
     process_register_handler(proc, REP_PROTO_CHECKPOINT_SIGN,    (handler_ptr_t)handle_checkpoint_sign);
     process_register_handler(proc, REP_PROTO_CHECKPOINT_FINAL,   (handler_ptr_t)handle_checkpoint_final);
@@ -7899,6 +8603,10 @@ void reputation_reset_state(int num_peers)
     map_init(&rep_state.slash_sigs);
     map_free(&rep_state.slash_pending);
     map_init(&rep_state.slash_pending);
+    map_free(&rep_state.attest_pending);
+    map_init(&rep_state.attest_pending);
+    map_free(&rep_state.attest_sigs);
+    map_init(&rep_state.attest_sigs);
     rep_state.slash_epoch = 0;
     map_free(&rep_state.slash_hw);
     map_init(&rep_state.slash_hw);
@@ -8238,6 +8946,31 @@ void reputation_install_tx_pair(const uuid_t task_uuid,
     pthread_mutex_unlock(&rep_state.lock);
 }
 
+int reputation_install_tx_attested(const uuid_t verifier_uuid, double score,
+                                   const char *channel,
+                                   const uuid_t subject_uuid,
+                                   const char *evidence_digest)
+{
+    _ensure_init();
+    transaction_t tx;
+    memset(&tx, 0, sizeof(tx));
+    tx.attested = true;
+    tx.p1_set = true;
+    uuid_copy(tx.p1_uuid, verifier_uuid);
+    tx.p1_score = score;
+    if (channel != NULL)
+        at_strlcpy(tx.p1_channel, channel, sizeof(tx.p1_channel));
+    uuid_copy(tx.subject_uuid, subject_uuid);
+    if (evidence_digest != NULL)
+        at_strlcpy(tx.evidence_digest, evidence_digest, sizeof(tx.evidence_digest));
+    tx_attest_task_uuid(verifier_uuid, subject_uuid, tx.evidence_digest, tx.task_uuid);
+    tx.index = -1;
+    pthread_mutex_lock(&rep_state.lock);
+    int rc = tx_history_append_attested(&rep_state.history, &tx, NULL);
+    pthread_mutex_unlock(&rep_state.lock);
+    return rc;
+}
+
 void reputation_install_tx_single(const uuid_t task_uuid,
                                   const uuid_t peer_uuid, double score)
 {
@@ -8351,6 +9084,18 @@ static void _handle_local_tx_score(const process_t *proc,
                                    const uuid_t self_uuid, bool have_self)
 {
     const tx_score_msg_t *ts = &msg->info.tx_score;
+    if (ts->attested)
+    {
+        /* A verifier-attested score: no Paxos round with the subject; the
+         * group certifies it instead (doc/architecture/reputation.md). Its
+         * task id is derived, so the zero-task sentinel below does not apply. */
+        if (!have_self)
+            log_warn(proc->logger,
+                     "Reputation: dropping local attestation — self identity unavailable\n");
+        else
+            _forward_attestation(proc, ts, self_uuid);
+        return;
+    }
     uuid_t zero;
     uuid_clear(zero);
     if (uuid_compare(ts->task_uuid, zero) == 0)

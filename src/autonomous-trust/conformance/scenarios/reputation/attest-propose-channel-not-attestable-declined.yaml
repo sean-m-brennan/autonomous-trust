@@ -1,0 +1,39 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-propose-channel-not-attestable-declined
+byte_pinning: false
+description: |
+    Only an attestable channel can carry an attested score.
+
+    `first_person` is one party's account of one exchange; co-signed by a
+    quorum it would be exactly the accusation that channel must never become.
+    bob declines.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+fixtures:
+  reputations:
+    bob:
+      alice: 0.7
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest propose
+    payload:
+      subject: carol
+      score: 0.3
+      channel: first_person
+    description: an attestation on a first-person channel.
+
+expected_state:
+  bob:
+    attest_signs_sent: 0

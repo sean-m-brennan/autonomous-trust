@@ -67,7 +67,9 @@
 #define AT_MSG_TYPE_FLEET_MAX    2199
 #define AT_MSG_TYPE_FC_MIN       2200
 #define AT_MSG_TYPE_FC_MAX       2219
-#define AT_MSG_TYPE_EXT_MAX      2219
+#define AT_MSG_TYPE_STELE_MIN    2300
+#define AT_MSG_TYPE_STELE_MAX    2309
+#define AT_MSG_TYPE_EXT_MAX      2309
 /** @} */
 
 /** @brief Ceiling on registered types across all features. */

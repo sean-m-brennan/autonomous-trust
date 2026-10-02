@@ -168,14 +168,8 @@ class TestSubtreeRoster:
         # Record a committed bilateral tx for `child` in the CHILD chain
         # via the wire path (4-tuple committed carrying the child group).
         task = uuid4()
-        rp.handle_committed(None, Message(
-            CfgIds.reputation, ReputationProtocol.committed,
-            _tuple_json((task, child, 0.9, cg_uuid)), None,
-            from_whom=rp.identity))
-        rp.handle_committed(None, Message(
-            CfgIds.reputation, ReputationProtocol.committed,
-            _tuple_json((task, cohort_peer, 0.9, cg_uuid)), None,
-            from_whom=rp.identity))
+        rp.handle_committed(None, _commit_from(rp, (task, child, 0.9, cg_uuid)))
+        rp.handle_committed(None, _commit_from(rp, (task, cohort_peer, 0.9, cg_uuid)))
         roster = rp._subtree_roster(gw)
         child_rep = next(r for r in roster if str(r.peer_id) == str(child))
         # EMA over a single 0.9 counterparty score == 0.9, well above the
@@ -233,14 +227,22 @@ def _tuple_json(tpl):
     return to_json_string(tpl)
 
 
+def _commit_from(rp, tpl):
+    """A `committed` as its proposer sends it: signed, and from the peer whose
+    half it writes (ISSUES.md §2.16, shape 2). tpl = (task, peer, score, ...)."""
+    msg = Message(CfgIds.reputation, ReputationProtocol.committed,
+                  _tuple_json(tpl), None, from_whom=rp.identity)
+    msg.verified = True
+    msg.from_whom = SimpleNamespace(uuid=tpl[1], nickname='proposer')
+    return msg
+
+
 class TestCommittedWireCompat:
     def test_legacy_3tuple_routes_to_primary(self):
         rp = _make_rep_process()
         peer = uuid4()
         task = uuid4()
-        rp.handle_committed(None, Message(
-            CfgIds.reputation, ReputationProtocol.committed,
-            _tuple_json((task, peer, 0.8)), None, from_whom=rp.identity))
+        rp.handle_committed(None, _commit_from(rp, (task, peer, 0.8)))
         assert len(rp.history) >= 0  # half-tx until counterparty arrives
         assert task in rp.history._task_mapping
         assert rp.child_histories == {}
@@ -252,10 +254,7 @@ class TestCommittedWireCompat:
         rp.protocol.child_groups = {cg_uuid: cg}
         peer = uuid4()
         task = uuid4()
-        rp.handle_committed(None, Message(
-            CfgIds.reputation, ReputationProtocol.committed,
-            _tuple_json((task, peer, 0.8, cg_uuid)), None,
-            from_whom=rp.identity))
+        rp.handle_committed(None, _commit_from(rp, (task, peer, 0.8, cg_uuid)))
         # Routed to the child chain, NOT the primary one.
         assert cg_uuid in rp.child_histories
         assert task in rp.child_histories[cg_uuid]._task_mapping
@@ -265,9 +264,6 @@ class TestCommittedWireCompat:
         rp = _make_rep_process()
         peer = uuid4()
         task = uuid4()
-        rp.handle_committed(None, Message(
-            CfgIds.reputation, ReputationProtocol.committed,
-            _tuple_json((task, peer, 0.8, str(uuid4()))), None,
-            from_whom=rp.identity))
+        rp.handle_committed(None, _commit_from(rp, (task, peer, 0.8, str(uuid4()))))
         assert task in rp.history._task_mapping
         assert rp.child_histories == {}

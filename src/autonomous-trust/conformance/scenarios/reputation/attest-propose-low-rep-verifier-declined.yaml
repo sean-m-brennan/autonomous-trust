@@ -1,0 +1,38 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-propose-low-rep-verifier-declined
+byte_pinning: false
+description: |
+    A verifier below the attestation floor in a member's view is not vouched for.
+
+    bob holds alice at 0.3, below `AT_ATTEST_MIN_REP` (0.5). A verifier this node
+    does not yet trust cannot place a score its subject cannot veto, so bob
+    declines to co-sign.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+fixtures:
+  reputations:
+    bob:
+      alice: 0.3
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest propose
+    payload:
+      subject: carol
+      score: 0.3
+    description: alice, in poor standing with bob, proposes.
+
+expected_state:
+  bob:
+    attest_signs_sent: 0

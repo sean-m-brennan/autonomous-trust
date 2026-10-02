@@ -72,6 +72,7 @@ and reads or writes the payload through `AT_MSG_EXT(msg, T)`.
 | 2000–2099 | ZTA (`zta/zta_msg_types.h`, 2000–2001 used) |
 | 2100–2199 | fleet (reserved) |
 | 2200–2219 | first contact (`identity/first_contact.h`, 2200–2201 used: `FIRST_CONTACT_EVENT`, `FIRST_CONTACT_CONTACT_EVENT`) |
+| 2300–2309 | stele (Stele's `at-stele/c/stele/stele_msg_types.h`) |
 
 Registration refuses an id outside the extension ranges, a duplicate id, a
 duplicate name, a name the core already uses, a zero or oversized payload, and
