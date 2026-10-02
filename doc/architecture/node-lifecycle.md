@@ -9,7 +9,7 @@ deterministic startup sequence before entering its active state.
 
 0. **Clock gate.** Read the host's clock discipline and refuse to continue on a clock nothing is steering (see [Clock discipline](#clock-discipline)). The C side does the same in `at_node_init` before it touches any directory.
 
-1. **Configure.** Load configuration files from `$AUTONOMOUS_TRUST_ROOT/etc/at/`. Required configs: network, identity, peers, capabilities. The `ProcessTracker` reads `subsystems.cfg.json` to determine which process classes to instantiate.
+1. **Configure.** Load configuration files from `$AUTONOMOUS_TRUST_ROOT/etc/at/`. Required configs: network, identity, peers, capabilities. The `ProcessTracker` reads `subsystems.cfg.json` to determine which process classes to instantiate. In C, a configuration that starts a feature library's subsystem (fleet or data source) on a node built without that library stops here with an error naming the library.
 
 2. **Spawn processes.** The orchestrator creates a process pool and starts each subsystem process (`NetworkProcess`, `IdentityProcess`, `NegotiationProcess`, `ReputationProcess`) as an async worker, each with access to the shared queue dict. An additional worker, `BootstrapWorker`, is also registered (see [Process architecture](process-architecture.md)) to run the bootstrap-capability corpus once peers begin to join.
 

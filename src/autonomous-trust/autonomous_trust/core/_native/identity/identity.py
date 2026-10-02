@@ -32,6 +32,7 @@ from ..._python.identity.identity import (  # noqa: F401
     # native backend too.
     public_identity_to_canonical,
     public_identity_from_canonical,
+    derive_local_petname,
 )
 
 # libsodium constants

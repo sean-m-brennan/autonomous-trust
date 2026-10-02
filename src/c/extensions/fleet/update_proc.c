@@ -26,6 +26,7 @@
 #include <sodium.h>
 
 #include "processes/processes.h"
+#include "processes/process_tracker.h"
 #include "fleet/update_proc.h"
 #include "fleet/artifact_proc.h"
 #include "fleet/artifact_store.h"
@@ -639,4 +640,7 @@ int update_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t
     proc->protocol.phase = 1;
     return process_run(proc, queues, signal, logger);
 }
-DECLARE_PROCESS(update, update_proc, update_run);
+/* An extension's process (FEATURE_SPLIT_PLAN Phase 8): registered at load,
+ * and started by default once this library is linked. */
+DEFINE_PROCESS(update, update_proc, update_run)
+DEFINE_SUBSYSTEM(update, "update", "update_proc")

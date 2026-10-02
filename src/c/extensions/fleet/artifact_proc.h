@@ -24,7 +24,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "autonomous_trust/processes/processes.h"
+#include "processes/processes.h"
 #include "fleet/update_proposal.h"  /* UPDATE_HASH_LEN, UPDATE_VERSION_LEN */
 
 #ifdef __cplusplus

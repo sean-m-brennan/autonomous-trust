@@ -24,7 +24,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "autonomous_trust/fleet/artifact_store.h"
+#include "fleet/artifact_store.h"
 
 /* ---------- helpers ---------- */
 

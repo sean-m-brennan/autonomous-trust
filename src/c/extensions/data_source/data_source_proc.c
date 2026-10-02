@@ -40,6 +40,7 @@
 #include <jansson.h>
 
 #include "processes/processes.h"
+#include "processes/process_tracker.h"
 #include "processes/capabilities.h"
 #include "data_source/data_source_proc.h"
 #include "structures/map.h"
@@ -543,6 +544,14 @@ int data_source_run(process_t *proc, directory_t *queues, queue_id_t signal,
  * row; build_local_capabilities includes it in the announce so the
  * coordinator's DataRcvr subscribes). Name must equal Python
  * DataProcess.capability_name == "data". */
-DECLARE_CAPABILITY(data, NULL, NULL);
+/* Load-time, as an extension's must be: the table generator does not scan
+ * extension libraries (FEATURE_SPLIT_PLAN Phase 8). */
+DEFINE_CAPABILITY(data, NULL, NULL)
 
-DECLARE_PROCESS(data_source, data_source_proc, data_source_run);
+/* An extension's process (FEATURE_SPLIT_PLAN Phase 8): registered at load,
+ * and started by default once this library is linked. */
+/* Subsystem key "data-source" is the queue name net_proc routes inbound
+ * subscribe requests to (route_to_process), and must match the wire name the
+ * coordinator's DataRcvr addresses (Python DataProcess.name). */
+DEFINE_PROCESS(data_source, data_source_proc, data_source_run)
+DEFINE_SUBSYSTEM(data_source, "data-source", "data_source_proc")
