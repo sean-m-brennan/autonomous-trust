@@ -1,0 +1,35 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-final-forged-cosignatures-refused
+byte_pinning: false
+description: |
+    Co-signatures that do not verify are not votes.
+
+    The map names alice and bob, but alice signed both entries (`forged_by`):
+    the case of a verifier minting its own certificate. bob verifies each
+    against the key he holds for the voter it names, counts one, and refuses.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest final
+    payload:
+      subject: carol
+      score: 0.3
+      cosigners: [alice, bob]
+      forged_by: alice
+    description: a certificate alice signed twice over.
+
+expected_state:
+  bob:
+    committed_tx_count: 0

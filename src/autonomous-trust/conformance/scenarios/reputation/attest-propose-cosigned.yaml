@@ -1,0 +1,40 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-propose-cosigned
+byte_pinning: false
+description: |
+    A member co-signs an admissible attestation.
+
+    bob holds alice above the 0.5 attestation floor, alice and carol are both
+    members, the channel is `probe`, the digest is well-formed, and bob's chain
+    holds nothing from alice about carol. So he signs the designation and sends
+    it back. He vouches for admissibility only: nothing in the check is a
+    judgement of whether carol's work was poor.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+fixtures:
+  reputations:
+    bob:
+      alice: 0.7
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest propose
+    payload:
+      subject: carol
+      score: 0.3
+    description: alice proposes an attested score about carol.
+
+expected_state:
+  bob:
+    attest_signs_sent: 1

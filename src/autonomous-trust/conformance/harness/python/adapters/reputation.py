@@ -40,7 +40,8 @@ from autonomous_trust.core.capabilities import PeerCapabilities
 from autonomous_trust.core.config import Configuration, to_json_string
 from autonomous_trust.core.reputation.reputation import (
     RESOLVE_TTL_DEFAULT, PeerReputation, resolve_query_to_dict,
-    resolved_to_dict)
+    resolved_to_dict, Transaction, attest_task_id, AttestedScore,
+    SignedAttestation)
 from autonomous_trust.core._python.identity.identity import (
     public_identity_to_canonical)
 from autonomous_trust.core.identity import Group, Identity, Peers
@@ -108,6 +109,10 @@ class _Participant:
         # is permissive about extra messages, so an unpinned stray proposal
         # would pass silently.
         self.slashes_proposed = 0
+        # Cumulative count of attestation co-signatures this participant SENT
+        # (doc/architecture/reputation.md, "Verifier-attested scores"), for the
+        # same reason: the cases this exists for are mostly "it declined".
+        self.attest_signs_sent = 0
 
     def drain_outbox(self) -> list[CapturedMessage]:
         captured: list[CapturedMessage] = []
@@ -304,6 +309,15 @@ class _Participant:
                         f'{self.id}: slashes_proposed={actual}, '
                         f'expected {expected}'
                     )
+            elif key == 'attest_signs_sent':
+                # How many attestation co-signatures this participant sent.
+                # Zero is the declining cases' pin: an inadmissible
+                # attestation, or one about this participant itself.
+                actual = self.attest_signs_sent
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: attest_signs_sent={actual}, '
+                        f'expected {expected}')
             elif key == 'app_roster':
                 # Which peers the app-facing roster pull reported, as
                 # participant ids. The carrier is local IPC toward the main
@@ -662,6 +676,19 @@ class ReputationAdapter:
                     float(entry['p2']))
 
             for entry in preset_tx_history.get(pid, []):
+                if entry.get('attested'):
+                    # A verifier-attested entry: p1 is the verifier, its task
+                    # id derived from its content. Mirrors the C adapter.
+                    v, subj = entry.get('p1'), entry.get('subject')
+                    if v in identities and subj in identities:
+                        vu, su = identities[v].uuid, identities[subj].uuid
+                        dig = entry.get('evidence_digest')
+                        participant.process.history.append_attested(Transaction(
+                            attest_task_id(vu, su, dig), p1_id=vu,
+                            p1_score=float(entry.get('p1_score', 0.0)),
+                            p1_channel=entry.get('p1_channel'), attested=True,
+                            subject_id=su, evidence_digest=dig))
+                    continue
                 slug = entry.get('task_id')
                 p1_id = entry.get('p1')
                 p2_id = entry.get('p2')
@@ -795,6 +822,8 @@ class ReputationAdapter:
                 captured.outbox_buffer.append(item)
                 if item.function == ReputationProtocol.slash_propose:
                     captured.slashes_proposed += 1
+                if item.function == ReputationProtocol.attest_sign:
+                    captured.attest_signs_sent += 1
             original_put(item, *args, **kwargs)
 
         queues[CfgIds.network].put = _record_and_put  # type: ignore[method-assign]
@@ -1112,6 +1141,40 @@ class ReputationAdapter:
                                                      sigs=sigs))
                 else:
                     obj = to_json_string(att)
+        elif function in (ReputationProtocol.attest_propose,
+                          ReputationProtocol.attest_sign,
+                          ReputationProtocol.attest_final):
+            # Verifier-attested scores -- Python's native shapes (per-impl;
+            # byte_pinning:false checks state equivalence). propose/final
+            # carry an AttestedScore / SignedAttestation; sign is a
+            # (task, voter, sig) tuple. The VERIFIER is the proposer (the
+            # step's `from` for propose/final, its `to` for sign), so every
+            # step of one round must name the same subject, score, channel and
+            # digest: the designation covers them all.
+            subject_pid = payload.get('subject')
+            subject_uuid = (str(participants[subject_pid].impl.identity.uuid)
+                            if subject_pid in participants else subject_pid)
+            verifier_pid = payload.get(
+                'verifier',
+                to_id if function == ReputationProtocol.attest_sign else from_id)
+            att = AttestedScore(
+                verifier_uuid=str(participants[verifier_pid].impl.identity.uuid),
+                subject_uuid=subject_uuid,
+                score=float(payload.get('score', 0.3)),
+                channel=payload.get('channel', 'probe'),
+                evidence_digest=payload.get('evidence_digest', 'ab' * 32))
+            if function == ReputationProtocol.attest_sign:
+                obj = to_json_string(
+                    (str(att.task_id), str(sender_identity.uuid),
+                     self._detached_sig(sender_identity, att.designation)))
+            elif function == ReputationProtocol.attest_final:
+                sigs = self._cosignatures(participants, payload,
+                                          att.designation,
+                                          exclude=subject_pid)
+                obj = to_json_string(SignedAttestation(attestation=att,
+                                                       sigs=sigs))
+            else:
+                obj = to_json_string(att)
         elif function in (ReputationProtocol.checkpoint_propose,
                           ReputationProtocol.checkpoint_sign,
                           ReputationProtocol.checkpoint_final):

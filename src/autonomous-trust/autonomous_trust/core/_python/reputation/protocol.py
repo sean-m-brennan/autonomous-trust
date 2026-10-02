@@ -116,6 +116,17 @@ class ReputationProtocol(Protocol):
     checkpoint_propose = 'checkpoint propose'
     checkpoint_sign = 'checkpoint sign'
     checkpoint_final = 'checkpoint final'
+    # Verifier-attested scores (doc/architecture/reputation.md,
+    # "Verifier-attested scores"): a verifier broadcasts `attest_propose` (an
+    # AttestedScore about a subject); members other than the subject co-sign
+    # with `attest_sign` if it is ADMISSIBLE in their own view (they vouch for
+    # nothing about its truth); on a strict majority of the non-subject
+    # members the verifier broadcasts `attest_final` (a SignedAttestation)
+    # and every node appends the entry. The subject's signature is never
+    # counted, so it cannot block the entry. Same three-phase shape as slash.
+    attest_propose = 'attest propose'
+    attest_sign = 'attest sign'
+    attest_final = 'attest final'
     # Deep resolution (doc/architecture/gateway-reputation-tree.md): one peer, on
     # demand, at any depth.
     #

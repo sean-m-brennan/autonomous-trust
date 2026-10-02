@@ -1,0 +1,38 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-propose-about-self-declined
+byte_pinning: false
+description: |
+    The subject does not co-sign an attestation about itself.
+
+    Its signature would not count, so carol says so in her log rather than send
+    one: an attestation's quorum is drawn from the members other than its
+    subject.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+fixtures:
+  reputations:
+    carol:
+      alice: 0.7
+
+steps:
+  - id: 1
+    from: alice
+    to: carol
+    function: attest propose
+    payload:
+      subject: carol
+      score: 0.3
+    description: the proposal reaches its subject.
+
+expected_state:
+  carol:
+    attest_signs_sent: 0

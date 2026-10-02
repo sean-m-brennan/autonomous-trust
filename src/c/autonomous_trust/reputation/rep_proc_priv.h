@@ -245,6 +245,13 @@ void reputation_install_tx_pair(const uuid_t task_uuid,
  *
  *  Untagged deliberately: the staged side is an ordinary task outcome, and the
  *  channel under test arrives on the wire. Conformance hook only. */
+/* Commit a verifier-attested entry directly (test/conformance hook): the
+ * chain's half of the rule, without the quorum round. Returns
+ * tx_history_append_attested's result. */
+int reputation_install_tx_attested(const uuid_t verifier_uuid, double score,
+                                   const char *channel,
+                                   const uuid_t subject_uuid,
+                                   const char *evidence_digest);
 void reputation_install_tx_single(const uuid_t task_uuid,
                                   const uuid_t peer_uuid, double score);
 

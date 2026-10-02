@@ -1,0 +1,39 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-final-commits-without-the-subject
+byte_pinning: false
+description: |
+    An attested entry commits on the verifier's half plus a quorum, and the
+    subject's signature is neither needed nor counted
+    (doc/architecture/reputation.md, "Verifier-attested scores").
+
+    carol is the subject. alice (the verifier) and bob have co-signed; carol has
+    not. In a group of three the bar is a strict majority of the two
+    non-subjects, so alice and bob together clear it. bob checks that for
+    himself, against his own roster, and appends the entry: one committed entry,
+    whose hash both runtimes agree on (the pinned window root).
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest final
+    payload:
+      subject: carol
+      score: 0.3
+      cosigners: [alice, bob]
+    description: alice broadcasts the certified attestation about carol.
+
+expected_state:
+  bob:
+    committed_tx_count: 1
+    window_root: "bbb38ed9d7e1a1a70cf4fd74184ac4339d4120415581828516beaf99ddac162d"

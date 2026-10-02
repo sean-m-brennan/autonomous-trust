@@ -110,6 +110,9 @@ typedef struct {
      * permissive about extra messages. g_snaps is zeroed per scenario, which
      * is exactly the lifetime a cumulative count wants. */
     int slashes_proposed;
+    /* Attestation co-signatures this participant SENT (verifier-attested
+     * scores); mirrors the Python adapter's attest_signs_sent. */
+    int attest_signs_sent;
     /* Peers this participant reported on the app-facing carrier
      * (doc/architecture/app-peer-carrier.md). Like slashes_proposed this is a
      * TALLY filled by _send_hook, not a snapshot: PeerReputation goes to
@@ -206,6 +209,13 @@ static int _send_hook(const char *key,
         rp_snap_t *es = _snap_get_or_make(g_current_emitter);
         if (es != NULL)
             es->slashes_proposed++;
+    }
+    if (g_current_emitter != NULL
+        && strcmp(function, REP_PROTO_ATTEST_SIGN) == 0)
+    {
+        rp_snap_t *es = _snap_get_or_make(g_current_emitter);
+        if (es != NULL)
+            es->attest_signs_sent++;
     }
     if (g_current_emitter != NULL && type == PEER_REPUTATION)
     {
@@ -474,6 +484,22 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
                 const char *slug = json_string_value(json_object_get(e, "task_id"));
                 const char *p1_id = json_string_value(json_object_get(e, "p1"));
                 const char *p2_id = json_string_value(json_object_get(e, "p2"));
+                if (json_is_true(json_object_get(e, "attested")))
+                {
+                    /* A verifier-attested entry: p1 is the verifier, its
+                     * task id derived from its content. Mirrors the Python
+                     * adapter. */
+                    const uuid_t *vu = _uuid_of(ctx, p1_id);
+                    const uuid_t *su = _uuid_of(ctx, json_string_value(
+                        json_object_get(e, "subject")));
+                    if (vu != NULL && su != NULL)
+                        reputation_install_tx_attested(*vu,
+                            json_number_value(json_object_get(e, "p1_score")),
+                            json_string_value(json_object_get(e, "p1_channel")),
+                            *su,
+                            json_string_value(json_object_get(e, "evidence_digest")));
+                    continue;
+                }
                 if (slug == NULL || p1_id == NULL) continue;
                 json_t *p1s_j = json_object_get(e, "p1_score");
                 json_t *p2s_j = json_object_get(e, "p2_score");
@@ -1079,6 +1105,83 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         body = json_object();
         json_object_set_new(body, "peer_uuids", uuids);
         json_object_set_new(body, "requesting_process", json_string(req_proc));
+    }
+    else if (strcmp(function, REP_PROTO_ATTEST_PROPOSE) == 0
+             || strcmp(function, REP_PROTO_ATTEST_SIGN) == 0
+             || strcmp(function, REP_PROTO_ATTEST_FINAL) == 0)
+    {
+        /* Verifier-attested scores -- C's own JSON shapes (per-impl;
+         * byte_pinning:false checks state equivalence). The VERIFIER is the
+         * step's `from` for propose/final and its `to` for sign (payload
+         * `verifier` overrides), so every step of one round names the same
+         * subject, score, channel and digest. Mirrors the Python adapter. */
+        bool is_sign = strcmp(function, REP_PROTO_ATTEST_SIGN) == 0;
+        const char *verifier_pid = is_sign ? to_id : from_id;
+        const char *subject_pid = NULL;
+        const char *channel = "probe";
+        const char *digest =
+            "abababababababababababababababababababababababababababababababab";
+        double score = 0.3;
+        if (payload && json_is_object(payload))
+        {
+            json_t *j = json_object_get(payload, "verifier");
+            if (json_is_string(j)) verifier_pid = json_string_value(j);
+            j = json_object_get(payload, "subject");
+            if (json_is_string(j)) subject_pid = json_string_value(j);
+            j = json_object_get(payload, "channel");
+            if (json_is_string(j)) channel = json_string_value(j);
+            j = json_object_get(payload, "evidence_digest");
+            if (json_is_string(j)) digest = json_string_value(j);
+            j = json_object_get(payload, "score");
+            if (json_is_number(j)) score = json_number_value(j);
+        }
+        const uuid_t *vu = _uuid_of(ctx, verifier_pid);
+        const uuid_t *su = _uuid_of(ctx, subject_pid);
+        if (vu == NULL || su == NULL)
+        {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "build_inbound: attest step needs a known verifier and subject");
+            return -1;
+        }
+        char v_str[UUID_STRING_LEN + 1], s_str[UUID_STRING_LEN + 1];
+        char t_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(*vu, v_str);
+        uuid_unparse_lower(*su, s_str);
+        uuid_t tk;
+        tx_attest_task_uuid(*vu, *su, digest, tk);
+        uuid_unparse_lower(tk, t_str);
+        /* "AT-ATTEST\0" verifier|subject|task|%.17g|channel|digest */
+        uint8_t desig[RP_DESIG_MAX];
+        static const char tag[] = "AT-ATTEST";
+        size_t dlen = 0;
+        int n = snprintf((char *)desig + sizeof(tag), sizeof(desig) - sizeof(tag),
+                         "%s|%s|%s|%.17g|%s|%s", v_str, s_str, t_str, score,
+                         channel, digest);
+        if (n > 0 && (size_t)n < sizeof(desig) - sizeof(tag))
+        {
+            memcpy(desig, tag, sizeof(tag));
+            dlen = sizeof(tag) + (size_t)n;
+        }
+        if (is_sign)
+        {
+            char signer[UUID_STRING_LEN + 1] = {0};
+            if (sender_impl && sender_impl->pub)
+                uuid_unparse_lower(sender_impl->pub->uuid, signer);
+            char sig_hex[RP_SIG_HEX_LEN + 1] = {0};
+            _rp_sign_hex(sender_impl, desig, dlen, sig_hex);
+            body = json_pack("{s:s, s:s, s:s}", "task", t_str,
+                             "signer_uuid", signer, "signature", sig_hex);
+        }
+        else
+        {
+            body = json_pack("{s:s, s:s, s:f, s:s, s:s, s:s}",
+                             "verifier_uuid", v_str, "subject_uuid", s_str,
+                             "score", score, "channel", channel,
+                             "evidence_digest", digest, "group_uuid", "");
+            if (strcmp(function, REP_PROTO_ATTEST_FINAL) == 0)
+                json_object_set_new(body, "sigs",
+                    _rp_cosignatures(ctx, payload, desig, dlen, subject_pid));
+        }
     }
     else if (strcmp(function, REP_PROTO_SLASH_PROPOSE) == 0
              || strcmp(function, REP_PROTO_SLASH_SIGN) == 0
@@ -1757,6 +1860,17 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: requests_count=%d, expected %d",
                              pid, snap->request_count, want);
+                    return -1;
+                }
+            }
+            else if (strcmp(key, "attest_signs_sent") == 0)
+            {
+                int want = (int)json_integer_value(val);
+                if (snap->attest_signs_sent != want)
+                {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: attest_signs_sent=%d, expected %d",
+                             pid, snap->attest_signs_sent, want);
                     return -1;
                 }
             }

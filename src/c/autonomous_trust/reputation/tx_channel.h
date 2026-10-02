@@ -280,4 +280,19 @@ static inline int at_tx_weight_round(double value)
 
 /** @} */ /* end of internal_reputation */
 
+/**
+ * @brief True iff a verifier may author a VERIFIER-ATTESTED score on @p channel.
+ *
+ * Only `probe` for now: a question the verifier authored about the subject's
+ * work. `replication` waits for N independent verifiers, and `first_person`
+ * never qualifies -- a first-person account co-signed by a quorum is exactly
+ * the accusation that channel must not become. See
+ * doc/architecture/reputation.md, "Verifier-attested scores". Mirrors Python
+ * TX_CHANNELS_ATTESTABLE.
+ */
+static inline bool tx_channel_attestable(const char *channel)
+{
+    return channel != NULL && strcmp(channel, TX_CHANNEL_PROBE) == 0;
+}
+
 #endif  /* TX_CHANNEL_H */

@@ -40,11 +40,13 @@ from ..identity.peer_standing import STANDING_PROVED, STANDING_FAILED
 from .protocol import ReputationProtocol
 from .reputation import (TransactionHistory, ReconcileResult, Reputation, Reputations,
                          TransactionScore, SlashAttestation, SignedSlash,
+                         AttestedScore, SignedAttestation,
                          Checkpoint, SignedCheckpoint, validate_tx_score,
                          validate_tx_channel,
                          PeerReputation, EVIDENCE_FILE, SLASH_MARKS_FILE,
                          evidence_to_dict,
-                         evidence_from_dict, RESOLVE_TTL_DEFAULT,
+                         evidence_from_dict, evidence_attest_certs,
+                         RESOLVE_TTL_DEFAULT,
                          resolve_query_to_dict, resolve_query_from_dict,
                          resolved_to_dict, resolved_from_dict, verify_resolved,
                          consensus_score_from_window, tx_channel_weight,
@@ -260,6 +262,13 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # the mechanism being a policy rather than a fact.
     SLASH_ENABLED = bool(os.environ.get('AT_SLASH_ENABLED'))
 
+    # Verifier-attested scores (doc/architecture/reputation.md): the standing a
+    # verifier must have in a co-signer's OWN view before that co-signer
+    # vouches the attestation is admissible. 0.5 is the tier-1 floor: a
+    # verifier this node does not yet trust cannot place a score its subject
+    # cannot veto. Mirrors AT_ATTEST_MIN_REP in rep_proc.c.
+    ATTEST_MIN_REP = _env_float('AT_ATTEST_MIN_REP', 0.5)
+
     # --- Deep resolution (doc/architecture/gateway-reputation-tree.md) ----------------------------
     # How long a relayed query stays in the pending table, and how long a
     # query we originated stays outstanding. A deep answer crosses several
@@ -361,6 +370,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             ReputationProtocol.slash_sign, self.handle_slash_sign)
         self.protocol.register_handler(
             ReputationProtocol.slash_final, self.handle_slash_final)
+        self.protocol.register_handler(
+            ReputationProtocol.attest_propose, self.handle_attest_propose)
+        self.protocol.register_handler(
+            ReputationProtocol.attest_sign, self.handle_attest_sign)
+        self.protocol.register_handler(
+            ReputationProtocol.attest_final, self.handle_attest_final)
         self.protocol.register_handler(
             ReputationProtocol.checkpoint_propose, self.handle_checkpoint_propose)
         self.protocol.register_handler(
@@ -541,6 +556,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self._slash_sigs: dict[tuple, dict] = {}
         # Proposer-side pending attestations awaiting quorum: key -> attestation.
         self._slash_pending: dict[tuple, SlashAttestation] = {}
+        # Verifier-attested scores this node proposed and is collecting
+        # co-signatures for: task id str -> AttestedScore / {voter: sig}.
+        self._attest_pending: dict[str, AttestedScore] = {}
+        self._attest_sigs: dict[str, dict] = {}
         # Dedup for finalized slashes (FIFO bounded), so a re-broadcast
         # slash_final is a cheap no-op. Mirrors committed_paxos_rounds.
         #
@@ -1261,6 +1280,22 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 return True
             if str(peer_id) == str(self.identity.uuid):
                 return True
+            # ISSUES.md §2.16, shape 2: provenance. Unsigned, a commit is
+            # nobody's word (its two sibling handlers already refused that);
+            # signed, it may write only its SENDER's own half -- the proposer
+            # commits the score it gave. Without this, any member wrote both
+            # halves of a fabricated entry about anybody.
+            if not message.verified:
+                self.logger.warning('Rejecting unverified committed from %s',
+                                    message.from_whom)
+                return True
+            sender = getattr(message.from_whom, 'uuid', None)
+            if sender is None or str(sender) != str(peer_id):
+                self.logger.warning(
+                    'Rejecting committed from %s: it writes %s\'s half, not '
+                    'its own', getattr(message.from_whom, 'nickname', '?'),
+                    str(peer_id)[:8])
+                return True
             try:
                 # doc/architecture/reputation.md: this payload is a BARE float on the wire, not a
                 # TransactionScore, so it bypasses the constructor's check --
@@ -1817,6 +1852,262 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             return True
         return False
 
+    # ----- Verifier-attested scores ---------------------------------------
+    # doc/architecture/reputation.md, "Verifier-attested scores". A fourth
+    # three-phase quorum, shaped like slash and checkpoint:
+    #   forward_attestation : a local producer (an extension, e.g. Stele's)
+    #                         puts an AttestedScore on the queue; we sign it as
+    #                         its verifier and broadcast attest_propose.
+    #   handle_attest_propose: a member other than the subject co-signs iff the
+    #                         attestation is ADMISSIBLE in its own view. It
+    #                         vouches for nothing about the finding's truth.
+    #   handle_attest_sign  : the verifier tallies verified co-signatures; on a
+    #                         strict majority of the non-subject members it
+    #                         appends the entry and broadcasts attest_final.
+    #   handle_attest_final : every node checks the quorum itself, against its
+    #                         own roster, and appends the entry.
+    # The subject's signature is never counted, so it cannot block the entry.
+
+    def _is_member(self, uuid) -> bool:
+        key = str(uuid)
+        return key == str(self.identity.uuid) or any(
+            str(p.uuid) == key for p in self.peers.all)
+
+    def _attest_quorum_met(self, att, sigs) -> bool:
+        """The verifier's own signature plus a strict majority of the members
+        other than the subject, sized from OUR roster and counting only
+        signatures that verify. The subject's is never counted."""
+        if not isinstance(sigs, dict):
+            return False
+        subject = str(att.subject_uuid)
+        voters = self._verified_cosigners(att.designation, sigs) - {subject}
+        if str(att.verifier_uuid) not in voters:
+            return False
+        members = len(self.peers.all) + 1
+        others = members - (1 if self._is_member(subject) else 0)
+        return len(voters) > others // 2
+
+    @staticmethod
+    def _attest_resident(chain, verifier, subject) -> bool:
+        """Does `chain` already hold an attested entry by `verifier` about
+        `subject`? The rate cap: one per pair in the resident window, counted
+        from the chain itself so every node reaches the same answer."""
+        return any(tx.attested and str(tx.p1_id) == str(verifier)
+                   and str(tx.subject_id) == str(subject) for tx in chain)
+
+    def _attest_admissible(self, att):
+        """``(True, '')`` when this node will vouch the attestation is
+        admissible, else ``(False, reason)``. Everything here is checked in
+        THIS node's own view; nothing is a judgement of the finding."""
+        if not isinstance(att, AttestedScore) or not att.well_formed():
+            return False, 'malformed'
+        if not self._is_member(att.verifier_uuid):
+            return False, 'verifier not a member'
+        if not self._is_member(att.subject_uuid):
+            return False, 'subject not a member'
+        if str(att.verifier_uuid) in self._slashed:
+            return False, 'verifier slashed'
+        rep = self.PREREP_NEUTRAL
+        for k in (att.verifier_uuid, str(att.verifier_uuid)):
+            try:
+                if k in self.reputations:
+                    rep = float(self.reputations[k])
+                    break
+            except (TypeError, ValueError):
+                continue
+        if rep < self.ATTEST_MIN_REP:
+            return False, 'verifier standing %.2f below %.2f' % (
+                rep, self.ATTEST_MIN_REP)
+        chain = self._chain_for_group(att.group_uuid or None)
+        task = att.task_id
+        if task in chain._task_mapping or task in chain._evicted_task_ids:
+            return False, 'already held'
+        if self._attest_resident(chain, att.verifier_uuid, att.subject_uuid):
+            return False, 'rate cap: this verifier already attested this subject'
+        return True, ''
+
+    def _commit_attestation(self, att, sigs) -> bool:
+        """Append a certified attestation to its chain and fold it."""
+        chain = self._chain_for_group(att.group_uuid or None)
+        tx = att.to_transaction()
+        if not chain.append_attested(tx, dict(sigs)):
+            return False
+        self._fold_committed_tx(tx.task_id, chain)
+        self._note_interaction(tx.subject_id)
+        self.logger.info(
+            'Attested score committed: verifier=%s subject=%s score=%.2f '
+            'channel=%s signers=%d', str(att.verifier_uuid)[:8],
+            str(att.subject_uuid)[:8], float(att.score), att.channel,
+            len(sigs))
+        return True
+
+    def _attest_certified(self, tx) -> bool:
+        """Does an attested entry from somebody else's chain carry a
+        certificate that meets OUR quorum? Catch-up refuses one that does
+        not, or it would be a way around the round."""
+        return self._attest_quorum_met(AttestedScore.of_transaction(tx),
+                                       getattr(tx, 'attest_sigs', None))
+
+    def forward_attestation(self, queues, message):
+        """A local producer's AttestedScore: sign it as its verifier and ask
+        the group to co-sign. Nothing is appended until a quorum certifies it,
+        here as everywhere else."""
+        if not isinstance(message, AttestedScore):
+            return False
+        att = message
+        att.verifier_uuid = str(self.identity.uuid)
+        if not att.well_formed():
+            self.logger.warning('Attestation NOT proposed: malformed (%s)', att)
+            return True
+        if not self._is_member(att.subject_uuid):
+            self.logger.warning(
+                'Attestation NOT proposed: subject %s is not a member',
+                str(att.subject_uuid)[:8])
+            return True
+        chain = self._chain_for_group(att.group_uuid or None)
+        if self._attest_resident(chain, att.verifier_uuid, att.subject_uuid):
+            self.logger.warning(
+                'Attestation NOT proposed: %s already attested in the window',
+                str(att.subject_uuid)[:8])
+            return True
+        key = str(att.task_id)
+        try:
+            sig = self._detached_sig(self.identity, att.designation)
+        except Exception:
+            self.logger.error('forward_attestation: cannot sign; not proposed')
+            return True
+        self._attest_pending[key] = att
+        self._attest_sigs[key] = {str(self.identity.uuid): sig}
+        if self.group is None:
+            return True
+        try:
+            msg = Message(self.name, ReputationProtocol.attest_propose,
+                          to_json_string(att), self.group,
+                          from_whom=self.identity)
+            queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+            self.logger.info('Proposed attested score: subject=%s score=%.2f',
+                             str(att.subject_uuid)[:8], float(att.score))
+        except Full:
+            self.logger.error('forward_attestation: network queue full')
+        return True
+
+    def handle_attest_propose(self, queues, message):
+        if message.function != ReputationProtocol.attest_propose:
+            return False
+        if not message.verified:
+            self.logger.warning('Rejecting unverified attest_propose from %s',
+                                message.from_whom)
+            return True
+        att = (message.obj if isinstance(message.obj, AttestedScore)
+               else from_json_string(message.obj))
+        if not isinstance(att, AttestedScore):
+            return True
+        if str(att.verifier_uuid) == str(self.identity.uuid):
+            return True     # our own bounce-back
+        # The verifier is the AUTHENTICATED sender, never just a claim.
+        if self._attributed_voter(message, att.verifier_uuid,
+                                  'attest_propose') is None:
+            return True
+        if str(att.subject_uuid) == str(self.identity.uuid):
+            # Our signature would not count; say so rather than send it.
+            self.logger.info('Not co-signing an attestation about ourselves '
+                             'from %s', message.from_whom)
+            return True
+        ok, why = self._attest_admissible(att)
+        if not ok:
+            self.logger.warning('Declining attest_propose from %s: %s',
+                                message.from_whom, why)
+            return True
+        try:
+            sig = self._detached_sig(self.identity, att.designation)
+        except Exception:
+            self.logger.error('handle_attest_propose: cannot sign; declining')
+            return True
+        ack = (str(att.task_id), str(self.identity.uuid), sig)
+        try:
+            msg = Message(self.name, ReputationProtocol.attest_sign,
+                          to_json_string(ack), message.from_whom,
+                          from_whom=self.identity)
+            queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+            self.logger.info('Co-signed attest_propose from %s',
+                             message.from_whom)
+        except Full:
+            self.logger.error('handle_attest_propose: queue full')
+        return True
+
+    def handle_attest_sign(self, queues, message):
+        if message.function != ReputationProtocol.attest_sign:
+            return False
+        if not message.verified:
+            self.logger.warning('Rejecting unverified attest_sign from %s',
+                                message.from_whom)
+            return True
+        payload = message.obj
+        if isinstance(payload, str):
+            payload = from_json_string(payload)
+        try:
+            task, claimed, sig = payload
+        except (TypeError, ValueError):
+            return True
+        att = self._attest_pending.get(str(task))
+        if att is None:
+            return True     # not our round, or already final
+        voter = self._attributed_voter(message, claimed, 'attest_sign')
+        if voter is None:
+            return True
+        if voter == str(att.subject_uuid):
+            self.logger.info('attest_sign from the subject; not counted')
+            return True
+        if not self._verify_cosignature(att.designation, voter, sig):
+            self.logger.warning('attest_sign from %s failed verification; '
+                                'not counted', voter[:8])
+            return True
+        sigs = self._attest_sigs.setdefault(str(task), {})
+        sigs[voter] = sig
+        if not self._attest_quorum_met(att, sigs):
+            return True
+        del self._attest_pending[str(task)]
+        self._attest_sigs.pop(str(task), None)
+        self._commit_attestation(att, sigs)
+        signed = SignedAttestation(attestation=att, sigs=dict(sigs))
+        try:
+            msg = Message(self.name, ReputationProtocol.attest_final,
+                          to_json_string(signed),
+                          self._group_by_uuid(att.group_uuid or None)
+                          or self.group, from_whom=self.identity)
+            queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+        except Full:
+            self.logger.error('handle_attest_sign: queue full broadcasting final')
+        return True
+
+    def handle_attest_final(self, _, message):
+        if message.function != ReputationProtocol.attest_final:
+            return False
+        if not message.verified:
+            self.logger.warning('Rejecting unverified attest_final from %s',
+                                message.from_whom)
+            return True
+        signed = (message.obj if isinstance(message.obj, SignedAttestation)
+                  else from_json_string(message.obj))
+        att = getattr(signed, 'attestation', None)
+        if not isinstance(att, AttestedScore) or not att.well_formed():
+            return True
+        chain = self._chain_for_group(att.group_uuid or None)
+        if att.task_id in chain._task_mapping:
+            return True     # already appended (our own round, or a duplicate)
+        # Quorum is verified HERE, against our own roster. Whether this node
+        # would itself have vouched is not the question: the certificate says
+        # a majority of the others did.
+        sigs = getattr(signed, 'sigs', None)
+        if not self._attest_quorum_met(att, sigs):
+            self.logger.warning(
+                'Rejecting attest_final about %s: %d verified co-signature(s) '
+                'do not meet quorum', str(att.subject_uuid)[:8],
+                len(self._verified_cosigners(att.designation, sigs or {})))
+            return True
+        self._commit_attestation(att, sigs)
+        return True
+
     # ----- Phase 2: quorum-signed Merkle checkpoints ----------------------
     # Lifecycle (mirrors the slash three-phase shape):
     #   forward_checkpoint    : a node originates -> stamps epoch/root over its
@@ -2072,7 +2363,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 signed = SignedCheckpoint(
                     checkpoint=ckpt,
                     sigs=dict(self._checkpoint_sigs_final.get(chain_key, {})))
-            doc = evidence_to_dict(self._chain_for_key(chain_key), signed)
+            hist = self._chain_for_key(chain_key)
+            doc = evidence_to_dict(hist, signed,
+                                   getattr(hist, 'attest_certs', None))
             with atomic_write(self._evidence_path(chain_key)) as f:
                 json.dump(doc, f, indent=2)
         except (OSError, IOError, ValueError, TypeError) as e:
@@ -2260,10 +2553,20 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # Verified: adopt the chain, and with it the checkpoint that attests
         # it, so this node resumes with a history a peer can audit and an
         # anchor slash evidence can be measured against.
+        restored = TransactionHistory(_chain=chain)
+        # Attested entries keep their quorum certificates across a restart:
+        # without them a peer catching up from us could not check the round.
+        resident = {tx.task_id for tx in chain if tx.attested}
+        restored.attest_certs = {k: v for k, v in
+                                 evidence_attest_certs(doc).items()
+                                 if k in resident}
+        for tx in chain:
+            if tx.attested and tx.task_id in restored.attest_certs:
+                tx.attest_sigs = dict(restored.attest_certs[tx.task_id])
         if chain_key:
-            self.child_histories[chain_key] = TransactionHistory(_chain=chain)
+            self.child_histories[chain_key] = restored
         else:
-            self.history = TransactionHistory(_chain=chain)
+            self.history = restored
         self._checkpoints[chain_key] = ckpt
         self._checkpoint_sigs_final[chain_key] = dict(signed.sigs or {})
         self._checkpoint_seen[ckpt.key()] = None
@@ -2367,12 +2670,17 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         totals: dict = {}
         counts: dict = {}
         for tx in window:
-            if len(tx) < 2:
+            if tx.attested:
+                # About its subject only, as in _fold_tx_for_peer. Its quorum
+                # certificate stands in for the counterparty's agreement.
+                pairs = ((tx.subject_id, tx.p1_score),)
+            elif len(tx) < 2:
                 continue  # not bilateral: no counterparty agreed to it
-            # A peer's score in a tx is the COUNTERPARTY's side of it, as in
-            # _fold_tx_for_peer: p1's standing is what p2 scored it.
-            for peer, score in ((tx.p1_id, tx.p2_score),
-                                (tx.p2_id, tx.p1_score)):
+            else:
+                # A peer's score in a tx is the COUNTERPARTY's side of it, as
+                # in _fold_tx_for_peer: p1's standing is what p2 scored it.
+                pairs = ((tx.p1_id, tx.p2_score), (tx.p2_id, tx.p1_score))
+            for peer, score in pairs:
                 key = str(peer)
                 if key == self_uuid or score is None:
                     continue
@@ -2707,6 +3015,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 chain = from_json_string(message.obj)
                 if not isinstance(chain, list):
                     return True
+                if not self._chain_certified(chain, message):
+                    return True
                 # Outvoted: a chain reproducing the quorum's checkpoint wins
                 # even an equal-length tiebreak (ISSUES.md §2.15). Mirrors C.
                 res = self.history.reconcile(chain, self._final_end(),
@@ -2732,8 +3042,13 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                             self._note_interaction(peer)
                 if res.status == ReconcileResult.ADOPTED:
                     self._repropose_dropped(queues, res)
+                    self._reappend_attested(res)
                 return True
-            self.updates[message.from_whom.uuid] = from_json_string(message.obj)
+            reported = from_json_string(message.obj)
+            if isinstance(reported, list) and \
+                    not self._chain_certified(reported, message):
+                return True
+            self.updates[message.from_whom.uuid] = reported
             up_count = len(self.updates)
             if up_count >= self.num_updates:
                 # Group reported chains by their serialized (canonical) form
@@ -2762,12 +3077,39 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                             '%d, added %d', res.fork, len(res.dropped),
                             len(res.added))
                         self._repropose_dropped(queues, res)
+                        self._reappend_attested(res)
                 else:
                     self.logger.error('Closest %d peers unable to agree on history', self.num_updates)
                     self._request_update(queues, len(self.peers.all),
                                          quorum=len(self.peers.all))
             return True
         return False
+
+    def _chain_certified(self, chain, message) -> bool:
+        """Catch-up refuses a segment carrying an attested entry whose
+        certificate does not meet our quorum (doc/architecture/reputation.md):
+        otherwise catch-up would be a way around the round."""
+        for tx in chain:
+            if getattr(tx, 'attested', False) and not self._attest_certified(tx):
+                self.logger.warning(
+                    'Rejecting chain from %s: an attested entry (task %s) '
+                    'carries no certificate meeting our quorum',
+                    getattr(message.from_whom, 'nickname', '?'),
+                    str(tx.task_id)[:8])
+                return False
+        return True
+
+    def _reappend_attested(self, res):
+        """An adopted chain that dropped a certified attested entry: re-append
+        it. It verifies on its own and does not depend on its position, so a
+        fork cannot take it away. Mirrors C _reappend_attested_locked."""
+        for tx in res.dropped:
+            if not tx.attested or tx.task_id in self.history._task_mapping:
+                continue
+            att = AttestedScore.of_transaction(tx)
+            sigs = getattr(tx, 'attest_sigs', None)
+            if self._attest_quorum_met(att, sigs):
+                self._commit_attestation(att, sigs)
 
     def _own_half_recorded(self, task_id) -> bool:
         """Does any chain we keep hold OUR half of `task_id`, bilateral or not?"""
@@ -2840,6 +3182,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                    if getattr(tc, 'score', None) is not None}
         due = []
         for tx in res.dropped:
+            if tx.attested:
+                # Not a half to re-propose: it is re-appended whole from its
+                # certificate (doc/architecture/reputation.md).
+                continue
             if str(tx.p1_id) == me:
                 score, channel = tx.p1_score, tx.p1_channel
             elif str(tx.p2_id) == me:
@@ -2880,16 +3226,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         total = 0.0
         total_weight = 0.0
         for tx in txs:
-            if tx.p1_id is None or tx.p2_id is None:
+            # An attested entry counts like any third-party observation, its
+            # verifier standing in for the counterparty (Tx.about).
+            about = tx.about(peer_uuid)
+            if about is None:
                 continue
-            if tx.p1_id == peer_uuid:
-                counterparty_id = tx.p2_id
-                counterparty_score = tx.p2_score
-            elif tx.p2_id == peer_uuid:
-                counterparty_id = tx.p1_id
-                counterparty_score = tx.p1_score
-            else:
-                continue
+            counterparty_score, counterparty_id = about
             cp_rep = self.reputations[counterparty_id] \
                 if counterparty_id in self.reputations else self.PREREP_NEUTRAL
             w = self.task_weights.get(str(tx.task_id), 1)
@@ -2971,12 +3313,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         for tx in txs:
             if tx.task_id in seen:
                 continue
-            if tx.p1_id == peer_uuid and tx.p2_id is not None:
-                about_peer, counterparty_id = tx.p2_score, tx.p2_id
-            elif tx.p2_id == peer_uuid and tx.p1_id is not None:
-                about_peer, counterparty_id = tx.p1_score, tx.p1_id
-            else:
+            about = tx.about(peer_uuid)
+            if about is None:
                 continue
+            about_peer, counterparty_id = about
             if about_peer is None or counterparty_id == self_uuid:
                 continue
             seen.add(tx.task_id)
@@ -3837,14 +4177,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             return
         if tx.index <= self._consensus_folded_idx.get(key, -1):
             return
-        if tx.p1_id == peer_uuid:
-            cp_score = tx.p2_score
-        elif tx.p2_id == peer_uuid:
-            cp_score = tx.p1_score
-        else:
+        about = tx.about(peer_uuid)
+        if about is None:
             return
-        if cp_score is None:
-            return
+        cp_score = about[0]
         ema = self._consensus_ema.get(key)
         # transaction_weight applied as w single-step folds (see
         # _consensus_reputation for why this preserves the [0,1] range).
@@ -3880,6 +4216,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         if tx is None or tx.index is None:
             return
         alpha = 1.0 - 0.5 ** (1.0 / float(self.CONSENSUS_EMA_HALF_LIFE))
+        if tx.attested:
+            # About its subject only; the verifier gains nothing from it.
+            self._fold_tx_for_peer(tx.subject_id, tx, alpha)
+            return
         self._fold_tx_for_peer(tx.p1_id, tx, alpha)
         self._fold_tx_for_peer(tx.p2_id, tx, alpha)
 
@@ -3999,16 +4339,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             txs,
             key=lambda t: (t.index if t.index is not None else 0))
         for tx in ordered:
-            if tx.p1_id is None or tx.p2_id is None:
+            about = tx.about(peer_uuid)
+            if about is None:
                 continue
-            if tx.p1_id == peer_uuid:
-                cp_score = tx.p2_score
-            elif tx.p2_id == peer_uuid:
-                cp_score = tx.p1_score
-            else:
-                continue
-            if cp_score is None:
-                continue
+            cp_score = about[0]
             # Apply the capability's transaction_weight by running the
             # EMA update `w` times — a tier-w transaction moves the
             # EMA exactly as far as w tier-1 transactions would. This
@@ -4059,18 +4393,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         ema_by_tier: dict[int, float] = {}
         seen = set()
         for tx in ordered:
-            if tx.p1_id is None or tx.p2_id is None:
-                continue
             if tx.task_id in seen:
                 continue
-            if tx.p1_id == peer_uuid:
-                cp_score = tx.p2_score
-            elif tx.p2_id == peer_uuid:
-                cp_score = tx.p1_score
-            else:
+            about = tx.about(peer_uuid)
+            if about is None:
                 continue
-            if cp_score is None:
-                continue
+            cp_score = about[0]
             seen.add(tx.task_id)
             tier = self.task_tiers.get(str(tx.task_id), 0)
             w = self.task_weights.get(str(tx.task_id), 1)
@@ -4106,7 +4434,13 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         for key in self._chain_keys():
             chain = self._chain_for_key(key)
             for tx in list(chain):
-                if tx.index is None or tx.p1_id is None or tx.p2_id is None:
+                if tx.index is None or tx.p1_id is None:
+                    continue
+                if tx.attested:
+                    if target in (str(tx.p1_id), str(tx.subject_id)):
+                        return key
+                    continue
+                if tx.p2_id is None:
                     continue
                 if target in (str(tx.p1_id), str(tx.p2_id)):
                     return key
@@ -4821,7 +5155,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                             # by a local detector, e.g. the coordinator)
                             # route here, mirroring forward_transaction.
                             if not self.forward_slash(queues, message) \
-                                    and not self.forward_checkpoint(queues, message):
+                                    and not self.forward_checkpoint(queues, message) \
+                                    and not self.forward_attestation(queues, message):
                                 if isinstance(message, Message):
                                     _probes.counter('proc.reputation', 'unhandled', message.function)
                                     _probes.trace_msg(message, 'unhandled', proc='reputation')

@@ -1,0 +1,35 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-final-the-subject-cannot-refuse-it
+byte_pinning: false
+description: |
+    The subject's own node appends a certified attestation about it.
+
+    carol is the subject and receives the finalizer herself. Nothing in the rule
+    asks her: the certificate's signers are alice and bob, which meets the
+    quorum in carol's view too, so her chain holds the entry like everyone
+    else's. The subject cannot block an attested score by declining to take it.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+steps:
+  - id: 1
+    from: alice
+    to: carol
+    function: attest final
+    payload:
+      subject: carol
+      score: 0.3
+      cosigners: [alice, bob]
+    description: the certified attestation reaches its subject.
+
+expected_state:
+  carol:
+    committed_tx_count: 1
