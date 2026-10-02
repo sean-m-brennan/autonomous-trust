@@ -39,9 +39,9 @@ STEP = 30
 
 
 def _await(q_out, want, seen, timeout=STEP):
-    from autonomous_trust.core.identity.first_contact import FirstContactEvent
-    from autonomous_trust.core._python.identity.area_contact import AreaEvent
-    from autonomous_trust.core._python.identity.directory_contact import DirectoryEvent
+    from autonomous_trust.first_contact.first_contact import FirstContactEvent
+    from autonomous_trust.first_contact._python.area_contact import AreaEvent
+    from autonomous_trust.first_contact._python.directory_contact import DirectoryEvent
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -66,7 +66,7 @@ def _list(node, seen, bucket):
     """List ``node`` in u4pr, until the hub says it holds the card (registration
     with Carol runs in the background)."""
     from autonomous_trust.core.app_verbs import AppRequest
-    from autonomous_trust.core._python.identity import area_contact as ac
+    from autonomous_trust.first_contact._python import area_contact as ac
     deadline = time.monotonic() + STEP
     while True:
         node['q_in'].put(AppRequest(ac.APP_AREA_PUBLISH, json.dumps(
@@ -81,7 +81,7 @@ def _list(node, seen, bucket):
 def _lookup(node, seen):
     """Every card one lookup found, once its DONE arrives."""
     from autonomous_trust.core.app_verbs import AppRequest
-    from autonomous_trust.core._python.identity import area_contact as ac
+    from autonomous_trust.first_contact._python import area_contact as ac
     node['q_in'].put(AppRequest(ac.APP_AREA_LOOKUP, json.dumps({'ref': 'look', 'area': 'u4pr'})))
     start = len(seen)
     _await(node['q_out'], lambda e: e.kind == ac.EVENT_DONE, seen)
@@ -90,10 +90,10 @@ def _lookup(node, seen):
 
 def test_find_someone_nearby_and_become_contacts(cohort):
     from autonomous_trust.core.app_verbs import AppRequest
-    from autonomous_trust.core.contacts import Contacts, Provenance
+    from autonomous_trust.first_contact import Contacts, Provenance
     from autonomous_trust.core.config import Configuration
-    from autonomous_trust.core.identity import first_contact as fc
-    from autonomous_trust.core._python.identity import directory_contact as dc
+    from autonomous_trust.first_contact import first_contact as fc
+    from autonomous_trust.first_contact._python import directory_contact as dc
     procs = _setup(cohort)
     seen_a, seen_b = [], []
     try:

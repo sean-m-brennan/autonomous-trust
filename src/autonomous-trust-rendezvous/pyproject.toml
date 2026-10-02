@@ -1,0 +1,28 @@
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "autonomous_trust_rendezvous"
+version = "0.2.1"
+description = "AutonomousTrust rendezvous: the relay client and server, signed reachability records, the seed list and community rosters"
+authors = ["Sean M Brennan <sean.brennan@tekfive.com>"]
+readme = "README.md"
+packages = [{include = "autonomous_trust"}]
+exclude = ["**/__pycache__"]
+
+[project]
+name = "autonomous_trust_rendezvous"
+version = "0.2.1"
+
+# How an installed core finds first contact (autonomous_trust.core.extensions):
+# the handshake, and its always-on network half.
+# How an installed core finds rendezvous (autonomous_trust.core.extensions).
+[project.entry-points."autonomous_trust.extensions"]
+rendezvous = "autonomous_trust.rendezvous._at_extension:EXTENSION"
+
+[tool.poetry.dependencies]
+python = "^3.13"
+autonomous-trust = ">=0.2.1"
+# Relay proofs, reachability records, signed seed lists and rosters.
+PyNaCl = ">=1.5.0"

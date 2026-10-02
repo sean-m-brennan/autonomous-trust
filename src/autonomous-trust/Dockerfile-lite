@@ -56,6 +56,8 @@ COPY src/autonomous-trust/autonomous_trust autonomous_trust
 # autonomous_trust namespace, where the core finds them (FEATURE_SPLIT_PLAN Phase 3).
 COPY src/autonomous-trust-oracle/autonomous_trust/oracle autonomous_trust/oracle
 COPY src/autonomous-trust-zta/autonomous_trust/zta autonomous_trust/zta
+COPY src/autonomous-trust-rendezvous/autonomous_trust/rendezvous autonomous_trust/rendezvous
+COPY src/autonomous-trust-first-contact/autonomous_trust/first_contact autonomous_trust/first_contact
 RUN rm -rf autonomous_trust/etc autonomous_trust/var
 
 COPY src/autonomous-trust/pyproject.toml pyproject.toml

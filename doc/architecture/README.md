@@ -12,6 +12,7 @@ Technical architecture documentation for the AutonomousTrust cooperative computi
 - [Native/FFI dual implementation](native-ffi-dual-implementation.md): C runtime, CFFI bridge, Python↔C interoperability, and embedded/microdrone nodes
 - [Identity protocol](identity-protocol.md): Peer discovery, voting, and group formation
 - [First contact](first-contact.md): Adding a specific person you already know: the 1:1 introduction, signed invitations, and safety-number verification
+- [Rendezvous](rendezvous.md): Reaching a node across NAT: relays, failover, relay proofs, reachability records, the seed list and community rosters
 - [Task negotiation](negotiation.md): Distributed task lifecycle
 - [Reputation consensus](reputation.md): Paxos-based reputation scoring
 - [Gateway reputation tree](gateway-reputation-tree.md): Multi-group membership and recursive subtree reputation

@@ -42,7 +42,7 @@ int identity_register_handlers(process_t *proc);
 
 /** This node's own PUBLISHED identity (public-only, freshly serialized from
  *  the identity config). Exposed for the sibling translation units that need
- *  it -- identity/first_contact.c must check that an invitation presented to
+ *  it -- first_contact/first_contact.c must check that an invitation presented to
  *  it was minted by US. Returns 0 on success. The caller frees any
  *  `operator_key_binding` on the result. */
 int identity_own_public_identity(const process_t *proc, public_identity_t *out);

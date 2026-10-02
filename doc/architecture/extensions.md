@@ -71,7 +71,8 @@ and reads or writes the payload through `AT_MSG_EXT(msg, T)`.
 | 1000–1999 | social (Agora's `at-social/c/social/social_msg_types.h`, 1000–1011 used) |
 | 2000–2099 | ZTA (`zta/zta_msg_types.h`, 2000–2001 used) |
 | 2100–2199 | fleet (reserved) |
-| 2200–2219 | first contact (`identity/first_contact.h`, 2200–2201 used: `FIRST_CONTACT_EVENT`, `FIRST_CONTACT_CONTACT_EVENT`) |
+| 2200–2219 | first contact (`first_contact/first_contact.h`, 2200–2201 used: `FIRST_CONTACT_EVENT`, `FIRST_CONTACT_CONTACT_EVENT`) |
+| 2220–2229 | rendezvous (`rendezvous/rdv_roster.c`, 2220 used: `RENDEZVOUS_ROSTER_EVENT`) |
 | 2300–2309 | stele (Stele's `at-stele/c/stele/stele_msg_types.h`) |
 
 Registration refuses an id outside the extension ranges, a duplicate id, a
@@ -101,7 +102,10 @@ known verb, each to one fixed process. The core's own verbs are hard-wired
 there. A feature adds its verbs with `AT_APP_VERB_REGISTER(tag, verb, target)`.
 The social feature registers its 18 verbs, all to `identity`; first contact
 registers seven (`app_first_contact_invite`, `_initiate`, and the address book's
-`_safety_number`, `_verify`, `_list`, `_rename`, `_remove`), also to `identity`. A registered verb reaches its process, but that says nothing about
+`_safety_number`, `_verify`, `_list`, `_rename`, `_remove`), also to `identity`,
+and rendezvous registers the two roster verbs (`app_relay_roster_install`,
+`_remove`) the same way.
+A registered verb reaches its process, but that says nothing about
 who sent it. An app verb and a peer's message are both `NET_MESSAGE`s
 dispatched by name, so each handler must still refuse a frame from the wire
 with `identity_is_local_app_verb`, or an admitted peer could make this node act
@@ -148,7 +152,7 @@ four build configs. Those are the numbers the foreign mirrors assert.
 | 0–3 | core |
 | 4–15 | Agora (`at_agora.h`), grandfathered; Agora appends into 16–99 |
 | 100–199 | future core kinds |
-| 1000–1099 | first contact (`at_first_contact.h`, 1000–1008 used) |
+| 1000–1099 | first contact (`first_contact/at_first_contact.h`, 1000–1008 used); 1028–1030 are rendezvous's roster events (`rendezvous/at_rendezvous.h`), which kept the numbers they had under first contact |
 | 1100– | further features, one block each |
 
 A feature's public header (`at_agora.h`, installed only by a build with social)
@@ -201,8 +205,9 @@ on stderr.
 There is no `init` hook. Message types, verbs, decoders and transports have
 registries of their own, and they cover everything an `init` would have done.
 
-First contact is the first client. It stays in the core tree, so the core calls
-its anchor, `at_first_contact_link()`, from `identity_register_handlers`.
+First contact was the first client. It is its own library now
+(`libat_first_contact`, see "First contact" below), so the core no longer calls
+its anchor and its consumers own the link, as ZTA's do.
 
 A feature's handlers reach identity's state only through the services
 `identity/id_proc_priv.h` exports for them: `identity_self_identity`,
@@ -480,6 +485,85 @@ under it, and a second lock would buy Python nothing it can use.
 `$AT_OWN_GEOHASH`/`$AT_OWN_EXACT`/`$AT_OWN_PROFILE` is set without social. It
 logs the loaded extensions at INFO.
 
+## Negotiation, reputation and network hooks (FEATURE_SPLIT_PLAN Phase 7a)
+
+Rendezvous and first contact reach three more core processes. Each gets a
+small registry, filled from constructors in C and from `Extension` fields in
+Python. With nothing registered, each process behaves exactly as the core does
+alone. A hook decides its own gate, so registering one turns nothing on, and
+the core asks a hook whenever its extension is present (negotiation,
+reputation) or loaded (network).
+
+| Hook | C | Python | Called from | Rule the core keeps |
+|---|---|---|---|---|
+| Tier cap | `neg_tier_cap_t` (`negotiation/neg_ext.h`) | `NegotiationHooks.capped_tier` | the invite's tier gate, after the earned tier and any test override | a cap only lowers: a higher answer is ignored |
+| Trust seeds | `rep_seed_provider_t` (`reputation/rep_ext.h`) | `ReputationHooks.trust_seeds` | reputation startup (after the snapshot, before the idle fade) and every pass | a seed fills only a peer with no reputation, and one outside (0, 1] is refused, not clamped |
+| Network | `net_ext_t` (`network/net_ext.h`) | `NetworkHooks` | `network_run` / `NetworkProcess.process` | see below |
+
+First contact registers the tier cap (an unverified contact is held at
+messaging, §10.3) and the seed provider (each verified contact's prior, §10.5).
+Reputation no longer imports the contacts store. Rendezvous registers the
+network hooks, and first contact registers a second set for its directory and
+area-hub clients (`local_verb` and `periodic`):
+
+- `start` / `on_start`: after the filters and configuration are checked, it
+  starts serving relays and registers with our own.
+- `periodic`: at the top of each pass, it keeps registrations alive, fails
+  over refusals, and hands identity what the relay readers queued.
+- `local_verb` (C), or handlers registered through `register_handlers`
+  (Python): `relay_route` and `reach_publish` for rendezvous, the directory and
+  area-hub verbs for first contact. None of them leaves on the wire.
+- `reachable` + `unicast` (C), `reaches` + `unicast` (Python): a unicast to a
+  peer an extension reaches goes through it, everything else through the
+  transport. In C, a peer with no address that an extension reaches is not a
+  broadcast.
+- `drain_inbound` (Python only): relayed frames beside the core's own receive
+  queues. C's relay readers call `handle_inbound_relayed` directly.
+- `exclusion` / `on_exclusion`: reputation cut a peer off or readmitted it.
+
+**Exclusions belong to the core (C4).** The network process records each
+exclusion by uuid and by the signing key it holds for the peer at that moment
+(`net_note_exclusion`, `NetworkProcess.handle_exclude`), before any extension
+hears of it. An extension asks `net_is_excluded(uuid, key)` /
+`NetworkProcess.is_excluded`, so a distrusted peer gains nothing by claiming a
+new uuid. Rendezvous adds the impostor check on top: a known peer's uuid
+presented with a different key.
+
+**Python has no frame-filter chain**, and Phase 7 did not add one. Only the
+gateway's envelope filters frames, and the gateway is C-only. Rendezvous needs
+the network hooks above, not a filter.
+
+## Plaintext verbs (`processes/plaintext_verbs.h`, `plaintext_verbs.py`)
+
+A receiver accepts a frame in the clear from a peer it already knows only for
+a named verb. The core's nine verbs are compiled in
+(`ID_UNENCRYPTED_VERBS`, `CORE_UNENCRYPTED_VERBS`), and no configuration adds
+to or removes from them. An extension DECLARES which of its own verbs may
+arrive unencrypted (`at_extension_t.plaintext_verbs`,
+`Extension.plaintext_verbs`). The operator GRANTS them in
+`<cfg_dir>/unencrypted_verbs.cfg.json`:
+
+```json
+{"verbs": ["first_contact_hello", "first_contact_hello_ack",
+           "first_contact_request", "first_contact_accept", "device_announce"]}
+```
+
+The rules, decided 2026-10-02 (FEATURE_SPLIT_PLAN D8), checked at startup
+(`identity_run` and `network_run` in C, `extensions.check_config` and
+`NetworkProcess.process` in Python):
+
+| File | Result |
+|---|---|
+| absent | the core verbs only |
+| malformed: not an object holding exactly `verbs`, a list of at most 32 distinct non-empty names of at most 64 characters | refuse to start |
+| names a verb no **enabled** extension declares, a core verb included (`group_key_update`, or even `request_access`) | refuse to start |
+| does not name every verb an enabled extension declares | refuse to start, naming the file and the missing verbs |
+
+So a node with first contact on needs the file, and one with it off must not
+list first contact's verbs. `plaintext_verbs.write(cfg_dir, verbs)` writes it
+atomically. The conformance scenarios `network/unencrypted-verbs` and
+`network/plaintext-verbs-file` pin the set and the rules in both runtimes.
+
 ## ZTA (`libat_zta`, `autonomous_trust.zta`)
 
 Zero Trust credential integration left both cores in FEATURE_SPLIT_PLAN Phase
@@ -558,6 +642,139 @@ protocols, gated on their `zta_policy` fixture: both adapters skip them without
 ZTA (C without `libat_zta`, Python without `autonomous_trust.zta`), and the two
 skip sets are the same 21 cases.
 
+## First contact (`libat_first_contact`, `autonomous_trust.first_contact`)
+
+First contact left both cores in FEATURE_SPLIT_PLAN Phase 7, ahead of
+rendezvous, because moving rendezvous first would have had the core and
+`libat_rendezvous` link each other while first contact still called the relay
+client. Everything about a person moved: the contact record and store,
+invitations and safety numbers, the handshake, the directory and area flows,
+devices, siblings, sync and the backup, the app ABI (`at_first_contact.h`,
+`first_contact_app.c`), and the directory registry and area hub a relay
+serves. Rendezvous followed it out in Phase 7b (see "Rendezvous" below), and
+first contact now links it.
+
+**C.** `src/c/extensions/first_contact/` builds `libat_first_contact`. Unlike
+ZTA it is built by default (the CMake option `AT_FIRST_CONTACT_LIB`, ON), as
+the gateway and the oracle layers are, and `AT_FIRST_CONTACT` still turns it
+on at run time. Its sources keep their names under one directory, so a header
+is included as `first_contact/<name>.h`. It registers from constructors: the
+extension `"first_contact"` (its handlers, plaintext verbs and reset), the
+identity hooks, the tier cap, the seed provider, a network extension for the
+directory and area-hub clients (`fc_net.c`), its app verbs, and the area
+provider below. Its tests and the `contacts` conformance adapter moved with
+it; the adapter registers through `at_conformance_adapter`. The core tests
+with a first-contact half (`extension_test`, `unencrypted_verbs_test`, and
+rendezvous's `net_relay_rosters_test`) and the identity and negotiation
+conformance adapters compile that half only when the library is built
+(`AT_FIRST_CONTACT_ENABLED`), and link it whole. Without the library the
+adapters skip first contact's cases, and the three tests check what a node
+without it does instead.
+
+It reaches the relay through four calls, the relay's seams (R1, R2; see
+"Rendezvous" below).
+
+**Python.** `src/autonomous-trust-first-contact/`
+(`autonomous_trust.first_contact`, D2's shape with an empty `_native`) holds
+the same modules in one flat `_python` package, and its package-level names
+are the old `autonomous_trust.core.contacts` ones. Its `_at_extension.py`
+exports `EXTENSIONS`, because first contact is two extensions in Python, where
+C has one extension plus a network hook: `first_contact`, gated by
+`AT_FIRST_CONTACT`, and `first_contact_network`, which is always on so that a
+node answers identity's directory and hub verbs either way. The installed
+distribution declares both as entry points. The operator tools
+(`device_cert.py`, `backup.py`, `directory_issuer.py`) moved into its `tools/`,
+a directory of scripts with no `__init__.py`, since two `tools` packages already
+shadow each other under pytest. Rendezvous names identity's `reach_record`
+verb itself (`_ID_REACH_RECORD` in `rdv_net.py`, `NET_ID_REACH_RECORD` in
+`rdv_net.c`), so neither the core nor rendezvous imports first contact.
+
+**Refusals.** A node with `AT_FIRST_CONTACT` on (1, true, yes or on) but
+without first contact refuses to start: it is a declaration in the same
+tables social uses (`identity_ext_check_env`, `extensions.check_env`), marked
+as a switch so that `AT_FIRST_CONTACT=0` declares nothing. A node with it on
+must also grant first contact's five plaintext verbs (see "Plaintext verbs").
+
+**Corpus and tests.** The `contacts` protocol (169 cases) and first contact's
+identity (39) and negotiation (8) cases skip without the extension, and so do
+`network/unencrypted-verbs` and the first-contact rows of
+`network/plaintext-verbs-file`. The skip sets match on both runtimes: 217
+cases. The unit tests moved to the distribution's `tests/a_unit`; the three
+integration tests (`test_first_contact_two_node.py`,
+`test_directory_three_node.py`, `test_area_three_node.py`) stay in the core's
+`tests/b_integration`, because they build on the core's own two- and
+three-node test helpers.
+
+## Rendezvous (`libat_rendezvous`, `autonomous_trust.rendezvous`)
+
+Rendezvous left both cores in FEATURE_SPLIT_PLAN Phase 7b, after first contact:
+the relay client and server, signed reachability records, the seed list and
+community rosters, the network process's relay routes, and the roster app
+verbs. The core keeps only the hooks it reaches them through: the network hooks
+above, and `handle_inbound_relayed` in C, the inbound path its relay readers
+hand frames to. See [Rendezvous](rendezvous.md) for what it does.
+
+**C.** `src/c/extensions/rendezvous/` builds `libat_rendezvous`, by default (the
+CMake option `AT_RENDEZVOUS_LIB`, ON), and `AT_FIRST_CONTACT_LIB` refuses to
+configure without it. About 1,100 lines of relay routing left `net_proc.c` for
+`rdv_net.c` unchanged; their declarations and the four relay verb strings went
+from `network/net_proc_priv.h` and `network/network.h` to
+`rendezvous/net_rendezvous.h`. It registers the network extension
+`"rendezvous"` and an always-on extension of the same name that puts the two
+roster verbs on identity (`rdv_roster.c`). Their app side is
+[`at_rendezvous.h`](../../src/c/extensions/rendezvous/at_rendezvous.h): the
+senders keep their names, the events keep kinds 1028–1030, and they ride
+rendezvous's own message type (`RENDEZVOUS_ROSTER_EVENT`, 2220) with their own
+payload and decoder, `at_rendezvous_roster_event()`. First contact's
+`at_app_area_t` keeps its unused `issuer` field so its layout does not change.
+
+**The relay's seams (R1, R2).** First contact reaches the relay only through
+four calls, which is what let the relay leave the core after it without first
+contact noticing:
+
+| Seam | C | Python |
+|---|---|---|
+| Send a request to a relay | `net_relay_client_request` | `RelayClient.request` |
+| Receive the answers to an op family | `net_relay_client_on_op` | `RelayClient.on_op` |
+| Serve an op family on our relay | `net_relay_server_add_op` | `RelayServer.add_op` |
+| The buckets this node is listed under, for roster hints | `net_relay_rosters_set_area_provider` | `relay_rosters.set_area_provider` |
+
+A relay answers an op with an underscore that no family claims as
+`{op: "<family>_refused", reason: "unknown_op"}`, echoing the request's other
+strings, so a relay without first contact still answers a `dir_lookup` and
+the finder counts it as answered rather than waiting out the timeout. Area
+syntax (geohash prefixes, 2 to 5 characters) moved to the roster code
+(`net_relay_area_normalize`, `relay_rosters.area_normalize`), because rosters
+carry areas whether or not first contact is present; the area cards use it.
+
+**Python.** `src/autonomous-trust-rendezvous/`
+(`autonomous_trust.rendezvous`, D2's shape with an empty `_native`) holds
+`relay`, `reach`, `relay_seeds`, `relay_rosters`, `rdv_net` (the former
+`NetworkProcess` relay methods, now functions over the process with their state
+under its old names), `roster` (the roster verbs and `RosterEvent`) and
+`rendezvous` (the extension and the services registry). The core's `contacts`
+package is gone with `reach`, and its built-in extension list is empty. The
+seed and roster tools moved into its `tools/`. In C the relay readers hand a
+frame to the core's `handle_inbound_relayed`; in Python `rdv_net`'s drain calls
+the network process's own inbound methods directly. Both deliver the same
+frames the same way.
+
+**Switches and refusals.** `AT_USE_RELAY` registers with relays, `AT_RELAY`
+serves as one, and `AT_RELAY_SEED_FALLBACK` (D9) lets the rosters and the seed
+list stand in for a blank `AT_USE_RELAY`; `AT_FIRST_CONTACT` no longer does.
+All three are declarations in the tables social and first contact use, the two
+switches only when on, so a node with any of them but without rendezvous
+refuses to start. In C the check counts a feature present when either its
+identity extension or its process extension is registered
+(`at_extension_present`), since rendezvous has no identity extension.
+
+**Corpus and tests.** Rendezvous's cases are the nine `network/relay-roster-*`
+wire vectors; without it they skip on both runtimes, and a core built with
+neither feature skips 226 cases, the same set in C and Python. Its unit tests
+moved with it. `test_relay.py` was split: the relay tests stayed with it, and
+the fourteen where first contact meets the relay moved to first contact's
+`test_first_contact_relay.py`.
+
 ## External extensions and conformance plug-ins
 
 An extension need not live in this repository. Agora's social
@@ -624,18 +841,19 @@ in the worker.
 
 Extensions come from three places:
 
-1. a built-in list (first contact). It is a built-in list, not the package's
-   own entry points, because the package usually runs from a source tree where
-   its `pyproject.toml` entry points are invisible;
+1. a built-in list, empty since rendezvous and first contact became
+   distributions (Phase 7); tests replace it;
 2. the `autonomous_trust.extensions` entry-point group, for an installed
    distribution (`autonomous-trust-oracle` declares `oracle`; Agora's
    `autonomous-trust-social` declares `social`);
 3. for a source tree, a marker scan. Every subpackage of the `autonomous_trust`
    namespace that holds `_at_extension.py` is found by a filesystem check, and
    only that module is imported, so a heavy sibling without one
-   (`-services`, `-simulator`) is never imported. Putting
-   `src/autonomous-trust-oracle` (or Agora's `at-social/python`) on
-   `PYTHONPATH` beside `src/autonomous-trust` is all a checkout needs.
+   (`-services`, `-simulator`) is never imported. The marker exports
+   `EXTENSION`, or `EXTENSIONS` when a feature brings more than one (first
+   contact has two). Putting `src/autonomous-trust-oracle` (or Agora's
+   `at-social/python`) on `PYTHONPATH` beside `src/autonomous-trust` is all a
+   checkout needs.
 
 The same extension found by both the entry point and the scan counts once.
 
@@ -643,8 +861,8 @@ Only extension **names** are kept on the process. Multiproc mode pickles the
 process to its worker, so a handler must pickle too: use a bound method or a
 `functools.partial` of a module function, never a lambda. First contact's
 lambdas broke exactly this whenever `AT_FIRST_CONTACT=1` with `multiproc=True`.
-`tests/a_unit/test_extensions.py` pins the round-trip on a real
-`IdentityProcess`.
+First contact's `tests/a_unit/test_first_contact_extension.py` pins the
+round-trip on a real `IdentityProcess`.
 
 A feature package that ships both backends beside the core calls
 `autonomous_trust.core.register_backend_prefix('<pkg>.')`. The import
@@ -665,7 +883,8 @@ depends on the feature calls it:
 |---|---|
 | `at_social_link()` (Agora's `libat_social`) | nothing in the core: the Agora shim (`agora_events_open`), `agorad`'s `main` and en-at's `EmbeddedAtNode` call it. It calls `at_agora_link()`, which calls `at_social_msg_types_link()` |
 | `at_zta_link()` (`libat_zta`) | nothing in the core: ZTA's consumers own its link (the conformance runner and the tests with a ZTA half link it whole; `examples/` adds it to every demo). It keeps the identity extension, the process, the configuration section and the message types |
-| `at_first_contact_link()` | `identity_register_handlers` |
+| `at_first_contact_link()` (`libat_first_contact`) | nothing in the core: first contact's consumers own its link (the conformance runner and the core tests with a first-contact half link it whole; `examples/` adds it to every demo) |
+| `at_rendezvous_link()` (`libat_rendezvous`) | nothing in the core: rendezvous's consumers own its link, as first contact's do. It reaches `rdv_net.c` as well as the roster verbs, so both objects' registrations survive |
 | `at_dtn_link()` | nothing in the core: DTN's consumers own its link |
 | `at_gateway_link()` | nothing in the core: the gateway's consumers own its link |
 | `at_physics_link()`, `at_calibration_link()`, `at_certificates_link()`, `at_prequential_link()`, `at_replication_link()` | nothing in the core. en-at's `EmbeddedAtNode` calls each one its build found (see below) |
@@ -699,9 +918,12 @@ whether it built.
   refused; the ZTA types are registered in a ZTA build.
 - `test/app_abi_test.c`: the event layout, identical in every config.
 - `test/extension_test.c`: extension registration refusals; `enabled()` is
-  re-read and dispatch is per process; first contact registers exactly when
-  enabled; transport and process registration and their refusals. It links
-  the core alone, so it also asserts `dtn_bp` is absent.
+  re-read and dispatch is per process; with `libat_first_contact` linked, first
+  contact registers exactly when enabled, and without it `AT_FIRST_CONTACT=1`
+  registers nothing and refuses the start, as do the three relay switches;
+  transport and process registration and their refusals. It links the core
+  alone, plus `libat_first_contact` when that is built, so it also asserts
+  `dtn_bp` is absent.
 - `extensions/dtn/test/dtn_link_test.c`: with `at_dtn_static` linked,
   `net_transport_find("dtn_bp")` and `find_process("dtn_bp")` resolve
   (FEATURE_SPLIT_PLAN.md §5.3).
@@ -762,10 +984,8 @@ whether it built.
 
 ## Honest limits
 
-- The anchors mean the core still references its in-tree features by name
-  (ZTA, first contact). That is the price of keeping the static archive correct
-  until the features are separate libraries. DTN, the gateway, the five oracle
-  layers and Agora's social are the ones that are not referenced.
+- The core references no feature's anchor any more: with rendezvous and first
+  contact out (Phase 7), every feature's consumers own its link.
 - Social's locking differs between the runtimes: C has a leaf lock of its own,
   and Python keeps the one `proc.lock`. In C a tier and a block are therefore
   two snapshots. Conformance is deterministic and cannot show a timing

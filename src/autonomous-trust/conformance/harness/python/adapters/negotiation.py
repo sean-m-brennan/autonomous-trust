@@ -30,6 +30,7 @@ are out of scope for this pass.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import os
 import queue
 import tempfile
@@ -312,6 +313,11 @@ class NegotiationAdapter:
                 f'  actual:   {actual_canonical!r}')
 
     def run_scenario(self, case: Case) -> None:
+        if 'first_contact' in (case.data.get('fixtures') or {}) \
+                and importlib.util.find_spec('autonomous_trust.first_contact') is None:
+            # First contact's tier-cap scenarios need its distribution
+            # (FEATURE_SPLIT_PLAN Phase 7), as C's need libat_first_contact.
+            raise NotImplementedError('first-contact scenario skipped: autonomous-trust-first-contact is not installed (put src/autonomous-trust-first-contact on the path to run it symmetrically)')
         self._scratch = tempfile.TemporaryDirectory(prefix='at-conformance-neg-')
         self._task_uuids = {}
         try:
@@ -348,7 +354,7 @@ class NegotiationAdapter:
         if not (fixtures.get('first_contact') or {}).get('enabled'):
             return False
         os.environ['AT_FIRST_CONTACT'] = '1'
-        from autonomous_trust.core.contacts import Contact, Contacts, Provenance
+        from autonomous_trust.first_contact import Contact, Contacts, Provenance
         store = Contacts()
         for key, verified in (('verified_contacts', True),
                               ('unverified_contacts', False)):
@@ -370,7 +376,7 @@ class NegotiationAdapter:
         devices = fixtures.get('contact_devices') or {}
         if devices:
             from nacl.signing import SigningKey
-            from autonomous_trust.core.contacts import (adopt_operator, create_device_cert,
+            from autonomous_trust.first_contact import (adopt_operator, create_device_cert,
                                                         link_device)
             operator = SigningKey(_HARNESS_OPERATOR_SEED)
             for first, others in devices.items():

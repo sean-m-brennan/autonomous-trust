@@ -41,8 +41,7 @@ never replaced by its Python twin), then -- following CPython's own
 `from pkg import x` -- a NAME the `_python` package exports, then a `_python`
 submodule. Resolution is lazy and cached, so a native node
 loads nothing it does not touch; that matters because some of these pull real
-dependencies in (`identity.first_contact` reaches `core.contacts`, an opt-in
-feature `idprocess` is careful to import lazily for exactly this reason).
+dependencies in.
 
 Anything the shim imports explicitly still wins outright -- a module's
 `__getattr__` runs only when normal attribute lookup has already failed -- so

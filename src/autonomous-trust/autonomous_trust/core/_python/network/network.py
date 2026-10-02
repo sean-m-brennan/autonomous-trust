@@ -69,14 +69,14 @@ class Network(InitializableConfig):
     #: identity -> network, local IPC: our own current reachability record
     #: ({body, sig}), to publish at each of our relays.
     reach_publish = 'reach_publish'
-    #: identity -> network, local IPC: the directory (network/registry.py).
+    #: identity -> network, local IPC: the directory (first_contact/registry.py).
     #: dir_publish {entry: {body, sig}} files our entry at each of our relays
     #: (and again at every registration); dir_withdraw {handle} takes it back;
     #: dir_lookup {handle} asks every relay we are registered at.
     dir_publish = 'dir_publish'
     dir_withdraw = 'dir_withdraw'
     dir_lookup = 'dir_lookup'
-    #: identity -> network, local IPC: area hubs (network/hub.py).
+    #: identity -> network, local IPC: area hubs (first_contact/hub.py).
     #: hub_publish {card: {body, sig}} files our card at each of our relays
     #: (and again at every registration); hub_withdraw {area} takes it back;
     #: hub_lookup {area} asks every relay we are registered at.

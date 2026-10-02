@@ -28,7 +28,11 @@ import sys
 # ZTA (src/autonomous-trust-zta, FEATURE_SPLIT_PLAN Phase 6) likewise: the
 # identity adapter's zta_policy scenarios run with it, as C's do with libat_zta,
 # and skip without it.
-for _dist in ('autonomous-trust-oracle', 'autonomous-trust-zta'):
+# Rendezvous and first contact (src/autonomous-trust-rendezvous and
+# src/autonomous-trust-first-contact, Phase 7) too: first contact's contacts
+# protocol and the identity and negotiation adapters' first-contact scenarios.
+for _dist in ('autonomous-trust-oracle', 'autonomous-trust-zta',
+              'autonomous-trust-rendezvous', 'autonomous-trust-first-contact'):
     _dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..',
                                         '..', '..', _dist))
     if os.path.isdir(_dir) and _dir not in sys.path:

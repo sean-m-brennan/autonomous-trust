@@ -1,0 +1,171 @@
+schema_version: "1"
+kind: scenario
+protocol: network
+name: plaintext-verbs-file
+byte_pinning: false
+description: |
+    The rules of unencrypted_verbs.cfg.json, the file that grants an optional
+    feature's plaintext verbs (FEATURE_SPLIT_PLAN D8, decided 2026-10-02).
+
+    A receiver accepts a frame in the clear from a peer it already knows only
+    for a named verb (`unencrypted-verbs`). The core's nine are compiled in. A
+    feature's are DECLARED by its extension and GRANTED by this file, read at
+    startup from the node's configuration directory. Every row below applies
+    one file through the production loader and records whether the node
+    refuses to start, and what is granted when it does not:
+
+      * no file: the core verbs only -- unless an enabled extension declares
+        verbs, which it then cannot receive, so the start is refused;
+      * a malformed file refuses: not an object holding exactly "verbs", a
+        list of at most 32 distinct non-empty names of at most 64 characters;
+      * a verb no ENABLED extension declares refuses. That covers a core verb:
+        the file must never be a way to downgrade the core (`group_key_update`
+        in the clear), nor restate a core verb, which says the file is not what
+        it seems. It also covers a feature's verb with that feature off;
+      * an enabled extension whose declared verbs the file does not all name
+        refuses, naming the file and the missing verbs.
+
+    A refusal leaves the previous grant in force, and the adapter resets
+    between rows so each row starts from the core verbs only.
+
+    Production-code analogue:
+      Python: plaintext_verbs.configure, through
+              extensions.configure_plaintext_verbs at node start.
+      C:      plaintext_verbs_configure, from identity_run and network_run.
+
+participants:
+  - id: node
+    role: receiver
+
+fixtures:
+  # file: absent (null), raw text (a string), or a document (an object).
+  # first_contact: whether that extension is enabled for the row.
+  # expect_granted: how many optional verbs are in force afterwards.
+  rows:
+    - id: no-file-core-only
+      file: null
+      first_contact: false
+      expect_refused: false
+      expect_granted: 0
+    - id: no-file-with-first-contact-refused
+      file: null
+      first_contact: true
+      expect_refused: true
+      expect_granted: 0
+    - id: first-contact-verbs-granted
+      file: {verbs: [first_contact_hello, first_contact_hello_ack,
+                     first_contact_request, first_contact_accept,
+                     device_announce]}
+      first_contact: true
+      expect_refused: false
+      expect_granted: 5
+    - id: one-verb-missing-refused
+      file: {verbs: [first_contact_hello, first_contact_hello_ack,
+                     first_contact_request, first_contact_accept]}
+      first_contact: true
+      expect_refused: true
+      expect_granted: 0
+    - id: core-encrypted-verb-refused
+      file: {verbs: [first_contact_hello, first_contact_hello_ack,
+                     first_contact_request, first_contact_accept,
+                     device_announce, group_key_update]}
+      first_contact: true
+      expect_refused: true
+      expect_granted: 0
+    - id: core-plaintext-verb-refused
+      file: {verbs: [first_contact_hello, first_contact_hello_ack,
+                     first_contact_request, first_contact_accept,
+                     device_announce, request_access]}
+      first_contact: true
+      expect_refused: true
+      expect_granted: 0
+    - id: full-history-refused
+      file: {verbs: [full_history]}
+      first_contact: false
+      expect_refused: true
+      expect_granted: 0
+    - id: feature-verbs-with-the-feature-off-refused
+      file: {verbs: [first_contact_hello, first_contact_hello_ack,
+                     first_contact_request, first_contact_accept,
+                     device_announce]}
+      first_contact: false
+      expect_refused: true
+      expect_granted: 0
+    - id: empty-list-is-valid
+      file: {verbs: []}
+      first_contact: false
+      expect_refused: false
+      expect_granted: 0
+    - id: not-json-refused
+      file: "not json"
+      first_contact: false
+      expect_refused: true
+      expect_granted: 0
+    - id: a-list-not-an-object-refused
+      file: "[]"
+      first_contact: false
+      expect_refused: true
+      expect_granted: 0
+    - id: no-verbs-key-refused
+      file: {}
+      first_contact: false
+      expect_refused: true
+      expect_granted: 0
+    - id: an-extra-key-refused
+      file: {verbs: [], extra: true}
+      first_contact: false
+      expect_refused: true
+      expect_granted: 0
+    - id: verbs-not-a-list-refused
+      file: {verbs: first_contact_hello}
+      first_contact: true
+      expect_refused: true
+      expect_granted: 0
+    - id: a-non-string-verb-refused
+      file: {verbs: [1]}
+      first_contact: false
+      expect_refused: true
+      expect_granted: 0
+    - id: an-empty-verb-refused
+      file: {verbs: [""]}
+      first_contact: false
+      expect_refused: true
+      expect_granted: 0
+    - id: a-verb-named-twice-refused
+      file: {verbs: [first_contact_hello, first_contact_hello,
+                     first_contact_hello_ack, first_contact_request,
+                     first_contact_accept, device_announce]}
+      first_contact: true
+      expect_refused: true
+      expect_granted: 0
+    - id: thirty-three-verbs-refused
+      file: {verbs: [v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12,
+                     v13, v14, v15, v16, v17, v18, v19, v20, v21, v22, v23,
+                     v24, v25, v26, v27, v28, v29, v30, v31, v32]}
+      first_contact: false
+      expect_refused: true
+      expect_granted: 0
+    - id: a-sixty-five-character-verb-refused
+      file: {verbs: [vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv]}
+      first_contact: false
+      expect_refused: true
+      expect_granted: 0
+
+steps:
+  - id: 1
+    from: node
+    to: node
+    function: configure_plaintext_verbs
+    description: |
+        For each row: write `file` into a scratch configuration directory (or
+        none), set the first-contact flag, apply it through the production
+        loader, record refused / granted, reset.
+
+expected_state:
+  node:
+    # Every row's refusal and grant matched.
+    all_rows_match: true
+    # A refused row never widened the grant past the core verbs.
+    a_refusal_grants_nothing: true
+    # No row, refused or not, made group_key_update plaintext.
+    group_key_update_never_plaintext: true

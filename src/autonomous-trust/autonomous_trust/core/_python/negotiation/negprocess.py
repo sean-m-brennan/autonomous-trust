@@ -25,7 +25,7 @@ from ..freshness import Freshness
 from ..identity.protocol import IdentityProtocol
 from ..network import Message
 from ..processes import Process, ProcMeta
-from ..extensions import load_extensions, run_post_fork
+from ..extensions import capped_tier, load_extensions, run_post_fork
 from .protocol import NegotiationProtocol
 from .negotiation import Job, JobQueue, Task, TaskStatus, TaskTracker, TaskCounter, TaskResult, Status
 from ..system import CfgIds, max_concurrency, now, proc_idle_floor
@@ -255,11 +255,11 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                         sender = self.peers.find_by_uuid(
                             getattr(message.from_whom, 'uuid', None))
                     sender_tier = getattr(sender, '_tier', 0) if sender is not None else 0
-                    # §10.3: an unverified first-contact peer may message, and
-                    # no more, until verified (doc/architecture/first-contact.md).
+                    # An extension may hold the peer lower (NegotiationHooks):
+                    # first contact keeps an unverified contact at messaging
+                    # until verified (§10.3, doc/architecture/first-contact.md).
                     if message.from_whom is not None:
-                        from ..identity import first_contact
-                        sender_tier = first_contact.capped_tier(
+                        sender_tier = capped_tier(
                             self, getattr(message.from_whom, 'uuid', None),
                             sender_tier)
                     # Capabilities is keyed by name; the task carries a
