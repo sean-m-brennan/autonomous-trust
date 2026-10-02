@@ -27,7 +27,7 @@
 
 #include <jansson.h>
 
-#include "autonomous_trust/processes/processes.h"
+#include "processes/processes.h"
 #include "fleet/update_proposal.h"
 #include "config/configuration.h"
 

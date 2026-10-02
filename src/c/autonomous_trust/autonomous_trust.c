@@ -68,11 +68,6 @@ int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
         if (messaging_send("negotiation", TASK_STATUS, msg, false) != 0)
             log_exception(logger);
         return 0;
-    case UPDATE_PROPOSAL:
-        /* Route update proposals to fleet process */
-        if (messaging_send("fleet", UPDATE_PROPOSAL, msg, false) != 0)
-            log_exception(logger);
-        return 0;
     case NET_MESSAGE:
     {
         /* An app may invoke only a small, explicit allowlist of local verbs,
@@ -207,7 +202,6 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
              * external-feedback queue. */
             case TASK_RESULT:
             case TRANSACTION_SCORE:
-            case UPDATE_ACCEPTED:
             case PEER_OBSERVED:
             case PEER_REPUTATION:
             case PEER_RTT_OBSERVED:
@@ -407,6 +401,11 @@ int run_autonomous_trust(char *q_in, char *q_out,
         .queues = &queues,
         .logger = &logger,
     };
+    /* A subsystem a feature library provides, configured on a node built
+     * without that library: refuse to start rather than run without it
+     * (FEATURE_SPLIT_PLAN Phase 8). */
+    if (tracker_check_subsystem_libraries(&tracker, &logger) != 0)
+        return -1;
     int num_err = 0;
     map_entries_for_each(tracker.registry, key, impl_val)
     {

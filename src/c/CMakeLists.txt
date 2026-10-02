@@ -159,6 +159,12 @@ option(AT_FIRST_CONTACT_LIB "Build the first-contact library (libat_first_contac
 # by default; first contact needs it. $AT_USE_RELAY / $AT_RELAY turn it on at
 # run time.
 option(AT_RENDEZVOUS_LIB "Build the rendezvous library (libat_rendezvous)" ON)
+# Fleet (consensus on updates, artifacts, config distribution) and the
+# data-source ingest process are extensions too (FEATURE_SPLIT_PLAN Phase 8),
+# OFF by default: a node configured to start their subsystems without them
+# refuses to start.
+option(AT_FLEET_LIB "Build the fleet library (libat_fleet)" OFF)
+option(AT_DATA_SOURCE_LIB "Build the data-source ingest library (libat_data_source)" OFF)
 
 # Extension libraries that live OUTSIDE this tree (e.g. Agora's libat_social):
 # a list of directories, each holding an extension's CMakeLists.txt. Each is
@@ -499,19 +505,6 @@ set(libsrc
     autonomous_trust/utilities/socket_helpers.c
     autonomous_trust/utilities/timeout.c
     autonomous_trust/utilities/util.c
-    autonomous_trust/fleet/update_proposal.c
-    autonomous_trust/fleet/fleet_helpers.c
-    autonomous_trust/fleet/fleet_ops.c
-    autonomous_trust/data_source/data_source_proc.c
-    autonomous_trust/fleet/fleet_proc.c
-    autonomous_trust/fleet/artifact_store.c
-    autonomous_trust/fleet/artifact_proc_helpers.c
-    autonomous_trust/fleet/artifact_proc.c
-    autonomous_trust/fleet/update_proc_helpers.c
-    autonomous_trust/fleet/update_selftest.c
-    autonomous_trust/fleet/update_proc.c
-    autonomous_trust/fleet/config_proc_helpers.c
-    autonomous_trust/fleet/config_proc.c
 )
 
 
@@ -556,12 +549,6 @@ set(libhdr
     autonomous_trust/negotiation/negotiation.h
     autonomous_trust/reputation/reputation.h
     autonomous_trust/config/generate.h
-    autonomous_trust/fleet/update_proposal.h
-    autonomous_trust/fleet/fleet_proc.h
-    autonomous_trust/fleet/artifact_store.h
-    autonomous_trust/fleet/artifact_proc.h
-    autonomous_trust/fleet/update_proc.h
-    autonomous_trust/fleet/config_proc.h
 )
 
 
@@ -624,7 +611,10 @@ function(preprocess _file_in)
     set(_fullpath ${CMAKE_CURRENT_SOURCE_DIR}/${_file_in})
     set(_header_file ${CMAKE_CURRENT_BINARY_DIR}/${_base}.h)
     set(_src_dir ${CMAKE_CURRENT_SOURCE_DIR})
-    set(_exclude_args)
+    # Extension libraries register at load (DEFINE_*); scanning them would put
+    # their rows in the core's static tables too, and include their headers in
+    # the core (FEATURE_SPLIT_PLAN Phase 8).
+    set(_exclude_args --exclude extensions)
     add_custom_command(
         OUTPUT ${_header_file}
         COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/preprocess.py ${_fullpath} ${_header_file} ${_src_dir}/ autonomous_trust ${_exclude_args}
@@ -900,9 +890,6 @@ add_executable(data_test test/data_test.c)
 set_source_files_properties(test/data_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(data_test PRIVATE ${AT_TEST_LIBS})
 
-add_executable(data_source_test test/data_source_test.c)
-set_source_files_properties(test/data_source_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(data_source_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(net_proc_ageout_test test/net_proc_ageout_test.c)
 set_source_files_properties(test/net_proc_ageout_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1011,7 +998,6 @@ add_test(NAME rep_resolve_test COMMAND $<TARGET_FILE:rep_resolve_test>)
 add_test(NAME subtree_roster_test COMMAND $<TARGET_FILE:subtree_roster_test>)
 add_test(NAME operator_attestation_test COMMAND $<TARGET_FILE:operator_attestation_test>)
 add_test(NAME data_test COMMAND $<TARGET_FILE:data_test>)
-add_test(NAME data_source_test COMMAND $<TARGET_FILE:data_source_test>)
 add_test(NAME net_proc_ageout_test COMMAND $<TARGET_FILE:net_proc_ageout_test>)
 add_test(NAME datetime_test COMMAND $<TARGET_FILE:datetime_test>)
 add_test(NAME b64_test COMMAND $<TARGET_FILE:b64_test>)
@@ -1171,78 +1157,6 @@ add_test(NAME paxos_test COMMAND $<TARGET_FILE:paxos_test>)
 # test files (array_test, array2_test, paxos_test, msg_types2_test,
 # identity2_test, config_test, group2_test).
 
-add_executable(update_proposal_test test/update_proposal_test.c)
-set_source_files_properties(test/update_proposal_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(update_proposal_test PRIVATE ${AT_TEST_LIBS})
-
-add_test(NAME update_proposal_test COMMAND $<TARGET_FILE:update_proposal_test>)
-
-# Fleet tests compile their own .c files (not via the library), so they need
-# proto and table headers to exist before compilation starts.  Depend on the
-# static library target which already generates both.
-#
-# Fleet .c files call helpers from autonomous_trust/utilities/util.c
-# (path_join, makedirs, min/max, strremove).  Pulling those from the static
-# archive would cause duplicate-symbol conflicts against the directly-
-# compiled fleet sources, so compile util.c into each fleet test instead.
-set(fleet_test_util_srcs
-    autonomous_trust/utilities/util.c
-    autonomous_trust/utilities/exception.c)
-
-add_executable(fleet_proc_test
-    test/fleet_proc_test.c
-    autonomous_trust/fleet/fleet_helpers.c
-    autonomous_trust/fleet/update_proposal.c
-    ${fleet_test_util_srcs})
-set_source_files_properties(test/fleet_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(fleet_proc_test PRIVATE ${TEST_DEPENDENCIES})
-add_dependencies(fleet_proc_test autonomous_trust_static)
-
-add_test(NAME fleet_proc_test COMMAND $<TARGET_FILE:fleet_proc_test>)
-
-add_executable(artifact_store_test
-    test/artifact_store_test.c
-    autonomous_trust/fleet/artifact_store.c
-    ${fleet_test_util_srcs})
-set_source_files_properties(test/artifact_store_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(artifact_store_test PRIVATE ${TEST_DEPENDENCIES})
-add_dependencies(artifact_store_test autonomous_trust_static)
-
-add_test(NAME artifact_store_test COMMAND $<TARGET_FILE:artifact_store_test>)
-
-add_executable(artifact_proc_test
-    test/artifact_proc_test.c
-    autonomous_trust/fleet/artifact_proc_helpers.c
-    ${fleet_test_util_srcs})
-set_source_files_properties(test/artifact_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(artifact_proc_test PRIVATE ${TEST_DEPENDENCIES})
-add_dependencies(artifact_proc_test autonomous_trust_static)
-
-add_test(NAME artifact_proc_test COMMAND $<TARGET_FILE:artifact_proc_test>)
-
-add_executable(update_proc_test
-    test/update_proc_test.c
-    autonomous_trust/fleet/update_proc_helpers.c
-    autonomous_trust/fleet/update_selftest.c
-    autonomous_trust/utilities/at_jansson.c
-    ${fleet_test_util_srcs})
-set_source_files_properties(test/update_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(update_proc_test PRIVATE ${TEST_DEPENDENCIES})
-add_dependencies(update_proc_test autonomous_trust_static)
-
-add_test(NAME update_proc_test COMMAND $<TARGET_FILE:update_proc_test>)
-
-add_executable(config_proc_test
-    test/config_proc_test.c
-    autonomous_trust/fleet/config_proc_helpers.c
-    autonomous_trust/fleet/update_proc_helpers.c
-    autonomous_trust/utilities/at_jansson.c
-    ${fleet_test_util_srcs})
-set_source_files_properties(test/config_proc_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(config_proc_test PRIVATE ${TEST_DEPENDENCIES})
-add_dependencies(config_proc_test autonomous_trust_static)
-
-add_test(NAME config_proc_test COMMAND $<TARGET_FILE:config_proc_test>)
 
 add_executable(util3_test test/util3_test.c)
 set_source_files_properties(test/util3_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1444,6 +1358,12 @@ if(AT_ZTA)
 endif()
 if(AT_RENDEZVOUS_LIB)
     add_subdirectory(extensions/rendezvous)
+endif()
+if(AT_FLEET_LIB)
+    add_subdirectory(extensions/fleet)
+endif()
+if(AT_DATA_SOURCE_LIB)
+    add_subdirectory(extensions/data_source)
 endif()
 if(AT_FIRST_CONTACT_LIB)
     if(NOT AT_RENDEZVOUS_LIB)

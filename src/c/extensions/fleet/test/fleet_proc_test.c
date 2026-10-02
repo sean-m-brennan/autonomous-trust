@@ -21,8 +21,8 @@
 #include <uuid/uuid.h>
 #include <string.h>
 
-#include "autonomous_trust/fleet/update_proposal.h"
-#include "autonomous_trust/fleet/fleet_proc.h"
+#include "fleet/update_proposal.h"
+#include "fleet/fleet_proc.h"
 
 static void fill_test_proposal(update_proposal_t *prop)
 {

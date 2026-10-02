@@ -301,11 +301,11 @@ run_c_harness() {
     # -S/-B rather than `cd $build_dir && cmake ..`: with
     # AT_CONFORMANCE_BUILD_DIR pointing outside the source tree, ".." is not the
     # source dir and cmake would configure whatever happens to be there.
-    cmake -S "$c_dir" -B "$build_dir" $cmake_zta_arg "$cmake_ext_arg"
+    cmake -S "$c_dir" -B "$build_dir" $cmake_zta_arg "$cmake_ext_arg" -DAT_FLEET_LIB=ON -DAT_DATA_SOURCE_LIB=ON
   else
     # Reused dir (--no-clean): refresh the cmake config in case CMake files
     # changed since last run, and to apply/keep -DAT_ZTA / -DAT_EXTERNAL_EXTENSIONS.
-    cmake -S "$c_dir" -B "$build_dir" $cmake_zta_arg "$cmake_ext_arg" >/dev/null
+    cmake -S "$c_dir" -B "$build_dir" $cmake_zta_arg "$cmake_ext_arg" -DAT_FLEET_LIB=ON -DAT_DATA_SOURCE_LIB=ON >/dev/null
   fi
 
   echo "Building + running C conformance harness ..."

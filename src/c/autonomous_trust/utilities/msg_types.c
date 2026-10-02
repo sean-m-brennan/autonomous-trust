@@ -26,7 +26,6 @@
 #include "msg_registry.h"
 #include "logger.h"
 
-#include "fleet/update_proposal.h"
 #include "identity/identity_priv.h"
 #include "processes/capabilities_priv.h"
 #include "negotiation/task_priv.h"
@@ -63,12 +62,6 @@ size_t message_size(message_type_t type)
         return sizeof(task_result_msg_t);
     case TRANSACTION_SCORE:
         return sizeof(tx_score_msg_t);
-    case UPDATE_PROPOSAL:
-        return sizeof(update_proposal_t);
-    case UPDATE_VOTE:
-        return sizeof(update_vote_msg_t);
-    case UPDATE_ACCEPTED:
-        return sizeof(update_accepted_msg_t);
     case PEER_RTT_UPDATE:
     case PEER_RTT_OBSERVED:
         return sizeof(peer_rtt_update_msg_t);
@@ -80,6 +73,9 @@ size_t message_size(message_type_t type)
         return sizeof(peer_standing_msg_t);
     case PEER_REMOVED:
         return sizeof(peer_removed_msg_t);
+    case MSG_TYPE_RETIRED_10:   /* fleet's old slots: never sent (Phase 8) */
+    case MSG_TYPE_RETIRED_11:
+    case MSG_TYPE_RETIRED_12:
     default:
     {
         const at_msg_vtable_t *vt = at_msg_type_lookup((long)type);
@@ -117,12 +113,6 @@ char *message_type_to_string(message_type_t type)
         return (char*)"TASK_RESULT";
     case TRANSACTION_SCORE:
         return (char*)"TRANSACTION_SCORE";
-    case UPDATE_PROPOSAL:
-        return (char*)"UPDATE_PROPOSAL";
-    case UPDATE_VOTE:
-        return (char*)"UPDATE_VOTE";
-    case UPDATE_ACCEPTED:
-        return (char*)"UPDATE_ACCEPTED";
     case PEER_RTT_UPDATE:
         return (char*)"PEER_RTT_UPDATE";
     case PEER_RTT_OBSERVED:
@@ -137,6 +127,9 @@ char *message_type_to_string(message_type_t type)
         return (char*)"PEER_STANDING";
     case PEER_REMOVED:
         return (char*)"PEER_REMOVED";
+    case MSG_TYPE_RETIRED_10:   /* fleet's old slots: never sent (Phase 8) */
+    case MSG_TYPE_RETIRED_11:
+    case MSG_TYPE_RETIRED_12:
     default:
     {
         const at_msg_vtable_t *vt = at_msg_type_lookup((long)type);
@@ -175,12 +168,6 @@ message_type_t message_type_core_by_name(const char *str)
         return TASK_RESULT;
     if (strcmp(str, "TRANSACTION_SCORE") == 0)
         return TRANSACTION_SCORE;
-    if (strcmp(str, "UPDATE_PROPOSAL") == 0)
-        return UPDATE_PROPOSAL;
-    if (strcmp(str, "UPDATE_VOTE") == 0)
-        return UPDATE_VOTE;
-    if (strcmp(str, "UPDATE_ACCEPTED") == 0)
-        return UPDATE_ACCEPTED;
     if (strcmp(str, "PEER_RTT_UPDATE") == 0)
         return PEER_RTT_UPDATE;
     if (strcmp(str, "PEER_RTT_OBSERVED") == 0)
@@ -445,22 +432,6 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         memcpy(subdata, &msg->info.tx_score, subdata_len);
         break;
     }
-    case UPDATE_VOTE:
-    {
-        subdata_len = sizeof(update_vote_msg_t);
-        subdata = smrt_create(subdata_len);
-        if (subdata == NULL) return EXCEPTION(ENOMEM);
-        memcpy(subdata, &msg->info.update_vote, subdata_len);
-        break;
-    }
-    case UPDATE_ACCEPTED:
-    {
-        subdata_len = sizeof(update_accepted_msg_t);
-        subdata = smrt_create(subdata_len);
-        if (subdata == NULL) return EXCEPTION(ENOMEM);
-        memcpy(subdata, &msg->info.update_accepted, subdata_len);
-        break;
-    }
     case PEER_RTT_UPDATE:
     case PEER_RTT_OBSERVED:
     {
@@ -502,8 +473,9 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         memcpy(subdata, &msg->info.peer_removed, subdata_len);
         break;
     }
-    case UPDATE_PROPOSAL:
-        /* UPDATE_PROPOSAL uses its own JSON serialization, not proto */
+    case MSG_TYPE_RETIRED_10:   /* fleet's old slots: never sent (Phase 8) */
+    case MSG_TYPE_RETIRED_11:
+    case MSG_TYPE_RETIRED_12:
         return -1;
     default:
     {
@@ -753,12 +725,6 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
     case TRANSACTION_SCORE:
         COPY_FIXED_PAYLOAD(tx_score, tx_score_msg_t);
         break;
-    case UPDATE_VOTE:
-        COPY_FIXED_PAYLOAD(update_vote, update_vote_msg_t);
-        break;
-    case UPDATE_ACCEPTED:
-        COPY_FIXED_PAYLOAD(update_accepted, update_accepted_msg_t);
-        break;
     case PEER_RTT_UPDATE:
     case PEER_RTT_OBSERVED:
         COPY_FIXED_PAYLOAD(peer_rtt_update, peer_rtt_update_msg_t);
@@ -775,8 +741,9 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
     case PEER_REMOVED:
         COPY_FIXED_PAYLOAD(peer_removed, peer_removed_msg_t);
         break;
-    case UPDATE_PROPOSAL:
-        /* UPDATE_PROPOSAL uses its own JSON serialization, not proto */
+    case MSG_TYPE_RETIRED_10:   /* fleet's old slots: never sent (Phase 8) */
+    case MSG_TYPE_RETIRED_11:
+    case MSG_TYPE_RETIRED_12:
         ret = -1;
         break;
     default:

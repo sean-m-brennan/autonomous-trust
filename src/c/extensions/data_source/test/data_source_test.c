@@ -27,7 +27,9 @@
 #include <string.h>
 #include <jansson.h>
 
-#include "autonomous_trust/data_source/data_source_proc_priv.h"
+#include "data_source/data_source_proc_priv.h"
+#include "processes/capabilities.h"
+#include "processes/process_tracker.h"
 
 /* _ts_keep parity vectors. The expected column was computed with the REAL
  * Python _ts_keep (examples/dod_mission/participant.py):
@@ -132,6 +134,26 @@ DEFINE_TEST(test_batch_task_id_missing)
     ck_assert(_batch_task_id(NULL, out, sizeof(out)) == false);
 }
 
+/* Linked, libat_data_source adds its process, its "data-source" subsystem and
+ * the "data" capability at load, so a configuration that starts it is not
+ * refused (FEATURE_SPLIT_PLAN Phase 8). */
+DEFINE_TEST(test_linking_data_source_adds_its_process_subsystem_and_capability)
+{
+    ck_assert_ptr_nonnull(find_process("data_source_proc"));
+    ck_assert_ptr_nonnull(find_capability("data"));
+    const char *keys[AT_SUBSYSTEM_EXT_MAX], *impls[AT_SUBSYSTEM_EXT_MAX];
+    ck_assert_uint_eq(subsystem_defaults(keys, impls, AT_SUBSYSTEM_EXT_MAX), 1);
+    ck_assert_str_eq(keys[0], "data-source");
+    ck_assert_str_eq(impls[0], "data_source_proc");
+    tracker_t tracker;
+    ck_assert_int_eq(tracker_init(NULL, &tracker), 0);
+    ck_assert_int_eq(tracker_register_subsystem(&tracker, keys[0], impls[0]), 0);
+    ck_assert_int_eq(tracker_check_subsystem_libraries(&tracker, NULL), 0);
+    tracker_free(&tracker);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(DataSource, test_ts_keep_python_parity, test_ts_keep_edge_cases,
           test_ts_keep_deterministic, test_batch_task_id_stamped,
-          test_batch_task_id_synthetic, test_batch_task_id_missing)
+          test_batch_task_id_synthetic, test_batch_task_id_missing,
+          test_linking_data_source_adds_its_process_subsystem_and_capability)

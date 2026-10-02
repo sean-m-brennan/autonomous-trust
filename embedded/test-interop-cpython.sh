@@ -100,9 +100,10 @@ if ! $SKIP_BUILD; then
   # dev symlink is absent on the host -> "No rule to make target .../libprotobuf-c.so".
   rm -f "$REPO/examples/build-gcc/CMakeCache.txt"
   CC=gcc CXX=g++ cmake -S "$REPO/examples" -B "$REPO/examples/build-gcc" \
-    -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="-Wno-unknown-warning-option" \
+    -DCMAKE_BUILD_TYPE=Release -DAT_FLEET_LIB=ON -DAT_DATA_SOURCE_LIB=ON \
+    -DCMAKE_C_FLAGS="-Wno-unknown-warning-option" \
     -DCMAKE_CXX_FLAGS="-Wno-unknown-warning-option" >/dev/null
-  cmake --build "$REPO/examples/build-gcc" --target autonomous_trust -j"$(nproc)" >/dev/null
+  cmake --build "$REPO/examples/build-gcc" --target autonomous_trust at_fleet at_data_source -j"$(nproc)" >/dev/null
   PB="$REPO/examples/build-gcc/lib/protobuf/autonomous_trust/core/protobuf"
   # at_demo links the static lib via --whole-archive under clang; gcc trips on a
   # relocation there, so link dynamically against the freshly-built .so instead.
@@ -121,8 +122,11 @@ if ! $SKIP_BUILD; then
   # from the .so it links against. The library is built with it; match here.
   gcc -fms-extensions "$REPO/examples/demo/src/at_demo.c" \
     "${CONDA_CFLAGS[@]}" \
-    -I "$REPO/src/c" -I "$REPO/src/c/autonomous_trust" -I "$PB" -I "$REPO/examples/build-gcc/lib/protobuf" \
-    -L "$REPO/examples/build-gcc/lib" "${CONDA_LDFLAGS[@]}" -lautonomous_trust \
+    -I "$REPO/src/c" -I "$REPO/src/c/autonomous_trust" -I "$REPO/src/c/extensions" \
+    -I "$PB" -I "$REPO/examples/build-gcc/lib/protobuf" \
+    -L "$REPO/examples/build-gcc/lib" -L "$REPO/examples/build-gcc/lib/extensions/fleet" \
+    -L "$REPO/examples/build-gcc/lib/extensions/data_source" "${CONDA_LDFLAGS[@]}" \
+    -Wl,--no-as-needed -lat_fleet -lat_data_source -Wl,--as-needed -lautonomous_trust \
     -lsodium -ljansson -luuid -lprotobuf-c -lprotobuf -lstdc++ -lpthread -lm \
     -Wl,-rpath,'$ORIGIN/lib' -o "$REPO/examples/build-gcc/at_demo_cur"
 

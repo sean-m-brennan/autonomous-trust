@@ -73,6 +73,43 @@ int process_table_append(const char *type, const char *name, handler_ptr_t runne
         (void)process_table_append(QUOTE(t), QUOTE(n), (r));                   \
     }
 
+/** Most subsystems extensions may add to a generated configuration. */
+#define AT_SUBSYSTEM_EXT_MAX 8
+
+/**
+ * @brief An extension's subsystem that a node starts by default: the
+ *        configuration generator (generate_subsystems_config) lists @p key
+ *        with runner @p impl after the core's own, so a node gets it exactly
+ *        when the library that provides it is linked.
+ *
+ * Refuses (-1, with a line on stderr) a NULL or empty key or impl, a key
+ * already registered, and a full table. Not locked: constructors run before
+ * main(). FEATURE_SPLIT_PLAN Phase 8.
+ */
+int subsystem_default_register(const char *key, const char *impl);
+
+/** @brief The registered default subsystems, in registration order, into
+ *  @p keys / @p impls (room for @p max each). @return how many. */
+size_t subsystem_defaults(const char **keys, const char **impls, size_t max);
+
+/**
+ * @brief Refuse a configuration that starts a feature library's subsystem
+ *        (fleet, artifact, update, config, data-source) on a node built
+ *        without that library: one error line per subsystem naming the
+ *        library. Names only, as the other declaration tables are. Any other
+ *        unknown runner is left to the start loop, which skips it.
+ * @return 0, or -1 when something is missing.
+ */
+int tracker_check_subsystem_libraries(const tracker_t *tracker, logger_t *logger);
+
+/** Register a default subsystem at load time; pair it with @ref DEFINE_PROCESS
+ *  for the runner @p impl names. */
+#define DEFINE_SUBSYSTEM(tag, key, impl)                                       \
+    static void __attribute__((constructor)) register_subsystem_##tag(void)    \
+    {                                                                          \
+        (void)subsystem_default_register((key), (impl));                       \
+    }
+
 /**
  * @brief Initialize existing tracker
  *
