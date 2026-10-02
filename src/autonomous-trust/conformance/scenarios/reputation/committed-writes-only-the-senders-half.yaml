@@ -1,0 +1,45 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: committed-writes-only-the-senders-half
+byte_pinning: false
+description: |
+    A `committed` broadcast may write only its sender's own half (ISSUES.md
+    §2.16, shape 2).
+
+    The proposer commits the score it gave, so a commit's half and its
+    authenticated sender are the same peer. alice sends a commit naming dave's
+    half. Before this rule any member could write both halves of a fabricated
+    entry about anybody; now bob refuses it, and the staged half stays pending.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: proposer
+  - id: dave
+    role: proposer
+
+fixtures:
+  tx_history:
+    bob:
+      - task_id: t-1
+        p1: carol
+        p1_score: 0.9
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: tx committed
+    payload:
+      task_id: t-1
+      proposer: dave
+      score: 0.2
+    description: alice commits a half that is dave's, not hers.
+
+expected_state:
+  bob:
+    committed_tx_count: 0

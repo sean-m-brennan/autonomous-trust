@@ -1342,9 +1342,12 @@ class TestProposerHistoryBilateral:
             info=lambda *a, **k: None)
 
         task = uuid4()
+        # A commit is signed and writes its SENDER's own half (ISSUES.md
+        # §2.16, shape 2), so it comes from the proposer it names.
         msg = SimpleNamespace(
             function=ReputationProtocol.committed,
             obj=to_json_string((task, peer_id, 0.7)),
+            verified=True, from_whom=SimpleNamespace(uuid=peer_id, nickname='p'),
         )
         ReputationProcess.handle_committed(stub, {}, msg)
 
@@ -1359,6 +1362,7 @@ class TestProposerHistoryBilateral:
         msg_self = SimpleNamespace(
             function=ReputationProtocol.committed,
             obj=to_json_string((task, self_id, 0.9)),
+            verified=True, from_whom=SimpleNamespace(uuid=self_id, nickname='s'),
         )
         ReputationProcess.handle_committed(stub, {}, msg_self)
         # Re-fetch; p2 must still be empty.
@@ -1401,6 +1405,7 @@ class TestProposerHistoryBilateral:
         msg = SimpleNamespace(
             function=ReputationProtocol.committed,
             obj=to_json_string((task, peer_id, 0.3)),
+            verified=True, from_whom=SimpleNamespace(uuid=peer_id, nickname='p'),
         )
         ReputationProcess.handle_committed(stub, {}, msg)
 

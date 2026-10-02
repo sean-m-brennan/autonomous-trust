@@ -1607,6 +1607,9 @@ class TestScoreRangeAtTheRemoteBoundary:
                    % (task_id, peer_id, score_json))
         msg.verified = True
         msg.from_whom = _make_mock_peer()
+        # A commit writes its SENDER's own half (ISSUES.md §2.16, shape 2), so
+        # the sender is the peer the payload names.
+        msg.from_whom.uuid = peer_id
         return msg
 
     def _assert_not_staged(self, rp, score_json):

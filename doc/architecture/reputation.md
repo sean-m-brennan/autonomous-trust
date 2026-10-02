@@ -636,6 +636,116 @@ Both adapters mint the co-signatures at scenario time, so the two runtimes are
 held to the same pre-image and scheme rather than to the recorded output of one
 side.
 
+## Verifier-attested scores
+
+A committed entry counts only when both halves exist, and each half is
+submitted by one of the two parties. That is the property that keeps a horde
+from forging evidence about an honest node (`R+D.md` §14.2), and it carries
+the cost that section names in its fourth open question: a peer can **withhold**
+its half to keep a poor score about itself off the chain. For most evidence
+this is acceptable, because a transaction it refuses to complete is one it
+never benefits from either. It is not acceptable for an audit. A verifier that
+checks a peer's published work and finds it unsafe has a finding the peer will
+never countersign, and the finding must still land.
+
+A **verifier-attested score** is the answer, and the only one-sided entry the
+chain admits. The verifier submits its half alone. The entry commits once a
+quorum of the group co-signs it, and the subject's consent is neither needed nor
+counted.
+
+**What the co-signers vouch for.** Admissibility, never truth. Each co-signer
+checks, in its own view of the group, that:
+
+- the verifier is an eligible author: its reputation in this node's view is at
+  least `AT_ATTEST_MIN_REP` (0.5 by default), and it is neither excluded nor
+  slashed;
+- the verifier is not the subject, and the subject is a member;
+- the channel is one a verifier can author (`probe`, for now);
+- the entry is well-formed, its task id is the one derived from its content,
+  and it is not a duplicate;
+- the verifier has not already attested this subject within the resident
+  window (one per pair, counted from the chain itself, so every node reaches the
+  same answer).
+
+None of that is a judgement about the finding. This keeps the rule from the
+start of this document intact: no channel becomes an accusation several nodes
+co-sign into a verdict. The quorum certifies that an eligible verifier said
+this, on this channel, with this reason. Whether the subject did poorly is still
+each peer's own reading of an entry it holds, folded like any other.
+
+**The entry.** It is an ordinary `Transaction` with three more fields, so it
+shares the chain, its index and links, the window root, checkpoints, the
+persisted evidence document and catch-up. The verifier occupies `p1`; `p2` is
+never set. The added fields name the **subject** (an ordinary entry names only
+its two scorers, and the subject is "the other side", which a one-sided entry
+does not have) and an **evidence digest**, the hash of the document the
+verifier's finding rests on, which the application that produced it publishes.
+The task id is derived from verifier, subject and digest, so a duplicate is
+recognizable on sight and an attestation cannot borrow a live round's id. A
+plain `committed` naming an attested task id is refused, so nothing can later
+fill the other half.
+
+Its canonical bytes extend the existing form rather than replacing it. Every
+attested entry carries a non-default channel, so the channel block is always
+present, and a final block `|attested|<subject>|<evidence_digest>` follows it.
+No ordinary entry has `p2` unset at commit time, so the two forms cannot
+collide, and every entry committed before the change keeps its bytes and its
+hash.
+
+**The round.** A fourth three-phase quorum, shaped like slashing and
+checkpoints rather than like the Paxos commit:
+
+| Wire function | Direction | Carries |
+|---|---|---|
+| `attest propose` | verifier → group | verifier, subject, task id, score, channel, evidence digest, the verifier's signature |
+| `attest sign` | member → verifier | task id, the member's signature |
+| `attest final` | verifier → group | the entry and the map of verified co-signatures |
+
+Each signer signs the designation
+`"AT-ATTEST\0" verifier|subject|task|score|channel|evidence_digest[|group]`,
+which excludes index and `prev_hash` because those differ per node until the
+chains reconcile. A receiver of the finalizer counts distinct verified signers
+under the rules of the previous section, with two more: the verifier's own
+signature is required, and the subject's is never counted. The bar is a strict
+majority of the members other than the subject, sized from the receiver's own
+roster. In a group of three, both non-subjects must sign.
+
+The certificate stays outside the entry hash, as a checkpoint's co-signatures
+stay outside its root. It travels with the entry wherever the entry goes: on
+catch-up, in the evidence document, and in deep-resolution answers. A catch-up
+segment carrying an attested entry without a certificate that verifies is
+refused, since otherwise catch-up would be a way around the round.
+
+**What the subject cannot do.** Block it, because its signature is not
+counted. Strip it, because the entry is hash-linked into a window root that a
+checkpoint quorum signs. Fork it away: when a node adopts a chain that dropped
+a certified attested entry, it re-appends the entry, which verifies on its own
+and does not depend on its position. Pair it, because the half it would fill is
+refused.
+
+**How it is folded.** For the subject, an attested entry contributes the
+verifier's score as one consensus observation at capability weight one. The
+`probe` multiplier applies only on the verifier's own node, exactly as in
+"Only your own evidence counts": a quorum certifies admissibility and does not
+raise a remote channel's weight. The verifier gains nothing from the entry.
+Attested entries are not bilateral history, so CTFT leaves them out. Decay is
+unchanged, which means a poor attested score is never lifted by the passage of
+time alone; only fresh evidence moves it.
+
+**What it opens, and what bounds it.** A malicious verifier can now place a poor
+score about a peer that peer cannot veto. Four things bound that. Every
+co-signer requires the verifier to be in good standing in its own view. One
+attestation per verifier and subject fits in the resident window. A remote node
+folds it at weight one. And the verifier's key and the quorum's are on a
+committed entry, so the slander is attributable, and peers judge the verifier
+by it in turn. There is still no dispute mechanism, for the reason given above:
+nothing here levies a verdict.
+
+The application decides what an audit means and what score it earns; AT
+decides only who may author one and what makes it stick. Stele
+(`apps/stele/`) is the first producer, scoring a repository owner's node on a
+vulnerability scan of its published commit.
+
 ## Asking others what they think
 
 A score computed here is one node's view. An observer dashboard wants the whole
@@ -1024,10 +1134,22 @@ stands over is documented rather than papered over.
 | Unattested checkpoint root refused | [`checkpoint-final-unattested-root-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/checkpoint-final-unattested-root-refused.yaml) |
 | Single-subject reputation request | [`request-reputation-cross-process.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/request-reputation-cross-process.yaml) |
 | Batched consensus request, self skipped and duplicates collapsed | [`consensus-reputation-batch.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/consensus-reputation-batch.yaml) |
+| An attested entry hashes the same in both runtimes, and links | [`attest-entry-canonical-bytes.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/attest-entry-canonical-bytes.yaml) |
+| A certified attestation commits without its subject | [`attest-final-commits-without-the-subject.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/attest-final-commits-without-the-subject.yaml) |
+| The subject's own node appends it | [`attest-final-the-subject-cannot-refuse-it.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/attest-final-the-subject-cannot-refuse-it.yaml) |
+| The subject's signature is not counted | [`attest-final-subject-signature-not-counted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/attest-final-subject-signature-not-counted.yaml) |
+| Sub-quorum or forged attestation certificates refused | [`attest-final-sub-quorum-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/attest-final-sub-quorum-refused.yaml) |
+| An attestation needs its verifier's signature | [`attest-final-without-the-verifier-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/attest-final-without-the-verifier-refused.yaml) |
+| Admissibility: floor, self, channel, rate cap | [`attest-propose-low-rep-verifier-declined.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/attest-propose-low-rep-verifier-declined.yaml) |
+| A commit writes only its sender's half (ISSUES §2.16) | [`committed-writes-only-the-senders-half.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/committed-writes-only-the-senders-half.yaml) |
 
 Unit coverage for the attestation rules lives in
 `tests/a_unit/test_repprocess_quorum_attestation.py` on the Python side and
-`src/c/test/rep_quorum_test.c` on the C side. The child-chain checkpoint work is
+`src/c/test/rep_quorum_test.c` on the C side. Verifier-attested scores have their own:
+`tests/a_unit/test_attested_scores.py` (the round end to end on real keys,
+catch-up's certificate gate, the re-append after a fork, folding) and
+`src/c/test/rep_attest_test.c` (the entry on the catch-up wire, in the evidence
+document, and handed back by a fork). The child-chain checkpoint work is
 described in [Gateway reputation tree](gateway-reputation-tree.md), and the
 closure of the original last-identifier divergence in `BUGS.md` section P6.
 

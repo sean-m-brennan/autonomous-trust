@@ -1,0 +1,36 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-final-sub-quorum-refused
+byte_pinning: false
+description: |
+    A finalizer that falls short of a majority of the non-subjects is refused.
+
+    Four members, carol the subject, so three non-subjects and a bar of two.
+    alice's finalizer bears only her own signature. dave counts one verified
+    signer and refuses the entry.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+  - id: dave
+    role: member
+
+steps:
+  - id: 1
+    from: alice
+    to: dave
+    function: attest final
+    payload:
+      subject: carol
+      score: 0.3
+      cosigners: [alice]
+    description: the verifier alone.
+
+expected_state:
+  dave:
+    committed_tx_count: 0

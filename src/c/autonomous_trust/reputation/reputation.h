@@ -90,6 +90,9 @@ extern char REP_PROTO_APP_ROSTER[];
 extern char REP_PROTO_SLASH_PROPOSE[];
 extern char REP_PROTO_SLASH_SIGN[];
 extern char REP_PROTO_SLASH_FINAL[];
+extern char REP_PROTO_ATTEST_PROPOSE[];
+extern char REP_PROTO_ATTEST_SIGN[];
+extern char REP_PROTO_ATTEST_FINAL[];
 /* Phase 2 quorum-signed Merkle checkpoint ops
  * (ReputationProtocol.checkpoint_propose / checkpoint_sign / checkpoint_final).
  * A member co-signs only when its own transaction_window_root matches the
@@ -257,6 +260,18 @@ typedef struct {
  * digest). Keep in lockstep so the languages agree on entry hashes. */
 #define TX_HASH_HEX_LEN 64
 
+/* A verifier-attested entry's evidence digest: lowercase hex of a 32-byte
+ * blake2b over the document the finding rests on. Mirrors Python
+ * ATTEST_DIGEST_HEX_LEN. See doc/architecture/reputation.md,
+ * "Verifier-attested scores". */
+#define TX_ATTEST_DIGEST_HEX_LEN 64
+
+/* Room for transaction_canonical_bytes at its longest: three uuids, two
+ * scores, an index, two channels, and the attested block (a marker, a fourth
+ * uuid and a digest). */
+#define TX_CANON_MAX (UUID_STRING_LEN * 4 + 160 + 2 * (TX_CHANNEL_NAMELEN + 1) \
+                      + TX_ATTEST_DIGEST_HEX_LEN)
+
 typedef struct {
     uuid_t task_uuid;
     uuid_t p1_uuid;
@@ -291,7 +306,43 @@ typedef struct {
      * offset the mirror already agrees on. */
     char   p1_channel[TX_CHANNEL_NAMELEN + 1];
     char   p2_channel[TX_CHANNEL_NAMELEN + 1];
+    /* A VERIFIER-ATTESTED entry (doc/architecture/reputation.md,
+     * "Verifier-attested scores"): p1 is the verifier, p2 is never set, and
+     * it commits on a quorum certificate rather than on the subject's half.
+     * An ordinary entry names only its two scorers and the subject is "the
+     * other side"; a one-sided entry has none, hence subject_uuid.
+     * evidence_digest names the document the finding rests on. Both are
+     * covered by transaction_canonical_bytes. APPENDED, for the CFFI mirror
+     * (see p1_channel). Mirrors Python Transaction.attested / subject_id /
+     * evidence_digest. */
+    bool   attested;
+    uuid_t subject_uuid;
+    char   evidence_digest[TX_ATTEST_DIGEST_HEX_LEN + 1];
 } transaction_t;
+
+/* Committed: bilateral, or attested and indexed. The one test every reader of
+ * the chain uses, so a one-sided attested entry is not mistaken for a pending
+ * half. */
+static inline bool tx_is_committed(const transaction_t *t)
+{
+    return (t->p1_set && t->p2_set) || (t->attested && t->p1_set && t->index >= 0);
+}
+
+/* The score @p tx holds ABOUT @p peer_uuid, and who gave it (@p author, may be
+ * NULL). An ordinary committed entry is about each side, scored by the other;
+ * an attested one is about its subject only, scored by the verifier in p1.
+ * Returns false when the entry holds no score about the peer. Mirrors Python
+ * Transaction.about. */
+bool transaction_score_about(const transaction_t *tx, const uuid_t peer_uuid,
+                             double *score, uuid_t author);
+
+/* uuid5(AT_ATTEST_NS, "verifier|subject|digest"): the task id an attested
+ * entry must carry. Mirrors Python attest_task_id. */
+void tx_attest_task_uuid(const uuid_t verifier, const uuid_t subject,
+                         const char *evidence_digest, uuid_t out);
+
+/* True iff @p digest is TX_ATTEST_DIGEST_HEX_LEN lowercase hex chars. */
+bool tx_attest_digest_valid(const char *digest);
 
 /****************************
  * Transaction history (block chain)
@@ -354,6 +405,11 @@ typedef struct {
      * rewrites it (it tracks the tail), so the link survives the sliding
      * window. Mirrors Python TransactionHistory._head_hash. */
     char          head_hash[TX_HASH_HEX_LEN + 1];
+    /* Quorum certificates of attested entries: task uuid_str -> the JSON text
+     * of {voter uuid: signature hex}. OUTSIDE the entry hash, as a
+     * checkpoint's co-signatures are outside its root; dropped on eviction.
+     * Mirrors Python TransactionHistory.attest_certs. */
+    map_t         attest_certs;
 } tx_history_t;
 
 /*@
@@ -401,6 +457,20 @@ void tx_history_destroy(tx_history_t *hist);
           hist->task_map, hist->peer_map;
   ensures \result == 0 || \result != 0;
 */
+/* Commit a verifier-attested entry. @p tx carries the verifier in p1 (uuid,
+ * score in [0,1], an attestable channel), p2 unset, attested, a subject other
+ * than the verifier, a valid digest, and the derived task id; index and
+ * prev_hash are assigned here. @p cert_json (may be NULL) is the quorum
+ * certificate's JSON text, kept beside the entry. Returns 0, or EINVAL and
+ * changes nothing when the entry is malformed or its task id was ever held.
+ * The quorum is the CALLER's to check. Mirrors Python
+ * TransactionHistory.append_attested. */
+int  tx_history_append_attested(tx_history_t *hist, const transaction_t *tx,
+                                const char *cert_json);
+
+/* The certificate kept for an attested entry (JSON text), or NULL. */
+const char *tx_history_attest_cert(const tx_history_t *hist, const uuid_t task_uuid);
+
 int  tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
                        const uuid_t peer_uuid, double score,
                        const char *channel);
