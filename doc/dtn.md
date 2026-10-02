@@ -394,6 +394,49 @@ architecture allows a single bundle to traverse TCP/IP segments, space links,
 radio links, and data mules in a single end-to-end transfer, something no single
 transport protocol can achieve.
 
+## 7. DTN in AutonomousTrust
+
+[AutonomousTrust over DTN](at-over-dtn.md) is the design. This is what is
+built. Both runtimes carry AT over a Bundle Protocol agent as an optional
+extension, outside the core:
+
+| | C | Python |
+|---|---|---|
+| Package | `libat_dtn` (`src/c/extensions/dtn/`), built with `-DAT_NET_DTN=ON` | `autonomous_trust.dtn` (`src/autonomous-trust-dtn/`) |
+| Selected by | the `dtn_bp` network process | `AT_TRANSPORT=autonomous_trust.dtn.transport.DTNNetworkProcess` |
+| BP agents | `stub`, ION, µD3TN AAP v1 and AAP 2.0, chosen at build time (`AT_NET_DTN_BACKEND`) | `stub` and µD3TN AAP 2.0, chosen at start (`AT_DTN_BACKEND`) |
+
+`stub` is the default in both: it drops every send and never receives, so a
+node can be built and tested without an agent. µD3TN is reached at
+`AT_DTN_UD3TN_SOCKET` (`unix:/path` or `tcp:host:port`).
+
+**Naming.** A node registers three endpoints. `dtn://at-<first four uuid
+bytes>/peer` is its unicast endpoint and the source of everything it sends.
+`/bcast` and `/group` sit on `dtn://at-group-<first eight bytes of the group
+uuid>/`, or on the shared pre-join group (`AT-boot`) before the node has
+joined one. A unicast goes to the peer's address verbatim when that address is
+a `dtn:` or `ipn:` EID, else to the `/peer` endpoint of the peer whose address
+matches, else to `dtn://at-<address>/peer`. The `dtn` conformance protocol holds
+the two runtimes to the same EIDs.
+
+**Mixed networks.** The hybrid transport (`hybrid_net` in C,
+`autonomous_trust.core.network.hybrid` in Python) runs one node on several
+transports at once, such as UDP on the local cluster and a DTN leg to a cluster
+reachable only through a BP agent. A unicast takes the first leg that matches
+the target: an EID leg for `dtn:`/`ipn:`, a CIDR leg for an address inside it,
+else the default leg. Broadcasts go out on every leg. This is the gateway
+arrangement of §5 and [at-over-dtn.md §4.3](at-over-dtn.md).
+
+**Not built.** AT's own encryption (NaCl box per peer, the group key for the
+group) travels inside the bundle payload. Nothing adds BPSec blocks, and
+nothing requests custody transfer. Endpoints are per channel, not per AT
+process as at-over-dtn.md §2.1 sketches. Bundles ask for a 24-hour lifetime,
+which only the ION backend passes on; the µD3TN backends leave it to the
+daemon's default. A node registers its group endpoints when it starts, so one
+that joins a group later still receives on the pre-join group's. See
+[extensions.md](architecture/extensions.md) for how the extension attaches to
+each core.
+
 ---
 
 ## References
