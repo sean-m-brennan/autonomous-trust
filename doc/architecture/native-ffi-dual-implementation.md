@@ -103,6 +103,17 @@ function whose **argument count** disagrees:
 - **LATENT.** Drift in a `cdef`-only function nothing calls from Python yet:
  reported, fails only under `--strict`.
 
+It also checks **which library defines** each `cdef` function. Since the
+feature split the C tree is a core library plus extension libraries
+(`src/c/extensions/<feature>/`, `libat_<feature>.so`, see
+[extensions](extensions.md)). `lib` is bound to the core `.so` only, and each
+extension is loaded with a handle of its own, only so that its constructors
+run. A `cdef` function that moved into an extension keeps its arity and its
+structs, so the other checks stay green while `lib.<name>` fails at its first
+call. Such a function is DANGEROUS when a `_native` wrapper calls it and LATENT
+otherwise. The wrapper scan covers every distribution's `_native` half, not just
+the core's. `--only libraries` runs this check alone.
+
 It runs without the conda env, so it is safe as a fast pre-build gate in
 `scripts/ci-local.sh`.
 

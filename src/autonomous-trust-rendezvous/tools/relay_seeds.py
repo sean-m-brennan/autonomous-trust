@@ -11,8 +11,9 @@ Release signer (run offline, where the release seed lives):
     relay_seeds.py sign --seed-file F --seq N relay://[uuid:fp@]host:port ...  > relay_seeds.cfg.json
     relay_seeds.py verify relay_seeds.cfg.json [--key HEX]
 
-The public key goes into RELEASE_KEY in network/relay_seeds.py and into
-AT_RELAY_SEEDS_RELEASE_KEY in src/c/autonomous_trust/network/net_relay_seeds.h;
+The public key goes into RELEASE_KEY in
+src/autonomous-trust-rendezvous/autonomous_trust/rendezvous/_python/relay_seeds.py
+and into AT_RELAY_SEEDS_RELEASE_KEY in src/c/extensions/rendezvous/net_relay_seeds.h;
 the signed file ships as <cfg_dir>/relay_seeds.cfg.json.
 
 Operator, on the node (uses $AUTONOMOUS_TRUST_ROOT, signs with the node's own identity key):
