@@ -26,6 +26,7 @@
 
 #include "processes/processes.h"
 #include "processes/extension.h"
+#include "processes/plaintext_verbs.h"
 #include "structures/map.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
@@ -41,7 +42,6 @@
 #include "identity_priv.h"
 #include "id_proc_priv.h"
 #include "id_ext.h"
-#include "first_contact.h"
 #include "utilities/b64.h"
 #include "utilities/freshness.h"
 
@@ -280,40 +280,14 @@ static char ID_ATTEST_RESPONSE[] = "operator_attest_response";
  * IdentityProtocol.hierarchy / hierarchy_req. */
 static char ID_HIERARCHY[]       = "hierarchy_root";
 static char ID_HIERARCHY_QUERY[] = "hierarchy_query";
-/* First contact: the OPTIONAL 1:1 introduction handshake (opt-in via
- * AT_FIRST_CONTACT; identity/first_contact.c, doc/architecture/first-contact.md).
- * DISTINCT from the cohort vote: a node holding a signed invitation reaches the
- * inviter directly, and each side admits the other as a DIRECT peer
- * (identity_admit_direct_peer -- no group key) rather than as a group member.
- *
- * Both ride the OPEN unencrypted channel because the first hello arrives before
- * the sender is a known peer, exactly like ID_ACCEPT. They are deliberately NOT
- * bootstrap verbs: they confer no group membership and hand over no group key,
- * so the gateway boundary need not refuse them.
- *
- * Non-static (unlike the rest of this table) so identity/first_contact.c, which
- * sends and receives them, shares the definition instead of respelling it --
- * declared `extern` in first_contact.h. Mirrors Python IdentityProtocol.hello /
- * .hello_ack. */
-char ID_FC_HELLO[]     = "first_contact_hello";
-char ID_FC_HELLO_ACK[] = "first_contact_hello_ack";
-/* Directory contact (FIRST_CONTACT_PLAN Phase 3): the finder's request and
- * the holder's accept. Mirrors Python IdentityProtocol.contact_request /
- * .contact_accept. */
-char ID_FC_REQUEST[]   = "first_contact_request";
-char ID_FC_ACCEPT[]    = "first_contact_accept";
-/* One human, several devices (FIRST_CONTACT_PLAN Phase 4): our device cert,
- * sealed, to a contact; and a new device telling a contact it is one of
- * theirs, plaintext. Mirrors Python IdentityProtocol.device_cert /
- * .device_announce. */
-char ID_FC_DEVICE_CERT[]     = "device_cert";
-char ID_FC_DEVICE_ANNOUNCE[] = "device_announce";
-
-/* Verbs this protocol legitimately puts on the wire in PLAINTEXT
- * (Message encrypt=false), and the only ones a receiver accepts unencrypted
- * from a peer it already knows. Mirrors Python's
- * identity.protocol.UNENCRYPTED_VERBS one-for-one -- the two lists are a
+/* The CORE verbs this protocol legitimately puts on the wire in PLAINTEXT
+ * (Message encrypt=false), and so the core verbs a receiver accepts
+ * unencrypted from a peer it already knows. Mirrors Python's
+ * identity.protocol.CORE_UNENCRYPTED_VERBS one-for-one -- the two lists are a
  * cross-language contract, so a change here needs the same change there.
+ * Compiled in: no configuration adds to or removes from them. An optional
+ * feature's plaintext verbs (first contact's hello, ...) are granted by
+ * unencrypted_verbs.cfg.json instead (processes/plaintext_verbs.h).
  *
  * Kept beside the verb table on purpose: this is the one place that already
  * owns these strings, so drift is visible in a single screen.
@@ -332,19 +306,19 @@ static char *const ID_UNENCRYPTED_VERBS[] = {
     ID_ROSTER_RESPONSE,     /* subtree_roster_response */
     ID_PARTITION_PROBE,     /* group_partition_probe */
     ID_PARTITION_RESPONSE,  /* group_partition_response */
-    ID_FC_HELLO,            /* first_contact_hello -- arrives before the peer is known */
-    ID_FC_HELLO_ACK,        /* first_contact_hello_ack -- and so does the answer */
-    ID_FC_REQUEST,          /* first_contact_request -- found by handle, not yet a peer */
-    ID_FC_ACCEPT,           /* first_contact_accept -- the holder's answer */
-    ID_FC_DEVICE_ANNOUNCE,  /* device_announce -- a contact's new device, not yet a peer */
 };
 
-size_t identity_unencrypted_verb_count(void)
+size_t identity_core_unencrypted_verb_count(void)
 {
     return sizeof(ID_UNENCRYPTED_VERBS) / sizeof(ID_UNENCRYPTED_VERBS[0]);
 }
 
-bool identity_verb_is_unencrypted(const char *verb)
+size_t identity_unencrypted_verb_count(void)
+{
+    return identity_core_unencrypted_verb_count() + plaintext_verbs_granted_count();
+}
+
+bool identity_verb_is_core_unencrypted(const char *verb)
 {
     if (verb == NULL)
         return false;
@@ -354,6 +328,11 @@ bool identity_verb_is_unencrypted(const char *verb)
             return true;
     }
     return false;
+}
+
+bool identity_verb_is_unencrypted(const char *verb)
+{
+    return identity_verb_is_core_unencrypted(verb) || plaintext_verb_granted(verb);
 }
 
 /* The pre-admission handshake: the verbs that place a node INTO a group, and
@@ -1324,7 +1303,7 @@ static int _add_peer(process_t *proc, directory_t *queues,
 }
 
 /* No-vote, no-group-key admission of a DIRECT (1:1) peer -- the seam the
- * optional first-contact handshake admits through (identity/first_contact.c).
+ * optional first-contact handshake admits through (first_contact/first_contact.c).
  *
  * Records the peer exactly as a PROVISIONAL admission does (peers[], the local
  * activity broadcast, the app-facing peer_observed) so the encrypted P2P
@@ -6908,7 +6887,7 @@ static int _own_public_identity(const process_t *proc, public_identity_t *out)
 }
 
 /* Public wrapper over _own_public_identity, for the sibling translation units
- * that need this node's own published identity (identity/first_contact.c has to
+ * that need this node's own published identity (first_contact/first_contact.c has to
  * check that an invitation was minted by US). Declared in id_proc_priv.h. */
 int identity_own_public_identity(const process_t *proc, public_identity_t *out)
 {
@@ -7812,14 +7791,12 @@ int identity_register_handlers(process_t *proc)
      * (empty) until seeded — a leaf node then answers a roster query purely
      * locally, identical to today. See gateway-reputation-tree.md. */
     proc->protocol.roster_private = _roster_env_private();
-    /* Optional features (processes/extension.h): first contact, opt-in via
-     * AT_FIRST_CONTACT, is the first of them. Each checks its own gate here,
-     * so a normal node registers none of their handlers. Mirrors Python
-     * IdentityProcess.__init__'s load_extensions. */
-    at_first_contact_link();
-    /* Social (libat_social), ZTA (libat_zta) and any other feature library
-     * register here too; their consumers keep them in the link
-     * (at_social_link(), at_zta_link()). */
+    /* Optional features (processes/extension.h) register their handlers here,
+     * each behind its own gate, so a normal node registers none of them.
+     * Mirrors Python IdentityProcess.__init__'s load_extensions. First contact
+     * (libat_first_contact), social (libat_social), ZTA (libat_zta) and the
+     * rest are their consumers' to keep in the link (at_first_contact_link(),
+     * at_social_link(), at_zta_link()). */
     at_extensions_register_handlers(proc, "identity");
     return 0;
 }
@@ -7946,6 +7923,11 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
         return -1;
     /* Likewise a node whose zta_policy enables ZTA with no libat_zta. */
     if (identity_ext_check_config(NULL, logger) != 0)
+        return -1;
+    /* And a plaintext-verbs file this node cannot honour: malformed, naming a
+     * verb no enabled extension declares, or missing one an enabled extension
+     * needs (processes/plaintext_verbs.h). The network process applies it. */
+    if (plaintext_verbs_configure(NULL, logger) != 0)
         return -1;
 
     /* Daemonize first so messaging is available for pre-loop activity */

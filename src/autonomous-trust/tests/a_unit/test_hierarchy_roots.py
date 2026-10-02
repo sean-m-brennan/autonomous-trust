@@ -200,9 +200,9 @@ class TestAdvertise:
         msg = queues[CfgIds.network].get_nowait()
         assert msg.function == IdentityProtocol.hierarchy
         # Not in the plaintext allowlist: the topology rides the group channel.
-        from autonomous_trust.core.identity.protocol import UNENCRYPTED_VERBS
-        assert IdentityProtocol.hierarchy not in UNENCRYPTED_VERBS
-        assert IdentityProtocol.hierarchy_req not in UNENCRYPTED_VERBS
+        from autonomous_trust.core.identity.protocol import CORE_UNENCRYPTED_VERBS
+        assert IdentityProtocol.hierarchy not in CORE_UNENCRYPTED_VERBS
+        assert IdentityProtocol.hierarchy_req not in CORE_UNENCRYPTED_VERBS
 
     def test_refresh_records_derived_parent_then_advertises(self):
         me = _new_identity('me', '10.0.0.1')

@@ -38,7 +38,7 @@
 #include "identity/id_ext.h"   /* identity_ext_credential_anchored */
 #include "config/configuration.h"   /* get_cfg_dir, CFG_PATH_LEN */
 #include "config/discover.h"        /* CFG_FILE_EXT */
-#include "contacts/contacts.h"     /* the first-contact address book (trust seeds) */
+#include "reputation/rep_ext.h"   /* extensions' trust seeds */
 #include "reputation/rep_proc_priv.h"
 
 #define EREP_PAXOS 253
@@ -1565,6 +1565,8 @@ static void _handle_peer_standing(const process_t *proc,
         bool rated = reputations_contains(&rep_state.reputations, st->peer_uuid);
         double rescored = rated ? _score_peer_locked(proc, st->peer_uuid) : 0.0;
         pthread_mutex_unlock(&rep_state.lock);
+        if (rated)
+            _persist_reputations(proc);
         log_info(proc->logger,
                  "Standing[%s]: %s proved; unwind anchor set at chain index %d\n",
                  source, key, rep_state.history.next_index);
@@ -3614,6 +3616,10 @@ static bool handle_rep_request(const process_t *proc, directory_t *queues, gener
         pthread_mutex_lock(&rep_state.lock);
         score = _score_peer_locked(proc, peer_uuid);
         pthread_mutex_unlock(&rep_state.lock);
+        /* Python's _compute_reputation persists after every score, so the
+         * snapshot is live, not only a shutdown artifact; outside the lock
+         * because _persist_reputations takes it. */
+        _persist_reputations(proc);
     }
 
     /* Publish a tier_update IPC to identity if the score crossed a tier.
@@ -6946,9 +6952,17 @@ static void _persist_reputations(const process_t *proc)
         json_decref(current);
         return;
     }
-    if (json_dump_file(doc, path, JSON_INDENT(2)) != 0)
+    /* Rewritten after every score, so write-then-rename: a reader (or a
+     * restart after a crash mid-write) sees the old snapshot or the new one,
+     * never a truncated file that would cold-start the node. */
+    char tmp[sizeof(path) + 8] = {0};
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if (json_dump_file(doc, tmp, JSON_INDENT(2)) != 0 || rename(tmp, path) != 0)
+    {
+        unlink(tmp);
         log_warn(proc->logger,
                  "Reputation: could not persist snapshot to %s\n", path);
+    }
     json_decref(doc);
 }
 
@@ -7290,77 +7304,39 @@ static void _grade_restored_reputations(const process_t *proc, map_t *ceilings,
                  "evidence supports\n", clamped);
 }
 
-/* mtime of contacts.cfg.json as of the last seed pass. The identity process
- * rewrites that file on every handshake and every verification, so its mtime is
- * the cheap "anything new?" test that makes a per-iteration call affordable.
- * 0 == not yet read. */
-static double contact_seed_mtime;
-
-/* Give each VERIFIED first-contact contact its cold-start reputation prior.
- *
- * The C twin of Python _apply_contact_seeds (FIRST_CONTACT_PLAN.md §10.5), and
- * it reads the same file: contacts.cfg.json is already shared byte-for-byte
- * between the runtimes, which is why the seed travels through the store rather
- * than through a new identity->reputation message.
- *
- * The seed is a PRIOR, not a score. It is written only where this node has NO
- * reputation for the peer at all, so it can never overwrite an earned value, a
- * warm-started one, or a slashed one -- a contact cannot be verified back into
- * good standing. Both halves of the record are checked (verified AND a seed
- * above zero): the file is plain JSON in the user's data dir, so honouring a
- * hand-written trust_seed on an unverified record would make one editable float
- * into a reputation prior. */
-static void _apply_contact_seeds(const process_t *proc)
+/* An extension's cold-start prior (reputation/rep_ext.h): applied only where
+ * this node has NO reputation for the peer at all, so it can never overwrite an
+ * earned value, a warm-started one, or a slashed one. Refused, not clamped,
+ * outside (0, 1]. */
+static void _offer_seed(void *arg, const uuid_t who, double seed, const char *what)
 {
-    char data_dir[CFG_PATH_LEN + 1] = {0};
-    if (get_data_dir(data_dir, sizeof(data_dir)) <= 0)
-        return;
-    char path[CFG_PATH_LEN + 64] = {0};
-    if ((size_t)snprintf(path, sizeof(path), "%s/%s", data_dir,
-                         AT_CONTACTS_FILENAME) >= sizeof(path))
-        return;
-
-    struct stat st;
-    if (stat(path, &st) != 0)
-        return;         /* no contacts file at all: the norm for most nodes */
-    double mtime = (double)st.st_mtime;
-    if (mtime <= contact_seed_mtime)
-        return;         /* nothing written since the last pass */
-    contact_seed_mtime = mtime;
-
-    contacts_t store;
-    contacts_init(&store);
-    if (contacts_load(data_dir, &store) != 0) {
+    const rep_seed_provider_t *p = ((const void **)arg)[0];
+    const process_t *proc = ((const void **)arg)[1];
+    char uuid_s[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(who, uuid_s);
+    if (!(seed > 0.0 && seed <= 1.0)) {
         log_warn(proc->logger,
-                 "Reputation: contacts store unreadable; no trust seeds "
-                 "applied this pass\n");
-        contacts_free(&store);
+                 "Reputation: %s: refusing seed %g for %s (outside (0, 1])\n",
+                 p->name, seed, uuid_s);
         return;
     }
-    size_t total = contacts_count(&store);
-    for (size_t i = 0; i < total; i++) {
-        const contact_t *c = &store.items[i];
-        if (!c->verified || c->trust_seed <= 0.0)
-            continue;
-        /* Every device of the contact is its own node, each seeded on its own
-         * (Phase 4): the human was verified, the standing is not shared. */
-        for (size_t d = 0; d <= c->devices_count; d++) {
-            uuid_t who;
-            if (d == 0)
-                uuid_copy(who, c->identity.uuid);
-            else if (uuid_parse(c->devices[d - 1].uuid, who) != 0)
-                continue;
-            if (reputations_contains(&rep_state.reputations, who))
-                continue;   /* already known here; earned beats seeded */
-            reputations_update(&rep_state.reputations, who, c->trust_seed);
-            char uuid_s[UUID_STRING_LEN + 1] = {0};
-            uuid_unparse_lower(who, uuid_s);
-            log_info(proc->logger,
-                     "Reputation: first contact: seeded verified contact %s at "
-                     "%.2f\n", uuid_s, c->trust_seed);
-        }
+    if (reputations_contains(&rep_state.reputations, who))
+        return;     /* already known here; earned beats seeded */
+    reputations_update(&rep_state.reputations, who, seed);
+    log_info(proc->logger, "Reputation: %s: seeded %s %s at %.2f\n",
+             p->name, what != NULL ? what : "peer", uuid_s, seed);
+}
+
+/* Ask every seed provider for priors that are new since its last answer. First
+ * contact's seeds each VERIFIED contact (FIRST_CONTACT_PLAN.md §10.5). */
+static void _apply_seeds(const process_t *proc)
+{
+    const rep_seed_provider_t *ps[REP_SEED_PROVIDER_MAX];
+    size_t n = rep_seed_providers(ps, REP_SEED_PROVIDER_MAX);
+    for (size_t i = 0; i < n; i++) {
+        const void *arg[2] = { ps[i], proc };
+        ps[i]->seeds(proc, _offer_seed, (void *)arg);
     }
-    contacts_free(&store);
 }
 
 /* Treat the persisted snapshot's mtime as the instant of our last AT-bounded
@@ -7628,6 +7604,8 @@ static int _rescore_peers(const process_t *proc, double present,
         }
     }
     pthread_mutex_unlock(&rep_state.lock);
+    if (kept > 0)
+        _persist_reputations(proc);
 
     for (int i = 0; i < kept; i++)
     {
@@ -9196,9 +9174,10 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
      * clamp every score the evidence does not bear out. See doc/architecture/reputation.md and
      * doc/architecture/reputation.md. */
     _load_reputations(proc);
-    /* First-contact trust seeds, after the snapshot so a persisted value always
-     * wins, and before the idle fade so a seed ages like any other prior. */
-    _apply_contact_seeds(proc);
+    /* Extensions' trust seeds (first contact's verified contacts), after the
+     * snapshot so a persisted value always wins, and before the idle fade so a
+     * seed ages like any other prior. */
+    _apply_seeds(proc);
     _seed_idle_from_snapshot(proc, have_self ? self_str : NULL);
     _rebuild_from_evidence(proc, have_self ? self_str : NULL);
     /* Slash replay marks, before the loop can handle a slash_final. Also
@@ -9217,10 +9196,10 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
          * answers is the ordinary case, not an error, and this is the only
          * thing that clears it. Mirrors Python's call in process(). */
         _prune_resolve_state(proc);
-        /* A contact verified since boot gets its seed here; guarded by the
-         * contacts file's mtime, so the usual pass is one stat() and nothing
-         * else. Mirrors Python's call in process(). */
-        _apply_contact_seeds(proc);
+        /* A contact verified since boot gets its seed here; first contact's
+         * provider is guarded by the contacts file's mtime, so the usual pass
+         * is one stat() and nothing else. Mirrors Python's call in process(). */
+        _apply_seeds(proc);
         _decay_reputations(proc, present);
         if (!have_self)
         {

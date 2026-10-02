@@ -41,7 +41,13 @@ from .adapters.physics import PhysicsAdapter
 from .adapters.calibration import CalibrationAdapter
 from .adapters.prequential import PrequentialAdapter
 from .adapters.certificate import CertificateAdapter
-from .adapters.contacts import ContactsAdapter
+try:
+    # First contact is an extension (FEATURE_SPLIT_PLAN Phase 7): without it,
+    # its contacts protocol has no adapter and skips, as C's does without
+    # libat_first_contact.
+    from .adapters.contacts import ContactsAdapter
+except ImportError:
+    ContactsAdapter = None
 from .adapters.replication import ReplicationAdapter
 from .adapters.identity import IdentityAdapter
 from .adapters.negotiation import NegotiationAdapter
@@ -112,7 +118,8 @@ def _adapters() -> dict[str, Any]:
         'calibration': CalibrationAdapter(corpus_root=CORPUS_ROOT),
         'prequential': PrequentialAdapter(corpus_root=CORPUS_ROOT),
         'replication': ReplicationAdapter(corpus_root=CORPUS_ROOT),
-        'contacts': ContactsAdapter(corpus_root=CORPUS_ROOT),
+        **({'contacts': ContactsAdapter(corpus_root=CORPUS_ROOT)}
+           if ContactsAdapter is not None else {}),
         **_plugin_adapters(),
     }
 

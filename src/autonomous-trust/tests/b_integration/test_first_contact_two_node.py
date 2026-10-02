@@ -48,6 +48,8 @@ from autonomous_trust.core import AutonomousTrust, Process
 from autonomous_trust.core.config import Configuration
 from autonomous_trust.core.config.generate import generate_identity
 from autonomous_trust.core.system import comm_port
+from autonomous_trust.core import plaintext_verbs
+from autonomous_trust.first_contact import first_contact
 from .test_two_node import MP_CTX, _make_node_dir, _mock_addresses, _patch_loopback
 from .. import TEST_DIR
 
@@ -73,7 +75,7 @@ def _run_node(cfg_dir, ip_addr, q_in, q_out, log_file):
 def _await(q_out, want, seen, timeout=STEP_TIMEOUT):
     """The first FirstContactEvent on ``q_out`` matching ``want``; every event
     read is appended to ``seen`` for the failure message."""
-    from autonomous_trust.core.identity.first_contact import FirstContactEvent
+    from autonomous_trust.first_contact.first_contact import FirstContactEvent
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -99,6 +101,8 @@ def strangers():
         with patch('autonomous_trust.core.network.network.Network.get_addresses',
                    return_value=_mock_addresses(ip)):
             generate_identity(cfg_dir, randomize=True, seed=int(ip.split('.')[-1]))
+        # First contact's plaintext verbs: granted, as a deployment must.
+        plaintext_verbs.write(cfg_dir, first_contact.EXTENSION.plaintext_verbs)
         log_dir = os.path.join(base, name, 'var', 'at')
         os.makedirs(log_dir, exist_ok=True)
         nodes[name] = {'cfg_dir': cfg_dir, 'ip': ip, 'data_dir': log_dir,
@@ -109,13 +113,13 @@ def strangers():
 
 
 def _contacts(node):
-    from autonomous_trust.core.contacts import Contacts
+    from autonomous_trust.first_contact import Contacts
     return Contacts.load(node['data_dir'])
 
 
 def test_two_strangers_add_each_other_over_real_sockets(strangers):
     from autonomous_trust.core.app_verbs import AppRequest
-    from autonomous_trust.core.identity import first_contact as fc
+    from autonomous_trust.first_contact import first_contact as fc
 
     alice, bob = strangers['alice'], strangers['bob']
     procs = []

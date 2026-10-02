@@ -58,7 +58,6 @@
 #ifdef AT_CONF_ORACLE_REPLICATION
 #include "adapters/replication.h"
 #endif
-#include "adapters/contacts.h"
 #include "conformance_registry.h"
 
 /* Adapters that handle kind:negative need the JSON corpus root to resolve
@@ -102,8 +101,6 @@ static void dispatch(const at_case_t *c, at_case_result_t *out) {
     } else if (strcmp(c->protocol, "replication") == 0) {
         at_replication_conformance_run(c, out);
 #endif
-    } else if (strcmp(c->protocol, "contacts") == 0) {
-        at_contacts_run(c, out);
     } else {
         /* An extension's own protocol (conformance_registry.h). */
         for (const at_conf_adapter_t *a = at_conf_ext_adapters; a->protocol; a++) {
