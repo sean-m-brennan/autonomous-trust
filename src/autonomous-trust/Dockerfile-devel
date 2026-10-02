@@ -94,6 +94,7 @@ COPY --chown=user:user src/autonomous-trust-oracle/autonomous_trust/oracle auton
 COPY --chown=user:user src/autonomous-trust-zta/autonomous_trust/zta autonomous_trust/zta
 COPY --chown=user:user src/autonomous-trust-rendezvous/autonomous_trust/rendezvous autonomous_trust/rendezvous
 COPY --chown=user:user src/autonomous-trust-first-contact/autonomous_trust/first_contact autonomous_trust/first_contact
+COPY --chown=user:user src/autonomous-trust-dtn/autonomous_trust/dtn autonomous_trust/dtn
 RUN rm -rf autonomous_trust/etc autonomous_trust/var
 
 # if using rust, swap with lines below

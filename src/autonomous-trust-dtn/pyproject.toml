@@ -1,0 +1,29 @@
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "autonomous_trust_dtn"
+version = "0.2.1"
+description = "AutonomousTrust DTN: the Bundle Protocol network transport (stub and µD3TN AAP 2.0 backends)"
+authors = ["Sean M Brennan <sean.brennan@tekfive.com>"]
+readme = "README.md"
+packages = [{include = "autonomous_trust"}]
+# The AAP 2.0 bindings are generated (scripts/build-py.sh) and gitignored, so
+# they are named here to reach the sdist, as the core's protobuf modules are.
+include = ["autonomous_trust/dtn/_python/aap2_pb2.py"]
+exclude = ["**/__pycache__"]
+
+[project]
+name = "autonomous_trust_dtn"
+version = "0.2.1"
+
+# How an installed core finds DTN (autonomous_trust.core.extensions).
+[project.entry-points."autonomous_trust.extensions"]
+dtn = "autonomous_trust.dtn._at_extension:EXTENSION"
+
+[tool.poetry.dependencies]
+python = "^3.13"
+autonomous-trust = ">=0.2.1"
+# The µD3TN AAP 2.0 backend's messages (aap2_pb2.py).
+protobuf = ">=4.21"

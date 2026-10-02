@@ -1,0 +1,32 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: "1"
+kind: "scenario"
+protocol: "dtn"
+name: "peer-eid-from-matching-address"
+description: |
+  A target that is exactly a peer's address goes to that peer's /peer EID.
+byte_pinning: false
+participants:
+  - id: "host"
+    role: "recipient"
+fixtures:
+  dtn:
+    op: "peer_eid"
+    target: "10.0.0.5"
+    peers:
+      - address: "10.0.0.4"
+        uuid: "aabbccdd-1122-4000-8000-000000000001"
+      - address: "10.0.0.5"
+        uuid: "bbbbbbbb-0000-4000-8000-000000000002"
+steps:
+  - id: 1
+    from: "host"
+    to: "host"
+    function: "peer_eid"
+    description: "trigger: peer_eid"
+expected_state:
+  host:
+    eid: "dtn://at-bbbbbbbb/peer"

@@ -1,0 +1,30 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: "1"
+kind: "scenario"
+protocol: "dtn"
+name: "peer-eid-dtn-literal-verbatim"
+description: |
+  A dtn: target is used verbatim, even when a peer has it as its address.
+byte_pinning: false
+participants:
+  - id: "host"
+    role: "recipient"
+fixtures:
+  dtn:
+    op: "peer_eid"
+    target: "dtn://elsewhere/x"
+    peers:
+      - address: "dtn://elsewhere/x"
+        uuid: "aabbccdd-1122-4000-8000-000000000001"
+steps:
+  - id: 1
+    from: "host"
+    to: "host"
+    function: "peer_eid"
+    description: "trigger: peer_eid"
+expected_state:
+  host:
+    eid: "dtn://elsewhere/x"

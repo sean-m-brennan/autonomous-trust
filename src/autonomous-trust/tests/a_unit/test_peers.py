@@ -120,6 +120,18 @@ class TestPeers:
         found = p.find_by_address('10.0.0.1/24')
         assert found is peer
 
+    def test_find_by_address_keeps_an_eid_whole(self):
+        # A DTN EID's slashes are its own; cutting at the first one used to
+        # collapse every EID-addressed peer to "dtn:".
+        p = Peers()
+        a = _mock_peer(nickname='a', address='dtn://at-aaaaaaaa/peer')
+        b = _mock_peer(nickname='b', address='dtn://at-bbbbbbbb/peer')
+        p.add(a)
+        p.add(b)
+        assert p.find_by_address('dtn://at-aaaaaaaa/peer') is a
+        assert p.find_by_address('dtn://at-bbbbbbbb/peer') is b
+        assert p.find_by_address('dtn:') is None
+
     def test_find_by_address_not_found(self):
         p = Peers()
         assert p.find_by_address('1.2.3.4') is None

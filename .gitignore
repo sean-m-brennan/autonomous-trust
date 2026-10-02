@@ -219,3 +219,4 @@ embedded/signing.pub
 /brag-output1/
 /doc/brag/brag.mp4
 /src/c/extensions/zta/test/zta_test_ca/output/
+/src/autonomous-trust-dtn/autonomous_trust/dtn/_python/aap2_pb2.py

@@ -49,6 +49,19 @@ DEFINE_TEST(test_every_registration_survived_the_link)
     ck_assert(identity_ext_present("zta"));
     ck_assert_ptr_nonnull(find_configuration("zta_policy"));
     ck_assert_ptr_nonnull(find_process("zta_proc"));
+    /* ...and it is a default subsystem, so a generated configuration starts it,
+     * and one that lists it is not refused. */
+    const char *keys[AT_SUBSYSTEM_EXT_MAX], *impls[AT_SUBSYSTEM_EXT_MAX];
+    size_t n = subsystem_defaults(keys, impls, AT_SUBSYSTEM_EXT_MAX);
+    bool listed = false;
+    for (size_t i = 0; i < n; i++)
+        listed = listed || (strcmp(keys[i], "zta_verify") == 0 && strcmp(impls[i], "zta_proc") == 0);
+    ck_assert(listed);
+    tracker_t tracker;
+    ck_assert_int_eq(tracker_init(NULL, &tracker), 0);
+    ck_assert_int_eq(tracker_register_subsystem(&tracker, "zta_verify", "zta_proc"), 0);
+    ck_assert_int_eq(tracker_check_subsystem_libraries(&tracker, NULL), 0);
+    tracker_free(&tracker);
     ck_assert_ptr_nonnull(at_msg_type_lookup(ZTA_REVOCATION_ALERT));
     ck_assert_ptr_nonnull(at_msg_type_lookup(ZTA_VERIFICATION_RESULT));
     ck_assert_str_eq(_custom_errstr(EX509_CALOAD), "EX509_CALOAD");

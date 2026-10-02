@@ -189,7 +189,12 @@ class Extension:
     UNENCRYPTED from a known peer. Declaring them grants nothing: the
     operator's ``unencrypted_verbs.cfg.json`` must name them, and an enabled
     extension whose verbs it does not name refuses the start
-    (:mod:`.plaintext_verbs`)."""
+    (:mod:`.plaintext_verbs`).
+
+    ``transports`` is ``((kind, class path), ...)``: network transports this
+    feature supplies, under the name C registers them by (``dtn_bp``), so the
+    hybrid transport can open one as a leg (:func:`transport_class`). A node
+    can also name the class path as its transport directly."""
     name: str
     enabled: Callable[[], bool]
     register_handlers: Callable[[Any, str], None]
@@ -202,6 +207,7 @@ class Extension:
     reputation: Optional[ReputationHooks] = None
     network: Optional[NetworkHooks] = None
     plaintext_verbs: tuple = ()
+    transports: tuple = ()
 
 
 def _builtin() -> list[Extension]:
@@ -278,6 +284,17 @@ def all_extensions() -> list[Extension]:
             continue
         seen[ext.name] = ext
     return list(seen.values())
+
+
+def transport_class(kind: str):
+    """The class path an extension registers for transport ``kind``, or None.
+    Looked up among the extensions present, enabled or not: a transport is
+    chosen by configuration, not switched by a feature flag."""
+    for ext in all_extensions():
+        for name, path in ext.transports:
+            if name == kind:
+                return path
+    return None
 
 
 def load_extensions(proc, proc_name: str) -> list[str]:

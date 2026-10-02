@@ -536,6 +536,8 @@ def test_process_rebinds_receiver_socket_timeouts():
 
     nproc = NetworkProcess.__new__(NetworkProcess)
     nproc.socket_timeout = 0.1
+    # process() applies the plaintext-verb policy first, and logs through this.
+    nproc.logger = MagicMock()
 
     captured: dict = {'ptp': None, 'grp': None, 'cast': None}
 

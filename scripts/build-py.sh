@@ -88,6 +88,22 @@ while IFS= read -r -d '' dir; do
   touch "$dir/__init__.py"
 done < <(find "$protobuf_py" -type d -name '__pycache__' -prune -o -type d -print0)
 
+# The DTN extension's µD3TN AAP 2.0 bindings (src/autonomous-trust-dtn), from
+# the vendored schema its C twin also builds from. A single module, beside the
+# backend that imports it, so no __init__.py seeding.
+aap2_src=src/c/extensions/dtn/proto
+aap2_py=src/autonomous-trust-dtn/autonomous_trust/dtn/_python
+if [[ -f $aap2_src/aap2.proto ]]; then
+  if ! protoc --python_out=$aap2_py -I $aap2_src $aap2_src/aap2.proto; then
+    echo "ERROR: protoc failed on $aap2_src/aap2.proto; $aap2_py/aap2_pb2.py is unchanged." >&2
+    exit 1
+  fi
+else
+  # The schema is a symlink into the ud3tn submodule.
+  echo "WARNING: $aap2_src/aap2.proto is missing (git submodule update --init" >&2
+  echo "  src/c/third_party/ud3tn); the DTN extension's ud3tnv2 backend will refuse to open." >&2
+fi
+
 if [[ "$*" != *"proto-only"* ]]; then
   # Create and extract distros
   rm -rf dist
@@ -98,6 +114,7 @@ if [[ "$*" != *"proto-only"* ]]; then
   poetry build --format sdist -C src/autonomous-trust-zta -o $dist_dir
   poetry build --format sdist -C src/autonomous-trust-rendezvous -o $dist_dir
   poetry build --format sdist -C src/autonomous-trust-first-contact -o $dist_dir
+  poetry build --format sdist -C src/autonomous-trust-dtn -o $dist_dir
   poetry build --format sdist -C src/autonomous-trust-inspector -o $dist_dir
   poetry build --format sdist -C src/autonomous-trust-services -o $dist_dir
   poetry build --format sdist -C src/autonomous-trust-simulator -o $dist_dir

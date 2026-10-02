@@ -814,6 +814,10 @@ add_executable(reputation_test test/reputation_test.c)
 set_source_files_properties(test/reputation_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(reputation_test PRIVATE ${AT_TEST_LIBS} m)
 
+add_executable(peers_address_test test/peers_address_test.c)
+set_source_files_properties(test/peers_address_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(peers_address_test PRIVATE ${AT_TEST_LIBS})
+
 add_executable(history_test test/history_test.c)
 set_source_files_properties(test/history_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(history_test PRIVATE ${AT_TEST_LIBS})
@@ -979,6 +983,7 @@ add_test(NAME at_jansson_test COMMAND $<TARGET_FILE:at_jansson_test>)
 add_test(NAME negotiation_test COMMAND $<TARGET_FILE:negotiation_test>)
 add_test(NAME reputation_test COMMAND $<TARGET_FILE:reputation_test>)
 add_test(NAME history_test COMMAND $<TARGET_FILE:history_test>)
+add_test(NAME peers_address_test COMMAND $<TARGET_FILE:peers_address_test>)
 add_test(NAME queue_pool_test COMMAND $<TARGET_FILE:queue_pool_test>)
 add_test(NAME network_test COMMAND $<TARGET_FILE:network_test>)
 add_test(NAME identity_test COMMAND $<TARGET_FILE:identity_test>)
@@ -1326,13 +1331,13 @@ endif() # LIBCHECK_LIBRARY
 # Extension libraries (src/c/extensions/): built by this project, after the
 # core targets and AT_TEST_LIBS, because they use the core's private headers
 # and flags. See doc/architecture/extensions.md.
+include(extensions/at_extension.cmake)
 if(AT_NET_DTN)
     add_subdirectory(extensions/dtn)
 endif()
 if(AT_NET_GATEWAY)
     add_subdirectory(extensions/gateway)
 endif()
-include(extensions/at_extension.cmake)
 # Certificates before replication, which links it.
 foreach(_layer PHYSICS CALIBRATION CERTIFICATES PREQUENTIAL REPLICATION)
     if(AT_ORACLE_${_layer})

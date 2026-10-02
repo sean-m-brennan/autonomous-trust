@@ -1,0 +1,32 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: "1"
+kind: "scenario"
+protocol: "dtn"
+name: "route-v6-cidr"
+description: |
+  An IPv6 CIDR takes an IPv6 address inside it.
+byte_pinning: false
+participants:
+  - id: "host"
+    role: "recipient"
+fixtures:
+  dtn:
+    op: "route"
+    inners:
+      - kind: "udp_net_4"
+        match_cidr: "10.0.0.0/8"
+      - kind: "udp_net_4"
+        match_cidr: "fd00::/64"
+    target: "fd00::5"
+steps:
+  - id: 1
+    from: "host"
+    to: "host"
+    function: "route"
+    description: "trigger: route"
+expected_state:
+  host:
+    leg: 1

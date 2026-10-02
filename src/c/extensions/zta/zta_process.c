@@ -20,6 +20,7 @@
 #include <jansson.h>
 
 #include "processes/processes.h"
+#include "processes/process_tracker.h"
 #include "utilities/message.h"
 #include "utilities/msg_types.h"
 #include "utilities/util.h"
@@ -917,6 +918,10 @@ int zta_process_run(process_t *proc, directory_t *queues,
 /* An extension library's process: the core's generated table does not scan
  * src/c/extensions, so it registers itself (process_tracker.h). */
 DEFINE_PROCESS(zta_verify, zta_proc, zta_process_run)
+/* Started by default once libat_zta is linked (AT_ZTA, still OFF by default):
+ * before this, no generated configuration listed it, so background
+ * re-verification ran only where an operator added it by hand. */
+DEFINE_SUBSYSTEM(zta_verify, "zta_verify", "zta_proc")
 
 /* Keeps the registration above in a static link (at_zta_link). */
 void at_zta_process_link(void) {}
