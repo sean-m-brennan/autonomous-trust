@@ -73,6 +73,12 @@ function(add_at_example target source)
     if(TARGET at_rendezvous_static)
         list(APPEND _at_ext_libs at_rendezvous_static)
     endif()
+    if(TARGET at_fleet_static)
+        list(APPEND _at_ext_libs at_fleet_static)
+    endif()
+    if(TARGET at_data_source_static)
+        list(APPEND _at_ext_libs at_data_source_static)
+    endif()
     # ZTA (AT_ZTA builds libat_zta, which brings OpenSSL).
     set(_at_ext_deps)
     if(TARGET at_zta_static)
@@ -114,9 +120,12 @@ endfunction()
 add_at_example(at_example ../src/c/example.c)
 
 # ----- Demo app (fleet update, containerized) -----
-add_at_example(at_demo demo/src/at_demo.c)
-if(AT_STATIC)
-    target_link_libraries(at_demo PRIVATE -static stdc++ m)
+# It drives fleet's update pipeline, so it needs libat_fleet (AT_FLEET_LIB).
+if(TARGET at_fleet_static)
+    add_at_example(at_demo demo/src/at_demo.c)
+    if(AT_STATIC)
+        target_link_libraries(at_demo PRIVATE -static stdc++ m)
+    endif()
 endif()
 
 # ----- ZTA demo app (DDIL, OCSP, delegated verification) -----

@@ -468,25 +468,16 @@ int generate_subsystems_config(const char *cfg_dir)
     err = tracker_register_subsystem(&tracker, "reputation", "rep_proc");
     if (err != 0)
         return err;
-    err = tracker_register_subsystem(&tracker, "fleet", "fleet_proc");
-    if (err != 0)
-        return err;
-    err = tracker_register_subsystem(&tracker, "artifact", "artifact_proc");
-    if (err != 0)
-        return err;
-    err = tracker_register_subsystem(&tracker, "update", "update_proc");
-    if (err != 0)
-        return err;
-    err = tracker_register_subsystem(&tracker, "config", "config_proc");
-    if (err != 0)
-        return err;
-    /* ISR data-source service (C counterpart of Python DataProcess). Subsystem
-     * key "data-source" becomes the process queue name net_proc routes inbound
-     * subscribe requests to (route_to_process), and must match the wire name the
-     * coordinator's DataRcvr addresses (Python DataProcess.name). */
-    err = tracker_register_subsystem(&tracker, "data-source", "data_source_proc");
-    if (err != 0)
-        return err;
+    /* The subsystems linked extensions provide (DEFINE_SUBSYSTEM): fleet's
+     * four and the data-source service, when their libraries are linked
+     * (FEATURE_SPLIT_PLAN Phase 8). */
+    const char *keys[AT_SUBSYSTEM_EXT_MAX], *impls[AT_SUBSYSTEM_EXT_MAX];
+    size_t n_ext = subsystem_defaults(keys, impls, AT_SUBSYSTEM_EXT_MAX);
+    for (size_t i = 0; i < n_ext; i++) {
+        err = tracker_register_subsystem(&tracker, keys[i], impls[i]);
+        if (err != 0)
+            return err;
+    }
 
     char filepath[CFG_PATH_LEN + 1];
     if (path_join(filepath, sizeof(filepath), cfg_dir, default_tracker_filename) < 0)

@@ -70,7 +70,7 @@ and reads or writes the payload through `AT_MSG_EXT(msg, T)`.
 | 1–999 | core (`message_type_t`); never registrable |
 | 1000–1999 | social (Agora's `at-social/c/social/social_msg_types.h`, 1000–1011 used) |
 | 2000–2099 | ZTA (`zta/zta_msg_types.h`, 2000–2001 used) |
-| 2100–2199 | fleet (reserved) |
+| 2100–2199 | fleet (`fleet/fleet_proc.h`, 2100 used: `FLEET_UPDATE_ACCEPTED`) |
 | 2200–2219 | first contact (`first_contact/first_contact.h`, 2200–2201 used: `FIRST_CONTACT_EVENT`, `FIRST_CONTACT_CONTACT_EVENT`) |
 | 2220–2229 | rendezvous (`rendezvous/rdv_roster.c`, 2220 used: `RENDEZVOUS_ROSTER_EVENT`) |
 | 2300–2309 | stele (Stele's `at-stele/c/stele/stele_msg_types.h`) |
@@ -246,6 +246,22 @@ name or runner, a name already in the table and a full table, where it once
 wrote past the end of the array. Its constructor is `static`, because
 `__COUNTER__` restarts in every translation unit and two extensions would
 otherwise both define `register_process_0`.
+
+A process in the table is only startable. A node starts the subsystems its
+`subsystems.cfg.json` lists, which `generate_subsystems_config` writes the
+first time. An extension that should run by default adds itself there with
+
+```c
+DEFINE_SUBSYSTEM(fleet, "fleet", "fleet_proc")
+```
+
+(`subsystem_default_register`, eight slots, the same refusals), and the
+generator appends what is registered after the core's own four, so a fresh
+configuration names a feature's subsystem exactly when its library is linked.
+A capability an extension declares registers the same way, with
+`DEFINE_CAPABILITY` (`capability_table_append`). Since Phase 8 the generator
+does not scan `src/c/extensions/` at all, because an extension's rows must
+come from its own constructors and its headers must stay out of the core.
 
 **DTN is the first extension library.** It lives in `src/c/extensions/dtn/`,
 outside the generator's scan root, and builds when `AT_NET_DTN=ON`:
@@ -775,6 +791,45 @@ moved with it. `test_relay.py` was split: the relay tests stayed with it, and
 the fourteen where first contact meets the relay moved to first contact's
 `test_first_contact_relay.py`.
 
+## Fleet and data source (`libat_fleet`, `libat_data_source`)
+
+Fleet (consensus on software updates, artifact transfer, the update and
+config-distribution processes) and the data-source ingest process left the C
+core in FEATURE_SPLIT_PLAN Phase 8. Neither had a Python twin in the core;
+Python's ingest is the services distribution's. Both are **off by default**
+(`AT_FLEET_LIB`, `AT_DATA_SOURCE_LIB`), as ZTA is, and the C Docker images, the
+test scripts and the interop script turn them on. `at_demo` drives fleet's
+update pipeline, so `examples/` builds it only with fleet.
+
+`src/c/extensions/fleet/` registers fleet's four processes and their default
+subsystems (`fleet`, `artifact`, `update`, `config`), and
+`src/c/extensions/data_source/` its process, the `data-source` subsystem and
+the `data` capability, all from constructors. Neither has a link anchor: their
+consumers link them whole, as `examples/` and the tests do.
+
+**Refusals.** A node whose configuration starts one of these subsystems but
+was built without the library refuses to start, naming the library
+(`tracker_check_subsystem_libraries`, before any process starts). The table is
+names only, like the other declaration tables. A configuration generated before
+Phase 8 lists all five subsystems, so a default build refuses it until it is
+regenerated or the libraries are built.
+
+**Message types.** Fleet's three core types became reserved slots 10–12
+(`MSG_TYPE_RETIRED_10`..`12`), so no later core type renumbers. `UPDATE_VOTE`
+was never sent and the typed `UPDATE_PROPOSAL` the main loop forwarded had no
+producer, so neither has a replacement. `UPDATE_ACCEPTED` is fleet's app-bound
+`FLEET_UPDATE_ACCEPTED` (2100), which the main loop forwards to the app like any
+registered app-bound type.
+
+**The app's proposal.** An app proposes an update with the app verb
+`app_fleet_propose` (`AT_APP_FLEET_PROPOSE`, registered to `fleet`), carrying
+`version`, `artifact_hash` (64 hex), `target_arch` and
+`min_proposer_reputation`. An app holds no private key, so the node builds the
+proposal, signs it with its own identity key and names itself the signer, then
+runs it through the same signature check and vote a peer's proposal gets. A
+frame from the wire is refused. `fleet_propose_update()` is still there for a
+program that holds its own signing key, as `at_demo` does.
+
 ## External extensions and conformance plug-ins
 
 An extension need not live in this repository. Agora's social
@@ -886,6 +941,7 @@ depends on the feature calls it:
 | `at_first_contact_link()` (`libat_first_contact`) | nothing in the core: first contact's consumers own its link (the conformance runner and the core tests with a first-contact half link it whole; `examples/` adds it to every demo) |
 | `at_rendezvous_link()` (`libat_rendezvous`) | nothing in the core: rendezvous's consumers own its link, as first contact's do. It reaches `rdv_net.c` as well as the roster verbs, so both objects' registrations survive |
 | `at_dtn_link()` | nothing in the core: DTN's consumers own its link |
+| none (`libat_fleet`, `libat_data_source`) | nothing in the core: their consumers link them whole (`examples/`, the tests) |
 | `at_gateway_link()` | nothing in the core: the gateway's consumers own its link |
 | `at_physics_link()`, `at_calibration_link()`, `at_certificates_link()`, `at_prequential_link()`, `at_replication_link()` | nothing in the core. en-at's `EmbeddedAtNode` calls each one its build found (see below) |
 
@@ -924,6 +980,16 @@ whether it built.
   transport and process registration and their refusals. It links the core
   alone, plus `libat_first_contact` when that is built, so it also asserts
   `dtn_bp` is absent.
+  It also pins the core-only half of Phase 8: no fleet or data-source process,
+  default subsystem or `data` capability, a generated configuration that names
+  none of them, and a configuration that does is refused; and the two new
+  registries' refusals.
+- `extensions/fleet/test/fleet_ext_test.c`: with `libat_fleet` linked, its four
+  processes and subsystems are there and accepted, `app_fleet_propose` targets
+  `fleet`, `FLEET_UPDATE_ACCEPTED` is app-bound in fleet's range, and the app's
+  proposal is signed by the node, names it the signer, and starts the vote;
+  refused from the wire or malformed, nothing is sent. `data_source_test` does
+  the same for the data-source process, subsystem and capability.
 - `extensions/dtn/test/dtn_link_test.c`: with `at_dtn_static` linked,
   `net_transport_find("dtn_bp")` and `find_process("dtn_bp")` resolve
   (FEATURE_SPLIT_PLAN.md §5.3).
@@ -986,6 +1052,18 @@ whether it built.
 
 - The core references no feature's anchor any more: with rendezvous and first
   contact out (Phase 7), every feature's consumers own its link.
+- Fleet's app verb has no flat-ABI sender, and `FLEET_UPDATE_ACCEPTED` no event
+  kind or decoder, so an app on `at_app_events_*` can neither propose nor hear
+  an acceptance; an embedding C program sends the verb itself. The core's
+  `UPDATE_ACCEPTED` was no more decodable before Phase 8.
+- A fleet proposal is verified only against the key its message carries.
+  Nothing checks that the key is the `signer_uuid`'s or one allowed to propose,
+  and the proposer chooses its own `min_proposer_reputation`. Phase 8 moved this
+  as it was.
+- ZTA's `zta_verify` process has never been in a generated subsystem list, so
+  in C its background re-verification runs only if an operator adds it to
+  `subsystems.cfg.json`. `DEFINE_SUBSYSTEM` is the one-line fix; it has not been
+  made.
 - Social's locking differs between the runtimes: C has a leaf lock of its own,
   and Python keeps the one `proc.lock`. In C a tier and a block are therefore
   two snapshots. Conformance is deterministic and cannot show a timing

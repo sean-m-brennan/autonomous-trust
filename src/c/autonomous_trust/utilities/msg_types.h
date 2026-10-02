@@ -46,9 +46,14 @@ typedef enum {
     TASK_STATUS,             /**< Task status update. */
     TASK_RESULT,             /**< Task completion payload. */
     TRANSACTION_SCORE,       /**< Reputation transaction score. */
-    UPDATE_PROPOSAL,         /**< Fleet update proposal. */
-    UPDATE_VOTE,             /**< Vote on an update proposal. */
-    UPDATE_ACCEPTED,         /**< Announcement that an update was accepted. */
+    /* 10-12 were fleet's UPDATE_PROPOSAL, UPDATE_VOTE and UPDATE_ACCEPTED.
+     * Fleet is an extension now (libat_fleet, FEATURE_SPLIT_PLAN Phase 8):
+     * an app proposes through the app_fleet_propose verb, and the acceptance
+     * is fleet's registered FLEET_UPDATE_ACCEPTED. Kept as slots so no later
+     * core type renumbers. */
+    MSG_TYPE_RETIRED_10,     /**< Reserved; never sent. */
+    MSG_TYPE_RETIRED_11,     /**< Reserved; never sent. */
+    MSG_TYPE_RETIRED_12,     /**< Reserved; never sent. */
     PEER_RTT_UPDATE,         /**< Net-proc → sibling processes: peer RTT telemetry. Local IPC only — not part of identity.proto / public_identity_t network serialization. */
     PEER_OBSERVED,           /**< Identity → app: one observed peer (@ref peer_observed_msg_t). Local IPC only. */
     PEER_REPUTATION,         /**< Reputation → app: one peer's earned score (@ref peer_reputation_msg_t). Local IPC only. */
@@ -207,18 +212,6 @@ typedef struct {
     bool   attested;
     char   evidence_digest[64 + 1];
 } tx_score_msg_t;
-
-typedef struct {
-    uuid_t proposal_uuid;
-    uuid_t voter_uuid;
-    bool accept;
-} update_vote_msg_t;
-
-typedef struct {
-    uuid_t proposal_uuid;
-    int accept_count;
-    int reject_count;
-} update_accepted_msg_t;
 
 /**
  * @brief Net-proc → sibling processes: latest per-peer RTT estimate.
@@ -513,8 +506,6 @@ typedef struct
         task_status_msg_t task_status;
         task_result_msg_t task_result;
         tx_score_msg_t tx_score;
-        update_vote_msg_t update_vote;
-        update_accepted_msg_t update_accepted;
         peer_rtt_update_msg_t peer_rtt_update;
         peer_observed_msg_t peer_observed;
         peer_reputation_msg_t peer_reputation;

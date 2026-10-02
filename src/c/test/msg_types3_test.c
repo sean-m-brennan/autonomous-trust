@@ -312,12 +312,23 @@ DEFINE_TEST(test_group_multicast_is_core_and_omitted_when_false)
  * but never decoded, so they were dropped at every real IPC hop. The
  * conformance harness's messaging hook bypasses serialization and could not
  * see it. Walks the whole enum, so a type added to one list only fails here. */
+static bool _retired(long t)
+{
+    return t == MSG_TYPE_RETIRED_10 || t == MSG_TYPE_RETIRED_11 || t == MSG_TYPE_RETIRED_12;
+}
+
 DEFINE_TEST(test_every_type_name_round_trips)
 {
     ck_assert(sodium_init() >= 0);
     for (long t = SIGNAL; t <= PEER_STANDING; t++)
     {
         const char *name = message_type_to_string((message_type_t)t);
+        if (_retired(t)) {
+            /* Fleet's old slots (FEATURE_SPLIT_PLAN Phase 8): never sent, so
+             * nameless, and no name maps back to them. */
+            ck_assert(string_to_message_type(name) != (message_type_t)t);
+            continue;
+        }
         ck_assert(name[0] != '\0');
         ck_assert_int_eq((long)string_to_message_type(name), t);
     }

@@ -24,8 +24,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "autonomous_trust/processes/processes.h"
-#include "autonomous_trust/fleet/update_proposal.h"
+#include "processes/processes.h"
+#include "utilities/msg_registry.h"
+#include "fleet/update_proposal.h"
 
 /* Writable char arrays — definitions in `fleet_proc.c`. Avoids the
  * `(char *)` const-cast at every assignment to `net_msg.function`
@@ -145,6 +146,32 @@ int fleet_propose_update(const uint8_t *artifact_hash, const char *version,
 */
 int fleet_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger);
 
+/** The app_fleet_propose handler (the fleet process registers it). Tests
+ *  drive it directly. Always returns true: a refusal is logged, not raised. */
+bool fleet_handle_app_propose(const process_t *proc, directory_t *queues, generic_msg_t *msg);
+
+/** The pending proposal @p proposal_uuid (lower-case uuid string) into
+ *  @p out. @return whether there is one. For tests. */
+bool fleet_pending_proposal(const char *proposal_uuid, update_proposal_t *out);
+
+
+/** The app's verb to propose an update (local IPC only): {version,
+ *  artifact_hash (64 hex), target_arch, min_proposer_reputation}. The node
+ *  signs the proposal with its own identity key. */
+#define AT_APP_FLEET_PROPOSE "app_fleet_propose"
+
+/** Fleet's message types: the extension range reserved for it
+ *  (utilities/msg_registry.h). They were core types until FEATURE_SPLIT_PLAN
+ *  Phase 8. */
+#define FLEET_UPDATE_ACCEPTED ((message_type_t)(AT_MSG_TYPE_FLEET_MIN + 0))
+
+/** FLEET_UPDATE_ACCEPTED's payload: a proposal this cohort accepted, sent to
+ *  the app (app-bound). */
+typedef struct {
+    uuid_t proposal_uuid;
+    int accept_count;
+    int reject_count;
+} fleet_update_accepted_msg_t;
 
 /** @} */ /* end of internal_fleet */
 

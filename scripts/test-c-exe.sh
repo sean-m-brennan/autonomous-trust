@@ -101,6 +101,8 @@ fi
 if [ $coverage -eq 1 ]; then
     cmake_flags+=("-DCMAKE_C_FLAGS=-g -O0 --coverage" "-DCMAKE_CXX_FLAGS=-g -O0 --coverage")
 fi
+# The OFF-by-default extensions (FEATURE_SPLIT_PLAN Phase 8), so their tests run.
+cmake_flags+=("-DAT_FLEET_LIB=ON" "-DAT_DATA_SOURCE_LIB=ON")
 if [ $verbose -eq 1 ]; then
     (cd "$build_dir" && cmake .. "${cmake_flags[@]}")
 else

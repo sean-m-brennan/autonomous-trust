@@ -24,7 +24,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "autonomous_trust/fleet/update_proc.h"
+#include "fleet/update_proc.h"
 
 /* ---------- helpers ---------- */
 

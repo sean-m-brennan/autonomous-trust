@@ -141,6 +141,27 @@ int capability_execute_result(const capability_t *cap, const char *kwargs_json,
  * expansion shape if/when call sites get added. */
 #define DECLARE_CAPABILITY(cap_name, cap_func, cap_res_func)
 
+/**
+ * @brief Add a capability at load time, for an extension library whose
+ *        sources the table generator does not scan (FEATURE_SPLIT_PLAN
+ *        Phase 8). The row is what DECLARE_CAPABILITY would have generated:
+ *        local, with @p fn and @p res_fn (either may be NULL).
+ *
+ * Refuses (-1, with a line on stderr) a NULL, empty or over-long name, a name
+ * already in the table, and a full table. Not locked: constructors run before
+ * main().
+ */
+int capability_table_append(const char *name, capability_function_t fn,
+                            capability_result_function_t res_fn);
+
+/** Register a capability at load time (what @ref capability_table_append
+ *  does for an extension). */
+#define DEFINE_CAPABILITY(cap_name, cap_fn, cap_res_fn)                            \
+    static void __attribute__((constructor)) register_capability_##cap_name(void) \
+    {                                                                            \
+        (void)capability_table_append(QUOTE(cap_name), (cap_fn), (cap_res_fn));    \
+    }
+
 #define QUOTE(x) #x
 
 

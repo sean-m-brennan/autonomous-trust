@@ -25,8 +25,8 @@
 
 #include "autonomous_trust.h"
 #include "autonomous_trust/utilities/message.h"
-#include "autonomous_trust/fleet/update_proposal.h"
-#include "autonomous_trust/fleet/fleet_proc.h"
+#include "fleet/update_proposal.h"
+#include "fleet/fleet_proc.h"
 
 /* ------------------------------------------------------------------ */
 /* CLI helpers                                                         */

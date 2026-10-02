@@ -20,6 +20,7 @@
 #include <sodium.h>
 
 #include "processes/processes.h"
+#include "processes/process_tracker.h"
 #include "fleet/fleet_proc.h"
 #include "fleet/update_proposal.h"
 #include "fleet/artifact_proc.h"
@@ -32,6 +33,10 @@
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
 #include "network/net_message.h"
+#include "utilities/msg_registry.h"
+#include "utilities/util.h"
+#include "config/configuration.h"
+#include "identity/identity.h"
 
 #define EFLEET_PAXOS 260
 DEFINE_ERROR(EFLEET_PAXOS, "Fleet Paxos consensus error");
@@ -44,6 +49,12 @@ char FLEET_PROTO_VOTE_GRANT[] = "update vote grant";
 char FLEET_PROTO_VOTE_NACK[]  = "update vote nack";
 char FLEET_PROTO_ACCEPTED[]   = "update accepted";
 char FLEET_PROTO_REJECTED[]   = "update rejected";
+
+AT_MSG_ASSERT_FITS(fleet_update_accepted_msg_t);
+static const at_msg_vtable_t fleet_update_accepted_vt = {
+    .name = "FLEET_UPDATE_ACCEPTED", .size = sizeof(fleet_update_accepted_msg_t),
+    .app_bound = true };
+AT_MSG_TYPE_REGISTER(fleet_update_accepted, FLEET_UPDATE_ACCEPTED, &fleet_update_accepted_vt)
 
 
 /****************************
@@ -502,11 +513,12 @@ static bool handle_update_accepted(const process_t *proc, directory_t *queues, g
 
     pthread_mutex_unlock(&fleet_state.lock);
 
-    /* Also notify the main process about the acceptance via UPDATE_ACCEPTED */
+    /* Also tell the app, through the main process: FLEET_UPDATE_ACCEPTED is
+     * app-bound, so the main loop forwards it. */
     generic_msg_t notify = {0};
-    notify.type = UPDATE_ACCEPTED;
-    uuid_parse(prop_uuid_str, notify.info.update_accepted.proposal_uuid);
-    messaging_send(AT_MAIN_QUEUE, UPDATE_ACCEPTED, &notify, false);
+    notify.type = FLEET_UPDATE_ACCEPTED;
+    uuid_parse(prop_uuid_str, AT_MSG_EXT(&notify, fleet_update_accepted_msg_t)->proposal_uuid);
+    messaging_send(AT_MAIN_QUEUE, FLEET_UPDATE_ACCEPTED, &notify, false);
 
     /* If we already have the artifact (proposer), mark complete.
      * Otherwise, request the artifact from the sender (proposer). */
@@ -556,6 +568,125 @@ static bool handle_update_accepted(const process_t *proc, directory_t *queues, g
 /* Frama-C: skipped — [solver-timeout] state-cascade through paxos_init +
  * process_register_handler stubs prevents WP from discharging
  * valid_rw(proc) and valid_rd(signal) at downstream call sites */
+/* -- the app's proposal (app_fleet_propose) ---------------------------------- */
+
+char FLEET_APP_PROPOSE[] = AT_APP_FLEET_PROPOSE;
+
+/* This node's own identity (the "identity" configuration), or NULL. */
+static const identity_t *_self_identity(const process_t *proc)
+{
+    if (proc == NULL || proc->configs == NULL)
+        return NULL;
+    data_t *id_dat = NULL;
+    char id_key[] = "identity";
+    if (map_get(proc->configs, id_key, &id_dat) != 0 || id_dat == NULL)
+        return NULL;
+    config_t *id_cfg = NULL;
+    if (data_object_ptr(id_dat, (void **)&id_cfg) != 0 || id_cfg == NULL
+        || id_cfg->data_struct == NULL)
+        return NULL;
+    return (const identity_t *)id_cfg->data_struct;
+}
+
+/* The app proposes an update: {version, artifact_hash (64 hex), target_arch,
+ * min_proposer_reputation}. An app holds no private key, so THIS node builds
+ * the proposal, signs it with its identity key and names itself the signer,
+ * then runs it through the same path a peer's proposal takes (signature check,
+ * then the vote). Local only: a frame from the wire is refused. FEATURE_SPLIT_PLAN
+ * Phase 8 (the user's call, 2026-10-02). */
+bool fleet_handle_app_propose(const process_t *proc, directory_t *queues, generic_msg_t *msg)
+{
+    _ensure_init();     /* idempotent; fleet_run has done it in a running node */
+    net_msg_t *nmsg = &msg->info.net_msg;
+    if (!uuid_is_null(nmsg->from_whom.uuid)) {
+        log_warn(proc->logger, "Fleet: refusing %s from the wire\n", AT_APP_FLEET_PROPOSE);
+        return true;
+    }
+    json_t *req = NULL;
+    if (net_msg_unpack_json(nmsg, &req) != 0 || !json_is_object(req)) {
+        json_decref(req);
+        log_warn(proc->logger, "Fleet: %s: not a JSON object\n", AT_APP_FLEET_PROPOSE);
+        return true;
+    }
+    const char *version = json_string_value(json_object_get(req, "version"));
+    const char *hash_hex = json_string_value(json_object_get(req, "artifact_hash"));
+    const char *arch = json_string_value(json_object_get(req, "target_arch"));
+    json_t *min_rep = json_object_get(req, "min_proposer_reputation");
+    update_proposal_t prop;
+    memset(&prop, 0, sizeof(prop));
+    size_t hash_len = 0;
+    bool ok = version != NULL && version[0] != '\0' && strlen(version) <= UPDATE_VERSION_LEN
+              && hash_hex != NULL && strlen(hash_hex) == 2 * UPDATE_HASH_LEN
+              && sodium_hex2bin(prop.artifact_hash, UPDATE_HASH_LEN, hash_hex,
+                                strlen(hash_hex), NULL, &hash_len, NULL) == 0
+              && hash_len == UPDATE_HASH_LEN
+              && (arch == NULL || strlen(arch) <= UPDATE_ARCH_LEN)
+              && (min_rep == NULL || json_is_number(min_rep));
+    const identity_t *self = _self_identity(proc);
+    if (!ok || self == NULL) {
+        json_decref(req);
+        log_warn(proc->logger, "Fleet: %s: %s\n", AT_APP_FLEET_PROPOSE,
+                 ok ? "no identity to sign with" : "bad proposal fields");
+        return true;
+    }
+    at_strlcpy(prop.version, version, sizeof(prop.version));
+    at_strlcpy(prop.target_arch, arch != NULL ? arch : "unknown", sizeof(prop.target_arch));
+    prop.min_proposer_reputation = min_rep != NULL ? json_number_value(min_rep) : 0.0;
+    json_decref(req);
+    uuid_generate(prop.proposal_uuid);
+    uuid_copy(prop.signer_uuid, self->uuid);
+    if (update_proposal_sign(&prop, self->signature.private) != 0) {
+        log_error(proc->logger, "Fleet: %s: signing failed\n", AT_APP_FLEET_PROPOSE);
+        return true;
+    }
+    public_identity_t *pub = NULL;
+    json_t *body = update_proposal_to_json(&prop);
+    if (body == NULL || identity_publish(self, &pub) != 0 || pub == NULL) {
+        json_decref(body);
+        smrt_deref(pub);
+        return true;
+    }
+    generic_msg_t own = {0};
+    own.type = NET_MESSAGE;
+    net_msg_t *onmsg = &own.info.net_msg;
+    at_strlcpy(onmsg->process, "fleet", sizeof(onmsg->process));
+    onmsg->function = FLEET_PROTO_PROPOSE;
+    memcpy(&onmsg->from_whom, pub, sizeof(public_identity_t));
+    smrt_deref(pub);
+    int rc = net_msg_pack_json(onmsg, body);
+    json_decref(body);
+    if (rc == 0) {
+        char u[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(prop.proposal_uuid, u);
+        log_info(proc->logger, "Fleet: proposing %s (%s) for the app as %s\n",
+                 prop.version, prop.target_arch, u);
+        (void)handle_update_proposal(proc, queues, &own);
+    }
+    net_msg_free_obj(onmsg);
+    return true;
+}
+
+bool fleet_pending_proposal(const char *proposal_uuid, update_proposal_t *out)
+{
+    if (proposal_uuid == NULL || out == NULL)
+        return false;
+    _ensure_init();
+    bool found = false;
+    pthread_mutex_lock(&fleet_state.lock);
+    data_t *dat = NULL;
+    update_proposal_t *prop = NULL;
+    if (map_get(&fleet_state.pending_proposals, (map_key_t)proposal_uuid, &dat) == 0
+        && dat != NULL && data_object_ptr(dat, (ptr_t *)&prop) == 0 && prop != NULL) {
+        memcpy(out, prop, sizeof(*out));
+        found = true;
+    }
+    pthread_mutex_unlock(&fleet_state.lock);
+    return found;
+}
+
+/* The app may send it, only to fleet (msg_registry.h). */
+AT_APP_VERB_REGISTER(fleet_propose, AT_APP_FLEET_PROPOSE, "fleet")
+
 int fleet_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t *logger)
 {
     _ensure_init();
@@ -571,9 +702,13 @@ int fleet_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t 
     process_register_handler(proc, FLEET_PROTO_VOTE_GRANT, (handler_ptr_t)handle_vote_grant);
     process_register_handler(proc, FLEET_PROTO_VOTE_NACK,  (handler_ptr_t)handle_vote_nack);
     process_register_handler(proc, FLEET_PROTO_ACCEPTED,   (handler_ptr_t)handle_update_accepted);
+    process_register_handler(proc, FLEET_APP_PROPOSE,      (handler_ptr_t)fleet_handle_app_propose);
 
     proc->protocol.phase = 1;
 
     return process_run(proc, queues, signal, logger);
 }
-DECLARE_PROCESS(fleet, fleet_proc, fleet_run);
+/* An extension's process (FEATURE_SPLIT_PLAN Phase 8): registered at load,
+ * and started by default once this library is linked. */
+DEFINE_PROCESS(fleet, fleet_proc, fleet_run)
+DEFINE_SUBSYSTEM(fleet, "fleet", "fleet_proc")
