@@ -196,6 +196,16 @@ typedef struct {
      * Carried verbatim by the whole-struct memcpy in msg_types.c
      * (TRANSACTION_SCORE ser/de), so no field-wise packing. */
     double competence;
+    /* A VERIFIER-ATTESTED score (doc/architecture/reputation.md,
+     * "Verifier-attested scores"): this node, as verifier, scores
+     * `peer_uuid` on an attestable channel and asks the group to certify it
+     * instead of running a Paxos round with the subject. `task_uuid` is
+     * ignored (an attested entry's id is derived); `evidence_digest` names the
+     * document the finding rests on. false / "" == an ordinary score, which is
+     * what every producer predating these fields sends (a zeroed struct).
+     * APPENDED, for the CFFI mirror; whole-struct memcpy as above. */
+    bool   attested;
+    char   evidence_digest[64 + 1];
 } tx_score_msg_t;
 
 typedef struct {

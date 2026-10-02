@@ -544,6 +544,9 @@ ffi.cdef("""
            meant. Local-only: this struct never crosses the wire. Mirrors
            Python TransactionScore.competence. */
         double competence;
+        /* verifier-attested submission (msg_types.h); appended */
+        bool attested;
+        char evidence_digest[65];
     } tx_score_msg_t;
 
     size_t message_size(message_type_t type);
@@ -670,6 +673,11 @@ ffi.cdef("""
          * appends it. */
         char p1_channel[32];
         char p2_channel[32];
+        /* verifier-attested entries (reputation.md "Verifier-attested
+         * scores"); appended, as in reputation.h */
+        bool attested;
+        unsigned char subject_uuid[16];
+        char evidence_digest[65];
     } transaction_t;
 
     /* tx_history_t/reputations_t contain embedded maps/arrays — opaque */

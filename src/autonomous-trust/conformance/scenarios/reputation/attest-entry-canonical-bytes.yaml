@@ -1,0 +1,71 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-entry-canonical-bytes
+byte_pinning: false
+description: |
+    A verifier-attested entry hashes identically in both runtimes, and an
+    ordinary commit links onto it (doc/architecture/reputation.md,
+    "Verifier-attested scores").
+
+    An attested entry is the one one-sided entry the chain admits: the
+    verifier occupies p1, p2 is never set, and it commits on a quorum
+    certificate rather than on its subject's half. Its canonical bytes extend
+    the ordinary form -- the channel block is always present, then
+    `|attested|<subject>|<evidence_digest>` -- so no ordinary entry's bytes
+    change and the two forms cannot collide (no ordinary entry has p2 unset
+    at commit time). The task id is derived, uuid5 over
+    verifier|subject|digest, so both adapters reach the same entry from the
+    same content.
+
+    The fixture commits the attested entry about carol directly, through the
+    chain's own rule (TransactionHistory.append_attested /
+    tx_history_append_attested); the quorum round that normally precedes it
+    is pinned by its own scenarios. The step then completes an ordinary
+    entry, which must take the next index and link to the attested entry's
+    hash.
+
+    The pin is bob's `window_root`, over both entries. A divergence anywhere
+    in the attested form -- field order, the marker, the subject's spelling,
+    the digest, or the forced channel block -- changes the root on one side
+    only. The legacy roots elsewhere in this corpus (for instance
+    `committed-channel-in-the-entry-hash`, `chain-catchup-verifies-links`)
+    are the control: the change did not move them.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: proposer
+
+fixtures:
+  tx_history:
+    bob:
+      - attested: true
+        p1: alice
+        p1_score: 0.3
+        p1_channel: probe
+        subject: carol
+        evidence_digest: "abababababababababababababababababababababababababababababababab"
+      - task_id: t-1
+        p1: carol
+        p1_score: 0.9
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: tx committed
+    payload:
+      task_id: t-1
+      score: 0.8
+    description: |
+        The commit that completes ordinary task t-1. It takes index 1 and
+        links to the attested entry at index 0.
+
+expected_state:
+  bob:
+    committed_tx_count: 2
+    window_root: "6aa70e940960572281d601bb91a953b28e1829256d297e211950a06aa784c254"
