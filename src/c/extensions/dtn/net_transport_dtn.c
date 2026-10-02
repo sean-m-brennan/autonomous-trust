@@ -70,7 +70,6 @@ typedef struct {
     const network_config_t *net_cfg;
     logger_t *logger;
     const process_t *proc;
-    char local_node_eid[DTN_EID_MAX + 1];
     dtn_slot_t slots[NET_CHAN__COUNT];
     pthread_mutex_t slot_lock;
     uint32_t default_lifetime_sec;
@@ -80,25 +79,11 @@ static const uint32_t DEFAULT_BUNDLE_LIFETIME_SEC = 86400; /* 24h */
 
 /* ---------- Helpers ---------- */
 
-static const char *channel_suffix(net_channel_t ch)
+/* The joined group's uuid, or NULL before one is joined (dtn_group_hash then
+ * gives the pre-join hash). */
+static const unsigned char *joined_group_uuid(const process_t *proc)
 {
-    switch (ch) {
-    case NET_CHAN_PEER:      return DTN_CHAN_PEER_SUFFIX;
-    case NET_CHAN_BROADCAST: return DTN_CHAN_BCAST_SUFFIX;
-    case NET_CHAN_GROUP:     return DTN_CHAN_GROUP_SUFFIX;
-    case NET_CHAN__COUNT:    break;
-    }
-    return NULL;
-}
-
-/* Frama-C: skipped — service_to_channel: strcmp. */
-static net_channel_t service_to_channel(const char *dest_service)
-{
-    if (dest_service == NULL) return NET_CHAN__COUNT;
-    if (strcmp(dest_service, DTN_CHAN_PEER_SUFFIX) == 0)  return NET_CHAN_PEER;
-    if (strcmp(dest_service, DTN_CHAN_BCAST_SUFFIX) == 0) return NET_CHAN_BROADCAST;
-    if (strcmp(dest_service, DTN_CHAN_GROUP_SUFFIX) == 0) return NET_CHAN_GROUP;
-    return NET_CHAN__COUNT;
+    return proc != NULL ? proc->protocol.group.uuid : NULL;
 }
 
 /* ---------- Vtable methods ---------- */
@@ -119,77 +104,34 @@ static int dtn_open(net_transport_ctx_t **out_ctx,
     ctx->default_lifetime_sec = DEFAULT_BUNDLE_LIFETIME_SEC;
     pthread_mutex_init(&ctx->slot_lock, NULL);
 
-    /* Derive the local node EID from myself->uuid when the identity is
-     * available; otherwise fall back to a placeholder so unit tests and
-     * pre-provisioning scenarios still get a usable endpoint. */
-    if (params->myself != NULL) {
-        if (dtn_eid_from_uuid(params->myself->uuid,
-                              ctx->local_node_eid,
-                              sizeof(ctx->local_node_eid)) < 0) {
-            log_error(params->logger, "DTN: local EID derivation failed\n");
-            pthread_mutex_destroy(&ctx->slot_lock);
-            free(ctx);
-            return -1;
-        }
-    } else {
-        log_warn(params->logger, "DTN: no identity at open(); using placeholder EID\n");
-        snprintf(ctx->local_node_eid, sizeof(ctx->local_node_eid),
-                 "dtn://at-local/");
-    }
-
     /* Register three endpoints so each AT channel has its own inbound
-     * stream from the BPA:
+     * stream from the BPA (dtn_endpoints):
      *
      *   [0] /peer  on our own node EID            — unicast, primary (source EID for sends)
      *   [1] /bcast on the group-broadcast EID     — open discovery broadcast
      *   [2] /group on the group-broadcast EID     — encrypted group multicast
      *
-     * The group-broadcast EID is derived from the joined-group UUID when
-     * one exists, otherwise from a stable "AT-boot" pre-join hash so a
-     * brand-new node still has a well-known address for discovery. */
-    char peer_eid[DTN_EID_MAX + 1];
-    char group_node_eid[DTN_EID_MAX + 1];
-    char bcast_eid[DTN_EID_MAX + 1];
-    char group_eid[DTN_EID_MAX + 1];
-
-    if (dtn_eid_for_service(ctx->local_node_eid, DTN_CHAN_PEER_SUFFIX,
-                            peer_eid, sizeof(peer_eid)) < 0) {
-        pthread_mutex_destroy(&ctx->slot_lock);
-        free(ctx);
-        return -1;
-    }
-
-    unsigned char hash_bytes[8] = {0};
-    bool have_group = false;
-    if (params->proc != NULL) {
-        const group_t *grp = &params->proc->protocol.group;
-        uuid_t zero = {0};
-        if (memcmp(grp->uuid, zero, sizeof(uuid_t)) != 0) {
-            memcpy(hash_bytes, grp->uuid, sizeof(hash_bytes));
-            have_group = true;
-        }
-    }
-    if (!have_group) {
-        static const unsigned char pre_join[8] = {
-            'A','T','-','b','o','o','t',0
-        };
-        memcpy(hash_bytes, pre_join, sizeof(hash_bytes));
-    }
-    if (dtn_eid_for_group(hash_bytes, sizeof(hash_bytes),
-                          group_node_eid, sizeof(group_node_eid)) < 0 ||
-        dtn_eid_for_service(group_node_eid, DTN_CHAN_BCAST_SUFFIX,
-                            bcast_eid, sizeof(bcast_eid)) < 0 ||
-        dtn_eid_for_service(group_node_eid, DTN_CHAN_GROUP_SUFFIX,
-                            group_eid, sizeof(group_eid)) < 0) {
+     * The node EID comes from myself->uuid, or a placeholder when there is no
+     * identity yet (unit tests, pre-provisioning). The group-broadcast EID is
+     * derived from the joined-group UUID when one exists, otherwise from a
+     * stable "AT-boot" pre-join hash so a brand-new node still has a
+     * well-known address for discovery. */
+    if (params->myself == NULL)
+        log_warn(params->logger, "DTN: no identity at open(); using placeholder EID\n");
+    char eids[NET_CHAN__COUNT][DTN_EID_MAX + 1];
+    int joined = dtn_endpoints(params->myself != NULL ? params->myself->uuid : NULL,
+                               joined_group_uuid(params->proc), eids);
+    if (joined < 0) {
+        log_error(params->logger, "DTN: local EID derivation failed\n");
         pthread_mutex_destroy(&ctx->slot_lock);
         free(ctx);
         return -1;
     }
 
     const dtn_endpoint_t endpoints[NET_CHAN__COUNT] = {
-        [NET_CHAN_PEER]      = { .eid = peer_eid,  .service = DTN_CHAN_PEER_SUFFIX  },
-        [NET_CHAN_BROADCAST] = { .eid = bcast_eid, .service = DTN_CHAN_BCAST_SUFFIX },
-        [NET_CHAN_GROUP]     = { .eid = group_eid, .service = DTN_CHAN_GROUP_SUFFIX },
+        [NET_CHAN_PEER]      = { .eid = eids[NET_CHAN_PEER],      .service = DTN_CHAN_PEER_SUFFIX  },
+        [NET_CHAN_BROADCAST] = { .eid = eids[NET_CHAN_BROADCAST], .service = DTN_CHAN_BCAST_SUFFIX },
+        [NET_CHAN_GROUP]     = { .eid = eids[NET_CHAN_GROUP],     .service = DTN_CHAN_GROUP_SUFFIX },
     };
 
     if (dtn_backend.init(endpoints, NET_CHAN__COUNT, params->logger) != 0) {
@@ -202,8 +144,8 @@ static int dtn_open(net_transport_ctx_t **out_ctx,
 
     log_info(params->logger,
              "DTN: ready, backend=%s peer=%s bcast=%s group=%s (group_joined=%s)\n",
-             dtn_backend.name, peer_eid, bcast_eid, group_eid,
-             have_group ? "yes" : "no (pre-join)");
+             dtn_backend.name, eids[NET_CHAN_PEER], eids[NET_CHAN_BROADCAST],
+             eids[NET_CHAN_GROUP], joined ? "yes" : "no (pre-join)");
     *out_ctx = (net_transport_ctx_t *)ctx;
     return 0;
 }
@@ -235,15 +177,11 @@ static int build_peer_eid(const dtn_ctx_t *ctx, const char *target,
     if (target == NULL || target[0] == '\0')
         return -1;
 
-    if (strncmp(target, "dtn:", 4) == 0 || strncmp(target, "ipn:", 4) == 0) {
-        int n = snprintf(out, out_len, "%s", target);
-        return (n > 0 && (size_t)n < out_len) ? n : -1;
-    }
-
-    if (ctx->proc != NULL) {
+    uuid_t matched_uuid;
+    bool found = false;
+    if (ctx->proc != NULL &&
+        strncmp(target, "dtn:", 4) != 0 && strncmp(target, "ipn:", 4) != 0) {
         peers_read_lock(ctx->proc);
-        uuid_t matched_uuid;
-        bool found = false;
         for (size_t i = 0; i < ctx->proc->protocol.num_peers; i++) {
             if (strcmp(ctx->proc->protocol.peers[i].address, target) == 0) {
                 memcpy(matched_uuid, ctx->proc->protocol.peers[i].uuid,
@@ -253,17 +191,8 @@ static int build_peer_eid(const dtn_ctx_t *ctx, const char *target,
             }
         }
         peers_read_unlock(ctx->proc);
-        if (found) {
-            char node_eid[DTN_EID_MAX + 1];
-            if (dtn_eid_from_uuid(matched_uuid, node_eid, sizeof(node_eid)) < 0)
-                return -1;
-            return dtn_eid_for_service(node_eid, DTN_CHAN_PEER_SUFFIX,
-                                       out, out_len);
-        }
     }
-
-    int n = snprintf(out, out_len, "dtn://at-%s/peer", target);
-    return (n > 0 && (size_t)n < out_len) ? n : -1;
+    return dtn_peer_eid(target, found ? matched_uuid : NULL, out, out_len);
 }
 
 static int dtn_send_unicast(net_transport_ctx_t *ctx_opaque,
@@ -292,38 +221,12 @@ static int dtn_send_broadcast(net_transport_ctx_t *ctx_opaque, net_channel_t cha
 
     /* Derive the group EID from the current group UUID held by the network
      * process. The group is populated asynchronously (once the group key
-     * has been distributed), so it may be empty here — in which case we
-     * degrade to a fixed "unjoined" group EID so open-broadcast discovery
-     * still works before provisioning completes. */
-    unsigned char hash_bytes[8] = {0};
-    bool have_group = false;
-    if (ctx->proc != NULL) {
-        const group_t *grp = &ctx->proc->protocol.group;
-        uuid_t zero = {0};
-        if (memcmp(grp->uuid, zero, sizeof(uuid_t)) != 0) {
-            memcpy(hash_bytes, grp->uuid, sizeof(hash_bytes));
-            have_group = true;
-        }
-    }
-    if (!have_group) {
-        /* Stable "pre-join" identifier: all nodes that haven't yet been
-         * admitted converge on the same broadcast EID for discovery. */
-        static const unsigned char pre_join[8] = {
-            'A','T','-','b','o','o','t',0
-        };
-        memcpy(hash_bytes, pre_join, sizeof(hash_bytes));
-    }
-
-    char group_node_eid[DTN_EID_MAX + 1];
-    if (dtn_eid_for_group(hash_bytes, sizeof(hash_bytes),
-                          group_node_eid, sizeof(group_node_eid)) < 0)
-        return -1;
-
+     * has been distributed), so it may be empty here — in which case
+     * dtn_broadcast_eid degrades to the fixed pre-join group EID so
+     * open-broadcast discovery still works before provisioning completes. */
     char dest_eid[DTN_EID_MAX + 1];
-    const char *suffix = channel_suffix(channel);
-    if (suffix == NULL ||
-        dtn_eid_for_service(group_node_eid, suffix,
-                            dest_eid, sizeof(dest_eid)) < 0)
+    if (dtn_broadcast_eid(channel, joined_group_uuid(ctx->proc),
+                          dest_eid, sizeof(dest_eid)) < 0)
         return -1;
 
     return dtn_backend.send(dest_eid, wire, wire_len, ctx->default_lifetime_sec);
@@ -368,7 +271,7 @@ static int dtn_recv(net_transport_ctx_t *ctx_opaque, net_channel_t channel,
     if (ret != 0)
         return ret;
 
-    net_channel_t got = service_to_channel(dest_service);
+    net_channel_t got = (net_channel_t)dtn_service_to_channel(dest_service);
     if (got == channel) {
         *out_buf = payload;
         *out_len = plen;

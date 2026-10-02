@@ -1,0 +1,32 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: "1"
+kind: "scenario"
+protocol: "dtn"
+name: "endpoints-zero-group-is-pre-join"
+description: |
+  The all-zero group uuid means no group.
+byte_pinning: false
+participants:
+  - id: "host"
+    role: "recipient"
+fixtures:
+  dtn:
+    op: "endpoints"
+    node_uuid: "aabbccdd-1122-4000-8000-000000000001"
+    group_uuid: "00000000-0000-0000-0000-000000000000"
+steps:
+  - id: 1
+    from: "host"
+    to: "host"
+    function: "endpoints"
+    description: "trigger: endpoints"
+expected_state:
+  host:
+    endpoints:
+      - ["dtn://at-aabbccdd/peer", "/peer"]
+      - ["dtn://at-group-41542d626f6f7400/bcast", "/bcast"]
+      - ["dtn://at-group-41542d626f6f7400/group", "/group"]
+    group_joined: false

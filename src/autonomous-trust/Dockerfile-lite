@@ -58,6 +58,7 @@ COPY src/autonomous-trust-oracle/autonomous_trust/oracle autonomous_trust/oracle
 COPY src/autonomous-trust-zta/autonomous_trust/zta autonomous_trust/zta
 COPY src/autonomous-trust-rendezvous/autonomous_trust/rendezvous autonomous_trust/rendezvous
 COPY src/autonomous-trust-first-contact/autonomous_trust/first_contact autonomous_trust/first_contact
+COPY src/autonomous-trust-dtn/autonomous_trust/dtn autonomous_trust/dtn
 RUN rm -rf autonomous_trust/etc autonomous_trust/var
 
 COPY src/autonomous-trust/pyproject.toml pyproject.toml

@@ -31,7 +31,10 @@
 #include <uuid/uuid.h>
 
 #include "config/configuration.h"
+#include "fleet/at_fleet.h"
 #include "fleet/fleet_proc.h"
+#include "app_events_registry.h"
+#include "utilities/util.h"   /* makedirs */
 #include "fleet/update_proposal.h"
 #include "identity/identity.h"
 #include "processes/process_tracker.h"
@@ -178,6 +181,47 @@ DEFINE_TEST(test_the_node_signs_the_apps_proposal_and_starts_the_vote)
 }
 END_TEST_DEFINITION()
 
+/* The flat ABI (at_fleet.h): the sender refuses a malformed proposal before
+ * sending anything and says when the node is not listening yet, and an
+ * acceptance decodes into kind AT_APP_EVENT_FLEET_UPDATE_ACCEPTED. */
+DEFINE_TEST(test_the_app_abi_sends_the_verb_and_decodes_the_acceptance)
+{
+    /* Socket paths live under <root>/var/at, so give the test a root. */
+    static char root[] = "/tmp/at-fleet-abi-testXXXXXX";
+    ck_assert_ptr_nonnull(mkdtemp(root));
+    ck_assert_int_eq(setenv("AUTONOMOUS_TRUST_ROOT", root, 1), 0);
+    char data_dir[CFG_PATH_LEN + 1] = {0};
+    ck_assert(get_data_dir(data_dir, sizeof(data_dir)) >= 0);
+    ck_assert_int_eq(makedirs(data_dir, 0755), 0);
+    at_app_events_t *ev = at_app_events_open("_fleet_abi_in");
+    ck_assert_ptr_nonnull(ev);
+    ck_assert_int_eq(at_app_fleet_propose(ev, "_fleet_abi_out", "", HASH, NULL, 0.0), -1);
+    ck_assert_int_eq(at_app_fleet_propose(ev, "_fleet_abi_out", "1.0", "abcd", NULL, 0.0), -1);
+    ck_assert_int_eq(at_app_fleet_propose(NULL, "_fleet_abi_out", "1.0", HASH, NULL, 0.0), -1);
+    ck_assert_int_eq(at_app_fleet_propose(ev, "_fleet_abi_out", "1.0", HASH, "arm64", 0.2),
+                     AT_APP_NOT_READY);
+    at_app_events_close(ev);
+
+    generic_msg_t msg = {0};
+    msg.type = FLEET_UPDATE_ACCEPTED;
+    uuid_t u;
+    uuid_generate(u);
+    uuid_copy(AT_MSG_EXT(&msg, fleet_update_accepted_msg_t)->proposal_uuid, u);
+    at_app_event_decoder_t dec = at_app_event_decoder_lookup((long)FLEET_UPDATE_ACCEPTED);
+    ck_assert_ptr_nonnull(dec);
+    at_app_event_t event;
+    memset(&event, 0, sizeof(event));
+    ck_assert_int_eq(dec(&msg, &event), 0);
+    ck_assert_int_eq(event.kind, AT_APP_EVENT_FLEET_UPDATE_ACCEPTED);
+    const at_app_fleet_accepted_t *acc = at_fleet_accepted_event(&event);
+    ck_assert_ptr_nonnull(acc);
+    ck_assert_int_eq(memcmp(acc->proposal_uuid, u, AT_APP_UUID_LEN), 0);
+    event.kind = 1027;
+    ck_assert_ptr_null(at_fleet_accepted_event(&event));
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(FleetExtension,
           test_linking_fleet_adds_its_processes_subsystems_verb_and_type,
-          test_the_node_signs_the_apps_proposal_and_starts_the_vote)
+          test_the_node_signs_the_apps_proposal_and_starts_the_vote,
+          test_the_app_abi_sends_the_verb_and_decodes_the_acceptance)

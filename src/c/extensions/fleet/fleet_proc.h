@@ -27,6 +27,7 @@
 #include "processes/processes.h"
 #include "utilities/msg_registry.h"
 #include "fleet/update_proposal.h"
+#include "fleet/at_fleet.h"   /* AT_APP_FLEET_PROPOSE */
 
 /* Writable char arrays — definitions in `fleet_proc.c`. Avoids the
  * `(char *)` const-cast at every assignment to `net_msg.function`
@@ -154,11 +155,6 @@ bool fleet_handle_app_propose(const process_t *proc, directory_t *queues, generi
  *  @p out. @return whether there is one. For tests. */
 bool fleet_pending_proposal(const char *proposal_uuid, update_proposal_t *out);
 
-
-/** The app's verb to propose an update (local IPC only): {version,
- *  artifact_hash (64 hex), target_arch, min_proposer_reputation}. The node
- *  signs the proposal with its own identity key. */
-#define AT_APP_FLEET_PROPOSE "app_fleet_propose"
 
 /** Fleet's message types: the extension range reserved for it
  *  (utilities/msg_registry.h). They were core types until FEATURE_SPLIT_PLAN

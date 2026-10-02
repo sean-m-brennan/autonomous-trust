@@ -31,8 +31,10 @@ import sys
 # Rendezvous and first contact (src/autonomous-trust-rendezvous and
 # src/autonomous-trust-first-contact, Phase 7) too: first contact's contacts
 # protocol and the identity and negotiation adapters' first-contact scenarios.
+# DTN (src/autonomous-trust-dtn, Phase 9): its dtn protocol.
 for _dist in ('autonomous-trust-oracle', 'autonomous-trust-zta',
-              'autonomous-trust-rendezvous', 'autonomous-trust-first-contact'):
+              'autonomous-trust-rendezvous', 'autonomous-trust-first-contact',
+              'autonomous-trust-dtn'):
     _dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..',
                                         '..', '..', _dist))
     if os.path.isdir(_dir) and _dir not in sys.path:

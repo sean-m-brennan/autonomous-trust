@@ -94,7 +94,7 @@ size_t subsystem_defaults(const char **keys, const char **impls, size_t max);
 
 /**
  * @brief Refuse a configuration that starts a feature library's subsystem
- *        (fleet, artifact, update, config, data-source) on a node built
+ *        (fleet, artifact, update, config, data-source, zta_verify) on a node built
  *        without that library: one error line per subsystem naming the
  *        library. Names only, as the other declaration tables are. Any other
  *        unknown runner is left to the start loop, which skips it.

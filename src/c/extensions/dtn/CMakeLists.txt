@@ -215,3 +215,9 @@ if(LIBCHECK_LIBRARY)
         add_dtn_test(dtn_transport_test)
     endif()
 endif()
+
+# The dtn conformance protocol (EIDs, receive demux, unicast resolution and the
+# hybrid's routing) is DTN's own; its scenarios skip without this library.
+at_conformance_adapter(PROTOCOL dtn RUN at_dtn_conf_run
+    SOURCES conformance/dtn_adapter.c
+    LIBS at_dtn_static)

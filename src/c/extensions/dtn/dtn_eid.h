@@ -71,4 +71,59 @@ int dtn_eid_for_service(const char *base_eid, const char *service,
 int dtn_eid_for_group(const unsigned char *group_hash, size_t hash_len,
                       char *out, size_t out_len);
 
+/* ---------- The transport's addressing, as pure functions ----------
+ *
+ * net_transport_dtn.c builds every EID through these, and the `dtn`
+ * conformance protocol runs them against the Python twin
+ * (autonomous_trust/dtn/_python/eid.py). */
+
+/** The group hash a node uses before it joins a group ("AT-boot\0"), so every
+ *  unjoined node converges on one broadcast EID for discovery. */
+extern const unsigned char DTN_PRE_JOIN_HASH[8];
+
+/** Node EID used when the transport opens without an identity. */
+#define DTN_PLACEHOLDER_NODE_EID "dtn://at-local/"
+
+/**
+ * @brief The eight bytes a group EID is built from.
+ * @param group_uuid  The joined group's uuid, or NULL / all-zero for none.
+ * @param out         The group's first eight bytes, or DTN_PRE_JOIN_HASH.
+ * @return 1 if a group is joined, 0 if not.
+ */
+int dtn_group_hash(const uuid_t group_uuid, unsigned char out[8]);
+
+/** The service suffix for an AT channel (net_channel_t), or NULL. */
+const char *dtn_channel_suffix(int channel);
+
+/** The channel (net_channel_t) a service suffix belongs to; NET_CHAN__COUNT
+ *  (3) for an unknown or NULL service. */
+int dtn_service_to_channel(const char *service);
+
+/**
+ * @brief The three endpoints a transport registers, in channel order: /peer
+ *        on the node EID (the primary), /bcast and /group on the group EID.
+ * @param node_uuid   The node's uuid, or NULL for DTN_PLACEHOLDER_NODE_EID.
+ * @param group_uuid  As dtn_group_hash.
+ * @param eids        Filled with the three EIDs.
+ * @return 1 if a group is joined, 0 if not, -1 if an EID did not fit.
+ */
+int dtn_endpoints(const uuid_t node_uuid, const uuid_t group_uuid,
+                  char eids[3][DTN_EID_MAX + 1]);
+
+/** Where a broadcast or group send goes for @p group_uuid (as
+ *  dtn_group_hash). @return length, or -1 for the peer channel or no fit. */
+int dtn_broadcast_eid(int channel, const uuid_t group_uuid,
+                      char *out, size_t out_len);
+
+/**
+ * @brief Where a unicast to @p target (a peer's address) goes:
+ *   1. @p target verbatim when it is a dtn: or ipn: EID;
+ *   2. the /peer EID of @p matched, the uuid of the peer whose address is
+ *      exactly @p target, when the caller found one (else NULL);
+ *   3. dtn://at-<target>/peer.
+ * @return length, or -1 for an empty target or no fit.
+ */
+int dtn_peer_eid(const char *target, const uuid_t matched,
+                 char *out, size_t out_len);
+
 #endif /* DTN_EID_H */
