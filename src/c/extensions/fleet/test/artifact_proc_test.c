@@ -21,7 +21,7 @@
 #include <string.h>
 #include <jansson.h>
 
-#include "autonomous_trust/fleet/artifact_proc.h"
+#include "fleet/artifact_proc.h"
 
 /* ---------------------------------------------------------------
  * test_chunk_size_calculation

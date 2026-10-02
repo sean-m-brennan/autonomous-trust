@@ -79,8 +79,11 @@ function(at_extension_tests name)
         add_executable(${_t} test/${_t}.c)
         set_source_files_properties(test/${_t}.c PROPERTIES COMPILE_FLAGS "-Wall")
         target_include_directories(${_t} PRIVATE ${AT_EXT_DIR}/../test ${AT_EXT_DIR} ${_root})
+        # libsubunit when found: a static libcheck needs it as soon as a test
+        # pulls in its logging (empty and skipped otherwise; see LIBSUBUNIT_LIBRARY).
         target_link_libraries(${_t} PRIVATE
-            -Wl,--whole-archive ${_whole} -Wl,--no-whole-archive ${AT_TEST_LIBS})
+            -Wl,--whole-archive ${_whole} -Wl,--no-whole-archive ${AT_TEST_LIBS}
+            ${LIBSUBUNIT_LIBRARY})
         add_test(NAME ${_t} COMMAND $<TARGET_FILE:${_t}>)
     endforeach()
 endfunction()

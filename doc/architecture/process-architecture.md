@@ -38,6 +38,14 @@ declares its `proc_name` and `description` in the metaclass arguments. The
 `ProcessTracker` reads `subsystems.cfg.json` to determine which process classes
 to instantiate and in what order (respecting dependency declarations).
 
+The C runtime reads the same `subsystems.cfg.json`. When it writes a fresh one
+it lists the four core processes, then the subsystems of the extension
+libraries linked into the build: fleet's `fleet`, `artifact`, `update` and
+`config` (`libat_fleet`), and `data-source` (`libat_data_source`). Both
+libraries are off by default, and a node whose configuration starts one of
+their subsystems without the library refuses to start (see
+[Extensions](extensions.md#fleet-and-data-source-libat_fleet-libat_data_source)).
+
 Additional worker processes can be added at runtime via
 `AutonomousTrust.add_worker()`. One such worker is the **`BootstrapWorker`**
 (`core/_python/bootstrap_worker.py`), auto-registered to run the

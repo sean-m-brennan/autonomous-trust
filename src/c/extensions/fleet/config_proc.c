@@ -22,6 +22,7 @@
 #include <sodium.h>
 
 #include "processes/processes.h"
+#include "processes/process_tracker.h"
 #include "fleet/config_proc.h"
 #include "fleet/artifact_proc.h"
 #include "fleet/artifact_store.h"
@@ -732,4 +733,7 @@ int config_run(process_t *proc, directory_t *queues, queue_id_t signal, logger_t
 
     return process_run(proc, queues, signal, logger);
 }
-DECLARE_PROCESS(config, config_proc, config_run);
+/* An extension's process (FEATURE_SPLIT_PLAN Phase 8): registered at load,
+ * and started by default once this library is linked. */
+DEFINE_PROCESS(config, config_proc, config_run)
+DEFINE_SUBSYSTEM(config, "config", "config_proc")

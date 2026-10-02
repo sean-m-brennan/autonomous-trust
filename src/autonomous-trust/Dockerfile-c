@@ -57,7 +57,7 @@ COPY src/c /build/src/c
 COPY src/protobuf /build/src/protobuf
 
 RUN rm -rf /build/examples/build && mkdir -p /build/examples/build && cd /build/examples/build && \
-    CC=clang CXX=clang++ cmake .. -DCMAKE_BUILD_TYPE=Release -DREVISION="$GIT_VERSION" -DCMAKE_C_FLAGS="-Wno-unknown-warning-option" -DCMAKE_CXX_FLAGS="-Wno-unknown-warning-option" && \
+    CC=clang CXX=clang++ cmake .. -DCMAKE_BUILD_TYPE=Release -DREVISION="$GIT_VERSION" -DAT_FLEET_LIB=ON -DAT_DATA_SOURCE_LIB=ON -DCMAKE_C_FLAGS="-Wno-unknown-warning-option" -DCMAKE_CXX_FLAGS="-Wno-unknown-warning-option" && \
     make -j$(nproc) && \
     make install DESTDIR=/build/install
 

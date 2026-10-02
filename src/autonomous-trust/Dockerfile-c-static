@@ -65,6 +65,8 @@ RUN rm -rf /build/examples/build && mkdir -p /build/examples/build && cd /build/
         -DCMAKE_BUILD_TYPE=Release \
         -DREVISION="$GIT_VERSION" \
         -DAT_STATIC=ON \
+        -DAT_FLEET_LIB=ON \
+        -DAT_DATA_SOURCE_LIB=ON \
         -DCMAKE_C_FLAGS="-Wno-unknown-warning-option" \
         -DCMAKE_CXX_FLAGS="-Wno-unknown-warning-option" && \
     make -j$(nproc) && \

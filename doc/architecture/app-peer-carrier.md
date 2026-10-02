@@ -71,7 +71,8 @@ Joining two facts on a uuid is the job of the consumer.
 
 **Emitted to the daemon queue, not to the app.** A sub-process does not know the
 queue name of the app. It sends to `AT_MAIN_QUEUE` and the main loop owns the
-outward hop, the route `UPDATE_ACCEPTED` already took.
+outward hop, the route `UPDATE_ACCEPTED` already took (fleet's
+`FLEET_UPDATE_ACCEPTED` since FEATURE_SPLIT_PLAN Phase 8).
 
 **`rated` is a separate field, not a sentinel.** AT scores are anchored by fixed
 constants rather than normalized across the population, so the number crosses

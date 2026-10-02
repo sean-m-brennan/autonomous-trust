@@ -24,12 +24,40 @@
 #include "capabilities_priv.h"
 #include "bootstrap/bootstrap_capabilities.h"
 #include "capability_table_priv.h"
+#include "utilities/util.h"
+#include <stdio.h>
 
 /*@
   requires name != \null && \valid_read(name);
   assigns \nothing;
   ensures \result == \null || \valid(\result);
 */
+int capability_table_append(const char *name, capability_function_t fn,
+                            capability_result_function_t res_fn)
+{
+    if (name == NULL || name[0] == '\0' || strlen(name) > CAP_NAMELEN) {
+        fprintf(stderr, "capability_table_append: refusing a bad name\n");
+        return -1;
+    }
+    if (find_capability(name) != NULL) {
+        fprintf(stderr, "capability_table_append: %s already in the table\n", name);
+        return -1;
+    }
+    if (capability_table_size >= CAPABILITY_TABLE_CAPACITY - 1) {   /* keep the sentinel */
+        fprintf(stderr, "capability_table_append: table full, %s refused\n", name);
+        return -1;
+    }
+    capability_t *row = &capability_table[capability_table_size];
+    memset(row, 0, sizeof(*row));
+    at_strlcpy(row->name, name, sizeof(row->name));
+    row->local = true;
+    row->function = fn;
+    row->result_function = res_fn;
+    capability_table_size++;
+    capability_table[capability_table_size].name[0] = '\0';  /* sentinel */
+    return 0;
+}
+
 /* TODO (divergence.md C14 follow-up): Python emits `peer.set/caps_*`
  * counter probes around capability-query traffic
  * (idprocess.py:884-977). The C side already covers

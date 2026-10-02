@@ -29,6 +29,9 @@
 #include "config/configuration.h"
 #include "processes/processes.h"
 #include "processes/extension.h"
+#include "config/generate.h"
+#include "processes/capabilities.h"
+#include "processes/process_tracker.h"
 #include "structures/map.h"
 #include "identity/id_proc_priv.h"
 #ifdef AT_FIRST_CONTACT_ENABLED   /* linked with libat_first_contact */
@@ -385,6 +388,86 @@ DEFINE_TEST(test_core_only_has_no_social_and_refuses_its_declarations)
 }
 END_TEST_DEFINITION()
 
+
+/* A core-only binary has no fleet and no data-source service: no process, no
+ * default subsystem, nothing of theirs in the configuration it generates, and
+ * a configuration that starts one of their subsystems refuses the start
+ * (FEATURE_SPLIT_PLAN Phase 8). Also the two load-time registries the move
+ * needed: default subsystems and capabilities. */
+DEFINE_TEST(test_core_only_has_no_fleet_and_refuses_its_subsystems)
+{
+    static const char *const feature[][2] = {
+        { "fleet", "fleet_proc" }, { "artifact", "artifact_proc" },
+        { "update", "update_proc" }, { "config", "config_proc" },
+        { "data-source", "data_source_proc" },
+    };
+    for (size_t i = 0; i < sizeof(feature) / sizeof(feature[0]); i++)
+        ck_assert_ptr_null(find_process(feature[i][1]));
+    ck_assert_uint_eq(subsystem_defaults(NULL, NULL, AT_SUBSYSTEM_EXT_MAX), 0);
+    ck_assert_ptr_null(find_capability("data"));
+
+    /* The generated configuration starts the core's subsystems only. */
+    char dir[] = "/tmp/at_ext_subsysXXXXXX";
+    ck_assert_ptr_nonnull(mkdtemp(dir));
+    ck_assert_int_eq(generate_subsystems_config(dir), 0);
+    char path[128];
+    snprintf(path, sizeof(path), "%s/%s", dir, default_tracker_filename);
+    FILE *fp = fopen(path, "r");
+    ck_assert_ptr_nonnull(fp);
+    char text[4096] = {0};
+    size_t n = fread(text, 1, sizeof(text) - 1, fp);
+    fclose(fp);
+    unlink(path);
+    rmdir(dir);
+    ck_assert(n > 0);
+    ck_assert(strstr(text, "id_proc") != NULL);
+    for (size_t i = 0; i < sizeof(feature) / sizeof(feature[0]); i++)
+        ck_assert(strstr(text, feature[i][1]) == NULL);
+
+    /* Configured anyway: refused, one line per subsystem. An unknown runner
+     * that is no feature's is not this check's to refuse. */
+    tracker_t tracker;
+    ck_assert_int_eq(tracker_init(NULL, &tracker), 0);
+    ck_assert_int_eq(tracker_register_subsystem(&tracker, "identity", "id_proc"), 0);
+    ck_assert_int_eq(tracker_register_subsystem(&tracker, "mystery", "no_such_proc"), 0);
+    ck_assert_int_eq(tracker_check_subsystem_libraries(&tracker, NULL), 0);
+    ck_assert_int_eq(tracker_register_subsystem(&tracker, "data-source", "data_source_proc"), 0);
+    ck_assert_int_eq(tracker_check_subsystem_libraries(&tracker, NULL), -1);
+    tracker_free(&tracker);
+    ck_assert_int_eq(tracker_init(NULL, &tracker), 0);
+    ck_assert_int_eq(tracker_register_subsystem(&tracker, "fleet", "fleet_proc"), 0);
+    ck_assert_int_eq(tracker_check_subsystem_libraries(&tracker, NULL), -1);
+    tracker_free(&tracker);
+
+    /* The default-subsystem registry refuses what process_table_append does. */
+    ck_assert_int_eq(subsystem_default_register(NULL, "x_proc"), -1);
+    ck_assert_int_eq(subsystem_default_register("x", ""), -1);
+    ck_assert_int_eq(subsystem_default_register("probe-sub", "probe_proc"), 0);
+    ck_assert_int_eq(subsystem_default_register("probe-sub", "probe_proc"), -1);
+    const char *keys[AT_SUBSYSTEM_EXT_MAX], *impls[AT_SUBSYSTEM_EXT_MAX];
+    ck_assert_uint_eq(subsystem_defaults(keys, impls, AT_SUBSYSTEM_EXT_MAX), 1);
+    ck_assert_str_eq(keys[0], "probe-sub");
+    ck_assert_str_eq(impls[0], "probe_proc");
+    static char sub_names[AT_SUBSYSTEM_EXT_MAX][16];
+    int accepted = 0;
+    for (int i = 0; i < AT_SUBSYSTEM_EXT_MAX; i++) {
+        snprintf(sub_names[i], sizeof(sub_names[i]), "fill-sub-%d", i);
+        if (subsystem_default_register(sub_names[i], "probe_proc") == 0)
+            accepted++;
+    }
+    ck_assert_int_eq(accepted, AT_SUBSYSTEM_EXT_MAX - 1);   /* probe-sub took one */
+
+    /* A capability added at load is found like a generated one. */
+    ck_assert_int_eq(capability_table_append("probe_cap", NULL, NULL), 0);
+    capability_t *cap = find_capability("probe_cap");
+    ck_assert_ptr_nonnull(cap);
+    ck_assert(cap->local);
+    ck_assert_int_eq(capability_table_append("probe_cap", NULL, NULL), -1);
+    ck_assert_int_eq(capability_table_append(NULL, NULL, NULL), -1);
+    ck_assert_int_eq(capability_table_append("", NULL, NULL), -1);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(Extension, test_registration_refusals,
           test_gate_is_reread_and_dispatch_is_per_process,
           test_first_contact_registers_exactly_when_enabled,
@@ -392,4 +475,5 @@ RUN_TESTS(Extension, test_registration_refusals,
           test_process_table_append,
           test_configuration_and_error_table_append,
           test_core_only_refuses_an_enabled_zta_policy,
-          test_core_only_has_no_social_and_refuses_its_declarations)
+          test_core_only_has_no_social_and_refuses_its_declarations,
+          test_core_only_has_no_fleet_and_refuses_its_subsystems)
