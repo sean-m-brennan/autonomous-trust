@@ -399,7 +399,7 @@ DEFINE_TEST(test_core_only_has_no_fleet_and_refuses_its_subsystems)
     static const char *const feature[][2] = {
         { "fleet", "fleet_proc" }, { "artifact", "artifact_proc" },
         { "update", "update_proc" }, { "config", "config_proc" },
-        { "data-source", "data_source_proc" },
+        { "data-source", "data_source_proc" }, { "zta_verify", "zta_proc" },
     };
     for (size_t i = 0; i < sizeof(feature) / sizeof(feature[0]); i++)
         ck_assert_ptr_null(find_process(feature[i][1]));
@@ -436,6 +436,10 @@ DEFINE_TEST(test_core_only_has_no_fleet_and_refuses_its_subsystems)
     tracker_free(&tracker);
     ck_assert_int_eq(tracker_init(NULL, &tracker), 0);
     ck_assert_int_eq(tracker_register_subsystem(&tracker, "fleet", "fleet_proc"), 0);
+    ck_assert_int_eq(tracker_check_subsystem_libraries(&tracker, NULL), -1);
+    tracker_free(&tracker);
+    ck_assert_int_eq(tracker_init(NULL, &tracker), 0);
+    ck_assert_int_eq(tracker_register_subsystem(&tracker, "zta_verify", "zta_proc"), 0);
     ck_assert_int_eq(tracker_check_subsystem_libraries(&tracker, NULL), -1);
     tracker_free(&tracker);
 

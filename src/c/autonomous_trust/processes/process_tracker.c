@@ -124,6 +124,7 @@ static const struct { const char *key; const char *lib; } subsystem_libraries[] 
     { "update", "libat_fleet" },
     { "config", "libat_fleet" },
     { "data-source", "libat_data_source" },
+    { "zta_verify", "libat_zta" },
 };
 
 int tracker_check_subsystem_libraries(const tracker_t *tracker, logger_t *logger)

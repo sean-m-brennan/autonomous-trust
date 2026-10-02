@@ -38,6 +38,7 @@ from ..extensions import (configure_plaintext_verbs, load_extensions,
                           network_hooks, run_post_fork)
 from .. import _probes
 from ..identity import Group
+from ..identity.peers import strip_cidr
 from ..system import (CfgIds, PortSource, comm_port, net_cadence, resolve_comm_port,
                       default_annoy_limit, default_mystery_max_age_s, default_recv_poll_ms,
                       resolve_annoy_limit, resolve_mystery_max_age_s, resolve_recv_poll_ms)
@@ -433,6 +434,20 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
     # process(), which matters because threading primitives can't survive
     # the multiprocessing spawn pickle (see _ensure_ping_at_pool).
 
+    def rebind_socket_timeouts(self):
+        """Give the bound receive sockets their timeout again, in the worker
+        (see process()). A transport without them -- DTN, the hybrid -- has
+        nothing to rebind; reading them inside the loop's tuple, outside any
+        try, used to raise AttributeError there and end the network process."""
+        for name in ('recv_ptp_sock', 'recv_grp_sock', 'recv_cast_sock'):
+            sock = getattr(self, name, None)
+            if sock is None:
+                continue
+            try:
+                sock.settimeout(self.socket_timeout)
+            except OSError:
+                pass
+
     def _init_transport(self):
         """Per-worker transport setup that can't be pickled across the
         spawn handoff (e.g. locks). Called once before receiver threads
@@ -500,10 +515,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         from_addr seen at recv."""
         if address is None:
             return None
-        address = str(address)
-        if '/' in address:
-            address = address.split('/')[0]
-        return address
+        return strip_cidr(str(address))
 
     def reject_message(self, address):
         """Check if an address is excluded (reputation cut-off) or
@@ -1031,12 +1043,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         # but the Python-level timeout tracking does not — without
         # this rebinding, recvfrom raises BlockingIOError on the very
         # first call. (Surfaced 2026-05-01 by tests/diag/harness.py.)
-        for _sock in (self.recv_ptp_sock, self.recv_grp_sock,
-                      self.recv_cast_sock):
-            try:
-                _sock.settimeout(self.socket_timeout)
-            except (OSError, AttributeError):
-                pass
+        self.rebind_socket_timeouts()
         self._init_transport()
         self.start_receivers(queues)
         for hooks in network_hooks(self):
@@ -1182,9 +1189,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                         self.track_send_error(self.unknown_peer)
                             else:  # defaults to pseudo-multicast
                                 for who in message.to_whom:  # Message ensures this is list  # noqa
-                                    address = who.address
-                                    if '/' in address:
-                                        address = address.split('/')[0]
+                                    address = strip_cidr(who.address)
                                     # Gateway boundary, invariant B: the
                                     # pre-admission handshake stays inside the
                                     # domain it started in.

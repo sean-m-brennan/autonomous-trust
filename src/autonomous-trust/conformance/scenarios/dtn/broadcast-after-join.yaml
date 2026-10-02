@@ -1,0 +1,28 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: "1"
+kind: "scenario"
+protocol: "dtn"
+name: "broadcast-after-join"
+description: |
+  A joined node broadcasts on its group's /bcast endpoint.
+byte_pinning: false
+participants:
+  - id: "host"
+    role: "recipient"
+fixtures:
+  dtn:
+    op: "broadcast_eid"
+    channel: "broadcast"
+    group_uuid: "11223344-5566-7788-99aa-bbccddeeff00"
+steps:
+  - id: 1
+    from: "host"
+    to: "host"
+    function: "broadcast_eid"
+    description: "trigger: broadcast_eid"
+expected_state:
+  host:
+    eid: "dtn://at-group-1122334455667788/bcast"
