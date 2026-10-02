@@ -1,4 +1,4 @@
-*Previous: [First contact](first-contact.md)*
+*Previous: [Rendezvous](rendezvous.md)*
 
 # Getting work done
 

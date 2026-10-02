@@ -150,6 +150,15 @@ option(AT_STATIC "Link at_demo fully statically (no shared library dependencies)
 # Zero Trust Architecture integration: builds libat_zta (src/c/extensions/zta,
 # which brings OpenSSL). The core itself needs neither (FEATURE_SPLIT_PLAN Phase 6).
 option(AT_ZTA "Build the Zero Trust credential integration library (libat_zta)" OFF)
+# First contact: introductions, contacts, the directory and area hubs, one
+# human's devices (src/c/extensions/first_contact, FEATURE_SPLIT_PLAN Phase 7).
+# Built by default; $AT_FIRST_CONTACT still turns it on at run time.
+option(AT_FIRST_CONTACT_LIB "Build the first-contact library (libat_first_contact)" ON)
+# Rendezvous: the relay client and server, reachability records, the seed list
+# and rosters (src/c/extensions/rendezvous, FEATURE_SPLIT_PLAN Phase 7b). Built
+# by default; first contact needs it. $AT_USE_RELAY / $AT_RELAY turn it on at
+# run time.
+option(AT_RENDEZVOUS_LIB "Build the rendezvous library (libat_rendezvous)" ON)
 
 # Extension libraries that live OUTSIDE this tree (e.g. Agora's libat_social):
 # a list of directories, each holding an extension's CMakeLists.txt. Each is
@@ -414,7 +423,6 @@ set(table_headers_in
 set(libsrc
     autonomous_trust/autonomous_trust.c
     autonomous_trust/app_events.c
-    autonomous_trust/first_contact_app.c
     # The daemon's side of the app-facing wire, in flat form, so a foreign
     # consumer's tests can play daemon. Nothing in AT calls it; it is here for
     # the same reason messaging_set_test_hook is in message.h.
@@ -436,45 +444,27 @@ set(libsrc
     autonomous_trust/identity/identity.c
     autonomous_trust/identity/id_proc.c
     autonomous_trust/identity/id_ext.c
-    autonomous_trust/identity/first_contact.c
-    autonomous_trust/identity/directory_contact.c
-    autonomous_trust/identity/area_contact.c
-    autonomous_trust/identity/device_contact.c
-    autonomous_trust/identity/sibling_sync.c
-    autonomous_trust/identity/backup_contact.c
     autonomous_trust/identity/peers.c
     autonomous_trust/identity/signature.c
-    autonomous_trust/contacts/contact.c
-    autonomous_trust/contacts/directory.c
-    autonomous_trust/contacts/area_card.c
-    autonomous_trust/contacts/backup.c
-    autonomous_trust/contacts/device.c
-    autonomous_trust/contacts/invitation.c
-    autonomous_trust/contacts/reach.c
-    autonomous_trust/contacts/siblings.c
-    autonomous_trust/contacts/store.c
-    autonomous_trust/contacts/sync.c
     autonomous_trust/negotiation/task.c
     autonomous_trust/negotiation/negotiation.c
     autonomous_trust/negotiation/neg_proc.c
     autonomous_trust/negotiation/neg_oracle.c
+    autonomous_trust/negotiation/neg_ext.c
     autonomous_trust/negotiation/neg_certified.c
     autonomous_trust/reputation/reputation.c
     autonomous_trust/reputation/rep_proc.c
+    autonomous_trust/reputation/rep_ext.c
     autonomous_trust/config/generate.c
     autonomous_trust/network/net_message.c
     autonomous_trust/network/net_proc.c
-    autonomous_trust/network/net_relay.c
-    autonomous_trust/network/net_relay_seeds.c
-    autonomous_trust/network/net_relay_rosters.c
-    autonomous_trust/network/net_registry.c
-    autonomous_trust/network/net_hub.c
     autonomous_trust/network/net_transport_ip.c
     autonomous_trust/network/net_transport_udp.c
     autonomous_trust/network/net_transport_tcp.c
     autonomous_trust/network/net_transport_hybrid.c
     autonomous_trust/network/net_transport_registry.c
     autonomous_trust/network/net_filter.c
+    autonomous_trust/network/net_ext.c
     autonomous_trust/network/network.c
     autonomous_trust/bootstrap/bootstrap_capabilities.c
     autonomous_trust/bootstrap/bootstrap_worker.c
@@ -483,6 +473,7 @@ set(libsrc
     autonomous_trust/processes/process_tracker.c
     autonomous_trust/processes/processes.c
     autonomous_trust/processes/extension.c
+    autonomous_trust/processes/plaintext_verbs.c
     autonomous_trust/structures/array.c
     autonomous_trust/structures/dag.c
     autonomous_trust/structures/data.c
@@ -533,7 +524,6 @@ set(libhdr
     # source tree until now.
     autonomous_trust/app_events.h
     autonomous_trust/app_events_test_support.h
-    autonomous_trust/at_first_contact.h
     autonomous_trust/app_node.h
     autonomous_trust/node.h
     autonomous_trust/algorithms/agreement.h
@@ -1056,54 +1046,9 @@ add_executable(unencrypted_verbs_test test/unencrypted_verbs_test.c)
 set_source_files_properties(test/unencrypted_verbs_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(unencrypted_verbs_test PRIVATE ${AT_TEST_LIBS})
 
-add_executable(first_contact_endpoint_test test/first_contact_endpoint_test.c)
-set_source_files_properties(test/first_contact_endpoint_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(first_contact_endpoint_test PRIVATE ${AT_TEST_LIBS})
 
-add_executable(first_contact_app_test test/first_contact_app_test.c)
-set_source_files_properties(test/first_contact_app_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(first_contact_app_test PRIVATE ${AT_TEST_LIBS})
 
-add_executable(net_relay_test test/net_relay_test.c)
-set_source_files_properties(test/net_relay_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(net_relay_test PRIVATE ${AT_TEST_LIBS})
-add_executable(directory_contact_test test/directory_contact_test.c)
-set_source_files_properties(test/directory_contact_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(directory_contact_test PRIVATE ${AT_TEST_LIBS})
-add_executable(directory_test test/directory_test.c)
-set_source_files_properties(test/directory_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(directory_test PRIVATE ${AT_TEST_LIBS})
-add_executable(net_registry_test test/net_registry_test.c)
-set_source_files_properties(test/net_registry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(net_registry_test PRIVATE ${AT_TEST_LIBS})
-add_executable(net_hub_test test/net_hub_test.c)
-set_source_files_properties(test/net_hub_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(net_hub_test PRIVATE ${AT_TEST_LIBS})
-add_executable(contacts_device_test test/contacts_device_test.c)
-set_source_files_properties(test/contacts_device_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(contacts_device_test PRIVATE ${AT_TEST_LIBS})
-add_executable(contacts_sync_test test/contacts_sync_test.c)
-set_source_files_properties(test/contacts_sync_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(contacts_sync_test PRIVATE ${AT_TEST_LIBS})
-add_executable(contacts_backup_test test/contacts_backup_test.c)
-set_source_files_properties(test/contacts_backup_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(contacts_backup_test PRIVATE ${AT_TEST_LIBS})
-add_executable(sibling_sync_test test/sibling_sync_test.c)
-set_source_files_properties(test/sibling_sync_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(sibling_sync_test PRIVATE ${AT_TEST_LIBS})
-add_executable(device_contact_test test/device_contact_test.c)
-set_source_files_properties(test/device_contact_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(device_contact_test PRIVATE ${AT_TEST_LIBS})
-add_executable(net_relay_seeds_test test/net_relay_seeds_test.c)
-set_source_files_properties(test/net_relay_seeds_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(net_relay_seeds_test PRIVATE ${AT_TEST_LIBS})
-add_executable(net_relay_rosters_test test/net_relay_rosters_test.c)
-set_source_files_properties(test/net_relay_rosters_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(net_relay_rosters_test PRIVATE ${AT_TEST_LIBS})
 
-add_executable(first_contact_live_test test/first_contact_live_test.c)
-set_source_files_properties(test/first_contact_live_test.c PROPERTIES COMPILE_FLAGS "-Wall")
-target_link_libraries(first_contact_live_test PRIVATE ${AT_TEST_LIBS})
 
 add_executable(net_source_bind_test test/net_source_bind_test.c)
 set_source_files_properties(test/net_source_bind_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1130,24 +1075,6 @@ add_test(NAME network2_test COMMAND $<TARGET_FILE:network2_test>)
 add_test(NAME net_port_test COMMAND $<TARGET_FILE:net_port_test>)
 add_test(NAME cidr_split_test COMMAND $<TARGET_FILE:cidr_split_test>)
 add_test(NAME unencrypted_verbs_test COMMAND $<TARGET_FILE:unencrypted_verbs_test>)
-add_test(NAME first_contact_endpoint_test COMMAND $<TARGET_FILE:first_contact_endpoint_test>)
-add_test(NAME first_contact_app_test COMMAND $<TARGET_FILE:first_contact_app_test>)
-add_test(NAME net_relay_test COMMAND $<TARGET_FILE:net_relay_test>)
-add_test(NAME directory_contact_test COMMAND $<TARGET_FILE:directory_contact_test>)
-add_test(NAME directory_test COMMAND $<TARGET_FILE:directory_test>)
-add_test(NAME net_registry_test COMMAND $<TARGET_FILE:net_registry_test>)
-add_test(NAME net_hub_test COMMAND $<TARGET_FILE:net_hub_test>)
-add_test(NAME contacts_device_test COMMAND $<TARGET_FILE:contacts_device_test>)
-add_test(NAME contacts_sync_test COMMAND $<TARGET_FILE:contacts_sync_test>)
-add_test(NAME contacts_backup_test COMMAND $<TARGET_FILE:contacts_backup_test>)
-add_test(NAME sibling_sync_test COMMAND $<TARGET_FILE:sibling_sync_test>)
-add_test(NAME device_contact_test COMMAND $<TARGET_FILE:device_contact_test>)
-add_test(NAME net_relay_seeds_test COMMAND $<TARGET_FILE:net_relay_seeds_test>)
-add_test(NAME net_relay_rosters_test COMMAND $<TARGET_FILE:net_relay_rosters_test>)
-# Two real daemons on 127.0.0.1/.2 (~10 s). Labelled so a quick run can skip
-# it: `ctest -LE live`.
-add_test(NAME first_contact_live_test COMMAND $<TARGET_FILE:first_contact_live_test>)
-set_tests_properties(first_contact_live_test PROPERTIES TIMEOUT 240 LABELS live)
 add_test(NAME net_source_bind_test COMMAND $<TARGET_FILE:net_source_bind_test>)
 add_test(NAME net_tcp_multiframe_test COMMAND $<TARGET_FILE:net_tcp_multiframe_test>)
 add_test(NAME proc_tracker2_test COMMAND $<TARGET_FILE:proc_tracker2_test>)
@@ -1402,6 +1329,10 @@ add_executable(neg_oracle_test test/neg_oracle_test.c)
 set_source_files_properties(test/neg_oracle_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(neg_oracle_test PRIVATE ${AT_TEST_LIBS})
 add_test(NAME neg_oracle_test COMMAND $<TARGET_FILE:neg_oracle_test>)
+add_executable(ext_hooks_test test/ext_hooks_test.c)
+set_source_files_properties(test/ext_hooks_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(ext_hooks_test PRIVATE ${AT_TEST_LIBS})
+add_test(NAME ext_hooks_test COMMAND $<TARGET_FILE:ext_hooks_test>)
 
 add_executable(net_filter_test test/net_filter_test.c)
 set_source_files_properties(test/net_filter_test.c PROPERTIES COMPILE_FLAGS "-Wall")
@@ -1509,6 +1440,33 @@ if(AT_ZTA)
                 -Wl,--whole-archive at_zta_static -Wl,--no-whole-archive
                 ${AT_TEST_LIBS} OpenSSL::SSL OpenSSL::Crypto)
         endforeach()
+    endif()
+endif()
+if(AT_RENDEZVOUS_LIB)
+    add_subdirectory(extensions/rendezvous)
+endif()
+if(AT_FIRST_CONTACT_LIB)
+    if(NOT AT_RENDEZVOUS_LIB)
+        message(FATAL_ERROR "AT_FIRST_CONTACT_LIB needs AT_RENDEZVOUS_LIB: first "
+                            "contact rides the rendezvous relays")
+    endif()
+    add_subdirectory(extensions/first_contact)
+    # Core tests with a first-contact half: built with it, and the library
+    # linked whole, when it is built; the core half alone otherwise.
+    if(LIBCHECK_LIBRARY)
+        foreach(_t extension_test unencrypted_verbs_test)
+            target_compile_definitions(${_t} PRIVATE AT_FIRST_CONTACT_ENABLED)
+            target_include_directories(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/extensions)
+            target_link_libraries(${_t} PRIVATE
+                -Wl,--whole-archive at_first_contact_static at_rendezvous_static
+                -Wl,--no-whole-archive ${AT_TEST_LIBS})
+        endforeach()
+        # Rendezvous's own roster test (it links rendezvous already): the hub
+        # preference needs first contact's area provider.
+        target_compile_definitions(net_relay_rosters_test PRIVATE AT_FIRST_CONTACT_ENABLED)
+        target_link_libraries(net_relay_rosters_test PRIVATE
+            -Wl,--whole-archive at_first_contact_static -Wl,--no-whole-archive
+            ${AT_TEST_LIBS})
     endif()
 endif()
 foreach(_ext_dir ${AT_EXTERNAL_EXTENSIONS})

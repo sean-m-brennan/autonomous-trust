@@ -16,28 +16,21 @@
 """The feature-extension hook (core/_python/extensions.py, FEATURE_SPLIT_PLAN
 Phase 0) and the backend redirector's feature prefixes.
 
-Pins: ``enabled`` is re-read on every load, handlers go only to the process
-the extension names, first contact is the built-in client, and an
-``IdentityProcess`` with first contact on still pickles -- multiproc mode
-ships it to its worker that way, and the old lambda handlers did not pickle.
+Pins: ``enabled`` is re-read on every load, and handlers go only to the
+process the extension names. First contact's own registration is pinned in its
+distribution (autonomous-trust-first-contact, test_first_contact_extension.py).
 """
-import pickle
 import sys
 import types
 
 import pytest
 
 from autonomous_trust.core import _backend_prefixes, register_backend_prefix
-from autonomous_trust.core.system import CfgIds, PackageHash
+from autonomous_trust.core.system import CfgIds
 from autonomous_trust.core.config import Configuration
-from autonomous_trust.core.identity import Identity, Peers
-from autonomous_trust.core.identity.protocol import IdentityProtocol
-from autonomous_trust.core.capabilities import PeerCapabilities
-from autonomous_trust.core.processes import ProcessTracker
 from autonomous_trust.core._python import extensions
 from autonomous_trust.core._python.extensions import (Extension, load_extensions,
                                                       run_post_fork, reset_extensions)
-from autonomous_trust.core._python.identity.idprocess import IdentityProcess
 
 
 @pytest.fixture(autouse=True)
@@ -78,6 +71,7 @@ def only(monkeypatch):
     def _set(*exts):
         monkeypatch.setattr(extensions, '_builtin', lambda: list(exts))
         monkeypatch.setattr(extensions, '_installed', lambda: [])
+        monkeypatch.setattr(extensions, '_source_tree', lambda: [])
     return _set
 
 
@@ -151,41 +145,37 @@ def test_a_broken_installed_extension_is_skipped(monkeypatch, caplog):
     assert 'broken' in caplog.text
 
 
-# -- first contact, the built-in client ---------------------------------------
-def test_first_contact_is_builtin():
-    assert 'first_contact' in [e.name for e in extensions.all_extensions()]
+# -- a feature asked for but absent ------------------------------------------
+@pytest.mark.parametrize('value,refused', [('1', True), ('on', True), ('0', False),
+                                           ('', False)])
+def test_first_contact_asked_for_but_absent(only, monkeypatch, value, refused):
+    """AT_FIRST_CONTACT is a switch: on without first contact's distribution,
+    the node refuses to start rather than run without it; off, it asks for
+    nothing. Same as C's identity_ext_check_env."""
+    only()
+    monkeypatch.setenv('AT_FIRST_CONTACT', value)
+    if refused:
+        with pytest.raises(extensions.ExtensionMissingError):
+            extensions.check_env()
+    else:
+        extensions.check_env()
 
 
-def _identity_process():
-    configurations = {
-        CfgIds.identity: Identity.initialize('alice@ex', 'alice@ex', '10.0.0.1'),
-        CfgIds.peers: Peers(),
-        CfgIds.capabilities: PeerCapabilities(),
-        PackageHash.key: 'test',
-        'processes': [types.SimpleNamespace(name=CfgIds.network)],
-    }
-    return IdentityProcess(configurations, ProcessTracker(), log_q=None,
-                           suppress_log=True)
-
-
-@pytest.mark.parametrize('flag,expect', [('1', True), ('0', False)])
-def test_first_contact_registers_exactly_when_enabled(monkeypatch, flag, expect):
-    monkeypatch.setenv('AT_FIRST_CONTACT', flag)
-    proc = _identity_process()
-    assert (IdentityProtocol.hello in proc.protocol.handlers) is expect
-    assert (IdentityProtocol.hello_ack in proc.protocol.handlers) is expect
-    assert ('first_contact' in proc._extensions) is expect
-
-
-def test_identity_process_with_first_contact_pickles(monkeypatch):
-    """Multiproc mode pickles the process (pool.apply_async(proc.process));
-    the old lambda handlers made that fail whenever AT_FIRST_CONTACT=1."""
-    monkeypatch.setenv('AT_FIRST_CONTACT', '1')
-    proc = _identity_process()
-    clone = pickle.loads(pickle.dumps(proc))
-    assert 'first_contact' in clone._extensions
-    handler = clone.protocol.handlers[IdentityProtocol.hello]
-    assert handler.args[0] is clone  # bound to the clone, not the original
+@pytest.mark.parametrize('env,value,refused', [
+    ('AT_USE_RELAY', '198.51.100.1:27790', True), ('AT_USE_RELAY', '', False),
+    ('AT_RELAY', '1', True), ('AT_RELAY', '0', False),
+    ('AT_RELAY_SEED_FALLBACK', 'yes', True), ('AT_RELAY_SEED_FALLBACK', 'off', False)])
+def test_a_relay_asked_for_without_rendezvous(only, monkeypatch, env, value, refused):
+    """A node told to use a relay, serve as one, or fall back on the rosters and
+    seed list refuses to start without rendezvous (FEATURE_SPLIT_PLAN 7b); the
+    two switches set off declare nothing. Same as C's identity_ext_check_env."""
+    only()
+    monkeypatch.setenv(env, value)
+    if refused:
+        with pytest.raises(extensions.ExtensionMissingError):
+            extensions.check_env()
+    else:
+        extensions.check_env()
 
 
 # -- backend redirector feature prefixes -------------------------------------

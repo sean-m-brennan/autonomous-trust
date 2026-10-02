@@ -55,8 +55,10 @@
 #include "../scenario_engine.h"
 #include "../scenario_loader.h"  /* at_byte_pin_json, at_load_testdata_bytes */
 #include "identity/identity_priv.h"  /* public_identity_from_json */
-#include "contacts/contacts.h"
-#include "contacts/device.h"
+#ifdef AT_FIRST_CONTACT_ENABLED   /* libat_first_contact is built */
+#include "first_contact/contacts.h"
+#include "first_contact/device.h"
+#endif
 #include "config/configuration.h"
 
 /* ------------------------------------------------------------------------- */
@@ -207,6 +209,7 @@ static bool _apply_first_contact(sce_run_ctx_t *ctx)
     setenv("AUTONOMOUS_TRUST_ROOT", root, 1);
     setenv("AT_FIRST_CONTACT", "1", 1);
 
+#ifdef AT_FIRST_CONTACT_ENABLED
     char dir[CFG_PATH_LEN + 1] = {0};
     if (get_data_dir(dir, sizeof(dir)) <= 0)
         return true;
@@ -277,6 +280,7 @@ static bool _apply_first_contact(sce_run_ctx_t *ctx)
     }
     (void)contacts_save(&store, dir);
     contacts_free(&store);
+#endif
     return true;
 }
 
@@ -979,6 +983,14 @@ void at_negotiation_run(const at_case_t *c, at_case_result_t *out)
         at_case_result_set_skip(out, detail);
         return;
     }
+#ifndef AT_FIRST_CONTACT_ENABLED
+    /* First contact's tier-cap scenarios need its library (AT_FIRST_CONTACT_LIB). */
+    if (json_object_get(json_object_get(c->data, "fixtures"), "first_contact") != NULL) {
+        at_case_result_set_skip(out, "first-contact scenario skipped: C built without "
+                                     "libat_first_contact (AT_FIRST_CONTACT_LIB=OFF)");
+        return;
+    }
+#endif
 
     char err[256] = {0};
     struct timespec t0, t1;

@@ -192,7 +192,46 @@ DEFINE_TEST(test_attest_a_fork_hands_it_back)
 }
 END_TEST_DEFINITION()
 
+/* The point of the whole mechanism: a committed attestation LOWERS its
+ * subject's score, in both regimes a node may score it under. Every other test
+ * here stops at "the entry is about its subject"; Stele's host cohort printed
+ * the subject's score before and after and passed with the two equal. */
+DEFINE_TEST(test_attest_lowers_its_subjects_score)
+{
+    uuid_generate(g_v);
+    uuid_generate(g_s);
+    uuid_t g_o;                                    /* the scoring node */
+    uuid_generate(g_o);
+    tx_history_t h;
+    reputations_t reps;
+    ck_assert_ret_ok(tx_history_init(&h));
+    ck_assert_ret_ok(reputations_init(&reps));
+    for (int i = 0; i < 10; i++)
+        _bilateral(&h, 0.9, 0.9);
+    ck_assert_ret_ok(reputations_update(&reps, g_v, 0.9));
+    ck_assert_ret_ok(reputations_update(&reps, g_s, 0.9));
+
+    double pure_before = reputation_pure(&h, &reps, g_s, NULL);
+    double ctft_before = reputation_contrite_tft(&h, &reps, g_o, g_s);
+    transaction_t tx = _attested(0.3, "probe");
+    ck_assert_ret_ok(tx_history_append_attested(&h, &tx, CERT));
+    double pure_after = reputation_pure(&h, &reps, g_s, NULL);
+    double ctft_after = reputation_contrite_tft(&h, &reps, g_o, g_s);
+
+    if (!(pure_after < pure_before - 0.01 && ctft_after < ctft_before - 0.01))
+        fprintf(stderr, "pure %.4f -> %.4f, contrite TFT %.4f -> %.4f\n",
+                pure_before, pure_after, ctft_before, ctft_after);
+    ck_assert(pure_after < pure_before - 0.01);
+    ck_assert(ctft_after < ctft_before - 0.01);
+    /* About its subject only: the verifier's own standing is untouched. */
+    ck_assert(reputation_pure(&h, &reps, g_v, NULL) > 0.89);
+    reputations_free(&reps);
+    tx_history_free(&h);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(RepAttest, test_attest_append_rules,
           test_attest_rides_the_catch_up_wire,
           test_attest_survives_the_evidence_document,
-          test_attest_a_fork_hands_it_back)
+          test_attest_a_fork_hands_it_back,
+          test_attest_lowers_its_subjects_score)

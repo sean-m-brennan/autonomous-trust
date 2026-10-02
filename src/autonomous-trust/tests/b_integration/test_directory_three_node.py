@@ -43,8 +43,8 @@ STEP = 30
 
 
 def _await(q_out, want, seen, timeout=STEP):
-    from autonomous_trust.core.identity.first_contact import FirstContactEvent
-    from autonomous_trust.core._python.identity.directory_contact import DirectoryEvent
+    from autonomous_trust.first_contact.first_contact import FirstContactEvent
+    from autonomous_trust.first_contact._python.directory_contact import DirectoryEvent
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -61,7 +61,7 @@ def _await(q_out, want, seen, timeout=STEP):
 
 def _signing_key(cfg_dir):
     from autonomous_trust.core.config import Configuration
-    from autonomous_trust.core._python.network import relay
+    from autonomous_trust.rendezvous._python import relay
     return relay._signing_hex(Configuration.from_file(
         os.path.join(cfg_dir, 'identity.cfg.json'))).lower()
 
@@ -76,8 +76,8 @@ def _setup(cohort):
 
 def _publish_and_find(cohort, seen_a, seen_b):
     from autonomous_trust.core.app_verbs import AppRequest
-    from autonomous_trust.core._python.contacts import directory as d
-    from autonomous_trust.core._python.identity import directory_contact as dc
+    from autonomous_trust.first_contact._python import directory as d
+    from autonomous_trust.first_contact._python import directory_contact as dc
     alice, bob = cohort['alice'], cohort['bob']
     att = d.attest(ISSUER, 'alice@example.org', _signing_key(alice['cfg_dir']),
                    int(time.time()) + 3600)
@@ -107,10 +107,10 @@ def _publish_and_find(cohort, seen_a, seen_b):
 
 def test_find_a_friend_by_handle(cohort):
     from autonomous_trust.core.app_verbs import AppRequest
-    from autonomous_trust.core.contacts import Contacts, Provenance
+    from autonomous_trust.first_contact import Contacts, Provenance
     from autonomous_trust.core.config import Configuration
-    from autonomous_trust.core.identity import first_contact as fc
-    from autonomous_trust.core._python.identity import directory_contact as dc
+    from autonomous_trust.first_contact import first_contact as fc
+    from autonomous_trust.first_contact._python import directory_contact as dc
     procs = _setup(cohort)
     seen_a, seen_b = [], []
     try:
@@ -137,8 +137,8 @@ def test_find_a_friend_by_handle(cohort):
 
 def test_a_request_waits_for_the_app(cohort):
     from autonomous_trust.core.app_verbs import AppRequest
-    from autonomous_trust.core.identity import first_contact as fc
-    from autonomous_trust.core._python.identity import directory_contact as dc
+    from autonomous_trust.first_contact import first_contact as fc
+    from autonomous_trust.first_contact._python import directory_contact as dc
     procs = _setup(cohort)
     seen_a, seen_b = [], []
     try:

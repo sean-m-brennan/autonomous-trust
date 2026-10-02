@@ -24,7 +24,6 @@
 
 #include "processes/processes.h"
 #include "network/net_transport.h"
-#include "network/net_relay.h"
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
 #include "utilities/logger.h"
@@ -93,118 +92,6 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
  *  sender. The caller keeps @p buf. */
 void handle_inbound_relayed(net_thread_ctx_t *ctx, const uint8_t *buf,
                             size_t nbytes, const char *from_uuid);
-
-/** @brief Identity's relay_route {uuid, relay}: reach that peer through that
- *  relay. Refused (-1) from the wire -- a peer must not reroute this node's
- *  traffic -- and when unusable; 0 when the route is set. */
-int net_handle_relay_route(net_msg_t *nmsg, logger_t *logger);
-
-/** @brief True iff @p peer is routed through a relay (tests). */
-bool net_relay_has_route(const uuid_t peer);
-/** @brief @p peer's relays, active first, into @p out (tests). @return how many. */
-size_t net_relay_route_endpoints(const uuid_t peer, net_relay_ep_t *out,
-                                 size_t max);
-/** @brief Forget every relay route (tests). */
-void net_relay_reset_routes(void);
-
-/** @brief Send @p buf to @p peer through its active relay, failing over down
- *  its route when one cannot be reached. 0 sent; -1 no relay reached it; 1 the
- *  peer has no relay route (send it directly). */
-int net_relay_send_to_peer(const uuid_t peer, const uint8_t *buf, size_t len);
-/** @brief Queue a relay's "unreachable" answer, as a client's reader does. */
-void net_relay_note_unreachable(const char *host, int port, const char *to_uuid);
-/** @brief Fail over and resend for each queued "unreachable". Run by the loop. */
-void net_relay_drain_unreachable(void);
-/** @brief Resend frames every relay refused whose retry is due. Run by the loop. */
-void net_relay_retry_refused(void);
-/** @brief Seconds before a refused frame is retried (tests shorten it). */
-void net_relay_set_retry_sec(int sec);
-/** @brief Reputation cut @p uuid off (@p excluded) or readmitted it: gates it
- *  as a relay client and as a relay, by uuid and by the key we hold for it. */
-void net_relay_note_exclusion(const char *uuid, bool excluded);
-/** @brief The relay gate: is @p uuid (proven to hold @p pubkey_hex)
- *  distrusted? See net_proc.c. */
-bool net_relay_is_distrusted(const char *uuid, const char *pubkey_hex);
-/** @brief Identity's reach_publish {body, sig}: our own reachability record,
- *  filed at our relays now and at each registration. Refused from the wire. */
-int net_handle_reach_publish(net_msg_t *nmsg, logger_t *logger);
-/** @brief Hand relay lookup answers to identity. Run by the loop. */
-void net_relay_drain_records(void);
-
-/** @brief The directory (net_registry.h), identity's local IPC: file our entry
- *  ({entry}) at our relays now and at each registration; withdraw it
- *  ({handle}); look a handle up at every relay we are registered at
- *  ({handle}). Each refused from the wire. Mirror Python
- *  NetworkProcess.handle_dir_*. */
-int net_handle_dir_publish(net_msg_t *nmsg, logger_t *logger);
-int net_handle_dir_withdraw(net_msg_t *nmsg, logger_t *logger);
-int net_handle_dir_lookup(net_msg_t *nmsg, logger_t *logger);
-/** @brief A registry's answer, as a relay client's on_dir (the reader thread);
- *  queued for @ref net_relay_drain_dir. Tests call it directly. */
-void net_relay_dir_answer(void *arg, const json_t *msg, const char *host, int port);
-/** @brief Hand registry answers to identity: a lookup's ONE outcome (the first
- *  entry found, or null once every relay asked has answered or 10 s passed)
- *  and the registry's word on our publish or withdraw. Run by the loop. */
-void net_relay_drain_dir(void);
-/** @brief Tests: make every lookup in flight @p seconds older. */
-void net_relay_dir_age_lookups(double seconds);
-/** @brief Stands in for the relay clients' dir_* requests (tests): each goes
- *  to @p fn (op "dir_publish" | "dir_withdraw" | "dir_lookup"), for each of
- *  our own relays as if connected. NULL restores. */
-typedef int (*net_relay_test_dir_fn)(const char *host, int port, const char *op,
-                                     const char *handle, const json_t *entry);
-void net_relay_set_test_dir(net_relay_test_dir_fn fn);
-
-/** @brief Area hubs (net_hub.h), identity's local IPC: file our card ({card})
- *  at our relays now and at each registration; withdraw it ({area}); ask every
- *  relay we are registered at who is listed in an area ({area}). Each refused
- *  from the wire. Mirror Python NetworkProcess.handle_hub_*. */
-int net_handle_hub_publish(net_msg_t *nmsg, logger_t *logger);
-int net_handle_hub_withdraw(net_msg_t *nmsg, logger_t *logger);
-int net_handle_hub_lookup(net_msg_t *nmsg, logger_t *logger);
-/** @brief A hub's answer, as a relay client's on_hub (the reader thread);
- *  queued for @ref net_relay_drain_hub. Tests call it directly. */
-void net_relay_hub_answer(void *arg, const json_t *msg, const char *host, int port);
-/** @brief Hand hub answers to identity: a lookup's ONE outcome (every card
- *  any relay asked held, once each has answered or 10 s passed) and a hub's
- *  word on our publish or withdraw (a relay that is no hub is not reported).
- *  Run by the loop. */
-void net_relay_drain_hub(void);
-/** @brief Tests: make every area lookup in flight @p seconds older. */
-void net_relay_hub_age_lookups(double seconds);
-/** @brief Stands in for the relay clients' hub_* requests (tests), as
- *  net_relay_set_test_dir does for dir_*: op "hub_publish" | "hub_withdraw" |
- *  "hub_lookup", @p area, and @p card for a publish. NULL restores. */
-typedef int (*net_relay_test_hub_fn)(const char *host, int port, const char *op,
-                                     const char *area, const json_t *card);
-void net_relay_set_test_hub(net_relay_test_hub_fn fn);
-/** Seconds an area lookup waits for its relays. Same as Python HUB_LOOKUP_TIMEOUT. */
-#define NET_HUB_LOOKUP_TIMEOUT_SEC 10.0
-#define NET_HUB_MAX_LOOKUPS 8
-
-/** Seconds a lookup waits for its relays. Same as Python DIR_LOOKUP_TIMEOUT. */
-#define NET_DIR_LOOKUP_TIMEOUT_SEC 10.0
-#define NET_DIR_MAX_LOOKUPS 32
-#define NET_DIR_MAX_ASKED 16
-typedef struct {
-    bool used;
-    char handle[128 + 1];
-    net_relay_ep_t asked[NET_DIR_MAX_ASKED];
-    bool answered[NET_DIR_MAX_ASKED];
-    size_t n_asked;
-    bool limited;
-    double since;
-} net_dir_lookup_t;
-
-/** @brief Stands in for the relay clients (tests): every relayed send goes to
- *  @p fn instead, which returns 0 when the relay "took" it. NULL restores. */
-typedef int (*net_relay_test_send_fn)(const char *host, int port,
-                                      const uuid_t to, const uint8_t *buf,
-                                      size_t len);
-void net_relay_set_test_sender(net_relay_test_send_fn fn);
-/** @brief The process whose peers[] the relay gate consults when there is no
- *  network context (tests). */
-void net_relay_set_test_proc(const process_t *proc);
 
 /** @brief Process one inbound BROADCAST-channel frame. See @ref handle_inbound_peer. */
 void handle_inbound_broadcast(net_thread_ctx_t *ctx,

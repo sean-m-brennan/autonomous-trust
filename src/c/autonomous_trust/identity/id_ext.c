@@ -17,11 +17,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include <jansson.h>
 
 #include "config/configuration.h"
 #include "identity/id_ext.h"
+#include "processes/extension.h"
 #include "identity/id_proc_priv.h"
 
 static const identity_ext_t *_exts[IDENTITY_EXT_MAX];
@@ -65,18 +67,43 @@ bool identity_ext_present(const char *name)
 /* The declarations a node's environment can make, and the extension that
  * must be present to honour each. Names only, as neg_oracle.c's table: the
  * core knows what a feature is called, never what it does, and an absent
- * feature cannot declare its own variables. */
-static const struct { const char *env; const char *ext; const char *lib; } declarations[] = {
-    { "AT_OWN_GEOHASH", "social", "libat_social" },
-    { "AT_OWN_PROFILE", "social", "libat_social" },
+ * feature cannot declare its own variables. A switch declares only when it is
+ * on (1/true/yes/on, as the feature reads it): AT_FIRST_CONTACT=0 asks for
+ * nothing. */
+static const struct {
+    const char *env;
+    const char *ext;
+    const char *lib;
+    bool is_switch;
+} declarations[] = {
+    { "AT_OWN_GEOHASH", "social", "libat_social", false },
+    { "AT_OWN_PROFILE", "social", "libat_social", false },
+    { "AT_FIRST_CONTACT", "first_contact", "libat_first_contact", true },
+    /* Rendezvous (FEATURE_SPLIT_PLAN Phase 7b): a node told to use a relay,
+     * serve as one, or fall back on the rosters and seed list. */
+    { "AT_USE_RELAY", "rendezvous", "libat_rendezvous", false },
+    { "AT_RELAY", "rendezvous", "libat_rendezvous", true },
+    { "AT_RELAY_SEED_FALLBACK", "rendezvous", "libat_rendezvous", true },
 };
+
+static bool _declares(const char *v, bool is_switch)
+{
+    if (v == NULL || v[0] == '\0')
+        return false;
+    if (!is_switch)
+        return true;
+    return strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0
+        || strcasecmp(v, "yes") == 0 || strcasecmp(v, "on") == 0;
+}
 
 int identity_ext_check_env(logger_t *logger)
 {
     int rc = 0;
     for (size_t i = 0; i < sizeof(declarations) / sizeof(declarations[0]); i++) {
         const char *v = getenv(declarations[i].env);
-        if (v == NULL || v[0] == '\0' || identity_ext_present(declarations[i].ext))
+        if (!_declares(v, declarations[i].is_switch)
+            || identity_ext_present(declarations[i].ext)
+            || at_extension_present(declarations[i].ext))
             continue;
         log_error(logger, "Identity: $%s is set, but %s is not loaded; refusing "
                           "to start rather than ignore it\n",

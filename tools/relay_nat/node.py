@@ -57,7 +57,7 @@ def _wait_file(path, deadline):
 
 
 def _await(q_out, want, deadline):
-    from autonomous_trust.core.identity.first_contact import FirstContactEvent
+    from autonomous_trust.first_contact.first_contact import FirstContactEvent
     while time.monotonic() < deadline:
         try:
             ev = q_out.get(timeout=1)
@@ -72,7 +72,7 @@ def _await(q_out, want, deadline):
 def _drive(args, q_in, q_out):
     from autonomous_trust.core import Process
     from autonomous_trust.core.app_verbs import AppRequest
-    from autonomous_trust.core.identity import first_contact as fc
+    from autonomous_trust.first_contact import first_contact as fc
     deadline = time.monotonic() + args.timeout
     result = os.path.join(args.share, '%s.result' % args.role)
     time.sleep(args.startup)
@@ -145,6 +145,11 @@ def main(argv=None):
     if not os.path.exists(os.path.join(cfg_dir, 'identity.cfg.json')):
         os.makedirs(cfg_dir, exist_ok=True)
         generate_identity(cfg_dir, randomize=True)
+    # First contact's plaintext verbs: granted, as a deployment must
+    # (unencrypted_verbs.cfg.json, FEATURE_SPLIT_PLAN D8).
+    from autonomous_trust.core import plaintext_verbs
+    from autonomous_trust.first_contact import first_contact
+    plaintext_verbs.write(cfg_dir, first_contact.EXTENSION.plaintext_verbs)
 
     q_in, q_out = queue.Queue(), queue.Queue()
     threading.Thread(target=_drive, args=(args, q_in, q_out), daemon=True).start()

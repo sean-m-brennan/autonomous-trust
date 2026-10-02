@@ -28,23 +28,44 @@ The gate is deliberately narrow. Plaintext acceptance is not new -- the
 unknown-sender branch has always tried a plaintext parse first -- but a peer in
 the listing must not be able to downgrade an arbitrary message to plaintext and
 have it honored. Three conditions, all required: it parses, its own `encrypt`
-flag is false, and the verb is in `UNENCRYPTED_VERBS`. The refusal cases below
-are the load-bearing half of this file.
+flag is false, and the verb is accepted in plaintext -- one of the core's
+`CORE_UNENCRYPTED_VERBS`, or an extension's verb that unencrypted_verbs.cfg.json
+grants (plaintext_verbs.py; the rules of that file are test_plaintext_verbs.py).
+The refusal cases below are the load-bearing half of this file.
 """
 from __future__ import annotations
 
 import ast
+import json
 import os
 from unittest.mock import MagicMock
 
 import pytest
 
+from autonomous_trust.core import plaintext_verbs
+from autonomous_trust.first_contact import first_contact
+from autonomous_trust.first_contact.fc_protocol import FirstContactProtocol
 from autonomous_trust.core.identity.protocol import (
     IdentityProtocol,
-    UNENCRYPTED_VERBS,
+    CORE_UNENCRYPTED_VERBS,
 )
 from autonomous_trust.core.network.netprocess import NetworkProcess
 from autonomous_trust.core.reputation import ReputationProtocol
+
+#: First contact's declared plaintext verbs, which the file below grants.
+FC_VERBS = frozenset(first_contact.EXTENSION.plaintext_verbs)
+#: Every verb the receiver accepts in plaintext once the file grants FC_VERBS.
+UNENCRYPTED_VERBS = CORE_UNENCRYPTED_VERBS | FC_VERBS
+
+
+@pytest.fixture(autouse=True)
+def _granted(tmp_path):
+    """The node's plaintext-verbs file names first contact's verbs."""
+    (tmp_path / plaintext_verbs.FILENAME).write_text(
+        json.dumps({'verbs': sorted(FC_VERBS)}))
+    plaintext_verbs.configure(str(tmp_path), [first_contact.EXTENSION])
+    yield
+    plaintext_verbs.reset()
 
 
 def _envelope(function, encrypt=False, process='identity'):
@@ -80,6 +101,15 @@ class TestAllowlistedVerbsAreAccepted:
         # Delivered without signature validation, as the unknown-sender branch
         # does for the same messages.
         assert proc._msg_to_queue.call_args.kwargs.get('validate') is False
+
+    @pytest.mark.parametrize('verb', sorted(FC_VERBS))
+    def test_an_extension_verb_is_refused_without_the_file(self, verb):
+        """First contact's verbs are plaintext only because the file grants
+        them; the core's are compiled in."""
+        plaintext_verbs.reset()
+        proc = _proc()
+        assert _accept(proc, _envelope(verb)) is False
+        assert _accept(proc, _envelope(IdentityProtocol.accept)) is True
 
     def test_access_granted_specifically(self):
         """The verb actually observed being dropped. Named explicitly because
@@ -143,16 +173,20 @@ class TestAllowlistMatchesTheSendSites:
     def _unencrypted_sends(self):
         """Every `Message(CfgIds.x, IdentityProtocol.verb, ..., encrypt=False)`
         in the identity process, resolved to its wire verb. Scans idprocess.py
-        and first_contact.py (the opt-in 1:1 handshake sends hello/hello_ack
-        plaintext from that module)."""
+        and first contact's modules (the opt-in 1:1 handshake sends hello/hello_ack
+        plaintext from first_contact.py)."""
         id_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(
                 os.path.abspath(__file__)))),
             'autonomous_trust', 'core', '_python', 'identity')
+        # First contact's modules, wherever its distribution is.
+        fc_dir = os.path.dirname(os.path.abspath(first_contact.__file__))
         found = {}
-        for fname in ('idprocess.py', 'first_contact.py', 'directory_contact.py',
-                      'device_contact.py'):
-            tree = ast.parse(open(os.path.join(id_dir, fname)).read())
+        for path in (os.path.join(id_dir, 'idprocess.py'),
+                     *(os.path.join(fc_dir, f) for f in (
+                         'first_contact.py', 'directory_contact.py',
+                         'device_contact.py'))):
+            tree = ast.parse(open(path).read())
             self._scan_sends(tree, found)
         return found
 
@@ -172,11 +206,14 @@ class TestAllowlistMatchesTheSendSites:
             if not plaintext or len(node.args) < 2:
                 continue
             verb_node = node.args[1]
-            # Only resolve the IdentityProtocol.<attr> form; anything else is
-            # reported rather than silently skipped.
-            if (isinstance(verb_node, ast.Attribute)
-                    and getattr(verb_node.value, 'id', None) == 'IdentityProtocol'):
-                verb = getattr(IdentityProtocol, verb_node.attr, None)
+            # Only resolve the IdentityProtocol.<attr> and
+            # FirstContactProtocol.<attr> forms; anything else is reported
+            # rather than silently skipped.
+            owner = {'IdentityProtocol': IdentityProtocol,
+                     'FirstContactProtocol': FirstContactProtocol}.get(
+                getattr(getattr(verb_node, 'value', None), 'id', None))
+            if isinstance(verb_node, ast.Attribute) and owner is not None:
+                verb = getattr(owner, verb_node.attr, None)
                 if verb is not None:
                     found[verb] = verb_node.attr
             else:
@@ -188,8 +225,9 @@ class TestAllowlistMatchesTheSendSites:
         assert sends, 'found no encrypt=False sends -- the scan broke, not the code'
         missing = {v: n for v, n in sends.items() if v not in UNENCRYPTED_VERBS}
         assert not missing, (
-            'these verbs are sent with encrypt=False but are not in '
-            'UNENCRYPTED_VERBS, so a known peer will silently drop them: %r'
+            'these verbs are sent with encrypt=False but are neither core '
+            'plaintext verbs nor first contact\'s declared ones, so a known peer '
+            'will silently drop them: %r'
             % missing)
 
     def test_allowlist_carries_no_verb_nobody_sends(self):

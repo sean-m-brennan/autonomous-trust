@@ -29,8 +29,11 @@ for Phase A and raise NotImplementedError so the runner records them as skip.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -326,7 +329,14 @@ class NetworkAdapter:
         pinned issuers: accepted or refused, and when accepted the seq and the
         relays as ``uuid:fp@host:port``. The file check only; the seq floor is
         node state."""
-        from autonomous_trust.core._python.network import relay_rosters
+        try:
+            from autonomous_trust.rendezvous._python import relay_rosters
+        except ImportError:
+            # Rosters are rendezvous's (FEATURE_SPLIT_PLAN Phase 7b), as C's
+            # case skips without libat_rendezvous.
+            raise NotImplementedError(
+                'rendezvous case skipped: autonomous-trust-rendezvous is not installed '
+                '(put src/autonomous-trust-rendezvous on the path to run it symmetrically)')
         should = bool(exp.get('valid', True))
         try:
             _issuer, seq, relays, areas = relay_rosters.verify_roster_areas(
@@ -456,6 +466,9 @@ class NetworkAdapter:
             return
         if case.name == 'unencrypted-verbs':
             self._run_unencrypted_verbs(case)
+            return
+        if case.name == 'plaintext-verbs-file':
+            self._run_plaintext_verbs_file(case)
             return
         if case.name == 'transport-binds-the-recipient':
             self._run_transport_binds_the_recipient(case)
@@ -723,39 +736,92 @@ class NetworkAdapter:
         """The plaintext allowlist: which verbs a receiver accepts unencrypted
         from a known peer, and how that set relates to the bootstrap set.
 
-        Two hand-maintained lists in two languages, so the negative half is
-        where the value is: a verb added on one side only becomes a downgrade
-        opening on that runtime alone. The `full_history` assertion is the
-        sharpest one -- it is bootstrap yet must never ride in the clear,
-        because it carries the group key.
+        The core's verbs are compiled in; first contact's are granted by the
+        scenario's `plaintext_file`, applied through the production loader
+        with that extension enabled. Hand-maintained in two languages, so the
+        negative half is where the value is: a verb added on one side only
+        becomes a downgrade opening on that runtime alone. The `full_history`
+        assertion is the sharpest one -- it is bootstrap yet must never ride in
+        the clear, because it carries the group key.
         """
+        from autonomous_trust.core import plaintext_verbs
         from autonomous_trust.core.identity.protocol import (
-            UNENCRYPTED_VERBS, BOOTSTRAP_VERBS)
+            CORE_UNENCRYPTED_VERBS, BOOTSTRAP_VERBS)
 
         fx = case.data.get('fixtures') or {}
         plain = list(fx.get('unencrypted_verbs') or [])
+        core = list(fx.get('core_unencrypted_verbs') or [])
         enc_only = list(fx.get('encrypted_only_verbs') or [])
         both = list(fx.get('both_bootstrap_and_unencrypted') or [])
         boot_enc = list(fx.get('bootstrap_but_encrypted') or [])
+        if not plain:
+            raise AssertionError('scenario: fixtures.unencrypted_verbs missing or empty')
+        if fx.get('first_contact') and not _first_contact_present():
+            # First contact declares the verbs its file grants; without its
+            # distribution the file is refused, as it should be.
+            raise NotImplementedError('first-contact scenario skipped: autonomous-trust-first-contact is not installed (put src/autonomous-trust-first-contact on the path to run it symmetrically)')
 
-        state = {
-            'all_unencrypted_verbs_recognized':
-                all(v in UNENCRYPTED_VERBS for v in plain),
-            'no_other_verb_is_unencrypted':
-                not any(v in UNENCRYPTED_VERBS for v in enc_only),
-            'unencrypted_verb_count_is_fourteen': len(UNENCRYPTED_VERBS) == 14,
-            'empty_verb_is_not_unencrypted':
-                (None not in UNENCRYPTED_VERBS) and ('' not in UNENCRYPTED_VERBS),
-            'overlap_verbs_are_both':
-                bool(both) and all(v in UNENCRYPTED_VERBS and v in BOOTSTRAP_VERBS
-                                   for v in both),
-            # Bootstrap, but encrypted: the group key never rides in plaintext.
-            'full_history_is_bootstrap_but_not_unencrypted':
-                bool(boot_enc) and all(v in BOOTSTRAP_VERBS
-                                       and v not in UNENCRYPTED_VERBS
-                                       for v in boot_enc),
-        }
+        with _plaintext_file(fx.get('plaintext_file'),
+                             bool(fx.get('first_contact'))) as cfg_dir:
+            granted = _configure_plaintext(cfg_dir)
+            if granted is None:
+                raise AssertionError('scenario: plaintext_file was refused')
+            active = plaintext_verbs.active()
+            ok = plaintext_verbs.is_unencrypted
+            state = {
+                'all_unencrypted_verbs_recognized': all(ok(v) for v in plain),
+                'no_other_verb_is_unencrypted': not any(ok(v) for v in enc_only),
+                'unencrypted_verb_count_is_fourteen': len(active) == 14,
+                'core_verbs_are_exactly_these_nine':
+                    len(CORE_UNENCRYPTED_VERBS) == 9
+                    and set(core) == set(CORE_UNENCRYPTED_VERBS),
+                'granted_verbs_are_not_core':
+                    bool(granted) and not (granted & CORE_UNENCRYPTED_VERBS),
+                'empty_verb_is_not_unencrypted': not ok(None) and not ok(''),
+                'overlap_verbs_are_both':
+                    bool(both) and all(ok(v) and v in BOOTSTRAP_VERBS for v in both),
+                # Bootstrap, but encrypted: the group key never rides in plaintext.
+                'full_history_is_bootstrap_but_not_unencrypted':
+                    bool(boot_enc) and all(v in BOOTSTRAP_VERBS and not ok(v)
+                                           for v in boot_enc),
+            }
         _assert_expected_flags(case, 'node', state)
+
+    def _run_plaintext_verbs_file(self, case: Case) -> None:
+        """The rules of unencrypted_verbs.cfg.json (FEATURE_SPLIT_PLAN D8):
+        each row applies one file through the production loader and records
+        whether the start is refused and how many verbs are granted."""
+        from autonomous_trust.core import plaintext_verbs
+        from autonomous_trust.core.identity.protocol import CORE_UNENCRYPTED_VERBS
+
+        rows = (case.data.get('fixtures') or {}).get('rows') or []
+        if not rows:
+            raise AssertionError('scenario: fixtures.rows missing or empty')
+        all_match = refusal_grants_nothing = gku_never = True
+        for row in rows:
+            if row.get('first_contact') and not _first_contact_present():
+                continue    # needs first contact's distribution; the core's rows still run
+            with _plaintext_file(row.get('file'),
+                                 bool(row.get('first_contact'))) as cfg_dir:
+                granted = _configure_plaintext(cfg_dir)
+                refused = granted is None
+                count = len(plaintext_verbs.active() - CORE_UNENCRYPTED_VERBS)
+                if refused and count != 0:
+                    refusal_grants_nothing = False
+                if plaintext_verbs.is_unencrypted('group_key_update'):
+                    gku_never = False
+            if refused != bool(row['expect_refused']) \
+                    or count != int(row['expect_granted']):
+                all_match = False
+                raise AssertionError(
+                    '%s: refused=%s granted=%d, want refused=%s granted=%d'
+                    % (row.get('id', '?'), refused, count, row['expect_refused'],
+                       row['expect_granted']))
+        _assert_expected_flags(case, 'node', {
+            'all_rows_match': all_match,
+            'a_refusal_grants_nothing': refusal_grants_nothing,
+            'group_key_update_never_plaintext': gku_never,
+        })
 
     def _run_transport_binds_the_recipient(self, case: Case) -> None:
         """The envelope's `from_*` claim is read ONLY when the transport gave
@@ -1315,6 +1381,48 @@ def _assert_expected_state(case: Case, participant_id: str, parsed) -> None:
             f'{participant_id}: verified mismatch: '
             f'expected {ver}, got {parsed.verified}'
         )
+
+
+def _first_contact_present() -> bool:
+    """Whether first contact's distribution (FEATURE_SPLIT_PLAN Phase 7) is on
+    the path. Without it, C's twin is a build without libat_first_contact."""
+    import importlib.util
+    return importlib.util.find_spec('autonomous_trust.first_contact') is not None
+
+
+@contextlib.contextmanager
+def _plaintext_file(doc, first_contact: bool):
+    """A scratch configuration directory holding ``doc`` as the node's
+    unencrypted_verbs.cfg.json (a string is written as-is, anything else as
+    JSON; no file at all for None), with AT_FIRST_CONTACT set to
+    ``first_contact``. Restores the flag and resets the grant afterwards."""
+    from autonomous_trust.core import plaintext_verbs
+    saved = os.environ.get('AT_FIRST_CONTACT')
+    os.environ['AT_FIRST_CONTACT'] = '1' if first_contact else '0'
+    plaintext_verbs.reset()
+    try:
+        with tempfile.TemporaryDirectory() as cfg_dir:
+            if doc is not None:
+                with open(os.path.join(cfg_dir, plaintext_verbs.FILENAME), 'w') as fh:
+                    fh.write(doc if isinstance(doc, str) else json.dumps(doc))
+            yield cfg_dir
+    finally:
+        plaintext_verbs.reset()
+        if saved is None:
+            os.environ.pop('AT_FIRST_CONTACT', None)
+        else:
+            os.environ['AT_FIRST_CONTACT'] = saved
+
+
+def _configure_plaintext(cfg_dir):
+    """The verbs the node-start check grants from ``cfg_dir``, or None when it
+    refuses the start."""
+    from autonomous_trust.core import plaintext_verbs
+    from autonomous_trust.core.extensions import configure_plaintext_verbs
+    try:
+        return configure_plaintext_verbs(cfg_dir, logging.getLogger('conformance'))
+    except plaintext_verbs.PlaintextVerbsError:
+        return None
 
 
 def _assert_expected_flags(case: Case, participant_id: str,

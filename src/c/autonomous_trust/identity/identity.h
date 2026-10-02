@@ -63,7 +63,7 @@ typedef struct
  *     my_addr)`), so a clipped value stops a node recognising its own traffic
  *     (see [[c-cidr-split-hardcoded-lengths]]: its three callers had already
  *     been widened to IPV6_ADDR_LEN as a local workaround for THIS constant);
- *   - identity/first_contact.c had to refuse an over-long rendezvous endpoint
+ *   - first_contact/first_contact.c had to refuse an over-long rendezvous endpoint
  *     outright rather than send a hello to a mangled host.
  * Python has no bound on Identity.address at all, so 32 was also a live
  * C-only divergence that the conformance corpus never exercised.
@@ -619,21 +619,33 @@ void identity_free(identity_t *ident);
  * and were therefore dropped AND annoy-tracked toward blacklisting. This
  * predicate bounds the plaintext fallback to named verbs, so a peer already in
  * the table cannot downgrade an arbitrary message to plaintext and have it
- * honored. Mirrors Python's identity.protocol.UNENCRYPTED_VERBS.
+ * honored. Two halves: the core's verbs, compiled in
+ * (@ref identity_verb_is_core_unencrypted), and an extension's verbs that the
+ * node's unencrypted_verbs.cfg.json grants (processes/plaintext_verbs.h).
+ * Mirrors Python's plaintext_verbs.is_unencrypted.
  *
  * Receive-side policy, so it covers every verb a PEER may legitimately send
  * unencrypted, including ones this implementation never sends itself.
  *
  * MAINTENANCE: adding an encrypt=false send REQUIRES adding its verb to the
- * table in id_proc.c, on both sides of the language boundary.
+ * core table in id_proc.c (or to its extension's plaintext_verbs), on both
+ * sides of the language boundary.
  *
  * @param verb Wire function selector; NULL is safe and returns false.
  */
 bool identity_verb_is_unencrypted(const char *verb);
 
+/** @brief Is @p verb one of the CORE's plaintext verbs? Mirrors Python's
+ *  identity.protocol.CORE_UNENCRYPTED_VERBS. NULL is safe and returns false. */
+bool identity_verb_is_core_unencrypted(const char *verb);
+
+/** @brief How many core verbs are accepted in plaintext (nine). */
+size_t identity_core_unencrypted_verb_count(void);
+
 
 /**
- * @brief How many verbs this protocol accepts in plaintext.
+ * @brief How many verbs this node accepts in plaintext now: the core's and the
+ *        ones unencrypted_verbs.cfg.json grants.
  *
  * Exists so conformance can pin the SIZE of the list, not just its members: a
  * verb added on one side of the language boundary and not the other is exactly

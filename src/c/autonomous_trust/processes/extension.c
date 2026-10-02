@@ -81,3 +81,22 @@ size_t at_extension_count(void)
 {
     return _extensions_len;
 }
+
+bool at_extension_present(const char *name)
+{
+    if (name == NULL)
+        return false;
+    for (size_t i = 0; i < _extensions_len; i++)
+        if (strcmp(_extensions[i]->name, name) == 0)
+            return true;
+    return false;
+}
+
+size_t at_extensions_enabled(const at_extension_t **out, size_t max)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < _extensions_len && n < max; i++)
+        if (_extensions[i]->enabled == NULL || _extensions[i]->enabled())
+            out[n++] = _extensions[i];
+    return n;
+}

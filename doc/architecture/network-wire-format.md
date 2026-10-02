@@ -222,10 +222,12 @@ the historical path.
 
 The verb set itself is two hand-maintained lists in two languages
 (`identity.protocol.BOOTSTRAP_VERBS`, C `ID_BOOTSTRAP_VERBS`), so its membership
-and size are pinned by `network/gateway-boundary-verbs`. Its sibling
-`UNENCRYPTED_VERBS` has the same shape and is pinned by
-`network/unencrypted-verbs`, which also holds the one relationship between the
-two sets that matters: they overlap on the two verbs that run before a key
+and size are pinned by `network/gateway-boundary-verbs`. Its sibling, the
+plaintext set, has two halves: the core's nine (`CORE_UNENCRYPTED_VERBS`, C
+`ID_UNENCRYPTED_VERBS`) and the extension verbs that `unencrypted_verbs.cfg.json`
+grants (see [Plaintext verbs](extensions.md#plaintext-verbs-processesplaintext_verbsh-plaintext_verbspy)).
+It is pinned by `network/unencrypted-verbs`, which also holds the one
+relationship between the two sets that matters: they overlap on the two verbs that run before a key
 exists, but `full_history` is bootstrap and must **never** be accepted in
 plaintext, because it hands over the group key.
 

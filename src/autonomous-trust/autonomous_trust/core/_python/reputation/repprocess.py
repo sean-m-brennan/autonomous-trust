@@ -30,7 +30,8 @@ from nacl.exceptions import BadSignatureError
 
 from ..network import Message, Network
 from ..processes import Process, ProcMeta
-from ..extensions import identity_hooks, load_extensions, run_post_fork
+from ..extensions import (identity_hooks, load_extensions, reputation_hooks,
+                          run_post_fork)
 from ..config import (Configuration, atomic_write, from_json_string,
                       to_json_string)
 from ..identity.protocol import IdentityProtocol
@@ -54,7 +55,6 @@ from .reputation import (TransactionHistory, ReconcileResult, Reputation, Reputa
                          # weight (R+D.md §12.5), `floor(x + 0.5)` as the C
                          # twin's at_tx_weight_round.
                          weight_round)
-from ..contacts import Contacts
 from ..system import CfgIds, now, encoding, proc_idle_floor
 from .. import _probes
 
@@ -438,11 +438,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # per-node reputation-view dump emitted from process(). See
         # _dump_reputation_trace. 0 == last dump not yet taken.
         self._last_rep_dump = 0.0
-        # First-contact trust seeds (FIRST_CONTACT_PLAN.md §10.5). Applied
-        # AFTER the warm-start snapshot above, so a persisted value always
-        # wins -- see _apply_contact_seeds.
-        self._contact_seed_mtime = None
-        self._apply_contact_seeds()
+        # Extensions' trust seeds (first contact's verified contacts,
+        # FIRST_CONTACT_PLAN.md §10.5). Applied AFTER the warm-start snapshot
+        # above, so a persisted value always wins -- see _apply_seeds.
+        self._apply_seeds()
         self._seed_idle_from_snapshot()
         # Communication-cut-off exclusion set (peer-uuid-str). A peer whose
         # aggregate reputation is below COMM_CUTOFF is excluded from the
@@ -3484,16 +3483,14 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             (score - cls.REPUTATION_DECAY_ASYMPTOTE) * factor
         return max(cls.REPUTATION_DECAY_ASYMPTOTE, decayed)
 
-    def _apply_contact_seeds(self):
-        """Give each VERIFIED first-contact contact its cold-start prior.
+    def _apply_seeds(self):
+        """Apply every extension's cold-start priors (ReputationHooks).
 
-        FIRST_CONTACT_PLAN.md §10.5, the user's settled fork: a contact whose
-        key the two humans confirmed out of band (the safety-number compare)
-        starts SLIGHTLY above the neutral cold-start band rather than at it --
-        ``FIRST_CONTACT_VERIFIED_SEED`` (0.3) against ``PREREP_NEUTRAL`` (0.2).
-        A deliberate human confirmation is worth more than no information, and
-        much less than earned standing, which is why the bump is one notch and
-        not a jump into the CTFT pivot band.
+        First contact's is FIRST_CONTACT_PLAN.md §10.5, the user's settled
+        fork: a contact whose key the two humans confirmed out of band (the
+        safety-number compare) starts SLIGHTLY above the neutral cold-start
+        band rather than at it -- one notch, not a jump into the CTFT pivot
+        band.
 
         The seed is a PRIOR, not a score. It is written only where this node
         has NO reputation for the peer at all, so it can never overwrite a
@@ -3501,44 +3498,29 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         or a slashed one -- a contact cannot be verified back into good
         standing. From there ``_consensus_baseline`` already prefers
         ``reputations.current`` over the neutral, so the seed reaches every
-        reader without a second mechanism.
-
-        Read from the contacts store rather than pushed by the identity
-        process: the store is durable, already shared byte-for-byte with the C
-        runtime, and this keeps the trust-seed decision in one file instead of
-        adding the tree's first identity->reputation IPC path. The cost is that
-        a seed lands on the next pass rather than the instant of verification,
-        which is immaterial for a cold-start prior.
+        reader without a second mechanism. A seed outside (0, 1] is refused,
+        not clamped: reputation lives in [0, 1], and a provider's source may
+        be a hand-editable file.
         """
-        try:
-            mtime = os.path.getmtime(Contacts.default_path())
-        except OSError:
-            return       # no contacts file at all: the norm for most nodes
-        if mtime == self._contact_seed_mtime:
-            return       # nothing has been written since the last pass
-        self._contact_seed_mtime = mtime
-        try:
-            store = Contacts.load()
-        except (OSError, ValueError, TypeError) as err:
-            self.logger.warning('contacts store unreadable (%s); no trust seeds '
-                                'applied this pass', err)
-            return
-        for contact in store.verified():
-            seed = float(getattr(contact, 'trust_seed', 0.0) or 0.0)
-            if seed <= 0.0:
+        for hooks in reputation_hooks():
+            if hooks.trust_seeds is None:
                 continue
-            # Every device of the contact is its own node, each seeded on its
-            # own (Phase 4): the human was verified, the standing is not shared.
-            for ident in contact.identities():
+            for peer_uuid, seed, what in hooks.trust_seeds(self):
                 try:
-                    peer_uuid = UUID(str(ident.uuid))
+                    peer_uuid = UUID(str(peer_uuid))
+                    seed = float(seed)
                 except (ValueError, TypeError, AttributeError):
+                    continue
+                if not 0.0 < seed <= 1.0:
+                    self.logger.warning('%s: refusing seed %r for %s (outside '
+                                        '(0, 1])', hooks.label, seed,
+                                        str(peer_uuid)[:8])
                     continue
                 current = self.reputations.current
                 if peer_uuid in current or str(peer_uuid) in current:
                     continue     # already known here; earned beats seeded
                 self.reputations.update(peer_uuid, seed)
-                self.logger.info('first contact: seeded verified contact %s at %.2f',
+                self.logger.info('%s: seeded %s %s at %.2f', hooks.label, what,
                                  str(peer_uuid)[:8], seed)
 
     def _seed_idle_from_snapshot(self):
@@ -5130,9 +5112,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 self._apply_peer_standings(queues)
                 # A contact verified since boot (the identity process rewrites
                 # contacts.cfg.json on every handshake and verification) gets
-                # its seed here. Guarded by mtime, so the usual pass is one
-                # stat() and nothing else.
-                self._apply_contact_seeds()
+                # its seed here. First contact's provider is guarded by mtime,
+                # so the usual pass is one stat() and nothing else.
+                self._apply_seeds()
                 drained = 0
                 # First iteration blocks briefly so we don't hot-spin
                 # when the queue is empty; subsequent iterations are

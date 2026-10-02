@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <sodium.h>
 #include <uuid/uuid.h>
@@ -31,7 +32,10 @@
 #include "identity/identity_priv.h"
 #include "network/network.h"
 #include "network/net_message.h"
-#include "network/net_relay_rosters.h"
+#ifdef AT_RENDEZVOUS_ENABLED   /* libat_rendezvous is built */
+#include "rendezvous/net_relay_rosters.h"
+#endif
+#include "processes/plaintext_verbs.h"
 
 #include "../negative_runner.h"
 #include "../jcs.h"
@@ -129,6 +133,7 @@ cleanup:
  * when accepted the seq and the relays as uuid:fp@host:port. The file check
  * only; the seq floor is node state. Mirrors the Python adapter's
  * _relay_roster_verify. */
+#ifdef AT_RENDEZVOUS_ENABLED
 static int run_relay_roster_verify(json_t *input, json_t *expected,
                                    char *err, size_t err_len) {
     const char *text = json_string_value(json_object_get(input, "roster"));
@@ -222,6 +227,18 @@ done:
     free(l);
     return rc;
 }
+#else
+/* Rosters are rendezvous's (FEATURE_SPLIT_PLAN Phase 7b): without its library
+ * the case skips, as the Python adapter's does without the distribution. */
+static int run_relay_roster_verify(json_t *input, json_t *expected,
+                                   char *err, size_t err_len) {
+    (void)input;
+    (void)expected;
+    snprintf(err, err_len, "rendezvous case skipped: C built without "
+                           "libat_rendezvous (AT_RENDEZVOUS_LIB=OFF)");
+    return 1;
+}
+#endif
 
 static int run_ed25519_verify(json_t *input, json_t *expected,
                               char *err, size_t err_len) {
@@ -2694,14 +2711,79 @@ static int run_gateway_boundary_verbs(const at_case_t *c,
  * but full_history is bootstrap and must NEVER be accepted in the clear
  * because it hands over the group key. Neither set is a subset of the other.
  */
+/* A scratch configuration directory holding @p doc as the node's
+ * unencrypted_verbs.cfg.json (a JSON string is written as its text, anything
+ * else as JSON; no file for NULL / null), with AT_FIRST_CONTACT set to
+ * @p first_contact; then apply it through the production loader. Returns the
+ * loader's rc (0 granted, -1 refused). The grant stays in force for the
+ * caller to inspect; plaintext_verbs_reset() undoes it. */
+static int _configure_plaintext(const json_t *doc, bool first_contact)
+{
+    char dir[] = "/tmp/at_conf_plaintext_XXXXXX";
+    if (mkdtemp(dir) == NULL)
+        return -2;
+    char path[sizeof(dir) + sizeof(PLAINTEXT_VERBS_FILENAME) + 1];
+    snprintf(path, sizeof(path), "%s/%s", dir, PLAINTEXT_VERBS_FILENAME);
+    bool wrote = false;
+    if (doc != NULL && !json_is_null(doc)) {
+        FILE *f = fopen(path, "w");
+        if (f == NULL) {
+            rmdir(dir);
+            return -2;
+        }
+        if (json_is_string(doc)) {
+            fputs(json_string_value(doc), f);
+        } else {
+            char *text = json_dumps(doc, JSON_COMPACT);
+            fputs(text != NULL ? text : "", f);
+            free(text);
+        }
+        fclose(f);
+        wrote = true;
+    }
+    const char *saved = getenv("AT_FIRST_CONTACT");
+    char saved_copy[16] = "";
+    bool had = saved != NULL;
+    if (had)
+        snprintf(saved_copy, sizeof(saved_copy), "%s", saved);
+    setenv("AT_FIRST_CONTACT", first_contact ? "1" : "0", 1);
+    plaintext_verbs_reset();
+    int rc = plaintext_verbs_configure(dir, NULL);
+    if (had)
+        setenv("AT_FIRST_CONTACT", saved_copy, 1);
+    else
+        unsetenv("AT_FIRST_CONTACT");
+    if (wrote)
+        unlink(path);
+    rmdir(dir);
+    return rc;
+}
+
 static int run_unencrypted_verbs(const at_case_t *c, char *err, size_t err_len) {
     json_t *fx = json_object_get(c->data, "fixtures");
     json_t *plain = fx ? json_object_get(fx, "unencrypted_verbs") : NULL;
+    json_t *core = fx ? json_object_get(fx, "core_unencrypted_verbs") : NULL;
     json_t *enc_only = fx ? json_object_get(fx, "encrypted_only_verbs") : NULL;
     json_t *both = fx ? json_object_get(fx, "both_bootstrap_and_unencrypted") : NULL;
     json_t *boot_enc = fx ? json_object_get(fx, "bootstrap_but_encrypted") : NULL;
     if (!json_is_array(plain) || json_array_size(plain) == 0) {
         snprintf(err, err_len, "scenario: fixtures.unencrypted_verbs missing or empty");
+        return -1;
+    }
+#ifndef AT_FIRST_CONTACT_ENABLED
+    /* First contact declares the verbs its file grants; without its library
+     * (AT_FIRST_CONTACT_LIB) the file is refused, as it should be. */
+    if (json_is_true(json_object_get(fx, "first_contact"))) {
+        snprintf(err, err_len, "first-contact scenario skipped: C built without "
+                               "libat_first_contact (AT_FIRST_CONTACT_LIB=OFF)");
+        return 1;
+    }
+#endif
+    if (_configure_plaintext(fx ? json_object_get(fx, "plaintext_file") : NULL,
+                             fx != NULL && json_is_true(json_object_get(fx, "first_contact")))
+        != 0) {
+        plaintext_verbs_reset();
+        snprintf(err, err_len, "scenario: plaintext_file was refused");
         return -1;
     }
 
@@ -2725,6 +2807,29 @@ static int run_unencrypted_verbs(const at_case_t *c, char *err, size_t err_len) 
     }
 
     bool count_is_fourteen = (identity_unencrypted_verb_count() == 14);
+    /* The core's nine: exactly the fixture's list, in either direction. */
+    bool core_nine = json_is_array(core)
+                     && identity_core_unencrypted_verb_count() == 9
+                     && json_array_size(core) == 9;
+    if (core_nine) {
+        json_array_foreach(core, i, item) {
+            const char *verb = json_string_value(item);
+            if (verb == NULL || !identity_verb_is_core_unencrypted(verb))
+                core_nine = false;
+        }
+    }
+    /* What the file granted is never a core verb. */
+    bool granted_not_core = plaintext_verbs_granted_count() > 0;
+    json_t *pfile = fx ? json_object_get(fx, "plaintext_file") : NULL;
+    json_t *gverbs = json_is_object(pfile) ? json_object_get(pfile, "verbs") : NULL;
+    if (json_is_array(gverbs)) {
+        json_array_foreach(gverbs, i, item) {
+            const char *verb = json_string_value(item);
+            if (verb == NULL || identity_verb_is_core_unencrypted(verb)
+                || !plaintext_verb_granted(verb))
+                granted_not_core = false;
+        }
+    }
     bool empty_safe = (!identity_verb_is_unencrypted(NULL) &&
                        !identity_verb_is_unencrypted(""));
 
@@ -2749,13 +2854,71 @@ static int run_unencrypted_verbs(const at_case_t *c, char *err, size_t err_len) 
                 boot_enc_ok = false;
         }
     }
+    plaintext_verbs_reset();
 
     if (expect_flag(c, "node", "all_unencrypted_verbs_recognized", all_recognized, err, err_len) != 0 ||
         expect_flag(c, "node", "no_other_verb_is_unencrypted", none_other, err, err_len) != 0 ||
         expect_flag(c, "node", "unencrypted_verb_count_is_fourteen", count_is_fourteen, err, err_len) != 0 ||
+        expect_flag(c, "node", "core_verbs_are_exactly_these_nine", core_nine, err, err_len) != 0 ||
+        expect_flag(c, "node", "granted_verbs_are_not_core", granted_not_core, err, err_len) != 0 ||
         expect_flag(c, "node", "empty_verb_is_not_unencrypted", empty_safe, err, err_len) != 0 ||
         expect_flag(c, "node", "overlap_verbs_are_both", overlap_ok, err, err_len) != 0 ||
         expect_flag(c, "node", "full_history_is_bootstrap_but_not_unencrypted", boot_enc_ok, err, err_len) != 0)
+        return -1;
+    return 0;
+}
+
+/* The rules of unencrypted_verbs.cfg.json (scenario `plaintext-verbs-file`,
+ * FEATURE_SPLIT_PLAN D8): each row applies one file through the production
+ * loader and records whether the start is refused and how many verbs are
+ * granted. Mirrors Python _run_plaintext_verbs_file. */
+static int run_plaintext_verbs_file(const at_case_t *c, char *err, size_t err_len) {
+    json_t *fx = json_object_get(c->data, "fixtures");
+    json_t *rows = fx ? json_object_get(fx, "rows") : NULL;
+    if (!json_is_array(rows) || json_array_size(rows) == 0) {
+        snprintf(err, err_len, "scenario: fixtures.rows missing or empty");
+        return -1;
+    }
+    bool all_match = true, refusal_grants_nothing = true, gku_never = true;
+    size_t i;
+    json_t *row;
+    json_array_foreach(rows, i, row) {
+#ifndef AT_FIRST_CONTACT_ENABLED
+        /* A row with first contact on needs its library (AT_FIRST_CONTACT_LIB);
+         * the core's rows still run. */
+        if (json_is_true(json_object_get(row, "first_contact")))
+            continue;
+#endif
+        int rc = _configure_plaintext(json_object_get(row, "file"),
+                                      json_is_true(json_object_get(row, "first_contact")));
+        if (rc == -2) {
+            snprintf(err, err_len, "adapter: cannot write a scratch config dir");
+            return -1;
+        }
+        bool refused = rc != 0;
+        long long count = (long long)plaintext_verbs_granted_count();
+        if (refused && count != 0)
+            refusal_grants_nothing = false;
+        if (identity_verb_is_unencrypted("group_key_update"))
+            gku_never = false;
+        plaintext_verbs_reset();
+        bool want_refused = json_is_true(json_object_get(row, "expect_refused"));
+        long long want_count = json_integer_value(json_object_get(row, "expect_granted"));
+        if (refused != want_refused || count != want_count) {
+            all_match = false;
+            const char *id = json_string_value(json_object_get(row, "id"));
+            snprintf(err, err_len, "%s: refused=%s granted=%lld, want refused=%s "
+                     "granted=%lld", id != NULL ? id : "?",
+                     refused ? "true" : "false", count,
+                     want_refused ? "true" : "false", want_count);
+            return -1;
+        }
+    }
+    if (expect_flag(c, "node", "all_rows_match", all_match, err, err_len) != 0 ||
+        expect_flag(c, "node", "a_refusal_grants_nothing", refusal_grants_nothing,
+                    err, err_len) != 0 ||
+        expect_flag(c, "node", "group_key_update_never_plaintext", gku_never,
+                    err, err_len) != 0)
         return -1;
     return 0;
 }
@@ -3106,6 +3269,9 @@ static int run_scenario(const at_case_t *c, char *err, size_t err_len) {
     }
     if (strcmp(c->name, "unencrypted-verbs") == 0) {
         return run_unencrypted_verbs(c, err, err_len);
+    }
+    if (strcmp(c->name, "plaintext-verbs-file") == 0) {
+        return run_plaintext_verbs_file(c, err, err_len);
     }
     if (strcmp(c->name, "transport-binds-the-recipient") == 0) {
         return run_transport_binds_the_recipient(c, err, err_len);

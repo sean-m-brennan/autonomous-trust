@@ -22,23 +22,27 @@ description: |
         arrive encrypted becomes acceptable in the clear, and an attacker
         selects it simply by not encrypting.
 
-    This case pins the MEMBERSHIP and the SIZE of that list, because it is two
-    hand-maintained lists in two languages -- Python
-    identity.protocol.UNENCRYPTED_VERBS and C's ID_UNENCRYPTED_VERBS -- kept in
-    sync by comment alone. A verb added on one side only opens the downgrade on
-    that runtime and nowhere else, which is precisely the asymmetry a corpus
-    exists to catch and no single-runtime test can see.
+    This case pins the MEMBERSHIP and the SIZE of that list, because it is
+    hand-maintained in two languages -- Python and C, kept in sync by comment
+    alone. A verb added on one side only opens the downgrade on that runtime
+    and nowhere else, which is precisely the asymmetry a corpus exists to catch
+    and no single-runtime test can see.
 
-    The first-contact pair is the newest entry and the clearest illustration of
-    the "too small" failure: the very first `first_contact_hello` arrives from
-    somebody who is not a peer yet, so there is no key it could have been
-    encrypted under, and a receiver that demanded one would make the 1:1
-    introduction impossible to start. They are plaintext for the same reason
-    `access_granted` is, and -- like the partition pair, and unlike
-    `full_history` -- they are NOT bootstrap: they confer no group membership
-    and hand over no group key, so the gateway boundary must keep carrying
-    them. (The handlers themselves are opt-in per node; the allowlist is a
-    RECEIVE policy and is not gated on the opt-in, on either runtime.)
+    The list has two halves (FEATURE_SPLIT_PLAN D8). The CORE's nine verbs are
+    compiled in, and no configuration adds to or removes from them. An optional
+    feature's verbs are DECLARED by its extension and GRANTED by the node's
+    unencrypted_verbs.cfg.json; the rules of that file are pinned by
+    `plaintext-verbs-file`. Here the file grants first contact's five, so the
+    whole list is the fourteen a first-contact node accepts.
+
+    The first-contact verbs are the clearest illustration of the "too small"
+    failure: the very first `first_contact_hello` arrives from somebody who is
+    not a peer yet, so there is no key it could have been encrypted under, and
+    a receiver that demanded one would make the 1:1 introduction impossible to
+    start. They are plaintext for the same reason `access_granted` is, and --
+    like the partition pair, and unlike `full_history` -- they are NOT
+    bootstrap: they confer no group membership and hand over no group key, so
+    the gateway boundary must keep carrying them.
 
     THE ASSERTION THAT MATTERS MOST is the relationship to the bootstrap set
     (see `gateway-boundary-verbs`). The two overlap on `request_access` and
@@ -49,9 +53,11 @@ description: |
     on the wire in the clear.
 
     Production-code analogue:
-      Python: identity.protocol.UNENCRYPTED_VERBS, consulted by
+      Python: identity.protocol.CORE_UNENCRYPTED_VERBS + plaintext_verbs.configure,
+              consulted through plaintext_verbs.is_unencrypted by
               NetworkProcess._accept_unencrypted.
-      C:      identity_verb_is_unencrypted, consulted by
+      C:      ID_UNENCRYPTED_VERBS + plaintext_verbs_configure, consulted
+              through identity_verb_is_unencrypted by
               try_unencrypted_from_known_peer.
 
 participants:
@@ -59,6 +65,26 @@ participants:
     role: receiver
 
 fixtures:
+  # The node's unencrypted_verbs.cfg.json, with first contact enabled.
+  first_contact: true
+  plaintext_file:
+    verbs:
+      - first_contact_hello
+      - first_contact_hello_ack
+      - first_contact_request
+      - first_contact_accept
+      - device_announce
+  # The compiled-in half: no file can change it.
+  core_unencrypted_verbs:
+    - request_access
+    - access_granted
+    - peer_identity_query
+    - peer_identity_response
+    - operator_attest_query
+    - operator_attest_response
+    - subtree_roster_response
+    - group_partition_probe
+    - group_partition_response
   unencrypted_verbs:
     - request_access             # pre-admission: no key exists yet
     - access_granted             # sent before the key lands
@@ -100,9 +126,10 @@ steps:
     to: node
     function: classify_unencrypted_verbs
     description: |
-        The adapter asks the production classifier about every verb in each
-        fixture list, and cross-checks the membership relationship between the
-        plaintext allowlist and the bootstrap set.
+        The adapter applies `plaintext_file` through the production loader
+        (first contact enabled), asks the production classifier about every
+        verb in each fixture list, cross-checks the membership relationship
+        between the plaintext allowlist and the bootstrap set, then resets.
 
 expected_state:
   node:
@@ -112,6 +139,10 @@ expected_state:
     no_other_verb_is_unencrypted: true
     # Fourteen verbs, exactly. A change is a protocol change, made on both sides.
     unencrypted_verb_count_is_fourteen: true
+    # Nine of them are the core's, and exactly those nine ...
+    core_verbs_are_exactly_these_nine: true
+    # ... and none the file granted is one of them.
+    granted_verbs_are_not_core: true
     # NULL/empty is safe and is not on the allowlist.
     empty_verb_is_not_unencrypted: true
     # The two sets overlap where a key does not yet exist ...

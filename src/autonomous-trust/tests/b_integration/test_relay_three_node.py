@@ -43,6 +43,8 @@ import pytest
 from autonomous_trust.core import AutonomousTrust, Process
 from autonomous_trust.core.config import Configuration
 from autonomous_trust.core.config.generate import generate_identity
+from autonomous_trust.core import plaintext_verbs
+from autonomous_trust.first_contact import first_contact
 from .test_two_node import MP_CTX, _make_node_dir, _mock_addresses, _patch_loopback
 from .test_first_contact_two_node import _await, STARTUP
 from .. import TEST_DIR
@@ -90,6 +92,8 @@ def cohort():
         with patch('autonomous_trust.core.network.network.Network.get_addresses',
                    return_value=_mock_addresses(ip)):
             generate_identity(cfg_dir, randomize=True, seed=port)
+        # First contact's plaintext verbs: granted, as a deployment must.
+        plaintext_verbs.write(cfg_dir, first_contact.EXTENSION.plaintext_verbs)
         log_dir = os.path.join(base, name, 'var', 'at')
         os.makedirs(log_dir, exist_ok=True)
         nodes[name] = {'cfg_dir': cfg_dir, 'ip': ip, 'port': port,
@@ -124,7 +128,7 @@ def _stop(nodes, procs):
 
 def _add_friend(alice, bob, seen_a, seen_b, rendezvous=None):
     from autonomous_trust.core.app_verbs import AppRequest
-    from autonomous_trust.core.identity import first_contact as fc
+    from autonomous_trust.first_contact import first_contact as fc
     req = {'ref': 'r'}
     if rendezvous is not None:
         req['rendezvous'] = rendezvous
@@ -137,8 +141,8 @@ def _add_friend(alice, bob, seen_a, seen_b, rendezvous=None):
 
 
 def test_two_nodes_with_no_direct_path_meet_through_a_relay(cohort):
-    from autonomous_trust.core.contacts import Invitation
-    from autonomous_trust.core.identity import first_contact as fc
+    from autonomous_trust.first_contact import Invitation
+    from autonomous_trust.first_contact import first_contact as fc
     # AT_TEST_EXTERNAL_RELAY=host:port uses a relay someone else runs -- the
     # C one, for the cross-runtime check -- instead of Carol.
     external = os.environ.get('AT_TEST_EXTERNAL_RELAY', '')
@@ -152,7 +156,7 @@ def test_two_nodes_with_no_direct_path_meet_through_a_relay(cohort):
         time.sleep(STARTUP)
         minted = _add_friend(cohort['alice'], cohort['bob'], seen_a, seen_b)
         # The link names the relay: that is how Bob learns it.
-        from autonomous_trust.core._python.network import relay as _relay
+        from autonomous_trust.rendezvous._python import relay as _relay
         hints = Invitation.decode(minted.blob).rendezvous
         assert relay_ep in ['%s:%d' % _relay.parse_endpoint(h) for h in hints
                             if h.startswith(_relay.SCHEME)]
@@ -186,7 +190,7 @@ def test_without_the_relay_they_never_meet(cohort):
     Bob's hello goes straight to Alice's address on Bob's port, where nobody
     listens -- so nothing establishes. This is what makes the other test's
     success the relay's doing."""
-    from autonomous_trust.core.identity import first_contact as fc
+    from autonomous_trust.first_contact import first_contact as fc
     procs = _start(cohort, {'alice': {}, 'bob': {}})
     seen_a, seen_b = [], []
     try:
@@ -200,7 +204,7 @@ def test_without_the_relay_they_never_meet(cohort):
 
 
 def _established(cohort, seen_a, seen_b):
-    from autonomous_trust.core.identity import first_contact as fc
+    from autonomous_trust.first_contact import first_contact as fc
     a = _await(cohort['alice']['q_out'], lambda e: e.kind == fc.EVENT_ESTABLISHED, seen_a)
     b = _await(cohort['bob']['q_out'], lambda e: e.kind == fc.EVENT_ESTABLISHED, seen_b)
     return a.role, b.role
@@ -229,14 +233,14 @@ DAVE_RELAY = {'AT_RELAY': '1', 'AT_RELAY_PORT': str(DAVE_RELAY_PORT)}
 def test_a_dead_first_relay_fails_over_to_the_next(cohort):
     """Alice names two relays and the first is down: she registers with the
     second, the link names both in order, and Bob's hello fails over."""
-    from autonomous_trust.core.contacts import Invitation
+    from autonomous_trust.first_contact import Invitation
     procs = _start(cohort, {'alice': {'AT_USE_RELAY': DEAD_RELAY + ',' + CAROL_EP},
                             'bob': {}, 'carol': CAROL_RELAY})
     seen_a, seen_b = [], []
     try:
         time.sleep(STARTUP)
         minted = _add_friend(cohort['alice'], cohort['bob'], seen_a, seen_b)
-        from autonomous_trust.core._python.network import relay as _relay
+        from autonomous_trust.rendezvous._python import relay as _relay
         hints = Invitation.decode(minted.blob).rendezvous
         assert ['%s:%d' % _relay.parse_endpoint(h) for h in hints] == [
             DEAD_RELAY, CAROL_EP]

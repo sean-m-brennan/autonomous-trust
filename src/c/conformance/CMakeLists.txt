@@ -39,7 +39,6 @@ set(AT_CONFORMANCE_SOURCES
     adapters/negotiation.c
     adapters/reputation.c
     adapters/bootstrap.c
-    adapters/contacts.c
 )
 
 # The verification layers are extension libraries (FEATURE_SPLIT_PLAN Phase 3):
@@ -65,6 +64,19 @@ endforeach()
 if(TARGET at_zta_static)
     list(APPEND AT_CONFORMANCE_EXTENSIONS at_zta_static)
     list(APPEND AT_CONFORMANCE_DEFS AT_ZTA_ENABLED)
+endif()
+# First contact (FEATURE_SPLIT_PLAN Phase 7): its own protocol (contacts)
+# registers through at_conformance_adapter below; the identity and negotiation
+# adapters have a first-contact half, compiled in -- and the library linked
+# whole -- only when it is built. Without it those scenarios skip.
+# Rendezvous (Phase 7b): the network adapter's roster scenarios and the
+# identity adapter's reachability records need it, and first contact links it.
+if(TARGET at_rendezvous_static)
+    list(APPEND AT_CONFORMANCE_EXTENSIONS at_rendezvous_static)
+    list(APPEND AT_CONFORMANCE_DEFS AT_RENDEZVOUS_ENABLED)
+endif()
+if(TARGET at_first_contact_static)
+    list(APPEND AT_CONFORMANCE_DEFS AT_FIRST_CONTACT_ENABLED)
 endif()
 # Adapters an extension registered with at_conformance_adapter()
 # (extensions/at_extension.cmake), e.g. an external extension's own protocol.

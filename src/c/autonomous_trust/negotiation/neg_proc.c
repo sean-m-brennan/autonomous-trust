@@ -19,7 +19,6 @@
 #include <pthread.h>
 #include <unistd.h>   /* close, for the custom run loop */
 
-#include "identity/first_contact.h"
 #include "processes/processes.h"
 #include "processes/extension.h"
 #include "negotiation/negotiation.h"
@@ -38,6 +37,7 @@
 #include "bootstrap/bootstrap_capabilities.h"  /* known-answer probe verifiers */
 #include "bootstrap/bootstrap_worker.h"        /* probe allocation + window */
 #include "negotiation/neg_oracle.h"            /* §12 verification layers */
+#include "negotiation/neg_ext.h"               /* extensions' tier caps */
 #include "negotiation/neg_certified.h"         /* §12.3 witness wire format */
 #include "config/configuration.h"             /* config_t, for our own identity */
 #include "reputation/tx_channel.h"             /* evidence channels */
@@ -1369,12 +1369,11 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
     int sender_tier = _peer_tier_override_locked(proc, nmsg->from_whom.uuid);
     if (sender_tier < 0)
         sender_tier = identity_get_peer_tier(nmsg->from_whom.uuid);
-    /* §10.3: an unverified first-contact peer may message, and no more, until
-     * verified (doc/architecture/first-contact.md). Applied after the test
-     * override too, so a corpus case can give such a peer a high tier and see
-     * it held. */
-    sender_tier = at_first_contact_capped_tier(proc, nmsg->from_whom.uuid,
-                                               sender_tier);
+    /* An extension may hold the peer lower (neg_ext.h): first contact keeps an
+     * unverified contact at messaging until verified (§10.3,
+     * doc/architecture/first-contact.md). Applied after the test override too,
+     * so a corpus case can give such a peer a high tier and see it held. */
+    sender_tier = neg_ext_capped_tier(proc, nmsg->from_whom.uuid, sender_tier);
     int required_tier = -1;
     if (have_task && task.capability.name[0] != '\0')
     {
