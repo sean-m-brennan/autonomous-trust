@@ -19,7 +19,15 @@
 # comment in the cdef stated the rule that
 #              the next commit broke; a comment is not a check.
 #
-# Severity (both checks):
+# LIBRARIES  which library DEFINES each cdef function. Since FEATURE_SPLIT_PLAN the
+# C tree is a core library plus extension libraries (src/c/extensions/<feature>/,
+# libat_<feature>.so). `_ffi.py` binds `lib` to the CORE .so alone and loads each
+# extension with a handle of its own, only so its constructors run. A cdef'd
+# function that moved into an extension therefore keeps its arity and its
+# structs, so the two checks above stay green, while `lib.<name>` fails at the
+# first call: the symbol is not in the library `lib` searches.
+#
+# Severity (all three checks):
 #   DANGEROUS  the drifting name is one Python actually uses -- a function a
 #              _native wrapper calls (`lib.<name>(...)`), or a struct Python
 #              allocates or sizes (`ffi.new('X *')`, `ffi.sizeof('X')`). A short
@@ -63,6 +71,7 @@
 #   scripts/audit-ffi-drift.py --strict   # fail on LATENT drift too
 #   scripts/audit-ffi-drift.py --quiet    # only print drift (for CI logs)
 #   scripts/audit-ffi-drift.py --only structs   # one check at a time
+#                                               # (arity, structs, libraries, abi)
 #   scripts/audit-ffi-drift.py --abi      # ALSO measure sizeof/offsetof by
 #                                         # compiling a probe (needs a compiler,
 #                                         # cffi and the generated *.pb-c.h;
@@ -82,6 +91,14 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FFI = os.path.join(REPO, "src/autonomous-trust/autonomous_trust/core/_native/_ffi.py")
 NATIVE_DIR = os.path.join(REPO, "src/autonomous-trust/autonomous_trust/core/_native")
+#: Every distribution's native half, the core's included: a feature package
+#: laid out as `<pkg>/_python` + `<pkg>/_native` (FEATURE_SPLIT_PLAN D2) may call
+#: `lib.<name>` too, so a name is "used from Python" if any of them calls it.
+NATIVE_GLOB = "src/*/autonomous_trust/*/_native/**/*.py"
+#: The core library's sources; anything under EXT_ROOT/<feature>/ is that
+#: extension library's.
+CORE_ROOT = os.path.join(REPO, "src/c/autonomous_trust")
+EXT_ROOT = os.path.join(REPO, "src/c/extensions")
 
 
 def strip_comments(text):
@@ -483,6 +500,46 @@ def audit_structs(cdef_blob, header_blob, pynative, quiet=False):
     return dangerous, latent, unmirrored, warnings
 
 
+def library_of(path):
+    """'core', 'libat_<feature>', or None for a file in neither (examples/,
+    conformance/, tests: none of them is a library `lib` could bind)."""
+    path = os.path.abspath(path)
+    if path.startswith(CORE_ROOT + os.sep):
+        return "core"
+    if path.startswith(EXT_ROOT + os.sep):
+        feature = os.path.relpath(path, EXT_ROOT).split(os.sep)[0]
+        rest = os.path.relpath(path, os.path.join(EXT_ROOT, feature)).split(os.sep)[0]
+        if rest in ("test", "conformance"):
+            return None
+        return "libat_" + feature
+    return None
+
+
+def audit_libraries(cdef, pynative):
+    """Cdef functions the core library does not define.
+
+    Returns (dangerous, latent, unlocated): rows of (name, [libraries]) for a
+    function defined only outside the core -- dangerous if a native wrapper
+    calls it (`lib.<name>`), latent if not -- and the names with no definition
+    found at all (a macro, an inline, a generated or third-party symbol), which
+    the arity check already lists.
+    """
+    files = collect_files(["src/c/**/*.c"])
+    dangerous, latent, unlocated = [], [], []
+    for name in sorted(cdef):
+        pat = re.compile(r"\b" + re.escape(name) + r"\s*\([^;{}]*\)\s*\{")
+        owners = sorted({library_of(path) for path, text in files if pat.search(text)}
+                        - {None})
+        if not owners:
+            unlocated.append(name)
+            continue
+        if "core" in owners:
+            continue
+        called = bool(re.search(r"\blib\." + re.escape(name) + r"\b", pynative))
+        (dangerous if called else latent).append((name, owners))
+    return dangerous, latent, unlocated
+
+
 #: Where the generated protobuf-c headers live, in preference order. The C
 #: headers include them, so a probe cannot compile without one.
 PB_C_DIRS = ("src/c/protobuf/autonomous_trust/core/protobuf",
@@ -662,7 +719,8 @@ def main():
                     help="also fail on LATENT (unused-from-Python) drift")
     ap.add_argument("--quiet", action="store_true",
                     help="print only drift lines")
-    ap.add_argument("--only", choices=("arity", "structs", "abi"), default=None,
+    ap.add_argument("--only", choices=("arity", "structs", "libraries", "abi"),
+                    default=None,
                     help="run just one of the checks")
     ap.add_argument("--abi", action="store_true",
                     help="also MEASURE sizeof/offsetof by compiling a probe "
@@ -673,9 +731,10 @@ def main():
 
     do_arity = args.only in (None, "arity")
     do_structs = args.only in (None, "structs")
+    do_libraries = args.only in (None, "libraries")
     do_abi = args.abi or args.only == "abi"
     if args.only == "abi":
-        do_arity = do_structs = False
+        do_arity = do_structs = do_libraries = False
 
     abi_fail = False
     if do_abi:
@@ -707,6 +766,34 @@ def main():
     headers = collect(["src/c/**/*.h"])
     sources = collect(["src/c/**/*.c"])
     pynative = collect_py()
+
+    lib_fail = False
+    if do_libraries:
+        l_dangerous, l_latent, _ = audit_libraries(cdef, pynative)
+        if not args.quiet:
+            print(f"cdef functions outside the core library  |  "
+                  f"DANGEROUS: {len(l_dangerous)}  LATENT: {len(l_latent)}\n")
+        if l_dangerous:
+            print("DANGEROUS (a native wrapper calls it through `lib`, which is "
+                  "bound to the core .so only -> fails at the first call):")
+            for name, owners in l_dangerous:
+                print(f"  ✗ {name}: defined in {', '.join(owners)}")
+        if l_latent or not args.quiet:
+            print("\nLATENT (declared in the cdef, defined only in an extension; "
+                  "nothing calls it yet):")
+            for name, owners in l_latent:
+                print(f"  ! {name}: defined in {', '.join(owners)}")
+            if not l_latent:
+                print("  (none)")
+        lib_fail = bool(l_dangerous) or (args.strict and bool(l_latent))
+        if args.only == "libraries":
+            if not args.quiet:
+                print("\n" + ("FAIL: cdef functions outside the core library."
+                              if lib_fail else "OK: every called cdef function "
+                              "is in the core library."))
+            return 1 if lib_fail else 0
+        if not args.quiet:
+            print()
 
     struct_fail = False
     if do_structs:
@@ -779,7 +866,7 @@ def main():
             print(f"  - {name}")
 
     fail = (bool(dangerous) or (args.strict and bool(latent))
-            or struct_fail or abi_fail)
+            or struct_fail or abi_fail or lib_fail)
     if not args.quiet:
         print("\n" + ("FAIL: FFI drift detected." if fail else "OK: no blocking FFI drift."))
     return 1 if fail else 0
@@ -787,7 +874,8 @@ def main():
 
 def collect_py():
     out = []
-    for f in glob.glob(os.path.join(NATIVE_DIR, "**/*.py"), recursive=True):
+    for f in sorted(set(glob.glob(os.path.join(NATIVE_DIR, "**/*.py"), recursive=True)
+                        + glob.glob(os.path.join(REPO, NATIVE_GLOB), recursive=True))):
         try:
             out.append(open(f, errors="replace").read())
         except OSError:
