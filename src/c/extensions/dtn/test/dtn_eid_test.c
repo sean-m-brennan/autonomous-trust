@@ -26,6 +26,7 @@
 #include <string.h>
 
 #include "extensions/dtn/dtn_eid.h"
+#include "network/net_transport.h"
 
 /* A fixed UUID so the derived EID is deterministic across runs. First 4
  * bytes are what dtn_eid_from_uuid() hashes into the prefix. */
@@ -123,7 +124,83 @@ DEFINE_TEST(test_eid_for_group_truncates)
 }
 END_TEST_DEFINITION()
 
+/* ---- the transport's addressing (dtn_eid.h's pure half) ---- */
+
+DEFINE_TEST(test_group_hash_pre_join_and_joined)
+{
+    unsigned char h[8];
+    const uuid_t zero = {0};
+    ck_assert_int_eq(dtn_group_hash(NULL, h), 0);
+    ck_assert_mem_eq(h, DTN_PRE_JOIN_HASH, 8);
+    ck_assert_int_eq(dtn_group_hash(zero, h), 0);
+    ck_assert_mem_eq(h, "AT-boot", 8);   /* the NUL is the eighth byte */
+    ck_assert_int_eq(dtn_group_hash(FIXED_UUID, h), 1);
+    ck_assert_mem_eq(h, FIXED_UUID, 8);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_endpoints_in_channel_order)
+{
+    char eids[3][DTN_EID_MAX + 1];
+    ck_assert_int_eq(dtn_endpoints(FIXED_UUID, NULL, eids), 0);
+    ck_assert_str_eq(eids[NET_CHAN_PEER], "dtn://at-deadbeef/peer");
+    ck_assert_str_eq(eids[NET_CHAN_BROADCAST], "dtn://at-group-41542d626f6f7400/bcast");
+    ck_assert_str_eq(eids[NET_CHAN_GROUP], "dtn://at-group-41542d626f6f7400/group");
+    ck_assert_int_eq(dtn_endpoints(NULL, FIXED_UUID, eids), 1);
+    ck_assert_str_eq(eids[NET_CHAN_PEER], "dtn://at-local/peer");
+    ck_assert_str_eq(eids[NET_CHAN_GROUP], "dtn://at-group-deadbeef00112233/group");
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_channel_service_round_trip)
+{
+    for (int ch = 0; ch < NET_CHAN__COUNT; ch++)
+        ck_assert_int_eq(dtn_service_to_channel(dtn_channel_suffix(ch)), ch);
+    ck_assert_int_eq(dtn_service_to_channel("/other"), NET_CHAN__COUNT);
+    ck_assert_int_eq(dtn_service_to_channel(NULL), NET_CHAN__COUNT);
+    ck_assert_ptr_null(dtn_channel_suffix(NET_CHAN__COUNT));
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_broadcast_eid)
+{
+    char eid[DTN_EID_MAX + 1] = {0};
+    ck_assert(dtn_broadcast_eid(NET_CHAN_GROUP, FIXED_UUID, eid, sizeof(eid)) > 0);
+    ck_assert_str_eq(eid, "dtn://at-group-deadbeef00112233/group");
+    ck_assert(dtn_broadcast_eid(NET_CHAN_BROADCAST, NULL, eid, sizeof(eid)) > 0);
+    ck_assert_str_eq(eid, "dtn://at-group-41542d626f6f7400/bcast");
+    ck_assert_int_eq(dtn_broadcast_eid(NET_CHAN_PEER, FIXED_UUID, eid, sizeof(eid)), -1);
+}
+END_TEST_DEFINITION()
+
+DEFINE_TEST(test_peer_eid_resolution_order)
+{
+    char eid[DTN_EID_MAX + 1] = {0};
+    ck_assert(dtn_peer_eid("ipn:42.1", FIXED_UUID, eid, sizeof(eid)) > 0);
+    ck_assert_str_eq(eid, "ipn:42.1");
+    ck_assert(dtn_peer_eid("10.0.0.5", FIXED_UUID, eid, sizeof(eid)) > 0);
+    ck_assert_str_eq(eid, "dtn://at-deadbeef/peer");
+    ck_assert(dtn_peer_eid("10.0.0.5", NULL, eid, sizeof(eid)) > 0);
+    ck_assert_str_eq(eid, "dtn://at-10.0.0.5/peer");
+    ck_assert_int_eq(dtn_peer_eid("", NULL, eid, sizeof(eid)), -1);
+    ck_assert_int_eq(dtn_peer_eid(NULL, NULL, eid, sizeof(eid)), -1);
+    char longest[114];
+    memset(longest, 'a', sizeof(longest) - 1);
+    longest[113] = '\0';
+    ck_assert_int_eq(dtn_peer_eid(longest, NULL, eid, sizeof(eid)), 127);
+    char too_long[115];
+    memset(too_long, 'a', sizeof(too_long) - 1);
+    too_long[114] = '\0';
+    ck_assert_int_eq(dtn_peer_eid(too_long, NULL, eid, sizeof(eid)), -1);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(DTN_EID,
+          test_group_hash_pre_join_and_joined,
+          test_endpoints_in_channel_order,
+          test_channel_service_round_trip,
+          test_broadcast_eid,
+          test_peer_eid_resolution_order,
           test_eid_from_uuid_known,
           test_eid_from_uuid_truncates,
           test_eid_for_service_leading_slash,

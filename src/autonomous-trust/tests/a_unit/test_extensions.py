@@ -100,6 +100,19 @@ def test_handlers_go_only_to_the_named_process(only):
     assert [n for _, n in rec.registered] == [CfgIds.reputation]
 
 
+# -- transport_class ----------------------------------------------------------
+def test_an_extension_supplies_a_transport_by_name(only):
+    off = Extension(name='leg', enabled=lambda: False, register_handlers=lambda p, n: None,
+                    transports=(('pigeon_net', 'pkg.mod.PigeonProcess'),))
+    only(_Recorder().ext, off)
+    # Present is enough: a transport is chosen by configuration, not by the
+    # feature's switch.
+    assert extensions.transport_class('pigeon_net') == 'pkg.mod.PigeonProcess'
+    assert extensions.transport_class('udp_net_4') is None
+    only()
+    assert extensions.transport_class('pigeon_net') is None
+
+
 def test_a_process_loads_an_extension_once(only):
     rec = _Recorder()
     only(rec.ext)

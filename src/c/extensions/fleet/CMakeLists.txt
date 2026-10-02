@@ -34,7 +34,9 @@ at_extension_library(fleet
         update_proc.c
         config_proc_helpers.c
         config_proc.c
+        fleet_app.c
 )
+install(FILES at_fleet.h DESTINATION include)
 
 at_extension_tests(fleet
     update_proposal_test

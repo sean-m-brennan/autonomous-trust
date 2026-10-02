@@ -1,0 +1,28 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: "1"
+kind: "scenario"
+protocol: "dtn"
+name: "peer-eid-ipn-literal-verbatim"
+description: |
+  An ipn: target is used verbatim.
+byte_pinning: false
+participants:
+  - id: "host"
+    role: "recipient"
+fixtures:
+  dtn:
+    op: "peer_eid"
+    target: "ipn:42.1"
+    peers: []
+steps:
+  - id: 1
+    from: "host"
+    to: "host"
+    function: "peer_eid"
+    description: "trigger: peer_eid"
+expected_state:
+  host:
+    eid: "ipn:42.1"

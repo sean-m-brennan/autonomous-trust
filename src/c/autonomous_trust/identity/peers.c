@@ -101,9 +101,13 @@ const public_identity_t *peers_find_by_uuid(peers_t *peers, const uuid_t uuid)
 /* Frama-C: skipped — [solver-timeout] array iteration preconditions */
 const public_identity_t *peers_find_by_address(peers_t *peers, const char *address)
 {
-    /* Strip CIDR suffix if present (mirrors Python behavior) */
+    /* Strip a CIDR suffix if present (mirrors Python's strip_cidr). A DTN
+     * endpoint ID (dtn:/ipn:) is kept whole: its slashes are part of the
+     * address, and cutting at the first one turned every EID into "dtn:". */
     char addr_buf[ADDR_LEN + 1];
-    const char *slash = strchr(address, '/');
+    const char *slash = (strncmp(address, "dtn:", 4) == 0 ||
+                         strncmp(address, "ipn:", 4) == 0)
+                        ? NULL : strchr(address, '/');
     if (slash != NULL)
     {
         size_t len = (size_t)(slash - address);

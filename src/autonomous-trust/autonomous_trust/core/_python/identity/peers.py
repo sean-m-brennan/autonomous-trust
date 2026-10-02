@@ -18,6 +18,16 @@ from ..config.configuration import Configuration
 from .. import _probes
 
 
+def strip_cidr(address):
+    """``address`` without a ``/prefix`` CIDR suffix. A DTN endpoint ID
+    (``dtn:``/``ipn:``) is returned whole: its slashes are part of the address,
+    and cutting at the first one turned every EID into ``dtn:``. Mirrors C's
+    peers_find_by_address."""
+    if isinstance(address, str) and '/' in address and not address.startswith(('dtn:', 'ipn:')):
+        return address.split('/')[0]
+    return address
+
+
 class Peers(Configuration):
     """
     Peers are arranged hierarchically by their network reach, which usually corresponds to greater capability.
@@ -90,8 +100,7 @@ class Peers(Configuration):
         return None
 
     def find_by_address(self, address):
-        if '/' in address:
-            address = address.split('/')[0]
+        address = strip_cidr(address)
         if address in self.listing:
             return self.listing[address]
         return None

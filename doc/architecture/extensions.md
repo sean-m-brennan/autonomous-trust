@@ -153,7 +153,8 @@ four build configs. Those are the numbers the foreign mirrors assert.
 | 4–15 | Agora (`at_agora.h`), grandfathered; Agora appends into 16–99 |
 | 100–199 | future core kinds |
 | 1000–1099 | first contact (`first_contact/at_first_contact.h`, 1000–1008 used); 1028–1030 are rendezvous's roster events (`rendezvous/at_rendezvous.h`), which kept the numbers they had under first contact |
-| 1100– | further features, one block each |
+| 1100–1109 | fleet (`fleet/at_fleet.h`, 1100 used: `AT_APP_EVENT_FLEET_UPDATE_ACCEPTED`) |
+| 1110– | further features, one block each |
 
 A feature's public header (`at_agora.h`, installed only by a build with social)
 carries its kinds, flat payload structs and **kind-checked accessors**:
@@ -256,7 +257,9 @@ DEFINE_SUBSYSTEM(fleet, "fleet", "fleet_proc")
 ```
 
 (`subsystem_default_register`, eight slots, the same refusals), and the
-generator appends what is registered after the core's own four, so a fresh
+generator appends what is registered after the core's own four (ZTA adds
+`zta_verify` this way, so a node built with `libat_zta` starts its background
+re-verification without anyone listing it), so a fresh
 configuration names a feature's subsystem exactly when its library is linked.
 A capability an extension declares registers the same way, with
 `DEFINE_CAPABILITY` (`capability_table_append`). Since Phase 8 the generator
@@ -827,8 +830,77 @@ registered app-bound type.
 `min_proposer_reputation`. An app holds no private key, so the node builds the
 proposal, signs it with its own identity key and names itself the signer, then
 runs it through the same signature check and vote a peer's proposal gets. A
-frame from the wire is refused. `fleet_propose_update()` is still there for a
-program that holds its own signing key, as `at_demo` does.
+frame from the wire is refused. An app on the flat ABI uses
+[`at_fleet.h`](../../src/c/extensions/fleet/at_fleet.h): `at_app_fleet_propose()`
+sends the verb, checking the fields before anything is sent, and an acceptance
+arrives as kind `AT_APP_EVENT_FLEET_UPDATE_ACCEPTED` (1100, fleet's block is
+1100–1109), read with `at_fleet_accepted_event()`. It names the proposal only:
+fleet does not count the votes where it announces the acceptance.
+`fleet_propose_update()` is still there for a program that holds its own
+signing key, as `at_demo` does.
+
+## DTN (`libat_dtn`, `autonomous_trust.dtn`)
+
+C's DTN has been `libat_dtn` since Phase 1 (above). Python had no DTN until
+FEATURE_SPLIT_PLAN Phase 9, which added it as its own distribution,
+`src/autonomous-trust-dtn/`. It is laid out as the other features are
+(`_python` beside an empty `_native`). A node uses it by naming the transport,
+`AT_TRANSPORT=autonomous_trust.dtn.transport.DTNNetworkProcess`, the class-path
+choice the UDP and TCP transports already had. A Python node's network
+process is Python on both backends, so the `_native` half stays empty. The
+native loader still dlopens `libat_dtn.so`, which registers C's `dtn_bp` in the
+C tables, but nothing in a Python node runs it.
+
+The transport is `net_transport_dtn.c` again. A node registers three endpoints
+when it opens: `/peer` on `dtn://at-<uuid[0:4]>/`, and `/bcast` and `/group`
+on `dtn://at-group-<hash[0:8]>/`, where the hash is the joined group's uuid or
+the pre-join `AT-boot`. Inbound bundles are routed by the endpoint they arrived
+on, with one pending slot per channel. A unicast goes to a `dtn:`/`ipn:` address
+verbatim, else to the `/peer` EID of the peer whose address is the target, else
+to `dtn://at-<target>/peer`. Bundles live 24 hours. `AT_DTN_BACKEND` picks the
+agent: `stub` (the default, as in C's default build) or `ud3tnv2`, µD3TN over
+AAP 2.0, reached at `AT_DTN_UD3TN_SOCKET` as C reaches it. ION and AAP v1 stay
+C-only, and asking for them in Python is refused by name.
+
+The addressing is shared code in C now. The group hash, the three endpoints,
+the broadcast EID, unicast resolution and the service demux moved out of
+`net_transport_dtn.c` into public functions in
+[`dtn_eid.h`](../../src/c/extensions/dtn/dtn_eid.h), which the transport calls.
+The **`dtn` conformance protocol** (48 scenarios under
+`conformance/scenarios/dtn/`) runs them against
+`autonomous_trust.dtn.eid` and the two hybrid routers. Its C adapter is DTN's
+own (`at_conformance_adapter`), so without `libat_dtn` or the Python
+distribution the protocol skips. `test-conformance.sh` builds C with
+`AT_NET_DTN=ON` on the stub backend so both sides run it.
+
+**The hybrid transport in Python.** C's `hybrid_net`, one node on several
+transports at once, is in the Python core now as
+`autonomous_trust.core.network.hybrid.HybridNetworkProcess`. It reads the same
+`hybrid_net.cfg.json` C reads, and C's routing rule case for case: an EID leg
+for `dtn:`/`ipn:`, a CIDR leg for an address inside it, else the first default
+leg, with the prefix read as C's `atoi` reads it. Broadcasts go out on every
+leg. A leg's `kind` is C's transport name. The core supplies `udp_net_4` and
+`tcp_net_4`; an extension supplies others through `Extension.transports`
+(`((kind, class path), ...)`, looked up by `transport_class`), which is how
+DTN's `dtn_bp` leg is found. Each leg is a transport of its own kind that
+shares the hybrid's peers, group, inbound queues, statistics and exclusions, so
+its receivers feed the queues the hybrid drains.
+
+**Addresses that are EIDs.** Both runtimes' peer lookup by address cut the
+address at its first `/` to drop a CIDR suffix, which turned every EID into
+`dtn:`. `peers_find_by_address` and Python's `strip_cidr` now leave a `dtn:` or
+`ipn:` address whole, and so does the Python network process's send loop.
+
+Recorded, not changed, because C behaves the same way: the endpoints are
+registered once, when the transport opens, so a node that joins a group later
+sends to its group's EIDs but keeps receiving on the ones it opened with. A
+second bundle for a busy channel overwrites the first in its slot. And an
+inbound bundle's address is its source EID, which matches a peer only if that
+peer's address was provisioned as the EID. Python's own differences are in the
+module docstrings. The core calls a group send once per member with the same
+frame, so the DTN transport sends that frame once. A hybrid leg without a
+`net_cfg` uses the node's own network configuration, where C opens it on a
+zeroed one. The AAP 2.0 client bounds a send's wait for the daemon at 30 s.
 
 ## External extensions and conformance plug-ins
 
@@ -887,8 +959,9 @@ their own.
 
 The Python processes do the same thing with an `Extension` dataclass
 (`name, enabled, register_handlers, post_fork=None, reset=None,
-identity=None`; `identity` is the feature's `IdentityHooks`, see "Identity
-hooks"). Each of
+identity=None`, and more; `identity` is the feature's `IdentityHooks`, see
+"Identity hooks", and `transports` names the network transports it supplies,
+see "DTN"). Each of
 `IdentityProcess`, `NetworkProcess`, `ReputationProcess` and
 `NegotiationProcess` ends its handler block with `load_extensions(self,
 self.name)`, and each `process()` starts with `run_post_fork(self)`, which runs
@@ -988,11 +1061,21 @@ whether it built.
   processes and subsystems are there and accepted, `app_fleet_propose` targets
   `fleet`, `FLEET_UPDATE_ACCEPTED` is app-bound in fleet's range, and the app's
   proposal is signed by the node, names it the signer, and starts the vote;
-  refused from the wire or malformed, nothing is sent. `data_source_test` does
+  refused from the wire or malformed, nothing is sent. `at_fleet.h`'s sender
+  refuses bad fields and reports a node not yet listening, and its decoder
+  turns an acceptance into kind 1100. `zta_link_test` checks `zta_verify` is a
+  default subsystem. `data_source_test` does
   the same for the data-source process, subsystem and capability.
 - `extensions/dtn/test/dtn_link_test.c`: with `at_dtn_static` linked,
   `net_transport_find("dtn_bp")` and `find_process("dtn_bp")` resolve
-  (FEATURE_SPLIT_PLAN.md §5.3).
+  (FEATURE_SPLIT_PLAN.md §5.3). `dtn_eid_test.c` pins the shared addressing
+  functions, and `test/peers_address_test.c` an EID address found whole.
+- The `dtn` protocol: 48 scenarios, passing in both runtimes. Eight of them,
+  one per kind of assertion, were corrupted on purpose, and both adapters
+  failed exactly those eight. The Python distribution's own tests drive the
+  transport over an in-process agent and the AAP 2.0 client against a fake
+  µD3TN daemon; `tests/a_unit/test_network_hybrid.py` runs C's
+  `hybrid_route_test` cases through the Python router.
 - `test/net_filter_test.c`: chain order, verdicts that stop it, narrowing,
   `after_deliver` slices, install refusals, reset, an empty chain passing
   frames through byte-identical, and the config gate refusing the envelope
@@ -1052,18 +1135,10 @@ whether it built.
 
 - The core references no feature's anchor any more: with rendezvous and first
   contact out (Phase 7), every feature's consumers own its link.
-- Fleet's app verb has no flat-ABI sender, and `FLEET_UPDATE_ACCEPTED` no event
-  kind or decoder, so an app on `at_app_events_*` can neither propose nor hear
-  an acceptance; an embedding C program sends the verb itself. The core's
-  `UPDATE_ACCEPTED` was no more decodable before Phase 8.
 - A fleet proposal is verified only against the key its message carries.
   Nothing checks that the key is the `signer_uuid`'s or one allowed to propose,
   and the proposer chooses its own `min_proposer_reputation`. Phase 8 moved this
   as it was.
-- ZTA's `zta_verify` process has never been in a generated subsystem list, so
-  in C its background re-verification runs only if an operator adds it to
-  `subsystems.cfg.json`. `DEFINE_SUBSYSTEM` is the one-line fix; it has not been
-  made.
 - Social's locking differs between the runtimes: C has a leaf lock of its own,
   and Python keeps the one `proc.lock`. In C a tier and a block are therefore
   two snapshots. Conformance is deterministic and cannot show a timing

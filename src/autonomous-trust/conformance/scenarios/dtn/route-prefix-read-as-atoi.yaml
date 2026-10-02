@@ -1,0 +1,30 @@
+# ******************
+#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Licensed under the Apache License, Version 2.0 (see LICENSE / api.md).
+# ******************
+schema_version: "1"
+kind: "scenario"
+protocol: "dtn"
+name: "route-prefix-read-as-atoi"
+description: |
+  The prefix length is read as C's atoi reads it: leading digits, the rest ignored.
+byte_pinning: false
+participants:
+  - id: "host"
+    role: "recipient"
+fixtures:
+  dtn:
+    op: "route"
+    inners:
+      - kind: "udp_net_4"
+        match_cidr: "10.0.0.0/24junk"
+    target: "10.0.0.9"
+steps:
+  - id: 1
+    from: "host"
+    to: "host"
+    function: "route"
+    description: "trigger: route"
+expected_state:
+  host:
+    leg: 0
