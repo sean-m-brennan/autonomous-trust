@@ -716,6 +716,16 @@ catch-up, in the evidence document, and in deep-resolution answers. A catch-up
 segment carrying an attested entry without a certificate that verifies is
 refused, since otherwise catch-up would be a way around the round.
 
+**A lost propose is sent again.** The propose is a one-shot fan-out, and a
+saturated network queue can drop one member's copy (Stele `st-660084`). When the
+member who lost it is needed for the quorum, the round can never certify. So a
+round still short of a quorum re-sends its propose every 15 s
+(`AT_REP_ATTEST_RETRY_SEC`), up to 5 times, and is then abandoned. A round whose
+entry is already in the chain, certified by a final from elsewhere, is simply
+forgotten. A repeat cannot fork the round, because the task id is derived from
+(verifier, subject, evidence digest): it is the same round, and a co-signer signs
+the same designation again (ISSUES §2.40).
+
 **What the subject cannot do.** Block it, because its signature is not
 counted. Strip it, because the entry is hash-linked into a window root that a
 checkpoint quorum signs. Fork it away: when a node adopts a chain that dropped
@@ -883,6 +893,16 @@ claimed for an interaction the other party never had. The same trap has bitten
 twice before in other shapes — receive loops that took one message per tick, and
 a queue close that unlinked by name — and the reasoning for each sits at its fix
 site, in `processes/processes.h` and `utilities/message.c`.
+
+The first fix was a bounded retry, 10 tries 20 ms apart, and that 200 ms was
+not enough either. On 2026-10-02 a queue stayed full for longer, and a joiner's
+history, a direct message and an attestation propose were each given up on. A
+frame still refused after the inline tries is now kept and retried on the
+identity tick for up to 30 s (`identity/id_send_retry.h`). Because a kept frame
+may still be given up on, "the send returned 0" no longer means "it went". So
+the reaction and the report score their bilateral half in an on-sent callback
+that hears whether the frame really left. A frame that never leaves is never
+scored (ISSUES §2.40).
 
 The pattern worth remembering is not any one of these. It is that a
 single-process conformance harness, however complete, is structurally blind to

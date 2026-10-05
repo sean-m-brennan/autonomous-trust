@@ -269,6 +269,76 @@ class TestChain:
         assert len(h) == 0
 
 
+
+def _proposes(queues):
+    return [m for m in _sent(queues)
+            if m.function == ReputationProtocol.attest_propose]
+
+
+def _later(rp, n):
+    """A sweep time n retry intervals from now (plus a second of slack)."""
+    from autonomous_trust.core._python.reputation.repprocess import now
+    return now().timestamp() + n * rp.ATTEST_RETRY_SEC + 1
+
+
+class TestReproposal:
+    """ISSUES §2.40: the propose is a one-shot fan-out, and a lost copy left
+    the round pending forever (Stele st-660084). It is now sent again on the
+    reputation tick, a bounded number of times."""
+
+    def _proposed(self, trio):
+        v, s, o = trio
+        ver, vq = _node(v, [s, o])
+        assert ver.forward_attestation(vq, AttestedScore(
+            subject_uuid=str(s.uuid), score=0.3, evidence_digest=DIGEST))
+        assert len(_proposes(vq)) == 1   # ...and, say, lost on the way
+        return ver, vq
+
+    def test_a_lost_propose_is_sent_again_after_the_interval(self, trio):
+        ver, vq = self._proposed(trio)
+        assert ver._retry_pending_attestations(vq, _later(ver, 0) - 2) == 0
+        assert _proposes(vq) == []
+        assert ver._retry_pending_attestations(vq, _later(ver, 1)) == 1
+        again = _proposes(vq)
+        assert len(again) == 1
+        # The same round: a co-signer signs the same designation again.
+        assert from_json_string_obj(again[0].obj).task_id == \
+            list(ver._attest_pending.values())[0].task_id
+
+    def test_reproposals_are_bounded_then_the_round_is_abandoned(self, trio):
+        ver, vq = self._proposed(trio)
+        sent = sum(ver._retry_pending_attestations(vq, _later(ver, i))
+                   for i in range(1, 3 * ver.ATTEST_RETRIES))
+        assert sent == ver.ATTEST_RETRIES
+        assert ver._attest_pending == {} and ver._attest_retry == {}
+
+    def test_a_certified_round_is_not_proposed_again(self, trio):
+        v, s, o = trio
+        ver, vq = self._proposed(trio)
+        obs, oq = _node(o, [v, s])
+        obs.reputations.update(v.uuid, 0.7)
+        obs.handle_attest_propose(oq, _msg(ReputationProtocol.attest_propose,
+                                           _att(v, s), v))
+        sign = [m for m in _sent(oq)
+                if m.function == ReputationProtocol.attest_sign][0]
+        ver.handle_attest_sign(vq, _msg(ReputationProtocol.attest_sign,
+                                        from_json_string_obj(sign.obj), o))
+        assert len(ver.history) == 1
+        _sent(vq)
+        assert ver._retry_pending_attestations(vq, _later(ver, 1)) == 0
+        assert _proposes(vq) == []
+
+    def test_a_round_already_in_the_chain_is_forgotten(self, trio):
+        v, s, o = trio
+        ver, vq = self._proposed(trio)
+        att = list(ver._attest_pending.values())[0]
+        # Certified elsewhere, and its final reached us first.
+        ver._commit_attestation(att, {str(v.uuid): _sig(v, att),
+                                      str(o.uuid): _sig(o, att)})
+        assert ver._retry_pending_attestations(vq, _later(ver, 1)) == 0
+        assert _proposes(vq) == []
+        assert ver._attest_pending == {} and ver._attest_retry == {}
+
 def from_json_string_obj(obj):
     from autonomous_trust.core.config import from_json_string
     return obj if not isinstance(obj, str) else from_json_string(obj)
