@@ -245,6 +245,21 @@ void reputation_install_tx_pair(const uuid_t task_uuid,
  *
  *  Untagged deliberately: the staged side is an ordinary task outcome, and the
  *  channel under test arrives on the wire. Conformance hook only. */
+/** Propose a locally produced verifier-attested score (@p ts->attested) to
+ *  the group as its verifier @p self_uuid: sign, file it pending, fan out the
+ *  propose, and start its re-propose clock. */
+void _forward_attestation(const process_t *proc, const tx_score_msg_t *ts,
+                          const uuid_t self_uuid);
+
+/** One pass of the attestation re-propose clock (ISSUES §2.40): resend each
+ *  pending round's propose once REP_ATTEST_RETRY has passed since the last, up
+ *  to REP_ATTEST_RETRIES times, then abandon it; forget rounds already in the
+ *  chain. @return proposes sent. */
+size_t _retry_pending_attestations(const process_t *proc, double present);
+
+/** Our attestation rounds still awaiting a quorum. */
+size_t reputation_attest_pending_count(void);
+
 /* Commit a verifier-attested entry directly (test/conformance hook): the
  * chain's half of the rule, without the quorum round. Returns
  * tx_history_append_attested's result. */

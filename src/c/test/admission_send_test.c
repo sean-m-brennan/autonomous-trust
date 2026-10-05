@@ -39,6 +39,8 @@
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
 #include "identity/id_proc_priv.h"
+#include "identity/id_send_retry.h"
+#include <time.h>
 #include "identity/group.h"
 #include "config/configuration.h"
 #include "structures/data.h"
@@ -186,14 +188,25 @@ DEFINE_TEST(test_an_idle_queue_sends_each_once)
 }
 END_TEST_DEFINITION()
 
-/* Bounded: a wedged queue is given up on (and logged) after ten tries each. */
-DEFINE_TEST(test_a_wedged_queue_is_given_up_on)
+/* A queue wedged past the inline tries: the grant is KEPT for the identity
+ * tick (ISSUES §2.40), and the history waits behind it rather than racing it,
+ * so the joiner still gets them in order. Both land once the queue drains.
+ * (Until §2.40 both were given up on after ten tries each, and the joiner
+ * founded a group of its own: Agora part-603464.) */
+DEFINE_TEST(test_a_wedged_queue_keeps_both_for_the_tick)
 {
     _admit(1000);
-    ck_assert_uint_eq(g_refused_grant, 10);
-    ck_assert_uint_eq(g_refused_hist, 10);
     ck_assert_uint_eq(g_granted, 0);
     ck_assert_uint_eq(g_history, 0);
+    ck_assert_uint_eq(g_refused_hist, 0);   /* queued behind the grant */
+    ck_assert(id_send_retry_pending("network") >= 2);
+    g_refuse_each = 0;                      /* the queue drains */
+    messaging_set_test_hook(_capture_hook); /* _admit removed it */
+    id_send_retry_drain(NULL, "network", (double)time(NULL));
+    messaging_set_test_hook(NULL);
+    ck_assert_uint_eq(g_granted, 1);
+    ck_assert_uint_eq(g_history, 1);
+    ck_assert_uint_eq(id_send_retry_pending("network"), 0);
 }
 END_TEST_DEFINITION()
 
@@ -236,5 +249,5 @@ END_TEST_DEFINITION()
 RUN_TESTS(AdmissionSend,
           test_a_joiner_gets_its_history_through_a_full_queue,
           test_an_idle_queue_sends_each_once,
-          test_a_wedged_queue_is_given_up_on,
+          test_a_wedged_queue_keeps_both_for_the_tick,
           test_a_rotation_reaches_a_member_through_a_full_queue)

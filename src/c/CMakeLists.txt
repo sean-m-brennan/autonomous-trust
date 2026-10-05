@@ -449,6 +449,7 @@ set(libsrc
     autonomous_trust/identity/history.c
     autonomous_trust/identity/identity.c
     autonomous_trust/identity/id_proc.c
+    autonomous_trust/identity/id_send_retry.c
     autonomous_trust/identity/id_ext.c
     autonomous_trust/identity/peers.c
     autonomous_trust/identity/signature.c
@@ -852,12 +853,18 @@ target_link_libraries(group_rotation_sibling_test PRIVATE ${AT_TEST_LIBS})
 add_executable(handoff_retry_test test/handoff_retry_test.c)
 set_source_files_properties(test/handoff_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(handoff_retry_test PRIVATE ${AT_TEST_LIBS})
+add_executable(send_retry_test test/send_retry_test.c)
+set_source_files_properties(test/send_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(send_retry_test PRIVATE ${AT_TEST_LIBS})
 add_executable(rep_commit_retry_test test/rep_commit_retry_test.c)
 set_source_files_properties(test/rep_commit_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(rep_commit_retry_test PRIVATE ${AT_TEST_LIBS})
 add_executable(rep_cosign_test test/rep_cosign_test.c)
 set_source_files_properties(test/rep_cosign_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(rep_cosign_test PRIVATE ${AT_TEST_LIBS})
+add_executable(rep_attest_retry_test test/rep_attest_retry_test.c)
+set_source_files_properties(test/rep_attest_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_attest_retry_test PRIVATE ${AT_TEST_LIBS})
 add_executable(admission_send_test test/admission_send_test.c)
 set_source_files_properties(test/admission_send_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(admission_send_test PRIVATE ${AT_TEST_LIBS})
@@ -992,8 +999,10 @@ add_test(NAME late_joiner_caps_resync_test COMMAND $<TARGET_FILE:late_joiner_cap
 add_test(NAME identity_resync_test COMMAND $<TARGET_FILE:identity_resync_test>)
 add_test(NAME group_rotation_sibling_test COMMAND $<TARGET_FILE:group_rotation_sibling_test>)
 add_test(NAME handoff_retry_test COMMAND $<TARGET_FILE:handoff_retry_test>)
+add_test(NAME send_retry_test COMMAND $<TARGET_FILE:send_retry_test>)
 add_test(NAME rep_commit_retry_test COMMAND $<TARGET_FILE:rep_commit_retry_test>)
 add_test(NAME rep_cosign_test COMMAND $<TARGET_FILE:rep_cosign_test>)
+add_test(NAME rep_attest_retry_test COMMAND $<TARGET_FILE:rep_attest_retry_test>)
 add_test(NAME admission_send_test COMMAND $<TARGET_FILE:admission_send_test>)
 add_test(NAME rep_quorum_test COMMAND $<TARGET_FILE:rep_quorum_test>)
 add_test(NAME rep_paxos_round_test COMMAND $<TARGET_FILE:rep_paxos_round_test>)

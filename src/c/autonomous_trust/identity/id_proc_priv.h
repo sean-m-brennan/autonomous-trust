@@ -22,6 +22,7 @@
 
 #include "processes/processes.h"
 #include "identity/group.h"
+#include "identity/id_send_retry.h"
 #include "utilities/clock.h"    /* at_clock_sample_t (cohort clock skew) */
 
 /*@
@@ -256,12 +257,36 @@ int identity_remove_direct_peer(process_t *proc, directory_t *queues,
 bool identity_find_peer_pub(const process_t *proc, const uuid_t uuid,
                             public_identity_t *out);
 
-/** Hand net_proc a frame a person asked for, retrying a full queue 10 times
- *  (20 ms apart) and logging a WARNING if it still did not go -- the action
- *  did not happen and nothing retries it. @p what / @p whom name it in that
- *  warning. @return 0, or the last messaging_send result. */
+/** Hand the sibling process @p queue a one-shot frame (identity process
+ *  only). Tries a full queue 10 times, 20 ms apart; if it is still full the
+ *  frame is KEPT and the identity tick retries it for up to 30 s
+ *  (id_send_retry.h, ISSUES §2.40). A send to a queue that already holds kept
+ *  frames waits behind them. @p what / @p whom name it in the log lines.
+ *  @return 0 when sent or kept -- the node owns the delivery -- or the
+ *  messaging_send error (a hard fault, or a full queue with no room to keep). */
+int identity_send_to(const process_t *proc, const char *queue,
+                     generic_msg_t *out, const char *what, const char *whom);
+
+/** @ref identity_send_to the network process. */
 int identity_send_to_network(const process_t *proc, generic_msg_t *out,
                              const char *what, const char *whom);
+
+/** @ref identity_send_to, then run @p on_sent (id_send_retry.h) with a copy of
+ *  @p ctx once the frame's fate is known: sent=true before this returns if the
+ *  inline tries took it, else from the identity tick that drains it or gives it
+ *  up (sent=false). Run once for every 0 returned, never after a non-zero one,
+ *  so act there, not on the 0, when the action must only count if the frame
+ *  went (a bilateral score). */
+int identity_send_to_then(const process_t *proc, const char *queue,
+                          generic_msg_t *out, const char *what,
+                          const char *whom, id_send_sent_fn on_sent,
+                          const void *ctx, size_t ctx_len);
+
+/** @ref identity_send_to_then the network process. */
+int identity_send_to_network_then(const process_t *proc, generic_msg_t *out,
+                                  const char *what, const char *whom,
+                                  id_send_sent_fn on_sent, const void *ctx,
+                                  size_t ctx_len);
 
 /** The next outbound freshness sequence for identity-signed frames, or <= 0
  *  if none could be issued (the caller must then refuse to send). Takes
