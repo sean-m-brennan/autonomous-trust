@@ -284,8 +284,10 @@ static void _end(void) { messaging_set_test_hook(NULL); }
 
 DEFINE_TEST(test_a_granted_round_reaches_a_transaction)
 {
-    /* THE regression. Two peers, so PAXOS_MAJORITY(2) == 2 and both have to
-     * answer — a round that committed on one grant would not be a quorum. */
+    /* THE regression. Two peers, sized live from the roster: Python's grant
+     * test is `count >= len(peers) // 2`, so ONE grant carries a round here,
+     * and C now asks the same (it used to ask n/2 + 1 of a count frozen at
+     * start-up). */
     _begin(2);
     identity_t *me = _mk_identity("me", "10.0.0.1");
     identity_t *alice = _mk_identity("alice", "10.0.0.2");
@@ -311,15 +313,15 @@ DEFINE_TEST(test_a_granted_round_reaches_a_transaction)
     ck_assert_str_eq(g_req_peer_uuid, me_str);
     ck_assert(g_req_id1 > 0);
 
-    /* One grant is short of quorum: the round is pending, not committed. */
-    _grant(proc, alice);
-    ck_assert_uint_eq(g_tx_count, 0);
-
-    /* The second grant carries it. Before the key fix this stayed at zero
+    /* The first grant carries it. Before the key fix this stayed at zero
      * however many grants arrived, because the lookup never found the
      * pending round at all. */
-    _grant(proc, bob);
+    _grant(proc, alice);
     ck_assert_uint_eq(g_tx_count, 2);   /* broadcast: one per peer */
+
+    /* A late grant for a round already carried sends nothing more. */
+    _grant(proc, bob);
+    ck_assert_uint_eq(g_tx_count, 2);
 
     /* And it is THIS round that committed, not some other pending one. */
     ck_assert_str_eq(g_tx_task_uuid, task_str);

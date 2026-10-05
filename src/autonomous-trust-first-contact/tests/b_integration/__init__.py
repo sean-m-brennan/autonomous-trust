@@ -1,6 +1,5 @@
-#!/bin/bash
 # ******************
-#  Copyright 2026 TekFive, Inc., Sean M. Brennan, and contributors
+#  Copyright 2023 TekFive, Inc., Sean M. Brennan, and contributors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -14,7 +13,3 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 # ******************
-cd "$(dirname "$0")"
-python -m pytest -q \
-  --cov=autonomous_trust --cov-config=.coveragerc --cov-report=term-missing \
-  tests/a_unit/ tests/b_integration/ "$@"

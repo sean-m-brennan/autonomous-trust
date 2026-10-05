@@ -744,11 +744,19 @@ must also grant first contact's five plaintext verbs (see "Plaintext verbs").
 identity (39) and negotiation (8) cases skip without the extension, and so do
 `network/unencrypted-verbs` and the first-contact rows of
 `network/plaintext-verbs-file`. The skip sets match on both runtimes: 217
-cases. The unit tests moved to the distribution's `tests/a_unit`; the three
-integration tests (`test_first_contact_two_node.py`,
-`test_directory_three_node.py`, `test_area_three_node.py`) stay in the core's
-`tests/b_integration`, because they build on the core's own two- and
-three-node test helpers.
+cases. The unit tests moved to the distribution's `tests/a_unit`, and on
+2026-10-05 the four integration tests followed into its `tests/b_integration`
+(`test_first_contact_two_node.py`, `test_relay_three_node.py`,
+`test_directory_three_node.py`, `test_area_three_node.py`). They had stayed in
+the core because they build on its loopback helpers, which left the core's
+suite unable to collect without the extension installed. The helpers are copied
+into `tests/b_integration/_loopback.py`, since both distributions name their
+test package `tests` and neither can import the other's. The core's plaintext
+tests keep the rules and exercise them with a stand-in extension; first
+contact's own verbs, its half of the plaintext file and its send sites are
+pinned in `tests/a_unit/test_first_contact_plaintext.py`. The core's unit and
+integration tests no longer import `autonomous_trust.first_contact`; the
+conformance adapters still do, and skip first contact's cases without it.
 
 ## Rendezvous (`libat_rendezvous`, `autonomous_trust.rendezvous`)
 

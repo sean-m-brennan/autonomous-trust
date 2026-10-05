@@ -1336,6 +1336,8 @@ class TestProposerHistoryBilateral:
         stub._chain_for_group = lambda g: history
         stub._note_interaction = lambda *a, **k: None
         stub._fold_committed_tx = lambda *a, **k: None
+        # A group that does not declare commit certificates (the default).
+        stub._commit_certs_required = lambda g=None: False
         stub.identity = SimpleNamespace(uuid=self_id)
         stub.logger = SimpleNamespace(
             warning=lambda *a, **k: None, debug=lambda *a, **k: None,
@@ -1397,6 +1399,7 @@ class TestProposerHistoryBilateral:
             _chain_for_group=lambda g: history,
             _note_interaction=lambda *a, **k: None,
             _fold_committed_tx=lambda *a, **k: None,
+            _commit_certs_required=lambda g=None: False,
             identity=SimpleNamespace(uuid=self_id),
             logger=SimpleNamespace(
                 warning=lambda *a, **k: None, debug=lambda *a, **k: None,

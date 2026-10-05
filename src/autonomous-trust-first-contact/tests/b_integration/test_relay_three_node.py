@@ -45,7 +45,7 @@ from autonomous_trust.core.config import Configuration
 from autonomous_trust.core.config.generate import generate_identity
 from autonomous_trust.core import plaintext_verbs
 from autonomous_trust.first_contact import first_contact
-from .test_two_node import MP_CTX, _make_node_dir, _mock_addresses, _patch_loopback
+from ._loopback import MP_CTX, _make_node_dir, _mock_addresses, _patch_loopback
 from .test_first_contact_two_node import _await, STARTUP
 from .. import TEST_DIR
 

@@ -31,8 +31,8 @@ app request crossing the main loop to identity, the hello and ack arriving on
 the network process's UNKNOWN-SENDER plaintext path, and the events coming
 back out through the main loop to each app's feedback queue.
 
-Loopback caveats are the ones test_two_node.py handles, and its patch is
-reused, with a peer list of just the node itself.
+Loopback caveats are the ones the core's test_two_node.py handles; its patch is
+reused (copied into _loopback.py), with a peer list of just the node itself.
 """
 import json
 import logging
@@ -50,7 +50,7 @@ from autonomous_trust.core.config.generate import generate_identity
 from autonomous_trust.core.system import comm_port
 from autonomous_trust.core import plaintext_verbs
 from autonomous_trust.first_contact import first_contact
-from .test_two_node import MP_CTX, _make_node_dir, _mock_addresses, _patch_loopback
+from ._loopback import MP_CTX, _make_node_dir, _mock_addresses, _patch_loopback
 from .. import TEST_DIR
 
 ALICE_IP = '127.0.0.1'

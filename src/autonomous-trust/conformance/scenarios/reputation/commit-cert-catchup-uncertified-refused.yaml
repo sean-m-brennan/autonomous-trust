@@ -1,0 +1,38 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: commit-cert-catchup-uncertified-refused
+byte_pinning: false
+description: |
+    Commit certificates (doc/architecture/reputation.md) on catch-up. In a group that
+    declares them, a segment whose entries are new to bob and covered by no quorum
+    checkpoint must carry a certificate for every half, or catch-up would be a way
+    around the round. alice's segment carries none, and bob refuses all of it.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: consumer
+  - id: carol
+    role: proposer
+  - id: dave
+    role: member
+
+fixtures:
+  commit_certificates: true
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: latest update
+    payload:
+      chain:
+        - {task: a, p1: 0.9, p2: 0.8, p1_id: alice, p2_id: carol}
+        - {task: b, p1: 0.7, p2: 0.6, p1_id: alice, p2_id: carol}
+
+expected_state:
+  bob:
+    committed_tx_count: 0
+    certified_halves: 0

@@ -1,0 +1,62 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: commit-cert-acceptor-signs-and-proposer-commits
+byte_pinning: false
+description: |
+    Commit certificates (doc/architecture/reputation.md), end to end through one
+    acceptor. alice's proposal asks for certification; bob signs what he accepts,
+    and that real signature travels on his `tx accepted`. alice's roster is bob
+    alone, so one verified signature clears her quorum (more than 1 // 2), and her
+    half is written beside its certificate.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+
+fixtures:
+  commit_certificates: true
+  requests:
+    bob:
+      - [1000, 1]
+  my_requests:
+    alice:
+      - id1: 1000
+        id2: 1
+        task_id: t-1
+        score: 0.8
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: transaction
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+      task_id: t-1
+      score: 0.8
+      certify: true
+
+  - id: 2
+    from: bob
+    to: alice
+    function: tx accepted
+    in_response_to: 1
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+      # The C engine rebuilds a propagated message from these keys; Python
+      # re-delivers bob's real one.
+      task_id: t-1
+      score: 0.8
+      signed: true
+
+expected_state:
+  alice:
+    halves_held: 1
+    certified_halves: 1

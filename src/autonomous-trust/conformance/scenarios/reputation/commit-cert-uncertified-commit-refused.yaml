@@ -1,0 +1,46 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: commit-cert-uncertified-commit-refused
+byte_pinning: false
+description: |
+    Commit certificates (doc/architecture/reputation.md). bob's roster is alice, carol
+    and dave, so his quorum is more than 3 // 2: two signatures over alice's
+    commit_designation, never counting alice's own. bob already holds carol's half
+    of t-1; alice's commit is the other half.
+
+    The group declares certificates and alice's commit carries none. bob refuses
+    it: t-1 stays one-sided.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: proposer
+  - id: dave
+    role: member
+
+fixtures:
+  commit_certificates: true
+  tx_history:
+    bob:
+      - task_id: t-1
+        p1: carol
+        p1_score: 0.9
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: tx committed
+    payload:
+      task_id: t-1
+      score: 0.8
+
+expected_state:
+  bob:
+    committed_tx_count: 0
+    halves_held: 1
+    certified_halves: 0

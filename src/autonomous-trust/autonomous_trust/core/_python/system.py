@@ -254,6 +254,18 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return default
 
 
+def resolve_commit_certificates() -> bool:
+    """Whether a group this node MINTS requires a quorum certificate on every
+    ordinary reputation commit (``AT_COMMIT_CERTIFICATES``, default off).
+
+    Like :func:`resolve_net_wire_mode`, this stamps a new group and nothing
+    else: an existing group's members read the declaration off the group
+    (``Group.commit_certificates``), which is what keeps a cohort from
+    disagreeing about which commits it writes. Mirrors C's
+    ``commit_certificates_resolve``."""
+    return _env_bool('AT_COMMIT_CERTIFICATES', False)
+
+
 def _env_num(name: str, default, cast):
     raw = os.environ.get(name)
     if raw is None:
