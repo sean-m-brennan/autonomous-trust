@@ -14,7 +14,6 @@
 #   limitations under the License.
 # ******************
 from autonomous_trust.core.identity.protocol import IdentityProtocol
-from autonomous_trust.first_contact.fc_protocol import FirstContactProtocol
 
 
 class TestIdentityProtocol:
@@ -50,7 +49,8 @@ class TestIdentityProtocol:
           (operator_state_req, operator_state_resp)
         - runtime hierarchy roots (hierarchy, hierarchy_req)
         First contact's verbs left with it (FEATURE_SPLIT_PLAN Phase 7, C6):
-        they are ``FirstContactProtocol``, pinned below.
+        they are ``FirstContactProtocol``, pinned in that distribution's
+        test_first_contact_plaintext.py.
         The social verbs (position, profile, connections, DMs, posts,
         reactions, proximity, business ads and posts, cosign, reports)
         left with social (FEATURE_SPLIT_PLAN Phase 5): they are
@@ -67,20 +67,3 @@ class TestIdentityProtocol:
         assert 'hello' not in values
         assert 'report' not in values
         assert 'business_ad' not in values
-
-    def test_first_contact_protocol_verbs(self):
-        """First contact's own verbs (first_contact/fc_protocol.py), registered on
-        the identity process by its extension: the 1:1 handshake (hello,
-        hello_ack; opt-in via AT_FIRST_CONTACT, see first-contact.md), its
-        reachability record (reach_record), the directory contact
-        (contact_request, contact_accept on the wire; dir_result, dir_status
-        local IPC from the network process), area hubs (hub_result,
-        hub_status, local IPC from the network process), one human's several
-        devices (device_cert, device_announce) and their shared address book
-        (contacts_sync). The wire strings did not change in the move, and none
-        is still an IdentityProtocol verb."""
-        values = list(FirstContactProtocol)
-        assert len(values) == 12
-        assert FirstContactProtocol.hello == 'first_contact_hello'
-        assert FirstContactProtocol.device_announce == 'device_announce'
-        assert not set(values) & set(IdentityProtocol)

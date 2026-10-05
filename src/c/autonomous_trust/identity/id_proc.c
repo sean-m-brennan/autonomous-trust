@@ -3987,6 +3987,11 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
          * epoch, not ours. Mirrors Python Group.update_from. */
         if (theirs_created > 0.0)
             ((process_t *)proc)->protocol.group.created = theirs_created;
+        /* And its commit-certificate declaration: a property of the cohort, so
+         * an absorbed node that kept its own would refuse (or accept) commits
+         * its new group does not. Mirrors Python Group.adopt_membership. */
+        ((process_t *)proc)->protocol.group.commit_certificates =
+            json_is_true(json_object_get(payload, "commit_certificates"));
         /* Replace address_map: free any existing entries, then ingest theirs
          * by walking the JSON object so we never need map_priv.h here. */
         if (((process_t *)proc)->protocol.group.address_map.items != NULL)
@@ -8118,6 +8123,10 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
                  * which keeps the conformance adapters format-agnostic. Mirrors Python
                  * Group.initialize. */
                 proc->protocol.group.wire_format = net_wire_mode_resolve(NULL, logger);
+                /* The commit-certificate declaration likewise: decided here,
+                 * adopted everywhere else. */
+                proc->protocol.group.commit_certificates =
+                    group_commit_certificates_resolve();
             }
             if (pub != NULL)
                 smrt_deref(pub);

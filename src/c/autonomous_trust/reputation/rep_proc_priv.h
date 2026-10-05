@@ -147,6 +147,12 @@ int reputation_get_chain_len(void);
  *  Returns -1 if state is uninitialized. */
 int reputation_get_committed_tx_count(void);
 
+/** Count the ordinary halves rep_state.history holds (pending or committed)
+ *  and how many of them carry a commit certificate, for the `halves_held` /
+ *  `certified_halves` expected_state assertions (doc/architecture/reputation.md, "Commit certificates").
+ *  Mirrors the Python adapter's reading of Transaction.commit_sigs. */
+void reputation_get_commit_cert_counts(int *halves_held, int *certified_halves);
+
 /** Write the RFC 6962 ordered Merkle root over the resident committed window
  *  (transaction_window_root) into `out` (must hold TX_HASH_HEX_LEN + 1 bytes)
  *  for the `window_root` expected_state assertion. Mirrors Python

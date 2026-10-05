@@ -362,6 +362,15 @@ transaction carrying the score, keyed by the same round tuple. Each acceptor
 verifies that the round was previously granted before emitting acceptance, and
 the proposer commits to history on majority acceptance.
 
+Both thresholds are sized per round from the round's own group as it stands
+then, `n = len(peers)`, this node excluded: a round carries at `n // 2` grants or
+more, and commits at more than `n // 2` acceptances. Both runtimes ask exactly
+that. C used to compare against `n / 2 + 1` of a count read once at start-up,
+before discovery had found anybody, so in production one grant and one
+acceptance carried every round however large the group grew. The acceptance
+test was already Python's (`>= n/2 + 1` is `> n // 2` in integers); only the
+count was frozen. The grant test was one stricter than Python's.
+
 *Phase 3, commit broadcast.* After committing to its own history, the proposer
 broadcasts the commit carrying the task identifier, the proposer identifier, and
 the score. Each acceptor writes the same entry to its own history, and the
@@ -756,6 +765,99 @@ decides only who may author one and what makes it stick. Stele
 (`apps/stele/`) is the first producer, scoring a repository owner's node on a
 vulnerability scan of its published commit.
 
+## Commit certificates
+
+A `committed` half is written by its sender, and since the provenance rule
+(pinned by `committed-writes-only-the-senders-half`) only by its sender: a
+member can no longer write another member's half. What it
+can still do is write its own half without any round having happened. Nothing
+on an ordinary commit shows that a quorum accepted it, so the effective
+Byzantine threshold on the chain is one member, not the majority the Paxos path
+is sized for.
+
+A group can close that by declaring **commit certificates**. Then every
+ordinary half carries the signatures of more than a quorum of acceptors over
+exactly what it writes, and no node writes one without them.
+
+**What a certificate proves, and what it does not.** It proves the round: that
+more than `n // 2` members of the receiver's own view accepted this score, from
+this scorer, on this channel, for this task. It does not prove the score is
+true. An acceptor never sees the task; it signs what the proposer tells it. So
+the lie a certificate leaves open is a scorer's about its own half, which is
+`R+D.md` §14.2's question (bilateral evidence), not this one's. What it buys is
+round existence, non-equivocation (every node writes the score a quorum saw),
+an entry that can be checked offline, and a per-entry cost of a quorum's
+participation.
+
+**The declaration is the group's.** `Group.commit_certificates` (C
+`group_t.commit_certificates`), default off. Two members that disagreed about
+it would write different commits and fork their chains, so it travels with the
+group, as `wire_format` does: in the canonical group form (emitted only when
+true, so an undeclared group's bytes are unchanged), in `identity.proto`
+`Group.commit_certificates`, and through a merge, where the absorbed node
+adopts the surviving group's value. `AT_COMMIT_CERTIFICATES` stamps only a
+group the node mints; a joiner adopts its group's value. Turning it on for an
+existing cohort means minting a new group, the same constraint `wire_format`
+has.
+
+**What is signed.** One certificate per half, so two per entry, because the two
+halves are committed by two rounds:
+
+    "AT-COMMIT\0" scorer "|" task "|" %.17g score "|" channel
+
+Lowercase uuids, and the channel normalized, so an absent channel and an
+explicit `task_outcome` are one claim with one signature, as they are one entry
+hash. Byte-identical in both runtimes (`commit_designation`), and pinned by a C
+unit test against Python's bytes.
+
+The group is not covered. An acceptor is never told which of a gateway's chains
+the round lands in, and a group's uuid changes when a merge absorbs it, which
+would orphan every certificate cut before. A certificate replayed into another
+chain still has to clear that group's quorum with signers the receiver
+resolves, so what it leaves is a scorer re-filing its own certified half.
+
+**The round.**
+
+1. In a declaring group, the proposer's `transaction` asks for certification
+   (Python appends `True`; C sets `"certify": true`).
+2. Each acceptor signs the half's designation, but only when the proposal comes
+   from the scorer it names. A relayed proposal is accepted unsigned.
+3. The proposer counts only acceptances whose signature verifies, attributed to
+   their authenticated sender, and commits once they clear the bar a receiver
+   will hold them to. The certificate rides on `committed` (Python: element
+   six; C: `"certificate"`).
+4. A receiver in a declaring group writes the half only if more than
+   `_quorum_for_group` distinct members of **its own** view signed it. The
+   scorer's own signature never counts.
+
+A receiver whose group does not declare them still keeps a valid certificate it
+is handed, so a chain cut before the group declared them can be served to one
+that does.
+
+**Where they are kept.** Beside the entry and outside its hash, as a
+checkpoint's co-signatures sit outside its root: `Transaction.commit_sigs` in
+Python, `tx_history_t.commit_certs` in C. They travel on the catch-up wire and
+in the evidence document as `commit_sigs`, `{scorer: {voter: signature}}`,
+omitted when there are none. A fork that drops an entry drops its
+certificates.
+
+**Catch-up.** In a declaring group, a segment is refused unless every ordinary
+half of every entry in it that is new to this node carries a certificate
+meeting this node's quorum. Two kinds of entry are exempt:
+
+- **Entries a quorum checkpoint covers.** If the segment holds the whole window
+  of the latest quorum-attested primary checkpoint and reproduces its root,
+  the checkpoint certifies those entries. This is how a chain cut before its
+  group declared certificates, or certified by members since gone, stays
+  acceptable once a quorum has checkpointed it. Only the uncheckpointed tail
+  has to show certificates, and the tail is checked against the current
+  roster.
+- **Entries already held identically**, at the same index with the same hash.
+  Repeating them tells the receiver nothing new.
+
+Pinned by the `commit-cert-*` scenarios below, `tests/a_unit/test_commit_certificates.py`
+and `src/c/test/rep_commit_cert_test.c`.
+
 ## Asking others what they think
 
 A score computed here is one node's view. An observer dashboard wants the whole
@@ -930,8 +1032,10 @@ proposer's next slot to match the acceptor's, drifting lengths meant that after
 a restart nobody granted anybody. The quorum is now one, in both runtimes. That
 is safe because the merge verifies the segment's hash links before loading any
 of it and appends only past what the node already holds, so one peer cannot
-rewrite another's history. A commit already lands on one member's word
-(ISSUES.md §2.16), so this does not lower the chain's effective threshold.
+rewrite another's history. In a group that does not declare commit
+certificates a commit already lands on one member's word, so this does not lower
+the chain's effective threshold; in one that does, catch-up checks the
+certificates itself (see [Commit certificates](#commit-certificates)).
 
 **C appended what it already had.** A peer answers "update needed" with its
 whole history. Python's catch-up loads only entries past its own next index; C's
@@ -1068,8 +1172,9 @@ own windows, and at the heal each refused to rewrite inside its finality (step
 `(num_peers + 1) / 2`, with more than that many required
 (`_ckpt_quorum_for_group` in C, `_checkpoint_quorum` in Python), at the
 proposer, the receiver of a final, the store and the warm-start rebuild. Odd
-sizes are unchanged, and Paxos grants and slashing are not touched (the grant
-formula is ISSUES.md §2.13). Pinned by `checkpoint-final-even-group-half-refused`
+sizes are unchanged, and Paxos grants and slashing are not touched: they keep
+`len(peers) // 2`, which C now sizes per round from the live roster as Python
+does (see [Commit certificates](#commit-certificates)). Pinned by `checkpoint-final-even-group-half-refused`
 and `checkpoint-final-even-group-majority-stored`.
 
 The first host runs with the rule in place (mod-2481048 and mod-2483539,
@@ -1164,6 +1269,17 @@ stands over is documented rather than papered over.
 | An attestation needs its verifier's signature | [`attest-final-without-the-verifier-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/attest-final-without-the-verifier-refused.yaml) |
 | Admissibility: floor, self, channel, rate cap | [`attest-propose-low-rep-verifier-declined.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/attest-propose-low-rep-verifier-declined.yaml) |
 | A commit writes only its sender's half (ISSUES §2.16) | [`committed-writes-only-the-senders-half.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/committed-writes-only-the-senders-half.yaml) |
+| A certified commit is written beside its certificate | [`commit-cert-certified-commit-written.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-certified-commit-written.yaml) |
+| A declaring group refuses an uncertified commit | [`commit-cert-uncertified-commit-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-uncertified-commit-refused.yaml) |
+| A sub-quorum certificate is refused | [`commit-cert-sub-quorum-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-sub-quorum-refused.yaml) |
+| The scorer's own signature is not counted | [`commit-cert-proposer-signature-not-counted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-proposer-signature-not-counted.yaml) |
+| A forged certificate is refused | [`commit-cert-forged-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-forged-refused.yaml) |
+| A certificate binds the score | [`commit-cert-other-score-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-other-score-refused.yaml) |
+| An undeclared group writes as ever and keeps a valid certificate | [`commit-cert-undeclared-group-keeps-certificate.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-undeclared-group-keeps-certificate.yaml) |
+| An acceptor signs, and the proposer commits on its signature | [`commit-cert-acceptor-signs-and-proposer-commits.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-acceptor-signs-and-proposer-commits.yaml) |
+| An unsigned acceptance is not counted | [`commit-cert-unsigned-acceptance-not-counted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-unsigned-acceptance-not-counted.yaml) |
+| Catch-up refuses an uncertified segment | [`commit-cert-catchup-uncertified-refused.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-catchup-uncertified-refused.yaml) |
+| Catch-up accepts a certified segment and keeps its certificates | [`commit-cert-catchup-certified-accepted.yaml`](../../src/autonomous-trust/conformance/scenarios/reputation/commit-cert-catchup-certified-accepted.yaml) |
 
 Unit coverage for the attestation rules lives in
 `tests/a_unit/test_repprocess_quorum_attestation.py` on the Python side and
