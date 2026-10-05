@@ -44,6 +44,7 @@
 #include "utilities/msg_registry.h"
 #include "utilities/msg_types_priv.h"   /* net_msg_pack_json, net_msg_unpack_json */
 #include "utilities/util.h"
+#include "utilities/send_retry.h"   /* at_send: keep a refused event */
 
 /* -- the event type ------------------------------------------------------------ */
 
@@ -104,8 +105,9 @@ static void _emit(const process_t *proc, int32_t kind, roster_ev_t e)
     at_strlcpy(m->data.reason, e.reason != NULL ? e.reason : "", sizeof(m->data.reason));
     m->data.seq = e.seq;
     m->data.count = e.count;
-    if (messaging_send(AT_MAIN_QUEUE, RENDEZVOUS_ROSTER_EVENT, &msg, false) != 0)
-        log_debug(proc->logger, "Identity: roster: no main queue for event %d\n", kind);
+    if (at_send(proc, AT_MAIN_QUEUE, &msg, "a roster event", "the app",
+                AT_SEND_NOW, NULL, NULL, 0) != 0)
+        log_debug(proc->logger, "Identity: roster: could not hand the app event %d\n", kind);
 }
 
 /* -- the handlers ---------------------------------------------------------------- */

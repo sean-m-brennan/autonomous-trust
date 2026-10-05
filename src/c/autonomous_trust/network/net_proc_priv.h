@@ -24,6 +24,7 @@
 
 #include "processes/processes.h"
 #include "network/net_transport.h"
+#include "network/net_message.h"   /* net_wire_msg_t */
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
 #include "utilities/logger.h"
@@ -172,6 +173,12 @@ void net_proc_test_reset_last_routed_from_addr(void);
  *         @p out (NUL-terminated, truncated to @p outlen). Empty string
  *         if no call has happened since the last reset. */
 void net_proc_test_get_last_routed_from_addr(char *out, size_t outlen);
+
+/** @brief route_to_process (the hand-off of every inbound wire frame to its
+ *         sibling process), for a test that drives it with a refusing
+ *         messaging hook (ISSUES §2.14). Not public API. */
+int net_proc_test_route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
+                                   logger_t *logger);
 
 /* ---- ping_at refusal (divergence: C implements no PingAT) ----
  * The outbound drain answers the `ping_at` selector with an explicit refusal

@@ -418,10 +418,22 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
     }
     case TASK_RESULT:
     {
-        subdata_len = sizeof(task_result_msg_t);
+        /* The struct, then its result bytes. result_data is a pointer, and
+         * every process is a fork: copying the struct whole sent the
+         * pointer's VALUE, which names nothing in the receiver (and pointed
+         * at negotiation's thread-local result buffer, which the next result
+         * overwrites). The pointer travels zeroed. */
+        const task_result_msg_t *tr = &msg->info.task_result;
+        size_t blob = (tr->result_data != NULL) ? tr->result_len : 0;
+        subdata_len = sizeof(task_result_msg_t) + blob;
         subdata = smrt_create(subdata_len);
         if (subdata == NULL) return EXCEPTION(ENOMEM);
-        memcpy(subdata, &msg->info.task_result, subdata_len);
+        task_result_msg_t head = *tr;
+        head.result_data = NULL;
+        head.result_len = blob;
+        memcpy(subdata, &head, sizeof(head));
+        if (blob > 0)
+            memcpy((uint8_t *)subdata + sizeof(head), tr->result_data, blob);
         break;
     }
     case TRANSACTION_SCORE:
@@ -721,6 +733,34 @@ int proto_to_generic_msg(void *data, size_t data_len, generic_msg_t *msg)
         break;
     case TASK_RESULT:
         COPY_FIXED_PAYLOAD(task_result, task_result_msg_t);
+        if (ret != 0)
+            break;
+        {
+            /* The result bytes follow the struct (generic_msg_to_proto). A
+             * sender's result_data is never trusted: it was a pointer into
+             * another process. messaging_recv_release frees the copy. */
+            task_result_msg_t *tr = &msg->info.task_result;
+            size_t blob = tr->result_len;
+            tr->result_data = NULL;
+            if (blob == 0)
+                break;
+            if (pb_msg->value.len - sizeof(task_result_msg_t) < blob) {
+                log_error(NULL, "proto_to_generic_msg: task_result claims %zu"
+                          " result bytes, carries %zu; dropping\n", blob,
+                          pb_msg->value.len - sizeof(task_result_msg_t));
+                tr->result_len = 0;
+                ret = -1;
+                break;
+            }
+            tr->result_data = malloc(blob);
+            if (tr->result_data == NULL) {
+                tr->result_len = 0;
+                ret = -1;
+                break;
+            }
+            memcpy(tr->result_data,
+                   pb_msg->value.data + sizeof(task_result_msg_t), blob);
+        }
         break;
     case TRANSACTION_SCORE:
         COPY_FIXED_PAYLOAD(tx_score, tx_score_msg_t);

@@ -34,6 +34,7 @@
 
 #include <pthread.h>
 #include <string.h>
+#include <time.h>
 #include <stdlib.h>
 
 #include <jansson.h>
@@ -47,6 +48,7 @@
 #include "structures/map.h"
 #include "processes/processes.h"
 #include "utilities/message.h"
+#include "utilities/send_retry.h"
 #include "utilities/msg_types.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/allocation.h"
@@ -99,8 +101,8 @@ static void _admit(process_t *proc, identity_t *peer)
 
 /* What the sweep SENT: tier_updates to identity and PEER_REPUTATIONs to the
  * main loop, counted, with the last of each kept. */
-static int g_tiers, g_reps, g_last_tier;
-static bool g_identity_full;
+static int g_tiers, g_reps, g_last_tier, g_tier_lost;
+static bool g_identity_full, g_negotiation_full;
 static peer_reputation_msg_t g_last_rep;
 
 static int _hook(const char *key, const message_type_t type,
@@ -118,6 +120,13 @@ static int _hook(const char *key, const message_type_t type,
             g_tiers++;
             json_decref(arr);
         }
+    } else if (type == NET_MESSAGE && key != NULL &&
+               strcmp(key, "negotiation") == 0 &&
+               msg->info.net_msg.function != NULL &&
+               strcmp(msg->info.net_msg.function, "tier_lost") == 0) {
+        if (g_negotiation_full)
+            return EAGAIN;
+        g_tier_lost++;
     } else if (type == PEER_REPUTATION) {
         g_last_rep = msg->info.peer_reputation;
         g_reps++;
@@ -128,8 +137,8 @@ static int _hook(const char *key, const message_type_t type,
 static void _begin(void)
 {
     reputation_reset_state(3);
-    g_tiers = 0; g_reps = 0; g_last_tier = -1;
-    g_identity_full = false;
+    g_tiers = 0; g_reps = 0; g_last_tier = -1; g_tier_lost = 0;
+    g_identity_full = false; g_negotiation_full = false;
     memset(&g_last_rep, 0, sizeof(g_last_rep));
     messaging_set_test_hook(_hook);
 }
@@ -294,6 +303,47 @@ DEFINE_TEST(test_a_tier_update_lost_to_a_full_queue_is_published_again)
 }
 END_TEST_DEFINITION()
 
+/* A demotion's tier_lost tells negotiation to cancel what the peer can no
+ * longer authorize, and nothing republishes it (the tier_update rollback above
+ * re-arms only identity's half). A full negotiation queue keeps it for this
+ * process's tick (ISSUES §2.14); until then it was one bare try. */
+DEFINE_TEST(test_a_tier_lost_to_a_full_queue_is_kept_for_the_tick)
+{
+    identity_t *me = _mk_identity("10.0.0.1", "self");
+    identity_t *bob = _mk_identity("10.0.0.2", "bob");
+    process_t *proc = _mk_process(me);
+    _begin();
+    _admit(proc, bob);
+    ck_assert_int_eq(reputation_rescore_sweep(proc, T0, me->uuid), 1);
+    reputation_install_peer_reputation(bob->uuid, 0.9);
+
+    /* A lenient bound restates bob's tier from his stored 0.9: promoted. */
+    peer_standing_msg_t st;
+    memset(&st, 0, sizeof(st));
+    memcpy(st.peer_uuid, bob->uuid, sizeof(uuid_t));
+    st.standing = (int32_t)PEER_STANDING_CAPPED;
+    st.ceiling = 0.99;
+    strncpy(st.source, PEER_STANDING_SOURCE_ETHNE, sizeof(st.source) - 1);
+    strncpy(st.reason, "test", sizeof(st.reason) - 1);
+    ck_assert_ret_ok(reputation_apply_peer_standing(proc, &st));
+    ck_assert(g_last_tier > 0);
+    ck_assert_int_eq(g_tier_lost, 0);
+
+    /* Then capped low: a demotion, with negotiation's queue full. */
+    g_negotiation_full = true;
+    st.ceiling = 0.10;
+    ck_assert_ret_ok(reputation_apply_peer_standing(proc, &st));
+    ck_assert_int_eq(g_last_tier, 0);
+    ck_assert_int_eq(g_tier_lost, 0);
+    ck_assert_uint_eq(at_send_retry_pending("negotiation"), 1);
+
+    g_negotiation_full = false;
+    ck_assert_uint_eq(at_send_retry_drain(proc, NULL, (double)time(NULL)), 1);
+    ck_assert_int_eq(g_tier_lost, 1);
+    _end();
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(RescoreSweep,
           test_an_unscored_peer_is_rated_at_its_prior_and_published,
           test_a_rated_peer_is_rescored_only_when_its_chain_moved,
@@ -301,4 +351,5 @@ RUN_TESTS(RescoreSweep,
           test_a_tier_update_lost_to_a_full_queue_is_published_again,
           test_the_sweep_is_throttled,
           test_a_node_never_scores_itself,
-          test_a_standing_bounds_what_the_sweep_writes)
+          test_a_standing_bounds_what_the_sweep_writes,
+          test_a_tier_lost_to_a_full_queue_is_kept_for_the_tick)

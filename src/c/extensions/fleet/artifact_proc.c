@@ -30,6 +30,7 @@
 #include "utilities/exception.h"
 #include "utilities/util.h"
 #include "network/net_message.h"
+#include "utilities/send_retry.h"   /* at_send: keep a refused frame (ISSUES §2.14) */
 
 #define EARTIFACT 270
 DEFINE_ERROR(EARTIFACT, "Artifact transfer error");
@@ -109,7 +110,8 @@ static int send_to_peer(const process_t *proc, const char *function,
         return -1;
     }
     json_decref(payload);
-    int rc = messaging_send("network", NET_MESSAGE, &out, false);
+    int rc = at_send(proc, "network", &out, function, "network",
+                     0, NULL, NULL, 0);
     net_msg_free_obj(nmsg);
     return rc;
 }
@@ -578,7 +580,8 @@ static bool handle_chunk_response(const process_t *proc, directory_t *queues, ge
 
         if (net_msg_pack_json(rnmsg, ready) == 0)
         {
-            messaging_send(notify_target, NET_MESSAGE, &ready_msg, false);
+            at_send(proc, notify_target, &ready_msg, "an artifact-ready notice", notify_target,
+                    0, NULL, NULL, 0);
             net_msg_free_obj(rnmsg);
         }
         json_decref(ready);

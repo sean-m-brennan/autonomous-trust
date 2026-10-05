@@ -48,6 +48,7 @@
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "network/net_message.h"
+#include "utilities/send_retry.h"   /* at_send: keep a refused frame */
 
 /* Protocol selectors (declared extern in the header) — writable arrays so they
  * can be assigned to net_msg_t.function (char *). Values match Python
@@ -322,7 +323,10 @@ static void _maybe_submit_producer_score(const process_t *proc, json_t *arr)
     msg.info.tx_score.score = 0.9;
     snprintf(msg.info.tx_score.capability_name,
              sizeof(msg.info.tx_score.capability_name), "dod.sensor-report");
-    messaging_send("reputation", TRANSACTION_SCORE, &msg, false);
+    /* last_ts_task is set before this, so a lost score is never sent again:
+     * kept on a full queue instead (ISSUES §2.14). */
+    (void)at_send(proc, "reputation", &msg, "a producer score", "reputation",
+                  0, NULL, NULL, 0);
     log_debug(proc->logger,
               "data-source: submitted producer score 0.9 for batch %s\n", task_id);
 }
@@ -374,6 +378,8 @@ static void emit_readings(const process_t *proc)
         memcpy(&o->to_whom, &snapshot[i].ident, sizeof(public_identity_t));
         snprintf(o->return_to, sizeof(o->return_to), "%s", DATA_SOURCE_PROC_NAME);
         net_msg_pack_json(o, arr);
+        /* Bare on purpose (a reading stream; the next tick sends fresher
+         * readings): ISSUES §2.14. */
         messaging_send("network", NET_MESSAGE, &out, false);
         net_msg_free_obj(o);
     }

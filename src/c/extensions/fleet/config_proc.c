@@ -35,6 +35,7 @@
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
 #include "network/net_message.h"
+#include "utilities/send_retry.h"   /* at_send: keep a refused frame (ISSUES §2.14) */
 
 #define ECONFIG 301   /* fleet: 300s (290 is EX509_CALOAD) */
 DEFINE_ERROR(ECONFIG, "Config distribution error");
@@ -104,7 +105,8 @@ static int send_to_peer(const process_t *proc, const char *function,
     memcpy(&msg.info.net_msg.to_whom, peer, sizeof(public_identity_t));
     strncpy(msg.info.net_msg.return_to, "config", PROC_NAME_LEN);
     net_msg_pack_json(&msg.info.net_msg, payload);
-    int rc = messaging_send("network", NET_MESSAGE, &msg, false);
+    int rc = at_send(proc, "network", &msg, function, "network",
+                     0, NULL, NULL, 0);
     net_msg_free_obj(&msg.info.net_msg);
     return rc;
 }
@@ -157,7 +159,8 @@ static bool handle_config_propose(const process_t *proc, directory_t *queues, ge
         score_msg.type = TRANSACTION_SCORE;
         score_msg.info.tx_score.score = CONFIG_IDENTITY_PENALTY;
         memcpy(&score_msg.info.tx_score.peer_uuid, &nmsg->from_whom.uuid, sizeof(uuid_t));
-        messaging_send("reputation", TRANSACTION_SCORE, &score_msg, false);
+        at_send(proc, "reputation", &score_msg, "a fleet score", "reputation",
+                0, NULL, NULL, 0);
 
         return true; /* handled, but rejected */
     }
@@ -497,7 +500,8 @@ static bool handle_config_accepted(const process_t *proc, directory_t *queues, g
 
             net_msg_pack_json(anmsg, fetch_req);
             json_decref(fetch_req);
-            messaging_send("network", NET_MESSAGE, &artifact_msg, false);
+            at_send(proc, "network", &artifact_msg, "an artifact request", "network",
+                    0, NULL, NULL, 0);
             net_msg_free_obj(anmsg);
 
             log_info(proc->logger, "Config: triggered artifact fetch for %s\n", artifact_hash_hex);
@@ -685,7 +689,8 @@ static bool handle_config_artifact_ready(const process_t *proc, directory_t *que
     net_msg_pack_json(rnmsg, ready_json);
     json_decref(ready_json);
 
-    messaging_send("update", NET_MESSAGE, &ready_msg, false);
+    at_send(proc, "update", &ready_msg, "a config-ready notice", "update",
+            0, NULL, NULL, 0);
     net_msg_free_obj(rnmsg);
 
     log_info(proc->logger, "Config: sent CONFIG_READY for %s to update process\n", config_name);

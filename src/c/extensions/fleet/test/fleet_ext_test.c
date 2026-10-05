@@ -41,7 +41,11 @@
 #include "utilities/message.h"
 #include "utilities/msg_registry.h"
 #include "utilities/msg_types_priv.h"
+#include "utilities/send_retry.h"
+#include <time.h>
+#include <errno.h>
 
+static bool g_network_full;
 static struct {
     int vote_requests;
     char last_to[UUID_STRING_LEN + 1];
@@ -55,6 +59,8 @@ static int _hook(const char *key, const message_type_t type, generic_msg_t *msg,
         || msg->info.net_msg.function == NULL
         || strcmp(msg->info.net_msg.function, "update vote request") != 0)
         return 0;
+    if (g_network_full)
+        return EAGAIN;
     g_sent.vote_requests++;
     uuid_unparse_lower(msg->info.net_msg.to_whom.uuid, g_sent.last_to);
     json_t *body = NULL;
@@ -221,7 +227,33 @@ DEFINE_TEST(test_the_app_abi_sends_the_verb_and_decodes_the_acceptance)
 }
 END_TEST_DEFINITION()
 
+/* Nothing in fleet times out or asks again, so a vote request lost to a full
+ * network queue stalled the proposal for good. It is kept for this process's
+ * tick now (ISSUES §2.14). */
+DEFINE_TEST(test_a_vote_request_survives_a_full_queue)
+{
+    identity_t *self = _mk_identity("self", "10.0.0.1");
+    identity_t *peer = _mk_identity("peer", "10.0.0.2");
+    process_t *proc = _mk_process(self, peer);
+    memset(&g_sent, 0, sizeof(g_sent));
+    at_send_retry_reset();
+    messaging_set_test_hook(_hook);
+    g_network_full = true;
+    _propose(proc, json_pack("{s:s, s:s, s:s, s:f}", "version", "3.0.0",
+                             "artifact_hash", HASH, "target_arch", "aarch64",
+                             "min_proposer_reputation", 0.5), NULL);
+    ck_assert_int_eq(g_sent.vote_requests, 0);
+    ck_assert_uint_eq(at_send_retry_pending("network"), 1);
+    g_network_full = false;
+    ck_assert_uint_eq(at_send_retry_drain(proc, NULL, (double)time(NULL)), 1);
+    ck_assert_int_eq(g_sent.vote_requests, 1);
+    messaging_set_test_hook(NULL);
+    at_send_retry_reset();
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(FleetExtension,
           test_linking_fleet_adds_its_processes_subsystems_verb_and_type,
           test_the_node_signs_the_apps_proposal_and_starts_the_vote,
-          test_the_app_abi_sends_the_verb_and_decodes_the_acceptance)
+          test_the_app_abi_sends_the_verb_and_decodes_the_acceptance,
+          test_a_vote_request_survives_a_full_queue)
