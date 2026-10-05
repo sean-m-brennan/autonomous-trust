@@ -38,6 +38,7 @@
 #include "network/network.h"  /* net_wire_mode_resolve (2.3) */
 #include "config/configuration.h"
 #include "peers.h"
+#include "identity/id_send_retry.h"
 #include "history.h"
 #include "identity_priv.h"
 #include "id_proc_priv.h"
@@ -90,29 +91,88 @@ bool identity_find_peer_pub(const process_t *proc, const uuid_t uuid,
  * hers and the transaction could never go bilateral. An earlier run of the
  * same script had worked, which is what a lost race looks like.
  *
- * Bounded retry, then say so, distinguishing saturation from a hard transport
- * fault because they call for different answers. Mirrors the PEER-update loop
- * at the top of this file, which fixed the same hazard for a different
- * message in P3.3. */
-int identity_send_to_network(const process_t *proc, generic_msg_t *out,
-                             const char *what, const char *whom)
+ * Bounded retry, distinguishing saturation from a hard transport fault because
+ * they call for different answers. Mirrors the PEER-update loop at the top of
+ * this file, which fixed the same hazard for a different message in P3.3.
+ *
+ * 200 ms was not enough either (ISSUES §2.40): on 2026-10-02 a joiner's
+ * full_history (Agora part-603464), a DM (dev-620062) and a Stele attestation
+ * (st-660084) were each lost to a queue that stayed full for longer. A frame
+ * still refused after the inline tries is now KEPT (id_send_retry.h) and the
+ * identity tick retries it for up to 30 s, so 0 means "this node owns the
+ * delivery", not "it is on the wire": a caller that scores on success is
+ * right to log success, because the frame either goes out or is reported
+ * lost. A caller whose action must only count once the frame is really out (a
+ * bilateral score: social's react and report) passes an on-sent callback to
+ * identity_send_to_then instead, and acts there: it is told once whether the
+ * frame went or was given up on. And a send to a queue that
+ * still holds kept frames waits behind them, so a DM sent after another
+ * arrives after it. */
+int identity_send_to_then(const process_t *proc, const char *queue,
+                          generic_msg_t *out, const char *what,
+                          const char *whom, id_send_sent_fn on_sent,
+                          const void *ctx, size_t ctx_len)
 {
+    /* proc may be NULL for a caller with no process in hand (first contact's
+     * local relay and sibling senders); the root logger takes the lines. */
+    logger_t *logger = proc != NULL ? proc->logger : NULL;
+    const char *to = whom == NULL ? "peer" : whom;
+    double now = (double)time(NULL);
+    if (id_send_retry_pending(queue) > 0) {
+        id_send_retry_drain(proc, queue, now);
+        if (id_send_retry_pending(queue) > 0
+            && id_send_retry_defer_then(queue, out, what, whom, now, on_sent,
+                                        ctx, ctx_len) == 0) {
+            log_info(logger, "Identity: %s to %s waits behind earlier frames"
+                     " for a full %s queue\n", what, to, queue);
+            return 0;
+        }
+    }
     int ret = -1;
     for (int attempt = 0; attempt < 10; attempt++)
     {
-        ret = messaging_send("network", out->type, out, false);
-        if (ret == 0)
+        ret = messaging_send(queue, out->type, out, false);
+        if (ret == 0) {
+            if (on_sent != NULL)
+                on_sent(proc, ctx, true);
             return 0;
+        }
         usleep(20000); /* 20ms */
     }
-    /* proc may be NULL for a caller with no process in hand (first contact's
-     * local relay and sibling senders); the root logger takes the warning. */
-    log_warn(proc != NULL ? proc->logger : NULL,
+    if (ret == EAGAIN && id_send_retry_defer_then(queue, out, what, whom, now,
+                                                  on_sent, ctx, ctx_len) == 0) {
+        log_info(logger, "Identity: %s to %s deferred (%s queue full); the"
+                 " identity tick retries it\n", what, to, queue);
+        return 0;
+    }
+    log_warn(logger,
              "Identity: could not send %s to %s after 10 tries (%s) — the"
              " action DID NOT HAPPEN and nothing retries it\n",
-             what, whom == NULL ? "peer" : whom,
-             ret == EAGAIN ? "network queue still full" : "send failed");
+             what, to,
+             ret == EAGAIN ? "queue still full, and no room to keep it"
+                           : "send failed");
     return ret;
+}
+
+int identity_send_to(const process_t *proc, const char *queue,
+                     generic_msg_t *out, const char *what, const char *whom)
+{
+    return identity_send_to_then(proc, queue, out, what, whom, NULL, NULL, 0);
+}
+
+int identity_send_to_network(const process_t *proc, generic_msg_t *out,
+                             const char *what, const char *whom)
+{
+    return identity_send_to(proc, "network", out, what, whom);
+}
+
+int identity_send_to_network_then(const process_t *proc, generic_msg_t *out,
+                                  const char *what, const char *whom,
+                                  id_send_sent_fn on_sent, const void *ctx,
+                                  size_t ctx_len)
+{
+    return identity_send_to_then(proc, "network", out, what, whom, on_sent,
+                                 ctx, ctx_len);
 }
 
 /* True iff this NET_MESSAGE came from THIS node's own app over the local
@@ -1128,7 +1188,7 @@ static int _update_group(const process_t *proc, directory_t *queues)
         }
         net_msg_pack_json(&update.info.net_msg, grp_json);
         json_decref(grp_json);
-        messaging_send("network", NET_MESSAGE, &update, false);
+        (void)identity_send_to_network(proc, &update, "group_key_update", NULL);
         net_msg_free_obj(&update.info.net_msg);
         return 0;
     }
@@ -1393,6 +1453,7 @@ static int _send_caps_query(const process_t *proc, const public_identity_t *peer
     query.info.net_msg.encrypt = true;
     memcpy(&query.info.net_msg.to_whom, peer, sizeof(public_identity_t));
     strncpy(query.info.net_msg.return_to, "identity", PROC_NAME_LEN);
+    /* Bare on purpose (caps resync re-queries every ~20 s): ISSUES §2.40. */
     messaging_send("network", NET_MESSAGE, &query, false);
     log_info(proc->logger,
              "Identity: sent caps_query to %s (UDP-loss recovery)\n",
@@ -1550,7 +1611,7 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
         }
         net_msg_pack_json(&confirm.info.net_msg, peer_json);
         json_decref(peer_json);
-        messaging_send("network", NET_MESSAGE, &confirm, false);
+        (void)identity_send_to_network(proc, &confirm, "a peer confirmation", NULL);
         net_msg_free_obj(&confirm.info.net_msg);
     }
     else
@@ -1577,7 +1638,7 @@ static int _peer_accepted(process_t *proc, directory_t *queues,
             }
             net_msg_pack_json(&confirm.info.net_msg, peer_json);
             json_decref(peer_json);
-            messaging_send("network", NET_MESSAGE, &confirm, false);
+            (void)identity_send_to_network(proc, &confirm, "a peer confirmation", NULL);
             net_msg_free_obj(&confirm.info.net_msg);
         }
         peers_read_unlock(proc);
@@ -2022,7 +2083,7 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
         propose_msg.info.net_msg.encrypt = false;
         /* to_whom zeroed → broadcast */
         net_msg_pack_json(&propose_msg.info.net_msg, proposal_json);
-        messaging_send("network", NET_MESSAGE, &propose_msg, false);
+        (void)identity_send_to_network(proc, &propose_msg, "a peer proposal", NULL);
         net_msg_free_obj(&propose_msg.info.net_msg);
     }
     else
@@ -2038,7 +2099,7 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
             memcpy(&propose_msg.info.net_msg.to_whom, &proc->protocol.peers[i],
                    sizeof(public_identity_t));
             net_msg_pack_json(&propose_msg.info.net_msg, proposal_json);
-            messaging_send("network", NET_MESSAGE, &propose_msg, false);
+            (void)identity_send_to_network(proc, &propose_msg, "a peer proposal", NULL);
             net_msg_free_obj(&propose_msg.info.net_msg);
         }
         peers_read_unlock(proc);
@@ -2248,7 +2309,7 @@ static int _announce_self_to_bundled_peers(const process_t *proc,
         }
         net_msg_pack_json(&accept.info.net_msg, accept_body);
         json_decref(accept_body);
-        if (messaging_send("network", NET_MESSAGE, &accept, false) == 0) {
+        if (identity_send_to_network(proc, &accept, "a self-announcement", NULL) == 0) {
             sent++;
             probes_counter("peer.set", "self_announce", "sent");
         } else {
@@ -2851,7 +2912,7 @@ static void _vote_on_peer_send(vote_on_peer_args_t *args)
     net_msg_pack_json(&vote_msg.info.net_msg, vote_json);
     json_decref(vote_json);
 
-    messaging_send("network", NET_MESSAGE, &vote_msg, false);
+    (void)identity_send_to_network(NULL, &vote_msg, "an admission vote", NULL);
     net_msg_free_obj(&vote_msg.info.net_msg);
     log_debug(args->logger, "Identity: sent approval vote for %s\n", args->proposed_uuid);
 }
@@ -3171,6 +3232,7 @@ void identity_reset_state(void)
     id_state.probe_seq = 0;
     pthread_mutex_unlock(&id_state.lock);
     _handoffs_reset();
+    id_send_retry_reset();
     /* After the unlock: a feature resets its own state under its own lock. */
     identity_ext_reset();
 }
@@ -4100,6 +4162,7 @@ static bool handle_caps_query(const process_t *proc, directory_t *queues, generi
     json_object_set_new(caps_env, "seq", json_integer((json_int_t)caps_seq));
     net_msg_pack_json(&response.info.net_msg, caps_env);
     json_decref(caps_env);
+    /* Bare on purpose (the querier re-queries on its caps resync): ISSUES §2.40. */
     messaging_send("network", NET_MESSAGE, &response, false);
     net_msg_free_obj(&response.info.net_msg);
     return true;
@@ -4482,24 +4545,16 @@ static bool handle_app_peer_standing(const process_t *proc,
     uuid_unparse_lower(peer_uuid, peer_buf);
     json_decref(payload);
 
-    /* Bounded retry, as for the social score: run 11 lost the reinstatement
-     * here on a reputation queue full of catch-up traffic, and the cap it was
-     * meant to lift stayed in force. */
-    int ret = -1;
-    for (int attempt = 0; attempt < 10; attempt++) {
-        ret = messaging_send("reputation", PEER_STANDING, &out, false);
-        if (ret == 0)
-            break;
-        usleep(20000); /* 20ms */
-    }
-    if (ret != 0) {
-        log_warn(proc->logger,
-                 "Identity: could not propagate %s standing for %s "
-                 "(ceiling %.2f) after 10 tries (%s) — it DID NOT take "
-                 "effect\n", out.info.peer_standing.source, peer_buf, ceiling,
-                 ret == EAGAIN ? "reputation queue still full" : "send failed");
+    /* Retried, as for the social score: run 11 lost the reinstatement here on
+     * a reputation queue full of catch-up traffic, and the cap it was meant to
+     * lift stayed in force. A queue full past 200 ms keeps it for the identity
+     * tick (ISSUES §2.40); only a hard fault, or no room to keep it, is lost,
+     * and identity_send_to says so. */
+    char what[96];
+    snprintf(what, sizeof(what), "%s standing (ceiling %.2f)",
+             out.info.peer_standing.source, ceiling);
+    if (identity_send_to(proc, "reputation", &out, what, peer_buf) != 0)
         return true;
-    }
     log_info(proc->logger,
              "Identity: %s standing for %s -> %s (ceiling %.2f): %s\n",
              out.info.peer_standing.source, peer_buf,
@@ -5064,6 +5119,7 @@ static int _announce_identity_for(const process_t *proc, directory_t *queues,
     int ret = -1;
     for (int attempt = 0; attempt < 20; attempt++)
     {
+        /* Bare on purpose (retried above while net_proc starts; re-announced until admitted): ISSUES §2.40. */
         ret = messaging_send("network", NET_MESSAGE, &buf, false);
         if (ret == 0)
             break;
@@ -5246,6 +5302,7 @@ static int _partition_verify_hex(const public_identity_t *pub,
  * _announce_identity. */
 static int _partition_broadcast(const process_t *proc, generic_msg_t *buf)
 {
+    /* Bare on purpose (the partition probe repeats each sweep): ISSUES §2.40. */
     int ret = messaging_send("network", NET_MESSAGE, buf, false);
     if (ret != 0) {
         log_error(proc->logger,
@@ -5419,6 +5476,7 @@ void identity_periodic_identity_resync(const process_t *proc)
     strncpy(query.info.net_msg.return_to, "identity", PROC_NAME_LEN);
     net_msg_pack_json(&query.info.net_msg, payload);
     json_decref(payload);
+    /* Bare on purpose (this resync repeats every ~20 s): ISSUES §2.40. */
     messaging_send("network", NET_MESSAGE, &query, false);
     net_msg_free_obj(&query.info.net_msg);
 
@@ -5506,6 +5564,7 @@ static bool handle_identity_query(const process_t *proc, directory_t *queues, ge
     strncpy(reply.info.net_msg.return_to, "identity", PROC_NAME_LEN);
     net_msg_pack_json(&reply.info.net_msg, out);
     json_decref(out);
+    /* Bare on purpose (the requester repeats its resync): ISSUES §2.40. */
     messaging_send("network", NET_MESSAGE, &reply, false);
     net_msg_free_obj(&reply.info.net_msg);
     probes_counter("peer.set", "identity_response_sent", "1");
@@ -6459,6 +6518,7 @@ static void _advertise_hierarchy(const process_t *proc, const public_identity_t 
         json_decref(payload);
         if (to_whom != NULL) {
             memcpy(&msg.info.net_msg.to_whom, to_whom, sizeof(public_identity_t));
+            /* Bare on purpose (re-advertised on the hierarchy refresh): ISSUES §2.40. */
             messaging_send("network", NET_MESSAGE, &msg, false);
         } else {
             peers_read_lock(proc);
@@ -6466,6 +6526,7 @@ static void _advertise_hierarchy(const process_t *proc, const public_identity_t 
                 generic_msg_t per = msg;
                 memcpy(&per.info.net_msg.to_whom, &proc->protocol.peers[i],
                        sizeof(public_identity_t));
+                /* Bare on purpose (re-advertised on the hierarchy refresh): ISSUES §2.40. */
                 messaging_send("network", NET_MESSAGE, &per, false);
             }
             peers_read_unlock(proc);
@@ -6641,6 +6702,7 @@ void identity_request_hierarchy(const process_t *proc)
         generic_msg_t per = msg;
         memcpy(&per.info.net_msg.to_whom, &proc->protocol.peers[i],
                sizeof(public_identity_t));
+        /* Bare on purpose (re-requested on the hierarchy refresh): ISSUES §2.40. */
         messaging_send("network", NET_MESSAGE, &per, false);
     }
     peers_read_unlock(proc);
@@ -6835,7 +6897,7 @@ bool handle_roster_request(const process_t *proc, directory_t *queues,
     strncpy(reply.info.net_msg.return_to, "identity", PROC_NAME_LEN);
     net_msg_pack_json(&reply.info.net_msg, out);
     json_decref(out);
-    messaging_send("network", NET_MESSAGE, &reply, false);
+    (void)identity_send_to_network(proc, &reply, "a roster reply", NULL);
     net_msg_free_obj(&reply.info.net_msg);
     return true;
 }
@@ -7064,7 +7126,7 @@ bool handle_attest_request(const process_t *proc, directory_t *queues,
     strncpy(reply.info.net_msg.return_to, "identity", PROC_NAME_LEN);
     net_msg_pack_json(&reply.info.net_msg, out);
     json_decref(out);
-    messaging_send("network", NET_MESSAGE, &reply, false);
+    (void)identity_send_to_network(proc, &reply, "an attestation reply", NULL);
     net_msg_free_obj(&reply.info.net_msg);
     return true;
 }
@@ -7115,7 +7177,7 @@ int identity_request_attestation(process_t *proc, const public_identity_t *peer,
     strncpy(req.info.net_msg.return_to, "identity", PROC_NAME_LEN);
     net_msg_pack_json(&req.info.net_msg, body);
     json_decref(body);
-    messaging_send("network", NET_MESSAGE, &req, false);
+    (void)identity_send_to_network(proc, &req, "an attestation request", NULL);
     net_msg_free_obj(&req.info.net_msg);
 
     if (out_nonce != NULL && nonce_len > 0) {
@@ -8128,6 +8190,7 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
         if (no_peers && ++cycle >= announce_interval)
         {
             cycle = 0;
+            /* Bare on purpose (repeats every 10 ticks until admitted): ISSUES §2.40. */
             messaging_send("network", NET_MESSAGE, &announce_buf, false);
             log_debug(logger, "Identity: re-announcing (no peers yet)\n");
         }
@@ -8142,6 +8205,11 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
          * one try each per tick until they land. Empty, and free, once the
          * cohort settles. */
         identity_retry_sibling_handoffs(proc);
+
+        /* One-shot frames a full queue refused for longer than the inline
+         * 200 ms (DMs, joiner histories, ads; ISSUES §2.40): one try each per
+         * tick, oldest first, until they land or age out. */
+        id_send_retry_drain(proc, NULL, (double)time(NULL));
 
         /* Periodic late-joiner cap-loss backstop (interval-gated so the
          * fast loop doesn't sweep every iteration; a converged group

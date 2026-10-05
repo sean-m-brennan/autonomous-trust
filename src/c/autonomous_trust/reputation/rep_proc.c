@@ -139,6 +139,21 @@ static double _tier_ceiling(int tier)
                            REP_COMMIT_TIMEOUT_DEFAULT))
 #define REP_COMMIT_RETRIES 5
 
+/* How long a verifier's attestation round may stay short of a quorum before
+ * its propose goes out again, and how many times (ISSUES §2.40). The propose is
+ * a one-shot fan-out, and the network queue drops it under load
+ * (Stele st-660084: the observer's copy was lost, the owner's arrived and was
+ * declined as the subject's, and the round sat pending forever). Re-sending is
+ * safe: the task id is derived from (verifier, subject, digest), so a repeat
+ * is the same round, and a co-signer signs the same designation again. After
+ * the last try the round is abandoned and its pending state dropped. Mirrors
+ * Python ATTEST_RETRY_SEC / AT_REP_ATTEST_RETRY_SEC and ATTEST_RETRIES. */
+#define REP_ATTEST_RETRY_DEFAULT 15.0
+#define REP_ATTEST_RETRY \
+    (reputation_env_double("AT_REP_ATTEST_RETRY_SEC", REP_ATTEST_RETRY_DEFAULT))
+#define REP_ATTEST_RETRIES 5
+#define REP_ATTEST_RETRY_MAX 16
+
 /* Forward declaration — definition follows _ensure_init/state struct.
  * Emits a local-IPC tier_update to the identity process queue iff the
  * peer's trust tier has changed since the last publication, and an
@@ -207,7 +222,7 @@ static int _repropose_dropped(const process_t *proc,
 static bool _chain_json_certified(const process_t *proc, json_t *arr);
 static void _reappend_attested(const process_t *proc,
                                const tx_reconcile_result_t *res);
-static void _forward_attestation(const process_t *proc, const tx_score_msg_t *ts,
+void _forward_attestation(const process_t *proc, const tx_score_msg_t *ts,
                                  const uuid_t self_uuid);
 static int _rescore_peers(const process_t *proc, double present,
                           const uuid_t self_uuid);
@@ -318,6 +333,14 @@ typedef struct {
 /* A checkpoint proposal parked for a later co-sign (ISSUES §2.29). Everything
  * the co-signature covers is kept, plus who to send it to: the designation is
  * rebuilt from these fields, exactly as the proposer built it. */
+/* One of our attestation rounds awaiting a quorum, for its re-propose clock. */
+typedef struct {
+    bool used;
+    char task[UUID_STRING_LEN + 1];
+    double due;          /* when the propose next goes out again */
+    int attempts;        /* re-proposals so far */
+} rep_attest_retry_t;
+
 #define REP_PARKED_COSIGN_MAX 16
 typedef struct {
     bool used;
@@ -509,6 +532,9 @@ static struct {
      * and chain -- a newer epoch replaces an older one -- re-checked every pass
      * by _recheck_parked_cosigns and dropped after one checkpoint interval. */
     rep_parked_cosign_t parked_cosigns[REP_PARKED_COSIGN_MAX];
+    /* Our own attestation rounds still short of a quorum (ISSUES §2.40), re-
+     * proposed by _retry_pending_attestations. */
+    rep_attest_retry_t attest_retries[REP_ATTEST_RETRY_MAX];
     char  checkpoint_root[TX_HASH_HEX_LEN + 1];  /* latest finalized root */
     int64_t checkpoint_epoch;  /* epoch of the latest finalized checkpoint */
     bool  checkpoint_set;      /* a checkpoint has been finalized/stored */
@@ -4701,6 +4727,34 @@ static bool _commit_attestation(const process_t *proc, const rep_attest_t *a,
     return true;
 }
 
+/* (Re)start the re-propose clock for our round @p task. A full table leaves
+ * the round to its one fan-out, as before. Caller holds rep_state.lock. */
+static void _attest_retry_arm_locked(const char *task, double due)
+{
+    rep_attest_retry_t *slot = NULL;
+    for (int i = 0; i < REP_ATTEST_RETRY_MAX; i++) {
+        rep_attest_retry_t *r = &rep_state.attest_retries[i];
+        if (r->used && strcmp(r->task, task) == 0) { slot = r; break; }
+        if (!r->used && slot == NULL)
+            slot = r;
+    }
+    if (slot == NULL)
+        return;
+    memset(slot, 0, sizeof(*slot));
+    slot->used = true;
+    at_strlcpy(slot->task, task, sizeof(slot->task));
+    slot->due = due;
+}
+
+/* Forget the clock for @p task. Caller holds rep_state.lock. */
+static void _attest_retry_clear_locked(const char *task)
+{
+    for (int i = 0; i < REP_ATTEST_RETRY_MAX; i++)
+        if (rep_state.attest_retries[i].used
+            && strcmp(rep_state.attest_retries[i].task, task) == 0)
+            memset(&rep_state.attest_retries[i], 0, sizeof(rep_attest_retry_t));
+}
+
 /* Send @p payload as @p function to one peer (@p to) or, when NULL, to every
  * peer on our roster, as the slash finalizer is sent. */
 static void _attest_send(const process_t *proc, char *function,
@@ -4739,7 +4793,7 @@ static void _attest_send(const process_t *proc, char *function,
 
 /* A local producer's attested score: sign it as its verifier and ask the group
  * to co-sign. Nothing is appended until a quorum certifies it. */
-static void _forward_attestation(const process_t *proc, const tx_score_msg_t *ts,
+void _forward_attestation(const process_t *proc, const tx_score_msg_t *ts,
                                  const uuid_t self_uuid)
 {
     rep_attest_t a;
@@ -4786,6 +4840,8 @@ static void _forward_attestation(const process_t *proc, const tx_score_msg_t *ts
         map_set(&rep_state.attest_pending, (map_key_t)a.task,
                 string_data(text, strlen(text) + 1));
     _record_cosig_locked(&rep_state.attest_sigs, a.task, a.verifier, sig_hex);
+    if (text != NULL)
+        _attest_retry_arm_locked(a.task, (double)time(NULL) + REP_ATTEST_RETRY);
     pthread_mutex_unlock(&rep_state.lock);
     free(text);
     if (rec != NULL)
@@ -4793,6 +4849,87 @@ static void _forward_attestation(const process_t *proc, const tx_score_msg_t *ts
     json_decref(rec);
     log_info(proc->logger, "Reputation: proposed attested score: subject=%.8s "
              "score=%.2f\n", a.subject, a.score);
+}
+
+/* Our attestation rounds still short of a quorum: send the propose again once
+ * REP_ATTEST_RETRY has passed, up to REP_ATTEST_RETRIES times, then abandon the
+ * round (ISSUES §2.40). A round whose entry is already in the chain (a final
+ * from elsewhere certified it) is simply forgotten. Collect under the lock,
+ * send outside it, as _retry_uncommitted_halves does. Returns the number of
+ * proposes sent this pass. */
+size_t _retry_pending_attestations(const process_t *proc, double present)
+{
+    char again[REP_ATTEST_RETRY_MAX][1024];
+    int attempt_of[REP_ATTEST_RETRY_MAX];
+    size_t n_again = 0;
+    pthread_mutex_lock(&rep_state.lock);
+    for (int i = 0; i < REP_ATTEST_RETRY_MAX; i++) {
+        rep_attest_retry_t *r = &rep_state.attest_retries[i];
+        if (!r->used)
+            continue;
+        char rec_text[1024] = {0};
+        data_t *d = NULL;
+        if (map_get(&rep_state.attest_pending, (map_key_t)r->task, &d) != 0
+            || d == NULL || data_string(d, rec_text, sizeof(rec_text)) != 0) {
+            memset(r, 0, sizeof(*r));      /* finalized or reset meanwhile */
+            continue;
+        }
+        json_t *rec = json_loads(rec_text, 0, NULL);
+        rep_attest_t a;
+        bool ok = _attest_from_json(rec, &a);
+        json_decref(rec);
+        uuid_t task_uuid;
+        transaction_t held;
+        bool committed = ok && uuid_parse(a.task, task_uuid) == 0
+            && tx_history_by_task(_chain_for_key_locked(a.group), task_uuid, &held) == 0;
+        if (!ok || committed) {
+            map_remove(&rep_state.attest_pending, r->task);
+            map_remove(&rep_state.attest_sigs, r->task);
+            memset(r, 0, sizeof(*r));
+            continue;
+        }
+        if (present < r->due)
+            continue;
+        if (r->attempts >= REP_ATTEST_RETRIES) {
+            log_warn(proc->logger, "Reputation: attested score about %.8s never "
+                     "reached a quorum after %d re-proposal(s); abandoning it\n",
+                     a.subject, r->attempts);
+            map_remove(&rep_state.attest_pending, r->task);
+            map_remove(&rep_state.attest_sigs, r->task);
+            memset(r, 0, sizeof(*r));
+            continue;
+        }
+        r->attempts++;
+        r->due = present + REP_ATTEST_RETRY;
+        at_strlcpy(again[n_again], rec_text, sizeof(again[n_again]));
+        attempt_of[n_again++] = r->attempts;
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+
+    for (size_t i = 0; i < n_again; i++) {
+        json_t *rec = json_loads(again[i], 0, NULL);
+        if (rec == NULL)
+            continue;
+        const char *subj = json_string_value(json_object_get(rec, "subject_uuid"));
+        log_info(proc->logger, "Reputation: attested score about %.8s has no "
+                 "quorum yet; re-proposing it (attempt %d of %d)\n",
+                 subj != NULL ? subj : "?", attempt_of[i], REP_ATTEST_RETRIES);
+        _attest_send(proc, REP_PROTO_ATTEST_PROPOSE, NULL, rec);
+        json_decref(rec);
+    }
+    return n_again;
+}
+
+size_t reputation_attest_pending_count(void)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    size_t n = 0;
+    for (int i = 0; i < REP_ATTEST_RETRY_MAX; i++)
+        if (rep_state.attest_retries[i].used)
+            n++;
+    pthread_mutex_unlock(&rep_state.lock);
+    return n;
 }
 
 static bool handle_attest_propose(const process_t *proc, directory_t *queues,
@@ -4933,6 +5070,7 @@ static bool handle_attest_sign(const process_t *proc, directory_t *queues,
     }
     pthread_mutex_lock(&rep_state.lock);
     map_remove(&rep_state.attest_pending, a.task);
+    _attest_retry_clear_locked(a.task);
     pthread_mutex_unlock(&rep_state.lock);
     _commit_attestation(proc, &a, sigs);
     json_t *fin = _attest_to_json(&a);
@@ -8585,6 +8723,7 @@ void reputation_reset_state(int num_peers)
     map_init(&rep_state.attest_pending);
     map_free(&rep_state.attest_sigs);
     map_init(&rep_state.attest_sigs);
+    memset(rep_state.attest_retries, 0, sizeof(rep_state.attest_retries));
     rep_state.slash_epoch = 0;
     map_free(&rep_state.slash_hw);
     map_init(&rep_state.slash_hw);
@@ -9220,6 +9359,8 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
         /* Checkpoint proposals that arrived before our chain held their
          * range (ISSUES §2.29). */
         _recheck_parked_cosigns(proc, present);
+        /* Our attestation rounds whose propose went missing (ISSUES §2.40). */
+        _retry_pending_attestations(proc, present);
         /* A gateway's child groups arrive over IPC (CHILD_GROUP) after this
          * process was constructed, so their persisted evidence is restored
          * here rather than at boot. Idempotent per group. */
