@@ -212,10 +212,18 @@ its anchor and its consumers own the link, as ZTA's do.
 
 A feature's handlers reach identity's state only through the services
 `identity/id_proc_priv.h` exports for them: `identity_self_identity`,
-`identity_find_peer_pub`, `identity_send_to_network`,
-`identity_freshness_stamp` and `identity_freshness_accept`. Each takes
-identity's lock for itself, and a feature keeps its own state behind its own
-lock.
+`identity_find_peer_pub`, `identity_send_to_network` (and its generalisations
+`identity_send_to` and `identity_send_to_then`), `identity_freshness_stamp` and
+`identity_freshness_accept`. Each takes identity's lock for itself, and a
+feature keeps its own state behind its own lock.
+
+A send through these helpers returns 0 when the frame was sent **or kept**: a
+queue still full after 200 ms has the frame retried on the identity tick for up
+to 30 s (ISSUES §2.40). A feature that may act only once the frame is really
+out, such as one that stages a bilateral score, passes an on-sent callback to
+`identity_send_to_then`. The callback is told once, `sent` true or false, for
+every 0 returned. It runs with no retry-list lock held, so it may send in turn,
+and it must take its own lock for any state it touches.
 
 ## Transports and processes
 
@@ -464,7 +472,9 @@ identity lock, unlocks, and only then asks `peer_blocked`, so a tier and a block
 are two snapshots rather than one. What a feature needs from identity it calls
 through exports in `identity/id_proc_priv.h`; social's are
 `identity_state_ensure_init`, the freshness pair, `identity_find_peer_pub`,
-`identity_send_to_network`, `identity_emit_peer_observed`,
+`identity_send_to_network`, `identity_send_to_network_then` (the reaction and
+the report score in its callback), `identity_send_to` (scores to reputation),
+`identity_emit_peer_observed`,
 `identity_request_attestation`, `identity_is_local_app_verb` and
 `identity_refuse_remote_app_verb`.
 

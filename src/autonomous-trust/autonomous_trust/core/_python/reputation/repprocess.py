@@ -268,6 +268,14 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # verifier this node does not yet trust cannot place a score its subject
     # cannot veto. Mirrors AT_ATTEST_MIN_REP in rep_proc.c.
     ATTEST_MIN_REP = _env_float('AT_ATTEST_MIN_REP', 0.5)
+    # How long a verifier's attestation round may stay short of a quorum
+    # before its propose goes out again, and how many times (ISSUES §2.40):
+    # the propose is a one-shot fan-out, and a lost copy left the round pending
+    # forever. The task id is derived from (verifier, subject, digest), so a
+    # repeat is the same round. After the last try the round is abandoned.
+    # Mirrors C REP_ATTEST_RETRY / REP_ATTEST_RETRIES.
+    ATTEST_RETRY_SEC = _env_float('AT_REP_ATTEST_RETRY_SEC', 15.0)
+    ATTEST_RETRIES = 5
 
     # --- Deep resolution (doc/architecture/gateway-reputation-tree.md) ----------------------------
     # How long a relayed query stays in the pending table, and how long a
@@ -559,6 +567,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # co-signatures for: task id str -> AttestedScore / {voter: sig}.
         self._attest_pending: dict[str, AttestedScore] = {}
         self._attest_sigs: dict[str, dict] = {}
+        # Their re-propose clocks: task id str -> [due, attempts] (§2.40).
+        self._attest_retry: dict[str, list] = {}
         # Dedup for finalized slashes (FIFO bounded), so a re-broadcast
         # slash_final is a cheap no-op. Mirrors committed_paxos_rounds.
         #
@@ -1977,18 +1987,65 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             return True
         self._attest_pending[key] = att
         self._attest_sigs[key] = {str(self.identity.uuid): sig}
+        self._attest_retry[key] = [now().timestamp() + self.ATTEST_RETRY_SEC, 0]
+        if self._send_attest_propose(queues, att):
+            self.logger.info('Proposed attested score: subject=%s score=%.2f',
+                             str(att.subject_uuid)[:8], float(att.score))
+        return True
+
+    def _send_attest_propose(self, queues, att) -> bool:
+        """Fan our attestation round's propose out to the group."""
         if self.group is None:
-            return True
+            return False
         try:
             msg = Message(self.name, ReputationProtocol.attest_propose,
                           to_json_string(att), self.group,
                           from_whom=self.identity)
             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
-            self.logger.info('Proposed attested score: subject=%s score=%.2f',
-                             str(att.subject_uuid)[:8], float(att.score))
+            return True
         except Full:
-            self.logger.error('forward_attestation: network queue full')
-        return True
+            self.logger.error('attest propose: network queue full')
+            return False
+
+    def _retry_pending_attestations(self, queues, present) -> int:
+        """Re-propose OUR attestation rounds still short of a quorum once
+        ATTEST_RETRY_SEC has passed, up to ATTEST_RETRIES times, then abandon
+        them (ISSUES §2.40). A round whose entry is already in the chain (a
+        final from elsewhere certified it) is forgotten. Mirrors C
+        _retry_pending_attestations. Returns how many were re-proposed."""
+        resent = 0
+        for key, clock in list(self._attest_retry.items()):
+            att = self._attest_pending.get(key)
+            if att is None:
+                del self._attest_retry[key]
+                continue
+            chain = self._chain_for_group(att.group_uuid or None)
+            if chain._task_mapping.get(att.task_id) is not None:
+                self._attest_pending.pop(key, None)
+                self._attest_sigs.pop(key, None)
+                del self._attest_retry[key]
+                continue
+            due, attempts = clock
+            if present < due:
+                continue
+            if attempts >= self.ATTEST_RETRIES:
+                self.logger.warning(
+                    'attested score about %s never reached a quorum after %d '
+                    're-proposal(s); abandoning it',
+                    str(att.subject_uuid)[:8], attempts)
+                self._attest_pending.pop(key, None)
+                self._attest_sigs.pop(key, None)
+                del self._attest_retry[key]
+                continue
+            clock[0] = present + self.ATTEST_RETRY_SEC
+            clock[1] = attempts + 1
+            self.logger.info(
+                'attested score about %s has no quorum yet; re-proposing it '
+                '(attempt %d of %d)', str(att.subject_uuid)[:8], attempts + 1,
+                self.ATTEST_RETRIES)
+            if self._send_attest_propose(queues, att):
+                resent += 1
+        return resent
 
     def handle_attest_propose(self, queues, message):
         if message.function != ReputationProtocol.attest_propose:
@@ -2067,6 +2124,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             return True
         del self._attest_pending[str(task)]
         self._attest_sigs.pop(str(task), None)
+        self._attest_retry.pop(str(task), None)
         self._commit_attestation(att, sigs)
         signed = SignedAttestation(attestation=att, sigs=dict(sigs))
         try:
@@ -5177,6 +5235,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 self._maybe_checkpoint(queues, present)
                 # Our halves that went out and never came back (§2.24).
                 self._retry_uncommitted_halves(queues, present)
+                # Our attestation rounds whose propose went missing (§2.40).
+                self._retry_pending_attestations(queues, present)
                 # Checkpoint proposals that arrived before our chain held
                 # their range (§2.29).
                 self._recheck_parked_cosigns(queues, present)
