@@ -40,6 +40,7 @@
 #include "utilities/msg_registry.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/util.h"
+#include "utilities/send_retry.h"   /* at_send: keep a refused event */
 
 #define AREA_LOOKUP_REFS_MAX 16
 #define AREA_REFS_PER_LOOKUP 8
@@ -143,8 +144,9 @@ static void _emit(const process_t *proc, int32_t kind, area_ev_t e)
     at_strlcpy(m->data.issuer, e.issuer != NULL ? e.issuer : "", sizeof(m->data.issuer));
     m->data.seq = e.seq;
     m->data.count = e.count;
-    if (messaging_send(AT_MAIN_QUEUE, FIRST_CONTACT_AREA_EVENT, &msg, false) != 0)
-        log_debug(proc->logger, "Identity: area: no main queue for event %d\n", kind);
+    if (at_send(proc, AT_MAIN_QUEUE, &msg, "an area event", "the app",
+                AT_SEND_NOW, NULL, NULL, 0) != 0)
+        log_debug(proc->logger, "Identity: area: could not hand the app event %d\n", kind);
 }
 
 /* Local IPC to the network process: {verb} with @p body (stolen). */

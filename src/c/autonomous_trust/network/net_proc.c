@@ -49,6 +49,7 @@
 #include "network/net_proc_priv.h"
 #include "network/net_filter.h"
 #include "network/net_ext.h"
+#include "utilities/send_retry.h"
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
 #include "structures/map.h"
@@ -134,6 +135,8 @@ static void _net_signal_partition(net_thread_ctx_t *ctx, const char *from_addr)
     if (body != NULL) {
         net_msg_pack_json(&sig.info.net_msg, body);
         json_decref(body);
+        /* Bare on purpose (it re-fires every 5 s while decrypts keep
+         * failing, see the cooldown above): ISSUES §2.14. */
         int rc = messaging_send("identity", NET_MESSAGE, &sig, false);
         net_msg_free_obj(&sig.info.net_msg);
         if (rc != 0) {
@@ -1029,7 +1032,17 @@ static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
     gmsg.info.net_msg.verified = wmsg->verified;
     gmsg.info.net_msg.has_signature = wmsg->has_signature;
 
-    int ret = messaging_send(wmsg->process, NET_MESSAGE, &gmsg, false);
+    /* Every inbound frame from the wire passes here, on a receiver thread, and
+     * the sibling's queue holds ten. A refused frame is KEPT (one try, so a
+     * receiver thread never sleeps; the copy is deep, because obj is borrowed
+     * from wmsg) and this process's tick retries it, in order, for up to 30 s
+     * (utilities/send_retry.h, ISSUES §2.14). Until then it was dropped here,
+     * whatever it carried. */
+    char what[96];
+    snprintf(what, sizeof(what), "an inbound %s",
+             wmsg->function != NULL ? wmsg->function : "frame");
+    int ret = at_send(proc, wmsg->process, &gmsg, what, wmsg->process,
+                      AT_SEND_NOW, NULL, NULL, 0);
     if (ret != 0) {
         log_error(logger, "Failed to route message to process '%s'\n", wmsg->process);
         if (gmsg.info.net_msg.function != NULL) free(gmsg.info.net_msg.function);
@@ -1039,6 +1052,12 @@ static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
               wmsg->from_whom.nickname);
     if (gmsg.info.net_msg.function != NULL) free(gmsg.info.net_msg.function);
     return 0;
+}
+
+int net_proc_test_route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
+                                   logger_t *logger)
+{
+    return route_to_process(wmsg, proc, NULL, logger);
 }
 
 /* Run the network filter chain (net_filter.h) over one outbound frame. On
@@ -1137,7 +1156,8 @@ int refuse_ping_at_unsupported(const char *target_addr,
     gmsg.info.net_msg.obj = (uint8_t *)body;
     gmsg.info.net_msg.len = strlen(body);
     gmsg.info.net_msg.encrypt = false;
-    int rc = messaging_send(return_to, NET_MESSAGE, &gmsg, false);
+    int rc = at_send(NULL, return_to, &gmsg, "a ping_at refusal", return_to,
+                     AT_SEND_NOW, NULL, NULL, 0);
     if (rc != 0)
         log_warn(logger, "Network: failed to post ping_at refusal to '%s'\n", return_to);
     if (gmsg.info.net_msg.function != NULL) free(gmsg.info.net_msg.function);
@@ -2116,7 +2136,10 @@ static void broadcast_rtt_update(const process_t *proc, directory_t *queues,
             continue;
         if (strcmp(qname, proc->name) == 0)
             continue;
-        int rc = messaging_send(qname, PEER_RTT_UPDATE, &msg, false);
+        /* Sent once per new peer, and nothing re-sends it (periodic re-emission
+         * is the refinement noted above), so it is kept (ISSUES §2.14). */
+        int rc = at_send(proc, qname, &msg, "an rtt update", qname,
+                         AT_SEND_NOW, NULL, NULL, 0);
         if (rc != 0)
             log_debug(logger, "Network: rtt_update to %s returned %d\n", qname, rc);
     }
@@ -2134,7 +2157,8 @@ static int net_emit_rtt_observed(const uuid_t peer_uuid, int rtt_ms)
     msg.size = sizeof(peer_rtt_update_msg_t);
     memcpy(msg.info.peer_rtt_update.peer_uuid, peer_uuid, 16);
     msg.info.peer_rtt_update.rtt_ms = rtt_ms;
-    return messaging_send(AT_MAIN_QUEUE, PEER_RTT_OBSERVED, &msg, false);
+    return at_send(NULL, AT_MAIN_QUEUE, &msg, "a peer rtt", "the app",
+                   AT_SEND_NOW, NULL, NULL, 0);
 }
 
 /* AT → app: emit the RTT for every known peer — the proximity half of the
@@ -2332,9 +2356,19 @@ static int network_run(const net_transport_t *transport,
              transport->name, bcast_addr, port_num);
 
     generic_msg_t buf = {0};
+    time_t last_kept_drain = 0;
     while (keep_running(proc, &pctx.sig_q, logger))
     {
         net_ext_periodic(&thread_ctx);
+        /* Frames a full sibling queue refused (route_to_process and friends,
+         * utilities/send_retry.h). sleep_until drains them too, but this loop
+         * reaches it only when its own queue is empty, which under a burst is
+         * exactly when it does not; so at most once a second here as well. */
+        time_t now_s = time(NULL);
+        if (now_s != last_kept_drain && at_send_retry_pending(NULL) > 0) {
+            last_kept_drain = now_s;
+            at_send_retry_drain(proc, NULL, (double)now_s);
+        }
         /* RECEIVE FIRST, SLEEP ONLY WHEN THERE IS NOTHING TO TAKE. This loop
          * used to sleep a cadence tick and then take exactly ONE message, so
          * the network process drained its queue at one datagram per ~0.5s

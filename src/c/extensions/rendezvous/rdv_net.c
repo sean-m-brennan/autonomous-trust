@@ -52,6 +52,7 @@
 #include "rendezvous/net_relay_rosters.h"
 #include "rendezvous/net_rendezvous.h"
 #include "rendezvous/reach.h"
+#include "utilities/send_retry.h"   /* at_send: keep a refused frame */
 
 /* Protocol strings (declared `extern char[]` in rendezvous/net_rendezvous.h). */
 /* identity -> network, local IPC: reach peer {uuid} through relay {relay}.
@@ -353,7 +354,10 @@ void net_relay_drain_records(void)
         msg.info.net_msg.encrypt = false;
         net_msg_pack_json(&msg.info.net_msg, wire);
         json_decref(wire);
-        messaging_send("identity", NET_MESSAGE, &msg, false);
+        /* The record was popped above, so a refused send used to lose it:
+         * kept for this process's tick instead (ISSUES §2.14). */
+        (void)at_send(NULL, "identity", &msg, "a reachability record",
+                      "identity", AT_SEND_NOW, NULL, NULL, 0);
         net_msg_free_obj(&msg.info.net_msg);
     }
 }
@@ -417,7 +421,10 @@ static void _relay_deliver(void *arg, const char *from_uuid,
                 msg.info.net_msg.encrypt = false;
                 net_msg_pack_json(&msg.info.net_msg, body);
                 json_decref(body);
-                if (messaging_send("identity", NET_MESSAGE, &msg, false) != 0)
+                /* Sent once per change (live is already updated), so a
+                 * refused one is kept for the tick (ISSUES §2.14). */
+                if (at_send(NULL, "identity", &msg, "a relay_peer", "identity",
+                            AT_SEND_NOW, NULL, NULL, 0) != 0)
                     log_debug(ctx->logger, "Relay: relay_peer for %.8s not sent\n",
                               from_uuid);
                 net_msg_free_obj(&msg.info.net_msg);
@@ -552,6 +559,8 @@ static void _relay_announce_own(const net_relay_ep_t *ep, net_relay_client_t *c)
     msg.info.net_msg.encrypt = false;
     net_msg_pack_json(&msg.info.net_msg, body);
     json_decref(body);
+    /* Bare on purpose (announced is set only on success, and _rdv_periodic
+     * tries again): ISSUES §2.14. */
     int sent = messaging_send("identity", NET_MESSAGE, &msg, false);
     net_msg_free_obj(&msg.info.net_msg);
     if (sent == 0) {

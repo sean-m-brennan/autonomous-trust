@@ -45,6 +45,7 @@
 #include "utilities/msg_registry.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/util.h"
+#include "utilities/send_retry.h"   /* at_send: keep a refused event */
 
 #define DIR_HINT_LEN (AT_RELAY_HOST_LEN + 96)
 #define DIR_OUT_MAX 64
@@ -217,8 +218,9 @@ static void _emit(const process_t *proc, int32_t kind, const char *ref,
     at_strlcpy(m->data.relay, relay != NULL ? relay : "", sizeof(m->data.relay));
     at_strlcpy(m->data.reason, reason != NULL ? reason : "", sizeof(m->data.reason));
     m->data.seq = seq;
-    if (messaging_send(AT_MAIN_QUEUE, FIRST_CONTACT_DIRECTORY_EVENT, &msg, false) != 0)
-        log_debug(proc->logger, "Identity: directory: no main queue for event %d\n", kind);
+    if (at_send(proc, AT_MAIN_QUEUE, &msg, "a directory event", "the app",
+                AT_SEND_NOW, NULL, NULL, 0) != 0)
+        log_debug(proc->logger, "Identity: directory: could not hand the app event %d\n", kind);
 }
 
 static void _refused(const process_t *proc, const char *ref, const char *handle,

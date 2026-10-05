@@ -38,7 +38,7 @@
 #include "network/network.h"  /* net_wire_mode_resolve (2.3) */
 #include "config/configuration.h"
 #include "peers.h"
-#include "identity/id_send_retry.h"
+#include "utilities/send_retry.h"
 #include "history.h"
 #include "identity_priv.h"
 #include "id_proc_priv.h"
@@ -98,8 +98,8 @@ bool identity_find_peer_pub(const process_t *proc, const uuid_t uuid,
  * 200 ms was not enough either (ISSUES §2.40): on 2026-10-02 a joiner's
  * full_history (Agora part-603464), a DM (dev-620062) and a Stele attestation
  * (st-660084) were each lost to a queue that stayed full for longer. A frame
- * still refused after the inline tries is now KEPT (id_send_retry.h) and the
- * identity tick retries it for up to 30 s, so 0 means "this node owns the
+ * still refused after the inline tries is now KEPT (utilities/send_retry.h)
+ * and the process tick retries it for up to 30 s, so 0 means "this node owns the
  * delivery", not "it is on the wire": a caller that scores on success is
  * right to log success, because the frame either goes out or is reported
  * lost. A caller whose action must only count once the frame is really out (a
@@ -110,48 +110,13 @@ bool identity_find_peer_pub(const process_t *proc, const uuid_t uuid,
  * arrives after it. */
 int identity_send_to_then(const process_t *proc, const char *queue,
                           generic_msg_t *out, const char *what,
-                          const char *whom, id_send_sent_fn on_sent,
+                          const char *whom, at_send_sent_fn on_sent,
                           const void *ctx, size_t ctx_len)
 {
     /* proc may be NULL for a caller with no process in hand (first contact's
-     * local relay and sibling senders); the root logger takes the lines. */
-    logger_t *logger = proc != NULL ? proc->logger : NULL;
-    const char *to = whom == NULL ? "peer" : whom;
-    double now = (double)time(NULL);
-    if (id_send_retry_pending(queue) > 0) {
-        id_send_retry_drain(proc, queue, now);
-        if (id_send_retry_pending(queue) > 0
-            && id_send_retry_defer_then(queue, out, what, whom, now, on_sent,
-                                        ctx, ctx_len) == 0) {
-            log_info(logger, "Identity: %s to %s waits behind earlier frames"
-                     " for a full %s queue\n", what, to, queue);
-            return 0;
-        }
-    }
-    int ret = -1;
-    for (int attempt = 0; attempt < 10; attempt++)
-    {
-        ret = messaging_send(queue, out->type, out, false);
-        if (ret == 0) {
-            if (on_sent != NULL)
-                on_sent(proc, ctx, true);
-            return 0;
-        }
-        usleep(20000); /* 20ms */
-    }
-    if (ret == EAGAIN && id_send_retry_defer_then(queue, out, what, whom, now,
-                                                  on_sent, ctx, ctx_len) == 0) {
-        log_info(logger, "Identity: %s to %s deferred (%s queue full); the"
-                 " identity tick retries it\n", what, to, queue);
-        return 0;
-    }
-    log_warn(logger,
-             "Identity: could not send %s to %s after 10 tries (%s) — the"
-             " action DID NOT HAPPEN and nothing retries it\n",
-             what, to,
-             ret == EAGAIN ? "queue still full, and no room to keep it"
-                           : "send failed");
-    return ret;
+     * local relay and sibling senders); the root logger takes the lines. The
+     * mechanism is every process's now (utilities/send_retry.h, §2.14). */
+    return at_send(proc, queue, out, what, whom, 0, on_sent, ctx, ctx_len);
 }
 
 int identity_send_to(const process_t *proc, const char *queue,
@@ -168,7 +133,7 @@ int identity_send_to_network(const process_t *proc, generic_msg_t *out,
 
 int identity_send_to_network_then(const process_t *proc, generic_msg_t *out,
                                   const char *what, const char *whom,
-                                  id_send_sent_fn on_sent, const void *ctx,
+                                  at_send_sent_fn on_sent, const void *ctx,
                                   size_t ctx_len)
 {
     return identity_send_to_then(proc, "network", out, what, whom, on_sent,
@@ -3232,7 +3197,7 @@ void identity_reset_state(void)
     id_state.probe_seq = 0;
     pthread_mutex_unlock(&id_state.lock);
     _handoffs_reset();
-    id_send_retry_reset();
+    at_send_retry_reset();
     /* After the unlock: a feature resets its own state under its own lock. */
     identity_ext_reset();
 }
@@ -7658,7 +7623,10 @@ int identity_emit_peer_observed(const process_t *proc,
      * (identity/id_ext.h); false without one. */
     msg.info.peer_observed.in_group = identity_ext_peer_in_group(proc, pu);
     msg.info.peer_observed.blocked = identity_ext_peer_blocked(pu);
-    return messaging_send(AT_MAIN_QUEUE, PEER_OBSERVED, &msg, false);
+    /* One try, then kept for the tick (ISSUES §2.14): a roster replay is one
+     * of these per peer, so no 200 ms each. */
+    return at_send(proc, AT_MAIN_QUEUE, &msg, "a peer observation", "the app",
+                   AT_SEND_NOW, NULL, NULL, 0);
 }
 
 
@@ -8207,9 +8175,8 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
         identity_retry_sibling_handoffs(proc);
 
         /* One-shot frames a full queue refused for longer than the inline
-         * 200 ms (DMs, joiner histories, ads; ISSUES §2.40): one try each per
-         * tick, oldest first, until they land or age out. */
-        id_send_retry_drain(proc, NULL, (double)time(NULL));
+         * 200 ms (DMs, joiner histories, ads; ISSUES §2.40) are drained by
+         * sleep_until at the top of this loop, as in every process. */
 
         /* Periodic late-joiner cap-loss backstop (interval-gated so the
          * fast loop doesn't sweep every iteration; a converged group

@@ -346,6 +346,9 @@ void messaging_recv_release(generic_msg_t *msg)
     if (msg->type == NET_MESSAGE) {
         free(msg->info.net_msg.function);
         free(msg->info.net_msg.obj);
+    } else if (msg->type == TASK_RESULT) {
+        /* proto_to_generic_msg allocates the result bytes (msg_types.c). */
+        free(msg->info.task_result.result_data);
     }
     memset(msg, 0, sizeof(*msg));
 }

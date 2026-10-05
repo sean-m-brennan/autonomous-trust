@@ -46,6 +46,7 @@
 #include "structures/map.h"
 #include "processes/processes.h"
 #include "utilities/message.h"
+#include "utilities/send_retry.h"
 #include "utilities/msg_types.h"
 #include "utilities/allocation.h"
 
@@ -113,7 +114,9 @@ static process_t *g_proc;
 
 /* The verifier, with the subject and an observer on its roster, proposes an
  * attestation about the subject while the network queue is full: every copy
- * of the propose is lost, and the round is left pending. */
+ * of the propose is lost, and the round is left pending. (A refused copy is
+ * kept for this process's tick now, ISSUES §2.14; the list is cleared below
+ * to stand for a copy lost past that: given up on, or on the far side.) */
 static void _begin_with_a_lost_propose(void)
 {
     ck_assert(sodium_init() >= 0);
@@ -138,6 +141,7 @@ static void _begin_with_a_lost_propose(void)
     g_refuse = true;
     _forward_attestation(g_proc, &ts, g_ver->uuid);
     g_refuse = false;
+    at_send_retry_reset();
     ck_assert_int_eq((int)g_proposes, 0);
     ck_assert_int_eq((int)reputation_attest_pending_count(), 1);
 }

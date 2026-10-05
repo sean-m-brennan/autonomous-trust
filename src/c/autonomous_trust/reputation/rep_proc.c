@@ -30,6 +30,7 @@
 #include "structures/array.h"
 #include "structures/data.h"
 #include "utilities/message.h"
+#include "utilities/send_retry.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
 #include "utilities/probes.h"
@@ -647,29 +648,19 @@ static bool _rep_frame_is_state(const char *fn)
  * messaging_send is non-blocking, and the network process's AF_UNIX datagram
  * queue holds net.unix.max_dgram_qlen frames -- 10 in every fresh network
  * namespace, whatever the host is tuned to. A frame that carries state
- * (_rep_frame_is_state) gets a bounded retry and, if that fails, a warning
- * naming the verb, as identity_send_to_network does. Chatter gets one try and
- * a debug line: the protocol will send it again. */
+ * (_rep_frame_is_state) gets a bounded retry and, if the queue is still full,
+ * is KEPT and retried on this process's tick for up to 30 s
+ * (utilities/send_retry.h, ISSUES §2.14) rather than lost: 200 ms was not
+ * enough for identity's one-shots either (§2.40). Chatter gets one try and a
+ * debug line: the protocol will send it again. */
 static int _rep_send_to_network(const process_t *proc, generic_msg_t *out)
 {
     const char *fn = out->info.net_msg.function;
-    bool state = _rep_frame_is_state(fn);
-    int tries = state ? 10 : 1;
-    int ret = -1;
-    for (int attempt = 0; attempt < tries; attempt++)
-    {
-        if (attempt > 0)
-            usleep(20000); /* 20ms */
-        ret = messaging_send("network", NET_MESSAGE, out, false);
-        if (ret == 0)
-            return 0;
-    }
-    if (state)
-        log_warn(proc->logger,
-                 "Reputation: could not hand %s to the network process after "
-                 "%d tries (%s); the frame is lost\n", fn, tries,
-                 ret == EAGAIN ? "network queue still full" : "send failed");
-    else
+    if (_rep_frame_is_state(fn))
+        return at_send(proc, "network", out, fn, "the network process", 0,
+                       NULL, NULL, 0);
+    int ret = messaging_send("network", NET_MESSAGE, out, false);
+    if (ret != 0)
         log_debug(proc->logger,
                   "Reputation: dropped %s at a full network queue; the "
                   "protocol re-sends it\n", fn != NULL ? fn : "?");
@@ -1372,7 +1363,11 @@ static void _publish_tier_change(const process_t *proc,
         ipc_neg.info.net_msg.encrypt = false;
         strncpy(ipc_neg.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
         net_msg_pack_json(&ipc_neg.info.net_msg, arr);
-        messaging_send("negotiation", NET_MESSAGE, &ipc_neg, false);
+        /* Kept if negotiation's queue is full (ISSUES §2.14): nothing
+         * republishes a demotion's tier_lost, unlike the tier_update above,
+         * whose rollback re-arms only identity's half. */
+        (void)at_send(proc, "negotiation", &ipc_neg, "tier_lost", uuid_str, 0,
+                      NULL, NULL, 0);
         net_msg_free_obj(&ipc_neg.info.net_msg);
     }
 
@@ -1723,7 +1718,10 @@ static int _publish_reputation(const uuid_t peer_uuid, double score, bool rated)
      * at the tier the cap exists to deny. An unrated peer has no tier. */
     double bounded = (ceiling >= 0.0 && score > ceiling) ? ceiling : score;
     msg.info.peer_reputation.effective_tier = rated ? _trust_tier(bounded) : 0;
-    return messaging_send(AT_MAIN_QUEUE, PEER_REPUTATION, &msg, false);
+    /* One try, then kept for the tick (ISSUES §2.14): no 200 ms per peer
+     * inside a roster replay. */
+    return at_send(NULL, AT_MAIN_QUEUE, &msg, "a peer reputation", "the app",
+                   AT_SEND_NOW, NULL, NULL, 0);
 }
 
 /* A score this process just committed is by construction rated. */
@@ -3777,7 +3775,11 @@ static bool handle_local_rep_query(const process_t *proc, directory_t *queues, g
     net_msg_pack_json(&resp.info.net_msg, resp_json);
     json_decref(resp_json);
 
-    messaging_send(return_proc, NET_MESSAGE, &resp, false);
+    /* The asker waits on this reply (ZTA defers a vouch until it comes) and
+     * does not ask again on its own, so it is kept if the queue is full
+     * (ISSUES §2.14). */
+    (void)at_send(proc, return_proc, &resp, "a local reputation reply",
+                  return_proc, 0, NULL, NULL, 0);
     net_msg_free_obj(&resp.info.net_msg);
     return true;
 }
@@ -8627,6 +8629,8 @@ void reputation_set_synchronous_dispatch(bool enabled)
 void reputation_reset_state(int num_peers)
 {
     _ensure_init();
+    /* Kept one-shot frames are this process's too (utilities/send_retry.h). */
+    at_send_retry_reset();
     pthread_mutex_lock(&rep_state.lock);
     /* Tear down + reinit. Preserve synchronous_dispatch so the harness
      * doesn't have to set it on every reset. */

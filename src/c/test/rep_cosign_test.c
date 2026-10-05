@@ -54,6 +54,7 @@
 #include "structures/map.h"
 #include "processes/processes.h"
 #include "utilities/message.h"
+#include "utilities/send_retry.h"
 #include "utilities/msg_types.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/allocation.h"
@@ -264,20 +265,26 @@ DEFINE_TEST(test_a_commit_broadcast_survives_a_full_network_queue)
 }
 END_TEST_DEFINITION()
 
-/* Bounded: a queue that never drains costs ten tries per frame, then the frame
- * is given up (and logged), rather than wedging the process. */
-DEFINE_TEST(test_a_wedged_network_queue_is_given_up_on)
+/* A queue wedged past the inline tries: the first commit is KEPT for this
+ * process's tick and the second waits behind it (ISSUES §2.14); both land,
+ * once each, when the queue drains. Until then each was given up on after
+ * ten tries. */
+DEFINE_TEST(test_a_wedged_network_queue_keeps_the_commits_for_the_tick)
 {
     _begin();
     cohort_t c;
     _cohort(&c);
     uuid_t task;
     char task_str[UUID_STRING_LEN + 1];
-    g_refuse_commits = 20;               /* ten tries for each of two peers */
+    g_refuse_commits = 1000;
     _round(&c, task, task_str);
     ck_assert_int_eq(reputation_get_chain_len(), 1);  /* the commit stands */
     ck_assert_uint_eq(g_commit_count, 0);
-    ck_assert_uint_eq(g_refuse_commits, 0);
+    ck_assert_uint_eq(at_send_retry_pending("network"), 2);
+    g_refuse_commits = 0;                             /* the queue drains */
+    ck_assert_uint_eq(at_send_retry_drain(NULL, NULL, (double)time(NULL)), 2);
+    ck_assert_uint_eq(g_commit_count, 2);
+    ck_assert_uint_eq(at_send_retry_pending("network"), 0);
     _end();
 }
 END_TEST_DEFINITION()
@@ -466,7 +473,7 @@ END_TEST_DEFINITION()
 
 RUN_TESTS(RepCosign,
           test_a_commit_broadcast_survives_a_full_network_queue,
-          test_a_wedged_network_queue_is_given_up_on,
+          test_a_wedged_network_queue_keeps_the_commits_for_the_tick,
           test_paxos_chatter_is_not_retried,
           test_a_signer_ahead_of_the_proposal_signs_its_range,
           test_a_signer_behind_signs_once_it_catches_up,

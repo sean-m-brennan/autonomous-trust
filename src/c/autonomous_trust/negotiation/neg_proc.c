@@ -41,6 +41,19 @@
 #include "negotiation/neg_certified.h"         /* §12.3 witness wire format */
 #include "config/configuration.h"             /* config_t, for our own identity */
 #include "reputation/tx_channel.h"             /* evidence channels */
+#include "utilities/send_retry.h"   /* at_send: keep a refused frame */
+
+/* Hand a sibling queue one of this process's frames, keeping it if the queue is
+ * full (utilities/send_retry.h, ISSUES §2.14). Every negotiation frame is a
+ * one-shot: nothing re-invites, re-refuses or re-reports, and there is no
+ * deadline sweep, so a frame lost here used to leave its task's tracker
+ * waiting forever. One try, because several callers hold neg_state.lock;
+ * this process's tick (sleep_until) retries what was kept, in order. */
+static int _neg_send(const process_t *proc, const char *queue,
+                     generic_msg_t *out, const char *what)
+{
+    return at_send(proc, queue, out, what, queue, AT_SEND_NOW, NULL, NULL, 0);
+}
 
 DEFINE_ERROR(ENEG_NOPEERS, "No capable peers available");
 
@@ -321,6 +334,8 @@ void negotiation_clear_test_state(const process_t *proc)
 
 void negotiation_reset_state(void)
 {
+    /* Kept one-shot frames are this process's too (utilities/send_retry.h). */
+    at_send_retry_reset();
     _ensure_init();
     pthread_mutex_lock(&neg_state.lock);
     job_queue_clear(&neg_state.task_stack);
@@ -1144,7 +1159,7 @@ static void _announce_task_locked(const process_t *proc, task_t *task,
         if (invite_json)
             net_msg_pack_json(&invite.info.net_msg, invite_json);
 
-        messaging_send("network", NET_MESSAGE, &invite, false);
+        _neg_send(proc, "network", &invite, "an invitation");
         net_msg_free_obj(&invite.info.net_msg);
         invited++;
     }
@@ -1340,7 +1355,7 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
                 net_msg_pack_json(&refuse.info.net_msg, rj);
                 json_decref(rj);
             }
-            messaging_send("network", NET_MESSAGE, &refuse, false);
+            _neg_send(proc, "network", &refuse, "a refusal");
             net_msg_free_obj(&refuse.info.net_msg);
             pthread_mutex_unlock(&neg_state.lock);
             return true;
@@ -1395,7 +1410,7 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
         _build_reply(nmsg, NEG_PROTO_REFUSE, &refuse);
         json_t *rj = _task_to_json(proc, &task);
         if (rj) { net_msg_pack_json(&refuse.info.net_msg, rj); json_decref(rj); }
-        messaging_send("network", NET_MESSAGE, &refuse, false);
+        _neg_send(proc, "network", &refuse, "a refusal");
         net_msg_free_obj(&refuse.info.net_msg);
         pthread_mutex_unlock(&neg_state.lock);
         return true;
@@ -1434,7 +1449,7 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
                 net_msg_pack_json(&haggle.info.net_msg, hj);
                 json_decref(hj);
             }
-            messaging_send("network", NET_MESSAGE, &haggle, false);
+            _neg_send(proc, "network", &haggle, "a haggle");
             net_msg_free_obj(&haggle.info.net_msg);
         }
         else
@@ -1467,7 +1482,7 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
                 net_msg_pack_json(&accept.info.net_msg, aj);
                 json_decref(aj);
             }
-            messaging_send("network", NET_MESSAGE, &accept, false);
+            _neg_send(proc, "network", &accept, "an acceptance");
             net_msg_free_obj(&accept.info.net_msg);
         }
     }
@@ -1486,7 +1501,7 @@ static bool handle_invite(const process_t *proc, directory_t *queues, generic_ms
             net_msg_pack_json(&refuse.info.net_msg, rj);
             json_decref(rj);
         }
-        messaging_send("network", NET_MESSAGE, &refuse, false);
+        _neg_send(proc, "network", &refuse, "a refusal");
         net_msg_free_obj(&refuse.info.net_msg);
     }
 
@@ -1558,7 +1573,7 @@ static bool handle_haggle(const process_t *proc, directory_t *queues, generic_ms
             net_msg_pack_json(&announce.info.net_msg, rj);
             json_decref(rj);
         }
-        messaging_send("network", NET_MESSAGE, &announce, false);
+        _neg_send(proc, "network", &announce, "a re-announcement");
         net_msg_free_obj(&announce.info.net_msg);
     }
     else
@@ -1580,7 +1595,7 @@ static bool handle_haggle(const process_t *proc, directory_t *queues, generic_ms
             net_msg_pack_json(&refuse.info.net_msg, rj);
             json_decref(rj);
         }
-        messaging_send("network", NET_MESSAGE, &refuse, false);
+        _neg_send(proc, "network", &refuse, "a refusal");
         net_msg_free_obj(&refuse.info.net_msg);
     }
 
@@ -1888,6 +1903,8 @@ static bool handle_stat_req(const process_t *proc, directory_t *queues, generic_
         json_decref(resp_json);
     }
 
+    /* Bare on purpose (a status reply; the asker's deadline sweep asks again,
+     * and nothing in C asks at all): ISSUES §2.14. */
     messaging_send("network", NET_MESSAGE, &resp, false);
     net_msg_free_obj(&resp.info.net_msg);
     return true;
@@ -2279,7 +2296,7 @@ static void _submit_tx_score(const process_t *proc, const uuid_t task_uuid,
     if (channel != NULL)
         at_strlcpy(msg.info.tx_score.channel, channel,
                    sizeof(msg.info.tx_score.channel));
-    if (messaging_send("reputation", TRANSACTION_SCORE, &msg, false) != 0)
+    if (_neg_send(proc, "reputation", &msg, "a task score") != 0)
         log_warn(proc->logger,
                  "Negotiation: could not submit score %.2f (via %s)\n",
                  score, (channel != NULL) ? channel : "-");
@@ -2470,7 +2487,7 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
                     result_msg.info.task_result.result_data = (uint8_t *)result_data;
                     result_msg.info.task_result.result_len  = result_len;
 
-                    messaging_send(AT_MAIN_QUEUE, TASK_RESULT, &result_msg, false);
+                    _neg_send(proc, AT_MAIN_QUEUE, &result_msg, "a task result");
 
                     /* Clean up tracker entry */
                     map_remove(&neg_state.my_tasks, task_uuid_str);
@@ -2592,7 +2609,7 @@ static void _report_result(const process_t *proc, const task_t *task,
     net_msg_pack_json(&out.info.net_msg, j);
     json_decref(j);
 
-    messaging_send("network", NET_MESSAGE, &out, false);
+    _neg_send(proc, "network", &out, "a task result");
     net_msg_free_obj(&out.info.net_msg);
 }
 
@@ -3026,7 +3043,7 @@ static bool handle_tier_lost(const process_t *proc, directory_t *queues, generic
                           orig_task->requestor_uuid);
                 cancel_msg.info.task_result.result_data = NULL;
                 cancel_msg.info.task_result.result_len  = 0;
-                messaging_send(AT_MAIN_QUEUE, TASK_RESULT, &cancel_msg, false);
+                _neg_send(proc, AT_MAIN_QUEUE, &cancel_msg, "a task cancellation");
 
                 map_remove(mt, task_uuid_str);
                 task_tracker_free(tracker);

@@ -898,7 +898,9 @@ The first fix was a bounded retry, 10 tries 20 ms apart, and that 200 ms was
 not enough either. On 2026-10-02 a queue stayed full for longer, and a joiner's
 history, a direct message and an attestation propose were each given up on. A
 frame still refused after the inline tries is now kept and retried on the
-identity tick for up to 30 s (`identity/id_send_retry.h`). Because a kept frame
+process tick for up to 30 s (`utilities/send_retry.h`). Since ISSUES §2.14 closed, that
+holds in every process, so reputation's own state frames, its `tier_lost` and
+its local replies are kept too, not just identity's one-shots. Because a kept frame
 may still be given up on, "the send returned 0" no longer means "it went". So
 the reaction and the report score their bilateral half in an on-sent callback
 that hears whether the frame really left. A frame that never leaves is never

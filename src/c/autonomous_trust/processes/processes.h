@@ -323,9 +323,11 @@ extern const long cadence;
 */
 bool keep_running(const process_t *proc, queue_t *sig_q, logger_t *logger);
 
+/** Sleep out the rest of this pass's @p how_long, after one drain of the
+ *  process's kept one-shot frames (utilities/send_retry.h): every loop calls
+ *  this once per tick, so that is where they are retried. */
 /*@
   requires \valid(proc);
-  assigns \nothing;
 */
 void sleep_until(const process_t *proc, long how_long);
 

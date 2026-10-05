@@ -36,6 +36,7 @@
 #include "zta_audit.h"
 #include "zta_protocol.h"
 #include "zta_msg_types.h"
+#include "utilities/send_retry.h"   /* at_send: keep a refused frame */
 
 /* Protocol-string definitions (declared `extern char[]` in
  * zta_protocol.h). Writable arrays so they're directly assignable to
@@ -149,7 +150,11 @@ static void _send_zta_standing(process_t *proc, const uuid_t peer_uuid,
     at_strlcpy(msg.info.peer_standing.source, PEER_STANDING_SOURCE_ZTA,
                sizeof(msg.info.peer_standing.source));
 
-    messaging_send("reputation", PEER_STANDING, &msg, false);
+    /* A standing bounds what a peer may hold; from admission or a deferred
+     * resolution nothing re-sends it, so a full reputation queue keeps it for
+     * this process's tick (ISSUES §2.14). */
+    (void)at_send(proc, "reputation", &msg, "a ZTA standing", "reputation", 0,
+                  NULL, NULL, 0);
 
     char uuid_str[37];
     uuid_unparse_lower(peer_uuid, uuid_str);
@@ -362,7 +367,10 @@ static void _request_reputation(process_t *proc, const uuid_t peer_uuid,
     net_msg_pack_json(&msg.info.net_msg, query);
     json_decref(query);
 
-    messaging_send("reputation", NET_MESSAGE, &msg, false);
+    /* The vouch waits on the reply and is re-asked only if another vouch
+     * arrives, so the query is kept on a full queue (ISSUES §2.14). */
+    (void)at_send(proc, "reputation", &msg, "a reputation query", "reputation",
+                  0, NULL, NULL, 0);
     net_msg_free_obj(&msg.info.net_msg);
 
     log_debug(logger, "ZTA: requested reputation for voucher %s\n", uuid_str);

@@ -59,6 +59,7 @@
 #include "first_contact/sibling_sync.h"
 #include "first_contact/backup_contact.h"
 #include "first_contact/siblings.h"
+#include "utilities/send_retry.h"   /* at_send: keep a refused event */
 
 /* First contact: the OPTIONAL 1:1 introduction handshake (opt-in via
  * AT_FIRST_CONTACT; first_contact/first_contact.c, doc/architecture/first-contact.md).
@@ -514,9 +515,10 @@ static void _fc_emit(const process_t *proc, int32_t kind, const char *ref,
     m->data.expiry = (int64_t)expiry;
     if (blob != NULL)
         at_strlcpy(m->data.blob, blob, sizeof(m->data.blob));
-    if (messaging_send(AT_MAIN_QUEUE, FIRST_CONTACT_EVENT, &msg, false) != 0)
+    if (at_send(proc, AT_MAIN_QUEUE, &msg, "a first-contact event", "the app",
+                AT_SEND_NOW, NULL, NULL, 0) != 0)
         log_debug(proc->logger,
-                  "Identity: first contact: no main queue for event %d\n", kind);
+                  "Identity: first contact: could not hand the app event %d\n", kind);
 }
 
 /* Record a spent nonce (pruning expired records first) and persist. Mirrors
@@ -1993,9 +1995,10 @@ static void _fc_emit_contact_o(const process_t *proc, int32_t kind,
     m->data.peer_dropped = dropped;
     m->data.count = count;
     m->data.origin = origin;
-    if (messaging_send(AT_MAIN_QUEUE, FIRST_CONTACT_CONTACT_EVENT, &msg, false) != 0)
+    if (at_send(proc, AT_MAIN_QUEUE, &msg, "a first-contact event", "the app",
+                AT_SEND_NOW, NULL, NULL, 0) != 0)
         log_debug(proc->logger,
-                  "Identity: first contact: no main queue for event %d\n", kind);
+                  "Identity: first contact: could not hand the app event %d\n", kind);
 }
 
 /* A refusal of an address-book request, on the first-contact event. */
@@ -2011,9 +2014,10 @@ static bool _fc_book_refused(const process_t *proc, const char *ref,
     if (peer != NULL && uuid_parse(peer, u) == 0)
         memcpy(m->data.peer_uuid, u, sizeof(m->data.peer_uuid));
     m->data.reason = (int32_t)reason;
-    if (messaging_send(AT_MAIN_QUEUE, FIRST_CONTACT_EVENT, &msg, false) != 0)
+    if (at_send(proc, AT_MAIN_QUEUE, &msg, "a first-contact event", "the app",
+                AT_SEND_NOW, NULL, NULL, 0) != 0)
         log_debug(proc->logger,
-                  "Identity: first contact: no main queue for a refusal\n");
+                  "Identity: first contact: could not hand the app a refusal\n");
     return true;
 }
 
@@ -2855,9 +2859,10 @@ void at_fc_emit_device_linked_ref(const process_t *proc, const char *ref,
     m->data.added_at = c->added_at;
     m->data.verified_at = c->verified_at;
     memcpy(m->data.device_uuid, device, sizeof(m->data.device_uuid));
-    if (messaging_send(AT_MAIN_QUEUE, FIRST_CONTACT_CONTACT_EVENT, &msg, false) != 0)
+    if (at_send(proc, AT_MAIN_QUEUE, &msg, "a first-contact event", "the app",
+                AT_SEND_NOW, NULL, NULL, 0) != 0)
         log_debug(proc->logger,
-                  "Identity: first contact: no main queue for event %d\n", m->kind);
+                  "Identity: first contact: could not hand the app event %d\n", m->kind);
 }
 
 void at_fc_emit_event(const process_t *proc, int32_t kind, const char *ref,
@@ -2890,9 +2895,10 @@ void at_fc_emit_sibling(const process_t *proc, int32_t kind, const char *ref,
     m->data.added_at = added_at;
     m->data.peer_dropped = dropped;
     m->data.count = count;
-    if (messaging_send(AT_MAIN_QUEUE, FIRST_CONTACT_CONTACT_EVENT, &msg, false) != 0)
+    if (at_send(proc, AT_MAIN_QUEUE, &msg, "a first-contact event", "the app",
+                AT_SEND_NOW, NULL, NULL, 0) != 0)
         log_debug(proc->logger,
-                  "Identity: first contact: no main queue for event %d\n", kind);
+                  "Identity: first contact: could not hand the app event %d\n", kind);
 }
 
 void at_fc_send_route_hints(const uuid_t uuid, const char *const *hints, size_t n)

@@ -218,12 +218,28 @@ A feature's handlers reach identity's state only through the services
 feature keeps its own state behind its own lock.
 
 A send through these helpers returns 0 when the frame was sent **or kept**: a
-queue still full after 200 ms has the frame retried on the identity tick for up
+queue still full after 200 ms has the frame retried on the process tick for up
 to 30 s (ISSUES §2.40). A feature that may act only once the frame is really
 out, such as one that stages a bilateral score, passes an on-sent callback to
 `identity_send_to_then`. The callback is told once, `sent` true or false, for
 every 0 returned. It runs with no retry-list lock held, so it may send in turn,
 and it must take its own lock for any state it touches.
+
+The same mechanism serves every process, so a feature that runs its own
+process (fleet, ZTA, the data source) or code in the network process (first
+contact's and rendezvous's network halves) sends one-shots through `at_send`
+(`utilities/send_retry.h`), which the identity helpers wrap.
+- `AT_SEND_NOW` makes one try and then keeps the frame. Use it on a receiver
+  thread, while holding a lock, or inside a burst such as a roster replay,
+  where a 200 ms sleep per frame would stall.
+- The list is drained in `sleep_until`, which every process loop calls once a
+  tick, so a feature's process needs no drain of its own.
+- A frame can be kept if it is a plain-data core type, a TASK_RESULT, or a
+  registered type with no `to_proto`, meaning a fixed raw copy (plain data by
+  construction). A registered type with its own serializer may own pointers,
+  so it is refused, and its loss is reported as before.
+- Chatter that a later tick re-sends anyway stays a bare `messaging_send`,
+  with a `Bare on purpose` comment saying what re-sends it.
 
 ## Transports and processes
 
