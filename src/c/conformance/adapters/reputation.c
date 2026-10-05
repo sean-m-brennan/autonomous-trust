@@ -121,6 +121,10 @@ typedef struct {
      * uuids and mapped back to participant ids at check time. */
     char app_roster[SCE_MAX_PARTICIPANTS][UUID_STRING_LEN + 1];
     int  app_roster_n;
+    /* Ordinary halves held, and how many carry a commit certificate
+     * (doc/architecture/reputation.md, "Commit certificates"). */
+    int halves_held;
+    int certified_halves;
 } rp_snap_t;
 static rp_snap_t g_snaps[SCE_MAX_PARTICIPANTS];
 
@@ -408,6 +412,18 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
         setenv("AT_SLASH_ENABLED", "1", 1);
     else
         unsetenv("AT_SLASH_ENABLED");
+
+    /* commit_certificates: true -- the cohort's group declares commit
+     * certificates (doc/architecture/reputation.md). Group-carried, so it is
+     * set on the target's group on every install, and cleared when absent.
+     * Mirrors the Python adapter setting it on the shared Group. */
+    {
+        sce_participant_t *tp = sce_find_participant(ctx, target_id);
+        rp_impl_t *ti = tp ? (rp_impl_t *)tp->impl : NULL;
+        if (ti != NULL && ti->proc != NULL)
+            ti->proc->protocol.group.commit_certificates =
+                json_is_true(json_object_get(g_fixtures, "commit_certificates"));
+    }
 
     /* requests: { "<pid>": [[id1, id2], ...] } — pre-stage granted Paxos
      * rounds (so handle_transaction's paxos_has_granted_id check passes). */
@@ -889,6 +905,36 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_object_set_new(body, "id1", json_integer(id1));
         json_object_set_new(body, "id2", json_integer(id2));
         json_object_set_new(body, "peer_uuid", json_string(proposer_str));
+        /* signed: true -- an acceptance in a group that declares commit
+         * certificates carries the acceptor's real signature over the half's
+         * commit_designation (doc/architecture/reputation.md, "Commit certificates"), as handle_transaction
+         * writes it. This engine REBUILDS a propagated message from the step
+         * rather than re-delivering it, so the step states task_id and score
+         * and the signature is made here by the sender's key. Gated on the
+         * key, so every other acceptance keeps its historical shape. */
+        if (strcmp(function, REP_PROTO_ACCEPTED) == 0 && payload != NULL
+            && json_is_true(json_object_get(payload, "signed"))
+            && proposer_uuid != NULL)
+        {
+            const char *slug = json_string_value(json_object_get(payload, "task_id"));
+            json_t *s_j = json_object_get(payload, "score");
+            double sc = json_is_number(s_j) ? json_number_value(s_j) : 1.0;
+            const char *chan = json_string_value(json_object_get(payload, "channel"));
+            if (slug != NULL)
+            {
+                uuid_t task_uuid;
+                _uuid5("tx:", slug, task_uuid);
+                char task_str[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(task_uuid, task_str);
+                json_object_set_new(body, "task_uuid", json_string(task_str));
+                uint8_t desig[512];
+                size_t dlen = commit_designation(*proposer_uuid, task_uuid, sc,
+                                                 chan, desig, sizeof(desig));
+                char sig_hex[RP_SIG_HEX_LEN + 1] = {0};
+                if (_rp_sign_hex(sender_impl, desig, dlen, sig_hex) == 0)
+                    json_object_set_new(body, "sig", json_string(sig_hex));
+            }
+        }
     }
     else if (strcmp(function, REP_PROTO_GRANT) == 0)
     {
@@ -929,6 +975,9 @@ static int _build_inbound(sce_run_ctx_t *ctx,
          * "task outcome" -- so every pre-channel scenario keeps its meaning. */
         if (channel)
             json_object_set_new(body, "channel", json_string(channel));
+        /* A proposer in a declaring group asks for certification. */
+        if (payload && json_is_true(json_object_get(payload, "certify")))
+            json_object_set_new(body, "certify", json_true());
         if (task_slug)
         {
             uuid_t task_uuid;
@@ -970,6 +1019,27 @@ static int _build_inbound(sce_run_ctx_t *ctx,
             char task_str[UUID_STRING_LEN + 1];
             uuid_unparse_lower(task_uuid, task_str);
             json_object_set_new(body, "task_uuid", json_string(task_str));
+            /* A commit certificate (doc/architecture/reputation.md, "Commit certificates"): real signatures
+             * over commit_designation by `cosigners`, or all by `forged_by`.
+             * Only when the scenario names one, so every other commit is
+             * unchanged. Mirrors the Python adapter. */
+            if (proposer_uuid != NULL
+                && (json_object_get(payload, "cosigners") != NULL
+                    || json_object_get(payload, "forged_by") != NULL))
+            {
+                /* certified_score: cut over a DIFFERENT score than the one
+                 * committed (the binding's negative control). */
+                json_t *cs_j = json_object_get(payload, "certified_score");
+                double cert_score = json_is_number(cs_j)
+                    ? json_number_value(cs_j) : score;
+                uint8_t desig[512];
+                size_t dlen = commit_designation(*proposer_uuid, task_uuid,
+                                                 cert_score, channel, desig,
+                                                 sizeof(desig));
+                json_object_set_new(body, "certificate",
+                                    _rp_cosignatures(ctx, payload, desig,
+                                                     dlen, NULL));
+            }
         }
     }
     else if (strcmp(function, REP_PROTO_OUTDATED) == 0)
@@ -1017,6 +1087,39 @@ static int _build_inbound(sce_run_ctx_t *ctx,
             }
             json_t *arr = NULL;
             tx_history_era_to_json(&tmp, 0, tx_history_len(&tmp), &arr);
+            /* certified_by: [ids] on a chain entry certifies both its halves
+             * with those participants' signatures (doc/architecture/reputation.md, "Commit certificates").
+             * era_to_json emits committed entries in the spec's order. */
+            for (size_t ai = 0; arr != NULL && ai < json_array_size(arr)
+                                && ai < json_array_size(spec); ai++)
+            {
+                json_t *spec_e = json_array_get(spec, ai);
+                json_t *by = json_object_get(spec_e, "certified_by");
+                if (!json_is_array(by))
+                    continue;
+                json_t *ae = json_array_get(arr, ai);
+                const char *task = json_string_value(json_object_get(spec_e, "task"));
+                uuid_t tk, pu[2];
+                _uuid5("chain:", task, tk);
+                _chain_half_uuid(ctx, spec_e, 1, task, pu[0]);
+                _chain_half_uuid(ctx, spec_e, 2, task, pu[1]);
+                double ps[2] = { json_number_value(json_object_get(spec_e, "p1")),
+                                 json_number_value(json_object_get(spec_e, "p2")) };
+                json_t *named = json_pack("{s:O}", "cosigners", by);
+                json_t *all = json_object();
+                for (int k = 0; k < 2; k++)
+                {
+                    uint8_t desig[512];
+                    size_t dlen = commit_designation(pu[k], tk, ps[k], NULL,
+                                                     desig, sizeof(desig));
+                    char su[UUID_STRING_LEN + 1];
+                    uuid_unparse_lower(pu[k], su);
+                    json_object_set_new(all, su, _rp_cosignatures(ctx, named, desig,
+                                                                  dlen, NULL));
+                }
+                json_object_set_new(ae, "commit_sigs", all);
+                json_decref(named);
+            }
             json_t *tamper = payload ? json_object_get(payload, "tamper") : NULL;
             if (arr != NULL && tamper != NULL && json_is_true(tamper)
                 && json_array_size(arr) >= 2)
@@ -1513,6 +1616,7 @@ static int _dispatch(sce_run_ctx_t *ctx,
     {
         s->chain_len     = reputation_get_chain_len();
         s->committed_tx_count = reputation_get_committed_tx_count();
+        reputation_get_commit_cert_counts(&s->halves_held, &s->certified_halves);
         reputation_get_window_root(s->window_root);
         reputation_get_checkpoint_root(s->checkpoint_root);
         s->cosigns_parked = (int)reputation_parked_cosign_count();
@@ -1614,6 +1718,19 @@ static int _check_expected_state(sce_run_ctx_t *ctx)
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: history_len=%d, expected %d",
                              pid, snap->chain_len, want);
+                    return -1;
+                }
+            }
+            else if (strcmp(key, "halves_held") == 0
+                     || strcmp(key, "certified_halves") == 0)
+            {
+                bool held = strcmp(key, "halves_held") == 0;
+                int have = held ? snap->halves_held : snap->certified_halves;
+                int want = (int)json_integer_value(val);
+                if (have != want)
+                {
+                    snprintf(ctx->err, sizeof(ctx->err), "%s: %s=%d, expected %d",
+                             pid, key, have, want);
                     return -1;
                 }
             }

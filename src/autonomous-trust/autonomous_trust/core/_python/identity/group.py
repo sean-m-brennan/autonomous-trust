@@ -33,7 +33,8 @@ class Group(InitializableConfig):
     _msg_class = identity_pb2.Group
 
     def __init__(self, _uuid, _address_map, _nickname, _encryptor, _public_only=True,
-                 _created=0.0, _key_epoch=0, _previous_keys=None, _wire_format=None):
+                 _created=0.0, _key_epoch=0, _previous_keys=None, _wire_format=None,
+                 _commit_certificates=False):
         super().__init__(identity_pb2.Group)
         self._uuid = str(_uuid)
         self._address_map = _address_map
@@ -98,6 +99,15 @@ class Group(InitializableConfig):
             # reading would cost more than it protects. Same discipline as
             # zta_policy.binding_mode falling back to `require`.
             self._wire_format = NetWireFormat.json
+        # Whether this group's members REQUIRE a quorum certificate on an
+        # ordinary reputation commit (doc/architecture/reputation.md, "Commit
+        # certificates"). Group-carried for the reason wire_format is: a
+        # receiver that requires one refuses commits a receiver that does not
+        # would write, so two members that disagreed would fork their chains.
+        # A joiner adopts its group's value; AT_COMMIT_CERTIFICATES only stamps
+        # a group this node mints. Absent -> False, which is every group minted
+        # before this existed.
+        self._commit_certificates = bool(_commit_certificates)
 
     def to_dict(self):
         # `_previous_keys` is process-local grace-window state, not part of the
@@ -142,6 +152,15 @@ class Group(InitializableConfig):
         Group unpickled or decoded from a config written before this field
         existed has no attribute at all, and every such group is JSON."""
         return getattr(self, '_wire_format', NetWireFormat.json)
+
+    @property
+    def commit_certificates(self) -> bool:
+        """Do this group's members require a quorum certificate on every
+        ordinary reputation commit? ``getattr`` with a default for the same
+        reason as :attr:`wire_format`: a group decoded from a config written
+        before the field existed has no attribute, and every such group does
+        not."""
+        return bool(getattr(self, '_commit_certificates', False))
 
     #: How long a superseded key still decrypts, and how many are kept. A
     #: rotation propagates as fast as one message to each member, so this is
@@ -347,6 +366,10 @@ class Group(InitializableConfig):
         # new group, which is precisely the split a group-carried format exists
         # to prevent.
         self._wire_format = other.wire_format
+        # Likewise the commit-certificate declaration: it is a property of the
+        # cohort, and an absorbed node that kept its own would refuse (or
+        # accept) commits the rest of its new group does not.
+        self._commit_certificates = other.commit_certificates
 
     def encrypt(self, msg, whom, nonce=None):
         """
@@ -398,7 +421,8 @@ class Group(InitializableConfig):
         # GROUP, not of holding its private key, and a member handed a
         # public-only view still has to know which envelope the cohort speaks.
         return Group(self.uuid, self.addresses, self.nickname, Encryptor(self.encryptor.publish(), True), True,
-                     _wire_format=self.wire_format)
+                     _wire_format=self.wire_format,
+                     _commit_certificates=self.commit_certificates)
 
     def sync_to_message(self):
         self.message.uuid = str(self._uuid).encode('utf-8')
@@ -416,6 +440,11 @@ class Group(InitializableConfig):
         self.message.wire_format = (identity_pb2.NET_WIRE_PROTO
                                     if self.wire_format == NetWireFormat.proto
                                     else identity_pb2.NET_WIRE_JSON)
+        # False is the proto3 default, so a group that does not declare it
+        # encodes to the bytes it did before this field existed. Guarded for
+        # generated code that predates the field.
+        if 'commit_certificates' in self.message.DESCRIPTOR.fields_by_name:
+            self.message.commit_certificates = self.commit_certificates
         self._encryptor.sync_to_message()
         self.message.encryptor.CopyFrom(self._encryptor.message)
 
@@ -433,6 +462,8 @@ class Group(InitializableConfig):
         self._wire_format = (NetWireFormat.proto
                              if self.message.wire_format == identity_pb2.NET_WIRE_PROTO
                              else NetWireFormat.json)
+        self._commit_certificates = bool(
+            getattr(self.message, 'commit_certificates', False))
         self._nickname = ''
         self._public_only = True
         # Reconstruct nested Encryptor
@@ -456,7 +487,7 @@ class Group(InitializableConfig):
         seed = self.encryptor.serialize() if owns_private else self.encryptor.publish()
         if isinstance(seed, bytes):
             seed = seed.decode('ascii')
-        return {
+        out = {
             'typename': 'group',
             'uuid': str(self._uuid),
             'address': next(iter(addr_map.values()), ''),
@@ -477,6 +508,12 @@ class Group(InitializableConfig):
             # the same message, from the member that admitted us.
             'wire_format': self.wire_format,
         }
+        # Commit-certificate declaration: emitted ONLY when set, so a group that
+        # does not declare it keeps the bytes it had before the field existed
+        # (every byte-pinned group form in the corpus). Absent reads as False.
+        if self.commit_certificates:
+            out['commit_certificates'] = True
+        return out
 
     @staticmethod
     def from_canonical(d):
@@ -495,7 +532,8 @@ class Group(InitializableConfig):
                      _key_epoch=int(d.get('key_epoch', 0) or 0),
                      # Absent -> json (the constructor's default), which is both
                      # what an older peer means and the safe reading (doc/architecture/network-wire-format.md).
-                     _wire_format=d.get('wire_format'))
+                     _wire_format=d.get('wire_format'),
+                     _commit_certificates=d.get('commit_certificates') is True)
 
     @staticmethod
     def initialize(address_map, our_nickname):
@@ -503,7 +541,7 @@ class Group(InitializableConfig):
         # Stamp a real creation epoch (doc/architecture/identity-protocol.md) so a group minted here carries a
         # comparable age for the merge tiebreaker. now() is the NTP-adjusted
         # clock (autonomous_trust.core.system.now).
-        from ..system import now, resolve_net_wire_mode
+        from ..system import now, resolve_net_wire_mode, resolve_commit_certificates
         created = now().timestamp()
         # AT_NET_WIRE_MODE applies HERE and only here: this is the one moment a
         # node decides a format rather than adopting one. Every other group this
@@ -511,9 +549,12 @@ class Group(InitializableConfig):
         # (doc/architecture/network-wire-format.md), so an operator stands up a proto cohort by setting the knob on
         # whichever node forms the group.
         wire_format, _src = resolve_net_wire_mode()
+        # The commit-certificate declaration likewise: decided here, adopted
+        # everywhere else.
         return Group(uuid_mod.uuid4(), address_map, our_nickname,
                      Encryptor.generate(), False, _created=created,
-                     _wire_format=wire_format)
+                     _wire_format=wire_format,
+                     _commit_certificates=resolve_commit_certificates())
 
 
 class ChildGroupSet(object):

@@ -143,4 +143,9 @@ message Group {
   // joiner adopts this at admission, and AT_NET_WIRE_MODE only stamps a group
   // its node MINTS. Absent/0 = json.
   NetWireFormat wire_format = 6;
+  // Whether this group's members require a quorum certificate on every
+  // ordinary reputation commit (doc/architecture/reputation.md, "Commit
+  // certificates"). Group-carried for the reason wire_format is; absent/false
+  // = not required, which is every group minted before this field.
+  bool commit_certificates = 7;
 }

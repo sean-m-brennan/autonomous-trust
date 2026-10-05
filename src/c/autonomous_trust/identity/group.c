@@ -14,7 +14,9 @@
  *   limitations under the License.
  *******************/
 
+#include <ctype.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <errno.h>
@@ -39,6 +41,9 @@ int group_init(uuid_t *uuid, char *address, group_t *group)
     strncpy(group->address, address, ADDR_LEN);
     group->address[ADDR_LEN] = '\0';   /* strncpy does not terminate when src is >= ADDR_LEN */
     map_init(&group->address_map);
+    /* Explicit rather than left to zeroed storage: a group initialized here
+     * has declared nothing, whatever memory it was handed. */
+    group->commit_certificates = false;
     unsigned char *eseed = encryptor_generate();
     if (eseed == NULL)
         return -1;
@@ -259,6 +264,27 @@ int group_add_address(group_t *group, const char *uuid_str, const char *address)
     return map_set(&group->address_map, (map_key_t)uuid_str, addr_data);
 }
 
+/* Frama-C: skipped — [env] getenv */
+bool group_commit_certificates_resolve(void)
+{
+    const char *raw = getenv("AT_COMMIT_CERTIFICATES");
+    if (raw == NULL)
+        return false;
+    char norm[8];
+    size_t n = 0;
+    for (const char *c = raw; *c != '\0'; c++)
+    {
+        if (*c == ' ' || *c == '\t')
+            continue;
+        if (n + 1 >= sizeof(norm))
+            return false;   /* longer than any truthy spelling */
+        norm[n++] = (char)tolower((unsigned char)*c);
+    }
+    norm[n] = '\0';
+    return strcmp(norm, "1") == 0 || strcmp(norm, "true") == 0
+        || strcmp(norm, "yes") == 0 || strcmp(norm, "on") == 0;
+}
+
 /* Frama-C: skipped — [serialization] jansson JSON serialization */
 /* The envelope format this group speaks to `address`
  * (doc/architecture/network-wire-format.md).
@@ -373,6 +399,12 @@ int group_to_json(const void *data_struct, json_t **obj_ptr)
      * predates it stays compatible. */
     json_object_set_new(obj, "wire_format",
                         json_string(net_wire_format_name(ident->wire_format)));
+    /* The commit-certificate declaration, emitted ONLY when set, so a group
+     * that does not declare it keeps the bytes it had before the field existed
+     * (every byte-pinned group form in the corpus). Mirrors Python
+     * to_canonical. */
+    if (ident->commit_certificates)
+        json_object_set_new(obj, "commit_certificates", json_true());
 
     return 0;
 }
@@ -447,6 +479,9 @@ int group_from_json(const json_t *obj, void *data_struct)
      * the format every node can read rather than fail the load. */
     const char *wf = json_string_value(json_object_get(obj, "wire_format"));
     group->wire_format = net_wire_format_from_name(wf);
+    /* Only a literal true turns it on, as Python's from_canonical reads it. */
+    group->commit_certificates =
+        json_is_true(json_object_get(obj, "commit_certificates"));
     return 0;
 }
 
@@ -464,6 +499,8 @@ int group_sync_out(group_t *group, AutonomousTrust__Core__Protobuf__Identity__Gr
     proto->wire_format = (group->wire_format == NET_WIRE_PROTO)
         ? AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__NET_WIRE_FORMAT__NET_WIRE_PROTO
         : AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__NET_WIRE_FORMAT__NET_WIRE_JSON;
+    /* false is the proto3 default: an undeclared group's bytes are unchanged. */
+    proto->commit_certificates = group->commit_certificates;
 
     /* Full address_map (doc/architecture/identity-protocol.md) as a proto3 map (repeated key/value entries).
      * Keys/values are SHARED with group->address_map: group_to_proto packs
@@ -540,6 +577,7 @@ int group_sync_in(AutonomousTrust__Core__Protobuf__Identity__Group *proto, group
     group->wire_format =
         (proto->wire_format == AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__NET_WIRE_FORMAT__NET_WIRE_PROTO)
         ? NET_WIRE_PROTO : NET_WIRE_JSON;
+    group->commit_certificates = proto->commit_certificates != 0;
 
     /* Rebuild the full address_map (doc/architecture/identity-protocol.md). proto_to_group deserializes into a
      * fresh (zeroed) group, so initialise the map before populating it. */

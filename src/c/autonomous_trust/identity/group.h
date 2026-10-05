@@ -79,6 +79,15 @@ typedef struct
      * consumer built against the older header misreads only this one rather
      * than everything after it. */
     net_wire_format_t wire_format;
+    /* Whether this group's members REQUIRE a quorum certificate on every
+     * ordinary reputation commit (doc/architecture/reputation.md, "Commit
+     * certificates"). Group-carried for the reason wire_format is: members
+     * that disagreed would write different commits and fork their chains.
+     * Rides group_to_json as "commit_certificates" (emitted only when true)
+     * and identity.proto Group.commit_certificates. false == group_init's
+     * zeroed struct == every group predating the field. Mirrors Python
+     * Group.commit_certificates. Last, for the reason wire_format is. */
+    bool commit_certificates;
 } group_t;
 
 /**
@@ -213,6 +222,17 @@ bool group_accept_rotation(group_t *group, const group_t *other);
  * @param address Peer address; NULL or empty yields NET_WIRE_JSON.
  * @return The format to encode in.
  */
+/**
+ * @brief Whether a group this node MINTS requires commit certificates:
+ *        AT_COMMIT_CERTIFICATES, default off.
+ *
+ * Stamps a new group and nothing else; an existing group's members read the
+ * declaration off the group. "1", "true", "yes" and "on" (trimmed, any case)
+ * turn it on; anything else, or unset, leaves it off. Mirrors Python
+ * resolve_commit_certificates.
+ */
+bool group_commit_certificates_resolve(void);
+
 net_wire_format_t group_wire_format_for_address(const group_t *group,
                                                 const char *address);
 

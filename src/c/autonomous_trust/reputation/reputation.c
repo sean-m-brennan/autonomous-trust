@@ -442,10 +442,13 @@ int tx_history_init(tx_history_t *hist)
     if (err != 0) return err;
     err = map_init(&hist->attest_certs);
     if (err != 0) return err;
+    err = map_init(&hist->commit_certs);
+    if (err != 0) return err;
     return map_init(&hist->evicted_set);
 }
 
 static void tx_history_evict_oldest(tx_history_t *hist);
+static void _drop_commit_certs(tx_history_t *hist, const transaction_t *tx);
 
 /* Append `slot` to peer_map[peer_uuid]'s index list, creating the list on
  * first sight. Factored out of tx_history_update so the LOADERS
@@ -607,6 +610,8 @@ static void tx_history_evict_oldest(tx_history_t *hist)
     map_remove(&hist->task_map, task_str);
     if (evicted.attested)
         map_remove(&hist->attest_certs, task_str);
+    else
+        _drop_commit_certs(hist, &evicted);
 
     /* 1a. Push the evicted task_uuid onto the tombstone ring. If the
      * ring is full, the displaced key must first be removed from
@@ -1020,6 +1025,152 @@ const char *tx_history_attest_cert(const tx_history_t *hist, const uuid_t task_u
     return text;
 }
 
+/****************************
+ * Commit certificates (doc/architecture/reputation.md)
+ ****************************/
+
+size_t commit_designation(const uuid_t scorer, const uuid_t task, double score,
+                          const char *channel, uint8_t *out, size_t cap)
+{
+    static const char tag[] = "AT-COMMIT";
+    size_t tag_len = sizeof(tag);   /* includes the NUL separator */
+    if (out == NULL || cap <= tag_len)
+        return 0;
+    char s_str[UUID_STRING_LEN + 1];
+    char t_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(scorer, s_str);
+    uuid_unparse_lower(task, t_str);
+    int n = snprintf((char *)out + tag_len, cap - tag_len, "%s|%s|%.17g|%s",
+                     s_str, t_str, score, tx_channel_or_default(channel));
+    if (n < 0 || (size_t)n >= cap - tag_len)
+        return 0;
+    memcpy(out, tag, tag_len);
+    return tag_len + (size_t)n;
+}
+
+static void _commit_cert_key(const uuid_t task, const uuid_t scorer,
+                             char out[2 * UUID_STRING_LEN + 2])
+{
+    char t_str[UUID_STRING_LEN + 1];
+    char s_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(task, t_str);
+    uuid_unparse_lower(scorer, s_str);
+    snprintf(out, 2 * UUID_STRING_LEN + 2, "%s|%s", t_str, s_str);
+}
+
+/* Does @p tx hold an ordinary half scored by @p scorer? */
+static bool _holds_half(const transaction_t *tx, const uuid_t scorer)
+{
+    if (tx->attested)
+        return false;
+    return (tx->p1_set && uuid_compare(tx->p1_uuid, scorer) == 0)
+        || (tx->p2_set && uuid_compare(tx->p2_uuid, scorer) == 0);
+}
+
+static int _slot_of_task(const tx_history_t *hist, const uuid_t task);
+
+int tx_history_attach_commit_cert(tx_history_t *hist, const uuid_t task,
+                                  const uuid_t scorer, const char *cert_json)
+{
+    if (hist == NULL || cert_json == NULL || cert_json[0] == '\0')
+        return -1;
+    int slot = _slot_of_task(hist, task);
+    if (slot < 0 || !_holds_half(&hist->chain[slot], scorer))
+        return -1;
+    char key[2 * UUID_STRING_LEN + 2];
+    _commit_cert_key(task, scorer, key);
+    return map_set(&hist->commit_certs, (map_key_t)key,
+                   string_data((string_t)cert_json, strlen(cert_json)));
+}
+
+const char *tx_history_commit_cert(const tx_history_t *hist, const uuid_t task,
+                                   const uuid_t scorer)
+{
+    if (hist == NULL)
+        return NULL;
+    char key[2 * UUID_STRING_LEN + 2];
+    _commit_cert_key(task, scorer, key);
+    data_t *d = NULL;
+    if (map_get((map_t *)&hist->commit_certs, key, &d) != 0 || d == NULL)
+        return NULL;
+    char *text = NULL;
+    if (data_string_ptr(d, &text) != 0)
+        return NULL;
+    return text;
+}
+
+/* Forget both halves' certificates of @p tx (eviction, or a fork dropping it). */
+static void _drop_commit_certs(tx_history_t *hist, const transaction_t *tx)
+{
+    char key[2 * UUID_STRING_LEN + 2];
+    if (tx->p1_set)
+    {
+        _commit_cert_key(tx->task_uuid, tx->p1_uuid, key);
+        map_remove(&hist->commit_certs, key);
+    }
+    if (tx->p2_set)
+    {
+        _commit_cert_key(tx->task_uuid, tx->p2_uuid, key);
+        map_remove(&hist->commit_certs, key);
+    }
+}
+
+/* {scorer: {voter: sig}} for @p tx's halves, or NULL when it holds none. The
+ * key is "commit_sigs" on the catch-up wire and in the evidence document, as
+ * in Python. Caller owns the reference. */
+static json_t *_commit_sigs_json(const tx_history_t *hist, const transaction_t *tx)
+{
+    if (tx->attested)
+        return NULL;
+    json_t *out = NULL;
+    const uuid_t *scorers[2] = { tx->p1_set ? &tx->p1_uuid : NULL,
+                                 tx->p2_set ? &tx->p2_uuid : NULL };
+    for (int k = 0; k < 2; k++)
+    {
+        if (scorers[k] == NULL)
+            continue;
+        const char *cert = tx_history_commit_cert(hist, tx->task_uuid, *scorers[k]);
+        json_t *cj = cert != NULL ? json_loads(cert, 0, NULL) : NULL;
+        if (!json_is_object(cj) || json_object_size(cj) == 0)
+        {
+            json_decref(cj);
+            continue;
+        }
+        if (out == NULL)
+            out = json_object();
+        char s_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(*scorers[k], s_str);
+        json_object_set_new(out, s_str, cj);
+    }
+    return out;
+}
+
+/* Attach the "commit_sigs" an entry @p obj carries to the half it names in
+ * @p hist. The caller verified them (catch-up) or wrote them (evidence). */
+static void _commit_sigs_from_json(tx_history_t *hist, const json_t *obj,
+                                   const char *task_key)
+{
+    json_t *all = json_object_get((json_t *)obj, "commit_sigs");
+    const char *task_str = json_string_value(json_object_get((json_t *)obj, task_key));
+    uuid_t task;
+    if (!json_is_object(all) || task_str == NULL || uuid_parse(task_str, task) != 0)
+        return;
+    const char *scorer_str = NULL;
+    json_t *sigs = NULL;
+    json_object_foreach(all, scorer_str, sigs)
+    {
+        uuid_t scorer;
+        if (!json_is_object(sigs) || uuid_parse(scorer_str, scorer) != 0)
+            continue;
+        char *text = json_dumps(sigs, JSON_COMPACT | JSON_SORT_KEYS);
+        if (text != NULL)
+        {
+            (void)tx_history_attach_commit_cert(hist, task, scorer, text);
+            free(text);
+        }
+    }
+}
+
 /* Frama-C: skipped — [solver-timeout] map lookup preconditions */
 int tx_history_by_task(const tx_history_t *hist, const uuid_t task_uuid, transaction_t *out)
 {
@@ -1128,6 +1279,7 @@ void tx_history_free(tx_history_t *hist)
     map_free(&hist->peer_map);
     map_free(&hist->evicted_set);
     map_free(&hist->attest_certs);
+    map_free(&hist->commit_certs);
     hist->chain_len = 0;
     hist->committed_count = 0;
     hist->next_index = 0;
@@ -1261,6 +1413,11 @@ int tx_history_era_to_json(const tx_history_t *hist, int start_idx, int end_idx,
             else
                 json_decref(cj);
         }
+        /* Commit certificates, omitted when none: an undeclared group's
+         * entries go on the wire as they always did. */
+        json_t *commit_sigs = _commit_sigs_json(hist, tx);
+        if (commit_sigs != NULL)
+            json_object_set_new(obj, "commit_sigs", commit_sigs);
         json_array_append_new(arr, obj);
         committed_seen++;
     }
@@ -1611,10 +1768,22 @@ int tx_history_reconcile_attested(tx_history_t *hist, const json_t *arr,
                                  : TX_RECONCILE_NONE;
 done:
     free(seg);
-    /* An attested entry that came in keeps its certificate (the caller
-     * checked it before reconciling). */
+    /* A dropped entry's commit certificates go with it, even when the peer's
+     * copy of the same task comes back below: the peer's halves may carry
+     * different scores, and only the peer's own certificates fit them. */
+    for (int di = 0; di < res.dropped && res.dropped_entries != NULL; di++)
+        if (!res.dropped_entries[di].attested)
+            _drop_commit_certs(hist, &res.dropped_entries[di]);
+    /* An attested entry that came in keeps its certificate, and an ordinary
+     * one its commit certificates (the caller checked them before
+     * reconciling). */
     if (res.status == TX_RECONCILE_ADOPTED || res.status == TX_RECONCILE_EXTENDED)
     {
+        size_t ci;
+        json_t *co;
+        json_array_foreach((json_t *)arr, ci, co)
+            if (!json_is_true(json_object_get(co, "attested")))
+                _commit_sigs_from_json(hist, co, "task");
         size_t ai;
         json_t *ao;
         json_array_foreach((json_t *)arr, ai, ao)
@@ -1758,6 +1927,11 @@ int reputation_evidence_to_json(const tx_history_t *hist,
             else
                 json_decref(cj);
         }
+        /* Commit certificates of ordinary halves, additive and omitted when
+         * absent. Mirrors Python evidence_to_dict. */
+        json_t *commit_sigs = _commit_sigs_json(hist, tx);
+        if (commit_sigs != NULL)
+            json_object_set_new(obj, "commit_sigs", commit_sigs);
         json_array_append_new(chain, obj);
     }
 
@@ -1931,11 +2105,15 @@ int reputation_evidence_from_json(const json_t *doc, tx_history_t *hist_out,
         _history_load_committed(hist_out, &staged[i]);
     free(staged);
 
-    /* Attested entries keep their quorum certificates across a restart. */
+    /* Attested entries keep their quorum certificates across a restart, and
+     * ordinary halves their commit certificates. */
     json_array_foreach(chain, idx, obj)
     {
         if (!json_is_true(json_object_get(obj, "attested")))
+        {
+            _commit_sigs_from_json(hist_out, obj, "task_id");
             continue;
+        }
         json_t *sigs = json_object_get(obj, "attest_sigs");
         const char *task_str = json_string_value(json_object_get(obj, "task_id"));
         uuid_t tk;
