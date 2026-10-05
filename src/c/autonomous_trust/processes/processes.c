@@ -30,6 +30,7 @@
 
 #define PROCESSES_IMPL
 #include "processes/processes.h"
+#include "utilities/send_retry.h"
 // #include "protobuf/processes.pb-c.h"
 #include "config/configuration.h"
 #include "structures/map.h"
@@ -474,6 +475,11 @@ void sleep_until(const process_t *proc, long how_long)
 {
     struct timeval now;
     gettimeofday(&now, NULL);
+
+    /* Every process's tick passes here, so it is where the one-shot frames a
+     * full queue refused are retried (utilities/send_retry.h, ISSUES §2.40 /
+     * §2.14): one try each, oldest first, until they land or age out. */
+    at_send_retry_drain(proc, NULL, (double)now.tv_sec);
 
     long delta = how_long - timeval_subtract(&now, (struct timeval *)&proc->start);
     if (delta > 0)

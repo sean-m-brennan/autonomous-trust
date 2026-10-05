@@ -32,13 +32,18 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <sys/time.h>
 
 #include <uuid/uuid.h>
 
 #include "identity/id_proc_priv.h"
-#include "identity/id_send_retry.h"
+#include "utilities/send_retry.h"
 #include "utilities/message.h"
 #include "utilities/msg_types.h"
+#include "utilities/msg_registry.h"
+#include "processes/processes.h"
+#include "network/net_message.h"
+#include "network/net_proc_priv.h"
 
 static char FN_DM[] = "peer_dm";
 
@@ -50,11 +55,13 @@ static char   g_seen_queue[SEEN_MAX][PROC_NAME_LEN + 1];
 static char   g_seen_fn[SEEN_MAX][32];
 static char   g_seen_obj[SEEN_MAX][64];
 static double g_seen_score[SEEN_MAX];
+static size_t g_tries;     /* every send the hook saw, refused or not */
 
 static int _hook(const char *key, const message_type_t type,
                  generic_msg_t *msg, bool blocking)
 {
     (void)blocking;
+    g_tries++;
     if (g_hard)
         return EPIPE;
     if (g_refuse)
@@ -71,6 +78,13 @@ static int _hook(const char *key, const message_type_t type,
             g_seen_obj[g_seen][n] = '\0';
         } else if (type == TRANSACTION_SCORE) {
             g_seen_score[g_seen] = msg->info.tx_score.score;
+        } else if (type == TASK_RESULT) {
+            const task_result_msg_t *tr = &msg->info.task_result;
+            size_t n = tr->result_len < sizeof(g_seen_obj[0]) - 1
+                           ? tr->result_len : sizeof(g_seen_obj[0]) - 1;
+            if (tr->result_data != NULL)
+                memcpy(g_seen_obj[g_seen], tr->result_data, n);
+            g_seen_obj[g_seen][n] = '\0';
         }
     }
     g_seen++;
@@ -79,9 +93,10 @@ static int _hook(const char *key, const message_type_t type,
 
 static void _begin(void)
 {
-    id_send_retry_reset();
+    at_send_retry_reset();
     g_refuse = g_hard = false;
     g_seen = 0;
+    g_tries = 0;
     memset(g_seen_queue, 0, sizeof(g_seen_queue));
     memset(g_seen_fn, 0, sizeof(g_seen_fn));
     memset(g_seen_obj, 0, sizeof(g_seen_obj));
@@ -91,7 +106,7 @@ static void _begin(void)
 static void _end(void)
 {
     messaging_set_test_hook(NULL);
-    id_send_retry_reset();
+    at_send_retry_reset();
 }
 
 /* A DM-shaped frame whose payload is a fresh malloc, as every sender's is. */
@@ -131,23 +146,23 @@ DEFINE_TEST(test_a_refused_frame_is_kept_and_lands_intact)
     g_refuse = true;
     ck_assert_int_eq(identity_send_to_network(NULL, &dm, "a direct message", "bob"), 0);
     _free_dm(&dm);
-    ck_assert_int_eq((int)id_send_retry_pending("network"), 1);
+    ck_assert_int_eq((int)at_send_retry_pending("network"), 1);
     ck_assert_int_eq((int)g_seen, 0);
 
     /* Still full on the next tick: kept, not dropped. */
-    ck_assert_int_eq((int)id_send_retry_drain(NULL, NULL, _now()), 0);
-    ck_assert_int_eq((int)id_send_retry_pending("network"), 1);
+    ck_assert_int_eq((int)at_send_retry_drain(NULL, NULL, _now()), 0);
+    ck_assert_int_eq((int)at_send_retry_pending("network"), 1);
 
     g_refuse = false;
-    ck_assert_int_eq((int)id_send_retry_drain(NULL, NULL, _now()), 1);
+    ck_assert_int_eq((int)at_send_retry_drain(NULL, NULL, _now()), 1);
     ck_assert_int_eq((int)g_seen, 1);
     ck_assert_str_eq(g_seen_queue[0], "network");
     ck_assert_str_eq(g_seen_fn[0], FN_DM);
     ck_assert_str_eq(g_seen_obj[0], "hello bob");
-    ck_assert_int_eq((int)id_send_retry_pending(NULL), 0);
+    ck_assert_int_eq((int)at_send_retry_pending(NULL), 0);
 
     /* Delivered once: a further tick sends nothing. */
-    ck_assert_int_eq((int)id_send_retry_drain(NULL, NULL, _now()), 0);
+    ck_assert_int_eq((int)at_send_retry_drain(NULL, NULL, _now()), 0);
     ck_assert_int_eq((int)g_seen, 1);
     _end();
 }
@@ -165,10 +180,10 @@ DEFINE_TEST(test_a_later_frame_waits_behind_a_backlog)
     ck_assert_int_eq(identity_send_to_network(NULL, &second, "a direct message", "bob"), 0);
     _free_dm(&first);
     _free_dm(&second);
-    ck_assert_int_eq((int)id_send_retry_pending("network"), 2);
+    ck_assert_int_eq((int)at_send_retry_pending("network"), 2);
 
     g_refuse = false;
-    ck_assert_int_eq((int)id_send_retry_drain(NULL, NULL, _now()), 2);
+    ck_assert_int_eq((int)at_send_retry_drain(NULL, NULL, _now()), 2);
     ck_assert_int_eq((int)g_seen, 2);
     ck_assert_str_eq(g_seen_obj[0], "first");
     ck_assert_str_eq(g_seen_obj[1], "second");
@@ -192,7 +207,7 @@ DEFINE_TEST(test_a_send_after_the_queue_frees_flushes_the_backlog_first)
     ck_assert_int_eq((int)g_seen, 2);
     ck_assert_str_eq(g_seen_obj[0], "first");
     ck_assert_str_eq(g_seen_obj[1], "second");
-    ck_assert_int_eq((int)id_send_retry_pending(NULL), 0);
+    ck_assert_int_eq((int)at_send_retry_pending(NULL), 0);
     _end();
 }
 
@@ -206,28 +221,28 @@ DEFINE_TEST(test_a_frame_is_given_up_at_the_age_bound)
     g_refuse = true;
     ck_assert_int_eq(identity_send_to_network(NULL, &dm, "a direct message", "bob"), 0);
     _free_dm(&dm);
-    ck_assert_int_eq((int)id_send_retry_drain(NULL, NULL, _now() + 1.0), 0);
-    ck_assert_int_eq((int)id_send_retry_pending(NULL), 1);
-    ck_assert_int_eq((int)id_send_retry_drain(
-        NULL, NULL, _now() + ID_SEND_RETRY_AGE_DEFAULT + 5.0), 0);
-    ck_assert_int_eq((int)id_send_retry_pending(NULL), 0);
+    ck_assert_int_eq((int)at_send_retry_drain(NULL, NULL, _now() + 1.0), 0);
+    ck_assert_int_eq((int)at_send_retry_pending(NULL), 1);
+    ck_assert_int_eq((int)at_send_retry_drain(
+        NULL, NULL, _now() + AT_SEND_RETRY_AGE_DEFAULT + 5.0), 0);
+    ck_assert_int_eq((int)at_send_retry_pending(NULL), 0);
     ck_assert_int_eq((int)g_seen, 0);
     _end();
 }
 
-/* The list is bounded: past ID_SEND_RETRY_MAX a defer is refused, and the
+/* The list is bounded: past AT_SEND_RETRY_MAX a defer is refused, and the
  * send reports the loss (non-zero) rather than claim it. */
 DEFINE_TEST(test_the_list_is_bounded)
 {
     _begin();
     generic_msg_t dm;
     _mk_dm(&dm, "x");
-    for (int i = 0; i < ID_SEND_RETRY_MAX; i++)
-        ck_assert_int_eq(id_send_retry_defer("network", &dm, "a dm", "bob", _now()), 0);
-    ck_assert(id_send_retry_defer("network", &dm, "a dm", "bob", _now()) != 0);
+    for (int i = 0; i < AT_SEND_RETRY_MAX; i++)
+        ck_assert_int_eq(at_send_retry_defer("network", &dm, "a dm", "bob", _now()), 0);
+    ck_assert(at_send_retry_defer("network", &dm, "a dm", "bob", _now()) != 0);
     g_refuse = true;
     ck_assert(identity_send_to_network(NULL, &dm, "a dm", "bob") != 0);
-    ck_assert_int_eq((int)id_send_retry_pending(NULL), ID_SEND_RETRY_MAX);
+    ck_assert_int_eq((int)at_send_retry_pending(NULL), AT_SEND_RETRY_MAX);
     _free_dm(&dm);
     _end();
 }
@@ -241,7 +256,7 @@ DEFINE_TEST(test_a_hard_fault_is_not_kept)
     _mk_dm(&dm, "x");
     g_hard = true;
     ck_assert(identity_send_to_network(NULL, &dm, "a dm", "bob") != 0);
-    ck_assert_int_eq((int)id_send_retry_pending(NULL), 0);
+    ck_assert_int_eq((int)at_send_retry_pending(NULL), 0);
     _free_dm(&dm);
     _end();
 }
@@ -259,10 +274,10 @@ DEFINE_TEST(test_a_score_to_reputation_is_kept_too)
     g_refuse = true;
     ck_assert_int_eq(identity_send_to(NULL, "reputation", &ts, "the attested score",
                                       "reputation"), 0);
-    ck_assert_int_eq((int)id_send_retry_pending("reputation"), 1);
-    ck_assert_int_eq((int)id_send_retry_pending("network"), 0);
+    ck_assert_int_eq((int)at_send_retry_pending("reputation"), 1);
+    ck_assert_int_eq((int)at_send_retry_pending("network"), 0);
     g_refuse = false;
-    ck_assert_int_eq((int)id_send_retry_drain(NULL, NULL, _now()), 1);
+    ck_assert_int_eq((int)at_send_retry_drain(NULL, NULL, _now()), 1);
     ck_assert_str_eq(g_seen_queue[0], "reputation");
     ck_assert(g_seen_score[0] > 0.299 && g_seen_score[0] < 0.301);
     _end();
@@ -306,10 +321,10 @@ DEFINE_TEST(test_the_on_sent_callback_hears_each_fate_once)
                                                    _on_sent, &tag, sizeof(tag)), 0);
     tag = 0;                                        /* the list kept a copy */
     ck_assert_int_eq(g_outcomes, 1);
-    ck_assert_int_eq((int)id_send_retry_drain(NULL, NULL, _now()), 0);
+    ck_assert_int_eq((int)at_send_retry_drain(NULL, NULL, _now()), 0);
     ck_assert_int_eq(g_outcomes, 1);                /* still full: no word */
     g_refuse = false;
-    ck_assert_int_eq((int)id_send_retry_drain(NULL, NULL, _now()), 1);
+    ck_assert_int_eq((int)at_send_retry_drain(NULL, NULL, _now()), 1);
     ck_assert_int_eq(g_outcomes, 2);
     ck_assert_int_eq(g_sent_ok, 2);
     ck_assert_int_eq(g_sent_tag, 8);
@@ -318,8 +333,8 @@ DEFINE_TEST(test_the_on_sent_callback_hears_each_fate_once)
     tag = 9;
     ck_assert_int_eq(identity_send_to_network_then(NULL, &dm, "a dm", "bob",
                                                    _on_sent, &tag, sizeof(tag)), 0);
-    ck_assert_int_eq((int)id_send_retry_drain(
-        NULL, NULL, _now() + ID_SEND_RETRY_AGE_DEFAULT + 5.0), 0);
+    ck_assert_int_eq((int)at_send_retry_drain(
+        NULL, NULL, _now() + AT_SEND_RETRY_AGE_DEFAULT + 5.0), 0);
     ck_assert_int_eq(g_outcomes, 3);
     ck_assert_int_eq(g_sent_ok, 2);
     ck_assert_int_eq(g_sent_tag, 9);
@@ -333,6 +348,137 @@ DEFINE_TEST(test_the_on_sent_callback_hears_each_fate_once)
     _end();
 }
 
+/* Since §2.14 the list serves every process, and more than identity's frames.
+ * A TASK_RESULT is kept with its own copy of the result bytes: negotiation
+ * hands it a thread-local buffer that the next result overwrites. */
+DEFINE_TEST(test_a_task_result_is_kept_with_its_own_bytes)
+{
+    _begin();
+    char result[] = "the answer";
+    generic_msg_t tr;
+    memset(&tr, 0, sizeof(tr));
+    tr.type = TASK_RESULT;
+    tr.info.task_result.result_data = (uint8_t *)result;
+    tr.info.task_result.result_len = strlen(result);
+    g_refuse = true;
+    ck_assert_int_eq(at_send(NULL, "AutonomousTrust", &tr, "a task result",
+                             "the app", AT_SEND_NOW, NULL, NULL, 0), 0);
+    memset(result, 'x', strlen(result));          /* the next result lands */
+    g_refuse = false;
+    ck_assert_int_eq((int)at_send_retry_drain(NULL, NULL, _now()), 1);
+    ck_assert_str_eq(g_seen_obj[0], "the answer");
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* A feature's type serialized as a fixed raw copy is plain data, so it can be
+ * kept; one with its own serializer may own pointers, and a TASK does (a map
+ * and an array), so those are refused and the loss is reported. */
+static int _dummy_to_proto(const void *payload, void **data, size_t *len)
+{
+    (void)payload; (void)data; (void)len;
+    return -1;
+}
+static const at_msg_vtable_t PLAIN_VT = { "test.kept_plain", 16, NULL, NULL, true };
+static const at_msg_vtable_t PROTO_VT = { "test.kept_proto", 16, _dummy_to_proto,
+                                          NULL, false };
+#define PLAIN_ID (AT_MSG_TYPE_STELE_MAX)
+#define PROTO_ID (AT_MSG_TYPE_STELE_MAX - 1)
+
+DEFINE_TEST(test_what_can_be_kept)
+{
+    _begin();
+    (void)at_msg_type_register(PLAIN_ID, &PLAIN_VT);
+    (void)at_msg_type_register(PROTO_ID, &PROTO_VT);
+    ck_assert(at_send_retry_supported(PLAIN_ID));
+    ck_assert(!at_send_retry_supported(PROTO_ID));
+    ck_assert(at_send_retry_supported(PEER_OBSERVED));
+    ck_assert(at_send_retry_supported(TASK_RESULT));
+    ck_assert(!at_send_retry_supported(TASK));
+    ck_assert(!at_send_retry_supported(GROUP));
+
+    generic_msg_t task;
+    memset(&task, 0, sizeof(task));
+    task.type = TASK;
+    g_refuse = true;
+    ck_assert_int_eq(at_send(NULL, "negotiation", &task, "an app task",
+                             "negotiation", AT_SEND_NOW, NULL, NULL, 0), EAGAIN);
+    ck_assert_int_eq((int)at_send_retry_pending(NULL), 0);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* AT_SEND_NOW is one try, then kept; without it, ten tries first. */
+DEFINE_TEST(test_now_makes_one_try_before_keeping)
+{
+    _begin();
+    generic_msg_t dm;
+    _mk_dm(&dm, "x");
+    g_refuse = true;
+    ck_assert_int_eq(at_send(NULL, "network", &dm, "a dm", "bob", AT_SEND_NOW,
+                             NULL, NULL, 0), 0);
+    ck_assert_int_eq((int)g_tries, 1);
+    at_send_retry_reset();
+    g_tries = 0;
+    ck_assert_int_eq(at_send(NULL, "network", &dm, "a dm", "bob", 0,
+                             NULL, NULL, 0), 0);
+    ck_assert_int_eq((int)g_tries, 10);
+    _free_dm(&dm);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* Every process's tick passes through sleep_until, which is where the kept
+ * frames are retried: no process has to remember to drain. */
+DEFINE_TEST(test_sleep_until_drains_the_list)
+{
+    _begin();
+    generic_msg_t dm;
+    _mk_dm(&dm, "tick");
+    g_refuse = true;
+    ck_assert_int_eq(identity_send_to_network(NULL, &dm, "a dm", "bob"), 0);
+    _free_dm(&dm);
+    g_refuse = false;
+    process_t proc;
+    memset(&proc, 0, sizeof(proc));
+    gettimeofday(&proc.start, NULL);
+    sleep_until(&proc, 0);
+    ck_assert_int_eq((int)at_send_retry_pending(NULL), 0);
+    ck_assert_int_eq((int)g_seen, 1);
+    ck_assert_str_eq(g_seen_obj[0], "tick");
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* The network process hands every inbound wire frame to its sibling in one
+ * try, on a receiver thread. A full sibling queue used to drop it there,
+ * whatever it was; now it is kept (its payload copied: the wire message owns
+ * the bytes and is freed at once) and the tick delivers it. */
+DEFINE_TEST(test_an_inbound_frame_is_kept_for_its_sibling)
+{
+    _begin();
+    net_wire_msg_t w;
+    memset(&w, 0, sizeof(w));
+    snprintf(w.process, sizeof(w.process), "%s", "identity");
+    w.function = strdup(FN_DM);
+    w.data = (uint8_t *)strdup("from the wire");
+    w.data_len = strlen("from the wire");
+    logger_t logger = {0};
+    g_refuse = true;
+    ck_assert_int_eq(net_proc_test_route_to_process(&w, NULL, &logger), 0);
+    ck_assert_int_eq((int)g_tries, 1);                 /* one try: a receiver thread */
+    memset(w.data, 'x', w.data_len);
+    free(w.data);
+    free(w.function);
+    g_refuse = false;
+    ck_assert_int_eq((int)at_send_retry_drain(NULL, NULL, _now()), 1);
+    ck_assert_str_eq(g_seen_queue[0], "identity");
+    ck_assert_str_eq(g_seen_fn[0], FN_DM);
+    ck_assert_str_eq(g_seen_obj[0], "from the wire");
+    _end();
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(SendRetry,
           test_a_refused_frame_is_kept_and_lands_intact,
           test_a_later_frame_waits_behind_a_backlog,
@@ -341,4 +487,9 @@ RUN_TESTS(SendRetry,
           test_the_list_is_bounded,
           test_a_hard_fault_is_not_kept,
           test_a_score_to_reputation_is_kept_too,
-          test_the_on_sent_callback_hears_each_fate_once)
+          test_the_on_sent_callback_hears_each_fate_once,
+          test_a_task_result_is_kept_with_its_own_bytes,
+          test_what_can_be_kept,
+          test_now_makes_one_try_before_keeping,
+          test_sleep_until_drains_the_list,
+          test_an_inbound_frame_is_kept_for_its_sibling)

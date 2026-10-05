@@ -40,6 +40,7 @@
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/util.h"
+#include "utilities/send_retry.h"   /* at_send: keep a refused frame */
 
 /* identity -> network, local IPC: the directory (net_registry.h). Mirror:
  * Python Network.dir_publish / dir_withdraw / dir_lookup. */
@@ -178,7 +179,11 @@ static void _to_identity(char *verb, json_t *body)
     msg.info.net_msg.encrypt = false;
     net_msg_pack_json(&msg.info.net_msg, body);
     json_decref(body);
-    messaging_send("identity", NET_MESSAGE, &msg, false);
+    /* A relay's answer (a directory or hub result or status) arrives once and
+     * nothing asks for it again, so a full identity queue keeps it for this
+     * process's tick (ISSUES §2.14). One try: this runs on network threads. */
+    (void)at_send(NULL, "identity", &msg, verb, "identity", AT_SEND_NOW, NULL,
+                  NULL, 0);
     net_msg_free_obj(&msg.info.net_msg);
 }
 

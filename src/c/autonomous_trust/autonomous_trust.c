@@ -24,10 +24,12 @@
 #include <sys/wait.h>
 #include <string.h>
 #include <signal.h>
+#include <time.h>
 
 #include "version.h"
 #include "at_route_priv.h"
 #include "utilities/message.h"
+#include "utilities/send_retry.h"
 #include "utilities/msg_types_priv.h"
 #include "utilities/logger.h"
 #include "utilities/sighandler.h"
@@ -52,6 +54,12 @@ void user1_handler() { /* reserved: SIGUSR1 — user-defined action */ }
 void user2_handler() { /* reserved: SIGUSR2 — user-defined action */ }
 
 
+/* Every send in this file goes through at_send with AT_SEND_NOW: one try,
+ * and a refused frame is KEPT and retried on this loop's tick
+ * (utilities/send_retry.h, ISSUES §2.14) rather than lost. These are an app's
+ * verbs on their way in and AT's events on their way out, and nothing sends
+ * either again. A TASK cannot be kept (task_t owns a map and an array), so a
+ * full negotiation queue still loses one, loudly. */
 int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
 {
     if (msg == NULL)
@@ -60,12 +68,15 @@ int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
     {
     case TASK:
         /* Route tasks to negotiation process */
-        if (messaging_send("negotiation", TASK, msg, false) != 0)
+        if (at_send(NULL, "negotiation", msg,
+                    "an app task", "negotiation", 0, NULL, NULL, 0) != 0)
             log_exception(logger);
         return 0;
     case TASK_STATUS:
         /* Route task status queries to negotiation */
-        if (messaging_send("negotiation", TASK_STATUS, msg, false) != 0)
+        if (at_send(NULL, "negotiation", msg,
+                    "an app task status", "negotiation",
+                    AT_SEND_NOW, NULL, NULL, 0) != 0)
             log_exception(logger);
         return 0;
     case NET_MESSAGE:
@@ -86,7 +97,9 @@ int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
                 generic_msg_t fwd = *msg;
                 snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
                          "%s", roster_targets[i]);
-                if (messaging_send(roster_targets[i], NET_MESSAGE, &fwd, false) != 0)
+                if (at_send(NULL, roster_targets[i], &fwd,
+                            "the app's roster request", roster_targets[i],
+                            AT_SEND_NOW, NULL, NULL, 0) != 0)
                     log_exception(logger);
             }
             return 0;
@@ -102,7 +115,8 @@ int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
                 generic_msg_t fwd = *msg;
                 snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
                          "%s", target);
-                if (messaging_send(target, NET_MESSAGE, &fwd, false) != 0)
+                if (at_send(NULL, target, &fwd,
+                            "an app verb", target, AT_SEND_NOW, NULL, NULL, 0) != 0)
                     log_exception(logger);
                 return 0;
             }
@@ -124,7 +138,9 @@ int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
             generic_msg_t fwd = *msg;
             snprintf(fwd.info.net_msg.process, sizeof(fwd.info.net_msg.process),
                      "%s", "identity");
-            if (messaging_send("identity", NET_MESSAGE, &fwd, false) != 0)
+            if (at_send(NULL, "identity", &fwd,
+                        "an app peer standing", "identity",
+                        AT_SEND_NOW, NULL, NULL, 0) != 0)
                 log_exception(logger);
             return 0;
         }
@@ -182,7 +198,9 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
             {
             case TASK_STATUS:
                 /* Task status updates go to negotiation */
-                if (messaging_send("negotiation", TASK_STATUS, inner, false) != 0)
+                if (at_send(NULL, "negotiation", inner,
+                            "a task status", "negotiation",
+                            AT_SEND_NOW, NULL, NULL, 0) != 0)
                     log_exception(logger);
                 break;
             /* App-bound: sent as we drain, in FIFO order. Batching them into a
@@ -207,7 +225,8 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
             case PEER_RTT_OBSERVED:
                 if (q_out == NULL)
                     break;   /* no app attached; nothing to do */
-                if (messaging_send(q_out, (message_type_t)inner->type, inner, false) != 0)
+                if (at_send(NULL, q_out, inner,
+                            "an app event", q_out, AT_SEND_NOW, NULL, NULL, 0) != 0)
                     log_exception(logger);
                 else
                     sent++;
@@ -220,7 +239,8 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
                 const at_msg_vtable_t *vt = at_msg_type_lookup(inner->type);
                 if (vt == NULL || !vt->app_bound || q_out == NULL)
                     break;
-                if (messaging_send(q_out, (message_type_t)inner->type, inner, false) != 0)
+                if (at_send(NULL, q_out, inner,
+                            "an app event", q_out, AT_SEND_NOW, NULL, NULL, 0) != 0)
                     log_exception(logger);
                 else
                     sent++;
@@ -565,6 +585,11 @@ int run_autonomous_trust(char *q_in, char *q_out,
         at_route_internal_msgs(&unhandled_msgs, q_out, &logger);
         /* Only now: the queue holds result_msg by reference. */
         messaging_recv_release(&result_msg);
+
+        /* This loop sleeps with usleep, not sleep_until, so it drains its own
+         * kept frames (the app-verb hand-offs and the hop to the app's queue;
+         * utilities/send_retry.h, ISSUES §2.14). */
+        at_send_retry_drain(NULL, NULL, (double)time(NULL));
 
         if (usleep(cadence) == -1)
         {

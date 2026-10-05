@@ -154,6 +154,9 @@ typedef struct {
 typedef struct {
     uuid_t task_uuid;
     uuid_t requestor_uuid;
+    /** The result bytes. Across IPC they travel after the struct and the
+     *  receiver gets its own copy (freed by messaging_recv_release): the
+     *  sender's pointer means nothing in another process. */
     uint8_t *result_data;
     size_t result_len;
 } task_result_msg_t;

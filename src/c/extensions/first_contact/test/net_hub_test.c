@@ -40,6 +40,8 @@
 #include "network/network.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
+#include "utilities/send_retry.h"
+#include <errno.h>
 
 static double g_mono = 1000.0;
 static double g_wall = 0.0;   /* > 0: the wall clock stands here */
@@ -429,10 +431,14 @@ static int _test_hub(const char *host, int port, const char *op, const char *are
     return 0;
 }
 
+static bool g_identity_full;   /* the identity queue refuses */
+
 static int _net_hook(const char *key, const message_type_t type, generic_msg_t *msg,
                      bool blocking)
 {
-    (void)key; (void)blocking;
+    (void)blocking;
+    if (g_identity_full && key != NULL && strcmp(key, "identity") == 0)
+        return EAGAIN;
     if (type == NET_MESSAGE && msg->info.net_msg.function != NULL && g_net.n_out < 16) {
         at_strlcpy(g_net.fn[g_net.n_out], msg->info.net_msg.function, sizeof(g_net.fn[0]));
         json_t *b = NULL;
@@ -447,6 +453,8 @@ static void _net_begin(void)
     for (int i = 0; i < g_net.n_out; i++)
         json_decref(g_net.body[i]);
     memset(&g_net, 0, sizeof(g_net));
+    g_identity_full = false;
+    at_send_retry_reset();
     setenv("AT_USE_RELAY", "198.51.100.1:27790,198.51.100.2:27790", 1);
     net_relay_reset_routes();
     fc_net_set_test_hub(_test_hub);
@@ -549,6 +557,33 @@ DEFINE_TEST(test_the_network_gathers_every_hubs_cards_and_answers_once)
 }
 END_TEST_DEFINITION()
 
+/* A hub lookup's answer reaches identity once and nothing asks for it again,
+ * so a full identity queue keeps it for the network process's tick (ISSUES
+ * §2.14); until then the person waited for an answer that had been lost. */
+DEFINE_TEST(test_a_hub_answer_survives_a_full_identity_queue)
+{
+    _net_begin();
+    identity_t *alice = _mk("alice");
+    _ipc(fc_net_hub_lookup, NET_FN_HUB_LOOKUP, json_pack("{s:s}", "area", "U4PR"), NULL);
+    json_t *wa = _card(alice, "u4pr", "u4pru", 1, 3600);
+    _answer("198.51.100.1", json_pack("{s:s, s:s, s:[O]}", "op", "hub_cards",
+                                      "area", "u4pr", "cards", wa));
+    g_identity_full = true;
+    _answer("198.51.100.2", json_pack("{s:s, s:s, s:[]}", "op", "hub_cards",
+                                      "area", "u4pr", "cards"));
+    fc_net_drain_hub();
+    ck_assert_int_eq(g_net.n_out, 0);
+    ck_assert_uint_eq(at_send_retry_pending("identity"), 1);
+    g_identity_full = false;
+    ck_assert_uint_eq(at_send_retry_drain(NULL, NULL, (double)time(NULL)), 1);
+    ck_assert_int_eq(g_net.n_out, 1);
+    ck_assert_str_eq(g_net.fn[0], "hub_result");
+    json_decref(wa);
+    _net_end();
+    at_send_retry_reset();
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(NetHub,
           test_a_card_verifies_and_a_tampered_or_bad_one_does_not,
           test_listed_people_see_each_other_but_never_themselves_and_outsiders_see_none,
@@ -557,4 +592,5 @@ RUN_TESTS(NetHub,
           test_lookups_are_rate_limited_and_an_answer_is_bounded_freshest_first,
           test_a_distrusted_holder_is_not_shown_and_areas_come_from_the_environment,
           test_the_ops_run_over_the_relay_link,
-          test_the_network_gathers_every_hubs_cards_and_answers_once)
+          test_the_network_gathers_every_hubs_cards_and_answers_once,
+          test_a_hub_answer_survives_a_full_identity_queue)

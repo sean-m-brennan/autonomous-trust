@@ -36,6 +36,7 @@
 #include "utilities/msg_types_priv.h"
 #include "utilities/exception.h"
 #include "network/net_message.h"
+#include "utilities/send_retry.h"   /* at_send: keep a refused frame (ISSUES §2.14) */
 
 #define EUPDATE 300   /* fleet: 300s (280 is EZTA_NOCRED) */
 DEFINE_ERROR(EUPDATE, "Update process error");
@@ -194,7 +195,8 @@ static void broadcast_status(const process_t *proc,
             continue;
         }
         json_decref(copy);
-        messaging_send("network", NET_MESSAGE, &out, false);
+        at_send(proc, "network", &out, "a status broadcast", "network",
+                0, NULL, NULL, 0);
         net_msg_free_obj(nmsg);
     }
     peers_read_unlock(proc);
@@ -380,6 +382,8 @@ static void run_health_check(const process_t *proc, update_state_t *state)
 
             if (net_msg_pack_json(nmsg, ping) == 0)
             {
+                /* Bare on purpose (a failed hand-off tries the next peer, and a
+                 * kept one would read as a handshake): ISSUES §2.14. */
                 int rc = messaging_send("network", NET_MESSAGE, &out, false);
                 net_msg_free_obj(nmsg);
                 if (rc == 0)
