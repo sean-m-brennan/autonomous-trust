@@ -863,7 +863,7 @@ runtime instead: `test_first_contact_handshake.py` and
 [`first_contact_app_test.c`](../../src/c/extensions/first_contact/test/first_contact_app_test.c) in C.
 
 One level up,
-[`test_first_contact_two_node.py`](../../src/autonomous-trust/tests/b_integration/test_first_contact_two_node.py)
+[`test_first_contact_two_node.py`](../../src/autonomous-trust-first-contact/tests/b_integration/test_first_contact_two_node.py)
 runs two real Python nodes on separate loopback addresses that cannot discover
 each other, and has their apps add each other: the request crosses the main
 loop, the hello and ack arrive on the network process's unknown-sender path,

@@ -1,0 +1,38 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: commit-cert-catchup-certified-accepted
+byte_pinning: false
+description: |
+    Commit certificates (doc/architecture/reputation.md) on catch-up. Every half of both
+    entries carries signatures by alice, carol and dave; each half's own scorer is
+    not counted, which leaves two, and bob's quorum is more than 3 // 2. bob adopts
+    the segment and keeps all four certificates.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: consumer
+  - id: carol
+    role: proposer
+  - id: dave
+    role: member
+
+fixtures:
+  commit_certificates: true
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: latest update
+    payload:
+      chain:
+        - {task: a, p1: 0.9, p2: 0.8, p1_id: alice, p2_id: carol, certified_by: [alice, carol, dave]}
+        - {task: b, p1: 0.7, p2: 0.6, p1_id: alice, p2_id: carol, certified_by: [alice, carol, dave]}
+
+expected_state:
+  bob:
+    committed_tx_count: 2
+    certified_halves: 4

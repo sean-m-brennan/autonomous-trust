@@ -23,6 +23,10 @@ this file. The rules pinned here, each a refusal to start unless noted:
 * a verb no loaded extension declares eligible, a core verb above all -- the
   file must never be a way to downgrade the core;
 * a loaded extension whose declared verbs the file does not name.
+
+The rules are the core's, so they are exercised with a stand-in extension.
+First contact's own half (its five verbs, and the start check that reads
+AT_FIRST_CONTACT) is in that distribution's test_first_contact_plaintext.py.
 """
 import json
 from dataclasses import dataclass
@@ -30,20 +34,19 @@ from dataclasses import dataclass
 import pytest
 
 from autonomous_trust.core import plaintext_verbs as pv
-from autonomous_trust.core.extensions import configure_plaintext_verbs
-from autonomous_trust.first_contact import first_contact
 from autonomous_trust.core.identity.protocol import (CORE_UNENCRYPTED_VERBS,
                                                      IdentityProtocol)
-from autonomous_trust.first_contact.fc_protocol import FirstContactProtocol
-
-FC = first_contact.EXTENSION
-FC_VERBS = sorted(FC.plaintext_verbs)
 
 
 @dataclass(frozen=True)
 class _Ext:
     name: str
     plaintext_verbs: tuple = ()
+
+
+#: A stand-in optional feature that declares two plaintext verbs.
+DEMO = _Ext('demo', ('demo_ack', 'demo_hello'))
+DEMO_VERBS = sorted(DEMO.plaintext_verbs)
 
 
 @pytest.fixture(autouse=True)
@@ -56,14 +59,6 @@ def _reset():
 def _write(tmp_path, doc):
     text = doc if isinstance(doc, str) else json.dumps(doc)
     (tmp_path / pv.FILENAME).write_text(text)
-
-
-def test_first_contact_declares_exactly_its_five_verbs():
-    assert set(FC_VERBS) == {
-        FirstContactProtocol.hello, FirstContactProtocol.hello_ack,
-        FirstContactProtocol.contact_request, FirstContactProtocol.contact_accept,
-        FirstContactProtocol.device_announce}
-    assert not set(FC_VERBS) & CORE_UNENCRYPTED_VERBS
 
 
 def test_the_core_has_nine_and_they_are_always_on():
@@ -79,25 +74,25 @@ def test_no_file_is_the_core_only(tmp_path):
 
 
 def test_the_file_grants_a_loaded_extensions_verbs(tmp_path):
-    _write(tmp_path, {'verbs': FC_VERBS})
-    assert pv.configure(str(tmp_path), [FC]) == frozenset(FC_VERBS)
-    assert pv.active() == CORE_UNENCRYPTED_VERBS | set(FC_VERBS)
-    assert pv.is_unencrypted(FirstContactProtocol.hello)
+    _write(tmp_path, {'verbs': DEMO_VERBS})
+    assert pv.configure(str(tmp_path), [DEMO]) == frozenset(DEMO_VERBS)
+    assert pv.active() == CORE_UNENCRYPTED_VERBS | set(DEMO_VERBS)
+    assert pv.is_unencrypted('demo_hello')
 
 
-def test_no_file_with_first_contact_on_refuses_naming_the_verbs(tmp_path):
+def test_no_file_with_the_feature_on_refuses_naming_the_verbs(tmp_path):
     with pytest.raises(pv.PlaintextVerbsError) as err:
-        pv.configure(str(tmp_path), [FC])
+        pv.configure(str(tmp_path), [DEMO])
     text = str(err.value)
     assert pv.FILENAME in text and 'no such file' in text
-    for verb in FC_VERBS:
+    for verb in DEMO_VERBS:
         assert verb in text
 
 
 def test_a_file_missing_one_verb_refuses_naming_it(tmp_path):
-    _write(tmp_path, {'verbs': FC_VERBS[1:]})
-    with pytest.raises(pv.PlaintextVerbsError, match=FC_VERBS[0]):
-        pv.configure(str(tmp_path), [FC])
+    _write(tmp_path, {'verbs': DEMO_VERBS[1:]})
+    with pytest.raises(pv.PlaintextVerbsError, match=DEMO_VERBS[0]):
+        pv.configure(str(tmp_path), [DEMO])
 
 
 @pytest.mark.parametrize('verb', [IdentityProtocol.update,   # group_key_update
@@ -106,14 +101,14 @@ def test_a_file_missing_one_verb_refuses_naming_it(tmp_path):
 def test_a_core_verb_refuses(tmp_path, verb):
     """The file cannot downgrade the core: not even a verb that is already
     core plaintext, since naming it is a sign the file is not what it seems."""
-    _write(tmp_path, {'verbs': FC_VERBS + [verb]})
+    _write(tmp_path, {'verbs': DEMO_VERBS + [verb]})
     with pytest.raises(pv.PlaintextVerbsError, match=verb):
-        pv.configure(str(tmp_path), [FC])
+        pv.configure(str(tmp_path), [DEMO])
     assert not pv.is_unencrypted(IdentityProtocol.update)
 
 
 def test_a_feature_verb_with_the_feature_off_refuses(tmp_path):
-    _write(tmp_path, {'verbs': FC_VERBS})
+    _write(tmp_path, {'verbs': DEMO_VERBS})
     with pytest.raises(pv.PlaintextVerbsError, match='no loaded extension'):
         pv.configure(str(tmp_path), [])
 
@@ -122,19 +117,19 @@ def test_a_feature_verb_with_the_feature_off_refuses(tmp_path):
     'not json',
     '[]',
     '{}',
-    '{"verbs": "first_contact_hello"}',
+    '{"verbs": "demo_hello"}',
     '{"verbs": [1]}',
     '{"verbs": [""]}',
     '{"verbs": [], "extra": true}',
     '{"verb": []}',
-    '{"verbs": ["first_contact_hello", "first_contact_hello"]}',
+    '{"verbs": ["demo_hello", "demo_hello"]}',
     json.dumps({'verbs': ['v%d' % i for i in range(33)]}),
     json.dumps({'verbs': ['v' * 65]}),
 ])
 def test_a_malformed_file_refuses(tmp_path, text):
     _write(tmp_path, text)
     with pytest.raises(pv.PlaintextVerbsError):
-        pv.configure(str(tmp_path), [_Ext('x', ('first_contact_hello',))])
+        pv.configure(str(tmp_path), [_Ext('x', ('demo_hello',))])
 
 
 def test_an_empty_list_is_valid(tmp_path):
@@ -143,25 +138,14 @@ def test_an_empty_list_is_valid(tmp_path):
 
 
 def test_a_refusal_keeps_the_previous_grant(tmp_path):
-    _write(tmp_path, {'verbs': FC_VERBS})
-    pv.configure(str(tmp_path), [FC])
+    _write(tmp_path, {'verbs': DEMO_VERBS})
+    pv.configure(str(tmp_path), [DEMO])
     _write(tmp_path, 'broken')
     with pytest.raises(pv.PlaintextVerbsError):
-        pv.configure(str(tmp_path), [FC])
-    assert pv.is_unencrypted(FirstContactProtocol.hello)
+        pv.configure(str(tmp_path), [DEMO])
+    assert pv.is_unencrypted('demo_hello')
 
 
 @pytest.mark.parametrize('verb', [None, '', 42])
 def test_nothing_odd_is_plaintext(verb):
     assert pv.is_unencrypted(verb) is False
-
-
-def test_the_start_check_reads_only_enabled_extensions(tmp_path, monkeypatch):
-    """configure_plaintext_verbs (called by extensions.check_config at start)
-    asks enabled(): first contact off, its verbs in the file, refuses."""
-    _write(tmp_path, {'verbs': FC_VERBS})
-    monkeypatch.setenv('AT_FIRST_CONTACT', '1')
-    assert configure_plaintext_verbs(str(tmp_path)) == frozenset(FC_VERBS)
-    monkeypatch.setenv('AT_FIRST_CONTACT', '0')
-    with pytest.raises(pv.PlaintextVerbsError):
-        configure_plaintext_verbs(str(tmp_path))

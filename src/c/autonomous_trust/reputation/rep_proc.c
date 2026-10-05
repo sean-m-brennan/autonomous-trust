@@ -220,7 +220,26 @@ static uuid_t *_chain_peers_locked(size_t *n_out);
 static int _repropose_dropped(const process_t *proc,
                               const tx_reconcile_result_t *res);
 /* Verifier-attested scores: defined with the rest of the round, below. */
+/* Longest designation: tag + 2 uuids (or uuid + 64-hex root) + reason +
+ * fixed-form floor + three integers, plus separators. 512 is generous. */
+#define REP_DESIG_MAX 512
+#define REP_SIG_HEX_LEN (crypto_sign_BYTES * 2)
 static bool _chain_json_certified(const process_t *proc, json_t *arr);
+static bool _commit_certs_required(const process_t *proc, const char *group_uuid);
+static bool _commit_cert_ok(const process_t *proc, const uuid_t scorer,
+                            const uuid_t task, double score, const char *channel,
+                            json_t *sigs, const char *group_uuid);
+static int _cosign_hex(const process_t *proc, const uint8_t *desig,
+                       size_t dlen, char *hex_out, size_t hex_cap);
+static bool _verify_cosignature(const process_t *proc, const char *voter_str,
+                                const uint8_t *desig, size_t dlen,
+                                const char *sig_hex);
+static void _record_cosig_locked(map_t *sigs, const char *round_key,
+                                 const char *voter, const char *sig_hex);
+static json_t *_cosigs_json_locked(map_t *sigs, const char *round_key,
+                                   size_t *count_out);
+static void _drop_cosigs_locked(map_t *sigs, const char *round_key);
+static bool _chain_json_commit_certified(const process_t *proc, json_t *arr);
 static void _reappend_attested(const process_t *proc,
                                const tx_reconcile_result_t *res);
 void _forward_attestation(const process_t *proc, const tx_score_msg_t *ts,
@@ -494,6 +513,11 @@ static struct {
      * (the slash_sigs shape). */
     map_t attest_pending;
     map_t attest_sigs;
+    /* Proposer side, only in a group that requires commit certificates:
+     * "task:voter" -> the acceptor's verified signature over the half's
+     * commit_designation (the slash_sigs shape). Mirrors Python
+     * commit_sigs_pending. */
+    map_t commit_sigs;
     int64_t slash_epoch;
     /* "target:slasher" -> integer_data(epoch): the highest slash epoch this
      * node has ever APPLIED for that pair. Never removed, unlike `slashed`
@@ -700,6 +724,7 @@ static void _ensure_init(void)
         map_init(&rep_state.slash_pending);
         map_init(&rep_state.attest_pending);
         map_init(&rep_state.attest_sigs);
+        map_init(&rep_state.commit_sigs);
         rep_state.slash_epoch = 0;
         map_init(&rep_state.slash_hw);
         map_init(&rep_state.excluded);
@@ -924,9 +949,9 @@ static size_t _quorum_for_group(const process_t *proc, const char *group_uuid)
  * it. So both halves of an even split finalized their own windows, each then
  * refused to rewrite inside its finality at the heal (tx_history_reconcile),
  * and the chains could never converge (Agora Phase 4 DDIL, 2026-09-25). Odd
- * sizes are unchanged. Deliberately NOT applied to Paxos grants or slashing:
- * the grant formula is the open ISSUES.md §2.13 decision. Mirrors Python's
- * _checkpoint_quorum. */
+ * sizes are unchanged. Deliberately NOT applied to Paxos grants or slashing,
+ * which keep Python's len(peers) // 2 (_round_quorum_locked). Mirrors
+ * Python's _checkpoint_quorum. */
 static size_t _ckpt_quorum_for_group(const process_t *proc, const char *group_uuid)
 {
     if (proc == NULL)
@@ -937,6 +962,28 @@ static size_t _ckpt_quorum_for_group(const process_t *proc, const char *group_uu
         ? proc->protocol.num_peers
         : _members_of_group(proc, group_uuid);
     return (roster + 1) / 2;
+}
+
+/* The Paxos threshold for the round filed under `paxos_key`, sized NOW against
+ * the round's own group. A grant carries the round at `>=` this many, and an
+ * acceptance at `>`, exactly as Python's handle_grant and handle_accepted
+ * compare against _quorum_for_group.
+ *
+ * Both used to compare against PAXOS_MAJORITY(rep_state.num_peers), a count
+ * read once in reputation_run, before discovery had found anybody. In
+ * production it was 0 for the life of the process, so one grant and one
+ * acceptance carried every round however large the group grew. The acceptance
+ * test was already Python's (`>= n/2 + 1` is `> n/2`); only the count was
+ * frozen. The grant test was one stricter than Python's. Caller holds
+ * rep_state.lock. */
+static size_t _round_quorum_locked(const process_t *proc, const char *paxos_key)
+{
+    char group[UUID_STRING_LEN + 1];
+    _get_round_group_locked(paxos_key, group, sizeof(group));
+    peers_read_lock(proc);
+    size_t quorum = _quorum_for_group(proc, group[0] != '\0' ? group : NULL);
+    peers_read_unlock(proc);
+    return quorum;
 }
 
 /* Per-chain finalized-checkpoint state. A gateway checkpoints each of its
@@ -2096,7 +2143,8 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
     double tx_score = (tx != NULL) ? tx->score : 0.0;
 
     int count = paxos_record_grant(&rep_state.paxos, id1, id2, tx_score);
-    bool send_tx = (count >= PAXOS_MAJORITY(rep_state.num_peers));
+    bool send_tx = (count >= 0
+                    && (size_t)count >= _round_quorum_locked(proc, round_key));
 
     /* Capture task_uuid + capability_name before potential removal.
      * The proposer caches its own weight here so reputation_pure (and
@@ -2175,6 +2223,12 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
         if (channel_local[0] != '\0')
             json_object_set_new(tx_json, "channel",
                                 json_string(channel_local));
+        /* A group that requires commit certificates asks each acceptor to
+         * sign what it accepts. Omitted otherwise, so every other proposal is
+         * the payload it always was. The round is bound to our primary group
+         * (just above), so that group's declaration is the one that counts. */
+        if (_commit_certs_required(proc, NULL))
+            json_object_set_new(tx_json, "certify", json_true());
 
         log_debug(proc->logger, "Reputation: Submit transaction score\n");
 
@@ -2502,6 +2556,40 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
     /* Record the grant (score) in the paxos proposals for later acceptance tracking */
     paxos_record_grant(&rep_state.paxos, id1, id2, score);
 
+    /* Asked to certify (a group that requires commit certificates): sign the
+     * half this round writes. Only the proposer may ask -- a relayed proposal
+     * carries somebody else's round, and signing it would vouch for a round
+     * this node never saw that peer run. Computed here because the channel is
+     * borrowed from `payload`. Mirrors Python handle_transaction. */
+    char commit_sig[REP_SIG_HEX_LEN + 1] = {0};
+    if (json_is_true(json_object_get(payload, "certify")))
+    {
+        uuid_t scorer, task;
+        if (peer_uuid_str != NULL && task_uuid_str != NULL
+            && uuid_parse(peer_uuid_str, scorer) == 0
+            && uuid_parse(task_uuid_str, task) == 0
+            && uuid_compare(nmsg->from_whom.uuid, scorer) == 0)
+        {
+            uint8_t desig[REP_DESIG_MAX];
+            size_t dlen = commit_designation(scorer, task, score,
+                                             channel_borrowed, desig,
+                                             sizeof(desig));
+            if (dlen == 0
+                || _cosign_hex(proc, desig, dlen, commit_sig,
+                               sizeof(commit_sig)) != 0)
+            {
+                commit_sig[0] = '\0';
+                log_error(proc->logger, "Reputation: cannot sign the commit "
+                          "designation; accepting unsigned\n");
+            }
+        }
+        else
+        {
+            log_warn(proc->logger, "Reputation: not certifying a proposal from "
+                     "%s for another peer's round\n", nmsg->from_whom.nickname);
+        }
+    }
+
     /* Cache the per-task transaction_weight so reputation_pure /
      * reputation_consensus can apply it when this transaction lands
      * in the chain. Mirrors Python handle_transaction's
@@ -2532,6 +2620,8 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
     json_object_set_new(acc_json, "peer_uuid", json_string(peer_uuid_str));
     if (task_uuid_str)
         json_object_set_new(acc_json, "task_uuid", json_string(task_uuid_str));
+    if (commit_sig[0] != '\0')
+        json_object_set_new(acc_json, "sig", json_string(commit_sig));
 
     generic_msg_t accepted = {0};
     accepted.type = NET_MESSAGE;
@@ -2616,7 +2706,62 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
     pthread_mutex_unlock(&rep_state.paxos.lock);
 
     int acc_count = paxos_record_acceptance(&rep_state.paxos, id1, id2);
-    bool commit = (acc_count >= PAXOS_MAJORITY(rep_state.num_peers));
+    pthread_mutex_lock(&rep_state.lock);
+    size_t acc_quorum = _round_quorum_locked(proc, paxos_key);
+    char acc_group[UUID_STRING_LEN + 1];
+    _get_round_group_locked(paxos_key, acc_group, sizeof(acc_group));
+    pthread_mutex_unlock(&rep_state.lock);
+    bool commit = (acc_count >= 0 && (size_t)acc_count > acc_quorum);
+
+    /* A group that requires commit certificates counts only SIGNED
+     * acceptances, and the round carries once their signatures clear the bar
+     * a receiver will hold them to (_commit_cert_ok), so a commit this node
+     * sends is one its own group will write. Mirrors Python handle_accepted. */
+    json_t *certificate = NULL;
+    const char *acc_task_str = json_string_value(json_object_get(payload,
+                                                                 "task_uuid"));
+    if (_commit_certs_required(proc, acc_group[0] != '\0' ? acc_group : NULL))
+    {
+        uuid_t scorer, task;
+        char voter[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(nmsg->from_whom.uuid, voter);
+        const char *sig = json_string_value(json_object_get(payload, "sig"));
+        char chan[TX_CHANNEL_NAMELEN + 1] = {0};
+        bool parsed = acc_task_str != NULL && peer_uuid_str != NULL
+            && uuid_parse(acc_task_str, task) == 0
+            && uuid_parse(peer_uuid_str, scorer) == 0;
+        uint8_t desig[REP_DESIG_MAX];
+        size_t dlen = 0;
+        if (parsed)
+        {
+            pthread_mutex_lock(&rep_state.lock);
+            const char *stashed = _task_channel_locked(acc_task_str);
+            if (stashed != NULL)
+                at_strlcpy(chan, stashed, sizeof(chan));
+            pthread_mutex_unlock(&rep_state.lock);
+            dlen = commit_designation(scorer, task, score, chan, desig,
+                                      sizeof(desig));
+        }
+        if (dlen == 0 || !_verify_cosignature(proc, voter, desig, dlen, sig))
+        {
+            log_warn(proc->logger, "Reputation: acceptance from %s carries no "
+                     "valid commit signature; not counted\n",
+                     nmsg->from_whom.nickname);
+            json_decref(payload);
+            return true;
+        }
+        pthread_mutex_lock(&rep_state.lock);
+        _record_cosig_locked(&rep_state.commit_sigs, acc_task_str, voter, sig);
+        json_t *pending = _cosigs_json_locked(&rep_state.commit_sigs,
+                                              acc_task_str, NULL);
+        pthread_mutex_unlock(&rep_state.lock);
+        commit = _commit_cert_ok(proc, scorer, task, score, chan, pending,
+                                 acc_group[0] != '\0' ? acc_group : NULL);
+        if (commit)
+            certificate = pending;
+        else
+            json_decref(pending);
+    }
 
     if (commit)
     {
@@ -2708,6 +2853,19 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
             was_bilateral = _is_bilateral_locked(chain, task_uuid, NULL);
             tx_history_update(chain, task_uuid, peer_uuid, score,
                               commit_channel);
+            if (certificate != NULL)
+            {
+                char *text = json_dumps(certificate, JSON_COMPACT | JSON_SORT_KEYS);
+                if (text != NULL)
+                {
+                    (void)tx_history_attach_commit_cert(chain, task_uuid,
+                                                        peer_uuid, text);
+                    free(text);
+                }
+                pthread_mutex_lock(&rep_state.lock);
+                _drop_cosigs_locked(&rep_state.commit_sigs, task_uuid_str);
+                pthread_mutex_unlock(&rep_state.lock);
+            }
             now_bilateral = _is_bilateral_locked(chain, task_uuid, &entry_index);
         }
         else
@@ -2768,6 +2926,9 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
             if (round_group[0] != '\0')
                 json_object_set_new(commit_json, "group_uuid",
                                     json_string(round_group));
+            /* The certificate, only from a group that requires one. */
+            if (certificate != NULL)
+                json_object_set(commit_json, "certificate", certificate);
 
             generic_msg_t bcast = {0};
             bcast.type = NET_MESSAGE;
@@ -2800,6 +2961,7 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
         log_debug(proc->logger, "Reputation: Tx accepted (%d so far)\n", acc_count);
     }
 
+    json_decref(certificate);
     json_decref(payload);
     return true;
 }
@@ -2912,6 +3074,31 @@ static bool handle_committed(const process_t *proc, directory_t *queues, generic
      * primary chain, so a leaf node behaves exactly as it did. */
     const char *group_str = json_string_value(json_object_get(payload,
                                                              "group_uuid"));
+
+    /* Commit certificates (doc/architecture/reputation.md): a group that declares
+     * them writes no ordinary half without a quorum of this node's own view
+     * having signed exactly this score. One that does not still keeps a valid
+     * certificate it is handed, so a chain cut before the group required them
+     * can be served to one that does. Mirrors Python handle_committed. */
+    json_t *cert = json_object_get(payload, "certificate");
+    bool certified = false;
+    uuid_t cert_task;
+    if (json_is_object(cert) && json_object_size(cert) > 0
+        && task_uuid_str != NULL && uuid_parse(task_uuid_str, cert_task) == 0)
+        certified = _commit_cert_ok(proc, peer_uuid, cert_task, score,
+                                    chan_borrowed, cert, group_str);
+    if (!certified && _commit_certs_required(proc, group_str))
+    {
+        log_warn(proc->logger, "Reputation: rejecting committed from %s: %s\n",
+                 nmsg->from_whom.nickname,
+                 json_is_object(cert) ? "its certificate does not meet our quorum"
+                                      : "this group requires a commit certificate");
+        json_decref(payload);
+        return true;
+    }
+    char *cert_text = certified
+        ? json_dumps(cert, JSON_COMPACT | JSON_SORT_KEYS) : NULL;
+
     pthread_mutex_lock(&rep_state.lock);
     tx_history_t *chain = _chain_for_group_locked(proc, group_str);
     bool was_bilateral = false, now_bilateral = false;
@@ -2920,6 +3107,9 @@ static bool handle_committed(const process_t *proc, directory_t *queues, generic
     {
         was_bilateral = _is_bilateral_locked(chain, task_uuid, NULL);
         tx_history_update(chain, task_uuid, peer_uuid, score, chan_borrowed);
+        if (cert_text != NULL)
+            (void)tx_history_attach_commit_cert(chain, task_uuid, peer_uuid,
+                                                cert_text);
         now_bilateral = _is_bilateral_locked(chain, task_uuid, &entry_index);
     }
     else
@@ -2929,6 +3119,7 @@ static bool handle_committed(const process_t *proc, directory_t *queues, generic
         tx_history_update(chain, peer_uuid, peer_uuid, score, chan_borrowed);
     }
     pthread_mutex_unlock(&rep_state.lock);
+    free(cert_text);
     if (now_bilateral && !was_bilateral)
         log_info(proc->logger, "Reputation: task %s is bilateral (index %d)\n",
                  task_uuid_str, entry_index);
@@ -4183,10 +4374,6 @@ static bool _verify_slash_evidence(json_t *evidence)
  * id_proc.c: detached Ed25519, carried as ASCII hex.
  ****************************/
 
-/* Longest designation: tag + 2 uuids (or uuid + 64-hex root) + reason +
- * fixed-form floor + three integers, plus separators. 512 is generous. */
-#define REP_DESIG_MAX 512
-#define REP_SIG_HEX_LEN (crypto_sign_BYTES * 2)
 /* A pending round record, held as a small JSON string. It carries EVERY field
  * the round's designation covers, not just the floor / root the maps used to
  * hold: a co-signer and the finalizer both have to reproduce the proposer's
@@ -4523,6 +4710,172 @@ static json_t *_attest_to_json(const rep_attest_t *a)
                      "verifier_uuid", a->verifier, "subject_uuid", a->subject,
                      "score", a->score, "channel", a->channel,
                      "evidence_digest", a->digest, "group_uuid", a->group);
+}
+
+/* Forget every co-signature recorded for `round_key` ("<round>:<voter>"
+ * keys), once the round has carried or been abandoned. */
+static void _drop_cosigs_locked(map_t *sigs, const char *round_key)
+{
+    if (sigs == NULL || round_key == NULL)
+        return;
+    size_t prefix_len = strlen(round_key);
+    array_t *keys = map_keys(sigs);
+    size_t n = array_size(keys);
+    for (size_t i = 0; i < n; i++)
+    {
+        data_t *kd = NULL;
+        char *k = NULL;
+        if (array_get(keys, (int)i, &kd) != 0 || data_string_ptr(kd, &k) != 0
+            || k == NULL)
+            continue;
+        if (strncmp(k, round_key, prefix_len) == 0 && k[prefix_len] == ':')
+            map_remove(sigs, k);
+    }
+    array_free(keys);
+}
+
+/****************************
+ * Commit certificates (doc/architecture/reputation.md)
+ *
+ * A group may declare that every ordinary half needs a quorum certificate
+ * (group_t.commit_certificates, default off). What one proves is the round:
+ * that more than a quorum of this node's own view accepted exactly this score
+ * from this scorer. It cannot prove the score TRUE -- an acceptor never sees
+ * the task -- so the lie it leaves open is a scorer's about its own half,
+ * which is R+D.md §14.2's to answer. Mirrors the Python twin's helpers of the
+ * same names.
+ ****************************/
+
+/* Does the group a commit lands in declare commit certificates? Read off the
+ * group, never configured per node, so every member gives the same answer. */
+static bool _commit_certs_required(const process_t *proc, const char *group_uuid)
+{
+    if (proc == NULL)
+        return false;
+    const group_t *child = _child_group_locked(proc, group_uuid);
+    return child != NULL ? child->commit_certificates
+                         : proc->protocol.group.commit_certificates;
+}
+
+/* Do `sigs` certify `scorer`'s half? More than _quorum_for_group distinct
+ * members of OUR view must have signed its commit_designation, and the
+ * scorer's own signature never counts: a proposer cannot vouch for its own
+ * round. Caller must NOT hold the peers lock. */
+static bool _commit_cert_ok(const process_t *proc, const uuid_t scorer,
+                            const uuid_t task, double score, const char *channel,
+                            json_t *sigs, const char *group_uuid)
+{
+    if (proc == NULL || !json_is_object(sigs) || json_object_size(sigs) == 0)
+        return false;
+    uint8_t desig[REP_DESIG_MAX];
+    size_t dlen = commit_designation(scorer, task, score, channel, desig,
+                                     sizeof(desig));
+    if (dlen == 0)
+        return false;
+    char scorer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(scorer, scorer_str);
+    size_t count = 0;
+    const char *voter = NULL;
+    json_t *val = NULL;
+    json_object_foreach(sigs, voter, val)
+    {
+        if (strcmp(voter, scorer_str) == 0)
+            continue;
+        if (_verify_cosignature(proc, voter, desig, dlen, json_string_value(val)))
+            count++;
+    }
+    peers_read_lock(proc);
+    size_t quorum = _quorum_for_group(proc, group_uuid);
+    peers_read_unlock(proc);
+    return count > quorum;
+}
+
+/* Catch-up's half of commit certificates: in a group that requires them,
+ * every ordinary half of every entry in the segment that is new to us and
+ * outside the latest quorum checkpoint carries a certificate meeting our
+ * quorum. Entries the checkpoint covers (the segment reproducing its root)
+ * are certified by it -- which is how a chain cut before the group required
+ * certificates, or by members since gone, stays acceptable once a quorum has
+ * checkpointed it. Mirrors Python _commit_certs_ok. Caller must NOT hold
+ * rep_state.lock or the peers lock. */
+static bool _chain_json_commit_certified(const process_t *proc, json_t *arr)
+{
+    if (!_commit_certs_required(proc, NULL) || !json_is_array(arr)
+        || json_array_size(arr) == 0)
+        return true;
+    tx_history_t *seg = NULL;
+    if (tx_history_create(&seg) != 0 || seg == NULL)
+        return false;
+    tx_reconcile_result_t res = { TX_RECONCILE_NONE, -1, 0, 0, NULL };
+    tx_history_reconcile(seg, arr, -1, &res);
+    tx_reconcile_status_t status = res.status;
+    tx_reconcile_result_free(&res);
+    if (status == TX_RECONCILE_REJECTED)
+    {
+        tx_history_destroy(seg);
+        return true;   /* not ours to judge: the merge itself refuses it */
+    }
+
+    int cov_first = -1, cov_end = -1;
+    pthread_mutex_lock(&rep_state.lock);
+    if (rep_state.final_set && rep_state.final_count > 0)
+    {
+        char root[TX_HASH_HEX_LEN + 1];
+        if (tx_history_range_root(seg, rep_state.final_first,
+                                  rep_state.final_count, root) == 0
+            && strcmp(root, rep_state.final_root) == 0)
+        {
+            cov_first = rep_state.final_first;
+            cov_end = rep_state.final_first + rep_state.final_count;
+        }
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+
+    bool ok = true;
+    for (int i = 0; ok && i < seg->chain_len; i++)
+    {
+        const transaction_t *t = &seg->chain[i];
+        if (t->attested || !tx_is_committed(t))
+            continue;
+        if (t->index >= cov_first && t->index < cov_end)
+            continue;
+        /* Held at the same index, hashing the same: nothing new to prove. */
+        transaction_t held;
+        pthread_mutex_lock(&rep_state.lock);
+        bool same = tx_history_by_task(&rep_state.history, t->task_uuid, &held) == 0
+            && held.index == t->index;
+        if (same)
+        {
+            char a[TX_HASH_HEX_LEN + 1], b[TX_HASH_HEX_LEN + 1];
+            transaction_entry_hash(&held, a);
+            transaction_entry_hash(t, b);
+            same = strcmp(a, b) == 0;
+        }
+        pthread_mutex_unlock(&rep_state.lock);
+        if (same)
+            continue;
+        const uuid_t *scorers[2] = { &t->p1_uuid, &t->p2_uuid };
+        const double scores[2] = { t->p1_score, t->p2_score };
+        const char *chans[2] = { t->p1_channel, t->p2_channel };
+        for (int k = 0; ok && k < 2; k++)
+        {
+            const char *text = tx_history_commit_cert(seg, t->task_uuid, *scorers[k]);
+            json_t *sigs = text != NULL ? json_loads(text, 0, NULL) : NULL;
+            ok = _commit_cert_ok(proc, *scorers[k], t->task_uuid, scores[k],
+                                 chans[k], sigs, NULL);
+            json_decref(sigs);
+            if (!ok)
+            {
+                char sstr[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(*scorers[k], sstr);
+                log_warn(proc->logger, "Reputation: entry %d has no commit "
+                         "certificate for %.8s's half meeting our quorum, and "
+                         "no checkpoint covers it\n", t->index, sstr);
+            }
+        }
+    }
+    tx_history_destroy(seg);
+    return ok;
 }
 
 /* Canonical bytes each co-signer signs. MUST stay byte-identical to Python
@@ -5162,7 +5515,7 @@ static bool _chain_json_certified(const process_t *proc, json_t *arr)
             || !_attest_quorum_met(proc, &a, json_object_get(e, "attest_sigs")))
             return false;
     }
-    return true;
+    return _chain_json_commit_certified(proc, arr);
 }
 
 /* An adopted chain that dropped a certified attested entry: re-append it. It
@@ -8727,6 +9080,8 @@ void reputation_reset_state(int num_peers)
     map_init(&rep_state.attest_pending);
     map_free(&rep_state.attest_sigs);
     map_init(&rep_state.attest_sigs);
+    map_free(&rep_state.commit_sigs);
+    map_init(&rep_state.commit_sigs);
     memset(rep_state.attest_retries, 0, sizeof(rep_state.attest_retries));
     rep_state.slash_epoch = 0;
     map_free(&rep_state.slash_hw);
@@ -8893,6 +9248,37 @@ int reputation_get_committed_tx_count(void)
     int len = tx_history_len(&rep_state.history);
     pthread_mutex_unlock(&rep_state.lock);
     return len;
+}
+
+void reputation_get_commit_cert_counts(int *halves_held, int *certified_halves)
+{
+    int held = 0, certified = 0;
+    if (rep_state.initialized)
+    {
+        pthread_mutex_lock(&rep_state.lock);
+        const tx_history_t *h = &rep_state.history;
+        for (int i = 0; i < h->chain_len; i++)
+        {
+            const transaction_t *t = &h->chain[i];
+            if (t->attested)
+                continue;
+            if (t->p1_set)
+            {
+                held++;
+                if (tx_history_commit_cert(h, t->task_uuid, t->p1_uuid) != NULL)
+                    certified++;
+            }
+            if (t->p2_set)
+            {
+                held++;
+                if (tx_history_commit_cert(h, t->task_uuid, t->p2_uuid) != NULL)
+                    certified++;
+            }
+        }
+        pthread_mutex_unlock(&rep_state.lock);
+    }
+    if (halves_held != NULL) *halves_held = held;
+    if (certified_halves != NULL) *certified_halves = certified;
 }
 
 void reputation_get_window_root(char *out)
@@ -9274,19 +9660,10 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
 {
     _ensure_init();
 
-    /* NOTE, unresolved and deliberately left alone (2026-09-21): this reads
-     * the peer count ONCE, before discovery has found anybody, so in
-     * production it is 0 for the life of the process and
-     * PAXOS_MAJORITY(0) == 1. One grant therefore carries a round.
-     *
-     * That happens to be what Python does for a small group — its
-     * _quorum_for_group is len(peers.all) // 2, which is also 1 for two or
-     * three peers — so live behaviour matches the reference today. It stops
-     * matching as the group grows: Python's threshold rises and this one does
-     * not, and merely refreshing num_peers here would NOT fix it, because the
-     * two formulas differ (n/2 + 1 against n // 2). Aligning them changes how
-     * many grants a commit needs, which is a protocol decision and not a
-     * cleanup. */
+    /* rep_state.num_peers is the paxos instance's size and nothing more. The
+     * grant and acceptance thresholds do NOT read it: it is sampled here,
+     * before discovery has found anybody, so it is 0 in production. They are
+     * sized per round against the live roster (_round_quorum_locked). */
     peers_read_lock(proc);
     rep_state.num_peers = (int)proc->protocol.num_peers;
     peers_read_unlock(proc);

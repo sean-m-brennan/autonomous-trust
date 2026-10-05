@@ -41,7 +41,7 @@ from autonomous_trust.core.config import Configuration, to_json_string
 from autonomous_trust.core.reputation.reputation import (
     RESOLVE_TTL_DEFAULT, PeerReputation, resolve_query_to_dict,
     resolved_to_dict, Transaction, attest_task_id, AttestedScore,
-    SignedAttestation)
+    SignedAttestation, commit_designation)
 from autonomous_trust.core._python.identity.identity import (
     public_identity_to_canonical)
 from autonomous_trust.core.identity import Group, Identity, Peers
@@ -142,6 +142,22 @@ class _Participant:
                         f'{self.id}: committed_tx_count={actual}, '
                         f'expected {expected}'
                     )
+            elif key in ('halves_held', 'certified_halves'):
+                # Ordinary halves held (pending or committed), and how many
+                # carry a commit certificate (doc/architecture/reputation.md, "Commit certificates").
+                held = certified = 0
+                for tx in self.process.history._task_mapping.values():
+                    if tx.attested:
+                        continue
+                    for scorer in (tx.p1_id, tx.p2_id):
+                        if scorer is None:
+                            continue
+                        held += 1
+                        certified += tx.certificate_of(scorer) is not None
+                actual = held if key == 'halves_held' else certified
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: {key}={actual}, expected {expected}')
             elif key == 'window_root':
                 # Phase 2: RFC 6962 ordered Merkle root over the resident
                 # committed window. Pins cross-language byte-identity of the
@@ -593,6 +609,10 @@ class ReputationAdapter:
                       'rep-grp', Encryptor.generate(), False)
         for spec in spec_participants[1:]:
             group.add_address(identities[spec['id']].uuid, identities[spec['id']].address)
+        # commit_certificates: true -- the cohort's group declares commit
+        # certificates (doc/architecture/reputation.md). Group-carried, so it is
+        # set on the one Group every participant shares. Mirrors the C adapter.
+        group._commit_certificates = fixtures.get('commit_certificates') is True
 
         handles: dict[str, ParticipantHandle] = {}
         for spec in spec_participants:
@@ -999,9 +1019,23 @@ class ReputationAdapter:
                 # keeps the pre-channel behavior.
                 channel=payload.get('channel'),
             )
-            obj = to_json_string((id_tup, score))
+            tup = (id_tup, score)
+            if payload.get('certify') is True:
+                # A proposer in a declaring group asks for certification.
+                tup = tup + (True,)
+            obj = to_json_string(tup)
         elif function == ReputationProtocol.accepted:
             tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)
+            if payload.get('signed') is True:
+                # The acceptor's signature over the half's commit_designation
+                # (doc/architecture/reputation.md, "Commit certificates"). Only a SOURCE step builds here; a
+                # response step re-delivers the real message, which is why the
+                # C adapter needs these same keys to rebuild it.
+                task_id = uuid5(_NS, f'tx:{payload.get("task_id", "default")}')
+                tup = tup + (self._detached_sig(
+                    sender_identity, commit_designation(
+                        proposer_uuid, task_id, float(payload.get('score', 1.0)),
+                        payload.get('channel'))),)
             obj = to_json_string(tup)
         elif function == ReputationProtocol.committed:
             # Phase 3 broadcast — (task_id, peer_id, score, group_uuid,
@@ -1020,6 +1054,19 @@ class ReputationAdapter:
             tup = (task_id, proposer_uuid, float(payload.get('score', 1.0)))
             if payload.get('channel') is not None:
                 tup = tup + (None, str(payload['channel']))
+            if 'cosigners' in payload or 'forged_by' in payload:
+                # A commit certificate (doc/architecture/reputation.md, "Commit certificates"): real
+                # signatures over commit_designation, built at scenario time.
+                # Only when the scenario names one. Mirrors the C adapter.
+                if len(tup) == 3:
+                    tup = tup + (None, payload.get('channel'))
+                # certified_score: the certificate is cut over a DIFFERENT
+                # score than the one committed (the binding's negative control).
+                tup = tup + (self._cosignatures(
+                    participants, payload, commit_designation(
+                        proposer_uuid, task_id,
+                        float(payload.get('certified_score', tup[2])),
+                        payload.get('channel'))),)
             obj = to_json_string(tup)
         elif function == ReputationProtocol.outdated:
             obj = str(payload.get('length', 0))
@@ -1050,6 +1097,17 @@ class ReputationAdapter:
                     tmp.update(tk, p1, float(entry['p1']))
                     tmp.update(tk, p2, float(entry['p2']))
                 built = list(tmp)
+                # certified_by: [ids] certifies both halves of an entry with
+                # those participants' signatures (doc/architecture/reputation.md, "Commit certificates").
+                for tx, entry in zip(built, spec):
+                    by = entry.get('certified_by')
+                    if not isinstance(by, list):
+                        continue
+                    for scorer, score in ((tx.p1_id, tx.p1_score),
+                                          (tx.p2_id, tx.p2_score)):
+                        tx.attach_certificate(scorer, self._cosignatures(
+                            participants, {'cosigners': by},
+                            commit_designation(scorer, tx.task_id, score)))
                 if payload.get('tamper') and len(built) >= 2:
                     built[1].p2_score = -1.0
                 obj = to_json_string(built)

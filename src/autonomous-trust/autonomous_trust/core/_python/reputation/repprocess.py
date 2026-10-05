@@ -43,7 +43,8 @@ from .reputation import (TransactionHistory, ReconcileResult, Reputation, Reputa
                          TransactionScore, SlashAttestation, SignedSlash,
                          AttestedScore, SignedAttestation,
                          Checkpoint, SignedCheckpoint, validate_tx_score,
-                         validate_tx_channel,
+                         validate_tx_channel, commit_designation,
+                         window_root_of,
                          PeerReputation, EVIDENCE_FILE, SLASH_MARKS_FILE,
                          evidence_to_dict,
                          evidence_from_dict, evidence_attest_certs,
@@ -416,6 +417,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self.requests: list[tuple[int, int]] = []
         self.proposals: dict[tuple[int, int], TransactionScore] = {}
         self.acceptances: dict[UUID, list[TransactionScore]] = {}
+        # Proposer side, only in a group that requires commit certificates:
+        # task id -> {acceptor uuid str: its signature over the half's
+        # commit_designation}, holding only signatures that verified. Becomes
+        # the certificate on `committed` once it clears the round's quorum.
+        self.commit_sigs_pending: dict = {}
         self.last_id = None
         self.last_value = None
         self.backoff = {}
@@ -902,6 +908,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     self.round_group.get(idx)):
                 try:
                     score = (id1, id2, peer_id), self.my_requests[idx].score
+                    if self._commit_certs_required(self.round_group.get(idx)):
+                        # Ask each acceptor to sign what it accepts: a third
+                        # element, appended so a two-element proposal is
+                        # byte-for-byte what it always was.
+                        score = score + (True,)
                     msg = Message(self.name, ReputationProtocol.transaction,
                                   to_json_string(score), self.group,
                                   from_whom=self.identity)
@@ -1108,8 +1119,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     def handle_transaction(self, queues, message):
         if message.function == ReputationProtocol.transaction:
             try:
-                (id1, id2, peer_id), score = from_json_string(message.obj)
-            except ValueError as err:
+                parts = from_json_string(message.obj)
+                (id1, id2, peer_id), score = parts[0], parts[1]
+                # A third element asks for a commit certificate (a group that
+                # requires them). Strictly `True`, so nothing else turns it on.
+                certify = len(parts) > 2 and parts[2] is True
+            except (ValueError, TypeError, IndexError) as err:
                 # An out-of-range score is rejected in TransactionScore's
                 # constructor (doc/architecture/reputation.md), which `from_json_string` runs. Dropping
                 # here rather than letting it propagate: the payload is
@@ -1135,8 +1150,31 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             if hasattr(score, 'task_id'):
                 self._record_task_weight(score.task_id, self._resolve_tx_weight(score))
                 self._record_task_tier(score.task_id, self._resolve_tx_tier(score))
+            reply = (id1, id2, peer_id)
+            if certify:
+                # Sign the half this round writes: its scorer is the proposer,
+                # and only the proposer may ask for one (a relayed proposal
+                # carries somebody else's round, and its signature would vouch
+                # for a round this node never saw that peer run).
+                sender = getattr(message.from_whom, 'uuid', None)
+                if sender is not None and str(sender) == str(peer_id) \
+                        and hasattr(score, 'task_id'):
+                    try:
+                        reply = reply + (self._detached_sig(
+                            self.identity, commit_designation(
+                                peer_id, score.task_id, score.score,
+                                score.channel)),)
+                    except Exception:
+                        self.logger.error(
+                            'handle_transaction: cannot sign the commit '
+                            'designation; accepting unsigned')
+                else:
+                    self.logger.warning(
+                        'Not certifying a proposal from %s for %s\'s round',
+                        getattr(message.from_whom, 'nickname', '?'),
+                        str(peer_id)[:8])
             msg = Message(self.name, ReputationProtocol.accepted,
-                          to_json_string((id1, id2, peer_id)),
+                          to_json_string(reply),
                           message.from_whom, from_whom=self.identity)
             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
             return True
@@ -1166,7 +1204,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def handle_accepted(self, queues, message):
         if message.function == ReputationProtocol.accepted:
-            id1, id2, peer_id = from_json_string(message.obj)
+            parts = from_json_string(message.obj)
+            id1, id2, peer_id = parts[0], parts[1], parts[2]
             idx = self._paxos_id_index(id1, id2)
             score = self.proposals[idx]
             self.logger.debug('Tx accepted')
@@ -1178,8 +1217,35 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     return True  # drop unverified acceptance
                 self.acceptances[score.task_id].append(message.from_whom)
             round_group_uuid = self.round_group.get(idx)
-            if len(self.acceptances[score.task_id]) > self._quorum_for_group(
-                    round_group_uuid):
+            certificate = None
+            if self._commit_certs_required(round_group_uuid):
+                # Only a SIGNED acceptance counts here, and the round carries
+                # once the signatures clear the same bar a receiver will hold
+                # them to (_commit_cert_ok), so a commit this node sends is one
+                # its own group will write.
+                voter = self._attributed_voter(message, None, 'accepted')
+                sig = parts[3] if len(parts) > 3 else None
+                desig = commit_designation(peer_id, score.task_id,
+                                           score.score, score.channel)
+                if voter is None or not self._verify_cosignature(desig, voter,
+                                                                 sig):
+                    self.logger.warning(
+                        'Acceptance from %s carries no valid commit signature;'
+                        ' not counted', getattr(message.from_whom, 'nickname',
+                                                '?'))
+                    return True
+                pending = self.commit_sigs_pending.setdefault(score.task_id, {})
+                pending[voter] = sig
+                if not self._commit_cert_ok(peer_id, score.task_id, score.score,
+                                            score.channel, pending,
+                                            round_group_uuid):
+                    return True
+                certificate = dict(pending)
+                reached = True
+            else:
+                reached = len(self.acceptances[score.task_id]) > \
+                    self._quorum_for_group(round_group_uuid)
+            if reached:
                 # Idempotency guard: every ACCEPTED that arrives
                 # after the majority threshold has been crossed would
                 # otherwise re-fire the commit-and-broadcast block.
@@ -1204,7 +1270,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # for the rationale). Route to the round's group chain
                 # — primary for leaf nodes, a child chain on a gateway.
                 self._chain_for_group(round_group_uuid).update(
-                    score.task_id, peer_id, score.score, score.channel)
+                    score.task_id, peer_id, score.score, score.channel,
+                    certificate=certificate)
+                self.commit_sigs_pending.pop(score.task_id, None)
                 # Our half is in: stop watching it (ISSUES §2.24).
                 self.awaiting_commit.pop(str(score.task_id), None)
                 # Fold-on-commit: keep the dashboard running consensus EMA
@@ -1245,11 +1313,17 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     # commit that arrived without it and one that arrived
                     # with `task_outcome` must hash the same -- which they do,
                     # since both normalize to no channel block.
+                    #
+                    # The certificate rides as element 6, and only in a group
+                    # that requires it, so every other commit is the five
+                    # elements it always was.
+                    commit_obj = (score.task_id, peer_id, score.score,
+                                  round_group_uuid, score.channel)
+                    if certificate is not None:
+                        commit_obj = commit_obj + (certificate,)
                     commit_msg = Message(
                         self.name, ReputationProtocol.committed,
-                        to_json_string(
-                            (score.task_id, peer_id, score.score,
-                             round_group_uuid, score.channel)),
+                        to_json_string(commit_obj),
                         self._group_by_uuid(round_group_uuid) or self.group,
                         from_whom=self.identity)
                     queues[CfgIds.network].put(
@@ -1283,6 +1357,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # group_uuid was: a legacy 3- or 4-tuple has no channel, which
                 # is `task_outcome` by construction (R+D.md §12.8).
                 channel = parsed[4] if len(parsed) > 4 else None
+                # Element 6: the commit certificate, present only from a group
+                # that requires one.
+                sigs = (parsed[5] if len(parsed) > 5
+                        and isinstance(parsed[5], dict) else None)
             except Exception:
                 self.logger.warning(
                     'handle_committed: malformed payload %r', message.obj)
@@ -1330,8 +1408,23 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 self.logger.warning(
                     'Dropping committed tx from %s: %s', str(peer_id)[:8], err)
                 return True
+            # Commit certificates (doc/architecture/reputation.md): a group that
+            # declares them writes no ordinary half without a quorum of this
+            # node's own view having signed exactly this score. One that does
+            # not still keeps a valid certificate it is handed, so a chain cut
+            # before the group required them can be served to one that does.
+            certified = bool(sigs) and self._commit_cert_ok(
+                peer_id, task_id, score, channel, sigs, group_uuid)
+            if not certified and self._commit_certs_required(group_uuid):
+                self.logger.warning(
+                    'Rejecting committed from %s: %s',
+                    getattr(message.from_whom, 'nickname', '?'),
+                    'its certificate does not meet our quorum' if sigs
+                    else 'this group requires a commit certificate')
+                return True
             chain = self._chain_for_group(group_uuid)
-            chain.update(task_id, peer_id, score, channel)
+            chain.update(task_id, peer_id, score, channel,
+                         certificate=sigs if certified else None)
             # Fold-on-commit: advance the dashboard running consensus EMA as
             # soon as this tx completes (primary chain only; idempotent).
             self._fold_committed_tx(task_id, chain)
@@ -1461,6 +1554,98 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         finalizer cannot also choose the bar it has to clear."""
         return len(self._verified_cosigners(designation, sigs)) > \
             self._quorum_for_group(group_uuid)
+
+    # ----- Commit certificates (doc/architecture/reputation.md) ------------
+    # A group may declare that every ordinary half needs a quorum certificate
+    # (Group.commit_certificates, default off). What one proves is the round:
+    # that more than a quorum of this node's own view accepted exactly this
+    # score from this scorer. It cannot prove the score is TRUE -- an acceptor
+    # never sees the task -- so the lie it leaves open is a scorer's about its
+    # own half, which is R+D.md §14.2's to answer, not this one's.
+
+    def _commit_certs_required(self, group_uuid=None) -> bool:
+        """Does the group a commit lands in declare commit certificates? Read
+        off the group, never configured per node, so every member of a cohort
+        gives the same answer."""
+        grp = self._group_by_uuid(group_uuid) or self.group
+        return getattr(grp, 'commit_certificates', False) is True
+
+    def _commit_cert_ok(self, scorer, task_id, score, channel, sigs,
+                        group_uuid=None) -> bool:
+        """Do `sigs` certify `scorer`'s half? More than ``_quorum_for_group``
+        distinct members of OUR view must have signed its
+        :func:`commit_designation`. The scorer's own signature never counts:
+        a proposer cannot vouch for its own round."""
+        if not isinstance(sigs, dict) or not sigs:
+            return False
+        try:
+            desig = commit_designation(scorer, task_id, score, channel)
+        except (TypeError, ValueError):
+            return False
+        voters = self._verified_cosigners(desig, sigs) - {str(scorer)}
+        return len(voters) > self._quorum_for_group(group_uuid)
+
+    def _covered_by_checkpoint(self, chain):
+        """``(first, end)`` of the latest quorum-attested primary checkpoint
+        when `chain` holds that whole window and reproduces its root, else
+        None. Entries in that range are certified by the checkpoint, so
+        catch-up does not ask them for commit certificates: that is how a chain
+        cut before its group required certificates, or by members since gone,
+        stays acceptable once a quorum has checkpointed it."""
+        ckpt = self._finalized
+        if ckpt is None or not getattr(ckpt, 'count', 0):
+            return None
+        first, count = int(ckpt.first_index), int(ckpt.count)
+        window = [tx for tx in chain if getattr(tx, 'index', None) is not None
+                  and first <= tx.index < first + count]
+        if [tx.index for tx in window] != list(range(first, first + count)):
+            return None
+        root, theirs = window_root_of(window), ckpt.root
+        if isinstance(root, bytes):
+            root = root.decode('ascii')
+        if isinstance(theirs, bytes):
+            theirs = theirs.decode('ascii')
+        return (first, first + count) if root == theirs else None
+
+    def _held_identically(self, tx) -> bool:
+        """Do we already hold `tx`, at its index, hashing the same? Then a
+        segment repeating it tells us nothing new and is not asked to prove it
+        again."""
+        held = self.history._task_mapping.get(getattr(tx, 'task_id', None))
+        return (held is not None and held.index is not None
+                and held.index == getattr(tx, 'index', None)
+                and held.entry_hash() == tx.entry_hash())
+
+    def _commit_certs_ok(self, chain, message) -> bool:
+        """Catch-up's half of commit certificates: in a group that requires
+        them, every ordinary half of every entry in `chain` that is new to us
+        and outside a quorum checkpoint carries a certificate meeting our
+        quorum. Otherwise catch-up would be a way around the round."""
+        if not self._commit_certs_required(None):
+            return True
+        covered = self._covered_by_checkpoint(chain)
+        for tx in chain:
+            if getattr(tx, 'attested', False) or getattr(tx, 'index', None) is None:
+                continue
+            if covered and covered[0] <= tx.index < covered[1]:
+                continue
+            if self._held_identically(tx):
+                continue
+            for scorer, score, chan in ((tx.p1_id, tx.p1_score, tx.p1_channel),
+                                        (tx.p2_id, tx.p2_score, tx.p2_channel)):
+                if scorer is None:
+                    continue
+                sigs = (getattr(tx, 'commit_sigs', None) or {}).get(str(scorer))
+                if not self._commit_cert_ok(scorer, tx.task_id, score, chan,
+                                            sigs):
+                    self.logger.warning(
+                        'Rejecting chain from %s: entry %s (task %s) has no '
+                        'commit certificate for %s\'s half meeting our quorum,'
+                        ' and no checkpoint covers it',
+                        getattr(message.from_whom, 'nickname', '?'),
+                        tx.index, str(tx.task_id)[:8], str(scorer)[:8])
+                    return False
+        return True
 
     def _slash_target_ok(self, attestation) -> bool:
         """Reject self-slash adoption and degenerate slasher==target."""
@@ -2186,8 +2371,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         roster WITHOUT this node and is one signature short for an even-sized
         group, so both halves of an even split finalized their own windows and
         could never reconcile after the heal (Agora Phase 4 DDIL, 2026-09-25).
-        Odd sizes are unchanged; Paxos grants and slashing are untouched (the
-        grant formula is ISSUES.md §2.13). Mirrors C _ckpt_quorum_for_group."""
+        Odd sizes are unchanged; Paxos grants and slashing keep
+        len(peers) // 2, which C now sizes the same way, live, per round.
+        Mirrors C _ckpt_quorum_for_group."""
         if not self.child_groups:
             roster = len(self.peers.all)
         else:
@@ -3154,7 +3340,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     getattr(message.from_whom, 'nickname', '?'),
                     str(tx.task_id)[:8])
                 return False
-        return True
+        return self._commit_certs_ok(chain, message)
 
     def _reappend_attested(self, res):
         """An adopted chain that dropped a certified attested entry: re-append

@@ -410,6 +410,12 @@ typedef struct {
      * checkpoint's co-signatures are outside its root; dropped on eviction.
      * Mirrors Python TransactionHistory.attest_certs. */
     map_t         attest_certs;
+    /* Commit certificates of ORDINARY halves (doc/architecture/reputation.md,
+     * "Commit certificates"): "<task uuid>|<scorer uuid>" -> the JSON text of
+     * {voter uuid: signature hex over commit_designation}. Two per entry, one
+     * per round. Outside the entry hash, like attest_certs; dropped on
+     * eviction. Mirrors Python Transaction.commit_sigs. */
+    map_t         commit_certs;
 } tx_history_t;
 
 /*@
@@ -470,6 +476,34 @@ int  tx_history_append_attested(tx_history_t *hist, const transaction_t *tx,
 
 /* The certificate kept for an attested entry (JSON text), or NULL. */
 const char *tx_history_attest_cert(const tx_history_t *hist, const uuid_t task_uuid);
+
+/**
+ * @brief The bytes an acceptor signs to certify ONE half of an ordinary
+ *        commit: "AT-COMMIT\0" scorer "|" task "|" %.17g score "|" channel.
+ *
+ * Lowercase uuids, and the channel normalized (NULL / "" == task_outcome), so
+ * an absent channel and an explicit default are one claim with one signature.
+ * The group is not covered; see Python commit_designation for why.
+ *
+ * @return the designation's length, or 0 if @p cap is too small.
+ */
+size_t commit_designation(const uuid_t scorer, const uuid_t task, double score,
+                          const char *channel, uint8_t *out, size_t cap);
+/**
+ * @brief Keep @p cert_json ({voter: sig hex}) as the commit certificate of
+ *        @p scorer's half of @p task. The caller has verified it.
+ *
+ * Nothing is kept unless the history holds that half of an ordinary entry, so
+ * a certificate cannot outlive or precede what it certifies.
+ *
+ * @return 0 when kept, -1 otherwise.
+ */
+int tx_history_attach_commit_cert(tx_history_t *hist, const uuid_t task,
+                                  const uuid_t scorer, const char *cert_json);
+/** @brief The commit certificate held for @p scorer's half of @p task, as JSON
+ *         text, or NULL. Borrowed: valid until the history next changes. */
+const char *tx_history_commit_cert(const tx_history_t *hist, const uuid_t task,
+                                   const uuid_t scorer);
 
 int  tx_history_update(tx_history_t *hist, const uuid_t task_uuid,
                        const uuid_t peer_uuid, double score,

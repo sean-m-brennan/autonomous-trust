@@ -1,0 +1,47 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: commit-cert-undeclared-group-keeps-certificate
+byte_pinning: false
+description: |
+    Commit certificates (doc/architecture/reputation.md). bob's roster is alice, carol
+    and dave, so his quorum is more than 3 // 2: two signatures over alice's
+    commit_designation, never counting alice's own. bob already holds carol's half
+    of t-1; alice's commit is the other half.
+
+    The group does NOT declare certificates, so an uncertified commit would be
+    written as ever. A valid certificate is still kept beside the half, so a chain
+    cut before the group declares them can be served to one that does.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: proposer
+  - id: dave
+    role: member
+
+fixtures:
+  tx_history:
+    bob:
+      - task_id: t-1
+        p1: carol
+        p1_score: 0.9
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: tx committed
+    payload:
+      task_id: t-1
+      score: 0.8
+      cosigners: [carol, dave]
+
+expected_state:
+  bob:
+    committed_tx_count: 1
+    halves_held: 2
+    certified_halves: 1

@@ -432,6 +432,31 @@ class TransactionScore(Configuration):
         return d
 
 
+def commit_designation(scorer, task_id, score, channel=None) -> bytes:
+    """The bytes an acceptor signs to certify ONE half of an ordinary commit
+    (doc/architecture/reputation.md, "Commit certificates"): that `scorer` put
+    this score, on this channel, for this task, to a round the signer accepted.
+
+    Domain-separated like every other co-signed designation in this module.
+    ``%.17g`` and lowercase uuids, as the C twin's ``commit_designation``. The
+    channel is normalized, so an absent channel and an explicit
+    :data:`TX_CHANNEL_DEFAULT` are one claim with one signature, exactly as they
+    are one entry hash.
+
+    The group is deliberately NOT covered. The acceptor is never told which of
+    a gateway's chains the round lands in, and a group's uuid changes when it is
+    absorbed by a merge, which would orphan every certificate cut before it. A
+    certificate replayed into another chain still has to clear THAT group's
+    quorum with signers the receiver resolves, so the reach this leaves is a
+    scorer re-filing its own certified half, never anybody else's."""
+    chan = channel if channel else TX_CHANNEL_DEFAULT
+    return (b'AT-COMMIT\x00'
+            + str(scorer).lower().encode()
+            + b'|' + str(task_id).lower().encode()
+            + b'|' + format(float(score), '.17g').encode()
+            + b'|' + str(chan).encode())
+
+
 class Transaction(Configuration):
     """A committed chain entry: who transacted, how well, and how we know.
 
@@ -452,7 +477,7 @@ class Transaction(Configuration):
                  prev_hash: bytes = None, p1_channel: str = None,
                  p2_channel: str = None, attested: bool = False,
                  subject_id: UUID = None, evidence_digest: str = None,
-                 attest_sigs: dict = None):
+                 attest_sigs: dict = None, commit_sigs: dict = None):
         self.task_id = task_id
         self.p1_id = p1_id
         self.p1_score = p1_score
@@ -495,6 +520,17 @@ class Transaction(Configuration):
         # in the canonical bytes, as a checkpoint's co-signatures are not in
         # its root; the history keeps its own copy in attest_certs.
         self.attest_sigs = dict(attest_sigs) if attest_sigs else None
+        # The commit certificate of each ORDINARY half (doc/architecture/
+        # reputation.md, "Commit certificates"): scorer uuid str -> {voter uuid
+        # str: signature hex over `commit_designation`}. The two halves of an
+        # entry are committed by two rounds, so there are two certificates. NOT
+        # in the canonical bytes, as a checkpoint's co-signatures are not in its
+        # root: an entry hashes the same with or without them, which is what
+        # lets a group start requiring them without breaking a stored chain.
+        self.commit_sigs = ({str(k): dict(v) for k, v in commit_sigs.items()
+                             if isinstance(v, dict)}
+                            if isinstance(commit_sigs, dict) and commit_sigs
+                            else None)
 
     def __len__(self):
         if self.p1_id is None and self.p2_id is None:
@@ -526,7 +562,24 @@ class Transaction(Configuration):
                 d.pop(k, None)
         elif not d.get('attest_sigs'):
             d.pop('attest_sigs', None)
+        # And the commit certificates: a group that does not declare them never
+        # cuts one, so its entries keep the shape they always had.
+        if not d.get('commit_sigs'):
+            d.pop('commit_sigs', None)
         return d
+
+    def certificate_of(self, scorer) -> 'dict | None':
+        """The commit certificate held for `scorer`'s half, or None."""
+        return (self.commit_sigs or {}).get(str(scorer))
+
+    def attach_certificate(self, scorer, sigs) -> None:
+        """Keep `sigs` as the certificate of `scorer`'s half. The caller has
+        verified it; an empty one is not kept."""
+        if not sigs:
+            return
+        if self.commit_sigs is None:
+            self.commit_sigs = {}
+        self.commit_sigs[str(scorer)] = dict(sigs)
 
     def about(self, peer_uuid):
         """``(score, author)``: the score this entry holds ABOUT `peer_uuid` and
@@ -787,7 +840,7 @@ class TransactionHistory(Mapping):
         return self._task_mapping[key]
 
     def update(self, task_id: UUID, peer_id: UUID, score: float,
-               channel: str = None):
+               channel: str = None, certificate: dict = None):
         if task_id not in self._task_mapping:
             # Refuse to reanimate a task we already committed and
             # rolled out of the resident chain. handle_committed
@@ -802,6 +855,13 @@ class TransactionHistory(Mapping):
                 return
             self._task_mapping[task_id] = Transaction(task_id)
         tx = self._task_mapping[task_id]
+        if certificate and peer_id is not None and not tx.attested \
+                and str(peer_id) in (str(tx.p1_id), str(tx.p2_id)):
+            # The half is already held, perhaps from a commit that arrived
+            # before this group required certificates: keep the certificate
+            # beside it rather than drop it, since that is what catch-up will
+            # ask for. Covers the duplicate case below as well.
+            tx.attach_certificate(peer_id, certificate)
         if len(tx) == 2:
             return  # ignore duplicates
         if tx.attested:
@@ -814,6 +874,8 @@ class TransactionHistory(Mapping):
             # and skew downstream peer-tx counts).
             return
         tx.add(peer_id, score, channel)
+        if certificate and peer_id is not None:
+            tx.attach_certificate(peer_id, certificate)
         # Index only the side just added. `_map_peers` indexes BOTH sides, so
         # calling it on each half listed every tx twice under its p1 and
         # double-counted those in every by_peer() consumer (CTFT, pure, the
@@ -1484,6 +1546,14 @@ def evidence_to_dict(chain, signed_checkpoint=None, attest_certs=None) -> dict:
             if cert:
                 entries[-1]['attest_sigs'] = {str(k): _hex_str(v)
                                               for k, v in cert.items()}
+        # Commit certificates of ordinary halves: additive and omitted when
+        # absent, like the channels. They sit outside the entry hash, so a
+        # verifier ignores them to recompute the root and reads them to check
+        # the rounds.
+        elif tx.commit_sigs:
+            entries[-1]['commit_sigs'] = {
+                str(scorer): {str(k): _hex_str(v) for k, v in sigs.items()}
+                for scorer, sigs in tx.commit_sigs.items()}
     doc = {
         'schema': EVIDENCE_SCHEMA,
         'chain': entries,
@@ -1556,7 +1626,13 @@ def evidence_from_dict(doc):
             evidence_digest=(str(entry['evidence_digest'])
                              if entry.get('attested')
                              and entry.get('evidence_digest') is not None
-                             else None)))
+                             else None),
+            commit_sigs=(None if entry.get('attested')
+                         or not isinstance(entry.get('commit_sigs'), dict)
+                         else {str(scorer): {str(k): str(v)
+                                             for k, v in sigs.items()}
+                               for scorer, sigs in entry['commit_sigs'].items()
+                               if isinstance(sigs, dict)})))
     signed = None
     raw_ck = doc.get('checkpoint')
     if isinstance(raw_ck, dict):

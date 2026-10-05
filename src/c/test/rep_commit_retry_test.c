@@ -196,7 +196,8 @@ static void _begin(void)
 
 static void _end(void) { messaging_set_test_hook(NULL); }
 
-/* Two peers, so PAXOS_MAJORITY(2) == 2: both must grant and both accept. */
+/* Two peers, sized live as Python sizes them: one grant carries the round
+ * (`>= 2 // 2`), and both must accept (`> 2 // 2`). */
 typedef struct { identity_t *me, *alice, *bob; process_t *proc;
                  uuid_t task; char task_str[UUID_STRING_LEN + 1]; } cohort_t;
 

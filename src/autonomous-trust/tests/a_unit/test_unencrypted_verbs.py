@@ -32,19 +32,22 @@ flag is false, and the verb is accepted in plaintext -- one of the core's
 `CORE_UNENCRYPTED_VERBS`, or an extension's verb that unencrypted_verbs.cfg.json
 grants (plaintext_verbs.py; the rules of that file are test_plaintext_verbs.py).
 The refusal cases below are the load-bearing half of this file.
+
+A file-granted verb is exercised with a stand-in extension; first contact's
+own verbs and send sites are pinned in that distribution's
+test_first_contact_plaintext.py.
 """
 from __future__ import annotations
 
 import ast
 import json
 import os
+from dataclasses import dataclass
 from unittest.mock import MagicMock
 
 import pytest
 
 from autonomous_trust.core import plaintext_verbs
-from autonomous_trust.first_contact import first_contact
-from autonomous_trust.first_contact.fc_protocol import FirstContactProtocol
 from autonomous_trust.core.identity.protocol import (
     IdentityProtocol,
     CORE_UNENCRYPTED_VERBS,
@@ -52,18 +55,25 @@ from autonomous_trust.core.identity.protocol import (
 from autonomous_trust.core.network.netprocess import NetworkProcess
 from autonomous_trust.core.reputation import ReputationProtocol
 
-#: First contact's declared plaintext verbs, which the file below grants.
-FC_VERBS = frozenset(first_contact.EXTENSION.plaintext_verbs)
-#: Every verb the receiver accepts in plaintext once the file grants FC_VERBS.
-UNENCRYPTED_VERBS = CORE_UNENCRYPTED_VERBS | FC_VERBS
+@dataclass(frozen=True)
+class _Ext:
+    name: str
+    plaintext_verbs: tuple = ()
+
+
+#: A stand-in optional feature whose plaintext verbs the file below grants.
+DEMO = _Ext('demo', ('demo_ack', 'demo_hello'))
+DEMO_VERBS = frozenset(DEMO.plaintext_verbs)
+#: Every verb the receiver accepts in plaintext once the file grants DEMO_VERBS.
+UNENCRYPTED_VERBS = CORE_UNENCRYPTED_VERBS | DEMO_VERBS
 
 
 @pytest.fixture(autouse=True)
 def _granted(tmp_path):
-    """The node's plaintext-verbs file names first contact's verbs."""
+    """The node's plaintext-verbs file names the stand-in's verbs."""
     (tmp_path / plaintext_verbs.FILENAME).write_text(
-        json.dumps({'verbs': sorted(FC_VERBS)}))
-    plaintext_verbs.configure(str(tmp_path), [first_contact.EXTENSION])
+        json.dumps({'verbs': sorted(DEMO_VERBS)}))
+    plaintext_verbs.configure(str(tmp_path), [DEMO])
     yield
     plaintext_verbs.reset()
 
@@ -102,9 +112,9 @@ class TestAllowlistedVerbsAreAccepted:
         # does for the same messages.
         assert proc._msg_to_queue.call_args.kwargs.get('validate') is False
 
-    @pytest.mark.parametrize('verb', sorted(FC_VERBS))
+    @pytest.mark.parametrize('verb', sorted(DEMO_VERBS))
     def test_an_extension_verb_is_refused_without_the_file(self, verb):
-        """First contact's verbs are plaintext only because the file grants
+        """An extension's verbs are plaintext only because the file grants
         them; the core's are compiled in."""
         plaintext_verbs.reset()
         proc = _proc()
@@ -168,30 +178,18 @@ class TestAllowlistMatchesTheSendSites:
     """Drift detector. An `encrypt=False` send whose verb is missing from the
     allowlist is dropped by the receiver once the peer is known -- silently, on
     a path that only surfaces in multi-peer convergence. That is exactly how the
-    original defect hid, so pin the two against each other."""
+    original defect hid, so pin the core's send sites against the core's
+    allowlist. First contact pins its own the same way."""
 
     def _unencrypted_sends(self):
         """Every `Message(CfgIds.x, IdentityProtocol.verb, ..., encrypt=False)`
-        in the identity process, resolved to its wire verb. Scans idprocess.py
-        and first contact's modules (the opt-in 1:1 handshake sends hello/hello_ack
-        plaintext from first_contact.py)."""
+        in the identity process, resolved to its wire verb."""
         id_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(
                 os.path.abspath(__file__)))),
             'autonomous_trust', 'core', '_python', 'identity')
-        # First contact's modules, wherever its distribution is.
-        fc_dir = os.path.dirname(os.path.abspath(first_contact.__file__))
         found = {}
-        for path in (os.path.join(id_dir, 'idprocess.py'),
-                     *(os.path.join(fc_dir, f) for f in (
-                         'first_contact.py', 'directory_contact.py',
-                         'device_contact.py'))):
-            tree = ast.parse(open(path).read())
-            self._scan_sends(tree, found)
-        return found
-
-    @staticmethod
-    def _scan_sends(tree, found):
+        tree = ast.parse(open(os.path.join(id_dir, 'idprocess.py')).read())
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -206,35 +204,33 @@ class TestAllowlistMatchesTheSendSites:
             if not plaintext or len(node.args) < 2:
                 continue
             verb_node = node.args[1]
-            # Only resolve the IdentityProtocol.<attr> and
-            # FirstContactProtocol.<attr> forms; anything else is reported
-            # rather than silently skipped.
-            owner = {'IdentityProtocol': IdentityProtocol,
-                     'FirstContactProtocol': FirstContactProtocol}.get(
-                getattr(getattr(verb_node, 'value', None), 'id', None))
-            if isinstance(verb_node, ast.Attribute) and owner is not None:
-                verb = getattr(owner, verb_node.attr, None)
+            # Only the IdentityProtocol.<attr> form resolves; anything else is
+            # reported rather than silently skipped.
+            if isinstance(verb_node, ast.Attribute) and \
+                    getattr(getattr(verb_node, 'value', None), 'id', None) \
+                    == 'IdentityProtocol':
+                verb = getattr(IdentityProtocol, verb_node.attr, None)
                 if verb is not None:
                     found[verb] = verb_node.attr
-            else:
-                found[ast.dump(verb_node)[:40]] = '<unresolved>'
+                    continue
+            found[ast.dump(verb_node)[:40]] = '<unresolved>'
         return found
 
     def test_every_plaintext_send_is_allowlisted(self):
         sends = self._unencrypted_sends()
         assert sends, 'found no encrypt=False sends -- the scan broke, not the code'
-        missing = {v: n for v, n in sends.items() if v not in UNENCRYPTED_VERBS}
+        missing = {v: n for v, n in sends.items()
+                   if v not in CORE_UNENCRYPTED_VERBS}
         assert not missing, (
-            'these verbs are sent with encrypt=False but are neither core '
-            'plaintext verbs nor first contact\'s declared ones, so a known peer '
-            'will silently drop them: %r'
+            'these verbs are sent with encrypt=False but are not core '
+            'plaintext verbs, so a known peer will silently drop them: %r'
             % missing)
 
     def test_allowlist_carries_no_verb_nobody_sends(self):
         """The other direction: an allowlist entry with no corresponding
         plaintext send is dead permission and should be removed."""
         sends = set(self._unencrypted_sends())
-        stale = set(UNENCRYPTED_VERBS) - sends
+        stale = set(CORE_UNENCRYPTED_VERBS) - sends
         assert not stale, (
             'allowlisted but never sent as plaintext (dead permission): %r'
             % sorted(stale))
