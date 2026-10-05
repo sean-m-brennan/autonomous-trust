@@ -37,6 +37,7 @@
 #include "utilities/util.h"
 #include "config/configuration.h"
 #include "identity/identity.h"
+#include "utilities/send_retry.h"   /* at_send: keep a refused frame (ISSUES §2.14) */
 
 #define EFLEET_PAXOS 260
 DEFINE_ERROR(EFLEET_PAXOS, "Fleet Paxos consensus error");
@@ -171,7 +172,8 @@ static bool handle_update_proposal(const process_t *proc, directory_t *queues, g
         memcpy(&req.info.net_msg.to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
         strncpy(req.info.net_msg.return_to, "fleet", PROC_NAME_LEN);
         net_msg_pack_json(&req.info.net_msg, req_json);
-        messaging_send("network", NET_MESSAGE, &req, false);
+        at_send(proc, "network", &req, "a vote request", "network",
+                0, NULL, NULL, 0);
         net_msg_free_obj(&req.info.net_msg);
     }
     peers_read_unlock(proc);
@@ -254,7 +256,8 @@ static bool handle_vote_request(const process_t *proc, directory_t *queues, gene
         json_decref(grant_json);
 
         log_debug(proc->logger, "Fleet: Vote granted\n");
-        messaging_send("network", NET_MESSAGE, &grant, false);
+        at_send(proc, "network", &grant, "a vote grant", "network",
+                0, NULL, NULL, 0);
         net_msg_free_obj(&grant.info.net_msg);
     }
     else
@@ -281,7 +284,8 @@ static bool handle_vote_request(const process_t *proc, directory_t *queues, gene
         json_decref(nack_json);
 
         log_debug(proc->logger, "Fleet: Vote nacked\n");
-        messaging_send("network", NET_MESSAGE, &nack, false);
+        at_send(proc, "network", &nack, "a vote refusal", "network",
+                0, NULL, NULL, 0);
         net_msg_free_obj(&nack.info.net_msg);
     }
 
@@ -376,7 +380,8 @@ static bool handle_vote_grant(const process_t *proc, directory_t *queues, generi
             memcpy(&acc_msg.info.net_msg.to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
             strncpy(acc_msg.info.net_msg.return_to, "fleet", PROC_NAME_LEN);
             net_msg_pack_json(&acc_msg.info.net_msg, acc_json);
-            messaging_send("network", NET_MESSAGE, &acc_msg, false);
+            at_send(proc, "network", &acc_msg, "an acceptance", "network",
+                    0, NULL, NULL, 0);
             net_msg_free_obj(&acc_msg.info.net_msg);
         }
         peers_read_unlock(proc);
@@ -518,7 +523,8 @@ static bool handle_update_accepted(const process_t *proc, directory_t *queues, g
     generic_msg_t notify = {0};
     notify.type = FLEET_UPDATE_ACCEPTED;
     uuid_parse(prop_uuid_str, AT_MSG_EXT(&notify, fleet_update_accepted_msg_t)->proposal_uuid);
-    messaging_send(AT_MAIN_QUEUE, FLEET_UPDATE_ACCEPTED, &notify, false);
+    at_send(proc, AT_MAIN_QUEUE, &notify, "an accepted update", AT_MAIN_QUEUE,
+            0, NULL, NULL, 0);
 
     /* If we already have the artifact (proposer), mark complete.
      * Otherwise, request the artifact from the sender (proposer). */
@@ -550,7 +556,8 @@ static bool handle_update_accepted(const process_t *proc, directory_t *queues, g
 
             net_msg_pack_json(anmsg, fetch_req);
             json_decref(fetch_req);
-            messaging_send("network", NET_MESSAGE, &artifact_msg, false);
+            at_send(proc, "network", &artifact_msg, "an artifact request", "network",
+                    0, NULL, NULL, 0);
             net_msg_free_obj(anmsg);
 
             log_info(proc->logger, "Fleet: triggered artifact fetch for %s from %s\n",

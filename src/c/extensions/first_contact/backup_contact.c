@@ -49,6 +49,7 @@
 #include "utilities/message.h"
 #include "utilities/msg_registry.h"
 #include "utilities/util.h"
+#include "utilities/send_retry.h"   /* at_send: keep a refused event */
 
 static char FN_APP_BACKUP_EXPORT[] = AT_APP_BACKUP_EXPORT;
 static char FN_APP_BACKUP_IMPORT[] = AT_APP_BACKUP_IMPORT;
@@ -75,8 +76,9 @@ static void _emit(const process_t *proc, int32_t kind, backup_ev_t e)
     m->data.added = e.added;
     m->data.updated = e.updated;
     m->data.removed = e.removed;
-    if (messaging_send(AT_MAIN_QUEUE, FIRST_CONTACT_BACKUP_EVENT, &msg, false) != 0)
-        log_debug(proc->logger, "Identity: backup: no main queue for event %d\n", kind);
+    if (at_send(proc, AT_MAIN_QUEUE, &msg, "a backup event", "the app",
+                AT_SEND_NOW, NULL, NULL, 0) != 0)
+        log_debug(proc->logger, "Identity: backup: could not hand the app event %d\n", kind);
     sodium_memzero(m->data.passphrase, sizeof(m->data.passphrase));
 }
 

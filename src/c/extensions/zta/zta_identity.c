@@ -51,6 +51,7 @@
 #include "zta/zta_process.h"
 #include "zta/zta_binding.h"     /* the credential->identity binding
                                     (doc/architecture/zta-integration.md) */
+#include "utilities/send_retry.h"   /* at_send: keep a refused frame */
 
 static bool _is_operator_credential(const zta_policy_t *policy,
                                     const uint8_t *cred, size_t cred_len,
@@ -300,7 +301,9 @@ static void _publish_zta_standing(const process_t *proc,
         at_strlcpy(msg.info.peer_standing.reason, "verified at admission",
                    sizeof(msg.info.peer_standing.reason));
     }
-    if (messaging_send("reputation", PEER_STANDING, &msg, false) != 0) {
+    /* Once, at admission: kept on a full queue (ISSUES §2.14). */
+    if (at_send(proc, "reputation", &msg, "a ZTA admission standing",
+                "reputation", 0, NULL, NULL, 0) != 0) {
         char uuid_str[UUID_STRING_LEN + 1];
         uuid_unparse_lower(peer->uuid, uuid_str);
         log_warn(proc->logger,

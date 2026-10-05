@@ -23,6 +23,8 @@
 
 #include "autonomous_trust/utilities/msg_types.h"
 #include "autonomous_trust/utilities/msg_types_priv.h"
+#include "autonomous_trust/utilities/message.h"
+#include "autonomous_trust/utilities/allocation.h"
 
 extern char *message_type_to_string(message_type_t type);
 extern message_type_t string_to_message_type(const char *str);
@@ -187,7 +189,70 @@ DEFINE_TEST(test_proto_to_signal_bounds_descr)
 }
 END_TEST_DEFINITION()
 
+/* A TASK_RESULT's bytes cross IPC; its pointer does not. Every process is a
+ * fork, and the struct used to be copied whole, so the receiver got the
+ * sender's pointer VALUE (ISSUES §2.14). */
+DEFINE_TEST(test_task_result_carries_its_bytes_not_its_pointer)
+{
+    char result[] = "forty-two";
+    generic_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = TASK_RESULT;
+    msg.size = sizeof(task_result_msg_t);
+    msg.info.task_result.result_data = (uint8_t *)result;
+    msg.info.task_result.result_len = sizeof(result);
+
+    void *data = NULL;
+    size_t data_len = 0;
+    ck_assert_ret_ok(generic_msg_to_proto(&msg, &data, &data_len));
+    memset(result, 'x', sizeof(result) - 1);   /* the sender's buffer moves on */
+
+    generic_msg_t got;
+    memset(&got, 0, sizeof(got));
+    ck_assert_ret_ok(proto_to_generic_msg(data, data_len, &got));
+    ck_assert_int_eq(got.type, TASK_RESULT);
+    ck_assert_uint_eq(got.info.task_result.result_len, sizeof(result));
+    ck_assert_ptr_nonnull(got.info.task_result.result_data);
+    ck_assert(got.info.task_result.result_data != (uint8_t *)result);
+    ck_assert_str_eq((const char *)got.info.task_result.result_data, "forty-two");
+    messaging_recv_release(&got);
+    ck_assert(got.info.task_result.result_data == NULL);
+
+    /* No result: nothing allocated. */
+    msg.info.task_result.result_data = NULL;
+    msg.info.task_result.result_len = 0;
+    ck_assert_ret_ok(generic_msg_to_proto(&msg, &data, &data_len));
+    memset(&got, 0, sizeof(got));
+    ck_assert_ret_ok(proto_to_generic_msg(data, data_len, &got));
+    ck_assert(got.info.task_result.result_data == NULL);
+    ck_assert_uint_eq(got.info.task_result.result_len, 0);
+}
+END_TEST_DEFINITION()
+
+/* A frame that claims more result bytes than it carries is dropped, not read
+ * past its end. */
+DEFINE_TEST(test_task_result_claiming_more_bytes_than_it_carries_is_dropped)
+{
+    task_result_msg_t head;
+    memset(&head, 0, sizeof(head));
+    head.result_len = 100;
+    void *data = NULL;
+    size_t data_len = 0;
+    void *raw = smrt_create(sizeof(head));   /* wrap_in_any derefs it */
+    ck_assert_ptr_nonnull(raw);
+    memcpy(raw, &head, sizeof(head));
+    ck_assert_ret_ok(wrap_in_any(TASK_RESULT, raw, sizeof(head), &data,
+                                 &data_len));
+    generic_msg_t got;
+    memset(&got, 0, sizeof(got));
+    ck_assert(proto_to_generic_msg(data, data_len, &got) != 0);
+    ck_assert(got.info.task_result.result_data == NULL);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(MsgTypes2, test_generic_msg_signal_proto_roundtrip, test_wrap_in_any,
           test_message_size_all_types, test_message_type_to_string_all,
           test_string_to_message_type_all, test_signal_proto_format,
-          test_proto_to_signal_bounds_descr)
+          test_proto_to_signal_bounds_descr,
+          test_task_result_carries_its_bytes_not_its_pointer,
+          test_task_result_claiming_more_bytes_than_it_carries_is_dropped)

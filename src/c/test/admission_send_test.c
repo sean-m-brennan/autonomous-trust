@@ -39,7 +39,7 @@
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
 #include "identity/id_proc_priv.h"
-#include "identity/id_send_retry.h"
+#include "utilities/send_retry.h"
 #include <time.h>
 #include "identity/group.h"
 #include "config/configuration.h"
@@ -199,14 +199,14 @@ DEFINE_TEST(test_a_wedged_queue_keeps_both_for_the_tick)
     ck_assert_uint_eq(g_granted, 0);
     ck_assert_uint_eq(g_history, 0);
     ck_assert_uint_eq(g_refused_hist, 0);   /* queued behind the grant */
-    ck_assert(id_send_retry_pending("network") >= 2);
+    ck_assert(at_send_retry_pending("network") >= 2);
     g_refuse_each = 0;                      /* the queue drains */
     messaging_set_test_hook(_capture_hook); /* _admit removed it */
-    id_send_retry_drain(NULL, "network", (double)time(NULL));
+    at_send_retry_drain(NULL, "network", (double)time(NULL));
     messaging_set_test_hook(NULL);
     ck_assert_uint_eq(g_granted, 1);
     ck_assert_uint_eq(g_history, 1);
-    ck_assert_uint_eq(id_send_retry_pending("network"), 0);
+    ck_assert_uint_eq(at_send_retry_pending("network"), 0);
 }
 END_TEST_DEFINITION()
 
