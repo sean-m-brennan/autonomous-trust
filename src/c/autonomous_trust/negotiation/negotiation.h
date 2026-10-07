@@ -121,6 +121,11 @@ typedef struct {
      *  built without an announce (unit tests) leaves it unknown. */
     map_t invited;
     bool  invited_known;
+    /** The deadline sweep's record: status requests sent since the deadline
+     *  last moved, and when the latest went out (wall clock, seconds). A live
+     *  answer resets both; NEG_STATUS_ASKS unanswered rounds drop the tracker. */
+    int    status_asks;
+    double status_asked_at;
 } task_tracker_t;
 
 /*@

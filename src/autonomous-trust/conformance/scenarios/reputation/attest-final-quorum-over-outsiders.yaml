@@ -1,0 +1,46 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-final-quorum-over-outsiders
+byte_pinning: false
+description: |
+    The quorum about a team member is counted over the members outside its
+    team (ISSUES §2.54).
+
+    Five members: carol the subject, dan and erin her teammates, alice and bob
+    outside. Without the conflict set the bar is a strict majority of the four
+    non-subjects, three, and two signatures fall short. With it, carol's
+    teammates neither witness nor count toward the bar: two outsiders, so two
+    signatures commit. A team that held most of a group could otherwise starve
+    every finding about itself by declining.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+  - id: dan
+    role: member
+  - id: erin
+    role: member
+
+fixtures:
+  attest_conflicts:
+    - [carol, dan, erin]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest final
+    payload:
+      subject: carol
+      score: 0.3
+      cosigners: [alice, bob]
+    description: both outsiders signed.
+
+expected_state:
+  bob:
+    committed_tx_count: 1

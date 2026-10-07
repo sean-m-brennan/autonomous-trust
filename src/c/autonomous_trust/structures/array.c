@@ -62,6 +62,13 @@ int array_create(array_t **array_ptr)
     arr->magic = SMRT_MAGIC;
     arr->alloc = true;
     arr->refs = 1;
+    if (err != 0)
+    {
+        /* No element buffer: hand back nothing rather than a half-built
+         * array the caller would have to know to release. */
+        smrt_deref(arr);
+        *array_ptr = NULL;
+    }
     return err;
 }
 
@@ -116,6 +123,42 @@ int array_filter(array_t *a, bool (*filter)(data_t*))
     return -1;
 }
 
+/* Frama-C: skipped — [alloc-pattern] releases the dropped elements */
+size_t array_keep_if(array_t *a, bool (*keep)(data_t *, void *), void *ctx)
+{
+    size_t kept = 0;
+    for (size_t i = 0; i < a->size; i++)
+    {
+        data_t *e = a->array[i];
+        if (keep(e, ctx))
+            a->array[kept++] = e;
+        else
+            smrt_deref(e);
+    }
+    size_t dropped = a->size - kept;
+    for (size_t i = kept; i < a->size; i++)
+        a->array[i] = NULL;
+    a->size = kept;
+    return dropped;
+}
+
+static void _owned_array_dtor(void *ptr)
+{
+    data_t *dat = ptr;
+    if (dat->obj != NULL)
+        array_free((array_t *)dat->obj);
+    dat->obj = NULL;
+}
+
+data_t *owned_array_data(array_t *a)
+{
+    data_t *dat = object_ptr_data(a, sizeof(array_t));
+    if (dat == NULL)
+        return dat;
+    dat->dtor = _owned_array_dtor;
+    return dat;
+}
+
 bool array_contains(array_t *a, data_t *element)
 {
     return array_find(a, element) >= 0;
@@ -161,23 +204,47 @@ int array_set(array_t *a, int index, data_t *element)
             a->array = grown;
         }
         a->size++;
+        a->array[index] = element;
+        return 0;
     }
+    /* Overwrite: the array ADOPTS the caller's reference and releases the
+     * element it displaces, as map_set does. Guarded against a self-assign,
+     * where the release would free the element being stored. */
+    data_t *displaced = a->array[index];
     a->array[index] = element;
+    if (displaced != element)
+        smrt_deref(displaced);
     return 0;
 }
 
 /* Frama-C: skipped — [alloc-pattern] memmove compaction */
-int array_remove(array_t *a, data_t *element)
+int array_remove_at(array_t *a, int index)
 {
-    int index = array_find(a, element);
     if (index < 0)
-        return EXCEPTION(EARR_NOELT);
-    size_t n = a->size - (index + 1);
+        index = (int)a->size + index;
+    if (index < 0 || (size_t)index >= a->size)
+        return EXCEPTION(EARR_OOB);
+    data_t *removed = a->array[index];
+    size_t n = a->size - ((size_t)index + 1);
     if (n > 0)
         memmove(a->array + index, a->array + index + 1, n * sizeof(data_t *));
     a->size--;
     a->array[a->size] = NULL;
+    /* The array's reference leaves with the element, as map_remove's does.
+     * A caller that still needs it takes its own (smrt_ref) first. */
+    smrt_deref(removed);
     return 0;
+}
+
+int array_remove(array_t *a, data_t *element)
+{
+    /* array_find matches by VALUE (data_equal), so what leaves may be an
+     * equal element rather than @p element itself. A caller that knows the
+     * slot uses array_remove_at. */
+    int index = array_find(a, element);
+    if (index < 0)
+        return EXCEPTION(EARR_NOELT);
+    return array_remove_at(a, index);
 }
 
 /* Frama-C: skipped — [alloc-pattern] iterative element free */

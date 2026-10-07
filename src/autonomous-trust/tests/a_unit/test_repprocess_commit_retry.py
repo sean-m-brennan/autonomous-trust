@@ -18,7 +18,8 @@
 A granted round leaves my_requests when its transaction goes out, so if the
 acceptors never commit it the half is gone; a round nobody answers gets no
 nack, so the nack retry never fires. Partition cohort part-3490610 lost island
-B's app reaction the first way. Mirrors C test/rep_commit_retry_test.c.
+B's app reaction the first way. What outlives the retries is parked until the
+chain grows from a peer (§2.60). Mirrors C test/rep_commit_retry_test.c.
 """
 import queue
 from uuid import uuid4
@@ -122,14 +123,16 @@ class TestUncommittedHalvesAreReProposed:
                 if tc.score.task_id == task]
         assert len(live) == 1, 'the stale round was left beside the new one'
 
-    def test_retries_are_bounded(self):
+    def test_an_exhausted_half_is_parked_not_dropped(self):
+        """Five re-proposals, then PARKED (§2.60), not dropped."""
         rp, queues, net_q = _cohort()
         task = uuid4()
         rp._start_paxos(queues, TransactionScore(task, 0.9))
         resent = sum(rp._retry_uncommitted_halves(queues, _later(i))
-                     for i in range(1, 9))
+                     for i in range(1, 7))
         assert resent == rp.COMMIT_RETRIES == 5
-        assert str(task) not in rp.awaiting_commit
+        assert str(task) in rp.awaiting_commit
+        assert rp.parked_count() == 1
 
     def test_a_half_already_in_the_chain_is_forgotten(self):
         rp, queues, net_q = _cohort()
@@ -137,4 +140,58 @@ class TestUncommittedHalvesAreReProposed:
         rp._start_paxos(queues, TransactionScore(task, 0.9))
         rp.history.update(task, rp.identity.uuid, 0.9)
         assert rp._retry_uncommitted_halves(queues, _later(1)) == 0
+        assert str(task) not in rp.awaiting_commit
+
+
+def _park(rp, queues, net_q):
+    """Park a half, as the minority side of a partition does: five
+    unanswered re-proposals, parked on the sixth pass at _later(6)."""
+    task = uuid4()
+    rp._start_paxos(queues, TransactionScore(task, 0.9))
+    for i in range(1, 7):
+        rp._retry_uncommitted_halves(queues, _later(i))
+    assert rp.parked_count() == 1
+    _requests(net_q)
+    return task
+
+
+class TestParkedHalves:
+    """ISSUES §2.60. Mirrors the parked tests in rep_commit_retry_test.c."""
+
+    def test_a_parked_half_is_re_proposed_every_park_retry(self):
+        rp, queues, net_q = _cohort()
+        _park(rp, queues, net_q)
+        assert rp._retry_uncommitted_halves(queues, _later(7)) == 0
+        assert rp._retry_uncommitted_halves(queues, _later(8)) == 1
+        assert rp.parked_count() == 1
+        assert rp._retry_uncommitted_halves(queues, _later(9)) == 0
+        assert rp._retry_uncommitted_halves(queues, _later(10)) == 1
+
+    def test_a_grown_chain_wakes_parked_halves(self):
+        """THE HEAL: the minority's chain is a prefix of the majority's, so
+        the heal arrives as an EXTENDED catch-up and wakes the parked half."""
+        from autonomous_trust.core.reputation.reputation import Transaction
+        rp, queues, net_q = _cohort()
+        _park(rp, queues, net_q)
+        alice, bob = rp.protocol.peers.all
+        chain = [Transaction(uuid4(), alice.uuid, 0.8, bob.uuid, 0.7,
+                             index=1)]
+        rp.handle_update(queues, Message(
+            CfgIds.reputation, ReputationProtocol.update,
+            to_yaml_string(chain), from_whom=alice))
+        assert len(rp.history) == 1, 'precondition: caught up'
+        # _later(7) is 60 s before the slow retry: only the wake makes it due.
+        assert rp._retry_uncommitted_halves(queues, _later(7)) == 1
+        assert rp.parked_count() == 1
+
+    def test_a_parked_half_expires_or_is_forgotten(self):
+        rp, queues, net_q = _cohort()
+        task = _park(rp, queues, net_q)
+        assert rp._retry_uncommitted_halves(
+            queues, _later(6) + rp.PARK_TTL + 60.0) == 0
+        assert str(task) not in rp.awaiting_commit
+
+        task = _park(rp, queues, net_q)
+        rp.history.update(task, rp.identity.uuid, 0.9)
+        assert rp._retry_uncommitted_halves(queues, _later(8)) == 0
         assert str(task) not in rp.awaiting_commit

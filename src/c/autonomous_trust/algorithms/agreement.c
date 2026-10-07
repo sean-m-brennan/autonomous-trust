@@ -650,7 +650,7 @@ bool agreement_finalize(agreement_protocol_t *proto, merkle_blob_t *blob)
             data_object_ptr(val, &ptr);
             if ((merkle_blob_t *)ptr == blob)
             {
-                array_remove(proto->state.work.approved, val);
+                array_remove_at(proto->state.work.approved, i);
                 return true;
             }
         }

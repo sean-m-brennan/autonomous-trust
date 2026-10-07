@@ -37,6 +37,7 @@
 #include "utilities/util.h"
 #include "config/configuration.h"
 #include "identity/identity.h"
+#include "identity/id_proc_priv.h"   /* identity_self_identity */
 #include "utilities/send_retry.h"   /* at_send: keep a refused frame (ISSUES §2.14) */
 
 #define EFLEET_PAXOS 260
@@ -584,22 +585,6 @@ static bool handle_update_accepted(const process_t *proc, directory_t *queues, g
 
 char FLEET_APP_PROPOSE[] = AT_APP_FLEET_PROPOSE;
 
-/* This node's own identity (the "identity" configuration), or NULL. */
-static const identity_t *_self_identity(const process_t *proc)
-{
-    if (proc == NULL || proc->configs == NULL)
-        return NULL;
-    data_t *id_dat = NULL;
-    char id_key[] = "identity";
-    if (map_get(proc->configs, id_key, &id_dat) != 0 || id_dat == NULL)
-        return NULL;
-    config_t *id_cfg = NULL;
-    if (data_object_ptr(id_dat, (void **)&id_cfg) != 0 || id_cfg == NULL
-        || id_cfg->data_struct == NULL)
-        return NULL;
-    return (const identity_t *)id_cfg->data_struct;
-}
-
 /* The app proposes an update: {version, artifact_hash (64 hex), target_arch,
  * min_proposer_reputation}. An app holds no private key, so THIS node builds
  * the proposal, signs it with its identity key and names itself the signer,
@@ -634,7 +619,7 @@ bool fleet_handle_app_propose(const process_t *proc, directory_t *queues, generi
               && hash_len == UPDATE_HASH_LEN
               && (arch == NULL || strlen(arch) <= UPDATE_ARCH_LEN)
               && (min_rep == NULL || json_is_number(min_rep));
-    const identity_t *self = _self_identity(proc);
+    const identity_t *self = identity_self_identity(proc);
     if (!ok || self == NULL) {
         json_decref(req);
         log_warn(proc->logger, "Fleet: %s: %s\n", AT_APP_FLEET_PROPOSE,

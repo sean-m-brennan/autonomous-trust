@@ -1,0 +1,53 @@
+schema_version: "1"
+kind: scenario
+protocol: identity
+name: group-membership-update-adopt-declarations
+byte_pinning: false
+description: |
+    A node absorbed by a merge takes the surviving group's group-carried
+    declarations along with its uuid and membership: the envelope format
+    ("surviving group's format", doc/architecture/network-wire-format.md) and
+    the commit-certificate declaration.
+
+    C's adopt branch used to copy the certificate declaration but not the
+    format, so an absorbed C node kept speaking its old format inside its new
+    group. Only a proto cohort merging with a JSON one could see it.
+
+    Topology: peer_a holds group G (uuid 0a..), json, no certificates, size 1.
+    peer_b holds a DIFFERENT, larger group H (uuid 0b..), proto, certificates
+    declared, size 3, and owns its private key, so peer_a adopts H outright
+    (the group-membership-update-adopt-foreign-key path).
+
+participants:
+  - id: peer_a
+    role: group_member
+  - id: peer_b
+    role: group_member
+
+fixtures:
+  groups:
+    peer_a:
+      uuid: "0a000000-0000-4000-8000-00000000000a"
+      size: 1
+      wire_format: json
+    peer_b:
+      uuid: "0b000000-0000-4000-8000-00000000000b"
+      size: 3
+      wire_format: proto
+      commit_certificates: true
+
+steps:
+  - id: 1
+    from: peer_b
+    to: peer_a
+    function: group_key_update
+    payload: {}
+    description: |
+        peer_b sends its larger group H. peer_a adopts it, and with it H's
+        format and certificate declaration.
+
+expected_state:
+  peer_a:
+    group_size: 3
+    group_wire_format: proto
+    group_commit_certificates: true

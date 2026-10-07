@@ -101,6 +101,20 @@ int negotiation_get_task_stack_size(void);
  *  Python adapter's `if not self.process.confirmed` check. */
 bool negotiation_has_confirmed_any(void);
 
+/** One pass of the deadline sweep at wall-clock time @p present: ask the
+ *  participants of every task of ours past its deadline for status, and give
+ *  up (forget, unscored) a task after NEG_STATUS_ASKS unanswered rounds or
+ *  when nobody is left to ask. Returns the number given up. negotiation_run's
+ *  loop calls it once per pass; @p present is a parameter so a test can
+ *  advance the clock. */
+size_t negotiation_status_sweep(const process_t *proc, double present);
+
+/** One pass of the worker side: report the jobs whose threads have finished,
+ *  then start every due job a slot is free for. Returns the number of jobs
+ *  still holding a slot. negotiation_run's loop runs this each pass; exposed
+ *  so a test can step it. */
+size_t negotiation_run_due_jobs(const process_t *proc);
+
 /** Returns true iff the shared `my_tasks` map has an entry keyed by
  *  the given uuid (its string form, as the production code stores).
  *  For the `has_my_task: <slug>` expected_state assertion in the

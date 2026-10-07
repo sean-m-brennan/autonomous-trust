@@ -123,6 +123,13 @@ int build_local_capabilities(const char *my_uuid, array_t **caps_out);
 int capability_execute(const capability_t *cap, thread_args_t args);
 
 /**
+ * @brief smrt finalizer for a heap capability_t: releases its @c arguments
+ *        map. Install it as @c cap->dtor on every smrt_create'd capability,
+ *        so the last smrt_deref takes the map with it.
+ */
+void capability_dtor(void *ptr);
+
+/**
  * @brief Invoke @p cap's result-producing entry point and collect its answer.
  *
  * Returns 0 with @p result_out written (NUL-terminated) on success, -1 if

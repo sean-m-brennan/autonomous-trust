@@ -248,13 +248,12 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
             }
             }
         }
-        if (array_remove(unhandled, msg_dat) != 0) {
+        /* Removing releases the array's reference, which is the only one:
+         * the routed message is freed here. */
+        if (array_remove_at(unhandled, 0) != 0) {
             log_exception(logger);
             break;  // guard against infinite loop if remove fails
         }
-        /* array_remove unlinks but does not free; without this the daemon
-         * leaks one data_t per message routed. */
-        smrt_deref(msg_dat);
     }
     return sent;
 }

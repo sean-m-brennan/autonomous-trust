@@ -1,0 +1,69 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: status-unknown-keeps-participant
+byte_pinning: false
+description: |
+    A status answer of `unknown` neither extends nor cancels (ISSUES §2.59).
+
+    `unknown` only says the worker is not tracking the task, which is also
+    what it says once it has finished and its result is on the way. Python
+    used to cancel the participant on it, deleting its slot, so the result
+    that arrived next was rejected as uninvited and never scored. C did
+    nothing. Both now leave the participant in place, and the deadline sweep
+    gives up on a worker that has really let the task go.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+  - id: carol
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: [data_fetch]
+    carol: [data_fetch]
+
+steps:
+  - id: 1
+    from: alice
+    to: alice
+    function: spawn task
+    payload:
+      capability: data_fetch
+      task_id: t-unknown
+    description: |
+        alice spawns the task and invites bob and carol. Two invitees, so
+        the result check has a roster to hold bob's result against: with one,
+        a cancel empties it and the check is skipped.
+  - id: 2
+    from: bob
+    to: alice
+    function: ack
+    payload:
+      task_id: t-unknown
+    description: bob accepts.
+  - id: 3
+    from: bob
+    to: alice
+    function: status response
+    payload:
+      task_id: t-unknown
+      status: unknown
+    description: |
+        bob, already finished, no longer tracks the task and says so.
+  - id: 4
+    from: bob
+    to: alice
+    function: report results
+    payload:
+      task_id: t-unknown
+      result: done
+    description: bob's result, in flight when the status answer left, lands.
+
+expected_state:
+  alice:
+    results_scored: {task: t-unknown, executors: [bob]}
+    has_my_task: {slug: t-unknown, present: true}

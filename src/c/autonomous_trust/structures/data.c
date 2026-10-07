@@ -104,6 +104,14 @@ void data_owned_obj_dtor(void *ptr)
     dat->obj = NULL;
 }
 
+/* Frama-C: skipped — [alloc-pattern] releases the owned smrt OBJECT */
+void data_owned_smrt_dtor(void *ptr)
+{
+    data_t *dat = ptr;
+    smrt_deref(dat->obj);
+    dat->obj = NULL;
+}
+
 bool data_equal(data_t *a, data_t *b)
 {
     return a->type == b->type && a->cmp(a, b) == 0;
@@ -230,6 +238,16 @@ data_t *owned_object_data(void *val, size_t len)
     if (dat == NULL)
         return dat;
     dat->dtor = data_owned_obj_dtor;
+    return dat;
+}
+
+/* Frama-C: skipped — [alloc-pattern] void pointer casting with unbounded types */
+data_t *owned_smrt_data(ptr_t o, size_t len)
+{
+    data_t *dat = object_ptr_data(o, len);
+    if (dat == NULL)
+        return dat;
+    dat->dtor = data_owned_smrt_dtor;
     return dat;
 }
 
@@ -500,7 +518,9 @@ int data_to_json(const void *data_struct, json_t **obj_ptr)
         if (enc_str == NULL)
             return EXCEPTION(ENOMEM);
         base64_encode(data->byt, data->size, enc_str, enc_size);
-        json_object_set_new(obj, "dat", json_stringn_nocheck(enc_str, enc_size));
+        /* enc_size counts libsodium's NUL terminator, which is not part of
+         * the text: carrying it put a "\u0000" on the end of the string */
+        json_object_set_new(obj, "dat", json_stringn_nocheck(enc_str, strlen(enc_str)));
         free(enc_str);
         break;
     }
@@ -545,8 +565,8 @@ int data_from_json(const json_t *obj, void *data_struct)
         const char *enc_str = json_string_value(dat);
         if (enc_str == NULL)
             return EXCEPTION(EINVAL);
-        /* data_to_json writes b64_encoded_len characters, which counts
-         * libsodium's NUL terminator, so the string ends in one NUL */
+        /* Builds before 2026-10-07 wrote b64_encoded_len characters, which
+         * counts libsodium's NUL terminator, so their strings end in one NUL */
         size_t b64_len = enc_size;
         if (b64_len > 0 && enc_str[b64_len - 1] == '\0')
             b64_len--;

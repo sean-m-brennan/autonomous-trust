@@ -42,6 +42,7 @@
 #include "history.h"
 #include "identity_priv.h"
 #include "id_proc_priv.h"
+#include "processes/capabilities_priv.h"   /* peer capability matrix */
 #include "id_ext.h"
 #include "package_hash.h"
 #include "utilities/b64.h"
@@ -604,15 +605,9 @@ static identity_history_t *_ensure_history_locked(const process_t *proc)
     if (proc == NULL || proc->configs == NULL)
         return NULL;
 
-    data_t *id_dat = NULL;
-    char id_key[] = "identity";
-    if (map_get(proc->configs, id_key, &id_dat) != 0 || id_dat == NULL)
+    const identity_t *self_id = identity_self_identity(proc);
+    if (self_id == NULL)
         return NULL;
-    config_t *id_cfg = NULL;
-    if (data_object_ptr(id_dat, (void **)&id_cfg) != 0 ||
-        id_cfg == NULL || id_cfg->data_struct == NULL)
-        return NULL;
-    identity_t *self_id = (identity_t *)id_cfg->data_struct;
     public_identity_t *self_pub = NULL;
     if (identity_publish(self_id, &self_pub) != 0 || self_pub == NULL)
         return NULL;
@@ -867,10 +862,98 @@ void identity_install_peer_caps(const uuid_t uuid,
     }
     char uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(uuid, uuid_str);
-    data_t *arr_dat = object_ptr_data(arr, sizeof(array_t));
+    data_t *arr_dat = owned_array_data(arr);
+    if (arr_dat == NULL)
+    {
+        array_free(arr);
+        return;
+    }
     pthread_mutex_lock(&id_state.lock);
     map_set(&id_state.peer_caps_map, uuid_str, arr_dat);
     pthread_mutex_unlock(&id_state.lock);
+}
+
+static int _remember_activity(const process_t *proc, directory_t *queues,
+                              generic_msg_t *msg);
+
+/* Does @p uuid_str already hold exactly these capability names, in this
+ * order? Caller holds id_state.lock. */
+static bool _same_caps_locked(const char *uuid_str, array_t *arr)
+{
+    data_t *dat = NULL;
+    array_t *cur = NULL;
+    if (map_get(&id_state.peer_caps_map, (map_key_t)uuid_str, &dat) != 0
+        || dat == NULL || data_object_ptr(dat, (void **)&cur) != 0
+        || cur == NULL || array_size(cur) != array_size(arr))
+        return false;
+    for (size_t i = 0; i < array_size(arr); i++)
+    {
+        data_t *a = NULL, *b = NULL;
+        char *sa = NULL, *sb = NULL;
+        if (array_get(cur, (int)i, &a) != 0 || array_get(arr, (int)i, &b) != 0
+            || data_string_ptr(a, &sa) != 0 || data_string_ptr(b, &sb) != 0
+            || sa == NULL || sb == NULL || strcmp(sa, sb) != 0)
+            return false;
+    }
+    return true;
+}
+
+/* The capability matrix (peer uuid -> capabilities) built from
+ * id_state.peer_caps_map into @p out, which the caller map_free()s. */
+static int _build_caps_matrix(peer_capabilities_matrix_t *out)
+{
+    if (map_init(out) != 0)
+        return -1;
+    pthread_mutex_lock(&id_state.lock);
+    char *uuid_str = NULL;
+    data_t *dat = NULL;
+    map_entries_for_each(&id_state.peer_caps_map, uuid_str, dat)
+        array_t *names = NULL;
+        if (data_object_ptr(dat, (void **)&names) != 0 || names == NULL)
+            continue;
+        size_t n = array_size(names);
+        const char **list = calloc(n > 0 ? n : 1, sizeof(*list));
+        if (list == NULL)
+            continue;
+        for (size_t i = 0; i < n; i++)
+        {
+            data_t *nd = NULL;
+            char *s = NULL;
+            if (array_get(names, (int)i, &nd) == 0 && data_string_ptr(nd, &s) == 0)
+                list[i] = s;
+        }
+        peer_capabilities_add(out, uuid_str, list, n);
+        free(list);
+    map_end_for_each
+    pthread_mutex_unlock(&id_state.lock);
+    return 0;
+}
+
+/* Hand the capability matrix to every sibling process and keep a copy as our
+ * own protocol.peer_capabilities, which _acquire_capabilities waits on. The
+ * C counterpart of Python's identity putting peer_capabilities on the main
+ * and negotiation queues: negotiation invites only the peers it names. Sent
+ * on change; a lost hand-off is repaired by the next change, not retried
+ * (the message carries pointers into a matrix freed after the send). */
+static void _publish_peer_capabilities(const process_t *proc, directory_t *queues)
+{
+    generic_msg_t msg = {0};
+    msg.type = PEER_CAPABILITIES;
+    if (_build_caps_matrix(&msg.info.peer_capabilities) == 0)
+    {
+        _remember_activity(proc, queues, &msg);
+        map_free(&msg.info.peer_capabilities);
+    }
+    peer_capabilities_matrix_t mine;
+    if (_build_caps_matrix(&mine) == 0)
+    {
+        peer_capabilities_matrix_t *fresh = peer_capabilities_take(&mine);
+        process_t *p = (process_t *)proc;
+        peer_capabilities_matrix_t *old = p->protocol.peer_capabilities;
+        p->protocol.peer_capabilities = fresh;
+        if (old != NULL)
+            map_free(old);
+    }
 }
 
 /****************************
@@ -2274,21 +2357,15 @@ static int _announce_self_to_bundled_peers(const process_t *proc,
 
     /* Populate from_whom with our published identity, same way as
      * _build_announcement does it. */
-    data_t *id_dat = NULL;
-    char id_key[] = "identity";
-    if (map_get(proc->configs, id_key, &id_dat) == 0 && id_dat != NULL)
+    const identity_t *self = identity_self_identity(proc);
+    if (self != NULL)
     {
-        config_t *id_cfg = NULL;
-        if (data_object_ptr(id_dat, (void **)&id_cfg) == 0 &&
-            id_cfg != NULL && id_cfg->data_struct != NULL)
-        {
-            public_identity_t *pub = NULL;
-            identity_publish((const identity_t *)id_cfg->data_struct, &pub);
-            if (pub != NULL) {
-                memcpy(&accept_template.info.net_msg.from_whom, pub,
-                       sizeof(public_identity_t));
-                smrt_deref(pub);
-            }
+        public_identity_t *pub = NULL;
+        identity_publish(self, &pub);
+        if (pub != NULL) {
+            memcpy(&accept_template.info.net_msg.from_whom, pub,
+                   sizeof(public_identity_t));
+            smrt_deref(pub);
         }
     }
 
@@ -2350,17 +2427,9 @@ static int _populate_peers_from_history(process_t *proc,
     /* Resolve self uuid for the dedup check. */
     uuid_t self_uuid;
     uuid_clear(self_uuid);
-    data_t *id_dat = NULL;
-    char id_key[] = "identity";
-    if (map_get(proc->configs, id_key, &id_dat) == 0 && id_dat != NULL) {
-        config_t *id_cfg = NULL;
-        if (data_object_ptr(id_dat, (void **)&id_cfg) == 0 &&
-            id_cfg != NULL && id_cfg->data_struct != NULL) {
-            const public_identity_t *me =
-                (const public_identity_t *)id_cfg->data_struct;
-            uuid_copy(self_uuid, (unsigned char *)me->uuid);
-        }
-    }
+    const identity_t *me = identity_self_identity(proc);
+    if (me != NULL)
+        uuid_copy(self_uuid, (unsigned char *)me->uuid);
 
     /* Append new peers. peers_write_lock guards the array; the
      * uniqueness check is similar to _add_peer's idempotent guard.
@@ -4021,6 +4090,13 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
          * epoch, not ours. Mirrors Python Group.update_from. */
         if (theirs_created > 0.0)
             ((process_t *)proc)->protocol.group.created = theirs_created;
+        /* Its envelope format ("surviving group's format",
+         * doc/architecture/network-wire-format.md): an absorbed node that kept
+         * its own would speak a format its new group may not read. Absent or
+         * unrecognized reads as json, as group_from_json reads it.
+         * Mirrors Python Group.adopt_membership. */
+        ((process_t *)proc)->protocol.group.wire_format = net_wire_format_from_name(
+            json_string_value(json_object_get(payload, "wire_format")));
         /* And its commit-certificate declaration: a property of the cohort, so
          * an absorbed node that kept its own would refuse (or accept) commits
          * its new group does not. Mirrors Python Group.adopt_membership. */
@@ -4291,7 +4367,6 @@ static json_t *_sanitize_descriptor(json_t *item)
 /* Frama-C: skipped — JSON parsing + map mutation. */
 static bool handle_caps_response(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
-    (void)queues;
     net_msg_t *nmsg = &msg->info.net_msg;
     log_debug(proc->logger, "Identity: caps_response from %s\n",
               nmsg->from_whom.nickname);
@@ -4402,10 +4477,18 @@ static bool handle_caps_response(const process_t *proc, directory_t *queues, gen
 
     char uuid_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(nmsg->from_whom.uuid, uuid_str);
-    data_t *arr_dat = object_ptr_data(arr, sizeof(array_t));
+    data_t *arr_dat = owned_array_data(arr);
+    if (arr_dat == NULL)
+    {
+        array_free(arr);
+        return true;
+    }
     pthread_mutex_lock(&id_state.lock);
+    bool changed = !_same_caps_locked(uuid_str, arr);
     map_set(&id_state.peer_caps_map, uuid_str, arr_dat);
     pthread_mutex_unlock(&id_state.lock);
+    if (changed)
+        _publish_peer_capabilities(proc, queues);
 
     log_debug(proc->logger,
               "Identity: registered %zu cap(s) for peer %s\n",
@@ -4605,20 +4688,12 @@ static bool handle_tier_update(const process_t *proc, directory_t *queues, gener
      * proc->configs["identity"]. Mirrors Python idprocess.py. */
     bool is_self = false;
     char self_str[UUID_STRING_LEN + 1] = {0};
-    data_t *id_dat = NULL;
-    char id_key[] = "identity";
-    if (map_get(proc->configs, id_key, &id_dat) == 0 && id_dat != NULL)
+    const identity_t *me = identity_self_identity(proc);
+    if (me != NULL)
     {
-        config_t *id_cfg = NULL;
-        if (data_object_ptr(id_dat, (void **)&id_cfg) == 0 &&
-            id_cfg != NULL && id_cfg->data_struct != NULL)
-        {
-            const public_identity_t *me =
-                (const public_identity_t *)id_cfg->data_struct;
-            uuid_unparse_lower(me->uuid, self_str);
-            if (strncmp(self_str, peer_uuid_str, UUID_STRING_LEN) == 0)
-                is_self = true;
-        }
+        uuid_unparse_lower(me->uuid, self_str);
+        if (strncmp(self_str, peer_uuid_str, UUID_STRING_LEN) == 0)
+            is_self = true;
     }
 
     /* map_set takes `char *const` for the key; copy into a writable
@@ -5010,20 +5085,15 @@ static int _build_announcement_for(const process_t *proc, generic_msg_t *buf,
     buf->info.net_msg.encrypt = false; /* Broadcast is unencrypted */
 
     /* Get own identity from config */
-    data_t *id_dat = NULL;
-    char id_key[] = "identity";
-    if (map_get(proc->configs, id_key, &id_dat) == 0)
+    const identity_t *self = identity_self_identity(proc);
+    if (self != NULL)
     {
-        config_t *id_cfg = NULL;
-        if (data_object_ptr(id_dat, (void **)&id_cfg) == 0 && id_cfg->data_struct != NULL)
+        public_identity_t *pub = NULL;
+        identity_publish(self, &pub);
+        if (pub != NULL)
         {
-            public_identity_t *pub = NULL;
-            identity_publish((const identity_t *)id_cfg->data_struct, &pub);
-            if (pub != NULL)
-            {
-                memcpy(&buf->info.net_msg.from_whom, pub, sizeof(public_identity_t));
-                smrt_deref(pub);
-            }
+            memcpy(&buf->info.net_msg.from_whom, pub, sizeof(public_identity_t));
+            smrt_deref(pub);
         }
     }
 
@@ -5252,7 +5322,8 @@ const identity_t *identity_self_identity(const process_t *proc)
     if (map_get(proc->configs, id_key, &id_dat) != 0 || id_dat == NULL)
         return NULL;
     config_t *id_cfg = NULL;
-    if (data_object_ptr(id_dat, (void **)&id_cfg) != 0 || id_cfg == NULL)
+    if (data_object_ptr(id_dat, (void **)&id_cfg) != 0 || id_cfg == NULL
+        || id_cfg->data_struct == NULL)
         return NULL;
     return (const identity_t *)id_cfg->data_struct;
 }
@@ -6926,17 +6997,11 @@ static double _attest_now(const process_t *proc)
 static int _own_public_identity(const process_t *proc, public_identity_t *out)
 {
     if (proc == NULL || out == NULL) return -1;
-    data_t *id_dat = NULL;
-    char id_key[] = "identity";
-    if (map_get(proc->configs, id_key, &id_dat) != 0 || id_dat == NULL)
-        return -1;
-    config_t *id_cfg = NULL;
-    if (data_object_ptr(id_dat, (void **)&id_cfg) != 0
-        || id_cfg == NULL || id_cfg->data_struct == NULL)
+    const identity_t *self = identity_self_identity(proc);
+    if (self == NULL)
         return -1;
     public_identity_t *pub = NULL;
-    if (identity_publish((const identity_t *)id_cfg->data_struct, &pub) != 0
-        || pub == NULL)
+    if (identity_publish(self, &pub) != 0 || pub == NULL)
         return -1;
     memcpy(out, pub, sizeof(public_identity_t));
     smrt_deref(pub);
@@ -8119,15 +8184,9 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
             log_info(logger, "Identity: choose_group: no histories received; "
                      "self-bootstrapping a fresh group\n");
             public_identity_t *pub = NULL;
-            data_t *id_dat = NULL;
-            char id_key[] = "identity";
-            if (map_get(proc->configs, id_key, &id_dat) == 0)
-            {
-                config_t *id_cfg = NULL;
-                if (data_object_ptr(id_dat, (void **)&id_cfg) == 0
-                    && id_cfg->data_struct != NULL)
-                    identity_publish((const identity_t *)id_cfg->data_struct, &pub);
-            }
+            const identity_t *self = identity_self_identity(proc);
+            if (self != NULL)
+                identity_publish(self, &pub);
             char empty_addr[1] = {0};
             char *seed_addr = (pub != NULL) ? pub->address : empty_addr;
             if (group_init(NULL, seed_addr, &proc->protocol.group) == 0 && pub != NULL)

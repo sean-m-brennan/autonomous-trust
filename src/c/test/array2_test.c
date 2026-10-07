@@ -52,6 +52,8 @@ DEFINE_TEST(test_array_copy)
     int val = 0;
     ck_assert_ret_ok(data_integer(out, &val));
     ck_assert_int_eq(val, 20);
+    array_free(&cpy);
+    array_free(&arr);
 }
 END_TEST_DEFINITION()
 
@@ -68,6 +70,7 @@ DEFINE_TEST(test_array_filter)
     /* Find first positive */
     int idx = array_filter(&arr, is_positive);
     ck_assert_int_eq(idx, 2);  /* index of 7 */
+    array_free(&arr);
 }
 END_TEST_DEFINITION()
 
@@ -81,6 +84,7 @@ DEFINE_TEST(test_array_filter_no_match)
 
     int idx = array_filter(&arr, is_positive);
     ck_assert_int_eq(idx, -1);
+    array_free(&arr);
 }
 END_TEST_DEFINITION()
 
@@ -103,6 +107,7 @@ DEFINE_TEST(test_array_for_each_macro)
     array_end_for_each
 
     ck_assert_int_eq(sum, 60);
+    array_free(&arr);
 }
 END_TEST_DEFINITION()
 
@@ -126,6 +131,7 @@ DEFINE_TEST(test_array_json_roundtrip)
     ck_assert_int_eq(json_integer_value(size_j), 3);
 
     json_decref(obj);
+    array_free(&arr);
 }
 END_TEST_DEFINITION()
 
@@ -191,6 +197,7 @@ DEFINE_TEST(test_array_while_drain_visits_all_fifo)
     ck_assert_int_eq(order[0], 10);
     ck_assert_int_eq(order[1], 20);
     ck_assert_int_eq(order[2], 30);
+    array_free(&arr);
 }
 END_TEST_DEFINITION()
 
@@ -214,6 +221,7 @@ DEFINE_TEST(test_array_two_phase_collect_then_remove)
         if (data_integer(v, &val) == 0)
             sum += val;
         visited++;
+        smrt_ref(v);   /* to_remove holds its own reference */
         ck_assert_ret_ok(array_append(&to_remove, v));
     array_end_for_each
 
@@ -228,6 +236,7 @@ DEFINE_TEST(test_array_two_phase_collect_then_remove)
 
     ck_assert_uint_eq(array_size(&arr), 0);
     array_free(&to_remove);
+    array_free(&arr);
 }
 END_TEST_DEFINITION()
 

@@ -579,6 +579,28 @@ class TestAnchor:
         assert ok, why
         assert details['linked'] and details['anchored']
 
+    def test_the_readers_teammates_do_not_count(self, trio, tmp_path, monkeypatch):
+        """ISSUES §2.54: with the reader's own list of the subject's teammates,
+        their signatures are not counted and at least two outsiders must sign.
+        The real record has the verifier and the observer; call the observer
+        a teammate and only the verifier is left."""
+        v, s, o = trio
+        rec, _, _, _ = self._real(trio, tmp_path, monkeypatch)
+        anchor = load_anchor(str(tmp_path))
+        ok, why = verify_attested_record(rec, anchor, exclude=[str(o.uuid)])
+        assert not ok and 'attestation short of a quorum' in why
+        # Naming only the subject, or a node the reader does not hold, changes nothing.
+        assert verify_attested_record(rec, anchor, exclude=[str(s.uuid)]) == (True, [])
+        assert verify_attested_record(rec, anchor, exclude=[str(uuid4())]) == (True, [])
+
+    def test_the_records_own_excluded_list_is_never_read(self, trio, tmp_path,
+                                                         monkeypatch):
+        """A forger would name the outsiders there and let teammates certify."""
+        v, s, o = trio
+        rec, _, _, _ = self._real(trio, tmp_path, monkeypatch)
+        rec = dict(rec, excluded=[str(o.uuid), str(v.uuid)])
+        assert verify_attested_record(rec, load_anchor(str(tmp_path))) == (True, [])
+
     def test_a_self_signed_forgery_passes_alone_and_fails_anchored(
             self, trio, tmp_path, monkeypatch):
         _, s, _ = trio
@@ -711,3 +733,40 @@ class TestReproposal:
 def from_json_string_obj(obj):
     from autonomous_trust.core.config import from_json_string
     return obj if not isinstance(obj, str) else from_json_string(obj)
+
+
+class TestConflictSet:
+    """ISSUES §2.54: the application's team file, read by reputation."""
+
+    def test_the_file_is_read_and_reread_when_it_changes(self, tmp_path, monkeypatch):
+        from autonomous_trust.core.config import Configuration
+        monkeypatch.setattr(Configuration, 'get_cfg_dir',
+                            staticmethod(lambda: str(tmp_path)))
+        a, b, c = _ident('a', 1), _ident('b', 2), _ident('c', 3)
+        rp, _ = _node(a, [b, c])
+        assert not rp._conflicted(b.uuid, c.uuid), 'no file, no conflict'
+        path = tmp_path / ReputationProcess.CONFLICTS_FILE
+        path.write_text(json.dumps({'teams': [[str(b.uuid), str(c.uuid)]]}))
+        assert rp._conflicted(b.uuid, c.uuid) and rp._conflicted(c.uuid, b.uuid)
+        assert not rp._conflicted(a.uuid, b.uuid)
+        assert not rp._conflicted(b.uuid, b.uuid), 'a node is not its own teammate'
+        assert rp._conflicted_members(c.uuid) == [str(b.uuid)]
+        # A changed file is picked up (a different size, so the stamp moves).
+        path.write_text(json.dumps({'teams': [[str(a.uuid), str(c.uuid), str(b.uuid)]]}))
+        assert rp._conflicted(a.uuid, c.uuid)
+        assert rp._conflicted_members(c.uuid) == sorted([str(a.uuid), str(b.uuid)])
+        # A malformed file is no teams at all, not a crash.
+        path.write_text('{"teams": [[1, 2]]}')
+        assert not rp._conflicted(a.uuid, c.uuid)
+        path.unlink()
+        assert not rp._conflicted(b.uuid, c.uuid)
+
+    def test_an_override_replaces_the_file_and_malformed_ones_are_refused(self):
+        a, b = _ident('a', 1), _ident('b', 2)
+        rp, _ = _node(a, [b])
+        rp.set_attest_conflicts({'teams': [[str(a.uuid), str(b.uuid)]]})
+        assert rp._conflicted(a.uuid, b.uuid)
+        with pytest.raises(ValueError):
+            rp.set_attest_conflicts({'teams': 'nope'})
+        assert rp._conflicted(a.uuid, b.uuid), 'unchanged by a refused set'
+        rp.set_attest_conflicts(None)

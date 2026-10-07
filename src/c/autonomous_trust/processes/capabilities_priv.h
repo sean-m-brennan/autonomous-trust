@@ -44,6 +44,17 @@ int peer_capabilities_sync_in(AutonomousTrust__Core__Protobuf__Processes__PeerCa
                               peer_capabilities_matrix_t *map);
 int proto_to_peer_capabilities(uint8_t *data, size_t len, peer_capabilities_matrix_t *peer_capabilities);
 
+/** Set @p map[@p peer] to capabilities named @p names (tier 0, weight 1, no
+ *  arguments), replacing any entry there. The matrix owns them: map_free
+ *  releases the arrays, the capabilities and their argument maps. */
+int peer_capabilities_add(peer_capabilities_matrix_t *map, const char *peer,
+                          const char *const *names, size_t n_names);
+
+/** Move the matrix in @p src (an embedded map, e.g. a received message's) to
+ *  a new heap map the caller frees with map_free, leaving @p src zeroed.
+ *  NULL when @p src holds nothing. */
+peer_capabilities_matrix_t *peer_capabilities_take(peer_capabilities_matrix_t *src);
+
 int peer_capabilities_to_json(const void *data_struct, json_t **obj_ptr);
 int peer_capabilities_from_json(const json_t *obj, void *data_struct);
 
