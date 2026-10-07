@@ -34,6 +34,7 @@
 // #include "protobuf/processes.pb-c.h"
 #include "config/configuration.h"
 #include "structures/map.h"
+#include "processes/capabilities_priv.h"   /* peer_capabilities_take */
 #include "utilities/msg_types_priv.h"
 #include "utilities/probes.h"
 #include "utilities/util.h"
@@ -390,9 +391,21 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
             log_debug(proc->logger, "%s: rtt_update for unknown peer\n", proc->name);
         return true;
     }
-    case PEER_CAPABILITIES:
-        // pproc->peer_capabilities = message
+    case PEER_CAPABILITIES: {
+        /* Identity's view of which peer offers what (_publish_peer_
+         * capabilities), the C counterpart of Python's matrix put on the
+         * negotiation queue. Adopted whole, replacing the last one; negotiation
+         * fans an invitation out only to the peers it names. */
+        peer_capabilities_matrix_t *fresh =
+            peer_capabilities_take(&msg->info.peer_capabilities);
+        if (fresh == NULL)
+            return true;
+        peer_capabilities_matrix_t *old = proc->protocol.peer_capabilities;
+        proc->protocol.peer_capabilities = fresh;
+        if (old != NULL)
+            map_free(old);
         return true;
+    }
     default: {
         /* Only a NET_MESSAGE carries a net_msg. Anything else reaching here --
          * a registered feature type, or a core type this process has no arm
@@ -522,24 +535,6 @@ int process_setup(process_t *proc, queue_id_t signal, logger_t *logger,
     return 0;
 }
 
-/* smrt finalizer for a process_loop stash entry: the heap fields the copy
- * took over from the receive buffer (as messaging_recv_release frees them,
- * without its memset of a whole generic_msg_t this block is shorter than),
- * then the block. */
-static void stashed_msg_dtor(void *ptr)
-{
-    data_t *dat = ptr;
-    generic_msg_t *msg = dat->obj;
-    if (msg->type == NET_MESSAGE) {
-        free(msg->info.net_msg.function);
-        free(msg->info.net_msg.obj);
-    } else if (msg->type == TASK_RESULT) {
-        free(msg->info.task_result.result_data);
-    }
-    free(msg);
-    dat->obj = NULL;
-}
-
 /* Frama-C: skipped —
  * [func-ptr] run_message_handlers dispatches via msg_handler_t [syscall] keep_running
  * reads from IPC message queue [solver-timeout] process_init/setup/start/loop/run:
@@ -549,8 +544,6 @@ static void stashed_msg_dtor(void *ptr)
 int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
                  process_ctx_t *ctx)
 {
-    array_t unprocessed;
-    array_init(&unprocessed);
     generic_msg_t buf = {0};
     while (keep_running(proc, &ctx->sig_q, logger))
     {
@@ -585,40 +578,14 @@ int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
                                  buf.info.net_msg.function,
                                  "unhandled", "proc", proc->name, NULL);
             }
-            /* The stash keeps the type beside the payload so its finalizer
-             * knows which heap fields the copy owns. Only the payload's
-             * message_size() bytes are allocated, not all of info. */
-            size_t size = message_size(buf.type);
-            generic_msg_t *msg = calloc(1, offsetof(generic_msg_t, info) + size);
-            if (msg == NULL)
-            {
-                log_debug(proc->logger, "%s: skipping unhandled message type %ld\n", proc->name, buf.type);
-                continue;
-            }
-            msg->type = buf.type;
-            memcpy(&msg->info, &buf.info, size);
-            data_t *m_dat = object_ptr_data(msg, size);
-            if (m_dat == NULL)
-            {
-                free(msg);   /* buf keeps its fields; the release below frees them */
-                continue;
-            }
-            m_dat->dtor = stashed_msg_dtor;
-            /* The stashed copy owns the payload now: keep the release at the
-             * top of the next pass from freeing it under the stash. */
-            if (buf.type == NET_MESSAGE) {
-                buf.info.net_msg.function = NULL;
-                buf.info.net_msg.obj = NULL;
-            } else if (buf.type == TASK_RESULT) {
-                buf.info.task_result.result_data = NULL;
-            }
-            if (array_append(&unprocessed, m_dat) != 0)
-                smrt_deref(m_dat);
+            /* Then dropped, as Python's processes drop theirs. The next
+             * pass's release frees the buffer. */
+            log_debug(proc->logger, "%s: unhandled message type %ld\n",
+                      proc->name, buf.type);
         }
         // Hook point for sub-process specific post-message activity (e.g. periodic tasks)
     }
     messaging_recv_release(&buf);
-    array_free(&unprocessed);
     array_free(queues);
     if (ctx->fd1 > 0)
         close(ctx->fd1);

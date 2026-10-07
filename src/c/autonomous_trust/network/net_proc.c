@@ -52,6 +52,7 @@
 #include "utilities/send_retry.h"
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
+#include "identity/id_proc_priv.h"   /* identity_self_identity */
 #include "structures/map.h"
 #include "structures/data.h"
 
@@ -2253,18 +2254,10 @@ static int network_run(const net_transport_t *transport,
     /* Extract identity before opening the transport — non-IP transports
      * (DTN) derive their local endpoint name from myself->uuid and need
      * it at open() time. Socket transports ignore it. */
-    identity_t *myself = NULL;
+    identity_t *myself = (identity_t *)identity_self_identity(proc);
     public_identity_t *my_public = NULL;
-    data_t *id_dat = NULL;
-    char id_key[] = "identity";
-    if (map_get(proc->configs, id_key, &id_dat) == 0) {
-        config_t *id_cfg = NULL;
-        if (data_object_ptr(id_dat, (void **)&id_cfg) == 0 &&
-            id_cfg->data_struct != NULL) {
-            myself = (identity_t *)id_cfg->data_struct;
-            identity_publish(myself, &my_public);
-        }
-    }
+    if (myself != NULL)
+        identity_publish(myself, &my_public);
 
     /* Some transports (currently: hybrid_net) require an extra config blob
      * that isn't in the standard network_config_t. Look for a same-named

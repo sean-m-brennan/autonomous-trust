@@ -38,6 +38,9 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
     Handle transaction agreement negotiations
     """
     max_task_duplicates = 5
+    # Status-request rounds the deadline sweep sends, without a live answer,
+    # before it gives a task up. C twin: NEG_STATUS_ASKS.
+    STATUS_ASKS = 3
 
     def __init__(self, configurations, subsystems, log_q, max_cores=max_concurrency, **kwargs):
         super().__init__(configurations, subsystems, log_q,
@@ -124,7 +127,6 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
             task = message.obj
             tracker = TaskTracker(task)
             self.my_tasks[task.uuid] = tracker
-            self.status_pending.append(task)
             participants = []
             for cap_name, uuid_list in self.peer_capabilities.items():
                 if cap_name == task.capability.name:
@@ -320,8 +322,6 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
         confirmed = self.confirmed.get(task.uuid)
         if confirmed is not None and message.from_whom in confirmed:
             confirmed.remove(message.from_whom)
-        if len(result) < task.size:
-            queues[CfgIds.main].put(result, block=True, timeout=self.q_cadence)
 
     def handle_haggle(self, queues, message):
         if message.function == NegotiationProtocol.response:
@@ -463,15 +463,20 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                             # our own patience is not the remote end's call to
                             # make.
                             params = tracker.parameters
-                            extend = params.timeout_extension
-                            if params.timeout.total_seconds() > 0:
-                                extend = params.timeout.total_seconds()
-                            elif params.duration.total_seconds() > 0:
-                                extend = int(params.duration.total_seconds() * params.duration_fraction / 100) + 1
-                            params.timeout += timedelta(seconds=extend)
+                            params.timeout += timedelta(seconds=params.extension_seconds())
                             for entry in pending:
                                 self.status_pending.remove(entry)
-                elif task.status in [Status.dead, Status.zombie, Status.stopped, Status.unknown]:
+                            # The deadline moved, so the sweep's count of
+                            # unanswered rounds starts over from it.
+                            tracker.status_asks = 0
+                            tracker.status_asked_at = None
+                # `unknown` is not here: it only says the worker is not
+                # tracking the task, which is also what a worker says once it
+                # has finished and its result is on the way. Cancelling then
+                # dropped that result as uninvited. It neither extends nor
+                # cancels; the deadline sweep gives up on a worker that has
+                # really let the task go. Mirrors C handle_stat_resp.
+                elif task.status in [Status.dead, Status.zombie, Status.stopped]:
                     try:
                         self._cancel_participant(queues, message)
                     except Full:
@@ -685,6 +690,65 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                 peer_uuid_str, new_tier, cancelled_jobs)
         return True
 
+    def _forget_task(self, task_id):
+        """Everything this node keeps about one of its own tasks: the tracker,
+        the confirmations and any outstanding status token."""
+        self.my_tasks.pop(task_id, None)
+        self.confirmed.pop(task_id, None)
+        self.status_pending = [t for t in self.status_pending
+                               if t.uuid != task_id]
+
+    def status_sweep(self, queues, present) -> int:
+        """The requestor's deadline sweep (doc/architecture/negotiation.md).
+
+        A task of ours past its deadline (when + duration + timeout) is asked
+        about: a status request to every confirmed participant still owing a
+        result. A live answer extends the deadline (handle_stat_resp).
+        Silence, or an answer that does not extend, is asked again once an
+        extension's worth of time has passed, and after ``STATUS_ASKS`` rounds
+        the task is given up: logged and forgotten, with no result to main and
+        no score, since a lost frame looks the same as a refusal. Returns the
+        number given up. C twin: ``negotiation_status_sweep``."""
+        given_up = 0
+        for task_id, tracker in list(self.my_tasks.items()):
+            params = tracker.parameters
+            if present <= params.when + params.duration + params.timeout:
+                continue
+            wait = timedelta(seconds=params.extension_seconds())
+            asks = getattr(tracker, 'status_asks', 0)
+            asked_at = getattr(tracker, 'status_asked_at', None)
+            if asks > 0 and asked_at is not None and present < asked_at + wait:
+                continue    # still waiting on the last round
+            scored = getattr(tracker, 'scored', set())
+            owing = [p for p in self.confirmed.get(task_id, [])
+                     if p.uuid not in scored]
+            asked = 0
+            if asks < self.STATUS_ASKS:
+                body = Task(**tracker.to_dict()).to_json_string()
+                for peer in owing:
+                    try:
+                        msg = Message(self.name, NegotiationProtocol.status_req,
+                                      body, peer)
+                        queues[CfgIds.network].put(msg, block=True,
+                                                   timeout=self.q_cadence)
+                        asked += 1
+                    except Full:
+                        self.logger.error('status_sweep: Network queue full')
+            if asked == 0:
+                self.logger.warning(
+                    'Task %s past its deadline with no live answer after %d '
+                    'status request round(s); giving it up', task_id, asks)
+                self._forget_task(task_id)
+                given_up += 1
+                continue
+            tracker.status_asks = asks + 1
+            tracker.status_asked_at = present
+            self.status_pending.append(tracker)
+            self.logger.debug('Task %s past its deadline; asked %d '
+                              'participant(s) for status (round %d)',
+                              task_id, asked, tracker.status_asks)
+        return given_up
+
     def process(self, queues, signal):
         run_post_fork(self)
         # Drain budget per iter — same shape as repprocess.py. The
@@ -733,27 +797,7 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                     except Full:
                         self.logger.error('process: Main queue full')
 
-                present = now()
-                for task_id in self.my_tasks:  # remote jobs
-                    task = self.my_tasks[task_id]
-                    params = task.parameters
-                    try:
-                        # Outstanding-request test by uuid, matching the way
-                        # handle_stat_resp consumes the entry. Identity
-                        # comparison here saw start_task's Task and this
-                        # tracker as different objects, so a task could carry
-                        # two pending entries at once — and two entries are two
-                        # extension tokens.
-                        if not any(t.uuid == task.uuid for t in self.status_pending) and \
-                                present > params.when + params.duration + params.timeout:
-                            tx_task = Task(**task.to_dict())
-                            msg = Message(self.name, NegotiationProtocol.status_req,
-                                          tx_task.to_json_string(), task.requestor)
-                            queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
-                            self.logger.debug('Request remote execution status from %s', task.requestor.nickname)
-                            self.status_pending.append(task)
-                    except Full:
-                        self.logger.error('process: Network queue full')
+                self.status_sweep(queues, now())
             except Exception as err:
                 self.logger.error(err)
                 self.logger.error(traceback.format_exc())

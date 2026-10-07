@@ -745,14 +745,11 @@ static void tx_history_evict_oldest(tx_history_t *hist)
             write_idx++;
         }
         /* Trim any stale tail. array_set doesn't shrink; pop until
-         * size == write_idx. */
+         * size == write_idx. By index: array_remove matches by value, and a
+         * rewritten slot in front can equal the stale tail. */
         while (array_size(arr) > write_idx)
         {
-            data_t *tail = NULL;
-            if (array_get(arr, (int)(array_size(arr) - 1), &tail) == 0
-                && tail != NULL)
-                array_remove(arr, tail);
-            else
+            if (array_remove_at(arr, -1) != 0)
                 break;
         }
         if (array_size(arr) == 0)

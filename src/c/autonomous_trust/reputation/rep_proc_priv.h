@@ -67,7 +67,7 @@ void _retry_nacked_rounds(const process_t *proc, double present,
 
 /** Re-propose every half of OURS still not in the chain REP_COMMIT_TIMEOUT
  *  (AT_REP_COMMIT_TIMEOUT_SEC, default 15 s) after it was last proposed, up to
- *  REP_COMMIT_RETRIES times, then give it up with a warning (ISSUES §2.24). A
+ *  REP_COMMIT_RETRIES times, then park it (ISSUES §2.24, §2.60). A
  *  granted round whose transaction never commits, and a round nobody answers,
  *  are otherwise lost for good. Called once per pass from reputation_run's
  *  loop; @p present is a parameter so a test can advance the clock. */
@@ -75,6 +75,8 @@ void _retry_uncommitted_halves(const process_t *proc, double present);
 
 /** Test seam: how many of our halves are waiting to reach the chain. */
 size_t reputation_awaiting_commit_count(void);
+/** Test seam: how many of those are parked (ISSUES §2.60). */
+size_t reputation_parked_count(void);
 
 /** Co-sign every parked checkpoint proposal whose range our chain now holds
  *  with the proposed root, and drop those parked longer than one checkpoint
@@ -266,6 +268,9 @@ size_t _retry_pending_attestations(const process_t *proc, double present);
 /** Our attestation rounds still awaiting a quorum. */
 size_t reputation_attest_pending_count(void);
 
+/** Co-signatures recorded for attestation rounds still in flight (test seam). */
+size_t reputation_attest_cosig_count(void);
+
 /* Commit a verifier-attested entry directly (test/conformance hook): the
  * chain's half of the rule, without the quorum round. Returns
  * tx_history_append_attested's result. */
@@ -273,6 +278,16 @@ int reputation_install_tx_attested(const uuid_t verifier_uuid, double score,
                                    const char *channel,
                                    const uuid_t subject_uuid,
                                    const char *evidence_digest);
+/** Replace the attestation conflict set (ISSUES §2.54) with @p json_text,
+ *  {"teams": [[uuid, ...], ...]}, instead of etc/at/attest_conflicts.cfg.json;
+ *  NULL goes back to the file. For tests and the conformance adapter. Returns
+ *  -1, changing nothing, on a malformed set. */
+int reputation_set_attest_conflicts(const char *json_text);
+
+/** Whether @p a and @p b are two different nodes of one team in the conflict
+ *  set in force (ISSUES §2.54). For tests. */
+bool reputation_attest_conflicted(const char *a, const char *b);
+
 /** @ref reputation_install_tx_attested with an attest scope (NULL for none)
  *  and its quorum certificate as JSON text (NULL for none). */
 int reputation_install_tx_attested_scoped(const uuid_t verifier_uuid,

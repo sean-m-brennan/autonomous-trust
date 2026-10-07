@@ -145,6 +145,35 @@ This is the principle the whole framework runs on, applied one level down. Trust
 is a live value, so an authorization derived from trust has to be live too, and
 an authorization that was correct when granted is not thereby correct now.
 
+## When a task goes quiet
+
+The requester keeps a tracker for each task it asked for, until every invitee
+has answered. A participant that never answers would keep that tracker alive
+forever, so the requester runs a deadline sweep.
+
+A task's deadline is its scheduled time plus its duration plus its timeout. Once
+that has passed, the requester sends a `status request` to every participant
+that accepted and still owes a result. A live answer (running, sleeping or
+pending) moves the deadline out by one extension: the task's timeout, else a
+tenth of its duration, else two minutes. That extension is spent from the
+outstanding request, so a replayed or unsolicited answer extends nothing.
+Without a live answer the requester asks again once an extension's worth of
+time has gone by, and after three such rounds it gives the task up.
+
+Giving up is quiet. The tracker and everything kept beside it are dropped and a
+warning is logged, but no result goes to the orchestrator and nobody is scored,
+because silence is not evidence: a frame lost in transit looks exactly like a
+peer that walked away. A task nobody accepted has no one to ask, and is given
+up at its deadline.
+
+The answers mean what they say, in both runtimes. A worker answers `pending`
+for a task still queued and `running` while it executes; the C worker runs each
+job on a thread of its own so that it stays free to answer while it works.
+`unknown` says only that the worker is not tracking the task, which is also
+what it says once it has finished and its result is on the way, so it neither
+extends nor cancels: a cancel there would drop that result as uninvited.
+`dead`, `zombie` and `stopped` cancel the participant.
+
 ## Components, and what each protects
 
 Four pieces carry the subsystem, and each one exists to bound a specific

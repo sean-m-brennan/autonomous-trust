@@ -1459,3 +1459,129 @@ class TestStartTaskAddressing:
         assert np.start_task({CfgIds.network: queue.Queue(),
                               CfgIds.main: queue.Queue()}, msg) is True
         assert set(np.my_tasks[task.uuid].results) == {carol.uuid}
+
+
+class TestStatusSweep:
+    """The requestor's deadline sweep (ISSUES §2.41): asks the confirmed
+    participants once the deadline passes, extends on a live answer, and gives
+    a task up -- unscored -- after STATUS_ASKS silent rounds. Mirrors the C
+    tests in neg_send_keep_test.c."""
+
+    T0 = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def _requestor(self, ack=True):
+        np = _make_neg_process()
+        tp = TaskParameters('noop', when=self.T0, duration=timedelta(seconds=1),
+                            timeout=timedelta(seconds=1))
+        task = Task(tp, 'req')
+        tracker = TaskTracker(task)
+        np.my_tasks[task.uuid] = tracker
+        peer = _make_mock_peer()
+        if ack:
+            np.confirmed[task.uuid] = [peer]
+        queues = {CfgIds.network: queue.Queue(), CfgIds.main: queue.Queue()}
+        return np, task, peer, queues
+
+    @staticmethod
+    def _asked(queues):
+        out = []
+        while not queues[CfgIds.network].empty():
+            out.append(queues[CfgIds.network].get_nowait())
+        return [m for m in out
+                if m.function == NegotiationProtocol.status_req]
+
+    def at(self, seconds):
+        return self.T0 + timedelta(seconds=seconds)
+
+    def test_start_task_holds_no_status_token(self):
+        # The token start_task used to add suppressed the sweep for good.
+        np = _make_neg_process()
+        np.peer_capabilities.items = MagicMock(return_value=[])
+        cap = MagicMock()
+        cap.name = 'noop'
+        tp = TaskParameters(cap)
+        msg = Message(CfgIds.negotiation, NegotiationProtocol.start,
+                      Task(tp, 'req'))
+        np.start_task({CfgIds.main: queue.Queue(),
+                       CfgIds.network: queue.Queue()}, msg)
+        assert np.status_pending == []
+
+    def test_a_silent_participant_is_asked_then_given_up(self):
+        np, task, peer, queues = self._requestor()
+        assert np.status_sweep(queues, self.at(1)) == 0
+        assert self._asked(queues) == []
+
+        assert np.status_sweep(queues, self.at(10)) == 0
+        asked = self._asked(queues)
+        assert len(asked) == 1
+        assert asked[0].to_whom == [peer] or asked[0].to_whom == peer
+        assert np.status_sweep(queues, self.at(10.5)) == 0
+        assert self._asked(queues) == []                 # still waiting
+        assert np.status_sweep(queues, self.at(12)) == 0
+        assert np.status_sweep(queues, self.at(14)) == 0
+        assert len(self._asked(queues)) == 2
+        assert task.uuid in np.my_tasks
+
+        assert np.status_sweep(queues, self.at(16)) == 1
+        assert self._asked(queues) == []
+        assert task.uuid not in np.my_tasks
+        assert task.uuid not in np.confirmed
+        assert np.status_pending == []
+        assert queues[CfgIds.main].empty()               # no result, no score
+
+    def test_a_live_answer_extends_and_resets_the_count(self):
+        np, task, peer, queues = self._requestor()
+        assert np.status_sweep(queues, self.at(3)) == 0
+        assert len(self._asked(queues)) == 1
+
+        status = TaskStatus(task, Status.running)
+        resp = Message(CfgIds.negotiation, NegotiationProtocol.status_resp,
+                       status)
+        resp.from_whom = peer
+        assert np.handle_stat_resp(queues, resp) is True
+        assert np.my_tasks[task.uuid].status_asks == 0
+
+        # Deadline now T0 + 3 s; asked again only after it.
+        assert np.status_sweep(queues, self.at(3)) == 0
+        assert self._asked(queues) == []
+        for i in range(3):
+            assert np.status_sweep(queues, self.at(5 + 2 * i)) == 0
+        assert len(self._asked(queues)) == 3
+        assert task.uuid in np.my_tasks
+
+    def test_an_unaccepted_task_is_given_up_at_the_deadline(self):
+        np, task, _, queues = self._requestor(ack=False)
+        assert np.status_sweep(queues, self.at(3)) == 1
+        assert self._asked(queues) == []
+        assert task.uuid not in np.my_tasks
+
+
+class TestUnknownStatusDoesNotCancel:
+    """ISSUES §2.59: `unknown` is what a worker says once it has finished, so
+    cancelling on it dropped the result that was still on its way."""
+
+    def test_unknown_then_late_result_is_still_forwarded(self):
+        np = _make_neg_process()
+        peer = _make_mock_peer()
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
+        task = Task(tp, peer)
+        tracker = TaskTracker(task)
+        tracker.results[peer.uuid] = None          # invited
+        np.my_tasks[task.uuid] = tracker
+        np.confirmed[task.uuid] = [peer]
+        main_q = queue.Queue()
+        queues = {CfgIds.main: main_q, CfgIds.network: queue.Queue()}
+
+        status = Message(CfgIds.negotiation, NegotiationProtocol.status_resp,
+                         TaskStatus(task, Status.unknown), from_whom=peer)
+        assert np.handle_stat_resp(queues, status) is True
+        assert peer.uuid in tracker.results         # not cancelled
+        assert peer in np.confirmed[task.uuid]
+        assert main_q.empty()                       # nothing posted to main
+
+        result = TaskResult(task, 'answer')
+        msg = Message(CfgIds.negotiation, NegotiationProtocol.result,
+                      result, from_whom=peer)
+        assert np.handle_results(queues, msg) is True
+        assert not main_q.empty()                   # forwarded and scored
+        assert task.uuid not in np.my_tasks

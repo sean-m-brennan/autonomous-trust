@@ -281,6 +281,63 @@ int map_get(map_t *map, const map_key_t key, data_t **value)
     return EXCEPTION(EMAP_NOKEY);
 }
 
+/* The key index (map->keys) records insertion order for map_keys and
+ * map_entries_for_each. map_remove leaves a removed key in it, so a loop may
+ * remove entries while it walks the index without anything moving under it;
+ * the walk skips the dead key because its map_get fails. Dead keys are
+ * dropped here instead, on the next NEW key, once they are at least as many
+ * as the live ones: the index stays under twice the live count, and only a
+ * new key added to a map while walking that same map could see it move.
+ * A key set again after its removal reuses its dead entry rather than
+ * appearing twice. */
+static bool _key_live(data_t *k, void *ctx)
+{
+    char *s = NULL;
+    data_t *v = NULL;
+    return data_string_ptr(k, &s) == 0 && s != NULL
+        && map_get((map_t *)ctx, s, &v) == 0;
+}
+
+typedef struct {
+    map_t *map;
+    map_t *seen;
+} key_once_ctx_t;
+
+/* _key_live, and the first time this key is met in the index. */
+static bool _key_live_once(data_t *k, void *vctx)
+{
+    key_once_ctx_t *ctx = vctx;
+    if (!_key_live(k, ctx->map))
+        return false;
+    char *s = NULL;
+    data_t *v = NULL;
+    data_string_ptr(k, &s);
+    if (map_get(ctx->seen, s, &v) == 0)
+        return false;
+    map_set(ctx->seen, s, integer_data(1));
+    return true;
+}
+
+/* @return true when @p key already sits (dead) in the index; otherwise
+ * compacts the index if dead keys are now at least as many as live ones.
+ * Called for a NEW key, before its item is written. */
+static bool _keys_before_insert(map_t *map, const char *key)
+{
+    size_t indexed = array_size(&map->keys);
+    if (indexed <= map->length)
+        return false;   /* no dead keys: nothing to reuse or drop */
+    for (size_t i = 0; i < indexed; i++)
+    {
+        char *s = NULL;
+        if (data_string_ptr(map->keys.array[i], &s) == 0 && s != NULL
+            && strcmp(s, key) == 0)
+            return true;
+    }
+    if (indexed - map->length >= map->length)
+        array_keep_if(&map->keys, _key_live, map);
+    return false;
+}
+
 /* Frama-C: skipped — [alloc-pattern] hash bucket manipulation with realloc */
 int map_set(map_t *map, const map_key_t key, data_t *value)
 {
@@ -327,6 +384,7 @@ int map_set(map_t *map, const map_key_t key, data_t *value)
     }
 
     // new entry
+    bool indexed = _keys_before_insert(map, key);
     map_item_t *item = &map->items[index];
     map_key_t key_cpy = strdup(key);
     if (key_cpy == NULL)
@@ -334,10 +392,13 @@ int map_set(map_t *map, const map_key_t key, data_t *value)
     item->key = key_cpy; // map owns this strdup'd copy; freed in map_delete/map_free
     item->hash = hash;
     item->value = value;  /* adopted, not referenced; see map.h */
-    data_t *str_dat = string_data(key_cpy, strlen(key_cpy));
-    int err = array_append(&map->keys, str_dat);
-    if (err != 0)
-        return err;
+    if (!indexed)
+    {
+        data_t *str_dat = string_data(key_cpy, strlen(key_cpy));
+        int err = array_append(&map->keys, str_dat);
+        if (err != 0)
+            return err;
+    }
     map->length++;
 
     //@ assert map->length <= map->capacity;
@@ -544,8 +605,23 @@ int map_to_json(const void *data_struct, json_t **obj_ptr)
     }
     json_object_set_new(obj, "hashkey", hash_arr);
 
+    /* Live keys only: the dead ones map_remove leaves in the index are not
+     * part of the map. */
+    array_t live;
+    array_init(&live);
+    for (size_t i = 0; i < map->keys.size; i++)
+    {
+        data_t *k = map->keys.array[i];
+        if (_key_live(k, (map_t *)map))
+        {
+            smrt_ref(k);
+            array_append(&live, k);
+        }
+    }
     json_t *keys;
-    if (array_to_json(&map->keys, &keys) < 0)
+    int kerr = array_to_json(&live, &keys);
+    array_free(&live);
+    if (kerr < 0)
         return -1;
     json_object_set_new(obj, "keys", keys);
 
@@ -633,6 +709,15 @@ int map_from_json(const json_t *obj, void *data_struct)
                 return -1;
             data_from_json(json_object_get(elt, "value"), map->items[i].value);
         }
+    }
+    /* Output from before the index was kept compact can carry dead keys, and
+     * a key removed and set again twice over; keep each live key once. */
+    map_t seen;
+    if (map_init(&seen) == 0)
+    {
+        key_once_ctx_t ctx = { map, &seen };
+        array_keep_if(&map->keys, _key_live_once, &ctx);
+        map_free(&seen);
     }
     //@ assert map->length <= map->capacity;
     return 0;

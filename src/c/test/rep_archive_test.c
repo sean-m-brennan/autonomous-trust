@@ -322,7 +322,63 @@ DEFINE_TEST(test_a_checkpoint_off_our_window_archives_nothing)
 }
 END_TEST_DEFINITION()
 
+/* ISSUES §2.54: the application's team file, read when it changes. */
+DEFINE_TEST(test_the_conflict_file_is_read_and_reread)
+{
+    char root_dir[] = "/tmp/at-conflicts-XXXXXX";
+    ck_assert_ptr_nonnull(mkdtemp(root_dir));
+    char etc[300], path[400];
+    snprintf(etc, sizeof(etc), "%s/etc", root_dir);
+    mkdir(etc, 0755);
+    snprintf(etc, sizeof(etc), "%s/etc/at", root_dir);
+    mkdir(etc, 0755);
+    setenv("AUTONOMOUS_TRUST_ROOT", root_dir, 1);
+    snprintf(path, sizeof(path), "%s/attest_conflicts.cfg.json", etc);
+    const char *A = "0f1e2d3c-4b5a-4968-8776-655443322110";
+    const char *B = "1a2b3c4d-5e6f-4071-8293-a4b5c6d7e8f9";
+    const char *C = "2b3c4d5e-6f70-4182-93a4-b5c6d7e8f90a";
+    reputation_set_attest_conflicts(NULL);
+    ck_assert(!reputation_attest_conflicted(A, B));   /* no file */
+
+    FILE *f = fopen(path, "w");
+    ck_assert_ptr_nonnull(f);
+    fprintf(f, "{\"teams\": [[\"%s\", \"%s\"]]}", A, B);
+    fclose(f);
+    ck_assert(reputation_attest_conflicted(A, B));
+    ck_assert(reputation_attest_conflicted(B, A));
+    ck_assert(!reputation_attest_conflicted(A, C));
+    ck_assert(!reputation_attest_conflicted(A, A));   /* not its own teammate */
+
+    /* A changed file (a different size, so the stamp moves) is picked up. */
+    f = fopen(path, "w");
+    ck_assert_ptr_nonnull(f);
+    fprintf(f, "{\"teams\": [[\"%s\", \"%s\", \"%s\"]]}", A, B, C);
+    fclose(f);
+    ck_assert(reputation_attest_conflicted(A, C));
+
+    /* A malformed file is no teams at all. */
+    f = fopen(path, "w");
+    ck_assert_ptr_nonnull(f);
+    fprintf(f, "{\"teams\": [[1, 2]]}");
+    fclose(f);
+    ck_assert(!reputation_attest_conflicted(A, B));
+
+    /* An override wins over the file, and a malformed one changes nothing. */
+    char doc[200];
+    snprintf(doc, sizeof(doc), "{\"teams\": [[\"%s\", \"%s\"]]}", B, C);
+    ck_assert_int_eq(reputation_set_attest_conflicts(doc), 0);
+    ck_assert(reputation_attest_conflicted(B, C));
+    ck_assert_int_eq(reputation_set_attest_conflicts("{\"teams\": 3}"), -1);
+    ck_assert(reputation_attest_conflicted(B, C));
+    reputation_set_attest_conflicts(NULL);
+
+    unlink(path);
+    ck_assert(!reputation_attest_conflicted(A, B));
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(RepArchive,
+          test_the_conflict_file_is_read_and_reread,
           test_a_checkpoint_archives_its_attested_entries,
           test_a_checkpoint_short_of_quorum_archives_nothing,
           test_a_checkpoint_off_our_window_archives_nothing)

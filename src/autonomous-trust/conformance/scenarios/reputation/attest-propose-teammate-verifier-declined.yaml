@@ -1,0 +1,39 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-propose-teammate-verifier-declined
+byte_pinning: false
+description: |
+    A verifier that is the subject's teammate is not vouched for (ISSUES §2.54).
+
+    alice and carol act for one team. alice's finding about carol is the team
+    speaking about itself, which is what an attestation exists to get past: a
+    team that could attest its own members clean would raise its own badge.
+    bob, an outsider, declines.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+fixtures:
+  attest_conflicts:
+    - [alice, carol]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest propose
+    payload:
+      subject: carol
+      score: 0.8
+      channel: probe
+    description: a teammate attests the subject.
+
+expected_state:
+  bob:
+    attest_signs_sent: 0

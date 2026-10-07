@@ -89,6 +89,7 @@ void data_dtor(void *ptr);
 
 /** smrt finalizer for owned_object_data: free()s the wrapped object. */
 void data_owned_obj_dtor(void *ptr);
+void data_owned_smrt_dtor(void *ptr);
 
 #define INT_DATA(i)   \
     {                 \
@@ -291,6 +292,19 @@ data_t *object_ptr_data(ptr_t o, size_t len);
  * @return A new data_t, or NULL (then @p o is still the caller's).
  */
 data_t *owned_object_data(ptr_t o, size_t len);
+
+/**
+ * @brief Wrap an smrt object (one that embeds smrt_ptr_t at offset 0) the
+ *        data_t takes the caller's reference to.
+ *
+ * The last smrt_deref of the data_t releases @p o with smrt_deref, so the
+ * object's own @c dtor runs (owned_object_data free()s, and would skip it).
+ *
+ * @param o   smrt_create'd object, or NULL on the caller's failure path.
+ * @param len Size of the object in bytes.
+ * @return A new data_t, or NULL (then @p o is still the caller's).
+ */
+data_t *owned_smrt_data(ptr_t o, size_t len);
 
 
 /********************/

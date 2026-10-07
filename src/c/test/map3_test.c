@@ -19,6 +19,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <jansson.h>
 
 #include "structures/map_priv.h"
 #include "structures/data_priv.h"
@@ -156,6 +157,131 @@ DEFINE_TEST(test_map_remove_and_reinsert)
 }
 END_TEST_DEFINITION()
 
+/* How many times map_entries_for_each visits @p key. */
+static int _visits(map_t *map, const char *want)
+{
+    int n = 0;
+    map_key_t key = NULL;
+    data_t *val = NULL;
+    map_entries_for_each(map, key, val)
+        if (strcmp(key, want) == 0)
+            n++;
+    map_end_for_each
+    return n;
+}
+
+/* Churn: the key index stays under twice the live count, however many keys
+ * come and go (it used to keep every key ever set). */
+DEFINE_TEST(test_map_key_index_is_bounded_under_churn)
+{
+    map_t map;
+    ck_assert_ret_ok(map_init(&map));
+    char key[32];
+    for (int i = 0; i < 1000; i++)
+    {
+        snprintf(key, sizeof(key), "k%d", i);
+        ck_assert_ret_ok(map_set(&map, key, integer_data(i)));
+        if (i >= 4)
+        {
+            snprintf(key, sizeof(key), "k%d", i - 4);
+            ck_assert_ret_ok(map_remove(&map, key));
+        }
+        ck_assert(array_size(map_keys(&map)) <= 2 * map_size(&map) + 1);
+    }
+    ck_assert_uint_eq(map_size(&map), 4);
+    map_free(&map);
+}
+END_TEST_DEFINITION()
+
+/* A key removed and set again is visited once, not twice. */
+DEFINE_TEST(test_map_reinserted_key_is_visited_once)
+{
+    map_t map;
+    ck_assert_ret_ok(map_init(&map));
+    ck_assert_ret_ok(map_set(&map, (char *)"a", integer_data(1)));
+    ck_assert_ret_ok(map_set(&map, (char *)"b", integer_data(2)));
+    ck_assert_ret_ok(map_remove(&map, (char *)"a"));
+    ck_assert_ret_ok(map_set(&map, (char *)"a", integer_data(3)));
+    ck_assert_int_eq(_visits(&map, "a"), 1);
+    ck_assert_int_eq(_visits(&map, "b"), 1);
+    map_free(&map);
+}
+END_TEST_DEFINITION()
+
+/* Removing entries while walking the index still visits every live one: the
+ * removal does not move the index (only a NEW key may compact it). */
+DEFINE_TEST(test_map_remove_while_walking_visits_all)
+{
+    map_t map;
+    ck_assert_ret_ok(map_init(&map));
+    char key[16];
+    for (int i = 0; i < 20; i++)
+    {
+        snprintf(key, sizeof(key), "k%d", i);
+        ck_assert_ret_ok(map_set(&map, key, integer_data(i)));
+    }
+    int seen = 0;
+    array_t *keys = map_keys(&map);
+    for (size_t i = 0; i < array_size(keys); i++)
+    {
+        data_t *kd = NULL;
+        char *k = NULL;
+        ck_assert_ret_ok(array_get(keys, (int)i, &kd));
+        ck_assert_ret_ok(data_string_ptr(kd, &k));
+        data_t *v = NULL;
+        if (map_get(&map, k, &v) != 0)
+            continue;
+        seen++;
+        ck_assert_ret_ok(map_remove(&map, k));
+    }
+    ck_assert_int_eq(seen, 20);
+    ck_assert_uint_eq(map_size(&map), 0);
+    map_free(&map);
+}
+END_TEST_DEFINITION()
+
+/* JSON carries the live keys only, and a reload drops dead and repeated keys
+ * that older output may hold. */
+DEFINE_TEST(test_map_json_keys_are_live_only)
+{
+    map_t map;
+    ck_assert_ret_ok(map_init(&map));
+    ck_assert_ret_ok(map_set(&map, (char *)"a", integer_data(1)));
+    ck_assert_ret_ok(map_set(&map, (char *)"b", integer_data(2)));
+    ck_assert_ret_ok(map_set(&map, (char *)"c", integer_data(3)));
+    ck_assert_ret_ok(map_remove(&map, (char *)"b"));
+    json_t *obj = NULL;
+    ck_assert_ret_ok(map_to_json(&map, &obj));
+    ck_assert_uint_eq(json_array_size(json_object_get(json_object_get(obj, "keys"), "array")), 2);
+
+    /* An old-style index: a dead "zz" and "a" twice. */
+    json_t *karr = json_object_get(json_object_get(obj, "keys"), "array");
+    json_t *dup = json_deep_copy(json_array_get(karr, 0));
+    json_array_append_new(karr, dup);
+    data_t *zz = string_data((char *)"zz", 2);
+    json_t *zj = NULL;
+    ck_assert_ret_ok(data_to_json(zz, &zj));
+    json_array_append_new(karr, zj);
+    smrt_deref(zz);
+    json_object_set_new(json_object_get(obj, "keys"), "size",
+                        json_integer((json_int_t)json_array_size(karr)));
+
+    map_t back;
+    memset(&back, 0, sizeof(back));
+    ck_assert_ret_ok(map_from_json(obj, &back));
+    ck_assert_uint_eq(array_size(map_keys(&back)), 2);
+    ck_assert_int_eq(_visits(&back, "a"), 1);
+    ck_assert_int_eq(_visits(&back, "c"), 1);
+    json_decref(obj);
+    map_free(&back);
+    map_free(&map);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(Map3, test_map_init_stack, test_map_capacity_growth,
           test_map_entries_for_each_macro, test_map_get_missing_key,
-          test_map_remove_and_reinsert)
+          test_map_remove_and_reinsert,
+          test_map_key_index_is_bounded_under_churn,
+          test_map_reinserted_key_is_visited_once,
+          test_map_remove_while_walking_visits_all,
+          test_map_json_keys_are_live_only)

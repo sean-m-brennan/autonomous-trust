@@ -28,6 +28,7 @@
 #include "config/configuration.h"
 
 #include "identity/identity.h"
+#include "identity/id_proc_priv.h"   /* identity_self_identity */
 #include "reputation/reputation.h"
 
 #include "zta_process.h"
@@ -817,19 +818,11 @@ int zta_process_run(process_t *proc, directory_t *queues,
 
     /* Resolve our own identity UUID for signing broadcast messages */
     {
-        data_t *id_dat = NULL;
-        char id_key[] = "identity";
-        if (map_get(proc->configs, id_key, &id_dat) == 0) {
-            config_t *id_cfg = NULL;
-            if (data_object_ptr(id_dat, (void **)&id_cfg) == 0 &&
-                    id_cfg->data_struct != NULL) {
-                identity_t *myself = (identity_t *)id_cfg->data_struct;
-                public_identity_t *pub = NULL;
-                if (identity_publish(myself, &pub) == 0 && pub) {
-                    memcpy(zta_state.self_uuid, pub->uuid, sizeof(uuid_t));
-                    smrt_deref(pub);
-                }
-            }
+        const identity_t *myself = identity_self_identity(proc);
+        public_identity_t *pub = NULL;
+        if (myself != NULL && identity_publish(myself, &pub) == 0 && pub) {
+            memcpy(zta_state.self_uuid, pub->uuid, sizeof(uuid_t));
+            smrt_deref(pub);
         }
     }
 
