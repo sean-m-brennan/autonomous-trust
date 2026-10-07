@@ -1,0 +1,49 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-scope-same-scope-refused
+byte_pinning: false
+description: |
+    The same scope is still capped.
+
+    bob's chain holds alice's finding about carol in scope A on `probe`. A
+    second attestation in scope A on `probe` repeats it, so bob declines: the
+    scope lets an application say "this is new", not repeat itself.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+fixtures:
+  reputations:
+    bob:
+      alice: 0.7
+  tx_history:
+    bob:
+      - attested: true
+        p1: alice
+        p1_score: 0.3
+        p1_channel: probe
+        subject: carol
+        evidence_digest: "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        attest_scope: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest propose
+    payload:
+      subject: carol
+      score: 0.8
+      channel: probe
+      scope: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    description: alice attests about carol again in the same scope.
+
+expected_state:
+  bob:
+    attest_signs_sent: 0

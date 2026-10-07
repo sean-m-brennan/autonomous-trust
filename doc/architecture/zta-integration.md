@@ -412,7 +412,7 @@ The ZTA check occurs during Phase 3 (Border Guard Mode) of the [identity
 protocol](identity-protocol.md). When a new peer announces, the border guard
 runs three steps.
 
-1. Validates the AT identity (UUID, keys, and package hash), unchanged.
+1. Validates the AT identity (UUID, keys, and package hash, against the allowlist when one ships; see [identity-protocol.md](identity-protocol.md)), unchanged.
 2. If `require_at_admission` is true, verifies the ZTA credential via the configured verifier.
 3. If verification returns `ZTA_VERIFIED`, the gate then **checks revocation** (`check_revocation` on the verified credential's hash). `verify_credential` walks only the chain and expiry, so a chain-valid but revoked certificate would otherwise admit, and the explicit revocation check closes that gap. Only an affirmative `ZTA_REVOKED` blocks. `ZTA_UNAVAILABLE`, the default when no CRL/OCSP source is configured, does **not**, so deployments without a revocation source are unaffected. A surviving credential is proposed for group voting with no reputation cap (starts at 0.5 neutral, can earn higher).
 4. If verification returns `ZTA_DEFERRED` and `allow_ddil_fallback` is true, the peer is admitted with a reputation cap of `ddil_fallback_reputation_cap`. The deferral is recorded in the audit log.

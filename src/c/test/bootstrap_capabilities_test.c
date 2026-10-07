@@ -64,6 +64,43 @@ DEFINE_TEST(test_verify_time_attest_bands)
 }
 END_TEST_DEFINITION()
 
+/* ISSUES §2.53: an honest clock read its time somewhere in the round trip,
+ * so the window runs from when we sent the probe to when we scored the reply.
+ * Against the scoring instant alone, a reply that took 1 s to come back (IPC
+ * plus network, routine in a live node) landed on 0.5 every time. */
+DEFINE_TEST(test_verify_time_attest_window)
+{
+    double tol = AT_DEFAULT_TIME_ATTEST_TOLERANCE_SEC;
+    /* Read 1 s before we scored it, inside a 2 s round trip: honest. The
+     * instant check grades the same answer as drift. */
+    ck_assert_score(verify_time_attest_window(1001.0, 1000.0, 1002.0, tol), 0.9);
+    ck_assert_score(verify_time_attest(1001.0, 1002.0, tol), 0.5);
+    /* The tolerance still applies at both edges. */
+    ck_assert_score(verify_time_attest_window(999.9, 1000.0, 1002.0, tol), 0.9);
+    ck_assert_score(verify_time_attest_window(1002.1, 1000.0, 1002.0, tol), 0.9);
+    ck_assert_score(verify_time_attest_window(999.7, 1000.0, 1002.0, tol), 0.5);
+    ck_assert_score(verify_time_attest_window(1002.3, 1000.0, 1002.0, tol), 0.5);
+    /* Unparseable stays a defection. */
+    ck_assert_score(verify_time_attest_window(NAN, 1000.0, 1002.0, tol), 0.1);
+    /* An unknown or impossible send time falls back to the instant check. */
+    ck_assert_score(verify_time_attest_window(1001.0, 0.0, 1002.0, tol), 0.5);
+    ck_assert_score(verify_time_attest_window(1001.0, NAN, 1002.0, tol), 0.5);
+    ck_assert_score(verify_time_attest_window(1001.0, 1003.0, 1002.0, tol), 0.5);
+    ck_assert_score(verify_time_attest_window(1002.05, 1003.0, 1002.0, tol), 0.9);
+
+    /* Through the dispatcher: the challenge carries the send time. */
+    probe_challenge_t ch = { .nonce = 0, .payload = NULL, .sent_at = 1000.0 };
+    double score = 0.0;
+    ck_assert(verify_bootstrap_result("at.time-attest", 1001.0, NULL, &ch,
+                                      1002.0, &score));
+    ck_assert_score(score, 0.9);
+    ch.sent_at = 0.0;
+    ck_assert(verify_bootstrap_result("at.time-attest", 1001.0, NULL, &ch,
+                                      1002.0, &score));
+    ck_assert_score(score, 0.5);
+}
+END_TEST_DEFINITION()
+
 DEFINE_TEST(test_echo_roundtrip_and_verify)
 {
     char *echoed = at_echo_challenge("echo:deadbeef");
@@ -355,6 +392,7 @@ RUN_TESTS(BootstrapCapabilities,
           test_handshake_increment,
           test_verify_handshake_scores,
           test_verify_time_attest_bands,
+          test_verify_time_attest_window,
           test_echo_roundtrip_and_verify,
           test_registration_metadata,
           test_is_probe_capability,

@@ -205,7 +205,9 @@ int signal_to_proto(const signal_t *msg, void **data_ptr, size_t *data_len_ptr)
     char data_str[1024];
     sprintf(data_str, "%d-%s", msg->sig, msg->descr);
     *data_len_ptr = strlen(data_str) + 1;
-    *data_ptr = smrt_create(*data_len_ptr);
+    *data_ptr = malloc(*data_len_ptr);
+    if (*data_ptr == NULL)
+        return EXCEPTION(ENOMEM);
     strcpy(*data_ptr, data_str);
     return 0;
 }
@@ -326,7 +328,7 @@ int net_msg_to_proto(const net_msg_t *msg, void **data_ptr, size_t *data_len_ptr
         return -1;
 
     size_t slen = strlen(str);
-    *data_ptr = smrt_create(slen + 1);
+    *data_ptr = malloc(slen + 1);
     if (*data_ptr == NULL)
     {
         free(str);
@@ -347,19 +349,20 @@ int wrap_in_any(message_type_t type, void *data_in, size_t data_in_len, void **d
     pb_msg.value.len = data_in_len;
 
     *data_len_ptr = google__protobuf__any__get_packed_size(&pb_msg);
-    *data_ptr = smrt_create(*data_len_ptr);
+    *data_ptr = malloc(*data_len_ptr > 0 ? *data_len_ptr : 1);
     if (*data_ptr == NULL)
     {
-        smrt_deref(data_in);
+        free(data_in);
         return EXCEPTION(ENOMEM);
     }
     size_t packed = google__protobuf__any__pack(&pb_msg, *data_ptr);
+    free(data_in);
     if (packed == 0)
     {
-        smrt_deref(*data_ptr);
+        free(*data_ptr);
+        *data_ptr = NULL;
         return EXCEPTION(EINVAL);
     }
-    smrt_deref(data_in);
     return 0;
 }
 
@@ -411,7 +414,7 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
     case TASK_STATUS:
     {
         subdata_len = sizeof(task_status_msg_t);
-        subdata = smrt_create(subdata_len);
+        subdata = malloc(subdata_len);
         if (subdata == NULL) return EXCEPTION(ENOMEM);
         memcpy(subdata, &msg->info.task_status, subdata_len);
         break;
@@ -426,7 +429,7 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
         const task_result_msg_t *tr = &msg->info.task_result;
         size_t blob = (tr->result_data != NULL) ? tr->result_len : 0;
         subdata_len = sizeof(task_result_msg_t) + blob;
-        subdata = smrt_create(subdata_len);
+        subdata = malloc(subdata_len);
         if (subdata == NULL) return EXCEPTION(ENOMEM);
         task_result_msg_t head = *tr;
         head.result_data = NULL;
@@ -439,7 +442,7 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
     case TRANSACTION_SCORE:
     {
         subdata_len = sizeof(tx_score_msg_t);
-        subdata = smrt_create(subdata_len);
+        subdata = malloc(subdata_len);
         if (subdata == NULL) return EXCEPTION(ENOMEM);
         memcpy(subdata, &msg->info.tx_score, subdata_len);
         break;
@@ -448,7 +451,7 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
     case PEER_RTT_OBSERVED:
     {
         subdata_len = sizeof(peer_rtt_update_msg_t);
-        subdata = smrt_create(subdata_len);
+        subdata = malloc(subdata_len);
         if (subdata == NULL) return EXCEPTION(ENOMEM);
         memcpy(subdata, &msg->info.peer_rtt_update, subdata_len);
         break;
@@ -456,7 +459,7 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
     case PEER_OBSERVED:
     {
         subdata_len = sizeof(peer_observed_msg_t);
-        subdata = smrt_create(subdata_len);
+        subdata = malloc(subdata_len);
         if (subdata == NULL) return EXCEPTION(ENOMEM);
         memcpy(subdata, &msg->info.peer_observed, subdata_len);
         break;
@@ -464,7 +467,7 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
     case PEER_REPUTATION:
     {
         subdata_len = sizeof(peer_reputation_msg_t);
-        subdata = smrt_create(subdata_len);
+        subdata = malloc(subdata_len);
         if (subdata == NULL) return EXCEPTION(ENOMEM);
         memcpy(subdata, &msg->info.peer_reputation, subdata_len);
         break;
@@ -472,7 +475,7 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
     case PEER_STANDING:
     {
         subdata_len = sizeof(peer_standing_msg_t);
-        subdata = smrt_create(subdata_len);
+        subdata = malloc(subdata_len);
         if (subdata == NULL) return EXCEPTION(ENOMEM);
         memcpy(subdata, &msg->info.peer_standing, subdata_len);
         break;
@@ -480,7 +483,7 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
     case PEER_REMOVED:
     {
         subdata_len = sizeof(peer_removed_msg_t);
-        subdata = smrt_create(subdata_len);
+        subdata = malloc(subdata_len);
         if (subdata == NULL) return EXCEPTION(ENOMEM);
         memcpy(subdata, &msg->info.peer_removed, subdata_len);
         break;
@@ -502,7 +505,7 @@ int generic_msg_to_proto(generic_msg_t *msg, void **data, size_t *data_len)
             break;
         }
         subdata_len = vt->size;
-        subdata = smrt_create(subdata_len);
+        subdata = malloc(subdata_len);
         if (subdata == NULL) return EXCEPTION(ENOMEM);
         memcpy(subdata, msg->info.payload, subdata_len);
         break;

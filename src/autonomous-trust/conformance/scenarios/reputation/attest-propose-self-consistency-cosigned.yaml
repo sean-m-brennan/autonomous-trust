@@ -1,0 +1,40 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-propose-self-consistency-cosigned
+byte_pinning: false
+description: |
+    A member co-signs an attestation on the `self_consistency` channel.
+
+    carol signed a claim about her own work (Stele: a "clean" CI verdict on a
+    release), and alice's independent evidence contradicts it. A contradiction
+    of the subject's own signed claim is the verifier's finding, so
+    `self_consistency` is attestable.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+fixtures:
+  reputations:
+    bob:
+      alice: 0.7
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest propose
+    payload:
+      subject: carol
+      score: 0.1
+      channel: self_consistency
+    description: alice attests that carol's signed claim is contradicted.
+
+expected_state:
+  bob:
+    attest_signs_sent: 1

@@ -75,7 +75,8 @@ int task_to_proto(task_t *msg, size_t size, void **data_ptr, size_t *data_len_pt
     proto.kwargs_json = msg->kwargs_json;
 
     *data_len_ptr = autonomous_trust__core__protobuf__negotiation__task__get_packed_size(&proto);
-    *data_ptr = smrt_create(*data_len_ptr);
+    /* a plain buffer the caller free()s; smrt_create is for headered structs */
+    *data_ptr = malloc(*data_len_ptr > 0 ? *data_len_ptr : 1);
     if (*data_ptr == NULL)
         return EXCEPTION(ENOMEM);
     autonomous_trust__core__protobuf__negotiation__task__pack(&proto, *data_ptr);

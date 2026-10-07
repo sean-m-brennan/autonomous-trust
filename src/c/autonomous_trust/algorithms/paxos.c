@@ -156,13 +156,22 @@ int paxos_record_grant(paxos_instance_t *inst,
     }
     else
     {
-        ptc = smrt_create(sizeof(paxos_proposal_t));
+        /* a plain struct (no smrt header) the map's data_t owns, so
+         * map_free and a displacing map_set release it with the wrapper */
+        ptc = calloc(1, sizeof(paxos_proposal_t));
         if (ptc != NULL)
         {
             ptc->score = score;
             ptc->grant_count = 1;
-            data_t *new_dat = object_ptr_data(ptc, sizeof(paxos_proposal_t));
-            map_set(&inst->proposals, key, new_dat);
+            data_t *new_dat = owned_object_data(ptc, sizeof(paxos_proposal_t));
+            if (new_dat == NULL || map_set(&inst->proposals, key, new_dat) != 0)
+            {
+                if (new_dat != NULL)
+                    smrt_deref(new_dat);   /* frees ptc too */
+                else
+                    free(ptc);
+                ptc = NULL;
+            }
         }
     }
 

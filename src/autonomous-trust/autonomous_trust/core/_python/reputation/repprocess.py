@@ -44,14 +44,16 @@ from .reputation import (TransactionHistory, ReconcileResult, Reputation, Reputa
                          AttestedScore, SignedAttestation,
                          Checkpoint, SignedCheckpoint, validate_tx_score,
                          validate_tx_channel, commit_designation,
-                         window_root_of,
+                         window_root_of, _hex_str,
                          PeerReputation, EVIDENCE_FILE, SLASH_MARKS_FILE,
                          evidence_to_dict,
                          evidence_from_dict, evidence_attest_certs,
+                         attested_record, ATTESTED_DIR,
                          RESOLVE_TTL_DEFAULT,
                          resolve_query_to_dict, resolve_query_from_dict,
                          resolved_to_dict, resolved_from_dict, verify_resolved,
                          consensus_score_from_window, tx_channel_weight,
+                         TX_CHANNEL_REPLICATION,
                          # The one shared rounding rule for a composed EMA
                          # weight (R+D.md §12.5), `floor(x + 0.5)` as the C
                          # twin's at_tx_weight_round.
@@ -174,6 +176,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # restart can attest: entries committed after the last checkpoint are
     # persisted but unattested, so they restore clamped.
     CHECKPOINT_INTERVAL = _env_float('AT_REP_CHECKPOINT_SEC', 300.0)
+    #: After an attested entry commits, a checkpoint is due within this many
+    #: seconds, so the entry is under a quorum-signed window (and archived,
+    #: _archive_attested) before a busy chain evicts it. Mirrors C
+    #: REP_ATTEST_CHECKPOINT_SEC.
+    ATTEST_CHECKPOINT_SEC = _env_float('AT_REP_ATTEST_CHECKPOINT_SEC', 10.0)
     # Seconds between rescore sweeps (_rescore_sweep). Mirrors C
     # REP_RESCORE_INTERVAL. Override: AT_REP_RESCORE_SEC.
     RESCORE_INTERVAL = _env_float('AT_REP_RESCORE_SEC', 60.0)
@@ -263,12 +270,19 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # the mechanism being a policy rather than a fact.
     SLASH_ENABLED = bool(os.environ.get('AT_SLASH_ENABLED'))
 
-    # Verifier-attested scores (doc/architecture/reputation.md): the standing a
-    # verifier must have in a co-signer's OWN view before that co-signer
-    # vouches the attestation is admissible. 0.5 is the tier-1 floor: a
-    # verifier this node does not yet trust cannot place a score its subject
-    # cannot veto. Mirrors AT_ATTEST_MIN_REP in rep_proc.c.
-    ATTEST_MIN_REP = _env_float('AT_ATTEST_MIN_REP', 0.5)
+    # Verifier-attested scores (doc/architecture/reputation.md): the EFFECTIVE
+    # tier a verifier must hold in a co-signer's OWN view (score bounded by any
+    # standing ceiling; tier 0 once excluded) before that co-signer vouches the
+    # attestation is admissible. Tier 1 for probe/certificate/self_consistency:
+    # a verifier this node does not yet trust cannot place a score its subject
+    # cannot veto. Tier 3 for replication, so a sybil the subject spins up
+    # cannot be the second voice that confirms a finding. AT_ATTEST_MIN_REP, the
+    # older raw-score knob, still sets the non-replication floor when given
+    # (cohorts lower it on purpose). Mirrors _attest_admissible in rep_proc.c.
+    ATTEST_MIN_TIER = int(_env_float('AT_ATTEST_MIN_TIER', 1))
+    ATTEST_REPLICATION_TIER = int(_env_float('AT_ATTEST_REPLICATION_TIER', 3))
+    ATTEST_MIN_REP = (_env_float('AT_ATTEST_MIN_REP', 0.5)
+                      if os.environ.get('AT_ATTEST_MIN_REP') else None)
     # How long a verifier's attestation round may stay short of a quorum
     # before its propose goes out again, and how many times (ISSUES §2.40):
     # the propose is a one-shot fan-out, and a lost copy left the round pending
@@ -823,11 +837,58 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     def _paxos_id_index(id1, id2):
         return (id1, id2)  # use tuple key to avoid float equality issues
 
+    FORK_PROBE_SEC = 10.0
+
+    def _our_head(self) -> str:
+        """Our committed head hash, '' for an empty chain (fork probe)."""
+        window = self.history._indexed_window()
+        return _hex_str(window[-1].entry_hash()) if window else ''
+
+    def _fork_probe_due(self, peer_uuid) -> bool:
+        """At most one chain exchange per peer per FORK_PROBE_SEC: a fork
+        probe moves two whole windows. Mirrors C _fork_probe_due."""
+        probes = self.__dict__.setdefault('_fork_probes', {})
+        key, t = str(peer_uuid), time.monotonic()
+        if t - probes.get(key, -1e9) < self.FORK_PROBE_SEC:
+            return False
+        probes[key] = t
+        return True
+
     def handle_request(self, queues, message):
         if message.function == ReputationProtocol.request:
-            id1, id2, peer_id = from_json_string(message.obj)
+            parts = from_json_string(message.obj)
+            id1, id2, peer_id = parts[0], parts[1], parts[2]
+            # The head the proposer extends (ISSUES §2.51), when it says.
+            head = parts[3] if len(parts) > 3 else None
+            echo = to_json_string((id1, id2, peer_id))
             if peer_id in [p.uuid for p in self.peers.all]:
                 try:
+                    # Fork probe: Paxos compares chain LENGTHS only, so nodes
+                    # forked at equal length grant each other forever and never
+                    # reconcile. Same length, different head: do not grant
+                    # (the round would extend the fork); backdate, so the
+                    # proposer pulls our chain, and ask for its chain, so both
+                    # run the same symmetric reconcile. Before the ballot
+                    # check, so last_id does not move. Mirrors C.
+                    ours = self._our_head()
+                    if (head and ours and len(self.history) + 1 == id2
+                            and str(head) != ours):
+                        self.logger.info(
+                            '%s proposes on another chain at our length %d '
+                            '(head %s, ours %s); exchanging chains',
+                            getattr(message.from_whom, 'nickname', '?'),
+                            len(self.history), str(head)[:12], ours[:12])
+                        queues[CfgIds.network].put(
+                            Message(self.name, ReputationProtocol.backdate, echo,
+                                    message.from_whom, from_whom=self.identity),
+                            block=True, timeout=self.q_cadence)
+                        if self._fork_probe_due(peer_id):
+                            queues[CfgIds.network].put(
+                                Message(self.name, ReputationProtocol.outdated,
+                                        str(len(self.history)), message.from_whom,
+                                        from_whom=self.identity),
+                                block=True, timeout=self.q_cadence)
+                        return True
                     if self.last_id is None or self.last_id < id1:
                         if len(self.history) + 1 == id2:
                             self.requests.append(self._paxos_id_index(id1, id2))
@@ -852,13 +913,13 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                             self.last_id = id1
                         else:
                             msg = Message(self.name, ReputationProtocol.backdate,
-                                          message.obj, message.from_whom,
+                                          echo, message.from_whom,
                                           from_whom=self.identity)
                             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                             self.logger.debug('Request backdated')
                     else:
                         msg = Message(self.name, ReputationProtocol.nack,
-                                      message.obj, message.from_whom,
+                                      echo, message.from_whom,
                                       from_whom=self.identity)
                         queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                         self.logger.debug('Request refused')
@@ -940,7 +1001,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         round's backoff. A round not ours, or already carried to quorum, is
         dropped. Shared by handle_nack and handle_backdate; mirrors C's
         _arm_round_retry."""
-        id1, id2, _ = from_json_string(obj)
+        parts = from_json_string(obj)
+        id1, id2 = parts[0], parts[1]
         idx = self._paxos_id_index(id1, id2)
         if idx not in self.my_requests:
             # Already completed (grant succeeded, removed from my_requests)
@@ -1100,9 +1162,13 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         if group_uuid is None and self.group is not None:
             group_uuid = str(self.group.uuid)
         self.round_group[idx] = group_uuid
+        # The head this round extends, so an acceptor on an equal-length fork
+        # can see it (handle_request, ISSUES §2.51). Omitted for an empty
+        # chain, and a 3-element ask is still read everywhere.
+        head = self._our_head()
         pax_msg = Message(self.name, ReputationProtocol.request,
-                          to_json_string(pax_id), self.group,
-                          from_whom=self.identity)
+                          to_json_string(tuple(pax_id) + ((head,) if head else ())),
+                          self.group, from_whom=self.identity)
         queues[CfgIds.network].put(pax_msg, block=True, timeout=self.q_cadence)
         self.proposals[idx] = score
         # Cache the weight for this task so _pure_reputation can later
@@ -2082,12 +2148,24 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         return len(voters) > others // 2
 
     @staticmethod
-    def _attest_resident(chain, verifier, subject) -> bool:
-        """Does `chain` already hold an attested entry by `verifier` about
-        `subject`? The rate cap: one per pair in the resident window, counted
-        from the chain itself so every node reaches the same answer."""
-        return any(tx.attested and str(tx.p1_id) == str(verifier)
-                   and str(tx.subject_id) == str(subject) for tx in chain)
+    def _attest_resident(chain, att) -> bool:
+        """Does `chain` already hold what this attestation would repeat? The
+        rate cap, counted from the chain itself so every node reaches the same
+        answer. Unscoped: one per (verifier, subject) pair in the resident
+        window. Scoped: one per (verifier, subject, channel, scope), so an
+        application can attest again about something new -- a fresh scan of a
+        fixed commit -- while a repeat about the same thing is still refused.
+        Mirrors _attest_resident_locked."""
+        for tx in chain:
+            if not (tx.attested and str(tx.p1_id) == str(att.verifier_uuid)
+                    and str(tx.subject_id) == str(att.subject_uuid)):
+                continue
+            if not att.attest_scope:
+                return True
+            if (str(tx.p1_channel) == str(att.channel)
+                    and getattr(tx, 'attest_scope', None) == att.attest_scope):
+                return True
+        return False
 
     def _attest_admissible(self, att):
         """``(True, '')`` when this node will vouch the attestation is
@@ -2101,6 +2179,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             return False, 'subject not a member'
         if str(att.verifier_uuid) in self._slashed:
             return False, 'verifier slashed'
+        if str(att.verifier_uuid) in self._excluded:
+            return False, 'verifier excluded'
         rep = self.PREREP_NEUTRAL
         for k in (att.verifier_uuid, str(att.verifier_uuid)):
             try:
@@ -2109,15 +2189,27 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     break
             except (TypeError, ValueError):
                 continue
-        if rep < self.ATTEST_MIN_REP:
-            return False, 'verifier standing %.2f below %.2f' % (
-                rep, self.ATTEST_MIN_REP)
+        ceiling = self._standing_ceiling(att.verifier_uuid)
+        if ceiling is not None and rep > ceiling:
+            rep = ceiling
+        tier = self._trust_tier(rep)
+        replication = str(att.channel) == TX_CHANNEL_REPLICATION
+        min_tier = (self.ATTEST_REPLICATION_TIER if replication
+                    else self.ATTEST_MIN_TIER)
+        min_rep = 0.0
+        if not replication and self.ATTEST_MIN_REP is not None:
+            min_tier, min_rep = 0, self.ATTEST_MIN_REP
+        if tier < min_tier or rep < min_rep:
+            return False, 'verifier tier %d (standing %.2f) below %d for %s' % (
+                tier, rep, min_tier, att.channel)
         chain = self._chain_for_group(att.group_uuid or None)
         task = att.task_id
         if task in chain._task_mapping or task in chain._evicted_task_ids:
             return False, 'already held'
-        if self._attest_resident(chain, att.verifier_uuid, att.subject_uuid):
-            return False, 'rate cap: this verifier already attested this subject'
+        if self._attest_resident(chain, att):
+            return False, ('rate cap: this verifier already attested this '
+                           'subject in this scope' if att.attest_scope else
+                           'rate cap: this verifier already attested this subject')
         return True, ''
 
     def _commit_attestation(self, att, sigs) -> bool:
@@ -2128,6 +2220,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             return False
         self._fold_committed_tx(tx.task_id, chain)
         self._note_interaction(tx.subject_id)
+        # Due for a checkpoint soon, so the entry is archived before a busy
+        # chain can evict it (doc/architecture/reputation.md).
+        soon = now().timestamp() + self.ATTEST_CHECKPOINT_SEC
+        if self._next_checkpoint_at > soon:
+            self._next_checkpoint_at = soon
         self.logger.info(
             'Attested score committed: verifier=%s subject=%s score=%.2f '
             'channel=%s signers=%d', str(att.verifier_uuid)[:8],
@@ -2159,7 +2256,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 str(att.subject_uuid)[:8])
             return True
         chain = self._chain_for_group(att.group_uuid or None)
-        if self._attest_resident(chain, att.verifier_uuid, att.subject_uuid):
+        if self._attest_resident(chain, att):
             self.logger.warning(
                 'Attestation NOT proposed: %s already attested in the window',
                 str(att.subject_uuid)[:8])
@@ -2374,13 +2471,16 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         Odd sizes are unchanged; Paxos grants and slashing keep
         len(peers) // 2, which C now sizes the same way, live, per round.
         Mirrors C _ckpt_quorum_for_group."""
+        return (self._checkpoint_roster(group_uuid) + 1) // 2
+
+    def _checkpoint_roster(self, group_uuid=None) -> int:
+        """The roster a checkpoint's quorum is sized from, this node NOT
+        included: the peers, or a gateway's members of that child group."""
         if not self.child_groups:
-            roster = len(self.peers.all)
-        else:
-            grp = self._group_by_uuid(group_uuid)
-            roster = (len(self.peers.all) if grp is None
-                      else len(self._members_of_group(grp)))
-        return (roster + 1) // 2
+            return len(self.peers.all)
+        grp = self._group_by_uuid(group_uuid)
+        return (len(self.peers.all) if grp is None
+                else len(self._members_of_group(grp)))
 
     def _checkpoint_quorum_met(self, designation, sigs, group_uuid=None) -> bool:
         """``_quorum_met`` with the checkpoint threshold."""
@@ -2488,6 +2588,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             if sigs and len(sigs) > len(held):
                 self._checkpoint_sigs_final[chain_key] = dict(sigs)
                 self._persist_history(chain_key)
+                self._persist_roster(chain_key)
+                self._archive_attested(chain_key)
             self._note_final(ckpt, sigs, chain_key)
             return
         self._checkpoints[chain_key] = ckpt
@@ -2497,6 +2599,139 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             self._checkpoint_seen.popitem(last=False)
         self._note_final(ckpt, sigs, chain_key)
         self._persist_history(chain_key)
+        self._persist_roster(chain_key)
+        self._archive_attested(chain_key)
+
+    ROSTER_FILE = 'roster.cfg.json'
+    ROSTER_CKPTS = 256
+
+    def _persist_roster(self, chain_key: str = ''):
+        """Write the roster a reader of etc/at/attested/ verifies against:
+        every member this node has held (uuid -> signing key, first and last
+        seen, the effective tier last published, whether it is a member now)
+        and the final checkpoints it stored, newest last. A record carries its
+        signers' keys itself, which is what a forger would write too; a
+        verifier that takes keys from here checks the record against THIS
+        node's view of its group. A member who leaves is kept, marked, so a
+        record it signed while a member still verifies. Atomic; failure logged
+        and swallowed. Mirrors C _persist_roster."""
+        path = os.path.join(Configuration.get_cfg_dir(), self.ROSTER_FILE)
+        try:
+            try:
+                with open(path) as f:
+                    doc = json.load(f)
+                if not isinstance(doc, dict):
+                    doc = {}
+            except (OSError, ValueError):
+                doc = {}
+            members = doc.get('members')
+            if not isinstance(members, dict):
+                members = {}
+            ckpts = doc.get('checkpoints')
+            if not isinstance(ckpts, list):
+                ckpts = []
+            stamp = int(time.time())
+            for m in members.values():
+                if isinstance(m, dict):
+                    m['member'] = False
+            current = [self.identity] + list(self.peers.all)
+            for ident in current:
+                uid = str(ident.uuid)
+                key = ident.signature.public.encode(
+                    encoder=HexEncoder).decode('ascii')
+                m = members.get(uid)
+                if not isinstance(m, dict) or m.get('pubkey', key) != key:
+                    # New, or a uuid whose key changed: a new identity.
+                    m = {'first_seen': stamp}
+                    members[uid] = m
+                m.update(pubkey=key, last_seen=stamp, member=True)
+                tier = self.peer_tiers.get(uid)
+                if tier is None:
+                    m.pop('tier', None)
+                else:
+                    m['tier'] = int(tier)
+            ckpt = self._checkpoints.get(chain_key)
+            if ckpt is not None:
+                gk = chain_key or ''
+                row = {'group_uuid': gk, 'epoch': int(ckpt.epoch),
+                       'root': _hex_str(ckpt.root),
+                       'first_index': int(ckpt.first_index),
+                       'count': int(ckpt.count)}
+                for i, c in enumerate(ckpts):
+                    if (isinstance(c, dict) and c.get('epoch') == row['epoch']
+                            and c.get('group_uuid') == gk):
+                        ckpts[i] = row
+                        break
+                else:
+                    ckpts.append(row)
+                del ckpts[:-self.ROSTER_CKPTS]
+            doc.update(schema='1', self=str(self.identity.uuid),
+                       group_uuid=str(self.group.uuid) if self.group else '',
+                       members=members, checkpoints=ckpts)
+            with atomic_write(path) as f:
+                json.dump(doc, f, indent=2)
+        except (OSError, IOError, ValueError, TypeError, AttributeError) as e:
+            self.logger.warning('Could not write %s: %s', self.ROSTER_FILE, e)
+
+    def _archive_path(self, task_id) -> str:
+        return os.path.join(Configuration.get_cfg_dir(), ATTESTED_DIR,
+                            '%s.json' % str(task_id))
+
+    def _archive_attested(self, chain_key: str = ''):
+        """Write a durable record (reputation.attested_record) for every
+        attested entry the chain's quorum-signed checkpoint now covers and
+        that has none yet. Once per entry, never rewritten: the record is the
+        lasting form of a finding the 200-entry window and the evidence file
+        both lose. Only under a checkpoint whose signatures meet the quorum in
+        OUR view, and with the keys WE hold, so a record says what this node
+        could verify. Failure is logged and swallowed, as for the evidence.
+        Mirrors C _archive_attested."""
+        try:
+            ckpt = self._checkpoints.get(chain_key)
+            if ckpt is None or not ckpt.count:
+                return
+            group = getattr(ckpt, 'group_uuid', '') or None
+            sigs = dict(self._checkpoint_sigs_final.get(chain_key, {}))
+            if not self._checkpoint_quorum_met(ckpt.designation, sigs, group):
+                return
+            hist = self._chain_for_key(chain_key)
+            # Only while our window reproduces the signed root: on a fork the
+            # quorum did not sign, a write-once record would carry a proof that
+            # never verifies. The next checkpoint after convergence archives.
+            mine = hist.range_root(ckpt.first_index, ckpt.count)
+            if mine is None or _hex_str(mine) != _hex_str(ckpt.root):
+                return
+            certs = getattr(hist, 'attest_certs', None) or {}
+            todo = [tx for tx in hist._indexed_window() if tx.attested
+                    and ckpt.first_index <= tx.index
+                    < ckpt.first_index + ckpt.count
+                    and not os.path.exists(self._archive_path(tx.task_id))]
+            if not todo:
+                return
+            os.makedirs(os.path.join(Configuration.get_cfg_dir(), ATTESTED_DIR),
+                        exist_ok=True)
+            doc = evidence_to_dict(hist, SignedCheckpoint(checkpoint=ckpt,
+                                                          sigs=sigs), certs)
+            ckpt_group_size = self._checkpoint_roster(group) + 1
+            for tx in todo:
+                voters = set(map(str, certs.get(tx.task_id, {}))) | set(sigs)
+                signers = {}
+                for voter in voters:
+                    ident = self._cosigner_identity(voter)
+                    if ident is not None:
+                        signers[voter] = ident.signature.public.encode(
+                            encoder=HexEncoder).decode('ascii')
+                rec = attested_record(doc, tx.task_id, signers,
+                                      len(self.peers.all) + 1, ckpt_group_size,
+                                      self._is_member(tx.subject_id))
+                if rec is None:
+                    continue
+                with atomic_write(self._archive_path(tx.task_id)) as f:
+                    json.dump(rec, f, indent=2)
+                self.logger.info('Archived attested entry %s (subject %s)',
+                                 str(tx.task_id)[:8], str(tx.subject_id)[:8])
+        except (OSError, IOError, ValueError, TypeError, KeyError) as e:
+            self.logger.warning('Could not archive attested entries: %s', e)
 
     def _note_final(self, ckpt, sigs, chain_key):
         """Record a primary checkpoint as FINAL once a quorum attests it.
@@ -3238,8 +3473,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 length = message.obj
                 if isinstance(length, bytes):
                     length = length.decode(encoding)
-                index = int(length)
-                chain = to_json_string(self.history.era(index))
+                int(length)
+                # The whole resident window, as C sends, whatever length the
+                # requester reports: an equal-length requester on a fork got
+                # an empty slice and never reconciled (ISSUES §2.51).
+                chain = to_json_string(self.history.era(0))
                 msg = Message(self.name, ReputationProtocol.update, chain,
                               message.from_whom, from_whom=self.identity)
                 queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
@@ -3328,12 +3566,33 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             return True
         return False
 
+    def _attest_already_held(self, tx) -> bool:
+        """Do we already hold, certified, the very attested entry ``tx`` is?
+        Then catch-up has nothing to re-judge: we accepted it under the quorum
+        in force when it committed, and if its certificate now looks short the
+        group has only grown since (ISSUES §2.48). Primary chain only.
+        Mirrors C _attest_already_held."""
+        held = self.history._task_mapping.get(tx.task_id)
+        certs = getattr(self.history, 'attest_certs', None) or {}
+        if held is None or not getattr(held, 'attested', False) \
+                or tx.task_id not in certs:
+            return False
+        return (str(held.p1_id) == str(tx.p1_id)
+                and str(held.subject_id) == str(tx.subject_id)
+                and str(held.p1_channel) == str(tx.p1_channel)
+                and str(held.evidence_digest) == str(tx.evidence_digest)
+                and (getattr(held, 'attest_scope', None) or '')
+                == (getattr(tx, 'attest_scope', None) or '')
+                and float(held.p1_score) == float(tx.p1_score))
+
     def _chain_certified(self, chain, message) -> bool:
         """Catch-up refuses a segment carrying an attested entry whose
         certificate does not meet our quorum (doc/architecture/reputation.md):
-        otherwise catch-up would be a way around the round."""
+        otherwise catch-up would be a way around the round. An entry we already
+        hold certified is not re-judged against today's roster."""
         for tx in chain:
-            if getattr(tx, 'attested', False) and not self._attest_certified(tx):
+            if getattr(tx, 'attested', False) and not self._attest_already_held(tx) \
+                    and not self._attest_certified(tx):
                 self.logger.warning(
                     'Rejecting chain from %s: an attested entry (task %s) '
                     'carries no certificate meeting our quorum',

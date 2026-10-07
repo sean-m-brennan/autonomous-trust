@@ -31,7 +31,7 @@ DEFINE_TEST(test_map_init_stack)
     ck_assert_uint_eq(map_size(&map), 0);
 
     /* Insert and retrieve */
-    char *k = smrt_create(8);
+    char k[8];   /* map_set copies the key */
     strcpy(k, "key1");
     data_t *v = integer_data(42);
     ck_assert_ret_ok(map_set(&map, k, v));
@@ -53,7 +53,7 @@ DEFINE_TEST(test_map_capacity_growth)
     ck_assert_ret_ok(map_create(&map));
 
     for (int i = 0; i < 50; i++) {
-        char *k = smrt_create(16);
+        char k[16];   /* map_set copies the key */
         snprintf(k, 16, "key_%03d", i);
         data_t *v = integer_data(i * 10);
         ck_assert_ret_ok(map_set(map, k, v));
@@ -80,15 +80,15 @@ DEFINE_TEST(test_map_entries_for_each_macro)
     map_t *map = NULL;
     ck_assert_ret_ok(map_create(&map));
 
-    char *k1 = smrt_create(8);
+    char k1[8];   /* map_set copies the key */
     strcpy(k1, "alpha");
     ck_assert_ret_ok(map_set(map, k1, integer_data(1)));
 
-    char *k2 = smrt_create(8);
+    char k2[8];   /* map_set copies the key */
     strcpy(k2, "beta");
     ck_assert_ret_ok(map_set(map, k2, integer_data(2)));
 
-    char *k3 = smrt_create(8);
+    char k3[8];   /* map_set copies the key */
     strcpy(k3, "gamma");
     ck_assert_ret_ok(map_set(map, k3, integer_data(3)));
 
@@ -130,7 +130,7 @@ DEFINE_TEST(test_map_remove_and_reinsert)
     map_t *map = NULL;
     ck_assert_ret_ok(map_create(&map));
 
-    char *k = smrt_create(8);
+    char k[8];   /* map_set copies the key */
     strcpy(k, "rmkey");
     ck_assert_ret_ok(map_set(map, k, integer_data(99)));
     ck_assert_uint_eq(map_size(map), 1);
@@ -140,7 +140,7 @@ DEFINE_TEST(test_map_remove_and_reinsert)
     ck_assert_uint_eq(map_size(map), 0);
 
     /* Re-insert with different value */
-    char *k2 = smrt_create(8);
+    char k2[8];   /* map_set copies the key */
     strcpy(k2, "rmkey");
     ck_assert_ret_ok(map_set(map, k2, integer_data(77)));
     ck_assert_uint_eq(map_size(map), 1);

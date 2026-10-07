@@ -952,16 +952,25 @@ static size_t _quorum_for_group(const process_t *proc, const char *group_uuid)
  * sizes are unchanged. Deliberately NOT applied to Paxos grants or slashing,
  * which keep Python's len(peers) // 2 (_round_quorum_locked). Mirrors
  * Python's _checkpoint_quorum. */
+/* The roster a checkpoint's quorum is sized from, this node NOT included: the
+ * peers, or a gateway's members of that child group. Caller holds the peers
+ * read lock. Mirrors Python _checkpoint_roster. */
+static size_t _ckpt_roster_for_group(const process_t *proc, const char *group_uuid)
+{
+    if (proc == NULL)
+        return 0;
+    return (proc->protocol.child_groups == NULL
+            || map_size(proc->protocol.child_groups) == 0
+            || group_uuid == NULL || group_uuid[0] == '\0')
+        ? proc->protocol.num_peers
+        : _members_of_group(proc, group_uuid);
+}
+
 static size_t _ckpt_quorum_for_group(const process_t *proc, const char *group_uuid)
 {
     if (proc == NULL)
         return 0;
-    size_t roster = (proc->protocol.child_groups == NULL
-                     || map_size(proc->protocol.child_groups) == 0
-                     || group_uuid == NULL || group_uuid[0] == '\0')
-        ? proc->protocol.num_peers
-        : _members_of_group(proc, group_uuid);
-    return (roster + 1) / 2;
+    return (_ckpt_roster_for_group(proc, group_uuid) + 1) / 2;
 }
 
 /* The Paxos threshold for the round filed under `paxos_key`, sized NOW against
@@ -1925,6 +1934,105 @@ static void _publish_exclusion(const process_t *proc,
  * ballot counter" (harness/python/adapters/reputation.py:130).
  *
  * Caller must NOT hold rep_state.lock. */
+/* Our committed head hash ("" for an empty chain) and length, for the fork
+ * probe a request carries (ISSUES §2.51). */
+static int _our_head(char out[TX_HASH_HEX_LEN + 1])
+{
+    pthread_mutex_lock(&rep_state.lock);
+    int len = tx_history_len(&rep_state.history);
+    if (rep_state.history.committed_count > 0)
+        at_strlcpy(out, rep_state.history.head_hash, TX_HASH_HEX_LEN + 1);
+    else
+        out[0] = '\0';
+    pthread_mutex_unlock(&rep_state.lock);
+    return len;
+}
+
+/* Our committed head hash, for conformance adapters that must name it. */
+int reputation_head_hash(char *out, size_t cap)
+{
+    char head[TX_HASH_HEX_LEN + 1];
+    int len = _our_head(head);
+    if (out != NULL && cap > 0)
+        at_strlcpy(out, head, cap);
+    return len;
+}
+
+/* At most one chain exchange per peer per REP_FORK_PROBE_SEC: a fork probe
+ * moves two whole windows. Caller holds no lock. */
+#define REP_FORK_PROBE_SEC 10
+#define REP_FORK_PROBE_SLOTS 64
+static struct { char peer[UUID_STRING_LEN + 1]; time_t at; }
+    g_fork_probe[REP_FORK_PROBE_SLOTS];
+
+static bool _fork_probe_due(const uuid_t peer)
+{
+    char key[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer, key);
+    time_t now = time(NULL);
+    bool due = true;
+    int slot = -1, oldest = 0;
+    pthread_mutex_lock(&rep_state.lock);
+    for (int i = 0; i < REP_FORK_PROBE_SLOTS; i++)
+    {
+        if (strcmp(g_fork_probe[i].peer, key) == 0)
+        {
+            slot = i;
+            due = now - g_fork_probe[i].at >= REP_FORK_PROBE_SEC;
+            break;
+        }
+        if (g_fork_probe[i].at < g_fork_probe[oldest].at)
+            oldest = i;
+    }
+    if (slot < 0)
+        slot = oldest;
+    if (due)
+    {
+        at_strlcpy(g_fork_probe[slot].peer, key, sizeof(g_fork_probe[slot].peer));
+        g_fork_probe[slot].at = now;
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    return due;
+}
+
+/* "out of date" to @p to for round (@p id1, @p id2): it pulls our chain and
+ * retries its round (handle_backdate). */
+static void _send_backdate(const process_t *proc, const public_identity_t *to,
+                           int64_t id1, int64_t id2)
+{
+    json_t *bd_json = json_object();
+    if (bd_json == NULL) {
+        log_error(proc->logger, "Reputation: json_object OOM (backdate)\n");
+        return;
+    }
+    json_object_set_new(bd_json, "id1", json_integer(id1));
+    json_object_set_new(bd_json, "id2", json_integer(id2));
+    generic_msg_t backdate = {0};
+    backdate.type = NET_MESSAGE;
+    strncpy(backdate.info.net_msg.process, "reputation", PROC_NAME_LEN);
+    backdate.info.net_msg.function = REP_PROTO_BACKDATE;
+    backdate.info.net_msg.encrypt = true;
+    memcpy(&backdate.info.net_msg.to_whom, to, sizeof(public_identity_t));
+    strncpy(backdate.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+    net_msg_pack_json(&backdate.info.net_msg, bd_json);
+    json_decref(bd_json);
+    _rep_send_to_network(proc, &backdate);
+    net_msg_free_obj(&backdate.info.net_msg);
+}
+
+/* "update needed" to @p to: it answers with its chain (handle_outdated). */
+static void _request_chain(const process_t *proc, const public_identity_t *to)
+{
+    generic_msg_t update_req = {0};
+    update_req.type = NET_MESSAGE;
+    strncpy(update_req.info.net_msg.process, "reputation", PROC_NAME_LEN);
+    update_req.info.net_msg.function = REP_PROTO_OUTDATED;
+    update_req.info.net_msg.encrypt = true;
+    memcpy(&update_req.info.net_msg.to_whom, to, sizeof(public_identity_t));
+    strncpy(update_req.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+    _rep_send_to_network(proc, &update_req);
+}
+
 static void _sync_chain_index(void)
 {
     pthread_mutex_lock(&rep_state.lock);
@@ -1986,6 +2094,34 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
     }
     const char *peer_uuid_str = have_peer_uuid ? peer_uuid_buf : NULL;
 
+    /* Fork probe (ISSUES §2.51). Paxos compares chain LENGTHS only, so two
+     * nodes whose chains forked at equal length grant each other forever,
+     * never exchange chains, and never reconcile. A request that says which
+     * head it extends lets us see the fork: same length, different head. We
+     * do not grant (the round would extend the fork); we backdate, so the
+     * proposer pulls our chain, and we ask for its chain, so both run the same
+     * symmetric reconcile and converge. Before paxos_handle_request, so
+     * last_id does not move. A request without a head (an older peer) is
+     * judged as before. */
+    const char *their_head = json_string_value(json_object_get(payload, "head"));
+    if (their_head != NULL && their_head[0] != '\0')
+    {
+        char ours[TX_HASH_HEX_LEN + 1];
+        int len = _our_head(ours);
+        if (id2 == (int64_t)len + 1 && ours[0] != '\0'
+            && strcmp(ours, their_head) != 0)
+        {
+            json_decref(payload);
+            log_info(proc->logger, "Reputation: %s proposes on another chain at "
+                     "our length %d (head %.12s, ours %.12s); exchanging chains\n",
+                     nmsg->from_whom.nickname, len, their_head, ours);
+            _send_backdate(proc, &nmsg->from_whom, id1, id2);
+            if (_fork_probe_due(nmsg->from_whom.uuid))
+                _request_chain(proc, &nmsg->from_whom);
+            return true;
+        }
+    }
+
     int64_t out_last_id = 0;
     int out_chain_len = 0;
     _sync_chain_index();
@@ -2025,27 +2161,8 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
     else if (result == PAXOS_BACKDATE)
     {
         /* BACKDATE: chain index mismatch */
-        json_t *bd_json = json_object();
-        if (bd_json == NULL) {
-            log_error(proc->logger, "Reputation: json_object OOM (backdate)\n");
-            return true;
-        }
-        json_object_set_new(bd_json, "id1", json_integer(id1));
-        json_object_set_new(bd_json, "id2", json_integer(id2));
-
-        generic_msg_t backdate = {0};
-        backdate.type = NET_MESSAGE;
-        strncpy(backdate.info.net_msg.process, "reputation", PROC_NAME_LEN);
-        backdate.info.net_msg.function = REP_PROTO_BACKDATE;
-        backdate.info.net_msg.encrypt = true;
-        memcpy(&backdate.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
-        strncpy(backdate.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
-        net_msg_pack_json(&backdate.info.net_msg, bd_json);
-        json_decref(bd_json);
-
         log_debug(proc->logger, "Reputation: Request backdated\n");
-        _rep_send_to_network(proc, &backdate);
-        net_msg_free_obj(&backdate.info.net_msg);
+        _send_backdate(proc, &nmsg->from_whom, id1, id2);
     }
     else
     {
@@ -2392,15 +2509,7 @@ static bool handle_backdate(const process_t *proc, directory_t *queues, generic_
     log_info(proc->logger, "Reputation: backdate notification from %s\n", nmsg->from_whom.nickname);
 
     /* Request chain update from this peer */
-    generic_msg_t update_req = {0};
-    update_req.type = NET_MESSAGE;
-    strncpy(update_req.info.net_msg.process, "reputation", PROC_NAME_LEN);
-    update_req.info.net_msg.function = REP_PROTO_OUTDATED;
-    update_req.info.net_msg.encrypt = true;
-    memcpy(&update_req.info.net_msg.to_whom, &nmsg->from_whom, sizeof(public_identity_t));
-    strncpy(update_req.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
-
-    _rep_send_to_network(proc, &update_req);
+    _request_chain(proc, &nmsg->from_whom);
 
     /* ...AND RETRY OUR ROUND, or it is simply lost. A backdate answers a
      * request whose chain index was one commit behind, which with three live
@@ -4168,6 +4277,10 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
     char identity_uuid[UUID_STRING_LEN + 1];
     uuid_unparse_lower(peer_uuid, identity_uuid);
 
+    /* The head this round extends (fork probe, ISSUES §2.51). */
+    char our_head[TX_HASH_HEX_LEN + 1];
+    (void)_our_head(our_head);
+
     /* Broadcast Paxos Phase 1a: request permission from all peers */
     peers_read_lock(proc);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
@@ -4189,6 +4302,10 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
         json_object_set_new(req_json, "id1", json_integer(id1));
         json_object_set_new(req_json, "id2", json_integer(id2));
         json_object_set_new(req_json, "peer_uuid", json_string(identity_uuid));
+        /* The head we extend, so an acceptor on an equal-length fork can see
+         * it (handle_request, ISSUES §2.51). Omitted for an empty chain. */
+        if (our_head[0] != '\0')
+            json_object_set_new(req_json, "head", json_string(our_head));
         net_msg_pack_json(&req.info.net_msg, req_json);
         json_decref(req_json);
 
@@ -4658,6 +4775,7 @@ typedef struct {
     double score;
     char   channel[TX_CHANNEL_NAMELEN + 1];
     char   digest[TX_ATTEST_DIGEST_HEX_LEN + 1];
+    char   scope[TX_ATTEST_DIGEST_HEX_LEN + 1];   /* "" for none */
     char   group[UUID_STRING_LEN + 1];
 } rep_attest_t;
 
@@ -4673,6 +4791,8 @@ static bool _attest_well_formed(rep_attest_t *a)
     if (!(a->score >= 0.0 && a->score <= 1.0))
         return false;
     if (!tx_channel_attestable(a->channel) || !tx_attest_digest_valid(a->digest))
+        return false;
+    if (a->scope[0] != '\0' && !tx_attest_digest_valid(a->scope))
         return false;
     uuid_unparse_lower(v, a->verifier);
     uuid_unparse_lower(s, a->subject);
@@ -4691,9 +4811,12 @@ static bool _attest_from_json(const json_t *j, rep_attest_t *a)
     const char *c = json_string_value(json_object_get((json_t *)j, "channel"));
     const char *d = json_string_value(json_object_get((json_t *)j, "evidence_digest"));
     const char *g = json_string_value(json_object_get((json_t *)j, "group_uuid"));
+    const char *sp = json_string_value(json_object_get((json_t *)j, "attest_scope"));
     json_t *sc = json_object_get((json_t *)j, "score");
     if (v == NULL || s == NULL || c == NULL || d == NULL || !json_is_number(sc))
         return false;
+    if (sp != NULL)
+        at_strlcpy(a->scope, sp, sizeof(a->scope));
     at_strlcpy(a->verifier, v, sizeof(a->verifier));
     at_strlcpy(a->subject, s, sizeof(a->subject));
     at_strlcpy(a->channel, c, sizeof(a->channel));
@@ -4706,10 +4829,14 @@ static bool _attest_from_json(const json_t *j, rep_attest_t *a)
 
 static json_t *_attest_to_json(const rep_attest_t *a)
 {
-    return json_pack("{s:s, s:s, s:f, s:s, s:s, s:s}",
-                     "verifier_uuid", a->verifier, "subject_uuid", a->subject,
-                     "score", a->score, "channel", a->channel,
-                     "evidence_digest", a->digest, "group_uuid", a->group);
+    json_t *j = json_pack("{s:s, s:s, s:f, s:s, s:s, s:s}",
+                          "verifier_uuid", a->verifier, "subject_uuid", a->subject,
+                          "score", a->score, "channel", a->channel,
+                          "evidence_digest", a->digest, "group_uuid", a->group);
+    /* Only when set, so an unscoped round's payload is unchanged. */
+    if (j != NULL && a->scope[0] != '\0')
+        json_object_set_new(j, "attest_scope", json_string(a->scope));
+    return j;
 }
 
 /* Forget every co-signature recorded for `round_key` ("<round>:<voter>"
@@ -4881,7 +5008,9 @@ static bool _chain_json_commit_certified(const process_t *proc, json_t *arr)
 /* Canonical bytes each co-signer signs. MUST stay byte-identical to Python
  * AttestedScore.designation:
  *   "AT-ATTEST\0" verifier "|" subject "|" task "|" %.17g score "|" channel
- *   "|" digest [ "|" group ]
+ *   "|" digest [ "|" scope ] [ "|" group ]
+ * The scope (64 hex) and the group (a uuid) each appear only when set, and
+ * cannot be mistaken for each other. An unscoped designation is unchanged.
  * Excludes index and prev_hash, which differ per node until reconcile. */
 static size_t _attest_designation(const rep_attest_t *a, uint8_t *out, size_t cap)
 {
@@ -4894,6 +5023,14 @@ static size_t _attest_designation(const rep_attest_t *a, uint8_t *out, size_t ca
                      a->digest);
     if (n < 0 || (size_t)n >= cap - tag_len)
         return 0;
+    if (a->scope[0] != '\0')
+    {
+        int m = snprintf((char *)out + tag_len + n, cap - tag_len - (size_t)n,
+                         "|%s", a->scope);
+        if (m < 0 || (size_t)m >= cap - tag_len - (size_t)n)
+            return 0;
+        n += m;
+    }
     if (a->group[0] != '\0')
     {
         int m = snprintf((char *)out + tag_len + n, cap - tag_len - (size_t)n,
@@ -4977,19 +5114,27 @@ static bool _attest_quorum_met(const process_t *proc, const rep_attest_t *a,
 }
 
 /* Does @p chain hold an attested entry by @p verifier about @p subject? The
- * rate cap: one per pair in the resident window, counted from the chain itself
- * so every node reaches the same answer. Caller holds rep_state.lock. */
+ * rate cap, counted from the chain itself so every node reaches the same
+ * answer. Unscoped: one per (verifier, subject) pair in the resident window.
+ * Scoped: one per (verifier, subject, channel, scope), so an application can
+ * attest again about something new -- a fresh scan of a fixed commit -- while
+ * a repeat about the same thing is still refused. Caller holds rep_state.lock. */
 static bool _attest_resident_locked(const tx_history_t *chain,
-                                    const char *verifier, const char *subject)
+                                    const rep_attest_t *a)
 {
     uuid_t v, s;
-    if (uuid_parse(verifier, v) != 0 || uuid_parse(subject, s) != 0)
+    if (uuid_parse(a->verifier, v) != 0 || uuid_parse(a->subject, s) != 0)
         return false;
     for (int i = 0; i < chain->chain_len; i++)
     {
         const transaction_t *t = &chain->chain[i];
-        if (t->attested && uuid_compare(t->p1_uuid, v) == 0
-            && uuid_compare(t->subject_uuid, s) == 0)
+        if (!t->attested || uuid_compare(t->p1_uuid, v) != 0
+            || uuid_compare(t->subject_uuid, s) != 0)
+            continue;
+        if (a->scope[0] == '\0')
+            return true;
+        if (strcmp(t->p1_channel, a->channel) == 0
+            && strcmp(t->attest_scope, a->scope) == 0)
             return true;
     }
     return false;
@@ -5019,7 +5164,23 @@ static bool _attest_admissible(const process_t *proc, const rep_attest_t *a,
         snprintf(why, why_cap, "subject not a member");
         return false;
     }
-    double min_rep = reputation_env_double("AT_ATTEST_MIN_REP", 0.5);
+    /* Eligibility is the verifier's EFFECTIVE tier in this node's view: the
+     * score bounded by any standing ceiling, and tier 0 once the verifier is
+     * excluded. Replication needs more than the other channels, because it is
+     * what lets a second voice confirm a finding, and a sybil spun up by the
+     * subject must not be that voice. AT_ATTEST_MIN_REP, the older raw-score
+     * knob, still sets the floor for the other channels when it is given
+     * (cohorts lower it on purpose); it never relaxes replication. */
+    bool replication = strcmp(a->channel, TX_CHANNEL_REPLICATION) == 0;
+    int min_tier = replication
+        ? (int)reputation_env_double("AT_ATTEST_REPLICATION_TIER", 3)
+        : (int)reputation_env_double("AT_ATTEST_MIN_TIER", 1);
+    double min_rep = 0.0;
+    if (!replication && getenv("AT_ATTEST_MIN_REP") != NULL)
+    {
+        min_rep = reputation_env_double("AT_ATTEST_MIN_REP", 0.5);
+        min_tier = 0;
+    }
     uuid_t vu;
     uuid_parse(a->verifier, vu);
     bool ok = true;
@@ -5027,15 +5188,26 @@ static bool _attest_admissible(const process_t *proc, const rep_attest_t *a,
     data_t *d = NULL;
     double rep = PREREP_NEUTRAL;
     reputations_get(&rep_state.reputations, vu, &rep);
+    double ceiling = _standing_ceiling_of(vu);
+    if (ceiling >= 0.0 && rep > ceiling)
+        rep = ceiling;
+    bool excluded = map_get(&rep_state.excluded, (map_key_t)a->verifier, &d) == 0;
+    int tier = excluded ? 0 : _trust_tier(rep);
     tx_history_t *chain = _chain_for_key_locked(a->group);
     if (map_get(&rep_state.slashed, (map_key_t)a->verifier, &d) == 0)
     {
         snprintf(why, why_cap, "verifier slashed");
         ok = false;
     }
-    else if (rep < min_rep)
+    else if (excluded)
     {
-        snprintf(why, why_cap, "verifier standing %.2f below %.2f", rep, min_rep);
+        snprintf(why, why_cap, "verifier excluded");
+        ok = false;
+    }
+    else if (tier < min_tier || rep < min_rep)
+    {
+        snprintf(why, why_cap, "verifier tier %d (standing %.2f) below %d for %s",
+                 tier, rep, min_tier, a->channel);
         ok = false;
     }
     else if (_task_ever_held_locked(chain, a->task))
@@ -5043,9 +5215,11 @@ static bool _attest_admissible(const process_t *proc, const rep_attest_t *a,
         snprintf(why, why_cap, "already held");
         ok = false;
     }
-    else if (_attest_resident_locked(chain, a->verifier, a->subject))
+    else if (_attest_resident_locked(chain, a))
     {
-        snprintf(why, why_cap, "rate cap: this verifier already attested this subject");
+        snprintf(why, why_cap, a->scope[0] != '\0'
+                 ? "rate cap: this verifier already attested this subject in this scope"
+                 : "rate cap: this verifier already attested this subject");
         ok = false;
     }
     pthread_mutex_unlock(&rep_state.lock);
@@ -5066,6 +5240,7 @@ static bool _commit_attestation(const process_t *proc, const rep_attest_t *a,
     tx.p1_score = a->score;
     at_strlcpy(tx.p1_channel, a->channel, sizeof(tx.p1_channel));
     at_strlcpy(tx.evidence_digest, a->digest, sizeof(tx.evidence_digest));
+    at_strlcpy(tx.attest_scope, a->scope, sizeof(tx.attest_scope));
     tx.index = -1;
     char *cert = json_dumps(sigs, JSON_COMPACT | JSON_SORT_KEYS);
     pthread_mutex_lock(&rep_state.lock);
@@ -5075,6 +5250,14 @@ static bool _commit_attestation(const process_t *proc, const rep_attest_t *a,
     if (rc != 0)
         return false;
     _note_interaction(tx.subject_uuid);
+    /* Due for a checkpoint soon, so the entry is archived (_archive_attested)
+     * before a busy chain can evict it. Mirrors Python ATTEST_CHECKPOINT_SEC. */
+    double soon = (double)time(NULL)
+        + reputation_env_double("AT_REP_ATTEST_CHECKPOINT_SEC", 10.0);
+    pthread_mutex_lock(&rep_state.lock);
+    if (rep_state.checkpoint_phase_taken && rep_state.next_checkpoint_at > soon)
+        rep_state.next_checkpoint_at = soon;
+    pthread_mutex_unlock(&rep_state.lock);
     log_info(proc->logger,
              "Reputation: attested score committed: verifier=%.8s subject=%.8s "
              "score=%.2f channel=%s signers=%zu\n", a->verifier, a->subject,
@@ -5158,6 +5341,7 @@ void _forward_attestation(const process_t *proc, const tx_score_msg_t *ts,
     a.score = ts->score;
     at_strlcpy(a.channel, ts->channel, sizeof(a.channel));
     at_strlcpy(a.digest, ts->evidence_digest, sizeof(a.digest));
+    at_strlcpy(a.scope, ts->attest_scope, sizeof(a.scope));
     if (!_attest_well_formed(&a))
     {
         log_warn(proc->logger, "Reputation: attestation NOT proposed: malformed "
@@ -5171,8 +5355,7 @@ void _forward_attestation(const process_t *proc, const tx_score_msg_t *ts,
         return;
     }
     pthread_mutex_lock(&rep_state.lock);
-    bool capped = _attest_resident_locked(_chain_for_key_locked(a.group),
-                                          a.verifier, a.subject);
+    bool capped = _attest_resident_locked(_chain_for_key_locked(a.group), &a);
     pthread_mutex_unlock(&rep_state.lock);
     if (capped)
     {
@@ -5485,9 +5668,38 @@ static bool handle_attest_final(const process_t *proc, directory_t *queues,
     return true;
 }
 
+/* Do we already hold, certified, the very attested entry @p a names (task
+ * @p task)? Then catch-up has nothing to re-judge: we accepted it under the
+ * quorum in force when it committed, and the group has only grown since if its
+ * certificate now looks short (ISSUES §2.48). Primary chain only; a child
+ * chain's entry is judged as before. */
+static bool _attest_already_held(const char *task, const rep_attest_t *a)
+{
+    uuid_t tu;
+    if (task == NULL || uuid_parse(task, tu) != 0)
+        return false;
+    transaction_t held;
+    pthread_mutex_lock(&rep_state.lock);
+    bool have = tx_history_by_task(&rep_state.history, tu, &held) == 0
+        && tx_history_attest_cert(&rep_state.history, tu) != NULL;
+    pthread_mutex_unlock(&rep_state.lock);
+    if (!have || !held.attested)
+        return false;
+    char v[UUID_STRING_LEN + 1], sj[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(held.p1_uuid, v);
+    uuid_unparse_lower(held.subject_uuid, sj);
+    return strcmp(v, a->verifier) == 0 && strcmp(sj, a->subject) == 0
+        && strcmp(held.p1_channel, a->channel) == 0
+        && strcmp(held.evidence_digest, a->digest) == 0
+        && strcmp(held.attest_scope, a->scope) == 0
+        && fabs(held.p1_score - a->score) < 1e-12;
+}
+
 /* Catch-up refuses a segment carrying an attested entry whose certificate does
- * not meet our quorum: otherwise catch-up would be a way around the round.
- * Caller must NOT hold rep_state.lock or the peers lock. */
+ * not meet our quorum: otherwise catch-up would be a way around the round. An
+ * entry we already hold certified is not re-judged against today's roster
+ * (_attest_already_held). Caller must NOT hold rep_state.lock or the peers
+ * lock. */
 static bool _chain_json_certified(const process_t *proc, json_t *arr)
 {
     if (!json_is_array(arr))
@@ -5504,15 +5716,21 @@ static bool _chain_json_certified(const process_t *proc, json_t *arr)
         const char *s = json_string_value(json_object_get(e, "subject"));
         const char *c = json_string_value(json_object_get(e, "p1_channel"));
         const char *dg = json_string_value(json_object_get(e, "evidence_digest"));
+        const char *sp = json_string_value(json_object_get(e, "attest_scope"));
         if (v == NULL || s == NULL || c == NULL || dg == NULL)
             return false;
         at_strlcpy(a.verifier, v, sizeof(a.verifier));
         at_strlcpy(a.subject, s, sizeof(a.subject));
         at_strlcpy(a.channel, c, sizeof(a.channel));
         at_strlcpy(a.digest, dg, sizeof(a.digest));
+        if (sp != NULL)
+            at_strlcpy(a.scope, sp, sizeof(a.scope));
         a.score = json_number_value(json_object_get(e, "p1_score"));
-        if (!_attest_well_formed(&a)
-            || !_attest_quorum_met(proc, &a, json_object_get(e, "attest_sigs")))
+        if (!_attest_well_formed(&a))
+            return false;
+        if (_attest_already_held(json_string_value(json_object_get(e, "task")), &a))
+            continue;
+        if (!_attest_quorum_met(proc, &a, json_object_get(e, "attest_sigs")))
             return false;
     }
     return _chain_json_commit_certified(proc, arr);
@@ -5535,6 +5753,7 @@ static void _reappend_attested(const process_t *proc, const tx_reconcile_result_
         uuid_unparse_lower(t->subject_uuid, a.subject);
         at_strlcpy(a.channel, t->p1_channel, sizeof(a.channel));
         at_strlcpy(a.digest, t->evidence_digest, sizeof(a.digest));
+        at_strlcpy(a.scope, t->attest_scope, sizeof(a.scope));
         a.score = t->p1_score;
         if (!_attest_well_formed(&a))
             continue;
@@ -7688,6 +7907,328 @@ static void _load_slash_marks(const process_t *proc)
  * signature set for the checkpoint we already hold is an UPGRADE, not a
  * duplicate — the proposer self-stores holding only its own signature, and the
  * quorum map only exists a round later. */
+/* Durable attested records (doc/architecture/reputation.md, "Verifier-attested
+ * scores"): one etc/at/attested/<task>.json per attested entry a quorum-signed
+ * checkpoint covers, written once and never rewritten. The resident window
+ * holds MAX_CHAIN_LEN entries and the evidence file is rewritten at every
+ * checkpoint, so both soon lose an attested entry; an application that shows
+ * a finding for longer (Stele's repo standing) reads it from here. A record
+ * carries everything a verifier needs on its own: the entry with its quorum
+ * certificate, the checkpoint and its signatures, the inclusion proof, the
+ * public keys of every signer THIS node held, and the group sizes both quorums
+ * count against. Mirrors Python _archive_attested / attested_record, whose
+ * verify_attested_record checks it. */
+#define REP_ATTESTED_DIR "attested"
+
+typedef struct {
+    char        task[UUID_STRING_LEN + 1];
+    char        subject[UUID_STRING_LEN + 1];
+    json_t     *proof;     /* [{sibling, left}] */
+    json_t     *cert;      /* {voter: sig} */
+} rep_archive_item_t;
+
+static int _archive_path(const char *task, char *out, size_t cap)
+{
+    char cfg_dir[CFG_PATH_LEN + 1] = {0};
+    if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) < 0)
+        return -1;
+    int n = (task == NULL)
+        ? snprintf(out, cap, "%s/%s", cfg_dir, REP_ATTESTED_DIR)
+        : snprintf(out, cap, "%s/%s/%s.json", cfg_dir, REP_ATTESTED_DIR, task);
+    return (n < 0 || (size_t)n >= cap) ? -1 : 0;
+}
+
+/* Add @p voter's public key to @p signers when this node holds one. */
+static void _archive_signer(const process_t *proc, json_t *signers,
+                            const char *voter)
+{
+    if (json_object_get(signers, voter) != NULL)
+        return;
+    unsigned char pk[crypto_sign_PUBLICKEYBYTES];
+    if (!_cosigner_pubkey(proc, voter, pk))
+        return;
+    char hex[crypto_sign_PUBLICKEYBYTES * 2 + 1];
+    sodium_bin2hex(hex, sizeof(hex), pk, sizeof(pk));
+    json_object_set_new(signers, voter, json_string(hex));
+}
+
+static void _archive_attested(const process_t *proc, const char *chain_key)
+{
+    if (proc == NULL)
+        return;
+    bool primary = (chain_key == NULL || chain_key[0] == '\0');
+    peers_read_lock(proc);
+    size_t roster = _ckpt_roster_for_group(proc, primary ? NULL : chain_key);
+    size_t members = proc->protocol.num_peers + 1;
+    peers_read_unlock(proc);
+
+    rep_archive_item_t items[MAX_CHAIN_LEN];
+    int n_items = 0;
+    json_t *doc = NULL;
+    rep_checkpoint_t ckpt;
+    if (rep_checkpoint_init(&ckpt) != 0)
+        return;
+    pthread_mutex_lock(&rep_state.lock);
+    rep_chain_ckpt_t *slot = _ckpt_slot_locked(chain_key);
+    /* Only while our resident window reproduces the signed root: a node still
+     * on a fork the quorum did not sign would otherwise prove its own entries
+     * against that root, and a record is written once and never rewritten.
+     * The next checkpoint stored after the chain converges archives them. */
+    char mine[TX_HASH_HEX_LEN + 1] = {0};
+    if (slot != NULL && slot->set && slot->count > 0
+        && map_size(&slot->sigs_final) > (roster + 1) / 2
+        && tx_history_range_root(_chain_for_key_locked(chain_key),
+                                 slot->first_index, slot->count, mine) == 0
+        && strcmp(mine, slot->root) == 0)
+    {
+        tx_history_t *chain = _chain_for_key_locked(chain_key);
+        for (int i = 0; i < chain->chain_len && n_items < MAX_CHAIN_LEN; i++)
+        {
+            const transaction_t *t = &chain->chain[i];
+            if (!t->attested || t->index < slot->first_index
+                || t->index >= slot->first_index + slot->count)
+                continue;
+            rep_archive_item_t *it = &items[n_items];
+            uuid_unparse_lower(t->task_uuid, it->task);
+            char path[CFG_PATH_LEN + 128];
+            if (_archive_path(it->task, path, sizeof(path)) != 0
+                || access(path, F_OK) == 0)
+                continue;
+            const char *cert = tx_history_attest_cert(chain, t->task_uuid);
+            tx_merkle_step_t steps[MAX_CHAIN_LEN];
+            int n_steps = 0;
+            if (cert == NULL
+                || tx_history_range_proof(chain, slot->first_index, slot->count,
+                                          t->index, steps, &n_steps) != 0)
+                continue;
+            it->cert = json_loads(cert, 0, NULL);
+            if (!json_is_object(it->cert) || json_object_size(it->cert) == 0)
+            {
+                json_decref(it->cert);
+                continue;
+            }
+            it->proof = json_array();
+            for (int k = 0; k < n_steps; k++)
+                json_array_append_new(it->proof, json_pack(
+                    "{s:s, s:b}", "sibling", steps[k].sibling,
+                    "left", steps[k].sibling_is_left));
+            uuid_unparse_lower(t->subject_uuid, it->subject);
+            n_items++;
+        }
+        if (n_items > 0)
+        {
+            _current_checkpoint_locked(chain_key, &ckpt);
+            if (reputation_evidence_to_json(chain, &ckpt, &doc) != 0)
+                doc = NULL;
+        }
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    rep_checkpoint_free(&ckpt);
+
+    char dir[CFG_PATH_LEN + 64];
+    if (n_items > 0 && doc != NULL && _archive_path(NULL, dir, sizeof(dir)) == 0)
+        (void)mkdir(dir, 0755);
+    json_t *doc_chain = doc != NULL ? json_object_get(doc, "chain") : NULL;
+    json_t *doc_ckpt = doc != NULL ? json_object_get(doc, "checkpoint") : NULL;
+    for (int i = 0; i < n_items; i++)
+    {
+        rep_archive_item_t *it = &items[i];
+        json_t *entry = NULL;
+        size_t ci;
+        json_t *ce;
+        json_array_foreach(doc_chain, ci, ce)
+        {
+            const char *tid = json_string_value(json_object_get(ce, "task_id"));
+            if (tid != NULL && strcmp(tid, it->task) == 0)
+            {
+                entry = ce;
+                break;
+            }
+        }
+        if (entry != NULL && json_is_object(doc_ckpt))
+        {
+            json_t *signers = json_object();
+            const char *voter;
+            json_t *v;
+            json_object_foreach(it->cert, voter, v)
+                _archive_signer(proc, signers, voter);
+            json_object_foreach(json_object_get(doc_ckpt, "sigs"), voter, v)
+                _archive_signer(proc, signers, voter);
+            json_t *entry_copy = json_deep_copy(entry);
+            if (json_object_get(entry_copy, "attest_sigs") == NULL)
+                json_object_set(entry_copy, "attest_sigs", it->cert);
+            json_t *rec = json_pack(
+                "{s:s, s:o, s:O, s:O, s:o, s:I, s:I, s:b}",
+                "schema", "1", "entry", entry_copy, "checkpoint", doc_ckpt,
+                "proof", it->proof, "signers", signers,
+                "group_size", (json_int_t)members,
+                "ckpt_group_size", (json_int_t)(roster + 1),
+                "subject_member", _is_member(proc, it->subject));
+            char path[CFG_PATH_LEN + 128], tmp[CFG_PATH_LEN + 136];
+            if (rec != NULL && _archive_path(it->task, path, sizeof(path)) == 0)
+            {
+                snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+                if (json_dump_file(rec, tmp, JSON_INDENT(2)) == 0
+                    && rename(tmp, path) == 0)
+                    log_info(proc->logger, "Reputation: archived attested entry "
+                             "%.8s (subject %.8s)\n", it->task, it->subject);
+                else
+                    log_warn(proc->logger, "Reputation: could not archive "
+                             "attested entry %.8s\n", it->task);
+            }
+            json_decref(rec);
+        }
+        json_decref(it->proof);
+        json_decref(it->cert);
+    }
+    json_decref(doc);
+}
+
+/* The roster a reader of etc/at/attested/ verifies against: every member
+ * this node has held (uuid -> signing key, when first and last seen, the
+ * effective tier last published, whether it is a member now) and the final
+ * checkpoints it stored, newest last. An attested record carries the signers'
+ * keys itself, and that is what a forger would write too, so a verifier that
+ * takes its keys from here instead is checking the record against THIS node's
+ * view of its group (doc/architecture/reputation.md, "Verifier-attested
+ * scores"). A member who leaves is kept, marked, so a record it signed while a
+ * member still verifies. Written after every stored checkpoint, beside the
+ * archive it anchors; atomic, failure logged and swallowed. Mirrors Python
+ * repprocess._persist_roster. */
+#define REP_ROSTER_FILE "roster.cfg.json"
+#define REP_ROSTER_CKPTS 256
+
+static void _persist_roster(const process_t *proc, const char *chain_key)
+{
+    if (proc == NULL)
+        return;
+    char cfg_dir[CFG_PATH_LEN + 1] = {0};
+    if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) < 0)
+        return;
+    char path[CFG_PATH_LEN + 64], tmp[CFG_PATH_LEN + 72];
+    snprintf(path, sizeof(path), "%s/%s", cfg_dir, REP_ROSTER_FILE);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+    json_t *doc = json_load_file(path, 0, NULL);
+    if (!json_is_object(doc))
+    {
+        json_decref(doc);
+        doc = json_object();
+    }
+    json_t *members = json_object_get(doc, "members");
+    if (!json_is_object(members))
+    {
+        members = json_object();
+        json_object_set_new(doc, "members", members);
+    }
+    json_t *ckpts = json_object_get(doc, "checkpoints");
+    if (!json_is_array(ckpts))
+    {
+        ckpts = json_array();
+        json_object_set_new(doc, "checkpoints", ckpts);
+    }
+    json_int_t now = (json_int_t)time(NULL);
+    const char *k;
+    json_t *v;
+    json_object_foreach(members, k, v)
+        json_object_set_new(v, "member", json_false());
+
+    char group[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(proc->protocol.group.uuid, group);
+    json_object_set_new(doc, "schema", json_string("1"));
+    json_object_set_new(doc, "group_uuid", json_string(group));
+
+    /* Snapshot uuid -> key under the peers lock; tiers come from rep_state. */
+    size_t n = 0;
+    char (*ids)[UUID_STRING_LEN + 1] = NULL;
+    char (*keys)[crypto_sign_PUBLICKEYBYTES * 2 + 1] = NULL;
+    peers_read_lock(proc);
+    size_t cap = proc->protocol.num_peers + 1;
+    ids = calloc(cap, sizeof(*ids));
+    keys = calloc(cap, sizeof(*keys));
+    if (ids != NULL && keys != NULL)
+    {
+        const identity_t *self = _resolve_self_identity(proc);
+        if (self != NULL)
+        {
+            uuid_unparse_lower(self->uuid, ids[n]);
+            sodium_bin2hex(keys[n], sizeof(keys[n]), self->signature.public,
+                           crypto_sign_PUBLICKEYBYTES);
+            json_object_set_new(doc, "self", json_string(ids[n]));
+            n++;
+        }
+        for (size_t i = 0; i < proc->protocol.num_peers && n < cap; i++, n++)
+        {
+            uuid_unparse_lower(proc->protocol.peers[i].uuid, ids[n]);
+            sodium_bin2hex(keys[n], sizeof(keys[n]),
+                           proc->protocol.peers[i].signature.public,
+                           crypto_sign_PUBLICKEYBYTES);
+        }
+    }
+    peers_read_unlock(proc);
+
+    pthread_mutex_lock(&rep_state.lock);
+    for (size_t i = 0; i < n; i++)
+    {
+        json_t *m = json_object_get(members, ids[i]);
+        const char *old = json_string_value(json_object_get(m, "pubkey"));
+        if (m == NULL || (old != NULL && strcmp(old, keys[i]) != 0))
+        {
+            /* A new member, or a uuid whose key changed: a changed key is a
+             * new identity, so its history starts again. */
+            m = json_object();
+            json_object_set_new(m, "first_seen", json_integer(now));
+            json_object_set_new(members, ids[i], m);
+        }
+        json_object_set_new(m, "pubkey", json_string(keys[i]));
+        json_object_set_new(m, "last_seen", json_integer(now));
+        json_object_set_new(m, "member", json_true());
+        int tier = -1;
+        data_t *d = NULL;
+        if (map_get(&rep_state.peer_tiers, (map_key_t)ids[i], &d) == 0 && d != NULL)
+            data_integer(d, &tier);
+        if (tier >= 0)
+            json_object_set_new(m, "tier", json_integer(tier));
+        else
+            json_object_del(m, "tier");
+    }
+    rep_chain_ckpt_t *slot = _ckpt_slot_locked(chain_key);
+    if (slot != NULL && slot->set)
+    {
+        const char *gk = (chain_key == NULL) ? "" : chain_key;
+        bool dup = false;
+        size_t ci;
+        json_t *ce;
+        json_array_foreach(ckpts, ci, ce)
+        {
+            const char *g = json_string_value(json_object_get(ce, "group_uuid"));
+            if (json_integer_value(json_object_get(ce, "epoch")) == slot->epoch
+                && g != NULL && strcmp(g, gk) == 0)
+            {
+                json_object_set_new(ce, "root", json_string(slot->root));
+                json_object_set_new(ce, "first_index", json_integer(slot->first_index));
+                json_object_set_new(ce, "count", json_integer(slot->count));
+                dup = true;
+                break;
+            }
+        }
+        if (!dup)
+            json_array_append_new(ckpts, json_pack(
+                "{s:s, s:I, s:s, s:i, s:i}", "group_uuid", gk,
+                "epoch", (json_int_t)slot->epoch, "root", slot->root,
+                "first_index", slot->first_index, "count", slot->count));
+        while (json_array_size(ckpts) > REP_ROSTER_CKPTS)
+            json_array_remove(ckpts, 0);
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    free(ids);
+    free(keys);
+
+    if (json_dump_file(doc, tmp, JSON_INDENT(2)) != 0 || rename(tmp, path) != 0)
+        log_warn(proc->logger, "Reputation: could not write %s\n", REP_ROSTER_FILE);
+    json_decref(doc);
+}
+
 static void _store_checkpoint(const process_t *proc, const char *proposer,
                               const char *root, int64_t epoch,
                               int first_index, int count,
@@ -7746,7 +8287,11 @@ static void _store_checkpoint(const process_t *proc, const char *proposer,
         _note_final_locked(root, first_index, count);
     pthread_mutex_unlock(&rep_state.lock);
     if (write)
+    {
         _persist_history(proc, chain_key);
+        _persist_roster(proc, chain_key);
+        _archive_attested(proc, chain_key);
+    }
 }
 
 /* Clamp each restored score to what the evidence supports for that peer: its
@@ -9458,6 +10003,28 @@ int reputation_install_tx_attested(const uuid_t verifier_uuid, double score,
                                    const uuid_t subject_uuid,
                                    const char *evidence_digest)
 {
+    return reputation_install_tx_attested_scoped(verifier_uuid, score, channel,
+                                                 subject_uuid, evidence_digest,
+                                                 NULL, NULL);
+}
+
+void reputation_test_store_checkpoint(const process_t *proc, const char *proposer,
+                                      const char *root, int64_t epoch,
+                                      int first_index, int count,
+                                      const char *chain_key, json_t *sigs)
+{
+    _ensure_init();
+    _store_checkpoint(proc, proposer, root, epoch, first_index, count,
+                      chain_key, sigs);
+}
+
+int reputation_install_tx_attested_scoped(const uuid_t verifier_uuid,
+                                          double score, const char *channel,
+                                          const uuid_t subject_uuid,
+                                          const char *evidence_digest,
+                                          const char *scope,
+                                          const char *cert_json)
+{
     _ensure_init();
     transaction_t tx;
     memset(&tx, 0, sizeof(tx));
@@ -9470,10 +10037,12 @@ int reputation_install_tx_attested(const uuid_t verifier_uuid, double score,
     uuid_copy(tx.subject_uuid, subject_uuid);
     if (evidence_digest != NULL)
         at_strlcpy(tx.evidence_digest, evidence_digest, sizeof(tx.evidence_digest));
+    if (scope != NULL)
+        at_strlcpy(tx.attest_scope, scope, sizeof(tx.attest_scope));
     tx_attest_task_uuid(verifier_uuid, subject_uuid, tx.evidence_digest, tx.task_uuid);
     tx.index = -1;
     pthread_mutex_lock(&rep_state.lock);
-    int rc = tx_history_append_attested(&rep_state.history, &tx, NULL);
+    int rc = tx_history_append_attested(&rep_state.history, &tx, cert_json);
     pthread_mutex_unlock(&rep_state.lock);
     return rc;
 }

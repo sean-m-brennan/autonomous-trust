@@ -20,6 +20,7 @@
 #include <uuid/uuid.h>
 
 #include "negotiation/negotiation.h"
+#include "bootstrap/bootstrap_capabilities.h" /* at_time_attest */
 #include "structures/map.h"
 #include "structures/data.h"
 #include "utilities/allocation.h"
@@ -239,7 +240,43 @@ int task_tracker_init(task_tracker_t *tracker, const uuid_t task_uuid, int expec
      * stack garbage would be read as a capability name at scoring time. */
     tracker->capability_name[0] = '\0';
     tracker->kwargs_json[0] = '\0';
+    tracker->issued_at = 0.0;
+    tracker->invited_known = false;
+    if (map_init(&tracker->invited) != 0)
+        return -1;
     return map_init(&tracker->results);
+}
+
+int task_tracker_add_invited(task_tracker_t *tracker, const uuid_t peer_uuid)
+{
+    if (tracker == NULL)
+        return -1;
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, uuid_str);
+    tracker->invited_known = true;
+    return map_set(&tracker->invited, uuid_str, integer_data(1));
+}
+
+bool task_tracker_was_invited(const task_tracker_t *tracker, const uuid_t peer_uuid)
+{
+    if (tracker == NULL)
+        return false;
+    if (!tracker->invited_known)
+        return true;
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, uuid_str);
+    data_t *d = NULL;
+    return map_get((map_t *)&tracker->invited, uuid_str, &d) == 0;
+}
+
+bool task_tracker_has_result(const task_tracker_t *tracker, const uuid_t peer_uuid)
+{
+    if (tracker == NULL)
+        return false;
+    char uuid_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer_uuid, uuid_str);
+    data_t *d = NULL;
+    return map_get((map_t *)&tracker->results, uuid_str, &d) == 0;
 }
 
 int task_tracker_set_request(task_tracker_t *tracker,
@@ -256,6 +293,9 @@ int task_tracker_set_request(task_tracker_t *tracker,
     if (kwargs_json != NULL)
         at_strlcpy(tracker->kwargs_json, kwargs_json,
                    sizeof(tracker->kwargs_json));
+    /* Recorded before the announcement goes out, so the window it opens
+     * contains the whole round trip. */
+    tracker->issued_at = at_time_attest();
     return 0;
 }
 
@@ -287,6 +327,8 @@ int task_tracker_result_count(const task_tracker_t *tracker)
 
 void task_tracker_free(task_tracker_t *tracker)
 {
+    if (tracker->invited.items != NULL)
+        map_free(&tracker->invited);
     if (tracker->results.items == NULL) return;
     map_free(&tracker->results);
 }

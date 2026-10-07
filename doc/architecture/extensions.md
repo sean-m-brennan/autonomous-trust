@@ -212,7 +212,7 @@ its anchor and its consumers own the link, as ZTA's do.
 
 A feature's handlers reach identity's state only through the services
 `identity/id_proc_priv.h` exports for them: `identity_self_identity`,
-`identity_find_peer_pub`, `identity_send_to_network` (and its generalisations
+`identity_find_peer_pub`, `identity_send_to_network` (and its generalizations
 `identity_send_to` and `identity_send_to_then`), `identity_freshness_stamp` and
 `identity_freshness_accept`. Each takes identity's lock for itself, and a
 feature keeps its own state behind its own lock.
@@ -240,6 +240,17 @@ contact's and rendezvous's network halves) sends one-shots through `at_send`
   so it is refused, and its loss is reported as before.
 - Chatter that a later tick re-sends anyway stays a bare `messaging_send`,
   with a `Bare on purpose` comment saying what re-sends it.
+
+A feature that audits other nodes' work, as Stele does, submits a
+**verifier-attested score** (reputation.md, "Verifier-attested scores"): a
+`TRANSACTION_SCORE` to the reputation process with `attested` set, the subject
+in `peer_uuid`, a channel of `probe`, `certificate` or `self_consistency`, and an
+`evidence_digest` naming the document it publishes. It may also set
+`attest_scope`, a 64-hex digest saying what the finding is about, which keys
+AT's rate cap so the feature can attest again when the thing it checks changes.
+Once a quorum-signed checkpoint covers the entry, every node keeps a durable,
+self-checking record of it under `etc/at/attested/`, and a feature that shows
+findings for longer than the resident window reads them from there.
 
 ## Transports and processes
 

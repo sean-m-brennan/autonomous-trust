@@ -135,7 +135,7 @@ class NetWireMessage:
         if rc != 0:
             raise RuntimeError(f"net_message_to_wire failed with rc={rc}")
         result = bytes(ffi.buffer(wire_out[0], wire_len[0]))
-        lib.smrt_deref(wire_out[0])
+        lib.at_free(wire_out[0])   # json_dumps/malloc output, not an smrt struct
         return result
 
     @classmethod

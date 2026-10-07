@@ -571,7 +571,11 @@ int load_config(char *filepath, config_t **config_ptr, char *cfg_name, logger_t 
         return EXCEPTION(ENOMEM);
     if (read_config_file(abspath, config->data_struct) != 0)
     {
-        smrt_deref(config->data_struct);
+        /* free, not smrt_deref: some sections' parsers memset the struct or
+         * open it with a non-header field (timeouts, hybrid_net, zta_policy,
+         * peer_capabilities), so the header may be gone and a deref would be
+         * the canary's no-op. The block is calloc'd either way. */
+        free(config->data_struct);
         config->data_struct = NULL;
         log_exception_extra(logger, " for config named '%s'\n", cfg_name);
         return -1;

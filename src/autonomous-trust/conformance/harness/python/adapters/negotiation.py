@@ -172,6 +172,27 @@ class _Participant:
                         f'{self.id}: flood_count for slug {slug!r} '
                         f'(uuid={want_uuid}) = {got}, expected {want}'
                     )
+            elif key == 'results_scored':
+                # {task: <slug>, executors: [<pid>, ...]}: the requestor scored
+                # exactly these executors' results, each once (ISSUES §2.50).
+                # Python scores in its main process, so what is observable
+                # here is each result handed to main, stamped with its
+                # executor; C scores in negotiation and asserts the
+                # TRANSACTION_SCORE it sends, under the pair task id.
+                slug = expected.get('task')
+                want = sorted(expected.get('executors') or [])
+                task_uuid = uuid5(_NS, f'task:{slug}')
+                by_uuid = {str(i.uuid): pid
+                           for pid, i in _PARTICIPANT_IDENTITIES.items()}
+                sink = self.queues[CfgIds.main]._sink
+                got = sorted(by_uuid.get(str(getattr(r, 'executor_uuid', None)), '?')
+                             for r in sink
+                             if str(getattr(r, 'uuid', '')) == str(task_uuid)
+                             and getattr(r, 'executor_uuid', None) is not None)
+                if got != want:
+                    raise AssertionError(
+                        f'{self.id}: results_scored for {slug!r} = {got}, '
+                        f'expected {want}')
             else:
                 raise AssertionError(f'{self.id}: unsupported expected_state key {key!r}')
 
@@ -658,10 +679,19 @@ class NegotiationAdapter:
         else:
             raise AssertionError(f'unsupported negotiation function {function!r}')
 
+        to_whom = recipient
+        if function == 'spawn task':
+            # On a start message `to_whom` is the peer the task is ADDRESSED
+            # to, and production's main process sends none. A spawn step goes
+            # requestor -> requestor, so copying its recipient addressed every
+            # task to ourselves. `target: <pid>` addresses it. Mirrors C.
+            target = payload.get('target')
+            to_whom = (participants[target].impl.identity
+                       if target in participants else None)
         msg = Message(
             CfgIds.negotiation, function, obj,
             from_whom=sender_identity,
-            to_whom=recipient,
+            to_whom=to_whom,
             encrypt=True,
         )
         return msg

@@ -970,33 +970,28 @@ class TestHandleResultsComplete:
         # Task removed from my_tasks after results collected
         assert task.uuid not in np.my_tasks
 
-    def test_results_incomplete_not_forwarded(self):
-        """Not enough results yet → do NOT put to main queue.
-
-        size=3 means we need 3 entries in results before forwarding.
-        We pre-populate 3 slots (all None) and only one peer reports back,
-        so len(results)==3 >= task.size==3 would trigger forwarding. Instead
-        we use size=4 so that 3 tracked results don't reach the threshold.
-        """
+    def test_an_incomplete_fan_out_keeps_the_task_open(self):
+        """Each invitee's result is scored as it arrives (ISSUES §2.50), so
+        peer1's is forwarded at once; the task stays open for peer2 and peer3.
+        (It used to wait for `size` results and forward only then.)"""
         np = _make_neg_process()
         peer1 = _make_mock_peer(nickname='p1')
         peer2 = _make_mock_peer(nickname='p2', address='10.0.0.2')
         peer3 = _make_mock_peer(nickname='p3', address='10.0.0.3')
         tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
-        # size=4 → need 4 results; only 3 participants tracked → won't forward
         task = Task(tp, peer1, size=4)
         task.result = 'partial'
         np.my_tasks[task.uuid] = TaskTracker(task)
         np.my_tasks[task.uuid].results[peer1.uuid] = None
         np.my_tasks[task.uuid].results[peer2.uuid] = None
         np.my_tasks[task.uuid].results[peer3.uuid] = None
-        # Only peer1 reports back
         msg = Message(CfgIds.negotiation, NegotiationProtocol.result,
                       task, from_whom=peer1)
         main_q = queue.Queue()
         result = np.handle_results({CfgIds.main: main_q}, msg)
         assert result is True
-        assert main_q.empty()  # 3 results tracked, need 4 → not forwarded
+        assert main_q.qsize() == 1
+        assert task.uuid in np.my_tasks
 
 
 class TestHandleTierLost:
@@ -1374,3 +1369,93 @@ class TestInvitationStamping:
         assert tracker.seq == 2
         # And the conceded schedule actually moved.
         assert tracker.parameters.when == counter_tp.when
+
+
+class TestResultsPerExecutor:
+    """ISSUES §2.50: every invitee's result is scored once, as it arrives;
+    a result from an uninvited peer, or a repeat, is dropped; the tracker
+    lives until every invitee has answered."""
+
+    def _setup(self, invitees):
+        np = _make_neg_process()
+        requestor = _make_mock_peer(nickname='alice')
+        tp = TaskParameters('cap1', when=datetime(2020, 1, 1, tzinfo=UTC))
+        task = Task(tp, requestor)
+        np.my_tasks[task.uuid] = TaskTracker(task)
+        for p in invitees:
+            np.my_tasks[task.uuid].results[p.uuid] = None
+        return np, task
+
+    def _report(self, np, task, peer, main_q):
+        tr = TaskResult(task=task, result='done')
+        msg = Message(CfgIds.negotiation, NegotiationProtocol.result, tr,
+                      from_whom=peer)
+        assert np.handle_results({CfgIds.main: main_q}, msg) is True
+
+    def _drain(self, q):
+        out = []
+        while not q.empty():
+            out.append(q.get_nowait())
+        return out
+
+    def test_each_invitee_is_forwarded_once_and_only_the_first_unflagged(self):
+        bob, carol = _make_mock_peer(nickname='bob'), _make_mock_peer(nickname='carol')
+        np, task = self._setup([bob, carol])
+        main_q = queue.Queue()
+        self._report(np, task, bob, main_q)
+        assert task.uuid in np.my_tasks                # carol still owes
+        self._report(np, task, carol, main_q)
+        assert task.uuid not in np.my_tasks
+        got = self._drain(main_q)
+        assert [r.executor_uuid for r in got] == [str(bob.uuid), str(carol.uuid)]
+        assert [r.score_only for r in got] == [False, True]
+
+    def test_a_repeat_is_not_forwarded_again(self):
+        bob, carol = _make_mock_peer(nickname='bob'), _make_mock_peer(nickname='carol')
+        np, task = self._setup([bob, carol])
+        main_q = queue.Queue()
+        self._report(np, task, bob, main_q)
+        self._report(np, task, bob, main_q)
+        assert len(self._drain(main_q)) == 1
+        assert task.uuid in np.my_tasks
+
+    def test_an_uninvited_peer_is_dropped(self):
+        bob, eve = _make_mock_peer(nickname='bob'), _make_mock_peer(nickname='eve')
+        np, task = self._setup([bob])
+        main_q = queue.Queue()
+        self._report(np, task, eve, main_q)
+        assert self._drain(main_q) == []
+        assert task.uuid in np.my_tasks
+        self._report(np, task, bob, main_q)
+        assert [r.executor_uuid for r in self._drain(main_q)] == [str(bob.uuid)]
+
+    def test_score_only_never_reaches_the_wire(self):
+        bob = _make_mock_peer(nickname='bob')
+        np, task = self._setup([bob])
+        tr = TaskResult(task=task, result='done')
+        tr.score_only = True
+        assert 'score_only' not in tr.to_dict()
+
+
+class TestStartTaskAddressing:
+    def test_a_directed_task_invites_only_its_target(self):
+        """Message wraps a lone Identity in a list; start_task must still read
+        it as the address, or a directed probe goes to every capable peer
+        (found by the conformance scenario results-uninvited-not-scored)."""
+        np = _make_neg_process()
+        bob, carol = MagicMock(spec=Identity), MagicMock(spec=Identity)
+        bob.uuid, carol.uuid = uuid4(), uuid4()
+        cap = Capability('video')
+        np.protocol.peer_capabilities.items = MagicMock(
+            return_value=[('video', [bob.uuid, carol.uuid])])
+        np.protocol.peers.find_by_uuid = MagicMock(
+            side_effect=lambda u: {bob.uuid: bob, carol.uuid: carol}[u])
+        task = Task(TaskParameters(cap, when=datetime(2020, 1, 1, tzinfo=UTC)),
+                    _make_mock_peer())
+        task.to_json_string = MagicMock(return_value='mock_yaml')
+        msg = Message(CfgIds.negotiation, NegotiationProtocol.start, task,
+                      to_whom=carol)
+        assert isinstance(msg.to_whom, list)
+        assert np.start_task({CfgIds.network: queue.Queue(),
+                              CfgIds.main: queue.Queue()}, msg) is True
+        assert set(np.my_tasks[task.uuid].results) == {carol.uuid}
