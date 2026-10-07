@@ -451,6 +451,7 @@ set(libsrc
     autonomous_trust/identity/id_proc.c
     autonomous_trust/utilities/send_retry.c
     autonomous_trust/identity/id_ext.c
+    autonomous_trust/identity/package_hash.c
     autonomous_trust/identity/peers.c
     autonomous_trust/identity/signature.c
     autonomous_trust/negotiation/task.c
@@ -528,6 +529,7 @@ set(libhdr
     autonomous_trust/config/names.h
     autonomous_trust/identity/history.h
     autonomous_trust/identity/identity.h
+    autonomous_trust/identity/package_hash.h
     autonomous_trust/identity/peers.h
     autonomous_trust/network/net_message.h
     autonomous_trust/network/net_transport.h
@@ -868,6 +870,12 @@ target_link_libraries(rep_cosign_test PRIVATE ${AT_TEST_LIBS})
 add_executable(rep_attest_retry_test test/rep_attest_retry_test.c)
 set_source_files_properties(test/rep_attest_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(rep_attest_retry_test PRIVATE ${AT_TEST_LIBS})
+add_executable(rep_archive_test test/rep_archive_test.c)
+set_source_files_properties(test/rep_archive_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_archive_test PRIVATE ${AT_TEST_LIBS})
+add_executable(package_hash_test test/package_hash_test.c)
+set_source_files_properties(test/package_hash_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(package_hash_test PRIVATE ${AT_TEST_LIBS})
 add_executable(admission_send_test test/admission_send_test.c)
 set_source_files_properties(test/admission_send_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(admission_send_test PRIVATE ${AT_TEST_LIBS})
@@ -1010,6 +1018,8 @@ add_test(NAME neg_send_keep_test COMMAND $<TARGET_FILE:neg_send_keep_test>)
 add_test(NAME rep_commit_retry_test COMMAND $<TARGET_FILE:rep_commit_retry_test>)
 add_test(NAME rep_cosign_test COMMAND $<TARGET_FILE:rep_cosign_test>)
 add_test(NAME rep_attest_retry_test COMMAND $<TARGET_FILE:rep_attest_retry_test>)
+add_test(NAME rep_archive_test COMMAND $<TARGET_FILE:rep_archive_test>)
+add_test(NAME package_hash_test COMMAND $<TARGET_FILE:package_hash_test>)
 add_test(NAME admission_send_test COMMAND $<TARGET_FILE:admission_send_test>)
 add_test(NAME rep_quorum_test COMMAND $<TARGET_FILE:rep_quorum_test>)
 add_test(NAME rep_paxos_round_test COMMAND $<TARGET_FILE:rep_paxos_round_test>)

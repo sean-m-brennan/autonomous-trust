@@ -230,8 +230,82 @@ DEFINE_TEST(test_attest_lowers_its_subjects_score)
 }
 END_TEST_DEFINITION()
 
+/* An optional scope (reputation.md, "Verifier-attested scores"): in the
+ * canonical bytes only when set, so an unscoped entry hashes as
+ * it always did; it rides the catch-up wire and the evidence document; and a
+ * malformed one is refused. Mirrors Python TestScope. */
+DEFINE_TEST(test_attest_scope)
+{
+    uuid_generate(g_v);
+    uuid_generate(g_s);
+    static const char SCOPE[] =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    transaction_t plain = _attested(0.3, "probe");
+    transaction_t scoped = plain;
+    snprintf(scoped.attest_scope, sizeof(scoped.attest_scope), "%s", SCOPE);
+    char a[TX_CANON_MAX], b[TX_CANON_MAX];
+    int na = transaction_canonical_bytes(&plain, a, sizeof(a));
+    int nb = transaction_canonical_bytes(&scoped, b, sizeof(b));
+    ck_assert(na > 0 && nb == na + 1 + (int)strlen(SCOPE));
+    ck_assert(memcmp(a, b, (size_t)na) == 0);
+    ck_assert(b[na] == '|');
+    ck_assert_str_eq(b + na + 1, SCOPE);
+
+    tx_history_t h, back, fresh;
+    ck_assert_ret_ok(tx_history_init(&h));
+    ck_assert_ret_ok(tx_history_init(&back));
+    ck_assert_ret_ok(tx_history_init(&fresh));
+    ck_assert_ret_ok(tx_history_append_attested(&h, &scoped, CERT));
+    json_t *doc = NULL;
+    ck_assert_ret_ok(reputation_evidence_to_json(&h, NULL, &doc));
+    ck_assert_ret_ok(reputation_evidence_from_json(doc, &back, NULL));
+    json_decref(doc);
+    ck_assert(_same_root(&h, &back));
+    transaction_t got;
+    ck_assert_ret_ok(tx_history_by_task(&back, scoped.task_uuid, &got));
+    ck_assert_str_eq(got.attest_scope, SCOPE);
+    json_t *wire = NULL;
+    ck_assert_ret_ok(tx_history_era_to_json(&h, 0, tx_history_len(&h), &wire));
+    tx_reconcile_result_t res;
+    ck_assert_ret_ok(tx_history_reconcile(&fresh, wire, -1, &res));
+    json_decref(wire);
+    ck_assert(_same_root(&fresh, &h));
+    tx_reconcile_result_free(&res);
+
+    transaction_t bad = _attested(0.3, "probe");
+    snprintf(bad.attest_scope, sizeof(bad.attest_scope), "%s", "zz");
+    tx_history_t e;
+    ck_assert_ret_ok(tx_history_init(&e));
+    ck_assert(tx_history_append_attested(&e, &bad, NULL) != 0);
+    tx_history_free(&e);
+    tx_history_free(&h);
+    tx_history_free(&back);
+    tx_history_free(&fresh);
+}
+END_TEST_DEFINITION()
+
+/* The pair task id (ISSUES §2.50), pinned with Python's
+ * test_pair_task_id.py: the same (task, executor) gives the same uuid. */
+DEFINE_TEST(test_pair_task_uuid_vector)
+{
+    uuid_t t, e, got, again, other;
+    uuid_parse("11111111-1111-4111-8111-111111111111", t);
+    uuid_parse("22222222-2222-4222-8222-222222222222", e);
+    tx_pair_task_uuid(t, e, got);
+    char s[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(got, s);
+    ck_assert_str_eq(s, "b783de4b-0f50-510f-81e3-d574b9f4db8f");
+    tx_pair_task_uuid(t, e, again);
+    ck_assert(uuid_compare(got, again) == 0);
+    tx_pair_task_uuid(e, t, other);
+    ck_assert(uuid_compare(got, other) != 0);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(RepAttest, test_attest_append_rules,
+          test_pair_task_uuid_vector,
           test_attest_rides_the_catch_up_wire,
           test_attest_survives_the_evidence_document,
           test_attest_a_fork_hands_it_back,
-          test_attest_lowers_its_subjects_score)
+          test_attest_lowers_its_subjects_score,
+          test_attest_scope)

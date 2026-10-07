@@ -1771,3 +1771,63 @@ class TestAppFacingReputationRated:
         conformance churn. `Reputation` still carries exactly two fields."""
         rep = Reputation(uuid4(), 0.5)
         assert not hasattr(rep, 'rated')
+
+
+class TestForkProbe:
+    """ISSUES §2.51: a request names the head it extends. Same length,
+    different head: an equal-length fork, which Paxos's length check never
+    sees. The acceptor does not grant; it backdates and asks for the
+    proposer's chain, rate-limited per peer. Mirrors C handle_request."""
+
+    def _rp_with_chain(self):
+        rp = _make_rep_process()
+        peer = _make_mock_peer()
+        rp.protocol.peers.all = [peer]
+        tid = uuid4()
+        rp.history.update(tid, peer.uuid, 0.5)
+        rp.history.update(tid, rp.identity.uuid, 0.7)
+        assert len(rp.history) == 1 and rp._our_head()
+        return rp, peer
+
+    def _ask(self, rp, peer, head=None, id1=100):
+        net_q = queue.Queue()
+        parts = (id1, len(rp.history) + 1, peer.uuid) + ((head,) if head else ())
+        msg = Message(CfgIds.reputation, ReputationProtocol.request,
+                      to_yaml_string(parts), from_whom=peer)
+        assert rp.handle_request({CfgIds.network: net_q,
+                                  CfgIds.reputation: queue.Queue()}, msg) is True
+        out = []
+        while not net_q.empty():
+            out.append(net_q.get_nowait())
+        return out
+
+    def test_a_different_head_at_our_length_is_backdated_and_probed(self):
+        rp, peer = self._rp_with_chain()
+        sent = self._ask(rp, peer, head='ff' * 32)
+        assert [m.function for m in sent] == [ReputationProtocol.backdate,
+                                              ReputationProtocol.outdated]
+        assert rp.last_id is None and not rp.requests
+        again = self._ask(rp, peer, head='ff' * 32, id1=101)
+        assert [m.function for m in again] == [ReputationProtocol.backdate]
+
+    def test_our_own_head_or_none_is_granted(self):
+        rp, peer = self._rp_with_chain()
+        sent = self._ask(rp, peer, head=rp._our_head())
+        assert [m.function for m in sent] == [ReputationProtocol.grant]
+        rp2, peer2 = self._rp_with_chain()
+        assert [m.function for m in self._ask(rp2, peer2)] == [ReputationProtocol.grant]
+
+    def test_the_echo_stays_three_elements(self):
+        from autonomous_trust.core.config import from_json_string
+        rp, peer = self._rp_with_chain()
+        sent = self._ask(rp, peer, head='ff' * 32)
+        assert len(from_json_string(sent[0].obj)) == 3
+
+    def test_outdated_sends_the_whole_window_at_equal_length(self):
+        from autonomous_trust.core.config import from_json_string
+        rp, peer = self._rp_with_chain()
+        net_q = queue.Queue()
+        msg = Message(CfgIds.reputation, ReputationProtocol.outdated,
+                      str(len(rp.history)), from_whom=peer)
+        rp.handle_outdated({CfgIds.network: net_q}, msg)
+        assert len(from_json_string(net_q.get_nowait().obj)) == len(rp.history)

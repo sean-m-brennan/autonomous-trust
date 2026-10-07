@@ -169,6 +169,20 @@ double negotiation_score_task_result(const char *cap_name,
                                      uint64_t seed,
                                      const char **channel_out);
 
+/** @ref negotiation_score_task_result, with @p issued_at: when this requestor
+ *  recorded the request (task_tracker_t.issued_at), so at.time-attest is
+ *  judged over the round trip rather than at the scoring instant alone
+ *  (ISSUES §2.53). 0 = unknown, which is what the shorter form passes. */
+double negotiation_score_task_result_at(const char *cap_name,
+                                        const char *kwargs_json,
+                                        double issued_at,
+                                        const char *result_str, size_t result_len,
+                                        const char *certificate_json,
+                                        const char *prediction_json,
+                                        const char *subject, double now,
+                                        uint64_t seed,
+                                        const char **channel_out);
+
 /** The learned EMA weight multiplier for @p subject on @p cap_name
  *  (R+D.md §12.5), NOT a score.
  *

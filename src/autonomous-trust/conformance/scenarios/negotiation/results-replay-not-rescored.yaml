@@ -1,0 +1,55 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: results-replay-not-rescored
+byte_pinning: false
+description: |
+    A repeated result from an executor already scored is not scored again.
+
+    Scoring per executor (ISSUES §2.50) keys on who answered, so a second copy
+    of bob's report would otherwise be a second transaction about bob. carol
+    has not answered yet, so the task stays open.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+  - id: carol
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: [data_fetch]
+    carol: [data_fetch]
+
+steps:
+  - id: 1
+    from: alice
+    to: alice
+    function: spawn task
+    payload:
+      capability: data_fetch
+      task_id: t-replay
+    description: alice spawns; bob and carol are invited.
+  - id: 2
+    from: bob
+    to: alice
+    function: report results
+    payload:
+      task_id: t-replay
+      result: done
+    description: bob reports.
+  - id: 3
+    from: bob
+    to: alice
+    function: report results
+    payload:
+      task_id: t-replay
+      result: done
+    description: bob reports again.
+
+expected_state:
+  alice:
+    results_scored: {task: t-replay, executors: [bob]}
+    has_my_task: {slug: t-replay, present: true}

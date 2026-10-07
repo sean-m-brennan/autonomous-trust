@@ -177,8 +177,17 @@ static bool handle_config_propose(const process_t *proc, directory_t *queues, ge
     uuid_unparse_lower(proposal.proposal_uuid, prop_uuid_str);
 
     pthread_mutex_lock(&config_state.lock);
-    data_t *prop_dat = object_ptr_data(&proposal, sizeof(config_proposal_t));
-    map_set(&config_state.pending_proposals, prop_uuid_str, prop_dat);
+    /* A heap copy the data_t owns. This stored &proposal -- this frame's
+     * stack local -- so every later lookup read a dead frame. */
+    config_proposal_t *heap_prop = malloc(sizeof(config_proposal_t));
+    data_t *prop_dat = (heap_prop != NULL)
+        ? owned_object_data(memcpy(heap_prop, &proposal, sizeof(config_proposal_t)),
+                            sizeof(config_proposal_t))
+        : NULL;
+    if (prop_dat == NULL)
+        free(heap_prop);
+    else if (map_set(&config_state.pending_proposals, prop_uuid_str, prop_dat) != 0)
+        smrt_deref(prop_dat);
     pthread_mutex_unlock(&config_state.lock);
 
     /* Initiate Paxos vote: broadcast vote request to all peers */

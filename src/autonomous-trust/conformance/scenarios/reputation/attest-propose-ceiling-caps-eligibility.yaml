@@ -1,0 +1,46 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-propose-ceiling-caps-eligibility
+byte_pinning: false
+description: |
+    Eligibility is the verifier's effective tier, after its standing ceiling.
+
+    bob's score for alice is 0.9, but an authority has bounded alice at 0.4
+    (here ZTA could not prove her credential; an Ethne expulsion lands the same
+    way). Her effective tier is 0, so her probe is not vouched for. Reading the
+    raw score instead would let a bounded verifier keep attesting.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+fixtures:
+  reputations:
+    bob:
+      alice: 0.9
+  peer_standing:
+    bob:
+      alice:
+        source: zta
+        status: capped
+        ceiling: 0.4
+        reason: credential not proved
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest propose
+    payload:
+      subject: carol
+      score: 0.3
+    description: a probe from a verifier bob holds under a 0.4 ceiling.
+
+expected_state:
+  bob:
+    attest_signs_sent: 0

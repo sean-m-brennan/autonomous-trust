@@ -1,0 +1,57 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: ask-permission-head-mismatch-backdated
+byte_pinning: false
+description: |
+    An equal-length fork is seen and both sides exchange chains (ISSUES §2.51).
+
+    Paxos compares chain LENGTHS: bob holds 3 entries and alice asks for index
+    4, so by length alone bob would grant. But alice's request names the head
+    it extends, and it is not bob's: the two chains forked at equal length.
+    Granting would extend the fork, and nothing else would ever bring the two
+    together (no length mismatch, no checkpoint while their windows differ).
+    So bob does not grant. He backdates (`out of date`), so alice pulls his
+    chain and retries, and asks for hers (`update needed`), so both run the
+    same symmetric reconcile and converge.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+
+fixtures:
+  history_len:
+    bob: 3
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: ask permission
+    payload:
+      id1: 9999
+      id2: 4
+      proposer: alice
+      head: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+
+  - id: 2
+    from: bob
+    to: alice
+    function: out of date
+    in_response_to: 1
+    payload:
+      id1: 9999
+      id2: 4
+      proposer: alice
+
+  - id: 3
+    from: bob
+    to: alice
+    function: update needed
+    in_response_to: 1
+
+expected_state:
+  bob:
+    requests_count: 0

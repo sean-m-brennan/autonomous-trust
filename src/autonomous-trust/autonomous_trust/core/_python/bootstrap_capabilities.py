@@ -29,6 +29,7 @@ and reads the result on the requestor side via TaskResult. See
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from typing import Any
@@ -107,6 +108,34 @@ def verify_time_attest(result: Any, requestor_now: float,
     return 0.9 if delta < tolerance else 0.5
 
 
+def verify_time_attest_window(result: Any, sent_at, requestor_now: float,
+                              tolerance: float = DEFAULT_TIME_ATTEST_TOLERANCE_SEC
+                              ) -> float:
+    """The same check against the round trip rather than one instant
+    (ISSUES §2.53). An honest clock read its time somewhere between our
+    sending the probe (``sent_at``) and our scoring the reply
+    (``requestor_now``), so anything in ``[sent_at - tolerance,
+    requestor_now + tolerance]`` scores 0.9. Outside it but parseable → 0.5;
+    unparseable → 0.1. A ``sent_at`` that is missing, not positive, not finite
+    or later than ``requestor_now`` is unknown, and the check falls back to
+    :func:`verify_time_attest` at ``requestor_now``.
+    """
+    try:
+        sent = float(sent_at)
+        now_ = float(requestor_now)
+    except (TypeError, ValueError):
+        return verify_time_attest(result, requestor_now, tolerance)
+    if not (math.isfinite(sent) and math.isfinite(now_)) or sent <= 0 or sent > now_:
+        return verify_time_attest(result, requestor_now, tolerance)
+    try:
+        value = float(result)
+    except (TypeError, ValueError):
+        return 0.1
+    if not math.isfinite(value):
+        return 0.1
+    return 0.9 if sent - tolerance < value < now_ + tolerance else 0.5
+
+
 def verify_echo(result: Any, sent_payload: str) -> float:
     """Byte-equality on the echoed payload. Mismatch == defection."""
     return 0.9 if isinstance(result, str) and result == sent_payload else 0.1
@@ -142,13 +171,12 @@ def time_attest_tolerance() -> float:
     The env override was documented at the top of this module from the start
     but never actually read, so the constant was the only value in play.
 
-    Worth knowing when tuning it: the comparison happens on the REQUESTOR at
-    scoring time, so the measured delta includes the round trip, not just the
-    responder's clock error. A truthful peer one RTT away can exceed a tight
-    tolerance through no fault of its own. That is survivable because
-    :func:`verify_time_attest` scores an out-of-tolerance-but-parseable answer
-    0.5 ("could be routine drift") rather than 0.1 ("defected") — but it is the
-    reason this is tunable rather than compiled in.
+    It bounds clock error only. The round trip is the window between when the
+    requestor issued the probe and when it scored the reply, which
+    :func:`verify_time_attest_window` allows on top of it (ISSUES §2.53).
+    Before that, the comparison was against the scoring instant alone, and a
+    live reply's IPC and network latency by itself exceeded 0.2 s, so nearly
+    every honest peer scored 0.5.
     """
     raw = os.environ.get('AT_TIME_ATTEST_TOLERANCE_SEC')
     if raw is None:
@@ -167,7 +195,8 @@ def is_probe_capability(cap_name) -> bool:
 
 def verify_bootstrap_result(cap_name, result, sent_kwargs=None,
                             requestor_now: float = None,
-                            tolerance: float = None):
+                            tolerance: float = None,
+                            sent_at: float = None):
     """Score a probe result against the answer the requestor already knows.
 
     Returns a score in [0, 1], or ``None`` if ``cap_name`` is not a probe
@@ -183,7 +212,9 @@ def verify_bootstrap_result(cap_name, result, sent_kwargs=None,
 
     ``sent_kwargs`` MUST be the requestor's own record of the challenge, not
     the copy carried on the responder's reply — see
-    :meth:`TaskResult.attach_requested_parameters`.
+    :meth:`TaskResult.attach_requested_parameters`. So must ``sent_at``, when
+    the requestor issued it (``TaskResult.requested_at``): at.time-attest is
+    judged over that round trip (:func:`verify_time_attest_window`).
     """
     if cap_name not in BOOTSTRAP_VERIFIERS:
         return None
@@ -196,7 +227,7 @@ def verify_bootstrap_result(cap_name, result, sent_kwargs=None,
     if cap_name == 'at.time-attest':
         now_ = time.time() if requestor_now is None else requestor_now
         tol = time_attest_tolerance() if tolerance is None else tolerance
-        return verify_time_attest(result, now_, tol)
+        return verify_time_attest_window(result, sent_at, now_, tol)
     if cap_name == 'at.echo-challenge':
         return verify_echo(result, sent.get('payload', ''))
     return None

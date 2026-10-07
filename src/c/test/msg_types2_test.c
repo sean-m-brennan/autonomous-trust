@@ -57,6 +57,7 @@ DEFINE_TEST(test_generic_msg_signal_proto_roundtrip)
     ck_assert_int_eq(msg2.type, SIGNAL);
     ck_assert_int_eq(msg2.info.signal.sig, 77);
     ck_assert_str_eq(msg2.info.signal.descr, "test_proto");
+    free(data);
 }
 END_TEST_DEFINITION()
 
@@ -67,7 +68,7 @@ DEFINE_TEST(test_wrap_in_any)
     /* Create simple data to wrap */
     char test_data[] = "hello";
     size_t test_len = strlen(test_data) + 1;
-    void *data_in = smrt_create(test_len);
+    void *data_in = malloc(test_len);
     ck_assert_ptr_nonnull(data_in);
     memcpy(data_in, test_data, test_len);
 
@@ -76,7 +77,8 @@ DEFINE_TEST(test_wrap_in_any)
     ck_assert_ret_ok(wrap_in_any(SIGNAL, data_in, test_len, &packed, &packed_len));
     ck_assert_ptr_nonnull(packed);
     ck_assert(packed_len > 0);
-    /* data_in is freed by wrap_in_any (smrt_deref) */
+    /* data_in is freed by wrap_in_any */
+    free(packed);
 }
 END_TEST_DEFINITION()
 
@@ -151,6 +153,7 @@ DEFINE_TEST(test_signal_proto_format)
     ck_assert_ret_ok(proto_to_signal((uint8_t *)data, data_len, &sig2));
     ck_assert_int_eq(sig2.sig, 42);
     ck_assert_str_eq(sig2.descr, "quit");
+    free(data);
 }
 END_TEST_DEFINITION()
 
@@ -221,11 +224,13 @@ DEFINE_TEST(test_task_result_carries_its_bytes_not_its_pointer)
     /* No result: nothing allocated. */
     msg.info.task_result.result_data = NULL;
     msg.info.task_result.result_len = 0;
+    free(data);
     ck_assert_ret_ok(generic_msg_to_proto(&msg, &data, &data_len));
     memset(&got, 0, sizeof(got));
     ck_assert_ret_ok(proto_to_generic_msg(data, data_len, &got));
     ck_assert(got.info.task_result.result_data == NULL);
     ck_assert_uint_eq(got.info.task_result.result_len, 0);
+    free(data);
 }
 END_TEST_DEFINITION()
 
@@ -238,7 +243,7 @@ DEFINE_TEST(test_task_result_claiming_more_bytes_than_it_carries_is_dropped)
     head.result_len = 100;
     void *data = NULL;
     size_t data_len = 0;
-    void *raw = smrt_create(sizeof(head));   /* wrap_in_any derefs it */
+    void *raw = malloc(sizeof(head));   /* wrap_in_any frees it */
     ck_assert_ptr_nonnull(raw);
     memcpy(raw, &head, sizeof(head));
     ck_assert_ret_ok(wrap_in_any(TASK_RESULT, raw, sizeof(head), &data,
@@ -247,6 +252,7 @@ DEFINE_TEST(test_task_result_claiming_more_bytes_than_it_carries_is_dropped)
     memset(&got, 0, sizeof(got));
     ck_assert(proto_to_generic_msg(data, data_len, &got) != 0);
     ck_assert(got.info.task_result.result_data == NULL);
+    free(data);
 }
 END_TEST_DEFINITION()
 

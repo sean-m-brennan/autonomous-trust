@@ -522,6 +522,24 @@ int process_setup(process_t *proc, queue_id_t signal, logger_t *logger,
     return 0;
 }
 
+/* smrt finalizer for a process_loop stash entry: the heap fields the copy
+ * took over from the receive buffer (as messaging_recv_release frees them,
+ * without its memset of a whole generic_msg_t this block is shorter than),
+ * then the block. */
+static void stashed_msg_dtor(void *ptr)
+{
+    data_t *dat = ptr;
+    generic_msg_t *msg = dat->obj;
+    if (msg->type == NET_MESSAGE) {
+        free(msg->info.net_msg.function);
+        free(msg->info.net_msg.obj);
+    } else if (msg->type == TASK_RESULT) {
+        free(msg->info.task_result.result_data);
+    }
+    free(msg);
+    dat->obj = NULL;
+}
+
 /* Frama-C: skipped —
  * [func-ptr] run_message_handlers dispatches via msg_handler_t [syscall] keep_running
  * reads from IPC message queue [solver-timeout] process_init/setup/start/loop/run:
@@ -567,22 +585,35 @@ int process_loop(process_t *proc, directory_t *queues, logger_t *logger,
                                  buf.info.net_msg.function,
                                  "unhandled", "proc", proc->name, NULL);
             }
+            /* The stash keeps the type beside the payload so its finalizer
+             * knows which heap fields the copy owns. Only the payload's
+             * message_size() bytes are allocated, not all of info. */
             size_t size = message_size(buf.type);
-            void *msg = smrt_create(size);
+            generic_msg_t *msg = calloc(1, offsetof(generic_msg_t, info) + size);
             if (msg == NULL)
             {
                 log_debug(proc->logger, "%s: skipping unhandled message type %ld\n", proc->name, buf.type);
                 continue;
             }
-            memcpy(msg, &buf.info, size);
+            msg->type = buf.type;
+            memcpy(&msg->info, &buf.info, size);
+            data_t *m_dat = object_ptr_data(msg, size);
+            if (m_dat == NULL)
+            {
+                free(msg);   /* buf keeps its fields; the release below frees them */
+                continue;
+            }
+            m_dat->dtor = stashed_msg_dtor;
             /* The stashed copy owns the payload now: keep the release at the
              * top of the next pass from freeing it under the stash. */
             if (buf.type == NET_MESSAGE) {
                 buf.info.net_msg.function = NULL;
                 buf.info.net_msg.obj = NULL;
+            } else if (buf.type == TASK_RESULT) {
+                buf.info.task_result.result_data = NULL;
             }
-            data_t *m_dat = object_ptr_data(msg, size);
-            array_append(&unprocessed, m_dat);
+            if (array_append(&unprocessed, m_dat) != 0)
+                smrt_deref(m_dat);
         }
         // Hook point for sub-process specific post-message activity (e.g. periodic tasks)
     }

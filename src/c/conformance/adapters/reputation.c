@@ -509,11 +509,13 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
                     const uuid_t *su = _uuid_of(ctx, json_string_value(
                         json_object_get(e, "subject")));
                     if (vu != NULL && su != NULL)
-                        reputation_install_tx_attested(*vu,
+                        reputation_install_tx_attested_scoped(*vu,
                             json_number_value(json_object_get(e, "p1_score")),
                             json_string_value(json_object_get(e, "p1_channel")),
                             *su,
-                            json_string_value(json_object_get(e, "evidence_digest")));
+                            json_string_value(json_object_get(e, "evidence_digest")),
+                            json_string_value(json_object_get(e, "attest_scope")),
+                            NULL);
                     continue;
                 }
                 if (slug == NULL || p1_id == NULL) continue;
@@ -905,6 +907,18 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         json_object_set_new(body, "id1", json_integer(id1));
         json_object_set_new(body, "id2", json_integer(id2));
         json_object_set_new(body, "peer_uuid", json_string(proposer_str));
+        /* The fork probe's head (ISSUES §2.51): a literal, or "own" for the
+         * acceptor's own head (the global chain, one per binary here). */
+        const char *head = (strcmp(function, REP_PROTO_REQUEST) == 0 && payload)
+            ? json_string_value(json_object_get(payload, "head")) : NULL;
+        char own[TX_HASH_HEX_LEN + 1];
+        if (head != NULL && strcmp(head, "own") == 0)
+        {
+            (void)reputation_head_hash(own, sizeof(own));
+            head = own;
+        }
+        if (head != NULL)
+            json_object_set_new(body, "head", json_string(head));
         /* signed: true -- an acceptance in a group that declares commit
          * certificates carries the acceptor's real signature over the half's
          * commit_designation (doc/architecture/reputation.md, "Commit certificates"), as handle_transaction
@@ -1224,10 +1238,13 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         const char *channel = "probe";
         const char *digest =
             "abababababababababababababababababababababababababababababababab";
+        const char *scope = NULL;
         double score = 0.3;
         if (payload && json_is_object(payload))
         {
             json_t *j = json_object_get(payload, "verifier");
+            if (json_is_string(json_object_get(payload, "scope")))
+                scope = json_string_value(json_object_get(payload, "scope"));
             if (json_is_string(j)) verifier_pid = json_string_value(j);
             j = json_object_get(payload, "subject");
             if (json_is_string(j)) subject_pid = json_string_value(j);
@@ -1253,13 +1270,14 @@ static int _build_inbound(sce_run_ctx_t *ctx,
         uuid_t tk;
         tx_attest_task_uuid(*vu, *su, digest, tk);
         uuid_unparse_lower(tk, t_str);
-        /* "AT-ATTEST\0" verifier|subject|task|%.17g|channel|digest */
+        /* "AT-ATTEST\0" verifier|subject|task|%.17g|channel|digest[|scope] */
         uint8_t desig[RP_DESIG_MAX];
         static const char tag[] = "AT-ATTEST";
         size_t dlen = 0;
         int n = snprintf((char *)desig + sizeof(tag), sizeof(desig) - sizeof(tag),
-                         "%s|%s|%s|%.17g|%s|%s", v_str, s_str, t_str, score,
-                         channel, digest);
+                         "%s|%s|%s|%.17g|%s|%s%s%s", v_str, s_str, t_str, score,
+                         channel, digest, scope != NULL ? "|" : "",
+                         scope != NULL ? scope : "");
         if (n > 0 && (size_t)n < sizeof(desig) - sizeof(tag))
         {
             memcpy(desig, tag, sizeof(tag));
@@ -1281,6 +1299,8 @@ static int _build_inbound(sce_run_ctx_t *ctx,
                              "verifier_uuid", v_str, "subject_uuid", s_str,
                              "score", score, "channel", channel,
                              "evidence_digest", digest, "group_uuid", "");
+            if (scope != NULL)
+                json_object_set_new(body, "attest_scope", json_string(scope));
             if (strcmp(function, REP_PROTO_ATTEST_FINAL) == 0)
                 json_object_set_new(body, "sigs",
                     _rp_cosignatures(ctx, payload, desig, dlen, subject_pid));

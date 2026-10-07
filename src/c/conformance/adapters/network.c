@@ -898,7 +898,7 @@ cleanup:
     if (ident != NULL) identity_free(ident);
     /* pub_copy and pb_buf are smrt_ptrs; smrt_deref releases them. */
     if (pub != NULL) smrt_deref(pub);
-    if (pb_buf != NULL) smrt_deref(pb_buf);
+    if (pb_buf != NULL) free(pb_buf);   /* peer_to_proto: plain malloc */
     return rc;
 }
 
