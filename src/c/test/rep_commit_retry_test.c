@@ -21,7 +21,8 @@
  *  it the half is gone; and a round nobody answers gets no nack, so the nack
  *  retry never fires. Partition cohort part-3490610 lost island B's app
  *  reaction the first way. _retry_uncommitted_halves re-proposes either, keyed
- *  by task. The fixture is rep_paxos_round_test.c's (that file is at the
+ *  by task, and parks what outlives the retries until the chain grows from a
+ *  peer (§2.60). The fixture is rep_paxos_round_test.c's (that file is at the
  *  RUN_TESTS cap). Mirrors tests/a_unit/test_repprocess_commit_retry.py.
  */
 
@@ -313,18 +314,106 @@ DEFINE_TEST(test_an_unanswered_round_is_re_proposed_and_its_ballot_retired)
 END_TEST_DEFINITION()
 
 /* Bounded: a half that never lands is re-proposed REP_COMMIT_RETRIES (5)
- * times, then given up. It does not churn the group forever. */
-DEFINE_TEST(test_retries_are_bounded)
+ * times, then PARKED (§2.60), not dropped and not churned every 15 s. */
+DEFINE_TEST(test_an_exhausted_half_is_parked_not_dropped)
 {
     _begin();
     cohort_t c;
     _cohort(&c);
     _propose(&c);
     g_request_count = 0;
-    for (int i = 1; i <= 8; i++)
+    for (int i = 1; i <= 6; i++)
         _retry_uncommitted_halves(c.proc, LATER(i));
-    /* Five re-proposals, two peers asked each time. */
+    /* Five re-proposals, two peers asked each time; the sixth pass parks. */
     ck_assert_uint_eq(g_request_count, 10);
+    ck_assert_uint_eq(reputation_awaiting_commit_count(), 1);
+    ck_assert_uint_eq(reputation_parked_count(), 1);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* Park the half, as the minority side of a partition does: five unanswered
+ * re-proposals, parked on the sixth pass at LATER(6). */
+static void _park(cohort_t *c)
+{
+    _propose(c);
+    for (int i = 1; i <= 6; i++)
+        _retry_uncommitted_halves(c->proc, LATER(i));
+    ck_assert_uint_eq(reputation_parked_count(), 1);
+    g_request_count = 0;
+}
+
+/* A parked half is re-proposed once every REP_PARK_RETRY (120 s), and stays
+ * parked: the 15 s churn does not restart. */
+DEFINE_TEST(test_a_parked_half_is_re_proposed_every_park_retry)
+{
+    _begin();
+    cohort_t c;
+    _cohort(&c);
+    _park(&c);
+    _retry_uncommitted_halves(c.proc, LATER(7));      /* 60 s parked */
+    ck_assert_uint_eq(g_request_count, 0);
+    _retry_uncommitted_halves(c.proc, LATER(8));      /* 120 s: due */
+    ck_assert_uint_eq(g_request_count, 2);
+    ck_assert_uint_eq(reputation_parked_count(), 1);
+    _retry_uncommitted_halves(c.proc, LATER(9));      /* 60 s after that */
+    ck_assert_uint_eq(g_request_count, 2);
+    _retry_uncommitted_halves(c.proc, LATER(10));
+    ck_assert_uint_eq(g_request_count, 4);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* THE HEAL (§2.60): the minority's chain is a strict prefix of the majority's,
+ * so the heal arrives as an EXTENDED catch-up. That wakes the parked half at
+ * once rather than at its next slow retry. */
+DEFINE_TEST(test_a_grown_chain_wakes_parked_halves)
+{
+    _begin();
+    cohort_t c;
+    _cohort(&c);
+    _park(&c);
+
+    /* The majority committed an unrelated task between alice and bob. */
+    tx_history_t theirs;
+    ck_assert_ret_ok(tx_history_init(&theirs));
+    uuid_t other;
+    uuid_generate(other);
+    ck_assert_ret_ok(tx_history_update(&theirs, other, c.alice->uuid, 0.8, NULL));
+    ck_assert_ret_ok(tx_history_update(&theirs, other, c.bob->uuid, 0.7, NULL));
+    json_t *chain = NULL;
+    ck_assert_ret_ok(tx_history_era_to_json(&theirs, 0, tx_history_len(&theirs),
+                                            &chain));
+    _dispatch(c.proc, c.alice, REP_PROTO_UPDATE, chain);
+    json_decref(chain);
+    tx_history_free(&theirs);
+
+    /* LATER(7) is 60 s before the slow retry: only the wake makes it due. */
+    _retry_uncommitted_halves(c.proc, LATER(7));
+    ck_assert_uint_eq(g_request_count, 2);
+    ck_assert_uint_eq(reputation_parked_count(), 1);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* A parked half is given up after REP_PARK_TTL (a day), and one that turns
+ * up in the chain meanwhile is forgotten. */
+DEFINE_TEST(test_a_parked_half_expires_or_is_forgotten)
+{
+    _begin();
+    cohort_t c;
+    _cohort(&c);
+    _park(&c);
+    _retry_uncommitted_halves(c.proc, LATER(6) + 86400.0 + 60.0);
+    ck_assert_uint_eq(g_request_count, 0);
+    ck_assert_uint_eq(reputation_awaiting_commit_count(), 0);
+
+    uuid_generate(c.task);
+    uuid_unparse_lower(c.task, c.task_str);
+    _park(&c);
+    reputation_install_tx_single(c.task, c.me->uuid, 0.9);
+    _retry_uncommitted_halves(c.proc, LATER(8));
+    ck_assert_uint_eq(g_request_count, 0);
     ck_assert_uint_eq(reputation_awaiting_commit_count(), 0);
     _end();
 }
@@ -352,5 +441,8 @@ RUN_TESTS(RepCommitRetry,
           test_a_granted_round_that_never_commits_is_re_proposed,
           test_a_committed_half_is_left_alone,
           test_an_unanswered_round_is_re_proposed_and_its_ballot_retired,
-          test_retries_are_bounded,
+          test_an_exhausted_half_is_parked_not_dropped,
+          test_a_parked_half_is_re_proposed_every_park_retry,
+          test_a_grown_chain_wakes_parked_halves,
+          test_a_parked_half_expires_or_is_forgotten,
           test_a_half_already_in_the_chain_is_forgotten)

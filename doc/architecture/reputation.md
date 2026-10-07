@@ -756,6 +756,28 @@ forgotten. A repeat cannot fork the round, because the task id is derived from
 (verifier, subject, evidence digest): it is the same round, and a co-signer signs
 the same designation again (ISSUES §2.40).
 
+**Teammates do not witness for each other.** An application may know that
+several nodes act for one team: Stele does, from a team roster the team's root
+key signs and every listed node consents to with its own key. It writes those
+teams to `etc/at/attest_conflicts.cfg.json` as `{"teams": [[uuid, ...], ...]}`,
+and reputation re-reads the file when it changes. Two nodes in one team are
+*conflicted*. A conflicted node does not co-sign an attestation about its
+teammate ("not co-signing an attestation about a teammate"), and no node vouches
+for a verifier that is the subject's teammate ("verifier is a teammate of the
+subject"). The quorum is a strict majority of the members other than the subject
+**and** its teammates, and at least two signatures once any teammate is left
+out. A team that held most of a group could otherwise starve every finding about
+itself by declining, or certify its own release through one accommodating
+verifier. The durable record lists the teammates the writing node left out as
+`excluded`, for information only: `verify_attested_record(..., exclude=)` takes
+the reader's own list, because a forger would name the outsiders there. Without
+the file nothing changes. The file is not verified here, any more than
+`package_hashes.cfg.json` is; every node must hold the same teams, which Stele
+arranges by distributing the roster (ISSUES §2.54). An application must only
+ever add to the set. If it removed a former teammate, older certificates
+would be recounted against a larger outside quorum and fall short wherever
+they were re-checked. Stele therefore keeps every node a team has ever listed.
+
 **What outlives the window.** The resident window holds 200 entries and the
 evidence file is rewritten at every checkpoint, so on a busy group both lose an
 attested entry within minutes, while an application may need to show the
@@ -1206,9 +1228,17 @@ our half clears it. The process loop's `_retry_uncommitted_halves` re-proposes
 any half not in the chain `AT_REP_COMMIT_TIMEOUT_SEC` (default 15 s) after its
 last proposal. It first retires any round still filed for the task, so a late
 grant cannot race the fresh ballot, and logs `our half of task T is not in the
-chain after N s; re-proposing it (attempt k of 5)`. After five re-proposals it
-warns and gives up. A half found in any chain, including one adopted, is
-forgotten without a re-proposal. Pinned by `rep_commit_retry_test` and
+chain after N s; re-proposing it (attempt k of 5)`. A half found in any chain,
+including one adopted, is forgotten without a re-proposal.
+
+**What outlives the retries is parked, not dropped** (2026-10-07, ISSUES
+§2.60). The usual reason is that no majority is reachable, as on the minority
+side of a partition, which cannot commit at all. After five re-proposals the
+half is parked (`… has no quorum after 5 re-proposal(s); parking it …`). It is
+re-proposed on the next pass after a chain update from a peer ends adopted or
+extended, which is how the minority's heal arrives. Otherwise it is
+re-proposed every `AT_REP_PARK_RETRY_SEC` (default 120 s), and given up after
+`AT_REP_PARK_TTL_SEC` (default one day). Parked halves are not persisted. Pinned by `rep_commit_retry_test` and
 `test_repprocess_commit_retry.py`.
 
 **A member co-signs the proposed range, and signs late rather than never**

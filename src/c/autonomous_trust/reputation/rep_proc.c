@@ -14,6 +14,7 @@
  *   limitations under the License.
  *******************/
 
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
@@ -37,6 +38,7 @@
 #include "network/net_message.h"
 #include "identity/identity_priv.h"   /* public_identity_to/from_json, unhexlify */
 #include "identity/id_ext.h"   /* identity_ext_credential_anchored */
+#include "identity/id_proc_priv.h"   /* identity_self_identity */
 #include "config/configuration.h"   /* get_cfg_dir, CFG_PATH_LEN */
 #include "config/discover.h"        /* CFG_FILE_EXT */
 #include "reputation/rep_ext.h"   /* extensions' trust seeds */
@@ -139,6 +141,20 @@ static double _tier_ceiling(int tier)
     (reputation_env_double("AT_REP_COMMIT_TIMEOUT_SEC", \
                            REP_COMMIT_TIMEOUT_DEFAULT))
 #define REP_COMMIT_RETRIES 5
+/* A half that used up its REP_COMMIT_RETRIES is PARKED, not dropped (ISSUES
+ * §2.60). A minority island cannot commit since §2.13's majority rule, and it
+ * waits out a partition far longer than five retries; dropped, its halves
+ * never reached the healed chain, since only a COMMITTED entry is re-proposed
+ * after an adoption (_repropose_dropped). A parked half is re-proposed when
+ * the chain grows from a peer (_wake_parked_locked), and otherwise every
+ * REP_PARK_RETRY seconds, until REP_PARK_TTL. Mirrors Python PARK_RETRY /
+ * AT_REP_PARK_RETRY_SEC and PARK_TTL / AT_REP_PARK_TTL_SEC. */
+#define REP_PARK_RETRY_DEFAULT 120.0
+#define REP_PARK_RETRY \
+    (reputation_env_double("AT_REP_PARK_RETRY_SEC", REP_PARK_RETRY_DEFAULT))
+#define REP_PARK_TTL_DEFAULT 86400.0
+#define REP_PARK_TTL \
+    (reputation_env_double("AT_REP_PARK_TTL_SEC", REP_PARK_TTL_DEFAULT))
 
 /* How long a verifier's attestation round may stay short of a quorum before
  * its propose goes out again, and how many times (ISSUES §2.40). The propose is
@@ -219,6 +235,9 @@ static bool _is_bilateral_locked(const tx_history_t *chain,
 static uuid_t *_chain_peers_locked(size_t *n_out);
 static int _repropose_dropped(const process_t *proc,
                               const tx_reconcile_result_t *res);
+/* Forward declaration: makes every parked half due after the chain grew
+ * from a peer (ISSUES §2.60). Defined beside awaiting_commit's helpers. */
+static void _wake_parked(const process_t *proc, const char *source);
 /* Verifier-attested scores: defined with the rest of the round, below. */
 /* Longest designation: tag + 2 uuids (or uuid + 64-hex root) + reason +
  * fixed-form floor + three integers, plus separators. 512 is generous. */
@@ -348,6 +367,7 @@ typedef struct {
     double competence;
     double deadline;
     int    attempts;     /* re-proposals so far */
+    double parked_at;    /* when the retries ran out (§2.60); 0 = not parked */
 } rep_awaiting_t;
 
 /* A checkpoint proposal parked for a later co-sign (ISSUES §2.29). Everything
@@ -3393,6 +3413,11 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
             _repropose_dropped(proc, &res);
             _reappend_attested(proc, &res);
         }
+        /* A chain that grew from a peer means a quorum may be back: the
+         * minority side of a heal arrives here EXTENDED (§2.60). */
+        if (res.status == TX_RECONCILE_ADOPTED
+            || res.status == TX_RECONCILE_EXTENDED)
+            _wake_parked(proc, nmsg->from_whom.nickname);
         tx_reconcile_result_free(&res);
         return true;
     }
@@ -3487,6 +3512,9 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
         _repropose_dropped(proc, &maj_res);
         _reappend_attested(proc, &maj_res);
     }
+    if (maj_res.status == TX_RECONCILE_ADOPTED
+        || maj_res.status == TX_RECONCILE_EXTENDED)
+        _wake_parked(proc, "the majority chain");
     tx_reconcile_result_free(&maj_res);
     return true;
 }
@@ -4124,8 +4152,10 @@ static void _await_commit_locked(const tx_score_t *tx, const uuid_t proposer)
         data_object_ptr(dat, (void **)&w);
     if (w != NULL) {
         /* A re-proposal (ours, a nack retry, or a DDIL one): same task, so
-         * the attempt count carries on and only the clock restarts. */
-        w->deadline = deadline;
+         * the attempt count carries on and only the clock restarts. A parked
+         * half keeps the park's slower clock (§2.60). */
+        w->deadline = w->parked_at > 0
+            ? (double)time(NULL) + REP_PARK_RETRY : deadline;
         return;
     }
     w = smrt_create(sizeof(rep_awaiting_t));
@@ -4140,6 +4170,7 @@ static void _await_commit_locked(const tx_score_t *tx, const uuid_t proposer)
     w->competence = tx->competence;
     w->deadline = deadline;
     w->attempts = 0;
+    w->parked_at = 0;
     data_t *wd = object_ptr_data(w, sizeof(rep_awaiting_t));
     if (wd == NULL || map_set(&rep_state.awaiting_commit, task_str, wd) != 0)
         smrt_deref(w);
@@ -4189,6 +4220,58 @@ size_t reputation_awaiting_commit_count(void)
     size_t n = map_size(&rep_state.awaiting_commit);
     pthread_mutex_unlock(&rep_state.lock);
     return n;
+}
+
+/* How many of the halves in awaiting_commit are parked (§2.60). */
+size_t reputation_parked_count(void)
+{
+    size_t n = 0;
+    pthread_mutex_lock(&rep_state.lock);
+    map_key_t key = NULL;
+    data_t *value = NULL;
+    map_entries_for_each(&rep_state.awaiting_commit, key, value)
+    {
+        rep_awaiting_t *w = NULL;
+        if (data_object_ptr(value, (void **)&w) == 0 && w != NULL
+            && w->parked_at > 0)
+            n++;
+    }
+    map_end_for_each;
+    pthread_mutex_unlock(&rep_state.lock);
+    return n;
+}
+
+/* The chain just grew from a peer, so a quorum may be reachable again: make
+ * every parked half due on the next pass (§2.60). Returns how many. Caller
+ * holds rep_state.lock. */
+static size_t _wake_parked_locked(void)
+{
+    size_t n = 0;
+    map_key_t key = NULL;
+    data_t *value = NULL;
+    map_entries_for_each(&rep_state.awaiting_commit, key, value)
+    {
+        rep_awaiting_t *w = NULL;
+        if (data_object_ptr(value, (void **)&w) == 0 && w != NULL
+            && w->parked_at > 0) {
+            w->deadline = 0;
+            n++;
+        }
+    }
+    map_end_for_each;
+    return n;
+}
+
+/* _wake_parked_locked from outside the lock, said out loud when it woke any. */
+static void _wake_parked(const process_t *proc, const char *source)
+{
+    pthread_mutex_lock(&rep_state.lock);
+    size_t n = _wake_parked_locked();
+    pthread_mutex_unlock(&rep_state.lock);
+    if (n > 0)
+        log_info(proc->logger,
+                 "Reputation: chain grew from %s; re-proposing %zu parked "
+                 "half(s)\n", source != NULL ? source : "a peer", n);
 }
 
 void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
@@ -4521,23 +4604,6 @@ static json_t *_load_pending_locked(map_t *pending, const char *key)
     return json_loads(text, 0, &err);
 }
 
-/* Self identity (with the private signing key) out of proc->configs — the same
- * access path _resolve_self_uuid, net_proc.c and zta_process.c use. */
-static const identity_t *_resolve_self_identity(const process_t *proc)
-{
-    if (proc == NULL || proc->configs == NULL)
-        return NULL;
-    data_t *id_dat = NULL;
-    char id_key[] = "identity";
-    if (map_get(proc->configs, id_key, &id_dat) != 0 || id_dat == NULL)
-        return NULL;
-    config_t *id_cfg = NULL;
-    if (data_object_ptr(id_dat, (void **)&id_cfg) != 0 || id_cfg == NULL
-        || id_cfg->data_struct == NULL)
-        return NULL;
-    return (const identity_t *)id_cfg->data_struct;
-}
-
 /* Canonical bytes a slash co-signer signs. MUST stay byte-identical to
  * Python SlashAttestation.designation:
  *   "AT-SLASH\0" slasher "|" target "|" reason "|" %.6f floor "|" epoch
@@ -4564,7 +4630,7 @@ static size_t _slash_designation(const char *slasher, const char *target,
 static int _cosign_hex(const process_t *proc, const uint8_t *desig,
                        size_t dlen, char *hex_out, size_t hex_cap)
 {
-    const identity_t *self = _resolve_self_identity(proc);
+    const identity_t *self = identity_self_identity(proc);
     if (self == NULL || desig == NULL || dlen == 0
         || hex_cap < REP_SIG_HEX_LEN + 1)
         return -1;
@@ -4586,7 +4652,7 @@ static bool _cosigner_pubkey(const process_t *proc, const char *voter_str,
 {
     if (proc == NULL || voter_str == NULL || out == NULL)
         return false;
-    const identity_t *self = _resolve_self_identity(proc);
+    const identity_t *self = identity_self_identity(proc);
     if (self != NULL)
     {
         char self_str[UUID_STRING_LEN + 1];
@@ -4858,7 +4924,7 @@ static void _drop_cosigs_locked(map_t *sigs, const char *round_key)
         if (strncmp(k, round_key, prefix_len) == 0 && k[prefix_len] == ':')
             map_remove(sigs, k);
     }
-    array_free(keys);
+    /* keys is the map's own key index (map_keys): not ours to free */
 }
 
 /****************************
@@ -5048,7 +5114,7 @@ static bool _is_member(const process_t *proc, const char *uuid_str)
 {
     if (proc == NULL || uuid_str == NULL)
         return false;
-    const identity_t *self = _resolve_self_identity(proc);
+    const identity_t *self = identity_self_identity(proc);
     if (self != NULL)
     {
         char me[UUID_STRING_LEN + 1];
@@ -5070,12 +5136,215 @@ static bool _is_member(const process_t *proc, const char *uuid_str)
 
 static bool _is_self(const process_t *proc, const char *uuid_str)
 {
-    const identity_t *self = _resolve_self_identity(proc);
+    const identity_t *self = identity_self_identity(proc);
     if (self == NULL || uuid_str == NULL)
         return false;
     char me[UUID_STRING_LEN + 1];
     uuid_unparse_lower(self->uuid, me);
     return strcmp(me, uuid_str) == 0;
+}
+
+/****************************
+ * Conflicted co-signers (ISSUES §2.54, doc/architecture/reputation.md,
+ * "Teammates do not witness for each other").
+ *
+ * An application that knows which nodes act for one team (Stele, from a team
+ * roster whose every member consented with its own key) writes them to
+ * etc/at/attest_conflicts.cfg.json as {"teams": [[uuid, ...], ...]}. Two nodes
+ * in one team are CONFLICTED. A conflicted node does not co-sign an attestation
+ * about its teammate, does not verify one about it, and does not count toward
+ * its quorum, which is a strict majority of the members other than the subject
+ * AND its teammates, and never fewer than two signatures once any teammate is
+ * left out. Without the file nothing changes.
+ *
+ * The file is the application's, re-read when it changes; nothing in it is
+ * verified here, as nothing in package_hashes.cfg.json is. Mirrors Python
+ * repprocess._attest_conflicts / _conflicted.
+ ****************************/
+#define REP_CONFLICTS_FILE "attest_conflicts.cfg.json"
+
+static pthread_mutex_t _conflicts_lock = PTHREAD_MUTEX_INITIALIZER;
+static json_t *_conflicts_teams = NULL;       /* owned; NULL = none */
+static json_t *_conflicts_override = NULL;    /* owned; tests and adapters */
+static bool _conflicts_loaded = false;
+static time_t _conflicts_mtime = 0;
+static off_t _conflicts_size = -1;
+
+/* {"teams": [[uuid, ...], ...]} with every uuid a string, or NULL. */
+static json_t *_conflicts_parse(json_t *doc)
+{
+    json_t *teams = json_is_object(doc) ? json_object_get(doc, "teams") : NULL;
+    if (!json_is_array(teams))
+        return NULL;
+    size_t i, j;
+    json_t *team, *u;
+    json_array_foreach(teams, i, team)
+    {
+        if (!json_is_array(team))
+            return NULL;
+        json_array_foreach(team, j, u)
+            if (!json_is_string(u))
+                return NULL;
+    }
+    return json_incref(teams);
+}
+
+/* Re-read the file when it changed. Caller holds _conflicts_lock. */
+static void _conflicts_refresh_locked(void)
+{
+    if (_conflicts_override != NULL)
+        return;
+    char cfg_dir[CFG_PATH_LEN + 1] = {0};
+    if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) < 0)
+        return;
+    char path[CFG_PATH_LEN + 64];
+    snprintf(path, sizeof(path), "%s/%s", cfg_dir, REP_CONFLICTS_FILE);
+    struct stat st;
+    if (stat(path, &st) != 0)
+    {
+        json_decref(_conflicts_teams);
+        _conflicts_teams = NULL;
+        _conflicts_loaded = true;
+        _conflicts_size = -1;
+        return;
+    }
+    if (_conflicts_loaded && st.st_mtime == _conflicts_mtime
+        && st.st_size == _conflicts_size)
+        return;
+    json_t *doc = json_load_file(path, 0, NULL);
+    json_decref(_conflicts_teams);
+    _conflicts_teams = _conflicts_parse(doc);
+    json_decref(doc);
+    _conflicts_loaded = true;
+    _conflicts_mtime = st.st_mtime;
+    _conflicts_size = st.st_size;
+}
+
+static json_t *_conflicts_current_locked(void)
+{
+    _conflicts_refresh_locked();
+    return _conflicts_override != NULL ? _conflicts_override : _conflicts_teams;
+}
+
+int reputation_set_attest_conflicts(const char *json_text)
+{
+    json_t *teams = NULL;
+    if (json_text != NULL)
+    {
+        json_t *doc = json_loads(json_text, 0, NULL);
+        teams = _conflicts_parse(doc);
+        json_decref(doc);
+        if (teams == NULL)
+            return -1;
+    }
+    pthread_mutex_lock(&_conflicts_lock);
+    json_decref(_conflicts_override);
+    _conflicts_override = teams;
+    _conflicts_loaded = false;
+    pthread_mutex_unlock(&_conflicts_lock);
+    return 0;
+}
+
+static int _cmp_cstr(const void *x, const void *y)
+{
+    return strcmp(*(const char *const *)x, *(const char *const *)y);
+}
+
+/* Sort a JSON array of strings in place. */
+static void _json_sort_strings(json_t *arr)
+{
+    size_t n = json_array_size(arr);
+    if (n < 2)
+        return;
+    json_t *copy = json_deep_copy(arr);
+    const char **v = calloc(n, sizeof(*v));
+    if (copy == NULL || v == NULL)
+    {
+        free(v);
+        json_decref(copy);
+        return;
+    }
+    for (size_t i = 0; i < n; i++)
+        v[i] = json_string_value(json_array_get(copy, i));
+    qsort(v, n, sizeof(*v), _cmp_cstr);
+    json_array_clear(arr);
+    for (size_t i = 0; i < n; i++)
+        json_array_append_new(arr, json_string(v[i]));
+    free(v);
+    json_decref(copy);
+}
+
+static bool _team_has(json_t *team, const char *uuid_str)
+{
+    size_t k;
+    json_t *u;
+    json_array_foreach(team, k, u)
+        if (strcmp(json_string_value(u), uuid_str) == 0)
+            return true;
+    return false;
+}
+
+/* Are @p a and @p b two different nodes of one team? */
+static bool _conflicted(const char *a, const char *b)
+{
+    if (a == NULL || b == NULL || strcmp(a, b) == 0)
+        return false;
+    bool hit = false;
+    pthread_mutex_lock(&_conflicts_lock);
+    json_t *teams = _conflicts_current_locked();
+    size_t i;
+    json_t *team;
+    json_array_foreach(teams, i, team)
+        if (_team_has(team, a) && _team_has(team, b))
+        {
+            hit = true;
+            break;
+        }
+    pthread_mutex_unlock(&_conflicts_lock);
+    return hit;
+}
+
+bool reputation_attest_conflicted(const char *a, const char *b)
+{
+    return _conflicted(a, b);
+}
+
+/* The members of our roster conflicted with @p subject, counted, and appended
+ * to @p out (uuid strings, sorted) when it is not NULL. Caller must NOT hold
+ * the peers lock. */
+static size_t _conflicted_members(const process_t *proc, const char *subject,
+                                  json_t *out)
+{
+    json_t *mates = json_array();
+    pthread_mutex_lock(&_conflicts_lock);
+    json_t *teams = _conflicts_current_locked();
+    size_t i, k;
+    json_t *team, *u;
+    json_array_foreach(teams, i, team)
+    {
+        if (!_team_has(team, subject))
+            continue;
+        json_array_foreach(team, k, u)
+        {
+            const char *m = json_string_value(u);
+            if (strcmp(m, subject) != 0 && !_team_has(mates, m))
+                json_array_append_new(mates, json_string(m));
+        }
+    }
+    pthread_mutex_unlock(&_conflicts_lock);
+    size_t n = 0;
+    json_array_foreach(mates, k, u)
+    {
+        if (!_is_member(proc, json_string_value(u)))
+            continue;
+        n++;
+        if (out != NULL)
+            json_array_append(out, u);
+    }
+    json_decref(mates);
+    if (out != NULL)
+        _json_sort_strings(out);
+    return n;
 }
 
 /* The verifier's own signature plus a strict majority of the members other
@@ -5096,7 +5365,8 @@ static bool _attest_quorum_met(const process_t *proc, const rep_attest_t *a,
     json_t *val = NULL;
     json_object_foreach(sigs, voter, val)
     {
-        if (strcmp(voter, a->subject) == 0)
+        /* Neither the subject nor its teammates witness for it (§2.54). */
+        if (strcmp(voter, a->subject) == 0 || _conflicted(voter, a->subject))
             continue;
         if (!_verify_cosignature(proc, voter, desig, dlen, json_string_value(val)))
             continue;
@@ -5109,7 +5379,11 @@ static bool _attest_quorum_met(const process_t *proc, const rep_attest_t *a,
     peers_read_lock(proc);
     size_t members = proc->protocol.num_peers + 1;
     peers_read_unlock(proc);
+    size_t mates = _conflicted_members(proc, a->subject, NULL);
     size_t others = members - (_is_member(proc, a->subject) ? 1 : 0);
+    others = others > mates ? others - mates : 0;
+    if (mates > 0 && count < 2)
+        return false;   /* the outsiders left must be at least two */
     return count > others / 2;
 }
 
@@ -5162,6 +5436,13 @@ static bool _attest_admissible(const process_t *proc, const rep_attest_t *a,
     if (!_is_member(proc, a->subject))
     {
         snprintf(why, why_cap, "subject not a member");
+        return false;
+    }
+    /* A teammate's finding about its own team is the team speaking about
+     * itself, which is what an attestation exists to get past (§2.54). */
+    if (_conflicted(a->verifier, a->subject))
+    {
+        snprintf(why, why_cap, "verifier is a teammate of the subject");
         return false;
     }
     /* Eligibility is the verifier's EFFECTIVE tier in this node's view: the
@@ -5422,7 +5703,7 @@ size_t _retry_pending_attestations(const process_t *proc, double present)
             && tx_history_by_task(_chain_for_key_locked(a.group), task_uuid, &held) == 0;
         if (!ok || committed) {
             map_remove(&rep_state.attest_pending, r->task);
-            map_remove(&rep_state.attest_sigs, r->task);
+            _drop_cosigs_locked(&rep_state.attest_sigs, r->task);
             memset(r, 0, sizeof(*r));
             continue;
         }
@@ -5433,7 +5714,7 @@ size_t _retry_pending_attestations(const process_t *proc, double present)
                      "reached a quorum after %d re-proposal(s); abandoning it\n",
                      a.subject, r->attempts);
             map_remove(&rep_state.attest_pending, r->task);
-            map_remove(&rep_state.attest_sigs, r->task);
+            _drop_cosigs_locked(&rep_state.attest_sigs, r->task);
             memset(r, 0, sizeof(*r));
             continue;
         }
@@ -5466,6 +5747,15 @@ size_t reputation_attest_pending_count(void)
     for (int i = 0; i < REP_ATTEST_RETRY_MAX; i++)
         if (rep_state.attest_retries[i].used)
             n++;
+    pthread_mutex_unlock(&rep_state.lock);
+    return n;
+}
+
+size_t reputation_attest_cosig_count(void)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    size_t n = map_size(&rep_state.attest_sigs);
     pthread_mutex_unlock(&rep_state.lock);
     return n;
 }
@@ -5510,6 +5800,19 @@ static bool handle_attest_propose(const process_t *proc, directory_t *queues,
                  "ourselves from %s\n", nmsg->from_whom.nickname);
         return true;
     }
+    {
+        const identity_t *me_id = identity_self_identity(proc);
+        char me_str[UUID_STRING_LEN + 1] = {0};
+        if (me_id != NULL)
+            uuid_unparse_lower(me_id->uuid, me_str);
+        if (me_id != NULL && _conflicted(me_str, a.subject))
+        {
+            /* Our signature would not count (§2.54); say so rather than send it. */
+            log_info(proc->logger, "Reputation: not co-signing an attestation about "
+                     "a teammate from %s\n", nmsg->from_whom.nickname);
+            return true;
+        }
+    }
     char why[128] = {0};
     if (!_attest_admissible(proc, &a, why, sizeof(why)))
     {
@@ -5520,7 +5823,7 @@ static bool handle_attest_propose(const process_t *proc, directory_t *queues,
     uint8_t desig[REP_DESIG_MAX];
     size_t dlen = _attest_designation(&a, desig, sizeof(desig));
     char sig_hex[REP_SIG_HEX_LEN + 1] = {0};
-    const identity_t *self = _resolve_self_identity(proc);
+    const identity_t *self = identity_self_identity(proc);
     if (self == NULL || dlen == 0
         || _cosign_hex(proc, desig, dlen, sig_hex, sizeof(sig_hex)) != 0)
     {
@@ -5608,6 +5911,7 @@ static bool handle_attest_sign(const process_t *proc, directory_t *queues,
     }
     pthread_mutex_lock(&rep_state.lock);
     map_remove(&rep_state.attest_pending, a.task);
+    _drop_cosigs_locked(&rep_state.attest_sigs, a.task);
     _attest_retry_clear_locked(a.task);
     pthread_mutex_unlock(&rep_state.lock);
     _commit_attestation(proc, &a, sigs);
@@ -5840,7 +6144,7 @@ static bool handle_slash_propose(const process_t *proc, directory_t *queues, gen
      * fully identify (no slasher / no reason) cannot be signed — the
      * designation covers both fields — so decline rather than sign different
      * bytes than the proposer will verify. */
-    const identity_t *self = _resolve_self_identity(proc);
+    const identity_t *self = identity_self_identity(proc);
     uint8_t desig[REP_DESIG_MAX];
     size_t dlen = (slasher_str != NULL && propose_reason != NULL)
         ? _slash_designation(slasher_str, target_str, propose_reason, floor,
@@ -6252,7 +6556,7 @@ static bool _cosign_checkpoint(const process_t *proc,
                                int64_t epoch, int64_t first_index,
                                int64_t count_covered, const char *group_raw)
 {
-    const identity_t *self = _resolve_self_identity(proc);
+    const identity_t *self = identity_self_identity(proc);
     uint8_t desig[REP_DESIG_MAX];
     /* Signed over the chain name the PROPOSER used (group_raw), never our
      * locally resolved chain_key -- the proposer verifies this signature
@@ -6774,7 +7078,7 @@ static void _prune_resolve_state(const process_t *proc)
             map_remove(tables[t], key);
             free(ent);
         }
-        array_free(keys);
+        /* keys is the map's own key index (map_keys): not ours to free */
     }
     pthread_mutex_unlock(&rep_state.lock);
 }
@@ -6820,7 +7124,7 @@ static bool _chain_holding_locked(const char *peer_str, char *out, size_t cap)
             }
         }
     }
-    array_free(child_keys);
+    /* child_keys is the map's own key index (map_keys): not ours to free */
     return found;
 }
 
@@ -6862,7 +7166,7 @@ static json_t *_resolve_signers(const process_t *proc, map_t *sigs)
             json_decref(obj);
         peers_read_unlock(proc);
     }
-    array_free(voters);
+    /* voters is the map's own key index (map_keys): not ours to free */
     return arr;
 }
 
@@ -6936,7 +7240,7 @@ static size_t _forward_resolve(const process_t *proc, json_t *query)
         }
         peers_read_unlock(proc);
     }
-    array_free(groups);
+    /* groups is the map's own key index (map_keys): not ours to free */
     json_decref(onward);
     return sent;
 }
@@ -7184,7 +7488,7 @@ static void _accept_resolved(const process_t *proc, const char *peer_str,
             verified_count++;
         }
     }
-    array_free(voters);
+    /* voters is the map's own key index (map_keys): not ours to free */
     rep_checkpoint_free(&ckpt);
     if (verified_count < 1)
     {
@@ -8064,6 +8368,12 @@ static void _archive_attested(const process_t *proc, const char *chain_key)
                 "group_size", (json_int_t)members,
                 "ckpt_group_size", (json_int_t)(roster + 1),
                 "subject_member", _is_member(proc, it->subject));
+            /* The subject's teammates this node left out of the quorum (§2.54).
+             * Informational: a reader verifies against its own team roster. */
+            json_t *excluded = json_array();
+            if (rec != NULL && _conflicted_members(proc, it->subject, excluded) > 0)
+                json_object_set(rec, "excluded", excluded);
+            json_decref(excluded);
             char path[CFG_PATH_LEN + 128], tmp[CFG_PATH_LEN + 136];
             if (rec != NULL && _archive_path(it->task, path, sizeof(path)) == 0)
             {
@@ -8148,7 +8458,7 @@ static void _persist_roster(const process_t *proc, const char *chain_key)
     keys = calloc(cap, sizeof(*keys));
     if (ids != NULL && keys != NULL)
     {
-        const identity_t *self = _resolve_self_identity(proc);
+        const identity_t *self = identity_self_identity(proc);
         if (self != NULL)
         {
             uuid_unparse_lower(self->uuid, ids[n]);
@@ -9234,16 +9544,32 @@ void _retry_nacked_rounds(const process_t *proc, double present,
  * reaching the chain (ISSUES §2.24; see _await_commit_locked). A half now in
  * the chain, by our commit or inside a chain we adopted, is simply forgotten.
  * Any round still filed for the task is retired first, so a late grant for
- * the stale ballot cannot race the fresh one. After REP_COMMIT_RETRIES the
- * half is given up, and that is said out loud. Collect-then-act, like
- * _retry_nacked_rounds: _forward_transaction takes the lock itself. */
+ * the stale ballot cannot race the fresh one.
+ *
+ * After REP_COMMIT_RETRIES the half is PARKED rather than given up (§2.60):
+ * the usual reason a half outlives five retries is that no quorum is
+ * reachable, as on the minority side of a partition, and the heal is when it
+ * can commit. A parked half is re-proposed every REP_PARK_RETRY, or on the
+ * next pass after the chain grows from a peer (_wake_parked_locked), and is
+ * given up only after REP_PARK_TTL. Each step is said out loud.
+ * Collect-then-act, like _retry_nacked_rounds: _forward_transaction takes the
+ * lock itself. */
 #define REP_COMMIT_RETRY_PER_PASS 4
+typedef enum {
+    REP_HALF_REPROPOSE,     /* an active half's next retry */
+    REP_HALF_PARK,          /* its retries ran out: park it */
+    REP_HALF_PARKED_RETRY,  /* a parked half's slow retry, or a wake */
+    REP_HALF_EXPIRE,        /* parked past REP_PARK_TTL: give it up */
+} rep_half_action_t;
+
 void _retry_uncommitted_halves(const process_t *proc, double present)
 {
     rep_awaiting_t due[REP_COMMIT_RETRY_PER_PASS];
+    rep_half_action_t act[REP_COMMIT_RETRY_PER_PASS];
     size_t n_due = 0;
     char gone[REP_COMMIT_RETRY_PER_PASS * 2][UUID_STRING_LEN + 1];
     size_t n_gone = 0;
+    double park_retry = REP_PARK_RETRY, park_ttl = REP_PARK_TTL;
 
     pthread_mutex_lock(&rep_state.lock);
     map_key_t key = NULL;
@@ -9258,17 +9584,37 @@ void _retry_uncommitted_halves(const process_t *proc, double present)
                 at_strlcpy(gone[n_gone++], key, sizeof(gone[0]));
             continue;
         }
-        if (w->deadline > present || n_due >= REP_COMMIT_RETRY_PER_PASS)
+        if (n_due >= REP_COMMIT_RETRY_PER_PASS)
             continue;
+        if (w->parked_at > 0) {
+            if (present - w->parked_at > park_ttl)
+                act[n_due] = REP_HALF_EXPIRE;
+            else if (w->deadline <= present)
+                act[n_due] = REP_HALF_PARKED_RETRY;
+            else
+                continue;
+            due[n_due++] = *w;
+            continue;
+        }
+        if (w->deadline > present)
+            continue;
+        if (w->attempts >= REP_COMMIT_RETRIES) {
+            act[n_due] = REP_HALF_PARK;
+            w->parked_at = present;
+            w->deadline = present + park_retry;
+        } else {
+            act[n_due] = REP_HALF_REPROPOSE;
+        }
         due[n_due++] = *w;
-        w->attempts++;
+        if (act[n_due - 1] == REP_HALF_REPROPOSE)
+            w->attempts++;
     }
     map_end_for_each;
     for (size_t i = 0; i < n_gone; i++)
         map_remove(&rep_state.awaiting_commit, gone[i]);
 
     /* Retire every round still filed for a due task, and the entries of the
-     * halves being given up. */
+     * halves being given up. A half being parked keeps its entry. */
     for (size_t i = 0; i < n_due; i++)
     {
         char task_str[UUID_STRING_LEN + 1];
@@ -9287,7 +9633,7 @@ void _retry_uncommitted_halves(const process_t *proc, double present)
             map_remove(&rep_state.my_requests, stale[j]);
             map_remove(&rep_state.retry_due, stale[j]);
         }
-        if (due[i].attempts >= REP_COMMIT_RETRIES)
+        if (act[i] == REP_HALF_EXPIRE)
             map_remove(&rep_state.awaiting_commit, task_str);
     }
     pthread_mutex_unlock(&rep_state.lock);
@@ -9298,24 +9644,50 @@ void _retry_uncommitted_halves(const process_t *proc, double present)
     {
         char task_str[UUID_STRING_LEN + 1];
         uuid_unparse_lower(due[i].task_uuid, task_str);
-        if (due[i].attempts >= REP_COMMIT_RETRIES) {
+        switch (act[i]) {
+        case REP_HALF_EXPIRE:
             log_warn(proc->logger,
                      "Reputation: our half of task %s never committed after "
-                     "%d re-proposal(s); giving up on it\n",
-                     task_str, due[i].attempts);
+                     "%d re-proposal(s) and %.0f s parked; giving up on it\n",
+                     task_str, due[i].attempts, present - due[i].parked_at);
             continue;
+        case REP_HALF_PARK:
+            log_info(proc->logger,
+                     "Reputation: our half of task %s has no quorum after %d "
+                     "re-proposal(s); parking it until the chain grows from "
+                     "a peer (or every %.0f s)\n",
+                     task_str, due[i].attempts, park_retry);
+            continue;
+        case REP_HALF_PARKED_RETRY:
+            log_info(proc->logger,
+                     "Reputation: re-proposing parked half of task %s\n",
+                     task_str);
+            break;
+        case REP_HALF_REPROPOSE:
+            log_info(proc->logger,
+                     "Reputation: our half of task %s is not in the chain after "
+                     "%.0f s; re-proposing it (attempt %d of %d)\n",
+                     task_str, REP_COMMIT_TIMEOUT, due[i].attempts + 1,
+                     REP_COMMIT_RETRIES);
+            break;
         }
-        log_info(proc->logger,
-                 "Reputation: our half of task %s is not in the chain after "
-                 "%.0f s; re-proposing it (attempt %d of %d)\n",
-                 task_str, REP_COMMIT_TIMEOUT, due[i].attempts + 1,
-                 REP_COMMIT_RETRIES);
         _forward_transaction(proc, due[i].task_uuid, due[i].proposer,
                              due[i].score,
                              due[i].capability_name[0] != '\0'
                                  ? due[i].capability_name : NULL,
                              due[i].channel[0] != '\0' ? due[i].channel : NULL,
                              no_subject, due[i].competence);
+        if (act[i] == REP_HALF_PARKED_RETRY) {
+            /* The next slow retry counts from this pass, whatever clock
+             * _await_commit_locked read. */
+            data_t *dat = NULL;
+            rep_awaiting_t *w = NULL;
+            pthread_mutex_lock(&rep_state.lock);
+            if (map_get(&rep_state.awaiting_commit, task_str, &dat) == 0
+                && data_object_ptr(dat, (void **)&w) == 0 && w != NULL)
+                w->deadline = present + park_retry;
+            pthread_mutex_unlock(&rep_state.lock);
+        }
     }
 }
 
@@ -10120,24 +10492,13 @@ int reputation_get_peer_reputation(const uuid_t peer_uuid, double *out)
 /* Frama-C: skipped — [solver-timeout] state-cascade through paxos_init +
  * process_register_handler stubs prevents WP from discharging
  * valid_rw(proc) and valid_rd(signal) at downstream call sites */
-/* Resolve this node's own identity UUID from the loaded "identity" config.
- * Same access path net_proc.c:1495 and zta_process.c:750 use — proc->configs
- * carries the identity config for every process, so the long-standing
- * "process doesn't carry self identity" comments above are obsolete. Returns
- * true and fills out_uuid on success; false if identity isn't resolvable yet. */
+/* This node's own identity UUID (identity_self_identity). Returns true and
+ * fills out_uuid on success; false if identity isn't resolvable yet. */
 static bool _resolve_self_uuid(const process_t *proc, uuid_t out_uuid)
 {
-    if (proc == NULL || proc->configs == NULL)
+    const identity_t *self = identity_self_identity(proc);
+    if (self == NULL)
         return false;
-    data_t *id_dat = NULL;
-    char id_key[] = "identity";
-    if (map_get(proc->configs, id_key, &id_dat) != 0 || id_dat == NULL)
-        return false;
-    config_t *id_cfg = NULL;
-    if (data_object_ptr(id_dat, (void **)&id_cfg) != 0 || id_cfg == NULL
-        || id_cfg->data_struct == NULL)
-        return false;
-    const identity_t *self = (const identity_t *)id_cfg->data_struct;
     uuid_copy(out_uuid, self->uuid);
     return true;
 }

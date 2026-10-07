@@ -24,6 +24,9 @@
 #include "processes/capabilities_priv.h"
 #include "structures/data_priv.h"
 #include "structures/array_priv.h"
+#include "utilities/msg_types_priv.h"
+#include "utilities/message.h"
+#include "processes/processes.h"
 
 DEFINE_TEST(test_capability_proto_roundtrip)
 {
@@ -160,6 +163,105 @@ DEFINE_TEST(test_peer_capabilities_json_multiple_peers)
 }
 END_TEST_DEFINITION()
 
+/* A heap capability released with smrt_deref takes its arguments map with
+ * it (capability_dtor). A watcher's extra reference on an argument makes the
+ * release observable without reading freed memory. */
+DEFINE_TEST(test_capability_release_frees_its_arguments)
+{
+    capability_t *cap = smrt_create(sizeof(capability_t));
+    ck_assert_ptr_nonnull(cap);
+    cap->dtor = capability_dtor;
+    map_init(&cap->arguments);
+    data_t *arg = integer_data(7);
+    smrt_ref(arg);   /* the watcher's */
+    ck_assert_ret_ok(map_set(&cap->arguments, (char *)"x", arg));
+    ck_assert_uint_eq(((smrt_ptr_t *)arg)->refs, 2);
+    smrt_deref(cap);
+    ck_assert_uint_eq(((smrt_ptr_t *)arg)->refs, 1);
+    smrt_deref(arg);
+}
+END_TEST_DEFINITION()
+
+/* The names in @p m[@p peer], in order, joined by ','. */
+static void _names_of(map_t *m, const char *peer, char *out, size_t len)
+{
+    out[0] = '\0';
+    data_t *dat = NULL;
+    array_t *arr = NULL;
+    if (map_get(m, (map_key_t)peer, &dat) != 0
+        || data_object_ptr(dat, (void **)&arr) != 0 || arr == NULL)
+        return;
+    for (size_t i = 0; i < array_size(arr); i++)
+    {
+        data_t *cd = NULL;
+        capability_t *cap = NULL;
+        ck_assert_ret_ok(array_get(arr, (int)i, &cd));
+        ck_assert_ret_ok(data_object_ptr(cd, (void **)&cap));
+        size_t used = strlen(out);
+        snprintf(out + used, len - used, "%s%s", i ? "," : "", cap->name);
+    }
+}
+
+/* A capability matrix crosses the IPC wire intact (its encoder used to read
+ * through NULL entry pointers), a process adopts the one it receives as its
+ * protocol.peer_capabilities, the next one replaces it, and a received
+ * matrix nobody adopted is released with the message. Run under valgrind,
+ * this is also the ownership check: every matrix here is freed exactly once. */
+DEFINE_TEST(test_capability_matrix_crosses_ipc_and_is_adopted)
+{
+    static const char *const two[] = { "c1", "c2" };
+    static const char *const one[] = { "c3" };
+    generic_msg_t out;
+    memset(&out, 0, sizeof(out));
+    out.type = PEER_CAPABILITIES;
+    ck_assert_ret_ok(map_init(&out.info.peer_capabilities));
+    ck_assert_ret_ok(peer_capabilities_add(&out.info.peer_capabilities, "peer-a", two, 2));
+    ck_assert_ret_ok(peer_capabilities_add(&out.info.peer_capabilities, "peer-b", one, 1));
+
+    void *wire = NULL;
+    size_t wire_len = 0;
+    ck_assert_ret_ok(generic_msg_to_proto(&out, &wire, &wire_len));
+
+    generic_msg_t in;
+    memset(&in, 0, sizeof(in));
+    ck_assert_ret_ok(proto_to_generic_msg(wire, wire_len, &in));
+    ck_assert_int_eq((int)in.type, (int)PEER_CAPABILITIES);
+    char names[64];
+    _names_of(&in.info.peer_capabilities, "peer-a", names, sizeof(names));
+    ck_assert_str_eq(names, "c1,c2");
+    _names_of(&in.info.peer_capabilities, "peer-b", names, sizeof(names));
+    ck_assert_str_eq(names, "c3");
+
+    process_t *proc = calloc(1, sizeof(process_t));
+    ck_assert_ptr_nonnull(proc);
+    strncpy(proc->name, "negotiation", PROC_NAME_LEN);
+    ck_assert(run_message_handlers(proc, NULL, PEER_CAPABILITIES, &in));
+    ck_assert_ptr_nonnull(proc->protocol.peer_capabilities);
+    ck_assert_ptr_null(in.info.peer_capabilities.items);   /* taken */
+    _names_of(proc->protocol.peer_capabilities, "peer-a", names, sizeof(names));
+    ck_assert_str_eq(names, "c1,c2");
+
+    generic_msg_t again;
+    memset(&again, 0, sizeof(again));
+    ck_assert_ret_ok(proto_to_generic_msg(wire, wire_len, &again));
+    peer_capabilities_matrix_t *first = proc->protocol.peer_capabilities;
+    ck_assert(run_message_handlers(proc, NULL, PEER_CAPABILITIES, &again));
+    ck_assert(proc->protocol.peer_capabilities != first);
+
+    generic_msg_t unadopted;
+    memset(&unadopted, 0, sizeof(unadopted));
+    ck_assert_ret_ok(proto_to_generic_msg(wire, wire_len, &unadopted));
+    messaging_recv_release(&unadopted);
+
+    map_free(proc->protocol.peer_capabilities);
+    free(proc);
+    free(wire);
+    map_free(&out.info.peer_capabilities);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(Capabilities3, test_capability_proto_roundtrip,
           test_capability_json_with_arguments,
-          test_peer_capabilities_json_multiple_peers)
+          test_peer_capabilities_json_multiple_peers,
+          test_capability_release_frees_its_arguments,
+          test_capability_matrix_crosses_ipc_and_is_adopted)

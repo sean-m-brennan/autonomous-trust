@@ -102,6 +102,17 @@ class TaskParameters(Configuration):
     def adjust(self):  # tailor to acceptable parameters
         pass
 
+    def extension_seconds(self) -> int:
+        """How far a live status answer moves this task's deadline, and so
+        how long the requestor's deadline sweep waits on one: the timeout,
+        else a fraction of the duration, else ``timeout_extension``. C twin:
+        ``_extension_secs`` (neg_proc.c)."""
+        if self.timeout.total_seconds() > 0:
+            return int(self.timeout.total_seconds())
+        if self.duration.total_seconds() > 0:
+            return int(self.duration.total_seconds() * self.duration_fraction / 100) + 1
+        return self.timeout_extension
+
     @property
     def capability(self):
         return self._capability
@@ -421,6 +432,10 @@ class TaskTracker(Task):
         # Peers whose result has been scored: one score per executor (ISSUES
         # §2.50), and a replayed result is not scored twice.
         self.scored = set()
+        # The deadline sweep's record: status-request rounds sent since the
+        # deadline last moved, and when the latest went out.
+        self.status_asks = 0
+        self.status_asked_at = None
 
 
 class Job(object):

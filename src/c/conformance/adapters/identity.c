@@ -958,6 +958,15 @@ static void _apply_fixtures(sce_run_ctx_t *ctx) {
                     if (json_is_integer(gke))
                         impl->proc->protocol.group.key_epoch =
                             json_integer_value(gke);
+                    /* The group-carried declarations a merge hands from the
+                     * surviving group to the absorbed node. Mirrors the
+                     * Python fixture. */
+                    json_t *gwf = json_object_get(gspec, "wire_format");
+                    if (json_is_string(gwf))
+                        impl->proc->protocol.group.wire_format =
+                            net_wire_format_from_name(json_string_value(gwf));
+                    impl->proc->protocol.group.commit_certificates =
+                        json_is_true(json_object_get(gspec, "commit_certificates"));
                     memcpy(impl->fixture_group_pub,
                            impl->proc->protocol.group.encryptor.public,
                            sizeof(impl->fixture_group_pub));
@@ -3317,6 +3326,27 @@ static int _identity_check_expected_state(sce_run_ctx_t *ctx) {
                 if (got != want) {
                     snprintf(ctx->err, sizeof(ctx->err),
                              "%s: group_owns_private_key=%d, expected %d",
+                             pid, (int)got, (int)want);
+                    return -1;
+                }
+            } else if (strcmp(key, "group_wire_format") == 0) {
+                /* The group-carried envelope format, after any merge. Mirrors
+                 * the Python adapter's group_wire_format. */
+                const char *want = json_string_value(val);
+                const char *got =
+                    net_wire_format_name(proc->protocol.group.wire_format);
+                if (want == NULL || got == NULL || strcmp(got, want) != 0) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: group_wire_format=%s, expected %s", pid,
+                             got ? got : "?", want ? want : "?");
+                    return -1;
+                }
+            } else if (strcmp(key, "group_commit_certificates") == 0) {
+                bool want = json_is_true(val);
+                bool got = proc->protocol.group.commit_certificates;
+                if (got != want) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: group_commit_certificates=%d, expected %d",
                              pid, (int)got, (int)want);
                     return -1;
                 }

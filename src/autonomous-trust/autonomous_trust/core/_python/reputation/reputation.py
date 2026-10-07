@@ -1793,7 +1793,7 @@ def load_anchor(where, min_group=ANCHOR_MIN_GROUP) -> 'dict | None':
     return None
 
 
-def verify_attested_record(record, anchor=None, details=None) \
+def verify_attested_record(record, anchor=None, details=None, exclude=None) \
         -> 'tuple[bool, list[str]]':
     """Check a durable attested record:
 
@@ -1813,6 +1813,13 @@ def verify_attested_record(record, anchor=None, details=None) \
     to a chain it holds a checkpoint for; each quorum is counted against at
     least ``anchor['min_group']``; and when the anchor holds a checkpoint over
     the same window at the same epoch, the roots must match (``linked``).
+
+    ``exclude`` is the READER's own list of the subject's teammates (ISSUES
+    §2.54; Stele takes it from a team roster it verified). Their signatures do
+    not count, the attestation quorum is a strict majority of the members
+    other than the subject and them, and at least two signatures are needed.
+    The record's own ``excluded`` list is never read, since a forger would
+    name the outsiders there.
 
     Returns ``(ok, reasons)``; ``reasons`` names every check that failed. When
     ``details`` is a dict it receives ``linked`` (bool), ``anchored`` (bool),
@@ -1890,9 +1897,14 @@ def verify_attested_record(record, anchor=None, details=None) \
     voters = _verified(att.designation,
                        record['entry'].get('attest_sigs')) - {str(tx.subject_id)}
     others = group_size - (1 if record.get('subject_member', True) else 0)
+    mates = {str(u) for u in (exclude or ())} - {str(tx.subject_id)}
+    if anchor is not None:
+        mates &= set(anchor['members'])
+    voters -= mates
+    others = max(others - len(mates), 0)
     if str(tx.p1_id) not in voters:
         reasons.append("the verifier's own signature is missing")
-    elif len(voters) <= others // 2:
+    elif len(voters) <= others // 2 or (mates and len(voters) < 2):
         reasons.append('attestation short of a quorum')
     if isinstance(details, dict):
         details.update(linked=linked and not reasons,

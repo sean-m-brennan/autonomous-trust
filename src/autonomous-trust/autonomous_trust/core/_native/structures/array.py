@@ -99,9 +99,9 @@ class Array(collections.abc.MutableSequence):
             index += len(self)
         if index < 0 or index >= len(self):
             raise IndexError(f"array index {index} out of range")
-        elem = ffi.new('data_t **')
-        lib.array_get(self._ptr, index, elem)
-        lib.array_remove(self._ptr, elem[0])
+        # By index: array_remove matches by value and would take the first
+        # equal element instead of this one.
+        lib.array_remove_at(self._ptr, index)
 
     def insert(self, index, value):
         # C array only supports append; for insert at arbitrary position,

@@ -30,7 +30,7 @@
 #include "utilities/exception.h"
 #include "network/net_message.h"
 #include "negotiation/neg_proc_priv.h"
-#include "identity/id_proc_priv.h"  /* identity_get_peer_tier */
+#include "identity/id_proc_priv.h"  /* identity_get_peer_tier, identity_self_identity */
 #include "identity/identity_priv.h"  /* public_identity_to_json */
 #include "utilities/freshness.h"
 #include "utilities/util.h"       /* at_strlcpy */
@@ -89,6 +89,24 @@ static char ID_TIER_LOST[] = "tier_lost";
 #define NEG_TIMEOUT_EXTENSION_SEC 120L
 #define NEG_DURATION_FRACTION_PCT 10L
 
+/* Status-request rounds the deadline sweep sends, without a live answer, before
+ * it gives the task up. Mirrors Python NegotiationProcess.STATUS_ASKS. */
+#define NEG_STATUS_ASKS 3
+
+/* Worker slots: a due job runs on a thread of its own (_drain_task_stack). At
+ * most max_concurrency are used at once; this is only the array's bound. */
+#define NEG_RUNNING_MAX 16
+
+typedef struct {
+    bool used;                    /* holds a job, running or not yet reported */
+    bool done;                    /* its thread has finished */
+    pthread_t thread;
+    job_t job;
+    const capability_t *cap;
+    int rc;
+    char result[CAP_RESULT_LEN + 1];
+} neg_running_t;
+
 static struct {
     job_queue_t task_stack;
     map_t proposed_tasks;  /* uuid_str -> task_t* */
@@ -140,7 +158,11 @@ static struct {
      * process, which is the one that owns the announce path the worker needs.
      * See _bootstrap_tick. */
     bootstrap_worker_t bootstrap;
+    /* Jobs running on worker threads, or finished and not yet reported. */
+    neg_running_t running[NEG_RUNNING_MAX];
 } neg_state;
+
+static void _join_running(void);
 
 static void _ensure_init(void)
 {
@@ -336,6 +358,7 @@ void negotiation_reset_state(void)
     /* Kept one-shot frames are this process's too (utilities/send_retry.h). */
     at_send_retry_reset();
     _ensure_init();
+    _join_running();   /* before the lock: a finishing thread takes it */
     pthread_mutex_lock(&neg_state.lock);
     job_queue_clear(&neg_state.task_stack);
     map_free(&neg_state.proposed_tasks);
@@ -441,9 +464,9 @@ static neg_status_t _py_status_value(const char *name)
     return NEG_UNKNOWN;
 }
 
-/* Forward declarations: both live further down with the peer/identity
- * helpers, and the serializers below need them to fill `requestor`. */
-static const identity_t *_self_identity(const process_t *proc);
+/* Forward declarations: they live further down (with the peer helpers and
+ * the deadline sweep), and code above needs them. */
+static long _extension_secs(const task_t *task);
 static bool _peer_by_uuid(const process_t *proc, const uuid_t peer_uuid,
                           public_identity_t *out);
 
@@ -600,7 +623,7 @@ static json_t *_requestor_json(const process_t *proc, const uuid_t requestor_uui
     }
     if (proc == NULL)
         return NULL;
-    const identity_t *self = _self_identity(proc);
+    const identity_t *self = identity_self_identity(proc);
     /* identity_t embeds public_identity_t at offset 0 (anonymous member). */
     if (self != NULL && uuid_compare(self->uuid, requestor_uuid) == 0)
     {
@@ -1063,8 +1086,8 @@ static bool _peer_has_capability(const process_t *proc, const char *peer_uuid_st
  * a cadence for it to come back around. Caller holds neg_state.lock.
  *
  * @p target_uuid, when non-zero, narrows the fan-out to one peer. */
-static void _announce_task_locked(const process_t *proc, task_t *task,
-                                  const uuid_t target_uuid)
+static int _announce_task_locked(const process_t *proc, task_t *task,
+                                 const uuid_t target_uuid)
 {
     /* Store task in proposed_tasks keyed by task UUID string */
     char task_uuid_str[UUID_STRING_LEN + 1] = {0};
@@ -1112,7 +1135,7 @@ static void _announce_task_locked(const process_t *proc, task_t *task,
         log_warn(proc->logger,
                  "Negotiation: no freshness sequence; not announcing task %s\n",
                  task_uuid_str);
-        return;
+        return 0;
     }
 
     /* Build JSON payload for invitation */
@@ -1133,6 +1156,7 @@ static void _announce_task_locked(const process_t *proc, task_t *task,
 
     /* Send invitation to capable peers */
     int invited = 0;
+    int sent = 0;   /* of those, the invitations the network queue took */
     peers_read_lock(proc);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
@@ -1158,7 +1182,8 @@ static void _announce_task_locked(const process_t *proc, task_t *task,
         if (invite_json)
             net_msg_pack_json(&invite.info.net_msg, invite_json);
 
-        _neg_send(proc, "network", &invite, "an invitation");
+        if (_neg_send(proc, "network", &invite, "an invitation") == 0)
+            sent++;
         net_msg_free_obj(&invite.info.net_msg);
         if (tracker != NULL)
             task_tracker_add_invited(tracker, proc->protocol.peers[i].uuid);
@@ -1189,6 +1214,7 @@ static void _announce_task_locked(const process_t *proc, task_t *task,
     if (invited == 0)
         log_warn(proc->logger, "Negotiation: no capable peers found for task %s\n",
                  task_uuid_str);
+    return sent;
 }
 
 /****************************
@@ -1883,12 +1909,24 @@ static bool handle_stat_req(const process_t *proc, directory_t *queues, generic_
      * is `pending`, not `running`. Returning RUNNING here causes the
      * requestor's clock-sync detector (handle_stat_resp:269 on the Python
      * side) to miss the discrepancy. Mirrors negprocess.py:238-239. */
+    /* A job holding a worker slot is running (or has just finished, its
+     * result about to go out). Python reports the executing process's state;
+     * this is the C runtime's equivalent. */
     neg_status_t status = NEG_UNKNOWN;
     if (have_task_uuid)
     {
         pthread_mutex_lock(&neg_state.lock);
         if (job_queue_contains(&neg_state.task_stack, task.uuid))
             status = NEG_PENDING;
+        else
+            for (int i = 0; i < NEG_RUNNING_MAX; i++)
+                if (neg_state.running[i].used
+                    && uuid_compare(neg_state.running[i].job.task.uuid,
+                                    task.uuid) == 0)
+                {
+                    status = NEG_RUNNING;
+                    break;
+                }
         pthread_mutex_unlock(&neg_state.lock);
     }
 
@@ -1907,8 +1945,8 @@ static bool handle_stat_req(const process_t *proc, directory_t *queues, generic_
         json_decref(resp_json);
     }
 
-    /* Bare on purpose (a status reply; the asker's deadline sweep asks again,
-     * and nothing in C asks at all): ISSUES §2.14. */
+    /* Bare on purpose: a status reply, and the asker's deadline sweep asks
+     * again. */
     messaging_send("network", NET_MESSAGE, &resp, false);
     net_msg_free_obj(&resp.info.net_msg);
     return true;
@@ -2016,14 +2054,8 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
                  * slot holds "" and cannot match a real uuid, so this is
                  * naturally idempotent.
                  *
-                 * NOTE: this runtime has no status-request SENDER yet
-                 * (NEG_PROTO_STAT_REQ is handled, never emitted), so nothing
-                 * appends to status_pending and the gate below is currently
-                 * always the refusal path. That is the correct behaviour
-                 * meanwhile: with no request outstanding there is no
-                 * extension to authorise. When a requester side lands it
-                 * must append the task uuid at its send site, the way
-                 * Python's process() loop does. */
+                 * The sender is negotiation_status_sweep, which appends the
+                 * task uuid each time it asks. */
                 bool had_pending = false;
                 for (size_t i = 0; i < array_size(&neg_state.status_pending); i++)
                 {
@@ -2045,16 +2077,12 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
                      * Order matters: explicit timeout wins over
                      * duration-derived; both fall back to the class
                      * default. */
-                    long extend = NEG_TIMEOUT_EXTENSION_SEC;
-                    if (live_task->timeout > 0) {
-                        extend = live_task->timeout;
-                    } else {
-                        long dur_secs = live_task->duration.seconds
-                                      + (long)live_task->duration.days * 86400L;
-                        if (dur_secs > 0)
-                            extend = (dur_secs * NEG_DURATION_FRACTION_PCT) / 100L + 1L;
-                    }
+                    long extend = _extension_secs(live_task);
                     live_task->timeout += extend;
+                    /* The deadline moved, so the sweep's count of unanswered
+                     * rounds starts over from it. */
+                    tracker->status_asks = 0;
+                    tracker->status_asked_at = 0.0;
                     log_debug(proc->logger,
                               "Negotiation: task %s active (status=%d), "
                               "extending timeout by %lds (peer %s)\n",
@@ -2091,6 +2119,10 @@ static bool handle_stat_resp(const process_t *proc, directory_t *queues, generic
                                         nmsg->from_whom.uuid);
                 break;
 
+            /* `unknown` only says the worker is not tracking the task, which
+             * is also what it says once it has finished and its result is on
+             * the way: neither extend nor cancel. The deadline sweep gives up
+             * on a worker that has really let the task go. */
             case NEG_UNKNOWN:
             default:
                 log_debug(proc->logger,
@@ -2505,9 +2537,11 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
 
                     _neg_send(proc, AT_MAIN_QUEUE, &result_msg, "a task result");
 
-                    /* Clean up tracker entry */
+                    /* Clean up tracker entry. The map's value only borrows
+                     * the tracker, which _announce_task_locked calloc'd. */
                     map_remove(&neg_state.my_tasks, task_uuid_str);
                     task_tracker_free(tracker);
+                    free(tracker);
                 }
             }
             else
@@ -2534,23 +2568,6 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
  * scoring above had nothing to score. That is what "no C node scores a probe
  * end to end" meant (R+D.md §12.7).
  ****************************/
-
-/* This node's own identity, from the process's config map. Same shape as the
- * reputation process's _resolve_self_uuid. */
-static const identity_t *_self_identity(const process_t *proc)
-{
-    if (proc == NULL || proc->configs == NULL)
-        return NULL;
-    data_t *id_dat = NULL;
-    char id_key[] = "identity";
-    if (map_get(proc->configs, id_key, &id_dat) != 0 || id_dat == NULL)
-        return NULL;
-    config_t *id_cfg = NULL;
-    if (data_object_ptr(id_dat, (void **)&id_cfg) != 0 || id_cfg == NULL
-        || id_cfg->data_struct == NULL)
-        return NULL;
-    return (const identity_t *)id_cfg->data_struct;
-}
 
 /* Copy the peer record for @p peer_uuid into @p out. Takes the peers read
  * lock itself, so callers must not already hold it. */
@@ -2629,34 +2646,165 @@ static void _report_result(const process_t *proc, const task_t *task,
     net_msg_free_obj(&out.info.net_msg);
 }
 
-/* Execute every job whose start time has arrived, report each answer, and
- * submit our own (executor) half of the bilateral transaction.
+/* Run every job whose start time has arrived, report each answer, and submit
+ * our own (executor) half of the bilateral transaction.
  *
- * Executed inline on the process loop rather than on a thread: these
- * capabilities are pure functions of their arguments, and a thread per job
- * would need a completion channel back to this loop for no gain. A capability
- * that blocks belongs behind `task_run`'s detached-thread path, which stays as
- * it was for the fire-and-forget shape.
+ * A job's capability runs on a worker thread of its own, up to
+ * max_concurrency at once, so this loop stays free to answer while it works:
+ * a status request about a running job is answered `running` (handle_stat_req)
+ * instead of waiting behind the job. The thread only fills its slot; the
+ * report, the executor score and every other send happen back on this loop
+ * (_finish_jobs), so nothing that sends runs off it. A job that cannot get a
+ * thread runs inline, as every job used to.
  *
  * The 0.9 executor score mirrors automate.py's `_handle_results`: it is our
  * claim to have done the work, and it is the requestor's own score for the
  * same task that decides what the work was worth. */
+
+/* Report one finished job: its answer (or none) to the requestor, and our own
+ * half when it produced one. Called on the process loop. */
+static void _complete_job(const process_t *proc, job_t *job,
+                          const capability_t *cap, int rc, const char *result)
+{
+    char task_uuid_str[UUID_STRING_LEN + 1] = {0};
+    uuid_unparse_lower(job->task.uuid, task_uuid_str);
+    if (rc != 0)
+    {
+        /* No result-producing entry point (the fire-and-forget shape) or
+         * the capability failed. Run the void form if there is one, so a
+         * legacy capability still does its work, and report nothing.
+         *
+         * The requestor then scores that as an empty return (0.3), which
+         * is worth being explicit about because it is a judgment and not
+         * an accident: a capability that cannot answer leaves the
+         * requestor with nothing, and the alternative -- staying silent --
+         * leaves it waiting on a tracker that never completes. Reporting
+         * an empty result is the honest half of a bad trade. No capability
+         * in the tree is in this shape today (`data` declares neither
+         * entry point and does its real work as a subscription, not a
+         * task), so this is the path for a future one. */
+        if (cap != NULL && cap->function != NULL)
+            task_run(&job->task);
+        log_debug(proc->logger,
+                  "Negotiation: job %s (%s) produced no result (rc=%d)\n",
+                  task_uuid_str, job->task.capability.name, rc);
+        _report_result(proc, &job->task, NULL);
+        return;
+    }
+
+    log_info(proc->logger, "Negotiation: job %s (%s) done\n",
+             task_uuid_str, job->task.capability.name);
+    _report_result(proc, &job->task, result);
+    /* Executor side, scoring our own completion: no subject, and none
+     * needed -- task_outcome is not slash-eligible. */
+    /* No subject, so no learned weight: competence is a fact about a
+     * peer's forecasting record, and this score is about our own
+     * completion. Neutral == the authored transaction_weight verbatim. */
+    /* Under the PAIR task id (ISSUES §2.50): this executor's half pairs
+     * only with the requester's half about this executor, however many
+     * peers the task fanned out to. */
+    const identity_t *me = identity_self_identity(proc);
+    if (me == NULL)
+    {
+        log_warn(proc->logger, "Negotiation: no identity; not scoring job %s\n",
+                 task_uuid_str);
+        return;
+    }
+    uuid_t pair;
+    tx_pair_task_uuid(job->task.uuid, me->uuid, pair);
+    _submit_tx_score(proc, pair, 0.9, job->task.capability.name,
+                     TX_CHANNEL_TASK_OUTCOME, NULL,
+                     NEG_NEUTRAL_COMPETENCE);
+}
+
+/* A worker thread: run the slot's capability into the slot's buffer, then
+ * mark it done for the loop to report. Touches nothing else. */
+static void *_run_job(void *arg)
+{
+    neg_running_t *slot = arg;
+    char result[CAP_RESULT_LEN + 1] = {0};
+    int rc = capability_execute_result(slot->cap, slot->job.task.kwargs_json,
+                                       result, sizeof(result));
+    pthread_mutex_lock(&neg_state.lock);
+    memcpy(slot->result, result, sizeof(slot->result));
+    slot->rc = rc;
+    slot->done = true;
+    pthread_mutex_unlock(&neg_state.lock);
+    return NULL;
+}
+
+static int _running_limit(void)
+{
+    int limit = neg_state.max_concurrency;
+    if (limit < 1)
+        limit = 1;
+    return limit < NEG_RUNNING_MAX ? limit : NEG_RUNNING_MAX;
+}
+
+/* Report every job whose thread has finished, and free its slot. */
+static void _finish_jobs(const process_t *proc)
+{
+    neg_running_t done[NEG_RUNNING_MAX];
+    size_t n_done = 0;
+    pthread_mutex_lock(&neg_state.lock);
+    for (int i = 0; i < NEG_RUNNING_MAX; i++)
+    {
+        neg_running_t *slot = &neg_state.running[i];
+        if (!slot->used || !slot->done)
+            continue;
+        /* The thread set `done` and released the lock it holds no more, so
+         * the join is immediate. */
+        pthread_join(slot->thread, NULL);
+        done[n_done++] = *slot;
+        memset(slot, 0, sizeof(*slot));
+    }
+    pthread_mutex_unlock(&neg_state.lock);
+    for (size_t i = 0; i < n_done; i++)
+        _complete_job(proc, &done[i].job, done[i].cap, done[i].rc,
+                      done[i].result);
+}
+
+/* Wait for every running job's thread (shutdown, and a test's reset). Their
+ * results are not reported. Caller must not hold neg_state.lock. */
+static void _join_running(void)
+{
+    for (int i = 0; i < NEG_RUNNING_MAX; i++)
+    {
+        neg_running_t *slot = &neg_state.running[i];
+        if (slot->used)
+            pthread_join(slot->thread, NULL);
+        memset(slot, 0, sizeof(*slot));
+    }
+}
+
 static void _drain_task_stack(const process_t *proc)
 {
+    _finish_jobs(proc);
     time_t now_sec = time(NULL);
     for (;;)
     {
         job_t job;
         memset(&job, 0, sizeof(job));
         bool have_job = false;
+        int free_slot = -1;
 
         pthread_mutex_lock(&neg_state.lock);
+        int in_use = 0;
+        for (int i = 0; i < NEG_RUNNING_MAX; i++)
+        {
+            if (neg_state.running[i].used)
+                in_use++;
+            else if (free_slot < 0)
+                free_slot = i;
+        }
         job_t peek;
         memset(&peek, 0, sizeof(peek));
         /* Peek before popping: a job scheduled for later must stay queued,
          * and the queue is start-time ordered, so the earliest not being due
-         * means none is. */
-        if (job_queue_min(&neg_state.task_stack, &peek) == 0
+         * means none is. A job with no slot free stays queued (and answers
+         * `pending`) until one frees. */
+        if (in_use < _running_limit() && free_slot >= 0
+            && job_queue_min(&neg_state.task_stack, &peek) == 0
             && peek.start_time <= now_sec
             && job_queue_pop(&neg_state.task_stack, &job) == 0)
             have_job = true;
@@ -2692,57 +2840,39 @@ static void _drain_task_stack(const process_t *proc)
             continue;
         }
 
+        pthread_mutex_lock(&neg_state.lock);
+        neg_running_t *slot = &neg_state.running[free_slot];
+        memset(slot, 0, sizeof(*slot));
+        slot->job = job;
+        slot->cap = cap;
+        slot->used = true;
+        bool started = pthread_create(&slot->thread, NULL, _run_job, slot) == 0;
+        if (!started)
+            memset(slot, 0, sizeof(*slot));
+        pthread_mutex_unlock(&neg_state.lock);
+        if (started)
+            continue;
+
+        log_warn(proc->logger, "Negotiation: no thread for job %s; running it "
+                 "inline\n", task_uuid_str);
         char result[CAP_RESULT_LEN + 1] = {0};
         int rc = capability_execute_result(cap, job.task.kwargs_json,
-                                          result, sizeof(result));
-        if (rc != 0)
-        {
-            /* No result-producing entry point (the fire-and-forget shape) or
-             * the capability failed. Run the void form if there is one, so a
-             * legacy capability still does its work, and report nothing.
-             *
-             * The requestor then scores that as an empty return (0.3), which
-             * is worth being explicit about because it is a judgment and not
-             * an accident: a capability that cannot answer leaves the
-             * requestor with nothing, and the alternative -- staying silent --
-             * leaves it waiting on a tracker that never completes. Reporting
-             * an empty result is the honest half of a bad trade. No capability
-             * in the tree is in this shape today (`data` declares neither
-             * entry point and does its real work as a subscription, not a
-             * task), so this is the path for a future one. */
-            if (cap->function != NULL)
-                task_run(&job.task);
-            log_debug(proc->logger,
-                      "Negotiation: job %s (%s) produced no result (rc=%d)\n",
-                      task_uuid_str, job.task.capability.name, rc);
-            _report_result(proc, &job.task, NULL);
-            continue;
-        }
-
-        log_info(proc->logger, "Negotiation: job %s (%s) done\n",
-                 task_uuid_str, job.task.capability.name);
-        _report_result(proc, &job.task, result);
-        /* Executor side, scoring our own completion: no subject, and none
-         * needed -- task_outcome is not slash-eligible. */
-        /* No subject, so no learned weight: competence is a fact about a
-         * peer's forecasting record, and this score is about our own
-         * completion. Neutral == the authored transaction_weight verbatim. */
-        /* Under the PAIR task id (ISSUES §2.50): this executor's half pairs
-         * only with the requester's half about this executor, however many
-         * peers the task fanned out to. */
-        const identity_t *me = _self_identity(proc);
-        if (me == NULL)
-        {
-            log_warn(proc->logger, "Negotiation: no identity; not scoring job %s\n",
-                     task_uuid_str);
-            continue;
-        }
-        uuid_t pair;
-        tx_pair_task_uuid(job.task.uuid, me->uuid, pair);
-        _submit_tx_score(proc, pair, 0.9, job.task.capability.name,
-                         TX_CHANNEL_TASK_OUTCOME, NULL,
-                         NEG_NEUTRAL_COMPETENCE);
+                                           result, sizeof(result));
+        _complete_job(proc, &job, cap, rc, result);
     }
+}
+
+size_t negotiation_run_due_jobs(const process_t *proc)
+{
+    _ensure_init();
+    _drain_task_stack(proc);
+    size_t n = 0;
+    pthread_mutex_lock(&neg_state.lock);
+    for (int i = 0; i < NEG_RUNNING_MAX; i++)
+        if (neg_state.running[i].used)
+            n++;
+    pthread_mutex_unlock(&neg_state.lock);
+    return n;
 }
 
 /****************************
@@ -2768,7 +2898,7 @@ static bool _emit_bootstrap_task(const probe_ctx_t *ctx, const char *cap_name,
                                  int target_index)
 {
     const process_t *proc = ctx->proc;
-    const identity_t *self = _self_identity(proc);
+    const identity_t *self = identity_self_identity(proc);
 
     task_t task;
     memset(&task, 0, sizeof(task));
@@ -2843,10 +2973,12 @@ static bool _emit_bootstrap_task(const probe_ctx_t *ctx, const char *cap_name,
             return false;
     }
 
+    /* Issued only if an invitation actually left: a probe whose every copy
+     * was refused is not one the worker should count. */
     pthread_mutex_lock(&neg_state.lock);
-    _announce_task_locked(proc, &task, target);
+    int sent = _announce_task_locked(proc, &task, target);
     pthread_mutex_unlock(&neg_state.lock);
-    return true;
+    return sent > 0;
 }
 
 static bool _pair_emit(void *vctx, const char *cap_name, long nonce,
@@ -3075,6 +3207,7 @@ static bool handle_tier_lost(const process_t *proc, directory_t *queues, generic
 
                 map_remove(mt, task_uuid_str);
                 task_tracker_free(tracker);
+                free(tracker);
             }
         }
     }
@@ -3088,6 +3221,208 @@ static bool handle_tier_lost(const process_t *proc, directory_t *queues, generic
 
     json_decref(payload);
     return true;
+}
+
+/****************************
+ * Deadline sweep (doc/architecture/negotiation.md)
+ *
+ * A task of ours whose deadline (when + duration + timeout) has passed is
+ * asked about: a status request to every confirmed participant still owing a
+ * result. A live answer extends the deadline (handle_stat_resp). Silence, or
+ * an answer that does not extend, is asked again once an extension's worth of
+ * time has passed, and after NEG_STATUS_ASKS rounds the task is given up:
+ * logged and forgotten, with no result to main and no score -- a lost frame
+ * looks the same as a refusal. Mirrors Python NegotiationProcess.status_sweep.
+ ****************************/
+
+/* How far a live status answer moves the deadline, and so how long the sweep
+ * waits on one: the task's own timeout, else a fraction of its duration, else
+ * the default. Mirrors Python TaskParameters.extension_seconds. */
+static long _extension_secs(const task_t *task)
+{
+    if (task->timeout > 0)
+        return task->timeout;
+    long dur_secs = task->duration.seconds + (long)task->duration.days * 86400L;
+    if (dur_secs > 0)
+        return (dur_secs * NEG_DURATION_FRACTION_PCT) / 100L + 1L;
+    return NEG_TIMEOUT_EXTENSION_SEC;
+}
+
+/* Everything this node keeps about one of its own tasks: the tracker, the
+ * proposed copy, the confirmations and any outstanding status token. Caller
+ * holds neg_state.lock. */
+static void _forget_task_locked(const char *task_uuid_str)
+{
+    data_t *d = NULL;
+    if (map_get(&neg_state.my_tasks, (map_key_t)task_uuid_str, &d) == 0 && d != NULL)
+    {
+        task_tracker_t *tracker = NULL;
+        data_object_ptr(d, (ptr_t *)&tracker);
+        map_remove(&neg_state.my_tasks, (map_key_t)task_uuid_str);
+        if (tracker != NULL)
+        {
+            task_tracker_free(tracker);
+            free(tracker);
+        }
+    }
+    d = NULL;
+    if (map_get(&neg_state.proposed_tasks, (map_key_t)task_uuid_str, &d) == 0 && d != NULL)
+    {
+        task_t *task = NULL;
+        data_object_ptr(d, (ptr_t *)&task);
+        map_remove(&neg_state.proposed_tasks, (map_key_t)task_uuid_str);
+        free(task);
+    }
+    map_remove(&neg_state.confirmed, (map_key_t)task_uuid_str);
+    size_t prefix_len = strlen(task_uuid_str);
+    array_t *keys = map_keys(&neg_state.confirmed_pairs);
+    size_t n = array_size(keys);
+    for (size_t i = 0; i < n; i++)
+    {
+        data_t *kd = NULL;
+        char *k = NULL;
+        if (array_get(keys, (int)i, &kd) != 0 || data_string_ptr(kd, &k) != 0
+            || k == NULL)
+            continue;
+        if (strncmp(k, task_uuid_str, prefix_len) == 0 && k[prefix_len] == ':')
+            map_remove(&neg_state.confirmed_pairs, k);
+    }
+    for (size_t i = 0; i < array_size(&neg_state.status_pending); i++)
+    {
+        data_t *item = NULL;
+        char *stored = NULL;
+        if (array_get(&neg_state.status_pending, (int)i, &item) == 0
+            && data_string_ptr(item, &stored) == 0 && stored != NULL
+            && strncmp(stored, task_uuid_str, UUID_STRING_LEN) == 0)
+            stored[0] = '\0';
+    }
+}
+
+/* Drop the spent status tokens (blanked in place by handle_stat_resp and
+ * _forget_task_locked), so the list holds only outstanding requests. Caller
+ * holds neg_state.lock. */
+static void _compact_status_pending_locked(void)
+{
+    size_t i = 0;
+    while (i < array_size(&neg_state.status_pending))
+    {
+        data_t *item = NULL;
+        char *stored = NULL;
+        if (array_get(&neg_state.status_pending, (int)i, &item) == 0
+            && data_string_ptr(item, &stored) == 0 && stored != NULL
+            && stored[0] == '\0')
+        {
+            array_remove_at(&neg_state.status_pending, (int)i);
+            continue;
+        }
+        i++;
+    }
+}
+
+/* Ask every confirmed participant of @p tracker that still owes a result.
+ * Returns how many requests the network queue took. Caller holds
+ * neg_state.lock. */
+static int _ask_status_locked(const process_t *proc, const char *task_uuid_str,
+                              task_tracker_t *tracker, const task_t *task)
+{
+    json_t *body = _task_to_json(proc, task);
+    if (body == NULL)
+        return 0;
+    int asked = 0;
+    array_t *keys = map_keys(&tracker->invited);
+    size_t n = array_size(keys);
+    for (size_t i = 0; i < n; i++)
+    {
+        data_t *kd = NULL;
+        char *peer_str = NULL;
+        if (array_get(keys, (int)i, &kd) != 0 || data_string_ptr(kd, &peer_str) != 0
+            || peer_str == NULL)
+            continue;
+        char pair_key[UUID_STRING_LEN * 2 + 4];
+        snprintf(pair_key, sizeof(pair_key), "%s:%s", task_uuid_str, peer_str);
+        data_t *m = NULL;
+        if (map_get(&neg_state.confirmed_pairs, pair_key, &m) != 0 || m == NULL)
+            continue;   /* never accepted, or cancelled out */
+        uuid_t peer_uuid;
+        if (uuid_parse(peer_str, peer_uuid) != 0
+            || task_tracker_has_result(tracker, peer_uuid))
+            continue;   /* already answered */
+        public_identity_t peer;
+        if (!_peer_by_uuid(proc, peer_uuid, &peer))
+            continue;
+        generic_msg_t req = {0};
+        req.type = NET_MESSAGE;
+        strncpy(req.info.net_msg.process, "negotiation", PROC_NAME_LEN);
+        req.info.net_msg.function = NEG_PROTO_STAT_REQ;
+        req.info.net_msg.encrypt = true;
+        memcpy(&req.info.net_msg.to_whom, &peer, sizeof(public_identity_t));
+        strncpy(req.info.net_msg.return_to, "negotiation", PROC_NAME_LEN);
+        net_msg_pack_json(&req.info.net_msg, body);
+        if (_neg_send(proc, "network", &req, "a status request") == 0)
+            asked++;
+        net_msg_free_obj(&req.info.net_msg);
+    }
+    json_decref(body);
+    return asked;
+}
+
+size_t negotiation_status_sweep(const process_t *proc, double present)
+{
+    _ensure_init();
+    size_t given_up = 0;
+    pthread_mutex_lock(&neg_state.lock);
+    _compact_status_pending_locked();
+    array_t *keys = map_keys(&neg_state.my_tasks);
+    size_t n = array_size(keys);
+    for (size_t i = 0; i < n; i++)
+    {
+        data_t *kd = NULL;
+        char *task_uuid_str = NULL;
+        if (array_get(keys, (int)i, &kd) != 0
+            || data_string_ptr(kd, &task_uuid_str) != 0 || task_uuid_str == NULL)
+            continue;
+        data_t *d = NULL;
+        task_tracker_t *tracker = NULL;
+        task_t *task = NULL;
+        if (map_get(&neg_state.my_tasks, task_uuid_str, &d) == 0 && d != NULL)
+            data_object_ptr(d, (ptr_t *)&tracker);
+        d = NULL;
+        if (map_get(&neg_state.proposed_tasks, task_uuid_str, &d) == 0 && d != NULL)
+            data_object_ptr(d, (ptr_t *)&task);
+        if (tracker == NULL || task == NULL)
+            continue;
+        double deadline = (double)negotiation_dt_epoch(&task->when)
+            + (double)task->duration.seconds + (double)task->duration.days * 86400.0
+            + (double)task->timeout;
+        if (present <= deadline)
+            continue;
+        if (tracker->status_asks > 0
+            && present < tracker->status_asked_at + (double)_extension_secs(task))
+            continue;   /* still waiting on the last round */
+        int asked = 0;
+        if (tracker->status_asks < NEG_STATUS_ASKS)
+            asked = _ask_status_locked(proc, task_uuid_str, tracker, task);
+        if (asked == 0)
+        {
+            log_warn(proc->logger,
+                     "Negotiation: task %s past its deadline with no live answer "
+                     "after %d status request round(s); giving it up\n",
+                     task_uuid_str, tracker->status_asks);
+            _forget_task_locked(task_uuid_str);
+            given_up++;
+            continue;
+        }
+        tracker->status_asks++;
+        tracker->status_asked_at = present;
+        array_append(&neg_state.status_pending,
+                     string_data(task_uuid_str, strlen(task_uuid_str) + 1));
+        log_debug(proc->logger,
+                  "Negotiation: task %s past its deadline; asked %d participant(s) "
+                  "for status (round %d)\n",
+                  task_uuid_str, asked, tracker->status_asks);
+    }
+    pthread_mutex_unlock(&neg_state.lock);
+    return given_up;
 }
 
 /****************************
@@ -3210,7 +3545,9 @@ int negotiation_run(process_t *proc, directory_t *queues, queue_id_t signal, log
 
         _drain_task_stack(proc);
         _bootstrap_tick(proc);
+        negotiation_status_sweep(proc, (double)time(NULL));
     }
+    _join_running();
 
     if (ctx.fd1 > 0)
         close(ctx.fd1);

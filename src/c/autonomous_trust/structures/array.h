@@ -180,6 +180,16 @@ int array_find(array_t *a, data_t *element);
 int array_filter(array_t *a, bool (*filter)(data_t *));
 
 /**
+ * @brief Keep only the elements @p keep accepts, in their original order,
+ *        releasing the array's reference to each one dropped.
+ *
+ * @param a Pointer to array.
+ * @param keep Predicate; @p ctx is passed through to it.
+ * @return The number of elements dropped.
+ */
+size_t array_keep_if(array_t *a, bool (*keep)(data_t *, void *), void *ctx);
+
+/**
  * @brief Is the given element in the array?
  *
  * @param array Pointer to array.
@@ -277,6 +287,9 @@ int array_get(array_t *a, int index, data_t **element);
 /**
  * @brief Set the element at the given index.
  *
+ * The array adopts the caller's reference to @p element. Overwriting an
+ * occupied slot releases the element it displaces, as map_set does.
+ *
  * @param array Pointer to array.
  * @param index Position in the array.
  * @param element Pointer to data.
@@ -306,6 +319,12 @@ int array_set(array_t *a, int index, data_t *element);
 /**
  * @brief Remove the given element from the array.
  *
+ * Removes the first element EQUAL to @p element (data_equal), which need not
+ * be @p element itself, and releases the array's reference to it, as
+ * map_remove does: a caller that still needs it must smrt_ref it first.
+ * Object data compares by pointer, so for it equal means the same object; a
+ * caller holding an index into scalar data uses array_remove_at.
+ *
  * @param array Pointer to array.
  * @param element Pointer to data.
  * @return Success (0) or error code.
@@ -323,6 +342,27 @@ int array_set(array_t *a, int index, data_t *element);
   disjoint behaviors;
 */
 int array_remove(array_t *a, data_t *element);
+
+/**
+ * @brief Remove the element at @p index (negative counts from the end) and
+ *        release the array's reference to it, as array_remove does.
+ *
+ * The removal for a caller that knows the slot: array_remove matches by
+ * value, and can take an earlier equal element instead.
+ *
+ * @param array Pointer to array.
+ * @param index Position in the array.
+ * @return Success (0) or EARR_OOB.
+ */
+int array_remove_at(array_t *a, int index);
+
+/**
+ * @brief Wrap a heap array (array_create) the data_t takes ownership of: its
+ *        last smrt_deref array_free()s @p a, elements and all.
+ *
+ * @return A new data_t, or NULL (then @p a is still the caller's).
+ */
+data_t *owned_array_data(array_t *a);
 
 /**
  * @brief Free all array structures (not data though).
