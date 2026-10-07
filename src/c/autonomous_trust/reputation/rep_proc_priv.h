@@ -273,6 +273,28 @@ int reputation_install_tx_attested(const uuid_t verifier_uuid, double score,
                                    const char *channel,
                                    const uuid_t subject_uuid,
                                    const char *evidence_digest);
+/** @ref reputation_install_tx_attested with an attest scope (NULL for none)
+ *  and its quorum certificate as JSON text (NULL for none). */
+int reputation_install_tx_attested_scoped(const uuid_t verifier_uuid,
+                                          double score, const char *channel,
+                                          const uuid_t subject_uuid,
+                                          const char *evidence_digest,
+                                          const char *scope,
+                                          const char *cert_json);
+
+/** Store a checkpoint as a finalized one arriving would (test hook): the
+ *  evidence file, the finality record, and the durable attested records
+ *  (_archive_attested) for every attested entry it covers. @p sigs are
+ *  {voter: sig hex}, taken as already verified, as every caller's are. */
+/** Our committed head hash ("" for an empty chain) into @p out, which holds
+ *  @p cap bytes (TX_HASH_HEX_LEN + 1 fits it); returns the chain length. What
+ *  a request's fork probe compares (ISSUES §2.51). */
+int reputation_head_hash(char *out, size_t cap);
+
+void reputation_test_store_checkpoint(const process_t *proc, const char *proposer,
+                                      const char *root, int64_t epoch,
+                                      int first_index, int count,
+                                      const char *chain_key, json_t *sigs);
 void reputation_install_tx_single(const uuid_t task_uuid,
                                   const uuid_t peer_uuid, double score);
 

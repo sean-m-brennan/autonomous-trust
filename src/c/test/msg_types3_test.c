@@ -106,7 +106,7 @@ DEFINE_TEST(test_net_msg_proto_roundtrip)
     ck_assert_int_eq((int)json_integer_value(json_object_get(restored_payload, "id")), 42);
     json_decref(restored_payload);
 
-    smrt_deref(data);
+    free(data);
     net_msg_free_obj(&original);
     if (restored.function)
         free(restored.function);
@@ -132,7 +132,7 @@ DEFINE_TEST(test_net_msg_proto_no_payload)
     ck_assert(restored.encrypt == false);
     ck_assert_ptr_null(restored.obj);
 
-    smrt_deref(data);
+    free(data);
 }
 END_TEST_DEFINITION()
 
@@ -255,7 +255,7 @@ DEFINE_TEST(test_net_msg_proto_carries_the_signature_verdict)
         ck_assert_int_eq((int)restored.verified, verdict);
         ck_assert_int_eq((int)restored.has_signature, verdict);
 
-        smrt_deref(data);
+        free(data);
         net_msg_free_obj(&original);
         if (restored.function)
             free(restored.function);
@@ -294,7 +294,7 @@ DEFINE_TEST(test_group_multicast_is_core_and_omitted_when_false)
         ck_assert_ret_ok(proto_to_net_msg(data, data_len, &restored));
         ck_assert_int_eq((int)restored.group_multicast, multicast);
 
-        smrt_deref(data);
+        free(data);
         net_msg_free_obj(&original);
         if (restored.function)
             free(restored.function);
@@ -383,7 +383,7 @@ DEFINE_TEST(test_child_group_survives_the_ipc_serializer)
     ck_assert_mem_eq(in.info.group.uuid, uuid, sizeof(uuid_t));
     ck_assert_double_eq_tol(in.info.group.created, 1700000000.5, 1e-6);
 
-    smrt_deref(data);
+    free(data);
     group_free(grp);
 }
 END_TEST_DEFINITION()
@@ -461,7 +461,7 @@ DEFINE_TEST(test_registered_type_survives_the_ipc_serializer)
     ck_assert_mem_eq(q->who, p->who, sizeof(uuid_t));
     ck_assert_int_eq(q->n, 42);
     ck_assert_str_eq(q->note, "through the registry");
-    smrt_deref(data);
+    free(data);
 }
 END_TEST_DEFINITION()
 
@@ -526,7 +526,7 @@ DEFINE_TEST(test_recv_release_frees_a_received_net_message)
 
     generic_msg_t got = {0};
     ck_assert_ret_ok(proto_to_generic_msg(wire, wire_len, &got));
-    smrt_deref(wire);
+    free(wire);
     ck_assert_int_eq(got.type, NET_MESSAGE);
     ck_assert_str_eq(got.info.net_msg.function, "device_cert");
     ck_assert_ptr_nonnull(got.info.net_msg.obj);

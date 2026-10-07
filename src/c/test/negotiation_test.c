@@ -109,6 +109,7 @@ DEFINE_TEST(test_task_proto_roundtrip_carries_seq)
     ck_assert_int_eq(proto_to_task((uint8_t *)data, data_len, &in), 0);
     ck_assert_int_eq((int)in.seq, 7);
     ck_assert_int_eq(uuid_compare(in.uuid, out.uuid), 0);
+    free(data);
 }
 END_TEST_DEFINITION()
 
@@ -133,6 +134,7 @@ DEFINE_TEST(test_task_proto_unstamped_reads_zero)
     in.seq = 99;  /* must be overwritten, not merely left alone */
     ck_assert_int_eq(proto_to_task((uint8_t *)data, data_len, &in), 0);
     ck_assert_int_eq((int)in.seq, 0);
+    free(data);
 }
 END_TEST_DEFINITION()
 

@@ -889,7 +889,8 @@ int peer_to_proto(public_identity_t *msg, void **data_ptr, size_t *data_len_ptr)
     AutonomousTrust__Core__Protobuf__Identity__Identity proto;
     public_identity_sync_out(msg, &proto);
     *data_len_ptr = autonomous_trust__core__protobuf__identity__identity__get_packed_size(&proto);
-    *data_ptr = smrt_create(*data_len_ptr);
+    /* a plain buffer the caller free()s; smrt_create is for headered structs */
+    *data_ptr = malloc(*data_len_ptr > 0 ? *data_len_ptr : 1);
     if (*data_ptr == NULL)
         return EXCEPTION(ENOMEM);
     autonomous_trust__core__protobuf__identity__identity__pack(&proto, *data_ptr);

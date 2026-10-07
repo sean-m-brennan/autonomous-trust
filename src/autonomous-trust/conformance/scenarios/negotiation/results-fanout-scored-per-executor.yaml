@@ -1,0 +1,63 @@
+schema_version: "1"
+kind: scenario
+protocol: negotiation
+name: results-fanout-scored-per-executor
+byte_pinning: false
+description: |
+    A task fanned out to two executors is two transactions (ISSUES §2.50).
+
+    alice spawns a task both bob and carol can do; both are invited and both
+    report. alice scores each result as it arrives, about that executor and
+    under its pair task id, uuid5(PAIR_NS, "task|executor"), the id that
+    executor's own half uses. Under the bare task id the requestor's one half
+    and the executors' halves were paired by arrival, so different nodes
+    committed different pairings at the same index and the chain forked. Once
+    every invitee has answered, the task is done.
+
+    Python scores in its main process, so its adapter sees each result handed
+    to main, stamped with its executor; C scores in negotiation and its
+    adapter checks the TRANSACTION_SCORE, pair task id included.
+
+participants:
+  - id: alice
+    role: requestor
+  - id: bob
+    role: worker
+  - id: carol
+    role: worker
+
+fixtures:
+  capabilities:
+    bob: [data_fetch]
+    carol: [data_fetch]
+
+steps:
+  - id: 1
+    from: alice
+    to: alice
+    function: spawn task
+    payload:
+      capability: data_fetch
+      task_id: t-fan
+    description: alice spawns; bob and carol are invited.
+  - id: 2
+    from: bob
+    to: alice
+    function: report results
+    payload:
+      task_id: t-fan
+      result: done
+    description: bob reports; alice scores bob.
+  - id: 3
+    from: carol
+    to: alice
+    function: report results
+    payload:
+      task_id: t-fan
+      result: done
+    description: carol reports; alice scores carol.
+
+expected_state:
+  alice:
+    results_scored: {task: t-fan, executors: [bob, carol]}
+    has_my_task: {slug: t-fan, present: false}

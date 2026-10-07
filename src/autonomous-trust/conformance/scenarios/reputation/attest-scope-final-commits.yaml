@@ -1,0 +1,36 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-scope-final-commits
+byte_pinning: false
+description: |
+    A scoped attestation commits with its scope, and the scope is part of the
+    committed fact: it is in the designation the quorum signed and in the
+    entry's canonical bytes, after the evidence digest. An unscoped entry's
+    bytes are unchanged (attest-final-commits-without-the-subject keeps its
+    pinned root).
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest final
+    payload:
+      subject: carol
+      score: 0.3
+      scope: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      cosigners: [alice, bob]
+    description: alice broadcasts a certified, scoped attestation about carol.
+
+expected_state:
+  bob:
+    committed_tx_count: 1
+    window_root: "b7b52ae98619b4b85be8c6cd5a2f59c07996f199d479c34a327149a6de23db69"

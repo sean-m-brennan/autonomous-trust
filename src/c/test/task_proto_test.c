@@ -66,7 +66,7 @@ DEFINE_TEST(test_task_proto_roundtrip)
     ck_assert(restored.flexible == true);
     ck_assert_int_eq((int)restored.argc, 2);
 
-    smrt_deref(data);
+    free(data);
 }
 END_TEST_DEFINITION()
 
@@ -95,7 +95,7 @@ DEFINE_TEST(test_task_proto_minimal)
     ck_assert(restored.flexible == false);
     ck_assert_int_eq((int)restored.argc, 0);
 
-    smrt_deref(data);
+    free(data);
 }
 END_TEST_DEFINITION()
 
@@ -153,7 +153,7 @@ DEFINE_TEST(test_paxos_payload_roundtrip)
 
     json_decref(result);
     net_msg_free_obj(&msg);
-    smrt_deref(wire);
+    free(wire);
     net_msg_free_obj(&restored);
     free(restored.function);
 }

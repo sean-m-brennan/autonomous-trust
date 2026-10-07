@@ -118,11 +118,24 @@ static bool _score_results(json_t *data, json_t *rows,
             }
         }
 
+        /* `sent_ago` / `result_ago` (seconds before now) date the request
+         * and a clock reading relative to the scoring instant, for
+         * at.time-attest's round-trip window (ISSUES §2.53). */
+        double now = at_time_attest();
+        json_t *sent_ago = json_object_get(row, "sent_ago");
+        json_t *result_ago = json_object_get(row, "result_ago");
+        double issued_at = json_is_number(sent_ago)
+            ? now - json_number_value(sent_ago) : 0.0;
+
         /* The reply, as text. A JSON null is "no result came back", which is
          * distinct from an empty string. */
         char result_buf[CAP_RESULT_LEN + 1] = {0};
         const char *result_str = NULL;
-        if (json_is_string(result)) {
+        if (json_is_number(result_ago)) {
+            snprintf(result_buf, sizeof(result_buf), "%.3f",
+                     now - json_number_value(result_ago));
+            result_str = result_buf;
+        } else if (json_is_string(result)) {
             snprintf(result_buf, sizeof(result_buf), "%s",
                      json_string_value(result));
             result_str = result_buf;
@@ -141,8 +154,8 @@ static bool _score_results(json_t *data, json_t *rows,
          * layer (R+D.md §12.2) is inert here anyway because no physics.json is
          * configured. Passing NULL keeps that explicit rather than resting on
          * the empty model -- see the `physics` protocol for its own vectors. */
-        double score = negotiation_score_task_result(
-            cap, kwargs_json, result_str,
+        double score = negotiation_score_task_result_at(
+            cap, kwargs_json, issued_at, result_str,
             (result_str != NULL) ? strlen(result_str) : 0,
             NULL, NULL, NULL, 0.0, 0, &channel);
 

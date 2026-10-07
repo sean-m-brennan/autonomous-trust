@@ -152,7 +152,8 @@ int capability_to_proto(capability_t *msg, void **data_ptr, size_t *data_len_ptr
         AUTONOMOUS_TRUST__CORE__PROTOBUF__PROCESSES__CAPABILITY__INIT;
     capability_sync_out(msg, &proto);
     *data_len_ptr = autonomous_trust__core__protobuf__processes__capability__get_packed_size(&proto);
-    *data_ptr = smrt_create(*data_len_ptr);
+    /* a plain buffer the caller free()s; smrt_create is for headered structs */
+    *data_ptr = malloc(*data_len_ptr > 0 ? *data_len_ptr : 1);
     if (*data_ptr == NULL)
         return EXCEPTION(ENOMEM);
     autonomous_trust__core__protobuf__processes__capability__pack(&proto, *data_ptr);
@@ -220,7 +221,8 @@ int peer_capabilities_to_proto(peer_capabilities_matrix_t *map, void **data_ptr,
     AutonomousTrust__Core__Protobuf__Processes__PeerCapabilities proto;
     peer_capabilities_sync_out(map, &proto);
     *data_len_ptr = autonomous_trust__core__protobuf__processes__peer_capabilities__get_packed_size(&proto);
-    *data_ptr = smrt_create(*data_len_ptr);
+    /* a plain buffer the caller free()s; smrt_create is for headered structs */
+    *data_ptr = malloc(*data_len_ptr > 0 ? *data_len_ptr : 1);
     if (*data_ptr == NULL)
         return EXCEPTION(ENOMEM);
     autonomous_trust__core__protobuf__processes__peer_capabilities__pack(&proto, *data_ptr);
@@ -250,9 +252,8 @@ int peer_capabilities_sync_in(AutonomousTrust__Core__Protobuf__Processes__PeerCa
         data_t *arr_dat = object_ptr_data(arr, sizeof(arr));
         if (arr_dat == NULL)
             return EXCEPTION(ENOMEM);
-        char *key = smrt_create(strlen(pcaps->peer) + 1);
-        strcpy(key, pcaps->peer);
-        if (map_set(map, key, arr_dat) != 0)
+        /* map_set strdup's the key, so no copy of our own */
+        if (map_set(map, pcaps->peer, arr_dat) != 0)
             return -1;
     }
     return 0;
@@ -336,9 +337,8 @@ static int capability_from_json_obj(const json_t *obj, capability_t *cap)
         json_object_foreach(args, arg_key, arg_val) {
             if (json_is_integer(arg_val)) {
                 data_t *d = integer_data((int)json_integer_value(arg_val));
-                char *k = smrt_create(strlen(arg_key) + 1);
-                strcpy(k, arg_key);
-                map_set(&cap->arguments, k, d);
+                /* map_set strdup's the key, so no copy of our own */
+                map_set(&cap->arguments, (char *)arg_key, d);
             }
         }
     }
@@ -428,9 +428,8 @@ int peer_capabilities_from_json(const json_t *obj, void *data_struct)
         data_t *arr_dat = object_ptr_data(arr, sizeof(array_t));
         if (arr_dat == NULL)
             return EXCEPTION(ENOMEM);
-        char *key = smrt_create(strlen(peer_uuid) + 1);
-        strcpy(key, peer_uuid);
-        map_set(matrix, key, arr_dat);
+        /* map_set strdup's the key, so no copy of our own */
+        map_set(matrix, (char *)peer_uuid, arr_dat);
     }
     return 0;
 }

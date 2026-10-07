@@ -162,6 +162,30 @@ DEFINE_TEST(test_task_tracker_create_destroy)
 }
 END_TEST_DEFINITION()
 
+/* Who may be scored, and only once (ISSUES §2.8 / §2.50): a tracker built
+ * without an announce knows no invitees and admits anyone; once the announce
+ * records them, only an invitee; and a peer whose result is held is a repeat. */
+DEFINE_TEST(test_task_tracker_invitees_and_repeats)
+{
+    uuid_t task_uuid, bob, carol;
+    uuid_generate(task_uuid);
+    uuid_generate(bob);
+    uuid_generate(carol);
+    task_tracker_t *tracker = NULL;
+    ck_assert_ret_ok(task_tracker_create(&tracker, task_uuid, 1));
+    ck_assert(task_tracker_was_invited(tracker, carol));      /* unknown: admit */
+    ck_assert_ret_ok(task_tracker_add_invited(tracker, bob));
+    ck_assert(task_tracker_was_invited(tracker, bob));
+    ck_assert(!task_tracker_was_invited(tracker, carol));
+    ck_assert(!task_tracker_has_result(tracker, bob));
+    const uint8_t data[] = {0x01};
+    ck_assert_ret_ok(task_tracker_set_result(tracker, bob, data, sizeof(data)));
+    ck_assert(task_tracker_has_result(tracker, bob));
+    ck_assert(!task_tracker_has_result(tracker, carol));
+    task_tracker_destroy(tracker);
+}
+END_TEST_DEFINITION()
+
 /* ------------------------------------------------------------------
  * Requestor-side result scoring (R+D.md §12.7 / §12.8)
  *
@@ -181,9 +205,13 @@ DEFINE_TEST(test_task_tracker_retains_the_request)
      * capability name at scoring time. */
     ck_assert_str_eq(tracker.capability_name, "");
     ck_assert_str_eq(tracker.kwargs_json, "");
+    ck_assert_double_eq_tol(tracker.issued_at, 0.0, 1e-12);
 
+    /* Recording the request stamps when we asked (ISSUES §2.53). */
+    double before = at_time_attest();
     ck_assert_ret_ok(task_tracker_set_request(&tracker, "at.handshake",
                                               "{\"nonce\":7}"));
+    ck_assert(tracker.issued_at >= before && tracker.issued_at <= at_time_attest());
     ck_assert_str_eq(tracker.capability_name, "at.handshake");
     ck_assert_str_eq(tracker.kwargs_json, "{\"nonce\":7}");
 
@@ -250,6 +278,35 @@ DEFINE_TEST(test_score_probe_result_uses_our_own_challenge)
                                           "{\"payload\":\"echo:cafe\"}",
                                           "echo:beef", 9, NULL, NULL, NULL, 0.0, 0, &channel);
     ck_assert_double_eq_tol(score, 0.1, 1e-9);
+}
+END_TEST_DEFINITION()
+
+/* ISSUES §2.53: the tracker's issued_at opens at.time-attest's window, so a
+ * truthful clock is not graded as drift for the time its answer spent coming
+ * back. */
+DEFINE_TEST(test_score_time_attest_over_the_round_trip)
+{
+    const char *channel = NULL;
+    double now = at_time_attest();
+    char reply[32];
+    snprintf(reply, sizeof(reply), "%.3f", now - 1.5);
+    double score = negotiation_score_task_result_at("at.time-attest", "",
+                                                    now - 3.0, reply,
+                                                    strlen(reply), NULL, NULL,
+                                                    NULL, 0.0, 0, &channel);
+    ck_assert_double_eq_tol(score, 0.9, 1e-9);
+    ck_assert_str_eq(channel, TX_CHANNEL_PROBE);
+    /* The same reply, with no record of when we asked, is drift. */
+    score = negotiation_score_task_result("at.time-attest", "", reply,
+                                          strlen(reply), NULL, NULL, NULL,
+                                          0.0, 0, &channel);
+    ck_assert_double_eq_tol(score, 0.5, 1e-9);
+    /* A clock that read before we asked is drift, round trip or not. */
+    snprintf(reply, sizeof(reply), "%.3f", now - 10.0);
+    score = negotiation_score_task_result_at("at.time-attest", "", now - 3.0,
+                                             reply, strlen(reply), NULL, NULL,
+                                             NULL, 0.0, 0, &channel);
+    ck_assert_double_eq_tol(score, 0.5, 1e-9);
 }
 END_TEST_DEFINITION()
 
@@ -340,6 +397,8 @@ DEFINE_TEST(test_task_kwargs_survive_the_proto_round_trip)
     memset(&back2, 0, sizeof(back2));
     ck_assert_ret_ok(proto_to_task((uint8_t *)data2, len2, &back2));
     ck_assert_str_eq(back2.kwargs_json, "");
+    free(data);
+    free(data2);
 }
 END_TEST_DEFINITION()
 
@@ -347,7 +406,9 @@ RUN_TESTS(Negotiation2, test_job_queue_create_destroy, test_job_queue_min,
           test_job_queue_contains, test_job_queue_clear,
           test_job_queue_find_nearest_slot, test_task_tracker_create_destroy,
           test_task_tracker_retains_the_request,
+          test_task_tracker_invitees_and_repeats,
           test_score_probe_result_uses_our_own_challenge,
+          test_score_time_attest_over_the_round_trip,
           test_score_non_probe_result_is_completion,
           test_score_probe_with_no_retained_challenge,
           test_task_kwargs_survive_the_proto_round_trip)

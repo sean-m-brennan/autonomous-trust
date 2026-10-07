@@ -79,6 +79,17 @@ int s_cmp(data_t *a, data_t *b);
 int d_cmp(data_t *a, data_t *b);
 int o_cmp(data_t *a, data_t *b);
 
+/**
+ * smrt finalizer for a data_t: frees the STRING/BYTES buffer the data_t owns.
+ * Installed by string_data, bytes_data and the two deserializers, and run by
+ * smrt_deref on the last reference. OBJECT payloads belong to the caller and
+ * are left alone. Never call it on a data_t that is still referenced.
+ */
+void data_dtor(void *ptr);
+
+/** smrt finalizer for owned_object_data: free()s the wrapped object. */
+void data_owned_obj_dtor(void *ptr);
+
 #define INT_DATA(i)   \
     {                 \
         .type = INT,  \
@@ -266,6 +277,20 @@ data_t *bytes_data(bytes_t b, size_t len);
   disjoint behaviors;
 */
 data_t *object_ptr_data(ptr_t o, size_t len);
+
+/**
+ * @brief Wrap a heap object the data_t takes ownership of.
+ *
+ * Like object_ptr_data, but the last smrt_deref of the data_t also
+ * free()s @p o, so a container holding it (map, array) releases the object
+ * with the wrapper. @p o must come from malloc/calloc and must not be freed
+ * by anyone else. object_ptr_data stays the borrowing form.
+ *
+ * @param o   Heap object (malloc/calloc), or NULL on the caller's failure path.
+ * @param len Size of the object in bytes.
+ * @return A new data_t, or NULL (then @p o is still the caller's).
+ */
+data_t *owned_object_data(ptr_t o, size_t len);
 
 
 /********************/

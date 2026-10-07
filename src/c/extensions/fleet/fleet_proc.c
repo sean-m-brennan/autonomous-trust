@@ -133,7 +133,9 @@ static bool handle_update_proposal(const process_t *proc, directory_t *queues, g
     uuid_unparse_lower(proposal.proposal_uuid, prop_uuid_str);
 
     pthread_mutex_lock(&fleet_state.lock);
-    update_proposal_t *heap_prop = smrt_create(sizeof(update_proposal_t));
+    /* A plain struct (no smrt header) owned by its data_t, so the map
+     * releases it when the last reference goes (accepted_updates or not). */
+    update_proposal_t *heap_prop = malloc(sizeof(update_proposal_t));
     if (heap_prop == NULL)
     {
         pthread_mutex_unlock(&fleet_state.lock);
@@ -141,8 +143,11 @@ static bool handle_update_proposal(const process_t *proc, directory_t *queues, g
         return false;
     }
     memcpy(heap_prop, &proposal, sizeof(update_proposal_t));
-    data_t *prop_dat = object_ptr_data(heap_prop, sizeof(update_proposal_t));
-    map_set(&fleet_state.pending_proposals, prop_uuid_str, prop_dat);
+    data_t *prop_dat = owned_object_data(heap_prop, sizeof(update_proposal_t));
+    if (prop_dat == NULL)
+        free(heap_prop);
+    else if (map_set(&fleet_state.pending_proposals, prop_uuid_str, prop_dat) != 0)
+        smrt_deref(prop_dat);
     pthread_mutex_unlock(&fleet_state.lock);
 
     json_decref(payload);

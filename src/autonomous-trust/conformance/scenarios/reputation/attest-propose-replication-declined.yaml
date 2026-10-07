@@ -1,0 +1,41 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-propose-replication-declined
+byte_pinning: false
+description: |
+    A replication below the replication tier is not vouched for.
+
+    `replication` is attestable, but it is how a second verifier confirms a
+    finding, so it needs effective tier 3 (`AT_ATTEST_REPLICATION_TIER`, 0.80)
+    in the co-signer's own view. bob holds alice at 0.7: tier 2, enough for a
+    probe and not for this. A sybil the subject spins up cannot be the second
+    voice. bob declines.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+fixtures:
+  reputations:
+    bob:
+      alice: 0.7
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest propose
+    payload:
+      subject: carol
+      score: 0.3
+      channel: replication
+    description: an attestation on the replication channel.
+
+expected_state:
+  bob:
+    attest_signs_sent: 0

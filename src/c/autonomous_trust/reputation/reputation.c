@@ -108,6 +108,9 @@ int transaction_canonical_bytes(const transaction_t *tx, char *out, size_t outsz
         uuid_unparse_lower(tx->subject_uuid, sstr);
         n += snprintf(buf + n, sizeof(buf) - n, "|attested|%s|%s", sstr,
                       tx->evidence_digest[0] != '\0' ? tx->evidence_digest : "null");
+        /* The scope, only when set: an unscoped entry's bytes are unchanged. */
+        if (tx->attest_scope[0] != '\0')
+            n += snprintf(buf + n, sizeof(buf) - n, "|%s", tx->attest_scope);
     }
     if (n < 0 || (size_t)n >= sizeof(buf) || (size_t)n >= outsz)
         return -1;
@@ -190,6 +193,22 @@ void tx_attest_task_uuid(const uuid_t verifier, const uuid_t subject,
     if (n < 0 || (size_t)n >= sizeof(name))
         n = (int)strnlen(name, sizeof(name) - 1);
     uuid_generate_sha1(out, AT_ATTEST_NS, name, (size_t)n);
+}
+
+/* uuid5(NAMESPACE_URL, "urn:autonomous-trust:task-pair"), mirrored by Python
+ * PAIR_NS. */
+static const uuid_t AT_PAIR_NS = {
+    0x61, 0xc2, 0x24, 0x77, 0x13, 0x84, 0x51, 0xfd,
+    0xb2, 0x86, 0xbb, 0x4b, 0x7f, 0x28, 0x50, 0x44 };
+
+void tx_pair_task_uuid(const uuid_t task, const uuid_t executor, uuid_t out)
+{
+    char t[UUID_STRING_LEN + 1], e[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(task, t);
+    uuid_unparse_lower(executor, e);
+    char name[2 * UUID_STRING_LEN + 2];
+    int n = snprintf(name, sizeof(name), "%s|%s", t, e);
+    uuid_generate_sha1(out, AT_PAIR_NS, name, (size_t)n);
 }
 
 bool tx_attest_digest_valid(const char *digest)
@@ -357,6 +376,35 @@ int tx_history_range_root(const tx_history_t *hist, int first, int count,
     if (n != count)
         return -1;
     mth_range(leaves, 0, n, out);
+    return 0;
+}
+
+int tx_history_range_proof(const tx_history_t *hist, int first, int count,
+                           int abs_index, tx_merkle_step_t *steps, int *n_steps)
+{
+    if (n_steps != NULL)
+        *n_steps = 0;
+    if (hist == NULL || steps == NULL || count <= 0 || count > MAX_CHAIN_LEN
+        || abs_index < first || abs_index >= first + count)
+        return -1;
+    char leaves[MAX_CHAIN_LEN][TX_HASH_HEX_LEN + 1];
+    int n = 0;
+    for (int i = 0; i < hist->chain_len && n < count; i++)
+    {
+        const transaction_t *t = &hist->chain[i];
+        if (t->index < first || t->index >= first + count)
+            continue;
+        if (t->index != first + n)
+            return -1;
+        transaction_entry_hash(t, leaves[n]);
+        n++;
+    }
+    if (n != count)
+        return -1;
+    int cnt = 0;
+    audit_path(leaves, 0, n, abs_index - first, steps, &cnt);
+    if (n_steps != NULL)
+        *n_steps = cnt;
     return 0;
 }
 
@@ -975,6 +1023,8 @@ int tx_history_append_attested(tx_history_t *hist, const transaction_t *in,
         return EXCEPTION(EINVAL);
     if (!tx_attest_digest_valid(in->evidence_digest))
         return EXCEPTION(EINVAL);
+    if (in->attest_scope[0] != '\0' && !tx_attest_digest_valid(in->attest_scope))
+        return EXCEPTION(EINVAL);
     uuid_t want;
     tx_attest_task_uuid(in->p1_uuid, in->subject_uuid, in->evidence_digest, want);
     if (uuid_compare(want, in->task_uuid) != 0)
@@ -1325,16 +1375,22 @@ static void _tx_attested_from_json_key(const json_t *obj, transaction_t *tx,
     tx->attested = false;
     memset(tx->subject_uuid, 0, sizeof(tx->subject_uuid));
     tx->evidence_digest[0] = '\0';
+    tx->attest_scope[0] = '\0';
     if (!json_is_true(json_object_get((json_t *)obj, "attested")))
         return;
     const char *subj = json_string_value(json_object_get((json_t *)obj, subject_key));
     const char *dig = json_string_value(json_object_get((json_t *)obj, "evidence_digest"));
+    const char *scope = json_string_value(json_object_get((json_t *)obj, "attest_scope"));
     uuid_t su;
     if (subj == NULL || uuid_parse(subj, su) != 0 || !tx_attest_digest_valid(dig))
+        return;
+    if (scope != NULL && !tx_attest_digest_valid(scope))
         return;
     tx->attested = true;
     uuid_copy(tx->subject_uuid, su);
     at_strlcpy(tx->evidence_digest, dig, sizeof(tx->evidence_digest));
+    if (scope != NULL)
+        at_strlcpy(tx->attest_scope, scope, sizeof(tx->attest_scope));
     tx->p2_set = false;
 }
 
@@ -1406,6 +1462,8 @@ int tx_history_era_to_json(const tx_history_t *hist, int start_idx, int end_idx,
             json_object_set_new(obj, "attested", json_true());
             json_object_set_new(obj, "subject", json_string(sstr));
             json_object_set_new(obj, "evidence_digest", json_string(tx->evidence_digest));
+            if (tx->attest_scope[0] != '\0')
+                json_object_set_new(obj, "attest_scope", json_string(tx->attest_scope));
             const char *cert = tx_history_attest_cert(hist, tx->task_uuid);
             json_t *cj = cert != NULL ? json_loads(cert, 0, NULL) : NULL;
             if (json_is_object(cj))
@@ -1920,6 +1978,8 @@ int reputation_evidence_to_json(const tx_history_t *hist,
             json_object_set_new(obj, "attested", json_true());
             json_object_set_new(obj, "subject_id", json_string(sstr));
             json_object_set_new(obj, "evidence_digest", json_string(tx->evidence_digest));
+            if (tx->attest_scope[0] != '\0')
+                json_object_set_new(obj, "attest_scope", json_string(tx->attest_scope));
             const char *cert = tx_history_attest_cert(hist, tx->task_uuid);
             json_t *cj = cert != NULL ? json_loads(cert, 0, NULL) : NULL;
             if (json_is_object(cj) && json_object_size(cj) > 0)

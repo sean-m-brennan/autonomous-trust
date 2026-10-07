@@ -2132,6 +2132,52 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         except Exception:
             pass
 
+    PACKAGE_HASHES_FILE = 'package_hashes.cfg.json'
+
+    @staticmethod
+    def _tagged_package_hash(value) -> str:
+        """A slot-0 package hash, tagged by runtime: this runtime's digest
+        travels as bytes and reads as ``py:<hex>``; a C node sends the string
+        ``c:<hex>`` (package_hash.h). Anything else is ``''``."""
+        if isinstance(value, (bytes, bytearray)):
+            try:
+                return 'py:' + bytes(value).decode('ascii')
+            except UnicodeDecodeError:
+                return ''
+        return value if isinstance(value, str) else ''
+
+    def _package_hash_admissible(self, ph) -> 'tuple[bool, str]':
+        """The admission decision for a peer presenting package hash ``ph``.
+
+        With ``etc/at/package_hashes.cfg.json`` (``{"accepted": [...]}``) the
+        tagged hash must be listed; an empty one is refused. Without it, the
+        old rule: a hash from THIS runtime must equal ours, and an empty or
+        other-runtime hash is unknown and admitted on identity alone.
+
+        The hash is self-reported. This turns away a modified build that says
+        what it is; one modified to report the honest hash gets in, and what
+        holds against it is that nothing it signs can raise its own standing
+        or erase a finding against it (doc/architecture/reputation.md,
+        "Verifier-attested scores"). Mirrors C at_package_hash_admissible."""
+        tagged = self._tagged_package_hash(ph)
+        path = os.path.join(Configuration.get_cfg_dir(), self.PACKAGE_HASHES_FILE)
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    accepted = json.load(f).get('accepted') or []
+            except (OSError, ValueError, AttributeError):
+                accepted = []
+            if tagged and any(isinstance(a, str) and hmac.compare_digest(a, tagged)
+                              for a in accepted):
+                return True, ''
+            return False, 'package hash %s not on the allowlist' % (
+                tagged[:10] or '(none)')
+        if isinstance(ph, str) and ph.startswith('c:'):
+            return True, ''
+        if not str(ph) or hmac.compare_digest(str(ph), str(self.package_hash)):
+            return True, ''
+        return False, 'package hash differs from ours'
+
     def welcoming_committee(self, queues, message):
         """
         Handle incoming newbies. Every peer in phase 3 caches the
@@ -2179,20 +2225,15 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                 if new_id == self.identity:
                     self.logger.debug('Should not have received my own announcement')
                     return
-                # Counterfeit check: a peer advertising a DIFFERENT non-empty
-                # package hash is running tampered software → reject. An EMPTY
-                # advertised hash means the peer doesn't compute one (e.g. a C
-                # at_demo node, which has no package-hash concept) — treat as
-                # "unknown", skip the check, and admit on identity/keys alone.
-                # This is the heterogeneous-fleet allowance that lets a C node
-                # join a Python welcoming committee; a same-runtime counterfeit
-                # still advertises its (mismatched) hash and is caught.
-                if str(ph) and not hmac.compare_digest(str(ph), str(self.package_hash)):
-                    self.logger.error("Newbie is running a counterfeit; Ignore")
+                # Counterfeit check (_package_hash_admissible): against the
+                # allowlist when etc/at ships one, else the old rule -- a
+                # same-runtime peer advertising a DIFFERENT hash is refused,
+                # and an empty or other-runtime hash is unknown, not refused.
+                ok, why = self._package_hash_admissible(ph)
+                if not ok:
+                    self.logger.error("Newbie is running a counterfeit; Ignore (%s)",
+                                      why)
                     return True
-                if not str(ph):
-                    self.logger.debug("Peer advertised no package hash (heterogeneous "
-                                      "runtime, e.g. C node); skipping counterfeit check")
                 id_obj = IdentityObj(new_id, new_id.uuid)
                 existing = self.peers.find_by_uuid(new_id.uuid)
                 if new_id == existing:  # don't care if it's a different address
@@ -2616,11 +2657,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                     self.freshness.mark(str(ident.uuid),
                                         IdentityProtocol.accept))
                 return True
-            # Counterfeit check: skip when the granter advertises an empty
-            # package hash (heterogeneous runtime, e.g. a C node) — same
-            # allowance as the request_access welcoming committee.
-            if str(pkh) and not hmac.compare_digest(str(pkh), str(self.package_hash)):
-                self.logger.error("Counterfeit 'peer'")
+            # Counterfeit check: the same gate as the welcoming committee.
+            ok, why = self._package_hash_admissible(pkh)
+            if not ok:
+                self.logger.error("Counterfeit 'peer' (%s)", why)
                 return True
             with self.lock:
                 self.peer_potentials[ident.uuid] = caps

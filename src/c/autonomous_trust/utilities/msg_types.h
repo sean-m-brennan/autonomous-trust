@@ -214,6 +214,13 @@ typedef struct {
      * APPENDED, for the CFFI mirror; whole-struct memcpy as above. */
     bool   attested;
     char   evidence_digest[64 + 1];
+    /* An attested score's SCOPE (optional, 64 lowercase hex, "" for none):
+     * what the attesting application says this finding is about, so AT's
+     * rate cap is one per (verifier, subject, channel, scope) rather than one
+     * per pair -- a fresh scan of a fixed commit is a new scope and answers a
+     * finding (Stele: blake2b(owner|name|commit|scanner)). APPENDED, for the
+     * CFFI mirror; whole-struct memcpy as above. */
+    char   attest_scope[64 + 1];
 } tx_score_msg_t;
 
 /**

@@ -268,9 +268,9 @@ typedef struct {
 
 /* Room for transaction_canonical_bytes at its longest: three uuids, two
  * scores, an index, two channels, and the attested block (a marker, a fourth
- * uuid and a digest). */
+ * uuid, a digest and an optional scope). */
 #define TX_CANON_MAX (UUID_STRING_LEN * 4 + 160 + 2 * (TX_CHANNEL_NAMELEN + 1) \
-                      + TX_ATTEST_DIGEST_HEX_LEN)
+                      + 2 * (TX_ATTEST_DIGEST_HEX_LEN + 1))
 
 typedef struct {
     uuid_t task_uuid;
@@ -318,6 +318,13 @@ typedef struct {
     bool   attested;
     uuid_t subject_uuid;
     char   evidence_digest[TX_ATTEST_DIGEST_HEX_LEN + 1];
+    /* An attested entry's optional SCOPE (64 lowercase hex, "" for none):
+     * what the attesting application says the finding is about. Keys the
+     * rate cap (one per verifier, subject, channel and scope) and is covered
+     * by transaction_canonical_bytes ONLY when set, so an unscoped entry
+     * hashes as it always did. APPENDED, for the CFFI mirror. Mirrors Python
+     * Transaction.attest_scope. */
+    char   attest_scope[TX_ATTEST_DIGEST_HEX_LEN + 1];
 } transaction_t;
 
 /* Committed: bilateral, or attested and indexed. The one test every reader of
@@ -340,6 +347,14 @@ bool transaction_score_about(const transaction_t *tx, const uuid_t peer_uuid,
  * entry must carry. Mirrors Python attest_task_id. */
 void tx_attest_task_uuid(const uuid_t verifier, const uuid_t subject,
                          const char *evidence_digest, uuid_t out);
+
+/* uuid5(AT_PAIR_NS, "task|executor"): the reputation task id for ONE
+ * requester-executor pair of a negotiation task. A task fanned out to N
+ * executors is N transactions, each pairing the requester's half about that
+ * executor with that executor's half; under the bare task id the N+1 halves
+ * were paired by arrival and nodes forked (ISSUES §2.50). Used for every task,
+ * since an executor cannot tell a fan-out. Mirrors Python pair_task_id. */
+void tx_pair_task_uuid(const uuid_t task, const uuid_t executor, uuid_t out);
 
 /* True iff @p digest is TX_ATTEST_DIGEST_HEX_LEN lowercase hex chars. */
 bool tx_attest_digest_valid(const char *digest);
@@ -567,6 +582,15 @@ typedef struct {
  * Mirrors Python TransactionHistory.inclusion_proof. */
 int  transaction_window_proof(const tx_history_t *hist, int abs_index,
                               tx_merkle_step_t *steps, int *n_steps);
+
+/* The audit path proving the committed entry at absolute `abs_index` belongs to
+ * the root over indices [first, first + count) -- a CHECKPOINT's window, which
+ * tx_history_range_root computes, rather than the whole resident window.
+ * Returns 0, or -1 unless every index in the range is resident, in order, and
+ * abs_index is inside it. Mirrors Python TransactionHistory._audit_path over
+ * attested_record's window. */
+int  tx_history_range_proof(const tx_history_t *hist, int first, int count,
+                            int abs_index, tx_merkle_step_t *steps, int *n_steps);
 
 /* Fold a leaf entry_hash up its audit path and check it reproduces root_hex.
  * Mirrors Python TransactionHistory.verify_inclusion. */

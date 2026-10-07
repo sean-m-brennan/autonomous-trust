@@ -41,6 +41,7 @@
 #include "negotiation/neg_certified.h"         /* §12.3 witness wire format */
 #include "config/configuration.h"             /* config_t, for our own identity */
 #include "reputation/tx_channel.h"             /* evidence channels */
+#include "reputation/reputation.h"              /* tx_pair_task_uuid */
 #include "utilities/send_retry.h"   /* at_send: keep a refused frame */
 
 /* Hand a sibling queue one of this process's frames, keeping it if the queue is
@@ -264,11 +265,9 @@ void negotiation_set_own_capabilities(const process_t *proc,
     {
         if (cap_names[i] == NULL) continue;
         size_t len = strlen(cap_names[i]);
-        char *dup = smrt_create(len + 1);
-        if (dup == NULL) continue;
-        memcpy(dup, cap_names[i], len + 1);
-        data_t *str_dat = string_data(dup, len + 1);
-        if (str_dat == NULL) { smrt_deref(dup); continue; }
+        /* string_data copies; no intermediate buffer to leak */
+        data_t *str_dat = string_data((char *)cap_names[i], len + 1);
+        if (str_dat == NULL) continue;
         array_append(arr, str_dat);
     }
     data_t *arr_dat = object_ptr_data(arr, sizeof(array_t));
@@ -1161,6 +1160,8 @@ static void _announce_task_locked(const process_t *proc, task_t *task,
 
         _neg_send(proc, "network", &invite, "an invitation");
         net_msg_free_obj(&invite.info.net_msg);
+        if (tracker != NULL)
+            task_tracker_add_invited(tracker, proc->protocol.peers[i].uuid);
         invited++;
     }
     peers_read_unlock(proc);
@@ -1175,12 +1176,15 @@ static void _announce_task_locked(const process_t *proc, task_t *task,
      *
      * The tracker is kept even when nothing was invited, which is what Python
      * does (start_task registers it before the participant check and leaves it
-     * on the no-peers path). It is also why a stray `report results` for a
-     * task nobody was invited to still scores -- true of both runtimes, and
-     * recorded in ISSUES.md rather than changed here, since it is a question
-     * about who may answer an invitation and not about this scoring path. */
+     * on the no-peers path). A stray `report results` from a peer that was
+     * not invited is no longer scored (ISSUES §2.8, closed by §2.50). */
     if (tracker != NULL)
+    {
         tracker->expected = invited;
+        /* The invitees are now known, none included: a result from anyone
+         * not invited is not scored (handle_results, ISSUES §2.8/§2.50). */
+        tracker->invited_known = true;
+    }
 
     if (invited == 0)
         log_warn(proc->logger, "Negotiation: no capable peers found for task %s\n",
@@ -2129,6 +2133,7 @@ static void _challenge_from_kwargs(const char *kwargs_json,
 {
     out->nonce = 0;
     out->payload = NULL;
+    out->sent_at = 0.0;
     payload_buf[0] = '\0';
     if (kwargs_json == NULL || kwargs_json[0] == '\0')
         return;
@@ -2197,6 +2202,22 @@ double negotiation_score_task_result(const char *cap_name,
                                     uint64_t seed,
                                     const char **channel_out)
 {
+    return negotiation_score_task_result_at(cap_name, kwargs_json, 0.0,
+                                            result_str, result_len,
+                                            certificate_json, prediction_json,
+                                            subject, now, seed, channel_out);
+}
+
+double negotiation_score_task_result_at(const char *cap_name,
+                                        const char *kwargs_json,
+                                        double issued_at,
+                                        const char *result_str, size_t result_len,
+                                        const char *certificate_json,
+                                        const char *prediction_json,
+                                        const char *subject, double now,
+                                        uint64_t seed,
+                                        const char **channel_out)
+{
     const char *channel_sink = NULL;
     if (channel_out == NULL)
         channel_out = &channel_sink;
@@ -2206,6 +2227,7 @@ double negotiation_score_task_result(const char *cap_name,
         probe_challenge_t challenge;
         _challenge_from_kwargs(kwargs_json, payload_buf,
                                sizeof(payload_buf), &challenge);
+        challenge.sent_at = issued_at;
         /* A numeric answer arrives as its decimal text (at.handshake,
          * at.time-attest). A reply that is not a number at all becomes NaN,
          * not 0: the verifiers treat non-finite as "unparseable" and score it
@@ -2405,7 +2427,19 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
             if (map_get(&neg_state.my_tasks, task_uuid_str, &trk_dat) == 0 && trk_dat)
                 data_object_ptr(trk_dat, (ptr_t *)&tracker);
 
-            if (tracker)
+            if (tracker && !task_tracker_was_invited(tracker, nmsg->from_whom.uuid))
+            {
+                log_warn(proc->logger, "Negotiation: results for task %s from %s, "
+                         "who was not invited; not scored\n", task_uuid_str,
+                         nmsg->from_whom.nickname);
+            }
+            else if (tracker && task_tracker_has_result(tracker, nmsg->from_whom.uuid))
+            {
+                log_debug(proc->logger, "Negotiation: repeated results for task %s "
+                          "from %s; already scored\n", task_uuid_str,
+                          nmsg->from_whom.nickname);
+            }
+            else if (tracker)
             {
                 /* Record the result from this peer */
                 task_tracker_set_result(tracker, nmsg->from_whom.uuid,
@@ -2416,66 +2450,48 @@ static bool handle_results(const process_t *proc, directory_t *queues, generic_m
                           "Negotiation: task %s collected %d/%d results\n",
                           task_uuid_str, collected, tracker->expected);
 
-                /* If all expected results have arrived, score and forward.
+                /* Score THIS result, as it arrives, under the pair task id
+                 * (ISSUES §2.50): one transaction per executor, so a task
+                 * fanned out to N peers is N transactions, each pairing our
+                 * half about that executor with that executor's half about
+                 * the task. Under the bare task id the N+1 halves were paired
+                 * by arrival and nodes forked.
                  *
                  * Scored here rather than in the main process, where Python
                  * scores it: the judgment needs what the requestor asked for,
-                 * and this is the process that retained it. Carrying the
-                 * capability name and the challenge onward through
-                 * task_result_msg_t would have meant widening an IPC struct
-                 * that the CFFI mirror also declares, to move a fact that is
-                 * already in hand here. One score per completed task, from
-                 * the last result to arrive, which is what Python's
-                 * handle_results forwards. */
+                 * and this is the process that retained it. The subject is
+                 * the authenticated sender, the same peer the physics layer
+                 * files the observation under and the competence weight
+                 * belongs to. */
+                const char *channel = TX_CHANNEL_TASK_OUTCOME;
+                char subject[UUID_STRING_LEN + 1] = {0};
+                uuid_unparse_lower(nmsg->from_whom.uuid, subject);
+                double score = negotiation_score_task_result_at(
+                    tracker->capability_name, tracker->kwargs_json,
+                    tracker->issued_at,
+                    (const char *)result_data, result_len,
+                    certificate_json, prediction_json, subject,
+                    _now_sec(), at_cert_verifier_seed(), &channel);
+                log_info(proc->logger,
+                         "Negotiation: task %s scored %.2f for %s (cap %s, via %s)\n",
+                         task_uuid_str, score, nmsg->from_whom.nickname,
+                         tracker->capability_name[0] != '\0'
+                             ? tracker->capability_name : "-",
+                         channel);
+                uuid_t pair;
+                tx_pair_task_uuid(task_uuid, nmsg->from_whom.uuid, pair);
+                _submit_tx_score(proc, pair, score, tracker->capability_name,
+                                 channel, nmsg->from_whom.uuid,
+                                 negotiation_competence_weight(
+                                     tracker->capability_name, subject));
+
+                /* Forward to the main process once every invitee has
+                 * answered, as before. */
                 if (collected >= tracker->expected)
                 {
                     log_info(proc->logger,
                              "Negotiation: task %s complete — forwarding results\n",
                              task_uuid_str);
-
-                    const char *channel = TX_CHANNEL_TASK_OUTCOME;
-                    /* The subject is the peer the physics layer files this
-                     * observation under, and it must be the SAME peer the
-                     * score is submitted against just below -- a fan-out is
-                     * unattributable, so both pass NULL and the layer runs
-                     * only the checks that need no identity. Filing several
-                     * peers' claims under one key would manufacture conflicts
-                     * between a peer and itself. */
-                    char subject_buf[UUID_STRING_LEN + 1] = {0};
-                    const char *subject = NULL;
-                    if (tracker->expected == 1)
-                    {
-                        uuid_unparse_lower(nmsg->from_whom.uuid, subject_buf);
-                        subject = subject_buf;
-                    }
-                    double score = negotiation_score_task_result(
-                        tracker->capability_name, tracker->kwargs_json,
-                        (const char *)result_data, result_len,
-                        certificate_json, prediction_json, subject,
-                        _now_sec(), at_cert_verifier_seed(), &channel);
-                    log_info(proc->logger,
-                             "Negotiation: task %s scored %.2f (cap %s, via %s)\n",
-                             task_uuid_str, score,
-                             tracker->capability_name[0] != '\0'
-                                 ? tracker->capability_name : "-",
-                             channel);
-                    /* The executor, from the AUTHENTICATED sender of the
-                     * reply -- and only for a single-participant task: the
-                     * results of a fan-out arrive from several peers and only
-                     * the last to answer carries the object that gets scored,
-                     * so naming it would attribute the whole task's outcome to
-                     * whoever happened to reply last. Mirrors Python
-                     * TaskResult.attach_executor. */
-                    /* The competence multiplier for the SAME peer the
-                     * score is filed against: a fan-out has no subject, so it
-                     * carries no learned weight either -- there is no single
-                     * peer whose record it would be. */
-                    _submit_tx_score(proc, task_uuid, score,
-                                     tracker->capability_name, channel,
-                                     (tracker->expected == 1)
-                                         ? nmsg->from_whom.uuid : NULL,
-                                     negotiation_competence_weight(
-                                         tracker->capability_name, subject));
 
                     /* Build TASK_RESULT message to the main (requestor) process */
                     generic_msg_t result_msg;
@@ -2711,7 +2727,19 @@ static void _drain_task_stack(const process_t *proc)
         /* No subject, so no learned weight: competence is a fact about a
          * peer's forecasting record, and this score is about our own
          * completion. Neutral == the authored transaction_weight verbatim. */
-        _submit_tx_score(proc, job.task.uuid, 0.9, job.task.capability.name,
+        /* Under the PAIR task id (ISSUES §2.50): this executor's half pairs
+         * only with the requester's half about this executor, however many
+         * peers the task fanned out to. */
+        const identity_t *me = _self_identity(proc);
+        if (me == NULL)
+        {
+            log_warn(proc->logger, "Negotiation: no identity; not scoring job %s\n",
+                     task_uuid_str);
+            continue;
+        }
+        uuid_t pair;
+        tx_pair_task_uuid(job.task.uuid, me->uuid, pair);
+        _submit_tx_score(proc, pair, 0.9, job.task.capability.name,
                          TX_CHANNEL_TASK_OUTCOME, NULL,
                          NEG_NEUTRAL_COMPETENCE);
     }

@@ -665,16 +665,36 @@ counted.
 **What the co-signers vouch for.** Admissibility, never truth. Each co-signer
 checks, in its own view of the group, that:
 
-- the verifier is an eligible author: its reputation in this node's view is at
-  least `AT_ATTEST_MIN_REP` (0.5 by default), and it is neither excluded nor
-  slashed;
+- the verifier is an eligible author by its **effective tier** in this node's
+  view, which is its score bounded by any standing ceiling (an unproved ZTA
+  credential, an Ethne expulsion) and tier 0 once it is excluded. A slashed or
+  excluded verifier is never eligible. The floor is tier 1 (0.50,
+  `AT_ATTEST_MIN_TIER`) for `probe`, `certificate` and `self_consistency`, and
+  tier 3 (0.80, `AT_ATTEST_REPLICATION_TIER`) for `replication`. When the older
+  raw-score knob `AT_ATTEST_MIN_REP` is set, it replaces the floor for the
+  first three channels and never relaxes replication's;
 - the verifier is not the subject, and the subject is a member;
-- the channel is one a verifier can author (`probe`, for now);
+- the channel is one a verifier can author: `probe` (a question the verifier
+  wrote and knows the answer to), `certificate` (the verifier checked a proof
+  the subject supplied about its own work, such as an SBOM against what the
+  verifier's own scan sees), `self_consistency` (the verifier's evidence
+  contradicts a claim the subject signed) or `replication` (the verifier re-ran
+  another verifier's check and reports what it got). Replication's higher tier
+  is the one difference between them. A replication is how a second voice
+  confirms a finding, so a node the subject has just spun up cannot be that
+  voice. Agreement across N verifiers is the consuming application's fold, not
+  the chain's, and every attested entry folds at weight one. `first_person`
+  never qualifies;
 - the entry is well-formed, its task id is the one derived from its content,
   and it is not a duplicate;
 - the verifier has not already attested this subject within the resident
-  window (one per pair, counted from the chain itself, so every node reaches the
-  same answer).
+  window, counted from the chain itself so every node reaches the same answer.
+  The cap is one per pair, unless the attestation names a **scope**: an
+  optional digest the application supplies to say what the finding is about
+  (Stele hashes owner, repository, commit and scanner). A scoped attestation is
+  capped at one per verifier, subject, channel and scope, so a fresh scan of the
+  commit that fixed a finding can answer it, and a repeat about the same commit
+  is still refused.
 
 None of that is a judgement about the finding. This keeps the rule from the
 start of this document intact: no channel becomes an accusation several nodes
@@ -696,10 +716,11 @@ fill the other half.
 
 Its canonical bytes extend the existing form rather than replacing it. Every
 attested entry carries a non-default channel, so the channel block is always
-present, and a final block `|attested|<subject>|<evidence_digest>` follows it.
-No ordinary entry has `p2` unset at commit time, so the two forms cannot
-collide, and every entry committed before the change keeps its bytes and its
-hash.
+present, and a final block `|attested|<subject>|<evidence_digest>` follows it,
+with `|<scope>` after that when the attestation names one. No ordinary entry has
+`p2` unset at commit time, so the two forms cannot collide, and every entry
+committed before the change keeps its bytes and its hash. An unscoped attested
+entry keeps its bytes too.
 
 **The round.** A fourth three-phase quorum, shaped like slashing and
 checkpoints rather than like the Paxos commit:
@@ -711,7 +732,7 @@ checkpoints rather than like the Paxos commit:
 | `attest final` | verifier → group | the entry and the map of verified co-signatures |
 
 Each signer signs the designation
-`"AT-ATTEST\0" verifier|subject|task|score|channel|evidence_digest[|group]`,
+`"AT-ATTEST\0" verifier|subject|task|score|channel|evidence_digest[|scope][|group]`,
 which excludes index and `prev_hash` because those differ per node until the
 chains reconcile. A receiver of the finalizer counts distinct verified signers
 under the rules of the previous section, with two more: the verifier's own
@@ -735,6 +756,44 @@ forgotten. A repeat cannot fork the round, because the task id is derived from
 (verifier, subject, evidence digest): it is the same round, and a co-signer signs
 the same designation again (ISSUES §2.40).
 
+**What outlives the window.** The resident window holds 200 entries and the
+evidence file is rewritten at every checkpoint, so on a busy group both lose an
+attested entry within minutes, while an application may need to show the
+finding for months. When a checkpoint whose signatures meet the quorum first
+covers an attested entry, each node writes a durable record of it to
+`etc/at/attested/<task>.json`, once, and never rewrites it. The record carries
+the entry and its certificate, the checkpoint and its signatures, the inclusion
+proof from one to the other, the public keys of every signer that node held, and
+the group sizes both quorums are counted against. `verify_attested_record`
+(Python) checks a record from that alone, which proves only that whoever wrote
+the record could sign it: a forger writes its own keys and a group of one.
+
+So each node also writes `etc/at/roster.cfg.json` after every checkpoint it
+stores. The file lists every member the node has held: uuid, signing key, first
+and last seen, the effective tier it last published, and whether the uuid is a
+member now. It also lists the last 256 checkpoints the node stored. A member who
+leaves is kept and marked, so a record it signed while it was a member still
+verifies. Given that roster as an `anchor` (`load_anchor`),
+`verify_attested_record` checks a record against the reader's own view of its
+group:
+- every key comes from the anchor, and a record signer whose key disagrees
+  fails;
+- the checkpoint must belong to the anchor's group, or to a chain the anchor
+  holds checkpoints for;
+- each quorum is counted against at least three members, whatever size the
+  record claims;
+- where the anchor holds a checkpoint over the same window at the same epoch,
+  the roots must match. The record is then reported as `linked`.
+
+A primary-chain checkpoint carries an empty `group_uuid`, because its
+designation does not bind the group. The keys are what tie it to one. Stele's
+viewer anchors on its own node, so a record handed to it from anywhere, the
+forge included, is believed only as far as that node's group signed it.
+
+To keep a busy chain from evicting an entry
+before any checkpoint covers it, a checkpoint falls due within 10 s of an
+attested commit (`AT_REP_ATTEST_CHECKPOINT_SEC`).
+
 **What the subject cannot do.** Block it, because its signature is not
 counted. Strip it, because the entry is hash-linked into a window root that a
 checkpoint quorum signs. Fork it away: when a node adopts a chain that dropped
@@ -744,7 +803,7 @@ refused.
 
 **How it is folded.** For the subject, an attested entry contributes the
 verifier's score as one consensus observation at capability weight one. The
-`probe` multiplier applies only on the verifier's own node, exactly as in
+channel multiplier applies only on the verifier's own node, exactly as in
 "Only your own evidence counts": a quorum certifies admissibility and does not
 raise a remote channel's weight. The verifier gains nothing from the entry.
 Attested entries are not bilateral history, so CTFT leaves them out. Decay is
@@ -754,7 +813,9 @@ time alone; only fresh evidence moves it.
 **What it opens, and what bounds it.** A malicious verifier can now place a poor
 score about a peer that peer cannot veto. Four things bound that. Every
 co-signer requires the verifier to be in good standing in its own view. One
-attestation per verifier and subject fits in the resident window. A remote node
+attestation per verifier and subject fits in the resident window, or one per
+scope and channel when the application names a scope, which still stops a
+verifier from repeating itself. A remote node
 folds it at weight one. And the verifier's key and the quorum's are on a
 committed entry, so the slander is attributable, and peers judge the verifier
 by it in turn. There is still no dispute mechanism, for the reason given above:
@@ -762,8 +823,9 @@ nothing here levies a verdict.
 
 The application decides what an audit means and what score it earns; AT
 decides only who may author one and what makes it stick. Stele
-(`apps/stele/`) is the first producer, scoring a repository owner's node on a
-vulnerability scan of its published commit.
+(`apps/stele/`) is the first producer, scoring a repository owner's node on
+scans of its published commits and folding a per-repository standing from the
+archived records.
 
 ## Commit certificates
 
@@ -1198,6 +1260,27 @@ outvoted. Now a stored quorate checkpoint our own chain does not reproduce sends
 the finalizer a chain request from the window's first index, and the reply is
 reconciled against that attestation. A checkpoint our chain matches sends
 nothing.
+
+That path needs a checkpoint to finalize, and while the live members' windows
+differ none can. Stele red-team run rt-1549357 (2026-10-06) left three live
+nodes split two against one at equal length, and the chain never moved again.
+So a request now also names the head it extends (an optional `head` key in C,
+a 4th element in Python). An acceptor at the same length with a different
+head does not grant. It backdates the proposer, which pulls the acceptor's
+chain, and asks for the proposer's chain, at most once per peer per 10 s.
+Both sides then reconcile under the same symmetric rule (ISSUES §2.51). Python
+also answers a chain request with its whole window, as C did, rather than
+the empty slice past the requester's own length.
+
+That run's fork came from one task committed with different pairings. A
+bootstrap task fans out to every capable peer, each executor submitted a half
+under the task's id, and so did the requestor. Two slots took the first two
+scorers to arrive, and each node saw a different two. A transaction is
+therefore now one requestor-executor pair: its task id is
+`pair_task_id(task, executor)`, uuid5 over `task|executor`. The executor
+scores under it, and the requestor scores each result as it arrives under the
+same id. A result from a peer that was not invited, or a repeat, is not scored
+(ISSUES §2.50, §2.8).
 
 Unit tests in both runtimes (`src/c/test/reputation_fork_test.c`,
 `TestChainForkReconcile`, `TestFinalityNeedsQuorum`, and the finality cases in

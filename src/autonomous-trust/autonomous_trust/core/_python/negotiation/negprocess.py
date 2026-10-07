@@ -145,6 +145,13 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
             # widest") is meaningless without that, and a peer that never
             # answers first is never probed at all.
             target = getattr(message, 'to_whom', None)
+            # Message wraps a single Identity in a list (_normalize_to_whom),
+            # so a directed probe arrives as [target]. Read as a bare object,
+            # every directed probe lost its address and went to every capable
+            # peer: the fan-out §2.50 forks the chain on. Found by
+            # results-uninvited-not-scored.
+            if isinstance(target, (list, tuple)):
+                target = target[0] if len(target) == 1 else None
             target_uuid = getattr(target, 'uuid', None)
             if target_uuid is not None:
                 addressed = [p for p in participants
@@ -484,56 +491,67 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
         return False
 
     def handle_results(self, queues, message):
+        """Every invitee's result is scored, as it arrives, under its own pair
+        task id (ISSUES §2.50): a task fanned out to N peers is N
+        transactions. Each result goes to the main process stamped with its
+        executor; all but the first carry ``score_only``, so the application
+        still sees one answer per task (forwarding stays first-reply, §2.8).
+        A result from a peer that was not invited, or a repeat from one
+        already scored, is dropped. The tracker lives until every invitee has
+        answered (or the task is cancelled). Mirrors C handle_results."""
         if message.function == NegotiationProtocol.result:
             task = message.obj
             if task.uuid in self.my_tasks:
                 try:
                     tracker = self.my_tasks[task.uuid]
                     results = tracker.results
-                    results[message.from_whom.uuid] = task.result
-                    if len(results) >= task.size:
-                        # Stamp the result with what WE asked for, before the
-                        # `del` below drops our only copy (R+D.md §12.7).
-                        # TaskInfo carries no `parameters`, so without this the
-                        # requestor-side scorer in automate.py cannot tell which
-                        # capability produced the result, let alone what
-                        # challenge was sent -- which is why the bootstrap
-                        # corpus's known-answer verifiers had nothing to
-                        # compare against and every probe scored as a plain
-                        # completion. Taken from `tracker` (our retained Task),
-                        # never from the responder's reply: see
-                        # TaskResult.attach_requested_parameters for why reading
-                        # the challenge off the reply would verify nothing.
-                        # The `result` verb carries a TaskResult in
-                        # production, but this handler is reachable with a bare
-                        # Task (the status/error paths build one, and the unit
-                        # tests exercise that shape), so stamp only what can be
-                        # stamped rather than raising out of the handler.
-                        # WHO answered, for the same reason and from the same
-                        # side of the wire (R+D.md §12.8): the requestor-side
-                        # scorer produces the evidence channel, and a
-                        # refutation that cannot name the peer it refutes is
-                        # scored but not actionable. Only for a single-
-                        # participant task -- see attach_executor.
-                        attach_who = getattr(task, 'attach_executor', None)
-                        if attach_who is not None:
-                            attach_who(next(iter(results))
-                                       if len(results) == 1 else None)
-                        attach = getattr(task, 'attach_requested_parameters',
-                                         None)
-                        if attach is None:
-                            self.logger.debug(
-                                'handle_results: %s carries no requested-'
-                                'parameter fields; forwarded unstamped',
-                                type(task).__name__)
-                        elif not attach(tracker):
-                            self.logger.debug(
-                                'handle_results: no parameters retained for '
-                                'task %s; result forwarded unstamped',
-                                task.uuid)
-                        queues[CfgIds.main].put(task, block=True, timeout=self.q_cadence)
-                        self.logger.debug('Task results forwarded')
-                    del self.my_tasks[task.uuid]  # no more results accepted
+                    who = message.from_whom.uuid
+                    invited = set(results)
+                    if invited and who not in invited:
+                        self.logger.warning(
+                            'handle_results: %s was not invited to task %s; '
+                            'not scored', str(who)[:8], task.uuid)
+                        return True
+                    scored = getattr(tracker, 'scored', None)
+                    if scored is None:
+                        scored = tracker.scored = set()
+                    if who in scored:
+                        self.logger.debug('handle_results: repeated result for '
+                                          '%s from %s', task.uuid, str(who)[:8])
+                        return True
+                    scored.add(who)
+                    results[who] = task.result
+                    # Stamp the result with what WE asked for (R+D.md §12.7),
+                    # from `tracker` (our retained Task), never from the
+                    # responder's reply: see TaskResult.attach_requested_
+                    # parameters for why reading the challenge off the reply
+                    # would verify nothing. The `result` verb carries a
+                    # TaskResult in production, but this handler is reachable
+                    # with a bare Task (the status/error paths build one, and
+                    # the unit tests exercise that shape), so stamp only what
+                    # can be stamped rather than raising out of the handler.
+                    # WHO answered, from the authenticated sender (R+D.md
+                    # §12.8): each result is now its own transaction, so it is
+                    # always attributable to exactly this executor.
+                    attach_who = getattr(task, 'attach_executor', None)
+                    if attach_who is not None:
+                        attach_who(who)
+                    attach = getattr(task, 'attach_requested_parameters', None)
+                    if attach is None:
+                        self.logger.debug(
+                            'handle_results: %s carries no requested-'
+                            'parameter fields; forwarded unstamped',
+                            type(task).__name__)
+                    elif not attach(tracker):
+                        self.logger.debug(
+                            'handle_results: no parameters retained for '
+                            'task %s; result forwarded unstamped', task.uuid)
+                    # Local-only: never serialized, read by automate.py.
+                    task.score_only = len(scored) > 1
+                    queues[CfgIds.main].put(task, block=True, timeout=self.q_cadence)
+                    self.logger.debug('Task results forwarded')
+                    if len(scored) >= max(1, len(invited)):
+                        del self.my_tasks[task.uuid]  # every invitee answered
                 except Full:
                     self.logger.error('handle_results: Main queue full')
             return True

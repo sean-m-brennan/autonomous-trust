@@ -43,6 +43,7 @@
 #include "identity_priv.h"
 #include "id_proc_priv.h"
 #include "id_ext.h"
+#include "package_hash.h"
 #include "utilities/b64.h"
 #include "utilities/freshness.h"
 
@@ -697,11 +698,9 @@ void identity_set_own_capabilities(const process_t *proc,
     {
         if (cap_names[i] == NULL) continue;
         size_t len = strlen(cap_names[i]);
-        char *dup = smrt_create(len + 1);
-        if (dup == NULL) continue;
-        memcpy(dup, cap_names[i], len + 1);
-        data_t *str_dat = string_data(dup, len + 1);
-        if (str_dat == NULL) { smrt_deref(dup); continue; }
+        /* string_data copies; no intermediate buffer to leak */
+        data_t *str_dat = string_data((char *)cap_names[i], len + 1);
+        if (str_dat == NULL) continue;
         array_append(arr, str_dat);
     }
     data_t *arr_dat = object_ptr_data(arr, sizeof(array_t));
@@ -1446,12 +1445,12 @@ static int _send_caps_query(const process_t *proc, const public_identity_t *peer
  ****************************/
 
 /* Frama-C: skipped — [solver-timeout] identity/peers preconditions */
-/* The access_granted body: ["", [], seq].
+/* The access_granted body: [package_hash, [], seq].
  *
- * This runtime does not advertise a package hash or a capability list on
- * access_granted (the identity rides on the envelope, and Python's
- * handle_acceptance skips its counterfeit check when the package hash is
- * empty -- the standing heterogeneous-runtime allowance). It DOES have to
+ * Slot 0 is this node's tagged package hash (package_hash.h), checked by the
+ * receiver against its allowlist when it has one. This runtime does not
+ * advertise a capability list on access_granted (the identity rides on the
+ * envelope). It DOES have to
  * carry the freshness sequence, because access_granted is plaintext and adds
  * the granter to the receiver's peer set on arrival, so unstamped it can be
  * harvested off the wire and replayed at any node past the handshake.
@@ -1470,7 +1469,7 @@ static json_t *_accept_body(const process_t *proc)
     json_t *body = json_array();
     if (body == NULL)
         return NULL;
-    json_array_append_new(body, json_string(""));
+    json_array_append_new(body, json_string(at_package_hash()));
     json_array_append_new(body, json_array());
     json_array_append_new(body, json_integer((json_int_t)seq));
     return body;
@@ -1873,6 +1872,29 @@ static bool handle_welcoming_committee(const process_t *proc, directory_t *queue
         }
     }
 
+    /* Package-hash gate (package_hash.h): with an allowlist in etc/at, a
+     * requester must present a listed hash; without one, admission is what it
+     * always was. Before the amnesia path, so a node that was admitted before
+     * the allowlist shipped is not re-admitted on its old standing. Mirrors
+     * Python welcoming_committee's _package_hash_admissible. */
+    {
+        char tagged[160] = {0};
+        json_t *hpayload = NULL;
+        if (net_msg_unpack_json(nmsg, &hpayload) == 0 && json_is_array(hpayload)
+            && json_array_size(hpayload) > 0)
+            at_package_hash_of_json(json_array_get(hpayload, 0), tagged,
+                                    sizeof(tagged));
+        json_decref(hpayload);
+        char why[96] = {0};
+        if (!at_package_hash_admissible(tagged, why, sizeof(why)))
+        {
+            log_warn(proc->logger, "Identity: Counterfeit %s refused (%s)\n",
+                     nmsg->from_whom.nickname, why);
+            probes_counter("id.join", "counterfeit", "refused");
+            return true;
+        }
+    }
+
     /* Check if already a peer.  If so, re-send access_granted in case the
      * peer restarted and lost its in-memory peer list (it still holds the
      * same identity/keys, but needs us to re-acknowledge it). */
@@ -2119,7 +2141,7 @@ static bool handle_acceptance(const process_t *proc, directory_t *queues, generi
              nmsg->from_whom.nickname);
 
     /* Freshness per granter, before anything is written. The body is
-     * [package_hash, capabilities, seq]; this runtime leaves the first two
+     * [package_hash, capabilities, seq]; this runtime leaves the capabilities
      * empty (see _accept_body) but the sequence is required. Unstamped is
      * refused, not accepted as legacy: this verb is PLAINTEXT, so anyone on
      * the wire can harvest one, and it appends the granter to our peer set
@@ -2127,6 +2149,7 @@ static bool handle_acceptance(const process_t *proc, directory_t *queues, generi
     {
         json_t *accept_payload = NULL;
         int64_t accept_seq = 0;
+        char tagged[160] = {0};
         if (net_msg_unpack_json(nmsg, &accept_payload) == 0
             && accept_payload != NULL && json_is_array(accept_payload)
             && json_array_size(accept_payload) >= 3)
@@ -2134,9 +2157,20 @@ static bool handle_acceptance(const process_t *proc, directory_t *queues, generi
             json_t *j = json_array_get(accept_payload, 2);
             if (json_is_integer(j))
                 accept_seq = (int64_t)json_integer_value(j);
+            at_package_hash_of_json(json_array_get(accept_payload, 0), tagged,
+                                    sizeof(tagged));
         }
         if (accept_payload != NULL)
             json_decref(accept_payload);
+        /* The granter is held to the same allowlist as a requester: an
+         * accept adds it to our peer set as surely as a vote adds a newbie. */
+        char why[96] = {0};
+        if (!at_package_hash_admissible(tagged, why, sizeof(why)))
+        {
+            log_warn(proc->logger, "Identity: Counterfeit granter %s refused (%s)\n",
+                     nmsg->from_whom.nickname, why);
+            return true;
+        }
         char granter[UUID_STRING_LEN + 1];
         uuid_unparse_lower(nmsg->from_whom.uuid, granter);
         pthread_mutex_lock(&id_state.lock);
@@ -4332,11 +4366,9 @@ static bool handle_caps_response(const process_t *proc, directory_t *queues, gen
         if (name == NULL) continue;   /* malformed item: skip */
 
         size_t len = strlen(name);
-        char *dup = smrt_create(len + 1);
-        if (dup == NULL) continue;
-        memcpy(dup, name, len + 1);
-        data_t *str_dat = string_data(dup, len + 1);
-        if (str_dat == NULL) { smrt_deref(dup); continue; }
+        /* string_data copies; no intermediate buffer to leak */
+        data_t *str_dat = string_data((char *)name, len + 1);
+        if (str_dat == NULL) continue;
         array_append(arr, str_dat);
 
         /* Object form: record the size-bounded descriptor keyed by cap name.
@@ -4352,22 +4384,14 @@ static bool handle_caps_response(const process_t *proc, directory_t *queues, gen
                 if (djson != NULL)
                 {
                     size_t dl = strlen(djson);
-                    char *ddup = smrt_create(dl + 1);
-                    if (ddup != NULL)
+                    /* string_data copies; no intermediate buffer to leak */
+                    data_t *ddat = string_data(djson, dl + 1);
+                    if (ddat != NULL)
                     {
-                        memcpy(ddup, djson, dl + 1);
-                        data_t *ddat = string_data(ddup, dl + 1);
-                        if (ddat != NULL)
-                        {
-                            pthread_mutex_lock(&id_state.lock);
-                            map_set(&id_state.peer_cap_descriptors_map,
-                                    (map_key_t)name, ddat);
-                            pthread_mutex_unlock(&id_state.lock);
-                        }
-                        else
-                        {
-                            smrt_deref(ddup);
-                        }
+                        pthread_mutex_lock(&id_state.lock);
+                        map_set(&id_state.peer_cap_descriptors_map,
+                                (map_key_t)name, ddat);
+                        pthread_mutex_unlock(&id_state.lock);
                     }
                     free(djson);   /* jansson json_dumps() uses malloc */
                 }
@@ -5010,13 +5034,14 @@ static int _build_announcement_for(const process_t *proc, generic_msg_t *buf,
      * Python's _broadcast_request_access (idprocess.py). Without a payload
      * Python's welcoming_committee (which does `ph, caps =
      * from_json_string(obj)`) would choke; emit the 2-element array so the
-     * two runtimes parse identically. The C node has no package-hash
-     * concept, so slot 0 is the empty string (Python treats an empty peer
-     * hash as "unknown" and skips its counterfeit check — see
-     * welcoming_committee). Slot 1 is this node's own capability names. */
+     * two runtimes parse identically. Slot 0 is this node's tagged package
+     * hash, "c:<hex>" (package_hash.h): a welcomer with an allowlist checks
+     * it, and one without treats another runtime's hash as unknown, as it
+     * always treated the empty one. Slot 1 is this node's own capability
+     * names. */
     json_t *payload = json_array();
     if (payload != NULL) {
-        json_array_append_new(payload, json_string(""));  /* package_hash */
+        json_array_append_new(payload, json_string(at_package_hash()));
         json_t *caps_arr = json_array();
         array_t *own = _id_own_caps_for(proc);
         if (own != NULL) {
@@ -7972,6 +7997,11 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
         return err;
 
     identity_register_handlers(proc);
+
+    /* What this node tells a welcomer it runs (package_hash.h), so an
+     * operator can put it on an allowlist. */
+    log_info(proc->logger, "Identity: package hash %s\n",
+             at_package_hash()[0] != '\0' ? at_package_hash() : "(unreadable)");
 
     /* Seed-assisted dual membership: adopt any group_child_*.cfg.json cohorts
      * this gateway holds (C twin of Python's _load_child_groups). A leaf with

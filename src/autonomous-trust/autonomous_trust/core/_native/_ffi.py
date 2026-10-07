@@ -40,12 +40,13 @@ ffi = FFI()
 ffi.cdef("""
 
     /* ---- utilities/allocation.h ---- */
-    typedef struct { bool alloc; size_t refs; } smrt_ptr_t;
+    typedef struct { uint64_t magic; bool alloc; size_t refs; void (*dtor)(void *); } smrt_ptr_t;
 
     void *smrt_create(size_t size);
     int smrt_recreate(void **pptr, size_t size);
     void smrt_ref(void *ptr);
     void smrt_deref(void *ptr);
+    void at_free(void *ptr);
 
     /* ---- utilities/exception.h ---- */
     typedef struct {
@@ -240,21 +241,21 @@ ffi.cdef("""
     } zta_credential_t;
 
     typedef struct {
-        bool alloc; size_t refs;  /* smrt_ptr_t */
+        uint64_t magic; bool alloc; size_t refs; void (*dtor)(void *);  /* smrt_ptr_t */
         unsigned char private_key[64];  /* crypto_sign_SECRETKEYBYTES */
         unsigned char public_key[32];   /* crypto_sign_PUBLICKEYBYTES */
         unsigned char public_hex[65];   /* hex + NUL */
     } signature_t;
 
     typedef struct {
-        bool alloc; size_t refs;  /* smrt_ptr_t */
+        uint64_t magic; bool alloc; size_t refs; void (*dtor)(void *);  /* smrt_ptr_t */
         unsigned char private_key[32];  /* crypto_box_SECRETKEYBYTES */
         unsigned char public_key[32];   /* crypto_box_PUBLICKEYBYTES */
         unsigned char public_hex[65];   /* hex + NUL */
     } encryptor_t;
 
     typedef struct {
-        bool alloc; size_t refs;  /* smrt_ptr_t */
+        uint64_t magic; bool alloc; size_t refs; void (*dtor)(void *);  /* smrt_ptr_t */
         unsigned char uuid[16];
         char address[46];     /* ADDR_LEN(45) + 1 == IPV6_ADDR_LEN; was 33 */
         char nickname[129];   /* NAME_LEN+1; Zooko ONLINE name (was fullname) */
@@ -346,7 +347,7 @@ ffi.cdef("""
 
     /* ---- network/network.h ---- */
     typedef struct {
-        bool alloc; size_t refs;  /* smrt_ptr_t */
+        uint64_t magic; bool alloc; size_t refs; void (*dtor)(void *);  /* smrt_ptr_t */
         int port;
         char mac_address[18];    /* MAC_ADDR_LEN(17) + 1 */
         char ip4_cidr[20];       /* CIDR4_LEN(19) + 1 */
@@ -547,6 +548,7 @@ ffi.cdef("""
         /* verifier-attested submission (msg_types.h); appended */
         bool attested;
         char evidence_digest[65];
+        char attest_scope[65];   /* optional scope; appended */
     } tx_score_msg_t;
 
     size_t message_size(message_type_t type);
@@ -576,7 +578,7 @@ ffi.cdef("""
 
     /* ---- processes/process_tracker.h ---- */
     typedef struct {
-        bool alloc; size_t refs;  /* smrt_ptr_t */
+        uint64_t magic; bool alloc; size_t refs; void (*dtor)(void *);  /* smrt_ptr_t */
         map_t *registry;
         logger_t *logger;
     } tracker_t;
@@ -678,6 +680,7 @@ ffi.cdef("""
         bool attested;
         unsigned char subject_uuid[16];
         char evidence_digest[65];
+        char attest_scope[65];   /* optional scope; appended */
     } transaction_t;
 
     /* tx_history_t/reputations_t contain embedded maps/arrays — opaque */

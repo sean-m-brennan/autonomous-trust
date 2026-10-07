@@ -18,15 +18,11 @@
 
 void *smrt_create(size_t size)
 {
-    /* Every smrt allocation carries a smrt_ptr_t header at offset 0 (the
-     * `sptr->alloc`/`sptr->refs` writes below). Callers that use smrt_create
-     * as a plain buffer allocator (e.g. smrt_create(strlen(s) + 1) for a
-     * string, or net_msg_pack_json for a short JSON payload) can request
-     * fewer than sizeof(smrt_ptr_t) bytes; the header write would then run
-     * past the allocation. Enforce the documented `requires size >=
-     * sizeof(smrt_ptr_t)` precondition with a floor so the header always
-     * fits. Over-allocating a few bytes is harmless — callers track their
-     * own logical length separately. */
+    /* Every smrt allocation carries a smrt_ptr_t header at offset 0. A
+     * request smaller than the header (once common, when smrt_create was
+     * also used for plain strings and packed buffers) would put the header
+     * write past the allocation, so floor it. Plain buffers now come from
+     * malloc/calloc; see the note on smrt_ptr_t in allocation.h. */
     if (size < sizeof(smrt_ptr_t))
         size = sizeof(smrt_ptr_t);
     void *ptr = calloc(1, size);
@@ -34,8 +30,10 @@ void *smrt_create(size_t size)
         return ptr;
     //@ assert ptr != \null;
     smrt_ptr_t *sptr = ptr;
+    sptr->magic = SMRT_MAGIC;
     sptr->alloc = true;
     sptr->refs = 1;
+    sptr->dtor = NULL;  /* already zeroed by calloc; explicit for WP */
     //@ assert sptr->alloc == true && sptr->refs == 1;
     return ptr;
 }
@@ -89,26 +87,36 @@ void smrt_ref(void *ptr)
  */
 /*@
   requires ptr == \null || \valid((smrt_ptr_t *)ptr);
-  requires ptr != \null ==> ((smrt_ptr_t *)ptr)->refs >= 1;
+  requires ptr != \null && ((smrt_ptr_t *)ptr)->magic == SMRT_MAGIC
+           ==> ((smrt_ptr_t *)ptr)->refs >= 1;
   behavior null_ptr:
     assumes ptr == \null;
     assigns \nothing;
     frees \nothing;
+  behavior not_smrt:
+    assumes ptr != \null;
+    assumes ((smrt_ptr_t *)ptr)->magic != SMRT_MAGIC;
+    assigns \nothing;
+    frees \nothing;
   behavior last_ref:
     assumes ptr != \null;
+    assumes ((smrt_ptr_t *)ptr)->magic == SMRT_MAGIC;
     assumes ((smrt_ptr_t *)ptr)->alloc == true;
     assumes ((smrt_ptr_t *)ptr)->refs == 1;
-    assigns ((smrt_ptr_t *)ptr)->alloc,
+    assigns ((smrt_ptr_t *)ptr)->magic,
+            ((smrt_ptr_t *)ptr)->alloc,
             ((smrt_ptr_t *)ptr)->refs;
     frees ptr;
   behavior decrement:
     assumes ptr != \null;
+    assumes ((smrt_ptr_t *)ptr)->magic == SMRT_MAGIC;
     assumes ((smrt_ptr_t *)ptr)->refs > 1;
     assigns ((smrt_ptr_t *)ptr)->refs;
     ensures ((smrt_ptr_t *)ptr)->refs == \old(((smrt_ptr_t *)ptr)->refs) - 1;
     frees \nothing;
   behavior not_allocated:
     assumes ptr != \null;
+    assumes ((smrt_ptr_t *)ptr)->magic == SMRT_MAGIC;
     assumes ((smrt_ptr_t *)ptr)->alloc == false;
     assumes ((smrt_ptr_t *)ptr)->refs == 1;
     assigns ((smrt_ptr_t *)ptr)->refs;
@@ -121,13 +129,22 @@ void _smrt_deref_impl(void *ptr)
         return;
     //@ assert ptr != \null;
     smrt_ptr_t *sptr = ptr;
+    /* Not an smrt block (a plain buffer written from offset 0, or a struct
+     * no smrt_create produced): touch nothing. Decrementing would corrupt
+     * the payload, and its bytes at the dtor slot are not a function. */
+    if (sptr->magic != SMRT_MAGIC)
+        return;
     //@ assert sptr->refs >= 1;
     sptr->refs--;
     //@ assert sptr->refs == \at(sptr->refs, Pre) - 1;
     if (sptr->alloc && sptr->refs <= 0) {
         //@ assert sptr->alloc == true && sptr->refs == 0;
+        sptr->magic = 0;  /* a second deref of the freed block reads no canary */
         sptr->alloc = false;
         sptr->refs = 0;
+        /* The finalizer releases what the struct owns; the block is ours. */
+        if (sptr->dtor != NULL)
+            sptr->dtor(ptr);
         free(ptr);
         //@ assert \at(sptr->alloc, Pre) == true;
     }
@@ -151,4 +168,9 @@ void _smrt_deref_impl(void *ptr)
 void smrt_deref(void *ptr)
 {
     _smrt_deref_impl(ptr);
+}
+
+void at_free(void *ptr)
+{
+    free(ptr);
 }

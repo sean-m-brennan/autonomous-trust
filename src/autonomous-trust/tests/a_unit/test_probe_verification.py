@@ -37,7 +37,8 @@ import pytest
 from autonomous_trust.core._python.bootstrap_capabilities import (
     at_echo_challenge, at_handshake, at_time_attest, is_probe_capability,
     register_bootstrap_capabilities, time_attest_tolerance,
-    verify_bootstrap_result, DEFAULT_TIME_ATTEST_TOLERANCE_SEC,
+    verify_bootstrap_result, verify_time_attest, verify_time_attest_window,
+    DEFAULT_TIME_ATTEST_TOLERANCE_SEC,
 )
 from autonomous_trust.core._python.capabilities import Capabilities
 from autonomous_trust.core._python.negotiation.negotiation import (
@@ -127,6 +128,66 @@ class TestTimeAttestTolerance:
             assert time_attest_tolerance() == DEFAULT_TIME_ATTEST_TOLERANCE_SEC
         finally:
             os.environ.pop('AT_TIME_ATTEST_TOLERANCE_SEC', None)
+
+
+class TestTimeAttestWindow:
+    """ISSUES §2.53: an honest clock read its time somewhere in the round
+    trip, so the window runs from when we sent the probe to when we scored
+    the reply. Against the scoring instant alone, a reply that took 1 s to
+    come back (routine in a live node) landed on 0.5 every time. Mirrors the
+    C test_verify_time_attest_window."""
+
+    TOL = DEFAULT_TIME_ATTEST_TOLERANCE_SEC
+
+    def test_an_answer_inside_the_round_trip_is_honest(self):
+        assert verify_time_attest_window(1001.0, 1000.0, 1002.0, self.TOL) == 0.9
+        assert verify_time_attest(1001.0, 1002.0, self.TOL) == 0.5
+
+    @pytest.mark.parametrize('result,want', [
+        (999.9, 0.9), (1002.1, 0.9), (999.7, 0.5), (1002.3, 0.5),
+        ('soon', 0.1), (float('nan'), 0.1)])
+    def test_the_tolerance_applies_at_both_edges(self, result, want):
+        assert verify_time_attest_window(result, 1000.0, 1002.0, self.TOL) == want
+
+    @pytest.mark.parametrize('sent_at', [None, 0, -5.0, float('nan'), 1003.0, 'x'])
+    def test_an_unknown_send_time_falls_back_to_the_instant(self, sent_at):
+        assert verify_time_attest_window(1001.0, sent_at, 1002.0, self.TOL) == 0.5
+        assert verify_time_attest_window(1002.05, sent_at, 1002.0, self.TOL) == 0.9
+
+    def test_the_tracker_dates_the_request_and_the_reply_carries_it(self):
+        from autonomous_trust.core import from_json_string, to_json_string
+        task = _task('at.time-attest')
+        before = at_time_attest()
+        tracker = TaskTracker(task)
+        assert before <= tracker.issued_at <= at_time_attest()
+        reply = TaskResult(task, result=at_time_attest(), requested_at=1.0)
+        reply.attach_requested_parameters(tracker)
+        assert reply.requested_at == tracker.issued_at
+        back = from_json_string(to_json_string(reply))
+        assert back.requested_at == tracker.issued_at
+
+    def test_no_local_record_clears_the_send_time(self):
+        class NoParams:
+            pass
+        reply = TaskResult(_task('at.time-attest'), result=1.0, requested_at=1.0)
+        reply.attach_requested_parameters(NoParams())
+        assert reply.requested_at is None
+
+    def test_the_requestor_scores_over_the_round_trip(self):
+        from autonomous_trust.core._python.automate import score_task_result
+        now = at_time_attest()
+        task = _task('at.time-attest')
+        late = TaskResult(task, result=now - 1.5,
+                          requested_capability_name='at.time-attest',
+                          requested_at=now - 3.0)
+        assert score_task_result(late) == (0.9, TX_CHANNEL_PROBE)
+        undated = TaskResult(task, result=now - 1.5,
+                             requested_capability_name='at.time-attest')
+        assert score_task_result(undated)[0] == 0.5
+        early = TaskResult(task, result=now - 10.0,
+                           requested_capability_name='at.time-attest',
+                           requested_at=now - 3.0)
+        assert score_task_result(early)[0] == 0.5
 
 
 class TestRequestedParameterIntegrity:

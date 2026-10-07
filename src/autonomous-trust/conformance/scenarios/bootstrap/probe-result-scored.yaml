@@ -27,9 +27,13 @@ description: |
     The bands, and why there are three rather than two:
       - 0.9, the answer we already knew;
       - 0.5, at.time-attest only: a clock outside tolerance but still a clock.
-        The comparison happens on the requestor at scoring time, so the measured
-        delta includes the round trip, and a truthful distant peer must not be
-        graded as a liar for it;
+        The window is the round trip (ISSUES §2.53): from when the requestor
+        recorded the request to when it scores the reply, widened by the
+        tolerance at both ends. Rows 8 to 10 date both with `sent_ago` /
+        `result_ago`, in seconds before the scoring instant: a reading 1.5 s
+        old on a request 3 s old is honest; the same reading with no record of
+        when we asked is drift (the window then shrinks to the instant), and
+        so is one that predates the request;
       - 0.1, wrong, or not an answer at all. `forty-two` and `soon` are parsed
         as unparseable rather than as zero, which matters most for
         at.time-attest: a finite 0 there lands on 0.5, so reading prose as zero
@@ -96,6 +100,17 @@ fixtures:
     - capability: at.time-attest
       kwargs: {}
       result: "soon"
+    - capability: at.time-attest
+      kwargs: {}
+      sent_ago: 3.0
+      result_ago: 1.5
+    - capability: at.time-attest
+      kwargs: {}
+      result_ago: 1.5
+    - capability: at.time-attest
+      kwargs: {}
+      sent_ago: 3.0
+      result_ago: 10.0
     - capability: data_fetch
       kwargs: {}
       result: "done"
@@ -114,6 +129,6 @@ steps:
 
 expected_state:
   requestor:
-    result_scores: [0.9, 0.1, 0.1, 0.9, 0.1, 0.5, 0.1, 0.8, 0.3]
+    result_scores: [0.9, 0.1, 0.1, 0.9, 0.1, 0.5, 0.1, 0.9, 0.5, 0.5, 0.8, 0.3]
     result_channels: [probe, probe, probe, probe, probe, probe, probe,
-                      task_outcome, task_outcome]
+                      probe, probe, probe, task_outcome, task_outcome]

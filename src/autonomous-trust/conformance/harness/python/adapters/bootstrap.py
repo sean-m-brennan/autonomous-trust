@@ -68,6 +68,7 @@ from __future__ import annotations
 import os
 import queue
 import sys
+import time
 from pathlib import Path
 import hashlib
 from types import SimpleNamespace
@@ -213,10 +214,21 @@ class BootstrapAdapter:
         channels: list[str] = []
         try:
             for row in rows:
+                # `sent_ago` / `result_ago` (seconds before now) date the
+                # request and a clock reading relative to the scoring
+                # instant, for at.time-attest's round-trip window (ISSUES
+                # §2.53).
+                now = time.time()
+                answer = row.get('result')
+                if 'result_ago' in row:
+                    answer = now - float(row['result_ago'])
+                sent_at = (now - float(row['sent_ago'])
+                           if 'sent_ago' in row else None)
                 result = TaskResult(
-                    None, row.get('result'), requestor=None,
+                    None, answer, requestor=None,
                     requested_capability_name=row.get('capability'),
-                    requested_kwargs=row.get('kwargs') or {})
+                    requested_kwargs=row.get('kwargs') or {},
+                    requested_at=sent_at)
                 score, channel = score_task_result(result)
                 scores.append(score)
                 channels.append(channel)

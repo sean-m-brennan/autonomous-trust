@@ -4,21 +4,17 @@ protocol: reputation
 name: chain-outdated-notification
 byte_pinning: false
 description: |
-    Exercises the `update needed` (ReputationProtocol.outdated)
-    handler — the path a peer takes when notified that its
-    reputation history is shorter than a peer's. handle_outdated
-    reads the requested length, slices `self.history.era(index)`,
-    and emits a `latest update` (ReputationProtocol.update)
-    message carrying the chain slice back to the sender.
+    Exercises the `update needed` (ReputationProtocol.outdated) handler: the
+    path a peer takes when another asks for its chain. handle_outdated answers
+    with a `latest update` carrying its WHOLE resident window, whatever length
+    the requester reports. Python used to send only `history.era(length)`,
+    which is empty for a requester as long as we are -- exactly the requester
+    on an equal-length fork, who then never reconciled (ISSUES §2.51). C always
+    sent the whole window.
 
-    Cross-language note: Python's adapter builds the inbound as
-    `str(length)` (raw decimal string); C's adapter builds an
-    empty JSON object `{}`. Both handlers may treat a missing/zero
-    length similarly (return empty chain) — the conformance value
-    here is no-crash equivalence on the handler entry point. A
-    deeper assertion (e.g. observable chain forwarded to sender)
-    would require expected_state coverage that neither adapter
-    currently exposes.
+    Cross-language note: Python's adapter builds the inbound as `str(length)`
+    (raw decimal string); C's adapter builds an empty JSON object `{}`. The
+    conformance value here is no-crash equivalence on the handler entry point.
 
 participants:
   - id: alice

@@ -277,6 +277,29 @@ class TestHandleMessages:
         at._handle_messages(queues, MagicMock(), {})
         assert not q_fb.empty()
 
+    def test_the_requestor_scores_each_executor_under_its_pair_id(self, setup_teardown):
+        """ISSUES §2.50: one transaction per executor; a result stamped
+        score_only is scored but not handed to the application again."""
+        from autonomous_trust.core.reputation.reputation import pair_task_id
+        at = self._make_at()
+        task = Task(TaskParameters('cap1'), 'req')
+        bob, carol = uuid4(), uuid4()
+        first = TaskResult(task=task, result=42)
+        first.attach_executor(bob)
+        second = TaskResult(task=task, result=42)
+        second.attach_executor(carol)
+        second.score_only = True
+        q_main, q_rep, q_fb = queue.Queue(), queue.Queue(), queue.Queue()
+        q_main.put(first)
+        q_main.put(second)
+        queues = {CfgIds.main: q_main, CfgIds.reputation: q_rep,
+                  at.external_feedback: q_fb}
+        at._handle_messages(queues, MagicMock(), {})
+        at._handle_messages(queues, MagicMock(), {})
+        ids = [q_rep.get_nowait().task_id for _ in range(2)]
+        assert ids == [pair_task_id(task.uuid, bob), pair_task_id(task.uuid, carol)]
+        assert q_fb.qsize() == 1
+
     def test_executable_task(self, setup_teardown):
         at = self._make_at()
         at.capabilities.register_ability('test_cap', lambda x: x)
@@ -346,6 +369,25 @@ class TestHandleResults:
         assert isinstance(ts, TransactionScore)
         assert ts.task_id == tr.uuid
         assert ts.capability_name == 'weighted_cap'
+
+    def test_the_executor_scores_under_its_pair_task_id(self, setup_teardown):
+        """ISSUES §2.50: the executor's half pairs only with the requestor's
+        half about THIS executor, however many peers the task fanned out to."""
+        from autonomous_trust.core.reputation.reputation import pair_task_id
+        at = self._make_at()
+        at.identity = SimpleNamespace(uuid=uuid4())
+        at.capabilities.register_ability('cap_p', lambda x: x)
+        task = Task(TaskParameters(Capability('cap_p')), 'req')
+        key = str(task.uuid)
+        at.active_tasks[key] = task
+        mock_result = MagicMock()
+        mock_result.ready.return_value = True
+        mock_result.get.return_value = 7
+        q_rep = queue.Queue()
+        at._handle_results({CfgIds.negotiation: queue.Queue(),
+                            CfgIds.reputation: q_rep}, {key: mock_result})
+        ts = q_rep.get_nowait()
+        assert ts.task_id == pair_task_id(task.uuid, at.identity.uuid)
 
     def test_completed_task_without_capability_is_unweighted(self,
                                                              setup_teardown):

@@ -32,10 +32,15 @@ int array_init(array_t *a)
      * that deref call free() on a stack address. alloc=false makes the deref
      * the intended no-op. array_create, whose struct IS an smrt allocation,
      * re-asserts the header afterwards. Mirrors map_init. */
+    a->magic = 0;
     a->alloc = false;
     a->refs = 0;
     a->size = 0;
-    a->array = smrt_create(sizeof(data_t));
+    /* The element buffer is a plain heap block of data_t pointers, NOT an
+     * smrt allocation: slot 0 sits at offset 0, so an smrt header there is
+     * overwritten by the first element, and a deref of the buffer then reads
+     * a pointer as `refs` and a pointer as `dtor`. */
+    a->array = calloc(1, sizeof(data_t *));
     if (a->array == NULL)
         return EXCEPTION(ENOMEM);
     return 0;
@@ -54,6 +59,7 @@ int array_create(array_t **array_ptr)
     /* array_init zeroes the header for the embedded case; this struct is a
      * real smrt allocation, so restore what smrt_create established or
      * array_free's closing deref would never free it. */
+    arr->magic = SMRT_MAGIC;
     arr->alloc = true;
     arr->refs = 1;
     return err;
@@ -64,10 +70,17 @@ int array_copy(array_t *a, array_t *cpy)
 {
     if (a == NULL)
         return EXCEPTION(EINVAL);
-    cpy->array = smrt_create(a->size * sizeof(data_t));
-    if (cpy->array == NULL)
+    data_t **buf = calloc(a->size > 0 ? a->size : 1, sizeof(data_t *));
+    if (buf == NULL)
         return EXCEPTION(ENOMEM);
-    memcpy(cpy->array, a->array, sizeof(data_t) * a->size);
+    memcpy(buf, a->array, sizeof(data_t *) * a->size);
+    /* The copy owns a reference to each element: array_free derefs every
+     * element of whichever array it is given, so a copy that shared them
+     * unreferenced released them once per array. */
+    for (size_t i = 0; i < a->size; i++)
+        smrt_ref(buf[i]);
+    free(cpy->array);  /* cpy is zeroed or array_init'd: NULL or init's slot */
+    cpy->array = buf;
     cpy->size = a->size;
     return 0;
 }
@@ -142,9 +155,10 @@ int array_set(array_t *a, int index, data_t *element)
          * array_init pre-allocates 1 slot, so size==0 && array!=NULL means
          * that slot is still free. Every other case must grow. */
         if (a->size > 0 || a->array == NULL) {
-            size_t new_size = (a->size + 1) * sizeof(data_t);
-            if (smrt_recreate((void **)&a->array, new_size) != 0)
+            data_t **grown = realloc(a->array, (a->size + 1) * sizeof(data_t *));
+            if (grown == NULL)
                 return EXCEPTION(ENOMEM);
+            a->array = grown;
         }
         a->size++;
     }
@@ -176,7 +190,7 @@ void array_free(array_t *a)
     */
     for (int i=0; i< a->size; i++)
         smrt_deref(a->array[i]);
-    smrt_deref(a->array);
+    free(a->array);
     a->array = NULL;
     a->size = 0;
     smrt_deref(a);
@@ -262,11 +276,15 @@ int array_from_json(const json_t *obj, void *data_struct)
 {
     array_t *array = data_struct;
     array->size = json_integer_value(json_object_get(obj, "size"));
-    array->array = smrt_create(array->size * sizeof(data_t *));
+    array->array = calloc(array->size > 0 ? array->size : 1, sizeof(data_t *));
+    if (array->array == NULL)
+        return -1;
     json_t *j_arr = json_object_get(obj, "array");
     for (int i=0; i<array->size; i++) {
         json_t *elt = json_array_get(j_arr, i);
         array->array[i] = smrt_create(sizeof(data_t));
+        if (array->array[i] == NULL)
+            return -1;
         data_from_json(elt, array->array[i]);
     }
     return 0;
