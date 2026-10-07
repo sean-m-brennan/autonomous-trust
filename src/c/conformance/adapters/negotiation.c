@@ -49,6 +49,7 @@
 #include "structures/map.h"
 #include "utilities/message.h"
 #include "utilities/msg_types_priv.h"
+#include "reputation/reputation.h"  /* tx_pair_task_uuid */
 
 #include "../negative_runner.h"
 
@@ -105,13 +106,27 @@ static const char *_resolve_to_id(const generic_msg_t *msg)
     return "unknown";
 }
 
+/* The task scores the requestor sent the reputation process this scenario:
+ * (task uuid, subject). `results_scored` asserts them. Python scores in its
+ * main process, so its adapter reads the results handed to main instead. */
+#define NEG_SCORES_MAX 32
+static struct { uuid_t task; uuid_t subject; } g_scores[NEG_SCORES_MAX];
+static size_t g_n_scores;
+
 static int _send_hook(const char *key,
                       const message_type_t type,
                       generic_msg_t *msg,
                       bool blocking)
 {
-    (void)key; (void)blocking;
+    (void)blocking;
     if (g_active_ctx == NULL) return 0;
+    if (type == TRANSACTION_SCORE && key != NULL && strcmp(key, "reputation") == 0
+        && g_n_scores < NEG_SCORES_MAX)
+    {
+        uuid_copy(g_scores[g_n_scores].task, msg->info.tx_score.task_uuid);
+        uuid_copy(g_scores[g_n_scores].subject, msg->info.tx_score.peer_uuid);
+        g_n_scores++;
+    }
     const char *to_id = _resolve_to_id(msg);
     const char *function = (type == NET_MESSAGE && msg->info.net_msg.function != NULL)
         ? msg->info.net_msg.function : "__internal__";
@@ -698,8 +713,25 @@ static int _build_inbound(sce_run_ctx_t *ctx,
     out->info.net_msg.function = (char *)function;
     out->info.net_msg.encrypt = false;
     memcpy(&out->info.net_msg.from_whom, sender_impl->pub, sizeof(public_identity_t));
-    if (recipient_impl)
+    /* A `spawn task` step goes from the requestor to itself, but on a start
+     * message `to_whom` is the peer the task is ADDRESSED to (start_task), and
+     * production's main process sends none. Copying the step's recipient made
+     * every spawned task "addressed to ourselves", so no peer was invited;
+     * it went unseen while a result from an uninvited peer still completed a
+     * task (ISSUES §2.8, closed by §2.50). A spawn carries no `to_whom` unless
+     * the step names `target`. */
+    bool spawn = strcmp(function, "spawn task") == 0;
+    if (recipient_impl && !spawn)
         memcpy(&out->info.net_msg.to_whom, recipient_impl->pub, sizeof(public_identity_t));
+    if (spawn && payload != NULL)
+    {
+        /* `target: <pid>` addresses the task. Mirrors the Python adapter. */
+        sce_participant_t *t = sce_find_participant(
+            ctx, json_string_value(json_object_get(payload, "target")));
+        np_impl_t *t_impl = t != NULL ? (np_impl_t *)t->impl : NULL;
+        if (t_impl != NULL && t_impl->pub != NULL)
+            memcpy(&out->info.net_msg.to_whom, t_impl->pub, sizeof(public_identity_t));
+    }
 
     if (body)
     {
@@ -826,6 +858,43 @@ static int _negotiation_check_expected_state(sce_run_ctx_t *ctx)
                              got ? "true" : "false",
                              want_present ? "true" : "false");
                     return -1;
+                }
+            } else if (strcmp(key, "results_scored") == 0) {
+                /* {task: <slug>, executors: [<pid>, ...]}: one score per
+                 * named executor, under pair(task, executor), about that
+                 * executor (ISSUES §2.50), and no other score. */
+                const char *slug = json_string_value(json_object_get(val, "task"));
+                json_t *ex = json_object_get(val, "executors");
+                if (slug == NULL || !json_is_array(ex)) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: results_scored expects {task, executors}", pid);
+                    return -1;
+                }
+                uuid_t task_uuid;
+                _uuid5("task:", slug, task_uuid);
+                if (g_n_scores != json_array_size(ex)) {
+                    snprintf(ctx->err, sizeof(ctx->err),
+                             "%s: results_scored for %s: %zu score(s), expected %zu",
+                             pid, slug, g_n_scores, json_array_size(ex));
+                    return -1;
+                }
+                size_t i;
+                json_t *who;
+                json_array_foreach(ex, i, who) {
+                    uuid_t ex_uuid, pair;
+                    _uuid5("neg:", json_string_value(who), ex_uuid);
+                    tx_pair_task_uuid(task_uuid, ex_uuid, pair);
+                    bool found = false;
+                    for (size_t k = 0; k < g_n_scores && !found; k++)
+                        found = uuid_compare(g_scores[k].task, pair) == 0
+                            && uuid_compare(g_scores[k].subject, ex_uuid) == 0;
+                    if (!found) {
+                        snprintf(ctx->err, sizeof(ctx->err),
+                                 "%s: results_scored for %s: no score about %s "
+                                 "under its pair task id", pid, slug,
+                                 json_string_value(who));
+                        return -1;
+                    }
                 }
             } else if (strcmp(key, "flood_count") == 0) {
                 /* {task: <slug>, count: <int>} — derive uuid from slug
@@ -1005,6 +1074,7 @@ void at_negotiation_run(const at_case_t *c, at_case_result_t *out)
     /* Wipe singleton neg_state so observables like task_in_stack:false /
      * has_my_task:false are not polluted by prior scenarios. */
     negotiation_reset_state();
+    g_n_scores = 0;
 
     json_t *parts = json_object_get(c->data, "participants");
     if (!json_is_array(parts))

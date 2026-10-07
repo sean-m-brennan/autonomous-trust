@@ -376,7 +376,7 @@ int messaging_send(const char *key, const message_type_t type, generic_msg_t *ms
     struct sockaddr_un target;
     if (unix_addr(key, &target) != 0)
     {
-        smrt_deref(data);
+        free(data);  /* generic_msg_to_proto's buffer is plain malloc */
         return SYS_EXCEPTION();
     }
 
@@ -394,7 +394,7 @@ int messaging_send(const char *key, const message_type_t type, generic_msg_t *ms
         .msg_iovlen  = 2,
     };
     ssize_t numbytes = sendmsg(my_q->fd, &mh, flags);
-    smrt_deref(data);
+    free(data);
     if (numbytes < 0)
     {
         if (errno == EAGAIN)

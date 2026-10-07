@@ -126,7 +126,7 @@ DEFINE_TEST(test_signal_proto_roundtrip)
     ck_assert_int_eq(sig_in.sig, 42);
     ck_assert_str_eq(sig_in.descr, "test_signal");
 
-    smrt_deref(data);
+    free(data);
 }
 END_TEST_DEFINITION()
 
@@ -154,7 +154,7 @@ DEFINE_TEST(test_generic_msg_signal_roundtrip)
     ck_assert_int_eq(msg_in.info.signal.sig, 7);
     ck_assert_str_eq(msg_in.info.signal.descr, "quit");
 
-    smrt_deref(data);
+    free(data);
 }
 END_TEST_DEFINITION()
 

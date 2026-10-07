@@ -77,6 +77,18 @@ double verify_time_attest(double result, double requestor_now, double tolerance)
     return (delta < tolerance) ? 0.9 : 0.5;
 }
 
+double verify_time_attest_window(double result, double sent_at,
+                                 double requestor_now, double tolerance)
+{
+    if (!isfinite(sent_at) || sent_at <= 0.0 || !isfinite(requestor_now)
+        || sent_at > requestor_now)
+        return verify_time_attest(result, requestor_now, tolerance);
+    if (!isfinite(result))
+        return 0.1;
+    return (result > sent_at - tolerance && result < requestor_now + tolerance)
+        ? 0.9 : 0.5;
+}
+
 double verify_echo(const char *result, const char *sent_payload)
 {
     if (result == NULL || sent_payload == NULL)
@@ -138,8 +150,9 @@ bool verify_bootstrap_result(const char *cap_name,
     }
     if (strcmp(cap_name, "at.time-attest") == 0) {
         double now_sec = (requestor_now > 0.0) ? requestor_now : at_time_attest();
-        *score_out = verify_time_attest(result_num, now_sec,
-                                        time_attest_tolerance());
+        double sent_at = (challenge != NULL) ? challenge->sent_at : 0.0;
+        *score_out = verify_time_attest_window(result_num, sent_at, now_sec,
+                                               time_attest_tolerance());
         return true;
     }
     if (strcmp(cap_name, "at.echo-challenge") == 0) {

@@ -81,7 +81,7 @@ DEFINE_TEST(test_peer_capabilities_json_roundtrip)
     data_t *cap2_dat = object_ptr_data(cap2, sizeof(capability_t));
     ck_assert_ret_ok(array_append(caps, cap2_dat));
 
-    char *peer_key = smrt_create(37);
+    char peer_key[37];   /* map_set copies the key */
     strcpy(peer_key, "550e8400-e29b-41d4-a716-446655440000");
     data_t *arr_dat = object_ptr_data(caps, sizeof(array_t));
     ck_assert_ret_ok(map_set(&matrix, peer_key, arr_dat));

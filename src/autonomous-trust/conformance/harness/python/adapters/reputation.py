@@ -707,7 +707,8 @@ class ReputationAdapter:
                             attest_task_id(vu, su, dig), p1_id=vu,
                             p1_score=float(entry.get('p1_score', 0.0)),
                             p1_channel=entry.get('p1_channel'), attested=True,
-                            subject_id=su, evidence_digest=dig))
+                            subject_id=su, evidence_digest=dig,
+                            attest_scope=entry.get('attest_scope')))
                     continue
                 slug = entry.get('task_id')
                 p1_id = entry.get('p1')
@@ -997,6 +998,13 @@ class ReputationAdapter:
                                                        from_id, to_id, payload))
         elif function == ReputationProtocol.request:
             tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)
+            # The fork probe's head (ISSUES §2.51): a literal, or "own" for
+            # the acceptor's own head. Mirrors the C adapter.
+            head = payload.get('head')
+            if head == 'own':
+                head = participants[to_id].impl.process._our_head()
+            if head:
+                tup = tup + (head,)
             obj = to_json_string(tup)
         elif function == ReputationProtocol.grant:
             id_tup = (int(payload['id1']), int(payload['id2']), proposer_uuid)
@@ -1220,7 +1228,8 @@ class ReputationAdapter:
                 subject_uuid=subject_uuid,
                 score=float(payload.get('score', 0.3)),
                 channel=payload.get('channel', 'probe'),
-                evidence_digest=payload.get('evidence_digest', 'ab' * 32))
+                evidence_digest=payload.get('evidence_digest', 'ab' * 32),
+                attest_scope=payload.get('scope'))
             if function == ReputationProtocol.attest_sign:
                 obj = to_json_string(
                     (str(att.task_id), str(sender_identity.uuid),

@@ -85,6 +85,25 @@ int d_cmp(data_t *a, data_t *b) { return memcmp(a->str, b->str, a->size); }
 */
 int o_cmp(data_t *a, data_t *b) { return a->obj != b->obj; }
 
+/* Frama-C: skipped — [alloc-pattern] frees the union's heap payload by type tag */
+void data_dtor(void *ptr)
+{
+    data_t *dat = ptr;
+    if (dat->type == STRING)
+        free(dat->str);
+    else if (dat->type == BYTES)
+        free(dat->byt);
+    dat->obj = NULL;
+}
+
+/* Frama-C: skipped — [alloc-pattern] frees the owned OBJECT payload */
+void data_owned_obj_dtor(void *ptr)
+{
+    data_t *dat = ptr;
+    free(dat->obj);
+    dat->obj = NULL;
+}
+
 bool data_equal(data_t *a, data_t *b)
 {
     return a->type == b->type && a->cmp(a, b) == 0;
@@ -162,8 +181,13 @@ data_t *string_data(char *val, size_t len)
     dat->type = STRING;
     dat->size = len;
     dat->str = calloc(1, len+1);
+    if (dat->str == NULL) {
+        smrt_deref(dat);
+        return NULL;
+    }
     strncpy(dat->str, val, len);
     dat->cmp = s_cmp;
+    dat->dtor = data_dtor;
     return dat;
 }
 
@@ -175,9 +199,14 @@ data_t *bytes_data(unsigned char *val, size_t len)
         return dat;
     dat->type = BYTES;
     dat->byt = calloc(1, len);
+    if (dat->byt == NULL && len > 0) {
+        smrt_deref(dat);
+        return NULL;
+    }
     memcpy(dat->byt, val, len);
     dat->cmp = d_cmp;
     dat->size = len;
+    dat->dtor = data_dtor;
     return dat;
 }
 
@@ -191,6 +220,16 @@ data_t *object_ptr_data(void *val, size_t len)
     dat->obj = val;
     dat->cmp = o_cmp;
     dat->size = 1;
+    return dat;
+}
+
+/* Frama-C: skipped — [alloc-pattern] void pointer casting with unbounded types */
+data_t *owned_object_data(void *val, size_t len)
+{
+    data_t *dat = object_ptr_data(val, len);
+    if (dat == NULL)
+        return dat;
+    dat->dtor = data_owned_obj_dtor;
     return dat;
 }
 
@@ -272,7 +311,8 @@ int data_bytes(data_t *d, unsigned char *b, size_t max_len)
 {
     if (d->type != BYTES)
         return EXCEPTION(EDAT_INVL);
-    memcpy(b, d->byt, max_len);
+    /* never read past the payload: max_len is the caller's buffer, not ours */
+    memcpy(b, d->byt, min(d->size, max_len));
     return 0;
 }
 
@@ -400,12 +440,19 @@ int data_sync_in(AutonomousTrust__Core__Protobuf__Structures__Data *pdata, data_
         data->bl = pdata->bl;
         break;
     case AUTONOMOUS_TRUST__CORE__PROTOBUF__STRUCTURES__DATA_TYPE__STRING:
-        data->str = malloc(pdata->size);
+        /* calloc(size + 1): a string filling `size` still ends in a NUL */
+        data->str = calloc(1, pdata->size + 1);
+        if (data->str == NULL)
+            return EXCEPTION(ENOMEM);
         strncpy(data->str, pdata->str, min(strlen(pdata->str), pdata->size));
+        data->dtor = data_dtor;
         break;
     case AUTONOMOUS_TRUST__CORE__PROTOBUF__STRUCTURES__DATA_TYPE__BYTES:
         data->byt = malloc(pdata->size);
+        if (data->byt == NULL && pdata->size > 0)
+            return EXCEPTION(ENOMEM);
         memcpy(data->byt, pdata->byt.data, pdata->size);
+        data->dtor = data_dtor;
         break;
     case AUTONOMOUS_TRUST__CORE__PROTOBUF__STRUCTURES__DATA_TYPE__OBJECT:
         return EXCEPTION(EDAT_SER_OBJ);
@@ -486,16 +533,33 @@ int data_from_json(const json_t *obj, void *data_struct)
         data->bl = json_boolean_value(dat);
         break;
     case STRING:
-        data->str = malloc(data->size + 1);
+        data->str = calloc(1, data->size + 1);
+        if (data->str == NULL)
+            return EXCEPTION(ENOMEM);
         strncpy(data->str, json_string_value(dat), data->size);
+        data->dtor = data_dtor;
         break;
     case BYTES:
     {
         size_t enc_size = json_string_length(dat);
         const char *enc_str = json_string_value(dat);
-        data->size = b64_decoded_len_s(enc_size, enc_str);
+        if (enc_str == NULL)
+            return EXCEPTION(EINVAL);
+        /* data_to_json writes b64_encoded_len characters, which counts
+         * libsodium's NUL terminator, so the string ends in one NUL */
+        size_t b64_len = enc_size;
+        if (b64_len > 0 && enc_str[b64_len - 1] == '\0')
+            b64_len--;
+        /* b64_decoded_len_s requires a whole number of >= 4-char quanta; a
+         * short one ("=", "==") underflowed it to SIZE_MAX */
+        if (b64_len != 0 && (b64_len < 4 || b64_len % 4 != 0))
+            return EXCEPTION(EINVAL);
+        data->size = (b64_len == 0) ? 0 : b64_decoded_len_s(b64_len, enc_str);
         data->byt = malloc(data->size);
+        if (data->byt == NULL && data->size > 0)
+            return EXCEPTION(ENOMEM);
         base64_decode(enc_str, enc_size, data->byt, data->size);
+        data->dtor = data_dtor;
         break;
     }
     case NONE:

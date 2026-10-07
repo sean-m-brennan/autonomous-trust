@@ -87,7 +87,8 @@ typedef struct {
     const char *name;
     /** Payload bytes in `info.payload`; must be <= @ref AT_MSG_PAYLOAD_MAX. */
     size_t size;
-    /** Serialize @p payload into a fresh smrt buffer at *@p data. */
+    /** Serialize @p payload into a fresh malloc buffer at *@p data (the caller
+     *  frees it; never an smrt_create block -- see allocation.h). */
     int (*to_proto)(const void *payload, void **data, size_t *data_len);
     /** Deserialize @p data into @p payload (AT_MSG_PAYLOAD_MAX bytes). */
     int (*from_proto)(const void *data, size_t data_len, void *payload);

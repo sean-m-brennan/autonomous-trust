@@ -59,7 +59,7 @@ from .network import Message, require_synced_clock
 from .reputation import (TransactionScore, ReputationProtocol, PeerReputation,
                          TX_CHANNEL_CERTIFICATE, TX_CHANNEL_TASK_OUTCOME,
                          TX_CHANNEL_PHYSICAL, TX_CHANNEL_PROBE)
-from .reputation.reputation import Reputation
+from .reputation.reputation import Reputation, pair_task_id
 from . import oracles
 from .negotiation.certified import split_certified
 from .queue_pool import QueuePool
@@ -168,7 +168,8 @@ def score_task_result(task, logger=None, name: str = '',
     cap_name = getattr(task, 'requested_capability_name', None)
     if is_probe_capability(cap_name):
         probe_score = verify_bootstrap_result(
-            cap_name, task.result, getattr(task, 'requested_kwargs', None))
+            cap_name, task.result, getattr(task, 'requested_kwargs', None),
+            sent_at=getattr(task, 'requested_at', None))
     if probe_score is not None:
         if logger is not None:
             logger.info('%s: probe %s scored %.2f for task %s',
@@ -1150,14 +1151,21 @@ class AutonomousTrust(Protocol):
                     # is the same reason a remote score's channel does not
                     # weigh (R+D.md §12.8).
                     executor = getattr(task, 'executor_uuid', None)
-                    tx = TransactionScore(task.uuid, score,
+                    # One transaction per executor, under the pair task id
+                    # (ISSUES §2.50); the executor's own half uses the same.
+                    tx_id = (pair_task_id(task.uuid, executor)
+                             if executor is not None else task.uuid)
+                    tx = TransactionScore(tx_id, score,
                                           capability_name=cap_name,
                                           channel=channel,
                                           subject_uuid=executor,
                                           competence=competence_weight(
                                               cap_name, executor))
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
-                    if self.external_feedback in queues:
+                    # The application sees one answer per task; the other
+                    # executors' results are scored only (negprocess).
+                    if self.external_feedback in queues \
+                            and not getattr(task, 'score_only', False):
                         queues[self.external_feedback].put(task, block=True, timeout=queue_cadence)
                 elif isinstance(message, (PeerReputation, AppEvent)):
                     # AT -> app: the outward hop the reputation process cannot
@@ -1298,7 +1306,12 @@ class AutonomousTrust(Protocol):
                     # falls back to weight 1, the prior behavior.
                     cap_name = getattr(
                         getattr(orig_task, 'capability', None), 'name', None)
-                    tx = TransactionScore(tr.uuid, 0.9, capability_name=cap_name)
+                    # Under the pair task id (ISSUES §2.50): pairs only with
+                    # the requestor's half about THIS executor.
+                    me = getattr(self.identity, 'uuid', None)
+                    tx = TransactionScore(
+                        pair_task_id(tr.uuid, me) if me is not None else tr.uuid,
+                        0.9, capability_name=cap_name)
                     queues[CfgIds.reputation].put(tx, block=True, timeout=queue_cadence)
                 except KeyboardInterrupt:
                     pass

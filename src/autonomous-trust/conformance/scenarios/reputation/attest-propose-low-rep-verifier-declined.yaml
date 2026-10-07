@@ -6,9 +6,9 @@ byte_pinning: false
 description: |
     A verifier below the attestation floor in a member's view is not vouched for.
 
-    bob holds alice at 0.3, below `AT_ATTEST_MIN_REP` (0.5). A verifier this node
-    does not yet trust cannot place a score its subject cannot veto, so bob
-    declines to co-sign.
+    bob holds alice at 0.3: effective tier 0, below `AT_ATTEST_MIN_TIER` (1, the
+    0.5 floor). A verifier this node does not yet trust cannot place a score its
+    subject cannot veto, so bob declines to co-sign.
 
 participants:
   - id: alice

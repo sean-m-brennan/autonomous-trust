@@ -1,0 +1,47 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: ask-permission-head-match-granted
+byte_pinning: false
+description: |
+    A request that extends the acceptor's own head is granted as before.
+
+    The fork probe (ISSUES §2.51) only withholds a grant when the lengths
+    match and the heads differ. Here alice extends bob's head at bob's length,
+    so it is the ordinary round-1 grant. (A request without a head, from a
+    peer that predates the probe, is request-granted.)
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+
+fixtures:
+  history_len:
+    bob: 3
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: ask permission
+    payload:
+      id1: 9999
+      id2: 4
+      proposer: alice
+      head: own
+
+  - id: 2
+    from: bob
+    to: alice
+    function: permission granted
+    in_response_to: 1
+    payload:
+      id1: 9999
+      id2: 4
+      proposer: alice
+
+expected_state:
+  bob:
+    requests_count: 1

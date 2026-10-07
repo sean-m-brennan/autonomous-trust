@@ -83,6 +83,16 @@ double verify_handshake(long result, long sent_nonce);
  *  0.5; non-finite (NaN/inf, the C analog of Python's unparseable) → 0.1. */
 double verify_time_attest(double result, double requestor_now, double tolerance);
 
+/** The same check against the round trip rather than one instant (ISSUES
+ *  §2.53): an honest clock read its time somewhere between our sending the
+ *  probe (@p sent_at) and our scoring the reply (@p requestor_now), so
+ *  anything in [sent_at - tolerance, requestor_now + tolerance] scores 0.9.
+ *  Outside it (but finite) → 0.5; non-finite → 0.1. A @p sent_at that is not
+ *  positive, not finite, or later than @p requestor_now is unknown, and the
+ *  check falls back to @ref verify_time_attest at @p requestor_now. */
+double verify_time_attest_window(double result, double sent_at,
+                                 double requestor_now, double tolerance);
+
 /** 0.9 iff both strings are non-NULL and byte-equal, else 0.1. */
 double verify_echo(const char *result, const char *sent_payload);
 
@@ -104,6 +114,9 @@ double verify_echo(const char *result, const char *sent_payload);
 typedef struct {
     long        nonce;
     const char *payload;
+    /** When we issued it, on our wall clock (at.time-attest's window opens
+     *  here); 0 = unknown, which scores against the scoring instant alone. */
+    double      sent_at;
 } probe_challenge_t;
 
 /** True iff @p cap_name is one of the known-answer probe capabilities.
@@ -115,10 +128,11 @@ bool is_probe_capability(const char *cap_name);
  *  @ref AT_DEFAULT_TIME_ATTEST_TOLERANCE_SEC on unset/garbage/non-positive.
  *
  *  The override was documented in both twins from the start and read by
- *  neither. Worth knowing when tuning it: the comparison happens on the
- *  REQUESTOR at scoring time, so the measured delta includes the round trip
- *  and not just the responder's clock error. That is survivable only because
- *  an out-of-tolerance-but-finite answer scores 0.5 rather than 0.1. */
+ *  neither. It bounds clock error only: the round trip is the window between
+ *  the challenge's sent_at and the scoring instant, which
+ *  @ref verify_time_attest_window allows on top of it (ISSUES §2.53). Before
+ *  that, a live reply's IPC and network latency alone exceeded 0.2 s, and
+ *  nearly every honest peer scored 0.5. */
 double time_attest_tolerance(void);
 
 /** Score a probe result against the answer the requestor already knows.
@@ -132,7 +146,9 @@ double time_attest_tolerance(void);
  *  @p result_num carries the numeric answer (at.handshake, at.time-attest)
  *  and @p result_str the string answer (at.echo-challenge); the unused one is
  *  ignored. @p requestor_now is the requestor's clock for at.time-attest; pass
- *  a non-positive value to read the clock here. Per-capability argument shapes
+ *  a non-positive value to read the clock here. A @p challenge with a
+ *  positive sent_at scores at.time-attest over the round trip
+ *  (@ref verify_time_attest_window). Per-capability argument shapes
  *  live in exactly this one place, mirroring Python verify_bootstrap_result. */
 bool verify_bootstrap_result(const char *cap_name,
                              double result_num, const char *result_str,

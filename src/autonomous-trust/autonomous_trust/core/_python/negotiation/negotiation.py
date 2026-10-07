@@ -16,6 +16,7 @@
 
 from datetime import UTC, datetime, timedelta
 import heapq
+import time
 from enum import Enum
 from queue import Empty
 from typing import Union, Optional
@@ -225,7 +226,8 @@ class TaskResult(TaskInfo):
     def __init__(self, task=None, result=None, proof=None,
                  certificate=None, prediction=None,
                  requested_capability_name: str = None,
-                 requested_args=None, requested_kwargs=None, **kwargs):
+                 requested_args=None, requested_kwargs=None,
+                 requested_at: float = None, **kwargs):
         if task is None:
             task_args = {}
         else:
@@ -279,6 +281,10 @@ class TaskResult(TaskInfo):
         self.requested_capability_name = requested_capability_name
         self.requested_args = tuple(requested_args or ())
         self.requested_kwargs = dict(requested_kwargs or {})
+        # WHEN we asked (TaskTracker.issued_at, wall clock), which opens
+        # at.time-attest's window (ISSUES §2.53). Same provenance as the rest
+        # of `requested_*`.
+        self.requested_at = requested_at
         # WHO produced this result, stamped on the requestor side by
         # `attach_executor` from the authenticated sender of the reply
         # (R+D.md §12.8). Local-only: `to_dict` drops it, so it is never
@@ -295,6 +301,9 @@ class TaskResult(TaskInfo):
         # TransactionScore.subject_uuid.
         d = super().to_dict()
         d.pop('executor_uuid', None)
+        # Likewise the requestor's own note that this result is scored but
+        # not forwarded to the application (negprocess.handle_results).
+        d.pop('score_only', None)
         return d
 
     def attach_executor(self, executor_uuid) -> bool:
@@ -349,6 +358,7 @@ class TaskResult(TaskInfo):
         self.requested_capability_name = None
         self.requested_args = ()
         self.requested_kwargs = {}
+        self.requested_at = None
         params = getattr(original, 'parameters', None)
         if params is None:
             return False
@@ -356,6 +366,7 @@ class TaskResult(TaskInfo):
         self.requested_capability_name = getattr(capability, 'name', None)
         self.requested_args = tuple(getattr(params, 'args', ()) or ())
         self.requested_kwargs = dict(getattr(params, 'kwargs', {}) or {})
+        self.requested_at = getattr(original, 'issued_at', None)
         return self.requested_capability_name is not None
 
     def generate_proof(self):
@@ -403,7 +414,13 @@ class TaskCounter(Task):
 class TaskTracker(Task):
     def __init__(self, task):
         super().__init__(**task.to_dict())
-        self.results = {}  # keyed by peer.uuid
+        # Wall clock when we asked: at.time-attest's window opens here
+        # (ISSUES §2.53).
+        self.issued_at = time.time()
+        self.results = {}  # keyed by peer.uuid; pre-seeded with the invitees
+        # Peers whose result has been scored: one score per executor (ISSUES
+        # §2.50), and a replayed result is not scored twice.
+        self.scored = set()
 
 
 class Job(object):

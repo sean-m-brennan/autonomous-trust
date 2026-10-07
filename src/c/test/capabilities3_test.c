@@ -47,7 +47,7 @@ DEFINE_TEST(test_capability_proto_roundtrip)
 
     ck_assert_str_eq(cap2.name, "test_cap");
 
-    smrt_deref(data);
+    free(data);
 }
 END_TEST_DEFINITION()
 
@@ -66,18 +66,18 @@ DEFINE_TEST(test_capability_json_with_arguments)
     strncpy(cap->name, "data_ingest", CAP_NAMELEN);
     map_init(&cap->arguments);
 
-    char *k1 = smrt_create(16);
+    char k1[16];   /* map_set copies the key */
     strcpy(k1, "frequency");
     map_set(&cap->arguments, k1, integer_data(3));
 
-    char *k2 = smrt_create(16);
+    char k2[16];   /* map_set copies the key */
     strcpy(k2, "format");
     map_set(&cap->arguments, k2, integer_data(5));
 
     data_t *cap_dat = object_ptr_data(cap, sizeof(capability_t));
     ck_assert_ret_ok(array_append(caps, cap_dat));
 
-    char *peer_key = smrt_create(37);
+    char peer_key[37];   /* map_set copies the key */
     strcpy(peer_key, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
     data_t *arr_dat = object_ptr_data(caps, sizeof(array_t));
     ck_assert_ret_ok(map_set(&matrix, peer_key, arr_dat));
@@ -129,7 +129,7 @@ DEFINE_TEST(test_peer_capabilities_json_multiple_peers)
     strncpy(c1->name, "sensing", CAP_NAMELEN);
     map_init(&c1->arguments);
     ck_assert_ret_ok(array_append(caps1, object_ptr_data(c1, sizeof(capability_t))));
-    char *k1 = smrt_create(37);
+    char k1[37];   /* map_set copies the key */
     strcpy(k1, "11111111-1111-1111-1111-111111111111");
     ck_assert_ret_ok(map_set(&matrix, k1, object_ptr_data(caps1, sizeof(array_t))));
 
@@ -145,7 +145,7 @@ DEFINE_TEST(test_peer_capabilities_json_multiple_peers)
     strncpy(c2b->name, "storage", CAP_NAMELEN);
     map_init(&c2b->arguments);
     ck_assert_ret_ok(array_append(caps2, object_ptr_data(c2b, sizeof(capability_t))));
-    char *k2 = smrt_create(37);
+    char k2[37];   /* map_set copies the key */
     strcpy(k2, "22222222-2222-2222-2222-222222222222");
     ck_assert_ret_ok(map_set(&matrix, k2, object_ptr_data(caps2, sizeof(array_t))));
 

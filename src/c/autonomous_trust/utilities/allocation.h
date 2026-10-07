@@ -23,10 +23,35 @@
 
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdint.h>
 
+/** Written by smrt_create into @c magic; anything else is not an smrt block. */
+#define SMRT_MAGIC 0x534d52545f484452ULL  /* "SMRT_HDR" */
+
+/**
+ * Header at offset 0 of every smrt allocation.
+ *
+ * @c magic is a canary: smrt_create writes SMRT_MAGIC, and smrt_deref is a
+ * no-op on a block that does not carry it. A buffer written from offset 0
+ * (a string, a packed protobuf, a raw struct copy) destroys it, so a stray
+ * smrt_deref of such a buffer can neither decrement payload bytes as @c refs
+ * nor call payload bytes as @c dtor. smrt_create is for structs that embed
+ * this header; plain buffers come from malloc/calloc and go back via free.
+ *
+ * @c dtor is an optional finalizer, called with the allocation's own address
+ * when the LAST reference is dropped, just before the block is freed. It
+ * releases whatever the struct owns beyond its own bytes (e.g. a @c data_t's
+ * STRING/BYTES buffer). It must not free the block itself or touch @c refs.
+ * smrt_create leaves it NULL; the owning type's constructor sets it.
+ *
+ * The layout is mirrored by the CFFI cdef (core/_native/_ffi.py) — once as
+ * this typedef and once inline in every struct that embeds it.
+ */
 typedef struct {
+    uint64_t magic;
     bool alloc;
     size_t refs;
+    void (*dtor)(void *);
 } smrt_ptr_t;
 
 /*@ predicate smrt_valid(smrt_ptr_t *p) =
@@ -45,8 +70,10 @@ typedef struct {
   assigns \result \from size;
   ensures \result == \null ||
     (\valid((char *)\result + (0 .. size - 1)) &&
+     ((smrt_ptr_t *)\result)->magic == SMRT_MAGIC &&
      ((smrt_ptr_t *)\result)->alloc == true &&
-     ((smrt_ptr_t *)\result)->refs == 1);
+     ((smrt_ptr_t *)\result)->refs == 1 &&
+     ((smrt_ptr_t *)\result)->dtor == \null);
 */
 void *smrt_create(size_t size);
 
@@ -80,24 +107,42 @@ void smrt_ref(void *ptr);
 
 /*@
   requires ptr == \null || \valid((smrt_ptr_t *)ptr);
-  requires ptr != \null ==> ((smrt_ptr_t *)ptr)->refs >= 1;
-  assigns ((smrt_ptr_t *)ptr)->alloc,
+  requires ptr != \null && ((smrt_ptr_t *)ptr)->magic == SMRT_MAGIC
+           ==> ((smrt_ptr_t *)ptr)->refs >= 1;
+  assigns ((smrt_ptr_t *)ptr)->magic,
+          ((smrt_ptr_t *)ptr)->alloc,
           ((smrt_ptr_t *)ptr)->refs;
   behavior null_ptr:
     assumes ptr == \null;
     assigns \nothing;
+  behavior not_smrt:
+    assumes ptr != \null;
+    assumes ((smrt_ptr_t *)ptr)->magic != SMRT_MAGIC;
+    assigns \nothing;
   behavior last_ref:
     assumes ptr != \null;
+    assumes ((smrt_ptr_t *)ptr)->magic == SMRT_MAGIC;
     assumes ((smrt_ptr_t *)ptr)->alloc == true;
     assumes ((smrt_ptr_t *)ptr)->refs == 1;
     ensures ((smrt_ptr_t *)ptr)->refs == 0;
   behavior decrement:
     assumes ptr != \null;
+    assumes ((smrt_ptr_t *)ptr)->magic == SMRT_MAGIC;
     assumes ((smrt_ptr_t *)ptr)->refs > 1;
     ensures ((smrt_ptr_t *)ptr)->refs == \old(((smrt_ptr_t *)ptr)->refs) - 1;
   disjoint behaviors;
 */
 void _smrt_deref_impl(void *ptr);
+
+/**
+ * @brief free() for FFI callers.
+ *
+ * Plain buffers the library hands out (the *_to_proto outputs,
+ * net_message_to_wire_fmt, ...) come from malloc and must go back through
+ * free, never smrt_deref. A foreign caller cannot name libc's free through
+ * the library handle reliably, so this exports it.
+ */
+void at_free(void *ptr);
 
 /* Macro NULLs the caller's pointer after free to prevent use-after-free */
 #define smrt_deref(ptr) do { _smrt_deref_impl(ptr); (ptr) = NULL; } while(0)

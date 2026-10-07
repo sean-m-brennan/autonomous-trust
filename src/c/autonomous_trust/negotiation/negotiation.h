@@ -110,6 +110,17 @@ typedef struct {
      *  Python TaskResult.attach_requested_parameters. See R+D.md §12.7. */
     char capability_name[CAP_NAMELEN + 1];
     char kwargs_json[TASK_KWARGS_LEN + 1];
+    /** When the request was recorded, on the wall clock (seconds; 0 = never).
+     *  Opens at.time-attest's window: an honest answer was read between this
+     *  and the scoring instant (ISSUES §2.53). */
+    double issued_at;
+    /** The peers the announce invited (uuid_str -> 1), and whether the announce
+     *  recorded them. Once known, a result from anyone else is not scored:
+     *  scoring per executor (ISSUES §2.50) would otherwise let a peer that
+     *  learned a task id earn a full bilateral transaction (§2.8). A tracker
+     *  built without an announce (unit tests) leaves it unknown. */
+    map_t invited;
+    bool  invited_known;
 } task_tracker_t;
 
 /*@
@@ -170,6 +181,18 @@ int  task_tracker_result_count(const task_tracker_t *tracker);
 int  task_tracker_set_request(task_tracker_t *tracker,
                               const char *capability_name,
                               const char *kwargs_json);
+
+/** Record that @p peer_uuid was invited to this tracker's task; from the first
+ *  call on, @ref task_tracker_was_invited answers from the record. */
+int  task_tracker_add_invited(task_tracker_t *tracker, const uuid_t peer_uuid);
+
+/** Whether a result from @p peer_uuid may be scored: true when the announce
+ *  recorded no invitees (the tracker was built without one), else only for an
+ *  invited peer. */
+bool task_tracker_was_invited(const task_tracker_t *tracker, const uuid_t peer_uuid);
+
+/** Whether this tracker already holds a result from @p peer_uuid (a replay). */
+bool task_tracker_has_result(const task_tracker_t *tracker, const uuid_t peer_uuid);
 
 /*@
   requires \valid(tracker);

@@ -154,11 +154,15 @@ size_t map_key2index(map_t *map, map_key_t key)
 int reindex(map_t *map)
 {
     size_t old_capacity = map->capacity;
-    map->capacity = increment_capacity(map->capacity);
-    map_item_t *items = smrt_create(map->capacity * sizeof(map_item_t));
+    size_t new_capacity = increment_capacity(map->capacity);
+    /* increment_capacity returns UINT64_MAX when its prime search runs out */
+    if (new_capacity == 0 || new_capacity > SIZE_MAX / sizeof(map_item_t))
+        return EXCEPTION(ENOMEM);
+    /* plain calloc: the items buffer is an array, not an smrt struct */
+    map_item_t *items = calloc(new_capacity, sizeof(map_item_t));
     if (items == NULL)
         return EXCEPTION(ENOMEM);
-    memset(items, 0, map->capacity * sizeof(map_item_t));
+    map->capacity = new_capacity;
     /*@
       loop invariant 0 <= i <= old_capacity;
       loop assigns i, items[0 .. map->capacity - 1];
@@ -186,7 +190,7 @@ int reindex(map_t *map)
             items[idx] = entry;
         }
     }
-    free(map->items); // no deref, force free
+    free(map->items);
     map->items = items;
     //@ assert map->length <= map->capacity;
     return 0;
@@ -203,9 +207,12 @@ int map_init(map_t *map)
     map->length = 0;
     crypto_shorthash_keygen(map->hashkey);
     array_init(&map->keys);
+    map->magic = 0;
     map->alloc = false;
     map->refs = 0;
-    map->items = smrt_create(map->capacity * sizeof(map_item_t));
+    /* A plain array: items[0] used to double as an smrt header that every
+     * insert, shift and reindex overwrote, so the closing deref leaked it. */
+    map->items = calloc(map->capacity, sizeof(map_item_t));
     if (map->items == NULL)
         return EXCEPTION(ENOMEM);
     //@ assert map->length == 0;
@@ -225,17 +232,20 @@ int map_create(map_t **map_ptr)
         return EXCEPTION(ENOMEM);
 
     int err = map_init(map);
-    if (err != 0)
-    {
-        smrt_deref(map);
-        return err;
-    }
     /* map_init zeroes the smrt header for the embedded case (a stack map_t or
      * a struct member, whose header no allocator wrote); this struct IS an
      * smrt allocation, so restore what smrt_create established or map_free's
-     * closing deref would never free it. Mirrors array_create. */
+     * closing deref -- and the error deref below -- would never free it.
+     * Mirrors array_create. */
+    map->magic = SMRT_MAGIC;
     map->alloc = true;
     map->refs = 1;
+    if (err != 0)
+    {
+        smrt_deref(map);
+        *map_ptr = NULL;
+        return err;
+    }
     return err;
 }
 
@@ -412,7 +422,7 @@ void map_free(map_t *map)
      *   map->items[i].key points into heap memory that was strdup'd when the
      *   entry was inserted (see map_set). Those key strings are independent
      *   allocations from the items array itself. We MUST free every key
-     *   before smrt_deref'ing map->items, because once items is freed the
+     *   before freeing map->items, because once items is freed the
      *   items[i].key pointers are no longer dereferenceable — even reading
      *   them to pass to free() would be a use-after-free.
      *
@@ -442,7 +452,7 @@ void map_free(map_t *map)
      * a struct member, so array_free's closing deref must find alloc=false
      * and do nothing rather than free() an interior pointer. */
     array_free(&map->keys);
-    smrt_deref(map->items);
+    free(map->items);
     smrt_deref(map);
 }
 
@@ -496,13 +506,15 @@ int map_sync_in(AutonomousTrust__Core__Protobuf__Structures__DataMap *dmap, map_
         data_t *elt = smrt_create(sizeof(data_t));
         if (elt == NULL)
             return EXCEPTION(ENOMEM);
-        char *key = smrt_create(strlen(dmap->map[i]->key) + 1);
-        if (key == NULL)
-            return EXCEPTION(ENOMEM);
-        strcpy(key, dmap->map[i]->key);
-        data_sync_in(dmap->map[i]->value, elt);
-        if (map_set(map, key, elt) != 0)
+        /* map_set strdup's the key, so no copy of our own */
+        if (data_sync_in(dmap->map[i]->value, elt) != 0) {
+            smrt_deref(elt);
             return -1;
+        }
+        if (map_set(map, dmap->map[i]->key, elt) != 0) {
+            smrt_deref(elt);
+            return -1;
+        }
     }
     return 0;
 }
@@ -575,7 +587,9 @@ int map_from_json(const json_t *obj, void *data_struct)
     map_t *map = data_struct;
     map->length = json_integer_value(json_object_get(obj, "length"));
     map->capacity = json_integer_value(json_object_get(obj, "capacity"));
-    map->items = smrt_create(map->capacity * sizeof(map_item_t));
+    map->items = calloc(map->capacity > 0 ? map->capacity : 1, sizeof(map_item_t));
+    if (map->items == NULL)
+        return -1;
 
     json_t *hash_arr = json_object_get(obj, "hashkey");
     /*@
@@ -611,7 +625,12 @@ int map_from_json(const json_t *obj, void *data_struct)
                 map->items[i].key = NULL;
                 continue;
             }
-            map->items[i].value = calloc(1, sizeof(data_t));
+            /* smrt_create, not calloc: map_free/map_remove release values
+             * with smrt_deref, which on a calloc'd header (refs 0, alloc
+             * false) underflowed refs and never freed the value. */
+            map->items[i].value = smrt_create(sizeof(data_t));
+            if (map->items[i].value == NULL)
+                return -1;
             data_from_json(json_object_get(elt, "value"), map->items[i].value);
         }
     }

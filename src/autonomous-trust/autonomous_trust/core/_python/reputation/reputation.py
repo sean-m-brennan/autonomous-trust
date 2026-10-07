@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import json
 import math
 import os
 from collections import OrderedDict
@@ -166,12 +167,18 @@ TX_CHANNEL_DEFAULT = TX_CHANNEL_TASK_OUTCOME
 
 #: Channels a verifier may author a VERIFIER-ATTESTED score on: an entry that
 #: commits on the verifier's half plus a quorum, without the subject's
-#: (doc/architecture/reputation.md, "Verifier-attested scores"). Only `probe`
-#: for now -- a question the verifier authored about the subject's work.
-#: `replication` waits for N independent verifiers; `first_person` never
-#: qualifies, since a first-person account co-signed by a quorum is exactly
-#: the accusation that channel must not become. Mirrors tx_channel_attestable.
-TX_CHANNELS_ATTESTABLE = (TX_CHANNEL_PROBE,)
+#: (doc/architecture/reputation.md, "Verifier-attested scores"). Each is a
+#: finding the verifier can stand behind on its own: `probe` (a question it
+#: authored), `certificate` (it checked a proof the subject supplied about its
+#: own work) and `self_consistency` (its own evidence contradicts a claim the
+#: subject signed) and `replication` (it re-ran another verifier's check;
+#: agreement across N verifiers is the consuming app's fold, and the chain only
+#: gates who may replicate, AT_ATTEST_REPLICATION_TIER);
+#: `first_person` never qualifies, since a first-person account co-signed by a
+#: quorum is exactly the accusation that channel must not become. Mirrors
+#: tx_channel_attestable.
+TX_CHANNELS_ATTESTABLE = (TX_CHANNEL_PROBE, TX_CHANNEL_CERTIFICATE,
+                          TX_CHANNEL_SELF_CONSISTENCY, TX_CHANNEL_REPLICATION)
 
 #: Namespace for an attested entry's task id, which is derived from its content
 #: (verifier, subject, evidence digest) rather than chosen: a duplicate is then
@@ -192,6 +199,20 @@ def attest_task_id(verifier, subject, evidence_digest) -> UUID:
     tx_attest_task_uuid."""
     return uuid5(ATTEST_NS, f'{str(verifier).lower()}|{str(subject).lower()}|'
                             f'{evidence_digest}')
+
+
+#: uuid5(NAMESPACE_URL, 'urn:autonomous-trust:task-pair'). Mirrors AT_PAIR_NS.
+PAIR_NS = UUID('61c22477-1384-51fd-b286-bb4b7f285044')
+
+
+def pair_task_id(task, executor) -> UUID:
+    """The reputation task id for ONE requester-executor pair of negotiation
+    task ``task``: uuid5 over ``task|executor`` (canonical lowercase uuids). A
+    task fanned out to N executors is N transactions; under the bare task id
+    its N+1 halves were paired by arrival and nodes forked (ISSUES §2.50).
+    Used for every task, since an executor cannot tell a fan-out. Mirrors
+    tx_pair_task_uuid."""
+    return uuid5(PAIR_NS, f'{str(task).lower()}|{str(executor).lower()}')
 
 
 def is_attestable_channel(channel) -> bool:
@@ -477,7 +498,8 @@ class Transaction(Configuration):
                  prev_hash: bytes = None, p1_channel: str = None,
                  p2_channel: str = None, attested: bool = False,
                  subject_id: UUID = None, evidence_digest: str = None,
-                 attest_sigs: dict = None, commit_sigs: dict = None):
+                 attest_sigs: dict = None, commit_sigs: dict = None,
+                 attest_scope: str = None):
         self.task_id = task_id
         self.p1_id = p1_id
         self.p1_score = p1_score
@@ -515,6 +537,12 @@ class Transaction(Configuration):
         self.attested = bool(attested)
         self.subject_id = subject_id
         self.evidence_digest = evidence_digest
+        # An attested entry's optional SCOPE (64 lowercase hex): what the
+        # attesting application says the finding is about. Keys the rate cap
+        # (one per verifier, subject, channel and scope) and is in the
+        # canonical bytes ONLY when set, so an unscoped entry hashes as it
+        # always did. Mirrors transaction_t.attest_scope.
+        self.attest_scope = attest_scope or None
         # The quorum certificate, carried on the catch-up wire so a receiver can
         # check the round (catch-up refuses an attested entry without one). NOT
         # in the canonical bytes, as a checkpoint's co-signatures are not in
@@ -558,10 +586,13 @@ class Transaction(Configuration):
         # it always was.
         if not d.get('attested'):
             for k in ('attested', 'subject_id', 'evidence_digest',
-                      'attest_sigs'):
+                      'attest_sigs', 'attest_scope'):
                 d.pop(k, None)
-        elif not d.get('attest_sigs'):
-            d.pop('attest_sigs', None)
+        else:
+            if not d.get('attest_sigs'):
+                d.pop('attest_sigs', None)
+            if not d.get('attest_scope'):
+                d.pop('attest_scope', None)
         # And the commit certificates: a group that does not declare them never
         # cuts one, so its entries keep the shape they always had.
         if not d.get('commit_sigs'):
@@ -658,6 +689,9 @@ class Transaction(Configuration):
             # cannot collide with one, and no ordinary entry's bytes change.
             fields += ['attested', _u(self.subject_id),
                        self.evidence_digest or 'null']
+            # The scope, only when set: an unscoped entry's bytes are unchanged.
+            if self.attest_scope:
+                fields.append(str(self.attest_scope))
         return '|'.join(fields).encode('utf-8')
 
     def entry_hash(self) -> bytes:
@@ -913,6 +947,8 @@ class TransactionHistory(Mapping):
         if not is_attestable_channel(tx.p1_channel):
             return False
         if not valid_evidence_digest(tx.evidence_digest):
+            return False
+        if tx.attest_scope and not valid_evidence_digest(tx.attest_scope):
             return False
         if str(tx.task_id) != str(attest_task_id(tx.p1_id, tx.subject_id,
                                                  tx.evidence_digest)):
@@ -1318,13 +1354,16 @@ class AttestedScore(Configuration):
 
     def __init__(self, verifier_uuid=None, subject_uuid=None, score: float = None,
                  channel: str = TX_CHANNEL_PROBE, evidence_digest: str = None,
-                 group_uuid: str = ''):
+                 group_uuid: str = '', attest_scope: str = None):
         self.verifier_uuid = verifier_uuid
         self.subject_uuid = subject_uuid
         self.score = score
         self.channel = channel
         self.evidence_digest = evidence_digest
         self.group_uuid = group_uuid or ''
+        # Optional (64 lowercase hex): what the application says this finding
+        # is about; keys the rate cap. See Transaction.attest_scope.
+        self.attest_scope = attest_scope or None
 
     @property
     def task_id(self) -> UUID:
@@ -1342,7 +1381,9 @@ class AttestedScore(Configuration):
                 and str(self.verifier_uuid) != str(self.subject_uuid)
                 and 0.0 <= score <= 1.0
                 and is_attestable_channel(self.channel)
-                and valid_evidence_digest(self.evidence_digest))
+                and valid_evidence_digest(self.evidence_digest)
+                and (not self.attest_scope
+                     or valid_evidence_digest(self.attest_scope)))
 
     @property
     def designation(self) -> bytes:
@@ -1357,6 +1398,10 @@ class AttestedScore(Configuration):
                + b'|' + format(float(self.score), '.17g').encode()
                + b'|' + str(self.channel).encode()
                + b'|' + str(self.evidence_digest).encode())
+        # The scope (64 hex) and the group (a uuid) each appear only when
+        # set, and cannot be mistaken for each other.
+        if self.attest_scope:
+            out += b'|' + str(self.attest_scope).encode()
         if self.group_uuid:
             out += b'|' + str(self.group_uuid).encode()
         return out
@@ -1365,13 +1410,15 @@ class AttestedScore(Configuration):
         return Transaction(self.task_id, p1_id=UUID(str(self.verifier_uuid)),
                            p1_score=float(self.score), p1_channel=self.channel,
                            attested=True, subject_id=UUID(str(self.subject_uuid)),
-                           evidence_digest=self.evidence_digest)
+                           evidence_digest=self.evidence_digest,
+                           attest_scope=self.attest_scope)
 
     @classmethod
     def of_transaction(cls, tx: Transaction, group_uuid: str = '') -> 'AttestedScore':
         return cls(verifier_uuid=str(tx.p1_id), subject_uuid=str(tx.subject_id),
                    score=tx.p1_score, channel=tx.p1_channel,
-                   evidence_digest=tx.evidence_digest, group_uuid=group_uuid)
+                   evidence_digest=tx.evidence_digest, group_uuid=group_uuid,
+                   attest_scope=getattr(tx, 'attest_scope', None))
 
 
 class SignedAttestation(Configuration):
@@ -1542,6 +1589,8 @@ def evidence_to_dict(chain, signed_checkpoint=None, attest_certs=None) -> dict:
             entries[-1]['attested'] = True
             entries[-1]['subject_id'] = str(tx.subject_id)
             entries[-1]['evidence_digest'] = str(tx.evidence_digest)
+            if getattr(tx, 'attest_scope', None):
+                entries[-1]['attest_scope'] = str(tx.attest_scope)
             cert = (attest_certs or {}).get(tx.task_id)
             if cert:
                 entries[-1]['attest_sigs'] = {str(k): _hex_str(v)
@@ -1627,6 +1676,9 @@ def evidence_from_dict(doc):
                              if entry.get('attested')
                              and entry.get('evidence_digest') is not None
                              else None),
+            attest_scope=(str(entry['attest_scope'])
+                          if entry.get('attested') and entry.get('attest_scope')
+                          else None),
             commit_sigs=(None if entry.get('attested')
                          or not isinstance(entry.get('commit_sigs'), dict)
                          else {str(scorer): {str(k): str(v)
@@ -1650,6 +1702,202 @@ def evidence_from_dict(doc):
         signed = SignedCheckpoint(checkpoint=ckpt,
                                   sigs={str(k): str(v) for k, v in sigs.items()})
     return chain, signed
+
+
+# --- Durable attested records (etc/at/attested/<task>.json) -----------------
+#
+# The resident window holds 200 entries and the evidence file is rewritten at
+# every checkpoint, so an attested entry is soon gone from both. An application
+# that shows a finding for longer (Stele's repo standing) needs it kept, and
+# kept in a form a verifier can check on its own: the entry with its quorum
+# certificate, the checkpoint that covers it with ITS signatures, the inclusion
+# proof from one to the other, the public keys of every signer this node held,
+# and the group sizes both quorums are counted against. Written once, when a
+# quorum-signed checkpoint first covers the entry; never rewritten. See
+# doc/architecture/reputation.md, "Verifier-attested scores".
+ATTESTED_RECORD_SCHEMA = '1'
+ATTESTED_DIR = 'attested'
+
+
+def attested_record(doc, task_id, signers, group_size, ckpt_group_size,
+                    subject_member=True) -> 'dict | None':
+    """The durable record of the attested entry ``task_id`` in the evidence
+    document ``doc`` (:func:`evidence_to_dict`), or None unless the document's
+    checkpoint covers it. ``signers`` maps voter uuid str -> Ed25519 public key
+    hex for every voter this node can name; ``group_size`` sizes the
+    attestation quorum and ``ckpt_group_size`` the checkpoint's (members, this
+    node included). Mirrors C reputation_attested_record."""
+    ck = (doc or {}).get('checkpoint')
+    if not isinstance(ck, dict):
+        return None
+    first, count = int(ck.get('first_index', 0)), int(ck.get('count', 0))
+    chain, _ = evidence_from_dict(doc)
+    window = [tx for tx in chain if tx.index is not None
+              and first <= tx.index < first + count]
+    if [tx.index for tx in window] != list(range(first, first + count)):
+        return None
+    pos = next((i for i, tx in enumerate(window)
+                if str(tx.task_id) == str(task_id)), None)
+    if pos is None or not window[pos].attested:
+        return None
+    entry = next(e for e in doc['chain'] if str(e.get('task_id')) == str(task_id))
+    if not isinstance(entry.get('attest_sigs'), dict) or not entry['attest_sigs']:
+        return None
+    proof = TransactionHistory._audit_path(pos, [tx.entry_hash() for tx in window])
+    return {'schema': ATTESTED_RECORD_SCHEMA,
+            'entry': dict(entry),
+            'checkpoint': dict(ck),
+            'proof': [{'sibling': _hex_str(sib), 'left': bool(left)}
+                      for sib, left in proof],
+            'signers': {str(k): str(v) for k, v in (signers or {}).items()},
+            'group_size': int(group_size),
+            'ckpt_group_size': int(ckpt_group_size),
+            'subject_member': bool(subject_member)}
+
+
+#: The roster file a node writes beside its attested archive (repprocess
+#: _persist_roster, C _persist_roster): the anchor a reader verifies records
+#: against instead of the keys a record carries about itself.
+ROSTER_FILE = 'roster.cfg.json'
+
+#: The smallest group an anchored verification will count a quorum against,
+#: whatever size a record claims: a record that says its group had one member
+#: still needs two of the anchor's keys behind it.
+ANCHOR_MIN_GROUP = 3
+
+
+def load_anchor(where, min_group=ANCHOR_MIN_GROUP) -> 'dict | None':
+    """The anchor for :func:`verify_attested_record`, read from a node's
+    roster file. ``where`` is the roster file itself, a config dir holding it,
+    or a node root (``<root>/etc/at/roster.cfg.json``). None when there is no
+    readable roster: a reader with no anchor has nothing to verify against."""
+    cands = [where, os.path.join(where, ROSTER_FILE),
+             os.path.join(where, 'etc', 'at', ROSTER_FILE)]
+    for path in cands:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path) as f:
+                doc = json.load(f)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(doc, dict) or not isinstance(doc.get('members'), dict):
+            return None
+        return {'group_uuid': str(doc.get('group_uuid') or ''),
+                'self': str(doc.get('self') or ''),
+                'members': {str(k): dict(v) for k, v in doc['members'].items()
+                            if isinstance(v, dict) and v.get('pubkey')},
+                'checkpoints': [c for c in doc.get('checkpoints') or []
+                                if isinstance(c, dict)],
+                'min_group': int(min_group)}
+    return None
+
+
+def verify_attested_record(record, anchor=None, details=None) \
+        -> 'tuple[bool, list[str]]':
+    """Check a durable attested record:
+
+    1. the entry's hash, folded up its inclusion proof, reproduces the
+       checkpoint's root;
+    2. more than half the checkpoint's group signed the checkpoint;
+    3. the verifier and a strict majority of the members other than the
+       subject signed the attestation, the subject's signature never counted.
+
+    Without ``anchor`` the signatures are checked against ``signers``, the keys
+    the record carries, and the quorums against the group sizes it claims. That
+    is only evidence for whoever trusts the node that wrote it, since a forger
+    writes its own keys and a group of one. With ``anchor``
+    (:func:`load_anchor`, the reader's own node's roster) every key comes from
+    the anchor and none from the record; a record signer whose key disagrees
+    with the anchor fails; the checkpoint must belong to the anchor's group or
+    to a chain it holds a checkpoint for; each quorum is counted against at
+    least ``anchor['min_group']``; and when the anchor holds a checkpoint over
+    the same window at the same epoch, the roots must match (``linked``).
+
+    Returns ``(ok, reasons)``; ``reasons`` names every check that failed. When
+    ``details`` is a dict it receives ``linked`` (bool), ``anchored`` (bool),
+    and ``signers`` (the attestation voters that counted)."""
+    from nacl.encoding import HexEncoder
+    from nacl.signing import VerifyKey
+    from nacl.exceptions import BadSignatureError
+    reasons = []
+    try:
+        if record.get('schema') != ATTESTED_RECORD_SCHEMA:
+            return False, ['unknown record schema']
+        doc = {'schema': EVIDENCE_SCHEMA, 'chain': [record['entry']],
+               'checkpoint': record['checkpoint']}
+        chain, signed = evidence_from_dict(doc)
+        tx = chain[0]
+        signers = record.get('signers') or {}
+        group_size = int(record['group_size'])
+        ckpt_group_size = int(record['ckpt_group_size'])
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False, ['malformed record']
+    linked = False
+    if anchor is not None:
+        keys = {u: str(m['pubkey']) for u, m in anchor['members'].items()}
+        for voter, key in signers.items():
+            if str(voter) in keys and str(key) != keys[str(voter)]:
+                reasons.append("signer %s's key disagrees with this node's "
+                               "roster" % str(voter)[:8])
+        floor = int(anchor.get('min_group', ANCHOR_MIN_GROUP))
+        group_size = max(group_size, floor)
+        ckpt_group_size = max(ckpt_group_size, floor)
+        ck = record['checkpoint']
+        group = str(ck.get('group_uuid') or '')
+        held = [c for c in anchor.get('checkpoints') or []
+                if str(c.get('group_uuid') or '') == group]
+        if group and group != anchor.get('group_uuid') and not held:
+            reasons.append('checkpoint from a group this node does not hold')
+        for c in held:
+            if (int(c.get('epoch', -1)) == int(ck.get('epoch', -2))
+                    and int(c.get('first_index', -1)) == int(ck.get('first_index', -2))
+                    and int(c.get('count', -1)) == int(ck.get('count', -2))):
+                if _hex_str(c.get('root')) == _hex_str(ck.get('root')):
+                    linked = True
+                else:
+                    reasons.append("checkpoint root differs from the one this "
+                                   "node holds at epoch %s" % ck.get('epoch'))
+        signers = keys
+
+    def _verified(designation, sigs):
+        out = set()
+        for voter, sig in (sigs or {}).items():
+            key = signers.get(str(voter))
+            if not key:
+                continue
+            try:
+                VerifyKey(key.encode('ascii'), encoder=HexEncoder).verify(
+                    designation, HexEncoder.decode(str(sig).encode('ascii')))
+            except (BadSignatureError, ValueError, TypeError):
+                continue
+            out.add(str(voter))
+        return out
+
+    if not tx.attested or signed is None:
+        return False, reasons + ['not an attested entry under a checkpoint']
+    proof = [(p['sibling'].encode('ascii'), bool(p['left']))
+             for p in record.get('proof') or []]
+    if not TransactionHistory.verify_inclusion(tx.entry_hash(), proof,
+                                               signed.checkpoint.root):
+        reasons.append('entry not in the checkpoint window')
+    if len(_verified(signed.checkpoint.designation, signed.sigs)) \
+            <= ckpt_group_size // 2:
+        reasons.append('checkpoint short of a quorum')
+    att = AttestedScore.of_transaction(tx)
+    if not att.well_formed():
+        reasons.append('attestation malformed')
+    voters = _verified(att.designation,
+                       record['entry'].get('attest_sigs')) - {str(tx.subject_id)}
+    others = group_size - (1 if record.get('subject_member', True) else 0)
+    if str(tx.p1_id) not in voters:
+        reasons.append("the verifier's own signature is missing")
+    elif len(voters) <= others // 2:
+        reasons.append('attestation short of a quorum')
+    if isinstance(details, dict):
+        details.update(linked=linked and not reasons,
+                       anchored=anchor is not None, signers=sorted(voters))
+    return not reasons, reasons
 
 
 def evidence_attest_certs(doc) -> dict:

@@ -177,8 +177,19 @@ convenience into a global namespace, which is exactly what we refuse.
 Four checks carry the security of the protocol, and each closes a specific
 attack.
 
-*Package hash verification* rejects nodes running different software, which
-prevents a modified implementation from participating on equal terms.
+*Package hash verification* rejects nodes running software the group has not
+accepted. Each node sends a hash of what it runs, tagged by runtime: a C node
+sends `c:<hex>`, blake2b-256 over the file holding libat's code, and a Python
+node's source digest reads as `py:<hex>`. When `etc/at/package_hashes.cfg.json`
+(`{"accepted": [...]}`) is present, both runtimes admit only a listed hash, on
+`request_access` and on `access_granted` alike, and refuse an empty one. When it
+is absent, a Python node refuses a Python peer whose hash differs from its own
+and treats an empty or C hash as unknown, and a C node does not check. The hash
+is self-reported, so the gate turns away a modified build that says what it is
+and admits one modified to send the honest hash. Against that build the
+verifier-attested score rule holds instead: nothing it signs raises its own
+standing or erases a finding against it (see `reputation.md`). The allowlist is
+covered in ISSUES §2.47.
 
 *Duplicate detection* rejects collisions in UUID, signing key and encryption key
 during voting, which is what stops an existing identity from being impersonated

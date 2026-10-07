@@ -1,0 +1,34 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: attest-final-certificate-commits
+byte_pinning: false
+description: |
+    A certified attestation on the `certificate` channel commits as one on
+    `probe` does: on the verifier's half plus a quorum of the other members,
+    without the subject. The channel is part of the committed fact, and every
+    remote node folds it at weight one.
+
+participants:
+  - id: alice
+    role: verifier
+  - id: bob
+    role: member
+  - id: carol
+    role: subject
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: attest final
+    payload:
+      subject: carol
+      score: 0.3
+      channel: certificate
+      cosigners: [alice, bob]
+    description: alice broadcasts the certified certificate finding about carol.
+
+expected_state:
+  bob:
+    committed_tx_count: 1

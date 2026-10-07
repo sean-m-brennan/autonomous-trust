@@ -79,7 +79,7 @@ class PublicIdentity:
         if rc != 0:
             raise RuntimeError(f"peer_to_proto failed with rc={rc}")
         result = bytes(ffi.buffer(data_ptr[0], data_len[0]))
-        lib.smrt_deref(data_ptr[0])
+        lib.at_free(data_ptr[0])   # a malloc buffer, not an smrt struct
         return result
 
     @classmethod
