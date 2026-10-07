@@ -242,6 +242,8 @@ int task_tracker_init(task_tracker_t *tracker, const uuid_t task_uuid, int expec
     tracker->kwargs_json[0] = '\0';
     tracker->issued_at = 0.0;
     tracker->invited_known = false;
+    tracker->status_asks = 0;
+    tracker->status_asked_at = 0.0;
     if (map_init(&tracker->invited) != 0)
         return -1;
     return map_init(&tracker->results);

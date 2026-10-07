@@ -82,12 +82,7 @@ DEFINE_TEST(test_array_data)
     ck_assert_ret_ok(data_integer(data, &one));
     ck_assert_int_eq(one, 1);
 
-    smrt_deref(data1);
-    smrt_deref(data2);
-    smrt_deref(data3);
-    smrt_deref(data4);
-    smrt_deref(data5);
-    smrt_deref(data6);
+    array_free(&arr);   /* releases data1..data6 */
 }
 END_TEST_DEFINITION()
 
@@ -136,9 +131,7 @@ DEFINE_TEST(test_array_find_contains)
     ck_assert(array_contains(&arr, d2) == true);
     ck_assert(array_contains(&arr, d_missing) == false);
 
-    smrt_deref(d1);
-    smrt_deref(d2);
-    smrt_deref(d3);
+    array_free(&arr);   /* releases d1..d3 */
     smrt_deref(d_missing);
 }
 END_TEST_DEFINITION()
@@ -162,8 +155,11 @@ DEFINE_TEST(test_array_set_overwrite)
     ck_assert_ret_ok(data_integer(out, &val));
     ck_assert_int_eq(val, 99);
 
-    /* Out-of-bounds set should fail */
-    ck_assert_ret_nonzero(array_set(&arr, 10, integer_data(0)));
+    /* Out-of-bounds set should fail, and leave the element with us */
+    data_t *refused = integer_data(0);
+    ck_assert_ret_nonzero(array_set(&arr, 10, refused));
+    smrt_deref(refused);
+    array_free(&arr);
 }
 END_TEST_DEFINITION()
 
@@ -181,7 +177,8 @@ DEFINE_TEST(test_array_remove)
     ck_assert_ret_ok(array_append(&arr, d3));
     ck_assert_uint_eq(array_size(&arr), 3);
 
-    /* Remove middle element */
+    /* Remove middle element (kept alive past the remove to check it) */
+    smrt_ref(d2);
     ck_assert_ret_ok(array_remove(&arr, d2));
     ck_assert_uint_eq(array_size(&arr), 2);
 
@@ -194,9 +191,9 @@ DEFINE_TEST(test_array_remove)
     data_t *d_missing = integer_data(999);
     ck_assert_ret_nonzero(array_remove(&arr, d_missing));
 
-    smrt_deref(d1);
+    /* d1 and d3 go with the array; d2 and the probe are ours. */
+    array_free(&arr);
     smrt_deref(d2);
-    smrt_deref(d3);
     smrt_deref(d_missing);
 }
 END_TEST_DEFINITION()
@@ -226,8 +223,11 @@ DEFINE_TEST(test_array_oob_errors)
     ck_assert_ret_ok(data_integer(out, &val));
     ck_assert_int_eq(val, 30);
 
-    /* Way out-of-bounds set should fail */
-    ck_assert_ret_nonzero(array_set(&arr, 10, integer_data(0)));
+    /* Way out-of-bounds set should fail, and leave the element with us */
+    data_t *refused = integer_data(0);
+    ck_assert_ret_nonzero(array_set(&arr, 10, refused));
+    smrt_deref(refused);
+    array_free(&arr);
 }
 END_TEST_DEFINITION()
 
@@ -245,6 +245,7 @@ DEFINE_TEST(test_array_get_rejects_index_equal_size)
 
     data_t *out = (data_t *)0xDEADBEEF;
     ck_assert_ret_nonzero(array_get(&arr, (int)array_size(&arr), &out));
+    array_free(&arr);
 }
 END_TEST_DEFINITION()
 
@@ -288,6 +289,7 @@ DEFINE_TEST(test_array_for_each_handles_remove_during_iteration)
         touched++;
     array_end_for_each
     ck_assert_int_eq(touched, 0);
+    array_free(&arr);
 }
 END_TEST_DEFINITION()
 
@@ -327,6 +329,62 @@ DEFINE_TEST(test_array_for_each_handles_filter_during_iteration)
         ck_assert_ret_ok(data_integer(out, &n));
         ck_assert_int_eq(n, expected[i]);
     }
+    array_free(&arr);
+}
+END_TEST_DEFINITION()
+
+/* The array owns one reference per element, as a map does: a displaced or
+ * removed element loses it, and a self-assign keeps it. A watcher's extra
+ * reference makes the count observable without freeing. */
+DEFINE_TEST(test_array_releases_what_it_drops)
+{
+    array_t arr;
+    ck_assert_ret_ok(array_init(&arr));
+    data_t *a = integer_data(1);
+    data_t *b = integer_data(2);
+    smrt_ref(a);   /* the watcher's */
+    smrt_ref(b);
+    ck_assert_ret_ok(array_append(&arr, a));
+    ck_assert_ret_ok(array_append(&arr, b));
+    ck_assert_uint_eq(((smrt_ptr_t *)a)->refs, 2);
+
+    ck_assert_ret_ok(array_set(&arr, 0, a));          /* self-assign */
+    ck_assert_uint_eq(((smrt_ptr_t *)a)->refs, 2);
+
+    ck_assert_ret_ok(array_set(&arr, 0, integer_data(3)));   /* displaces a */
+    ck_assert_uint_eq(((smrt_ptr_t *)a)->refs, 1);
+
+    ck_assert_ret_ok(array_remove(&arr, b));
+    ck_assert_uint_eq(((smrt_ptr_t *)b)->refs, 1);
+
+    smrt_deref(a);
+    smrt_deref(b);
+    array_free(&arr);
+}
+END_TEST_DEFINITION()
+
+/* array_remove takes the first EQUAL element; array_remove_at takes the slot
+ * named. [1, 2, 1]: removing the trailing 1 by value would leave [2, 1]. */
+DEFINE_TEST(test_array_remove_at_takes_the_slot_named)
+{
+    array_t arr;
+    ck_assert_ret_ok(array_init(&arr));
+    ck_assert_ret_ok(array_append(&arr, integer_data(1)));
+    ck_assert_ret_ok(array_append(&arr, integer_data(2)));
+    ck_assert_ret_ok(array_append(&arr, integer_data(1)));
+    ck_assert_ret_ok(array_remove_at(&arr, -1));
+    ck_assert_uint_eq(array_size(&arr), 2);
+    data_t *d = NULL;
+    int v = 0;
+    ck_assert_ret_ok(array_get(&arr, 0, &d));
+    ck_assert_ret_ok(data_integer(d, &v));
+    ck_assert_int_eq(v, 1);
+    ck_assert_ret_ok(array_get(&arr, 1, &d));
+    ck_assert_ret_ok(data_integer(d, &v));
+    ck_assert_int_eq(v, 2);
+    ck_assert_ret_nonzero(array_remove_at(&arr, 2));
+    ck_assert_ret_nonzero(array_remove_at(&arr, -3));
+    array_free(&arr);
 }
 END_TEST_DEFINITION()
 
@@ -335,4 +393,6 @@ RUN_TESTS(Array, test_array_data, test_array_create_heap,
           test_array_remove, test_array_oob_errors,
           test_array_get_rejects_index_equal_size,
           test_array_for_each_handles_remove_during_iteration,
-          test_array_for_each_handles_filter_during_iteration)
+          test_array_for_each_handles_filter_during_iteration,
+          test_array_releases_what_it_drops,
+          test_array_remove_at_takes_the_slot_named)

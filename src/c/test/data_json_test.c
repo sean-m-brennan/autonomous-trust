@@ -129,6 +129,11 @@ DEFINE_TEST(test_data_bytes_json_roundtrip)
     json_t *obj = NULL;
     ck_assert_ret_ok(data_to_json(d, &obj));
     ck_assert_ptr_nonnull(obj);
+    /* The text is the base64 alone: no NUL carried on the end of it. */
+    json_t *dat = json_object_get(obj, "dat");
+    ck_assert_ptr_nonnull(dat);
+    ck_assert_str_eq(json_string_value(dat), "3q2+7wAB");
+    ck_assert_uint_eq(json_string_length(dat), 8);
 
     data_t d2;
     memset(&d2, 0, sizeof(d2));
@@ -140,6 +145,24 @@ DEFINE_TEST(test_data_bytes_json_roundtrip)
 
     json_decref(obj);
     smrt_deref(d);
+    free(d2.byt);
+}
+END_TEST_DEFINITION()
+
+/* A string written before the writer stopped carrying libsodium's NUL still
+ * reads back. */
+DEFINE_TEST(test_data_bytes_json_reads_a_trailing_nul)
+{
+    json_t *obj = json_pack("{s:i, s:i, s:s%}", "type", BYTES, "size", 6,
+                            "dat", "3q2+7wAB\0", (size_t)9);
+    ck_assert_ptr_nonnull(obj);
+    data_t d2;
+    memset(&d2, 0, sizeof(d2));
+    ck_assert_ret_ok(data_from_json(obj, &d2));
+    unsigned char raw[] = {0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01};
+    ck_assert_uint_eq(d2.size, sizeof(raw));
+    ck_assert_mem_eq(d2.byt, raw, sizeof(raw));
+    json_decref(obj);
     free(d2.byt);
 }
 END_TEST_DEFINITION()
@@ -168,4 +191,5 @@ END_TEST_DEFINITION()
 
 RUN_TESTS(DataJson, test_data_int_json_roundtrip, test_data_float_json_roundtrip,
           test_data_bool_json_roundtrip, test_data_string_json_roundtrip,
-          test_data_bytes_json_roundtrip, test_data_uint_json_roundtrip)
+          test_data_bytes_json_roundtrip, test_data_uint_json_roundtrip,
+          test_data_bytes_json_reads_a_trailing_nul)

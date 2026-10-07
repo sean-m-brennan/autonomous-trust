@@ -134,6 +134,7 @@ ffi.cdef("""
     int    array_get(array_t *a, int index, data_t **element);
     int    array_set(array_t *a, int index, data_t *element);
     int    array_remove(array_t *a, data_t *element);
+    int    array_remove_at(array_t *a, int index);
     void   array_free(array_t *a);
 
     /* ---- structures/map.h ---- */

@@ -349,6 +349,11 @@ void messaging_recv_release(generic_msg_t *msg)
     } else if (msg->type == TASK_RESULT) {
         /* proto_to_generic_msg allocates the result bytes (msg_types.c). */
         free(msg->info.task_result.result_data);
+    } else if (msg->type == PEER_CAPABILITIES
+               && msg->info.peer_capabilities.items != NULL) {
+        /* A decoded matrix nobody adopted (the PEER_CAPABILITIES handler
+         * takes it, leaving this zeroed). */
+        map_free(&msg->info.peer_capabilities);
     }
     memset(msg, 0, sizeof(*msg));
 }

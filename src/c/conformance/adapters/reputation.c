@@ -369,8 +369,42 @@ static void _install_target_state(sce_run_ctx_t *ctx, const char *target_id)
     int num_peers = (int)ctx->participant_count - 1;
     if (num_peers < 1) num_peers = 1;
     reputation_reset_state(num_peers);
+    /* Never leak one case's teams into the next, nor read a conflict file an
+     * extension's case wrote into the shared config dir: no teams unless the
+     * case stages them. */
+    reputation_set_attest_conflicts("{\"teams\": []}");
 
     if (g_fixtures == NULL || target_id == NULL) return;
+
+    /* attest_conflicts: [[<pid>, ...], ...] -- the teams whose members do not
+     * witness for each other (ISSUES §2.54). Scenario-level: every node holds
+     * the same set, as every node holding one verified team roster does.
+     * Mirrors the Python adapter's preset_attest_conflicts. */
+    json_t *acs = json_object_get(g_fixtures, "attest_conflicts");
+    if (json_is_array(acs))
+    {
+        json_t *teams = json_array();
+        size_t i, j;
+        json_t *team, *pid_j;
+        json_array_foreach(acs, i, team)
+        {
+            json_t *uuids = json_array();
+            json_array_foreach(team, j, pid_j)
+            {
+                const uuid_t *u = _uuid_of(ctx, json_string_value(pid_j));
+                if (u == NULL) continue;
+                char us[UUID_STRING_LEN + 1];
+                uuid_unparse_lower(*u, us);
+                json_array_append_new(uuids, json_string(us));
+            }
+            json_array_append_new(teams, uuids);
+        }
+        json_t *doc = json_pack("{s:o}", "teams", teams);
+        char *text = json_dumps(doc, JSON_COMPACT);
+        reputation_set_attest_conflicts(text);
+        free(text);
+        json_decref(doc);
+    }
 
     /* history_len: { "<pid>": N, ... } */
     json_t *hl = json_object_get(g_fixtures, "history_len");

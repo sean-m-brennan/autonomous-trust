@@ -642,6 +642,18 @@ class _Participant:
                     raise AssertionError(
                         f'{self.id}: group_size={actual}, expected {int(expected)}'
                     )
+            elif key in ('group_wire_format', 'group_commit_certificates'):
+                # The group-carried declarations, after any merge: an absorbed
+                # node takes the surviving group's. C mirrors via
+                # group_t.wire_format / group_t.commit_certificates.
+                grp = self.process.group
+                if key == 'group_wire_format':
+                    actual = str(grp.wire_format) if grp is not None else None
+                else:
+                    actual = bool(grp.commit_certificates) if grp is not None else None
+                if actual != expected:
+                    raise AssertionError(
+                        f'{self.id}: {key}={actual}, expected {expected}')
             elif key == 'group_key_epoch':
                 # How many times this participant's group key has been rotated.
                 # Admission rotates (doc/architecture/gateway-reputation-tree.md), so a welcomer that admitted one
@@ -1606,9 +1618,14 @@ class IdentityAdapter:
         # `key_epoch` pins how many rotations this participant's group key has
         # been through, so a scenario can hand a member an update from a
         # sender an epoch behind it (ISSUES §2.31).
+        # `wire_format` and `commit_certificates` are the group-carried
+        # declarations a merge hands from the surviving group to the absorbed
+        # node (Group.adopt_membership).
         grp = Group(group_uuid, {identity.uuid: identity.address},
                     f'grp-{pid}', enc, public_only,
-                    _key_epoch=int(spec.get('key_epoch', 0)))
+                    _key_epoch=int(spec.get('key_epoch', 0)),
+                    _wire_format=spec.get('wire_format'),
+                    _commit_certificates=spec.get('commit_certificates') is True)
         _FIXTURE_GROUP_PUB[pid] = enc.publish()
         ns = UUID('00000000-0000-0000-0000-000000000aaa')
         for k in range(max(0, size - 1)):

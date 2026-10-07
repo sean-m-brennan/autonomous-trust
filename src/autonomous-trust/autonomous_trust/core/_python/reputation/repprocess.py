@@ -192,6 +192,15 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # AT_REP_COMMIT_TIMEOUT_SEC.
     COMMIT_TIMEOUT = _env_float('AT_REP_COMMIT_TIMEOUT_SEC', 15.0)
     COMMIT_RETRIES = 5
+    # A half that used up its COMMIT_RETRIES is PARKED, not dropped (ISSUES
+    # §2.60): a minority island cannot commit under the majority rule (§2.13)
+    # and waits out a partition far longer than five retries. A parked half
+    # is re-proposed when the chain grows from a peer (_wake_parked), and
+    # otherwise every PARK_RETRY seconds, until PARK_TTL. Mirrors C
+    # REP_PARK_RETRY / REP_PARK_TTL. Overrides: AT_REP_PARK_RETRY_SEC,
+    # AT_REP_PARK_TTL_SEC.
+    PARK_RETRY = _env_float('AT_REP_PARK_RETRY_SEC', 120.0)
+    PARK_TTL = _env_float('AT_REP_PARK_TTL_SEC', 86400.0)
 
     # Hysteresis band for the CTFT ↔ pure-reputation dispatch in
     # _compute_reputation. A single 0.5 threshold made peers hovering
@@ -1147,11 +1156,15 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         pax_id = (id1, id2, self.identity.uuid)
         self.my_requests[idx] = TxCount(score, 0)
         # Follow our half until it is in the chain. A re-proposal of the same
-        # task keeps its attempt count and only restarts the clock.
+        # task keeps its attempt count and only restarts the clock; a parked
+        # half keeps the park's slower clock (§2.60).
         deadline = now().timestamp() + self.COMMIT_TIMEOUT
         waiting = self.awaiting_commit.get(str(score.task_id))
         if waiting is None:
-            self.awaiting_commit[str(score.task_id)] = [score, deadline, 0]
+            self.awaiting_commit[str(score.task_id)] = [score, deadline, 0,
+                                                        None]
+        elif waiting[3] is not None:
+            waiting[1] = now().timestamp() + self.PARK_RETRY
         else:
             waiting[1] = deadline
         # Bind this round to its group so quorum + commit routing use
@@ -2133,18 +2146,90 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         return key == str(self.identity.uuid) or any(
             str(p.uuid) == key for p in self.peers.all)
 
+    #: Conflicted co-signers (ISSUES §2.54): ``{"teams": [[uuid, ...], ...]}``,
+    #: written by an application (Stele, from a verified team roster). Two
+    #: nodes in one team do not witness for each other. Mirrors C
+    #: REP_CONFLICTS_FILE.
+    CONFLICTS_FILE = 'attest_conflicts.cfg.json'
+
+    @staticmethod
+    def _conflicts_parse(doc):
+        teams = doc.get('teams') if isinstance(doc, dict) else None
+        if not isinstance(teams, list) or not all(
+                isinstance(t, list) and all(isinstance(u, str) for u in t)
+                for t in teams):
+            return None
+        return [set(t) for t in teams]
+
+    def set_attest_conflicts(self, doc):
+        """Replace the conflict set with ``doc`` instead of the file; None goes
+        back to the file. For tests and the conformance adapter. Raises
+        ValueError, changing nothing, on a malformed set. Mirrors C
+        reputation_set_attest_conflicts."""
+        if doc is None:
+            self._conflicts_override = None
+            return
+        teams = self._conflicts_parse(doc)
+        if teams is None:
+            raise ValueError('malformed attest conflict set')
+        self._conflicts_override = teams
+
+    def _attest_conflicts(self) -> list:
+        """The teams in force, re-read from the file when it changed."""
+        override = getattr(self, '_conflicts_override', None)
+        if override is not None:
+            return override
+        path = os.path.join(Configuration.get_cfg_dir(), self.CONFLICTS_FILE)
+        try:
+            st = os.stat(path)
+        except OSError:
+            self._conflicts_cache = (None, [])
+            return []
+        stamp = (st.st_mtime_ns, st.st_size)
+        cached = getattr(self, '_conflicts_cache', None)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        try:
+            with open(path) as f:
+                teams = self._conflicts_parse(json.load(f)) or []
+        except (OSError, ValueError):
+            teams = []
+        self._conflicts_cache = (stamp, teams)
+        return teams
+
+    def _conflicted(self, a, b) -> bool:
+        """Are ``a`` and ``b`` two different nodes of one team?"""
+        a, b = str(a), str(b)
+        return a != b and any(a in t and b in t for t in self._attest_conflicts())
+
+    def _conflicted_members(self, subject) -> list:
+        """The members of our roster conflicted with ``subject``, sorted."""
+        subject = str(subject)
+        mates = set()
+        for team in self._attest_conflicts():
+            if subject in team:
+                mates |= team - {subject}
+        return sorted(m for m in mates if self._is_member(m))
+
     def _attest_quorum_met(self, att, sigs) -> bool:
         """The verifier's own signature plus a strict majority of the members
-        other than the subject, sized from OUR roster and counting only
-        signatures that verify. The subject's is never counted."""
+        other than the subject AND its teammates (§2.54), sized from OUR
+        roster and counting only signatures that verify. Neither the
+        subject's signature nor a teammate's is ever counted, and once any
+        teammate is left out at least two signatures are needed."""
         if not isinstance(sigs, dict):
             return False
         subject = str(att.subject_uuid)
-        voters = self._verified_cosigners(att.designation, sigs) - {subject}
+        voters = {v for v in self._verified_cosigners(att.designation, sigs) - {subject}
+                  if not self._conflicted(v, subject)}
         if str(att.verifier_uuid) not in voters:
             return False
         members = len(self.peers.all) + 1
+        mates = len(self._conflicted_members(subject))
         others = members - (1 if self._is_member(subject) else 0)
+        others = max(others - mates, 0)
+        if mates and len(voters) < 2:
+            return False
         return len(voters) > others // 2
 
     @staticmethod
@@ -2177,6 +2262,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             return False, 'verifier not a member'
         if not self._is_member(att.subject_uuid):
             return False, 'subject not a member'
+        # A teammate's finding about its own team is the team speaking about
+        # itself, which is what an attestation exists to get past (§2.54).
+        if self._conflicted(att.verifier_uuid, att.subject_uuid):
+            return False, 'verifier is a teammate of the subject'
         if str(att.verifier_uuid) in self._slashed:
             return False, 'verifier slashed'
         if str(att.verifier_uuid) in self._excluded:
@@ -2349,6 +2438,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         if str(att.subject_uuid) == str(self.identity.uuid):
             # Our signature would not count; say so rather than send it.
             self.logger.info('Not co-signing an attestation about ourselves '
+                             'from %s', message.from_whom)
+            return True
+        if self._conflicted(self.identity.uuid, att.subject_uuid):
+            # Nor would a teammate's (§2.54).
+            self.logger.info('Not co-signing an attestation about a teammate '
                              'from %s', message.from_whom)
             return True
         ok, why = self._attest_admissible(att)
@@ -2726,6 +2820,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                                       self._is_member(tx.subject_id))
                 if rec is None:
                     continue
+                # The teammates this node left out of the quorum (§2.54).
+                # Informational: a reader verifies against its own roster.
+                mates = self._conflicted_members(tx.subject_id)
+                if mates:
+                    rec['excluded'] = mates
                 with atomic_write(self._archive_path(tx.task_id)) as f:
                     json.dump(rec, f, indent=2)
                 self.logger.info('Archived attested entry %s (subject %s)',
@@ -3524,6 +3623,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 if res.status == ReconcileResult.ADOPTED:
                     self._repropose_dropped(queues, res)
                     self._reappend_attested(res)
+                # A chain that grew from a peer means a quorum may be back:
+                # the minority side of a heal arrives here EXTENDED (§2.60).
+                if res.status in (ReconcileResult.ADOPTED,
+                                  ReconcileResult.EXTENDED):
+                    self._wake_parked(who)
                 return True
             reported = from_json_string(message.obj)
             if isinstance(reported, list) and \
@@ -3559,6 +3663,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                             len(res.added))
                         self._repropose_dropped(queues, res)
                         self._reappend_attested(res)
+                    if res.status in (ReconcileResult.ADOPTED,
+                                      ReconcileResult.EXTENDED):
+                        self._wake_parked('the majority chain')
                 else:
                     self.logger.error('Closest %d peers unable to agree on history', self.num_updates)
                     self._request_update(queues, len(self.peers.all),
@@ -3627,38 +3734,80 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         the chain (ISSUES §2.24). A half now in the chain, by our commit or in
         a chain we adopted, is forgotten. Rounds still filed for the task are
         retired first, so a late grant for the stale ballot cannot race the
-        fresh one. After COMMIT_RETRIES the half is given up, with a warning.
-        Mirrors C _retry_uncommitted_halves. Returns how many were
-        re-proposed."""
+        fresh one. After COMMIT_RETRIES the half is PARKED (§2.60): re-proposed
+        every PARK_RETRY, or on the next pass after the chain grows from a peer
+        (_wake_parked), and given up only after PARK_TTL. Mirrors C
+        _retry_uncommitted_halves. Returns how many were re-proposed."""
         resent = 0
         for key, waiting in list(self.awaiting_commit.items()):
-            score, deadline, attempts = waiting
+            score, deadline, attempts, parked_at = waiting
             if self._own_half_recorded(score.task_id):
                 del self.awaiting_commit[key]
                 continue
-            if deadline > present:
+            if parked_at is not None:
+                if present - parked_at > self.PARK_TTL:
+                    expire = True
+                elif deadline <= present:
+                    expire = False
+                else:
+                    continue
+            elif deadline > present:
                 continue
             for idx in [i for i, tc in self.my_requests.items()
                         if str(tc.score.task_id) == key]:
                 del self.my_requests[idx]
                 self.backoff.pop(idx, None)
-            if attempts >= self.COMMIT_RETRIES:
-                self.logger.warning(
-                    'our half of task %s never committed after %d '
-                    're-proposal(s); giving up on it', key, attempts)
-                del self.awaiting_commit[key]
+            if parked_at is not None:
+                if expire:
+                    self.logger.warning(
+                        'our half of task %s never committed after %d '
+                        're-proposal(s) and %.0f s parked; giving up on it',
+                        key, attempts, present - parked_at)
+                    del self.awaiting_commit[key]
+                    continue
+                self.logger.info('re-proposing parked half of task %s', key)
+            elif attempts >= self.COMMIT_RETRIES:
+                waiting[1] = present + self.PARK_RETRY
+                waiting[3] = present
+                self.logger.info(
+                    'our half of task %s has no quorum after %d '
+                    're-proposal(s); parking it until the chain grows from a '
+                    'peer (or every %.0f s)', key, attempts, self.PARK_RETRY)
                 continue
-            waiting[2] = attempts + 1
-            self.logger.info(
-                'our half of task %s is not in the chain after %.0f s; '
-                're-proposing it (attempt %d of %d)', key, self.COMMIT_TIMEOUT,
-                attempts + 1, self.COMMIT_RETRIES)
+            else:
+                waiting[2] = attempts + 1
+                self.logger.info(
+                    'our half of task %s is not in the chain after %.0f s; '
+                    're-proposing it (attempt %d of %d)', key,
+                    self.COMMIT_TIMEOUT, attempts + 1, self.COMMIT_RETRIES)
             try:
                 self._start_paxos(queues, score)
                 resent += 1
             except Full:
                 self.logger.error('retry_uncommitted: Network queue full')
+            if parked_at is not None:
+                # The next slow retry counts from this pass.
+                waiting[1] = present + self.PARK_RETRY
         return resent
+
+    def parked_count(self) -> int:
+        """How many of the halves in awaiting_commit are parked (§2.60)."""
+        return sum(1 for w in self.awaiting_commit.values()
+                   if w[3] is not None)
+
+    def _wake_parked(self, source) -> int:
+        """The chain just grew from a peer, so a quorum may be reachable
+        again: make every parked half due on the next pass (§2.60). Mirrors
+        C _wake_parked. Returns how many."""
+        woken = 0
+        for waiting in self.awaiting_commit.values():
+            if waiting[3] is not None:
+                waiting[1] = 0
+                woken += 1
+        if woken:
+            self.logger.info('chain grew from %s; re-proposing %d parked '
+                             'half(s)', source, woken)
+        return woken
 
     def _repropose_dropped(self, queues, res: 'ReconcileResult') -> int:
         """RE-PROPOSE WHAT AN ADOPTION DROPPED (Agora Phase 4 DDIL,

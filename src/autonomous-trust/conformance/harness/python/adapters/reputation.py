@@ -587,6 +587,11 @@ class ReputationAdapter:
         # Scenario-level rather than per-participant, because the C twin's
         # knob is an environment variable and the whole cohort shares it.
         preset_slash_enabled: bool = bool(fixtures.get('slash_enabled', False))
+        # attest_conflicts: [[pid, ...], ...] -- the teams whose members do not
+        # witness for each other (ISSUES §2.54). Scenario-level: every node
+        # holds the same set, as every node holding one verified team roster
+        # does. Mirrors the C adapter's reputation_set_attest_conflicts.
+        preset_attest_conflicts: list = fixtures.get('attest_conflicts') or []
 
         identities: dict[str, Identity] = {}
         for idx, spec in enumerate(spec_participants):
@@ -767,6 +772,11 @@ class ReputationAdapter:
                     # Keyed by the finding's own (peer, source) key, exactly as
                     # Protocol.run_message_handlers would file it.
                     participant.process.protocol.peer_standing[found.key] = found
+            # Always set, so a conflict file another case wrote into the
+            # shared config dir is never read: no teams unless staged.
+            participant.process.set_attest_conflicts({'teams': [
+                [str(uuid5(_NS, f'rep:{m}')) for m in team]
+                for team in preset_attest_conflicts]})
             if preset_peer_standing.get(pid):
                 # ACT on them, not merely record them: the C adapter's
                 # reputation_apply_peer_standing does the unwind at install time,
