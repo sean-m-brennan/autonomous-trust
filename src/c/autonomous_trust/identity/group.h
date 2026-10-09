@@ -202,6 +202,13 @@ int64_t group_rotate_key(group_t *group);
  *  Returns whether it was adopted. Mirrors Python Group.accept_rotation. */
 bool group_accept_rotation(group_t *group, const group_t *other);
 
+/** Why group_accept_rotation would refuse @p other, as a short phrase for a
+ *  log line, or NULL when it would adopt it. The single source of that
+ *  decision: group_accept_rotation refuses exactly when this is non-NULL. A
+ *  lost tiebreak reads "ours stands (…)". Mirrors Python
+ *  Group.rotation_refusal. */
+const char *group_rotation_refusal(const group_t *group, const group_t *other);
+
 
 /**
  * @brief The envelope format this group speaks to @p address.

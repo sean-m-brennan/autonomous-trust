@@ -84,6 +84,14 @@ typedef struct {
     int      probes_issued;
     double   last_probe_sec;
     bool     probed_ever;
+    /* Peers not to probe, by index, @c peer_count entries; NULL = none.
+     * Borrowed for one tick: negotiation points it at a snapshot of the
+     * peers the network process reports absent
+     * (doc/architecture/peer-presence.md) and clears it after. A probe to an
+     * absent peer would not be sent, and an unsent probe is not counted, so
+     * without this the selector would choose the same absent peer every
+     * interval and probe nobody. */
+    const bool *skip_peer;
 } bootstrap_worker_t;
 
 /** Invitation sink. Mirrors a `put` onto the negotiation queue: return true
@@ -168,7 +176,10 @@ double bootstrap_ucb_bonus(int count, int total);
  *  For @p peer_count above @ref AT_PROBE_MAX_TRACKED_PEERS there is no
  *  per-peer state to compare, so this degrades to an explicit round-robin
  *  (`probes_issued % peer_count`) -- still full coverage, just no longer
- *  uncertainty-directed. Returns 0 when @p peer_count is 0. */
+ *  uncertainty-directed. Returns 0 when @p peer_count is 0.
+ *
+ *  A peer marked in @c skip_peer is never chosen. When every peer is, the
+ *  result is @p peer_count, which names nobody. */
 size_t bootstrap_worker_select_target(const bootstrap_worker_t *w,
                                       size_t peer_count);
 
@@ -189,7 +200,8 @@ size_t bootstrap_worker_select_target(const bootstrap_worker_t *w,
 const char *bootstrap_worker_select_capability(const bootstrap_worker_t *w);
 
 /** Issue one directed probe. Returns true iff one was emitted (and counted).
- *  False on: no peers, no registered caps, or @p emit reporting queue-full. */
+ *  False on: no peers, no peer that is not skipped, no registered caps, or
+ *  @p emit reporting queue-full. */
 bool bootstrap_worker_try_issue_probe(bootstrap_worker_t *w, size_t peer_count,
                                      bootstrap_probe_emit_fn emit, void *ctx);
 

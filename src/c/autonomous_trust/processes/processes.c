@@ -27,6 +27,7 @@
 #include <pthread.h>
 
 #include <jansson.h>
+#include <sodium.h>
 
 #define PROCESSES_IMPL
 #include "processes/processes.h"
@@ -322,8 +323,11 @@ bool processes_remove_peer(process_t *proc, const unsigned char *uuid)
                 tail * sizeof(proc->protocol.peers[0]));
         memmove(&proc->protocol.peer_rtt_ms[i], &proc->protocol.peer_rtt_ms[i + 1],
                 tail * sizeof(proc->protocol.peer_rtt_ms[0]));
+        memmove(&proc->protocol.peer_absent[i], &proc->protocol.peer_absent[i + 1],
+                tail * sizeof(proc->protocol.peer_absent[0]));
         memset(&proc->protocol.peers[n - 1], 0, sizeof(proc->protocol.peers[0]));
         proc->protocol.peer_rtt_ms[n - 1] = 0;
+        proc->protocol.peer_absent[n - 1] = false;
         proc->protocol.num_peers = n - 1;
         removed = true;
         break;
@@ -337,9 +341,28 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
 {
     switch (msgtype)
     {
-    case GROUP:
+    case GROUP: {
+        /* Name the key a sibling installs when it changes, so a process left
+         * on a stale key (rep-2368077: both network processes on a retired
+         * epoch-1 key while identity held epoch 2) is visible beside
+         * identity's own rotation lines. */
+        const group_t *was = &proc->protocol.group;
+        const group_t *now = &msg->info.group;
+        if (was->key_epoch != now->key_epoch
+            || memcmp(was->encryptor.public, now->encryptor.public,
+                      sizeof(now->encryptor.public)) != 0)
+        {
+            char wfp[17] = {0}, nfp[17] = {0};
+            sodium_bin2hex(wfp, sizeof(wfp), was->encryptor.public, 8);
+            sodium_bin2hex(nfp, sizeof(nfp), now->encryptor.public, 8);
+            log_info(proc->logger,
+                     "%s: installed group key %s… epoch %lld (was %s… epoch "
+                     "%lld)\n", proc->name, nfp, (long long)now->key_epoch,
+                     wfp, (long long)was->key_epoch);
+        }
         proc->protocol.group = msg->info.group;
         return true;
+    }
     case CHILD_GROUP: {
         /* A cohort this node GATEWAYS, not its primary group — so it must
          * never land in protocol.group. The reputation process keys a separate
@@ -363,6 +386,7 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
         if (proc->protocol.num_peers < DEFAULT_MAX_PEERS)
         {
             memcpy(&proc->protocol.peers[proc->protocol.num_peers], &msg->info.peer, sizeof(public_identity_t));
+            proc->protocol.peer_absent[proc->protocol.num_peers] = false;
             proc->protocol.num_peers++;
         }
         peers_write_unlock(proc);
@@ -389,6 +413,23 @@ bool run_message_handlers(process_t *proc, directory_t *queues, long msgtype, ge
         peers_write_unlock(proc);
         if (!matched)
             log_debug(proc->logger, "%s: rtt_update for unknown peer\n", proc->name);
+        return true;
+    }
+    case PEER_PRESENCE: {
+        /* Net-proc → us: a peer went quiet or came back. Advisory only:
+         * nothing leaves the roster (doc/architecture/peer-presence.md). A
+         * presence that outran the PEER message finds nobody and is dropped;
+         * the network process re-emits on the next transition. */
+        const peer_presence_msg_t *pp = &msg->info.peer_presence;
+        peers_write_lock(proc);
+        for (size_t i = 0; i < proc->protocol.num_peers; i++) {
+            if (memcmp(proc->protocol.peers[i].uuid, pp->peer_uuid,
+                       sizeof(uuid_t)) == 0) {
+                proc->protocol.peer_absent[i] = !pp->present;
+                break;
+            }
+        }
+        peers_write_unlock(proc);
         return true;
     }
     case PEER_CAPABILITIES: {

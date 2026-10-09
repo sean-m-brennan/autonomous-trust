@@ -1097,6 +1097,14 @@ class AutonomousTrust(Protocol):
                                     to_whom=None, from_whom=self.identity)
                     queues[CfgIds.reputation].put(query, block=True,
                                                   timeout=queue_cadence)
+                    # The presence half (doc/architecture/peer-presence.md),
+                    # as the C daemon also asks its network process.
+                    if CfgIds.network in queues:
+                        queues[CfgIds.network].put(
+                            Message(CfgIds.network,
+                                    ReputationProtocol.app_roster_request, '',
+                                    to_whom=None, from_whom=self.identity),
+                            block=True, timeout=queue_cadence)
                 elif isinstance(cmd, AppRequest):
                     self._route_app_request(queues, cmd)
                 elif cmd == Process.sig_quit:

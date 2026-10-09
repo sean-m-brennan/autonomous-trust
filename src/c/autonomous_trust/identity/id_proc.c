@@ -703,6 +703,44 @@ void identity_set_own_capabilities(const process_t *proc,
     pthread_mutex_unlock(&id_state.lock);
 }
 
+size_t identity_advertise_local_capabilities(const process_t *proc)
+{
+    if (proc == NULL)
+        return 0;
+    _ensure_id_init();
+    /* A list someone installed (the conformance adapter's fixtures) stands. */
+    if (_id_own_caps_for(proc) != NULL)
+        return 0;
+    char self_str[UUID_STRING_LEN + 1] = "";
+    const identity_t *self = identity_self_identity(proc);
+    if (self != NULL)
+        uuid_unparse_lower(self->uuid, self_str);
+    array_t *caps = NULL;
+    if (build_local_capabilities(self_str, &caps) != 0 || caps == NULL)
+    {
+        if (caps != NULL)
+            array_free(caps);
+        return 0;
+    }
+    size_t n = array_size(caps);
+    const char **names = calloc(n > 0 ? n : 1, sizeof(*names));
+    size_t k = 0;
+    for (size_t i = 0; names != NULL && i < n; i++)
+    {
+        data_t *d = NULL;
+        capability_t *cap = NULL;
+        if (array_get(caps, (int)i, &d) == 0 && d != NULL
+            && data_object_ptr(d, (ptr_t *)&cap) == 0 && cap != NULL
+            && cap->name[0] != '\0')
+            names[k++] = cap->name;
+    }
+    if (k > 0)
+        identity_set_own_capabilities(proc, names, k);
+    free((void *)names);
+    array_free(caps);
+    return k;
+}
+
 int64_t identity_freshness_refusals(const char *verb)
 {
     if (!id_state.initialized) return 0;
@@ -1214,6 +1252,39 @@ static int _remember_activity(const process_t *proc, directory_t *queues, generi
  ****************************/
 
 /* Frama-C: skipped — [solver-timeout] identity/peers/JSON preconditions */
+/* Name the key a group update carries, so the wire can be compared with what
+ * each side's identity and network processes hold (a three-way boot rotation
+ * forked the key in rep-2368077 and no line said which key went out). INFO
+ * when the key or epoch differs from the last update sent, debug otherwise:
+ * membership-only updates resend the same key and would drown the line. */
+static void _log_group_update_sent(const process_t *proc, size_t members)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static unsigned char last_key[crypto_box_PUBLICKEYBYTES];
+    static int64_t last_epoch = -1;
+    const group_t *g = &proc->protocol.group;
+    pthread_mutex_lock(&lock);
+    bool changed = g->key_epoch != last_epoch
+        || memcmp(last_key, g->encryptor.public, sizeof(last_key)) != 0;
+    last_epoch = g->key_epoch;
+    memcpy(last_key, g->encryptor.public, sizeof(last_key));
+    pthread_mutex_unlock(&lock);
+    char kfp[17] = {0};
+    sodium_bin2hex(kfp, sizeof(kfp), g->encryptor.public, 8);
+    int carries_key = sodium_is_zero(g->encryptor.private,
+                                     crypto_box_SECRETKEYBYTES) ? 0 : 1;
+    if (changed)
+        log_info(proc->logger,
+                 "Identity: sending group update with key %s… epoch %lld "
+                 "(carries_key=%d) to %zu member(s)\n",
+                 kfp, (long long)g->key_epoch, carries_key, members);
+    else
+        log_debug(proc->logger,
+                  "Identity: sending group update with key %s… epoch %lld "
+                  "(carries_key=%d) to %zu member(s)\n",
+                  kfp, (long long)g->key_epoch, carries_key, members);
+}
+
 static int _update_group(const process_t *proc, directory_t *queues)
 {
     (void)queues; /* network emission uses messaging_send by queue name */
@@ -1235,12 +1306,14 @@ static int _update_group(const process_t *proc, directory_t *queues)
         }
         net_msg_pack_json(&update.info.net_msg, grp_json);
         json_decref(grp_json);
+        _log_group_update_sent(proc, 0);
         (void)identity_send_to_network(proc, &update, "group_key_update", NULL);
         net_msg_free_obj(&update.info.net_msg);
         return 0;
     }
 
     peers_read_lock(proc);
+    _log_group_update_sent(proc, proc->protocol.num_peers);
     for (size_t i = 0; i < proc->protocol.num_peers; i++)
     {
         generic_msg_t update = {0};
@@ -3924,9 +3997,18 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
             group_t theirs = {0};
             memcpy(theirs.uuid, proc->protocol.group.uuid, sizeof(uuid_t));
             theirs.key_epoch = theirs_epoch;
-            if (carries_key
+            bool seed_loaded = carries_key
                 && encryptor_init_from_private(&theirs.encryptor,
-                       (const unsigned char *)seed_hex, strlen(seed_hex)) == 0
+                       (const unsigned char *)seed_hex, strlen(seed_hex)) == 0;
+            /* Why a refusal happened, decided once: the line below used to
+             * say "ours stands" for every failure in this chain, so a seed
+             * that did not load or a retired key read exactly like a lost
+             * tiebreak, and a forked cohort could not be told from one that
+             * settled (three-way boot rotation, rep-2368077). */
+            const char *refusal = !carries_key ? "it carries no key"
+                : !seed_loaded ? "its key seed did not load"
+                : group_rotation_refusal(&proc->protocol.group, &theirs);
+            if (refusal == NULL
                 && group_accept_rotation(&((process_t *)proc)->protocol.group,
                                          &theirs))
             {
@@ -3956,17 +4038,26 @@ static bool handle_group_update(const process_t *proc, directory_t *queues, gene
                 _remember_activity(proc, queues, &group_msg);
             }
             else
-                /* The tiebreak ran and declined, which is normal for the
-                 * WINNER of a simultaneous rotation — it keeps its own key and
-                 * the loser adopts. Logged anyway: "who won" is otherwise
-                 * invisible, and a cohort where BOTH sides log this line is
-                 * forked. */
+            {
+                /* A lost tiebreak is normal for the WINNER of a simultaneous
+                 * rotation — it keeps its own key and the loser adopts.
+                 * Logged anyway: "who won" is otherwise invisible, and a
+                 * cohort where BOTH sides log "ours stands" is forked. Both
+                 * keys are named, so the two sides' lines can be compared. */
+                char tfp[17] = "?", ofp[17] = {0};
+                if (seed_loaded)
+                    sodium_bin2hex(tfp, sizeof(tfp), theirs.encryptor.public, 8);
+                sodium_bin2hex(ofp, sizeof(ofp),
+                               proc->protocol.group.encryptor.public, 8);
                 log_info(proc->logger,
                          "Identity: rotation from %s not adopted (theirs epoch "
-                         "%lld, ours %lld, carries_key=%d) — ours stands\n",
+                         "%lld, ours %lld, carries_key=%d) — %s; theirs %s…, "
+                         "ours %s…\n",
                          nmsg->from_whom.nickname, (long long)theirs_epoch,
                          (long long)proc->protocol.group.key_epoch,
-                         (int)carries_key);
+                         (int)carries_key, refusal ? refusal : "refused",
+                         tfp, ofp);
+            }
         }
         else if (carries_key
                  && theirs_epoch >= proc->protocol.group.key_epoch
@@ -8090,6 +8181,16 @@ int identity_run(process_t *proc, directory_t *queues, queue_id_t signal, logger
                 identity_refresh_hierarchy(proc);
             }
         }
+    }
+
+    /* What this node can do, for every caps_response and confirm it sends
+     * (ISSUES §2.63). Nothing else installs it in production, so a C node
+     * advertised no capabilities, and once negotiation filtered by the
+     * matrix (§2.56) no peer was invited to anything. */
+    {
+        size_t n_caps = identity_advertise_local_capabilities(proc);
+        log_info(proc->logger, "Identity: advertising %zu capabilit%s\n",
+                 n_caps, n_caps == 1 ? "y" : "ies");
     }
 
     /* Phase 0→1: Acquire capabilities */

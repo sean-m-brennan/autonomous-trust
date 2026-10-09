@@ -332,6 +332,74 @@ DEFINE_TEST(test_an_exhausted_half_is_parked_not_dropped)
 }
 END_TEST_DEFINITION()
 
+/* Contention, not a partition: alice (with us, a majority of three) is
+ * reachable and the half still never committed. Given up as before §2.60, not
+ * parked: parked contention losers swamped the heal in part-2123724. */
+DEFINE_TEST(test_a_half_a_majority_reached_is_dropped_not_parked)
+{
+    _begin();
+    cohort_t c;
+    _cohort(&c);
+    _propose(&c);
+    for (int i = 1; i <= 6; i++) {
+        reputation_note_heard(c.alice->uuid, LATER(i));
+        _retry_uncommitted_halves(c.proc, LATER(i));
+    }
+    ck_assert_uint_eq(reputation_parked_count(), 0);
+    ck_assert_uint_eq(reputation_awaiting_commit_count(), 0);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* THE REGRESSION (part-2136648): reach is any frame from the peer, not an
+ * answer to one of the half's own rounds. A grant that arrives for a ballot
+ * the retry already retired lands nowhere, and counting those parked a whole
+ * connected group's contention losers. Here nothing answers a live round;
+ * alice is merely heard, late, and that is enough. */
+DEFINE_TEST(test_a_peer_heard_on_a_retired_ballot_still_counts)
+{
+    _begin();
+    cohort_t c;
+    _cohort(&c);
+    _propose(&c);
+    int64_t stale1 = g_req_id1, stale2 = g_req_id2;
+    for (int i = 1; i <= 5; i++)
+        _retry_uncommitted_halves(c.proc, LATER(i));
+    g_req_id1 = stale1; g_req_id2 = stale2;
+    _grant(c.proc, c.alice);               /* for a retired ballot */
+    reputation_note_heard(c.alice->uuid, LATER(6));
+    _retry_uncommitted_halves(c.proc, LATER(6));
+    ck_assert_uint_eq(reputation_parked_count(), 0);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* The minority side of a partition: of five, only alice is reachable (two of
+ * five, counting us), and whoever was heard before the split is stale. */
+DEFINE_TEST(test_a_minority_island_parks_its_half)
+{
+    _begin();
+    cohort_t c;
+    _cohort(&c);
+    identity_t *carol = _mk_identity("carol", "10.0.0.4");
+    identity_t *dave = _mk_identity("dave", "10.0.0.5");
+    _add_peer(c.proc, carol);
+    _add_peer(c.proc, dave);
+    _propose(&c);
+    /* Everyone answered before the split, four timeouts back... */
+    reputation_note_heard(c.bob->uuid, LATER(5));
+    reputation_note_heard(carol->uuid, LATER(5));
+    reputation_note_heard(dave->uuid, LATER(5));
+    for (int i = 1; i <= 6; i++) {
+        /* ...and only alice since. */
+        reputation_note_heard(c.alice->uuid, LATER(i));
+        _retry_uncommitted_halves(c.proc, LATER(i));
+    }
+    ck_assert_uint_eq(reputation_parked_count(), 1);
+    _end();
+}
+END_TEST_DEFINITION()
+
 /* Park the half, as the minority side of a partition does: five unanswered
  * re-proposals, parked on the sixth pass at LATER(6). */
 static void _park(cohort_t *c)
@@ -367,31 +435,71 @@ END_TEST_DEFINITION()
 /* THE HEAL (§2.60): the minority's chain is a strict prefix of the majority's,
  * so the heal arrives as an EXTENDED catch-up. That wakes the parked half at
  * once rather than at its next slow retry. */
+/* alice sends a chain of @p n entries, unrelated tasks she committed with bob,
+ * as the majority island's does at the heal. */
+static void _catch_up(cohort_t *c, int n)
+{
+    tx_history_t theirs;
+    ck_assert_ret_ok(tx_history_init(&theirs));
+    for (int i = 0; i < n; i++) {
+        uuid_t other;
+        uuid_generate(other);
+        ck_assert_ret_ok(tx_history_update(&theirs, other, c->alice->uuid, 0.8,
+                                           NULL));
+        ck_assert_ret_ok(tx_history_update(&theirs, other, c->bob->uuid, 0.7,
+                                           NULL));
+    }
+    json_t *chain = NULL;
+    ck_assert_ret_ok(tx_history_era_to_json(&theirs, 0, tx_history_len(&theirs),
+                                            &chain));
+    _dispatch(c->proc, c->alice, REP_PROTO_UPDATE, chain);
+    json_decref(chain);
+    tx_history_free(&theirs);
+}
+
 DEFINE_TEST(test_a_grown_chain_wakes_parked_halves)
 {
     _begin();
     cohort_t c;
     _cohort(&c);
     _park(&c);
+    _catch_up(&c, 1);
 
-    /* The majority committed an unrelated task between alice and bob. */
-    tx_history_t theirs;
-    ck_assert_ret_ok(tx_history_init(&theirs));
-    uuid_t other;
-    uuid_generate(other);
-    ck_assert_ret_ok(tx_history_update(&theirs, other, c.alice->uuid, 0.8, NULL));
-    ck_assert_ret_ok(tx_history_update(&theirs, other, c.bob->uuid, 0.7, NULL));
-    json_t *chain = NULL;
-    ck_assert_ret_ok(tx_history_era_to_json(&theirs, 0, tx_history_len(&theirs),
-                                            &chain));
-    _dispatch(c.proc, c.alice, REP_PROTO_UPDATE, chain);
-    json_decref(chain);
-    tx_history_free(&theirs);
-
+    /* Not at once: the last round has its COMMIT_TIMEOUT first. */
+    _retry_uncommitted_halves(c.proc, (double)time(NULL));
+    ck_assert_uint_eq(g_request_count, 0);
     /* LATER(7) is 60 s before the slow retry: only the wake makes it due. */
     _retry_uncommitted_halves(c.proc, LATER(7));
     ck_assert_uint_eq(g_request_count, 2);
-    ck_assert_uint_eq(reputation_parked_count(), 1);
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* A wake UNPARKS (part-2272442): the half is active again, with
+ * REP_WAKE_RETRIES (10) fresh retries, and with a majority now reachable it is
+ * given up after them as a contention loser. Left parked, every chain growth
+ * after the heal re-sent the island's whole backlog. */
+DEFINE_TEST(test_a_woken_half_is_unparked_with_fresh_retries)
+{
+    _begin();
+    cohort_t c;
+    _cohort(&c);
+    _park(&c);
+    _catch_up(&c, 1);
+    _retry_uncommitted_halves(c.proc, LATER(7));
+    ck_assert_uint_eq(reputation_parked_count(), 0);
+    ck_assert_uint_eq(reputation_awaiting_commit_count(), 1);
+    /* A second growth leaves it unparked, with its count running. */
+    _catch_up(&c, 2);
+    ck_assert_uint_eq(reputation_parked_count(), 0);
+    g_request_count = 0;
+    /* Nine more retries (ten in all since the wake), then given up. */
+    for (int i = 8; i <= 17; i++) {
+        reputation_note_heard(c.alice->uuid, LATER(i));
+        _retry_uncommitted_halves(c.proc, LATER(i));
+    }
+    ck_assert_uint_eq(g_request_count, 18);
+    ck_assert_uint_eq(reputation_awaiting_commit_count(), 0);
     _end();
 }
 END_TEST_DEFINITION()
@@ -437,6 +545,71 @@ DEFINE_TEST(test_a_half_already_in_the_chain_is_forgotten)
 }
 END_TEST_DEFINITION()
 
+/* A NEW probe half (an "at." capability), through the same gate the local
+ * TRANSACTION_SCORE handler uses. Returns whether it was admitted. */
+static bool _probe(cohort_t *c, uuid_t task)
+{
+    uuid_generate(task);
+    if (!_admit_new_half(c->proc, task, "at.handshake"))
+        return false;
+    uuid_t subject;
+    uuid_clear(subject);
+    _forward_transaction(c->proc, task, c->me->uuid, 0.9, "at.handshake",
+                         NULL, subject, 0.0);
+    return true;
+}
+
+/* PROBE BACKPRESSURE (part-2314213): at most AT_REP_MAX_PROBE_HALVES (4)
+ * probe halves are followed at once; the fifth is dropped. An app half is
+ * never capped. */
+DEFINE_TEST(test_probe_halves_are_capped_app_halves_are_not)
+{
+    _begin();
+    cohort_t c;
+    _cohort(&c);
+    uuid_t t;
+    for (int i = 0; i < 4; i++)
+        ck_assert(_probe(&c, t));
+    ck_assert(!_probe(&c, t));
+    ck_assert_uint_eq(reputation_awaiting_commit_count(), 4);
+    ck_assert(_admit_new_half(c.proc, c.task, "agora-post"));
+    ck_assert(_admit_new_half(c.proc, c.task, NULL));
+    _end();
+}
+END_TEST_DEFINITION()
+
+/* While an app half of ours is pending, our probes yield: a new one is
+ * dropped, and an overdue one waits, its attempts unspent, until the app half
+ * commits. bob's reaction lost 24 rounds in a row to probes in part-2314213. */
+DEFINE_TEST(test_probes_yield_to_a_pending_app_half)
+{
+    _begin();
+    cohort_t c;
+    _cohort(&c);
+    uuid_t probe;
+    ck_assert(_probe(&c, probe));
+    _propose(&c);                          /* the app half */
+    uuid_t t;
+    ck_assert(!_probe(&c, t));
+
+    g_request_count = 0;
+    _retry_uncommitted_halves(c.proc, LATER(1));
+    ck_assert_uint_eq(g_request_count, 2);  /* the app half only */
+
+    _grant(c.proc, c.alice);
+    _grant(c.proc, c.bob);
+    _accept(c.proc, c.alice, c.task_str);
+    _accept(c.proc, c.bob, c.task_str);
+    ck_assert_uint_eq(reputation_awaiting_commit_count(), 1);
+
+    g_request_count = 0;
+    _retry_uncommitted_halves(c.proc, LATER(2));
+    ck_assert_uint_eq(g_request_count, 2);  /* now the probe goes */
+    ck_assert(_probe(&c, t));
+    _end();
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(RepCommitRetry,
           test_a_granted_round_that_never_commits_is_re_proposed,
           test_a_committed_half_is_left_alone,
@@ -444,5 +617,11 @@ RUN_TESTS(RepCommitRetry,
           test_an_exhausted_half_is_parked_not_dropped,
           test_a_parked_half_is_re_proposed_every_park_retry,
           test_a_grown_chain_wakes_parked_halves,
+          test_a_woken_half_is_unparked_with_fresh_retries,
+          test_probe_halves_are_capped_app_halves_are_not,
+          test_probes_yield_to_a_pending_app_half,
           test_a_parked_half_expires_or_is_forgotten,
+          test_a_half_a_majority_reached_is_dropped_not_parked,
+          test_a_peer_heard_on_a_retired_ballot_still_counts,
+          test_a_minority_island_parks_its_half,
           test_a_half_already_in_the_chain_is_forgotten)

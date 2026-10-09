@@ -49,6 +49,7 @@
 #include "network/net_proc_priv.h"
 #include "network/net_filter.h"
 #include "network/net_ext.h"
+#include "network/net_presence.h"
 #include "utilities/send_retry.h"
 #include "identity/identity.h"
 #include "identity/identity_priv.h"
@@ -1007,6 +1008,19 @@ static int route_to_process(const net_wire_msg_t *wmsg, process_t *proc,
     snprintf(_test_last_routed_from_addr, sizeof(_test_last_routed_from_addr),
              "%s", wmsg->from_whom.address);
     pthread_mutex_unlock(&_test_last_routed_lock);
+
+    /* Every frame from the wire is routed here, so this is where a peer is
+     * heard (doc/architecture/peer-presence.md). A uuid not on the roster is
+     * ignored by the tracker. A presence frame has said everything it carries
+     * by arriving: consumed here, never routed. */
+    net_presence_heard(wmsg->from_whom.uuid, (double)time(NULL));
+    if (wmsg->function != NULL
+        && strcmp(wmsg->process, NET_PRESENCE_PROCESS) == 0
+        && strcmp(wmsg->function, NET_PRESENCE_FUNCTION) == 0) {
+        log_debug(logger, "Network: presence from %s\n",
+                  wmsg->from_whom.nickname);
+        return 0;
+    }
 
     /* Build a generic_msg_t with NET_MESSAGE type.  obj/data are POINTER
      * ASSIGNMENTS, not copies — no heap-overflow possible regardless of
@@ -2195,6 +2209,116 @@ static int net_emit_all_rtts(const process_t *proc, logger_t *logger)
     return emitted;
 }
 
+/* Tell the sibling processes and the app that one peer went quiet or came
+ * back (PEER_PRESENCE, doc/architecture/peer-presence.md). Kept on a full
+ * queue like any state hand-off: a lost transition would leave negotiation
+ * skipping a peer that is back, until the next one. */
+static void net_emit_presence(const process_t *proc, directory_t *queues,
+                              const net_presence_change_t *c, bool to_siblings,
+                              logger_t *logger)
+{
+    generic_msg_t msg = {0};
+    msg.type = PEER_PRESENCE;
+    msg.size = sizeof(peer_presence_msg_t);
+    memcpy(msg.info.peer_presence.peer_uuid, c->peer_uuid, sizeof(uuid_t));
+    msg.info.peer_presence.present = c->present;
+    msg.info.peer_presence.last_heard = c->last_heard;
+
+    size_t qsize = to_siblings && queues != NULL ? array_size(queues) : 0;
+    for (size_t i = 0; i < qsize; i++) {
+        data_t *name_val = NULL;
+        char *qname = NULL;
+        if (array_get(queues, (int)i, &name_val) != 0
+            || data_string_ptr(name_val, &qname) != 0)
+            continue;
+        if (strcmp(qname, proc->name) == 0 || strcmp(qname, AT_MAIN_QUEUE) == 0)
+            continue;
+        int rc = at_send(proc, qname, &msg, "a peer presence", qname,
+                         AT_SEND_NOW, NULL, NULL, 0);
+        if (rc != 0)
+            log_debug(logger, "Network: presence to %s returned %d\n", qname, rc);
+    }
+    int rc = at_send(proc, AT_MAIN_QUEUE, &msg, "a peer presence", "the app",
+                     AT_SEND_NOW, NULL, NULL, 0);
+    if (rc != 0)
+        log_debug(logger, "Network: presence to the app returned %d\n", rc);
+}
+
+/* The roster's uuids, snapshotted under the read lock. Returns the count. */
+static size_t net_roster_uuids(const process_t *proc, uuid_t *out)
+{
+    peers_read_lock(proc);
+    size_t n = proc->protocol.num_peers;
+    if (n > DEFAULT_MAX_PEERS)
+        n = DEFAULT_MAX_PEERS;
+    for (size_t i = 0; i < n; i++)
+        memcpy(out[i], proc->protocol.peers[i].uuid, sizeof(uuid_t));
+    peers_read_unlock(proc);
+    return n;
+}
+
+/* AT → app: every peer's presence, the presence half of the roster pull. */
+static int net_emit_all_presence(const process_t *proc, logger_t *logger)
+{
+    uuid_t roster[DEFAULT_MAX_PEERS];
+    net_presence_change_t rows[DEFAULT_MAX_PEERS];
+    size_t n = net_roster_uuids(proc, roster);
+    size_t m = net_presence_snapshot(roster, n, rows, DEFAULT_MAX_PEERS);
+    for (size_t i = 0; i < m; i++)
+        net_emit_presence(proc, NULL, &rows[i], false, logger);
+    return (int)m;
+}
+
+/* Once a second: evaluate presence, tell everyone what changed, and when we
+ * have been silent toward some member for the heartbeat interval, queue one
+ * presence frame to the group. It goes out through our own queue so it takes
+ * exactly the path, gates and accounting of any other group multicast. A
+ * node without the group's private key cannot multicast, and has nothing to
+ * say to a roster of none. */
+static void net_presence_step(const process_t *proc, directory_t *queues,
+                              double now, logger_t *logger)
+{
+    uuid_t roster[DEFAULT_MAX_PEERS];
+    net_presence_change_t changes[DEFAULT_MAX_PEERS];
+    size_t n_changes = 0;
+    size_t n = net_roster_uuids(proc, roster);
+    bool due = net_presence_tick(roster, n, now, changes, DEFAULT_MAX_PEERS,
+                                 &n_changes);
+    for (size_t i = 0; i < n_changes; i++) {
+        char who[UUID_STR_LEN + 1];
+        uuid_unparse_lower(changes[i].peer_uuid, who);
+        if (changes[i].present)
+            log_info(logger, "Network: peer %.8s is present again\n", who);
+        else
+            log_info(logger, "Network: peer %.8s is absent: nothing heard for "
+                     "%.0f s (last %s)\n", who, net_presence_absent_sec(),
+                     changes[i].last_heard > 0.0 ? "frame recorded" : "none ever");
+        net_emit_presence(proc, queues, &changes[i], true, logger);
+    }
+    if (!due || n == 0
+        || sodium_is_zero(proc->protocol.group.encryptor.private,
+                          crypto_box_SECRETKEYBYTES))
+        return;
+    generic_msg_t beat = {0};
+    beat.type = NET_MESSAGE;
+    snprintf(beat.info.net_msg.process, sizeof(beat.info.net_msg.process),
+             "%s", NET_PRESENCE_PROCESS);
+    beat.info.net_msg.function = (char *)NET_PRESENCE_FUNCTION;
+    beat.info.net_msg.encrypt = true;
+    beat.info.net_msg.group_multicast = true;
+    json_t *body = json_object();
+    if (body != NULL) {
+        net_msg_pack_json(&beat.info.net_msg, body);
+        json_decref(body);
+    }
+    /* One try: a full queue means traffic is going out anyway, and the next
+     * second asks again. Stamped on success so a slow drain cannot queue one
+     * heartbeat per second. */
+    if (messaging_send(proc->name, NET_MESSAGE, &beat, false) == 0)
+        net_presence_sent(NULL, now);
+    net_msg_free_obj(&beat.info.net_msg);
+}
+
 /****************************
  * Network process main
  ****************************/
@@ -2328,6 +2452,7 @@ static int network_run(const net_transport_t *transport,
     }
     /* The optional half of the plaintext receive policy (identity_run checked
      * it too, but this is the process that consults it). */
+    net_presence_init();
     if (plaintext_verbs_configure(NULL, logger) != 0) {
         transport->close(tctx);
         if (my_public != NULL) smrt_deref(my_public);
@@ -2350,9 +2475,17 @@ static int network_run(const net_transport_t *transport,
 
     generic_msg_t buf = {0};
     time_t last_kept_drain = 0;
+    time_t last_presence = 0;
     while (keep_running(proc, &pctx.sig_q, logger))
     {
         net_ext_periodic(&thread_ctx);
+        {
+            time_t t = time(NULL);
+            if (t != last_presence) {
+                last_presence = t;
+                net_presence_step(proc, queues, (double)t, logger);
+            }
+        }
         /* Frames a full sibling queue refused (route_to_process and friends,
          * utilities/send_retry.h). sleep_until drains them too, but this loop
          * reaches it only when its own queue is empty, which under a burst is
@@ -2433,8 +2566,10 @@ static int network_run(const net_transport_t *transport,
                  * only — an app never learns another node's whole verb surface. */
                 if (strcmp(nmsg->function, AT_APP_ROSTER_REQUEST) == 0) {
                     int n = net_emit_all_rtts(proc, logger);
+                    int p = net_emit_all_presence(proc, logger);
                     log_debug(logger,
-                              "Network: rtt roster request -> %d observation(s)\n", n);
+                              "Network: roster request -> %d rtt and %d presence "
+                              "observation(s)\n", n, p);
                     continue;
                 }
                 /* Reputation communication cut-off enforcement. rep_proc's
@@ -2614,6 +2749,11 @@ static int network_run(const net_transport_t *transport,
                           nmsg->process, nmsg->function);
                 log_exception(logger);
             } else {
+                /* What a peer has heard from us lately decides whether we owe
+                 * the group a presence frame (net_presence_step). */
+                net_presence_sent((is_group || is_broadcast)
+                                      ? NULL : nmsg->to_whom.uuid,
+                                  (double)time(NULL));
                 log_info(logger, "Network: sent %s.%s to %s\n",
                          nmsg->process, nmsg->function,
                          is_broadcast ? bcast_addr : nmsg->to_whom.address);

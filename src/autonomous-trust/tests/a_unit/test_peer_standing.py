@@ -476,3 +476,30 @@ def test_a_lifted_ceiling_is_rescored_when_it_lifts():
     _stand(rp, peer, STANDING_PROVED, source=STANDING_SOURCE_ETHNE)
     rp._apply_peer_standings({})
     assert scored == [peer]
+
+
+def test_a_finding_never_raises_a_peer_known_through_others():
+    """ISSUES §2.64: a peer this node never transacted with, known only through
+    a third party's 0.9s, was given the cold-start prior (0.60) as its first
+    score, since the absent stored score chose the CTFT regime; the next entry
+    about it, a 0.3 finding, flipped it to the pure mean and RAISED it (Stele
+    cohort st-2590772). The first score's regime now follows what the node
+    would assign, so the finding lowers it. Twin of the C test of that name."""
+    rp = _make_rep_process()
+    rp._persist_reputations = MagicMock()
+    other, them = uuid4(), uuid4()
+    rp.reputations.update(other, 0.9)
+    for _ in range(4):
+        tid = uuid4()
+        rp.history.update(tid, other, 0.9)
+        rp.history.update(tid, them, 0.9)
+    assert them not in rp.reputations
+    rp._compute_reputation(them, MagicMock(), MagicMock())
+    first = rp.reputations.current[them]
+    # The evidence's mean, not the prior shrunk toward neutral (0.60).
+    assert abs(first - 0.9) < 0.01
+    tid = uuid4()
+    rp.history.update(tid, other, 0.3)      # `other` scores `them` 0.3
+    rp.history.update(tid, them, 0.9)
+    rp._compute_reputation(them, MagicMock(), MagicMock())
+    assert rp.reputations.current[them] < first

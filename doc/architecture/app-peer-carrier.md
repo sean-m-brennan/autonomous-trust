@@ -532,4 +532,4 @@ in `libhdr` now.
 
 ---
 
-*Next: [Extensions](extensions.md)*
+*Next: [Peer presence](peer-presence.md)*

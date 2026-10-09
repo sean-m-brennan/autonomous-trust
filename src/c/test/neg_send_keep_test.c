@@ -509,6 +509,63 @@ DEFINE_TEST(test_the_matrix_narrows_the_fanout)
 }
 END_TEST_DEFINITION()
 
+/* A peer the network process reports absent (PEER_PRESENCE,
+ * doc/architecture/peer-presence.md) is not invited: asking it to work would
+ * only time out. It stays on the roster, and is invited again once present. */
+DEFINE_TEST(test_an_absent_peer_is_not_invited)
+{
+    _begin_requestor(false);                     /* one peer, broadcast */
+    ck_assert_uint_eq(g_invites, 1);
+
+    identity_t *other_full = NULL;
+    public_identity_t *other = NULL;
+    uuid_t u;
+    uuid_generate(u);
+    ck_assert_ret_ok(identity_create(&u, "10.0.60.4", "other", "other", &other_full));
+    ck_assert_ret_ok(identity_publish(other_full, &other));
+    memcpy(&g_proc->protocol.peers[1], other, sizeof(public_identity_t));
+    g_proc->protocol.num_peers = 2;
+    char peer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(g_peer->uuid, peer_str);
+
+    /* Delivered the way the network process sends it. */
+    generic_msg_t presence = {0};
+    presence.type = PEER_PRESENCE;
+    memcpy(presence.info.peer_presence.peer_uuid, other->uuid, sizeof(uuid_t));
+    presence.info.peer_presence.present = false;
+    ck_assert(run_message_handlers(g_proc, NULL, PEER_PRESENCE, &presence));
+    ck_assert(g_proc->protocol.peer_absent[1]);
+
+    for (int round = 0; round < 2; round++) {
+        g_invites = 0;
+        uuid_t task;
+        uuid_generate(task);
+        uuid_unparse_lower(task, g_task_str);
+        json_t *params = json_pack("{s:s, s:{s:s, s:s, s:i, s:i}, s:b}",
+                                   "__type__", PY_TYPE_TASK_PARAMS,
+                                   "_capability", "__type__", PY_TYPE_CAPABILITY,
+                                   "name", "noop", "required_tier", 0,
+                                   "transaction_weight", 1, "_flexible", 1);
+        json_t *j = json_pack("{s:s, s:o, s:i, s:o}", "__type__", PY_TYPE_TASK,
+                              "uuid", _uuid_json(), "size", 1, "parameters", params);
+        _dispatch(NEG_PROTO_START, g_req, j);
+        json_decref(j);
+        if (round == 0) {
+            ck_assert_uint_eq(g_invites, 1);
+            ck_assert_str_eq(g_invited_peer, peer_str);
+            presence.info.peer_presence.present = true;
+            ck_assert(run_message_handlers(g_proc, NULL, PEER_PRESENCE, &presence));
+            ck_assert(!g_proc->protocol.peer_absent[1]);
+        } else {
+            ck_assert_uint_eq(g_invites, 2);     /* back: invited again */
+        }
+    }
+
+    smrt_deref(other);
+    _end();
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(NegSendKeep,
           test_a_refusal_survives_a_full_queue,
           test_an_acceptance_survives_a_full_queue,
@@ -516,4 +573,5 @@ RUN_TESTS(NegSendKeep,
           test_a_live_answer_extends_and_resets_the_count,
           test_an_unaccepted_task_is_given_up_at_the_deadline,
           test_a_running_job_answers_running,
-          test_the_matrix_narrows_the_fanout)
+          test_the_matrix_narrows_the_fanout,
+          test_an_absent_peer_is_not_invited)

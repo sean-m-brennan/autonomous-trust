@@ -623,7 +623,63 @@ DEFINE_TEST(test_a_lifted_ceiling_is_rescored_when_it_lifts)
 }
 END_TEST_DEFINITION()
 
+/****************************
+ * ISSUES §2.64: a peer this node has scored no transaction with, known only
+ * through a third party's 0.9s, was given the cold-start prior (0.60) as its
+ * first score, because the absent stored score (0) chose the CTFT regime. The
+ * next entry about it, a 0.3 finding, flipped it to the pure mean and RAISED it
+ * to 0.78 (Stele cohort st-2590772). The first score's regime now follows what
+ * the node would assign it, so the finding lowers the peer, as it must.
+ ****************************/
+DEFINE_TEST(test_a_finding_never_raises_a_peer_known_through_others)
+{
+    identity_t *me = _mk_identity("10.0.0.1", "self");
+    identity_t *them = _mk_identity("10.0.0.2", "peer");
+    identity_t *other = _mk_identity("10.0.0.3", "other");
+    process_t *proc = _mk_process(me);
+
+    char peer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(them->uuid, peer_str);
+    json_t *payload = json_object();
+    json_object_set_new(payload, "peer_uuid", json_string(peer_str));
+    json_object_set_new(payload, "requesting_process", json_string("negotiation"));
+
+    reputation_reset_state(3);
+    messaging_set_test_hook(_sink_hook);
+    reputation_install_peer_reputation(other->uuid, 0.9);
+    for (int i = 0; i < 4; i++) {
+        uuid_t task;
+        uuid_clear(task);
+        task[0] = (unsigned char)(40 + i);
+        task[15] = 2;
+        reputation_install_tx_pair(task, other->uuid, 0.9, them->uuid, 0.9);
+    }
+    double first = 0.0;
+    ck_assert(reputation_get_peer_reputation(them->uuid, &first) != 0);   /* never scored */
+    _dispatch(proc, them, REP_REQ_FN, payload);
+    ck_assert_ret_ok(reputation_get_peer_reputation(them->uuid, &first));
+    /* The evidence's mean, not the prior shrunk toward neutral
+     * ((4 x 0.9 + 3 x 0.2) / 7 = 0.60). */
+    ck_assert_double_eq_tol(first, 0.9, 0.01);
+
+    uuid_t finding;
+    uuid_clear(finding);
+    finding[0] = 50;
+    finding[15] = 2;
+    /* p1's score is the one p1 gave: `other` scores `them` 0.3. */
+    reputation_install_tx_pair(finding, other->uuid, 0.3, them->uuid, 0.9);
+    _dispatch(proc, them, REP_REQ_FN, payload);
+    double after = 0.0;
+    ck_assert_ret_ok(reputation_get_peer_reputation(them->uuid, &after));
+    ck_assert(after < first);
+
+    json_decref(payload);
+    messaging_set_test_hook(NULL);
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(PeerStanding,
+          test_a_finding_never_raises_a_peer_known_through_others,
           test_a_lifted_ceiling_is_rescored_when_it_lifts,
           test_a_capped_peer_is_bounded,
           test_a_proved_peer_is_unbounded,

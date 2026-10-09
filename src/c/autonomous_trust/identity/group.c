@@ -184,25 +184,25 @@ static bool _group_key_is_retired(const group_t *group, const encryptor_t *key)
  * the epoch exists to stop still cannot land. What an equal epoch may now do
  * is replace a live key with a DIFFERENT live key of the same generation, which
  * is the fork we are resolving. */
-bool group_accept_rotation(group_t *group, const group_t *other)
+const char *group_rotation_refusal(const group_t *group, const group_t *other)
 {
     if (group == NULL || other == NULL)
-        return false;
+        return "no group to compare";
     if (uuid_compare(group->uuid, other->uuid) != 0)
-        return false;
+        return "a different group";
     if (other->key_epoch < group->key_epoch)
-        return false;
+        return "a lower epoch (a replay)";
     if (!_group_owns_private(other))
-        return false;
+        return "it carries no private key";
     /* Never reinstate a key we rotated away from, whatever epoch it claims. */
     if (_group_key_is_retired(group, &other->encryptor))
-        return false;
+        return "a key we already retired";
     if (other->key_epoch == group->key_epoch)
     {
         int order = memcmp(other->encryptor.public, group->encryptor.public,
                            crypto_box_PUBLICKEYBYTES);
         if (order == 0)
-            return false;   /* already the same key — nothing to adopt */
+            return "already our key";
         /* A real key always beats NO key at the same epoch. Holding a
          * public-only view means we cannot read the cohort at all, so there is
          * nothing to defend by winning a byte comparison, and a tiebreak that
@@ -210,8 +210,15 @@ bool group_accept_rotation(group_t *group, const group_t *other)
          * only reaches an equal-epoch adoption from a VERIFIED update, so this
          * is not a way to hand a node a key of the attacker's choosing.) */
         if (_group_owns_private(group) && order > 0)
-            return false;   /* ours wins the tiebreak; they will adopt it */
+            return "ours stands (the lower key wins the tiebreak)";
     }
+    return NULL;
+}
+
+bool group_accept_rotation(group_t *group, const group_t *other)
+{
+    if (group_rotation_refusal(group, other) != NULL)
+        return false;
     if (_group_owns_private(group))
     {
         size_t keep = group->num_previous_keys;
