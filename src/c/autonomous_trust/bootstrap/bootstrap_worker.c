@@ -208,12 +208,21 @@ size_t bootstrap_worker_select_target(const bootstrap_worker_t *w,
     if (peer_count > AT_PROBE_MAX_TRACKED_PEERS) {
         /* No per-peer state to compare beyond the cap. Round-robin rather than
          * silently probing only the first AT_PROBE_MAX_TRACKED_PEERS peers,
-         * which would leave the rest permanently unchallenged. */
-        return (size_t)w->probes_issued % peer_count;
+         * which would leave the rest permanently unchallenged. A skipped peer
+         * passes its turn to the next one. */
+        size_t start = (size_t)w->probes_issued % peer_count;
+        for (size_t k = 0; k < peer_count; k++) {
+            size_t i = (start + k) % peer_count;
+            if (w->skip_peer == NULL || !w->skip_peer[i])
+                return i;
+        }
+        return peer_count;
     }
-    size_t best = 0;
+    size_t best = peer_count;
     double best_bonus = -1.0;
     for (size_t i = 0; i < peer_count; i++) {
+        if (w->skip_peer != NULL && w->skip_peer[i])
+            continue;
         double bonus = bootstrap_ucb_bonus(w->probes_by_peer[i],
                                           w->probes_issued);
         /* Strict >: ties keep the lowest index, so the result does not depend
@@ -265,6 +274,8 @@ bool bootstrap_worker_try_issue_probe(bootstrap_worker_t *w, size_t peer_count,
     if (idx < 0)
         return false;
     size_t target = bootstrap_worker_select_target(w, peer_count);
+    if (target >= peer_count)
+        return false;                     /* every peer is skipped */
 
     /* Same per-cap argument shapes as the window path, drawing from the same
      * PRNG so a probe's challenge is as unpredictable as a bootstrap pair's --

@@ -1,4 +1,4 @@
-*Previous: [App-facing peer carrier](app-peer-carrier.md)*
+*Previous: [Peer presence](peer-presence.md)*
 
 # Extensions: how a feature attaches to the core
 
@@ -802,6 +802,15 @@ contact noticing:
 | Receive the answers to an op family | `net_relay_client_on_op` | `RelayClient.on_op` |
 | Serve an op family on our relay | `net_relay_server_add_op` | `RelayServer.add_op` |
 | The buckets this node is listed under, for roster hints | `net_relay_rosters_set_area_provider` | `relay_rosters.set_area_provider` |
+
+The same seams serve an external extension. Stele (`apps/stele/at-stele`,
+loaded through `AT_EXTERNAL_EXTENSIONS`) plugs its discovery relay, the `stl_`
+family, into the relay with `NET_RDV_SERVICE_REGISTER` and
+`net_relay_server_add_op`, and its app verbs go straight to the network process
+(`AT_APP_VERB_REGISTER(..., "network")`), whose `local_verb` hook owns them.
+That takes the third of the four service and op-family slots, after first
+contact's directory and area hub. Its library declares `DEPENDS rendezvous`,
+and `at_stele_link()` keeps the constructor-registered glue in a static link.
 
 A relay answers an op with an underscore that no family claims as
 `{op: "<family>_refused", reason: "unknown_op"}`, echoing the request's other

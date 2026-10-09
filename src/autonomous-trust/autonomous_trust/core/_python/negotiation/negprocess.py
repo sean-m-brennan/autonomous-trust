@@ -19,6 +19,7 @@ from queue import Empty, Full
 from datetime import timedelta
 from uuid import UUID
 
+from ..bootstrap_capabilities import BOOTSTRAP_CAPABILITY_NAMES
 from ..capabilities import Capability
 from ..config import from_json_string
 from ..freshness import Freshness
@@ -134,6 +135,25 @@ class NegotiationProcess(Process, metaclass=ProcMeta,
                         peer = self.peers.find_by_uuid(peer_id)
                         if peer is not None:
                             participants.append(peer)
+            # A peer the network process has heard nothing from lately is not
+            # asked to work: it would only time out
+            # (doc/architecture/peer-presence.md). It stays a member. A probe
+            # addressed to one is not issued at all, as in C, where the probe
+            # selector never picks it: a no_peers result would be scored.
+            absent = getattr(self.protocol, 'absent_peers', set())
+            if absent:
+                present = [p for p in participants if str(p.uuid) not in absent]
+                target = getattr(message, 'to_whom', None)
+                if isinstance(target, (list, tuple)):
+                    target = target[0] if len(target) == 1 else None
+                if (target is not None and str(getattr(target, 'uuid', '')) in absent
+                        and task.capability.name in BOOTSTRAP_CAPABILITY_NAMES):
+                    self.logger.debug('Probe %s to absent peer %s not issued',
+                                      task.capability.name,
+                                      str(target.uuid)[:8])
+                    del self.my_tasks[task.uuid]
+                    return True
+                participants = present
             # Optional single-peer addressing (R+D.md §12.7). `to_whom` unset
             # keeps the historical fan-out to every capable peer; set, it
             # narrows the announcement to that one peer.

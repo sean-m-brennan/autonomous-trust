@@ -73,6 +73,30 @@ void _retry_nacked_rounds(const process_t *proc, double present,
  *  loop; @p present is a parameter so a test can advance the clock. */
 void _retry_uncommitted_halves(const process_t *proc, double present);
 
+/** Hand our committed-but-unpaired halves on the primary chain to each peer
+ *  that joined the roster after we committed them, at 5, 15 and 30 s after it
+ *  is first seen (ISSUES §2.62): a join carries only bilateral entries, so
+ *  without this the late member holds our counterpart's half alone and its
+ *  chain forks from ours. Called once per pass from reputation_run's loop;
+ *  @p present is a parameter so a test can advance the clock. Returns how
+ *  many `tx committed` frames went out. */
+size_t _hand_off_pending_halves(const process_t *proc, double present,
+                                const uuid_t self_uuid, bool have_self);
+
+/** Record that @p peer sent us a reputation frame at @p when (epoch seconds).
+ *  reputation_run calls it for every inbound net frame; a half whose retries
+ *  run out is parked only if fewer than a majority of the group, counting us,
+ *  were heard within two commit timeouts (ISSUES §2.60). A test seam too. */
+void reputation_note_heard(const uuid_t peer, double when);
+
+/** Probe backpressure (ISSUES §2.60): may a NEW half of ours for @p task_uuid
+ *  be proposed? Always, unless @p capability_name is one of AT's own probes
+ *  ("at." prefix) and either an app half of ours is pending or
+ *  AT_REP_MAX_PROBE_HALVES (default 4) probe halves are already followed.
+ *  A refused probe is logged and dropped. */
+bool _admit_new_half(const process_t *proc, const uuid_t task_uuid,
+                     const char *capability_name);
+
 /** Test seam: how many of our halves are waiting to reach the chain. */
 size_t reputation_awaiting_commit_count(void);
 /** Test seam: how many of those are parked (ISSUES §2.60). */

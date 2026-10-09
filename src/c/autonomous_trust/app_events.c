@@ -156,6 +156,17 @@ int at_app_events_poll(at_app_events_t *handle, at_app_event_t *out, size_t max)
             ev->data.rtt.rtt_ms = msg.info.peer_rtt_update.rtt_ms;
             break;
         }
+        case PEER_PRESENCE:
+        {
+            at_app_event_t *ev = &out[n++];
+            memset(ev, 0, sizeof(*ev));
+            ev->kind = AT_APP_EVENT_PEER_PRESENCE;
+            memcpy(ev->data.presence.peer_uuid,
+                   msg.info.peer_presence.peer_uuid, AT_APP_UUID_LEN);
+            ev->data.presence.present = msg.info.peer_presence.present;
+            ev->data.presence.last_heard = msg.info.peer_presence.last_heard;
+            break;
+        }
         default:
         {
             /* A feature's event (app_events_registry.h), e.g. Agora's. The

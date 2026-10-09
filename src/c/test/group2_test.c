@@ -459,6 +459,78 @@ DEFINE_TEST(test_group_accept_rotation_never_reinstates_a_retired_key)
     group_free(mine);
 }
 
+/* group_rotation_refusal names WHY a rotation is refused, for the log line a
+ * forked cohort is diagnosed from (a three-way boot rotation, rep-2368077, could
+ * not be: every refusal read "ours stands"). Each reason, and the one rule
+ * that makes the line trustworthy: accept_rotation refuses exactly when the
+ * reason is non-NULL. */
+static void _assert_refusal(group_t *mine, const group_t *offer,
+                            const char *expect)
+{
+    const char *why = group_rotation_refusal(mine, offer);
+    if (expect == NULL)
+        ck_assert_ptr_null(why);
+    else
+        ck_assert_str_eq(why, expect);
+    group_t probe = *mine;   /* accept mutates; judge a copy */
+    ck_assert(group_accept_rotation(&probe, offer) == (why == NULL));
+}
+
+DEFINE_TEST(test_group_rotation_refusal_names_each_reason)
+{
+    ck_assert(sodium_init() >= 0);
+
+    uuid_t uuid;
+    uuid_generate(uuid);
+    char addr[] = "10.0.0.8";
+    group_t *mine = NULL, *theirs = NULL;
+    ck_assert_ret_ok(group_create(&uuid, addr, &mine));
+    ck_assert_ret_ok(group_create(&uuid, addr, &theirs));
+    memcpy(theirs->uuid, mine->uuid, sizeof(uuid_t));
+    encryptor_t first = mine->encryptor;
+    ck_assert(group_rotate_key(mine) == 1);
+
+    group_t offer = *theirs;
+    offer.key_epoch = 2;
+    _assert_refusal(mine, &offer, NULL);
+
+    offer.key_epoch = 0;
+    _assert_refusal(mine, &offer, "a lower epoch (a replay)");
+
+    uuid_t other_uuid;
+    uuid_generate(other_uuid);
+    group_t foreign = offer;
+    memcpy(foreign.uuid, other_uuid, sizeof(uuid_t));
+    foreign.key_epoch = 2;
+    _assert_refusal(mine, &foreign, "a different group");
+
+    group_t public_only = offer;
+    public_only.key_epoch = 2;
+    sodium_memzero(public_only.encryptor.private, crypto_box_SECRETKEYBYTES);
+    _assert_refusal(mine, &public_only, "it carries no private key");
+
+    group_t replay = offer;
+    replay.key_epoch = 5;
+    replay.encryptor = first;
+    _assert_refusal(mine, &replay, "a key we already retired");
+
+    group_t same = *mine;
+    _assert_refusal(mine, &same, "already our key");
+
+    /* Equal epoch, a different live key: exactly one of the two orders wins. */
+    group_t rival = offer;
+    rival.key_epoch = mine->key_epoch;
+    bool theirs_lower = memcmp(rival.encryptor.public, mine->encryptor.public,
+                               crypto_box_PUBLICKEYBYTES) < 0;
+    _assert_refusal(mine, &rival, theirs_lower
+                    ? NULL : "ours stands (the lower key wins the tiebreak)");
+
+    ck_assert_str_eq(group_rotation_refusal(NULL, &offer), "no group to compare");
+
+    group_free(theirs);
+    group_free(mine);
+}
+
 RUN_TESTS(Group2, test_group_json_roundtrip,
           test_group_json_roundtrip_preserves_keypair, test_group_free_null,
           test_group_publish_null,
@@ -469,4 +541,5 @@ RUN_TESTS(Group2, test_group_json_roundtrip,
           test_group_accept_rotation_equal_epoch_converges,
           test_group_accept_rotation_never_reinstates_a_retired_key,
           test_group_accept_rotation_public_only_takes_a_real_key,
+          test_group_rotation_refusal_names_each_reason,
           test_group_decrypt_falls_back_to_retired_key)

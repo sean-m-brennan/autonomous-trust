@@ -46,6 +46,11 @@ from ..config import NetWireFormat
 from .network import Network
 from .message import Message, WireFormatMismatch
 from .ping_at import PingATServer, ping_at
+from .presence import PRESENCE_FUNCTION, PRESENCE_PROCESS, PresenceTracker
+
+#: ReputationProtocol.app_roster_request (C AT_APP_ROSTER_REQUEST), spelled out:
+#: importing the reputation package from here would be circular.
+app_roster_request = 'app_roster_request'
 
 
 class NetworkProtocol(Enum):
@@ -975,6 +980,19 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         if isinstance(from_whom, Identity):
             from_addr = from_whom.address
 
+        # Every frame from the wire is routed here, so this is where a peer is
+        # heard (doc/architecture/peer-presence.md). A uuid not on the roster
+        # is ignored by the tracker. A presence frame has said everything it
+        # carries by arriving: consumed here, never routed.
+        sender = from_whom if isinstance(from_whom, Identity) \
+            else getattr(message, 'from_whom', None)
+        presence = getattr(self, '_presence', None)
+        if presence is not None:
+            presence.heard(getattr(sender, 'uuid', None), time.time())
+        if message.process == PRESENCE_PROCESS and message.function == PRESENCE_FUNCTION:
+            self.logger.debug('Presence from %s', from_addr)
+            return
+
         # Gateway boundary, invariant B (see the block above _held_groups):
         # bootstrap is domain-local. Two refusals, and neither can fire on a
         # leaf node -- the first because the pre-admission verbs are never
@@ -1021,6 +1039,62 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
             self.logger.error('Recvd message for unknown %s process from %s. Ignoring.', target, from_addr)
             self.logger.debug('Message: %s', str(message))
 
+    def _emit_presence(self, queues, presence):
+        """Hand one :class:`PeerPresence` to negotiation (which stops or resumes
+        inviting the peer) and to main (which forwards it to the app, as for
+        any AppEvent). Best effort per queue, like :meth:`update`."""
+        for name in (CfgIds.negotiation, CfgIds.main):
+            if name not in queues:
+                continue
+            try:
+                queues[name].put(presence, block=True, timeout=self.q_cadence)
+            except Full:
+                _probes.counter('net.presence', 'queue_full', name)
+
+    def _emit_all_presence(self, queues):
+        """The presence half of the app's roster pull: every peer, to main."""
+        if CfgIds.main not in queues:
+            return
+        for row in self._presence.snapshot([p.uuid for p in self.peers.all]):
+            try:
+                queues[CfgIds.main].put(row, block=True, timeout=self.q_cadence)
+            except Full:
+                _probes.counter('net.presence', 'queue_full', CfgIds.main)
+
+    def _presence_step(self, queues):
+        """Once a second: evaluate presence, tell negotiation and the app what
+        changed, and when this node has been silent toward some member for the
+        heartbeat interval, queue one presence frame to the group. It goes out
+        through our own queue so it takes exactly the path of any other group
+        message. A node without the group's private key cannot send one, and
+        has nothing to say to a roster of none. Mirrors C net_presence_step."""
+        now_s = time.time()
+        if int(now_s) == self._presence_last_step:
+            return
+        self._presence_last_step = int(now_s)
+        members = list(self.peers.all)
+        due, changes = self._presence.tick([p.uuid for p in members], now_s)
+        for change in changes:
+            if change.present:
+                self.logger.info('Network: peer %s is present again', change.peer_uuid[:8])
+            else:
+                self.logger.info('Network: peer %s is absent: nothing heard for %.0f s (last %s)',
+                                 change.peer_uuid[:8], self._presence.absent_sec,
+                                 'frame recorded' if change.last_heard else 'none ever')
+            self._emit_presence(queues, change)
+        group = self.group
+        if not due or not members or group is None or getattr(group, '_public_only', True):
+            return
+        beat = Message(PRESENCE_PROCESS, PRESENCE_FUNCTION, '', to_whom=group)
+        try:
+            # One try: a full queue means traffic is going out anyway, and the
+            # next second asks again. Stamped on success so a slow drain cannot
+            # queue one heartbeat per second.
+            queues[self.name].put(beat, block=False)
+            self._presence.sent(None, now_s)
+        except Full:
+            pass
+
     def process(self, queues, signal):
         """
         Network processing main loop
@@ -1045,6 +1119,10 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         # first call. (Surfaced 2026-05-01 by tests/diag/harness.py.)
         self.rebind_socket_timeouts()
         self._init_transport()
+        # Created here, in the worker, not in __init__: the instance is pickled
+        # across the fork and the tracker holds a lock.
+        self._presence = PresenceTracker()
+        self._presence_last_step = 0
         self.start_receivers(queues)
         for hooks in network_hooks(self):
             if hooks.on_start is not None:
@@ -1054,6 +1132,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
         while self.keep_running(signal):
             try:
                 self.reap_idle_conns()
+                self._presence_step(queues)
                 for hooks in network_hooks(self):
                     if hooks.periodic is not None:
                         hooks.periodic(self, queues)
@@ -1096,7 +1175,12 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                           to=str(to_whom)[:80])
                         self.logger.debug('Send network message: %s:%s', message.process, message.function)
                         try:
-                            if message.function == Network.stats_req:
+                            if (message.function == app_roster_request
+                                    and message.process == CfgIds.network):
+                                # The app's roster pull, presence half. Local
+                                # only: never leaves on the wire.
+                                self._emit_all_presence(queues)
+                            elif message.function == Network.stats_req:
                                 msg = Message(CfgIds.network, Network.stats_resp, self.net_stats)
                                 queues[message.process].put(msg, block=True, timeout=self.q_cadence)
                             elif message.function == Network.ping_at:
@@ -1132,6 +1216,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                 try:
                                     self.send_any(msg)
                                     self.track_send_stats(self.unknown_peer, len(msg))
+                                    self._presence.sent(None, time.time())
                                 except TransmissionError as err:
                                     self.logger.error('Network: %s', err)
                                     self.track_send_error(self.unknown_peer)
@@ -1184,6 +1269,9 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                     try:
                                         self.send_group(msg, addr)
                                         self.track_send_stats(self.unknown_peer, len(msg))
+                                        member = self.peers.find_by_address(addr)
+                                        if member is not None:
+                                            self._presence.sent(member.uuid, time.time())
                                     except TransmissionError as err:
                                         self.logger.error('Network: %s', err)
                                         self.track_send_error(self.unknown_peer)
@@ -1225,6 +1313,7 @@ class NetworkProcess(Process, metaclass=_NetProcMeta):
                                         else:
                                             self.send_peer(msg, address)
                                         self.track_send_stats(who.uuid, len(msg))
+                                        self._presence.sent(who.uuid, time.time())
                                     except TransmissionError as err:
                                         self.logger.error('Network: %s', err)
                                         self.track_send_error(who.uuid)

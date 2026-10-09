@@ -36,4 +36,5 @@ Technical architecture documentation for the AutonomousTrust cooperative computi
 - [Operator access](operator-access.md): Human operator authentication via PIV/CAC + MFA, session lifecycle, and the request-only operator node
 - [Operator-attended signal](operator-attended.md): Which nodes have a human behind them: the durable guardian binding and the consumer-pull attended-now attestation
 - [App-facing peer carrier](app-peer-carrier.md): What a hosting application learns about peers: the two carrier messages, the roster pull, and the flat app-facing ABI
+- [Peer presence](peer-presence.md): Local soft-absence: which peers this node has heard from lately, the idle-only heartbeat, and what skips an absent peer
 - [Extensions](extensions.md): How a feature adds IPC message types, app verbs and app-event kinds through registries instead of `#ifdef`s; the extension libraries (DTN, the gateway, the five oracle layers) and the scorer's oracle registry; and the static-link anchor rule
