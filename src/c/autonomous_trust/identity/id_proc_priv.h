@@ -73,8 +73,8 @@ int vote_collection_get(const char *uuid_key, int *out_count);
  *  names (e.g. "sensor_validation"). The list is dup'd and owned by
  *  the identity state; pass cap_names=NULL or n_caps=0 to clear.
  *
- *  Production code MUST NOT call this — capabilities normally flow in
- *  through the autonomous_ability fan-put. Mirrors
+ *  Production code MUST NOT call this; production installs the capability
+ *  table through identity_advertise_local_capabilities (ISSUES §2.63). Mirrors
  *  `negotiation_set_own_capabilities` in neg_proc_priv.h.
  *
  *  Consumed by handle_caps_query, which emits the list as a JSON array
@@ -83,6 +83,14 @@ int vote_collection_get(const char *uuid_key, int *out_count);
 void identity_set_own_capabilities(const process_t *proc,
                                    const char *const *cap_names,
                                    size_t n_caps);
+
+/** Install this node's own capability names, the local rows of the
+ *  capability table (build_local_capabilities, which honours
+ *  AT_BOOTSTRAP_DISABLED), as what @p proc advertises in every caps_response
+ *  and confirm, unless a list was already installed (ISSUES §2.63). The
+ *  production counterpart of identity_set_own_capabilities; identity_run
+ *  calls it once at startup. Returns how many names it installed. */
+size_t identity_advertise_local_capabilities(const process_t *proc);
 
 /** Return the number of capabilities recorded for @p uuid in the
  *  shared peer_capabilities map, or 0 if no entry exists. The map is

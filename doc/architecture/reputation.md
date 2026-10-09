@@ -280,7 +280,13 @@ strategies, chosen by the current standing of the peer.
 The mode switch uses hysteresis, which we added because a peer hovering near the
 boundary used to flip modes on every tick, swinging between 0.9 and 0.4. A peer
 must climb above 0.55 to enter cooperation mode and must fall below 0.45 to drop
-back. Inside that band the previously selected mode is retained.
+back. Inside that band the previously selected mode is retained. A peer
+scored for the first time has no previous score, so the mode is chosen from
+the score contrite tit-for-tat would give it (its cold-start prior when this
+node has no transactions with it): a peer known only through good third-party
+evidence starts in cooperation mode rather than parked at its prior until the
+next entry about it, which could otherwise raise it even when that entry was a
+finding (ISSUES §2.64).
 
 In *cooperation mode*, the score is pure reputation, being a weighted average of
 every transaction score involving this peer. Each score carries two weights, the
@@ -1231,15 +1237,41 @@ grant cannot race the fresh ballot, and logs `our half of task T is not in the
 chain after N s; re-proposing it (attempt k of 5)`. A half found in any chain,
 including one adopted, is forgotten without a re-proposal.
 
-**What outlives the retries is parked, not dropped** (2026-10-07, ISSUES
-§2.60). The usual reason is that no majority is reachable, as on the minority
-side of a partition, which cannot commit at all. After five re-proposals the
-half is parked (`… has no quorum after 5 re-proposal(s); parking it …`). It is
-re-proposed on the next pass after a chain update from a peer ends adopted or
-extended, which is how the minority's heal arrives. Otherwise it is
+**What could not reach a majority is parked, not dropped** (2026-10-07,
+ISSUES §2.60). Each node remembers when every peer last sent it any
+reputation frame. After five re-proposals, a half lost to contention if a
+majority of the group, this node included, was heard within the last two
+commit timeouts, and it is given up as before. Otherwise no majority is
+reachable, as on the minority side of a partition, and the half is parked
+(`… has no quorum after 5 re-proposal(s) (R of M member(s) reachable);
+parking it …`). It is woken by a chain update from a peer that
+ends adopted or extended, which is how the minority's heal arrives. A wake
+unparks the half: it is active again with ten retries (twice a fresh half's),
+and reachability decides afresh when they run out. A woken half waits out its
+last round's commit timeout, and wakes are spread over 5 s by task.
+AT's own probe halves (an `at.` capability) are held back so that an app half
+is not lost in the lottery for chain slots: a node follows at most
+`AT_REP_MAX_PROBE_HALVES` (default 4) of them, and while an app half of its own
+is pending it proposes none. New probes are dropped, and overdue ones wait. Otherwise it is
 re-proposed every `AT_REP_PARK_RETRY_SEC` (default 120 s), and given up after
 `AT_REP_PARK_TTL_SEC` (default one day). Parked halves are not persisted. Pinned by `rep_commit_retry_test` and
 `test_repprocess_commit_retry.py`.
+
+**A member that joins late is handed the halves it missed** (2026-10-08,
+ISSUES §2.62). A join carries only bilateral entries. A half committed before a
+member arrived therefore never reaches it, and when the counterpart's half
+commits later the late member holds that one alone, one entry short of everyone
+who paired it. In Stele `rt-2404254` that split a four-node group two and two,
+and an even split never finalizes a checkpoint, so nothing reconciled it. Each
+node now watches its roster. At 5, 15 and 30 s after a peer first appears, it
+sends that peer every committed-but-unpaired half of its own on the primary
+chain, as the same `tx committed` it broadcast at commit, certificate included
+(`_hand_off_pending_halves`, logged as `handed N pending half(s) of ours to P
+(pass k of 3)`). It sends only its own halves, because a commit may write only
+its sender's half. The repeats cover a newcomer that does not hold the group
+key yet, and a repeat is a no-op. A peer that leaves the roster is forgotten,
+so one that comes back is handed them again. Pinned by `rep_half_handoff_test`
+and `test_repprocess_half_handoff.py`.
 
 **A member co-signs the proposed range, and signs late rather than never**
 (2026-09-29, ISSUES.md §2.29). A member co-signs when its entries at the

@@ -132,10 +132,10 @@ create_conda_env() {
     # Platform-specific compiler packages
     local platform_yaml
     case "$PLATFORM-$ARCH" in
-        Linux-x86_64)   platform_yaml="$CFG_DIR/linux-64/platform.yaml" ;;
-        Linux-aarch64)  platform_yaml="$CFG_DIR/linux-64/platform.yaml" ;;
-        MacOSX-x86_64)  platform_yaml="$CFG_DIR/osx-64/platform.yaml" ;;
-        MacOSX-arm64)   platform_yaml="$CFG_DIR/osx-64/platform.yaml" ;;
+        Linux-x86_64)   platform_yaml="$CFG_DIR/linux-64/platform.yml" ;;
+        Linux-aarch64)  platform_yaml="$CFG_DIR/linux-64/platform.yml" ;;
+        MacOSX-x86_64)  platform_yaml="$CFG_DIR/osx-64/platform.yml" ;;
+        MacOSX-arm64)   platform_yaml="$CFG_DIR/osx-64/platform.yml" ;;
     esac
     if [ -n "${platform_yaml:-}" ] && [ -f "$platform_yaml" ]; then
         info "Installing platform compiler packages ..."

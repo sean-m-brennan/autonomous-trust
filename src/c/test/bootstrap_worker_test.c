@@ -246,6 +246,44 @@ DEFINE_TEST(test_probe_queue_full_no_count)
 }
 END_TEST_DEFINITION()
 
+/* An absent peer (doc/architecture/peer-presence.md) is skipped, and the other
+ * peers are still probed. Without the skip the selector picks the absent peer,
+ * negotiation refuses to send to it, the unsent probe is not counted, and the
+ * next interval picks it again: nobody is ever probed. */
+DEFINE_TEST(test_a_skipped_peer_is_never_probed_and_starves_nobody)
+{
+    bootstrap_worker_t w;
+    bootstrap_worker_init_config(&w, 999, 0, 1, false);
+    w.probe_interval_sec = 0.0;
+    bool skip[3] = { true, false, false };   /* peer 0 is the least probed */
+    w.skip_peer = skip;
+    ck_assert_uint_eq(bootstrap_worker_select_target(&w, 3), 1);
+    probe_ctx_t p = {0};
+    for (int i = 0; i < 4; i++)
+        bootstrap_worker_tick_all(&w, 3, 0.0, NULL, _capture_probe, &p);
+    ck_assert_int_eq(p.calls, 4);
+    ck_assert_int_eq(p.per_peer[0], 0);
+    ck_assert_int_eq(p.per_peer[1], 2);
+    ck_assert_int_eq(p.per_peer[2], 2);
+
+    /* Everyone skipped: no target, no probe, nothing counted. */
+    bool all[3] = { true, true, true };
+    w.skip_peer = all;
+    ck_assert_uint_eq(bootstrap_worker_select_target(&w, 3), 3);
+    int before = w.probes_issued;
+    ck_assert(!bootstrap_worker_try_issue_probe(&w, 3, _capture_probe, &p));
+    ck_assert_int_eq(w.probes_issued, before);
+
+    /* The round-robin used past AT_PROBE_MAX_TRACKED_PEERS passes a skipped
+     * peer's turn to the next one. */
+    bool many[AT_PROBE_MAX_TRACKED_PEERS + 2] = {false};
+    w.skip_peer = many;
+    w.probes_issued = 0;
+    many[0] = true;
+    ck_assert_uint_eq(bootstrap_worker_select_target(&w, AT_PROBE_MAX_TRACKED_PEERS + 2), 1);
+}
+END_TEST_DEFINITION()
+
 DEFINE_TEST(test_config_defaults)
 {
     bootstrap_worker_t w;
@@ -401,4 +439,5 @@ RUN_TESTS(BootstrapWorker,
           test_probes_spread_across_peers,
           test_capability_allocation_covers_all_and_is_proportional,
           test_unregistered_caps_are_not_probed,
-          test_probe_queue_full_no_count)
+          test_probe_queue_full_no_count,
+          test_a_skipped_peer_is_never_probed_and_starves_nobody)

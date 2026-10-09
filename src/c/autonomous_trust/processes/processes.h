@@ -59,6 +59,12 @@ struct process_s
          * See at_timeout_scale_ms() in utilities/timeout.h. Indices align
          * with peers[] and are covered by the same rwlock. */
         int peer_rtt_ms[DEFAULT_MAX_PEERS];
+        /* Parallel array: the network process has heard nothing from
+         * peers[i] for AT_PRESENCE_ABSENT_SEC (PEER_PRESENCE,
+         * doc/architecture/peer-presence.md). Advisory: the peer stays on the
+         * roster and in every quorum; negotiation stops inviting it. Indices
+         * align with peers[] and are covered by the same rwlock. */
+        bool peer_absent[DEFAULT_MAX_PEERS];
         map_t *peer_capabilities;
         int phase;
         array_t *unhandled_messages;

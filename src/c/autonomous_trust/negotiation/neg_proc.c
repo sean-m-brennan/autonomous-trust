@@ -1170,6 +1170,12 @@ static int _announce_task_locked(const process_t *proc, task_t *task,
         if (!_peer_has_capability(proc, peer_uuid_str, task->capability.name))
             continue;
 
+        /* Not a peer the network process has heard from lately: asking it to
+         * work would only time out (doc/architecture/peer-presence.md). It
+         * stays a member; it is just not invited. */
+        if (proc->protocol.peer_absent[i])
+            continue;
+
         generic_msg_t invite = {0};
         invite.type = NET_MESSAGE;
         strncpy(invite.info.net_msg.process, "negotiation", PROC_NAME_LEN);
@@ -3008,10 +3014,24 @@ static void _bootstrap_tick(const process_t *proc)
     if (peer_count == 0)
         return;
 
+    /* Who not to probe this pass: the peers reported absent. Snapshotted, so
+     * the worker reads a stable view; indices match peers[] for this tick
+     * (_emit_bootstrap_task re-checks the index under the lock). */
+    bool absent[DEFAULT_MAX_PEERS] = {false};
+    peers_read_lock(proc);
+    size_t snap = proc->protocol.num_peers < DEFAULT_MAX_PEERS
+                  ? proc->protocol.num_peers : DEFAULT_MAX_PEERS;
+    memcpy(absent, proc->protocol.peer_absent, snap * sizeof(absent[0]));
+    peers_read_unlock(proc);
+    if (peer_count > snap)
+        peer_count = snap;
+
     probe_ctx_t ctx = { .proc = proc, .peer_count = peer_count };
     double now_sec = _now_sec();
+    neg_state.bootstrap.skip_peer = absent;
     bootstrap_worker_tick_all(&neg_state.bootstrap, peer_count, now_sec,
                               _pair_emit, _probe_emit, &ctx);
+    neg_state.bootstrap.skip_peer = NULL;
 }
 
 /****************************

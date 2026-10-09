@@ -39,7 +39,7 @@
  * - TASK_RESULT: a deep copy of @c result_data;
  * - the plain-data core types (TASK_STATUS, TRANSACTION_SCORE, PEER_STANDING,
  *   PEER_RTT_UPDATE, PEER_RTT_OBSERVED, PEER_OBSERVED, PEER_REPUTATION,
- *   PEER_REMOVED), copied whole;
+ *   PEER_REMOVED, PEER_PRESENCE), copied whole;
  * - any registered feature type serialized as a fixed raw copy (its vtable
  *   has no @c to_proto, msg_registry.h), which is plain data by construction.
  * Anything else (TASK, GROUP, PEER, ...) is refused, and its caller reports

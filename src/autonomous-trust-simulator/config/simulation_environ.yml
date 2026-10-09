@@ -3,7 +3,7 @@
 #
 # Usage:
 #   cd src/autonomous-trust-simulator/config
-#   conda env create -f simulation_environ.yaml
+#   conda env create -f simulation_environ.yml
 #   conda activate muudd_simulation
 #   bash build_splat.sh
 #   bash download_srtm.sh
@@ -23,7 +23,7 @@ dependencies:
   - jansson
   - cmake
 
-  # Python deps matching AT's environment.yaml
+  # Python deps matching AT's environment.yml
   - numpy
   - py-opencv
   - geopy

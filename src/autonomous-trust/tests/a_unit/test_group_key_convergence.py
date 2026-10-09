@@ -229,6 +229,105 @@ class TestSimultaneousRotationConverges:
             'attack surface the gate exists for')
 
 
+class TestRotationRefusalIsNamed:
+    """Every refusal used to read the same ("ours stands" in C, nothing at all
+    in Python), so a forked cohort (three-way boot rotation, rep-2368077) could
+    not be told from one that settled. The reason is now named, the phrases
+    match C group_rotation_refusal, and accept_rotation refuses exactly when
+    a reason is given."""
+
+    def _assert_refusal(self, mine, offer, expect):
+        assert mine.rotation_refusal(offer) == expect
+        probe = Group.from_canonical(mine.to_canonical())
+        probe._previous_keys = list(getattr(mine, '_previous_keys', []) or [])
+        assert probe.accept_rotation(offer) == (expect is None)
+
+    def test_each_reason(self):
+        a_id = _new_identity('a', '10.0.0.1')
+        b_id = _new_identity('b', '10.0.0.2')
+        mine, theirs = _shared_group(a_id, b_id)
+        first = Group.from_canonical(mine.to_canonical())
+        mine.rotate_key()                       # epoch 1; `first` now retired
+        theirs = Group.from_canonical(theirs.to_canonical())
+        theirs.rotate_key()
+        theirs.rotate_key()                     # epoch 2, a live key
+        self._assert_refusal(mine, theirs, None)
+
+        self._assert_refusal(mine, None, 'no group to compare')
+        foreign = Group.initialize({str(a_id.uuid): a_id.address}, 'other')
+        self._assert_refusal(mine, foreign, 'a different group')
+        stale = Group.from_canonical(first.to_canonical())
+        stale._key_epoch = 0
+        self._assert_refusal(mine, stale, 'a lower epoch (a replay)')
+        public_only = theirs.publish()
+        public_only._key_epoch = theirs.key_epoch
+        self._assert_refusal(mine, public_only, 'it carries no private key')
+        replay = Group.from_canonical(first.to_canonical())
+        replay._key_epoch = 5
+        self._assert_refusal(mine, replay, 'a key we already retired')
+        self._assert_refusal(mine, Group.from_canonical(mine.to_canonical()),
+                             'already our key')
+
+        rival = Group.from_canonical(theirs.to_canonical())
+        rival._key_epoch = mine.key_epoch
+        lower = bytes(rival.encryptor.public) < bytes(mine.encryptor.public)
+        self._assert_refusal(mine, rival, None if lower else
+                             'ours stands (the lower key wins the tiebreak)')
+
+    def test_the_refusal_is_logged_with_both_keys(self, caplog):
+        a_id = _new_identity('a', '10.0.0.1')
+        b_id = _new_identity('b', '10.0.0.2')
+        a_grp, b_grp = _shared_group(a_id, b_id)
+        a = _build_process(a_id, a_grp)
+        b = _build_process(b_id, b_grp)
+        a.group.rotate_key()
+        b.group.rotate_key()
+        a_says, b_says = _update_from(a.group), _update_from(b.group)
+        a_key, b_key = _key_of(a.group)[:16].decode(), _key_of(b.group)[:16].decode()
+        with caplog.at_level(logging.INFO):
+            a.handle_group_update(_queues(), b_says)
+            b.handle_group_update(_queues(), a_says)
+        lines = [r.getMessage() for r in caplog.records if 'not adopted' in r.getMessage()]
+        # Exactly the winner refuses, with the tiebreak named and both keys.
+        assert len(lines) == 1, lines
+        assert 'ours stands (the lower key wins the tiebreak)' in lines[0]
+        assert a_key in lines[0] and b_key in lines[0]
+
+    def test_a_sibling_names_the_key_it_installs_once(self, caplog):
+        a_id = _new_identity('a', '10.0.0.1')
+        b_id = _new_identity('b', '10.0.0.2')
+        grp, _ = _shared_group(a_id, b_id)
+        sibling = Protocol(CfgIds.network, logging.getLogger('test.sibling'), None)
+        # A copy per hand-off, as a queue delivers it.
+        def wire(g):
+            return Group.from_canonical(g.to_canonical())
+        with caplog.at_level(logging.INFO, logger='test.sibling'):
+            sibling.run_message_handlers(_queues(), wire(grp))
+            sibling.run_message_handlers(_queues(), wire(grp))  # same key: quiet
+            grp.rotate_key()
+            sibling.run_message_handlers(_queues(), wire(grp))
+        lines = [r.getMessage() for r in caplog.records if 'installed group key' in r.getMessage()]
+        assert len(lines) == 2, lines
+        assert lines[1].startswith('network: installed group key %s… epoch 1'
+                                   % _key_of(grp)[:16].decode())
+
+    def test_an_outgoing_update_names_its_key(self, caplog):
+        a_id = _new_identity('a', '10.0.0.1')
+        b_id = _new_identity('b', '10.0.0.2')
+        grp, _ = _shared_group(a_id, b_id)
+        proc = _build_process(a_id, grp)
+        del proc._update_group                   # the real one, not the mock
+        proc.peers.hierarchy[0][str(b_id.uuid)] = b_id.publish()
+        queues = _queues()
+        with caplog.at_level(logging.DEBUG):
+            proc._update_group(queues, grp, 0)
+            proc._update_group(queues, grp, 0)
+        sent = [r for r in caplog.records if 'Sending group update' in r.getMessage()]
+        assert [r.levelno for r in sent] == [logging.INFO, logging.DEBUG]
+        assert ('with key %s… epoch 0 (carries_key=1) to 1 member(s)'
+                % _key_of(grp)[:16].decode()) in sent[0].getMessage()
+
+
 class TestAdoptedKeyReachesSiblings:
     """The adopted key must reach the NETWORK process, not only identity.
 
