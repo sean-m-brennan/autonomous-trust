@@ -1430,6 +1430,7 @@ class TestProposerHistoryBilateral:
         stub.logger = SimpleNamespace(
             error=lambda *a, **k: None, debug=lambda *a, **k: None)
         stub._start_paxos = lambda q, m: start_paxos_calls.append((q, m))
+        stub.admit_new_half = lambda m: True   # §2.60 probe gate: not under test
 
         task = uuid4()
         ts = TransactionScore(task_id=task, score=0.9)

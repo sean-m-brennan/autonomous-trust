@@ -44,6 +44,7 @@
 #include "processes/processes.h"
 #include "network/net_message.h"
 #include "network/net_proc_priv.h"
+#include "network/net_presence.h"
 
 static char FN_DM[] = "peer_dm";
 
@@ -393,6 +394,7 @@ DEFINE_TEST(test_what_can_be_kept)
     ck_assert(at_send_retry_supported(PLAIN_ID));
     ck_assert(!at_send_retry_supported(PROTO_ID));
     ck_assert(at_send_retry_supported(PEER_OBSERVED));
+    ck_assert(at_send_retry_supported(PEER_PRESENCE));
     ck_assert(at_send_retry_supported(TASK_RESULT));
     ck_assert(!at_send_retry_supported(TASK));
     ck_assert(!at_send_retry_supported(GROUP));
@@ -479,6 +481,47 @@ DEFINE_TEST(test_an_inbound_frame_is_kept_for_its_sibling)
 }
 END_TEST_DEFINITION()
 
+/* A presence frame (doc/architecture/peer-presence.md) is consumed where every
+ * inbound frame is routed: its sender is marked heard, and nothing is handed to
+ * any sibling. Routed onward it would reach a process that has no use for it,
+ * and on a node predating presence, the network's own outbound loop. */
+DEFINE_TEST(test_a_presence_frame_is_heard_and_consumed)
+{
+    _begin();
+    net_presence_configure(30.0, 90.0);
+    uuid_t peer;
+    uuid_generate(peer);
+    double t0 = (double)time(NULL);
+    ck_assert(!net_presence_tick(&peer, 1, t0, NULL, 0, NULL));
+
+    net_wire_msg_t w;
+    memset(&w, 0, sizeof(w));
+    snprintf(w.process, sizeof(w.process), "%s", NET_PRESENCE_PROCESS);
+    w.function = strdup(NET_PRESENCE_FUNCTION);
+    uuid_copy(w.from_whom.uuid, peer);
+    logger_t logger = {0};
+    ck_assert_int_eq(net_proc_test_route_to_process(&w, NULL, &logger), 0);
+    ck_assert_int_eq((int)g_tries, 0);                 /* routed nowhere */
+    free(w.function);
+
+    net_presence_change_t row;
+    ck_assert_uint_eq(net_presence_snapshot(&peer, 1, &row, 1), 1);
+    ck_assert(row.present);
+    ck_assert(row.last_heard > 0.0);
+
+    /* Any other frame from the peer is heard AND routed. */
+    memset(&w, 0, sizeof(w));
+    snprintf(w.process, sizeof(w.process), "%s", "identity");
+    w.function = strdup(FN_DM);
+    uuid_copy(w.from_whom.uuid, peer);
+    ck_assert_int_eq(net_proc_test_route_to_process(&w, NULL, &logger), 0);
+    ck_assert_int_eq((int)g_tries, 1);
+    free(w.function);
+    net_presence_configure(30.0, 90.0);
+    _end();
+}
+END_TEST_DEFINITION()
+
 RUN_TESTS(SendRetry,
           test_a_refused_frame_is_kept_and_lands_intact,
           test_a_later_frame_waits_behind_a_backlog,
@@ -492,4 +535,5 @@ RUN_TESTS(SendRetry,
           test_what_can_be_kept,
           test_now_makes_one_try_before_keeping,
           test_sleep_until_drains_the_list,
-          test_an_inbound_frame_is_kept_for_its_sibling)
+          test_an_inbound_frame_is_kept_for_its_sibling,
+          test_a_presence_frame_is_heard_and_consumed)

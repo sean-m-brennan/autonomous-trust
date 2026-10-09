@@ -472,6 +472,7 @@ set(libsrc
     autonomous_trust/network/net_transport_hybrid.c
     autonomous_trust/network/net_transport_registry.c
     autonomous_trust/network/net_filter.c
+    autonomous_trust/network/net_presence.c
     autonomous_trust/network/net_ext.c
     autonomous_trust/network/network.c
     autonomous_trust/bootstrap/bootstrap_capabilities.c
@@ -855,6 +856,9 @@ target_link_libraries(group_rotation_sibling_test PRIVATE ${AT_TEST_LIBS})
 add_executable(handoff_retry_test test/handoff_retry_test.c)
 set_source_files_properties(test/handoff_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(handoff_retry_test PRIVATE ${AT_TEST_LIBS})
+add_executable(net_presence_test test/net_presence_test.c)
+set_source_files_properties(test/net_presence_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(net_presence_test PRIVATE ${AT_TEST_LIBS})
 add_executable(send_retry_test test/send_retry_test.c)
 set_source_files_properties(test/send_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(send_retry_test PRIVATE ${AT_TEST_LIBS})
@@ -864,6 +868,12 @@ target_link_libraries(neg_send_keep_test PRIVATE ${AT_TEST_LIBS})
 add_executable(rep_commit_retry_test test/rep_commit_retry_test.c)
 set_source_files_properties(test/rep_commit_retry_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(rep_commit_retry_test PRIVATE ${AT_TEST_LIBS})
+add_executable(rep_half_handoff_test test/rep_half_handoff_test.c)
+set_source_files_properties(test/rep_half_handoff_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(rep_half_handoff_test PRIVATE ${AT_TEST_LIBS})
+add_executable(id_own_caps_test test/id_own_caps_test.c)
+set_source_files_properties(test/id_own_caps_test.c PROPERTIES COMPILE_FLAGS "-Wall")
+target_link_libraries(id_own_caps_test PRIVATE ${AT_TEST_LIBS})
 add_executable(rep_cosign_test test/rep_cosign_test.c)
 set_source_files_properties(test/rep_cosign_test.c PROPERTIES COMPILE_FLAGS "-Wall")
 target_link_libraries(rep_cosign_test PRIVATE ${AT_TEST_LIBS})
@@ -1013,9 +1023,12 @@ add_test(NAME late_joiner_caps_resync_test COMMAND $<TARGET_FILE:late_joiner_cap
 add_test(NAME identity_resync_test COMMAND $<TARGET_FILE:identity_resync_test>)
 add_test(NAME group_rotation_sibling_test COMMAND $<TARGET_FILE:group_rotation_sibling_test>)
 add_test(NAME handoff_retry_test COMMAND $<TARGET_FILE:handoff_retry_test>)
+add_test(NAME net_presence_test COMMAND $<TARGET_FILE:net_presence_test>)
 add_test(NAME send_retry_test COMMAND $<TARGET_FILE:send_retry_test>)
 add_test(NAME neg_send_keep_test COMMAND $<TARGET_FILE:neg_send_keep_test>)
 add_test(NAME rep_commit_retry_test COMMAND $<TARGET_FILE:rep_commit_retry_test>)
+add_test(NAME rep_half_handoff_test COMMAND $<TARGET_FILE:rep_half_handoff_test>)
+add_test(NAME id_own_caps_test COMMAND $<TARGET_FILE:id_own_caps_test>)
 add_test(NAME rep_cosign_test COMMAND $<TARGET_FILE:rep_cosign_test>)
 add_test(NAME rep_attest_retry_test COMMAND $<TARGET_FILE:rep_attest_retry_test>)
 add_test(NAME rep_archive_test COMMAND $<TARGET_FILE:rep_archive_test>)

@@ -153,6 +153,35 @@ static double _tier_ceiling(int tier)
 #define REP_PARK_RETRY \
     (reputation_env_double("AT_REP_PARK_RETRY_SEC", REP_PARK_RETRY_DEFAULT))
 #define REP_PARK_TTL_DEFAULT 86400.0
+/* Only a half that could not REACH a majority is parked (§2.60). Parking
+ * contention losers too piled every node's probe losers into a backlog that
+ * swamped the heal (part-2123724). Reach is measured per PEER, not per round:
+ * a majority of the group, counting us, must have sent us any reputation frame
+ * within this many commit timeouts of the decision. Counting the answers to a
+ * half's own rounds undercounted (part-2136648): a round is retired when it is
+ * re-proposed under a new ballot, so an answer that waited out a full queue
+ * found nothing to land on, and a whole connected group parked its losers. */
+#define REP_REACH_WINDOW_TIMEOUTS 2.0
+/* A woken half is unparked with this many retries, twice a fresh half's: it
+ * waited out the split, and the heal is its contended moment (part-2272442,
+ * where ben's reaction lost six post-heal rounds in a row). */
+#define REP_WAKE_RETRIES (2 * REP_COMMIT_RETRIES)
+/* PROBE BACKPRESSURE (§2.60, part-2314213). AT's own probe halves (handshake,
+ * time-attest, echo-challenge) carry an "at." capability; an app half carries
+ * its app's, or none. After the heal, seven nodes proposed ~2,800 rounds in
+ * four minutes, 95% of them probes, and ~150 committed, one chain slot at a
+ * time: bob's app reaction lost all 24 of its rounds in that lottery. So a node
+ * keeps at most REP_MAX_PROBE_HALVES probe halves in awaiting_commit (a new one
+ * past that is dropped), and while an app half of its own is pending it
+ * proposes no probe at all: new ones are dropped, and overdue ones wait. */
+#define REP_PROBE_CAP_PREFIX "at."
+#define REP_MAX_PROBE_HALVES_DEFAULT 4.0
+#define REP_MAX_PROBE_HALVES \
+    (reputation_env_double("AT_REP_MAX_PROBE_HALVES", \
+                           REP_MAX_PROBE_HALVES_DEFAULT))
+/* A wake spreads its halves over this many seconds, by task, so a whole
+ * island's backlog does not hit the healed group in one tick. */
+#define REP_WAKE_SPREAD_SEC 5.0
 #define REP_PARK_TTL \
     (reputation_env_double("AT_REP_PARK_TTL_SEC", REP_PARK_TTL_DEFAULT))
 
@@ -367,7 +396,9 @@ typedef struct {
     double competence;
     double deadline;
     int    attempts;     /* re-proposals so far */
+    int    retries;      /* how many it gets before it is parked or given up */
     double parked_at;    /* when the retries ran out (§2.60); 0 = not parked */
+    double last_proposed; /* when a round last went out for it */
 } rep_awaiting_t;
 
 /* A checkpoint proposal parked for a later co-sign (ISSUES §2.29). Everything
@@ -443,6 +474,17 @@ static struct {
      * simply abandoned — and in a live cohort most rounds ARE nacked, because
      * every member proposes on the same probe at the same instant. */
     map_t retry_due;
+    /* peer uuid_str -> integer_data(epoch seconds): when that peer last sent
+     * us any reputation frame. Whether a majority is reachable is read from
+     * this when a half's retries run out (§2.60, _majority_reachable). */
+    map_t heard;
+    /* peer uuid_str -> integer_data(epoch seconds): when that peer was first
+     * seen in the live roster, and -> integer_data(passes done): how many
+     * times our pending halves have been handed to it (ISSUES §2.62,
+     * _hand_off_pending_halves). A peer that leaves the roster is forgotten,
+     * so one that comes back is handed them again. */
+    map_t handoff_seen;
+    map_t handoff_passes;
     map_t updates;         /* uuid_str -> json_t* (pending chain updates) */
     array_t requested_reps; /* array of pending reputation responses */
     paxos_instance_t paxos;
@@ -727,6 +769,9 @@ static void _ensure_init(void)
         map_init(&rep_state.my_requests);
         map_init(&rep_state.awaiting_commit);
         map_init(&rep_state.retry_due);
+        map_init(&rep_state.heard);
+        map_init(&rep_state.handoff_seen);
+        map_init(&rep_state.handoff_passes);
         map_init(&rep_state.updates);
         array_init(&rep_state.requested_reps);
         map_init(&rep_state.peer_tiers);
@@ -2131,10 +2176,11 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
         if (id2 == (int64_t)len + 1 && ours[0] != '\0'
             && strcmp(ours, their_head) != 0)
         {
-            json_decref(payload);
+            /* Logged before the free: their_head is borrowed from payload. */
             log_info(proc->logger, "Reputation: %s proposes on another chain at "
                      "our length %d (head %.12s, ours %.12s); exchanging chains\n",
                      nmsg->from_whom.nickname, len, their_head, ours);
+            json_decref(payload);
             _send_backdate(proc, &nmsg->from_whom, id1, id2);
             if (_fork_probe_due(nmsg->from_whom.uuid))
                 _request_chain(proc, &nmsg->from_whom);
@@ -3883,7 +3929,19 @@ static double _score_peer_locked(const process_t *proc, const uuid_t peer_uuid)
      * the hysteresis lives here, at the protocol boundary, where
      * the per-peer state is available. */
     double current_score = 0.0;
-    reputations_get(&rep_state.reputations, peer_uuid, &current_score);
+    if (reputations_get(&rep_state.reputations, peer_uuid, &current_score) != 0)
+    {
+        /* A peer scored for the first time has no stored score, and an
+         * absent score must not choose the regime: it read as 0, held a peer
+         * known only through others at its cold-start prior, and the next
+         * entry about it (a finding, in Stele's cohort st-2590772) flipped it
+         * to the pure mean and RAISED it. The first score's regime follows
+         * what this node would assign it now (ISSUES §2.64). Mirrors Python's
+         * _compute_reputation. */
+        current_score = reputation_contrite_tft(&rep_state.history,
+                                                &rep_state.reputations,
+                                                self_uuid, peer_uuid);
+    }
 
     char coop_key[UUID_STRING_LEN + 1];
     uuid_unparse_lower(peer_uuid, coop_key);
@@ -4156,6 +4214,7 @@ static void _await_commit_locked(const tx_score_t *tx, const uuid_t proposer)
          * half keeps the park's slower clock (§2.60). */
         w->deadline = w->parked_at > 0
             ? (double)time(NULL) + REP_PARK_RETRY : deadline;
+        w->last_proposed = (double)time(NULL);
         return;
     }
     w = smrt_create(sizeof(rep_awaiting_t));
@@ -4170,7 +4229,9 @@ static void _await_commit_locked(const tx_score_t *tx, const uuid_t proposer)
     w->competence = tx->competence;
     w->deadline = deadline;
     w->attempts = 0;
+    w->retries = REP_COMMIT_RETRIES;
     w->parked_at = 0;
+    w->last_proposed = (double)time(NULL);
     data_t *wd = object_ptr_data(w, sizeof(rep_awaiting_t));
     if (wd == NULL || map_set(&rep_state.awaiting_commit, task_str, wd) != 0)
         smrt_deref(w);
@@ -4214,6 +4275,47 @@ static bool _own_half_recorded_locked(const uuid_t task_uuid,
     return found;
 }
 
+/* @p peer sent us a reputation frame at @p when (§2.60). Any frame counts:
+ * reach is a property of the island, not of one round. */
+void reputation_note_heard(const uuid_t peer, double when)
+{
+    if (uuid_is_null(peer))
+        return;
+    char peer_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(peer, peer_str);
+    data_t *at = integer_data((int)when);
+    if (at == NULL)
+        return;
+    pthread_mutex_lock(&rep_state.lock);
+    if (map_set(&rep_state.heard, peer_str, at) != 0)
+        smrt_deref(at);
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+/* How many members of the group, this node included, sent us a reputation
+ * frame within REP_REACH_WINDOW_TIMEOUTS commit timeouts of @p present; the
+ * group's size goes to @p members. Caller holds rep_state.lock. */
+static size_t _members_reachable_locked(const process_t *proc, double present,
+                                        size_t *members)
+{
+    double since = present - REP_REACH_WINDOW_TIMEOUTS * REP_COMMIT_TIMEOUT;
+    size_t reached = 1;
+    peers_read_lock(proc);
+    size_t n = proc->protocol.num_peers;
+    for (size_t i = 0; i < n; i++) {
+        char peer_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(proc->protocol.peers[i].uuid, peer_str);
+        data_t *at = NULL;
+        int when = 0;
+        if (map_get(&rep_state.heard, peer_str, &at) == 0
+            && data_integer(at, &when) == 0 && (double)when >= since)
+            reached++;
+    }
+    peers_read_unlock(proc);
+    *members = n + 1;
+    return reached;
+}
+
 size_t reputation_awaiting_commit_count(void)
 {
     pthread_mutex_lock(&rep_state.lock);
@@ -4254,12 +4356,93 @@ static size_t _wake_parked_locked(void)
         rep_awaiting_t *w = NULL;
         if (data_object_ptr(value, (void **)&w) == 0 && w != NULL
             && w->parked_at > 0) {
-            w->deadline = 0;
+            /* Not before its last round has had its chance, and spread by
+             * task so the island's backlog does not land in one tick. */
+            double spread = (double)(((unsigned)w->task_uuid[0] << 8
+                                      | w->task_uuid[1]) % 1000)
+                            * REP_WAKE_SPREAD_SEC / 1000.0;
+            double due = w->last_proposed + REP_COMMIT_TIMEOUT;
+            double soon = (double)time(NULL) + spread;
+            if (soon > due)
+                due = soon;
+            if (due < w->deadline)
+                w->deadline = due;
+            /* Unparked: an active half again, with REP_WAKE_RETRIES retries,
+             * and reachability decides afresh when they run out. Left parked,
+             * every chain growth after the heal re-sent the whole backlog, and
+             * ben's reaction never won a round (part-2272442). */
+            w->parked_at = 0;
+            w->attempts = 0;
+            w->retries = REP_WAKE_RETRIES;
             n++;
         }
     }
     map_end_for_each;
     return n;
+}
+
+static bool _is_probe_cap(const char *cap)
+{
+    return cap != NULL && strncmp(cap, REP_PROBE_CAP_PREFIX,
+                                  sizeof(REP_PROBE_CAP_PREFIX) - 1) == 0;
+}
+
+/* How many probe halves of ours are in awaiting_commit (parked included), and
+ * is an app half of ours pending (active, not parked)? Caller holds
+ * rep_state.lock. */
+static size_t _probe_load_locked(bool *app_pending)
+{
+    size_t probes = 0;
+    bool app = false;
+    map_key_t key = NULL;
+    data_t *value = NULL;
+    map_entries_for_each(&rep_state.awaiting_commit, key, value)
+    {
+        rep_awaiting_t *w = NULL;
+        if (data_object_ptr(value, (void **)&w) != 0 || w == NULL)
+            continue;
+        if (_is_probe_cap(w->capability_name))
+            probes++;
+        else if (w->parked_at <= 0)
+            app = true;
+    }
+    map_end_for_each;
+    if (app_pending != NULL)
+        *app_pending = app;
+    return probes;
+}
+
+bool _admit_new_half(const process_t *proc, const uuid_t task_uuid,
+                     const char *capability_name)
+{
+    if (!_is_probe_cap(capability_name))
+        return true;
+    char task_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(task_uuid, task_str);
+    bool app_pending = false;
+    pthread_mutex_lock(&rep_state.lock);
+    /* A probe already followed (a resubmission) is not a new load. */
+    data_t *dat = NULL;
+    bool known = map_get(&rep_state.awaiting_commit, task_str, &dat) == 0;
+    size_t probes = _probe_load_locked(&app_pending);
+    pthread_mutex_unlock(&rep_state.lock);
+    if (known)
+        return true;
+    double cap = REP_MAX_PROBE_HALVES;
+    if (app_pending) {
+        log_info(proc->logger,
+                 "Reputation: dropping probe half for task %s (%s): an app "
+                 "half of ours is pending\n", task_str, capability_name);
+        return false;
+    }
+    if (cap > 0 && (double)probes >= cap) {
+        log_info(proc->logger,
+                 "Reputation: dropping probe half for task %s (%s): %zu probe "
+                 "half(s) in flight, cap %.0f\n", task_str, capability_name,
+                 probes, cap);
+        return false;
+    }
+    return true;
 }
 
 /* _wake_parked_locked from outside the lock, said out loud when it woke any. */
@@ -9480,6 +9663,8 @@ void _retry_nacked_rounds(const process_t *proc, double present,
     size_t n_due = 0;
 
     pthread_mutex_lock(&rep_state.lock);
+    bool app_pending = false;
+    (void)_probe_load_locked(&app_pending);
     map_key_t key = NULL;
     data_t *value = NULL;
     map_entries_for_each(&rep_state.retry_due, key, value)
@@ -9508,6 +9693,10 @@ void _retry_nacked_rounds(const process_t *proc, double present,
                    sizeof(due[n_due].channel));
             due[n_due].channel[TX_CHANNEL_NAMELEN] = '\0';
             due[n_due].competence = tx->competence;
+            /* A probe yields to a pending app half (§2.60): its round is
+             * retired unsent, and the half's commit retry follows it later. */
+            if (app_pending && _is_probe_cap(due[n_due].cap))
+                due[n_due].resend = false;
         }
         /* else: the round reached quorum while it was waiting, so there is
          * nothing to re-propose — only the alarm to clear. */
@@ -9566,12 +9755,16 @@ void _retry_uncommitted_halves(const process_t *proc, double present)
 {
     rep_awaiting_t due[REP_COMMIT_RETRY_PER_PASS];
     rep_half_action_t act[REP_COMMIT_RETRY_PER_PASS];
+    size_t members = 0;
+    size_t reached = 0;
     size_t n_due = 0;
     char gone[REP_COMMIT_RETRY_PER_PASS * 2][UUID_STRING_LEN + 1];
     size_t n_gone = 0;
     double park_retry = REP_PARK_RETRY, park_ttl = REP_PARK_TTL;
 
     pthread_mutex_lock(&rep_state.lock);
+    bool app_pending = false;
+    (void)_probe_load_locked(&app_pending);
     map_key_t key = NULL;
     data_t *value = NULL;
     map_entries_for_each(&rep_state.awaiting_commit, key, value)
@@ -9589,19 +9782,34 @@ void _retry_uncommitted_halves(const process_t *proc, double present)
         if (w->parked_at > 0) {
             if (present - w->parked_at > park_ttl)
                 act[n_due] = REP_HALF_EXPIRE;
-            else if (w->deadline <= present)
-                act[n_due] = REP_HALF_PARKED_RETRY;
-            else
+            else if (w->deadline > present)
                 continue;
+            else if (app_pending && _is_probe_cap(w->capability_name)) {
+                w->deadline = present + REP_COMMIT_TIMEOUT;   /* yields (§2.60) */
+                continue;
+            } else
+                act[n_due] = REP_HALF_PARKED_RETRY;
             due[n_due++] = *w;
             continue;
         }
         if (w->deadline > present)
             continue;
-        if (w->attempts >= REP_COMMIT_RETRIES) {
-            act[n_due] = REP_HALF_PARK;
-            w->parked_at = present;
-            w->deadline = present + park_retry;
+        if (app_pending && _is_probe_cap(w->capability_name)) {
+            /* A probe yields to a pending app half (§2.60): it waits, its
+             * attempts unspent, and is looked at again a timeout later. */
+            w->deadline = present + REP_COMMIT_TIMEOUT;
+            continue;
+        }
+        if (w->attempts >= w->retries) {
+            reached = _members_reachable_locked(proc, present, &members);
+            if (reached * 2 > members) {
+                /* Reachable, just outcompeted: give it up as before. */
+                act[n_due] = REP_HALF_EXPIRE;
+            } else {
+                act[n_due] = REP_HALF_PARK;
+                w->parked_at = present;
+                w->deadline = present + park_retry;
+            }
         } else {
             act[n_due] = REP_HALF_REPROPOSE;
         }
@@ -9646,17 +9854,25 @@ void _retry_uncommitted_halves(const process_t *proc, double present)
         uuid_unparse_lower(due[i].task_uuid, task_str);
         switch (act[i]) {
         case REP_HALF_EXPIRE:
-            log_warn(proc->logger,
-                     "Reputation: our half of task %s never committed after "
-                     "%d re-proposal(s) and %.0f s parked; giving up on it\n",
-                     task_str, due[i].attempts, present - due[i].parked_at);
+            if (due[i].parked_at > 0)
+                log_warn(proc->logger,
+                         "Reputation: our half of task %s never committed "
+                         "after %d re-proposal(s) and %.0f s parked; giving "
+                         "up on it\n", task_str, due[i].attempts,
+                         present - due[i].parked_at);
+            else
+                log_warn(proc->logger,
+                         "Reputation: our half of task %s never committed "
+                         "after %d re-proposal(s), though %zu of %zu "
+                         "member(s) are reachable; giving up on it\n",
+                         task_str, due[i].attempts, reached, members);
             continue;
         case REP_HALF_PARK:
             log_info(proc->logger,
                      "Reputation: our half of task %s has no quorum after %d "
-                     "re-proposal(s); parking it until the chain grows from "
-                     "a peer (or every %.0f s)\n",
-                     task_str, due[i].attempts, park_retry);
+                     "re-proposal(s) (%zu of %zu member(s) reachable); parking "
+                     "it until the chain grows from a peer (or every %.0f s)\n",
+                     task_str, due[i].attempts, reached, members, park_retry);
             continue;
         case REP_HALF_PARKED_RETRY:
             log_info(proc->logger,
@@ -9668,7 +9884,7 @@ void _retry_uncommitted_halves(const process_t *proc, double present)
                      "Reputation: our half of task %s is not in the chain after "
                      "%.0f s; re-proposing it (attempt %d of %d)\n",
                      task_str, REP_COMMIT_TIMEOUT, due[i].attempts + 1,
-                     REP_COMMIT_RETRIES);
+                     due[i].retries);
             break;
         }
         _forward_transaction(proc, due[i].task_uuid, due[i].proposer,
@@ -9778,6 +9994,206 @@ static int _repropose_dropped(const process_t *proc,
                              no_subject, 0.0);
     free(due);
     return n_due;
+}
+
+/* Hand our pending halves to a member that joined after we committed them
+ * (ISSUES §2.62). A join carries only bilateral entries, so a half of ours
+ * committed before a member arrived never reaches it; when our counterpart's
+ * half commits later, the late member holds it alone and its chain forks from
+ * ours. Stele rt-2404254 split two and two that way, and an even split never
+ * finalizes a checkpoint, so nothing reconciled it. Each pass at
+ * REP_HANDOFF_AT seconds after a peer is first seen in the roster re-sends it
+ * every one of our committed-but-unpaired halves on the primary chain as the
+ * same `tx committed` we broadcast at commit, certificate included. Only OUR
+ * halves: a commit may write only its sender's half (§2.16). Repeated because
+ * a newcomer may not hold the group key yet; a repeat is harmless, as
+ * tx_history_update refuses a second half from the same scorer. Mirrors
+ * Python _hand_off_pending_halves. */
+static const double REP_HANDOFF_AT[] = { 5.0, 15.0, 30.0 };
+#define REP_HANDOFF_PASSES \
+    ((int)(sizeof(REP_HANDOFF_AT) / sizeof(REP_HANDOFF_AT[0])))
+#define REP_HANDOFF_MAX_HALVES 32
+
+typedef struct {
+    uuid_t task;
+    double score;
+    char   channel[TX_CHANNEL_NAMELEN + 1];
+    char  *cert;   /* owned JSON text, or NULL */
+} rep_handoff_half_t;
+
+size_t _hand_off_pending_halves(const process_t *proc, double present,
+                                const uuid_t self_uuid, bool have_self)
+{
+    if (proc == NULL || !have_self)
+        return 0;
+
+    /* Snapshot the roster: sends happen outside every lock. */
+    size_t n_peers = 0;
+    public_identity_t *peers = NULL;
+    peers_read_lock(proc);
+    if (proc->protocol.num_peers > 0)
+    {
+        peers = calloc(proc->protocol.num_peers, sizeof(public_identity_t));
+        if (peers != NULL)
+        {
+            n_peers = proc->protocol.num_peers;
+            memcpy(peers, proc->protocol.peers,
+                   n_peers * sizeof(public_identity_t));
+        }
+    }
+    peers_read_unlock(proc);
+
+    char (*ids)[UUID_STRING_LEN + 1] =
+        calloc(n_peers > 0 ? n_peers : 1, sizeof(*ids));
+    bool *due = calloc(n_peers > 0 ? n_peers : 1, sizeof(bool));
+    int *pass = calloc(n_peers > 0 ? n_peers : 1, sizeof(int));
+    if (ids == NULL || due == NULL || pass == NULL)
+    {
+        free(peers); free(ids); free(due); free(pass);
+        return 0;
+    }
+    for (size_t i = 0; i < n_peers; i++)
+        uuid_unparse_lower(peers[i].uuid, ids[i]);
+
+    rep_handoff_half_t halves[REP_HANDOFF_MAX_HALVES];
+    size_t n_halves = 0, n_due = 0;
+
+    pthread_mutex_lock(&rep_state.lock);
+    /* Forget whoever left the roster. Collected first: the map's key index
+     * must not change under the walk. */
+    size_t n_seen = map_size(&rep_state.handoff_seen);
+    char (*gone)[UUID_STRING_LEN + 1] =
+        calloc(n_seen > 0 ? n_seen : 1, sizeof(*gone));
+    size_t n_gone = 0;
+    if (gone != NULL)
+    {
+        map_key_t key = NULL;
+        data_t *value = NULL;
+        map_entries_for_each(&rep_state.handoff_seen, key, value)
+        {
+            (void)value;
+            bool present_now = false;
+            for (size_t i = 0; i < n_peers && !present_now; i++)
+                present_now = strcmp(ids[i], key) == 0;
+            if (!present_now && n_gone < n_seen)
+                at_strlcpy(gone[n_gone++], key, sizeof(gone[0]));
+        }
+        map_end_for_each
+        for (size_t g = 0; g < n_gone; g++)
+        {
+            map_remove(&rep_state.handoff_seen, gone[g]);
+            map_remove(&rep_state.handoff_passes, gone[g]);
+        }
+        free(gone);
+    }
+    for (size_t i = 0; i < n_peers; i++)
+    {
+        data_t *d = NULL;
+        if (map_get(&rep_state.handoff_seen, (map_key_t)ids[i], &d) != 0
+            || d == NULL)
+        {
+            map_set(&rep_state.handoff_seen, (map_key_t)ids[i],
+                    integer_data((int)present));
+            map_set(&rep_state.handoff_passes, (map_key_t)ids[i],
+                    integer_data(0));
+            continue;
+        }
+        int first = 0, done = 0;
+        data_integer(d, &first);
+        d = NULL;
+        if (map_get(&rep_state.handoff_passes, (map_key_t)ids[i], &d) == 0
+            && d != NULL)
+            data_integer(d, &done);
+        /* Every pass whose time has come counts, but a late tick sends once. */
+        int now_done = done;
+        while (now_done < REP_HANDOFF_PASSES
+               && present >= (double)first + REP_HANDOFF_AT[now_done])
+            now_done++;
+        if (now_done == done)
+            continue;
+        map_set(&rep_state.handoff_passes, (map_key_t)ids[i],
+                integer_data(now_done));
+        due[i] = true;
+        pass[i] = now_done;
+        n_due++;
+    }
+    if (n_due > 0)
+    {
+        const tx_history_t *chain = &rep_state.history;
+        for (int s = 0; s < chain->chain_len
+                        && n_halves < REP_HANDOFF_MAX_HALVES; s++)
+        {
+            const transaction_t *t = &chain->chain[s];
+            if (!t->p1_set || t->p2_set || t->attested
+                || uuid_compare(t->p1_uuid, self_uuid) != 0)
+                continue;
+            rep_handoff_half_t *h = &halves[n_halves++];
+            uuid_copy(h->task, t->task_uuid);
+            h->score = t->p1_score;
+            at_strlcpy(h->channel, t->p1_channel, sizeof(h->channel));
+            const char *cert = tx_history_commit_cert(chain, t->task_uuid,
+                                                      self_uuid);
+            h->cert = (cert != NULL) ? strdup(cert) : NULL;
+        }
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+
+    size_t sent = 0;
+    char self_str[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(self_uuid, self_str);
+    for (size_t i = 0; i < n_peers && n_halves > 0; i++)
+    {
+        if (!due[i])
+            continue;
+        for (size_t k = 0; k < n_halves; k++)
+        {
+            const rep_handoff_half_t *h = &halves[k];
+            char task_str[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(h->task, task_str);
+            json_t *commit_json = json_object();
+            if (commit_json == NULL)
+                continue;
+            /* The same fields, spelled the same way, as handle_accepted's
+             * broadcast: the primary chain carries no group_uuid. */
+            json_object_set_new(commit_json, "task_uuid", json_string(task_str));
+            json_object_set_new(commit_json, "peer_uuid", json_string(self_str));
+            json_object_set_new(commit_json, "score", json_real(h->score));
+            if (h->channel[0] != '\0')
+                json_object_set_new(commit_json, "channel",
+                                    json_string(h->channel));
+            if (h->cert != NULL)
+            {
+                json_t *cert = json_loads(h->cert, 0, NULL);
+                if (json_is_object(cert))
+                    json_object_set_new(commit_json, "certificate", cert);
+                else
+                    json_decref(cert);
+            }
+            generic_msg_t out = {0};
+            out.type = NET_MESSAGE;
+            strncpy(out.info.net_msg.process, "reputation", PROC_NAME_LEN);
+            out.info.net_msg.function = REP_PROTO_COMMITTED;
+            out.info.net_msg.encrypt = true;
+            memcpy(&out.info.net_msg.to_whom, &peers[i],
+                   sizeof(public_identity_t));
+            net_msg_pack_json(&out.info.net_msg, commit_json);
+            json_decref(commit_json);
+            if (_rep_send_to_network(proc, &out) == 0)
+                sent++;
+            net_msg_free_obj(&out.info.net_msg);
+        }
+        log_info(proc->logger,
+                 "Reputation: handed %zu pending half(s) of ours to %s "
+                 "(pass %d of %d)\n", n_halves, peers[i].nickname, pass[i],
+                 REP_HANDOFF_PASSES);
+    }
+    for (size_t k = 0; k < n_halves; k++)
+        free(halves[k].cert);
+    free(peers);
+    free(ids);
+    free(due);
+    free(pass);
+    return sent;
 }
 
 /* Originate a checkpoint on the interval, when the window has actually moved.
@@ -9914,6 +10330,12 @@ void reputation_reset_state(int num_peers)
     map_init(&rep_state.awaiting_commit);
     map_free(&rep_state.retry_due);
     map_init(&rep_state.retry_due);
+    map_free(&rep_state.heard);
+    map_init(&rep_state.heard);
+    map_free(&rep_state.handoff_seen);
+    map_init(&rep_state.handoff_seen);
+    map_free(&rep_state.handoff_passes);
+    map_init(&rep_state.handoff_passes);
     map_free(&rep_state.updates);
     map_init(&rep_state.updates);
     array_free(&rep_state.requested_reps);
@@ -10581,6 +11003,9 @@ static void _handle_local_tx_score(const process_t *proc,
      * weight band, and a non-positive value is read as absence rather than
      * refused -- a zeroed struct from a producer predating the field means
      * "the authored weight, verbatim". */
+    /* Probe backpressure (§2.60): AT's probes yield to app halves. */
+    if (!_admit_new_half(proc, ts->task_uuid, ts->capability_name))
+        return;
     _forward_transaction(proc, ts->task_uuid, self_uuid, ts->score,
                          ts->capability_name, ts->channel, ts->peer_uuid,
                          ts->competence);
@@ -10667,6 +11092,9 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
         _retry_nacked_rounds(proc, present, self_uuid, have_self);
         /* Our halves that went out and never came back (ISSUES §2.24). */
         _retry_uncommitted_halves(proc, present);
+        /* Our unpaired halves, to members that joined after we committed
+         * them (ISSUES §2.62). */
+        _hand_off_pending_halves(proc, present, self_uuid, have_self);
         /* Checkpoint proposals that arrived before our chain held their
          * range (ISSUES §2.29). */
         _recheck_parked_cosigns(proc, present);
@@ -10710,6 +11138,10 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
             }
             else
             {
+                /* Who is reachable, for parking (§2.60). */
+                if (buf.type == NET_MESSAGE)
+                    reputation_note_heard(buf.info.net_msg.from_whom.uuid,
+                                          (double)time(NULL));
                 run_message_handlers(proc, queues, buf.type, &buf);
             }
         }

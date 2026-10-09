@@ -192,6 +192,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # AT_REP_COMMIT_TIMEOUT_SEC.
     COMMIT_TIMEOUT = _env_float('AT_REP_COMMIT_TIMEOUT_SEC', 15.0)
     COMMIT_RETRIES = 5
+    # A woken half is unparked with twice a fresh half's retries: the heal is
+    # its contended moment (part-2272442). Mirrors C REP_WAKE_RETRIES.
+    WAKE_RETRIES = 2 * COMMIT_RETRIES
     # A half that used up its COMMIT_RETRIES is PARKED, not dropped (ISSUES
     # §2.60): a minority island cannot commit under the majority rule (§2.13)
     # and waits out a partition far longer than five retries. A parked half
@@ -201,6 +204,24 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     # AT_REP_PARK_TTL_SEC.
     PARK_RETRY = _env_float('AT_REP_PARK_RETRY_SEC', 120.0)
     PARK_TTL = _env_float('AT_REP_PARK_TTL_SEC', 86400.0)
+    # Only a half that could not REACH a majority is parked; one lost to
+    # contention is given up as before. Parking those too swamped the heal
+    # (part-2123724). Reach is measured per PEER: a majority of the group,
+    # counting us, must have sent us any reputation frame within
+    # REACH_WINDOW_TIMEOUTS commit timeouts. Counting answers to the half's
+    # own rounds undercounted (part-2136648): a retired round's late answer
+    # landed nowhere. Mirrors C REP_REACH_WINDOW_TIMEOUTS.
+    REACH_WINDOW_TIMEOUTS = 2.0
+    # PROBE BACKPRESSURE (§2.60, part-2314213): AT's own probe halves carry an
+    # "at." capability. A node follows at most MAX_PROBE_HALVES of them (a new
+    # one past that is dropped), and while an app half of its own is pending it
+    # proposes no probe at all: new ones are dropped, overdue ones wait.
+    # Mirrors C REP_MAX_PROBE_HALVES. Override: AT_REP_MAX_PROBE_HALVES.
+    PROBE_CAP_PREFIX = 'at.'
+    MAX_PROBE_HALVES = _env_float('AT_REP_MAX_PROBE_HALVES', 4.0)
+    # A wake spreads its halves over WAKE_SPREAD seconds, by task. Mirrors C
+    # REP_WAKE_SPREAD_SEC.
+    WAKE_SPREAD = 5.0
 
     # Hysteresis band for the CTFT ↔ pure-reputation dispatch in
     # _compute_reputation. A single 0.5 threshold made peers hovering
@@ -437,6 +458,16 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # not yet in the chain, followed by task because the round is what gets
         # lost (ISSUES §2.24). _retry_uncommitted_halves reads it.
         self.awaiting_commit: dict[str, list] = {}
+        # peer uuid str -> epoch seconds: when that peer last sent us any
+        # reputation frame. Read when a half's retries run out, to park it
+        # only if no majority is reachable (§2.60, _members_reachable).
+        self.heard: dict[str, float] = {}
+        # peer uuid str -> [first seen (epoch seconds), passes done]: when a
+        # peer first appeared in the roster and how many times our pending
+        # halves have been handed to it (ISSUES §2.62,
+        # _hand_off_pending_halves). A peer that leaves is forgotten, so one
+        # that comes back is handed them again.
+        self.handoff: dict[str, list] = {}
         self.requests: list[tuple[int, int]] = []
         self.proposals: dict[tuple[int, int], TransactionScore] = {}
         self.acceptances: dict[UUID, list[TransactionScore]] = {}
@@ -1000,12 +1031,36 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         start = now()
         while (now() - start).total_seconds() < wait:
             time.sleep(self.cadence)
+        if self._is_probe(score) and self._probe_load()[1]:
+            # A probe yields to a pending app half (§2.60): unsent, and the
+            # half's commit retry follows it later.
+            return
         try:
             self._start_paxos(queues, score)
         except Full:
             self.logger.error('try_again: Network queue full')
 
-    def _arm_round_retry(self, queues, obj):
+    def note_heard(self, peer, when=None):
+        """``peer`` sent us a reputation frame at ``when`` (§2.60). Any
+        frame counts: reach is a property of the island, not of one round.
+        Mirrors C reputation_note_heard."""
+        uuid = getattr(peer, 'uuid', None)
+        if uuid is None:
+            return
+        self.heard[str(uuid)] = (now().timestamp() if when is None
+                                 else when)
+
+    def _members_reachable(self, present):
+        """(reached, members): how many members of the group, us included,
+        were heard within REACH_WINDOW_TIMEOUTS commit timeouts of
+        ``present``. Mirrors C _members_reachable_locked."""
+        since = present - self.REACH_WINDOW_TIMEOUTS * self.COMMIT_TIMEOUT
+        members = list(self.peers.all)
+        reached = 1 + sum(1 for p in members
+                          if self.heard.get(str(p.uuid), float('-inf')) >= since)
+        return reached, len(members) + 1
+
+    def _arm_round_retry(self, queues, obj, peer=None):
         """Re-propose OUR round named by a nack/backdate payload, after the
         round's backoff. A round not ours, or already carried to quorum, is
         dropped. Shared by handle_nack and handle_backdate; mirrors C's
@@ -1027,7 +1082,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def handle_nack(self, queues, message):
         if message.function == ReputationProtocol.nack:
-            self._arm_round_retry(queues, message.obj)
+            self._arm_round_retry(queues, message.obj, message.from_whom)
             return True
         return False
 
@@ -1053,7 +1108,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             # armed a re-proposal, so a round every acceptor backdated
             # vanished (moderation_cohort.sh's report). Mirrors C.
             try:
-                self._arm_round_retry(queues, message.obj)
+                self._arm_round_retry(queues, message.obj, message.from_whom)
             except (TypeError, ValueError):
                 self.logger.debug('backdate without a round id; not retrying')
             return True
@@ -1160,13 +1215,15 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # half keeps the park's slower clock (§2.60).
         deadline = now().timestamp() + self.COMMIT_TIMEOUT
         waiting = self.awaiting_commit.get(str(score.task_id))
+        # [score, deadline, attempts, parked_at, last proposed, retries]
         if waiting is None:
-            self.awaiting_commit[str(score.task_id)] = [score, deadline, 0,
-                                                        None]
-        elif waiting[3] is not None:
-            waiting[1] = now().timestamp() + self.PARK_RETRY
+            self.awaiting_commit[str(score.task_id)] = [
+                score, deadline, 0, None, now().timestamp(),
+                self.COMMIT_RETRIES]
         else:
-            waiting[1] = deadline
+            waiting[1] = (now().timestamp() + self.PARK_RETRY
+                          if waiting[3] is not None else deadline)
+            waiting[4] = now().timestamp()
         # Bind this round to its group so quorum + commit routing use
         # the round's own group, not the conflated self.peers.all.
         # Defaults to the primary group (the gateway's own/parent
@@ -1259,8 +1316,48 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             return True
         return False
 
+    def _is_probe(self, score) -> bool:
+        cap = getattr(score, 'capability_name', None)
+        return bool(cap) and cap.startswith(self.PROBE_CAP_PREFIX)
+
+    def _probe_load(self):
+        """(probe halves followed, parked included; is an app half of ours
+        pending, active not parked?). Mirrors C _probe_load_locked."""
+        probes, app = 0, False
+        for w in self.awaiting_commit.values():
+            if self._is_probe(w[0]):
+                probes += 1
+            elif w[3] is None:
+                app = True
+        return probes, app
+
+    def admit_new_half(self, score) -> bool:
+        """Probe backpressure (§2.60): may this NEW half be proposed? Always,
+        unless it is one of AT's probes and an app half of ours is pending or
+        MAX_PROBE_HALVES are already followed. Mirrors C _admit_new_half."""
+        if not self._is_probe(score):
+            return True
+        key = str(score.task_id)
+        if key in self.awaiting_commit:
+            return True
+        probes, app = self._probe_load()
+        if app:
+            self.logger.info('dropping probe half for task %s (%s): an app '
+                             'half of ours is pending', key,
+                             score.capability_name)
+            return False
+        if self.MAX_PROBE_HALVES > 0 and probes >= self.MAX_PROBE_HALVES:
+            self.logger.info('dropping probe half for task %s (%s): %d probe '
+                             'half(s) in flight, cap %.0f', key,
+                             score.capability_name, probes,
+                             self.MAX_PROBE_HALVES)
+            return False
+        return True
+
     def forward_transaction(self, queues, message):
         if isinstance(message, TransactionScore):
+            if not self.admit_new_half(message):
+                return True
             try:
                 # Don't write to history here.  The C twin
                 # _forward_transaction (rep_proc.c:1081-1102) only
@@ -3729,6 +3826,80 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 return True
         return False
 
+    #: Seconds after a peer is first seen at which our pending halves are
+    #: handed to it (ISSUES §2.62). Mirrors C REP_HANDOFF_AT.
+    HANDOFF_AT = (5.0, 15.0, 30.0)
+    #: At most this many halves go to one peer per pass. Mirrors C
+    #: REP_HANDOFF_MAX_HALVES.
+    HANDOFF_MAX_HALVES = 32
+
+    def _hand_off_pending_halves(self, queues, present) -> int:
+        """Hand our committed-but-unpaired halves on the primary chain to each
+        peer that joined after we committed them (ISSUES §2.62). A join
+        carries only bilateral entries, so without this a late member holds
+        our counterpart's half alone when it commits, and its chain forks from
+        ours (Stele rt-2404254 split two and two, and an even split never
+        finalizes a checkpoint). Each pass at HANDOFF_AT seconds after a peer
+        is first seen re-sends it the same `committed` we broadcast at commit,
+        certificate included. Only OUR halves: a commit may write only its
+        sender's half (§2.16). Repeated because a newcomer may not hold the
+        group key yet; TransactionHistory.update refuses a second half from
+        the same scorer, so a repeat is harmless. Mirrors C
+        _hand_off_pending_halves. Returns how many frames went out."""
+        identity = getattr(self, 'identity', None)
+        if identity is None:
+            return 0
+        roster = {str(p.uuid): p for p in self.peers.all}
+        for gone in [k for k in self.handoff if k not in roster]:
+            del self.handoff[gone]
+        due = []
+        for key, peer in roster.items():
+            seen = self.handoff.get(key)
+            if seen is None:
+                self.handoff[key] = [present, 0]
+                continue
+            first, done = seen
+            now_done = done
+            # Every pass whose time has come counts, but a late tick sends once.
+            while now_done < len(self.HANDOFF_AT) and \
+                    present >= first + self.HANDOFF_AT[now_done]:
+                now_done += 1
+            if now_done != done:
+                seen[1] = now_done
+                due.append((peer, now_done))
+        if not due:
+            return 0
+        me = str(identity.uuid)
+        halves = [tx for tx in self.history._task_mapping.values()
+                  if len(tx) == 1 and not tx.attested and tx.p2_id is None
+                  and str(tx.p1_id) == me][:self.HANDOFF_MAX_HALVES]
+        if not halves:
+            return 0
+        sent = 0
+        for peer, done in due:
+            for tx in halves:
+                # The same tuple handle_accepted broadcasts; the primary chain
+                # carries no group uuid.
+                commit_obj = (tx.task_id, tx.p1_id, tx.p1_score, None,
+                              tx.p1_channel)
+                cert = tx.certificate_of(tx.p1_id)
+                if cert:
+                    commit_obj = commit_obj + (cert,)
+                try:
+                    queues[CfgIds.network].put(
+                        Message(self.name, ReputationProtocol.committed,
+                                to_json_string(commit_obj), peer,
+                                from_whom=identity),
+                        block=True, timeout=self.q_cadence)
+                    sent += 1
+                except Full:
+                    self.logger.error('hand_off_pending_halves: Network queue full')
+            self.logger.info('handed %d pending half(s) of ours to %s (pass %d '
+                             'of %d)', len(halves),
+                             getattr(peer, 'nickname', '?'), done,
+                             len(self.HANDOFF_AT))
+        return sent
+
     def _retry_uncommitted_halves(self, queues, present) -> int:
         """Re-propose OUR halves that waited out COMMIT_TIMEOUT without reaching
         the chain (ISSUES §2.24). A half now in the chain, by our commit or in
@@ -3739,8 +3910,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         (_wake_parked), and given up only after PARK_TTL. Mirrors C
         _retry_uncommitted_halves. Returns how many were re-proposed."""
         resent = 0
+        app_pending = self._probe_load()[1]
         for key, waiting in list(self.awaiting_commit.items()):
-            score, deadline, attempts, parked_at = waiting
+            score, deadline, attempts, parked_at = waiting[:4]
             if self._own_half_recorded(score.task_id):
                 del self.awaiting_commit[key]
                 continue
@@ -3752,6 +3924,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 else:
                     continue
             elif deadline > present:
+                continue
+            if not (parked_at is not None and expire) and app_pending and \
+                    self._is_probe(score):
+                # A probe yields to a pending app half (§2.60): it waits, its
+                # attempts unspent, and is looked at again a timeout later.
+                waiting[1] = present + self.COMMIT_TIMEOUT
                 continue
             for idx in [i for i, tc in self.my_requests.items()
                         if str(tc.score.task_id) == key]:
@@ -3766,20 +3944,31 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     del self.awaiting_commit[key]
                     continue
                 self.logger.info('re-proposing parked half of task %s', key)
-            elif attempts >= self.COMMIT_RETRIES:
+            elif attempts >= waiting[5]:
+                reached, members = self._members_reachable(present)
+                if reached * 2 > members:
+                    # Reachable, just outcompeted: give it up as before.
+                    self.logger.warning(
+                        'our half of task %s never committed after %d '
+                        're-proposal(s), though %d of %d member(s) are '
+                        'reachable; giving up on it', key, attempts, reached,
+                        members)
+                    del self.awaiting_commit[key]
+                    continue
                 waiting[1] = present + self.PARK_RETRY
                 waiting[3] = present
                 self.logger.info(
                     'our half of task %s has no quorum after %d '
-                    're-proposal(s); parking it until the chain grows from a '
-                    'peer (or every %.0f s)', key, attempts, self.PARK_RETRY)
+                    're-proposal(s) (%d of %d member(s) reachable); parking '
+                    'it until the chain grows from a peer (or every %.0f s)',
+                    key, attempts, reached, members, self.PARK_RETRY)
                 continue
             else:
                 waiting[2] = attempts + 1
                 self.logger.info(
                     'our half of task %s is not in the chain after %.0f s; '
                     're-proposing it (attempt %d of %d)', key,
-                    self.COMMIT_TIMEOUT, attempts + 1, self.COMMIT_RETRIES)
+                    self.COMMIT_TIMEOUT, attempts + 1, waiting[5])
             try:
                 self._start_paxos(queues, score)
                 resent += 1
@@ -3800,9 +3989,22 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         again: make every parked half due on the next pass (§2.60). Mirrors
         C _wake_parked. Returns how many."""
         woken = 0
+        present = now().timestamp()
         for waiting in self.awaiting_commit.values():
             if waiting[3] is not None:
-                waiting[1] = 0
+                # Not before its last round has had its chance, and spread by
+                # task so the island's backlog does not land in one tick.
+                b = UUID(str(waiting[0].task_id)).bytes
+                spread = ((b[0] << 8 | b[1]) % 1000) * self.WAKE_SPREAD / 1000
+                due = max(waiting[4] + self.COMMIT_TIMEOUT, present + spread)
+                waiting[1] = min(waiting[1], due)
+                # Unparked: an active half again, with WAKE_RETRIES retries,
+                # and reachability decides afresh when they run out. Left
+                # parked, every chain growth after the heal re-sent the whole
+                # backlog (part-2272442). Mirrors C _wake_parked_locked.
+                waiting[2] = 0
+                waiting[3] = None
+                waiting[5] = self.WAKE_RETRIES
                 woken += 1
         if woken:
             self.logger.info('chain grew from %s; re-proposing %d parked '
@@ -4712,9 +4914,17 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                         (Reputation(peer_uuid, rep_score), req_proc, requestor))
                 _probes.counter('rep.compute', 'slashed')
                 return
-            previous = self.PREREP_NEUTRAL
+            # A peer scored for the first time has no stored score, and an
+            # absent score must not choose the regime: it read as neutral,
+            # held a peer known only through others at its cold-start prior,
+            # and the next entry about it (a finding, in Stele's cohort
+            # st-2590772) flipped it to the pure mean and RAISED it. The
+            # first score's regime follows what this node would assign it
+            # now (AT ISSUES §2.64). Mirrors C _score_peer_locked.
             if peer_uuid in self.reputations:
                 previous = self.reputations[peer_uuid]
+            else:
+                previous = self._contrite_tit_for_tat(peer)
             in_coop = self._coop_mode.get(peer_uuid, False)
             if in_coop:
                 use_pure = previous > self.COOP_EXIT
@@ -5783,6 +5993,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     except Empty:
                         break
                     drained += 1
+                    if isinstance(message, Message):
+                        # Who is reachable, for parking (§2.60).
+                        self.note_heard(message.from_whom)
                     if not self.protocol.run_message_handlers(queues, message):
                         if not self.forward_transaction(queues, message):
                             # Raw SlashAttestation objects (put on the queue
@@ -5829,6 +6042,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 self._maybe_checkpoint(queues, present)
                 # Our halves that went out and never came back (§2.24).
                 self._retry_uncommitted_halves(queues, present)
+                # Our unpaired halves, to members that joined after we
+                # committed them (§2.62).
+                self._hand_off_pending_halves(queues, present)
                 # Our attestation rounds whose propose went missing (§2.40).
                 self._retry_pending_attestations(queues, present)
                 # Checkpoint proposals that arrived before our chain held

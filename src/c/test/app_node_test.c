@@ -587,7 +587,7 @@ DEFINE_TEST(test_every_app_event_type_forwards_to_the_app_queue)
     messaging_assign(&sender_q);
 
     static const message_type_t app_types[] = {
-        PEER_OBSERVED, PEER_REPUTATION, PEER_RTT_OBSERVED,
+        PEER_OBSERVED, PEER_REPUTATION, PEER_RTT_OBSERVED, PEER_PRESENCE,
     };
     const size_t n = sizeof(app_types) / sizeof(app_types[0]);
 

@@ -88,7 +88,7 @@ int at_route_extern_msg(generic_msg_t *msg, logger_t *logger)
         if (fn != NULL && strcmp(fn, AT_APP_ROSTER_REQUEST) == 0)
         {
             /* All three carrier producers answer: identity holds the peer facts
-             * (and now positions), reputation the scores, network the RTT. Each
+             * (and now positions), reputation the scores, network the RTT and presence. Each
              * copy is addressed to its own process, since dispatch matches
              * net_msg.process against proc->name. */
             static const char *const roster_targets[] = { "identity", "reputation", "network" };
@@ -223,6 +223,7 @@ int at_route_internal_msgs(array_t *unhandled, const char *q_out,
             case PEER_OBSERVED:
             case PEER_REPUTATION:
             case PEER_RTT_OBSERVED:
+            case PEER_PRESENCE:
                 if (q_out == NULL)
                     break;   /* no app attached; nothing to do */
                 if (at_send(NULL, q_out, inner,

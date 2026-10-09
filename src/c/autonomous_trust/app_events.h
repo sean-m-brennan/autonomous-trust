@@ -81,6 +81,9 @@ typedef enum {
     /** A peer's latest round-trip time (@c rtt). A network-latency proximity
      *  proxy, in milliseconds — NOT a geographic distance. */
     AT_APP_EVENT_PEER_RTT = 3,
+    /** A peer went quiet or came back (@c presence). Advisory: an absent peer
+     *  is still a member. The first of the core's 100..199 block. */
+    AT_APP_EVENT_PEER_PRESENCE = 100,
     /* Kinds 4..15 are the Agora social feature's -- at_agora.h, with their
      * payloads and accessors. Reserved so nobody collides with them:
      *   0..99      core, and Agora's 4..15 grandfathered (Agora appends 16..99)
@@ -175,6 +178,21 @@ typedef struct {
     int32_t rtt_ms;
 } at_app_rtt_t;
 
+/** Whether this node has heard from a peer recently. Mirrors
+ *  `peer_presence_msg_t`. Sent when it changes, and once per peer on a roster
+ *  pull. */
+typedef struct {
+    uint8_t peer_uuid[AT_APP_UUID_LEN];
+    /** False once nothing has been heard from the peer for
+     *  AT_PRESENCE_ABSENT_SEC (default 90 s). AT keeps the peer as a member
+     *  and only stops asking it to do work, so read this as "quiet", not
+     *  "gone". */
+    bool    present;
+    /** Epoch seconds of the last frame from the peer; 0 = none yet. Grade it
+     *  against your own clock. */
+    double  last_heard;
+} at_app_presence_t;
+
 
 /** Bytes of @ref at_app_event_t's opaque payload arm. A feature's event (e.g.
  *  the Agora kinds in at_agora.h) is carried there and read through that
@@ -209,6 +227,7 @@ typedef struct {
         at_app_peer_t       peer;
         at_app_reputation_t reputation;
         at_app_rtt_t        rtt;
+        at_app_presence_t   presence;
         /** A feature's event; read it through that feature's accessors. */
         AT_APP_ALIGN8 uint8_t payload[AT_APP_EVENT_PAYLOAD_MAX];
     } data;

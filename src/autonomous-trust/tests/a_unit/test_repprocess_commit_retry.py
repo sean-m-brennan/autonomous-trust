@@ -155,6 +155,18 @@ def _park(rp, queues, net_q):
     return task
 
 
+def _catch_up(rp, queues, n):
+    """alice sends a chain of ``n`` unrelated alice/bob entries, as the
+    majority island's does at the heal."""
+    from autonomous_trust.core.reputation.reputation import Transaction
+    alice, bob = rp.protocol.peers.all[:2]
+    chain = [Transaction(uuid4(), alice.uuid, 0.8, bob.uuid, 0.7, index=i + 1)
+             for i in range(n)]
+    rp.handle_update(queues, Message(
+        CfgIds.reputation, ReputationProtocol.update,
+        to_yaml_string(chain), from_whom=alice))
+
+
 class TestParkedHalves:
     """ISSUES §2.60. Mirrors the parked tests in rep_commit_retry_test.c."""
 
@@ -170,19 +182,33 @@ class TestParkedHalves:
     def test_a_grown_chain_wakes_parked_halves(self):
         """THE HEAL: the minority's chain is a prefix of the majority's, so
         the heal arrives as an EXTENDED catch-up and wakes the parked half."""
-        from autonomous_trust.core.reputation.reputation import Transaction
         rp, queues, net_q = _cohort()
         _park(rp, queues, net_q)
-        alice, bob = rp.protocol.peers.all
-        chain = [Transaction(uuid4(), alice.uuid, 0.8, bob.uuid, 0.7,
-                             index=1)]
-        rp.handle_update(queues, Message(
-            CfgIds.reputation, ReputationProtocol.update,
-            to_yaml_string(chain), from_whom=alice))
+        _catch_up(rp, queues, 1)
         assert len(rp.history) == 1, 'precondition: caught up'
+        # Not at once: the last round has its COMMIT_TIMEOUT first.
+        assert rp._retry_uncommitted_halves(queues, now().timestamp()) == 0
         # _later(7) is 60 s before the slow retry: only the wake makes it due.
         assert rp._retry_uncommitted_halves(queues, _later(7)) == 1
-        assert rp.parked_count() == 1
+
+    def test_a_woken_half_is_unparked_with_fresh_retries(self):
+        """A wake UNPARKS (part-2272442): WAKE_RETRIES (10) fresh retries,
+        then, with a majority reachable, given up as a contention loser."""
+        rp, queues, net_q = _cohort()
+        _park(rp, queues, net_q)
+        _catch_up(rp, queues, 1)
+        assert rp._retry_uncommitted_halves(queues, _later(7)) == 1
+        assert rp.parked_count() == 0
+        assert len(rp.awaiting_commit) == 1
+        _catch_up(rp, queues, 2)
+        assert rp.parked_count() == 0
+        alice = rp.protocol.peers.all[0]
+        resent = 0
+        for i in range(8, 18):
+            rp.note_heard(alice, _later(i))
+            resent += rp._retry_uncommitted_halves(queues, _later(i))
+        assert resent == 9
+        assert len(rp.awaiting_commit) == 0
 
     def test_a_parked_half_expires_or_is_forgotten(self):
         rp, queues, net_q = _cohort()
@@ -195,3 +221,90 @@ class TestParkedHalves:
         rp.history.update(task, rp.identity.uuid, 0.9)
         assert rp._retry_uncommitted_halves(queues, _later(8)) == 0
         assert str(task) not in rp.awaiting_commit
+
+    def test_a_half_a_majority_reached_is_dropped_not_parked(self):
+        """Contention, not a partition: alice (with us, a majority of three)
+        is reachable and it still never committed. Given up as before
+        §2.60."""
+        rp, queues, net_q = _cohort()
+        task = uuid4()
+        rp._start_paxos(queues, TransactionScore(task, 0.9))
+        alice = rp.protocol.peers.all[0]
+        for i in range(1, 7):
+            rp.note_heard(alice, _later(i))
+            rp._retry_uncommitted_halves(queues, _later(i))
+        assert rp.parked_count() == 0
+        assert str(task) not in rp.awaiting_commit
+
+    def test_a_peer_heard_on_a_retired_ballot_still_counts(self):
+        """THE REGRESSION (part-2136648): reach is any frame from the peer,
+        not an answer to one of the half's own rounds. A grant for a ballot
+        the retry already retired lands nowhere; alice is merely heard."""
+        rp, queues, net_q = _cohort()
+        task = uuid4()
+        rp._start_paxos(queues, TransactionScore(task, 0.9))
+        stale = next(reversed(rp.my_requests))
+        for i in range(1, 6):
+            rp._retry_uncommitted_halves(queues, _later(i))
+        alice = rp.protocol.peers.all[0]
+        ack = ((stale[0], stale[1], rp.identity.uuid),
+               (None, len(rp.history)), None)
+        rp.handle_grant(queues, Message(CfgIds.reputation,
+                                        ReputationProtocol.grant,
+                                        to_yaml_string(ack), from_whom=alice))
+        rp.note_heard(alice, _later(6))
+        rp._retry_uncommitted_halves(queues, _later(6))
+        assert rp.parked_count() == 0
+
+    def test_a_minority_island_parks_its_half(self):
+        """Of five, only alice is reachable (two of five, counting us), and
+        whoever was heard before the split is stale."""
+        rp, queues, net_q = _cohort()
+        rp.protocol.peers.all = rp.protocol.peers.all + [
+            _make_mock_peer(nickname='carol'), _make_mock_peer(nickname='dave')]
+        alice, bob, carol, dave = rp.protocol.peers.all
+        rp._start_paxos(queues, TransactionScore(uuid4(), 0.9))
+        for peer in (bob, carol, dave):
+            rp.note_heard(peer, _later(5))
+        for i in range(1, 7):
+            rp.note_heard(alice, _later(i))
+            rp._retry_uncommitted_halves(queues, _later(i))
+        assert rp.parked_count() == 1
+
+
+class TestProbeBackpressure:
+    """ISSUES §2.60, part-2314213. Mirrors the probe tests in
+    rep_commit_retry_test.c."""
+
+    @staticmethod
+    def _probe(rp, queues):
+        """A NEW probe half through the local entry point. Admitted?"""
+        before = len(rp.awaiting_commit)
+        rp.forward_transaction(queues, TransactionScore(
+            uuid4(), 0.9, capability_name='at.handshake'))
+        return len(rp.awaiting_commit) == before + 1
+
+    def test_probe_halves_are_capped_app_halves_are_not(self):
+        rp, queues, net_q = _cohort()
+        for _ in range(4):
+            assert self._probe(rp, queues)
+        assert not self._probe(rp, queues)
+        assert len(rp.awaiting_commit) == 4
+        assert rp.admit_new_half(TransactionScore(uuid4(), 0.9,
+                                                  capability_name='agora-post'))
+        assert rp.admit_new_half(TransactionScore(uuid4(), 0.9))
+
+    def test_probes_yield_to_a_pending_app_half(self):
+        """bob's reaction lost 24 rounds in a row to probes in part-2314213."""
+        rp, queues, net_q = _cohort()
+        assert self._probe(rp, queues)
+        task = uuid4()
+        rp._start_paxos(queues, TransactionScore(task, 0.9))  # the app half
+        assert not self._probe(rp, queues)
+        _requests(net_q)
+        assert rp._retry_uncommitted_halves(queues, _later(1)) == 1
+        idx = _grant_all(rp, queues)
+        _accept_all(rp, queues, idx)
+        assert str(task) not in rp.awaiting_commit
+        assert rp._retry_uncommitted_halves(queues, _later(2)) == 1
+        assert self._probe(rp, queues)

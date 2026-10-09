@@ -2374,7 +2374,20 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         # is not rotated here (membership-only; key handover is a deferred
         # design — see idprocess.py:1042 / [[project_group_key_sync]]).
         grp_msg = to_json_string(group.to_canonical())  # to self.handle_group_update()
-        for to_peer in list(self.peers.hierarchy[level].values()):
+        recipients = list(self.peers.hierarchy[level].values())
+        # Name the key the update carries, so the wire can be compared with
+        # what each side's identity and network hold. INFO when the key or
+        # epoch changed since the last update sent, debug otherwise:
+        # membership-only updates resend the same key. Mirrors C
+        # _log_group_update_sent.
+        key = group.encryptor.publish()[:16].decode()
+        sent = (key, group.key_epoch)
+        log = (self.logger.info if sent != getattr(self, '_last_update_sent', None)
+               else self.logger.debug)
+        self._last_update_sent = sent
+        log('Sending group update with key %s… epoch %d (carries_key=%d) to %d member(s)',
+            key, group.key_epoch, int(group.owns_private_key), len(recipients))
+        for to_peer in recipients:
             message = Message(self.name, IdentityProtocol.update, grp_msg, to_whom=to_peer)
             queues[CfgIds.network].put(message, block=True, timeout=self.q_cadence)
             self.logger.debug('Sent group %s to %s (%s)', group.nickname, to_peer.nickname, to_peer.address)
@@ -3819,7 +3832,21 @@ class IdentityProcess(Process, metaclass=ProcMeta,
                         'Rejecting unverified group key rotation from %s', message.from_whom)
                     return True
                 if (theirs.key_epoch > mine.key_epoch or same_epoch_tiebreak) and verified:
-                    if mine.accept_rotation(theirs):
+                    # Why a refusal happened, decided once and logged with
+                    # both keys, so a forked cohort can be told from one that
+                    # settled (three-way boot rotation, rep-2368077). Mirrors
+                    # the C line in handle_group_update.
+                    refusal = ('it carries no key' if not carries_key
+                               else mine.rotation_refusal(theirs))
+                    if refusal is not None:
+                        self.logger.info(
+                            'Rotation from %s not adopted (theirs epoch %d, ours %d, '
+                            'carries_key=%d) — %s; theirs %s…, ours %s…',
+                            getattr(message.from_whom, 'nickname', message.from_whom),
+                            theirs.key_epoch, mine.key_epoch, int(carries_key), refusal,
+                            theirs.encryptor.publish()[:16].decode(),
+                            mine.encryptor.publish()[:16].decode())
+                    elif mine.accept_rotation(theirs):
                         self.logger.info(
                             'Adopted rotated group key, epoch %d%s, key %s…', mine.key_epoch,
                             ' (same-epoch tiebreak)' if same_epoch_tiebreak else '',

@@ -17,6 +17,7 @@
 import random
 import time
 import uuid as uuid_mod
+from typing import Optional
 
 from nacl.exceptions import CryptoError
 from nacl.public import Box
@@ -213,6 +214,37 @@ class Group(InitializableConfig):
                 return True
         return False
 
+    def rotation_refusal(self, other) -> Optional[str]:
+        """Why :meth:`accept_rotation` would refuse ``other``, as a short phrase
+        for a log line, or None when it would adopt it. accept_rotation refuses
+        exactly when this is not None. A lost tiebreak reads "ours stands
+        (...)". Phrases match C group_rotation_refusal."""
+        if other is None:
+            return 'no group to compare'
+        if str(other.uuid) != str(self.uuid):
+            return 'a different group'
+        if other.key_epoch < self.key_epoch:
+            return 'a lower epoch (a replay)'
+        if not other.owns_private_key:
+            return 'it carries no private key'
+        # Never reinstate a key we rotated away from, whatever epoch it claims.
+        if self._key_is_retired(other.encryptor):
+            return 'a key we already retired'
+        if other.key_epoch == self.key_epoch:
+            theirs = bytes(other.encryptor.public)
+            ours = bytes(self.encryptor.public)
+            if theirs == ours:
+                return 'already our key'
+            # A real key always beats NO key at the same epoch. Holding a
+            # public-only view means we cannot read the cohort at all, so there
+            # is nothing to defend by winning a byte comparison, and a tiebreak
+            # that refused here would strand us unable to decrypt anything. (The
+            # caller only reaches an equal-epoch adoption from a VERIFIED
+            # update, so this is not a way to hand a node a chosen key.)
+            if self.owns_private_key and theirs > ours:
+                return 'ours stands (the lower key wins the tiebreak)'
+        return None
+
     def accept_rotation(self, other, now_ts=None) -> bool:
         """Adopt ``other``'s shared key if it supersedes ours.
 
@@ -251,29 +283,9 @@ class Group(InitializableConfig):
 
         Authenticating WHO may rotate is the caller's job (a verified message
         from a member); this only decides whether the key on offer supersedes
-        ours."""
-        if other is None or str(other.uuid) != str(self.uuid):
+        ours. :meth:`rotation_refusal` is the decision itself."""
+        if self.rotation_refusal(other) is not None:
             return False
-        if other.key_epoch < self.key_epoch:
-            return False
-        if not other.owns_private_key:
-            return False
-        # Never reinstate a key we rotated away from, whatever epoch it claims.
-        if self._key_is_retired(other.encryptor):
-            return False
-        if other.key_epoch == self.key_epoch:
-            theirs = bytes(other.encryptor.public)
-            ours = bytes(self.encryptor.public)
-            if theirs == ours:
-                return False    # already the same key -- nothing to adopt
-            # A real key always beats NO key at the same epoch. Holding a
-            # public-only view means we cannot read the cohort at all, so there
-            # is nothing to defend by winning a byte comparison, and a tiebreak
-            # that refused here would strand us unable to decrypt anything. (The
-            # caller only reaches an equal-epoch adoption from a VERIFIED
-            # update, so this is not a way to hand a node a chosen key.)
-            if self.owns_private_key and theirs > ours:
-                return False    # ours wins the tiebreak; they will adopt it
         stamp = time.time() if now_ts is None else float(now_ts)
         prev = getattr(self, '_previous_keys', None)
         if prev is None:
