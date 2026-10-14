@@ -14,8 +14,11 @@
  *   limitations under the License.
  *******************/
 
+#include <ctype.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <math.h>
 #include <time.h>
 #include <pthread.h>
@@ -137,6 +140,9 @@ static double _tier_ceiling(int tier)
  * nack. Either way nothing else would ever look at it again. Mirrors Python
  * COMMIT_TIMEOUT / AT_REP_COMMIT_TIMEOUT_SEC and COMMIT_RETRIES. */
 #define REP_COMMIT_TIMEOUT_DEFAULT 15.0
+/* Entries rep_state.round_granters or round_acceptors may hold before it
+ * starts over. */
+#define REP_ROUND_ACCEPTORS_CAP 4096
 #define REP_COMMIT_TIMEOUT \
     (reputation_env_double("AT_REP_COMMIT_TIMEOUT_SEC", \
                            REP_COMMIT_TIMEOUT_DEFAULT))
@@ -272,8 +278,17 @@ static void _wake_parked(const process_t *proc, const char *source);
  * fixed-form floor + three integers, plus separators. 512 is generous. */
 #define REP_DESIG_MAX 512
 #define REP_SIG_HEX_LEN (crypto_sign_BYTES * 2)
-static bool _chain_json_certified(const process_t *proc, json_t *arr);
+static bool _chain_json_certified(const process_t *proc, json_t *arr,
+                                  const char *key);
+static int *_placement_certified_indices(const process_t *proc, const char *key,
+                                         const char *group, json_t *arr,
+                                         int *n_out, bool *refused);
+static void _apply_ahead(const process_t *proc, const char *key,
+                         const char *group);
 static bool _commit_certs_required(const process_t *proc, const char *group_uuid);
+static bool _ordered_placement(const process_t *proc, const char *group_uuid);
+static json_t *_pool_to_json(const tx_history_t *h);
+static int _pool_from_json(tx_history_t *h, const json_t *doc);
 static bool _commit_cert_ok(const process_t *proc, const uuid_t scorer,
                             const uuid_t task, double score, const char *channel,
                             json_t *sigs, const char *group_uuid);
@@ -287,13 +302,22 @@ static void _record_cosig_locked(map_t *sigs, const char *round_key,
 static json_t *_cosigs_json_locked(map_t *sigs, const char *round_key,
                                    size_t *count_out);
 static void _drop_cosigs_locked(map_t *sigs, const char *round_key);
-static bool _chain_json_commit_certified(const process_t *proc, json_t *arr);
+static bool _chain_json_commit_certified(const process_t *proc, json_t *arr,
+                                         const char *key);
 static void _reappend_attested(const process_t *proc,
                                const tx_reconcile_result_t *res);
 void _forward_attestation(const process_t *proc, const tx_score_msg_t *ts,
                                  const uuid_t self_uuid);
 static int _rescore_peers(const process_t *proc, double present,
                           const uuid_t self_uuid);
+static bool _place_member(const process_t *proc, const char *voter);
+static double _mono(void);
+static bool _place_deciders_ok(const process_t *proc, const char *key, int k,
+                               const char *me, const char *by);
+static json_t *_roster_for_group(const process_t *proc, const char *group_uuid);
+static bool _verify_cosignature_in(const process_t *proc, const json_t *roster,
+                                   const char *voter, const uint8_t *desig,
+                                   size_t dlen, const char *sig_hex);
 
 /* Slash "reason" that lifts (rather than floors) a target: releases the
  * slash floor, restores the score to PREREP_NEUTRAL, and re-admits it.
@@ -322,6 +346,34 @@ static int _rescore_peers(const process_t *proc, double present,
  * hold. A commit already lands on one member's word (§2.16), so this does
  * not lower the chain's effective threshold. */
 #define REP_CATCHUP_QUORUM 1
+
+/* A catch-up reply carries the whole resident window (§2.51), and with commit
+ * and placement certificates an entry runs about 1.4 KB, so a window soon
+ * outgrows one UDP datagram: 57 entries came to 104 KB and the transport cut
+ * every reply to 65,507 bytes, which then failed to decrypt (partition cohort
+ * part-3629127, ISSUES §2.67). A window whose JSON exceeds this many bytes goes
+ * as pages {"page", "of", "head", "chain"[, "group"]}, each well under the
+ * datagram once encrypted and enveloped; the receiver collects every page of
+ * one head from one sender and then handles the window as if it came whole.
+ * Mirrors repprocess.py UPDATE_PAGE_BYTES. */
+#define REP_UPDATE_PAGE_BYTES 24000
+/* More pages than a 200-entry window at the page size ever needs. */
+#define REP_UPDATE_PAGES_MAX 64
+/* Paged replies being collected at once, one per sender and chain; the
+ * oldest is dropped for a new one. */
+#define REP_PAGE_BUFS 8
+
+typedef struct
+{
+    bool used;
+    char sender[UUID_STRING_LEN + 1];
+    char key[UUID_STRING_LEN + 1];
+    char head[TX_HASH_HEX_LEN + 1];
+    int of;
+    int got;
+    uint64_t seq;               /* when it was started, for eviction */
+    json_t *pages[REP_UPDATE_PAGES_MAX];
+} rep_page_buf_t;
 
 char REP_PROTO_REQUEST[]     = "ask permission";
 char REP_PROTO_GRANT[]       = "permission granted";
@@ -357,6 +409,12 @@ char REP_PROTO_CHECKPOINT_SIGN[]    = "checkpoint sign";
 char REP_PROTO_CHECKPOINT_FINAL[]   = "checkpoint final";
 char REP_PROTO_REP_RESOLVE[]        = "resolve reputation";
 char REP_PROTO_REP_RESOLVED[]       = "resolved reputation";
+char REP_PROTO_PLACE_REQUEST[]      = "place request";
+char REP_PROTO_PLACE_GRANT[]        = "place grant";
+char REP_PROTO_PLACE_NACK[]         = "place nack";
+char REP_PROTO_PLACE[]              = "place";
+char REP_PROTO_PLACE_ACCEPTED[]     = "place accepted";
+char REP_PROTO_PLACED[]             = "placed";
 
 /* Local-IPC `function` field for the tier_update message reputation
  * emits to identity. Writable buffer so the assignment to
@@ -486,6 +544,10 @@ static struct {
     map_t handoff_seen;
     map_t handoff_passes;
     map_t updates;         /* uuid_str -> json_t* (pending chain updates) */
+    /* Paged catch-up replies being collected (REP_UPDATE_PAGE_BYTES). */
+    rep_page_buf_t page_bufs[REP_PAGE_BUFS];
+    uint64_t page_seq;
+    size_t update_page_bytes;   /* 0 = REP_UPDATE_PAGE_BYTES */
     array_t requested_reps; /* array of pending reputation responses */
     paxos_instance_t paxos;
     int num_peers;
@@ -517,6 +579,15 @@ static struct {
     char committed_paxos_ring[COMMITTED_ROUNDS_CAP][64];
     int  committed_paxos_ring_head;  /* next slot to overwrite */
     int  committed_paxos_ring_len;   /* up to COMMITTED_ROUNDS_CAP */
+    /* Proposer side: "round:voter" -> "1" for each member that granted, and
+     * for each that accepted, a round of ours, so a member counts once per
+     * round (the commit_sigs shape). Mirrors Python grants / acceptances. */
+    map_t round_granters;
+    map_t round_acceptors;
+    /* Ordered placement: this node's acceptor state per chain (_place_state_
+     * locked). Mirrors Python PlacementMixin._place_state. */
+    struct rep_place_state_s *place;
+    int place_len;
     /* Per-peer latch for the CTFT/pure-reputation dispatch in
      * handle_rep_request. uuid_str -> integer_data(0|1). Combined
      * with COOP_ENTER/COOP_EXIT to give the mode switch hysteresis;
@@ -721,6 +792,7 @@ static bool _rep_frame_is_state(const char *fn)
         REP_PROTO_CHECKPOINT_FINAL, REP_PROTO_SLASH_PROPOSE,
         REP_PROTO_SLASH_SIGN, REP_PROTO_SLASH_FINAL,
         REP_PROTO_ATTEST_PROPOSE, REP_PROTO_ATTEST_SIGN, REP_PROTO_ATTEST_FINAL,
+        REP_PROTO_PLACE, REP_PROTO_PLACE_ACCEPTED, REP_PROTO_PLACED,
         NET_EXCLUDE_FUNC, NET_READMIT_FUNC,
     };
     for (size_t i = 0; i < sizeof(state) / sizeof(state[0]); i++)
@@ -790,6 +862,8 @@ static void _ensure_init(void)
         map_init(&rep_state.attest_pending);
         map_init(&rep_state.attest_sigs);
         map_init(&rep_state.commit_sigs);
+        map_init(&rep_state.round_granters);
+        map_init(&rep_state.round_acceptors);
         rep_state.slash_epoch = 0;
         map_init(&rep_state.slash_hw);
         map_init(&rep_state.excluded);
@@ -989,7 +1063,8 @@ static size_t _members_of_group(const process_t *proc, const char *group_uuid)
     return count;
 }
 
-/* Majority threshold for a round in `group_uuid`. A non-gateway (no child
+/* num_peers / 2, the bar slashing and the co-signature quorum test clear with
+ * `>`; Paxos rounds use _round_quorum_for_group. A non-gateway (no child
  * groups) always uses the historical num_peers/2, so leaf quorum math is
  * unchanged. Mirrors Python _quorum_for_group. */
 static size_t _quorum_for_group(const process_t *proc, const char *group_uuid)
@@ -1014,9 +1089,9 @@ static size_t _quorum_for_group(const process_t *proc, const char *group_uuid)
  * it. So both halves of an even split finalized their own windows, each then
  * refused to rewrite inside its finality at the heal (tx_history_reconcile),
  * and the chains could never converge (Agora Phase 4 DDIL, 2026-09-25). Odd
- * sizes are unchanged. Deliberately NOT applied to Paxos grants or slashing,
- * which keep Python's len(peers) // 2 (_round_quorum_locked). Mirrors
- * Python's _checkpoint_quorum. */
+ * sizes are unchanged. Paxos rounds now take the same majority
+ * (_round_quorum_for_group); slashing keeps num_peers / 2. Mirrors Python's
+ * _checkpoint_quorum. */
 /* The roster a checkpoint's quorum is sized from, this node NOT included: the
  * peers, or a gateway's members of that child group. Caller holds the peers
  * read lock. Mirrors Python _checkpoint_roster. */
@@ -1038,26 +1113,56 @@ static size_t _ckpt_quorum_for_group(const process_t *proc, const char *group_uu
     return (_ckpt_roster_for_group(proc, group_uuid) + 1) / 2;
 }
 
-/* The Paxos threshold for the round filed under `paxos_key`, sized NOW against
- * the round's own group. A grant carries the round at `>=` this many, and an
- * acceptance at `>`, exactly as Python's handle_grant and handle_accepted
- * compare against _quorum_for_group.
+/* Other members a Paxos round needs, grants and acceptances alike. With the
+ * proposer's own vote that is a strict majority of the group: members / 2 of
+ * the others, where members is the roster plus this node. The checkpoint
+ * sizing, compared with `>=` over the others rather than `>` over everyone.
+ * It used to be num_peers / 2 with the proposer left out, which asked one
+ * member MORE than a majority to commit (three of three, four of five) and
+ * one LESS to be granted in an even group (two of four). Caller holds the
+ * peers read lock. Mirrors Python _round_quorum. */
+static size_t _round_quorum_for_group(const process_t *proc, const char *group_uuid)
+{
+    if (proc == NULL)
+        return 0;
+    return (_ckpt_roster_for_group(proc, group_uuid) + 1) / 2;
+}
+
+/* _round_quorum_for_group for the round filed under `paxos_key`, sized NOW
+ * against the round's own group. A grant carries the round at `>=` this many
+ * (our own grant is the other one: paxos_next_ids outranks every ballot we
+ * promised), and acceptances plus our own vote carry it at `>`.
  *
  * Both used to compare against PAXOS_MAJORITY(rep_state.num_peers), a count
- * read once in reputation_run, before discovery had found anybody. In
- * production it was 0 for the life of the process, so one grant and one
- * acceptance carried every round however large the group grew. The acceptance
- * test was already Python's (`>= n/2 + 1` is `> n/2`); only the count was
- * frozen. The grant test was one stricter than Python's. Caller holds
- * rep_state.lock. */
+ * read once in reputation_run, before discovery had found anybody, so in
+ * production one grant and one acceptance carried every round however large
+ * the group grew. Caller holds rep_state.lock. */
 static size_t _round_quorum_locked(const process_t *proc, const char *paxos_key)
 {
     char group[UUID_STRING_LEN + 1];
     _get_round_group_locked(paxos_key, group, sizeof(group));
     peers_read_lock(proc);
-    size_t quorum = _quorum_for_group(proc, group[0] != '\0' ? group : NULL);
+    size_t quorum = _round_quorum_for_group(proc, group[0] != '\0' ? group : NULL);
     peers_read_unlock(proc);
     return quorum;
+}
+
+/* How many distinct voters `sigs` holds for `round_key` ("<round>:<voter>"
+ * keys, _record_cosig_locked's). Caller holds rep_state.lock. */
+static size_t _round_voters_locked(map_t *sigs, const char *round_key)
+{
+    size_t prefix_len = strlen(round_key);
+    size_t count = 0;
+    map_key_t key = NULL;
+    data_t *value = NULL;
+    map_entries_for_each(sigs, key, value)
+    {
+        (void)value;
+        if (strncmp(key, round_key, prefix_len) == 0 && key[prefix_len] == ':')
+            count++;
+    }
+    map_end_for_each;
+    return count;
 }
 
 /* Per-chain finalized-checkpoint state. A gateway checkpoints each of its
@@ -1469,6 +1574,12 @@ static void _publish_tier_change(const process_t *proc,
                  "tries (%s); will republish on the next rescore\n",
                  uuid_str, new_tier,
                  sent == EAGAIN ? "identity queue still full" : "send failed");
+    } else if (prior >= 0) {
+        log_info(proc->logger, "Reputation: tier of %s %d -> %d (score %.3f)\n",
+                 uuid_str, prior, new_tier, score);
+    } else {
+        log_info(proc->logger, "Reputation: tier of %s first set to %d (score %.3f)\n",
+                 uuid_str, new_tier, score);
     }
     net_msg_free_obj(&ipc.info.net_msg);
 
@@ -2098,6 +2209,37 @@ static void _request_chain(const process_t *proc, const public_identity_t *to)
     _rep_send_to_network(proc, &update_req);
 }
 
+/* "update needed" for chain @p key: a bare request for the primary chain,
+ * {"from", "group"} for a gateway's child chain. Mirrors Python
+ * _request_update(key=). */
+static void _request_chain_for(const process_t *proc, const public_identity_t *to,
+                               const char *key)
+{
+    if (key == NULL || key[0] == '\0')
+    {
+        _request_chain(proc, to);
+        return;
+    }
+    generic_msg_t req = {0};
+    req.type = NET_MESSAGE;
+    strncpy(req.info.net_msg.process, "reputation", PROC_NAME_LEN);
+    req.info.net_msg.function = REP_PROTO_OUTDATED;
+    req.info.net_msg.encrypt = true;
+    memcpy(&req.info.net_msg.to_whom, to, sizeof(public_identity_t));
+    strncpy(req.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+    pthread_mutex_lock(&rep_state.lock);
+    int from = _chain_for_key_locked(key)->next_index;
+    pthread_mutex_unlock(&rep_state.lock);
+    json_t *body = json_pack("{s:i, s:s}", "from", from, "group", key);
+    if (body != NULL)
+    {
+        net_msg_pack_json(&req.info.net_msg, body);
+        json_decref(body);
+    }
+    _rep_send_to_network(proc, &req);
+    net_msg_free_obj(&req.info.net_msg);
+}
+
 static void _sync_chain_index(void)
 {
     pthread_mutex_lock(&rep_state.lock);
@@ -2271,6 +2413,126 @@ static bool handle_request(const process_t *proc, directory_t *queues, generic_m
   requires proc->logger == \null || \valid(proc->logger);
   requires rep_state.paxos.initialized == \true;
 */
+/* Send our half to the group to accept: after a majority granted the round
+ * (handle_grant), or at once in a group that places its order
+ * (_forward_transaction). The staged half leaves my_requests, the round is
+ * bound to our primary group, and in a placing group the proposal names that
+ * group, which is what lets an acceptor take it without a grant
+ * (handle_transaction). Mirrors Python _propose_half. */
+static void _propose_half(const process_t *proc, int64_t id1, int64_t id2,
+                          const char *peer_uuid_str, double tx_score)
+{
+    char round_key[PAXOS_KEY_LEN];
+    paxos_id_index(round_key, sizeof(round_key), id1, id2);
+    pthread_mutex_lock(&rep_state.lock);
+    data_t *tx_dat = NULL;
+    tx_score_t *tx = NULL;
+    if (map_get(&rep_state.my_requests, round_key, &tx_dat) == 0)
+        data_object_ptr(tx_dat, (void **)&tx);
+    if (tx == NULL)
+    {
+        /* Already sent: a second grant past the quorum, racing the first. */
+        pthread_mutex_unlock(&rep_state.lock);
+        return;
+    }
+    /* Capture task_uuid + capability_name before potential removal.
+     * The proposer caches its own weight here so reputation_pure (and
+     * its EMA twin) on this side use the same weight as the
+     * receivers, who will cache via handle_transaction below. */
+    char task_uuid_str[UUID_STRING_LEN + 1] = {0};
+    char cap_name_local[CAP_NAMELEN + 1] = {0};
+    char channel_local[TX_CHANNEL_NAMELEN + 1] = {0};
+    uuid_unparse_lower(tx->task_uuid, task_uuid_str);
+    _drop_cosigs_locked(&rep_state.round_granters, round_key);
+    strncpy(cap_name_local, tx->capability_name, CAP_NAMELEN);
+    cap_name_local[CAP_NAMELEN] = '\0';
+    /* Same copy-before-removal reason as cap_name: `tx` can be freed by
+     * the map_remove below, and the channel is needed for the broadcast. */
+    strncpy(channel_local, tx->channel, TX_CHANNEL_NAMELEN);
+    channel_local[TX_CHANNEL_NAMELEN] = '\0';
+    /* Same copy-before-removal reason again: the staged competence
+     * multiplier has to outlive `tx` so this re-record reproduces the
+     * weight the round started with (R+D.md §12.5). */
+    double competence_local = tx->competence;
+    if (task_uuid_str[0] != '\0')
+    {
+        /* Our own round, so the channel counts (R+D.md §12.8). */
+        _record_task_weight_locked(task_uuid_str,
+                                   _resolve_tx_weight_local(cap_name_local,
+                                                            channel_local,
+                                                            competence_local));
+        /* ...and it has to survive to handle_accepted, which writes this
+         * entry to our history and broadcasts it: the channel is part of
+         * the committed fact now, and `tx` is freed by the map_remove
+         * below. */
+        _record_task_channel_locked(task_uuid_str, channel_local);
+    }
+
+    map_remove(&rep_state.my_requests, round_key);
+    /* Bind the round to OUR primary group, the C twin of Python's
+     * _start_paxos(round_group). The tag then travels on the commit
+     * broadcast, and each receiver maps it through its own view: a sibling
+     * member sees its primary group, while a GATEWAY sees one of its child
+     * groups and routes the entry to that subtree's chain (doc/architecture/gateway-reputation-tree.md). */
+    char own_group[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(proc->protocol.group.uuid, own_group);
+    _set_round_group_locked(round_key, own_group);
+    pthread_mutex_unlock(&rep_state.lock);
+
+    /* Broadcast REP_PROTO_TX to all peers */
+    json_t *tx_json = json_object();
+    if (tx_json == NULL) {
+        log_error(proc->logger, "Reputation: json_object OOM (tx)\n");
+        return;
+    }
+    json_object_set_new(tx_json, "id1", json_integer(id1));
+    json_object_set_new(tx_json, "id2", json_integer(id2));
+    json_object_set_new(tx_json, "peer_uuid", json_string(peer_uuid_str));
+    json_object_set_new(tx_json, "score", json_real(tx_score));
+    if (task_uuid_str[0] != '\0')
+        json_object_set_new(tx_json, "task_uuid", json_string(task_uuid_str));
+    if (cap_name_local[0] != '\0')
+        json_object_set_new(tx_json, "capability_name",
+                            json_string(cap_name_local));
+    /* Emitted only when set, matching capability_name's convention: an
+     * absent key is how a receiver reads "task outcome" without this side
+     * having to assert a channel it was never told (R+D.md §12.8). The
+     * Python twin serializes the normalized value unconditionally; both
+     * spellings of absence land on TX_CHANNEL_TASK_OUTCOME. */
+    if (channel_local[0] != '\0')
+        json_object_set_new(tx_json, "channel",
+                            json_string(channel_local));
+    /* A group that requires commit certificates asks each acceptor to
+     * sign what it accepts. Omitted otherwise, so every other proposal is
+     * the payload it always was. The round is bound to our primary group
+     * (just above), so that group's declaration is the one that counts. */
+    if (_commit_certs_required(proc, NULL))
+    {
+        json_object_set_new(tx_json, "certify", json_true());
+        if (_ordered_placement(proc, NULL))
+            json_object_set_new(tx_json, "group", json_string(own_group));
+    }
+
+    log_debug(proc->logger, "Reputation: Submit transaction score\n");
+
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++)
+    {
+        generic_msg_t tx_msg = {0};
+        tx_msg.type = NET_MESSAGE;
+        strncpy(tx_msg.info.net_msg.process, "reputation", PROC_NAME_LEN);
+        tx_msg.info.net_msg.function = REP_PROTO_TX;
+        tx_msg.info.net_msg.encrypt = true;
+        memcpy(&tx_msg.info.net_msg.to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
+        strncpy(tx_msg.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+        net_msg_pack_json(&tx_msg.info.net_msg, tx_json);
+        _rep_send_to_network(proc, &tx_msg);
+        net_msg_free_obj(&tx_msg.info.net_msg);
+    }
+    peers_read_unlock(proc);
+    json_decref(tx_json);
+}
+
 static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg_t *msg)
 {
     net_msg_t *nmsg = &msg->info.net_msg;
@@ -2298,6 +2560,15 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
     int64_t id1 = json_integer_value(j_id1);
     int64_t id2 = json_integer_value(j_id2);
     const char *peer_uuid_str = json_string_value(j_peer_uuid);
+    if (!nmsg->verified)
+    {
+        json_decref(payload);
+        log_warn(proc->logger, "Reputation: rejecting unverified Paxos grant from %s\n",
+                 nmsg->from_whom.nickname);
+        return true;
+    }
+    char granter[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, granter);
 
     pthread_mutex_lock(&rep_state.lock);
 
@@ -2325,113 +2596,21 @@ static bool handle_grant(const process_t *proc, directory_t *queues, generic_msg
     data_object_ptr(tx_dat, (void **)&tx);
     double tx_score = (tx != NULL) ? tx->score : 0.0;
 
-    int count = paxos_record_grant(&rep_state.paxos, id1, id2, tx_score);
-    bool send_tx = (count >= 0
-                    && (size_t)count >= _round_quorum_locked(proc, round_key));
-
-    /* Capture task_uuid + capability_name before potential removal.
-     * The proposer caches its own weight here so reputation_pure (and
-     * its EMA twin) on this side use the same weight as the
-     * receivers, who will cache via handle_transaction below. */
-    char task_uuid_str[UUID_STRING_LEN + 1] = {0};
-    char cap_name_local[CAP_NAMELEN + 1] = {0};
-    char channel_local[TX_CHANNEL_NAMELEN + 1] = {0};
-    if (send_tx && tx != NULL)
+    /* Files the round's score on its first grant. One grant per member per
+     * round: a repeated grant is not a second vote. */
+    (void)paxos_record_grant(&rep_state.paxos, id1, id2, tx_score);
+    if (map_size(&rep_state.round_granters) >= REP_ROUND_ACCEPTORS_CAP)
     {
-        uuid_unparse_lower(tx->task_uuid, task_uuid_str);
-        strncpy(cap_name_local, tx->capability_name, CAP_NAMELEN);
-        cap_name_local[CAP_NAMELEN] = '\0';
-        /* Same copy-before-removal reason as cap_name: `tx` can be freed by
-         * the map_remove below, and the channel is needed for the broadcast. */
-        strncpy(channel_local, tx->channel, TX_CHANNEL_NAMELEN);
-        channel_local[TX_CHANNEL_NAMELEN] = '\0';
-        /* Same copy-before-removal reason again: the staged competence
-         * multiplier has to outlive `tx` so this re-record reproduces the
-         * weight the round started with (R+D.md §12.5). */
-        double competence_local = tx->competence;
-        if (task_uuid_str[0] != '\0')
-        {
-            /* Our own round, so the channel counts (R+D.md §12.8). */
-            _record_task_weight_locked(task_uuid_str,
-                                       _resolve_tx_weight_local(cap_name_local,
-                                                                channel_local,
-                                                                competence_local));
-            /* ...and it has to survive to handle_accepted, which writes this
-             * entry to our history and broadcasts it: the channel is part of
-             * the committed fact now, and `tx` is freed by the map_remove
-             * below. */
-            _record_task_channel_locked(task_uuid_str, channel_local);
-        }
+        map_free(&rep_state.round_granters);
+        map_init(&rep_state.round_granters);
     }
-
-    if (send_tx)
-    {
-        /* Remove from my_requests */
-        map_remove(&rep_state.my_requests, round_key);
-        /* Bind the round to OUR primary group, the C twin of Python's
-         * _start_paxos(round_group). The tag then travels on the commit
-         * broadcast, and each receiver maps it through its own view: a sibling
-         * member sees its primary group, while a GATEWAY sees one of its child
-         * groups and routes the entry to that subtree's chain (doc/architecture/gateway-reputation-tree.md). */
-        char own_group[UUID_STRING_LEN + 1];
-        uuid_unparse_lower(proc->protocol.group.uuid, own_group);
-        _set_round_group_locked(round_key, own_group);
-    }
+    _record_cosig_locked(&rep_state.round_granters, round_key, granter, "1");
+    size_t count = _round_voters_locked(&rep_state.round_granters, round_key);
+    bool send_tx = count >= _round_quorum_locked(proc, round_key);
 
     pthread_mutex_unlock(&rep_state.lock);
-
     if (send_tx)
-    {
-        /* Broadcast REP_PROTO_TX to all peers */
-        json_t *tx_json = json_object();
-        if (tx_json == NULL) {
-            log_error(proc->logger, "Reputation: json_object OOM (tx)\n");
-            json_decref(payload);
-            return true;
-        }
-        json_object_set_new(tx_json, "id1", json_integer(id1));
-        json_object_set_new(tx_json, "id2", json_integer(id2));
-        json_object_set_new(tx_json, "peer_uuid", json_string(peer_uuid_str));
-        json_object_set_new(tx_json, "score", json_real(tx_score));
-        if (task_uuid_str[0] != '\0')
-            json_object_set_new(tx_json, "task_uuid", json_string(task_uuid_str));
-        if (cap_name_local[0] != '\0')
-            json_object_set_new(tx_json, "capability_name",
-                                json_string(cap_name_local));
-        /* Emitted only when set, matching capability_name's convention: an
-         * absent key is how a receiver reads "task outcome" without this side
-         * having to assert a channel it was never told (R+D.md §12.8). The
-         * Python twin serializes the normalized value unconditionally; both
-         * spellings of absence land on TX_CHANNEL_TASK_OUTCOME. */
-        if (channel_local[0] != '\0')
-            json_object_set_new(tx_json, "channel",
-                                json_string(channel_local));
-        /* A group that requires commit certificates asks each acceptor to
-         * sign what it accepts. Omitted otherwise, so every other proposal is
-         * the payload it always was. The round is bound to our primary group
-         * (just above), so that group's declaration is the one that counts. */
-        if (_commit_certs_required(proc, NULL))
-            json_object_set_new(tx_json, "certify", json_true());
-
-        log_debug(proc->logger, "Reputation: Submit transaction score\n");
-
-        peers_read_lock(proc);
-        for (size_t i = 0; i < proc->protocol.num_peers; i++)
-        {
-            generic_msg_t tx_msg = {0};
-            tx_msg.type = NET_MESSAGE;
-            strncpy(tx_msg.info.net_msg.process, "reputation", PROC_NAME_LEN);
-            tx_msg.info.net_msg.function = REP_PROTO_TX;
-            tx_msg.info.net_msg.encrypt = true;
-            memcpy(&tx_msg.info.net_msg.to_whom, &proc->protocol.peers[i], sizeof(public_identity_t));
-            strncpy(tx_msg.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
-            net_msg_pack_json(&tx_msg.info.net_msg, tx_json);
-            _rep_send_to_network(proc, &tx_msg);
-            net_msg_free_obj(&tx_msg.info.net_msg);
-        }
-        peers_read_unlock(proc);
-        json_decref(tx_json);
-    }
+        _propose_half(proc, id1, id2, peer_uuid_str, tx_score);
 
     json_decref(payload);
     return true;
@@ -2625,7 +2804,7 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
      * with no private key (or an attacker who can deliver bytes to
      * net_proc) can drive consensus by submitting unsigned
      * transactions and have us grant them. Note we drop after
-     * logging but before paxos_has_granted_id, so we don't even
+     * logging but before paxos_take_grant, so we don't even
      * leak which proposal indices we've granted. */
     if (!nmsg->verified)
     {
@@ -2721,10 +2900,25 @@ static bool handle_transaction(const process_t *proc, directory_t *queues, gener
     log_debug(proc->logger, "Reputation: transaction score %.2f via %s\n",
               score, channel_str);
 
-    if (!paxos_has_granted_id(&rep_state.paxos, (int)id2))
+    /* Only under the exact ballot we granted, and only while we have
+     * promised no higher one since -- unless the proposal names a group that
+     * places its order and asks to be certified: such a half was never
+     * granted, and needs no grant, because placement decides where it goes.
+     * Mirrors Python handle_transaction. */
+    const char *placing_group = json_is_true(json_object_get(payload, "certify"))
+        ? json_string_value(json_object_get(payload, "group")) : NULL;
+    if (placing_group != NULL)
+    {
+        char key[UUID_STRING_LEN + 1];
+        _chain_key(proc, placing_group, key, sizeof(key));
+        if (!_ordered_placement(proc, key[0] != '\0' ? placing_group : NULL))
+            placing_group = NULL;
+    }
+    if (placing_group == NULL && !paxos_take_grant(&rep_state.paxos, id1, id2))
     {
         json_decref(payload);
-        log_debug(proc->logger, "Reputation: Transaction not granted by us, dropping\n");
+        log_debug(proc->logger, "Reputation: Transaction not granted by us, or "
+                  "outranked since; dropping\n");
         return true;
     }
 
@@ -2880,13 +3074,17 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
     }
     pthread_mutex_unlock(&rep_state.paxos.lock);
 
-    int acc_count = paxos_record_acceptance(&rep_state.paxos, id1, id2);
     pthread_mutex_lock(&rep_state.lock);
     size_t acc_quorum = _round_quorum_locked(proc, paxos_key);
     char acc_group[UUID_STRING_LEN + 1];
     _get_round_group_locked(paxos_key, acc_group, sizeof(acc_group));
     pthread_mutex_unlock(&rep_state.lock);
-    bool commit = (acc_count >= 0 && (size_t)acc_count > acc_quorum);
+    char acc_voter[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, acc_voter);
+    char self_str[UUID_STRING_LEN + 1] = {0};
+    uuid_t self_uuid;
+    if (_resolve_self_uuid(proc, self_uuid))
+        uuid_unparse_lower(self_uuid, self_str);
 
     /* A group that requires commit certificates counts only SIGNED
      * acceptances, and the round carries once their signatures clear the bar
@@ -2917,7 +3115,11 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
             dlen = commit_designation(scorer, task, score, chan, desig,
                                       sizeof(desig));
         }
-        if (dlen == 0 || !_verify_cosignature(proc, voter, desig, dlen, sig))
+        json_t *in_force = _roster_for_group(proc, acc_group[0] != '\0' ? acc_group : NULL);
+        bool counted = dlen > 0
+            && _verify_cosignature_in(proc, in_force, voter, desig, dlen, sig);
+        json_decref(in_force);
+        if (!counted)
         {
             log_warn(proc->logger, "Reputation: acceptance from %s carries no "
                      "valid commit signature; not counted\n",
@@ -2930,12 +3132,46 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
         json_t *pending = _cosigs_json_locked(&rep_state.commit_sigs,
                                               acc_task_str, NULL);
         pthread_mutex_unlock(&rep_state.lock);
-        commit = _commit_cert_ok(proc, scorer, task, score, chan, pending,
-                                 acc_group[0] != '\0' ? acc_group : NULL);
-        if (commit)
+        if (_commit_cert_ok(proc, scorer, task, score, chan, pending,
+                            acc_group[0] != '\0' ? acc_group : NULL))
             certificate = pending;
         else
             json_decref(pending);
+    }
+
+    /* One vote per member per round, ours included: sending the transaction
+     * was our own acceptance. Rounds that never commit are not otherwise forgotten, so
+     * past REP_ROUND_ACCEPTORS_CAP entries the map starts over: a round in
+     * flight then loses its votes and is re-proposed by the commit sweep.
+     * Mirrors Python handle_accepted. */
+    pthread_mutex_lock(&rep_state.lock);
+    if (map_size(&rep_state.round_acceptors) >= REP_ROUND_ACCEPTORS_CAP)
+    {
+        map_free(&rep_state.round_acceptors);
+        map_init(&rep_state.round_acceptors);
+    }
+    _record_cosig_locked(&rep_state.round_acceptors, paxos_key, acc_voter, "1");
+    size_t own = (self_str[0] != '\0' && peer_uuid_str != NULL
+                  && strcmp(peer_uuid_str, self_str) == 0) ? 1 : 0;
+    size_t votes = _round_voters_locked(&rep_state.round_acceptors, paxos_key)
+        + own;
+    pthread_mutex_unlock(&rep_state.lock);
+    bool commit = votes > acc_quorum;
+    if (_commit_certs_required(proc, acc_group[0] != '\0' ? acc_group : NULL)
+        && certificate == NULL)
+        commit = false;
+    else if (certificate != NULL)
+    {
+        /* Sized by the logged roster, which the certificate meets. */
+        json_t *in_force = _roster_for_group(proc, acc_group[0] != '\0' ? acc_group : NULL);
+        if (in_force != NULL)
+            commit = true;
+        json_decref(in_force);
+    }
+    if (!commit && certificate != NULL)
+    {
+        json_decref(certificate);
+        certificate = NULL;
     }
 
     if (commit)
@@ -2956,6 +3192,9 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
         }
         data_t *mark = integer_data(1);
         map_set(&rep_state.committed_paxos_rounds, paxos_key, mark);
+        pthread_mutex_lock(&rep_state.lock);
+        _drop_cosigs_locked(&rep_state.round_acceptors, paxos_key);
+        pthread_mutex_unlock(&rep_state.lock);
         /* FIFO ring: if we're at cap, the head slot already holds the
          * oldest key — drop it from the map before overwriting the
          * slot. ring_len caps at COMMITTED_ROUNDS_CAP; once steady
@@ -3023,7 +3262,22 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
         }
         bool was_bilateral = false, now_bilateral = false;
         int entry_index = -1;
-        if (have_task_uuid)
+        bool placing = _ordered_placement(proc, round_group);
+        if (have_task_uuid && placing)
+        {
+            /* A group that places its order: the half waits in the pool until
+             * a placement writes its entry (doc/architecture/reputation.md,
+             * "Agreeing on an order"). Mirrors Python _record_committed_half. */
+            char *text = certificate != NULL
+                ? json_dumps(certificate, JSON_COMPACT | JSON_SORT_KEYS) : NULL;
+            pthread_mutex_lock(&rep_state.lock);
+            (void)tx_history_record_half(chain, task_uuid, peer_uuid, score,
+                                         commit_channel, text);
+            _drop_cosigs_locked(&rep_state.commit_sigs, task_uuid_str);
+            pthread_mutex_unlock(&rep_state.lock);
+            free(text);
+        }
+        else if (have_task_uuid)
         {
             was_bilateral = _is_bilateral_locked(chain, task_uuid, NULL);
             tx_history_update(chain, task_uuid, peer_uuid, score,
@@ -3133,7 +3387,8 @@ static bool handle_accepted(const process_t *proc, directory_t *queues, generic_
     }
     else
     {
-        log_debug(proc->logger, "Reputation: Tx accepted (%d so far)\n", acc_count);
+        log_debug(proc->logger, "Reputation: Tx accepted (%zu of more than %zu so far)\n",
+                  votes, acc_quorum);
     }
 
     json_decref(certificate);
@@ -3278,7 +3533,15 @@ static bool handle_committed(const process_t *proc, directory_t *queues, generic
     tx_history_t *chain = _chain_for_group_locked(proc, group_str);
     bool was_bilateral = false, now_bilateral = false;
     int entry_index = -1;
-    if (task_uuid_str && uuid_parse(task_uuid_str, task_uuid) == 0)
+    bool have_task = task_uuid_str && uuid_parse(task_uuid_str, task_uuid) == 0;
+    if (have_task && _ordered_placement(proc, group_str))
+    {
+        /* To the pool, to wait for its placement. Mirrors Python
+         * _record_committed_half. */
+        (void)tx_history_record_half(chain, task_uuid, peer_uuid, score,
+                                     chan_borrowed, cert_text);
+    }
+    else if (have_task)
     {
         was_bilateral = _is_bilateral_locked(chain, task_uuid, NULL);
         tx_history_update(chain, task_uuid, peer_uuid, score, chan_borrowed);
@@ -3306,6 +3569,290 @@ static bool handle_committed(const process_t *proc, directory_t *queues, generic
     return true;
 }
 
+/* Reconcile chain @p key with a peer's verified segment @p arr and act on
+ * the result. In a group that places its order the segment's placement
+ * certificates decide (tx_history_reconcile_placed). @p finality applies our
+ * finalized checkpoint (primary chain, quorum-of-one path). Mirrors Python
+ * _reconcile_into. Caller holds no lock. */
+static void _reconcile_into(const process_t *proc, const char *key, json_t *arr,
+                            const char *who, bool finality)
+{
+    const char *group = key[0] != '\0' ? key : NULL;
+    bool placing = _ordered_placement(proc, group);
+    static const int none[1] = { 0 };
+    int *cert = NULL;
+    int n_cert = 0;
+    if (placing)
+    {
+        bool refused = false;
+        cert = _placement_certified_indices(proc, key, group, arr, &n_cert, &refused);
+        if (refused)
+        {
+            log_warn(proc->logger, "Reputation: rejecting chain from %s: a "
+                     "placement certificate does not meet our quorum\n", who);
+            free(cert);
+            return;
+        }
+    }
+    bool primary = key[0] == '\0';
+    pthread_mutex_lock(&rep_state.lock);
+    tx_history_t *hist = _chain_for_key_locked(key);
+    int before = tx_history_len(hist);
+    /* Never rewrite inside our finalized checkpoint (user decision, ISSUES.md
+     * §2.15). Outvoted: a chain reproducing the quorum's checkpoint wins even
+     * an equal-length tiebreak (§2.15, mod-2538837). */
+    int final_end = finality ? _final_end_locked() : -1;
+    tx_attested_t att;
+    bool outvoted = finality && _outvoted_locked(&att);
+    /* Peers named before and after: an adoption can drop entries as well as
+     * add them, and both move scores. */
+    size_t n_before = 0, n_after = 0;
+    uuid_t *peers_before = primary ? _chain_peers_locked(&n_before) : NULL;
+    tx_reconcile_result_t res = { TX_RECONCILE_NONE, -1, 0, 0, NULL, 0 };
+    tx_history_reconcile_placed(hist, arr, final_end, outvoted ? &att : NULL,
+                                placing ? (cert != NULL ? cert : none) : NULL,
+                                n_cert, &res);
+    int after = tx_history_len(hist);
+    uuid_t *peers_after = primary ? _chain_peers_locked(&n_after) : NULL;
+    pthread_mutex_unlock(&rep_state.lock);
+    free(cert);
+
+    if (res.status == TX_RECONCILE_ADOPTED)
+        log_info(proc->logger,
+                 "Reputation: adopted chain from %s at index %d: dropped "
+                 "%d, added %d (ours %d -> theirs %d)\n",
+                 who, res.fork, res.dropped, res.added, before, after);
+    else if (res.status == TX_RECONCILE_EXTENDED)
+        log_info(proc->logger, "Reputation: caught up from %s: chain %d -> %d\n",
+                 who, before, after);
+    else if (res.status == TX_RECONCILE_REFUSED_FINAL)
+        log_warn(proc->logger,
+                 "Reputation: chain from %s forks at index %d, inside our "
+                 "finalized checkpoint (ends %d); keeping ours\n",
+                 who, res.fork, final_end);
+    else if (res.status == TX_RECONCILE_EQUIVOCATION)
+        log_error(proc->logger,
+                  "Reputation: chain from %s holds a certified placement at "
+                  "index %d that differs from ours: two quorums signed two "
+                  "values there; keeping ours\n", who, res.fork);
+    else
+        log_debug(proc->logger, "Reputation: chain update from %s: status %d\n",
+                  who, (int)res.status);
+
+    bool grew = res.status == TX_RECONCILE_ADOPTED
+             || res.status == TX_RECONCILE_EXTENDED;
+    if (grew)
+    {
+        for (size_t k = 0; k < n_before; k++)
+            _note_interaction(peers_before[k]);
+        for (size_t k = 0; k < n_after; k++)
+            _note_interaction(peers_after[k]);
+    }
+    free(peers_before);
+    free(peers_after);
+    /* Placements buffered ahead of the chain may now follow it. */
+    if (placing && grew)
+        _apply_ahead(proc, key, group);
+    /* After the unlock: a re-proposal starts a Paxos round, which takes the
+     * lock itself. Under placement the reconcile already returned what it
+     * dropped to the pool. */
+    if (res.status == TX_RECONCILE_ADOPTED)
+    {
+        if (placing)
+        {
+            if (res.pooled > 0)
+                log_info(proc->logger, "Reputation: returned %d dropped entr%s "
+                         "to the pool\n", res.pooled, res.pooled == 1 ? "y" : "ies");
+        }
+        else if (primary)
+        {
+            _repropose_dropped(proc, &res);
+            _reappend_attested(proc, &res);
+        }
+    }
+    /* A chain that grew from a peer means a quorum may be back: the minority
+     * side of a heal arrives here EXTENDED (§2.60). */
+    if (primary && grew)
+        _wake_parked(proc, who);
+    tx_reconcile_result_free(&res);
+}
+
+/* Free a paged reply being collected and mark its slot unused. */
+static void _page_buf_clear(rep_page_buf_t *buf)
+{
+    for (int i = 0; i < REP_UPDATE_PAGES_MAX; i++)
+    {
+        if (buf->pages[i] != NULL)
+            json_decref(buf->pages[i]);
+    }
+    memset(buf, 0, sizeof(*buf));
+}
+
+/* Send @p era (a JSON array of entries, the whole window of chain @p key) to
+ * @p to as pages whose entries each serialize to at most @p budget bytes,
+ * every page naming @p head so the receiver puts together one window, not
+ * pieces of two. A single entry larger than the budget gets a page alone. */
+static void _send_update_pages(const process_t *proc, const public_identity_t *to,
+                               const char *key, const char *head,
+                               json_t *era, size_t budget)
+{
+    size_t n = json_array_size(era);
+    int starts[REP_UPDATE_PAGES_MAX + 1];
+    int pages = 0;
+    size_t used = 0;
+    for (size_t i = 0; i < n; i++)
+    {
+        char *text = json_dumps(json_array_get(era, i), JSON_COMPACT);
+        size_t len = text != NULL ? strlen(text) + 1 : 0;
+        free(text);
+        if (pages == 0 || (used > 0 && used + len > budget))
+        {
+            if (pages == REP_UPDATE_PAGES_MAX)
+            {
+                log_error(proc->logger,
+                          "Reputation: chain of %zu entries needs more than %d "
+                          "pages; not sent\n", n, REP_UPDATE_PAGES_MAX);
+                return;
+            }
+            starts[pages++] = (int)i;
+            used = 0;
+        }
+        used += len;
+    }
+    starts[pages] = (int)n;
+    log_info(proc->logger, "Reputation: sending our chain to %s in %d pages "
+             "(%zu entries)\n", to->nickname, pages, n);
+    for (int p = 0; p < pages; p++)
+    {
+        json_t *chunk = json_array();
+        for (int i = starts[p]; i < starts[p + 1]; i++)
+            json_array_append(chunk, json_array_get(era, (size_t)i));
+        json_t *page = json_pack("{s:i, s:i, s:s, s:o}", "page", p, "of", pages,
+                                 "head", head, "chain", chunk);
+        if (page != NULL && key[0] != '\0')
+            json_object_set_new(page, "group", json_string(key));
+        generic_msg_t update = {0};
+        update.type = NET_MESSAGE;
+        strncpy(update.info.net_msg.process, "reputation", PROC_NAME_LEN);
+        update.info.net_msg.function = REP_PROTO_UPDATE;
+        update.info.net_msg.encrypt = true;
+        memcpy(&update.info.net_msg.to_whom, to, sizeof(public_identity_t));
+        strncpy(update.info.net_msg.return_to, "reputation", PROC_NAME_LEN);
+        if (page != NULL)
+        {
+            net_msg_pack_json(&update.info.net_msg, page);
+            json_decref(page);
+        }
+        _rep_send_to_network(proc, &update);
+        net_msg_free_obj(&update.info.net_msg);
+    }
+}
+
+/* A `latest update` that is one page of a window (_send_update_pages): keep
+ * it, and once every page of that head from that sender is in, replace
+ * @p *payload with the window as an unpaged reply carries it (an array, or
+ * {"group", "chain"} for a child chain) and return true. Returns true with
+ * @p *payload untouched for an unpaged reply, false while pages are missing
+ * or when the page is malformed (consumed either way). */
+static bool _assemble_update_pages(const process_t *proc, const net_msg_t *nmsg,
+                                   json_t **payload)
+{
+    json_t *obj = *payload;
+    if (!json_is_object(obj) || json_object_get(obj, "page") == NULL)
+        return true;
+    json_t *jp = json_object_get(obj, "page");
+    json_t *jof = json_object_get(obj, "of");
+    const char *head = json_string_value(json_object_get(obj, "head"));
+    const char *group = json_string_value(json_object_get(obj, "group"));
+    json_t *chunk = json_object_get(obj, "chain");
+    int page = json_is_integer(jp) ? (int)json_integer_value(jp) : -1;
+    int of = json_is_integer(jof) ? (int)json_integer_value(jof) : 0;
+    if (head == NULL || !json_is_array(chunk) || of < 1
+        || of > REP_UPDATE_PAGES_MAX || page < 0 || page >= of)
+    {
+        log_warn(proc->logger, "Reputation: malformed chain page from %s; "
+                 "dropped\n", nmsg->from_whom.nickname);
+        json_decref(obj);
+        *payload = NULL;
+        return false;
+    }
+    char sender[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, sender);
+    const char *key = group != NULL ? group : "";
+
+    pthread_mutex_lock(&rep_state.lock);
+    rep_page_buf_t *buf = NULL, *free_slot = NULL, *oldest = NULL;
+    for (int i = 0; i < REP_PAGE_BUFS; i++)
+    {
+        rep_page_buf_t *b = &rep_state.page_bufs[i];
+        if (!b->used)
+        {
+            if (free_slot == NULL)
+                free_slot = b;
+            continue;
+        }
+        if (strcmp(b->sender, sender) == 0 && strcmp(b->key, key) == 0)
+            buf = b;
+        if (oldest == NULL || b->seq < oldest->seq)
+            oldest = b;
+    }
+    /* A new head or page count means the sender's window moved on: start
+     * over with this one. */
+    if (buf != NULL && (strcmp(buf->head, head) != 0 || buf->of != of))
+        _page_buf_clear(buf);
+    if (buf == NULL || !buf->used)
+    {
+        if (buf == NULL)
+            buf = free_slot != NULL ? free_slot : oldest;
+        _page_buf_clear(buf);
+        buf->used = true;
+        at_strlcpy(buf->sender, sender, sizeof(buf->sender));
+        at_strlcpy(buf->key, key, sizeof(buf->key));
+        at_strlcpy(buf->head, head, sizeof(buf->head));
+        buf->of = of;
+        buf->seq = ++rep_state.page_seq;
+    }
+    if (buf->pages[page] == NULL)
+    {
+        buf->pages[page] = json_incref(chunk);
+        buf->got++;
+    }
+    int got = buf->got;
+    json_t *whole = NULL;
+    if (got == of)
+    {
+        whole = json_array();
+        for (int p = 0; p < of; p++)
+            json_array_extend(whole, buf->pages[p]);
+        _page_buf_clear(buf);
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+
+    if (whole == NULL)
+    {
+        log_debug(proc->logger, "Reputation: chain page %d of %d from %s; "
+                  "%d in\n", page + 1, of, nmsg->from_whom.nickname, got);
+        json_decref(obj);
+        *payload = NULL;
+        return false;
+    }
+    log_info(proc->logger, "Reputation: all %d pages of %s's chain are in "
+             "(%zu entries)\n", of, nmsg->from_whom.nickname,
+             json_array_size(whole));
+    if (group != NULL)
+    {
+        json_t *wrapped = json_pack("{s:s, s:o}", "group", group, "chain", whole);
+        json_decref(obj);
+        *payload = wrapped;
+    }
+    else
+    {
+        json_decref(obj);
+        *payload = whole;
+    }
+    return *payload != NULL;
+}
+
 /****************************
  * Handler: handle_outdated (update needed)
  * Send chain slice to requesting peer.
@@ -3324,13 +3871,52 @@ static bool handle_outdated(const process_t *proc, directory_t *queues, generic_
     net_msg_t *nmsg = &msg->info.net_msg;
     log_info(proc->logger, "Reputation: update requested by %s\n", nmsg->from_whom.nickname);
 
+    /* A bare request (or a length) is for the primary chain; an object names
+     * the chain's group, so a gateway's child chain can be caught up too. */
+    char key[UUID_STRING_LEN + 1] = {0};
+    json_t *req = NULL;
+    if (net_msg_unpack_json(nmsg, &req) == 0 && json_is_object(req))
+    {
+        const char *group = json_string_value(json_object_get(req, "group"));
+        if (group != NULL && group[0] != '\0')
+        {
+            _chain_key(proc, group, key, sizeof(key));
+            if (key[0] == '\0')
+            {
+                json_decref(req);
+                return true;            /* not a chain we keep */
+            }
+        }
+    }
+    json_decref(req);
+
     pthread_mutex_lock(&rep_state.lock);
 
     json_t *era_json = NULL;
-    int chain_len = tx_history_len(&rep_state.history);
-    tx_history_era_to_json(&rep_state.history, 0, chain_len, &era_json);
+    tx_history_t *hist = _chain_for_key_locked(key);
+    int chain_len = tx_history_len(hist);
+    tx_history_era_to_json(hist, 0, chain_len, &era_json);
 
+    char head[TX_HASH_HEX_LEN + 1];
+    at_strlcpy(head, hist->head_hash, sizeof(head));
+    size_t budget = rep_state.update_page_bytes > 0 ? rep_state.update_page_bytes
+                                                    : REP_UPDATE_PAGE_BYTES;
     pthread_mutex_unlock(&rep_state.lock);
+
+    char *whole = era_json != NULL ? json_dumps(era_json, JSON_COMPACT) : NULL;
+    bool paged = whole != NULL && strlen(whole) > budget;
+    free(whole);
+    if (paged)
+    {
+        _send_update_pages(proc, &nmsg->from_whom, key, head, era_json, budget);
+        json_decref(era_json);
+        return true;
+    }
+    if (key[0] != '\0' && era_json != NULL)
+    {
+        json_t *wrapped = json_pack("{s:s, s:o}", "group", key, "chain", era_json);
+        era_json = wrapped;
+    }
 
     /* Send update with the era JSON packed into the message */
     generic_msg_t update = {0};
@@ -3376,14 +3962,33 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
         log_error(proc->logger, "Reputation: handle_update: failed to unpack JSON\n");
         return false;
     }
+    /* A paged window waits here until every page is in. */
+    if (!_assemble_update_pages(proc, nmsg, &chain_json))
+        return true;
 
-    /* An attested entry must carry a certificate that meets OUR quorum, or
-     * catch-up would be a way around the round (doc/architecture/reputation.md). */
-    if (!_chain_json_certified(proc, chain_json))
+    /* A child chain's update: always applied directly, as the quorum of one
+     * is (the vote below is the primary chain's). */
+    if (json_is_object(chain_json))
+    {
+        const char *group = json_string_value(json_object_get(chain_json, "group"));
+        json_t *arr = json_object_get(chain_json, "chain");
+        char key[UUID_STRING_LEN + 1] = {0};
+        if (group != NULL)
+            _chain_key(proc, group, key, sizeof(key));
+        if (key[0] != '\0' && json_is_array(arr)
+            && _chain_json_certified(proc, arr, key))
+            _reconcile_into(proc, key, arr, nmsg->from_whom.nickname, false);
+        json_decref(chain_json);
+        return true;
+    }
+
+    /* Every certificate the segment carries must meet OUR quorum, or catch-up
+     * would be a way around the round (doc/architecture/reputation.md). */
+    if (!_chain_json_certified(proc, chain_json, ""))
     {
         log_warn(proc->logger,
-                 "Reputation: rejecting chain from %s: an attested entry carries "
-                 "no certificate meeting our quorum\n", nmsg->from_whom.nickname);
+                 "Reputation: rejecting chain from %s: a certificate does not "
+                 "meet the roster in force\n", nmsg->from_whom.nickname);
         json_decref(chain_json);
         return true;
     }
@@ -3399,72 +4004,10 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
      * the current one in the majority path below. */
     if (rep_state.num_updates <= 1)
     {
-        int before = tx_history_len(&rep_state.history);
-        /* Never rewrite inside our finalized checkpoint (user decision,
-         * ISSUES.md §2.15). */
-        int final_end = _final_end_locked();
-        /* Outvoted: a chain reproducing the quorum's checkpoint wins even an
-         * equal-length tiebreak (ISSUES.md §2.15, mod-2538837). */
-        tx_attested_t att;
-        bool outvoted = _outvoted_locked(&att);
-        /* Peers named before and after: an adoption can drop entries as well
-         * as add them, and both move scores. */
-        size_t n_before = 0;
-        uuid_t *peers_before = _chain_peers_locked(&n_before);
-        tx_reconcile_result_t res = { TX_RECONCILE_NONE, -1, 0, 0, NULL };
-        if (json_is_array(chain_json))
-            tx_history_reconcile_attested(&rep_state.history, chain_json,
-                                          final_end, outvoted ? &att : NULL,
-                                          &res);
-        int after = tx_history_len(&rep_state.history);
-        size_t n_after = 0;
-        uuid_t *peers_after = _chain_peers_locked(&n_after);
         pthread_mutex_unlock(&rep_state.lock);
+        if (json_is_array(chain_json))
+            _reconcile_into(proc, "", chain_json, nmsg->from_whom.nickname, true);
         json_decref(chain_json);
-
-        if (res.status == TX_RECONCILE_ADOPTED)
-            log_info(proc->logger,
-                     "Reputation: adopted chain from %s at index %d: dropped "
-                     "%d, added %d (ours %d -> theirs %d)\n",
-                     nmsg->from_whom.nickname, res.fork, res.dropped,
-                     res.added, before, after);
-        else if (res.status == TX_RECONCILE_EXTENDED)
-            log_info(proc->logger,
-                     "Reputation: caught up from %s: chain %d -> %d\n",
-                     nmsg->from_whom.nickname, before, after);
-        else if (res.status == TX_RECONCILE_REFUSED_FINAL)
-            log_warn(proc->logger,
-                     "Reputation: chain from %s forks at index %d, inside our "
-                     "finalized checkpoint (ends %d); keeping ours\n",
-                     nmsg->from_whom.nickname, res.fork, final_end);
-        else
-            log_debug(proc->logger,
-                      "Reputation: chain update from %s: status %d\n",
-                      nmsg->from_whom.nickname, (int)res.status);
-
-        if (res.status == TX_RECONCILE_ADOPTED
-            || res.status == TX_RECONCILE_EXTENDED)
-        {
-            for (size_t k = 0; k < n_before; k++)
-                _note_interaction(peers_before[k]);
-            for (size_t k = 0; k < n_after; k++)
-                _note_interaction(peers_after[k]);
-        }
-        free(peers_before);
-        free(peers_after);
-        /* After the unlock: a re-proposal starts a Paxos round, which takes
-         * the lock itself. */
-        if (res.status == TX_RECONCILE_ADOPTED)
-        {
-            _repropose_dropped(proc, &res);
-            _reappend_attested(proc, &res);
-        }
-        /* A chain that grew from a peer means a quorum may be back: the
-         * minority side of a heal arrives here EXTENDED (§2.60). */
-        if (res.status == TX_RECONCILE_ADOPTED
-            || res.status == TX_RECONCILE_EXTENDED)
-            _wake_parked(proc, nmsg->from_whom.nickname);
-        tx_reconcile_result_free(&res);
         return true;
     }
 
@@ -3473,7 +4016,7 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
     map_set(&rep_state.updates, sender_uuid, chain_dat);
 
     size_t up_count = map_size(&rep_state.updates);
-    tx_reconcile_result_t maj_res = { TX_RECONCILE_NONE, -1, 0, 0, NULL };
+    json_t *majority = NULL;
 
     if (up_count >= (size_t)rep_state.num_updates)
     {
@@ -3525,8 +4068,7 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
 
             if (best_json != NULL && best_count > (int)(up_count / 2))
             {
-                tx_history_reconcile(&rep_state.history, best_json, -1,
-                                     &maj_res);
+                majority = json_incref(best_json);
                 log_debug(proc->logger, "Reputation: Updated\n");
             }
             else
@@ -3550,18 +4092,11 @@ static bool handle_update(const process_t *proc, directory_t *queues, generic_ms
     }
 
     pthread_mutex_unlock(&rep_state.lock);
-    if (maj_res.status == TX_RECONCILE_ADOPTED)
+    if (majority != NULL)
     {
-        log_info(proc->logger,
-                 "Reputation: adopted the majority chain at index %d: dropped "
-                 "%d, added %d\n", maj_res.fork, maj_res.dropped, maj_res.added);
-        _repropose_dropped(proc, &maj_res);
-        _reappend_attested(proc, &maj_res);
+        _reconcile_into(proc, "", majority, "the majority chain", false);
+        json_decref(majority);
     }
-    if (maj_res.status == TX_RECONCILE_ADOPTED
-        || maj_res.status == TX_RECONCILE_EXTENDED)
-        _wake_parked(proc, "the majority chain");
-    tx_reconcile_result_free(&maj_res);
     return true;
 }
 
@@ -4254,11 +4789,22 @@ static bool _half_in_chain_locked(const tx_history_t *chain,
         || (t->p2_set && uuid_compare(t->p2_uuid, proposer) == 0);
 }
 
+/* Is @p proposer's half of @p task_uuid waiting in @p chain's pool? */
+static bool _half_in_pool_locked(const tx_history_t *chain,
+                                 const uuid_t task_uuid, const uuid_t proposer)
+{
+    const transaction_t *t = tx_history_pooled(chain, task_uuid);
+    return t != NULL
+        && ((t->p1_set && uuid_compare(t->p1_uuid, proposer) == 0)
+            || (t->p2_set && uuid_compare(t->p2_uuid, proposer) == 0));
+}
+
 /* The primary chain, or any child chain a gateway keeps. */
 static bool _own_half_recorded_locked(const uuid_t task_uuid,
                                       const uuid_t proposer)
 {
-    if (_half_in_chain_locked(&rep_state.history, task_uuid, proposer))
+    if (_half_in_chain_locked(&rep_state.history, task_uuid, proposer)
+        || _half_in_pool_locked(&rep_state.history, task_uuid, proposer))
         return true;
     bool found = false;
     map_key_t ck = NULL;
@@ -4267,8 +4813,10 @@ static bool _own_half_recorded_locked(const uuid_t task_uuid,
     {
         void *hp = NULL;
         if (!found && data_object_ptr(cv, &hp) == 0 && hp != NULL
-            && _half_in_chain_locked((const tx_history_t *)hp, task_uuid,
-                                     proposer))
+            && (_half_in_chain_locked((const tx_history_t *)hp, task_uuid,
+                                      proposer)
+                || _half_in_pool_locked((const tx_history_t *)hp, task_uuid,
+                                        proposer)))
             found = true;
     }
     map_end_for_each;
@@ -4542,6 +5090,18 @@ void _forward_transaction(const process_t *proc, const uuid_t task_uuid,
     /* Get identity UUID for the request */
     char identity_uuid[UUID_STRING_LEN + 1];
     uuid_unparse_lower(peer_uuid, identity_uuid);
+
+    /* In a group that places its order (doc/architecture/reputation.md,
+     * "Agreeing on an order") the half needs no round of its own: its place
+     * in the chain is decided by placement, so it goes straight to the
+     * co-signing phase. The score is filed as a first grant would file it, so
+     * handle_accepted finds it. Mirrors Python _start_paxos. */
+    if (_ordered_placement(proc, NULL))
+    {
+        paxos_record_grant(&rep_state.paxos, id1, id2, score);
+        _propose_half(proc, id1, id2, identity_uuid, score);
+        return;
+    }
 
     /* The head this round extends (fork probe, ISSUES §2.51). */
     char our_head[TX_HASH_HEX_LEN + 1];
@@ -4905,6 +5465,110 @@ static size_t _verified_cosigners(const process_t *proc, json_t *sigs,
     return count;
 }
 
+/* ---- The logged roster (doc/architecture/reputation.md, "Who is in the
+ * group") -----------------------------------------------------------------
+ *
+ * Once a placing chain holds a roster entry, the members of the roster in
+ * force for an instance decide it, and their signatures are verified with the
+ * keys the roster records -- not with the live peer list, which a join can
+ * change between a decision and its learning (partition cohort
+ * part-3546034). Mirrors the `roster` arguments of Python
+ * _verify_cosignature / _verified_cosigners. */
+
+/* The roster in force for instance @p k of chain @p key, as its canonical
+ * member list [[uuid, key], ...] (a new reference), or NULL while the chain
+ * holds none. Caller holds rep_state.lock. */
+static json_t *_roster_at_locked(const char *key, int k)
+{
+    transaction_t r;
+    tx_history_t *chain = _chain_for_key_locked(key);
+    if (tx_history_roster_at(chain, k, &r) != 0)
+        return NULL;
+    const char *text = tx_history_roster_members(chain, r.roster_digest);
+    return text != NULL ? json_loads(text, 0, NULL) : NULL;
+}
+
+static json_t *_roster_at(const char *key, int k)
+{
+    pthread_mutex_lock(&rep_state.lock);
+    json_t *r = _roster_at_locked(key, k);
+    pthread_mutex_unlock(&rep_state.lock);
+    return r;
+}
+
+/* The roster in force for the next instance of the chain @p group_uuid places
+ * its order on, or NULL (a group that does not place, or no roster yet: the
+ * live view decides). Mirrors Python _roster_for_group. */
+static json_t *_roster_for_group(const process_t *proc, const char *group_uuid)
+{
+    if (!_ordered_placement(proc, group_uuid))
+        return NULL;
+    char key[UUID_STRING_LEN + 1];
+    _chain_key(proc, group_uuid, key, sizeof(key));
+    pthread_mutex_lock(&rep_state.lock);
+    json_t *r = _roster_at_locked(key, _chain_for_key_locked(key)->next_index);
+    pthread_mutex_unlock(&rep_state.lock);
+    return r;
+}
+
+/* @p uuid's signing key (hex) in @p roster, or NULL when it is no member. */
+static const char *_roster_key_of(const json_t *roster, const char *uuid)
+{
+    size_t i;
+    json_t *m;
+    json_array_foreach((json_t *)roster, i, m)
+    {
+        const char *u = json_string_value(json_array_get(m, 0));
+        if (u != NULL && uuid != NULL && strcasecmp(u, uuid) == 0)
+            return json_string_value(json_array_get(m, 1));
+    }
+    return NULL;
+}
+
+/* A strict majority of @p roster, as a count of signatures. */
+static size_t _roster_majority(const json_t *roster)
+{
+    return json_array_size(roster) / 2 + 1;
+}
+
+/* _verify_cosignature against @p roster's keys and members, or against the
+ * live view when @p roster is NULL. */
+static bool _verify_cosignature_in(const process_t *proc, const json_t *roster,
+                                   const char *voter, const uint8_t *desig,
+                                   size_t dlen, const char *sig_hex)
+{
+    if (roster == NULL)
+        return _verify_cosignature(proc, voter, desig, dlen, sig_hex);
+    const char *kh = _roster_key_of(roster, voter);
+    if (kh == NULL || sig_hex == NULL || desig == NULL || dlen == 0
+        || strnlen(sig_hex, REP_SIG_HEX_LEN + 2) != REP_SIG_HEX_LEN
+        || strlen(kh) != 2 * crypto_sign_PUBLICKEYBYTES)
+        return false;
+    unsigned char pk[crypto_sign_PUBLICKEYBYTES], sig[crypto_sign_BYTES];
+    if (unhexlify((const unsigned char *)kh, 2 * crypto_sign_PUBLICKEYBYTES, pk) != 0
+        || unhexlify((const unsigned char *)sig_hex, REP_SIG_HEX_LEN, sig) != 0)
+        return false;
+    return crypto_sign_verify_detached(sig, desig, dlen, pk) == 0;
+}
+
+/* _verified_cosigners against @p roster (NULL: the live view). */
+static size_t _verified_cosigners_in(const process_t *proc, const json_t *roster,
+                                     json_t *sigs, const uint8_t *desig, size_t dlen)
+{
+    if (sigs == NULL || !json_is_object(sigs))
+        return 0;
+    size_t count = 0;
+    const char *voter = NULL;
+    json_t *val = NULL;
+    json_object_foreach(sigs, voter, val)
+    {
+        if (_verify_cosignature_in(proc, roster, voter, desig, dlen,
+                                   json_string_value(val)))
+            count++;
+    }
+    return count;
+}
+
 /* Receiver-side quorum test: more than floor(N/2) distinct voters must have
  * signed the exact bytes we re-derive. Sized against OUR OWN roster
  * (proc->protocol.num_peers, the mirror of Python's len(peers.all)), so the
@@ -5129,12 +5793,27 @@ static bool _commit_certs_required(const process_t *proc, const char *group_uuid
     if (proc == NULL)
         return false;
     const group_t *child = _child_group_locked(proc, group_uuid);
-    return child != NULL ? child->commit_certificates
-                         : proc->protocol.group.commit_certificates;
+    const group_t *grp = child != NULL ? child : &proc->protocol.group;
+    /* Ordered placement requires them: a placed entry carries its halves'
+     * certificates, and that is all an acceptor has to judge them by. */
+    return grp->commit_certificates || grp->ordered_placement;
 }
 
-/* Do `sigs` certify `scorer`'s half? More than _quorum_for_group distinct
- * members of OUR view must have signed its commit_designation, and the
+/* Does the group a chain belongs to declare ordered placement? Read off the
+ * group, so every member gives the same answer. Mirrors Python
+ * PlacementMixin._ordered_placement. */
+static bool _ordered_placement(const process_t *proc, const char *group_uuid)
+{
+    if (proc == NULL)
+        return false;
+    const group_t *child = _child_group_locked(proc, group_uuid);
+    return child != NULL ? child->ordered_placement
+                         : proc->protocol.group.ordered_placement;
+}
+
+/* Do `sigs` certify `scorer`'s half? At least _round_quorum_for_group
+ * distinct members of OUR view (with the scorer, a majority) must have signed
+ * its commit_designation, and the
  * scorer's own signature never counts: a proposer cannot vouch for its own
  * round. Caller must NOT hold the peers lock. */
 static bool _commit_cert_ok(const process_t *proc, const uuid_t scorer,
@@ -5150,20 +5829,31 @@ static bool _commit_cert_ok(const process_t *proc, const uuid_t scorer,
         return false;
     char scorer_str[UUID_STRING_LEN + 1];
     uuid_unparse_lower(scorer, scorer_str);
+    /* In a group that places its order, the roster in force decides
+     * (doc/architecture/reputation.md, "Who is in the group"). */
+    json_t *roster = _roster_for_group(proc, group_uuid);
     size_t count = 0;
     const char *voter = NULL;
     json_t *val = NULL;
     json_object_foreach(sigs, voter, val)
     {
-        if (strcmp(voter, scorer_str) == 0)
+        if (strcasecmp(voter, scorer_str) == 0)
             continue;
-        if (_verify_cosignature(proc, voter, desig, dlen, json_string_value(val)))
+        if (_verify_cosignature_in(proc, roster, voter, desig, dlen,
+                                   json_string_value(val)))
             count++;
     }
-    peers_read_lock(proc);
-    size_t quorum = _quorum_for_group(proc, group_uuid);
-    peers_read_unlock(proc);
-    return count > quorum;
+    size_t quorum;
+    if (roster != NULL)
+        quorum = json_array_size(roster) / 2;   /* the scorer the remaining vote */
+    else
+    {
+        peers_read_lock(proc);
+        quorum = _round_quorum_for_group(proc, group_uuid);
+        peers_read_unlock(proc);
+    }
+    json_decref(roster);
+    return count >= quorum;
 }
 
 /* Catch-up's half of commit certificates: in a group that requires them,
@@ -5174,9 +5864,11 @@ static bool _commit_cert_ok(const process_t *proc, const uuid_t scorer,
  * certificates, or by members since gone, stays acceptable once a quorum has
  * checkpointed it. Mirrors Python _commit_certs_ok. Caller must NOT hold
  * rep_state.lock or the peers lock. */
-static bool _chain_json_commit_certified(const process_t *proc, json_t *arr)
+static bool _chain_json_commit_certified(const process_t *proc, json_t *arr,
+                                         const char *key)
 {
-    if (!_commit_certs_required(proc, NULL) || !json_is_array(arr)
+    const char *group = (key != NULL && key[0] != '\0') ? key : NULL;
+    if (!_commit_certs_required(proc, group) || !json_is_array(arr)
         || json_array_size(arr) == 0)
         return true;
     tx_history_t *seg = NULL;
@@ -5194,7 +5886,7 @@ static bool _chain_json_commit_certified(const process_t *proc, json_t *arr)
 
     int cov_first = -1, cov_end = -1;
     pthread_mutex_lock(&rep_state.lock);
-    if (rep_state.final_set && rep_state.final_count > 0)
+    if (group == NULL && rep_state.final_set && rep_state.final_count > 0)
     {
         char root[TX_HASH_HEX_LEN + 1];
         if (tx_history_range_root(seg, rep_state.final_first,
@@ -5218,7 +5910,8 @@ static bool _chain_json_commit_certified(const process_t *proc, json_t *arr)
         /* Held at the same index, hashing the same: nothing new to prove. */
         transaction_t held;
         pthread_mutex_lock(&rep_state.lock);
-        bool same = tx_history_by_task(&rep_state.history, t->task_uuid, &held) == 0
+        bool same = tx_history_by_task(_chain_for_key_locked(key), t->task_uuid,
+                                       &held) == 0
             && held.index == t->index;
         if (same)
         {
@@ -5238,7 +5931,7 @@ static bool _chain_json_commit_certified(const process_t *proc, json_t *arr)
             const char *text = tx_history_commit_cert(seg, t->task_uuid, *scorers[k]);
             json_t *sigs = text != NULL ? json_loads(text, 0, NULL) : NULL;
             ok = _commit_cert_ok(proc, *scorers[k], t->task_uuid, scores[k],
-                                 chans[k], sigs, NULL);
+                                 chans[k], sigs, group);
             json_decref(sigs);
             if (!ok)
             {
@@ -5542,6 +6235,9 @@ static bool _attest_quorum_met(const process_t *proc, const rep_attest_t *a,
     size_t dlen = _attest_designation(a, desig, sizeof(desig));
     if (dlen == 0)
         return false;
+    /* In a group that places its order, the roster in force decides
+     * (doc/architecture/reputation.md, "Who is in the group"). */
+    json_t *roster = _roster_for_group(proc, a->group[0] != '\0' ? a->group : NULL);
     size_t count = 0;
     bool verifier_signed = false;
     const char *voter = NULL;
@@ -5551,19 +6247,43 @@ static bool _attest_quorum_met(const process_t *proc, const rep_attest_t *a,
         /* Neither the subject nor its teammates witness for it (§2.54). */
         if (strcmp(voter, a->subject) == 0 || _conflicted(voter, a->subject))
             continue;
-        if (!_verify_cosignature(proc, voter, desig, dlen, json_string_value(val)))
+        if (!_verify_cosignature_in(proc, roster, voter, desig, dlen,
+                                    json_string_value(val)))
             continue;
         count++;
         if (strcmp(voter, a->verifier) == 0)
             verifier_signed = true;
     }
     if (!verifier_signed)
+    {
+        json_decref(roster);
         return false;
+    }
+    size_t members, mates, others;
+    if (roster != NULL)
+    {
+        members = json_array_size(roster);
+        mates = 0;
+        size_t ri;
+        json_t *rm;
+        json_array_foreach(roster, ri, rm)
+        {
+            const char *u = json_string_value(json_array_get(rm, 0));
+            if (u != NULL && strcmp(u, a->subject) != 0 && _conflicted(u, a->subject))
+                mates++;
+        }
+        others = members - (_roster_key_of(roster, a->subject) != NULL ? 1 : 0);
+        json_decref(roster);
+        others = others > mates ? others - mates : 0;
+        if (mates > 0 && count < 2)
+            return false;
+        return count > others / 2;
+    }
     peers_read_lock(proc);
-    size_t members = proc->protocol.num_peers + 1;
+    members = proc->protocol.num_peers + 1;
     peers_read_unlock(proc);
-    size_t mates = _conflicted_members(proc, a->subject, NULL);
-    size_t others = members - (_is_member(proc, a->subject) ? 1 : 0);
+    mates = _conflicted_members(proc, a->subject, NULL);
+    others = members - (_is_member(proc, a->subject) ? 1 : 0);
     others = others > mates ? others - mates : 0;
     if (mates > 0 && count < 2)
         return false;   /* the outsiders left must be at least two */
@@ -5707,12 +6427,19 @@ static bool _commit_attestation(const process_t *proc, const rep_attest_t *a,
     at_strlcpy(tx.attest_scope, a->scope, sizeof(tx.attest_scope));
     tx.index = -1;
     char *cert = json_dumps(sigs, JSON_COMPACT | JSON_SORT_KEYS);
+    bool placing = _ordered_placement(proc, a->group[0] != '\0' ? a->group : NULL);
     pthread_mutex_lock(&rep_state.lock);
-    int rc = tx_history_append_attested(_chain_for_key_locked(a->group), &tx, cert);
+    /* A group that places its order: the entry waits in the pool for its
+     * placement. Mirrors Python _commit_attestation. */
+    int rc = placing
+        ? tx_history_pool_attested(_chain_for_key_locked(a->group), &tx, cert)
+        : tx_history_append_attested(_chain_for_key_locked(a->group), &tx, cert);
     pthread_mutex_unlock(&rep_state.lock);
     free(cert);
     if (rc != 0)
         return false;
+    if (placing)
+        return true;
     _note_interaction(tx.subject_uuid);
     /* Due for a checkpoint soon, so the entry is archived (_archive_attested)
      * before a busy chain can evict it. Mirrors Python ATTEST_CHECKPOINT_SEC. */
@@ -6187,7 +6914,48 @@ static bool _attest_already_held(const char *task, const rep_attest_t *a)
  * entry we already hold certified is not re-judged against today's roster
  * (_attest_already_held). Caller must NOT hold rep_state.lock or the peers
  * lock. */
-static bool _chain_json_certified(const process_t *proc, json_t *arr)
+static bool _chain_json_certified_all(const process_t *proc, json_t *arr,
+                                      const char *key);
+
+/* In a group that places its order, an entry a verified placement covers is
+ * not re-judged: its acceptors checked each half's and each attestation's
+ * certificate against the roster in force when they accepted it (the user's
+ * call, 2026-10-14). A segment whose placement certificate does not verify is
+ * refused whole. Mirrors Python _chain_certified. */
+static bool _chain_json_certified(const process_t *proc, json_t *arr,
+                                  const char *key)
+{
+    const char *group = (key != NULL && key[0] != '\0') ? key : NULL;
+    if (!json_is_array(arr) || !_ordered_placement(proc, group))
+        return _chain_json_certified_all(proc, arr, key);
+    int n = 0;
+    bool refused = false;
+    int *covered = _placement_certified_indices(proc, key, group, arr, &n, &refused);
+    if (refused)
+    {
+        free(covered);
+        return false;
+    }
+    json_t *rest = json_array();
+    size_t i;
+    json_t *e;
+    json_array_foreach(arr, i, e)
+    {
+        json_t *ji = json_object_get(e, "index");
+        bool in = false;
+        for (int c = 0; json_is_integer(ji) && c < n && !in; c++)
+            in = covered[c] == (int)json_integer_value(ji);
+        if (!in)
+            json_array_append(rest, e);
+    }
+    free(covered);
+    bool ok = _chain_json_certified_all(proc, rest, key);
+    json_decref(rest);
+    return ok;
+}
+
+static bool _chain_json_certified_all(const process_t *proc, json_t *arr,
+                                      const char *key)
 {
     if (!json_is_array(arr))
         return true;
@@ -6215,12 +6983,13 @@ static bool _chain_json_certified(const process_t *proc, json_t *arr)
         a.score = json_number_value(json_object_get(e, "p1_score"));
         if (!_attest_well_formed(&a))
             return false;
-        if (_attest_already_held(json_string_value(json_object_get(e, "task")), &a))
+        if (key[0] == '\0'
+            && _attest_already_held(json_string_value(json_object_get(e, "task")), &a))
             continue;
         if (!_attest_quorum_met(proc, &a, json_object_get(e, "attest_sigs")))
             return false;
     }
-    return _chain_json_commit_certified(proc, arr);
+    return _chain_json_commit_certified(proc, arr, key);
 }
 
 /* An adopted chain that dropped a certified attested entry: re-append it. It
@@ -9291,9 +10060,18 @@ static bool _rebuild_one_chain(const process_t *proc, const char *chain_key,
              * attests it, so this node resumes with a window a peer can audit
              * and an anchor slash evidence can be measured against. */
             tx_history_t *dest = _chain_for_key_locked(chain_key);
+            /* A child chain is restored late, so its pool may already hold
+             * halves (or what reputation-pool restored); they wait on this
+             * chain now. */
+            json_t *pool = dest->pool_len > 0 ? _pool_to_json(dest) : NULL;
+            unsigned rev = dest->pool_rev;
             tx_history_free(dest);
             *dest = *loaded;
             memset(loaded, 0, sizeof(*loaded));  /* ownership moved */
+            dest->pool_rev = rev + 1;
+            if (pool != NULL)
+                (void)_pool_from_json(dest, pool);
+            json_decref(pool);
             rep_chain_ckpt_t *slot = _ckpt_slot_locked(chain_key);
             if (slot != NULL)
             {
@@ -10135,6 +10913,22 @@ size_t _hand_off_pending_halves(const process_t *proc, double present,
                                                       self_uuid);
             h->cert = (cert != NULL) ? strdup(cert) : NULL;
         }
+        /* In a group that places its order, an unpaired half waits in the
+         * pool rather than in the chain: hand those off too. */
+        for (int s = 0; s < chain->pool_len
+                        && n_halves < REP_HANDOFF_MAX_HALVES; s++)
+        {
+            const transaction_t *t = &chain->pool[s];
+            if (!t->p1_set || t->p2_set || t->attested
+                || uuid_compare(t->p1_uuid, self_uuid) != 0)
+                continue;
+            rep_handoff_half_t *h = &halves[n_halves++];
+            uuid_copy(h->task, t->task_uuid);
+            h->score = t->p1_score;
+            at_strlcpy(h->channel, t->p1_channel, sizeof(h->channel));
+            const char *cert = tx_history_pool_cert(chain, t->task_uuid, self_uuid);
+            h->cert = (cert != NULL) ? strdup(cert) : NULL;
+        }
     }
     pthread_mutex_unlock(&rep_state.lock);
 
@@ -10267,6 +11061,2610 @@ static void _maybe_checkpoint(const process_t *proc, double present,
         _originate_checkpoint(proc, self_uuid_str, due_keys[i]);
 }
 
+/****************************
+ * Ordered placement (doc/architecture/reputation.md, "Agreeing on an order")
+ *
+ * Classic Paxos decides the chain's order. Instance k decides what the chain
+ * holds from index k: a batch of ready items (completed bilateral tasks and
+ * attested entries). An acceptor promises and accepts per chain; a grant
+ * reports the value it last accepted at k, and a proposer holding a majority
+ * of grants must carry the highest-ballot one of those rather than its own. A
+ * decided placement is broadcast with a quorum certificate over
+ * place_designation, and every member writes it at k exactly as given. Only a
+ * group that declares ordered_placement runs any of this.
+ *
+ * This is the acceptor's and learner's half. Payloads are JSON objects, one
+ * shape in both runtimes. Mirrors Python reputation/placement.py.
+ ****************************/
+
+#define REP_PLACEMENT_FILE "reputation-placement"
+/* The pending pool, one file per chain: committed halves and certified
+ * attestations not yet placed. Without it a restart of every holder would
+ * lose them (their rounds are over; nobody proposes them again). */
+#define REP_POOL_FILE "reputation-pool"
+#define REP_POOL_SCHEMA 1
+#define REP_PLACED_AHEAD_MAX 16
+
+/* One chain's acceptor state: the highest ballot promised, and the value last
+ * accepted at each open instance ("k" -> JSON text {"ballot", "value"}), plus
+ * decided placements held ahead of the chain ("k" -> JSON text {"value",
+ * "sigs"}). */
+typedef struct rep_place_state_s {
+    char    key[UUID_STRING_LEN + 1];
+    bool    broken;
+    bool    have_promised;
+    int64_t prom_n;
+    char    prom_by[UUID_STRING_LEN + 1];
+    map_t   accepted;
+    map_t   ahead;
+    /* The proposer's side (_maybe_place): our open round, if any. */
+    bool    round_open;
+    int     round_k;
+    int64_t round_n;
+    char    round_head[TX_HASH_HEX_LEN + 1];
+    json_t *round_grants;    /* voter -> accepted {ballot, value} or null */
+    json_t *round_value;     /* the value we sent, once we sent it */
+    char    round_digest[TX_HASH_HEX_LEN + 1];
+    json_t *round_accepts;   /* voter -> signature */
+    double  round_started;
+    /* The pending pool's file: restored once, and the pool_rev last written
+     * (pool_saved says whether there was a write). */
+    bool     pool_restored;
+    bool     pool_saved;
+    unsigned pool_saved_rev;
+    /* When ready items appeared at ready_k, when we last heard anyone work on
+     * heard_k, who placed the previous instance, and our backoff. */
+    int     ready_k;
+    double  ready_since;
+    int     heard_k;
+    double  heard_at;
+    char    placer[UUID_STRING_LEN + 1];
+    double  backoff_until;
+    /* The instance we may place at without asking, under the ballot a
+     * majority promised us at the one before (the leader's skip). */
+    bool    lead_set;
+    int     lead_k;
+    int64_t lead_n;
+} rep_place_state_t;
+
+/* A ballot: (n, proposer uuid), compared lexicographically, so two proposers
+ * minting the same n are still ordered. */
+static int _ballot_cmp(int64_t n1, const char *by1, int64_t n2, const char *by2)
+{
+    if (n1 != n2)
+        return n1 < n2 ? -1 : 1;
+    return strcmp(by1, by2);
+}
+
+static bool _parse_ballot(const json_t *obj, int64_t *n,
+                          char by[UUID_STRING_LEN + 1])
+{
+    json_t *jn = json_object_get(obj, "n");
+    const char *jb = json_string_value(json_object_get(obj, "by"));
+    if (!json_is_integer(jn) || jb == NULL || strlen(jb) != UUID_STRING_LEN)
+        return false;
+    *n = json_integer_value(jn);
+    for (size_t i = 0; i <= UUID_STRING_LEN; i++)
+        by[i] = (char)tolower((unsigned char)jb[i]);
+    return true;
+}
+
+static json_t *_ballot_json(int64_t n, const char *by)
+{
+    return json_pack("{s:I, s:s}", "n", (json_int_t)n, "by", by);
+}
+
+/* Test seam: where placement state lives instead of the config directory. */
+static char g_placement_dir[CFG_PATH_LEN + 1];
+
+static int _place_file_path(const char *base, const char *key, char *out,
+                            size_t cap)
+{
+    char cfg_dir[CFG_PATH_LEN + 1] = {0};
+    if (g_placement_dir[0] != '\0')
+        at_strlcpy(cfg_dir, g_placement_dir, sizeof(cfg_dir));
+    else if (get_cfg_dir(cfg_dir, sizeof(cfg_dir)) < 0)
+        return -1;
+    int n = snprintf(out, cap, "%s/%s%s%s%s", cfg_dir, base,
+                     key[0] != '\0' ? "-" : "", key, CFG_FILE_EXT);
+    return (n < 0 || (size_t)n >= cap) ? -1 : 0;
+}
+
+static int _placement_path(const char *key, char *out, size_t cap)
+{
+    return _place_file_path(REP_PLACEMENT_FILE, key, out, cap);
+}
+
+static void _load_place_state(const process_t *proc, rep_place_state_t *st)
+{
+    char path[CFG_PATH_LEN + 128] = {0};
+    if (_placement_path(st->key, path, sizeof(path)) != 0)
+        return;
+    FILE *f = fopen(path, "r");
+    if (f == NULL)
+        return;   /* cold start */
+    json_error_t err;
+    json_t *doc = json_loadf(f, 0, &err);
+    fclose(f);
+    json_t *prom = doc != NULL ? json_object_get(doc, "promised") : NULL;
+    json_t *acc = doc != NULL ? json_object_get(doc, "accepted") : NULL;
+    if (doc == NULL || !json_is_object(doc)
+        || (prom != NULL && !json_is_null(prom)
+            && !_parse_ballot(prom, &st->prom_n, st->prom_by))
+        || (acc != NULL && !json_is_object(acc)))
+    {
+        if (proc != NULL)
+            log_error(proc->logger, "Reputation: placement state %s is unreadable; "
+                      "left in place, and this node will promise nothing until it "
+                      "is repaired\n", path);
+        st->broken = true;
+        json_decref(doc);
+        return;
+    }
+    st->have_promised = prom != NULL && !json_is_null(prom);
+    const char *k = NULL;
+    json_t *rec = NULL;
+    json_object_foreach(acc, k, rec)
+    {
+        char *text = json_dumps(rec, JSON_COMPACT);
+        if (text != NULL)
+            map_set(&st->accepted, (map_key_t)k, string_data((string_t)text, strlen(text)));
+        free(text);
+    }
+    json_decref(doc);
+}
+
+/* Write the acceptor state before answering, so a promise or an acceptance
+ * this node sent is one it still holds after a restart. Atomic: written
+ * beside the file and renamed over it. */
+static bool _persist_place_state(const process_t *proc, const rep_place_state_t *st)
+{
+    char path[CFG_PATH_LEN + 128] = {0};
+    char tmp[CFG_PATH_LEN + 136] = {0};
+    if (_placement_path(st->key, path, sizeof(path)) != 0)
+        return false;
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    json_t *doc = json_object();
+    json_object_set_new(doc, "promised", st->have_promised
+                        ? _ballot_json(st->prom_n, st->prom_by) : json_null());
+    json_t *acc = json_object();
+    map_key_t k = NULL;
+    data_t *v = NULL;
+    map_entries_for_each((map_t *)&st->accepted, k, v)
+    {
+        char *text = NULL;
+        if (data_string_ptr(v, &text) == 0 && text != NULL)
+        {
+            json_t *rec = json_loads(text, 0, NULL);
+            if (rec != NULL)
+                json_object_set_new(acc, (const char *)k, rec);
+        }
+    }
+    map_end_for_each
+    json_object_set_new(doc, "accepted", acc);
+    bool ok = json_dump_file(doc, tmp, JSON_COMPACT) == 0 && rename(tmp, path) == 0;
+    json_decref(doc);
+    if (!ok)
+        log_warn(proc->logger, "Reputation: could not persist placement state to %s\n",
+                 path);
+    return ok;
+}
+
+/* This node's acceptor state for chain @p key, restored from disk on first
+ * use. Caller holds rep_state.lock. */
+static rep_place_state_t *_place_state_locked(const process_t *proc, const char *key)
+{
+    for (int i = 0; i < rep_state.place_len; i++)
+        if (strcmp(rep_state.place[i].key, key) == 0)
+            return &rep_state.place[i];
+    rep_place_state_t *grown = realloc(rep_state.place,
+                                       (size_t)(rep_state.place_len + 1) * sizeof(*grown));
+    if (grown == NULL)
+        return NULL;
+    rep_state.place = grown;
+    rep_place_state_t *st = &rep_state.place[rep_state.place_len++];
+    memset(st, 0, sizeof(*st));
+    at_strlcpy(st->key, key, sizeof(st->key));
+    st->ready_k = st->heard_k = -1;
+    map_init(&st->accepted);
+    map_init(&st->ahead);
+    _load_place_state(proc, st);
+    return st;
+}
+
+static void _place_round_close(rep_place_state_t *st)
+{
+    json_decref(st->round_grants);
+    json_decref(st->round_value);
+    json_decref(st->round_accepts);
+    st->round_grants = st->round_value = st->round_accepts = NULL;
+    st->round_open = false;
+}
+
+static void _place_states_free(void)
+{
+    for (int i = 0; i < rep_state.place_len; i++)
+    {
+        map_free(&rep_state.place[i].accepted);
+        map_free(&rep_state.place[i].ahead);
+        _place_round_close(&rep_state.place[i]);
+    }
+    free(rep_state.place);
+    rep_state.place = NULL;
+    rep_state.place_len = 0;
+}
+
+/* Drop the instances below @p next from a "k" -> text map. */
+static void _place_prune_below(map_t *m, int next)
+{
+    array_t *keys = map_keys(m);
+    for (size_t i = 0; keys != NULL && i < array_size(keys); i++)
+    {
+        data_t *kd = NULL;
+        char *kstr = NULL;
+        if (array_get(keys, (int)i, &kd) == 0 && data_string_ptr(kd, &kstr) == 0
+            && kstr != NULL && atoi(kstr) < next)
+            map_remove(m, (map_key_t)kstr);
+    }
+}
+
+static const char *_place_text(map_t *m, int k)
+{
+    char key[24];
+    snprintf(key, sizeof(key), "%d", k);
+    data_t *d = NULL;
+    char *text = NULL;
+    if (map_get(m, (map_key_t)key, &d) != 0 || d == NULL
+        || data_string_ptr(d, &text) != 0)
+        return NULL;
+    return text;
+}
+
+static void _place_set_text(map_t *m, int k, const char *text)
+{
+    char key[24];
+    snprintf(key, sizeof(key), "%d", k);
+    map_set(m, (map_key_t)key, string_data((string_t)text, strlen(text)));
+}
+
+/* One placement entry from its wire form, into @p tx; its certificates (if
+ * any) borrowed from @p d into @p c1 / @p c2 (halves) or @p asigs (attested).
+ * Mirrors Python entry_from_dict. */
+static bool _place_entry_from_json(const json_t *d, transaction_t *tx,
+                                   json_t **c1, json_t **c2, json_t **asigs)
+{
+    memset(tx, 0, sizeof(*tx));
+    tx->index = -1;
+    *c1 = *c2 = *asigs = NULL;
+    if (!json_is_object(d))
+        return false;
+    json_t *r = json_object_get(d, "roster");
+    if (r != NULL)
+    {
+        /* A roster entry (doc/architecture/reputation.md, "Who is in the
+         * group"): its member list must reproduce its digest. Mirrors Python
+         * entry_from_dict. */
+        const char *task = json_string_value(json_object_get(d, "task"));
+        const char *op = json_string_value(json_object_get(r, "op"));
+        const char *who = json_string_value(json_object_get(r, "uuid"));
+        const char *dig = json_string_value(json_object_get(r, "digest"));
+        char want[TX_HASH_HEX_LEN + 1];
+        if (task == NULL || uuid_parse(task, tx->task_uuid) != 0
+            || !tx_roster_op_valid(op) || dig == NULL
+            || roster_digest(json_object_get(r, "members"), want, NULL) != 0
+            || strcmp(want, dig) != 0
+            || (who != NULL && uuid_parse(who, tx->roster_uuid) != 0))
+            return false;
+        tx->roster = true;
+        at_strlcpy(tx->roster_op, op, sizeof(tx->roster_op));
+        at_strlcpy(tx->roster_digest, dig, sizeof(tx->roster_digest));
+        return true;
+    }
+    const char *task = json_string_value(json_object_get(d, "task"));
+    const char *p1 = json_string_value(json_object_get(d, "p1"));
+    json_t *s1 = json_object_get(d, "p1_score");
+    const char *ch1 = json_string_value(json_object_get(d, "p1_channel"));
+    if (task == NULL || p1 == NULL || !json_is_number(s1)
+        || uuid_parse(task, tx->task_uuid) != 0 || uuid_parse(p1, tx->p1_uuid) != 0)
+        return false;
+    tx->p1_set = true;
+    tx->p1_score = json_number_value(s1);
+    if (!(tx->p1_score >= 0.0 && tx->p1_score <= 1.0))
+        return false;
+    if (ch1 != NULL && ch1[0] != '\0')
+    {
+        if (!tx_channel_valid(ch1))
+            return false;
+        at_strlcpy(tx->p1_channel, ch1, sizeof(tx->p1_channel));
+    }
+    if (json_is_true(json_object_get(d, "attested")))
+    {
+        const char *subj = json_string_value(json_object_get(d, "subject"));
+        const char *dig = json_string_value(json_object_get(d, "evidence_digest"));
+        const char *scope = json_string_value(json_object_get(d, "attest_scope"));
+        if (subj == NULL || dig == NULL || uuid_parse(subj, tx->subject_uuid) != 0)
+            return false;
+        tx->attested = true;
+        at_strlcpy(tx->evidence_digest, dig, sizeof(tx->evidence_digest));
+        if (scope != NULL)
+            at_strlcpy(tx->attest_scope, scope, sizeof(tx->attest_scope));
+        *asigs = json_object_get(d, "attest_sigs");
+        return true;
+    }
+    const char *p2 = json_string_value(json_object_get(d, "p2"));
+    json_t *s2 = json_object_get(d, "p2_score");
+    const char *ch2 = json_string_value(json_object_get(d, "p2_channel"));
+    if (p2 == NULL || !json_is_number(s2) || uuid_parse(p2, tx->p2_uuid) != 0)
+        return false;
+    tx->p2_set = true;
+    tx->p2_score = json_number_value(s2);
+    if (!(tx->p2_score >= 0.0 && tx->p2_score <= 1.0))
+        return false;
+    if (ch2 != NULL && ch2[0] != '\0')
+    {
+        if (!tx_channel_valid(ch2))
+            return false;
+        at_strlcpy(tx->p2_channel, ch2, sizeof(tx->p2_channel));
+    }
+    *c1 = json_object_get(d, "p1_cert");
+    *c2 = json_object_get(d, "p2_cert");
+    return true;
+}
+
+/* --- pool persistence --------------------------------------------------- */
+
+/* The certificate JSON text kept under @p key in @p m, parsed, or NULL. */
+static json_t *_pool_cert_json(const map_t *m, const char *key)
+{
+    data_t *d = NULL;
+    char *text = NULL;
+    if (map_get((map_t *)m, (map_key_t)key, &d) != 0 || d == NULL
+        || data_string_ptr(d, &text) != 0 || text == NULL)
+        return NULL;
+    return json_loads(text, 0, NULL);
+}
+
+/* The pool as persisted (reputation-pool[-<chain>].cfg.json), oldest first. A
+ * half keeps its scorer, score, channel and commit certificate; an attested
+ * entry is written as a placement writes it. Mirrors Python
+ * TransactionHistory.pool_to_dict. */
+static json_t *_pool_to_json(const tx_history_t *h)
+{
+    json_t *items = json_array();
+    for (int i = 0; i < h->pool_len; i++)
+    {
+        const transaction_t *tx = &h->pool[i];
+        char t[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(tx->task_uuid, t);
+        json_t *d = json_object();
+        json_object_set_new(d, "task", json_string(t));
+        if (tx->attested)
+        {
+            char a[UUID_STRING_LEN + 1], sj[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(tx->p1_uuid, a);
+            uuid_unparse_lower(tx->subject_uuid, sj);
+            json_object_set_new(d, "attested", json_true());
+            json_object_set_new(d, "p1", json_string(a));
+            json_object_set_new(d, "p1_score", json_real(tx->p1_score));
+            json_object_set_new(d, "p1_channel", json_string(tx->p1_channel));
+            json_object_set_new(d, "subject", json_string(sj));
+            json_object_set_new(d, "evidence_digest", json_string(tx->evidence_digest));
+            if (tx->attest_scope[0] != '\0')
+                json_object_set_new(d, "attest_scope", json_string(tx->attest_scope));
+            json_t *cert = _pool_cert_json(&h->pool_certs, t);
+            if (cert != NULL)
+                json_object_set_new(d, "attest_sigs", cert);
+            json_array_append_new(items, d);
+            continue;
+        }
+        json_t *halves = json_array();
+        for (int side = 0; side < 2; side++)
+        {
+            if (!(side == 0 ? tx->p1_set : tx->p2_set))
+                continue;
+            char by[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(side == 0 ? tx->p1_uuid : tx->p2_uuid, by);
+            const char *chan = side == 0 ? tx->p1_channel : tx->p2_channel;
+            json_t *half = json_object();
+            json_object_set_new(half, "by", json_string(by));
+            json_object_set_new(half, "score",
+                                json_real(side == 0 ? tx->p1_score : tx->p2_score));
+            if (chan[0] != '\0')
+                json_object_set_new(half, "channel", json_string(chan));
+            char key[2 * UUID_STRING_LEN + 2];
+            snprintf(key, sizeof(key), "%s|%s", t, by);
+            json_t *cert = _pool_cert_json(&h->pool_certs, key);
+            if (cert != NULL)
+                json_object_set_new(half, "cert", cert);
+            json_array_append_new(halves, half);
+        }
+        json_object_set_new(d, "halves", halves);
+        json_array_append_new(items, d);
+    }
+    return json_pack("{s:i, s:o}", "schema", REP_POOL_SCHEMA, "pool", items);
+}
+
+/* Put back what _pool_to_json wrote, through tx_history_record_half and
+ * tx_history_pool_attested, so a task since placed or tombstoned stays out. An
+ * item that does not parse is skipped. Returns how many items are pooled
+ * afterwards, or -1 when @p doc is not a pool document. Mirrors Python
+ * TransactionHistory.pool_from_dict. */
+static int _pool_from_json(tx_history_t *h, const json_t *doc)
+{
+    json_t *items = json_object_get(doc, "pool");
+    json_t *schema = json_object_get(doc, "schema");
+    if (!json_is_integer(schema) || json_integer_value(schema) != REP_POOL_SCHEMA
+        || !json_is_array(items))
+        return -1;
+    size_t i;
+    json_t *item;
+    json_array_foreach(items, i, item)
+    {
+        if (!json_is_object(item))
+            continue;
+        if (json_is_true(json_object_get(item, "attested")))
+        {
+            transaction_t tx;
+            json_t *c1, *c2, *as;
+            if (!_place_entry_from_json(item, &tx, &c1, &c2, &as))
+                continue;
+            char *cert = json_is_object(as) ? json_dumps(as, JSON_COMPACT) : NULL;
+            (void)tx_history_pool_attested(h, &tx, cert);
+            free(cert);
+            continue;
+        }
+        const char *task = json_string_value(json_object_get(item, "task"));
+        uuid_t task_uuid;
+        if (task == NULL || uuid_parse(task, task_uuid) != 0)
+            continue;
+        size_t j;
+        json_t *half;
+        json_array_foreach(json_object_get(item, "halves"), j, half)
+        {
+            const char *by = json_string_value(json_object_get(half, "by"));
+            json_t *score = json_object_get(half, "score");
+            const char *chan = json_string_value(json_object_get(half, "channel"));
+            json_t *cert = json_object_get(half, "cert");
+            uuid_t by_uuid;
+            if (by == NULL || uuid_parse(by, by_uuid) != 0 || !json_is_number(score)
+                || !(json_number_value(score) >= 0.0 && json_number_value(score) <= 1.0))
+                continue;
+            char *text = json_is_object(cert) ? json_dumps(cert, JSON_COMPACT) : NULL;
+            (void)tx_history_record_half(h, task_uuid, by_uuid, json_number_value(score),
+                                         chan, text);
+            free(text);
+        }
+    }
+    return h->pool_len;
+}
+
+/* Put chain @p key's persisted pool back, once per chain, before its pool is
+ * next written. A broken file is logged and the pool starts empty. Caller
+ * holds rep_state.lock. */
+/* A placing chain that holds entries but no roster was written before
+ * membership went in the chain (doc/architecture/reputation.md, "Who is in
+ * the group"): nothing in it can be judged by a roster in force. It exists
+ * only in development and cohort directories, so it is cleared -- chain,
+ * placement state and pool -- and the group founds it anew (the user's call,
+ * 2026-10-14). Primary chain; runs at boot before anything reads the
+ * placement state. Caller holds rep_state.lock. Mirrors Python
+ * _reset_pre_roster_chain. */
+static bool _reset_pre_roster_chain_locked(const process_t *proc)
+{
+    tx_history_t *chain = &rep_state.history;
+    if (!_ordered_placement(proc, NULL) || tx_history_len(chain) == 0
+        || tx_history_roster_at(chain, chain->next_index, NULL) == 0)
+        return false;
+    log_warn(proc->logger, "Reputation: placing chain primary holds %d entries "
+             "and no roster: resetting it, its placement state and its pool\n",
+             tx_history_len(chain));
+    tx_history_free(chain);
+    tx_history_init(chain);
+    char path[CFG_PATH_LEN + 128];
+    if (_place_file_path(REP_PLACEMENT_FILE, "", path, sizeof(path)) == 0)
+        unlink(path);
+    if (_place_file_path(REP_POOL_FILE, "", path, sizeof(path)) == 0)
+        unlink(path);
+    rep_place_state_t *st = _place_state_locked(proc, "");
+    if (st != NULL)
+    {
+        _place_round_close(st);
+        st->have_promised = false;
+        st->lead_set = false;
+        map_free(&st->accepted);
+        map_init(&st->accepted);
+        map_free(&st->ahead);
+        map_init(&st->ahead);
+    }
+    return true;
+}
+
+static void _restore_pool_locked(const process_t *proc, const char *key)
+{
+    rep_place_state_t *st = _place_state_locked(proc, key);
+    if (st == NULL || st->pool_restored)
+        return;
+    st->pool_restored = true;
+    char path[CFG_PATH_LEN + 128] = {0};
+    if (_place_file_path(REP_POOL_FILE, key, path, sizeof(path)) != 0)
+        return;
+    FILE *f = fopen(path, "r");
+    if (f == NULL)
+        return;
+    json_error_t err;
+    json_t *doc = json_loadf(f, 0, &err);
+    fclose(f);
+    int held = doc != NULL ? _pool_from_json(_chain_for_key_locked(key), doc) : -1;
+    json_decref(doc);
+    if (proc == NULL)
+        return;
+    if (held < 0)
+        log_error(proc->logger, "Reputation: placement pool %s is unreadable; "
+                  "starting with an empty pool\n", path);
+    else
+        log_info(proc->logger, "Reputation: placement pool restored for chain %s: "
+                 "%d item(s)\n", key[0] != '\0' ? key : "primary", held);
+}
+
+/* Write chain @p key's pool if it has changed since it was last written.
+ * Caller holds rep_state.lock. */
+static void _persist_pool_locked(const process_t *proc, const char *key)
+{
+    _restore_pool_locked(proc, key);
+    rep_place_state_t *st = _place_state_locked(proc, key);
+    tx_history_t *chain = _chain_for_key_locked(key);
+    if (st == NULL || (st->pool_saved && st->pool_saved_rev == chain->pool_rev))
+        return;
+    char path[CFG_PATH_LEN + 128] = {0};
+    char tmp[CFG_PATH_LEN + 136] = {0};
+    if (_place_file_path(REP_POOL_FILE, key, path, sizeof(path)) != 0)
+        return;
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    json_t *doc = _pool_to_json(chain);
+    bool ok = doc != NULL && json_dump_file(doc, tmp, JSON_COMPACT) == 0
+        && rename(tmp, path) == 0;
+    json_decref(doc);
+    if (ok)
+    {
+        st->pool_saved = true;
+        st->pool_saved_rev = chain->pool_rev;
+    }
+    else if (proc != NULL)
+        log_warn(proc->logger, "Reputation: could not persist placement pool to %s\n",
+                 path);
+}
+
+/* Write each placing chain's pool when it has changed. Runs on the process
+ * loop. Mirrors Python PlacementMixin._persist_pools. */
+static void _persist_pools(const process_t *proc)
+{
+    pthread_mutex_lock(&rep_state.lock);
+    if (_ordered_placement(proc, NULL))
+        _persist_pool_locked(proc, "");
+    array_t *keys = map_keys(&rep_state.child_hist);
+    for (size_t i = 0; keys != NULL && i < array_size(keys); i++)
+    {
+        data_t *kd = NULL;
+        char *key = NULL;
+        if (array_get(keys, (int)i, &kd) == 0 && data_string_ptr(kd, &key) == 0
+            && key != NULL && key[0] != '\0' && _ordered_placement(proc, key))
+            _persist_pool_locked(proc, key);
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+/* A value's entries, or -1 when it is malformed. */
+static int _place_value_from_json(const json_t *value, transaction_t *out)
+{
+    if (!json_is_array(value) || json_array_size(value) < 1
+        || json_array_size(value) > PLACE_BATCH_MAX)
+        return -1;
+    for (size_t i = 0; i < json_array_size(value); i++)
+    {
+        json_t *c1, *c2, *as;
+        if (!_place_entry_from_json(json_array_get(value, i), &out[i], &c1, &c2, &as))
+            return -1;
+    }
+    return (int)json_array_size(value);
+}
+
+/* ---- Who is in the group: proposing and accepting roster entries -------
+ *
+ * The members deciding instance k are those of the roster logged before it
+ * (doc/architecture/reputation.md, "Who is in the group"). A placing chain's
+ * first entry is a genesis roster, decided by every member it lists; after
+ * that, each member it does not yet list is added by one roster entry,
+ * decided by a majority of the roster before it, and a roster about to leave
+ * the resident window is restated. Rosters only grow (the user's call,
+ * 2026-10-14). A roster entry is placed alone and ahead of any ready item.
+ * Mirrors the "who is in the group" part of Python PlacementMixin. */
+
+static bool _place_peer_in_chain(const process_t *proc,
+                                 const public_identity_t *peer, const char *key);
+
+/* This node and the live members of chain @p key's group, each with its
+ * signing key, canonical (a new reference), or NULL. Caller must NOT hold the
+ * peers lock. Mirrors Python _live_roster. */
+static json_t *_live_roster(const process_t *proc, const char *key)
+{
+    const identity_t *self = identity_self_identity(proc);
+    if (self == NULL)
+        return NULL;
+    json_t *raw = json_array();
+    char u[UUID_STRING_LEN + 1], k[2 * crypto_sign_PUBLICKEYBYTES + 1];
+    uuid_unparse_lower(self->uuid, u);
+    sodium_bin2hex(k, sizeof(k), self->signature.public, crypto_sign_PUBLICKEYBYTES);
+    json_array_append_new(raw, json_pack("[s, s]", u, k));
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++)
+    {
+        const public_identity_t *p = &proc->protocol.peers[i];
+        if (!_place_peer_in_chain(proc, p, key) || uuid_compare(p->uuid, self->uuid) == 0)
+            continue;
+        uuid_unparse_lower(p->uuid, u);
+        sodium_bin2hex(k, sizeof(k), p->signature.public, crypto_sign_PUBLICKEYBYTES);
+        json_array_append_new(raw, json_pack("[s, s]", u, k));
+    }
+    peers_read_unlock(proc);
+    json_t *norm = NULL;
+    char d[TX_HASH_HEX_LEN + 1];
+    if (roster_digest(raw, d, &norm) != 0)
+        norm = NULL;
+    json_decref(raw);
+    return norm;
+}
+
+/* A roster entry on the placement wire (borrowing @p members). */
+static json_t *_roster_entry_json(const uuid_t task, const char *op,
+                                  const char *who, const char *digest,
+                                  json_t *members)
+{
+    char t[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(task, t);
+    json_t *r = json_object();
+    json_object_set_new(r, "op", json_string(op));
+    json_object_set_new(r, "uuid", who != NULL ? json_string(who) : json_null());
+    json_object_set_new(r, "digest", json_string(digest));
+    json_object_set(r, "members", members);
+    json_t *e = json_object();
+    json_object_set_new(e, "task", json_string(t));
+    json_object_set_new(e, "roster", r);
+    return e;
+}
+
+/* The roster in force for the next instance of chain @p key (copied to
+ * @p r), its member list (a new reference, or NULL), the chain's next index
+ * and length. Caller must NOT hold rep_state.lock. */
+static json_t *_roster_now(const char *key, transaction_t *r, bool *have,
+                           int *next, int *len)
+{
+    pthread_mutex_lock(&rep_state.lock);
+    tx_history_t *chain = _chain_for_key_locked(key);
+    *next = chain->next_index;
+    *len = tx_history_len(chain);
+    *have = tx_history_roster_at(chain, chain->next_index, r) == 0;
+    const char *mt = *have ? tx_history_roster_members(chain, r->roster_digest) : NULL;
+    json_t *cur = mt != NULL ? json_loads(mt, 0, NULL) : NULL;
+    pthread_mutex_unlock(&rep_state.lock);
+    return cur;
+}
+
+/* The roster entry this node would place next on chain @p key (wire form, a
+ * new reference), or NULL: a genesis of its live view on an empty chain, an
+ * add of the first live member the roster in force lacks, or a restatement
+ * of a roster half a window old. Mirrors Python _roster_item. */
+static json_t *_roster_item(const process_t *proc, const char *key)
+{
+    json_t *live = _live_roster(proc, key);
+    if (live == NULL)
+        return NULL;
+    transaction_t r;
+    bool have = false;
+    int next = 0, len = 0;
+    json_t *cur = _roster_now(key, &r, &have, &next, &len);
+    json_t *out = NULL;
+    char d[TX_HASH_HEX_LEN + 1];
+    uuid_t t;
+    if (!have)
+    {
+        if (next == 0 && len == 0 && json_array_size(live) >= 2
+            && roster_digest(live, d, NULL) == 0)
+        {
+            tx_roster_task_uuid(NULL, "genesis", NULL, d, t);
+            out = _roster_entry_json(t, "genesis", NULL, d, live);
+        }
+    }
+    else if (cur != NULL)
+    {
+        const char *who = NULL, *wk = NULL;
+        size_t i;
+        json_t *m;
+        json_array_foreach(live, i, m)
+        {
+            const char *u = json_string_value(json_array_get(m, 0));
+            if (u != NULL && _roster_key_of(cur, u) == NULL)
+            {
+                who = u;
+                wk = json_string_value(json_array_get(m, 1));
+                break;
+            }
+        }
+        if (who != NULL)
+        {
+            json_t *members = json_deep_copy(cur), *norm = NULL;
+            json_array_append_new(members, json_pack("[s, s]", who, wk));
+            uuid_t wu;
+            if (roster_digest(members, d, &norm) == 0 && uuid_parse(who, wu) == 0)
+            {
+                tx_roster_task_uuid(r.task_uuid, "add", wu, d, t);
+                out = _roster_entry_json(t, "add", who, d, norm);
+            }
+            json_decref(norm);
+            json_decref(members);
+        }
+        else if (r.index >= 0 && next - r.index >= MAX_CHAIN_LEN / 2)
+        {
+            tx_roster_task_uuid(r.task_uuid, "restate", NULL, r.roster_digest, t);
+            out = _roster_entry_json(t, "restate", NULL, r.roster_digest, cur);
+        }
+    }
+    json_decref(cur);
+    json_decref(live);
+    return out;
+}
+
+/* Has chain @p key a roster in force? Nothing but a genesis is placed,
+ * accepted or learned before. Caller holds rep_state.lock. Mirrors Python
+ * _founded. */
+static bool _founded_locked(const char *key)
+{
+    tx_history_t *chain = _chain_for_key_locked(key);
+    return tx_history_roster_at(chain, chain->next_index, NULL) == 0;
+}
+
+/* The members of @p value if it is a single genesis roster entry (canonical,
+ * a new reference), else NULL. */
+static json_t *_value_genesis(const json_t *value)
+{
+    if (!json_is_array(value) || json_array_size(value) != 1)
+        return NULL;
+    json_t *r = json_object_get(json_array_get(value, 0), "roster");
+    const char *op = json_string_value(json_object_get(r, "op"));
+    if (op == NULL || strcmp(op, "genesis") != 0)
+        return NULL;
+    json_t *norm = NULL;
+    char d[TX_HASH_HEX_LEN + 1];
+    const char *dig = json_string_value(json_object_get(r, "digest"));
+    if (roster_digest(json_object_get(r, "members"), d, &norm) != 0
+        || dig == NULL || strcmp(d, dig) != 0)
+    {
+        json_decref(norm);
+        return NULL;
+    }
+    return norm;
+}
+
+/* Why a value holding a roster entry cannot be accepted on chain @p key now,
+ * or NULL when it can. Mirrors Python _roster_value_ok. */
+static const char *_roster_value_why(const process_t *proc, const char *key,
+                                     const json_t *value)
+{
+    if (json_array_size(value) != 1)
+        return "a roster entry is placed alone";
+    json_t *e = json_array_get(value, 0);
+    json_t *ro = json_object_get(e, "roster");
+    const char *op = json_string_value(json_object_get(ro, "op"));
+    const char *who = json_string_value(json_object_get(ro, "uuid"));
+    const char *dig = json_string_value(json_object_get(ro, "digest"));
+    const char *task = json_string_value(json_object_get(e, "task"));
+    json_t *members = NULL;
+    char d[TX_HASH_HEX_LEN + 1];
+    uuid_t tu, want, wu;
+    if (!tx_roster_op_valid(op) || dig == NULL || task == NULL
+        || uuid_parse(task, tu) != 0
+        || roster_digest(json_object_get(ro, "members"), d, &members) != 0
+        || strcmp(d, dig) != 0)
+    {
+        json_decref(members);
+        return "roster members do not match their digest";
+    }
+    json_t *live = _live_roster(proc, key);
+    transaction_t r;
+    bool have = false;
+    int next = 0, len = 0;
+    json_t *cur = _roster_now(key, &r, &have, &next, &len);
+    char me[UUID_STRING_LEN + 1] = {0};
+    uuid_t self_u;
+    if (_resolve_self_uuid(proc, self_u))
+        uuid_unparse_lower(self_u, me);
+    const char *why = NULL;
+    size_t i;
+    json_t *m;
+    if (strcmp(op, "genesis") == 0)
+    {
+        if (have || next != 0)
+            why = "genesis on a chain that has one";
+        else if (_roster_key_of(members, me) == NULL)
+            why = "a genesis that leaves us out";
+        else
+            json_array_foreach(members, i, m)
+            {
+                const char *u = json_string_value(json_array_get(m, 0));
+                const char *lk = live != NULL ? _roster_key_of(live, u) : NULL;
+                if (lk == NULL || strcmp(lk, json_string_value(json_array_get(m, 1))) != 0)
+                    why = "a genesis naming a member we do not see";
+            }
+        tx_roster_task_uuid(NULL, "genesis", NULL, dig, want);
+    }
+    else if (!have || cur == NULL)
+        why = "a roster change with no roster in force";
+    else if (strcmp(op, "add") == 0)
+    {
+        if (who == NULL || uuid_parse(who, wu) != 0 || _roster_key_of(cur, who) != NULL)
+            why = "an add of nobody new";
+        else if (json_array_size(members) != json_array_size(cur) + 1)
+            why = "an add that changes more than one member";
+        else
+        {
+            json_array_foreach(cur, i, m)
+            {
+                const char *u = json_string_value(json_array_get(m, 0));
+                const char *mk = _roster_key_of(members, u);
+                if (mk == NULL || strcmp(mk, json_string_value(json_array_get(m, 1))) != 0)
+                    why = "an add that changes more than one member";
+            }
+            const char *nk = _roster_key_of(members, who);
+            const char *lk = live != NULL ? _roster_key_of(live, who) : NULL;
+            if (why == NULL && (nk == NULL || lk == NULL || strcmp(nk, lk) != 0))
+                why = "an add of a member we do not see";
+        }
+        if (who != NULL && uuid_parse(who, wu) == 0)
+            tx_roster_task_uuid(r.task_uuid, "add", wu, dig, want);
+    }
+    else
+    {
+        if (strcmp(dig, r.roster_digest) != 0)
+            why = "a restatement that changes the roster";
+        else if (r.index < 0 || next - r.index < MAX_CHAIN_LEN / 2)
+            why = "a restatement too early";
+        tx_roster_task_uuid(r.task_uuid, "restate", NULL, dig, want);
+    }
+    if (why == NULL && uuid_compare(want, tu) != 0)
+        why = "a roster entry with the wrong task id";
+    json_decref(members);
+    json_decref(live);
+    json_decref(cur);
+    return why;
+}
+
+/* Why @p value cannot be placed on the chain at @p key now, or NULL when it
+ * can: one of each task, by task id; nothing already held; every half
+ * certified; every attestation well formed, on its quorum and under its rate
+ * cap. Checked against this node's own prefix and its own view of the group,
+ * before accepting, so a decided value is valid by construction. Mirrors
+ * Python PlacementMixin._place_value_ok. */
+static const char *_place_value_why(const process_t *proc, const char *key,
+                                    const json_t *value, const char *group)
+{
+    size_t vi;
+    json_t *ve;
+    json_array_foreach((json_t *)value, vi, ve)
+        if (json_object_get(ve, "roster") != NULL)
+            return _roster_value_why(proc, key, value);
+    pthread_mutex_lock(&rep_state.lock);
+    bool founded = _founded_locked(key);
+    pthread_mutex_unlock(&rep_state.lock);
+    if (!founded)
+        return "nothing is placed before the genesis";
+    transaction_t *entries = calloc(PLACE_BATCH_MAX, sizeof(transaction_t));
+    if (entries == NULL)
+        return "out of memory";
+    const char *why = NULL;
+    int n = _place_value_from_json(value, entries);
+    if (n < 0)
+        why = "malformed";
+    for (int i = 0; why == NULL && i < n; i++)
+    {
+        transaction_t *tx = &entries[i];
+        char task_str[UUID_STRING_LEN + 1], prev[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(tx->task_uuid, task_str);
+        if (i > 0)
+        {
+            uuid_unparse_lower(entries[i - 1].task_uuid, prev);
+            if (strcmp(prev, task_str) >= 0)
+            {
+                why = "not one of each task, by task id";
+                break;
+            }
+        }
+        pthread_mutex_lock(&rep_state.lock);
+        tx_history_t *chain = _chain_for_key_locked(key);
+        data_t *d = NULL;
+        int slot = -1;
+        bool held = (map_get(&chain->task_map, (map_key_t)task_str, &d) == 0
+                     && data_integer(d, &slot) == 0 && slot >= 0
+                     && slot < chain->chain_len
+                     && tx_is_committed(&chain->chain[slot]))
+            || map_get(&chain->evicted_set, (map_key_t)task_str, &d) == 0;
+        bool resident = false;
+        rep_attest_t a;
+        memset(&a, 0, sizeof(a));
+        if (tx->attested)
+        {
+            uuid_unparse_lower(tx->p1_uuid, a.verifier);
+            uuid_unparse_lower(tx->subject_uuid, a.subject);
+            a.score = tx->p1_score;
+            at_strlcpy(a.channel, tx->p1_channel, sizeof(a.channel));
+            at_strlcpy(a.digest, tx->evidence_digest, sizeof(a.digest));
+            at_strlcpy(a.scope, tx->attest_scope, sizeof(a.scope));
+            resident = _attest_well_formed(&a) && _attest_resident_locked(chain, &a);
+        }
+        pthread_mutex_unlock(&rep_state.lock);
+        if (held)
+        {
+            why = "a task is already held";
+            break;
+        }
+        json_t *c1, *c2, *as;
+        (void)_place_entry_from_json(json_array_get(value, (size_t)i), tx, &c1, &c2, &as);
+        if (tx->attested)
+        {
+            uuid_t want;
+            tx_attest_task_uuid(tx->p1_uuid, tx->subject_uuid, tx->evidence_digest, want);
+            if (!_attest_well_formed(&a) || uuid_compare(want, tx->task_uuid) != 0)
+                why = "malformed attestation";
+            else if (!_attest_quorum_met(proc, &a, as))
+                why = "an attestation lacks its quorum";
+            else if (resident)
+                why = "an attestation is over its rate cap";
+            continue;
+        }
+        char a1[UUID_STRING_LEN + 1], a2[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(tx->p1_uuid, a1);
+        uuid_unparse_lower(tx->p2_uuid, a2);
+        if (strcmp(a1, a2) >= 0)
+            why = strcmp(a1, a2) == 0 ? "an entry is not bilateral"
+                                      : "an entry's halves are out of order";
+        else if (!_commit_cert_ok(proc, tx->p1_uuid, tx->task_uuid, tx->p1_score,
+                                  tx->p1_channel, c1, group)
+                 || !_commit_cert_ok(proc, tx->p2_uuid, tx->task_uuid, tx->p2_score,
+                                     tx->p2_channel, c2, group))
+            why = "a half is not certified";
+    }
+    free(entries);
+    return why;
+}
+
+static void _note_place_heard(const process_t *proc, const char *key, int k);
+
+static void _place_send(const process_t *proc, char *function,
+                        const public_identity_t *to, json_t *payload)
+{
+    _attest_send(proc, function, to, payload);
+}
+
+/* Is @p peer a member of chain @p key's group? Every peer for the primary
+ * chain, or for a child chain whose group we no longer hold. Caller holds the
+ * peers read lock. Mirrors Python PlacementMixin._place_members. */
+static bool _place_peer_in_chain(const process_t *proc,
+                                 const public_identity_t *peer, const char *key)
+{
+    if (key == NULL || key[0] == '\0' || _child_group_locked(proc, key) == NULL)
+        return true;
+    return _peer_in_group(proc, peer, key);
+}
+
+/* A round's broadcast: to chain @p key's group, so a child chain's round
+ * reaches that group's members alone. Mirrors Python _place_target. */
+static void _place_broadcast(const process_t *proc, char *function,
+                             const char *key, json_t *payload)
+{
+    if (key == NULL || key[0] == '\0')
+    {
+        _attest_send(proc, function, NULL, payload);
+        return;
+    }
+    peers_read_lock(proc);
+    size_t n = proc->protocol.num_peers, m = 0;
+    public_identity_t *members = calloc(n > 0 ? n : 1, sizeof(public_identity_t));
+    for (size_t i = 0; members != NULL && i < n; i++)
+        if (_place_peer_in_chain(proc, &proc->protocol.peers[i], key))
+            members[m++] = proc->protocol.peers[i];
+    peers_read_unlock(proc);
+    for (size_t i = 0; members != NULL && i < m; i++)
+        _attest_send(proc, function, &members[i], payload);
+    free(members);
+}
+
+/* The payload of a placement message and the chain it is for, or NULL when
+ * it is malformed, unverified, or for a chain that does not place. Caller owns
+ * the payload. */
+static json_t *_place_payload(const process_t *proc, net_msg_t *nmsg,
+                              char key[UUID_STRING_LEN + 1],
+                              const char **group, int *k)
+{
+    if (!nmsg->verified)
+    {
+        log_warn(proc->logger, "Reputation: rejecting unverified %s from %s\n",
+                 nmsg->function, nmsg->from_whom.nickname);
+        return NULL;
+    }
+    json_t *payload = NULL;
+    if (net_msg_unpack_json(nmsg, &payload) != 0 || !json_is_object(payload))
+    {
+        json_decref(payload);
+        return NULL;
+    }
+    json_t *jk = json_object_get(payload, "k");
+    if (!json_is_integer(jk) || json_integer_value(jk) < 0
+        || json_integer_value(jk) > INT32_MAX)
+    {
+        json_decref(payload);
+        return NULL;
+    }
+    *k = (int)json_integer_value(jk);
+    *group = json_string_value(json_object_get(payload, "group"));
+    if (*group != NULL && (*group)[0] == '\0')
+        *group = NULL;
+    _chain_key(proc, *group, key, UUID_STRING_LEN + 1);
+    if (!_ordered_placement(proc, key[0] != '\0' ? *group : NULL))
+    {
+        json_decref(payload);
+        return NULL;
+    }
+    return payload;
+}
+
+static bool _from_proposer(const net_msg_t *nmsg, const char *by)
+{
+    char sender[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, sender);
+    return strcmp(sender, by) == 0;
+}
+
+static void _place_nack(const process_t *proc, net_msg_t *nmsg, json_t *payload,
+                        int k, int next, const rep_place_state_t *st,
+                        const char *why)
+{
+    log_debug(proc->logger, "Reputation: placement %d from %s refused: %s\n",
+              k, nmsg->from_whom.nickname, why);
+    json_t *nack = json_object();
+    const char *group = json_string_value(json_object_get(payload, "group"));
+    json_object_set_new(nack, "group", json_string(group != NULL ? group : ""));
+    json_object_set_new(nack, "k", json_integer(k));
+    json_t *ballot = json_object_get(payload, "ballot");
+    json_object_set(nack, "ballot", ballot != NULL ? ballot : json_null());
+    json_object_set_new(nack, "next", json_integer(next));
+    if (st->have_promised)
+        json_object_set_new(nack, "promised", _ballot_json(st->prom_n, st->prom_by));
+    _place_send(proc, REP_PROTO_PLACE_NACK, &nmsg->from_whom, nack);
+    json_decref(nack);
+}
+
+/* Instance k is open here only once everything below it is applied, and only
+ * on the same prefix. Otherwise refuse, and catch up when we are behind.
+ * Takes and releases rep_state.lock. */
+static bool _place_position_ok(const process_t *proc, net_msg_t *nmsg,
+                               json_t *payload, const char *key, int k)
+{
+    pthread_mutex_lock(&rep_state.lock);
+    tx_history_t *chain = _chain_for_key_locked(key);
+    int next = chain->next_index;
+    char head[TX_HASH_HEX_LEN + 1];
+    at_strlcpy(head, chain->head_hash, sizeof(head));
+    rep_place_state_t *live = _place_state_locked(proc, key);
+    rep_place_state_t snapshot = live != NULL ? *live : (rep_place_state_t){0};
+    pthread_mutex_unlock(&rep_state.lock);
+    if (live == NULL)
+        return false;
+    const char *theirs = json_string_value(json_object_get(payload, "head"));
+    if (k != next)
+    {
+        _place_nack(proc, nmsg, payload, k, next, &snapshot, "not our next index");
+        if (k > next)
+            _request_chain_for(proc, &nmsg->from_whom, key);
+        return false;
+    }
+    if (strcmp(theirs != NULL ? theirs : "", head) != 0)
+    {
+        _place_nack(proc, nmsg, payload, k, next, &snapshot, "extends another head");
+        return false;
+    }
+    return true;
+}
+
+static bool handle_place_request(const process_t *proc, directory_t *queues,
+                                 generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    char key[UUID_STRING_LEN + 1];
+    const char *group = NULL;
+    int k = 0;
+    json_t *payload = _place_payload(proc, nmsg, key, &group, &k);
+    if (payload == NULL)
+        return true;
+    int64_t n;
+    char by[UUID_STRING_LEN + 1];
+    char self_str[UUID_STRING_LEN + 1] = {0};
+    uuid_t self_u;
+    if (_resolve_self_uuid(proc, self_u))
+        uuid_unparse_lower(self_u, self_str);
+    if (!_parse_ballot(json_object_get(payload, "ballot"), &n, by)
+        || !_from_proposer(nmsg, by)
+        || !_place_deciders_ok(proc, key, k, self_str, by))
+    {
+        json_decref(payload);
+        return true;
+    }
+    _note_place_heard(proc, key, k);
+    if (!_place_position_ok(proc, nmsg, payload, key, k))
+    {
+        json_decref(payload);
+        return true;
+    }
+    pthread_mutex_lock(&rep_state.lock);
+    rep_place_state_t *st = _place_state_locked(proc, key);
+    if (st == NULL || st->broken)
+    {
+        pthread_mutex_unlock(&rep_state.lock);
+        json_decref(payload);
+        return true;
+    }
+    if (st->have_promised && _ballot_cmp(n, by, st->prom_n, st->prom_by) <= 0)
+    {
+        rep_place_state_t snapshot = *st;
+        int next = _chain_for_key_locked(key)->next_index;
+        pthread_mutex_unlock(&rep_state.lock);
+        _place_nack(proc, nmsg, payload, k, next, &snapshot, "outranked");
+        json_decref(payload);
+        return true;
+    }
+    st->have_promised = true;
+    st->prom_n = n;
+    at_strlcpy(st->prom_by, by, sizeof(st->prom_by));
+    bool kept = _persist_place_state(proc, st);
+    const char *held = _place_text(&st->accepted, k);
+    json_t *accepted = held != NULL ? json_loads(held, 0, NULL) : NULL;
+    pthread_mutex_unlock(&rep_state.lock);
+    if (kept)
+    {
+        json_t *grant = json_object();
+        json_object_set_new(grant, "group", json_string(group != NULL ? group : ""));
+        json_object_set_new(grant, "k", json_integer(k));
+        json_object_set_new(grant, "ballot", _ballot_json(n, by));
+        if (accepted != NULL)
+            json_object_set(grant, "accepted", accepted);
+        _place_send(proc, REP_PROTO_PLACE_GRANT, &nmsg->from_whom, grant);
+        json_decref(grant);
+    }
+    json_decref(accepted);
+    json_decref(payload);
+    return true;
+}
+
+static bool handle_place(const process_t *proc, directory_t *queues,
+                         generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    char key[UUID_STRING_LEN + 1];
+    const char *group = NULL;
+    int k = 0;
+    json_t *payload = _place_payload(proc, nmsg, key, &group, &k);
+    if (payload == NULL)
+        return true;
+    int64_t n;
+    char by[UUID_STRING_LEN + 1];
+    char self_str[UUID_STRING_LEN + 1] = {0};
+    uuid_t self_u;
+    if (_resolve_self_uuid(proc, self_u))
+        uuid_unparse_lower(self_u, self_str);
+    if (!_parse_ballot(json_object_get(payload, "ballot"), &n, by)
+        || !_from_proposer(nmsg, by)
+        || !_place_deciders_ok(proc, key, k, self_str, by))
+    {
+        json_decref(payload);
+        return true;
+    }
+    _note_place_heard(proc, key, k);
+    if (!_place_position_ok(proc, nmsg, payload, key, k))
+    {
+        json_decref(payload);
+        return true;
+    }
+    pthread_mutex_lock(&rep_state.lock);
+    rep_place_state_t *st = _place_state_locked(proc, key);
+    bool broken = st == NULL || st->broken;
+    bool outranked = !broken && st->have_promised
+        && _ballot_cmp(n, by, st->prom_n, st->prom_by) < 0;
+    rep_place_state_t snapshot = broken ? (rep_place_state_t){0} : *st;
+    int next = _chain_for_key_locked(key)->next_index;
+    pthread_mutex_unlock(&rep_state.lock);
+    if (broken || outranked)
+    {
+        if (outranked)
+            _place_nack(proc, nmsg, payload, k, next, &snapshot, "outranked");
+        json_decref(payload);
+        return true;
+    }
+    json_t *value = json_object_get(payload, "value");
+    const char *why = _place_value_why(proc, key, value, key[0] != '\0' ? group : NULL);
+    if (why != NULL)
+    {
+        log_warn(proc->logger, "Reputation: not accepting placement %d from %s: %s\n",
+                 k, nmsg->from_whom.nickname, why);
+        json_decref(payload);
+        return true;
+    }
+    transaction_t *entries = calloc(PLACE_BATCH_MAX, sizeof(transaction_t));
+    int m = entries != NULL ? _place_value_from_json(value, entries) : -1;
+    char digest[TX_HASH_HEX_LEN + 1] = {0};
+    if (m > 0)
+        place_value_digest(entries, m, k, digest);
+    free(entries);
+
+    pthread_mutex_lock(&rep_state.lock);
+    tx_history_t *chain = _chain_for_key_locked(key);
+    char head[TX_HASH_HEX_LEN + 1];
+    at_strlcpy(head, chain->head_hash, sizeof(head));
+    bool moved = chain->next_index != k
+        || (st->have_promised && _ballot_cmp(n, by, st->prom_n, st->prom_by) < 0);
+    bool kept = false;
+    if (!moved && digest[0] != '\0')
+    {
+        st->have_promised = true;
+        st->prom_n = n;
+        at_strlcpy(st->prom_by, by, sizeof(st->prom_by));
+        _place_prune_below(&st->accepted, k);
+        json_t *rec = json_object();
+        json_object_set_new(rec, "ballot", _ballot_json(n, by));
+        json_object_set(rec, "value", value);
+        char *text = json_dumps(rec, JSON_COMPACT);
+        json_decref(rec);
+        if (text != NULL)
+        {
+            _place_set_text(&st->accepted, k, text);
+            free(text);
+            kept = _persist_place_state(proc, st);
+        }
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    if (!kept)
+    {
+        json_decref(payload);
+        return true;
+    }
+    uint8_t desig[PLACE_DESIG_MAX];
+    size_t dlen = place_designation(k, head, digest, desig, sizeof(desig));
+    char sig[REP_SIG_HEX_LEN + 1] = {0};
+    if (dlen == 0 || _cosign_hex(proc, desig, dlen, sig, sizeof(sig)) != 0)
+    {
+        log_error(proc->logger, "Reputation: handle_place: cannot sign; not accepting\n");
+        json_decref(payload);
+        return true;
+    }
+    json_t *ok = json_object();
+    json_object_set_new(ok, "group", json_string(group != NULL ? group : ""));
+    json_object_set_new(ok, "k", json_integer(k));
+    json_object_set_new(ok, "ballot", _ballot_json(n, by));
+    json_object_set_new(ok, "digest", json_string(digest));
+    json_object_set_new(ok, "sig", json_string(sig));
+    _place_send(proc, REP_PROTO_PLACE_ACCEPTED, &nmsg->from_whom, ok);
+    json_decref(ok);
+    json_decref(payload);
+    return true;
+}
+
+/* Does @p sigs certify @p value at @p k after @p head? A strict majority of
+ * the group, counted from our own view, must have signed its
+ * place_designation. Must NOT hold the peers lock. */
+static bool _placement_certified(const process_t *proc, const transaction_t *entries,
+                                 int m, int k, const char *head, json_t *sigs,
+                                 const char *group)
+{
+    char digest[TX_HASH_HEX_LEN + 1];
+    place_value_digest(entries, m, k, digest);
+    uint8_t desig[PLACE_DESIG_MAX];
+    size_t dlen = place_designation(k, head, digest, desig, sizeof(desig));
+    if (digest[0] == '\0' || dlen == 0)
+        return false;
+    /* The roster in force for k decides, with the keys it records; the live
+     * view only while the chain holds none. Mirrors Python
+     * _placement_certified. */
+    json_t *roster = _roster_at(group != NULL ? group : "", k);
+    if (roster == NULL && m == 1 && entries[0].roster
+        && strcmp(entries[0].roster_op, "genesis") == 0)
+    {
+        /* A genesis is decided by every member it lists. */
+        pthread_mutex_lock(&rep_state.lock);
+        const char *gt = tx_history_roster_members(
+            _chain_for_key_locked(group != NULL ? group : ""), entries[0].roster_digest);
+        json_t *g = gt != NULL ? json_loads(gt, 0, NULL) : NULL;
+        pthread_mutex_unlock(&rep_state.lock);
+        bool ok = g != NULL
+            && _verified_cosigners_in(proc, g, sigs, desig, dlen) == json_array_size(g);
+        json_decref(g);
+        return ok;
+    }
+    if (roster != NULL)
+    {
+        bool ok = _verified_cosigners_in(proc, roster, sigs, desig, dlen)
+            >= _roster_majority(roster);
+        json_decref(roster);
+        return ok;
+    }
+    return false;               /* nothing but a genesis before the roster */
+}
+
+/* _placement_certified for catch-up: the roster in force for @p k is the
+ * latest below it among our own entries AND the segment @p arr's (its member
+ * list checked against its digest), so a node can follow a roster change it
+ * does not hold yet. Mirrors Python _placement_certified_indices. */
+static bool _placement_certified_seg(const process_t *proc, const char *key,
+                                     json_t *arr, const transaction_t *entries,
+                                     int m, int k, const char *head, json_t *sigs,
+                                     const char *group)
+{
+    transaction_t ours;
+    int ours_at = -1;
+    pthread_mutex_lock(&rep_state.lock);
+    if (tx_history_roster_at(_chain_for_key_locked(key), k, &ours) == 0)
+        ours_at = ours.index;
+    pthread_mutex_unlock(&rep_state.lock);
+    json_t *best = NULL;
+    int best_at = ours_at;
+    size_t i;
+    json_t *e;
+    json_array_foreach(arr, i, e)
+    {
+        json_t *ji = json_object_get(e, "index");
+        const char *dig = json_string_value(json_object_get(e, "roster_digest"));
+        json_t *members = json_object_get(e, "roster_members");
+        char want[TX_HASH_HEX_LEN + 1];
+        if (!json_is_integer(ji) || dig == NULL
+            || !tx_roster_op_valid(json_string_value(json_object_get(e, "roster_op"))))
+            continue;
+        int at = (int)json_integer_value(ji);
+        if (at >= k || at <= best_at || roster_digest(members, want, NULL) != 0
+            || strcmp(want, dig) != 0)
+            continue;
+        best = members;
+        best_at = at;
+    }
+    if (best == NULL && m == 1 && entries[0].roster
+        && strcmp(entries[0].roster_op, "genesis") == 0)
+    {
+        /* A genesis is decided by every member it lists: its own list, from
+         * the segment, checked against its digest. */
+        json_array_foreach(arr, i, e)
+        {
+            json_t *ji = json_object_get(e, "index");
+            if (json_is_integer(ji) && (int)json_integer_value(ji) == k)
+                best = json_object_get(e, "roster_members");
+        }
+        json_t *g = NULL;
+        char gd[TX_HASH_HEX_LEN + 1];
+        char digest[TX_HASH_HEX_LEN + 1];
+        place_value_digest(entries, m, k, digest);
+        uint8_t desig[PLACE_DESIG_MAX];
+        size_t dlen = place_designation(k, head, digest, desig, sizeof(desig));
+        bool ok = best != NULL && roster_digest(best, gd, &g) == 0
+            && strcmp(gd, entries[0].roster_digest) == 0 && dlen > 0
+            && _verified_cosigners_in(proc, g, sigs, desig, dlen) == json_array_size(g);
+        json_decref(g);
+        return ok;
+    }
+    if (best == NULL)
+        return _placement_certified(proc, entries, m, k, head, sigs, group);
+    json_t *roster = NULL;
+    char d[TX_HASH_HEX_LEN + 1];
+    if (roster_digest(best, d, &roster) != 0 || roster == NULL)
+        return false;
+    char digest[TX_HASH_HEX_LEN + 1];
+    place_value_digest(entries, m, k, digest);
+    uint8_t desig[PLACE_DESIG_MAX];
+    size_t dlen = place_designation(k, head, digest, desig, sizeof(desig));
+    bool ok = digest[0] != '\0' && dlen > 0
+        && _verified_cosigners_in(proc, roster, sigs, desig, dlen) >= _roster_majority(roster);
+    json_decref(roster);
+    return ok;
+}
+
+/* Verify and write one decided placement at the chain's next index. */
+static bool _apply_placement(const process_t *proc, const char *key, int k,
+                             json_t *value, json_t *sigs, const char *group)
+{
+    transaction_t *entries = calloc(PLACE_BATCH_MAX, sizeof(transaction_t));
+    if (entries == NULL)
+        return false;
+    int m = _place_value_from_json(value, entries);
+    pthread_mutex_lock(&rep_state.lock);
+    tx_history_t *chain = _chain_for_key_locked(key);
+    /* A roster entry's member list first (its digest was checked when it was
+     * parsed): judging a genesis needs it. */
+    for (int i = 0; i < m; i++)
+        if (entries[i].roster)
+            (void)tx_history_roster_put(chain, json_object_get(json_object_get(
+                json_array_get(value, (size_t)i), "roster"), "members"), NULL);
+    char head[TX_HASH_HEX_LEN + 1];
+    at_strlcpy(head, chain->head_hash, sizeof(head));
+    bool at_next = chain->next_index == k;
+    pthread_mutex_unlock(&rep_state.lock);
+    if (m < 0 || !at_next || !_placement_certified(proc, entries, m, k, head, sigs, group))
+    {
+        if (m >= 0 && at_next)
+            log_warn(proc->logger, "Reputation: refusing placement %d: its "
+                     "certificate does not meet our quorum\n", k);
+        free(entries);
+        return false;
+    }
+    /* Each half's commit certificate travels in the value; keep it with the
+     * entry, as a commit would. */
+    char *sigs_text = json_dumps(sigs, JSON_COMPACT | JSON_SORT_KEYS);
+    uuid_t self_uuid;
+    bool have_self = _resolve_self_uuid(proc, self_uuid);
+    pthread_mutex_lock(&rep_state.lock);
+    chain = _chain_for_key_locked(key);
+    bool applied = chain->next_index == k && strcmp(chain->head_hash, head) == 0
+        && tx_history_apply_placed(chain, k, entries, m, sigs_text) == TX_PLACE_APPLIED;
+    for (int i = 0; applied && i < m; i++)
+    {
+        json_t *c1, *c2, *as;
+        transaction_t scratch;
+        (void)_place_entry_from_json(json_array_get(value, (size_t)i), &scratch,
+                                     &c1, &c2, &as);
+        const transaction_t *tx = &entries[i];
+        char task_str[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(tx->task_uuid, task_str);
+        /* The line a commit used to log when it completed an entry; under
+         * ordered placement an entry is completed here, so it is logged here
+         * (cohorts and operators watch for it). */
+        if (!tx->roster && !tx->attested && tx->p1_set && tx->p2_set)
+            log_info(proc->logger, "Reputation: task %s is bilateral (index %d)\n",
+                     task_str, k + i);
+        if (tx->roster)
+        {
+            /* Its member list, checked against its digest when parsed. */
+            (void)tx_history_roster_put(chain, json_object_get(json_object_get(
+                json_array_get(value, (size_t)i), "roster"), "members"), NULL);
+            continue;
+        }
+        if (tx->attested)
+        {
+            char *t = json_is_object(as) ? json_dumps(as, JSON_COMPACT | JSON_SORT_KEYS) : NULL;
+            if (t != NULL)
+                map_set(&chain->attest_certs, (map_key_t)task_str,
+                        string_data((string_t)t, strlen(t)));
+            free(t);
+        }
+        else
+        {
+            for (int side = 0; side < 2; side++)
+            {
+                json_t *c = side == 0 ? c1 : c2;
+                const unsigned char *scorer = side == 0 ? scratch.p1_uuid : scratch.p2_uuid;
+                char *t = json_is_object(c) ? json_dumps(c, JSON_COMPACT | JSON_SORT_KEYS) : NULL;
+                if (t != NULL)
+                    (void)tx_history_attach_commit_cert(chain, tx->task_uuid, scorer, t);
+                free(t);
+            }
+        }
+        if (have_self && ((tx->p1_set && uuid_compare(tx->p1_uuid, self_uuid) == 0)
+                          || (tx->p2_set && uuid_compare(tx->p2_uuid, self_uuid) == 0)))
+            map_remove(&rep_state.awaiting_commit, (map_key_t)task_str);
+    }
+    int next = chain->next_index;
+    rep_place_state_t *st = applied ? _place_state_locked(proc, key) : NULL;
+    if (st != NULL)
+        _place_prune_below(&st->accepted, next);
+    pthread_mutex_unlock(&rep_state.lock);
+    free(sigs_text);
+    if (applied)
+    {
+        for (int i = 0; i < m; i++)
+        {
+            const transaction_t *tx = &entries[i];
+            if (tx->p1_set && !(have_self && uuid_compare(tx->p1_uuid, self_uuid) == 0))
+                _note_interaction(tx->p1_uuid);
+            if (tx->p2_set && !(have_self && uuid_compare(tx->p2_uuid, self_uuid) == 0))
+                _note_interaction(tx->p2_uuid);
+            if (tx->attested)
+                _note_interaction(tx->subject_uuid);
+        }
+        log_info(proc->logger, "Reputation: placed %d entr%s at %d on chain %s "
+                 "(next %d)\n", m, m == 1 ? "y" : "ies", k,
+                 key[0] != '\0' ? key : "primary", next);
+    }
+    free(entries);
+    return applied;
+}
+
+static bool handle_placed(const process_t *proc, directory_t *queues,
+                          generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    char key[UUID_STRING_LEN + 1];
+    const char *group = NULL;
+    int k = 0;
+    json_t *payload = _place_payload(proc, nmsg, key, &group, &k);
+    if (payload == NULL)
+        return true;
+    json_t *value = json_object_get(payload, "value");
+    json_t *sigs = json_object_get(payload, "sigs");
+    if (!json_is_array(value) || !json_is_object(sigs))
+    {
+        json_decref(payload);
+        return true;
+    }
+    const char *chain_group = key[0] != '\0' ? group : NULL;
+    pthread_mutex_lock(&rep_state.lock);
+    int next = _chain_for_key_locked(key)->next_index;
+    if (k > next)
+    {
+        /* Ahead of us: hold it until the chain reaches k, and catch up. */
+        rep_place_state_t *st = _place_state_locked(proc, key);
+        if (st != NULL && (map_size(&st->ahead) < REP_PLACED_AHEAD_MAX
+                           || _place_text(&st->ahead, k) != NULL))
+        {
+            json_t *rec = json_pack("{s:O, s:O}", "value", value, "sigs", sigs);
+            char *text = rec != NULL ? json_dumps(rec, JSON_COMPACT) : NULL;
+            if (text != NULL)
+                _place_set_text(&st->ahead, k, text);
+            free(text);
+            json_decref(rec);
+        }
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    if (k > next)
+    {
+        _request_chain_for(proc, &nmsg->from_whom, key);
+        json_decref(payload);
+        return true;
+    }
+    if (k < next || !_apply_placement(proc, key, k, value, sigs, chain_group))
+    {
+        json_decref(payload);
+        return true;
+    }
+    json_decref(payload);
+    pthread_mutex_lock(&rep_state.lock);
+    rep_place_state_t *placed_st = _place_state_locked(proc, key);
+    if (placed_st != NULL)
+    {
+        uuid_unparse_lower(nmsg->from_whom.uuid, placed_st->placer);
+        placed_st->lead_set = false;
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    _apply_ahead(proc, key, chain_group);
+    return true;
+}
+
+/* Write the decided placements held ahead of chain @p key that now follow
+ * it, in order, and forget any it has passed. Caller holds no lock. Mirrors
+ * Python _apply_ahead. */
+static void _apply_ahead(const process_t *proc, const char *key,
+                         const char *chain_group)
+{
+    for (;;)
+    {
+        pthread_mutex_lock(&rep_state.lock);
+        rep_place_state_t *st = _place_state_locked(proc, key);
+        int at = _chain_for_key_locked(key)->next_index;
+        const char *held = st != NULL ? _place_text(&st->ahead, at) : NULL;
+        json_t *rec = held != NULL ? json_loads(held, 0, NULL) : NULL;
+        if (st != NULL)
+            _place_prune_below(&st->ahead, at + (rec != NULL ? 1 : 0));
+        pthread_mutex_unlock(&rep_state.lock);
+        if (rec == NULL)
+            break;
+        bool more = _apply_placement(proc, key, at, json_object_get(rec, "value"),
+                                     json_object_get(rec, "sigs"), chain_group);
+        json_decref(rec);
+        if (!more)
+            break;
+    }
+}
+
+/* The indices of segment @p arr whose placement certificates verify against
+ * OUR view of the group, or, with *@p refused set, nothing: a certificate
+ * over entries the segment carries in full that does not verify refuses the
+ * segment whole. A placement carried only in part that we cannot complete
+ * from our own entries (or complete differently) is just uncertified.
+ * Returns a malloc'd array (NULL when empty) of *@p n_out indices. Caller
+ * holds no lock. Mirrors Python _placement_certified_indices. */
+/* May a node that knows no roster of chain @p key take segment entry @p r
+ * (the segment's latest roster entry, catch-up wire form) as the group's?
+ * It must differ from the group as identity shows it to us by at most one
+ * member (perhaps ourselves), list the same keys for the members both know,
+ * and carry a placement certificate signed by a majority of the roster before
+ * it, counting only members we know and verifying their signatures with the
+ * keys identity holds. A history invented by an insider fails one of these.
+ * Mirrors Python _roster_anchor_ok. */
+static bool _roster_anchor_ok(const process_t *proc, const char *key, json_t *r)
+{
+    const char *op = json_string_value(json_object_get(r, "roster_op"));
+    const char *who = json_string_value(json_object_get(r, "roster_uuid"));
+    const char *dig = json_string_value(json_object_get(r, "roster_digest"));
+    const char *task = json_string_value(json_object_get(r, "task"));
+    const char *prev = json_string_value(json_object_get(r, "prev_hash"));
+    json_t *ji = json_object_get(r, "index");
+    json_t *jf = json_object_get(r, "place_from");
+    json_t *sigs = json_object_get(r, "place_sigs");
+    json_t *members = NULL;
+    char d[TX_HASH_HEX_LEN + 1];
+    if (!tx_roster_op_valid(op) || dig == NULL || task == NULL
+        || !json_is_integer(ji) || !json_is_integer(jf)
+        || json_integer_value(jf) != json_integer_value(ji) || !json_is_object(sigs)
+        || roster_digest(json_object_get(r, "roster_members"), d, &members) != 0
+        || strcmp(d, dig) != 0)
+    {
+        json_decref(members);
+        return false;
+    }
+    json_t *live = _live_roster(proc, key);
+    bool ok = live != NULL;
+    size_t diff = 0, i;
+    json_t *m;
+    json_array_foreach(live, i, m)
+    {
+        const char *u = json_string_value(json_array_get(m, 0));
+        const char *mk = _roster_key_of(members, u);
+        if (mk == NULL)
+            diff++;
+        else if (strcmp(mk, json_string_value(json_array_get(m, 1))) != 0)
+            ok = false;
+    }
+    json_array_foreach(members, i, m)
+        if (_roster_key_of(live, json_string_value(json_array_get(m, 0))) == NULL)
+            diff++;
+    if (diff > 1)
+        ok = false;
+    /* The roster before it: an add's, without the member it adds. */
+    size_t before = json_array_size(members);
+    bool is_add = strcmp(op, "add") == 0 && who != NULL;
+    if (is_add && _roster_key_of(members, who) != NULL)
+        before--;
+    transaction_t tx;
+    memset(&tx, 0, sizeof(tx));
+    tx.index = -1;
+    tx.roster = true;
+    at_strlcpy(tx.roster_op, op, sizeof(tx.roster_op));
+    at_strlcpy(tx.roster_digest, dig, sizeof(tx.roster_digest));
+    if (uuid_parse(task, tx.task_uuid) != 0 || (who != NULL && uuid_parse(who, tx.roster_uuid) != 0))
+        ok = false;
+    int k = (int)json_integer_value(ji);
+    char digest[TX_HASH_HEX_LEN + 1];
+    place_value_digest(&tx, 1, k, digest);
+    uint8_t desig[PLACE_DESIG_MAX];
+    size_t dlen = place_designation(k, prev != NULL ? prev : "", digest, desig, sizeof(desig));
+    size_t signers = 0;
+    const char *voter;
+    json_t *val;
+    json_object_foreach(sigs, voter, val)
+    {
+        if (!ok || dlen == 0 || _roster_key_of(members, voter) == NULL
+            || (is_add && strcasecmp(voter, who) == 0))
+            continue;
+        if (_verify_cosignature_in(proc, live, voter, desig, dlen, json_string_value(val)))
+            signers++;
+    }
+    ok = ok && signers >= before / 2 + 1;
+    json_decref(members);
+    json_decref(live);
+    return ok;
+}
+
+static int *_placement_certified_indices(const process_t *proc, const char *key,
+                                         const char *group, json_t *arr,
+                                         int *n_out, bool *refused)
+{
+    *n_out = 0;
+    *refused = false;
+    /* We know no roster of this chain (a newcomer, or a node far behind):
+     * anchor on the segment's latest roster entry. What precedes it is taken
+     * by its hash links; what follows, by the rosters it leads to. */
+    pthread_mutex_lock(&rep_state.lock);
+    tx_history_t *own = _chain_for_key_locked(key);
+    bool know = tx_history_roster_at(own, own->next_index, NULL) == 0;
+    pthread_mutex_unlock(&rep_state.lock);
+    json_t *anchor = NULL;
+    int anchor_at = -1;
+    size_t ai;
+    json_t *ae;
+    json_array_foreach(arr, ai, ae)
+    {
+        json_t *ji = json_object_get(ae, "index");
+        if (!know && json_is_integer(ji) && json_object_get(ae, "roster_op") != NULL
+            && (int)json_integer_value(ji) > anchor_at)
+        {
+            anchor = ae;
+            anchor_at = (int)json_integer_value(ji);
+        }
+    }
+    int *anchored = NULL;
+    int n_anchored = 0;
+    if (anchor != NULL)
+    {
+        if (!_roster_anchor_ok(proc, key, anchor))
+        {
+            *refused = true;
+            return NULL;
+        }
+        anchored = calloc(json_array_size(arr) + 1, sizeof(int));
+        json_array_foreach(arr, ai, ae)
+        {
+            json_t *ji = json_object_get(ae, "index");
+            if (anchored != NULL && json_is_integer(ji)
+                && (int)json_integer_value(ji) <= anchor_at)
+                anchored[n_anchored++] = (int)json_integer_value(ji);
+        }
+    }
+    tx_place_batch_t *batches = NULL;
+    int nb = 0;
+    pthread_mutex_lock(&rep_state.lock);
+    int rc = tx_history_place_batches(_chain_for_key_locked(key), arr,
+                                      &batches, &nb);
+    pthread_mutex_unlock(&rep_state.lock);
+    if (rc != 0 || nb == 0)
+    {
+        free(batches);
+        if (anchored != NULL && n_anchored > 0)
+        {
+            *n_out = n_anchored;
+            return anchored;
+        }
+        free(anchored);
+        return NULL;
+    }
+    int *out = calloc((size_t)nb * PLACE_BATCH_MAX + (size_t)n_anchored + 1, sizeof(int));
+    if (out == NULL)
+    {
+        free(batches);
+        free(anchored);
+        *refused = true;
+        return NULL;
+    }
+    for (int i = 0; i < n_anchored; i++)
+        out[(*n_out)++] = anchored[i];
+    free(anchored);
+    for (int b = 0; b < nb; b++)
+    {
+        tx_place_batch_t *bt = &batches[b];
+        if (bt->n <= 0 || (anchor != NULL && bt->k <= anchor_at))
+            continue;
+        if (_placement_certified_seg(proc, key, arr, bt->entries, bt->n, bt->k,
+                                     bt->entries[0].prev_hash, (json_t *)bt->sigs,
+                                     group))
+        {
+            for (int i = 0; i < bt->n; i++)
+                out[(*n_out)++] = bt->k + i;
+        }
+        else if (bt->whole)
+        {
+            *refused = true;
+            break;
+        }
+    }
+    free(batches);
+    if (*refused || *n_out == 0)
+    {
+        free(out);
+        *n_out = 0;
+        return NULL;
+    }
+    return out;
+}
+
+/* ---- Ordered placement: the proposer ---------------------------------
+ *
+ * The node that placed the previous instance on a chain leads the next one,
+ * so in a quiet group one node drives every placement and nobody duels.
+ * Every other member with ready items waits REP_PLACE_READY_WAIT, plus
+ * REP_PLACE_RANK_STEP per place it holds in this instance's ranking, before
+ * taking over; hearing anyone else work on the instance resets that wait. A
+ * round that stalls for REP_PLACE_ROUND_TIMEOUT is dropped, and a refused one
+ * backs off a random interval, so rival proposers spread out instead of
+ * colliding again. Mirrors Python PlacementMixin's proposer. */
+
+#define REP_PLACE_READY_WAIT    3.0
+#define REP_PLACE_RANK_STEP     0.3
+#define REP_PLACE_ROUND_TIMEOUT 5.0
+
+static int64_t g_place_seen_n;
+
+static double _mono(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static double _place_backoff(void)
+{
+    return 0.5 + (double)randombytes_uniform(1500) / 1000.0;
+}
+
+/* Note that someone is working on instance @p k of chain @p key. */
+static void _note_place_heard(const process_t *proc, const char *key, int k)
+{
+    pthread_mutex_lock(&rep_state.lock);
+    rep_place_state_t *st = _place_state_locked(proc, key);
+    if (st != NULL)
+    {
+        st->heard_k = k;
+        st->heard_at = _mono();
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+/* Is @p voter this node or a peer on our roster? */
+static bool _place_member(const process_t *proc, const char *voter)
+{
+    unsigned char pk[crypto_sign_PUBLICKEYBYTES];
+    return _cosigner_pubkey(proc, voter, pk);
+}
+
+/* Does @p voter decide instance @p k of chain @p key? A member of the roster
+ * in force for it, or, while the chain holds none, this node or a peer.
+ * Mirrors Python _place_voter / _place_members. */
+static bool _place_member_at(const process_t *proc, const char *key, int k,
+                             const char *voter)
+{
+    json_t *roster = _roster_at(key, k);
+    if (roster == NULL)
+        return _place_member(proc, voter);
+    bool in = _roster_key_of(roster, voter) != NULL;
+    json_decref(roster);
+    return in;
+}
+
+/* How many signatures, the proposer's own included, decide instance @p k: a
+ * strict majority of the roster in force, or of the live view while there is
+ * none. Mirrors Python _place_majority. */
+static size_t _place_majority(const process_t *proc, const char *key, int k,
+                              const char *group)
+{
+    json_t *roster = _roster_at(key, k);
+    if (roster != NULL)
+    {
+        size_t n = _roster_majority(roster);
+        json_decref(roster);
+        return n;
+    }
+    pthread_mutex_lock(&rep_state.lock);
+    bool unfounded = k == 0 && !_founded_locked(key);
+    pthread_mutex_unlock(&rep_state.lock);
+    if (unfounded)
+    {
+        /* The genesis: every member it will list. */
+        json_t *live = _live_roster(proc, key);
+        size_t n = json_array_size(live);
+        json_decref(live);
+        return n;
+    }
+    peers_read_lock(proc);
+    size_t q = _round_quorum_for_group(proc, group);
+    peers_read_unlock(proc);
+    return q + 1;
+}
+
+/* Do this node (@p me) and the proposer (@p by) both decide instance @p k?
+ * Once the chain holds a roster only its members promise, accept or propose
+ * there. Mirrors Python _place_deciders_ok. */
+static bool _place_deciders_ok(const process_t *proc, const char *key, int k,
+                               const char *me, const char *by)
+{
+    return _place_member_at(proc, key, k, me) && _place_member_at(proc, key, k, by);
+}
+
+/* blake2b(uuid|k), 16 bytes, hex: a member's place in instance k's order. */
+static void _rank_hash(const char *uuid, int k, char out[33])
+{
+    char in[UUID_STRING_LEN + 24];
+    unsigned char h[16];
+    snprintf(in, sizeof(in), "%s|%d", uuid, k);
+    crypto_generichash(h, sizeof(h), (const unsigned char *)in, strlen(in), NULL, 0);
+    sodium_bin2hex(out, 33, h, sizeof(h));
+}
+
+/* Where this node stands in instance @p k's takeover order on chain @p key:
+ * the members deciding k by blake2b(uuid|k), 16 bytes, hex. -1 when @p me is
+ * not one of them. */
+static int _place_rank(const process_t *proc, const char *key, const char *me,
+                       int k)
+{
+    char mine[33];
+    char in[UUID_STRING_LEN + 24];
+    unsigned char h[16];
+    _rank_hash(me, k, mine);
+    json_t *roster = _roster_at(key, k);
+    if (roster != NULL)
+    {
+        int rank = _roster_key_of(roster, me) != NULL ? 0 : -1;
+        size_t i;
+        json_t *m;
+        json_array_foreach(roster, i, m)
+        {
+            char theirs[33];
+            const char *u = json_string_value(json_array_get(m, 0));
+            if (rank < 0 || u == NULL)
+                continue;
+            _rank_hash(u, k, theirs);
+            if (strcmp(theirs, mine) < 0)
+                rank++;
+        }
+        json_decref(roster);
+        return rank;
+    }
+    int rank = 0;
+    peers_read_lock(proc);
+    for (size_t i = 0; i < proc->protocol.num_peers; i++)
+    {
+        char u[UUID_STRING_LEN + 1], theirs[33];
+        if (!_place_peer_in_chain(proc, &proc->protocol.peers[i], key))
+            continue;
+        uuid_unparse_lower(proc->protocol.peers[i].uuid, u);
+        snprintf(in, sizeof(in), "%s|%d", u, k);
+        crypto_generichash(h, sizeof(h), (const unsigned char *)in, strlen(in), NULL, 0);
+        sodium_bin2hex(theirs, sizeof(theirs), h, sizeof(h));
+        if (strcmp(theirs, mine) < 0)
+            rank++;
+    }
+    peers_read_unlock(proc);
+    return rank;
+}
+
+/* Our own ready items @p value (owned), kept only where an acceptor will take
+ * them. One it would refuse (a half whose certificate falls short of our
+ * quorum, say) leaves the pool, or it would sink every round that carries it.
+ * Returns the kept value, or NULL when nothing is left. Caller holds no lock.
+ * Mirrors Python handle_place_grant. */
+static json_t *_place_own_value_valid(const process_t *proc, const char *key,
+                                      json_t *value, const char *group)
+{
+    json_t *kept = json_array();
+    size_t i;
+    json_t *e;
+    json_array_foreach(value, i, e)
+    {
+        json_t *one = json_array();
+        json_array_append(one, e);
+        const char *why = _place_value_why(proc, key, one, group);
+        json_decref(one);
+        if (why == NULL)
+        {
+            json_array_append(kept, e);
+            continue;
+        }
+        const char *task = json_string_value(json_object_get(e, "task"));
+        uuid_t tu;
+        if (task != NULL && uuid_parse(task, tu) == 0)
+        {
+            pthread_mutex_lock(&rep_state.lock);
+            (void)tx_history_pool_drop(_chain_for_key_locked(key), tu);
+            pthread_mutex_unlock(&rep_state.lock);
+        }
+        log_warn(proc->logger, "Reputation: placement: dropping %.8s from the "
+                 "pool: %s\n", task != NULL ? task : "?", why);
+    }
+    json_decref(value);
+    if (json_array_size(kept) == 0)
+    {
+        json_decref(kept);
+        return NULL;
+    }
+    return kept;
+}
+
+static json_t *_place_ready_value_locked(const tx_history_t *chain);
+
+/* What we would place next on chain @p key (wire entries, a new reference),
+ * or NULL: a roster entry alone when one is due, else our ready items --
+ * none before the chain is founded. Caller must NOT hold rep_state.lock.
+ * Mirrors Python _own_place_value. */
+static json_t *_place_own_value(const process_t *proc, const char *key)
+{
+    json_t *item = _roster_item(proc, key);
+    if (item != NULL)
+    {
+        json_t *v = json_array();
+        json_array_append_new(v, item);
+        return v;
+    }
+    pthread_mutex_lock(&rep_state.lock);
+    json_t *v = _founded_locked(key)
+        ? _place_ready_value_locked(_chain_for_key_locked(key)) : NULL;
+    pthread_mutex_unlock(&rep_state.lock);
+    return v;
+}
+
+/* The value of our ready items on chain @p key, as wire entries. Caller holds
+ * rep_state.lock. */
+static json_t *_place_ready_value_locked(const tx_history_t *chain)
+{
+    transaction_t *items = calloc(PLACE_BATCH_MAX, sizeof(transaction_t));
+    if (items == NULL)
+        return NULL;
+    int n = tx_history_ready_items(chain, items, PLACE_BATCH_MAX);
+    json_t *value = n > 0 ? json_array() : NULL;
+    for (int i = 0; value != NULL && i < n; i++)
+    {
+        const transaction_t *tx = &items[i];
+        json_t *d = json_object();
+        char t[UUID_STRING_LEN + 1], a[UUID_STRING_LEN + 1];
+        uuid_unparse_lower(tx->task_uuid, t);
+        uuid_unparse_lower(tx->p1_uuid, a);
+        json_object_set_new(d, "task", json_string(t));
+        json_object_set_new(d, "p1", json_string(a));
+        json_object_set_new(d, "p1_score", json_real(tx->p1_score));
+        if (tx->attested)
+        {
+            char s[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(tx->subject_uuid, s);
+            json_object_set_new(d, "attested", json_true());
+            json_object_set_new(d, "p1_channel", json_string(tx->p1_channel));
+            json_object_set_new(d, "subject", json_string(s));
+            json_object_set_new(d, "evidence_digest", json_string(tx->evidence_digest));
+            if (tx->attest_scope[0] != '\0')
+                json_object_set_new(d, "attest_scope", json_string(tx->attest_scope));
+            data_t *cd = NULL;
+            char *text = NULL;
+            if (map_get((map_t *)&chain->pool_certs, (map_key_t)t, &cd) == 0
+                && data_string_ptr(cd, &text) == 0 && text != NULL)
+                json_object_set_new(d, "attest_sigs", json_loads(text, 0, NULL));
+        }
+        else
+        {
+            char b[UUID_STRING_LEN + 1];
+            uuid_unparse_lower(tx->p2_uuid, b);
+            json_object_set_new(d, "p2", json_string(b));
+            json_object_set_new(d, "p2_score", json_real(tx->p2_score));
+            if (tx->p1_channel[0] != '\0')
+                json_object_set_new(d, "p1_channel", json_string(tx->p1_channel));
+            if (tx->p2_channel[0] != '\0')
+                json_object_set_new(d, "p2_channel", json_string(tx->p2_channel));
+            for (int side = 0; side < 2; side++)
+            {
+                char key[2 * UUID_STRING_LEN + 2];
+                snprintf(key, sizeof(key), "%s|%s", t, side == 0 ? a : b);
+                data_t *cd = NULL;
+                char *text = NULL;
+                if (map_get((map_t *)&chain->pool_certs, (map_key_t)key, &cd) == 0
+                    && data_string_ptr(cd, &text) == 0 && text != NULL)
+                    json_object_set_new(d, side == 0 ? "p1_cert" : "p2_cert",
+                                        json_loads(text, 0, NULL));
+            }
+        }
+        json_array_append_new(value, d);
+    }
+    free(items);
+    return value;
+}
+
+/* Open a round for chain @p key's next instance: promise our own ballot,
+ * then ask the group. */
+static void _start_place_round(const process_t *proc, const char *key, const char *me)
+{
+    pthread_mutex_lock(&rep_state.lock);
+    rep_place_state_t *st = _place_state_locked(proc, key);
+    tx_history_t *chain = _chain_for_key_locked(key);
+    if (st == NULL || st->broken)
+    {
+        pthread_mutex_unlock(&rep_state.lock);
+        return;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    int64_t n = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    if (n <= g_place_seen_n)
+        n = g_place_seen_n + 1;
+    if (st->have_promised && st->prom_n >= n)
+        n = st->prom_n + 1;
+    g_place_seen_n = n;
+    st->have_promised = true;
+    st->prom_n = n;
+    at_strlcpy(st->prom_by, me, sizeof(st->prom_by));
+    if (!_persist_place_state(proc, st))
+    {
+        pthread_mutex_unlock(&rep_state.lock);
+        return;
+    }
+    int k = chain->next_index;
+    _place_round_close(st);
+    st->round_open = true;
+    st->round_k = k;
+    st->round_n = n;
+    at_strlcpy(st->round_head, chain->head_hash, sizeof(st->round_head));
+    st->round_grants = json_object();
+    const char *held = _place_text(&st->accepted, k);
+    json_object_set_new(st->round_grants, me,
+                        held != NULL ? json_loads(held, 0, NULL) : json_null());
+    st->round_accepts = json_object();
+    st->round_started = _mono();
+    json_t *req = json_object();
+    json_object_set_new(req, "group", json_string(key));
+    json_object_set_new(req, "k", json_integer(k));
+    json_object_set_new(req, "ballot", _ballot_json(n, me));
+    json_object_set_new(req, "head", json_string(st->round_head));
+    pthread_mutex_unlock(&rep_state.lock);
+    _place_broadcast(proc, REP_PROTO_PLACE_REQUEST, key, req);
+    json_decref(req);
+}
+
+/* Start a placement round on chain @p key if its ready items are ours to
+ * place now. */
+static void _place_unasked(const process_t *proc, const char *key,
+                           const char *me, int64_t n);
+
+static void _maybe_place_chain(const process_t *proc, const char *key,
+                               const char *me)
+{
+    double clock = _mono();
+    json_t *item = _roster_item(proc, key);
+    bool roster_due = item != NULL;
+    json_decref(item);
+    pthread_mutex_lock(&rep_state.lock);
+    rep_place_state_t *st = _place_state_locked(proc, key);
+    tx_history_t *chain = _chain_for_key_locked(key);
+    if (st == NULL)
+    {
+        pthread_mutex_unlock(&rep_state.lock);
+        return;
+    }
+    int k = chain->next_index;
+    if (st->round_open && st->round_k != k)
+        _place_round_close(st);
+    if (st->round_open)
+    {
+        if (clock - st->round_started > REP_PLACE_ROUND_TIMEOUT)
+        {
+            _place_round_close(st);
+            st->lead_set = false;
+            st->backoff_until = clock + _place_backoff();
+        }
+        pthread_mutex_unlock(&rep_state.lock);
+        return;
+    }
+    transaction_t probe;
+    bool ready = clock >= st->backoff_until
+        && (roster_due || (tx_history_ready_items(chain, &probe, 1) > 0
+                           && _founded_locked(key)));
+    if (!ready)
+    {
+        if (clock >= st->backoff_until)
+            st->ready_k = -1;
+        pthread_mutex_unlock(&rep_state.lock);
+        return;
+    }
+    if (st->ready_k != k)
+    {
+        st->ready_k = k;
+        st->ready_since = clock;
+    }
+    bool busy = st->heard_k == k && clock - st->heard_at < REP_PLACE_ROUND_TIMEOUT;
+    char placer[UUID_STRING_LEN + 1];
+    at_strlcpy(placer, st->placer, sizeof(placer));
+    double since = st->ready_since;
+    /* Our ballot still carries k when it is the one a majority promised us at
+     * k - 1, we have promised no other since, and hold nothing accepted at k. */
+    bool lead = st->lead_set && st->lead_k == k && !st->broken
+        && st->have_promised && st->prom_n == st->lead_n
+        && strcmp(st->prom_by, me) == 0 && _place_text(&st->accepted, k) == NULL;
+    int64_t lead_n = st->lead_n;
+    pthread_mutex_unlock(&rep_state.lock);
+    if (busy)
+        return;
+    int rank = _place_rank(proc, key, me, k);
+    if (rank < 0)
+        return;                         /* not a member of the roster in force */
+    if (placer[0] != '\0' && !_place_member_at(proc, key, k, placer))
+        placer[0] = '\0';
+    bool leader = placer[0] != '\0' ? strcmp(placer, me) == 0 : rank == 0;
+    double wait = leader ? 0.0 : REP_PLACE_READY_WAIT + rank * REP_PLACE_RANK_STEP;
+    if (clock - since < wait)
+        return;
+    if (leader && lead)
+    {
+        _place_unasked(proc, key, me, lead_n);
+        return;
+    }
+    pthread_mutex_lock(&rep_state.lock);
+    rep_place_state_t *again = _place_state_locked(proc, key);
+    if (again != NULL)
+        again->lead_set = false;
+    pthread_mutex_unlock(&rep_state.lock);
+    _start_place_round(proc, key, me);
+}
+
+/* Start a placement round on any chain whose ready items are ours to place
+ * now: the primary, then each child chain a gateway holds whose group places.
+ * Runs on the process loop. Mirrors Python PlacementMixin._maybe_place. */
+static void _maybe_place(const process_t *proc)
+{
+    uuid_t self_uuid;
+    if (!_resolve_self_uuid(proc, self_uuid))
+        return;
+    char me[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(self_uuid, me);
+    if (_ordered_placement(proc, NULL))
+        _maybe_place_chain(proc, "", me);
+    /* The child chains' keys, copied: the index is the map's own and a
+     * round may materialize another chain while we walk. */
+    pthread_mutex_lock(&rep_state.lock);
+    array_t *keys = map_keys(&rep_state.child_hist);
+    size_t n = keys != NULL ? array_size(keys) : 0, m = 0;
+    char (*chains)[UUID_STRING_LEN + 1] = calloc(n > 0 ? n : 1, sizeof(*chains));
+    for (size_t i = 0; chains != NULL && i < n; i++)
+    {
+        data_t *kd = NULL, *live = NULL;
+        char *key = NULL;
+        if (array_get(keys, (int)i, &kd) == 0 && data_string_ptr(kd, &key) == 0
+            && key != NULL && key[0] != '\0'
+            && map_get(&rep_state.child_hist, (map_key_t)key, &live) == 0)
+            at_strlcpy(chains[m++], key, sizeof(chains[0]));
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    for (size_t i = 0; chains != NULL && i < m; i++)
+        if (_ordered_placement(proc, chains[i]))
+            _maybe_place_chain(proc, chains[i], me);
+    free(chains);
+}
+
+/* The round a reply is for, or NULL. Caller holds rep_state.lock. */
+static rep_place_state_t *_place_round_for_locked(const process_t *proc,
+                                                  const char *key, int k,
+                                                  json_t *payload)
+{
+    rep_place_state_t *st = _place_state_locked(proc, key);
+    int64_t n;
+    char by[UUID_STRING_LEN + 1];
+    if (st == NULL || !st->round_open || st->round_k != k
+        || !_parse_ballot(json_object_get(payload, "ballot"), &n, by)
+        || n != st->round_n || strcmp(by, st->prom_by) != 0)
+        return NULL;
+    return st;
+}
+
+/* Phase 2 of our round at instance @p k under (@p n, @p me): accept @p value
+ * ourselves, durably, then ask chain @p key's group to. Shared by a round
+ * whose majority granted (handle_place_grant) and the leader's skip
+ * (_place_unasked). Mirrors Python PlacementMixin._send_place. */
+static void _send_place(const process_t *proc, const char *key, int k,
+                        int64_t n, const char *me, const char *head,
+                        json_t *value)
+{
+    transaction_t *entries = calloc(PLACE_BATCH_MAX, sizeof(transaction_t));
+    int m = entries != NULL ? _place_value_from_json(value, entries) : -1;
+    char digest[TX_HASH_HEX_LEN + 1] = {0};
+    if (m > 0)
+        place_value_digest(entries, m, k, digest);
+    free(entries);
+    uint8_t desig[PLACE_DESIG_MAX];
+    size_t dlen = place_designation(k, head, digest, desig, sizeof(desig));
+    char sig[REP_SIG_HEX_LEN + 1] = {0};
+    bool signed_ok = digest[0] != '\0' && dlen > 0
+        && _cosign_hex(proc, desig, dlen, sig, sizeof(sig)) == 0;
+
+    pthread_mutex_lock(&rep_state.lock);
+    rep_place_state_t *st = _place_state_locked(proc, key);
+    bool kept = false;
+    if (st != NULL && st->round_open && st->round_k == k && st->round_n == n
+        && st->round_value == NULL && signed_ok
+        && !(st->have_promised && _ballot_cmp(n, me, st->prom_n, st->prom_by) < 0))
+    {
+        /* Our own acceptance, durable before anyone hears of it. */
+        _place_prune_below(&st->accepted, k);
+        json_t *rec = json_object();
+        json_object_set_new(rec, "ballot", _ballot_json(n, me));
+        json_object_set(rec, "value", value);
+        char *text = json_dumps(rec, JSON_COMPACT);
+        json_decref(rec);
+        if (text != NULL)
+        {
+            _place_set_text(&st->accepted, k, text);
+            free(text);
+            kept = _persist_place_state(proc, st);
+        }
+        if (kept)
+        {
+            st->round_value = json_incref(value);
+            at_strlcpy(st->round_digest, digest, sizeof(st->round_digest));
+            json_object_set_new(st->round_accepts, me, json_string(sig));
+        }
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    if (kept)
+    {
+        json_t *place = json_object();
+        json_object_set_new(place, "group", json_string(key));
+        json_object_set_new(place, "k", json_integer(k));
+        json_object_set_new(place, "ballot", _ballot_json(n, me));
+        json_object_set_new(place, "head", json_string(head));
+        json_object_set(place, "value", value);
+        _place_broadcast(proc, REP_PROTO_PLACE, key, place);
+        json_decref(place);
+    }
+}
+
+/* Lead instance k under the ballot a majority promised us at k - 1: straight
+ * to `place`, with our own ready items (the leader's skip; see "Who
+ * proposes"). Mirrors Python PlacementMixin._place_unasked. */
+static void _place_unasked(const process_t *proc, const char *key,
+                           const char *me, int64_t n)
+{
+    pthread_mutex_lock(&rep_state.lock);
+    rep_place_state_t *st = _place_state_locked(proc, key);
+    tx_history_t *chain = _chain_for_key_locked(key);
+    if (st == NULL || st->broken || st->round_open)
+    {
+        pthread_mutex_unlock(&rep_state.lock);
+        return;
+    }
+    int k = chain->next_index;
+    st->round_open = true;
+    st->round_k = k;
+    st->round_n = n;
+    at_strlcpy(st->round_head, chain->head_hash, sizeof(st->round_head));
+    st->round_grants = json_object();
+    st->round_accepts = json_object();
+    st->round_started = _mono();
+    char head[TX_HASH_HEX_LEN + 1];
+    at_strlcpy(head, st->round_head, sizeof(head));
+    pthread_mutex_unlock(&rep_state.lock);
+    json_t *value = _place_own_value(proc, key);
+    if (value != NULL)
+        value = _place_own_value_valid(proc, key, value, key[0] != '\0' ? key : NULL);
+    if (value == NULL)
+    {
+        pthread_mutex_lock(&rep_state.lock);
+        rep_place_state_t *again = _place_state_locked(proc, key);
+        if (again != NULL)
+            _place_round_close(again);
+        pthread_mutex_unlock(&rep_state.lock);
+        return;
+    }
+    _send_place(proc, key, k, n, me, head, value);
+    json_decref(value);
+}
+
+static bool handle_place_grant(const process_t *proc, directory_t *queues,
+                               generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    char key[UUID_STRING_LEN + 1];
+    const char *group = NULL;
+    int k = 0;
+    json_t *payload = _place_payload(proc, nmsg, key, &group, &k);
+    if (payload == NULL)
+        return true;
+    char voter[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, voter);
+    if (!_place_member_at(proc, key, k, voter))
+    {
+        json_decref(payload);
+        return true;
+    }
+    uuid_t self_uuid;
+    char me[UUID_STRING_LEN + 1] = {0};
+    if (_resolve_self_uuid(proc, self_uuid))
+        uuid_unparse_lower(self_uuid, me);
+    size_t majority = _place_majority(proc, key, k, key[0] != '\0' ? group : NULL);
+
+    pthread_mutex_lock(&rep_state.lock);
+    rep_place_state_t *st = _place_round_for_locked(proc, key, k, payload);
+    if (st == NULL || st->round_value != NULL)
+    {
+        pthread_mutex_unlock(&rep_state.lock);
+        json_decref(payload);
+        return true;
+    }
+    json_t *acc = json_object_get(payload, "accepted");
+    json_object_set(st->round_grants, voter, json_is_object(acc) ? acc : json_null());
+    if (json_object_size(st->round_grants) < majority)
+    {
+        pthread_mutex_unlock(&rep_state.lock);
+        json_decref(payload);
+        return true;
+    }
+    /* A majority promised. Carry the highest-ballot value any of them
+     * accepted at k, or, if none did, our own ready items. */
+    json_t *best = NULL;
+    int64_t best_n = 0;
+    char best_by[UUID_STRING_LEN + 1] = {0};
+    const char *v = NULL;
+    json_t *g = NULL;
+    json_object_foreach(st->round_grants, v, g)
+    {
+        int64_t gn;
+        char gb[UUID_STRING_LEN + 1];
+        if (!json_is_object(g) || !json_is_array(json_object_get(g, "value"))
+            || !_parse_ballot(json_object_get(g, "ballot"), &gn, gb))
+            continue;
+        if (best == NULL || _ballot_cmp(gn, gb, best_n, best_by) > 0)
+        {
+            best = json_object_get(g, "value");
+            best_n = gn;
+            at_strlcpy(best_by, gb, sizeof(best_by));
+        }
+    }
+    json_t *value = best != NULL ? json_incref(best) : NULL;
+    int64_t n = st->round_n;
+    char head[TX_HASH_HEX_LEN + 1];
+    at_strlcpy(head, st->round_head, sizeof(head));
+    pthread_mutex_unlock(&rep_state.lock);
+    if (best == NULL)
+        value = _place_own_value(proc, key);
+    if (best == NULL && value != NULL)
+        value = _place_own_value_valid(proc, key, value,
+                                       key[0] != '\0' ? group : NULL);
+    if (value == NULL
+        || (best != NULL && _place_value_why(proc, key, value,
+                                             key[0] != '\0' ? group : NULL) != NULL))
+    {
+        if (best != NULL)
+            log_warn(proc->logger, "Reputation: placement %d: the value to carry "
+                     "is not valid here; dropping the round\n", k);
+        pthread_mutex_lock(&rep_state.lock);
+        rep_place_state_t *again = _place_state_locked(proc, key);
+        if (again != NULL)
+            _place_round_close(again);
+        pthread_mutex_unlock(&rep_state.lock);
+        json_decref(value);
+        json_decref(payload);
+        return true;
+    }
+    _send_place(proc, key, k, n, me, head, value);
+    json_decref(value);
+    json_decref(payload);
+    return true;
+}
+
+static bool handle_place_accepted(const process_t *proc, directory_t *queues,
+                                  generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    char key[UUID_STRING_LEN + 1];
+    const char *group = NULL;
+    int k = 0;
+    json_t *payload = _place_payload(proc, nmsg, key, &group, &k);
+    if (payload == NULL)
+        return true;
+    char voter[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, voter);
+    const char *digest = json_string_value(json_object_get(payload, "digest"));
+    const char *sig = json_string_value(json_object_get(payload, "sig"));
+    pthread_mutex_lock(&rep_state.lock);
+    rep_place_state_t *st = _place_round_for_locked(proc, key, k, payload);
+    bool ours = st != NULL && st->round_value != NULL && digest != NULL
+        && strcmp(digest, st->round_digest) == 0;
+    char head[TX_HASH_HEX_LEN + 1] = {0};
+    json_t *genesis = NULL;
+    if (ours)
+    {
+        at_strlcpy(head, st->round_head, sizeof(head));
+        genesis = _value_genesis(st->round_value);
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    uint8_t desig[PLACE_DESIG_MAX];
+    size_t dlen = ours ? place_designation(k, head, digest, desig, sizeof(desig)) : 0;
+    json_t *roster = ours ? _roster_at(key, k) : NULL;
+    if (roster != NULL)
+    {
+        json_decref(genesis);
+        genesis = NULL;
+    }
+    /* A genesis is decided by every member it lists, with their keys. */
+    bool verified = ours && dlen > 0
+        && _verify_cosignature_in(proc, roster != NULL ? roster : genesis, voter,
+                                  desig, dlen, sig);
+    json_decref(roster);
+    if (!verified)
+    {
+        json_decref(genesis);
+        json_decref(payload);
+        return true;
+    }
+    size_t majority = genesis != NULL ? json_array_size(genesis)
+        : _place_majority(proc, key, k, key[0] != '\0' ? group : NULL);
+    json_decref(genesis);
+    json_t *placed = NULL;
+    int64_t won_n = 0;
+    pthread_mutex_lock(&rep_state.lock);
+    st = _place_round_for_locked(proc, key, k, payload);
+    if (st != NULL && st->round_value != NULL)
+    {
+        json_object_set_new(st->round_accepts, voter, json_string(sig));
+        if (json_object_size(st->round_accepts) >= majority)
+        {
+            /* Decided. Tell everyone, and write it here. */
+            placed = json_object();
+            json_object_set_new(placed, "group", json_string(key));
+            json_object_set_new(placed, "k", json_integer(k));
+            json_object_set(placed, "value", st->round_value);
+            json_object_set(placed, "sigs", st->round_accepts);
+            won_n = st->round_n;
+            _place_round_close(st);
+        }
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    if (placed != NULL)
+    {
+        _place_broadcast(proc, REP_PROTO_PLACED, key, placed);
+        if (_apply_placement(proc, key, k, json_object_get(placed, "value"),
+                             json_object_get(placed, "sigs"),
+                             key[0] != '\0' ? group : NULL))
+        {
+            uuid_t self_uuid;
+            pthread_mutex_lock(&rep_state.lock);
+            rep_place_state_t *s2 = _place_state_locked(proc, key);
+            if (s2 != NULL && _resolve_self_uuid(proc, self_uuid))
+            {
+                uuid_unparse_lower(self_uuid, s2->placer);
+                /* Our ballot still carries the next instance (the leader's
+                 * skip) -- unless the group changed: a promise given under
+                 * the old roster is asked for again. */
+                bool roster_placed = false;
+                size_t pi;
+                json_t *pe;
+                json_array_foreach(json_object_get(placed, "value"), pi, pe)
+                    if (json_object_get(pe, "roster") != NULL)
+                        roster_placed = true;
+                s2->lead_set = !roster_placed;
+                s2->lead_k = _chain_for_key_locked(key)->next_index;
+                s2->lead_n = won_n;
+            }
+            pthread_mutex_unlock(&rep_state.lock);
+        }
+        json_decref(placed);
+    }
+    json_decref(payload);
+    return true;
+}
+
+static bool handle_place_nack(const process_t *proc, directory_t *queues,
+                              generic_msg_t *msg)
+{
+    (void)queues;
+    net_msg_t *nmsg = &msg->info.net_msg;
+    char key[UUID_STRING_LEN + 1];
+    const char *group = NULL;
+    int k = 0;
+    json_t *payload = _place_payload(proc, nmsg, key, &group, &k);
+    if (payload == NULL)
+        return true;
+    int64_t pn;
+    char pb[UUID_STRING_LEN + 1];
+    json_t *jnext = json_object_get(payload, "next");
+    /* Only a member deciding the instance can refuse it: a node the roster
+     * does not list yet -- one waiting to be added, still behind -- would
+     * otherwise end every round that adds it. */
+    char sender[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(nmsg->from_whom.uuid, sender);
+    bool member = _place_member_at(proc, key, k, sender);
+    pthread_mutex_lock(&rep_state.lock);
+    if (_parse_ballot(json_object_get(payload, "promised"), &pn, pb) && pn > g_place_seen_n)
+        g_place_seen_n = pn;
+    rep_place_state_t *st = member ? _place_round_for_locked(proc, key, k, payload) : NULL;
+    bool behind = false;
+    if (st != NULL)
+    {
+        _place_round_close(st);
+        st->lead_set = false;
+        st->backoff_until = _mono() + _place_backoff();
+        behind = json_is_integer(jnext)
+            && json_integer_value(jnext) > _chain_for_key_locked(key)->next_index;
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+    if (behind)
+        _request_chain_for(proc, &nmsg->from_whom, key);
+    json_decref(payload);
+    return true;
+}
+
 int reputation_register_handlers(process_t *proc)
 {
     if (proc == NULL) return -1;
@@ -10275,6 +13673,12 @@ int reputation_register_handlers(process_t *proc)
     process_register_handler(proc, REP_PROTO_NACK,      (handler_ptr_t)handle_nack);
     process_register_handler(proc, REP_PROTO_BACKDATE,  (handler_ptr_t)handle_backdate);
     process_register_handler(proc, REP_PROTO_TX,        (handler_ptr_t)handle_transaction);
+    process_register_handler(proc, REP_PROTO_PLACE_REQUEST, (handler_ptr_t)handle_place_request);
+    process_register_handler(proc, REP_PROTO_PLACE,     (handler_ptr_t)handle_place);
+    process_register_handler(proc, REP_PROTO_PLACED,    (handler_ptr_t)handle_placed);
+    process_register_handler(proc, REP_PROTO_PLACE_GRANT, (handler_ptr_t)handle_place_grant);
+    process_register_handler(proc, REP_PROTO_PLACE_ACCEPTED, (handler_ptr_t)handle_place_accepted);
+    process_register_handler(proc, REP_PROTO_PLACE_NACK, (handler_ptr_t)handle_place_nack);
     process_register_handler(proc, REP_PROTO_ACCEPTED,  (handler_ptr_t)handle_accepted);
     process_register_handler(proc, REP_PROTO_COMMITTED, (handler_ptr_t)handle_committed);
     process_register_handler(proc, REP_PROTO_OUTDATED,  (handler_ptr_t)handle_outdated);
@@ -10338,6 +13742,10 @@ void reputation_reset_state(int num_peers)
     map_init(&rep_state.handoff_passes);
     map_free(&rep_state.updates);
     map_init(&rep_state.updates);
+    for (int i = 0; i < REP_PAGE_BUFS; i++)
+        _page_buf_clear(&rep_state.page_bufs[i]);
+    rep_state.page_seq = 0;
+    rep_state.update_page_bytes = 0;
     array_free(&rep_state.requested_reps);
     array_init(&rep_state.requested_reps);
     /* History reset: free contents + reinit. tx_history_destroy
@@ -10421,6 +13829,11 @@ void reputation_reset_state(int num_peers)
     map_init(&rep_state.attest_sigs);
     map_free(&rep_state.commit_sigs);
     map_init(&rep_state.commit_sigs);
+    map_free(&rep_state.round_acceptors);
+    map_init(&rep_state.round_acceptors);
+    map_free(&rep_state.round_granters);
+    map_init(&rep_state.round_granters);
+    _place_states_free();
     memset(rep_state.attest_retries, 0, sizeof(rep_state.attest_retries));
     rep_state.slash_epoch = 0;
     map_free(&rep_state.slash_hw);
@@ -10514,6 +13927,14 @@ void reputation_set_last_id(int64_t id)
     pthread_mutex_unlock(&rep_state.lock);
 }
 
+void reputation_set_update_page_bytes(size_t bytes)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    rep_state.update_page_bytes = bytes;
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
 void reputation_set_num_updates(int n)
 {
     _ensure_init();
@@ -10558,14 +13979,14 @@ void reputation_install_accepted(int64_t id1, int64_t id2)
 {
     _ensure_init();
     pthread_mutex_lock(&rep_state.lock);
-    /* paxos_has_granted_id(id2) walks paxos.granted_ids — populated only
-     * by paxos_handle_request on the PAXOS_GRANT branch. To pretend a
-     * round at (id1, id2) was granted, append id2 directly and also
-     * stage a proposal so the score lookup in handle_accepted has
-     * something to find. */
+    /* handle_transaction takes the grant of the exact ballot, which only
+     * paxos_handle_request records on the PAXOS_GRANT branch. To pretend a
+     * round at (id1, id2) was granted, record it directly, and promise it,
+     * as a grant does. */
     data_t *id2_dat = integer_data((int)id2);
     if (id2_dat != NULL)
         array_append(&rep_state.paxos.granted_ids, id2_dat);
+    paxos_mark_granted(&rep_state.paxos, id1, id2);
     if (id1 > rep_state.paxos.last_id)
         rep_state.paxos.last_id = id1;
     pthread_mutex_unlock(&rep_state.lock);
@@ -10618,6 +14039,204 @@ void reputation_get_commit_cert_counts(int *halves_held, int *certified_halves)
     }
     if (halves_held != NULL) *halves_held = held;
     if (certified_halves != NULL) *certified_halves = certified;
+}
+
+void reputation_set_placement_dir(const char *dir)
+{
+    at_strlcpy(g_placement_dir, dir != NULL ? dir : "", sizeof(g_placement_dir));
+}
+
+void reputation_install_place_promise(int64_t n, const uuid_t by)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    rep_place_state_t *st = _place_state_locked(NULL, "");
+    if (st != NULL)
+    {
+        st->have_promised = true;
+        st->prom_n = n;
+        uuid_unparse_lower(by, st->prom_by);
+    }
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+bool reputation_get_place_promise(int64_t *n, uuid_t by)
+{
+    if (!rep_state.initialized)
+        return false;
+    bool have = false;
+    pthread_mutex_lock(&rep_state.lock);
+    for (int i = 0; i < rep_state.place_len; i++)
+        if (rep_state.place[i].key[0] == '\0' && rep_state.place[i].have_promised)
+        {
+            *n = rep_state.place[i].prom_n;
+            have = uuid_parse(rep_state.place[i].prom_by, by) == 0;
+        }
+    pthread_mutex_unlock(&rep_state.lock);
+    return have;
+}
+
+int reputation_get_chain_tasks(uuid_t *out, int max)
+{
+    if (!rep_state.initialized || out == NULL)
+        return 0;
+    int n = 0;
+    pthread_mutex_lock(&rep_state.lock);
+    const tx_history_t *h = &rep_state.history;
+    for (int i = 0; i < h->chain_len && n < max; i++)
+        if (tx_is_committed(&h->chain[i]))
+            uuid_copy(out[n++], h->chain[i].task_uuid);
+    pthread_mutex_unlock(&rep_state.lock);
+    return n;
+}
+
+int reputation_get_pool_tasks(uuid_t *out, int max)
+{
+    if (!rep_state.initialized || out == NULL)
+        return 0;
+    int n = 0;
+    pthread_mutex_lock(&rep_state.lock);
+    const tx_history_t *h = &rep_state.history;
+    for (int i = 0; i < h->pool_len && n < max; i++)
+        uuid_copy(out[n++], h->pool[i].task_uuid);
+    pthread_mutex_unlock(&rep_state.lock);
+    return n;
+}
+
+void reputation_persist_pools(const process_t *proc)
+{
+    _ensure_init();
+    _persist_pools(proc);
+}
+
+bool reputation_reset_pre_roster(const process_t *proc)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    bool reset = _reset_pre_roster_chain_locked(proc);
+    pthread_mutex_unlock(&rep_state.lock);
+    return reset;
+}
+
+void reputation_restore_pool(const process_t *proc)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    _restore_pool_locked(proc, "");
+    pthread_mutex_unlock(&rep_state.lock);
+}
+
+char *reputation_pool_json(void)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    json_t *doc = _pool_to_json(&rep_state.history);
+    pthread_mutex_unlock(&rep_state.lock);
+    char *text = doc != NULL ? json_dumps(doc, JSON_COMPACT) : NULL;
+    json_decref(doc);
+    return text;
+}
+
+int reputation_pool_load_json(const char *text)
+{
+    _ensure_init();
+    json_t *doc = text != NULL ? json_loads(text, 0, NULL) : NULL;
+    if (doc == NULL)
+        return -1;
+    pthread_mutex_lock(&rep_state.lock);
+    int held = _pool_from_json(&rep_state.history, doc);
+    pthread_mutex_unlock(&rep_state.lock);
+    json_decref(doc);
+    return held;
+}
+
+unsigned reputation_pool_rev(void)
+{
+    _ensure_init();
+    return rep_state.history.pool_rev;
+}
+
+int reputation_install_chain_json(const json_t *arr)
+{
+    _ensure_init();
+    if (!json_is_array(arr))
+        return -1;
+    size_t n = json_array_size(arr);
+    int *idx = calloc(n > 0 ? n : 1, sizeof(int));
+    if (idx == NULL)
+        return -1;
+    int m = 0;
+    size_t i;
+    json_t *e;
+    json_array_foreach((json_t *)arr, i, e)
+    {
+        json_t *ix = json_object_get(e, "index");
+        if (json_is_integer(ix))
+            idx[m++] = (int)json_integer_value(ix);
+    }
+    pthread_mutex_lock(&rep_state.lock);
+    int rc = tx_history_reconcile_placed(&rep_state.history, arr, -1, NULL,
+                                         idx, m, NULL);
+    pthread_mutex_unlock(&rep_state.lock);
+    free(idx);
+    return rc;
+}
+
+int reputation_record_half(const uuid_t task, const uuid_t scorer, double score,
+                           const char *channel, const char *cert_json)
+{
+    return reputation_record_half_on("", task, scorer, score, channel, cert_json);
+}
+
+int reputation_record_half_on(const char *chain_key, const uuid_t task,
+                              const uuid_t scorer, double score,
+                              const char *channel, const char *cert_json)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    int rc = tx_history_record_half(_chain_for_key_locked(chain_key), task, scorer,
+                                    score, channel, cert_json);
+    pthread_mutex_unlock(&rep_state.lock);
+    return rc;
+}
+
+void reputation_place_start(const process_t *proc)
+{
+    uuid_t self_uuid;
+    if (proc == NULL || !_resolve_self_uuid(proc, self_uuid))
+        return;
+    char me[UUID_STRING_LEN + 1];
+    uuid_unparse_lower(self_uuid, me);
+    _start_place_round(proc, "", me);
+}
+
+int reputation_set_roster_anchor(const json_t *members)
+{
+    _ensure_init();
+    pthread_mutex_lock(&rep_state.lock);
+    char digest[TX_HASH_HEX_LEN + 1];
+    int rc = tx_history_roster_put(&rep_state.history, members, digest);
+    if (rc == 0)
+        at_strlcpy(rep_state.history.roster_anchor, digest,
+                   sizeof(rep_state.history.roster_anchor));
+    pthread_mutex_unlock(&rep_state.lock);
+    return rc;
+}
+
+void reputation_maybe_place(const process_t *proc)
+{
+    if (proc != NULL)
+        _maybe_place(proc);
+}
+
+void reputation_get_head_hash(char *out)
+{
+    out[0] = '\0';
+    if (!rep_state.initialized)
+        return;
+    pthread_mutex_lock(&rep_state.lock);
+    at_strlcpy(out, rep_state.history.head_hash, TX_HASH_HEX_LEN + 1);
+    pthread_mutex_unlock(&rep_state.lock);
 }
 
 void reputation_get_window_root(char *out)
@@ -11022,7 +14641,14 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
     peers_read_lock(proc);
     rep_state.num_peers = (int)proc->protocol.num_peers;
     peers_read_unlock(proc);
-    paxos_init(&rep_state.paxos, rep_state.num_peers, logger);
+    /* Ballots carry a per-node id in their low 16 bits, so two nodes minting
+     * in the same millisecond do not propose equal ballots. */
+    uint16_t node_id = 0;
+    uuid_t node_uuid;
+    if (_resolve_self_uuid(proc, node_uuid))
+        node_id = (uint16_t)(((node_uuid[0] ^ node_uuid[14]) << 8)
+                             | (node_uuid[1] ^ node_uuid[15]));
+    paxos_init_with_node(&rep_state.paxos, rep_state.num_peers, node_id, logger);
 
     reputation_register_handlers(proc);
     proc->protocol.phase = 1;
@@ -11055,6 +14681,12 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
     _apply_seeds(proc);
     _seed_idle_from_snapshot(proc, have_self ? self_str : NULL);
     _rebuild_from_evidence(proc, have_self ? self_str : NULL);
+    /* Ordered placement's pending pool, after the chain it waits on -- and a
+     * chain from before rosters, reset first. */
+    pthread_mutex_lock(&rep_state.lock);
+    (void)_reset_pre_roster_chain_locked(proc);
+    _restore_pool_locked(proc, "");
+    pthread_mutex_unlock(&rep_state.lock);
     /* Slash replay marks, before the loop can handle a slash_final. Also
      * resumes our own slash epoch, so it must precede the first origination. */
     _load_slash_marks(proc);
@@ -11100,11 +14732,15 @@ int reputation_run(process_t *proc, directory_t *queues, queue_id_t signal, logg
         _recheck_parked_cosigns(proc, present);
         /* Our attestation rounds whose propose went missing (ISSUES §2.40). */
         _retry_pending_attestations(proc, present);
+        /* Ordered placement: propose the next instance if it is ours now. */
+        _maybe_place(proc);
         /* A gateway's child groups arrive over IPC (CHILD_GROUP) after this
          * process was constructed, so their persisted evidence is restored
          * here rather than at boot. Idempotent per group. */
         if (proc->protocol.child_groups != NULL)
             _restore_child_evidence(proc, have_self ? self_str : NULL);
+        /* After the child chains are restored, so their pools wait on them. */
+        _persist_pools(proc);
 
         /* Drain what is queued rather than one per tick: the per-pass work
          * above keeps its cadence, but a reputation burst (every peer's

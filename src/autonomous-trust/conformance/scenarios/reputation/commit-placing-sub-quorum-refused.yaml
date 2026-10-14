@@ -1,0 +1,39 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: commit-placing-sub-quorum-refused
+byte_pinning: false
+description: |
+    Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+    order"). bob's roster is alice, carol and dave, so a certificate needs two
+    signatures besides alice's. Only carol signed: bob pools nothing.
+    Placement-mode twin of commit-cert-sub-quorum-refused.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: proposer
+  - id: dave
+    role: member
+
+fixtures:
+  ordered_placement: true
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: tx committed
+    payload:
+      task_id: t-1
+      score: 0.8
+      cosigners: [carol]
+
+expected_state:
+  bob:
+    committed_tx_count: 0
+    chain_tasks: []
+    pool_tasks: []

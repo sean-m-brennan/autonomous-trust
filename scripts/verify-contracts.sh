@@ -52,6 +52,9 @@ VALID_MODULES=(
     utilities
     dtn
     gateway
+    rendezvous
+    first_contact
+    data_source
 )
 
 # The verification layers (FEATURE_SPLIT_PLAN Phase 3, src/c/extensions/<layer>/).
@@ -267,7 +270,7 @@ elif [[ -n "$module" ]]; then
     fi
     while IFS= read -r -d '' f; do
         files+=("$f")
-    done < <(find "$mod_dir" -name '*.c' -type f -not -path '*/test/*' -print0 | sort -z)
+    done < <(find "$mod_dir" -name '*.c' -type f -not -path '*/test/*' -not -path '*/conformance/*' -print0 | sort -z)
 else
     # All modules
     for m in "${VALID_MODULES[@]}"; do
@@ -275,7 +278,7 @@ else
         if [[ -d "$mod_dir" ]]; then
             while IFS= read -r -d '' f; do
                 files+=("$f")
-            done < <(find "$mod_dir" -name '*.c' -type f -not -path '*/test/*' -print0 | sort -z)
+            done < <(find "$mod_dir" -name '*.c' -type f -not -path '*/test/*' -not -path '*/conformance/*' -print0 | sort -z)
         fi
     done
 fi

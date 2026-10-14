@@ -88,6 +88,13 @@ typedef struct
      * zeroed struct == every group predating the field. Mirrors Python
      * Group.commit_certificates. Last, for the reason wire_format is. */
     bool commit_certificates;
+    /* Whether Paxos decides this group's chain order (doc/architecture/
+     * reputation.md, "Agreeing on an order"). Group-carried for the reason
+     * commit_certificates is: a cohort that half placed and half appended as
+     * entries completed would fork. Rides group_to_json as
+     * "ordered_placement" (emitted only when true) and identity.proto
+     * Group.ordered_placement. Mirrors Python Group.ordered_placement. */
+    bool ordered_placement;
 } group_t;
 
 /**
@@ -239,6 +246,15 @@ const char *group_rotation_refusal(const group_t *group, const group_t *other);
  * resolve_commit_certificates.
  */
 bool group_commit_certificates_resolve(void);
+
+/**
+ * @brief Whether Paxos decides the chain order of a group this node MINTS:
+ *        AT_ORDERED_PLACEMENT, default ON since 2026-10-13. "0", "false", "no"
+ *        or "off" (trimmed, any case) turns it off; anything else, or unset,
+ *        leaves it on. Stamps a new group and nothing else. Mirrors Python
+ *        resolve_ordered_placement.
+ */
+bool group_ordered_placement_resolve(void);
 
 net_wire_format_t group_wire_format_for_address(const group_t *group,
                                                 const char *address);

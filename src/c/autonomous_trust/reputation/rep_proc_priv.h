@@ -142,6 +142,11 @@ void reputation_set_last_id(int64_t id);
  *  default of 3 could never accumulate across steps. */
 void reputation_set_num_updates(int n);
 
+/** Page catch-up replies whose window serializes to more than @p bytes
+ *  (0 restores REP_UPDATE_PAGE_BYTES). Test and conformance seam; reset by
+ *  reputation_reset_state. */
+void reputation_set_update_page_bytes(size_t bytes);
+
 /** Pre-install an outstanding paxos round on the dispatching
  *  participant. handle_grant looks the entry up by @p proposer_uuid.
  *  @p task_uuid carries through into the broadcast tx payload on
@@ -158,6 +163,73 @@ void reputation_install_my_request(int64_t id1, int64_t id2,
  *  this to satisfy handle_transaction's "did we grant this round?"
  *  check. */
 void reputation_install_accepted(int64_t id1, int64_t id2);
+
+/** Keep placement state under @p dir rather than the config directory, or
+ *  NULL for the config directory. Test and conformance seam: every
+ *  participant shares one process there, and a promise must not survive into
+ *  the next case. */
+void reputation_set_placement_dir(const char *dir);
+
+/** Stage the primary chain's promised placement ballot (@p n, @p by). */
+void reputation_install_place_promise(int64_t n, const uuid_t by);
+
+/** The primary chain's promised placement ballot: true and @p n / @p by, or
+ *  false when nothing is promised. */
+bool reputation_get_place_promise(int64_t *n, uuid_t by);
+
+/** The task uuids of the primary chain's resident entries, in index order,
+ *  up to @p max. Returns how many. */
+int reputation_get_chain_tasks(uuid_t *out, int max);
+/* The primary chain's pooled tasks, in pool order. */
+int reputation_get_pool_tasks(uuid_t *out, int max);
+/* Load a catch-up segment into the primary chain verbatim, every entry taken
+ * as certified (placement certificates and commit certificates included), as
+ * the local_chain fixture of a placed chain needs. */
+int reputation_install_chain_json(const json_t *arr);
+
+/** Put a committed half in the primary chain's pool, as a commit does under
+ *  ordered placement. Returns tx_history_record_half's status. */
+int reputation_record_half(const uuid_t task, const uuid_t scorer, double score,
+                           const char *channel, const char *cert_json);
+
+/** reputation_record_half on chain @p chain_key ("" is the primary, else a
+ *  child group's uuid), creating the child chain on first use. */
+int reputation_record_half_on(const char *chain_key, const uuid_t task,
+                              const uuid_t scorer, double score,
+                              const char *channel, const char *cert_json);
+
+/** Take @p members ([[uuid, signing key hex], ...]) as the roster in force on
+ *  the primary chain below every resident roster entry (a conformance
+ *  fixture's stand-in for a roster logged earlier). Returns 0, or -1 for a
+ *  malformed list. */
+int reputation_set_roster_anchor(const json_t *members);
+
+/** Reset a placing primary chain that holds entries but no roster, as boot
+ *  does. True when it was reset. */
+bool reputation_reset_pre_roster(const process_t *proc);
+
+/** Write each placing chain's pool if it changed, as the process loop does. */
+void reputation_persist_pools(const process_t *proc);
+/** Put the primary chain's persisted pool back, as boot does (once per state
+ *  reset). */
+void reputation_restore_pool(const process_t *proc);
+/** The primary chain's pool as persisted, compact JSON text (caller frees). */
+char *reputation_pool_json(void);
+/** Put a persisted pool document into the primary chain's pool. Returns how
+ *  many items are pooled afterwards, or -1 when it is not a pool document. */
+int reputation_pool_load_json(const char *text);
+/** The primary chain's pool revision. */
+unsigned reputation_pool_rev(void);
+
+/** Open a placement round on the primary chain now, as _maybe_place does
+ *  once it is this node's turn. */
+void reputation_place_start(const process_t *proc);
+/** One pass of the proposer over every placing chain, as the process loop
+ *  runs it. */
+void reputation_maybe_place(const process_t *proc);
+
+/** The primary chain's head hash ("" for an empty chain). */
+void reputation_get_head_hash(char *out);   /* TX_HASH_HEX_LEN + 1 */
 
 /** Read the current chain length (committed history entries) for
  *  expected_state assertions. Returns -1 if state is uninitialized.

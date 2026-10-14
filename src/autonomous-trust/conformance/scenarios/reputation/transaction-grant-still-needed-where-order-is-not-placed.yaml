@@ -1,0 +1,41 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: transaction-grant-still-needed-where-order-is-not-placed
+byte_pinning: false
+description: |
+    A group that does not place its order (doc/architecture/reputation.md,
+    "Agreeing on a history") keeps the full half round: there the grant is
+    what orders the chain. A proposal that names the group as if it placed,
+    and asks to be certified, is still dropped when bob never granted it.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+
+fixtures:
+  commit_certificates: true
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: transaction
+    payload:
+      id1: 1000
+      id2: 1
+      proposer: alice
+      task_id: t-1
+      score: 0.8
+      certify: true
+      placing: true
+
+  - id: 2
+    from: bob
+    to: alice
+    function: tx accepted
+    in_response_to: 1
+    expect_none: true
+    payload: {}

@@ -70,6 +70,7 @@ typedef struct {
     map_t acceptances;         /**< id_index → acceptance count. */
     map_t backoff;             /**< id_index → current backoff seconds. */
     array_t granted_ids;       /**< Ballot IDs granted in the current chain. */
+    map_t granted;             /**< id_index of each exact ballot granted and not yet taken. */
     pthread_mutex_t lock;      /**< Serializes all mutating operations. */
     logger_t *logger;          /**< Non-owning logger sink. */
     bool initialized;          /**< @c true between paxos_init/paxos_destroy. */
@@ -168,7 +169,7 @@ void paxos_id_index(char *buf, size_t len, int64_t id1, int64_t id2);
   requires inst->initialized == \true;
   requires \valid(out_last_id);
   requires \valid(out_chain_len);
-  assigns inst->last_id, inst->granted_ids,
+  assigns inst->last_id, inst->granted_ids, inst->granted,
           *out_last_id, *out_chain_len;
   ensures \result == PAXOS_GRANT || \result == PAXOS_NACK || \result == PAXOS_BACKDATE;
   ensures \result == PAXOS_GRANT ==> inst->last_id == id1;
@@ -223,6 +224,37 @@ int paxos_record_acceptance(paxos_instance_t *inst,
 bool paxos_has_granted_id(paxos_instance_t *inst, int id2);
 
 /**
+ * @brief Take the grant of the exact ballot (@p id1, @p id2) for its
+ *        transaction.
+ *
+ * Phase 2 of classic Paxos: an acceptor takes a transaction only under a
+ * ballot it granted, and only while it has promised no higher one since.
+ * The grant is used up either way, so one grant carries one transaction.
+ *
+ * @return @c true if (@p id1, @p id2) was granted and @p id1 is still at
+ *         least @c last_id.
+ */
+/*@
+  requires \valid(inst);
+  requires inst->initialized == \true;
+  assigns inst->granted;
+  ensures \result == \true || \result == \false;
+*/
+bool paxos_take_grant(paxos_instance_t *inst, int64_t id1, int64_t id2);
+
+/**
+ * @brief Record the exact ballot (@p id1, @p id2) as granted, as
+ *        paxos_handle_request does on @ref PAXOS_GRANT. Test and
+ *        conformance seam.
+ */
+/*@
+  requires \valid(inst);
+  requires inst->initialized == \true;
+  assigns inst->granted;
+*/
+void paxos_mark_granted(paxos_instance_t *inst, int64_t id1, int64_t id2);
+
+/**
  * @brief Commit the current position and advance @c chain_len by one.
  *
  * Called once a ballot has reached quorum and its value is durably chosen.
@@ -238,7 +270,9 @@ void paxos_advance_chain(paxos_instance_t *inst);
 /**
  * @brief Generate the next (@c id1, @c id2) pair to propose.
  *
- * @p id1 is an instance-monotonic counter; @p id2 is @c chain_len + 1.
+ * @p id1 is an instance-monotonic counter, raised past @c last_id when a
+ * promised ballot outranks it, so the node's own grant counts toward its
+ * round; @c last_id becomes @p id1. @p id2 is @c chain_len + 1.
  *
  * @param[in]  inst     Initialized instance.
  * @param[out] out_id1  New ballot primary ID.
@@ -249,7 +283,7 @@ void paxos_advance_chain(paxos_instance_t *inst);
   requires inst->initialized == \true;
   requires \valid(out_id1);
   requires \valid(out_id2);
-  assigns inst->last_id, *out_id1, *out_id2;
+  assigns inst->last_id, inst->next_counter, *out_id1, *out_id2;
   ensures *out_id2 == \old(inst->chain_len) + 1;
 */
 void paxos_next_ids(paxos_instance_t *inst, int64_t *out_id1, int64_t *out_id2);

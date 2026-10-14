@@ -1,0 +1,45 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: place-roster-not-alone-refused
+byte_pinning: false
+description: |
+    Membership recorded in the chain (doc/architecture/reputation.md, "Who is
+    in the group"). A roster entry is placed alone, so the next instance's
+    deciders are never in doubt. A value carrying an add beside an ordinary
+    entry is refused.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  ordered_placement: true
+  roster:
+    bob: [alice, bob, carol]
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: place
+    payload:
+      k: 0
+      ballot: {n: 5, by: alice}
+      head: ""
+      value:
+        - {roster: add, member: dave}
+        - {task_id: t-1, p1: carol, p1_score: 0.9, p2: dave, p2_score: 0.7}
+  - id: 2
+    from: bob
+    to: alice
+    function: place accepted
+    in_response_to: 1
+    expect_none: true
+    payload: {}

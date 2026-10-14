@@ -682,6 +682,12 @@ ffi.cdef("""
         unsigned char subject_uuid[16];
         char evidence_digest[65];
         char attest_scope[65];   /* optional scope; appended */
+        /* roster entries (reputation.md "Who is in the group"); appended,
+         * as in reputation.h. TX_ROSTER_OP_LEN 8, TX_HASH_HEX_LEN + NUL. */
+        bool roster;
+        char roster_op[8];
+        unsigned char roster_uuid[16];
+        char roster_digest[65];
     } transaction_t;
 
     /* tx_history_t/reputations_t contain embedded maps/arrays — opaque */

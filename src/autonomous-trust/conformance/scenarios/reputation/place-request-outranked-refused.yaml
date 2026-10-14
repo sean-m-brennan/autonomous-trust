@@ -1,0 +1,53 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: place-request-outranked-refused
+byte_pinning: false
+description: |
+    Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+    order"): classic Paxos decides what the chain holds from each index.
+    bob has promised ballot (9, carol). alice asks under (5, alice), which ranks
+    below it, so bob refuses with a nack and grants nothing; its promise stands.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  ordered_placement: true
+  place_promised:
+    bob: {n: 9, by: carol}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: place request
+    payload:
+      k: 0
+      ballot: {n: 5, by: alice}
+      head: ""
+  - id: 2
+    from: bob
+    to: alice
+    function: place grant
+    in_response_to: 1
+    expect_none: true
+    payload: {}
+  - id: 3
+    from: bob
+    to: alice
+    function: place nack
+    in_response_to: 1
+    no_propagate: true
+    payload: {}
+
+expected_state:
+  bob:
+    place_promised: {n: 9, by: carol}

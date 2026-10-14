@@ -148,4 +148,9 @@ message Group {
   // certificates"). Group-carried for the reason wire_format is; absent/false
   // = not required, which is every group minted before this field.
   bool commit_certificates = 7;
+  // Whether Paxos decides this group's chain order (doc/architecture/
+  // reputation.md, "Agreeing on an order"). Group-carried for the reason
+  // commit_certificates is; absent/false = entries go in as they complete,
+  // which is every group minted before this field.
+  bool ordered_placement = 8;
 }

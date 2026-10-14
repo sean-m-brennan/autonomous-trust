@@ -19,9 +19,15 @@
  * @brief DTN/Bundle-Protocol implementation of net_transport_t.
  *
  * Maps AT's three logical channels onto bundle destinations:
- *   NET_CHAN_PEER      -> dtn://at-<peer-uuid>/peer     (BPSec bcb, NaCl Box)
- *   NET_CHAN_BROADCAST -> dtn://at-group-<hash>/bcast   (no BPSec, flooded)
- *   NET_CHAN_GROUP     -> dtn://at-group-<hash>/group   (BPSec bcb, SecretBox)
+ *   NET_CHAN_PEER      -> dtn://at-<peer-uuid>/peer     (NaCl Box in the payload)
+ *   NET_CHAN_BROADCAST -> dtn://at-group-<hash>/bcast   (plaintext, flooded)
+ *   NET_CHAN_GROUP     -> dtn://at-group-<hash>/group   (SecretBox in the payload)
+ *
+ * No BPSec block is added. AT's own encryption rides inside the payload, so a
+ * frame is as confidential as over UDP, but a forwarder sees an unprotected
+ * bundle and there is no BPSec integrity block. Every bundle asks for a 24 h
+ * lifetime; only the ION backend passes it on, and the AAP backends leave it
+ * to the daemon's default.
  *
  * The transport keeps one logical endpoint per channel (via service demux
  * suffixes) but receives all inbound bundles from a single backend recv

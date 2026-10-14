@@ -60,9 +60,10 @@ def _grant_all(rp, queues):
     id1, id2 = idx
     for peer in rp.protocol.peers.all:
         ack = ((id1, id2, rp.identity.uuid), (None, len(rp.history)), None)
-        rp.handle_grant(queues, Message(CfgIds.reputation,
-                                        ReputationProtocol.grant,
-                                        to_yaml_string(ack), from_whom=peer))
+        msg = Message(CfgIds.reputation, ReputationProtocol.grant,
+                      to_yaml_string(ack), from_whom=peer)
+        msg.verified = True
+        rp.handle_grant(queues, msg)
     return idx
 
 

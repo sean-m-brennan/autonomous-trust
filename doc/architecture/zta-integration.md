@@ -295,6 +295,13 @@ verifies a credential against ZTA infrastructure, it broadcasts the result via
 `ZTA_PROTO_VERIFICATION`. Peers that could not verify independently accept the
 delegated result, but only from peers they trust.
 
+**Not wired yet.** The receive side below is written, and the send side never
+reaches a peer. `_broadcast_verification` puts its message on the local network
+process's queue, and the network process does not forward it, so no peer ever
+receives a vouch. A DDIL-admitted peer stays capped until this node's own
+re-verification proves it. The same holds for revocation alerts (§9). This
+section describes the design.
+
 ### How it works
 
 1. Peer A admits Peer B in DDIL mode (reputation capped at 0.5).
@@ -361,7 +368,7 @@ that:
 1. **Periodically re-verifies** peer credentials against ZTA infrastructure at the configured interval.
 2. **Applies reputation penalties** for revoked or expired credentials.
 3. **Resolves deferred verifications** when infrastructure becomes available.
-4. **Broadcasts revocation alerts** to the group via `ZTA_PROTO_REVOCATION_ALERT` messages.
+4. **Is meant to broadcast revocation alerts** to the group via `ZTA_PROTO_REVOCATION_ALERT` messages. It does not yet: the alert stops at the local network process, and the revoking node only penalizes locally (§8).
 5. **Enforces reputation caps** on peers admitted without ZTA verification.
 
 When ZTA is disabled at runtime, the process exits immediately.
@@ -377,7 +384,9 @@ ZTA peers exchange three message types via the network layer:
 | `zta_reverify` | `ZTA_PROTO_REVERIFY_REQ` | Request peers to re-verify a specific peer |
 
 These use the existing `net_msg_t` transport with the function field set to the
-protocol constant.
+protocol constant. That is the design. Today the three constants are defined
+and not used: nothing sends them to a peer and no handler is registered for
+them.
 
 ---
 

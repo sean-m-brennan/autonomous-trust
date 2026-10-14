@@ -1808,7 +1808,7 @@ void handle_inbound_peer(net_thread_ctx_t *ctx,
                 log_warn(ctx->logger,
                          "Network: group_key_update arrived UNVERIFIED via "
                          "unknown-sender-plaintext (has_signature=%d) — the rotation will be "
-                         "ignored\\n", (int)wmsg.has_signature);
+                         "ignored\n", (int)wmsg.has_signature);
             route_to_process(&wmsg, ctx->proc, ctx->queues, ctx->logger);
             net_wire_msg_free(&wmsg);
         } else {
@@ -2079,7 +2079,7 @@ void handle_inbound_group(net_thread_ctx_t *ctx,
                 log_warn(ctx->logger,
                          "Network: group_key_update arrived UNVERIFIED via "
                          "group-channel (has_signature=%d) — the rotation will be "
-                         "ignored\\n", (int)wmsg.has_signature);
+                         "ignored\n", (int)wmsg.has_signature);
             /* Gateway boundary, invariant B: the pre-admission handshake is
              * never a group message -- announce is broadcast, accept and
              * history are point-to-point to an unplaced identity -- so a

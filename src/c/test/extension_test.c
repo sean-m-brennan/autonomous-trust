@@ -375,6 +375,7 @@ DEFINE_TEST(test_core_only_has_no_social_and_refuses_its_declarations)
     ck_assert_int_eq(map_get(proc.protocol.handlers, (map_key_t)"app_peer_standing", &h), 0);
 
     unsetenv("AT_OWN_GEOHASH");
+    unsetenv("AT_OWN_EXACT");
     unsetenv("AT_OWN_PROFILE");
     ck_assert_int_eq(identity_ext_check_env(NULL), 0);
     setenv("AT_OWN_PROFILE", "{\"display_name\": \"x\"}", 1);
@@ -385,6 +386,9 @@ DEFINE_TEST(test_core_only_has_no_social_and_refuses_its_declarations)
     setenv("AT_OWN_GEOHASH", "9q8yy", 1);
     ck_assert_int_eq(identity_ext_check_env(NULL), -1);
     unsetenv("AT_OWN_GEOHASH");
+    setenv("AT_OWN_EXACT", "37.77,-122.42", 1);   /* the same table as Python's */
+    ck_assert_int_eq(identity_ext_check_env(NULL), -1);
+    unsetenv("AT_OWN_EXACT");
 }
 END_TEST_DEFINITION()
 

@@ -56,6 +56,11 @@
             "default": false,
             "description": "When true on an assertion step (in_response_to set), the engine verifies the captured outbound exists in the parent step's outbox but does NOT deliver it to the recipient. Useful when the recipient's handler depends on state outside the scenario's control or hits a known production bug."
           },
+          "expect_none": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true on an assertion step (in_response_to set), the engine verifies that NO message matching from/to/function is in the parent step's outbox: a refusal that must stay silent. Nothing is delivered."
+          },
           "repeat": {
             "type": "integer",
             "minimum": 1,

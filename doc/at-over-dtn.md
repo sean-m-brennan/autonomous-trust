@@ -75,6 +75,12 @@ bundle layer, surviving store-carry-forward hops -- unlike TLS which requires an
 end-to-end connection. The existing AT NaCl encryption maps directly to BPSec
 security contexts.
 
+**What is built.** The DTN transport (`libat_dtn`, `autonomous_trust.dtn`)
+does not add BPSec blocks yet. AT's NaCl encryption travels in the bundle
+payload, so a frame is as confidential as it is over UDP. A forwarder sees an
+unprotected bundle, though, and there is no BPSec integrity block. The table
+above is the design, not the current wire.
+
 ### 2.3 Messages as Bundles
 
 AT messages follow a pipe-delimited wire format:
