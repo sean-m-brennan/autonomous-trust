@@ -14,6 +14,7 @@
 #   limitations under the License.
 # ******************
 
+import copy
 import json
 import math
 import os
@@ -199,6 +200,51 @@ def attest_task_id(verifier, subject, evidence_digest) -> UUID:
     tx_attest_task_uuid."""
     return uuid5(ATTEST_NS, f'{str(verifier).lower()}|{str(subject).lower()}|'
                             f'{evidence_digest}')
+
+
+#: uuid5(NAMESPACE_URL, 'urn:autonomous-trust:roster'). Mirrors AT_ROSTER_NS.
+ROSTER_NS = UUID('26dd8363-9e20-5e9e-9627-133144c10ccc')
+
+#: What a roster entry records (doc/architecture/reputation.md, "Who is in the
+#: group"): the first roster, one member added, or the same members restated so
+#: the roster in force never leaves the resident window.
+ROSTER_OPS = ('genesis', 'add', 'restate')
+
+
+def roster_members_norm(members) -> 'list[tuple[str, str]]':
+    """``members`` as sorted ``(uuid, signing key hex)`` pairs, lowercase.
+    Raises ValueError on a malformed or repeated member."""
+    out = {}
+    for m in members or ():
+        uid, key = m[0], m[1]
+        uid = str(UUID(str(uid))).lower()
+        key = str(key).lower()
+        if len(key) != 64 or any(c not in '0123456789abcdef' for c in key):
+            raise ValueError('roster member key is not 32 bytes of hex')
+        if uid in out:
+            raise ValueError('roster member repeated')
+        out[uid] = key
+    if not out:
+        raise ValueError('empty roster')
+    return sorted(out.items())
+
+
+def roster_digest(members) -> str:
+    """blake2b over ``AT-ROSTER\0`` and one ``uuid:key`` line per member,
+    sorted by uuid: what a roster entry's hash covers of its member list.
+    Mirrors C roster_digest."""
+    lines = '\n'.join('%s:%s' % m for m in roster_members_norm(members))
+    return MerkleTree.get_hash(b'AT-ROSTER\x00' + lines.encode('ascii')).decode('ascii')
+
+
+def roster_task_id(prev_task, op, member, digest) -> UUID:
+    """The task id a roster entry carries: uuid5 over
+    ``prev roster task|op|member|digest`` ('null' for none), so two members
+    proposing the same change propose the same value. Mirrors
+    tx_roster_task_uuid."""
+    prev = 'null' if prev_task is None else str(prev_task).lower()
+    who = 'null' if member is None else str(member).lower()
+    return uuid5(ROSTER_NS, f'{prev}|{op}|{who}|{digest}')
 
 
 #: uuid5(NAMESPACE_URL, 'urn:autonomous-trust:task-pair'). Mirrors AT_PAIR_NS.
@@ -478,6 +524,62 @@ def commit_designation(scorer, task_id, score, channel=None) -> bytes:
             + b'|' + str(chan).encode())
 
 
+# Upper bound on the entries one placement decides (doc/architecture/
+# reputation.md, "Agreeing on an order").
+PLACE_BATCH_MAX = 32
+
+# The persisted pool's schema (TransactionHistory.pool_to_dict).
+POOL_SCHEMA = 1
+
+
+def placement_entry(tx: 'Transaction') -> 'Transaction':
+    """`tx` as a placement writes it: a copy with no index or link, and the two
+    halves of an ordinary entry ordered by scorer uuid, so every node builds
+    the same bytes whichever half reached it first. An attested entry keeps its
+    verifier in p1. Mirrors C placement_entry."""
+    out = copy.copy(tx)
+    out.index = None
+    out.prev_hash = None
+    out.place_from = None
+    out.place_sigs = None
+    if (not out.attested and out.p1_id is not None and out.p2_id is not None
+            and str(out.p2_id).lower() < str(out.p1_id).lower()):
+        out.p1_id, out.p2_id = out.p2_id, out.p1_id
+        out.p1_score, out.p2_score = out.p2_score, out.p1_score
+        out.p1_channel, out.p2_channel = out.p2_channel, out.p1_channel
+    return out
+
+
+def place_value_bytes(entries, k: int) -> bytes:
+    """The canonical bytes of a placement's value: `entries` (placement
+    entries, in order) written at chain indices k, k+1, ..., each in its
+    entry's canonical form. Domain-separated. Mirrors C place_value_bytes."""
+    parts = []
+    for i, entry in enumerate(entries):
+        at = copy.copy(entry)
+        at.index = int(k) + i
+        parts.append(at._canonical_bytes())
+    return b'AT-PLACE-VALUE\x00' + b'\n'.join(parts)
+
+
+def place_value_digest(entries, k: int) -> bytes:
+    """blake2b of :func:`place_value_bytes`, 64 lowercase hex bytes, like an
+    entry hash."""
+    return MerkleTree.get_hash(place_value_bytes(entries, k))
+
+
+def place_designation(k: int, prev_hash, digest) -> bytes:
+    """The bytes an acceptor signs to certify a placement: that the value with
+    `digest` is what the chain holds from index `k`, after the entry whose hash
+    is `prev_hash` (b'' at the genesis). Covering the predecessor pins the whole
+    prefix, so the group is not needed. Mirrors C place_designation."""
+    prev = prev_hash or b''
+    if isinstance(prev, str):
+        prev = prev.encode('ascii')
+    dig = digest.encode('ascii') if isinstance(digest, str) else digest
+    return b'AT-PLACE\x00' + str(int(k)).encode() + b'|' + prev + b'|' + dig
+
+
 class Transaction(Configuration):
     """A committed chain entry: who transacted, how well, and how we know.
 
@@ -499,7 +601,10 @@ class Transaction(Configuration):
                  p2_channel: str = None, attested: bool = False,
                  subject_id: UUID = None, evidence_digest: str = None,
                  attest_sigs: dict = None, commit_sigs: dict = None,
-                 attest_scope: str = None):
+                 attest_scope: str = None, place_from: int = None,
+                 place_sigs: dict = None, roster_op: str = None,
+                 roster_uuid: UUID = None, roster_digest: str = None,
+                 roster_members: list = None):
         self.task_id = task_id
         self.p1_id = p1_id
         self.p1_score = p1_score
@@ -559,6 +664,38 @@ class Transaction(Configuration):
                              if isinstance(v, dict)}
                             if isinstance(commit_sigs, dict) and commit_sigs
                             else None)
+        # The placement certificate (doc/architecture/reputation.md, "Agreeing
+        # on an order"), on the LAST entry a decided placement wrote:
+        # `place_from` is the index the placement began at and `place_sigs`
+        # {voter uuid str: signature hex over place_designation}. Carried on
+        # the catch-up wire and in persisted evidence so a receiver can check
+        # the placement; NOT in the canonical bytes, like the other
+        # certificates.
+        self.place_from = (int(place_from) if place_sigs and place_from is not None
+                           else None)
+        self.place_sigs = ({str(k): str(v) for k, v in place_sigs.items()}
+                           if isinstance(place_sigs, dict) and place_sigs
+                           and place_from is not None else None)
+        # A ROSTER entry (doc/architecture/reputation.md, "Who is in the
+        # group"): who the group is from the next index on. No scorer and no
+        # score; `roster_op` is one of ROSTER_OPS, `roster_uuid` the member an
+        # `add` adds, and `roster_digest` covers the member list, which
+        # travels beside the entry like a certificate ([[uuid, signing key
+        # hex]], `roster_members`) and is checked against the digest. Covered
+        # by the canonical bytes. Mirrors transaction_t.roster / roster_op /
+        # roster_uuid / roster_digest.
+        if roster_op is not None and roster_op not in ROSTER_OPS:
+            raise ValueError('unknown roster op %r' % (roster_op,))
+        self.roster_op = roster_op
+        self.roster_uuid = roster_uuid
+        self.roster_digest = roster_digest
+        self.roster_members = ([[str(u), str(k)] for u, k in
+                                roster_members_norm(roster_members)]
+                               if roster_members else None)
+
+    @property
+    def is_roster(self) -> bool:
+        return self.roster_op is not None
 
     def __len__(self):
         if self.p1_id is None and self.p2_id is None:
@@ -597,6 +734,15 @@ class Transaction(Configuration):
         # cuts one, so its entries keep the shape they always had.
         if not d.get('commit_sigs'):
             d.pop('commit_sigs', None)
+        # And the placement certificate: only a placement's last entry has one.
+        if not d.get('place_sigs'):
+            d.pop('place_sigs', None)
+            d.pop('place_from', None)
+        # And the roster fields: only a roster entry has them.
+        if d.get('roster_op') is None:
+            for k in ('roster_op', 'roster_uuid', 'roster_digest',
+                      'roster_members'):
+                d.pop(k, None)
         return d
 
     def certificate_of(self, scorer) -> 'dict | None':
@@ -692,6 +838,12 @@ class Transaction(Configuration):
             # The scope, only when set: an unscoped entry's bytes are unchanged.
             if self.attest_scope:
                 fields.append(str(self.attest_scope))
+        if self.roster_op is not None:
+            # A roster entry: no scorer, no channel, so its block follows the
+            # six common fields. No other entry has `roster` there ("roster"
+            # is not a channel), and no existing entry's bytes change.
+            fields += ['roster', str(self.roster_op), _u(self.roster_uuid),
+                       self.roster_digest or 'null']
         return '|'.join(fields).encode('utf-8')
 
     def entry_hash(self) -> bytes:
@@ -729,12 +881,19 @@ class ReconcileResult:
     KEPT = 'kept'                # forked; our tip won
     REFUSED_FINAL = 'refused_final'  # forked inside our finalized checkpoint
     REJECTED = 'rejected'        # links, a gap, or an impossible duplicate
+    # Ordered placement: the peer's CERTIFIED entry differs from one we hold
+    # inside our own placed prefix. Two quorums cannot certify two values at
+    # one index unless someone signed both, so this is never resolved by rule.
+    EQUIVOCATION = 'equivocation'
 
     def __init__(self):
         self.status = self.NONE
         self.fork = None
         self.dropped: 'list[Transaction]' = []
         self.added: 'list[Transaction]' = []
+        # Under ordered placement: how many dropped entries went back to the
+        # pool to be placed again.
+        self.pooled = 0
 
 
 class TransactionHistory(Mapping):
@@ -828,6 +987,28 @@ class TransactionHistory(Mapping):
         # signature hex}. OUTSIDE the entry hash, as a checkpoint's
         # co-signatures are outside its root; evicted with the entry.
         self.attest_certs: dict = {}
+        # Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+        # order"). Committed halves and certified attestations wait in the
+        # POOL, by task, until a decided placement writes their entry; nothing
+        # in it is in the chain or the peer map, so no score reads it. Bounded
+        # FIFO, the size of the chain.
+        self._pool: 'OrderedDict[UUID, Transaction]' = OrderedDict()
+        # Bumped on every change to the pool, so the process persists it
+        # (reputation-pool.cfg.json) only when there is something new.
+        self.pool_rev = 0
+        # Decided placements that arrived ahead of the chain: first index ->
+        # (entries, placement certificate). Applied in order.
+        self._decided: dict = {}
+        # Placement certificates, task_id of a placement's LAST entry ->
+        # {voter uuid str: signature hex over place_designation}. Outside the
+        # entry hash; evicted with the entry.
+        self.place_certs: dict = {link.task_id: dict(link.place_sigs)
+                                   for link in self._chain
+                                   if getattr(link, 'place_sigs', None)}
+        # A roster taken as in force below every resident roster entry, with
+        # no index: how a conformance fixture stands for a roster logged before
+        # the scenario starts, as fixture checkpoints stand for finalized ones.
+        self.roster_anchor: 'Transaction | None' = None
 
     def _map_peers(self, tx: Transaction):
         if tx.p1_id is not None:
@@ -851,6 +1032,7 @@ class TransactionHistory(Mapping):
         oldest = self._chain.pop(0)
         self._task_mapping.pop(oldest.task_id, None)
         self.attest_certs.pop(oldest.task_id, None)
+        self.place_certs.pop(oldest.task_id, None)
         for peer_id in {oldest.p1_id, oldest.p2_id,
                         oldest.subject_id if oldest.attested else None} - {None}:
             lst = self._peer_mapping.get(peer_id)
@@ -930,14 +1112,9 @@ class TransactionHistory(Mapping):
             if len(self._chain) == 1:
                 self._first_index = tx.index
 
-    def append_attested(self, tx: Transaction, certificate: dict = None) -> bool:
-        """Commit a verifier-attested entry. Returns False, and changes
-        nothing, unless `tx` is well-formed: attested, the verifier in p1 with
-        a score in [0, 1] on an attestable channel, p2 unset, a subject other
-        than the verifier, a valid evidence digest, the derived task id, and a
-        task id this history has never held. The quorum is the CALLER's to
-        check; this is the chain's half of the rule. Mirrors
-        tx_history_append_attested."""
+    @staticmethod
+    def _attested_well_formed(tx: Transaction) -> bool:
+        """The chain's half of the attested-entry rule (append_attested)."""
         if not tx.attested or tx.p1_id is None or tx.p2_id is not None:
             return False
         if tx.subject_id is None or str(tx.subject_id) == str(tx.p1_id):
@@ -950,8 +1127,22 @@ class TransactionHistory(Mapping):
             return False
         if tx.attest_scope and not valid_evidence_digest(tx.attest_scope):
             return False
-        if str(tx.task_id) != str(attest_task_id(tx.p1_id, tx.subject_id,
-                                                 tx.evidence_digest)):
+        return str(tx.task_id) == str(attest_task_id(tx.p1_id, tx.subject_id,
+                                                     tx.evidence_digest))
+
+    def append_attested(self, tx: Transaction, certificate: dict = None) -> bool:
+        """Commit a verifier-attested entry. Returns False, and changes
+        nothing, unless `tx` is well-formed: attested, the verifier in p1 with
+        a score in [0, 1] on an attestable channel, p2 unset, a subject other
+        than the verifier, a valid evidence digest, the derived task id, and a
+        task id this history has never held. The quorum is the CALLER's to
+        check; this is the chain's half of the rule. Mirrors
+        tx_history_append_attested."""
+        if not tx.attested or tx.p1_id is None or tx.p2_id is not None:
+            return False
+        if tx.subject_id is None or str(tx.subject_id) == str(tx.p1_id):
+            return False
+        if not self._attested_well_formed(tx):
             return False
         if tx.task_id in self._task_mapping or tx.task_id in self._evicted_task_ids:
             return False
@@ -971,6 +1162,229 @@ class TransactionHistory(Mapping):
             self.attest_certs[tx.task_id] = dict(certificate)
             tx.attest_sigs = dict(certificate)
         return True
+
+    # --- Ordered placement ------------------------------------------------
+
+    def _placed(self, task_id) -> bool:
+        tx = self._task_mapping.get(task_id)
+        return tx is not None and tx.index is not None
+
+    def _pool_room(self):
+        while len(self._pool) > self.max_chain_len:
+            self._pool.popitem(last=False)
+
+    def record_half(self, task_id: UUID, peer_id: UUID, score: float,
+                    channel: str = None, certificate: dict = None) -> str:
+        """Put a committed half in the pool. Returns 'pending' (the task has
+        one half), 'ready' (both, so its entry can be placed), 'dup' (this
+        scorer's half is already held), 'placed' (the task is in the chain) or
+        'tombstoned' (it was, and has been evicted). Nothing here touches the
+        chain. Mirrors C tx_history_record_half."""
+        if self._placed(task_id):
+            return 'placed'
+        if task_id in self._evicted_task_ids:
+            return 'tombstoned'
+        tx = self._pool.get(task_id)
+        if tx is None:
+            tx = Transaction(task_id)
+            self._pool[task_id] = tx
+            self._pool_room()
+            self.pool_rev += 1
+        if tx.attested:
+            return 'dup'
+        if peer_id is not None and str(peer_id) in (str(tx.p1_id),
+                                                    str(tx.p2_id)):
+            if certificate and tx.certificate_of(peer_id) != certificate:
+                tx.attach_certificate(peer_id, certificate)
+                self.pool_rev += 1
+            return 'dup'
+        if len(tx) == 2:
+            return 'dup'
+        tx.add(peer_id, score, channel)
+        if certificate:
+            tx.attach_certificate(peer_id, certificate)
+        self.pool_rev += 1
+        return 'ready' if len(tx) == 2 else 'pending'
+
+    def pool_attested(self, tx: Transaction, certificate: dict = None) -> bool:
+        """Put a certified attested entry in the pool, ready to be placed.
+        False, and nothing changes, when it is malformed or its task was ever
+        held. Mirrors C tx_history_pool_attested."""
+        if not self._attested_well_formed(tx):
+            return False
+        if (tx.task_id in self._task_mapping or tx.task_id in self._pool
+                or tx.task_id in self._evicted_task_ids):
+            return False
+        held = copy.copy(tx)
+        held.p2_channel = None
+        if certificate:
+            held.attest_sigs = dict(certificate)
+        self._pool[held.task_id] = held
+        self._pool_room()
+        self.pool_rev += 1
+        return True
+
+    def pooled(self, task_id) -> 'Transaction | None':
+        return self._pool.get(task_id)
+
+    def pooled_count(self) -> int:
+        return len(self._pool)
+
+    def pool_drop(self, task_id) -> bool:
+        """Take `task_id` out of the pool. False when it was not pooled.
+        Mirrors C tx_history_pool_drop."""
+        if self._pool.pop(task_id, None) is None:
+            return False
+        self.pool_rev += 1
+        return True
+
+    def pool_to_dict(self) -> dict:
+        """The pool as persisted (reputation-pool[-<chain>].cfg.json), oldest
+        first. A half keeps its scorer, score, channel and commit certificate;
+        an attested entry is written as a placement writes it. Mirrors C
+        _pool_to_json (rep_proc.c)."""
+        from .placement import entry_to_dict
+        items = []
+        for tx in self._pool.values():
+            if tx.attested:
+                items.append(entry_to_dict(tx))
+                continue
+            halves = []
+            for uid, score, chan in ((tx.p1_id, tx.p1_score, tx.p1_channel),
+                                     (tx.p2_id, tx.p2_score, tx.p2_channel)):
+                if uid is None:
+                    continue
+                half = {'by': str(uid), 'score': float(score)}
+                if chan:
+                    half['channel'] = str(chan)
+                cert = tx.certificate_of(uid)
+                if cert:
+                    half['cert'] = {str(k): _hex_str(v) for k, v in cert.items()}
+                halves.append(half)
+            items.append({'task': str(tx.task_id), 'halves': halves})
+        return {'schema': POOL_SCHEMA, 'pool': items}
+
+    def pool_from_dict(self, doc) -> int:
+        """Put back what :meth:`pool_to_dict` wrote, through record_half and
+        pool_attested, so a task since placed or tombstoned stays out. An item
+        that does not parse is skipped. Returns how many items are pooled
+        afterwards. Raises ValueError when the document itself is not a pool.
+        Mirrors C _pool_from_json (rep_proc.c)."""
+        from .placement import entry_from_dict
+        if not isinstance(doc, dict) or doc.get('schema') != POOL_SCHEMA \
+                or not isinstance(doc.get('pool'), list):
+            raise ValueError('not a reputation pool document')
+        for item in doc['pool']:
+            try:
+                if not isinstance(item, dict):
+                    continue
+                if item.get('attested') is True:
+                    tx = entry_from_dict(item)
+                    self.pool_attested(tx, tx.attest_sigs)
+                    continue
+                task = UUID(str(item['task']))
+                for half in item.get('halves') or []:
+                    score = half['score']
+                    if isinstance(score, bool) or not isinstance(score, (int, float)) \
+                            or not 0.0 <= float(score) <= 1.0:
+                        continue
+                    cert = half.get('cert')
+                    cert = ({str(k): str(v) for k, v in cert.items()}
+                            if isinstance(cert, dict) else None)
+                    self.record_half(task, UUID(str(half['by'])), float(score),
+                                     half.get('channel') or None, cert)
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+        return len(self._pool)
+
+    def ready_items(self, limit: int = PLACE_BATCH_MAX) -> 'list[Transaction]':
+        """Up to `limit` pooled entries that can be placed now, as placement
+        entries, by task id. Mirrors C tx_history_ready_items."""
+        ready = [tx for tx in self._pool.values()
+                 if tx.attested or len(tx) == 2]
+        ready.sort(key=lambda tx: str(tx.task_id).lower())
+        return [placement_entry(tx) for tx in ready[:max(0, int(limit))]]
+
+    def _append_placed(self, entries, place_sigs):
+        last = None
+        first = self._next_index
+        for entry in entries:
+            tx = placement_entry(entry)
+            tx.index = self._next_index
+            self._next_index += 1
+            tx.prev_hash = self._head_hash
+            if len(self._chain) >= self.max_chain_len:
+                self._evict_oldest()
+            self._chain.append(tx)
+            self._task_mapping[tx.task_id] = tx
+            self._map_peers(tx)
+            self._head_hash = tx.entry_hash()
+            if len(self._chain) == 1:
+                self._first_index = tx.index
+            if tx.attested and tx.attest_sigs:
+                self.attest_certs[tx.task_id] = dict(tx.attest_sigs)
+            self.pool_drop(tx.task_id)
+            last = tx
+        if last is not None and place_sigs:
+            last.place_from = first
+            last.place_sigs = {str(k): str(v) for k, v in place_sigs.items()}
+            self.place_certs[last.task_id] = dict(place_sigs)
+
+    def apply_placed(self, k: int, entries, place_sigs: dict = None) -> str:
+        """Write a decided placement: `entries` at chain indices k, k+1, ...,
+        exactly as given. 'applied' when k is the next index (and any buffered
+        placements that then follow are applied too), 'buffered' when k is
+        ahead of the chain, 'old' when it is behind, 'empty' for no entries.
+        Validity was settled before the placement was decided, so nothing is
+        checked here. Mirrors C tx_history_apply_placed."""
+        entries = list(entries or [])
+        if not entries:
+            return 'empty'
+        k = int(k)
+        if k < self._next_index:
+            return 'old'
+        if k > self._next_index:
+            self._decided[k] = (entries, dict(place_sigs) if place_sigs else None)
+            return 'buffered'
+        self._append_placed(entries, place_sigs)
+        while self._next_index in self._decided:
+            more, sigs = self._decided.pop(self._next_index)
+            self._append_placed(more, sigs)
+        for stale in [i for i in self._decided if i < self._next_index]:
+            del self._decided[stale]
+        return 'applied'
+
+    @property
+    def next_index(self) -> int:
+        return self._next_index
+
+    @property
+    def head_hash(self) -> bytes:
+        return self._head_hash
+
+    def roster_at(self, k: int) -> 'Transaction | None':
+        """The roster in force for instance `k`: the latest resident roster
+        entry below index `k`, or None when the window holds none (doc/
+        architecture/reputation.md, "Who is in the group"). Restatement keeps
+        the roster in force inside the window. Mirrors C tx_history_roster_at."""
+        best = None
+        for tx in self._chain:
+            if tx.is_roster and tx.index is not None and tx.index < k \
+                    and (best is None or tx.index > best.index):
+                best = tx
+        return best if best is not None else self.roster_anchor
+
+    def latest_roster(self) -> 'Transaction | None':
+        """The roster in force for the next instance."""
+        return self.roster_at(self._next_index)
+
+    @property
+    def placed_end(self) -> 'int | None':
+        """One past the highest resident index a placement certificate covers,
+        or None. Mirrors C tx_history_placed_end."""
+        ends = [tx.index + 1 for tx in self._chain
+                if tx.index is not None and tx.task_id in self.place_certs]
+        return max(ends) if ends else None
 
     def __len__(self):
         return len(self._chain)
@@ -1023,9 +1437,95 @@ class TransactionHistory(Mapping):
         """Merge a peer's reported chain. See ``reconcile``."""
         return self.reconcile(chain)
 
+    def placement_batches(self, seg: 'list[Transaction]') -> list:
+        """The placements a segment carries certificates for, as
+        ``(k, entries, sigs)``: an entry with ``place_sigs`` closes the
+        placement that began at its ``place_from``. A placement that began
+        before the segment does is completed from our own resident entries,
+        when we hold them; ``entries`` is None when it cannot be completed.
+        The caller checks the signatures. Mirrors C tx_history_place_batches."""
+        by_index = {t.index: t for t in seg if t.index is not None}
+        ours = {t.index: t for t in self._chain}
+        out = []
+        for t in seg:
+            if t.index is None or not getattr(t, 'place_sigs', None) \
+                    or t.place_from is None:
+                continue
+            k = int(t.place_from)
+            if k > t.index or t.index - k >= PLACE_BATCH_MAX:
+                out.append((k, None, t.place_sigs))
+                continue
+            entries = []
+            for i in range(k, t.index + 1):
+                e = by_index.get(i, ours.get(i))
+                if e is None:
+                    entries = None
+                    break
+                entries.append(e)
+            out.append((k, entries, t.place_sigs))
+        return out
+
+    def _placed_segment(self, seg, certified):
+        """Cut a placement-mode segment to what may be taken: from the
+        first certified index on (or from our own placed end, if that comes
+        first), only certified entries, up to the first that is not."""
+        cut = min([i for i in (min(certified, default=None), self.placed_end)
+                   if i is not None], default=None)
+        if cut is None:
+            return seg
+        out = []
+        for t in seg:
+            if t.index >= cut and t.index not in certified:
+                break
+            out.append(t)
+        return out
+
+    def _jump_to(self, seg) -> 'ReconcileResult':
+        """Replace the whole resident window with a certified segment that
+        starts past our next index. What we held is below the gap and is
+        tombstoned, so a late commit cannot bring it back."""
+        res = ReconcileResult()
+        dropped = list(self._chain)
+        for t in dropped:
+            self._task_mapping.pop(t.task_id, None)
+            self.attest_certs.pop(t.task_id, None)
+            self.place_certs.pop(t.task_id, None)
+            self._unmap_peers(t)
+            self._evicted_task_ids[t.task_id] = None
+        while len(self._evicted_task_ids) > self.max_chain_len:
+            self._evicted_task_ids.popitem(last=False)
+        self._chain = []
+        res.fork = seg[0].index
+        self._load_incoming(seg)
+        self._next_index = seg[-1].index + 1
+        while len(self._chain) > self.max_chain_len:
+            self._evict_oldest()
+        self._first_index = self._chain[0].index
+        self._head_hash = self._chain[-1].entry_hash()
+        res.status = ReconcileResult.ADOPTED
+        res.added = list(seg)
+        return res
+
+    def _load_incoming(self, incoming):
+        for t in incoming:
+            pending = self._task_mapping.get(t.task_id)
+            if pending is not None:
+                self._unmap_peers(pending)      # completed in place by the peer's copy
+            self._evicted_task_ids.pop(t.task_id, None)
+            self.pool_drop(t.task_id)
+            self._chain.append(t)
+            self._task_mapping[t.task_id] = t
+            self._map_peers(t)
+            if t.attested and t.attest_sigs:
+                # The caller checked the certificate before reconciling.
+                self.attest_certs[t.task_id] = dict(t.attest_sigs)
+            if getattr(t, 'place_sigs', None):
+                self.place_certs[t.task_id] = dict(t.place_sigs)
+
     def reconcile(self, chain: 'list[Transaction]',
                   final_end: 'int | None' = None,
-                  attested: 'tuple | None' = None) -> 'ReconcileResult':
+                  attested: 'tuple | None' = None,
+                  certified: 'set | None' = None) -> 'ReconcileResult':
         """Reconcile our committed chain with a peer's verified segment by the
         LONGEST VERIFIED CHAIN rule (ISSUES.md §2.15). Mirrors C's
         ``tx_history_reconcile`` step for step.
@@ -1053,6 +1553,21 @@ class TransactionHistory(Mapping):
         5. Adopting drops our committed entries from ``f`` on (both halves of
            anything only we held there are lost; that is the price of the
            rule) and loads the peer's, completing a task we held pending.
+
+        ``certified`` is given only for a chain whose group places its order
+        (doc/architecture/reputation.md, "Agreeing on an order"): the indices
+        of the segment whose placement certificates the caller verified. Then
+        a placement decides, not a length:
+
+        6. From the first certified index (or our own placed end, if that is
+           lower) on, only certified entries are taken; the segment is cut at
+           the first that is not.
+        7. Nothing below our placed end is rewritten: a peer's certified
+           entry differing there is EQUIVOCATION, an uncertified one is KEPT.
+        8. Past it, a peer's certified entry at the fork wins whatever the
+           lengths (still never below ``final_end``).
+        9. A gap is crossed only by a segment opening on a certified
+           placement: our window is then replaced (see ``_jump_to``).
         """
         res = ReconcileResult()
         seg = sorted((t for t in chain if t.index is not None),
@@ -1062,12 +1577,25 @@ class TransactionHistory(Mapping):
         if not self.verify_chain_links(seg):
             res.status = ReconcileResult.REJECTED
             return res
+        placing = certified is not None
+        if placing:
+            seg = self._placed_segment(seg, certified)
+            if not seg:
+                return res
         ours = {t.index: t for t in self._chain}
         by_index = {t.index: t for t in seg}
         if not self._chain:
             f = seg[0].index
         else:
             if seg[0].index > self._next_index:
+                if placing:
+                    starts = sorted(t.place_from for t in seg
+                                    if getattr(t, 'place_sigs', None)
+                                    and t.index in certified
+                                    and t.place_from >= seg[0].index)
+                    if starts:
+                        return self._jump_to([t for t in seg
+                                              if t.index >= starts[0]])
                 res.status = ReconcileResult.REJECTED   # a gap: nothing to link to
                 return res
             f = None
@@ -1090,7 +1618,16 @@ class TransactionHistory(Mapping):
                 res.status = ReconcileResult.REJECTED
                 return res
         res.fork = f
-        if self._chain and f < self._next_index:
+        placed_end = self.placed_end if placing else None
+        if placing and self._chain and placed_end is not None and f < placed_end:
+            res.status = (ReconcileResult.EQUIVOCATION if f in certified
+                          else ReconcileResult.KEPT)
+            return res
+        if placing and self._chain and f < self._next_index and f in certified:
+            if final_end is not None and f < final_end:
+                res.status = ReconcileResult.REFUSED_FINAL
+                return res
+        elif self._chain and f < self._next_index:
             s_tip, o_tip = seg[-1].index + 1, self._next_index
             s_head = seg[-1].entry_hash()
             quorum_chain = self._segment_reproduces(seg, attested)
@@ -1106,7 +1643,8 @@ class TransactionHistory(Mapping):
         # A task we hold COMMITTED below the fork cannot appear again above it.
         for t in incoming:
             held = self._task_mapping.get(t.task_id)
-            if held is not None and (len(held) == 2 or held.attested) \
+            if held is not None and (len(held) == 2 or held.attested
+                                     or held.is_roster) \
                     and held.index is not None and held.index < f:
                 res.status = ReconcileResult.REJECTED
                 return res
@@ -1117,18 +1655,9 @@ class TransactionHistory(Mapping):
                 if self._task_mapping.get(t.task_id) is t:
                     del self._task_mapping[t.task_id]
                 self.attest_certs.pop(t.task_id, None)
+                self.place_certs.pop(t.task_id, None)
                 self._unmap_peers(t)
-        for t in incoming:
-            pending = self._task_mapping.get(t.task_id)
-            if pending is not None:
-                self._unmap_peers(pending)      # completed in place by the peer's copy
-            self._evicted_task_ids.pop(t.task_id, None)
-            self._chain.append(t)
-            self._task_mapping[t.task_id] = t
-            self._map_peers(t)
-            if t.attested and t.attest_sigs:
-                # The caller checked the certificate before reconciling.
-                self.attest_certs[t.task_id] = dict(t.attest_sigs)
+        self._load_incoming(incoming)
         self._next_index = max(f, incoming[-1].index + 1)
         while len(self._chain) > self.max_chain_len:
             self._evict_oldest()
@@ -1139,7 +1668,28 @@ class TransactionHistory(Mapping):
                       else ReconcileResult.EXTENDED)
         res.dropped = dropped
         res.added = incoming
+        if placing:
+            res.pooled = self._pool_dropped(dropped)
         return res
+
+    def _pool_dropped(self, dropped) -> int:
+        """Under ordered placement, what an adoption drops goes back to the
+        pool to be placed again, each half with its certificate, rather than
+        being re-proposed: its halves were committed, only its place was
+        lost. A half without a certificate is not returned (no acceptor would
+        take it). Returns how many entries went back. Mirrors the C reconcile."""
+        back = 0
+        for tx in dropped:
+            if tx.attested:
+                back += bool(self.pool_attested(tx, tx.attest_sigs))
+                continue
+            for uid, score, chan in ((tx.p1_id, tx.p1_score, tx.p1_channel),
+                                     (tx.p2_id, tx.p2_score, tx.p2_channel)):
+                if uid is not None and tx.certificate_of(uid):
+                    self.record_half(tx.task_id, uid, score, chan,
+                                     certificate=tx.certificate_of(uid))
+            back += self.pooled(tx.task_id) is not None
+        return back
 
     @classmethod
     def _segment_reproduces(cls, seg, attested) -> bool:
@@ -1603,6 +2153,21 @@ def evidence_to_dict(chain, signed_checkpoint=None, attest_certs=None) -> dict:
             entries[-1]['commit_sigs'] = {
                 str(scorer): {str(k): _hex_str(v) for k, v in sigs.items()}
                 for scorer, sigs in tx.commit_sigs.items()}
+        # A roster entry: its fields are in the entry hash, its member list
+        # beside it (checked against the digest on the way back in).
+        if getattr(tx, 'roster_op', None) is not None:
+            entries[-1]['roster_op'] = str(tx.roster_op)
+            entries[-1]['roster_uuid'] = (None if tx.roster_uuid is None
+                                          else str(tx.roster_uuid))
+            entries[-1]['roster_digest'] = str(tx.roster_digest)
+            entries[-1]['roster_members'] = [list(m) for m in
+                                             tx.roster_members or []]
+        # A placement certificate, on the last entry of each placement:
+        # additive, omitted otherwise, outside the entry hash.
+        if getattr(tx, 'place_sigs', None) and tx.place_from is not None:
+            entries[-1]['place_from'] = int(tx.place_from)
+            entries[-1]['place_sigs'] = {str(k): _hex_str(v)
+                                         for k, v in tx.place_sigs.items()}
     doc = {
         'schema': EVIDENCE_SCHEMA,
         'chain': entries,
@@ -1626,6 +2191,21 @@ def evidence_to_dict(chain, signed_checkpoint=None, attest_certs=None) -> dict:
                      for k, v in (signed_checkpoint.sigs or {}).items()},
         }
     return doc
+
+
+def _roster_fields(entry) -> dict:
+    """A persisted roster entry's fields, its member list checked against its
+    digest. Empty for any other entry."""
+    if entry.get('roster_op') is None:
+        return {}
+    members = entry.get('roster_members')
+    digest = entry.get('roster_digest')
+    if not isinstance(members, list) or roster_digest(members) != digest:
+        raise ValueError('roster members do not match their digest')
+    who = entry.get('roster_uuid')
+    return {'roster_op': str(entry['roster_op']),
+            'roster_uuid': None if who is None else UUID(str(who)),
+            'roster_digest': str(digest), 'roster_members': members}
 
 
 def evidence_from_dict(doc):
@@ -1684,7 +2264,14 @@ def evidence_from_dict(doc):
                          else {str(scorer): {str(k): str(v)
                                              for k, v in sigs.items()}
                                for scorer, sigs in entry['commit_sigs'].items()
-                               if isinstance(sigs, dict)})))
+                               if isinstance(sigs, dict)}),
+            place_from=(int(entry['place_from'])
+                        if isinstance(entry.get('place_from'), int)
+                        and not isinstance(entry.get('place_from'), bool)
+                        else None),
+            place_sigs=(entry['place_sigs']
+                        if isinstance(entry.get('place_sigs'), dict) else None),
+            **_roster_fields(entry)))
     signed = None
     raw_ck = doc.get('checkpoint')
     if isinstance(raw_ck, dict):

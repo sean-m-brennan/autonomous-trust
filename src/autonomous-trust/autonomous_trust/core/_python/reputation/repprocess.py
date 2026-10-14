@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 from nacl.encoding import HexEncoder
 from nacl.exceptions import BadSignatureError
+from nacl.signing import VerifyKey
 
 from ..network import Message, Network
 from ..processes import Process, ProcMeta
@@ -39,6 +40,7 @@ from ..identity.identity import (public_identity_to_canonical,
                                  public_identity_from_canonical)
 from ..identity.peer_standing import STANDING_PROVED, STANDING_FAILED
 from .protocol import ReputationProtocol
+from .placement import PlacementMixin
 from .reputation import (TransactionHistory, ReconcileResult, Reputation, Reputations,
                          TransactionScore, SlashAttestation, SignedSlash,
                          AttestedScore, SignedAttestation,
@@ -46,7 +48,8 @@ from .reputation import (TransactionHistory, ReconcileResult, Reputation, Reputa
                          validate_tx_channel, commit_designation,
                          window_root_of, _hex_str,
                          PeerReputation, EVIDENCE_FILE, SLASH_MARKS_FILE,
-                         evidence_to_dict,
+                         evidence_to_dict, place_value_digest, placement_entry,
+                         place_designation,
                          evidence_from_dict, evidence_attest_certs,
                          attested_record, ATTESTED_DIR,
                          RESOLVE_TTL_DEFAULT,
@@ -102,6 +105,18 @@ MAX_REP_BATCH_SUBJECTS = 256
 # only past _next_index; a commit already lands on one member's word (§2.16).
 REP_CATCHUP_QUORUM = 1
 
+# A catch-up reply carries the whole resident window (§2.51), and with commit
+# and placement certificates an entry runs about 1.4 KB, so a window soon
+# outgrows one UDP datagram: 57 entries came to 104 KB and the transport cut
+# every reply to 65,507 bytes, which then failed to decrypt (partition cohort
+# part-3629127, ISSUES §2.67). A window whose JSON exceeds this many bytes goes
+# as pages {page, of, head, chain[, group]}; the receiver collects every page
+# of one head from one sender and then handles the window as if it came whole.
+# Mirrors rep_proc.c REP_UPDATE_PAGE_BYTES / _PAGES_MAX / REP_PAGE_BUFS.
+UPDATE_PAGE_BYTES = 24000
+UPDATE_PAGES_MAX = 64
+UPDATE_PAGE_BUFS = 8
+
 
 @dataclass
 class TxCount(object):
@@ -109,7 +124,7 @@ class TxCount(object):
     count: int
 
 
-class ReputationProcess(Process, metaclass=ProcMeta,
+class ReputationProcess(PlacementMixin, Process, metaclass=ProcMeta,
                         proc_name=CfgIds.reputation, description='Reputation tracking', cfg_name=CfgIds.reputation):
     protocol_timeout = 30
     backoff_mult = 1.5
@@ -439,6 +454,18 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             ReputationProtocol.rep_resolve, self.handle_resolve)
         self.protocol.register_handler(
             ReputationProtocol.rep_resolved, self.handle_resolved)
+        self.protocol.register_handler(
+            ReputationProtocol.place_request, self.handle_place_request)
+        self.protocol.register_handler(
+            ReputationProtocol.place, self.handle_place)
+        self.protocol.register_handler(
+            ReputationProtocol.placed, self.handle_placed)
+        self.protocol.register_handler(
+            ReputationProtocol.place_grant, self.handle_place_grant)
+        self.protocol.register_handler(
+            ReputationProtocol.place_accepted, self.handle_place_accepted)
+        self.protocol.register_handler(
+            ReputationProtocol.place_nack, self.handle_place_nack)
         load_extensions(self, self.name)
         self.history = TransactionHistory()
         # Gateway reputation tree: one child chain per child group this node gateways
@@ -470,7 +497,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self.handoff: dict[str, list] = {}
         self.requests: list[tuple[int, int]] = []
         self.proposals: dict[tuple[int, int], TransactionScore] = {}
-        self.acceptances: dict[UUID, list[TransactionScore]] = {}
+        # Proposer side: round (id1, id2) -> uuid strs of the members that
+        # granted it, and of those that accepted it. Per round, one vote per
+        # member.
+        self.grants: dict[tuple[int, int], set[str]] = {}
+        self.acceptances: dict[tuple[int, int], set[str]] = {}
         # Proposer side, only in a group that requires commit certificates:
         # task id -> {acceptor uuid str: its signature over the half's
         # commit_designation}, holding only signatures that verified. Becomes
@@ -546,6 +577,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         self._consensus_folded_idx: dict[str, int] = {}
         self.requested_reps = []
         self.updates = {}
+        # Paged catch-up replies being collected: (sender uuid, chain key)
+        # -> {'head', 'of', 'pages', 'seq'} (UPDATE_PAGE_BYTES).
+        self.page_bufs = {}
+        self._page_seq = 0
+        self.update_page_bytes = UPDATE_PAGE_BYTES
         self.num_updates = REP_CATCHUP_QUORUM
         # Last published trust tier per peer uuid-string. Suppresses
         # redundant tier_update IPC when the tier hasn't changed.
@@ -748,6 +784,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # loaded reputation snapshot, the peer roster and the checkpoint
         # state above, and it revises self.history.
         self._rebuild_from_evidence()
+        # Ordered placement's pending pool, after the chain it waits on.
+        self._reset_pre_roster_chain('')
+        self._restore_pool('')
 
     @property
     def peers(self):
@@ -840,7 +879,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 if getattr(p, 'address', None) in addrs]
 
     def _quorum_for_group(self, group_uuid):
-        """Majority threshold (floor(N/2)) for a round in the given group.
+        """floor(roster/2), the bar slashing and the co-signature quorum test
+        (`_quorum_met`) clear with `>`. Paxos rounds use _round_quorum.
 
         Back-compat: a non-gateway node (no child_groups) always uses the
         historical len(self.peers.all)//2, so leaf quorum math is
@@ -852,6 +892,24 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         if grp is None:
             return len(self.peers.all) // 2
         return len(self._members_of_group(grp)) // 2
+
+    def _round_quorum(self, group_uuid):
+        """Other members a Paxos round needs, grants and acceptances alike.
+        With the proposer's own vote that is a strict majority of the group:
+        N // 2 of the others, where N is the roster plus this node. The
+        checkpoint sizing, compared with `>=` over the others rather than `>`
+        over everyone. Mirrors C _round_quorum_for_group."""
+        return (self._checkpoint_roster(group_uuid) + 1) // 2
+
+    def _expire_rounds(self, present):
+        """Forget Paxos rounds older than ``expiration`` seconds. A round's
+        id1 is in milliseconds and `present` in seconds."""
+        horizon = (present - self.expiration) * 1000
+        self.requests[:] = [req for req in self.requests if req[0] >= horizon]
+        for rounds in (self.proposals, self.round_group, self.grants,
+                       self.acceptances):
+            for rnd in [r for r in rounds if r[0] < horizon]:
+                del rounds[rnd]
 
     def _chain_for_group(self, group_uuid):
         """Return the TransactionHistory for a group-uuid, defaulting to
@@ -973,7 +1031,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     def _paxos_timeout(self, queues, pax_id):
         retry = True
         idx = self._paxos_id_index(pax_id[0], pax_id[1])
-        quorum = self._quorum_for_group(self.round_group.get(idx))
+        quorum = self._round_quorum(self.round_group.get(idx))
         start = now()
         while (now() - start).total_seconds() < self.protocol_timeout:
             if idx not in self.my_requests:
@@ -1004,28 +1062,50 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             if idx not in self.my_requests:
                 self.logger.debug('Grant for already-completed request')
                 return True
-            self.my_requests[idx].count += 1
-            if self.my_requests[idx].count >= self._quorum_for_group(
+            granter = getattr(message.from_whom, 'uuid', None)
+            if not message.verified or granter is None:
+                self.logger.warning('Rejecting unverified Paxos grant from %s',
+                                    message.from_whom)
+                return True
+            # One grant per member per round: a repeated grant is not a
+            # second vote.
+            granters = self.grants.setdefault(idx, set())
+            granters.add(str(granter))
+            self.my_requests[idx].count = len(granters)
+            # Our own grant is the other one: _start_paxos ranks our ballot
+            # above any we have promised.
+            if self.my_requests[idx].count >= self._round_quorum(
                     self.round_group.get(idx)):
                 try:
-                    score = (id1, id2, peer_id), self.my_requests[idx].score
-                    if self._commit_certs_required(self.round_group.get(idx)):
-                        # Ask each acceptor to sign what it accepts: a third
-                        # element, appended so a two-element proposal is
-                        # byte-for-byte what it always was.
-                        score = score + (True,)
-                    msg = Message(self.name, ReputationProtocol.transaction,
-                                  to_json_string(score), self.group,
-                                  from_whom=self.identity)
-                    queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
-                    self.logger.debug('Submit transaction score')
+                    self._propose_half(queues, (id1, id2, peer_id),
+                                       self.my_requests[idx].score,
+                                       self.round_group.get(idx))
                     if idx in self.backoff:
                         del self.backoff[idx]
                     del self.my_requests[idx]
+                    self.grants.pop(idx, None)
                 except Full:
                     self.logger.error('handle_grant: Network queue full')
             return True
         return False
+
+    def _propose_half(self, queues, pax_id, score, group_uuid):
+        """Send our half to the group to accept: after a majority granted the
+        round, or at once in a group that places its order. There the
+        proposal names its group as a fourth element, which is what lets an
+        acceptor take it without a grant (handle_transaction)."""
+        obj = (tuple(pax_id), score)
+        if self._commit_certs_required(group_uuid):
+            # Ask each acceptor to sign what it accepts: a third element,
+            # appended so a two-element proposal is byte-for-byte what it
+            # always was.
+            obj = obj + (True,)
+            if self._ordered_placement(group_uuid):
+                obj = obj + (str(group_uuid or ''),)
+        msg = Message(self.name, ReputationProtocol.transaction,
+                      to_json_string(obj), self.group, from_whom=self.identity)
+        queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+        self.logger.debug('Submit transaction score')
 
     def _try_again(self, wait, queues, score):
         start = now()
@@ -1086,15 +1166,26 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             return True
         return False
 
-    def _request_update(self, queues, n=3, quorum=None):
+    def _request_update(self, queues, n=3, quorum=None, key: str = ''):
         # Only the no-majority path widens the vote. A backdate used to reset
         # the quorum to 3 here as a side effect, which is what kept a node
         # with two peers from ever catching up.
         if quorum is not None:
             self.num_updates = quorum
-        for peer in self.peers.find_top_n(n):
-            msg = Message(self.name, ReputationProtocol.outdated,
-                          str(len(self.history)), peer,
+        if key:
+            # A child chain: ask that group's members, naming the chain. Its
+            # update is applied directly (handle_update), so no vote is set.
+            members = {str(p.uuid) for p in
+                       self._members_of_group(self._group_by_uuid(key))}
+            peers = [p for p in self.peers.find_top_n(len(self.peers.all))
+                     if str(p.uuid) in members][:n]
+            req = json.dumps({'from': self._chain_for_key(key).next_index,
+                              'group': key})
+        else:
+            peers = self.peers.find_top_n(n)
+            req = str(len(self.history))
+        for peer in peers:
+            msg = Message(self.name, ReputationProtocol.outdated, req, peer,
                           from_whom=self.identity)
             queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
 
@@ -1206,10 +1297,23 @@ class ReputationProcess(Process, metaclass=ProcMeta,
 
     def _start_paxos(self, queues, score: TransactionScore, group_uuid=None):
         id1 = int(now().timestamp() * 1000)
+        # Outrank every ballot we have promised and promise our own, so our
+        # own grant counts toward the round. Mirrors C paxos_next_ids.
+        if self.last_id is not None and id1 <= self.last_id:
+            id1 = self.last_id + 1
+        self.last_id = id1
         id2 = len(self.history) + 1
         idx = self._paxos_id_index(id1, id2)
         pax_id = (id1, id2, self.identity.uuid)
-        self.my_requests[idx] = TxCount(score, 0)
+        if group_uuid is None and self.group is not None:
+            group_uuid = str(self.group.uuid)
+        # In a group that places its order (doc/architecture/reputation.md,
+        # "Agreeing on an order") the half needs no round of its own: its
+        # place in the chain is decided by placement, so it goes straight to
+        # the co-signing phase. Mirrors C _forward_transaction.
+        placing = self._ordered_placement(group_uuid)
+        if not placing:
+            self.my_requests[idx] = TxCount(score, 0)
         # Follow our half until it is in the chain. A re-proposal of the same
         # task keeps its attempt count and only restarts the clock; a parked
         # half keeps the park's slower clock (§2.60).
@@ -1229,18 +1333,19 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         # Defaults to the primary group (the gateway's own/parent
         # cohort), which is correct for the demo where a gateway's
         # self-initiated transactions are with its command cohort.
-        if group_uuid is None and self.group is not None:
-            group_uuid = str(self.group.uuid)
         self.round_group[idx] = group_uuid
-        # The head this round extends, so an acceptor on an equal-length fork
-        # can see it (handle_request, ISSUES §2.51). Omitted for an empty
-        # chain, and a 3-element ask is still read everywhere.
-        head = self._our_head()
-        pax_msg = Message(self.name, ReputationProtocol.request,
-                          to_json_string(tuple(pax_id) + ((head,) if head else ())),
-                          self.group, from_whom=self.identity)
-        queues[CfgIds.network].put(pax_msg, block=True, timeout=self.q_cadence)
         self.proposals[idx] = score
+        if placing:
+            self._propose_half(queues, pax_id, score, group_uuid)
+        else:
+            # The head this round extends, so an acceptor on an equal-length
+            # fork can see it (handle_request, ISSUES §2.51). Omitted for an
+            # empty chain, and a 3-element ask is still read everywhere.
+            head = self._our_head()
+            pax_msg = Message(self.name, ReputationProtocol.request,
+                              to_json_string(tuple(pax_id) + ((head,) if head else ())),
+                              self.group, from_whom=self.identity)
+            queues[CfgIds.network].put(pax_msg, block=True, timeout=self.q_cadence)
         # Cache the weight for this task so _pure_reputation can later
         # aggregate it correctly (Slice 3 / trust-tiers.md §5), and the tier
         # so the per-tier consensus view can bucket it (doc/architecture/network-wire-format.md).
@@ -1260,6 +1365,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # A third element asks for a commit certificate (a group that
                 # requires them). Strictly `True`, so nothing else turns it on.
                 certify = len(parts) > 2 and parts[2] is True
+                # A fourth names the round's group when that group places its
+                # order: then the half was never granted, and needs no grant.
+                placing_group = (parts[3] if certify and len(parts) > 3
+                                 and isinstance(parts[3], str) else None)
             except (ValueError, TypeError, IndexError) as err:
                 # An out-of-range score is rejected in TransactionScore's
                 # constructor (doc/architecture/reputation.md), which `from_json_string` runs. Dropping
@@ -1270,12 +1379,21 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     'Dropping Paxos proposal from %s: %s', message.from_whom, err)
                 return True
             idx = self._paxos_id_index(id1, id2)
-            if idx not in self.requests:
+            granted = idx in self.requests
+            if granted:
+                self.requests.remove(idx)
+            elif placing_group is None or not self._ordered_placement(
+                    placing_group or None):
                 return True  # not granted, drop
-            self.requests.remove(idx)
             if not message.verified:
                 self.logger.warning('Rejecting unverified Paxos proposal from %s', message.from_whom)
                 return True  # drop unverified proposal
+            if granted and self.last_id is not None and id1 < self.last_id:
+                # Promised a higher ballot since granting this one.
+                self.logger.debug(
+                    'Not accepting ballot %d from %s: promised %d since',
+                    id1, str(peer_id)[:8], self.last_id)
+                return True
             if idx not in self.proposals:
                 self.proposals[idx] = score
                 self.logger.debug("Tx to proposals ")
@@ -1383,15 +1501,17 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             parts = from_json_string(message.obj)
             id1, id2, peer_id = parts[0], parts[1], parts[2]
             idx = self._paxos_id_index(id1, id2)
-            score = self.proposals[idx]
+            score = self.proposals.get(idx)
+            if score is None:
+                self.logger.debug('Acceptance for an unknown round')
+                return True
             self.logger.debug('Tx accepted')
-            if score.task_id not in self.acceptances:
-                self.acceptances[score.task_id] = []
-            if message.from_whom not in self.acceptances[score.task_id]:
-                if not message.verified:
-                    self.logger.warning('Rejecting unverified Paxos acceptance from %s', message.from_whom)
-                    return True  # drop unverified acceptance
-                self.acceptances[score.task_id].append(message.from_whom)
+            if not message.verified:
+                self.logger.warning('Rejecting unverified Paxos acceptance from %s', message.from_whom)
+                return True  # drop unverified acceptance
+            voter_uuid = getattr(message.from_whom, 'uuid', None)
+            if voter_uuid is None:
+                return True
             round_group_uuid = self.round_group.get(idx)
             certificate = None
             if self._commit_certs_required(round_group_uuid):
@@ -1403,8 +1523,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 sig = parts[3] if len(parts) > 3 else None
                 desig = commit_designation(peer_id, score.task_id,
                                            score.score, score.channel)
-                if voter is None or not self._verify_cosignature(desig, voter,
-                                                                 sig):
+                if voter is None or not self._verify_cosignature(
+                        desig, voter, sig,
+                        self._roster_for_group(round_group_uuid)):
                     self.logger.warning(
                         'Acceptance from %s carries no valid commit signature;'
                         ' not counted', getattr(message.from_whom, 'nickname',
@@ -1412,15 +1533,23 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     return True
                 pending = self.commit_sigs_pending.setdefault(score.task_id, {})
                 pending[voter] = sig
-                if not self._commit_cert_ok(peer_id, score.task_id, score.score,
-                                            score.channel, pending,
-                                            round_group_uuid):
-                    return True
-                certificate = dict(pending)
+                if self._commit_cert_ok(peer_id, score.task_id, score.score,
+                                        score.channel, pending,
+                                        round_group_uuid):
+                    certificate = dict(pending)
+            # One vote per member per round, ours included: sending the
+            # transaction was our own acceptance.
+            voters = self.acceptances.setdefault(idx, set())
+            voters.add(str(voter_uuid))
+            own = int(str(peer_id) == str(self.identity.uuid))
+            reached = len(voters) + own > self._round_quorum(round_group_uuid)
+            if certificate is None and self._commit_certs_required(
+                    round_group_uuid):
+                reached = False
+            elif certificate is not None and \
+                    self._roster_for_group(round_group_uuid) is not None:
+                # Sized by the logged roster, which the certificate meets.
                 reached = True
-            else:
-                reached = len(self.acceptances[score.task_id]) > \
-                    self._quorum_for_group(round_group_uuid)
             if reached:
                 # Idempotency guard: every ACCEPTED that arrives
                 # after the majority threshold has been crossed would
@@ -1445,16 +1574,19 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 # peers' histories (see ReputationProtocol.committed
                 # for the rationale). Route to the round's group chain
                 # — primary for leaf nodes, a child chain on a gateway.
-                self._chain_for_group(round_group_uuid).update(
-                    score.task_id, peer_id, score.score, score.channel,
-                    certificate=certificate)
+                placing = self._record_committed_half(
+                    round_group_uuid, score.task_id, peer_id, score.score,
+                    score.channel, certificate)
                 self.commit_sigs_pending.pop(score.task_id, None)
+                self.acceptances.pop(idx, None)
                 # Our half is in: stop watching it (ISSUES §2.24).
                 self.awaiting_commit.pop(str(score.task_id), None)
                 # Fold-on-commit: keep the dashboard running consensus EMA
                 # current the moment a tx completes (primary chain only).
-                self._fold_committed_tx(
-                    score.task_id, self._chain_for_group(round_group_uuid))
+                # Under ordered placement that is when it is placed.
+                if not placing:
+                    self._fold_committed_tx(
+                        score.task_id, self._chain_for_group(round_group_uuid))
                 self._note_interaction(peer_id)
                 # Bumped to info to make demo debugging tractable —
                 # without a commit log, "no movement on reputations"
@@ -1599,11 +1731,13 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     else 'this group requires a commit certificate')
                 return True
             chain = self._chain_for_group(group_uuid)
-            chain.update(task_id, peer_id, score, channel,
-                         certificate=sigs if certified else None)
+            placing = self._record_committed_half(
+                group_uuid, task_id, peer_id, score, channel,
+                sigs if certified else None)
             # Fold-on-commit: advance the dashboard running consensus EMA as
             # soon as this tx completes (primary chain only; idempotent).
-            self._fold_committed_tx(task_id, chain)
+            if not placing:
+                self._fold_committed_tx(task_id, chain)
             self._note_interaction(peer_id)
             self.logger.info(
                 'Recorded committed tx from %s: task=%s score=%.2f via %s '
@@ -1670,30 +1804,57 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 return peer
         return None
 
-    def _verify_cosignature(self, designation, voter_uuid, sig) -> bool:
+    def _verify_cosignature(self, designation, voter_uuid, sig,
+                            roster=None) -> bool:
         """True iff ``sig`` is ``voter_uuid``'s signature over
         ``designation``. Any malformed / unknown / bad-signature case is
-        False: a co-signature that cannot be checked must never be counted."""
-        ident = self._cosigner_identity(voter_uuid)
-        if ident is None or sig is None:
+        False: a co-signature that cannot be checked must never be counted.
+
+        With a ``roster`` (a roster entry, doc/architecture/reputation.md,
+        "Who is in the group") only its members count, each verified with the
+        key the roster records, so a member who has since left is still
+        checkable and a peer outside it never counts."""
+        if sig is None:
             return False
+        if roster is not None:
+            key = dict(roster.roster_members or ()).get(str(voter_uuid).lower())
+            if key is None:
+                return False
+            try:
+                verifier = VerifyKey(key.encode('ascii'), encoder=HexEncoder)
+            except (ValueError, TypeError):
+                return False
+        else:
+            ident = self._cosigner_identity(voter_uuid)
+            if ident is None:
+                return False
+            verifier = getattr(getattr(ident, 'signature', None), 'public', None)
         try:
             if isinstance(sig, str):
                 sig = sig.encode('ascii')
-            ident.signature.public.verify(designation, HexEncoder.decode(sig))
+            verifier.verify(designation, HexEncoder.decode(sig))
         except (BadSignatureError, ValueError, TypeError, AttributeError):
             return False
         return True
 
-    def _verified_cosigners(self, designation, sigs) -> set:
+    def _verified_cosigners(self, designation, sigs, roster=None) -> set:
         """The DISTINCT voters in ``sigs`` whose signature over
-        ``designation`` verifies against a key we hold. Counting the set of
-        verified signers -- rather than tallying arriving messages -- is what
-        makes one peer's replayed signature worth exactly one vote."""
+        ``designation`` verifies against a key we hold (or, with ``roster``,
+        that roster records). Counting the set of verified signers -- rather
+        than tallying arriving messages -- is what makes one peer's replayed
+        signature worth exactly one vote."""
         if not isinstance(sigs, dict):
             return set()
-        return {str(voter) for voter, sig in sigs.items()
-                if self._verify_cosignature(designation, voter, sig)}
+        return {str(voter).lower() for voter, sig in sigs.items()
+                if self._verify_cosignature(designation, voter, sig, roster)}
+
+    def _roster_for_group(self, group_uuid=None):
+        """The roster in force for the next instance of the chain a group
+        places its order on, or None (a group that does not place, or one with
+        no roster yet: the live view decides)."""
+        if not self._ordered_placement(group_uuid):
+            return None
+        return self._chain_for_group(group_uuid).latest_roster()
 
     def _attributed_voter(self, message, claimed, where: str):
         """The uuid-str a ``*_sign`` ack may be credited to, or None.
@@ -1744,22 +1905,32 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         off the group, never configured per node, so every member of a cohort
         gives the same answer."""
         grp = self._group_by_uuid(group_uuid) or self.group
-        return getattr(grp, 'commit_certificates', False) is True
+        # Ordered placement requires them: a placed entry carries its halves'
+        # certificates, and that is all an acceptor has to judge them by.
+        return (getattr(grp, 'commit_certificates', False) is True
+                or getattr(grp, 'ordered_placement', False) is True)
 
     def _commit_cert_ok(self, scorer, task_id, score, channel, sigs,
-                        group_uuid=None) -> bool:
-        """Do `sigs` certify `scorer`'s half? More than ``_quorum_for_group``
+                        group_uuid=None, roster=...) -> bool:
+        """Do `sigs` certify `scorer`'s half? At least ``_round_quorum``
         distinct members of OUR view must have signed its
-        :func:`commit_designation`. The scorer's own signature never counts:
-        a proposer cannot vouch for its own round."""
+        :func:`commit_designation`: with the scorer, a majority. The scorer's
+        own signature never counts: a proposer cannot vouch for its own
+        round."""
         if not isinstance(sigs, dict) or not sigs:
             return False
         try:
             desig = commit_designation(scorer, task_id, score, channel)
         except (TypeError, ValueError):
             return False
-        voters = self._verified_cosigners(desig, sigs) - {str(scorer)}
-        return len(voters) > self._quorum_for_group(group_uuid)
+        if roster is ...:
+            # Unless told otherwise, the roster in force for the group.
+            roster = self._roster_for_group(group_uuid)
+        voters = self._verified_cosigners(desig, sigs, roster) - {str(scorer).lower()}
+        if roster is not None:
+            # A majority of the logged roster, the scorer the remaining vote.
+            return len(voters) >= len(roster.roster_members or ()) // 2
+        return len(voters) >= self._round_quorum(group_uuid)
 
     def _covered_by_checkpoint(self, chain):
         """``(first, end)`` of the latest quorum-attested primary checkpoint
@@ -1783,29 +1954,33 @@ class ReputationProcess(Process, metaclass=ProcMeta,
             theirs = theirs.decode('ascii')
         return (first, first + count) if root == theirs else None
 
-    def _held_identically(self, tx) -> bool:
+    def _held_identically(self, tx, hist=None) -> bool:
         """Do we already hold `tx`, at its index, hashing the same? Then a
         segment repeating it tells us nothing new and is not asked to prove it
         again."""
-        held = self.history._task_mapping.get(getattr(tx, 'task_id', None))
+        hist = self.history if hist is None else hist
+        held = hist._task_mapping.get(getattr(tx, 'task_id', None))
         return (held is not None and held.index is not None
                 and held.index == getattr(tx, 'index', None)
                 and held.entry_hash() == tx.entry_hash())
 
-    def _commit_certs_ok(self, chain, message) -> bool:
+    def _commit_certs_ok(self, chain, message, key: str = '') -> bool:
         """Catch-up's half of commit certificates: in a group that requires
         them, every ordinary half of every entry in `chain` that is new to us
         and outside a quorum checkpoint carries a certificate meeting our
-        quorum. Otherwise catch-up would be a way around the round."""
-        if not self._commit_certs_required(None):
+        quorum. Otherwise catch-up would be a way around the round. `key`
+        names the chain (a gateway's child chain is sized by its own group)."""
+        group = key or None
+        if not self._commit_certs_required(group):
             return True
-        covered = self._covered_by_checkpoint(chain)
+        hist = self._chain_for_key(key)
+        covered = None if key else self._covered_by_checkpoint(chain)
         for tx in chain:
             if getattr(tx, 'attested', False) or getattr(tx, 'index', None) is None:
                 continue
             if covered and covered[0] <= tx.index < covered[1]:
                 continue
-            if self._held_identically(tx):
+            if self._held_identically(tx, hist):
                 continue
             for scorer, score, chan in ((tx.p1_id, tx.p1_score, tx.p1_channel),
                                         (tx.p2_id, tx.p2_score, tx.p2_channel)):
@@ -1813,7 +1988,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     continue
                 sigs = (getattr(tx, 'commit_sigs', None) or {}).get(str(scorer))
                 if not self._commit_cert_ok(scorer, tx.task_id, score, chan,
-                                            sigs):
+                                            sigs, group):
                     self.logger.warning(
                         'Rejecting chain from %s: entry %s (task %s) has no '
                         'commit certificate for %s\'s half meeting our quorum,'
@@ -2308,19 +2483,32 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 mates |= team - {subject}
         return sorted(m for m in mates if self._is_member(m))
 
-    def _attest_quorum_met(self, att, sigs) -> bool:
+    def _attest_quorum_met(self, att, sigs, roster=...) -> bool:
         """The verifier's own signature plus a strict majority of the members
         other than the subject AND its teammates (§2.54), sized from OUR
         roster and counting only signatures that verify. Neither the
         subject's signature nor a teammate's is ever counted, and once any
-        teammate is left out at least two signatures are needed."""
+        teammate is left out at least two signatures are needed. In a group
+        that places its order, the roster is the logged one in force (unless
+        `roster` names another, or None for the live view)."""
         if not isinstance(sigs, dict):
             return False
-        subject = str(att.subject_uuid)
-        voters = {v for v in self._verified_cosigners(att.designation, sigs) - {subject}
-                  if not self._conflicted(v, subject)}
-        if str(att.verifier_uuid) not in voters:
+        if roster is ...:
+            roster = self._roster_for_group(getattr(att, 'group_uuid', '') or None)
+        subject = str(att.subject_uuid).lower()
+        voters = {v for v in self._verified_cosigners(att.designation, sigs, roster)
+                  - {subject} if not self._conflicted(v, subject)}
+        if str(att.verifier_uuid).lower() not in voters:
             return False
+        if roster is not None:
+            listed = [u for u, _k in roster.roster_members or ()]
+            members = len(listed)
+            mates = sum(1 for u in listed if u != subject and self._conflicted(u, subject))
+            others = members - (1 if subject in listed else 0)
+            others = max(others - mates, 0)
+            if mates and len(voters) < 2:
+                return False
+            return len(voters) > others // 2
         members = len(self.peers.all) + 1
         mates = len(self._conflicted_members(subject))
         others = members - (1 if self._is_member(subject) else 0)
@@ -2402,6 +2590,9 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         """Append a certified attestation to its chain and fold it."""
         chain = self._chain_for_group(att.group_uuid or None)
         tx = att.to_transaction()
+        if self._ordered_placement(att.group_uuid or None):
+            # It waits in the pool for its placement, which folds it.
+            return chain.pool_attested(tx, dict(sigs))
         if not chain.append_attested(tx, dict(sigs)):
             return False
         self._fold_committed_tx(tx.task_id, chain)
@@ -2659,8 +2850,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         roster WITHOUT this node and is one signature short for an even-sized
         group, so both halves of an even split finalized their own windows and
         could never reconcile after the heal (Agora Phase 4 DDIL, 2026-09-25).
-        Odd sizes are unchanged; Paxos grants and slashing keep
-        len(peers) // 2, which C now sizes the same way, live, per round.
+        Odd sizes are unchanged. Paxos rounds now take the same majority
+        (_round_quorum); slashing keeps len(peers) // 2.
         Mirrors C _ckpt_quorum_for_group."""
         return (self._checkpoint_roster(group_uuid) + 1) // 2
 
@@ -3237,6 +3428,12 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         for tx in chain:
             if tx.attested and tx.task_id in restored.attest_certs:
                 tx.attest_sigs = dict(restored.attest_certs[tx.task_id])
+        # A child chain is restored late, so its pool may already hold halves
+        # (or what reputation-pool restored); they wait on this chain now.
+        previous = (self.child_histories.get(chain_key) if chain_key
+                    else self.history)
+        if previous is not None and previous.pooled_count():
+            restored.pool_from_dict(previous.pool_to_dict())
         if chain_key:
             self.child_histories[chain_key] = restored
         else:
@@ -3666,67 +3863,295 @@ class ReputationProcess(Process, metaclass=ProcMeta,
     def handle_outdated(self, queues, message):
         if message.function == ReputationProtocol.outdated:
             try:
-                length = message.obj
-                if isinstance(length, bytes):
-                    length = length.decode(encoding)
-                int(length)
+                req = message.obj
+                if isinstance(req, bytes):
+                    req = req.decode(encoding)
+                # Bare length: the primary chain. An object names the chain's
+                # group, so a gateway's child chain can be caught up too.
+                group = ''
+                try:
+                    parsed = json.loads(req)
+                except (TypeError, ValueError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    int(parsed.get('from', 0))
+                    group = str(parsed.get('group') or '')
+                else:
+                    int(req)
+                key = self._chain_key(group)
+                if group and not key:
+                    return True         # not a chain we keep
                 # The whole resident window, as C sends, whatever length the
                 # requester reports: an equal-length requester on a fork got
                 # an empty slice and never reconciled (ISSUES §2.51).
-                chain = to_json_string(self.history.era(0))
+                hist = self._chain_for_key(key)
+                era = hist.era(0)
+                budget = getattr(self, 'update_page_bytes', UPDATE_PAGE_BYTES)
+                if len(to_json_string(era)) > budget:
+                    self._send_update_pages(queues, message.from_whom, key,
+                                            hist, era, budget)
+                    return True
+                chain = (to_json_string({'group': key, 'chain': era}) if key
+                         else to_json_string(era))
                 msg = Message(self.name, ReputationProtocol.update, chain,
                               message.from_whom, from_whom=self.identity)
                 queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
                 self.logger.debug('Sent update')
             except Full:
                 self.logger.error('handle_outdated: Network queue full')
+            except (TypeError, ValueError):
+                self.logger.debug('handle_outdated: malformed request')
             return True
         return False
 
+    def _placement_certified_indices(self, hist, seg, group):
+        """The indices of `seg` whose placement certificates verify, each
+        against the roster in force for its instance (doc/architecture/
+        reputation.md, "Who is in the group") -- the latest roster entry below
+        it, ours or the segment's; a genesis, by every member it lists; with
+        no roster, nothing. None when a certificate over entries the segment
+        carries in full does not verify: that segment is refused whole. A
+        placement the segment carries only in part, and we cannot complete
+        from our own entries (or complete differently), is just
+        uncertified."""
+        out = set()
+        have = {t.index for t in seg if getattr(t, 'index', None) is not None}
+        seg_rosters = sorted((t for t in seg if getattr(t, 'is_roster', False)
+                              and t.index is not None), key=lambda t: t.index)
+        anchor = None
+        if hist.latest_roster() is None and seg_rosters:
+            # We know no roster of this chain (a newcomer, or a node far
+            # behind): anchor on the segment's latest one, judged against the
+            # group as identity shows it to us. What precedes it is taken by
+            # its hash links; what follows, by the rosters it leads to.
+            anchor = seg_rosters[-1]
+            if not self._roster_anchor_ok(anchor, group or ''):
+                return None
+            out = {i for i in have if i <= anchor.index}
+        for k, entries, sigs in hist.placement_batches(seg):
+            if anchor is not None and k <= anchor.index:
+                continue
+            whole = entries is not None and all(
+                i in have for i in range(k, k + len(entries)))
+            if entries is None:
+                continue
+            roster = hist.roster_at(k)
+            for r in seg_rosters:
+                if r.index < k and (roster is None or r.index > roster.index):
+                    roster = r
+            digest = place_value_digest(entries, k)
+            desig = place_designation(k, entries[0].prev_hash or b'', digest)
+            genesis = self._genesis_of(entries)
+            if roster is None and genesis is not None:
+                # A genesis is decided by every member it lists.
+                roster = genesis
+                need = len(genesis.roster_members or ())
+            elif roster is not None:
+                need = len(roster.roster_members or ()) // 2 + 1
+            else:
+                need = None             # nothing but a genesis before a roster
+            if need is not None and \
+                    len(self._verified_cosigners(desig, sigs, roster)) >= need:
+                out.update(range(k, k + len(entries)))
+            elif whole:
+                return None
+        return out
+
+    def _roster_anchor_ok(self, r, key) -> bool:
+        """May a node that knows no roster of chain `key` take the segment's
+        latest roster entry `r` as the group's? (doc/architecture/
+        reputation.md, "Who is in the group".) It must differ from the group
+        as identity shows it to us by at most one member (perhaps ourselves),
+        list the same keys for the members both know, and carry a placement
+        certificate signed by a majority of the roster before it, counting
+        only members we know and verifying their signatures with the keys
+        identity holds. A history invented by an insider fails one of these:
+        it cannot make the members we know sign its last roster change."""
+        live = dict(map(tuple, self._live_roster(key)))
+        members = dict(map(tuple, r.roster_members or ()))
+        if not members or len(set(live) ^ set(members)) > 1:
+            return False
+        if any(live[u] != members[u] for u in set(live) & set(members)):
+            return False
+        before = dict(members)
+        if r.roster_op == 'add' and r.roster_uuid is not None:
+            before.pop(str(r.roster_uuid).lower(), None)
+        if not getattr(r, 'place_sigs', None) or r.place_from != r.index:
+            return False
+        entries = [placement_entry(r)]
+        desig = place_designation(r.index, r.prev_hash or b'',
+                                  place_value_digest(entries, r.index))
+        signers = {u for u in self._verified_cosigners(desig, r.place_sigs, None)
+                   if u in before and u in live}
+        return len(signers) >= len(before) // 2 + 1
+
+    def _reconcile_into(self, queues, key, seg, who, message=None,
+                        final_end=None, attested=None) -> 'ReconcileResult | None':
+        """Reconcile one chain with a peer's verified segment and act on the
+        result. In a group that places its order the segment's placement
+        certificates decide (TransactionHistory.reconcile, rules 6-9)."""
+        hist = self._chain_for_key(key)
+        group = key or None
+        certified = None
+        if self._ordered_placement(group):
+            certified = self._placement_certified_indices(hist, seg, group)
+            if certified is None:
+                self.logger.warning(
+                    'Rejecting chain from %s: a placement certificate does '
+                    'not meet our quorum', who)
+                return None
+        before = len(hist)
+        res = hist.reconcile(seg, final_end, attested, certified)
+        after = len(hist)
+        if res.status == ReconcileResult.ADOPTED:
+            self.logger.info(
+                'adopted chain from %s at index %d: dropped %d, added '
+                '%d (ours %d -> theirs %d)', who, res.fork,
+                len(res.dropped), len(res.added), before, after)
+        elif res.status == ReconcileResult.EXTENDED:
+            self.logger.info('caught up from %s: chain %d -> %d',
+                             who, before, after)
+        elif res.status == ReconcileResult.REFUSED_FINAL:
+            self.logger.warning(
+                'chain from %s forks at index %d, inside our finalized '
+                'checkpoint (ends %d); keeping ours', who, res.fork,
+                final_end)
+        elif res.status == ReconcileResult.EQUIVOCATION:
+            self.logger.error(
+                'chain from %s holds a certified placement at index %d '
+                'that differs from ours: two quorums signed two values '
+                'there; keeping ours', who, res.fork)
+        for tx in res.added + res.dropped:
+            for peer in (tx.p1_id, tx.p2_id):
+                if peer is not None:
+                    self._note_interaction(peer)
+        if certified is not None and res.status in (ReconcileResult.ADOPTED,
+                                                    ReconcileResult.EXTENDED):
+            # Placements buffered ahead of the chain may now follow it.
+            self._apply_ahead(key, hist, group)
+        if res.status == ReconcileResult.ADOPTED:
+            if certified is not None:
+                if res.pooled:
+                    self.logger.info('returned %d dropped entr%s to the pool',
+                                     res.pooled, 'y' if res.pooled == 1 else 'ies')
+            elif not key:
+                self._repropose_dropped(queues, res)
+                self._reappend_attested(res)
+        # A chain that grew from a peer means a quorum may be back:
+        # the minority side of a heal arrives here EXTENDED (§2.60).
+        if not key and res.status in (ReconcileResult.ADOPTED,
+                                      ReconcileResult.EXTENDED):
+            self._wake_parked(who)
+        return res
+
+    def _send_update_pages(self, queues, to_whom, key, hist, era, budget):
+        """Send `era` (the whole window of chain `key`) to `to_whom` as pages
+        whose entries each serialize to at most `budget` bytes, every page
+        naming the chain's head so the receiver puts together one window, not
+        pieces of two. A single entry larger than the budget gets a page
+        alone. Mirrors C _send_update_pages."""
+        starts, used = [], 0
+        for i, entry in enumerate(era):
+            size = len(to_json_string(entry)) + 1
+            if not starts or (used > 0 and used + size > budget):
+                if len(starts) == UPDATE_PAGES_MAX:
+                    self.logger.error('chain of %d entries needs more than %d '
+                                      'pages; not sent', len(era), UPDATE_PAGES_MAX)
+                    return
+                starts.append(i)
+                used = 0
+            used += size
+        starts.append(len(era))
+        pages = len(starts) - 1
+        head = hist._head_hash
+        head = head.decode() if isinstance(head, bytes) else str(head or '')
+        self.logger.info('sending our chain to %s in %d pages (%d entries)',
+                         getattr(to_whom, 'nickname', '?'), pages, len(era))
+        for p in range(pages):
+            page = {'page': p, 'of': pages, 'head': head,
+                    'chain': era[starts[p]:starts[p + 1]]}
+            if key:
+                page['group'] = key
+            msg = Message(self.name, ReputationProtocol.update,
+                          to_json_string(page), to_whom, from_whom=self.identity)
+            queues[CfgIds.network].put(msg, block=True, timeout=self.q_cadence)
+
+    def _assemble_update_pages(self, message, reported):
+        """A `latest update` that is one page of a window (_send_update_pages):
+        keep it, and once every page of that head from that sender is in,
+        return the window as an unpaged reply carries it (a list, or
+        {'group', 'chain'} for a child chain). An unpaged reply comes back
+        unchanged; None while pages are missing or for a malformed page.
+        Mirrors C _assemble_update_pages."""
+        if not isinstance(reported, dict) or 'page' not in reported:
+            return reported
+        page, of = reported.get('page'), reported.get('of')
+        head, chunk = reported.get('head'), reported.get('chain')
+        group = reported.get('group')
+        if not isinstance(page, int) or not isinstance(of, int) \
+                or not isinstance(head, str) or not isinstance(chunk, list) \
+                or not 1 <= of <= UPDATE_PAGES_MAX or not 0 <= page < of:
+            self.logger.warning('malformed chain page from %s; dropped',
+                                message.from_whom.nickname)
+            return None
+        if not hasattr(self, 'page_bufs'):
+            self.page_bufs, self._page_seq = {}, 0
+        slot = (str(message.from_whom.uuid), group or '')
+        buf = self.page_bufs.get(slot)
+        # A new head or page count means the sender's window moved on.
+        if buf is None or buf['head'] != head or buf['of'] != of:
+            if buf is None and len(self.page_bufs) >= UPDATE_PAGE_BUFS:
+                oldest = min(self.page_bufs,
+                             key=lambda k: self.page_bufs[k]['seq'])
+                del self.page_bufs[oldest]
+            self._page_seq += 1
+            buf = {'head': head, 'of': of, 'pages': {}, 'seq': self._page_seq}
+            self.page_bufs[slot] = buf
+        buf['pages'].setdefault(page, chunk)
+        got = len(buf['pages'])
+        if got < of:
+            self.logger.debug('chain page %d of %d from %s; %d in', page + 1,
+                              of, message.from_whom.nickname, got)
+            return None
+        del self.page_bufs[slot]
+        whole = [e for p in range(of) for e in buf['pages'][p]]
+        self.logger.info('all %d pages of %s\'s chain are in (%d entries)', of,
+                         message.from_whom.nickname, len(whole))
+        return {'group': group, 'chain': whole} if group else whole
+
     def handle_update(self, queues, message):
         if message.function == ReputationProtocol.update:
+            who = message.from_whom.nickname
+            reported = from_json_string(message.obj)
+            # A paged window waits here until every page is in.
+            reported = self._assemble_update_pages(message, reported)
+            if reported is None:
+                return True
+            if isinstance(reported, dict):
+                # A child chain's update: always applied directly, as the
+                # quorum of one is (the vote below is the primary chain's).
+                group = str(reported.get('group') or '')
+                key = self._chain_key(group)
+                chain = reported.get('chain')
+                if not key or not isinstance(chain, list):
+                    return True
+                if not self._chain_certified(chain, message, key):
+                    return True
+                self._reconcile_into(queues, key, chain, who, message)
+                return True
             if self.num_updates <= 1:
                 # Quorum of one: apply this peer's verified segment directly,
                 # without storing it, so no stale report can out-vote it.
-                before = len(self.history)
-                chain = from_json_string(message.obj)
+                chain = reported
                 if not isinstance(chain, list):
                     return True
                 if not self._chain_certified(chain, message):
                     return True
                 # Outvoted: a chain reproducing the quorum's checkpoint wins
                 # even an equal-length tiebreak (ISSUES.md §2.15). Mirrors C.
-                res = self.history.reconcile(chain, self._final_end(),
-                                             self._outvoted())
-                after = len(self.history)
-                who = message.from_whom.nickname
-                if res.status == ReconcileResult.ADOPTED:
-                    self.logger.info(
-                        'adopted chain from %s at index %d: dropped %d, added '
-                        '%d (ours %d -> theirs %d)', who, res.fork,
-                        len(res.dropped), len(res.added), before, after)
-                elif res.status == ReconcileResult.EXTENDED:
-                    self.logger.info('caught up from %s: chain %d -> %d',
-                                     who, before, after)
-                elif res.status == ReconcileResult.REFUSED_FINAL:
-                    self.logger.warning(
-                        'chain from %s forks at index %d, inside our finalized '
-                        'checkpoint (ends %d); keeping ours', who, res.fork,
-                        self._final_end())
-                for tx in res.added + res.dropped:
-                    for peer in (tx.p1_id, tx.p2_id):
-                        if peer is not None:
-                            self._note_interaction(peer)
-                if res.status == ReconcileResult.ADOPTED:
-                    self._repropose_dropped(queues, res)
-                    self._reappend_attested(res)
-                # A chain that grew from a peer means a quorum may be back:
-                # the minority side of a heal arrives here EXTENDED (§2.60).
-                if res.status in (ReconcileResult.ADOPTED,
-                                  ReconcileResult.EXTENDED):
-                    self._wake_parked(who)
+                self._reconcile_into(queues, '', chain, who, message,
+                                     self._final_end(), self._outvoted())
                 return True
-            reported = from_json_string(message.obj)
             if isinstance(reported, list) and \
                     not self._chain_certified(reported, message):
                 return True
@@ -3751,18 +4176,8 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 self.logger.debug(grouping)
                 if len(best) > up_count // 2:
                     chain = best[0]  # all entries in the bucket are identical
-                    res = self.history.catchup(chain)
                     self.logger.debug('Updated')
-                    if res.status == ReconcileResult.ADOPTED:
-                        self.logger.info(
-                            'adopted the majority chain at index %d: dropped '
-                            '%d, added %d', res.fork, len(res.dropped),
-                            len(res.added))
-                        self._repropose_dropped(queues, res)
-                        self._reappend_attested(res)
-                    if res.status in (ReconcileResult.ADOPTED,
-                                      ReconcileResult.EXTENDED):
-                        self._wake_parked('the majority chain')
+                    self._reconcile_into(queues, '', chain, 'the majority chain')
                 else:
                     self.logger.error('Closest %d peers unable to agree on history', self.num_updates)
                     self._request_update(queues, len(self.peers.all),
@@ -3789,13 +4204,32 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 == (getattr(tx, 'attest_scope', None) or '')
                 and float(held.p1_score) == float(tx.p1_score))
 
-    def _chain_certified(self, chain, message) -> bool:
+    def _chain_certified(self, chain, message, key: str = '') -> bool:
         """Catch-up refuses a segment carrying an attested entry whose
         certificate does not meet our quorum (doc/architecture/reputation.md):
         otherwise catch-up would be a way around the round. An entry we already
-        hold certified is not re-judged against today's roster."""
+        hold certified is not re-judged against today's roster.
+
+        In a group that places its order, an entry a verified placement
+        covers is not re-judged: its acceptors checked each half's and each
+        attestation's certificate against the roster in force when they
+        accepted it (the user's call, 2026-10-14). A segment whose placement
+        certificate does not verify is refused whole."""
+        if self._ordered_placement(key or None):
+            seg = sorted((t for t in chain if getattr(t, 'index', None) is not None),
+                         key=lambda t: t.index)
+            covered = self._placement_certified_indices(
+                self._chain_for_key(key), seg, key or None)
+            if covered is None:
+                self.logger.warning(
+                    'Rejecting chain from %s: a placement certificate does not '
+                    'meet the roster in force',
+                    getattr(message.from_whom, 'nickname', '?'))
+                return False
+            chain = [t for t in chain if getattr(t, 'index', None) not in covered]
         for tx in chain:
-            if getattr(tx, 'attested', False) and not self._attest_already_held(tx) \
+            if getattr(tx, 'attested', False) \
+                    and not (not key and self._attest_already_held(tx)) \
                     and not self._attest_certified(tx):
                 self.logger.warning(
                     'Rejecting chain from %s: an attested entry (task %s) '
@@ -3803,7 +4237,7 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     getattr(message.from_whom, 'nickname', '?'),
                     str(tx.task_id)[:8])
                 return False
-        return self._commit_certs_ok(chain, message)
+        return self._commit_certs_ok(chain, message, key)
 
     def _reappend_attested(self, res):
         """An adopted chain that dropped a certified attested entry: re-append
@@ -3818,12 +4252,27 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 self._commit_attestation(att, sigs)
 
     def _own_half_recorded(self, task_id) -> bool:
-        """Does any chain we keep hold OUR half of `task_id`, bilateral or not?"""
+        """Does any chain we keep hold OUR half of `task_id`, bilateral or not,
+        placed or waiting in the pool?"""
         me = str(self.identity.uuid)
         for chain in [self.history] + list(self.child_histories.values()):
-            tx = chain._task_mapping.get(task_id)
-            if tx is not None and me in (str(tx.p1_id), str(tx.p2_id)):
-                return True
+            for tx in (chain._task_mapping.get(task_id), chain.pooled(task_id)):
+                if tx is not None and me in (str(tx.p1_id), str(tx.p2_id)):
+                    return True
+        return False
+
+    def _record_committed_half(self, group_uuid, task_id, scorer, score,
+                               channel, certificate) -> bool:
+        """Write a committed half to its chain, or, in a group that places its
+        order (doc/architecture/reputation.md, "Agreeing on an order"), to
+        that chain's pool, where it waits to be placed. True when it went to
+        the pool."""
+        chain = self._chain_for_group(group_uuid)
+        if self._ordered_placement(group_uuid):
+            chain.record_half(task_id, scorer, score, channel,
+                              certificate=certificate)
+            return True
+        chain.update(task_id, scorer, score, channel, certificate=certificate)
         return False
 
     #: Seconds after a peer is first seen at which our pending halves are
@@ -3870,7 +4319,11 @@ class ReputationProcess(Process, metaclass=ProcMeta,
         if not due:
             return 0
         me = str(identity.uuid)
-        halves = [tx for tx in self.history._task_mapping.values()
+        # In a group that places its order, an unpaired half waits in the
+        # pool rather than in the task map: hand those off too.
+        held = (list(self.history._task_mapping.values())
+                + list(self.history._pool.values()))
+        halves = [tx for tx in held
                   if len(tx) == 1 and not tx.attested and tx.p2_id is None
                   and str(tx.p1_id) == me][:self.HANDOFF_MAX_HALVES]
         if not halves:
@@ -4603,7 +5056,10 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                     '%s -> %d will republish on the next rescore',
                     key, new_tier)
                 return
-            self.logger.debug('Published tier_update for %s: %d (score=%.3f)', key, new_tier, score)
+            if old_tier is None:
+                self.logger.info('Tier of %s first set to %d (score %.3f)', key, new_tier, score)
+            else:
+                self.logger.info('Tier of %s %d -> %d (score %.3f)', key, old_tier, new_tier, score)
             if is_demotion:
                 lost_msg = Message(CfgIds.negotiation, IdentityProtocol.tier_lost,
                                    payload, to_whom=None, from_whom=self.identity)
@@ -6047,21 +6503,17 @@ class ReputationProcess(Process, metaclass=ProcMeta,
                 self._hand_off_pending_halves(queues, present)
                 # Our attestation rounds whose propose went missing (§2.40).
                 self._retry_pending_attestations(queues, present)
+                # Ordered placement: propose the next instance of any chain
+                # whose ready items are ours to place now.
+                self._maybe_place(queues, present)
+                self._persist_pools()
                 # Checkpoint proposals that arrived before our chain held
                 # their range (§2.29).
                 self._recheck_parked_cosigns(queues, present)
                 # Debug instrument: emit this node's own reputation view for
                 # a host-side log harvester (opt-in, throttled internally).
                 self._dump_reputation_trace(present)
-                for req in list(self.requests):
-                    if present - req[0] > self.expiration:
-                        self.requests.remove(req)
-                for prop in dict(self.proposals):
-                    if present - prop[0] > self.expiration:
-                        del self.proposals[prop]
-                for rnd in list(self.round_group):
-                    if present - rnd[0] > self.expiration:
-                        del self.round_group[rnd]
+                self._expire_rounds(present)
                 # Guarantee a CPU-yield floor. queue.get's q_cadence timeout
                 # only sleeps when the queue is idle for a full window; under
                 # continuous traffic there is no idle window and this loop

@@ -1,0 +1,51 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: place-request-not-next-refused
+byte_pinning: false
+description: |
+    Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+    order"): classic Paxos decides what the chain holds from each index.
+    An instance is open only at the chain's next index. bob's chain is empty, so
+    alice's request for instance 1 is refused, and bob promises nothing.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  ordered_placement: true
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: place request
+    payload:
+      k: 1
+      ballot: {n: 5, by: alice}
+      head: ""
+  - id: 2
+    from: bob
+    to: alice
+    function: place grant
+    in_response_to: 1
+    expect_none: true
+    payload: {}
+  - id: 3
+    from: bob
+    to: alice
+    function: place nack
+    in_response_to: 1
+    no_propagate: true
+    payload: {}
+
+expected_state:
+  bob:
+    place_promised: null

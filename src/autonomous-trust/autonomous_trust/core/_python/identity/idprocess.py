@@ -2186,6 +2186,10 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         drive the vote/broadcast/welcome cycle.
         """
         if self.phase != 3:
+            if message.function == IdentityProtocol.announce:
+                # Nobody resends a request_access, so say that this one is lost.
+                self.logger.info('Dropping access request from %s: identity phase %s, not 3',
+                                 getattr(message.from_whom, 'nickname', '?'), self.phase)
             return False
         if message.function == IdentityProtocol.announce:
             try:
@@ -3767,6 +3771,14 @@ class IdentityProcess(Process, metaclass=ProcMeta,
         :return: bool (message handled)
         """
         if self.phase != 3:
+            if message.function == IdentityProtocol.update:
+                # The senders see us as already a member and will not resend,
+                # so the update is held: unhandled, process() keeps it in
+                # self.messages and offers it again every pass until phase 3.
+                # C holds it the same way (identity_replay_held_group_updates;
+                # ISSUES §2.18, §2.61).
+                self.logger.info('Holding group update from %s until phase 3 (identity phase %s)',
+                                 getattr(message.from_whom, 'nickname', '?'), self.phase)
             return False
         if message.function == IdentityProtocol.update:
             self.logger.debug('Received group update')

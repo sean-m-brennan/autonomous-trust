@@ -77,7 +77,7 @@
  * co-signatures inside a record the core cannot parse, exactly as a business
  * page bundle is. What the core trusts is the CHANNEL: that this arrived on
  * the local app queue from the app on this device. Nothing peer-supplied may
- * reach the handler — see _is_local_app_verb.
+ * reach the handler — see identity_is_local_app_verb.
  *
  * `standing: "proved"` from the app means REINSTATED: it removes this source's
  * ceiling and nothing else. That is what makes "revocation as a reputation

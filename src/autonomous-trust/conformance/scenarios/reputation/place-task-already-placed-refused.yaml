@@ -1,0 +1,50 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: place-task-already-placed-refused
+byte_pinning: false
+description: |
+    Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+    order"): classic Paxos decides what the chain holds from each index.
+    bob's chain already holds task t-1. alice proposes it again at the next
+    index, extending bob's own head, and bob does not accept it: no task is placed
+    twice.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  ordered_placement: true
+  tx_history:
+    bob:
+      - {task_id: t-1, p1: carol, p1_score: 0.9, p2: dave, p2_score: 0.7}
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: place
+    payload:
+      k: 1
+      ballot: {n: 5, by: alice}
+      head: recipient
+      value:
+          - {task_id: t-1, p1: carol, p1_score: 0.9, p2: dave, p2_score: 0.7}
+  - id: 2
+    from: bob
+    to: alice
+    function: place accepted
+    in_response_to: 1
+    expect_none: true
+    payload: {}
+
+expected_state:
+  bob:
+    chain_tasks: [t-1]

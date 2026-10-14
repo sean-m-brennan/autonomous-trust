@@ -44,6 +44,7 @@ int group_init(uuid_t *uuid, char *address, group_t *group)
     /* Explicit rather than left to zeroed storage: a group initialized here
      * has declared nothing, whatever memory it was handed. */
     group->commit_certificates = false;
+    group->ordered_placement = false;
     unsigned char *eseed = encryptor_generate();
     if (eseed == NULL)
         return -1;
@@ -272,11 +273,15 @@ int group_add_address(group_t *group, const char *uuid_str, const char *address)
 }
 
 /* Frama-C: skipped — [env] getenv */
-bool group_commit_certificates_resolve(void)
+/* The boolean knob @p name: "1", "true", "yes" or "on" (trimmed, any case) is
+ * true, "0", "false", "no" or "off" is false, and anything else, or unset, is
+ * @p dflt -- a knob that is on by default must be turned off explicitly, not
+ * by a typo. Mirrors Python system._env_bool. */
+static bool _env_bool(const char *name, bool dflt)
 {
-    const char *raw = getenv("AT_COMMIT_CERTIFICATES");
+    const char *raw = getenv(name);
     if (raw == NULL)
-        return false;
+        return dflt;
     char norm[8];
     size_t n = 0;
     for (const char *c = raw; *c != '\0'; c++)
@@ -284,12 +289,27 @@ bool group_commit_certificates_resolve(void)
         if (*c == ' ' || *c == '\t')
             continue;
         if (n + 1 >= sizeof(norm))
-            return false;   /* longer than any truthy spelling */
+            return dflt;   /* longer than any spelling */
         norm[n++] = (char)tolower((unsigned char)*c);
     }
     norm[n] = '\0';
-    return strcmp(norm, "1") == 0 || strcmp(norm, "true") == 0
-        || strcmp(norm, "yes") == 0 || strcmp(norm, "on") == 0;
+    if (strcmp(norm, "1") == 0 || strcmp(norm, "true") == 0
+        || strcmp(norm, "yes") == 0 || strcmp(norm, "on") == 0)
+        return true;
+    if (strcmp(norm, "0") == 0 || strcmp(norm, "false") == 0
+        || strcmp(norm, "no") == 0 || strcmp(norm, "off") == 0)
+        return false;
+    return dflt;
+}
+
+bool group_commit_certificates_resolve(void)
+{
+    return _env_bool("AT_COMMIT_CERTIFICATES", false);
+}
+
+bool group_ordered_placement_resolve(void)
+{
+    return _env_bool("AT_ORDERED_PLACEMENT", true);
 }
 
 /* Frama-C: skipped — [serialization] jansson JSON serialization */
@@ -412,6 +432,9 @@ int group_to_json(const void *data_struct, json_t **obj_ptr)
      * to_canonical. */
     if (ident->commit_certificates)
         json_object_set_new(obj, "commit_certificates", json_true());
+    /* Likewise the ordered-placement declaration. */
+    if (ident->ordered_placement)
+        json_object_set_new(obj, "ordered_placement", json_true());
 
     return 0;
 }
@@ -489,6 +512,8 @@ int group_from_json(const json_t *obj, void *data_struct)
     /* Only a literal true turns it on, as Python's from_canonical reads it. */
     group->commit_certificates =
         json_is_true(json_object_get(obj, "commit_certificates"));
+    group->ordered_placement =
+        json_is_true(json_object_get(obj, "ordered_placement"));
     return 0;
 }
 
@@ -508,6 +533,7 @@ int group_sync_out(group_t *group, AutonomousTrust__Core__Protobuf__Identity__Gr
         : AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__NET_WIRE_FORMAT__NET_WIRE_JSON;
     /* false is the proto3 default: an undeclared group's bytes are unchanged. */
     proto->commit_certificates = group->commit_certificates;
+    proto->ordered_placement = group->ordered_placement;
 
     /* Full address_map (doc/architecture/identity-protocol.md) as a proto3 map (repeated key/value entries).
      * Keys/values are SHARED with group->address_map: group_to_proto packs
@@ -585,6 +611,7 @@ int group_sync_in(AutonomousTrust__Core__Protobuf__Identity__Group *proto, group
         (proto->wire_format == AUTONOMOUS_TRUST__CORE__PROTOBUF__IDENTITY__NET_WIRE_FORMAT__NET_WIRE_PROTO)
         ? NET_WIRE_PROTO : NET_WIRE_JSON;
     group->commit_certificates = proto->commit_certificates != 0;
+    group->ordered_placement = proto->ordered_placement != 0;
 
     /* Rebuild the full address_map (doc/architecture/identity-protocol.md). proto_to_group deserializes into a
      * fresh (zeroed) group, so initialise the map before populating it. */

@@ -1,0 +1,45 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: place-request-granted
+byte_pinning: false
+description: |
+    Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+    order"): classic Paxos decides what the chain holds from each index.
+    bob's chain is empty, so its next index is 0. alice asks for instance 0
+    under ballot (5, alice), extending the empty head, and bob, having promised
+    nothing, grants it and promises the ballot.
+
+participants:
+  - id: alice
+    role: proposer
+  - id: bob
+    role: acceptor
+  - id: carol
+    role: member
+  - id: dave
+    role: member
+
+fixtures:
+  ordered_placement: true
+
+steps:
+  - id: 1
+    from: alice
+    to: bob
+    function: place request
+    payload:
+      k: 0
+      ballot: {n: 5, by: alice}
+      head: ""
+  - id: 2
+    from: bob
+    to: alice
+    function: place grant
+    in_response_to: 1
+    no_propagate: true
+    payload: {}
+
+expected_state:
+  bob:
+    place_promised: {n: 5, by: alice}

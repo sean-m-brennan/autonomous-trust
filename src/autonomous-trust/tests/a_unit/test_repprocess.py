@@ -231,6 +231,7 @@ class TestHandleGrant:
         ack = ((100, 1, uuid4()), (None, 0), None)  # different peer_id
         msg = Message(CfgIds.reputation, ReputationProtocol.grant,
                       to_yaml_string(ack), from_whom=peer)
+        msg.verified = True
         result = rp.handle_grant({CfgIds.network: queue.Queue()}, msg)
         assert result is True
 
@@ -410,6 +411,7 @@ class TestHandleGrantDeeper:
         # First grant from peer1
         msg = Message(CfgIds.reputation, ReputationProtocol.grant,
                       to_yaml_string(ack), from_whom=peer1)
+        msg.verified = True
         rp.handle_grant(queues, msg)
 
         # With 2 peers, quorum is 1 (2//2), so 1 grant should trigger transaction
@@ -421,6 +423,7 @@ class TestHandleGrantDeeper:
         ack = ((100, 1, rp.identity.uuid), (None, 0), None)
         msg = Message(CfgIds.reputation, ReputationProtocol.grant,
                       to_yaml_string(ack), from_whom=peer)
+        msg.verified = True
         # my_requests is empty, so idx not in my_requests
         result = rp.handle_grant({CfgIds.network: queue.Queue()}, msg)
         assert result is True
@@ -495,14 +498,15 @@ class TestHandleAcceptedDeeper:
         msg = Message(CfgIds.reputation, ReputationProtocol.accepted,
                       to_yaml_string((id1, id2, peer1.uuid)),
                       from_whom=peer1)
+        msg.verified = True
         result = rp.handle_accepted(None, msg)
         assert result is True
-        assert tid in rp.acceptances
+        assert rp.acceptances[idx] == {str(peer1.uuid)}
 
     def test_accepted_reaches_majority(self):
         rp = _make_rep_process()
         peer1 = _make_mock_peer(nickname='p1')
-        rp.protocol.peers.all = [peer1]  # 1 peer, quorum = 0
+        rp.protocol.peers.all = [peer1]  # 2 members: both must accept
 
         id1 = 100
         id2 = 1
@@ -511,12 +515,13 @@ class TestHandleAcceptedDeeper:
         score = TransactionScore(tid, 0.8)
         rp.proposals[idx] = score
 
-        # Pre-populate history with identity's side of the transaction
-        # (as forward_transaction would have done)
-        rp.history.update(tid, rp.identity.uuid, 0.8)
+        # Pre-populate history with peer1's side of the transaction, so
+        # our half completes the entry.
+        rp.history.update(tid, peer1.uuid, 0.8)
 
+        # Our round: sending the transaction was our own acceptance.
         msg = Message(CfgIds.reputation, ReputationProtocol.accepted,
-                      to_yaml_string((id1, id2, peer1.uuid)),
+                      to_yaml_string((id1, id2, rp.identity.uuid)),
                       from_whom=peer1)
         msg.verified = True  # simulate signed message (mock peer can't sign)
         # Crossing the majority threshold triggers a `committed`
@@ -524,7 +529,7 @@ class TestHandleAcceptedDeeper:
         # test passed None and crashed at the broadcast site.
         net_q = queue.Queue()
         rp.handle_accepted({CfgIds.network: net_q}, msg)
-        # 1 acceptance > 1//2=0, so transaction should be committed
+        # peer1's acceptance and ours: 1 + 1 > (1 + 1) // 2, so it commits
         assert len(rp.history) > 0
 
 
@@ -764,6 +769,7 @@ class TestHandleGrantDeeper:
         ack = ((id1, id2, rp.identity.uuid), (200, 0), None)  # last_id=200 >= id1=100
         msg = Message(CfgIds.reputation, ReputationProtocol.grant,
                       to_yaml_string(ack), from_whom=peer)
+        msg.verified = True
         result = rp.handle_grant({CfgIds.network: queue.Queue()}, msg)
         assert result is True
 
@@ -780,6 +786,7 @@ class TestHandleGrantDeeper:
         ack = ((id1, id2, rp.identity.uuid), (None, 0), None)
         msg = Message(CfgIds.reputation, ReputationProtocol.grant,
                       to_yaml_string(ack), from_whom=peer)
+        msg.verified = True
         result = rp.handle_grant({CfgIds.network: queue.Queue()}, msg)
         assert result is True
         assert rp.my_requests[idx].count == 1
@@ -933,16 +940,17 @@ class TestHandleAcceptedAlreadyAccepted:
         tid = uuid4()
         score = TransactionScore(tid, 0.8)
         rp.proposals[idx] = score
-        rp.acceptances[tid] = [peer1]  # already accepted
+        rp.acceptances[idx] = {str(peer1.uuid)}  # already accepted
         rp.committed_paxos_rounds[idx] = None  # already committed
 
         msg = Message(CfgIds.reputation, ReputationProtocol.accepted,
                       to_yaml_string((id1, id2, peer1.uuid)),
                       from_whom=peer1)
+        msg.verified = True
         result = rp.handle_accepted({CfgIds.network: queue.Queue()}, msg)
         assert result is True
         # Should not add duplicate
-        assert len(rp.acceptances[tid]) == 1
+        assert len(rp.acceptances[idx]) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1004,6 +1012,7 @@ class TestHandleGrantFaultyPeer:
         ack = ((id1, id2, rp.identity.uuid), (200, 0), None)
         msg = Message(CfgIds.reputation, ReputationProtocol.grant,
                       to_yaml_string(ack), from_whom=peer)
+        msg.verified = True
         result = rp.handle_grant({CfgIds.network: queue.Queue()}, msg)
         assert result is True
         rp.protocol.peers.demote.assert_called_once_with(peer)
@@ -1021,6 +1030,7 @@ class TestHandleGrantFaultyPeer:
         ack = ((id1, id2, rp.identity.uuid), (None, 999), None)
         msg = Message(CfgIds.reputation, ReputationProtocol.grant,
                       to_yaml_string(ack), from_whom=peer)
+        msg.verified = True
         result = rp.handle_grant({CfgIds.network: queue.Queue()}, msg)
         assert result is True
         rp.protocol.peers.demote.assert_called_once_with(peer)
@@ -1039,6 +1049,7 @@ class TestHandleGrantAlreadyCompleted:
         ack = ((id1, id2, rp.identity.uuid), (None, 0), None)
         msg = Message(CfgIds.reputation, ReputationProtocol.grant,
                       to_yaml_string(ack), from_whom=peer)
+        msg.verified = True
         result = rp.handle_grant({CfgIds.network: queue.Queue()}, msg)
         assert result is True
 
@@ -1063,6 +1074,7 @@ class TestHandleGrantMajorityReached:
         net_q = queue.Queue()
         msg = Message(CfgIds.reputation, ReputationProtocol.grant,
                       to_yaml_string(ack), from_whom=peer1)
+        msg.verified = True
         result = rp.handle_grant({CfgIds.network: net_q}, msg)
         assert result is True
         assert not net_q.empty()
@@ -1089,6 +1101,7 @@ class TestHandleGrantMajorityReached:
         full_q.put = MagicMock(side_effect=Full)
         msg = Message(CfgIds.reputation, ReputationProtocol.grant,
                       to_yaml_string(ack), from_whom=peer1)
+        msg.verified = True
         result = rp.handle_grant({CfgIds.network: full_q}, msg)
         assert result is True
 
@@ -1188,7 +1201,7 @@ class TestHandleAcceptedDeeper2:
         """
         rp = _make_rep_process()
         peer1 = _make_mock_peer(nickname='p1')
-        rp.protocol.peers.all = [peer1]  # 1 peer → quorum = 0
+        rp.protocol.peers.all = [peer1]  # 2 members: both must accept
 
         id1 = 100
         id2 = 1
@@ -1196,17 +1209,18 @@ class TestHandleAcceptedDeeper2:
         tid = uuid4()
         score = TransactionScore(tid, 0.9)
         rp.proposals[idx] = score
-        # pre-populate identity side of tx so history.update can find it
-        rp.history.update(tid, rp.identity.uuid, 0.9)
+        # pre-populate peer1's side of tx, so our half completes it
+        rp.history.update(tid, peer1.uuid, 0.9)
 
+        # Our round: sending the transaction was our own acceptance.
         msg = Message(CfgIds.reputation, ReputationProtocol.accepted,
-                      to_yaml_string((id1, id2, peer1.uuid)),
+                      to_yaml_string((id1, id2, rp.identity.uuid)),
                       from_whom=peer1)
         msg.verified = True  # simulate signed message (mock peer can't sign)
         net_q = queue.Queue()
         result = rp.handle_accepted({CfgIds.network: net_q}, msg)
         assert result is True
-        # 1 acceptance > 1//2=0, so history should have been updated
+        # peer1's acceptance and ours make both members
         assert len(rp.history) > 0
 
     def test_accepted_below_majority_no_commit(self):

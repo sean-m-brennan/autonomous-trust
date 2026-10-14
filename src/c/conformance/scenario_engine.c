@@ -162,6 +162,20 @@ static int _drive_assertion(sce_run_ctx_t *ctx, json_t *step, int in_resp) {
             break;
         }
     }
+    /* Optional expect_none: a refusal that must stay silent. Nothing of the
+     * kind may be in the parent's outbox, and nothing is delivered. */
+    if (json_is_true(json_object_get(step, "expect_none"))) {
+        if (match) {
+            snprintf(ctx->err, sizeof(ctx->err),
+                     "step %d: expected no %.31s->%.31s:%.63s in response to "
+                     "step %d, but one was sent",
+                     sid, from, to, function, in_resp);
+            return -1;
+        }
+        ctx->outbox_start[sid] = (int)ctx->captured_count;
+        ctx->outbox_end[sid] = (int)ctx->captured_count;
+        return 0;
+    }
     if (!match) {
         char captured[256] = {0};
         size_t off = 0;

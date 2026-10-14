@@ -144,6 +144,17 @@ static void _drop_copy(group_t *g)
         map_free(&g->address_map);
 }
 
+/* A queue directory naming both identity and network (so _remember_activity
+ * has a sibling to tell). */
+static directory_t *_queues(void)
+{
+    directory_t *queues = NULL;
+    ck_assert_ret_ok(array_create(&queues));
+    ck_assert_ret_ok(array_append(queues, string_data(ID_NAME, strlen(ID_NAME))));
+    ck_assert_ret_ok(array_append(queues, string_data(NET_NAME, strlen(NET_NAME))));
+    return queues;
+}
+
 /* Dispatch @p theirs as a VERIFIED group_key_update from @p member, through a
  * queue directory naming both identity and network (so _remember_activity has
  * a sibling to tell). */
@@ -164,12 +175,11 @@ static void _dispatch_update(process_t *proc, identity_t *member, group_t *their
     ck_assert_ret_ok(net_msg_pack_json(&msg.info.net_msg, payload));
     json_decref(payload);
 
-    directory_t *queues = NULL;
-    ck_assert_ret_ok(array_create(&queues));
-    ck_assert_ret_ok(array_append(queues, string_data(ID_NAME, strlen(ID_NAME))));
-    ck_assert_ret_ok(array_append(queues, string_data(NET_NAME, strlen(NET_NAME))));
+    directory_t *queues = _queues();
     run_message_handlers(proc, queues, NET_MESSAGE, &msg);
     array_free(queues);
+    /* A held update keeps its own copy; this one is ours to free. */
+    net_msg_free_obj(&msg.info.net_msg);
 }
 
 /* The live shape: a peer rotated (higher epoch), membership unchanged. */
@@ -224,6 +234,81 @@ DEFINE_TEST(test_a_declined_rotation_sends_nothing)
     _end();
 }
 
+/* Partition cohort part-3615656 (2026-10-14), ISSUES §2.61: three members
+ * rotated at once to the same epoch. cal was still in phase 2 when amy's and
+ * dee's update with the winning (lower) key arrived, so it dropped them, then
+ * took the losing key from the merge history. Nobody resends to a member, so
+ * cal held the losing key for good. The update is now held and replayed at
+ * phase 3, where the same-epoch tiebreak hands cal the winner. */
+DEFINE_TEST(test_an_update_before_phase_3_is_replayed_and_settles_the_tiebreak)
+{
+    _begin();
+    identity_t *me = _mk_identity("cal", "10.0.0.3");
+    identity_t *amy = _mk_identity("amy", "10.0.0.2");
+    process_t *proc = _mk_process(me);
+
+    /* Two members' simultaneous rotations of one group: the same epoch. */
+    group_t a, b;
+    _copy_group(proc, &a);
+    _copy_group(proc, &b);
+    int64_t epoch = group_rotate_key(&a);
+    ck_assert(group_rotate_key(&b) == epoch);
+    int order = memcmp(a.encryptor.public, b.encryptor.public,
+                       crypto_box_PUBLICKEYBYTES);
+    ck_assert(order != 0);
+    group_t *winner = order < 0 ? &a : &b;
+    group_t *loser = order < 0 ? &b : &a;
+
+    proc->protocol.phase = 2;
+    _dispatch_update(proc, amy, winner);
+    ck_assert_int_eq((int)g_group_to_network, 0);       /* nothing applied yet */
+
+    /* Joining the group takes the losing key, as cal's merge did. */
+    ck_assert(group_accept_rotation(&proc->protocol.group, loser));
+    proc->protocol.phase = 3;
+
+    directory_t *queues = _queues();
+    ck_assert_int_eq((int)identity_replay_held_group_updates(proc, queues), 1);
+    ck_assert_int_eq(memcmp(proc->protocol.group.encryptor.public,
+                            winner->encryptor.public,
+                            crypto_box_PUBLICKEYBYTES), 0);
+    ck_assert_int_eq((int)g_group_to_network, 1);
+    ck_assert_int_eq(memcmp(g_last_key, winner->encryptor.public,
+                            crypto_box_PUBLICKEYBYTES), 0);
+    /* Replayed once, then forgotten. */
+    ck_assert_int_eq((int)identity_replay_held_group_updates(proc, queues), 0);
+    array_free(queues);
+
+    _drop_copy(&a);
+    _drop_copy(&b);
+    _end();
+}
+
+/* The hold is bounded: past ID_HELD_GROUP_UPDATES the oldest goes. */
+DEFINE_TEST(test_held_updates_are_bounded)
+{
+    _begin();
+    identity_t *me = _mk_identity("cal", "10.0.0.3");
+    identity_t *amy = _mk_identity("amy", "10.0.0.2");
+    process_t *proc = _mk_process(me);
+    group_t theirs;
+    _copy_group(proc, &theirs);
+
+    proc->protocol.phase = 2;
+    for (int i = 0; i < ID_HELD_GROUP_UPDATES + 3; i++)
+        _dispatch_update(proc, amy, &theirs);
+    proc->protocol.phase = 3;
+
+    directory_t *queues = _queues();
+    ck_assert_int_eq((int)identity_replay_held_group_updates(proc, queues),
+                     ID_HELD_GROUP_UPDATES);
+    array_free(queues);
+    _drop_copy(&theirs);
+    _end();
+}
+
 RUN_TESTS(GroupRotationSibling,
           test_an_equal_size_rotation_reaches_the_network_process,
-          test_a_declined_rotation_sends_nothing)
+          test_a_declined_rotation_sends_nothing,
+          test_an_update_before_phase_3_is_replayed_and_settles_the_tiebreak,
+          test_held_updates_are_bounded)

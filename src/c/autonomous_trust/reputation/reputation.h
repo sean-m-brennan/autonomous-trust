@@ -111,6 +111,16 @@ extern char REP_PROTO_CHECKPOINT_FINAL[];
 extern char REP_PROTO_REP_RESOLVE[];
 extern char REP_PROTO_REP_RESOLVED[];
 
+/* Ordered placement (doc/architecture/reputation.md, "Agreeing on an order"):
+ * classic Paxos per chain index, only in a group that declares it. Wire
+ * strings match Python ReputationProtocol.place_*. */
+extern char REP_PROTO_PLACE_REQUEST[];
+extern char REP_PROTO_PLACE_GRANT[];
+extern char REP_PROTO_PLACE_NACK[];
+extern char REP_PROTO_PLACE[];
+extern char REP_PROTO_PLACE_ACCEPTED[];
+extern char REP_PROTO_PLACED[];
+
 /****************************
  * Reputation tuning constants — mirror Python class attributes in
  * src/autonomous-trust/.../reputation/repprocess.py:ReputationProcess.
@@ -269,8 +279,11 @@ typedef struct {
 /* Room for transaction_canonical_bytes at its longest: three uuids, two
  * scores, an index, two channels, and the attested block (a marker, a fourth
  * uuid, a digest and an optional scope). */
-#define TX_CANON_MAX (UUID_STRING_LEN * 4 + 160 + 2 * (TX_CHANNEL_NAMELEN + 1) \
-                      + 2 * (TX_ATTEST_DIGEST_HEX_LEN + 1))
+#define TX_CANON_MAX (UUID_STRING_LEN * 5 + 200 + 2 * (TX_CHANNEL_NAMELEN + 1) \
+                      + 3 * (TX_ATTEST_DIGEST_HEX_LEN + 1))
+
+/* A roster entry's op ("genesis", "add", "restate") plus NUL. */
+#define TX_ROSTER_OP_LEN 8
 
 typedef struct {
     uuid_t task_uuid;
@@ -325,6 +338,18 @@ typedef struct {
      * hashes as it always did. APPENDED, for the CFFI mirror. Mirrors Python
      * Transaction.attest_scope. */
     char   attest_scope[TX_ATTEST_DIGEST_HEX_LEN + 1];
+    /* A ROSTER entry (doc/architecture/reputation.md, "Who is in the group"):
+     * who the group is from the next index on. No scorer, no score. roster_op
+     * is "genesis", "add" or "restate"; roster_uuid the member an add adds
+     * (zero otherwise); roster_digest covers the member list, which is kept
+     * beside the chain in tx_history_t.rosters, keyed by this digest, like a
+     * certificate. Covered by transaction_canonical_bytes. APPENDED, for the
+     * CFFI mirror. Mirrors Python Transaction.roster_op / roster_uuid /
+     * roster_digest. */
+    bool   roster;
+    char   roster_op[TX_ROSTER_OP_LEN];
+    uuid_t roster_uuid;
+    char   roster_digest[TX_HASH_HEX_LEN + 1];
 } transaction_t;
 
 /* Committed: bilateral, or attested and indexed. The one test every reader of
@@ -332,7 +357,8 @@ typedef struct {
  * half. */
 static inline bool tx_is_committed(const transaction_t *t)
 {
-    return (t->p1_set && t->p2_set) || (t->attested && t->p1_set && t->index >= 0);
+    return (t->p1_set && t->p2_set) || (t->attested && t->p1_set && t->index >= 0)
+        || (t->roster && t->index >= 0);
 }
 
 /* The score @p tx holds ABOUT @p peer_uuid, and who gave it (@p author, may be
@@ -342,6 +368,24 @@ static inline bool tx_is_committed(const transaction_t *t)
  * Transaction.about. */
 bool transaction_score_about(const transaction_t *tx, const uuid_t peer_uuid,
                              double *score, uuid_t author);
+
+/* Is @p op one a roster entry may record? */
+bool tx_roster_op_valid(const char *op);
+
+/* The digest of a roster member list (doc/architecture/reputation.md, "Who is
+ * in the group"): blake2b over "AT-ROSTER\0" and one "uuid:key" line per
+ * member, sorted by uuid, lowercase. @p members is a JSON array of [uuid,
+ * signing key hex] pairs. Writes the canonical (sorted, lowercase) list to
+ * @p norm_out when it is not NULL (caller decrefs). Returns 0, or -1 for a
+ * malformed, empty or repeated list. Mirrors Python roster_digest. */
+int roster_digest(const json_t *members, char out[TX_HASH_HEX_LEN + 1],
+                  json_t **norm_out);
+
+/* uuid5(AT_ROSTER_NS, "prev|op|member|digest"), "null" for an absent prev or
+ * member: the task id a roster entry carries, so two members proposing the
+ * same change propose the same value. Mirrors Python roster_task_id. */
+void tx_roster_task_uuid(const uuid_t prev, const char *op, const uuid_t member,
+                         const char *digest, uuid_t out);
 
 /* uuid5(AT_ATTEST_NS, "verifier|subject|digest"): the task id an attested
  * entry must carry. Mirrors Python attest_task_id. */
@@ -431,7 +475,71 @@ typedef struct {
      * per round. Outside the entry hash, like attest_certs; dropped on
      * eviction. Mirrors Python Transaction.commit_sigs. */
     map_t         commit_certs;
+    /* Ordered placement (doc/architecture/reputation.md, "Agreeing on an
+     * order"). Committed halves and certified attestations wait in the POOL,
+     * by task, until a decided placement writes their entry; nothing in it is
+     * in chain[], task_map or peer_map, so no score reads it. Bounded FIFO,
+     * oldest first. Mirrors Python TransactionHistory._pool. */
+    transaction_t pool[MAX_CHAIN_LEN];
+    int           pool_len;
+    /* Certificates of pooled entries: "<task>|<scorer>" -> commit certificate
+     * JSON of a half, "<task>" -> quorum certificate JSON of an attestation.
+     * Moved beside the entry when it is placed. */
+    map_t         pool_certs;
+    /* Bumped on every change to the pool, so the process persists it
+     * (reputation-pool.cfg.json) only when there is something new. Mirrors
+     * Python TransactionHistory.pool_rev. */
+    unsigned      pool_rev;
+    /* Decided placements that arrived ahead of the chain: "<first index>" ->
+     * the entries (a tx_decided_t), and "<first index>" -> the placement
+     * certificate JSON. Applied in order. Mirrors Python _decided. */
+    map_t         decided;
+    map_t         decided_sigs;
+    /* Placement certificates: task uuid of a placement's LAST entry -> JSON
+     * {voter: signature hex over place_designation}. Outside the entry hash;
+     * dropped on eviction. Mirrors Python place_certs. */
+    map_t         place_certs;
+    /* The index each of those placements began at: task uuid of its LAST
+     * entry -> integer. Travels with the certificate as "place_from" on the
+     * catch-up wire and in evidence, so a receiver can rebuild the value the
+     * quorum signed. Mirrors Python Transaction.place_from. */
+    map_t         place_from;
+    /* Roster member lists (doc/architecture/reputation.md, "Who is in the
+     * group"): roster digest -> canonical JSON [[uuid, key], ...]. Stored only
+     * after checking the list against its digest. Mirrors the member list a
+     * Python roster Transaction carries. */
+    map_t         rosters;
+    /* A roster taken as in force below every resident roster entry, with no
+     * index ("" for none): its digest, the list in `rosters`. How a
+     * conformance fixture stands for a roster logged before the scenario
+     * starts. Mirrors Python TransactionHistory.roster_anchor. */
+    char          roster_anchor[TX_HASH_HEX_LEN + 1];
 } tx_history_t;
+
+/* Upper bound on the entries one placement decides. Mirrors Python
+ * PLACE_BATCH_MAX. */
+#define PLACE_BATCH_MAX 32
+/* Room for place_value_bytes at its longest. */
+#define PLACE_VALUE_MAX (16 + PLACE_BATCH_MAX * (TX_CANON_MAX + 1))
+/* Room for place_designation: tag, index, two hex digests, separators. */
+#define PLACE_DESIG_MAX (16 + 24 + 2 * TX_HASH_HEX_LEN)
+
+/* tx_history_record_half's outcomes. Mirrors the Python strings. */
+typedef enum {
+    TX_HALF_PENDING = 0,   /* the task has one half */
+    TX_HALF_READY,         /* both: its entry can be placed */
+    TX_HALF_DUP,           /* this scorer's half (or a whole entry) is held */
+    TX_HALF_PLACED,        /* the task is in the chain */
+    TX_HALF_TOMBSTONED     /* it was, and has been evicted */
+} tx_half_status_t;
+
+/* tx_history_apply_placed's outcomes. Mirrors the Python strings. */
+typedef enum {
+    TX_PLACE_APPLIED = 0,  /* written, with any buffered placements after it */
+    TX_PLACE_BUFFERED,     /* ahead of the chain: held until its turn */
+    TX_PLACE_OLD,          /* behind the chain */
+    TX_PLACE_EMPTY         /* no entries */
+} tx_place_status_t;
 
 /*@
   requires \valid(hist);
@@ -491,6 +599,77 @@ int  tx_history_append_attested(tx_history_t *hist, const transaction_t *tx,
 
 /* The certificate kept for an attested entry (JSON text), or NULL. */
 const char *tx_history_attest_cert(const tx_history_t *hist, const uuid_t task_uuid);
+
+/* Put a committed half in the pool, with its commit certificate JSON
+ * (@p cert_json, may be NULL). Returns a tx_half_status_t, or -1 for a NULL
+ * history or an unknown channel. Nothing here touches the chain. Mirrors
+ * Python TransactionHistory.record_half. */
+int  tx_history_record_half(tx_history_t *hist, const uuid_t task_uuid,
+                            const uuid_t peer_uuid, double score,
+                            const char *channel, const char *cert_json);
+/* Put a certified attested entry in the pool, ready to be placed. Returns 0,
+ * or EINVAL and changes nothing when it is malformed or its task was ever
+ * held. Mirrors Python TransactionHistory.pool_attested. */
+int  tx_history_pool_attested(tx_history_t *hist, const transaction_t *tx,
+                              const char *cert_json);
+/* The pooled entry for @p task_uuid, or NULL. Borrowed. */
+const transaction_t *tx_history_pooled(const tx_history_t *hist,
+                                       const uuid_t task_uuid);
+/* The certificate kept for @p scorer's pooled half of @p task_uuid (for an
+ * attested entry, @p scorer is ignored and its quorum certificate returned),
+ * or NULL. Borrowed. */
+const char *tx_history_pool_cert(const tx_history_t *hist,
+                                 const uuid_t task_uuid, const uuid_t scorer);
+/* Take @p task_uuid out of the pool with its certificates. Returns 0, or -1
+ * when it is not pooled. */
+int  tx_history_pool_drop(tx_history_t *hist, const uuid_t task_uuid);
+/* Up to @p max_out pooled entries that can be placed now, as placement
+ * entries, by task id, into @p out. Returns how many. Mirrors Python
+ * TransactionHistory.ready_items. */
+int  tx_history_ready_items(const tx_history_t *hist, transaction_t *out,
+                            int max_out);
+/* @p in as a placement writes it into @p out: no index or link, and the two
+ * halves of an ordinary entry ordered by scorer uuid. Mirrors Python
+ * placement_entry. */
+void placement_entry(const transaction_t *in, transaction_t *out);
+/* The canonical bytes of a placement's value: @p n placement entries written
+ * at chain indices k, k+1, ... Returns the length, or 0 if @p cap is too
+ * small. Mirrors Python place_value_bytes. */
+size_t place_value_bytes(const transaction_t *entries, int n, int k,
+                         uint8_t *out, size_t cap);
+/* blake2b of place_value_bytes, lowercase hex ("" on failure). */
+void place_value_digest(const transaction_t *entries, int n, int k,
+                        char out[TX_HASH_HEX_LEN + 1]);
+/* The bytes an acceptor signs to certify a placement:
+ * "AT-PLACE\0" k "|" prev_hash "|" digest. Returns the length, or 0 if
+ * @p cap is too small. Mirrors Python place_designation. */
+size_t place_designation(int k, const char *prev_hash, const char *digest,
+                         uint8_t *out, size_t cap);
+/* Write a decided placement, @p n entries at chain indices k, k+1, ...,
+ * exactly as given, with its certificate JSON (@p sigs_json, may be NULL) on
+ * the last. Returns a tx_place_status_t, or -1 for bad arguments. Validity
+ * was settled before the placement was decided. Mirrors Python
+ * TransactionHistory.apply_placed. */
+int  tx_history_apply_placed(tx_history_t *hist, int k,
+                             const transaction_t *entries, int n,
+                             const char *sigs_json);
+/* One past the highest resident index a placement certificate covers, or -1.
+ * Mirrors Python placed_end. */
+int  tx_history_placed_end(const tx_history_t *hist);
+/* The placement certificate kept on @p task_uuid's entry (JSON), or NULL. */
+const char *tx_history_place_cert(const tx_history_t *hist,
+                                  const uuid_t task_uuid);
+/* Keep a roster member list, checked against its digest. Writes the digest to
+ * @p digest_out when not NULL. Returns 0, or -1 for a malformed list. */
+int  tx_history_roster_put(tx_history_t *hist, const json_t *members,
+                           char digest_out[TX_HASH_HEX_LEN + 1]);
+/* The roster in force for instance @p k: the latest resident roster entry
+ * below index @p k, copied to @p out. Returns 0, or -1 when the window holds
+ * none. Mirrors Python TransactionHistory.roster_at. */
+int  tx_history_roster_at(const tx_history_t *hist, int k, transaction_t *out);
+/* The canonical member list (JSON text) kept for @p digest, or NULL. */
+const char *tx_history_roster_members(const tx_history_t *hist,
+                                      const char *digest);
 
 /**
  * @brief The bytes an acceptor signs to certify ONE half of an ordinary
@@ -649,6 +828,10 @@ typedef enum {
     TX_RECONCILE_KEPT,           /**< forked; our tip won */
     TX_RECONCILE_REFUSED_FINAL,  /**< forked inside our finalized checkpoint */
     TX_RECONCILE_REJECTED,       /**< links, a gap, or an impossible duplicate */
+    /** Ordered placement: the peer's CERTIFIED entry differs from one we hold
+     *  inside our own placed prefix. Two quorums signed two values at one
+     *  index; never resolved by rule. */
+    TX_RECONCILE_EQUIVOCATION,
 } tx_reconcile_status_t;
 
 typedef struct {
@@ -663,6 +846,9 @@ typedef struct {
      *  island keeps the reputation it earned (Agora Phase 4 DDIL). Mirrors
      *  Python's ReconcileResult.dropped. */
     transaction_t *dropped_entries;
+    /** Under ordered placement: dropped entries returned to the pool, each
+     *  half with its certificate, to be placed again. */
+    int pooled;
 } tx_reconcile_result_t;
 
 /** Free what a reconcile result owns (its dropped_entries). Safe on a result
@@ -694,6 +880,40 @@ int  tx_history_reconcile_attested(tx_history_t *hist, const json_t *arr,
                                    int final_end,
                                    const tx_attested_t *attested,
                                    tx_reconcile_result_t *out);
+
+/** tx_history_reconcile_attested for a chain whose group places its order
+ *  (doc/architecture/reputation.md, "Agreeing on an order"). @p certified
+ *  lists the segment's indices whose placement certificates the caller
+ *  verified (@p n_certified of them, any order); NULL means the legacy rule.
+ *  Then: from the first certified index (or our placed end, if lower) on,
+ *  only certified entries are taken; nothing below our placed end is
+ *  rewritten (a certified rival there is TX_RECONCILE_EQUIVOCATION, an
+ *  uncertified one KEPT); past it a certified entry at the fork wins whatever
+ *  the lengths; a gap is crossed only by a segment opening on a certified
+ *  placement, which replaces our window. Mirrors Python
+ *  TransactionHistory.reconcile(certified=...). */
+int  tx_history_reconcile_placed(tx_history_t *hist, const json_t *arr,
+                                 int final_end,
+                                 const tx_attested_t *attested,
+                                 const int *certified, int n_certified,
+                                 tx_reconcile_result_t *out);
+
+/** One placement a catch-up segment carries a certificate for. */
+typedef struct {
+    int  k;                  /**< the index it began at */
+    int  n;                  /**< its entries; 0 when it cannot be completed */
+    bool whole;              /**< every entry came from the segment itself */
+    transaction_t entries[PLACE_BATCH_MAX];
+    const json_t *sigs;      /**< borrowed from the segment */
+} tx_place_batch_t;
+
+/** The placements segment @p arr carries certificates for: an entry with
+ *  "place_sigs" closes the placement begun at its "place_from". One begun
+ *  before the segment is completed from our resident entries when we hold
+ *  them. *@p out is allocated (free it); *@p n_out is its length. The caller
+ *  checks the signatures. Mirrors Python placement_batches. */
+int  tx_history_place_batches(const tx_history_t *hist, const json_t *arr,
+                              tx_place_batch_t **out, int *n_out);
 
 /** Merkle root over our committed entries at indices [first, first + count),
  *  the value a checkpoint over that window attests. Returns -1 unless every

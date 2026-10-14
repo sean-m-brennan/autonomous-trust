@@ -1,0 +1,36 @@
+schema_version: "1"
+kind: scenario
+protocol: reputation
+name: catchup-paged-malformed-page-dropped
+byte_pinning: false
+description: |
+    A page of a paged catch-up reply (ISSUES §2.67) must name a page inside its
+    own count. alice's claims to be page 3 of 1: dave drops it and applies
+    nothing, rather than treating its chain as a whole window.
+
+participants:
+  - id: alice
+    role: provider
+  - id: dave
+    role: consumer
+
+fixtures:
+  num_updates:
+    dave: 1
+
+steps:
+  - id: 1
+    from: alice
+    to: dave
+    function: latest update
+    payload:
+      page: 3
+      of: 1
+      head: "aa"
+      chain:
+        - {task: a, p1: 0.7, p2: 0.5}
+        - {task: b, p1: 0.9, p2: 0.3}
+
+expected_state:
+  dave:
+    committed_tx_count: 0
